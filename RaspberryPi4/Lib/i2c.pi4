@@ -146,13 +146,14 @@
 ;                 "fixes the clock-stretching bug that was present in
 ;                 BCM283x devices" (section 3.1), so on THIS part a stretch
 ;                 is handled in hardware and this bit means a real overrun.
-;    #I2C_TIMEOUT our own wall-clock backstop: the controller never set
-;                 S.DONE within a bounded spin. This is the SDA/SCL-stuck,
-;                 no-pull-ups, wrong-wiring case the hardware cannot report
-;                 because without a clock edge it never gets as far as an
-;                 error. It is a SPIN COUNT, not a calibrated time (see
-;                 THE TIMEOUT below), so that this library depends on no
-;                 clock - the same shape uart.pi4's UartReadWait uses.
+;    #I2C_TIMEOUT our own no-progress deadline: the controller did not
+;                 complete or advance a byte within 20 ms. The local
+;                 architectural counter gives elapsed time independently
+;                 of CPU/cache speed. A finite spin backstop also remains
+;                 for an unavailable or stopped counter; that fallback
+;                 alone is not a wall-time guarantee. Abort recovery has
+;                 its own 20 ms deadline and refuses a new START if TA
+;                 never clears. See THE WALL-CLOCK BACKSTOP below.
 ;
 ;  ---- REPEATED START: TWO PATHS, AND THE DEFAULT IS STILL TWO STOPS ---
 ;
@@ -410,18 +411,17 @@ EnableExplicit
 #I2C_SRC_NOMINAL    = 3       ; nothing answered - the datasheet constant
 
 ; ----------------------------------------------------------------------
-;  THE WALL-CLOCK BACKSTOP. A spin count, not a time, so this library
-;  needs no timer (board.pi4's header: a spin count is the right shape for
-;  a library that must not depend on a clock; a tick count is right only
-;  where the CPU speed can change under you, which is the command layer's
-;  problem, not the bus's). It only has to be "long enough that a real
-;  100 kHz byte - about 90 microseconds - never trips it, and short enough
-;  that a stuck bus returns to the prompt in a blink". Each byte of forward
-;  progress RESETS it, so this bounds the wait PER byte, not per transfer:
-;  an N-byte transfer to a healthy slow device cannot time out just for
-;  being long. It is the SDA/SCL-stuck case it exists to catch.
+;  THE WALL-CLOCK BACKSTOP. CNTFRQ_EL0/CNTPCT_EL0 give this Pi-specific
+;  driver a real elapsed-time bound without a dependency include. Twenty
+;  milliseconds is over two hundred 100 kHz bit cells and far beyond one
+;  byte or the separately programmed hardware stretch window. Each byte of
+;  progress resets the deadline, so a healthy long transfer does not time
+;  out merely for being long. The spin count remains an independent fallback
+;  for a loader that left CNTFRQ_EL0 at zero.
 ; ----------------------------------------------------------------------
 #I2C_SPIN_MAX  = 2000000
+#I2C_PROGRESS_TIMEOUT_US = 20000
+#I2C_RECOVER_TIMEOUT_US = 20000
 
 ; Result codes - see hal.pi4's #HW_I2C_* portable vocabulary, which these
 ; equal so the board backend can hand them straight up to the core. Named
@@ -456,11 +456,27 @@ EnableExplicit
                               ; through I2cMapCode's default would be reported
                               ; as a timeout, which is the wrong sentence.
 
+; One bounded, non-mutating sequence of controller reads for diagnostics.
+; Each member is a 32-bit BSC register read through I2cRd (PeekN); FIFO is
+; deliberately absent because reading it consumes received data. The words
+; are sequential evidence, not an atomic hardware snapshot: S, DLEN or C can
+; change between reads while hardware completes or aborts a transaction. The
+; diagnostic starts no transaction and never reads the side-effecting FIFO.
+#I2C_SNAP_C = 0
+#I2C_SNAP_S = 1
+#I2C_SNAP_DLEN = 2
+#I2C_SNAP_A = 3
+#I2C_SNAP_DIV = 4
+#I2C_SNAP_DEL = 5
+#I2C_SNAP_CLKT = 6
+#I2C_SNAP_WORDS = 7
+
 ; Counts transactions that ended in a wedged-bus timeout since boot. A
 ; timeout is the one failure that suggests wiring rather than a missing
 ; chip, so it is worth being able to print a running total. Same idea as
 ; gpio.pi4's gpio_bad_pins.
 Global i2c_timeouts.i
+Global i2c_recover_failed.i
 
 ; ----------------------------------------------------------------------
 ;  THE ACTIVE BUS. ONE global, written by I2cSelectBus() and by nothing
@@ -1012,28 +1028,118 @@ EndProcedure
 ;  described. That is why this is a fix in the driver and not a retry at
 ;  the call site.
 ;
-;  What it does, in the datasheet's own terms (Table 25, p.25): write C
-;  with I2CEN and CLEAR, which empties the FIFO and leaves ST unset, so
-;  no transfer is in flight; then write 1 to DONE, ERR and CLKT, which is
-;  how sticky S bits are cleared whether or not they are set; then leave
-;  C enabled and idle. It does NOT touch the divider, the slave address
-;  or the stretch timeout - a recovery that also reset the rate would
-;  throw away a rate the operator chose, which is the mistake I2cUp
-;  exists to avoid.
+;  What it does follows both the datasheet's controller definition and the
+;  upstream BCM2835 driver's timeout path. First write C with CLEAR and
+;  I2CEN OFF. That disables the controller and aborts an active transfer;
+;  CLEAR also empties both FIFOs. The abort is asynchronous on the bus, so
+;  poll TA until the controller says the transfer is no longer active.
+;  Only THEN clear DONE, ERR and CLKT: clearing them before TA falls permits
+;  a late abort-completion DONE to become the next transaction's status.
+;  Finally leave C enabled and idle. Linux uses the same disabled CLEAR at
+;  timeout and completion (drivers/i2c/busses/i2c-bcm2835.c:338-342,
+;  372-375 at commit 50d05c7c76c96b90462f24debacca971d2e86713).
 ;
-;  It is deliberately NOT called on a NACK or a clock-stretch timeout.
-;  Those two are the controller REPORTING, not the controller stuck: it
-;  raised the bit, it finished, and the transaction is over. Recovering
-;  from them would hide the difference between a bus that answered "no"
-;  and a bus that said nothing at all, which is the one distinction this
-;  whole file is built to keep.
+;  It does NOT touch the divider, the slave address or the stretch timeout -
+;  a recovery that also reset the rate would throw away a rate the operator
+;  chose, which is the mistake I2cUp exists to avoid.
+;
+;  A single framed I2cXfer clears a reported NACK or clock-stretch status and
+;  returns it directly. The combined repeated-start procedure calls recovery
+;  for those errors because they can occur between its two phases, while the
+;  controller still owns a half-transaction. Recovery never changes the
+;  error returned to the caller, so NACK, CLKT and timeout remain distinct.
 ; ----------------------------------------------------------------------
-Procedure I2cRecover()
+Procedure.i I2cRecover()
+  Define s.i
+  Define spin.i
+  Define deadline.i
+
   a64_barrier()
-  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)
+  I2cWr(#BSC_C_OFF, #BSC_C_CLEAR)
+
+  spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_RECOVER_TIMEOUT_US)
+  Repeat
+    s = I2cRd(#BSC_S_OFF)
+    If (s & #BSC_S_TA) = 0
+      Break
+    EndIf
+    spin = spin - 1
+  Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+
+  If (s & #BSC_S_TA) <> 0
+    ; Leave the controller disabled. A caller already returning an error must
+    ; not advertise an enabled-idle controller that never became idle.
+    i2c_recover_failed = 1
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  ; DONE may have arrived as the abort completed. This clear belongs after
+  ; the TA observation above, never immediately after requesting the abort.
   I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)
   I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)
+  i2c_recover_failed = 0
   a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; Architectural counter access stays local so this hardware library does not
+; include another library. The counter is fixed-frequency across cache/CPU
+; regimes; zero frequency activates the independent spin fallback.
+Procedure.i I2cCounterHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i I2cCounterTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i I2cDeadlineUs(us.i)
+  Define hz.i
+  hz = I2cCounterHz()
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn I2cCounterTicks() + (hz / 1000000) * us
+EndProcedure
+
+Procedure.i I2cDeadlinePassed(deadline.i)
+  If deadline = 0
+    ProcedureReturn 0
+  EndIf
+  ; The signed delta is wrap-safe for deadlines less than 2^63 ticks away.
+  If (I2cCounterTicks() - deadline) >= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Refuse to launch a fresh transaction over one that recovery could not make
+; idle. The common success path is one status read. A previous failed abort
+; leaves I2CEN off; only a confirmed TA-low recovery may enable it again.
+Procedure.i I2cEnsureIdle()
+  If i2c_recover_failed = 0 And (I2cRd(#BSC_S_OFF) & #BSC_S_TA) = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn I2cRecover()
+EndProcedure
+
+Procedure.i I2cSnapshot(*snap)
+  If *snap = 0
+    ProcedureReturn 0
+  EndIf
+  PokeL(*snap + #I2C_SNAP_C * 4, I2cRd(#BSC_C_OFF))
+  PokeL(*snap + #I2C_SNAP_S * 4, I2cRd(#BSC_S_OFF))
+  PokeL(*snap + #I2C_SNAP_DLEN * 4, I2cRd(#BSC_DLEN_OFF))
+  PokeL(*snap + #I2C_SNAP_A * 4, I2cRd(#BSC_A_OFF))
+  PokeL(*snap + #I2C_SNAP_DIV * 4, I2cRd(#BSC_DIV_OFF))
+  PokeL(*snap + #I2C_SNAP_DEL * 4, I2cRd(#BSC_DEL_OFF))
+  PokeL(*snap + #I2C_SNAP_CLKT * 4, I2cRd(#BSC_CLKT_OFF))
+  ProcedureReturn 1
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1061,9 +1167,13 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
   Define i.i
   Define ctl.i
   Define spin.i
+  Define deadline.i
 
   If n < 1 Or addr < 0 Or addr > $7F
     ProcedureReturn #I2C_ARG
+  EndIf
+  If I2cEnsureIdle() = 0
+    ProcedureReturn #I2C_TIMEOUT
   EndIf
 
   a64_barrier()
@@ -1081,6 +1191,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
 
   i = 0
   spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
   Repeat
     s = I2cRd(#BSC_S_OFF)
 
@@ -1102,6 +1213,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
         PokeA(*buf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
         i = i + 1
         spin = #I2C_SPIN_MAX          ; progress - reset the backstop
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
         Continue
       EndIf
     Else
@@ -1109,6 +1221,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
         I2cWr(#BSC_FIFO_OFF, PeekA(*buf + i) & $FF)
         i = i + 1
         spin = #I2C_SPIN_MAX
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
         Continue
       EndIf
     EndIf
@@ -1138,7 +1251,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
 
     ; --- the wall-clock backstop -------------------------------------
     spin = spin - 1
-    If spin <= 0
+    If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
       a64_barrier()
       i2c_timeouts = i2c_timeouts + 1
       I2cRecover()
@@ -1251,9 +1364,13 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   Define s.i
   Define i.i
   Define spin.i
+  Define deadline.i
 
   If wn < 1 Or rn < 1 Or addr < 0 Or addr > $7F
     ProcedureReturn #I2C_ARG
+  EndIf
+  If I2cEnsureIdle() = 0
+    ProcedureReturn #I2C_TIMEOUT
   EndIf
 
   a64_barrier()
@@ -1273,6 +1390,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   ; refill a partial FIFO. When the final byte is enqueued, queue READ|ST in
   ; this same iteration - do not wait for another status transition.
   spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
   Repeat
     s = I2cRd(#BSC_S_OFF)
     If (s & #BSC_S_ERR) <> 0
@@ -1310,6 +1428,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
         I2cWr(#BSC_FIFO_OFF, PeekA(*wbuf + i) & $FF)
         i = i + 1
         spin = #I2C_SPIN_MAX
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
       Wend
 
       If i = wn
@@ -1320,7 +1439,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     spin = spin - 1
-    If spin <= 0
+    If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
       i2c_timeouts = i2c_timeouts + 1
       I2cRecover()
       ProcedureReturn #I2C_TIMEOUT
@@ -1331,6 +1450,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   ; called because I2cXfer owns the whole transaction from its own START.
   i = 0
   spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
   Repeat
     s = I2cRd(#BSC_S_OFF)
 
@@ -1347,6 +1467,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
       PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
       i = i + 1
       spin = #I2C_SPIN_MAX
+      deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
       Continue
     EndIf
 
@@ -1366,7 +1487,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     spin = spin - 1
-    If spin <= 0
+    If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
       i2c_timeouts = i2c_timeouts + 1
       I2cRecover()
       ProcedureReturn #I2C_TIMEOUT

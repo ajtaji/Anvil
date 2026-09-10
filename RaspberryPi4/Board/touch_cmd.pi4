@@ -176,6 +176,31 @@ Procedure TouchSayPads(when.i)
   PrintN("")
 EndProcedure
 
+; Read-only BSC register evidence. FIFO is intentionally not part of the
+; snapshot: reading it would consume a byte and turn a diagnostic into a bus
+; operation. These are 32-bit device reads, never byte-assembled `m` output.
+Global Dim gTouchI2cSnap.l[7]
+
+Procedure TouchSayController(when.i)
+  If I2cSnapshot(@gTouchI2cSnap[0]) = 0
+    ProcedureReturn
+  EndIf
+  If when = 0
+    PrintN("  controller before probe:")
+  Else
+    PrintN("  controller after probe:")
+  EndIf
+  Print("    C $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_C], 8)
+  Print("  S $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_S], 8)
+  Print("  DLEN $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_DLEN], 8)
+  Print("  A $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_A], 8)
+  PrintN("")
+  Print("    DIV $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_DIV], 8)
+  Print("  DEL $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_DEL], 8)
+  Print("  CLKT $") : PutHexN(gTouchI2cSnap[#I2C_SNAP_CLKT], 8)
+  PrintN("")
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  TouchSayMcu - the v2 panel MCU: probe it, read its three identity
 ;  bytes, power it on. Returns 1 if the MCU answered, else 0.
@@ -262,6 +287,7 @@ Procedure TouchStatus()
 
   TouchSayBus()
   TouchSayPads(1)
+  TouchSayController(0)
 
   TouchSayMcu()
 
@@ -270,6 +296,7 @@ Procedure TouchStatus()
   ; so a `touch` that revives a controller revives the finger with it -
   ; and there is one place that decides whether the thing is up.
   HwTouchRestart()
+  TouchSayController(1)
   a = Gt9Addr()
   If a = 0
     PrintN("No Goodix touch controller answered.")

@@ -90,11 +90,12 @@ UART_DR = G["uart_dr"]
 LOADER_LR = 0xDEADBEE0
 STEP_LIMIT = 80_000_000
 
-# One millisecond of virtual time per interpreter step. The probe spends
-# about six seconds inside delay(); at this rate that is six thousand
-# steps of spinning instead of three hundred million.
+# One microsecond of virtual time per interpreter step. This remains coarse
+# enough to keep the probe's deliberate multi-second delays practical, while
+# a 20 ms I2C no-progress deadline still spans thousands of emitted
+# instructions instead of expiring in procedure overhead.
 CNTFRQ = 54_000_000
-TICKS_PER_STEP = CNTFRQ // 1000
+TICKS_PER_STEP = CNTFRQ // 1_000_000
 
 
 # =====================================================================
@@ -324,7 +325,9 @@ class Bsc:
     `patience=0` makes DONE arrive before the first TXW and exercises NOSR.
     """
 
-    def __init__(self, base=BSC_BASE, patience=2, tx_chunk=1, stall=False):
+    def __init__(self, base=BSC_BASE, patience=2, tx_chunk=1, stall=False,
+                 stall_writes=0, abort_delay=0, abort_never=False,
+                 tx_gap_reads=1):
         self.base = base
         self.patience = patience
         self.devices = {}
@@ -344,13 +347,22 @@ class Bsc:
         self.write_data = bytearray()
         self.tx_chunk = tx_chunk
         self.stall = stall
+        self.stall_writes = stall_writes
+        self.stall_this = False
+        self.abort_delay = abort_delay
+        self.abort_never = abort_never
+        self.abort_pending = 0
+        self.abort_completions = 0
         self.tx_slots = 0
         self.tx_gap = False
+        self.tx_gap_reads = tx_gap_reads
+        self.tx_gap_left = 0
         self.start_delay = 2
         self.prefilled_starts = 0
         self.txw_events = 0
         self.phase_switches = 0
         self.polls = 0
+        self.status_reads = 0
         self.cur = None
 
         # Everything worth grading that is not a register.
@@ -381,6 +393,29 @@ class Bsc:
         self.ta = False
         self.done = True
         self.cur = None
+
+    def _complete_abort(self):
+        """Finish a controller-disable abort without committing its write.
+
+        Real BSC abort completion is not synchronous with the C write. TA
+        can remain visible and DONE can arrive later. Keeping that interval
+        in the model is what catches a recovery path that clears S too early.
+        """
+        if self.cur is not None:
+            self.cur.stop()
+        self.stops += 1
+        self.active = False
+        self.ta = False
+        self.done = True
+        self.cur = None
+        self.write_left = 0
+        self.write_data = bytearray()
+        self.tx_slots = 0
+        self.tx_gap = False
+        self.tx_gap_left = 0
+        self.stall_this = False
+        self.abort_pending = 0
+        self.abort_completions += 1
 
     def _begin(self, is_read, repeated):
         addr = self.regs[C["BSC_A_OFF"]] & 0x7F
@@ -449,14 +484,29 @@ class Bsc:
             self.write_data = bytearray()
             self.tx_slots = 0
             self.tx_gap = False
+            self.tx_gap_left = 0
+            self.stall_this = self.stall
+            if self.stall_writes > 0:
+                self.stall_writes -= 1
+                self.stall_this = True
 
     # ---- the register window ---------------------------------------
     def read32(self, off):
         if off == C["BSC_S_OFF"]:
-            if self.active and not self.is_read:
+            self.status_reads += 1
+            if self.abort_never and self.abort_pending:
+                pass
+            elif self.abort_pending > 0:
+                self.abort_pending -= 1
+                if self.abort_pending == 0:
+                    self._complete_abort()
+            elif self.active and not self.is_read:
                 self.polls += 1
-                if self.stall:
-                    pass
+                if self.stall_this:
+                    # A stuck transfer can still have entered TA. It simply
+                    # never reaches TXW/DONE until the driver aborts it.
+                    if not self.ta and self.polls > self.start_delay:
+                        self.ta = True
                 elif self.patience == 0:
                     self._emit_stop()
                 elif not self.ta and self.polls > self.start_delay:
@@ -466,9 +516,12 @@ class Bsc:
                     # safe action was READ|ST before asking status again.
                     self._emit_stop()
                 elif self.ta and self.tx_gap:
-                    # One observation with TXD clear forces the emitted
-                    # loop to leave the inner fill and wait for another TXW.
-                    self.tx_gap = False
+                    # A configurable number of empty observations separates
+                    # refill events. Long-but-sub-deadline gaps prove that
+                    # byte progress resets the production deadline.
+                    self.tx_gap_left -= 1
+                    if self.tx_gap_left <= 0:
+                        self.tx_gap = False
                 elif self.ta and self.tx_slots == 0:
                     self.tx_slots = min(self.tx_chunk, self.write_left)
                     self.txw_events += 1
@@ -526,25 +579,37 @@ class Bsc:
                     self.tx_slots -= 1
                     if self.tx_slots == 0 and self.write_left > 0:
                         self.tx_gap = True
+                        self.tx_gap_left = self.tx_gap_reads
             return
         if off == C["BSC_C_OFF"]:
             self.regs[off] = val
             if val & C["BSC_C_CLEAR"]:
                 self.txbuf = bytearray()
                 self.rxbuf = bytearray()
-                if self.active:
+                if self.active and self.abort_delay > 0:
+                    # CLEAR requests an abort. The bus-visible completion is
+                    # deliberately delayed; clearing S before it lands must
+                    # not make the fixture green.
+                    if self.abort_pending == 0:
+                        self.abort_pending = self.abort_delay
+                elif self.active:
                     if self.cur is not None:
                         self.cur.stop()
                     self.stops += 1
-                self.active = False
-                self.ta = False
-                self.cur = None
-                self.write_left = 0
-                self.write_data = bytearray()
-                self.tx_slots = 0
-                self.tx_gap = False
+                    self.active = False
+                    self.ta = False
+                    self.cur = None
+                    self.write_left = 0
+                    self.write_data = bytearray()
+                    self.tx_slots = 0
+                    self.tx_gap = False
+                    self.tx_gap_left = 0
             if val & C["BSC_C_ST"]:
-                self._begin(bool(val & C["BSC_C_READ"]), self.active)
+                # A new START cannot outrun an unfinished abort. If a broken
+                # recovery tries, the later abort DONE is what its next poll
+                # observes, reproducing the stale-status contamination.
+                if self.abort_pending == 0:
+                    self._begin(bool(val & C["BSC_C_READ"]), self.active)
             return
         if off in self.regs:
             self.regs[off] = val
@@ -611,7 +676,7 @@ def build(probe_rel, out):
         raise SystemExit("build failed:\n" + r.stdout)
 
 
-def run(img, bsc):
+def run(img, bsc, counter_hz=CNTFRQ):
     blob = img.read_bytes()
     cpu = A64()
     mem = cpu.memory
@@ -632,7 +697,7 @@ def run(img, bsc):
         steps[0] += 1
         ins = cpu.fetch(cpu.pc)
         if (ins & 0xFFFFFFE0) == 0xD53BE000:          # MRS Xt, CNTFRQ_EL0
-            cpu.x[ins & 31] = CNTFRQ
+            cpu.x[ins & 31] = counter_hz
             cpu.pc += 4
             return
         if (ins & 0xFFFFFFE0) == 0xD53BE020:          # MRS Xt, CNTPCT_EL0
@@ -1066,12 +1131,7 @@ def run_nosr(probe_rel, work, fails):
 
 
 def run_timeout(work, fails):
-    """Execute the real timeout/cleanup path with only its desk wait shortened.
-
-    The production bound is intentionally large. Recompiling the same source
-    with that one constant reduced keeps this gate finite while retaining the
-    emitted loop, result code and recovery writes under test.
-    """
+    """Execute the real counter deadline and stopped-counter fallback."""
     d = work / "timeout"
     d.mkdir(parents=True, exist_ok=True)
     src = DRV_I2C.read_text(encoding="utf-8", errors="replace")
@@ -1080,20 +1140,19 @@ def run_timeout(work, fails):
         fails.append("timeout: the I2C spin-bound anchor changed; the emitted "
                      "timeout path was not exercised")
         return 1
-    short_i2c = d / "timeout_i2c.pi4"
-    short_i2c.write_text(src.replace(anchor, "#I2C_SPIN_MAX  = 16"),
-                         encoding="utf-8")
+    timed_i2c = d / "timeout_i2c.pi4"
+    timed_i2c.write_text(src, encoding="utf-8")
 
     probe = PROBE.read_text(encoding="utf-8", errors="replace")
     inc = 'XIncludeFile "RaspberryPi4/Lib/i2c.pi4"'
     if probe.count(inc) != 1:
-        fails.append("timeout: the probe's I2C include changed; the shortened "
+        fails.append("timeout: the probe's I2C include changed; the timed "
                      "test build was not made")
         return 1
     short_probe = d / "timeout_probe.pi4"
     short_probe.write_text(
         probe.replace(inc, 'XIncludeFile "%s"' %
-                      short_i2c.relative_to(ROOT).as_posix()),
+                      timed_i2c.relative_to(ROOT).as_posix()),
         encoding="utf-8")
     img = d / "timeout.img"
     build(short_probe.relative_to(ROOT).as_posix(), img)
@@ -1123,6 +1182,170 @@ def run_timeout(work, fails):
           bsc.regs[C["BSC_A_OFF"]] == 0x14,
           "A changed to $%02X instead of retaining the final fallback address"
           % bsc.regs[C["BSC_A_OFF"]])
+
+    check("live counter expires before the spin fallback",
+          bsc.status_reads < 100000,
+          "%d status reads means the 2,000,000-spin fallback, not the "
+          "20 ms architectural-counter deadline, ended the wait"
+          % bsc.status_reads)
+
+    # The independent fallback is compiled short only in this desk fixture.
+    fallback_i2c = d / "fallback_i2c.pi4"
+    fallback_i2c.write_text(src.replace(anchor, "#I2C_SPIN_MAX  = 16"),
+                            encoding="utf-8")
+    fallback_probe = d / "fallback_probe.pi4"
+    fallback_probe.write_text(
+        probe.replace(inc,
+                      'XIncludeFile "%s"' %
+                      fallback_i2c.relative_to(ROOT).as_posix()),
+        encoding="utf-8")
+    fallback_img = d / "fallback.img"
+    build(fallback_probe.relative_to(ROOT).as_posix(), fallback_img)
+    fb_bsc, fb_g, fb_mcu = make_bus(stall=True)
+    fb_cpu, fb_out, fb_steps = run(fallback_img, fb_bsc, counter_hz=0)
+    check("zero CNTFRQ uses the finite spin fallback",
+          "code at $5D = -4" in fb_out and not fb_bsc.active,
+          "the stopped-counter run did not return timeout and idle")
+    return cases
+
+
+def run_delayed_abort_recovery(i2c_path, work, fails):
+    """A failed combined transfer must not poison the next ordinary one.
+
+    The BSC fixture keeps TA asserted for three status observations after
+    CLEAR and raises DONE only when that asynchronous abort completes. The
+    old clear-status/immediate-reenable sequence therefore loses: its next
+    START runs into the pending abort and sees that late DONE. The production
+    sequence must wait for TA to fall, clear the completion status afterward,
+    and then complete a normal MCU write and read without a retry.
+    """
+    d = work / "delayed_abort"
+    d.mkdir(parents=True, exist_ok=True)
+    src = pathlib.Path(i2c_path).read_text(encoding="utf-8", errors="replace")
+    anchor = "#I2C_SPIN_MAX  = 2000000"
+    if src.count(anchor) != 1 and not re.search(
+            r"^#I2C_SPIN_MAX\s*=\s*64$", src, re.M):
+        fails.append("delayed-abort: the I2C spin-bound anchor changed; the "
+                     "emitted recovery path was not exercised")
+        return 1
+    short_i2c = d / "recovery_i2c.pi4"
+    short_i2c.write_text(src, encoding="utf-8")
+
+    probe = d / "recovery_probe.pi4"
+    probe.write_text(
+        'XIncludeFile "RaspberryPi4/Lib/timer.pi4"\n'
+        'XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"\n'
+        'XIncludeFile "RaspberryPi4/Lib/gpio.pi4"\n'
+        'XIncludeFile "%s"\n'
+        'Global Dim wr.a[2]\n'
+        'Global Dim rd.a[6]\n'
+        'Procedure.i Main()\n'
+        '  I2cUp()\n'
+        '  wr[0] = $81 : wr[1] = $40\n'
+        '  If I2cWriteRead($5D, @wr[0], 2, @rd[0], 6) <> #I2C_TIMEOUT\n'
+        '    ProcedureReturn 11\n'
+        '  EndIf\n'
+        '  wr[0] = $AB : wr[1] = $55\n'
+        '  If I2cWrite($45, @wr[0], 2) <> #I2C_OK\n'
+        '    ProcedureReturn 12\n'
+        '  EndIf\n'
+        '  If I2cRead($45, @rd[0], 1) <> #I2C_OK\n'
+        '    ProcedureReturn 13\n'
+        '  EndIf\n'
+        '  ProcedureReturn 0\n'
+        'EndProcedure\n'
+        % short_i2c.relative_to(ROOT).as_posix(),
+        encoding="utf-8")
+
+    img = d / "recovery.img"
+    build(probe.relative_to(ROOT).as_posix(), img)
+    bsc, g, mcu = make_bus()
+    bsc.stall_writes = 1
+    bsc.abort_delay = 3
+    cpu, out, steps = run(img, bsc)
+
+    cases = 0
+    def check(name, ok, detail):
+        nonlocal cases
+        cases += 1
+        if not ok:
+            fails.append("delayed-abort: %s: %s" % (name, detail))
+
+    check("emitted probe returned success", cpu.x[0] == 0,
+          "Main returned %d; 11=missing timeout, 12=next write failed, "
+          "13=next read failed" % cpu.x[0])
+    check("the delayed abort actually completed",
+          bsc.abort_completions == 1,
+          "%d delayed abort completion(s) were observed"
+          % bsc.abort_completions)
+    check("the next ordinary MCU write completed exactly once",
+          mcu.writes == [(0xAB, 0x55)],
+          "MCU writes were %r" % (mcu.writes,))
+    check("the next ordinary MCU read completed", mcu.reads == 1,
+          "MCU reads=%d" % mcu.reads)
+    check("no stale status or active transfer remained",
+          not bsc.active and not bsc.done and not bsc.abort_pending,
+          "active=%r DONE=%r abort_pending=%d"
+          % (bsc.active, bsc.done, bsc.abort_pending))
+
+    # A permanently asserted TA is not recoverable by software. The driver
+    # must keep I2CEN off and refuse the next transaction; blindly issuing a
+    # new START would make a bus fault look like an MCU failure.
+    stuck, stuck_g, stuck_mcu = make_bus()
+    stuck.stall_writes = 1
+    stuck.abort_delay = 3
+    stuck.abort_never = True
+    stuck_cpu, stuck_out, stuck_steps = run(img, stuck)
+    check("a permanently active abort refuses the next ordinary transfer",
+          stuck_cpu.x[0] == 12,
+          "Main returned %d instead of the next-write failure code 12"
+          % stuck_cpu.x[0])
+    check("no new START was issued over permanently active TA",
+          stuck.starts == 1 and not stuck_mcu.writes,
+          "starts=%d MCU writes=%r" % (stuck.starts, stuck_mcu.writes))
+    check("the unrecovered controller remains disabled",
+          (stuck.regs[C["BSC_C_OFF"]] & C["BSC_C_I2CEN"]) == 0,
+          "C=$%08X still advertises I2CEN" % stuck.regs[C["BSC_C_OFF"]])
+    return cases
+
+
+def run_progress_deadline(work, fails):
+    """A multi-byte transfer may exceed one window if bytes keep moving."""
+    d = work / "progress_deadline"
+    d.mkdir(parents=True, exist_ok=True)
+    probe = d / "progress_probe.pi4"
+    probe.write_text(
+        'XIncludeFile "RaspberryPi4/Lib/timer.pi4"\n'
+        'XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"\n'
+        'XIncludeFile "RaspberryPi4/Lib/gpio.pi4"\n'
+        'XIncludeFile "RaspberryPi4/Lib/i2c.pi4"\n'
+        'Global Dim wr.a[2]\n'
+        'Global Dim rd.a[6]\n'
+        'Procedure.i Main()\n'
+        '  I2cUp()\n'
+        '  wr[0] = $81 : wr[1] = $40\n'
+        '  ProcedureReturn I2cWriteRead($5D, @wr[0], 2, @rd[0], 6)\n'
+        'EndProcedure\n', encoding="utf-8")
+    img = d / "progress.img"
+    build(probe.relative_to(ROOT).as_posix(), img)
+    bsc, g, mcu = make_bus()
+    bsc.tx_gap_reads = 120
+    cpu, out, steps = run(img, bsc)
+    elapsed_us = steps * TICKS_PER_STEP * 1_000_000 // CNTFRQ
+    cases = 0
+    cases += 1
+    if cpu.x[0] != C["I2C_OK"]:
+        fails.append("progress-deadline: the slow two-byte TXW refill "
+                     "returned %d instead of success" % cpu.x[0])
+    cases += 1
+    if elapsed_us <= 20000:
+        fails.append("progress-deadline: fixture took only %d us, so it did "
+                     "not prove a transfer can outlive one 20 ms window"
+                     % elapsed_us)
+    cases += 1
+    if bsc.repeated_starts != 1 or g.reads != [(0x8140, 6)]:
+        fails.append("progress-deadline: repeated-start read was not intact: "
+                     "Sr=%d reads=%r" % (bsc.repeated_starts, g.reads))
     return cases
 
 
@@ -1247,6 +1470,10 @@ MUTATIONS = [
     ("i2c", "the read length is never written to DLEN",
      "        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)",
      "        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)"),
+
+    ("i2c", "recovery clears status before the asynchronous abort completes",
+     "  I2cWr(#BSC_C_OFF, #BSC_C_CLEAR)\n\n  spin = #I2C_SPIN_MAX\n  deadline = I2cDeadlineUs(#I2C_RECOVER_TIMEOUT_US)\n  Repeat\n    s = I2cRd(#BSC_S_OFF)\n    If (s & #BSC_S_TA) = 0\n      Break\n    EndIf\n    spin = spin - 1\n  Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0\n\n  If (s & #BSC_S_TA) <> 0\n    ; Leave the controller disabled. A caller already returning an error must\n    ; not advertise an enabled-idle controller that never became idle.\n    i2c_recover_failed = 1\n    a64_barrier()\n    ProcedureReturn 0\n  EndIf\n  ; DONE may have arrived as the abort completed. This clear belongs after\n  ; the TA observation above, never immediately after requesting the abort.\n  I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)",
+     "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)\n  I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)\n  spin = 1\n  s = 0\n  deadline = 0\n  i2c_recover_failed = 0"),
 ]
 
 SRC_OF = {"touch": DRV_TOUCH, "panel": DRV_PANEL, "i2c": DRV_I2C}
@@ -1316,6 +1543,8 @@ def mutate_one(job):
             run_v1(rel, d, fails)
         if not fails:
             run_nosr(rel, d, fails)
+        if not fails and which == "i2c":
+            run_delayed_abort_recovery(mut, d, fails)
     except (SystemExit, AssertionError, KeyError, IndexError,
             ValueError, ZeroDivisionError) as e:
         return (name, True, "the run refused it: %s"
@@ -1388,6 +1617,8 @@ def main():
     cases += run_v1(rel, WORK, fails)
     cases += run_nosr(rel, WORK, fails)
     cases += run_timeout(WORK, fails)
+    cases += run_delayed_abort_recovery(DRV_I2C, WORK, fails)
+    cases += run_progress_deadline(WORK, fails)
 
     if fails:
         print("touch_emitted_check: FAIL - %d" % len(fails))
@@ -1409,8 +1640,9 @@ def main():
     print("document on this machine. The SCREEN MAPPING is not here at")
     print("all - it lives in the display layer now and is graded by")
     print("a64_dsiscreen_check. BSC0 on GPIO 44/45 - the bus the panel")
-    print("is actually on - is not modelled; this probe deliberately")
-    print("stays on the header bus the overlay's i2c1 override describes.")
+    print("is actually on - is not modelled; this gate's simulated fixture")
+    print("uses the header bus. The separate returning hardware diagnostic")
+    print("i2c_touch_recovery_probe.pi4 explicitly selects display BSC0.")
 
     if args.mutate:
         return run_mutations()

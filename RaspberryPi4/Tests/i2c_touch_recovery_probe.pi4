@@ -1,0 +1,219 @@
+; i2c_touch_recovery_probe.pi4 - returning, read-only panel-bus evidence.
+;
+; This payload does not power, reset, or configure the panel and does not
+; alter a GPIO function. It selects the already-live display BSC in its own
+; private driver state, reads the v2 MCU identity and Goodix identity, records
+; non-FIFO BSC registers before and after, prints a compact UART result, and
+; returns. The shipping monitor remains responsible for having brought BSC0
+; and GPIO 44/45 up before this payload is called.
+;
+; Build outside the repository product directories:
+;   pmfc RaspberryPi4/Tests/i2c_touch_recovery_probe.pi4 -t pi4 \
+;     --load-addr 0x00500000 --bss-addr 0x00600000 \
+;     --stack-addr 0x00800000 --entry-returns -o i2c-touch-probe.img
+;
+; Load at $00500000 and arm `deadman 15` immediately before `run 500000`.
+; This is a desk/hardware diagnostic, not release firmware. Root owns board
+; access and must read the generated symbol map for the fixed globals below.
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
+
+#PROBE_UART_DR = $FE201000
+#PROBE_UART_FR = $FE201018
+#PROBE_UART_TXFF = $20
+#PROBE_UART_SPINS = 200000
+#PROBE_DONE_MAGIC = $49324332       ; ASCII "I2C2"
+#PROBE_MCU_ADDR = $45
+#PROBE_MCU_SIZE = $97
+#PROBE_MCU_HWID = $98
+#PROBE_MCU_VERSION = $99
+#PROBE_MCU_READ_MS = 10
+
+Global probe_done.i
+Global probe_mcu_ok.i
+Global probe_mcu_code.i
+Global probe_mcu_size.i
+Global probe_mcu_hwid.i
+Global probe_mcu_version.i
+Global probe_goodix_addr.i
+Global probe_goodix_code_5d.i
+Global probe_goodix_code_14.i
+Global probe_goodix_id.i
+Global probe_goodix_firmware.i
+
+Global probe_before_c.i
+Global probe_before_s.i
+Global probe_before_dlen.i
+Global probe_before_a.i
+Global probe_before_div.i
+Global probe_before_del.i
+Global probe_before_clkt.i
+Global probe_after_c.i
+Global probe_after_s.i
+Global probe_after_dlen.i
+Global probe_after_a.i
+Global probe_after_div.i
+Global probe_after_del.i
+Global probe_after_clkt.i
+Global Dim probe_mcu_buf.a[2]
+Global Dim probe_regs.l[14]
+
+Procedure ProbePutC(c.i)
+  Define spins.i
+  spins = #PROBE_UART_SPINS
+  While (PeekN(#PROBE_UART_FR) & #PROBE_UART_TXFF) <> 0 And spins > 0
+    spins = spins - 1
+  Wend
+  If spins > 0
+    PokeN(#PROBE_UART_DR, c & $FF)
+  EndIf
+EndProcedure
+
+Procedure ProbePutS(*s)
+  Define c.i
+  If *s = 0
+    ProcedureReturn
+  EndIf
+  Repeat
+    c = PeekA(*s) & $FF
+    If c = 0
+      Break
+    EndIf
+    ProbePutC(c)
+    *s = *s + 1
+  ForEver
+EndProcedure
+
+Procedure ProbeHex(v.i, digits.i)
+  Define n.i
+  Define d.i
+  n = digits - 1
+  While n >= 0
+    d = (v >> (n * 4)) & $F
+    If d < 10
+      ProbePutC(48 + d)
+    Else
+      ProbePutC(55 + d)
+    EndIf
+    n = n - 1
+  Wend
+EndProcedure
+
+Procedure ProbeRegs(*label, *r)
+  ProbePutS(*label)
+  ProbePutS(" C=") : ProbeHex(PeekL(*r + #I2C_SNAP_C * 4), 8)
+  ProbePutS(" S=") : ProbeHex(PeekL(*r + #I2C_SNAP_S * 4), 8)
+  ProbePutS(" DLEN=") : ProbeHex(PeekL(*r + #I2C_SNAP_DLEN * 4), 4)
+  ProbePutS(" A=") : ProbeHex(PeekL(*r + #I2C_SNAP_A * 4), 2)
+  ProbePutS(" DIV=") : ProbeHex(PeekL(*r + #I2C_SNAP_DIV * 4), 4)
+  ProbePutS(" DEL=") : ProbeHex(PeekL(*r + #I2C_SNAP_DEL * 4), 8)
+  ProbePutS(" CLKT=") : ProbeHex(PeekL(*r + #I2C_SNAP_CLKT * 4), 4)
+  ProbePutC(13) : ProbePutC(10)
+EndProcedure
+
+; The Waveshare MCU's documented read convention is STOP-separated:
+; register byte, 10 ms processing window, one-byte read. This duplicates no
+; power or expander path and writes only the read pointer.
+Procedure.i ProbeMcuRead(reg.i)
+  Define r.i
+  probe_mcu_buf[0] = reg & $FF
+  r = I2cWrite(#PROBE_MCU_ADDR, @probe_mcu_buf[0], 1)
+  probe_mcu_code = r
+  If r <> #I2C_OK
+    ProcedureReturn -1
+  EndIf
+  delay(#PROBE_MCU_READ_MS)
+  probe_mcu_buf[1] = 0
+  r = I2cRead(#PROBE_MCU_ADDR, @probe_mcu_buf[1], 1)
+  probe_mcu_code = r
+  If r <> #I2C_OK
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn probe_mcu_buf[1] & $FF
+EndProcedure
+
+Procedure.i Main()
+  Define *before
+  Define *after
+  Define *id
+
+  probe_done = 0
+  *before = @probe_regs[0]
+  *after = @probe_regs[#I2C_SNAP_WORDS]
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  I2cSnapshot(*before)
+
+  probe_mcu_size = -1
+  probe_mcu_hwid = -1
+  probe_mcu_version = -1
+  probe_mcu_size = ProbeMcuRead(#PROBE_MCU_SIZE)
+  If probe_mcu_size >= 0
+    probe_mcu_hwid = ProbeMcuRead(#PROBE_MCU_HWID)
+    If probe_mcu_hwid >= 0
+      probe_mcu_version = ProbeMcuRead(#PROBE_MCU_VERSION)
+      If probe_mcu_version >= 0
+        probe_mcu_ok = 1
+      EndIf
+    EndIf
+  EndIf
+
+  probe_goodix_addr = 0
+  If Gt9TryAddr(#GT9_ADDR_HIGH) <> 0
+    probe_goodix_addr = #GT9_ADDR_HIGH
+  Else
+    probe_goodix_code_5d = Gt9LastBusCode()
+    If Gt9TryAddr(#GT9_ADDR_LOW) <> 0
+      probe_goodix_addr = #GT9_ADDR_LOW
+    Else
+      probe_goodix_code_14 = Gt9LastBusCode()
+    EndIf
+  EndIf
+  If probe_goodix_addr <> 0
+    *id = Gt9ProdId()
+    probe_goodix_id = (PeekA(*id) & $FF) | ((PeekA(*id + 1) & $FF) << 8)
+    probe_goodix_id = probe_goodix_id | ((PeekA(*id + 2) & $FF) << 16)
+    probe_goodix_id = probe_goodix_id | ((PeekA(*id + 3) & $FF) << 24)
+    probe_goodix_firmware = Gt9Firmware()
+  EndIf
+
+  I2cSnapshot(*after)
+  ; Explicitly leave the payload's selector on the monitor's normal display
+  ; bus. I2cSelectBus changes no mux or controller register by itself.
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+
+  probe_before_c = PeekL(*before + #I2C_SNAP_C * 4)
+  probe_before_s = PeekL(*before + #I2C_SNAP_S * 4)
+  probe_before_dlen = PeekL(*before + #I2C_SNAP_DLEN * 4)
+  probe_before_a = PeekL(*before + #I2C_SNAP_A * 4)
+  probe_before_div = PeekL(*before + #I2C_SNAP_DIV * 4)
+  probe_before_del = PeekL(*before + #I2C_SNAP_DEL * 4)
+  probe_before_clkt = PeekL(*before + #I2C_SNAP_CLKT * 4)
+  probe_after_c = PeekL(*after + #I2C_SNAP_C * 4)
+  probe_after_s = PeekL(*after + #I2C_SNAP_S * 4)
+  probe_after_dlen = PeekL(*after + #I2C_SNAP_DLEN * 4)
+  probe_after_a = PeekL(*after + #I2C_SNAP_A * 4)
+  probe_after_div = PeekL(*after + #I2C_SNAP_DIV * 4)
+  probe_after_del = PeekL(*after + #I2C_SNAP_DEL * 4)
+  probe_after_clkt = PeekL(*after + #I2C_SNAP_CLKT * 4)
+  probe_done = #PROBE_DONE_MAGIC
+
+  ProbeRegs("i2c before", *before)
+  ProbeRegs("i2c after ", *after)
+  ProbePutS("mcu ok/code/size/hwid/ver=")
+  ProbeHex(probe_mcu_ok, 2) : ProbePutC(47)
+  ProbeHex(probe_mcu_code, 8) : ProbePutC(47)
+  ProbeHex(probe_mcu_size, 2) : ProbePutC(47)
+  ProbeHex(probe_mcu_hwid, 2) : ProbePutC(47)
+  ProbeHex(probe_mcu_version, 2) : ProbePutC(13) : ProbePutC(10)
+  ProbePutS("goodix addr/code5d/code14/id/fw=")
+  ProbeHex(probe_goodix_addr, 2) : ProbePutC(47)
+  ProbeHex(probe_goodix_code_5d, 8) : ProbePutC(47)
+  ProbeHex(probe_goodix_code_14, 8) : ProbePutC(47)
+  ProbeHex(probe_goodix_id, 8) : ProbePutC(47)
+  ProbeHex(probe_goodix_firmware, 4) : ProbePutC(13) : ProbePutC(10)
+  ProcedureReturn 0
+EndProcedure
