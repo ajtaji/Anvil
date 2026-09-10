@@ -1,0 +1,182 @@
+; Bounded, operator-visible multitouch diagnostic. Uses the already-running
+; HwTouch backend: no additional bring-up, reset, reprobe or pin setup occurs.
+
+#TOUCH_VISUAL_POLLS = 1500
+#TOUCH_VISUAL_MS = 20
+#TOUCH_VISUAL_MARK = 84
+
+Procedure.i TouchVisualColour(id.i)
+  Select id & 15
+    Case 0 : ProcedureReturn $00FFFF
+    Case 1 : ProcedureReturn $FF8000
+    Case 2 : ProcedureReturn $00FF00
+    Case 3 : ProcedureReturn $FF00FF
+    Case 4 : ProcedureReturn $0080FF
+    Case 5 : ProcedureReturn $00A0A0
+    Case 6 : ProcedureReturn $A000FF
+    Case 7 : ProcedureReturn $80FF00
+    Case 8 : ProcedureReturn $FF0080
+    Default : ProcedureReturn $FFFFFF
+  EndSelect
+EndProcedure
+
+Procedure TouchVisualMarker(id.i, x.i, y.i)
+  Define c.i
+  Define left.i
+  Define top.i
+  c = TouchVisualColour(id)
+  left = x - (#TOUCH_VISUAL_MARK / 2)
+  top = y - (#TOUCH_VISUAL_MARK / 2)
+  DisplayFillRect(left, top, #TOUCH_VISUAL_MARK, 5, c)
+  DisplayFillRect(left, top + #TOUCH_VISUAL_MARK - 5, #TOUCH_VISUAL_MARK, 5, c)
+  DisplayFillRect(left, top, 5, #TOUCH_VISUAL_MARK, c)
+  DisplayFillRect(left + #TOUCH_VISUAL_MARK - 5, top, 5, #TOUCH_VISUAL_MARK, c)
+  DisplayFillRect(x - 18, y - 2, 37, 5, c)
+  DisplayFillRect(x - 2, y - 18, 5, 37, c)
+  ; Put the stable tracking ID above/right of the fingertip, not underneath it.
+  left = (x + 28) / DisplayCharWidth()
+  top = (y - 36) / DisplayCharHeight()
+  If left >= DisplayCols() : left = DisplayCols() - 1 : EndIf
+  If top < 3 : top = 3 : EndIf
+  If top >= DisplayRows() : top = DisplayRows() - 1 : EndIf
+  DisplayLocate(left, top)
+  DisplayPrintHex(id & 15, 1)
+EndProcedure
+
+Procedure TouchVisualHeader(cap.i, live.i, peak.i, downs.i, moves.i, ups.i)
+  DisplayLocate(0, 0)
+  DisplayColour($FFFFFF, $101020)
+  DisplayPrint("TOUCH 10-POINT TEST  capacity ") : DisplayPrintDec(cap)
+  DisplayPrint("  live ") : DisplayPrintDec(live)
+  DisplayPrint("  peak ") : DisplayPrintDec(peak)
+  DisplayPrint("   ")
+  DisplayLocate(0, 1)
+  DisplayPrint("Place up to capacity fingers together; drag them. Any key exits.")
+  DisplayPrint("   ")
+  DisplayLocate(0, 2)
+  DisplayPrint("DOWN ") : DisplayPrintDec(downs)
+  DisplayPrint("  MOVE ") : DisplayPrintDec(moves)
+  DisplayPrint("  UP ") : DisplayPrintDec(ups)
+  DisplayPrint("          ")
+EndProcedure
+
+Procedure.i TouchVisualTest()
+  Define wasV3d.i
+  Define wasShown.i
+  Define *wasPaint
+  Define cap.i
+  Define drawCap.i
+  Define polls.i
+  Define n.i
+  Define i.i
+  Define id.i
+  Define x.i
+  Define y.i
+  Define peak.i
+  Define d0.i
+  Define m0.i
+  Define u0.i
+  Define deadline.i
+  Define failure.i
+  Define oldCox.i : Define oldCoy.i : Define oldCols.i : Define oldRows.i
+  Define oldCx.i : Define oldCy.i : Define oldFg.i : Define oldBg.i
+  Dim oldX.i[16]
+  Dim oldY.i[16]
+  Dim active.a[16]
+  Dim seen.a[16]
+  Dim ev.a[#HW_TOUCH_EVSZ]
+
+  If gScreen = 0 Or gScrSrc <> #SCR_SRC_DSI
+    PrintN("!! touch test needs the active DSI screen; nothing was drawn.")
+    ProcedureReturn 0
+  EndIf
+  If HwTouchReady() = 0
+    PrintN("!! touch test needs the already-running touch controller; no reprobe was made.")
+    ProcedureReturn 0
+  EndIf
+  cap = HwTouchMaxPoints()
+  drawCap = cap
+  If drawCap < 0 : drawCap = 0 : EndIf
+  If drawCap > 10 : drawCap = 10 : EndIf
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  wasV3d = V3dConActive()
+  CompilerEndIf
+  wasShown = gCurShown
+  *wasPaint = *gConPaint
+  oldCox = dsp_cox : oldCoy = dsp_coy : oldCols = dsp_cols : oldRows = dsp_rows
+  oldCx = dsp_cx : oldCy = dsp_cy : oldFg = dsp_fg : oldBg = dsp_bg
+  PointerHide()
+  ; Own presentation for the bounded test without changing the grid. The
+  ; network/UART cancellation pump remains live through OutBreak below, but
+  ; ScreenPump cannot overwrite the diagnostic while no renderer is bound.
+  ConNoRenderer()
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  If wasV3d <> 0
+    gV3dConOn = 0
+    gCursorGpuOwned = 0
+  EndIf
+  CompilerEndIf
+  DisplayConsoleFull()
+  DisplayColour($FFFFFF, $101020)
+  DisplayClear($101020)
+  d0 = HwTouchDowns() : m0 = HwTouchMoves() : u0 = HwTouchUps()
+  TouchVisualHeader(cap, 0, 0, 0, 0, 0)
+  deadline = Ticks() + TickHz() * 30
+
+  While polls < #TOUCH_VISUAL_POLLS And Ticks() < deadline
+    If OutBreak() <> 0 Or KeyboardChar() >= 0 : Break : EndIf
+    n = HwTouchTick()
+    If n < 0 : failure = n : Break : EndIf
+    If n > peak : peak = n : EndIf
+    For i = 0 To 15 : seen[i] = 0 : Next
+    i = 0
+    While i < n And i < drawCap
+      id = HwTouchPointId(i) & 15
+      x = HwTouchPointX(i) : y = HwTouchPointY(i)
+      seen[id] = 1
+      If active[id] <> 0
+        DisplayFillRect(x - 3, y - 3, 7, 7, TouchVisualColour(id))
+      EndIf
+      TouchVisualMarker(id, x, y)
+      oldX[id] = x : oldY[id] = y : active[id] = 1
+      i = i + 1
+    Wend
+    For i = 0 To 15
+      If active[i] <> 0 And seen[i] = 0
+        ; A released contact leaves a white outlined endpoint in its trail.
+        DisplayFillRect(oldX[i] - 16, oldY[i] - 16, 32, 2, $FFFFFF)
+        DisplayFillRect(oldX[i] - 16, oldY[i] + 14, 32, 2, $FFFFFF)
+        DisplayFillRect(oldX[i] - 16, oldY[i] - 16, 2, 32, $FFFFFF)
+        DisplayFillRect(oldX[i] + 14, oldY[i] - 16, 2, 32, $FFFFFF)
+        active[i] = 0
+      EndIf
+    Next
+    While HwTouchPoll(@ev[0]) = 1 : Wend
+    TouchVisualHeader(cap, n, peak, HwTouchDowns() - d0,
+                      HwTouchMoves() - m0, HwTouchUps() - u0)
+    delay(#TOUCH_VISUAL_MS)
+    polls = polls + 1
+  Wend
+
+  DisplayColour(oldFg, oldBg)
+  DisplayClear(oldBg)
+  DrawBanner()
+  DisplayConsole(oldCox, oldCoy, oldCols * DisplayCharWidth(),
+                 oldRows * DisplayCharHeight())
+  DisplayLocate(oldCx, oldCy)
+  ConSetRenderer(*wasPaint)
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  If wasV3d <> 0
+    gV3dConOn = 1
+    gCursorGpuOwned = 1
+  EndIf
+  CompilerEndIf
+  ConRepaint()
+  If wasShown <> 0 : PointerShow() : EndIf
+  Print("Touch test ended: capacity ") : PrintDec(cap)
+  Print(", peak ") : PrintDec(peak)
+  Print(", down ") : PrintDec(HwTouchDowns() - d0)
+  Print(", move ") : PrintDec(HwTouchMoves() - m0)
+  Print(", up ") : PrintDec(HwTouchUps() - u0) : PrintN(".")
+  ProcedureReturn failure
+EndProcedure

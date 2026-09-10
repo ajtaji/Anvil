@@ -82,6 +82,7 @@ Procedure TouchUsage()
   PrintN("  touch trace                  retained boot I2C phase records; RAM only")
   PrintN("  touch                        what answered and what was observed")
   PrintN("  touch points                 live coordinates until a key is pressed")
+  PrintN("  touch test                   visual ten-contact markers and drag trails")
   PrintN("  touch panel power            request rails/reset state from the MCU")
   PrintN("  touch panel prepare          request iovcc, avdd and panel reset")
   PrintN("  touch panel light <n>        backlight, 0 dark to 255 full, DECIMAL")
@@ -960,6 +961,7 @@ EndProcedure
 Procedure CmdTouch()
   Define which.i
   Define up.i
+  Define visualResult.i
 
   SkipSpace()
   If gLine[gPos] = 0
@@ -975,6 +977,8 @@ Procedure CmdTouch()
     which = 0
     If WordIs("points") <> 0
       which = 2
+    ElseIf WordIs("test") <> 0
+      which = 8
     ElseIf WordIs("panel") <> 0
       which = 3
     ElseIf WordIs("axes") <> 0
@@ -1000,6 +1004,27 @@ Procedure CmdTouch()
       PrintN("!! touch trace takes no arguments; nothing was changed.")
     Else
       TouchTrace()
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If which = 8
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("!! touch test takes no arguments; nothing was changed.")
+    Else
+      visualResult = TouchVisualTest()
+      If visualResult <> 0
+        Print("!! Touch input stopped (code ") : PrintDec(visualResult)
+        If visualResult = #GT9_ENODEV
+          PrintN("): no active touch controller is available.")
+        ElseIf visualResult = #GT9_EBUS
+          PrintN("): the touch input transfer failed.")
+        Else
+          PrintN("): the touch backend refused the input frame.")
+        EndIf
+        PrintN("Check the retained touch trace and touch-controller status before retrying.")
+      EndIf
     EndIf
     ProcedureReturn
   EndIf
