@@ -42,12 +42,15 @@ def probe_source() -> str:
     constants = source_range(source, "#WIFI_REC_IDLE", "#WIFI_REC_ENTROPY_MS")
     globals_ = source_range(source, "Global gWifiRecPhase", "Global Dim wifi_recPmk")
     names = (
-        "WifiRecoveryCancel", "WifiRecoveryActive", "wifi_RecoverForgetPmk",
+        "WifiRecoveryCancel", "WifiRecoveryActive", "WifiRecoveryInitialJoinFailed",
+        "wifi_RecoverForgetPmk",
         "wifi_RecoverCandidateFail", "wifi_RecoverFail",
-        "wifi_RecoverControlFail", "wifi_RecoverEventDropFail",
+        "wifi_RecoverControlFail", "wifi_RecoverSupplicantSendFail",
+        "wifi_RecoverEventDropFail",
         "wifi_RecoverTeardownOk",
         "wifi_RecoverNextCandidate", "wifi_RecoverJoinFailed",
         "wifi_RecoverHandshakeFailed", "wifi_RecoverCredentialCurrent",
+        "wifi_RecoverLeaseBound",
         "WifiRecoveryStart", "WifiRecoveryTick",
     )
     bodies = "\n\n".join(procedure(source, name) for name in names)
@@ -82,6 +85,8 @@ EnableExplicit
 #CYW43_IO_STATUS = -3
 #ENTROPY_OK = 1
 #ENTROPY_ERR_HEALTH = -2
+#DHCPC_BOUND = 3
+#NET_ADDR_LEASE = 1
 
 Global gate_ms.i = 1000
 Global gate_down.i
@@ -101,9 +106,15 @@ Global gate_joinVerdict.i
 Global gate_dropOnJoinPoll.i
 Global gate_receives.i
 Global gate_eapolCode.i
+Global gate_sendRc.i
+Global gate_sendCalls.i
 Global gate_dhcpStart.i
 Global gate_dhcpRc.i = 1
 Global gate_dhcpAcquire.i
+Global gate_dhcpState.i = #DHCPC_BOUND
+Global gate_dhcpIp.i = $01020304
+Global gate_netIp.i = $01020304
+Global gate_netSrc.i = #NET_ADDR_LEASE
 Global gate_leave.i
 Global gate_leaveRc.i
 Global gate_disassoc.i
@@ -224,7 +235,7 @@ Procedure Wpa2SupSetSnonce(p.i) : EndProcedure
 Procedure.i Cyw43Receive(ms.i) : gate_receives = gate_receives + 1 : ProcedureReturn 120 : EndProcedure
 Procedure.i Cyw43ReceivePtr() : ProcedureReturn @gateCache[0] : EndProcedure
 Procedure.i Wpa2SupHandle(p.i, n.i) : ProcedureReturn gate_eapolCode : EndProcedure
-Procedure.i wifi_SendSup() : ProcedureReturn 0 : EndProcedure
+Procedure.i wifi_SendSup() : gate_sendCalls = gate_sendCalls + 1 : ProcedureReturn gate_sendRc : EndProcedure
 Procedure.i Wpa2SupTk() : ProcedureReturn @gateCache[0] : EndProcedure
 Procedure.i Wpa2SupTkLen() : ProcedureReturn 16 : EndProcedure
 Procedure.i Wpa2SupApMac() : ProcedureReturn @wifi_apMac[0] : EndProcedure
@@ -239,6 +250,10 @@ Procedure Wpa2SupSessionArm() : EndProcedure
 Procedure wifi_PersistPmkIfDirty() : If gWifiPmkDirty : gate_settingsSave = gate_settingsSave + 1 : gWifiPmkDirty = 0 : EndIf : EndProcedure
 Procedure.i NetDhcpStart(k.i, auto.i) : gate_dhcpStart = gate_dhcpStart + 1 : ProcedureReturn gate_dhcpRc : EndProcedure
 Procedure.i NetDhcpAcquire(k.i, wait.i, keep.i) : gate_dhcpAcquire = gate_dhcpAcquire + 1 : ProcedureReturn 0 : EndProcedure
+Procedure.i DhcpClientState(k.i) : ProcedureReturn gate_dhcpState : EndProcedure
+Procedure.i DhcpClientIp(k.i) : ProcedureReturn gate_dhcpIp : EndProcedure
+Procedure.i NetIPv4(k.i) : ProcedureReturn gate_netIp : EndProcedure
+Procedure.i NetIfSrc(k.i) : ProcedureReturn gate_netSrc : EndProcedure
 
 DataSection
   wifi_rsnIe: Data.a 0
@@ -254,8 +269,9 @@ Procedure GateInit()
   gate_pbkdfPw = 0 : gate_pbkdfBegins = 0 : gate_pbkdfBeginRc = #PBKDF2_STEP_RUNNING : gate_cacheHit = 1 : gate_passwordUseAlt = 0
   gate_scanPolls = 0 : gate_scanVerdict = #CYW43_SCAN_DONE
   gate_joinPolls = 0 : gate_joinVerdict = #CYW43_JOIN_JOINED : gate_dropOnJoinPoll = 0
-  gate_receives = 0 : gate_eapolCode = #WPA2SUP_SENT_M2
+  gate_receives = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_sendRc = 0 : gate_sendCalls = 0
   gate_dhcpStart = 0 : gate_dhcpRc = 1 : gate_dhcpAcquire = 0 : gate_leave = 0 : gate_leaveRc = 0
+  gate_dhcpState = #DHCPC_BOUND : gate_dhcpIp = $01020304 : gate_netIp = $01020304 : gate_netSrc = #NET_ADDR_LEASE
   gate_disassoc = 0 : gate_disassocRc = 0 : gate_ioctlStatus = 0 : gate_secItem = 0 : gate_joinStart = 0
   gate_readSsid = 0 : gate_setKey = 0 : gate_setKeyFail = 0
   gate_settingsSave = 0 : gate_mismatch = 0 : gate_service = 0
@@ -346,9 +362,46 @@ Procedure.i Main()
   If gate_dhcpStart <> 1 Or gate_dhcpAcquire <> 0 Or gWifiRecPhase <> #WIFI_REC_DHCP_WAIT : ProcedureReturn 13 : EndIf
   WifiRecoveryTick()
   If gWifiRecPhase <> #WIFI_REC_DHCP_WAIT Or gWifiRejoins <> 0 : ProcedureReturn 14 : EndIf
-  gWifiHaveIp = 1
+  gWifiHaveIp = 1 : gWifiIp = gate_dhcpIp
   WifiRecoveryTick()
   If gWifiRecPhase <> #WIFI_REC_IDLE Or gWifiRejoins <> 1 Or gWifiHealPend <> 0 : ProcedureReturn 15 : EndIf
+
+  ; A prepared M2/M4 is not success unless the exact frame was transmitted.
+  ; Refusal preserves the send rc, does not set M1, and never advances to key
+  ; installation. It is an association/transport failure, not evidence that a
+  ; cached PMK is wrong: preserve that PMK and do not begin fresh PBKDF2.
+  GateInit() : WifiRecoveryStart(0) : GateBindCredential()
+  gWifiRecSlot = 1 : gWifiRecSsidLen = 4 : gWifiRecFp = 123
+  gWifiRecPmkCached = 1 : wifi_recPmk[0] = 77 : wifi_pmk[0] = 66
+  gWifiRecPhase = #WIFI_REC_EAPOL_RX : gWifiRecAttempt = 0 : gWifiRecM1 = 0 : gWifiRecAt = gate_ms
+  gate_eapolCode = #WPA2SUP_SENT_M2 : gate_sendRc = -4
+  WifiRecoveryTick()
+  If gate_sendCalls <> 1 : ProcedureReturn 68 : EndIf
+  If gWifiRecM1 <> 0 : ProcedureReturn 78 : EndIf
+  If gate_settingsRemove <> 0 Or gate_pbkdfBegins <> 0 : ProcedureReturn 82 : EndIf
+  If gWifiRecPmkCached = 0 Or gWifiRecFreshFallback <> 0 : ProcedureReturn 82 : EndIf
+  If wifi_recPmk[0] <> 77 Or wifi_pmk[0] <> 66 : ProcedureReturn 82 : EndIf
+  If gWifiRecPhase <> #WIFI_REC_DISASSOC : ProcedureReturn 79 : EndIf
+  If gWifiRecLastFailPhase <> #WIFI_REC_EAPOL_RX Or gWifiRecLastFailRc <> -4 : ProcedureReturn 69 : EndIf
+
+  GateInit() : WifiRecoveryStart(0) : GateBindCredential()
+  gWifiRecSlot = 1 : gWifiRecSsidLen = 4 : gWifiRecFp = 123
+  gWifiRecPmkCached = 1 : wifi_recPmk[0] = 88 : wifi_pmk[0] = 55
+  gWifiRecPhase = #WIFI_REC_EAPOL_RX : gWifiRecAttempt = 0 : gWifiRecM1 = 1 : gWifiRecAt = gate_ms
+  gate_eapolCode = #WPA2SUP_SENT_M4 : gate_sendRc = -1
+  WifiRecoveryTick()
+  If gate_settingsRemove <> 0 Or gate_pbkdfBegins <> 0 : ProcedureReturn 83 : EndIf
+  If gWifiRecPmkCached = 0 Or gWifiRecFreshFallback <> 0 : ProcedureReturn 83 : EndIf
+  If wifi_recPmk[0] <> 88 Or wifi_pmk[0] <> 55 : ProcedureReturn 83 : EndIf
+  If gate_sendCalls <> 1 Or gWifiRecPhase <> #WIFI_REC_DISASSOC Or gate_setKey <> 0 : ProcedureReturn 70 : EndIf
+  If gWifiRecLastFailPhase <> #WIFI_REC_EAPOL_RX Or gWifiRecLastFailRc <> -1 : ProcedureReturn 71 : EndIf
+
+  ; A radio that becomes unavailable does not remain armed for a pointless
+  ; association retry. Incremental radio bring-up is a separate contract.
+  GateInit() : WifiRecoveryStart(0) : gWifiUp = 0
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_IDLE Or gWifiHealPend <> 0 : ProcedureReturn 80 : EndIf
+  If gate_leave <> 0 Or gate_scanPolls <> 0 Or gate_joinStart <> 0 : ProcedureReturn 81 : EndIf
 
   ; Explicit cancellation invalidates the generation and no old phase runs.
   WifiRecoveryStart(0) : generation = gWifiRecGeneration : before = gate_leave
@@ -562,6 +615,31 @@ Procedure.i Main()
   WifiRecoveryTick()
   If gWifiRecPhase <> #WIFI_REC_IDLE Or gWifiRejoins <> 0 Or gWifiKeyed <> 0 Or gWifiHaveIp <> 0 : ProcedureReturn 59 : EndIf
 
+  ; The compatibility address flag alone cannot complete recovery. Require a
+  ; BOUND common client, lease provenance and one exact nonzero IP in the
+  ; client, interface row and Wi-Fi compatibility state.
+  GateInit() : WifiRecoveryStart(0) : GateBindCredential()
+  gWifiRecSlot = 1 : gWifiRecSsidLen = 4 : gWifiRecFp = 123
+  gWifiRecPhase = #WIFI_REC_DHCP_WAIT : gWifiRecEventDropBase = 0 : gWifiHaveIp = 1
+  gate_dhcpState = 2
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_DHCP_WAIT Or gWifiRejoins <> 0 : ProcedureReturn 72 : EndIf
+  gate_dhcpState = #DHCPC_BOUND : gate_netSrc = 2
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_DHCP_WAIT : ProcedureReturn 73 : EndIf
+  gate_netSrc = #NET_ADDR_LEASE : gate_dhcpIp = 0
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_DHCP_WAIT : ProcedureReturn 74 : EndIf
+  gate_dhcpIp = $01020304 : gate_netIp = $05060708
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_DHCP_WAIT : ProcedureReturn 75 : EndIf
+  gate_netIp = gate_dhcpIp : gWifiIp = $05060708
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_DHCP_WAIT : ProcedureReturn 76 : EndIf
+  gWifiIp = gate_dhcpIp
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_IDLE Or gWifiRejoins <> 1 : ProcedureReturn 77 : EndIf
+
   ; DHCP start is a checked interface/listener boundary. Both no-usable-link
   ; and same-interface server conflict fail the candidate without entering an
   ; invented timeout or a false WAIT state.
@@ -590,7 +668,7 @@ Procedure.i Main()
       If gWifiRecM1 = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : Else : gate_eapolCode = #WPA2SUP_SENT_M4 : EndIf
     EndIf
     If gWifiRecPhase = #WIFI_REC_DHCP_WAIT
-      If waitedDhcp <> 0 : gWifiHaveIp = 1 : EndIf
+      If waitedDhcp <> 0 : gWifiHaveIp = 1 : gWifiIp = gate_dhcpIp : EndIf
       waitedDhcp = 1
     EndIf
     before = gate_leave + gate_secItem + gate_scanPolls + gate_disassoc
@@ -621,7 +699,7 @@ def build(pmfc: Path, work: Path, probe: Path) -> Path:
     staged = work / pmfc.name
     shutil.copy2(pmfc, staged)
     if (ROOT / "Boards").is_dir():
-        shutil.copytree(ROOT / "Boards", work / "Boards")
+        shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
     image = work / "wifi_recovery_gate.img"
     command = [str(staged), str(probe), "-t", "pi4",
                "--load-addr", hex(emitted.LOAD), "--stack-addr", hex(emitted.STACK),
@@ -646,13 +724,34 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-wifi-recovery-emitted-") as temporary:
         work = Path(temporary)
         probe = work / "wifi_recovery_gate.pi4"
-        probe.write_text(probe_source(), encoding="utf-8", newline="\n")
+        exact_source = probe_source()
+        probe.write_text(exact_source, encoding="utf-8", newline="\n")
         image = build(pmfc, work, probe)
         result, steps = emitted.execute(a64, image)
+        if result == 0:
+            helper = procedure(exact_source, "wifi_RecoverSupplicantSendFail")
+            wrong_owner = helper.replace(
+                "  wifi_RecoverJoinFailed()", "  wifi_RecoverHandshakeFailed()", 1
+            )
+            if wrong_owner == helper:
+                raise SystemExit("wifi recovery gate: cached-PMK owner mutation site not found")
+            mutated = exact_source.replace(helper, wrong_owner, 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            mutant_image = build(pmfc, work, probe)
+            mutant_result, _ = emitted.execute(a64, mutant_image)
+            if mutant_result != 82:
+                print(
+                    "wifi_recovery_emitted_check: FAIL wrong-owner mutant returned "
+                    f"{mutant_result}, expected 82"
+                )
+                return 1
     if result:
         print(f"wifi_recovery_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"wifi_recovery_emitted_check: PASS - 67 assertions, {steps:,} A64 instructions")
+    print(
+        "wifi_recovery_emitted_check: PASS - 83 assertions, "
+        f"{steps:,} A64 instructions; cached-PMK wrong-owner mutant fails assertion 82"
+    )
     return 0
 
 

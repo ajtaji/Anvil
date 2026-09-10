@@ -204,6 +204,11 @@ Procedure BootNetUp()
   Else
     PrintN("Wi-Fi did not join any saved network. The radio/firmware diagnostics above")
     PrintN("name the failed stage; wired Ethernet remains available for recovery.")
+    ; A ready radio gets one slow cooperative first-connection generation at
+    ; the ordinary recovery cadence. A failed radio bring-up is reported but
+    ; is not synchronously reloaded from the prompt; that requires a separate
+    ; incremental radio-initialization contract.
+    WifiRecoveryInitialJoinFailed()
     ScreenServiceTick()
   EndIf
   gBootLog = 0

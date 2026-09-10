@@ -1938,6 +1938,31 @@ Procedure wifi_RecordLinkDown()
   gWifiKaLast = 0
 EndProcedure
 
+; A failed foreground join at boot is not a link-loss event, but it has the
+; same eventual-connect obligation when the radio/firmware is already ready.
+; Arm exactly the existing slow cooperative cadence: do not rerun the blocking
+; foreground join here and do not invent a second retry machine. A radio that
+; never reached gWifiUp needs a separately designed incremental bring-up
+; contract; repeatedly calling the synchronous blob/firmware path from the
+; prompt would make wired service unreliable, so that case is reported and
+; deliberately left unarmed.
+Procedure WifiRecoveryInitialJoinFailed()
+  wifi_RecordLinkDown()
+  If gWifiUp = 0
+    PrintN("Wi-Fi: automatic association retry is unavailable because radio bring-up did not finish.")
+    PrintN("       Wired Ethernet remains available; retrying radio initialization needs a separate bounded service.")
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0
+    PrintN("Wi-Fi: the radio is ready, but automatic connection policy is OFF; the failed boot join is left down.")
+    ProcedureReturn
+  EndIf
+  gWifiHealPend = 1
+  gWifiHealLast = millis()
+  gWifiKaLast = 0
+  PrintN("Wi-Fi: the radio is ready; the failed boot join will be retried cooperatively.")
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  WifiRejoin - re-associate and re-lease after the link was lost.
 ;
@@ -2162,6 +2187,22 @@ Procedure wifi_RecoverControlFail(phase.i, rc.i)
   wifi_RecoverCandidateFail()
 EndProcedure
 
+; Wpa2SupHandle has prepared an exact M2/M4 frame, but preparation is not
+; transmission. wifi_SendSup returns -1 when no frame/buffer is available and
+; otherwise returns Cyw43Send's exact transport result (0 success, negative
+; refusal/error). Never promote either M2 or M4 past this boundary on failure.
+; A transport refusal did not test the PMK, so it owns an association retry,
+; not the cached-key rejection/fresh-derivation transition.
+Procedure wifi_RecoverSupplicantSendFail(rc.i)
+  gWifiRecLastFailPhase = #WIFI_REC_EAPOL_RX
+  gWifiRecLastFailRc = rc
+  gWifiRecLastFailStatus = 0
+  Print("Wi-Fi: recovery handshake frame was not transmitted (driver rc ")
+  PrintDec(rc)
+  PrintN("). The candidate will be retried.")
+  wifi_RecoverJoinFailed()
+EndProcedure
+
 Procedure wifi_RecoverEventDropFail()
   gWifiRecLastFailPhase = gWifiRecPhase
   gWifiRecLastFailRc = Cyw43EventsDropped() - gWifiRecEventDropBase
@@ -2274,6 +2315,27 @@ Procedure.i wifi_RecoverCredentialCurrent()
   ProcedureReturn 1
 EndProcedure
 
+; Completion belongs to the common per-interface DHCP client, not to the
+; compatibility gWifiHaveIp flag alone. All four views must name the same
+; nonzero leased address before recovery may announce or count success.
+Procedure.i wifi_RecoverLeaseBound()
+  Define ip.i
+  If gWifiHaveIp = 0
+    ProcedureReturn 0
+  EndIf
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_BOUND
+    ProcedureReturn 0
+  EndIf
+  If NetIfSrc(#HW_LINK_WIFI) <> #NET_ADDR_LEASE
+    ProcedureReturn 0
+  EndIf
+  ip = DhcpClientIp(#HW_LINK_WIFI)
+  If ip = 0 Or NetIPv4(#HW_LINK_WIFI) <> ip Or gWifiIp <> ip
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure WifiRecoveryStart(announce.i)
   WifiRecoveryCancel()
   wifi_RecordLinkDown()
@@ -2323,7 +2385,11 @@ Procedure WifiRecoveryTick()
     ProcedureReturn
   EndIf
   If gWifiUp = 0
-    wifi_RecoverFail()
+    ; A permanently unready radio is not an association candidate. Cancel the
+    ; generation and leave it unarmed rather than waking once a minute only to
+    ; rediscover that firmware initialization never completed.
+    WifiRecoveryCancel()
+    WifiRecoveryInitialJoinFailed()
     ProcedureReturn
   EndIf
   ; JoinStart clears the ring but not its cumulative overflow counter. A
@@ -2632,12 +2698,20 @@ Procedure WifiRecoveryTick()
       If n >= 14
         code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
         If code = #WPA2SUP_SENT_M2
-          wifi_SendSup()
-          gWifiRecM1 = 1
-          gWifiRecAt = millis()
+          r = wifi_SendSup()
+          If r = 0
+            gWifiRecM1 = 1
+            gWifiRecAt = millis()
+          Else
+            wifi_RecoverSupplicantSendFail(r)
+          EndIf
         ElseIf code = #WPA2SUP_SENT_M4
-          wifi_SendSup()
-          gWifiRecPhase = #WIFI_REC_PTK_INSTALL
+          r = wifi_SendSup()
+          If r = 0
+            gWifiRecPhase = #WIFI_REC_PTK_INSTALL
+          Else
+            wifi_RecoverSupplicantSendFail(r)
+          EndIf
         ElseIf code < 0
           wifi_RecoverHandshakeFailed()
         EndIf
@@ -2715,7 +2789,7 @@ Procedure WifiRecoveryTick()
     Case #WIFI_REC_DHCP_WAIT
       ; NetDhcpTick, immediately after this service in parse.pbi, owns every
       ; retransmission and lease transition. Do not create a second timer.
-      If gWifiHaveIp <> 0
+      If wifi_RecoverLeaseBound() <> 0
         gWifiRecPhase = #WIFI_REC_IDLE
         gWifiHealPend = 0
         gWifiRejoins = gWifiRejoins + 1
@@ -2847,7 +2921,7 @@ Procedure WifiLinkTick()
     ; attempt strands the board. The new phase generation starts silently
     ; here; its final success/failure owns any narration.
     If gWifiHealPend <> 0 And gWifiHealOn <> 0
-      If (millis() - gWifiHealLast) >= #WIFI_HEAL_MS
+      If ((millis() - gWifiHealLast) & $FFFFFFFF) >= #WIFI_HEAL_MS
         gWifiHealLast = millis()
         WifiRecoveryStart(0)
       EndIf

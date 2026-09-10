@@ -24,6 +24,7 @@ import tcp_multiif_emitted_check as emitted
 ROOT = Path(__file__).resolve().parents[1]
 WIFI = ROOT / "RaspberryPi4" / "Lib" / "wifi.pi4"
 CYW43 = ROOT / "RaspberryPi4" / "Lib" / "cyw43.pi4"
+BOOT = ROOT / "RaspberryPi4" / "Board" / "boot.pi4"
 
 
 def procedure(source: str, name: str) -> str:
@@ -41,7 +42,8 @@ def procedure(source: str, name: str) -> str:
 def probe_source() -> str:
     source = WIFI.read_text(encoding="utf-8")
     cyw_source = CYW43.read_text(encoding="utf-8")
-    wifi_names = ("WifiDrainEvents", "WifiRadioPump", "wifi_RecordLinkDown", "WifiLinkTick")
+    wifi_names = ("WifiDrainEvents", "WifiRadioPump", "wifi_RecordLinkDown",
+                  "WifiRecoveryInitialJoinFailed", "WifiLinkTick")
     cyw_names = ("cyw43_EvrPush", "cyw43_EvrPop", "cyw43_EvrClear", "cyw43_JoinClassify", "Cyw43JoinPoll")
     wifi_bodies = "\n\n".join(procedure(source, name) for name in wifi_names)
     cyw_bodies = "\n\n".join(procedure(cyw_source, name) for name in cyw_names)
@@ -74,10 +76,12 @@ Global gate_assocCalls.i
 Global gate_keepalive.i
 Global gate_recActive.i
 Global gate_recTicks.i
+Global gate_recCancels.i
 Global gate_joinVerdict.i
 Global gate_pollEvents.i
 
 Global gWifiLinkOn.i
+Global gWifiUp.i
 Global gWifiKeyed.i
 Global gWifiHaveIp.i
 Global gWifiSecDone.i
@@ -147,7 +151,7 @@ Procedure PrintDec(v.i) : EndProcedure
 Procedure PutIp(v.i) : EndProcedure
 Procedure.i WifiRejoin(announce.i) : gate_rejoins = gate_rejoins + 1 : ProcedureReturn 1 : EndProcedure
 Procedure WifiRecoveryStart(announce.i) : gate_rejoins = gate_rejoins + 1 : gate_recActive = 1 : wifi_RecordLinkDown() : EndProcedure
-Procedure WifiRecoveryCancel() : gate_recActive = 0 : gWifiRecPhase = #WIFI_REC_IDLE : EndProcedure
+Procedure WifiRecoveryCancel() : gate_recCancels = gate_recCancels + 1 : gate_recActive = 0 : gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF : EndProcedure
 Procedure.i WifiRecoveryActive() : ProcedureReturn gate_recActive : EndProcedure
 Procedure WifiRecoveryTick()
   gate_recTicks = gate_recTicks + 1
@@ -178,9 +182,9 @@ Procedure GateReset()
   gate_pumps = 0 : gate_linkDown = 0 : gate_rejoins = 0
   gate_dhcpStarts = 0 : gate_assocCalls = 0 : gate_assoc = 1
   gate_keepalive = 0 : gate_ms = 100000
-  gate_recActive = 0 : gate_recTicks = 0 : gate_joinVerdict = #CYW43_JOIN_RUNNING
+  gate_recActive = 0 : gate_recTicks = 0 : gate_recCancels = 0 : gate_joinVerdict = #CYW43_JOIN_RUNNING
   gate_pollEvents = 0 : gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = 7
-  gWifiLinkOn = 1 : gWifiKeyed = 1 : gWifiHaveIp = 1
+  gWifiLinkOn = 1 : gWifiUp = 1 : gWifiKeyed = 1 : gWifiHaveIp = 1
   gWifiSecDone = 1 : gWifiBadReads = 0 : gWifiTeardown = 0
   gWifiVerify = 0 : gWifiHealPend = 0 : gWifiHealLast = 0
   gWifiKaProbes = 0 : gWifiKaLast = gate_ms
@@ -276,12 +280,53 @@ Procedure.i Main()
   WifiLinkTick()
   If gate_recActive <> 0 Or gate_recTicks <> 0 : ProcedureReturn 14 : EndIf
 
+  ; Heal-off also cancels an already-owned pre-DHCP generation before it can
+  ; consume another join event. Radio service continues, but the cancelled
+  ; generation is invalidated and recovery does not advance.
+  GateReset()
+  gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_JOIN_POLL : gWifiHealOn = 0
+  WifiLinkTick()
+  If gate_recActive <> 0 Or gate_recTicks <> 0 Or gate_recCancels <> 1 : ProcedureReturn 24 : EndIf
+  If gWifiRecGeneration <> 8 Or gate_pumps <> 1 : ProcedureReturn 25 : EndIf
+
   ; DHCP_WAIT is deliberately past the event/handshake ownership boundary:
   ; normal packet pumping resumes before the recovery observes the lease.
   GateReset()
   gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_DHCP_WAIT
   WifiLinkTick()
   If gate_pumps <> 1 Or gate_recTicks <> 1 : ProcedureReturn 15 : EndIf
+
+  ; A failed first boot join with a ready radio arms the same slow cooperative
+  ; cadence. It performs no immediate scan/join and does not claim a lost
+  ; association. One tick before the deadline is inert; the deadline starts
+  ; exactly one recovery generation while wired service remains schedulable.
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gate_ms = 5000
+  WifiRecoveryInitialJoinFailed()
+  If gWifiHealPend = 0 Or gWifiHealLast <> 5000 Or gate_rejoins <> 0 : ProcedureReturn 16 : EndIf
+  gate_ms = 5000 + #WIFI_HEAL_MS - 1 : WifiLinkTick()
+  If gate_rejoins <> 0 Or gate_recActive <> 0 : ProcedureReturn 17 : EndIf
+  gate_ms = 5000 + #WIFI_HEAL_MS : WifiLinkTick()
+  If gate_rejoins <> 1 Or gate_recActive = 0 : ProcedureReturn 18 : EndIf
+
+  ; A radio-firmware bring-up failure is explicit and does not turn each
+  ; prompt spin into another synchronous blob/init attempt. Policy-off likewise
+  ; leaves the failed initial join down without arming a hidden retry.
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiUp = 0
+  WifiRecoveryInitialJoinFailed()
+  If gWifiHealPend <> 0 Or gate_rejoins <> 0 Or gate_linkDown <> 1 : ProcedureReturn 19 : EndIf
+  gate_ms = gate_ms + #WIFI_HEAL_MS : WifiLinkTick()
+  If gate_rejoins <> 0 Or gate_recActive <> 0 : ProcedureReturn 20 : EndIf
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiHealOn = 0
+  WifiRecoveryInitialJoinFailed()
+  If gWifiHealPend <> 0 Or gate_rejoins <> 0 : ProcedureReturn 21 : EndIf
+
+  ; The 32-bit millisecond clock may wrap between scheduling and retry.
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gate_ms = $FFFFFF00
+  WifiRecoveryInitialJoinFailed()
+  gate_ms = $00000100 : WifiLinkTick()
+  If gate_rejoins <> 0 : ProcedureReturn 22 : EndIf
+  gate_ms = ($FFFFFF00 + #WIFI_HEAL_MS) & $FFFFFFFF : WifiLinkTick()
+  If gate_rejoins <> 1 Or gate_recActive = 0 : ProcedureReturn 23 : EndIf
 
   ProcedureReturn 0
 EndProcedure
@@ -322,6 +367,22 @@ def main() -> int:
     pmfc = emitted.required_path(args.pmfc, "PMFC")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
+    boot_source = BOOT.read_text(encoding="utf-8")
+    boot_body = procedure(boot_source, "BootNetUp")
+    failure_branch = re.compile(
+        r'Else\s+'
+        r'PrintN\("Wi-Fi did not join any saved network\. The radio/firmware diagnostics above"\)\s+'
+        r'PrintN\("name the failed stage; wired Ethernet remains available for recovery\."\)'
+        r'.*?WifiRecoveryInitialJoinFailed\(\)\s+'
+        r'ScreenServiceTick\(\)\s+'
+        r'EndIf\s+gBootLog = 0',
+        re.DOTALL,
+    )
+    if failure_branch.search(boot_body) is None:
+        raise SystemExit("wifi link policy gate: BootNetUp initial-failure recovery hook is missing")
+    boot_mutant = boot_body.replace("    WifiRecoveryInitialJoinFailed()", "    ; owner hook removed", 1)
+    if failure_branch.search(boot_mutant) is not None:
+        raise SystemExit("wifi link policy gate: BootNetUp failure-branch negative control survived")
     with tempfile.TemporaryDirectory(prefix="anvil-wifi-link-policy-emitted-") as temporary:
         work = Path(temporary)
         probe = work / "wifi_link_policy_gate.pi4"
@@ -343,7 +404,10 @@ def main() -> int:
     if result:
         print(f"wifi_link_policy_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"wifi_link_policy_emitted_check: PASS - 15 assertions, {steps:,} A64 instructions; old pump-first ordering fails assertion 8")
+    print(
+        f"wifi_link_policy_emitted_check: PASS - 25 assertions, {steps:,} A64 instructions; "
+        "old pump-first ordering fails assertion 8; BootNetUp failure-hook mutant rejected"
+    )
     return 0
 
 
