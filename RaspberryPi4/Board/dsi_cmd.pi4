@@ -31,12 +31,12 @@
 ;
 ;  ---- WHY `mmio` EXISTS ----------------------------------------------
 ;
-;  `memory` reads BYTES - its own help says so - and the peripheral
-;  blocks on this part do not answer sub-word reads with register
-;  content. They answer with a block-identity string. So `memory.l` over
-;  MMIO returns something that looks exactly like a plausible register
-;  dump and is not one: on 2026-09-06 it read GPFSEL4 as the ASCII
-;  "gpio" while `gpio status 44` read ALT1 out of the same register.
+;  `memory` defaults to byte reads, and the peripheral blocks on this
+;  part do not answer sub-word reads with register content. They answer
+;  with a block-identity string. On 2026-09-06 the old byte-assembled
+;  `memory.l` read GPFSEL4 as the ASCII "gpio" while `gpio status 44`
+;  read ALT1 out of the same register. `memory.l` now issues true 32-bit
+;  accesses; bare `memory` and `memory.b` deliberately remain byte reads.
 ;
 ;  `mmio` is one 32-bit load, which is what a peripheral register wants.
 ;  It reads and never writes: a monitor command that can write any word
@@ -652,10 +652,49 @@ Procedure DsiPipe()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  DsiRegs - the whole DSI1 block, one word at a time, through a real
-;  32-bit load. Offsets past $8C are not printed: they are not claimed
-;  registers and they all answer with the identity string, so printing
-;  them would fill a screen with a number that means nothing.
+;  DsiDiagRegReadable - the status-safe DSI1 register allowlist.
+;
+;  A register block is not an array of ordinary memory. In particular,
+;  RXPKT_FIFO at $24 consumes reply data when read, and the packet/FIFO
+;  write paths are not status registers. Reserved holes are not evidence
+;  either. The Raspberry Pi Linux VC4 driver's dsi1_regs debugfs list is
+;  the primary cross-check for the readable status/configuration set:
+;  https://github.com/raspberrypi/linux/blob/0ac97ba3443f519b61bbc96079736cd8b881ea22/drivers/gpu/drm/vc4/vc4_dsi.c
+;  Its RXPKT1 description also says long response data is in RXPKT_FIFO.
+;  This is a list of register facts, not copied driver code.
+; ----------------------------------------------------------------------
+Procedure.i DsiDiagRegReadable(off.i)
+  Select off
+    Case #DSI1_CTRL_OFF              : ProcedureReturn 1
+    Case #DSI1_DISP0_CTRL_OFF        : ProcedureReturn 1
+    Case #DSI1_DISP1_CTRL_OFF        : ProcedureReturn 1
+    Case #DSI1_INT_STAT_OFF          : ProcedureReturn 1
+    Case #DSI1_INT_EN_OFF            : ProcedureReturn 1
+    Case #DSI1_STAT_OFF              : ProcedureReturn 1
+    Case #DSI1_HSTX_TO_CNT_OFF       : ProcedureReturn 1
+    Case #DSI1_LPRX_TO_CNT_OFF       : ProcedureReturn 1
+    Case #DSI1_TA_TO_CNT_OFF         : ProcedureReturn 1
+    Case #DSI1_PR_TO_CNT_OFF         : ProcedureReturn 1
+    Case #DSI1_PHYC_OFF              : ProcedureReturn 1
+    Case #DSI1_HS_CLT0_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_CLT1_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_CLT2_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT3_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT4_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT5_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT6_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT7_OFF           : ProcedureReturn 1
+    Case #DSI1_PHY_AFEC0_OFF         : ProcedureReturn 1
+    Case #DSI1_PHY_AFEC1_OFF         : ProcedureReturn 1
+    Case #DSI1_ID_OFF                : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiRegs - the DSI1 status-safe register set, one word at a time,
+;  through a real 32-bit load. Every other word through $8C is named as
+;  skipped rather than read or silently printed as a fabricated zero.
 ; ----------------------------------------------------------------------
 Procedure DsiRegs()
   Define o.i
@@ -665,7 +704,11 @@ Procedure DsiRegs()
     Print("FE7000")
     PutHex2(o)
     Print("  ")
-    PutHex8(DsiRd(o))
+    If DsiDiagRegReadable(o) <> 0
+      PutHex8(DsiRd(o))
+    Else
+      Print("<skipped: not a status-safe register read>")
+    EndIf
     PrintNl()
     o = o + 4
   Wend
@@ -844,33 +887,8 @@ Procedure DsiUlps()
   EndIf
 EndProcedure
 
-Procedure DsiPokeCmd()
-  Define off.i
-  Define v.i
+Procedure DsiPokeCmd(off.i, v.i)
   Define was.i
-
-  SkipSpace()
-  off = ParseHex()
-  If gParseOk = 0
-    PrintN("!! dsi poke needs an offset and a value, both hex:")
-    PrintN("   dsi poke 70 DB6C0377")
-    PrintN("   The offset is inside the DSI1 block, 0 to 8C, a multiple of four.")
-    ProcedureReturn
-  EndIf
-
-  SkipSpace()
-  v = ParseHex()
-  If gParseOk = 0
-    PrintN("!! dsi poke needs a value as well as an offset. Nothing was written.")
-    ProcedureReturn
-  EndIf
-
-  If off < 0 Or off > $8C Or (off & 3) <> 0
-    PrintN("!! That offset is outside the DSI1 register block or is not a")
-    PrintN("   multiple of four. Past 8C there are no registers, only the")
-    PrintN("   identity string. Nothing was written.")
-    ProcedureReturn
-  EndIf
 
   was = DsiRd(off)
   DsiPoke(off, v)
@@ -961,16 +979,17 @@ EndProcedure
 ; it; this file PRINTS it.
 
 ; ----------------------------------------------------------------------
-;  THE BOOT SNAPSHOT
+;  THE FIRST-COMMAND SNAPSHOT (historically called the boot snapshot)
 ;
 ;  WHAT IT IS FOR. The question this campaign is now asking is what the
 ;  FIRMWARE leaves behind, and by the time `dsi host` has run the answer
 ;  is buried under twenty of our own writes. `dsi snapshot` after that
 ;  reads back our own arithmetic and proves nothing about the firmware.
 ;
-;  IT IS TAKEN ON THE FIRST `dsi` COMMAND OF A SESSION, AT THE TOP OF THE
-;  DISPATCHER, BEFORE THAT COMMAND RUNS - and NOT from Main. That is a
-;  correction, and it cost a board.
+;  IT IS TAKEN ON THE FIRST VALID `dsi` COMMAND OF A SESSION, AFTER THE
+;  command and its arguments have parsed but before that command runs -
+;  and NOT from Main. A typo must not touch hardware. That is a correction,
+;  and the earlier boot-time placement cost a board.
 ;
 ;  The first version of this ran from Main() before the banner, on the
 ;  argument that only that instant is truly the firmware's. The board
@@ -996,6 +1015,7 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Global dsi_snapTaken.i = 0
 Global Dim dsi_snapReg.i[36]     ; DSI1 $00..$8C, 36 words
+Global Dim dsi_snapRegValid.i[36] ; 1 only when that word was actually read
 Global dsi_snapCmPlld.i     = 0
 Global dsi_snapCmLock.i     = 0
 Global dsi_snapCmDsi1Ectl.i = 0
@@ -1016,18 +1036,18 @@ Global dsi_snapDomArm.i     = -1
 ; ----------------------------------------------------------------------
 ;  dsi_SnapDomain - ONE read-only GET_DOMAIN_STATE, no printing.
 ;
-;  Used by the boot snapshot, which has no console yet worth talking to
-;  and must not print anything into the middle of the banner. Returns the
-;  reply's state word, or -1 if the transaction did not complete. -1 and
-;  not 0, because 0 is a good answer meaning "off".
+;  Used by the command-time snapshot and deliberately has no printing of
+;  its own, so the snapshot remains one coherent report when shown later.
+;  Returns the reply's state word, or -1 if the transaction did not
+;  complete. -1 and not 0, because 0 is a good answer meaning "off".
 ; ----------------------------------------------------------------------
 Procedure.i dsi_SnapDomain(id.i)
   ProcedureReturn DsiDomainGet(id)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  DsiSnapshotTake - taken once, from the top of CmdDsi, before the
-;  subcommand that triggered it runs. Later calls do nothing.
+;  DsiSnapshotTake - taken once, after a valid command has parsed and
+;  before the subcommand that triggered it runs. Later calls do nothing.
 ; ----------------------------------------------------------------------
 Procedure DsiSnapshotTake()
   Define i.i
@@ -1038,7 +1058,12 @@ Procedure DsiSnapshotTake()
 
   i = 0
   While i < 36
-    dsi_snapReg[i] = PeekN(#DSI1_BASE + i * 4) & $FFFFFFFF
+    If DsiDiagRegReadable(i * 4) <> 0
+      dsi_snapReg[i] = PeekN(#DSI1_BASE + i * 4) & $FFFFFFFF
+      dsi_snapRegValid[i] = 1
+    Else
+      dsi_snapRegValid[i] = 0
+    EndIf
     i = i + 1
   Wend
 
@@ -1093,13 +1118,13 @@ Procedure DsiSnapshotShow()
     ProcedureReturn
   EndIf
 
-  PrintN("What the FIRMWARE left behind, captured at the first dsi command of this")
-  PrintN("session and before it ran. Nothing in the boot path writes a DSI1")
-  PrintN("register, so this is the firmware's state with none of our arithmetic")
-  PrintN("on top of it.")
+  PrintN("Captured before the first valid hardware dsi command of this session.")
+  PrintN("This is a command-time snapshot, not a boot-time measurement. Earlier")
+  PrintN("firmware and monitor initialization may already have changed clocks,")
+  PrintN("GPIO or power state; skipped registers were deliberately not read.")
   PrintNl()
 
-  PrintN("---- the DSI1 block at boot, FE700000 .. FE70008C -----------------")
+  PrintN("---- captured DSI1 state, FE700000 .. FE70008C --------------------")
   i = 0
   While i < 36
     If OutBreak() <> 0
@@ -1108,7 +1133,11 @@ Procedure DsiSnapshotShow()
     Print("  FE7000")
     PutHex2(i * 4)
     Print("  ")
-    PutHex8(dsi_snapReg[i])
+    If dsi_snapRegValid[i] <> 0
+      PutHex8(dsi_snapReg[i])
+    Else
+      Print("<skipped: not a status-safe register read>")
+    EndIf
     PrintNl()
     i = i + 1
   Wend
@@ -1119,7 +1148,7 @@ Procedure DsiSnapshotShow()
   PrintN("  at 4C, PHY_AFEC0 at 70 and STAT at 38.")
   PrintNl()
 
-  PrintN("---- the DSI1 clocks at boot -------------------------------------")
+  PrintN("---- captured DSI1 clocks ----------------------------------------")
   Print("  CM_LOCK      ")
   PutHex8(dsi_snapCmLock)
   PrintNl()
@@ -1144,16 +1173,16 @@ Procedure DsiSnapshotShow()
   PrintNl()
   PrintNl()
 
-  Print("---- GPFSEL4 at boot: ")
+  Print("---- captured GPFSEL4: ")
   PutHex8(dsi_snapGpfsel4)
   PrintNl()
   PrintN("  GPIO 44 and 45 are the display connector's I2C pair and they are")
   PrintN("  ALT1 for BSC0. Their function fields are bits 14:12 and 17:15, and")
-  PrintN("  ALT1 is 5. Plain input is 0, which is what a firmware that never")
-  PrintN("  went looking for a panel leaves behind.")
+  PrintN("  ALT1 is 5 and plain input is 0. This is the observed mux state;")
+  PrintN("  it does not identify which firmware or driver last configured it.")
   PrintNl()
 
-  PrintN("---- the power domains at boot, before anything was set -----------")
+  PrintN("---- captured power-domain state --------------------------------")
   Print("  DSI1, firmware domain 19: ")
   dsi_SayDomain(dsi_snapDomDsi1)
   Print("  DSI0, firmware domain 18: ")
@@ -1425,23 +1454,12 @@ EndProcedure
 Procedure CmdDsi()
   Define which.i
   Define fb.i
-
-  ; THE FIRMWARE SNAPSHOT, BEFORE THE SUBCOMMAND AND ONLY ONCE.
-  ;
-  ; Nothing in this monitor writes a DSI1 register except this file and
-  ; the host library it drives, and both are reached only from here. So
-  ; the first time `dsi` is typed in a session, the block still holds
-  ; whatever the firmware left it holding, and that is the last honest
-  ; moment to record it. Every later call returns immediately.
-  ;
-  ; It is here rather than in Main deliberately. See the long note above
-  ; DsiSnapshotTake: the version that ran at boot took a board off the
-  ; air, and a diagnostic that can only be undone by pulling the card is
-  ; the wrong shape whatever it measures.
-  DsiSnapshotTake()
+  Define pokeOff.i
+  Define pokeV.i
 
   SkipSpace()
   If gLine[gPos] = 0
+    DsiSnapshotTake()
     DsiStatus()
     ProcedureReturn
   EndIf
@@ -1493,6 +1511,13 @@ Procedure CmdDsi()
     ProcedureReturn
   EndIf
 
+  ; Help is known syntax but not a hardware command. It must remain safe
+  ; on a machine whose DSI block cannot answer at all.
+  If which = 11
+    DsiUsage()
+    ProcedureReturn
+  EndIf
+
   ; The two that take an address share the parse, so there is one place
   ; a default can be wrong.
   fb = #DSI_FB_DEFAULT
@@ -1505,7 +1530,38 @@ Procedure CmdDsi()
         ProcedureReturn
       EndIf
     EndIf
+  ElseIf which = 13
+    SkipSpace()
+    pokeOff = ParseHex()
+    If gParseOk = 0
+      PrintN("!! dsi poke needs an offset and a value, both hex:")
+      PrintN("   dsi poke 70 DB6C0377")
+      PrintN("   The offset is inside the DSI1 block, 0 to 8C, a multiple of four.")
+      ProcedureReturn
+    EndIf
+    SkipSpace()
+    pokeV = ParseHex()
+    If gParseOk = 0
+      PrintN("!! dsi poke needs a value as well as an offset. Nothing was written.")
+      ProcedureReturn
+    EndIf
+    If pokeOff < 0 Or pokeOff > $8C Or (pokeOff & 3) <> 0
+      PrintN("!! That offset is outside the DSI1 register block or is not a")
+      PrintN("   multiple of four. Past 8C there are no registers, only the")
+      PrintN("   identity string. Nothing was written.")
+      ProcedureReturn
+    EndIf
   EndIf
+
+  ; THE FIRMWARE SNAPSHOT, BEFORE A VALID SUBCOMMAND AND ONLY ONCE.
+  ;
+  ; Capture the state before this command acts, not a claimed pristine
+  ; firmware/boot state: startup drivers can already have changed related
+  ; clocks, power and GPIO. Parsing, including the optional framebuffer
+  ; address, happens first so a typo or malformed command touches nothing.
+  ; It remains here rather than in Main for the recovery reason above
+  ; DsiSnapshotTake.
+  DsiSnapshotTake()
 
   If which = 1
     DsiClocks()
@@ -1530,7 +1586,7 @@ Procedure CmdDsi()
   ElseIf which = 12
     DsiRails()
   ElseIf which = 13
-    DsiPokeCmd()
+    DsiPokeCmd(pokeOff, pokeV)
   ElseIf which = 14
     DsiUlps()
   ElseIf which = 15
