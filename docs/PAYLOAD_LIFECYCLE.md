@@ -103,7 +103,7 @@ return value.
 That gate cannot prove MMIO, PHY negotiation, DMA idle, UDP delivery or a
 watchdog on real silicon. The smallest attended board proof is:
 
-1. record `net`, `net dhcp`, `wifi`, and GENET counters;
+1. record `net` (including its DHCP state), `wifi`, and GENET counters;
 2. run a tiny returning payload over serial with Ethernet initially down and
    confirm it remains down;
 3. bring Ethernet up with a static/direct-cable identity, launch the same
@@ -117,5 +117,18 @@ watchdog on real silicon. The smallest attended board proof is:
    that Ethernet recovery never rewrites the Wi-Fi row and the existing health
    worker alone performs any rejoin.
 
-All board steps require a fresh memory map, an attended lease, and the existing
-deadman policy. No hardware result is claimed by this document.
+All board steps require a fresh memory map, exclusive board ownership, and the
+existing deadman policy. Deliberate failure and expiry cases need an attended
+recovery path; they must not be inferred from the normal returning case.
+
+### Build 24 normal-return result
+
+Two small generated resident-model payloads, FP32 and INT8, were independently
+length/SHA-verified and run with a 15-second deadman. Each bound once, checked
+three distinct inputs, executed ten timed requests, checked final output and
+returned x0=0 through the launching Ethernet console. Hardware caches were
+restored, both interface identities and the existing direct-link client lease
+survived, and a later Wi-Fi time command answered. Continuous uptime confirmed
+there was no intervening reset. This proves the ordinary active-to-active
+return on that board; it does not prove the untested failure/expiry cases or
+full-model performance.
