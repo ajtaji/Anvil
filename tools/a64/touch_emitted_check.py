@@ -323,9 +323,12 @@ class Bsc:
 
     THE TXW HOLD IS THE INTERESTING PART. The model delays TA/TXW, starts
     with an empty FIFO, and accepts at most `tx_chunk` bytes per TXW event.
-    Once the last byte is queued, the next status observation emits STOP;
-    correct code therefore queues READ|ST in that same TXW handling step.
-    `patience=0` makes DONE arrive before the first TXW and exercises NOSR.
+    Once the last write byte is queued, the next status observation emits
+    STOP; correct code therefore queues READ|ST in that same TXW handling
+    step. Reads have independent wire progress: bytes enter the 16-byte FIFO,
+    DLEN counts down, RXR rises at 3/4 full, and the controller—not a FIFO
+    read—sets DONE when the requested length has arrived. `patience=0` makes
+    DONE arrive before the first TXW and exercises NOSR.
     """
 
     def __init__(self, base=BSC_BASE, patience=2, tx_chunk=1, stall=False,
@@ -338,8 +341,11 @@ class Bsc:
                      C["BSC_DLEN_OFF"]: 0, C["BSC_A_OFF"]: 0,
                      C["BSC_DIV_OFF"]: 0x5DC, C["BSC_DEL_OFF"]: 0,
                      C["BSC_CLKT_OFF"]: 0x40}
+        self.dlen_programmed = 0
         self.txbuf = bytearray()
         self.rxbuf = bytearray()
+        self.read_data = bytearray()
+        self.read_left = 0
         self.active = False
         self.is_read = False
         self.err = False
@@ -412,9 +418,12 @@ class Bsc:
         self.active = False
         self.ta = False
         self.done = True
+        self.regs[C["BSC_DLEN_OFF"]] = 0
         self.cur = None
         self.write_left = 0
         self.write_data = bytearray()
+        self.read_data = bytearray()
+        self.read_left = 0
         self.tx_slots = 0
         self.tx_gap = False
         self.tx_gap_left = 0
@@ -425,6 +434,8 @@ class Bsc:
     def _begin(self, is_read, repeated):
         addr = self.regs[C["BSC_A_OFF"]] & 0x7F
         dlen = self.regs[C["BSC_DLEN_OFF"]] & 0xFFFF
+        self.read_data = bytearray()
+        self.read_left = 0
         if not repeated:
             self.starts += 1
             dev = self.devices.get(addr)
@@ -482,7 +493,12 @@ class Bsc:
         self.polls = 0
         self.is_read = is_read
         if is_read:
-            self.rxbuf = bytearray(self.cur.read(dlen))
+            self.rxbuf = bytearray()
+            self.read_data = bytearray(self.cur.read(dlen))
+            if len(self.read_data) != dlen:
+                raise AssertionError("model slave returned %d bytes for DLEN %d" %
+                                     (len(self.read_data), dlen))
+            self.read_left = dlen
             self.write_left = 0
         else:
             self.write_left = dlen
@@ -539,8 +555,17 @@ class Bsc:
                 elif self.ta and self.tx_slots == 0:
                     self.tx_slots = min(self.tx_chunk, self.write_left)
                     self.txw_events += 1
-            elif self.active and self.is_read and not self.rxbuf:
-                self._emit_stop()
+            elif self.active and self.is_read:
+                # One status observation advances one bus byte when FIFO
+                # space exists. DLEN and DONE belong to this wire-side state;
+                # reading FIFO only removes an already received byte.
+                if self.read_left > 0 and len(self.rxbuf) < 16:
+                    index = len(self.read_data) - self.read_left
+                    self.rxbuf.append(self.read_data[index])
+                    self.read_left -= 1
+                    self.regs[C["BSC_DLEN_OFF"]] = self.read_left
+                    if self.read_left == 0:
+                        self._emit_stop()
             s = 0
             if self.err:
                 s |= C["BSC_S_ERR"]
@@ -552,6 +577,10 @@ class Bsc:
                 s |= C["BSC_S_TA"]
             if self.rxbuf:
                 s |= C["BSC_S_RXD"]
+            if len(self.rxbuf) >= 16:
+                s |= C["BSC_S_RXF"]
+            if self.active and self.is_read and len(self.rxbuf) >= 12:
+                s |= C["BSC_S_RXR"]
             if self.active and not self.is_read and self.tx_slots > 0:
                 s |= C["BSC_S_TXD"]
             if self.active and not self.is_read and self.tx_slots > 0:
@@ -578,6 +607,14 @@ class Bsc:
                 self.clkt = False
             if val & C["BSC_S_DONE"]:
                 self.done = False
+                if not self.active:
+                    # BCM2711 exposes zero while DONE is asserted, then the
+                    # last programmed DLEN again once TA=0/DONE=0.
+                    self.regs[C["BSC_DLEN_OFF"]] = self.dlen_programmed
+            return
+        if off == C["BSC_DLEN_OFF"]:
+            self.dlen_programmed = val & 0xFFFF
+            self.regs[off] = self.dlen_programmed
             return
         if off == C["BSC_FIFO_OFF"]:
             self.txbuf.append(val & 0xFF)
@@ -612,6 +649,8 @@ class Bsc:
                 elif self.active:
                     self.txbuf = bytearray()
                     self.rxbuf = bytearray()
+                    self.read_data = bytearray()
+                    self.read_left = 0
                     if self.cur is not None:
                         self.cur.stop()
                     self.stops += 1
@@ -626,6 +665,8 @@ class Bsc:
                 else:
                     self.txbuf = bytearray()
                     self.rxbuf = bytearray()
+                    self.read_data = bytearray()
+                    self.read_left = 0
             if val & C["BSC_C_ST"]:
                 # A new START cannot outrun an unfinished abort. If a broken
                 # recovery tries, the later abort DONE is what its next poll
@@ -637,6 +678,96 @@ class Bsc:
             self.regs[off] = val
             return
         self.unknown_writes.append((off, val))
+
+
+def run_bsc_receive_model_checks(fails):
+    """Check documented receive state independently of emitted product code."""
+
+    def expect(label, condition, detail):
+        if not condition:
+            fails.append("BSC receive model %s: %s" % (label, detail))
+
+    # A one-byte transfer completes from wire-side DLEN progress while the
+    # byte remains available in FIFO. Consuming it cannot be what creates
+    # DONE or STOP.
+    one = Bsc()
+    one_dev = PanelMcu()
+    one.add(one_dev)
+    one.write32(C["BSC_A_OFF"], one_dev.addr)
+    one.write32(C["BSC_DLEN_OFF"], 1)
+    one.write32(C["BSC_C_OFF"], C["BSC_C_I2CEN"] | C["BSC_C_ST"] |
+                C["BSC_C_READ"])
+    status = one.read32(C["BSC_S_OFF"])
+    expect("one-byte completion",
+           status & C["BSC_S_DONE"] and status & C["BSC_S_RXD"] and
+           not (status & C["BSC_S_TA"]) and
+           one.regs[C["BSC_DLEN_OFF"]] == 0 and len(one.rxbuf) == 1,
+           "DONE/RXD/TA/DLEN/FIFO were %X/%d/%d" %
+           (status, one.regs[C["BSC_DLEN_OFF"]], len(one.rxbuf)))
+    stops = one.stops
+    one.read32(C["BSC_FIFO_OFF"])
+    expect("FIFO pop is observational",
+           one.done and one.stops == stops and len(one.rxbuf) == 0,
+           "FIFO pop changed done=%r stops=%d fifo=%d" %
+           (one.done, one.stops, len(one.rxbuf)))
+    one.write32(C["BSC_S_OFF"], C["BSC_S_DONE"])
+    expect("idle DLEN recalls programmed value",
+           one.regs[C["BSC_DLEN_OFF"]] == 1,
+           "DLEN=%d after DONE clear" % one.regs[C["BSC_DLEN_OFF"]])
+
+    # With more bytes requested than FIFO capacity, receive progresses to
+    # RXR, then RXF and stalls with DLEN remaining. FIFO space permits wire
+    # progress to resume and only exhausting DLEN completes the transfer.
+    many = Bsc()
+    many_dev = PanelMcu()
+    many.add(many_dev)
+    many.write32(C["BSC_A_OFF"], many_dev.addr)
+    many.write32(C["BSC_DLEN_OFF"], 20)
+    many.write32(C["BSC_C_OFF"], C["BSC_C_I2CEN"] | C["BSC_C_ST"] |
+                 C["BSC_C_READ"])
+    for _ in range(12):
+        status = many.read32(C["BSC_S_OFF"])
+    expect("RXR threshold",
+           status & C["BSC_S_RXR"] and status & C["BSC_S_TA"] and
+           not (status & C["BSC_S_DONE"]) and len(many.rxbuf) == 12 and
+           many.regs[C["BSC_DLEN_OFF"]] == 8,
+           "status=%X fifo=%d DLEN=%d" %
+           (status, len(many.rxbuf), many.regs[C["BSC_DLEN_OFF"]]))
+    for _ in range(4):
+        status = many.read32(C["BSC_S_OFF"])
+    expect("RXF stalls wire",
+           status & C["BSC_S_RXF"] and status & C["BSC_S_RXR"] and
+           many.regs[C["BSC_DLEN_OFF"]] == 4 and len(many.rxbuf) == 16,
+           "status=%X fifo=%d DLEN=%d" %
+           (status, len(many.rxbuf), many.regs[C["BSC_DLEN_OFF"]]))
+    before_left, before_stops = many.read_left, many.stops
+    many.read32(C["BSC_FIFO_OFF"])
+    expect("active FIFO pop does not complete",
+           many.active and not many.done and many.read_left == before_left and
+           many.stops == before_stops,
+           "active=%r done=%r left=%d stops=%d" %
+           (many.active, many.done, many.read_left, many.stops))
+    for _ in range(4):
+        many.read32(C["BSC_FIFO_OFF"])
+    for _ in range(4):
+        status = many.read32(C["BSC_S_OFF"])
+    expect("wire completion after resumed space",
+           status & C["BSC_S_DONE"] and not (status & C["BSC_S_TA"]) and
+           many.regs[C["BSC_DLEN_OFF"]] == 0 and many.stops == 1,
+           "status=%X DLEN=%d stops=%d" %
+           (status, many.regs[C["BSC_DLEN_OFF"]], many.stops))
+    many.write32(C["BSC_C_OFF"], C["BSC_C_I2CEN"] | C["BSC_C_CLEAR"])
+    expect("idle CLEAR empties FIFO only",
+           not many.rxbuf and many.done and
+           many.regs[C["BSC_DLEN_OFF"]] == 0,
+           "fifo=%d done=%r DLEN=%d" %
+           (len(many.rxbuf), many.done, many.regs[C["BSC_DLEN_OFF"]]))
+    many.write32(C["BSC_S_OFF"], C["BSC_S_DONE"])
+    expect("DONE clear recalls configured DLEN",
+           not many.done and many.regs[C["BSC_DLEN_OFF"]] == 20,
+           "done=%r DLEN=%d" %
+           (many.done, many.regs[C["BSC_DLEN_OFF"]]))
+    return 9
 
 
 def install(cpu, bsc, console):
@@ -1831,7 +1962,22 @@ def main():
     ap.add_argument(
         "--abort-resume-only", action="store_true",
         help="run only the emitted C=I2CEN/no-ST abort diagnostic gate")
+    ap.add_argument(
+        "--model-only", action="store_true",
+        help="run only the BSC receive-state self-checks (no compiler)")
     args = ap.parse_args()
+
+    fails = []
+    model_cases = run_bsc_receive_model_checks(fails)
+    if args.model_only:
+        if fails:
+            print("touch_emitted_check --model-only: FAIL - %d" % len(fails))
+            for f in fails:
+                print("  * %s" % f)
+            return 1
+        print("touch_emitted_check --model-only: PASS - %d cases" % model_cases)
+        print("           DLEN/DONE/RXR/RXF advance independently of FIFO reads.")
+        return 0
 
     if args.pmfc:
         PMFC = pathlib.Path(args.pmfc).expanduser().resolve()
@@ -1842,9 +1988,8 @@ def main():
             "touch emitted gate: compiler not found; pass --pmfc or set PMFC")
 
     WORK.mkdir(parents=True, exist_ok=True)
-    fails = []
     if args.abort_resume_only:
-        cases = run_abort_resume_probe(WORK, fails)
+        cases = model_cases + run_abort_resume_probe(WORK, fails)
         if fails:
             print("touch_emitted_check --abort-resume-only: FAIL - %d"
                   % len(fails))
@@ -1859,6 +2004,7 @@ def main():
 
     rel = PROBE.relative_to(ROOT).as_posix()
     cases, out, steps = run_clean(rel, WORK, fails)
+    cases += model_cases
     cases += run_v1(rel, WORK, fails)
     cases += run_nosr(rel, WORK, fails)
     cases += run_timeout(WORK, fails)

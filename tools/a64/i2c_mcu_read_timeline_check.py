@@ -48,19 +48,28 @@ class ReadFaultBus(touch.Bsc):
             self.err = True
         elif self.mode == 'clkt':
             self.clkt = True
-        elif self.mode == 'done-with-data':
-            self.done = True
-        elif self.mode == 'stall':
-            self.rxbuf.clear()
+        # These are explicit broken-controller observations, not normal BSC
+        # semantics. The base model completes from wire-side DLEN progress.
+        elif self.mode == 'one-byte-no-done':
+            self.rxbuf = bytearray(b'\xA6')
+        elif self.mode == 'threshold-no-done':
+            # Reproduce the anomalous RXR/data-without-DONE shape without
+            # asserting that a correct DLEN=1 controller would receive 12.
+            self.rxbuf = bytearray(b'\xA6' * 12)
 
     def read32(self, offset):
         if offset == touch.C['BSC_FIFO_OFF']:
             self.fifo_reads += 1
         if (offset == touch.C['BSC_S_OFF'] and self.active and self.is_read
-                and not self.abort_pending and not self.rxbuf
-                and self.mode in ('stall', 'done-stall')):
+                and not self.abort_pending
+                and self.mode in ('stall', 'one-byte-no-done', 'threshold-no-done')):
             self.status_reads += 1
-            return touch.C['BSC_S_TA'] | touch.C['BSC_S_TXE']
+            status = touch.C['BSC_S_TA'] | touch.C['BSC_S_TXE']
+            if self.rxbuf:
+                status |= touch.C['BSC_S_RXD']
+            if len(self.rxbuf) >= 12:
+                status |= touch.C['BSC_S_RXR']
+            return status
         return super().read32(offset)
 
 
@@ -90,11 +99,12 @@ def main():
             return q
 
         for mode, expected, reads in (
-                ('ok', 0, 1), ('done-with-data', 0, 1),
+                ('ok', 0, 1),
                 ('nack', touch.C['I2C_NACK'], 0),
                 ('clkt', I2C_CLKT, 0),
                 ('stall', touch.C['I2C_TIMEOUT'], 0),
-                ('done-stall', touch.C['I2C_TIMEOUT'], 1)):
+                ('one-byte-no-done', touch.C['I2C_TIMEOUT'], 0),
+                ('threshold-no-done', touch.C['I2C_TIMEOUT'], 1)):
             bus = ReadFaultBus(mode)
             dev = IdentityMcu()
             bus.add(dev)
@@ -109,12 +119,24 @@ def main():
             if expected == 0:
                 assert q('probe_recover_result') == -1, mode
                 assert q('probe_rxd_tick') > 0 and q('probe_done_tick') > 0, mode
+                assert not bus.done and bus.regs[touch.C['BSC_C_OFF']] == touch.C['BSC_C_I2CEN'], mode
             else:
                 assert q('probe_recover_result') == 1, mode
                 assert not bus.active and not bus.abort_pending, mode
-            if mode in ('stall', 'done-stall'):
+            if mode in ('stall', 'one-byte-no-done', 'threshold-no-done'):
                 assert touch.CNTFRQ // 50 <= q('probe_elapsed') < touch.CNTFRQ // 40, mode
             cases += 1
+
+        # READ may remain asserted after a completed transfer. No TA means
+        # that it is idle, not a speculative attempt to repair a busy bus.
+        bus = ReadFaultBus()
+        bus.regs[touch.C['BSC_C_OFF']] |= touch.C['BSC_C_READ']
+        bus.done = True
+        bus.add(IdentityMcu())
+        q = execute(bus)
+        assert q('probe_read_result') == 0 and bus.fifo_reads == 1
+        assert not bus.done and bus.regs[touch.C['BSC_C_OFF']] == touch.C['BSC_C_I2CEN']
+        cases += 1
 
         # Write refusal must never turn into a speculative read.
         bus = ReadFaultBus()
@@ -137,7 +159,7 @@ def main():
         assert q('probe_write_result') == -10 and bus.register_writes == []
         cases += 1
     print(f'i2c_mcu_read_timeline_check: PASS - {cases} cases, {steps_total:,} emitted instructions')
-    print('  exact pointer/READ, RXD-only FIFO, error priority, bounded recovery and refusal')
+    print('  exact pointer/READ, RXD plus DONE/RXR FIFO service, error priority, bounded recovery and refusal')
     return 0
 
 
