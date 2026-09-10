@@ -99,11 +99,14 @@ Global gate_radioActive.i
 Global gate_radioTicks.i
 Global gate_radioArms.i
 Global gate_slots.i
+Global gate_settingsRevision.i
+Global gate_reconciles.i
 
 Global gWifiLinkOn.i
 Global gWifiUp.i
 Global gWifiKeyed.i
 Global gWifiHaveIp.i
+Global gWifiSettingsRevisionSeen.i
 Global gWifiSecDone.i
 Global gWifiBadReads.i
 Global gWifiTeardown.i
@@ -176,7 +179,9 @@ Procedure WifiRecoveryCancel()
   gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF
   gWifiEapolRecover = 0 : gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE : gWifiEapolRecoverRc = 0
 EndProcedure
+Procedure WifiRecoveryReconcile(announce.i) : gate_reconciles = gate_reconciles + 1 : EndProcedure
 Procedure.i SettingsWifiSlotCount() : ProcedureReturn gate_slots : EndProcedure
+Procedure.i SettingsWifiRevision() : ProcedureReturn gate_settingsRevision : EndProcedure
 Procedure.i WifiRadioInitActive() : ProcedureReturn gate_radioActive : EndProcedure
 Procedure WifiRadioInitTick() : gate_radioTicks = gate_radioTicks + 1 : EndProcedure
 Procedure WifiRadioInitArm(announce.i)
@@ -242,6 +247,7 @@ Procedure GateReset()
   gate_liveWipes = 0 : gate_inReceive = 0 : gate_reentered = 0 : gate_latchInPump = 0 : gate_rxLen = 0
   gate_pollEvents = 0 : gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = 7
   gate_radioActive = 0 : gate_radioTicks = 0 : gate_radioArms = 0 : gate_slots = 1
+  gate_settingsRevision = 0 : gate_reconciles = 0 : gWifiSettingsRevisionSeen = 0
   gWifiLinkOn = 1 : gWifiUp = 1 : gWifiKeyed = 1 : gWifiHaveIp = 1
   gWifiSecDone = 1 : gWifiBadReads = 0 : gWifiTeardown = 0
   gWifiVerify = 0 : gWifiHealPend = 0 : gWifiHealLast = 0
@@ -422,6 +428,25 @@ Procedure.i Main()
   gate_ms = ($FFFFFF00 + #WIFI_HEAL_MS) & $FFFFFFFF : WifiLinkTick()
   If gate_rejoins <> 1 Or gate_recActive = 0 : ProcedureReturn 23 : EndIf
 
+  ; A settings-owned revision is consumed once at the safe outer tick. It
+  ; cancels the old generation and reconciles once, then is acknowledged.
+  GateReset() : gate_settingsRevision = 9
+  WifiLinkTick()
+  If gWifiSettingsRevisionSeen <> 9 Or gate_recCancels <> 1 Or gate_reconciles <> 1 : ProcedureReturn 31 : EndIf
+  WifiLinkTick()
+  If gate_recCancels <> 1 Or gate_reconciles <> 1 : ProcedureReturn 31 : EndIf
+
+  ; Policy OFF still consumes the event without creating per-tick churn.
+  GateReset() : gWifiLinkOn = 0 : gate_settingsRevision = 10
+  WifiLinkTick()
+  If gWifiSettingsRevisionSeen <> 10 Or gate_recCancels <> 1 Or gate_reconciles <> 1 : ProcedureReturn 32 : EndIf
+
+  ; PMK bookkeeping leaves the settings revision unchanged. An active
+  ; recovery owner therefore advances normally rather than being cancelled.
+  GateReset() : gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_QUIET
+  WifiLinkTick()
+  If gate_recCancels <> 0 Or gate_reconciles <> 0 Or gate_recTicks <> 1 : ProcedureReturn 33 : EndIf
+
   ProcedureReturn 0
 EndProcedure
 '''
@@ -539,12 +564,25 @@ def main() -> int:
                     f"{negative_result}, expected 19"
                 )
                 return 1
+            observer = "  If settingsRevision <> gWifiSettingsRevisionSeen"
+            if exact_source.count(observer) != 1:
+                raise SystemExit("wifi link policy gate: settings observer mutation site is not unique")
+            mutated = exact_source.replace(observer, "  If 0 <> 0", 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            negative_image = build(pmfc, work, probe)
+            negative_result, _ = emitted.execute(a64, negative_image)
+            if negative_result != 31:
+                print(
+                    "wifi_link_policy_emitted_check: FAIL settings-observer mutant returned "
+                    f"{negative_result}, expected 31"
+                )
+                return 1
     if result:
         print(f"wifi_link_policy_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     print(
-        f"wifi_link_policy_emitted_check: PASS - 30 assertions, {steps:,} A64 instructions; "
-        "pump-order/callback-reentry, BootNetUp and radio-init-hook mutants rejected"
+        f"wifi_link_policy_emitted_check: PASS - 33 assertions, {steps:,} A64 instructions; "
+        "pump-order/callback-reentry, BootNetUp, radio-init-hook and settings-observer mutants rejected"
     )
     return 0
 

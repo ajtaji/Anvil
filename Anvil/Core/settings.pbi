@@ -781,6 +781,9 @@ Global set_dupes.i   = 0     ; keys the last parse saw more than once
 ; bad line and the table does not hold what the file holds. 2 is what
 ; SettingsSave refuses on. See THE STRICT PARSE in the header.
 Global set_loadState.i = 0
+Global set_wifiRevision.i = 0
+Global set_wifiBatchDepth.i = 0
+Global set_wifiBatchChanged.i = 0
 
 ; The key the caller asked for, folded and validated by set_MakeKey.
 ; SAME PATTERN AS fat.pi4's fat_wantName (fat.pi4:1338) and for the same
@@ -873,6 +876,44 @@ Procedure set_CopyZ(*dst, *src, n.i)
   Wend
   PokeA(*dst + n, 0)
 EndProcedure
+
+; Exact association-selection allow-list. Cached PMK bookkeeping does not
+; match and therefore cannot restart a live owner.
+Procedure.i set_WifiSelectionKey(*key)
+  Define n.i
+  Define d.i
+  If *key = 0 : ProcedureReturn 0 : EndIf
+  n = set_Len(*key)
+  If n = 12 And set_Contains(*key, "wifi.network") <> 0 : ProcedureReturn 1 : EndIf
+  If n = 23 And set_Contains(*key, "wifi.password.plaintext") <> 0 : ProcedureReturn 1 : EndIf
+  If n = 11 Or n = 25
+    If PeekA(*key) = 119 And PeekA(*key + 1) = 105 And PeekA(*key + 2) = 102 And PeekA(*key + 3) = 105 And PeekA(*key + 4) = 46 And PeekA(*key + 6) = 46
+      d = PeekA(*key + 5)
+      If d >= 49 And d <= 52
+        If n = 11 And set_Contains(*key + 7, "ssid") <> 0 : ProcedureReturn 1 : EndIf
+        If n = 25 And set_Contains(*key + 7, "password.plaintext") <> 0 : ProcedureReturn 1 : EndIf
+      EndIf
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure set_WifiChanged()
+  If set_wifiBatchDepth <> 0
+    set_wifiBatchChanged = 1
+  Else
+    set_wifiRevision = (set_wifiRevision + 1) & $FFFFFFFF
+  EndIf
+EndProcedure
+Procedure set_WifiBatchBegin() : set_wifiBatchDepth = set_wifiBatchDepth + 1 : EndProcedure
+Procedure set_WifiBatchEnd()
+  If set_wifiBatchDepth > 0 : set_wifiBatchDepth = set_wifiBatchDepth - 1 : EndIf
+  If set_wifiBatchDepth = 0 And set_wifiBatchChanged <> 0
+    set_wifiBatchChanged = 0
+    set_wifiRevision = (set_wifiRevision + 1) & $FFFFFFFF
+  EndIf
+EndProcedure
+Procedure.i SettingsWifiRevision() : ProcedureReturn set_wifiRevision : EndProcedure
 
 ; 1 if the NUL-terminated *needle appears anywhere in the NUL-terminated
 ; *hay. Used only by SettingsIsSecret, on a key name that is at most 31
@@ -1085,6 +1126,16 @@ EndProcedure
 
 Procedure SettingsReset()
   Define i.i
+  Define changed.i
+  changed = 0
+  i = 0
+  While i < set_count
+    If set_WifiSelectionKey(@set_keys[0] + (i * #SET_KEY_STRIDE)) <> 0
+      changed = 1
+      Break
+    EndIf
+    i = i + 1
+  Wend
   ; The KEY bytes are zeroed, which is what empties the table - a slot
   ; whose name is the empty string can never match anything, because
   ; set_MakeKey refuses an empty key before a search ever happens.
@@ -1111,6 +1162,7 @@ Procedure SettingsReset()
   set_err = #SET_ERR_NONE
   set_errLine = 0
   set_dupes = 0
+  If changed <> 0 : set_WifiChanged() : EndIf
 EndProcedure
 
 Procedure.i SettingsCount()
@@ -1147,6 +1199,8 @@ EndProcedure
 Procedure.i SettingsSet(*key, *value)
   Define idx.i
   Define n.i
+  Define i.i
+  Define same.i
 
   set_err = #SET_ERR_NONE
 
@@ -1158,6 +1212,19 @@ Procedure.i SettingsSet(*key, *value)
   EndIf
 
   idx = set_FindWant()
+  same = 0
+  If idx >= 0
+    same = 1
+    i = 0
+    While i < #SET_VAL_STRIDE
+      If set_vals[(idx * #SET_VAL_STRIDE) + i] <> PeekA(*value + i)
+        same = 0
+        Break
+      EndIf
+      If PeekA(*value + i) = 0 : Break : EndIf
+      i = i + 1
+    Wend
+  EndIf
   If idx < 0
     If set_count >= #SET_MAX_KEYS
       ProcedureReturn set_Fail(#SET_ERR_FULL)
@@ -1171,6 +1238,9 @@ Procedure.i SettingsSet(*key, *value)
   n = set_Len(*value)
   set_CopyZ(@set_vals[0] + (idx * #SET_VAL_STRIDE), *value, n)
   set_dirty = 1
+  If same = 0 And set_WifiSelectionKey(@set_wantKey[0]) <> 0
+    set_WifiChanged()
+  EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -1315,6 +1385,7 @@ Procedure.i SettingsRemove(*key)
   Define idx.i
   Define i.i
   Define j.i
+  Define wifiChanged.i
 
   set_err = #SET_ERR_NONE
   If set_MakeKey(*key) = 0
@@ -1324,6 +1395,7 @@ Procedure.i SettingsRemove(*key)
   If idx < 0
     ProcedureReturn set_Fail(#SET_ERR_NOTFOUND)
   EndIf
+  wifiChanged = set_WifiSelectionKey(@set_wantKey[0])
 
   i = idx
   While i < (set_count - 1)
@@ -1355,6 +1427,7 @@ Procedure.i SettingsRemove(*key)
 
   set_count = set_count - 1
   set_dirty = 1
+  If wifiChanged <> 0 : set_WifiChanged() : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -1558,15 +1631,21 @@ Procedure.i SettingsParse(*buf, len.i)
   Define le.i
   Define line.i
   Define c.i
+  Define result.i
 
+  set_WifiBatchBegin()
   SettingsReset()
   set_loadState = 0
 
   If *buf = 0
-    ProcedureReturn set_Fail(#SET_ERR_NULL)
+    result = set_Fail(#SET_ERR_NULL)
+    set_WifiBatchEnd()
+    ProcedureReturn result
   EndIf
   If len < 0
-    ProcedureReturn set_Fail(#SET_ERR_BAD_LEN)
+    result = set_Fail(#SET_ERR_BAD_LEN)
+    set_WifiBatchEnd()
+    ProcedureReturn result
   EndIf
 
   i = 0
@@ -1623,6 +1702,7 @@ Procedure.i SettingsParse(*buf, len.i)
     If set_ParseLine(*buf, ls, le) = 0
       set_errLine = line
       set_loadState = 2
+      set_WifiBatchEnd()
       ProcedureReturn 0
     EndIf
   Wend
@@ -1633,6 +1713,7 @@ Procedure.i SettingsParse(*buf, len.i)
   set_errLine = 0
   set_loadState = 1
   set_err = #SET_ERR_NONE
+  set_WifiBatchEnd()
   ProcedureReturn 1
 EndProcedure
 
@@ -1854,7 +1935,9 @@ Procedure.i SettingsLoad()
     If HwFileLastError() = #HW_FILE_NOTFOUND
       ; The table is emptied even so. A load that fails must not leave
       ; the previous medium's settings in place looking like this one's.
+      set_WifiBatchBegin()
       SettingsReset()
+      set_WifiBatchEnd()
       set_loadState = 0
       ProcedureReturn set_Fail(#SET_ERR_NO_FILE)
     EndIf

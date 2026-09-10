@@ -540,6 +540,7 @@ Global gWifiKeyed.i = 0
 Global gWifiSecDone.i = 0
 Global gWifiHaveIp.i = 0
 Global gWifiIp.i = 0
+Global gWifiSettingsRevisionSeen.i = 0
 
 Procedure wifi_RecordEapolFailure(stage.i, rc.i, deferred.i)
   gWifiEapolFailStage = stage
@@ -2625,6 +2626,7 @@ EndProcedure
 ; invalidate the old association/radio generation, then schedule the current
 ; configuration according to radio readiness and policy.
 Procedure WifiConfigChanged()
+  gWifiSettingsRevisionSeen = SettingsWifiRevision()
   WifiRecoveryCancel()
   WifiRecoveryReconcile(0)
 EndProcedure
@@ -3561,6 +3563,17 @@ Procedure WifiLinkTick()
   Define er.i
   Define age.i
   Define rr.i
+  Define settingsRevision.i
+
+  ; Generic settings/env mutation and load paths publish only a revision; they
+  ; never call back while the settings table or parser buffers are owned.
+  settingsRevision = SettingsWifiRevision()
+  If settingsRevision <> gWifiSettingsRevisionSeen
+    gWifiSettingsRevisionSeen = settingsRevision
+    WifiRecoveryCancel()
+    WifiRecoveryReconcile(0)
+    ProcedureReturn
+  EndIf
 
   ; An unready radio has no valid steady-state receive/event owner. Advance one
   ; coarse initialization phase and return to the board's outer service loop,

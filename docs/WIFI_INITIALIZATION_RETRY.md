@@ -186,36 +186,51 @@ and asynchronous control at once. Those follow only after the orchestration and
 cancellation ownership pass independently.
 
 The focused emitted candidate gate currently passes 42 scenario assertions,
-17 mandatory phase-failure rows and 23 cancellation boundaries over 94,155
+17 mandatory phase-failure rows and 23 cancellation boundaries over 94,189
 executed A64 instructions. It rejects 15 emitted product mutations and 10
 structural command-branch mutations. A second emitted fixture executes the
 extracted real `CmdWifi` control flow for 16 success/refusal/foreground-policy
 assertions over 13,437 A64 instructions and rejects a hook moved before setter
 success. This is desk evidence for ownership and order,
-not acceptance or a physical radio result. The gate includes the supported
+not physical radio acceptance. The gate includes the supported
 `Cyw43SetBlockMode(1) = 0` byte-mode fallback, the shared synchronous/automatic
 forum-737 preflight, and cancellation after GTK publication but before DHCP:
 the live keyed session remains valid and reconciliation explicitly hands the
 unaddressed interface to the common DHCP client.
 
-## Deferred generic configuration event seam
+## Generic configuration revision
 
-The narrow candidate covers successful Wi-Fi-specific commands only. Generic
-`settings set/remove/load/discard` and `env set/delete/load` routes can also
-change Wi-Fi rows, but do not yet notify an idle radio or association owner.
-The next bounded slice should add one monotonically increasing successful-
-configuration revision owned by the settings layer. Increment it only after a
-generic operation has actually committed a Wi-Fi-relevant row or replaced the
-active settings image; refused/no-op operations must not advance it. Cached-PMK
-maintenance is explicitly excluded because it is session bookkeeping, not a
-network-selection change.
+The follow-on source-accepted slice adds one settings-owned, wrapping Wi-Fi
+selection revision. Its positive allow-list is exactly `wifi.network`,
+`wifi.password.plaintext`, and the SSID/passphrase pair for numbered slots 1
+through 4. Cached `wifi.N.pmk.secret` rows and unrelated settings are excluded:
+they are session bookkeeping, not network selection. A successful direct set
+advances only when the stored value actually changes; a refused set, identical
+set, missing removal or settings discard does not. A successful removal does.
 
-Wi-Fi should sample the revision only after the settings/shared-buffer
-operation has returned, cancel its old generation once per new revision, and
-run `WifiRecoveryReconcile(0)` from that safe outer event boundary. It must not
-call back into Wi-Fi while settings storage or shared parsing buffers are
-owned, and it must not replace this event with unconditional per-tick auto-arm.
-That design needs a separate file-scope review before implementation.
+`SettingsParse` owns a batch around reset and every accepted input line, so a
+full or partial replacement publishes at most one revision. Null and negative-
+length parses still close the batch after their documented reset. The no-file
+`SettingsLoad` reset has its own batch; open/size/read failures before table
+replacement preserve the old table and revision. `SettingsDiscardLoad` changes
+only whether a partial image may later be saved, so it publishes no selection
+event.
+
+Wi-Fi samples the revision only after the settings/shared-buffer operation has
+returned, at the top of `WifiLinkTick`. It acknowledges the newest value before
+cancelling once and calling `WifiRecoveryReconcile(0)`, so any number of setters
+between ticks coalesce. Wi-Fi-specific commands acknowledge their synchronous
+event in `WifiConfigChanged`, avoiding a duplicate cancellation on the next
+tick. There is no callback from the settings store, no secret output, and no
+unconditional radio auto-arm. Policy-off/no-credential truth remains idle;
+keyed live sessions remain live, with the existing keyed/unaddressed path
+explicitly returning address ownership to the common DHCP client.
+
+The emitted settings gate executes the real reset, set, remove, parse, load and
+discard bodies for 20 assertions over 713,193 A64 instructions and rejects six
+assertion-failing mutations. The link-policy composition executes the real
+outer observer, including one-shot/coalesced consumption, policy-off and active
+recovery preservation when PMK bookkeeping leaves the revision unchanged.
 
 ## Follow-on split: firmware/SDIO and atomic control
 

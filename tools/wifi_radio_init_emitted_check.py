@@ -347,8 +347,8 @@ def main() -> int:
         ),
         (
             "configuration reconcile",
-            "Procedure WifiConfigChanged()\n  WifiRecoveryCancel()\n  WifiRecoveryReconcile(0)",
-            "Procedure WifiConfigChanged()\n  WifiRecoveryCancel()",
+            "Procedure WifiConfigChanged()\n  gWifiSettingsRevisionSeen = SettingsWifiRevision()\n  WifiRecoveryCancel()\n  WifiRecoveryReconcile(0)",
+            "Procedure WifiConfigChanged()\n  gWifiSettingsRevisionSeen = SettingsWifiRevision()\n  WifiRecoveryCancel()",
         ),
         (
             "heal re-enable",
