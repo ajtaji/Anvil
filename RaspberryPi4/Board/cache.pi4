@@ -312,6 +312,7 @@ EndProcedure
 Procedure RunAt(a.i)
   Define wasCached.i
   Define wasEth.i
+  Define resumeEth.i
   ; The one place a payload is entered, so `g` and the autoboot cannot
   ; drift apart in what they check or what they print.
   ;
@@ -422,7 +423,8 @@ Procedure RunAt(a.i)
   ; untrusted bus master may still be live. Drain the only reliable local
   ; diagnostic and take the existing PM-watchdog route back to firmware.
   If EthPayloadReclaim() = 0
-    PrintN("!! the payload returned, but GENET did not read back disabled.")
+    PrintN("!! the payload returned, but the GENET stop command or an enable-field")
+    PrintN("   readback failed, so a stopped controller was not established.")
     PrintN("   Cache, display and network recovery have NOT been attempted.")
     PrintN("   The monitor is resetting rather than run beside an untrusted DMA master.")
     EthWhyGenet()
@@ -485,7 +487,20 @@ Procedure RunAt(a.i)
   ; arbitrary code. eth_HwUp deliberately keeps the wired software row: its
   ; primary address and provenance, link-local/served alias, DHCP machines
   ; and UDP listeners have lifetimes independent of a MAC reset.
-  EthPayloadResume(wasEth)
+  resumeEth = EthPayloadResume(wasEth)
+  If resumeEth < 0
+    PrintN("!! the payload returned, but the wired-controller restart then failed")
+    PrintN("   and its stop command or an owned enable-field readback also failed.")
+    PrintN("   DHCP, console rearm and watchdog stop have NOT been attempted.")
+    PrintN("   This readback is not a physical DMA-idle acknowledgement; it is the")
+    PrintN("   strongest safe cleanup boundary this GENET driver currently exposes.")
+    Print("   The payload x0 value was ")
+    PutHex16(gGoRc)
+    PrintN(".")
+    UartDrain()
+    SafetyToFirmware()
+    ProcedureReturn 0
+  EndIf
 
   ; The prompt did not tick while the payload owned the CPU. Advance lease
   ; state against the real elapsed clock now, after physical links are back:

@@ -45,7 +45,12 @@ firmware after every payload or erase the radio's independent identity.
    beside an untrusted bus master.
 5. Restore monitor caches and reclaim display DMA. If GENET was active before
    the jump, perform a full bounded controller, descriptor-ring, PHY and MAC
-   reinitialisation. If it was inactive, leave it inactive.
+   reinitialisation. If it was inactive, leave it inactive. A failed restart is
+   allowed to return to the monitor only after the common rebuild-entry stop,
+   or a later failure cleanup, proves the MAC TX/RX and both DMA enable fields
+   clear. If a stop command or its readback fails, print the complete captured
+   payload `x0` through the local UART and reset through firmware before
+   touching DHCP, console ownership or watchdog state.
 6. Advance DHCP state by the actual elapsed time, re-derive network-console
    reachability and ownership, then stop the deadman.
 7. Print and flush the final return value through the restored interface when
@@ -78,11 +83,28 @@ before final network output, so Anvil never sends the return response from an
 address it no longer owns. Static/link-local and direct-server state do not
 become leases merely because hardware restarted.
 
-If GENET reinitialisation fails, the controller and `gEthUp` remain down, the
-logical record is retained for an explicit later `net up`, and the return value
-is still reported locally. The network console forgets a peer whose interface
-is no longer usable; it does not claim a response was sent through a stopped
-link.
+Every rebuild which is not the genuinely-already-active shortcut first issues
+the checked stop and readback before Probe, MAC or RX-region configuration.
+`GenetStop` uses the fixed BCM2711 register block and does not depend on a
+successful Probe. This makes an early configuration refusal and a later start
+refusal share one safe down-state boundary instead of trusting an old software
+flag.
+
+If GENET reinitialisation fails *after a checked down boundary*, the controller
+and `gEthUp` remain down, the logical record is retained for an explicit later
+`net up`, and the return value is still reported locally. The network console
+forgets a peer whose interface is no longer usable; it does not claim a response
+was sent through a stopped link. If checked cleanup fails, no stopped-link claim
+is made: the readback boundary is unsafe, so the full return value is printed
+locally and the existing firmware-reset path is taken.
+
+The raw Pi bring-up result is deliberately a four-result contract: `-1` means
+the common stop or a later cleanup could not establish a safe down state, `0`
+means failed after a checked down boundary, `1` means freshly started and `2`
+means already active. Ordinary monitor callers go through one wrapper that
+turns `-1` into a drained local diagnostic and firmware reset. The returning
+payload owner consumes the same negative result itself so it can preserve and
+print all sixteen hexadecimal digits of payload `x0` before resetting.
 
 ## Desk gate and remaining proof
 
@@ -93,15 +115,41 @@ python tools/payload_lifecycle_check.py --pmfc <path-to-pmfc>
 ```
 
 It compiles the real Pi 4 monitor with `-S`, checks the emitted A64 call order,
-refuses logical reset calls in the hardware-start procedure, and exercises 125
+refuses logical reset calls in the hardware-start procedure, and exercises
 source/model/emission assertions covering inactive, active and inconsistent
-controller flags; DMA-stop refusal; static, alias, direct-server and leased
-identity; elapsed lease expiry; bounded restart failure; Wi-Fi isolation;
-console flush/rearm order; the deadman window; and preservation of the payload
-return value.
+controller flags; common rebuild-entry cleanup before early configuration;
+command and readback cleanup refusal after both failed start and network-MAC
+publication; four-result handling at every caller; static, alias,
+direct-server and leased identity; elapsed lease expiry; bounded restart
+failure; Wi-Fi isolation; console flush/rearm order; the deadman window; and
+preservation of the payload return value. Mutation controls restore the old
+unchecked cleanup and nonzero-is-success branches and require the gate to fail.
 
 That gate cannot prove MMIO, PHY negotiation, DMA idle, UDP delivery or a
-watchdog on real silicon. The smallest attended board proof is:
+watchdog on real silicon.
+
+Two companion gates execute decoded instructions from the real monitor rather
+than relying on the separate lifecycle state model:
+
+```text
+python tools/payload_return_emitted_check.py --pmfc <path-to-pmfc>
+python tools/eth_hwup_emitted_check.py --pmfc <path-to-pmfc>
+```
+
+The return gate executes `RunAt`, `CallAddr` and the Ethernet lifecycle through
+entry, return, rebuild-entry and failed-restart cleanup. It checks complete
+payload arguments and `x0`, restored monitor SP, exact MAC pointers/bytes and
+RX-region arguments, driver/software state, and refusal before ordinary service
+recovery. The bring-up gate separately executes raw and local-wrapper entries,
+including genuine already-up, stale-active, pre-start refusal and unsafe cleanup.
+Both require exact image and symbol SHA-256 values in existing-artifact mode,
+guard their memory models, and reject targeted decoded instruction mutations.
+
+GENET operations, printing, firmware reset and network-service effects are
+explicit modeled seams. These gates do not prove physical DMA idle, PHY
+negotiation, actual DHCP expiry, radio delivery or a working hardware watchdog.
+
+The smallest attended board proof is:
 
 1. record `net` (including its DHCP state), `wifi`, and GENET counters;
 2. run a tiny returning payload over serial with Ethernet initially down and

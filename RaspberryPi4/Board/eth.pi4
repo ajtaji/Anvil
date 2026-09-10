@@ -86,6 +86,17 @@ EndProcedure
 ;     0  it was not active; nothing is owed on return
 ;     1  it was active and must be restarted on return
 ; ----------------------------------------------------------------------
+
+; eth_HwUp has four results rather than a Boolean because a failed start has
+; two materially different end states. Zero means the controller was checked
+; down and the prompt may continue. A negative result means the stop command or
+; one of its three enable-field readbacks failed; treating that value as merely
+; "not up" would let the monitor keep running beside a possibly live bus master.
+#ETH_HWUP_UNSAFE  = -1
+#ETH_HWUP_DOWN    = 0
+#ETH_HWUP_STARTED = 1
+#ETH_HWUP_ALREADY = 2
+
 Procedure.i EthPayloadStopChecked()
   Define cmd.i
   Define tdma.i
@@ -123,7 +134,8 @@ Procedure.i EthPayloadQuiesce()
   EndIf
   If EthPayloadStopChecked() = 0
     gEthUp = 0
-    PrintN("!! the Ethernet stop did not read back disabled, so the payload was")
+    PrintN("!! the Ethernet stop command or an enable-field readback failed, so")
+    PrintN("   a stopped controller was not established and the payload was")
     PrintN("   NOT run. Running it with a bus master still writing into Anvil's")
     PrintN("   receive memory would give two programs ownership of the same RAM.")
     EthWhyGenet()
@@ -146,6 +158,7 @@ Procedure.i EthPayloadReclaim()
 EndProcedure
 
 Procedure.i EthPayloadResume(was.i)
+  Define r.i
   ; EthPayloadReclaim already established the stop/readback boundary before
   ; cache, display, DHCP or console recovery. This procedure only restores the
   ; physical controller that was active before entry.
@@ -154,9 +167,16 @@ Procedure.i EthPayloadResume(was.i)
   EndIf
   PrintN("The wired controller was active before the payload. Reinitialising it")
   PrintN("from hardware now; the wait is bounded by the Ethernet link timeout.")
-  If eth_HwUp() = 0
-    ; eth_HwUp leaves gEthUp clear and stops every partially-started DMA
-    ; path. The caller still returns to the local console and reports x0.
+  r = eth_HwUp()
+  If r < 0
+    ; The raw start already named the failed cleanup. Do not reset here: RunAt
+    ; owns the captured payload x0 and must print all sixteen digits first.
+    ProcedureReturn -1
+  EndIf
+  If r = #ETH_HWUP_DOWN
+    ; A zero from eth_HwUp means its checked stop succeeded. The controller's
+    ; three owned enable fields read back clear, although that is deliberately
+    ; not described as proof that every previously issued DMA write is idle.
     PrintN("!! the payload returned, but the wired controller did not come back.")
     PrintN("   Its saved network identity is retained; no inactive link is being")
     PrintN("   reported as active. Fix the link and type net up to try it again.")
@@ -208,6 +228,8 @@ EndProcedure
 ;  configuration. The shared core of EthUp, EthUpIp and EthLinkUp.
 ;
 ;  RETURNS:
+;   -1  bring-up failed and the stop command or its enable-field readback also
+;       failed. The caller MUST take the local firmware-reset path;
 ;    2  already up and the link is still there - the caller need not
 ;       reconfigure, net.pi4's wired row still holds whatever IP it had;
 ;    1  freshly brought up - the wired row's MAC is revalidated in net.pi4;
@@ -239,15 +261,33 @@ EndProcedure
 ;  that was already bound.
 ; ----------------------------------------------------------------------
 Procedure.i eth_HwUp()
+  Define startErr.i
   If gEthUp = 1
     If GenetStarted() = 1
       If GenetPhyLinkUp() = 1
-        ProcedureReturn 2
+        ProcedureReturn #ETH_HWUP_ALREADY
       EndIf
     EndIf
     PrintN("The Ethernet was up and is not any more - the link has gone away since")
     PrintN("the last command. Bringing it up again from the beginning.")
     gEthUp = 0
+  EndIf
+
+  ; EVERY REBUILD STARTS FROM ONE PROVED-DOWN HARDWARE STATE. This is after
+  ; the genuinely-live shortcut above, so an already working controller pays
+  ; nothing. Every other path may be a cold start, a stale software flag, a
+  ; lost link with the old DMA generation still enabled, or a retry after an
+  ; incomplete caller. GenetStop is probe-independent: it addresses the fixed
+  ; BCM2711 GENET block directly. EthPayloadStopChecked then orders and reads
+  ; back the MAC TX/RX and both DMA enable fields. Only after that boundary can
+  ; a later Probe/MAC/RX-region refusal honestly return #ETH_HWUP_DOWN.
+  gEthUp = 0
+  If EthPayloadStopChecked() = 0
+    PrintN("!! the Ethernet rebuild could not establish a stopped controller.")
+    PrintN("   Its stop command or an enable-field readback failed. The caller")
+    PrintN("   must reset rather than continue beside a possibly active MAC or DMA.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_UNSAFE
   EndIf
 
   EthMacFetch()
@@ -259,21 +299,21 @@ Procedure.i eth_HwUp()
     PrintN("   this monitor reading the wrong address or a part that is not a")
     PrintN("   BCM2711.")
     EthWhyGenet()
-    ProcedureReturn 0
+    ProcedureReturn #ETH_HWUP_DOWN
   EndIf
 
   If GenetSetMac(@gEthMac[0]) = 0
     PrintN("!! the Ethernet controller refused this board's hardware address, so")
     PrintN("   nothing was done.")
     EthWhyGenet()
-    ProcedureReturn 0
+    ProcedureReturn #ETH_HWUP_DOWN
   EndIf
   If GenetSetRxRegion(#ETH_RX_BASE, #ETH_RX_BYTES) = 0
     PrintN("!! the Ethernet controller refused the receive region, so nothing was")
     PrintN("   done. That region is a constant in this monitor and not something")
     PrintN("   you typed, so this is a fault in Anvil rather than in what you did.")
     EthWhyGenet()
-    ProcedureReturn 0
+    ProcedureReturn #ETH_HWUP_DOWN
   EndIf
 
   Print("Bringing the Ethernet up. Waiting up to ")
@@ -297,39 +337,47 @@ Procedure.i eth_HwUp()
     ; thing this monitor promises about #ETH_RX_BASE is that no bus
     ; master is writing there while a payload runs, and "the network
     ; failed to come up" is precisely the state somebody then types
-    ; `run` from. Two register writes remove the question.
-    GenetStop()
-    If GenetError() = #GENET_ERR_NO_LINK
+    ; `run` from. The checked stop and its three enable-field readbacks remove
+    ; the question or return the distinct unsafe result below.
+    startErr = GenetError()
+    If EthPayloadStopChecked() = 0
+      PrintN("!! the Ethernet start failed, and its cleanup stop command or an")
+      PrintN("   enable-field readback also failed. The caller must reset rather")
+      PrintN("   than continue beside a possibly active MAC or DMA engine.")
+      EthWhyGenet()
+      ProcedureReturn #ETH_HWUP_UNSAFE
+    EndIf
+    If startErr = #GENET_ERR_NO_LINK
       PrintN("!! there is no Ethernet link, so the network is not up and nothing")
       PrintN("   was done. Nothing is plugged into this board's Ethernet socket, or")
       PrintN("   the other end of the cable is not powered, or the cable is bad. Put")
       PrintN("   one in, wait a moment for the socket lights, and type the command")
       PrintN("   again. This monitor waited five seconds and then answered, rather")
       PrintN("   than sitting here looking like a hung board.")
-      ProcedureReturn 0
+      ProcedureReturn #ETH_HWUP_DOWN
     EndIf
-    If GenetError() = #GENET_ERR_ANEG
+    If startErr = #GENET_ERR_ANEG
       PrintN("!! the Ethernet link came up but auto-negotiation never finished, so")
       PrintN("   nothing was done. The speed and duplex a PHY reports before")
       PrintN("   negotiation completes are left over from last time and acting on")
       PrintN("   them would configure the controller wrongly. This is usually an")
       PrintN("   old switch or a fixed-speed port at the other end. The network is")
       PrintN("   not up and nothing was done.")
-      ProcedureReturn 0
+      ProcedureReturn #ETH_HWUP_DOWN
     EndIf
-    If GenetError() = #GENET_ERR_HALF_DUPLEX
+    If startErr = #GENET_ERR_HALF_DUPLEX
       PrintN("!! the link negotiated HALF duplex and this driver refuses to run on")
       PrintN("   one, so the network is not up and nothing was done. Half duplex")
       PrintN("   means collisions, and the controller's collision handling is not")
       PrintN("   implemented here - genet.pi4 refuses it rather than passing")
       PrintN("   traffic badly. Set the port at the other end to full duplex, or")
       PrintN("   use a different port.")
-      ProcedureReturn 0
+      ProcedureReturn #ETH_HWUP_DOWN
     EndIf
     PrintN("!! the Ethernet controller did not start, so the network is not up and")
     PrintN("   nothing was done.")
     EthWhyGenet()
-    ProcedureReturn 0
+    ProcedureReturn #ETH_HWUP_DOWN
   EndIf
 
   ; Initialise mutable defaults only on the first software attachment.
@@ -343,15 +391,41 @@ Procedure.i eth_HwUp()
   ; independently learned neighbours and its entire identity row.
   NetArpFlush(#HW_LINK_WIRED)
   If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0
+    ; This logical refusal happened after GenetStart enabled the MAC and DMA.
+    ; Reclaim the hardware before printing it. NetError is owned by net.pi4
+    ; and is not changed by this GENET cleanup.
+    If EthPayloadStopChecked() = 0
+      PrintN("!! the network stack refused the wired address, and the controller")
+      PrintN("   cleanup stop command or an enable-field readback failed. The caller")
+      PrintN("   must reset rather than continue beside a possibly active MAC or DMA.")
+      EthWhyGenet()
+      ProcedureReturn #ETH_HWUP_UNSAFE
+    EndIf
     PrintN("!! the network stack refused this board's hardware address, so nothing")
     PrintN("   was done.")
     EthWhyNet()
-    GenetStop()
-    ProcedureReturn 0
+    ProcedureReturn #ETH_HWUP_DOWN
   EndIf
 
   gEthUp = 1
-  ProcedureReturn 1
+  ProcedureReturn #ETH_HWUP_STARTED
+EndProcedure
+
+; Ordinary monitor callers use this wrapper, never the raw four-result value directly.
+; If an attempted bring-up cannot prove the three owned enable fields clear,
+; there is no safe local prompt to return to. The returning-payload path is the
+; one exception: it must first print the payload's complete captured x0, so
+; EthPayloadResume propagates the negative result to RunAt instead.
+Procedure.i eth_HwUpLocal()
+  Define r.i
+  r = eth_HwUp()
+  If r < 0
+    PrintN("The monitor is resetting through firmware because GENET could not be")
+    PrintN("proved disabled after a failed local start.")
+    UartDrain()
+    SafetyToFirmware()
+  EndIf
+  ProcedureReturn r
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -450,7 +524,7 @@ Procedure.i HwLinkStaticUp()
     ProcedureReturn #HW_LINK_NONE
   EndIf
   If gEthUp <> 1 Or GenetStarted() <> 1 Or GenetPhyLinkUp() <> 1
-    If eth_HwUp() = 0
+    If eth_HwUpLocal() <= #ETH_HWUP_DOWN
       ProcedureReturn #HW_LINK_NONE
     EndIf
   EndIf
@@ -1004,7 +1078,7 @@ Procedure.i HwLinkOpen(needIp.i)
   If wiredLink = 0
     If LinkPin() = #HW_LINK_WIRED Or wifiIp = 0
       If LinkPin() <> #HW_LINK_WIFI
-        If eth_HwUp() <> 0
+        If eth_HwUpLocal() > #ETH_HWUP_DOWN
           wiredLink = 1
         EndIf
       EndIf

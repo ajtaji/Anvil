@@ -82,6 +82,7 @@ class Machine:
     stop_ok: bool = True
     return_stop_ok: bool = True
     restart_ok: bool = True
+    restart_cleanup_ok: bool = True
     stop_calls: int = 0
     restart_calls: int = 0
 
@@ -92,26 +93,39 @@ class Machine:
         self.genet_started = False
         return was if self.stop_ok else -1
 
-    def resume(self, was: int) -> bool:
+    def resume(self, was: int) -> int:
         # RunAt reclaims the untrusted peripheral immediately after return,
         # before cache/display/network recovery. Resume only restores an owed
         # physical controller.
         if was == 0:
-            return True
+            return 1
         self.restart_calls += 1
         if not self.restart_ok:
             self.eth_flag = False
             self.genet_started = False
-            return False
+            return 0 if self.restart_cleanup_ok else -1
         self.eth_flag = True
         self.genet_started = True
-        return True
+        return 1
 
     def reclaim(self) -> bool:
         self.stop_calls += 1
         self.eth_flag = False
         self.genet_started = False
         return self.return_stop_ok
+
+    def rebuild(self, prestart_ok: bool) -> int:
+        """Model the raw common-stop boundary before Probe/MAC/RX setup."""
+        self.stop_calls += 1
+        self.eth_flag = False
+        self.genet_started = False
+        if not self.stop_ok:
+            return -1
+        if not prestart_ok:
+            return 0
+        self.eth_flag = True
+        self.genet_started = True
+        return 1
 
     def tick_elapsed(self, seconds: int) -> None:
         # Only a DHCP-client lease expires here. Static/link-local identity and
@@ -135,14 +149,14 @@ def model_checks(checks: Checks) -> None:
     checks.yes(down.stop_calls == 1, "inactive flags must still issue an entry hardware stop")
     down.genet_started = True             # payload tried to leave DMA active
     checks.yes(down.reclaim(), "return must reclaim payload-started GENET")
-    checks.yes(down.resume(0), "inactive controller resume must succeed as a no-op")
+    checks.yes(down.resume(0) == 1, "inactive controller resume must succeed as a no-op")
     checks.yes(not down.genet_started and down.stop_calls == 2, "return must reclaim payload-started GENET")
     checks.yes(down.restart_calls == 0, "inactive controller must not be started")
 
     half = Machine(False, True)
     checks.yes(half.quiesce() == 1, "driver-active/flag-clear mismatch must be restored")
     checks.yes(half.reclaim(), "active controller must be reclaimed before recovery")
-    checks.yes(half.resume(1), "mismatched active controller must restart")
+    checks.yes(half.resume(1) == 1, "mismatched active controller must restart")
     checks.yes(half.eth_flag and half.genet_started, "successful restart must publish active")
 
     refused = Machine(True, True, stop_ok=False)
@@ -181,7 +195,7 @@ def model_checks(checks: Checks) -> None:
     result = active.quiesce()
     checks.yes(result == 1, "active controller must record a restart obligation")
     checks.yes(active.reclaim(), "active controller must be reclaimed before recovery")
-    checks.yes(active.resume(result), "active controller must restart")
+    checks.yes(active.resume(result) == 1, "active controller must restart")
     active.tick_elapsed(20)
     checks.yes(active.wired == before_wired, "static/link-local/alias/server state must survive")
     checks.yes(active.wifi == before_wifi, "Ethernet restart must not rewrite Wi-Fi identity")
@@ -192,7 +206,7 @@ def model_checks(checks: Checks) -> None:
     detached_before = Identity(**vars(detached.wifi))
     detached_was = detached.quiesce()
     checks.yes(detached.reclaim(), "detached-Wi-Fi case must reclaim GENET")
-    checks.yes(detached.resume(detached_was), "wired restart must not depend on Wi-Fi association")
+    checks.yes(detached.resume(detached_was) == 1, "wired restart must not depend on Wi-Fi association")
     checks.yes(detached.wifi == detached_before and not detached.wifi_associated, "detached Wi-Fi is left to its bounded health/rejoin path")
 
     leased = Machine(True, True, wired=Identity(mac=wired.mac, ip="10.0.0.9", mask="255.255.255.0", gateway="10.0.0.1", source="lease", listener_5555=True, lease_left=30), wifi=Identity(**vars(wifi)))
@@ -207,21 +221,40 @@ def model_checks(checks: Checks) -> None:
     failed_before = Identity(**vars(failed.wired))
     failed_was = failed.quiesce()
     checks.yes(failed.reclaim(), "init-failure case must first reclaim GENET")
-    checks.yes(not failed.resume(failed_was), "bounded controller init failure must be reported")
+    checks.yes(failed.resume(failed_was) == 0, "safely cleaned controller init failure must be reported")
     checks.yes(not failed.eth_flag and not failed.genet_started, "failed init must leave link inactive")
     checks.yes(failed.wired == failed_before, "failed hardware init must retain logical identity")
     checks.yes(failed.go_rc == 0x123456789ABCDEF0, "failed init must not overwrite return x0")
 
+    unsafe = Machine(True, True, wired=Identity(**vars(wired)), restart_ok=False, restart_cleanup_ok=False, go_rc=0xFEDCBA9876543210)
+    unsafe_was = unsafe.quiesce()
+    checks.yes(unsafe.reclaim(), "unsafe-restart case must first reclaim payload GENET")
+    checks.yes(unsafe.resume(unsafe_was) == -1, "failed restart cleanup must remain distinct from safely down")
+    checks.yes(not unsafe.eth_flag and not unsafe.genet_started, "unsafe cleanup must never publish active software state")
+    checks.yes(unsafe.go_rc == 0xFEDCBA9876543210, "unsafe cleanup must preserve the complete payload x0")
 
-def source_checks(checks: Checks) -> None:
-    cache = CACHE.read_text(encoding="utf-8")
-    eth = ETH.read_text(encoding="utf-8")
+    inherited = Machine(True, True)
+    checks.yes(inherited.rebuild(False) == 0, "inherited active hardware must be stopped before an early rebuild refusal")
+    checks.yes(not inherited.eth_flag and not inherited.genet_started and inherited.stop_calls == 1, "early refusal must follow one checked common stop")
+    inherited_unsafe = Machine(True, True, stop_ok=False)
+    checks.yes(inherited_unsafe.rebuild(False) == -1, "failed common rebuild stop must remain unsafe")
+    checks.yes(not inherited_unsafe.eth_flag and not inherited_unsafe.genet_started, "unsafe common stop must not publish active software state")
+
+
+def source_checks(checks: Checks, cache: str | None = None, eth: str | None = None) -> None:
+    if cache is None:
+        cache = CACHE.read_text(encoding="utf-8")
+    if eth is None:
+        eth = ETH.read_text(encoding="utf-8")
     run = procedure(cache, "RunAt")
     checked_stop = procedure(eth, "EthPayloadStopChecked")
     quiesce = procedure(eth, "EthPayloadQuiesce")
     reclaim = procedure(eth, "EthPayloadReclaim")
     resume = procedure(eth, "EthPayloadResume")
     hwup = procedure(eth, "eth_HwUp")
+    local_up = procedure(eth, "eth_HwUpLocal")
+    static_up = procedure(eth, "HwLinkStaticUp")
+    link_open = procedure(eth, "HwLinkOpen")
 
     in_order(
         checks,
@@ -233,7 +266,12 @@ def source_checks(checks: Checks) -> None:
             "SafetyWatchdogStart(gDead)",
             "CallAddr()",
             "EthPayloadReclaim()",
-            "EthPayloadResume(wasEth)",
+            "resumeEth = EthPayloadResume(wasEth)",
+            "If resumeEth < 0",
+            'Print("   The payload x0 value was ")',
+            "PutHex16(gGoRc)",
+            "UartDrain()",
+            "SafetyToFirmware()",
             "NetDhcpTick()",
             "NetConsoleRearm()",
             "SafetyWatchdogStop()",
@@ -251,15 +289,128 @@ def source_checks(checks: Checks) -> None:
         checks.yes(register in checked_stop, f"checked stop must read back {register}")
     checks.yes("EthPayloadStopChecked()" in reclaim, "return reclaim must use checked stop")
     checks.yes("SafetyToFirmware()" in run, "failed return reclaim must take the reset path")
+    checks.yes(run.count("SafetyToFirmware()") == 2, "both reclaim and restart-cleanup failures must reset")
     checks.yes(run.find("EthPayloadReclaim()") < run.find("CacheEnable()"), "return reclaim must precede cache recovery")
     checks.yes(run.find("EthPayloadReclaim()") < run.find("DmaChannelReset()"), "return reclaim must precede display DMA recovery")
-    checks.yes("If was = 0" in resume and "eth_HwUp()" in resume, "resume must restart only a prior active controller")
+    checks.yes("If was = 0" in resume and "r = eth_HwUp()" in resume, "resume must restart only a prior active controller")
+    checks.yes("If r < 0" in resume and "ProcedureReturn -1" in resume, "resume must propagate unsafe cleanup to the payload owner")
+    for constant in (
+        "#ETH_HWUP_UNSAFE  = -1",
+        "#ETH_HWUP_DOWN    = 0",
+        "#ETH_HWUP_STARTED = 1",
+        "#ETH_HWUP_ALREADY = 2",
+    ):
+        checks.yes(constant in eth, f"raw start result constant is missing or changed: {constant}")
+    pre_start = hwup[: hwup.find("If GenetStart(")]
+    in_order(checks, pre_start, ["EthPayloadStopChecked()", "EthMacFetch()", "GenetProbe()", "GenetSetMac(", "GenetSetRxRegion("], "common rebuild-entry cleanup")
+    checks.yes(pre_start.count("ProcedureReturn #ETH_HWUP_DOWN") == 3, "all three pre-Start refusals must return checked down")
+    checks.yes("ProcedureReturn 0" not in hwup, "raw start contains an unclassified Boolean zero return")
+    checks.yes(hwup.count("EthPayloadStopChecked()") == 3, "common entry and both post-start failure paths must use the checked stop")
+    checks.yes("GenetStop()" not in hwup, "raw start must not use an unchecked cleanup")
+    start_fail = hwup[hwup.find("If GenetStart("):hwup.find("; Initialise mutable defaults")]
+    in_order(checks, start_fail, ["startErr = GenetError()", "EthPayloadStopChecked()", "ProcedureReturn #ETH_HWUP_UNSAFE"], "GenetStart failure cleanup")
+    mac_fail = hwup[hwup.find("If NetSetMac(#HW_LINK_WIRED"):]
+    in_order(checks, mac_fail, ["EthPayloadStopChecked()", "ProcedureReturn #ETH_HWUP_UNSAFE", "EthWhyNet()", "ProcedureReturn #ETH_HWUP_DOWN"], "NetSetMac failure cleanup")
+    in_order(checks, local_up, ["r = eth_HwUp()", "If r < 0", "UartDrain()", "SafetyToFirmware()"], "ordinary start wrapper")
+    checks.yes("eth_HwUpLocal() <= #ETH_HWUP_DOWN" in static_up, "static boot path must not treat unsafe as success")
+    checks.yes("eth_HwUpLocal() > #ETH_HWUP_DOWN" in link_open, "link selection must accept only positive start results")
     for forbidden in ("NetClearIPv4", "NetIfClear", "NetReset", "NetInit", "DhcpdStop", "NetUdpListen"):
         checks.yes(forbidden not in hwup, f"hardware restart must not call {forbidden}")
     checks.yes("NetMacSet(#HW_LINK_WIRED)" in hwup, "first attachment must initialise defaults")
     checks.yes("NetArpFlush(#HW_LINK_WIRED)" in hwup, "restart must invalidate wired neighbours")
     checks.yes("NetSetMac(#HW_LINK_WIRED" in hwup, "restart must revalidate wired MAC identity")
     checks.yes("#HW_LINK_WIFI" not in hwup + checked_stop + quiesce + reclaim + resume, "wired lifecycle must not mutate Wi-Fi")
+
+
+def mutation_checks(checks: Checks) -> None:
+    cache = CACHE.read_text(encoding="utf-8")
+    eth = ETH.read_text(encoding="utf-8")
+    mutations = [
+        (
+            "common rebuild entry bypasses checked stop",
+            "eth",
+            eth,
+            "If EthPayloadStopChecked() = 0\n    PrintN(\"!! the Ethernet rebuild could not establish a stopped controller.\")",
+            "If GenetStop() = 0\n    PrintN(\"!! the Ethernet rebuild could not establish a stopped controller.\")",
+            cache,
+        ),
+        (
+            "raw DOWN constant changed",
+            "eth",
+            eth,
+            "#ETH_HWUP_DOWN    = 0",
+            "#ETH_HWUP_DOWN    = 1",
+            cache,
+        ),
+        (
+            "raw STARTED constant changed",
+            "eth",
+            eth,
+            "#ETH_HWUP_STARTED = 1",
+            "#ETH_HWUP_STARTED = 0",
+            cache,
+        ),
+        (
+            "early Probe refusal claims started",
+            "eth",
+            eth,
+            "EthWhyGenet()\n    ProcedureReturn #ETH_HWUP_DOWN\n  EndIf\n\n  If GenetSetMac",
+            "EthWhyGenet()\n    ProcedureReturn #ETH_HWUP_STARTED\n  EndIf\n\n  If GenetSetMac",
+            cache,
+        ),
+        (
+            "GenetStart unchecked cleanup",
+            "eth",
+            eth,
+            "startErr = GenetError()\n    If EthPayloadStopChecked() = 0",
+            "startErr = GenetError()\n    GenetStop()\n    If 1 = 0",
+            cache,
+        ),
+        (
+            "NetSetMac unchecked cleanup",
+            "eth",
+            eth,
+            "If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0\n    ; This logical refusal happened after GenetStart enabled the MAC and DMA.",
+            "If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0\n    GenetStop()\n    ; This logical refusal happened after GenetStart enabled the MAC and DMA.",
+            cache,
+        ),
+        (
+            "ordinary caller accepts negative",
+            "eth",
+            eth,
+            "If eth_HwUpLocal() > #ETH_HWUP_DOWN",
+            "If eth_HwUp() <> 0",
+            cache,
+        ),
+        (
+            "payload resume swallows unsafe",
+            "eth",
+            eth,
+            "If r < 0\n    ; The raw start already named the failed cleanup.",
+            "If r = 0\n    ; The raw start already named the failed cleanup.",
+            cache,
+        ),
+        (
+            "RunAt ignores unsafe resume",
+            "cache",
+            cache,
+            "resumeEth = EthPayloadResume(wasEth)\n  If resumeEth < 0",
+            "EthPayloadResume(wasEth)\n  If 0",
+            eth,
+        ),
+    ]
+    for name, kind, owner, old, new, other in mutations:
+        checks.yes(old in owner, f"mutation pattern disappeared: {name}")
+        changed = owner.replace(old, new, 1)
+        try:
+            if kind == "eth":
+                source_checks(Checks(), other, changed)
+            else:
+                source_checks(Checks(), changed, other)
+        except AssertionError:
+            checks.yes(True, f"mutation killed: {name}")
+        else:
+            checks.yes(False, f"mutation survived: {name}")
 
 
 def asm_procedure(assembly: str, start: str, end: str) -> str:
@@ -270,13 +421,20 @@ def asm_procedure(assembly: str, start: str, end: str) -> str:
     return assembly[begin + 1 : finish]
 
 
+def has_call(assembly: str, label: str) -> bool:
+    return re.search(rf"(?m)^\s*bl\s+{re.escape(label)}\s*$", assembly) is not None
+
+
 def emitted_checks(checks: Checks, assembly: str) -> None:
     run = asm_procedure(assembly, "RunAt", "CmdBlock")
     checked_stop = asm_procedure(assembly, "EthPayloadStopChecked", "EthPayloadQuiesce")
     quiesce = asm_procedure(assembly, "EthPayloadQuiesce", "EthPayloadReclaim")
     reclaim = asm_procedure(assembly, "EthPayloadReclaim", "EthPayloadResume")
     resume = asm_procedure(assembly, "EthPayloadResume", "HwLinkClose")
-    hwup = asm_procedure(assembly, "eth_HwUp", "EthCableIn")
+    hwup = asm_procedure(assembly, "eth_HwUp", "eth_HwUpLocal")
+    local_up = asm_procedure(assembly, "eth_HwUpLocal", "EthCableIn")
+    static_up = asm_procedure(assembly, "HwLinkStaticUp", "EthBootWired")
+    link_open = asm_procedure(assembly, "HwLinkOpen", "HwLinkAddressBound")
 
     in_order(
         checks,
@@ -288,6 +446,10 @@ def emitted_checks(checks: Checks, assembly: str) -> None:
             "bl calladdr",
             "bl ethpayloadreclaim",
             "bl ethpayloadresume",
+            "global_ggorc",
+            "bl puthex16",
+            "bl uartdrain",
+            "bl safetytofirmware",
             "bl netdhcptick",
             "bl netconsolerearm",
             "bl safetywatchdogstop",
@@ -311,7 +473,14 @@ def emitted_checks(checks: Checks, assembly: str) -> None:
     checks.yes(run.find("bl ethpayloadreclaim") < run.find("bl cacheenable"), "emitted reclaim must precede cache recovery")
     checks.yes(run.find("bl ethpayloadreclaim") < run.find("bl dmachannelreset"), "emitted reclaim must precede display DMA recovery")
     checks.yes("bl safetytofirmware" in run, "emitted failed reclaim must reset rather than continue")
-    checks.yes("bl eth_hwup" in resume, "emitted resume must call the full hardware start")
+    checks.yes(run.count("bl safetytofirmware") == 2, "emitted RunAt must reset on reclaim and restart-cleanup failures")
+    checks.yes(has_call(resume, "eth_hwup"), "emitted resume must call the full hardware start")
+    checks.yes(hwup.count("bl ethpayloadstopchecked") == 3, "emitted common entry and start failures must use checked cleanup")
+    checks.yes(not has_call(hwup, "genetstop"), "emitted raw start contains unchecked cleanup")
+    in_order(checks, hwup, ["bl ethpayloadstopchecked", "bl ethmacfetch", "bl genetprobe", "bl genetsetmac", "bl genetsetrxregion", "bl genetstart"], "emitted common rebuild entry")
+    in_order(checks, local_up, ["bl eth_hwup", "bl uartdrain", "bl safetytofirmware"], "ordinary start wrapper emitted A64")
+    checks.yes(has_call(static_up, "eth_hwuplocal") and not has_call(static_up, "eth_hwup"), "static-up path bypasses ordinary safety wrapper")
+    checks.yes(has_call(link_open, "eth_hwuplocal") and not has_call(link_open, "eth_hwup"), "link-open path bypasses ordinary safety wrapper")
     for forbidden in ("netclearipv4", "netifclear", "netreset", "netinit", "dhcpdstop", "netudplisten"):
         checks.yes(f"bl {forbidden}" not in hwup, f"emitted hardware restart calls {forbidden}")
     in_order(checks, hwup, ["bl netmacset", "bl netdefaults", "bl netarpflush", "bl netsetmac"], "eth_HwUp emitted A64")
@@ -343,6 +512,7 @@ def main() -> int:
     try:
         model_checks(checks)
         source_checks(checks)
+        mutation_checks(checks)
         if args.assembly:
             assembly = Path(args.assembly).read_text(encoding="utf-8")
         else:
