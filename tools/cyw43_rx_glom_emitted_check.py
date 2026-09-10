@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and execute the production CYW43 transport-telemetry gate.
-
-Requires external tools; neither is copied into the product tree:
-  PMFC=<path-to-pmfc> PMF_A64_INTERP=<path-to-a64_interp.py> \
-      python tools/wifi_bus_telemetry_emitted_check.py
-"""
+"""Compile and execute the bounded CYW43 receive-glom parser gate."""
 
 from __future__ import annotations
 
@@ -19,27 +14,27 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROBE = ROOT / "RaspberryPi4" / "Tests" / "wifi_bus_telemetry_emitted_gate.pi4"
+PROBE = ROOT / "RaspberryPi4" / "Tests" / "cyw43_rx_glom_emitted_gate.pi4"
 LOAD = 0x00400000
 STACK = 0x03000000
 STACK_BYTES = 0x00100000
 LOADER_LR = 0xDEAD0000
-STEP_LIMIT = 4_000_000
+STEP_LIMIT = 8_000_000
 
 
 def required_path(value: str | None, env_name: str) -> Path:
     if not value:
-        raise SystemExit(f"wifi bus telemetry gate: set {env_name} or pass its option")
+        raise SystemExit(f"cyw43 rx glom gate: set {env_name} or pass its option")
     path = Path(value).expanduser().resolve()
     if not path.is_file():
-        raise SystemExit(f"wifi bus telemetry gate: {env_name} file not found: {path}")
+        raise SystemExit(f"cyw43 rx glom gate: {env_name} file not found: {path}")
     return path
 
 
 def load_interpreter(path: Path):
-    spec = importlib.util.spec_from_file_location("anvil_wifi_bus_a64_interp", path)
+    spec = importlib.util.spec_from_file_location("anvil_cyw43_rx_glom_a64", path)
     if spec is None or spec.loader is None:
-        raise SystemExit(f"wifi bus telemetry gate: cannot load interpreter: {path}")
+        raise SystemExit(f"cyw43 rx glom gate: cannot load interpreter: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -57,7 +52,7 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
     try:
         return values["__bss_start__"], values["__bss_end__"]
     except KeyError as exc:
-        raise SystemExit("wifi bus telemetry gate: compiler symbol map has no BSS bounds") from exc
+        raise SystemExit("cyw43 rx glom gate: compiler symbol map has no BSS bounds") from exc
 
 
 def build(pmfc: Path, work: Path) -> Path:
@@ -66,7 +61,7 @@ def build(pmfc: Path, work: Path) -> Path:
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
-    image = work / "wifi_bus_telemetry_gate.img"
+    image = work / "cyw43_rx_glom_gate.img"
     command = [
         str(staged), PROBE.relative_to(ROOT).as_posix(),
         "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
@@ -79,9 +74,9 @@ def build(pmfc: Path, work: Path) -> Path:
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
     if run.returncode or "pmfc: OK" not in run.stdout:
-        raise SystemExit("wifi bus telemetry gate: compile failed\n" + run.stdout)
+        raise SystemExit("cyw43 rx glom gate: compile failed\n" + run.stdout)
     if not image.is_file() or not image.with_suffix(image.suffix + ".sym").is_file():
-        raise SystemExit("wifi bus telemetry gate: compiler omitted image or symbol map")
+        raise SystemExit("cyw43 rx glom gate: compiler omitted image or symbol map")
     return image
 
 
@@ -109,7 +104,7 @@ def execute(a64, image: Path) -> tuple[int, int]:
         cpu.align_guard(addr, size, False)
         if not contains(readable, addr, size):
             raise SystemExit(
-                f"wifi bus telemetry gate: read outside image/BSS/stack at ${addr:08X}+{size}"
+                f"cyw43 rx glom gate: read outside image/BSS/stack at ${addr:08X}+{size}"
             )
         return sum(cpu.memory.get(addr + i, 0) << (8 * i) for i in range(size))
 
@@ -117,29 +112,18 @@ def execute(a64, image: Path) -> tuple[int, int]:
         cpu.align_guard(addr, size, True)
         if not contains(writable, addr, size):
             raise SystemExit(
-                f"wifi bus telemetry gate: write outside BSS/stack at ${addr:08X}+{size}"
+                f"cyw43 rx glom gate: write outside BSS/stack at ${addr:08X}+{size}"
             )
         for i in range(size):
             cpu.memory[addr + i] = (value >> (8 * i)) & 0xFF
 
     cpu.load = load
     cpu.store = store
-    ticks = 0
-    plain_step = a64.A64.step.__get__(cpu)
     for steps in range(STEP_LIMIT):
         if cpu.pc == LOADER_LR:
             return cpu.x[0], steps
-        ticks += 1
-        ins = load(cpu.pc, 4)
-        if (ins & 0xFFFFFFE0) == 0xD53BE000:       # mrs Xt,cntfrq_el0
-            cpu.x[ins & 31] = 54_000_000
-            cpu.pc += 4
-        elif (ins & 0xFFFFFFE0) == 0xD53BE020:     # mrs Xt,cntpct_el0
-            cpu.x[ins & 31] = ticks
-            cpu.pc += 4
-        else:
-            plain_step()
-    raise SystemExit(f"wifi bus telemetry gate: no return in {STEP_LIMIT} instructions")
+        cpu.step()
+    raise SystemExit(f"cyw43 rx glom gate: no return in {STEP_LIMIT} instructions")
 
 
 def main() -> int:
@@ -150,13 +134,13 @@ def main() -> int:
     pmfc = required_path(args.pmfc, "PMFC")
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
-    with tempfile.TemporaryDirectory(prefix="anvil-wifi-bus-emitted-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="anvil-cyw43-rx-glom-") as temporary:
         image = build(pmfc, Path(temporary))
         result, steps = execute(a64, image)
     if result:
-        print(f"wifi_bus_telemetry_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
+        print(f"cyw43_rx_glom_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"wifi_bus_telemetry_emitted_check: PASS - 35 assertions, {steps:,} A64 instructions")
+    print(f"cyw43_rx_glom_emitted_check: PASS - 42 assertions, {steps:,} A64 instructions")
     return 0
 
 

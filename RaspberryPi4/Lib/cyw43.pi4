@@ -1,6 +1,9 @@
 ; ======================================================================
 ; CYW43455 - the Raspberry Pi 4's on-board WiFi part, over SDIO.
 ; Library, not a compiler builtin.
+; Portions adapt Linux brcmfmac protocol/transport source:
+; Copyright (c) 2010, 2012, 2014 Broadcom Corporation, ISC license.
+; See licenses/Broadcom-brcmfmac-ISC.txt and docs/THIRD_PARTY_NOTICES.md.
 ; ----------------------------------------------------------------------
 ; THIS FILE STOPS AT THE FIRMWARE WALL AND IT STOPS LOUDLY. Read the
 ; section called THE WALL before writing anything that calls it. What is
@@ -11,13 +14,14 @@
 ; with evidence rather than left as a TODO for somebody to trip over.
 ;
 ; ======================================================================
-; USE - this file names no other file (house rule: a library never
-; includes a library). The MAIN program lists what it needs, and hands
-; this file its four SDIO primitives:
+; USE - the MAIN program includes the register-free receive-glom parser before
+; this file, then hands this file its four SDIO primitives. Libraries do not
+; nest other libraries; the complete dependency order is explicit at the main.
 ;
 ;     XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+;     XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
 ;
 ;     MailboxInit()
@@ -567,9 +571,12 @@
 #CYW43_SBADDRLOW   = $1000A  ; SBSDIO_FUNC1_SBADDRLOW    s:75
 #CYW43_SBADDRMID   = $1000B  ; SBSDIO_FUNC1_SBADDRMID    s:77
 #CYW43_SBADDRHIGH  = $1000C  ; SBSDIO_FUNC1_SBADDRHIGH   s:79
-#CYW43_FRAMECTRL   = $1000D  ; SBSDIO_FUNC1_FRAMECTRL    s:81  unused
+#CYW43_FRAMECTRL   = $1000D  ; SBSDIO_FUNC1_FRAMECTRL    s:81
 #CYW43_CHIPCLKCSR  = $1000E  ; SBSDIO_FUNC1_CHIPCLKCSR   s:83
 #CYW43_SDIOPULLUP  = $1000F  ; SBSDIO_FUNC1_SDIOPULLUP   s:85
+#CYW43_RFRAMEBCLO  = $1001B  ; SBSDIO_FUNC1_RFRAMEBCLO   s:91
+#CYW43_RFRAMEBCHI  = $1001C  ; SBSDIO_FUNC1_RFRAMEBCHI   s:93
+#CYW43_RF_TERM     = 1       ; SFC_RF_TERM, sdio.c:244
 
 #CYW43_SB_OFT_ADDR_MASK = $00007FFF  ; SBSDIO_SB_OFT_ADDR_MASK   s:122
 #CYW43_SB_OFT_ADDR_LIMIT = $00008000 ; SBSDIO_SB_OFT_ADDR_LIMIT  s:123
@@ -1293,6 +1300,8 @@
 #CYW43_TXBUF     = 1536
 #CYW43_RXBUF     = 2048
 #CYW43_MAX_FRAME = 2048
+#CYW43_RXQ_CAP   = 64        ; one retained glom plus headroom for one maximum glom
+#CYW43_RXQ_SLOT  = #CYW43_MAX_FRAME
 
 ; How many networks the scan table holds. A refusal at the limit, not a
 ; wrap: see Cyw43ScanPoll.
@@ -1314,6 +1323,7 @@
 ; from a refused ioctl and it gets its own code: a refusal blames the
 ; transport, this blames the bytes. The raw word is in Cyw43ClmStatus().
 #CYW43_IO_CLMBAD  = -5
+#CYW43_IO_PENDING = -6       ; received data retained; caller must drain it
 
 ; What Cyw43ScanPoll returns.
 #CYW43_SCAN_RUNNING = 0
@@ -1484,7 +1494,7 @@
 ;  ring would be a row nobody reads. Same exclusion the Pico makes and
 ;  for the same reason.
 ; ----------------------------------------------------------------------
-#CYW43_EVRING = 16
+#CYW43_EVRING = 32           ; one documented maximum-size receive glom
 
 ; The iovar names, and their lengths WITHOUT the terminating NUL.
 ; Kept as constants beside the DataSection they describe, because a loop
@@ -4438,6 +4448,25 @@ EndProcedure
 Global Dim cyw43_tx.l[#CYW43_TXBUF / 4]
 Global Dim cyw43_rx.l[#CYW43_RXBUF / 4]
 
+; Raw SDPCM frames retained when a control/event/credit wait encounters
+; unrelated network data, and when one receive glom expands into several
+; frames. Sixty-four slots hold one retained documented 32-frame aggregate
+; plus enough reserved space to accept one further maximum aggregate while a
+; synchronous control wait advances to its matching reply.
+Global Dim cyw43_rxq.l[(#CYW43_RXQ_CAP * #CYW43_RXQ_SLOT) / 4]
+Global Dim cyw43_rxqLen.i[#CYW43_RXQ_CAP]
+Global Dim cyw43_rxqSeqDone.a[#CYW43_RXQ_CAP]
+Global Dim cyw43_rxqCreditDone.a[#CYW43_RXQ_CAP]
+Global cyw43_rxqHead.i = 0
+Global cyw43_rxqTail.i = 0
+Global cyw43_rxqCount.i = 0
+Global cyw43_rxqHigh.i = 0
+Global cyw43_rxqQueued.i = 0
+Global cyw43_rxqFull.i = 0
+Global cyw43_rxFrameLen.i = 0
+Global cyw43_rxFrameSeqDone.i = 0
+Global cyw43_rxFrameCreditDone.i = 0
+
 ; The iovar staging buffer. Declared .l for the same reason the others
 ; are: a Dim array lands 8-byte aligned on this backend, which is more
 ; than CMD53's 4-byte contract asks for.
@@ -4618,6 +4647,15 @@ Global cyw43_rxBadLastComp.i = 0
 Global cyw43_rxTooBigLastSize.i = 0
 Global cyw43_rxTooBigLastChan.i = 0
 Global cyw43_rxTooBigGlom.i = 0
+Global cyw43_rxGlomPackets.i = 0
+Global cyw43_rxGlomFailures.i = 0
+Global cyw43_rxAbortActive.i = 0
+Global cyw43_rxAbortT0.i = 0
+Global cyw43_rxAbortBudget.i = 0
+Global cyw43_rxAbortStarted.i = 0
+Global cyw43_rxAbortDone.i = 0
+Global cyw43_rxAbortFailed.i = 0
+Global cyw43_rxAbortFault.i = 0
 
 ; WHERE THE ETHERNET FRAME STARTS inside cyw43_rx, for the event that
 ; was just decoded. It is NOT a constant: it is
@@ -4918,6 +4956,12 @@ EndProcedure
 ;  carries the rounded length because the bus cannot move a partial
 ;  word; the SDPCM header inside carries the true length, and that is
 ;  the one the firmware checks.
+;
+;  FUNCTION 2 IS A FIFO, SO ITS CMD53 ADDRESS IS FIXED. bcmsdh.c uses
+;  sdio_readsb for F2 and its scatter/gather command sets OP_CODE only for
+;  function 1. Consequently every F2 primitive below receives incr = 0 and
+;  `addr` never advances between chunks. This is independent of receive
+;  glomming; a dedicated emitted gate checks both byte and block calls.
 ; ----------------------------------------------------------------------
 Procedure.i cyw43_F2Xfer(write.i, *buf, n.i)
   Define addr.i
@@ -4936,7 +4980,10 @@ Procedure.i cyw43_F2Xfer(write.i, *buf, n.i)
   If n <= 0 Or (n & 3) <> 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_BAD_LEN)
   EndIf
-  If n > #CYW43_MAX_FRAME
+  If write <> 0 And n > #CYW43_MAX_FRAME
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_BAD_LEN)
+  EndIf
+  If write = 0 And n > #CYW43_RXG_MAX_BYTES
     ProcedureReturn cyw43_Fail(#CYW43_ERR_BAD_LEN)
   EndIf
 
@@ -4966,18 +5013,17 @@ Procedure.i cyw43_F2Xfer(write.i, *buf, n.i)
       whole = blocks * cyw43_f2Blk
       cyw43_TraceIo(#CYW43_TR_F2_BLOCK)
       If write <> 0
-        If cyw43_wrb(#CYW43_FN_WLAN, addr, q, cyw43_f2Blk, blocks, 1) <> 1
+        If cyw43_wrb(#CYW43_FN_WLAN, addr, q, cyw43_f2Blk, blocks, 0) <> 1
           cyw43_f2Failures = cyw43_f2Failures + 1
           ProcedureReturn cyw43_Fail(#CYW43_ERR_XFER)
         EndIf
       Else
-        If cyw43_rdb(#CYW43_FN_WLAN, addr, q, cyw43_f2Blk, blocks, 1) <> 1
+        If cyw43_rdb(#CYW43_FN_WLAN, addr, q, cyw43_f2Blk, blocks, 0) <> 1
           cyw43_f2Failures = cyw43_f2Failures + 1
           ProcedureReturn cyw43_Fail(#CYW43_ERR_XFER)
         EndIf
       EndIf
       q = q + whole
-      addr = addr + whole
       left = left - whole
     Wend
   EndIf
@@ -4989,18 +5035,17 @@ Procedure.i cyw43_F2Xfer(write.i, *buf, n.i)
     EndIf
     cyw43_TraceIo(#CYW43_TR_F2_BYTE)
     If write <> 0
-      If cyw43_wr(#CYW43_FN_WLAN, addr, q, rest, 1) <> 1
+      If cyw43_wr(#CYW43_FN_WLAN, addr, q, rest, 0) <> 1
         cyw43_f2Failures = cyw43_f2Failures + 1
         ProcedureReturn cyw43_Fail(#CYW43_ERR_XFER)
       EndIf
     Else
-      If cyw43_rd(#CYW43_FN_WLAN, addr, q, rest, 1) <> 1
+      If cyw43_rd(#CYW43_FN_WLAN, addr, q, rest, 0) <> 1
         cyw43_f2Failures = cyw43_f2Failures + 1
         ProcedureReturn cyw43_Fail(#CYW43_ERR_XFER)
       EndIf
     EndIf
     q = q + rest
-    addr = addr + rest
     left = left - rest
   Wend
 
@@ -5084,6 +5129,154 @@ EndProcedure
 
 
 ; ----------------------------------------------------------------------
+;  Retained receive frames.
+;
+;  The queue stores complete, already bounded SDPCM frames. It is not a
+;  second network dispatcher: Cyw43Receive pops a frame back into cyw43_rx
+;  and the one existing parser handles it. Copies are word-at-a-time; both
+;  buffers and every accepted glom segment are four-byte aligned.
+; ----------------------------------------------------------------------
+Procedure.i cyw43_RxqPush(*frame, bytes.i, seqDone.i, creditDone.i)
+  Define *dst
+  Define words.i
+  Define i.i
+  If *frame = 0 Or bytes < #CYW43_SDPCM_HDRLEN Or bytes > #CYW43_RXQ_SLOT
+    ProcedureReturn 0
+  EndIf
+  If cyw43_rxqCount >= #CYW43_RXQ_CAP
+    cyw43_rxqFull = cyw43_rxqFull + 1
+    ProcedureReturn 0
+  EndIf
+  *dst = @cyw43_rxq[0] + (cyw43_rxqTail * #CYW43_RXQ_SLOT)
+  words = bytes / 4
+  For i = 0 To words - 1
+    PokeL(*dst + (i * 4), PeekL(*frame + (i * 4)))
+  Next
+  For i = words * 4 To bytes - 1
+    PokeB(*dst + i, PeekA(*frame + i))
+  Next
+  cyw43_rxqLen[cyw43_rxqTail] = bytes
+  cyw43_rxqSeqDone[cyw43_rxqTail] = seqDone
+  cyw43_rxqCreditDone[cyw43_rxqTail] = creditDone
+  cyw43_rxqTail = (cyw43_rxqTail + 1) % #CYW43_RXQ_CAP
+  cyw43_rxqCount = cyw43_rxqCount + 1
+  cyw43_rxqQueued = cyw43_rxqQueued + 1
+  If cyw43_rxqCount > cyw43_rxqHigh
+    cyw43_rxqHigh = cyw43_rxqCount
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i cyw43_RxqPop()
+  Define *src
+  Define bytes.i
+  Define words.i
+  Define i.i
+  If cyw43_rxqCount <= 0
+    ProcedureReturn 0
+  EndIf
+  bytes = cyw43_rxqLen[cyw43_rxqHead]
+  If bytes < #CYW43_SDPCM_HDRLEN Or bytes > #CYW43_RXBUF
+    cyw43_rxqFull = cyw43_rxqFull + 1
+    cyw43_rxqHead = (cyw43_rxqHead + 1) % #CYW43_RXQ_CAP
+    cyw43_rxqCount = cyw43_rxqCount - 1
+    ProcedureReturn 0
+  EndIf
+  *src = @cyw43_rxq[0] + (cyw43_rxqHead * #CYW43_RXQ_SLOT)
+  cyw43_rxFrameSeqDone = cyw43_rxqSeqDone[cyw43_rxqHead]
+  cyw43_rxFrameCreditDone = cyw43_rxqCreditDone[cyw43_rxqHead]
+  words = bytes / 4
+  For i = 0 To words - 1
+    PokeL(@cyw43_rx[0] + (i * 4), PeekL(*src + (i * 4)))
+  Next
+  For i = words * 4 To bytes - 1
+    PokeB(@cyw43_rx[0] + i, PeekA(*src + i))
+  Next
+  cyw43_rxqHead = (cyw43_rxqHead + 1) % #CYW43_RXQ_CAP
+  cyw43_rxqCount = cyw43_rxqCount - 1
+  cyw43_rxFrameLen = bytes
+  ProcedureReturn bytes
+EndProcedure
+
+Procedure.i cyw43_RxqCanPoll()
+  ; Keep enough empty slots for one complete maximum-size aggregate. This
+  ; lets a synchronous control wait pass retained data and reach its reply,
+  ; without starting a superframe read that cannot be committed atomically.
+  If cyw43_rxqCount > (#CYW43_RXQ_CAP - #CYW43_RXG_MAX_FRAMES)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i cyw43_RxqHeadChannel()
+  Define *src
+  If cyw43_rxqCount <= 0
+    ProcedureReturn -1
+  EndIf
+  *src = @cyw43_rxq[0] + (cyw43_rxqHead * #CYW43_RXQ_SLOT)
+  ProcedureReturn PeekA(*src + #CYW43_SDPCM_OFF_CHAN) & #CYW43_SDPCM_CHAN_MASK
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  Receive-frame termination.
+;
+;  Linux brcmf_sdio_rxfail writes SFC_RF_TERM, then observes the F1 receive
+;  byte count until it reaches zero. Here one step performs one observation;
+;  callers remain responsive and no unbounded 65,535-command loop sits inside
+;  a console/network pump. No further F2 header is read while this is active.
+; ----------------------------------------------------------------------
+#CYW43_RX_ABORT_MS = 100
+
+Procedure.i cyw43_RxAbortStart()
+  cyw43_rxAbortStarted = cyw43_rxAbortStarted + 1
+  cyw43_rxAbortActive = 1
+  cyw43_rxAbortFault = 0
+  If Cyw43WriteByte(#CYW43_FN_BACKPLANE, #CYW43_FRAMECTRL, #CYW43_RF_TERM) = 0
+    cyw43_rxAbortFailed = cyw43_rxAbortFailed + 1
+    cyw43_rxAbortFault = 1
+    ProcedureReturn 0
+  EndIf
+  cyw43_rxAbortT0 = cyw43_Ticks()
+  cyw43_rxAbortBudget = (cyw43_hz / 1000) * #CYW43_RX_ABORT_MS
+  If cyw43_rxAbortBudget < 1
+    cyw43_rxAbortBudget = 1
+  EndIf
+  cyw43_rxAbortActive = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i cyw43_RxAbortStep()
+  Define hi.i
+  Define lo.i
+  If cyw43_rxAbortActive = 0
+    ProcedureReturn 1
+  EndIf
+  If cyw43_rxAbortFault <> 0
+    ProcedureReturn -1
+  EndIf
+  hi = Cyw43ReadByte(#CYW43_FN_BACKPLANE, #CYW43_RFRAMEBCHI)
+  lo = Cyw43ReadByte(#CYW43_FN_BACKPLANE, #CYW43_RFRAMEBCLO)
+  If hi < 0 Or lo < 0
+    cyw43_rxAbortFault = 1
+    cyw43_rxAbortFailed = cyw43_rxAbortFailed + 1
+    ProcedureReturn -1
+  EndIf
+  If hi = 0 And lo = 0
+    cyw43_rxAbortActive = 0
+    cyw43_rxAbortDone = cyw43_rxAbortDone + 1
+    ProcedureReturn 1
+  EndIf
+  If (cyw43_Ticks() - cyw43_rxAbortT0) > cyw43_rxAbortBudget
+    cyw43_rxAbortFault = 1
+    cyw43_rxAbortFailed = cyw43_rxAbortFailed + 1
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+
+; ----------------------------------------------------------------------
 ;  Cyw43TransportReset - the bookkeeping, once, before the first ioctl.
 ;
 ;  Sequence 0 and credit 1. See the declarations for why the 1 matters.
@@ -5135,6 +5328,25 @@ Procedure Cyw43TransportReset()
   cyw43_rxTooBigLastSize = 0
   cyw43_rxTooBigLastChan = 0
   cyw43_rxTooBigGlom = 0
+  cyw43_rxGlomPackets = 0
+  cyw43_rxGlomFailures = 0
+  cyw43_rxqHead = 0
+  cyw43_rxqTail = 0
+  cyw43_rxqCount = 0
+  cyw43_rxqHigh = 0
+  cyw43_rxqQueued = 0
+  cyw43_rxqFull = 0
+  cyw43_rxFrameLen = 0
+  cyw43_rxFrameSeqDone = 0
+  cyw43_rxFrameCreditDone = 0
+  cyw43_rxAbortActive = 0
+  cyw43_rxAbortT0 = 0
+  cyw43_rxAbortBudget = 0
+  cyw43_rxAbortStarted = 0
+  cyw43_rxAbortDone = 0
+  cyw43_rxAbortFailed = 0
+  cyw43_rxAbortFault = 0
+  Cyw43RxGlomReset()
   cyw43_evP = 0
   cyw43_evType = -1
   cyw43_evStatus = -1
@@ -5425,6 +5637,7 @@ EndProcedure
 ;     1  a control reply arrived whose BCDC id matched wantId
 ;     2  a validated ESCAN_RESULT event was decoded
 ;     3  a frame arrived and was consumed but was none of the above
+;     6  a glom was consumed and its inner frames were retained
 ;    -1  the bus failed
 ;
 ;  wantId of -1 matches no reply, which is how a caller drains the FIFO
@@ -5434,7 +5647,7 @@ EndProcedure
 ;  been taken out of the FIFO by the read below; anything else would
 ;  punish the next frame for this one's sins.
 ; ----------------------------------------------------------------------
-Procedure.i cyw43_RxFrame(wantId.i)
+Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
   Define size.i
   Define comp.i
   Define chan.i
@@ -5448,16 +5661,46 @@ Procedure.i cyw43_RxFrame(wantId.i)
   Define rawchan.i
   Define seq.i
   Define nextlen.i
+  Define fromQueue.i
+  Define ar.i
+  Define gr.i
+  Define gc.i
+  Define gi.i
+  Define gp.i
+  Define gn.i
 
-  ; The first read. Its length is fixed because the frame's own length
-  ; is not known yet.
-  cyw43_rxFirstReads = cyw43_rxFirstReads + 1
-  cyw43_TraceIo(#CYW43_TR_F2_FIRST)
-  If cyw43_F2Xfer(0, @cyw43_rx[0], #CYW43_FIRSTREAD) = 0
-    ProcedureReturn -1
+  fromQueue = 0
+  cyw43_rxFrameSeqDone = 0
+  cyw43_rxFrameCreditDone = 0
+  If allowQueued <> 0 And cyw43_rxqCount > 0
+    size = cyw43_RxqPop()
+    If size = 0
+      ProcedureReturn -1
+    EndIf
+    fromQueue = 1
+  Else
+    ; Finish a prior malformed-frame termination before asking F2 for a
+    ; new header. One observation per call keeps this recovery nonblocking.
+    If cyw43_rxAbortActive <> 0
+      ar = cyw43_RxAbortStep()
+      If ar < 0
+        ProcedureReturn -1
+      EndIf
+      If ar = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
+
+    ; The first read. Its length is fixed because the frame's own length
+    ; is not known yet.
+    cyw43_rxFirstReads = cyw43_rxFirstReads + 1
+    cyw43_TraceIo(#CYW43_TR_F2_FIRST)
+    If cyw43_F2Xfer(0, @cyw43_rx[0], #CYW43_FIRSTREAD) = 0
+      ProcedureReturn -1
+    EndIf
+    size = cyw43_RxLE16(#CYW43_SDPCM_OFF_LEN)
   EndIf
 
-  size = cyw43_RxLE16(#CYW43_SDPCM_OFF_LEN)
   comp = cyw43_RxLE16(#CYW43_SDPCM_OFF_COMP)
 
   ; sdio.c lines 1382-1385, and the order of these two tests is the
@@ -5470,10 +5713,20 @@ Procedure.i cyw43_RxFrame(wantId.i)
     cyw43_rxBadHdr = cyw43_rxBadHdr + 1
     cyw43_rxBadLastSize = size
     cyw43_rxBadLastComp = comp
+    If fromQueue = 0
+      If cyw43_RxAbortStart() = 0
+        ProcedureReturn -1
+      EndIf
+    EndIf
     ProcedureReturn 3
   EndIf
   If size < #CYW43_SDPCM_HDRLEN
     cyw43_rxShort = cyw43_rxShort + 1
+    If fromQueue = 0
+      If cyw43_RxAbortStart() = 0
+        ProcedureReturn -1
+      EndIf
+    EndIf
     ProcedureReturn 3
   EndIf
   If size > #CYW43_MAX_FRAME
@@ -5487,16 +5740,24 @@ Procedure.i cyw43_RxFrame(wantId.i)
     If (rawchan & #CYW43_SDPCM_CHAN_MASK) = #CYW43_CHAN_GLOM
       cyw43_rxTooBigGlom = cyw43_rxTooBigGlom + 1
     EndIf
+    If fromQueue = 0
+      If cyw43_RxAbortStart() = 0
+        ProcedureReturn -1
+      EndIf
+    EndIf
     ProcedureReturn 3
   EndIf
 
   ; The rest of the frame, if there is any. Rounded up to a word for the
   ; bus; the slack lands in the buffer and is ignored.
-  If size > #CYW43_FIRSTREAD
+  If fromQueue = 0 And size > #CYW43_FIRSTREAD
     rest = size - #CYW43_FIRSTREAD
     total = (rest + 3) & (~3)
     If (#CYW43_FIRSTREAD + total) > #CYW43_RXBUF
       cyw43_rxTooBig = cyw43_rxTooBig + 1
+      If cyw43_RxAbortStart() = 0
+        ProcedureReturn -1
+      EndIf
       ProcedureReturn 3
     EndIf
     cyw43_rxRestReads = cyw43_rxRestReads + 1
@@ -5506,6 +5767,7 @@ Procedure.i cyw43_RxFrame(wantId.i)
     EndIf
   EndIf
 
+  cyw43_rxFrameLen = size
   cyw43_rxFrames = cyw43_rxFrames + 1
 
   rawchan = cyw43_Rx8(#CYW43_SDPCM_OFF_CHAN)
@@ -5518,16 +5780,18 @@ Procedure.i cyw43_RxFrame(wantId.i)
   ; rule. brcmfmac likewise records a mismatch and keeps draining. A gap
   ; here says the loss is below TCP; a continuous sequence with TCP holes
   ; moves the investigation above this layer.
-  If cyw43_rxSeqSeen <> 0
-    If seq <> cyw43_rxSeqExpect
-      cyw43_rxSeqMismatch = cyw43_rxSeqMismatch + 1
-      cyw43_rxSeqLastExpect = cyw43_rxSeqExpect
-      cyw43_rxSeqLastGot = seq
+  If cyw43_rxFrameSeqDone = 0
+    If cyw43_rxSeqSeen <> 0
+      If seq <> cyw43_rxSeqExpect
+        cyw43_rxSeqMismatch = cyw43_rxSeqMismatch + 1
+        cyw43_rxSeqLastExpect = cyw43_rxSeqExpect
+        cyw43_rxSeqLastGot = seq
+      EndIf
+    Else
+      cyw43_rxSeqSeen = 1
     EndIf
-  Else
-    cyw43_rxSeqSeen = 1
+    cyw43_rxSeqExpect = (seq + 1) & $FF
   EndIf
-  cyw43_rxSeqExpect = (seq + 1) & $FF
 
   ; NEXTLEN is in sixteen-byte units (sdio.c, SDPCM_NEXTLEN_SHIFT). This
   ; reader deliberately still does the fixed first read; the count tells
@@ -5541,7 +5805,9 @@ Procedure.i cyw43_RxFrame(wantId.i)
 
   ; CREDITS REFRESH FROM EVERY FRAME, whatever channel it came on, which
   ; is why this sits before the channel test and not inside it.
-  cyw43_credit = cyw43_Rx8(#CYW43_SDPCM_OFF_WIN)
+  If cyw43_rxFrameCreditDone = 0
+    cyw43_credit = cyw43_Rx8(#CYW43_SDPCM_OFF_WIN)
+  EndIf
 
   ; The data offset is where the payload starts, measured from the start
   ; of the SDPCM header. It must be inside the frame.
@@ -5725,16 +5991,71 @@ Procedure.i cyw43_RxFrame(wantId.i)
     ProcedureReturn 5
   EndIf
 
-  ; Glom frames are still not de-glommed in this measurement-only change,
-  ; but are no longer hidden inside rxOther. The descriptor flag is bit 7
-  ; of the raw channel byte (SDPCM_GLOMDESC); a channel-3 frame without it
-  ; is the superframe. Linux handles the pair in brcmf_sdio_rxglom.
+  ; Receive glom: the descriptor is already complete in cyw43_rx. Validate
+  ; every advertised segment before it authorizes one exact, bounded F2
+  ; superframe read. The parser then validates every inner frame before this
+  ; loop queues any of them, preserving wire order and the exact last frame.
   If chan = #CYW43_CHAN_GLOM
     cyw43_rxGlom = cyw43_rxGlom + 1
     If (rawchan & #CYW43_SDPCM_GLOMDESC) <> 0
       cyw43_rxGlomDesc = cyw43_rxGlomDesc + 1
-    Else
+      gr = Cyw43RxGlomLoadDescriptor(@cyw43_rx[0], size, cyw43_f2Blk, 4)
+      If gr <> #CYW43_RXG_OK
+        cyw43_rxGlomFailures = cyw43_rxGlomFailures + 1
+        ; The invalid descriptor cannot safely name the following superframe's
+        ; length. Terminate that receive frame before another header read.
+        If cyw43_RxAbortStart() = 0
+          ProcedureReturn -1
+        EndIf
+        ProcedureReturn 3
+      EndIf
+      gc = Cyw43RxGlomDescriptorFrames()
+      If gc > (#CYW43_RXQ_CAP - cyw43_rxqCount)
+        cyw43_rxGlomFailures = cyw43_rxGlomFailures + 1
+        If cyw43_RxAbortStart() = 0
+          ProcedureReturn -1
+        EndIf
+        ProcedureReturn 3
+      EndIf
+      gr = Cyw43RxGlomReadBytes()
+      If cyw43_F2Xfer(0, Cyw43RxGlomReadPtr(), gr) = 0
+        cyw43_rxGlomFailures = cyw43_rxGlomFailures + 1
+        If cyw43_RxAbortStart() = 0
+          ProcedureReturn -1
+        EndIf
+        ProcedureReturn -1
+      EndIf
+      cyw43_rxGlom = cyw43_rxGlom + 1
       cyw43_rxGlomSuper = cyw43_rxGlomSuper + 1
+      If Cyw43RxGlomAcceptSuperframe(gr) <> #CYW43_RXG_OK
+        ; The whole rounded superframe has already been drained, so the next
+        ; F2 read is aligned even though nothing from this aggregate escapes.
+        cyw43_rxGlomFailures = cyw43_rxGlomFailures + 1
+        ProcedureReturn 3
+      EndIf
+      cyw43_credit = Cyw43RxGlomOuterWindow()
+      For gi = 0 To gc - 1
+        gp = Cyw43RxGlomFramePtr(gi)
+        gn = Cyw43RxGlomFrameBytes(gi)
+        ; The descriptor was sequence-accounted above and the aggregate's
+        ; outer credit/window was applied once. Inner frames still carry the
+        ; consecutive receive sequence, but their WIN bytes must not replace
+        ; the accepted outer window.
+        If cyw43_RxqPush(gp, gn, 0, 1) = 0
+          ; Capacity was checked for the complete aggregate before the first
+          ; push. Reaching this arm is an internal invariant failure.
+          cyw43_rxGlomFailures = cyw43_rxGlomFailures + 1
+          ProcedureReturn -1
+        EndIf
+      Next
+      cyw43_rxGlomPackets = cyw43_rxGlomPackets + gc
+      ProcedureReturn 6
+    Else
+      ; A standalone superframe has no trusted descriptor lengths. This small
+      ; one was fully drained; an oversized one is terminated in the header
+      ; path above.
+      cyw43_rxGlomSuper = cyw43_rxGlomSuper + 1
+      cyw43_rxGlomFailures = cyw43_rxGlomFailures + 1
     EndIf
   Else
     cyw43_rxUnknown = cyw43_rxUnknown + 1
@@ -5778,7 +6099,22 @@ Procedure.i cyw43_Poll(wantId.i, wantEvent.i, timeoutMs.i, context.i)
   cyw43_TraceIo(#CYW43_TR_POLL_ENTER)
 
   Repeat
-    r = cyw43_RxFrame(wantId)
+    ; Retained events may satisfy this wait and are dispatched in wire order.
+    ; Data remains queued for the top-level network consumer. While one full
+    ; maximum aggregate still fits, continue reading F2 so unrelated data in
+    ; front of a synchronous ioctl reply cannot turn that request into a
+    ; failure/resend with a different id.
+    If cyw43_rxqCount > 0
+      If cyw43_RxqHeadChannel() = #CYW43_CHAN_EVENT
+        r = cyw43_RxFrame(wantId, 1)
+      ElseIf cyw43_RxqCanPoll() <> 0
+        r = cyw43_RxFrame(wantId, 0)
+      Else
+        ProcedureReturn #CYW43_IO_BADFRAME
+      EndIf
+    Else
+      r = cyw43_RxFrame(wantId, 0)
+    EndIf
     If r = -1
       ProcedureReturn #CYW43_IO_BADFRAME
     EndIf
@@ -5789,10 +6125,9 @@ Procedure.i cyw43_Poll(wantId.i, wantEvent.i, timeoutMs.i, context.i)
       ProcedureReturn 2
     EndIf
     If r = 5
-      ; This is the receive-hole instrument. The current control/credit
-      ; wait has nowhere to retain an unrelated Ethernet frame, so another
-      ; iteration overwrites it. Count the exact caller class; do not alter
-      ; the established behaviour in a telemetry-only build.
+      If cyw43_RxqPush(@cyw43_rx[0], cyw43_rxFrameLen, 1, 1) = 0
+        ProcedureReturn #CYW43_IO_BADFRAME
+      EndIf
       If context = #CYW43_POLL_CREDIT
         cyw43_rxDataPollCredit = cyw43_rxDataPollCredit + 1
       ElseIf context = #CYW43_POLL_EVENT
@@ -5800,6 +6135,13 @@ Procedure.i cyw43_Poll(wantId.i, wantEvent.i, timeoutMs.i, context.i)
       Else
         cyw43_rxDataPollControl = cyw43_rxDataPollControl + 1
       EndIf
+      ; Keep the request synchronous. The queue metadata records that this
+      ; ordinary frame's sequence and credit were already accounted here.
+    EndIf
+    If r = 6
+      ; A finite, fully validated aggregate is now retained. Inspect its head
+      ; before applying the caller's wall-clock deadline.
+      Continue
     EndIf
     If (cyw43_Ticks() - t0) > budget
       cyw43_TraceIo(#CYW43_TR_POLL_TIMEOUT)
@@ -5845,12 +6187,28 @@ Procedure.i cyw43_PollEvent(timeoutMs.i)
   t0 = cyw43_Ticks()
 
   Repeat
-    r = cyw43_RxFrame(-1)
+    If cyw43_rxqCount > 0
+      If cyw43_RxqHeadChannel() = #CYW43_CHAN_EVENT
+        r = cyw43_RxFrame(-1, 1)
+      ElseIf cyw43_RxqCanPoll() <> 0
+        r = cyw43_RxFrame(-1, 0)
+      Else
+        ProcedureReturn 0
+      EndIf
+    Else
+      r = cyw43_RxFrame(-1, 0)
+    EndIf
     If r = -1
       ProcedureReturn 0
     EndIf
     If r = 5
+      If cyw43_RxqPush(@cyw43_rx[0], cyw43_rxFrameLen, 1, 1) = 0
+        ProcedureReturn 0
+      EndIf
       cyw43_rxDataPollEvent = cyw43_rxDataPollEvent + 1
+    EndIf
+    If r = 6
+      Continue
     EndIf
     If cyw43_evrCount > 0
       ProcedureReturn 1
@@ -7112,11 +7470,23 @@ Procedure.i Cyw43RxDataLostInControlPoll()
   ProcedureReturn cyw43_rxDataPollControl
 EndProcedure
 
+Procedure.i Cyw43RxDataQueuedInControlPoll()
+  ProcedureReturn cyw43_rxDataPollControl
+EndProcedure
+
 Procedure.i Cyw43RxDataLostInCreditPoll()
   ProcedureReturn cyw43_rxDataPollCredit
 EndProcedure
 
+Procedure.i Cyw43RxDataQueuedInCreditPoll()
+  ProcedureReturn cyw43_rxDataPollCredit
+EndProcedure
+
 Procedure.i Cyw43RxDataLostInEventPoll()
+  ProcedureReturn cyw43_rxDataPollEvent
+EndProcedure
+
+Procedure.i Cyw43RxDataQueuedInEventPoll()
   ProcedureReturn cyw43_rxDataPollEvent
 EndProcedure
 
@@ -7130,6 +7500,50 @@ EndProcedure
 
 Procedure.i Cyw43RxGlomSuperframes()
   ProcedureReturn cyw43_rxGlomSuper
+EndProcedure
+
+Procedure.i Cyw43RxGlomPackets()
+  ProcedureReturn cyw43_rxGlomPackets
+EndProcedure
+
+Procedure.i Cyw43RxGlomFailures()
+  ProcedureReturn cyw43_rxGlomFailures
+EndProcedure
+
+Procedure.i Cyw43RxQueueDepth()
+  ProcedureReturn cyw43_rxqCount
+EndProcedure
+
+Procedure.i Cyw43RxQueueHighWater()
+  ProcedureReturn cyw43_rxqHigh
+EndProcedure
+
+Procedure.i Cyw43RxQueueTotal()
+  ProcedureReturn cyw43_rxqQueued
+EndProcedure
+
+Procedure.i Cyw43RxQueueFull()
+  ProcedureReturn cyw43_rxqFull
+EndProcedure
+
+Procedure.i Cyw43RxAbortActive()
+  ProcedureReturn cyw43_rxAbortActive
+EndProcedure
+
+Procedure.i Cyw43RxAbortStarted()
+  ProcedureReturn cyw43_rxAbortStarted
+EndProcedure
+
+Procedure.i Cyw43RxAbortDone()
+  ProcedureReturn cyw43_rxAbortDone
+EndProcedure
+
+Procedure.i Cyw43RxAbortFailed()
+  ProcedureReturn cyw43_rxAbortFailed
+EndProcedure
+
+Procedure.i Cyw43RxAbortFault()
+  ProcedureReturn cyw43_rxAbortFault
 EndProcedure
 
 Procedure.i Cyw43RxUnknownChannel()
@@ -8993,13 +9407,18 @@ Procedure.i Cyw43Receive(timeoutMs.i)
   t0 = cyw43_Ticks()
 
   Repeat
-    r = cyw43_RxFrame(-1)
+    r = cyw43_RxFrame(-1, 1)
     If r = -1
       ProcedureReturn 0
     EndIf
     If r = 5
       cyw43_rxData = cyw43_rxData + 1
       ProcedureReturn cyw43_dataLen
+    EndIf
+    If cyw43_rxqCount > 0
+      ; At most 32 already-validated entries. Draining the next queued entry
+      ; is bounded and must not be mistaken for waiting on the radio.
+      Continue
     EndIf
     If (cyw43_Ticks() - t0) > budget
       ProcedureReturn 0
