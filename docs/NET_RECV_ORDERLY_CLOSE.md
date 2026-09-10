@@ -22,3 +22,13 @@ and Wi-Fi interfaces. It covers acknowledged success, lost-final-ACK retry
 exhaustion, overflow from a failed `LAST_ACK`, connected cancellation and idle
 timeout, peer RST with no response, and pre-connection timeout. Mutants removing
 the success close or treating every `LAST_ACK` as successful must fail.
+
+## Hardware acceptance (2026-09-10)
+
+Pi build35 completed 2,429,080-byte RAM uploads over Ethernet and Wi-Fi. The
+host observed orderly TCP closure on both (previous builds reported reset),
+and board length plus SHA256 matched the source image exactly. Board transfer
+times were308ms wired and1947ms wireless. These are individual transfer
+measurements, not maximum throughput. Lost-ACK/cancellation/failure coverage
+above is emitted-test evidence, not injected hardware failures. UNO Q build11
+compiled successfully; it was not deployed or hardware-tested in this check.
