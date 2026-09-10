@@ -27,8 +27,18 @@ def main():
  f=f.replace('; @@CONSTANTS@@',const).replace('; @@BODY@@',body)
  result,steps=run(a64,pmfc,f,'gate')
  if result: print(f'touch_visual_emitted_check: FAIL assertion {result} after {steps:,} instructions'); return 1
- mutant=f.replace('    ScrPresentAll()','    ; presentation removed',1)
+ frame_anchor='    ScrPresentAll()'
+ if f.count(frame_anchor)!=1: raise SystemExit('touch visual gate: frame presentation anchor not unique')
+ frame_mutant=f.replace(frame_anchor,'    ; frame presentation removed',1)
+ frame_result,frame_steps=run(a64,pmfc,frame_mutant,'no_frame_present')
+ if frame_result==0: print('touch_visual_emitted_check: FAIL frame-presentation deletion mutant survived'); return 1
+ anchor='  ScrPresentAll()\n  ConSetRenderer(*wasPaint)'
+ if f.count(anchor)!=1: raise SystemExit('touch visual gate: exit presentation anchor not unique')
+ mutant=f.replace(anchor,'  ; exit presentation removed\n  ConSetRenderer(*wasPaint)',1)
  mutation_result,mutation_steps=run(a64,pmfc,mutant,'no_present')
  if mutation_result==0: print('touch_visual_emitted_check: FAIL presentation deletion mutant survived'); return 1
- print(f'touch_visual_emitted_check: PASS - ten IDs, motion/release, presentation, exits and restoration, {steps:,} instructions; deletion mutant rejected in {mutation_steps:,}'); return 0
+ reordered=f.replace(anchor,'  ConSetRenderer(*wasPaint)\n  ScrPresentAll()',1)
+ order_result,order_steps=run(a64,pmfc,reordered,'late_present')
+ if order_result==0: print('touch_visual_emitted_check: FAIL late-presentation mutant survived'); return 1
+ print(f'touch_visual_emitted_check: PASS - ten IDs, motion/release, frame and ordered exit presentation, exits and restoration, {steps:,} instructions; frame/exit/order mutants rejected in {frame_steps:,}/{mutation_steps:,}/{order_steps:,}'); return 0
 if __name__=='__main__': sys.exit(main())
