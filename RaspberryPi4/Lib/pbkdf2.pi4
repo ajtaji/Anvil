@@ -24,8 +24,15 @@
 ;    Wpa2Psk(passphrase, plen, ssid, ssidlen, dst)
 ;        the WPA2 mapping: PBKDF2(passphrase, ssid, 4096, 32).
 ;        Returns 32, or 0 if the arguments break IEEE 802.11's rules
+;    Pbkdf2StepBegin(...) / Pbkdf2Step(budget) / Pbkdf2StepWipe()
+;        a separate resumable engine. `budget` is complete PRFs, never
+;        wall time; each call finishes every HMAC it starts and invokes no
+;        callback. Wpa2PskStepBegin applies WPA2's argument/size mapping.
 ;    Pbkdf2Wipe()
-;        zero every buffer in this file
+;        zero the synchronous engine's U/T/counter buffers. It deliberately
+;        does not cancel the independent resumable engine; its owner uses
+;        Pbkdf2StepWipe() so an unrelated synchronous caller cannot destroy
+;        a recovery derivation between slices.
 ;
 ;  DEPENDENCIES: RaspberryPi4/Lib/sha1.pi4 and
 ;  RaspberryPi4/Lib/hmacsha1.pi4, in that order, and NEITHER IS
@@ -229,6 +236,16 @@ EnableExplicit
 #WPA2_PASS_MAX  = 63
 #WPA2_SSID_MAX  = 32
 
+; Cooperative PBKDF2 status. The ordinary Pbkdf2Sha1/Wpa2Psk entry
+; points below remain synchronous for boot-time and diagnostic callers.
+; These values describe the separate resumable engine used by automatic
+; Wi-Fi recovery, where monopolising the prompt for a whole 4096-round
+; derivation would also stop the wired network service.
+#PBKDF2_STEP_IDLE    = 0
+#PBKDF2_STEP_RUNNING = 1
+#PBKDF2_STEP_DONE    = 2
+#PBKDF2_STEP_ERROR   = -1
+
 ; ----------------------------------------------------------------------
 ;  STATE - flat Global arrays, house style.
 ;
@@ -246,6 +263,29 @@ Global Dim secPbkdf2U.a[20]         ; the running U_j
 Global Dim secPbkdf2T.a[20]         ; U_1 XOR U_2 XOR ... XOR U_j so far
 Global Dim secPbkdf2Int.a[4]        ; INT(i), four octets, big-endian
 
+; The resumable engine owns different U/T/counter storage from the
+; synchronous API. Its password and salt pointers remain caller-owned and
+; valid only while RUNNING. A Wi-Fi recovery copies its selected SSID into
+; stable storage and cancels this engine before credentials can change.
+; HMAC's cached pad state is shared, so EVERY Step call keys HMAC anew before
+; doing a complete, indivisible group of PRFs. Other HMAC users may therefore
+; run between Step calls without corrupting the derivation.
+Global Dim secPbkdf2StepU.a[20]
+Global Dim secPbkdf2StepT.a[20]
+Global Dim secPbkdf2StepInt.a[4]
+Global pbkdf2StepState.i = #PBKDF2_STEP_IDLE
+Global pbkdf2StepPw.i = 0
+Global pbkdf2StepPwLen.i = 0
+Global pbkdf2StepSalt.i = 0
+Global pbkdf2StepSaltLen.i = 0
+Global pbkdf2StepIters.i = 0
+Global pbkdf2StepDst.i = 0
+Global pbkdf2StepDkLen.i = 0
+Global pbkdf2StepBlocks.i = 0
+Global pbkdf2StepBlock.i = 0
+Global pbkdf2StepIter.i = 0
+Global pbkdf2StepOff.i = 0
+
 ; Optional cooperative progress boundary for long derivations. The library
 ; does not know what the callback services and never prints from it. Setting a
 ; callback returns the previous one so a caller can install it for exactly one
@@ -259,13 +299,17 @@ Procedure.i Pbkdf2SetProgress(*fn)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  Pbkdf2Wipe() - zero every buffer in this file.
+;  Pbkdf2Wipe() - zero the synchronous engine's private buffers.
 ;
 ;  NOT AUTOMATIC AT THE END OF Pbkdf2Sha1, and that is deliberate: the
 ;  caller decides when the derived key stops being needed, and a
 ;  library that wiped on the way out would be making that decision for
 ;  a caller who might legitimately want to look at what it produced.
 ;  Call it once the PMK has been installed.
+;
+;  IT DOES NOT CANCEL OR WIPE THE SEPARATE RESUMABLE ENGINE. That engine
+;  intentionally survives unrelated complete synchronous PBKDF/HMAC users
+;  between slices and is owned through Pbkdf2StepWipe().
 ;
 ;  IT DOES NOT WIPE hmacsha1.pi4's CACHED PAD STATES, which still hold
 ;  a key-derived SHA-1 state after this runs. That is that file's
@@ -286,6 +330,166 @@ Procedure Pbkdf2Wipe()
     secPbkdf2Int[i] = 0
     i = i + 1
   Wend
+EndProcedure
+
+; Cancel and wipe only the cooperative engine. The caller's destination is
+; deliberately not wiped: after DONE it is the derived key the caller asked
+; for. During cancellation the Wi-Fi owner separately wipes its PMK buffer.
+Procedure Pbkdf2StepWipe()
+  Protected i.i
+  For i = 0 To #PBKDF2_HLEN - 1
+    secPbkdf2StepU[i] = 0
+    secPbkdf2StepT[i] = 0
+  Next
+  For i = 0 To 3
+    secPbkdf2StepInt[i] = 0
+  Next
+  pbkdf2StepState = #PBKDF2_STEP_IDLE
+  pbkdf2StepPw = 0
+  pbkdf2StepPwLen = 0
+  pbkdf2StepSalt = 0
+  pbkdf2StepSaltLen = 0
+  pbkdf2StepIters = 0
+  pbkdf2StepDst = 0
+  pbkdf2StepDkLen = 0
+  pbkdf2StepBlocks = 0
+  pbkdf2StepBlock = 0
+  pbkdf2StepIter = 0
+  pbkdf2StepOff = 0
+EndProcedure
+
+; Begin a resumable PBKDF2-HMAC-SHA1 derivation. No PRF is executed here.
+; The pointer lifetimes and the one-active-operation rule are explicit: a
+; second begin is refused until the owner cancels or consumes completion.
+Procedure.i Pbkdf2StepBegin(pw.i, pwlen.i, salt.i, saltlen.i, iters.i, dst.i, dklen.i)
+  If pbkdf2StepState = #PBKDF2_STEP_RUNNING
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If dst = 0 Or pwlen < 0 Or saltlen < 0
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If (pw = 0 And pwlen > 0) Or (salt = 0 And saltlen > 0)
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If iters < 1 Or dklen < 1 Or dklen > #PBKDF2_MAXDK
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+
+  Pbkdf2StepWipe()
+  pbkdf2StepPw = pw
+  pbkdf2StepPwLen = pwlen
+  pbkdf2StepSalt = salt
+  pbkdf2StepSaltLen = saltlen
+  pbkdf2StepIters = iters
+  pbkdf2StepDst = dst
+  pbkdf2StepDkLen = dklen
+  pbkdf2StepBlocks = (dklen + #PBKDF2_HLEN - 1) / #PBKDF2_HLEN
+  pbkdf2StepBlock = 1
+  pbkdf2StepIter = 0
+  pbkdf2StepOff = 0
+  pbkdf2StepState = #PBKDF2_STEP_RUNNING
+  ProcedureReturn pbkdf2StepState
+EndProcedure
+
+; Execute at most `budget` complete PRFs. It never calls a progress or network
+; callback, and it never yields in the middle of HMAC begin/update/end. The
+; budget is a compute-work bound, not a wall-clock promise.
+Procedure.i Pbkdf2Step(budget.i)
+  Protected k.i
+  Protected want.i
+
+  If pbkdf2StepState <> #PBKDF2_STEP_RUNNING
+    ProcedureReturn pbkdf2StepState
+  EndIf
+  If budget < 1
+    ProcedureReturn pbkdf2StepState
+  EndIf
+
+  ; Restore our PRF key in case a complete HMAC user ran between slices.
+  HmacSha1Key(pbkdf2StepPw, pbkdf2StepPwLen)
+
+  While budget > 0 And pbkdf2StepBlock <= pbkdf2StepBlocks
+    If pbkdf2StepIter = 0
+      secPbkdf2StepInt[0] = (pbkdf2StepBlock >> 24) & 255
+      secPbkdf2StepInt[1] = (pbkdf2StepBlock >> 16) & 255
+      secPbkdf2StepInt[2] = (pbkdf2StepBlock >> 8) & 255
+      secPbkdf2StepInt[3] = pbkdf2StepBlock & 255
+      HmacSha1Begin()
+      If pbkdf2StepSaltLen > 0
+        HmacSha1Update(pbkdf2StepSalt, pbkdf2StepSaltLen)
+      EndIf
+      HmacSha1Update(@secPbkdf2StepInt[0], 4)
+      HmacSha1End(@secPbkdf2StepU[0], #PBKDF2_HLEN)
+      For k = 0 To #PBKDF2_HLEN - 1
+        secPbkdf2StepT[k] = secPbkdf2StepU[k]
+      Next
+      pbkdf2StepIter = 1
+    Else
+      HmacSha1Begin()
+      HmacSha1Update(@secPbkdf2StepU[0], #PBKDF2_HLEN)
+      HmacSha1End(@secPbkdf2StepU[0], #PBKDF2_HLEN)
+      For k = 0 To #PBKDF2_HLEN - 1
+        secPbkdf2StepT[k] = secPbkdf2StepT[k] ! secPbkdf2StepU[k]
+      Next
+      pbkdf2StepIter = pbkdf2StepIter + 1
+    EndIf
+    budget = budget - 1
+
+    If pbkdf2StepIter >= pbkdf2StepIters
+      want = pbkdf2StepDkLen - pbkdf2StepOff
+      If want > #PBKDF2_HLEN
+        want = #PBKDF2_HLEN
+      EndIf
+      For k = 0 To want - 1
+        PokeB(pbkdf2StepDst + pbkdf2StepOff + k, secPbkdf2StepT[k] & 255)
+      Next
+      pbkdf2StepOff = pbkdf2StepOff + want
+      pbkdf2StepBlock = pbkdf2StepBlock + 1
+      pbkdf2StepIter = 0
+    EndIf
+  Wend
+
+  If pbkdf2StepBlock > pbkdf2StepBlocks
+    ; Drop borrowed secret pointers AND wipe the private U/T/counter state at
+    ; completion. The requested bytes are already in the caller's destination;
+    ; retaining intermediate key material until a later explicit Wipe would
+    ; make completion and cancellation have different secret lifetimes.
+    For k = 0 To #PBKDF2_HLEN - 1
+      secPbkdf2StepU[k] = 0
+      secPbkdf2StepT[k] = 0
+    Next
+    For k = 0 To 3
+      secPbkdf2StepInt[k] = 0
+    Next
+    pbkdf2StepPw = 0
+    pbkdf2StepPwLen = 0
+    pbkdf2StepSalt = 0
+    pbkdf2StepSaltLen = 0
+    pbkdf2StepIters = 0
+    pbkdf2StepDst = 0
+    pbkdf2StepDkLen = 0
+    pbkdf2StepBlocks = 0
+    pbkdf2StepBlock = 0
+    pbkdf2StepIter = 0
+    pbkdf2StepOff = 0
+    pbkdf2StepState = #PBKDF2_STEP_DONE
+  EndIf
+  ProcedureReturn pbkdf2StepState
+EndProcedure
+
+Procedure.i Pbkdf2StepState()
+  ProcedureReturn pbkdf2StepState
+EndProcedure
+
+; WPA2's argument contract around the generic resumable engine.
+Procedure.i Wpa2PskStepBegin(passphrase.i, plen.i, ssid.i, ssidlen.i, dst.i)
+  If plen < #WPA2_PASS_MIN Or plen > #WPA2_PASS_MAX
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If ssidlen < 1 Or ssidlen > #WPA2_SSID_MAX
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  ProcedureReturn Pbkdf2StepBegin(passphrase, plen, ssid, ssidlen, #WPA2_PSK_ITERS, dst, #WPA2_PSK_LEN)
 EndProcedure
 
 ; ----------------------------------------------------------------------

@@ -422,6 +422,10 @@ Procedure CmdWifi()
   ; the air. The bring-up reads 600 KB of firmware off the stick and
   ; runs once; a second scan reuses the radio already up.
   If WordIs("scan") <> 0
+    ; A scan replaces the firmware's result table. It therefore owns the
+    ; radio generation just as a manual join does; an automatic selector
+    ; must not resume later against a different table.
+    WifiRecoveryCancel()
     WifiScanMatch()
     ProcedureReturn
   EndIf
@@ -454,6 +458,9 @@ Procedure CmdWifi()
       PrintN("own within about a minute.")
       ProcedureReturn
     EndIf
+    ; A manual join owns the radio now. Cancel any automatic recovery
+    ; generation before the synchronous compatibility path reads settings.
+    WifiRecoveryCancel()
     If WifiJoinKnown() <> 0
       If WifiDhcp() <> 0
         NetConsoleRearm()
@@ -584,6 +591,7 @@ Procedure CmdWifi()
         ProcedureReturn
       EndIf
       If (PeekA(k) | $20) = 111 And (PeekA(k + 1) | $20) = 102 And (PeekA(k + 2) | $20) = 102 And PeekA(k + 3) = 0
+        WifiRecoveryCancel()
         gWifiHealOn = 0
         PrintN("Wi-Fi: automatic re-association is OFF. A dead link will be left")
         PrintN("dead so it can be observed; type wifi rejoin to recover by hand.")
@@ -691,6 +699,7 @@ Procedure CmdWifi()
       PrintN(".")
       ProcedureReturn
     EndIf
+    WifiRecoveryCancel()
     If SettingsSetWifiSlotSsid(s, v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -773,6 +782,7 @@ Procedure CmdWifi()
       ProcedureReturn
     EndIf
     n = StrLenZ(v)
+    WifiRecoveryCancel()
     If SettingsSetWifiSlotPassword(s, v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -930,6 +940,7 @@ Procedure CmdWifi()
       PrintN("   cannot set it: use  settings set wifi.network <name>  instead.")
       ProcedureReturn
     EndIf
+    WifiRecoveryCancel()
     If SettingsSetWifiNetwork(v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -985,6 +996,7 @@ Procedure CmdWifi()
       ProcedureReturn
     EndIf
     n = StrLenZ(v)
+    WifiRecoveryCancel()
     If SettingsSetWifiPassword(v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -1030,6 +1042,7 @@ Procedure CmdWifi()
         WifiSayNoSuchSlot(s)
         ProcedureReturn
       EndIf
+      WifiRecoveryCancel()
       If SettingsRemoveWifiSlot(s) = 0
         If s = SettingsWifiLegacySlot()
           PrintN("The older single pair was already empty, so nothing was forgotten")
@@ -1068,6 +1081,7 @@ Procedure CmdWifi()
       PrintN("forgotten and nothing changed.")
       ProcedureReturn
     EndIf
+    WifiRecoveryCancel()
     If hadNet <> 0
       SettingsRemove(SettingsWifiNetworkKey())
       PrintN("The Wi-Fi network name has been forgotten.")

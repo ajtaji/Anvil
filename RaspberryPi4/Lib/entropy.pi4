@@ -846,6 +846,41 @@ Procedure.i EntropyWarmupWait(spins.i)
   ProcedureReturn #ENTROPY_ERR_TIMEOUT
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  EntropyTryWord(dst) - one nonblocking RNG200 service attempt.
+;
+;  Returns #ENTROPY_OK after writing exactly one 32-bit FIFO word, zero
+;  while warm-up/FIFO production is still pending, or the same negative
+;  OFF/HEALTH/ARG refusals as EntropyWords. There is NO retry loop here:
+;  a cooperative owner supplies its own wrap-safe elapsed-time deadline.
+;
+;  The guards are the synchronous reader's guards, in explicit order: the
+;  block must be enabled, the health bits must be clean, warm-up
+;  TOTAL_BIT_COUNT must have passed 16, and FIFO_COUNT must say a word exists before
+;  RNG_FIFO_DATA is touched. One call consumes at most one word.
+; ----------------------------------------------------------------------
+Procedure.i EntropyTryWord(dst.i)
+  If dst = 0
+    ProcedureReturn #ENTROPY_ERR_ARG
+  EndIf
+  If EntropyEnabled() = 0
+    ProcedureReturn #ENTROPY_ERR_OFF
+  EndIf
+  If EntropyHealthy() = 0
+    entHealthStops = entHealthStops + 1
+    ProcedureReturn #ENTROPY_ERR_HEALTH
+  EndIf
+  If EntropyTotalBits() <= #ENTROPY_READY_BITS
+    ProcedureReturn 0
+  EndIf
+  If EntropyFifoCount() = 0
+    ProcedureReturn 0
+  EndIf
+  PokeN(dst, EntropyReg(#RNG_FIFO_DATA_OFF))
+  entWordsRead = entWordsRead + 1
+  ProcedureReturn #ENTROPY_OK
+EndProcedure
+
 ; ======================================================================
 ;  READING
 ; ======================================================================

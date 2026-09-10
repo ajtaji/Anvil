@@ -16,12 +16,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import re
 
 import tcp_multiif_emitted_check as emitted
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WIFI = ROOT / "RaspberryPi4" / "Lib" / "wifi.pi4"
+CYW43 = ROOT / "RaspberryPi4" / "Lib" / "cyw43.pi4"
 
 
 def procedure(source: str, name: str) -> str:
@@ -38,9 +40,20 @@ def procedure(source: str, name: str) -> str:
 
 def probe_source() -> str:
     source = WIFI.read_text(encoding="utf-8")
-    bodies = "\n\n".join(
-        (procedure(source, "wifi_RecordLinkDown"), procedure(source, "WifiLinkTick"))
-    )
+    cyw_source = CYW43.read_text(encoding="utf-8")
+    wifi_names = ("WifiDrainEvents", "WifiRadioPump", "wifi_RecordLinkDown", "WifiLinkTick")
+    cyw_names = ("cyw43_EvrPush", "cyw43_EvrPop", "cyw43_EvrClear", "cyw43_JoinClassify", "Cyw43JoinPoll")
+    wifi_bodies = "\n\n".join(procedure(source, name) for name in wifi_names)
+    cyw_bodies = "\n\n".join(procedure(cyw_source, name) for name in cyw_names)
+    identifiers = sorted(set(re.findall(r"#CYW43_[A-Z0-9_]*[A-Z0-9](?![A-Z0-9_*])", cyw_bodies + "\n" + wifi_bodies)))
+    constant_lines = []
+    cyw_lines = cyw_source.splitlines()
+    for identifier in identifiers:
+        line = next((item for item in cyw_lines if item.startswith(identifier + " ") or item.startswith(identifier + "=")), None)
+        if line is None:
+            raise SystemExit(f"wifi link policy gate: production constant {identifier} not found")
+        constant_lines.append(line)
+    constants = "\n".join(constant_lines)
     prelude = r'''
 EnableExplicit
 
@@ -59,6 +72,10 @@ Global gate_dhcpStarts.i
 Global gate_assoc.i
 Global gate_assocCalls.i
 Global gate_keepalive.i
+Global gate_recActive.i
+Global gate_recTicks.i
+Global gate_joinVerdict.i
+Global gate_pollEvents.i
 
 Global gWifiLinkOn.i
 Global gWifiKeyed.i
@@ -77,9 +94,50 @@ Global gWifiTdReason.i
 Global gWifiDropReq.i
 Global gWifiRxProof.i
 Global gWifiGw.i
+Global gWifiRecPhase.i
+Global gWifiRecGeneration.i
+Global gWifiConOwnsRx.i
+Global gWifiRadioLast.i
+Global gWifiEvtDrops.i
+Global gWifiEvtLast.i
+Global gWifiEvtType.i
+Global gWifiEvtReason.i
+Global gWifiDeauths.i
+Global gWifiRoams.i
+
+#WIFI_PUMP_BUDGET = 4
+#WIFI_REC_IDLE = 0
+#WIFI_REC_QUIET = 2
+#WIFI_REC_JOIN_POLL = 15
+#WIFI_REC_DHCP_WAIT = 24
+#CYW43_JS_ACTIVE = $0001
+
+Global Dim cyw43_evrType.i[#CYW43_EVRING]
+Global Dim cyw43_evrStatus.i[#CYW43_EVRING]
+Global Dim cyw43_evrReason.i[#CYW43_EVRING]
+Global Dim cyw43_evrFlags.i[#CYW43_EVRING]
+Global cyw43_evrHead.i
+Global cyw43_evrTail.i
+Global cyw43_evrCount.i
+Global cyw43_evrDropped.i
+Global cyw43_evrTotal.i
+Global cyw43_jevType.i
+Global cyw43_jevStatus.i
+Global cyw43_jevReason.i
+Global cyw43_jevFlags.i
+Global cyw43_jevNew.i
+Global cyw43_joinSsidOk.i
+Global cyw43_joinFail.i
+Global cyw43_joinState.i
+Global cyw43_joinTlink.i
+Global cyw43_joinDone.i
+Global cyw43_joinPhase.i
+Global cyw43_linkLost.i
+Global cyw43_joinT0.i
+Global cyw43_hz.i = 1000
+Global cyw43_icvCount.i
 
 Procedure.i millis() : ProcedureReturn gate_ms : EndProcedure
-Procedure WifiRadioPump() : gate_pumps = gate_pumps + 1 : EndProcedure
 Procedure NetDhcpLinkDown(kind.i) : gate_linkDown = gate_linkDown + 1 : EndProcedure
 Procedure.i Cyw43EventName(t.i) : ProcedureReturn "event" : EndProcedure
 Procedure str_print_at(p.i) : EndProcedure
@@ -88,22 +146,54 @@ Procedure UartWriteStr(p.i) : EndProcedure
 Procedure PrintDec(v.i) : EndProcedure
 Procedure PutIp(v.i) : EndProcedure
 Procedure.i WifiRejoin(announce.i) : gate_rejoins = gate_rejoins + 1 : ProcedureReturn 1 : EndProcedure
+Procedure WifiRecoveryStart(announce.i) : gate_rejoins = gate_rejoins + 1 : gate_recActive = 1 : wifi_RecordLinkDown() : EndProcedure
+Procedure WifiRecoveryCancel() : gate_recActive = 0 : gWifiRecPhase = #WIFI_REC_IDLE : EndProcedure
+Procedure.i WifiRecoveryActive() : ProcedureReturn gate_recActive : EndProcedure
+Procedure WifiRecoveryTick()
+  gate_recTicks = gate_recTicks + 1
+  If gWifiRecPhase = #WIFI_REC_JOIN_POLL
+    gate_joinVerdict = Cyw43JoinPoll(20)
+  EndIf
+EndProcedure
 Procedure.i NetDhcpStart(kind.i, automatic.i) : gate_dhcpStarts = gate_dhcpStarts + 1 : ProcedureReturn 1 : EndProcedure
 Procedure.i Cyw43ReadBssid(ms.i) : gate_assocCalls = gate_assocCalls + 1 : ProcedureReturn gate_assoc : EndProcedure
 Procedure.i wifi_KeepAliveArp(target.i) : ProcedureReturn gate_keepalive : EndProcedure
 Procedure.i DhcpClientServer(kind.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43EventsDropped() : ProcedureReturn cyw43_evrDropped : EndProcedure
+Procedure.i Cyw43PopEvent() : ProcedureReturn cyw43_EvrPop() : EndProcedure
+Procedure.i Cyw43JoinEventType() : ProcedureReturn cyw43_jevType : EndProcedure
+Procedure.i Cyw43JoinEventReason() : ProcedureReturn cyw43_jevReason : EndProcedure
+Procedure.i Cyw43JoinEventFlags() : ProcedureReturn cyw43_jevFlags : EndProcedure
+Procedure.i Cyw43Receive(ms.i) : gate_pumps = gate_pumps + 1 : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ReceivePtr() : ProcedureReturn 0 : EndProcedure
+Procedure.i HwLinkOfferRaw(kind.i, p.i, n.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i NetInput(kind.i, p.i, n.i) : ProcedureReturn 0 : EndProcedure
+Procedure HwLinkNoteRx(kind.i, n.i) : EndProcedure
+Procedure NetServiceInput(kind.i, p.i, n.i) : EndProcedure
+Procedure.i cyw43_Ticks() : ProcedureReturn gate_ms : EndProcedure
+Procedure.i cyw43_PollEvent(ms.i) : gate_pollEvents = gate_pollEvents + 1 : ProcedureReturn 0 : EndProcedure
 '''
     main = r'''
 Procedure GateReset()
   gate_pumps = 0 : gate_linkDown = 0 : gate_rejoins = 0
   gate_dhcpStarts = 0 : gate_assocCalls = 0 : gate_assoc = 1
   gate_keepalive = 0 : gate_ms = 100000
+  gate_recActive = 0 : gate_recTicks = 0 : gate_joinVerdict = #CYW43_JOIN_RUNNING
+  gate_pollEvents = 0 : gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = 7
   gWifiLinkOn = 1 : gWifiKeyed = 1 : gWifiHaveIp = 1
   gWifiSecDone = 1 : gWifiBadReads = 0 : gWifiTeardown = 0
   gWifiVerify = 0 : gWifiHealPend = 0 : gWifiHealLast = 0
   gWifiKaProbes = 0 : gWifiKaLast = gate_ms
   gWifiHealOn = 1 : gWifiTdType = 0 : gWifiTdReason = 0
   gWifiDropReq = 0 : gWifiRxProof = gate_ms : gWifiGw = 0
+  gWifiConOwnsRx = 0 : gWifiRadioLast = 0
+  gWifiEvtDrops = 0 : gWifiEvtLast = 0 : gWifiEvtType = 0 : gWifiEvtReason = 0
+  gWifiDeauths = 0 : gWifiRoams = 0
+  cyw43_EvrClear() : cyw43_evrDropped = 0 : cyw43_evrTotal = 0
+  cyw43_joinSsidOk = 0 : cyw43_joinFail = #CYW43_JOINFAIL_NONE
+  cyw43_joinState = #CYW43_JS_ACTIVE : cyw43_joinTlink = gate_ms
+  cyw43_joinDone = 0 : cyw43_joinPhase = 0 : cyw43_linkLost = 0
+  cyw43_joinT0 = gate_ms
 EndProcedure
 
 Procedure.i Main()
@@ -131,7 +221,7 @@ Procedure.i Main()
   GateReset()
   gWifiTeardown = 1
   WifiLinkTick()
-  If gate_rejoins <> 1 Or gate_linkDown <> 0 : ProcedureReturn 5 : EndIf
+  If gate_rejoins <> 1 Or gate_linkDown <> 1 Or gate_recActive = 0 : ProcedureReturn 5 : EndIf
 
   ; Two firmware NOTASSOCIATED answers plus heal-off mark the row down.
   GateReset()
@@ -148,10 +238,56 @@ Procedure.i Main()
   WifiLinkTick()
   If gate_assocCalls <> 1 Or gate_linkDown <> 1 Or gWifiHaveIp <> 0 : ProcedureReturn 7 : EndIf
 
+  ; Real ring + real JoinPoll across the shipped WifiLinkTick boundary.
+  ; AUTH was queued while SET_SSID waited for its control reply. The
+  ; steady-state drain must not steal it before JoinPoll classifies it.
+  GateReset()
+  gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_JOIN_POLL : gWifiKeyed = 0
+  cyw43_joinState = #CYW43_JS_ACTIVE | #CYW43_JS_LINK | #CYW43_JS_KEYED
+  cyw43_EvrPush(#CYW43_EV_AUTH, 0, 0, 0)
+  WifiLinkTick()
+  If gate_pumps <> 0 Or gate_recTicks <> 1 Or gate_joinVerdict <> #CYW43_JOIN_JOINED : ProcedureReturn 8 : EndIf
+  If cyw43_evrCount <> 0 Or (cyw43_joinState & #CYW43_JS_AUTH) = 0 : ProcedureReturn 9 : EndIf
+
+  ; Locally initiated LEAVE/DISASSOC fallout remains owned by the old
+  ; recovery attempt. Multiple prompt turns neither latch teardown nor
+  ; restart the generation; JoinStart's documented clear discards it.
+  GateReset()
+  gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_QUIET : gWifiKeyed = 0
+  cyw43_EvrPush(#CYW43_EV_LINK, 0, 0, 0)
+  cyw43_EvrPush(#CYW43_EV_DISASSOC, 0, 0, 0)
+  WifiLinkTick() : WifiLinkTick()
+  If gate_pumps <> 0 Or gate_recTicks <> 2 Or gWifiTeardown <> 0 : ProcedureReturn 10 : EndIf
+  If gate_rejoins <> 0 Or gWifiRecGeneration <> 7 Or cyw43_evrCount <> 2 : ProcedureReturn 11 : EndIf
+  cyw43_EvrClear()
+  If cyw43_evrCount <> 0 : ProcedureReturn 12 : EndIf
+
+  ; A failed recovery's existing slow cadence starts one fresh generation;
+  ; it does not call the old synchronous rejoin loop.
+  GateReset()
+  gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiHealPend = 1
+  gWifiHealLast = gate_ms - #WIFI_HEAL_MS
+  WifiLinkTick()
+  If gate_rejoins <> 1 Or gate_recActive = 0 Or gate_linkDown <> 1 : ProcedureReturn 13 : EndIf
+
+  ; Policy cancellation wins before an owned phase can resume.
+  GateReset()
+  gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_JOIN_POLL : gWifiLinkOn = 0
+  WifiLinkTick()
+  If gate_recActive <> 0 Or gate_recTicks <> 0 : ProcedureReturn 14 : EndIf
+
+  ; DHCP_WAIT is deliberately past the event/handshake ownership boundary:
+  ; normal packet pumping resumes before the recovery observes the lease.
+  GateReset()
+  gate_recActive = 1 : gWifiRecPhase = #WIFI_REC_DHCP_WAIT
+  WifiLinkTick()
+  If gate_pumps <> 1 Or gate_recTicks <> 1 : ProcedureReturn 15 : EndIf
+
   ProcedureReturn 0
 EndProcedure
 '''
-    return prelude + "\n" + bodies + "\n" + main
+    prelude = prelude.replace("EnableExplicit", "EnableExplicit\n\n" + constants, 1)
+    return prelude + "\n" + cyw_bodies + "\n" + wifi_bodies + "\n" + main
 
 
 def build(pmfc: Path, work: Path, probe: Path) -> Path:
@@ -159,7 +295,7 @@ def build(pmfc: Path, work: Path, probe: Path) -> Path:
     shutil.copy2(pmfc, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
-        shutil.copytree(boards, work / "Boards")
+        shutil.copytree(boards, work / "Boards", dirs_exist_ok=True)
     image = work / "wifi_link_policy_gate.img"
     command = [
         str(staged), str(probe), "-t", "pi4",
@@ -189,13 +325,25 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-wifi-link-policy-emitted-") as temporary:
         work = Path(temporary)
         probe = work / "wifi_link_policy_gate.pi4"
-        probe.write_text(probe_source(), encoding="utf-8", newline="\n")
+        exact_source = probe_source()
+        probe.write_text(exact_source, encoding="utf-8", newline="\n")
         image = build(pmfc, work, probe)
         result, steps = emitted.execute(a64, image)
+        if result == 0:
+            ownership = "If WifiRecoveryActive() <> 0 And gWifiRecPhase <> #WIFI_REC_DHCP_WAIT"
+            if ownership not in exact_source:
+                raise SystemExit("wifi link policy gate: ownership boundary not found for negative control")
+            mutated = exact_source.replace(ownership, "If 0 <> 0 And gWifiRecPhase <> #WIFI_REC_DHCP_WAIT", 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            negative_image = build(pmfc, work, probe)
+            negative_result, _ = emitted.execute(a64, negative_image)
+            if negative_result != 8:
+                print(f"wifi_link_policy_emitted_check: FAIL negative control returned {negative_result}, expected 8")
+                return 1
     if result:
         print(f"wifi_link_policy_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"wifi_link_policy_emitted_check: PASS - 7 assertions, {steps:,} A64 instructions")
+    print(f"wifi_link_policy_emitted_check: PASS - 15 assertions, {steps:,} A64 instructions; old pump-first ordering fails assertion 8")
     return 0
 
 
