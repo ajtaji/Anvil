@@ -42,6 +42,7 @@ def probe_source() -> str:
     eapol_state = source_range(source, "#WIFI_EAPOL_FAIL_NONE", "Global gWifiEapolRecoverRc")
     constants = source_range(source, "#WIFI_REC_IDLE", "#WIFI_REC_ENTROPY_MS")
     globals_ = source_range(source, "Global gWifiRecPhase", "Global Dim wifi_recPmk")
+    radio_globals = source_range(source, "Global gWifiRinitPhase", "Global gWifiRinitFwCalls")
     names = (
         "wifi_RecordEapolFailure", "wifi_HandshakeFinish", "wifi_Handshake",
         "wifi_HexVal", "wifi_HexDigit", "wifi_ByteToHex", "wifi_U32ToHex",
@@ -171,6 +172,9 @@ Global gate_beginPmk1.i
 Global gate_sendFailMask.i
 Global gate_sendFailRc.i
 Global gate_drainCalls.i
+Global gate_radioArms.i
+Global gate_radioAnnounce.i
+Global gate_wifiSlots.i = 1
 
 Global gWifiHealPend.i
 Global gWifiHealLast.i
@@ -214,6 +218,8 @@ Procedure str_print_at(p.i) : EndProcedure
 Procedure PrintNl() : EndProcedure
 Procedure PrintDec(v.i) : EndProcedure
 Procedure PutIp(v.i) : EndProcedure
+Procedure.i SettingsWifiSlotCount() : ProcedureReturn gate_wifiSlots : EndProcedure
+Procedure WifiRadioInitArm(announce.i) : gate_radioArms = gate_radioArms + 1 : gate_radioAnnounce = announce : EndProcedure
 Procedure Pbkdf2Wipe() : gate_pbkdfWipes = gate_pbkdfWipes + 1 : EndProcedure
 Procedure Pbkdf2StepWipe() : gate_wipes = gate_wipes + 1 : gate_pbkdfState = #PBKDF2_STEP_IDLE : EndProcedure
 Procedure.i Pbkdf2SetProgress(p.i) : ProcedureReturn 0 : EndProcedure
@@ -938,7 +944,14 @@ Procedure.i Main()
   ProcedureReturn 0
 EndProcedure
 '''
-    return prelude + "\n" + eapol_state + "\n" + constants + "\n" + globals_ + "\n" + bodies + "\n" + tests
+    radio_cancel_stub = r'''
+Procedure WifiRadioInitCancel()
+  gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+  gWifiRinitStepGeneration = 0 : gWifiRinitPhase = #WIFI_RINIT_IDLE
+  gWifiRinitAt = 0 : gWifiRinitAnnounce = 0 : gWifiRinitClockHz = 0
+EndProcedure
+'''
+    return prelude + "\n" + eapol_state + "\n" + constants + "\n" + globals_ + "\n" + radio_globals + "\n" + radio_cancel_stub + "\n" + bodies + "\n" + tests
 
 
 def build(pmfc: Path, work: Path, probe: Path) -> Path:

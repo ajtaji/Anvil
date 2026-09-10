@@ -95,6 +95,10 @@ Global gate_latchInPump.i
 Global gate_rxLen.i
 Global gate_joinVerdict.i
 Global gate_pollEvents.i
+Global gate_radioActive.i
+Global gate_radioTicks.i
+Global gate_radioArms.i
+Global gate_slots.i
 
 Global gWifiLinkOn.i
 Global gWifiUp.i
@@ -166,10 +170,23 @@ Procedure UartWriteStr(p.i) : EndProcedure
 Procedure PrintDec(v.i) : EndProcedure
 Procedure PutIp(v.i) : EndProcedure
 Procedure.i WifiRejoin(announce.i) : gate_rejoins = gate_rejoins + 1 : ProcedureReturn 1 : EndProcedure
+Procedure WifiRadioInitCancel() : gate_radioActive = 0 : EndProcedure
 Procedure WifiRecoveryCancel()
-  gate_recCancels = gate_recCancels + 1 : gate_recActive = 0 : gWifiRecPhase = #WIFI_REC_IDLE
+  gate_recCancels = gate_recCancels + 1 : gate_recActive = 0 : WifiRadioInitCancel() : gWifiRecPhase = #WIFI_REC_IDLE
   gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF
   gWifiEapolRecover = 0 : gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE : gWifiEapolRecoverRc = 0
+EndProcedure
+Procedure.i SettingsWifiSlotCount() : ProcedureReturn gate_slots : EndProcedure
+Procedure.i WifiRadioInitActive() : ProcedureReturn gate_radioActive : EndProcedure
+Procedure WifiRadioInitTick() : gate_radioTicks = gate_radioTicks + 1 : EndProcedure
+Procedure WifiRadioInitArm(announce.i)
+  If gWifiUp <> 0 Or gate_radioActive <> 0 Or gWifiLinkOn = 0 Or gWifiHealOn = 0 Or gate_slots = 0
+    ProcedureReturn
+  EndIf
+  WifiRecoveryCancel()
+  wifi_RecordLinkDown()
+  gate_radioActive = 1
+  gate_radioArms = gate_radioArms + 1
 EndProcedure
 Procedure WifiRecoveryStart(announce.i)
   If gate_inReceive <> 0 : gate_reentered = gate_reentered + 1 : EndIf
@@ -224,6 +241,7 @@ Procedure GateReset()
   gate_recActive = 0 : gate_recTicks = 0 : gate_recCancels = 0 : gate_joinVerdict = #CYW43_JOIN_RUNNING
   gate_liveWipes = 0 : gate_inReceive = 0 : gate_reentered = 0 : gate_latchInPump = 0 : gate_rxLen = 0
   gate_pollEvents = 0 : gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = 7
+  gate_radioActive = 0 : gate_radioTicks = 0 : gate_radioArms = 0 : gate_slots = 1
   gWifiLinkOn = 1 : gWifiUp = 1 : gWifiKeyed = 1 : gWifiHaveIp = 1
   gWifiSecDone = 1 : gWifiBadReads = 0 : gWifiTeardown = 0
   gWifiVerify = 0 : gWifiHealPend = 0 : gWifiHealLast = 0
@@ -377,17 +395,24 @@ Procedure.i Main()
   gate_ms = 5000 + #WIFI_HEAL_MS : WifiLinkTick()
   If gate_rejoins <> 1 Or gate_recActive = 0 : ProcedureReturn 18 : EndIf
 
-  ; A radio-firmware bring-up failure is explicit and does not turn each
-  ; prompt spin into another synchronous blob/init attempt. Policy-off likewise
-  ; leaves the failed initial join down without arming a hidden retry.
+  ; An eligible radio-firmware bring-up failure arms the distinct cooperative
+  ; radio initializer. It starts no association recovery and the next prompt
+  ; service only advances that radio owner.
   GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiUp = 0
   WifiRecoveryInitialJoinFailed()
-  If gWifiHealPend <> 0 Or gate_rejoins <> 0 Or gate_linkDown <> 1 : ProcedureReturn 19 : EndIf
-  gate_ms = gate_ms + #WIFI_HEAL_MS : WifiLinkTick()
-  If gate_rejoins <> 0 Or gate_recActive <> 0 : ProcedureReturn 20 : EndIf
-  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiHealOn = 0
+  If gate_radioActive = 0 Or gate_radioArms <> 1 Or gate_linkDown <> 1 : ProcedureReturn 19 : EndIf
+  If gate_rejoins <> 0 Or gate_recActive <> 0 Or gWifiHealPend <> 0 : ProcedureReturn 20 : EndIf
+  WifiLinkTick()
+  If gate_radioTicks <> 1 Or gate_pumps <> 0 Or gate_rejoins <> 0 : ProcedureReturn 29 : EndIf
+
+  ; Policy-off and missing-credential failures remain truthfully down and do
+  ; not arm either radio initialization or association recovery.
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiUp = 0 : gWifiHealOn = 0
   WifiRecoveryInitialJoinFailed()
-  If gWifiHealPend <> 0 Or gate_rejoins <> 0 : ProcedureReturn 21 : EndIf
+  If gate_radioActive <> 0 Or gate_radioArms <> 0 Or gate_rejoins <> 0 Or gate_linkDown <> 1 : ProcedureReturn 21 : EndIf
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiUp = 0 : gate_slots = 0
+  WifiRecoveryInitialJoinFailed()
+  If gate_radioActive <> 0 Or gate_radioArms <> 0 Or gate_rejoins <> 0 Or gate_linkDown <> 1 : ProcedureReturn 30 : EndIf
 
   ; The 32-bit millisecond clock may wrap between scheduling and retry.
   GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : gate_ms = $FFFFFF00
@@ -499,12 +524,27 @@ def main() -> int:
                     f"{negative_result}, expected 26"
                 )
                 return 1
+            radio_hook = "    WifiRadioInitArm(1)"
+            if exact_source.count(radio_hook) != 1:
+                raise SystemExit(
+                    "wifi link policy gate: radio-init boot-failure hook mutation site is not unique"
+                )
+            mutated = exact_source.replace(radio_hook, "    ; radio-init retry hook removed", 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            negative_image = build(pmfc, work, probe)
+            negative_result, _ = emitted.execute(a64, negative_image)
+            if negative_result != 19:
+                print(
+                    "wifi_link_policy_emitted_check: FAIL radio-init-hook mutant returned "
+                    f"{negative_result}, expected 19"
+                )
+                return 1
     if result:
         print(f"wifi_link_policy_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     print(
-        f"wifi_link_policy_emitted_check: PASS - 28 assertions, {steps:,} A64 instructions; "
-        "pump-order/callback-reentry and BootNetUp-hook mutants rejected"
+        f"wifi_link_policy_emitted_check: PASS - 30 assertions, {steps:,} A64 instructions; "
+        "pump-order/callback-reentry, BootNetUp and radio-init-hook mutants rejected"
     )
     return 0
 

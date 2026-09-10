@@ -426,7 +426,12 @@ Procedure CmdWifi()
     ; radio generation just as a manual join does; an automatic selector
     ; must not resume later against a different table.
     WifiRecoveryCancel()
-    WifiScanMatch()
+    n = WifiScanMatch()
+    ; Scan is a foreground owner and cancels any older automatic generation.
+    ; Reconcile afterward: an already-keyed link is untouched, an unready
+    ; radio gets radio initialization, and a ready/unkeyed radio resumes the
+    ; association machine against the scan result it just produced.
+    WifiRecoveryReconcile(1)
     ProcedureReturn
   EndIf
 
@@ -465,6 +470,8 @@ Procedure CmdWifi()
       If WifiDhcp() <> 0
         NetConsoleRearm()
       EndIf
+    Else
+      WifiRecoveryInitialJoinFailed()
     EndIf
     ; AND AGAIN AFTER THE ATTEMPT, whatever it returned. DHCP may have
     ; bound the lease on a path of its own (the portable dhcp command
@@ -586,13 +593,12 @@ Procedure CmdWifi()
     k = ArgWord()
     If k <> 0
       If (PeekA(k) | $20) = 111 And (PeekA(k + 1) | $20) = 110 And PeekA(k + 2) = 0
-        gWifiHealOn = 1
+        WifiHealSet(1)
         PrintN("Wi-Fi: automatic re-association (the backstop) is ON.")
         ProcedureReturn
       EndIf
       If (PeekA(k) | $20) = 111 And (PeekA(k + 1) | $20) = 102 And (PeekA(k + 2) | $20) = 102 And PeekA(k + 3) = 0
-        WifiRecoveryCancel()
-        gWifiHealOn = 0
+        WifiHealSet(0)
         PrintN("Wi-Fi: automatic re-association is OFF. A dead link will be left")
         PrintN("dead so it can be observed; type wifi rejoin to recover by hand.")
         ProcedureReturn
@@ -716,7 +722,6 @@ Procedure CmdWifi()
       PrintN(".")
       ProcedureReturn
     EndIf
-    WifiRecoveryCancel()
     If SettingsSetWifiSlotSsid(s, v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -724,6 +729,7 @@ Procedure CmdWifi()
       PrintN(" characters. Nothing was changed.")
       ProcedureReturn
     EndIf
+    WifiConfigChanged()
     Print("Wi-Fi slot ")
     PrintDec(s)
     Print(" is now ")
@@ -799,7 +805,6 @@ Procedure CmdWifi()
       ProcedureReturn
     EndIf
     n = StrLenZ(v)
-    WifiRecoveryCancel()
     If SettingsSetWifiSlotPassword(s, v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -811,6 +816,7 @@ Procedure CmdWifi()
       EndIf
       ProcedureReturn
     EndIf
+    WifiConfigChanged()
     Print("The passphrase for Wi-Fi slot ")
     PrintDec(s)
     Print(" is set. It is ")
@@ -957,7 +963,6 @@ Procedure CmdWifi()
       PrintN("   cannot set it: use  settings set wifi.network <name>  instead.")
       ProcedureReturn
     EndIf
-    WifiRecoveryCancel()
     If SettingsSetWifiNetwork(v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -965,6 +970,7 @@ Procedure CmdWifi()
       PrintN(" characters. Nothing was changed.")
       ProcedureReturn
     EndIf
+    WifiConfigChanged()
     Print("The Wi-Fi network name is now ")
     UartWriteStr(v)
     Print("   (")
@@ -1013,7 +1019,6 @@ Procedure CmdWifi()
       ProcedureReturn
     EndIf
     n = StrLenZ(v)
-    WifiRecoveryCancel()
     If SettingsSetWifiPassword(v) = 0
       SettingsSayWhyNot()
       Print("   You typed ")
@@ -1025,6 +1030,7 @@ Procedure CmdWifi()
       EndIf
       ProcedureReturn
     EndIf
+    WifiConfigChanged()
     Print("The Wi-Fi passphrase is set. It is ")
     PrintDec(n)
     PrintN(" characters long.")
@@ -1059,7 +1065,6 @@ Procedure CmdWifi()
         WifiSayNoSuchSlot(s)
         ProcedureReturn
       EndIf
-      WifiRecoveryCancel()
       If SettingsRemoveWifiSlot(s) = 0
         If s = SettingsWifiLegacySlot()
           PrintN("The older single pair was already empty, so nothing was forgotten")
@@ -1072,6 +1077,7 @@ Procedure CmdWifi()
         EndIf
         ProcedureReturn
       EndIf
+      WifiConfigChanged()
       If s = SettingsWifiLegacySlot()
         PrintN("The older single pair has been forgotten - both the network name and")
         PrintN("the passphrase.")
@@ -1098,7 +1104,6 @@ Procedure CmdWifi()
       PrintN("forgotten and nothing changed.")
       ProcedureReturn
     EndIf
-    WifiRecoveryCancel()
     If hadNet <> 0
       SettingsRemove(SettingsWifiNetworkKey())
       PrintN("The Wi-Fi network name has been forgotten.")
@@ -1108,6 +1113,7 @@ Procedure CmdWifi()
       PrintN("The Wi-Fi passphrase has been forgotten. Its bytes are cleared out of")
       PrintN("the table in memory as well as the name.")
     EndIf
+    WifiConfigChanged()
     PrintN("  A copy is still in SETTINGS.TXT on the medium until you type")
     PrintN("  settings save. Until then a reset and a settings load bring it back.")
     Print("  This did NOT touch the numbered slots. Type wifi forget <1 to ")

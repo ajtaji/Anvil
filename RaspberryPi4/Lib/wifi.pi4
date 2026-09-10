@@ -236,12 +236,29 @@ EndProcedure
 ;  Cyw43WifiUp done, or 0 having printed why. Runs its expensive half
 ;  once; a second call with gWifiUp set is a no-op that returns 1.
 ; ----------------------------------------------------------------------
+; Every destructive radio generation shares the forum-737 snapshot boundary.
+; Return the exact optional-telemetry disable result so a synchronous owner can
+; stop and the cooperative owner can retain it in phase diagnostics.
+Procedure.i wifi_RadioGenerationPreflight()
+  If Cyw43RxIrqActive() <> 0 Or Cyw43RxIrqRestorePending() <> 0
+    ProcedureReturn Cyw43RxIrqTelemetry(0)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i WifiRadioUp()
   Define r.i
   Define hz.i
 
   If gWifiUp <> 0
     ProcedureReturn 1
+  EndIf
+
+  r = wifi_RadioGenerationPreflight()
+  If r <> 1
+    PrintN("!! Wi-Fi radio initialization cannot replace the current SDIO generation")
+    PrintN("   because its optional receive-readiness snapshot was not restored.")
+    ProcedureReturn 0
   EndIf
 
   If WifiLoadBlobs() = 0
@@ -415,6 +432,11 @@ Procedure.i WifiScanMatch()
   Define i.i
   Define slot.i
   Define matched.i
+
+  ; A foreground scan owns radio bring-up synchronously. An older automatic
+  ; initialization generation must not resume after this command returns and
+  ; publish over the state it established.
+  WifiRadioInitCancel()
 
   ; Load the stored networks if a fresh boot has not. Done before the
   ; radio comes up so a missing SETTINGS.TXT is reported before 600 KB
@@ -1048,6 +1070,9 @@ Procedure.i WifiJoinKnown()
   Define band.i
   Define ssid.i
   Define ssidLen.i
+  ; Boot and explicit join are the synchronous compatibility owner. Cancel a
+  ; pending automatic radio generation before either reads or changes state.
+  WifiRadioInitCancel()
   If gWifiKeyed <> 0
     ProcedureReturn 1
   EndIf
@@ -1970,6 +1995,38 @@ Global gWifiHealLast.i = 0     ; millis() of the last automatic heal retry
 #WIFI_REC_DHCP_START    = 23
 #WIFI_REC_DHCP_WAIT     = 24
 
+; Radio initialization is deliberately a DIFFERENT generation from association
+; recovery. It advances one existing top-level primitive per WifiLinkTick and
+; leaves every primitive's present synchronous bound intact. The coarse slice
+; removes the whole-chain retry from prompt service; it does not claim that an
+; individual mailbox, SDIO or firmware-control call is nonblocking.
+#WIFI_RINIT_IDLE        = 0
+#WIFI_RINIT_BACKOFF     = 1
+#WIFI_RINIT_RESTORE     = 2
+#WIFI_RINIT_BLOBS       = 3
+#WIFI_RINIT_MBX_INIT    = 4
+#WIFI_RINIT_CLOCK       = 5
+#WIFI_RINIT_CLOCK_SET   = 6
+#WIFI_RINIT_WLON        = 7
+#WIFI_RINIT_SDIO        = 8
+#WIFI_RINIT_F1          = 9
+#WIFI_RINIT_IO          = 10
+#WIFI_RINIT_BLOCK_IO    = 11
+#WIFI_RINIT_ATTACH      = 12
+#WIFI_RINIT_BLOCK_MODE  = 13
+#WIFI_RINIT_PREPARE     = 14
+#WIFI_RINIT_VERIFY_MODE = 15
+#WIFI_RINIT_FW          = 16
+#WIFI_RINIT_NVRAM       = 17
+#WIFI_RINIT_START       = 18
+#WIFI_RINIT_HT          = 19
+#WIFI_RINIT_ANNOUNCE    = 20
+#WIFI_RINIT_F2          = 21
+#WIFI_RINIT_TRANSPORT   = 22
+#WIFI_RINIT_ROAM        = 23
+#WIFI_RINIT_POWER       = 24
+#WIFI_RINIT_READY       = 25
+
 #WIFI_REC_QUIET_MS      = 120
 #WIFI_REC_PBKDF_PRFS    = 16  ; compute-work bound, not a time promise
 ; RNG200 generates at the configured 1 MHz and withholds the first 262144
@@ -2018,6 +2075,64 @@ Global Dim wifi_recPass.a[#WPA2_PASS_MAX + 1]
 Global gWifiRecPassLen.i = 0
 Global Dim wifi_recPmk.a[32]
 
+; Coarse radio-initialization ownership. BACKOFF uses the existing slow heal
+; cadence and unsigned subtraction; it schedules a new attempt but is not the
+; mechanism that makes the attempt cooperative. A primitive may synchronously
+; consume its documented timeout, after which the next phase returns control to
+; the ordinary wired/display/watchdog service loop.
+Global gWifiRinitPhase.i = #WIFI_RINIT_IDLE
+Global gWifiRinitGeneration.i = 0
+Global gWifiRinitStepGeneration.i = 0
+Global gWifiRinitAt.i = 0
+Global gWifiRinitAttempts.i = 0
+Global gWifiRinitClockHz.i = 0
+Global gWifiRinitAnnounce.i = 0
+Global gWifiRinitLastFailPhase.i = #WIFI_RINIT_IDLE
+Global gWifiRinitLastFailRc.i = 0
+Global gWifiRinitLastSdio.i = 0
+Global gWifiRinitLastCyw.i = 0
+Global gWifiRinitRoamRc.i = 0
+Global gWifiRinitPowerRc.i = 0
+Global gWifiRinitBlockMode.i = 0
+Global gWifiRinitFwCalls.i = 0
+
+; Cancellation performs no radio I/O. It invalidates phase ownership so a late
+; return from a synchronous primitive cannot advance or publish an old
+; generation. Saved settings and the persisted PMK cache are not touched.
+Procedure WifiRadioInitCancel()
+  gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+  gWifiRinitStepGeneration = 0
+  gWifiRinitPhase = #WIFI_RINIT_IDLE
+  gWifiRinitAt = 0
+  gWifiRinitAnnounce = 0
+  gWifiRinitClockHz = 0
+  gWifiRinitBlockMode = 0
+EndProcedure
+
+Procedure.i WifiRadioInitActive()
+  ProcedureReturn Bool(gWifiRinitPhase <> #WIFI_RINIT_IDLE)
+EndProcedure
+
+Procedure.i WifiRadioInitPhase()
+  ProcedureReturn gWifiRinitPhase
+EndProcedure
+
+Procedure.i WifiRadioInitAttempts()
+  ProcedureReturn gWifiRinitAttempts
+EndProcedure
+
+Procedure.i WifiRadioInitFirmwareCalls()
+  ProcedureReturn gWifiRinitFwCalls
+EndProcedure
+
+Procedure.i WifiRadioInitLastFailPhase()
+  ProcedureReturn gWifiRinitLastFailPhase
+EndProcedure
+
+Procedure.i WifiRadioInitLastFailRc()
+  ProcedureReturn gWifiRinitLastFailRc
+EndProcedure
+
 ; Cancel has no radio I/O. Generation invalidation makes an old phase unable
 ; to resume after a manual command or configuration change has taken over.
 ; The private resumable U/T state and every recovery-owned PMK byte go too.
@@ -2029,6 +2144,10 @@ Procedure WifiRecoveryCancel()
   wasActive = Bool(gWifiRecPhase <> #WIFI_REC_IDLE)
   ownedHandshake = Bool(gWifiRecPhase >= #WIFI_REC_EAPOL_BEGIN And gWifiRecPhase <= #WIFI_REC_GTK_INSTALL)
   brokenSession = Bool(gWifiEapolRecover <> 0)
+  ; Every explicit/manual/settings/policy owner already crosses this common
+  ; cancellation seam. Let the radio owner invalidate its own generation
+  ; before the association generation is replaced.
+  WifiRadioInitCancel()
   gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF
   gWifiRecStepGeneration = 0
   gWifiRecPhase = #WIFI_REC_IDLE
@@ -2090,21 +2209,384 @@ Procedure wifi_RecordLinkDown()
   gWifiKaLast = 0
 EndProcedure
 
-; A failed foreground join at boot is not a link-loss event, but it has the
-; same eventual-connect obligation when the radio/firmware is already ready.
-; Arm exactly the existing slow cooperative cadence: do not rerun the blocking
-; foreground join here and do not invent a second retry machine. A radio that
-; never reached gWifiUp needs a separately designed incremental bring-up
-; contract; repeatedly calling the synchronous blob/firmware path from the
-; prompt would make wired service unreliable, so that case is reported and
-; deliberately left unarmed.
-Procedure WifiRecoveryInitialJoinFailed()
-  wifi_RecordLinkDown()
-  If gWifiUp = 0
-    PrintN("Wi-Fi: automatic association retry is unavailable because radio bring-up did not finish.")
-    PrintN("       Wired Ethernet remains available; retrying radio initialization needs a separate bounded service.")
+; Arm one slow automatic retry after a foreground boot attempt failed before
+; gWifiUp was published. This owns no saved credential or PMK bytes: radio
+; initialization only makes the firmware available, then hands current settings
+; to the existing association-recovery machine.
+Procedure WifiRadioInitArm(announce.i)
+  If gWifiUp <> 0 Or gWifiRinitPhase <> #WIFI_RINIT_IDLE
     ProcedureReturn
   EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0
+    ProcedureReturn
+  EndIf
+  If SettingsWifiSlotCount() = 0
+    ProcedureReturn
+  EndIf
+
+  ; The association generation and any live lease/key claim are not valid for
+  ; an unready radio. Cancel first, then establish a new radio owner.
+  WifiRecoveryCancel()
+  wifi_RecordLinkDown()
+  gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+  gWifiRinitStepGeneration = gWifiRinitGeneration
+  gWifiRinitPhase = #WIFI_RINIT_BACKOFF
+  gWifiRinitAt = millis()
+  gWifiRinitAnnounce = Bool(announce <> 0)
+  If gWifiRinitAnnounce <> 0
+    PrintN("Wi-Fi: radio initialization will retry cooperatively; wired Ethernet remains available.")
+  EndIf
+EndProcedure
+
+Procedure.i wifi_RadioInitStillOwned(generation.i)
+  If gWifiRinitPhase = #WIFI_RINIT_IDLE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Bool(gWifiRinitGeneration = generation And gWifiRinitStepGeneration = generation)
+EndProcedure
+
+Procedure wifi_RadioInitFail(phase.i, rc.i)
+  gWifiUp = 0
+  gWifiRinitLastFailPhase = phase
+  gWifiRinitLastFailRc = rc
+  gWifiRinitLastSdio = SdioLastError()
+  gWifiRinitLastCyw = Cyw43LastError()
+  wifi_RecordLinkDown()
+  gWifiRinitPhase = #WIFI_RINIT_BACKOFF
+  gWifiRinitAt = millis()
+  If gWifiRinitAnnounce <> 0
+    Print("Wi-Fi: cooperative radio initialization stopped at phase ")
+    PrintDec(phase)
+    Print(" (result ")
+    PrintDec(rc)
+    PrintN("); it will retry on the normal recovery cadence.")
+  EndIf
+EndProcedure
+
+; One existing top-level primitive per call. Read-only accessors and state
+; publication do not count as bus work. Every primitive is followed by the
+; generation check before phase state can advance, so a nested cancellation or
+; foreground takeover makes the result stale.
+Procedure WifiRadioInitTick()
+  Define phase.i
+  Define generation.i
+  Define r.i
+  Define now.i
+
+  If gWifiRinitPhase = #WIFI_RINIT_IDLE
+    ProcedureReturn
+  EndIf
+  If gWifiUp <> 0
+    WifiRadioInitCancel()
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0 Or SettingsWifiSlotCount() = 0
+    WifiRadioInitCancel()
+    ProcedureReturn
+  EndIf
+  If gWifiRinitStepGeneration <> gWifiRinitGeneration
+    WifiRadioInitCancel()
+    ProcedureReturn
+  EndIf
+
+  phase = gWifiRinitPhase
+  generation = gWifiRinitGeneration
+
+  Select phase
+    Case #WIFI_RINIT_BACKOFF
+      now = millis()
+      If ((now - gWifiRinitAt) & $FFFFFFFF) < #WIFI_HEAL_MS
+        ProcedureReturn
+      EndIf
+      ; A retry is a new hardware generation. No failed attempt's phase or
+      ; partial firmware offset is eligible for reuse.
+      gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+      gWifiRinitStepGeneration = gWifiRinitGeneration
+      gWifiRinitAttempts = gWifiRinitAttempts + 1
+      gWifiRinitPhase = #WIFI_RINIT_RESTORE
+      ProcedureReturn
+
+    Case #WIFI_RINIT_RESTORE
+      ; The optional forum-737 observer owns exact old-generation card/host
+      ; snapshots until verified disable. No destructive primitive below may run
+      ; after a failed restoration.
+      r = wifi_RadioGenerationPreflight()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_BLOBS
+
+    Case #WIFI_RINIT_BLOBS
+      r = WifiLoadBlobs()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_MBX_INIT
+
+    Case #WIFI_RINIT_MBX_INIT
+      r = MailboxInit()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_CLOCK
+
+    Case #WIFI_RINIT_CLOCK
+      r = WifiClockHz()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <= 0
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitClockHz = r
+      gWifiRinitPhase = #WIFI_RINIT_CLOCK_SET
+
+    Case #WIFI_RINIT_CLOCK_SET
+      SdioSetBaseClockKhz(gWifiRinitClockHz / 1000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_WLON
+
+    Case #WIFI_RINIT_WLON
+      r = SdioAssertWlOn()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_SDIO
+
+    Case #WIFI_RINIT_SDIO
+      r = SdioInit()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_F1
+
+    Case #WIFI_RINIT_F1
+      r = SdioEnableFunction(1)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_IO
+
+    Case #WIFI_RINIT_IO
+      r = Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_BLOCK_IO
+
+    Case #WIFI_RINIT_BLOCK_IO
+      r = Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_ATTACH
+
+    Case #WIFI_RINIT_ATTACH
+      r = Cyw43Attach()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_BLOCK_MODE
+
+    Case #WIFI_RINIT_BLOCK_MODE
+      r = Cyw43SetBlockMode(1)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      ; This API returns the selected mode, not an operation status. Zero is
+      ; the supported byte-mode fallback used by the existing radio path.
+      gWifiRinitBlockMode = r
+      gWifiRinitPhase = #WIFI_RINIT_PREPARE
+
+    Case #WIFI_RINIT_PREPARE
+      r = Cyw43PrepareDownload()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_VERIFY_MODE
+
+    Case #WIFI_RINIT_VERIFY_MODE
+      Cyw43SetVerify(2)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_FW
+
+    Case #WIFI_RINIT_FW
+      gWifiRinitFwCalls = gWifiRinitFwCalls + 1
+      r = Cyw43UploadFirmware(#WIFI_FW_ADDR, #WIFI_FW_LEN, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_NVRAM
+
+    Case #WIFI_RINIT_NVRAM
+      r = Cyw43UploadNvram(#WIFI_NV_ADDR, #WIFI_NV_LEN, #WIFI_NV_WORK, #WIFI_NV_WORK_MAX, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_START
+
+    Case #WIFI_RINIT_START
+      r = Cyw43Start()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_HT
+
+    Case #WIFI_RINIT_HT
+      r = Cyw43HtClock()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_ANNOUNCE
+
+    Case #WIFI_RINIT_ANNOUNCE
+      r = Cyw43AnnounceHost()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_F2
+
+    Case #WIFI_RINIT_F2
+      r = SdioEnableFunction(2)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_TRANSPORT
+
+    Case #WIFI_RINIT_TRANSPORT
+      r = Cyw43WifiUp(#WIFI_CLM_ADDR, #WIFI_CLM_LEN, #CYW43_EVMASK_JOIN, 2000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 0
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_ROAM
+
+    Case #WIFI_RINIT_ROAM
+      r = Cyw43SetRoamOff(1, 2000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitRoamRc = r
+      gWifiRinitPhase = #WIFI_RINIT_POWER
+
+    Case #WIFI_RINIT_POWER
+      r = Cyw43SetPowerMode(#CYW43_PM_OFF, 2000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitPowerRc = r
+      gWifiRinitPhase = #WIFI_RINIT_READY
+
+    Case #WIFI_RINIT_READY
+      ; Publish only after every mandatory stage. Roam/power policy retains the
+      ; existing nonfatal meaning and its exact result remains diagnostic.
+      gWifiUp = 1
+      gWifiRinitPhase = #WIFI_RINIT_IDLE
+      gWifiRinitStepGeneration = 0
+      If gWifiRinitAnnounce <> 0
+        PrintN("Wi-Fi: radio initialization recovered; association will continue cooperatively.")
+      EndIf
+      gWifiRinitAnnounce = 0
+      WifiRecoveryStart(1)
+
+    Default
+      wifi_RadioInitFail(phase, -1)
+  EndSelect
+EndProcedure
+
+; A failed foreground join at boot has the same eventual-connect obligation
+; whether it stopped before or after the firmware became ready. An unready radio
+; arms the coarse initializer above; a ready radio arms the existing association
+; generation. Both use the same slow cadence and neither reruns a whole blocking
+; foreground join from prompt service.
+Procedure WifiRecoveryInitialJoinFailed()
+  If gWifiUp = 0
+    If gWifiLinkOn = 0 Or gWifiHealOn = 0
+      wifi_RecordLinkDown()
+      PrintN("Wi-Fi: radio bring-up did not finish and automatic connection policy is OFF.")
+      ProcedureReturn
+    EndIf
+    If SettingsWifiSlotCount() = 0
+      wifi_RecordLinkDown()
+      PrintN("Wi-Fi: radio bring-up did not finish and no saved network is available for automatic retry.")
+      ProcedureReturn
+    EndIf
+    WifiRadioInitArm(1)
+    ProcedureReturn
+  EndIf
+  wifi_RecordLinkDown()
   If gWifiLinkOn = 0 Or gWifiHealOn = 0
     PrintN("Wi-Fi: the radio is ready, but automatic connection policy is OFF; the failed boot join is left down.")
     ProcedureReturn
@@ -2113,6 +2595,48 @@ Procedure WifiRecoveryInitialJoinFailed()
   gWifiHealLast = millis()
   gWifiKaLast = 0
   PrintN("Wi-Fi: the radio is ready; the failed boot join will be retried cooperatively.")
+EndProcedure
+
+; Reconcile an explicit policy/configuration/foreground event after its old
+; owner has been cancelled. This is deliberately event-driven: WifiLinkTick
+; does not arm an unready radio merely because it observes gWifiUp = 0.
+Procedure WifiRecoveryReconcile(announce.i)
+  If gWifiKeyed <> 0
+    ; GTK installation publishes the live association before recovery reaches
+    ; DHCP_START. A successful settings command may cancel in that interval;
+    ; preserve the valid session and explicitly hand address acquisition back
+    ; to the common per-interface client instead of waiting for a later tick.
+    If gWifiHaveIp = 0
+      NetDhcpStart(#HW_LINK_WIFI, 1)
+    EndIf
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0 Or SettingsWifiSlotCount() = 0
+    ProcedureReturn
+  EndIf
+  If gWifiUp = 0
+    WifiRadioInitArm(announce)
+  Else
+    WifiRecoveryStart(announce)
+  EndIf
+EndProcedure
+
+; Successful Wi-Fi-specific settings commands cross one common ownership seam:
+; invalidate the old association/radio generation, then schedule the current
+; configuration according to radio readiness and policy.
+Procedure WifiConfigChanged()
+  WifiRecoveryCancel()
+  WifiRecoveryReconcile(0)
+EndProcedure
+
+Procedure WifiHealSet(on.i)
+  If on <> 0
+    gWifiHealOn = 1
+    WifiRecoveryReconcile(1)
+  Else
+    WifiRecoveryCancel()
+    gWifiHealOn = 0
+  EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -3038,6 +3562,14 @@ Procedure WifiLinkTick()
   Define age.i
   Define rr.i
 
+  ; An unready radio has no valid steady-state receive/event owner. Advance one
+  ; coarse initialization phase and return to the board's outer service loop,
+  ; which preserves wired Ethernet and the console between phases.
+  If WifiRadioInitActive() <> 0
+    WifiRadioInitTick()
+    ProcedureReturn
+  EndIf
+
   ; ------------------------------------------------------------------
   ; RECOVERY OWNS JOIN EVENTS AND HANDSHAKE FRAMES.
   ;
@@ -3292,6 +3824,9 @@ Procedure WifiLinkSet(on.i)
   If on <> 0
     gWifiLinkOn = 1
     gWifiKaLast = 0
+    ; Re-enabling policy is an explicit retry event. Do not poll gWifiUp and
+    ; auto-arm on every prompt turn; a radio-off policy must remain meaningful.
+    WifiRecoveryReconcile(1)
   Else
     gWifiLinkOn = 0
     WifiRecoveryCancel()
