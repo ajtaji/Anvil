@@ -208,14 +208,20 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure NetRecvRelease()
   Define keep.i
+  Define orderly.i
   If gNrSock < 0
     ProcedureReturn
   EndIf
   keep = TcpCurrent()
   TcpUse(gNrSock)
   TcpUnlisten()
-  If TcpState() <> #TCP_CLOSED
-    If TcpState() <> #TCP_TIME_WAIT
+  ; A successful receive has already answered the peer's FIN with our own
+  ; orderly FIN. LAST_ACK remains owned by the ordinary multi-socket TCP
+  ; service until the peer ACKs it or the existing retransmission bound
+  ; expires. Only that exact successful terminal is exempt from abort.
+  orderly = Bool(gNrState = #NR_DONE And TcpState() = #TCP_LAST_ACK)
+  If orderly = 0
+    If TcpState() <> #TCP_CLOSED And TcpState() <> #TCP_TIME_WAIT
       TcpAbort()
       TcpUnlisten()
     EndIf
@@ -374,6 +380,13 @@ Procedure.i NetRecvStep()
   st = TcpState()
   If st = #TCP_CLOSE_WAIT Or st = #TCP_CLOSED Or st = #TCP_LAST_ACK
     If TcpAvailable() = 0
+      ; The peer FIN is the file delimiter, but it does not make an abortive
+      ; local close correct. Revoke the one-shot listener before queueing our
+      ; FIN so the later LAST_ACK completion frees rather than re-listens.
+      If st = #TCP_CLOSE_WAIT
+        TcpUnlisten()
+        TcpClose()
+      EndIf
       gNrT1 = millis()
       gNrState = #NR_DONE
       TcpUse(keep)

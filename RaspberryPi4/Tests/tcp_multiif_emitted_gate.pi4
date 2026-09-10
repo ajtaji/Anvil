@@ -265,6 +265,9 @@ Procedure.i GateShortReceiver(kind.i, localIp.i, peerIp.i, mode.i)
   Define room.i
   Define expected.i
   Define ack.i
+  Define sock.i
+  Define rst0.i
+  Define seq.i
   Define state.i
   TcpInit()
   For i = 0 To 31 : gate_upload[i] = $AA : Next
@@ -273,7 +276,7 @@ Procedure.i GateShortReceiver(kind.i, localIp.i, peerIp.i, mode.i)
   If mode = 2 : room = 8 : expected = #NR_OVER : EndIf
   If NetRecvArm(5100, @gate_upload[1], @gate_upload[room]) <> #NR_WAIT : ProcedureReturn 1 : EndIf
   TcpUse(3)
-  If mode >= 3
+  If mode = 3 Or mode = 4
     If mode = 4
       TcpUse(NetRecvSock())
       TcpUnlisten()
@@ -295,6 +298,31 @@ Procedure.i GateShortReceiver(kind.i, localIp.i, peerIp.i, mode.i)
   If TcpState() <> #TCP_SYN_RECEIVED : ProcedureReturn 8 : EndIf
   ack = tcp_snd_nxt
   TcpUse(3)
+  If mode >= 5
+    GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_ACK)
+    gate_now = gate_now + 1000
+    If NetRecvStep() <> #NR_RECV : ProcedureReturn 26 : EndIf
+    rst0 = tcp_rst_tx
+    If mode = 5
+      gNrState = #NR_STOP
+    ElseIf mode = 6
+      gate_now = gate_now + (#NR_IDLE_MS + 1) * 1000
+      If NetRecvStep() <> #NR_TIME : ProcedureReturn 27 : EndIf
+    Else
+      GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_RST)
+      If NetRecvStep() <> #NR_RST : ProcedureReturn 28 : EndIf
+    EndIf
+    sock = NetRecvSock()
+    NetRecvRelease()
+    TcpUse(sock)
+    If TcpState() <> #TCP_CLOSED Or tcp_inuse <> 0 : ProcedureReturn 29 : EndIf
+    If mode = 7
+      If tcp_rst_tx <> rst0 : ProcedureReturn 30 : EndIf
+    Else
+      If tcp_rst_tx <> rst0 + 1 : ProcedureReturn 31 : EndIf
+    EndIf
+    ProcedureReturn 0
+  EndIf
   ; The final handshake ACK may also carry data and FIN. This is a real
   ; protocol path into CLOSE_WAIT in one poll, before NR_WAIT saw ESTABLISHED.
   GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_ACK | #TCP_FIN)
@@ -310,10 +338,51 @@ Procedure.i GateShortReceiver(kind.i, localIp.i, peerIp.i, mode.i)
     If gate_upload[i + 1] <> ((i * 17) & $FF) : ProcedureReturn 13 : EndIf
   Next
   If gate_upload[0] <> $AA Or gate_upload[n + 1] <> $AA : ProcedureReturn 14 : EndIf
+  sock = NetRecvSock()
+  rst0 = tcp_rst_tx
+  If expected = #NR_DONE
+    TcpUse(sock)
+    If TcpState() <> #TCP_LAST_ACK Or tcp_listen_port <> 0 : ProcedureReturn 15 : EndIf
+    If gate_txLen < 54 Or (gate_tx[47] & (#TCP_FIN | #TCP_ACK | #TCP_RST)) <> (#TCP_FIN | #TCP_ACK) : ProcedureReturn 16 : EndIf
+    ack = tcp_snd_nxt
+    seq = tcp_rcv_nxt
+    TcpUse(3)
+  Else
+    ; LAST_ACK alone is not proof of receiver success. A failed owner may
+    ; already have initiated close; release must still abort that session.
+    TcpUse(sock)
+    TcpUnlisten()
+    TcpClose()
+    If TcpState() <> #TCP_LAST_ACK : ProcedureReturn 25 : EndIf
+    TcpUse(3)
+  EndIf
   NetRecvRelease()
-  If TcpCurrent() <> 3 Or NetRecvSock() <> -1 : ProcedureReturn 15 : EndIf
-  TcpUse(0)
-  If TcpState() <> #TCP_CLOSED Or tcp_listen_port <> 0 Or tcp_inuse <> 0 : ProcedureReturn 16 : EndIf
+  If TcpCurrent() <> 3 Or NetRecvSock() <> -1 : ProcedureReturn 17 : EndIf
+  TcpUse(sock)
+  If expected = #NR_DONE
+    If TcpState() <> #TCP_LAST_ACK Or tcp_listen_port <> 0 Or tcp_inuse = 0 : ProcedureReturn 18 : EndIf
+    If tcp_rst_tx <> rst0 : ProcedureReturn 19 : EndIf
+    If mode = 0
+      GateQueueTcp(kind, peerIp, localIp, 44000, 5100, seq, ack, #TCP_ACK)
+      TcpPoll(0)
+      If TcpState() <> #TCP_CLOSED : ProcedureReturn 20 : EndIf
+      TcpTick()
+    Else
+      ; Withhold the final ACK. Ordinary service must retransmit FIN and
+      ; eventually reclaim the parked socket without emitting a reset.
+      For i = 0 To #TCP_MAX_RETRIES
+        gate_now = gate_now + 60000000
+        TcpTick()
+      Next
+      If TcpState() <> #TCP_CLOSED : ProcedureReturn 32 : EndIf
+      TcpTick()
+    EndIf
+    If tcp_listen_port <> 0 Or tcp_inuse <> 0 : ProcedureReturn 24 : EndIf
+    If tcp_rst_tx <> rst0 : ProcedureReturn 21 : EndIf
+  Else
+    If TcpState() <> #TCP_CLOSED Or tcp_listen_port <> 0 Or tcp_inuse <> 0 : ProcedureReturn 22 : EndIf
+    If tcp_rst_tx <> rst0 + 1 : ProcedureReturn 23 : EndIf
+  EndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -411,7 +480,7 @@ Procedure.i Main()
   If TcpListen(5001) <> #NET_TCP_E_BUSY : ProcedureReturn 26 : EndIf
   TcpUse(0)
   If NetSetIPv4Alt(#HW_LINK_WIRED, wiredAlias, $FFFFFF00) = 0 : ProcedureReturn 27 : EndIf
-  For i = 0 To 4
+  For i = 0 To 7
     LinkUseKind(#HW_LINK_WIFI)
     result = GateShortReceiver(#HW_LINK_WIRED, wiredAlias, peerWired, i)
     If result <> 0 : ProcedureReturn 100 + i * 20 + result : EndIf

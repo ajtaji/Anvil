@@ -24,7 +24,7 @@ LOAD = 0x00400000
 STACK = 0x03000000
 STACK_BYTES = 0x00100000
 LOADER_LR = 0xDEAD0000
-STEP_LIMIT = 3_000_000
+STEP_LIMIT = 8_000_000
 
 
 def required_path(value: str | None, env_name: str) -> Path:
@@ -60,7 +60,7 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
         raise SystemExit("tcp multi-if gate: compiler symbol map has no BSS bounds") from exc
 
 
-def build(pmfc: Path, work: Path, old_wait: bool = False) -> Path:
+def build(pmfc: Path, work: Path, mutation: str = "") -> Path:
     staged = work / pmfc.name
     shutil.copy2(pmfc, staged)
     boards = ROOT / "Boards"
@@ -68,15 +68,25 @@ def build(pmfc: Path, work: Path, old_wait: bool = False) -> Path:
         shutil.copytree(boards, work / "Boards")
     image = work / "tcp_multiif_gate.img"
     probe = PROBE
-    if old_wait:
+    if mutation:
         # Restore the actual defective production admission predicate in an
         # isolated generated include. All other protocol code remains real.
         receiver = (ROOT / "Anvil/Core/netrecv.pbi").read_text(encoding="utf-8")
-        fixed = "If st = #TCP_ESTABLISHED Or st = #TCP_CLOSE_WAIT"
+        if mutation == "old_wait":
+            fixed = "If st = #TCP_ESTABLISHED Or st = #TCP_CLOSE_WAIT"
+            broken = "If st = #TCP_ESTABLISHED"
+        elif mutation == "no_close":
+            fixed = "        TcpClose()"
+            broken = "        ; TcpClose removed by mutation"
+        elif mutation == "last_ack_only":
+            fixed = "orderly = Bool(gNrState = #NR_DONE And TcpState() = #TCP_LAST_ACK)"
+            broken = "orderly = Bool(TcpState() = #TCP_LAST_ACK)"
+        else:
+            raise SystemExit(f"tcp multi-if mutation: unknown mutation {mutation}")
         if receiver.count(fixed) != 1:
-            raise SystemExit("tcp multi-if mutation: admission predicate drifted")
+            raise SystemExit(f"tcp multi-if mutation: {mutation} site drifted")
         mutated = work / "netrecv_old_wait.pbi"
-        mutated.write_text(receiver.replace(fixed, "If st = #TCP_ESTABLISHED", 1), encoding="utf-8")
+        mutated.write_text(receiver.replace(fixed, broken, 1), encoding="utf-8")
         source = PROBE.read_text(encoding="utf-8")
         include = 'XIncludeFile "Anvil/Core/netrecv.pbi"'
         if source.count(include) != 1:
@@ -167,13 +177,20 @@ def main() -> int:
         print(f"tcp_multiif_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     with tempfile.TemporaryDirectory(prefix="anvil-tcp-old-wait-") as temporary:
-        mutant = build(pmfc, Path(temporary), old_wait=True)
+        mutant = build(pmfc, Path(temporary), mutation="old_wait")
         mutation_result, mutation_steps = execute(a64, mutant)
     if mutation_result != 109:
         print(f"tcp_multiif_emitted_check: FAIL old-wait mutation returned {mutation_result}; expected assertion 109")
         return 1
-    print(f"tcp_multiif_emitted_check: PASS - 27 endpoint assertions, 10 receiver scenarios, {steps:,} A64 instructions")
-    print(f"  real-frame short/empty FIN, ceiling, no-peer and revoked-listener cases on both links; old-wait mutation rejected at 109 ({mutation_steps:,} instructions)")
+    for mutation, expected in (("no_close", 115), ("last_ack_only", 162)):
+        with tempfile.TemporaryDirectory(prefix=f"anvil-tcp-{mutation}-") as temporary:
+            mutant = build(pmfc, Path(temporary), mutation=mutation)
+            mutation_result, mutation_steps = execute(a64, mutant)
+        if mutation_result != expected:
+            print(f"tcp_multiif_emitted_check: FAIL {mutation} mutation returned {mutation_result}; expected assertion {expected}")
+            return 1
+    print(f"tcp_multiif_emitted_check: PASS - 27 endpoint assertions, 16 receiver scenarios, {steps:,} A64 instructions")
+    print(f"  orderly ACK and lost-ACK success, overflow/stop/idle abort, peer-RST silence, no-peer and revoked-listener on both links; 3 mutations rejected")
     return 0
 
 
