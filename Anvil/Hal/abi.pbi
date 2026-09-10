@@ -68,8 +68,34 @@
 ;    SP        the payload's own stack, at the address its --stack-addr
 ;              declared, ALREADY SWITCHED. The payload's own prologue does
 ;              that switch and does it under #PMF_FLAG_RETURNS too.
-;    EL        EL2, Non-secure - the same level Anvil runs at. The payload
-;              does NOT change it.
+;    EL        THE SAME LEVEL ANVIL RUNS AT, whatever that is. The payload
+;              does NOT change it, and it MUST NOT hard-code a number.
+;
+;              This said "EL2, Non-secure" until 2026-09-07, and it was a
+;              fact about one boot path being written down as a contract.
+;              Anvil runs at EL2 when the firmware's own arm stub loads
+;              it and at EL3 when RaspberryPi4/Board/armstub8.asm does,
+;              and a payload is entered at whichever it is. At EL3 the
+;              world is Secure, so "Non-secure" was wrong there too.
+;
+;              THIS IS NOT AN ABI BREAK AND DID NOT RAISE THE MAJOR, for
+;              a reason worth stating rather than assuming: no slot's
+;              signature changed and no payload can observe the level
+;              except through SvcMmuState() and its own CurrentEL read,
+;              both of which already answered truthfully. What changed is
+;              this sentence, which promised more than the monitor knew.
+;              A payload that BUILT IN the number 2 was relying on
+;              something never guaranteed - the line above it says the
+;              same about the MMU and the caches, and for the same
+;              reason: ASK, do not assume.
+;
+;              PHASE 2 will drop the payload to EL2 or EL1 under an EL3
+;              monitor, with an SMC gate in place of the direct function
+;              pointers in this table - a lower level cannot call an EL3
+;              address. That IS an ABI change and it will raise the
+;              major. Phase 1 calls payloads at the monitor's own level
+;              so that this table and every proof over it stay exactly
+;              as they are.
 ;    MMU and   WHATEVER STATE ANVIL IS IN, which is not fixed and must not
 ;    caches    be assumed. SvcMmuState() answers; the payload ASKS rather
 ;              than guessing. (In practice RunAt hands over with the

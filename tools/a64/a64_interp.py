@@ -49,6 +49,8 @@ SYS_MAINTENANCE = {
     0x0870: "tlbi vmalle1",   # op1=0 CRn=8  CRm=7  op2=0
     0x4830: "tlbi alle2is",   # op1=4 CRn=8  CRm=3  op2=0
     0x4870: "tlbi alle2",     # op1=4 CRn=8  CRm=7  op2=0
+    0x6830: "tlbi alle3is",   # op1=6 CRn=8  CRm=3  op2=0
+    0x6870: "tlbi alle3",     # op1=6 CRn=8  CRm=7  op2=0
 }
 
 # AT - address translation, 2026-09-04 (forum 627). Same SYS family and the
@@ -65,6 +67,8 @@ SYS_ADDRESS_TRANSLATION = {
     0x4781: "at s1e2w",       # op1=4 CRn=7  CRm=8  op2=1
     0x4784: "at s12e1r",      # op1=4 CRn=7  CRm=8  op2=4
     0x4785: "at s12e1w",      # op1=4 CRn=7  CRm=8  op2=5
+    0x6780: "at s1e3r",       # op1=6 CRn=7  CRm=8  op2=0
+    0x6781: "at s1e3w",       # op1=6 CRn=7  CRm=8  op2=1
 }
 
 # SVC / HVC / SMC / BRK / HLT - exception generation, 2026-09-04 (forum 611).
@@ -78,6 +82,22 @@ EXCEPTION_GENERATION = {
     0xD4000003: ("smc", "a secure-monitor handler at EL3"),
     0xD4200000: ("brk", "an attached debugger"),
     0xD4400000: ("hlt", "an attached debug host"),
+}
+
+
+# The ELR and SPSR a given exception level's ERET reads, keyed by the
+# level it returns FROM and valued by the WRITE base of each register -
+# the same key the opt-in system-register store uses. The encodings come
+# from RaspberryPi4/A64Assembler.pbi, which cites
+# RaspberryPi4/Reference/llvm19.1.0_AArch64SystemOperands.td for the EL3
+# pair and v6.12_arm64_sysreg.h for the other two.
+#
+# EL0 is absent on purpose: an exception return from EL0 is not defined,
+# and a table entry answering it would be an invented destination.
+ERET_BANKS = {
+    3: (0xD51E4020, 0xD51E4000),   # elr_el3, spsr_el3
+    2: (0xD51C4020, 0xD51C4000),   # elr_el2, spsr_el2
+    1: (0xD5184020, 0xD5184000),   # elr_el1, spsr_el1
 }
 
 
@@ -437,6 +457,52 @@ class A64:
     this_instr: int = 0
 
     # ------------------------------------------------------------------
+    #  SYSTEM REGISTERS AND THE EXCEPTION LEVEL - added 2026-09-07,
+    #  OPT-IN, AND OFF BY DEFAULT
+    # ------------------------------------------------------------------
+    #  This model decoded no MRS and no MSR at all: every gate that needed
+    #  one shimmed it around step(), and a word nobody shimmed reached the
+    #  "unsupported A64 word" refusal.  That was the right contract while
+    #  the only registers anybody read were CurrentEL, CNTFRQ_EL0 and
+    #  CNTPCT_EL0 - three read-only values a gate can answer in four lines
+    #  (see tools/a64/a64_anvil_check.py's answer_sysregs).
+    #
+    #  The EL3 work needs more than an answer.  RaspberryPi4/Board/
+    #  armstub8.asm exists to WRITE eleven system registers and then not
+    #  eret, and the only useful question to ask of it at a desk is "which
+    #  registers did it write, with what, and at what level did it leave
+    #  the machine".  A shim that answers reads cannot record writes, and
+    #  three gates growing three private copies of a register file is how
+    #  three models come to disagree.
+    #
+    #  SO IT IS A STORE, NOT A MODEL.  Nothing here acts on a value.
+    #  Writing SCTLR_ELx.M does not turn on translation; writing SCR_EL3.NS
+    #  does not create a second world; writing VBAR does not install
+    #  vectors.  A register written can be read back and a gate can judge
+    #  it, and that is the whole of it.  Inventing consequences would be
+    #  a wrong answer where an absent one is honest - and `mmu_enabled()`
+    #  above already says at length why this model must not pretend to
+    #  translate.
+    #
+    #  OFF BY DEFAULT so that every gate written before today keeps the
+    #  behaviour it was written against: an un-shimmed MRS is still a loud
+    #  refusal, not a silent zero.  A gate opts in with
+    #  enable_system_registers(), which is also the only way to get an
+    #  exception level that is anything but the 2 the firmware hands over.
+    system_registers: Optional[Dict[int, int]] = None
+
+    # The level MRS CurrentEL reports and the level an eret returns FROM.
+    # 2 unless a gate says otherwise, because that is where the stock
+    # armstub and U-Boot both hand over.
+    current_el: int = 2
+
+    # Every ERET this run executed, as (from_el, to_el, target_pc).  The
+    # stub gate's central claim is a NEGATIVE one - that our stub never
+    # erets - and a negative claim needs a record to check, not the
+    # absence of a symptom.
+    erets: List[Tuple[int, int, int]] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
     #  THE LOCAL EXCLUSIVE MONITOR - added 2026-08-28 with the atomics
     # ------------------------------------------------------------------
     #  WHAT THIS IS FOR, AND WHAT IT HONESTLY CANNOT BE FOR.
@@ -726,6 +792,47 @@ class A64:
         }
         return table.get(code, False)
 
+    # ------------------------------------------------------------------
+    #  The system-register store's entry points.  See the field above.
+    # ------------------------------------------------------------------
+    #  The encodings are the ones RaspberryPi4/A64Assembler.pbi emits, and
+    #  the rule that produces them is stated there:
+    #     base = 0xD5100000 | (op0-2)<<19 | op1<<16 | CRn<<12 | CRm<<8
+    #            | op2<<5,  with 0x00200000 added for a read.
+    #  A register is keyed here by its WRITE base, so `msr x, R` and
+    #  `mrs R, x` reach the same slot.
+    SYSREG_WRITE_MASK = 0xFFFFFFE0
+    SYSREG_READ_BIT = 0x00200000
+    CURRENTEL_WRITE_BASE = 0xD5184240
+
+    def enable_system_registers(self, el: int = 2,
+                                preset: Optional[Dict[int, int]] = None) -> None:
+        """Turn on the register store, at exception level `el`.
+
+        `preset` seeds registers the firmware or a previous stage would
+        have left set - keyed by WRITE base, the same key a gate reads
+        back with.  A gate that seeds nothing gets zero for every
+        register it has not written, which is a MODEL CHOICE and not a
+        claim about the part: the architecture leaves most of these
+        UNKNOWN at reset.  Do not write a gate whose pass depends on an
+        unwritten register reading zero.
+        """
+        if el not in (0, 1, 2, 3):
+            raise ValueError("exception level must be 0, 1, 2 or 3, not %r" % el)
+        self.system_registers = dict(preset or {})
+        self.current_el = el
+
+    def sysreg(self, write_base: int) -> Optional[int]:
+        """What a register holds, or None if nothing has written it.
+
+        None and 0 are different answers and the caller must be able to
+        tell them apart: "the stub never wrote SCR_EL3" and "the stub
+        wrote zero into SCR_EL3" are two different stubs.
+        """
+        if self.system_registers is None:
+            return None
+        return self.system_registers.get(write_base)
+
     def step(self) -> None:
         here = self.pc
         # THE FAULT MUST NAME THE INSTRUCTION THAT MADE THE ACCESS, not
@@ -827,6 +934,79 @@ class A64:
         # no-ops after their encoding has been independently checked.
         if (ins & 0xFFFFF0FF) in (0xD50340DF, 0xD50340FF):
             return
+
+        # ------------------------------------------------------------------
+        #  MRS / MSR (register form) and ERET - 2026-09-07, OPT-IN ONLY.
+        # ------------------------------------------------------------------
+        #  Both of these are silent unless a gate called
+        #  enable_system_registers(); without it they fall through to the
+        #  refusal at the foot of step(), exactly as they did before today.
+        #  That is deliberate - see the long note on `system_registers`.
+        #
+        #  ORDER MATTERS. This test sits BELOW the hint, barrier, SYS and
+        #  PSTATE-immediate tests above, because `msr daifset, #n`,
+        #  `msr spsel, #n`, `dc`, `ic`, `tlbi` and the barriers all live in
+        #  the same 0xD5.. space with op0 = 00 or 01, and a broader test
+        #  placed first would swallow them and report each one as a system
+        #  register nobody has heard of.
+        if self.system_registers is not None:
+            top = ins & 0xFFF00000
+            if top in (0xD5100000, 0xD5300000):
+                read = bool(ins & self.SYSREG_READ_BIT)
+                base = (ins & self.SYSREG_WRITE_MASK) & ~self.SYSREG_READ_BIT
+                rt = ins & 31
+                if read:
+                    if base == self.CURRENTEL_WRITE_BASE:
+                        # CurrentEL holds the level in bits 3:2, so EL3
+                        # reads as 12 and EL2 as 8. Answered from the
+                        # model's own level rather than from the store,
+                        # because it is not a register anything writes.
+                        value = self.current_el << 2
+                    else:
+                        value = self.system_registers.get(base, 0)
+                    if rt != 31:
+                        self.x[rt] = value & MASK64
+                else:
+                    self.system_registers[base] = (
+                        self.x[rt] & MASK64 if rt != 31 else 0)
+                return
+
+            # ERET. The level it returns FROM decides which ELR and SPSR
+            # it reads; SPSR.M[3:2] decides the level it returns TO. Both
+            # halves are needed here: the stub gate's whole claim is that
+            # our stub reaches the kernel WITHOUT one of these, and a
+            # model that could not execute an eret at all could not tell
+            # a stub that skips it from a stub whose eret it cannot decode.
+            if ins == 0xD69F03E0:
+                elr_base, spsr_base = ERET_BANKS.get(
+                    self.current_el, (None, None))
+                if elr_base is None:
+                    raise RuntimeError(
+                        f"eret at EL{self.current_el} at {here:#x}: an "
+                        "exception return from EL0 is not a thing the "
+                        "architecture defines, and this model will not "
+                        "invent a destination for it.")
+                spsr = self.system_registers.get(spsr_base, 0)
+                if (spsr >> 4) & 1:
+                    raise RuntimeError(
+                        f"eret at {here:#x} with SPSR.M[4] set asks to "
+                        f"return to AArch32 (SPSR = {spsr:#x}). This model "
+                        "executes A64 only, and taking the request as "
+                        "AArch64 would run a different machine's "
+                        "instructions and call the answer a result.")
+                to_el = (spsr >> 2) & 3
+                if to_el > self.current_el:
+                    raise RuntimeError(
+                        f"eret at EL{self.current_el} at {here:#x} with "
+                        f"SPSR.M asking for EL{to_el}. An exception return "
+                        "cannot gain privilege; on the part this raises an "
+                        "Illegal Exception Return, so it is refused here "
+                        "rather than modelled as a level nobody may reach.")
+                target = self.system_registers.get(elr_base, 0)
+                self.erets.append((self.current_el, to_el, target))
+                self.current_el = to_el
+                self.pc = target & MASK64
+                return
 
         # CLREX - added 2026-08-28.  Same 0xD503 hint/barrier space as the
         # block above but op2 = 010, so it falls through that test rather
@@ -2595,6 +2775,8 @@ def selftest() -> None:
         0xD508831F,  # tlbi vmalle1is
         0xD50C871F,  # tlbi alle2
         0xD50C831F,  # tlbi alle2is
+        0xD50E871F,  # tlbi alle3
+        0xD50E831F,  # tlbi alle3is
     ]
     quiet = A64(pc=0x2000)
     load_words(quiet, maintenance, base=0x2000)
@@ -2634,6 +2816,8 @@ def selftest() -> None:
         (0xD50C7820, "at s1e2w, x0"),
         (0xD50C7880, "at s12e1r, x0"),
         (0xD50C78A0, "at s12e1w, x0"),
+        (0xD50E7800, "at s1e3r, x0"),
+        (0xD50E7820, "at s1e3w, x0"),
         (0xD4000001, "svc #0"),
         (0xD4024681, "svc #4660"),       # imm16 = 0x1234, at bits 20:5
         (0xD4000002, "hvc #0"),

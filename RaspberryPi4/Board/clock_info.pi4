@@ -89,6 +89,52 @@ Procedure CmdInfo()
   ; exactly the boards where things are already going wrong.
   HwAddrReport()
 
+  ; WHICH EXCEPTION LEVEL, AND WHICH STUB PUT US THERE. Added 2026-09-07.
+  ;
+  ; Printed HERE, above the mailbox check, for exactly the reason the
+  ; block above gives about addresses: it is board knowledge that needs
+  ; no firmware to answer, and it is the first thing anybody wants after
+  ; a flash that added an `armstub=` line to CONFIG.TXT. A board that
+  ; came up at the level nobody expected is a board whose next twenty
+  ; minutes go on the wrong question.
+  ;
+  ; IT IS A SENTENCE AND NOT A DIGIT. `version` already prints "at
+  ; exception level N" as part of the processor line, which answers
+  ; WHAT; this answers SO WHAT - which stub is on the card, which control
+  ; register governs this machine, and what to change to get the other
+  ; one.
+  ;
+  ; THE LEVEL IS READ, NEVER ASSERTED. MmuEl() decodes CurrentEL off the
+  ; running processor (RaspberryPi4/Lib/mmu.pi4). Forum 575 was a banner
+  ; that printed the digit 2 as prose and was right on one board by luck;
+  ; nothing here is allowed to be right by luck.
+  Print("level       exception level ")
+  PrintDec(MmuEl())
+  If MmuAtEl3() <> 0
+    PrintN(", the secure monitor level. Our own arm stub")
+    PrintN("            put us here and did not drop to level 2, so the ARM side of")
+    PrintN("            this machine is entirely ours: SCR_EL3, the secure GIC banks")
+    PrintN("            and the translation regime below all belong to this monitor.")
+    PrintN("            Remove the armstub line from CONFIG.TXT and reset to go back")
+    PrintN("            to level 2.")
+    Print("            SCTLR_EL3 = $")
+  Else
+    PrintN(", where the firmware's own arm stub hands")
+    PrintN("            over. That stub sets the machine up at level 3 and drops to")
+    PrintN("            level 2 before branching here, so the secure world is not")
+    PrintN("            ours. Put armstub8.bin on the card and add one armstub line")
+    PrintN("            to CONFIG.TXT to come up at level 3 instead.")
+    Print("            SCTLR_EL2 = $")
+  EndIf
+  PutHex16(MmuSctlr())
+  If MmuStubEntered() <> 0
+    PrintN(", exactly as the stub left it, so the MMU")
+    PrintN("            and both caches are off and nothing has touched the register.")
+  Else
+    PrintN(", which is NOT what the stub left. Something")
+    PrintN("            has written it since - `cache` says whether that was us.")
+  EndIf
+
   If MbxUp() = 0
     ProcedureReturn
   EndIf

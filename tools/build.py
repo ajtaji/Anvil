@@ -24,6 +24,12 @@ TARGETS = {
         "output": Path("build/unoq/anvil.img"),
         "args": ["--entry-returns"],
     },
+    "armstub": {
+        "source": Path("RaspberryPi4/Board/armstub8.asm"),
+        "output": Path("build/pi4/armstub8.bin"),
+        "target": "pi4",
+        "args": ["--armstub"],
+    },
 }
 
 
@@ -65,7 +71,7 @@ def build(compiler: str, target: str) -> None:
         compiler,
         spec["source"].as_posix(),
         "-t",
-        target,
+        spec.get("target", target),
         *spec["args"],
         "-o",
         str(output),
@@ -107,7 +113,9 @@ def main() -> int:
     args = parser.parse_args()
 
     compiler = find_compiler(args.pmfc)
-    selected = TARGETS if args.target == "all" else (args.target,)
+    # Experimental boot firmware is an explicit build, never an implicit
+    # part of the ordinary monitor pair. Building does not install it.
+    selected = ("pi4", "unoq") if args.target == "all" else (args.target,)
     with tempfile.TemporaryDirectory(prefix="anvil-pmfc-") as temporary:
         isolated_compiler = staged_compiler(compiler, Path(temporary))
         for target in selected:

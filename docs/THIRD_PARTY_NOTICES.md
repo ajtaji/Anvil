@@ -4,6 +4,14 @@ Anvil includes or derives material from the projects listed below. The
 repository MIT license does not replace these terms. The complete retained
 license texts are in [`licenses/`](../licenses/).
 
+## Raspberry Pi firmware stub
+
+`RaspberryPi4/Board/armstub8.asm` is a translation and modification of
+[Raspberry Pi's armstub8.S](https://github.com/raspberrypi/tools/blob/439b6198a9b340de5998dd14a26a0d9d38a6bcac/armstubs/armstub8.S).
+It retains the complete BSD-3-Clause copyright, conditions and disclaimer in
+its source header. Binary distributions of the optional stub must also carry
+that notice; it is not relicensed under Anvil's MIT license.
+
 ## CYW43455 firmware
 
 The firmware image and CLM data in `Firmware/CYW43455/` are binary Cypress

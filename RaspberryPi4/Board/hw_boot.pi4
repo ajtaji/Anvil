@@ -96,6 +96,46 @@ EndProcedure
 ;  "pmfc: OK"); whether Linux comes up is owed a Pi 4.
 ; ----------------------------------------------------------------------
 Procedure HwBootToEl1(entry.i, dtb.i)
+  ; ------------------------------------------------------------------
+  ;  AT EL3 THIS REFUSES, AND THE REFUSAL IS THE WHOLE POINT. 2026-09-07.
+  ;
+  ;  Everything below is an EL2 -> EL1 handover: it writes SPSR_EL2 and
+  ;  ELR_EL2 and then erets. An `eret` executed AT EL3 reads SPSR_EL3 and
+  ;  ELR_EL3 - registers nothing in this procedure has written and which
+  ;  our own arm stub deliberately leaves untouched, because a stub that
+  ;  never returns has no return to prepare. They read as zero, and the
+  ;  board branches to address 0 with the console already drained.
+  ;
+  ;  That is a dead board with no message on a machine that has no serial
+  ;  port, produced by a command an operator typed on purpose. So it is
+  ;  refused here, in a whole sentence, before EthDown() and
+  ;  CacheDisable() have taken the machine apart - a refusal that arrives
+  ;  after the Ethernet is down and the caches are flushed is a refusal
+  ;  that cost something.
+  ;
+  ;  THE EL3 PATH IS PHASE 2 AND IT IS NOT A RENAME. Dropping from EL3 to
+  ;  EL1 skips EL2 rather than removing it: SCR_EL3 has to be composed
+  ;  first (NS for the target world, RW, and SMD cleared only alongside a
+  ;  dispatcher), then the whole CNTHCTL_EL2 / CNTVOFF_EL2 / VPIDR_EL2 /
+  ;  VMPIDR_EL2 / CPTR_EL2 / HSTR_EL2 / HCR_EL2 block below still has to
+  ;  be written on the way past, then SPSR_EL3 and ELR_EL3. U-Boot's
+  ;  armv8_switch_to_el2 followed by armv8_switch_to_el1 is the two-step
+  ;  shape to transcribe (RaspberryPi4/Reference/v2025.01_transition.S).
+  ;  Design and cost are in the vault note for the EL3 work.
+  ; ------------------------------------------------------------------
+  If MmuAtEl3() <> 0
+    PrintN("!! booti cannot hand this machine over: the monitor is running at")
+    PrintN("   exception level 3 and this handover is an EL2-to-EL1 one. It sets")
+    PrintN("   SPSR_EL2 and ELR_EL2, and an exception return taken at EL3 reads")
+    PrintN("   SPSR_EL3 and ELR_EL3 instead - which nothing has written - so the")
+    PrintN("   board would branch to address 0 with the console already shut down.")
+    PrintN("   Nothing has been touched: the Ethernet is still up and the caches")
+    PrintN("   are as they were. The EL3 handover is not built yet.")
+    PrintN("   To boot a kernel today, remove the armstub line from CONFIG.TXT and")
+    PrintN("   reset - `info` will then say exception level 2 and this will work.")
+    ProcedureReturn
+  EndIf
+
   ; QUIESCE THE MACHINE before it changes hands - the RunAt discipline.
   ; EthDown() stops the receive DMA bus master (returns at once if the port
   ; was never up). CacheDisable() cleans every dirty line to DRAM and turns

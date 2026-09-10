@@ -86,6 +86,24 @@ Target entries are
 [`RaspberryPi4/Board/board.pi4`](RaspberryPi4/Board/board.pi4) and
 [`ArduinoQ/Board/board.unoq`](ArduinoQ/Board/board.unoq).
 
+### Experimental EL3 firmware stub
+
+The optional Pi 4 stub has a separate, explicit build using a compiler with
+`--armstub` support:
+
+```sh
+python3 tools/build.py armstub --pmfc pmfc
+python3 tools/a64/a64_el3_check.py --pmfc pmfc
+python3 tools/a64/el3_runtime_emitted_check.py --pmfc pmfc
+```
+
+This produces `build/pi4/armstub8.bin`; it is not part of `all` and is **not
+installed automatically**. The stub and EL2/EL3 MMU selection pass emitted-code
+tests, but EL3 hardware boot is not yet verified. Secure interrupt handling,
+secondary-core activation and the EL3-to-EL1 handoff remain incomplete. Do not
+change boot configuration without physical recovery access. The stub retains
+its upstream [BSD-3-Clause notice](RaspberryPi4/Board/armstub8.asm).
+
 ### Boot and runtime assets
 
 - The Pi build produces `build/pi4/anvil.img`, a raw bare-metal image. Vendor

@@ -258,10 +258,36 @@ Procedure CmdDeadman()
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  power_SaySctlr() - print the control register, NAMED BY THE LEVEL.
+;
+;  This printed "SCTLR_EL2 = $..." in three places, which was true while
+;  the monitor could only be at EL2. Since 2026-09-07 it can be at EL3,
+;  where the register that governs its translation and caches is
+;  SCTLR_EL3 - a different register with the same layout and, on this
+;  board, a very similar value. Printing the wrong NAME beside a right
+;  VALUE is the worst of the three possible mistakes: somebody comparing
+;  the number against $30C50830 gets the answer they expect and goes
+;  away, having read the wrong register's state as the right one.
+;
+;  So the label is derived from MmuEl() and the value comes from
+;  MmuSctlr(), and the two cannot disagree.
+; ----------------------------------------------------------------------
+Procedure power_SaySctlr()
+  If MmuAtEl3() <> 0
+    Print("SCTLR_EL3 = $")
+  Else
+    Print("SCTLR_EL2 = $")
+  EndIf
+  PutHex16(MmuSctlr())
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  CmdCache - turn the D-cache and MMU on or off at runtime.
 ;
 ;  cache            - show the state
-;  cache on         - build the identity tables and set SCTLR_EL2 M|C|I
+;  cache on         - build the identity tables and set the running
+;                     level's SCTLR M|C|I
 ;  cache off        - flush the whole D-cache to DRAM and disable
 ;
 ;  RECOVERABLE BY DESIGN: caches are off at every boot, so a wrong enable
@@ -283,9 +309,8 @@ Procedure CmdCache()
     Else
       PrintN("OFF - the stub's state, every access straight to DRAM.")
     EndIf
-    Print("  SCTLR_EL2 = $")
-    PutHex16(MmuSctlrEl2())
-    PrintNl()
+    Print("  ")
+    power_SaySctlr()
     CompilerIf #ANVIL_CACHE = 1
     PrintN("  cache on   - build the identity tables and enable M|C|I")
     PrintN("  cache off  - flush the whole D-cache to DRAM and disable")
@@ -305,9 +330,8 @@ Procedure CmdCache()
       ProcedureReturn
     EndIf
     If CacheEnable() <> 0
-      Print("Caches ON. SCTLR_EL2 = $")
-      PutHex16(MmuSctlrEl2())
-      PrintNl()
+      Print("Caches ON. ")
+      power_SaySctlr()
       PrintN("  Everything stays coherent: the framebuffer and the GENET receive")
       PrintN("  ring are mapped non-cacheable, and the mailbox and DMA engine clean")
       PrintN("  their buffers, so the console, screenshots, wifi, USB, ethernet and")
@@ -326,9 +350,7 @@ Procedure CmdCache()
     EndIf
     CacheDisable()
     Print("Caches OFF - everything the monitor had cached is flushed to DRAM. ")
-    Print("SCTLR_EL2 = $")
-    PutHex16(MmuSctlrEl2())
-    PrintNl()
+    power_SaySctlr()
     ProcedureReturn
   EndIf
   CompilerEndIf

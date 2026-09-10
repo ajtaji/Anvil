@@ -54,24 +54,34 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  HwMmuState() - bit 0 MMU on, bit 1 D-cache on, bit 2 I-cache on.
 ;
-;  READ OUT OF SCTLR_EL2 RATHER THAN OUT OF gCacheOn, and that difference
-;  is the whole reason this is a seam and not a getter on a global.
-;  gCacheOn is what the MONITOR BELIEVES it did; SCTLR_EL2 is what the
-;  PROCESSOR IS ACTUALLY DOING. A payload asking this question is asking
-;  the second one - it has just been handed a machine that a `cache off`,
-;  a RunAt handover and possibly its own earlier code have all touched,
-;  and the honest answer is the register.
+;  READ OUT OF THE LIVE SCTLR RATHER THAN OUT OF gCacheOn, and that
+;  difference is the whole reason this is a seam and not a getter on a
+;  global. gCacheOn is what the MONITOR BELIEVES it did; the register is
+;  what the PROCESSOR IS ACTUALLY DOING. A payload asking this question
+;  is asking the second one - it has just been handed a machine that a
+;  `cache off`, a RunAt handover and possibly its own earlier code have
+;  all touched, and the honest answer is the register.
 ;
-;  SCTLR_EL2 bit 0 is M (MMU enable), bit 2 is C (data cacheability) and
-;  bit 12 is I (instruction cacheability) - ARM ARM D13.2.106. The bit
-;  positions are remapped onto the ABI's own 0/1/2 here so that the
-;  payload never learns an ARM field number, which is exactly what the
-;  portable vocabulary is for.
+;  WHICH SCTLR, and it is no longer a fixed answer. 2026-09-07: Anvil
+;  runs at EL3 under our own arm stub and at EL2 under the stock one, so
+;  this asks MmuSctlr() (RaspberryPi4/Lib/mmu.pi4) for the SCTLR OF THE
+;  LEVEL THE MONITOR IS AT. It said MmuSctlrEl2(), which at EL3 reads a
+;  register the processor is not translating through and which the stub
+;  leaves holding $30C50830 - so a payload would have been told the MMU
+;  and both caches were off at the exact moment `cache on` had turned
+;  them on. This procedure exists to refuse that kind of answer.
+;
+;  THE BIT POSITIONS DO NOT CHANGE WITH THE LEVEL. M is bit 0, C is bit
+;  2 and I is bit 12 in SCTLR_EL2 and in SCTLR_EL3 alike - ARM ARM
+;  D13.2.106 and D13.2.107, and the two registers share their RES1
+;  pattern for the same reason. They are remapped onto the ABI's own
+;  0/1/2 here so that the payload never learns an ARM field number,
+;  which is exactly what the portable vocabulary is for.
 ; ----------------------------------------------------------------------
 Procedure.i HwMmuState()
   Define s.i
   Define r.i
-  s = MmuSctlrEl2()
+  s = MmuSctlr()
   r = 0
   If (s & 1) <> 0
     r = r | 1

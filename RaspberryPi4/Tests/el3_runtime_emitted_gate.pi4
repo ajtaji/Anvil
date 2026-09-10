@@ -1,0 +1,19 @@
+; Execute the real runtime-level selection procedures without MMIO.
+; The host gate runs this same image at EL2 and EL3 with deliberately
+; different SCTLR values, proving the decision is made from CurrentEL.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+#EL3_GATE_OUT = $06000000
+
+Procedure.i Main()
+  PokeI(#EL3_GATE_OUT + 0,  MmuEl())
+  PokeI(#EL3_GATE_OUT + 8,  MmuAtEl3())
+  PokeI(#EL3_GATE_OUT + 16, MmuSctlr())
+  PokeI(#EL3_GATE_OUT + 24, MmuEnabled())
+  PokeI(#EL3_GATE_OUT + 32, MmuStubEntered())
+  MmuEnable()
+  PokeI(#EL3_GATE_OUT + 40, MmuSctlr())
+  MmuDisable()
+  PokeI(#EL3_GATE_OUT + 48, MmuSctlr())
+  ProcedureReturn 0
+EndProcedure

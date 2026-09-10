@@ -765,6 +765,134 @@ Procedure.i MmuSctlrEl2Entered()
   ProcedureReturn 0
 EndProcedure
 
+; ======================================================================
+;  EL3 - THE SAME REGISTERS ONE LEVEL UP. Added 2026-09-07.
+; ======================================================================
+;  Ruling 2026-09-07: Anvil runs at EL3 on this board, entered there by
+;  RaspberryPi4/Board/armstub8.asm instead of being dropped to EL2 by the
+;  stock stub.
+;
+;  THE MONITOR MUST BOOT AT EITHER LEVEL, and that is not a nicety - it
+;  is what makes the flash survivable. KERNEL8.IMG goes on the card
+;  FIRST, under the stock stub, and has to come up and say "exception
+;  level 2". Only then do armstub8.bin and the one `armstub=` line
+;  follow. A monitor that only worked at EL3 would have to be flashed
+;  together with the stub, which on a board with no serial port means one
+;  reset that either works or leaves nothing to ask.
+;
+;  So every decision below is at RUN TIME, off MmuEl(), and never at
+;  compile time. One image, both levels.
+;
+;  WHAT IS ACTUALLY DIFFERENT BETWEEN THE TWO, AND IT IS LESS THAN IT
+;  LOOKS. TCR_EL3, MAIR_EL3 and TTBR0_EL3 have the SAME FIELD LAYOUT as
+;  their EL2 twins - both are the "one VA range, no VHE" format - so
+;  #MMU_TCR_EL2 and #MMU_MAIR_EL2 are correct values for the EL3
+;  registers too and are not duplicated with new names. SCTLR_EL3 shares
+;  SCTLR_EL2's RES1 pattern as well (bits 29,28,23,22,18,16,11,5,4), so
+;  M, C and I sit at bits 0, 2 and 12 in both and #MMU_SCTLR_MCI is one
+;  constant for both. The only real difference is the register NAME in
+;  the MSR, and `tlbi alle3` where `tlbi alle2` was.
+;
+;  THAT SAMENESS IS ALSO THE DANGER, and it is why these procedures
+;  exist instead of a comment saying "use the EL2 ones, they are the
+;  same". An `msr sctlr_el2` executed AT EL3 is legal - EL3 may write EL2
+;  registers - so the wrong one does not trap, does not refuse, and does
+;  not print anything. It programs a translation regime that is not the
+;  one the processor is using, and MmuEnabled() then reads SCTLR_EL2.M
+;  set and reports the MMU is on while every access still runs
+;  untranslated and uncached. A confident wrong answer with no symptom
+;  is the exact failure this whole tree is built to refuse.
+
+; ----------------------------------------------------------------------
+;  MmuAtEl3() - 1 when the monitor is running at EL3, 0 otherwise.
+;
+;  Every level-dependent branch in this tree goes through this one
+;  predicate rather than comparing MmuEl() itself, so that the question
+;  is asked the same way everywhere and can be grepped for.
+; ----------------------------------------------------------------------
+Procedure.i MmuAtEl3()
+  If MmuEl() = 3
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlrEl3() - the raw SCTLR_EL3.
+;
+;  Readable from EL3 only. Calling it at EL2 traps, which is why nothing
+;  outside this file calls it directly - MmuSctlr() below is the seam.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlrEl3()
+  ASM
+    mrs x0, sctlr_el3
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlr() - the SCTLR OF THE LEVEL WE ARE ACTUALLY AT.
+;
+;  This is what every caller outside this file wants, and every one of
+;  them used to call MmuSctlrEl2() because there was only one answer.
+;  `cache status`, HwMmuState() and MmuEnabled() are all asking "is
+;  translation on for the code I am running", and at EL3 that question
+;  is answered by SCTLR_EL3 and not by SCTLR_EL2 - which at EL3 holds
+;  whatever the stub left and answers a question nobody asked.
+;
+;  MmuSctlrEl2() STAYS, unchanged and still exported, because the
+;  diagnostics that dump machine state (pi4MmuState, pi4SmpWake,
+;  pi4FpState) want the EL2 register specifically, and at EL3 reading it
+;  is still legal and still informative.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlr()
+  If MmuAtEl3() <> 0
+    ProcedureReturn MmuSctlrEl3()
+  EndIf
+  ProcedureReturn MmuSctlrEl2()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  #MMU_SCTLR_EL3_STUB - what OUR stub leaves in SCTLR_EL3.
+;
+;  The same $30C50830, and it is not a copy made on the assumption that
+;  the two registers are alike. RaspberryPi4/Board/armstub8.asm WRITES
+;  this value into SCTLR_EL3 - the line is there and the reasoning is in
+;  that file's header - so this is a fact about our own code rather than
+;  a claim about the firmware. The stock stub never touches SCTLR_EL3 at
+;  all, because it is leaving EL3 and does not care what it holds; on a
+;  board booted the stock way this constant is meaningless and nothing
+;  compares against it, because nothing runs at EL3 there.
+;
+;  It happens to equal #MMU_SCTLR_EL2_STUB, and that is not a
+;  coincidence: in ARMv8.0 SCTLR_EL2 and SCTLR_EL3 have the same RES1
+;  pattern, so "every set bit is RES1, nothing else on" is the same
+;  number for both. It is written out separately anyway. Two constants
+;  that agree today for a stated reason can be checked against each
+;  other; one constant used for two registers cannot, and the day the
+;  stub changes one of them the shared constant is silently wrong for
+;  the other.
+; ----------------------------------------------------------------------
+#MMU_SCTLR_EL3_STUB = $30C50830
+
+; ----------------------------------------------------------------------
+;  MmuStubEntered() - 1 if the SCTLR of the level we are at is still
+;  exactly what the stub that brought us here left in it.
+;
+;  The level-aware twin of MmuSctlrEl2Entered(), and the one `info` and
+;  the probes should ask. A 0 still means only that SOMETHING changed the
+;  register - see the long note on MmuSctlrEl2Entered() for why that is
+;  not the same as "the MMU is on".
+; ----------------------------------------------------------------------
+Procedure.i MmuStubEntered()
+  If MmuAtEl3() <> 0
+    If MmuSctlrEl3() = #MMU_SCTLR_EL3_STUB
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MmuSctlrEl2Entered()
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  MmuSctlrEl1() - the raw SCTLR_EL1.
 ;
@@ -1426,6 +1554,64 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure MmuEnable()
   CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; ------------------------------------------------------------------
+  ;  THE EL3 TWIN, added 2026-09-07. Chosen at RUN TIME, because one
+  ;  image has to boot under either stub - see the EL3 block up beside
+  ;  MmuAtEl3() for the whole argument.
+  ;
+  ;  THE TWO ARMS ARE DUPLICATED RATHER THAN FACTORED, and that is
+  ;  deliberate. The obvious tidy-up is one helper called from both with
+  ;  the register name passed in, which this assembler cannot express -
+  ;  a system register is part of the instruction, not an operand. The
+  ;  next tidy-up is a helper per level called from the middle of the
+  ;  sequence, and that puts a stack push and pop between the register
+  ;  loads and the enable. MmuDisableCached()'s note records what a
+  ;  memory round trip cost here once already, measured on this silicon:
+  ;  a store and a load a few instructions apart did NOT round-trip
+  ;  through the D-cache, the mask read back as all ones, and the MMU
+  ;  stayed on with nothing to see. Two copies of eighteen instructions
+  ;  is cheaper than one copy of that bug.
+  ;
+  ;  THE VALUES ARE THE SAME ONES. #MMU_TCR_EL2 and #MMU_MAIR_EL2 are
+  ;  correct for the EL3 registers too: TCR_EL3 and MAIR_EL3 have the
+  ;  same field layout as their EL2 twins, both being the one-VA-range
+  ;  no-VHE format. That is why there is no #MMU_TCR_EL3 to disagree
+  ;  with them.
+  ;
+  ;  REASONED, NOT MEASURED. No board has run this arm.
+  ; ------------------------------------------------------------------
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      tlbi alle3
+      dsb sy
+      isb
+
+      adrp x9, global_mmu_ttbr
+      add  x9, x9, #:lo12:global_mmu_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el3, x9
+
+      adrp x9, global_mmu_tcr
+      add  x9, x9, #:lo12:global_mmu_tcr
+      ldr  x9, [x9]
+      msr  tcr_el3, x9
+
+      adrp x9, global_mmu_mair
+      add  x9, x9, #:lo12:global_mmu_mair
+      ldr  x9, [x9]
+      msr  mair_el3, x9
+
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el3
+      movz x10, #1
+      orr  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+    EndASM
+  Else
   ASM
     dsb sy
     tlbi alle2
@@ -1456,6 +1642,7 @@ Procedure MmuEnable()
     msr  sctlr_el2, x9
     isb
   EndASM
+  EndIf
   CompilerElse
   ; The assembler cannot encode ttbr0_el2/tcr_el2/mair_el2 yet. A nop
   ; rather than a build error, so the table builder above stays
@@ -1491,6 +1678,20 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure MmuDisable()
   CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; The EL3 twin - see MmuEnable() for why the arms are duplicated.
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      mrs  x9, sctlr_el3
+      movn x10, #1
+      and  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+      tlbi alle3
+      dsb sy
+      isb
+    EndASM
+  Else
   ASM
     dsb sy
     mrs  x9, sctlr_el2
@@ -1502,6 +1703,7 @@ Procedure MmuDisable()
     dsb sy
     isb
   EndASM
+  EndIf
   CompilerElse
   ASM
     nop
@@ -1716,10 +1918,57 @@ Procedure MmuEnableCached()
   ; Cold transition only: discard the unknown reset-state D-cache lines
   ; before C exposes them. Skipped when C is already set, so a re-entry
   ; over live cached data does not throw that data away.
-  If (MmuSctlrEl2() & #MMU_SCTLR_C) = 0
+  ; MmuSctlr(), not MmuSctlrEl2(): the cold-transition test asks whether
+  ; the data cache of THE LEVEL WE ARE AT is currently off, and at EL3
+  ; that is SCTLR_EL3.C. Reading the EL2 register here would test a bit
+  ; nothing is using - and get it wrong in the dangerous direction,
+  ; because the stub leaves SCTLR_EL2.C clear, so the invalidate would
+  ; run every time including over live dirty lines.
+  If (MmuSctlr() & #MMU_SCTLR_C) = 0
     MmuInvalidateDCacheAll()
   EndIf
   mmu_scset = #MMU_SCTLR_MCI
+  ; The EL3 twin - see MmuEnable() for why the arms are duplicated.
+  ; #MMU_SCTLR_MCI is one constant for both levels because SCTLR_EL3
+  ; shares SCTLR_EL2's layout: M at bit 0, C at bit 2, I at bit 12.
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      tlbi alle3
+      dsb sy
+      isb
+
+      adrp x9, global_mmu_ttbr
+      add  x9, x9, #:lo12:global_mmu_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el3, x9
+
+      adrp x9, global_mmu_tcr
+      add  x9, x9, #:lo12:global_mmu_tcr
+      ldr  x9, [x9]
+      msr  tcr_el3, x9
+
+      adrp x9, global_mmu_mair
+      add  x9, x9, #:lo12:global_mmu_mair
+      ldr  x9, [x9]
+      msr  mair_el3, x9
+
+      dsb sy
+      isb
+
+      ic iallu
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el3
+      adrp x10, global_mmu_scset
+      add  x10, x10, #:lo12:global_mmu_scset
+      ldr  x10, [x10]
+      orr  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+    EndASM
+  Else
   ASM
     dsb sy
     tlbi alle2
@@ -1756,6 +2005,7 @@ Procedure MmuEnableCached()
     msr  sctlr_el2, x9
     isb
   EndASM
+  EndIf
   CompilerElse
   ASM
     nop
@@ -1792,6 +2042,23 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure MmuDisableCached()
   CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; The EL3 twin - see MmuEnable() for why the arms are duplicated, and
+  ; note that the argument is at its strongest HERE: this is the
+  ; procedure whose memory round trip failed on this silicon.
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      mrs  x9, sctlr_el3
+      movn x10, #4101                ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
+      and  x9, x9, x10               ; clear M, C and I in one AND
+      msr  sctlr_el3, x9
+      isb
+      ic iallu
+      tlbi alle3
+      dsb sy
+      isb
+    EndASM
+  Else
   ASM
     dsb sy
     mrs  x9, sctlr_el2
@@ -1804,6 +2071,7 @@ Procedure MmuDisableCached()
     dsb sy
     isb
   EndASM
+  EndIf
   CompilerElse
   ASM
     nop
@@ -2028,12 +2296,47 @@ EndProcedure
 Procedure MmuDisableCachedFlushed()
   CompilerIf #MMU_HAVE_EL2_REGS = 1
   ASM
-    ; --- clear M, C, I: MMU and both caches off -----------------------
+    ; --- WHICH LEVEL, DECIDED INSIDE THE ASM. 2026-09-07 --------------
+    ;
+    ; Every other procedure in this file takes its EL3 twin as a whole
+    ; duplicated ASM block under an If. THIS ONE CANNOT, for two reasons
+    ; that both come from the constraints above:
+    ;
+    ;   * the walk below carries LABELS, and two copies of it would be
+    ;     two definitions of mmuDcfLevel, mmuDcfSet and the rest - a
+    ;     build error, and renaming them gives two walks that have to be
+    ;     kept identical by hand for ever;
+    ;   * an If around two blocks would put the level test between the
+    ;     caller's frame and the clear, which is fine, but the natural
+    ;     way to write it in the host language reads a value from memory,
+    ;     and constraint 2 is that NOTHING may touch the stack between
+    ;     the clear and the end of the flush.
+    ;
+    ; So the level is read into x14 here, ONCE, and tested twice - at the
+    ; SCTLR clear and at the TLB invalidate. x14 is not touched by the
+    ; walk (which uses x0-x8 and x9-x13), so it survives.
+    ;
+    ; REASONED, NOT MEASURED. No board has run the EL3 arm.
     dsb  sy
+    mrs  x14, currentel
+    lsr  x14, x14, #2
+    movz x13, #3
+    and  x14, x14, x13              ; x14 = the exception level, 0..3
+    cmp  x14, #3
+    b.ne mmuDcfClearEl2
+    ; --- clear M, C, I at EL3 -----------------------------------------
+    mrs  x9, sctlr_el3
+    movn x10, #4101                 ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
+    and  x9, x9, x10
+    msr  sctlr_el3, x9
+    b    mmuDcfCleared
+mmuDcfClearEl2:
+    ; --- clear M, C, I: MMU and both caches off -----------------------
     mrs  x9, sctlr_el2
     movn x10, #4101                 ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
     and  x9, x9, x10
     msr  sctlr_el2, x9
+mmuDcfCleared:
     isb
     ; --- clean+invalidate the whole D-cache by set/way, INLINE --------
     ; Byte-for-byte MmuFlushDCacheAll's walk, but here with no procedure
@@ -2090,7 +2393,18 @@ mmuDcfDone:
     dsb  sy
     isb
     ic   iallu
+    ; The second use of x14. The EL2 and EL3 translation regimes have
+    ; SEPARATE TLB entries, so invalidating the wrong one leaves the
+    ; regime we are actually using holding stale translations - silently,
+    ; because a stale translation of an identity map looks exactly like a
+    ; correct one until something is remapped.
+    cmp  x14, #3
+    b.ne mmuDcfTlbiEl2
+    tlbi alle3
+    b    mmuDcfTlbiDone
+mmuDcfTlbiEl2:
     tlbi alle2
+mmuDcfTlbiDone:
     dsb  sy
     isb
   EndASM
@@ -2102,13 +2416,25 @@ mmuDcfDone:
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  MmuEnabled() - 1 if SCTLR_EL2.M is set, 0 if not.
+;  MmuEnabled() - 1 if the M bit of the SCTLR OF THE LEVEL WE ARE AT is
+;  set, 0 if not.
 ;
 ;  Reads the live register rather than remembering what was written,
 ;  which is the difference between an instrument and a comment.
+;
+;  IT READS MmuSctlr() AND NOT MmuSctlrEl2(), 2026-09-07, and the
+;  difference is not cosmetic. At EL3 the translation regime in force is
+;  EL3's, so SCTLR_EL2.M answers a question about a level nothing is
+;  running at - and answers it WRONG IN THE DANGEROUS DIRECTION either
+;  way round. Left as it was, `cache on` at EL3 would set SCTLR_EL3.M
+;  and this would keep reporting 0 while the caches were live; and if a
+;  future path wrote SCTLR_EL2.M from EL3 this would report 1 while
+;  every access still ran untranslated. Callers use it to decide whether
+;  a payload jump has to quiesce the caches, so a wrong answer here is a
+;  payload entered with dirty lines the board never wrote back.
 ; ----------------------------------------------------------------------
 Procedure.i MmuEnabled()
-  If (MmuSctlrEl2() & #MMU_SCTLR_M) = #MMU_SCTLR_M
+  If (MmuSctlr() & #MMU_SCTLR_M) = #MMU_SCTLR_M
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
