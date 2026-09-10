@@ -8,6 +8,7 @@ Global gV3dConOn.i=1 : Global gCursorGpuOwned.i=1
 Global gate_mode.i : Global gate_tick.i : Global gate_ids.i : Global gate_moveMarks.i : Global gate_releaseLines.i
 Global gate_renderer.i : Global gate_repaint.i : Global gate_show.i : Global gate_hide.i : Global gate_busSay.i
 Global gate_v3d.i=1 : Global gate_readyCalls.i : Global gate_tickCalls.i
+Global gate_presents.i
 Procedure GatePrintN(p.i) : EndProcedure
 Procedure GatePrint(p.i) : EndProcedure
 Procedure GatePrintDec(v.i) : EndProcedure
@@ -61,9 +62,10 @@ Procedure.i HwTouchUps() : ProcedureReturn Bool(gate_tick>=3)*10 : EndProcedure
 Procedure.i Gt9LastBusCode() : ProcedureReturn -77 : EndProcedure
 Procedure TouchSayBusCode(c.i) : gate_busSay=c : EndProcedure
 Procedure DrawBanner() : EndProcedure
+Procedure ScrPresentAll() : gate_presents=gate_presents+1 : EndProcedure
 ; @@BODY@@
 Procedure Reset(mode.i)
- gate_mode=mode : gate_tick=0 : gate_ids=0 : gate_moveMarks=0 : gate_releaseLines=0 : gate_renderer=0 : gate_repaint=0 : gate_show=0 : gate_hide=0 : gate_busSay=0 : gate_v3d=1 : gate_readyCalls=0 : gate_tickCalls=0
+ gate_mode=mode : gate_tick=0 : gate_ids=0 : gate_moveMarks=0 : gate_releaseLines=0 : gate_renderer=0 : gate_repaint=0 : gate_show=0 : gate_hide=0 : gate_busSay=0 : gate_v3d=1 : gate_readyCalls=0 : gate_tickCalls=0 : gate_presents=0
  gScreen=1 : gScrSrc=#SCR_SRC_DSI : gCurShown=1 : *gConPaint=$1234
  dsp_cox=3 : dsp_coy=4 : dsp_cols=80 : dsp_rows=30 : dsp_cx=7 : dsp_cy=8 : dsp_fg=$112233 : dsp_bg=$445566 : gV3dConOn=1 : gCursorGpuOwned=1
 EndProcedure
@@ -74,18 +76,18 @@ Procedure.i Main()
  Define rc.i
  Reset(0) : rc=TouchVisualTest()
  If rc<>0 : ProcedureReturn 1 : EndIf
-  If gate_ids<>$3FF Or gate_moveMarks<>10 Or gate_releaseLines<>40 Or Restored()=0 : ProcedureReturn 1 : EndIf
+ If gate_ids<>$3FF Or gate_moveMarks<>10 Or gate_releaseLines<>40 Or gate_presents<>4 Or Restored()=0 : ProcedureReturn 1 : EndIf
  ; CPU renderer and a previously hidden cursor stay that way on key exit.
  Reset(1) : gate_v3d=0 : gV3dConOn=0 : gCursorGpuOwned=0 : gCurShown=0 : rc=TouchVisualTest()
- If rc<>0 Or *gConPaint<>$1234 Or gate_repaint<>1 Or gate_show<>0 Or gCurShown<>0 Or gV3dConOn<>0 Or gCursorGpuOwned<>0 : ProcedureReturn 2 : EndIf
- Reset(2) : rc=TouchVisualTest() : If rc<>-1 Or Restored()=0 : ProcedureReturn 3 : EndIf
+ If rc<>0 Or gate_presents<>1 Or *gConPaint<>$1234 Or gate_repaint<>1 Or gate_show<>0 Or gCurShown<>0 Or gV3dConOn<>0 Or gCursorGpuOwned<>0 : ProcedureReturn 2 : EndIf
+ Reset(2) : rc=TouchVisualTest() : If rc<>-1 Or gate_presents<>1 Or Restored()=0 : ProcedureReturn 3 : EndIf
  ; Re-entry after an error which populated all ten active slots must start with
  ; fresh locals: no stale failure return and no extra first-frame motion.
- Reset(3) : rc=TouchVisualTest() : If rc<>-1 Or gate_ids<>$3FF Or Restored()=0 : ProcedureReturn 5 : EndIf
+ Reset(3) : rc=TouchVisualTest() : If rc<>-1 Or gate_ids<>$3FF Or gate_presents<>2 Or Restored()=0 : ProcedureReturn 5 : EndIf
  Reset(0) : rc=TouchVisualTest()
- If rc<>0 Or gate_ids<>$3FF Or gate_moveMarks<>10 Or gate_releaseLines<>40 Or Restored()=0 : ProcedureReturn 6 : EndIf
+ If rc<>0 Or gate_ids<>$3FF Or gate_moveMarks<>10 Or gate_releaseLines<>40 Or gate_presents<>4 Or Restored()=0 : ProcedureReturn 6 : EndIf
  ; Refusal occurs before any touch hardware call or renderer mutation.
  Reset(0) : gScreen=0 : rc=TouchVisualTest()
- If rc<>0 Or gate_readyCalls<>0 Or gate_tickCalls<>0 Or gate_hide<>0 Or *gConPaint<>$1234 : ProcedureReturn 4 : EndIf
+ If rc<>0 Or gate_readyCalls<>0 Or gate_tickCalls<>0 Or gate_hide<>0 Or gate_presents<>0 Or *gConPaint<>$1234 : ProcedureReturn 4 : EndIf
  ProcedureReturn 0
 EndProcedure
