@@ -393,9 +393,11 @@ Procedure CmdSave()
   ; stay on the success path only. The sentences below it are free prose
   ; and the script ignores them.
   PrintN("written.")
-  PrintN("  The file on the boot medium now holds what was in memory, and the")
+  Print("  Saved ") : UartWriteStr(@gName[0]) : PrintN(" on the boot medium.")
+  PrintN("  That file now holds what was in memory, and the")
   PrintN("  block writer has been disarmed again so nothing else in this monitor")
-  PrintN("  can reach the medium. Type reset to boot into it.")
+  PrintN("  can reach the medium. Saving does not change the boot-file selection;")
+  PrintN("  reset still loads the configured boot image, not an arbitrary saved file.")
 EndProcedure
 
 ; ======================================================================
