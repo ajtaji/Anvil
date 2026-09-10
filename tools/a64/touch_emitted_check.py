@@ -333,7 +333,8 @@ class Bsc:
 
     def __init__(self, base=BSC_BASE, patience=2, tx_chunk=1, stall=False,
                  stall_writes=0, abort_delay=0, abort_never=False,
-                 tx_gap_reads=1, abort_residue=b""):
+                 tx_gap_reads=1, abort_residue=b"", turnaround_reads=0,
+                 rxr_without_rxd=False):
         self.base = base
         self.patience = patience
         self.devices = {}
@@ -374,6 +375,15 @@ class Bsc:
         self.polls = 0
         self.status_reads = 0
         self.cur = None
+        # Optional silicon-observed write/read turnaround: RXD can describe
+        # the shared FIFO before a read byte could have arrived. It expires
+        # with controller progress; FIFO reads during it steal outgoing data.
+        self.turnaround_reads = turnaround_reads
+        self.turnaround_left = 0
+        self.turnaround_fifo = bytearray()
+        self.turnaround_fifo_reads = 0
+        self.fifo_reads = 0
+        self.rxr_without_rxd = rxr_without_rxd
 
         # Everything worth grading that is not a register.
         self.starts = 0
@@ -500,6 +510,9 @@ class Bsc:
                                      (len(self.read_data), dlen))
             self.read_left = dlen
             self.write_left = 0
+            if repeated and self.turnaround_reads:
+                self.turnaround_left = self.turnaround_reads
+                self.turnaround_fifo = bytearray(self.write_data)
         else:
             self.write_left = dlen
             self.write_data = bytearray()
@@ -515,6 +528,14 @@ class Bsc:
     def read32(self, off):
         if off == C["BSC_S_OFF"]:
             self.status_reads += 1
+            if self.turnaround_fifo and not self.turnaround_left:
+                self.turnaround_fifo = bytearray()
+            if self.turnaround_left:
+                self.turnaround_left -= 1
+                s = C["BSC_S_TA"] | C["BSC_S_TXD"]
+                if self.turnaround_fifo:
+                    s |= C["BSC_S_RXD"]
+                return s
             # CLEAR with I2CEN off requests an asynchronous abort but cannot
             # advance the controller state machine.  BCM2711 says disabled
             # controllers perform no transfers, and Linux explicitly warns
@@ -555,7 +576,7 @@ class Bsc:
                 elif self.ta and self.tx_slots == 0:
                     self.tx_slots = min(self.tx_chunk, self.write_left)
                     self.txw_events += 1
-            elif self.active and self.is_read:
+            elif self.active and self.is_read and not self.rxr_without_rxd:
                 # One status observation advances one bus byte when FIFO
                 # space exists. DLEN and DONE belong to this wire-side state;
                 # reading FIFO only removes an already received byte.
@@ -581,6 +602,8 @@ class Bsc:
                 s |= C["BSC_S_RXF"]
             if self.active and self.is_read and len(self.rxbuf) >= 12:
                 s |= C["BSC_S_RXR"]
+            if self.active and self.is_read and self.rxr_without_rxd:
+                s |= C["BSC_S_RXR"]
             if self.active and not self.is_read and self.tx_slots > 0:
                 s |= C["BSC_S_TXD"]
             if self.active and not self.is_read and self.tx_slots > 0:
@@ -589,6 +612,10 @@ class Bsc:
                 s |= C["BSC_S_TXE"]
             return s
         if off == C["BSC_FIFO_OFF"]:
+            self.fifo_reads += 1
+            if self.turnaround_fifo:
+                self.turnaround_fifo_reads += 1
+                return self.turnaround_fifo.pop(0)
             if self.rxbuf:
                 return self.rxbuf.pop(0)
             return 0
@@ -910,10 +937,10 @@ SCRIPT = [
 ]
 
 
-def make_bus(patience=2, goodix_kwargs=None, stall=False):
+def make_bus(patience=2, goodix_kwargs=None, stall=False, **bsc_kwargs):
     """The bench bus: a GT9271 at $5D, which is what the v2 overlay's
     goodix@5d node describes and what is plugged into this board."""
-    bsc = Bsc(patience=patience, stall=stall)
+    bsc = Bsc(patience=patience, stall=stall, **bsc_kwargs)
     g = Goodix(**(goodix_kwargs or {}))
     for points, claim in SCRIPT:
         g.push_frame(points, claim)
@@ -1194,6 +1221,63 @@ def run_clean(probe_rel, work, fails):
                      % (cpu.x[0] & 0xFFFFFFFF))
     n += 1
     return n, out, steps
+
+
+def run_turnaround_rxd(probe_rel, work, fails):
+    """Run emitted product code with physical write/read-boundary RXD.
+
+    The transient expires independently of software. This does not invent a
+    controller that completes only when FIFO is left alone; it checks solely
+    that RXD without the documented read qualifiers is not consumed.
+    """
+    img = work / "touch.img"
+    bsc, g, mcu = make_bus(turnaround_reads=2)
+    cpu, out, steps = run(img, bsc)
+    cases = 0
+
+    def check(name, ok, detail):
+        nonlocal cases
+        cases += 1
+        if not ok:
+            fails.append("turnaround RXD: %s: %s" % (name, detail))
+
+    check("outgoing FIFO was not read",
+          bsc.turnaround_fifo_reads == 0,
+          "%d FIFO read(s) consumed outgoing bytes" %
+          bsc.turnaround_fifo_reads)
+    check("identity output remained exact",
+          "product id = 9271" in out and "firmware version = 4192" in out,
+          "identity output was corrupted: %r" %
+          [line for line in out.splitlines() if "product id" in line or
+           "firmware version" in line])
+    check("combined reads completed",
+          bsc.repeated_starts > 0 and not bsc.active and
+          "=== done" in out and not (cpu.x[0] & 0xFFFFFFFF),
+          "repeated=%d active=%r return=%d" %
+          (bsc.repeated_starts, bsc.active, cpu.x[0] & 0xFFFFFFFF))
+    return cases
+
+
+def run_rxr_without_rxd(work, fails):
+    """A contradictory RXR-without-RXD status is not byte progress."""
+    img = work / "touch.img"
+    bsc, g, mcu = make_bus(rxr_without_rxd=True)
+    cpu, out, steps = run(img, bsc)
+    cases = 0
+
+    def check(name, ok, detail):
+        nonlocal cases
+        cases += 1
+        if not ok:
+            fails.append("RXR without RXD: %s: %s" % (name, detail))
+
+    check("bounded timeout remained live", "code at $5D = -4" in out,
+          "the inconsistent threshold did not reach #I2C_TIMEOUT")
+    check("no nonexistent byte was consumed", bsc.fifo_reads == 0,
+          "%d empty FIFO read(s)" % bsc.fifo_reads)
+    check("execution stayed bounded", steps < STEP_LIMIT,
+          "%d instructions reached the interpreter ceiling" % steps)
+    return cases
 
 
 def run_v1(probe_rel, work, fails):
@@ -1823,12 +1907,16 @@ MUTATIONS = [
     # anchor that does not match is now a gate that DID NOT RUN, printed
     # as its own outcome with its reason, and it fails the run.
     ("i2c", "DONE before TXW is ignored instead of refused",
-     "    If (s & #BSC_S_DONE) <> 0\n      ; The write is over and a STOP went with it. Do NOT begin a plain read.\n      I2cRecover()\n      ProcedureReturn #I2C_NOSR\n    EndIf",
+     "    If (s & #BSC_S_DONE) <> 0\n      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)\n      ; The write is over and a STOP went with it. Do NOT begin a plain read.\n      I2cTraceFault(s, #I2C_NOSR)\n      I2cRecover()\n      ProcedureReturn I2cTraceReturn(trace, #I2C_NOSR)\n    EndIf",
      "    If (s & #BSC_S_DONE) <> 0\n      I2cWr(#BSC_S_OFF, #BSC_S_DONE)\n      I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n      I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)\n      Break\n    EndIf"),
 
     ("i2c", "the read length is never written to DLEN",
      "        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)",
      "        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)"),
+
+    ("i2c", "combined receive consumes unqualified turnaround RXD",
+     "    If i < rn And (s & #BSC_S_RXR) <> 0",
+     "    If i < rn And (s & #BSC_S_RXD) <> 0"),
 
     ("i2c", "recovery waits for the queued abort with the engine disabled",
      "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)\n\n  spin = #I2C_SPIN_MAX",
@@ -1902,6 +1990,8 @@ def mutate_one(job):
             run_v1(rel, d, fails)
         if not fails:
             run_nosr(rel, d, fails)
+        if not fails and which == "i2c":
+            run_turnaround_rxd(rel, d, fails)
         if not fails and which == "i2c":
             run_delayed_abort_recovery(mut, d, fails)
     except (SystemExit, AssertionError, KeyError, IndexError,
@@ -2005,6 +2095,8 @@ def main():
     rel = PROBE.relative_to(ROOT).as_posix()
     cases, out, steps = run_clean(rel, WORK, fails)
     cases += model_cases
+    cases += run_turnaround_rxd(rel, WORK, fails)
+    cases += run_rxr_without_rxd(WORK, fails)
     cases += run_v1(rel, WORK, fails)
     cases += run_nosr(rel, WORK, fails)
     cases += run_timeout(WORK, fails)

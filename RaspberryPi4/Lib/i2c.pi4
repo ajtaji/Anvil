@@ -1659,6 +1659,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   Define deadline.i
   Define trace.i
   Define tracePhase.i
+  Define before.i
 
   If wn < 1 Or rn < 1 Or addr < 0 Or addr > $7F
     ProcedureReturn #I2C_ARG
@@ -1752,8 +1753,8 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
   ForEver
 
-  ; From here it is I2cXfer's read loop, and it is written out rather than
-  ; called because I2cXfer owns the whole transaction from its own START.
+  ; Receive the queued repeated-start phase here. I2cXfer owns a separate
+  ; transaction from START and does not have this direction boundary.
   i = 0
   spin = #I2C_SPIN_MAX
   deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
@@ -1771,15 +1772,17 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
       ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
     EndIf
 
-    If i < rn And (s & #BSC_S_RXD) <> 0
-      I2cTraceMilestone(#I2C_TRACE_EDGE_RX, s)
-      PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
-      i = i + 1
-      spin = #I2C_SPIN_MAX
-      deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
-      Continue
-    EndIf
-
+    ; RXD alone is not a phase qualifier at the queued write-to-read
+    ; boundary. On this BCM2711 it was observed only a few core-counter ticks
+    ; after READ|ST, long before a read byte could cross a 100 kHz bus; shared
+    ; FIFO turnaround is the narrow hypothesis, not yet a hardware proof.
+    ; Plain I2cXfer reads may service
+    ; RXD immediately because they do not turn this shared FIFO around.
+    ;
+    ; Match the controller's documented read-qualified conditions here:
+    ; DONE owns the short tail; RXR owns an active FIFO-threshold service.
+    ; This is the same ordering used by the upstream BCM2835 interrupt driver,
+    ; expressed as polling rather than copied from its GPL implementation.
     If (s & #BSC_S_DONE) <> 0
       I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
       While i < rn And (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
@@ -1792,9 +1795,31 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
         I2cRecover()
         ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
       EndIf
+      ; More FIFO data than the caller requested is a length failure, not a
+      ; successful truncated read. Do not consume beyond *rbuf.
+      If (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
+        i2c_timeouts = i2c_timeouts + 1
+        I2cTraceFault(s, #I2C_TIMEOUT)
+        I2cRecover()
+        ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
+      EndIf
       I2cWr(#BSC_S_OFF, #BSC_S_DONE)
       a64_barrier()
       ProcedureReturn I2cTraceReturn(trace, #I2C_OK)
+    EndIf
+
+    If i < rn And (s & #BSC_S_RXR) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_RX, s)
+      before = i
+      While i < rn And (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
+        PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
+        i = i + 1
+      Wend
+      If i > before
+        spin = #I2C_SPIN_MAX
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+        Continue
+      EndIf
     EndIf
 
     spin = spin - 1

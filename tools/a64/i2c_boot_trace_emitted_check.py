@@ -234,8 +234,12 @@ def main():
     for p in (1, 3, 5):
         expected += [(p, 1), (p, 4), (p, 7), (p, 2),
                      (p + 1, 1), (p + 1, 6), (p + 1, 7), (p + 1, 2)]
-    expected += [(7, e) for e in (1, 4, 5, 6, 7, 2)]
-    check("seven transactions with milestones", len(recs) == 30, "records=%d" % len(recs))
+    # The six-byte combined identity read is shorter than RXR's 3/4 FIFO
+    # threshold. Its receive bytes are therefore drained by DONE; there is no
+    # separate RX milestone. Plain MCU reads still report RX because I2cXfer
+    # begins directly in read direction and may service RXD.
+    expected += [(7, e) for e in (1, 4, 5, 7, 2)]
+    check("seven transactions with milestones", len(recs) == 29, "records=%d" % len(recs))
     check("phase and edge order",
           [(r[1], r[0]) for r in recs] == expected,
           repr([(r[1], r[0]) for r in recs]))
@@ -262,8 +266,8 @@ def main():
     sat_recs = records(sat_cpu, sat_syms)
     check("bounded below fixed capacity", len(sat_recs) <= 64)
     check("overflow is loud", u64(sat_cpu, sat_syms, "trace_fixture_overflow") == 1)
-    check("first history retained", sat_recs[:30] == recs)
-    tail = sat_recs[30:]
+    check("first history retained", sat_recs[:29] == recs)
+    tail = sat_recs[29:]
     check("no orphan transaction",
           all(tail[i][0] == 1 and tail[i + 1][0] == 3 and tail[i + 2][0] == 2
               for i in range(0, len(tail), 3)))
@@ -352,7 +356,7 @@ def main():
                       (default, off, on, sat, recovered, refused, missing))
     print("i2c_boot_trace_emitted_check: PASS - %d checks, %d instructions" %
           (checks[0], total_steps))
-    print("  off/on wire sequence identical; normal trace 30 records; capacity 64")
+    print("  off/on wire sequence identical; normal trace 29 records; capacity 64")
     print("  readback RAM-only; FIFO never sampled by the trace")
     return 0
 
