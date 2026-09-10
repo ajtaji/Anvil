@@ -214,10 +214,37 @@ EndProcedure
 ;  THE SILENT "screen on" REGRESSION note below still governs every path
 ;  out of here: EVERY ONE OF THEM PRINTS SOMETHING.
 ; ----------------------------------------------------------------------
+Global gScreenDsiEarlyCacheArm.i
+
+Procedure ScreenDsiEarlyCacheArm()
+  gScreenDsiEarlyCacheArm = 1
+EndProcedure
+
+Procedure.i ScreenDsiEarlyCacheTake()
+  Define armed.i
+  armed = gScreenDsiEarlyCacheArm
+  gScreenDsiEarlyCacheArm = 0
+  ProcedureReturn armed
+EndProcedure
+
+; Enable the cache early only for the armed boot call and Anvil's fixed DSI window. HDMI remains on
+; the late V3D path because V3dConTryDouble may replace its firmware-owned
+; framebuffer before CacheEnable records the adopted range.
+Procedure ScreenDsiEarlyCache(armed.i)
+  If armed <> 0 And gScrSrc = #SCR_SRC_DSI
+    CacheEnable()
+  EndIf
+EndProcedure
+
 Procedure.i ScreenUpOn(src.i, index.i)
   Define w.i
   Define h.i
   Define rc.i
+  Define earlyCache.i
+
+  ; Consume before every early return. A failed/no-display boot attempt must
+  ; not leave permission for a later manual screen command to re-enable cache.
+  earlyCache = ScreenDsiEarlyCacheTake()
 
   ; ---- 0. WHICH SCREEN ------------------------------------------------
   ; The panel that is physically plugged in wins over a firmware default
@@ -540,6 +567,12 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; measures the console rectangle in cells of this size).
   gScrScale = ScrScaleWanted(gScrSrc, DisplayWidth())
   DisplayScale(gScrScale)
+
+  ; The DSI surface is now adopted and both of its fixed buffers are mapped
+  ; NC by CacheEnable. Turning normal code/data caching on here accelerates
+  ; the first visible clear/banner without changing panel power/reset or DMA
+  ; setup. HDMI deliberately does nothing here; see ScreenDsiEarlyCache.
+  ScreenDsiEarlyCache(earlyCache)
 
   ; THE BLITTER, BEFORE ANYTHING IS DRAWN. It has to come after the
   ; surface is installed, whichever way it was got, because it is bound
