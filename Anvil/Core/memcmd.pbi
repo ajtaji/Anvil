@@ -92,11 +92,12 @@ EndProcedure
 ;
 ;  THE TWO KINDS OF SUFFIX, AND WHY THEY ARE BOTH RIGHT
 ;  ----------------------------------------------------
-;  WtScales() = 0  the suffix only GROUPS. The dump shows the same
-;                  sixteen bytes a line as 8, 16 or 32-bit values; the
-;                  count stays in bytes. Two counts that meant different
-;                  things in one monitor would be the trap, and `memory
-;                  <addr> <count>` has counted bytes since it existed.
+;  WtScales() = 0  the suffix selects the true ACCESS WIDTH and GROUPING.
+;                  The dump reads 8, 16 or 32 bits per access and shows
+;                  sixteen bytes a line; the count stays in bytes. Two
+;                  counts that meant different things in one monitor
+;                  would be the trap, and `memory <addr> <count>` has
+;                  counted bytes since it existed.
 ;  WtScales() = 1  the suffix SIZES THE OBJECT the count counts, which is
 ;                  U-Boot's cmd_get_data_size(argv[0], N) read off the
 ;                  command word (v2025.01_cmd_mem.c:143 mw, :256 cmp,
@@ -174,7 +175,8 @@ Procedure.i MemSize(defSize.i)
 EndProcedure
 
 Procedure.i WtScales(i.i)
-  ; 1 the suffix scales the COUNT, 0 it only regroups what is shown.
+  ; 1 the suffix scales the COUNT, 0 it selects access width/grouping
+  ; while the count remains bytes.
   ; The dump is the only 0 in the table, and it is the row 585 was about.
   If i = #WT_MD
     ProcedureReturn 0
@@ -185,20 +187,17 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  DumpMem - the hex+ASCII dump, grouped by 1, 2 or 4 bytes.
 ;
-;  WIDTH is U-Boot's .b / .w / .l for md (v2025.01_cmd_mem.c:66-115,
-;  table :1313-1317). 1 groups the sixteen bytes of a line one at a time,
-;  which is what this monitor has ALWAYS done and is still the default; 2
-;  groups them as eight 16-bit values; 4 as four 32-bit values. The count
-;  n is in BYTES in every case - see the note on gMemWidth in state.pi4
-;  and the memory family's header below - so a line is always sixteen
-;  bytes wide and only the grouping of them changes.
+;  Width 1, 2 or 4 means an actual 8, 16 or 32-bit bus access, not merely
+;  how byte reads are regrouped afterward. The count n remains BYTES in
+;  every case. Explicit wide dumps therefore require an aligned address
+;  and a whole number of units before the first target access. A bare dump
+;  remains byte-wide and can show any byte range.
 ;
-;  VALUES ARE LITTLE-ENDIAN, assembled a byte at a time rather than read
-;  with PeekU/PeekN, because md must be able to look at an unaligned
-;  device register block and a wide Peek of an unaligned address is an
-;  alignment fault with no console message - the same trap `write`
-;  guards against. Byte assembly reads the same little-endian value the
-;  ARM would at an aligned address and simply cannot fault.
+;  Each row is captured exactly once before it is formatted. Every unit is
+;  read with ReadWidth(), decomposed into the 16-byte row snapshot, and both
+;  hex and ASCII are rendered from that snapshot. This matters for device
+;  registers: a status/FIFO register can change or have side effects on read,
+;  so the ASCII column must never ask it a second time.
 ; ----------------------------------------------------------------------
 ;
 ;  IT RETURNS HOW MANY BYTES IT ACTUALLY PRINTED, which is not always n:
@@ -214,9 +213,12 @@ Procedure.i DumpMem(a.i, n.i, width.i)
   Define b.i
   Define wide.i
   Define v.i
-  Define ok.i
-  If width <> 2 And width <> 4
-    width = 1                     ; 0 (no suffix) and anything odd is byte
+  Dim snap.i[16]
+  If width <> 1 And width <> 2 And width <> 4
+    ProcedureReturn 0
+  EndIf
+  If (a & (width - 1)) <> 0 Or (n & (width - 1)) <> 0
+    ProcedureReturn 0
   EndIf
   ; THE ADDRESS COLUMN WIDTH IS DECIDED ONCE, for the whole dump, from
   ; its highest address - not per line. Deciding per line would make the
@@ -240,27 +242,30 @@ Procedure.i DumpMem(a.i, n.i, width.i)
     If row > 16
       row = 16
     EndIf
+    ; Capture before printing: one target read per selected-width unit.
+    j = 0
+    While j < row
+      v = ReadWidth(a + i + j, width)
+      k = 0
+      While k < width
+        snap[j + k] = (v >> (k * 8)) & $FF
+        k = k + 1
+      Wend
+      j = j + width
+    Wend
     PutHexN(a + i, wide)
     Print(": ")
     ; The hex area, in items of `width` bytes across the sixteen columns.
     j = 0
     While j < 16
-      ok = 1
-      k = 0
-      While k < width
-        If (j + k) >= row
-          ok = 0
-        EndIf
-        k = k + 1
-      Wend
-      If ok <> 0
+      If j < row
         ; Little-endian: the byte at the lowest address is the low byte,
         ; so it prints RIGHTMOST, which is how U-Boot and every hex tool
         ; show a word.
         v = 0
         k = width - 1
         While k >= 0
-          v = (v << 8) | PeekA(a + i + j + k)
+          v = (v << 8) | snap[j + k]
           k = k - 1
         Wend
         PutHexN(v, width * 2)
@@ -278,7 +283,7 @@ Procedure.i DumpMem(a.i, n.i, width.i)
     UartWrite(124)
     j = 0
     While j < row
-      b = PeekA(a + i + j)
+      b = snap[j]
       If b < 32 Or b > 126
         b = 46
       EndIf
@@ -301,7 +306,7 @@ Procedure CmdMem()
   ; loop's SUFFIX block when the word was md.b / md.w / md.l (or the same
   ; on memory / dump / m), 0 when there was none. MemSize() falls back to
   ; this command's own row in the width table (#WT_MD), which is 1 - byte
-  ; grouping, what this command has always done - so a bare md is
+  ; access and grouping, what this command has always done - so a bare md is
   ; unchanged and the default is stated in ONE place that help reads too.
   width = MemSize(WtDefSize(#WT_MD))
   a = ParseHex()
@@ -314,8 +319,8 @@ Procedure CmdMem()
       PrintN("   missing or is not a hex number. Nothing was dumped.")
       PrintN("   memory <address> <count>, both hex, and the count is in bytes.")
       PrintN("   Leave the count out and you get 64 bytes.")
-      PrintN("   md.b, md.w and md.l group the SAME bytes as 8, 16 or 32-bit")
-      PrintN("   values; the count is still bytes whichever you pick.")
+      PrintN("   md.b, md.w and md.l issue true 8, 16 or 32-bit reads and group")
+      PrintN("   those values; the count is still bytes whichever you pick.")
     EndIf
     ProcedureReturn
   EndIf
@@ -330,6 +335,20 @@ Procedure CmdMem()
     ; nothing is indistinguishable from a monitor that has crashed.
     PrintN("!! a count of zero bytes dumps nothing, so nothing was dumped. Give a")
     PrintN("   count in hexadecimal bytes, or leave it out entirely and you get 64.")
+    ProcedureReturn
+  EndIf
+  ; Explicit wide reads are a hardware access contract. Reject a partial
+  ; final unit before any target address is touched instead of silently
+  ; falling back to byte reads or reading beyond the requested byte count.
+  If (n & (width - 1)) <> 0
+    Print("!! a ")
+    PutUnit1(width)
+    Print(" dump needs a whole number of ")
+    PutUnit(width)
+    PrintN(".")
+    Print("   The byte count must be a multiple of ")
+    PrintDec(width)
+    PrintN(". Nothing was read.")
     ProcedureReturn
   EndIf
   If n > 4096
@@ -347,6 +366,15 @@ Procedure CmdMem()
   ; this. With no `base` command ever typed gBase is 0 and this is a
   ; no-op that prints nothing.
   a = AddBase(a)
+  If (a & (width - 1)) <> 0
+    Print("!! the address must be ")
+    PrintDec(width)
+    Print("-byte aligned for a ")
+    PrintDec(width * 8)
+    PrintN("-bit dump.")
+    PrintN("   Use an aligned address or md.b. Nothing was read.")
+    ProcedureReturn
+  EndIf
   ; ==================================================================
   ;  NO SIZE WARNING, AND NO AUTOMATIC "screen off". ARGUED, NOT
   ;  OVERLOOKED - it was asked for after the 2026-08-26 hang and the
@@ -441,8 +469,8 @@ Procedure CmdMem()
     PrintDec(n)
     PrintN(" and this stopped early, so that is PART of the range.")
   EndIf
-  PrintN("  The count is in bytes whichever grouping you choose; the suffix moves")
-  PrintN("  the columns, not the amount. Type help for the whole rule.")
+  PrintN("  The count is in bytes whichever access width you choose; the suffix")
+  PrintN("  selects true 8, 16 or 32-bit reads, not the amount. Type help for the rule.")
 EndProcedure
 
 Procedure CmdWrite()
@@ -720,20 +748,17 @@ Procedure StoreWidth(a.i, v.i, size.i)
 EndProcedure
 
 Procedure.i ReadWidth(a.i, size.i)
-  ; One read of `size` bytes, ASSEMBLED A BYTE AT A TIME, little-endian -
-  ; the same reason DumpMem does it: a wide Peek of an unaligned device
-  ; register is an alignment fault with no console message, and mm/nm
-  ; must be able to show the current value of anything the operator
-  ; points them at. Returns an unsigned value in the low `size` bytes.
-  Define v.i
-  Define k.i
-  v = 0
-  k = size - 1
-  While k >= 0
-    v = (v << 8) | (PeekA(a + k) & $FF)
-    k = k - 1
-  Wend
-  ProcedureReturn v
+  ; Exactly one bus access of the requested width. Every caller validates
+  ; alignment before arriving here. Returns an unsigned value in the low
+  ; `size` bytes; unsupported widths refuse without touching the address.
+  If size = 1
+    ProcedureReturn PeekA(a) & $FF
+  ElseIf size = 2
+    ProcedureReturn PeekU(a) & $FFFF
+  ElseIf size = 4
+    ProcedureReturn PeekN(a) & $FFFFFFFF
+  EndIf
+  ProcedureReturn 0
 EndProcedure
 
 ; ----------------------------------------------------------------------

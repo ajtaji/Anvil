@@ -27,8 +27,8 @@
 ; ----------------------------------------------------------------------
 ;  PutWtNames(which) - the command words as "a, b and c".
 ;
-;  which = 0 those whose suffix only regroups, 1 those whose suffix
-;  scales the count, -1 all of them. The Oxford comma is left out to
+;  which = 0 those whose suffix does not scale the byte count, 1 those
+;  whose suffix scales the count, -1 all of them. The Oxford comma is left out to
 ;  match the prose everywhere else in this help.
 ; ----------------------------------------------------------------------
 Procedure PutWtNames(which.i)
@@ -69,10 +69,10 @@ Procedure PutWidthRule()
   PrintN("  It does one of two things and which one depends on the command.")
   Print("  On ")
   PutWtNames(0)
-  PrintN(" the suffix changes only the GROUPING:")
-  PrintN("  the same bytes are shown as 8, 16 or 32-bit values and the count")
-  PrintN("  stays in BYTES whichever width you pick, because two counts meaning")
-  PrintN("  different things in one monitor would be a trap.")
+  PrintN(" the suffix selects true 8, 16 or 32-bit reads and their GROUPING:")
+  PrintN("  the count stays in BYTES whichever width you pick. A .w or .l start")
+  PrintN("  must be aligned to 2 or 4 bytes, and the byte count must be a whole")
+  PrintN("  number of that width; otherwise nothing is read. Bare md reads bytes.")
   Print("  On ")
   PutWtNames(1)
   PrintN(" it changes what the count COUNTS:")
@@ -254,12 +254,12 @@ Procedure Help()
   PrintN("                  point of a debugger, and being able to point it at")
   PrintN("                  a device register block is most of its value - but")
   PrintN("                  the BOARD is asked about it first. See force below.")
-  PrintN("                  md.b, md.w and md.l group the SAME sixteen bytes a")
-  PrintN("                  line as 8, 16 or 32-bit little-endian values, which")
-  PrintN("                  is U-Boot's width suffix. The count is still in")
-  PrintN("                  bytes whichever you pick - only the grouping changes,")
-  PrintN("                  because two counts that meant different things would")
-  PrintN("                  be a trap. A bare md is byte-grouped as it always was.")
+  PrintN("                  md.b, md.w and md.l issue true 8, 16 or 32-bit reads")
+  PrintN("                  and group each line in little-endian values. The count")
+  PrintN("                  is still bytes whichever you pick. .w/.l require a")
+  PrintN("                  2-/4-byte-aligned start and a byte count containing")
+  PrintN("                  whole units; invalid ranges read nothing. A bare md")
+  PrintN("                  reads bytes, as it always did.")
   PrintN("                  It ends by printing the byte total it dumped and the")
   PrintN("                  grouping it used, like the rest of this family.")
   PrintN("  write <address> <value>               [w, poke]")
