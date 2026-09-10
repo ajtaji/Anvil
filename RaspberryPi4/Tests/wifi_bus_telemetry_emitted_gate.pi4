@@ -1,0 +1,137 @@
+; Executable gate for the measurement-only CYW43 receive telemetry.
+; The production parser runs over scripted SDPCM frames behind its real I/O
+; seam. Main returns the first failed assertion number, or zero.
+
+Global Dim gate_frame.a[4096]
+Global gate_len.i
+Global gate_pos.i
+Global gate_fail.i
+
+Procedure.i GateRb(fn.i, addr.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GateWb(fn.i, addr.i, v.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateRd(fn.i, addr.i, *dst, n.i, incr.i)
+  Define i.i
+  If gate_fail <> 0
+    gate_fail = 0
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To n - 1
+    If gate_pos < gate_len
+      PokeB(*dst + i, gate_frame[gate_pos])
+    Else
+      PokeB(*dst + i, 0)
+    EndIf
+    gate_pos = gate_pos + 1
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateWr(fn.i, addr.i, *src, n.i, incr.i)
+  ProcedureReturn 1
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+
+Procedure GateFrame(seq.i, rawchan.i, size.i, nextlen.i)
+  Define i.i
+  For i = 0 To 4095
+    gate_frame[i] = 0
+  Next
+  gate_len = size
+  If gate_len > 4096 : gate_len = 64 : EndIf
+  gate_pos = 0
+  gate_frame[0] = size & $FF
+  gate_frame[1] = (size >> 8) & $FF
+  If size = 0
+    gate_frame[2] = 0
+    gate_frame[3] = 0
+  Else
+    gate_frame[2] = (~size) & $FF
+    gate_frame[3] = ((~size) >> 8) & $FF
+  EndIf
+  gate_frame[4] = seq & $FF
+  gate_frame[5] = rawchan & $FF
+  gate_frame[6] = nextlen & $FF
+  gate_frame[7] = 12
+  ; A data channel frame needs its four-byte BDC header and non-empty data.
+  If (rawchan & $0F) = #CYW43_CHAN_DATA And size > 16
+    gate_frame[15] = 0
+    For i = 16 To size - 1
+      gate_frame[i] = i & $FF
+    Next
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  If Cyw43SetIo(@GateRb, @GateWb, @GateRd, @GateWr) = 0 : ProcedureReturn 1 : EndIf
+  cyw43_f2ByteMax = 512
+  cyw43_f2Blk = 512
+  cyw43_hz = 1000
+  Cyw43TransportReset()
+
+  GateFrame(0, 0, 0, 0)
+  If cyw43_RxFrame(-1) <> 0 : ProcedureReturn 2 : EndIf
+  If Cyw43RxFirstReads() <> 1 Or Cyw43RxEmpty() <> 1 : ProcedureReturn 3 : EndIf
+  If Cyw43F2ReadCalls() <> 1 Or Cyw43F2ReadBytes() <> 64 : ProcedureReturn 4 : EndIf
+
+  GateFrame(0, #CYW43_CHAN_DATA, 80, 2)
+  If cyw43_RxFrame(-1) <> 5 : ProcedureReturn 5 : EndIf
+  If Cyw43RxDataChannel() <> 1 Or Cyw43RxRestReads() <> 1 : ProcedureReturn 6 : EndIf
+  If Cyw43RxNextLenCount() <> 1 Or Cyw43RxNextLenMax() <> 2 : ProcedureReturn 7 : EndIf
+  If Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 8 : EndIf
+
+  GateFrame(2, #CYW43_CHAN_DATA, 80, 0)
+  If cyw43_RxFrame(-1) <> 5 : ProcedureReturn 9 : EndIf
+  If Cyw43RxSeqMismatch() <> 1 : ProcedureReturn 10 : EndIf
+  If Cyw43RxSeqLastExpected() <> 1 Or Cyw43RxSeqLastGot() <> 2 : ProcedureReturn 11 : EndIf
+
+  GateFrame(3, #CYW43_SDPCM_GLOMDESC | #CYW43_CHAN_GLOM, 16, 0)
+  If cyw43_RxFrame(-1) <> 3 : ProcedureReturn 12 : EndIf
+  GateFrame(4, #CYW43_CHAN_GLOM, 16, 0)
+  If cyw43_RxFrame(-1) <> 3 : ProcedureReturn 13 : EndIf
+  If Cyw43RxGlom() <> 2 Or Cyw43RxGlomDescriptors() <> 1 Or Cyw43RxGlomSuperframes() <> 1 : ProcedureReturn 14 : EndIf
+
+  GateFrame(5, 7, 16, 0)
+  If cyw43_RxFrame(-1) <> 3 Or Cyw43RxUnknownChannel() <> 1 : ProcedureReturn 15 : EndIf
+
+  GateFrame(6, #CYW43_CHAN_GLOM, 3000, 0)
+  If cyw43_RxFrame(-1) <> 3 : ProcedureReturn 16 : EndIf
+  If Cyw43RxTooBig() <> 1 Or Cyw43RxTooBigGlom() <> 1 : ProcedureReturn 17 : EndIf
+  If Cyw43RxTooBigLastSize() <> 3000 Or Cyw43RxTooBigLastChannel() <> #CYW43_CHAN_GLOM : ProcedureReturn 18 : EndIf
+
+  GateFrame(6, 0, 40, 0)
+  gate_frame[2] = 0 : gate_frame[3] = 0
+  If cyw43_RxFrame(-1) <> 3 : ProcedureReturn 19 : EndIf
+  If Cyw43RxBadHdr() <> 1 Or Cyw43RxBadLastSize() <> 40 Or Cyw43RxBadLastComplement() <> 0 : ProcedureReturn 20 : EndIf
+
+  GateFrame(6, #CYW43_CHAN_DATA, 80, 0)
+  r = cyw43_Poll(-1, 0, 0, #CYW43_POLL_CREDIT)
+  If r <> #CYW43_IO_TIMEOUT Or Cyw43RxDataLostInCreditPoll() <> 1 : ProcedureReturn 21 : EndIf
+  GateFrame(7, #CYW43_CHAN_DATA, 80, 0)
+  r = cyw43_Poll(-1, 0, 0, #CYW43_POLL_CONTROL)
+  If r <> #CYW43_IO_TIMEOUT Or Cyw43RxDataLostInControlPoll() <> 1 : ProcedureReturn 22 : EndIf
+  GateFrame(8, #CYW43_CHAN_DATA, 80, 0)
+  r = cyw43_PollEvent(0)
+  If r <> 0 Or Cyw43RxDataLostInEventPoll() <> 1 : ProcedureReturn 23 : EndIf
+
+  GateFrame(9, #CYW43_CHAN_DATA, 80, 0)
+  If Cyw43Receive(0) <> 64 : ProcedureReturn 24 : EndIf
+  If Cyw43RxDataFrames() <> 1 : ProcedureReturn 25 : EndIf
+
+  gate_fail = 1
+  If cyw43_RxFrame(-1) <> -1 : ProcedureReturn 26 : EndIf
+  If Cyw43F2Failures() <> 1 : ProcedureReturn 27 : EndIf
+  If Cyw43F2ReadCalls() <> Cyw43RxFirstReads() + Cyw43RxRestReads() : ProcedureReturn 28 : EndIf
+
+  Cyw43TransportReset()
+  If Cyw43RxGlom() <> 0 Or Cyw43RxTooBig() <> 0 Or Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 29 : EndIf
+  If Cyw43F2ReadCalls() <> 0 Or Cyw43RxDataLostInCreditPoll() <> 0 : ProcedureReturn 30 : EndIf
+  ProcedureReturn 0
+EndProcedure

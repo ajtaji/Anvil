@@ -23,12 +23,12 @@ WHAT THIS PROVES
 
 THE ONE THING IT EXISTS FOR
 
-  I2cWriteRead() is new. It is a mid-transaction poke at a controller -
-  start a write, wait for ACTIVE, re-aim DLEN and set READ|ST - and that
-  is the exact shape of the repeated-start bug this project has already
-  paid for twice on the RP2040 and RP2350. Nothing in the tree could
-  observe whether a STOP came out in the middle, because no model of this
-  controller existed.
+  I2cWriteRead() is a mid-transaction poke at a controller. The BCM2835
+  state-machine workaround used by Linux starts the write with an EMPTY
+  FIFO, waits for TXW, fills as much as TXD allows, and queues READ|ST in
+  the same TXW handling step that enqueues the last byte. Nothing in the
+  tree could observe that order, or whether a STOP came out in the middle,
+  because no model of this controller existed.
 
   Now one does, and THE GT911 MODEL FORGETS ITS REGISTER POINTER ON A
   STOP. So a driver that writes the pointer, stops, and then reads gets
@@ -47,14 +47,15 @@ WHAT IT CANNOT PROVE, AND THE LIST IS SHORT AND IMPORTANT
     the right direction for a gate - it forbids a pattern nobody has
     shown to be safe - but it means a green run here does NOT prove a
     real GT911 would have failed the two-transaction path.
-  * The TA race that I2cWriteRead returns #I2C_NOSR for is EXERCISED here
-    by a deliberately impatient controller variant, which proves the code
-    path. It does not predict whether real silicon ever loses that race.
+  * DONE-before-the-first-TXW, delayed TA, an initially empty TXW, partial
+    FIFO refill, and the immediate phase switch are EXERCISED here. That
+    proves the emitted state transitions, not their timing on real silicon.
   * The axis transform is graded against the numbers in a device-tree
     overlay. If the overlay is wrong about this panel, this gate is wrong
     with it, in the same direction, and only a finger will say so.
   * The bus is BSC1 on GPIO 2/3. The panel is on BSC0 at GPIO 44/45.
-    Nothing here models BSC0, because nothing in the tree drives it yet.
+    This diagnostic deliberately defaults to BSC1, so the model places the
+    same BSC register behavior there; the shipping touch path selects BSC0.
 """
 
 import os
@@ -316,15 +317,14 @@ class Goodix(Slave):
 class Bsc:
     """The BCM2711 BSC master, as much of it as a polled driver sees.
 
-    THE STOP IS THE INTERESTING PART. A write transaction does not finish
-    the instant its bytes are gone: the controller stays ACTIVE, and only
-    emits a STOP once nobody has re-armed it. `patience` is how many reads
-    of the status register that takes. Set it to 0 and the controller
-    finishes before it ever reports ACTIVE, which is the race
-    I2cWriteRead returns #I2C_NOSR for.
+    THE TXW HOLD IS THE INTERESTING PART. The model delays TA/TXW, starts
+    with an empty FIFO, and accepts at most `tx_chunk` bytes per TXW event.
+    Once the last byte is queued, the next status observation emits STOP;
+    correct code therefore queues READ|ST in that same TXW handling step.
+    `patience=0` makes DONE arrive before the first TXW and exercises NOSR.
     """
 
-    def __init__(self, base=BSC_BASE, patience=2):
+    def __init__(self, base=BSC_BASE, patience=2, tx_chunk=1, stall=False):
         self.base = base
         self.patience = patience
         self.devices = {}
@@ -341,6 +341,15 @@ class Bsc:
         self.done = False
         self.ta = False
         self.write_left = 0
+        self.write_data = bytearray()
+        self.tx_chunk = tx_chunk
+        self.stall = stall
+        self.tx_slots = 0
+        self.tx_gap = False
+        self.start_delay = 2
+        self.prefilled_starts = 0
+        self.txw_events = 0
+        self.phase_switches = 0
         self.polls = 0
         self.cur = None
 
@@ -360,6 +369,11 @@ class Bsc:
 
     # ---- transaction machinery -------------------------------------
     def _emit_stop(self):
+        if (self.cur is not None and not self.is_read and
+                self.write_left == 0 and self.write_data):
+            if not self.cur.write(bytes(self.write_data)):
+                self.nacks += 1
+                self.err = True
         if self.cur is not None:
             self.cur.stop()
         self.stops += 1
@@ -393,8 +407,37 @@ class Bsc:
                 self.ta = False
                 return
 
+        # The repeated-start workaround explicitly begins with an empty
+        # FIFO. Reject prefill in the model so the old TA shortcut cannot
+        # accidentally pass this gate again.
+        if not repeated and not is_read and self.txbuf:
+            self.prefilled_starts += 1
+            self.err = True
+            self.done = True
+            self.active = False
+            self.ta = False
+            self.cur = None
+            return
+
+        if repeated:
+            self.phase_switches += 1
+            if self.write_left != 0:
+                self.err = True
+                self.done = True
+                self.active = False
+                self.ta = False
+                return
+            if self.write_data and not self.cur.write(bytes(self.write_data)):
+                self.nacks += 1
+                self.err = True
+                self.done = True
+                self.active = False
+                self.ta = False
+                self.cur = None
+                return
+
         self.active = True
-        self.ta = True
+        self.ta = bool(repeated or is_read)
         self.done = False
         self.polls = 0
         self.is_read = is_read
@@ -403,28 +446,32 @@ class Bsc:
             self.write_left = 0
         else:
             self.write_left = dlen
-            self._drain_tx()
-
-    def _drain_tx(self):
-        if self.write_left > 0 and len(self.txbuf) >= self.write_left:
-            data = bytes(self.txbuf[:self.write_left])
-            del self.txbuf[:self.write_left]
-            self.write_left = 0
-            if not self.cur.write(data):
-                self.nacks += 1
-                self.err = True
-                self.done = True
-                self.active = False
-                self.ta = False
-                self.cur = None
+            self.write_data = bytearray()
+            self.tx_slots = 0
+            self.tx_gap = False
 
     # ---- the register window ---------------------------------------
     def read32(self, off):
         if off == C["BSC_S_OFF"]:
-            if self.active and not self.is_read and self.write_left == 0:
+            if self.active and not self.is_read:
                 self.polls += 1
-                if self.polls > self.patience:
+                if self.stall:
+                    pass
+                elif self.patience == 0:
                     self._emit_stop()
+                elif not self.ta and self.polls > self.start_delay:
+                    self.ta = True
+                elif self.ta and self.write_left == 0:
+                    # The driver has already queued every byte. Its only
+                    # safe action was READ|ST before asking status again.
+                    self._emit_stop()
+                elif self.ta and self.tx_gap:
+                    # One observation with TXD clear forces the emitted
+                    # loop to leave the inner fill and wait for another TXW.
+                    self.tx_gap = False
+                elif self.ta and self.tx_slots == 0:
+                    self.tx_slots = min(self.tx_chunk, self.write_left)
+                    self.txw_events += 1
             elif self.active and self.is_read and not self.rxbuf:
                 self._emit_stop()
             s = 0
@@ -438,8 +485,10 @@ class Bsc:
                 s |= C["BSC_S_TA"]
             if self.rxbuf:
                 s |= C["BSC_S_RXD"]
-            if self.active and not self.is_read and self.write_left > 0:
+            if self.active and not self.is_read and self.tx_slots > 0:
                 s |= C["BSC_S_TXD"]
+            if self.active and not self.is_read and self.tx_slots > 0:
+                s |= C["BSC_S_TXW"]
             if not self.txbuf:
                 s |= C["BSC_S_TXE"]
             return s
@@ -465,13 +514,35 @@ class Bsc:
         if off == C["BSC_FIFO_OFF"]:
             self.txbuf.append(val & 0xFF)
             if self.active and not self.is_read:
-                self._drain_tx()
+                if self.tx_slots <= 0 or self.write_left <= 0:
+                    self.err = True
+                    self.done = True
+                    self.active = False
+                    self.ta = False
+                else:
+                    self.write_data.append(val & 0xFF)
+                    self.txbuf.pop()
+                    self.write_left -= 1
+                    self.tx_slots -= 1
+                    if self.tx_slots == 0 and self.write_left > 0:
+                        self.tx_gap = True
             return
         if off == C["BSC_C_OFF"]:
             self.regs[off] = val
             if val & C["BSC_C_CLEAR"]:
                 self.txbuf = bytearray()
                 self.rxbuf = bytearray()
+                if self.active:
+                    if self.cur is not None:
+                        self.cur.stop()
+                    self.stops += 1
+                self.active = False
+                self.ta = False
+                self.cur = None
+                self.write_left = 0
+                self.write_data = bytearray()
+                self.tx_slots = 0
+                self.tx_gap = False
             if val & C["BSC_C_ST"]:
                 self._begin(bool(val & C["BSC_C_READ"]), self.active)
             return
@@ -591,10 +662,10 @@ SCRIPT = [
 ]
 
 
-def make_bus(patience=2, goodix_kwargs=None):
+def make_bus(patience=2, goodix_kwargs=None, stall=False):
     """The bench bus: a GT9271 at $5D, which is what the v2 overlay's
     goodix@5d node describes and what is plugged into this board."""
-    bsc = Bsc(patience=patience)
+    bsc = Bsc(patience=patience, stall=stall)
     g = Goodix(**(goodix_kwargs or {}))
     for points, claim in SCRIPT:
         g.push_frame(points, claim)
@@ -659,6 +730,20 @@ def grade(out, bsc, g, mcu, fails):
           bsc.repeated_starts > 0,
           "not one repeated start was issued in the whole run, so "
           "I2cWriteRead either was not called or did not reach step 7")
+    check("every combined write began with an empty FIFO",
+          bsc.prefilled_starts == 0,
+          "%d write(s) prefilled the FIFO before ST; the upstream BCM2835 "
+          "repeated-start workaround explicitly starts empty"
+          % bsc.prefilled_starts)
+    check("TXW flow control drove the write phase",
+          bsc.txw_events >= bsc.repeated_starts * 2,
+          "%d TXW event(s) served %d repeated start(s); the model only "
+          "accepts one pointer byte per TXW, so partial refill did not run"
+          % (bsc.txw_events, bsc.repeated_starts))
+    check("each phase switch happened while the write remained active",
+          bsc.phase_switches == bsc.repeated_starts,
+          "%d active phase switch(es), %d repeated start(s)"
+          % (bsc.phase_switches, bsc.repeated_starts))
     check("every Goodix read followed a repeated start",
           bsc.repeated_starts >= len(g.reads),
           "%d reads were served but only %d repeated starts went out"
@@ -934,8 +1019,7 @@ def run_v1(probe_rel, work, fails):
 
 
 def run_nosr(probe_rel, work, fails):
-    """The impatient controller: it emits its STOP before it ever reports
-    ACTIVE, so the repeated start cannot be issued.
+    """The impatient controller emits STOP before its first TXW hold.
 
     I2cWriteRead must REFUSE, not read anyway. This is the one path in
     that procedure that a healthy bus never exercises, and it is the path
@@ -949,8 +1033,8 @@ def run_nosr(probe_rel, work, fails):
     cases += 1
     if g.reads_without_pointer != 1:
         fails.append(
-            "nosr: with the controller finishing before it reported "
-            "ACTIVE, %d pointerless read(s) went out where only the one "
+            "nosr: with the controller finishing before its first TXW, "
+            "%d pointerless read(s) went out where only the one "
             "address probe is legitimate. I2cWriteRead must return "
             "#I2C_NOSR and read nothing, or a lost race becomes a wrong "
             "coordinate" % g.reads_without_pointer)
@@ -958,8 +1042,8 @@ def run_nosr(probe_rel, work, fails):
     if bsc.repeated_starts:
         fails.append(
             "nosr: %d repeated start(s) were issued by a controller that "
-            "was never ACTIVE, so the model and the driver disagree about "
-            "what step 5 measures" % bsc.repeated_starts)
+            "never offered TXW, so the model and driver disagree about the "
+            "phase boundary" % bsc.repeated_starts)
     cases += 1
     if "no Goodix answered" not in out:
         fails.append(
@@ -978,6 +1062,67 @@ def run_nosr(probe_rel, work, fails):
             "arrives as a number: %r"
             % next((l for l in out.splitlines()
                     if "code at $5D" in l), ""))
+    return cases
+
+
+def run_timeout(work, fails):
+    """Execute the real timeout/cleanup path with only its desk wait shortened.
+
+    The production bound is intentionally large. Recompiling the same source
+    with that one constant reduced keeps this gate finite while retaining the
+    emitted loop, result code and recovery writes under test.
+    """
+    d = work / "timeout"
+    d.mkdir(parents=True, exist_ok=True)
+    src = DRV_I2C.read_text(encoding="utf-8", errors="replace")
+    anchor = "#I2C_SPIN_MAX  = 2000000"
+    if src.count(anchor) != 1:
+        fails.append("timeout: the I2C spin-bound anchor changed; the emitted "
+                     "timeout path was not exercised")
+        return 1
+    short_i2c = d / "timeout_i2c.pi4"
+    short_i2c.write_text(src.replace(anchor, "#I2C_SPIN_MAX  = 16"),
+                         encoding="utf-8")
+
+    probe = PROBE.read_text(encoding="utf-8", errors="replace")
+    inc = 'XIncludeFile "RaspberryPi4/Lib/i2c.pi4"'
+    if probe.count(inc) != 1:
+        fails.append("timeout: the probe's I2C include changed; the shortened "
+                     "test build was not made")
+        return 1
+    short_probe = d / "timeout_probe.pi4"
+    short_probe.write_text(
+        probe.replace(inc, 'XIncludeFile "%s"' %
+                      short_i2c.relative_to(ROOT).as_posix()),
+        encoding="utf-8")
+    img = d / "timeout.img"
+    build(short_probe.relative_to(ROOT).as_posix(), img)
+    bsc, g, mcu = make_bus(stall=True)
+    cpu, out, steps = run(img, bsc)
+
+    cases = 0
+    def check(name, ok, detail):
+        nonlocal cases
+        cases += 1
+        if not ok:
+            fails.append("timeout: %s: %s" % (name, detail))
+
+    check("timeout and address NACK remain distinct",
+          "code at $5D = -4" in out and "code at $14 = -2" in out,
+          "the present-but-stalled $5D path must report #I2C_TIMEOUT and "
+          "the absent $14 fallback must report #I2C_NACK")
+    check("no read phase begins after a stalled write",
+          bsc.repeated_starts == 0,
+          "%d repeated start(s) escaped a write phase with no TXW"
+          % bsc.repeated_starts)
+    check("timeout recovery leaves the controller idle",
+          not bsc.active and not bsc.txbuf and not bsc.rxbuf,
+          "active=%r, tx=%d, rx=%d after recovery"
+          % (bsc.active, len(bsc.txbuf), len(bsc.rxbuf)))
+    check("recovery preserves the last requested address",
+          bsc.regs[C["BSC_A_OFF"]] == 0x14,
+          "A changed to $%02X instead of retaining the final fallback address"
+          % bsc.regs[C["BSC_A_OFF"]])
     return cases
 
 
@@ -1079,9 +1224,13 @@ MUTATIONS = [
      "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)",
      "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST)"),
 
-    ("i2c", "the write phase is started before the FIFO is loaded",
-     "  I2cWr(#BSC_DLEN_OFF, wn & $FFFF)\n  i = 0\n  While i < wn",
-     "  I2cWr(#BSC_DLEN_OFF, wn & $FFFF)\n  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST)\n  i = 0\n  While i < wn"),
+    ("i2c", "the repeated-start write preloads the FIFO before ST",
+     "  I2cWr(#BSC_DLEN_OFF, wn & $FFFF)\n  i = 0\n  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST)",
+     "  I2cWr(#BSC_DLEN_OFF, wn & $FFFF)\n  i = 0\n  While i < wn\n    I2cWr(#BSC_FIFO_OFF, PeekA(*wbuf + i) & $FF)\n    i = i + 1\n  Wend\n  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST)"),
+
+    ("i2c", "the phase switch waits for another status after the final byte",
+     "      If i = wn\n        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)",
+     "      If i = wn And (I2cRd(#BSC_S_OFF) & #BSC_S_TXW) <> 0\n        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)"),
 
     # THE ANCHOR HAD GONE STALE AND THE GATE SAID NOTHING - found
     # 2026-09-08. i2c.pi4 grew an I2cRecover() call in this arm at some
@@ -1091,20 +1240,22 @@ MUTATIONS = [
     # The reporting half of that is fixed in run_mutations below: an
     # anchor that does not match is now a gate that DID NOT RUN, printed
     # as its own outcome with its reason, and it fails the run.
-    ("i2c", "DONE before TA is read anyway instead of refused",
-     "      ; The write is over and a STOP went with it. Do NOT read.\n      I2cWr(#BSC_S_OFF, #BSC_S_DONE)\n      a64_barrier()\n      I2cRecover()\n      ProcedureReturn #I2C_NOSR",
-     "      I2cWr(#BSC_S_OFF, #BSC_S_DONE)\n      a64_barrier()\n      started = 1\n      Break"),
+    ("i2c", "DONE before TXW is ignored instead of refused",
+     "    If (s & #BSC_S_DONE) <> 0\n      ; The write is over and a STOP went with it. Do NOT begin a plain read.\n      I2cRecover()\n      ProcedureReturn #I2C_NOSR\n    EndIf",
+     "    If (s & #BSC_S_DONE) <> 0\n      I2cWr(#BSC_S_OFF, #BSC_S_DONE)\n      I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n      I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)\n      Break\n    EndIf"),
 
     ("i2c", "the read length is never written to DLEN",
-     "  I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)",
-     "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)"),
+     "        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)",
+     "        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)"),
 ]
 
 SRC_OF = {"touch": DRV_TOUCH, "panel": DRV_PANEL, "i2c": DRV_I2C}
 
 
 def mutate_one(job):
-    idx, which, name, old, new = job
+    global PMFC
+    idx, which, name, old, new, compiler = job
+    PMFC = pathlib.Path(compiler)
     d = WORK / "mut" / str(idx)
     d.mkdir(parents=True, exist_ok=True)
 
@@ -1118,8 +1269,19 @@ def mutate_one(job):
                 "the anchor text appears %d times in %s, not once - the "
                 "mutation could not be applied and proves nothing"
                 % (src.count(old), src_path.name))
+    mut_src = src.replace(old, new)
+    if which == "i2c":
+        # A mutation can intentionally strand the BSC in a state whose
+        # production backstop is two million emitted loop iterations. The
+        # bound is not the behavior being mutated, so shorten it for these
+        # desk-only negative controls exactly as run_timeout does.
+        spin_anchor = "#I2C_SPIN_MAX  = 2000000"
+        if mut_src.count(spin_anchor) != 1:
+            return (name, None, "the I2C spin-bound anchor changed; this "
+                    "negative control could run without a finite desk bound")
+        mut_src = mut_src.replace(spin_anchor, "#I2C_SPIN_MAX  = 64")
     mut = d / ("mut_" + src_path.name)
-    mut.write_text(src.replace(old, new), encoding="utf-8")
+    mut.write_text(mut_src, encoding="utf-8")
 
     probe = PROBE.read_text(encoding="utf-8", errors="replace")
     if which == "panel":
@@ -1163,7 +1325,7 @@ def mutate_one(job):
 
 def run_mutations():
     from concurrent.futures import ProcessPoolExecutor
-    jobs = [(i, w, n, o, x)
+    jobs = [(i, w, n, o, x, str(PMFC))
             for i, (w, n, o, x) in enumerate(MUTATIONS)]
     workers = max(1, min(len(jobs), (os.cpu_count() or 4) - 2))
     print("negative control: %d mutations across %d workers"
@@ -1225,6 +1387,7 @@ def main():
     cases, out, steps = run_clean(rel, WORK, fails)
     cases += run_v1(rel, WORK, fails)
     cases += run_nosr(rel, WORK, fails)
+    cases += run_timeout(WORK, fails)
 
     if fails:
         print("touch_emitted_check: FAIL - %d" % len(fails))

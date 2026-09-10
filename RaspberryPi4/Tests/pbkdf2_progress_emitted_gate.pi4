@@ -1,0 +1,70 @@
+; Executed-code gate for PBKDF2's cooperative progress boundary.
+; DIAGNOSTIC. Does not ship in the monitor image.
+
+XIncludeFile "RaspberryPi4/Lib/sha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/hmacsha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/pbkdf2.pi4"
+
+Global Dim probeOutA.a[20]
+Global Dim probeOutB.a[20]
+Global probeCalls.i
+
+Procedure ProbeProgress()
+  probeCalls = probeCalls + 1
+EndProcedure
+
+Procedure.i ProbeRun(iters.i)
+  probeCalls = 0
+  Pbkdf2SetProgress(@ProbeProgress)
+  Pbkdf2Sha1(?probePassword, 8, ?probeSalt, 4, iters, @probeOutB[0], 20)
+  Pbkdf2SetProgress(0)
+  ProcedureReturn probeCalls
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define old.i
+
+  ; Independent known answer: PBKDF2-HMAC-SHA1("password", "salt", 257).
+  If Pbkdf2Sha1(?probePassword, 8, ?probeSalt, 4, 257, @probeOutA[0], 20) <> 20
+    ProcedureReturn 1
+  EndIf
+  old = Pbkdf2SetProgress(@ProbeProgress)
+  If old <> 0
+    ProcedureReturn 2
+  EndIf
+  probeCalls = 0
+  If Pbkdf2Sha1(?probePassword, 8, ?probeSalt, 4, 257, @probeOutB[0], 20) <> 20
+    ProcedureReturn 3
+  EndIf
+  If Pbkdf2SetProgress(old) <> @ProbeProgress
+    ProcedureReturn 4
+  EndIf
+  If probeCalls <> 1
+    ProcedureReturn 5
+  EndIf
+  For i = 0 To 19
+    If probeOutA[i] <> PeekA(?probeExpected + i)
+      ProcedureReturn 6
+    EndIf
+    If probeOutB[i] <> probeOutA[i]
+      ProcedureReturn 7
+    EndIf
+  Next
+
+  ; No callback is issued for a short ordinary derivation. Together with
+  ; 257 yielding exactly one above, this pins the nonzero 256 cadence without
+  ; paying for a WPA-length/double-block soak in the interpreter.
+  If ProbeRun(2) <> 0 : ProcedureReturn 8 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  probePassword:
+  Data.a 112,97,115,115,119,111,114,100
+  probeSalt:
+  Data.a 115,97,108,116
+  probeExpected:
+  Data.a $26,$C1,$B1,$19,$69,$DC,$5F,$88,$40,$91
+  Data.a $E5,$1D,$34,$37,$1C,$D6,$EB,$55,$03,$E9
+EndDataSection

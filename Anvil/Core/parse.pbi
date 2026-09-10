@@ -23,12 +23,9 @@ Procedure ReadLine()
   gLineTrunc = 0
   gLineCtrlC = 0
   ; Everything the last command printed, plus the prompt, goes to the
-  ; screen here - the one moment we are certain nothing is mid-output.
-  ; UartRead() below blocks, so there is no pumping while waiting; a
-  ; payload that prints for ten seconds and then resets the board will
-  ; have said it all on the wire and none of it on the screen. The wire
-  ; is the record. The screen is the convenience.
-  ScreenPump()
+  ; screen here, outside the producer callback. The nonblocking prompt
+  ; spin below continues servicing display updates while input is idle.
+  ScreenServiceTick()
   ; ATTACH HERE, NOT DEEPER IN. The first version did it inside
   ; MouseTick(), which meant the "looking for a mouse" lines landed
   ; after the prompt had already been drawn and cut it in half. This is
@@ -110,7 +107,7 @@ Procedure ReadLine()
       ; it advances only from this core spin, stops if the monitor stalls, and
       ; is internally rate-limited/damage-bounded. It is not driven by network
       ; traffic and it never delays this loop.
-      ScreenBannerTick()
+      ScreenServiceTick()
       ; KEEP THE RADIO ASSOCIATED. Self-rate-limited to a 20 s cadence, so
       ; this is a millis() read and two compares on all but one spin in
       ; millions - but when the access point idles the board out (~2 h with
@@ -122,6 +119,9 @@ Procedure ReadLine()
       ; expiry and INIT-REBOOT advance here even while no network command
       ; is active, without blocking the prompt or the other interface.
       NetDhcpTick()
+      CompilerIf #CAP_NET = 1
+      NtpServiceTick()
+      CompilerEndIf
       ; AND KEEP THE FAN TURNING. Two rate classes in one call, and both
       ; of them have to be here rather than anywhere else.
       ;

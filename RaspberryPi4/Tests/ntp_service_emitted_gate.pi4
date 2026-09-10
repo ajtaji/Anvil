@@ -1,0 +1,381 @@
+; Executable emitted-code gate for the nonblocking SNTP service.
+; All network/tick inputs are synthetic; no device or host network is touched.
+
+#HW_LINK_NONE = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI = 2
+#NETIF_KINDS = 3
+#NET_E_NO_ARP = -118
+#DNS_PORT = 53
+
+Global gate_ms.i
+Global gate_ticks.i
+Global gate_sends.i
+Global gate_arps.i
+Global gate_reentrantIo.i
+Global gate_inInput.i
+Global gate_netError.i
+Global gate_noArp.i
+Global gate_preferred.i
+Global gate_routeKind.i
+Global gate_dnsResult.i
+Global gate_dnsAccept.i
+Global gate_rxKind.i
+Global gate_rxFrom.i
+Global gate_rxPort.i
+Global gate_rxDstPort.i
+Global gate_rxTo.i
+Global gate_rxLen.i
+Global gate_lastKind.i
+Global gate_lastDst.i
+Global gate_lastDstPort.i
+Global gate_lastSrcPort.i
+Global gate_lastLen.i
+Global Dim gate_usable.i[3]
+Global Dim gate_ip.i[3]
+Global Dim gate_dns.i[3]
+Global Dim gate_ntp.i[3]
+Global Dim gate_listenerDns.i[3]
+Global Dim gate_listenerNtp.i[3]
+Global Dim gate_tx.a[512]
+Global Dim gate_rx.a[512]
+Global Dim gate_dnsQuery.a[128]
+Global Dim gate_server.a[128]
+Global Dim gate_zone.a[32]
+Global Dim gate_saved.a[32]
+
+Procedure.i millis() : ProcedureReturn gate_ms : EndProcedure
+Procedure.i Ticks() : gate_ticks = gate_ticks + 1 : ProcedureReturn gate_ticks : EndProcedure
+Procedure.i TickHz() : ProcedureReturn 1000 : EndProcedure
+
+Procedure GateCopy(*dst, *src, limit.i)
+  Define i.i
+  Define c.i
+  i = 0
+  If *src <> 0
+    c = PeekA(*src) & $FF
+    While c <> 0 And i < limit
+      PokeA(*dst + i, c)
+      i = i + 1
+      c = PeekA(*src + i) & $FF
+    Wend
+  EndIf
+  PokeA(*dst + i, 0)
+EndProcedure
+
+Procedure.i GateEq(*a, *b)
+  Define i.i
+  Define ca.i
+  Define cb.i
+  i = 0
+  Repeat
+    ca = PeekA(*a + i) & $FF
+    cb = PeekA(*b + i) & $FF
+    If ca <> cb : ProcedureReturn 0 : EndIf
+    If ca = 0 : ProcedureReturn 1 : EndIf
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure.i SettingsGet(*key)
+  If GateEq(*key, "ntp.server") <> 0
+    If gate_server[0] <> 0 : ProcedureReturn @gate_server[0] : EndIf
+  ElseIf GateEq(*key, "clock.zone") <> 0
+    If gate_zone[0] <> 0 : ProcedureReturn @gate_zone[0] : EndIf
+  ElseIf GateEq(*key, "clock.utc") <> 0
+    If gate_saved[0] <> 0 : ProcedureReturn @gate_saved[0] : EndIf
+  ElseIf GateEq(*key, "net.dns") <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i SettingsSet(*key, *value)
+  If GateEq(*key, "ntp.server") <> 0
+    GateCopy(@gate_server[0], *value, 127)
+  ElseIf GateEq(*key, "clock.zone") <> 0
+    GateCopy(@gate_zone[0], *value, 31)
+  ElseIf GateEq(*key, "clock.utc") <> 0
+    GateCopy(@gate_saved[0], *value, 31)
+  Else
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EthKeyDns() : ProcedureReturn "net.dns" : EndProcedure
+
+Procedure.i ParseDotted(*s)
+  Define i.i
+  Define c.i
+  Define fields.i
+  Define digits.i
+  Define part.i
+  Define ip.i
+  If *s = 0 : ProcedureReturn -1 : EndIf
+  i = 0 : fields = 0 : digits = 0 : part = 0 : ip = 0
+  Repeat
+    c = PeekA(*s + i) & $FF
+    If c >= 48 And c <= 57
+      If digits >= 3 : ProcedureReturn -1 : EndIf
+      part = part * 10 + (c - 48)
+      If part > 255 : ProcedureReturn -1 : EndIf
+      digits = digits + 1
+    ElseIf c = 46 Or c = 0
+      If digits = 0 : ProcedureReturn -1 : EndIf
+      ip = (ip << 8) | part
+      fields = fields + 1
+      digits = 0 : part = 0
+      If c = 0 : Break : EndIf
+    Else
+      ProcedureReturn -1
+    EndIf
+    i = i + 1
+  ForEver
+  If fields <> 4 : ProcedureReturn -1 : EndIf
+  ProcedureReturn ip
+EndProcedure
+
+Procedure.i NetIfDns(kind.i) : ProcedureReturn gate_dns[kind] : EndProcedure
+Procedure.i NetIfPreferred() : ProcedureReturn gate_preferred : EndProcedure
+Procedure.i NetIfUsable(kind.i) : ProcedureReturn gate_usable[kind] : EndProcedure
+Procedure.i NetIfUsableCount()
+  ProcedureReturn gate_usable[1] + gate_usable[2]
+EndProcedure
+Procedure.i NetIfNext(after.i)
+  Define k.i
+  k = after + 1
+  While k < #NETIF_KINDS
+    If gate_usable[k] <> 0 : ProcedureReturn k : EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn #HW_LINK_NONE
+EndProcedure
+Procedure.i NetIfForDest(ip.i)
+  If gate_routeKind > 0 And gate_usable[gate_routeKind] <> 0
+    ProcedureReturn gate_routeKind
+  EndIf
+  ProcedureReturn #HW_LINK_NONE
+EndProcedure
+Procedure.i NetNextHop(kind.i, ip.i)
+  If gate_usable[kind] <> 0 And ip <> 0 : ProcedureReturn ip : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NetSrcFor(kind.i, ip.i) : ProcedureReturn gate_ip[kind] : EndProcedure
+Procedure.i NetIfHoldsIp(kind.i, ip.i)
+  ProcedureReturn Bool(gate_usable[kind] <> 0 And gate_ip[kind] = ip)
+EndProcedure
+Procedure.i DhcpClientNtp(kind.i) : ProcedureReturn gate_ntp[kind] : EndProcedure
+
+Procedure.i NetUdpListen(kind.i, port.i, on.i)
+  If gate_inInput <> 0 : gate_reentrantIo = 1 : EndIf
+  If port >= 49200 And port < 49216
+    gate_listenerDns[kind] = on
+  ElseIf port >= 49216 And port < 49232
+    gate_listenerNtp[kind] = on
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i NetUdpBuild(kind.i, dst.i, dp.i, sp.i, *p, n.i)
+  Define i.i
+  If gate_inInput <> 0 : gate_reentrantIo = 1 : EndIf
+  gate_lastKind = kind : gate_lastDst = dst : gate_lastDstPort = dp
+  gate_lastSrcPort = sp : gate_lastLen = n
+  If gate_noArp <> 0
+    gate_netError = #NET_E_NO_ARP
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To n - 1 : gate_tx[i] = PeekA(*p + i) & $FF : Next
+  ProcedureReturn n
+EndProcedure
+Procedure.i NetError() : ProcedureReturn gate_netError : EndProcedure
+Procedure.i NetArpRequest(kind.i, hop.i) : gate_arps = gate_arps + 1 : ProcedureReturn 1 : EndProcedure
+Procedure.i LinkTxStagedOn(kind.i) : gate_sends = gate_sends + 1 : ProcedureReturn 1 : EndProcedure
+
+Procedure.i DnsBuildQuery(*name, qid.i)
+  GateCopy(@gate_dnsQuery[0], *name, 127)
+  ProcedureReturn 20
+EndProcedure
+Procedure.i DnsQueryBuf() : ProcedureReturn @gate_dnsQuery[0] : EndProcedure
+Procedure.i DnsParseReply(*p, n.i, qid.i) : ProcedureReturn gate_dnsAccept : EndProcedure
+Procedure.i DnsResultIp(i.i) : ProcedureReturn gate_dnsResult : EndProcedure
+
+Procedure.i NetRxTo() : ProcedureReturn gate_rxTo : EndProcedure
+Procedure.i NetUdpRxFrom() : ProcedureReturn gate_rxFrom : EndProcedure
+Procedure.i NetUdpRxPort() : ProcedureReturn gate_rxPort : EndProcedure
+Procedure.i NetUdpRxDstPort() : ProcedureReturn gate_rxDstPort : EndProcedure
+Procedure.i NetUdpRxData() : ProcedureReturn @gate_rx[0] : EndProcedure
+Procedure.i NetUdpRxLen() : ProcedureReturn gate_rxLen : EndProcedure
+
+XIncludeFile "Anvil/Core/wallclock.pbi"
+XIncludeFile "Anvil/Core/sntp_codec.pbi"
+XIncludeFile "Anvil/Core/ntp_service.pbi"
+
+Procedure GatePut32(*p, v.i)
+  PokeA(*p, (v >> 24) & $FF)
+  PokeA(*p + 1, (v >> 16) & $FF)
+  PokeA(*p + 2, (v >> 8) & $FF)
+  PokeA(*p + 3, v & $FF)
+EndProcedure
+
+Procedure GateReply(rawSeconds.i, fraction.i)
+  Define i.i
+  For i = 0 To 47 : gate_rx[i] = 0 : Next
+  gate_rx[0] = $24
+  gate_rx[1] = 2
+  For i = 0 To 7 : gate_rx[24 + i] = gate_tx[40 + i] : Next
+  GatePut32(@gate_rx[0] + 40, rawSeconds)
+  GatePut32(@gate_rx[0] + 44, fraction)
+  gate_rxLen = 48
+  gate_rxFrom = gate_lastDst
+  gate_rxPort = 123
+  gate_rxDstPort = gate_lastSrcPort
+  gate_rxTo = gate_ip[gate_lastKind]
+EndProcedure
+
+Procedure GateStep(ms.i)
+  gate_ms = ms
+  gate_ticks = ms
+  NtpServiceTick()
+EndProcedure
+
+Procedure.i Main()
+  Define before.i
+  Define epoch.i
+  Define due.i
+
+  gate_usable[#HW_LINK_WIRED] = 1
+  gate_usable[#HW_LINK_WIFI] = 1
+  gate_ip[#HW_LINK_WIRED] = $C0A88901
+  gate_ip[#HW_LINK_WIFI] = $C0A80110
+  gate_dns[#HW_LINK_WIFI] = $C0A80102
+  gate_preferred = #HW_LINK_WIFI
+  gate_routeKind = #HW_LINK_WIFI
+  gate_ntp[#HW_LINK_WIFI] = $C0A8012A
+  GateCopy(@gate_server[0], "203.0.113.10", 127)
+  GateCopy(@gate_zone[0], "America/Chicago", 31)
+  If NtpServerNameValid(@gate_server[0]) = 0 : ProcedureReturn 34 : EndIf
+  If ParseDotted(@gate_server[0]) <> $CB00710A : ProcedureReturn 35 : EndIf
+
+  ; Boot only restores local state. It cannot send, resolve or wait.
+  WallClockInit()
+  WallClockSetZoneName(@gate_zone[0])
+  NtpServiceBoot()
+  If gate_sends <> 0 Or gate_arps <> 0 : ProcedureReturn 1 : EndIf
+  If GateEq(WallClockZoneName(), "America/Chicago") = 0 : ProcedureReturn 2 : EndIf
+
+  ; Explicit server wins over DHCP option 42 and binds the routed Wi-Fi row.
+  GateStep(1000)
+  If NtpServiceState() <> #NTP_SERVICE_NTP_SEND : ProcedureReturn 3 : EndIf
+  GateStep(1001)
+  If NtpServiceState() <> #NTP_SERVICE_NTP_WAIT : ProcedureReturn 4 : EndIf
+  If gate_lastKind <> #HW_LINK_WIFI Or gate_lastDst <> $CB00710A : ProcedureReturn 5 : EndIf
+  If gate_lastDstPort <> 123 Or gate_lastLen <> 48 : ProcedureReturn 6 : EndIf
+
+  ; Wrong interface is not this service's packet. A wrong server on the right
+  ; listener is consumed/rejected; neither can mutate or transmit in callback.
+  GateReply(1208988800, $40000000)
+  gate_inInput = 1
+  If NtpServiceInput(#HW_LINK_WIRED) <> 0 : ProcedureReturn 7 : EndIf
+  gate_inInput = 0
+  gate_rxFrom = $CB00710B
+  gate_inInput = 1
+  If NtpServiceInput(#HW_LINK_WIFI) = 0 : ProcedureReturn 8 : EndIf
+  gate_inInput = 0
+  If NtpServiceRejects() <> 1 Or NtpServiceState() <> #NTP_SERVICE_NTP_WAIT : ProcedureReturn 9 : EndIf
+  If gate_reentrantIo <> 0 : ProcedureReturn 10 : EndIf
+
+  ; A forged originate timestamp is refused; the exact tuple+nonce succeeds.
+  GateReply(1208988800, $40000000)
+  gate_rx[24] = gate_rx[24] ! 1
+  gate_inInput = 1
+  NtpServiceInput(#HW_LINK_WIFI)
+  gate_inInput = 0
+  If NtpServiceRejects() <> 2 : ProcedureReturn 11 : EndIf
+  GateReply(1208988800, $40000000)
+  gate_ticks = 2000 : gate_ms = 2000
+  gate_inInput = 1
+  If NtpServiceInput(#HW_LINK_WIFI) = 0 : ProcedureReturn 12 : EndIf
+  gate_inInput = 0
+  If NtpServiceState() <> #NTP_SERVICE_APPLY : ProcedureReturn 13 : EndIf
+
+  ; APPLY is deliberately delayed five seconds. The receive anchor plus the
+  ; half-RTT estimate must preserve elapsed time instead of setting stale time.
+  GateStep(7000)
+  epoch = WallClockNtp32ToEpoch(1208988800)
+  If WallClockNow() <> epoch + 5 : ProcedureReturn 14 : EndIf
+  If WallClockSource() <> #WALLCLOCK_SRC_SNTP Or WallClockTrusted() = 0 : ProcedureReturn 15 : EndIf
+  If NtpServiceSuccesses() <> 1 Or NtpServiceState() <> #NTP_SERVICE_HOLD : ProcedureReturn 16 : EndIf
+
+  ; A manual refresh that loses its address closes ownership and backs off;
+  ; the synchronized wall clock remains valid as holdover.
+  NtpServiceRequestNow()
+  GateStep(7100) : GateStep(7101)
+  gate_usable[#HW_LINK_WIFI] = 0
+  GateStep(7200)
+  If NtpServiceLastError() <> #NTP_SERVICE_E_ADDRESS_LOST : ProcedureReturn 17 : EndIf
+  If WallClockValid() = 0 : ProcedureReturn 18 : EndIf
+  gate_usable[#HW_LINK_WIFI] = 1
+
+  ; Permanent ARP failure is one bounded attempt followed by normal backoff,
+  ; never an endless four-requests-per-second loop.
+  NtpServiceRequestNow()
+  gate_noArp = 1 : gate_arps = 0
+  GateStep(8000) : GateStep(8001)
+  GateStep(8251) : GateStep(8501) : GateStep(8751) : GateStep(9001)
+  GateStep(9251) : GateStep(9501) : GateStep(9751) : GateStep(10001)
+  GateStep(10251) : GateStep(10501) : GateStep(10751) : GateStep(11001)
+  GateStep(11251)
+  If NtpServiceLastError() <> #NTP_SERVICE_E_TIMEOUT : ProcedureReturn 19 : EndIf
+  If NtpServiceState() <> #NTP_SERVICE_SELECT : ProcedureReturn 20 : EndIf
+  If gate_arps > 13 : ProcedureReturn 21 : EndIf
+  before = gate_arps
+  GateStep(12000)
+  If gate_arps <> before : ProcedureReturn 22 : EndIf
+  gate_noArp = 0
+
+  ; With no explicit server, DHCP option 42 is interface-bound and precedes
+  ; the public default hostname. Invalid/offline paths report, never block.
+  gate_server[0] = 0
+  NtpServiceReload()
+  GateStep(20000)
+  If NtpServiceServerSource() <> #NTP_SERVER_DHCP Or NtpServiceKind() <> #HW_LINK_WIFI : ProcedureReturn 23 : EndIf
+  If NtpServiceServerIp() <> $C0A8012A : ProcedureReturn 24 : EndIf
+  gate_ntp[#HW_LINK_WIFI] = 0
+  gate_usable[#HW_LINK_WIRED] = 0 : gate_usable[#HW_LINK_WIFI] = 0
+  NtpServiceReload() : GateStep(21000)
+  If NtpServiceLastError() <> #NTP_SERVICE_E_NO_NETWORK : ProcedureReturn 25 : EndIf
+  gate_usable[#HW_LINK_WIRED] = 1
+  NtpServiceRequestNow() : GateStep(22000)
+  If NtpServiceLastError() <> #NTP_SERVICE_E_NO_DNS : ProcedureReturn 26 : EndIf
+
+  ; Default hostname DNS uses the only interface with a resolver. Its reply is
+  ; parsed/copied in the callback and the later tick owns packet construction.
+  gate_usable[#HW_LINK_WIFI] = 1
+  gate_dnsAccept = 1 : gate_dnsResult = $CB007114
+  NtpServiceRequestNow()
+  GateStep(30000)
+  If NtpServiceState() <> #NTP_SERVICE_DNS_SEND Or NtpServiceKind() <> #HW_LINK_WIFI : ProcedureReturn 27 : EndIf
+  GateStep(30001)
+  If GateEq(@gate_dnsQuery[0], "time.cloudflare.com") = 0 : ProcedureReturn 28 : EndIf
+  gate_rxTo = gate_ip[#HW_LINK_WIFI]
+  gate_rxFrom = gate_dns[#HW_LINK_WIFI]
+  gate_rxPort = 53 : gate_rxDstPort = 49202 : gate_rxLen = 20
+  gate_inInput = 1
+  If NtpServiceInput(#HW_LINK_WIFI) = 0 : ProcedureReturn 29 : EndIf
+  gate_inInput = 0
+  If gate_reentrantIo <> 0 : ProcedureReturn 30 : EndIf
+  GateStep(30002)
+  If gate_lastDst <> gate_dnsResult Or gate_lastKind <> #HW_LINK_WIFI : ProcedureReturn 31 : EndIf
+
+  ; Periodic refresh leaves HOLD only after the configured six-hour interval.
+  ntps_state = #NTP_SERVICE_HOLD
+  ntps_due = (40000 + #NTP_REFRESH_MS) & $FFFFFFFF
+  GateStep(40000)
+  If NtpServiceState() <> #NTP_SERVICE_HOLD : ProcedureReturn 32 : EndIf
+  GateStep((40000 + #NTP_REFRESH_MS) & $FFFFFFFF)
+  If NtpServiceState() = #NTP_SERVICE_HOLD : ProcedureReturn 33 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

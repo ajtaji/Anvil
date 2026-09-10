@@ -27,6 +27,31 @@ storage, interrupt control, clocks, console paths, network links, display, DMA,
 and watchdogs. The payload container is verified before entry and may request
 services through the ABI table. Pure computation can remain in a payload.
 
+Returning payloads must preserve the resident monitor and devices they have
+not claimed. Hardware controller lifetime is separate from logical interface
+identity: a GENET restart rebuilds its registers and rings without clearing
+addresses, lease deadlines, aliases or the radio's state. The return path
+evaluates elapsed lease time before using a restored network console. See
+[PAYLOAD_LIFECYCLE.md](PAYLOAD_LIFECYCLE.md) for the exact sequence and outstanding
+hardware checks.
+
+## Cooperative services and wall time
+
+The prompt advances bounded services rather than running an unbounded network
+operation in a clock callback. The common wall-clock core anchors UTC to a
+monotonic hardware counter, with distinct unset, restored-floor, manual and
+SNTP sources. Its network service validates the selected interface and reply
+transaction, but plain SNTP is not cryptographically authenticated. Public
+defaults use UTC; a named zone is an explicit saved setting, not an inference
+from a server location. Boards without a network backend retain the common
+manual clock and timezone interface. See [WALL_CLOCK.md](WALL_CLOCK.md).
+
+On the Pi, `ScreenServiceTick` pumps pending output and bounded banner updates.
+Boot and long radio phases invoke it at cooperative boundaries, outside the
+character producer and cryptographic primitive internals. Early output is
+retained until a scanning panel exists; that retained history is not described
+as live presentation on a previously dark panel.
+
 ## Driver modules: format and placement engine only
 
 `Anvil/Hal/module_format.pbi` is the canonical numeric definition of the

@@ -132,9 +132,9 @@ StackAddress $68000000
 ;  Full write-up: the vault's Environment/Build number note, and the
 ;  header of BuildNumber.pbi in the compiler tree.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 1        ; pmf:build
-#ANVIL_BUILD_DATE = 20260904   ; pmf:builddate
-#ANVIL_BUILD_TIME = 000000     ; pmf:buildtime
+#ANVIL_BUILD = 2        ; pmf:build
+#ANVIL_BUILD_DATE = 20260910   ; pmf:builddate
+#ANVIL_BUILD_TIME = 025227     ; pmf:buildtime
 
 ; ----------------------------------------------------------------------
 ;  1. THE Q'S HARDWARE BACKENDS.
@@ -354,6 +354,7 @@ XIncludeFile "ArduinoQ/Board/hw_i2c_q.unoq"
 ; true, and it must precede Anvil/Core/settings.pbi, which calls it.
 XIncludeFile "ArduinoQ/Board/hw_file_q.unoq"
 XIncludeFile "ArduinoQ/Board/qstubs_q.unoq"
+XIncludeFile "Anvil/Core/wallclock.pbi"
 ; The Q's HwBoard* answers - identity, reset and MMU state - and then the
 ; payload ABI itself. abi.pi4 is CORE and unedited for this board: it
 ; names no chip, and the three groups the Q cannot back (console, net,
@@ -409,6 +410,7 @@ XIncludeFile "Anvil/Core/usb_cmd.pbi"
 XIncludeFile "Anvil/Core/boot_cmd.pbi"
 XIncludeFile "Anvil/Core/fs_cmd.pbi"
 XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
 ; sha256.pi4 is pure computation with no chip in it at all, which is why
 ; it lives in Anvil/Core rather than under a board. The bootloader below
 ; needs it: the hash check before a payload is entered is mandatory.
@@ -644,6 +646,7 @@ Procedure Main()
     PrintN("   this monitor is guesswork. Transfers may not time out.")
   EndIf
   gBootTicks = Ticks()
+  WallClockInit()
 
   hz = TickHz()
   If hz <= 0 Or hz > 1000000000
@@ -764,6 +767,7 @@ Procedure Main()
   ; happened in: devices, then the boot countdown, then the prompt and
   ; whatever is typed at it.
   BootFileWait()
+  TimeBoot()
 
   ; THE FAN POLICY, after the settings and before the prompt - the same
   ; place and the same reason as on the Pi 4. On this board #CAP_PWM is
@@ -908,6 +912,8 @@ Procedure Main()
       CmdSettingsSave()
     ElseIf WordIs("env") <> 0
       CmdEnv()
+    ElseIf WordIs("time") <> 0
+      CmdTime()
     ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
       CmdUptime()
     ElseIf WordIs("echo") <> 0

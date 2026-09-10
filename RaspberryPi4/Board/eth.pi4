@@ -52,11 +52,117 @@
 ; act and is what Anvil/Core/net_cmd.pbi calls; renaming this one would
 ; have gained nothing and moved a guarantee two other files depend on.
 Procedure EthDown()
-  If gEthUp = 0
-    ProcedureReturn
-  EndIf
+  ; gEthUp is the monitor's logical state, not a hardware interlock. A
+  ; half-failed start can have enabled receive DMA before that flag was set,
+  ; so always ask the idempotent driver stop to clear both enable paths.
   GenetStop()
   gEthUp = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The returning-payload hardware lease.
+;
+;  A payload may use the CPU, caches and explicitly handed-over devices;
+;  it does not own Anvil's image/BSS or unrelated devices. No recovery can
+;  make arbitrary corruption of the monitor's RAM meaningful again, and
+;  none is claimed here. GENET is different: its receive DMA is a live bus
+;  master before the jump, so Anvil explicitly disables it and cannot enter
+;  the payload unless the enable bits read back clear after a system barrier.
+;  That is the strongest boundary this driver exposes: it proves the stop
+;  writes reached the Device register block and were accepted there. It is
+;  NOT a hardware idle/empty acknowledgement and cannot rule out a final
+;  already-issued write. The RX arena is therefore still monitor-owned and
+;  must not be repurposed by a returning payload.
+;
+;  The return value preserves only whether the wired controller was active.
+;  IP addresses, provenance, lease timers, aliases, UDP listeners and the
+;  direct-cable DHCP server already live in their owning software rows. They
+;  are neither copied nor cleared. EthPayloadResume performs a complete,
+;  bounded hardware start because the payload had the machine and the old
+;  peripheral register contents cannot be trusted.
+;
+;  RESULTS FROM EthPayloadQuiesce:
+;    -1  the stop command/readback boundary failed; DO NOT JUMP
+;     0  it was not active; nothing is owed on return
+;     1  it was active and must be restarted on return
+; ----------------------------------------------------------------------
+Procedure.i EthPayloadStopChecked()
+  Define cmd.i
+  Define tdma.i
+  Define rdma.i
+
+  If GenetStop() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Device accesses to GENET are ordered with one another by the MMU mapping,
+  ; and this dsb sy/isb makes the whole stop sequence complete before either
+  ; a payload instruction or a monitor DRAM reuse can follow it. Readback is
+  ; deliberately limited to the three enable fields the driver owns. There is
+  ; no cited GENETv5 "DMA idle" acknowledgement in this driver, so do not turn
+  ; these clear bits into a stronger claim than they make.
+  a64_barrier()
+  cmd  = PeekL(#GENET_BASE + #GENET_UMAC_CMD) & $FFFFFFFF
+  tdma = PeekL(#GENET_BASE + #GENET_TDMA_CTRL) & $FFFFFFFF
+  rdma = PeekL(#GENET_BASE + #GENET_RDMA_CTRL) & $FFFFFFFF
+  a64_barrier()
+  If (cmd & (#GENET_CMD_TX_EN | #GENET_CMD_RX_EN)) <> 0
+    ProcedureReturn 0
+  EndIf
+  If (tdma & #GENET_DMA_EN) <> 0 Or (rdma & #GENET_DMA_EN) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EthPayloadQuiesce()
+  Define was.i
+  was = 0
+  If gEthUp <> 0 Or GenetStarted() <> 0
+    was = 1
+  EndIf
+  If EthPayloadStopChecked() = 0
+    gEthUp = 0
+    PrintN("!! the Ethernet stop did not read back disabled, so the payload was")
+    PrintN("   NOT run. Running it with a bus master still writing into Anvil's")
+    PrintN("   receive memory would give two programs ownership of the same RAM.")
+    EthWhyGenet()
+    ProcedureReturn -1
+  EndIf
+  gEthUp = 0
+  ProcedureReturn was
+EndProcedure
+
+Procedure.i EthPayloadReclaim()
+  ; This is called IMMEDIATELY after CallAddr, with the monitor's caches still
+  ; in their handoff state. A payload may have started or partly programmed
+  ; GENET even when it was down before entry, so software flags are irrelevant.
+  If EthPayloadStopChecked() = 0
+    gEthUp = 0
+    ProcedureReturn 0
+  EndIf
+  gEthUp = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EthPayloadResume(was.i)
+  ; EthPayloadReclaim already established the stop/readback boundary before
+  ; cache, display, DHCP or console recovery. This procedure only restores the
+  ; physical controller that was active before entry.
+  If was = 0
+    ProcedureReturn 1
+  EndIf
+  PrintN("The wired controller was active before the payload. Reinitialising it")
+  PrintN("from hardware now; the wait is bounded by the Ethernet link timeout.")
+  If eth_HwUp() = 0
+    ; eth_HwUp leaves gEthUp clear and stops every partially-started DMA
+    ; path. The caller still returns to the local console and reports x0.
+    PrintN("!! the payload returned, but the wired controller did not come back.")
+    PrintN("   Its saved network identity is retained; no inactive link is being")
+    PrintN("   reported as active. Fix the link and type net up to try it again.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -104,9 +210,8 @@ EndProcedure
 ;  RETURNS:
 ;    2  already up and the link is still there - the caller need not
 ;       reconfigure, net.pi4's wired row still holds whatever IP it had;
-;    1  freshly brought up - the wired row's MAC is set in net.pi4 and
-;       its addresses have been cleared, so the caller must (re)apply
-;       any IP itself;
+;    1  freshly brought up - the wired row's MAC is revalidated in net.pi4;
+;       its existing logical address, lease, alias and listeners are kept;
 ;    0  it did not come up, and the reason has been printed.
 ;
 ;  WHY THIS EXISTS. Until ping, dns and dhcp were added, this bring-up
@@ -116,27 +221,22 @@ EndProcedure
 ;  the TFTP server, get and put need all four. One shared core is the
 ;  reason the four paths cannot drift about how the GENET comes up.
 ;
-;  IT CLEARS THE WIRED ROW AND NO OTHER ROW, and that sentence is the
-;  whole of a defect this port nearly shipped. It used to call
-;  NetInit(), which resets the WHOLE stack. Under one shared identity
-;  that was the same thing - there was only the one - and with a row per
-;  interface it TAKES THE RADIO' ADDRESS AWAY as a side effect of
-;  bringing the cable up: the radio re-writes its own row on the next
-;  keepalive tick so the address comes back, but every frame it builds
-;  in between is built from an unconfigured row, and nothing anywhere
-;  reports it. That is the 2026-09-07 defect wearing the other coat, and
-;  `ifconfig eth0 up` does not touch wlan0.
+;  IT CLEARS NO ADDRESS ROW. It used to call NetInit(), which reset the
+;  whole stack, and was narrowed to NetClearIPv4(WIRED). That was still
+;  hardware start erasing logical state: a returning payload or `net down`
+;  followed by `net up` lost a live lease, a link-local primary, the
+;  direct-cable alias and its listener. A controller reset invalidates its
+;  registers and DMA rings, not the software identity above it. The MAC is
+;  re-applied below and the wired ARP entries are flushed; the address row,
+;  DHCP client/server machines and listeners keep their own lifecycle.
 ;
-;  THE ARP CACHE IS STILL FLUSHED WHOLE, deliberately: a freshly
-;  restarted MAC means every entry learned before it is about a
-;  conversation that no longer exists, and the neighbour cache is one
-;  table shared by both interfaces, so there is no per-interface half of
-;  it to flush. Losing the radio' gateway entry costs one ARP exchange
-;  and it re-resolves itself; keeping a stale one costs a frame sent to
-;  a station that is not there.
+;  THE WIRED ARP ROWS ARE STILL FLUSHED deliberately: a freshly restarted
+;  MAC means every entry learned through its old incarnation is suspect.
+;  The radio's independently learned neighbours are not touched.
 ;
-;  The wired row' MAC is set again immediately below, and the IP is the
-;  caller' to reapply.
+;  The wired row's MAC is set again immediately below. An ordinary caller
+;  may still apply a new address afterward; a payload return keeps the one
+;  that was already bound.
 ; ----------------------------------------------------------------------
 Procedure.i eth_HwUp()
   If gEthUp = 1
@@ -232,11 +332,15 @@ Procedure.i eth_HwUp()
     ProcedureReturn 0
   EndIf
 
-  ; The stack's tunables, this port's row, and the shared neighbour
-  ; cache - and nothing that belongs to another interface. See IT CLEARS
-  ; THE WIRED ROW AND NO OTHER ROW in the header above.
-  NetDefaults()
-  NetClearIPv4(#HW_LINK_WIRED)
+  ; Initialise mutable defaults only on the first software attachment.
+  ; A hardware restart must not silently replace a checksum policy or any
+  ; listener state the running monitor deliberately selected.
+  If NetMacSet(#HW_LINK_WIRED) = 0
+    NetDefaults()
+  EndIf
+  ; The controller has new rings, so neighbours learned through its old
+  ; incarnation are stale. Flush only this interface; the radio keeps its
+  ; independently learned neighbours and its entire identity row.
   NetArpFlush(#HW_LINK_WIRED)
   If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0
     PrintN("!! the network stack refused this board's hardware address, so nothing")

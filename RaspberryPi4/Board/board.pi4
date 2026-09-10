@@ -1161,7 +1161,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 23        ; pmf:build
+#ANVIL_BUILD = 24        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1170,7 +1170,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260910   ; pmf:builddate
-#ANVIL_BUILD_TIME = 011333     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 025227     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -1179,6 +1179,7 @@ StackAddress $8000000
 ; ======================================================================
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "Anvil/Core/wallclock.pbi"
 XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
 XIncludeFile "RaspberryPi4/Lib/clocks.pi4"
 ; safety.pi4 is here for its PM/watchdog half only - the boot-count
@@ -1460,6 +1461,9 @@ XIncludeFile "RaspberryPi4/Lib/wifi.pi4"
 ; under HwLink*.
 XIncludeFile "RaspberryPi4/Board/hw_link.pi4"
 XIncludeFile "RaspberryPi4/Lib/link.pi4"
+XIncludeFile "Anvil/Core/netfmt.pbi"
+XIncludeFile "Anvil/Core/sntp_codec.pbi"
+XIncludeFile "Anvil/Core/ntp_service.pbi"
 ; THE NETWORK CONSOLE - one console, on EVERY interface that holds an
 ; address. It was inside wifi.pi4 until 2026-09-07 and was called the
 ; wireless console; it named the radio in every line, so a board reachable
@@ -1753,6 +1757,7 @@ XIncludeFile "RaspberryPi4/Board/cursor_input.pi4"
 CompilerIf #ANVIL_V3D_CONSOLE = 1
 XIncludeFile "RaspberryPi4/Board/v3d_console.pi4"
 CompilerEndIf
+XIncludeFile "RaspberryPi4/Board/banner_clock.pi4"
 XIncludeFile "RaspberryPi4/Board/screen_cmd.pi4"
 XIncludeFile "RaspberryPi4/Board/power.pi4"
 XIncludeFile "RaspberryPi4/Board/storage.pi4"
@@ -1770,9 +1775,9 @@ XIncludeFile "RaspberryPi4/Board/hw_usb.pi4"
 XIncludeFile "Anvil/Core/fs_cmd.pbi"
 XIncludeFile "Anvil/Core/argfmt.pbi"
 XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
 XIncludeFile "Anvil/Core/wifi_cmd.pbi"
 XIncludeFile "RaspberryPi4/Board/eth_globals.pi4"
-XIncludeFile "Anvil/Core/netfmt.pbi"
 XIncludeFile "RaspberryPi4/Board/eth_mac.pi4"
 XIncludeFile "Anvil/Core/netcfg.pbi"
 ; netll - RFC 3927 link-local, the THIRD way this board can hold an
@@ -2024,6 +2029,7 @@ Procedure Main()
   ; reset. CNTPCT_EL0 is cleared by a reboot, so this is zero-based per
   ; boot with nothing to subtract.
   gBootTicks = Ticks()
+  WallClockInit()
 
   ; Two seconds of silence ends a transfer. ubsend.py pauses 4 ms
   ; between records in S-record mode and 600 ms after the command, and
@@ -2041,6 +2047,7 @@ Procedure Main()
   gHaveEntry = 0
   gMbx = 0
 
+  ScreenEarlyLogStart()
   Banner()
 
   ; ------------------------------------------------------------------
@@ -2066,12 +2073,16 @@ Procedure Main()
   ;  arrives on the wire either way.
   ; ------------------------------------------------------------------
   BootConfigUp()
+  TimeBoot()
+  NtpServiceBoot()
   ScreenUp()
+  ScreenEarlyLogFinish()
   TouchBoot()
+  WifiSetProgressHook(@ScreenServiceTick)
   ; Draw whatever is already waiting the instant the glass is up, so the
   ; screen shows it immediately rather than holding it - with the whole
   ; network bring-up behind it - until the first prompt.
-  ScreenPump()
+  ScreenServiceTick()
   BootNetUp()
   ; THE DRAM AUTOBOOT RECORD FIRST, THE PERSISTED BOOT TARGET SECOND, and
   ; the order is the precedence. BootWait() takes `autoboot <addr>`, which
@@ -2093,7 +2104,7 @@ Procedure Main()
   ; the DMA engine did not bind. See V3dConAutoStart for the honest cost.
   CompilerIf #ANVIL_V3D_CONSOLE = 1
   V3dConAutoStart()
-  ScreenPump()
+  ScreenServiceTick()
   CompilerEndIf
 
   ; THE FAN, LAST, AND AFTER THE SETTINGS ARE IN. FanBoot() resets the
@@ -2105,7 +2116,7 @@ Procedure Main()
   ; temperature nobody has read yet. It prints one line when a fan is
   ; configured and nothing at all when one is not.
   FanBoot()
-  ScreenPump()
+  ScreenServiceTick()
 
   Repeat
     ; "pmf> " IS A PROTOCOL STRING - the five characters, the space
@@ -2429,6 +2440,8 @@ Procedure Main()
     ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0   ; i
       CmdInfo()
 
+    ElseIf WordIs("time") <> 0
+      CmdTime()
     ElseIf WordIs("clock") <> 0 Or LetterIs(99) <> 0   ; c
       CmdClock()
 

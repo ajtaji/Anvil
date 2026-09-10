@@ -93,8 +93,8 @@ The optional Pi 4 stub has a separate, explicit build using a compiler with
 
 ```sh
 python3 tools/build.py armstub --pmfc pmfc
-python3 tools/a64/a64_el3_check.py --pmfc pmfc
-python3 tools/a64/el3_runtime_emitted_check.py --pmfc pmfc
+python3 tools/a64/a64_el3_check.py --pmfc /path/to/pmfc
+python3 tools/a64/el3_runtime_emitted_check.py --pmfc /path/to/pmfc
 ```
 
 This produces `build/pi4/armstub8.bin`; it is not part of `all` and is **not
@@ -103,6 +103,32 @@ tests, but EL3 hardware boot is not yet verified. Secure interrupt handling,
 secondary-core activation and the EL3-to-EL1 handoff remain incomplete. Do not
 change boot configuration without physical recovery access. The stub retains
 its upstream [BSD-3-Clause notice](RaspberryPi4/Board/armstub8.asm).
+
+### Live time and returning applications
+
+The common wall clock supports UTC, named U.S. Central time with daylight-saving
+rules, and fixed offsets. On a network-capable board, synchronization runs as
+bounded background work; an unreachable time server does not hold the prompt.
+An unset clock or saved time floor is visibly unsynchronized, never presented
+as a running battery-backed RTC.
+
+```text
+time
+time sync
+time zone America/Chicago
+settings save
+```
+
+`time sync` is available only with a network backend. UNO Q currently supports
+the common manual clock and zone commands, not network synchronization.
+See [wall-clock commands and trust boundaries](docs/WALL_CLOCK.md).
+
+Returning applications have an explicit
+[hardware ownership and Ethernet recovery contract](docs/PAYLOAD_LIFECYCLE.md).
+The monitor stops active Ethernet DMA before entry and rebuilds the previously
+active controller after return without erasing another interface or an
+unexpired lease. These new service paths have desk gates; their remaining
+silicon checks are documented separately from a completion claim.
 
 ### Boot and runtime assets
 
@@ -149,6 +175,18 @@ repository-local path. The module gate, for example, is:
 ```sh
 python3 tools/module_engine_check.py
 ```
+
+The interpreter's lazy floating-point dependency has its own isolated host
+gate, so a private installation cannot hide a missing exported helper:
+
+```sh
+python3 tools/a64/interpreter_dependency_check.py
+```
+
+The matching differential diagnostic sources are under
+`RaspberryPi4/Examples/Diagnostics/`. They are not installed or run by a normal
+build. Follow their hardware-state and recovery prerequisites before any
+on-board use.
 
 ## Deliberately incomplete work
 

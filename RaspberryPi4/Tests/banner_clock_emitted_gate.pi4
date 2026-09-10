@@ -1,0 +1,116 @@
+; Executed-code gate for the production banner overlay.
+; DIAGNOSTIC. No MMIO, GPU submission, DMA, or real cache operation occurs.
+
+XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
+
+#CUR_W = 8
+#CUR_H = 14
+#CUR_COLOUR = $FFF09A32
+#BANNER_CLOCK_Y = 94
+#BANNER_CLOCK_H = 16
+#BANNER_CLOCK_MAX = 127
+
+#BC_PANEL_W = 128
+#BC_PANEL_H = 160
+#BC_PITCH = #BC_PANEL_W * 4
+#BC_SLOT_BYTES = $20000
+#BC_OUT = $06000000
+#BC_META = $06800000
+
+Global gScreen.i = 1
+Global gScreenBg.i = $FF101820
+Global gCursorGpuOwned.i = 1
+Global gCurShown.i = 1
+Global gCurX.i = 12
+Global gCurY.i = #BANNER_CLOCK_Y
+Global Dim gCurMask.i[#CUR_H]
+Global gBannerClockX.i = 10
+Global gBannerClockW.i = 16
+Global gBannerClockChars.i = 1
+Global gBannerClockMs.i
+Global Dim gBannerClockText.a[#BANNER_CLOCK_MAX + 1]
+Global Dim gBannerClockNext.a[#BANNER_CLOCK_MAX + 1]
+Global probeSlot.i
+Global probeCleanCalls.i
+Global probeMirrorOn.i
+Global probePumpCalls.i
+
+; Hardware/service boundaries used by banner_clock.pi4 but not exercised here.
+Procedure.i DisplayRGB(r.i, g.i, b.i) : ProcedureReturn ($FF000000 | (r << 16)) | (g << 8) | b : EndProcedure
+Procedure MmuCleanRange(addr.i, bytes.i)
+  PokeI(#BC_META + probeSlot * $1000 + probeCleanCalls * 16, addr)
+  PokeI(#BC_META + probeSlot * $1000 + probeCleanCalls * 16 + 8, bytes)
+  probeCleanCalls = probeCleanCalls + 1
+EndProcedure
+Procedure.i millis() : ProcedureReturn 0 : EndProcedure
+Procedure.i WallClockCaption() : ProcedureReturn ?probeCaption : EndProcedure
+Procedure BannerClockCopy(dst.i, src.i, lim.i) : EndProcedure
+Procedure.i BannerClockSame(a.i, b.i) : ProcedureReturn 1 : EndProcedure
+Procedure CursorRestore(x.i, y.i) : EndProcedure
+Procedure CursorSave(x.i, y.i) : EndProcedure
+Procedure CursorDraw(x.i, y.i) : EndProcedure
+Procedure DisplayFlushRect(x.i, y.i, w.i, h.i) : EndProcedure
+Procedure ScrPresent(y0.i, y1.i) : EndProcedure
+Procedure BannerClockDrawLogical(caption.i) : EndProcedure
+Procedure.i ScrCaptureSnapshot(a.i, b.i, c.i, d.i, e.i, f.i, g.i, h.i) : ProcedureReturn 0 : EndProcedure
+Procedure ScreenPump() : probePumpCalls = probePumpCalls + 1 : EndProcedure
+Procedure ScreenBannerTick() : EndProcedure
+Procedure UartMirror(on.i) : probeMirrorOn = on : EndProcedure
+
+XIncludeFile "RaspberryPi4/Board/banner_clock.pi4"
+
+Procedure ProbeOne(slot.i, rot.i)
+  Define base.i
+  Define r.i
+  base = #BC_OUT + slot * #BC_SLOT_BYTES
+  probeSlot = slot
+
+  ; Two real font bits distinguish glyph coordinates from the cleared cell.
+  For r = 0 To 15
+    PokeA(?dsp_font8x16 + (65 - 32) * 16 + r, 0)
+  Next
+  PokeA(?dsp_font8x16 + (65 - 32) * 16, $80)
+  PokeA(?dsp_font8x16 + (65 - 32) * 16 + 1, $40)
+
+  PresentedOverlayClock(base, #BC_PITCH, rot, #BC_PANEL_W, #BC_PANEL_H, ?probeCaption)
+  gCurMask[0] = $80
+  gCurMask[1] = $40
+  PresentedOverlayCursor(base, #BC_PITCH, rot, #BC_PANEL_W, #BC_PANEL_H)
+
+  gPresentedOverlayRect\x = gBannerClockX
+  gPresentedOverlayRect\y = #BANNER_CLOCK_Y
+  gPresentedOverlayRect\w = gBannerClockW
+  gPresentedOverlayRect\h = #BANNER_CLOCK_H
+  probeCleanCalls = 0
+  PresentedOverlaySyncRect(base, #BC_PITCH, rot, #BC_PANEL_W, #BC_PANEL_H, @gPresentedOverlayRect)
+  PokeI(#BC_META + slot * $1000 + $FF0, probeCleanCalls)
+EndProcedure
+
+Procedure.i Main()
+  ; Before a surface, capture arms and a failed/headless finish disarms. With
+  ; a surface, finish preserves capture and immediately services one repaint.
+  gScreen = 0
+  ScreenEarlyLogStart()
+  If probeMirrorOn <> 1 : ProcedureReturn 1 : EndIf
+  ScreenEarlyLogFinish()
+  If probeMirrorOn <> 0 Or probePumpCalls <> 0 : ProcedureReturn 2 : EndIf
+  gScreen = 1
+  ScreenEarlyLogStart()
+  ScreenEarlyLogFinish()
+  If probeMirrorOn <> 1 Or probePumpCalls <> 1 : ProcedureReturn 3 : EndIf
+
+  ProbeOne(0, 0)
+  ProbeOne(1, 90)
+  ProbeOne(2, 180)
+  ProbeOne(3, 270)
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  probeCaption:
+  Data.a 65,0
+  ; The gate seeds the two rows it reads. Keep this label last so the model's
+  ; deliberately sparse font writes cannot overwrite emitted code.
+  dsp_font8x16:
+  Data.a 0
+EndDataSection

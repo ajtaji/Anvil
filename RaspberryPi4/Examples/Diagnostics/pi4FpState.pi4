@@ -1,0 +1,621 @@
+; pi4FpState.pi4 - STAGE 0 of the hardware floating-point work. Read the
+;                   machine's actual FP trap configuration and print it.
+;                   Execute NO floating-point instruction. Change nothing.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   pmfc pi4FpState.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o fpstate.img
+;
+; ----------------------------------------------------------------------
+; WHY THIS EXISTS, AND WHY IT COMES BEFORE ANY OTHER FP WORK
+; ----------------------------------------------------------------------
+; The Cortex-A72 has a full FP and Advanced SIMD unit and this backend
+; does not emit a single FP instruction. The obvious next move is to
+; emit one. The reason that is the WRONG next move is that FP access at
+; EL2 is gated by CPTR_EL2.TFP, and if that bit is set the first `fmul`
+; does not compute anything - it raises a Trapped-FP-access exception
+; to EL2.
+;
+; This program is entered at EL2 and NOTHING IN THIS TREE INSTALLS AN
+; EXCEPTION VECTOR. Checked mechanically on 2026-08-26: a grep for
+; `vbar` across the whole RaspberryPi4 tree finds the assembler's
+; encoding table, the emulator's decode table and one comment in
+; mmu.pi4 listing register names - and no writer anywhere. VBAR_EL2 is
+; therefore whatever reset left it at, so an exception taken at EL2
+; branches into an address nobody chose.
+;
+; The observable result of that is A HANG WITH NO CONSOLE OUTPUT. Not a
+; fault message, not a wrong number - silence. That failure looks
+; identical to a dozen other failures (a bad load address, a stack in
+; the wrong place, a UART that never initialised), so a first attempt
+; that hangs would burn a session on the wrong hypothesis.
+;
+; This probe removes that ambiguity BEFORE any FP instruction is
+; assembled, by reading the gate register and printing it. It is free,
+; it cannot hang, and its answer decides whether the emitter has to
+; write CPTR_EL2 in the program prologue or merely check it.
+;
+; ----------------------------------------------------------------------
+; THIS IS SAFE, AND HERE IS THE ARGUMENT RATHER THAN THE ASSERTION
+; ----------------------------------------------------------------------
+; Every instruction this probe adds over an empty program is an `mrs`.
+; MRS reads. None of the five registers read here can fault at EL2, no
+; write is performed to any of them, and there is no floating-point
+; instruction anywhere in this file - which is the specific hazard the
+; probe exists to measure and therefore the specific thing it must not
+; contain. There is no sequence here for which a power cycle could be
+; needed.
+;
+; ARM THE DEADMAN ANYWAY, exactly as pi4MmuState.pi4 does and for the
+; same reason: the habit is the thing being maintained, not the
+; coverage. It costs one line.
+;
+; ----------------------------------------------------------------------
+; WHAT THE OUTPUT MEANS - read this BEFORE running it, not after
+; ----------------------------------------------------------------------
+; CPTR_EL2 is the line that matters, and specifically BIT 10.
+;
+; The architectural rule, quoted rather than recalled. The shared
+; pseudocode in Datasheets/arm-a64-instruction-set.txt:479887-479895
+; (AArch64_CheckFPAdvSIMDTrap) reads, for an execution at EL2 that is
+; not in a VHE host:
+;
+;     if PSTATE.EL IN {EL0, EL1, EL2} && EL2Enabled() then
+;         if ELIsInHost(EL2) then  ... FPEN form ...
+;         else
+;             if CPTR_EL2().TFP == '1' then
+;                 AArch64_AdvSIMDFPAccessTrap(EL2);
+;             end;
+;         end;
+;     end;
+;
+; and the CPACR_EL1 check that precedes it, at :479919-479929, applies
+; only when PSTATE.EL is EL0 or EL1. So at EL2, CPACR_EL1 is
+; IRRELEVANT and CPTR_EL2.TFP is the whole gate. That matters because
+; CPACR_EL1 is the register every ARM bring-up note talks about, and
+; writing it here would accomplish nothing at all while looking exactly
+; like a fix.
+;
+; BIT 10 CLEAR   FP and SIMD are usable at EL2 as the machine stands.
+;                An `fmul s0, s0, s1` will compute.
+;
+; BIT 10 SET     FP is TRAPPED. Every FP instruction becomes an
+;                exception into an uninstalled vector, i.e. a silent
+;                hang. The emitter must clear the bit before the first
+;                FP instruction in any program that uses one.
+;
+; WHAT THE FIRMWARE LEAVES BEHIND, from the source rather than from
+; memory. Datasheets/pi4/armstub8.S is the EL3 stub that runs before
+; us. At :115-117 it writes
+;
+;     /* Enable FP/SIMD */
+;     /* Bit 10 (TFP) is set to 0 */
+;     msr CPTR_EL3, xzr
+;
+; so the EL3 gate is open. It then writes SCTLR_EL2 at :136-141 and
+; erets to EL2h at :143-147. IT NEVER WRITES CPTR_EL2. Read the whole
+; file if you doubt it - it is 240 lines and `cptr` appears once.
+;
+; So CPTR_EL2 arrives at our code AT ITS RESET VALUE, and no document
+; on this machine states what that value is. The architecture makes
+; most of the register's bits UNKNOWN at reset; the Cortex-A72 TRM
+; would say what this part actually does, and the A72 TRM is not on
+; this machine - see THE MISSING DOCUMENTS at the foot of this file.
+;
+; THAT UNCERTAINTY IS PRECISELY WHY THIS PROBE EXISTS. Measure it.
+;
+; HCR_EL2 bit 34 (E2H) is the second line that matters, and it decides
+; how to READ the first one. CPTR_EL2 has two entirely different
+; layouts:
+;
+;     E2H == 0   the plain layout. Bit 10 is TFP, and TFP SET means
+;                trapped. Writing $33FF - all the RES1 bits and nothing
+;                else - opens the gate.
+;
+;     E2H == 1   the VHE layout. Bits 21:20 are FPEN and the polarity
+;                is INVERTED: 00 means DISABLED and 11 means enabled.
+;                Writing $33FF under this layout would leave FPEN at 00
+;                and TRAP EVERY FP INSTRUCTION - the exact bug this
+;                probe is here to prevent, wearing the costume of the
+;                fix.
+;
+; The Cortex-A72 is an ARMv8.0-A part and does not implement FEAT_VHE,
+; so E2H should read 0 and be RES0. armstub8.S never writes HCR_EL2 at
+; all, which is consistent. Both of those are expectations; the number
+; printed below is the measurement.
+;
+; BOTH QUESTIONS ARE ASKED BELOW, because they are different questions.
+; HCR_EL2.E2H says what the bit IS right now. ID_AA64MMFR1_EL1.VH, bits
+; 11:8, says whether the silicon can ever SET it - 0b0000 is NI - and
+; that register's encoding (3,0,0,7,1) is at
+; RaspberryPi4/Reference/llvm19.1.0_AArch64SystemOperands.td:757. If VH
+; reads NI then E2H is RES0 and the plain CPTR_EL2 layout is not merely
+; what is in force today, it is the only layout this part has. That is
+; the stronger answer and it is the one the emitter needs, because the
+; prologue has to be right on every boot and not only on the boot that
+; happened to be measured.
+;
+; ID_AA64PFR0_EL1 answers the prior question nobody has actually asked
+; on this board: IS THERE A FLOATING-POINT UNIT? Field FP at bits 19:16
+; reads 0b0000 for implemented and 0b1111 for not; field AdvSIMD at
+; 23:20 says the same for the SIMD half. Every FP instruction page
+; carries "if !IsFeatureImplemented(FEAT_FP) then
+; EndOfDecode(Decode_UNDEF)", so on a part without the unit an `fmul` is
+; not slow - it is UNDEFINED, which is another exception into the same
+; uninstalled vector and another silent hang wearing the same face as a
+; trap. The unit is mandatory on an ARMv8-A A-profile core and will be
+; there; asking costs one instruction and turns an assumption into a
+; reading.
+;
+; MIDR_EL1 is printed to identify the part, because every sentence
+; above about reset values and VHE is a sentence about a Cortex-A72
+; specifically. The A72's MIDR part number is $D08 in bits 15:4. If a
+; future board reports something else, none of the reasoning above has
+; been checked against it.
+;
+; SCTLR_EL2 is printed because it costs one line and because every
+; other stage-0 probe in this directory prints it, so the outputs stay
+; comparable. $30C50830 is the value armstub8.S:136-141 writes.
+;
+; ----------------------------------------------------------------------
+; WHAT THIS PROBE DELIBERATELY DOES NOT DO
+; ----------------------------------------------------------------------
+; IT DOES NOT WRITE CPTR_EL2. A stage-0 probe measures. Clearing the
+; trap is a change to machine state that the monitor has to survive
+; being returned to, and it belongs in the emitter's prologue where
+; every program gets it consistently, not in a diagnostic where it
+; would be a one-off that nothing else inherits.
+;
+; IT DOES NOT EXECUTE AN FP INSTRUCTION. Obviously. The whole point is
+; to find out whether doing so is safe.
+;
+; IT READS FPCR LAST, AND ONLY IF THE TRAP IS OPEN. This is the one
+; ordering constraint in the file and it is not decoration.
+;
+; FPCR is a floating-point register. An access to it is a floating-point
+; access, and the architecture traps floating-point accesses through the
+; same CPTR_EL2.TFP this probe exists to measure. If TFP is set, then
+; `mrs x0, fpcr` is not a read that returns a surprising number - it is
+; an exception into the uninstalled vector, and the probe hangs doing
+; the very thing it was written to make unnecessary. So CPTR_EL2 is read
+; first, TFP is tested, and FPCR is read only when the answer is that it
+; is safe.
+;
+; THAT PARTICULAR TRAP RULE IS NOT CITED, and the honesty is deliberate.
+; The MRS page (arm-a64-instruction-set.txt:43633) delegates to
+; AArch64_SysRegRead, whose per-register trap behaviour lives in the
+; System Register Descriptions volume, which is not on this machine. So
+; the ordering above is a PRECAUTION reasoned from what FPCR is, not a
+; quotation. It costs one branch. If the rule turns out not to apply,
+; nothing has been lost; if it does apply and the guard were missing,
+; the cost is a session spent debugging the diagnostic.
+;
+; ----------------------------------------------------------------------
+; WHAT IS STILL MISSING, AFTER THIS PROBE
+; ----------------------------------------------------------------------
+; The four registers this work needed are now encodable - FPCR, FPSR,
+; ID_AA64PFR0_EL1 and ID_AA64MMFR1_EL1 were added to A64SystemRegBase()
+; on 2026-08-26, cited to
+; RaspberryPi4/Reference/llvm19.1.0_AArch64SystemOperands.td.
+;
+; WHAT THAT TABLE DOES NOT GIVE IS FPCR's FIELD LAYOUT, and that is the
+; remaining gap. It is a table of (name, op0, op1, CRn, CRm, op2): it
+; says where FPCR lives and not which bit of it is which. Three of its
+; fields change ANSWERS rather than speed:
+;
+;   FZ    flushes subnormal inputs and results to zero. The shared
+;         pseudocode reads it at
+;         arm-a64-instruction-set.txt:507197 (`let fz : boolean =
+;         fpcr.FZ == '1' && ...` inside FPUnpackBase).
+;   DN    replaces a propagated NaN with the default NaN.
+;         arm-a64-instruction-set.txt:505977 (`if fpcr.DN == '1' then
+;         result = FPDefaultNaN{N}(fpcr)` inside FPProcessNaN).
+;   RMode selects the rounding mode.
+;
+; The pseudocode names all three and states the position of none of
+; them. A correctly-rounded software core computes as though all three
+; were zero, so if the part boots with FZ set then every subnormal
+; answer differs from software and nothing says so.
+;
+; SO THIS PROBE PRINTS FPCR RAW AND DECODES NOTHING FROM IT. That is the
+; same discipline mmu.pi4 applies to SCTLR_EL2 and for the same reason:
+; a raw hex value is a fact, and a decode built on a recalled bit
+; position is a fact-shaped guess wearing the same clothes. If the value
+; printed is zero, every field is zero whatever the layout is, and the
+; question stops mattering. If it is not zero, the layout has to be
+; obtained before anything is written back - see THE MISSING DOCUMENTS.
+;
+; ----------------------------------------------------------------------
+; THE MISSING DOCUMENTS - named exactly, so nobody has to go looking
+; ----------------------------------------------------------------------
+; TWO documents would close what is left, and neither is on this machine.
+;
+;   1. FPCR's FIELD LAYOUT - the positions of DN, FZ and RMode.
+;      Authoritative source: Arm DDI 0487, the A-profile Architecture
+;      Reference Manual, in the System Register Descriptions volume.
+;      That manual is roughly 14,000 pages behind a site that will not
+;      serve a PDF to a fetch, which is why this repo cites vendor
+;      tables instead - and this is the one question no vendor TABLE can
+;      answer, because a table of encodings is not a table of fields.
+;      A smaller fetchable source that does carry the positions would
+;      also do; it has to be a real source, not a remembered constant.
+;
+;      HOW BADLY IT IS NEEDED DEPENDS ON WHAT THIS PROBE PRINTS. If
+;      FPCR reads as zero on the board, the machine is already in the
+;      state a correctly-rounded software core assumes, and the layout
+;      is needed only to WRITE the register defensively rather than to
+;      understand it. If it reads non-zero, nothing can proceed until
+;      the layout is in hand.
+;
+;   2. The Cortex-A72 Technical Reference Manual, which would state the
+;      RESET VALUES of CPTR_EL2 and FPCR for this specific part. The
+;      architecture declines to define them, so only the implementer's
+;      manual knows.
+;
+;      THIS PROBE STANDS IN FOR THAT ONE, and is arguably the better
+;      source: it reports what the board in the room actually does, on
+;      the firmware that is actually on the card, rather than what the
+;      part is documented to do. Fetch the TRM only if a number printed
+;      below is surprising and needs explaining.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+
+; ----------------------------------------------------------------------
+;  The reads. One `mrs` each, in an ASM block, because this language has
+;  no syntax for a system register and the assembler does have the
+;  encoding. The idiom - ASM, one mrs into x0, fall out of the block,
+;  ProcedureReturn - is timer.pi4:198-214's and mmu.pi4:585-588's and is
+;  not invented here.
+;
+;  WHERE EACH ENCODING COMES FROM, so that a wrong number printed below
+;  can be traced to a table rather than to a guess:
+;    currentel          A64Assembler.pbi:446   hand-written, pre-dates the table
+;    midr_el1           A64Assembler.pbi:710   v6.12_arm64_sysreg.h:278
+;    sctlr_el2          A64Assembler.pbi:475   hand-written 2026-08-24
+;    hcr_el2            A64Assembler.pbi:476   hand-written 2026-08-24
+;    cptr_el2           A64Assembler.pbi:610   v6.12_arm64_sysreg.h:512
+;    fpcr               A64Assembler.pbi       llvm19.1.0_AArch64SystemOperands.td:990
+;    fpsr               A64Assembler.pbi       llvm19.1.0_AArch64SystemOperands.td:991
+;    id_aa64pfr0_el1    A64Assembler.pbi       llvm19.1.0_AArch64SystemOperands.td:744
+;    id_aa64mmfr1_el1   A64Assembler.pbi       llvm19.1.0_AArch64SystemOperands.td:757
+;
+;  cptr_el2 being present before this work started is worth naming: it
+;  arrived with the generated table, from v6.12_arm64_sysreg.h:512, and
+;  its value $D51C1140 is independently reproduced by
+;  llvm19.1.0_AArch64SystemOperands.td:951, which gives the same
+;  (3,4,1,1,2). Two unrelated vendor tables agreeing on the encoding of
+;  the one register this whole probe turns on.
+; ----------------------------------------------------------------------
+Procedure.i FpCurrentEl()
+  ASM
+    mrs x0, currentel
+  EndASM
+EndProcedure
+
+Procedure.i FpMidrEl1()
+  ASM
+    mrs x0, midr_el1
+  EndASM
+EndProcedure
+
+Procedure.i FpSctlrEl2()
+  ASM
+    mrs x0, sctlr_el2
+  EndASM
+EndProcedure
+
+Procedure.i FpHcrEl2()
+  ASM
+    mrs x0, hcr_el2
+  EndASM
+EndProcedure
+
+Procedure.i FpCptrEl2()
+  ASM
+    mrs x0, cptr_el2
+  EndASM
+EndProcedure
+
+; The two feature-identification registers. Reading either is an
+; ordinary system-register read and is not a floating-point access, so
+; these are safe to call before the trap has been established - which is
+; the order Main() uses them in.
+Procedure.i FpIdPfr0()
+  ASM
+    mrs x0, id_aa64pfr0_el1
+  EndASM
+EndProcedure
+
+Procedure.i FpIdMmfr1()
+  ASM
+    mrs x0, id_aa64mmfr1_el1
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THESE TWO ARE THE DANGEROUS ONES. DO NOT CALL THEM UNCONDITIONALLY.
+;
+;  FPCR and FPSR are floating-point registers, so an access to either is
+;  a floating-point access and is subject to the same CPTR_EL2.TFP this
+;  probe exists to measure. Calling one on a machine where the trap is
+;  closed takes an exception into an uninstalled vector, and the probe
+;  hangs with no output - which is precisely the failure it was written
+;  to make impossible to mistake for anything else.
+;
+;  Main() reads CPTR_EL2 first and calls these only when bit 10 is
+;  clear. The reasoning behind that ordering, and the admission that the
+;  trap rule for FPCR specifically is NOT quotable from any document on
+;  this machine, is in the header above under WHAT THIS PROBE
+;  DELIBERATELY DOES NOT DO.
+; ----------------------------------------------------------------------
+Procedure.i FpFpcr()
+  ASM
+    mrs x0, fpcr
+  EndASM
+EndProcedure
+
+Procedure.i FpFpsr()
+  ASM
+    mrs x0, fpsr
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PutHex16 - a full 64-bit value, all sixteen digits, always.
+;
+;  Copied deliberately from pi4MmuState.pi4 rather than shared, because
+;  a diagnostic that depends on another diagnostic is a diagnostic that
+;  stops building when somebody tidies the other one. The reasoning for
+;  sixteen digits with no zero suppression is that file's and still
+;  holds: "0000000030C50830" says the top half was read and was zero,
+;  and "30C50830" leaves open the possibility that only 32 bits were
+;  fetched.
+;
+;  No character literals - house rule. 48 is the code for the digit
+;  zero and 55 is the code for the letter A minus ten.
+; ----------------------------------------------------------------------
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*label, v.i)
+  UartWriteStr(*label)
+  UartWrite(36)                 ; the dollar sign that marks hex here
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure Verdict(*label, *text)
+  UartWriteStr(*label)
+  UartWriteStr(*text)
+  UartWriteNl()
+EndProcedure
+
+Procedure.i Main()
+  Define cptr.i
+  Define hcr.i
+  Define midr.i
+  Define pfr0.i
+  Define mmfr1.i
+  Define tfp.i
+  Define e2h.i
+  Define vh.i
+  Define fpfield.i
+  Define simdfield.i
+  Define part.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4FpState - stage 0, read only, no FP instruction")
+  UartWriteNl()
+  UartWriteNl()
+
+  ; --- everything that is safe to read unconditionally ---------------
+  ; None of these is a floating-point access, so none of them can be
+  ; caught by the trap being measured. CPTR_EL2 is read HERE, before
+  ; anything else needs it, because two later decisions depend on it:
+  ; the verdict, and whether FPCR may be touched at all.
+  midr  = FpMidrEl1()
+  cptr  = FpCptrEl2()
+  hcr   = FpHcrEl2()
+  pfr0  = FpIdPfr0()
+  mmfr1 = FpIdMmfr1()
+
+  Row("CurrentEL raw   ", FpCurrentEl())
+  Row("MIDR_EL1        ", midr)
+  Row("SCTLR_EL2       ", FpSctlrEl2())
+  Row("HCR_EL2         ", hcr)
+  Row("CPTR_EL2        ", cptr)
+  Row("ID_AA64PFR0_EL1 ", pfr0)
+  Row("ID_AA64MMFR1_EL1", mmfr1)
+
+  UartWriteNl()
+
+  ; --- the decoded fields, each printed as its own row ---------------
+  ;
+  ; DECODED HERE AND NOT IN mmu.pi4's style, and the difference is
+  ; deliberate. That file refuses to decode SCTLR_EL2 because no
+  ; document on this machine states its bit positions. These positions
+  ; ARE stated by documents on this machine, so decoding them is
+  ; reporting a fact rather than dressing up a guess:
+  ;
+  ;   CPTR_EL2 bit 10 is TFP. u-boot's own header at
+  ;   RaspberryPi4/Reference/v2025.01_arm_system.h:54 defines
+  ;   CPTR_EL2_RES1 as (3 << 12 | 0x3ff), which is $33FF - bits 13, 12
+  ;   and 9 down to 0. Bit 10 is conspicuously NOT in the RES1 set,
+  ;   which is exactly what you would expect of the one writable trap
+  ;   bit in that range, and the pseudocode quoted in this file's header
+  ;   names CPTR_EL2.TFP as the gate.
+  ;
+  ;   ID_AA64PFR0_EL1 field FP is bits 19:16 and field AdvSIMD is bits
+  ;   23:20, both on a scale where 0b0000 means implemented and 0b1111
+  ;   means not. Read out of the kernel's own field table on 2026-08-26
+  ;   ("SignedEnum 19:16 FP / 0b0000 IMP / 0b1111 NI").
+  ;
+  ;   ID_AA64MMFR1_EL1 field VH is bits 11:8, 0b0000 meaning FEAT_VHE is
+  ;   not implemented, from the same table.
+  ;
+  ;   HCR_EL2 bit 34 is E2H. This is the one position here that no file
+  ;   on this machine states outright, so it is stated as an ASSUMPTION
+  ;   and the raw HCR_EL2 is printed above regardless. If the raw value
+  ;   is zero the assumption cannot change the verdict, because every
+  ;   bit is clear - and if VH says FEAT_VHE is absent then E2H is RES0
+  ;   and the question is settled from the other direction as well.
+  ;
+  ;   MIDR_EL1 bits 15:4 are the part number. $D08 is the Cortex-A72.
+  part      = (midr >> 4) & $FFF
+  tfp       = (cptr >> 10) & 1
+  e2h       = (hcr >> 34) & 1
+  vh        = (mmfr1 >> 8) & $F
+  fpfield   = (pfr0 >> 16) & $F
+  simdfield = (pfr0 >> 20) & $F
+
+  Row("part number     ", part)
+  Row("PFR0 FP field   ", fpfield)
+  Row("PFR0 AdvSIMD    ", simdfield)
+  Row("MMFR1 VH field  ", vh)
+  Row("CPTR_EL2 bit 10 ", tfp)
+  Row("HCR_EL2  bit 34 ", e2h)
+
+  UartWriteNl()
+
+  ; --- is there a unit at all -----------------------------------------
+  ; Asked before the trap question, because "trapped" and "absent" have
+  ; the same symptom - an exception into a vector nobody installed - and
+  ; only this register can tell them apart.
+  If fpfield = $F
+    Verdict("VERDICT: ", "THIS PART REPORTS NO FLOATING-POINT UNIT.")
+    Verdict("         ", "ID_AA64PFR0_EL1.FP reads 0b1111, which is NI.")
+    Verdict("         ", "Every FP instruction is UNDEFINED here, not")
+    Verdict("         ", "merely trapped, and no CPTR_EL2 setting can")
+    Verdict("         ", "change that. Stop: the whole plan assumes a")
+    Verdict("         ", "unit that this reading says is not present.")
+    UartWriteNl()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- the verdict, spelled out --------------------------------------
+  ;
+  ; The numbers above are the finding; this is the convenience. It is
+  ; written out so that nobody at the bench has to compare two
+  ; sixteen-digit numbers by eye at the end of a long session.
+  ;
+  ; THE E2H TEST COMES FIRST because it decides what bit 10 even means.
+  ; A verdict on TFP that was reached without checking the layout is
+  ; not a verdict, it is a coin toss that happened to land right.
+  If e2h = 1
+    Verdict("VERDICT: ", "HCR_EL2.E2H is SET. CPTR_EL2 is in its VHE")
+    Verdict("         ", "layout and bit 10 is NOT TFP. Nothing below")
+    Verdict("         ", "applies. Do not write $33FF - under this")
+    Verdict("         ", "layout that clears FPEN and traps everything.")
+    Verdict("         ", "Stop and re-derive from the VHE field table.")
+  Else
+    If tfp = 0
+      Verdict("VERDICT: ", "FP and SIMD are USABLE at EL2 right now.")
+      Verdict("         ", "CPTR_EL2.TFP is clear, so an fmul computes")
+      Verdict("         ", "rather than trapping. The emitter should")
+      Verdict("         ", "STILL write the register, because this is")
+      Verdict("         ", "one board on one firmware and a reset value")
+      Verdict("         ", "no document states is not a guarantee.")
+    Else
+      Verdict("VERDICT: ", "FP IS TRAPPED. CPTR_EL2.TFP is set, so the")
+      Verdict("         ", "first fmul in any program would take an")
+      Verdict("         ", "exception into an uninstalled EL2 vector,")
+      Verdict("         ", "which presents as a hang with no output.")
+      Verdict("         ", "The emitter MUST clear it before emitting")
+      Verdict("         ", "any FP instruction. This is the finding the")
+      Verdict("         ", "probe exists for.")
+    EndIf
+  EndIf
+
+  UartWriteNl()
+
+  ; --- FPCR, and ONLY if the trap is open ------------------------------
+  ; See the header. FPCR is a floating-point register, so reading it is
+  ; a floating-point access; on a machine with TFP set this read is the
+  ; hang. The guard is the whole reason CPTR_EL2 was read first.
+  ;
+  ; NOTHING IS DECODED FROM THE VALUE. No document on this machine
+  ; states where DN, FZ or RMode sit inside FPCR, so the raw sixteen
+  ; digits are the honest output and a decode would be an invention.
+  ; What can be said without the layout is said: if the value is zero,
+  ; every field is zero whatever the layout, which is exactly the state
+  ; a correctly-rounded software implementation assumes.
+  If tfp = 0
+    Define fpcr.i
+    Define fpsr.i
+    fpcr = FpFpcr()
+    fpsr = FpFpsr()
+    Row("FPCR            ", fpcr)
+    Row("FPSR            ", fpsr)
+    UartWriteNl()
+    If fpcr = 0
+      Verdict("FPCR:    ", "zero. Every field is zero whatever the layout")
+      Verdict("         ", "is, so rounding is nearest-even, subnormals")
+      Verdict("         ", "are not flushed and NaN payloads propagate.")
+      Verdict("         ", "That is the state a correctly-rounded software")
+      Verdict("         ", "core assumes, so the differential gate can be")
+      Verdict("         ", "run without obtaining the field layout first.")
+    Else
+      Verdict("FPCR:    ", "NOT zero. Some field is set and this file")
+      Verdict("         ", "deliberately does not know which. Obtain the")
+      Verdict("         ", "layout from a real source before writing this")
+      Verdict("         ", "register or trusting a bit-exactness result -")
+      Verdict("         ", "FZ, DN and RMode each change ANSWERS. See THE")
+      Verdict("         ", "MISSING DOCUMENTS in this file's header.")
+    EndIf
+    UartWriteNl()
+  Else
+    Verdict("FPCR:    ", "NOT READ. CPTR_EL2.TFP is set, and an access")
+    Verdict("         ", "to FPCR is itself a floating-point access, so")
+    Verdict("         ", "reading it here would have hung this probe.")
+    UartWriteNl()
+  EndIf
+
+  ; --- the one remaining note ------------------------------------------
+  ; VH is reported separately from the E2H verdict because they answer
+  ; different questions and only the pair is conclusive: E2H is what the
+  ; bit is, VH is whether it could ever be anything else.
+  If vh = 0
+    Verdict("NOTE:    ", "MMFR1.VH is 0, so FEAT_VHE is not implemented")
+    Verdict("         ", "and HCR_EL2.E2H is RES0. The plain CPTR_EL2")
+    Verdict("         ", "layout is the only one this part has, on every")
+    Verdict("         ", "boot and not merely on this one.")
+    UartWriteNl()
+  Else
+    Verdict("NOTE:    ", "MMFR1.VH is NOT 0 - this part implements")
+    Verdict("         ", "FEAT_VHE, so E2H is writable and the CPTR_EL2")
+    Verdict("         ", "layout can change under software. The emitter")
+    Verdict("         ", "must read E2H rather than assume it.")
+    UartWriteNl()
+  EndIf
+
+  If part <> $D08
+    Verdict("NOTE:    ", "MIDR part number is not $D08, so this is not")
+    Verdict("         ", "a Cortex-A72 and none of the reasoning in this")
+    Verdict("         ", "file's header has been checked against it.")
+    UartWriteNl()
+  EndIf
+
+  UartDrain()
+
+  ; Back to the monitor. Zero is the boring answer and the one the
+  ; monitor prints as the payload's return value; the finding is in the
+  ; text above, not in this number.
+  ProcedureReturn 0
+EndProcedure

@@ -310,6 +310,8 @@ Procedure CallAddr()
 EndProcedure
 
 Procedure RunAt(a.i)
+  Define wasCached.i
+  Define wasEth.i
   ; The one place a payload is entered, so `g` and the autoboot cannot
   ; drift apart in what they check or what they print.
   ;
@@ -332,26 +334,6 @@ Procedure RunAt(a.i)
     PrintN("   and the two payload windows that help prints are the sensible ones.")
     ProcedureReturn 0
   EndIf
-  ; STOP THE ETHERNET BEFORE THE MACHINE CHANGES HANDS.
-  ;
-  ; The receive DMA engine is a bus master writing into #ETH_RX_BASE on
-  ; its own schedule, and it keeps doing that whatever the processor is
-  ; running. Handing the board to a payload with that engine live means
-  ; two writers in one address space with no agreement between them -
-  ; and the payload is arbitrary code that has never heard of this
-  ; monitor's memory map.
-  ;
-  ; It costs two register writes and it is unconditional, so a `run`
-  ; behaves identically whether or not anybody used the network first.
-  ; EthDown() returns immediately when the port was never up.
-  ;
-  ; NOT PUT BACK AFTERWARDS, on purpose. A payload that returns has had
-  ; the whole machine in the meantime; believing the controller is still
-  ; configured the way we left it would be a guess. The next get, put or
-  ; net up brings it up from the beginning, which is a second of link
-  ; wait and no doubt at all.
-  EthDown()
-
   gGoAddr = a
   gGoRc = 0
   ; x0 IS CLEARED HERE AND SET BY THE CALLER AFTERWARDS, in that order.
@@ -374,6 +356,24 @@ Procedure RunAt(a.i)
   PutAddr(a)
   PrintN(". Control leaves the monitor now, and")
   PrintN("anything printed below this line came from the payload, not from Anvil.")
+
+  ; A command launched over Ethernet must receive the entering notice before
+  ; the controller carrying it is stopped. The aux tap flushes on newlines,
+  ; but make the boundary explicit so a future wording change cannot strand
+  ; a partial line in the ring.
+  NetConsoleFlush()
+
+  ; STOP THE ETHERNET BEFORE THE MACHINE CHANGES HANDS. The receive DMA
+  ; engine is a bus master writing into #ETH_RX_BASE on its own schedule.
+  ; EthPayloadQuiesce records whether the port must be restored, stops the
+  ; hardware even if its software flags disagree, and fails closed if the
+  ; bus master cannot be proved stopped. There is no safe jump in that state.
+  wasEth = EthPayloadQuiesce()
+  If wasEth < 0
+    gGoX0 = 0
+    NetConsoleFlush()
+    ProcedureReturn 0
+  EndIf
 
   ; THE DEADMAN. If one is set, arm the PM watchdog immediately before
   ; the jump and stop it immediately after. A payload that returns gets
@@ -403,13 +403,35 @@ Procedure RunAt(a.i)
   ; order (MmuDisableCachedFlushed: clear C|M, then set/way clean). This is
   ; done INSIDE the deadman window armed just above, so a hang in the flush
   ; or the re-enable is caught by the watchdog rather than wedging the board.
-  Define wasCached.i
   wasCached = gCacheOn
   If wasCached <> 0
     CacheDisable()
   EndIf
 
   CallAddr()
+
+  ; RECLAIM GENET BEFORE TOUCHING CACHES, DISPLAY DMA OR NETWORK SOFTWARE.
+  ; A returning payload may have enabled this bus master even when Ethernet
+  ; was down on entry. The checked stop issues a system barrier and reads the
+  ; three owned enable fields back clear. GENET exposes no cited idle/empty
+  ; acknowledgement here, so this is a command/readback boundary, not proof
+  ; that no already-issued final write exists.
+  ;
+  ; Failure is terminal. Continuing into cache-table rebuild, display recovery
+  ; or a prompt would pretend RAM and the interface were safe while an
+  ; untrusted bus master may still be live. Drain the only reliable local
+  ; diagnostic and take the existing PM-watchdog route back to firmware.
+  If EthPayloadReclaim() = 0
+    PrintN("!! the payload returned, but GENET did not read back disabled.")
+    PrintN("   Cache, display and network recovery have NOT been attempted.")
+    PrintN("   The monitor is resetting rather than run beside an untrusted DMA master.")
+    EthWhyGenet()
+    Print("   The payload x0 value was ")
+    PutHex16(gGoRc)
+    PrintN(".")
+    UartDrain()
+    SafetyToFirmware()
+  EndIf
 
   ; THE HANDOVER VALUE IS SPENT. Clear it so that the next `run`, `g` or
   ; autoboot of a plain image cannot be handed a service-table pointer
@@ -457,6 +479,28 @@ Procedure RunAt(a.i)
     EndIf
   EndIf
 
+  ; Restore only a controller that was active before the handoff. GENET was
+  ; already reclaimed immediately after CallAddr. This is a
+  ; full bounded hardware start, not trust in peripheral registers left by
+  ; arbitrary code. eth_HwUp deliberately keeps the wired software row: its
+  ; primary address and provenance, link-local/served alias, DHCP machines
+  ; and UDP listeners have lifetimes independent of a MAC reset.
+  EthPayloadResume(wasEth)
+
+  ; The prompt did not tick while the payload owned the CPU. Advance lease
+  ; state against the real elapsed clock now, after physical links are back:
+  ; a still-valid lease survives, a T1/T2 deadline schedules renewal, and an
+  ; expired lease is removed rather than used for the return response. This
+  ; existing worker also advances a Wi-Fi lease by elapsed time without
+  ; resetting or rewriting the radio's identity.
+  NetDhcpTick()
+
+  ; Re-derive listening and exact peer ownership before the first final line.
+  ; If wired recovery failed or its lease expired, the stale peer is forgotten
+  ; and these lines remain available on the local UART instead of being sent
+  ; through an interface the monitor just said was down.
+  NetConsoleRearm()
+
   If gDead > 0
     SafetyWatchdogStop()
     PrintN("The payload came back, so the deadman watchdog has been stopped. The")
@@ -480,5 +524,9 @@ Procedure RunAt(a.i)
   PrintN(",")
   PrintN("which is whatever it chose to return. A stock image never returns at")
   PrintN("all, so seeing this line means the payload was built to come back.")
+  ; Close the command-response boundary for a network launcher. Per-line
+  ; flushing normally sent the prose above; this sends any tail a future edit
+  ; leaves behind while the restored controller and peer are still current.
+  NetConsoleFlush()
   ProcedureReturn 1
 EndProcedure

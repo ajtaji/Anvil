@@ -227,6 +227,106 @@ Procedure WifiShowSlot(s.i)
   PrintN(" characters, hidden)")
 EndProcedure
 
+; Print a duration counter without multiplying it (a long-running board can
+; overflow ticks * 1000). Totals are milliseconds; maxima are microseconds.
+Procedure wifi_BusTotal(label.i, ticks.i)
+  Define perMs.i
+  UartWriteStr(label)
+  perMs = SdioTickHz() / 1000
+  If perMs > 0
+    PrintDec(ticks / perMs)
+    PrintN(" ms")
+  Else
+    PrintDec(ticks)
+    PrintN(" ticks (counter frequency unavailable)")
+  EndIf
+EndProcedure
+
+Procedure wifi_BusMax(label.i, ticks.i)
+  Define perUs.i
+  UartWriteStr(label)
+  perUs = SdioTickHz() / 1000000
+  If perUs > 0
+    PrintDec(ticks / perUs)
+    PrintN(" us")
+  Else
+    PrintDec(ticks)
+    PrintN(" ticks (counter frequency unavailable)")
+  EndIf
+EndProcedure
+
+; Read-only radio transport evidence. Nothing here resets a counter or writes
+; a register, so before/after readings can be compared around one transfer.
+Procedure WifiBusStatus()
+  PrintN("Wi-Fi SDIO transport counters since this radio was brought up:")
+  Print("  bus ") : PrintDec(SdioClockKhz()) : Print(" kHz, ")
+  PrintDec(SdioBusWidth()) : Print("-bit; F2 block ")
+  PrintDec(Cyw43F2BlockSize()) : Print(" bytes, block mode ")
+  If Cyw43BlockMode() <> 0 : PrintN("ON") : Else : PrintN("OFF") : EndIf
+
+  Print("  CMD53 calls ") : PrintDec(SdioCmd53Calls())
+  Print(" (read ") : PrintDec(SdioCmd53ReadCalls())
+  Print(", write ") : PrintDec(SdioCmd53WriteCalls())
+  Print("); bytes requested ") : PrintDec(SdioCmd53Bytes())
+  Print("; failures ") : PrintDec(SdioCmd53Failures()) : PrintNl()
+  Print("  CMD53 block mode ") : PrintDec(SdioCmd53BlockCalls())
+  Print(", byte mode ") : PrintDec(SdioCmd53ByteCalls()) : PrintNl()
+  wifi_BusTotal("  CMD53 total service ", SdioCmd53Ticks())
+  wifi_BusMax("  slowest CMD53 ", SdioCmd53MaxTicks())
+  wifi_BusTotal("  waiting for buffer ready ", SdioCmd53ReadyTicks())
+  wifi_BusMax("  slowest buffer-ready wait ", SdioCmd53ReadyMaxTicks())
+  wifi_BusTotal("  waiting for transfer complete ", SdioCmd53EndTicks())
+  wifi_BusMax("  slowest transfer-complete wait ", SdioCmd53EndMaxTicks())
+
+  Print("  F2 reads ") : PrintDec(Cyw43F2ReadCalls())
+  Print(" / ") : PrintDec(Cyw43F2ReadBytes())
+  Print(" bytes requested; writes ") : PrintDec(Cyw43F2WriteCalls())
+  Print(" / ") : PrintDec(Cyw43F2WriteBytes())
+  Print(" bytes requested; failures ") : PrintDec(Cyw43F2Failures()) : PrintNl()
+  Print("  receive first reads ") : PrintDec(Cyw43RxFirstReads())
+  Print(", rest reads ") : PrintDec(Cyw43RxRestReads())
+  Print(", empty polls ") : PrintDec(Cyw43RxEmpty()) : PrintNl()
+  Print("  SDPCM channels: data ") : PrintDec(Cyw43RxDataChannel())
+  Print(", control ") : PrintDec(Cyw43RxControl())
+  Print(", event ") : PrintDec(Cyw43RxEvent())
+  Print(", glom ") : PrintDec(Cyw43RxGlom())
+  Print(", unknown ") : PrintDec(Cyw43RxUnknownChannel()) : PrintNl()
+  Print("  glom descriptors ") : PrintDec(Cyw43RxGlomDescriptors())
+  Print(", superframes ") : PrintDec(Cyw43RxGlomSuperframes()) : PrintNl()
+  Print("  data frames delivered ") : PrintDec(Cyw43RxDataFrames())
+  Print(", LOST in control waits ") : PrintDec(Cyw43RxDataLostInControlPoll())
+  Print(", TX-credit waits ") : PrintDec(Cyw43RxDataLostInCreditPoll())
+  Print(", event waits ") : PrintDec(Cyw43RxDataLostInEventPoll()) : PrintNl()
+  Print("  TX-credit polls ") : PrintDec(Cyw43CreditPolls())
+  Print(", still stalled after 5 ms ") : PrintDec(Cyw43Stalls()) : PrintNl()
+  Print("  SDPCM sequence mismatches ") : PrintDec(Cyw43RxSeqMismatch())
+  If Cyw43RxSeqMismatch() <> 0
+    Print("; last expected ") : PrintDec(Cyw43RxSeqLastExpected())
+    Print(", got ") : PrintDec(Cyw43RxSeqLastGot())
+  EndIf
+  PrintNl()
+  Print("  NEXTLEN offered ") : PrintDec(Cyw43RxNextLenCount())
+  Print(" times; largest ") : PrintDec(Cyw43RxNextLenMax() * 16) : PrintN(" bytes")
+  Print("  malformed: bad header ") : PrintDec(Cyw43RxBadHdr())
+  Print(", too large ") : PrintDec(Cyw43RxTooBig())
+  Print(", short ") : PrintDec(Cyw43RxShort()) : PrintNl()
+  If Cyw43RxBadHdr() <> 0
+    Print("    last bad length $") : PutHexN(Cyw43RxBadLastSize(), 4)
+    Print(", complement $") : PutHexN(Cyw43RxBadLastComplement(), 4) : PrintNl()
+  EndIf
+  If Cyw43RxTooBig() <> 0
+    Print("    oversized glom ") : PrintDec(Cyw43RxTooBigGlom())
+    Print("; last length ") : PrintDec(Cyw43RxTooBigLastSize())
+    Print(", raw channel $") : PutHexN(Cyw43RxTooBigLastChannel(), 2) : PrintNl()
+  EndIf
+  Print("  last SDIO error ") : PrintDec(SdioLastError())
+  Print(", interrupt $") : PutHexN(SdioLastIntr(), 8)
+  Print(", status $") : PutHexN(SdioLastStatus(), 8) : PrintNl()
+  PrintN("  These are observations, not a speed claim. After one transfer, compare")
+  PrintN("  tcp status for each socket; net's preferred-route footer does not identify")
+  PrintN("  this radio. A nonzero LOST count names a receive hole below TCP.")
+EndProcedure
+
 Procedure CmdWifi()
   Define v.i
   Define net.i
@@ -360,6 +460,11 @@ Procedure CmdWifi()
   ; ip / status - show this board's own MAC and address on the network.
   If WordIs("ip") <> 0 Or WordIs("status") <> 0 Or WordIs("addr") <> 0
     WifiPrintNet()
+    ProcedureReturn
+  EndIf
+
+  If WordIs("bus") <> 0 Or WordIs("transport") <> 0
+    WifiBusStatus()
     ProcedureReturn
   EndIf
 
@@ -1000,6 +1105,7 @@ Procedure CmdWifi()
   PrintN("  wifi scan                  which stored networks are on the air now")
   PrintN("  wifi join                  associate and key to a stored network")
   PrintN("  wifi ip                    this board's MAC and address")
+  PrintN("  wifi bus                   read-only SDIO/frame-loss counters")
   PrintN("  wifi rejoin                re-associate and re-lease right now")
   PrintN("  wifi link [on|off]         the keepalive + auto-reconnect, and its count")
   PrintN("  wifi drop                  simulate an access-point drop and watch it recover")

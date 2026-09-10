@@ -1,0 +1,261 @@
+; ======================================================================
+;  banner_clock.pi4 - live banner clock and bounded display service.
+;
+;  Include after console.pi4, cursor_input.pi4 and (when enabled)
+;  v3d_console.pi4. display.pi4 owns the layout and logical draw routine;
+;  this file owns the once-per-second presented update and boot/prompt pump.
+;
+;  No procedure here prints, polls a network, or waits. ScreenServiceTick
+;  may therefore be called after a boot progress line, but never from the
+;  UART producer callback. Its re-entry guard protects shared caption and
+;  renderer scratch if a future service path is accidentally nested.
+; ======================================================================
+
+Global gScreenServiceBusy.i = 0
+Structure PresentedOverlayRect
+  x.i
+  y.i
+  w.i
+  h.i
+EndStructure
+Global gPresentedOverlayRect.PresentedOverlayRect
+
+Procedure.i BannerClockIntersectsCursor()
+  If gCurShown = 0
+    ProcedureReturn 0
+  EndIf
+  If gCurX >= (gBannerClockX + gBannerClockW) Or (gCurX + #CUR_W) <= gBannerClockX
+    ProcedureReturn 0
+  EndIf
+  If gCurY >= (#BANNER_CLOCK_Y + #BANNER_CLOCK_H) Or (gCurY + #CUR_H) <= #BANNER_CLOCK_Y
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Write one logical overlay pixel into a snapshotted presented raster.
+; Cache maintenance is deliberately absent here; PresentedOverlaySyncRect
+; batches it by physical row once the complete rectangle has been written.
+Procedure PresentedOverlayPixel(base.i, pitch.i, rot.i, panelW.i, panelH.i, x.i, y.i, colour.i)
+  Define px.i
+  Define py.i
+  If x < 0 Or y < 0 Or x >= ScrLogicalW(rot, panelW, panelH) Or y >= ScrLogicalH(rot, panelW, panelH)
+    ProcedureReturn
+  EndIf
+  px = ScrMapX(rot, x, y, panelW, panelH)
+  py = ScrMapY(rot, x, y, panelW, panelH)
+  PokeL(base + py * pitch + px * 4, colour)
+EndProcedure
+
+; Clean the physical bounding rectangle corresponding to one logical rect.
+; A sideways logical strip becomes a narrow physical column: one clean per
+; physical row, never one clean per pixel and never a whole-frame clean.
+; The rectangle is an explicit context pointer so the call stays under the
+; compiler's eight-argument ABI without a hidden set-then-call contract.
+Procedure PresentedOverlaySyncRect(base.i, pitch.i, rot.i, panelW.i, panelH.i, *rect.PresentedOverlayRect)
+  Define ax.i
+  Define ay.i
+  Define bx.i
+  Define by.i
+  Define cx.i
+  Define cy.i
+  Define dx.i
+  Define dy.i
+  Define loX.i
+  Define hiX.i
+  Define loY.i
+  Define hiY.i
+  Define row.i
+  If *rect = 0 Or *rect\w < 1 Or *rect\h < 1
+    ProcedureReturn
+  EndIf
+  ax = ScrMapX(rot, *rect\x, *rect\y, panelW, panelH)
+  ay = ScrMapY(rot, *rect\x, *rect\y, panelW, panelH)
+  bx = ScrMapX(rot, *rect\x + *rect\w - 1, *rect\y, panelW, panelH)
+  by = ScrMapY(rot, *rect\x + *rect\w - 1, *rect\y, panelW, panelH)
+  cx = ScrMapX(rot, *rect\x, *rect\y + *rect\h - 1, panelW, panelH)
+  cy = ScrMapY(rot, *rect\x, *rect\y + *rect\h - 1, panelW, panelH)
+  dx = ScrMapX(rot, *rect\x + *rect\w - 1, *rect\y + *rect\h - 1, panelW, panelH)
+  dy = ScrMapY(rot, *rect\x + *rect\w - 1, *rect\y + *rect\h - 1, panelW, panelH)
+  loX = ax : hiX = ax : loY = ay : hiY = ay
+  If bx < loX : loX = bx : EndIf : If bx > hiX : hiX = bx : EndIf
+  If cx < loX : loX = cx : EndIf : If cx > hiX : hiX = cx : EndIf
+  If dx < loX : loX = dx : EndIf : If dx > hiX : hiX = dx : EndIf
+  If by < loY : loY = by : EndIf : If by > hiY : hiY = by : EndIf
+  If cy < loY : loY = cy : EndIf : If cy > hiY : hiY = cy : EndIf
+  If dy < loY : loY = dy : EndIf : If dy > hiY : hiY = dy : EndIf
+  row = loY
+  While row <= hiY
+    MmuCleanRange(base + row * pitch + loX * 4, (hiX - loX + 1) * 4)
+    row = row + 1
+  Wend
+  a64_barrier()
+EndProcedure
+
+Procedure PresentedOverlayClock(base.i, pitch.i, rot.i, panelW.i, panelH.i, *caption)
+  Define r.i
+  Define c.i
+  Define i.i
+  Define ch.i
+  Define bits.i
+  Define colour.i
+  Define fg.i
+  Define bg.i
+  bg = gScreenBg
+  fg = DisplayRGB(120, 132, 150)
+  r = 0
+  While r < #BANNER_CLOCK_H
+    c = 0
+    While c < gBannerClockW
+      PresentedOverlayPixel(base, pitch, rot, panelW, panelH, gBannerClockX + c, #BANNER_CLOCK_Y + r, bg)
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  i = 0
+  While i < gBannerClockChars
+    ch = PeekA(*caption + i)
+    If ch = 0
+      Break
+    EndIf
+    If ch >= 32 And ch <= 126
+      r = 0
+      While r < 16
+        bits = PeekA(?dsp_font8x16 + (ch - 32) * 16 + r)
+        c = 0
+        While c < 8
+          colour = bg
+          If (bits & (128 >> c)) <> 0
+            colour = fg
+          EndIf
+          PresentedOverlayPixel(base, pitch, rot, panelW, panelH, gBannerClockX + i * 8 + c, #BANNER_CLOCK_Y + r, colour)
+          c = c + 1
+        Wend
+        r = r + 1
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; The GPU cursor has no CPU save-under. When it intersects the clock, redraw
+; its mask after the clock so the time advances underneath a visible cursor.
+Procedure PresentedOverlayCursor(base.i, pitch.i, rot.i, panelW.i, panelH.i)
+  Define r.i
+  Define c.i
+  Define bits.i
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  r = 0
+  While r < #CUR_H
+    bits = gCurMask[r]
+    c = 0
+    While c < #CUR_W
+      If (bits & (128 >> c)) <> 0
+        PresentedOverlayPixel(base, pitch, rot, panelW, panelH, gCurX + c, gCurY + r, #CUR_COLOUR)
+      EndIf
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+Procedure BannerClockTick()
+  Define now.i
+  Define overlap.i
+  Define base.i
+  Define lw.i
+  Define lh.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+  Define y0.i
+  Define y1.i
+
+  If gScreen = 0 Or gBannerClockW < 8
+    ProcedureReturn
+  EndIf
+  now = millis()
+  If (now - gBannerClockMs) < 1000
+    ProcedureReturn
+  EndIf
+  BannerClockCopy(@gBannerClockNext[0], WallClockCaption(), gBannerClockChars)
+  gBannerClockMs = now
+  If BannerClockSame(@gBannerClockNext[0], @gBannerClockText[0]) <> 0
+    ProcedureReturn
+  EndIf
+  BannerClockCopy(@gBannerClockText[0], @gBannerClockNext[0], gBannerClockChars)
+  overlap = BannerClockIntersectsCursor()
+
+  If gCursorGpuOwned = 0
+    y0 = #BANNER_CLOCK_Y
+    y1 = #BANNER_CLOCK_Y + #BANNER_CLOCK_H - 1
+    If overlap <> 0
+      CursorRestore(gCurX, gCurY)
+      If gCurY < y0 : y0 = gCurY : EndIf
+      If (gCurY + #CUR_H - 1) > y1 : y1 = gCurY + #CUR_H - 1 : EndIf
+    EndIf
+    BannerClockDrawLogical(@gBannerClockText[0])
+    If overlap <> 0
+      CursorSave(gCurX, gCurY)
+      CursorDraw(gCurX, gCurY)
+      DisplayFlushRect(gCurX, gCurY, #CUR_W, #CUR_H)
+    EndIf
+    ScrPresent(y0, y1)
+    ProcedureReturn
+  EndIf
+
+  ; V3D owns a physical render target, so snapshot and update the actual
+  ; scan surface rather than interpreting that target as a logical raster.
+  If ScrCaptureSnapshot(@base, @lw, @lh, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    ProcedureReturn
+  EndIf
+  PresentedOverlayClock(base, pitch, rot, panelW, panelH, @gBannerClockText[0])
+  If overlap <> 0
+    PresentedOverlayCursor(base, pitch, rot, panelW, panelH)
+  EndIf
+  gPresentedOverlayRect\x = gBannerClockX
+  gPresentedOverlayRect\y = #BANNER_CLOCK_Y
+  gPresentedOverlayRect\w = gBannerClockW
+  gPresentedOverlayRect\h = #BANNER_CLOCK_H
+  PresentedOverlaySyncRect(base, pitch, rot, panelW, panelH, @gPresentedOverlayRect)
+  If overlap <> 0
+    gPresentedOverlayRect\x = gCurX
+    gPresentedOverlayRect\y = gCurY
+    gPresentedOverlayRect\w = #CUR_W
+    gPresentedOverlayRect\h = #CUR_H
+    PresentedOverlaySyncRect(base, pitch, rot, panelW, panelH, @gPresentedOverlayRect)
+  EndIf
+EndProcedure
+
+; Safe boot/prompt service boundary. Call after a meaningful progress line
+; or driver phase tick, never for every character and never from UartWrite.
+Procedure ScreenServiceTick()
+  If gScreenServiceBusy <> 0
+    ProcedureReturn
+  EndIf
+  gScreenServiceBusy = 1
+  ScreenPump()
+  BannerClockTick()
+  ScreenBannerTick()
+  gScreenServiceBusy = 0
+EndProcedure
+
+; Begin mirroring before a surface exists. ConDrainRing refuses while the
+; grid is uninitialised, so these bytes remain queued and are painted once
+; immediately after the panel starts scanning. This is retained history,
+; not a claim that a dark, pre-scan panel displayed its own bring-up live.
+Procedure ScreenEarlyLogStart()
+  UartMirror(1)
+EndProcedure
+
+Procedure ScreenEarlyLogFinish()
+  If gScreen = 0
+    UartMirror(0)
+    ProcedureReturn
+  EndIf
+  ScreenServiceTick()
+EndProcedure

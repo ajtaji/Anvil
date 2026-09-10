@@ -32,11 +32,11 @@
 ;  be heard, and that limitation is stated in the command's own output
 ;  rather than left to be discovered.
 ;
-;  WHAT IT ASKS FOR: the subnet mask (1), the router (3), the DNS servers
-;  (6) and the lease time (51), through the Parameter Request List (55).
+;  WHAT IT ASKS FOR: the subnet mask (1), router (3), DNS servers (6),
+;  NTP servers (42) and lease time (51), through Parameter Request List (55).
 ;  What it keeps from the reply: yiaddr, and options 1, 3 (first router),
-;  6 (first DNS server), 51 and 54 (the server identifier, which the
-;  REQUEST must echo). Anything else the server sends is stepped over.
+;  6 (first DNS server), 42 (first NTP server), 51 and 54 (the server
+;  identifier, which the REQUEST must echo). Anything else is stepped over.
 ;
 ;  ENDIANNESS as everywhere in this stack: multi-byte fields go through
 ;  net.pi4's net_GetBE16/net_GetBE32/net_PutBE16/net_PutBE32, and an
@@ -90,6 +90,7 @@
 #DHCP_OPT_SUBNET       = 1
 #DHCP_OPT_ROUTER       = 3
 #DHCP_OPT_DNS          = 6
+#DHCP_OPT_NTP          = 42
 #DHCP_OPT_REQ_IP       = 50
 #DHCP_OPT_LEASE        = 51
 #DHCP_OPT_MSG_TYPE     = 53
@@ -109,6 +110,7 @@ Global dhcp_yourIp.i          ; yiaddr
 Global dhcp_mask.i            ; option 1
 Global dhcp_gw.i              ; option 3, first router
 Global dhcp_dns.i             ; option 6, first server
+Global dhcp_ntp.i             ; option 42, first NTP server
 Global dhcp_lease.i           ; option 51, seconds
 Global dhcp_serverId.i        ; option 54
 Global dhcp_t1.i              ; option 58, seconds (0 means derive)
@@ -170,17 +172,18 @@ Procedure.i dhcp_Base(xid.i, *mac)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  dhcp_ParamList - write option 55, the four things we ask for, at `p`.
+;  dhcp_ParamList - write option 55, the five things we ask for, at `p`.
 ;  Returns the offset after it.
 ; ----------------------------------------------------------------------
 Procedure.i dhcp_ParamList(p.i)
   dhcp_out[p + 0] = #DHCP_OPT_PARAM_LIST
-  dhcp_out[p + 1] = 4
+  dhcp_out[p + 1] = 5
   dhcp_out[p + 2] = #DHCP_OPT_SUBNET
   dhcp_out[p + 3] = #DHCP_OPT_ROUTER
   dhcp_out[p + 4] = #DHCP_OPT_DNS
-  dhcp_out[p + 5] = #DHCP_OPT_LEASE
-  ProcedureReturn p + 6
+  dhcp_out[p + 5] = #DHCP_OPT_NTP
+  dhcp_out[p + 6] = #DHCP_OPT_LEASE
+  ProcedureReturn p + 7
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -303,7 +306,7 @@ Procedure.i DhcpBuildReboot(xid.i, *mac, rememberedIp.i)
   dhcp_out[p + 2] = #DHCP_REQUEST
   p = p + 3
   dhcp_out[p + 0] = #DHCP_OPT_REQ_IP
-  dhcp_out[p + 1] = 4
+  dhcp_out[p + 1] = 5
   net_PutBE32(@dhcp_out[p + 2], rememberedIp & $FFFFFFFF)
   p = p + 6
   p = dhcp_ParamList(p)
@@ -343,6 +346,7 @@ Procedure.i DhcpParseReplyFor(*p, n.i, xid.i, *mac)
   dhcp_mask = 0
   dhcp_gw = 0
   dhcp_dns = 0
+  dhcp_ntp = 0
   dhcp_lease = 0
   dhcp_serverId = 0
   dhcp_t1 = 0
@@ -420,6 +424,15 @@ Procedure.i DhcpParseReplyFor(*p, n.i, xid.i, *mac)
     ElseIf code = #DHCP_OPT_DNS
       If len >= 4
         dhcp_dns = net_GetBE32(*p + pos + 2)  ; the first server only
+      EndIf
+    ElseIf code = #DHCP_OPT_NTP
+      ; RFC 2132 section 8.3: a preference-ordered list of IPv4
+      ; addresses, with length a nonzero multiple of four.
+      If len >= 4 And (len % 4) = 0
+        dhcp_ntp = net_GetBE32(*p + pos + 2)  ; the first server only
+        If dhcp_ntp = 0 Or dhcp_ntp = $FFFFFFFF
+          dhcp_ntp = 0
+        EndIf
       EndIf
     ElseIf code = #DHCP_OPT_LEASE
       If len >= 4
@@ -647,6 +660,7 @@ Global Dim dhcpc_ip.i[#DHCPC_IFS]
 Global Dim dhcpc_mask.i[#DHCPC_IFS]
 Global Dim dhcpc_gw.i[#DHCPC_IFS]
 Global Dim dhcpc_dns.i[#DHCPC_IFS]
+Global Dim dhcpc_ntp.i[#DHCPC_IFS]
 Global Dim dhcpc_server.i[#DHCPC_IFS]
 Global Dim dhcpc_lease.i[#DHCPC_IFS]
 Global Dim dhcpc_t1.i[#DHCPC_IFS]
@@ -682,6 +696,7 @@ Procedure DhcpClientReset(kind.i)
   dhcpc_mask[kind] = 0
   dhcpc_gw[kind] = 0
   dhcpc_dns[kind] = 0
+  dhcpc_ntp[kind] = 0
   dhcpc_server[kind] = 0
   dhcpc_lease[kind] = 0
   dhcpc_t1[kind] = 0
@@ -791,6 +806,7 @@ Procedure.i DhcpClientInput(kind.i, *p, n.i, now.i)
     dhcpc_mask[kind] = dhcp_mask
     dhcpc_gw[kind] = dhcp_gw
     dhcpc_dns[kind] = dhcp_dns
+    dhcpc_ntp[kind] = dhcp_ntp
     dhcpc_server[kind] = dhcp_serverId
     dhcpc_lease[kind] = dhcp_lease
     dhcpc_t1[kind] = dhcp_t1
@@ -812,6 +828,9 @@ Procedure.i DhcpClientInput(kind.i, *p, n.i, now.i)
   dhcpc_ip[kind] = dhcp_yourIp
   dhcpc_gw[kind] = dhcp_gw
   dhcpc_dns[kind] = dhcp_dns
+  If dhcp_ntp <> 0
+    dhcpc_ntp[kind] = dhcp_ntp
+  EndIf
   dhcpc_server[kind] = dhcp_serverId
   dhcpc_lease[kind] = dhcp_lease
   dhcpc_t1[kind] = dhcp_t1
@@ -951,6 +970,10 @@ EndProcedure
 Procedure.i DhcpClientDns(kind.i)
   If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn dhcpc_dns[kind]
+EndProcedure
+Procedure.i DhcpClientNtp(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_ntp[kind]
 EndProcedure
 Procedure.i DhcpClientServer(kind.i)
   If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf

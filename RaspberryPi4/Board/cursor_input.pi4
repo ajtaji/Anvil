@@ -216,16 +216,16 @@ Procedure BootStep(*name)
   ; jumped straight to its "ok" eleven seconds later). UartDrain is
   ; spin-capped, so a dead port costs a sub-millisecond timeout, not a hang.
   ;
-  ; The HDMI screen: everything printed goes into a mirror ring that only
-  ; ScreenPump() drains onto the glass, and the prompt's ReadLine is the
-  ; only caller. So without this, the WHOLE bring-up log sits in the ring
+  ; The screen: everything printed goes into a mirror ring that the display
+  ; service drains onto the glass. So without this boundary, the WHOLE
+  ; bring-up log can sit in the ring
   ; and lands on the screen in one burst at the first prompt - the board
   ; "sits there then prints everything at once". Pumping here draws the
   ; label the instant it is written, so the screen shows what is being
-  ; started before the pause, exactly like the wire now does. ScreenPump
-  ; returns at once when there is no screen or nothing waiting.
+  ; started before the pause, exactly like the wire now does. The service
+  ; also advances bounded banner work, and returns at once with no screen.
   UartDrain()
-  ScreenPump()
+  ScreenServiceTick()
 EndProcedure
 Procedure BootOk(*name)
   ; UartWriteStr, NOT PrintN: *name is a pointer and PrintN routes by
@@ -234,9 +234,9 @@ Procedure BootOk(*name)
   If gBootLog <> 0
     UartWriteStr(*name)
     PrintNl()
-    ; Land the result on the HDMI screen now, next to the label BootStep
+    ; Land the result on the screen now, next to the label BootStep
     ; already drew - otherwise it waits in the mirror ring for the prompt.
-    ScreenPump()
+    ScreenServiceTick()
   EndIf
 EndProcedure
 

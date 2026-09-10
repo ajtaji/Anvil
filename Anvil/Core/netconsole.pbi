@@ -703,6 +703,12 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
         ProcedureReturn 1
       EndIf
     EndIf
+    ; DNS/SNTP ownership is exact-interface and exact-tuple. This callback
+    ; validates and copies bounded state only; packet construction and sends
+    ; remain in NtpServiceTick after receive scratch is no longer live.
+    If NtpServiceInput(kind) <> 0
+      ProcedureReturn 1
+    EndIf
     own = NetConsoleOfferUdp(*frame, kind)
     If own = 2
       netcon_SendStaged(kind)
@@ -1041,7 +1047,11 @@ Procedure NetDhcpSay(kind.i)
   Print(", drops ") : PrintDec(netdhcp_drops[kind]) : PrintNl()
   If DhcpClientState(kind) >= #DHCPC_BOUND
     Print("    address ") : PutIp(DhcpClientIp(kind))
-    Print(", server ") : PutIp(DhcpClientServer(kind)) : PrintNl()
+    Print(", server ") : PutIp(DhcpClientServer(kind))
+    If DhcpClientNtp(kind) <> 0
+      Print(", NTP ") : PutIp(DhcpClientNtp(kind))
+    EndIf
+    PrintNl()
     Print("    lease ") : PrintDec(DhcpClientLeaseLeft(kind))
     Print("/") : PrintDec(DhcpClientLease(kind))
     Print(" s; T1 ") : PrintDec(DhcpClientT1Left(kind))

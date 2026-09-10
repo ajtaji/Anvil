@@ -106,9 +106,9 @@ Procedure BootNetUp()
     ; costs nothing that a later lease does not recover.
     ; ------------------------------------------------------------------
   EthBootWired()
-  ScreenPump()
+  ScreenServiceTick()
   NetConsoleRearm()
-  ScreenPump()
+  ScreenServiceTick()
 
   ; Wi-Fi needs a saved network identity. Never invent one and never
   ; reuse a lease from SETTINGS.TXT as if it were DHCP state: the common
@@ -121,7 +121,7 @@ Procedure BootNetUp()
       PrintN("Wi-Fi was not started: SETTINGS.TXT contains no saved Wi-Fi network.")
       PrintN("Wired Ethernet remains available; add a Wi-Fi setting to enable radio boot.")
     EndIf
-    ScreenPump()
+    ScreenServiceTick()
     gBootLog = 0
     ProcedureReturn
   EndIf
@@ -131,12 +131,12 @@ Procedure BootNetUp()
     ; all at once when the prompt finally arrives. (wifi.pi4 stays free of
     ; any screen dependency - the pumps live here, in the monitor.)
   If WifiJoinKnown() <> 0
-      ScreenPump()
+      ScreenServiceTick()
       ; One bounded foreground slice starts the shared per-interface DHCP
       ; machine. If the access point answers later, that same transaction
       ; continues in the prompt; boot does not create a second retry loop.
       WifiDhcp()
-      ScreenPump()
+      ScreenServiceTick()
       ; ----------------------------------------------------------------
       ; AND THE RADIO GETS THE SAME ANSWER THE CABLE DOES.  2026-09-07.
       ;
@@ -183,7 +183,7 @@ Procedure BootNetUp()
           PutIp(NetIPv4(#HW_LINK_WIFI))
           PrintN(" (no DHCP answer).")
         EndIf
-        ScreenPump()
+        ScreenServiceTick()
       EndIf
       ; ARM FROM THE BOARD'S STATE, NOT FROM THIS PATH'S OWN RESULT.
       ; NetConsoleRearm arms when the IP layer holds an address that
@@ -200,11 +200,11 @@ Procedure BootNetUp()
       ; right: the console is already listening on the cable, which is
       ; the preferred interface, and the wireless join has not moved it.
       NetConsoleRearm()
-      ScreenPump()
+      ScreenServiceTick()
   Else
     PrintN("Wi-Fi did not join any saved network. The radio/firmware diagnostics above")
     PrintN("name the failed stage; wired Ethernet remains available for recovery.")
-    ScreenPump()
+    ScreenServiceTick()
   EndIf
   gBootLog = 0
 EndProcedure

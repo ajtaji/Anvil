@@ -1189,7 +1189,7 @@ EndProcedure
 ;  call for an EEPROM or a common sensor. This is the addition, not a
 ;  replacement, and I2cWrite / I2cRead are untouched.
 ;
-;  ---- THE RECIPE IS THE MANUAL'S, GENERALISED TO 7-BIT ----------------
+;  ---- THE RECIPE IS THE UPSTREAM DRIVER'S POLLED EQUIVALENT ------------
 ;
 ;  BCM2711 ARM Peripherals section 3.3.2 "Reading" (page 30) writes the
 ;  procedure out for a 10-bit address, where the low eight bits of the
@@ -1202,30 +1202,39 @@ EndProcedure
 ;        start bit, the slave address and the R/W bit (which is 1),
 ;        initiating the read
 ;
-;  So: set up and start a normal write, wait until the controller says it
-;  is ACTIVE, then re-aim DLEN at the read length and set READ|ST again.
-;  The controller emits Sr rather than a STOP because ST was set while the
-;  transfer was still running. That is the whole trick, and it is written
-;  down by Broadcom rather than inferred.
+;  There is a silicon-specific catch which that recipe does not make
+;  obvious. Linux's BCM2835/BCM2711 driver documents the controller state
+;  machine workaround and does NOT preload the FIFO. It starts the write
+;  empty, lets TXW prove the transfer is active, fills as much as TXD
+;  permits, and queues the read immediately when the last write byte has
+;  been put in the FIFO. Primary implementation reference:
 ;
-;  ---- WHY THE WRITE BYTES ARE PRE-LOADED, AND WHY wn IS CAPPED --------
+;    Linux 50d05c7c76c96b90462f24debacca971d2e86713
+;    drivers/i2c/busses/i2c-bcm2835.c:209-300
+;    https://github.com/torvalds/linux/blob/50d05c7c76c96b90462f24debacca971d2e86713/drivers/i2c/busses/i2c-bcm2835.c#L209-L300
 ;
-;  The manual's steps 1-4 put every write byte into the FIFO BEFORE ST is
-;  set, and this follows that. It is not laziness about feeding the FIFO
-;  mid-transfer: between ST and the TA poll there is a window in which we
-;  must not be doing anything else, and a driver that is simultaneously
-;  feeding bytes and watching for TA can miss TA on a short write. The
-;  FIFO is 16 bytes deep (section 3.2, I2CFIFO), so wn > 16 is REFUSED
-;  with #I2C_ARG rather than quietly truncated. Every caller this exists
-;  for writes two or three bytes.
+;  Waiting only for TA after PRELOADING is not equivalent. It can ask for
+;  READ before the controller has entered the TXW hold which makes the
+;  repeated-start transition reliable. That exact old sequence timed out
+;  on the Pi 4 display bus while ordinary STOP-separated MCU transfers
+;  still worked.
+;
+;  ---- WHY wn IS NOT CAPPED AT THE FIFO DEPTH --------------------------
+;
+;  TXW/TXD are the flow control. Long writes refill the FIFO on later TXW
+;  observations; short Goodix register pointers fit on the first one. The
+;  read is queued in the SAME TXW handling step that enqueues the last byte,
+;  just as the upstream interrupt handler does. Waiting for a second TXW or
+;  FIFO-empty indication can lose the active window and emit a STOP.
 ;
 ;  ---- THE ONE RACE, AND IT IS NAMED RATHER THAN IGNORED ---------------
 ;
-;  If the write phase were to finish entirely before we observe TA, the
+;  If the write phase were to finish entirely before we observe TXW, the
 ;  controller would have emitted a STOP and step 7 would begin a fresh
 ;  transaction - a plain read, with no Sr, which is precisely the silent
-;  wrong answer this procedure exists to prevent. So the TA wait ALSO
-;  watches DONE, and DONE-without-TA returns #I2C_NOSR and reads nothing.
+;  wrong answer this procedure exists to prevent. So the TXW wait ALSO
+;  watches DONE, and DONE-before-the-read returns #I2C_NOSR and reads
+;  nothing. DONE is checked before TXW, matching the upstream handler.
 ;
 ;  At 100 kHz a two-byte write takes about 270 microseconds and the poll
 ;  is a handful of nanoseconds, so this should never fire. "Should never"
@@ -1234,21 +1243,16 @@ EndProcedure
 ;  touch panel that reads the wrong register.
 ;
 ;  A NACK on the write phase is NOT this case - a NACK sets S.ERR, which
-;  is checked first, and comes back as #I2C_NACK.
+;  is checked first, and comes back as #I2C_NACK. Every combined-transfer
+;  error clears the FIFO/controller transaction state with I2cRecover;
+;  that preserves A, DIV and CLKT, including the selected slave address.
 ; ----------------------------------------------------------------------
 Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   Define s.i
   Define i.i
   Define spin.i
-  Define started.i
 
   If wn < 1 Or rn < 1 Or addr < 0 Or addr > $7F
-    ProcedureReturn #I2C_ARG
-  EndIf
-  If wn > 16
-    ; The FIFO is sixteen deep and the recipe pre-loads. Refusing is the
-    ; whole point: a truncated pointer write reads a wrong register and
-    ; returns data, which is the failure shape with no symptom.
     ProcedureReturn #I2C_ARG
   EndIf
 
@@ -1256,67 +1260,72 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   I2cWr(#BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
   I2cWr(#BSC_A_OFF, addr & $7F)
 
-  ; Empty the FIFO before loading it. CLEAR is written on its own, WITHOUT
-  ; ST, so it cannot start anything - and it is NOT repeated on the second
-  ; C write further down, because clearing the FIFO mid-transaction is not
-  ; part of the manual's recipe and would discard bytes already received.
+  ; Start with an EMPTY FIFO. Linux's BCM2835 controller driver names this
+  ; as part of the repeated-start state-machine workaround. CLEAR is written
+  ; without ST and is not repeated at the phase switch.
   I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)
 
   I2cWr(#BSC_DLEN_OFF, wn & $FFFF)
   i = 0
-  While i < wn
-    I2cWr(#BSC_FIFO_OFF, PeekA(*wbuf + i) & $FF)
-    i = i + 1
-  Wend
-
-  ; Step 4/5 of the recipe: start the write.
   I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST)
 
-  ; Step 5: wait for ACTIVE. Errors first, then DONE (the race above),
-  ; then TA - most specific first, exactly as I2cXfer orders them.
-  started = 0
+  ; The first TXW proves the un-prefilled transfer is active. Each TXW may
+  ; refill a partial FIFO. When the final byte is enqueued, queue READ|ST in
+  ; this same iteration - do not wait for another status transition.
   spin = #I2C_SPIN_MAX
   Repeat
     s = I2cRd(#BSC_S_OFF)
     If (s & #BSC_S_ERR) <> 0
-      I2cWr(#BSC_S_OFF, #BSC_S_ERR)
-      a64_barrier()
+      I2cRecover()
       ProcedureReturn #I2C_NACK
     EndIf
     If (s & #BSC_S_CLKT) <> 0
-      I2cWr(#BSC_S_OFF, #BSC_S_CLKT)
-      a64_barrier()
+      I2cRecover()
       ProcedureReturn #I2C_CLKT
     EndIf
-    If (s & #BSC_S_TA) <> 0
-      started = 1
-      Break
-    EndIf
     If (s & #BSC_S_DONE) <> 0
-      ; The write is over and a STOP went with it. Do NOT read.
-      I2cWr(#BSC_S_OFF, #BSC_S_DONE)
-      a64_barrier()
+      ; The write is over and a STOP went with it. Do NOT begin a plain read.
       I2cRecover()
       ProcedureReturn #I2C_NOSR
     EndIf
+
+    If (s & #BSC_S_TXW) <> 0
+      While i < wn
+        s = I2cRd(#BSC_S_OFF)
+        If (s & #BSC_S_ERR) <> 0
+          I2cRecover()
+          ProcedureReturn #I2C_NACK
+        EndIf
+        If (s & #BSC_S_CLKT) <> 0
+          I2cRecover()
+          ProcedureReturn #I2C_CLKT
+        EndIf
+        If (s & #BSC_S_DONE) <> 0
+          I2cRecover()
+          ProcedureReturn #I2C_NOSR
+        EndIf
+        If (s & #BSC_S_TXD) = 0
+          Break
+        EndIf
+        I2cWr(#BSC_FIFO_OFF, PeekA(*wbuf + i) & $FF)
+        i = i + 1
+        spin = #I2C_SPIN_MAX
+      Wend
+
+      If i = wn
+        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)
+        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)
+        Break
+      EndIf
+    EndIf
+
     spin = spin - 1
     If spin <= 0
-      a64_barrier()
       i2c_timeouts = i2c_timeouts + 1
       I2cRecover()
       ProcedureReturn #I2C_TIMEOUT
     EndIf
   ForEver
-
-  If started = 0
-    a64_barrier()
-    ProcedureReturn #I2C_NOSR
-  EndIf
-
-  ; Steps 6 and 7: re-aim DLEN and set READ|ST while the transfer is still
-  ; active. That is what makes the next bit on the wire a repeated START.
-  I2cWr(#BSC_DLEN_OFF, rn & $FFFF)
-  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)
 
   ; From here it is I2cXfer's read loop, and it is written out rather than
   ; called because I2cXfer owns the whole transaction from its own START.
@@ -1326,13 +1335,11 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     s = I2cRd(#BSC_S_OFF)
 
     If (s & #BSC_S_ERR) <> 0
-      I2cWr(#BSC_S_OFF, #BSC_S_ERR)
-      a64_barrier()
+      I2cRecover()
       ProcedureReturn #I2C_NACK
     EndIf
     If (s & #BSC_S_CLKT) <> 0
-      I2cWr(#BSC_S_OFF, #BSC_S_CLKT)
-      a64_barrier()
+      I2cRecover()
       ProcedureReturn #I2C_CLKT
     EndIf
 
@@ -1348,19 +1355,18 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
         PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
         i = i + 1
       Wend
-      I2cWr(#BSC_S_OFF, #BSC_S_DONE)
-      a64_barrier()
       If i < rn
         i2c_timeouts = i2c_timeouts + 1
         I2cRecover()
         ProcedureReturn #I2C_TIMEOUT
       EndIf
+      I2cWr(#BSC_S_OFF, #BSC_S_DONE)
+      a64_barrier()
       ProcedureReturn #I2C_OK
     EndIf
 
     spin = spin - 1
     If spin <= 0
-      a64_barrier()
       i2c_timeouts = i2c_timeouts + 1
       I2cRecover()
       ProcedureReturn #I2C_TIMEOUT

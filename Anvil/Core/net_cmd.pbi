@@ -2393,6 +2393,7 @@ Procedure.i CmdDhcp()
   Define mask.i
   Define gw.i
   Define dns.i
+  Define ntp.i
   Define serverId.i
   Define lease.i
 
@@ -2441,6 +2442,7 @@ Procedure.i CmdDhcp()
   mask = DhcpClientMask(kind)
   gw = DhcpClientGateway(kind)
   dns = DhcpClientDns(kind)
+  ntp = DhcpClientNtp(kind)
   serverId = DhcpClientServer(kind)
   lease = DhcpClientLeaseLeft(kind)
 
@@ -2453,6 +2455,8 @@ Procedure.i CmdDhcp()
   If gw = 0 : PrintN("none given") : Else : PutIp(gw) : PrintNl() : EndIf
   Print("  DNS       ")
   If dns = 0 : PrintN("none given") : Else : PutIp(dns) : PrintNl() : EndIf
+  Print("  NTP       ")
+  If ntp = 0 : PrintN("none given") : Else : PutIp(ntp) : PrintN(" (DHCP option 42)") : EndIf
   Print("  server    ") : PutIp(serverId) : PrintNl()
   Print("  lease     ") : PrintDec(lease) : PrintN(" seconds remaining")
   PrintN("The lease is runtime protocol state and is not written over saved static")

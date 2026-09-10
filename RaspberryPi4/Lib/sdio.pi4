@@ -1493,6 +1493,25 @@ Global sdio_resp1.i = 0
 Global sdio_resp2.i = 0
 Global sdio_resp3.i = 0
 
+; CMD53 service accounting. This is deliberately transport-neutral and
+; measurement-only: the counters are never consulted by a transfer. Two
+; counter reads per command bound its whole duration; the ready/end samples
+; reuse the timer already read by the timeout loops. Linux brcmfmac exposes
+; the analogous f2rxhdrs/f2rxdata/f2txdata and error counters.
+Global sdio_cmd53Calls.i = 0
+Global sdio_cmd53ReadCalls.i = 0
+Global sdio_cmd53WriteCalls.i = 0
+Global sdio_cmd53Bytes.i = 0
+Global sdio_cmd53BlockCalls.i = 0
+Global sdio_cmd53ByteCalls.i = 0
+Global sdio_cmd53Failures.i = 0
+Global sdio_cmd53Ticks.i = 0
+Global sdio_cmd53MaxTicks.i = 0
+Global sdio_cmd53ReadyTicks.i = 0
+Global sdio_cmd53ReadyMaxTicks.i = 0
+Global sdio_cmd53EndTicks.i = 0
+Global sdio_cmd53EndMaxTicks.i = 0
+
 
 ; ======================================================================
 ;  The clock. Two instructions each. Same form as emmc.pi4 and
@@ -2976,6 +2995,18 @@ EndProcedure
 ;  times more likely to stall in any one place, and a budget divided by
 ;  the block count would make a large transfer fail for being large.
 ; ----------------------------------------------------------------------
+Procedure sdio_Cmd53Done(t0.i, ok.i)
+  Define dt.i
+  dt = sdio_Ticks() - t0
+  sdio_cmd53Ticks = sdio_cmd53Ticks + dt
+  If dt > sdio_cmd53MaxTicks
+    sdio_cmd53MaxTicks = dt
+  EndIf
+  If ok = 0
+    sdio_cmd53Failures = sdio_cmd53Failures + 1
+  EndIf
+EndProcedure
+
 Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMode.i, incr.i)
   Define arg.i
   Define cmdtm.i
@@ -2987,6 +3018,8 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
   Define budget.i
   Define want.i
   Define p.i
+  Define xferT0.i
+  Define waitTicks.i
 
   If *buf = 0
     ProcedureReturn sdio_Fail(#SDIO_ERR_NULL_BUF)
@@ -3011,6 +3044,20 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
   ; this file exists to refuse, so the contradiction is refused instead.
   If blockMode = 0 And blocks <> 1
     ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_COUNT)
+  EndIf
+
+  xferT0 = sdio_Ticks()
+  sdio_cmd53Calls = sdio_cmd53Calls + 1
+  sdio_cmd53Bytes = sdio_cmd53Bytes + (blksz * blocks)
+  If dir = 1
+    sdio_cmd53ReadCalls = sdio_cmd53ReadCalls + 1
+  Else
+    sdio_cmd53WriteCalls = sdio_cmd53WriteCalls + 1
+  EndIf
+  If blockMode <> 0
+    sdio_cmd53BlockCalls = sdio_cmd53BlockCalls + 1
+  Else
+    sdio_cmd53ByteCalls = sdio_cmd53ByteCalls + 1
   EndIf
 
   arg = 0
@@ -3051,6 +3098,7 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
     ; branch and the command-stuck branch both call sdio_ResetLine(1)
     ; before returning. Adding a second reset would be harmless and
     ; would also be a claim that the first one is not trusted.
+    sdio_Cmd53Done(xferT0, 0)
     ProcedureReturn 0
   EndIf
 
@@ -3084,6 +3132,7 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
   ; ====================================================================
   If sdio_CheckR5() = 0
     sdio_ResetLine(1)
+    sdio_Cmd53Done(xferT0, 0)
     ProcedureReturn 0
   EndIf
 
@@ -3104,6 +3153,11 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
       intr = sdio_Rd(#SDIO_INT_STATUS)
       If (intr & want) <> 0
         sdio_Wr(#SDIO_INT_STATUS, want)
+        waitTicks = sdio_Ticks() - t0
+        sdio_cmd53ReadyTicks = sdio_cmd53ReadyTicks + waitTicks
+        If waitTicks > sdio_cmd53ReadyMaxTicks
+          sdio_cmd53ReadyMaxTicks = waitTicks
+        EndIf
         Break
       EndIf
       If (intr & #SDIO_INT_ERROR_MASK) <> 0
@@ -3113,6 +3167,12 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
         sdio_Wr(#SDIO_INT_STATUS, intr)
         sdio_ResetLine(1)
         sdio_err = #SDIO_ERR_DATA_ERROR
+        waitTicks = sdio_Ticks() - t0
+        sdio_cmd53ReadyTicks = sdio_cmd53ReadyTicks + waitTicks
+        If waitTicks > sdio_cmd53ReadyMaxTicks
+          sdio_cmd53ReadyMaxTicks = waitTicks
+        EndIf
+        sdio_Cmd53Done(xferT0, 0)
         ProcedureReturn 0
       EndIf
       If (sdio_Ticks() - t0) > budget
@@ -3120,6 +3180,12 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
         sdio_lastIntr = intr
         sdio_lastStat = sdio_Rd(#SDIO_STATUS)
         sdio_err = #SDIO_ERR_DATA_TMO
+        waitTicks = sdio_Ticks() - t0
+        sdio_cmd53ReadyTicks = sdio_cmd53ReadyTicks + waitTicks
+        If waitTicks > sdio_cmd53ReadyMaxTicks
+          sdio_cmd53ReadyMaxTicks = waitTicks
+        EndIf
+        sdio_Cmd53Done(xferT0, 0)
         ProcedureReturn 0
       EndIf
     ForEver
@@ -3148,6 +3214,11 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
     intr = sdio_Rd(#SDIO_INT_STATUS)
     If (intr & #SDIO_INT_DATA_END) <> 0
       sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_DATA_END)
+      waitTicks = sdio_Ticks() - t0
+      sdio_cmd53EndTicks = sdio_cmd53EndTicks + waitTicks
+      If waitTicks > sdio_cmd53EndMaxTicks
+        sdio_cmd53EndMaxTicks = waitTicks
+      EndIf
       Break
     EndIf
     If (intr & #SDIO_INT_ERROR_MASK) <> 0
@@ -3157,6 +3228,12 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
       sdio_Wr(#SDIO_INT_STATUS, intr)
       sdio_ResetLine(1)
       sdio_err = #SDIO_ERR_DATA_ERROR
+      waitTicks = sdio_Ticks() - t0
+      sdio_cmd53EndTicks = sdio_cmd53EndTicks + waitTicks
+      If waitTicks > sdio_cmd53EndMaxTicks
+        sdio_cmd53EndMaxTicks = waitTicks
+      EndIf
+      sdio_Cmd53Done(xferT0, 0)
       ProcedureReturn 0
     EndIf
     If (sdio_Ticks() - t0) > budget
@@ -3164,10 +3241,17 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
       sdio_lastIntr = intr
       sdio_lastStat = sdio_Rd(#SDIO_STATUS)
       sdio_err = #SDIO_ERR_XFER_TMO
+      waitTicks = sdio_Ticks() - t0
+      sdio_cmd53EndTicks = sdio_cmd53EndTicks + waitTicks
+      If waitTicks > sdio_cmd53EndMaxTicks
+        sdio_cmd53EndMaxTicks = waitTicks
+      EndIf
+      sdio_Cmd53Done(xferT0, 0)
       ProcedureReturn 0
     EndIf
   ForEver
 
+  sdio_Cmd53Done(xferT0, 1)
   ProcedureReturn 1
 EndProcedure
 
@@ -3465,6 +3549,19 @@ Procedure.i SdioInit()
   sdio_rca   = 0
   sdio_ocr   = 0
   sdio_nfunc = 0
+  sdio_cmd53Calls = 0
+  sdio_cmd53ReadCalls = 0
+  sdio_cmd53WriteCalls = 0
+  sdio_cmd53Bytes = 0
+  sdio_cmd53BlockCalls = 0
+  sdio_cmd53ByteCalls = 0
+  sdio_cmd53Failures = 0
+  sdio_cmd53Ticks = 0
+  sdio_cmd53MaxTicks = 0
+  sdio_cmd53ReadyTicks = 0
+  sdio_cmd53ReadyMaxTicks = 0
+  sdio_cmd53EndTicks = 0
+  sdio_cmd53EndMaxTicks = 0
 
   ; --- 1 ---------------------------------------------------------------
   sdio_hz = sdio_TickHz()
@@ -3973,6 +4070,62 @@ EndProcedure
 
 Procedure.i SdioClockKhz()
   ProcedureReturn sdio_clkKhz
+EndProcedure
+
+Procedure.i SdioTickHz()
+  ProcedureReturn sdio_hz
+EndProcedure
+
+Procedure.i SdioCmd53Calls()
+  ProcedureReturn sdio_cmd53Calls
+EndProcedure
+
+Procedure.i SdioCmd53ReadCalls()
+  ProcedureReturn sdio_cmd53ReadCalls
+EndProcedure
+
+Procedure.i SdioCmd53WriteCalls()
+  ProcedureReturn sdio_cmd53WriteCalls
+EndProcedure
+
+Procedure.i SdioCmd53Bytes()
+  ProcedureReturn sdio_cmd53Bytes
+EndProcedure
+
+Procedure.i SdioCmd53BlockCalls()
+  ProcedureReturn sdio_cmd53BlockCalls
+EndProcedure
+
+Procedure.i SdioCmd53ByteCalls()
+  ProcedureReturn sdio_cmd53ByteCalls
+EndProcedure
+
+Procedure.i SdioCmd53Failures()
+  ProcedureReturn sdio_cmd53Failures
+EndProcedure
+
+Procedure.i SdioCmd53Ticks()
+  ProcedureReturn sdio_cmd53Ticks
+EndProcedure
+
+Procedure.i SdioCmd53MaxTicks()
+  ProcedureReturn sdio_cmd53MaxTicks
+EndProcedure
+
+Procedure.i SdioCmd53ReadyTicks()
+  ProcedureReturn sdio_cmd53ReadyTicks
+EndProcedure
+
+Procedure.i SdioCmd53ReadyMaxTicks()
+  ProcedureReturn sdio_cmd53ReadyMaxTicks
+EndProcedure
+
+Procedure.i SdioCmd53EndTicks()
+  ProcedureReturn sdio_cmd53EndTicks
+EndProcedure
+
+Procedure.i SdioCmd53EndMaxTicks()
+  ProcedureReturn sdio_cmd53EndMaxTicks
 EndProcedure
 
 Procedure.i SdioDivisor()

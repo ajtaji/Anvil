@@ -387,6 +387,94 @@ Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i)
   ProcedureReturn x - x0
 EndProcedure
 
+; ======================================================================
+;  THE BANNER CLOCK'S LOGICAL BACKING
+;
+;  WallClockCaption() owns its return buffer, so the display copies it
+;  immediately. The copy is also the canonical text used by a V3D/front-
+;  surface overlay: no renderer retains a pointer into the clock core.
+; ======================================================================
+#BANNER_CLOCK_Y = 94
+#BANNER_CLOCK_H = 16
+#BANNER_CLOCK_GAP = 24
+#BANNER_CLOCK_MAX = 127
+
+Global Dim gBannerClockText.a[#BANNER_CLOCK_MAX + 1]
+Global Dim gBannerClockNext.a[#BANNER_CLOCK_MAX + 1]
+Global gBannerClockX.i = 0
+Global gBannerClockW.i = 0
+Global gBannerClockChars.i = 0
+Global gBannerClockMs.i = 0
+
+Procedure BannerClockCopy(*dst, *src, lim.i)
+  Define i.i
+  If lim < 0
+    lim = 0
+  EndIf
+  If lim > #BANNER_CLOCK_MAX
+    lim = #BANNER_CLOCK_MAX
+  EndIf
+  i = 0
+  While i < lim And PeekA(*src + i) <> 0
+    PokeA(*dst + i, PeekA(*src + i))
+    i = i + 1
+  Wend
+  PokeA(*dst + i, 0)
+EndProcedure
+
+Procedure.i BannerClockSame(*a, *b)
+  Define i.i
+  i = 0
+  While i <= #BANNER_CLOCK_MAX
+    If PeekA(*a + i) <> PeekA(*b + i)
+      ProcedureReturn 0
+    EndIf
+    If PeekA(*a + i) = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; Keep the immutable build label on the left and the anvil picture on the
+; right. On the 800-pixel portrait view a long trailing timezone label may
+; be clipped at a character boundary. Trust provenance is a caption prefix,
+; so clipping can never turn restored/manual time into an apparently trusted
+; network timestamp.
+Procedure BannerClockLayout()
+  Define left.i
+  Define right.i
+  left = 28 + DisplayTextWidth(AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME)) + #BANNER_CLOCK_GAP
+  right = DisplayWidth() - #ANVIL_PIC_W - #LOGO_MARGIN - 16
+  gBannerClockX = left
+  gBannerClockW = right - left
+  If gBannerClockW < 0
+    gBannerClockW = 0
+  EndIf
+  gBannerClockChars = gBannerClockW / 8
+  If gBannerClockChars > #BANNER_CLOCK_MAX
+    gBannerClockChars = #BANNER_CLOCK_MAX
+  EndIf
+  gBannerClockW = gBannerClockChars * 8
+EndProcedure
+
+; Draw into the renderer's logical surface. DrawBanner uses this for every
+; ordinary framebuffer banner and every HDMI V3D back-buffer banner. The
+; once-per-second service uses the same routine on the DMA/CPU tier.
+Procedure BannerClockDrawLogical(*caption)
+  Define savedAuto.i
+  If gBannerClockW < 8 Or *caption = 0
+    ProcedureReturn
+  EndIf
+  savedAuto = dsp_auto
+  DisplayAutoFlush(0)
+  DisplayFillRect(gBannerClockX, #BANNER_CLOCK_Y, gBannerClockW, #BANNER_CLOCK_H, gScreenBg)
+  DisplayTextClear(gBannerClockX, #BANNER_CLOCK_Y, *caption, DisplayRGB(120, 132, 150))
+  DisplayAutoFlush(savedAuto)
+  DisplayFlushRect(gBannerClockX, #BANNER_CLOCK_Y, gBannerClockW, #BANNER_CLOCK_H)
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  DrawBanner - the whole top band: title, subtitle, rule, and the anvil.
 ;
@@ -448,6 +536,13 @@ Procedure DrawBanner()
   ; Identity is permanently visible above the scrolling console and uses
   ; exactly the constants printed by `version`, including zero-padded time.
   DisplayTextClear(28, 94, AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME), steel)
+
+  ; The live clock shares the identity row without moving the title, build
+  ; label, rule or anvil. Copy now: WallClockCaption's buffer is temporary.
+  BannerClockLayout()
+  BannerClockCopy(@gBannerClockText[0], WallClockCaption(), gBannerClockChars)
+  BannerClockDrawLogical(@gBannerClockText[0])
+  gBannerClockMs = millis()
 
   ; ---- the rule that separates the banner from the console ------------
   ; Two lines rather than one: a bright hairline over a dim one reads as

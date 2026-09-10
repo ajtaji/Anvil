@@ -78,6 +78,22 @@
 Global gWifiLoaded.i = 0
 Global gWifiUp.i     = 0
 
+; Optional cooperative service hook. The radio remains independent of the
+; screen: it only announces completed lines and bounded wait slices. The board
+; may register its display service, while a payload may leave this at zero.
+Global *gWifiProgressHook = 0
+Global gWifiProgressBusy.i = 0
+Procedure WifiSetProgressHook(*fn)
+  *gWifiProgressHook = *fn
+EndProcedure
+Procedure wifi_Progress()
+  If *gWifiProgressHook <> 0 And gWifiProgressBusy = 0
+    gWifiProgressBusy = 1
+    gWifiProgressHook()
+    gWifiProgressBusy = 0
+  EndIf
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  wifi_PrintSsid - an SSID is bytes and a length, not a C string, so it
 ;  is printed a byte at a time. A byte below space or above ~ is shown
@@ -296,6 +312,7 @@ Procedure.i WifiRadioUp()
   Print("  firmware uploaded to the radio in ")
   PrintDec(millis() - upMs)
   PrintN(" ms.")
+  wifi_Progress()
   If Cyw43UploadNvram(#WIFI_NV_ADDR, #WIFI_NV_LEN, #WIFI_NV_WORK, #WIFI_NV_WORK_MAX, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN) = 0
     Print("!! ")
     UartWriteStr(Cyw43ErrorText())
@@ -659,6 +676,7 @@ Procedure.i wifi_Handshake()
         EndIf
       EndIf
     EndIf
+    wifi_Progress()
   Wend
   If keyed <> 0
     ; KEEP THE KEY MATERIAL. The KCK/KEK/PMK are needed to answer the
@@ -830,6 +848,8 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
   Define cached.i
   Define used.i
   Define hi.i
+  Define pskResult.i
+  Define oldProgress.i
   fp = wifi_Fp(ssid, ssidLen, pass, passLen)
   key = wifi_PmkKey(slot)
   used = 0
@@ -843,11 +863,16 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
   Print("  ")
   wifi_PrintSsid(ssid, ssidLen)
   If used <> 0
-    PrintN(": using the cached key (no ten-second derivation this boot).")
+    PrintN(": using the cached network key.")
   Else
-    PrintN(": deriving the key (about ten seconds - PBKDF2, MMU off)...")
-    If Wpa2Psk(pass, passLen, ssid, ssidLen, @wifi_pmk[0]) <> 32
+    PrintN(": deriving the network key (PBKDF2)...")
+    wifi_Progress()
+    oldProgress = Pbkdf2SetProgress(@wifi_Progress)
+    pskResult = Wpa2Psk(pass, passLen, ssid, ssidLen, @wifi_pmk[0])
+    Pbkdf2SetProgress(oldProgress)
+    If pskResult <> 32
       PrintN("    key derivation failed. Skipping.")
+      wifi_Progress()
       ProcedureReturn 0
     EndIf
     wifi_U32ToHex(@wifi_pmkVal[0], fp)
@@ -880,6 +905,7 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
     While verdict = #CYW43_JOIN_RUNNING And slices < #WIFI_JOIN_SLICES
       verdict = Cyw43JoinPoll(#WIFI_JOIN_SLICE_MS)
       slices = slices + 1
+      wifi_Progress()
     Wend
     If verdict <> #CYW43_JOIN_JOINED
       If attempt = 0
@@ -888,11 +914,13 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
       Else
         PrintN("    did not associate (refused, or not this passphrase's network).")
       EndIf
+      wifi_Progress()
       Cyw43Disassoc(2000)
       Cyw43DrainEvents(150)
       Continue
     EndIf
     PrintN("    associated - running the four-way handshake...")
+    wifi_Progress()
     If wifi_Handshake() <> 0
       ProcedureReturn 1
     EndIf
@@ -938,12 +966,14 @@ Procedure.i WifiJoinKnown()
   While stop = 0 And slices < (#WIFI_SCAN_BUDGET_MS / #WIFI_SCAN_SLICE_MS)
     r = Cyw43ScanPoll(#WIFI_SCAN_SLICE_MS)
     slices = slices + 1
+    wifi_Progress()
     If r = #CYW43_SCAN_DONE Or r = #CYW43_SCAN_FAILED
       stop = 1
     EndIf
   Wend
   found = Cyw43ScanCount()
   PrintN("Joining a known Wi-Fi network...")
+  wifi_Progress()
   For band = 0 To 1
     i = 0
     While i < found
