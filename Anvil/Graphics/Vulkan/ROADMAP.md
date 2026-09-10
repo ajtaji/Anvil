@@ -4,6 +4,10 @@ This is a coverage inventory, not a version or conformance claim. The schema
 target is `VK_API_VERSION_1_0`, generated from the pinned registry identified
 in `COVERAGE.md`. Production currently exposes no physical device.
 
+See the [cross-layer compatibility inventory](../../../docs/VULKAN_COMPATIBILITY_STATUS.md)
+for the current implementation matrix, prerequisites, target-neutral boundaries,
+and the next resource-backed transfer slice with its acceptance gates.
+
 Primary API references are the [Khronos Vulkan Registry](https://registry.khronos.org/vulkan/),
 the Vulkan specification's [clear-command definition](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#clears-images-outside-render-pass),
 and the pinned `vk.xml`. The V3D implementation reference is Mesa's

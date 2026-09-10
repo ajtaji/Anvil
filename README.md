@@ -208,6 +208,9 @@ on-board use.
 See [the module format](docs/MODULE_FORMAT.md),
 [Vulkan coverage](Anvil/Graphics/Vulkan/COVERAGE.md), and the
 [Vulkan roadmap](Anvil/Graphics/Vulkan/ROADMAP.md) for exact boundaries.
+The [compatibility inventory](docs/VULKAN_COMPATIBILITY_STATUS.md) maps the
+implemented layers, missing prerequisites, and next resource-backed transfer
+slice without claiming a production Vulkan device.
 
 ## Safety and support
 
