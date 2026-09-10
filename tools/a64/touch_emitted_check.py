@@ -76,6 +76,8 @@ print("[gate] tree under test: %s" % ROOT, file=sys.stderr)
 
 PMFC = None
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "touch_goodix_compile.pi4"
+ABORT_PROBE = (ROOT / "RaspberryPi4" / "Tests" /
+               "i2c_abort_resume_probe.pi4")
 DRV_TOUCH = ROOT / "RaspberryPi4" / "Lib" / "touch_goodix.pi4"
 DRV_PANEL = (ROOT / "RaspberryPi4" / "Tests" / "Fixtures" /
              "dsi_panel_v1.pi4")
@@ -126,7 +128,7 @@ def lib_consts(text, names):
 
 I2C_TEXT = DRV_I2C.read_text(encoding="utf-8", errors="replace")
 C = lib_consts(I2C_TEXT, [
-    "BSC1_BASE", "BSC_C_OFF", "BSC_S_OFF", "BSC_DLEN_OFF", "BSC_A_OFF",
+    "BSC0_BASE", "BSC1_BASE", "BSC_C_OFF", "BSC_S_OFF", "BSC_DLEN_OFF", "BSC_A_OFF",
     "BSC_FIFO_OFF", "BSC_DIV_OFF", "BSC_DEL_OFF", "BSC_CLKT_OFF",
     "BSC_C_I2CEN", "BSC_C_ST", "BSC_C_CLEAR", "BSC_C_READ",
     "BSC_S_CLKT", "BSC_S_ERR", "BSC_S_RXF", "BSC_S_TXE", "BSC_S_RXD",
@@ -372,6 +374,7 @@ class Bsc:
         self.nacks = 0
         self.unknown_reads = []
         self.unknown_writes = []
+        self.register_writes = []
 
     def add(self, dev):
         self.devices[dev.addr] = dev
@@ -494,12 +497,21 @@ class Bsc:
     def read32(self, off):
         if off == C["BSC_S_OFF"]:
             self.status_reads += 1
-            if self.abort_never and self.abort_pending:
-                pass
-            elif self.abort_pending > 0:
-                self.abort_pending -= 1
-                if self.abort_pending == 0:
-                    self._complete_abort()
+            # CLEAR with I2CEN off requests an asynchronous abort but cannot
+            # advance the controller state machine.  BCM2711 says disabled
+            # controllers perform no transfers, and Linux explicitly warns
+            # that the abort NACK/STOP remains queued for the next enable.
+            # The old fixture decremented this countdown on status reads alone,
+            # which let production "recover" while the engine was disabled --
+            # precisely the state silicon disproved (C=0, S.TA=1).
+            enabled = bool(self.regs[C["BSC_C_OFF"]] & C["BSC_C_I2CEN"])
+            if self.abort_pending:
+                if self.abort_never:
+                    pass
+                elif enabled:
+                    self.abort_pending -= 1
+                    if self.abort_pending == 0:
+                        self._complete_abort()
             elif self.active and not self.is_read:
                 self.polls += 1
                 if self.stall_this:
@@ -556,6 +568,7 @@ class Bsc:
 
     def write32(self, off, val):
         val &= 0xFFFFFFFF
+        self.register_writes.append((off, val))
         if off == C["BSC_S_OFF"]:
             if val & C["BSC_S_ERR"]:
                 self.err = False
@@ -663,11 +676,13 @@ def install(cpu, bsc, console):
 #  BUILD AND RUN
 # =====================================================================
 
-def build(probe_rel, out):
+def build(probe_rel, out, bss_addr=None, load_addr=LOAD, stack_addr=STACK):
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [str(PMFC), probe_rel, "-t", G["flag"],
-           "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
+           "--load-addr", hex(load_addr), "--stack-addr", hex(stack_addr),
            "--entry-returns", "-o", str(out)]
+    if bss_addr is not None:
+        cmd[6:6] = ["--bss-addr", hex(bss_addr)]
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
     r = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
@@ -676,15 +691,15 @@ def build(probe_rel, out):
         raise SystemExit("build failed:\n" + r.stdout)
 
 
-def run(img, bsc, counter_hz=CNTFRQ):
+def run(img, bsc, counter_hz=CNTFRQ, load_addr=LOAD, stack_addr=STACK):
     blob = img.read_bytes()
     cpu = A64()
     mem = cpu.memory
     for i, b in enumerate(blob):
-        mem[LOAD + i] = b
-    attach_symbols(cpu, img, LOAD)
-    cpu.pc = LOAD
-    cpu.sp = STACK
+        mem[load_addr + i] = b
+    attach_symbols(cpu, img, load_addr)
+    cpu.pc = load_addr
+    cpu.sp = stack_addr
     cpu.x[30] = LOADER_LR
 
     console = bytearray()
@@ -712,6 +727,34 @@ def run(img, bsc, counter_hz=CNTFRQ):
         step()
     raise SystemExit("the probe never returned (%d steps)\n%s"
                      % (steps[0], console.decode("latin-1")))
+
+
+def image_symbols(img):
+    """Read the compiler's exact emitted global addresses for a probe."""
+    sym_path = pathlib.Path(str(img) + ".sym")
+    if not sym_path.is_file():
+        raise SystemExit("symbol sidecar missing for emitted probe: %s"
+                         % sym_path)
+    symbols = {}
+    for line in sym_path.read_text(encoding="utf-8",
+                                   errors="strict").splitlines():
+        name, sep, value = line.partition("=")
+        if sep:
+            symbols[name.strip().lower()] = int(value.strip(), 0)
+    return symbols
+
+
+def memory_u64(cpu, symbols, name):
+    """Read one emitted PureMetal `.i` global without host ABI guessing."""
+    key = ("global_" + name).lower()
+    if key not in symbols:
+        raise SystemExit("emitted symbol missing: %s" % key)
+    addr = symbols[key]
+    return sum(cpu.memory.get(addr + i, 0) << (8 * i) for i in range(8))
+
+
+def signed_u64(value):
+    return value - (1 << 64) if value & (1 << 63) else value
 
 
 # The frames the model plays. Deliberately not all the same shape:
@@ -1209,6 +1252,169 @@ def run_timeout(work, fails):
     return cases
 
 
+def run_abort_resume_probe(work, fails):
+    """Execute the no-ST diagnostic against both finite and stuck aborts.
+
+    This is intentionally independent from I2cRecover().  It answers only
+    whether C=I2CEN can advance an abort which was queued while the engine was
+    disabled, and whether the diagnostic restores C=0 when TA never falls.
+    """
+    d = work / "abort_resume"
+    img = d / "abort_resume.img"
+    probe_load = 0x00500000
+    probe_bss = 0x00600000
+    probe_stack = 0x00800000
+    build(ABORT_PROBE.relative_to(ROOT).as_posix(), img,
+          bss_addr=probe_bss, load_addr=probe_load, stack_addr=probe_stack)
+    symbols = image_symbols(img)
+
+    required = [
+        "probe_done", "probe_status", "probe_before_c", "probe_before_s",
+        "probe_after_c", "probe_after_s", "probe_hz",
+        "probe_elapsed_ticks", "probe_polls",
+    ]
+    for name in required:
+        if ("global_" + name).lower() not in symbols:
+            fails.append("abort-resume: emitted symbol missing: global_%s"
+                         % name)
+            return 1
+
+    cases = 0
+
+    def check(name, ok, detail):
+        nonlocal cases
+        cases += 1
+        if not ok:
+            fails.append("abort-resume: %s: %s" % (name, detail))
+
+    def queued_abort(never=False):
+        bsc = Bsc(base=C["BSC0_BASE"], abort_delay=3, abort_never=never)
+        bsc.active = True
+        bsc.ta = True
+        bsc.abort_pending = 3
+        bsc.regs[C["BSC_C_OFF"]] = 0
+        return bsc
+
+    # Negative control for the old fixture: MMIO status reads are observations,
+    # not clocks.  A disabled engine must retain its queued abort and TA.
+    finite = queued_abort()
+    for _ in range(5):
+        finite.read32(C["BSC_S_OFF"])
+    check("disabled status reads cannot advance a queued abort",
+          finite.abort_pending == 3 and finite.ta and
+          finite.abort_completions == 0,
+          "disabled observations left pending=%d TA=%r completions=%d"
+          % (finite.abort_pending, finite.ta, finite.abort_completions))
+    finite.register_writes = []
+
+    cpu, out, steps = run(img, finite, load_addr=probe_load,
+                          stack_addr=probe_stack)
+    value = lambda name: memory_u64(cpu, symbols, name)
+    check("finite queued abort probe returned", cpu.x[0] == 0,
+          "Main returned %d" % cpu.x[0])
+    check("probe sampled the disabled active entry state",
+          value("probe_before_c") == 0 and
+          value("probe_before_s") & C["BSC_S_TA"],
+          "before C=$%X S=$%X"
+          % (value("probe_before_c"), value("probe_before_s")))
+    check("I2CEN without ST let the queued abort quiesce",
+          signed_u64(value("probe_status")) == 1 and
+          finite.abort_completions == 1 and not finite.ta,
+          "status=%d completions=%d TA=%r"
+          % (signed_u64(value("probe_status")),
+             finite.abort_completions, finite.ta))
+    check("successful probe issued only the no-ST enable",
+          finite.register_writes == [(C["BSC_C_OFF"], C["BSC_C_I2CEN"])],
+          "register writes were %r" % (finite.register_writes,))
+    check("successful probe did not create an I2C transaction",
+          finite.starts == 0 and finite.repeated_starts == 0 and
+          not finite.unknown_writes,
+          "starts=%d repeated=%d unknown=%r"
+          % (finite.starts, finite.repeated_starts,
+             finite.unknown_writes))
+    check("successful probe published bounded evidence",
+          value("probe_done") == 0x49324152 and
+          value("probe_hz") == CNTFRQ and
+          value("probe_polls") > 0 and
+          value("probe_elapsed_ticks") < CNTFRQ // 50,
+          "done=$%X hz=%d polls=%d elapsed=%d ticks steps=%d"
+          % (value("probe_done"), value("probe_hz"),
+             value("probe_polls"), value("probe_elapsed_ticks"), steps))
+
+    stuck = queued_abort(never=True)
+    stuck_cpu, stuck_out, stuck_steps = run(
+        img, stuck, load_addr=probe_load, stack_addr=probe_stack)
+    stuck_value = lambda name: memory_u64(stuck_cpu, symbols, name)
+    check("permanently active probe returned", stuck_cpu.x[0] == 0,
+          "Main returned %d" % stuck_cpu.x[0])
+    check("permanently active TA expired fail-closed",
+          signed_u64(stuck_value("probe_status")) == -1 and stuck.ta and
+          stuck.abort_completions == 0,
+          "status=%d TA=%r completions=%d"
+          % (signed_u64(stuck_value("probe_status")), stuck.ta,
+             stuck.abort_completions))
+    check("failed probe restored C=0 after one no-ST enable",
+          stuck.register_writes == [
+              (C["BSC_C_OFF"], C["BSC_C_I2CEN"]),
+              (C["BSC_C_OFF"], 0),
+          ] and stuck_value("probe_after_c") == 0,
+          "writes=%r after C=$%X"
+          % (stuck.register_writes, stuck_value("probe_after_c")))
+    check("failed probe did not create an I2C transaction",
+          stuck.starts == 0 and stuck.repeated_starts == 0 and
+          not stuck.unknown_writes,
+          "starts=%d repeated=%d unknown=%r"
+          % (stuck.starts, stuck.repeated_starts, stuck.unknown_writes))
+    check("failed probe used architectural deadline before spin fallback",
+          stuck_value("probe_hz") == CNTFRQ and
+          stuck_value("probe_polls") < 200000 and
+          stuck_value("probe_elapsed_ticks") >= CNTFRQ // 50 and
+          stuck_value("probe_elapsed_ticks") < CNTFRQ // 40,
+          "hz=%d polls=%d elapsed=%d ticks steps=%d"
+          % (stuck_value("probe_hz"), stuck_value("probe_polls"),
+             stuck_value("probe_elapsed_ticks"), stuck_steps))
+
+    # The diagnostic is valid only for the exact state observed after build 24:
+    # C=0 with TA=1.  It must remain read-only for both an unexpectedly enabled
+    # active controller and an already-idle disabled controller.
+    enabled = queued_abort(never=True)
+    enabled.regs[C["BSC_C_OFF"]] = C["BSC_C_I2CEN"]
+    enabled_cpu, enabled_out, enabled_steps = run(
+        img, enabled, load_addr=probe_load, stack_addr=probe_stack)
+    enabled_value = lambda name: memory_u64(enabled_cpu, symbols, name)
+    check("enabled active precondition is refused without writes",
+          signed_u64(enabled_value("probe_status")) == -2 and
+          enabled.register_writes == [] and
+          enabled_value("probe_before_c") == C["BSC_C_I2CEN"] and
+          enabled_value("probe_before_s") & C["BSC_S_TA"] and
+          enabled_value("probe_after_c") == C["BSC_C_I2CEN"] and
+          enabled_value("probe_after_s") & C["BSC_S_TA"],
+          "status=%d writes=%r before=$%X/$%X after=$%X/$%X steps=%d"
+          % (signed_u64(enabled_value("probe_status")),
+             enabled.register_writes, enabled_value("probe_before_c"),
+             enabled_value("probe_before_s"),
+             enabled_value("probe_after_c"),
+             enabled_value("probe_after_s"), enabled_steps))
+
+    idle = Bsc(base=C["BSC0_BASE"])
+    idle_cpu, idle_out, idle_steps = run(
+        img, idle, load_addr=probe_load, stack_addr=probe_stack)
+    idle_value = lambda name: memory_u64(idle_cpu, symbols, name)
+    check("already-idle precondition is refused without writes",
+          signed_u64(idle_value("probe_status")) == -2 and
+          idle.register_writes == [] and
+          idle_value("probe_before_c") == 0 and
+          not (idle_value("probe_before_s") & C["BSC_S_TA"]) and
+          idle_value("probe_after_c") == 0 and
+          not (idle_value("probe_after_s") & C["BSC_S_TA"]),
+          "status=%d writes=%r before=$%X/$%X after=$%X/$%X steps=%d"
+          % (signed_u64(idle_value("probe_status")), idle.register_writes,
+             idle_value("probe_before_c"), idle_value("probe_before_s"),
+             idle_value("probe_after_c"), idle_value("probe_after_s"),
+             idle_steps))
+    return cases
+
+
 def run_delayed_abort_recovery(i2c_path, work, fails):
     """A failed combined transfer must not poison the next ordinary one.
 
@@ -1600,6 +1806,9 @@ def main():
         help="path to the external PureMetal compiler (or set PMFC)")
     ap.add_argument("--mutate", action="store_true",
                     help="run the negative control (all cores)")
+    ap.add_argument(
+        "--abort-resume-only", action="store_true",
+        help="run only the emitted C=I2CEN/no-ST abort diagnostic gate")
     args = ap.parse_args()
 
     if args.pmfc:
@@ -1612,11 +1821,26 @@ def main():
 
     WORK.mkdir(parents=True, exist_ok=True)
     fails = []
+    if args.abort_resume_only:
+        cases = run_abort_resume_probe(WORK, fails)
+        if fails:
+            print("touch_emitted_check --abort-resume-only: FAIL - %d"
+                  % len(fails))
+            for f in fails:
+                print("  * %s" % f)
+            return 1
+        print("touch_emitted_check --abort-resume-only: PASS - %d cases"
+              % cases)
+        print("           emitted no-ST enable quiesced a finite queued abort;")
+        print("           permanently active TA expired and restored C=0.")
+        return 0
+
     rel = PROBE.relative_to(ROOT).as_posix()
     cases, out, steps = run_clean(rel, WORK, fails)
     cases += run_v1(rel, WORK, fails)
     cases += run_nosr(rel, WORK, fails)
     cases += run_timeout(WORK, fails)
+    cases += run_abort_resume_probe(WORK, fails)
     cases += run_delayed_abort_recovery(DRV_I2C, WORK, fails)
     cases += run_progress_deadline(WORK, fails)
 

@@ -1,0 +1,96 @@
+; i2c_abort_resume_probe.pi4 - can an enabled BSC finish a queued abort?
+;
+; DIAGNOSTIC ONLY. This returning payload answers one controller-lifecycle
+; question exposed by the build-24 touch probe: after C=CLEAR with I2CEN off,
+; BSC0 still reported S.TA=1. The BCM2711 manual says disabled controllers do
+; not perform transfers; Linux warns that the abort NACK/STOP remains queued
+; until the engine is started again. This probe therefore writes only
+; C=I2CEN -- no ST, READ or CLEAR -- and watches whether TA becomes zero.
+;
+; It does not touch GPIO, panel power/reset, FIFO, A or DLEN, and it addresses
+; no MCU or Goodix device. If TA does not fall inside 20 ms it restores C=0
+; and returns fail-closed. Register samples are sequential evidence, not an
+; atomic snapshot. Root alone owns compilation, loading and board execution.
+;
+; Build outside the repository product directories:
+;   pmfc RaspberryPi4/Tests/i2c_abort_resume_probe.pi4 -t pi4 \
+;     --load-addr 0x00500000 --bss-addr 0x00600000 \
+;     --stack-addr 0x00800000 --entry-returns -o i2c-abort-resume.img
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+
+#PROBE_DONE_MAGIC = $49324152       ; ASCII "I2AR"
+#PROBE_WAIT_US = 20000
+#PROBE_SPIN_MAX = 200000
+
+#PROBE_STATUS_QUIESCED = 1
+#PROBE_STATUS_STILL_ACTIVE = -1
+#PROBE_STATUS_REFUSED = -2
+
+Global probe_done.i
+Global probe_status.i
+Global probe_before_c.i
+Global probe_before_s.i
+Global probe_after_c.i
+Global probe_after_s.i
+Global probe_hz.i
+Global probe_elapsed_ticks.i
+Global probe_polls.i
+
+Procedure.i Main()
+  Define start.i
+  Define deadline.i
+  Define s.i
+  Define spins.i
+
+  probe_done = 0
+  probe_status = 0
+  probe_polls = 0
+
+  ; This changes only the library's selected register base. It performs no
+  ; pin-mux or controller access of its own.
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  probe_before_c = I2cRd(#BSC_C_OFF)
+  probe_before_s = I2cRd(#BSC_S_OFF)
+
+  probe_hz = I2cCounterHz()
+  start = I2cCounterTicks()
+
+  ; Refuse any state except the exact build-24 finding. In particular, do not
+  ; rewrite an unexpectedly enabled controller and do not count an already
+  ; idle controller as evidence that enabling advances a queued abort.
+  If probe_before_c = 0 And (probe_before_s & #BSC_S_TA) <> 0
+    deadline = I2cDeadlineUs(#PROBE_WAIT_US)
+    spins = #PROBE_SPIN_MAX
+
+    ; The one experimental write. Enabling without ST cannot launch a new
+    ; address phase; it only gives an already-queued abort state room to run.
+    I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)
+    Repeat
+      s = I2cRd(#BSC_S_OFF)
+      probe_polls = probe_polls + 1
+      If (s & #BSC_S_TA) = 0
+        probe_status = #PROBE_STATUS_QUIESCED
+        Break
+      EndIf
+      spins = spins - 1
+    Until spins <= 0 Or I2cDeadlinePassed(deadline) <> 0
+
+    If probe_status <> #PROBE_STATUS_QUIESCED
+      ; No new transaction may follow a controller which still owns the bus.
+      I2cWr(#BSC_C_OFF, 0)
+      probe_status = #PROBE_STATUS_STILL_ACTIVE
+    EndIf
+  Else
+    probe_status = #PROBE_STATUS_REFUSED
+  EndIf
+
+  probe_after_c = I2cRd(#BSC_C_OFF)
+  probe_after_s = I2cRd(#BSC_S_OFF)
+  probe_elapsed_ticks = I2cCounterTicks() - start
+  probe_done = #PROBE_DONE_MAGIC
+  ProcedureReturn 0
+EndProcedure
