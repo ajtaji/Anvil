@@ -1,0 +1,67 @@
+EnableExplicit
+
+Global gate_ms.i=5000 : Global gate_pending.i
+Global gate_raw.i : Global gate_frames.i : Global gate_empty.i : Global gate_first.i : Global gate_cmd.i
+Global gate_fp.i : Global gate_fq.i : Global gate_np.i : Global gate_nq.i : Global gate_ep.i : Global gate_eq.i
+Global gate_decMask.i : Global gate_decCalls.i : Global gate_lines.i
+
+; @@GLOBALS@@
+
+Procedure.i millis() : ProcedureReturn gate_ms : EndProcedure
+Procedure.i Cyw43RxIrqRestorePending() : ProcedureReturn gate_pending : EndProcedure
+Procedure.i Cyw43RxIrqRawReady() : ProcedureReturn gate_raw : EndProcedure
+Procedure.i Cyw43RxIrqFrameIndications() : ProcedureReturn gate_frames : EndProcedure
+Procedure.i Cyw43RxEmpty() : ProcedureReturn gate_empty : EndProcedure
+Procedure.i Cyw43RxFirstReads() : ProcedureReturn gate_first : EndProcedure
+Procedure.i SdioCmd53Calls() : ProcedureReturn gate_cmd : EndProcedure
+Procedure.i Cyw43RxIrqFirstPending() : ProcedureReturn gate_fp : EndProcedure
+Procedure.i Cyw43RxIrqFirstNoPending() : ProcedureReturn gate_fq : EndProcedure
+Procedure.i Cyw43RxIrqNonemptyPending() : ProcedureReturn gate_np : EndProcedure
+Procedure.i Cyw43RxIrqNonemptyNoPending() : ProcedureReturn gate_nq : EndProcedure
+Procedure.i Cyw43RxIrqEmptyPending() : ProcedureReturn gate_ep : EndProcedure
+Procedure.i Cyw43RxIrqEmptyNoPending() : ProcedureReturn gate_eq : EndProcedure
+Procedure.i Cyw43RxIrqZeroCause() : ProcedureReturn 31 : EndProcedure
+Procedure.i Cyw43RxIrqRearmReady() : ProcedureReturn 32 : EndProcedure
+Procedure.i Cyw43RxIrqNestedCalls() : ProcedureReturn 33 : EndProcedure
+Procedure.i Cyw43RxIrqFault() : ProcedureReturn 34 : EndProcedure
+Procedure GatePrint(p.i) : EndProcedure
+Procedure GatePrintN(p.i) : gate_lines=gate_lines+1 : EndProcedure
+Procedure PrintNl() : gate_lines=gate_lines+1 : EndProcedure
+Procedure PrintDec(v.i)
+  gate_decCalls=gate_decCalls+1
+  If v>=101 And v<=106 : gate_decMask=gate_decMask | (1 << (v-101)) : EndIf
+EndProcedure
+
+; @@HELPERS@@
+; @@STATUS@@
+
+Procedure ResetOutput() : gate_decMask=0 : gate_decCalls=0 : gate_lines=0 : EndProcedure
+
+Procedure.i Main()
+  ; Default-off and pending restoration are different status branches.
+  gWifiRxReadyArmed=0 : gate_pending=0 : ResetOutput() : WifiRxReadyStatus()
+  If gate_decCalls<>0 Or gate_lines<1 : ProcedureReturn 1 : EndIf
+  gate_pending=1 : ResetOutput() : WifiRxReadyStatus()
+  If gate_decCalls<>0 Or gate_lines<2 : ProcedureReturn 2 : EndIf
+
+  ; Known baselines and all six correlation increments. Capture is a snapshot:
+  ; repeated status must neither advance nor clear a baseline.
+  gate_pending=0 : gWifiRxReadyArmed=1 : gWifiRxReadyGeneration=7 : gWifiRinitGeneration=7
+  gWifiRxReadyMs=1000 : gWifiRxReadyRaw=10 : gWifiRxReadyFrames=20
+  gWifiRxReadyEmpty=30 : gWifiRxReadyFirst=40 : gWifiRxReadyCmd53=50
+  gWifiRxReadyFirstPending=60 : gWifiRxReadyFirstQuiet=70
+  gWifiRxReadyNonPending=80 : gWifiRxReadyNonQuiet=90
+  gWifiRxReadyEmptyPending=100 : gWifiRxReadyEmptyQuiet=110
+  gate_raw=21 : gate_frames=32 : gate_empty=43 : gate_first=54 : gate_cmd=65
+  gate_fp=161 : gate_fq=172 : gate_np=183 : gate_nq=194 : gate_ep=205 : gate_eq=216
+  ResetOutput() : WifiRxReadyStatus()
+  If gate_decMask<>$3F : ProcedureReturn 3 : EndIf
+  If gWifiRxReadyFirstPending<>60 Or gWifiRxReadyEmptyQuiet<>110 : ProcedureReturn 4 : EndIf
+  ResetOutput() : WifiRxReadyStatus()
+  If gate_decMask<>$3F : ProcedureReturn 5 : EndIf
+
+  ; A mismatched generation prints a refusal and no numeric correlation.
+  gWifiRinitGeneration=8 : ResetOutput() : WifiRxReadyStatus()
+  If gate_decCalls<>0 Or gate_lines<2 : ProcedureReturn 6 : EndIf
+  ProcedureReturn 0
+EndProcedure
