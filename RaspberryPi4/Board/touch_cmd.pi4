@@ -52,11 +52,11 @@
 ;
 ;  THE ORDER MATTERS AND IT IS NOT OBVIOUS. On a v2 board the touch
 ;  controller's reset line is expander bit 9 - it is not on any Pi GPIO -
-;  so the Goodix CANNOT ANSWER until the MCU at $45 has been written.
-;  Probing the touch address first therefore reads as a dead bus on a
-;  perfectly good panel. DsiV2Begin() runs before Gt9Begin() only when
-;  the panel MCU has not already been brought up. Repeating it rewrites
-;  the whole expander shadow and can clear live rails and backlight.
+;  so the vendor sequence requests $0300 from the MCU at $45 before the
+;  Goodix probe. An early failed probe does not prove the electrical reset
+;  level. DsiV2Begin() runs before Gt9Begin() only when the driver does not
+;  already hold panel-MCU state. Repeating it rewrites the whole expander
+;  shadow and can clear live rails and backlight.
 ; ======================================================================
 
 ; How long `touch points` runs before giving up on its own, in polls at
@@ -80,12 +80,12 @@
 Procedure TouchUsage()
   PrintN("touch talks to the DSI panel's touch controller and its power MCU:")
   PrintN("  touch trace                  retained boot I2C phase records; RAM only")
-  PrintN("  touch                        what is on the bus, and what it is")
+  PrintN("  touch                        what answered and what was observed")
   PrintN("  touch points                 live coordinates until a key is pressed")
-  PrintN("  touch panel power            rails up, touch out of reset")
-  PrintN("  touch panel prepare          iovcc, avdd and the panel's own reset")
+  PrintN("  touch panel power            request rails/reset state from the MCU")
+  PrintN("  touch panel prepare          request iovcc, avdd and panel reset")
   PrintN("  touch panel light <n>        backlight, 0 dark to 255 full, DECIMAL")
-  PrintN("  touch panel reset            pulse the touch controller's reset")
+  PrintN("  touch panel reset            request a touch-reset pulse from the MCU")
   PrintN("  touch bus display            use BSC0 on GPIO 44/45 - the default")
   PrintN("  touch bus header             use BSC1 on GPIO 2 and 3 instead")
   PrintN("  touch axes                   the controller-to-panel axis correction")
@@ -151,14 +151,13 @@ EndProcedure
 ;  TouchSayPads - the FSEL code and the pad level of each line.
 ;
 ;  THIS IS THE 584 INSTRUMENT. A bus that will not transfer is either
-;  unmuxed, or muxed and idle-high with nothing on it, or muxed and held
-;  low - and those three want three different answers. Printing the pads
-;  BEFORE anything is changed is the only way to know which one arrived.
+;  unmuxed, muxed and idle-high, or muxed with a line low. Those are useful
+;  observations but do not by themselves identify the electrical cause.
+;  Printing the pads BEFORE anything is changed preserves the arrival state.
 ;
-;  On the display connector there are no pull-ups on the Pi: they are on
-;  the panel board, through the ribbon. So BOTH LINES LOW HERE IS A CABLE
-;  RESULT, not a driver result, and it is the one thing on this bench
-;  that can say so without an eye.
+;  On the display connector the external pull-ups are on the panel side.
+;  Both lines low is evidence to retain, not proof of a cable, panel or
+;  controller cause.
 ; ----------------------------------------------------------------------
 Procedure TouchSayPads(when.i)
   If when = 0
@@ -223,18 +222,17 @@ Procedure.i TouchSayMcu()
     PrintN(".")
     ProcedureReturn 0
   EndIf
-  PrintN("A panel control MCU acknowledged $45.")
+  PrintN("A device acknowledged the configured panel-MCU address $45.")
 
   If DsiV2Identify() = 0
     Print("  but its identity registers would not read: ")
     TouchSayBusCode(DsiV2BusCode())
     PrintN(".")
     PrintN("  $97, $98 and $99 are the v2 MCU's size, hardware id and firmware")
-    PrintN("  version. A part that ACKs and will not read them is either the")
-    PrintN("  FIRST-generation MCU, whose register map has none of them, or a")
-    PrintN("  bus that can address but not receive. Nothing is written to it")
-    PrintN("  from here either way - the v1 registers are outside this MCU's")
-    PrintN("  map and what an out-of-range write does is undocumented.")
+    PrintN("  version. An ACK followed by failed reads does not identify the")
+    PrintN("  MCU generation or the cause. Keep the bus code, controller row")
+    PrintN("  and retained boot trace as the observations. Nothing is written")
+    PrintN("  here: the v1 registers are outside the v2 MCU's published map.")
     ProcedureReturn 0
   EndIf
 
@@ -248,18 +246,18 @@ Procedure.i TouchSayMcu()
 
   ok = DsiV2Plausible()
   If ok = 0
-    PrintN("  ALL THREE ARE $00 or ALL THREE ARE $FF. That is what an undriven")
-    PrintN("  or a held bus reads, not what a part answers. Treat the MCU as")
-    PrintN("  ABSENT and suspect the ribbon before the driver.")
+    PrintN("  ALL THREE ARE $00 or ALL THREE ARE $FF. The reads completed, but")
+    PrintN("  those values do not identify the fitted part, connection or live")
+    PrintN("  electrical state. They are retained as observations only.")
     ProcedureReturn 0
   EndIf
 
-  PrintN("  Three bytes came back with content in them, from a part that had")
-  PrintN("  to be addressed, hold a register number across a STOP and then")
-  PrintN("  drive data. THE RIBBON CARRIES I2C AND IS SEATED. It says nothing")
-  PrintN("  about the four differential lanes in the same cable.")
-  PrintN("  What the values MEAN is not published anywhere; they are recorded,")
-  PrintN("  not interpreted.")
+  PrintN("  Three bytes came back with content after address $45 held a")
+  PrintN("  register number across a STOP and then drove data. That proves")
+  PrintN("  those transactions completed; it does not identify the fitted")
+  PrintN("  part or prove the cable and electrical reset state.")
+  PrintN("  This driver records those values without using them to identify")
+  PrintN("  the fitted part or diagnose the connection.")
 
   If DsiV2Ready() = 0
     If DsiV2Begin() = 0
@@ -268,17 +266,17 @@ Procedure.i TouchSayMcu()
       PrintN(".")
       ProcedureReturn 0
     EndIf
-    PrintN("  VCC is on and the touch controller is out of reset (expander")
-    PrintN("  $0300). The Goodix could not have answered before this line.")
+    PrintN("  The expander accepted $0300, requesting VCC on and touch reset")
+    PrintN("  deasserted. Its software shadow does not prove the pin levels.")
   Else
-    PrintN("  The panel MCU is already up. Its expander shadow was left alone,")
+    PrintN("  The driver already holds v2 MCU state. Its expander shadow was left alone,")
     PrintN("  so this status command did not clear live rails or backlight.")
   EndIf
   ProcedureReturn 1
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  TouchStatus - a bare `touch`. What answered, and what it means.
+;  TouchStatus - a bare `touch`. What answered and what was observed.
 ; ----------------------------------------------------------------------
 Procedure TouchStatus()
   Define a.i
@@ -307,15 +305,14 @@ Procedure TouchStatus()
     Print("  $14 said: ")
     TouchSayBusCode(Gt9CodeLow())
     PrintN(".")
-    PrintN("If the MCU above answered and this did not, the touch chip is held")
-    PrintN("in reset or is not fitted - NOT a dead bus, because the bus just")
-    PrintN("carried three bytes. `touch panel reset` pulses expander bit 9.")
-    PrintN("If NEITHER answered, nothing on this bus is alive: check the")
-    PrintN("ribbon, and read the pad levels printed above before the driver.")
+    PrintN("Neither supported address completed the six-byte read from $8140.")
+    PrintN("That does not distinguish controller state, reset, wiring, fitted")
+    PrintN("part or transfer behavior. Keep the two codes, controller rows and")
+    PrintN("retained `touch trace` records; no reset diagnosis follows from them.")
     ProcedureReturn
   EndIf
 
-  Print("A Goodix touch controller answered at $")
+  Print("A six-byte identity read completed at address $")
   PutHex2(a)
   PrintN(".")
 
@@ -356,10 +353,10 @@ Procedure TouchStatus()
   PrintDec(Gt9MaxPoints())
   PrintN(" points at once")
   If Gt9XMax() < 1 Or Gt9YMax() < 1
-    PrintN("  A RANGE OF ZERO IS AN UNPROGRAMMED CONFIG BLOCK, not a coordinate.")
+    PrintN("  A RANGE OF ZERO CANNOT BE USED AS A COORDINATE EXTENT.")
     PrintN("  Nothing invents a number in its place, so no touch can be mapped")
-    PrintN("  to the screen until the part reports one; the raw values below")
-    PrintN("  still read, which is how to tell a dead controller from this.")
+    PrintN("  to the screen until the part reports one. The successful identity")
+    PrintN("  and config reads above are the retained observations.")
   EndIf
   Print("  interrupt      the config block asks for trigger type ")
   PrintDec(Gt9IntTrigger())
@@ -368,19 +365,12 @@ Procedure TouchStatus()
   PrintN("  about 60 Hz - which is what the reference driver does on exactly")
   PrintN("  this wiring. The number is printed, not acted on.")
 
-  ; WHICH PANEL THIS IS, which is worth more than the touch on a first
-  ; bring-up: the two generations need completely different display work.
-  If a = $14
-    PrintN("$14 is the first-generation Waveshare panel: 1280x800 landscape,")
-    PrintN("and its display needs NO DSI initialisation sequence at all.")
-    PrintN("It is NOT the board this monitor is set up for - `touch panel`")
-    PrintN("drives the v2 MCU, whose registers a v1 part does not have.")
-  Else
-    PrintN("$5D is the DSI-TOUCH generation - the v2 board. Native mode is")
-    PrintN("800x1280 PORTRAIT at 60 Hz, 70 MHz pixel clock, two lanes, and")
-    PrintN("its display needs a 205-command DCS table before it shows a")
-    PrintN("thing. Landscape is a rotation of that, not a mode.")
-  EndIf
+  ; THE ADDRESS IS NOT A PANEL-GENERATION ID. Goodix selects $14/$5D
+  ; through its address strap/reset sequence. The compiled display path,
+  ; independently, is the v2 10.1-inch-a panel.
+  PrintN("The Goodix address alone does not identify the Waveshare panel")
+  PrintN("generation. This monitor's configured v2 display has an 800x1280")
+  PrintN("portrait native mode; landscape is a rotation of that surface.")
 
   TouchSayMapping()
 EndProcedure
@@ -587,9 +577,9 @@ Procedure TouchLive()
   PrintDec(HwTouchUps())
   PrintN(" up.")
   If Gt9Frames() = 1
-    PrintN("EXACTLY ONE frame and then nothing is the signature of the")
-    PrintN("buffer flag never being released. That would be a defect in")
-    PrintN("Gt9Poll, not a panel that stopped being touched.")
+    PrintN("EXACTLY ONE frame and then nothing can indicate the buffer flag")
+    PrintN("was not released, but this count alone does not diagnose controller")
+    PrintN("or driver state. Repeat with a deliberate continuing gesture.")
   EndIf
   If HwTouchLost() > 0
     Print("!! ")
@@ -637,20 +627,21 @@ Procedure TouchPanel()
 
   If WordIs("power") <> 0
     If DsiV2Ready() <> 0
-      PrintN("The panel MCU is already up. Nothing was rewritten: repeating the")
-      PrintN("power-on write could clear live rails and backlight.")
+      PrintN("The driver already holds v2 MCU state. Nothing was rewritten;")
+      PrintN("repeating the power-on write could clear live rails and backlight.")
       ProcedureReturn
     EndIf
     If DsiV2Begin() = 0
       Print("!! the power-on write failed: ")
       TouchSayBusCode(DsiV2BusCode())
-      PrintN(". Nothing is powered.")
+      PrintN(". The requested expander state was not confirmed.")
       ProcedureReturn
     EndIf
     Print("Expander written to $")
     PutHexN(DsiV2Pins(), 4)
-    PrintN(": VCC on, touch controller out of reset.")
-    PrintN("That is what the Linux probe does and no more. The panel's own")
+    PrintN(": requested VCC on and touch reset deasserted.")
+    PrintN("The accepted write and software shadow do not prove pin levels.")
+    PrintN("That is what the Linux probe requests and no more. The panel's own")
     PrintN("rails are `touch panel prepare`; the light is `touch panel light`.")
     ProcedureReturn
   EndIf
@@ -669,9 +660,9 @@ Procedure TouchPanel()
     Print("iovcc, avdd, then reset low 60 ms and high 60 ms. Expander $")
     PutHexN(DsiV2Pins(), 4)
     PrintN(".")
-    PrintN("THE PANEL IS POWERED AND STILL BLANK, and that is correct: it")
-    PrintN("shows nothing until the DCS init table has gone over DSI and")
-    PrintN("video is running. A lit backlight over a blank panel is a RESULT.")
+    PrintN("The prepare writes completed; they do not read back rail or reset")
+    PrintN("levels. The panel shows nothing until the DCS init table has gone")
+    PrintN("over DSI and video is running.")
     ProcedureReturn
   EndIf
 
@@ -686,9 +677,9 @@ Procedure TouchPanel()
       PrintN(".")
       ProcedureReturn
     EndIf
-    PrintN("Expander bit 9 pulsed low for 20 ms. Nothing on this board reaches")
-    PrintN("the Goodix reset except that bit, so this is the only reset there")
-    PrintN("is. Run `touch` again to see whether it answers now.")
+    PrintN("The MCU accepted writes requesting expander bit 9 low for 20 ms")
+    PrintN("then high. The shadow does not prove the electrical reset level.")
+    PrintN("Run `touch` again to record whether the controller answers now.")
     ProcedureReturn
   EndIf
 
@@ -728,10 +719,9 @@ Procedure TouchPanel()
     Print(", PWM register $96 set to ")
     PrintDec(v)
     PrintN(" of 255.")
-    PrintN("THIS MCU IS NOT INVERTED - the first-generation one takes $FF")
-    PrintN("minus the level and this one takes the level. If the light does")
-    PrintN("not change, that is a wiring or a generation answer, not a")
-    PrintN("missing commit write: this generation has no commit register.")
+    PrintN("The v2 register takes the level directly and has no commit write.")
+    PrintN("A completed write without a visible change does not by itself")
+    PrintN("diagnose the panel generation, wiring or electrical state.")
     PrintN("A LADDER, NOT ONE VALUE: try 0, then 128, then 255. One write")
     PrintN("cannot tell a working backlight from a stuck one.")
     ProcedureReturn
