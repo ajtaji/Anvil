@@ -1209,13 +1209,11 @@ Procedure net_PinApply()
   If HwLinkOpen(1) = 0
     ProcedureReturn
   EndIf
-  ; A PIN THAT LANDS ON A LINK WITH A STORED ADDRESS TAKES THE SAME TAIL
-  ; A LEASE TAKES. HwLinkOpen has already put the three numbers into the
-  ; IP layer; this is the rest of it - record them, tell the board, arm
-  ; the console - and it is the one copy of that list.
-  If LinkKind() <> #HW_LINK_NONE And EthHasIpConfig() <> 0
-    NetAddressBound(LinkKind(), gEthIp, gEthMask, gEthGw, #NET_ADDR_SAVED)
-  EndIf
+  ; Selection is not address acquisition. HwLinkOpen has installed the
+  ; selected interface's existing address row. Do not bind it again from
+  ; gEthIp: that tuple belongs to wired, even when Wi-Fi was selected, and
+  ; rebinding would overwrite the radio's lease and its address provenance.
+  ; Static changes and DHCP acquisition keep their own NetAddressBound tail.
   LinkSay()
   NetConsoleRearm()
   NetConsoleSay()
