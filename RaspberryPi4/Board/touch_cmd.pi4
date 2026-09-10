@@ -79,6 +79,7 @@
 ; ----------------------------------------------------------------------
 Procedure TouchUsage()
   PrintN("touch talks to the DSI panel's touch controller and its power MCU:")
+  PrintN("  touch trace                  retained boot I2C phase records; RAM only")
   PrintN("  touch                        what is on the bus, and what it is")
   PrintN("  touch points                 live coordinates until a key is pressed")
   PrintN("  touch panel power            rails up, touch out of reset")
@@ -105,16 +106,16 @@ Procedure TouchSayBusCode(c.i)
   If c = #I2C_OK
     Print("the transfer succeeded")
   ElseIf c = #I2C_NACK
-    Print("nothing acknowledged that address")
+    Print("the controller reported an unacknowledged address or write byte")
   ElseIf c = #I2C_CLKT
-    Print("the device held the clock too long")
+    Print("the controller reported a clock-stretch timeout")
   ElseIf c = #I2C_TIMEOUT
-    Print("the transfer never finished - the bus looks wedged")
+    Print("the transfer did not complete within its bounded deadline")
   ElseIf c = #I2C_ARG
-    Print("the driver refused its own arguments, which is a defect here")
+    Print("the driver refused the transfer arguments")
   ElseIf c = #I2C_NOSR
-    Print("the repeated start could not be issued, which is a defect in")
-    Print(" I2cWriteRead and NOT a missing panel")
+    Print("the write phase ended before a repeated start could be issued;")
+    Print(" no read was attempted")
   Else
     Print("code ")
     PrintDec(c)
@@ -892,6 +893,61 @@ EndProcedure
 ;  subcommand is decided before any hardware is touched, so an unknown
 ;  word cannot leave the bus half-configured.
 ; ----------------------------------------------------------------------
+; Retained boot history only. No I2cUp, device probing, pad selection or MMIO
+; belongs here: observing a failure must not retry it or erase its evidence.
+Procedure TouchTrace()
+  Define i.i
+  Define count.i
+  Define edge.i
+  Define phase.i
+  count = I2cTraceCount()
+  Print("Boot I2C trace: ") : PrintDec(count) : PrintN(" retained records.")
+  If I2cTraceOverflow() <> 0
+    PrintN("  Capture saturated; first records are preserved, later records omitted.")
+  EndIf
+  If count = 0
+    PrintN("  No panel/touch transaction was captured in this boot.")
+    ProcedureReturn
+  EndIf
+  PrintN("Ticks are architectural-counter ticks, not microseconds.")
+  PrintN("C/S/DLEN/A are sequential observations; reserved status bits are uninterpreted.")
+  PrintN("BEGIN result is a placeholder; FAULT is the observed failure; END is the final result.")
+  PrintN("preflight outcome is meaningful on END only: 0=not needed, 1=recovered, -1=failed.")
+  For i = 0 To count - 1
+    PrintDec(i) : Print(" ")
+    edge = I2cTraceGet(i, #I2C_TRACE_FIELD_EDGE)
+    If edge = #I2C_TRACE_EDGE_BEGIN
+      Print("BEGIN ")
+    ElseIf edge = #I2C_TRACE_EDGE_END
+      Print("END   ")
+    ElseIf edge = #I2C_TRACE_EDGE_FAULT
+      Print("FAULT ")
+    Else
+      Print("EDGE ") : PrintDec(edge) : Print(" ")
+    EndIf
+    phase = I2cTraceGet(i, #I2C_TRACE_FIELD_PHASE)
+    Select phase
+      Case #I2C_TRACE_MCU_SIZE_WRITE : Print("MCU97 pointer")
+      Case #I2C_TRACE_MCU_SIZE_READ : Print("MCU97 read")
+      Case #I2C_TRACE_MCU_ID_WRITE : Print("MCU98 pointer")
+      Case #I2C_TRACE_MCU_ID_READ : Print("MCU98 read")
+      Case #I2C_TRACE_MCU_VERSION_WRITE : Print("MCU99 pointer")
+      Case #I2C_TRACE_MCU_VERSION_READ : Print("MCU99 read")
+      Case #I2C_TRACE_GOODIX_5D : Print("Goodix5D identity")
+      Case #I2C_TRACE_GOODIX_14 : Print("Goodix14 identity")
+      Default : Print("phase ") : PrintDec(phase)
+    EndSelect
+    Print(" result=") : PrintDec(I2cTraceGet(i, #I2C_TRACE_FIELD_RESULT))
+    Print(" preflight=") : PrintDec(I2cTraceGet(i, #I2C_TRACE_FIELD_RECOVERED))
+    Print(" tick=") : PrintDec(I2cTraceGet(i, #I2C_TRACE_FIELD_TICKS))
+    Print(" C=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_C), 8)
+    Print(" S=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_S), 8)
+    Print(" DLEN=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_DLEN), 8)
+    Print(" A=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_A), 8)
+    PrintN("")
+  Next
+EndProcedure
+
 Procedure CmdTouch()
   Define which.i
   Define up.i
@@ -918,6 +974,8 @@ Procedure CmdTouch()
       which = 5
     ElseIf WordIs("bus") <> 0
       which = 6
+    ElseIf WordIs("trace") <> 0
+      which = 7
     EndIf
 
     If which = 0
@@ -925,6 +983,16 @@ Procedure CmdTouch()
       TouchUsage()
       ProcedureReturn
     EndIf
+  EndIf
+
+  If which = 7
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("!! touch trace takes no arguments; nothing was changed.")
+    Else
+      TouchTrace()
+    EndIf
+    ProcedureReturn
   EndIf
 
   If which = 5

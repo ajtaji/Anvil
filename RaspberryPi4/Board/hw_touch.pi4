@@ -362,10 +362,16 @@ Procedure.i HwTouchUp()
     EndIf
   EndIf
 
+  ; Name only Gt9Begin's first identity transaction at each legal address.
+  ; With tracing disabled these calls perform no MMIO and do not alter the
+  ; bus sequence; with it enabled i2c.pi4 retains the pre-clear state and
+  ; the real result of the existing I2cWriteRead.
+  I2cTraceGoodixWindow(1)
   a = Gt9Begin()
+  I2cTraceGoodixWindow(0)
   TouchBusLeave()
   If a = 0
-    gTouchErr = "no Goodix touch controller answered at $5D or $14 on the display connector's bus, although the panel's micro did - so the touch chip is held in reset or is not fitted rather than the bus being dead; `touch panel reset` pulses expander bit 9 and `touch` prints what each address said."
+    gTouchErr = "no Goodix identity read completed at $5D or $14 on the display connector's bus, although the panel's micro answered earlier. That records which transactions failed; it does not establish whether the cause is controller state, reset ownership, wiring or the fitted part. `touch` prints each address's bus code."
     ProcedureReturn 0
   EndIf
 

@@ -479,6 +479,59 @@ Global i2c_timeouts.i
 Global i2c_recover_failed.i
 
 ; ----------------------------------------------------------------------
+;  OPT-IN BOOT TRANSACTION TRACE
+;
+;  This is a bounded RAM record of the EXISTING panel-MCU identity and
+;  Goodix identity transactions. It starts no transfer and it never reads
+;  FIFO. The four controller words are sequential observations, not an
+;  atomic snapshot. Tracing is OFF in zeroed BSS and an off trace performs
+;  no MMIO reads at all.
+;
+;  BEGIN is captured before I2cXfer/I2cWriteRead can clear status or call
+;  I2cEnsureIdle; an optional FAULT preserves the polling status plus safe
+;  registers before cleanup; END carries the real return code and whether
+;  that preflight had to run I2cRecover (1 success, -1 failure).
+;  The buffer saturates instead of wrapping, preserving the first failure
+;  and all state that led to it.
+; ----------------------------------------------------------------------
+#I2C_TRACE_MAX = 32
+#I2C_TRACE_FIELDS = 9
+
+#I2C_TRACE_EDGE_BEGIN = 1
+#I2C_TRACE_EDGE_END = 2
+#I2C_TRACE_EDGE_FAULT = 3
+
+#I2C_TRACE_FIELD_EDGE = 0
+#I2C_TRACE_FIELD_PHASE = 1
+#I2C_TRACE_FIELD_RESULT = 2
+#I2C_TRACE_FIELD_RECOVERED = 3
+#I2C_TRACE_FIELD_TICKS = 4
+#I2C_TRACE_FIELD_C = 5
+#I2C_TRACE_FIELD_S = 6
+#I2C_TRACE_FIELD_DLEN = 7
+#I2C_TRACE_FIELD_A = 8
+
+#I2C_TRACE_MCU_SIZE_WRITE = 1
+#I2C_TRACE_MCU_SIZE_READ = 2
+#I2C_TRACE_MCU_ID_WRITE = 3
+#I2C_TRACE_MCU_ID_READ = 4
+#I2C_TRACE_MCU_VERSION_WRITE = 5
+#I2C_TRACE_MCU_VERSION_READ = 6
+#I2C_TRACE_GOODIX_5D = 7
+#I2C_TRACE_GOODIX_14 = 8
+
+Global Dim i2c_trace_words.i[#I2C_TRACE_MAX * #I2C_TRACE_FIELDS]
+Global i2c_trace_on.i
+Global i2c_trace_count.i
+Global i2c_trace_overflow.i
+Global i2c_trace_pending.i
+Global i2c_trace_phase.i
+Global i2c_trace_recovered.i
+Global i2c_trace_faulted.i
+Global i2c_trace_goodix.i
+Global i2c_trace_goodix_seen.i
+
+; ----------------------------------------------------------------------
 ;  THE ACTIVE BUS. ONE global, written by I2cSelectBus() and by nothing
 ;  else, read by every procedure below.
 ;
@@ -653,6 +706,177 @@ Procedure I2cWr(off.i, v.i)
   Else
     PokeL(#BSC1_BASE + off, v)
   EndIf
+EndProcedure
+
+; Enable starts a fresh capture. Disable retains the records so a command can
+; read them later without touching either controller. The boot hook should
+; enable before ScreenUp and disable immediately after TouchBoot.
+Procedure I2cTraceEnable(on.i)
+  If on <> 0
+    i2c_trace_count = 0
+    i2c_trace_overflow = 0
+    i2c_trace_pending = 0
+    i2c_trace_phase = 0
+    i2c_trace_recovered = 0
+    i2c_trace_faulted = 0
+    i2c_trace_goodix = 0
+    i2c_trace_goodix_seen = 0
+    i2c_trace_on = 1
+  Else
+    i2c_trace_on = 0
+    i2c_trace_pending = 0
+    i2c_trace_goodix = 0
+  EndIf
+EndProcedure
+
+Procedure.i I2cTraceEnabled()
+  ProcedureReturn i2c_trace_on
+EndProcedure
+
+Procedure.i I2cTraceCount()
+  ProcedureReturn i2c_trace_count
+EndProcedure
+
+Procedure.i I2cTraceOverflow()
+  ProcedureReturn i2c_trace_overflow
+EndProcedure
+
+; Pure RAM retrieval. Invalid coordinates return zero and never bring a bus
+; up, select one, or read a register.
+Procedure.i I2cTraceGet(index.i, field.i)
+  If index < 0 Or index >= i2c_trace_count
+    ProcedureReturn 0
+  EndIf
+  If field < 0 Or field >= #I2C_TRACE_FIELDS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn i2c_trace_words[index * #I2C_TRACE_FIELDS + field]
+EndProcedure
+
+Procedure I2cTracePut(index.i, field.i, value.i)
+  i2c_trace_words[index * #I2C_TRACE_FIELDS + field] = value
+EndProcedure
+
+Procedure I2cTraceCapture(edge.i, phase.i, result.i, recovered.i)
+  Define index.i
+  If i2c_trace_on = 0 Or i2c_trace_count >= #I2C_TRACE_MAX
+    ProcedureReturn
+  EndIf
+  index = i2c_trace_count
+  i2c_trace_count = i2c_trace_count + 1
+  I2cTracePut(index, #I2C_TRACE_FIELD_EDGE, edge)
+  I2cTracePut(index, #I2C_TRACE_FIELD_PHASE, phase)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RESULT, result)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RECOVERED, recovered)
+  I2cTracePut(index, #I2C_TRACE_FIELD_TICKS, I2cCounterTicks())
+  I2cTracePut(index, #I2C_TRACE_FIELD_C, I2cRd(#BSC_C_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_S, I2cRd(#BSC_S_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_DLEN, I2cRd(#BSC_DLEN_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_A, I2cRd(#BSC_A_OFF))
+EndProcedure
+
+; Return 1 only when this call owns a complete transaction record. Three free
+; records are required up front for BEGIN, an optional FAULT, and END, so a
+; full buffer cannot retain an orphan BEGIN or hide a fault for lack of room.
+Procedure.i I2cTraceBegin(phase.i)
+  If i2c_trace_on = 0 Or phase <= 0
+    ProcedureReturn 0
+  EndIf
+  If i2c_trace_pending <> 0
+    i2c_trace_overflow = 1
+    ProcedureReturn 0
+  EndIf
+  If i2c_trace_count > #I2C_TRACE_MAX - 3
+    i2c_trace_overflow = 1
+    ProcedureReturn 0
+  EndIf
+  i2c_trace_pending = 1
+  i2c_trace_phase = phase
+  i2c_trace_recovered = 0
+  i2c_trace_faulted = 0
+  I2cTraceCapture(#I2C_TRACE_EDGE_BEGIN, phase, 0, 0)
+  ProcedureReturn 1
+EndProcedure
+
+; Preserve the decisive controller state BEFORE an error path clears sticky
+; status or invokes recovery. `status` is the word the polling loop already
+; observed; using it avoids a second S read whose value could be later. C,
+; DLEN and A remain sequential, non-atomic observations. FIFO is never read.
+Procedure I2cTraceFault(status.i, result.i)
+  Define index.i
+  If i2c_trace_on = 0 Or i2c_trace_pending = 0 Or i2c_trace_faulted <> 0
+    ProcedureReturn
+  EndIf
+  If i2c_trace_count >= #I2C_TRACE_MAX
+    i2c_trace_overflow = 1
+    ProcedureReturn
+  EndIf
+  index = i2c_trace_count
+  i2c_trace_count = i2c_trace_count + 1
+  i2c_trace_faulted = 1
+  I2cTracePut(index, #I2C_TRACE_FIELD_EDGE, #I2C_TRACE_EDGE_FAULT)
+  I2cTracePut(index, #I2C_TRACE_FIELD_PHASE, i2c_trace_phase)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RESULT, result)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RECOVERED, 0)
+  I2cTracePut(index, #I2C_TRACE_FIELD_TICKS, I2cCounterTicks())
+  I2cTracePut(index, #I2C_TRACE_FIELD_C, I2cRd(#BSC_C_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_S, status)
+  I2cTracePut(index, #I2C_TRACE_FIELD_DLEN, I2cRd(#BSC_DLEN_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_A, I2cRd(#BSC_A_OFF))
+EndProcedure
+
+Procedure I2cTraceEnd(owned.i, result.i)
+  If owned <> 0 And i2c_trace_pending <> 0
+    I2cTraceCapture(#I2C_TRACE_EDGE_END, i2c_trace_phase, result, i2c_trace_recovered)
+    i2c_trace_pending = 0
+    i2c_trace_phase = 0
+    i2c_trace_recovered = 0
+    i2c_trace_faulted = 0
+  EndIf
+EndProcedure
+
+Procedure.i I2cTraceReturn(owned.i, result.i)
+  I2cTraceEnd(owned, result)
+  ProcedureReturn result
+EndProcedure
+
+; Called only by I2cEnsureIdle after it has actually invoked I2cRecover.
+; 1 means recovery reached idle; -1 means it remained fail-closed.
+Procedure I2cTraceEnsureRecovered(ok.i)
+  If i2c_trace_on <> 0 And i2c_trace_pending <> 0
+    If ok <> 0
+      i2c_trace_recovered = 1
+    Else
+      i2c_trace_recovered = -1
+    EndIf
+  EndIf
+EndProcedure
+
+; HwTouchUp brackets only Gt9Begin with this window. The first identity
+; transaction at each legal address is retained; later config/frame accesses
+; are deliberately outside the boot identity trace.
+Procedure I2cTraceGoodixWindow(on.i)
+  If on <> 0
+    i2c_trace_goodix = 1
+    i2c_trace_goodix_seen = 0
+  Else
+    i2c_trace_goodix = 0
+  EndIf
+EndProcedure
+
+Procedure.i I2cTraceGoodixPhase(addr.i)
+  If i2c_trace_on = 0 Or i2c_trace_goodix = 0
+    ProcedureReturn 0
+  EndIf
+  If addr = $5D And (i2c_trace_goodix_seen & 1) = 0
+    i2c_trace_goodix_seen = i2c_trace_goodix_seen | 1
+    ProcedureReturn #I2C_TRACE_GOODIX_5D
+  EndIf
+  If addr = $14 And (i2c_trace_goodix_seen & 2) = 0
+    i2c_trace_goodix_seen = i2c_trace_goodix_seen | 2
+    ProcedureReturn #I2C_TRACE_GOODIX_14
+  EndIf
+  ProcedureReturn 0
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1135,10 +1359,16 @@ EndProcedure
 ; idle. The common success path is one status read. A previous failed abort
 ; leaves I2CEN off; only a confirmed TA-low recovery may enable it again.
 Procedure.i I2cEnsureIdle()
-  If i2c_recover_failed = 0 And (I2cRd(#BSC_S_OFF) & #BSC_S_TA) = 0
+  Define r.i
+  Define s.i
+  s = I2cRd(#BSC_S_OFF)
+  If i2c_recover_failed = 0 And (s & #BSC_S_TA) = 0
     ProcedureReturn 1
   EndIf
-  ProcedureReturn I2cRecover()
+  I2cTraceFault(s, #I2C_TIMEOUT)
+  r = I2cRecover()
+  I2cTraceEnsureRecovered(r)
+  ProcedureReturn r
 EndProcedure
 
 Procedure.i I2cSnapshot(*snap)
@@ -1210,11 +1440,13 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
 
     ; --- the two hardware failures, most specific first ---------------
     If (s & #BSC_S_ERR) <> 0
+      I2cTraceFault(s, #I2C_NACK)
       I2cWr(#BSC_S_OFF, #BSC_S_ERR)   ; clear it
       a64_barrier()
       ProcedureReturn #I2C_NACK
     EndIf
     If (s & #BSC_S_CLKT) <> 0
+      I2cTraceFault(s, #I2C_CLKT)
       I2cWr(#BSC_S_OFF, #BSC_S_CLKT)
       a64_barrier()
       ProcedureReturn #I2C_CLKT
@@ -1249,6 +1481,9 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
           i = i + 1
         Wend
       EndIf
+      If i < n
+        I2cTraceFault(s, #I2C_TIMEOUT)
+      EndIf
       I2cWr(#BSC_S_OFF, #BSC_S_DONE)
       a64_barrier()
       If i < n
@@ -1265,6 +1500,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
     ; --- the wall-clock backstop -------------------------------------
     spin = spin - 1
     If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+      I2cTraceFault(s, #I2C_TIMEOUT)
       a64_barrier()
       i2c_timeouts = i2c_timeouts + 1
       I2cRecover()
@@ -1378,12 +1614,16 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   Define i.i
   Define spin.i
   Define deadline.i
+  Define trace.i
+  Define tracePhase.i
 
   If wn < 1 Or rn < 1 Or addr < 0 Or addr > $7F
     ProcedureReturn #I2C_ARG
   EndIf
+  tracePhase = I2cTraceGoodixPhase(addr)
+  trace = I2cTraceBegin(tracePhase)
   If I2cEnsureIdle() = 0
-    ProcedureReturn #I2C_TIMEOUT
+    ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
   EndIf
 
   a64_barrier()
@@ -1407,33 +1647,39 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   Repeat
     s = I2cRd(#BSC_S_OFF)
     If (s & #BSC_S_ERR) <> 0
+      I2cTraceFault(s, #I2C_NACK)
       I2cRecover()
-      ProcedureReturn #I2C_NACK
+      ProcedureReturn I2cTraceReturn(trace, #I2C_NACK)
     EndIf
     If (s & #BSC_S_CLKT) <> 0
+      I2cTraceFault(s, #I2C_CLKT)
       I2cRecover()
-      ProcedureReturn #I2C_CLKT
+      ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
     EndIf
     If (s & #BSC_S_DONE) <> 0
       ; The write is over and a STOP went with it. Do NOT begin a plain read.
+      I2cTraceFault(s, #I2C_NOSR)
       I2cRecover()
-      ProcedureReturn #I2C_NOSR
+      ProcedureReturn I2cTraceReturn(trace, #I2C_NOSR)
     EndIf
 
     If (s & #BSC_S_TXW) <> 0
       While i < wn
         s = I2cRd(#BSC_S_OFF)
         If (s & #BSC_S_ERR) <> 0
+          I2cTraceFault(s, #I2C_NACK)
           I2cRecover()
-          ProcedureReturn #I2C_NACK
+          ProcedureReturn I2cTraceReturn(trace, #I2C_NACK)
         EndIf
         If (s & #BSC_S_CLKT) <> 0
+          I2cTraceFault(s, #I2C_CLKT)
           I2cRecover()
-          ProcedureReturn #I2C_CLKT
+          ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
         EndIf
         If (s & #BSC_S_DONE) <> 0
+          I2cTraceFault(s, #I2C_NOSR)
           I2cRecover()
-          ProcedureReturn #I2C_NOSR
+          ProcedureReturn I2cTraceReturn(trace, #I2C_NOSR)
         EndIf
         If (s & #BSC_S_TXD) = 0
           Break
@@ -1454,8 +1700,9 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     spin = spin - 1
     If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
       i2c_timeouts = i2c_timeouts + 1
+      I2cTraceFault(s, #I2C_TIMEOUT)
       I2cRecover()
-      ProcedureReturn #I2C_TIMEOUT
+      ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
     EndIf
   ForEver
 
@@ -1468,12 +1715,14 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     s = I2cRd(#BSC_S_OFF)
 
     If (s & #BSC_S_ERR) <> 0
+      I2cTraceFault(s, #I2C_NACK)
       I2cRecover()
-      ProcedureReturn #I2C_NACK
+      ProcedureReturn I2cTraceReturn(trace, #I2C_NACK)
     EndIf
     If (s & #BSC_S_CLKT) <> 0
+      I2cTraceFault(s, #I2C_CLKT)
       I2cRecover()
-      ProcedureReturn #I2C_CLKT
+      ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
     EndIf
 
     If i < rn And (s & #BSC_S_RXD) <> 0
@@ -1491,19 +1740,21 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
       Wend
       If i < rn
         i2c_timeouts = i2c_timeouts + 1
+        I2cTraceFault(s, #I2C_TIMEOUT)
         I2cRecover()
-        ProcedureReturn #I2C_TIMEOUT
+        ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
       EndIf
       I2cWr(#BSC_S_OFF, #BSC_S_DONE)
       a64_barrier()
-      ProcedureReturn #I2C_OK
+      ProcedureReturn I2cTraceReturn(trace, #I2C_OK)
     EndIf
 
     spin = spin - 1
     If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
       i2c_timeouts = i2c_timeouts + 1
+      I2cTraceFault(s, #I2C_TIMEOUT)
       I2cRecover()
-      ProcedureReturn #I2C_TIMEOUT
+      ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
     EndIf
   ForEver
 EndProcedure

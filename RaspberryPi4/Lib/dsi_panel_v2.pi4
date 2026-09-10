@@ -204,11 +204,23 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i DsiV2Read(reg.i)
   Define r.i
+  Define phase.i
+  Define traced.i
   Dim a.a[1]
   Dim b.a[1]
 
   a[0] = reg & $FF
+  phase = 0
+  If reg = #DSI_V2_REG_SIZE
+    phase = #I2C_TRACE_MCU_SIZE_WRITE
+  ElseIf reg = #DSI_V2_REG_ID
+    phase = #I2C_TRACE_MCU_ID_WRITE
+  ElseIf reg = #DSI_V2_REG_VERSION
+    phase = #I2C_TRACE_MCU_VERSION_WRITE
+  EndIf
+  traced = I2cTraceBegin(phase)
   r = I2cWrite(#DSI_V2_ADDR, @a, 1)
+  I2cTraceEnd(traced, r)
   dsi_v2_code = r
   If r <> #I2C_OK
     ProcedureReturn -1
@@ -219,7 +231,16 @@ Procedure.i DsiV2Read(reg.i)
   delay(#DSI_V2_MS_READ)
 
   b[0] = 0
+  If phase = #I2C_TRACE_MCU_SIZE_WRITE
+    phase = #I2C_TRACE_MCU_SIZE_READ
+  ElseIf phase = #I2C_TRACE_MCU_ID_WRITE
+    phase = #I2C_TRACE_MCU_ID_READ
+  ElseIf phase = #I2C_TRACE_MCU_VERSION_WRITE
+    phase = #I2C_TRACE_MCU_VERSION_READ
+  EndIf
+  traced = I2cTraceBegin(phase)
   r = I2cRead(#DSI_V2_ADDR, @b, 1)
+  I2cTraceEnd(traced, r)
   dsi_v2_code = r
   If r <> #I2C_OK
     ProcedureReturn -1
