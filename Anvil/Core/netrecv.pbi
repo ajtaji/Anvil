@@ -319,9 +319,10 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  NetRecvStep - one pump. Returns the state.
 ;
-;  ONE SEGMENT PER CALL is TcpPoll's contract, so this is called in a
-;  tight loop and the slice is zero: the caller is doing nothing else and
-;  a slice would be time the transfer spends waiting on purpose.
+;  TcpPoll may process a bounded batch before returning. The peer can
+;  therefore finish its handshake, data and FIN before this consumer ever
+;  observes ESTABLISHED. CLOSE_WAIT still owns that accepted byte stream.
+;  The slice is zero because this caller has no reason to wait deliberately.
 ; ----------------------------------------------------------------------
 Procedure.i NetRecvStep()
   Define st.i
@@ -338,7 +339,7 @@ Procedure.i NetRecvStep()
   st = TcpPoll(0)
 
   If gNrState = #NR_WAIT
-    If st = #TCP_ESTABLISHED
+    If st = #TCP_ESTABLISHED Or st = #TCP_CLOSE_WAIT
       gNrState = #NR_RECV
       gNrT0 = millis()
       gNrLast = gNrT0

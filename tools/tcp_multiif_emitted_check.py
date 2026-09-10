@@ -60,16 +60,32 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
         raise SystemExit("tcp multi-if gate: compiler symbol map has no BSS bounds") from exc
 
 
-def build(pmfc: Path, work: Path) -> Path:
+def build(pmfc: Path, work: Path, old_wait: bool = False) -> Path:
     staged = work / pmfc.name
     shutil.copy2(pmfc, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
     image = work / "tcp_multiif_gate.img"
+    probe = PROBE
+    if old_wait:
+        # Restore the actual defective production admission predicate in an
+        # isolated generated include. All other protocol code remains real.
+        receiver = (ROOT / "Anvil/Core/netrecv.pbi").read_text(encoding="utf-8")
+        fixed = "If st = #TCP_ESTABLISHED Or st = #TCP_CLOSE_WAIT"
+        if receiver.count(fixed) != 1:
+            raise SystemExit("tcp multi-if mutation: admission predicate drifted")
+        mutated = work / "netrecv_old_wait.pbi"
+        mutated.write_text(receiver.replace(fixed, "If st = #TCP_ESTABLISHED", 1), encoding="utf-8")
+        source = PROBE.read_text(encoding="utf-8")
+        include = 'XIncludeFile "Anvil/Core/netrecv.pbi"'
+        if source.count(include) != 1:
+            raise SystemExit("tcp multi-if mutation: receiver include drifted")
+        probe = work / "tcp_multiif_old_wait.pi4"
+        probe.write_text(source.replace(include, f'XIncludeFile "{mutated.as_posix()}"'), encoding="utf-8")
     command = [
         str(staged),
-        PROBE.relative_to(ROOT).as_posix(),
+        str(probe),
         "-t", "pi4",
         "--load-addr", hex(LOAD),
         "--stack-addr", hex(STACK),
@@ -150,7 +166,14 @@ def main() -> int:
     if result:
         print(f"tcp_multiif_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"tcp_multiif_emitted_check: PASS - 26 assertions, {steps:,} A64 instructions")
+    with tempfile.TemporaryDirectory(prefix="anvil-tcp-old-wait-") as temporary:
+        mutant = build(pmfc, Path(temporary), old_wait=True)
+        mutation_result, mutation_steps = execute(a64, mutant)
+    if mutation_result != 109:
+        print(f"tcp_multiif_emitted_check: FAIL old-wait mutation returned {mutation_result}; expected assertion 109")
+        return 1
+    print(f"tcp_multiif_emitted_check: PASS - 27 endpoint assertions, 10 receiver scenarios, {steps:,} A64 instructions")
+    print(f"  real-frame short/empty FIN, ceiling, no-peer and revoked-listener cases on both links; old-wait mutation rejected at 109 ({mutation_steps:,} instructions)")
     return 0
 
 

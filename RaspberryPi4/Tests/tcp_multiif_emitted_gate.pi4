@@ -22,6 +22,7 @@ Global Dim gate_rxLen.i[6]
 Global Dim gate_tx.a[1600]
 Global gate_txLen.i
 Global gate_txKind.i
+Global Dim gate_upload.a[32]
 
 Procedure.i Micros()
   ProcedureReturn gate_now
@@ -140,6 +141,8 @@ EndProcedure
 
 XIncludeFile "RaspberryPi4/Lib/link.pi4"
 XIncludeFile "RaspberryPi4/Lib/tcp.pi4"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Core/netrecv.pbi"
 
 Procedure GatePut16(*p, v.i)
   PokeA(*p, (v >> 8) & $FF)
@@ -232,6 +235,88 @@ Procedure GateResetCapture()
   gate_txKind = #HW_LINK_NONE
 EndProcedure
 
+; Add a deterministic binary payload to the segment just queued. Checksums
+; cover the actual wire bytes, not direct changes to TCP's internal state.
+Procedure GateTcpPayload(kind.i, n.i)
+  Define p.i
+  Define i.i
+  Define sum.i
+  p = gate_rxPtr[kind]
+  For i = 0 To n - 1
+    PokeA(p + 54 + i, (i * 17) & $FF)
+  Next
+  GatePut16(p + 16, 40 + n)
+  GatePut16(p + 24, 0)
+  GatePut16(p + 24, GateFold(GateSum(p + 14, 20, 0)))
+  GatePut16(p + 50, 0)
+  sum = GateSum(p + 26, 8, 0) + 6 + 20 + n
+  sum = GateSum(p + 34, 20 + n, sum)
+  GatePut16(p + 50, GateFold(sum))
+  gate_rxLen[kind] = 54 + n
+  If gate_rxLen[kind] < 60 : gate_rxLen[kind] = 60 : EndIf
+EndProcedure
+
+; mode0: short binary file; mode1: empty FIN; mode2: ceiling refusal;
+; mode3: no connection; mode4: revoked listener, never connected.
+; Both network interfaces run every mode.
+Procedure.i GateShortReceiver(kind.i, localIp.i, peerIp.i, mode.i)
+  Define i.i
+  Define n.i
+  Define room.i
+  Define expected.i
+  Define ack.i
+  Define state.i
+  TcpInit()
+  For i = 0 To 31 : gate_upload[i] = $AA : Next
+  n = 16 : room = 16 : expected = #NR_DONE
+  If mode = 1 : n = 0 : EndIf
+  If mode = 2 : room = 8 : expected = #NR_OVER : EndIf
+  If NetRecvArm(5100, @gate_upload[1], @gate_upload[room]) <> #NR_WAIT : ProcedureReturn 1 : EndIf
+  TcpUse(3)
+  If mode >= 3
+    If mode = 4
+      TcpUse(NetRecvSock())
+      TcpUnlisten()
+      TcpUse(3)
+    EndIf
+    If NetRecvStep() <> #NR_WAIT : ProcedureReturn 2 : EndIf
+    If NetRecvCount() <> 0 Or TcpCurrent() <> 3 : ProcedureReturn 3 : EndIf
+    gate_now = gate_now + (#NR_ARM_MS + 1) * 1000
+    If NetRecvStep() <> #NR_TIME : ProcedureReturn 4 : EndIf
+    NetRecvRelease()
+    If gate_upload[0] <> $AA Or gate_upload[1] <> $AA : ProcedureReturn 5 : EndIf
+    ProcedureReturn 0
+  EndIf
+
+  GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1000, 0, #TCP_SYN)
+  If NetRecvStep() <> #NR_WAIT : ProcedureReturn 6 : EndIf
+  If TcpCurrent() <> 3 : ProcedureReturn 7 : EndIf
+  TcpUse(NetRecvSock())
+  If TcpState() <> #TCP_SYN_RECEIVED : ProcedureReturn 8 : EndIf
+  ack = tcp_snd_nxt
+  TcpUse(3)
+  ; The final handshake ACK may also carry data and FIN. This is a real
+  ; protocol path into CLOSE_WAIT in one poll, before NR_WAIT saw ESTABLISHED.
+  GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_ACK | #TCP_FIN)
+  GateTcpPayload(kind, n)
+  gate_now = gate_now + 1000
+  state = NetRecvStep()
+  If state <> expected : ProcedureReturn 9 : EndIf
+  If TcpCurrent() <> 3 : ProcedureReturn 10 : EndIf
+  If n > room : n = room : EndIf
+  If NetRecvCount() <> n : ProcedureReturn 11 : EndIf
+  If NetRecvPeer() <> peerIp : ProcedureReturn 12 : EndIf
+  For i = 0 To n - 1
+    If gate_upload[i + 1] <> ((i * 17) & $FF) : ProcedureReturn 13 : EndIf
+  Next
+  If gate_upload[0] <> $AA Or gate_upload[n + 1] <> $AA : ProcedureReturn 14 : EndIf
+  NetRecvRelease()
+  If TcpCurrent() <> 3 Or NetRecvSock() <> -1 : ProcedureReturn 15 : EndIf
+  TcpUse(0)
+  If TcpState() <> #TCP_CLOSED Or tcp_listen_port <> 0 Or tcp_inuse <> 0 : ProcedureReturn 16 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i Main()
   Define i.i
   Define wiredIp.i
@@ -241,6 +326,7 @@ Procedure.i Main()
   Define peerWifi.i
   Define ack.i
   Define rst0.i
+  Define result.i
 
   wiredIp = $A9FEAAFA       ; 169.254.170.250
   wiredAlias = $C0A88901    ; 192.168.137.1
@@ -324,5 +410,14 @@ Procedure.i Main()
   TcpUse(1)
   If TcpListen(5001) <> #NET_TCP_E_BUSY : ProcedureReturn 26 : EndIf
   TcpUse(0)
+  If NetSetIPv4Alt(#HW_LINK_WIRED, wiredAlias, $FFFFFF00) = 0 : ProcedureReturn 27 : EndIf
+  For i = 0 To 4
+    LinkUseKind(#HW_LINK_WIFI)
+    result = GateShortReceiver(#HW_LINK_WIRED, wiredAlias, peerWired, i)
+    If result <> 0 : ProcedureReturn 100 + i * 20 + result : EndIf
+    LinkUseKind(#HW_LINK_WIRED)
+    result = GateShortReceiver(#HW_LINK_WIFI, wifiIp, peerWifi, i)
+    If result <> 0 : ProcedureReturn 200 + i * 20 + result : EndIf
+  Next
   ProcedureReturn 0
 EndProcedure
