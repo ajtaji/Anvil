@@ -36,6 +36,10 @@ XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
 Global probe_done.i
 Global probe_mcu_ok.i
 Global probe_mcu_code.i
+Global probe_mcu_register.i
+Global probe_mcu_phase.i        ; 1 pointer write, 2 one-byte read
+Global probe_mcu_write_code.i
+Global probe_mcu_read_code.i    ; 999 means not attempted
 Global probe_mcu_size.i
 Global probe_mcu_hwid.i
 Global probe_mcu_version.i
@@ -120,15 +124,22 @@ EndProcedure
 ; power or expander path and writes only the read pointer.
 Procedure.i ProbeMcuRead(reg.i)
   Define r.i
+  probe_mcu_register = reg
+  probe_mcu_phase = 1
+  probe_mcu_write_code = 999
+  probe_mcu_read_code = 999
   probe_mcu_buf[0] = reg & $FF
   r = I2cWrite(#PROBE_MCU_ADDR, @probe_mcu_buf[0], 1)
+  probe_mcu_write_code = r
   probe_mcu_code = r
   If r <> #I2C_OK
     ProcedureReturn -1
   EndIf
   delay(#PROBE_MCU_READ_MS)
   probe_mcu_buf[1] = 0
+  probe_mcu_phase = 2
   r = I2cRead(#PROBE_MCU_ADDR, @probe_mcu_buf[1], 1)
+  probe_mcu_read_code = r
   probe_mcu_code = r
   If r <> #I2C_OK
     ProcedureReturn -1
