@@ -14,6 +14,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import build as anvil_build  # noqa: E402
 
 CORE = ROOT / "RaspberryPi4" / "Lib" / "core_worker.pi4"
 MMUSEC = ROOT / "RaspberryPi4" / "Lib" / "mmu_secondary.pi4"
+MEMMAP = ROOT / "RaspberryPi4" / "Board" / "memmap.pi4"
 FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "core_worker_emitted_gate.pi4"
 SCRATCH_FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "core_worker_scratch_gate.pi4"
 STUB = ROOT / "RaspberryPi4" / "Board" / "armstub8.asm"
@@ -75,13 +77,14 @@ def in_order(c: Checks, text: str, needles: list[str], where: str) -> None:
         cursor = found
 
 
-def source_checks(c: Checks, core: str, mmu: str) -> None:
+def source_checks(c: Checks, core: str, mmu: str, memmap: str) -> None:
     secondary = proc(core, "CoreRawSecondary")
     prepare = proc(core, "CoreRawPrepare")
     release = proc(core, "CoreRawRelease")
     wait = proc(core, "CoreRawWaitReady")
     result = proc(core, "CoreRawResult")
     acquire = proc(core, "coreRaw_LoadAcquire")
+    stack_owned = proc(core, "CoreRawStackOwned")
     join = proc(mmu, "MmuSecondaryJoinRaw")
 
     c.yes(re.search(r"ProcedureNaked CoreRawSecondary\(\)", secondary) is not None,
@@ -160,6 +163,28 @@ def source_checks(c: Checks, core: str, mmu: str) -> None:
     c.yes("coreRaw_Sp() >= stackBase" in prepare and
           "CoreRawBootBase() < top" in prepare and "CoreRawRowBase() < top" in prepare,
           "stack must not overlap the primary or raw-core allocations")
+    c.yes("HwCoreRawStackBase(core)" in stack_owned and
+          "HwCoreRawStackBytes(core)" in stack_owned and
+          "stackBase <> owned Or stackBytes <> bytes" in stack_owned,
+          "raw stack ownership must be the board's exact core/page pair")
+    in_order(c, prepare,
+             ["If CoreRawStackOwned(core, stackBase, stackBytes) = 0",
+              "If stackBase <= HwMonHi() And HwMonLo() < top",
+              "boot = CoreRawBootAddr(core)", "PeekI(box)",
+              "PokeI(row + slot * 8", "MmuCleanRange(boot"],
+             "stack ownership before prepare side effects")
+    for token in (
+        "#CORE_RAW_STACK_LO    = $001FC000",
+        "#CORE_RAW_STACK_PAGE  = $00001000",
+        "#CORE_RAW_STACK_HI    = $001FEFFF",
+        "Case 1 : ProcedureReturn #CORE_RAW_STACK_LO",
+        "Case 2 : ProcedureReturn #CORE_RAW_STACK_LO + #CORE_RAW_STACK_PAGE",
+        "Case 3 : ProcedureReturn #CORE_RAW_STACK_LO + (#CORE_RAW_STACK_PAGE * 2)",
+        "ProcedureReturn 5",
+        "Case 4 : ProcedureReturn #CORE_RAW_STACK_LO",
+        "Case 4 : ProcedureReturn #CORE_RAW_STACK_HI",
+    ):
+        c.yes(token in memmap, f"board stack reservation missing {token}")
     for forbidden in ("Print", "Uart", "Safety", "Genet", "Dma", "Display"):
         c.yes(forbidden not in secondary + join,
               f"secondary path must not touch {forbidden}")
@@ -243,7 +268,7 @@ def model_checks(c: Checks) -> None:
     row0 = 0x481100
     boots = [boot0 + i * STRIDE for i in range(4)]
     rows = [row0 + i * STRIDE for i in range(4)]
-    stacks = [0, 0x1004000, 0x1014000, 0x1024000]
+    stacks = [0, 0x001FC000, 0x001FD000, 0x001FE000]
     c.yes(len(set(boots + rows)) == 8, "boot/control rows must all be distinct")
     for addr in boots + rows:
         c.yes(addr % ALIGN == 0, f"row is not aligned: {addr:#x}")
@@ -251,10 +276,10 @@ def model_checks(c: Checks) -> None:
           "secondary stacks must be distinct and aligned")
 
     def prepare_allowed(core: int, primary: int, el: int, sctlr: int,
-                        busy: bool, stack: int) -> bool:
+                        busy: bool, stack: int, size: int = 0x1000) -> bool:
         return (primary == 0 and 1 <= core <= 3 and core != primary and
                 el == 3 and (sctlr & 0x1005) == 0x1005 and
-                not busy and stack != 0 and stack % 16 == 0)
+                not busy and stack == stacks[core] and size == 0x1000)
 
     c.yes(prepare_allowed(1, 0, 3, SCTLR_CACHED, False, stacks[1]),
           "valid EL3 setup was refused")
@@ -265,8 +290,23 @@ def model_checks(c: Checks) -> None:
         ((1, 0, 3, 0x30C50830, False, stacks[1]), "missing M/C/I"),
         ((1, 0, 3, SCTLR_CACHED, True, stacks[1]), "busy slot"),
         ((1, 0, 3, SCTLR_CACHED, False, 0), "missing stack"),
+        ((1, 0, 3, SCTLR_CACHED, False, stacks[2]), "other core's page"),
+        ((1, 0, 3, SCTLR_CACHED, False, stacks[1], 0x800), "partial page"),
+        ((1, 0, 3, SCTLR_CACHED, False, stacks[1], 0x2000), "shared pages"),
+        ((1, 0, 3, SCTLR_CACHED, False, 0x01000000), "unrelated page"),
     ):
         c.yes(not prepare_allowed(*args), f"model failed to refuse {label}")
+
+    reserved_lo, reserved_hi = stacks[1], stacks[3] + 0xFFF
+    monitor_stack, monitor_image, autoboot = 0x00100000, 0x00200000, 0x001FF000
+    c.yes(monitor_stack < reserved_lo and reserved_hi < autoboot and
+          reserved_hi < monitor_image,
+          "reserved pages overlap primary stack, autoboot or image base")
+    c.yes(reserved_hi + 1 == autoboot,
+          "reserved pages are not the exact band below autoboot")
+    for image_end in (0x00200001, 0x00402918, 0x02000000, 0x07EFFFFF):
+        c.yes(reserved_hi < monitor_image <= image_end,
+              f"image growth reached fixed raw stacks at {image_end:#x}")
 
 
 def parse_symbols(image: Path) -> dict[str, int]:
@@ -480,7 +520,7 @@ def scratch_clobber_checks(c: Checks, a64, image: Path, asm: str) -> None:
           "join scratch clobber destroyed the control-row address")
 
 
-def mutation_checks(c: Checks, core: str, mmu: str) -> None:
+def mutation_checks(c: Checks, core: str, mmu: str, memmap: str) -> None:
     mutations = [
         ("cold record clean", "MmuCleanRange(boot, #CORE_RAW_STRIDE)", "MmuCleanRange(boot, 0)"),
         ("control row clean", "MmuCleanRange(row, #CORE_RAW_STRIDE)", "MmuCleanRange(row, 0)"),
@@ -501,16 +541,22 @@ def mutation_checks(c: Checks, core: str, mmu: str) -> None:
         ("join SMPEN refusal", "    cbz  x10, mmuSecJoinFail", "    nop"),
         ("all-level cache discovery", "    movz x14, #0", "    mrs  x14, clidr_el1"),
         ("raw parameters", "ProcedureNaked MmuSecondaryJoinRaw()", "ProcedureNaked MmuSecondaryJoinRaw(bad.i)"),
+        ("stack owner check", "If CoreRawStackOwned(core, stackBase, stackBytes) = 0", "If 0 = 1"),
+        ("exact stack pair", "If stackBase <> owned Or stackBytes <> bytes", "If 0 = 1"),
+        ("running monitor overlap", "If stackBase <= HwMonHi() And HwMonLo() < top", "If 0 = 1"),
+        ("monitor reservation", "  ProcedureReturn 5\nEndProcedure", "  ProcedureReturn 4\nEndProcedure"),
     ]
     for name, old, new in mutations:
-        owner = core if old in core else mmu
+        owner = core if old in core else (mmu if old in mmu else memmap)
         c.yes(old in owner, f"mutation pattern disappeared: {name}")
         changed = owner.replace(old, new, 1)
         try:
             if owner is core:
-                source_checks(Checks(), changed, mmu)
+                source_checks(Checks(), changed, mmu, memmap)
+            elif owner is mmu:
+                source_checks(Checks(), core, changed, memmap)
             else:
-                source_checks(Checks(), core, changed)
+                source_checks(Checks(), core, mmu, changed)
         except AssertionError:
             c.yes(True, f"mutation killed: {name}")
         else:
@@ -518,24 +564,268 @@ def mutation_checks(c: Checks, core: str, mmu: str) -> None:
 
 
 def build(pmfc: str, work: Path, fixture: Path = FIXTURE,
-          stem: str = "core_worker") -> tuple[Path, str]:
+          stem: str = "core_worker", source_root: Path = ROOT,
+          load_addr: int = LOAD) -> tuple[Path, str]:
     compiler_dir = work / "compiler"
     compiler_dir.mkdir(parents=True, exist_ok=True)
     staged = anvil_build.staged_compiler(pmfc, compiler_dir)
     image = work / f"{stem}.img"
     env = os.environ.copy()
-    env["PMF_ROOT"] = str(ROOT)
-    cmd = [staged, str(fixture.relative_to(ROOT)).replace("\\", "/"),
-           "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
+    env["PMF_ROOT"] = str(source_root)
+    cmd = [staged, str(fixture.relative_to(source_root)).replace("\\", "/"),
+           "-t", "pi4", "--load-addr", hex(load_addr), "--stack-addr", hex(STACK),
            "--entry-returns", "-S", "-s", "-o", str(image)]
-    result = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
+    result = subprocess.run(cmd, cwd=source_root, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode or not image.is_file():
         raise AssertionError("fixture build failed:\n" + result.stdout)
     return image, Path(str(image) + ".asm").read_text(encoding="utf-8")
 
 
+def main_fixture_check(c: Checks, a64, image: Path,
+                       expected_return: int = 0, load_addr: int = LOAD,
+                       refused_calls: frozenset[int] | None = None) -> tuple[int, int]:
+    blob = image.read_bytes()
+    sym = parse_symbols(image)
+    required = (
+        "__image_start__", "__image_end__", "__bss_start__", "__bss_end__",
+        "main", "corerawprepare", "global_core_raw_boot",
+        "global_core_raw_row", "global_core_raw_prepared",
+        "global_core_raw_released", "global_core_raw_stackbase",
+        "global_core_raw_stacktop", "global_core_raw_err",
+    )
+    missing = [name for name in required if name not in sym]
+    c.yes(not missing, "main fixture symbols missing: " + ", ".join(missing))
+    code = (load_addr, load_addr + len(blob))
+    bss = (sym["__bss_start__"], sym["__bss_end__"])
+    stack = (STACK - 0x10000, STACK)
+
+    def inside(span: tuple[int, int], address: int, size: int) -> bool:
+        return size > 0 and span[0] <= address and address + size <= span[1]
+
+    c.yes(sym["__image_start__"] == 0 and sym["__image_end__"] == len(blob),
+          "main fixture symbol/image extent mismatch")
+    c.yes(bss[1] > bss[0], "main fixture BSS is empty or reversed")
+    spans = (code, bss, stack)
+    c.yes(all(not (left[0] < right[1] and right[0] < left[1])
+              for index, left in enumerate(spans)
+              for right in spans[index + 1:]),
+          "main fixture code/BSS/stack admission overlaps")
+    for name in ("main", "corerawprepare"):
+        c.yes(0 <= sym[name] < len(blob) and sym[name] % 4 == 0,
+              f"invalid emitted procedure offset: {name}")
+    for name in required[6:]:
+        c.yes(sym[name] % 8 == 0 and inside(bss, sym[name], 8),
+              f"invalid emitted BSS symbol: {name}")
+
+    cpu = a64.A64()
+    for offset, byte in enumerate(blob):
+        cpu.memory[load_addr + offset] = byte
+    a64.attach_symbols(cpu, image, load_addr)
+    spin_slots = (0xD8, 0xE0, 0xE8, 0xF0)
+    boot = (sym["global_core_raw_boot"] + ALIGN - 1) & -ALIGN
+    row = (sym["global_core_raw_row"] + ALIGN - 1) & -ALIGN
+    watched = {
+        "boot": (boot, boot + 4 * STRIDE),
+        "row": (row, row + 4 * STRIDE),
+        "prepared": (sym["global_core_raw_prepared"],
+                     sym["global_core_raw_prepared"] + 32),
+        "released": (sym["global_core_raw_released"],
+                     sym["global_core_raw_released"] + 32),
+        "stackbase": (sym["global_core_raw_stackbase"],
+                      sym["global_core_raw_stackbase"] + 32),
+        "stacktop": (sym["global_core_raw_stacktop"],
+                     sym["global_core_raw_stacktop"] + 32),
+    }
+    for label, span in watched.items():
+        c.yes(inside(bss, span[0], span[1] - span[0]),
+              f"complete protected {label} extent escapes exact BSS")
+    protected_rows = list(watched.items())
+    c.yes(all(not (left[0] < right[1] and right[0] < left[1])
+              for index, (_, left) in enumerate(protected_rows)
+              for _, right in protected_rows[index + 1:]),
+          "protected record/metadata extents overlap")
+    watched.update({f"spin_{address:x}": (address, address + 8)
+                    for address in spin_slots})
+    watched_writes: list[tuple[str, int, int]] = []
+    spin_reads: list[int] = []
+
+    def overlap(span: tuple[int, int], address: int, size: int) -> bool:
+        return address < span[1] and span[0] < address + size
+
+    def load(address: int, size: int) -> int:
+        cpu.align_guard(address, size, False)
+        if cpu.fetching:
+            if not inside(code, address, size):
+                raise AssertionError("instruction fetch outside admitted image")
+        elif not (inside(code, address, size) or inside(bss, address, size) or
+                  inside(stack, address, size) or
+                  (address in spin_slots and size == 8)):
+            raise AssertionError(f"read outside admitted RAM/spin slot: {address:#x}+{size}")
+        if address in spin_slots:
+            spin_reads.append(address)
+        return sum(cpu.memory.get(address + i, 0) << (8 * i) for i in range(size))
+
+    def store(address: int, value: int, size: int) -> None:
+        cpu.align_guard(address, size, True)
+        if not (inside(bss, address, size) or inside(stack, address, size) or
+                (address in spin_slots and size == 8)):
+            raise AssertionError(f"write outside admitted BSS/stack/spin slot: {address:#x}+{size}")
+        for label, span in watched.items():
+            if overlap(span, address, size):
+                watched_writes.append((label, address, size))
+        for i in range(size):
+            cpu.memory[address + i] = (value >> (8 * i)) & 0xFF
+
+    cpu.load, cpu.store = load, store
+
+    def must_refuse(action, diagnostic: str) -> None:
+        try:
+            action()
+        except AssertionError as error:
+            c.yes(diagnostic in str(error),
+                  f"wrong guard diagnostic for {diagnostic}: {error}")
+        else:
+            c.yes(False, f"guard failed to reject {diagnostic}")
+
+    must_refuse(lambda: load(0x10000000, 8), "outside admitted RAM")
+    must_refuse(lambda: store(code[0], 0, 4), "outside admitted BSS")
+    must_refuse(lambda: store(stack[0] - 8, 0, 8), "outside admitted BSS")
+    must_refuse(lambda: load(0xD0, 8), "outside admitted RAM")
+    must_refuse(lambda: load(0xE0, 4), "outside admitted RAM")
+    cpu.fetching = True
+    try:
+        must_refuse(lambda: load(bss[0], 4), "fetch outside admitted image")
+        must_refuse(lambda: load(stack[0], 4), "fetch outside admitted image")
+    finally:
+        cpu.fetching = False
+
+    cpu.enable_system_registers(
+        el=3,
+        preset={
+            MPIDR_EL1_KEY: 0,
+            SCTLR_EL3_KEY: SCTLR_CACHED,
+            0xD51E2000: 0x00900000,  # TTBR0_EL3
+            0xD51E2040: 0x0000000080803520,  # TCR_EL3
+            0xD51EA200: 0x00000000FF440400,  # MAIR_EL3
+        },
+    )
+    cpu.pc = load_addr
+    cpu.sp = STACK
+    cpu.x[29] = 0x2929292929292929
+    cpu.x[30] = RETURN_PC
+    main_pc = load_addr + sym["main"]
+    prepare_pc = load_addr + sym["corerawprepare"]
+    poisoned = False
+    calls = 0
+    active = None
+    dc_ops: list[int] = []
+
+    def snapshot() -> bytes:
+        spans = list(watched.values())
+        return bytes(cpu.memory.get(address, 0)
+                     for lo, hi in spans for address in range(lo, hi))
+
+    for steps in range(500_000):
+        if cpu.pc == main_pc and not poisoned:
+            for offset in range(0, 4 * STRIDE, 8):
+                cpu.raw_store(boot + offset, 0x1122334455667788, 8)
+                cpu.raw_store(row + offset, 0x2233445566778899, 8)
+            cpu.raw_store(0xE0, 0x33445566778899AA, 8)
+            poisoned = True
+        if cpu.pc == prepare_pc and active is None:
+            calls += 1
+            active = (cpu.x[30], snapshot(), len(watched_writes), len(dc_ops),
+                      len(spin_reads))
+        if active is not None and cpu.pc == active[0]:
+            before = active
+            call_writes = watched_writes[before[2]:]
+            call_dc = len(dc_ops) - before[3]
+            required_refusals = (frozenset(range(1, 5)) if refused_calls is None
+                                 and expected_return == 0 else
+                                 (refused_calls or frozenset()))
+            if calls in required_refusals:
+                c.yes(not call_writes,
+                      f"refused Prepare {calls} wrote protected state: {call_writes}")
+                c.yes(snapshot() == before[1],
+                      f"refused Prepare {calls} changed protected bytes")
+                c.yes(call_dc == 0,
+                      f"refused Prepare {calls} issued {call_dc} cache operations")
+                c.yes(len(spin_reads) == before[4],
+                      f"refused Prepare {calls} read a firmware spin slot")
+            elif expected_return == 0:
+                labels = {item[0] for item in call_writes}
+                c.yes({"boot", "row", "prepared", "stackbase",
+                       "stacktop"}.issubset(labels),
+                      f"valid Prepare did not publish every protected field: {labels}")
+                c.yes("released" not in labels,
+                      "Prepare changed release ownership before release")
+                c.yes(not any(label.startswith("spin_") for label in labels),
+                      "Prepare wrote a firmware spin slot")
+                c.yes(call_dc == 8,
+                      f"valid Prepare issued {call_dc} cache operations, expected 8")
+            active = None
+        if cpu.pc == RETURN_PC:
+            c.yes(cpu.x[0] == expected_return,
+                  f"primary ownership fixture returned {cpu.x[0]}")
+            if expected_return == 0:
+                c.yes(poisoned, "real Main entry was not observed")
+                c.yes(active is None and calls == 5,
+                      f"expected five completed Prepare routes, observed {calls}")
+            elif refused_calls:
+                c.yes(active is None and calls == max(refused_calls),
+                      f"expected {max(refused_calls)} completed refused routes, observed {calls}")
+            c.yes(cpu.sp == STACK and cpu.x[29] == 0x2929292929292929,
+                  "entry-return stack/frame-pointer contract was not preserved")
+            return steps, 7
+        ins = sum(cpu.memory.get(cpu.pc + i, 0) << (8 * i) for i in range(4))
+        if (ins & 0xFFF80000) == 0xD5080000:
+            dc_ops.append(ins)
+        cpu.step()
+    raise AssertionError("primary ownership fixture did not return")
+
+
+def build_ownership_mutant(pmfc: str, work: Path, label: str,
+                           owner: str, old: str, new: str,
+                           load_addr: int = LOAD) -> tuple[Path, str]:
+    root = work / f"ownership-mutant-{label}"
+    for relative in (
+        Path("RaspberryPi4/Board/memmap.pi4"),
+        Path("RaspberryPi4/Lib/mmu.pi4"),
+        Path("RaspberryPi4/Lib/mmu_secondary.pi4"),
+        Path("RaspberryPi4/Lib/core_worker.pi4"),
+        Path("RaspberryPi4/Tests/core_worker_emitted_gate.pi4"),
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
+    shutil.copytree(ROOT / "Boards", root / "Boards")
+    shutil.copytree(
+        ROOT / "RaspberryPi4" / "Intrinsics",
+        root / "RaspberryPi4" / "Intrinsics",
+    )
+    path = root / owner
+    source = path.read_text(encoding="utf-8")
+    if source.count(old) != 1:
+        raise AssertionError(
+            f"emitted mutant {label} expected one source match, found {source.count(old)}"
+        )
+    path.write_text(source.replace(old, new, 1), encoding="utf-8", newline="\n")
+    return build(
+        pmfc,
+        root / "out",
+        root / "RaspberryPi4" / "Tests" / "core_worker_emitted_gate.pi4",
+        f"core_worker_{label}",
+        root,
+        load_addr,
+    )
+
+
 def main() -> int:
+    if not __debug__:
+        print("a64_core_worker_check: FAIL - Python -O disables interpreter assertions")
+        return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
     parser.add_argument("--interp", default=str(INTERP))
@@ -544,23 +834,97 @@ def main() -> int:
     try:
         core = CORE.read_text(encoding="utf-8")
         mmu = MMUSEC.read_text(encoding="utf-8")
-        source_checks(checks, core, mmu)
+        memmap = MEMMAP.read_text(encoding="utf-8")
+        source_checks(checks, core, mmu, memmap)
         model_checks(checks)
-        mutation_checks(checks, core, mmu)
+        mutation_checks(checks, core, mmu, memmap)
         compiler = anvil_build.find_compiler(args.pmfc)
         with tempfile.TemporaryDirectory(prefix="anvil-core-worker-") as name:
             work = Path(name)
             image, asm = build(compiler, work / "real")
             emitted_checks(checks, asm)
-            interpreter_checks(checks, load_interp(Path(args.interp)), image)
+            a64 = load_interp(Path(args.interp))
+            primary_steps, primary_guards = main_fixture_check(checks, a64, image)
+            relocated_load = 0x001FC000
+            relocated_image, _ = build(
+                compiler, work / "relocated", stem="core_worker_relocated",
+                load_addr=relocated_load)
+            relocated_steps, _ = main_fixture_check(
+                checks, a64, relocated_image, expected_return=0,
+                load_addr=relocated_load, refused_calls=frozenset(range(1, 6)))
+            interpreter_checks(checks, a64, image)
             scratch_image, scratch_asm = build(
                 compiler, work / "scratch", SCRATCH_FIXTURE, "core_worker_scratch")
             scratch_clobber_checks(
                 checks, load_interp(Path(args.interp)), scratch_image, scratch_asm)
+            emitted_mutants = (
+                (
+                    "prepare_guard",
+                    "RaspberryPi4/Lib/core_worker.pi4",
+                    "If CoreRawStackOwned(core, stackBase, stackBytes) = 0",
+                    "If 0 = 1",
+                    14,
+                    LOAD,
+                ),
+                (
+                    "exact_pair",
+                    "RaspberryPi4/Lib/core_worker.pi4",
+                    "If stackBase <> owned Or stackBytes <> bytes",
+                    "If 0 = 1",
+                    7,
+                    LOAD,
+                ),
+                (
+                    "monitor_region",
+                    "RaspberryPi4/Board/memmap.pi4",
+                    "Procedure.i HwMonRegions()\n  ProcedureReturn 5",
+                    "Procedure.i HwMonRegions()\n  ProcedureReturn 4",
+                    5,
+                    LOAD,
+                ),
+                (
+                    "shared_page",
+                    "RaspberryPi4/Board/memmap.pi4",
+                    "Case 2 : ProcedureReturn #CORE_RAW_STACK_LO + #CORE_RAW_STACK_PAGE",
+                    "Case 2 : ProcedureReturn #CORE_RAW_STACK_LO",
+                    3,
+                    LOAD,
+                ),
+                (
+                    "running_image_overlap",
+                    "RaspberryPi4/Lib/core_worker.pi4",
+                    "If stackBase <= HwMonHi() And HwMonLo() < top",
+                    "If 0 = 1",
+                    23,
+                    relocated_load,
+                ),
+            )
+            mutant_steps = 0
+            for label, owner, old, new, expected, mutant_load in emitted_mutants:
+                mutant_image, _ = build_ownership_mutant(
+                    compiler, work, label, owner, old, new, mutant_load
+                )
+                before = checks.count
+                try:
+                    used, _ = main_fixture_check(
+                        checks, a64, mutant_image, expected_return=expected,
+                        load_addr=mutant_load)
+                except AssertionError as error:
+                    raise AssertionError(
+                        f"emitted mutant {label} failed before its expected route: {error}"
+                    ) from error
+                else:
+                    mutant_steps += used
+                    checks.count = before + 1
     except (AssertionError, OSError, subprocess.SubprocessError, RuntimeError) as error:
         print(f"a64_core_worker_check: FAIL after {checks.count} checks: {error}")
         return 1
     print(f"a64_core_worker_check: PASS - {checks.count} source/model/emitted/interpreter checks")
+    print(f"Primary ownership fixture returned in {primary_steps:,} instructions; "
+          f"5 Prepare routes and {primary_guards} active memory guards; "
+          "5 emitted ownership mutants rejected.")
+    print(f"Relocated-image overlap fixture refused the fifth Prepare route in "
+          f"{relocated_steps:,} instructions.")
     print("No board was contacted; caches, WFE/SEV, coherency and parallelism remain silicon checks.")
     return 0
 

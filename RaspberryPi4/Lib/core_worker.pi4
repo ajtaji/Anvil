@@ -1,9 +1,9 @@
 ; ======================================================================
 ;  core_worker.pi4 - cache-coherent raw-secondary bootstrap, milestone 1
 ;
-;  Requires mmu.pi4 and mmu_secondary.pi4 before this file.  It is not in the
-;  board include graph yet.  It releases no core unless a future primary-only
-;  caller explicitly prepares and releases one.
+;  Requires the board memmap accessors, mmu.pi4 and mmu_secondary.pi4 before
+;  this file.  It is not in the board include graph yet.  It releases no core
+;  unless a future primary-only caller explicitly prepares and releases one.
 ;
 ;  This is deliberately NOT CoreStart(callback).  Ordinary generated A64
 ;  parameters and locals live in fixed BSS slots and are not reentrant.  The
@@ -77,6 +77,7 @@
 #CORE_RAW_ERR_RANGE      = -9
 #CORE_RAW_ERR_TIMEOUT    = -10
 #CORE_RAW_ERR_STATE      = -11
+#CORE_RAW_ERR_OWNERSHIP  = -12
 
 ; Over-allocation plus runtime round-up gives every record and row a 256-byte
 ; base even though the emitter guarantees only aggregate BSS alignment.  The
@@ -190,8 +191,28 @@ Procedure.i CoreRawResult(core.i, slot.i)
   ProcedureReturn PeekI(row + slot * 8)
 EndProcedure
 
-; Primary-only validation and immutable-record construction. The stack region
-; is rounded inward and must not overlap another prepared secondary stack.
+; A raw secondary may use only the exact page assigned by the board map.
+; Keeping this predicate separate makes wrong-core, partial, shared and
+; unrelated ranges testable without touching a cold record, control row,
+; cache line or firmware spin slot.
+Procedure.i CoreRawStackOwned(core.i, stackBase.i, stackBytes.i)
+  Define owned.i
+  Define bytes.i
+  owned = HwCoreRawStackBase(core)
+  bytes = HwCoreRawStackBytes(core)
+  If owned = 0 Or bytes <> #CORE_RAW_STACK_MIN
+    ProcedureReturn 0
+  EndIf
+  If stackBase <> owned Or stackBytes <> bytes
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Primary-only validation and immutable-record construction. The board's exact
+; core/page pair is required; later alignment/range checks do not round a
+; caller-supplied substitute into ownership. It must not overlap another
+; prepared secondary stack.
 Procedure.i CoreRawPrepare(core.i, stackBase.i, stackBytes.i, context.i)
   Define top.i
   Define other.i
@@ -227,6 +248,14 @@ Procedure.i CoreRawPrepare(core.i, stackBase.i, stackBytes.i, context.i)
     ProcedureReturn 0
   EndIf
 
+  ; The board owns exactly one page per secondary. Refuse an offset, short,
+  ; oversized, shared, other-core or otherwise unrelated range before the
+  ; first record/row write, cache operation or spin-slot access.
+  If CoreRawStackOwned(core, stackBase, stackBytes) = 0
+    core_raw_err = #CORE_RAW_ERR_OWNERSHIP
+    ProcedureReturn 0
+  EndIf
+
   If stackBase = 0 Or stackBytes < #CORE_RAW_STACK_MIN Or (stackBase & 7) <> 0
     core_raw_err = #CORE_RAW_ERR_STACK
     ProcedureReturn 0
@@ -238,6 +267,13 @@ Procedure.i CoreRawPrepare(core.i, stackBase.i, stackBytes.i, context.i)
     ProcedureReturn 0
   EndIf
   If stackBase < #CORE_RAW_LOW_RESERVED Or top > #CORE_RAW_PERIPH_LO
+    core_raw_err = #CORE_RAW_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  ; Fixed board ownership is not enough when the monitor is deliberately
+  ; linked somewhere other than its canonical base. Refuse an exact raw stack
+  ; page that overlaps the actual running image before touching cold state.
+  If stackBase <= HwMonHi() And HwMonLo() < top
     core_raw_err = #CORE_RAW_ERR_RANGE
     ProcedureReturn 0
   EndIf

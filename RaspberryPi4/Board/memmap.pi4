@@ -146,6 +146,36 @@
 #AB_MAGIC  = $5041594C4F414421 ; "PAYLOAD!" - positive in a signed .i
 
 ; ----------------------------------------------------------------------
+;  RAW SECONDARY STACK RESERVATION - INACTIVE, BOARD OWNED
+;
+;  Cores 1..3 each own one exact 4 KiB page immediately below the autoboot
+;  page. The whole $001FC000..$001FEFFF band is below the fixed firmware load
+;  address, above the primary stack top, outside BSS, framebuffer and both
+;  payload windows, and cannot move when the linked image grows upward.
+;  core_worker.pi4 is not in the live include graph; these accessors establish
+;  ownership and monitor protection without activating a secondary core.
+; ----------------------------------------------------------------------
+#CORE_RAW_STACK_LO    = $001FC000
+#CORE_RAW_STACK_PAGE  = $00001000
+#CORE_RAW_STACK_HI    = $001FEFFF
+
+Procedure.i HwCoreRawStackBase(core.i)
+  Select core
+    Case 1 : ProcedureReturn #CORE_RAW_STACK_LO
+    Case 2 : ProcedureReturn #CORE_RAW_STACK_LO + #CORE_RAW_STACK_PAGE
+    Case 3 : ProcedureReturn #CORE_RAW_STACK_LO + (#CORE_RAW_STACK_PAGE * 2)
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwCoreRawStackBytes(core.i)
+  If core >= 1 And core <= 3
+    ProcedureReturn #CORE_RAW_STACK_PAGE
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  THE MONITOR'S DATA WINDOW - the Globals, put there by --bss-addr.
 ;
 ;  UNCHANGED 2026-09-08 except that it is now one of the regions the
@@ -407,7 +437,7 @@ EndProcedure
 ;  these.
 ;
 ;  So the board enumerates and the core walks. HitsMonitor() is a loop
-;  over HwMonRegions() and it does not change again when a fourth region
+;  over HwMonRegions() and it does not change again when another region
 ;  appears; it is written once here, per board, beside the constants it
 ;  describes.
 ;
@@ -416,7 +446,7 @@ EndProcedure
 ;  one whose extent moved.
 ; ======================================================================
 Procedure.i HwMonRegions()
-  ProcedureReturn 4
+  ProcedureReturn 5
 EndProcedure
 
 Procedure.i HwMonRegionLo(i.i)
@@ -425,6 +455,7 @@ Procedure.i HwMonRegionLo(i.i)
     Case 1 : ProcedureReturn #MON_DATA_LO
     Case 2 : ProcedureReturn #AB_BASE
     Case 3 : ProcedureReturn #MON_FB_LO
+    Case 4 : ProcedureReturn #CORE_RAW_STACK_LO
   EndSelect
   ; A region index this board does not have. Answering an address here
   ; would make HitsMonitor() refuse a range for a region that does not
@@ -439,6 +470,7 @@ Procedure.i HwMonRegionHi(i.i)
     Case 1 : ProcedureReturn #MON_DATA_HI
     Case 2 : ProcedureReturn #AB_BASE + #AB_BYTES - 1
     Case 3 : ProcedureReturn #MON_FB_HI
+    Case 4 : ProcedureReturn #CORE_RAW_STACK_HI
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -457,6 +489,8 @@ Procedure HwMonRegionSay(i.i)
       Print("the autoboot record")
     Case 3
       Print("the DSI framebuffer")
+    Case 4
+      Print("the reserved raw-secondary stacks")
     Default
       Print("a region this board does not have")
   EndSelect

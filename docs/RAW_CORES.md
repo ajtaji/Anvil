@@ -46,12 +46,23 @@ appears only in cluster power-down.
 `RaspberryPi4/Lib/core_worker.pi4` owns the spin-table handoff and the permanent
 raw state witness. Bootstrap records and result rows are separate
 over-allocated BSS objects; both bases are rounded up to 256 bytes and each core
-uses a distinct 256-byte stride. Each stack is separate and 16-byte aligned.
+uses a distinct 256-byte stride. `RaspberryPi4/Board/memmap.pi4` owns one exact
+4 KiB stack page per secondary: core 1 owns `$001FC000..$001FCFFF`, core 2 owns
+`$001FD000..$001FDFFF`, and core 3 owns `$001FE000..$001FEFFF`. The complete
+band is immediately below the autoboot page at `$001FF000`, above the primary
+stack top at `$00100000`, and below the fixed linked-image base at `$00200000`.
+It is independent of upward image growth and outside the BSS, framebuffer and
+payload windows. The board monitor-map enumeration includes the complete band
+as a protected region even while the raw-core library remains inactive.
 
 The primary-only sequence is:
 
 1. Refuse core 0, a non-primary caller, EL other than 3, an uncached primary,
-   an absent/overlapping stack, a busy spin slot, or a repeated preparation.
+   any stack other than the target core's exact board-owned page, a busy spin
+   slot, a repeated preparation, or an exact page that overlaps the actual
+   running monitor after a noncanonical link. The ownership and running-image
+   checks precede every bootstrap/control-row write, cache operation and
+   firmware spin-slot access.
 2. Record an immutable per-core cold record containing stack, context, row,
    exception level and the primary's live EL-specific translation registers.
 3. Initialise the separate control row to `PREPARED`, then clean the complete
@@ -87,16 +98,43 @@ Run:
 python tools/a64/a64_core_worker_check.py --pmfc <path-to-pmfc>
 ```
 
-The gate compiles the real fixture with emitted assembly, checks that both raw
-procedures have no generated frames or static-BSS access, allowlists the single
-raw MMU call, verifies the EL3 register sequence, private-L1-only set/way
-operands, release/acquire and spin-slot clean/barrier/event order, and checks that `READY` follows every
-mapping witness. Mutation controls remove cold-record cleaning, row cleaning,
-spin-slot cleaning, the barrier, event, acquire, release, MMU join, cache
-invalidation, EL3 TLB invalidation, requested M/C/I guard, the register-only
-pre-DRAM cold-state/SMPEN refusals and the join's defensive refusals. It also
-injects CLIDR all-level discovery, premature READY, a wrong row stride and a
-declared raw parameter. Every mutation must be killed.
+The gate refuses Python `-O`, compiles the real fixture with emitted assembly,
+and executes its `Main` entry in the A64 interpreter. That primary execution
+admits only the exact flat image for instruction fetch, the emitted BSS, a
+bounded 64 KiB primary stack and the four exact 64-bit firmware spin slots.
+Seven active negative probes prove that reads, writes and fetches outside those
+regions (including wrong-width and nearby low-memory spin accesses) are
+rejected. After the generated entry's BSS clear and before `Main`, the host
+poisons every byte of all four 256-byte boot records and control rows plus
+core 1's spin slot. Each complete watched BSS extent is independently admitted
+and checked for overlap. It then traces all five actual `CoreRawPrepare` calls:
+all four ownership refusals must leave every poisoned byte and all ownership
+metadata unchanged, issue no data-cache operation, read no spin slot and
+perform no protected store; the
+one valid route must publish the boot/row/stack metadata, leave release state
+and spin slots alone, and execute exactly the eight cache-line cleans for the
+two 256-byte regions. The returned entry stack and frame-pointer are also
+checked. A second build links that same decoded fixture at `$001FC000`, inside
+core 1's otherwise valid page; its fifth preparation must return the precise
+range refusal without protected stores or cache operations. Removing the
+running-image overlap check makes that relocated fixture take the success route
+and is a required mutation kill. This is off-board control-flow evidence, not a
+claim that a core was released.
+
+The remaining gate checks that both raw procedures have no generated
+frames or static-BSS access, allowlists the single raw MMU call, verifies the
+EL3 register sequence, private-L1-only set/way operands, release/acquire and
+spin-slot clean/barrier/event order, and checks that `READY` follows every
+mapping witness. It verifies all three exact stack pages, the protected monitor
+region, and refusal of wrong-core, partial, shared and unrelated ranges. Four independently
+compiled ownership mutants remove the prepare guard, remove exact-pair matching,
+remove the monitor region, or give two cores one page; their emitted programs
+must fail at the expected assertion routes. Additional source mutations remove
+cold-record cleaning, row cleaning, spin-slot cleaning, the barrier, event,
+acquire, release, MMU join, cache invalidation, EL3 TLB invalidation, requested
+M/C/I guard, the register-only pre-DRAM cold-state/SMPEN refusals and the join's
+defensive refusals. They also inject CLIDR all-level discovery, premature READY,
+a wrong row stride and a declared raw parameter. Every mutation must be killed.
 
 Three independent interpreter instances then execute the emitted secondary
 entry over one shared byte dictionary. They prove distinct core IDs, stacks and
@@ -122,10 +160,11 @@ behaviour, simultaneous execution, speed or any silicon result.
 
 After the board owner explicitly wires this inactive library and grants an
 attended lease, the first proof should release one secondary only. Record the
-fresh monitor map and verify that its stack, bootstrap record, row and the
-firmware slot are disjoint and resident. Arm the primary-owned deadman, prepare
-core 1, release it, and use a bounded wait without petting the watchdog. Require
-`READY`, core ID 1, the exact stack and row, EL matching the primary, and exact
+fresh monitor map and verify that the reserved `$001FC000..$001FEFFF` band,
+bootstrap record, row and firmware slot are disjoint and resident. Arm the
+primary-owned deadman, prepare core 1 with only its `$001FC000` page, release
+it, and use a bounded wait without petting the watchdog. Require `READY`, core
+ID 1, the exact stack and row, EL matching the primary, and exact
 TTBR/TCR/MAIR/SCTLR witnesses. A timeout is a failure, not permission to release
 another core.
 
