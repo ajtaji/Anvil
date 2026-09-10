@@ -636,6 +636,23 @@ Procedure CmdWifi()
     Print("  rekeys not serviced       ")
     PrintDec(gWifiEapolErr)
     PrintNl()
+    If gWifiEapolFailStage <> #WIFI_EAPOL_FAIL_NONE
+      Print("  last failure              ")
+      UartWriteStr(wifi_EapolFailureName(gWifiEapolFailStage))
+      Print(" (stage ")
+      PrintDec(gWifiEapolFailStage)
+      Print(", rc ")
+      PrintDec(gWifiEapolFailRc)
+      PrintN(")")
+    Else
+      PrintN("  last failure              none")
+    EndIf
+    Print("  failure cleanup pending   ")
+    If gWifiEapolRecover <> 0
+      PrintN("YES")
+    Else
+      PrintN("no")
+    EndIf
     Print("  re-associations (want 0)  ")
     PrintDec(WifiRejoinCount())
     PrintNl()

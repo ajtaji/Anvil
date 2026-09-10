@@ -495,8 +495,48 @@ EndProcedure
 #WIFI_EAPOL_M1_MS   = 2600
 #WIFI_EAPOL_M3_MS   = 800
 
+; Exact EAPOL failure ownership. Foreground join failures are diagnostic only;
+; steady-state failures additionally latch a deferred outer-service action.
+; The receive callback never tears down or re-enters the radio/network stack.
+#WIFI_EAPOL_FAIL_NONE        = 0
+#WIFI_EAPOL_FAIL_JOIN_M2_TX  = 1
+#WIFI_EAPOL_FAIL_JOIN_M4_TX  = 2
+#WIFI_EAPOL_FAIL_REKEY_M2_TX = 3
+#WIFI_EAPOL_FAIL_REKEY_M4_TX = 4
+#WIFI_EAPOL_FAIL_REKEY_PTK   = 5
+#WIFI_EAPOL_FAIL_REKEY_M4_GTK = 6
+#WIFI_EAPOL_FAIL_REKEY_G2_TX = 7
+#WIFI_EAPOL_FAIL_REKEY_NONCE = 8
+#WIFI_EAPOL_FAIL_REKEY_G2_GTK = 9
+
+Global gWifiEapolFailStage.i = #WIFI_EAPOL_FAIL_NONE
+Global gWifiEapolFailRc.i = 0
+Global gWifiEapolRecover.i = 0
+Global gWifiEapolRecoverStage.i = #WIFI_EAPOL_FAIL_NONE
+Global gWifiEapolRecoverRc.i = 0
 Global gWifiKeyed.i = 0
 Global gWifiSecDone.i = 0
+Global gWifiHaveIp.i = 0
+Global gWifiIp.i = 0
+
+Procedure wifi_RecordEapolFailure(stage.i, rc.i, deferred.i)
+  gWifiEapolFailStage = stage
+  gWifiEapolFailRc = rc
+  ; Preserve the first pending failure until its owning outer service turn.
+  If deferred <> 0 And gWifiEapolRecover = 0
+    gWifiEapolRecoverStage = stage
+    gWifiEapolRecoverRc = rc
+    gWifiEapolRecover = 1
+    ; Scalar eligibility closes synchronously when the receive callback
+    ; returns. HwLinkReady consults gWifiKeyed, so no subsequent IP send can
+    ; select this partially changed session while outer service is pending.
+    ; DHCP/interface cleanup itself remains outside the callback.
+    gWifiKeyed = 0
+    gWifiHaveIp = 0
+    gWifiSecDone = 0
+  EndIf
+EndProcedure
+
 Global Dim wifi_ourMac.a[6]
 ; Scratch for reading back the hardware address on net.pi4's row for the
 ; radio, so wifi_NetAddrIsOurs can compare it with the radio's own
@@ -624,7 +664,24 @@ Procedure wifi_ReadAssocIe()
   Wend
 EndProcedure
 
-; The four-way handshake on a fresh association. wifi_pmk must be set.
+; Finish one foreground supplicant transaction. The handshake borrows its PMK
+; from wifi_TrySlot; it owns only the supplicant/key-install scratch. A failed
+; transaction must wipe that scratch, while a keyed transaction keeps the
+; armed session material needed for a later group rekey.
+Procedure.i wifi_HandshakeFinish(keyed.i)
+  If keyed <> 0
+    Wpa2SupSessionArm()
+  Else
+    Wpa2SupWipe()
+  EndIf
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  ProcedureReturn keyed
+EndProcedure
+
+; The four-way handshake on a fresh association. wifi_pmk is borrowed and
+; remains caller-owned so the same candidate can make its one bounded retry.
 ; Returns 1 if both keys installed.
 Procedure.i wifi_Handshake()
   Define n.i
@@ -646,12 +703,9 @@ Procedure.i wifi_Handshake()
     r = Wpa2SupBegin(@wifi_pmk[0], @wifi_ourMac[0], @wifi_apMac[0], ?wifi_rsnIe, #WIFI_RSN_IE_LEN)
   EndIf
   If r = 0
-    ProcedureReturn 0
+    ProcedureReturn wifi_HandshakeFinish(0)
   EndIf
   Wpa2SupSetSnonce(@wifi_snonce[0])
-  For n = 0 To 31
-    wifi_pmk[n] = 0
-  Next
   m1 = 0
   m3 = 0
   keyed = 0
@@ -662,39 +716,39 @@ Procedure.i wifi_Handshake()
     If n >= 14
       code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
       If code = #WPA2SUP_SENT_M2
-        m1 = m1 + 1
-        wifi_SendSup()
-        t0 = millis()
-        waitMs = #WIFI_EAPOL_M3_MS
+        r = wifi_SendSup()
+        If r = 0
+          m1 = m1 + 1
+          t0 = millis()
+          waitMs = #WIFI_EAPOL_M3_MS
+        Else
+          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_JOIN_M2_TX, r, 0)
+          Print("Wi-Fi: handshake message 2 was not transmitted (driver rc ")
+          PrintDec(r)
+          PrintN(").")
+          Break
+        EndIf
       ElseIf code = #WPA2SUP_SENT_M4
-        m3 = 1
-        wifi_SendSup()
-        jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
-        r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
-        If jrc = 0 And r = 0
-          keyed = 1
+        r = wifi_SendSup()
+        If r = 0
+          m3 = 1
+          jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+          r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+          If jrc = 0 And r = 0
+            keyed = 1
+          EndIf
+        Else
+          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_JOIN_M4_TX, r, 0)
+          Print("Wi-Fi: handshake message 4 was not transmitted (driver rc ")
+          PrintDec(r)
+          PrintN(").")
+          Break
         EndIf
       EndIf
     EndIf
     wifi_Progress()
   Wend
-  If keyed <> 0
-    ; KEEP THE KEY MATERIAL. The KCK/KEK/PMK are needed to answer the
-    ; access point's mid-session rekey (see wpa2sup.pi4's MID-SESSION
-    ; REKEY section) - throwing them away here is what left the link
-    ; unable to complete the hourly group-key handshake, and TX-only
-    ; dead when it happened. Arm the session hold instead of wiping.
-    ; Wpa2SupWipe still runs on the next Wpa2SupBegin (a fresh join) and
-    ; leaves the material no longer than the association it belongs to,
-    ; which is exactly what wpa_supplicant keeps in RAM.
-    Wpa2SupSessionArm()
-  Else
-    Wpa2SupWipe()
-  EndIf
-  Cyw43KeyWipe()
-  AesWipe()
-  KwWipe()
-  ProcedureReturn keyed
+  ProcedureReturn wifi_HandshakeFinish(keyed)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -771,6 +825,19 @@ Procedure.i wifi_HexToBytes(p.i, dst.i, n.i)
   ProcedureReturn 1
 EndProcedure
 
+; Validate the complete stored cache row before decoding any part of it. This
+; prevents a malformed tail from leaving a partially replaced PMK in the
+; candidate buffer, including the fingerprint-zero ambiguity of HexToU32.
+Procedure.i wifi_HexValid(p.i, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    If wifi_HexVal(PeekA(p + i)) < 0
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
 ; FNV-1a over SSID, a separator, then the passphrase. 32-bit. Not a
 ; security hash - it only has to change when the credential changes.
 Procedure.i wifi_Fp(ssid.i, ssidLen.i, pass.i, passLen.i)
@@ -831,6 +898,21 @@ Procedure wifi_PersistPmkIfDirty()
   gWifiPmkDirty = 0
 EndProcedure
 
+; wifi_TrySlot owns the foreground candidate PMK and encoded cache scratch.
+; Wpa2Psk's private U/T/counter state is part of the same candidate lifetime.
+; This is deliberately separate from the armed Wpa2Sup session material.
+Procedure.i wifi_CandidateFinish(result.i)
+  Define i.i
+  For i = 0 To 31
+    wifi_pmk[i] = 0
+  Next
+  For i = 0 To 79
+    wifi_pmkVal[i] = 0
+  Next
+  Pbkdf2Wipe()
+  ProcedureReturn result
+EndProcedure
+
 ; One stored slot: derive its PMK, associate, run the handshake.
 Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
   Define pass.i
@@ -838,11 +920,6 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
   Define r.i
   Define slices.i
   Define verdict.i
-  pass    = SettingsWifiSlotPassword(slot)
-  passLen = SettingsLength(SettingsWifiSlotPasswordKey(slot))
-  If pass = 0 Or passLen < 8
-    ProcedureReturn 0
-  EndIf
   Define fp.i
   Define key.i
   Define cached.i
@@ -850,14 +927,29 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
   Define hi.i
   Define pskResult.i
   Define oldProgress.i
+  Define needsStore.i
+
+  ; This procedure is the sole owner of the foreground candidate buffer.
+  ; Start and every exit wipe leftovers from an earlier candidate, while the
+  ; successfully armed supplicant keeps its distinct session-owned copy.
+  wifi_CandidateFinish(0)
+  pass    = SettingsWifiSlotPassword(slot)
+  passLen = SettingsLength(SettingsWifiSlotPasswordKey(slot))
+  If pass = 0 Or passLen < 8
+    ProcedureReturn wifi_CandidateFinish(0)
+  EndIf
   fp = wifi_Fp(ssid, ssidLen, pass, passLen)
   key = wifi_PmkKey(slot)
   used = 0
+  needsStore = 0
   cached = SettingsGet(key)
   If cached <> 0
-    If SettingsLength(key) >= 72 And wifi_HexToU32(cached) = fp
-      wifi_HexToBytes(cached + 8, @wifi_pmk[0], 32)
-      used = 1
+    If SettingsLength(key) = 72 And wifi_HexValid(cached, 72) <> 0
+      If wifi_HexToU32(cached) = fp
+        If wifi_HexToBytes(cached + 8, @wifi_pmk[0], 32) <> 0
+          used = 1
+        EndIf
+      EndIf
     EndIf
   EndIf
   Print("  ")
@@ -870,18 +962,13 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
     oldProgress = Pbkdf2SetProgress(@wifi_Progress)
     pskResult = Wpa2Psk(pass, passLen, ssid, ssidLen, @wifi_pmk[0])
     Pbkdf2SetProgress(oldProgress)
+    Pbkdf2Wipe()
     If pskResult <> 32
       PrintN("    key derivation failed. Skipping.")
       wifi_Progress()
-      ProcedureReturn 0
+      ProcedureReturn wifi_CandidateFinish(0)
     EndIf
-    wifi_U32ToHex(@wifi_pmkVal[0], fp)
-    For hi = 0 To 31
-      wifi_ByteToHex(@wifi_pmkVal[0], 8 + hi * 2, wifi_pmk[hi])
-    Next
-    wifi_pmkVal[72] = 0
-    SettingsSet(key, @wifi_pmkVal[0])
-    gWifiPmkDirty = 1
+    needsStore = 1
   EndIf
   Cyw43Disassoc(2000)
   Cyw43DrainEvents(120)
@@ -922,13 +1009,28 @@ Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
     PrintN("    associated - running the four-way handshake...")
     wifi_Progress()
     If wifi_Handshake() <> 0
-      ProcedureReturn 1
+      ; A derived PMK is only an optimization until this candidate has both
+      ; pairwise and group keys installed. Publish it now, and only advertise
+      ; dirty persistence when SettingsSet actually accepted the complete row.
+      If needsStore <> 0
+        wifi_U32ToHex(@wifi_pmkVal[0], fp)
+        For hi = 0 To 31
+          wifi_ByteToHex(@wifi_pmkVal[0], 8 + hi * 2, wifi_pmk[hi])
+        Next
+        wifi_pmkVal[72] = 0
+        If SettingsSet(key, @wifi_pmkVal[0]) <> 0
+          gWifiPmkDirty = 1
+        Else
+          PrintN("    connected, but the derived key could not be cached in settings.")
+        EndIf
+      EndIf
+      ProcedureReturn wifi_CandidateFinish(1)
     EndIf
     PrintN("    associated but the handshake did not complete.")
     Cyw43Disassoc(2000)
     Cyw43DrainEvents(150)
   Next
-  ProcedureReturn 0
+  ProcedureReturn wifi_CandidateFinish(0)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1010,8 +1112,6 @@ EndProcedure
 ; DHCP packet construction, validation, lease time and retransmission are
 ; owned by Lib/dhcp.pi4 plus Core/netconsole.pbi. These values only mirror
 ; the radio's per-interface address for radio health/status code.
-Global gWifiHaveIp.i = 0
-Global gWifiIp.i   = 0
 Global gWifiMask.i = 0
 Global gWifiGw.i   = 0
 
@@ -1303,7 +1403,6 @@ Procedure.i WifiDhcp()
   ProcedureReturn 1
 EndProcedure
 
-
 ; ----------------------------------------------------------------------
 ;  WifiAdoptAddress - THE RADIO WAS GIVEN AN ADDRESS BY SOMETHING THAT IS
 ;  NOT WifiDhcp, and this is the board taking it as its own.
@@ -1421,32 +1520,54 @@ Procedure wifi_ServiceEapol(*frame, len.i)
   ; A PTK rekey re-runs the four-way; give it a fresh SNonce first, the
   ; same as wpa_supplicant does. A group rekey needs no nonce.
   If Wpa2SupPeekPtkM1(*frame, len) <> 0
-    If EntropyBytes(@wifi_snonce[0], 32, #ENTROPY_SPINS) = 32
-      Wpa2SupSetSnonce(@wifi_snonce[0])
+    r = EntropyBytes(@wifi_snonce[0], 32, #ENTROPY_SPINS)
+    If r <> 32
+      For n = 0 To 31
+        wifi_snonce[n] = 0
+      Next
+      gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_NONCE, r, 1)
+      ProcedureReturn
     EndIf
+    Wpa2SupSetSnonce(@wifi_snonce[0])
   EndIf
 
   code = Wpa2SupHandleSession(*frame, len)
 
   If code = #WPA2SUP_SENT_M2
     ; PTK rekey, message 2 out. Keys not ready until message 3.
-    wifi_SendSup()
+    r = wifi_SendSup()
+    If r <> 0
+      gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M2_TX, r, 1)
+    EndIf
 
   ElseIf code = #WPA2SUP_SENT_M4
     ; PTK rekey complete. SEND MESSAGE 4 FIRST, then install - the AP
     ; installs its PTK on receiving message 4, so a frame sent under the
     ; new key before then arrives as noise (the join learned this).
-    wifi_SendSup()
-    jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
-    r   = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
-    Wpa2SupSessionArm()
-    If jrc = 0 And r = 0
-      gWifiPtkKeyed = gWifiPtkKeyed + 1
-      If gWifiEapolLog <> 0
-        PrintN("Wi-Fi: pairwise key rekeyed mid-session - the link stays up.")
-      EndIf
-    Else
+    r = wifi_SendSup()
+    If r <> 0
       gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_TX, r, 1)
+    Else
+      jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+      If jrc <> 0
+        gWifiEapolErr = gWifiEapolErr + 1
+        wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_PTK, jrc, 1)
+      Else
+        r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+        If r <> 0
+          gWifiEapolErr = gWifiEapolErr + 1
+          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_GTK, r, 1)
+        Else
+          Wpa2SupSessionArm()
+          gWifiPtkKeyed = gWifiPtkKeyed + 1
+          If gWifiEapolLog <> 0
+            PrintN("Wi-Fi: pairwise key rekeyed mid-session - the link stays up.")
+          EndIf
+        EndIf
+      EndIf
     EndIf
 
   ElseIf code = #WPA2SUP_SENT_G2
@@ -1454,15 +1575,21 @@ Procedure wifi_ServiceEapol(*frame, len.i)
     ; message 2. The PAIRWISE key is untouched. This is the frame that,
     ; unanswered, was killing the link on the hour.
     r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
-    wifi_SendSup()
-    If r = 0
-      gWifiGrpKeyed = gWifiGrpKeyed + 1
-      If gWifiEapolLog <> 0
-        PrintN("Wi-Fi: group key rekeyed - the hourly rekey is now serviced,")
-        PrintN("       so the link no longer goes TX-only dead when it happens.")
-      EndIf
-    Else
+    If r <> 0
       gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_G2_GTK, r, 1)
+    Else
+      r = wifi_SendSup()
+      If r <> 0
+        gWifiEapolErr = gWifiEapolErr + 1
+        wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_G2_TX, r, 1)
+      Else
+        gWifiGrpKeyed = gWifiGrpKeyed + 1
+        If gWifiEapolLog <> 0
+          PrintN("Wi-Fi: group key rekeyed - the hourly rekey is now serviced,")
+          PrintN("       so the link no longer goes TX-only dead when it happens.")
+        EndIf
+      EndIf
     EndIf
 
   ElseIf code < 0
@@ -1729,6 +1856,12 @@ Procedure WifiRadioPump()
       NetServiceInput(#HW_LINK_WIFI, Cyw43ReceivePtr(), rc)
     EndIf
     k = k + 1
+    ; A serviced EAPOL frame may have invalidated this live session. Finish the
+    ; complete frame iteration, then stop before another receive can be offered
+    ; to IP under keys that outer service has not yet cleaned up.
+    If gWifiEapolRecover <> 0
+      Break
+    EndIf
   Wend
 
   WifiDrainEvents()
@@ -1892,8 +2025,10 @@ Procedure WifiRecoveryCancel()
   Define i.i
   Define wasActive.i
   Define ownedHandshake.i
+  Define brokenSession.i
   wasActive = Bool(gWifiRecPhase <> #WIFI_REC_IDLE)
   ownedHandshake = Bool(gWifiRecPhase >= #WIFI_REC_EAPOL_BEGIN And gWifiRecPhase <= #WIFI_REC_GTK_INSTALL)
+  brokenSession = Bool(gWifiEapolRecover <> 0)
   gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF
   gWifiRecStepGeneration = 0
   gWifiRecPhase = #WIFI_REC_IDLE
@@ -1906,6 +2041,12 @@ Procedure WifiRecoveryCancel()
   gWifiRecPmkCached = 0
   gWifiRecFreshFallback = 0
   gWifiRecPmkNeedsStore = 0
+  ; Manual replacement, policy cancellation and every new recovery generation
+  ; own this boundary. A late callback failure must not tear down their newer
+  ; session; retain the last diagnostic but discard its pending action.
+  gWifiEapolRecover = 0
+  gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE
+  gWifiEapolRecoverRc = 0
   For i = 0 To 31
     wifi_recPmk[i] = 0
     wifi_pmk[i] = 0
@@ -1919,6 +2060,17 @@ Procedure WifiRecoveryCancel()
     Cyw43KeyWipe()
     AesWipe()
     KwWipe()
+  EndIf
+  ; If an explicit policy/manual owner cancels after a callback latched failure
+  ; but before WifiLinkTick consumes it, cancellation owns the same live-session
+  ; cleanup. Scalar eligibility was already closed in the callback; this also
+  ; revokes the common DHCP/interface identity and live crypto state.
+  If brokenSession <> 0
+    Wpa2SupWipe()
+    Cyw43KeyWipe()
+    AesWipe()
+    KwWipe()
+    wifi_RecordLinkDown()
   EndIf
 EndProcedure
 
@@ -2806,6 +2958,69 @@ Procedure WifiRecoveryTick()
   EndSelect
 EndProcedure
 
+Procedure.i wifi_EapolFailureName(stage.i)
+  Select stage
+    Case #WIFI_EAPOL_FAIL_JOIN_M2_TX
+      ProcedureReturn "foreground M2 transmit"
+    Case #WIFI_EAPOL_FAIL_JOIN_M4_TX
+      ProcedureReturn "foreground M4 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_M2_TX
+      ProcedureReturn "live M2 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_M4_TX
+      ProcedureReturn "live M4 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_PTK
+      ProcedureReturn "live PTK install"
+    Case #WIFI_EAPOL_FAIL_REKEY_M4_GTK
+      ProcedureReturn "live M4 GTK install"
+    Case #WIFI_EAPOL_FAIL_REKEY_G2_TX
+      ProcedureReturn "live G2 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_NONCE
+      ProcedureReturn "live PTK nonce entropy"
+    Case #WIFI_EAPOL_FAIL_REKEY_G2_GTK
+      ProcedureReturn "live G2 GTK install"
+  EndSelect
+  ProcedureReturn "unknown EAPOL stage"
+EndProcedure
+
+; Consume a steady-state EAPOL failure only after WifiRadioPump has returned.
+; The callback has already recorded the first pending stage/rc, but performed
+; no association, DHCP or radio-control action. This boundary invalidates the
+; broken live identity even when automatic policy is disabled; policy controls
+; whether a new association starts, not whether partial keys remain usable.
+Procedure.i wifi_ServiceDeferredEapolFailure()
+  Define stage.i
+  Define rc.i
+  If gWifiEapolRecover = 0
+    ProcedureReturn 0
+  EndIf
+  stage = gWifiEapolRecoverStage
+  rc = gWifiEapolRecoverRc
+  ; Consume before cleanup so no nested/later service can apply this event to
+  ; a replacement generation. Last-failure diagnostics remain available.
+  gWifiEapolRecover = 0
+  gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE
+  gWifiEapolRecoverRc = 0
+  Print("Wi-Fi: live EAPOL service failed: ")
+  UartWriteStr(wifi_EapolFailureName(stage))
+  Print(" (stage ")
+  PrintDec(stage)
+  Print(", driver rc ")
+  PrintDec(rc)
+  PrintN("); the current keyed session is no longer trusted.")
+  If gWifiLinkOn <> 0 And gWifiHealOn <> 0
+    WifiRecoveryStart(1)
+  Else
+    WifiRecoveryCancel()
+    Wpa2SupWipe()
+    Cyw43KeyWipe()
+    AesWipe()
+    KwWipe()
+    wifi_RecordLinkDown()
+    PrintN("Wi-Fi: automatic recovery is OFF, so the failed session is being left down.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  WifiLinkTick - the periodic keepalive + health check.
 ;
@@ -2862,6 +3077,12 @@ Procedure WifiLinkTick()
   ; prevents this monitor from consuming an in-progress join's evidence.
   ; ------------------------------------------------------------------
   WifiRadioPump()
+
+  ; A rekey callback may only latch failure. Consume it here, after the receive
+  ; pump is complete, so recovery cannot recursively enter that pump.
+  If wifi_ServiceDeferredEapolFailure() <> 0
+    ProcedureReturn
+  EndIf
 
   ; ------------------------------------------------------------------
   ; THE RADIO SAID THE LINK IS GONE. Act on it now, not at the next

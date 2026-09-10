@@ -39,9 +39,14 @@ def source_range(source: str, first_text: str, last_text: str) -> str:
 
 def probe_source() -> str:
     source = WIFI.read_text(encoding="utf-8")
+    eapol_state = source_range(source, "#WIFI_EAPOL_FAIL_NONE", "Global gWifiEapolRecoverRc")
     constants = source_range(source, "#WIFI_REC_IDLE", "#WIFI_REC_ENTROPY_MS")
     globals_ = source_range(source, "Global gWifiRecPhase", "Global Dim wifi_recPmk")
     names = (
+        "wifi_RecordEapolFailure", "wifi_HandshakeFinish", "wifi_Handshake",
+        "wifi_HexVal", "wifi_HexDigit", "wifi_ByteToHex", "wifi_U32ToHex",
+        "wifi_HexToU32", "wifi_HexToBytes", "wifi_HexValid",
+        "wifi_CandidateFinish", "wifi_TrySlot", "wifi_ServiceEapol",
         "WifiRecoveryCancel", "WifiRecoveryActive", "WifiRecoveryInitialJoinFailed",
         "wifi_RecoverForgetPmk",
         "wifi_RecoverCandidateFail", "wifi_RecoverFail",
@@ -79,6 +84,11 @@ EnableExplicit
 #ENTROPY_SPINS = 4000000
 #WPA2SUP_SENT_M2 = 2
 #WPA2SUP_SENT_M4 = 4
+#WPA2SUP_SENT_G2 = 3
+#WPA2_FRAME_MIN = 113
+#WPA2_K_INFO = 19
+#WPA2_KI_PAIRWISE = $0008
+#WPA2_KI_MIC = $0100
 #CYW43_CRYPTO_ALGO_AES_CCM = 4
 #CYW43_IO_OK = 0
 #CYW43_IO_TIMEOUT = -1
@@ -89,6 +99,7 @@ EnableExplicit
 #NET_ADDR_LEASE = 1
 
 Global gate_ms.i = 1000
+Global gate_autoMs.i
 Global gate_down.i
 Global gate_wipes.i
 Global gate_pbkdfCalls.i
@@ -106,8 +117,15 @@ Global gate_joinVerdict.i
 Global gate_dropOnJoinPoll.i
 Global gate_receives.i
 Global gate_eapolCode.i
+Global gate_eapolAfter.i
+Global gate_eapolHandles.i
 Global gate_sendRc.i
 Global gate_sendCalls.i
+Global gate_sessionCode.i
+Global gate_sessionArms.i
+Global gate_ptkRc.i
+Global gate_gtkRc.i
+Global gate_progress.i
 Global gate_dhcpStart.i
 Global gate_dhcpRc.i = 1
 Global gate_dhcpAcquire.i
@@ -131,18 +149,42 @@ Global gate_service.i
 Global gate_fp.i = 123
 Global gate_entropyRc.i = #ENTROPY_OK
 Global gate_entropyCalls.i
+Global gate_entropyBytesRc.i = 32
+Global gate_peekPtkM1.i
+Global gate_snonceSets.i
+Global gate_sessionHandles.i
 Global gate_eventDrains.i
 Global gate_teardownOnDrain.i
 Global gate_eventDrops.i
 Global gate_settingsRemove.i
 Global gate_settingsSet.i
 Global gate_settingsSetRc.i = 1
+Global gate_cacheLen.i = 72
+Global gate_pskRc.i = 32
+Global gate_pskCalls.i
+Global gate_pbkdfWipes.i
+Global gate_joinStartRc.i
+Global gate_handshakeSequence.i
+Global gate_supBegins.i
+Global gate_beginPmk0.i
+Global gate_beginPmk1.i
+Global gate_sendFailMask.i
+Global gate_sendFailRc.i
+Global gate_drainCalls.i
 
 Global gWifiHealPend.i
 Global gWifiHealLast.i
 Global gWifiKaLast.i
 Global gWifiLinkOn.i = 1
 Global gWifiHealOn.i = 1
+Global gWifiRekeyOn.i = 1
+Global gWifiEapolLog.i
+Global gWifiEapolSeen.i
+Global gWifiGrpKeyed.i
+Global gWifiPtkKeyed.i
+Global gWifiEapolErr.i
+Global gWifiEapolLast.i
+Global gWifiEapolInfo.i
 Global gWifiUp.i = 1
 Global gWifiSecDone.i
 Global gWifiKeyed.i
@@ -163,15 +205,28 @@ Global wifi_joinSsidLen.i
 Global Dim gateScanSsid.a[8]
 Global Dim gateReplySsid.a[8]
 Global Dim gateCache.a[80]
+Global Dim gateStored.a[80]
 Global Dim gatePassword.a[64]
 Global Dim gatePasswordAlt.a[64]
 
-Procedure.i millis() : ProcedureReturn gate_ms : EndProcedure
+Procedure.i millis() : If gate_autoMs <> 0 : gate_ms = gate_ms + 100 : EndIf : ProcedureReturn gate_ms : EndProcedure
 Procedure str_print_at(p.i) : EndProcedure
 Procedure PrintNl() : EndProcedure
 Procedure PrintDec(v.i) : EndProcedure
 Procedure PutIp(v.i) : EndProcedure
+Procedure Pbkdf2Wipe() : gate_pbkdfWipes = gate_pbkdfWipes + 1 : EndProcedure
 Procedure Pbkdf2StepWipe() : gate_wipes = gate_wipes + 1 : gate_pbkdfState = #PBKDF2_STEP_IDLE : EndProcedure
+Procedure.i Pbkdf2SetProgress(p.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Wpa2Psk(p.i, plen.i, s.i, slen.i, d.i)
+  Define i.i
+  gate_pskCalls = gate_pskCalls + 1
+  If gate_pskRc > 0
+    For i = 0 To gate_pskRc - 1
+      If i < 32 : PokeA(d + i, 160 + i) : EndIf
+    Next
+  EndIf
+  ProcedureReturn gate_pskRc
+EndProcedure
 Procedure.i Pbkdf2StepState() : ProcedureReturn gate_pbkdfState : EndProcedure
 Procedure.i Wpa2PskStepBegin(p.i, plen.i, s.i, slen.i, d.i) : gate_pbkdfBegins = gate_pbkdfBegins + 1 : gate_pbkdfPw = p : gate_pbkdfState = gate_pbkdfBeginRc : ProcedureReturn gate_pbkdfState : EndProcedure
 Procedure.i Pbkdf2Step(budget.i)
@@ -183,7 +238,7 @@ Procedure Cyw43KeyWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
 Procedure AesWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
 Procedure KwWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
 Procedure NetDhcpLinkDown(k.i) : gate_down = gate_down + 1 : EndProcedure
-Procedure wifi_RecordLinkDown() : NetDhcpLinkDown(#HW_LINK_WIFI) : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiTeardown = 0 : EndProcedure
+Procedure wifi_RecordLinkDown() : NetDhcpLinkDown(#HW_LINK_WIFI) : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiSecDone = 0 : gWifiTeardown = 0 : EndProcedure
 Procedure WifiDrainEvents() : gate_eventDrains = gate_eventDrains + 1 : If gate_teardownOnDrain : gWifiTeardown = 1 : EndIf : EndProcedure
 Procedure.i Cyw43Leave(ms.i) : gate_leave = gate_leave + 1 : ProcedureReturn gate_leaveRc : EndProcedure
 Procedure.i Cyw43IoctlStatus() : ProcedureReturn gate_ioctlStatus : EndProcedure
@@ -192,7 +247,11 @@ Procedure.i Cyw43MacAddress(p.i, ms.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i EntropyBegin() : ProcedureReturn 1 : EndProcedure
 Procedure.i EntropyWarmupWait(n.i) : ProcedureReturn 1 : EndProcedure
 Procedure.i EntropyBytes(p.i, n.i, spins.i)
-  Define i.i : For i=0 To n-1 : PokeA(p+i, i+1) : Next : ProcedureReturn n
+  Define i.i
+  If gate_entropyBytesRc > 0
+    For i=0 To gate_entropyBytesRc-1 : If i < n : PokeA(p+i, i+1) : EndIf : Next
+  EndIf
+  ProcedureReturn gate_entropyBytesRc
 EndProcedure
 Procedure.i EntropyTryWord(p.i)
   gate_entropyCalls = gate_entropyCalls + 1
@@ -211,31 +270,50 @@ Procedure.i Cyw43ScanChannel(i.i) : ProcedureReturn 6 : EndProcedure
 Procedure.i SettingsWifiFindSsid(p.i) : ProcedureReturn 1 : EndProcedure
 Procedure.i SettingsWifiSlotPassword(slot.i) : If gate_passwordUseAlt : ProcedureReturn @gatePasswordAlt[0] : EndIf : ProcedureReturn @gatePassword[0] : EndProcedure
 Procedure.i SettingsWifiSlotPasswordKey(slot.i) : ProcedureReturn ?gatePassKey : EndProcedure
-Procedure.i SettingsLength(k.i) : If k = ?gatePmkKey : ProcedureReturn 72 : EndIf : ProcedureReturn 8 : EndProcedure
+Procedure.i SettingsLength(k.i) : If k = ?gatePmkKey : ProcedureReturn gate_cacheLen : EndIf : ProcedureReturn 8 : EndProcedure
 Procedure.i wifi_Fp(s.i, sl.i, p.i, pl.i) : ProcedureReturn gate_fp : EndProcedure
 Procedure.i wifi_PmkKey(slot.i) : ProcedureReturn ?gatePmkKey : EndProcedure
 Procedure.i SettingsGet(k.i) : If gate_cacheHit = 0 : ProcedureReturn 0 : EndIf : ProcedureReturn @gateCache[0] : EndProcedure
-Procedure.i wifi_HexToU32(p.i) : ProcedureReturn 123 : EndProcedure
-Procedure.i wifi_HexToBytes(p.i, d.i, n.i)
-  Define i.i : For i=0 To n-1 : PokeA(d+i, i+1) : Next : ProcedureReturn 1
+Procedure.i SettingsSet(k.i, v.i)
+  Define i.i
+  gate_settingsSet = gate_settingsSet + 1
+  For i = 0 To 72 : gateStored[i] = PeekA(v + i) : Next
+  ProcedureReturn gate_settingsSetRc
 EndProcedure
-Procedure wifi_U32ToHex(p.i, v.i) : EndProcedure
-Procedure wifi_ByteToHex(p.i, o.i, b.i) : EndProcedure
-Procedure.i SettingsSet(k.i, v.i) : gate_settingsSet = gate_settingsSet + 1 : ProcedureReturn gate_settingsSetRc : EndProcedure
 Procedure.i SettingsRemove(k.i) : gate_settingsRemove = gate_settingsRemove + 1 : gate_cacheHit = 0 : ProcedureReturn 1 : EndProcedure
 Procedure.i Cyw43Disassoc(ms.i) : gate_disassoc = gate_disassoc + 1 : ProcedureReturn gate_disassocRc : EndProcedure
-Procedure.i Cyw43JoinStart(p.i, n.i, ms.i) : gate_joinStart = gate_joinStart + 1 : ProcedureReturn 0 : EndProcedure
+Procedure Cyw43DrainEvents(ms.i) : gate_drainCalls = gate_drainCalls + 1 : EndProcedure
+Procedure wifi_PrintSsid(p.i, n.i) : EndProcedure
+Procedure.i Cyw43JoinStart(p.i, n.i, ms.i) : gate_joinStart = gate_joinStart + 1 : ProcedureReturn gate_joinStartRc : EndProcedure
 Procedure.i Cyw43JoinPoll(ms.i) : gate_joinPolls = gate_joinPolls + 1 : If gate_dropOnJoinPoll : gate_eventDrops = gate_eventDrops + 1 : EndIf : ProcedureReturn gate_joinVerdict : EndProcedure
 Procedure.i Cyw43ReadSsid(ms.i) : gate_readSsid = gate_readSsid + 1 : ProcedureReturn 0 : EndProcedure
 Procedure.i Cyw43LinkSsidLen() : ProcedureReturn 4 : EndProcedure
 Procedure.i Cyw43LinkSsid() : If gate_mismatch : ProcedureReturn @gateReplySsid[0] : EndIf : ProcedureReturn @gateScanSsid[0] : EndProcedure
 Procedure wifi_ReadAssocIe() : wifi_ieLen = 0 : EndProcedure
-Procedure.i Wpa2SupBegin(p.i, m.i, a.i, ie.i, n.i) : ProcedureReturn 1 : EndProcedure
-Procedure Wpa2SupSetSnonce(p.i) : EndProcedure
+Procedure.i Wpa2SupBegin(p.i, m.i, a.i, ie.i, n.i)
+  gate_supBegins = gate_supBegins + 1
+  If gate_supBegins = 1 : gate_beginPmk0 = PeekA(p) : ElseIf gate_supBegins = 2 : gate_beginPmk1 = PeekA(p) : EndIf
+  If gate_handshakeSequence <> 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_eapolAfter = #WPA2SUP_SENT_M4 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure Wpa2SupSetSnonce(p.i) : gate_snonceSets = gate_snonceSets + 1 : EndProcedure
+Procedure wifi_Progress() : gate_progress = gate_progress + 1 : EndProcedure
 Procedure.i Cyw43Receive(ms.i) : gate_receives = gate_receives + 1 : ProcedureReturn 120 : EndProcedure
 Procedure.i Cyw43ReceivePtr() : ProcedureReturn @gateCache[0] : EndProcedure
-Procedure.i Wpa2SupHandle(p.i, n.i) : ProcedureReturn gate_eapolCode : EndProcedure
-Procedure.i wifi_SendSup() : gate_sendCalls = gate_sendCalls + 1 : ProcedureReturn gate_sendRc : EndProcedure
+Procedure.i Wpa2SupHandle(p.i, n.i)
+  Define code.i
+  code = gate_eapolCode : gate_eapolHandles = gate_eapolHandles + 1
+  If gate_eapolAfter <> 0 : gate_eapolCode = gate_eapolAfter : EndIf
+  ProcedureReturn code
+EndProcedure
+Procedure.i Wpa2SupPeekPtkM1(p.i, n.i) : ProcedureReturn gate_peekPtkM1 : EndProcedure
+Procedure.i Wpa2SupHandleSession(p.i, n.i) : gate_sessionHandles = gate_sessionHandles + 1 : ProcedureReturn gate_sessionCode : EndProcedure
+Procedure.i wifi_SendSup()
+  gate_sendCalls = gate_sendCalls + 1
+  If (gate_sendFailMask & (1 << gate_sendCalls)) <> 0 : ProcedureReturn gate_sendFailRc : EndIf
+  ProcedureReturn gate_sendRc
+EndProcedure
+Procedure UartWrite(v.i) : EndProcedure
 Procedure.i Wpa2SupTk() : ProcedureReturn @gateCache[0] : EndProcedure
 Procedure.i Wpa2SupTkLen() : ProcedureReturn 16 : EndProcedure
 Procedure.i Wpa2SupApMac() : ProcedureReturn @wifi_apMac[0] : EndProcedure
@@ -244,9 +322,12 @@ Procedure.i Wpa2SupGtk() : ProcedureReturn @gateCache[16] : EndProcedure
 Procedure.i Wpa2SupGtkLen() : ProcedureReturn 16 : EndProcedure
 Procedure.i Wpa2SupGtkRsc() : ProcedureReturn @gateCache[32] : EndProcedure
 Procedure.i Cyw43SetWsecKey(i.i, k.i, n.i, algo.i, mac.i, rsc.i, ms.i)
-  gate_setKey = gate_setKey + 1 : ProcedureReturn gate_setKeyFail
+  gate_setKey = gate_setKey + 1
+  If i = 0 And gate_ptkRc <> 0 : ProcedureReturn gate_ptkRc : EndIf
+  If i <> 0 And gate_gtkRc <> 0 : ProcedureReturn gate_gtkRc : EndIf
+  ProcedureReturn gate_setKeyFail
 EndProcedure
-Procedure Wpa2SupSessionArm() : EndProcedure
+Procedure Wpa2SupSessionArm() : gate_sessionArms = gate_sessionArms + 1 : EndProcedure
 Procedure wifi_PersistPmkIfDirty() : If gWifiPmkDirty : gate_settingsSave = gate_settingsSave + 1 : gWifiPmkDirty = 0 : EndIf : EndProcedure
 Procedure.i NetDhcpStart(k.i, auto.i) : gate_dhcpStart = gate_dhcpStart + 1 : ProcedureReturn gate_dhcpRc : EndProcedure
 Procedure.i NetDhcpAcquire(k.i, wait.i, keep.i) : gate_dhcpAcquire = gate_dhcpAcquire + 1 : ProcedureReturn 0 : EndProcedure
@@ -264,12 +345,14 @@ EndDataSection
     tests = r'''
 Procedure GateInit()
   Define i.i
-  gate_ms = 1000 : gate_down = 0 : gate_wipes = 0
+  gate_ms = 1000 : gate_autoMs = 0 : gate_down = 0 : gate_wipes = 0
   gate_pbkdfCalls = 0 : gate_pbkdfState = #PBKDF2_STEP_RUNNING : gate_pbkdfBudget = 0
   gate_pbkdfPw = 0 : gate_pbkdfBegins = 0 : gate_pbkdfBeginRc = #PBKDF2_STEP_RUNNING : gate_cacheHit = 1 : gate_passwordUseAlt = 0
   gate_scanPolls = 0 : gate_scanVerdict = #CYW43_SCAN_DONE
   gate_joinPolls = 0 : gate_joinVerdict = #CYW43_JOIN_JOINED : gate_dropOnJoinPoll = 0
-  gate_receives = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_sendRc = 0 : gate_sendCalls = 0
+  gate_receives = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_eapolAfter = 0 : gate_eapolHandles = 0
+  gate_sendRc = 0 : gate_sendCalls = 0
+  gate_sessionCode = 0 : gate_sessionArms = 0 : gate_ptkRc = 0 : gate_gtkRc = 0 : gate_progress = 0
   gate_dhcpStart = 0 : gate_dhcpRc = 1 : gate_dhcpAcquire = 0 : gate_leave = 0 : gate_leaveRc = 0
   gate_dhcpState = #DHCPC_BOUND : gate_dhcpIp = $01020304 : gate_netIp = $01020304 : gate_netSrc = #NET_ADDR_LEASE
   gate_disassoc = 0 : gate_disassocRc = 0 : gate_ioctlStatus = 0 : gate_secItem = 0 : gate_joinStart = 0
@@ -277,20 +360,34 @@ Procedure GateInit()
   gate_settingsSave = 0 : gate_mismatch = 0 : gate_service = 0
   gate_fp = 123
   gate_entropyRc = #ENTROPY_OK : gate_entropyCalls = 0
+  gate_entropyBytesRc = 32 : gate_peekPtkM1 = 0 : gate_snonceSets = 0 : gate_sessionHandles = 0
   gate_eventDrains = 0 : gate_teardownOnDrain = 0 : gate_eventDrops = 0 : gWifiTeardown = 0
   gate_settingsRemove = 0 : gate_settingsSet = 0 : gate_settingsSetRc = 1
+  gate_cacheLen = 72 : gate_pskRc = 32 : gate_pskCalls = 0 : gate_pbkdfWipes = 0
+  gate_joinStartRc = 0 : gate_handshakeSequence = 0 : gate_supBegins = 0
+  gate_beginPmk0 = 0 : gate_beginPmk1 = 0 : gate_sendFailMask = 0 : gate_sendFailRc = 0
+  gate_drainCalls = 0
   gWifiLinkOn = 1 : gWifiHealOn = 1 : gWifiUp = 1
-  gWifiSecDone = 0 : gWifiKeyed = 1 : gWifiHaveIp = 1
+  gWifiRekeyOn = 1 : gWifiEapolLog = 0 : gWifiEapolSeen = 0
+  gWifiGrpKeyed = 0 : gWifiPtkKeyed = 0 : gWifiEapolErr = 0
+  gWifiEapolLast = 0 : gWifiEapolInfo = 0
+  gWifiSecDone = 1 : gWifiKeyed = 1 : gWifiHaveIp = 1
   gWifiHealPend = 0 : gWifiHealLast = 0 : gWifiKaLast = 0
   gWifiRejoins = 0 : gWifiPmkDirty = 0 : gWifiIp = $01020304
   gWifiRecEventDropBase = 0 : gWifiRecPmkCached = 0 : gWifiRecFreshFallback = 0 : gWifiRecPmkNeedsStore = 0
+  gWifiEapolFailStage = #WIFI_EAPOL_FAIL_NONE : gWifiEapolFailRc = 0
+  gWifiEapolRecover = 0 : gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE : gWifiEapolRecoverRc = 0
   gWifiRecLastFailPhase = #WIFI_REC_IDLE : gWifiRecLastFailRc = 0 : gWifiRecLastFailStatus = 0
   gateScanSsid[0]=116 : gateScanSsid[1]=101 : gateScanSsid[2]=115 : gateScanSsid[3]=116
   gateReplySsid[0]=98 : gateReplySsid[1]=97 : gateReplySsid[2]=100 : gateReplySsid[3]=33
   gatePassword[0]=112 : gatePassword[1]=97 : gatePassword[2]=115 : gatePassword[3]=115
   gatePassword[4]=119 : gatePassword[5]=111 : gatePassword[6]=114 : gatePassword[7]=100
   For i=0 To 7 : gatePasswordAlt[i]=gatePassword[i] : Next
-  For i=0 To 71 : gateCache[i]=48 : Next
+  For i=0 To 79 : gateCache[i]=0 : gateStored[i]=0 : wifi_pmkVal[i]=0 : Next
+  gateCache[0]=48 : gateCache[1]=48 : gateCache[2]=48 : gateCache[3]=48
+  gateCache[4]=48 : gateCache[5]=48 : gateCache[6]=55 : gateCache[7]=98
+  For i=0 To 31 : wifi_ByteToHex(@gateCache[0], 8+i*2, i+1) : wifi_pmk[i]=0 : Next
+  gateCache[72]=0
   gWifiRecPhase = #WIFI_REC_IDLE
 EndProcedure
 
@@ -689,10 +786,159 @@ Procedure.i Main()
   If gate_joinPolls <> 1 Or gate_readSsid <> 1 Or gate_receives <> 2 Or gate_setKey <> 2 : ProcedureReturn 25 : EndIf
   If gate_dhcpStart <> 1 Or gate_dhcpAcquire <> 0 Or gWifiRejoins <> 1 Or gWifiHaveIp = 0 : ProcedureReturn 26 : EndIf
 
+  ; Foreground handshake sends are state transitions, not narration. A refused
+  ; M2 cannot advance the M1 clock; a refused M4 cannot install or arm keys.
+  GateInit() : gate_autoMs = 1 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_eapolAfter = -20 : gate_sendRc = -7
+  If wifi_Handshake() <> 0 : ProcedureReturn 84 : EndIf
+  If gate_sendCalls <> 1 Or gate_setKey <> 0 Or gate_sessionArms <> 0 : ProcedureReturn 84 : EndIf
+  If gWifiEapolFailStage <> #WIFI_EAPOL_FAIL_JOIN_M2_TX Or gWifiEapolFailRc <> -7 : ProcedureReturn 84 : EndIf
+  If gWifiEapolRecover <> 0 : ProcedureReturn 84 : EndIf
+
+  GateInit() : gate_autoMs = 1 : gate_eapolCode = #WPA2SUP_SENT_M4 : gate_sendRc = -8
+  If wifi_Handshake() <> 0 : ProcedureReturn 85 : EndIf
+  If gate_sendCalls <> 1 Or gate_setKey <> 0 Or gate_sessionArms <> 0 : ProcedureReturn 85 : EndIf
+  If gWifiEapolFailStage <> #WIFI_EAPOL_FAIL_JOIN_M4_TX Or gWifiEapolFailRc <> -8 : ProcedureReturn 85 : EndIf
+
+  ; Steady rekey callbacks only latch exact failures. They neither install/arm
+  ; after a refused response nor invoke recovery from inside receive service.
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M2 : gate_sendRc = -9
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolErr <> 1 Or gWifiEapolRecover = 0 : ProcedureReturn 86 : EndIf
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_M2_TX Or gWifiEapolRecoverRc <> -9 : ProcedureReturn 86 : EndIf
+  If gate_setKey <> 0 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 86 : EndIf
+  If gWifiKeyed <> 0 Or gWifiHaveIp <> 0 Or gWifiSecDone <> 0 : ProcedureReturn 86 : EndIf
+
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4 : gate_sendRc = -10
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_M4_TX Or gWifiEapolRecoverRc <> -10 : ProcedureReturn 87 : EndIf
+  If gate_setKey <> 0 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 87 : EndIf
+
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4 : gate_ptkRc = -11
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_PTK Or gWifiEapolRecoverRc <> -11 : ProcedureReturn 88 : EndIf
+  If gate_setKey <> 1 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 88 : EndIf
+
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4 : gate_gtkRc = -12
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_M4_GTK Or gWifiEapolRecoverRc <> -12 : ProcedureReturn 89 : EndIf
+  If gate_setKey <> 2 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 89 : EndIf
+
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_G2 : gate_gtkRc = -13
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_G2_GTK Or gWifiEapolRecoverRc <> -13 : ProcedureReturn 90 : EndIf
+  If gate_sendCalls <> 0 Or gWifiGrpKeyed <> 0 : ProcedureReturn 90 : EndIf
+
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_G2 : gate_sendRc = -14
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_G2_TX Or gWifiEapolRecoverRc <> -14 : ProcedureReturn 91 : EndIf
+  If gate_setKey <> 1 Or gate_sendCalls <> 1 Or gWifiGrpKeyed <> 0 : ProcedureReturn 91 : EndIf
+
+  ; A complete M4/G2 remains the only route to success counters/session arm.
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gate_setKey <> 2 Or gate_sessionArms <> 1 Or gWifiPtkKeyed <> 1 Or gWifiEapolRecover <> 0 : ProcedureReturn 92 : EndIf
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_G2
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gate_setKey <> 1 Or gate_sendCalls <> 1 Or gWifiGrpKeyed <> 1 Or gWifiEapolRecover <> 0 : ProcedureReturn 93 : EndIf
+
+  ; The first pending snapshot is stable until outer service owns it, while
+  ; last-failure diagnostics may record a later callback failure.
+  GateInit()
+  wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M2_TX, -15, 1)
+  wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_G2_TX, -16, 1)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_M2_TX Or gWifiEapolRecoverRc <> -15 : ProcedureReturn 99 : EndIf
+  If gWifiEapolFailStage <> #WIFI_EAPOL_FAIL_REKEY_G2_TX Or gWifiEapolFailRc <> -16 : ProcedureReturn 99 : EndIf
+  ; Cancellation owns stale deferred work but retains last exact diagnostics.
+  before = gate_down : after = gate_wipes
+  WifiRecoveryCancel()
+  If gWifiEapolRecover <> 0 Or gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_NONE Or gWifiEapolRecoverRc <> 0 : ProcedureReturn 94 : EndIf
+  If gWifiEapolFailStage <> #WIFI_EAPOL_FAIL_REKEY_G2_TX Or gWifiEapolFailRc <> -16 : ProcedureReturn 94 : EndIf
+  If gate_down <> before + 1 Or gate_wipes <> after + 5 : ProcedureReturn 100 : EndIf
+
+  ; A PTK M1 cannot reuse the old nonce after entropy returns short, refusal,
+  ; or a health error. Each failure wipes all partial bytes, records the exact
+  ; rc, and returns before supplicant/session/send/key transitions.
+  GateInit() : gate_peekPtkM1 = 1 : gate_entropyBytesRc = 7
+  For i = 0 To 31 : wifi_snonce[i] = 85 : Next
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_NONCE Or gWifiEapolRecoverRc <> 7 : ProcedureReturn 95 : EndIf
+  If gate_snonceSets <> 0 Or gate_sessionHandles <> 0 Or gate_sendCalls <> 0 Or gate_setKey <> 0 : ProcedureReturn 95 : EndIf
+  For i = 0 To 31 : If wifi_snonce[i] <> 0 : ProcedureReturn 95 : EndIf : Next
+
+  GateInit() : gate_peekPtkM1 = 1 : gate_entropyBytesRc = 0
+  For i = 0 To 31 : wifi_snonce[i] = 85 : Next
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverRc <> 0 Or gate_sessionHandles <> 0 : ProcedureReturn 96 : EndIf
+  For i = 0 To 31 : If wifi_snonce[i] <> 0 : ProcedureReturn 96 : EndIf : Next
+
+  GateInit() : gate_peekPtkM1 = 1 : gate_entropyBytesRc = #ENTROPY_ERR_HEALTH
+  For i = 0 To 31 : wifi_snonce[i] = 85 : Next
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiEapolRecoverRc <> #ENTROPY_ERR_HEALTH Or gate_sessionHandles <> 0 : ProcedureReturn 97 : EndIf
+  For i = 0 To 31 : If wifi_snonce[i] <> 0 : ProcedureReturn 97 : EndIf : Next
+
+  GateInit() : gate_peekPtkM1 = 1 : gate_entropyBytesRc = 32 : gate_sessionCode = #WPA2SUP_SENT_M2
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gate_snonceSets <> 1 Or gate_sessionHandles <> 1 Or gate_sendCalls <> 1 : ProcedureReturn 98 : EndIf
+  If gWifiEapolRecover <> 0 Or gWifiEapolErr <> 0 : ProcedureReturn 98 : EndIf
+
+  ; Exercise the actual foreground candidate path. The cached PMK belongs to
+  ; TrySlot across both attempts: a refused first M2 may not make the second
+  ; Wpa2SupBegin consume the zeroes that the old handshake used to leave.
+  GateInit() : gate_autoMs = 1 : gate_handshakeSequence = 1
+  gate_sendFailMask = (1 << 1) : gate_sendFailRc = -21
+  If wifi_TrySlot(1, @gateScanSsid[0], 4) = 0 : ProcedureReturn 101 : EndIf
+  If gate_joinStart <> 2 Or gate_supBegins <> 2 Or gate_sendCalls <> 3 : ProcedureReturn 101 : EndIf
+  If gate_beginPmk0 <> 1 Or gate_beginPmk1 <> 1 Or gate_setKey <> 2 Or gate_sessionArms <> 1 : ProcedureReturn 101 : EndIf
+  If gate_settingsSet <> 0 Or gWifiPmkDirty <> 0 : ProcedureReturn 101 : EndIf
+  For i=0 To 31 : If wifi_pmk[i] <> 0 : ProcedureReturn 101 : EndIf : Next
+  For i=0 To 79 : If wifi_pmkVal[i] <> 0 : ProcedureReturn 101 : EndIf : Next
+
+  ; Both candidate attempts may fail transport, but both still borrow the same
+  ; intact cache row and every exit wipes the caller-owned PMK/cache scratch.
+  GateInit() : gate_autoMs = 1 : gate_handshakeSequence = 1
+  gate_sendFailMask = (1 << 1) | (1 << 2) : gate_sendFailRc = -22
+  If wifi_TrySlot(1, @gateScanSsid[0], 4) <> 0 : ProcedureReturn 102 : EndIf
+  If gate_supBegins <> 2 Or gate_beginPmk0 <> 1 Or gate_beginPmk1 <> 1 : ProcedureReturn 102 : EndIf
+  If gate_setKey <> 0 Or gate_settingsSet <> 0 Or gWifiPmkDirty <> 0 : ProcedureReturn 102 : EndIf
+  For i=0 To 31 : If wifi_pmk[i] <> 0 : ProcedureReturn 102 : EndIf : Next
+
+  ; A corrupt cache row is validated in full before decode. It falls back to a
+  ; complete derivation and is published only after the resulting keys install.
+  GateInit() : gate_autoMs = 1 : gate_handshakeSequence = 1 : gateCache[40] = 122
+  If wifi_TrySlot(1, @gateScanSsid[0], 4) = 0 : ProcedureReturn 103 : EndIf
+  If gate_pskCalls <> 1 Or gate_supBegins <> 1 Or gate_beginPmk0 <> 160 : ProcedureReturn 103 : EndIf
+  If gate_settingsSet <> 1 Or gWifiPmkDirty = 0 : ProcedureReturn 103 : EndIf
+
+  ; A short derivation never reaches association or cache publication, and its
+  ; partial destination plus the PBKDF engine scratch are wiped on the exit.
+  GateInit() : gate_cacheHit = 0 : gate_pskRc = 7
+  If wifi_TrySlot(1, @gateScanSsid[0], 4) <> 0 : ProcedureReturn 104 : EndIf
+  If gate_pskCalls <> 1 Or gate_joinStart <> 0 Or gate_settingsSet <> 0 : ProcedureReturn 104 : EndIf
+  If gate_pbkdfWipes < 2 : ProcedureReturn 104 : EndIf
+  For i=0 To 31 : If wifi_pmk[i] <> 0 : ProcedureReturn 104 : EndIf : Next
+
+  ; Settings refusal cannot invalidate an otherwise keyed association, but it
+  ; also cannot mark the rejected row dirty or retain encoded key scratch.
+  GateInit() : gate_cacheHit = 0 : gate_autoMs = 1 : gate_handshakeSequence = 1 : gate_settingsSetRc = 0
+  If wifi_TrySlot(1, @gateScanSsid[0], 4) = 0 : ProcedureReturn 105 : EndIf
+  If gate_settingsSet <> 1 Or gWifiPmkDirty <> 0 Or gate_sessionArms <> 1 : ProcedureReturn 105 : EndIf
+  For i=0 To 79 : If wifi_pmkVal[i] <> 0 : ProcedureReturn 105 : EndIf : Next
+
+  ; The accepted publication contains the exact fingerprint + full derived PMK
+  ; and is staged only after successful M2/M4 sends and both key installs.
+  GateInit() : gate_cacheHit = 0 : gate_autoMs = 1 : gate_handshakeSequence = 1
+  If wifi_TrySlot(1, @gateScanSsid[0], 4) = 0 : ProcedureReturn 106 : EndIf
+  If gate_settingsSet <> 1 Or gWifiPmkDirty = 0 Or gate_setKey <> 2 : ProcedureReturn 106 : EndIf
+  If gateStored[0]<>48 Or gateStored[6]<>55 Or gateStored[7]<>98 : ProcedureReturn 106 : EndIf
+  If gateStored[8]<>97 Or gateStored[9]<>48 Or gateStored[70]<>98 Or gateStored[71]<>102 Or gateStored[72]<>0 : ProcedureReturn 106 : EndIf
+  For i=0 To 31 : If wifi_pmk[i] <> 0 : ProcedureReturn 106 : EndIf : Next
+  For i=0 To 79 : If wifi_pmkVal[i] <> 0 : ProcedureReturn 106 : EndIf : Next
+
   ProcedureReturn 0
 EndProcedure
 '''
-    return prelude + "\n" + constants + "\n" + globals_ + "\n" + bodies + "\n" + tests
+    return prelude + "\n" + eapol_state + "\n" + constants + "\n" + globals_ + "\n" + bodies + "\n" + tests
 
 
 def build(pmfc: Path, work: Path, probe: Path) -> Path:
@@ -745,12 +991,88 @@ def main() -> int:
                     f"{mutant_result}, expected 82"
                 )
                 return 1
+            handshake = procedure(exact_source, "wifi_Handshake")
+            unchecked_m2 = handshake.replace(
+                "        If r = 0\n          m1 = m1 + 1",
+                "        If 1 = 1\n          m1 = m1 + 1",
+                1,
+            )
+            if unchecked_m2 == handshake:
+                raise SystemExit("wifi recovery gate: foreground M2 result mutation site not found")
+            mutated = exact_source.replace(handshake, unchecked_m2, 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            mutant_image = build(pmfc, work, probe)
+            mutant_result, _ = emitted.execute(a64, mutant_image)
+            if mutant_result != 84:
+                print(
+                    "wifi_recovery_emitted_check: FAIL unchecked foreground-M2 mutant returned "
+                    f"{mutant_result}, expected 84"
+                )
+                return 1
+            borrower = procedure(exact_source, "wifi_Handshake")
+            steals_candidate = borrower.replace(
+                "  Wpa2SupSetSnonce(@wifi_snonce[0])",
+                "  Wpa2SupSetSnonce(@wifi_snonce[0])\n  wifi_pmk[0] = 0",
+                1,
+            )
+            if steals_candidate == borrower:
+                raise SystemExit("wifi recovery gate: foreground PMK owner mutation site not found")
+            mutated = exact_source.replace(borrower, steals_candidate, 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            mutant_image = build(pmfc, work, probe)
+            mutant_result, _ = emitted.execute(a64, mutant_image)
+            if mutant_result != 101:
+                print(
+                    "wifi_recovery_emitted_check: FAIL PMK-owner mutant returned "
+                    f"{mutant_result}, expected 101"
+                )
+                return 1
+            candidate = procedure(exact_source, "wifi_TrySlot")
+            unchecked_cache = candidate.replace(
+                "    If SettingsLength(key) = 72 And wifi_HexValid(cached, 72) <> 0",
+                "    If SettingsLength(key) = 72",
+                1,
+            ).replace(
+                "        If wifi_HexToBytes(cached + 8, @wifi_pmk[0], 32) <> 0\n          used = 1\n        EndIf",
+                "        wifi_HexToBytes(cached + 8, @wifi_pmk[0], 32)\n        used = 1",
+                1,
+            )
+            if unchecked_cache == candidate:
+                raise SystemExit("wifi recovery gate: cache-decode mutation site not found")
+            mutated = exact_source.replace(candidate, unchecked_cache, 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            mutant_image = build(pmfc, work, probe)
+            mutant_result, _ = emitted.execute(a64, mutant_image)
+            if mutant_result != 103:
+                print(
+                    "wifi_recovery_emitted_check: FAIL partial-cache mutant returned "
+                    f"{mutant_result}, expected 103"
+                )
+                return 1
+            service = procedure(exact_source, "wifi_ServiceEapol")
+            unchecked_rekey_m2 = service.replace(
+                "    If r <> 0\n      gWifiEapolErr = gWifiEapolErr + 1",
+                "    If r = 0\n      gWifiEapolErr = gWifiEapolErr + 1",
+                1,
+            )
+            if unchecked_rekey_m2 == service:
+                raise SystemExit("wifi recovery gate: steady M2 result mutation site not found")
+            mutated = exact_source.replace(service, unchecked_rekey_m2, 1)
+            probe.write_text(mutated, encoding="utf-8", newline="\n")
+            mutant_image = build(pmfc, work, probe)
+            mutant_result, _ = emitted.execute(a64, mutant_image)
+            if mutant_result != 86:
+                print(
+                    "wifi_recovery_emitted_check: FAIL unchecked steady-M2 mutant returned "
+                    f"{mutant_result}, expected 86"
+                )
+                return 1
     if result:
         print(f"wifi_recovery_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     print(
-        "wifi_recovery_emitted_check: PASS - 83 assertions, "
-        f"{steps:,} A64 instructions; cached-PMK wrong-owner mutant fails assertion 82"
+        "wifi_recovery_emitted_check: PASS - 106 assertions, "
+        f"{steps:,} A64 instructions; candidate-owner/cache/send mutants rejected"
     )
     return 0
 

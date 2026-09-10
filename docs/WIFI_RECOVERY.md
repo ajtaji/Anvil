@@ -42,9 +42,35 @@ Prepared WPA2 M2/M4 bytes are not treated as transmitted: a negative
 `wifi_SendSup()` result cannot advance M1 or key installation. Because a
 transport refusal did not test the PMK, it retries the association without
 evicting a cached PMK or starting fresh PBKDF2. Only a supplicant rejection or
-timeout owns the cached-key fallback described above. Recovery declares DHCP success only when the common Wi-Fi
-client is `BOUND`, the interface address provenance is `LEASE`, and the common
-client, interface row, and compatibility state contain the same nonzero IP.
+timeout owns the cached-key fallback described above. The older foreground
+join follows the same checked M2/M4 send rule and reports the exact failed
+stage and transport result before returning failure to its candidate owner.
+That foreground candidate owns one PMK across both of its bounded association
+attempts; the handshake only borrows it and cannot erase the second attempt's
+input. The candidate wipes its PMK, encoded cache row, and synchronous PBKDF2
+scratch on every exit. A cache row is validated in full before decode, and a
+freshly derived row is offered to `SettingsSet()` only after both keys install.
+Settings refusal leaves the encrypted link usable but does not mark the row
+dirty or claim persistence.
+
+Live rekey service is also fail-closed. A PTK message 1 must obtain exactly 32
+fresh nonce bytes before the session supplicant sees it; short, refused, or
+health-failed entropy wipes the partial nonce. M2/M4/G2 response sends and PTK
+or GTK installation are checked individually. Session arm and success counters
+advance only after their complete send/install sequence succeeds.
+
+The receive callback records the first pending failure stage/result and clears
+the scalar keyed/address eligibility immediately, but does not re-associate,
+run DHCP, or call back into radio receive. `WifiLinkTick()` consumes that latch
+after the radio pump returns. It wipes and records the broken identity even
+when link/heal policy is off; those switches may suppress a new association,
+but cannot make a partially changed session usable. Manual cancellation and a
+new recovery generation discard stale pending work without erasing the last
+diagnostic.
+
+Recovery declares DHCP success only when the common Wi-Fi client is `BOUND`,
+the interface address provenance is `LEASE`, and the common client, interface
+row, and compatibility state contain the same nonzero IP.
 
 The scan/join loops and PBKDF spin are cooperative, but individual CYW43
 control requests still use the driver's existing atomic timeout. A single
@@ -68,9 +94,12 @@ python tools/a64/pbkdf2_progress_emitted_check.py
 The gates compile extracted production procedures and execute their emitted
 A64. They cover phase ordering and service opportunities; cancellation and
 credential ownership; real CYW43 event-ring ownership at the join boundary;
-event-drop generations; LEAVE, DISASSOC, cached-PMK-preserving handshake-send,
-and DHCP-start
-failures; exact DHCP lease ownership; bounded first-connection retry; the
+event-drop generations; LEAVE, DISASSOC, cached-PMK-preserving handshake sends,
+the actual two-attempt foreground candidate with cache decode/derive/publish
+ownership and sensitive-buffer wiping;
+foreground and live M2/M4/G2 send failures; partial key installation; nonce
+entropy failures; callback/outer-service ownership; policy-off invalidation;
+DHCP-start failures; exact DHCP lease ownership; bounded first-connection retry; the
 cached-PMK fallback; one-word entropy boundaries; the published RFC 6070
 PBKDF2 vector; and the IEEE 802.11 Annex H.4 4096-iteration WPA2 vector.
 They are desk evidence, not proof of radio reconnection on physical hardware.
@@ -82,9 +111,11 @@ Compiler SHA-256:
 
 Gate results:
 
-- recovery phases and failures: 67 assertions, 282,771 emitted instructions;
-- event ownership/pump ordering: 15 assertions, 8,435 instructions, with the
-  old pump-first mutation failing assertion 8;
+- recovery, foreground candidate, handshake, rekey, nonce and failure phases:
+  106 assertions, 818,911 emitted instructions, with candidate-owner,
+  partial-cache and unchecked-send mutations rejected;
+- event ownership/pump ordering: 28 assertions, 16,092 instructions, with
+  pump-first and callback-reentry mutations rejected;
 - one-word entropy: 10 assertions, 1,932 instructions;
 - resumable RFC/IEEE PBKDF2: 14 assertions, 710,698,425 instructions;
 - unchanged synchronous PBKDF2/callback behavior: exact 2/257 cadence,
@@ -93,20 +124,19 @@ Gate results:
 Reviewed closure SHA-256 values:
 
 ```text
-8670a0cccb8e156ae039901b5657040dc023de34739c4fad4fd318248a0079f3  Anvil/Core/wifi_cmd.pbi
+6dd835eea9030928793d426066c9d24d4726884a014f6352b811032a995e5ec6  Anvil/Core/wifi_cmd.pbi
 1fef5b309f9157638ffcf70ebc8b6155ee36ecfd0b929628a9e8f4e90a552017  RaspberryPi4/Lib/entropy.pi4
 7333a7c5e19d278942ec0f61e422a24e67fc2b50f9f0be5407bbfaa5d817cfda  RaspberryPi4/Lib/pbkdf2.pi4
-8fbe424ef90e4fff460f210badb14720ab30e2b7c29316692846eb387dff56a8  RaspberryPi4/Lib/wifi.pi4
+1a5353fef36406f9481b859b57b282e47da938792a908de74b7077cf4932265b  RaspberryPi4/Lib/wifi.pi4
 8540bdbeab8449700c2227d58ac7c5ef8a70ac599c20bb8db0d8c60990fbc1ed  RaspberryPi4/Tests/pbkdf2_step_emitted_gate.pi4
 0d01e52722ce13ab1d2f337d2445835e79c7b71212691aaeeb81ac56c9585164  tools/entropy_tryword_emitted_check.py
 697206e22c2ecfc944cef81b2a2d661bc9daaf0e98f32838803154661e8e84fb  tools/pbkdf2_step_emitted_check.py
-235e7fc1f6a63b2f13c6dbec1a4819e9868341f25fcf6895c7eb590343332c67  tools/wifi_link_policy_emitted_check.py
-7b06de2300ddaf38c611e1b4cd177c401b3e2bc50a160fbc5d34be7a419ffae5  tools/wifi_recovery_emitted_check.py
+6e3a189fa830575bd6fdbd20d63bc25ce5a9f3396ff60dfa059458f5ebac10fe  tools/wifi_link_policy_emitted_check.py
+e88aa06cacc2969c08557cea7c007c2f31c3c9bee40b04f15a328717431efbe5  tools/wifi_recovery_emitted_check.py
 ```
 
-An independent read-only review accepted the recovery surface after verifying
-idempotent NOTASSOCIATED teardown, all other control-failure paths, event-drop
-generation checks, cached-PMK fallback bounds, post-key-install persistence,
-and candidate cleanup. This remains desk evidence; physical AP-loss recovery
-and an indefinitely unanswered but normally running DHCP client require later
-board observation.
+The narrower cooperative-recovery and cached-PMK transport-owner cut received
+an independent read-only review. The expanded foreground/rekey failure surface
+above has emitted desk evidence and awaits separate integration and physical
+AP/rekey review. An indefinitely unanswered but normally running DHCP client
+also still requires later board observation.
