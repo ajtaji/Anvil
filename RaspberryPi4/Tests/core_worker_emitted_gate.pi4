@@ -1,0 +1,28 @@
+; Compile-only fixture for the inactive raw-secondary milestone.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu_secondary.pi4"
+XIncludeFile "RaspberryPi4/Lib/core_worker.pi4"
+
+Procedure.i Main()
+  ; No release or MMIO: force the primary-only API and raw entry into output.
+  If CoreRawBootBase() = CoreRawRowBase()
+    ProcedureReturn 1
+  EndIf
+  If CoreRawReleaseAddr(1) <> $E0
+    ProcedureReturn 2
+  EndIf
+  ; Runtime-false on BCM2711, but not a compile-time constant: retain every
+  ; managed primary procedure for emitted inspection without touching page 0.
+  If CoreRawId() = 99
+    If CoreRawPrepare(1, $1000000, $4000, $1234) = 0
+      ProcedureReturn 3
+    EndIf
+    If CoreRawRelease(1) = 0
+      ProcedureReturn 4
+    EndIf
+    If CoreRawWaitReady(1, 100) = 0
+      ProcedureReturn 5
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
