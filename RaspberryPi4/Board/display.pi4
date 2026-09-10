@@ -1112,6 +1112,14 @@ EndProcedure
 ;   THE SCROLL, AND WHY IT IS PRE-EMPTED RATHER THAN LEFT TO THE
 ;   LIBRARY. THIS IS A MARKED, TEMPORARY WORK-AROUND.
 ;  ====================================================================
+;  2026-09-10 UPDATE: the per-line DmaCacheLines call/store overhead
+;  described below is removed at the library's owning walk. An independent
+;  decoded comparison preserves every CIVAC address and caller barrier;
+;  a 100-line walk falls from 3446 to 446 instructions. This is NOT a new
+;  hardware timing measurement. The historical measurements and removal
+;  criterion below are retained: do not delete this path until ordinary
+;  DisplayScroll is measured with the actual cacheability/present policy.
+;
 ;  display.pi4's DisplayScroll() ALREADY has an accelerated path and it
 ;  is a good one - it detects that this console's rows are contiguous
 ;  and hands the whole block to the engine in a single linear transfer.
@@ -1132,9 +1140,9 @@ EndProcedure
 ;  TWO SEPARATE FACTS ABOUT THAT MAINTENANCE, AND THEY ARE DIFFERENT
 ;  FACTS:
 ;
-;    1  IT MAINTAINS NOTHING HERE. This monitor runs with the MMU off,
-;       so every access is Device memory and there is no cached copy of
-;       a framebuffer byte anywhere to clean or to drop. That is an
+;    1  IT MAINTAINED NO CACHED PIXELS IN THAT DIAGNOSTIC. The
+;       2026-08-28 diagnostic ran with the MMU off, so there was no
+;       cached framebuffer copy to clean or drop. That is an
 ;       argument, and it was turned into evidence rather than left as
 ;       one: pi4ScrollFast.pi4 section 2 paints a distinct colour into
 ;       all sixty text rows with the CPU, scrolls with the engine and

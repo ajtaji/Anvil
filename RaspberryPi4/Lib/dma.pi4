@@ -790,11 +790,10 @@ EndProcedure
 ;  file in this tree that hand-writes this sequence says so, because it
 ;  is the shape of bug the widening creates.
 ;
-;  WITH THE MMU OFF this is architecturally a no-op and costs a few
-;  cycles per line. That is the correct behaviour to leave in: the MMU
-;  is only on while a payload turns it on, and a library that skipped
-;  maintenance because it guessed the caches were off would be wrong
-;  the first time somebody enabled them.
+;  This library does not infer whether maintenance can be skipped from
+;  the caller's current MMU state. Anvil can enable cached execution,
+;  and a payload can use the library under its own mappings. Preserve
+;  the explicit maintenance contract in either case.
 ; ======================================================================
 Procedure DmaCacheLine()
   ASM
@@ -847,11 +846,27 @@ Procedure DmaCacheLines(addr.i, len.i)
   EndIf
   a = (addr / #DMA_CACHE_LINE) * #DMA_CACHE_LINE
   e = addr + len
-  While a < e
-    dma_flushaddr = a
-    DmaCacheLine()
-    a = a + #DMA_CACHE_LINE
-  Wend
+  ; Load the full-width bounds once. The hot loop has no procedure call or
+  ; shared scratch store per cache line; maintenance still uses CIVAC and
+  ; the public range/rectangle caller still owns its final barrier. These
+  ; are positive physical addresses with a non-overflowing exclusive end,
+  ; exactly the existing range contract. BCM2711's D-cache line is 64 bytes.
+  ASM
+    adrp x9, dmacachelines_a
+    add  x9, x9, #:lo12:dmacachelines_a
+    ldr  x9, [x9]
+    adrp x10, dmacachelines_e
+    add  x10, x10, #:lo12:dmacachelines_e
+    ldr  x10, [x10]
+    cmp  x9, x10
+    b.ge dmaCacheWalkDone
+  dmaCacheWalkNext:
+    dc   civac, x9
+    add  x9, x9, #64
+    cmp  x9, x10
+    b.lt dmaCacheWalkNext
+  dmaCacheWalkDone:
+  EndASM
 EndProcedure
 
 ; ONE BEHAVIOUR CHANGED IN THE 2026-08-27 SPLIT AND IT IS NAMED HERE
