@@ -1028,16 +1028,23 @@ EndProcedure
 ;  described. That is why this is a fix in the driver and not a retry at
 ;  the call site.
 ;
-;  What it does follows both the datasheet's controller definition and the
-;  upstream BCM2835 driver's timeout path. First write C with CLEAR and
-;  I2CEN OFF. That disables the controller and aborts an active transfer;
-;  CLEAR also empties both FIFOs. The abort is asynchronous on the bus, so
-;  poll TA until the controller says the transfer is no longer active.
-;  Only THEN clear DONE, ERR and CLKT: clearing them before TA falls permits
-;  a late abort-completion DONE to become the next transaction's status.
-;  Finally leave C enabled and idle. Linux uses the same disabled CLEAR at
-;  timeout and completion (drivers/i2c/busses/i2c-bcm2835.c:338-342,
-;  372-375 at commit 50d05c7c76c96b90462f24debacca971d2e86713).
+;  What it does follows the controller definition, the upstream BCM2835
+;  driver's warning, and one deliberately narrow silicon measurement. First
+;  write C with CLEAR and I2CEN OFF. That requests an abort and FIFO clear,
+;  but it does NOT by itself make TA fall: Linux says a non-idle read queues
+;  the abort NACK/STOP for the next time the engine is started
+;  (drivers/i2c/busses/i2c-bcm2835.c:254-260 at commit
+;  50d05c7c76c96b90462f24debacca971d2e86713).
+;
+;  Then enable the engine WITHOUT ST. Measured on BCM2711 2026-09-09, an
+;  as-found C=0/S.TA=1 controller reached TA=0/DONE=1 in 109 us after exactly
+;  C=I2CEN; no address or length register was rewritten and no new START was
+;  requested. Poll TA under the same independent wall-clock/spin bounds.
+;  Only after TA is zero is it safe to issue enabled CLEAR for any residual
+;  FIFO data, clear DONE/ERR/CLKT, and leave C enabled and idle. Clearing
+;  status earlier permits a late abort-completion DONE to contaminate the
+;  next transaction. Build-24 actually left RXD set after abort completion,
+;  so the post-idle FIFO clear is required rather than assumed.
 ;
 ;  It does NOT touch the divider, the slave address or the stretch timeout -
 ;  a recovery that also reset the rate would throw away a rate the operator
@@ -1056,6 +1063,9 @@ Procedure.i I2cRecover()
 
   a64_barrier()
   I2cWr(#BSC_C_OFF, #BSC_C_CLEAR)
+  ; A disabled engine preserves the queued abort. I2CEN alone advances it;
+  ; ST deliberately remains zero so recovery cannot launch an address phase.
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)
 
   spin = #I2C_SPIN_MAX
   deadline = I2cDeadlineUs(#I2C_RECOVER_TIMEOUT_US)
@@ -1068,15 +1078,18 @@ Procedure.i I2cRecover()
   Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
 
   If (s & #BSC_S_TA) <> 0
-    ; Leave the controller disabled. A caller already returning an error must
-    ; not advertise an enabled-idle controller that never became idle.
+    ; Restore disabled/fail-closed after the bounded no-ST enable attempt. A
+    ; caller already returning an error must not launch over active TA.
+    I2cWr(#BSC_C_OFF, 0)
     i2c_recover_failed = 1
     a64_barrier()
     ProcedureReturn 0
   EndIf
-  ; DONE may have arrived as the abort completed. This clear belongs after
-  ; the TA observation above, never immediately after requesting the abort.
+  ; The measured completion retained RXD. Clear both FIFOs only after the
+  ; observed TA-low state, then clear the abort's sticky status separately.
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)
   I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)
+  ; CLEAR is a command field; spell the steady enabled-idle state explicitly.
   I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)
   i2c_recover_failed = 0
   a64_barrier()

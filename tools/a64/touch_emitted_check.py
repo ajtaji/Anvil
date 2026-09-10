@@ -38,9 +38,10 @@ THE ONE THING IT EXISTS FOR
 
 WHAT IT CANNOT PROVE, AND THE LIST IS SHORT AND IMPORTANT
 
-  * Nothing here has touched a real controller, a real MCU or a real
-    panel. Every number came out of a Linux driver, and a Linux driver
-    is evidence about a register map, not about this silicon.
+  * The gate itself touches no real controller, MCU or panel. Its register
+    behavior is derived from the BCM2711 manual and Linux driver, plus the
+    narrow C=I2CEN/no-ST abort transition separately measured on silicon;
+    executing the same emitted code in a model is still not hardware proof.
   * The model's "a STOP loses the pointer" rule is STRICTER THAN THE
     DATASHEET, because there is no Goodix datasheet on this machine and
     the claim comes from the comments in two drivers. Being stricter is
@@ -53,9 +54,9 @@ WHAT IT CANNOT PROVE, AND THE LIST IS SHORT AND IMPORTANT
   * The axis transform is graded against the numbers in a device-tree
     overlay. If the overlay is wrong about this panel, this gate is wrong
     with it, in the same direction, and only a finger will say so.
-  * The bus is BSC1 on GPIO 2/3. The panel is on BSC0 at GPIO 44/45.
-    This diagnostic deliberately defaults to BSC1, so the model places the
-    same BSC register behavior there; the shipping touch path selects BSC0.
+  * The functional touch fixture is BSC1 on GPIO 2/3. The panel is on BSC0
+    at GPIO 44/45. The independent abort-resume fixture selects and models
+    BSC0, but addresses no device; the shipping touch path also selects BSC0.
 """
 
 import os
@@ -329,7 +330,7 @@ class Bsc:
 
     def __init__(self, base=BSC_BASE, patience=2, tx_chunk=1, stall=False,
                  stall_writes=0, abort_delay=0, abort_never=False,
-                 tx_gap_reads=1):
+                 tx_gap_reads=1, abort_residue=b""):
         self.base = base
         self.patience = patience
         self.devices = {}
@@ -355,6 +356,7 @@ class Bsc:
         self.abort_never = abort_never
         self.abort_pending = 0
         self.abort_completions = 0
+        self.abort_residue = bytes(abort_residue)
         self.tx_slots = 0
         self.tx_gap = False
         self.tx_gap_reads = tx_gap_reads
@@ -597,15 +599,19 @@ class Bsc:
         if off == C["BSC_C_OFF"]:
             self.regs[off] = val
             if val & C["BSC_C_CLEAR"]:
-                self.txbuf = bytearray()
-                self.rxbuf = bytearray()
                 if self.active and self.abort_delay > 0:
                     # CLEAR requests an abort. The bus-visible completion is
-                    # deliberately delayed; clearing S before it lands must
-                    # not make the fixture green.
+                    # deliberately delayed.  The build-24 controller retained
+                    # RXD after completion, so a disabled CLEAR is not modelled
+                    # as proof that the FIFO is empty; only a later idle CLEAR
+                    # may discard the injected residue.
                     if self.abort_pending == 0:
                         self.abort_pending = self.abort_delay
+                        if self.abort_residue:
+                            self.rxbuf = bytearray(self.abort_residue)
                 elif self.active:
+                    self.txbuf = bytearray()
+                    self.rxbuf = bytearray()
                     if self.cur is not None:
                         self.cur.stop()
                     self.stops += 1
@@ -617,6 +623,9 @@ class Bsc:
                     self.tx_slots = 0
                     self.tx_gap = False
                     self.tx_gap_left = 0
+                else:
+                    self.txbuf = bytearray()
+                    self.rxbuf = bytearray()
             if val & C["BSC_C_ST"]:
                 # A new START cannot outrun an unfinished abort. If a broken
                 # recovery tries, the later abort DONE is what its next poll
@@ -1418,12 +1427,10 @@ def run_abort_resume_probe(work, fails):
 def run_delayed_abort_recovery(i2c_path, work, fails):
     """A failed combined transfer must not poison the next ordinary one.
 
-    The BSC fixture keeps TA asserted for three status observations after
-    CLEAR and raises DONE only when that asynchronous abort completes. The
-    old clear-status/immediate-reenable sequence therefore loses: its next
-    START runs into the pending abort and sees that late DONE. The production
-    sequence must wait for TA to fall, clear the completion status afterward,
-    and then complete a normal MCU write and read without a retry.
+    The BSC fixture keeps TA asserted after disabled CLEAR: status reads alone
+    cannot advance the queued abort.  C=I2CEN without ST must run it for three
+    observations, after which the production path clears residual FIFO data
+    and sticky status while idle.  Only then may a normal MCU write/read run.
     """
     d = work / "delayed_abort"
     d.mkdir(parents=True, exist_ok=True)
@@ -1468,6 +1475,7 @@ def run_delayed_abort_recovery(i2c_path, work, fails):
     bsc, g, mcu = make_bus()
     bsc.stall_writes = 1
     bsc.abort_delay = 3
+    bsc.abort_residue = bytes([0xA5])
     cpu, out, steps = run(img, bsc)
 
     cases = 0
@@ -1484,6 +1492,20 @@ def run_delayed_abort_recovery(i2c_path, work, fails):
           bsc.abort_completions == 1,
           "%d delayed abort completion(s) were observed"
           % bsc.abort_completions)
+    recovery_seq = [
+        (C["BSC_C_OFF"], C["BSC_C_CLEAR"]),
+        (C["BSC_C_OFF"], C["BSC_C_I2CEN"]),
+        (C["BSC_C_OFF"], C["BSC_C_I2CEN"] | C["BSC_C_CLEAR"]),
+        (C["BSC_S_OFF"], C["BSC_S_DONE"] | C["BSC_S_ERR"] |
+         C["BSC_S_CLKT"]),
+        (C["BSC_C_OFF"], C["BSC_C_I2CEN"]),
+    ]
+    check("recovery enables without ST then clears FIFO/status while idle",
+          any(bsc.register_writes[i:i + len(recovery_seq)] == recovery_seq
+              for i in range(len(bsc.register_writes) -
+                             len(recovery_seq) + 1)),
+          "required recovery subsequence missing from %r"
+          % (bsc.register_writes,))
     check("the next ordinary MCU write completed exactly once",
           mcu.writes == [(0xAB, 0x55)],
           "MCU writes were %r" % (mcu.writes,))
@@ -1677,9 +1699,9 @@ MUTATIONS = [
      "        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)\n        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)",
      "        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)"),
 
-    ("i2c", "recovery clears status before the asynchronous abort completes",
-     "  I2cWr(#BSC_C_OFF, #BSC_C_CLEAR)\n\n  spin = #I2C_SPIN_MAX\n  deadline = I2cDeadlineUs(#I2C_RECOVER_TIMEOUT_US)\n  Repeat\n    s = I2cRd(#BSC_S_OFF)\n    If (s & #BSC_S_TA) = 0\n      Break\n    EndIf\n    spin = spin - 1\n  Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0\n\n  If (s & #BSC_S_TA) <> 0\n    ; Leave the controller disabled. A caller already returning an error must\n    ; not advertise an enabled-idle controller that never became idle.\n    i2c_recover_failed = 1\n    a64_barrier()\n    ProcedureReturn 0\n  EndIf\n  ; DONE may have arrived as the abort completed. This clear belongs after\n  ; the TA observation above, never immediately after requesting the abort.\n  I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)",
-     "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)\n  I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)\n  spin = 1\n  s = 0\n  deadline = 0\n  i2c_recover_failed = 0"),
+    ("i2c", "recovery waits for the queued abort with the engine disabled",
+     "  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)\n\n  spin = #I2C_SPIN_MAX",
+     "  spin = #I2C_SPIN_MAX"),
 ]
 
 SRC_OF = {"touch": DRV_TOUCH, "panel": DRV_PANEL, "i2c": DRV_I2C}
@@ -1863,10 +1885,9 @@ def main():
     print("MCU. The 'a STOP loses the pointer' rule is stricter than any")
     print("document on this machine. The SCREEN MAPPING is not here at")
     print("all - it lives in the display layer now and is graded by")
-    print("a64_dsiscreen_check. BSC0 on GPIO 44/45 - the bus the panel")
-    print("is actually on - is not modelled; this gate's simulated fixture")
-    print("uses the header bus. The separate returning hardware diagnostic")
-    print("i2c_touch_recovery_probe.pi4 explicitly selects display BSC0.")
+    print("a64_dsiscreen_check. The functional touch fixture uses the")
+    print("header bus; the independent abort-resume fixture selects BSC0")
+    print("but addresses no device. No model run is physical touch proof.")
 
     if args.mutate:
         return run_mutations()
