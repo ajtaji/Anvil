@@ -28,6 +28,8 @@ Global gate_serviceTurns.i
 Global gate_blockModeRc.i
 Global gate_settingsWrites.i
 Global gate_clockHz.i
+Global gate_rxCallback.i : Global gate_rxActive.i : Global gate_rxPending.i
+Global gate_rxEnableRc.i = 1 : Global gate_rxDisableRc.i = 1
 Global Dim gate_phaseForOp.i[24]
 
 ; The association globals touched by the shared cancellation seam are present
@@ -100,8 +102,25 @@ Procedure.i Cyw43RxIrqRestorePending() : ProcedureReturn gate_restorePending : E
 Procedure.i Cyw43RxIrqTelemetry(on.i)
   gate_calls = gate_calls + 1 : gate_lastOp = 23
   If gate_cancelOp = 23 : WifiRadioInitCancel() : EndIf
+  If on<>0 And gate_restoreRc=0 : gate_restorePending=1 : EndIf
   ProcedureReturn gate_restoreRc
 EndProcedure
+Procedure.i SdioRxIrqOp(op.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i Cyw43SetRxIrqIo(op.i)
+  If gate_rxActive<>0 Or gate_rxPending<>0 : ProcedureReturn 0 : EndIf
+  gate_rxCallback=op : ProcedureReturn 1
+EndProcedure
+Procedure.i Cyw43RxIrqRawReady() : ProcedureReturn 11 : EndProcedure
+Procedure.i Cyw43RxIrqFrameIndications() : ProcedureReturn 12 : EndProcedure
+Procedure.i Cyw43RxEmpty() : ProcedureReturn 13 : EndProcedure
+Procedure.i Cyw43RxFirstReads() : ProcedureReturn 14 : EndProcedure
+Procedure.i SdioCmd53Calls() : ProcedureReturn 15 : EndProcedure
+Procedure.i Cyw43RxIrqFirstPending() : ProcedureReturn 16 : EndProcedure
+Procedure.i Cyw43RxIrqFirstNoPending() : ProcedureReturn 17 : EndProcedure
+Procedure.i Cyw43RxIrqNonemptyPending() : ProcedureReturn 18 : EndProcedure
+Procedure.i Cyw43RxIrqNonemptyNoPending() : ProcedureReturn 19 : EndProcedure
+Procedure.i Cyw43RxIrqEmptyPending() : ProcedureReturn 20 : EndProcedure
+Procedure.i Cyw43RxIrqEmptyNoPending() : ProcedureReturn 21 : EndProcedure
 
 Procedure.i WifiLoadBlobs() : ProcedureReturn GateOp(1, 1) : EndProcedure
 Procedure.i MailboxInit() : ProcedureReturn GateOp(2, 1) : EndProcedure
@@ -159,6 +178,7 @@ Procedure GateReset()
   gate_ms = 1000 : gate_slots = 1 : gate_calls = 0 : gate_lastOp = 0
   gate_failOp = 0 : gate_cancelOp = 0
   gate_restoreActive = 0 : gate_restorePending = 0 : gate_restoreRc = 1
+  gate_rxCallback=0 : gate_rxActive=0 : gate_rxPending=0
   gate_down = 0 : gate_dhcpStarts = 0 : gate_recCancels = 0 : gate_wipes = 0
   gate_settingsWrites = 0
   gate_serviceTurns = 0 : gate_blockModeRc = 1 : gate_clockHz = 54000000
@@ -417,6 +437,25 @@ Procedure.i Main()
   If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 28 : EndIf
   GateReset() : gate_slots = 0 : WifiRecoveryInitialJoinFailed()
   If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 29 : EndIf
+
+  ; The monitor session is default-off, binds the current generation, and
+  ; unregisters only after verified disable.
+  GateReset() : gWifiUp=1
+  If WifiRxReadyActive()<>0 Or WifiRxReadyArm()=0 : ProcedureReturn 40 : EndIf
+  If WifiRxReadyActive()=0 Or WifiRxReadyGenerationValid()=0 Or gate_rxCallback=0 : ProcedureReturn 41 : EndIf
+  If WifiRxReadyFirstDelta()<>0 Or WifiRxReadyEmptyDelta()<>0 : ProcedureReturn 42 : EndIf
+  gWifiRinitGeneration=gWifiRinitGeneration+1
+  If WifiRxReadyArm()<>0 Or WifiRxReadyGenerationValid()<>0 : ProcedureReturn 43 : EndIf
+  If WifiRxReadyDisable()=0 Or gate_rxCallback<>0 Or WifiRxReadyActive()<>0 : ProcedureReturn 44 : EndIf
+
+  ; Failed ARM rollback retains callback and old-generation ownership. Disable
+  ; remains available after a generation mismatch and clears only on success.
+  GateReset() : gWifiUp=1 : gate_restoreRc=0
+  If WifiRxReadyArm()<>0 Or gate_rxCallback=0 Or gWifiRxReadyArmed<>2 : ProcedureReturn 45 : EndIf
+  gWifiRinitGeneration=gWifiRinitGeneration+1
+  If WifiRxReadyDisable()<>0 Or gate_rxCallback=0 Or gWifiRxReadyArmed<>2 : ProcedureReturn 46 : EndIf
+  gate_restoreRc=1 : gate_restorePending=0
+  If WifiRxReadyDisable()=0 Or gate_rxCallback<>0 Or gWifiRxReadyArmed<>0 : ProcedureReturn 47 : EndIf
 
   ProcedureReturn 0
 EndProcedure

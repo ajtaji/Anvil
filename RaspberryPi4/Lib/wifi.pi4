@@ -77,6 +77,19 @@
 ; radio has been uploaded, started and taken through Cyw43WifiUp.
 Global gWifiLoaded.i = 0
 Global gWifiUp.i     = 0
+; Explicit, default-off receive-readiness observation session. These baselines
+; never reset production counters and never participate in receive policy.
+Global gWifiRxReadyArmed.i = 0
+Global gWifiRxReadyGeneration.i = 0
+Global gWifiRxReadyMs.i = 0
+Global gWifiRxReadyRaw.i = 0
+Global gWifiRxReadyFrames.i = 0
+Global gWifiRxReadyEmpty.i = 0
+Global gWifiRxReadyFirst.i = 0
+Global gWifiRxReadyCmd53.i = 0
+Global gWifiRxReadyFirstPending.i = 0 : Global gWifiRxReadyFirstQuiet.i = 0
+Global gWifiRxReadyNonPending.i = 0 : Global gWifiRxReadyNonQuiet.i = 0
+Global gWifiRxReadyEmptyPending.i = 0 : Global gWifiRxReadyEmptyQuiet.i = 0
 
 ; Optional cooperative service hook. The radio remains independent of the
 ; screen: it only announces completed lines and bounded wait slices. The board
@@ -241,6 +254,9 @@ EndProcedure
 ; stop and the cooperative owner can retain it in phase diagnostics.
 Procedure.i wifi_RadioGenerationPreflight()
   If Cyw43RxIrqActive() <> 0 Or Cyw43RxIrqRestorePending() <> 0
+    If gWifiRxReadyArmed <> 0
+      ProcedureReturn WifiRxReadyDisable()
+    EndIf
     ProcedureReturn Cyw43RxIrqTelemetry(0)
   EndIf
   ProcedureReturn 1
@@ -2086,6 +2102,7 @@ Global Dim wifi_recPmk.a[32]
 Global gWifiRinitPhase.i = #WIFI_RINIT_IDLE
 Global gWifiRinitGeneration.i = 0
 Global gWifiRinitStepGeneration.i = 0
+
 Global gWifiRinitAt.i = 0
 Global gWifiRinitAttempts.i = 0
 Global gWifiRinitClockHz.i = 0
@@ -3872,3 +3889,89 @@ Procedure WifiLinkSet(on.i)
     WifiRecoveryCancel()
   EndIf
 EndProcedure
+
+Procedure.i WifiRxReadyArm()
+  If gWifiRxReadyArmed <> 0
+    ProcedureReturn Bool(gWifiRxReadyArmed = 1 And gWifiRxReadyGeneration = gWifiRinitGeneration And Cyw43RxIrqRestorePending() = 0)
+  EndIf
+  If gWifiUp = 0 Or gWifiRinitStepGeneration <> 0 Or Cyw43RxIrqRestorePending() <> 0
+    ProcedureReturn 0
+  EndIf
+  If Cyw43SetRxIrqIo(@SdioRxIrqOp) = 0
+    ProcedureReturn 0
+  EndIf
+  ; Own the callback/generation conservatively before ARM. Failure may retain
+  ; an exact old-generation snapshot which only disable may release.
+  gWifiRxReadyArmed = 2
+  gWifiRxReadyGeneration = gWifiRinitGeneration
+  gWifiRxReadyMs = millis()
+  gWifiRxReadyRaw = Cyw43RxIrqRawReady()
+  gWifiRxReadyFrames = Cyw43RxIrqFrameIndications()
+  gWifiRxReadyEmpty = Cyw43RxEmpty()
+  gWifiRxReadyFirst = Cyw43RxFirstReads()
+  gWifiRxReadyCmd53 = SdioCmd53Calls()
+  gWifiRxReadyFirstPending=Cyw43RxIrqFirstPending() : gWifiRxReadyFirstQuiet=Cyw43RxIrqFirstNoPending()
+  gWifiRxReadyNonPending=Cyw43RxIrqNonemptyPending() : gWifiRxReadyNonQuiet=Cyw43RxIrqNonemptyNoPending()
+  gWifiRxReadyEmptyPending=Cyw43RxIrqEmptyPending() : gWifiRxReadyEmptyQuiet=Cyw43RxIrqEmptyNoPending()
+  If Cyw43RxIrqTelemetry(1) = 0
+    ; A failed ARM may retain the old transport snapshot. Only unregister when
+    ; verified cleanup says there is no retryable ownership.
+    If Cyw43RxIrqRestorePending() = 0
+      Cyw43SetRxIrqIo(0)
+      gWifiRxReadyArmed = 0
+      gWifiRxReadyGeneration = 0
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  gWifiRxReadyArmed = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i WifiRxReadyDisable()
+  If gWifiRxReadyArmed = 0 And Cyw43RxIrqRestorePending() = 0
+    ProcedureReturn 1
+  EndIf
+  If Cyw43RxIrqTelemetry(0) = 0
+    ProcedureReturn 0
+  EndIf
+  If Cyw43SetRxIrqIo(0) = 0
+    ProcedureReturn 0
+  EndIf
+  gWifiRxReadyArmed = 0
+  gWifiRxReadyGeneration = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i WifiRxReadyActive()
+  ProcedureReturn Bool(gWifiRxReadyArmed = 1)
+EndProcedure
+Procedure.i WifiRxReadyGeneration()
+  ProcedureReturn gWifiRxReadyGeneration
+EndProcedure
+Procedure.i WifiRxReadyGenerationValid()
+  ProcedureReturn Bool(gWifiRxReadyArmed = 1 And gWifiRxReadyGeneration = gWifiRinitGeneration)
+EndProcedure
+Procedure.i WifiRxReadyElapsed()
+  ProcedureReturn (millis() - gWifiRxReadyMs) & $FFFFFFFF
+EndProcedure
+Procedure.i WifiRxReadyRawDelta()
+  ProcedureReturn Cyw43RxIrqRawReady() - gWifiRxReadyRaw
+EndProcedure
+Procedure.i WifiRxReadyFrameDelta()
+  ProcedureReturn Cyw43RxIrqFrameIndications() - gWifiRxReadyFrames
+EndProcedure
+Procedure.i WifiRxReadyEmptyDelta()
+  ProcedureReturn Cyw43RxEmpty() - gWifiRxReadyEmpty
+EndProcedure
+Procedure.i WifiRxReadyFirstDelta()
+  ProcedureReturn Cyw43RxFirstReads() - gWifiRxReadyFirst
+EndProcedure
+Procedure.i WifiRxReadyCmd53Delta()
+  ProcedureReturn SdioCmd53Calls() - gWifiRxReadyCmd53
+EndProcedure
+Procedure.i WifiRxReadyFirstPendingDelta() : ProcedureReturn Cyw43RxIrqFirstPending()-gWifiRxReadyFirstPending : EndProcedure
+Procedure.i WifiRxReadyFirstQuietDelta() : ProcedureReturn Cyw43RxIrqFirstNoPending()-gWifiRxReadyFirstQuiet : EndProcedure
+Procedure.i WifiRxReadyNonPendingDelta() : ProcedureReturn Cyw43RxIrqNonemptyPending()-gWifiRxReadyNonPending : EndProcedure
+Procedure.i WifiRxReadyNonQuietDelta() : ProcedureReturn Cyw43RxIrqNonemptyNoPending()-gWifiRxReadyNonQuiet : EndProcedure
+Procedure.i WifiRxReadyEmptyPendingDelta() : ProcedureReturn Cyw43RxIrqEmptyPending()-gWifiRxReadyEmptyPending : EndProcedure
+Procedure.i WifiRxReadyEmptyQuietDelta() : ProcedureReturn Cyw43RxIrqEmptyNoPending()-gWifiRxReadyEmptyQuiet : EndProcedure

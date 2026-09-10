@@ -13,6 +13,7 @@ Global gate_settingRc.i : Global gate_hasNet.i : Global gate_hasPw.i
 Global gate_hasCalls.i
 Global gate_mutations.i : Global gate_hooks.i : Global gate_cancels.i
 Global gate_reconciles.i : Global gate_joinFails.i : Global gate_heal.i
+Global gate_rxArm.i : Global gate_rxDisable.i
 
 Procedure SkipSpace() : EndProcedure : Procedure SkipWord() : gPos = gWordAt + 1 : EndProcedure
 Procedure.i ArgWord() : ProcedureReturn gate_word : EndProcedure
@@ -56,6 +57,11 @@ Procedure NetConsoleRearm() : EndProcedure : Procedure WifiShowSlot(s.i) : EndPr
 Procedure WifiSayNoSuchSlot(s.i) : EndProcedure : Procedure.i WifiSlotWord(*s) : ProcedureReturn 1 : EndProcedure
 Procedure.i WifiLooksSlotted(*s) : ProcedureReturn 0 : EndProcedure
 Procedure WifiPrintNet() : EndProcedure : Procedure WifiBusStatus() : EndProcedure
+Procedure.i WifiRxReadyArm() : gate_rxArm=gate_rxArm+1 : ProcedureReturn gate_settingRc : EndProcedure
+Procedure.i WifiRxReadyDisable() : gate_rxDisable=gate_rxDisable+1 : ProcedureReturn gate_settingRc : EndProcedure
+Procedure.i WifiRxReadyActive() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqRestorePending() : ProcedureReturn 0 : EndProcedure
+Procedure WifiRxReadyStatus() : EndProcedure
 Procedure.i WifiRejoin(a.i) : ProcedureReturn 0 : EndProcedure : Procedure.i WifiLinkActive() : ProcedureReturn 1 : EndProcedure
 Procedure.i WifiRejoinCount() : ProcedureReturn 0 : EndProcedure : Procedure WifiLinkSet(on.i) : EndProcedure
 Procedure WifiLinkDrop() : EndProcedure : Procedure.i wifi_EapolFailureName(s.i) : ProcedureReturn "none" : EndProcedure
@@ -67,6 +73,7 @@ Procedure GateReset(cmd.i,word.i,rest.i,rc.i)
   gate_cmd=cmd : gate_word=word : gate_rest=rest : gate_settingRc=rc
   gate_hasNet=0 : gate_hasPw=0 : gate_hasCalls=0 : gate_mutations=0 : gate_hooks=0
   gate_cancels=0 : gate_reconciles=0 : gate_joinFails=0 : gate_heal=0
+  gate_rxArm=0 : gate_rxDisable=0
   gWordLen=1 : gWifiKeyed=0 : gWifiHaveIp=0 : gWifiHealPend=0
 EndProcedure
 Procedure.i GateConfig(cmd.i,word.i,rest.i,rc.i)
@@ -101,5 +108,11 @@ Procedure.i Main()
   If gate_heal <> 2 : ProcedureReturn 15 : EndIf
   GateReset(3,"off",0,1) : CmdWifi()
   If gate_heal <> 1 : ProcedureReturn 16 : EndIf
+  GateReset(10,0,0,1) : CmdWifi()
+  If gate_rxArm <> 1 Or gate_rxDisable <> 0 : ProcedureReturn 17 : EndIf
+  GateReset(11,0,0,1) : CmdWifi()
+  If gate_rxArm <> 0 Or gate_rxDisable <> 1 : ProcedureReturn 18 : EndIf
+  GateReset(9,0,0,1) : CmdWifi()
+  If gate_rxArm <> 0 Or gate_rxDisable <> 0 : ProcedureReturn 19 : EndIf
   ProcedureReturn 0
 EndProcedure

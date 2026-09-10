@@ -78,6 +78,7 @@ def probe_source(source: str | None = None) -> str:
     constants.append(source_range(source, "#WIFI_EAPOL_FAIL_NONE", "Global gWifiEapolRecoverRc"))
     globals_ = source_range(source, "Global gWifiRecPhase", "Global Dim wifi_recPmk")
     globals_ += "\n" + source_range(source, "Global gWifiRinitPhase", "Global gWifiRinitFwCalls")
+    globals_ += "\n" + "\n".join(line for line in source.splitlines() if line.startswith("Global gWifiRxReady"))
     names = (
         "wifi_RadioGenerationPreflight", "WifiRadioUp",
         "WifiRadioInitCancel", "WifiRecoveryCancel", "wifi_RecordLinkDown",
@@ -88,6 +89,10 @@ def probe_source(source: str | None = None) -> str:
         "WifiRadioInitTick", "WifiRecoveryInitialJoinFailed",
         "WifiRecoveryStart", "WifiRecoveryReconcile", "WifiConfigChanged",
         "WifiHealSet", "WifiLinkSet",
+        "WifiRxReadyArm", "WifiRxReadyDisable", "WifiRxReadyActive",
+        "WifiRxReadyGeneration", "WifiRxReadyGenerationValid",
+        "WifiRxReadyElapsed", "WifiRxReadyRawDelta", "WifiRxReadyFrameDelta",
+        "WifiRxReadyEmptyDelta", "WifiRxReadyFirstDelta", "WifiRxReadyCmd53Delta",
     )
     bodies = "\n\n".join(procedure(source, name) for name in names)
     template = FIXTURE.read_text(encoding="utf-8")
@@ -117,10 +122,12 @@ def command_probe(source: str) -> str:
         "scan": 1, "join": 2, "connect": 2, "heal": 3,
         "ssid": 4, "phrase": 5, "network": 6,
         "password": 7, "passphrase": 7, "forget": 8,
+        "rxready": 9, "capture": 9, "status": 9, "arm": 10,
+        "disable": 11, "off": 11,
     }
     body = re.sub(
         r'WordIs\("([^"]+)"\)',
-        lambda match: f"Bool(gate_cmd = {command_ids.get(match.group(1), 0)})",
+        lambda match: ("Bool(gate_cmd >= 9 And gate_cmd <= 11)" if match.group(1) == "rxready" else f"Bool(gate_cmd = {command_ids.get(match.group(1), 0)})"),
         body,
     )
     return template.replace(marker, body)
@@ -260,6 +267,21 @@ def main() -> int:
         "ready association reconcile body",
     )
     mutations = (
+        (
+            "rxready callback registration",
+            "  If Cyw43SetRxIrqIo(@SdioRxIrqOp) = 0",
+            "  If 1 = 0",
+        ),
+        (
+            "rxready failed-restore retention",
+            "    If Cyw43RxIrqRestorePending() = 0\n      Cyw43SetRxIrqIo(0)",
+            "    If 1 = 1\n      Cyw43SetRxIrqIo(0)",
+        ),
+        (
+            "rxready generation binding",
+            "  ProcedureReturn Bool(gWifiRxReadyArmed = 1 And gWifiRxReadyGeneration = gWifiRinitGeneration)",
+            "  ProcedureReturn Bool(gWifiRxReadyArmed = 1)",
+        ),
         (
             "coarse clock retry",
             "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)",
@@ -455,7 +477,7 @@ def main() -> int:
         "17 mandatory phase-failure rows, 23 cancellation boundaries, "
         f"{steps:,} emitted A64 instructions; {len(mutations)} emitted mutants and "
         f"10 structural command mutants and 1 executed early-hook mutant rejected; "
-        f"16 executed command assertions / {command_steps:,} command A64 instructions; "
+        f"19 executed command assertions / {command_steps:,} command A64 instructions; "
         f"({mutant_steps:,} mutant instructions)"
     )
     return 0

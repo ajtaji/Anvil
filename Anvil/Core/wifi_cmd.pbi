@@ -338,6 +338,41 @@ Procedure WifiBusStatus()
   PrintN("  this radio. Queue full, glom failure or terminate failure is a loss alarm.")
 EndProcedure
 
+Procedure WifiRxReadyStatus()
+  If WifiRxReadyActive() = 0
+    If Cyw43RxIrqRestorePending() <> 0
+      PrintN("Wi-Fi receive-readiness capture is OFF, but exact SDIO restoration is still pending.")
+      PrintN("Type wifi rxready disable to retry restoration through the old transport.")
+    Else
+      PrintN("Wi-Fi receive-readiness capture is OFF. It is never armed at boot.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  If WifiRxReadyGenerationValid() = 0
+    PrintN("!! Wi-Fi receive-readiness capture belongs to a different radio generation.")
+    PrintN("   No correlation is reported; type wifi rxready disable to restore it.")
+    ProcedureReturn
+  EndIf
+  Print("Wi-Fi receive-readiness capture generation ") : PrintDec(WifiRxReadyGeneration())
+  Print(", elapsed ") : PrintDec(WifiRxReadyElapsed()) : PrintN(" ms:")
+  Print("  raw CARD_INT pending ") : PrintDec(WifiRxReadyRawDelta())
+  Print(", FRAME_IND ") : PrintDec(WifiRxReadyFrameDelta()) : PrintNl()
+  Print("  legacy F2 first reads ") : PrintDec(WifiRxReadyFirstDelta())
+  Print(", empty first reads ") : PrintDec(WifiRxReadyEmptyDelta())
+  Print(", all CMD53 calls ") : PrintDec(WifiRxReadyCmd53Delta()) : PrintNl()
+  Print("  first reads pending/quiet ") : PrintDec(WifiRxReadyFirstPendingDelta())
+  Print("/") : PrintDec(WifiRxReadyFirstQuietDelta()) : PrintNl()
+  Print("  nonempty pending/quiet ") : PrintDec(WifiRxReadyNonPendingDelta())
+  Print("/") : PrintDec(WifiRxReadyNonQuietDelta())
+  Print(", empty pending/quiet ") : PrintDec(WifiRxReadyEmptyPendingDelta())
+  Print("/") : PrintDec(WifiRxReadyEmptyQuietDelta()) : PrintNl()
+  Print("  lifetime zero cause ") : PrintDec(Cyw43RxIrqZeroCause())
+  Print(", rearm pending ") : PrintDec(Cyw43RxIrqRearmReady())
+  Print(", nested ") : PrintDec(Cyw43RxIrqNestedCalls())
+  Print(", fault ") : PrintDec(Cyw43RxIrqFault()) : PrintNl()
+  PrintN("  Observation only: the legacy F2 read still runs on every receive pass.")
+EndProcedure
+
 Procedure CmdWifi()
   Define v.i
   Define net.i
@@ -490,6 +525,35 @@ Procedure CmdWifi()
 
   If WordIs("bus") <> 0 Or WordIs("transport") <> 0
     WifiBusStatus()
+    ProcedureReturn
+  EndIf
+
+  If WordIs("rxready") <> 0
+    SkipSpace()
+    gWordAt = gPos
+    SkipWord()
+    gWordLen = gPos - gWordAt
+    If gWordLen = 0 Or WordIs("capture") <> 0 Or WordIs("status") <> 0
+      WifiRxReadyStatus()
+    ElseIf WordIs("arm") <> 0
+      If WifiRxReadyArm() <> 0
+        PrintN("Wi-Fi receive-readiness capture is armed for this radio generation.")
+        WifiRxReadyStatus()
+      Else
+        PrintN("!! Wi-Fi receive-readiness capture could not be armed (code -7371).")
+        PrintN("   The radio must be fully up, with no initialization or restore pending.")
+        PrintN("   If an older capture owns restoration, retry wifi rxready disable first.")
+      EndIf
+    ElseIf WordIs("disable") <> 0 Or WordIs("off") <> 0
+      If WifiRxReadyDisable() <> 0
+        PrintN("Wi-Fi receive-readiness capture is disabled and its SDIO masks are restored.")
+      Else
+        PrintN("!! Wi-Fi receive-readiness capture could not restore its SDIO masks (code -7372).")
+        PrintN("   Ownership was retained; retry wifi rxready disable before radio reset.")
+      EndIf
+    Else
+      PrintN("!! wifi rxready accepts arm, capture, or disable (code -7373). Nothing changed.")
+    EndIf
     ProcedureReturn
   EndIf
 

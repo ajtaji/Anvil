@@ -126,8 +126,22 @@ An observed nonempty read without readiness blocks enforcement until explained.
 
 Transport reset or reinitialization must also disable and verify restoration
 before discarding the old callback/latch generation. The current optional
-prototype is not registered by the monitor; that integration contract still
-needs an explicit gate before telemetry is enabled there.
+The monitor keeps the prototype off at boot. `wifi rxready arm` is the only
+arming action; it requires a stable operational radio generation, registers the
+SDIO callback, enables telemetry, and records counter baselines. `wifi rxready
+capture` (or bare `wifi rxready`) prints read-only deltas without clearing
+cumulative counters. `wifi rxready disable` restores the exact saved masks and
+removes the callback only after restoration verifies. Failed restore retains
+the callback, generation and retryable ownership.
+
+Capture places CARD_INT/frame indications beside legacy first/empty F2 reads
+and CMD53 calls. It does not change `cyw43_RxFrame`; every case still performs
+the legacy read. This is observation, not a scheduler or performance fix.
+
+Physical acceptance sequence: arm; capture an idle interval; capture around
+ping, control/event, TCP and glom-producing traffic; then disable. `wifi bus`
+remains the cumulative transport view. Any nonempty F2 read without readiness
+blocks later enforcement until explained.
 
 ## Executable gates
 
