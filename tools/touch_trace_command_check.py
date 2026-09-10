@@ -22,6 +22,10 @@ TRACE_RECORDS = (
     # A later transaction can encounter a non-idle preflight, recover it,
     # and still complete. Keep +1 independently visible from the -1 case.
     (1, 8, 0, 0, 404, 0x00000000, 0x40000051, 1, 0x14),
+    (4, 8, 0, 0, 420, -1, 0x00000014, -1, -1),
+    (5, 8, 0, 0, 430, -1, 0x00000015, -1, -1),
+    (6, 8, 0, 0, 440, -1, 0x00000020, -1, -1),
+    (7, 8, 0, 0, 450, -1, 0x00000002, -1, -1),
     (3, 8, -4, 0, 505, 0x00008000, 0x40000051, 1, 0x14),
     (2, 8, 0, 1, 606, 0x00008000, 0x00000052, 0, 0x14),
 )
@@ -36,9 +40,17 @@ EXPECTED_RECORD_LINES = (
     'C=00000000 S=40000051 DLEN=00000000 A=00000045',
     '3 BEGIN Goodix14 identity result=0 preflight=0 tick=404 '
     'C=00000000 S=40000051 DLEN=00000001 A=00000014',
-    '4 FAULT Goodix14 identity result=-4 preflight=0 tick=505 '
+    '4 TX    Goodix14 identity result=0 preflight=0 tick=420 '
+    'C=not-sampled S=00000014 DLEN=not-sampled A=not-sampled',
+    '5 READST Goodix14 identity result=0 preflight=0 tick=430 '
+    'C=not-sampled S=00000015 DLEN=not-sampled A=not-sampled',
+    '6 RX    Goodix14 identity result=0 preflight=0 tick=440 '
+    'C=not-sampled S=00000020 DLEN=not-sampled A=not-sampled',
+    '7 DONE  Goodix14 identity result=0 preflight=0 tick=450 '
+    'C=not-sampled S=00000002 DLEN=not-sampled A=not-sampled',
+    '8 FAULT Goodix14 identity result=-4 preflight=0 tick=505 '
     'C=00008000 S=40000051 DLEN=00000001 A=00000014',
-    '5 END   Goodix14 identity result=0 preflight=1 tick=606 '
+    '9 END   Goodix14 identity result=0 preflight=1 tick=606 '
     'C=00008000 S=00000052 DLEN=00000000 A=00000014',
 )
 
@@ -90,14 +102,14 @@ def check(image, a64):
     fields = constant('I2C_TRACE_FIELDS')
     cases, total = 0, 0
     for line, count, expected, overflow in (
-            ('trace', 6, [], 0), ('TrAcE', 6, [], 1), ('trace  ', 0, [], 0),
-            ('trace extra', 6, [], 0), ('traceable', 6, ['usage'], 0),
-            ('help', 6, ['usage'], 0), ('nonesuch', 6, ['usage'], 0),
-            ('', 6, ['select', 'up', 'status', 'select'], 0),
-            ('points', 6, ['select', 'up', 'live', 'select'], 0),
-            ('panel', 6, ['select', 'up', 'panel', 'select'], 0),
-            ('axes', 6, ['mapping'], 0),
-            ('bus', 6, ['select', 'saybus', 'select'], 0)):
+            ('trace', 10, [], 0), ('TrAcE', 10, [], 1), ('trace  ', 0, [], 0),
+            ('trace extra', 10, [], 0), ('traceable', 10, ['usage'], 0),
+            ('help', 10, ['usage'], 0), ('nonesuch', 10, ['usage'], 0),
+            ('', 10, ['select', 'up', 'status', 'select'], 0),
+            ('points', 10, ['select', 'up', 'live', 'select'], 0),
+            ('panel', 10, ['select', 'up', 'panel', 'select'], 0),
+            ('axes', 10, ['mapping'], 0),
+            ('bus', 10, ['select', 'saybus', 'select'], 0)):
         cpu = emitted.fresh_cpu(a64, image)
         cpu.memory = RamOnly(cpu.memory)
         for index, byte in enumerate(line.encode('ascii') + b'\0'):
@@ -173,6 +185,10 @@ def check(image, a64):
                         'trace records were not rendered exactly in B/F/E order:\n' +
                         '\n'.join(record_lines))
                 for phrase in (
+                        'TX/READST/RX/DONE are first progress observations; '
+                        'their result=0 is a placeholder.',
+                        'On progress rows C/DLEN/A=not-sampled; '
+                        'S is the already-read status.',
                         'BEGIN result is a placeholder; FAULT is the observed failure; '
                         'END is the final result.',
                         'preflight outcome is meaningful on END only: 0=not needed, '

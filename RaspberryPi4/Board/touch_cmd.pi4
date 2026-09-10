@@ -890,6 +890,7 @@ Procedure TouchTrace()
   Define count.i
   Define edge.i
   Define phase.i
+  Define progress.i
   count = I2cTraceCount()
   Print("Boot I2C trace: ") : PrintDec(count) : PrintN(" retained records.")
   If I2cTraceOverflow() <> 0
@@ -901,17 +902,32 @@ Procedure TouchTrace()
   EndIf
   PrintN("Ticks are architectural-counter ticks, not microseconds.")
   PrintN("C/S/DLEN/A are sequential observations; reserved status bits are uninterpreted.")
+  PrintN("TX/READST/RX/DONE are first progress observations; their result=0 is a placeholder.")
+  PrintN("On progress rows C/DLEN/A=not-sampled; S is the already-read status.")
   PrintN("BEGIN result is a placeholder; FAULT is the observed failure; END is the final result.")
   PrintN("preflight outcome is meaningful on END only: 0=not needed, 1=recovered, -1=failed.")
   For i = 0 To count - 1
     PrintDec(i) : Print(" ")
     edge = I2cTraceGet(i, #I2C_TRACE_FIELD_EDGE)
+    progress = 0
     If edge = #I2C_TRACE_EDGE_BEGIN
       Print("BEGIN ")
     ElseIf edge = #I2C_TRACE_EDGE_END
       Print("END   ")
     ElseIf edge = #I2C_TRACE_EDGE_FAULT
       Print("FAULT ")
+    ElseIf edge = #I2C_TRACE_EDGE_TX
+      progress = 1
+      Print("TX    ")
+    ElseIf edge = #I2C_TRACE_EDGE_SWITCH
+      progress = 1
+      Print("READST ")
+    ElseIf edge = #I2C_TRACE_EDGE_RX
+      progress = 1
+      Print("RX    ")
+    ElseIf edge = #I2C_TRACE_EDGE_DONE
+      progress = 1
+      Print("DONE  ")
     Else
       Print("EDGE ") : PrintDec(edge) : Print(" ")
     EndIf
@@ -930,10 +946,13 @@ Procedure TouchTrace()
     Print(" result=") : PrintDec(I2cTraceGet(i, #I2C_TRACE_FIELD_RESULT))
     Print(" preflight=") : PrintDec(I2cTraceGet(i, #I2C_TRACE_FIELD_RECOVERED))
     Print(" tick=") : PrintDec(I2cTraceGet(i, #I2C_TRACE_FIELD_TICKS))
-    Print(" C=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_C), 8)
+    Print(" C=")
+    If progress <> 0 : Print("not-sampled") : Else : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_C), 8) : EndIf
     Print(" S=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_S), 8)
-    Print(" DLEN=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_DLEN), 8)
-    Print(" A=") : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_A), 8)
+    Print(" DLEN=")
+    If progress <> 0 : Print("not-sampled") : Else : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_DLEN), 8) : EndIf
+    Print(" A=")
+    If progress <> 0 : Print("not-sampled") : Else : PutHexN(I2cTraceGet(i, #I2C_TRACE_FIELD_A), 8) : EndIf
     PrintN("")
   Next
 EndProcedure

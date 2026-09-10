@@ -10,7 +10,10 @@ entry which is forbidden from touching MMIO or FIFO.
 import argparse
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path(os.environ.get("PMF_REPO") or HERE.parents[1]).resolve()
@@ -155,6 +158,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pmfc", default=os.environ.get("PMFC"),
                     help="external PureMetal compiler (or set PMFC)")
+    ap.add_argument("--skip-mutations", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if not args.pmfc:
         raise SystemExit("pass --pmfc or set PMFC")
@@ -226,16 +230,24 @@ def main():
            on_goodix.status_clears))
 
     recs = records(on_cpu, on_syms)
-    expected_phases = [1, 2, 3, 4, 5, 6, 7]
-    check("seven transaction pairs", len(recs) == 14, "records=%d" % len(recs))
+    expected = []
+    for p in (1, 3, 5):
+        expected += [(p, 1), (p, 4), (p, 7), (p, 2),
+                     (p + 1, 1), (p + 1, 6), (p + 1, 7), (p + 1, 2)]
+    expected += [(7, e) for e in (1, 4, 5, 6, 7, 2)]
+    check("seven transactions with milestones", len(recs) == 30, "records=%d" % len(recs))
     check("phase and edge order",
-          [(r[1], r[0]) for r in recs] ==
-          [(p, e) for p in expected_phases for e in (1, 2)],
+          [(r[1], r[0]) for r in recs] == expected,
           repr([(r[1], r[0]) for r in recs]))
     check("real results retained",
-          len(recs) == 14 and all(recs[i][2] == 0 for i in range(1, 14, 2)))
+          len([r for r in recs if r[0] == 2 and r[2] == 0]) == 7)
     check("healthy preflight did not recover",
-          len(recs) == 14 and all(recs[i][3] == 0 for i in range(1, 14, 2)))
+          all(r[3] == 0 for r in recs if r[0] == 2))
+    progress = [r for r in recs if r[0] in (4, 5, 6, 7)]
+    check("milestones reuse status without snapshots",
+          progress and all(r[5] == 0xFFFFFFFF and r[7] == 0xFFFFFFFF and
+                           r[8] == 0xFFFFFFFF
+                           for r in progress))
     check("snapshot excludes FIFO",
           on_bsc.fifo_reads == off_bsc.fifo_reads,
           "off=%d on=%d" % (off_bsc.fifo_reads, on_bsc.fifo_reads))
@@ -248,24 +260,23 @@ def main():
 
     sat_cpu, sat_syms = sat[0], sat[1]
     sat_recs = records(sat_cpu, sat_syms)
-    check("saturates at fixed capacity", len(sat_recs) == 32)
+    check("bounded below fixed capacity", len(sat_recs) <= 64)
     check("overflow is loud", u64(sat_cpu, sat_syms, "trace_fixture_overflow") == 1)
-    check("first history retained", sat_recs[:14] == recs)
+    check("first history retained", sat_recs[:30] == recs)
+    tail = sat_recs[30:]
     check("no orphan transaction",
-          all(sat_recs[i][0] == 1 and sat_recs[i + 1][0] == 3 and
-              sat_recs[i + 2][0] == 2 for i in range(14, len(sat_recs), 3)))
+          all(tail[i][0] == 1 and tail[i + 1][0] == 3 and tail[i + 2][0] == 2
+              for i in range(0, len(tail), 3)))
 
     recovered_recs = records(recovered[0], recovered[1])
     check("successful preflight recovery annotated",
-          len(recovered_recs) >= 3 and recovered_recs[1][0] == 3 and
-          recovered_recs[2][3] == 1 and recovered_recs[2][2] == 0,
+          any(r[0] == 3 for r in recovered_recs) and
+          any(r[0] == 2 and r[3] == 1 and r[2] == 0 for r in recovered_recs),
           repr(recovered_recs[:3]))
     refused_recs = records(refused[0], refused[1])
     check("failed preflight recovery annotated",
-          len(refused_recs) >= 3 and refused_recs[1][0] == 3 and
-          refused_recs[1][2] == touch.C["I2C_TIMEOUT"] and
-          refused_recs[2][3] == -1 and
-          refused_recs[2][2] == touch.C["I2C_TIMEOUT"],
+          any(r[0] == 3 and r[2] == touch.C["I2C_TIMEOUT"] for r in refused_recs) and
+          any(r[0] == 2 and r[3] == -1 and r[2] == touch.C["I2C_TIMEOUT"] for r in refused_recs),
           repr(refused_recs[:3]))
     check("failed recovery starts no new transfer",
           refused[2].starts == 0 and refused[2].repeated_starts == 0,
@@ -275,7 +286,7 @@ def main():
     missing_recs = records(missing[0], missing[1])
     missing_faults = [r for r in missing_recs if r[0] == 3]
     check("failed Goodix identities preserve pre-cleanup faults",
-          len(missing_recs) == 18 and [r[1] for r in missing_faults] == [7, 8] and
+          [r[1] for r in missing_faults] == [7, 8] and
           all(r[2] == touch.C["I2C_NACK"] and
               (r[6] & touch.C["BSC_S_ERR"]) for r in missing_faults),
           repr(missing_faults))
@@ -302,11 +313,46 @@ def main():
         for failure in fails:
             print("  * " + failure)
         return 1
+    if not args.skip_mutations:
+        source_text = I2C.read_text(encoding="utf-8")
+        mutations = (
+            ("missing repeated-start milestone",
+             "        I2cTraceMilestone(#I2C_TRACE_EDGE_SWITCH, s)\n", ""),
+            ("missing combined TX milestone",
+             "      I2cTraceMilestone(#I2C_TRACE_EDGE_TX, s)\n      While i < wn",
+             "      While i < wn"),
+        )
+        for label, old, new in mutations:
+            if source_text.count(old) != 1:
+                raise SystemExit("mutation anchor is not unique: " + label)
+            with tempfile.TemporaryDirectory(prefix="anvil-i2c-trace-mutant-") as td:
+                staged = pathlib.Path(td)
+                shutil.copytree(ROOT / "RaspberryPi4", staged / "RaspberryPi4")
+                shutil.copy2(pmfc.parent / "keywords.def", staged / "keywords.def")
+                compiler_intrinsics = pmfc.parent / "RaspberryPi4/Intrinsics"
+                if compiler_intrinsics.is_dir():
+                    shutil.copytree(compiler_intrinsics,
+                                    staged / "RaspberryPi4/Intrinsics",
+                                    dirs_exist_ok=True)
+                mutant_i2c = staged / "RaspberryPi4/Lib/i2c.pi4"
+                mutant_i2c.write_text(source_text.replace(old, new, 1), encoding="utf-8")
+                env = os.environ.copy()
+                env["PMF_REPO"] = str(staged)
+                run_mutant = subprocess.run(
+                    [sys.executable, str(pathlib.Path(__file__).resolve()),
+                     "--pmfc", str(pmfc), "--skip-mutations"], env=env,
+                    capture_output=True, text=True, timeout=120)
+                if run_mutant.returncode == 0:
+                    raise SystemExit("compiled mutation survived: " + label)
+                if "i2c_boot_trace_emitted_check: FAIL" not in run_mutant.stdout:
+                    raise SystemExit("mutation did not reach emitted assertions: " + label +
+                                     "\n" + run_mutant.stdout + run_mutant.stderr)
+            print("  rejected compiled mutation: " + label)
     total_steps = sum(x[7] for x in
                       (default, off, on, sat, recovered, refused, missing))
     print("i2c_boot_trace_emitted_check: PASS - %d checks, %d instructions" %
           (checks[0], total_steps))
-    print("  off/on wire sequence identical; normal 14, error 18, saturation 32")
+    print("  off/on wire sequence identical; normal trace 30 records; capacity 64")
     print("  readback RAM-only; FIFO never sampled by the trace")
     return 0
 

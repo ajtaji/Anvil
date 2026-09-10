@@ -494,12 +494,16 @@ Global i2c_recover_failed.i
 ;  The buffer saturates instead of wrapping, preserving the first failure
 ;  and all state that led to it.
 ; ----------------------------------------------------------------------
-#I2C_TRACE_MAX = 32
+#I2C_TRACE_MAX = 64
 #I2C_TRACE_FIELDS = 9
 
 #I2C_TRACE_EDGE_BEGIN = 1
 #I2C_TRACE_EDGE_END = 2
 #I2C_TRACE_EDGE_FAULT = 3
+#I2C_TRACE_EDGE_TX = 4
+#I2C_TRACE_EDGE_SWITCH = 5
+#I2C_TRACE_EDGE_RX = 6
+#I2C_TRACE_EDGE_DONE = 7
 
 #I2C_TRACE_FIELD_EDGE = 0
 #I2C_TRACE_FIELD_PHASE = 1
@@ -530,6 +534,7 @@ Global i2c_trace_recovered.i
 Global i2c_trace_faulted.i
 Global i2c_trace_goodix.i
 Global i2c_trace_goodix_seen.i
+Global i2c_trace_milestones.i
 
 ; ----------------------------------------------------------------------
 ;  THE ACTIVE BUS. ONE global, written by I2cSelectBus() and by nothing
@@ -721,6 +726,7 @@ Procedure I2cTraceEnable(on.i)
     i2c_trace_faulted = 0
     i2c_trace_goodix = 0
     i2c_trace_goodix_seen = 0
+    i2c_trace_milestones = 0
     i2c_trace_on = 1
   Else
     i2c_trace_on = 0
@@ -775,8 +781,9 @@ Procedure I2cTraceCapture(edge.i, phase.i, result.i, recovered.i)
   I2cTracePut(index, #I2C_TRACE_FIELD_A, I2cRd(#BSC_A_OFF))
 EndProcedure
 
-; Return 1 only when this call owns a complete transaction record. Three free
-; records are required up front for BEGIN, an optional FAULT, and END, so a
+; Return 1 only when this call owns a complete transaction record. Seven
+; records are required up front for BEGIN, four progress milestones, an
+; optional FAULT, and END, so a
 ; full buffer cannot retain an orphan BEGIN or hide a fault for lack of room.
 Procedure.i I2cTraceBegin(phase.i)
   If i2c_trace_on = 0 Or phase <= 0
@@ -786,7 +793,7 @@ Procedure.i I2cTraceBegin(phase.i)
     i2c_trace_overflow = 1
     ProcedureReturn 0
   EndIf
-  If i2c_trace_count > #I2C_TRACE_MAX - 3
+  If i2c_trace_count > #I2C_TRACE_MAX - 7
     i2c_trace_overflow = 1
     ProcedureReturn 0
   EndIf
@@ -794,8 +801,40 @@ Procedure.i I2cTraceBegin(phase.i)
   i2c_trace_phase = phase
   i2c_trace_recovered = 0
   i2c_trace_faulted = 0
+  i2c_trace_milestones = 0
   I2cTraceCapture(#I2C_TRACE_EDGE_BEGIN, phase, 0, 0)
   ProcedureReturn 1
+EndProcedure
+
+; Retain the first observation of a transaction milestone using only the
+; status word the polling loop already loaded. This procedure performs no
+; MMIO access and reserves the final two slots for first FAULT and END.
+Procedure I2cTraceMilestone(edge.i, status.i)
+  Define bit.i
+  Define index.i
+  If i2c_trace_on = 0 Or i2c_trace_pending = 0
+    ProcedureReturn
+  EndIf
+  bit = 1 << edge
+  If (i2c_trace_milestones & bit) <> 0
+    ProcedureReturn
+  EndIf
+  If i2c_trace_count > #I2C_TRACE_MAX - 3
+    i2c_trace_overflow = 1
+    ProcedureReturn
+  EndIf
+  i2c_trace_milestones = i2c_trace_milestones | bit
+  index = i2c_trace_count
+  i2c_trace_count = i2c_trace_count + 1
+  I2cTracePut(index, #I2C_TRACE_FIELD_EDGE, edge)
+  I2cTracePut(index, #I2C_TRACE_FIELD_PHASE, i2c_trace_phase)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RESULT, 0)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RECOVERED, 0)
+  I2cTracePut(index, #I2C_TRACE_FIELD_TICKS, I2cCounterTicks())
+  I2cTracePut(index, #I2C_TRACE_FIELD_C, $FFFFFFFF)
+  I2cTracePut(index, #I2C_TRACE_FIELD_S, status)
+  I2cTracePut(index, #I2C_TRACE_FIELD_DLEN, $FFFFFFFF)
+  I2cTracePut(index, #I2C_TRACE_FIELD_A, $FFFFFFFF)
 EndProcedure
 
 ; Preserve the decisive controller state BEFORE an error path clears sticky
@@ -832,6 +871,7 @@ Procedure I2cTraceEnd(owned.i, result.i)
     i2c_trace_phase = 0
     i2c_trace_recovered = 0
     i2c_trace_faulted = 0
+    i2c_trace_milestones = 0
   EndIf
 EndProcedure
 
@@ -1455,6 +1495,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
     ; --- move a byte if the FIFO is ready and there is one to move ----
     If isRead <> 0
       If i < n And (s & #BSC_S_RXD) <> 0
+        I2cTraceMilestone(#I2C_TRACE_EDGE_RX, s)
         PokeA(*buf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
         i = i + 1
         spin = #I2C_SPIN_MAX          ; progress - reset the backstop
@@ -1463,6 +1504,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
       EndIf
     Else
       If i < n And (s & #BSC_S_TXD) <> 0
+        I2cTraceMilestone(#I2C_TRACE_EDGE_TX, s)
         I2cWr(#BSC_FIFO_OFF, PeekA(*buf + i) & $FF)
         i = i + 1
         spin = #I2C_SPIN_MAX
@@ -1473,6 +1515,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
 
     ; --- finished? ----------------------------------------------------
     If (s & #BSC_S_DONE) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
       If isRead <> 0
         ; DONE can be set with bytes still sitting in the FIFO - drain
         ; whatever is left before declaring the count short.
@@ -1657,6 +1700,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
       ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
     EndIf
     If (s & #BSC_S_DONE) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
       ; The write is over and a STOP went with it. Do NOT begin a plain read.
       I2cTraceFault(s, #I2C_NOSR)
       I2cRecover()
@@ -1664,6 +1708,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     If (s & #BSC_S_TXW) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_TX, s)
       While i < wn
         s = I2cRd(#BSC_S_OFF)
         If (s & #BSC_S_ERR) <> 0
@@ -1693,6 +1738,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
       If i = wn
         I2cWr(#BSC_DLEN_OFF, rn & $FFFF)
         I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)
+        I2cTraceMilestone(#I2C_TRACE_EDGE_SWITCH, s)
         Break
       EndIf
     EndIf
@@ -1726,6 +1772,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     If i < rn And (s & #BSC_S_RXD) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_RX, s)
       PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
       i = i + 1
       spin = #I2C_SPIN_MAX
@@ -1734,6 +1781,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     If (s & #BSC_S_DONE) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
       While i < rn And (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
         PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
         i = i + 1

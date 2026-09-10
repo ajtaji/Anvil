@@ -19,6 +19,14 @@ trace file and no background storage write.
 | BEGIN | Controller state before the existing transaction's preflight/status clearing. The result field is a placeholder. |
 | FAULT | The first observed failure or non-idle preflight state, before cleanup. The status word is the one already observed by the polling code. |
 | END | The transaction's real return code and final observed controller state. |
+| TX | First TXD/TXW progress observed. |
+| READST | Goodix read length and READ/ST command written. |
+| RX | First RXD progress observed. |
+| DONE | First DONE observed. |
+
+Progress rows reuse the status word already loaded by the polling loop and add
+no MMIO read. The viewer prints their C, DLEN and A fields as `not-sampled`.
+BEGIN/FAULT/END retain their original nine-field layout and meanings.
 
 `preflight` is meaningful on END only: `0` means no idle recovery was needed,
 `1` means that recovery succeeded, and `-1` means it failed. It does not report
@@ -36,8 +44,9 @@ The trace never samples the receive FIFO. Capturing still costs instructions
 and safe register reads, so it can perturb timing; it is not proof that an
 intermittent failure will reproduce identically with capture disabled.
 
-The 32-record buffer preserves the earliest history without wrapping. A new
-transaction is admitted only with room for BEGIN, optional FAULT and END.
+The 64-record buffer preserves the earliest history without wrapping. A new
+transaction is admitted only with room for BEGIN, four progress milestones,
+optional FAULT and END.
 The viewer reports saturation rather than silently presenting truncated
 history as complete. No records means no matching transaction was captured;
 it does not mean that the touch hardware passed.
