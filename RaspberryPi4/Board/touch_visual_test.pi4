@@ -86,6 +86,12 @@ Procedure.i TouchVisualTest()
   Dim seen.a[16]
   Dim ev.a[#HW_TOUCH_EVSZ]
 
+  ; Each invocation owns fresh test state, including after an interrupted run.
+  polls = 0 : peak = 0 : failure = 0 : wasV3d = 0
+  For i = 0 To 15
+    oldX[i] = 0 : oldY[i] = 0 : active[i] = 0 : seen[i] = 0
+  Next
+
   If gScreen = 0 Or gScrSrc <> #SCR_SRC_DSI
     PrintN("!! touch test needs the active DSI screen; nothing was drawn.")
     ProcedureReturn 0
