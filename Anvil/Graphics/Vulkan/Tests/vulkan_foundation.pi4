@@ -1,0 +1,168 @@
+; Executable state/lifetime probe. The A64 host gate runs this image; it is
+; never a board diagnostic and its explicitly enabled backend owns no GPU.
+#ANVIL_VK_TEST_BACKEND = 1
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+
+#VKT_OUT = $06000000
+Global vktFails.i = 0
+Global vktChecks.i = 0
+
+Procedure Vkt(ok.i)
+  PokeN(#VKT_OUT + $100 + (vktChecks * 8), ok)
+  vktChecks = vktChecks + 1
+  If ok = 0 : vktFails = vktFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i
+  Define inst2.i
+  Define phys.i
+  Define dev.i
+  Define dev2.i
+  Define queue.i
+  Define pool.i
+  Define pool2.i
+  Define cmd.i
+  Define cmdNew.i
+  Define second.i
+  Define count.i
+  Define rc.i
+
+  ; Exact currently-expressible structure sizes.
+  Vkt(SizeOf(VkExtent2D) = 8)
+  Vkt(SizeOf(VkExtent3D) = 12)
+  Vkt(SizeOf(VkOffset2D) = 8)
+  Vkt(SizeOf(VkOffset3D) = 12)
+  Vkt(SizeOf(VkViewport) = 24)
+  Vkt(SizeOf(VkComponentMapping) = 16)
+  Vkt(SizeOf(VkRect2D) = 16)
+  Vkt(OffsetOf(VkRect2D\extent\height) = 12)
+  Vkt(SizeOf(VkExtensionProperties) = 260)
+  Vkt(OffsetOf(VkExtensionProperties\specVersion) = 256)
+  Vkt(SizeOf(VkLayerProperties) = 520)
+  Vkt(OffsetOf(VkLayerProperties\description) = 264)
+  Vkt(SizeOf(VkApplicationInfo) = 48)
+  Vkt(OffsetOf(VkApplicationInfo\pNext) = 8)
+  Vkt(OffsetOf(VkApplicationInfo\pApplicationName) = 16)
+  Vkt(OffsetOf(VkApplicationInfo\applicationVersion) = 24)
+  Vkt(OffsetOf(VkApplicationInfo\pEngineName) = 32)
+  Vkt(OffsetOf(VkApplicationInfo\apiVersion) = 44)
+  Vkt(SizeOf(VkAllocationCallbacks) = 48)
+  Vkt(SizeOf(VkDeviceQueueCreateInfo) = 40)
+  Vkt(OffsetOf(VkDeviceQueueCreateInfo\pNext) = 8)
+  Vkt(OffsetOf(VkDeviceQueueCreateInfo\pQueuePriorities) = 32)
+  Vkt(SizeOf(VkDeviceCreateInfo) = 72)
+  Vkt(OffsetOf(VkDeviceCreateInfo\pQueueCreateInfos) = 24)
+  Vkt(OffsetOf(VkDeviceCreateInfo\ppEnabledLayerNames) = 40)
+  Vkt(OffsetOf(VkDeviceCreateInfo\pEnabledFeatures) = 64)
+  Vkt(SizeOf(VkInstanceCreateInfo) = 64)
+  Vkt(OffsetOf(VkInstanceCreateInfo\pApplicationInfo) = 24)
+  Vkt(OffsetOf(VkInstanceCreateInfo\ppEnabledLayerNames) = 40)
+  Vkt(OffsetOf(VkInstanceCreateInfo\ppEnabledExtensionNames) = 56)
+  Vkt(SizeOf(VkCommandPoolCreateInfo) = 24)
+  Vkt(OffsetOf(VkCommandPoolCreateInfo\queueFamilyIndex) = 20)
+  Vkt(SizeOf(VkCommandBufferAllocateInfo) = 32)
+  Vkt(OffsetOf(VkCommandBufferAllocateInfo\commandPool) = 16)
+  Vkt(OffsetOf(VkCommandBufferAllocateInfo\level) = 24)
+  Vkt(SizeOf(VkCommandBufferInheritanceInfo) = 56)
+  Vkt(OffsetOf(VkCommandBufferInheritanceInfo\framebuffer) = 32)
+  Vkt(OffsetOf(VkCommandBufferInheritanceInfo\pipelineStatistics) = 48)
+  Vkt(SizeOf(VkCommandBufferBeginInfo) = 32)
+  Vkt(OffsetOf(VkCommandBufferBeginInfo\pInheritanceInfo) = 24)
+  Vkt(SizeOf(VkSubmitInfo) = 72)
+  Vkt(OffsetOf(VkSubmitInfo\pWaitSemaphores) = 24)
+  Vkt(OffsetOf(VkSubmitInfo\pCommandBuffers) = 48)
+  Vkt(OffsetOf(VkSubmitInfo\pSignalSemaphores) = 64)
+
+  Vkt(AnvilVkBackendAvailable() = 0)
+  inst = 123
+  Vkt(AnvilVkInstanceCreate(@inst) = #VK_ERROR_INCOMPATIBLE_DRIVER)
+  Vkt(inst = #VK_NULL_HANDLE)
+  Vkt(AnvilVkTestBackendEnable() = #ANVIL_VK_OK)
+  Vkt(AnvilVkInstanceCreate(@inst) = #VK_SUCCESS)
+  Vkt(inst <> #VK_NULL_HANDLE)
+  Vkt(avkTokenKind(inst) = #ANVIL_VK_TYPE_INSTANCE)
+
+  count = 0
+  Vkt(AnvilVkPhysicalEnumerate(inst, @count, 0) = #VK_SUCCESS)
+  Vkt(count = 1)
+  count = 0
+  phys = 99
+  Vkt(AnvilVkPhysicalEnumerate(inst, @count, @phys) = #VK_INCOMPLETE)
+  Vkt(count = 0 And phys = 99)
+  count = 1
+  Vkt(AnvilVkPhysicalEnumerate(inst, @count, @phys) = #VK_SUCCESS)
+  Vkt(count = 1 And phys <> 0)
+
+  Vkt(AnvilVkDeviceCreate(phys, @dev) = #VK_SUCCESS)
+  Vkt(AnvilVkDeviceQueue(dev, @queue) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandPoolCreate(dev, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @pool) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferAllocate(dev, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INITIAL)
+  Vkt(AnvilVkCommandBufferBegin(cmd, $80) = #ANVIL_VK_ERR_ARGS)
+  Vkt(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  Vkt(AnvilVkCommandBufferBegin(cmd, 0) = #ANVIL_VK_ERR_STATE)
+  Vkt(AnvilVkCommandBufferEnd(cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+  Vkt(AnvilVkQueueSubmitEmpty(queue, cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+
+  Vkt(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferBegin(cmd, #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferEnd(cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkQueueSubmitEmpty(queue, cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+  Vkt(AnvilVkCommandBufferReset(cmd, $80) = #ANVIL_VK_ERR_ARGS)
+  Vkt(AnvilVkCommandBufferReset(cmd, #VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INITIAL)
+
+  ; A real but unsupported operation is never accepted as empty work.
+  Vkt(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  Vkt(AnvilVkTestRecordUnsupported(cmd) = #ANVIL_VK_OK)
+  Vkt(AnvilVkCommandBufferEnd(cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkQueueSubmitEmpty(queue, cmd) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+
+  ; Secondary buffers record but cannot be submitted directly.
+  Vkt(AnvilVkCommandBufferAllocate(dev, pool, #VK_COMMAND_BUFFER_LEVEL_SECONDARY, @second) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferBegin(second, #VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferEnd(second) = #VK_SUCCESS)
+  Vkt(AnvilVkQueueSubmitEmpty(queue, second) = #ANVIL_VK_ERR_STATE)
+
+  ; Free/reallocate proves generation-tagged stale handles do not revive.
+  Vkt(AnvilVkCommandBufferFree(dev, pool, cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkCommandBufferAllocate(dev, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmdNew) = #VK_SUCCESS)
+  Vkt(cmdNew <> cmd)
+  Vkt(AnvilVkCommandBufferBegin(cmd, 0) = #ANVIL_VK_ERR_HANDLE)
+
+  ; Ownership is device-scoped even inside the synthetic backend.
+  Vkt(AnvilVkDeviceCreate(phys, @dev2) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandPoolCreate(dev2, 0, @pool2) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferAllocate(dev, pool2, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @inst2) = #ANVIL_VK_ERR_OWNER)
+
+  ; Pool reset returns all its buffers to initial; destroy invalidates them.
+  Vkt(AnvilVkCommandPoolReset(dev, pool, $80) = #ANVIL_VK_ERR_ARGS)
+  Vkt(AnvilVkCommandPoolReset(dev, pool, 0) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(second) = #ANVIL_VK_CB_INITIAL)
+  Vkt(AnvilVkCommandPoolDestroy(dev, pool) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(second) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkCommandBufferState(cmdNew) = #ANVIL_VK_ERR_HANDLE)
+
+  ; Parent destruction cascades through device, queue, pool and command buffer.
+  Vkt(AnvilVkCommandBufferAllocate(dev2, pool2, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmdNew) = #VK_SUCCESS)
+  Vkt(AnvilVkInstanceDestroy(inst) = #VK_SUCCESS)
+  Vkt(AnvilVkDeviceQueue(dev2, @queue) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkCommandBufferState(cmdNew) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkInstanceDestroy(inst) = #ANVIL_VK_ERR_HANDLE)
+
+  PokeN(#VKT_OUT + 0, $564B5445) ; "VKTE"
+  PokeN(#VKT_OUT + 8, vktChecks)
+  PokeN(#VKT_OUT + 16, vktFails)
+  PokeI(#VKT_OUT + 24, inst)
+  PokeI(#VKT_OUT + 32, phys)
+  PokeI(#VKT_OUT + 40, dev)
+  PokeI(#VKT_OUT + 48, queue)
+  ProcedureReturn vktFails
+EndProcedure

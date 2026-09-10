@@ -1,0 +1,105 @@
+; ======================================================================
+;  hw_board_q.pi4 - the Arduino UNO Q backend for the HwBoard* seam.
+;
+;  Three facts the payload ABI (Anvil/Hal/abi.pbi) needs and no command
+;  family does: what this board is called, how to reset it, and what state
+;  its MMU and caches are in. They have no #CAP_ flag for the same reason
+;  HwAddr* has none - every board has an identity, a way to reset and a
+;  cache state, so there is nothing that could be absent.
+;
+;  INCLUDE ORDER: after ArduinoQ/Board/qefi_q.unoq (QEfiReset) and
+;  qcon_q.pi4 (UartDrain), and before Anvil/Hal/abi.pbi, which calls all
+;  three. House rule 10: this file includes nothing itself.
+; ======================================================================
+
+Procedure.i HwBoardName()
+  ProcedureReturn "Arduino UNO Q (Qualcomm QCM2290)"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwReboot() - reset the board. Does not return.
+;
+;  THROUGH UEFI'S RUNTIME SERVICES AND NOT THROUGH A REGISTER. Anvil is a
+;  UEFI application here, boot services are still up, and the firmware
+;  owns the PMIC. Poking a reset register underneath a firmware that
+;  believes it still owns the machine is exactly the class of thing this
+;  board's address-safety seam exists to refuse.
+; ----------------------------------------------------------------------
+Procedure HwReboot()
+  UartDrain()
+  QEfiReset()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmuState() - bit 0 MMU on, bit 1 D-cache on, bit 2 I-cache on.
+;
+;  ALL THREE ARE 1 HERE AND THE ANSWER IS NOT A GUESS: UEFI runs this
+;  application at EL1 with the MMU and both caches already enabled - that
+;  is what makes boot services usable at all - and nothing in this image
+;  changes any of them.
+;
+;  IT IS A CONSTANT RATHER THAN A READ OF SCTLR_EL1, and that is the one
+;  thing worth saying out loud. The Pi 4 backend reads its register
+;  because Anvil there is the thing that turns caches on and off, so the
+;  register is the only honest source. Here Anvil never touches them, so
+;  a read would return the same three bits every time and would look like
+;  a measurement while being a restatement. If this image ever gains a
+;  path that disables a cache, this becomes a read of SCTLR_EL1 - and the
+;  comment is here so that whoever writes that path knows to.
+; ----------------------------------------------------------------------
+Procedure.i HwMmuState()
+  ProcedureReturn 7
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMicros() - monotonic microseconds since Anvil started.
+;
+;  COMPUTED FROM THE ARCHITECTURAL COUNTER AND ITS MEASURED FREQUENCY,
+;  never from a baked constant. CNTFRQ on this board is 19.2 MHz against
+;  the Pi 4's 54 MHz - a board that baked the Pi 4's number would be wrong
+;  here by a factor of 2.8, and every duration the payload measured would
+;  be wrong by that factor while looking perfectly plausible.
+;
+;  THE DIVIDE IS DONE ON THE TICKS AND NOT ON THE PRODUCT. ticks * 1000000
+;  overflows a signed 64-bit value after about fifteen minutes at 19.2 MHz,
+;  which is exactly long enough for a bench session to look fine and a
+;  truck to not. Dividing first costs sub-microsecond resolution, which no
+;  caller of this seam has ever needed, and keeps the answer monotonic for
+;  the life of the board.
+; ----------------------------------------------------------------------
+;  THE COUNTER IS READ ONCE INTO A LOCAL, and that is not tidiness: two
+;  reads of a free-running counter in one expression are two different
+;  numbers, and the whole-seconds term and the remainder term would then
+;  disagree - producing an answer that occasionally goes BACKWARDS by up
+;  to a second. A monotonic clock that is monotonic almost always is not
+;  a monotonic clock, and the ABI promises this one never goes backwards.
+Procedure.i HwMicros()
+  Define hz.i
+  Define t.i
+  Define whole.i
+  hz = TickHz()
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  t = Ticks()
+  whole = t / hz
+  ProcedureReturn whole * 1000000 + ((t - whole * hz) * 1000000) / hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPet() - pet the deadman.
+;
+;  A NO-OP HERE, AND IT IS AN HONEST ONE RATHER THAN A MISSING FEATURE.
+;  There is no deadman on this board: Anvil is a UEFI application, the
+;  firmware owns the PMIC and the watchdog, and `deadman` is not a command
+;  the Q offers. A payload that pets in its own loop therefore costs one
+;  call and nothing happens, which is the correct behaviour - the
+;  alternative is a payload that has to know which board it is on in order
+;  to know whether to pet, and that is the fork the whole capability model
+;  exists to prevent.
+;
+;  IT IS NOT GATED BY A #CAP_ FLAG for the same reason HwReboot is not:
+;  the payload does not branch on this, it just calls it.
+; ----------------------------------------------------------------------
+Procedure HwPet()
+EndProcedure

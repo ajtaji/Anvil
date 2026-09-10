@@ -1,0 +1,262 @@
+; ======================================================================
+;  hw_con.pi4 - the Pi 4 backend for the HwCon* seam.
+;
+;  THE PAYLOAD OWNS THE PIXELS AND ANVIL OWNS THE DEVICE. This file is the
+;  one place that knows this board draws into a mailbox-allocated linear
+;  framebuffer at 32 bits per pixel; Anvil/Hal/abi.pbi above it knows only
+;  rectangles, text runs and a tier code.
+;
+;  It is thin over RaspberryPi4/Lib/display.pi4 (the surface: base, pitch,
+;  geometry) and RaspberryPi4/Board/display.pi4 (the smooth-text
+;  rasteriser and its three fonts). It re-drives nothing - the same
+;  discipline hw_usb.pi4 states for the xHCI stack.
+;
+;  INCLUDE ORDER: after RaspberryPi4/Lib/display.pi4,
+;  RaspberryPi4/Monitor/anvil_fonts.pi4 and RaspberryPi4/Board/display.pi4
+;  (DrawSmoothText, SmoothTextWidth), and before Anvil/Hal/abi.pbi, which
+;  calls this. House rule 10: this file includes nothing itself.
+;
+; ----------------------------------------------------------------------
+;  WHY THE PIXELS ARE WRITTEN BY A PLAIN LOOP AND NOT BY THE DMA ENGINE
+; ----------------------------------------------------------------------
+;  The monitor's own console scrolls with DMA channel 0 and RunAt takes
+;  that channel back on every return, because "a payload must not leave a
+;  bus master running underneath the monitor" (cache.pi4). A payload
+;  filling rectangles through the same channel would be the mirror of that
+;  problem - two owners, one engine, no agreement - and the monitor is not
+;  running to arbitrate while the payload has the machine.
+;
+;  A processor loop needs no arbitration, cannot be left running, and is
+;  fast enough for a UI that redraws rectangles rather than whole screens.
+;  HwConTier() reports #HW_TIER_CPU honestly rather than claiming a tier
+;  this path does not use, so a payload that measures its frame cost knows
+;  what it measured.
+;
+; ----------------------------------------------------------------------
+;  THE ONE HONEST LIMITATION, SAID OUT LOUD RATHER THAN DISCOVERED
+; ----------------------------------------------------------------------
+;  THIS BOARD HAS THREE FONTS AND ONE SIZE. anvil_fonts.pi4 carries sans,
+;  serif and condensed, each rasterised at a single line height (57, 58
+;  and 57 pixels). The ABI's SvcText takes a pixel height because a UI
+;  wants one; this backend cannot honour it, so HwConTextHeight() reports
+;  the height the board actually draws at and a payload that lays out
+;  against the number it asked for rather than the number it got will draw
+;  outside its own boxes.
+;
+;  Scaled or multi-size text is real work (a second rasteriser, or a
+;  distance field) and it is not Phase A. Reporting the truth costs one
+;  procedure; pretending would cost somebody an afternoon in front of a
+;  screen wondering why the rows overlap.
+; ======================================================================
+
+; The tier vocabulary. In Anvil/Hal/hal.pbi's portable set, restated here
+; only in the comment: #HW_TIER_V3D / _DMA / _CPU.
+
+; ----------------------------------------------------------------------
+;  Geometry. Straight from the surface the mailbox allocated.
+; ----------------------------------------------------------------------
+Procedure.i HwConWidth()
+  ProcedureReturn DisplayWidth()
+EndProcedure
+
+Procedure.i HwConHeight()
+  ProcedureReturn DisplayHeight()
+EndProcedure
+
+Procedure.i HwConTier()
+  ProcedureReturn #HW_TIER_CPU
+EndProcedure
+
+; The single line height this board's fonts are rasterised at. See the
+; limitation note above.
+Procedure.i HwConTextHeight()
+  ProcedureReturn #FONT_sans_LINEH
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConFrameBegin / HwConFrameEnd
+;
+;  THERE IS NO BACK BUFFER ON THIS PATH AND THE SEAM SAYS SO. The
+;  monitor's V3D console can double-buffer; this direct path draws
+;  straight into the visible surface, so Begin only checks that a surface
+;  exists and End is where the cost is measured.
+;
+;  Begin returns 1 when there is a surface to draw on, 0 when there is
+;  not - which on this board means the mailbox never gave the monitor a
+;  framebuffer, and a payload that drew anyway would be writing to
+;  address 0.
+; ----------------------------------------------------------------------
+Procedure.i HwConFrameBegin()
+  If DisplayReady() = 0
+    ProcedureReturn 0
+  EndIf
+  If DisplayBase() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwConFrameEnd()
+  ; NOTHING TO FLIP on the direct path, but the barrier is not optional:
+  ; the payload may be running with the D-cache on (SvcMmuState answers
+  ; that question) and the display controller is reading DRAM, not the
+  ; cache. DisplayCacheLine cleans the surface's lines the same way the
+  ; monitor's own console does after a CPU-drawn frame.
+  If DisplayReady() = 0
+    ProcedureReturn 0
+  EndIf
+  DisplayCacheLine()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConRect(x, y, w, h, argb) - a filled, alpha-blended rectangle.
+;
+;  THE ONE PRIMITIVE THE WHOLE UI IS BUILT FROM. The V3D study measured
+;  that GlIdeShell makes zero direct draw calls and reduces to a blended
+;  rect, a tinted textured quad and a clip; the ELD's screens are the
+;  same shape.
+;
+;  THE CALLER HAS ALREADY CLIPPED. Anvil/Hal/abi.pbi's SvcRect intersects
+;  against the scissor and against the screen before calling here, because
+;  rectangle arithmetic is not silicon knowledge and belongs where it can
+;  be tested without a board. This procedure still refuses a range it
+;  cannot draw - a second check on the one path that would otherwise write
+;  outside the surface, which is the class of bug that corrupts something
+;  else entirely and is diagnosed hours later.
+;
+;  ALPHA IS THE TOP BYTE. 255 is opaque and takes the fast path with no
+;  read at all; 0 draws nothing; anything between reads the destination
+;  and blends per channel. Blending in integers, 0..255, with the
+;  round-to-nearest term - (a*s + (255-a)*d + 127) / 255 - because
+;  dropping it darkens every translucent overlay by up to one level per
+;  composite, and a UI composites the same panel every frame.
+; ----------------------------------------------------------------------
+Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
+  Define base.i
+  Define pitch.i
+  Define sw.i
+  Define sh.i
+  Define a.i
+  Define sr.i
+  Define sg.i
+  Define sb.i
+  Define row.i
+  Define col.i
+  Define p.i
+  Define d.i
+  Define dr.i
+  Define dg.i
+  Define db.i
+
+  If DisplayReady() = 0
+    ProcedureReturn
+  EndIf
+  base = DisplayBase()
+  If base = 0
+    ProcedureReturn
+  EndIf
+  If w <= 0 Or h <= 0
+    ProcedureReturn
+  EndIf
+
+  sw = DisplayWidth()
+  sh = DisplayHeight()
+  If x < 0
+    w = w + x
+    x = 0
+  EndIf
+  If y < 0
+    h = h + y
+    y = 0
+  EndIf
+  If x + w > sw
+    w = sw - x
+  EndIf
+  If y + h > sh
+    h = sh - y
+  EndIf
+  If w <= 0 Or h <= 0
+    ProcedureReturn
+  EndIf
+
+  a = (argb >> 24) & $FF
+  If a = 0
+    ProcedureReturn
+  EndIf
+  sr = (argb >> 16) & $FF
+  sg = (argb >> 8) & $FF
+  sb = argb & $FF
+
+  pitch = DisplayPitch()
+  row = 0
+  While row < h
+    p = base + (y + row) * pitch + x * 4
+    col = 0
+    While col < w
+      If a = 255
+        PokeL(p, argb & $00FFFFFF)
+      Else
+        d = PeekL(p)
+        dr = (d >> 16) & $FF
+        dg = (d >> 8) & $FF
+        db = d & $FF
+        dr = (a * sr + (255 - a) * dr + 127) / 255
+        dg = (a * sg + (255 - a) * dg + 127) / 255
+        db = (a * sb + (255 - a) * db + 127) / 255
+        PokeL(p, (dr << 16) | (dg << 8) | db)
+      EndIf
+      p = p + 4
+      col = col + 1
+    Wend
+    row = row + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConText(x, y, *utf8, argb, bg) - one run of text, baseline at y.
+;
+;  y IS THE BASELINE AND NOT THE TOP, because that is what the rasteriser
+;  underneath takes and because a UI that aligns two runs of different
+;  glyphs aligns their baselines. HwConTextHeight() and the font's ascent
+;  are what a caller converts a top-left box into a baseline with.
+;
+;  THE BACKGROUND IS A PARAMETER AND NOT AN ALPHA. DrawSmoothText blends
+;  each glyph's coverage between fg and bg without reading the surface,
+;  which is what makes it fast and what makes it wrong over a picture. For
+;  the ELD's screens - flat panels of colour - passing the panel's own
+;  colour is exactly right, and it is the caller who knows what that is.
+;
+;  Returns the width drawn.
+; ----------------------------------------------------------------------
+Procedure.i HwConText(x.i, y.i, *utf8, argb.i, bg.i)
+  If DisplayReady() = 0
+    ProcedureReturn 0
+  EndIf
+  If *utf8 = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DrawSmoothText(x, y, *utf8, 0, argb & $00FFFFFF, bg & $00FFFFFF)
+EndProcedure
+
+Procedure.i HwConTextWidth(*utf8)
+  If *utf8 = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn SmoothTextWidth(*utf8, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConBacklight(pct)
+;
+;  -1, AND THAT IS THE HONEST ANSWER RATHER THAN A NO-OP THAT RETURNS 0.
+;  An HDMI monitor's brightness is the monitor's own, reachable only over
+;  DDC/CI and not at all through this board's framebuffer path. A payload
+;  that dimmed the screen for a night-driving mode and got a silent
+;  success would show the driver a screen that never dims and no reason.
+;  The DSI panel has a real backlight over the mailbox, and when that
+;  backend exists it answers here.
+; ----------------------------------------------------------------------
+Procedure.i HwConBacklight(pct.i)
+  ProcedureReturn -1
+EndProcedure

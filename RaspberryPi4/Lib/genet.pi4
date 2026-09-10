@@ -1,0 +1,4071 @@
+; ======================================================================
+; BCM2711 GENET v5 ETHERNET - MDIO, the BCM54213PE PHY, the UniMAC, the
+; two DMA rings, and one frame out and one frame in. Library, not a
+; builtin.
+; ----------------------------------------------------------------------
+; USE:
+;     XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+;
+;     If GenetProbe() <> 1                 ; is this really a GENETv5?
+;       ; GenetError() says why. Stop.
+;     EndIf
+;     GenetSetMac(@mymac[0])               ; SIX BYTES. Not optional.
+;     GenetSetRxRegion(base, bytes)        ; 512 KiB, 64-byte aligned
+;     If GenetStart() <> 1
+;       ; GenetError() / GenetErrorText()
+;     EndIf
+;     GenetSend(@frame[0], 64)
+;     n = GenetRecv(@into[0], 1536)             ; 0 = nothing waiting NOW
+;     n = GenetRecvWait(@into[0], 1536, 3000)   ; ...or wait 3 seconds
+;
+; USE GenetRecvWait() UNLESS YOU HAVE YOUR OWN CLOCK IN THE LOOP.
+; GenetRecv() answers "is there a frame in the ring at this instant",
+; and calling it a fixed number of times in a bare loop asks that
+; question for a few microseconds and then concludes the network is
+; dead. That exact mistake produced a false "receive is broken" report
+; on the first silicon run; the whole story is in GenetRecvWait's
+; header and it is short.
+;
+; DEPENDENCIES - none in code. A library includes no library here
+; (project ruling, 2026-07-30), so this file names no other .pi4. The
+; two system-register readers and the one cache-line operation it needs
+; are duplicated locally rather than pulled from timer.pi4 or
+; mailbox.pi4, on purpose, for exactly that reason.
+;
+; What it EXPECTS of the caller:
+;   * a console, if you want to see anything. NOTHING HERE PRINTS.
+;     Every procedure returns a value.
+;   * a MAC address. This file cannot obtain one - see THE MAC ADDRESS.
+;   * half a megabyte of RX buffer space that nothing else touches.
+;
+; ======================================================================
+;  READ THIS FIRST - WHAT THIS FILE DOES NOT DO, AND SAYS SO OUT LOUD
+; ======================================================================
+; THIS FILE HAS RUN ON SILICON AND CARRIES REAL TRAFFIC. First on
+; 2026-08-26, twice - once with no cable and once into a live switch -
+; then a third confirming run with a 3-second listen that RECEIVED a
+; spanning-tree BPDU off the network, and then under
+; RaspberryPi4/Lib/net.pi4, where a laptop answered four of four pings
+; over this driver. See WHAT THE BOARD SAID at the bottom, which
+; replaces the "nothing here has ever run" warning this paragraph used
+; to carry. The short version: identity, MDIO, the PHY,
+; auto-negotiation, the UniMAC reset, both rings, DMA enable and
+; TRANSMIT all worked on the first attempt. Receive appeared not to,
+; and that appearance was an artefact of the diagnostic rather than a
+; fault in this file - the detail is under WHAT THE BOARD SAID and in
+; the header of GenetRecvWait(), because it is the kind of mistake that
+; will be made again.
+;
+; Four things are REFUSED rather than guessed, each with its own return
+; code so a caller finds out by testing a value instead of by wondering
+; why the wire is quiet:
+;
+;   1. A HALF-DUPLEX LINK.  #GENET_ERR_HALF_DUPLEX
+;      The cited U-Boot driver's bcmgenet_adjust_link() writes ONLY the
+;      speed field into UMAC_CMD (v2025.01_bcmgenet.c:468). It never
+;      looks at duplex. Linux does: bcmgenet_mac_config() sets
+;      CMD_HD_EN together with both PAUSE_IGNORE bits when the link is
+;      not full duplex (v6.12_bcmmii.c:44-47).
+;      So the sequence this file is built from is INCOMPLETE for a
+;      half-duplex link, and following it anyway would leave a MAC
+;      configured full-duplex on a half-duplex wire. That does not
+;      fail loudly on the wire - it produces collisions and quietly
+;      terrible throughput, which is the worst shape of bug this
+;      project has.
+;      The Linux fix is one OR of three bits and it is written down in
+;      the comments at GenetAdjustLink(). It is not enabled because
+;      ONE source is not two, and because nothing here can test it.
+;      A gigabit link to any switch made this century negotiates full
+;      duplex, so this refusal is expected never to fire in practice -
+;      which is precisely why it must be loud when it does.
+;
+;   2. 2500 Mbit/s.  #GENET_ERR_SPEED
+;      UMAC_SPEED_2500 exists in the register (v2025.01_bcmgenet.c:83)
+;      and the MAC will accept it. The Pi 4 cannot reach it: the PHY is
+;      a BCM54213PE, a 10/100/1000 part, and the MAC-to-PHY link is
+;      RGMII, which tops out at 1000. Setting the field would be a
+;      silently wrong clock select. Refused.
+;
+;   3. A FORCED SPEED.  #GENET_ERR_UNCITED
+;      There is no GenetForceSpeed(). Auto-negotiation is the only path
+;      here. Forcing means writing BMCR speed/duplex bits AND getting
+;      the RGMII out-of-band block to agree without a negotiated link,
+;      and the second half of that is not written down in either driver
+;      on this disk for the disabled-OOB case this file uses.
+;
+;   4. A MAC ADDRESS THIS FILE INVENTED.  #GENET_ERR_NO_MAC
+;      See THE MAC ADDRESS below. GenetStart() refuses until one is
+;      supplied.
+;
+; And two structural absences, stated so they are not mistaken for
+; oversights:
+;
+;   * NO INTERRUPTS. The dtsi gives GENET two SPIs, 157 and 158
+;     (bcm2711.dtsi:592-593). Nothing here enables or handles them.
+;     Everything polls, every poll is bounded by a deadline, and
+;     GenetRecv() returns 0 for "nothing waiting" rather than blocking.
+;   * NO MULTICAST FILTER. The MAC filters on the one unicast address
+;     in UMAC_MAC0/MAC1 and on broadcast. The MDF hash-filter block is
+;     not programmed and there is no API for it, so a caller that
+;     wants multicast will not receive it and will not be told a lie
+;     about why.
+;   * NO 802.3x FLOW CONTROL, IN EITHER DIRECTION, AND IT IS SWITCHED
+;     OFF RATHER THAN LEFT OUT. This driver advertises no pause
+;     capability and sets both CMD_RX_PAUSE_IGNORE and
+;     CMD_TX_PAUSE_IGNORE on every link, so the MAC can neither emit a
+;     PAUSE frame nor be stopped by one. That is a DECISION with a
+;     price - a frame arriving at a full ring is dropped - and it was
+;     taken on 2026-09-09 after the alternative broke a bench laptop's
+;     Ethernet card. THE WHOLE ARGUMENT IS AT THE PAUSE PROMISE, above
+;     #GENET_PAUSE_RX. Until that day this absence was accidental:
+;     nothing wrote the two bits, both read zero, and zero is ON.
+;
+; ======================================================================
+;  THE SOURCES - every constant in this file is cited to one of these
+; ======================================================================
+; All under RaspberryPi4/Reference/
+;
+;   [U]  pi4/uboot/v2025.01_bcmgenet.c
+;        U-Boot v2025.01, drivers/net/bcmgenet.c. THE PRIMARY SOURCE.
+;        It is a complete, small, working GENETv5 driver written for
+;        this exact board, and it is inside the loader this Pi 4
+;        actually boots. Everything structural here follows it.
+;
+;   [L]  pi4/uboot/v6.12_bcmgenet.h  and  pi4/uboot/v6.12_unimac.h
+;        Linux v6.12, drivers/net/ethernet/broadcom/genet/bcmgenet.h
+;        and drivers/net/ethernet/broadcom/unimac.h. THE SECOND
+;        WITNESS. U-Boot's header comment says its own definitions are
+;        "derived from Linux source" (v2025.01_bcmgenet.c:39), so these
+;        are not fully independent - but they are the upstream, they
+;        are maintained by the vendor, and where they agree on a number
+;        that number has survived two sets of eyes and two drivers.
+;        EVERY BLOCK OFFSET AND EVERY REGISTER OFFSET BELOW WAS CHECKED
+;        AGAINST BOTH AND THEY AGREE ON ALL OF THEM.
+;
+;   [M]  pi4/uboot/v6.12_bcmmii.c
+;        Linux, the MII/link half. Used for the duplex refusal above and
+;        for the whole of THE PAUSE PROMISE - bcmgenet_mac_config() at
+;        :28-95 is the vendor's own decision about the two PAUSE_IGNORE
+;        bits, and bcmgenet_phy_pause_set() at :136-145 is the
+;        advertisement that goes with them.
+;
+;   [LD] pi4/uboot/v6.12_bcmgenet.c
+;        Linux v6.12, drivers/net/ethernet/broadcom/genet/bcmgenet.c -
+;        THE DRIVER, where [L] above is only its header. Added
+;        2026-09-09 for the pause audit and the MIB counters, both of
+;        which live in the .c and not the .h: the ethtool pause
+;        semantics at :920-940, the driver's own pause defaults at
+;        :4021-4023, the MIB walk and its $C group gap at :1022-1025
+;        and :1199-1240, and the NAPI receive budget at :2279 and :2391
+;        that is the whole reason Linux may make a flow-control promise
+;        this file may not.
+;
+;   [P]  pi4/uboot/v2025.01_phy.c
+;        U-Boot's generic clause-22 PHY code. genphy_update_link() at
+;        :226 and genphy_parse_link() at :295 are what the link and
+;        speed logic here reproduces.
+;
+;   [I]  pi4/uboot/v6.12_mii.h
+;        Linux include/uapi/linux/mii.h - the IEEE 802.3 clause 22
+;        register numbers and bits. Architectural, not Broadcom's.
+;
+;   [D]  pi4/bcm2711.dtsi  and  pi4/bcm2711-rpi-4-b.dts
+;        The node, its address, its size, and the PHY's MDIO address.
+;
+; And two that are IN THE REPO, under RaspberryPi4/Reference/, fetched
+; 2026-08-26 for the LED work because nothing on this machine described
+; the PHY's shadow registers:
+;
+;   [B]  RaspberryPi4/Reference/v6.12_brcmphy.h
+;        Linux v6.12, include/linux/brcmphy.h. THE REGISTER MAP for the
+;        Broadcom PHY's shadow and expansion windows and for the LED
+;        source encodings. Nothing else on the disk carries them.
+;
+;   [C]  RaspberryPi4/Reference/v6.12_bcm_phy_lib.c  and
+;        RaspberryPi4/Reference/v6.12_phy_broadcom.c
+;        Linux v6.12, drivers/net/phy/bcm-phy-lib.c and
+;        drivers/net/phy/broadcom.c. THE ACCESS PROTOCOL for those two
+;        windows, and what Linux actually programs into them. Cited as
+;        [C1] for broadcom.c and [C2] for bcm-phy-lib.c.
+;
+; A NOTE ON WHAT "CITED" MEANS HERE. Every #constant below carries the
+; file and line it came from. Where the driver writes the value as an
+; expression over other macros - and it does that for nearly every
+; offset - THE ARITHMETIC IS SHOWN, because a constant initialiser in
+; this language takes a bare literal and cannot do the sum itself. The
+; sum being visible in the comment is the only thing standing between a
+; typo and a store to the wrong register, so it is written out in full
+; every time rather than summarised.
+;
+; ======================================================================
+;  WHERE THE BLOCK IS - $FD580000, and the arithmetic that gets there
+; ======================================================================
+; bcm2711.dtsi:587-589
+;     genet: ethernet@7d580000 {
+;         compatible = "brcm,bcm2711-genet-v5";
+;         reg = <0x0 0x7d580000 0x10000>;
+;
+; $7D580000 is a legacy VideoCore bus address, not an ARM one. The soc
+; node's ranges translate it - bcm2711.dtsi:41-43:
+;     ranges = <0x7e000000  0x0 0xfe000000  0x01800000>,
+;              <0x7c000000  0x0 0xfc000000  0x02000000>,
+;              <0x40000000  0x0 0xff800000  0x00800000>;
+;
+; $7D580000 falls in the SECOND range:
+;     $7D580000 - $7C000000 = $01580000
+;     $FC000000 + $01580000 = $FD580000
+;
+; The same arithmetic through the FIRST range puts the PL011 at
+; $FE201000, and that one is proven on this silicon - the monitor talks
+; through it every day. So the translation rule has a working witness
+; on the same chip and is not being taken on trust.
+;
+; The block is $10000 bytes long and genet_Poke()/genet_Peek() enforce
+; that bound on every access. The highest offset this file touches is
+; $504C, so there is a great deal of headroom; the bound is there to
+; catch an arithmetic slip, not because anything is near the edge.
+;
+; NOTHING HAS TO BE POWERED OR CLOCKED FIRST, and that was checked
+; rather than assumed. The genet node in bcm2711.dtsi:587-603 has no
+; `clocks`, no `power-domains` and no `resets` property, and the U-Boot
+; driver - which includes <clk.h> - never calls clk_enable(). Compare
+; the v3d node eight lines below it, which DOES carry
+; power-domains = <&pm BCM2835_POWER_DOMAIN_GRAFX_V3D> and
+; resets = <&pm BCM2835_RESET_V3D> (bcm2711.dtsi:611-612). The
+; difference is in the device tree, not in an assumption.
+;
+; The node is `status = "disabled"` in bcm2711.dtsi:594 and switched to
+; `status = "okay"` for this board in bcm2711-rpi-4-b.dts:196-200. That
+; is a device-tree lifecycle detail and means nothing to code that does
+; not read a device tree; it is recorded only so the next reader who
+; greps for "disabled" does not spend an hour on it.
+;
+; ======================================================================
+;  THE PHY - BCM54213PE at MDIO ADDRESS 1
+; ======================================================================
+; bcm2711.dtsi:596-602 puts the MDIO controller INSIDE the genet node:
+;     genet_mdio: mdio@e14 { compatible = "brcm,genet-mdio-v5";
+;                            reg = <0xe14 0x8>; reg-names = "mdio"; }
+;
+; That $E14 is the same MDIO_CMD register the driver reaches as
+; GENET_UMAC_OFF + 0x614 = $800 + $614 = $E14
+; (v2025.01_bcmgenet.c:61 and :67). TWO INDEPENDENT SOURCES LANDING ON
+; THE SAME OFFSET, from opposite directions - one a driver macro, one a
+; device-tree child node - which is as good as provenance gets for a
+; register on this chip.
+;
+; bcm2711-rpi-4-b.dts:202-207 gives the PHY's address on that bus:
+;     &genet_mdio { phy1: ethernet-phy@1 { reg = <0x1>; }; };
+; so #GENET_PHY_ADDR = 1. GenetPhyScan() exists anyway and sweeps all
+; 32 addresses, because a device tree is a claim about a board and the
+; MDIO bus is the board itself. If they disagree, the bus wins and the
+; scan is how you find that out.
+;
+; bcm2711-rpi-4-b.dts:198 gives phy-mode = "rgmii-rxid" - RGMII with
+; the RX internal delay supplied BY THE PHY. That matters exactly once,
+; in GenetAdjustLink(): U-Boot's adjust_link sets ID_MODE_DIS for both
+; PHY_INTERFACE_MODE_RGMII and PHY_INTERFACE_MODE_RGMII_RXID
+; (v2025.01_bcmgenet.c:464-466), i.e. it tells the MAC's RGMII block to
+; add NO delay of its own, because the PHY is doing it. Getting this
+; backwards gives a link that trains and then drops packets, which is
+; the single most-reported RGMII failure there is.
+;
+; THE PART NUMBER IS NOT CITABLE FROM ANYTHING ON THIS DISK. "BCM54213PE"
+; appears in no file under Datasheets\. The device tree says only
+; "ethernet-phy@1" with no compatible string, which is itself
+; meaningful - it means Linux drives it with the GENERIC clause-22 PHY
+; driver and needs no part-specific quirk. So this file drives it
+; generically too, and GenetPhyId() returns the raw
+; (PHYSID1 << 16) | PHYSID2 for a caller to print rather than a name
+; this file would have had to make up. An OUI of $001018 with a model
+; in the $006x range is a Broadcom gigabit part; that is a hint for a
+; human reading the number, not a check this code performs.
+;
+; ======================================================================
+;  THE MAC ADDRESS - WHY THIS FILE WILL NOT MAKE ONE UP
+; ======================================================================
+; U-Boot gets the board's address from the VideoCore firmware and
+; writes it in bcmgenet_gmac_write_hwaddr() (v2025.01_bcmgenet.c:236).
+; This file cannot: the mailbox lives in RaspberryPi4/Lib/mailbox.pi4
+; and a library includes no library here.
+;
+; The three tempting alternatives were all rejected:
+;   - a locally-administered address invented at build time. Two Pi 4s
+;     running the same image would then answer to the same address on
+;     the same switch, and the failure mode of that is intermittent and
+;     blamed on everything except the cause.
+;   - all-zeros. The MAC filter would then accept nothing, and the
+;     symptom is "receive does not work" with no reason attached.
+;   - reading the OTP or the firmware ourselves. That is the mailbox
+;     again, wearing a hat.
+;
+; So GenetSetMac() is MANDATORY and GenetStart() refuses with
+; #GENET_ERR_NO_MAC until it has been called. A main program that has
+; already included mailbox.pi4 can fetch the real address with tag
+; $00010003 GET_BOARD_MAC_ADDRESS and hand it over in one line; that is
+; the caller's business and it keeps the dependency where it belongs.
+;
+; ======================================================================
+;  DMA - THE DESCRIPTORS ARE REGISTERS, THE BUFFERS ARE NOT
+; ======================================================================
+; This is the one genuinely surprising thing about GENET and it is
+; worth stating plainly, because every other DMA engine in this project
+; works the other way round.
+;
+; THE 256 RX AND 256 TX DESCRIPTORS LIVE IN MMIO, INSIDE THE CONTROLLER
+; (v2025.01_bcmgenet.c:11-14: "There are 256 DMA descriptors (both for
+; TX and RX), and they live in MMIO registers"). RX descriptors start
+; at block offset $2000 and TX at $4000, twelve bytes each. So there is
+; no descriptor ring to allocate, no descriptor coherency problem, and
+; no physical-address translation for the ring itself. Writing a
+; descriptor is three PokeL's to the controller.
+;
+; THE PACKET BUFFERS ARE ORDINARY MEMORY and they have every coherency
+; problem the descriptors do not. See THE CACHE, below.
+;
+; All 256 descriptors go to the DEFAULT QUEUE, #16 - the hardware can
+; slice them into sixteen priority queues and we do not
+; (v2025.01_bcmgenet.c:13-14). DEFAULT_Q = $10 is what makes
+; TDMA_RING_REG_BASE and RDMA_RING_REG_BASE land where they do; the sum
+; is written out at each constant.
+;
+; ONE ODDITY IS REPRODUCED DELIBERATELY. tx_ring_init() programs the TX
+; ring's DMA_RING_BUF_SIZE as (TX_DESCS << 16) | RX_BUF_LENGTH - the
+; **RX** buffer length, in the TX ring (v2025.01_bcmgenet.c:435-436).
+; That reads like a copy-paste, and it may well be one. It is copied
+; here unchanged, with this note, because a driver that is known to
+; work on this board is worth more than a tidier one that has never
+; run. If TX ever misbehaves on silicon, THIS IS THE FIRST THING TO
+; TRY CHANGING, and that sentence is the entire reason the oddity is
+; called out instead of quietly fixed.
+;
+; CHECKED AGAIN 2026-08-26, in the direction it is easy to get backwards.
+; The oddity is RX_BUF_LENGTH appearing in the **TX** ring, not the
+; other way round. rx_ring_init() writes (RX_DESCS << 16) |
+; RX_BUF_LENGTH ([U:413-414]) - correct and unremarkable - and
+; tx_ring_init() writes (TX_DESCS << 16) | RX_BUF_LENGTH
+; ([U:435-436]) - the odd one. Because RX_DESCS and TX_DESCS are both
+; TOTAL_DESCS ([U:97-98]), the two expressions evaluate to the SAME
+; NUMBER, $01000800, so #GENET_RING_BUF_SIZE_VALUE serving both rings
+; reproduces the driver EXACTLY and the direction cannot be got wrong
+; here even in principle. This was verified rather than assumed because
+; a "deliberately reproduced oddity" is exactly the sort of note that
+; turns out to describe the opposite of what the code does.
+;
+; ======================================================================
+;  THE CACHE - LOAD-BEARING NOW THAT CACHES ARE ON (M4, 2026-08)
+; ======================================================================
+; THIS SECTION USED TO SAY "THE MMU AND THE CACHES ARE OFF, so a cache-
+; coherency theory cannot explain a symptom AT ALL." THAT IS NO LONGER
+; TRUE, and the old wording is corrected in place rather than deleted,
+; because dismissing the cache now that it is a real party to every
+; frame is exactly the wrong-way version of the mistake that heading was
+; written against.
+;
+; The board now boots with the MMU on and the D-cache ENABLED
+; (cache.pi4 / mmu.pi4, SCTLR_EL2 M|C|I). Coherency with the GENET bus
+; master is kept two ways and BOTH matter:
+;
+;   * THE RX RING is mapped Normal Non-Cacheable (cache.pi4 ->
+;     MmuAddNc($08100000, $08180000), the #ETH_RX_BASE region). The
+;     controller's frame writes land in DRAM and this core reads them
+;     straight from DRAM - no stale line can shadow them. The `dc civac`
+;     on the ring below is then a harmless no-op, but the `dsb` it
+;     carries is the ordering barrier taken after the producer-index
+;     read, and that is NOT optional.
+;
+;   * THE CALLER'S TX FRAME may be ordinary cached Write-Back DRAM. The
+;     `dc civac` in GenetSend (clean before the master reads) followed by
+;     `dsb sy` is what pushes it to DRAM; without it the controller would
+;     fetch a stale line. This maintenance is now LOAD-BEARING, not the
+;     no-op it was with caches off.
+;
+;   * THE DESCRIPTORS live in the controller's MMIO register file
+;     (#GENET_BASE), Device-mapped and never cached, so they need no
+;     maintenance - only the barrier between writing a descriptor and
+;     kicking the producer index, which GenetSend has.
+;
+; PROVEN on the fabricated GENET (a64_genet_check.py) but NOT YET with a
+; real frame on silicon WITH CACHES ON - that needs a cable on the Pi's
+; ethernet port and the port linked to the LAN. Until then this path is
+; coherent-by-construction and inspection-verified, not silicon-verified.
+; See "WHAT WAS ACTUALLY PROVEN" below.
+;
+; The account that follows is still accurate for a caches-on board.
+; ----------------------------------------------------------------------
+; The controller reads TX frames out of DRAM and writes RX frames into
+; DRAM. It does not see this core's data cache. U-Boot therefore
+; flushes before transmit (v2025.01_bcmgenet.c:287) and invalidates
+; before reading a received frame (:348) and again before handing the
+; buffer back (:366).
+;
+; The same three operations are here, built from `dc civac` one
+; 64-byte line at a time, in the shape mailbox.pi4 already uses for the
+; VideoCore. "civac" - clean AND invalidate to the point of coherency -
+; not "cvau", because the other party is a bus master beyond the point
+; of coherency and not this core's instruction fetch; and one operation
+; for both directions because a clean-and-invalidate is correct whether
+; the line was dirty, clean, or absent.
+;
+; A library cannot know whether the MMU is even on. If it is off, or
+; the region is mapped Device or Non-cacheable, `dc civac` on those
+; lines is architecturally harmless and the flush is simply wasted
+; work. That is the same argument mailbox.pi4:271-274 makes and it is
+; the reason the flush is unconditional rather than guarded by a guess.
+;
+; WHAT COULD STILL BE WRONG, and only a board can settle it:
+;   * the line length. 64 bytes is the A72's, and it is what every
+;     other file in this project uses, but nothing here READS CTR_EL0
+;     to confirm it. A smaller line would make the loop skip lines.
+;   * write buffering between the last PokeL to a descriptor and the
+;     controller's read of it. There is a barrier at each hand-off, but
+;     barrier placement is exactly the class of thing that looks right
+;     on paper for years.
+;   * whether the caller's TX buffer is cacheable at all.
+;
+; ======================================================================
+;  64-BIT LANGUAGE MODEL - the traps this file is written around
+; ======================================================================
+;   * .i AND POINTERS ARE EIGHT BYTES. Every register here is 32 bits,
+;     so every register read is PeekN and every register write is
+;     PokeL. A bare Peek would be a 64-bit read of a 32-bit register
+;     and would not announce itself.
+;   * PeekB/PeekC/PeekW SIGN-EXTEND. PeekA/PeekU/PeekN are the unsigned
+;     spellings. Every byte read here is PeekA and every register read
+;     is PeekN.
+;   * PeekN's result is ZERO-EXTENDED on the paths used here, so a
+;     register value is always in 0..$FFFFFFFF and never negative.
+;     THAT IS WHY EVERY ERROR CODE IN THIS FILE IS A SMALL NEGATIVE:
+;     a refusal can never be confused with data, including with the
+;     all-ones a dead MDIO bus returns. Do not "tidy" a register read
+;     into a .l local; that sign-extends it and destroys the property.
+;   * & | ! BIND TIGHTER THAN << >>. Every shift here is parenthesised.
+;   * A CONSTANT INITIALISER TAKES A BARE LITERAL. No #A = #B + 4. Every
+;     offset below is therefore a precomputed literal with its sum in
+;     the comment.
+;   * Procedure locals are statically allocated. Nothing here is
+;     reentrant. Do not call into this file from an interrupt.
+;
+; ======================================================================
+;  WHAT WAS ACTUALLY PROVEN - 2026-08-25
+; ======================================================================
+; BUILT clean by the current pmfc.exe for -t pi4.
+;
+; EXECUTED against a fabricated BCM2711 GENET on
+; tools/a64/a64_interp.py, driven by
+; RaspberryPi4/Examples/Diagnostics/pi4GenetProbe.pi4 and checked by
+; tools/a64/a64_genet_check.py. That gate does NOT read its expected
+; values from this file: it parses them out of
+; Datasheets/pi4/uboot/v2025.01_bcmgenet.c - macro definitions and all,
+; resolving the arithmetic - so this library and the gate read the same
+; vendor source independently and are able to disagree. If a number
+; here is wrong, the gate's model raises "unmodelled MMIO" or an
+; expectation fails; it cannot agree with this file by construction.
+;
+; THAT PROPERTY EARNED ITS KEEP ON THE GATE'S FIRST RUN. The gate's
+; first draft merged unimac.h's macro table into the driver's, and
+; unimac.h defines UMAC_CMD as $008 - the offset within the UMAC block -
+; where the driver defines it as GENET_UMAC_OFF + 0x008 = $808, the
+; offset within the whole register file. Both are right in their own
+; frame; one shadowing the other moved every UMAC register 2 KiB. The
+; model's "unmodelled MMIO write at +$0808" stopped it dead. A gate
+; that had transcribed its numbers from this file would have agreed
+; with itself and said nothing.
+;
+; THE GATE HAS BEEN WATCHED FAILING. `--mutate` rebuilds this library
+; seven times with a deliberate defect and requires a red result each
+; time: the final enable written blind instead of setbits, the two MDIO
+; writes collapsed into one, RBUF_CTRL written blind, the TX descriptor
+; armed before its address is written, RGMII_LINK DROPPED FROM
+; GenetAdjustLink(), EXT_RGMII_OOB_CTRL WRITTEN BLIND so the four
+; unnamed hardware bits at 20-23 are lost, and THE HALF-DUPLEX REFUSAL
+; DELETED. All seven are caught. The refusal one is there because a
+; refusal is exactly the kind of thing a later reader removes as
+; over-cautious.
+;
+; THE RGMII_LINK MUTATION WAS ADDED ON 2026-08-26 AND THE GATE COULD
+; NOT CATCH IT BEFORE THAT DAY. Dropping that one bit leaves the MAC
+; believing the line is down - it still transmits, because a MAC will
+; happily send into a link it thinks is dead, and it never receives -
+; which is precisely the shape the first silicon report had, and was the
+; leading hypothesis for it. The gate's model used to hold UMAC_MODE's
+; MODE_LINK_STATUS at a constant 1, and the probe never read
+; EXT_RGMII_OOB_CTRL back off the bus, so the mutation sailed through.
+; The model now DERIVES that bit from EXT_RGMII_OOB_CTRL the way the
+; silicon does. A model that is kinder than the hardware is a gate that
+; agrees with you, and a gate that agrees with you is worth nothing.
+;
+; AND THE HALF-DUPLEX REFUSAL IS WATCHED FIRING. The gate runs the same
+; image a second time against a PHY that advertises only 1000BASE-T
+; HALF on both sides, and requires that GenetStart() fails, that it
+; says why, that UMAC_CMD is never enabled, and that
+; EXT_RGMII_OOB_CTRL is never written - the refusal has to come before
+; the RGMII block is half-configured for a link that is then rejected.
+;
+; ======================================================================
+;  THE MEASURED RESET STATE - 2026-08-26, READ OFF THE BOARD
+; ======================================================================
+; These are the values the block holds after a board reset and BEFORE
+; any code in this project has written to it. They were read from the
+; Anvil monitor's prompt, which does not link this library at all, so
+; nothing here had run when they were taken. They are therefore the
+; genuine power-on state and not the residue of one of our own runs.
+;
+;     SYS_REV_CTRL    $FD580000 = $06000000
+;     SYS_PORT_CTRL   $FD580004 = $00000000
+;     EXT_RGMII_OOB   $FD58008C = $00F00000
+;     UMAC_CMD        $FD580808 = $00000000
+;     UMAC_MAC0       $FD58080C = $00000000
+;     UMAC_MAC1       $FD580810 = $00000000
+;
+; THIS CORRECTED SOMETHING THIS HEADER PREVIOUSLY GOT WRONG. The
+; explanation of the "MAC-side link 0" reading used to assert that
+; OOB_DISABLE is set at reset. It is not. Decoding $00F00000 against
+; the bit definitions, which are identical in both sources -
+; RGMII_LINK is bit 4 ([U:51], [L:323]), OOB_DISABLE is bit 5
+; ([U:52], [L:324]), RGMII_MODE_EN is bit 6 ([U:53], [L:325]) and
+; ID_MODE_DIS is bit 16 ([U:54], [L:326]) - every one of those four
+; bits is CLEAR at reset. The bits that are set are 20, 21, 22 and 23.
+;
+; The conclusion that "MAC-side link 0 before bring-up is correct"
+; survives the correction, and in fact gets simpler: RGMII_LINK is
+; clear, so the MAC has not been told there is a link, so it says there
+; is none. The reasoning that reached the right answer through a wrong
+; premise has been rewritten rather than left standing, because a right
+; answer resting on a wrong premise is a trap for the next reader.
+;
+; BITS 20 THROUGH 23 ARE NOT NAMED IN ANY SOURCE ON THIS DISK. U-Boot
+; defines four bits in this register ([U:51-54]) and Linux defines five
+; ([L:322-326], adding RGMII_MODE_EN_V123 at bit 0, which is for
+; GENET v1 to v3 and not this part). Nothing accounts for bits 20-23.
+; They are set by the hardware at reset, neither driver clears them,
+; and neither driver knows what they are.
+;
+; THAT IS THE ARGUMENT FOR genet_Modify() OVER A BLIND WRITE, AND IT IS
+; NOW AN ARGUMENT FROM MEASUREMENT RATHER THAN FROM PRINCIPLE. This
+; file has always said that EXT_RGMII_OOB_CTRL "carries bits this file
+; does not own". Here they are, four of them, in the register the
+; RGMII block is configured through. A blind write of
+; RGMII_LINK | RGMII_MODE_EN | ID_MODE_DIS would clear all four and
+; nothing in either driver would tell you what you had just switched
+; off. GenetAdjustLink() uses a read-modify-write, so they survive, and
+; the gate's model now preloads exactly this measured value and fails
+; the build if they do not.
+;
+; SYS_PORT_CTRL READS ZERO AT RESET, WHICH MATTERS. PORT_MODE_EXT_GPHY
+; is 3 ([U:43], confirmed [L:295]) and zero is not it, so the port mode
+; genuinely has to be programmed and is not inherited from the
+; firmware. GenetInterfaceSet() writes it, and GenetStart() calls that
+; first, before the UniMAC reset - matching U-Boot, which writes it in
+; its probe at [U:612] ahead of everything else. This was checked
+; specifically because "we never program it" would have been a second
+; complete explanation for a MAC that does not receive; it is not one,
+; but only because the write is there.
+;
+; ======================================================================
+;  WHAT THE BOARD SAID - 2026-08-26, THE FIRST TWO RUNS ON SILICON
+; ======================================================================
+; Run 1, no cable:
+;   SYS_REV_CTRL $06000000, major 6. MDIO found the PHY at address 1,
+;   id $600D84A2. BMSR $7949 - link down - and GenetStart() refused with
+;   #GENET_ERR_NO_LINK, "the PHY reports no link". Correct.
+;
+; Run 2, cable into a live switch:
+;   LPA $CDE1, STAT1000 $3C00 -> 1000 Mbit/s full duplex, resolved by
+;   GenetPhyResolve() exactly as genphy_parse_link() would. GenetStart()
+;   succeeded. GenetSend() put 60 bytes out and the consumer index
+;   confirmed it. All thirteen refusals fired with the right codes and
+;   the 64-bit canary passed.
+;
+; SO THESE ARE NOW PROVEN ON HARDWARE, and the "NOT PROVEN" list this
+; section used to end with is retired:
+;   that $FD580000 answers a read, and that it is a GENETv5;
+;   that MDIO reaches the PHY at address 1;
+;   that the UniMAC reset sequence leaves the block usable;
+;   that the DMA engine reads a descriptor this file wrote;
+;   that a frame leaves the connector.
+;
+; TWO THINGS IN THAT RUN LOOKED LIKE FAULTS AND WERE NOT. Both are
+; written down at length because both are the diagnostic lying, which is
+; the worst kind of evidence to have and the easiest to act on.
+;
+;   1. "MAC-side link 0" WHILE THE PHY REPORTED LINK.
+;      GenetMacLinkStatus() reads UMAC_MODE bit 5, and the probe printed
+;      it in its step 4 - BEFORE GenetStart() ran. At that moment
+;      EXT_RGMII_OOB_CTRL is still in its reset state, and that state
+;      has since been MEASURED rather than guessed - it is $00F00000,
+;      in which RGMII_LINK is clear. See THE MEASURED RESET STATE
+;      below, which also corrects what this paragraph used to claim.
+;      The MAC has not been told that there is a link, so it reports
+;      that there is no link, and it is right to. Only
+;      GenetAdjustLink() - which runs inside GenetStart(), at [U:461] -
+;      sets RGMII_LINK. Reading the MAC's opinion
+;      of the link before the MAC has been told what the link is answers
+;      a question nobody asked. Linux confirms the mechanism from the
+;      other end: bcmgenet_mac_config() SETS RGMII_LINK when the link
+;      comes up ([M:74-77]), bcmgenet_mii_setup() CLEARS it when the
+;      link goes down ([M:103-115], the clear at [M:113]), and Linux's
+;      fixed-PHY hook reads MODE_LINK_STATUS straight back out as the
+;      link state ([M:128-130]). The bit this file READS is driven by
+;      the bit GenetAdjustLink() WRITES, one register apart.
+;      The probe now prints it TWICE, before and after bring-up, and the
+;      gate requires 0 then 1.
+;
+;   2. "RECEIVE GOT NOTHING" AFTER EIGHT POLLS.
+;      Eight bare iterations with no delay - microseconds of listening
+;      on a wire whose unsolicited traffic arrives in seconds. See
+;      GenetRecvWait(), which is the fix and carries the full account.
+;
+; TWO OF THE FOUR OPEN ITEMS WERE CLOSED LATER THE SAME DAY. They are
+; kept in place and struck through, because WHAT closed them is more
+; useful than the fact that they closed:
+;
+;   ~~that a frame ARRIVES - run 2 never listened long enough to know~~
+;     CLOSED, 2026-08-26. With a 3-second listen the board received 60
+;     bytes, dst[0] $01, "ethertype" $0026, rx count 1 - a genuine
+;     spanning-tree BPDU off the switch. $01 is the multicast bit of
+;     01:80:C2:00:00:00 and $0026 is 38, an 802.3 LENGTH field rather
+;     than an ethertype. THE NETWORK TALKED TO US UNPROMPTED, which is
+;     the strongest evidence the receive path is real, precisely because
+;     nothing on this board asked for it.
+;
+;   ~~that the frame that left was well-formed on the wire, as opposed~~
+;     ~~to merely handed to the DMA engine~~
+;     CLOSED, 2026-08-26, and by a different file. RaspberryPi4/Lib/
+;     net.pi4 ran over this driver and a laptop answered four of four
+;     pings, 0% loss, with this board's MAC 02-00-4d-46-00-01 appearing
+;     in the laptop's own ARP table. An ARP request that gets a reply,
+;     and an echo reply that Windows accepts, are both proof that the
+;     bytes left this connector correctly framed.
+;
+; AND ONE THING THE BOARD PROVED IN THE OTHER DIRECTION, 2026-09-08,
+; WHICH IS THE WORST WAY TO LEARN SOMETHING. This board came up on a
+; cable straight into the bench laptop during a display bring-up, and
+; the laptop's Realtek Ethernet card logged "reset by tx hang" twelve
+; times in two and a half minutes and was then stopped by Windows.
+; Nothing was run against that card from the PC. The audit of this file
+; against the vendor driver, 2026-09-09, found the bring-up order and
+; every register value clean and ONE REGISTER THIS FILE NEVER WROTE:
+; UMAC_CMD's two PAUSE_IGNORE bits, whose comment in this very file
+; used to say "NOTHING IN THIS FILE WRITES THEM" as though that were a
+; virtue. Both clear is 802.3x flow control ON in both directions, on a
+; link where this file had never advertised the capability because it
+; had never written MII_ADVERTISE either. THE PAUSE PROMISE, below, is
+; the whole account and the fix. What it did NOT find - checked rather
+; than assumed - is any PHY reset (BMCR_RESET and BMCR_PDOWN are
+; defined here and written nowhere), any auto-negotiation restart on a
+; timer or a command, or any bring-up this file performs unasked.
+;
+; STILL NOT PROVEN, AND ONLY A BOARD CAN SETTLE IT:
+;   THAT THE PAUSE FIX HOLDS ON THE WIRE. `net stats` on the board
+;     prints the UniMAC's own count of PAUSE frames transmitted and it
+;     must read ZERO after a boot on a cable. Until that reading exists
+;     this file's most important claim is inspection and a gate, and
+;     the gate models a MAC that cannot lie. The full recipe, and what
+;     the bench needs, is in the vault note "GENET against the vendor
+;     driver 2026-09-09".
+;   the cache-line length and every barrier placement, though with the
+;     MMU off neither can currently matter - see THE CACHE. Note that
+;     "the MMU is off" is now a statement about how programs are RUN
+;     rather than about the part: translation with write-back cacheable
+;     DRAM was enabled on this board on 2026-08-26, and every run so far
+;     turns it off again before returning. The day something leaves it
+;     on, this becomes the live question in this file.
+;   whether RGMII delay handling is right for this board's rgmii-rxid;
+;   THE PHY LEDs, added 2026-08-26 and never confirmed. GenetPhyLeds()
+;     programs three MDIO shadow/expansion registers to reproduce
+;     Linux's bcm54xx_config_init LED block. It exists because the jack
+;     was dark during a run in which the laptop's own NIC counters
+;     proved 14 unicast frames had arrived from this board - working
+;     hardware looking dead - and we had simply never programmed the
+;     PHY. WHAT TO LOOK FOR when the cable is back: `leds programmed 1`
+;     and `LEDS1 (want 00AA) 00AA`, with both jack LEDs lighting on link
+;     and flashing together on traffic. The readback is a genuine second
+;     transaction and not an echo - the shadow window is written blind,
+;     and a wrong selector lands in a different register while reporting
+;     success - so $00AA READING BACK CORRECTLY WITH THE LEDS STILL DARK
+;     would mean this board wires its jack to a different pin pair, and
+;     the alternative is in that procedure's own comment, one edit away.
+;
+; ----------------------------------------------------------------------
+;  ONE OPEN DIVERGENCE BETWEEN THE TWO SOURCES: ID_MODE_DIS
+; ----------------------------------------------------------------------
+; U-Boot and Linux DISAGREE about this bit for this board's phy-mode,
+; and this file follows U-Boot. Recorded here so the next person does
+; not have to rediscover it:
+;
+;   U-Boot [U:464-466] sets ID_MODE_DIS for BOTH
+;     PHY_INTERFACE_MODE_RGMII and PHY_INTERFACE_MODE_RGMII_RXID.
+;   Linux [M:245-265] sets it ONLY for PHY_INTERFACE_MODE_RGMII
+;     (`id_mode_dis = BIT(16)` at :252). For RGMII_RXID and RGMII_TXID
+;     it leaves id_mode_dis at 0 and [M:282-285] then CLEARS the bit.
+;
+; bcm2711-rpi-4-b.dts:198 says rgmii-rxid, so the two drivers program
+; this board's RGMII block differently. ID_MODE_DIS is a TRANSMIT-side
+; control - Linux's own comment at [M:246-250] describes it as "TXC
+; transitions at the same time as TXD (requires PCB or receiver-side
+; delay)" - so it can only affect frames going OUT, never frames coming
+; in, and it is therefore NOT a candidate explanation for a quiet
+; receive path. It IS a candidate explanation for a frame that leaves
+; the DMA engine and is dropped by the switch with an FCS error, which
+; is indistinguishable from a working transmit unless somebody looks at
+; the switch's counters.
+;
+; NOT CHANGED, because U-Boot was the primary source here, it was the
+; loader this board booted when the decision was taken, and changing a
+; bit to match the other witness on a path that had never been measured
+; would have been trading a tested guess for an untested one.
+;
+; AND THE PATH HAS SINCE BEEN MEASURED, SO THE SUSPECT IS RETIRED. This
+; paragraph used to end "If the next run shows frames leaving and
+; nothing answering them, THIS is the bit to try." The next run had
+; things answering: on 2026-08-26 a laptop replied to four of four pings
+; over this driver and its ARP table held our address. Frames leave this
+; connector correctly framed with ID_MODE_DIS as U-Boot sets it, so THIS
+; BIT IS NO LONGER A CANDIDATE FOR ANYTHING and a driver that works did
+; not get "fixed" to match the other document.
+;
+; TWO CAVEATS ON RETIRING IT, so it is retired honestly rather than
+; forgotten. The proof is one link at 1000 Mbit/s full duplex into one
+; switch and one laptop; and U-Boot is no longer on this stick at all
+; (the firmware loads KERNEL8.IMG directly, since 2026-08-26), so "the
+; loader this board actually boots" is now Anvil. The CITATION is still
+; sound - U-Boot v2025.01 is the driver that demonstrably drove this
+; silicon - but it is a document on disk now rather than something
+; running on the bench beside us.
+; ======================================================================
+
+EnableExplicit
+
+; ======================================================================
+;  THE BLOCK
+; ======================================================================
+; bcm2711.dtsi:589  reg = <0x0 0x7d580000 0x10000>, translated through
+; the soc ranges at bcm2711.dtsi:41-43. See WHERE THE BLOCK IS.
+#GENET_BASE = $FD580000
+#GENET_SIZE = $10000
+
+; ======================================================================
+;  SYS BLOCK - GENET_SYS_OFF = $0000   [U:45] [L:281]
+; ======================================================================
+#GENET_SYS_REV_CTRL        = $0000   ; $0000 + $00   [U:40] [L:290]
+#GENET_SYS_PORT_CTRL       = $0004   ; $0000 + $04   [U:42] [L:291]
+#GENET_SYS_RBUF_FLUSH_CTRL = $0008   ; $0000 + $08   [U:46] [L:302]
+#GENET_SYS_TBUF_FLUSH_CTRL = $000C   ; $0000 + $0c   [U:47] [L:303]
+
+; SYS_PORT_CTRL value for an EXTERNAL gigabit PHY, which is what a Pi 4
+; has. [U:43] PORT_MODE_EXT_GPHY 3, confirmed [L:295].
+#GENET_PORT_MODE_EXT_GPHY = 3
+
+; SYS_REV_CTRL decoding. [U:637-646]:
+;     reg = readl(SYS_REV_CTRL); major = (reg >> 24) & 0x0f;
+;     if (major != 6) { ... "Unsupported GENETv%d.%d" }
+; So the field that means "v5" reads as SIX. That is not a typo in the
+; driver and it is not one here either - the encoding is offset by one
+; above v4, which is why the driver's own error path maps 5 back to 4
+; and 0 back to 1 before printing. A check that looked for 5 would
+; reject every real Pi 4.
+#GENET_REV_MAJOR_SHIFT = 24
+#GENET_REV_MAJOR_MASK  = $0F
+#GENET_REV_MAJOR_V5    = 6
+#GENET_REV_MINOR_SHIFT = 16
+#GENET_REV_MINOR_MASK  = $0F
+
+; ======================================================================
+;  EXT BLOCK - GENET_EXT_OFF = $0080   [U:49] [L:283]
+; ======================================================================
+#GENET_EXT_RGMII_OOB_CTRL = $008C    ; $0080 + $0c  [U:50] [L:321]
+
+#GENET_RGMII_LINK    = $00000010     ; BIT(4)   [U:51] [L:323]
+#GENET_OOB_DISABLE   = $00000020     ; BIT(5)   [U:52] [L:324]
+#GENET_RGMII_MODE_EN = $00000040     ; BIT(6)   [U:53] [L:325]
+#GENET_ID_MODE_DIS   = $00010000     ; BIT(16)  [U:54] [L:326]
+
+; ======================================================================
+;  RBUF BLOCK - GENET_RBUF_OFF = $0300   [U:56] [L:286]
+; ======================================================================
+#GENET_RBUF_CTRL           = $0300   ; $0300 + $00   [U:58] [L:190]
+#GENET_RBUF_TBUF_SIZE_CTRL = $03B4   ; $0300 + $b4   [U:57] [L:209]
+
+; RBUF_ALIGN_2B - the hardware inserts two pad bytes before every
+; received frame so that the IP header lands 4-byte aligned. That is
+; why GenetRecv() skips #GENET_RX_BUF_OFFSET and why the length the
+; descriptor reports is two larger than the frame.
+#GENET_RBUF_ALIGN_2B = $00000002     ; BIT(1)   [U:59] [L:192]
+
+; ======================================================================
+;  UMAC BLOCK - GENET_UMAC_OFF = $0800   [U:61] [L:287]
+; ======================================================================
+#GENET_UMAC_CMD           = $0808    ; $0800 + $008  [U:66] [unimac.h:10]
+#GENET_UMAC_MAC0          = $080C    ; $0800 + $00c  [U:64] [unimac.h:38]
+#GENET_UMAC_MAC1          = $0810    ; $0800 + $010  [U:65] [unimac.h:39]
+#GENET_UMAC_MAX_FRAME_LEN = $0814    ; $0800 + $014  [U:63] [unimac.h:40]
+#GENET_UMAC_TX_FLUSH      = $0B34    ; $0800 + $334  [U:68] [unimac.h:64]
+#GENET_UMAC_MIB_CTRL      = $0D80    ; $0800 + $580  [U:62] [L:185]
+#GENET_MDIO_CMD           = $0E14    ; $0800 + $614  [U:67] [L:157]
+                                     ; and independently bcm2711.dtsi:596
+                                     ; as the child node mdio@e14
+
+; UMAC_MODE, and READ ONLY. unimac.h:43-44 gives UMAC_MODE at $044 with
+; MODE_LINK_STATUS at bit 5, so $0800 + $044 = $0844. THIS HAS ONE
+; SOURCE, NOT TWO: neither U-Boot's driver nor bcmgenet.h mentions it.
+; It is exposed by GenetMacLinkStatus() as a diagnostic ONLY - a second
+; opinion on the link, from the MAC's side of the RGMII bus rather than
+; from the PHY's registers - and NOTHING in this file makes a decision
+; from it. A single-source register is fine to look at and not fine to
+; steer on.
+#GENET_UMAC_MODE        = $0844      ; $0800 + $044  [unimac.h:43]
+#GENET_MODE_LINK_STATUS = $00000020  ; BIT(5)        [unimac.h:44]
+
+; UMAC_CMD bits. [U:78-89], all confirmed [unimac.h:11-28].
+#GENET_CMD_TX_EN       = $00000001   ; BIT(0)   [U:78]  [unimac.h:11]
+#GENET_CMD_RX_EN       = $00000002   ; BIT(1)   [U:79]  [unimac.h:12]
+#GENET_CMD_SW_RESET    = $00002000   ; BIT(13)  [U:86]  [unimac.h:27]
+#GENET_CMD_LCL_LOOP_EN = $00008000   ; BIT(15)  [U:87]  [unimac.h:28]
+#GENET_CMD_SPEED_SHIFT = 2           ;          [U:84]  [unimac.h:17]
+#GENET_CMD_SPEED_MASK  = 3           ;          [U:85]  [unimac.h:18]
+
+; The speed field's encoding. [U:80-83], confirmed [unimac.h:13-16].
+#GENET_UMAC_SPEED_10   = 0
+#GENET_UMAC_SPEED_100  = 1
+#GENET_UMAC_SPEED_1000 = 2
+#GENET_UMAC_SPEED_2500 = 3           ; REFUSED - see the header
+
+; CMD_HD_EN and the two PAUSE_IGNORE bits. [unimac.h:22] [unimac.h:19]
+; [unimac.h:29] and the sequence at [M:44-47].
+;
+; CMD_HD_EN IS STILL NEVER WRITTEN - the half-duplex refusal is intact
+; and it is what names that bit. THE TWO PAUSE_IGNORE BITS ARE WRITTEN
+; NOW, on every link, and the whole argument is at THE PAUSE PROMISE
+; below. This comment used to say "NOTHING IN THIS FILE WRITES THEM",
+; and that sentence was true and was the defect: a UniMAC with both
+; bits CLEAR is a MAC with 802.3x flow control ON in both directions,
+; which is what this driver shipped for two weeks without deciding to.
+#GENET_CMD_HD_EN           = $00000400  ; BIT(10) [unimac.h:22]
+#GENET_CMD_RX_PAUSE_IGNORE = $00000100  ; BIT(8)  [unimac.h:19]
+#GENET_CMD_TX_PAUSE_IGNORE = $10000000  ; BIT(28) [unimac.h:29]
+
+; ======================================================================
+;  THE PAUSE PROMISE - WHY THIS DRIVER TURNS 802.3x FLOW CONTROL OFF
+;  AT THE MAC, IN BOTH DIRECTIONS, AND SAYS SO ON THE WIRE
+; ======================================================================
+; WHAT THE TWO BITS MEAN, and Linux states it twice so it cannot be got
+; backwards. bcmgenet_get_pauseparam reports the pair to ethtool as
+;     epause->tx_pause = !(umac_cmd & CMD_TX_PAUSE_IGNORE);
+;     epause->rx_pause = !(umac_cmd & CMD_RX_PAUSE_IGNORE);
+; ([LD:933-934]), and bcmgenet_mac_config builds
+; the same pair the other way round at [M:56-66]:
+;     if (!tx_pause) cmd_bits |= CMD_TX_PAUSE_IGNORE;
+;     if (!rx_pause) cmd_bits |= CMD_RX_PAUSE_IGNORE;
+; In ethtool's vocabulary tx_pause is "this device may TRANSMIT PAUSE
+; frames" and rx_pause is "this device HONOURS a PAUSE frame it
+; receives". So:
+;
+;   CMD_TX_PAUSE_IGNORE SET  -> the UniMAC never emits a PAUSE frame.
+;   CMD_RX_PAUSE_IGNORE SET  -> the UniMAC never stops transmitting
+;                               because somebody sent it one.
+;
+; BOTH CLEAR - which is what a UniMAC holds after the reset sequence,
+; and what this file left it holding until 2026-09-09 - IS FLOW CONTROL
+; FULLY ON. The RX DMA's XON/XOFF threshold then decides WHEN, and the
+; MAC does the rest with no further reference to software.
+;
+; THAT IS NOT WHAT THE VENDOR SHIPS, AND THE DIFFERENCE IS THE WHOLE
+; BUG. Linux never enables the MAC without first deciding this pair
+; ([M:28-95], reached from bcmgenet_mii_setup on every link-up), and it
+; decides it from what the two ends NEGOTIATED - phy_get_pause() at
+; [M:54]. This file negotiated nothing: it never wrote MII_ADVERTISE,
+; so it never advertised the pause capability, and it then emitted
+; PAUSE frames anyway. A PAUSE frame on a link where the capability was
+; not resolved is a frame the partner never agreed to receive.
+;
+; WHAT IT COST. 2026-09-08, this board on a cable straight into the
+; bench laptop during a display bring-up: the laptop's Realtek PCIe GbE
+; card logged "reset by tx hang" TWELVE times between 17:38:57 and
+; 17:41:16, at 11-13 second intervals, and Windows then stopped the
+; device (CM_PROB_FAILED_POST_START). Nothing was run against that card
+; from the PC. A Realtek transmit hang is its transmit descriptors not
+; completing; a partner holding XOFF asserted is the textbook way to
+; produce one on a point-to-point link, and 11-13 seconds is a transmit
+; watchdog firing over and over into a queue that never drains.
+;
+; WHY THIS DRIVER SAYS NO RATHER THAN NEGOTIATING PROPERLY. Flow
+; control is a promise to drain shortly. Linux may make it because it
+; drains under NAPI to a budget of 64 every time the ring fills
+; (bcmgenet_rx_poll at [LD:2391], `rxpktprocessed < budget` at
+; [LD:2279]). This monitor sits at a prompt for hours with the
+; interface up and has single-threaded stretches of tens of seconds
+; when NOTHING reads the ring at all - a DSI panel bring-up, a crc32
+; over two megabytes, a write to the card. It cannot keep the promise,
+; so it must not make it, and it must not make it BY ACCIDENT either.
+;
+; THE VENDOR HAS A FIRST-CLASS WAY TO SAY THAT and this is it, not a
+; special case invented here: priv->rx_pause and priv->tx_pause are the
+; manual override behind `ethtool -A`, defaulted to 1 at
+; [LD:4021-4023] and applied at [M:62-66] regardless of what was
+; negotiated. THIS DRIVER'S PAIR IS 0 AND 0. That single decision then
+; drives both halves through the vendor's own code paths:
+;
+;   * the ADVERTISEMENT, [M:136-145] bcmgenet_phy_pause_set(): the
+;     Pause bit is advertised from `rx` and the Asym_Pause bit from
+;     `rx | tx`. With both 0 the two advertisement bits are CLEAR, so
+;     the partner is told the truth - this board will not use 802.3x -
+;     and pause resolution on both ends comes out "none".
+;   * the MAC, [M:62-66]: both IGNORE bits set on every link.
+;
+; AND THE SECOND ONE IS THE GUARANTEE, WHICH THE THRESHOLD IS NOT.
+; RDMA_XON_XOFF_THRESH decides when the RX DMA asks for flow control;
+; CMD_TX_PAUSE_IGNORE decides whether the MAC is willing to ask at all.
+; Writing 0 into the threshold makes the request improbable and nothing
+; on this disk defines what a zero XOFF threshold does - neither driver
+; ever writes one. Setting the bit makes the frame impossible, and it
+; is the register the vendor uses for exactly this purpose. Both are
+; worth having; only one is a proof.
+;
+; TO TURN FLOW CONTROL BACK ON, when something in this monitor can
+; promise a bounded drain: set the two constants below to 1, and arm
+; RDMA_XON_XOFF_THRESH with #GENET_DMA_FC_THRESH_VALUE in the same
+; edit. They are two halves of one decision and separating them is what
+; produced this bug.
+; ----------------------------------------------------------------------
+#GENET_PAUSE_RX = 0     ; priv->rx_pause. Vendor default 1, [LD:4023]
+#GENET_PAUSE_TX = 0     ; priv->tx_pause. Vendor default 1, [LD:4022]
+
+; ======================================================================
+;  THE MIB COUNTERS - what the MAC counted, so the next boot on a cable
+;  can tell the story from this board's side
+; ======================================================================
+; UMAC_MIB_START is $400 within the UMAC block ([L:155]
+; v6.12_bcmgenet.h), so every offset below is $0800 + $400 + n and the
+; sum is written out. The counters are the UniMAC's RSV (receive status
+; vector) and TSV (transmit status vector) blocks, laid out in the
+; declaration order of struct bcmgenet_rx_counters and
+; struct bcmgenet_tx_counters ([L:91-137]).
+;
+; THE LAYOUT HAS A GAP AND IT IS NOT OPTIONAL TO KNOW ABOUT IT.
+; bcmgenet_update_mib_counters walks the two structures with a running
+; byte offset and adds BCMGENET_STAT_OFFSET = $C when it crosses from
+; the RX group into the TX group, and $C again crossing into the RUNT
+; group ([LD:1213-1220] and the comment at [LD:1022-1024]: "There
+; is a 0xC gap between the end of RX and beginning of TX stats").
+; Reading the TX counters at the address the C structure alone implies
+; lands three registers early, on rx.mtue / rx.pok / rx.uc, and those
+; are plausible numbers.
+;
+; The arithmetic, in full, so the sum can be checked rather than
+; trusted. The RX group is 10 packet-size counters plus 19 named
+; fields = 29 words, $400 through $470 inclusive. The TX group starts
+; at $470 + $4 + $C = $480. Two anchors in the vendor's own comments
+; confirm both ends: rx.pkt is annotated "(0x428)" at [L:93] and $400 +
+; 10*4 = $428; tx.pkts is annotated "(0x4a8)" at [L:117] and $480 +
+; 10*4 = $4A8. tx.uc is annotated "(0x4f0)" at [L:135] and $480 + 28*4
+; = $4F0. Three independent checks on one layout.
+;
+; ONLY THE COUNTERS THAT ANSWER A QUESTION ARE HERE. The ten size
+; histograms and the collision counters are real and are not read,
+; because a register map full of constants nothing reads is how a
+; register map rots (the same argument the ESTATUS fallback is left out
+; under, in GenetPhyResolve).
+;
+; THE COUNTERS SATURATE, THEY DO NOT WRAP. bcmgenet_update_stat_misc
+; treats $FFFFFFFF as "overflowed" and writes 0 back ([LD:1188-1191]),
+; which only makes sense for a counter that sticks at all-ones. Nothing
+; here writes them back; GenetUmacReset() zeroes the whole block through
+; UMAC_MIB_CTRL at every bring-up, so a reading is always "since this
+; interface came up".
+; ----------------------------------------------------------------------
+; RX group. $0800 + $400 + n.
+#GENET_MIB_RX_PKT   = $0C28   ; $800+$428 rx.pkt   received packets  [L:93]
+#GENET_MIB_RX_FCS   = $0C38   ; $800+$438 rx.fcs   FCS errors        [L:97]
+#GENET_MIB_RX_PF    = $0C40   ; $800+$440 rx.pf    PAUSE frames IN   [L:99]
+#GENET_MIB_RX_ALN   = $0C48   ; $800+$448 rx.aln   alignment errors  [L:101]
+#GENET_MIB_RX_FLR   = $0C4C   ; $800+$44c rx.flr   length out of range
+#GENET_MIB_RX_OVR   = $0C58   ; $800+$458 rx.ovr   oversize frames
+#GENET_MIB_RX_JBR   = $0C5C   ; $800+$45c rx.jbr   jabber
+; TX group. $0800 + $480 + n, the $C gap already taken.
+#GENET_MIB_TX_PKTS  = $0CA8   ; $800+$4a8 tx.pkts  transmitted pkts  [L:117]
+#GENET_MIB_TX_PF    = $0CB4   ; $800+$4b4 tx.pf    PAUSE frames OUT  [L:120]
+#GENET_MIB_TX_FCS   = $0CBC   ; $800+$4bc tx.fcs   FCS errors out
+#GENET_MIB_TX_OVR   = $0CC0   ; $800+$4c0 tx.ovr   oversize out
+#GENET_MIB_TX_LCL   = $0CD4   ; $800+$4d4 tx.lcl   late collisions
+#GENET_MIB_TX_ECL   = $0CD8   ; $800+$4d8 tx.ecl   excessive collisions
+
+; The three counters that are NOT in the MIB block. The first two are in
+; the RBUF block and the vendor reaches them at a GENETv3-and-later
+; offset that is different from the v1 one - RBUF_OVFL_CNT_V3PLUS $94
+; and RBUF_ERR_CNT_V3PLUS $98, [L:169] and [L:181], selected at
+; [LD:1165-1191]. A v5 part is "V3PLUS".
+;
+; RBUF_OVFL_CNT IS THE ONE THAT ANSWERS "DID THE RING OVERRUN". It
+; counts frames the receive buffer had nowhere to put. It is the
+; hardware's own answer to the same question the discard count in the
+; top half of RDMA_PROD_INDEX answers, from the other side of the FIFO,
+; and the two together separate "the ring was full" from "the FIFO was
+; full".
+#GENET_RBUF_OVFL_CNT = $0394  ; $300 + $94   [L:169]
+#GENET_RBUF_ERR_CNT  = $0398  ; $300 + $98   [L:181]
+#GENET_UMAC_MDF_ERR_CNT = $0E38 ; $800 + $638 [L:182]
+
+; MIB_CTRL reset bits, written together then cleared. [U:91-93] [L:186-188]
+#GENET_MIB_RESET_RX   = $00000001    ; BIT(0)
+#GENET_MIB_RESET_RUNT = $00000002    ; BIT(1)
+#GENET_MIB_RESET_TX   = $00000004    ; BIT(2)
+#GENET_MIB_RESET_ALL  = $00000007    ; the three OR'd, as [U:222-223]
+
+; ENET_MAX_MTU_SIZE, written to UMAC_MAX_FRAME_LEN at [U:226].
+; [U:107-109]: ETH_DATA_LEN + ETH_HLEN + VLAN_HLEN + ENET_BRCM_TAG_LEN
+;              + ETH_FCS_LEN + ENET_PAD
+;            = 1500       + 14       + 4         + 6
+;              + 4           + 8
+;            = 1536
+; The three constants that are not in the driver are Linux's own and
+; are fixed by the Ethernet frame format: ETH_DATA_LEN 1500, ETH_HLEN
+; 14, ETH_FCS_LEN 4, VLAN_HLEN 4. The comment at [U:102-104] states the
+; same total in words - "Body(1500) + EH_SIZE(14) + VLANTAG(4) +
+; BRCMTAG(6) + FCS(4) = 1528. 1536 is multiple of 256 bytes" - which is
+; a second statement of the arithmetic by the driver's own author.
+#GENET_MAX_MTU_SIZE = 1536
+
+; ======================================================================
+;  MDIO - the register is one 32-bit word that carries the whole
+;  transaction. [U:67-76], all confirmed [L:157-165].
+; ======================================================================
+#GENET_MDIO_START_BUSY = $20000000   ; BIT(29)   [U:69] [L:158]
+#GENET_MDIO_READ_FAIL  = $10000000   ; BIT(28)   [U:70] [L:159]
+#GENET_MDIO_RD         = $08000000   ; (2 << 26) [U:71] [L:160]
+#GENET_MDIO_WR         = $04000000   ; BIT(26)   [U:72] [L:161]
+#GENET_MDIO_PMD_SHIFT  = 21          ;           [U:73] [L:162]
+#GENET_MDIO_PMD_MASK   = $1F         ;           [U:74] [L:163]
+#GENET_MDIO_REG_SHIFT  = 16          ;           [U:75] [L:164]
+#GENET_MDIO_REG_MASK   = $1F         ;           [U:76] [L:165]
+
+; U-Boot bounds the START_BUSY wait at 20 ms: wait_for_bit_32(...,
+; MDIO_START_BUSY, false, 20, true) at [U:559-560] and [U:577-578].
+; A clause-22 transaction at the usual 2.5 MHz MDC is about 26
+; microseconds, so 20 ms is four orders of magnitude of slack - it is a
+; "the bus is dead" deadline, not a timing budget.
+#GENET_MDIO_TIMEOUT_MS = 20
+
+; ======================================================================
+;  CLAUSE 22 PHY REGISTERS - IEEE 802.3, not Broadcom's. [I]
+; ======================================================================
+#GENET_MII_BMCR      = $00           ; [mii.h:16]
+#GENET_MII_BMSR      = $01           ; [mii.h:17]
+#GENET_MII_PHYSID1   = $02           ; [mii.h:18]
+#GENET_MII_PHYSID2   = $03           ; [mii.h:19]
+#GENET_MII_ADVERTISE = $04           ; [mii.h:20]
+#GENET_MII_LPA       = $05           ; [mii.h:21]
+#GENET_MII_CTRL1000  = $09           ; [mii.h:23]
+#GENET_MII_STAT1000  = $0A           ; [mii.h:24]
+
+#GENET_BMCR_ANRESTART = $0200        ; [mii.h:45]
+#GENET_BMCR_ISOLATE   = $0400        ; [mii.h:46]
+#GENET_BMCR_PDOWN     = $0800        ; [mii.h:47]
+#GENET_BMCR_ANENABLE  = $1000        ; [mii.h:48]
+#GENET_BMCR_RESET     = $8000        ; [mii.h:51]
+
+#GENET_BMSR_LSTATUS      = $0004     ; [mii.h:57]
+#GENET_BMSR_ANEGCAPABLE  = $0008     ; [mii.h:58]
+#GENET_BMSR_ANEGCOMPLETE = $0020     ; [mii.h:60]
+
+#GENET_LPA_10HALF  = $0020           ; [mii.h:97]
+#GENET_LPA_10FULL  = $0040           ; [mii.h:99]
+#GENET_LPA_100HALF = $0080           ; [mii.h:101]
+#GENET_LPA_100FULL = $0100           ; [mii.h:103]
+
+; THE TWO PAUSE BITS OF THE ADVERTISEMENT, and their mirror in the link
+; partner's. They occupy the same two positions in MII_ADVERTISE and
+; MII_LPA, which is the architectural reason one mask reads both.
+; GenetPhyPauseSet() clears them in MII_ADVERTISE; GenetPauseAdvert()
+; and GenetPauseLpa() read the pair back so a diagnostic can print what
+; each end asked for. See THE PAUSE PROMISE.
+#GENET_ADVERTISE_PAUSE_CAP  = $0400  ; [mii.h:83]
+#GENET_ADVERTISE_PAUSE_ASYM = $0800  ; [mii.h:84]
+#GENET_LPA_PAUSE_CAP        = $0400  ; [mii.h:106]
+#GENET_LPA_PAUSE_ASYM       = $0800  ; [mii.h:107]
+#GENET_ADVERTISE_PAUSE_MASK = $0C00  ; the two OR'd
+
+; The 1000BASE-T pair, and the shift that relates them. CTRL1000
+; advertises with ADVERTISE_1000FULL $0200 / ADVERTISE_1000HALF $0100
+; [mii.h:152-153]; STAT1000 reports the partner with LPA_1000FULL $0800
+; / LPA_1000HALF $0400 [mii.h:163-164]. The two sets are the same two
+; bits two positions apart, which is why genphy_parse_link can AND them
+; after one shift: `gblpa &= phy_read(MII_CTRL1000) << 2` at [P:317].
+#GENET_ADVERTISE_1000FULL = $0200    ; [mii.h:152]
+#GENET_ADVERTISE_1000HALF = $0100    ; [mii.h:153]
+#GENET_LPA_1000FULL       = $0800    ; [mii.h:163]
+#GENET_LPA_1000HALF       = $0400    ; [mii.h:164]
+#GENET_CTRL1000_TO_LPA_SHIFT = 2     ; [P:317]
+
+; The PHY's MDIO address on this board. bcm2711-rpi-4-b.dts:202-207.
+#GENET_PHY_ADDR = 1
+#GENET_PHY_ADDR_MAX = 31             ; clause 22 is a 5-bit field
+
+; ======================================================================
+;  THE PHY'S LED CONTROL - the shadow and expansion windows
+; ======================================================================
+;  Clause 22 gives a PHY thirty-two registers and Broadcom needs more
+;  than thirty-two, so two of them are WINDOWS onto larger banks. Both
+;  are addressed indirectly and neither can be read the way an ordinary
+;  register is read.
+;
+;  THE SHADOW WINDOW is register $1C on its own. One 16-bit write
+;  carries a direction bit, a five-bit selector and ten bits of data
+;  [B:117-120]. To read, write the selector with the direction bit
+;  CLEAR and then read $1C back, keeping the low ten bits [C2:242-246].
+;
+;  THE EXPANSION WINDOW is a pair: write a 16-bit selector to $17, then
+;  read or write the data at $15 [B:90-91], [C2:21-30]. The selector
+;  carries a bank in its high byte - $0F00 is the ordinary expansion
+;  bank [B:95] - so the constants below are complete selectors, not
+;  offsets, exactly as brcmphy.h writes them.
+; ----------------------------------------------------------------------
+#GENET_PHY_SHD           = $1C       ; MII_BCM54XX_SHD        [B:117]
+#GENET_PHY_SHD_WRITE     = $8000     ; MII_BCM54XX_SHD_WRITE  [B:118]
+#GENET_PHY_SHD_SEL_SHIFT = 10        ; (sel & $1F) << 10      [B:119]
+#GENET_PHY_SHD_SEL_MASK  = $1F       ;                        [B:119]
+#GENET_PHY_SHD_DATA_MASK = $3FF      ; val & $3FF             [B:120]
+
+#GENET_PHY_SHD_LEDS1     = $0D       ; LED Selector 1         [B:212]
+#GENET_PHY_SHD_LEDS2     = $0E       ; LED Selector 2         [B:218]
+
+; Inside a LED selector register, two four-bit source fields. LEDS1
+; holds LED1 at bits 3..0 [B:217] and LED3 at bits 7..4 [B:215], which
+; is the general rule 4 * n stated at [B:214].
+#GENET_PHY_LED_LO_SHIFT  = 0         ;                        [B:217]
+#GENET_PHY_LED_HI_SHIFT  = 4         ;                        [B:215]
+#GENET_PHY_LED_SRC_MASK  = $F        ; BCM_LED_SRC_MASK       [B:166]
+
+; What a LED pin can be driven by. [B:152-165]
+#GENET_LED_SRC_LINKSPD1   = $0       ; BCM_LED_SRC_LINKSPD1   [B:152]
+#GENET_LED_SRC_LINKSPD2   = $1       ; BCM_LED_SRC_LINKSPD2   [B:153]
+#GENET_LED_SRC_XMITLED    = $2       ; BCM_LED_SRC_XMITLED    [B:154]
+#GENET_LED_SRC_ACTIVITY   = $3       ; BCM_LED_SRC_ACTIVITYLED [B:155]
+#GENET_LED_SRC_FDXLED     = $4       ; BCM_LED_SRC_FDXLED     [B:156]
+#GENET_LED_SRC_RCVLED     = $8       ; BCM_LED_SRC_RCVLED     [B:160]
+#GENET_LED_SRC_MULTICOLOR = $A       ; BCM_LED_SRC_MULTICOLOR1 [B:162]
+#GENET_LED_SRC_OFF        = $E       ; tied high              [B:164]
+#GENET_LED_SRC_ON         = $F       ; tied low               [B:165]
+
+; The expansion window, and the one register in it this file uses.
+#GENET_PHY_EXP_DATA       = $15      ; MII_BCM54XX_EXP_DATA   [B:90]
+#GENET_PHY_EXP_SEL        = $17      ; MII_BCM54XX_EXP_SEL    [B:91]
+#GENET_PHY_EXP_SEL_ER     = $0F00    ; MII_BCM54XX_EXP_SEL_ER [B:95]
+; BCM_EXP_MULTICOLOR = MII_BCM54XX_EXP_SEL_ER + $04 [B:171], so $0F04.
+#GENET_PHY_EXP_MULTICOLOR = $0F04    ;                        [B:171]
+
+; What a MULTICOLOR pair does. The four-bit fields sit in the same two
+; positions as the LED sources above - Linux reuses the LEDS1 macros to
+; build this value [C1:504-506].
+#GENET_LED_MC_IN_PHASE    = $100     ; BCM_LED_MULTICOLOR_IN_PHASE, BIT(8)
+                                     ;                        [B:172]
+#GENET_LED_MC_LINK_ACT    = $0       ; BCM_LED_MULTICOLOR_LINK_ACT
+                                     ;                        [B:173]
+
+; ======================================================================
+;  DMA - the numbers, every sum written out
+; ======================================================================
+; [U:96-100]
+#GENET_TOTAL_DESCS = 256             ; TOTAL_DESCS   [U:96]
+#GENET_RX_DESCS    = 256             ; = TOTAL_DESCS [U:97]
+#GENET_TX_DESCS    = 256             ; = TOTAL_DESCS [U:98]
+#GENET_DEFAULT_Q   = $10             ; queue 16      [U:100]
+
+; Descriptor layout. [U:135-138]
+#GENET_DESC_LENGTH_STATUS = $00      ; [U:135]
+#GENET_DESC_ADDRESS_LO    = $04      ; [U:136]
+#GENET_DESC_ADDRESS_HI    = $08      ; [U:137]
+#GENET_DESC_SIZE          = 12       ; [U:138]
+
+; The two descriptor arrays, in MMIO. [U:140] and [U:143]
+#GENET_RX_OFF = $2000                ; [U:140]
+#GENET_TX_OFF = $4000                ; [U:143]
+
+; The ring-register blocks sit immediately past the descriptors.
+; [U:141-142]  GENET_RDMA_REG_OFF = GENET_RX_OFF + TOTAL_DESCS * DMA_DESC_SIZE
+;                                 = $2000 + 256 * 12
+;                                 = $2000 + $0C00 = $2C00
+; [U:144-145]  GENET_TDMA_REG_OFF = GENET_TX_OFF + TOTAL_DESCS * DMA_DESC_SIZE
+;                                 = $4000 + $0C00 = $4C00
+#GENET_RDMA_REG_OFF = $2C00
+#GENET_TDMA_REG_OFF = $4C00
+
+; [U:131-132] DMA_RING_SIZE $40, DMA_RINGS_SIZE = $40 * ($10 + 1) = $440
+#GENET_DMA_RING_SIZE  = $40
+#GENET_DMA_RINGS_SIZE = $440
+
+; The DEFAULT-QUEUE ring registers.
+; [U:154-155]  TDMA_RING_REG_BASE = GENET_TDMA_REG_OFF + DEFAULT_Q * DMA_RING_SIZE
+;                                 = $4C00 + $10 * $40
+;                                 = $4C00 + $0400 = $5000
+; [U:166-167]  RDMA_RING_REG_BASE = $2C00 + $0400 = $3000
+#GENET_TDMA_RING_BASE = $5000
+#GENET_RDMA_RING_BASE = $3000
+
+; Offsets WITHIN a ring-register block. [U:156-164] and [U:168-172]
+; give some as absolutes and some as within-block; both spellings are
+; kept straight here by writing the sum for every one.
+;   [U:159] DMA_RING_BUF_SIZE      $10
+;   [U:160] DMA_START_ADDR         $14
+;   [U:161] DMA_END_ADDR           $1c
+;   [U:162] DMA_MBUF_DONE_THRESH   $24
+#GENET_TDMA_READ_PTR         = $5000 ; $5000 + $00  [U:156]
+#GENET_TDMA_CONS_INDEX       = $5008 ; $5000 + $08  [U:157]
+#GENET_TDMA_PROD_INDEX       = $500C ; $5000 + $0c  [U:158]
+#GENET_TDMA_RING_BUF_SIZE    = $5010 ; $5000 + $10  [U:159]
+#GENET_TDMA_START_ADDR       = $5014 ; $5000 + $14  [U:160]
+#GENET_TDMA_END_ADDR         = $501C ; $5000 + $1c  [U:161]
+#GENET_TDMA_MBUF_DONE_THRESH = $5024 ; $5000 + $24  [U:162]
+#GENET_TDMA_FLOW_PERIOD      = $5028 ; $5000 + $28  [U:163]
+#GENET_TDMA_WRITE_PTR        = $502C ; $5000 + $2c  [U:164]
+
+#GENET_RDMA_WRITE_PTR      = $3000   ; $3000 + $00  [U:168]
+#GENET_RDMA_PROD_INDEX     = $3008   ; $3000 + $08  [U:169]
+#GENET_RDMA_CONS_INDEX     = $300C   ; $3000 + $0c  [U:170]
+#GENET_RDMA_RING_BUF_SIZE  = $3010   ; $3000 + $10  [U:159]
+#GENET_RDMA_START_ADDR     = $3014   ; $3000 + $14  [U:160]
+#GENET_RDMA_END_ADDR       = $301C   ; $3000 + $1c  [U:161]
+#GENET_RDMA_XON_XOFF_THRESH = $3028  ; $3000 + $28  [U:171]
+#GENET_RDMA_READ_PTR       = $302C   ; $3000 + $2c  [U:172]
+
+; The per-ENGINE (not per-ring) registers, past all seventeen rings.
+; [U:174] TDMA_REG_BASE = GENET_TDMA_REG_OFF + DMA_RINGS_SIZE
+;                       = $4C00 + $440 = $5040
+; [U:175] RDMA_REG_BASE = $2C00 + $440 = $3040
+; [U:176-178] DMA_RING_CFG $00, DMA_CTRL $04, DMA_SCB_BURST_SIZE $0c
+#GENET_TDMA_RING_CFG       = $5040   ; $5040 + $00
+#GENET_TDMA_CTRL           = $5044   ; $5040 + $04
+#GENET_TDMA_SCB_BURST_SIZE = $504C   ; $5040 + $0c
+#GENET_RDMA_RING_CFG       = $3040   ; $3040 + $00
+#GENET_RDMA_CTRL           = $3044   ; $3040 + $04
+#GENET_RDMA_SCB_BURST_SIZE = $304C   ; $3040 + $0c
+
+; DMA control and descriptor bits. [U:112-128]
+#GENET_DMA_EN                = $00000001  ; BIT(0)  [U:112]
+#GENET_DMA_RING_BUF_EN_SHIFT = 1          ;         [U:113]
+#GENET_DMA_BUFLENGTH_MASK    = $0FFF      ;         [U:115]
+#GENET_DMA_BUFLENGTH_SHIFT   = 16         ;         [U:116]
+#GENET_DMA_RING_SIZE_SHIFT   = 16         ;         [U:117]
+#GENET_DMA_OWN               = $8000      ;         [U:118]
+#GENET_DMA_EOP               = $4000      ;         [U:119]
+#GENET_DMA_SOP               = $2000      ;         [U:120]
+#GENET_DMA_WRAP              = $1000      ;         [U:121]
+#GENET_DMA_MAX_BURST_LENGTH  = $8         ;         [U:122]
+#GENET_DMA_TX_APPEND_CRC     = $0040      ;         [U:125]
+#GENET_DMA_TX_QTAG_SHIFT     = 7          ;         [U:128]
+
+; THE PRODUCER INDEX REGISTER IS TWO FIELDS, NOT ONE, and U-Boot never
+; says so. [U:338] reads RDMA_PROD_INDEX and compares the whole 32-bit
+; word against its own consumer index, which reads as if the register
+; were a plain counter. It is not. Linux names both halves:
+;   [L:345] DMA_P_INDEX_MASK              0xFFFF   - the index, bits 15:0
+;   [L:341] DMA_P_INDEX_DISCARD_CNT_MASK  0xFFFF   - bits 31:16
+;   [L:342] DMA_P_INDEX_DISCARD_CNT_SHIFT 16
+;
+; THE UPPER HALF IS THE COUNT OF FRAMES THE RING DROPPED, and it is the
+; single most useful number on this whole block when receive is silent.
+; "The producer index has not moved" has two completely different
+; causes that look identical from the low half alone:
+;   * nothing arrived at the MAC at all - a link, filter, or RGMII
+;     problem, or simply a quiet wire;
+;   * frames arrived and the RX ring threw every one of them away - no
+;     descriptor was available, or the DMA is not actually enabled.
+; The discard count separates them in one read, and there is no other
+; way to tell from software. GenetRxDiscards() exists for that and for
+; nothing else.
+;
+; GenetRecv() masks the index to sixteen bits before comparing, which
+; U-Boot does not ([U:341] compares the raw words). On U-Boot's path
+; that difference is invisible until the discard count changes between
+; two polls, at which point U-Boot decides a frame arrived when none
+; did. This file does not reproduce that.
+#GENET_DMA_P_INDEX_MASK          = $FFFF   ; [L:345]
+#GENET_DMA_P_INDEX_DISCARD_SHIFT = 16      ; [L:342]
+#GENET_DMA_P_INDEX_DISCARD_MASK  = $FFFF   ; [L:341]
+
+; The value bcmgenet_enable_dma() writes to both DMA_CTRL registers:
+; [U:264]  (1 << (DEFAULT_Q + DMA_RING_BUF_EN_SHIFT)) | DMA_EN
+;        = (1 << ($10 + 1)) | 1
+;        = (1 << 17) | 1
+;        = $00020000 | $00000001 = $00020001
+#GENET_DMA_CTRL_ENABLE = $00020001
+
+; The value written to both DMA_RING_CFG registers - "enable ring 16".
+; [U:416] and [U:438]:  1 << DEFAULT_Q = 1 << $10 = $00010000
+#GENET_DMA_RING_CFG_Q16 = $00010000
+
+; RX flow control thresholds. [U:147-150]
+;   DMA_FC_THRESH_HI    = RX_DESCS >> 4 = 256 >> 4 = 16 = $10
+;   DMA_FC_THRESH_LO    = 5
+;   DMA_FC_THRESH_VALUE = (5 << 16) | 16 = $00050010
+#GENET_DMA_FC_THRESH_VALUE = $00050010
+
+; DMA_START_ADDR / DMA_END_ADDR are indices in 32-BIT WORDS into the
+; descriptor MMIO area, not byte offsets - which is why the end value
+; is divided by four. [U:405-406] and [U:427-428]:
+;   RX_DESCS * DMA_DESC_SIZE / 4 - 1 = 256 * 12 / 4 - 1
+;                                    = 3072 / 4 - 1 = 768 - 1 = 767
+#GENET_DMA_END_ADDR_VALUE = 767
+
+; DMA_RING_BUF_SIZE for both rings. [U:413-414] and [U:435-436]:
+;   (RX_DESCS << DMA_RING_SIZE_SHIFT) | RX_BUF_LENGTH
+;   = (256 << 16) | 2048 = $01000000 | $0800 = $01000800
+; The TX ring gets the identical value in the driver, RX_BUF_LENGTH and
+; all. See the ONE ODDITY note in the header.
+#GENET_RING_BUF_SIZE_VALUE = $01000800
+
+; RX buffers. [U:180-182]
+#GENET_RX_BUF_LENGTH = 2048          ; [U:180]
+#GENET_RX_BUF_OFFSET = 2             ; [U:182] - the RBUF_ALIGN_2B pad
+; RX_TOTAL_BUFSIZE = RX_BUF_LENGTH * RX_DESCS = 2048 * 256 = 524288
+#GENET_RX_TOTAL_BYTES = 524288       ; [U:181]
+
+; The TX descriptor's flag word, everything but the length.
+; [U:290-291]:
+;   len_stat |= 0x3F << DMA_TX_QTAG_SHIFT;
+;   len_stat |= DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
+;   ($3F << 7) = $1F80
+;   $1F80 | DMA_TX_APPEND_CRC $0040 = $1FC0
+;   $1FC0 | DMA_SOP $2000           = $3FC0
+;   $3FC0 | DMA_EOP $4000           = $7FC0
+; The QTAG field being all-ones is the driver's way of saying "no
+; Broadcom tag"; it is not a queue number.
+#GENET_TX_FLAGS = $7FC0
+
+; The RX descriptor's initial length/status. [U:385]:
+;   (RX_BUF_LENGTH << DMA_BUFLENGTH_SHIFT) | DMA_OWN
+;   = (2048 << 16) | $8000 = $08000000 | $8000 = $08008000
+#GENET_RX_DESC_INIT = $08008000
+
+; ======================================================================
+;  SIZES AND BOUNDS OF OUR OWN
+; ======================================================================
+; The shortest legal Ethernet frame is 64 bytes on the wire including
+; the 4-byte FCS, so 60 bytes of frame. The MAC appends the FCS for us
+; (DMA_TX_APPEND_CRC is in #GENET_TX_FLAGS), so the shortest thing a
+; caller may hand GenetSend is 60 bytes. Format fact, IEEE 802.3, not a
+; Broadcom number.
+;
+; PADDING SHORT FRAMES IS NOT DONE HERE, and that is a deliberate
+; refusal rather than an omission. CMD_PAD_EN exists (unimac.h:20) and
+; would make the MAC do it, but it is single-source and U-Boot never
+; sets it; padding in software would mean writing into a caller's
+; buffer past the length they gave us, which is worse. So a short frame
+; is REFUSED with #GENET_ERR_ARG and the caller pads its own buffer,
+; where it knows how big the buffer is.
+#GENET_MIN_FRAME = 60
+#GENET_MAX_FRAME = 1536              ; = #GENET_MAX_MTU_SIZE
+
+#GENET_CACHE_LINE = 64               ; A72. NOT read from CTR_EL0 - see
+                                     ; THE CACHE in the header.
+
+; The counter fallback, identical to the one in pcie.pi4 and
+; anvil.pi4 and carrying the same caveat: it is a documented
+; assumption about this chip, not a measured fact. A timeout built on a
+; wrong frequency is out by a factor; a timeout built on a zero
+; frequency never fires at all, and that is the case this guards.
+#GENET_HZ_FALLBACK = 54000000
+#GENET_HZ_MAX      = 1000000000
+
+; ======================================================================
+;  RETURN CODES - every one of them negative, on purpose
+; ======================================================================
+; See the 64-BIT LANGUAGE MODEL note: a register read can never be
+; negative on the paths this file uses, so a refusal is never mistaken
+; for data - not even for the all-ones a dead bus returns.
+#GENET_ERR_NONE        =   0
+#GENET_ERR_ARG         =  -1   ; a parameter was out of range
+#GENET_ERR_RANGE       =  -2   ; a register offset outside the block
+#GENET_ERR_ALIGN       =  -3   ; a register offset that was not 4-aligned
+#GENET_ERR_VERSION     =  -4   ; SYS_REV_CTRL does not say GENETv5
+#GENET_ERR_MDIO_BUSY   =  -5   ; START_BUSY never cleared - bus dead?
+#GENET_ERR_MDIO_FAIL   =  -6   ; MDIO_READ_FAIL - nothing answered
+#GENET_ERR_PHY_NONE    =  -7   ; no PHY ID at that address
+#GENET_ERR_NO_LINK     =  -8   ; the PHY reports no link
+#GENET_ERR_ANEG        =  -9   ; auto-negotiation did not complete
+#GENET_ERR_SPEED       = -10   ; a speed this MAC must not be set to
+#GENET_ERR_HALF_DUPLEX = -11   ; REFUSED - see the header, refusal 1
+#GENET_ERR_NO_MAC      = -12   ; GenetSetMac() was never called
+#GENET_ERR_NO_RXBUF    = -13   ; GenetSetRxRegion() was never called,
+                               ; or the region is too small/misaligned
+#GENET_ERR_NOT_STARTED = -14   ; GenetStart() has not succeeded
+#GENET_ERR_TX_TIMEOUT  = -15   ; the consumer index never advanced
+#GENET_ERR_RX_LONG     = -16   ; a received frame will not fit the
+                               ; caller's buffer
+#GENET_ERR_NARROW      = -17   ; a 64-bit address truncated - the canary
+#GENET_ERR_UNCITED     = -18   ; asked for something with no citation
+
+; ======================================================================
+;  STATE
+; ======================================================================
+Global genet_err.i               ; last refusal, one of the above
+Global genet_probed.i            ; GenetProbe() has succeeded
+Global genet_started.i           ; GenetStart() has succeeded
+Global genet_rev.i               ; raw SYS_REV_CTRL, as read
+
+Global genet_macSet.i            ; GenetSetMac() has been called
+Global genet_mac0.i              ; the two register images, prebuilt
+Global genet_mac1.i
+
+Global genet_rxBase.i            ; caller's RX region
+Global genet_rxBytes.i
+
+Global genet_phyAddr.i           ; where the PHY answered
+Global genet_ledsSet.i           ; 1 once GenetPhyLeds() has run
+Global genet_phyId.i             ; (PHYSID1 << 16) | PHYSID2
+Global genet_linkUp.i
+Global genet_speed.i             ; 10, 100 or 1000. Mbit/s.
+Global genet_fullDuplex.i        ; 1 full, 0 half
+
+Global genet_txIndex.i           ; our cursor into the TX descriptors
+Global genet_rxIndex.i           ; our cursor into the RX descriptors
+Global genet_cIndex.i            ; the RX consumer index we last wrote
+
+Global genet_flushAddr.i         ; the one line GenetCacheLine() acts on
+
+Global genet_txCount.i           ; instrumentation, not control
+Global genet_rxCount.i
+
+; THE FOUR NUMBERS A BENCH ASKS AFTER A LINK HAS MISBEHAVED, and every
+; one of them is counted rather than inferred. They are instrumentation
+; and nothing in this file steers on them.
+;
+;   genet_startCount    how many times GenetStart() has SUCCEEDED. Each
+;                       one resets the UniMAC and re-arms the RGMII
+;                       block, so a number above 1 says the interface
+;                       was rebuilt during the session and is the first
+;                       thing to look at when a partner reports a link
+;                       that comes and goes.
+;   genet_anegRestarts  how many times this file has written
+;                       BMCR_ANRESTART. IT SHOULD BE 0 OR 1 FOREVER.
+;                       Nothing here restarts negotiation on a timer,
+;                       on a command, or on a pump - the only writer is
+;                       GenetPhyPauseSet(), once per bring-up, and only
+;                       when the advertisement it wants differs from
+;                       the one already in the PHY. A rising count is a
+;                       link being renegotiated under a partner's feet,
+;                       which is one of the two ways to hang somebody
+;                       else's transmit queue.
+;   genet_linkDrops     how many times BMSR's LATCHED link-status bit
+;                       has been found clear while the live one was
+;                       set - i.e. the link went down and came back
+;                       between two looks. The latch is what makes this
+;                       countable at all; see GenetPhyLinkUp().
+;   genet_pauseApplied  the PAUSE_IGNORE bits GenetAdjustLink() last
+;                       OR'd into UMAC_CMD, kept so a diagnostic can
+;                       print the decision rather than re-deriving it.
+Global genet_startCount.i
+Global genet_anegRestarts.i
+Global genet_linkDrops.i
+Global genet_pauseApplied.i
+
+; ======================================================================
+;  THE CANARY - did a 64-bit address survive the compiler?
+; ======================================================================
+; pcie.pi4 exists partly because of this failure and its header records
+; the measurement: built by a 32-bit pmfc, an address above 4 GiB
+; became `movz w11, #0` with no diagnostic and the build said
+; "pmfc: OK".
+;
+; It matters HERE for a different reason than it does there. Every MMIO
+; address in this file is below 4 GiB, so register access is safe
+; either way. What is NOT safe is the DMA buffer address: a Pi 4 can
+; have 8 GB, the descriptor has a separate ADDRESS_HI word precisely
+; because buffers can live above 4 GiB, and a truncated address handed
+; to a bus master is a DMA engine writing packets over somebody else's
+; memory. That is worse than a wrong read, because nothing faults and
+; the damage lands somewhere else entirely.
+;
+; So GenetSetRxRegion() calls this, and refuses a high region on a
+; narrow build instead of quietly dropping the top half.
+;
+; The three tests are not redundant: the first catches total
+; truncation, the second catches a carry into the high word, the third
+; catches anything else at all. It touches no hardware.
+; ----------------------------------------------------------------------
+Procedure.i GenetAddrIsWide()
+  Protected a.i
+  a = $600000000
+  If a = 0
+    ProcedureReturn 0
+  EndIf
+  ; ">>" is arithmetic on a signed .i. `a` is provably positive - it is
+  ; at most 35 bits - so this is a logical shift in effect.
+  If (a >> 32) <> 6
+    ProcedureReturn 0
+  EndIf
+  If a <> $600000000
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE CLOCK - CNTPCT_EL0, so no wait here is a bare spin count
+; ======================================================================
+; INLINE ASM, AND THIS IS THE "GENUINELY IMPOSSIBLE" CASE the
+; libraries-never-intrinsics rule allows for: `mrs` reads a system
+; register and the language has no equivalent. It is one instruction,
+; it is the same pair pcie.pi4, safety.pi4 and mailbox.pi4 all use, and
+; there is no other way to ask the question.
+; ----------------------------------------------------------------------
+Procedure.i genet_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i genet_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; How many ticks is `ms` milliseconds? Falls back to 54 MHz when
+; CNTFRQ_EL0 is implausible, because firmware is free to leave it zero
+; and an unbounded wait is worse than an inaccurate one.
+; Returns 0 for ms <= 0, so a caller passing garbage gets a deadline
+; that has already expired rather than one that never fires.
+Procedure.i GenetTimeoutTicks(ms.i)
+  Protected hz.i
+  If ms <= 0
+    ProcedureReturn 0
+  EndIf
+  hz = genet_TickHz()
+  If hz <= 0 Or hz > #GENET_HZ_MAX
+    hz = #GENET_HZ_FALLBACK
+  EndIf
+  ProcedureReturn (hz / 1000) * ms
+EndProcedure
+
+; Ticks since `start`. CNTPCT_EL0 is 64 bits; at 54 MHz it takes over
+; ten thousand years to wrap, so the subtraction is honest.
+Procedure.i GenetElapsed(start.i)
+  ProcedureReturn genet_Ticks() - start
+EndProcedure
+
+; Busy-wait `us` microseconds off the architectural counter.
+; U-Boot's udelay(10) and udelay(2) in the reset sequence are the only
+; users; both are settling delays for a block coming out of reset.
+Procedure genet_DelayUs(us.i)
+  Protected hz.i
+  Protected t0.i
+  Protected want.i
+  If us <= 0
+    ProcedureReturn
+  EndIf
+  hz = genet_TickHz()
+  If hz <= 0 Or hz > #GENET_HZ_MAX
+    hz = #GENET_HZ_FALLBACK
+  EndIf
+  want = (hz / 1000000) * us
+  If want < 1
+    want = 1
+  EndIf
+  t0 = genet_Ticks()
+  While (genet_Ticks() - t0) < want
+  Wend
+EndProcedure
+
+; ======================================================================
+;  REGISTER ACCESS - bounded, aligned, and 32 bits wide every time
+; ======================================================================
+; `off` is a byte offset from $FD580000, checked against the $10000
+; length the device tree gives.
+;
+; PeekN / PokeL, never a bare Peek/Poke: a bare one is EIGHT bytes on
+; this target and would straddle two registers. Half of the GENET
+; register map is index pairs and pointer pairs sitting next to each
+; other, so a 64-bit access does not merely read too much - it reads
+; two live registers at once and returns their concatenation, which
+; looks like a plausible number.
+;
+; genet_Peek returns #GENET_ERR_RANGE / #GENET_ERR_ALIGN rather than
+; faulting. Those are negative and a register value cannot be, so a
+; caller that ignores the distinction still cannot mistake one for the
+; other.
+; ----------------------------------------------------------------------
+Procedure.i genet_Peek(off.i)
+  If off < 0
+    ProcedureReturn #GENET_ERR_RANGE
+  EndIf
+  If (off & 3) <> 0
+    ProcedureReturn #GENET_ERR_ALIGN
+  EndIf
+  If (off + 4) > #GENET_SIZE
+    ProcedureReturn #GENET_ERR_RANGE
+  EndIf
+  ProcedureReturn PeekN(#GENET_BASE + off)
+EndProcedure
+
+; Returns 1 if the write happened, 0 if it was refused. A refused write
+; is the case worth catching: it means an offset was computed wrongly,
+; and the alternative to refusing is a store into whatever else lives
+; at $FD580000 + garbage.
+Procedure.i genet_Poke(off.i, value.i)
+  If off < 0
+    genet_err = #GENET_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  If (off & 3) <> 0
+    genet_err = #GENET_ERR_ALIGN
+    ProcedureReturn 0
+  EndIf
+  If (off + 4) > #GENET_SIZE
+    genet_err = #GENET_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  PokeL(#GENET_BASE + off, value & $FFFFFFFF)
+  ProcedureReturn 1
+EndProcedure
+
+; Read-modify-write: clear the bits in `clr`, then set the bits in
+; `set`. This is clrsetbits_32() and it exists for the same reason the
+; watchdog's PM_RSTC access does - EXT_RGMII_OOB_CTRL and UMAC_CMD both
+; carry bits this file does not own, and a blind write is how you
+; discover that six months later.
+Procedure.i genet_Modify(off.i, clr.i, set.i)
+  Protected v.i
+  v = genet_Peek(off)
+  If v < 0
+    genet_err = v
+    ProcedureReturn 0
+  EndIf
+  v = (v & (~clr)) | set
+  ProcedureReturn genet_Poke(off, v)
+EndProcedure
+
+; ======================================================================
+;  CACHE MAINTENANCE - one line, then a range
+; ======================================================================
+; The shape is mailbox.pi4:494-533's, for the same reason: the other
+; party is a bus master beyond the point of coherency, so the line must
+; be pushed out AND dropped, which is `civac` and not `cvau`.
+;
+; "ldr x9", not "ldr w9". genet_flushAddr is a .i and a .i is eight
+; bytes here; loading it with ldr w9 would silently lose the top half
+; of an address - and on a machine where a buffer can legitimately live
+; above 4 GiB that is not theoretical.
+; ----------------------------------------------------------------------
+Procedure genet_CacheLine()
+  ASM
+    adrp x9, global_genet_flushaddr
+    add  x9, x9, #:lo12:global_genet_flushaddr
+    ldr  x9, [x9]
+    dc civac, x9
+  EndASM
+EndProcedure
+
+; Clean+invalidate every line the range [addr, addr+len) touches, then
+; one barrier for the whole range.
+;
+; The start is rounded DOWN and the end UP, which is what U-Boot does
+; at [U:276-288] and for the same reason: a partial line still has to
+; be maintained. Rounding out can only touch neighbouring lines, and a
+; clean-and-invalidate of a neighbour costs a refill and loses nothing,
+; because civac writes back dirty data before dropping the line.
+;
+; Round down by shifting, not by masking. A mask written as a 32-bit
+; literal would clear the top half of a 64-bit address along with the
+; low six bits. The address is physical and therefore positive, so the
+; arithmetic shift is a logical one.
+Procedure genet_CacheRange(addr.i, len.i)
+  Protected a.i
+  Protected e.i
+  If len <= 0
+    ProcedureReturn
+  EndIf
+  a = (addr / #GENET_CACHE_LINE) * #GENET_CACHE_LINE
+  e = addr + len
+  While a < e
+    genet_flushAddr = a
+    genet_CacheLine()
+    a = a + #GENET_CACHE_LINE
+  Wend
+  a64_barrier()                  ; dsb sy + isb
+EndProcedure
+
+; ======================================================================
+;  PROBE - is this a GENETv5, and is anything there at all?
+; ======================================================================
+; ONE 32-BIT READ, AND IT IS THE MILESTONE FOR THIS WHOLE FILE. Like
+; dwc2's GSNPSID, SYS_REV_CTRL is a hardwired identity register at
+; offset zero of the block: no clock to enable, no reset to release, no
+; PHY, no link, no firmware. If this returns the right nibble then the
+; block is present, powered, clocked, and reachable at the address the
+; device tree arithmetic produced - four separate assumptions settled
+; by one PeekN.
+;
+; Returns 1, or 0 with GenetError() set. Idempotent.
+;
+; ALL-ONES AND ALL-ZEROS ARE CALLED OUT SEPARATELY from a wrong version
+; because they mean different things: all-ones is the classic "nothing
+; decodes this address", all-zeros is "something decodes it but the
+; block is held in reset or unpowered". Both come back as
+; #GENET_ERR_VERSION, but GenetRevision() keeps the raw word so a human
+; can tell which happened.
+; ----------------------------------------------------------------------
+Procedure.i GenetProbe()
+  Protected reg.i
+  Protected major.i
+
+  genet_err = #GENET_ERR_NONE
+
+  reg = genet_Peek(#GENET_SYS_REV_CTRL)
+  If reg < 0
+    genet_err = reg
+    ProcedureReturn 0
+  EndIf
+  genet_rev = reg
+
+  ; [U:638] major = (reg >> 24) & 0x0f;  [U:639] if (major != 6) fail.
+  ; SIX means v5. See the note at #GENET_REV_MAJOR_V5.
+  major = (reg >> #GENET_REV_MAJOR_SHIFT) & #GENET_REV_MAJOR_MASK
+  If major <> #GENET_REV_MAJOR_V5
+    genet_err = #GENET_ERR_VERSION
+    genet_probed = 0
+    ProcedureReturn 0
+  EndIf
+
+  genet_probed = 1
+  ProcedureReturn 1
+EndProcedure
+
+; The raw SYS_REV_CTRL word, for printing. 0 until GenetProbe() runs.
+Procedure.i GenetRevision()
+  ProcedureReturn genet_rev
+EndProcedure
+
+; The minor revision nibble. [U:645] prints (reg >> 16) & 0x0f.
+Procedure.i GenetRevisionMinor()
+  ProcedureReturn (genet_rev >> #GENET_REV_MINOR_SHIFT) & #GENET_REV_MINOR_MASK
+EndProcedure
+
+; ======================================================================
+;  MDIO
+; ======================================================================
+; The whole transaction is one 32-bit register. Write the command word,
+; set START_BUSY, wait for the hardware to clear it, and for a read
+; take the low sixteen bits of what is left behind.
+;
+; U-Boot does it in two writes - the command word, then a separate
+; read-modify-write that sets START_BUSY (bcmgenet_mdio_start() at
+; [U:539-542], called from [U:557] and [U:575]). THAT ORDER IS COPIED
+; EXACTLY AND IT IS NOT AN ACCIDENT. Putting START_BUSY in the same
+; write as the address would ask the hardware to latch the command and
+; begin the transaction in one cycle, and nothing in either driver says
+; it may. Two writes cost a few nanoseconds and match a driver known to
+; work on this board.
+;
+; THE WAIT IS BOUNDED. 20 ms, from [U:559-560]. A clause-22 frame at
+; 2.5 MHz takes about 26 microseconds, so the deadline is four orders
+; of magnitude of slack and exists only to convert "the bus is dead"
+; from a hang into a return value.
+; ----------------------------------------------------------------------
+
+; Wait for START_BUSY to clear. 1 if it cleared, 0 on timeout.
+Procedure.i genet_MdioWait()
+  Protected t0.i
+  Protected budget.i
+  Protected v.i
+  t0 = genet_Ticks()
+  budget = GenetTimeoutTicks(#GENET_MDIO_TIMEOUT_MS)
+  Repeat
+    v = genet_Peek(#GENET_MDIO_CMD)
+    If v < 0
+      genet_err = v
+      ProcedureReturn 0
+    EndIf
+    If (v & #GENET_MDIO_START_BUSY) = 0
+      ProcedureReturn 1
+    EndIf
+    If (genet_Ticks() - t0) > budget
+      ProcedureReturn 0
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetMdioRead - one clause-22 read.
+;
+;  Returns 0..$FFFF, or a negative #GENET_ERR_*. The value can never be
+;  negative, so the two are always distinguishable - which is exactly
+;  the property that lets this be used inline without a separate status
+;  out-parameter.
+;
+;  MDIO_READ_FAIL IS CHECKED AND U-BOOT DOES NOT CHECK IT. [U:70]
+;  defines the bit and then [U:563-585] never looks at it; Linux does,
+;  which is why the bit exists at all. Ignoring it means an absent PHY
+;  returns $FFFF - a perfectly plausible register value, and in BMSR it
+;  would read as "link up, autoneg complete, everything supported".
+;  That is the precise shape of silent wrong answer this project exists
+;  to refuse, so the bit is tested and #GENET_ERR_MDIO_FAIL is returned
+;  instead.
+; ----------------------------------------------------------------------
+Procedure.i GenetMdioRead(phy.i, reg.i)
+  Protected cmd.i
+  Protected v.i
+
+  If phy < 0 Or phy > #GENET_PHY_ADDR_MAX
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn #GENET_ERR_ARG
+  EndIf
+  If reg < 0 Or reg > #GENET_MDIO_REG_MASK
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn #GENET_ERR_ARG
+  EndIf
+
+  ; [U:571] val = MDIO_RD | (addr << MDIO_PMD_SHIFT) | (reg << MDIO_REG_SHIFT)
+  cmd = #GENET_MDIO_RD
+  cmd = cmd | ((phy & #GENET_MDIO_PMD_MASK) << #GENET_MDIO_PMD_SHIFT)
+  cmd = cmd | ((reg & #GENET_MDIO_REG_MASK) << #GENET_MDIO_REG_SHIFT)
+  If genet_Poke(#GENET_MDIO_CMD, cmd) = 0
+    ProcedureReturn genet_err
+  EndIf
+
+  ; [U:541] setbits_32(MDIO_CMD, MDIO_START_BUSY) - a separate write.
+  If genet_Modify(#GENET_MDIO_CMD, 0, #GENET_MDIO_START_BUSY) = 0
+    ProcedureReturn genet_err
+  EndIf
+
+  If genet_MdioWait() = 0
+    genet_err = #GENET_ERR_MDIO_BUSY
+    ProcedureReturn #GENET_ERR_MDIO_BUSY
+  EndIf
+
+  v = genet_Peek(#GENET_MDIO_CMD)
+  If v < 0
+    genet_err = v
+    ProcedureReturn v
+  EndIf
+  If (v & #GENET_MDIO_READ_FAIL) <> 0
+    genet_err = #GENET_ERR_MDIO_FAIL
+    ProcedureReturn #GENET_ERR_MDIO_FAIL
+  EndIf
+
+  ProcedureReturn v & $FFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetMdioWrite - one clause-22 write. 1, or 0 with GenetError() set.
+;  [U:552-553] val = MDIO_WR | (addr << PMD) | (reg << REG) | (value & 0xffff)
+; ----------------------------------------------------------------------
+Procedure.i GenetMdioWrite(phy.i, reg.i, value.i)
+  Protected cmd.i
+
+  If phy < 0 Or phy > #GENET_PHY_ADDR_MAX
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If reg < 0 Or reg > #GENET_MDIO_REG_MASK
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+
+  cmd = #GENET_MDIO_WR
+  cmd = cmd | ((phy & #GENET_MDIO_PMD_MASK) << #GENET_MDIO_PMD_SHIFT)
+  cmd = cmd | ((reg & #GENET_MDIO_REG_MASK) << #GENET_MDIO_REG_SHIFT)
+  cmd = cmd | (value & $FFFF)
+  If genet_Poke(#GENET_MDIO_CMD, cmd) = 0
+    ProcedureReturn 0
+  EndIf
+
+  If genet_Modify(#GENET_MDIO_CMD, 0, #GENET_MDIO_START_BUSY) = 0
+    ProcedureReturn 0
+  EndIf
+
+  If genet_MdioWait() = 0
+    genet_err = #GENET_ERR_MDIO_BUSY
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE PHY
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  GenetPhyIdAt - the 32-bit identifier at one MDIO address, or a
+;  negative #GENET_ERR_*.
+;
+;  (PHYSID1 << 16) | PHYSID2. PHYSID1 carries OUI bits 3..18 and
+;  PHYSID2 the rest of the OUI plus the model and revision - IEEE
+;  802.3 clause 22.2.4.3.1, and the register numbers are [mii.h:18-19].
+;
+;  $FFFFFFFF and $00000000 both mean "nobody home": an idle MDIO bus
+;  floats high, and a held-in-reset PHY answers zeros. Both are
+;  reported as #GENET_ERR_PHY_NONE. Note that GenetMdioRead already
+;  rejects most of the all-ones case through MDIO_READ_FAIL; this is
+;  the belt to that braces, because READ_FAIL depends on the MAC
+;  noticing, and a PHY that is present but wedged will not set it.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyIdAt(phy.i)
+  Protected hi.i
+  Protected lo.i
+  Protected id.i
+
+  hi = GenetMdioRead(phy, #GENET_MII_PHYSID1)
+  If hi < 0
+    ProcedureReturn hi
+  EndIf
+  lo = GenetMdioRead(phy, #GENET_MII_PHYSID2)
+  If lo < 0
+    ProcedureReturn lo
+  EndIf
+
+  id = ((hi & $FFFF) << 16) | (lo & $FFFF)
+  If id = 0 Or id = $FFFFFFFF
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn #GENET_ERR_PHY_NONE
+  EndIf
+  ProcedureReturn id
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyScan - sweep all 32 clause-22 addresses and settle on the
+;  first that answers. Returns the address, or #GENET_ERR_PHY_NONE.
+;
+;  WHY SCAN WHEN THE DEVICE TREE ALREADY SAYS 1. Because the device
+;  tree is a claim about a board and the MDIO bus is the board. They
+;  agree on every Pi 4 anyone has seen, and the day they do not, this
+;  is what tells you - loudly, with an address - instead of the whole
+;  file failing at "no link" three procedures later.
+;
+;  ADDRESS 1 IS TRIED FIRST rather than starting at 0, so the normal
+;  case costs one transaction. A full sweep of 32 addresses at 20 ms
+;  each is 640 ms in the worst case, which is a long time to spend
+;  discovering nothing is there but is bounded and only happens on a
+;  broken board.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyScan()
+  Protected a.i
+  Protected id.i
+
+  genet_err = #GENET_ERR_NONE
+
+  id = GenetPhyIdAt(#GENET_PHY_ADDR)
+  If id > 0
+    genet_phyAddr = #GENET_PHY_ADDR
+    genet_phyId = id
+    ProcedureReturn #GENET_PHY_ADDR
+  EndIf
+
+  a = 0
+  While a <= #GENET_PHY_ADDR_MAX
+    If a <> #GENET_PHY_ADDR
+      id = GenetPhyIdAt(a)
+      If id > 0
+        genet_phyAddr = a
+        genet_phyId = id
+        ProcedureReturn a
+      EndIf
+    EndIf
+    a = a + 1
+  Wend
+
+  genet_err = #GENET_ERR_PHY_NONE
+  ProcedureReturn #GENET_ERR_PHY_NONE
+EndProcedure
+
+; Where the PHY answered, and what it said its identity was. Both are
+; 0 until GenetPhyScan() has run.
+Procedure.i GenetPhyAddress()
+  ProcedureReturn genet_phyAddr
+EndProcedure
+
+Procedure.i GenetPhyId()
+  ProcedureReturn genet_phyId
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyRestartAneg - kick auto-negotiation.
+;
+;  genphy_restart_aneg(), [P:155-171]: read BMCR, OR in ANENABLE and
+;  ANRESTART, AND OUT ISOLATE, write it back. The ISOLATE clear is the
+;  part that looks like noise and is not - a PHY left isolated is
+;  electrically disconnected from the MII and negotiates nothing, and
+;  the comment in the driver ("Don't isolate the PHY if we're
+;  negotiating") is there because somebody was bitten by it.
+;
+;  READ-MODIFY-WRITE, not a blind write of the three bits. BMCR also
+;  holds the forced speed and duplex selects, and clobbering those on a
+;  PHY the firmware may already have configured is a slow way to find
+;  out that a blind write was wrong.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  GenetPhyShadowWrite - one write into the shadow window.
+;
+;  $8000 | ((sel & $1F) << 10) | (val & $3FF), one MDIO write
+;  [C2:249-256].
+;
+;  THERE IS NO READ-MODIFY-WRITE HERE AND THAT IS DELIBERATE for the
+;  LED selectors specifically: LEDS1 holds nothing but the two source
+;  fields, so every bit of it is being set. Linux writes it the same
+;  way, whole [C1:500-502], while it read-modify-writes SCR3 and APD
+;  [C2:344-368] because those DO carry bits it is not setting. Copying
+;  the read-modify-write everywhere would look more careful and would
+;  be worse - it doubles the MDIO traffic and it makes a wedged read
+;  able to corrupt a write.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyShadowWrite(sel.i, value.i)
+  Protected v.i
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+  v = #GENET_PHY_SHD_WRITE
+  v = v | ((sel & #GENET_PHY_SHD_SEL_MASK) << #GENET_PHY_SHD_SEL_SHIFT)
+  v = v | (value & #GENET_PHY_SHD_DATA_MASK)
+  ProcedureReturn GenetMdioWrite(genet_phyAddr, #GENET_PHY_SHD, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyShadowRead - the low ten bits of one shadow register, or a
+;  negative #GENET_ERR_*.
+;
+;  Two transactions: the selector with the WRITE bit CLEAR, then a read
+;  of $1C [C2:242-246]. The upper six bits of what comes back are the
+;  selector echoed and are masked off.
+;
+;  IT EXISTS SO THE LED PROGRAMMING CAN BE READ BACK. A write to a
+;  write-only-looking window that nobody ever reads is exactly the kind
+;  of change that assembles clean and does nothing, and this file has
+;  no other way to tell those two apart.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyShadowRead(sel.i)
+  Protected v.i
+  Protected sl.i
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn #GENET_ERR_PHY_NONE
+  EndIf
+  ; One statement per line: this compiler has no line continuation, and
+  ; a call split across two lines is a parse error, not a style note.
+  sl = (sel & #GENET_PHY_SHD_SEL_MASK) << #GENET_PHY_SHD_SEL_SHIFT
+  If GenetMdioWrite(genet_phyAddr, #GENET_PHY_SHD, sl) = 0
+    ProcedureReturn #GENET_ERR_MDIO_BUSY
+  EndIf
+  v = GenetMdioRead(genet_phyAddr, #GENET_PHY_SHD)
+  If v < 0
+    ProcedureReturn v
+  EndIf
+  ProcedureReturn v & #GENET_PHY_SHD_DATA_MASK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyExpWrite - one write into the expansion window.
+;
+;  The selector to $17, then the value to $15 [C2:21-30]. `reg` is a
+;  COMPLETE selector including its bank in the high byte, which is how
+;  brcmphy.h spells these constants [B:171].
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyExpWrite(reg.i, value.i)
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+  If GenetMdioWrite(genet_phyAddr, #GENET_PHY_EXP_SEL, reg & $FFFF) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn GenetMdioWrite(genet_phyAddr, #GENET_PHY_EXP_DATA, value & $FFFF)
+EndProcedure
+
+; ======================================================================
+;  GenetPhyLeds - MAKE THE PORT'S LEDs BEHAVE LIKE A PORT'S LEDs
+; ======================================================================
+;  Returns 1, or 0 with genet_err set.
+;
+;  WHY THIS EXISTS. Until 2026-08-26 this file brought the PHY up over
+;  MDIO and never wrote a single LED register, so the jack's two LEDs
+;  sat dark through a link that was up at 1000 Mbit/s full duplex and
+;  through fourteen unicast frames that the far end's own counters
+;  confirmed it had received. The traffic was real and the port looked
+;  dead. That is not a cosmetic defect: an instrument that reports
+;  "nothing is happening" while everything is happening costs more time
+;  than the thing it was supposed to be measuring, and on the bench that
+;  day it cost exactly that.
+;
+;  WHAT IS PROGRAMMED, AND WHY IT IS THIS AND NOT SOMETHING SIMPLER.
+;  This reproduces what Linux writes for this part [C1:493-508]:
+;
+;    LEDS1  <- LED1 = MULTICOLOR1, LED3 = MULTICOLOR1
+;    EXP $0F04 <- IN_PHASE | LED1 = LINK_ACT | LED3 = LINK_ACT
+;
+;  The obvious alternative - LED1 = ACTIVITYLED, LED3 = LINKSPD1, one
+;  source per pin and no expansion register at all - is simpler to read
+;  and I did not choose it, for one reason: THE PI 4'S LEDs DEMONSTRABLY
+;  WORK UNDER LINUX, and this is the code that makes them work, so this
+;  is the only programming on this board that is known-good rather than
+;  merely plausible. The alternative is written down in the paragraph
+;  above precisely so that it is one edit away if the known-good one
+;  turns out not to light them.
+;
+;  THAT THE PI 4 TAKES THIS PATH IS CHECKED, NOT ASSUMED. The board
+;  reports PHY identifier $600D84A2 (recorded in the run log above).
+;  Linux's BCM54210E entry matches with .phy_id 0x600d84a0 and
+;  .phy_id_mask 0xfffffff0 [C1:1438-1439], and $600D84A2 & $FFFFFFF0 is
+;  $600D84A0, so the BCM54213PE on this board binds to that entry and
+;  runs bcm54xx_config_init [C1:1447], whose LED block [C1:498-508] is
+;  the code quoted above. The block is guarded only by phy_on_sfp
+;  [C1:498] and there is no SFP module on a Pi 4.
+;
+;  LEDS2 AND LED4 ARE NOT TOUCHED. Linux does not touch them either.
+;  LED4 is a shared pin that can be a 125 MHz clock output on parts in
+;  this family [B:370], and this file has established nothing about
+;  what the Pi 4 wires it to. Writing a pin whose function is unknown
+;  in order to improve a diagnostic is the wrong trade.
+;
+;  IT IS CALLED BEFORE THE LINK IS WAITED FOR, not after. The LEDs are
+;  most wanted in exactly the case where the link never comes up, and a
+;  configuration step that only runs on success is no use to the person
+;  standing at the bench wondering whether the cable is in.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyLeds()
+  Protected leds1.i
+  Protected mc.i
+
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+
+  ; $AA: MULTICOLOR1 ($A) in both four-bit fields. [C1:500-501]
+  leds1 = (#GENET_LED_SRC_MULTICOLOR << #GENET_PHY_LED_LO_SHIFT)
+  leds1 = leds1 | (#GENET_LED_SRC_MULTICOLOR << #GENET_PHY_LED_HI_SHIFT)
+  If GenetPhyShadowWrite(#GENET_PHY_SHD_LEDS1, leds1) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; $100: IN_PHASE, with LINK_ACT (zero) in both fields. [C1:504-506]
+  mc = #GENET_LED_MC_IN_PHASE
+  mc = mc | (#GENET_LED_MC_LINK_ACT << #GENET_PHY_LED_LO_SHIFT)
+  mc = mc | (#GENET_LED_MC_LINK_ACT << #GENET_PHY_LED_HI_SHIFT)
+  If GenetPhyExpWrite(#GENET_PHY_EXP_MULTICOLOR, mc) = 0
+    ProcedureReturn 0
+  EndIf
+
+  genet_ledsSet = 1
+  ProcedureReturn 1
+EndProcedure
+
+; The LEDS1 shadow register as the PHY holds it right now, or a
+; negative #GENET_ERR_*. A diagnostic prints it; see pi4GenetProbe.
+; After GenetPhyLeds() it must read $AA, and $AA read back out of a
+; window that was written blind is the difference between "the write
+; was issued" and "the PHY took it".
+Procedure.i GenetPhyLedsRaw()
+  ProcedureReturn GenetPhyShadowRead(#GENET_PHY_SHD_LEDS1)
+EndProcedure
+
+; 1 once GenetPhyLeds() has succeeded in this session.
+Procedure.i GenetLedsSet()
+  ProcedureReturn genet_ledsSet
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyRestartAneg - genphy_restart_aneg(), [P:155-170].
+;
+;  IT IS COUNTED, AND THE COUNT IS MEANT TO STAY AT ZERO OR ONE.
+;  Restarting negotiation takes a gigabit link down for two to four
+;  seconds. A driver that does it on a timer, or once per command, hands
+;  its partner a link that keeps disappearing mid-transmit, and a NIC
+;  whose transmit queue is cut off repeatedly is a NIC whose watchdog
+;  fires. Nothing in this file calls this on any schedule; the one
+;  caller is GenetPhyPauseSet(), once per bring-up, and only when the
+;  advertisement actually has to change. See genet_anegRestarts.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyRestartAneg()
+  Protected ctl.i
+
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+
+  ctl = GenetMdioRead(genet_phyAddr, #GENET_MII_BMCR)
+  If ctl < 0
+    ProcedureReturn 0
+  EndIf
+  ctl = ctl | #GENET_BMCR_ANENABLE | #GENET_BMCR_ANRESTART
+  ctl = ctl & (~#GENET_BMCR_ISOLATE)
+  If GenetMdioWrite(genet_phyAddr, #GENET_MII_BMCR, ctl) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_anegRestarts = genet_anegRestarts + 1
+  ProcedureReturn 1
+EndProcedure
+
+; How many times this file has restarted auto-negotiation. See
+; genet_anegRestarts - anything above 1 wants explaining.
+Procedure.i GenetAnegRestarts()
+  ProcedureReturn genet_anegRestarts
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyPauseSet - ADVERTISE THE PAUSE CAPABILITY THIS DRIVER
+;  ACTUALLY HAS, WHICH IS NONE.
+;
+;  This is bcmgenet_phy_pause_set() [M:136-145], with the vendor's two
+;  parameters frozen at this file's #GENET_PAUSE_RX / #GENET_PAUSE_TX.
+;  Linux writes
+;      linkmode_mod_bit(Pause_BIT,      advertising, rx);
+;      linkmode_mod_bit(Asym_Pause_BIT, advertising, rx | tx);
+;      phy_start_aneg(phydev);
+;  and with rx = 0 and tx = 0 both bits come out CLEAR, which is exactly
+;  the advertisement this driver is entitled to make. THE WHOLE
+;  ARGUMENT IS AT THE PAUSE PROMISE, above the two constants.
+;
+;  WHY IT WRITES THE ADVERTISEMENT AT ALL, given that
+;  CMD_TX_PAUSE_IGNORE already makes a PAUSE frame impossible. Because
+;  the two have to agree. A PHY left advertising Pause by a previous
+;  boot, by the firmware, or by whatever ran before us is a board
+;  telling the partner "send me PAUSE and I will honour it" while the
+;  MAC is configured to ignore every one - a lie on the wire, and the
+;  kind that only shows up as somebody else's throughput collapsing.
+;  One MDIO read settles whether there is anything to do.
+;
+;  IT RESTARTS NEGOTIATION ONLY IF THE ADVERTISEMENT CHANGED, and that
+;  rule is the vendor's, not a caution invented here: genphy_config_aneg
+;  restarts only when genphy_config_advert reports a change ([P:182-216],
+;  `if (result > 0) result = genphy_restart_aneg(phydev)`). On a board
+;  whose PHY comes out of reset with the pause bits clear - which is
+;  every cold boot seen on this bench - THIS PROCEDURE WRITES NOTHING
+;  AND COSTS ONE MDIO READ. Linux's phy_start_aneg would restart
+;  unconditionally; U-Boot's rule is followed instead, deliberately,
+;  because an unconditional restart is a link flap on every bring-up and
+;  a link flap is one of the two ways this driver could hang a partner's
+;  transmit queue. That departure is stated rather than silent.
+;
+;  Returns 1 when the advertisement is in the state this driver wants -
+;  including when it already was - and 0 with GenetError() set if MDIO
+;  refused.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyPauseSet()
+  Protected adv.i
+  Protected want.i
+
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+
+  adv = GenetMdioRead(genet_phyAddr, #GENET_MII_ADVERTISE)
+  If adv < 0
+    ProcedureReturn 0
+  EndIf
+
+  ; [M:140-142]. Pause from rx; Asym_Pause from rx | tx.
+  want = adv & (~#GENET_ADVERTISE_PAUSE_MASK)
+  If #GENET_PAUSE_RX <> 0
+    want = want | #GENET_ADVERTISE_PAUSE_CAP
+  EndIf
+  If #GENET_PAUSE_RX <> 0 Or #GENET_PAUSE_TX <> 0
+    want = want | #GENET_ADVERTISE_PAUSE_ASYM
+  EndIf
+
+  ; Nothing to say, so say nothing and leave the link alone. [P:182-216]
+  If want = adv
+    ProcedureReturn 1
+  EndIf
+
+  If GenetMdioWrite(genet_phyAddr, #GENET_MII_ADVERTISE, want) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn GenetPhyRestartAneg()
+EndProcedure
+
+; MII_ADVERTISE and MII_LPA as they stand, for a diagnostic that wants to
+; print what each end asked for. Raw registers; the caller masks with
+; #GENET_ADVERTISE_PAUSE_MASK if the pause pair is what it is after.
+Procedure.i GenetPauseAdvert()
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn #GENET_ERR_PHY_NONE
+  EndIf
+  ProcedureReturn GenetMdioRead(genet_phyAddr, #GENET_MII_ADVERTISE)
+EndProcedure
+
+Procedure.i GenetPauseLpa()
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn #GENET_ERR_PHY_NONE
+  EndIf
+  ProcedureReturn GenetMdioRead(genet_phyAddr, #GENET_MII_LPA)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyLinkUp - is the link up RIGHT NOW?
+;
+;  BMSR IS READ TWICE AND THE SECOND READ IS THE ANSWER. This is not
+;  defensive programming, it is the register's definition: BMSR.2 Link
+;  Status is LATCHING LOW. Once the link has dropped, the bit reads 0
+;  until it is read, and only then does it show the current state. A
+;  single read of a link that dropped and came back reports "down".
+;
+;  genphy_update_link() does exactly this at [P:284-290], with the
+;  comment "Read the link a second time to clear the latched state".
+;
+;  AND THE LATCH IS ALSO A LINK-DROP DETECTOR, WHICH IS WHY THE FIRST
+;  READ IS NOT THROWN AWAY ANY MORE. The first read is the state SINCE
+;  ANYBODY LAST LOOKED and the second is the state NOW. First clear and
+;  second set means the link went down and came back in between, and
+;  that is the only way software with no interrupt can see a flap at
+;  all. It is counted into genet_linkDrops and reported by
+;  GenetLinkDrops(). Nothing steers on it.
+;
+;  THE COUNT IS A FLOOR, NOT A TOTAL, and saying so is the point. The
+;  latch collapses any number of drops between two reads into one, and
+;  this procedure is only called when something asks. A count of 0 means
+;  "no drop was seen between the looks that happened", not "the link
+;  never dropped"; a count above 0 is hard evidence that it did.
+;
+;  Returns 1, 0, or a negative #GENET_ERR_*. Callers must test for
+;  negative BEFORE testing for zero, or a dead MDIO bus reads as "link
+;  is down" - which is a plausible-looking answer to the wrong
+;  question.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyLinkUp()
+  Protected v.i
+  Protected latched.i
+
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn #GENET_ERR_PHY_NONE
+  EndIf
+
+  latched = GenetMdioRead(genet_phyAddr, #GENET_MII_BMSR)
+  If latched < 0
+    ProcedureReturn latched
+  EndIf
+  v = GenetMdioRead(genet_phyAddr, #GENET_MII_BMSR)
+  If v < 0
+    ProcedureReturn v
+  EndIf
+
+  If (v & #GENET_BMSR_LSTATUS) <> 0
+    If (latched & #GENET_BMSR_LSTATUS) = 0
+      genet_linkDrops = genet_linkDrops + 1
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; How many times a link drop has been CAUGHT IN THE LATCH. A floor, not
+; a total - see GenetPhyLinkUp().
+Procedure.i GenetLinkDrops()
+  ProcedureReturn genet_linkDrops
+EndProcedure
+
+; How many times GenetStart() has succeeded. Every one of them resets
+; the UniMAC and re-arms the RGMII block.
+Procedure.i GenetStartCount()
+  ProcedureReturn genet_startCount
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyWaitLink - wait up to `ms` for a link, bounded.
+;
+;  1 if the link came up, 0 if it did not (with #GENET_ERR_NO_LINK or
+;  #GENET_ERR_ANEG), negative propagated from MDIO.
+;
+;  THE TIMEOUT IS THE CALLER'S because there is no citable number for
+;  it here. U-Boot's genphy_update_link waits CONFIG_PHY_ANEG_TIMEOUT
+;  ([P:243]) and that value lives in a Kconfig this project does not
+;  have a copy of. Inventing "4 seconds because that is usually the
+;  default" would be an uncited constant dressed as a fact, so it is a
+;  parameter. Gigabit auto-negotiation takes on the order of two to
+;  four seconds from a cold link, and rather longer if the far end is
+;  an old switch that does parallel detection.
+;
+;  IT WAITS FOR ANEG COMPLETE, NOT JUST FOR LINK, when the PHY says it
+;  can auto-negotiate. Link can assert before negotiation finishes and
+;  the speed read at that moment is whatever was left over from last
+;  time. [P:239-273] makes the same distinction.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyWaitLink(ms.i)
+  Protected t0.i
+  Protected budget.i
+  Protected bmsr.i
+  Protected canAneg.i
+
+  If ms <= 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+
+  bmsr = GenetMdioRead(genet_phyAddr, #GENET_MII_BMSR)
+  If bmsr < 0
+    ProcedureReturn bmsr
+  EndIf
+  canAneg = 0
+  If (bmsr & #GENET_BMSR_ANEGCAPABLE) <> 0
+    canAneg = 1
+  EndIf
+
+  t0 = genet_Ticks()
+  budget = GenetTimeoutTicks(ms)
+
+  Repeat
+    bmsr = GenetMdioRead(genet_phyAddr, #GENET_MII_BMSR)
+    If bmsr < 0
+      ProcedureReturn bmsr
+    EndIf
+    bmsr = GenetMdioRead(genet_phyAddr, #GENET_MII_BMSR)
+    If bmsr < 0
+      ProcedureReturn bmsr
+    EndIf
+
+    If (bmsr & #GENET_BMSR_LSTATUS) <> 0
+      If canAneg = 0
+        ProcedureReturn 1
+      EndIf
+      If (bmsr & #GENET_BMSR_ANEGCOMPLETE) <> 0
+        ProcedureReturn 1
+      EndIf
+    EndIf
+
+    If (genet_Ticks() - t0) > budget
+      Break
+    EndIf
+  ForEver
+
+  ; Report WHICH half failed. "No link" and "link but negotiation never
+  ; finished" are different faults with different cables behind them,
+  ; and collapsing them into one code costs the next person an hour.
+  If (bmsr & #GENET_BMSR_LSTATUS) <> 0
+    genet_err = #GENET_ERR_ANEG
+  Else
+    genet_err = #GENET_ERR_NO_LINK
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetPhyResolve - what speed and duplex did the two ends agree on?
+;
+;  This is genphy_parse_link()'s auto-negotiation branch, [P:295-350],
+;  reproduced step for step:
+;
+;    1. baseline 10 Mbit/s half duplex                        [P:322-323]
+;    2. gigabit: gblpa = STAT1000 & (CTRL1000 << 2)           [P:310-318]
+;       If either 1000 bit survives, the speed is 1000 and the
+;       duplex is full only if LPA_1000FULL survived.  Return.  [P:326-334]
+;    3. otherwise lpa = ADVERTISE & LPA                       [P:336-337]
+;       100 if either 100 bit survives, full if LPA_100FULL   [P:339-344]
+;       else full duplex if LPA_10FULL                        [P:345-346]
+;
+;  THE AND IS THE WHOLE ALGORITHM AND IT IS EASY TO GET BACKWARDS. What
+;  the link runs at is the intersection of what WE advertised and what
+;  THEY advertised - not what they claim to support, and not what we
+;  claim to support. Reading only LPA gives the partner's advertisement
+;  and would happily conclude "gigabit" on a link where our own gigabit
+;  advertisement was switched off.
+;
+;  The CTRL1000 << 2 in step 2 is not a trick: ADVERTISE_1000FULL $0200
+;  and LPA_1000FULL $0800 are the same bit two positions apart
+;  ([mii.h:152] against [mii.h:163]), so one shift lines the two
+;  registers up. Confirmed for the HALF pair too: $0100 << 2 = $0400.
+;
+;  STEP 4 OF THE DRIVER IS DELIBERATELY NOT HERE. [P:352-364] falls
+;  back to MII_ESTATUS when the 1000BASE-T registers are absent
+;  (BMSR_ESTATEN set and BMSR_ERCAP clear). That path exists for
+;  1000BASE-X and for PHYs with no MMD; this PHY is a plain
+;  1000BASE-T part with the clause-22 gigabit registers present, so the
+;  fallback cannot fire. Writing it would mean adding MII_ESTATUS and
+;  four ESTATUS_* constants that no path here can reach, and dead
+;  constants are how a register map rots.
+;
+;  Returns 1 on success with GenetSpeed() and GenetFullDuplex() set,
+;  or 0/negative. Requires the link to be up; it does not check, on
+;  purpose, because the caller has just been told by GenetPhyWaitLink
+;  and reading these registers on a down link is harmless.
+; ----------------------------------------------------------------------
+Procedure.i GenetPhyResolve()
+  Protected gbctl.i
+  Protected gbsta.i
+  Protected gblpa.i
+  Protected adv.i
+  Protected lpa.i
+
+  If genet_phyAddr < 0
+    genet_err = #GENET_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+
+  ; The baseline. [P:322-323]
+  genet_speed = 10
+  genet_fullDuplex = 0
+
+  ; --- gigabit -------------------------------------------------------
+  gbsta = GenetMdioRead(genet_phyAddr, #GENET_MII_STAT1000)
+  If gbsta < 0
+    ProcedureReturn 0
+  EndIf
+  gbctl = GenetMdioRead(genet_phyAddr, #GENET_MII_CTRL1000)
+  If gbctl < 0
+    ProcedureReturn 0
+  EndIf
+  gblpa = gbsta & (gbctl << #GENET_CTRL1000_TO_LPA_SHIFT)
+
+  If (gblpa & (#GENET_LPA_1000FULL | #GENET_LPA_1000HALF)) <> 0
+    genet_speed = 1000
+    If (gblpa & #GENET_LPA_1000FULL) <> 0
+      genet_fullDuplex = 1
+    EndIf
+    ProcedureReturn 1
+  EndIf
+
+  ; --- 100 and 10 ----------------------------------------------------
+  adv = GenetMdioRead(genet_phyAddr, #GENET_MII_ADVERTISE)
+  If adv < 0
+    ProcedureReturn 0
+  EndIf
+  lpa = GenetMdioRead(genet_phyAddr, #GENET_MII_LPA)
+  If lpa < 0
+    ProcedureReturn 0
+  EndIf
+  lpa = adv & lpa
+
+  If (lpa & (#GENET_LPA_100FULL | #GENET_LPA_100HALF)) <> 0
+    genet_speed = 100
+    If (lpa & #GENET_LPA_100FULL) <> 0
+      genet_fullDuplex = 1
+    EndIf
+  ElseIf (lpa & #GENET_LPA_10FULL) <> 0
+    genet_fullDuplex = 1
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; 10, 100 or 1000, in Mbit/s. 0 until GenetPhyResolve() has run.
+Procedure.i GenetSpeed()
+  ProcedureReturn genet_speed
+EndProcedure
+
+Procedure.i GenetFullDuplex()
+  ProcedureReturn genet_fullDuplex
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetMacLinkStatus - the MAC's own opinion of the link.
+;
+;  UMAC_MODE bit 5, and it is SINGLE-SOURCE - unimac.h:43-44 and
+;  nothing else on this disk. It is here as a second opinion for a
+;  human staring at a probe listing, taken from the other side of the
+;  RGMII bus, and NOTHING IN THIS FILE MAKES A DECISION FROM IT.
+;
+;  Reading a register whose only witness is one header is fine.
+;  Steering on one is not, and the difference is the whole reason this
+;  procedure is documented instead of just existing.
+; ----------------------------------------------------------------------
+Procedure.i GenetMacLinkStatus()
+  Protected v.i
+  v = genet_Peek(#GENET_UMAC_MODE)
+  If v < 0
+    ProcedureReturn v
+  EndIf
+  If (v & #GENET_MODE_LINK_STATUS) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE MAC ADDRESS
+; ======================================================================
+; Six bytes at *mac, in wire order. Builds the two register images now
+; and writes them during GenetStart(), so a caller can set the address
+; before the block has been probed.
+;
+; [U:243-247]:
+;   reg = addr[0] << 24 | addr[1] << 16 | addr[2] << 8 | addr[3]  -> MAC0
+;   reg = addr[4] << 8  | addr[5]                                 -> MAC1
+;
+; PeekA, not PeekB. PeekB sign-extends as of 2026-08-25, so a byte of
+; $FF - and a broadcast address is six of them - would become
+; $FFFFFFFFFFFFFFFF and every OR below would fill the register with
+; ones. That is not hypothetical for this particular data.
+;
+; A MULTICAST ADDRESS IS REFUSED. Bit 0 of the first byte is the
+; individual/group bit; a station address with it set is not a valid
+; source address, frames sent from it are discarded by conformant
+; switches, and the failure is silent and remote. It is exactly the
+; sort of thing that gets typed in by hand from a datasheet example.
+; ----------------------------------------------------------------------
+Procedure.i GenetSetMac(*mac)
+  Protected b0.i
+  Protected b1.i
+  Protected b2.i
+  Protected b3.i
+  Protected b4.i
+  Protected b5.i
+
+  genet_err = #GENET_ERR_NONE
+
+  If *mac = 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+
+  b0 = PeekA(*mac + 0)
+  b1 = PeekA(*mac + 1)
+  b2 = PeekA(*mac + 2)
+  b3 = PeekA(*mac + 3)
+  b4 = PeekA(*mac + 4)
+  b5 = PeekA(*mac + 5)
+
+  If (b0 & 1) <> 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If b0 = 0 And b1 = 0 And b2 = 0 And b3 = 0 And b4 = 0 And b5 = 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+
+  genet_mac0 = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & $FFFFFFFF
+  genet_mac1 = ((b4 << 8) | b5) & $FFFF
+  genet_macSet = 1
+  ProcedureReturn 1
+EndProcedure
+
+; The two register images, for a probe to print. 0 until GenetSetMac.
+Procedure.i GenetMac0()
+  ProcedureReturn genet_mac0
+EndProcedure
+
+Procedure.i GenetMac1()
+  ProcedureReturn genet_mac1
+EndProcedure
+
+; ======================================================================
+;  THE RX REGION
+; ======================================================================
+; 512 KiB - 256 descriptors of 2048 bytes - supplied by the caller.
+;
+; WHY NOT A `Global Dim` HERE. Half a megabyte of BSS would be imposed
+; on every program that so much as includes this file to read
+; SYS_REV_CTRL. The U-Boot driver embeds the array in its private
+; structure because U-Boot allocates that structure only when the
+; device probes; there is no equivalent here, so the caller owns the
+; memory and says where it is.
+;
+; THE SIZE IS CHECKED, and it has to be, because the failure mode of
+; getting it wrong is a bus master writing 512 KiB over whatever came
+; after a smaller buffer. Nothing in the language can check a pointer's
+; extent, so the length is a parameter and a short one is refused. An
+; unchecked buffer here would corrupt memory the CPU never wrote and
+; the fault would surface somewhere with no connection to Ethernet.
+;
+; ALIGNMENT: 64 bytes, one cache line. ARCH_DMA_MINALIGN in the driver
+; ([U:185] `__aligned(ARCH_DMA_MINALIGN)`), which is 64 on ARMv8.
+; Misaligned, the cache maintenance at each end of the region would
+; touch a line that belongs to somebody else's dirty data. Each 2048-
+; byte buffer within an aligned region is then aligned for free.
+; ----------------------------------------------------------------------
+Procedure.i GenetSetRxRegion(base.i, bytes.i)
+  genet_err = #GENET_ERR_NONE
+
+  If base <= 0
+    genet_err = #GENET_ERR_NO_RXBUF
+    ProcedureReturn 0
+  EndIf
+  If (base & (#GENET_CACHE_LINE - 1)) <> 0
+    genet_err = #GENET_ERR_NO_RXBUF
+    ProcedureReturn 0
+  EndIf
+  If bytes < #GENET_RX_TOTAL_BYTES
+    genet_err = #GENET_ERR_NO_RXBUF
+    ProcedureReturn 0
+  EndIf
+
+  ; The canary. A region above 4 GiB on a build that truncated the
+  ; address would be handed to the DMA engine as its low half, and the
+  ; controller would then write received frames into low memory - which
+  ; on this board is the firmware spin table and three parked cores.
+  ; Refuse instead.
+  If (base >> 32) <> 0
+    If GenetAddrIsWide() = 0
+      genet_err = #GENET_ERR_NARROW
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  genet_rxBase = base
+  genet_rxBytes = bytes
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  BRING-UP
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  GenetInterfaceSet - tell the SYS block there is an external GPHY.
+;
+;  [U:605-620] bcmgenet_interface_set(): for RGMII and RGMII_RXID,
+;  write PORT_MODE_EXT_GPHY to SYS_PORT_CTRL. Everything else is
+;  refused by the driver with "unknown phy mode".
+;
+;  This board is rgmii-rxid (bcm2711-rpi-4-b.dts:198), so the branch
+;  taken is the one that exists. There is no mode parameter here
+;  because there is no other mode this board can be in; adding one
+;  would be inventing a general driver to run against a soldered-down
+;  configuration.
+; ----------------------------------------------------------------------
+Procedure.i GenetInterfaceSet()
+  ProcedureReturn genet_Poke(#GENET_SYS_PORT_CTRL, #GENET_PORT_MODE_EXT_GPHY)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetUmacReset - the UniMAC reset sequence, [U:199-234], in order.
+;
+;  THE ORDER IS THE WHOLE THING and it is not obvious from the
+;  register names, so it is spelled out:
+;
+;    1. RBUF flush: set bit 1, wait 10 us, clear bit 1, wait 10 us,
+;       write zero, wait 10 us. Three writes and three delays for what
+;       looks like one operation. [U:203-212]
+;    2. UMAC_CMD = 0 - stop the MAC before reconfiguring it. [U:215]
+;    3. UMAC_CMD = SW_RESET | LCL_LOOP_EN, wait 2 us, UMAC_CMD = 0.
+;       [U:217-219]. THE LOOPBACK BIT IS NOT A TEST MODE HERE. The
+;       driver's own comment at [U:657] says why: "issue soft reset
+;       with (rg)mii loopback to ensure a stable rxclk". The MAC needs
+;       a receive clock to come out of reset cleanly and the PHY may
+;       not be supplying one yet, so it borrows its own. Dropping
+;       LCL_LOOP_EN because "we do not want loopback" is the mistake
+;       this note exists to prevent.
+;    4. MIB counters reset, then released. [U:222-224]
+;    5. UMAC_MAX_FRAME_LEN = 1536. [U:226]
+;    6. RBUF_CTRL |= ALIGN_2B - read-modify-write, [U:229-231].
+;    7. RBUF_TBUF_SIZE_CTRL = 1. [U:233]
+;
+;  Step 1's first two writes are read-modify-write in the driver
+;  (`reg = readl(...); reg |= BIT(1)`), and are so here.
+;
+;  Returns 1, or 0 with GenetError() set.
+; ----------------------------------------------------------------------
+Procedure.i GenetUmacReset()
+  ; 1. the RBUF flush dance
+  If genet_Modify(#GENET_SYS_RBUF_FLUSH_CTRL, 0, $00000002) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_DelayUs(10)
+  If genet_Modify(#GENET_SYS_RBUF_FLUSH_CTRL, $00000002, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_DelayUs(10)
+  If genet_Poke(#GENET_SYS_RBUF_FLUSH_CTRL, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_DelayUs(10)
+
+  ; 2. stop the MAC
+  If genet_Poke(#GENET_UMAC_CMD, 0) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 3. soft reset WITH local loopback - see the note above
+  If genet_Poke(#GENET_UMAC_CMD, #GENET_CMD_SW_RESET | #GENET_CMD_LCL_LOOP_EN) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_DelayUs(2)
+  If genet_Poke(#GENET_UMAC_CMD, 0) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 4. clear the MIB counters
+  If genet_Poke(#GENET_UMAC_MIB_CTRL, #GENET_MIB_RESET_ALL) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_UMAC_MIB_CTRL, 0) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 5. the frame length limit
+  If genet_Poke(#GENET_UMAC_MAX_FRAME_LEN, #GENET_MAX_MTU_SIZE) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 6. two-byte IP alignment - read-modify-write, [U:229-231]
+  If genet_Modify(#GENET_RBUF_CTRL, 0, #GENET_RBUF_ALIGN_2B) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 7. [U:233] writel(1, RBUF_TBUF_SIZE_CTRL). The driver gives this
+  ;    bare 1 no name and no comment, and neither Linux header defines
+  ;    a symbol for the field. IT IS COPIED AS A LITERAL AND THAT IS
+  ;    THE HONEST STATE OF IT: the value is cited, its meaning is not.
+  If genet_Poke(#GENET_RBUF_TBUF_SIZE_CTRL, 1) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetWriteHwAddr - the address into UMAC_MAC0/MAC1. [U:236-250]
+; ----------------------------------------------------------------------
+Procedure.i GenetWriteHwAddr()
+  If genet_macSet = 0
+    genet_err = #GENET_ERR_NO_MAC
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_UMAC_MAC0, genet_mac0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_UMAC_MAC1, genet_mac1) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetDisableDma - [U:252-260]. Clear DMA_EN on both engines, then
+;  pulse UMAC_TX_FLUSH.
+;
+;  clrbits, not a blind zero: DMA_CTRL's upper bits are the per-ring
+;  enables and this only turns the engine off, leaving the ring
+;  configuration where it was.
+; ----------------------------------------------------------------------
+Procedure.i GenetDisableDma()
+  If genet_Modify(#GENET_TDMA_CTRL, #GENET_DMA_EN, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Modify(#GENET_RDMA_CTRL, #GENET_DMA_EN, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_UMAC_TX_FLUSH, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_DelayUs(10)
+  If genet_Poke(#GENET_UMAC_TX_FLUSH, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetEnableDma - [U:262-269].
+;
+;  NOTE THE ASYMMETRY, IT IS IN THE DRIVER AND IT IS COPIED. TX gets a
+;  plain write of the value; RX gets setbits_32 of the same value. A
+;  tidier version would use the same operation for both and would be
+;  changing behaviour on a working driver for the sake of symmetry.
+; ----------------------------------------------------------------------
+Procedure.i GenetEnableDma()
+  If genet_Poke(#GENET_TDMA_CTRL, #GENET_DMA_CTRL_ENABLE) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Modify(#GENET_RDMA_CTRL, 0, #GENET_DMA_CTRL_ENABLE) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetRxRingInit - [U:397-417].
+;
+;  THE ONE THING IN HERE THAT IS NOT A TRANSCRIPTION IS ALSO THE ONE
+;  THING MOST LIKELY TO BE MISREAD, so the driver's own comment is
+;  quoted: "cannot init RDMA_PROD_INDEX to 0, so align RDMA_CONS_INDEX
+;  on it instead" ([U:408]). The producer index is written by the
+;  HARDWARE and is not resettable by software; a driver that assumed it
+;  started at zero would think 65535 frames were waiting. So we READ it
+;  and adopt whatever it says as our starting consumer index. The
+;  descriptor cursor is the low eight bits of that same value
+;  ([U:411-412]).
+;
+;  DMA_START_ADDR and DMA_END_ADDR are in 32-BIT WORDS, not bytes - see
+;  #GENET_DMA_END_ADDR_VALUE.
+; ----------------------------------------------------------------------
+Procedure.i GenetRxRingInit()
+  Protected p.i
+
+  If genet_Poke(#GENET_RDMA_SCB_BURST_SIZE, #GENET_DMA_MAX_BURST_LENGTH) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_RDMA_START_ADDR, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_RDMA_READ_PTR, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_RDMA_WRITE_PTR, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_RDMA_END_ADDR, #GENET_DMA_END_ADDR_VALUE) = 0
+    ProcedureReturn 0
+  EndIf
+
+  p = genet_Peek(#GENET_RDMA_PROD_INDEX)
+  If p < 0
+    genet_err = p
+    ProcedureReturn 0
+  EndIf
+  genet_cIndex = p
+  If genet_Poke(#GENET_RDMA_CONS_INDEX, genet_cIndex) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_rxIndex = p & $FF
+
+  If genet_Poke(#GENET_RDMA_RING_BUF_SIZE, #GENET_RING_BUF_SIZE_VALUE) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_RDMA_XON_XOFF_THRESH, #GENET_DMA_FC_THRESH_VALUE) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_RDMA_RING_CFG, #GENET_DMA_RING_CFG_Q16) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetRxDescsInit - point all 256 RX descriptors at the caller's
+;  region and hand them to the hardware. [U:379-395].
+;
+;  len_stat = (RX_BUF_LENGTH << 16) | DMA_OWN, i.e. #GENET_RX_DESC_INIT.
+;  DMA_OWN is what says "the hardware may write this one".
+;
+;  THE ADDRESS IS SPLIT ACROSS TWO REGISTERS and both are written even
+;  when the high half is zero. Leaving ADDRESS_HI alone would inherit
+;  whatever the firmware or a previous run left there, and a stale
+;  high half on a buffer that is actually low is a DMA write four
+;  gigabytes away from where anybody is looking.
+; ----------------------------------------------------------------------
+Procedure.i GenetRxDescsInit()
+  Protected i.i
+  Protected d.i
+  Protected buf.i
+
+  If genet_rxBase = 0
+    genet_err = #GENET_ERR_NO_RXBUF
+    ProcedureReturn 0
+  EndIf
+
+  i = 0
+  While i < #GENET_RX_DESCS
+    d = #GENET_RX_OFF + (i * #GENET_DESC_SIZE)
+    buf = genet_rxBase + (i * #GENET_RX_BUF_LENGTH)
+    If genet_Poke(d + #GENET_DESC_ADDRESS_LO, buf & $FFFFFFFF) = 0
+      ProcedureReturn 0
+    EndIf
+    If genet_Poke(d + #GENET_DESC_ADDRESS_HI, (buf >> 32) & $FFFFFFFF) = 0
+      ProcedureReturn 0
+    EndIf
+    If genet_Poke(d + #GENET_DESC_LENGTH_STATUS, #GENET_RX_DESC_INIT) = 0
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+
+  ; The whole region is about to be written by a bus master. Drop every
+  ; line we might be holding so a later read does not serve a stale
+  ; one. This is the expensive call in the file - 8192 cache
+  ; operations - and it happens once, at start.
+  genet_CacheRange(genet_rxBase, #GENET_RX_TOTAL_BYTES)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetTxRingInit - [U:419-439]. The mirror of the RX case, with the
+;  producer/consumer roles swapped: on TX it is the CONSUMER index the
+;  hardware owns, so that is the one read and adopted ([U:429-432]).
+;
+;  The RING_BUF_SIZE oddity is here. See the header.
+; ----------------------------------------------------------------------
+Procedure.i GenetTxRingInit()
+  Protected c.i
+
+  If genet_Poke(#GENET_TDMA_SCB_BURST_SIZE, #GENET_DMA_MAX_BURST_LENGTH) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_START_ADDR, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_READ_PTR, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_WRITE_PTR, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_END_ADDR, #GENET_DMA_END_ADDR_VALUE) = 0
+    ProcedureReturn 0
+  EndIf
+
+  c = genet_Peek(#GENET_TDMA_CONS_INDEX)
+  If c < 0
+    genet_err = c
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_PROD_INDEX, c) = 0
+    ProcedureReturn 0
+  EndIf
+  genet_txIndex = c & $FF
+
+  If genet_Poke(#GENET_TDMA_MBUF_DONE_THRESH, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_FLOW_PERIOD, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_RING_BUF_SIZE, #GENET_RING_BUF_SIZE_VALUE) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(#GENET_TDMA_RING_CFG, #GENET_DMA_RING_CFG_Q16) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetAdjustLink - tell the MAC what the PHY negotiated. [U:441-471].
+;
+;  THIS IS WHERE THE HALF-DUPLEX REFUSAL LIVES, and the reason is worth
+;  having in front of the code rather than only in the header.
+;
+;  The cited driver does three things here: map the speed onto the
+;  UMAC_SPEED_* encoding ([U:446-459]); clear OOB_DISABLE and set
+;  RGMII_LINK | RGMII_MODE_EN in EXT_RGMII_OOB_CTRL ([U:461-462]); set
+;  ID_MODE_DIS for RGMII and RGMII_RXID ([U:464-466]); and write the
+;  speed field to UMAC_CMD ([U:468]).
+;
+;  IT NEVER MENTIONS DUPLEX. Linux does - CMD_HD_EN together with
+;  CMD_RX_PAUSE_IGNORE and CMD_TX_PAUSE_IGNORE when the link is not
+;  full duplex ([M:44-47]). Following U-Boot on a half-duplex link
+;  therefore leaves a MAC configured for full duplex on a wire that is
+;  not, and the result is collisions and terrible throughput rather
+;  than an error - a silent wrong answer, which is the one outcome this
+;  project refuses to ship.
+;
+;  THE HALF-DUPLEX HALF OF THAT FIX IS STILL NOT ENABLED - CMD_HD_EN
+;  is written nowhere and the refusal stands, because a half-duplex
+;  link cannot be tested here. Turn it on when a board and a
+;  half-duplex partner exist to prove it, and delete the refusal in the
+;  same commit. What that used to say about "pause-frame handling this
+;  file does not implement" was the mistake: NOT IMPLEMENTING PAUSE
+;  HANDLING AND LEAVING BOTH IGNORE BITS CLEAR IS NOT NEUTRAL - it is
+;  802.3x flow control switched fully ON, in both directions, by
+;  omission. That is now decided rather than inherited; see below.
+;
+;  THE PAUSE BITS, AND THIS IS THE 2026-09-09 FIX. Linux never enables
+;  the MAC without deciding the pair, and its manual-override path is
+;  [M:62-66]:
+;      if (!priv->rx_pause) cmd_bits |= CMD_RX_PAUSE_IGNORE;
+;      if (!priv->tx_pause) cmd_bits |= CMD_TX_PAUSE_IGNORE;
+;  This driver's pair is #GENET_PAUSE_RX = 0 and #GENET_PAUSE_TX = 0,
+;  so both bits go in on every link, and the UniMAC can neither emit a
+;  PAUSE frame nor be stopped by one. THE WHOLE ARGUMENT IS AT THE
+;  PAUSE PROMISE, beside the two constants; the short version is that a
+;  monitor with tens of seconds between visits to the receive ring
+;  cannot keep the promise a PAUSE frame makes, and on 2026-09-08 it
+;  broke a bench laptop's Ethernet card by making it anyway.
+;
+;  IT GOES IN THE SAME WRITE AS THE SPEED, not a second one, because
+;  that is what [M:79-90] does - one read-modify-write of UMAC_CMD
+;  carrying speed, duplex and pause together - and because a second
+;  write would leave a window in which the MAC is configured with flow
+;  control on. The window is microseconds and the link is not up yet;
+;  it is closed anyway, because "it is only a short window" is how this
+;  class of bug is argued into existing.
+;
+;  THE UMAC_CMD WRITE IS A BLIND WRITE AND SO IS THE DRIVER'S.
+;  [U:468] is `writel(speed << CMD_SPEED_SHIFT, UMAC_CMD)` - not a
+;  read-modify-write. That is safe HERE and only here, because the
+;  reset sequence has just left UMAC_CMD at zero and TX_EN/RX_EN are
+;  set afterwards by GenetStart(). Calling GenetAdjustLink() on a
+;  RUNNING MAC would clear those two bits and stop the interface, which
+;  is why it is not a public re-tuning entry point.
+; ----------------------------------------------------------------------
+Procedure.i GenetAdjustLink()
+  Protected speed.i
+  Protected pause.i
+
+  genet_err = #GENET_ERR_NONE
+
+  ; REFUSAL 1 - see above and the header.
+  If genet_fullDuplex = 0
+    genet_err = #GENET_ERR_HALF_DUPLEX
+    ProcedureReturn 0
+  EndIf
+
+  ; [U:446-459], plus the 2500 refusal this file adds.
+  Select genet_speed
+    Case 1000
+      speed = #GENET_UMAC_SPEED_1000
+    Case 100
+      speed = #GENET_UMAC_SPEED_100
+    Case 10
+      speed = #GENET_UMAC_SPEED_10
+    Default
+      genet_err = #GENET_ERR_SPEED
+      ProcedureReturn 0
+  EndSelect
+
+  ; [U:461-462] clrsetbits_32(EXT_RGMII_OOB_CTRL, OOB_DISABLE,
+  ;                           RGMII_LINK | RGMII_MODE_EN)
+  ; OOB_DISABLE off means the block takes its link/speed indication
+  ; from these register bits rather than from RGMII in-band signalling,
+  ; which the BCM54213PE is not configured to send.
+  If genet_Modify(#GENET_EXT_RGMII_OOB_CTRL, #GENET_OOB_DISABLE, #GENET_RGMII_LINK | #GENET_RGMII_MODE_EN) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; [U:464-466] ID_MODE_DIS for RGMII and RGMII_RXID. This board is
+  ; rgmii-rxid (bcm2711-rpi-4-b.dts:198), so it is set: the PHY adds
+  ; the RX delay and the MAC must add none. See THE PHY in the header
+  ; for why getting this backwards is the classic RGMII failure.
+  If genet_Modify(#GENET_EXT_RGMII_OOB_CTRL, 0, #GENET_ID_MODE_DIS) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; THE PAUSE PAIR. [M:62-66], with this driver's #GENET_PAUSE_RX and
+  ; #GENET_PAUSE_TX in place of the vendor's priv->rx_pause and
+  ; priv->tx_pause. Both are 0 here, so both IGNORE bits go in and the
+  ; MAC will neither send a PAUSE frame nor stop for one. THE WHOLE
+  ; ARGUMENT IS AT THE PAUSE PROMISE, and the cost of not having made
+  ; this decision is a bench laptop's Ethernet card, 2026-09-08.
+  pause = 0
+  If #GENET_PAUSE_RX = 0
+    pause = pause | #GENET_CMD_RX_PAUSE_IGNORE
+  EndIf
+  If #GENET_PAUSE_TX = 0
+    pause = pause | #GENET_CMD_TX_PAUSE_IGNORE
+  EndIf
+  genet_pauseApplied = pause
+
+  ; [U:468] the blind write - see the note above - carrying the pause
+  ; pair with it the way [M:79-90] carries it, in ONE write.
+  If genet_Poke(#GENET_UMAC_CMD, (speed << #GENET_CMD_SPEED_SHIFT) | pause) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; The PAUSE_IGNORE bits GenetAdjustLink() last put into UMAC_CMD. Both
+; set - $10000100 - is flow control off in both directions, which is
+; what this driver always wants. See THE PAUSE PROMISE.
+Procedure.i GenetPauseApplied()
+  ProcedureReturn genet_pauseApplied
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetStart - the whole bring-up, in the driver's order.
+;
+;  [U:473-514] bcmgenet_gmac_eth_start(), with the PHY steps that
+;  U-Boot delegates to phy_startup() done inline here.
+;
+;    interface set (SYS_PORT_CTRL)          [U:649] via probe
+;    umac reset                             [U:481]
+;    hardware address                       [U:483]
+;    disable DMA and flush TX               [U:486]
+;    rx ring, rx descriptors, tx ring       [U:488-491]
+;    enable DMA                             [U:494]
+;    pause advertisement                    [M:136-145] / [LD:3423]
+;    PHY startup - link and speed           [U:497]
+;    adjust link                            [U:504]
+;    UMAC_CMD |= TX_EN | RX_EN              [U:511]
+;
+;  THE PAUSE ADVERTISEMENT STEP IS LINUX'S, NOT U-BOOT'S, and it is in
+;  the position Linux puts it in - inside open(), before the interface
+;  starts carrying traffic. U-Boot reaches the same place from the other
+;  side, through phy_config()/genphy_config_aneg() before phy_startup();
+;  either way the advertisement is settled before the link is waited
+;  for, because settling it afterwards settles nothing.
+;
+;  THE LAST STEP IS setbits, NOT A WRITE. [U:511] is
+;  `setbits_32(UMAC_CMD, CMD_TX_EN | CMD_RX_EN)` and it must stay that
+;  way: GenetAdjustLink() has just put the speed field in that register
+;  and a blind write here would clear it, giving a MAC running at 10
+;  Mbit/s on a gigabit link. That combination does pass traffic, badly,
+;  which is what makes it dangerous.
+;
+;  `linkMs` is how long to wait for auto-negotiation. See
+;  GenetPhyWaitLink for why there is no default.
+;
+;  Returns 1, or 0 with GenetError() set. The failure codes worth
+;  handling separately are #GENET_ERR_NO_MAC, #GENET_ERR_NO_RXBUF,
+;  #GENET_ERR_NO_LINK (no cable) and #GENET_ERR_HALF_DUPLEX.
+; ----------------------------------------------------------------------
+Procedure.i GenetStart(linkMs.i)
+  genet_err = #GENET_ERR_NONE
+  genet_started = 0
+
+  If genet_probed = 0
+    If GenetProbe() = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  If genet_macSet = 0
+    genet_err = #GENET_ERR_NO_MAC
+    ProcedureReturn 0
+  EndIf
+  If genet_rxBase = 0
+    genet_err = #GENET_ERR_NO_RXBUF
+    ProcedureReturn 0
+  EndIf
+
+  If GenetInterfaceSet() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetUmacReset() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetWriteHwAddr() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetDisableDma() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetRxRingInit() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetRxDescsInit() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetTxRingInit() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetEnableDma() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; --- the PHY half ---------------------------------------------------
+  If genet_phyAddr = 0 And genet_phyId = 0
+    If GenetPhyScan() < 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ; The LEDs, before the link is waited for and NOT gated on the wait
+  ; succeeding - see GenetPhyLeds for why that order is the useful one.
+  ; A failure here is not fatal: an Ethernet port that works with dark
+  ; LEDs is worth more than a refusal to bring the port up, and the
+  ; failure is still legible through GenetLedsSet().
+  GenetPhyLeds()
+
+  ; THE PAUSE ADVERTISEMENT, AND IT HAS TO BE HERE - BEFORE THE WAIT.
+  ; Linux calls bcmgenet_phy_pause_set() in bcmgenet_open() ahead of
+  ; bringing the interface up ([LD:3423]), for the plain reason that an
+  ; advertisement settled after negotiation has finished is an
+  ; advertisement of nothing. On the ordinary path this writes no
+  ; register at all - the PHY already advertises no pause - and when it
+  ; does have to write, the wait below is what covers the
+  ; renegotiation. See GenetPhyPauseSet() and THE PAUSE PROMISE.
+  ;
+  ; NOT FATAL, for the same reason the LEDs are not: a board whose PHY
+  ; refuses this one MDIO write still has a working Ethernet port, the
+  ; MAC-side half of the same decision is applied unconditionally in
+  ; GenetAdjustLink() below, and the failure stays legible through
+  ; GenetError() and GenetAnegRestarts().
+  GenetPhyPauseSet()
+
+  If GenetPhyWaitLink(linkMs) = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetPhyResolve() = 0
+    ProcedureReturn 0
+  EndIf
+  genet_linkUp = 1
+
+  If GenetAdjustLink() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; [U:511] setbits - NOT a write. See the note above.
+  If genet_Modify(#GENET_UMAC_CMD, 0, #GENET_CMD_TX_EN | #GENET_CMD_RX_EN) = 0
+    ProcedureReturn 0
+  EndIf
+
+  genet_started = 1
+  genet_startCount = genet_startCount + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetStop - [U:672-679]. Clear TX_EN/RX_EN, then stop the DMA.
+;
+;  IN THAT ORDER. Stopping the DMA first would leave a MAC still
+;  accepting frames with nowhere to put them.
+; ----------------------------------------------------------------------
+Procedure.i GenetStop()
+  genet_started = 0
+  genet_linkUp = 0
+  If genet_Modify(#GENET_UMAC_CMD, #GENET_CMD_TX_EN | #GENET_CMD_RX_EN, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn GenetDisableDma()
+EndProcedure
+
+; ======================================================================
+;  TRANSMIT
+; ======================================================================
+; [U:271-314] bcmgenet_gmac_eth_send().
+;
+;   read TDMA_PROD_INDEX
+;   flush the packet out of the data cache
+;   len_stat = (length << 16) | ($3F << 7) | APPEND_CRC | SOP | EOP
+;   descriptor: ADDRESS_LO, ADDRESS_HI, then LENGTH_STATUS
+;   advance our descriptor cursor, wrapping at 256
+;   write PROD_INDEX + 1  <- this is what starts the transmission
+;   spin until TDMA_CONS_INDEX catches up, 100 tries
+;
+; THE WRITE ORDER INSIDE THE DESCRIPTOR IS LOAD-BEARING. Address first,
+; length/status LAST. The length/status word is what arms the
+; descriptor; writing it before the address would arm a descriptor
+; pointing at the previous frame's buffer, and the previous frame would
+; go out twice with the new one's length. The driver does it in this
+; order at [U:294-296] and so does this.
+;
+; THE FRAME IS NOT COPIED. The DMA engine reads the caller's buffer
+; directly, so THE BUFFER MUST STAY PUT AND UNMODIFIED UNTIL THIS
+; RETURNS. That is safe because this call is synchronous - it does not
+; return until the hardware's consumer index says the frame is gone -
+; but it is stated because the obvious "optimisation" of returning
+; early is a use-after-free waiting to happen.
+;
+; THE COMPLETION SPIN IS BOUNDED BY TIME, NOT BY 100 TRIES. U-Boot's
+; `tries = 100` at [U:278] is a bare loop count with no delay in it,
+; which means its real duration depends on the compiler and the CPU
+; clock; on an A72 at 1.5 GHz that could expire in well under a
+; microsecond, long before a 1518-byte frame has left a gigabit
+; interface. Substituting a real deadline is a DELIBERATE DEPARTURE
+; from the cited driver and it is called out here so nobody "restores"
+; it. The deadline is the caller's, for the same reason
+; GenetPhyWaitLink's is.
+;
+; ONE FRAME AT A TIME. The ring has 256 descriptors and this uses them
+; one at a time, synchronously, exactly as the driver does. Queueing
+; several and reaping them later is a real feature and it is not this;
+; nobody asked for it and it would need an interrupt or a reaper the
+; caller has to remember to call.
+; ----------------------------------------------------------------------
+Procedure.i GenetSend(*frame, length.i, timeoutMs.i)
+  Protected d.i
+  Protected prod.i
+  Protected cons.i
+  Protected lenStat.i
+  Protected t0.i
+  Protected budget.i
+  Protected addr.i
+
+  genet_err = #GENET_ERR_NONE
+
+  If genet_started = 0
+    genet_err = #GENET_ERR_NOT_STARTED
+    ProcedureReturn 0
+  EndIf
+  If *frame = 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  ; Short frames are REFUSED, not padded. See #GENET_MIN_FRAME.
+  If length < #GENET_MIN_FRAME Or length > #GENET_MAX_FRAME
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If timeoutMs <= 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+
+  addr = *frame
+  If (addr >> 32) <> 0
+    If GenetAddrIsWide() = 0
+      genet_err = #GENET_ERR_NARROW
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  prod = genet_Peek(#GENET_TDMA_PROD_INDEX)
+  If prod < 0
+    genet_err = prod
+    ProcedureReturn 0
+  EndIf
+
+  ; Push the frame out of our cache before a bus master reads it.
+  genet_CacheRange(addr, length)
+
+  ; [U:275] and [U:290-291]
+  lenStat = ((length & #GENET_DMA_BUFLENGTH_MASK) << #GENET_DMA_BUFLENGTH_SHIFT) | #GENET_TX_FLAGS
+
+  d = #GENET_TX_OFF + (genet_txIndex * #GENET_DESC_SIZE)
+  If genet_Poke(d + #GENET_DESC_ADDRESS_LO, addr & $FFFFFFFF) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(d + #GENET_DESC_ADDRESS_HI, (addr >> 32) & $FFFFFFFF) = 0
+    ProcedureReturn 0
+  EndIf
+  If genet_Poke(d + #GENET_DESC_LENGTH_STATUS, lenStat) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; [U:299-300] advance the cursor, wrapping at TX_DESCS
+  genet_txIndex = genet_txIndex + 1
+  If genet_txIndex >= #GENET_TX_DESCS
+    genet_txIndex = 0
+  EndIf
+
+  ; The descriptor must be visible to the controller before the
+  ; producer index tells it to look. The controller reads descriptors
+  ; through MMIO, which is Device memory and not reordered against
+  ; itself on this core - but the barrier is one instruction and the
+  ; cost of being wrong about that is a frame sent from a
+  ; half-written descriptor.
+  a64_barrier()
+
+  ; [U:302-305] the write that starts the transmission
+  prod = (prod + 1) & $FFFF
+  If genet_Poke(#GENET_TDMA_PROD_INDEX, prod) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; [U:307-312] wait for the consumer index, but on a real clock.
+  t0 = genet_Ticks()
+  budget = GenetTimeoutTicks(timeoutMs)
+  Repeat
+    cons = genet_Peek(#GENET_TDMA_CONS_INDEX)
+    If cons < 0
+      genet_err = cons
+      ProcedureReturn 0
+    EndIf
+    If (cons & $FFFF) >= prod
+      genet_txCount = genet_txCount + 1
+      ProcedureReturn 1
+    EndIf
+    If (genet_Ticks() - t0) > budget
+      Break
+    EndIf
+  ForEver
+
+  genet_err = #GENET_ERR_TX_TIMEOUT
+  ProcedureReturn 0
+EndProcedure
+
+; How many frames GenetSend() has confirmed. Instrumentation only.
+Procedure.i GenetTxCount()
+  ProcedureReturn genet_txCount
+EndProcedure
+
+; ======================================================================
+;  RECEIVE
+; ======================================================================
+; [U:333-377], which U-Boot splits into eth_recv() and free_pkt(). They
+; are one call here because the split exists so U-Boot's network stack
+; can hold onto a buffer across calls, and there is no such stack here;
+; splitting it would hand a caller a pointer into a buffer the hardware
+; is about to be told it may overwrite, which is a trap with no upside.
+;
+;   prod = RDMA_PROD_INDEX
+;   if prod == our consumer index, nothing has arrived   -> return 0
+;   read the descriptor's length/status and address
+;   invalidate the buffer's cache lines
+;   the frame starts RX_BUF_OFFSET bytes in - the RBUF_ALIGN_2B pad
+;   copy it out
+;   flush the buffer, advance our consumer index, write RDMA_CONS_INDEX
+;   advance the descriptor cursor, wrapping at 256
+;
+; RETURN VALUE: the number of bytes copied, 0 for "nothing waiting", or
+; a negative #GENET_ERR_*. ZERO IS NOT AN ERROR and does not set
+; GenetError(); a poll loop that treats it as one will report a fault
+; every time it runs faster than the wire.
+;
+; THE FRAME IS COPIED OUT, unlike TX. The alternative is handing back a
+; pointer into a DMA buffer and trusting the caller to be finished with
+; it before the next call - which is precisely the lifetime bug the
+; U-Boot split manages carefully and that nothing here would manage at
+; all.
+;
+; THE LENGTH IS THE DESCRIPTOR'S, MINUS THE TWO PAD BYTES. [U:344-356].
+; The 12-bit field can express up to 4095, and RX_BUF_LENGTH is 2048,
+; so a length larger than the buffer means the descriptor is garbage;
+; that is checked rather than trusted, because trusting it is a copy
+; past the end of somebody's buffer.
+; ----------------------------------------------------------------------
+Procedure.i GenetRecv(*into, capacity.i)
+  Protected prod.i
+  Protected d.i
+  Protected lenStat.i
+  Protected length.i
+  Protected lo.i
+  Protected hi.i
+  Protected buf.i
+  Protected src.i
+  Protected i.i
+
+  genet_err = #GENET_ERR_NONE
+
+  If genet_started = 0
+    genet_err = #GENET_ERR_NOT_STARTED
+    ProcedureReturn #GENET_ERR_NOT_STARTED
+  EndIf
+  If *into = 0 Or capacity <= 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn #GENET_ERR_ARG
+  EndIf
+
+  prod = genet_Peek(#GENET_RDMA_PROD_INDEX)
+  If prod < 0
+    genet_err = prod
+    ProcedureReturn prod
+  EndIf
+
+  ; [U:341-342] nothing has arrived. NOT an error.
+  ;
+  ; MASKED TO SIXTEEN BITS ON BOTH SIDES, which [U:341] does not do.
+  ; The top half of RDMA_PROD_INDEX is the discard count ([L:341-342]),
+  ; not part of the index; comparing the raw words makes a frame the
+  ; ring DROPPED look like a frame that ARRIVED. See the note at
+  ; #GENET_DMA_P_INDEX_MASK.
+  If (prod & #GENET_DMA_P_INDEX_MASK) = (genet_cIndex & #GENET_DMA_P_INDEX_MASK)
+    ProcedureReturn 0
+  EndIf
+
+  d = #GENET_RX_OFF + (genet_rxIndex * #GENET_DESC_SIZE)
+
+  lenStat = genet_Peek(d + #GENET_DESC_LENGTH_STATUS)
+  If lenStat < 0
+    genet_err = lenStat
+    ProcedureReturn lenStat
+  EndIf
+  ; [U:345] length = (length >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK
+  length = (lenStat >> #GENET_DMA_BUFLENGTH_SHIFT) & #GENET_DMA_BUFLENGTH_MASK
+
+  lo = genet_Peek(d + #GENET_DESC_ADDRESS_LO)
+  If lo < 0
+    genet_err = lo
+    ProcedureReturn lo
+  EndIf
+  hi = genet_Peek(d + #GENET_DESC_ADDRESS_HI)
+  If hi < 0
+    genet_err = hi
+    ProcedureReturn hi
+  EndIf
+  buf = ((hi & $FFFFFFFF) << 32) | (lo & $FFFFFFFF)
+
+  ; A descriptor claiming more than the buffer holds is a descriptor
+  ; that should not be believed. U-Boot only prints a warning here
+  ; ([U:327-328], "Cache invalidate area exceeds buffer size") and
+  ; carries on; that is a copy past the end of the buffer and it is
+  ; refused instead.
+  If length > #GENET_RX_BUF_LENGTH
+    genet_err = #GENET_ERR_RX_LONG
+    ProcedureReturn #GENET_ERR_RX_LONG
+  EndIf
+  If length <= #GENET_RX_BUF_OFFSET
+    ; A frame shorter than the pad it carries. Hand the descriptor
+    ; back and report nothing rather than returning a negative length.
+    length = #GENET_RX_BUF_OFFSET
+  EndIf
+
+  ; Drop our stale lines before reading what the controller wrote.
+  genet_CacheRange(buf, length)
+
+  ; [U:354] the two pad bytes RBUF_ALIGN_2B inserted
+  src = buf + #GENET_RX_BUF_OFFSET
+  length = length - #GENET_RX_BUF_OFFSET
+
+  If length > capacity
+    genet_err = #GENET_ERR_RX_LONG
+    ProcedureReturn #GENET_ERR_RX_LONG
+  EndIf
+
+  i = 0
+  While i < length
+    PokeB(*into + i, PeekA(src + i))
+    i = i + 1
+  Wend
+
+  ; [U:366] hand the buffer back, then [U:369-370] tell the MAC.
+  genet_CacheRange(buf, #GENET_RX_BUF_LENGTH)
+  genet_cIndex = (genet_cIndex + 1) & $FFFF
+  If genet_Poke(#GENET_RDMA_CONS_INDEX, genet_cIndex) = 0
+    ProcedureReturn genet_err
+  EndIf
+
+  ; [U:373-374]
+  genet_rxIndex = genet_rxIndex + 1
+  If genet_rxIndex >= #GENET_RX_DESCS
+    genet_rxIndex = 0
+  EndIf
+
+  genet_rxCount = genet_rxCount + 1
+  ProcedureReturn length
+EndProcedure
+
+Procedure.i GenetRxCount()
+  ProcedureReturn genet_rxCount
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetRecvWait - GenetRecv(), bounded by a CLOCK instead of by a loop
+;  count.
+;
+;  THIS PROCEDURE EXISTS BECAUSE OF A MEASURED MISTAKE THAT COST A
+;  HARDWARE RUN, and the mistake is recorded here rather than quietly
+;  fixed elsewhere, because the shape of it will be made again.
+;
+;  On 2026-08-26, the first run of pi4GenetProbe.pi4 on real silicon
+;  with a cable in a live switch printed:
+;      7. receive
+;        polls used     8
+;        bytes          0
+;        rx count       0
+;  and that reads exactly like a receive path that does not work. It is
+;  not evidence of anything. The probe's loop was
+;      While i < 8 : n = GenetRecv(...) : i = i + 1 : Wend
+;  with NO DELAY IN IT. Eight calls to GenetRecv() on an empty ring is
+;  eight bounds checks and one 32-bit MMIO read each: single-digit
+;  MICROSECONDS end to end. Unsolicited traffic on a quiet switch port -
+;  an ARP, a spanning-tree BPDU - arrives on the order of SECONDS. The
+;  probe was not listening. It blinked.
+;
+;  A LOOP COUNT IS NOT A DURATION. That is the same lesson GenetSend()
+;  already carries in its header about [U:278] `tries = 100`, where a
+;  bare count was replaced with a real deadline for precisely this
+;  reason. Having learned it twice, it is now a procedure instead of
+;  something each caller re-derives.
+;
+;  THE DEADLINE IS THE CALLER'S, for the same reason GenetPhyWaitLink's
+;  is: there is no citable number for "how long before a quiet network
+;  says something". It depends on the switch. Two to three seconds
+;  catches a spanning-tree hello on any switch that runs STP; a port
+;  with STP off and no other stations on it can be silent indefinitely,
+;  and no timeout here can fix that.
+;
+;  Returns exactly what GenetRecv() returns: bytes copied, 0 if the
+;  deadline expired with nothing waiting, or a negative #GENET_ERR_*.
+;  A NEGATIVE IS RETURNED IMMEDIATELY AND NOT RETRIED - a refusal does
+;  not become truthful by being asked again, and spinning on
+;  #GENET_ERR_NOT_STARTED for three seconds helps nobody.
+; ----------------------------------------------------------------------
+Procedure.i GenetRecvWait(*into, capacity.i, ms.i)
+  Protected n.i
+  Protected t0.i
+  Protected budget.i
+
+  If ms <= 0
+    genet_err = #GENET_ERR_ARG
+    ProcedureReturn #GENET_ERR_ARG
+  EndIf
+
+  t0 = genet_Ticks()
+  budget = GenetTimeoutTicks(ms)
+
+  Repeat
+    n = GenetRecv(*into, capacity)
+    If n <> 0
+      ProcedureReturn n
+    EndIf
+    If (genet_Ticks() - t0) > budget
+      Break
+    EndIf
+  ForEver
+
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  RAW REGISTER WINDOWS - READ ONLY, FOR A HUMAN WITH A PROBLEM
+; ======================================================================
+; Every one of these is a single 32-bit read of a register this file
+; already writes or already reads, exposed so a diagnostic can PRINT the
+; number instead of inferring it. NOTHING HERE STEERS ANYTHING and
+; nothing here writes.
+;
+; They exist because of what the first silicon run could not answer. The
+; transcript said "receive got nothing" and there was no way to tell
+; which of four completely different faults that was:
+;   * the RGMII block never got its link bit          -> GenetOobCtrl()
+;   * RX_EN never made it into UMAC_CMD               -> GenetUmacCmd()
+;   * the RX DMA engine is not running                -> GenetRdmaCtrl()
+;   * frames arrived and the ring dropped them all    -> GenetRxDiscards()
+; Four reads settle all four. Guessing between them costs a board trip
+; each time, and a board trip is the most expensive thing this project
+; spends.
+;
+; All return the raw register, or a negative #GENET_ERR_* from
+; genet_Peek(). A register value on these paths is zero-extended and can
+; never be negative, so the two cannot be confused - the same property
+; the rest of this file relies on.
+; ----------------------------------------------------------------------
+
+; EXT_RGMII_OOB_CTRL. After a successful GenetStart() this must have
+; OOB_DISABLE ($20) CLEAR and RGMII_LINK ($10) | RGMII_MODE_EN ($40) |
+; ID_MODE_DIS ($10000) SET - see GenetAdjustLink() and [U:461-466]. So
+; the low byte should read $50 and bit 16 should be on. If OOB_DISABLE
+; is still set or RGMII_LINK is clear, the MAC believes the line is
+; down: it will still transmit, and it will not receive.
+Procedure.i GenetOobCtrl()
+  ProcedureReturn genet_Peek(#GENET_EXT_RGMII_OOB_CTRL)
+EndProcedure
+
+; UMAC_CMD. After a successful GenetStart() on a gigabit link this must
+; read $1000010B:
+;     CMD_TX_EN            $00000001
+;   | CMD_RX_EN            $00000002
+;   | UMAC_SPEED_1000 << 2 $00000008
+;   | CMD_RX_PAUSE_IGNORE  $00000100
+;   | CMD_TX_PAUSE_IGNORE  $10000000
+; A value of $9 means the speed field survived but RX_EN did not; $3
+; means the enables landed on a MAC left at the 10 Mbit/s encoding,
+; which passes traffic badly rather than failing.
+;
+; AND $0000000B - THE VALUE THIS COMMENT DEMANDED UNTIL 2026-09-09 -
+; IS NOW A FAULT, not a pass. It is a MAC with 802.3x flow control ON
+; in both directions on a link where nothing negotiated it, which is
+; the configuration that stopped a bench laptop's Ethernet card on
+; 2026-09-08. If the two top bits are missing, GenetAdjustLink() did
+; not run or was overwritten by a blind write after it. See THE PAUSE
+; PROMISE.
+Procedure.i GenetUmacCmd()
+  ProcedureReturn genet_Peek(#GENET_UMAC_CMD)
+EndProcedure
+
+; RDMA_CTRL and TDMA_CTRL. Both must read $00020001 while the interface
+; is up - DMA_EN plus the ring-16 enable, #GENET_DMA_CTRL_ENABLE,
+; [U:264]. RDMA_CTRL without DMA_EN is a receive engine that is simply
+; switched off, and it looks from the index alone exactly like a quiet
+; wire.
+Procedure.i GenetRdmaCtrl()
+  ProcedureReturn genet_Peek(#GENET_RDMA_CTRL)
+EndProcedure
+
+Procedure.i GenetTdmaCtrl()
+  ProcedureReturn genet_Peek(#GENET_TDMA_CTRL)
+EndProcedure
+
+; RDMA_PROD_INDEX, RAW - both fields, index in the low half and discard
+; count in the high half. See #GENET_DMA_P_INDEX_MASK.
+Procedure.i GenetRxProdIndex()
+  ProcedureReturn genet_Peek(#GENET_RDMA_PROD_INDEX)
+EndProcedure
+
+; RDMA_CONS_INDEX as the HARDWARE has it, which is what this file last
+; wrote there and is not necessarily what it thinks it wrote.
+Procedure.i GenetRxConsIndex()
+  ProcedureReturn genet_Peek(#GENET_RDMA_CONS_INDEX)
+EndProcedure
+
+; The consumer index this file BELIEVES it has reached. Printed next to
+; GenetRxConsIndex() the pair says whether software and hardware agree.
+Procedure.i GenetRxCIndex()
+  ProcedureReturn genet_cIndex
+EndProcedure
+
+; The discard count: frames the RX ring received and threw away.
+; [L:341-342]. NON-ZERO IS THE ANSWER TO "WHY IS RECEIVE SILENT" - it
+; means the wire is fine, the filter is fine, the link is fine, and the
+; ring had nowhere to put the frame.
+Procedure.i GenetRxDiscards()
+  Protected p.i
+  p = genet_Peek(#GENET_RDMA_PROD_INDEX)
+  If p < 0
+    ProcedureReturn p
+  EndIf
+  ProcedureReturn (p >> #GENET_DMA_P_INDEX_DISCARD_SHIFT) & #GENET_DMA_P_INDEX_DISCARD_MASK
+EndProcedure
+
+; SYS_PORT_CTRL. This must read 3, PORT_MODE_EXT_GPHY ([U:43], [L:295]),
+; once GenetInterfaceSet() has run. It is worth printing because the
+; board reads ZERO here at reset - measured, see THE MEASURED RESET
+; STATE - so a zero after bring-up means the write never happened and
+; the MAC is not configured for an external gigabit PHY at all.
+Procedure.i GenetSysPortCtrl()
+  ProcedureReturn genet_Peek(#GENET_SYS_PORT_CTRL)
+EndProcedure
+
+; RBUF_CTRL. Bit 1, RBUF_ALIGN_2B, must be set: it is what makes the
+; hardware insert the two pad bytes that GenetRecv() then skips. If this
+; bit is clear and GenetRecv() still skips two bytes, every received
+; frame is silently shifted by two and nothing reports an error.
+Procedure.i GenetRbufCtrl()
+  ProcedureReturn genet_Peek(#GENET_RBUF_CTRL)
+EndProcedure
+
+; UMAC_MAC0 and UMAC_MAC1 AS THE HARDWARE HOLDS THEM, which is not the
+; same question as GenetMac0() and GenetMac1(). Those two return the
+; images this file BUILT from the address it was given; these two return
+; what is actually in the registers. Printed side by side they say
+; whether the write landed. A MAC address of all zeros accepts nothing
+; and the symptom of that is "receive does not work" with no reason
+; attached, which is one of the failure modes the header's THE MAC
+; ADDRESS section exists to rule out.
+Procedure.i GenetMac0Reg()
+  ProcedureReturn genet_Peek(#GENET_UMAC_MAC0)
+EndProcedure
+
+Procedure.i GenetMac1Reg()
+  ProcedureReturn genet_Peek(#GENET_UMAC_MAC1)
+EndProcedure
+
+; The two DMA_RING_CFG registers, which say WHICH RINGS EXIST as far as
+; the engine is concerned. Both must read $00010000 - ring 16 and
+; nothing else, [U:416] and [U:438]. DMA_CTRL enabling the engine while
+; RING_CFG says no ring is configured is a receiver that is switched on
+; and has nowhere to put anything, and the two registers are far enough
+; apart in the map that getting one and not the other is easy.
+Procedure.i GenetRdmaRingCfg()
+  ProcedureReturn genet_Peek(#GENET_RDMA_RING_CFG)
+EndProcedure
+
+Procedure.i GenetTdmaRingCfg()
+  ProcedureReturn genet_Peek(#GENET_TDMA_RING_CFG)
+EndProcedure
+
+; The transmit ring's two indices. On TX the roles are the opposite way
+; round from RX - the hardware owns the CONSUMER index and this file
+; writes the PRODUCER index - so if the two are equal every frame handed
+; to the engine has been sent, and if the producer is ahead the engine
+; is still working or has stopped.
+Procedure.i GenetTxProdIndex()
+  ProcedureReturn genet_Peek(#GENET_TDMA_PROD_INDEX)
+EndProcedure
+
+Procedure.i GenetTxConsIndex()
+  ProcedureReturn genet_Peek(#GENET_TDMA_CONS_INDEX)
+EndProcedure
+
+; ======================================================================
+;  THE MIB COUNTERS - WHAT THE MAC ITSELF COUNTED
+; ======================================================================
+; Every one of these is a single 32-bit read of a UniMAC statistics
+; register, and they exist because of what 2026-09-08 could not answer.
+; The bench saw a laptop's NIC reset twelve times; from this board there
+; was NOTHING to read that would say whether this board had sent it a
+; single PAUSE frame. GenetMibTxPause() is that number.
+;
+; THE READINGS ARE "SINCE THIS INTERFACE CAME UP". GenetUmacReset()
+; zeroes the whole block through UMAC_MIB_CTRL at every bring-up, so a
+; count read after a boot is that boot's. Compare GenetStartCount(): if
+; the interface has been rebuilt during the session, these numbers are
+; only about the most recent build of it.
+;
+; THEY SATURATE RATHER THAN WRAP - the vendor treats $FFFFFFFF as
+; "overflowed" ([LD:1188-1191]) - so an all-ones reading is "at least
+; four billion", not zero and not a bus fault. Nothing here writes them
+; back; a reader that wants them cleared brings the interface up again.
+;
+; All return the raw counter, or a negative #GENET_ERR_* from
+; genet_Peek(). See THE MIB COUNTERS in the constants for the layout and
+; for the $C group gap that makes the TX offsets what they are.
+; ----------------------------------------------------------------------
+
+; THE ONE THAT ANSWERS 2026-09-08. PAUSE frames this MAC has PUT ON THE
+; WIRE. With #GENET_PAUSE_TX = 0 and CMD_TX_PAUSE_IGNORE set on every
+; link, THIS MUST BE ZERO FOREVER, and a non-zero reading means the bit
+; did not land - which is the one fault in this file that damages
+; somebody else's hardware rather than this board's traffic.
+Procedure.i GenetMibTxPause()
+  ProcedureReturn genet_Peek(#GENET_MIB_TX_PF)
+EndProcedure
+
+; PAUSE frames the partner sent US. Non-zero is not a fault here and is
+; worth knowing: it says the far end is congested and is asking this
+; board to stop. With CMD_RX_PAUSE_IGNORE set this board does not stop,
+; which is the deliberate choice - see THE PAUSE PROMISE - and this
+; counter is how anybody would ever find out it is being asked.
+Procedure.i GenetMibRxPause()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_PF)
+EndProcedure
+
+; Good frames in and out, as the MAC counts them - which is a different
+; number from GenetRxCount()/GenetTxCount(). Those two count what this
+; SOFTWARE handled; these count what the HARDWARE saw. The gap between
+; them is frames the MAC accepted and the ring or the reader never got
+; to, and it is the first thing worth looking at when a link "works" and
+; a protocol above it does not.
+Procedure.i GenetMibRxPackets()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_PKT)
+EndProcedure
+
+Procedure.i GenetMibTxPackets()
+  ProcedureReturn genet_Peek(#GENET_MIB_TX_PKTS)
+EndProcedure
+
+; The receive error counters. FCS is a corrupt frame - a cable, a
+; connector, or an RGMII delay set the wrong way round. Alignment is a
+; frame that did not end on a byte boundary. Length-out-of-range,
+; oversize and jabber are frames the MAC judged malformed. On a healthy
+; gigabit link into one switch all five stay at zero.
+Procedure.i GenetMibRxFcsErrors()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_FCS)
+EndProcedure
+
+Procedure.i GenetMibRxAlignErrors()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_ALN)
+EndProcedure
+
+Procedure.i GenetMibRxLengthErrors()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_FLR)
+EndProcedure
+
+Procedure.i GenetMibRxOversize()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_OVR)
+EndProcedure
+
+Procedure.i GenetMibRxJabber()
+  ProcedureReturn genet_Peek(#GENET_MIB_RX_JBR)
+EndProcedure
+
+; The transmit error counters. FCS and oversize are this MAC's own
+; complaints about what it was handed. THE TWO COLLISION COUNTERS ARE
+; THE ONES THAT MATTER ON A LINK THAT SHOULD NOT HAVE ANY: a full-duplex
+; link has no collisions by definition, so a late or excessive collision
+; count above zero on a link this driver brought up full-duplex means
+; the two ends do not agree about the duplex, and that produces exactly
+; the "works, but terribly" failure the half-duplex refusal exists to
+; prevent - reached from the other direction.
+Procedure.i GenetMibTxFcsErrors()
+  ProcedureReturn genet_Peek(#GENET_MIB_TX_FCS)
+EndProcedure
+
+Procedure.i GenetMibTxOversize()
+  ProcedureReturn genet_Peek(#GENET_MIB_TX_OVR)
+EndProcedure
+
+Procedure.i GenetMibTxLateColl()
+  ProcedureReturn genet_Peek(#GENET_MIB_TX_LCL)
+EndProcedure
+
+Procedure.i GenetMibTxExcessColl()
+  ProcedureReturn genet_Peek(#GENET_MIB_TX_ECL)
+EndProcedure
+
+; THE RECEIVE BUFFER OVERFLOW COUNT - the hardware's own answer to "did
+; the ring overrun". It counts frames the RBUF had nowhere to put, and
+; it is the number that WOULD have been non-zero on 2026-09-08 if this
+; board had been dropping frames instead of asking the laptop to stop
+; sending them. Read beside GenetRxDiscards(), which counts the same
+; event one stage later, at the DMA ring: overflow with no discards is a
+; FIFO that filled faster than the DMA drained it; discards with no
+; overflow is a ring with no free descriptor. Both non-zero is a
+; receiver that is simply behind, which for a monitor is the ORDINARY
+; and CORRECT outcome - it is what dropping a frame instead of pausing a
+; partner looks like from here.
+Procedure.i GenetRbufOverflows()
+  ProcedureReturn genet_Peek(#GENET_RBUF_OVFL_CNT)
+EndProcedure
+
+; Receive buffer errors, and address-filter errors. The second is the
+; MDF block, which this file does not program (see the header's NO
+; MULTICAST FILTER note), so it is expected to stay at zero and is read
+; only so that "expected" is checked rather than assumed.
+Procedure.i GenetRbufErrors()
+  ProcedureReturn genet_Peek(#GENET_RBUF_ERR_CNT)
+EndProcedure
+
+Procedure.i GenetMdfErrors()
+  ProcedureReturn genet_Peek(#GENET_UMAC_MDF_ERR_CNT)
+EndProcedure
+
+; UMAC_MODE RAW, all thirty-two bits, where GenetMacLinkStatus() returns
+; only the one bit decoded. The raw word is here because a decoded 0 and
+; a register that reads as all zeros because nothing decodes the address
+; are the same answer to a caller and completely different faults to a
+; human. SINGLE-SOURCE AND READ ONLY, exactly as GenetMacLinkStatus()
+; is - see the note there.
+Procedure.i GenetUmacMode()
+  ProcedureReturn genet_Peek(#GENET_UMAC_MODE)
+EndProcedure
+
+; ======================================================================
+;  STATE AND REFUSALS
+; ======================================================================
+
+Procedure.i GenetStarted()
+  ProcedureReturn genet_started
+EndProcedure
+
+Procedure.i GenetLinkUp()
+  ProcedureReturn genet_linkUp
+EndProcedure
+
+Procedure.i GenetError()
+  ProcedureReturn genet_err
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetErrorText - the refusal in words.
+;
+;  Every string here names WHAT WAS REFUSED AND WHY, not just which
+;  constant fired. A code with a one-word gloss ("bad argument") sends
+;  the reader back into the source; a code that explains itself does
+;  not. The half-duplex one in particular has to carry its reason,
+;  because a caller meeting it will otherwise assume it is a bug.
+; ----------------------------------------------------------------------
+Procedure.i GenetErrorText()
+  Select genet_err
+    Case #GENET_ERR_NONE
+      ProcedureReturn "genet: ok"
+    Case #GENET_ERR_ARG
+      ProcedureReturn "genet: a parameter was out of range - frame under 60 bytes, over 1536, a multicast MAC, or a zero pointer"
+    Case #GENET_ERR_RANGE
+      ProcedureReturn "genet: register offset outside the $10000 block - an offset was computed wrongly"
+    Case #GENET_ERR_ALIGN
+      ProcedureReturn "genet: register offset was not 4-byte aligned"
+    Case #GENET_ERR_VERSION
+      ProcedureReturn "genet: SYS_REV_CTRL does not say GENETv5 - all-ones means nothing decodes $FD580000, all-zeros means the block is held down"
+    Case #GENET_ERR_MDIO_BUSY
+      ProcedureReturn "genet: MDIO START_BUSY never cleared inside 20 ms - the bus is not running"
+    Case #GENET_ERR_MDIO_FAIL
+      ProcedureReturn "genet: MDIO_READ_FAIL - no PHY answered that address"
+    Case #GENET_ERR_PHY_NONE
+      ProcedureReturn "genet: no PHY identifier at any of the 32 MDIO addresses"
+    Case #GENET_ERR_NO_LINK
+      ProcedureReturn "genet: the PHY reports no link - check the cable"
+    Case #GENET_ERR_ANEG
+      ProcedureReturn "genet: link is up but auto-negotiation never completed"
+    Case #GENET_ERR_SPEED
+      ProcedureReturn "genet: REFUSED - only 10, 100 and 1000 Mbit/s are supported. 2500 exists in the register and cannot work over RGMII with this PHY"
+    Case #GENET_ERR_HALF_DUPLEX
+      ProcedureReturn "genet: REFUSED - the link negotiated HALF duplex. The cited U-Boot driver never writes CMD_HD_EN, so bringing the MAC up would leave it full-duplex on a half-duplex wire. Untested and not guessed at"
+    Case #GENET_ERR_NO_MAC
+      ProcedureReturn "genet: REFUSED - no MAC address. Call GenetSetMac() with six bytes. This library cannot ask the firmware for one"
+    Case #GENET_ERR_NO_RXBUF
+      ProcedureReturn "genet: REFUSED - no RX region, or it is under 524288 bytes or not 64-byte aligned"
+    Case #GENET_ERR_NOT_STARTED
+      ProcedureReturn "genet: GenetStart() has not succeeded"
+    Case #GENET_ERR_TX_TIMEOUT
+      ProcedureReturn "genet: the TX consumer index never advanced - the frame was queued and nothing collected it"
+    Case #GENET_ERR_RX_LONG
+      ProcedureReturn "genet: a received frame will not fit - either the caller's buffer is too small or the descriptor reported an impossible length"
+    Case #GENET_ERR_NARROW
+      ProcedureReturn "genet: a buffer above 4 GiB on a build that truncates 64-bit addresses - the DMA engine would write into low memory"
+    Case #GENET_ERR_UNCITED
+      ProcedureReturn "genet: REFUSED - there is no citable source on this disk for what was asked"
+  EndSelect
+  ProcedureReturn "genet: unknown error"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GenetForceSpeed - REFUSED, ALWAYS. Refusal 3 in the header.
+;
+;  This exists as a procedure rather than as an absence so that a
+;  caller who goes looking for it FINDS AN ANSWER instead of finding
+;  nothing and writing their own from a half-read datasheet. An empty
+;  space in an API is indistinguishable from an oversight; a refusal
+;  that names its reason is not.
+;
+;  What forcing would need: the BMCR speed and duplex selects (those
+;  are cited - [mii.h:42-51]) AND an EXT_RGMII_OOB_CTRL configuration
+;  that makes the MAC believe in a link that never negotiated. The
+;  second half is what is missing. U-Boot's adjust_link only ever runs
+;  after a successful negotiation, so its OOB sequence is not evidence
+;  for the forced case, and Linux's forced path goes through phylink
+;  with a state machine none of which is on this disk.
+; ----------------------------------------------------------------------
+Procedure.i GenetForceSpeed(mbits.i, fullDuplex.i)
+  genet_err = #GENET_ERR_UNCITED
+  ProcedureReturn 0
+EndProcedure

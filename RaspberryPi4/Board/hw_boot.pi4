@@ -1,0 +1,208 @@
+; ======================================================================
+;  hw_boot.pi4 - the Pi 4 HwBootEl1 backend. THE ONE FILE THAT KNOWS HOW
+;  THIS SoC DROPS FROM EL2 TO EL1; the core above it (Anvil/Core/boot_cmd.pbi)
+;  knows only the seam HwBootToEl1(entry, dtb) and asks first whether the
+;  board has #CAP_BOOT_EL1.
+;
+;  This is the board side of the HwBootEl1 seam declared in Anvil/Hal/hal.pbi.
+;  The `booti` and `bootm` commands are CORE: they validate the image header,
+;  choose the device tree and print what they are about to do, then call
+;  HwBootToEl1, which does not return.
+;
+;  INCLUDE ORDER, and it is not arbitrary:
+;    * RaspberryPi4/Board/cache.pi4 BEFORE this file - CacheDisable()/gCacheOn.
+;    * RaspberryPi4/Board/eth.pi4   BEFORE this file - EthDown().
+;    * RaspberryPi4/Lib/uart.pi4    BEFORE this file - UartDrain().
+;    * Anvil/Core/boot_cmd.pbi      AFTER this file - it calls HwBootToEl1
+;      and HwFirmwareDtb.
+;
+; ----------------------------------------------------------------------
+;  WHERE THE DTB COMES FROM.
+;
+;  Anvil is kernel8.img, loaded whole by the firmware to $200000
+;  (Lib/mmu.pi4). The Raspberry Pi armstub runs first, at EL3, and hands the
+;  kernel over at EL2h with x0 = the firmware's flattened-device-tree pointer
+;  and x1=x2=x3=0 - Datasheets/pi4/armstub8.S:163-171:
+;
+;      primary_cpu:
+;          ldr w4, kernel_entry32     ; = $200000, Anvil
+;          ldr w0, dtb_ptr32          ; the DTB the firmware placed
+;      boot_kernel:
+;          mov x1, #0 / mov x2, #0 / mov x3, #0
+;          br  x4
+;
+;  So the DTB pointer arrives in x0 at Anvil's _start and is Anvil's for the
+;  taking. Anvil never captured it before this. It is captured in Main()'s
+;  very first instruction (RaspberryPi4/Board/board.pi4) into gBootDtb, and
+;  read back here by HwFirmwareDtb(). Nothing between _start and that capture
+;  touches x0: EmitCore_A64.pbi's preamble uses x9,x10,x16,x17,x18 for the
+;  stack/BSS/FP-gate, Main()'s prologue uses x29,x30, and the capture is
+;  Main()'s first statement - so x0 is still the firmware's DTB when it is
+;  stored. The U-Boot equivalent is rpi.c publishing the same pointer as
+;  fdt_addr (Datasheets/pi4/uboot/v2025.01_rpi.c) - we keep the firmware's
+;  DTB rather than build one, exactly as the inventory's minimum-viable path
+;  says (Raspberry Pi 4/U-Boot command and feature inventory.md S3.5).
+; ======================================================================
+
+; gBootDtb  - the firmware DTB pointer, captured from x0 at entry in Main().
+;             0 until Main() runs its capture, which is before any prompt.
+Global gBootDtb.i
+
+; gBootEntry / gBootDtbArg - the two values HwBootToEl1 hands to its inline
+; asm. They cross in BSS globals for the same reason CallAddr's gGoAddr does
+; (RaspberryPi4/Board/cache.pi4): the asm is about to change exception level
+; and the stack cannot be relied on, so nothing crosses on it.
+Global gBootEntry.i
+Global gBootDtbArg.i
+
+; ----------------------------------------------------------------------
+;  HwFirmwareDtb() - the firmware's device-tree pointer, or 0 if none was
+;  captured. The core's booti/bootm read it here rather than reaching for a
+;  board global, so the core stays chip-free.
+; ----------------------------------------------------------------------
+Procedure.i HwFirmwareDtb()
+  ProcedureReturn gBootDtb
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwBootToEl1(entry, dtb) - install an EL1, put the DTB in x0, drop from
+;  EL2 to EL1 and branch to `entry`. Does not return.
+;
+;  Anvil runs at EL2h (the stub eret'd us there; the CurrentEL probe reads
+;  EL2 - see board.pi4's "0002 is CurrentEL>>2" note and A64EmuCore.pbi:624).
+;  The Linux arm64 boot protocol wants the kernel entered at EL2 OR at
+;  non-secure EL1; U-Boot's own arm64 path drops to EL1 when
+;  CONFIG_ARMV8_SWITCH_TO_EL1 is set, and this is that path made concrete.
+;
+;  THE REGISTER SET-UP IS FAITHFUL TO U-BOOT's armv8_switch_to_el1_m for the
+;  AArch64 case - RaspberryPi4/Reference/v2025.01_macro.h:244-310 - and every
+;  bit value is from RaspberryPi4/Reference/v2025.01_arm_system.h. It is
+;  reached from transition.S's armv8_switch_to_el1 (v2025.01_transition.S:36-44)
+;  after switch_el confirms we are at EL2.
+;
+;  WHAT WE HAND OVER WITH. Caches off and DRAM coherent, the Ethernet receive
+;  DMA stopped, and the instruction cache invalidated so the freshly-loaded
+;  kernel is fetched from DRAM - the same quiesce RunAt does before a bare
+;  jump (RaspberryPi4/Board/cache.pi4), because a kernel expects the stub's
+;  world (MMU off, caches cold) exactly as a bare payload does.
+;
+;  NO DEADMAN. Unlike RunAt, no watchdog is armed: a booted kernel is MEANT
+;  never to return, so a deadman would reboot a working Linux. booti is a
+;  one-way door and says so.
+;
+;  COMPILE-VERIFIED ONLY. There is no silicon on this bench and no emulator
+;  models an EL2->EL1 eret, so this handoff and a real Linux boot have never
+;  run here. Every instruction assembles (the whole image builds to
+;  "pmfc: OK"); whether Linux comes up is owed a Pi 4.
+; ----------------------------------------------------------------------
+Procedure HwBootToEl1(entry.i, dtb.i)
+  ; QUIESCE THE MACHINE before it changes hands - the RunAt discipline.
+  ; EthDown() stops the receive DMA bus master (returns at once if the port
+  ; was never up). CacheDisable() cleans every dirty line to DRAM and turns
+  ; the D-cache/MMU off in the safe order, so the kernel Image the monitor
+  ; wrote is coherent in DRAM when the kernel reads it with caches cold.
+  EthDown()
+  If gCacheOn <> 0
+    CacheDisable()
+  EndIf
+
+  ; Cross the two values into BSS (uncached now, so they land in DRAM where
+  ; the asm's ldr will read them).
+  gBootEntry   = entry
+  gBootDtbArg  = dtb
+
+  ; Everything printed is on the wire before control leaves - a line still in
+  ; the PL011 FIFO at the eret is a line nobody sees.
+  UartDrain()
+
+  ASM
+    ; ==============================================================
+    ;  EL2h -> EL1h, arm64 Linux boot protocol.
+    ;  Faithful to U-Boot armv8_switch_to_el1_m (ES_TO_AARCH64):
+    ;  RaspberryPi4/Reference/v2025.01_macro.h:244-310. Bit values from
+    ;  RaspberryPi4/Reference/v2025.01_arm_system.h. Temps x5..x9; x0 and
+    ;  x4 hold the two hand-over values and are not touched after they are
+    ;  loaded.
+    ; ==============================================================
+
+    ; --- the two values, from BSS (macro.h comment :240-242: x0 = FDT) ---
+    adrp x4, global_gbootentry
+    add  x4, x4, #:lo12:global_gbootentry
+    ldr  x4, [x4]                  ; x4 = kernel entry point
+    adrp x0, global_gbootdtbarg
+    add  x0, x0, #:lo12:global_gbootdtbarg
+    ldr  x0, [x0]                  ; x0 = DTB pointer, passed to the kernel
+
+    ; --- make the freshly-loaded kernel visible to instruction fetch ---
+    dsb  sy
+    ic   ialluis
+    dsb  sy
+    isb
+
+    ; a materialised zero, used where U-Boot writes xzr.
+    movz x9, #0
+
+    ; --- CNTHCTL_EL2: let EL1 reach the physical timer/counter (macro.h:246-250)
+    mrs  x5, cnthctl_el2
+    movz x6, #3                   ; EL1PCEN|EL1PCTEN (arm_system.h:74-75)
+    orr  x5, x5, x6
+    msr  cnthctl_el2, x5
+    msr  cntvoff_el2, x9          ; (macro.h:251)
+
+    ; --- virtual MPID/MIDR for EL1 (macro.h:254-257) ---
+    mrs  x5, midr_el1
+    msr  vpidr_el2, x5
+    mrs  x5, mpidr_el1
+    msr  vmpidr_el2, x5
+
+    ; --- disable coprocessor traps to EL2 (macro.h:260-262) ---
+    movz x5, #0x33FF              ; CPTR_EL2_RES1 (arm_system.h:54)
+    msr  cptr_el2, x5
+    msr  hstr_el2, x9
+
+    ; --- enable FP/SIMD at EL1 (macro.h:263-264). cpacr_el1 is not in the
+    ;     assembler's system-register table, so the exact MSR word is emitted
+    ;     raw: msr cpacr_el1, x7 = sys_reg(3,0,1,0,2) -> $D5181040 | Rt(7).
+    ;     (Cross-checked against the table's cpacr_el12 = $D51D1040, which is
+    ;     the same encoding with op1=5 instead of 0.)
+    movz x7, #0x30, lsl #16       ; CPACR_EL1_FPEN_EN = (3<<20) (arm_system.h:110)
+    .word 0xD5181047             ; msr cpacr_el1, x7
+
+    ; --- SCTLR_EL1: MMU/caches/alignment off, RES1 bits set (macro.h:273-282)
+    ;     SCTLR_EL1_RES1 = (3<<28|3<<22|1<<20|1<<11) = $30D00800; every other
+    ;     term in U-Boot's OR is a "_DIS"/"_EN" that is (0<<n) (arm_system.h:115-133).
+    movz x5, #0x0800
+    movk x5, #0x30D0, lsl #16     ; x5 = $30D00800
+    msr  sctlr_el1, x5
+
+    ; --- migrate SP and VBAR to EL1 (macro.h:284-287) ---
+    mov  x5, sp
+    msr  sp_el1, x5
+    mrs  x5, vbar_el2
+    msr  vbar_el1, x5
+
+    ; --- HCR_EL2 = RW (EL1 is AArch64) | HCD (macro.h:299; arm_system.h:84,86).
+    ;     = (1<<31)|(1<<29) = $A0000000. U-Boot ALSO ORs in APK|API (bits
+    ;     40,41) to stop pointer-authentication traps, but ONLY when the part
+    ;     implements PAuth (its csel at macro.h:295-301). The BCM2711's
+    ;     Cortex-A72 is ARMv8.0-A with no FEAT_PAuth, so those bits are
+    ;     irrelevant here and $A0000000 is exactly the value that csel picks
+    ;     on a no-PAuth part. A future PAuth-capable board must OR in
+    ;     (1<<40)|(1<<41); see the note in this file's header.
+    movz x5, #0xA000, lsl #16     ; $A0000000
+    msr  hcr_el2, x5
+
+    ; --- SPSR_EL2: D,A,I,F masked, return to EL1h (macro.h:305-307;
+    ;     arm_system.h:37-49). $3C5 = (1<<9|1<<8|1<<7|1<<6) | 5(EL1h).
+    movz x5, #0x3C5
+    msr  spsr_el2, x5
+    msr  elr_el2, x4              ; return address = kernel entry (macro.h:309)
+
+    ; --- arm64 boot protocol: x0 = DTB (already loaded), x1=x2=x3=0 ---
+    mov  x1, x9
+    mov  x2, x9
+    mov  x3, x9
+
+    eret                          ; drop to EL1h and branch to x4 (macro.h:310)
+  EndASM
+EndProcedure

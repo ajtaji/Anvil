@@ -1,0 +1,1413 @@
+; ======================================================================
+;  uart.pi4 - the PL011 (UART0) on a Raspberry Pi 4, from cold or adopted.
+;
+;      XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+;
+;      Procedure Main()
+;        UartInit(115200)          ; WE own the port: pins, clock, baud
+;        PrintN("ready")           ; Print is routed here - see below
+;        Repeat
+;        ForEver
+;      EndProcedure
+;
+;  DEPENDENCIES: NONE. This file includes no other library, per the house
+;  rule - a library never includes a library, the MAIN file lists what it
+;  needs. Everything here is PeekL/PokeL against the BCM2711 and two
+;  system-register reads; there is nothing to depend on.
+;
+; ======================================================================
+;  WHICH OF THE TWO PROCEDURES TO CALL, AND WHEN. READ THIS FIRST.
+; ======================================================================
+;  There are two ways to get a working port and they are not
+;  interchangeable:
+;
+;    UartInit(baud)   COLD BRING-UP. Muxes GPIO14/15 to ALT0, sets the
+;                     pulls, programs CR/IBRD/FBRD/LCRH in the order the
+;                     PL011 demands, and enables the port. Call this when
+;                     the PROGRAM OWNS THE MACHINE - kernel8.img, or
+;                     anything that cannot prove a loader ran first.
+;
+;    UartAttach()     ADOPTION. Touches no register that changes
+;                     behaviour: it reads FR, records that the port is
+;                     usable, and returns. Call this when a LOADER
+;                     ALREADY CONFIGURED THE PORT and the console is the
+;                     one you are already typing into.
+;
+;  EVERYTHING WORKING ON THIS TARGET TODAY IS THE SECOND CASE, and that
+;  is the whole reason this file has to offer the first. RaspberryPi4/
+;  Examples/01_GettingStarted/pi4Hello.pi4 says it in as many words:
+;  "Arriving via a loader means the UART is ALREADY configured - no clock
+;  setup, no baud divisor, no pin muxing." RaspberryPi4/Monitor/
+;  anvil.pi4 says the same and is built on it. A LIBRARY CANNOT
+;  ASSUME IT. A program that owns the machine - which is where this
+;  target is going - arrives at a port that is off, unmuxed and
+;  undivided, and calling UartAttach() there gets you a healthy-looking
+;  FR read and total silence.
+;
+;  Calling UartInit() when a loader IS underneath is not an error, but it
+;  is not free either: it disables the port, reprograms it, and re-enables
+;  it. Anything the loader had queued in the TX FIFO is flushed (that is
+;  step 3 of the PL011's own programming sequence, not an accident), so a
+;  half-printed loader line disappears. Under Anvil, use
+;  UartAttach().
+;
+; ======================================================================
+;  THE ROUTING TRAP. IT IS SILENT, AND IT COST AN EVENING ON 2026-08-24.
+; ======================================================================
+;  On a Pi 4, WHICH UART REACHES HEADER PINS 8 AND 10 IS A config.txt
+;  DECISION:
+;
+;    Bluetooth enabled (the default) -> the header gets the MINI-UART
+;                                       (UART1) and the PL011 (UART0) is
+;                                       wired to the Bluetooth module
+;    dtoverlay=disable-bt            -> the header gets the PL011
+;
+;  This file drives the PL011, so it assumes disable-bt. The boot medium
+;  now sets it.
+;
+;  THE FAILURE MODE WHEN THIS IS WRONG IS THAT NOTHING FAILS. Writing to
+;  the UART that is not on the wire SUCCEEDS - the device is real,
+;  powered and idle - so there is no fault, no hang and no output, and
+;  reading its status register returns a perfectly healthy value. Every
+;  check this file can make passes. UartInit() will report success.
+;  Nothing will arrive.
+;
+;  IF THIS PRINTS NOTHING AT ALL, CHECK config.txt BEFORE YOU DOUBT
+;  ANYTHING ELSE. And check the file as well as the line: disable-bt
+;  needs overlays/disable-bt.dtbo present on the boot partition, and
+;  without it the line is accepted and does nothing - the same silent
+;  non-failure a second time.
+;
+;  THE DOCUMENTED ALTERNATIVE. If you are running WITHOUT disable-bt, the
+;  header is the mini-UART and this file is the wrong one. Its two
+;  registers, so they are written down somewhere findable:
+;
+;    AUX_MU_IO_REG   $FE215040   data
+;    AUX_MU_LSR_REG  $FE215054   line status
+;                                bit 5 = "Transmitter empty ... can accept
+;                                        at least one byte"  -> READY,
+;                                        the OPPOSITE SENSE to the
+;                                        PL011's TXFF (= FULL)
+;                                bit 0 = "Data ready"        -> RX has a
+;                                        byte, again the opposite sense
+;                                        to the PL011's RXFE (= EMPTY)
+;
+;  So a mini-UART port waits UNTIL a bit is SET where this file waits
+;  UNTIL a bit is CLEAR. Copying a loop between the two and forgetting to
+;  invert the test produces a driver that spins for ever on a working
+;  port, or - worse - one that never waits at all and drops every
+;  character after the first.
+;
+;  The mini-UART also takes its baud from the VPU core clock, which the
+;  firmware SCALES at run time. That is the second reason the PL011 with
+;  a pinned reference clock is the one to want.
+;
+; ======================================================================
+;  THE BAUD DIVISOR DEPENDS ON A LINE IN config.txt. STATE IT PLAINLY.
+; ======================================================================
+;  The PL011's divisor is computed from FUARTCLK, the UART REFERENCE
+;  CLOCK - not from the CPU clock, and not from anything this program can
+;  read. On a Pi 4 the firmware sets FUARTCLK, and it is only
+;  deterministic because config.txt on the boot medium says
+;
+;      init_uart_clock=48000000
+;
+;  #UART_CLOCK_HZ below IS THAT NUMBER. If the boot medium loses the line
+;  the firmware picks its own value, #UART_CLOCK_HZ becomes a lie, and
+;  every divisor computed from it is wrong by the same ratio - which on
+;  the wire is not silence but GARBAGE, a stream of framing errors that
+;  looks like a bad cable. That is a different symptom from the routing
+;  trap above and it is worth knowing which is which:
+;
+;      nothing at all on the wire   -> routing (disable-bt)
+;      mojibake on the wire         -> reference clock (init_uart_clock)
+;
+;  A board whose config.txt differs calls UartInitClk(baud, clkhz) and
+;  passes the real number rather than editing this file.
+;
+;  AND THERE IS A WAY TO STOP GUESSING ENTIRELY, which this file will not
+;  take by itself. RaspberryPi4/Lib/mailbox.pi4 can ASK THE FIRMWARE what
+;  the UART clock actually is - MailboxClockRate(#MBX_CLK_UART), or
+;  MailboxClockRateMeasured(#MBX_CLK_UART) for what the silicon is really
+;  running at. A main file that wants a divisor that cannot be wrong
+;  writes:
+;
+;      MailboxInit()
+;      hz = MailboxClockRate(#MBX_CLK_UART)
+;      If hz > 0
+;        UartInitClk(115200, hz)
+;      Else
+;        UartInit(115200)                  ; fall back on config.txt
+;      EndIf
+;
+;  THAT COUPLING BELONGS IN THE MAIN FILE AND NOT IN THIS ONE. The house
+;  rule is that a library never includes a library; beyond the rule, a
+;  UART that cannot come up without the mailbox working is a UART that
+;  cannot tell you the mailbox is broken. #UART_CLOCK_HZ keeps this file
+;  standalone and keeps the console the LAST thing to fail.
+;
+;  UartAttach() needs none of this. It never computes a divisor, which is
+;  exactly why it is the safe call under a loader.
+;
+; ======================================================================
+;  THE PRINT ROUTER LIVES AT THE BOTTOM OF THIS FILE
+; ======================================================================
+;  Print and PrintN are COMPILER KEYWORDS on this target. The router in
+;  RaspberryPi4/IRCore_A64.pbi picks a formatter from the argument's TYPE
+;  and calls one of three procedures BY NAME - str_print_at, printdec,
+;  printnl - and it does NOT choose the transport. Whichever file defines
+;  those three owns where every Print in the program goes.
+;
+;  On the RP2350 they live in their own file (RP2350/Lib/
+;  string_out_uart.pico2, three procedures and nothing else) so that a
+;  future USB build can swap one include line. THIS TARGET HAS ONE
+;  TRANSPORT AND ONE FILE, so they are here, in a clearly marked section
+;  at the bottom.
+;
+;  WHEN A SECOND Print DESTINATION APPEARS ON THIS PART - HDMI console,
+;  USB CDC, a RAM ring buffer - CUT THAT SECTION OUT into
+;  RaspberryPi4/Lib/string_out_uart.pi4 and leave the transport
+;  (UartWrite) here. Do not add a second copy of the three names to
+;  another file while they are still in this one: both would define
+;  str_print_at, and the duplicate-procedure error you get is the RIGHT
+;  outcome - a program has one Print destination at a time - but it will
+;  point at the wrong file.
+;
+;  A program that includes this file gets Print over UART0 whether it
+;  wanted it or not. That is the cost of the merge and it is small: there
+;  is nothing else for Print to mean on this target today.
+;
+; ======================================================================
+;  LANGUAGE FACTS THIS FILE IS WRITTEN AROUND (the 64-bit pi4 model)
+; ======================================================================
+;  * .i, POINTERS AND EVERY INTEGER INTERMEDIATE ARE EIGHT BYTES. So a
+;    bare Peek/Poke IS A 64-BIT ACCESS. Every BCM2711 peripheral register
+;    touched here is 32 bits wide - that is silicon, and widening the
+;    language does not widen the device - so EVERY ONE of them is
+;    PeekL/PokeL, spelled .l on purpose. There is not one bare Peek in
+;    this file and there must never be.
+;  * .l IS FOUR BYTES AND SIGNED, and PeekL sign-extends into the X
+;    register. A PL011 FR read can never set bit 31 (FR is 9 bits), but
+;    every read here masks the bit it wants immediately anyway, so the
+;    question cannot arise.
+;  * OPERATOR PRECEDENCE IS NOT THE DESKTOP LANGUAGE'S: & | ! BIND TIGHTER THAN
+;    << >>. "t >> 6 & 63" would parse as "t >> (6 & 63)". Every shift in
+;    this file is parenthesised.
+;  * >> IS ARITHMETIC on a signed .i. The one value shifted right here
+;    (the rounded divisor t) is provably positive - it is a positive
+;    clock divided by a positive baud - and the guard above the shift
+;    proves it.
+;  * Procedure locals are statically allocated. Nothing here is
+;    reentrant: do not call UartWrite() from an interrupt that can
+;    interrupt UartWrite().
+;
+; ======================================================================
+;  CITATIONS - every address and every bit below, and where it came from
+; ======================================================================
+;  Bus address $7Ennnnnn maps to ARM physical $FEnnnnnn on the BCM2711.
+;
+;  PL011 UART0 base    $FE201000
+;      Datasheets/pi4/bcm283x.dtsi, "uart0: serial@7e201000",
+;      reg = <0x7e201000 0x200>, compatible "arm,pl011".
+;      Cross-checked: bcm2711-peripherals.pdf 11.5 Register View, p.148,
+;      "The PL011 UARTs are mapped onto the following base addresses:
+;       UART0: 0x7e201000".
+;
+;  PL011 register offsets   bcm2711-peripherals.pdf Table 172, p.148:
+;      0x00 DR, 0x18 FR, 0x24 IBRD, 0x28 FBRD, 0x2c LCRH, 0x30 CR,
+;      0x38 IMSC, 0x44 ICR.
+;
+;  FR bits             Table 175, p.149-150:
+;      bit 7 TXFE transmit FIFO empty, bit 6 RXFF receive FIFO full,
+;      bit 5 TXFF transmit FIFO FULL, bit 4 RXFE receive FIFO EMPTY,
+;      bit 3 BUSY "UART busy ... remains set until the complete byte,
+;      including all the stop bits, has been sent from the shift
+;      register".
+;      TXFF and RXFE are additionally SILICON-PROVEN: they are what
+;      pi4Hello.pi4 and anvil.pi4 already run on.
+;
+;  LCRH bits           Table 179, p.152:
+;      bits 6:5 WLEN, b11 = 8 bits;  bit 4 FEN enable FIFOs;
+;      bit 3 STP2; bit 2 EPS; bit 1 PEN; bit 0 BRK.
+;      Same page, the NOTE that fixes half the ordering below: "The
+;      UART_LCRH, UART_IBRD, and UART_FBRD registers must not be changed
+;      when the UART is enabled".
+;
+;  CR bits             Table 181, p.153-154:
+;      bit 0 UARTEN, bit 8 TXE, bit 9 RXE, bit 7 LBE loopback,
+;      bit 14 RTSEN, bit 15 CTSEN.
+;      Same table's NOTE is the OTHER half of the ordering: "Program the
+;      control registers as follows: 1. Disable the UART. 2. Wait for the
+;      end of transmission or reception of the current character.
+;      3. Flush the transmit FIFO by setting the FEN bit to 0 in the Line
+;      Control Register, UART_LCRH. 4. Reprogram the Control Register,
+;      UART_CR. 5. Enable the UART."
+;
+;  IBRD / FBRD         Tables 177 and 178, p.151-152:
+;      IBRD is bits 15:0, FBRD is bits 5:0, and the formula is quoted
+;      verbatim in UartInitClk() below.
+;
+;  ICR                 Table 186, p.156: bits 10:0 are the write-one-to-
+;      clear interrupt clears, so $7FF clears every one. Bits 31:11
+;      reserved.
+;
+;  GPIO base           $FE200000
+;      bcm2711-peripherals.pdf 5.2 Register View, p.67: "The GPIO
+;      register base address is 0x7e200000." Also bcm283x.dtsi,
+;      "gpio: gpio@7e200000".
+;  GPFSEL1 offset 0x04 and GPIO_PUP_PDN_CNTRL_REG0 offset 0xe4
+;      bcm2711-peripherals.pdf Table 63, p.67.
+;  FSEL14 = GPFSEL1 bits 14:12, FSEL15 = GPFSEL1 bits 17:15
+;      bcm2711-peripherals.pdf Table 65, p.68.
+;  ALT0 = b100
+;      bcm2711-peripherals.pdf Table 65, p.68: "100 = GPIO Pin 19 takes
+;      alternate function 0" - the encoding is the same for every FSELn.
+;  GPIO14 ALT0 = TXD0, GPIO15 ALT0 = RXD0
+;      bcm2711-peripherals.pdf Table 171, p.146 (the UART/GPIO map), and
+;      raspberry-pi-4-datasheet.pdf Table 5, p.10. Also bcm283x.dtsi's
+;      own "uart0_gpio14" group: brcm,pins = <14 15>, function = ALT0.
+;  Pull encoding, GPIO14 = bits 29:28, GPIO15 = bits 31:30
+;      bcm2711-peripherals.pdf Table 90, p.~95: "00 = No resistor is
+;      selected, 01 = Pull up resistor is selected, 10 = Pull down
+;      resistor is selected, 11 = Reserved". Reset value for both is 0x2
+;      (pull down).
+;
+;  Mini-UART           AUX block base 0x7e215000 (bcm283x.dtsi,
+;      "aux: aux@7e215000"); AUX_MU_IO_REG offset 0x40 and
+;      AUX_MU_LSR_REG offset 0x54 (bcm2711-peripherals.pdf, Auxiliary
+;      peripherals Address Map, p.9); LSR bit 5 "Transmitter empty" and
+;      bit 0 "Data ready" (Table 10, p.14). Hence $FE215040 / $FE215054.
+;
+;  CNTPCT_EL0 / CNTFRQ_EL0
+;      ARMv8-A architectural registers, readable at EL2 with no trap and
+;      no setup. Not BCM2711 registers and not in any Broadcom document.
+;      Lifted verbatim from anvil.pi4's Ticks()/TickHz(), which are
+;      the silicon-proven form on this board.
+;
+;  WHAT IS DELIBERATELY NOT HERE, because it could not be cited:
+;      * the UART clock manager (CM_UARTCTL/CM_UARTDIV). The BCM2711
+;        peripherals document's clock chapter covers only the GENERAL
+;        PURPOSE clocks (5.4, p.82: CM_GP0CTL..CM_GP2DIV at 0x7e101000).
+;        It does not give a register for the PL011's reference clock. So
+;        this file DOES NOT PROGRAM FUARTCLK - it takes the firmware's
+;        value as an input (#UART_CLOCK_HZ / UartInitClk) and says so
+;        above. Anyone who "fixes" that by guessing an offset in the
+;        0x7e101000 block will get a board that boots and then stops
+;        being able to talk.
+;      * hardware flow control. RTSEN/CTSEN are cited above but GPIO16/17
+;        are not muxed here and nothing tests them, so CR is written with
+;        both clear rather than with an untested option.
+;
+; ======================================================================
+;  WHAT HAS BEEN TESTED
+; ======================================================================
+;  THIS FILE IS THE CONSOLE. If you are reading a line from this board,
+;  this file printed it.
+;
+;  ---- WHY THAT SENTENCE IS HERE ---------------------------------------
+;
+;  Until 2026-08-27 this heading read "NOTHING IN THIS FILE HAS RUN ON
+;  SILICON", written on 2026-08-24 and true for about a day. It survived
+;  three weeks of bench work in which every single result - the mailbox,
+;  the framebuffer, PCIe, GENET, the MMU, the Wi-Fi firmware upload -
+;  arrived over the port this file brings up. A banner nobody owns and
+;  no test contradicts does not decay; it just sits there being wrong,
+;  and the reason it is dangerous is stated in the audit that found it:
+;  a reader either re-derives finished work or distrusts a proven file.
+;  The old text is kept below, struck through in the same way RULES.md
+;  keeps superseded rules, because a claim that simply vanishes gets
+;  re-derived by the next reader who finds it in the git history.
+;
+;  ---- WHAT RAN, WHEN, AND WHAT WAS MEASURED --------------------------
+;
+;    * UartInit() BRINGS A PL011 UP FROM COLD AND IT WORKS. Proven on
+;      silicon continuously since 2026-08-26, the day the board began
+;      booting `KERNEL8.IMG` directly with no U-Boot on the stick.
+;      RaspberryPi4/Monitor/anvil.pi4:9481 calls `UartInit(115200)` as
+;      the second thing after the stack is set, with NOTHING having
+;      touched the PL011 first: no loader, no pin mux, no pulls, no
+;      divisor. Anvil's prompt then appears on the FTDI. That is the
+;      whole of UartInit - mux, pulls, divisor, LCRH, CR - executed from
+;      a genuinely cold port and producing readable characters at the
+;      other end of the cable. It is not an adopted port; anvil.pi4's
+;      own header records the change from UartAttach() to UartInit() and
+;      why it had to happen the day the monitor became bootable.
+;
+;      The ordering inside UartInit() was the part flagged to doubt.
+;      Nothing has ever come out garbled, at any of the three rates
+;      below, so the ordering is right as written. Do not reorder it on
+;      the strength of a different vendor's example.
+;
+;    * THE DIVISOR ARITHMETIC IS MEASURED, NOT ARGUED, AT THREE RATES.
+;      `UartInit(n)` is what Anvil's `baud` command calls
+;      (anvil.pi4:4914), so a rate change is this file's IBRD/FBRD
+;      calculation and nothing else. From the bench, 2026-08-26 (vault:
+;      "Silicon results 2026-08-26", section 4):
+;
+;          115200      9.23 s      9.0 KB/s
+;          1500000     2.59 s     32.1 KB/s
+;          3000000     accepted by both ends and CORRUPTS DATA
+;
+;      1.5 Mbaud is the ceiling on this adapter and is in routine use -
+;      `tools/anvil_update.py` calls setbaud(1500000) on every run and
+;      moved a 259 KB image in 6.9 s. So the divisor is right at a 13x
+;      spread of rates, which is a far stronger statement than one
+;      working baud rate: a wrong FBRD term shows up as a rate-dependent
+;      error, and this file does not have one. The 3 Mbaud failure is
+;      the ADAPTER, not this arithmetic - both ends accept the setting.
+;
+;    * FUARTCLK IS CORROBORATED FROM THE OTHER SIDE. This file does not
+;      program the UART clock and takes the firmware's value as an input
+;      (see WHAT IS DELIBERATELY NOT HERE above). On 2026-08-25 the
+;      mailbox reported UART clock configured 48000000, measured
+;      48001464 (clocks.pi4's own header carries the table), against a
+;      config.txt carrying init_uart_clock=48000000 and a console
+;      visibly working at 115200. Three independent readings agreeing.
+;
+;    * THE TRANSMIT AND RECEIVE LOOPS ARE PROVEN, and were the first
+;      thing here that was. UartWrite() and UartRead() are
+;      pi4Hello.pi4's PutC() and anvil.pi4's GetC() with a bound added -
+;      same registers, same bit, same sense - and those ran on this
+;      board on 2026-08-24. Every command typed at the `pmf>` prompt
+;      since has gone through UartRead(); every line of every bench
+;      transcript quoted anywhere in this tree has gone through
+;      UartWrite().
+;
+;  ---- WHAT IS STILL NOT PROVEN, and this list is the honest half -----
+;
+;    * HARDWARE FLOW CONTROL. Still not muxed, still not tested, still
+;      written with RTSEN/CTSEN clear. Unchanged.
+;    * THE RECEIVE OVERRUN AND FRAMING ERROR PATHS. The console has
+;      never been deliberately overrun or fed a wrong-rate stream, so
+;      the RSRECR/ECR handling has never been reached by a real error.
+;      A 3 Mbaud run is the cheapest way to produce one on purpose.
+;    * ANY RATE ABOVE 1.5 Mbaud. The board accepts the setting and the
+;      wire corrupts, so nothing above that has been usefully exercised
+;      and no claim is made about the divisor there.
+;
+;  ---- SUPERSEDED, kept because it explains what the evidence replaced -
+;
+;    ~~NOTHING IN THIS FILE HAS RUN ON SILICON.~~
+;    ~~UartInit() HAS NEVER RUN AT ALL, on this board or any other. It~~
+;    ~~is the first code in this project to bring a PL011 up from cold~~
+;    ~~on a Pi 4. It was written from the register tables cited above~~
+;    ~~and checked against the emitted assembly; that is reading, not~~
+;    ~~running. THE ORDERING IS THE PART TO DOUBT.~~
+;
+;    Written 2026-08-24. Both sentences were true that day. The second
+;    one stopped being true two days later and nothing in the tree
+;    noticed - see THE BANNER PROBLEM at the very bottom of this header.
+;
+;    * WHAT THE BUILD PROVED BEFORE ANY OF THE ABOVE, and it is still
+;      worth keeping because it is what the file rested on for two days.
+;      This file was first written and built against a pmfc.exe
+;      that PREDATED the 64-bit pi4 model - .i four bytes, every
+;      expression in W registers - and then rebuilt against the 64-bit
+;      one the moment it landed (2026-08-24, ~20:58). Both builds are
+;      clean, with no warnings.
+;
+;      The emitted assembly was read both times, and the thing worth
+;      recording is that IT CHANGED EXACTLY WHERE IT SHOULD AND NOWHERE
+;      ELSE. Under the new model every .i intermediate moved from W to X
+;      - and every PL011 and GPIO access stayed "ldr w" / "str w",
+;      because they are PeekL/PokeL and PeekL/PokeL are four bytes on
+;      any model. That is the whole of the monitor's warning about bare
+;      Peek/Poke, checked rather than asserted.
+;
+;      Confirmed by reading tuart.img.asm under the 64-bit build:
+;        FR   read at $FE201018, masked with 32   (TXFF)
+;        DR   written at $FE201000, masked with $FF
+;        mux  GPFSEL1 $FE200004, clear $0003F000, set (4<<12) and (4<<15)
+;             GPPUP0  $FE2000E4, clear $F0000000, set (1<<30)
+;        init CR=0, FR.BUSY poll, LCRH=0, mux, IMSC=0, ICR=$7FF,
+;             IBRD, FBRD, LCRH=$70, CR=$301 - in that order.
+;      Reading an emitted image is not running one. It rules out the
+;      transcription mistakes; it rules out nothing about the silicon.
+;
+;  ---- THE BANNER PROBLEM, since this file was its worst instance ------
+;
+;  A "nothing has run" banner is a CLAIM WITH NO OWNER AND NO TEST. It
+;  is written by whoever is at the keyboard on day one, when it is both
+;  true and easy to write, and from that moment nothing in the tree can
+;  ever make it go red. Every other statement in this header is either
+;  a citation (which a gate can re-open and re-derive) or a measurement
+;  (which a re-run can contradict). The status line is the one sentence
+;  that is pure prose, and prose does not fail a build.
+;
+;  Worse, the failure is silent in BOTH directions and the second is the
+;  dangerous one. An understated banner costs a reader an afternoon
+;  re-deriving finished work, or makes them distrust a file that is
+;  proven. An OVERSTATED one - a header claiming a proof the bench never
+;  produced - gets believed, built on, and only discovered when the
+;  thing it promised does not happen on someone else's board.
+;
+;  The cheap fix this file adopts, and every silicon claim above obeys
+;  it: A CLAIM CARRIES ITS EVIDENCE OR IT IS NOT MADE. Not "works" but
+;  what ran, on what date, and what number came back. A sentence with a
+;  date and a measurement in it announces its own staleness - a reader
+;  who sees 2026-08-24 on a file that has been through five bench
+;  sessions knows to go and look. "NOTHING HAS RUN ON SILICON" carries
+;  no date, so it reads as present tense for ever.
+; ======================================================================
+
+; ======================================================================
+;  THE TWO BOARD-SPECIFIC ADDRESSES IN THIS FILE. THERE ARE NO OTHERS.
+; ======================================================================
+;  Changed 2026-08-26. This file used to carry eleven absolute BCM2711
+;  addresses; it now carries two, and everything else below is an
+;  OFFSET INSIDE A BLOCK, which is the same on every Broadcom part this
+;  project might reach.
+;
+;  WHY THAT IS WORTH DOING even though nothing moved today. The eleven
+;  addresses were spread over two definition groups and quoted a
+;  further nine times in the comment prose above, so "find every board
+;  address in uart.pi4" was a reading job with a real chance of missing
+;  one - and a missed PL011 address on a Pi 3 is a console that writes
+;  into nothing and says not one word about it. Now the question has a
+;  two-line answer.
+;
+;  WHY THE OFFSETS ARE NAMED "_OFF" AND THE OLD NAMES ARE GONE. If
+;  #UART_FR had simply changed value from $FE201018 to $18, every use
+;  site this conversion failed to update would still COMPILE - and
+;  would read address $18 for ever. Renaming them means a missed site
+;  is a compile error naming the constant. That is the entire reason
+;  for the suffix; it is not decoration.
+;
+;  WHY THESE TWO ARE STILL LITERALS AND NOT #SOC_UART0_BASE /
+;  #SOC_GPIO_BASE FROM RaspberryPi4/Lib/soc.pi4. Only because making
+;  them so would make soc.pi4 a MANDATORY include for every program
+;  that prints a character, and there are twenty-two examples, the
+;  monitor and four gates that would all stop compiling in the same
+;  commit. soc.pi4 carries the same two numbers with fuller citations
+;  and tools/a64/a64_socbase_check.py FAILS if these two lines and that
+;  file ever disagree, so there is one source of truth today and the
+;  duplication is machine-checked rather than trusted. The last step -
+;  deleting these two lines and taking the values from soc.pi4 - is a
+;  one-line edit per program and is written up in the vault as
+;  "Making the tree portable 2026-08-26".
+;
+;  CITATIONS. serial@7e201000 - Datasheets/pi4/bcm283x.dtsi:304, and
+;  bcm2711-peripherals.pdf 11.5 Register View, p.148, "UART0:
+;  0x7e201000". gpio@7e200000 - bcm283x.dtsi:107, and the same document
+;  5.2 Register View, p.67, "The GPIO register base address is
+;  0x7e200000". Bus $7Ennnnnn is ARM physical $FEnnnnnn on this part -
+;  bcm2711.dtsi:41.
+; ======================================================================
+#UART_BASE      = $FE201000    ; serial@7e201000, the PL011
+#UART_GPIO_BASE = $FE200000    ; gpio@7e200000, for the pin mux only
+
+; ----------------------------------------------------------------------
+;  PL011 UART0 register OFFSETS. 32-bit device registers - PeekL/PokeL
+;  only. bcm2711-peripherals.pdf Table 172, p.148.
+; ----------------------------------------------------------------------
+#UART_DR_OFF    = $00          ; data
+#UART_FR_OFF    = $18          ; flags
+#UART_IBRD_OFF  = $24          ; integer baud divisor   (15:0)
+#UART_FBRD_OFF  = $28          ; fractional divisor      (5:0)
+#UART_LCRH_OFF  = $2C          ; line control
+#UART_CR_OFF    = $30          ; control
+#UART_IMSC_OFF  = $38          ; interrupt mask set/clear
+#UART_ICR_OFF   = $44          ; interrupt clear
+
+#FR_TXFF    = 32               ; bit 5 - transmit FIFO FULL
+#FR_RXFE    = 16               ; bit 4 - receive FIFO EMPTY
+#FR_BUSY    = 8                ; bit 3 - still shifting a character out
+#FR_TXFE    = 128              ; bit 7 - transmit FIFO empty
+
+#LCRH_WLEN8 = $60              ; bits 6:5 = b11, eight data bits
+#LCRH_FEN   = $10              ; bit 4    - enable the 32-deep FIFOs
+#LCRH_STP2  = 8                ; bit 3    - two stop bits (unused here)
+#LCRH_PEN   = 2                ; bit 1    - parity enable (unused here)
+
+#CR_UARTEN  = 1                ; bit 0
+#CR_TXE     = $100             ; bit 8
+#CR_RXE     = $200             ; bit 9
+
+#ICR_ALL    = $7FF             ; bits 10:0, every write-one-to-clear bit
+
+; ----------------------------------------------------------------------
+;  GPIO register OFFSETS, for the pin mux only. The base is
+;  #UART_GPIO_BASE above. bcm2711-peripherals.pdf Table 63, p.67.
+; ----------------------------------------------------------------------
+#UART_GPFSEL1_OFF = $04        ; GPIO 10..19, three bits each
+#UART_GPPUP0_OFF  = $E4        ; GPIO 0..15 pull select, two bits each
+
+; ----------------------------------------------------------------------
+;  The reference clock. THIS IS THE config.txt NUMBER - see the header.
+;      init_uart_clock=48000000
+; ----------------------------------------------------------------------
+#UART_CLOCK_HZ = 48000000
+
+; ----------------------------------------------------------------------
+;  How long a bounded wait waits.
+;
+;  THIS IS AN ITERATION COUNT, NOT A DURATION, and the distinction is the
+;  point: it needs no clock, no calibration and no init, so it is correct
+;  on the very first character of a program whose clocks are not up yet.
+;  Each iteration is one read of a peripheral register across the
+;  BCM2711's peripheral bus, so the real ceiling is tens of milliseconds
+;  on a 1.5 GHz A72 - two orders of magnitude more than the ~2.8 ms a
+;  full 32-byte TX FIFO needs to drain at 115200. At a very low baud rate
+;  it is proportionally tighter; a program running at 300 baud should not
+;  be surprised by a dropped character.
+;
+;  WHY THERE IS A BOUND AT ALL. Without one, a Print() issued before
+;  UartInit() - or after a UartInit() whose return value was not checked,
+;  or on a board whose config.txt sent the PL011 to Bluetooth - spins for
+;  ever on the first character and the board is dead with no message. Two
+;  of those three are the exact failures this file's header is about. So
+;  a starved UartWrite() gives up, drops the character and RETURNS, and
+;  the program carries on. Silence is a better failure than a hang.
+; ----------------------------------------------------------------------
+#UART_SPIN_MAX = 1000000
+
+Global uart_ready.i            ; 0 = never brought up or adopted
+Global uart_dropped.i          ; characters given up on - see UartDropped()
+
+; ----------------------------------------------------------------------
+;  THE MIRROR - a copy of everything written, for a second console.
+; ----------------------------------------------------------------------
+;  ADDED 2026-08-25 so the Pi 4 monitor can put its output on the HDMI
+;  screen as well as the serial line.
+;
+;  WHY A BUFFER AND NOT A CALLBACK. The obvious design is a hook: let
+;  the caller register a procedure and have UartWrite call it. This
+;  language has no procedure pointers, so that is not on the table.
+;
+;  WHY NOT JUST CALL THE DISPLAY FROM HERE. Because a library never
+;  includes a library in this project - the MAIN file lists what it
+;  needs - and a uart.pi4 that referenced display.pi4 would drag a
+;  framebuffer into every program that wants to print a number,
+;  including the ones that run before there is a display at all.
+;
+;  So the coupling is inverted: this file writes characters into a ring
+;  and knows nothing about who reads them. Whoever owns a screen drains
+;  it. The dependency points from the screen to the UART, which is the
+;  direction that costs nothing.
+;
+;  OFF BY DEFAULT, and that is load-bearing. Every existing program
+;  compiles to the same instructions it did before, because the enable
+;  flag starts at zero and the only added cost on the hot path is one
+;  test of a global. The buffer's BSS is the only unconditional cost.
+;
+;  OVERFLOW DROPS THE NEWEST AND COUNTS IT. Dropping the oldest would
+;  scroll the interesting line off the screen precisely when something
+;  is going wrong and output is heavy, which is the wrong half to lose.
+;  Either way it is counted, because a silently lossy console is worse
+;  than no console - this whole file is written around that idea.
+#UART_MIRROR_BYTES = 8192      ; a comfortable screenful and then some
+
+Global Dim uart_mirror.a[#UART_MIRROR_BYTES]
+; A SECOND, independent output tap. The primary mirror above has one
+; consumer (the HDMI console drains it with UartMirrorGet); a wireless
+; console needs the same bytes without stealing them from the screen,
+; so it drains this parallel ring instead. Generic on purpose - it is
+; an 'aux output tap', not a Wi-Fi thing - so any target's second sink
+; uses it the same way.
+Global Dim uart_aux.a[#UART_MIRROR_BYTES]
+Global uart_auxOn.i
+Global uart_auxHead.i
+Global uart_auxTail.i
+Global uart_auxLost.i
+; A FLUSH CALLBACK. When output is produced faster than the prompt's
+; wait loop drains the aux tap - a long command printing forty lines
+; before it returns - the ring would overflow and the far end would
+; see only the tail. A consumer (the wireless console) registers a
+; flush here and uart_AuxPut calls it on each line and before the ring
+; fills, so the output goes out AS IT IS PRODUCED. Generic: uart.pi4
+; does not know what the sink is.
+Global *uart_auxFlush
+Global uart_auxBusy.i
+; BULK MODE. Normally the flush fires on every line boundary so a command's
+; output feels live. A bulk dump (the screenshot's tens of thousands of short
+; run-lines) would then send one tiny datagram PER LINE - a firehose that
+; overruns the radio's and the host's buffers and drops packets mid-stream.
+; In bulk mode the per-line trigger is suppressed and only the fill-high rule
+; fires, so lines coalesce into full ~1 KB datagrams: same bytes, ~16x fewer
+; packets. It changes only WHEN the tap flushes, never WHAT - and the serial
+; path never touches this ring, so it is unaffected either way.
+Global uart_auxBulk.i
+Global uart_mirrorOn.i         ; 0 until somebody asks for it
+Global uart_mirrorHead.i       ; next slot to write
+Global uart_mirrorTail.i       ; next slot to read
+Global uart_mirrorLost.i       ; characters the ring could not hold
+; The primary mirror has the same producer-side safety valve as the aux
+; tap, but its callback has a deliberately narrower contract: move bytes
+; into the terminal MODEL only. It must not paint, poll a network, or print.
+; That separation lets a command emit arbitrarily many lines without an
+; 8 KiB loss window while still batching the expensive screen render at the
+; next ScreenPump after the command returns.
+Global *uart_mirrorDrain
+Global uart_mirrorBusy.i
+
+; Turn the mirror on or off. Off also empties it: a console that is
+; switched on again should show what happens next, not a backlog from
+; before it existed.
+Procedure UartMirror(on.i)
+  uart_mirrorOn = on
+  If on = 0
+    uart_mirrorHead = 0
+    uart_mirrorTail = 0
+  EndIf
+EndProcedure
+
+Procedure.i UartMirrorOn()
+  ProcedureReturn uart_mirrorOn
+EndProcedure
+
+; Register the model-only drain called while output is being produced, or 0
+; for none. The callback runs inside UartWrite and MUST NOT print. A guard is
+; applied by uart_MirrorPut even though the intended console callback never
+; re-enters output.
+Procedure UartMirrorSetDrain(*fn)
+  *uart_mirrorDrain = *fn
+EndProcedure
+
+; The next mirrored character, or -1 if there is nothing waiting.
+; -1 and not 0, because 0 is a character.
+Procedure.i UartMirrorGet()
+  Define c.i
+  If uart_mirrorTail = uart_mirrorHead
+    ProcedureReturn -1
+  EndIf
+  c = uart_mirror[uart_mirrorTail] & $FF
+  uart_mirrorTail = uart_mirrorTail + 1
+  If uart_mirrorTail >= #UART_MIRROR_BYTES
+    uart_mirrorTail = 0
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+; How many characters the ring had to throw away. Print it somewhere.
+Procedure.i UartMirrorLost()
+  ProcedureReturn uart_mirrorLost
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LOOKING AT THE RING WITHOUT EMPTYING IT
+;
+;  Added 2026-08-26. UartMirrorGet() consumes, which is right for a
+;  console that draws every character as it arrives - and wrong for one
+;  that wants to know what is coming BEFORE it starts drawing.
+;
+;  WHY A CONSOLE WOULD WANT THAT, because it is not obvious and the pair
+;  below is otherwise just API surface. A screen console handed more
+;  full lines than it has rows will draw every one of them and then
+;  scroll all but the last screenful straight off the top. On the Pi 4's
+;  HDMI surface a scroll moves several megabytes, so those are the most
+;  expensive characters in the system and NOT ONE of them is still on
+;  the glass when the drawing stops. A console that can count the line
+;  feeds first can skip the doomed ones and draw only what survives,
+;  which is the difference between a board that looks hung and one that
+;  does not.
+;
+;  READ ONLY, both of them. Neither moves the tail, so the drawing loop
+;  still consumes through UartMirrorGet() exactly as before and nothing
+;  that does not call these can behave differently.
+;
+;  UartMirrorAt(0) is the OLDEST character waiting - the next one
+;  UartMirrorGet() would return - and index n-1 is the newest, where n
+;  is UartMirrorCount(). An index outside that range returns -1 rather
+;  than a byte of whatever the ring last held there: a caller that walks
+;  off the end should see something impossible, not a stale character
+;  that looks real.
+; ----------------------------------------------------------------------
+Procedure.i UartMirrorCount()
+  Define n.i
+  n = uart_mirrorHead - uart_mirrorTail
+  If n < 0
+    n = n + #UART_MIRROR_BYTES
+  EndIf
+  ProcedureReturn n
+EndProcedure
+
+; Leave two KiB of headroom. Newlines normally drain much sooner; this rule
+; is what makes one unusually long line lossless as well.
+Procedure.i UartMirrorFillHigh()
+  If UartMirrorCount() > (#UART_MIRROR_BYTES - 2048)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i UartMirrorAt(i.i)
+  Define k.i
+  If i < 0 Or i >= UartMirrorCount()
+    ProcedureReturn -1
+  EndIf
+  k = uart_mirrorTail + i
+  If k >= #UART_MIRROR_BYTES
+    k = k - #UART_MIRROR_BYTES
+  EndIf
+  ProcedureReturn uart_mirror[k] & $FF
+EndProcedure
+
+Procedure uart_MirrorPut(c.i)
+  Define nxt.i
+  nxt = uart_mirrorHead + 1
+  If nxt >= #UART_MIRROR_BYTES
+    nxt = 0
+  EndIf
+  If nxt = uart_mirrorTail
+    ; Full. Keep what is already queued and count this one lost.
+    uart_mirrorLost = uart_mirrorLost + 1
+    ProcedureReturn
+  EndIf
+  uart_mirror[uart_mirrorHead] = c & $FF
+  uart_mirrorHead = nxt
+  ; Drain into the shared terminal model while a long synchronous command is
+  ; printing. Rendering is intentionally NOT done here: one help dump becomes
+  ; many cheap model updates followed by one frame, not hundreds of frames.
+  If *uart_mirrorDrain <> 0 And uart_mirrorBusy = 0
+    If c = 10 Or UartMirrorFillHigh() <> 0
+      uart_mirrorBusy = 1
+      uart_mirrorDrain()
+      uart_mirrorBusy = 0
+    EndIf
+  EndIf
+EndProcedure
+
+; The aux tap. Same ring discipline as the primary mirror.
+Procedure UartAuxMirror(on.i)
+  uart_auxOn = on
+  If on = 0
+    uart_auxHead = 0
+    uart_auxTail = 0
+  EndIf
+EndProcedure
+
+; Register the flush to call while output is being produced, or 0 for
+; none. The callback MUST NOT print (it runs inside UartWrite), and it is
+; re-entry guarded regardless.
+Procedure UartAuxSetFlush(*fn)
+  *uart_auxFlush = *fn
+EndProcedure
+
+; Turn bulk (coalescing) mode on/off for the aux tap. On for a large machine
+; dump (the screenshot), off for ordinary interactive output. See the note on
+; uart_auxBulk. Off is the default, so nothing changes for normal commands.
+Procedure UartAuxBulk(on.i)
+  If on <> 0
+    uart_auxBulk = 1
+  Else
+    uart_auxBulk = 0
+  EndIf
+EndProcedure
+
+; 1 when the aux ring is within 2 KB of full - flush before it drops.
+Procedure.i UartAuxFillHigh()
+  Define n.i
+  n = uart_auxHead - uart_auxTail
+  If n < 0
+    n = n + #UART_MIRROR_BYTES
+  EndIf
+  If n > (#UART_MIRROR_BYTES - 2048)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i UartAuxOn()
+  ProcedureReturn uart_auxOn
+EndProcedure
+
+Procedure.i UartAuxGet()
+  Define c.i
+  If uart_auxTail = uart_auxHead
+    ProcedureReturn -1
+  EndIf
+  c = uart_aux[uart_auxTail] & $FF
+  uart_auxTail = uart_auxTail + 1
+  If uart_auxTail >= #UART_MIRROR_BYTES
+    uart_auxTail = 0
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+Procedure uart_AuxPut(c.i)
+  Define nxt.i
+  nxt = uart_auxHead + 1
+  If nxt >= #UART_MIRROR_BYTES
+    nxt = 0
+  EndIf
+  If nxt = uart_auxTail
+    uart_auxLost = uart_auxLost + 1
+    ProcedureReturn
+  EndIf
+  uart_aux[uart_auxHead] = c & $FF
+  uart_auxHead = nxt
+  ; Flush on a line boundary or when the ring is filling, so a long
+  ; command's output reaches the far end instead of overflowing. Guarded
+  ; against re-entry: a flush that itself printed would recurse here. In
+  ; bulk mode the per-line trigger is off, so a many-thousand-line dump
+  ; coalesces into full datagrams (fill-high) instead of one per line.
+  If *uart_auxFlush <> 0 And uart_auxBusy = 0
+    If (uart_auxBulk = 0 And c = 10) Or UartAuxFillHigh() <> 0
+      uart_auxBusy = 1
+      uart_auxFlush()
+      uart_auxBusy = 0
+    EndIf
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  Transmit and receive.
+;
+;  Lifted from pi4Hello.pi4 (PutC) and anvil.pi4 (GetC/GetCT), which
+;  are what actually ran on this board. The registers, the bit and the
+;  sense are unchanged; the bound is the addition.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UartWrite(c) - one byte. Bounded; never hangs.
+;
+;  Waits until the transmit FIFO is NOT full. THE SENSE IS THE OPPOSITE
+;  OF THE MINI-UART'S LSR BIT 5, which means "ready" - see the header.
+; ----------------------------------------------------------------------
+Procedure UartWrite(c.i)
+  Define f.i
+  Define n.i
+  n = 0
+  Repeat
+    f = PeekN(#UART_BASE + #UART_FR_OFF)
+    If (f & #FR_TXFF) = 0
+      PokeL(#UART_BASE + #UART_DR_OFF, c & $FF)
+      ; The mirror sees only what the wire saw. A character dropped
+      ; below because the FIFO never drained must not appear on the
+      ; screen either, or the two consoles disagree about what happened
+      ; and the screen becomes the more trustworthy-looking liar.
+      If uart_mirrorOn <> 0
+        uart_MirrorPut(c)
+      EndIf
+      If uart_auxOn <> 0
+        uart_AuxPut(c)
+      EndIf
+      ProcedureReturn 1
+    EndIf
+    n = n + 1
+  Until n >= #UART_SPIN_MAX
+  ; The FIFO never drained. Drop it and say so, rather than spin.
+  uart_dropped = uart_dropped + 1
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartWriteStr(*s) - a NUL-terminated string.
+;
+;  NOTE ON THE MISSING STAR further down in str_print_at(), and it is not
+;  a typo: in a procedure taking "*s", the bare name inside the body IS
+;  the address. Here the pointer parameter is used as an address and
+;  PeekB does the dereferencing, exactly as PutS() does in the monitor.
+;
+;  PeekB SIGN-EXTENDS, so a byte of 200 arrives as -56 and the NUL test
+;  would still work but the character would be wrong. Masked with $FF.
+; ----------------------------------------------------------------------
+Procedure UartWriteStr(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    UartWrite(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartWriteNl() - CR and LF both, because the reader is a terminal.
+; ----------------------------------------------------------------------
+Procedure UartWriteNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartReadReady() - 1 if a byte is waiting. Never blocks.
+;
+;  RXFE is "receive FIFO EMPTY" - again the opposite sense to the
+;  mini-UART, whose LSR bit 0 is "Data ready".
+; ----------------------------------------------------------------------
+Procedure UartReadReady()
+  If (PeekN(#UART_BASE + #UART_FR_OFF) & #FR_RXFE) = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartRead() - one byte. BLOCKS FOR EVER.
+;
+;  That is deliberate and it is the right default for a line editor,
+;  where waiting for a human is the whole job. It is the WRONG call
+;  inside a transfer loop: use UartReadWait(), which leaves a live
+;  program behind when the wire dies. anvil.pi4 makes exactly this
+;  split (GetC vs GetCT) and for exactly this reason.
+;
+;  Masked with $FF: DR bits 11:8 are the receive error flags (OE, BE, PE,
+;  FE - Table 173) and are not part of the character.
+; ----------------------------------------------------------------------
+Procedure.i UartRead()
+  Define f.i
+  Repeat
+    f = PeekN(#UART_BASE + #UART_FR_OFF)
+  Until (f & #FR_RXFE) = 0
+  ProcedureReturn PeekN(#UART_BASE + #UART_DR_OFF) & $FF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartReadWait(spins) - one byte, or -1 if none arrived.
+;
+;  spins is an iteration count on the same scale as #UART_SPIN_MAX; pass
+;  0 to use that default. A transfer that dies halfway must leave a live
+;  prompt behind, not a wedged board on a shared bench.
+; ----------------------------------------------------------------------
+Procedure.i UartReadWait(spins.i)
+  Define f.i
+  Define n.i
+  If spins <= 0
+    spins = #UART_SPIN_MAX
+  EndIf
+  n = 0
+  Repeat
+    f = PeekN(#UART_BASE + #UART_FR_OFF)
+    If (f & #FR_RXFE) = 0
+      ProcedureReturn PeekN(#UART_BASE + #UART_DR_OFF) & $FF
+    EndIf
+    n = n + 1
+  Until n >= spins
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartDrain() - block, bounded, until everything has left the wire.
+;
+;  BUSY, not TXFE. TXFE only says the FIFO is empty; BUSY "remains set
+;  until the complete byte, including all the stop bits, has been sent
+;  from the shift register" (Table 175). The difference is one character
+;  time, and it is the difference between a clean handover and a
+;  truncated last line when the next thing you do is reset the board.
+; ----------------------------------------------------------------------
+Procedure UartDrain()
+  Define n.i
+  n = 0
+  Repeat
+    If (PeekN(#UART_BASE + #UART_FR_OFF) & #FR_BUSY) = 0
+      ProcedureReturn 1
+    EndIf
+    n = n + 1
+  Until n >= #UART_SPIN_MAX
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartDropped() - how many characters UartWrite() has given up on.
+;
+;  A bench instrument, and the one number that distinguishes "the program
+;  printed nothing" from "the program printed and the port ate it". Zero
+;  with no output means the routing trap; non-zero means the port is
+;  there and not draining.
+; ----------------------------------------------------------------------
+Procedure.i UartDropped()
+  ProcedureReturn uart_dropped
+EndProcedure
+
+; ======================================================================
+;  Adoption - the call for a program a loader started.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UartAttach() - adopt an already-running port. Returns 1.
+;
+;  IT WRITES NOTHING. Not CR, not LCRH, not ICR, not a GPIO register.
+;  That is the entire contract: whatever the loader set up keeps working,
+;  including a baud rate this file has no way to discover and a pin mux
+;  it must not disturb.
+;
+;  IT CANNOT VERIFY ANYTHING EITHER, and pretending otherwise would be
+;  worse than useless. The FR read below proves the peripheral aperture
+;  is mapped and answering - it would fault or read as garbage if the
+;  MMIO window were wrong - and that is ALL it proves. A PL011 routed to
+;  the Bluetooth module answers exactly as healthily as one on the
+;  header. So this returns 1 unconditionally rather than inventing a
+;  confidence it does not have.
+;
+;  Reading FR has no side effect: FR is RO (Table 175) and unlike the
+;  mini-UART's LSR - whose overrun bit "is cleared each time this
+;  register is read" - nothing here is read-to-clear.
+; ----------------------------------------------------------------------
+Procedure.i UartAttach()
+  Define f.i
+  f = PeekN(#UART_BASE + #UART_FR_OFF)
+  uart_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  Cold bring-up.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  uart_MuxPins() - GPIO14 -> TXD0, GPIO15 -> RXD0, both ALT0. Internal.
+;
+;  READ-MODIFY-WRITE, and the mask matters. GPFSEL1 holds GPIO10..19,
+;  three bits each; FSEL14 is bits 14:12 and FSEL15 is bits 17:15
+;  (Table 65). Six bits to change, twenty-six to leave alone - GPIO16/17
+;  are UART0's CTS/RTS on ALT3 but they are also SPI1 and a dozen other
+;  things on this board, and GPIO10..13 may be an SPI or an I2C somebody
+;  else in the program set up. Writing the whole register would silently
+;  return all of them to plain inputs.
+;
+;  THE PULLS. Reset value for both pins is b10, pull-down (Table 90),
+;  which is also what raspberry-pi-4-datasheet.pdf Table 5 lists as the
+;  power-on default ("Low"). This sets:
+;
+;      GPIO14 (TX)  b00, no resistor - it is an output, the PL011 drives
+;                   it, and a resistor on a driven pin is only current
+;
+;      GPIO15 (RX)  b01, pull UP - so an UNCONNECTED RX idles HIGH, which
+;                   is the line's marking state. Left at its pull-DOWN
+;                   default an unplugged RX sits at 0, which a UART reads
+;                   as a permanent start bit: a continuous BREAK and a
+;                   stream of $00 characters out of a port with nothing
+;                   attached to it. That is a real bench symptom that
+;                   looks like a fault in whatever is reading.
+;
+;  This is a CHOICE, not a citation - the bit positions and the encoding
+;  are Table 90, the values are the engineering call above. Note that
+;  bcm283x.dtsi's own uart0_gpio14 group specifies pins and function but
+;  NO brcm,pull, so Linux leaves the pulls wherever it found them; this
+;  file does not, deliberately.
+;
+;  NO DELAY SEQUENCE. The BCM2835's GPPUD/GPPUDCLK dance needed "wait 150
+;  cycles" twice. THAT REGISTER PAIR IS NOT WHAT THIS IS. The BCM2711
+;  replaced it with the directly-written GPIO_PUP_PDN_CNTRL_REGn at 0xe4
+;  (Table 63), which has no clock and no documented settling protocol. If
+;  you are porting code from a Pi 3 and it has two delay loops in it, the
+;  delays are not the part to keep - the register is wrong.
+; ----------------------------------------------------------------------
+Procedure uart_MuxPins()
+  Define v.i
+
+  ; --- function select: FSEL14 = ALT0 (b100), FSEL15 = ALT0 (b100) ---
+  v = PeekN(#UART_GPIO_BASE + #UART_GPFSEL1_OFF)
+  ; Clear bits 17:12 - $3F000 - then set b100 at 12 and b100 at 15.
+  ; The shifts are parenthesised because & binds tighter than <<.
+  v = v & (~$0003F000)
+  v = v | (4 << 12)
+  v = v | (4 << 15)
+  PokeL(#UART_GPIO_BASE + #UART_GPFSEL1_OFF, v)
+
+  ; --- pulls: GPIO14 bits 29:28 = b00, GPIO15 bits 31:30 = b01 -------
+  v = PeekN(#UART_GPIO_BASE + #UART_GPPUP0_OFF)
+  v = v & (~$F0000000)
+  v = v | (1 << 30)
+  PokeL(#UART_GPIO_BASE + #UART_GPPUP0_OFF, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartInitClk(baud, clkhz) - cold bring-up with an explicit reference
+;  clock. Returns 1 on success, 0 if the divisor is out of range.
+;
+;  UartInit(baud) is this with clkhz = #UART_CLOCK_HZ and is what you
+;  normally call. This form exists for a boot medium whose config.txt
+;  says something other than init_uart_clock=48000000.
+;
+;  THE DIVISOR. bcm2711-peripherals.pdf Table 178, p.151, verbatim:
+;
+;      "Baud rate divisor BAUDDIV = (FUARTCLK/(16 * Baud rate)) where
+;       FUARTCLK is the UART reference clock frequency. The BAUDDIV is
+;       comprised of the integer value IBRD and the fractional value
+;       FBRD."
+;
+;  FBRD is six bits (Table 178), so the fraction is in 64ths. Computing
+;  it as 64*BAUDDIV in one integer expression and splitting the result
+;  avoids a floating-point step this target does not need:
+;
+;      64 * BAUDDIV = 64 * clk / (16 * baud) = (clk * 4) / baud
+;
+;  and to ROUND rather than truncate that last division, double it and
+;  add one before halving. Worked through for the deterministic case:
+;
+;      clk 48000000, baud 115200
+;      t = (48000000 * 8) / 115200 = 384000000 / 115200 = 3333
+;      t = (3333 + 1) / 2          = 1667
+;      IBRD = 1667 >> 6            = 26
+;      FBRD = 1667 & 63            = 3
+;
+;      check: 48e6/(16*115200) = 26.0417;  0.0417 * 64 = 2.67 -> 3.  OK.
+;
+;  clk * 8 IS THE ONLY PLACE THIS COULD OVERFLOW and it does not: at 48
+;  MHz it is 384000000, comfortably inside even a 32-bit signed .i. A
+;  board passing a reference clock above ~268 MHz would break that, which
+;  no Pi 4 does; the guard below catches the resulting nonsense anyway.
+;
+;  THE RANGE CHECK IS NOT DECORATION. IBRD is 16 bits (Table 177) and an
+;  IBRD of 0 turns the baud generator off - the port then looks perfectly
+;  configured and transmits nothing, which is this file's least favourite
+;  failure shape. Both ends are refused rather than truncated.
+; ----------------------------------------------------------------------
+Procedure.i UartInitClk(baud.i, clkhz.i)
+  Define t.i
+  Define ibrd.i
+  Define fbrd.i
+  Define n.i
+
+  If baud <= 0 Or clkhz <= 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 64 * BAUDDIV, rounded to the nearest 64th.
+  t = (clkhz * 8) / baud
+  t = (t + 1) / 2
+  ; t is positive here - a positive clock over a positive baud - so the
+  ; arithmetic >> below is a logical one.
+  If t < 64
+    ProcedureReturn 0            ; IBRD would be 0: generator off
+  EndIf
+  ibrd = (t >> 6)
+  fbrd = t & 63
+  If ibrd > 65535
+    ProcedureReturn 0            ; IBRD is 16 bits (Table 177)
+  EndIf
+
+  ; ==================================================================
+  ;  THE ORDER BELOW IS THE PL011'S, NOT A PREFERENCE. Two documented
+  ;  constraints overlap and both are quoted in the header:
+  ;
+  ;    Table 181's NOTE gives the five programming steps, and
+  ;    Table 179's NOTE says LCRH, IBRD and FBRD "must not be changed
+  ;    when the UART is enabled".
+  ;
+  ;  Reordering these is the classic way to get a port that works after
+  ;  the SECOND init and not the first, or one whose baud rate is right
+  ;  only until the next character. The numbered steps are the
+  ;  datasheet's own numbering.
+  ; ==================================================================
+
+  ; (1) Disable the UART. Everything below depends on this having
+  ;     happened first.
+  PokeL(#UART_BASE + #UART_CR_OFF, 0)
+
+  ; (2) "Wait for the end of transmission or reception of the current
+  ;     character." BUSY is that condition (Table 175). Bounded, because
+  ;     on a port that was never running - the cold case this procedure
+  ;     exists for - BUSY may simply never be what we expect, and an
+  ;     unbounded wait here would hang the board inside its own console
+  ;     bring-up, with no console to say so.
+  n = 0
+  While (PeekN(#UART_BASE + #UART_FR_OFF) & #FR_BUSY) <> 0 And n < #UART_SPIN_MAX
+    n = n + 1
+  Wend
+
+  ; (3) "Flush the transmit FIFO by setting the FEN bit to 0 in the Line
+  ;     Control Register." Writing LCRH = 0 does that and is legal now
+  ;     because the UART is disabled.
+  PokeL(#UART_BASE + #UART_LCRH_OFF, 0)
+
+  ; --- pins. Between (3) and (4) on purpose: the port is disabled and
+  ;     flushed, so nothing half-formed is driven onto TXD as the pin
+  ;     changes function, and the mux is in place before the port comes
+  ;     back up in (5).
+  uart_MuxPins()
+
+  ; --- mask and clear interrupts. This is a POLLED driver: it installs
+  ;     no vector table and no handler. IMSC = 0 first so nothing new can
+  ;     be raised, then ICR clears whatever a loader left pending. Skip
+  ;     this and a program that later enables the GIC takes an interrupt
+  ;     it has no handler for, seconds after this call returned success.
+  PokeL(#UART_BASE + #UART_IMSC_OFF, 0)
+  PokeL(#UART_BASE + #UART_ICR_OFF, #ICR_ALL)
+
+  ; --- the divisor. Legal here and only here: the UART is disabled
+  ;     (Table 179's note), and IBRD must be written before FBRD is
+  ;     latched with LCRH below.
+  PokeL(#UART_BASE + #UART_IBRD_OFF, ibrd)
+  PokeL(#UART_BASE + #UART_FBRD_OFF, fbrd)
+
+  ; --- line format: 8 data bits, no parity, one stop bit, FIFOs on.
+  ;     WRITING LCRH IS WHAT LATCHES IBRD AND FBRD on a PL011 - that is
+  ;     why it comes after them and not before. FIFOs on because this is
+  ;     a polled driver: 32 bytes of slack is the difference between
+  ;     dropping characters and not, when the program is off doing
+  ;     something else.
+  PokeL(#UART_BASE + #UART_LCRH_OFF, #LCRH_WLEN8 | #LCRH_FEN)
+
+  ; (4)+(5) Reprogram CR and enable. One write: UARTEN with TXE and RXE.
+  ;     Table 181's own note - "To enable transmission, the TXE bit and
+  ;     UARTEN bit must be set to 1" - is why all three are in the same
+  ;     word. Flow control (RTSEN/CTSEN) is deliberately left clear; see
+  ;     the header.
+  PokeL(#UART_BASE + #UART_CR_OFF, #CR_UARTEN | #CR_TXE | #CR_RXE)
+
+  uart_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartInit(baud) - cold bring-up at the config.txt reference clock.
+;
+;  THE CALL TO MAKE when the program owns the machine. Returns 1, or 0 if
+;  baud is not reachable from #UART_CLOCK_HZ - and a 0 here must not be
+;  ignored, because everything downstream will look fine and print
+;  nothing.
+; ----------------------------------------------------------------------
+Procedure.i UartInit(baud.i)
+  ProcedureReturn UartInitClk(baud, #UART_CLOCK_HZ)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartRunning() - is UARTEN set? 1 or 0.
+;
+;  A HONEST BUT NARROW instrument, and the narrowness is the point: it
+;  reads CR bit 0, so it says the port is ENABLED. It says nothing about
+;  whether the port is ON THE HEADER (that is config.txt - see the
+;  routing trap) or whether the baud rate matches the far end (that is
+;  init_uart_clock). Do not build a gate out of it that you then trust.
+; ----------------------------------------------------------------------
+Procedure.i UartRunning()
+  If (PeekN(#UART_BASE + #UART_CR_OFF) & #CR_UARTEN) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartOff() - drain, then disable. Returns 1.
+;
+;  Drains first so the last line actually leaves the wire (see
+;  UartDrain's note on BUSY versus TXFE), then clears CR. The pin mux is
+;  LEFT ALONE: returning GPIO14/15 to inputs would drop TXD low, which
+;  the far end reads as a break condition. If you genuinely want the pins
+;  back, do it yourself after this and know what you are asking for.
+; ----------------------------------------------------------------------
+Procedure.i UartOff()
+  UartDrain()
+  PokeL(#UART_BASE + #UART_CR_OFF, 0)
+  uart_ready = 0
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+; ======================================================================
+;  THE PRINT ROUTER'S THREE PROCEDURES.
+;
+;  CUT FROM HERE DOWN into RaspberryPi4/Lib/string_out_uart.pi4 the day a
+;  second Print destination exists on this part. See the header.
+;
+;  The compiler resolves these BY NAME, lowercased: str_print_at,
+;  printdec, printnl. Renaming one does not produce a link error - it
+;  produces "Print()/PrintN() needs Lib/string_out.pico (it defines
+;  printdec)" from the front end, which is a confusing message to get
+;  about a file you are looking at.
+; ======================================================================
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  str_print_at(p) - the raw-address string walk.
+;
+;  NOTE ON THE MISSING STAR, and it is not a typo: in a procedure taking
+;  "*s.i" the bare name s inside the body IS the address and "*s"
+;  DEREFERENCES it. This one takes a plain .i for that reason - the same
+;  choice, for the same reason, as the RP2350 twin.
+;
+;  PeekB sign-extends, so a byte of 200 would arrive as -56. Masked.
+; ----------------------------------------------------------------------
+Procedure str_print_at(p.i)
+  Define c.i
+  c = PeekB(p) & $FF
+  While c <> 0
+    UartWrite(c)                 ; <-- the ONE transport dependency
+    p = p + 1
+    c = PeekB(p) & $FF
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PrintDec(v) - a SIGNED integer in base 10.
+;
+;  THIS IS anvil.pi4's PutDec(), NOT the RP2350's digit-buffer
+;  version, and the difference is the type. The RP2350 file accumulates
+;  on the NEGATIVE side because "the size-first version divides by -1 to
+;  handle negatives, and INT_MIN / -1 overflows - measured on an Uno
+;  2026-07-31, where it printed -2147483648 as a minus sign and ONE
+;  digit."
+;
+;  That is still true here, and it is still handled - just at the other
+;  end. "v = 0 - v" on the most negative .i gives back the same negative
+;  number, so the guarded scale walk below would print nothing for it.
+;  What saves it is that the scale is 19 digits: on the 64-bit pi4 model
+;  the most negative .i is -9223372036854775808 and the loop reaches it,
+;  because the DIVISION is what extracts each digit and no division by -1
+;  ever happens. Under the old 32-bit model the same source printed
+;  -2147483648 correctly for the same reason.
+;
+;  THE SCALE IS BUILT AT RUN TIME AND CHECKED, and that is three lines
+;  of insurance against a stale compiler - which is not a hypothetical.
+;  THIS FILE WAS BUILT BY A 32-BIT pmfc.exe FOR THE FIRST HOUR OF ITS
+;  LIFE, on 2026-08-24, while the 64-bit backend was still being landed
+;  by another worker.
+;
+;  Written as the literal 1000000000000000000, such a compiler prints
+;
+;      WARNING: 1000000000000000000 does not fit in 'scale' (.i, range
+;               -2147483648..4294967295).
+;
+;  and WRAPS IT - to $A7640000, which is NEGATIVE in that model's signed
+;  .i, so "While scale > 0" never runs and PrintDec prints absolutely
+;  nothing for every positive number. A silent, total failure of the one
+;  procedure you would be using to debug it.
+;
+;  The warning is exactly right on anvil.pi4, which carries that
+;  literal on purpose as a canary. On a library that every image
+;  includes it is noise on every build, and noise on every build is how
+;  a real warning gets missed. So the value is MULTIPLIED at run time -
+;  which the constant folder cannot see, so there is no warning - and
+;  the product is then TESTED. Negative means wrapped: fall back to ten
+;  digits, which is every value that model can hold anyway. On the
+;  64-bit model, which is now the shipped one, the test is one compare
+;  and the branch is dead.
+; ----------------------------------------------------------------------
+Procedure PrintDec(v.i)
+  Define d.i
+  Define scale.i
+  Define started.i
+  If v < 0
+    UartWrite(45)                ; '-'
+    v = 0 - v
+  EndIf
+  If v = 0
+    UartWrite(48)                ; '0'
+    ProcedureReturn
+  EndIf
+  scale = 1000000000
+  scale = scale * 1000000000
+  If scale <= 0
+    scale = 1000000000
+  EndIf
+  started = 0
+  While scale > 0
+    d = (v / scale) % 10
+    If d <> 0 Or started <> 0
+      UartWrite(48 + d)
+      started = 1
+    EndIf
+    scale = scale / 10
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PrintNl() - end the line.
+;
+;  No flush, and none needed: a UART has no packet boundary to commit,
+;  unlike USB CDC where a short line sits in the endpoint until something
+;  forces it out. Do not add a UartDrain() here - it would cost a
+;  character time on every line for nothing.
+; ----------------------------------------------------------------------
+Procedure PrintNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure

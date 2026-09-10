@@ -1,0 +1,949 @@
+; ======================================================================
+;  touch - the Waveshare DSI panel's touch controller and its power MCU
+; ----------------------------------------------------------------------
+;  WHY THIS IS A BOARD FILE AND NOT A CORE ONE, and it is a deliberate
+;  choice rather than a shortcut.
+;
+;  Every other command family in this monitor lives in Anvil/Core and
+;  reaches hardware through an Hw* seam, so it compiles on a board that
+;  has none of it and degrades to an honest refusal. That is the right
+;  shape for a family two boards will ever have.
+;
+;  This one has exactly one board. There is no HwTouch* vocabulary in
+;  hal.pi4 and inventing one for a single implementation would be
+;  designing a seam from one example, which is how a seam ends up shaped
+;  like its first caller. THE PRESENCE OF THIS FILE IS THE CAPABILITY:
+;  board.pi4 includes it, and a board that does not include it does not
+;  have the command. When a second board grows a touch panel, the seam
+;  gets designed from two examples and this file moves to Core.
+;
+;  It also has one thing no Hw* seam offers today: I2cWriteRead(), the
+;  repeated-start transfer. HwI2cWrite/HwI2cRead cannot express it, and
+;  a Goodix read through those two would put a STOP in the middle and
+;  return real bytes from the wrong register.
+;
+;  REQUIRES, and board.pi4 lists them all in order ahead of this file:
+;    RaspberryPi4/Lib/gpio.pi4
+;    RaspberryPi4/Lib/i2c.pi4
+;    RaspberryPi4/Lib/dsi_panel.pi4
+;    RaspberryPi4/Lib/touch_goodix.pi4
+;    Anvil/Core/parse.pbi, format.pi4, rxbreak.pi4 (the usual command kit)
+;
+;  WHICH BUS - AND THIS CHANGED ON 2026-09-06. i2c.pi4 now drives BOTH
+;  BSC masters, so this command talks to the one the panel is actually
+;  on: BSC0, GPIO 44/45 at ALT1, the DSI and CSI connectors' bus. No
+;  jumper wires. `touch bus header` puts it back on GPIO 2/3 for a panel
+;  wired to the header the way the overlay's i2c1 override describes.
+;
+;  IT PUTS THE HEADER BUS BACK WHEN IT IS DONE. The selected bus is a
+;  global inside i2c.pi4 and the core `i2c` command shares it; a `touch`
+;  that walked away leaving BSC0 selected would make the next `i2c scan`
+;  report BSC0's devices under a heading naming GPIO 2 and 3. HwI2cUp()
+;  re-selects the header bus as well, so the two guards cross-check.
+;
+;  WHICH GENERATION. The bench panel is the v2 board - its overlay line
+;  is vc4-kms-dsi-waveshare-panel-v2,10_1_inch_a - so `touch panel`
+;  drives Lib/dsi_panel_v2.pi4, the GPIO expander at $94..$99. The v1
+;  register file in Lib/dsi_panel.pi4 is NOT driven from here and must
+;  not be: $AB and $AD are outside the v2 MCU's regmap and what an
+;  out-of-range write does to it is undocumented. The v1 library stays in
+;  the tree for a v1 board and is what the desk gate exercises through
+;  Examples/Diagnostics/pi4TouchProbe.pi4.
+;
+;  THE ORDER MATTERS AND IT IS NOT OBVIOUS. On a v2 board the touch
+;  controller's reset line is expander bit 9 - it is not on any Pi GPIO -
+;  so the Goodix CANNOT ANSWER until the MCU at $45 has been written.
+;  Probing the touch address first therefore reads as a dead bus on a
+;  perfectly good panel. DsiV2Begin() runs before Gt9Begin() only when
+;  the panel MCU has not already been brought up. Repeating it rewrites
+;  the whole expander shadow and can clear live rails and backlight.
+; ======================================================================
+
+; How long `touch points` runs before giving up on its own, in polls at
+; #TOUCH_POLL_MS each. About thirty seconds. It also stops on a keypress;
+; this is the backstop for a session that walked away.
+#TOUCH_LIVE_POLLS = 1500
+#TOUCH_POLL_MS = 20
+
+; WHICH BUS THE PANEL IS ON is gTouchBus, and it is declared in
+; RaspberryPi4/Board/hw_touch.pi4 rather than here. It used to live in
+; this file, which was right while this command was the only thing that
+; talked to the panel; it is not any more. The boot path, the cursor's
+; tick and the payload ABI all reach the same controller now, so one
+; copy of "which pair of pins" has to serve all four - and the seam is
+; where it belongs. `touch bus display` and `touch bus header` set it.
+
+; ----------------------------------------------------------------------
+;  TouchUsage - what to type. Printed for a bare `touch` word that is not
+;  a subcommand, the same shape i2c_cmd.pi4 uses.
+; ----------------------------------------------------------------------
+Procedure TouchUsage()
+  PrintN("touch talks to the DSI panel's touch controller and its power MCU:")
+  PrintN("  touch                        what is on the bus, and what it is")
+  PrintN("  touch points                 live coordinates until a key is pressed")
+  PrintN("  touch panel power            rails up, touch out of reset")
+  PrintN("  touch panel prepare          iovcc, avdd and the panel's own reset")
+  PrintN("  touch panel light <n>        backlight, 0 dark to 255 full, DECIMAL")
+  PrintN("  touch panel reset            pulse the touch controller's reset")
+  PrintN("  touch bus display            use BSC0 on GPIO 44/45 - the default")
+  PrintN("  touch bus header             use BSC1 on GPIO 2 and 3 instead")
+  PrintN("  touch axes                   the controller-to-panel axis correction")
+  PrintN("  touch axes <swap> <invx> <invy>   set it, each 0 or 1, and SAVE it")
+  PrintN("The default bus is the DISPLAY connector's, BSC0 on GPIO 44/45 at")
+  PrintN("ALT1. No jumpers are needed. The header bus is one command away for")
+  PrintN("a panel wired to pins 3 and 5 instead.")
+  PrintN("A finger moves the same cursor a USB mouse moves and a tap presses")
+  PrintN("the same button, so there is nothing to turn on: touch comes up with")
+  PrintN("the panel at boot. `touch axes` is the one thing an eye may have to")
+  PrintN("correct, and it is saved, so it is typed once and not again.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchSayBusCode - one #I2C_* code, in words, so a failure names itself.
+; ----------------------------------------------------------------------
+Procedure TouchSayBusCode(c.i)
+  If c = #I2C_OK
+    Print("the transfer succeeded")
+  ElseIf c = #I2C_NACK
+    Print("nothing acknowledged that address")
+  ElseIf c = #I2C_CLKT
+    Print("the device held the clock too long")
+  ElseIf c = #I2C_TIMEOUT
+    Print("the transfer never finished - the bus looks wedged")
+  ElseIf c = #I2C_ARG
+    Print("the driver refused its own arguments, which is a defect here")
+  ElseIf c = #I2C_NOSR
+    Print("the repeated start could not be issued, which is a defect in")
+    Print(" I2cWriteRead and NOT a missing panel")
+  Else
+    Print("code ")
+    PrintDec(c)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchSayBus - which controller, which pads, which alt. Printed before
+;  anything is probed, because a result nobody can attribute to a pair of
+;  wires is not a result.
+; ----------------------------------------------------------------------
+Procedure TouchSayBus()
+  If I2cBus() = #I2C_BUS_DISPLAY
+    Print("The bus is BSC0 on GPIO ")
+  Else
+    Print("The bus is BSC1 on GPIO ")
+  EndIf
+  PrintDec(I2cBusSda())
+  Print(" and ")
+  PrintDec(I2cBusScl())
+  Print(", at ALT")
+  PrintDec(I2cBusAlt())
+  Print(", base $")
+  PutHexN(I2cBusBase(), 8)
+  If I2cBus() = #I2C_BUS_DISPLAY
+    PrintN(" - the DSI and CSI connectors.")
+  Else
+    PrintN(" - the 40-pin header.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchSayPads - the FSEL code and the pad level of each line.
+;
+;  THIS IS THE 584 INSTRUMENT. A bus that will not transfer is either
+;  unmuxed, or muxed and idle-high with nothing on it, or muxed and held
+;  low - and those three want three different answers. Printing the pads
+;  BEFORE anything is changed is the only way to know which one arrived.
+;
+;  On the display connector there are no pull-ups on the Pi: they are on
+;  the panel board, through the ribbon. So BOTH LINES LOW HERE IS A CABLE
+;  RESULT, not a driver result, and it is the one thing on this bench
+;  that can say so without an eye.
+; ----------------------------------------------------------------------
+Procedure TouchSayPads(when.i)
+  If when = 0
+    Print("  before the mux: ")
+  Else
+    Print("  after the mux:  ")
+  EndIf
+  Print("sda fsel ")
+  PrintDec(PinModeGet(I2cBusSda()))
+  Print(" level ")
+  PrintDec(I2cPadLevel(I2cBusSda()))
+  Print(", scl fsel ")
+  PrintDec(PinModeGet(I2cBusScl()))
+  Print(" level ")
+  PrintDec(I2cPadLevel(I2cBusScl()))
+  PrintN("")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchSayMcu - the v2 panel MCU: probe it, read its three identity
+;  bytes, power it on. Returns 1 if the MCU answered, else 0.
+;
+;  IT PROBES BEFORE IT WRITES and it READS BEFORE IT WRITES. An address
+;  probe is a zero-length transaction that changes nothing, and the three
+;  identity registers are read-only. So the first two things this does
+;  cannot alter the state of a panel that is already running, which is
+;  what makes `touch` safe to type twice.
+; ----------------------------------------------------------------------
+Procedure.i TouchSayMcu()
+  Define c.i
+  Define ok.i
+
+  c = I2cProbe(#DSI_V2_ADDR)
+  If c <> #I2C_OK
+    Print("No panel MCU at $45: ")
+    TouchSayBusCode(c)
+    PrintN(".")
+    ProcedureReturn 0
+  EndIf
+  PrintN("A panel control MCU acknowledged $45.")
+
+  If DsiV2Identify() = 0
+    Print("  but its identity registers would not read: ")
+    TouchSayBusCode(DsiV2BusCode())
+    PrintN(".")
+    PrintN("  $97, $98 and $99 are the v2 MCU's size, hardware id and firmware")
+    PrintN("  version. A part that ACKs and will not read them is either the")
+    PrintN("  FIRST-generation MCU, whose register map has none of them, or a")
+    PrintN("  bus that can address but not receive. Nothing is written to it")
+    PrintN("  from here either way - the v1 registers are outside this MCU's")
+    PrintN("  map and what an out-of-range write does is undocumented.")
+    ProcedureReturn 0
+  EndIf
+
+  Print("  size $")
+  PutHex2(DsiV2Size())
+  Print("  hardware id $")
+  PutHex2(DsiV2Id())
+  Print("  mcu version $")
+  PutHex2(DsiV2Version())
+  PrintN("")
+
+  ok = DsiV2Plausible()
+  If ok = 0
+    PrintN("  ALL THREE ARE $00 or ALL THREE ARE $FF. That is what an undriven")
+    PrintN("  or a held bus reads, not what a part answers. Treat the MCU as")
+    PrintN("  ABSENT and suspect the ribbon before the driver.")
+    ProcedureReturn 0
+  EndIf
+
+  PrintN("  Three bytes came back with content in them, from a part that had")
+  PrintN("  to be addressed, hold a register number across a STOP and then")
+  PrintN("  drive data. THE RIBBON CARRIES I2C AND IS SEATED. It says nothing")
+  PrintN("  about the four differential lanes in the same cable.")
+  PrintN("  What the values MEAN is not published anywhere; they are recorded,")
+  PrintN("  not interpreted.")
+
+  If DsiV2Ready() = 0
+    If DsiV2Begin() = 0
+      Print("  the power-on write failed: ")
+      TouchSayBusCode(DsiV2BusCode())
+      PrintN(".")
+      ProcedureReturn 0
+    EndIf
+    PrintN("  VCC is on and the touch controller is out of reset (expander")
+    PrintN("  $0300). The Goodix could not have answered before this line.")
+  Else
+    PrintN("  The panel MCU is already up. Its expander shadow was left alone,")
+    PrintN("  so this status command did not clear live rails or backlight.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchStatus - a bare `touch`. What answered, and what it means.
+; ----------------------------------------------------------------------
+Procedure TouchStatus()
+  Define a.i
+  Define i.i
+  Define c.i
+  Define *idp
+
+  TouchSayBus()
+  TouchSayPads(1)
+
+  TouchSayMcu()
+
+  ; THROUGH THE SEAM'S OWN BRING-UP, not straight at the driver. It is
+  ; the same procedure the boot path and the cursor's lazy attach use,
+  ; so a `touch` that revives a controller revives the finger with it -
+  ; and there is one place that decides whether the thing is up.
+  HwTouchRestart()
+  a = Gt9Addr()
+  If a = 0
+    PrintN("No Goodix touch controller answered.")
+    Print("  $5D said: ")
+    TouchSayBusCode(Gt9CodeHigh())
+    PrintN(".")
+    Print("  $14 said: ")
+    TouchSayBusCode(Gt9CodeLow())
+    PrintN(".")
+    PrintN("If the MCU above answered and this did not, the touch chip is held")
+    PrintN("in reset or is not fitted - NOT a dead bus, because the bus just")
+    PrintN("carried three bytes. `touch panel reset` pulses expander bit 9.")
+    PrintN("If NEITHER answered, nothing on this bus is alive: check the")
+    PrintN("ribbon, and read the pad levels printed above before the driver.")
+    ProcedureReturn
+  EndIf
+
+  Print("A Goodix touch controller answered at $")
+  PutHex2(a)
+  PrintN(".")
+
+  ; THE ID IS PRINTED BYTE BY BYTE, not with Print(*idp). Print's router
+  ; picks its formatter from the argument's TYPE, and an untyped pointer
+  ; is not a string - Print(*idp) would emit the ADDRESS in decimal with
+  ; no diagnostic at all. board.pi4's own header records that exact
+  ; defect in PutClockRow, found by a model rather than by a reader.
+  *idp = Gt9ProdId()
+  If *idp <> 0
+    Print("  product id     ")
+    i = 0
+    While i < 4
+      c = PeekA(*idp + i) & $FF
+      If c >= 32 And c < 127
+        UartWrite(c)
+      EndIf
+      i = i + 1
+    Wend
+    PrintN("")
+  EndIf
+  Print("  firmware       $")
+  PutHexN(Gt9Firmware(), 4)
+  PrintN("")
+  Print("  config version ")
+  PrintDec(Gt9ConfigVersion())
+  PrintN("")
+
+  ; THE RESOLUTION IS READ OFF THE PART, NOT ASSUMED - and it has to be
+  ; printed, because every mapped coordinate is scaled by these two
+  ; numbers and a wrong one does not look like an error. It looks like a
+  ; finger landing a hand's width from where it touched.
+  Print("  reports        ")
+  PrintDec(Gt9XMax())
+  Print(" by ")
+  PrintDec(Gt9YMax())
+  Print(", up to ")
+  PrintDec(Gt9MaxPoints())
+  PrintN(" points at once")
+  If Gt9XMax() < 1 Or Gt9YMax() < 1
+    PrintN("  A RANGE OF ZERO IS AN UNPROGRAMMED CONFIG BLOCK, not a coordinate.")
+    PrintN("  Nothing invents a number in its place, so no touch can be mapped")
+    PrintN("  to the screen until the part reports one; the raw values below")
+    PrintN("  still read, which is how to tell a dead controller from this.")
+  EndIf
+  Print("  interrupt      the config block asks for trigger type ")
+  PrintDec(Gt9IntTrigger())
+  PrintN("")
+  PrintN("  and nothing on this board is wired to it, so this driver polls at")
+  PrintN("  about 60 Hz - which is what the reference driver does on exactly")
+  PrintN("  this wiring. The number is printed, not acted on.")
+
+  ; WHICH PANEL THIS IS, which is worth more than the touch on a first
+  ; bring-up: the two generations need completely different display work.
+  If a = $14
+    PrintN("$14 is the first-generation Waveshare panel: 1280x800 landscape,")
+    PrintN("and its display needs NO DSI initialisation sequence at all.")
+    PrintN("It is NOT the board this monitor is set up for - `touch panel`")
+    PrintN("drives the v2 MCU, whose registers a v1 part does not have.")
+  Else
+    PrintN("$5D is the DSI-TOUCH generation - the v2 board. Native mode is")
+    PrintN("800x1280 PORTRAIT at 60 Hz, 70 MHz pixel clock, two lanes, and")
+    PrintN("its display needs a 205-command DCS table before it shows a")
+    PrintN("thing. Landscape is a rotation of that, not a mode.")
+  EndIf
+
+  TouchSayMapping()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchSayMapping - where a finger lands, and what decides it.
+;
+;  THE ROTATION IS NOT THIS COMMAND'S TO OWN and it is not repeated
+;  here as a setting: it is the SCREEN's rotation, the one `screen
+;  rotate` sets and the one the console's own pixels go through. What
+;  this prints is which rotation is in force and what it does to a
+;  corner, so that a wrong picture and a wrong touch are visibly the
+;  same fault rather than two.
+; ----------------------------------------------------------------------
+; TouchSayBit - one bit of the axis code as a 0 or a 1.
+;
+; A PROCEDURE AND NOT AN EXPRESSION INSIDE PrintDec. Whether a
+; comparison yields exactly 1 is a language question this file has no
+; business depending on, and a mapping report that printed something
+; other than 0 or 1 would be read as a corrupted setting.
+Procedure TouchSayBit(f.i, bit.i)
+  If (f & bit) <> 0
+    Print("1")
+  Else
+    Print("0")
+  EndIf
+EndProcedure
+
+Procedure TouchSayMapping()
+  Define f.i
+  Define st.i
+  Define deg.i
+  Define lw.i
+  Define lh.i
+  Define xm.i
+  Define ym.i
+
+  f = HwTouchFlip()
+  st = TouchFlipStored()
+  deg = TouchRotation()
+  lw = TouchSurfaceW()
+  lh = TouchSurfaceH()
+  xm = Gt9XMax()
+  ym = Gt9YMax()
+
+  Print("The controller's axes are taken as ")
+  If f = #SCR_TOUCH_ALIGNED
+    Print("ALIGNED with the panel's")
+  Else
+    Print("corrected: swap ")
+    TouchSayBit(f, #SCR_TOUCH_SWAP)
+    Print(", invert-x ")
+    TouchSayBit(f, #SCR_TOUCH_INVX)
+    Print(", invert-y ")
+    TouchSayBit(f, #SCR_TOUCH_INVY)
+  EndIf
+  Print(" (code ")
+  PrintDec(f)
+  PrintN(").")
+
+  If ScrTouchFlipOk(st) = 0
+    PrintN("SETTINGS.TXT names no axis correction, so that is the DEFAULT and")
+    PrintN("not something stored - which is what the overlay says about this")
+    PrintN("panel: the 10.1 inch a variant sets no swap and no inversion.")
+  Else
+    Print("SETTINGS.TXT holds ")
+    PrintDec(st)
+    PrintN(", so this is a stored answer and survives a reset.")
+  EndIf
+
+  Print("The console on the panel is turned ")
+  PrintDec(deg)
+  Print(" degrees and is ")
+  PrintDec(lw)
+  Print(" by ")
+  PrintDec(lh)
+  PrintN(" pixels;")
+  PrintN("a touch is scaled onto exactly that surface, so a change of screen")
+  PrintN("rotation or of scale moves the finger with the picture and needs")
+  PrintN("nothing typed here.")
+  If gScrSrc <> #SCR_SRC_DSI
+    PrintN("THE CONSOLE IS NOT ON THE PANEL AT THE MOMENT, so those are the")
+    PrintN("numbers the panel WOULD come up at. A finger cannot move a cursor")
+    PrintN("on a screen it is not on, so nothing is moved until `screen on dsi`.")
+  EndIf
+
+  If xm > 0 And ym > 0
+    PrintN("Where the corners land, computed rather than promised:")
+    Print("  controller 0,0            -> screen ")
+    PrintDec(ScrTouchX(deg, f, 0, 0, xm, ym, lw, lh))
+    Print(",")
+    PrintDec(ScrTouchY(deg, f, 0, 0, xm, ym, lw, lh))
+    PrintN("")
+    Print("  controller ")
+    PrintDec(xm - 1)
+    Print(",")
+    PrintDec(ym - 1)
+    Print("  -> screen ")
+    PrintDec(ScrTouchX(deg, f, xm - 1, ym - 1, xm, ym, lw, lh))
+    Print(",")
+    PrintDec(ScrTouchY(deg, f, xm - 1, ym - 1, xm, ym, lw, lh))
+    PrintN("")
+  EndIf
+  PrintN("`touch points` and one drag corner to corner is how the mapping is")
+  PrintN("checked against a finger; `touch axes` is how it changes, and it is")
+  PrintN("saved, so it is typed once.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchLive - `touch points`. Every contact, raw and mapped, until a
+;  key is pressed.
+;
+;  IT RUNS THROUGH THE SEAM, so what it prints is exactly what a UI and
+;  the cursor are being given - the same read, the same mapping, the
+;  same frame. A separate polling loop of its own would be a second
+;  opinion, and the whole point of typing this command is to find out
+;  whether the first one is right.
+;
+;  THE CURSOR MOVES WHILE IT RUNS, for the same reason: HwTouchTick is
+;  the one reader, so a finger dragged during this command is a finger
+;  dragging the arrow on the glass, and the numbers on the wire and the
+;  picture on the panel are the same event seen twice.
+; ----------------------------------------------------------------------
+Procedure TouchLive()
+  Define n.i
+  Define i.i
+  Define polls.i
+  Define seen.i
+  Define last.i
+
+  If HwTouchReady() = 0
+    If HwTouchRestart() = 0
+      PrintN("!! no touch controller answered. Run `touch` for the reason.")
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  PrintN("Reporting every frame that changes. Press any key to stop.")
+  PrintN("raw is what the controller said; screen is where that lands on the")
+  PrintN("console, through the same rotation and scale the picture uses.")
+  polls = 0
+  seen = 0
+  last = -1
+  While polls < #TOUCH_LIVE_POLLS
+    If OutBreak() <> 0
+      Break
+    EndIf
+    n = HwTouchTick()
+    If n < 0
+      Print("!! a transfer failed: ")
+      TouchSayBusCode(Gt9LastBusCode())
+      PrintN(".")
+      Break
+    EndIf
+    ; ONLY WHEN SOMETHING IS DOWN, AND ONLY WHEN IT CHANGED. A finger
+    ; resting still produces a frame every 17 ms; printing all of them
+    ; would scroll the very console the finger is being tested against
+    ; and, at 90 degrees, spend a full-screen transpose on each one.
+    If n > 0
+      If HwTouchQueued() > 0 Or n <> last
+        seen = seen + 1
+        i = 0
+        While i < n
+          Print("  id ")
+          PrintDec(HwTouchPointId(i))
+          Print("  raw ")
+          PrintDec(HwTouchPointRawX(i))
+          Print(",")
+          PrintDec(HwTouchPointRawY(i))
+          Print("  screen ")
+          PrintDec(HwTouchPointX(i))
+          Print(",")
+          PrintDec(HwTouchPointY(i))
+          Print("  size ")
+          PrintDec(HwTouchPointSize(i))
+          PrintN("")
+          i = i + 1
+        Wend
+      EndIf
+    EndIf
+    last = n
+    ; AND THE SAME DRAIN THE PROMPT DOES, so the arrow follows the
+    ; finger while this command holds the console. Two reasons and both
+    ; matter: the ring would otherwise fill and start dropping the
+    ; OLDEST event, which is the DOWN; and a report that printed
+    ; coordinates while the cursor stood still would be testing half the
+    ; path. TouchTick's own read is rate limited, so this costs nothing.
+    TouchTick()
+    delay(#TOUCH_POLL_MS)
+    polls = polls + 1
+  Wend
+
+  Print("Stopped after ")
+  PrintDec(polls)
+  Print(" polls; ")
+  PrintDec(seen)
+  Print(" report(s) printed, ")
+  PrintDec(Gt9Frames())
+  Print(" frames arrived, ")
+  PrintDec(HwTouchDowns())
+  Print(" down, ")
+  PrintDec(HwTouchMoves())
+  Print(" move, ")
+  PrintDec(HwTouchUps())
+  PrintN(" up.")
+  If Gt9Frames() = 1
+    PrintN("EXACTLY ONE frame and then nothing is the signature of the")
+    PrintN("buffer flag never being released. That would be a defect in")
+    PrintN("Gt9Poll, not a panel that stopped being touched.")
+  EndIf
+  If HwTouchLost() > 0
+    Print("!! ")
+    PrintDec(HwTouchLost())
+    PrintN(" event(s) have been dropped for a full queue since boot. That is a")
+    PrintN("   queue nobody drained, not a controller fault.")
+  EndIf
+  If HwTouchUnmapped() > 0
+    Print("!! ")
+    PrintDec(HwTouchUnmapped())
+    PrintN(" contact(s) could not be mapped to the screen since boot - the")
+    PrintN("   controller would not say what its coordinate range is, so there")
+    PrintN("   is no number to scale by. `touch` prints the range it reported.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchPanel - `touch panel ...`. gPos is past the word "panel".
+;
+;  Four verbs, and they are deliberately the four STEPS rather than one
+;  "bring the panel up": every one of them is a separate thing that can
+;  fail, and a single command that did all four would report the last
+;  failure and hide the first. On a bring-up bench the ladder IS the
+;  instrument.
+;
+;    power    the MCU's own probe write: VCC on, touch reset released
+;    prepare  the panel's rails and its reset, exactly as the panel
+;             driver does them before it sends one DCS byte
+;    light    the backlight - and this is the stage a human eye grades
+;    reset    pulse the touch controller's reset, expander bit 9
+; ----------------------------------------------------------------------
+Procedure TouchPanel()
+  Define v.i
+
+  SkipSpace()
+  If gLine[gPos] = 0
+    PrintN("!! touch panel needs power, prepare, light <n> or reset.")
+    PrintN("   Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If WordIs("power") <> 0
+    If DsiV2Ready() <> 0
+      PrintN("The panel MCU is already up. Nothing was rewritten: repeating the")
+      PrintN("power-on write could clear live rails and backlight.")
+      ProcedureReturn
+    EndIf
+    If DsiV2Begin() = 0
+      Print("!! the power-on write failed: ")
+      TouchSayBusCode(DsiV2BusCode())
+      PrintN(". Nothing is powered.")
+      ProcedureReturn
+    EndIf
+    Print("Expander written to $")
+    PutHexN(DsiV2Pins(), 4)
+    PrintN(": VCC on, touch controller out of reset.")
+    PrintN("That is what the Linux probe does and no more. The panel's own")
+    PrintN("rails are `touch panel prepare`; the light is `touch panel light`.")
+    ProcedureReturn
+  EndIf
+
+  If WordIs("prepare") <> 0
+    If DsiV2Ready() = 0
+      PrintN("!! run `touch panel power` first. Nothing was done.")
+      ProcedureReturn
+    EndIf
+    If DsiV2Prepare() = 0
+      Print("!! the prepare sequence failed: ")
+      TouchSayBusCode(DsiV2BusCode())
+      PrintN(".")
+      ProcedureReturn
+    EndIf
+    Print("iovcc, avdd, then reset low 60 ms and high 60 ms. Expander $")
+    PutHexN(DsiV2Pins(), 4)
+    PrintN(".")
+    PrintN("THE PANEL IS POWERED AND STILL BLANK, and that is correct: it")
+    PrintN("shows nothing until the DCS init table has gone over DSI and")
+    PrintN("video is running. A lit backlight over a blank panel is a RESULT.")
+    ProcedureReturn
+  EndIf
+
+  If WordIs("reset") <> 0
+    If DsiV2Ready() = 0
+      PrintN("!! run `touch panel power` first. Nothing was done.")
+      ProcedureReturn
+    EndIf
+    If DsiV2TouchReset(20) = 0
+      Print("!! the reset pulse failed: ")
+      TouchSayBusCode(DsiV2BusCode())
+      PrintN(".")
+      ProcedureReturn
+    EndIf
+    PrintN("Expander bit 9 pulsed low for 20 ms. Nothing on this board reaches")
+    PrintN("the Goodix reset except that bit, so this is the only reset there")
+    PrintN("is. Run `touch` again to see whether it answers now.")
+    ProcedureReturn
+  EndIf
+
+  If WordIs("light") <> 0
+    ; DECIMAL, like clock and baud and speed, and unlike every address in
+    ; this monitor. Said in the usage text because a brightness typed as
+    ; hex is a working screen at the wrong level, which nobody notices.
+    v = ParseDec()
+    If gParseOk = 0
+      PrintN("!! touch panel light needs a DECIMAL level, 0 to 255.")
+      ProcedureReturn
+    EndIf
+    If DsiV2Ready() = 0
+      If DsiV2Begin() = 0
+        Print("!! no panel MCU at $45: ")
+        TouchSayBusCode(DsiV2BusCode())
+        PrintN(". Nothing was done.")
+        ProcedureReturn
+      EndIf
+    EndIf
+    If DsiV2Backlight(v) = 0
+      If v < 0 Or v > 255
+        PrintN("!! the level must be 0 to 255. Nothing was done.")
+      Else
+        Print("!! the backlight write failed: ")
+        TouchSayBusCode(DsiV2BusCode())
+        PrintN(".")
+      EndIf
+      ProcedureReturn
+    EndIf
+    Print("Backlight enable ")
+    If v = 0
+      Print("off")
+    Else
+      Print("on")
+    EndIf
+    Print(", PWM register $96 set to ")
+    PrintDec(v)
+    PrintN(" of 255.")
+    PrintN("THIS MCU IS NOT INVERTED - the first-generation one takes $FF")
+    PrintN("minus the level and this one takes the level. If the light does")
+    PrintN("not change, that is a wiring or a generation answer, not a")
+    PrintN("missing commit write: this generation has no commit register.")
+    PrintN("A LADDER, NOT ONE VALUE: try 0, then 128, then 255. One write")
+    PrintN("cannot tell a working backlight from a stuck one.")
+    ProcedureReturn
+  EndIf
+
+  PrintN("!! touch panel does not know that word. Nothing was done.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchBus - `touch bus display` / `touch bus header`.
+;
+;  It does NOT bring the new bus up: selecting is not configuring, and
+;  the next `touch` line does that. Printing what changed without
+;  changing four pads is the whole point - see I2cSelectBus.
+; ----------------------------------------------------------------------
+Procedure TouchBus()
+  SkipSpace()
+  If gLine[gPos] = 0
+    ; ***SELECT FIRST, THEN REPORT, AND RESTORE.*** TouchSayBus() prints
+    ; whatever bus i2c.pi4 currently has selected, and between commands
+    ; that is always the header bus, because every touch command puts it
+    ; back. Measured on silicon 2026-09-06: a bare `touch bus` answered
+    ; "BSC1 on GPIO 2 and 3" while the very next `touch` used BSC0. It
+    ; was a true sentence about the wrong question - the operator is
+    ; asking which bus THIS COMMAND uses, not which one the library is
+    ; parked on - and a true sentence about the wrong question is the
+    ; kind of thing that gets written down.
+    I2cSelectBus(gTouchBus)
+    TouchSayBus()
+    I2cSelectBus(#I2C_BUS_HEADER)
+    PrintN("Type `touch bus display` or `touch bus header` to change it.")
+    ProcedureReturn
+  EndIf
+
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If WordIs("display") <> 0
+    gTouchBus = #I2C_BUS_DISPLAY
+  ElseIf WordIs("header") <> 0
+    gTouchBus = #I2C_BUS_HEADER
+  Else
+    PrintN("!! touch bus takes display or header. Nothing was changed.")
+    ProcedureReturn
+  EndIf
+
+  I2cSelectBus(gTouchBus)
+  TouchSayBus()
+  TouchSayPads(0)
+  PrintN("Nothing was muxed and nothing was enabled - the next touch command")
+  PrintN("does that. The levels above are the pads as the firmware left them.")
+  I2cSelectBus(#I2C_BUS_HEADER)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchAxes - `touch axes` reports, `touch axes <swap> <invx> <invy>`
+;  sets AND SAVES.
+;
+;  ***IT IS SAVED, AND THAT IS THE POINT OF IT.*** Which way the touch
+;  controller counts against the panel it is glued to is a fact about
+;  the panel, like which way up the panel is bolted - and `screen
+;  rotate` is stored for exactly that reason. A correction that had to
+;  be retyped after every reset would mean the board did NOT come up
+;  with working touch, which is the requirement.
+;
+;  It is not the rotation and it does not duplicate it. The rotation is
+;  the screen's and is set with `screen rotate`; this is only the
+;  controller's axes against the panel's, which the device tree states
+;  per panel model and states as "nothing" for the panel on this bench.
+;  Three numbers in, one code stored - see #SCR_TOUCH_SWAP.
+; ----------------------------------------------------------------------
+Procedure TouchAxes()
+  Define sw.i
+  Define ix.i
+  Define iy.i
+  Define f.i
+  Dim buf.a[16]
+
+  SkipSpace()
+  If gLine[gPos] = 0
+    TouchSayMapping()
+    PrintN("Type `touch axes <swap> <invert-x> <invert-y>`, each 0 or 1, to")
+    PrintN("change it. Try one thing at a time: if a finger moves the cursor")
+    PrintN("the right way across but the wrong way down, that is invert-y")
+    PrintN("alone, and swapping as well would move it sideways instead.")
+    ProcedureReturn
+  EndIf
+
+  sw = ParseDec()
+  If gParseOk = 0
+    PrintN("!! touch axes needs three numbers: swap, invert-x, invert-y.")
+    PrintN("   Each is 0 or 1, decimal. Nothing was done.")
+    ProcedureReturn
+  EndIf
+  ix = ParseDec()
+  If gParseOk = 0
+    PrintN("!! touch axes needs three numbers: swap, invert-x, invert-y.")
+    PrintN("   Each is 0 or 1, decimal. Nothing was done.")
+    ProcedureReturn
+  EndIf
+  iy = ParseDec()
+  If gParseOk = 0
+    PrintN("!! touch axes needs three numbers: swap, invert-x, invert-y.")
+    PrintN("   Each is 0 or 1, decimal. Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  If sw < 0 Or sw > 1 Or ix < 0 Or ix > 1 Or iy < 0 Or iy > 1
+    PrintN("!! each of the three is 0 or 1 and nothing else, because each one")
+    PrintN("   is a yes or a no about an axis. Nothing was changed.")
+    ProcedureReturn
+  EndIf
+
+  f = 0
+  If sw <> 0
+    f = f | #SCR_TOUCH_SWAP
+  EndIf
+  If ix <> 0
+    f = f | #SCR_TOUCH_INVX
+  EndIf
+  If iy <> 0
+    f = f | #SCR_TOUCH_INVY
+  EndIf
+
+  ; STORE FIRST, THEN APPLY - the same order `screen rotate` uses, and
+  ; for the same reason: a correction that is on the glass but not in
+  ; the store is one that vanishes at the next reset without saying so,
+  ; and the operator who typed it has no way to tell.
+  PmfPutDec(f, @buf[0])
+  If SettingsSet(TouchAxesKey(), @buf[0]) = 0
+    PrintN("!! the axis correction could not be recorded in the settings store,")
+    PrintN("   so it was not applied either. Nothing was changed.")
+    ProcedureReturn
+  EndIf
+  If SettingsSave() = 0
+    PrintN("!! the settings store would not write to the boot medium, so this")
+    PrintN("   correction is in memory only and will be gone at the next reset.")
+    PrintN("   It is being applied anyway; type settings save when the medium")
+    PrintN("   is back to make it stick.")
+  EndIf
+
+  If HwTouchSetFlip(f) = 0
+    PrintN("!! the driver refused that combination, which is a defect here and")
+    PrintN("   not a typing mistake - the store now holds it and the driver")
+    PrintN("   does not. Report it.")
+    ProcedureReturn
+  EndIf
+
+  TouchSayMapping()
+  PrintN("It is saved, so the panel comes up mapped this way with nothing")
+  PrintN("typed. Drag one finger corner to corner and check `touch points`.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdTouch - the dispatcher. gPos is already past "touch".
+;
+;  THE BUS COMES UP HERE AND ONLY HERE, the same shape CmdI2c uses: the
+;  subcommand is decided before any hardware is touched, so an unknown
+;  word cannot leave the bus half-configured.
+; ----------------------------------------------------------------------
+Procedure CmdTouch()
+  Define which.i
+  Define up.i
+
+  SkipSpace()
+  If gLine[gPos] = 0
+    ; A bare `touch` is the status report, not the usage text - status is
+    ; what somebody typing one word wants, and the usage is one line away
+    ; from any wrong word.
+    which = 1
+  Else
+    gWordAt = gPos
+    SkipWord()
+    gWordLen = gPos - gWordAt
+
+    which = 0
+    If WordIs("points") <> 0
+      which = 2
+    ElseIf WordIs("panel") <> 0
+      which = 3
+    ElseIf WordIs("axes") <> 0
+      which = 4
+    ElseIf WordIs("help") <> 0
+      which = 5
+    ElseIf WordIs("bus") <> 0
+      which = 6
+    EndIf
+
+    If which = 0
+      PrintN("!! touch does not know that subcommand.")
+      TouchUsage()
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  If which = 5
+    TouchUsage()
+    ProcedureReturn
+  EndIf
+
+  ; `touch bus` reports and selects without configuring anything, so it
+  ; runs OUTSIDE the bring-up below - that is what makes it able to print
+  ; the pads as the firmware left them.
+  If which = 6
+    TouchBus()
+    ProcedureReturn
+  EndIf
+
+  ; `touch axes` is arithmetic, not a transfer. Bringing a bus up for it
+  ; would mux two pads to answer a question about a coordinate mapping.
+  If which = 4
+    TouchAxes()
+    ProcedureReturn
+  EndIf
+
+  ; ---- THE BUS, AND THE PADS BEFORE IT IS TOUCHED --------------------
+  ; The reading BEFORE the mux is the one that cannot be taken later, so
+  ; it is taken here, on the path every hardware subcommand goes through.
+  I2cSelectBus(gTouchBus)
+  If gTouchBus = #I2C_BUS_DISPLAY
+    TouchSayPads(0)
+  EndIf
+
+  up = I2cUp()
+
+  ; ---- AND THE HEADER BUS GOES BACK, WHATEVER HAPPENS ----------------
+  ; Every return path below is inside this procedure so the restore at
+  ; the end is unavoidable. A `touch` that left BSC0 selected would make
+  ; the next `i2c scan` describe BSC0's devices under a heading naming
+  ; GPIO 2 and 3.
+  If up = 0
+    PrintN("!! the I2C bus would not come up. Nothing was done.")
+  ElseIf which = 1
+    TouchStatus()
+  ElseIf which = 2
+    TouchLive()
+  Else
+    TouchPanel()
+  EndIf
+
+  I2cSelectBus(#I2C_BUS_HEADER)
+EndProcedure

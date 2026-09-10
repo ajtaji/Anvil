@@ -1,0 +1,135 @@
+; Emitted command-list/backend seam probe. Neon calls below are memory-only
+; stubs: the gate proves lowering order/state without pretending to model V3D.
+; Root's board gate is the proof that the same calls submit real control lists.
+#ANVIL_VK_TEST_BACKEND = 0
+#NEON_OK = 0
+
+#VKD_OUT = $06010000
+#VKD_OLD_SURFACE = $00100000
+#VKD_MAP_BASE = $00200000
+#VKD_IMAGE = $00204000
+#VKD_IMAGE_BYTES = 16384
+
+Global vkdReady.i = 1
+Global vkdBase.i = #VKD_OLD_SURFACE
+Global vkdW.i = 64
+Global vkdH.i = 64
+Global vkdPitch.i = 256
+Global vkdCalls.i
+Global vkdFirstTarget.i
+Global vkdRestoreTarget.i
+Global vkdClearWord.i
+Global vkdEndRc.i
+
+Procedure.i Neon_Ready()
+  ProcedureReturn vkdReady
+EndProcedure
+Procedure.i Neon_SurfaceBase()
+  ProcedureReturn vkdBase
+EndProcedure
+Procedure.i Neon_SurfacePhysicalW()
+  ProcedureReturn vkdW
+EndProcedure
+Procedure.i Neon_SurfacePhysicalH()
+  ProcedureReturn vkdH
+EndProcedure
+Procedure.i Neon_SurfacePitch()
+  ProcedureReturn vkdPitch
+EndProcedure
+Procedure.i NeonRetarget(base.i, bytes.i)
+  vkdCalls = vkdCalls + 1
+  If vkdCalls = 1 Or vkdCalls = 3
+    vkdFirstTarget = base
+  Else
+    vkdRestoreTarget = base
+  EndIf
+  If bytes <> #VKD_IMAGE_BYTES : ProcedureReturn 91 : EndIf
+  vkdBase = base
+  ProcedureReturn #NEON_OK
+EndProcedure
+Procedure.i NeonFrameBegin(colour.i)
+  vkdCalls = vkdCalls + 1
+  vkdClearWord = colour
+  ProcedureReturn #NEON_OK
+EndProcedure
+Procedure.i NeonFrameEnd()
+  vkdCalls = vkdCalls + 1
+  ProcedureReturn vkdEndRc
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_development.pi4"
+
+Global vkdChecks.i
+Global vkdFails.i
+
+Procedure Vkd(ok.i)
+  PokeN(#VKD_OUT + $100 + (vkdChecks * 8), ok)
+  vkdChecks = vkdChecks + 1
+  If ok = 0 : vkdFails = vkdFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define instance.i
+  Define physical.i
+  Define device.i
+  Define queue.i
+  Define pool.i
+  Define commandBuffer.i
+  Define count.i
+
+  Vkd(AnvilVkBackendAvailable() = 0)
+  Vkd(AnvilVkV3dDevelopmentEnable(#VKD_MAP_BASE, $10000) = #ANVIL_VK_OK)
+  Vkd(AnvilVkBackendAvailable() = 0)
+  Vkd(AnvilVkBackendKind() = #ANVIL_VK_BACKEND_V3D_DEVELOPMENT)
+  Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
+  count = 1
+  Vkd(AnvilVkPhysicalEnumerate(instance, @count, @physical) = #VK_SUCCESS)
+  Vkd(count = 1 And physical <> 0)
+  Vkd(AnvilVkDeviceCreate(physical, @device) = #VK_SUCCESS)
+  Vkd(AnvilVkDeviceQueue(device, @queue) = #VK_SUCCESS)
+  Vkd(AnvilVkCommandPoolCreate(device, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @pool) = #VK_SUCCESS)
+  Vkd(AnvilVkCommandBufferAllocate(device, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @commandBuffer) = #VK_SUCCESS)
+
+  Vkd(AnvilVkV3dDevelopmentFormat() = #VK_FORMAT_B8G8R8A8_UNORM)
+  Vkd(AnvilVkV3dDevelopmentImageBind(device, #VKD_MAP_BASE - 4096, #VKD_IMAGE_BYTES, 64, 64, 256, #VK_IMAGE_LAYOUT_UNDEFINED) = #ANVIL_VK_ERR_ARGS)
+  Vkd(AnvilVkV3dDevelopmentImageBind(device, #VKD_IMAGE, #VKD_IMAGE_BYTES, 64, 64, 256, #VK_IMAGE_LAYOUT_UNDEFINED) = #VK_SUCCESS)
+  Vkd(AnvilVkCommandBufferBegin(commandBuffer, 0) = #VK_SUCCESS)
+  Vkd(AnvilVkV3dDevelopmentCmdTransitionClear(commandBuffer, #VK_IMAGE_LAYOUT_UNDEFINED, 17, 34, 51, 68) = #VK_SUCCESS)
+  Vkd(AnvilVkV3dDevelopmentCmdTransitionClear(commandBuffer, #VK_IMAGE_LAYOUT_UNDEFINED, 0, 0, 0, 0) = #ANVIL_VK_ERR_STATE)
+  Vkd(AnvilVkCommandBufferEnd(commandBuffer) = #VK_SUCCESS)
+  ; Generic empty-submit must not erase or pretend to execute this work.
+  Vkd(AnvilVkQueueSubmitEmpty(queue, commandBuffer) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Vkd(AnvilVkCommandBufferState(commandBuffer) = #ANVIL_VK_CB_EXECUTABLE)
+
+  Vkd(AnvilVkV3dDevelopmentQueueSubmit(queue, commandBuffer) = #VK_SUCCESS)
+  Vkd(vkdCalls = 4)
+  Vkd(vkdFirstTarget = #VKD_IMAGE)
+  Vkd(vkdRestoreTarget = #VKD_OLD_SURFACE And vkdBase = #VKD_OLD_SURFACE)
+  Vkd(vkdClearWord = $44112233)
+  Vkd(AnvilVkV3dDevelopmentImageLayout() = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+  Vkd(AnvilVkV3dDevelopmentSubmits() = 1)
+  Vkd(AnvilVkCommandBufferState(commandBuffer) = #ANVIL_VK_CB_EXECUTABLE)
+
+  ; A failed real submission invalidates the command buffer, preserves the
+  ; pre-submit layout metadata and still restores the previous target.
+  Vkd(AnvilVkCommandBufferReset(commandBuffer, 0) = #VK_SUCCESS)
+  Vkd(AnvilVkV3dDevelopmentImageBind(device, #VKD_IMAGE, #VKD_IMAGE_BYTES, 64, 64, 256, #VK_IMAGE_LAYOUT_GENERAL) = #ANVIL_VK_ERR_ARGS)
+  Vkd(AnvilVkV3dDevelopmentImageBind(device, #VKD_IMAGE, #VKD_IMAGE_BYTES, 64, 64, 256, #VK_IMAGE_LAYOUT_UNDEFINED) = #VK_SUCCESS)
+  Vkd(AnvilVkCommandBufferBegin(commandBuffer, #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) = #VK_SUCCESS)
+  Vkd(AnvilVkV3dDevelopmentCmdTransitionClear(commandBuffer, #VK_IMAGE_LAYOUT_UNDEFINED, 1, 2, 3, 4) = #VK_SUCCESS)
+  Vkd(AnvilVkCommandBufferEnd(commandBuffer) = #VK_SUCCESS)
+  vkdEndRc = 77
+  Vkd(AnvilVkV3dDevelopmentQueueSubmit(queue, commandBuffer) = #VK_ERROR_DEVICE_LOST)
+  Vkd(AnvilVkV3dDevelopmentLastNativeError() = 77)
+  Vkd(AnvilVkV3dDevelopmentImageLayout() = #VK_IMAGE_LAYOUT_UNDEFINED)
+  Vkd(AnvilVkCommandBufferState(commandBuffer) = #ANVIL_VK_CB_INVALID)
+  Vkd(vkdBase = #VKD_OLD_SURFACE)
+  Vkd(AnvilVkV3dDevelopmentSubmits() = 1)
+
+  PokeN(#VKD_OUT + 0, $564B4431) ; "VKD1"
+  PokeN(#VKD_OUT + 8, vkdChecks)
+  PokeN(#VKD_OUT + 16, vkdFails)
+  PokeN(#VKD_OUT + 24, vkdCalls)
+  PokeN(#VKD_OUT + 32, vkdClearWord)
+  ProcedureReturn vkdFails
+EndProcedure

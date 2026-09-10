@@ -1,0 +1,1888 @@
+; ======================================================================
+;  mailbox.pi4 - the VideoCore mailbox, property channel, on a Pi 4
+; ======================================================================
+;
+;  THE FIRST LIBRARY FOR THIS TARGET, and it is the first for a reason:
+;  on a Raspberry Pi the ARM does not own the machine. The VideoCore
+;  firmware owns the clock tree, the power domains, the framebuffer, the
+;  thermal sensor and the board's identity, and the ARM asks for every
+;  one of them down this one wire. Anything later that needs a clock
+;  rate, a power rail or a display buffer comes back here.
+;
+;  ---- A QUICK EXAMPLE ---------------------------------------------
+;
+;    XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+;
+;    Procedure Main()
+;      Define hz.i
+;      If MailboxInit() = 0
+;        ; the buffer is outside the window the VideoCore can reach -
+;        ; see THE 1 GiB DMA WINDOW below
+;        ProcedureReturn
+;      EndIf
+;      hz = MailboxArmClock()          ; what the CPU is running at NOW
+;      hz = MailboxArmClockMax()       ; the ceiling the firmware allows
+;      Repeat
+;      ForEver
+;    EndProcedure
+;
+;  ---- HOUSE RULE 10: THIS LIBRARY INCLUDES NOTHING ------------------
+;  There is no XIncludeFile line below. A library never includes another
+;  library; the MAIN file lists what it needs, one line each, in order.
+;  This file happens to need nothing at all - no clock setup, no UART,
+;  no timer. It reads CNTPCT_EL0/CNTFRQ_EL0 directly for its timeouts
+;  precisely so that it has no dependency to declare and can be the
+;  first thing a program calls.
+;
+;  That is also why its counter helpers are called MbxTicks() and
+;  MbxCounterHz() and not Ticks() and TickHz(). RaspberryPi4/Lib/
+;  timer.pi4 owns those two names and reads the same two registers. A
+;  main file that includes both must not find the name defined twice,
+;  and this file must not be the one that quietly requires the other -
+;  so it keeps its own two-instruction copies under a private prefix.
+;  Every internal in this file is Mbx*; everything public is Mailbox*.
+;
+;  Include paths are ROOT-RELATIVE ("RaspberryPi4/Lib/mailbox.pi4"),
+;  never "../..".
+;
+; ======================================================================
+;  WHERE EVERY NUMBER IN THIS FILE COMES FROM
+; ======================================================================
+;
+;  THE VC MAILBOX IS NOT IN THE BCM2711 PERIPHERALS MANUAL. Chapter 13
+;  of that manual, "ARM Mailboxes", is a DIFFERENT device: the sixteen
+;  core-to-core mailboxes in the ARM_LOCAL block. Grepping the manual
+;  for "b880" returns nothing. So none of the transport numbers below
+;  can be cited to it, and pretending otherwise would be the exact
+;  failure this project keeps paying for. They are cited to the two
+;  sources that DO describe this device and that are on this machine:
+;
+;    Datasheets/pi4/bcm283x.dtsi          the device-tree node
+;    Datasheets/pi4/bcm2711.dtsi          the soc ranges / dma-ranges
+;    Datasheets/pi4/bcm2835-mailbox.c     the mailbox driver
+;    Datasheets/pi4/raspberrypi-firmware.c the property-channel driver
+;    Datasheets/pi4/armstub8.S            CNTFRQ_EL0 on this part
+;
+;  ---- THE ADDRESS -------------------------------------------------
+;  bcm283x.dtsi:100    mailbox: mailbox@7e00b880 { reg = <0x7e00b880 0x40>; }
+;  bcm2711.dtsi:41     ranges = <0x7e000000 0x0 0xfe000000 0x01800000>
+;
+;  Bus $7E000000 maps to ARM $FE000000, so the node's $7E00B880 is ARM
+;  $FE00B880. The node is $40 bytes long, which is worth noticing: it
+;  covers $FE00B880..$FE00B8BF, i.e. BOTH mailboxes, which is what makes
+;  the mailbox-1 offsets below part of the same documented block.
+;
+;  ---- THE REGISTERS -----------------------------------------------
+;  bcm2835-mailbox.c defines them as offsets from that base:
+;
+;    ARM_0_MAIL0 0x00   ARM_0_MAIL1 0x20
+;    MAIL0_RD  = MAIL0 + 0x00     $FE00B880   ARM reads replies here
+;    MAIL0_STA = MAIL0 + 0x18     $FE00B898   status of the READ side
+;    MAIL1_WRT = MAIL1 + 0x00     $FE00B8A0   ARM writes requests here
+;    MAIL1_STA = MAIL1 + 0x18     $FE00B8B8   status of the WRITE side
+;
+;    ARM_MS_FULL  = BIT(31)       $80000000
+;    ARM_MS_EMPTY = BIT(30)       $40000000
+;
+;  and the comment above them states the direction plainly: "We deliver
+;  to the VC in mailbox 1, it delivers to us in mailbox 0."
+;
+;  >>> THE ONE PLACE THIS FILE DISAGREES WITH THE COMMON TUTORIAL CODE.
+;  Nearly every bare-metal mailbox example on the internet polls FULL on
+;  $FE00B898 - mailbox ZERO's status - before writing to mailbox one.
+;  The driver does not: bcm2835_last_tx_done() reads MAIL1_STA ($38) for
+;  FULL and only the receive path reads MAIL0_STA ($18) for EMPTY. A
+;  full mailbox 0 means "there are eight replies the ARM has not read",
+;  which has nothing to do with whether there is room to SEND. The
+;  tutorial version works in practice because that condition is almost
+;  never true, not because it is the right question. This file asks the
+;  right one, and if MAIL1_STA turns out to read back wrong on silicon
+;  the symptom is a bounded #MBX_ERR_TXTIMEOUT and not a hang - which is
+;  the whole reason every wait here has a deadline. FIRST THING TO CHECK
+;  ON THE BENCH if MailboxSend() times out with nothing else wrong.
+;
+;  ---- THE CHANNEL AND THE 16-BYTE ALIGNMENT ------------------------
+;  raspberrypi-firmware.c:21-24
+;
+;    #define MBOX_MSG(chan, data28)  (((data28) & ~0xf) | ((chan) & 0xf))
+;    #define MBOX_CHAN_PROPERTY      8
+;
+;  One 32-bit word carries both: the low four bits are the channel and
+;  the upper 28 are the address. That is WHY the buffer must be 16-byte
+;  aligned - there are no low four bits left to put an address in. The
+;  firmware wiki says the same thing in one sentence: "The buffer itself
+;  is 16-byte aligned as only the upper 28 bits of the address can be
+;  passed via the mailbox."
+;
+;  Alignment is computed AT RUN TIME here, not assumed. The emitted .bss
+;  aligns __bss_start__ to 16 but packs the globals after it eight bytes
+;  at a time, so a global array's own base is 8-aligned at best and can
+;  be worse if some earlier file declared an odd-sized byte array. The
+;  buffer below is over-allocated and MailboxInit() rounds an aligned
+;  window out of the middle of it.
+;
+;  THE WINDOW IS ALIGNED TO 64, NOT 16, AND THAT IS A CACHE DECISION
+;  RATHER THAN A MAILBOX ONE. Sixteen is all the mailbox word needs. But
+;  the buffer is cleaned and invalidated by CACHE LINE, a line on a
+;  Cortex-A72 is 64 bytes, and cache maintenance cannot be aimed at half
+;  of one. A 16-aligned buffer shares its first and last lines with
+;  whatever globals the compiler happened to place either side of it -
+;  including this file's own procedure locals, which are statically
+;  allocated in the same .bss. That sharing is not untidy, it is a
+;  CORRECTNESS BUG waiting to happen: touching a neighbour between the
+;  send and the reply makes the shared line dirty with a stale copy of
+;  the buffer, and the clean that follows the reply would write that
+;  stale copy back OVER the firmware's answer. Aligning the window to 64
+;  and sizing it to exactly one line means the line belongs to the
+;  buffer alone and nothing else can dirty it. The array is 128 bytes so
+;  that a 64-byte line always fits inside it whatever the base turns out
+;  to be.
+;
+;  ---- THE BUS ADDRESS, AND WHY THE CONVERSION EXISTS ---------------
+;  bcm2711.dtsi:45     dma-ranges = <0xc0000000 0x0 0x00000000 0x40000000>
+;
+;  The address handed to the mailbox is NOT an ARM address. The ARM and
+;  the VideoCore see the same DRAM through different windows: what the
+;  ARM calls $00000000 the VideoCore calls $C0000000. The mailbox word
+;  is consumed by the VideoCore, so it must carry the VideoCore's name
+;  for the buffer - ARM address + $C0000000. Hand it an ARM address and
+;  the firmware reads some other megabyte entirely and replies with
+;  nonsense or not at all; nothing faults, because $3E000000 is real
+;  memory from the VideoCore's point of view too.
+;
+;  ---- THE 1 GiB DMA WINDOW -----------------------------------------
+;  That dma-ranges entry is 0x40000000 LONG. The alias covers exactly
+;  the low gigabyte: ARM $00000000..$3FFFFFFF. There is no bus alias in
+;  this window for anything above 1 GiB, so a mailbox buffer placed
+;  there CANNOT BE NAMED to the VideoCore at all - "+ $C0000000" would
+;  wrap past 32 bits and the truncated word would point somewhere else.
+;
+;  This is a live hazard on this target, not a theoretical one: the
+;  Monitor's high payload window starts at $40000000, and an image built
+;  with --load-addr 0x40000000 puts its .bss (load base + 512 KiB) and
+;  therefore this buffer straight into the unreachable region.
+;  MailboxInit() CHECKS FOR THIS AND REFUSES, with #MBX_ERR_ADDRESS,
+;  rather than sending an address that means something else. Build the
+;  program that talks to the firmware for the low window.
+;
+;  ---- THE PROPERTY BUFFER ------------------------------------------
+;  raspberrypi-firmware.c:92-116 builds it, and the firmware wiki
+;  documents the same layout:
+;
+;    +0   u32  total size of the buffer in bytes, padding included
+;    +4   u32  request/response code
+;    +8   u32  tag id
+;    +12  u32  value buffer size in bytes
+;    +16  u32  request: 0        response: b31 set, b30-b0 = length
+;    +20  ...  the value words
+;    ...  u32  end tag, 0
+;
+;    RPI_FIRMWARE_STATUS_REQUEST = 0
+;    RPI_FIRMWARE_STATUS_SUCCESS = 0x80000000
+;    RPI_FIRMWARE_STATUS_ERROR   = 0x80000001
+;    RPI_FIRMWARE_PROPERTY_END   = 0
+;
+;  The three status values and the tag numbers further down are NOT in
+;  any file on this machine - raspberrypi-firmware.c uses the symbols
+;  and the header that defines them, include/soc/bcm2835/raspberrypi-
+;  firmware.h, is not here. They were read out of that header in the
+;  kernel tree and CROSS-CHECKED, value by value, against the firmware
+;  project's own "Mailbox property interface" documentation, which is
+;  the upstream both of them describe. Two independent sources agreeing
+;  on every number is the bar this file was held to; see THE TAGS below
+;  for what was deliberately left out for failing it.
+;
+; ======================================================================
+;  THE TAGS THIS FILE IMPLEMENTS, AND THE ONES IT DOES NOT
+; ======================================================================
+;
+;  IMPLEMENTED - each of these appears with the same hex value in BOTH
+;  the kernel header's enum rpi_firmware_property_tag AND the firmware
+;  project's property-interface documentation:
+;
+;    $00010002  get board revision       req 0   resp 4
+;    $00030002  get clock rate           req 4   resp 8
+;    $00038002  set clock rate           req 12  resp 8
+;    $00030004  get max clock rate       req 4   resp 8
+;    $00030007  get min clock rate       req 4   resp 8
+;    $00030047  get clock rate, MEASURED req 4   resp 8
+;    $00030006  get temperature          req 4   resp 8
+;    $0003000A  get max temperature      req 4   resp 8
+;
+;    clock ids: EMMC 1, UART 2, ARM 3, CORE 4, V3D 5, H264 6, ISP 7,
+;               SDRAM 8, PIXEL 9, PWM 10, HEVC 11, EMMC2 12
+;    Only the four this file names as constants were needed; the rest
+;    are listed here so the numbers are written down once and can be
+;    passed to MailboxClockRate() directly.
+;
+;  NO LONGER LEFT OUT - THE FRAMEBUFFER FAMILY. This entry used to read
+;  "deliberately left out, for want of a second source", and it said of
+;  "$00040001 and its neighbours" that the family "deserves its own
+;  library, written against a display on the bench, not a guess appended
+;  to this one". Both halves have since been overtaken by events and the
+;  text is corrected rather than deleted, because the next reader who
+;  greps this header for a framebuffer tag needs to know it is here and
+;  not go looking for the library that was promised:
+;
+;    the nine framebuffer configuration tags are carried below, under
+;      THE FRAMEBUFFER TAGS, each cited to two on-disk headers. The
+;      "whole protocol" worry was right - see SEVERAL TAGS IN ONE
+;      MESSAGE for what it cost to learn - but the answer was a
+;      multi-tag transport here plus RaspberryPi4/Lib/display.pi4 on
+;      top of it, not a second mailbox.
+;    the three DISPLAY SELECTION tags ($00040013 / $00048013 /
+;      $00040016) are carried below as well, added 2026-08-26, and they
+;      are the reason this section needed rewriting at all: they are
+;      literally "neighbours of $00040001" and a reader who trusted the
+;      old sentence would have concluded this file had decided against
+;      them. It had not. Nobody knew they existed, because neither of
+;      the two headers cited for everything else contains them. See
+;      THE DISPLAY SELECTION TAGS below for the third source and why it
+;      took a third one.
+;
+;  DELIBERATELY LEFT OUT, for want of a second source or of a use:
+;
+;    the POWER DOMAIN tags ($00020001 / $00028001). Cited fine, but
+;      turning rails off with no consumer of them is a way to make a
+;      board stop working, not a feature.
+;    get board serial / model / MAC ($00010004 / $00010001 / $00010003),
+;      get voltage ($00030003), get throttled ($00030046), turbo
+;      ($00030009 / $00038009), ARM/VC memory split ($00010005 /
+;      $00010006). All are cited by the same two sources, and any of
+;      them can be issued TODAY through MailboxBegin/MailboxSend
+;      without editing this file - see THE ESCAPE HATCH. They are not
+;      wrapped because nothing has asked for them yet.
+;    GET_DISPLAY_SETTINGS ($00040014). Its NUMBER is as well cited as
+;      the three display tags next to it - the same enum, the same
+;      line block - but a tag number with no known payload is not a
+;      usable tag, and its payload is the one thing no source on this
+;      disk describes. The downstream header carries a bare
+;      "#define GET_DISPLAY_SETTINGS_PAYLOAD_SIZE 64"
+;      (raspberrypi-firmware-downstream.h:185) and says nothing about
+;      what those sixty-four bytes contain; the property-interface
+;      documentation does not mention the tag at all; and
+;      vc4_firmware_kms.c, which is what taught us the other three,
+;      never sends it. So the number is written down below as a
+;      comment, where it is findable, and no constant is declared for
+;      it - because declaring one would invite somebody to send it and
+;      read the reply as though the layout were known.
+;    anything whose number could only be recalled rather than read.
+;      There is none of that in this file. If a tag is not above, it is
+;      not because it was forgotten.
+;
+;  ---- THE ESCAPE HATCH ---------------------------------------------
+;  MailboxBegin / MailboxSetWord / MailboxSend / MailboxWord are public
+;  on purpose. The transport is the hard, verifiable part and the tag
+;  number is one word the caller can supply. That is what keeps an
+;  un-wrapped tag from being a reason to guess at a wrapper:
+;
+;      If MailboxBegin($00010004, 0, 8) <> 0 And MailboxSend() <> 0
+;        lo = MailboxWord(0) : hi = MailboxWord(1)   ; board serial
+;      EndIf
+;
+; ======================================================================
+;  SEVERAL TAGS IN ONE MESSAGE - ADDED 2026-08-26, AND WHY IT HAD TO BE
+; ======================================================================
+;  Until today this file could only build a message carrying ONE tag,
+;  and the single-tag call above was described as the whole story. It is
+;  not, and the gap cost a working display.
+;
+;  WHAT HAPPENED. RaspberryPi4/Lib/display.pi4 asked the firmware for a
+;  framebuffer with seven separate single-tag messages - set physical
+;  size, set virtual size, set depth, set offset, allocate, get pitch.
+;  Booted through U-Boot it worked, every time. Booted STRAIGHT FROM THE
+;  FIRMWARE, with nothing having configured video first, DisplayInit()
+;  returned success and produced a 2 x 2 framebuffer with a pitch of 64,
+;  while the panel on the bench is a perfectly good 1920 x 1080 and a
+;  GET of the physical size said so.
+;
+;  It was chased as a timing problem first - the mode "had not settled
+;  yet" - and that theory is dead: ten attempts spread over 1.8 seconds
+;  returned 2 x 2 every single time. Waiting longer for a request that
+;  is shaped wrong is superstition.
+;
+;  THE CAUSE. The firmware accumulates the framebuffer's requested state
+;  WITHIN ONE PROPERTY TRANSACTION and allocates against what that one
+;  transaction has accumulated. Separate messages do not build on one
+;  another for this purpose, so the allocate ran against a default and
+;  handed back a placeholder surface. Under U-Boot the symptom was
+;  invisible because U-Boot had already done the combined call and the
+;  firmware had a real mode configured before our seven messages
+;  started.
+;
+;  THE AUTHORITY, and it is on this disk:
+;    Datasheets/pi4/uboot/v2025.01_msg.c:35-47   struct msg_setup - ONE
+;      buffer, NINE tags, then the end tag.
+;    Datasheets/pi4/uboot/v2025.01_msg.c:159-204 bcm2835_set_video_params()
+;      fills all nine and makes ONE bcm2835_mbox_call_prop() call, then
+;      reads the physical size, the pitch, the framebuffer address and
+;      the framebuffer size back out of THAT SAME response.
+;    Datasheets/pi4/uboot/v2025.01_mbox.h:31-36 says it plainly in prose:
+;      "With some limitations, an arbitrary set of tags may be combined
+;      together into a single message buffer."
+;
+;  SO THIS FILE NOW COMPOSES. MailboxListBegin / MailboxListAdd /
+;  MailboxListSetWord / MailboxListSend / MailboxListWord are the
+;  multi-tag half of the transport. The single-tag four are UNCHANGED -
+;  a great deal calls them and none of it was touched - and the two
+;  halves share one buffer, one alignment argument, one set of cache
+;  operations and one bounded wait, because duplicating the transport
+;  would have been two places to get the mailbox wrong.
+;
+;      If MailboxListBegin() <> 0
+;        t0 = MailboxListAdd($00048003, 8, 8)    ; set physical w/h
+;        t1 = MailboxListAdd($00040008, 0, 4)    ; get pitch
+;        MailboxListSetWord(t0, 0, 1920)
+;        MailboxListSetWord(t0, 1, 1080)
+;        If MailboxListSend() <> 0
+;          w = MailboxListWord(t0, 0)
+;          p = MailboxListWord(t1, 0)
+;        EndIf
+;      EndIf
+;
+;  MailboxListSend() checks the response code AND every tag's own
+;  response bit, not just the first, and MailboxListFailedTag() names
+;  the index of the first one the firmware left unanswered. A list where
+;  eight tags were understood and the ninth was not is a FAILURE here,
+;  reported as #MBX_ERR_TAG, because the eight that worked configured a
+;  display that the ninth was supposed to allocate.
+;
+;  ONE DELIBERATE DIFFERENCE FROM THE SINGLE-TAG PATH, stated because it
+;  looks like an inconsistency and is not. In a request, each tag's
+;  third header word is the "value length". The kernel writes ZERO there
+;  for every tag (raspberrypi-firmware.c:170, req_resp_size = 0) and the
+;  single-tag path below matches the kernel. U-Boot writes the size of
+;  the REQUEST half instead (v2025.01_mbox.h:94-98,
+;  BCM2835_MBOX_INIT_TAG sets val_len = sizeof(body.req), and :100-104
+;  BCM2835_MBOX_INIT_TAG_NO_REQ sets it to 0 for a pure get). Both work
+;  on real firmware - each of the two drivers is in daily use - and the
+;  list path follows U-BOOT, because U-Boot is the code whose combined
+;  framebuffer message is known to work on this board and reproducing it
+;  byte for byte removes one variable from the next thing that goes
+;  wrong. The single-tag path is not changed to match: it is proven as
+;  it stands and nothing here is worth risking for symmetry.
+;
+; ======================================================================
+;  CACHES, AND WHY THIS FILE CLEANS THE BUFFER EVEN THOUGH IT MIGHT NOT
+;  HAVE TO
+; ======================================================================
+;  The VideoCore reads the buffer out of DRAM. It is not a coherency
+;  master with the ARM's D-cache. So if the D-cache is on, the words
+;  this file writes can still be sitting in it when the firmware looks,
+;  and the reply can still be in DRAM when this file reads the cache.
+;
+;  Whether the cache IS on depends entirely on who started the program:
+;
+;    the firmware, as kernel8.img  -> MMU and caches OFF (which is what
+;                                     the emitted _start assumes)
+;    a resident loader, via "go"   -> whatever the loader left enabled,
+;                                     and U-Boot on AArch64 runs with
+;                                     MMU and caches ON. "go" is not
+;                                     "bootm"; it does not tear them
+;                                     down for you.
+;
+;  A library cannot know which. "dc civac" on a line that is not cached
+;  costs a few cycles and does nothing, so this file cleans and
+;  invalidates the buffer unconditionally, before the send and after the
+;  reply, and puts a dsb around the mailbox accesses. Correct in both
+;  worlds beats correct in the one that happened to be tested.
+;
+; ======================================================================
+;  64-BIT LANGUAGE MODEL - THE TRAPS THIS FILE IS WRITTEN AROUND
+; ======================================================================
+;  * .i AND POINTERS ARE EIGHT BYTES on this target. A bare Peek/Poke is
+;    therefore a 64-BIT access. Every mailbox register and every word of
+;    the property buffer is THIRTY-TWO bits, so every access in this
+;    file is spelled PeekL/PokeL. A bare one would be a 64-bit access to
+;    a 32-bit register and it would not announce itself.
+;  * A 32-BIT READ DOES NOT AGREE WITH ITSELF ABOUT SIGN. Verified in
+;    the emitted assembly of this compiler: PeekL lowers to a bare
+;    "ldr w" (zero-extending), while reading a .l ARRAY ELEMENT lowers
+;    to "ldr w" followed by "sxtw" (sign-extending). Two spellings of
+;    the same width with opposite answers for bit 31. This file
+;    therefore MASKS with & $FFFFFFFF at every point where bit 31 can be
+;    set and the value is then compared or returned - the response code
+;    $80000000, the echoed mailbox word, and any clock rate at or above
+;    2.147 GHz. Masking is right under either lowering, so nothing here
+;    depends on which one you get.
+;  * & | ! BIND TIGHTER THAN << >>. Every shift in this file is
+;    parenthesised.
+;  * >> IS ARITHMETIC on a signed .i. The only right shift here is on a
+;    physical address, which is positive.
+;  * Procedure locals are statically allocated. Nothing here is
+;    reentrant, and there is ONE shared buffer: do not call into this
+;    library from an interrupt that can land on top of a MailboxSend().
+;
+; ======================================================================
+;  WHAT HAS BEEN VERIFIED - 2026-08-24
+; ======================================================================
+;  Compiles clean, with no warnings, under BOTH compilers present in the
+;  tree: pmfc_64.exe, which implements the 64-bit model this file is
+;  written for, and the shipped pmfc.exe, which at the time of writing is
+;  still the older 32-bit build. Gate:
+;
+;    pmfc scratchpad/mbxprobe/mbxtest.pi4 -t pi4 --load-addr 0x200000
+;         -o scratchpad/mbxprobe/mbxtest.img -s
+;
+;  The emitted assembly was READ, and confirms:
+;    $FE00B880 / $FE00B898 / $FE00B8A0 / $FE00B8B8 all materialised as
+;      written, each reached with a 32-bit "ldr w" or "str w",
+;    the +$C0000000 bus conversion emitted as an add of $C0000000
+;      immediately before the or-with-8 and the "str w" to the write
+;      register,
+;    the buffer window rounded up with "+63 & $FFFFFFFFFFFFFFC0" - a
+;      full 64-bit mask, not a truncated one - and the array emitted as
+;      ".space 128",
+;    the 1 GiB window check comparing bufAddr+64 against $40000000,
+;    the response code compared against $80000000 after an explicit
+;      32-bit mask, and the tag's response bit tested separately,
+;    "dc civac" and the dsb/isb barrier assembled.
+;
+;  ---- 2026-08-26, THE MULTI-TAG HALF -------------------------------
+;  MailboxListBegin / Add / SetWord / Send / Word were added and are
+;  exercised end to end by tools/a64/a64_display_check.py: the real
+;  pmfc.exe builds
+;  RaspberryPi4/Examples/Diagnostics/pi4DisplayProbe.pi4, the image runs
+;  on the A64 oracle, and a modelled VideoCore PARSES THE WHOLE TAG LIST
+;  out of the buffer rather than assuming one tag. That model checks the
+;  structure and stops the run rather than answering politely if the
+;  size word, a tag's value-buffer length, the end tag or the request
+;  code is wrong - so the composed buffer's layout is verified by
+;  something that did not compose it.
+;
+;  The nine-tag framebuffer message goes out as one transaction, all
+;  nine response bits come back set, and every value is read out of that
+;  one reply. The gate's --mutate rebuilds display.pi4 seven ways -
+;  including the exact seven-message shape that produced the 2 x 2
+;  screen - and every one of them goes red.
+;
+;  THE SINGLE-TAG PATH WAS RE-RUN, not assumed unaffected: the clock,
+;  SDIO/CYW43 and HCI gates all still pass, and each of them drives
+;  MailboxBegin/MailboxSend through this file.
+;
+;  ---- VERIFIED ON SILICON. The list below used to be the "NOT
+;       VERIFIED, AND ONLY SILICON CAN" list, and silicon did. --------
+;
+;  THE FIRMWARE ANSWERS. Proven 2026-08-25 and in continuous use since;
+;  RaspberryPi4/Monitor/anvil.pi4 includes this file and calls it at
+;  every boot, so a broken mailbox is a board that does not come up.
+;
+;    * MAIL1_STA IS THE RIGHT REGISTER TO POLL FOR FULL. The transaction
+;      completes; it would hang or drop if it were not.
+;    * REPLY LATENCY sits comfortably inside the one-second deadline -
+;      no mailbox timeout has ever been reported at the bench, across
+;      the clock, framebuffer, EMMC-clock, MAC-address and SDIO paths.
+;    * WHAT THE FIRMWARE DOES WITH A SET ON THE ARM CLOCK, which was the
+;      one flagged "above all". IT CLAMPS AND REPORTS SUCCESS. Asking
+;      for more than the part allows returns response code SUCCESS with
+;      the tag marked answered and the rate silently limited, which is
+;      why every setter in RaspberryPi4/Lib/clocks.pi4 returns THE RATE
+;      THE FIRMWARE APPLIED rather than the rate that was requested. On
+;      this board ClockInit() takes the ARM from 600000000 to a measured
+;      1500345728.
+;    * THE FULL CLOCK TABLE, read back off the board 2026-08-25, Pi 4
+;      Model B rev 1.2, 4 GB:
+;
+;          clock  configured      min          max        measured
+;          ARM     600000000   600000000   1500000000    600169920
+;          CORE    200000000   200000000    500000000    200008304
+;          EMMC    250000000   250000000    250000000    250000496
+;          UART     48000000           0   1000000000     48001464
+;
+;      The UART row is corroboration rather than a reading: it matches
+;      config.txt's init_uart_clock=48000000 AND a console visibly
+;      working at 115200, so the mailbox and the serial port confirm
+;      each other.
+;    * THE NINE-TAG FRAMEBUFFER TRANSACTION reaches a real firmware and
+;      brings up a 1920x1080 surface on the direct-boot path - the path
+;      that had never been tested, because under U-Boot the surface
+;      already existed and the old seven-message version could not fail
+;      visibly.
+;
+;  ---- STILL NOT VERIFIED --------------------------------------------
+;
+;    * WHETHER THE D-CACHE IS ON UNDER THE LOADER IN USE. Still open,
+;      and now sharper rather than vaguer: the MMU has been enabled on
+;      this board (2026-08-26) with DRAM mapped write-back cacheable,
+;      and every run so far turns translation off again before
+;      returning. A resident program that leaves caches on has not used
+;      this file.
+;    * EVERY TAG'S BEHAVIOUR. The tags this tree actually sends are
+;      exercised; the rest of the tag space is transcription with a
+;      citation attached.
+;
+;  ---- SUPERSEDED -----------------------------------------------------
+;
+;      ~~Nothing in this file has run on a Pi 4.~~
+;
+;  This was the first library written for this target and one of the
+;  first proven, and the sentence outlived its truth by two days while
+;  every clock number quoted anywhere in this tree came through here.
+; ======================================================================
+
+EnableExplicit
+
+; ---- the device -------------------------------------------------------
+; bcm283x.dtsi mailbox@7e00b880, translated by bcm2711.dtsi's soc ranges.
+#MBX_READ    = $FE00B880       ; MAIL0_RD   - replies arrive here
+#MBX_STATUS0 = $FE00B898       ; MAIL0_STA  - the READ side's status
+#MBX_WRITE   = $FE00B8A0       ; MAIL1_WRT  - requests go here
+#MBX_STATUS1 = $FE00B8B8       ; MAIL1_STA  - the WRITE side's status
+
+#MBX_FULL    = $80000000       ; ARM_MS_FULL  = BIT(31)
+#MBX_EMPTY   = $40000000       ; ARM_MS_EMPTY = BIT(30)
+
+#MBX_CHANNEL = 8               ; MBOX_CHAN_PROPERTY
+#MBX_CHANMASK = $F             ; MBOX_MSG puts the channel in the low nibble
+
+; ARM address -> VideoCore bus address. See THE BUS ADDRESS above.
+#MBX_BUS_OFFSET = $C0000000
+; ... and the end of the window that offset is valid in.
+#MBX_DMA_LIMIT  = $40000000
+
+; ---- the property protocol -------------------------------------------
+#MBX_REQUEST    = 0            ; RPI_FIRMWARE_STATUS_REQUEST
+#MBX_SUCCESS    = $80000000    ; RPI_FIRMWARE_STATUS_SUCCESS
+#MBX_END_TAG    = 0            ; RPI_FIRMWARE_PROPERTY_END
+#MBX_RESP_BIT   = $80000000    ; set by the firmware in the tag's +16 word
+#MBX_LEN_MASK   = $7FFFFFFF    ; and the length is what is left of it
+
+; Byte offsets inside the buffer.
+#MBX_OFF_SIZE   = 0
+#MBX_OFF_CODE   = 4
+#MBX_OFF_TAG    = 8
+#MBX_OFF_VALLEN = 12
+#MBX_OFF_TAGCODE = 16
+#MBX_OFF_VALUE  = 20
+
+; The same layout said the other way round, for the multi-tag path,
+; where a tag can start anywhere. The buffer header is two words and
+; each tag header is three; the six offsets above are these two plus
+; these four, and they are written out separately rather than derived
+; from each other so that a reader of either path sees the whole shape
+; without arithmetic.
+;   v2025.01_mbox.h:69-72  struct bcm2835_mbox_hdr  { buf_size; code; }
+;   v2025.01_mbox.h:88-92  struct bcm2835_mbox_tag_hdr
+;                          { tag; val_buf_size; val_len; }
+#MBX_HDR_BYTES    = 8
+#MBX_TAGHDR_BYTES = 12
+#MBX_TOFF_ID      = 0          ; the tag number
+#MBX_TOFF_VALLEN  = 4          ; the value buffer's size in bytes
+#MBX_TOFF_CODE    = 8          ; request: length in; response: b31|length
+#MBX_TOFF_VALUE   = 12         ; the value words
+
+; ---- the tags (see THE TAGS above for the two sources) ---------------
+#MBX_TAG_BOARD_REVISION = $00010002
+#MBX_TAG_GET_CLOCK      = $00030002
+#MBX_TAG_SET_CLOCK      = $00038002
+#MBX_TAG_MAX_CLOCK      = $00030004
+#MBX_TAG_MIN_CLOCK      = $00030007
+#MBX_TAG_CLOCK_MEASURED = $00030047
+#MBX_TAG_TEMPERATURE    = $00030006
+#MBX_TAG_MAX_TEMPERATURE = $0003000A
+
+; ---- the framebuffer tags --------------------------------------------
+; ON DISK AND CITABLE, 2026-08-25. These were the seven numbers
+; display.pi4 refused to write down: the defining header was not on this
+; machine, two agents each burned a full filesystem search looking for
+; it, and the library shipped with seven EMPTY SLOTS and a refusal
+; (#DSP_ENOTAGS) rather than a guess. The download was then authorised.
+;
+; Source: Datasheets/pi4/raspberrypi-firmware.h - the kernel's
+; include/soc/bcm2835/raspberrypi-firmware.h, enum
+; rpi_firmware_property_tag. Line numbers given per value so each is
+; checkable in seconds.
+;
+; They live HERE and not in display.pi4 because display.pi4's header
+; says so in as many words: "put them in the main program, or in
+; mailbox.pi4 beside the tags it already carries, and leave this file's
+; slots as slots. Being correct about what it does not know is this
+; file's job; being the home of a number whose provenance is a wiki page
+; is not." The provenance is no longer a wiki page, and the slot
+; mechanism is still the right shape - so the numbers came here.
+;
+; WHAT THIS DOWNLOAD ALSO SETTLED: the eight tags above were taken from
+; the same header UPSTREAM and cross-checked against the firmware
+; project's documentation. All eight now match the on-disk file value
+; for value, including $00030047 and $0003000A. The cross-check was
+; sound; it is simply citable now.
+#MBX_TAG_FB_ALLOCATE   = $00040001   ; h:97   FRAMEBUFFER_ALLOCATE
+#MBX_TAG_FB_GETPITCH   = $00040008   ; h:104  FRAMEBUFFER_GET_PITCH
+#MBX_TAG_FB_SETPHYS    = $00048003   ; h:120  SET_PHYSICAL_WIDTH_HEIGHT
+#MBX_TAG_FB_SETVIRT    = $00048004   ; h:121  SET_VIRTUAL_WIDTH_HEIGHT
+#MBX_TAG_FB_SETDEPTH   = $00048005   ; h:122  SET_DEPTH
+#MBX_TAG_FB_SETORDER   = $00048006   ; h:123  SET_PIXEL_ORDER
+#MBX_TAG_FB_SETOFFSET  = $00048009   ; h:125  SET_VIRTUAL_OFFSET
+
+; ---- three more of the same family, added 2026-08-26 ------------------
+; U-Boot's combined framebuffer message carries nine tags and this file
+; only had six of them. These are the missing three. Each now has TWO
+; on-disk citations rather than one, because a second copy of the same
+; header arrived with the U-Boot download and the two agree value for
+; value - which is the bar the eight clock and temperature tags at the
+; top of this section were held to and the framebuffer six were not:
+;
+;   h  = Datasheets/pi4/raspberrypi-firmware.h        (the kernel enum)
+;   ub = Datasheets/pi4/uboot/v2025.01_mbox.h         (U-Boot's #defines)
+;
+; The six above were re-checked against ub at the same time and all six
+; match: ALLOCATE ub:270, GET_PITCH ub:410, SET_PHYSICAL ub:315,
+; SET_VIRTUAL ub:335, SET_DEPTH ub:354, SET_PIXEL_ORDER ub:371,
+; SET_VIRTUAL_OFFSET ub:426. They are no longer single-sourced.
+#MBX_TAG_FB_GETPHYS    = $00040003   ; h:99   GET_PHYSICAL_WIDTH_HEIGHT
+                                     ; ub:313 BCM2835_MBOX_TAG_GET_PHYSICAL_W_H
+#MBX_TAG_FB_SETALPHA   = $00048007   ; h:124  SET_ALPHA_MODE
+                                     ; ub:391 BCM2835_MBOX_TAG_SET_ALPHA_MODE
+#MBX_TAG_FB_SETOVERSCAN = $0004800A  ; h:126  SET_OVERSCAN
+                                     ; ub:445 BCM2835_MBOX_TAG_SET_OVERSCAN
+
+; ---- and the VALUES those two tags carry ------------------------------
+; THE TAG NUMBER AND THE MEANING OF ITS VALUE ARE TWO SEPARATE THINGS TO
+; KNOW, and display.pi4 spent a whole section on that distinction: it
+; refused to send set-pixel-order because the number became citable on
+; 2026-08-25 and the meaning of the state word did not. The U-Boot
+; header settles the second half as well, so the refusal is over. It is
+; recorded here rather than quietly dropped, because a constraint that
+; disappears without explanation gets re-derived by the next reader.
+#MBX_FB_ORDER_BGR = 0          ; ub:373 BCM2835_MBOX_PIXEL_ORDER_BGR
+#MBX_FB_ORDER_RGB = 1          ; ub:374 BCM2835_MBOX_PIXEL_ORDER_RGB
+
+#MBX_FB_ALPHA_0_OPAQUE      = 0  ; ub:393 - alpha 0 means fully opaque
+#MBX_FB_ALPHA_0_TRANSPARENT = 1  ; ub:394 - alpha 0 means fully clear
+#MBX_FB_ALPHA_IGNORED       = 2  ; ub:395 - the channel is not looked at
+
+; ======================================================================
+;  THE DISPLAY SELECTION TAGS - ADDED 2026-08-26
+; ======================================================================
+;
+;  THE GAP THEY CLOSE. A Pi 4 has TWO HDMI sockets. Until today nothing
+;  in this tree ever told the firmware which one to put a framebuffer
+;  on, so the firmware's own choice was silently accepted and could not
+;  even be reported afterwards - the monitor's "no framebuffer" message
+;  named HDMI0 out of nothing but habit, which sends anybody whose cable
+;  is in HDMI1 to the wrong end of the board.
+;
+;  ---- A THIRD CITATION KEY, AND WHY THERE HAD TO BE ONE -------------
+;
+;  Every other number in this file carries "h:NN" or "ub:NNN". Those two
+;  keys were enough because every other tag appears in both files. THESE
+;  THREE APPEAR IN NEITHER:
+;
+;    Datasheets/pi4/raspberrypi-firmware.h   - the kernel enum this file
+;      cites as h:. It is the UPSTREAM header, and upstream Linux has no
+;      firmware-KMS driver, so it has no reason to carry the tags that
+;      only that driver uses. Grepping it for DISPLAY_NUM returns
+;      nothing.
+;    Datasheets/pi4/uboot/v2025.01_mbox.h    - cited as ub:. U-Boot sets
+;      up ONE framebuffer on whatever the firmware offers and never
+;      selects a display, so it has no display-selection tag either.
+;
+;  THAT ABSENCE IS THE WHOLE REASON THIS WAS MISSED. Two sources agreed
+;  perfectly, and they agreed about a smaller world than the one the
+;  board is in. Agreement between two documents is not coverage.
+;
+;  So two more keys, each naming a DIFFERENT file. The key is per-file
+;  and there are now four of them; read the key before the line number:
+;
+;    h  = Datasheets/pi4/raspberrypi-firmware.h
+;         the kernel's include/soc/bcm2835/raspberrypi-firmware.h
+;    ub = Datasheets/pi4/uboot/v2025.01_mbox.h
+;         U-Boot v2025.01 arch/arm/mach-bcm283x/include/mach/mbox.h
+;    dh = Datasheets/pi4/hdmi/raspberrypi-firmware-downstream.h
+;         the SAME kernel header from the raspberrypi/linux DOWNSTREAM
+;         tree, which is a superset: it carries the tags the Pi's own
+;         drivers use and upstream's copy does not. THE TAG NUMBERS
+;         BELOW COME FROM HERE AND FROM NOWHERE ELSE.
+;    fk = Datasheets/pi4/hdmi/vc4_firmware_kms.c
+;         the downstream DRM driver that actually sends them. It is not
+;         a source for the numbers - it uses the symbols - but it is
+;         the only source on this disk for HOW they are used, which for
+;         these three is more than half of what has to be known.
+;
+;  SINGLE-SOURCED, AND SAID PLAINLY. The eight clock tags at the top of
+;  this file were held to "two independent documents agree, value for
+;  value". These three cannot meet that bar, because only one document
+;  on this machine contains them at all. What they have instead is one
+;  document for the NUMBER and a second, independent one for the
+;  BEHAVIOUR - a driver that compiles against that header and ships on
+;  this exact silicon. That is weaker than two headers agreeing and it
+;  is written down here rather than glossed, so that if a display
+;  selection ever behaves oddly on the bench this paragraph is the first
+;  place to look.
+;
+;  ---- WHAT THE DRIVER ACTUALLY DOES WITH THEM ----------------------
+;
+;  Read out of fk, not reasoned about. This is the part that decides the
+;  shape of every caller, so it is quoted rather than summarised:
+;
+;  1. GET_NUM_DISPLAYS is a message of its own, a pure GET with no
+;     request words and one response word.
+;       fk:1958-1960  rpi_firmware_property(..., GET_NUM_DISPLAYS,
+;                                           &num_displays, sizeof(u32))
+;     A FAILURE IS NOT FATAL THERE. fk:1962-1970 comments that a
+;     firmware old enough to lack the call should be treated as having
+;     one display, and carries on. Wrappers here take the same view:
+;     "the firmware would not say" is a distinct answer from "zero".
+;
+;  2. GET_DISPLAY_ID is a message of its own, and it is IN AND OUT
+;     THROUGH THE SAME WORD - the caller writes an INDEX, the firmware
+;     answers with that display's identity.
+;       fk:1990-1994  for (display_num = 0; display_num < num_displays;
+;                          display_num++) {
+;                       display_id = display_num;
+;                       rpi_firmware_property(..., GET_DISPLAY_ID,
+;                                             &display_id, ...);
+;     So there are TWO NUMBERINGS and confusing them is the obvious way
+;     to get this wrong. See THE TWO NUMBERINGS below.
+;
+;  3. SET_DISPLAY_NUM is NOT a message of its own. It is the FIRST TAG
+;     of a message whose LATER TAGS are the ones it applies to:
+;       fk:1845-1850  struct mailbox_blank_display blank = {
+;                       .tag1 = {SET_DISPLAY_NUM, 4, 0, },
+;                       .display = display_idx,
+;                       .tag2 = {FRAMEBUFFER_BLANK, 4, 0, },
+;                       .blank = 1,
+;                     };
+;       fk:1863       rpi_firmware_property_list(vc4->firmware, &blank,
+;                                                sizeof(blank));
+;     One buffer. Selection first, then the tag it steers. That is the
+;     ONLY use of SET_DISPLAY_NUM anywhere in the driver.
+;
+;  ---- WHAT THE DRIVER DOES *NOT* SETTLE, AND IT MATTERS ------------
+;
+;  WHETHER THE SELECTION IS STICKY. The driver sends SET_DISPLAY_NUM
+;  exactly once, in one two-tag message, and never relies on it again -
+;  every other display-aware tag it sends carries the display number as
+;  a FIELD OF ITS OWN VALUE BUFFER instead:
+;    fk:915        set_plane.display     = display_num
+;    fk:955        set_timings.display   = display_number
+;    fk:1397       set_timings.display   = display_number  (GET_TIMING)
+;    fk:1449-1450  mailbox_get_edid.display_number
+;    fk:1812       mailbox_display_pwr.display
+;  A driver that had a sticky, connection-wide "current display" would
+;  not need five separate display fields. That is SUGGESTIVE of
+;  message-scope and it is not proof, and no file on this disk says
+;  either way: the firmware project's own property-interface
+;  documentation (Datasheets/pi4/hdmi/firmware-Mailbox-property-
+;  interface.md) does not document SET_DISPLAY_NUM, GET_NUM_DISPLAYS or
+;  GET_DISPLAY_ID AT ALL - grep it for "display" and you get the
+;  physical-size headings and a Pi-3 gamma tag.
+;
+;  WHAT GET_PHYSICAL_W_H DOES AFTERWARDS is unestablished for the same
+;  reason: the driver never sends a framebuffer configuration tag in a
+;  message with SET_DISPLAY_NUM, so nothing here demonstrates what the
+;  combination does.
+;
+;  THE RULE THIS TREE THEREFORE FOLLOWS, chosen because it is correct
+;  under BOTH answers rather than because one of them was picked:
+;
+;      EVERY MESSAGE THAT TOUCHES THE FRAMEBUFFER CARRIES THE SELECTION
+;      AS ITS FIRST TAG, WHENEVER A SELECTION IS IN FORCE.
+;
+;  If the selection is message-scoped, that is required. If it is
+;  sticky, re-sending the same index is a no-op. The one shape that is
+;  wrong under either answer is the tempting one - send SET_DISPLAY_NUM
+;  in a message of its own and assume the next message inherits it -
+;  and this tree does not do it. display.pi4 implements the rule; see
+;  DISPLAY SELECTION in that file.
+;
+;  ---- THE TWO NUMBERINGS --------------------------------------------
+;
+;  An INDEX is 0..num_displays-1, a position in the list of displays the
+;  firmware found at boot. SET_DISPLAY_NUM takes an INDEX (fk:1847
+;  passes display_idx, the loop counter) and GET_DISPLAY_ID takes an
+;  INDEX (fk:1991 writes display_num into the value word).
+;
+;  An ID is the DispmanX display identity, which is FIXED per socket and
+;  does not move when displays come and go. GET_DISPLAY_ID returns one.
+;  fk:343-356 maps every id to a display type, and the comments in that
+;  table are the only naming of the sockets on this disk. fk:344-346
+;  heads it "The firmware display (DispmanX) IDs map to specific types
+;  in a fixed manner", which is the sentence that makes an id safe to
+;  print and an index not:
+;
+;      0  MAIN_LCD      DSI or DPI     fk:347
+;      1  AUX_LCD       DSI            fk:348
+;      2  HDMI0         TMDS           fk:349
+;      3  VEC           composite      fk:350
+;      4  FORCE_LCD                    fk:351
+;      5  FORCE_TV                     fk:352
+;      6  FORCE_OTHER                  fk:353
+;      7  HDMI1         TMDS           fk:354
+;      8  FORCE_TV2                    fk:355
+;
+;  fk:1140-1150 confirms 2 and 7 independently: it caps the pixel clock
+;  per socket with "case 2: /* HDMI0 */" (fk:1141) and
+;  "case 7: /* HDMI1 */" (fk:1146).
+;
+;  WITH ONE DISPLAY PLUGGED INTO HDMI1 THE INDEX IS 0 AND THE ID IS 7,
+;  which is exactly the confusion this whole section exists to prevent:
+;  index 0 does not mean HDMI0.
+;
+;  WHICH SOCKET IS "HDMI0" PHYSICALLY is not in any file on this disk.
+;  The note above that it is the one nearer the USB-C power jack is Pi 4
+;  board lore, not a citation, and it is marked as such here rather than
+;  printed by anything.
+; ======================================================================
+; THE VALUE-BUFFER SIZES ARE THE DRIVER'S, not a guess: each is the
+; sizeof() the driver hands rpi_firmware_property, or the buf_size in
+; the tag header it builds by hand.
+#MBX_TAG_FB_GETNUMDISPLAYS = $00040013  ; dh:124 FRAMEBUFFER_GET_NUM_DISPLAYS
+                                        ; value buffer 4 bytes, nothing in,
+                                        ; the count out. fk:1958-1960 passes
+                                        ; sizeof(u32).
+#MBX_TAG_FB_SETDISPLAYNUM  = $00048013  ; dh:123 FRAMEBUFFER_SET_DISPLAY_NUM
+                                        ; value buffer 4 bytes, one u32 INDEX
+                                        ; in. fk:1846 builds the tag header
+                                        ; literally as {tag, 4, 0}.
+#MBX_TAG_FB_GETDISPLAYID   = $00040016  ; dh:122 FRAMEBUFFER_GET_DISPLAY_ID
+                                        ; value buffer 4 bytes, and the SAME
+                                        ; WORD both ways: INDEX in, ID out.
+                                        ; fk:1991-1994.
+; dh:125 FRAMEBUFFER_GET_DISPLAY_SETTINGS = $00040014 is deliberately NOT
+; declared. Its payload is undocumented everywhere on this disk; see
+; DELIBERATELY LEFT OUT in the header for the argument.
+
+; ---- and the VALUES those tags carry ---------------------------------
+; The DispmanX display ids, from the table at fk:341-359 quoted above.
+; These are IDS, never indices. Only the two HDMI sockets are named as
+; constants because they are the two this board has and the two anything
+; here has a use for; the rest are in the comment above, written down
+; once, so that a program meeting id 3 can look it up instead of
+; guessing.
+; The two DSI-capable identifiers. Declared 2026-09-06 for the Waveshare
+; panel work: on a Pi 4 the display connector's panel, IF the firmware
+; brings it up at all, arrives as one of these and NOT as a new tag. The
+; whole display-select path above is identifier-agnostic, so nothing else
+; had to change - only the naming, so a census can say what it found
+; instead of printing a bare number. See the vault note "Waveshare 10.1
+; DSI and touch - what the hardware is".
+;
+; WHETHER EITHER EVER APPEARS ON THIS BOARD IS UNKNOWN and is exactly the
+; experiment: the firmware's built-in DSI support is for the official
+; Raspberry Pi Touch Display, which it detects on I2C, and a third-party
+; panel is predicted NOT to be enumerated. Predicted, not measured.
+#MBX_FB_DISPLAY_MAIN_LCD = 0   ; fk:347 display_types[0], /* MAIN_LCD - DSI or DPI */
+#MBX_FB_DISPLAY_AUX_LCD = 1    ; fk:348 display_types[1], /* AUX_LCD */
+#MBX_FB_DISPLAY_HDMI0 = 2      ; fk:349 display_types[2], /* HDMI0 */
+                               ; and fk:1141 "case 2: /* HDMI0 */"
+#MBX_FB_DISPLAY_HDMI1 = 7      ; fk:354 display_types[7], /* HDMI1 */
+                               ; and fk:1146 "case 7: /* HDMI1 */"
+
+; The alignment ALLOCATE_BUFFER is asked for. Not a protocol constant -
+; it is the caller's request - but it is U-Boot's number and there is no
+; reason to differ: v2025.01_msg.c:188, allocate_buffer.body.req.alignment
+; = 0x100.
+#MBX_FB_ALLOC_ALIGN = $100
+
+; ---- clock ids --------------------------------------------------------
+#MBX_CLK_EMMC = 1
+#MBX_CLK_UART = 2
+#MBX_CLK_ARM  = 3
+#MBX_CLK_CORE = 4
+
+; ---- error codes, from MailboxError() --------------------------------
+#MBX_OK           = 0
+#MBX_ERR_NOINIT   = 1          ; MailboxInit() was not called, or failed
+#MBX_ERR_ADDRESS  = 2          ; buffer above 1 GiB - unreachable, see above
+#MBX_ERR_TOOBIG   = 3          ; the value buffer asked for does not fit
+#MBX_ERR_TXTIMEOUT = 4         ; mailbox 1 stayed FULL
+#MBX_ERR_RXTIMEOUT = 5         ; mailbox 0 stayed EMPTY, or only ever
+                               ; produced other channels' traffic
+#MBX_ERR_ECHO     = 6          ; the reply named a different buffer
+#MBX_ERR_STATUS   = 7          ; the firmware's response code was not SUCCESS
+#MBX_ERR_TAG      = 8          ; the firmware did not mark the tag answered
+                               ; - on a list, MailboxListFailedTag() says
+                               ;   which one
+#MBX_ERR_MODE     = 9          ; a single-tag call while a list is open, or
+                               ; a list call with no list. Loud, because
+                               ; the two paths share one buffer and mixing
+                               ; them would send a half-built message.
+#MBX_ERR_EMPTY    = 10         ; MailboxListSend() with no tags in the list
+
+; How long any single wait is willing to spin. Both bounds are always
+; live: the tick deadline is the honest one, the iteration count is the
+; backstop for the case where CNTFRQ_EL0 reads zero because nothing set
+; it. An unbounded spin on a device that never answers is a hang with no
+; message, which is the one outcome this library refuses to have.
+#MBX_TIMEOUT_MS = 1000
+#MBX_SPIN_LIMIT = 200000000
+
+; The buffer.
+;
+; IT WAS ONE CACHE LINE UNTIL 2026-08-26 AND IS NOW FOUR. The largest
+; single-tag request is nine words - 5 header + 3 value for a
+; set-clock-rate + 1 end tag = 36 bytes, rounded to 48 - and 64 was
+; ample for that. The multi-tag path is what needed the room:
+; display.pi4's combined framebuffer message reproduces U-Boot's
+; struct msg_setup (v2025.01_msg.c:35-47), which is
+;
+;   8 header + 20 + 20 + 16 + 16 + 16 + 20 + 28 + 20 + 16 + 4 end
+;
+; = 184 bytes, rounded to 192. 256 leaves headroom for a tenth tag
+; without another visit here, and it is FOUR WHOLE CACHE LINES, which is
+; the property that actually matters.
+;
+; THE TENTH TAG ARRIVED THE SAME DAY, which is a nice demonstration that
+; the headroom was worth leaving: display.pi4 puts SET_DISPLAY_NUM in
+; front of those nine whenever a display has been chosen (12 header + 4
+; value = 16 bytes, taking the message to 200) and in front of the
+; get-physical query as well. Both still fit inside 256 with a whole
+; cache line to spare. An ELEVENTH would not leave much, so the next
+; person to add one should read the line-ownership argument below before
+; assuming there is room.
+;
+; THE LINE-OWNERSHIP ARGUMENT IS UNCHANGED AND IS WHY 256 AND NOT 200.
+; See THE WINDOW IS ALIGNED TO 64 in the header: the window must consist
+; of whole 64-byte lines that belong to this buffer alone, because a
+; line shared with a neighbouring global can be dirtied between the send
+; and the reply and the clean afterwards would write that stale copy
+; back over the firmware's answer. A 3.25-line window would reintroduce
+; exactly that. Raise #MBX_MAX_BYTES only in multiples of 64, and raise
+; #MBX_BUF_BYTES / #MBX_BUF_WORDS with it.
+;
+; The array is #MBX_MAX_BYTES + 64 so that an aligned window of the full
+; size always fits inside it whatever the array's own base alignment
+; turns out to be (worst case wastes 63 bytes at the front and 1 at the
+; back).
+#MBX_CACHE_LINE = 64
+#MBX_BUF_WORDS = 80
+#MBX_BUF_BYTES = 320
+#MBX_MAX_BYTES = 256
+
+; How many tags one composed message may carry. Nine is what U-Boot's
+; framebuffer setup needs; twelve is that with room to spare and still
+; small enough that the two index arrays are a rounding error in .bss.
+; MailboxListAdd() refuses the thirteenth rather than writing past them.
+#MBX_MAX_TAGS = 12
+
+; Which half of the transport is currently holding the buffer. The two
+; halves share one buffer on purpose - one alignment argument, one set
+; of cache operations, one bounded wait - so they must not overlap, and
+; the overlap is REFUSED rather than tolerated. A MailboxSend() issued
+; while a list is half-built would transmit a buffer whose header says
+; one thing and whose body says another.
+#MBX_MODE_IDLE   = 0
+#MBX_MODE_SINGLE = 1
+#MBX_MODE_LIST   = 2
+
+Global Dim mbxBuf.l[#MBX_BUF_WORDS]
+
+Global mbxBufAddr.i            ; 64-byte-aligned ARM address inside mbxBuf
+Global mbxBusAddr.i            ; the same buffer, named for the VideoCore
+Global mbxReady.i              ; MailboxInit() succeeded
+Global mbxErr.i                ; last error, one of #MBX_ERR_*
+Global mbxTimeoutTicks.i       ; #MBX_TIMEOUT_MS in CNTPCT_EL0 ticks
+Global mbxHaveClock.i          ; CNTFRQ_EL0 was non-zero
+Global mbxTotalBytes.i         ; size of the request currently being built
+Global mbxValueBytes.i         ; its value buffer
+Global mbxFlushAddr.i          ; one cache line, for MbxCacheLine()
+
+; ---- the multi-tag half ----------------------------------------------
+Global mbxMode.i               ; #MBX_MODE_* - who owns the buffer
+Global mbxListCount.i          ; tags added so far
+Global mbxListCursor.i         ; byte offset of the next free tag slot
+Global mbxListBad.i            ; index of the first tag the firmware left
+                               ; unanswered, or -1
+Global Dim mbxListOff.i[#MBX_MAX_TAGS]   ; byte offset of each tag header
+Global Dim mbxListVal.i[#MBX_MAX_TAGS]   ; each tag's value buffer, bytes
+
+; ----------------------------------------------------------------------
+;  The architectural counter. CNTPCT_EL0 and CNTFRQ_EL0 are readable
+;  with no setup and no trap at the exception levels a loader hands a
+;  program, which makes them the cheapest honest clock a library with no
+;  dependencies can have. armstub8.S sets CNTFRQ_EL0 from OSC_FREQ,
+;  which is 54000000 on BCM2711 (armstub8.S:54 and :110-112), so on a
+;  normally-booted Pi 4 this reads 54 MHz. It is READ rather than
+;  assumed, because a program that arrived some other way may find it
+;  zero - and that case is handled rather than divided by.
+; ----------------------------------------------------------------------
+Procedure.i MbxTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i MbxCounterHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One 64-byte cache line, cleaned AND invalidated to the point of
+;  coherency. "civac", not the Monitor's "cvau": cvau cleans to the
+;  point of UNIFICATION, which is the right target when the reader is
+;  this core's instruction fetch. The reader here is the VideoCore,
+;  which is not on the far side of the point of unification but of the
+;  point of COHERENCY, and it both reads what we wrote and writes what
+;  we then read - so the line has to be pushed out and dropped.
+;
+;  "ldr x9", not "ldr w9". mbxFlushAddr is a .i and a .i is eight bytes
+;  here; loading it with ldr w9 would silently lose the top half of an
+;  address.
+; ----------------------------------------------------------------------
+Procedure MbxCacheLine()
+  ASM
+    adrp x9, global_mbxflushaddr
+    add  x9, x9, #:lo12:global_mbxflushaddr
+    ldr  x9, [x9]
+    dc civac, x9
+  EndASM
+EndProcedure
+
+Procedure MbxSyncBuffer()
+  Define a.i
+  Define e.i
+  ; mbxBufAddr is on a 64-byte boundary and the window is #MBX_MAX_BYTES
+  ; long, so this runs once per cache line in the window - FOUR times
+  ; since 2026-08-26, when the window grew to hold a nine-tag message.
+  ; The round-down was kept through the one-line era for exactly this
+  ; moment and cost two instructions a transaction to have.
+  ;
+  ; THE WHOLE WINDOW, EVERY TIME, even for a message that fills 48 bytes
+  ; of it. Cleaning a line that was not written is a few cycles and no
+  ; effect; deciding which lines to clean from the message size would be
+  ; a second place for the size accounting to be wrong, and getting it
+  ; wrong leaves the firmware's answer sitting behind a stale cache line
+  ; with nothing to announce it.
+  ;
+  ; Round down by shifting, not by masking: a mask written as a 32-bit
+  ; literal would clear the top half of a 64-bit address as well as the
+  ; low six bits. The address is physical and therefore positive, so the
+  ; arithmetic shift is a logical one.
+  a = (mbxBufAddr >> 6) << 6
+  e = mbxBufAddr + #MBX_MAX_BYTES
+  While a < e
+    mbxFlushAddr = a
+    MbxCacheLine()
+    a = a + 64
+  Wend
+  a64_barrier()                ; dsb sy + isb
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Wait until (PeekL(reg) & bit) is clear, or give up. Returns 1 if the
+;  bit cleared, 0 on timeout. Both deadlines are checked every pass; see
+;  #MBX_TIMEOUT_MS.
+; ----------------------------------------------------------------------
+Procedure.i MbxWaitClear(reg.i, bit.i)
+  Define t0.i
+  Define n.i
+  t0 = MbxTicks()
+  n = 0
+  Repeat
+    ; PeekL, not Peek: these are 32-bit registers and a bare Peek would
+    ; read eight bytes. The & keeps only the bit asked for, so it does
+    ; not matter whether the load sign-extended.
+    If (PeekN(reg) & bit) = 0
+      ProcedureReturn 1
+    EndIf
+    n = n + 1
+    If n > #MBX_SPIN_LIMIT
+      ProcedureReturn 0
+    EndIf
+    If mbxHaveClock <> 0
+      If (MbxTicks() - t0) > mbxTimeoutTicks
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  ForEver
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - set-up and status
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  MailboxInit() - find a 16-byte-aligned buffer, prove the VideoCore
+;  can name it, and work out the timeout. Returns 1 on success, 0 on the
+;  single failure that is possible here: the buffer landed outside the
+;  low gigabyte, where there is no bus alias for it. Call it once,
+;  before anything else in this file.
+;
+;  It talks to no hardware, so it cannot fail for a hardware reason and
+;  a 1 from it is NOT evidence the firmware is alive. The first
+;  MailboxSend() is.
+; ----------------------------------------------------------------------
+Procedure.i MailboxInit()
+  Define hz.i
+
+  mbxReady = 0
+  mbxErr = #MBX_OK
+  mbxTotalBytes = 0
+  mbxValueBytes = 0
+  mbxMode = #MBX_MODE_IDLE
+  mbxListCount = 0
+  mbxListCursor = 0
+  mbxListBad = -1
+
+  ; Round the array's base UP to the next 64-byte boundary. Sixteen is
+  ; what the mailbox needs - the low four bits of the word are the
+  ; channel, so an address with any of them set cannot be sent at all -
+  ; and 64 is what the CACHE needs, so that this buffer owns its line
+  ; and no neighbouring global can dirty it between the send and the
+  ; reply. 64 satisfies 16, so one number does both jobs.
+  ;
+  ; -64 is a full-width 64-bit mask, which is why it is written as -64
+  ; and not as a hex literal that would be 32 bits wide and would clear
+  ; the top half of the address as well as the low six bits.
+  mbxBufAddr = (@mbxBuf[0] + (#MBX_CACHE_LINE - 1)) & (-64)
+
+  ; The dma-ranges alias is 0x40000000 long. Above that there is no name
+  ; for this buffer that the VideoCore would understand, and forming one
+  ; anyway would produce a valid-looking word pointing at the wrong
+  ; memory. Refuse instead. See THE 1 GiB DMA WINDOW.
+  If (mbxBufAddr + #MBX_MAX_BYTES) > #MBX_DMA_LIMIT
+    mbxErr = #MBX_ERR_ADDRESS
+    ProcedureReturn 0
+  EndIf
+
+  mbxBusAddr = (mbxBufAddr + #MBX_BUS_OFFSET) & $FFFFFFFF
+
+  hz = MbxCounterHz()
+  If hz > 0
+    mbxHaveClock = 1
+    ; Divide first. hz is tens of millions and the product with 1000
+    ; would still fit a 64-bit .i, but dividing first is exact enough
+    ; for a deadline and cannot overflow on any counter frequency.
+    mbxTimeoutTicks = (hz / 1000) * #MBX_TIMEOUT_MS
+  Else
+    ; Nothing set CNTFRQ_EL0. Say so rather than dividing by it; the
+    ; iteration backstop in MbxWaitClear() carries the deadline alone.
+    mbxHaveClock = 0
+    mbxTimeoutTicks = 0
+  EndIf
+
+  mbxReady = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i MailboxReady()
+  ProcedureReturn mbxReady
+EndProcedure
+
+; The reason the last call failed, as one of the #MBX_ERR_* constants.
+; Cleared to #MBX_OK at the start of every MailboxBegin() and every
+; wrapper below, so it always describes the most recent attempt.
+Procedure.i MailboxError()
+  ProcedureReturn mbxErr
+EndProcedure
+
+; The ARM address of the aligned buffer, and the bus address the
+; VideoCore was given. Diagnostics only - printing these two and
+; checking the second is the first minus nothing but the offset is the
+; quickest way to confirm the conversion on the bench.
+Procedure.i MailboxBufferAddr()
+  ProcedureReturn mbxBufAddr
+EndProcedure
+
+Procedure.i MailboxBusAddr()
+  ProcedureReturn mbxBusAddr
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - the transport. Build a single-tag request, send it, read the
+;  answer. Every wrapper further down is three or four calls to these.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  MailboxBegin(tag, reqBytes, respBytes) - lay out a one-tag property
+;  buffer. reqBytes is how many bytes of value the request carries,
+;  respBytes how many the firmware will write back; the value buffer is
+;  sized to the larger, which is what the protocol requires and is why
+;  a tag like set-clock-rate (12 in, 8 out) declares 12.
+;
+;  Returns 1 if the request fits, 0 otherwise. Fill the request words
+;  with MailboxSetWord() afterwards, then call MailboxSend().
+; ----------------------------------------------------------------------
+Procedure.i MailboxBegin(tag.i, reqBytes.i, respBytes.i)
+  Define valBytes.i
+  Define total.i
+  Define i.i
+
+  mbxErr = #MBX_OK
+  If mbxReady = 0
+    mbxErr = #MBX_ERR_NOINIT
+    ProcedureReturn 0
+  EndIf
+
+  valBytes = reqBytes
+  If respBytes > valBytes
+    valBytes = respBytes
+  EndIf
+  ; Packets are processed a word at a time, so round the value buffer up
+  ; to a multiple of four rather than letting a byte count through that
+  ; would leave the end tag unaligned.
+  valBytes = (valBytes + 3) & (-4)
+
+  ; 5 header words + the value + the end tag, then rounded to 16 so the
+  ; declared size never stops short of a word we wrote. The wiki's own
+  ; description of the size field says it includes the padding.
+  total = #MBX_OFF_VALUE + valBytes + 4
+  total = (total + 15) & (-16)
+  If total > #MBX_MAX_BYTES
+    mbxErr = #MBX_ERR_TOOBIG
+    ProcedureReturn 0
+  EndIf
+
+  mbxTotalBytes = total
+  mbxValueBytes = valBytes
+  ; This call takes the buffer. Anything half-composed by the list path
+  ; is discarded here rather than left to be mixed in later.
+  mbxMode = #MBX_MODE_SINGLE
+  mbxListCount = 0
+  mbxListCursor = 0
+  mbxListBad = -1
+
+  ; Zero the whole thing first. The value words of a request that only
+  ; fills some of them must not carry whatever the last call left, and
+  ; the padding after the end tag should not either.
+  i = 0
+  While i < total
+    PokeL(mbxBufAddr + i, 0)
+    i = i + 4
+  Wend
+
+  PokeL(mbxBufAddr + #MBX_OFF_SIZE, total)
+  PokeL(mbxBufAddr + #MBX_OFF_CODE, #MBX_REQUEST)
+  PokeL(mbxBufAddr + #MBX_OFF_TAG, tag)
+  PokeL(mbxBufAddr + #MBX_OFF_VALLEN, valBytes)
+  ; The tag's own code word. The driver sets req_resp_size to 0 on the
+  ; way out and reads the firmware's answer back out of the same word.
+  PokeL(mbxBufAddr + #MBX_OFF_TAGCODE, 0)
+  PokeL(mbxBufAddr + #MBX_OFF_VALUE + valBytes, #MBX_END_TAG)
+
+  ProcedureReturn 1
+EndProcedure
+
+; Word i of the value buffer, counted from zero.
+Procedure MailboxSetWord(i.i, v.i)
+  If mbxTotalBytes > 0
+    If (i * 4) < mbxValueBytes
+      PokeL(mbxBufAddr + #MBX_OFF_VALUE + (i * 4), v)
+    EndIf
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MbxTransact() - hand the buffer to the firmware and wait for it back.
+;
+;  EVERYTHING THAT IS TRUE OF ANY PROPERTY MESSAGE, whether it carries
+;  one tag or nine, and nothing that is true of only one of them. The
+;  per-tag response-bit check is NOT here, because "which tags were
+;  answered" is the one question the two paths answer differently:
+;  MailboxSend() has one word to look at, MailboxListSend() has a list
+;  and has to say which member failed.
+;
+;  Factored out of MailboxSend() on 2026-08-26 when the list path
+;  arrived. Two copies of a mailbox transaction is two places for the
+;  echo check, the channel filter or a deadline to be got wrong, and the
+;  header's whole argument for this file is that the transport is the
+;  hard, verifiable part.
+;
+;  The sequence, and every step of it is a check rather than a hope:
+;    push the buffer out of the D-cache      (the VideoCore reads DRAM)
+;    wait for mailbox 1 to be not-FULL       (bounded)
+;    write channel 8 | bus address           (one word, both fields)
+;    wait for mailbox 0 to be not-EMPTY      (bounded)
+;    read, and if the low nibble is not 8 that reply belongs to someone
+;      else - drop it and keep waiting, still bounded
+;    check the upper 28 bits are OUR buffer, not another request's
+;    pull the buffer back into the D-cache   (the VideoCore wrote DRAM)
+;    check the response code says SUCCESS
+;
+;  Returns 1 only if all of that held. On 0, MailboxError() says which
+;  step failed, and the value words must not be read.
+; ----------------------------------------------------------------------
+Procedure.i MbxTransact()
+  Define msg.i
+  Define reply.i
+  Define code.i
+  Define n.i
+
+  MbxSyncBuffer()
+
+  ; MBOX_MSG(chan, data28): the address supplies bits 31:4 and the
+  ; channel bits 3:0. mbxBusAddr is 64-byte aligned by construction, so
+  ; the or cannot disturb the address; the mask is belt and braces and
+  ; documents the field boundary at the one place the word is built.
+  msg = (mbxBusAddr & (-16)) | (#MBX_CHANNEL & #MBX_CHANMASK)
+
+  If MbxWaitClear(#MBX_STATUS1, #MBX_FULL) = 0
+    mbxErr = #MBX_ERR_TXTIMEOUT
+    ProcedureReturn 0
+  EndIf
+
+  a64_barrier()
+  PokeL(#MBX_WRITE, msg)
+  a64_barrier()
+
+  ; The read loop. A reply on another channel is not an error and not
+  ; ours - drop it and go round. Bounded by the same spin limit so a
+  ; firmware that only ever talks to somebody else still ends in a
+  ; timeout rather than a hang.
+  n = 0
+  Repeat
+    If MbxWaitClear(#MBX_STATUS0, #MBX_EMPTY) = 0
+      mbxErr = #MBX_ERR_RXTIMEOUT
+      ProcedureReturn 0
+    EndIf
+    reply = PeekN(#MBX_READ) & $FFFFFFFF
+    If (reply & #MBX_CHANMASK) = #MBX_CHANNEL
+      Break
+    EndIf
+    n = n + 1
+    If n > 64
+      mbxErr = #MBX_ERR_RXTIMEOUT
+      ProcedureReturn 0
+    EndIf
+  ForEver
+
+  a64_barrier()
+
+  ; The firmware echoes the address it was given. If it is not the one
+  ; we sent, this reply answers a different request and its buffer is
+  ; not ours to read.
+  If (reply & (-16) & $FFFFFFFF) <> (msg & (-16) & $FFFFFFFF)
+    mbxErr = #MBX_ERR_ECHO
+    ProcedureReturn 0
+  EndIf
+
+  ; The VideoCore wrote DRAM under us; drop any stale lines before
+  ; reading the answer back.
+  MbxSyncBuffer()
+
+  ; & $FFFFFFFF because SUCCESS is $80000000: bit 31 is set, and whether
+  ; a 32-bit load sign-extended decides whether the comparison would
+  ; otherwise be against a negative number. See the LANGUAGE MODEL note.
+  code = PeekN(mbxBufAddr + #MBX_OFF_CODE) & $FFFFFFFF
+  If code <> #MBX_SUCCESS
+    mbxErr = #MBX_ERR_STATUS
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MailboxSend() - send the single-tag request MailboxBegin() laid out.
+;
+;  UNCHANGED IN BEHAVIOUR by the 2026-08-26 multi-tag work. The body
+;  moved into MbxTransact() and the per-tag check stayed here; the
+;  #MBX_ERR_MODE guard below cannot fire for any caller that has not
+;  opened a list, and nothing that existed before that date has.
+; ----------------------------------------------------------------------
+Procedure.i MailboxSend()
+  Define tagcode.i
+
+  mbxErr = #MBX_OK
+  If mbxReady = 0
+    mbxErr = #MBX_ERR_NOINIT
+    ProcedureReturn 0
+  EndIf
+  If mbxTotalBytes = 0
+    mbxErr = #MBX_ERR_NOINIT
+    ProcedureReturn 0
+  EndIf
+  ; The list path owns the buffer right now. Refuse rather than transmit
+  ; a half-composed message under a single-tag header.
+  If mbxMode <> #MBX_MODE_SINGLE
+    mbxErr = #MBX_ERR_MODE
+    ProcedureReturn 0
+  EndIf
+
+  If MbxTransact() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; A whole-buffer SUCCESS is not the same claim as "this tag was
+  ; understood". The firmware marks each tag it answered by setting bit
+  ; 31 of the tag's own code word; a tag it did not recognise is left
+  ; clear while the buffer still reports success.
+  tagcode = PeekN(mbxBufAddr + #MBX_OFF_TAGCODE) & $FFFFFFFF
+  If (tagcode & #MBX_RESP_BIT) = 0
+    mbxErr = #MBX_ERR_TAG
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; Word i of the value buffer after a successful send, masked to 32 bits
+; so a rate at or above 2.147 GHz does not come back negative.
+Procedure.i MailboxWord(i.i)
+  If mbxTotalBytes = 0
+    ProcedureReturn 0
+  EndIf
+  If (i * 4) >= mbxValueBytes
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekN(mbxBufAddr + #MBX_OFF_VALUE + (i * 4)) & $FFFFFFFF
+EndProcedure
+
+; How many bytes of value the firmware says it wrote. Usually the
+; respBytes that was asked for; worth reading when it is not.
+Procedure.i MailboxRespBytes()
+  If mbxTotalBytes = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekN(mbxBufAddr + #MBX_OFF_TAGCODE) & #MBX_LEN_MASK
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - SEVERAL TAGS IN ONE MESSAGE
+;
+;  Read SEVERAL TAGS IN ONE MESSAGE in the header first. The short
+;  version: the firmware accumulates a device's requested state WITHIN
+;  ONE property transaction and acts on what that transaction
+;  accumulated. For the framebuffer that is not an optimisation, it is
+;  the difference between a 1920 x 1080 surface and a 2 x 2 one.
+;
+;      MailboxListBegin()               take the buffer, empty the list
+;      i = MailboxListAdd(tag, req, resp)   append one tag, -1 if it
+;                                           will not fit
+;      MailboxListSetWord(i, w, v)      fill request word w of tag i
+;      MailboxListSend()                send once, validate everything
+;      MailboxListWord(i, w)            response word w of tag i
+;
+;  The tags go out IN THE ORDER THEY WERE ADDED and that order is part
+;  of the protocol, not a detail: the firmware processes them in buffer
+;  order, so a tag that configures must precede the tag that acts on the
+;  configuration. This file does not police the order - it cannot know
+;  what a caller's tags mean - but it does not reorder them either, and
+;  MailboxListAdd() returning a sequential index is the caller's handle
+;  on that fact.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  MailboxListBegin() - start composing. Returns 1, or 0 if the
+;  transport is not up.
+;
+;  It writes the buffer header immediately and leaves the cursor just
+;  past it. The total size word is NOT final until MailboxListSend()
+;  writes it, because it is not known until the last tag is in.
+; ----------------------------------------------------------------------
+Procedure.i MailboxListBegin()
+  mbxErr = #MBX_OK
+  If mbxReady = 0
+    mbxErr = #MBX_ERR_NOINIT
+    ProcedureReturn 0
+  EndIf
+
+  ; Take the buffer away from the single-tag path. MailboxWord() and
+  ; MailboxSetWord() both key off mbxTotalBytes, so zeroing it makes a
+  ; stale single-tag read return 0 instead of a word out of somebody
+  ; else's message.
+  mbxTotalBytes = 0
+  mbxValueBytes = 0
+  mbxMode = #MBX_MODE_LIST
+  mbxListCount = 0
+  mbxListCursor = #MBX_HDR_BYTES
+  mbxListBad = -1
+
+  PokeL(mbxBufAddr + #MBX_OFF_SIZE, 0)
+  PokeL(mbxBufAddr + #MBX_OFF_CODE, #MBX_REQUEST)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MailboxListAdd(tag, reqBytes, respBytes) - append one tag.
+;
+;  RETURNS THE TAG'S INDEX, 0 for the first, and -1 if it will not fit
+;  or the list is not open. -1 and not 0, because 0 is a legitimate
+;  index and a caller that ignored a failure would otherwise write its
+;  words into the first tag.
+;
+;  reqBytes / respBytes have the same meaning as MailboxBegin()'s: the
+;  value buffer is sized to the larger of the two, which is what the
+;  protocol requires. v2025.01_mbox.h:96 says the same thing in C -
+;  val_buf_size = sizeof(body), and body is a union of the request and
+;  response structs.
+; ----------------------------------------------------------------------
+Procedure.i MailboxListAdd(tag.i, reqBytes.i, respBytes.i)
+  Define valBytes.i
+  Define need.i
+  Define total.i
+  Define at.i
+  Define i.i
+
+  mbxErr = #MBX_OK
+  If mbxReady = 0
+    mbxErr = #MBX_ERR_NOINIT
+    ProcedureReturn -1
+  EndIf
+  If mbxMode <> #MBX_MODE_LIST
+    mbxErr = #MBX_ERR_MODE
+    ProcedureReturn -1
+  EndIf
+  If mbxListCount >= #MBX_MAX_TAGS
+    mbxErr = #MBX_ERR_TOOBIG
+    ProcedureReturn -1
+  EndIf
+
+  valBytes = reqBytes
+  If respBytes > valBytes
+    valBytes = respBytes
+  EndIf
+  ; "Packets are processed a dword at a time" - raspberrypi-firmware.c:99
+  ; rejects a whole buffer whose size is not a multiple of four. Rounding
+  ; each value buffer up to four is what keeps every LATER tag header
+  ; word-aligned as well, which is the part that would not announce
+  ; itself.
+  valBytes = (valBytes + 3) & (-4)
+
+  need = #MBX_TAGHDR_BYTES + valBytes
+  ; The end tag has to fit too, and the whole buffer is rounded to 16.
+  total = mbxListCursor + need + 4
+  total = (total + 15) & (-16)
+  If total > #MBX_MAX_BYTES
+    mbxErr = #MBX_ERR_TOOBIG
+    ProcedureReturn -1
+  EndIf
+
+  at = mbxListCursor
+  PokeL(mbxBufAddr + at + #MBX_TOFF_ID, tag)
+  PokeL(mbxBufAddr + at + #MBX_TOFF_VALLEN, valBytes)
+  ; U-Boot's BCM2835_MBOX_INIT_TAG (v2025.01_mbox.h:94-98) puts the
+  ; REQUEST's length in this word on the way out; the kernel puts zero
+  ; (raspberrypi-firmware.c:170). Both are in daily use against real
+  ; firmware. This path follows U-Boot - see the long note in the header
+  ; for why the two paths deliberately differ here rather than one of
+  ; them being changed to match the other.
+  ;
+  ; Rounded to four for the same reason the value buffer is: a length
+  ; that is not a whole number of words describes a buffer this protocol
+  ; cannot address.
+  PokeL(mbxBufAddr + at + #MBX_TOFF_CODE, (reqBytes + 3) & (-4))
+
+  ; Zero the value words. A tag that fills only some of them must not
+  ; carry whatever the last message left in the rest - and for a pure
+  ; GET, which fills none, this is the whole of the request.
+  i = 0
+  While i < valBytes
+    PokeL(mbxBufAddr + at + #MBX_TOFF_VALUE + i, 0)
+    i = i + 4
+  Wend
+
+  mbxListOff[mbxListCount] = at
+  mbxListVal[mbxListCount] = valBytes
+  mbxListCursor = at + need
+  mbxListCount = mbxListCount + 1
+  ProcedureReturn mbxListCount - 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MailboxListSetWord(tagIndex, i, v) - word i of tag tagIndex's value
+;  buffer, counted from zero. Silently does nothing for an out-of-range
+;  index, which is MailboxSetWord()'s behaviour and the same argument:
+;  the write cannot land anywhere harmful, and the tag's response will
+;  not carry what the caller expected, which is the loud part.
+; ----------------------------------------------------------------------
+Procedure MailboxListSetWord(tagIndex.i, i.i, v.i)
+  If tagIndex >= 0 And tagIndex < mbxListCount
+    If (i * 4) < mbxListVal[tagIndex]
+      PokeL(mbxBufAddr + mbxListOff[tagIndex] + #MBX_TOFF_VALUE + (i * 4), v)
+    EndIf
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MailboxListSend() - close the buffer and send it, once.
+;
+;  On top of everything MbxTransact() checks, this checks EVERY TAG'S
+;  OWN RESPONSE BIT, not just the first. That matters more here than it
+;  does for a single tag: a combined message where eight tags were
+;  understood and the ninth was not comes back with a whole-buffer
+;  SUCCESS, and the eight that worked have already reconfigured the
+;  device the ninth was supposed to act on. Reporting that as success
+;  would be the exact failure this library exists to refuse.
+;
+;  Returns 1 or 0; on 0, MailboxError() names the step and
+;  MailboxListFailedTag() names the tag when the step was #MBX_ERR_TAG.
+; ----------------------------------------------------------------------
+Procedure.i MailboxListSend()
+  Define total.i
+  Define i.i
+  Define code.i
+
+  mbxErr = #MBX_OK
+  If mbxReady = 0
+    mbxErr = #MBX_ERR_NOINIT
+    ProcedureReturn 0
+  EndIf
+  If mbxMode <> #MBX_MODE_LIST
+    mbxErr = #MBX_ERR_MODE
+    ProcedureReturn 0
+  EndIf
+  If mbxListCount = 0
+    ; An empty list is not a message with no effect, it is a caller that
+    ; thinks it added tags. Say so.
+    mbxErr = #MBX_ERR_EMPTY
+    ProcedureReturn 0
+  EndIf
+
+  mbxListBad = -1
+
+  PokeL(mbxBufAddr + mbxListCursor, #MBX_END_TAG)
+  total = mbxListCursor + 4
+  total = (total + 15) & (-16)
+  If total > #MBX_MAX_BYTES
+    ; MailboxListAdd() already refused anything that would land here, so
+    ; reaching this means the accounting disagrees with itself. Refuse
+    ; rather than send a size word that overruns the buffer.
+    mbxErr = #MBX_ERR_TOOBIG
+    ProcedureReturn 0
+  EndIf
+  ; Zero the padding between the end tag and the declared size. The wiki
+  ; and raspberrypi-firmware.c:114 both include the padding in the size,
+  ; so the firmware will read it, and it must not read a word left over
+  ; from a previous message and mistake it for a tag.
+  i = mbxListCursor + 4
+  While i < total
+    PokeL(mbxBufAddr + i, 0)
+    i = i + 4
+  Wend
+  PokeL(mbxBufAddr + #MBX_OFF_SIZE, total)
+  PokeL(mbxBufAddr + #MBX_OFF_CODE, #MBX_REQUEST)
+
+  If MbxTransact() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Every tag, in order, so the FIRST one the firmware did not answer is
+  ; the one reported - which is also the earliest point the message
+  ; stopped meaning what the caller wrote.
+  i = 0
+  While i < mbxListCount
+    code = PeekN(mbxBufAddr + mbxListOff[i] + #MBX_TOFF_CODE) & $FFFFFFFF
+    If (code & #MBX_RESP_BIT) = 0
+      mbxListBad = i
+      mbxErr = #MBX_ERR_TAG
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+
+  ProcedureReturn 1
+EndProcedure
+
+; Word i of tag tagIndex's value buffer after a successful send, masked
+; to 32 bits so a framebuffer bus address of $DE400000 does not come
+; back negative. Returns 0 for an index that is not there.
+Procedure.i MailboxListWord(tagIndex.i, i.i)
+  If tagIndex < 0 Or tagIndex >= mbxListCount
+    ProcedureReturn 0
+  EndIf
+  If (i * 4) >= mbxListVal[tagIndex]
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekN(mbxBufAddr + mbxListOff[tagIndex] + #MBX_TOFF_VALUE + (i * 4)) & $FFFFFFFF
+EndProcedure
+
+; How many bytes of value the firmware says it wrote for that tag.
+Procedure.i MailboxListRespBytes(tagIndex.i)
+  If tagIndex < 0 Or tagIndex >= mbxListCount
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekN(mbxBufAddr + mbxListOff[tagIndex] + #MBX_TOFF_CODE) & #MBX_LEN_MASK
+EndProcedure
+
+; How many tags are in the list.
+Procedure.i MailboxListCount()
+  ProcedureReturn mbxListCount
+EndProcedure
+
+; The index of the first tag the firmware did not mark answered, or -1.
+; Only meaningful after a MailboxListSend() that returned 0 with
+; MailboxError() = #MBX_ERR_TAG.
+Procedure.i MailboxListFailedTag()
+  ProcedureReturn mbxListBad
+EndProcedure
+
+; The byte offset of a tag inside the message. Diagnostics only - a
+; harness that wants to check the buffer LAYOUT rather than its answers
+; needs this, and computing it outside would mean a second copy of the
+; sizing rules.
+Procedure.i MailboxListTagOffset(tagIndex.i)
+  If tagIndex < 0 Or tagIndex >= mbxListCount
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn mbxListOff[tagIndex]
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - the clock tags
+;
+;  All four getters share one shape: request is the clock id, response
+;  is the clock id echoed back and the rate in Hz. Word 1 is the rate.
+;
+;  A ZERO RATE IS THE FIRMWARE'S "I DO NOT KNOW", not an error - the
+;  documentation says the rate comes back 0 for a clock that does not
+;  exist on this part. These procedures return 0 for that AND for a
+;  failed transaction, so check MailboxError() when 0 matters: #MBX_OK
+;  with a zero rate means the firmware answered and said zero.
+; ======================================================================
+
+Procedure.i MbxClockQuery(tag.i, clockId.i)
+  If MailboxBegin(tag, 4, 8) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, clockId)
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+; The rate the firmware has the clock CONFIGURED at, in Hz.
+Procedure.i MailboxClockRate(clockId.i)
+  ProcedureReturn MbxClockQuery(#MBX_TAG_GET_CLOCK, clockId)
+EndProcedure
+
+; The highest rate the firmware will accept for this clock.
+Procedure.i MailboxClockRateMax(clockId.i)
+  ProcedureReturn MbxClockQuery(#MBX_TAG_MAX_CLOCK, clockId)
+EndProcedure
+
+Procedure.i MailboxClockRateMin(clockId.i)
+  ProcedureReturn MbxClockQuery(#MBX_TAG_MIN_CLOCK, clockId)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The MEASURED rate, which is a different question from the configured
+;  one and is the honest answer to "what is this thing actually doing".
+;  The configured rate is what the firmware intends; the measured rate
+;  is what it observes. They disagree whenever the governor has dropped
+;  the core for thermal or undervoltage reasons, and that disagreement
+;  is exactly what you want to see after a MailboxArmClockSet().
+; ----------------------------------------------------------------------
+Procedure.i MailboxClockRateMeasured(clockId.i)
+  ProcedureReturn MbxClockQuery(#MBX_TAG_CLOCK_MEASURED, clockId)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MailboxClockRateSet(clockId, hz, skipTurbo)
+;
+;  RETURNS THE RATE THE FIRMWARE ACTUALLY APPLIED, in Hz, and 0 if the
+;  transaction failed. That return value is the entire point of this
+;  procedure, and it is not a courtesy:
+;
+;  THE FIRMWARE DOES NOT REFUSE A RATE IT DOES NOT LIKE. IT CLAMPS IT,
+;  AND REPORTS SUCCESS. Ask for 2.5 GHz on a part whose max-clock-rate
+;  is 1.5 GHz and the response code is SUCCESS, the tag is marked
+;  answered, and the rate word in the reply says 1500000000. A wrapper
+;  that returned the rate it was ASKED for - or just a 1 for "worked" -
+;  would be a confident wrong answer about the speed of the machine, and
+;  every timing calculation downstream would inherit it. So the caller
+;  gets the firmware's number and can compare it with its own.
+;
+;  Three other things bound what you will get back, and none of them
+;  produce an error either:
+;    * the ceiling is arm_freq / arm_freq_max in config.txt, reported by
+;      MailboxClockRateMax(). Raising the CPU past the board default
+;      means editing config.txt; this tag cannot exceed what the
+;      firmware was configured to allow.
+;    * the on-demand governor moves the ARM clock between min and max by
+;      itself. A rate set here can be walked back to the minimum a
+;      moment later with no notification at all - which is why the
+;      answer to "did it stick" is MailboxClockRateMeasured(), taken a
+;      little while afterwards, and not this return value.
+;    * undervoltage and over-temperature throttling override everything
+;      above.
+;
+;  skipTurbo: pass 0 for normal behaviour. Non-zero asks the firmware
+;  not to move the other turbo-managed clocks (core, sdram, v3d) along
+;  with this one. It is the third request word in the documented layout.
+; ----------------------------------------------------------------------
+Procedure.i MailboxClockRateSet(clockId.i, hz.i, skipTurbo.i)
+  If MailboxBegin(#MBX_TAG_SET_CLOCK, 12, 8) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, clockId)
+  MailboxSetWord(1, hz)
+  MailboxSetWord(2, skipTurbo)
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ; Word 1 of the RESPONSE - the applied rate. Never hz.
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+; ---- the ARM clock, which is what all of this was built for ----------
+; Three one-line wrappers, so the clock id is written once and the
+; question a program actually asks is spelled the way it is asked.
+
+Procedure.i MailboxArmClock()
+  ProcedureReturn MailboxClockRate(#MBX_CLK_ARM)
+EndProcedure
+
+Procedure.i MailboxArmClockMax()
+  ProcedureReturn MailboxClockRateMax(#MBX_CLK_ARM)
+EndProcedure
+
+Procedure.i MailboxArmClockMeasured()
+  ProcedureReturn MailboxClockRateMeasured(#MBX_CLK_ARM)
+EndProcedure
+
+; Returns the rate the firmware applied. Read the long comment on
+; MailboxClockRateSet() before believing any number this hands back.
+Procedure.i MailboxArmClockSet(hz.i)
+  ProcedureReturn MailboxClockRateSet(#MBX_CLK_ARM, hz, 0)
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - board identity and temperature
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  The board revision word. This is the packed new-style revision code
+;  the firmware reports - it is NOT a small integer, and decoding its
+;  bitfields into a model name is a table this library deliberately does
+;  not carry: the tag number is cited, a model table would not be.
+;  Returns 0 on failure; check MailboxError().
+; ----------------------------------------------------------------------
+Procedure.i MailboxBoardRevision()
+  ; Request length 0 - this tag takes no argument - but the response is
+  ; four bytes, so the value buffer is sized for the response.
+  If MailboxBegin(#MBX_TAG_BOARD_REVISION, 0, 4) = 0
+    ProcedureReturn 0
+  EndIf
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MailboxWord(0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The SoC temperature, IN THOUSANDTHS OF A DEGREE CELSIUS - so 48732
+;  means 48.732 C. It is not degrees and it is not tenths; the unit is
+;  the documented one and converting it here would only hide it.
+;  Temperature id 0 is the only sensor on this part.
+;  Returns 0 on failure; check MailboxError(), since 0 millidegrees is
+;  not a temperature this board will ever report.
+; ----------------------------------------------------------------------
+Procedure.i MailboxTemperature()
+  If MailboxBegin(#MBX_TAG_TEMPERATURE, 4, 8) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, 0)
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+; The temperature at which the firmware starts throttling, same unit.
+; Worth reading next to MailboxTemperature() before an overclock: the
+; gap between them is how much headroom the clock request has.
+Procedure.i MailboxTemperatureMax()
+  If MailboxBegin(#MBX_TAG_MAX_TEMPERATURE, 4, 8) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, 0)
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure

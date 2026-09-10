@@ -1,0 +1,3581 @@
+; ======================================================================
+; tcp.pi4 - TCP for the Raspberry Pi 4, over whichever link is up.
+;
+; RFC 9293 (STD 7, August 2022 - obsoletes RFC 793), plus RFC 6298 for
+; the retransmission timer. Both are on this machine at
+;   Datasheets/rfc9293-tcp.txt
+;   Datasheets/rfc6298-tcp-rto.txt
+; and EVERY RULE BELOW CITES ITS SECTION. A TCP written from memory is a
+; TCP that works against one peer on one afternoon.
+;
+; THIS IS THE PICO'S TCP, PORTED, AND THE PORT IS NOT A COPY.
+; ----------------------------------------------------------------------
+; RP2350/Lib/tcp.pico2 is the original and it was proven against a real
+; server: 131,072 bytes byte-exact each way, retransmission proven from
+; both ends, RST survival, eleven connections on one flash. This file
+; keeps its SHAPE - the same state constants with the same numbers, the
+; same procedure names, the same order of the checks in TcpInput, the
+; same counters, the same deliberate loss injector - so that a defect
+; found on one part can be looked for in the same place on the other.
+;
+; What it does NOT do is pretend the two parts are the same machine.
+; Three things differ and every one of them is load bearing:
+;
+;   1. THE REGISTER IS 64 BITS WIDE HERE. On the Pico the native integer
+;      is 32 bits, so TCP's modulo-2**32 arithmetic (RFC 9293 3.4) falls
+;      out of the machine for free and `(a - b) < 0` IS the comparison.
+;      On AArch64 it is not: two sequence numbers 2**31 apart subtract to
+;      a 64-bit number whose SIGN IS THE OPPOSITE of the modulo-2**32
+;      answer, and every ordering decision in TCP is that sign. So every
+;      sequence variable here is declared `.l` and every helper takes and
+;      returns `.l`. See THE WIDTH RULE below; it is the single most
+;      likely thing to be broken by a careless edit and the breakage is
+;      invisible for months.
+;
+;   2. THE LINK IS NOT FIXED. The Pico has one radio. This board has two
+;      interfaces, and the ruling of 2026-09-02 (Anvil/Rulings 2026-09-02
+;      - memory safety seam, net over any link) is that ONE IP layer
+;      rides whichever link is up, wired preferred. So this file never
+;      names GENET and never names the CYW43. It asks the link seam, and
+;      the seam decides - including for the send ceiling, which is a
+;      CONSTANT on the Pico and a RUN-TIME QUESTION here because the two
+;      interfaces cannot carry the same largest frame.
+;
+;   3. THERE IS A SOCKET TABLE, NOT ONE TCB. The brief asked for one and
+;      the table is #TCP_SOCKETS entries. Everything below is written
+;      against the CURRENT socket, so the state machine still reads
+;      exactly like the Pico's; TcpUse() is what moves the window.
+;
+; WHAT THIS SITS ON. RaspberryPi4/Lib/net.pi4 owns frames: it validates
+; the Ethernet and IPv4 headers, verifies the TCP checksum, and hands up
+; ONE segment's coordinates as NetTcpRx*(). It holds no sequence numbers
+; and no states. RaspberryPi4/Lib/link.pi4 owns the wire: it says which
+; interface carries traffic and puts a staged frame on it. This file owns
+; the protocol and contains no register access and no frame layout below
+; the TCP header. The seam is deliberate and it is the same seam
+; cyw43.pico2 drew for the Pico.
+;
+; REQUIRES, and the main program includes them IN THIS ORDER (house
+; rule 10: a library never includes a library, the main file lists them):
+;
+;     XIncludeFile "RaspberryPi4/Lib/timer.pi4"     ; Micros(), millis()
+;     XIncludeFile "RaspberryPi4/Lib/net.pi4"       ; the framing
+;     XIncludeFile "RaspberryPi4/Lib/link.pi4"      ; the wire
+;     XIncludeFile "RaspberryPi4/Lib/tcp.pi4"       ; this file
+;
+; The exact names this file calls and does not define, so that a missing
+; include fails at COMPILE time with the name in the message rather than
+; at run time with a wrong answer:
+;
+;     Micros()                                       timer.pi4
+;     NetTcpSegBuf()   NetTcpBuild()                 net.pi4
+;     NetTcpRxSrcPort()  NetTcpRxDstPort()           net.pi4
+;     NetTcpRxFrom()   NetTcpRxData()                net.pi4
+;     NetTcpRxDataLen()  NetTcpRxSeg()               net.pi4
+;     NetTcpRxHdrLen()   NetTcpRxMac()               net.pi4
+;     NetIPv4()  NetArpLookup()  NetArpRequest()     net.pi4
+;     NetNextHop()  NetError()                       net.pi4
+;     LinkTxStaged()  LinkTxMax()  LinkPumpNet()     link.pi4
+;     LinkUp()                                       link.pi4
+;
+; A GATE MAY SUBSTITUTE THE LINK. tools/a64/a64_tcp_check.py compiles a
+; harness that defines LinkTxStaged / LinkTxMax / LinkPumpNet itself and
+; does NOT include link.pi4, so the whole state machine is driven with
+; byte-exact frames and no device model at all. That is only possible
+; because the three names above are the entire contract.
+;
+; ======================================================================
+; THE WIDTH RULE. READ IT BEFORE EDITING A SINGLE LINE OF ARITHMETIC.
+; ======================================================================
+; RFC 9293 3.4: "the comparisons are done modulo 2**32". On this part the
+; native integer is SIXTY-FOUR BITS, so that modulo does NOT happen by
+; itself and must be made to happen.
+;
+; HOW IT IS MADE TO HAPPEN, and there is exactly one mechanism:
+; **every sequence-space value is declared `.l`**, and the compiler
+; narrows to a declared type at the four sites that establish a width -
+; an assignment, a declaration, a ProcedureReturn, and a parameter
+; (forum 618, fixed on both AArch64 backends 2026-09-03). Storing a
+; 64-bit sum into a `.l` truncates it to 32 bits and sign-extends, which
+; IS reduction modulo 2**32 into the signed representative - the exact
+; thing the RFC asks for.
+;
+; WHY A DIRECT SUBTRACTION IS NOT ENOUGH, with the number that proves it:
+; take a = $7FFFFFFF and b = $FFFFFFFF. As 32-bit signed values those are
+; 2147483647 and -1. At 64 bits a - b is 2147483648, which is POSITIVE,
+; so a naive test says a is after b. Modulo 2**32 the difference is
+; -2147483648, which is NEGATIVE, so a is BEFORE b. Those are opposite
+; answers about the same pair, and the second one is TCP's. Every
+; comparison in this file therefore goes through the four helpers, which
+; subtract into a `.l` local first and test the sign of THAT.
+;
+; THREE RULES, and they are not stylistic:
+;
+;   * A GLOBAL THAT HOLDS A SEQUENCE NUMBER IS `.l`, NEVER `.i`. Changing
+;     one to `.i` "for consistency" removes the modulo from every
+;     expression that lands in it, and the stack then works perfectly
+;     until a connection happens to straddle the wrap.
+;   * A PROCEDURE THAT TAKES A SEQUENCE NUMBER DECLARES THE PARAMETER
+;     `.l`. That is what reduces an expression like `seq + seglen`
+;     computed at the call site, where there is no assignment to do it.
+;   * A COMPARISON OF TWO SEQUENCE NUMBERS GOES THROUGH TcpSeqLt / Le /
+;     Gt / Ge AND THROUGH NOTHING ELSE. Writing `If a < b` directly is
+;     right for most values and catastrophic near the wrap, which is to
+;     say it is right on every bench and wrong in the field.
+;
+; THE COUNTERS AND THE RING INDICES ARE `.i` ON PURPOSE. tcp_rcv_cnt,
+; tcp_snd_head, the byte totals and every statistic are ordinary numbers
+; that must NOT wrap at 32 bits - a transfer of five gigabytes should
+; report five gigabytes. Only sequence space is modular. Mixing the two
+; up in either direction is the mistake this section exists to prevent.
+;
+; ======================================================================
+; WHAT THIS IS NOT. READ THIS BEFORE TRUSTING IT WITH ANYTHING.
+; ======================================================================
+; These are not oversights and they are not "TODO". Each one is a
+; decision, and each one is listed here so it can never be discovered by
+; a user instead of read by a maintainer. They are the Pico's list, kept
+; in the same order and with the same numbers, with the differences from
+; that part marked.
+;
+;  1. NO CONGESTION CONTROL. There is no slow start, no congestion
+;     window, no fast retransmit and no fast recovery (RFC 5681 is not
+;     implemented at all). Flow control - the peer's advertised window -
+;     IS honoured in full; congestion control is what is missing.
+;     THE COST IS HIGHER HERE THAN ON THE PICO, not lower. The Pico's
+;     note says "do not point this at the internet" because its
+;     bottleneck was a 440 kbit/s bit-banged bus, so it could not
+;     generate congestion if it tried. This board has a gigabit MAC and
+;     can. Fetching one small page with `http get` is inside what a
+;     sender with no congestion window can be trusted with; a bulk
+;     transfer across a WAN is not, and nothing here refuses it, so it
+;     is refused in words.
+;  2. FOUR SOCKETS, NOT ONE, AND NOT MANY. #TCP_SOCKETS entries, one of
+;     which may be a listener. A SYN for a port nobody is listening on
+;     is answered with a RST, which is the correct thing to say and not
+;     a silent drop.
+;  3. NO WINDOW SCALING (RFC 7323). The window field is 16 bits, so the
+;     ceiling is 65535 bytes in flight. Our buffers are far smaller, so
+;     it binds nothing here.
+;  4. NO SACK, NO TIMESTAMPS, NO ECN, NO URGENT DATA. An URG pointer is
+;     parsed only far enough to be ignored; the segment's data is
+;     delivered in band, which is what every modern stack does anyway
+;     (RFC 6093 deprecates urgent data).
+;  5. BOUNDED OUT-OF-ORDER REASSEMBLY, NOT UNLIMITED. A segment that
+;     arrives ahead of RCV.NXT with a gap is held in a FIXED queue of
+;     #TCP_OOO_SLOTS segments per socket - reserved once, no dynamic
+;     allocation - and delivered in order the instant the gap fills. A
+;     duplicate ACK is sent for every out-of-order arrival so a
+;     conformant peer fast-retransmits (RFC 5681 3.2) rather than making
+;     us wait a full RTO. RFC 9293 3.10.7.4 makes this queuing a MAY.
+;     THE RESIDUAL LIMIT IS REAL: reordering deeper than the queue can
+;     hold spills back to the drop-and-duplicate-ACK path - still
+;     correct, because the peer retransmits, but no faster than a bare
+;     receiver for that segment. There is still no SACK, so a hole is
+;     recovered one segment at a time.
+;  6. KEEPALIVE EXISTS AND IS OFF. THIS IS THE ONE GAP IN THE PICO'S
+;     LIST THAT THIS FILE CLOSES, and the reason it could be closed here
+;     is difference 1 above turned the other way round: RFC 9293 3.8.4
+;     permits keepalives, requires them OFF unless the application asks
+;     (MUST-24), and wants the interval configurable. On the Pico every
+;     span is measured with a 32-bit microsecond subtraction that goes
+;     signed-negative after 35 minutes, so an interval measured in hours
+;     could not be expressed. Micros() here is 64-bit, so it can.
+;     TcpKeepalive(seconds); 0 is off and 0 is the default.
+;  7. THE ISN IS NOT CRYPTOGRAPHIC. RFC 9293 3.4.1 wants a clock-driven
+;     ISN and RFC 6528 wants that clock hashed with the connection's
+;     4-tuple and a secret. We use the microsecond clock mixed with the
+;     socket index and the local port, which defeats accidental
+;     collision and NOT an attacker.
+;  8. NO TLS. That is a separate file and a separate lane. Nothing here
+;     encrypts anything.
+;
+; ======================================================================
+; STATES - RFC 9293 3.3.2, "State Machine Overview", and Figure 5.
+; ======================================================================
+; The numbering is ours and it is THE SAME AS THE PICO'S, deliberately,
+; so that a state number in a log from either board means the same
+; thing. The names and the meanings are the RFC's. CLOSED is 0 so that a
+; zeroed socket is a closed one.
+#TCP_CLOSED       = 0   ; "no connection state at all" (3.3.2)
+#TCP_LISTEN       = 1   ; "waiting for a connection request from any
+                        ;  remote TCP peer and port"
+#TCP_SYN_SENT     = 2   ; "waiting for a matching connection request
+                        ;  after having sent a connection request"
+#TCP_SYN_RECEIVED = 3   ; "waiting for a confirming connection request
+                        ;  acknowledgment after having both received and
+                        ;  sent a connection request"
+#TCP_ESTABLISHED  = 4   ; "an open connection, data received can be
+                        ;  delivered to the user"
+#TCP_FIN_WAIT_1   = 5   ; "waiting for a connection termination request
+                        ;  from the remote TCP peer, or an acknowledgment
+                        ;  of the connection termination request
+                        ;  previously sent"
+#TCP_FIN_WAIT_2   = 6   ; "waiting for a connection termination request
+                        ;  from the remote TCP peer"
+#TCP_CLOSE_WAIT   = 7   ; "waiting for a connection termination request
+                        ;  from the local user"
+#TCP_CLOSING      = 8   ; "waiting for a connection termination request
+                        ;  acknowledgment from the remote TCP peer"
+#TCP_LAST_ACK     = 9   ; "waiting for an acknowledgment of the
+                        ;  connection termination request previously sent
+                        ;  to the remote TCP peer"
+#TCP_TIME_WAIT    = 10  ; "waiting for enough time to pass to be sure the
+                        ;  remote TCP peer received the acknowledgment of
+                        ;  its connection termination request"
+
+; ======================================================================
+; THE HEADER - RFC 9293 3.1, Figure 1.
+; ======================================================================
+;  off  sz  field
+;   0    2  source port
+;   2    2  destination port
+;   4    4  sequence number
+;   8    4  acknowledgment number
+;  12    1  data offset (high nibble, in 32-bit words) | reserved
+;  13    1  control bits
+;  14    2  window
+;  16    2  checksum          <- NEVER OPTIONAL (3.1)
+;  18    2  urgent pointer
+;  20   ..  options, then data
+#TCP_H_SPORT  = 0
+#TCP_H_DPORT  = 2
+#TCP_H_SEQ    = 4
+#TCP_H_ACK    = 8
+#TCP_H_OFF    = 12
+#TCP_H_FLAGS  = 13
+#TCP_H_WND    = 14
+#TCP_H_SUM    = 16
+#TCP_H_URP    = 18
+
+; Control bits, RFC 9293 3.1. CWR and ECE (bits 7 and 6) exist and we
+; never set them - see gap 1.
+#TCP_FIN = 1
+#TCP_SYN = 2
+#TCP_RST = 4
+#TCP_PSH = 8
+#TCP_ACK = 16
+#TCP_URG = 32
+
+; ======================================================================
+; THE SOCKET TABLE, SIZED BY A CONSTANT.
+; ======================================================================
+; FOUR IS A CHOSEN NUMBER AND NOT A ROUND ONE: one connection for
+; whatever the operator typed, one for `http get` while that is up, one
+; for a listener, and one spare so that the fourth attempt is refused
+; with a sentence the operator can act on rather than for want of a slot
+; nobody sized. Each entry costs #TCP_RCVBUF + #TCP_SNDBUF plus its
+; reassembly queue, which is about ten kilobytes, so the table is about
+; forty. Every byte of it is reserved once at load: THERE IS NO DYNAMIC
+; ALLOCATION ANYWHERE IN THIS FILE, and that is the property that makes
+; a monitor's memory map knowable rather than hopeful.
+#TCP_SOCKETS = 4
+
+; ======================================================================
+; SIZES, AND THE MSS RULING - RFC 9293 3.7.1.
+; ======================================================================
+; "The TCP Maximum Segment Size (MSS) defines the maximum amount of TCP
+; data in a single datagram that the local TCP peer can receive."  THE
+; VALUE WE SEND IS ABOUT OUR RECEIVE PATH, NOT OUR SEND PATH. Getting
+; that backwards is the classic MSS bug and it presents as a peer that
+; sends fine and stalls on large replies.
+;
+; OUR TWO MTUs ARE NOT THE SAME NUMBER, AND ON THIS BOARD THE SEND ONE
+; IS NOT EVEN A CONSTANT. That is the whole reason the link seam exists:
+;
+;   RECEIVE.  Both interfaces deliver a full 1514-byte Ethernet frame -
+;             the wired MAC because #GENET_MAX_FRAME is 1536, the radio
+;             because #CYW43_MAX_FRAME is 2048 on this part. So a
+;             full-MTU datagram can be received either way and
+;             1500 - 20 IPv4 - 20 TCP = 1460 is what we advertise. That
+;             is the ordinary Ethernet number and every peer expects it.
+;
+;   SEND.     The wired path can build a 1514-byte frame. The radio
+;             cannot: cyw43.pi4's transmit buffer is #CYW43_TXBUF bytes
+;             and the SDPCM and BDC headers take sixteen of them, so the
+;             largest 802.3 frame Cyw43Send will accept is far smaller -
+;             and it REFUSES anything longer rather than truncating,
+;             because a truncated segment is not a shorter message, it
+;             is a corrupt one.
+;
+; So the send ceiling is asked for at RUN TIME, from TcpTxCap() below,
+; which reads LinkTxMax(). It changes when the link changes, and a
+; connection that outlives a link change gets the new ceiling on its
+; next segment. The asymmetry is legal and invisible on the wire: MSS
+; constrains the SENDER of data and a sender is always free to send
+; less. It is written down here because a reader comparing 1460 with
+; what actually goes out over Wi-Fi will otherwise assume a bug.
+#TCP_MSS_RX      = 1460   ; what we ADVERTISE. Our receive capability.
+#TCP_MSS_FLOOR   = 88     ; a peer that offers something absurdly small
+                          ; is floored here, so that one byte of data can
+                          ; never cost a forty-byte header forever
+#TCP_MSS_DEFAULT = 536    ; RFC 9293 3.7.1: "If an MSS Option is not
+                          ; received at connection setup, TCP
+                          ; implementations MUST assume a default send
+                          ; MSS of 536 (576 - 40)". MUST, not SHOULD.
+
+; The rings. Both are powers of two so the wrap is a mask, and both are
+; sized so the receive window is comfortably more than two full segments
+; - a window smaller than 2*MSS makes the peer's own silly-window
+; avoidance stall it, which looks exactly like packet loss.
+;
+; ======================================================================
+; THE RECEIVE RING WENT 4096 -> 16384 ON 2026-09-07, AND THE REASON IS A
+; MEASUREMENT RATHER THAN A PREFERENCE.
+; ======================================================================
+; A receiver can never take delivery faster than ONE WINDOW PER ROUND
+; TRIP: the sender may have at most RCV.WND unacknowledged octets
+; outstanding, so the ceiling is
+;
+;     throughput <= RCV.WND / RTT
+;
+; and no amount of work anywhere else in this file can move it. With 4096
+; octets that is 4096/RTT, and on the bench radio it was the binding
+; constraint: an image upload measured 622 KB/s, which is 4096 octets
+; every 6.4 ms - and 4096 octets is not even three full segments. Three
+; segments in flight is not a pipeline, it is stop-and-go with a pause.
+;
+; 16384 IS CHOSEN TO STOP BEING THE CONSTRAINT, NOT TO BE LARGE. Eleven
+; full 1460-octet segments in flight puts the window ceiling at about
+; 2.5 MB/s on that same 6.4 ms round trip, comfortably above what the
+; receive path can service per segment - so after this the limit is the
+; board's own per-segment work, which is a thing that can be measured and
+; reduced, rather than a constant nobody had a number for. More than that
+; would be buying headroom against a bound that no longer binds.
+;
+; THE COST IS #TCP_SOCKETS x 12288 = 48 KiB OF BSS, and this board's BSS
+; window is eight megabytes of which about 7% was in use (see WHERE THIS
+; IMAGE RUNS in the board file). It is reserved once at load like
+; everything else here; there is still no dynamic allocation in this file.
+;
+; THE SEND RING IS DELIBERATELY LEFT AT 4096. It bounds what this board
+; can have outstanding when it is the SENDER, and nothing here has ever
+; been the bulk sender - `net recv` receives, `http get` sends a request
+; line. Raising it would cost the same 48 KiB to speed up a case nobody
+; has measured, which is the opposite of the argument above.
+;
+; FOR ANYONE RAISING IT AGAIN: the advertised window is a 16-bit field and
+; window scaling (RFC 7323) is NOT implemented here, so 65535 is the hard
+; ceiling and TcpAdvertiseWnd's clamp is what enforces it. Above 65536 the
+; ring would be larger than anything that can ever be advertised out of it.
+#TCP_RCVBUF  = 16384
+#TCP_SNDBUF  = 4096
+#TCP_RCVMASK = 16383
+#TCP_SNDMASK = 4095
+
+; ======================================================================
+; THE BOUNDED OUT-OF-ORDER REASSEMBLY QUEUE - RFC 9293 3.10.7.4.
+; ======================================================================
+; 3.10.7.4 makes queuing a segment that arrives ahead of RCV.NXT a MAY,
+; not a MUST. This is that MAY, in a FIXED footprint: #TCP_OOO_SLOTS
+; slots per socket, each large enough for one full receive-MSS segment,
+; reserved once at load and never grown. Four slots absorb the
+; reordering a single dropped segment produces on a one-hop link, which
+; is the case worth the memory.
+#TCP_OOO_SLOTS = 4
+#TCP_OOO_BUFSZ = 1460
+
+; ======================================================================
+; TIMERS.
+; ======================================================================
+; Every span below is measured with a raw Micros() subtraction. ON THIS
+; PART THAT IS SAFE FOR ANY SPAN, and the reason differs from the Pico's:
+; Micros() here comes off CNTPCT_EL0 into a 64-bit value, so the
+; subtraction does not go signed-negative after 35 minutes the way a
+; 32-bit one does. The Pico's file carries a warning that a keepalive
+; measured in hours would break its clock; here it does not, which is
+; exactly why gap 6 could be closed on this part and was left open there.
+#TCP_RTO_MIN_MS  = 1000   ; RFC 6298 2.4: "Whenever RTO is computed, if
+                          ; it is less than 1 second then the RTO SHOULD
+                          ; be rounded up to 1 second."
+#TCP_RTO_MAX_MS  = 60000  ; RFC 6298 2.5: "A maximum value MAY be placed
+                          ; on RTO provided it is at least 60 seconds."
+#TCP_RTO_INIT_MS = 1000   ; RFC 6298 2.1: "until a round-trip time (RTT)
+                          ; measurement has been made ... the RTO SHOULD
+                          ; be set to 1 second."
+#TCP_CLOCK_G_MS  = 1      ; the granularity G of RFC 6298 2.2/2.3.
+#TCP_MAX_RETRIES = 8      ; retransmissions of the SAME segment before
+                          ; the connection is declared dead. RFC 9293
+                          ; 3.8.3 requires giving up only after "R2" and
+                          ; leaves the value open; at a one-second floor
+                          ; doubling to a sixty-second cap, eight is
+                          ; about four minutes, well inside RFC 1122
+                          ; 4.2.3.5's hundred-second floor for R2.
+#TCP_SYN_RETRIES = 5      ; a SYN gets fewer: nothing has been proven
+                          ; about the peer yet and a bench wants a
+                          ; verdict rather than four minutes of hope.
+#TCP_MSL_MS      = 120000 ; RFC 9293 3.4.2: "For this specification the
+                          ; MSL is taken to be 2 minutes."
+#TCP_TIMEWAIT_MS = 240000 ; 2*MSL. RFC 9293 3.6, MUST-13.
+#TCP_PERSIST_MIN_MS = 1000
+#TCP_PERSIST_MAX_MS = 60000
+#TCP_KEEP_PROBES   = 3    ; unanswered keepalives before the connection
+                          ; is declared dead. RFC 1122 4.2.3.6 wants a
+                          ; count, not a single probe.
+#TCP_KEEP_INTVL_MS = 5000 ; the gap between probes once the first has
+                          ; gone unanswered
+
+; ======================================================================
+; RETURN CODES - #NET_TCP_*, negative, named, and never shared with
+; net.pi4's or the link's. A caller that gets -13 must not have to work
+; out whose -13 it is, so these start at -300 where net.pi4's stop at
+; -125. EVERY ONE HAS A FULL SENTENCE IN TcpErrorText() and the sentence
+; carries the number: house rule of 2026-09-03, never a bare code.
+; ======================================================================
+#NET_TCP_OK        =    0
+#NET_TCP_E_BUSY    = -300  ; every socket is in use, or this one is
+#NET_TCP_E_NOADDR  = -301  ; this board has no IPv4 address yet
+#NET_TCP_E_STATE   = -302  ; the call is not legal in this state
+#NET_TCP_E_ARP     = -303  ; the next hop has not answered yet
+#NET_TCP_E_RESET   = -304  ; the peer sent RST
+#NET_TCP_E_TIMEOUT = -305  ; retransmission gave up
+#NET_TCP_E_TOOBIG  = -306  ; more than one segment could carry
+#NET_TCP_E_NOLINK  = -307  ; no interface is carrying traffic
+#NET_TCP_E_TX      = -308  ; the link refused the frame
+#NET_TCP_E_SOCKET  = -309  ; a socket number outside 0..#TCP_SOCKETS-1
+#NET_TCP_E_PORT    = -310  ; a port outside 1..65535
+#NET_TCP_E_ROUTE   = -311  ; no route to that address at all
+#NET_TCP_E_ARG     = -312  ; a null pointer or a negative length
+
+; ======================================================================
+; THE TCB - RFC 9293 3.3.1, "Transmission Control Block".
+; ======================================================================
+; The variable names are the RFC's own, lowercased, because a reader with
+; the RFC open should not have to translate. SND.UNA is tcp_snd_una.
+;
+; HOW A TABLE OF FOUR IS BUILT OUT OF ONE SET OF VARIABLES, AND WHY IT
+; WAS DONE THIS WAY RATHER THAN THE OBVIOUS WAY.
+; ----------------------------------------------------------------------
+; The obvious way is to make every field an array and write
+; tcp_state[s] everywhere. It was rejected for ONE reason and the reason
+; is THE WIDTH RULE above: a sequence number becomes correct at the
+; moment it is stored into something declared `.l`, and the mechanism
+; that does that - the compiler's narrowing at the four sites - is
+; proven for a plain global (forum 618's gate exercises exactly that).
+; Whether it also fires on an ARRAY ELEMENT store is a question this
+; file would then depend on and does not test. Depending on an untested
+; property of the toolchain, to hold a property that is invisible when
+; broken, is the worst trade available.
+;
+; So the working set is PLAIN GLOBALS - one socket's worth - and the
+; other three sockets are parked in tcp_parked[], an ordinary `.i` array.
+; tcp_Load and tcp_Save move them, TcpUse(s) is the only thing that
+; calls either, and every public entry point below begins with TcpUse.
+;
+; PARKING A SEQUENCE NUMBER IN AN `.i` SLOT IS EXACT. What is stored is
+; a value that has ALREADY been narrowed to 32 bits and sign-extended,
+; so the round trip through 64 bits changes nothing, and loading it back
+; into the `.l` global narrows a value that is already narrow. The
+; modulo lives entirely in the globals, which is where the arithmetic
+; happens.
+;
+; ADDING A FIELD MEANS THREE EDITS AND ALL THREE ARE IN THIS SECTION:
+; a #TCP_SV_ index, a line in tcp_Load, and the mirror line in tcp_Save.
+; The two procedures are written in the SAME ORDER as the index list so
+; that reading them side by side shows an omission immediately, and
+; a64_tcp_check.py drives two sockets alternately for the case where
+; reading them does not.
+;
+; THE RINGS ARE NOT PARKED. Four kilobytes each, twice, four times over
+; is far too much to copy on a socket switch, so the rings and the
+; reassembly buffers are one flat array apiece and the current socket's
+; slice is reached through tcp_rcvBase / tcp_sndBase / tcp_oooBase,
+; which TcpUse sets. Bytes have no width problem, so nothing above
+; applies to them.
+; ----------------------------------------------------------------------
+
+Global tcp_s.i                ; the CURRENT socket, 0..#TCP_SOCKETS-1
+Global tcp_rcvBase.i          ; tcp_s * #TCP_RCVBUF
+Global tcp_sndBase.i          ; tcp_s * #TCP_SNDBUF
+Global tcp_oooBase.i          ; tcp_s * #TCP_OOO_SLOTS * #TCP_OOO_BUFSZ
+
+Global tcp_inuse.i            ; 1 once this socket has been opened. A
+                              ; socket in TIME-WAIT is CLOSED and still
+                              ; in use, which is the distinction that
+                              ; makes TcpAlloc honest.
+Global tcp_state.i
+Global tcp_lport.i            ; our port
+Global tcp_rport.i            ; the peer's
+; THE PEER'S ADDRESS IS `.i` AND NOT `.l`, AND THE DIFFERENCE IS A
+; DEFECT THAT WAS FOUND TWICE IN ONE EVENING - once by
+; tools/a64/a64_tcp_check.py and once, ten minutes later, on silicon.
+;
+; THE WIDTH RULE ABOVE IS ABOUT SEQUENCE SPACE. TCP's sequence numbers
+; are modular and `.l` is what makes them so. AN IPv4 ADDRESS IS NOT
+; MODULAR: net.pi4 holds one as a plain `.i` in 0..$FFFFFFFF, and its
+; net_GetBE32 ends `& $FFFFFFFF` precisely so that it never comes back
+; negative.
+;
+; Declaring this one field `.l` sign-extended every address with bit 31
+; set - all of 192.168.0.0/16, all of 172.16.0.0/12, and half the
+; internet. 192.168.1.20 was stored as -1062731500 while
+; NetTcpRxFrom() answered 3232235796, so `tcp_rip = NetTcpRxFrom()` in
+; tcp_Match was NEVER TRUE, no socket ever matched, and TcpInput
+; answered every segment of its own conversation with a RST from the
+; no-connection path.
+;
+; THE SYMPTOM DID NOT LOOK LIKE A TYPE. On the bench `http get
+; http://example.com/` reported that the connection was never
+; established, and `tcp status` showed eight segments out, three
+; retransmissions, and FOUR RESETS SENT TO A CLOSED PORT - the board
+; resetting its own connection, once per SYN-ACK. 10.0.0.0/8 works
+; perfectly, which is exactly why a bench on a 10-net would never have
+; found it.
+; ----------------------------------------------------------------------
+;  WHICH INTERFACE THIS CONNECTION IS ON, and it is part of the peer.
+;
+;  A board with a cable and a radio holds an address on each, and a
+;  segment built for the wrong one carries the wrong source address and
+;  the wrong hardware address - a frame every switch on the path filters
+;  out, with nothing at either end reporting a fault. So the interface
+;  is latched with the rest of the peer: on an active OPEN from the
+;  route the caller resolved, and on a passive one from the very frame
+;  the SYN arrived in, which is the same place tcp_rmac comes from and
+;  is why a listener needs no ARP at all.
+; ----------------------------------------------------------------------
+Global tcp_kind.i             ; an #HW_LINK_* kind, 0 when closed
+Global tcp_lip.i              ; the exact local address the peer named
+Global tcp_rip.i              ; the peer's address, 0..$FFFFFFFF
+Global Dim tcp_rmac.a[8]      ; the next hop's MAC, latched at connect
+                              ; time or taken from the SYN's own frame
+Global Dim tcp_savmac.a[8]    ; scratch, so TcpSendRstFor can answer a
+                              ; stranger without losing the live peer
+Global tcp_listen_port.i      ; the port a listener returns to on close
+
+; --- send sequence variables (3.3.1). ALL `.l`. SEE THE WIDTH RULE. ---
+Global tcp_snd_una.l          ; oldest unacknowledged sequence number
+Global tcp_snd_nxt.l          ; next sequence number to be sent
+Global tcp_snd_wnd.i          ; the peer's advertised window. NOT a
+                              ; sequence number - it is a count, 0..65535
+Global tcp_snd_wl1.l          ; SEG.SEQ of the last window update
+Global tcp_snd_wl2.l          ; SEG.ACK of the last window update
+Global tcp_iss.l              ; initial send sequence number
+Global tcp_snd_mss.i          ; the peer's MSS, clamped by TcpTxCap()
+
+; --- receive sequence variables (3.3.1) ------------------------------
+Global tcp_rcv_nxt.l          ; next sequence number expected
+Global tcp_rcv_wnd.i          ; the window we last ADVERTISED, a count
+Global tcp_rcv_edge.l         ; RCV.NXT + RCV.WND, as last advertised.
+                              ; Kept explicitly because the one property
+                              ; that makes a dynamic window safe is that
+                              ; this number NEVER MOVES BACKWARDS, and a
+                              ; property is easier to defend when it is a
+                              ; variable than when it is an argument.
+Global tcp_irs.l              ; initial receive sequence number
+
+; --- our own bookkeeping ---------------------------------------------
+Global tcp_fin_sent.i         ; 1 once our FIN has been placed in the
+                              ; sequence space. It occupies one sequence
+                              ; number (3.6) and must not be re-issued.
+Global tcp_fin_seq.l          ; the sequence number our FIN occupies
+Global tcp_fin_rcvd.i         ; the peer's FIN has been accepted
+Global tcp_close_pending.i    ; TcpClose() was called while data was
+                              ; still queued; the FIN goes after the
+                              ; last byte
+Global tcp_err.i              ; the last hard failure, a #NET_TCP_E_*
+Global tcp_reset_seen.i       ; a RST arrived. LATCHED, so a caller that
+                              ; polls after the state has already gone
+                              ; back to CLOSED can still tell a reset
+                              ; from an orderly close - the difference
+                              ; matters and CLOSED alone does not carry
+                              ; it.
+
+; --- the rings, one flat array each, sliced by tcp_rcvBase/tcp_sndBase
+Global Dim tcp_snd.a[#TCP_SOCKETS * #TCP_SNDBUF]
+Global tcp_snd_head.i         ; write index WITHIN this socket's slice
+Global tcp_snd_cnt.i          ; bytes held, all of them from SND.UNA on
+Global Dim tcp_rcv.a[#TCP_SOCKETS * #TCP_RCVBUF]
+Global tcp_rcv_tail.i         ; read index WITHIN this socket's slice
+Global tcp_rcv_cnt.i          ; bytes available to the application
+
+; --- the bounded out-of-order reassembly queue (3.10.7.4) -------------
+; One occupied slot holds one segment that arrived ahead of RCV.NXT: its
+; left-edge sequence number, its data length, and its bytes. The bytes
+; for slot s of the current socket live at
+; tcp_ooo_buf[tcp_oooBase + s * #TCP_OOO_BUFSZ ..].
+Global Dim tcp_ooo_seq.l[#TCP_OOO_SLOTS]
+Global Dim tcp_ooo_len.i[#TCP_OOO_SLOTS]
+Global Dim tcp_ooo_used.a[#TCP_OOO_SLOTS]
+Global Dim tcp_ooo_buf.a[#TCP_SOCKETS * #TCP_OOO_SLOTS * #TCP_OOO_BUFSZ]
+Global tcp_ooo_count.i        ; slots currently occupied
+
+; --- the retransmission timer (RFC 6298) ------------------------------
+; SRTT is held multiplied by 8 and RTTVAR multiplied by 4, which is the
+; standard integer form: it makes the 1/8 and 1/4 gains of 2.3 exact
+; shifts instead of a division that loses the whole correction on a fast
+; LAN where R is a handful of milliseconds.
+Global tcp_srtt8.i            ; SRTT * 8, in ms
+Global tcp_rttvar4.i          ; RTTVAR * 4, in ms
+Global tcp_rto.i              ; ms
+Global tcp_rtt_valid.i        ; 0 until the first measurement (2.1 v 2.2)
+Global tcp_rtt_seq.l          ; the sequence number being timed
+Global tcp_rtt_t0.i           ; Micros() when it went out
+Global tcp_rtt_timing.i       ; 1 while a measurement is in flight
+Global tcp_rtt_last.i         ; the last R, ms - printed, not used
+Global tcp_rto_t0.i           ; Micros() when the retransmit timer began
+Global tcp_rto_armed.i
+Global tcp_retries.i
+
+; --- the persist timer (RFC 9293 3.8.6.1) -----------------------------
+Global tcp_persist_t0.i
+Global tcp_persist_ms.i
+Global tcp_persist_armed.i
+
+; --- other timers -----------------------------------------------------
+Global tcp_tw_t0.i            ; TIME-WAIT entry stamp
+Global tcp_keep_ms.i          ; keepalive idle time, ms. 0 = OFF (gap 6)
+Global tcp_keep_t0.i          ; Micros() of the last thing that counted
+                              ; as activity on this connection
+Global tcp_keep_sent.i        ; unanswered probes since that activity
+Global tcp_ephemeral.i        ; the local port a client uses next. ONE
+                              ; counter for the whole table, so two
+                              ; sockets can never pick the same port.
+
+; --- counters. THE BENCH READS THESE, so every one of them answers a
+; --- question somebody will ask out loud. They are TABLE-WIDE, not
+; --- per-socket: a bench asks "how many retransmissions did that run
+; --- take", not "how many on socket 2".
+Global tcp_seg_rx.i           ; segments accepted by the state machine
+Global tcp_seg_tx.i           ; segments transmitted, retransmits included
+Global tcp_retrans.i          ; RETRANSMISSIONS. The number the brief asks
+                              ; for, and the one that proves the recovery
+                              ; path FIRED rather than being reasoned about
+Global tcp_dupacks.i          ; duplicate ACKs we SENT
+Global tcp_ooo_drop.i         ; out-of-order segments the queue could NOT
+                              ; keep. Recovered by retransmit.
+Global tcp_ooo_queued.i       ; out-of-order segments STORED
+Global tcp_ooo_deliver.i      ; segments DRAINED, in order, once the gap
+                              ; in front of them was filled
+Global tcp_unacceptable.i     ; segments failing the 3.10.7.4 test
+Global tcp_rst_rx.i
+Global tcp_rst_tx.i
+Global tcp_probes.i           ; zero-window probes sent
+Global tcp_keeps.i            ; keepalive probes sent
+Global tcp_bytes_tx.i         ; application bytes acknowledged by the peer
+Global tcp_bytes_rx.i         ; application bytes delivered to a ring
+Global tcp_txfail.i           ; the link refused a frame
+Global tcp_zerowin.i          ; times a peer advertised a zero window
+Global tcp_norst.i            ; segments for a port nobody has open, each
+                              ; answered with a RST
+Global tcp_wndup.i            ; WINDOW UPDATES SENT because the application
+                              ; read and the right edge could move. On a
+                              ; board receiving an image this climbs about
+                              ; once per MSS consumed. A transfer that
+                              ; advances in five-second steps with this at
+                              ; ZERO is the 2026-09-09 defect: the edge
+                              ; reopened and nothing told the peer, so the
+                              ; peer's persist timer set the rate. See
+                              ; TcpRead.
+
+; --- scratch, so no procedure below has to own a big local -----------
+Global tcp_seg_seq.l
+Global tcp_seg_ack.l
+Global tcp_seg_flags.i
+Global tcp_seg_wnd.i
+Global tcp_seg_len.i          ; SEG.LEN: data bytes ONLY at parse time;
+                              ; the SYN/FIN contribution is added where
+                              ; 3.3.1's definition needs it, never before
+Global tcp_seg_data.i         ; -> the segment's first data byte, INSIDE
+                              ; THE RECEIVED FRAME. Valid only until the
+                              ; next pump; see net.pi4's lifetime rule.
+Global tcp_seg_dlen.i
+Global tcp_seg_hdr.i          ; -> the segment's first header byte
+Global tcp_seg_hl.i           ; the data offset, in octets
+
+; --- THE LOSS INJECTOR. DEFAULT 0 = OFF, AND IT MUST SHIP THAT WAY. ---
+; Set tcp_drop_every to N and every Nth DATA-carrying segment is built,
+; checksummed and then NOT HANDED TO THE LINK. The peer never sees it,
+; the retransmission timer fires, and the transfer completes anyway.
+;
+; WHY THIS EXISTS AT ALL. A kernel socket on the far end cannot be made
+; to withhold an acknowledgment - the stack acknowledges what it
+; accepts, and changing that needs a raw socket and Administrator
+; rights. So the only way to prove the retransmit path FIRES, rather
+; than to reason that it would, is to lose a segment on purpose from
+; this side. tools/tcp_host.py can close its window and cause real loss
+; too; the two attack the same path from opposite ends, and THIS ONE IS
+; DETERMINISTIC.
+;
+; A RETRANSMISSION IS NEVER DROPPED, even when the counter comes round
+; to it. Dropping the retransmissions as well tests the backoff rather
+; than the recovery, and a test that never lets the connection finish
+; proves the wrong thing. tcp_drop_hold carries that distinction.
+Global tcp_drop_every.i       ; 0 = off. Never non-zero in a shipped image
+Global tcp_drop_n.i           ; data segments seen since the last drop
+Global tcp_dropped.i          ; segments deliberately discarded
+Global tcp_drop_hold.i        ; 1 while a retransmission is being emitted
+
+; ======================================================================
+; THE PARK. Three edits to add a field: an index here, a line in
+; tcp_Load, the mirror line in tcp_Save. Read the two side by side.
+; ======================================================================
+#TCP_SV_INUSE    = 0
+#TCP_SV_STATE    = 1
+#TCP_SV_LPORT    = 2
+#TCP_SV_RPORT    = 3
+#TCP_SV_RIP      = 4
+#TCP_SV_MAC0     = 5          ; six slots, 5..10
+#TCP_SV_LISTEN   = 11
+#TCP_SV_SND_UNA  = 12
+#TCP_SV_SND_NXT  = 13
+#TCP_SV_SND_WND  = 14
+#TCP_SV_SND_WL1  = 15
+#TCP_SV_SND_WL2  = 16
+#TCP_SV_ISS      = 17
+#TCP_SV_SND_MSS  = 18
+#TCP_SV_RCV_NXT  = 19
+#TCP_SV_RCV_WND  = 20
+#TCP_SV_RCV_EDGE = 21
+#TCP_SV_IRS      = 22
+#TCP_SV_FIN_SENT = 23
+#TCP_SV_FIN_SEQ  = 24
+#TCP_SV_FIN_RCVD = 25
+#TCP_SV_CLOSEP   = 26
+#TCP_SV_ERR      = 27
+#TCP_SV_RSTSEEN  = 28
+#TCP_SV_SND_HEAD = 29
+#TCP_SV_SND_CNT  = 30
+#TCP_SV_RCV_TAIL = 31
+#TCP_SV_RCV_CNT  = 32
+#TCP_SV_SRTT8    = 33
+#TCP_SV_RTTVAR4  = 34
+#TCP_SV_RTO      = 35
+#TCP_SV_RTTVALID = 36
+#TCP_SV_RTT_SEQ  = 37
+#TCP_SV_RTT_T0   = 38
+#TCP_SV_RTT_TMG  = 39
+#TCP_SV_RTT_LAST = 40
+#TCP_SV_RTO_T0   = 41
+#TCP_SV_RTO_ARM  = 42
+#TCP_SV_RETRIES  = 43
+#TCP_SV_PER_T0   = 44
+#TCP_SV_PER_MS   = 45
+#TCP_SV_PER_ARM  = 46
+#TCP_SV_TW_T0    = 47
+#TCP_SV_KEEP_MS  = 48
+#TCP_SV_KEEP_T0  = 49
+#TCP_SV_KEEP_N   = 50
+#TCP_SV_OOO_CNT  = 51
+#TCP_SV_OOO_SEQ  = 52          ; #TCP_OOO_SLOTS slots
+#TCP_SV_OOO_LEN  = 56          ; #TCP_OOO_SLOTS slots
+#TCP_SV_OOO_USED = 60          ; #TCP_OOO_SLOTS slots
+#TCP_SV_LIP      = 64
+#TCP_SV_N        = 65          ; must exceed every index above
+
+Global Dim tcp_parked.i[#TCP_SOCKETS * #TCP_SV_N]
+
+Procedure tcp_Load(s.i)
+  Define b.i
+  Define i.i
+  b = s * #TCP_SV_N
+  tcp_inuse         = tcp_parked[b + #TCP_SV_INUSE]
+  tcp_state         = tcp_parked[b + #TCP_SV_STATE]
+  tcp_lport         = tcp_parked[b + #TCP_SV_LPORT]
+  tcp_rport         = tcp_parked[b + #TCP_SV_RPORT]
+  tcp_rip           = tcp_parked[b + #TCP_SV_RIP]
+  tcp_lip           = tcp_parked[b + #TCP_SV_LIP]
+  i = 0
+  While i < 6
+    tcp_rmac[i]     = tcp_parked[b + #TCP_SV_MAC0 + i] & $FF
+    i = i + 1
+  Wend
+  tcp_listen_port   = tcp_parked[b + #TCP_SV_LISTEN]
+  tcp_snd_una       = tcp_parked[b + #TCP_SV_SND_UNA]
+  tcp_snd_nxt       = tcp_parked[b + #TCP_SV_SND_NXT]
+  tcp_snd_wnd       = tcp_parked[b + #TCP_SV_SND_WND]
+  tcp_snd_wl1       = tcp_parked[b + #TCP_SV_SND_WL1]
+  tcp_snd_wl2       = tcp_parked[b + #TCP_SV_SND_WL2]
+  tcp_iss           = tcp_parked[b + #TCP_SV_ISS]
+  tcp_snd_mss       = tcp_parked[b + #TCP_SV_SND_MSS]
+  tcp_rcv_nxt       = tcp_parked[b + #TCP_SV_RCV_NXT]
+  tcp_rcv_wnd       = tcp_parked[b + #TCP_SV_RCV_WND]
+  tcp_rcv_edge      = tcp_parked[b + #TCP_SV_RCV_EDGE]
+  tcp_irs           = tcp_parked[b + #TCP_SV_IRS]
+  tcp_fin_sent      = tcp_parked[b + #TCP_SV_FIN_SENT]
+  tcp_fin_seq       = tcp_parked[b + #TCP_SV_FIN_SEQ]
+  tcp_fin_rcvd      = tcp_parked[b + #TCP_SV_FIN_RCVD]
+  tcp_close_pending = tcp_parked[b + #TCP_SV_CLOSEP]
+  tcp_err           = tcp_parked[b + #TCP_SV_ERR]
+  tcp_reset_seen    = tcp_parked[b + #TCP_SV_RSTSEEN]
+  tcp_snd_head      = tcp_parked[b + #TCP_SV_SND_HEAD]
+  tcp_snd_cnt       = tcp_parked[b + #TCP_SV_SND_CNT]
+  tcp_rcv_tail      = tcp_parked[b + #TCP_SV_RCV_TAIL]
+  tcp_rcv_cnt       = tcp_parked[b + #TCP_SV_RCV_CNT]
+  tcp_srtt8         = tcp_parked[b + #TCP_SV_SRTT8]
+  tcp_rttvar4       = tcp_parked[b + #TCP_SV_RTTVAR4]
+  tcp_rto           = tcp_parked[b + #TCP_SV_RTO]
+  tcp_rtt_valid     = tcp_parked[b + #TCP_SV_RTTVALID]
+  tcp_rtt_seq       = tcp_parked[b + #TCP_SV_RTT_SEQ]
+  tcp_rtt_t0        = tcp_parked[b + #TCP_SV_RTT_T0]
+  tcp_rtt_timing    = tcp_parked[b + #TCP_SV_RTT_TMG]
+  tcp_rtt_last      = tcp_parked[b + #TCP_SV_RTT_LAST]
+  tcp_rto_t0        = tcp_parked[b + #TCP_SV_RTO_T0]
+  tcp_rto_armed     = tcp_parked[b + #TCP_SV_RTO_ARM]
+  tcp_retries       = tcp_parked[b + #TCP_SV_RETRIES]
+  tcp_persist_t0    = tcp_parked[b + #TCP_SV_PER_T0]
+  tcp_persist_ms    = tcp_parked[b + #TCP_SV_PER_MS]
+  tcp_persist_armed = tcp_parked[b + #TCP_SV_PER_ARM]
+  tcp_tw_t0         = tcp_parked[b + #TCP_SV_TW_T0]
+  tcp_keep_ms       = tcp_parked[b + #TCP_SV_KEEP_MS]
+  tcp_keep_t0       = tcp_parked[b + #TCP_SV_KEEP_T0]
+  tcp_keep_sent     = tcp_parked[b + #TCP_SV_KEEP_N]
+  tcp_ooo_count     = tcp_parked[b + #TCP_SV_OOO_CNT]
+  i = 0
+  While i < #TCP_OOO_SLOTS
+    tcp_ooo_seq[i]  = tcp_parked[b + #TCP_SV_OOO_SEQ + i]
+    tcp_ooo_len[i]  = tcp_parked[b + #TCP_SV_OOO_LEN + i]
+    tcp_ooo_used[i] = tcp_parked[b + #TCP_SV_OOO_USED + i] & $FF
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure tcp_Save(s.i)
+  Define b.i
+  Define i.i
+  b = s * #TCP_SV_N
+  tcp_parked[b + #TCP_SV_INUSE]    = tcp_inuse
+  tcp_parked[b + #TCP_SV_STATE]    = tcp_state
+  tcp_parked[b + #TCP_SV_LPORT]    = tcp_lport
+  tcp_parked[b + #TCP_SV_RPORT]    = tcp_rport
+  tcp_parked[b + #TCP_SV_RIP]      = tcp_rip
+  tcp_parked[b + #TCP_SV_LIP]      = tcp_lip
+  i = 0
+  While i < 6
+    tcp_parked[b + #TCP_SV_MAC0 + i] = tcp_rmac[i] & $FF
+    i = i + 1
+  Wend
+  tcp_parked[b + #TCP_SV_LISTEN]   = tcp_listen_port
+  tcp_parked[b + #TCP_SV_SND_UNA]  = tcp_snd_una
+  tcp_parked[b + #TCP_SV_SND_NXT]  = tcp_snd_nxt
+  tcp_parked[b + #TCP_SV_SND_WND]  = tcp_snd_wnd
+  tcp_parked[b + #TCP_SV_SND_WL1]  = tcp_snd_wl1
+  tcp_parked[b + #TCP_SV_SND_WL2]  = tcp_snd_wl2
+  tcp_parked[b + #TCP_SV_ISS]      = tcp_iss
+  tcp_parked[b + #TCP_SV_SND_MSS]  = tcp_snd_mss
+  tcp_parked[b + #TCP_SV_RCV_NXT]  = tcp_rcv_nxt
+  tcp_parked[b + #TCP_SV_RCV_WND]  = tcp_rcv_wnd
+  tcp_parked[b + #TCP_SV_RCV_EDGE] = tcp_rcv_edge
+  tcp_parked[b + #TCP_SV_IRS]      = tcp_irs
+  tcp_parked[b + #TCP_SV_FIN_SENT] = tcp_fin_sent
+  tcp_parked[b + #TCP_SV_FIN_SEQ]  = tcp_fin_seq
+  tcp_parked[b + #TCP_SV_FIN_RCVD] = tcp_fin_rcvd
+  tcp_parked[b + #TCP_SV_CLOSEP]   = tcp_close_pending
+  tcp_parked[b + #TCP_SV_ERR]      = tcp_err
+  tcp_parked[b + #TCP_SV_RSTSEEN]  = tcp_reset_seen
+  tcp_parked[b + #TCP_SV_SND_HEAD] = tcp_snd_head
+  tcp_parked[b + #TCP_SV_SND_CNT]  = tcp_snd_cnt
+  tcp_parked[b + #TCP_SV_RCV_TAIL] = tcp_rcv_tail
+  tcp_parked[b + #TCP_SV_RCV_CNT]  = tcp_rcv_cnt
+  tcp_parked[b + #TCP_SV_SRTT8]    = tcp_srtt8
+  tcp_parked[b + #TCP_SV_RTTVAR4]  = tcp_rttvar4
+  tcp_parked[b + #TCP_SV_RTO]      = tcp_rto
+  tcp_parked[b + #TCP_SV_RTTVALID] = tcp_rtt_valid
+  tcp_parked[b + #TCP_SV_RTT_SEQ]  = tcp_rtt_seq
+  tcp_parked[b + #TCP_SV_RTT_T0]   = tcp_rtt_t0
+  tcp_parked[b + #TCP_SV_RTT_TMG]  = tcp_rtt_timing
+  tcp_parked[b + #TCP_SV_RTT_LAST] = tcp_rtt_last
+  tcp_parked[b + #TCP_SV_RTO_T0]   = tcp_rto_t0
+  tcp_parked[b + #TCP_SV_RTO_ARM]  = tcp_rto_armed
+  tcp_parked[b + #TCP_SV_RETRIES]  = tcp_retries
+  tcp_parked[b + #TCP_SV_PER_T0]   = tcp_persist_t0
+  tcp_parked[b + #TCP_SV_PER_MS]   = tcp_persist_ms
+  tcp_parked[b + #TCP_SV_PER_ARM]  = tcp_persist_armed
+  tcp_parked[b + #TCP_SV_TW_T0]    = tcp_tw_t0
+  tcp_parked[b + #TCP_SV_KEEP_MS]  = tcp_keep_ms
+  tcp_parked[b + #TCP_SV_KEEP_T0]  = tcp_keep_t0
+  tcp_parked[b + #TCP_SV_KEEP_N]   = tcp_keep_sent
+  tcp_parked[b + #TCP_SV_OOO_CNT]  = tcp_ooo_count
+  i = 0
+  While i < #TCP_OOO_SLOTS
+    tcp_parked[b + #TCP_SV_OOO_SEQ + i]  = tcp_ooo_seq[i]
+    tcp_parked[b + #TCP_SV_OOO_LEN + i]  = tcp_ooo_len[i]
+    tcp_parked[b + #TCP_SV_OOO_USED + i] = tcp_ooo_used[i] & $FF
+    i = i + 1
+  Wend
+EndProcedure
+
+; TcpUse - make socket s the current one. Idempotent and cheap when it
+; is already current, which matters because every public entry point
+; calls it and TcpPollAll calls it once per socket per slice.
+;
+; IT IS THE ONLY THING THAT MOVES tcp_s. Setting tcp_s directly leaves
+; the working globals describing one socket and the bases describing
+; another, and the symptom is a connection reading another connection's
+; bytes - silent, and exactly the failure the whole park exists to
+; prevent.
+Procedure.i TcpUse(s.i)
+  If s < 0 Or s >= #TCP_SOCKETS
+    ProcedureReturn #NET_TCP_E_SOCKET
+  EndIf
+  If s = tcp_s
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  tcp_Save(tcp_s)
+  tcp_s = s
+  tcp_Load(tcp_s)
+  tcp_rcvBase = tcp_s * #TCP_RCVBUF
+  tcp_sndBase = tcp_s * #TCP_SNDBUF
+  tcp_oooBase = tcp_s * #TCP_OOO_SLOTS * #TCP_OOO_BUFSZ
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+Procedure.i TcpCurrent()
+  ProcedureReturn tcp_s
+EndProcedure
+
+; ======================================================================
+; SEQUENCE ARITHMETIC - RFC 9293 3.4, and Appendix A.2.
+; ======================================================================
+; "the comparisons are done modulo 2**32" (3.4).
+;
+; THIS IS WHERE THE PORT DIVERGES FROM THE PICO AND IT IS THE ONLY PLACE
+; IT HAD TO. On the Pico these four are `(a - b) < 0` on a machine whose
+; arithmetic is already 32 bits wide. Here the arithmetic is 64 bits
+; wide, so the subtraction is performed INTO A `.l` LOCAL and the sign
+; of that is tested: the store is what reduces the difference modulo
+; 2**32 and sign-extends the representative, which is precisely the
+; comparison the RFC defines. Every argument is `.l` too, so an
+; expression built at the call site - `seq + seglen`, `tcp_rcv_nxt +
+; wnd` - is reduced on the way in.
+;
+; The result is exact for any two sequence numbers less than 2**31
+; apart, and 2**31 is a gigabyte of sequence space against a four
+; kilobyte window.
+;
+; THERE IS NO FIFTH WAY. Do not write `If a < b` on two sequence
+; numbers anywhere in this file. It is right for most values and
+; catastrophic near the wrap.
+; ----------------------------------------------------------------------
+Procedure.i TcpSeqLt(a.l, b.l)
+  Define d.l
+  d = a - b
+  If d < 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i TcpSeqLe(a.l, b.l)
+  Define d.l
+  d = a - b
+  If d <= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i TcpSeqGt(a.l, b.l)
+  Define d.l
+  d = a - b
+  If d > 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i TcpSeqGe(a.l, b.l)
+  Define d.l
+  d = a - b
+  If d >= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; TcpSeqAdd - a sequence number plus a count, reduced. Written out
+; rather than left inline at each site so that the reduction cannot be
+; forgotten in the one place that matters.
+Procedure.l TcpSeqAdd(a.l, n.i)
+  Define d.l
+  d = a + n
+  ProcedureReturn d
+EndProcedure
+
+; ======================================================================
+; THE RECEIVE WINDOW - RFC 9293 3.8.6.2.2, receiver-side silly-window
+; avoidance, expressed so the right edge can never move backwards.
+; ======================================================================
+; The oldest byte the application has not read sits at sequence number
+; RCV.NXT - tcp_rcv_cnt, so the furthest right edge the ring could
+; support is (RCV.NXT - cnt) + RCVBUF. That quantity only ever grows,
+; because RCV.NXT grows by exactly the bytes that enter the ring and cnt
+; grows with them and shrinks when the application reads.
+;
+; 3.8.6.2.2 says not to move the edge for a trivial gain: "The offered
+; window is not increased until it can be increased by ... min( Fr *
+; RCV.BUFF, Eff.snd.MSS )".  So the edge is advanced only when it could
+; move by at least min(RCVBUF/2, MSS), and otherwise it stays where it
+; was. It is NEVER pulled back. That single property is what makes a
+; dynamic window as safe as a fixed one, and it is why tcp_rcv_edge is a
+; stored variable rather than something recomputed at each use.
+;
+; The window is clamped to 65535 because the field is 16 bits and we do
+; not implement window scaling (gap 3). Our buffer is 4096, so the clamp
+; is dead code that exists to stay dead.
+; ----------------------------------------------------------------------
+Procedure.i TcpAdvertiseWnd()
+  Define newedge.l
+  Define lim.i
+  Define w.i
+  newedge = (tcp_rcv_nxt - tcp_rcv_cnt) + #TCP_RCVBUF
+  lim = #TCP_RCVBUF / 2
+  If #TCP_MSS_RX < lim
+    lim = #TCP_MSS_RX
+  EndIf
+  ; newedge - tcp_rcv_edge is a SMALL NON-NEGATIVE COUNT, not a sequence
+  ; number, and it is computed with TcpSeqLt's arithmetic so that it is
+  ; still a small count when the two straddle the wrap.
+  If TcpSeqGe(newedge, tcp_rcv_edge + lim) <> 0
+    tcp_rcv_edge = newedge
+  EndIf
+  w = tcp_rcv_edge - tcp_rcv_nxt
+  If w < 0
+    w = 0
+  EndIf
+  If w > 65535
+    w = 65535
+  EndIf
+  tcp_rcv_wnd = w
+  ProcedureReturn w
+EndProcedure
+
+; ======================================================================
+; THE SEND CEILING, WHICH IS A RUN-TIME QUESTION ON THIS BOARD.
+; ======================================================================
+; See SIZES above. LinkTxMaxOn(tcp_kind) is the largest 802.3 frame this
+; socket's own interface will accept, so the largest TCP DATA a
+; segment can hold is that minus the Ethernet, IPv4 and TCP headers.
+; A SYN carries four more bytes of MSS option and no data at all, so it
+; is not the case that binds.
+;
+; IT IS FLOORED AT #TCP_MSS_FLOOR RATHER THAN ALLOWED TO GO NEGATIVE. A
+; link that reports an absurd maximum is a bug somewhere else, and the
+; right behaviour here is to keep making forward progress in tiny
+; segments while that bug is found, not to divide by it.
+Procedure.i TcpTxCap()
+  Define m.i
+  m = LinkTxMaxOn(tcp_kind) - 14 - 20 - 20
+  If m > #TCP_MSS_RX
+    m = #TCP_MSS_RX
+  EndIf
+  If m < #TCP_MSS_FLOOR
+    m = #TCP_MSS_FLOOR
+  EndIf
+  ProcedureReturn m
+EndProcedure
+
+; ==== PORTABLE CORE BEGIN ====
+; 2.4's clamps, applied everywhere RTO is written and nowhere else.
+Procedure TcpClampRto()
+  If tcp_rto < #TCP_RTO_MIN_MS
+    tcp_rto = #TCP_RTO_MIN_MS
+  EndIf
+  If tcp_rto > #TCP_RTO_MAX_MS
+    tcp_rto = #TCP_RTO_MAX_MS
+  EndIf
+EndProcedure
+
+; RFC 6298 2.2 (first measurement) and 2.3 (every later one).
+;
+;   first:  SRTT = R              RTTVAR = R/2
+;   later:  RTTVAR = 3/4 RTTVAR + 1/4 |SRTT - R|
+;           SRTT   = 7/8 SRTT   + 1/8 R
+;   both:   RTO    = SRTT + max(G, 4*RTTVAR)
+;
+; In the scaled integers: srtt8 = SRTT*8 and rttvar4 = RTTVAR*4, so
+; 4*RTTVAR is exactly rttvar4 and needs no multiply. The updates become
+; srtt8 += err and rttvar4 += |err| - rttvar4/4, which is the textbook
+; form and is exact in integers.
+;
+; KARN'S ALGORITHM (RFC 6298 3.1, "Karn's algorithm ... TCP MUST NOT use
+; retransmitted segments") is enforced by the CALLER: tcp_rtt_timing is
+; cleared the moment a segment is retransmitted, so no sample is ever
+; taken from an ambiguous acknowledgment. Getting this wrong makes RTO
+; collapse under loss, which turns one lost segment into a storm.
+Procedure.i TcpRttUpdate(r.i)
+  Define err.i
+  If r < 0
+    ProcedureReturn 0
+  EndIf
+  tcp_rtt_last = r
+  If tcp_rtt_valid = 0
+    tcp_srtt8 = r * 8
+    tcp_rttvar4 = r * 2                 ; (R/2)*4
+    tcp_rtt_valid = 1
+  Else
+    err = r - (tcp_srtt8 / 8)
+    tcp_srtt8 = tcp_srtt8 + err
+    If err < 0
+      err = -err
+    EndIf
+    tcp_rttvar4 = tcp_rttvar4 + (err - (tcp_rttvar4 / 4))
+    If tcp_rttvar4 < 1
+      tcp_rttvar4 = 1
+    EndIf
+  EndIf
+  tcp_rto = (tcp_srtt8 / 8) + tcp_rttvar4
+  If tcp_rttvar4 < #TCP_CLOCK_G_MS
+    tcp_rto = (tcp_srtt8 / 8) + #TCP_CLOCK_G_MS
+  EndIf
+  TcpClampRto()
+  ProcedureReturn 0
+EndProcedure
+; ==== PORTABLE CORE END ====
+
+; RFC 6298 5.1/5.2: the timer runs whenever data is outstanding and is
+; restarted on an ACK that acknowledges new data.
+Procedure TcpArmRto()
+  tcp_rto_t0 = Micros()
+  tcp_rto_armed = 1
+EndProcedure
+
+Procedure TcpDisarmRto()
+  tcp_rto_armed = 0
+  tcp_retries = 0
+EndProcedure
+
+; ======================================================================
+; BYTES ON AND OFF THE WIRE, ONE AT A TIME.
+; ======================================================================
+; The wire is BIG-ENDIAN and this machine is LITTLE-ENDIAN. net.pi4's
+; header argues this at length and the argument is not repeated: every
+; multi-byte field is read and written ONE BYTE AT A TIME, there is not
+; a single PeekW/PeekL/PokeW/PokeL aimed at a protocol field in this
+; file, and that is deliberate rather than accidental. A byte-swapped
+; port of 7 is 1792 and nothing anywhere complains.
+;
+; These are tcp_-prefixed copies of what net.pi4 has, and they are
+; copies ON PURPOSE: net_PutBE16 is that file's own private helper, and
+; a library reaching into another library's underscored names is a
+; dependency nobody declared. Four three-line procedures is the cheaper
+; side of that trade.
+; ----------------------------------------------------------------------
+Procedure.i tcp_GetBE16(p.i)
+  ProcedureReturn ((PeekA(p) & $FF) << 8) | (PeekA(p + 1) & $FF)
+EndProcedure
+
+Procedure.l tcp_GetBE32(p.i)
+  Define v.l
+  v = ((PeekA(p) & $FF) << 24) | ((PeekA(p + 1) & $FF) << 16) | ((PeekA(p + 2) & $FF) << 8) | (PeekA(p + 3) & $FF)
+  ProcedureReturn v
+EndProcedure
+
+Procedure tcp_PutBE16(p.i, v.i)
+  PokeB(p + 0, (v >> 8) & $FF)
+  PokeB(p + 1, v & $FF)
+EndProcedure
+
+Procedure tcp_PutBE32(p.i, v.l)
+  PokeB(p + 0, (v >> 24) & $FF)
+  PokeB(p + 1, (v >> 16) & $FF)
+  PokeB(p + 2, (v >> 8) & $FF)
+  PokeB(p + 3, v & $FF)
+EndProcedure
+
+; ======================================================================
+; THE RINGS
+; ======================================================================
+
+; ======================================================================
+;  tcp_Move - n octets from src to dst, as wide as the two addresses
+;  allow. THE ONE PLACE EITHER RING COPIES BULK DATA.
+; ======================================================================
+;  WHY THIS EXISTS, AND IT IS A MEASUREMENT. `a64_tcp_check.py --cost`
+;  counts the instructions the receive path spends per octet received.
+;  On 2026-09-07 it read 135.4, and 96.1 of those - SEVENTY-ONE PER CENT
+;  - were the two byte-at-a-time loops in TcpRcvPush and TcpRead, at
+;  about 48 instructions PER OCTET each. That is not a copy being slow,
+;  it is a copy being written as four statements over globals, so every
+;  octet paid a ring-mask, a bounds increment, a loop counter and a
+;  compare, and each of those is a load, an operation and a store.
+;
+;  On the radio that is not a detail on top of the round trip - it IS the
+;  round trip. A receiver acknowledges each segment as it lands, so the
+;  peer's next window opens only after this board has finished with the
+;  last one, and the board's per-segment service time is therefore most
+;  of the RTT the window is divided by. That is why turning the caches on
+;  moved an image upload from 207 KB/s to 622 KB/s: a three-fold change
+;  from a switch that cannot touch the wire.
+;
+;  TWO THINGS MAKE IT CHEAPER AND NEITHER IS CLEVER:
+;
+;  1. RUNS, NOT OCTETS. A ring copy is at most two contiguous runs - up
+;     to the end of the ring, then from its start. The wrap is decided
+;     ONCE per run instead of tested once per octet.
+;
+;  2. THE WIDEST ACCESS BOTH ADDRESSES ALLOW. Checked at run time on the
+;     real addresses, because on this target the answer is not a
+;     property of the code.
+;
+;  THE ALIGNMENT RULE IS WHY THE WIDTH IS ASKED AND NOT ASSUMED. With the
+;  MMU off every data access on this part is Device-nGnRnE and an
+;  unaligned 2/4/8-byte access is an Alignment fault with NO exception
+;  vector installed - the board stops mid-line and needs a power cycle.
+;  SCTLR_EL2.A being clear does not help: .A governs Normal memory. See
+;  the vault's note of 2026-08-27. So each run asks what the pair of
+;  addresses actually is and steps down 8 -> 4 -> 2 -> 1 accordingly, and
+;  `a64_tcp_check` runs under an interpreter that raises exactly that
+;  fault, so a mistake here is caught at the desk and not on the bench.
+;
+;  WHAT THE REAL ADDRESSES TURN OUT TO BE, because it decides the size of
+;  the win and it is worth writing down rather than rediscovering: the
+;  received TCP payload sits 14 + 20 + 20 = 54 octets into a frame whose
+;  own base is word-aligned, so its address is 2 past a multiple of four
+;  and the PUSH gets 2-octet moves. The ring and the DRAM window are both
+;  word-aligned and advance by a whole segment, so the READ gets 4- and
+;  8-octet moves. The ladder is not decoration; two of its rungs are the
+;  ones that fire.
+;
+;  IT IS BYTE-EXACT WHATEVER RUNG IT TAKES, and that is the property the
+;  gate holds it to: the same 202 cases, the same frames, and the upload
+;  group's SHA-256 of the DRAM the octets landed in.
+Procedure tcp_Move(dst.i, src.i, n.i)
+  Define d.i
+  Define s.i
+  Define e.i
+  Define left.i
+  d = dst
+  s = src
+  left = n
+  If left <= 0
+    ProcedureReturn
+  EndIf
+
+  ; Eight at a time when both are eight-aligned. PeekX/PokeX are the
+  ; 64-bit pair and exist only on this target, which is the only one this
+  ; file is built for.
+  If (d & 7) = 0 And (s & 7) = 0
+    e = d + (left & (~7))
+    While d < e
+      PokeX(d, PeekX(s))
+      d = d + 8
+      s = s + 8
+    Wend
+    left = left & 7
+  EndIf
+
+  If (d & 3) = 0 And (s & 3) = 0
+    e = d + (left & (~3))
+    While d < e
+      PokeL(d, PeekL(s))
+      d = d + 4
+      s = s + 4
+    Wend
+    left = left & 3
+  EndIf
+
+  If (d & 1) = 0 And (s & 1) = 0
+    e = d + (left & (~1))
+    While d < e
+      PokeW(d, PeekW(s))
+      d = d + 2
+      s = s + 2
+    Wend
+    left = left & 1
+  EndIf
+
+  ; Whatever the ladder could not take. SIGN IS NOT A QUESTION ANYWHERE
+  ; ABOVE: a Peek named after a signed type sign-extends and the matching
+  ; Poke writes back the low bits of what it is given, so every rung
+  ; moves the same bits it read. Only a Peek whose result were ARITHMETIC
+  ; would have to care.
+  e = d + left
+  While d < e
+    PokeB(d, PeekA(s))
+    d = d + 1
+    s = s + 1
+  Wend
+EndProcedure
+
+Procedure.i TcpRcvFree()
+  ProcedureReturn #TCP_RCVBUF - tcp_rcv_cnt
+EndProcedure
+
+; Append n bytes from the RECEIVED FRAME at src into the receive ring.
+; The caller has already established that they are in order and fit.
+; src is an ADDRESS here where the Pico's is an index into its driver's
+; one receive buffer; net.pi4 hands up pointers, for the reason its
+; globals block gives.
+;
+; TWO RUNS AT MOST, and the second one exists only when the write wraps
+; the end of the ring. See tcp_Move above for why this is not a loop over
+; octets any more.
+Procedure TcpRcvPush(src.i, n.i)
+  Define w.i
+  Define s.i
+  Define run.i
+  Define left.i
+  w = (tcp_rcv_tail + tcp_rcv_cnt) & #TCP_RCVMASK
+  s = src
+  left = n
+  While left > 0
+    run = #TCP_RCVBUF - w
+    If run > left
+      run = left
+    EndIf
+    tcp_Move(@tcp_rcv[0] + tcp_rcvBase + w, s, run)
+    s = s + run
+    w = (w + run) & #TCP_RCVMASK
+    left = left - run
+  Wend
+  tcp_rcv_cnt = tcp_rcv_cnt + n
+  tcp_bytes_rx = tcp_bytes_rx + n
+EndProcedure
+
+Procedure.i TcpSndFree()
+  ProcedureReturn #TCP_SNDBUF - tcp_snd_cnt
+EndProcedure
+
+; The send ring holds every byte from SND.UNA forward, so byte k of the
+; ring is sequence number SND.UNA + k. That one invariant is what makes
+; retransmission a copy from a known offset rather than a search.
+Procedure.i TcpSndByteAt(seq.l)
+  Define off.i
+  off = seq - tcp_snd_una
+  ProcedureReturn tcp_snd[tcp_sndBase + ((tcp_snd_head - tcp_snd_cnt + off) & #TCP_SNDMASK)]
+EndProcedure
+
+; ======================================================================
+; THE OUT-OF-ORDER REASSEMBLY QUEUE (RFC 9293 3.10.7.4)
+; ======================================================================
+; Three operations on the fixed slot array declared above: empty it,
+; store one out-of-order segment, and - once RCV.NXT has moved - deliver
+; in order every slot that has become contiguous. The queue never
+; advertises more than it holds and never delivers a byte twice; RCV.NXT
+; is the single source of truth for what has been delivered, and every
+; slot is measured against it fresh, so a partially delivered slot is
+; re-measured on the next drain rather than edited in place.
+
+Procedure TcpOooReset()
+  Define s.i
+  s = 0
+  While s < #TCP_OOO_SLOTS
+    tcp_ooo_used[s] = 0
+    tcp_ooo_seq[s] = 0
+    tcp_ooo_len[s] = 0
+    s = s + 1
+  Wend
+  tcp_ooo_count = 0
+EndProcedure
+
+; Store one out-of-order segment. seq is its left edge (ahead of RCV.NXT
+; with a gap, which is the only case the caller uses this for) and n is
+; its data length; src points at the bytes inside the received frame.
+; Returns 1 if the segment is now held - either freshly stored or
+; already covered by an existing slot - and 0 if it could not be kept,
+; which is a segment larger than #TCP_OOO_BUFSZ or a full queue. The
+; caller sends a duplicate ACK either way: queuing changes what we KEEP,
+; not what we ACKNOWLEDGE, and the duplicate ACKs are what drive a
+; conformant peer's fast retransmit (RFC 5681 3.2).
+Procedure.i TcpOooInsert(src.i, seq.l, n.i)
+  Define s.i
+  Define i.i
+  Define free.i
+  Define base.i
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  If n > #TCP_OOO_BUFSZ
+    ProcedureReturn 0                     ; larger than a slot; cannot hold
+  EndIf
+  ; Already covered in full? A retransmitted out-of-order segment must
+  ; not take a second slot, or a handful of duplicates fills the queue.
+  free = -1
+  s = 0
+  While s < #TCP_OOO_SLOTS
+    If tcp_ooo_used[s] <> 0
+      If tcp_ooo_seq[s] = seq
+        If tcp_ooo_len[s] >= n
+          ProcedureReturn 1               ; already held
+        EndIf
+      EndIf
+    ElseIf free < 0
+      free = s                            ; remember the first empty slot
+    EndIf
+    s = s + 1
+  Wend
+  If free < 0
+    ProcedureReturn 0                     ; queue full - dropped, as gap 5
+  EndIf
+  base = tcp_oooBase + free * #TCP_OOO_BUFSZ
+  i = 0
+  While i < n
+    tcp_ooo_buf[base + i] = PeekA(src + i) & $FF
+    i = i + 1
+  Wend
+  tcp_ooo_seq[free] = seq
+  tcp_ooo_len[free] = n
+  tcp_ooo_used[free] = 1
+  tcp_ooo_count = tcp_ooo_count + 1
+  tcp_ooo_queued = tcp_ooo_queued + 1
+  ProcedureReturn 1
+EndProcedure
+
+; RCV.NXT has advanced. Deliver, in order, every queued segment now
+; contiguous with it, freeing each slot as it goes; a slot that has
+; fallen wholly behind RCV.NXT (a duplicate the peer resent before our
+; ACK landed) is simply freed. Delivering one slot can make the next
+; contiguous, so the scan repeats until a full pass makes no progress.
+; It terminates because every pass either frees at least one slot or
+; sets progress = 0, and there are only #TCP_OOO_SLOTS slots. If the
+; receive ring cannot take a whole deliverable slot the drain stops and
+; leaves it queued; RCV.NXT is the truth, so the remainder is delivered
+; on a later drain once the application reads.
+Procedure TcpOooDrain()
+  Define s.i
+  Define progress.i
+  Define trim.i
+  Define n.i
+  Define i.i
+  Define base.i
+  Define w.i
+  Define nx.l
+  progress = 1
+  While progress = 1
+    progress = 0
+    s = 0
+    While s < #TCP_OOO_SLOTS
+      If tcp_ooo_used[s] <> 0
+        If TcpSeqLe(TcpSeqAdd(tcp_ooo_seq[s], tcp_ooo_len[s]), tcp_rcv_nxt) <> 0
+          tcp_ooo_used[s] = 0             ; wholly behind RCV.NXT: stale
+          tcp_ooo_count = tcp_ooo_count - 1
+          progress = 1
+        ElseIf TcpSeqLe(tcp_ooo_seq[s], tcp_rcv_nxt) <> 0
+          ; Contiguous: left edge at or before RCV.NXT, extends past it.
+          trim = tcp_rcv_nxt - tcp_ooo_seq[s]
+          If trim < 0
+            trim = 0
+          EndIf
+          n = tcp_ooo_len[s] - trim
+          If n > TcpRcvFree()
+            n = TcpRcvFree()              ; never overrun the receive ring
+          EndIf
+          If n > 0
+            base = tcp_oooBase + s * #TCP_OOO_BUFSZ
+            w = (tcp_rcv_tail + tcp_rcv_cnt) & #TCP_RCVMASK
+            i = 0
+            While i < n
+              tcp_rcv[tcp_rcvBase + w] = tcp_ooo_buf[base + trim + i] & $FF
+              w = (w + 1) & #TCP_RCVMASK
+              i = i + 1
+            Wend
+            tcp_rcv_cnt = tcp_rcv_cnt + n
+            tcp_bytes_rx = tcp_bytes_rx + n
+            nx = tcp_rcv_nxt + n
+            tcp_rcv_nxt = nx
+          EndIf
+          If (trim + n) >= tcp_ooo_len[s]
+            tcp_ooo_used[s] = 0           ; whole slot delivered
+            tcp_ooo_count = tcp_ooo_count - 1
+            tcp_ooo_deliver = tcp_ooo_deliver + 1
+            progress = 1
+          Else
+            ProcedureReturn               ; ring full; leave the rest queued
+          EndIf
+        EndIf
+      EndIf
+      s = s + 1
+    Wend
+  Wend
+EndProcedure
+
+; ======================================================================
+; BUILDING AND SENDING ONE SEGMENT
+; ======================================================================
+; The TCP header goes at NetTcpSegBuf() - which is net.pi4's staging
+; buffer, offset past where the Ethernet and IPv4 headers will go - and
+; the data goes straight after it. Then NetTcpBuild() writes those two
+; headers in front, computes the TCP checksum over the pseudo-header and
+; the whole segment, and pads the frame; LinkTxStaged() puts it on
+; whichever interface is carrying traffic.
+;
+; THE CHECKSUM IS NOT COMPUTED HERE and that is a change from the Pico,
+; where tcp.pico2 does its own pseudo-header arithmetic beside the
+; driver's. It is done in net.pi4 instead because net.pi4 already owns
+; net_Sum16 and net_PseudoSum for ICMP and UDP, and a fourth
+; transcription of a ones-complement fold is a fourth chance to get the
+; odd-length pad or the zero-while-summing rule wrong. RFC 9293 3.1's
+; "The TCP checksum is never optional" is enforced there, in both
+; directions.
+;
+; BUILD THE SEGMENT FIRST, THEN CALL NetTcpBuild. The order is written
+; in capitals in net.pi4 as well: building after the call writes into a
+; buffer whose checksum has already been computed, and the result is a
+; segment every peer on earth silently discards, with nothing in either
+; file able to notice.
+; ----------------------------------------------------------------------
+
+; datalen bytes of application data starting at sequence number seq are
+; copied out of the send ring behind the header. withmss adds the
+; 4-byte MSS option (RFC 9293 3.7.1 / 3.2: Kind 2, Length 4, then two
+; bytes of value, big-endian) - legal only on a segment carrying SYN.
+Procedure.i TcpSendSeg(seq.l, flags.i, datalen.i, withmss.i)
+  Define hl.i
+  Define i.i
+  Define seglen.i
+  Define wnd.i
+  Define p.i
+  Define cap.i
+
+  hl = 20
+  If withmss <> 0
+    hl = 24
+  EndIf
+  If datalen < 0
+    datalen = 0
+  EndIf
+  cap = TcpTxCap()
+  If datalen > cap
+    ProcedureReturn #NET_TCP_E_TOOBIG
+  EndIf
+
+  p = NetTcpSegBuf()
+  tcp_PutBE16(p + #TCP_H_SPORT, tcp_lport)
+  tcp_PutBE16(p + #TCP_H_DPORT, tcp_rport)
+  tcp_PutBE32(p + #TCP_H_SEQ, seq)
+  ; The acknowledgment field "is only valid when the ACK control bit is
+  ; set" (3.1). We still write RCV.NXT into it unconditionally, because
+  ; a field that is ignored is cheaper to write than to branch around,
+  ; and a stale value in an ignored field is exactly the sort of thing
+  ; that becomes meaningful later by accident. Writing the truth costs
+  ; nothing.
+  tcp_PutBE32(p + #TCP_H_ACK, tcp_rcv_nxt)
+  PokeB(p + #TCP_H_OFF, (hl / 4) << 4)
+  PokeB(p + #TCP_H_FLAGS, flags & $FF)
+  ; A RST is sent when the connection is being torn down or does not
+  ; exist, so advertising a window on it is meaningless - 3.10.7.1 shows
+  ; RST segments built with no window at all. TcpAdvertiseWnd is NOT
+  ; CALLED on that path, and that is not tidiness: it WRITES
+  ; tcp_rcv_edge and tcp_rcv_wnd, and TcpSendRstFor calls this with a
+  ; doctored tcp_rcv_nxt. Calling it there would compute a receive edge
+  ; from a number that is not our receive edge and leave it behind.
+  If (flags & #TCP_RST) <> 0
+    wnd = 0
+  Else
+    wnd = TcpAdvertiseWnd()
+  EndIf
+  tcp_PutBE16(p + #TCP_H_WND, wnd)
+  tcp_PutBE16(p + #TCP_H_SUM, 0)        ; net.pi4 zeroes it too; doing it
+                                        ; here as well costs two bytes and
+                                        ; means this buffer is never
+                                        ; handed on carrying a stale one
+  tcp_PutBE16(p + #TCP_H_URP, 0)        ; no urgent data, ever (gap 4)
+
+  If withmss <> 0
+    PokeB(p + 20, 2)                    ; Kind = 2, Maximum Segment Size
+    PokeB(p + 21, 4)                    ; Length = 4, the option's own size
+    tcp_PutBE16(p + 22, #TCP_MSS_RX)
+  EndIf
+
+  i = 0
+  While i < datalen
+    PokeB(p + hl + i, TcpSndByteAt(TcpSeqAdd(seq, i)) & $FF)
+    i = i + 1
+  Wend
+
+  seglen = hl + datalen
+  If NetTcpBuildFrom(tcp_kind, tcp_lip, tcp_rip, seglen, @tcp_rmac[0]) = 0
+    tcp_txfail = tcp_txfail + 1
+    ProcedureReturn #NET_TCP_E_TX
+  EndIf
+
+  ; THE INJECTOR. The segment is fully built and checksummed first, so
+  ; what is being tested is the loss of a CORRECT segment - not a
+  ; shortcut that skips the arithmetic and might hide a defect in it.
+  If tcp_drop_every > 0
+    If datalen > 0
+      If tcp_drop_hold = 0
+        tcp_drop_n = tcp_drop_n + 1
+        If tcp_drop_n >= tcp_drop_every
+          tcp_drop_n = 0
+          tcp_dropped = tcp_dropped + 1
+          tcp_seg_tx = tcp_seg_tx + 1
+          ProcedureReturn #NET_TCP_OK    ; the caller advances SND.NXT,
+        EndIf                            ; which is exactly what a real
+      EndIf                              ; loss looks like from here
+    EndIf
+  EndIf
+
+  If LinkTxStagedOn(tcp_kind) <> 1
+    tcp_txfail = tcp_txfail + 1
+    ProcedureReturn #NET_TCP_E_TX
+  EndIf
+  tcp_seg_tx = tcp_seg_tx + 1
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+; ======================================================================
+; TEARDOWN
+; ======================================================================
+
+; Wipe the current socket back to CLOSED without sending anything. Used
+; after a RST arrives, after a retransmission gives up, and by TcpAbort
+; behind a RST.
+;
+; tcp_reset_seen and tcp_err are DELIBERATELY NOT CLEARED HERE: they are
+; the only evidence of why a connection ended, and a caller that polls
+; the state a moment later would otherwise see a clean CLOSED and have
+; no way to tell an orderly close from a peer that pulled the plug. That
+; distinction is the whole of the robustness requirement.
+Procedure TcpWipe()
+  tcp_state = #TCP_CLOSED
+  tcp_kind = #HW_LINK_NONE
+  tcp_lip = 0
+  tcp_snd_cnt = 0
+  tcp_snd_head = 0
+  tcp_rcv_cnt = 0
+  tcp_rcv_tail = 0
+  tcp_fin_sent = 0
+  tcp_fin_rcvd = 0
+  tcp_close_pending = 0
+  tcp_rto_armed = 0
+  tcp_retries = 0
+  tcp_rtt_timing = 0
+  tcp_persist_armed = 0
+  tcp_keep_sent = 0
+  tcp_snd_wnd = 0
+  TcpOooReset()                 ; a new connection inherits no stale segments
+EndProcedure
+
+; A bare RST for a segment that arrived for a connection that does not
+; exist - RFC 9293 3.10.7.1, "CLOSED STATE (i.e., TCB does not exist)":
+;
+;   "If the ACK bit is off, sequence number zero is used:
+;      <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+;    If the ACK bit is on:
+;      <SEQ=SEG.ACK><CTL=RST>"
+;
+; This is the rule that makes a closed port say "nobody home" instead of
+; timing out, and it is why a RST probe gets an instant answer rather
+; than a seventy-five-second silence.
+;
+; A RST IS NEVER SENT IN RESPONSE TO A RST (3.5.2 "Reset Generation";
+; 3.10.7.1 opens with "If the state is CLOSED ... an incoming segment
+; containing a RST is discarded"). Without that rule two stacks can
+; trade resets forever.
+;
+; ANSWERING A STRANGER MUST NOT DISTURB THE CONNECTION WE ALREADY HAVE.
+; A segment for a port we are not using can arrive while a real
+; connection is up, and the reply has to be addressed to the stranger -
+; which means writing tcp_rip, tcp_rport, tcp_lport and tcp_rmac, the
+; four fields the live connection is made of. They are saved and put
+; back around the send. Without that, one stray probe from the LAN
+; re-points an established connection at whoever sent it, and every
+; later segment goes to the wrong host with no error anywhere.
+;
+; tcp_rcv_nxt is borrowed too, because the RST's ACK field is built from
+; it; TcpSendSeg deliberately does not recompute the receive window on a
+; RST, so nothing else is touched.
+Procedure TcpSendRstFor(seq.l, ack.l, seglen.i, hadack.i, toip.i, toport.i, myport.i, tomac.i)
+  Define saved_rcv.l
+  Define saved_rip.i
+  Define saved_rport.i
+  Define saved_lport.i
+  Define saved_kind.i
+  Define saved_lip.i
+  Define i.i
+  saved_rcv = tcp_rcv_nxt
+  saved_kind = tcp_kind
+  ; The stranger's own interface, out of the frame it arrived in - the
+  ; fifth field of the borrowed peer, and the one without which a RST
+  ; answering a probe off the radio would be built as the cable.
+  tcp_kind = NetRxKind()
+  saved_lip = tcp_lip
+  tcp_lip = NetRxTo()
+  saved_rip = tcp_rip
+  saved_rport = tcp_rport
+  saved_lport = tcp_lport
+  i = 0
+  While i < 8
+    tcp_savmac[i] = tcp_rmac[i] & $FF
+    i = i + 1
+  Wend
+  tcp_rip = toip
+  tcp_rport = toport
+  tcp_lport = myport
+  i = 0
+  While i < 6
+    tcp_rmac[i] = PeekA(tomac + i) & $FF
+    i = i + 1
+  Wend
+  If hadack <> 0
+    ; 3.10.7.1: "If the ACK bit is on: <SEQ=SEG.ACK><CTL=RST>"
+    tcp_rcv_nxt = 0
+    TcpSendSeg(ack, #TCP_RST, 0, 0)
+  Else
+    ; "If the ACK bit is off, sequence number zero is used:
+    ;  <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>"
+    tcp_rcv_nxt = TcpSeqAdd(seq, seglen)
+    TcpSendSeg(0, #TCP_RST | #TCP_ACK, 0, 0)
+  EndIf
+  tcp_rcv_nxt = saved_rcv
+  tcp_kind = saved_kind
+  tcp_lip = saved_lip
+  tcp_rip = saved_rip
+  tcp_rport = saved_rport
+  tcp_lport = saved_lport
+  i = 0
+  While i < 8
+    tcp_rmac[i] = tcp_savmac[i] & $FF
+    i = i + 1
+  Wend
+  tcp_rst_tx = tcp_rst_tx + 1
+EndProcedure
+
+; ======================================================================
+; OUTPUT - what may be sent right now, and the two rules that bound it.
+; ======================================================================
+; RULE ONE, FLOW CONTROL (3.8.4 and 3.3.1): a byte may be sent only if
+; it is inside the window the peer advertised, i.e. below SND.UNA +
+; SND.WND.
+;
+; RULE TWO, THE SEGMENT CEILING: never more than SND.MSS of data in one
+; segment, and never more than the CURRENT LINK can carry - which on
+; this board is a run-time question, see TcpTxCap().
+;
+; SENDER-SIDE SILLY-WINDOW AVOIDANCE (3.8.6.2.1) is implemented in its
+; simplest defensible form: send a full-sized segment whenever one is
+; available, and otherwise send a short one only when nothing is in
+; flight. That is Nagle's condition (3.7.4) and it is why a large
+; transfer goes out in full segments rather than in whatever the
+; application happened to hand over.
+;
+; A caller that wants a small write on the wire NOW (a request/response
+; protocol, which is exactly what `http get` is) is served by there
+; being nothing in flight, which is exactly when Nagle allows it.
+; ----------------------------------------------------------------------
+Procedure.i TcpUsableWindow()
+  Define usable.i
+  usable = (tcp_snd_una + tcp_snd_wnd) - tcp_snd_nxt
+  If usable < 0
+    usable = 0
+  EndIf
+  ProcedureReturn usable
+EndProcedure
+
+Procedure.i TcpOutput()
+  Define avail.i
+  Define usable.i
+  Define n.i
+  Define flags.i
+  Define sent.i
+  Define inflight.i
+  Define r.i
+  Define mss.i
+  Define nx.l
+
+  If tcp_state = #TCP_CLOSED
+    ProcedureReturn 0
+  EndIf
+  If tcp_state = #TCP_LISTEN
+    ProcedureReturn 0
+  EndIf
+  If tcp_state = #TCP_SYN_SENT
+    ProcedureReturn 0                   ; the SYN is the retransmit
+  EndIf                                 ; timer's business, not this loop's
+  If tcp_state = #TCP_SYN_RECEIVED
+    ProcedureReturn 0
+  EndIf
+  If tcp_state = #TCP_TIME_WAIT
+    ProcedureReturn 0
+  EndIf
+
+  mss = tcp_snd_mss
+  If mss > TcpTxCap()
+    mss = TcpTxCap()                    ; the link may have changed under
+  EndIf                                 ; a live connection
+
+  sent = 0
+  ; Loop while there is something to send AND room to send it. Bounded
+  ; by the send buffer, so it cannot spin: every pass either transmits
+  ; and advances SND.NXT, or returns.
+  While 1 = 1
+    inflight = tcp_snd_nxt - tcp_snd_una
+    avail = tcp_snd_cnt - inflight      ; buffered bytes not yet sent
+    usable = TcpUsableWindow()
+    If avail > usable
+      avail = usable
+    EndIf
+    n = avail
+    If n > mss
+      n = mss
+    EndIf
+
+    flags = #TCP_ACK
+    ; The FIN goes on the segment that carries the last byte, or alone
+    ; once every byte has been sent. 3.6: "A TCP endpoint ... sends a
+    ; FIN segment ... after all preceding SENDs have been segmentized".
+    If tcp_close_pending <> 0
+      If tcp_fin_sent = 0
+        If n = (tcp_snd_cnt - inflight)
+          flags = flags | #TCP_FIN
+        EndIf
+      EndIf
+    EndIf
+
+    If n = 0
+      If (flags & #TCP_FIN) = 0
+        ; Nothing to send. Return BEFORE emitting an empty segment - an
+        ; unsolicited bare ACK here would be a packet storm at line rate,
+        ; and this board's line rate is a gigabit.
+        ProcedureReturn sent
+      EndIf
+    Else
+      ; Nagle / SWS (3.7.4, 3.8.6.2.1): a short segment waits unless the
+      ; pipe is empty. A full-sized one never waits.
+      If n < mss
+        If inflight > 0
+          If (flags & #TCP_FIN) = 0
+            ProcedureReturn sent
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+
+    r = TcpSendSeg(tcp_snd_nxt, flags, n, 0)
+    If r <> #NET_TCP_OK
+      ProcedureReturn sent              ; the link refused it. The RTO
+    EndIf                               ; will bring us back; SND.NXT has
+                                        ; not moved, so nothing is lost
+    If tcp_rtt_timing = 0
+      If n > 0
+        ; RFC 6298 3.1: one measurement in flight at a time, and never
+        ; on a retransmission. This is the only place a sample starts.
+        tcp_rtt_timing = 1
+        tcp_rtt_seq = TcpSeqAdd(tcp_snd_nxt, n)
+        tcp_rtt_t0 = Micros()
+      EndIf
+    EndIf
+    nx = tcp_snd_nxt + n
+    tcp_snd_nxt = nx
+    sent = sent + n
+    If (flags & #TCP_FIN) <> 0
+      tcp_fin_seq = tcp_snd_nxt
+      nx = tcp_snd_nxt + 1              ; 3.6: the FIN occupies one
+      tcp_snd_nxt = nx                  ; sequence number
+      tcp_fin_sent = 1
+      If tcp_state = #TCP_ESTABLISHED
+        tcp_state = #TCP_FIN_WAIT_1
+      ElseIf tcp_state = #TCP_CLOSE_WAIT
+        tcp_state = #TCP_LAST_ACK
+      EndIf
+    EndIf
+    If tcp_rto_armed = 0
+      TcpArmRto()
+    EndIf
+    If n = 0
+      ProcedureReturn sent
+    EndIf
+  Wend
+  ProcedureReturn sent
+EndProcedure
+
+; A bare acknowledgment. Sent when a segment is unacceptable (3.10.7.4:
+; "If an incoming segment is not acceptable, an acknowledgment should be
+; sent in reply"), when data arrives, and when the peer's FIN does.
+Procedure TcpSendAck()
+  TcpSendSeg(tcp_snd_nxt, #TCP_ACK, 0, 0)
+EndProcedure
+
+; ======================================================================
+; THE INITIAL SEND SEQUENCE NUMBER - RFC 9293 3.4.1, and gap 7.
+; ======================================================================
+; "the choice of the ISS ... a clock-driven scheme". Ours is the
+; microsecond clock, mixed with the socket index and the local port so
+; that two sockets opened in the same microsecond - which the emulator
+; can do and silicon nearly can - cannot pick the same number. The port
+; is in it because it is the other half of what makes a connection
+; distinct.
+;
+; THIS IS NOT RFC 6528 AND DOES NOT PRETEND TO BE. 6528 wants the clock
+; hashed with the 4-tuple and a SECRET, which defeats an off-path
+; attacker guessing sequence numbers. This defeats accidental collision
+; and nothing else, and gap 7 says so at the top of the file rather than
+; leaving somebody to infer it from the arithmetic.
+Procedure.l tcp_IssFor(port.i)
+  Define v.l
+  v = Micros() + (tcp_s << 20) + (port << 7)
+  ProcedureReturn v
+EndProcedure
+
+; ======================================================================
+; INPUT - RFC 9293 3.10.7, "SEGMENT ARRIVES".
+; ======================================================================
+; The order of the checks below is the RFC's order and it is load-
+; bearing: the acceptability test comes before the RST check, which comes
+; before the SYN check, which comes before the ACK check, which comes
+; before the data, which comes before the FIN. Reordering any pair
+; creates a way to be talked out of a connection by a stale segment.
+; ----------------------------------------------------------------------
+
+; Read the MSS option out of a SYN's option area. RFC 9293 3.2: options
+; are (Kind), or (Kind, Length, data...); Kind 0 is End of Option List
+; and Kind 1 is No-Operation, a one-byte pad. ANY OTHER OPTION IS SKIPPED
+; BY ITS OWN LENGTH BYTE - and a length byte below 2 would not advance,
+; so it is treated as malformed and the walk stops. That check is the
+; difference between ignoring an unknown option and hanging on one.
+Procedure.i TcpParseMss(hdr.i, hl.i)
+  Define i.i
+  Define kind.i
+  Define len.i
+  Define mss.i
+  mss = 0
+  i = 20
+  While i < hl
+    kind = PeekA(hdr + i) & $FF
+    If kind = 0
+      i = hl                            ; End of Option List
+    ElseIf kind = 1
+      i = i + 1                         ; No-Operation
+    Else
+      If (i + 1) >= hl
+        i = hl                          ; a Kind with no Length: malformed
+      Else
+        len = PeekA(hdr + i + 1) & $FF
+        If len < 2
+          i = hl                        ; would not advance. Stop.
+        Else
+          If kind = 2
+            If len = 4
+              If (i + 3) < hl
+                mss = ((PeekA(hdr + i + 2) & $FF) << 8) | (PeekA(hdr + i + 3) & $FF)
+              EndIf
+            EndIf
+          EndIf
+          i = i + len
+        EndIf
+      EndIf
+    EndIf
+  Wend
+  ProcedureReturn mss
+EndProcedure
+
+; The peer's MSS, clamped. RFC 9293 3.7.1's default of 536 applies when
+; no option arrived, and it is a MUST. A peer that offers something
+; absurdly small is floored so one byte of data never costs a 40-byte
+; header forever; a peer that offers more than the CURRENT LINK can
+; carry is capped at TcpTxCap(), which is the run-time part.
+Procedure TcpSetSndMss(offered.i)
+  Define m.i
+  Define cap.i
+  m = #TCP_MSS_DEFAULT
+  If offered > 0
+    m = offered
+  EndIf
+  If m < #TCP_MSS_FLOOR
+    m = #TCP_MSS_FLOOR
+  EndIf
+  cap = TcpTxCap()
+  If m > cap
+    m = cap
+  EndIf
+  tcp_snd_mss = m
+EndProcedure
+
+; RFC 9293 3.10.7.4, and Table 6 - the four acceptability cases. Returns
+; 1 if the segment is acceptable.
+;
+;   SEG.LEN  RCV.WND  test
+;   0        0        SEG.SEQ = RCV.NXT
+;   0        >0       RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+;   >0       0        not acceptable
+;   >0       >0       RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+;                     or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+;
+; SEG.LEN here is the RFC's SEG.LEN: data plus the SYN and FIN flags,
+; because both occupy sequence space (3.3.1, and 3.6 for the FIN).
+Procedure.i TcpAcceptable(seq.l, seglen.i, wnd.i)
+  Define lastseq.l
+  Define edge.l
+  edge = tcp_rcv_nxt + wnd
+  If seglen = 0
+    If wnd = 0
+      If seq = tcp_rcv_nxt
+        ProcedureReturn 1
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    If TcpSeqGe(seq, tcp_rcv_nxt) <> 0
+      If TcpSeqLt(seq, edge) <> 0
+        ProcedureReturn 1
+      EndIf
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If wnd = 0
+    ProcedureReturn 0
+  EndIf
+  If TcpSeqGe(seq, tcp_rcv_nxt) <> 0
+    If TcpSeqLt(seq, edge) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  lastseq = seq + seglen - 1
+  If TcpSeqGe(lastseq, tcp_rcv_nxt) <> 0
+    If TcpSeqLt(lastseq, edge) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The ACK arm, shared by every synchronized state (3.10.7.4, "fifth check
+; the ACK field"). Returns 1 if processing should continue, 0 if the
+; segment must be dropped.
+Procedure.i TcpAckArm()
+  Define acked.i
+  If TcpSeqLe(tcp_seg_ack, tcp_snd_una) <> 0
+    ; "If the ACK is a duplicate ... it can be ignored." A duplicate ACK
+    ; is information we do not act on, because acting on it is fast
+    ; retransmit and fast retransmit belongs to congestion control.
+    ProcedureReturn 1
+  EndIf
+  If TcpSeqGt(tcp_seg_ack, tcp_snd_nxt) <> 0
+    ; "If the ACK acks something not yet sent, then send an ACK, drop the
+    ; segment, and return." Answering with our own state is what breaks
+    ; the deadlock a confused peer would otherwise sit in.
+    TcpSendAck()
+    ProcedureReturn 0
+  EndIf
+
+  acked = tcp_seg_ack - tcp_snd_una
+  ; The FIN's sequence number is acknowledged like a byte but is not one,
+  ; so it must not be removed from the send ring.
+  If tcp_fin_sent <> 0
+    If TcpSeqGt(tcp_seg_ack, tcp_fin_seq) <> 0
+      acked = acked - 1
+    EndIf
+  EndIf
+  ; Likewise our SYN, which occupied ISS.
+  If TcpSeqLe(tcp_snd_una, tcp_iss) <> 0
+    acked = acked - 1
+  EndIf
+  If acked < 0
+    acked = 0
+  EndIf
+  If acked > tcp_snd_cnt
+    acked = tcp_snd_cnt
+  EndIf
+  tcp_snd_cnt = tcp_snd_cnt - acked
+  tcp_bytes_tx = tcp_bytes_tx + acked
+  tcp_snd_una = tcp_seg_ack
+
+  ; RFC 6298 3.1 and 5.3: a measurement completes when the ACK covers the
+  ; sequence number being timed, and Karn forbids it if that segment was
+  ; ever retransmitted (tcp_rtt_timing is cleared on retransmission).
+  If tcp_rtt_timing <> 0
+    If TcpSeqGe(tcp_seg_ack, tcp_rtt_seq) <> 0
+      TcpRttUpdate((Micros() - tcp_rtt_t0) / 1000)
+      tcp_rtt_timing = 0
+    EndIf
+  EndIf
+
+  ; RFC 6298 5.2/5.3: turn the timer off when everything is acknowledged,
+  ; restart it when something is still outstanding.
+  If tcp_snd_una = tcp_snd_nxt
+    TcpDisarmRto()
+  Else
+    TcpArmRto()
+    tcp_retries = 0
+  EndIf
+
+  ; The window update, guarded by SND.WL1/SND.WL2 (3.10.7.4): "If
+  ; SND.UNA =< SEG.ACK =< SND.NXT, the send window should be updated. If
+  ; (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)) ..."
+  ; Without that guard an old segment reordered into the present can
+  ; SHRINK the window and wedge the sender - the classic bug this guard
+  ; exists for.
+  If TcpSeqLt(tcp_snd_wl1, tcp_seg_seq) <> 0
+    tcp_snd_wnd = tcp_seg_wnd
+    tcp_snd_wl1 = tcp_seg_seq
+    tcp_snd_wl2 = tcp_seg_ack
+  ElseIf tcp_snd_wl1 = tcp_seg_seq
+    If TcpSeqLe(tcp_snd_wl2, tcp_seg_ack) <> 0
+      tcp_snd_wnd = tcp_seg_wnd
+      tcp_snd_wl2 = tcp_seg_ack
+    EndIf
+  EndIf
+  If tcp_snd_wnd = 0
+    tcp_zerowin = tcp_zerowin + 1
+  Else
+    tcp_persist_armed = 0
+  EndIf
+  ; Anything the peer says is proof it is alive, so the keepalive idle
+  ; clock restarts here and only here. RFC 1122 4.2.3.6 is explicit that
+  ; a keepalive measures IDLE time, not elapsed time.
+  tcp_keep_t0 = Micros()
+  tcp_keep_sent = 0
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TcpInput() - one validated segment, whose coordinates net.pi4 has
+; already put in NetTcpRx*(). It takes no arguments for the same reason
+; the Pico's does not: the segment is wherever the frame is, and copying
+; it in order to pass it would be the copy net.pi4's globals block
+; explains it is avoiding.
+;
+; THE SOCKET IS CHOSEN HERE, NOT BY THE CALLER. A segment names a
+; 4-tuple; this walks the table for the socket that owns it, falls back
+; to a LISTEN socket on the right port, and answers a RST when neither
+; exists. That is the one structural thing this file does that the
+; Pico's single-TCB version had no need of.
+; ----------------------------------------------------------------------
+
+; Which socket does the segment in NetTcpRx*() belong to? Returns the
+; index, or -1. An exact 4-tuple match wins over a listener, always: a
+; SYN arriving for a connection that is already up is a retransmission
+; of that connection's SYN and must reach that connection, not re-open
+; it on the listener.
+Procedure.i tcp_Match()
+  Define i.i
+  Define keep.i
+  Define hit.i
+  keep = tcp_s
+  hit = -1
+  i = 0
+  While i < #TCP_SOCKETS
+    TcpUse(i)
+    If tcp_state <> #TCP_CLOSED
+      If tcp_state <> #TCP_LISTEN
+        ; The interface is part of the local endpoint.  Two peers can
+        ; legally use the same address and port on two attached networks,
+        ; and without this test a segment arriving over the radio can be
+        ; delivered to the cable's otherwise-identical connection.
+        If tcp_kind = NetRxKind()
+          If tcp_lip = NetRxTo()
+            If tcp_lport = NetTcpRxDstPort()
+              If tcp_rport = NetTcpRxSrcPort()
+                If tcp_rip = NetTcpRxFrom()
+                  hit = i
+                  i = #TCP_SOCKETS
+                EndIf
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If hit < 0
+    i = 0
+    While i < #TCP_SOCKETS
+      TcpUse(i)
+      If tcp_state = #TCP_LISTEN
+        If tcp_listen_port = NetTcpRxDstPort()
+          hit = i
+          i = #TCP_SOCKETS
+        EndIf
+      EndIf
+      i = i + 1
+    Wend
+  EndIf
+  TcpUse(keep)
+  ProcedureReturn hit
+EndProcedure
+
+Procedure.i tcp_InputCore()
+  Define hdr.i
+  Define hl.i
+  Define seglen.i
+  Define trim.i
+  Define n.i
+  Define acceptable.i
+  Define who.i
+  Define nx.l
+
+  hdr = NetTcpRxSeg()
+  hl = NetTcpRxHdrLen()
+  tcp_seg_hdr = hdr
+  tcp_seg_hl = hl
+  tcp_seg_seq = tcp_GetBE32(hdr + #TCP_H_SEQ)
+  tcp_seg_ack = tcp_GetBE32(hdr + #TCP_H_ACK)
+  tcp_seg_flags = PeekA(hdr + #TCP_H_FLAGS) & $FF
+  tcp_seg_wnd = tcp_GetBE16(hdr + #TCP_H_WND)
+  tcp_seg_dlen = NetTcpRxDataLen()
+  tcp_seg_data = NetTcpRxData()
+  If tcp_seg_dlen < 0
+    tcp_seg_dlen = 0
+  EndIf
+
+  ; --- whose is it? ----------------------------------------------------
+  who = tcp_Match()
+  If who < 0
+    ; RFC 9293 3.10.7.1: a segment for a connection that does not exist
+    ; gets a RST, so a closed port answers instead of black-holing. That
+    ; is what makes "connection refused" instant on the far end.
+    tcp_norst = tcp_norst + 1
+    If (tcp_seg_flags & #TCP_RST) = 0
+      seglen = tcp_seg_dlen
+      If (tcp_seg_flags & #TCP_SYN) <> 0
+        seglen = seglen + 1
+      EndIf
+      If (tcp_seg_flags & #TCP_FIN) <> 0
+        seglen = seglen + 1
+      EndIf
+      TcpSendRstFor(tcp_seg_seq, tcp_seg_ack, seglen, tcp_seg_flags & #TCP_ACK, NetTcpRxFrom(), NetTcpRxSrcPort(), NetTcpRxDstPort(), NetTcpRxMac())
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  TcpUse(who)
+
+  tcp_seg_rx = tcp_seg_rx + 1
+
+  ; ====================================================================
+  ; LISTEN - RFC 9293 3.10.7.2
+  ; ====================================================================
+  If tcp_state = #TCP_LISTEN
+    If (tcp_seg_flags & #TCP_RST) <> 0
+      ProcedureReturn 0                 ; "an incoming RST ... should be
+    EndIf                               ;  ignored"
+    If (tcp_seg_flags & #TCP_ACK) <> 0
+      ; "Any acknowledgment is bad if it arrives on a connection still in
+      ; the LISTEN state ... <SEQ=SEG.ACK><CTL=RST> and return."
+      TcpSendRstFor(tcp_seg_seq, tcp_seg_ack, 0, 1, NetTcpRxFrom(), NetTcpRxSrcPort(), NetTcpRxDstPort(), NetTcpRxMac())
+      ProcedureReturn 0
+    EndIf
+    If (tcp_seg_flags & #TCP_SYN) = 0
+      ProcedureReturn 0                 ; "any other ... should be dropped"
+    EndIf
+    ; A connection request. Latch the peer - including its MAC, which
+    ; arrived free in the frame and is why a listener needs no ARP at all.
+    tcp_kind = NetRxKind()
+    tcp_lip = NetRxTo()
+    tcp_rip = NetTcpRxFrom()
+    tcp_rport = NetTcpRxSrcPort()
+    tcp_lport = NetTcpRxDstPort()
+    n = 0
+    While n < 6
+      tcp_rmac[n] = PeekA(NetTcpRxMac() + n) & $FF
+      n = n + 1
+    Wend
+    tcp_irs = tcp_seg_seq
+    tcp_rcv_nxt = TcpSeqAdd(tcp_seg_seq, 1)   ; the SYN occupies one number
+    tcp_rcv_edge = TcpSeqAdd(tcp_rcv_nxt, #TCP_RCVBUF)
+    tcp_rcv_cnt = 0
+    tcp_rcv_tail = 0
+    tcp_iss = tcp_IssFor(tcp_lport)
+    tcp_snd_una = tcp_iss
+    tcp_snd_nxt = TcpSeqAdd(tcp_iss, 1)
+    tcp_snd_wnd = tcp_seg_wnd
+    tcp_snd_wl1 = tcp_seg_seq
+    tcp_snd_wl2 = tcp_iss
+    TcpSetSndMss(TcpParseMss(hdr, hl))
+    tcp_state = #TCP_SYN_RECEIVED
+    tcp_snd_cnt = 0
+    tcp_snd_head = 0
+    tcp_fin_sent = 0
+    tcp_fin_rcvd = 0
+    tcp_close_pending = 0
+    tcp_rtt_timing = 0
+    tcp_retries = 0
+    tcp_keep_t0 = Micros()
+    tcp_keep_sent = 0
+    ; <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>, carrying our own MSS.
+    TcpSendSeg(tcp_iss, #TCP_SYN | #TCP_ACK, 0, 1)
+    TcpArmRto()
+    ProcedureReturn 0
+  EndIf
+
+  ; ====================================================================
+  ; SYN-SENT - RFC 9293 3.10.7.3
+  ; ====================================================================
+  If tcp_state = #TCP_SYN_SENT
+    If (tcp_seg_flags & #TCP_ACK) <> 0
+      ; "If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset ... unless
+      ; the RST bit is set, in which case discard the segment and return."
+      If TcpSeqLe(tcp_seg_ack, tcp_iss) <> 0 Or TcpSeqGt(tcp_seg_ack, tcp_snd_nxt) <> 0
+        If (tcp_seg_flags & #TCP_RST) = 0
+          TcpSendRstFor(tcp_seg_seq, tcp_seg_ack, 0, 1, tcp_rip, tcp_rport, tcp_lport, @tcp_rmac[0])
+        EndIf
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    If (tcp_seg_flags & #TCP_RST) <> 0
+      ; "If the ACK was acceptable, then signal to the user 'error:
+      ; connection reset', drop the segment, enter CLOSED state."
+      ; THIS IS THE CONNECTION-REFUSED PATH: a machine with nothing
+      ; listening on the port answers a SYN with RST,ACK and this is
+      ; where that becomes a named error instead of a long wait.
+      If (tcp_seg_flags & #TCP_ACK) <> 0
+        tcp_rst_rx = tcp_rst_rx + 1
+        tcp_reset_seen = 1
+        tcp_err = #NET_TCP_E_RESET
+        TcpWipe()
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    If (tcp_seg_flags & #TCP_SYN) = 0
+      ProcedureReturn 0
+    EndIf
+    tcp_irs = tcp_seg_seq
+    tcp_rcv_nxt = TcpSeqAdd(tcp_seg_seq, 1)
+    tcp_rcv_edge = TcpSeqAdd(tcp_rcv_nxt, #TCP_RCVBUF)
+    tcp_rcv_cnt = 0
+    tcp_rcv_tail = 0
+    TcpSetSndMss(TcpParseMss(hdr, hl))
+    If (tcp_seg_flags & #TCP_ACK) <> 0
+      tcp_snd_una = tcp_seg_ack
+      tcp_snd_wnd = tcp_seg_wnd
+      tcp_snd_wl1 = tcp_seg_seq
+      tcp_snd_wl2 = tcp_seg_ack
+      ; "If SND.UNA > ISS (our SYN has been ACKed) ... enter ESTABLISHED
+      ; state, form an ACK segment <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>."
+      If TcpSeqGt(tcp_snd_una, tcp_iss) <> 0
+        tcp_state = #TCP_ESTABLISHED
+        TcpDisarmRto()
+        If tcp_rtt_timing <> 0
+          TcpRttUpdate((Micros() - tcp_rtt_t0) / 1000)
+          tcp_rtt_timing = 0
+        EndIf
+        tcp_keep_t0 = Micros()
+        tcp_keep_sent = 0
+        TcpSendAck()
+        TcpOutput()
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    ; A simultaneous open: SYN with no acceptable ACK. 3.10.7.3 says
+    ; enter SYN-RECEIVED and resend our SYN with an ACK on it. Rare on a
+    ; bench and free to be correct about.
+    tcp_state = #TCP_SYN_RECEIVED
+    tcp_snd_nxt = TcpSeqAdd(tcp_iss, 1)
+    TcpSendSeg(tcp_iss, #TCP_SYN | #TCP_ACK, 0, 1)
+    TcpArmRto()
+    ProcedureReturn 0
+  EndIf
+
+  ; ====================================================================
+  ; EVERY OTHER STATE - RFC 9293 3.10.7.4
+  ; ====================================================================
+
+  ; --- first check: the sequence number -------------------------------
+  seglen = tcp_seg_dlen
+  If (tcp_seg_flags & #TCP_SYN) <> 0
+    seglen = seglen + 1
+  EndIf
+  If (tcp_seg_flags & #TCP_FIN) <> 0
+    seglen = seglen + 1
+  EndIf
+  acceptable = TcpAcceptable(tcp_seg_seq, seglen, tcp_rcv_wnd)
+  If acceptable = 0
+    tcp_unacceptable = tcp_unacceptable + 1
+    ; "If an incoming segment is not acceptable, an acknowledgment should
+    ; be sent in reply (unless the RST bit is set, if so drop the segment
+    ; and return)". The ACK is what tells a peer whose retransmission we
+    ; have already seen that it may move on.
+    If (tcp_seg_flags & #TCP_RST) = 0
+      TcpSendAck()
+      tcp_dupacks = tcp_dupacks + 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  ; --- second check: the RST bit --------------------------------------
+  ; 3.10.7.4: in SYN-RECEIVED a RST returns to LISTEN if the connection
+  ; was passively opened; in every synchronized state it aborts.
+  ;
+  ; THIS IS THE PATH THE ROBUSTNESS REQUIREMENT RIDES ON. A machine that
+  ; kills a socket mid-transfer sends RST, and everything queued here -
+  ; unacknowledged bytes, a running retransmit timer, a half-written
+  ; receive ring - has to be released in one step without leaving the
+  ; board in a state that refuses the next connection.
+  If (tcp_seg_flags & #TCP_RST) <> 0
+    tcp_rst_rx = tcp_rst_rx + 1
+    tcp_reset_seen = 1
+    tcp_err = #NET_TCP_E_RESET
+    If tcp_state = #TCP_SYN_RECEIVED
+      If tcp_listen_port <> 0
+        TcpWipe()
+        tcp_state = #TCP_LISTEN         ; back to accepting, no reflash
+        tcp_lport = tcp_listen_port
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    TcpWipe()
+    If tcp_listen_port <> 0
+      tcp_state = #TCP_LISTEN
+      tcp_lport = tcp_listen_port
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  ; --- fourth check: the SYN bit --------------------------------------
+  ; (There is no third check here: 3.10.7.4's third is security and
+  ; precedence, which RFC 9293 itself reduces to nothing.)
+  ;
+  ; A SYN inside the window on an established connection is either a
+  ; badly confused peer or an attack. RFC 9293 3.10.7.4 as updated by RFC
+  ; 5961 4.2 says: send a "challenge ACK" and DO NOT tear the connection
+  ; down. The answer is the same either way - a challenge ACK - and that
+  ; is the point rather than an oversight. A SYN at RCV.NXT-1 is our
+  ; peer's SYN or SYN-ACK arriving again because our reply was lost, and
+  ; an ACK is what it needs. A SYN anywhere else in the window is a
+  ; confused or forged segment, and RFC 5961 4.2's whole finding is that
+  ; the answer to that is ALSO an ACK and never a RST: the pre-5961
+  ; behaviour let one forged packet tear down a live connection.
+  If (tcp_seg_flags & #TCP_SYN) <> 0
+    TcpSendAck()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- fifth check: the ACK field -------------------------------------
+  If (tcp_seg_flags & #TCP_ACK) = 0
+    ProcedureReturn 0                   ; "if the ACK bit is off, drop the
+  EndIf                                 ;  segment and return"
+
+  If tcp_state = #TCP_SYN_RECEIVED
+    ; "If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED state."
+    If TcpSeqLe(tcp_snd_una, tcp_seg_ack) <> 0 And TcpSeqLe(tcp_seg_ack, tcp_snd_nxt) <> 0
+      tcp_snd_wnd = tcp_seg_wnd
+      tcp_snd_wl1 = tcp_seg_seq
+      tcp_snd_wl2 = tcp_seg_ack
+      tcp_snd_una = tcp_seg_ack
+      tcp_state = #TCP_ESTABLISHED
+      tcp_keep_t0 = Micros()
+      tcp_keep_sent = 0
+      TcpDisarmRto()
+    Else
+      ; "If the segment acknowledgment is not acceptable, form a reset
+      ; segment <SEQ=SEG.ACK><CTL=RST> and send it."
+      TcpSendRstFor(tcp_seg_seq, tcp_seg_ack, 0, 1, tcp_rip, tcp_rport, tcp_lport, @tcp_rmac[0])
+      ProcedureReturn 0
+    EndIf
+  Else
+    If TcpAckArm() = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ; State transitions driven by the ACK, once SND.UNA has moved.
+  If tcp_state = #TCP_FIN_WAIT_1
+    If tcp_fin_sent <> 0
+      If TcpSeqGt(tcp_snd_una, tcp_fin_seq) <> 0
+        tcp_state = #TCP_FIN_WAIT_2
+      EndIf
+    EndIf
+  EndIf
+  If tcp_state = #TCP_CLOSING
+    If tcp_fin_sent <> 0
+      If TcpSeqGt(tcp_snd_una, tcp_fin_seq) <> 0
+        tcp_state = #TCP_TIME_WAIT
+        tcp_tw_t0 = Micros()
+      EndIf
+    EndIf
+  EndIf
+  If tcp_state = #TCP_LAST_ACK
+    If tcp_fin_sent <> 0
+      If TcpSeqGt(tcp_snd_una, tcp_fin_seq) <> 0
+        ; "the only thing that can arrive is an acknowledgment of our
+        ; FIN ... delete the TCB, enter the CLOSED state, and return."
+        TcpWipe()
+        If tcp_listen_port <> 0
+          tcp_state = #TCP_LISTEN       ; a listener re-arms itself, which
+          tcp_lport = tcp_listen_port   ; is what "reconnect without a
+        EndIf                           ; reflash" means in practice
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+  If tcp_state = #TCP_TIME_WAIT
+    ; "The only thing that can arrive in this state is a retransmission
+    ; of the remote FIN. Acknowledge it, and restart the 2 MSL timeout."
+    TcpSendAck()
+    tcp_tw_t0 = Micros()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- seventh check: process the segment text ------------------------
+  ; (The sixth is URG, which is not implemented - gap 4. RFC 6093 says
+  ; new applications should not use it and receivers must not break on
+  ; it; we ignore the pointer and deliver the bytes in band.)
+  If tcp_seg_dlen > 0
+    If tcp_state = #TCP_ESTABLISHED Or tcp_state = #TCP_FIN_WAIT_1 Or tcp_state = #TCP_FIN_WAIT_2
+      ; LEFT TRIM. A retransmission whose left edge is behind RCV.NXT is
+      ; the COMMON case, not an error - it is exactly what arrives after
+      ; a peer stops stalling. Trimming it and taking the remainder is
+      ; how an overlapping retransmission is absorbed; the reorder queue
+      ; below handles the DISJOINT case, a segment wholly ahead of
+      ; RCV.NXT.
+      trim = tcp_rcv_nxt - tcp_seg_seq
+      If trim < 0
+        trim = 0
+      EndIf
+      If trim >= tcp_seg_dlen
+        ; Entirely old. Acknowledge so the peer stops sending it.
+        TcpSendAck()
+        tcp_dupacks = tcp_dupacks + 1
+      ElseIf trim > 0 Or tcp_seg_seq = tcp_rcv_nxt
+        n = tcp_seg_dlen - trim
+        If n > TcpRcvFree()
+          n = TcpRcvFree()              ; right trim: never overrun the
+        EndIf                           ; ring, whatever was advertised
+        If n > 0
+          TcpRcvPush(tcp_seg_data + trim, n)
+          nx = tcp_rcv_nxt + n
+          tcp_rcv_nxt = nx
+          ; The gap in front of the queue may have just been filled.
+          ; Deliver everything now contiguous BEFORE acknowledging, so
+          ; the single ACK we send names the furthest RCV.NXT we can
+          ; reach.
+          TcpOooDrain()
+        EndIf
+        ; 3.8.6.3 permits delaying an ACK up to 500 ms. WE DO NOT DELAY.
+        ; An immediate ACK is never wrong, only sometimes wasteful, and
+        ; a delayed one is a class of stall nobody can see from a
+        ; console.
+        TcpSendAck()
+      Else
+        ; A hole: this segment sits ahead of RCV.NXT with a gap. Hold it
+        ; in the bounded reassembly queue (3.10.7.4) instead of throwing
+        ; it away, so that when the missing segment arrives the whole
+        ; tail is delivered at once rather than re-fetched a segment at a
+        ; time. A duplicate ACK is sent whether or not it could be
+        ; queued: it names RCV.NXT unchanged, and the third such ACK is
+        ; what makes a conformant peer fast-retransmit (RFC 5681 3.2)
+        ; instead of waiting a full RTO. A segment the bounded queue
+        ; cannot hold falls back to the old drop-and-retransmit path with
+        ; no loss of correctness.
+        If TcpOooInsert(tcp_seg_data, tcp_seg_seq, tcp_seg_dlen) = 0
+          tcp_ooo_drop = tcp_ooo_drop + 1
+        EndIf
+        TcpSendAck()
+        tcp_dupacks = tcp_dupacks + 1
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+
+  ; --- eighth check: the FIN bit --------------------------------------
+  ; "If the FIN bit is set, signal the user 'connection closing' ...
+  ; advance RCV.NXT over the FIN, and send an acknowledgment for the
+  ; FIN."  The FIN is only honoured once RCV.NXT has reached it - a FIN
+  ; riding on a segment whose data we dropped as out-of-order must NOT
+  ; close the connection early, or the tail of the transfer is lost and
+  ; the loss looks like the sender's fault.
+  If (tcp_seg_flags & #TCP_FIN) <> 0
+    If TcpSeqAdd(tcp_seg_seq, tcp_seg_dlen) = tcp_rcv_nxt
+      nx = tcp_rcv_nxt + 1
+      tcp_rcv_nxt = nx
+      tcp_fin_rcvd = 1
+      TcpSendAck()
+      If tcp_state = #TCP_ESTABLISHED
+        tcp_state = #TCP_CLOSE_WAIT
+      ElseIf tcp_state = #TCP_SYN_RECEIVED
+        tcp_state = #TCP_CLOSE_WAIT
+      ElseIf tcp_state = #TCP_FIN_WAIT_1
+        If tcp_fin_sent <> 0
+          If TcpSeqGt(tcp_snd_una, tcp_fin_seq) <> 0
+            tcp_state = #TCP_TIME_WAIT
+            tcp_tw_t0 = Micros()
+          Else
+            tcp_state = #TCP_CLOSING
+          EndIf
+        Else
+          tcp_state = #TCP_CLOSING
+        EndIf
+      ElseIf tcp_state = #TCP_FIN_WAIT_2
+        tcp_state = #TCP_TIME_WAIT
+        tcp_tw_t0 = Micros()
+      EndIf
+    EndIf
+  EndIf
+
+  TcpOutput()
+  ProcedureReturn 0
+EndProcedure
+
+; Dispatching an input segment is table-wide work, not a request to
+; change the socket selected by an application.  tcp_InputCore selects
+; the matching socket while it handles the segment; this public boundary
+; restores the caller's selection so a packet for another connection can
+; never redirect the next TcpRead, TcpWrite or TcpClose.
+Procedure.i TcpInput()
+  Define keep.i
+  Define rc.i
+  keep = tcp_s
+  rc = tcp_InputCore()
+  TcpUse(keep)
+  ProcedureReturn rc
+EndProcedure
+
+; ======================================================================
+; TIMERS - RFC 9293 3.10.8, "Timeouts", and RFC 6298 5.4-5.6.
+; ======================================================================
+; Runs for the CURRENT socket. TcpPoll walks the table and calls it for
+; each in turn; nothing else should call it, because a timer that fires
+; for whichever socket happened to be selected is worse than no timer.
+Procedure.i TcpTimers()
+  Define now.i
+  Define elapsed.i
+  Define n.i
+  Define lim.i
+  Define nx.l
+
+  now = Micros()
+
+  ; --- TIME-WAIT ------------------------------------------------------
+  If tcp_state = #TCP_TIME_WAIT
+    If (now - tcp_tw_t0) >= (#TCP_TIMEWAIT_MS * 1000)
+      TcpWipe()
+      If tcp_listen_port <> 0
+        tcp_state = #TCP_LISTEN
+        tcp_lport = tcp_listen_port
+      EndIf
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  If tcp_state = #TCP_CLOSED
+    ProcedureReturn 0
+  EndIf
+  If tcp_state = #TCP_LISTEN
+    ProcedureReturn 0
+  EndIf
+
+  ; --- the keepalive, RFC 9293 3.8.4 and RFC 1122 4.2.3.6 -------------
+  ; OFF unless the application asked (MUST-24), which is what
+  ; tcp_keep_ms = 0 means and is the default. This is the gap the Pico's
+  ; list leaves open, closed here only because Micros() is 64 bits wide
+  ; on this part and an idle time measured in hours can be expressed.
+  ;
+  ; A KEEPALIVE PROBE IS A DELIBERATELY WRONG SEGMENT. RFC 1122 4.2.3.6:
+  ; "it SHOULD be sent with no data ... and SEG.SEQ = SND.NXT-1". A peer
+  ; answers it with an ACK naming the byte it has already had, which is
+  ; the whole trick - it costs nothing and it proves the far end and
+  ; every NAT between here and it are still there. Sending SND.NXT
+  ; instead would be an ordinary bare ACK, which some middleboxes do not
+  ; count as traffic at all.
+  ;
+  ; IT DOES NOT RUN WHILE THERE IS ANYTHING IN FLIGHT. The retransmit
+  ; timer already proves liveness in that case, and two mechanisms
+  ; declaring the same connection dead at different times is how a
+  ; half-second of jitter becomes an unexplained drop.
+  If tcp_keep_ms > 0
+    If tcp_state = #TCP_ESTABLISHED Or tcp_state = #TCP_CLOSE_WAIT
+      If tcp_snd_nxt = tcp_snd_una
+        elapsed = (now - tcp_keep_t0) / 1000
+        n = tcp_keep_ms
+        If tcp_keep_sent > 0
+          n = #TCP_KEEP_INTVL_MS
+        EndIf
+        If elapsed >= n
+          If tcp_keep_sent >= #TCP_KEEP_PROBES
+            tcp_err = #NET_TCP_E_TIMEOUT
+            TcpWipe()
+            If tcp_listen_port <> 0
+              tcp_state = #TCP_LISTEN
+              tcp_lport = tcp_listen_port
+            EndIf
+            ProcedureReturn 0
+          EndIf
+          TcpSendSeg(TcpSeqAdd(tcp_snd_nxt, -1), #TCP_ACK, 0, 0)
+          tcp_keep_sent = tcp_keep_sent + 1
+          tcp_keeps = tcp_keeps + 1
+          tcp_keep_t0 = now
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; --- the zero-window persist timer, RFC 9293 3.8.6.1 ----------------
+  ; 3.8.6.1, "Zero-Window Probing": "The sending TCP peer must regularly
+  ; transmit at least one octet of new data (if available), or retransmit
+  ; to the receiving TCP peer even if the send window is zero, in order
+  ; to 'probe' the window." MUST-36 makes it mandatory. The schedule is
+  ; SHLD-29 - the first probe after "a zero window has existed for the
+  ; retransmission timeout period" - and SHLD-30, "increase exponentially
+  ; the interval between successive probes". Both are implemented below.
+  ;
+  ; THE DEADLOCK IS THE WHOLE POINT. If the window-update ACK that
+  ; reopens a zero window is lost, the receiver believes it has told us
+  ; to carry on and we believe we must wait; both sides then wait
+  ; forever, with no retransmission to break the tie because there is
+  ; nothing outstanding to retransmit. A probe is the only way out and
+  ; it is why "the window is zero, so there is nothing to do" is wrong.
+  If tcp_snd_wnd = 0
+    If tcp_snd_cnt > (tcp_snd_nxt - tcp_snd_una)
+      If tcp_persist_armed = 0
+        tcp_persist_armed = 1
+        tcp_persist_t0 = now
+        tcp_persist_ms = tcp_rto
+        If tcp_persist_ms < #TCP_PERSIST_MIN_MS
+          tcp_persist_ms = #TCP_PERSIST_MIN_MS
+        EndIf
+      ElseIf (now - tcp_persist_t0) >= (tcp_persist_ms * 1000)
+        ; One byte, deliberately outside the advertised window. The peer
+        ; answers with either an ACK carrying a real window or an ACK
+        ; repeating zero; either breaks the deadlock.
+        ;
+        ; SND.NXT ADVANCES OVER THE PROBE BYTE and the retransmit timer
+        ; is armed behind it. The alternative - probe without advancing -
+        ; leaves the peer free to acknowledge a byte that SND.NXT says
+        ; was never sent, and SND.UNA then passes SND.NXT, which every
+        ; comparison in this file assumes cannot happen. If the probe is
+        ; discarded instead, the RTO retransmits it from SND.UNA, which
+        ; is the same one byte again: correct either way.
+        If TcpSendSeg(tcp_snd_nxt, #TCP_ACK, 1, 0) = #NET_TCP_OK
+          nx = tcp_snd_nxt + 1
+          tcp_snd_nxt = nx
+          If tcp_rto_armed = 0
+            TcpArmRto()
+          EndIf
+        EndIf
+        tcp_probes = tcp_probes + 1
+        tcp_persist_t0 = now
+        tcp_persist_ms = tcp_persist_ms * 2
+        If tcp_persist_ms > #TCP_PERSIST_MAX_MS
+          tcp_persist_ms = #TCP_PERSIST_MAX_MS
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; --- the retransmission timer ---------------------------------------
+  If tcp_rto_armed = 0
+    ProcedureReturn 0
+  EndIf
+  elapsed = (now - tcp_rto_t0) / 1000
+  If elapsed < tcp_rto
+    ProcedureReturn 0
+  EndIf
+
+  lim = #TCP_MAX_RETRIES
+  If tcp_state = #TCP_SYN_SENT Or tcp_state = #TCP_SYN_RECEIVED
+    lim = #TCP_SYN_RETRIES
+  EndIf
+  If tcp_retries >= lim
+    ; RFC 9293 3.8.3: after R2, "close the connection". A dead peer must
+    ; produce a NAMED failure, because the alternative is a board that
+    ; looks busy forever and a bench that cannot tell it from a hang.
+    tcp_err = #NET_TCP_E_TIMEOUT
+    TcpWipe()
+    If tcp_listen_port <> 0
+      tcp_state = #TCP_LISTEN
+      tcp_lport = tcp_listen_port
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  tcp_retries = tcp_retries + 1
+  tcp_retrans = tcp_retrans + 1
+  ; RFC 6298 5.5: "the host MUST set RTO <- RTO * 2 ('back off the
+  ; timer')". 5.6 restarts it. And Karn (3.1): any measurement in flight
+  ; is now ambiguous and must be abandoned - THIS ONE LINE is the
+  ; difference between an RTO that recovers and one that collapses.
+  tcp_rtt_timing = 0
+  tcp_rto = tcp_rto * 2
+  TcpClampRto()
+  tcp_rto_t0 = now
+
+  If tcp_state = #TCP_SYN_SENT
+    TcpSendSeg(tcp_iss, #TCP_SYN, 0, 1)
+    ProcedureReturn 0
+  EndIf
+  If tcp_state = #TCP_SYN_RECEIVED
+    TcpSendSeg(tcp_iss, #TCP_SYN | #TCP_ACK, 0, 1)
+    ProcedureReturn 0
+  EndIf
+
+  ; RFC 6298 5.4: "retransmit the earliest segment that has not been
+  ; acknowledged". Not the newest, not everything - the oldest, once.
+  ; Whether the rest follows is decided by the next ACK.
+  ;
+  ; SND.NXT - SND.UNA counts everything in flight INCLUDING a FIN, which
+  ; occupies a sequence number but is not a byte in the ring; tcp_snd_cnt
+  ; counts exactly the data bytes from SND.UNA on. The smaller of the two
+  ; is therefore the data in flight, with no special case for the FIN.
+  n = tcp_snd_nxt - tcp_snd_una
+  If n > tcp_snd_cnt
+    n = tcp_snd_cnt
+  EndIf
+  If n > tcp_snd_mss
+    n = tcp_snd_mss
+  EndIf
+  If n > TcpTxCap()
+    n = TcpTxCap()
+  EndIf
+  If n < 0
+    n = 0
+  EndIf
+  If n > 0
+    tcp_drop_hold = 1                   ; a retransmission is never dropped
+    TcpSendSeg(tcp_snd_una, #TCP_ACK, n, 0)
+    tcp_drop_hold = 0
+    ProcedureReturn 0
+  EndIf
+  If tcp_fin_sent <> 0
+    If TcpSeqLe(tcp_snd_una, tcp_fin_seq) <> 0
+      TcpSendSeg(tcp_fin_seq, #TCP_ACK | #TCP_FIN, 0, 0)
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ; Nothing outstanding after all. Stop the timer rather than spin.
+  TcpDisarmRto()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+; THE APPLICATION INTERFACE - RFC 9293 3.9.1 / 3.10.1-3.10.4
+; ======================================================================
+
+Procedure TcpInit()
+  Define i.i
+  Define n.i
+  tcp_s = 0
+  tcp_rcvBase = 0
+  tcp_sndBase = 0
+  tcp_oooBase = 0
+  ; Wipe every slot, current one last so the working globals end up
+  ; describing socket 0 rather than socket #TCP_SOCKETS-1.
+  i = #TCP_SOCKETS - 1
+  While i >= 0
+    tcp_s = i
+    tcp_rcvBase = i * #TCP_RCVBUF
+    tcp_sndBase = i * #TCP_SNDBUF
+    tcp_oooBase = i * #TCP_OOO_SLOTS * #TCP_OOO_BUFSZ
+    TcpWipe()
+    tcp_inuse = 0
+    tcp_listen_port = 0
+    tcp_lport = 0
+    tcp_rport = 0
+    tcp_rip = 0
+    tcp_kind = 0
+    tcp_lip = 0
+    tcp_err = 0
+    tcp_reset_seen = 0
+    tcp_snd_mss = #TCP_MSS_DEFAULT
+    tcp_rto = #TCP_RTO_INIT_MS
+    tcp_srtt8 = 0
+    tcp_rttvar4 = 0
+    tcp_rtt_valid = 0
+    tcp_rtt_last = 0
+    tcp_rcv_wnd = #TCP_RCVBUF
+    tcp_rcv_edge = 0
+    tcp_keep_ms = 0
+    tcp_keep_t0 = 0
+    tcp_keep_sent = 0
+    n = 0
+    While n < 8
+      tcp_rmac[n] = 0
+      n = n + 1
+    Wend
+    tcp_Save(i)
+    i = i - 1
+  Wend
+  tcp_s = 0
+  tcp_rcvBase = 0
+  tcp_sndBase = 0
+  tcp_oooBase = 0
+  tcp_Load(0)
+
+  ; The ephemeral port. RFC 6335 4.2 names 49152-65535 the Dynamic
+  ; range; a fresh one per connection is what keeps a TIME-WAIT from the
+  ; last connection out of the way of the next - see TcpConnect. ONE
+  ; counter serves the whole table so two sockets cannot collide.
+  tcp_ephemeral = 49152 + (Micros() & $1FFF)
+  tcp_seg_rx = 0
+  tcp_seg_tx = 0
+  tcp_retrans = 0
+  tcp_dupacks = 0
+  tcp_ooo_drop = 0
+  tcp_ooo_queued = 0
+  tcp_ooo_deliver = 0
+  tcp_unacceptable = 0
+  tcp_rst_rx = 0
+  tcp_rst_tx = 0
+  tcp_probes = 0
+  tcp_keeps = 0
+  tcp_bytes_tx = 0
+  tcp_bytes_rx = 0
+  tcp_txfail = 0
+  tcp_zerowin = 0
+  tcp_norst = 0
+  tcp_wndup = 0
+  tcp_drop_every = 0                    ; OFF. The instrument arms it, and
+  tcp_drop_n = 0                        ; prints in as many words that it
+  tcp_dropped = 0                       ; has, so no reading of a bench log
+  tcp_drop_hold = 0                     ; can mistake an injected loss for
+EndProcedure                            ; a real one
+
+Procedure.i TcpState()
+  ProcedureReturn tcp_state
+EndProcedure
+
+; 1 exactly while the application may send. CLOSE-WAIT is deliberately
+; excluded: the peer has said it will send no more, and RFC 9293 3.6
+; allows us to keep sending, but a caller that treats CLOSE-WAIT as open
+; will wait forever for data that can never come. TcpAvailable still
+; returns whatever is left in the ring, which is the half that matters.
+Procedure.i TcpConnected()
+  If tcp_state = #TCP_ESTABLISHED
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i TcpAvailable()
+  ProcedureReturn tcp_rcv_cnt
+EndProcedure
+
+Procedure.i TcpSendSpace()
+  ProcedureReturn #TCP_SNDBUF - tcp_snd_cnt
+EndProcedure
+
+Procedure.i TcpError()
+  ProcedureReturn tcp_err
+EndProcedure
+
+Procedure.i TcpWasReset()
+  ProcedureReturn tcp_reset_seen
+EndProcedure
+
+Procedure.i TcpPeerIp()
+  ProcedureReturn tcp_rip
+EndProcedure
+
+Procedure.i TcpPeerPort()
+  ProcedureReturn tcp_rport
+EndProcedure
+
+Procedure.i TcpLocalPort()
+  ProcedureReturn tcp_lport
+EndProcedure
+
+Procedure.i TcpLocalIp()
+  ProcedureReturn tcp_lip
+EndProcedure
+
+Procedure.i TcpLinkKind()
+  ProcedureReturn tcp_kind
+EndProcedure
+
+; Keepalive, in SECONDS of idle time. 0 turns it off and 0 is the
+; default (gap 6, and RFC 9293 MUST-24). Applies to the CURRENT socket.
+Procedure.i TcpKeepalive(seconds.i)
+  If seconds < 0
+    ProcedureReturn #NET_TCP_E_ARG
+  EndIf
+  tcp_keep_ms = seconds * 1000
+  tcp_keep_t0 = Micros()
+  tcp_keep_sent = 0
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+Procedure.i TcpKeepaliveMs()
+  ProcedureReturn tcp_keep_ms
+EndProcedure
+
+; The loss injector. IT IS TABLE-WIDE AND NOT PER-SOCKET, and that is
+; worth stating because the four variables sit among per-socket ones:
+; tcp_drop_every, tcp_drop_n, tcp_dropped and tcp_drop_hold have no
+; #TCP_SV_* index and appear in neither tcp_Load nor tcp_Save, so arming
+; it while socket 0 is selected drops data segments on EVERY socket.
+; That is the right scope for a bench instrument - the counters it feeds
+; are table-wide too - but a bench that armed it on one connection and
+; then wondered why another stalled would have every right to be cross.
+; It MUST be zero in anything shipped; TcpInit sets it to zero and the
+; command that arms it says so in capitals for as long as it is on.
+Procedure.i TcpDropEvery(n.i)
+  If n < 0
+    ProcedureReturn #NET_TCP_E_ARG
+  EndIf
+  tcp_drop_every = n
+  tcp_drop_n = 0
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+; TcpAlloc - the first socket that is not in use, or -1.
+;
+; A SOCKET IN TIME-WAIT IS NOT FREE even though its state is CLOSED-ish:
+; 3.6 MUST-13 keeps it for 2*MSL so a delayed duplicate from the old
+; connection cannot be mistaken for a new one. tcp_inuse is what carries
+; that, and it is cleared only when the socket genuinely leaves
+; TIME-WAIT or is aborted.
+Procedure.i TcpAlloc()
+  Define i.i
+  Define keep.i
+  Define hit.i
+  keep = tcp_s
+  hit = -1
+  i = 0
+  While i < #TCP_SOCKETS
+    TcpUse(i)
+    If tcp_inuse = 0
+      hit = i
+      i = #TCP_SOCKETS
+    EndIf
+    i = i + 1
+  Wend
+  If hit < 0
+    TcpUse(keep)
+  EndIf
+  ProcedureReturn hit
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TcpConnect - RFC 9293 3.10.1, an active OPEN, on the CURRENT socket.
+;
+; Non-blocking: it sends the SYN and returns. The caller polls
+; TcpState() until ESTABLISHED, or until it goes back to CLOSED with
+; TcpError() set. A blocking connect inside a monitor's command loop
+; would put an unbounded wait upstream of every escape hatch there is.
+;
+; THE NEXT HOP MUST BE RESOLVED FIRST and that is why this can return
+; #NET_TCP_E_ARP: unlike a UDP peer that has already spoken to us, a TCP
+; server has said nothing, so its hardware address has to be asked for.
+; net.pi4 does no I/O, so the ARP REQUEST IS STAGED HERE AND SENT HERE
+; and the caller calls again; NetArpLookup answers the moment the reply
+; has been pumped in.
+;
+; A FRESH LOCAL PORT EVERY TIME. 3.10.1 would refuse an OPEN while a
+; socket sits in TIME-WAIT, and TIME-WAIT is four minutes; a bench that
+; must reconnect immediately cannot wait that out. The escape is the one
+; every real client uses: a NEW ephemeral port makes a DIFFERENT
+; connection, whose 4-tuple no old duplicate can match, which is the
+; only thing TIME-WAIT was protecting.
+; ----------------------------------------------------------------------
+Procedure.i TcpConnect(kind.i, ip.i, port.i)
+  Define i.i
+  Define hop.i
+  Define src.i
+  If NetConfigured(kind) = 0
+    tcp_err = #NET_TCP_E_NOADDR
+    ProcedureReturn #NET_TCP_E_NOADDR
+  EndIf
+  If HwLinkReady(kind) = 0
+    tcp_err = #NET_TCP_E_NOLINK
+    ProcedureReturn #NET_TCP_E_NOLINK
+  EndIf
+  If port < 1 Or port > 65535
+    ProcedureReturn #NET_TCP_E_PORT
+  EndIf
+  If ip = 0
+    ProcedureReturn #NET_TCP_E_ARG
+  EndIf
+  src = NetSrcFor(kind, ip)
+  If src = 0
+    tcp_err = #NET_TCP_E_NOADDR
+    ProcedureReturn #NET_TCP_E_NOADDR
+  EndIf
+  If tcp_state <> #TCP_CLOSED
+    If tcp_state <> #TCP_TIME_WAIT
+      ProcedureReturn #NET_TCP_E_BUSY
+    EndIf
+  EndIf
+
+  hop = NetNextHop(kind, ip)
+  If hop = 0
+    tcp_err = #NET_TCP_E_ROUTE
+    ProcedureReturn #NET_TCP_E_ROUTE
+  EndIf
+  If NetArpLookup(kind, hop, @tcp_rmac[0]) <> 1
+    ; Not known yet. Stage a request and put it on the link; the caller
+    ; pumps and calls again. This is the one place in this file that
+    ; sends something that is not a TCP segment, and it is here rather
+    ; than in the caller because the caller would have to know about
+    ; NetNextHop to do it - which is the routing decision net.pi4's
+    ; header calls the most commonly mis-implemented line in a first IP
+    ; stack.
+    If NetArpRequest(kind, hop) <> 0
+      LinkTxStagedOn(kind)
+    EndIf
+    ProcedureReturn #NET_TCP_E_ARP
+  EndIf
+
+  TcpWipe()
+  tcp_inuse = 1
+  tcp_err = 0
+  tcp_reset_seen = 0
+  tcp_kind = kind
+  tcp_lip = src
+  tcp_rip = ip
+  tcp_rport = port
+  tcp_ephemeral = tcp_ephemeral + 1
+  If tcp_ephemeral > 65535
+    tcp_ephemeral = 49152
+  EndIf
+  tcp_lport = tcp_ephemeral
+  tcp_iss = tcp_IssFor(tcp_lport)
+  tcp_snd_una = tcp_iss
+  tcp_snd_nxt = TcpSeqAdd(tcp_iss, 1)
+  tcp_snd_wnd = 0
+  tcp_snd_wl1 = 0
+  tcp_snd_wl2 = 0
+  tcp_snd_mss = #TCP_MSS_DEFAULT
+  tcp_rcv_nxt = 0
+  tcp_rcv_edge = 0
+  tcp_rcv_wnd = #TCP_RCVBUF
+  tcp_rto = #TCP_RTO_INIT_MS
+  tcp_keep_t0 = Micros()
+  tcp_keep_sent = 0
+  tcp_state = #TCP_SYN_SENT
+  ; <SEQ=ISS><CTL=SYN>, with our MSS on it.
+  TcpSendSeg(tcp_iss, #TCP_SYN, 0, 1)
+  TcpArmRto()
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+; TcpListen - RFC 9293 3.10.1, a passive OPEN, on the CURRENT socket.
+; A SYN for a port nobody is listening on gets a RST from TcpInput's
+; table walk, which is a refusal rather than a silence.
+Procedure.i TcpListen(port.i)
+  Define i.i
+  Define keep.i
+  If port < 1 Or port > 65535
+    ProcedureReturn #NET_TCP_E_PORT
+  EndIf
+  If tcp_state <> #TCP_CLOSED
+    If tcp_state <> #TCP_LISTEN
+      ProcedureReturn #NET_TCP_E_BUSY
+    EndIf
+  EndIf
+
+  ; A passive port is wildcard across every local address and interface.
+  ; Two wildcard owners for the same port would make acceptance depend on
+  ; socket-table order, so refuse the second even while the first has an
+  ; accepted connection and is waiting to re-arm.
+  keep = tcp_s
+  i = 0
+  While i < #TCP_SOCKETS
+    If i <> keep
+      TcpUse(i)
+      If tcp_inuse <> 0 And tcp_listen_port = port
+        TcpUse(keep)
+        ProcedureReturn #NET_TCP_E_BUSY
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  TcpUse(keep)
+
+  TcpWipe()
+  tcp_inuse = 1
+  tcp_err = 0
+  tcp_reset_seen = 0
+  tcp_listen_port = port
+  tcp_lport = port
+  tcp_kind = #HW_LINK_NONE
+  tcp_lip = 0
+  tcp_state = #TCP_LISTEN
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TcpUnlisten - TAKE THE PASSIVE OPEN AWAY. New 2026-09-05.
+;
+; A LISTENER RE-ARMS ITSELF ON CLOSE, BY DESIGN. tcp_listen_port is
+; consulted in nine places in this file and every one of them puts the
+; socket back into LISTEN when a connection over it ends, which is
+; exactly what a server wants and exactly what a ONE-SHOT receiver must
+; not have: Anvil/Core/netrecv.pi4 opens a port to accept one image and
+; a bootloader that goes on accepting images on that port for the rest of
+; its uptime is a different program from the one that was asked for.
+;
+; So the passive open is a thing that can be REVOKED, not only a thing
+; that can be created. Nothing else in this file changes: a caller that
+; never calls this sees exactly the behaviour it always had.
+;
+; IT DOES NOT ABORT A LIVE CONNECTION. A socket in ESTABLISHED, in a
+; close handshake or in TIME-WAIT keeps running and simply does not go
+; back to LISTEN when it finishes - TcpPoll's release path already reads
+; tcp_listen_port to decide that. Only a socket sitting in LISTEN with
+; nothing on it is released here and now, because there is nothing to
+; wait for. A caller that wants the connection gone as well calls
+; TcpAbort, and then this, in that order.
+; ----------------------------------------------------------------------
+Procedure.i TcpUnlisten()
+  tcp_listen_port = 0
+  If tcp_state = #TCP_LISTEN
+    TcpWipe()
+    tcp_inuse = 0
+  EndIf
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TcpSend - RFC 9293 3.10.2. Copies into the send ring and returns HOW
+; MANY BYTES IT TOOK, which may be fewer than asked and may be zero.
+;
+; A SHORT RETURN IS NOT AN ERROR AND MUST NOT BE TREATED AS ONE. The
+; ring is four kilobytes and the window is the peer's to set; a caller
+; pushing more loops on the return value. Silently accepting bytes there
+; is no room for is how a transfer arrives at the far end with a hole in
+; the middle and no error anywhere - the exact silent-wrong-answer shape
+; this project exists to refuse.
+; ----------------------------------------------------------------------
+Procedure.i TcpSend(src.i, len.i)
+  Define n.i
+  Define i.i
+  If src = 0 Or len < 0
+    ProcedureReturn 0
+  EndIf
+  If tcp_state <> #TCP_ESTABLISHED
+    If tcp_state <> #TCP_CLOSE_WAIT
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  If tcp_close_pending <> 0
+    ProcedureReturn 0                   ; a FIN is already queued; nothing
+  EndIf                                 ; may be appended behind it
+  n = len
+  If n > TcpSendSpace()
+    n = TcpSendSpace()
+  EndIf
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < n
+    tcp_snd[tcp_sndBase + tcp_snd_head] = PeekA(src + i) & $FF
+    tcp_snd_head = (tcp_snd_head + 1) & #TCP_SNDMASK
+    i = i + 1
+  Wend
+  tcp_snd_cnt = tcp_snd_cnt + n
+  TcpOutput()
+  ProcedureReturn n
+EndProcedure
+
+; TcpRead - RFC 9293 3.10.3. Takes up to maxlen bytes out of the receive
+; ring.
+;
+; ======================================================================
+; READING RE-OPENS THE WINDOW, AND THE PEER HAS TO BE TOLD - RFC 1122
+; 4.2.2.17 and RFC 9293 3.8.6.2.2. THIS IS THE HALF THAT WAS MISSING.
+; ======================================================================
+; This comment used to say the opposite, in as many words: "the window
+; is recomputed on the next segment we send rather than eagerly here: a
+; window update with no ACK to carry it is a segment for its own sake."
+; That sentence is wrong, and it cost this board a factor of four
+; hundred on a gigabit cable on 2026-09-09.
+;
+; A RECEIVER THAT REOPENS ITS WINDOW AND DOES NOT SAY SO HANDS THE RATE
+; TO THE SENDER'S PERSIST TIMER. When the ring fills, the advertised
+; window goes to zero and the peer stops - correctly. The application
+; then drains the ring, so the edge could move again; but nothing this
+; board sends is due, because there is nothing left to acknowledge and
+; no data of our own to carry it. The peer is not permitted to guess: it
+; waits out its persist timer and probes. Measured on this bench,
+; 2026-09-09, a 256 KB `net recv` over the cable: FOUR stalls of
+; 5,010 / 5,003 / 5,001 / 5,006 milliseconds, one per window fill, with
+; the board answering 119 of 120 pings under five milliseconds THROUGH
+; them - the board was never busy, it was never asked. 12.8 KB/s on a
+; link that had measured 2,401 KB/s.
+;
+; The field sends the update from exactly here. lwIP's tcp_recved() sets
+; TF_ACK_NOW when the freed space passes its threshold; BSD's
+; tcp_cleanup_rbuf does the same when the window would grow by two MSS.
+; Both put it at the moment the APPLICATION consumed the bytes, because
+; that is the only moment a receiver learns something the sender cannot
+; work out for itself.
+;
+; THE THRESHOLD IS NOT A NEW NUMBER. TcpAdvertiseWnd already refuses to
+; move the right edge for less than min(RCVBUF/2, Eff.snd.MSS) - that IS
+; 3.8.6.2.2's test, and it is the only receiver-side silly-window rule
+; this file has. So the update is sent when, and only when, calling it
+; actually MOVED the edge. One threshold, in one place; inventing a
+; second one here is how the two drift apart.
+;
+; It is charged to tcp_wndup so the board can say it did this, because
+; the failure it fixes is invisible from both ends: no drops, no
+; retransmissions, no zero windows seen, nothing in any counter, and a
+; transfer that simply takes four hundred times as long.
+;
+; TWO RUNS AT MOST, the second only when the read wraps the end of the
+; ring - the same shape as TcpRcvPush and for the same measured reason.
+; See tcp_Move.
+;
+; tcp_rcv_tail IS ADVANCED ONCE PER RUN, not once per octet, and it is
+; still masked every time, so the ring index cannot walk off the end even
+; if a caller asks for exactly #TCP_RCVBUF octets in one call.
+Procedure.i TcpRead(dst.i, maxlen.i)
+  Define n.i
+  Define d.i
+  Define run.i
+  Define left.i
+  Define edge.l
+  If dst = 0 Or maxlen < 0
+    ProcedureReturn 0
+  EndIf
+  n = tcp_rcv_cnt
+  If n > maxlen
+    n = maxlen
+  EndIf
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  d = dst
+  left = n
+  While left > 0
+    run = #TCP_RCVBUF - tcp_rcv_tail
+    If run > left
+      run = left
+    EndIf
+    tcp_Move(d, @tcp_rcv[0] + tcp_rcvBase + tcp_rcv_tail, run)
+    d = d + run
+    tcp_rcv_tail = (tcp_rcv_tail + run) & #TCP_RCVMASK
+    left = left - run
+  Wend
+  tcp_rcv_cnt = tcp_rcv_cnt - n
+
+  ; THE WINDOW UPDATE. Only where the peer may still send data - in
+  ; CLOSE-WAIT it has sent its FIN and a larger window is an offer of
+  ; something it will never take, and in every earlier or later state
+  ; there is no established window to widen.
+  If tcp_state = #TCP_ESTABLISHED Or tcp_state = #TCP_FIN_WAIT_1 Or tcp_state = #TCP_FIN_WAIT_2
+    edge = tcp_rcv_edge
+    TcpAdvertiseWnd()
+    If tcp_rcv_edge <> edge
+      tcp_wndup = tcp_wndup + 1
+      TcpSendAck()
+    EndIf
+  EndIf
+
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TcpClose - RFC 9293 3.10.4, an orderly close.
+;
+; "Queue this until all preceding SENDs have been segmentized, then form
+; a FIN segment and send it." The FIN is therefore QUEUED, not sent
+; here: TcpOutput puts it on the last segment of buffered data, or alone
+; once the buffer has drained. Sending it immediately would place it
+; BEFORE data the application has already handed over, and the peer
+; would then be told the conversation was over while bytes it had
+; accepted were still in our ring.
+; ----------------------------------------------------------------------
+Procedure.i TcpClose()
+  If tcp_state = #TCP_LISTEN
+    TcpWipe()
+    tcp_listen_port = 0
+    tcp_inuse = 0
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  If tcp_state = #TCP_SYN_SENT
+    TcpWipe()                           ; "delete the TCB and return"
+    tcp_inuse = 0
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  If tcp_state = #TCP_ESTABLISHED
+    tcp_close_pending = 1
+    TcpOutput()
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  If tcp_state = #TCP_CLOSE_WAIT
+    tcp_close_pending = 1
+    TcpOutput()
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  If tcp_state = #TCP_SYN_RECEIVED
+    tcp_close_pending = 1
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  ProcedureReturn #NET_TCP_E_STATE      ; already closing. 3.10.4:
+                                        ; "error: connection closing"
+EndProcedure
+
+; TcpAbort - RFC 9293 3.10.5, ABORT. "Send a reset segment
+; <SEQ=SND.NXT><CTL=RST> ... and delete the TCB." The hard exit.
+Procedure.i TcpAbort()
+  If tcp_state = #TCP_CLOSED
+    tcp_inuse = 0
+    ProcedureReturn #NET_TCP_OK
+  EndIf
+  If tcp_state <> #TCP_LISTEN
+    If tcp_state <> #TCP_SYN_SENT
+      TcpSendSeg(tcp_snd_nxt, #TCP_RST, 0, 0)
+      tcp_rst_tx = tcp_rst_tx + 1
+    EndIf
+  EndIf
+  TcpWipe()
+  If tcp_listen_port <> 0
+    tcp_state = #TCP_LISTEN
+    tcp_lport = tcp_listen_port
+  Else
+    tcp_inuse = 0
+  EndIf
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+; TcpPoll(slice_ms) - the engine. Call it in every loop the program can
+; sit in, exactly as UartAuxFlush() and SafetyPet() are called, and for
+; the same reason: a protocol that only runs when the application
+; remembers to run it is a protocol that stalls whenever the
+; application is busy.
+;
+; Returns the state of the socket that was current when it was called,
+; so a caller's loop is `If TcpPoll(5) = #TCP_ESTABLISHED` with no
+; second call needed.
+;
+; ORDER: timers for every socket, then output for every socket, then ONE
+; received segment. Timers first so a retransmission is not delayed by a
+; poll slice that finds nothing; output before input so data handed over
+; since the last call is on the wire before we block; and EXACTLY ONE
+; SEGMENT PER CALL because the link has one receive buffer and
+; processing it to completion before the next pump is that buffer's
+; whole safety argument. The Pico's file says the same thing in the same
+; place, and the reason has not changed just because there are now four
+; sockets.
+;
+; TIME-WAIT RELEASES THE SOCKET, and that is done here rather than in
+; TcpTimers so there is exactly one place that clears tcp_inuse on a
+; timer.
+; ----------------------------------------------------------------------
+Procedure.i TcpPoll(slice_ms.i)
+  Define keep.i
+  Define i.i
+  Define n.i
+  Define took.i
+  Define wait.i
+  keep = tcp_s
+
+  i = 0
+  While i < #TCP_SOCKETS
+    TcpUse(i)
+    If tcp_inuse <> 0
+      ; An established endpoint owns the exact local address the peer
+      ; connected to. If DHCP expiry or explicit reconfiguration removes
+      ; it, the connection cannot migrate to another address/interface.
+      ; End it deterministically; a server socket becomes wildcard again.
+      If tcp_state <> #TCP_LISTEN And tcp_lip <> 0 And NetIfHoldsIp(tcp_kind, tcp_lip) = 0
+        tcp_err = #NET_TCP_E_NOADDR
+        TcpWipe()
+        If tcp_listen_port <> 0
+          tcp_state = #TCP_LISTEN
+          tcp_lport = tcp_listen_port
+        Else
+          tcp_inuse = 0
+        EndIf
+      Else
+        TcpTimers()
+        TcpOutput()
+        If tcp_state = #TCP_CLOSED
+          If tcp_listen_port = 0
+            tcp_inuse = 0
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+
+  took = 0
+  wait = slice_ms
+  While took < #LINK_RX_BUDGET
+    n = LinkPumpAllNet(wait)
+    If n = #LINK_RX_NONE
+      Break
+    EndIf
+    took = took + 1
+    wait = 0
+    If n = #NET_IN_TCP
+      TcpInput()
+    EndIf
+  Wend
+
+  TcpUse(keep)
+  ProcedureReturn tcp_state
+EndProcedure
+
+; The state's name, for a log line. Never derive behaviour from this.
+Procedure.i TcpStateName(s.i)
+  If s = #TCP_CLOSED
+    ProcedureReturn "CLOSED"
+  EndIf
+  If s = #TCP_LISTEN
+    ProcedureReturn "LISTEN"
+  EndIf
+  If s = #TCP_SYN_SENT
+    ProcedureReturn "SYN-SENT"
+  EndIf
+  If s = #TCP_SYN_RECEIVED
+    ProcedureReturn "SYN-RECEIVED"
+  EndIf
+  If s = #TCP_ESTABLISHED
+    ProcedureReturn "ESTABLISHED"
+  EndIf
+  If s = #TCP_FIN_WAIT_1
+    ProcedureReturn "FIN-WAIT-1"
+  EndIf
+  If s = #TCP_FIN_WAIT_2
+    ProcedureReturn "FIN-WAIT-2"
+  EndIf
+  If s = #TCP_CLOSE_WAIT
+    ProcedureReturn "CLOSE-WAIT"
+  EndIf
+  If s = #TCP_CLOSING
+    ProcedureReturn "CLOSING"
+  EndIf
+  If s = #TCP_LAST_ACK
+    ProcedureReturn "LAST-ACK"
+  EndIf
+  If s = #TCP_TIME_WAIT
+    ProcedureReturn "TIME-WAIT"
+  EndIf
+  ProcedureReturn "?"
+EndProcedure
+
+; ======================================================================
+; THE REFUSAL, IN WORDS.
+; ======================================================================
+; The rule of 2026-09-03: every error a shipped program prints is a full
+; sentence that KEEPS THE NUMERIC CODE and also says what it means and
+; what to check first. Never a bare "code -303". The number is here so a
+; log can be searched for it and the sentence is here so the person
+; reading the log does not have to find this file.
+; ----------------------------------------------------------------------
+Procedure.i TcpErrorText(e.i)
+  Select e
+    Case #NET_TCP_OK
+      ProcedureReturn "tcp: no refusal recorded"
+    Case #NET_TCP_E_BUSY
+      ProcedureReturn "tcp -300: every socket is in use, so the connection was not opened. Close one with tcp close, or wait - a socket that has just closed is held for four minutes so a late duplicate cannot be mistaken for the next connection"
+    Case #NET_TCP_E_NOADDR
+      ProcedureReturn "tcp -301: this board has no IPv4 address, so nothing was sent. Get one with dhcp, or set one with net ip <address>"
+    Case #NET_TCP_E_STATE
+      ProcedureReturn "tcp -302: that is not legal in this state and nothing was done. tcp status prints the state; a connection that is already closing cannot be closed again"
+    Case #NET_TCP_E_ARP
+      ProcedureReturn "tcp -303: the next hop has not answered a hardware-address request yet, so no SYN has gone out. This is not a TCP failure - keep polling, and if it never answers the machine at that address is not on this segment"
+    Case #NET_TCP_E_RESET
+      ProcedureReturn "tcp -304: the peer sent a reset. Either nothing is listening on that port, or it killed the connection. This is the far end's answer and not a fault on this board"
+    Case #NET_TCP_E_TIMEOUT
+      ProcedureReturn "tcp -305: the peer stopped answering and retransmission gave up, so the connection is gone. The segments went out and nothing came back; check the far end is still running and that a firewall has not started dropping"
+    Case #NET_TCP_E_TOOBIG
+      ProcedureReturn "tcp -306: more than one segment could carry on the link that is up now. This is an internal ceiling and not something you typed; tcp status prints the current limit"
+    Case #NET_TCP_E_NOLINK
+      ProcedureReturn "tcp -307: no interface is carrying traffic, so nothing was sent. Plug in the Ethernet cable or join a wireless network, then type net to see which link the stack picked and why"
+    Case #NET_TCP_E_TX
+      ProcedureReturn "tcp -308: the link refused the frame, so the segment was not transmitted. Over Wi-Fi that is usually the radio out of transmit credit for a moment and the retransmission timer will cover it; over the wire it is the controller"
+    Case #NET_TCP_E_SOCKET
+      ProcedureReturn "tcp -309: that socket number does not exist. They are numbered from zero and there are four"
+    Case #NET_TCP_E_PORT
+      ProcedureReturn "tcp -310: a port must be between 1 and 65535, so nothing was done"
+    Case #NET_TCP_E_ROUTE
+      ProcedureReturn "tcp -311: there is no route to that address at all. It is not on this board's own subnet and no gateway is configured - set one with net gateway <router>"
+    Case #NET_TCP_E_ARG
+      ProcedureReturn "tcp -312: a null pointer or a negative length reached the stack, which is a fault in the monitor and not in what you typed"
+    Default
+      ProcedureReturn "tcp: an unnumbered refusal, which is itself a defect"
+  EndSelect
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TcpTick - one non-blocking pass, for a caller's idle loop.
+;
+;  ZERO SLICE ON PURPOSE. The monitor's prompt is already waiting on a
+;  key and calls this on every spin; a poll that blocked even five
+;  milliseconds per pass would make typing feel like treacle. With no
+;  frame waiting, LinkPumpNet returns at once.
+;
+;  IT RUNS WHETHER OR NOT ANYTHING IS OPEN, and that costs one walk of a
+;  table of four. Making it conditional on a "something is open" flag
+;  means a timer that stops running when the flag goes stale, which is
+;  a failure this project has met more than once and which presents as a
+;  connection that never times out and never completes.
+; ----------------------------------------------------------------------
+Procedure TcpTick()
+  TcpPoll(0)
+EndProcedure

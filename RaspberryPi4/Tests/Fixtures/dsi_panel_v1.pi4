@@ -1,0 +1,303 @@
+; ======================================================================
+; WAVESHARE DSI PANEL CONTROL MCU for the Raspberry Pi 4 - TEST FIXTURE.
+; Power, enable and backlight over I2C. Six legacy-v1 registers.
+; ----------------------------------------------------------------------
+; Retained only by RaspberryPi4/Tests/touch_goodix_compile.pi4 so the
+; emitted bus model can exercise a second I2C slave. The shipping Pi board
+; uses Lib/dsi_panel_v2.pi4; this fixture is never included there.
+;
+; The Waveshare MIPI DSI panels (the 10.1" 1280x800 one this was written
+; for, and its siblings from 2.8" to 13.3") carry a small microcontroller
+; at I2C address 0x45 that owns the panel's power rails and its backlight.
+; It answers plain 8-bit-register, 8-bit-value writes.
+;
+; THIS FILE SENDS NO DSI. It cannot: it is an I2C driver. On the v1 family
+; that is the whole control surface - see WHICH FAMILY below.
+;
+; USE - all three includes, in this order, in the MAIN file:
+;     XIncludeFile "RaspberryPi4/Lib/gpio.pi4"      ; i2c.pi4 needs it
+;     XIncludeFile "RaspberryPi4/Lib/i2c.pi4"       ; REQUIRED, before this
+;     XIncludeFile "RaspberryPi4/Lib/dsi_panel.pi4"
+;
+; Libraries do not include libraries (project ruling, 2026-07-30), so this
+; file names no other .pi4. Without i2c.pi4 above it the build fails
+; LOUDLY on an undefined I2cWrite, which is the designed failure.
+;
+;     I2cUp()
+;     If DsiPanelBegin() <> 0
+;       DsiPanelEnable(1)
+;       DsiPanelBacklight(255)
+;     EndIf
+;
+; ======================================================================
+; STATUS
+; ======================================================================
+; Written 2026-09-06 with NO PANEL CONNECTED. Every register is cited
+; below against the driver Linux ships. Nothing here has written to a real
+; MCU. The gate tools/a64/a64_touch_check.py drives it against a model,
+; which proves the sequence and proves nothing about the silicon.
+;
+; ======================================================================
+; WHICH FAMILY - AND THIS FILE IS FOR ONE OF THEM
+; ======================================================================
+; Waveshare ship two incompatible generations, both with an MCU at 0x45,
+; and the difference is not cosmetic:
+;
+;   v1  "10.1inch DSI LCD (C)" and siblings. The MCU IS the control
+;       surface. The panel needs NO DSI initialisation at all - Linux's
+;       panel-waveshare-dsi.c has an EMPTY prepare() and an EMPTY
+;       unprepare(), and every action in the driver is one of the six
+;       register writes below. THIS FILE IS THAT FAMILY.
+;
+;   v2  the "DSI-TOUCH" series. The MCU at the same address is a GPIO
+;       EXPANDER instead - the device tree calls it
+;       "waveshare,touchscreen-panel-regulator" and hangs reset, iovcc,
+;       avdd and the backlight off its pins - and the panel itself needs a
+;       long DCS init table over DSI. NONE of the registers below apply.
+;
+; TELLING THEM APART DOES NOT USE THIS FILE. The touch controller's
+; address does it: 0x14 (GT911) is v1, 0x5D (GT9271) is v2, settled by the
+; product ID string. See RaspberryPi4/Lib/touch_goodix.pi4's header.
+;
+; DsiPanelBegin() therefore CANNOT confirm the family on its own. It
+; confirms that something at 0x45 accepts a write, which both generations
+; will do. Probe the touch address first and only then believe this file.
+;
+; ======================================================================
+; THE BACKLIGHT IS INVERTED AND IT NEEDS A SECOND WRITE
+; ======================================================================
+; Two independent traps in one operation, and a driver that misses either
+; looks like a panel with no backlight:
+;
+;   1. THE VALUE IS INVERTED. Register 0xAB takes 0xFF - brightness. Zero
+;      is FULL BRIGHTNESS and 0xFF is off. Linux:
+;          ws_panel_i2c_write(ts, 0xab, 0xff - backlight_get_brightness(bl));
+;
+;   2. IT DOES NOTHING UNTIL 0xAA IS WRITTEN AFTER IT. The next line is
+;          ws_panel_i2c_write(ts, 0xaa, 0x01);
+;      and without it the level sits in the MCU unapplied.
+;
+; DsiPanelBacklight() takes a NORMAL brightness - 0 dark, 255 full - and
+; does both writes. The inversion lives in exactly one place, here, and no
+; caller should ever compute 0xFF minus anything.
+;
+; ======================================================================
+; WHERE THE REGISTERS COME FROM (do not guess - rule 21)
+; ======================================================================
+; RaspberryPi4/Reference/rpi-6.12.y_panel-waveshare-dsi.c, fetched
+; 2026-09-06 from
+; https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/
+; drivers/gpu/drm/panel/panel-waveshare-dsi.c
+;
+;   :332-339  ws_panel_i2c_write - i2c_smbus_write_byte_data, i.e. one
+;             register byte then one value byte, one transaction
+;   :479-481  probe writes 0xC0=1, 0xC2=1, 0xAC=1
+;   :423-426  enable  writes 0xAD=1   (0xAD=2 for the 13.3" 2-lane only)
+;   :345      disable writes 0xAD=0
+;   :426-427  backlight writes 0xAB=0xFF-level then 0xAA=1
+;
+; and the address itself from
+; RaspberryPi4/Reference/rpi-6.12.y_vc4-kms-dsi-waveshare-panel-overlay.dts:
+;   panel_disp1@45 { reg = <0x45>; compatible = "waveshare,10.1inch-panel"; }
+;   on the i2c_csi_dsi bus - which on a Pi 4 is BSC0 muxed to GPIO 44/45
+;   at ALT1, NOT the header's GPIO 2/3. i2c.pi4 drives GPIO 2/3 today; see
+;   the vault note "Waveshare 10.1 DSI and touch - what the hardware is".
+;
+; WHAT THE REGISTERS MEAN INDIVIDUALLY IS NOT DOCUMENTED ANYWHERE. Linux
+; writes 0xC0, 0xC2 and 0xAC as a fixed opening with no comment, so this
+; file calls them the opening sequence and sends them in that order rather
+; than inventing meanings for them. If one of them turns out to matter on
+; the bench, the finding goes in the vault, not in a guessed name here.
+; ======================================================================
+
+EnableExplicit
+
+#DSI_PANEL_ADDR = $45
+
+; The opening sequence. Order is Linux's order.
+#DSI_PANEL_REG_OPEN_A = $C0
+#DSI_PANEL_REG_OPEN_B = $C2
+#DSI_PANEL_REG_OPEN_C = $AC
+
+#DSI_PANEL_REG_BL_LEVEL  = $AB    ; INVERTED - see the header
+#DSI_PANEL_REG_BL_COMMIT = $AA
+#DSI_PANEL_REG_ENABLE    = $AD
+
+#DSI_PANEL_ENABLE_OFF    = $00
+#DSI_PANEL_ENABLE_ON     = $01
+#DSI_PANEL_ENABLE_ON_2LANE = $02  ; the 13.3" two-lane board only
+
+#DSI_PANEL_BL_MAX = 255
+
+Global dsi_panel_ready.i          ; 1 once the opening sequence was ACKed
+Global dsi_panel_bl.i             ; the last brightness ASKED FOR, 0..255
+Global dsi_panel_on.i             ; the last enable value written
+Global dsi_panel_buscode.i        ; the last #I2C_* code any write returned
+Global dsi_panel_writes.i         ; register writes that ACKed since Begin
+
+; ----------------------------------------------------------------------
+;  DsiPanelWrite(reg, v) - one register write. Returns 1 or 0.
+;
+;  Private in spirit; exposed because a bench session poking an
+;  undocumented register is exactly the thing that finds out what 0xC2 is
+;  for, and making that require an edit would mean it never happens.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelWrite(reg.i, v.i)
+  Define r.i
+  Dim pkt.a[2]
+
+  pkt[0] = reg & $FF
+  pkt[1] = v & $FF
+  r = I2cWrite(#DSI_PANEL_ADDR, @pkt, 2)
+  dsi_panel_buscode = r
+  If r <> #I2C_OK
+    ProcedureReturn 0
+  EndIf
+  dsi_panel_writes = dsi_panel_writes + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanelBegin() - send the opening sequence.
+;
+;  Returns 1 if all three writes were acknowledged, else 0 with the reason
+;  in DsiPanelBusCode().
+;
+;  IT DOES NOT ENABLE THE PANEL and it does not touch the backlight. Those
+;  are separate calls on purpose: bringing the rails up and lighting the
+;  screen are different decisions, and a caller that is only identifying
+;  what is on the bus should not make the panel flash.
+;
+;  IT ALSO CANNOT TELL YOU THE FAMILY. A v2 board's GPIO expander lives at
+;  the same address and will acknowledge these writes too. See the header.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelBegin()
+  dsi_panel_ready = 0
+  dsi_panel_bl = -1
+  dsi_panel_on = -1
+  dsi_panel_writes = 0
+  dsi_panel_buscode = #I2C_OK
+
+  If DsiPanelWrite(#DSI_PANEL_REG_OPEN_A, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  If DsiPanelWrite(#DSI_PANEL_REG_OPEN_B, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  If DsiPanelWrite(#DSI_PANEL_REG_OPEN_C, 1) = 0
+    ProcedureReturn 0
+  EndIf
+
+  dsi_panel_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanelEnable(on) - 0 off, 1 on. Returns 1 or 0.
+;
+;  Refuses before DsiPanelBegin has succeeded, because enabling a panel
+;  whose opening sequence was never acknowledged is writing into the dark
+;  and the failure would surface as a blank screen rather than as a code.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelEnable(on.i)
+  Define v.i
+
+  If dsi_panel_ready = 0
+    dsi_panel_buscode = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+
+  If on = 0
+    v = #DSI_PANEL_ENABLE_OFF
+  Else
+    v = #DSI_PANEL_ENABLE_ON
+  EndIf
+
+  If DsiPanelWrite(#DSI_PANEL_REG_ENABLE, v) = 0
+    ProcedureReturn 0
+  EndIf
+  dsi_panel_on = v
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanelEnable2Lane() - the 13.3" two-lane board's enable value, 0x02.
+;
+;  Its own procedure rather than a parameter on DsiPanelEnable, because
+;  "2" is not a brighter kind of on: it is one specific board's value, and
+;  a caller that can pass it by accident will eventually pass it by
+;  accident. Linux picks it by comparing the mode pointer, which is the
+;  same statement in a different language.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelEnable2Lane()
+  If dsi_panel_ready = 0
+    dsi_panel_buscode = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+  If DsiPanelWrite(#DSI_PANEL_REG_ENABLE, #DSI_PANEL_ENABLE_ON_2LANE) = 0
+    ProcedureReturn 0
+  EndIf
+  dsi_panel_on = #DSI_PANEL_ENABLE_ON_2LANE
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanelBacklight(level) - level is NORMAL: 0 dark, 255 full.
+;
+;  The inversion and the commit write live here and nowhere else. A level
+;  outside 0..255 is REFUSED rather than clamped: a clamp turns a caller's
+;  arithmetic bug into a working screen at the wrong brightness, which
+;  nobody ever finds.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelBacklight(level.i)
+  If dsi_panel_ready = 0
+    dsi_panel_buscode = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+  If level < 0 Or level > #DSI_PANEL_BL_MAX
+    dsi_panel_buscode = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+
+  ; INVERTED. 0xFF - level. Full brightness is the value zero.
+  If DsiPanelWrite(#DSI_PANEL_REG_BL_LEVEL, #DSI_PANEL_BL_MAX - level) = 0
+    ProcedureReturn 0
+  EndIf
+  ; AND IT DOES NOTHING UNTIL THIS ONE. Not an acknowledgement read, not a
+  ; nicety - the level above is not applied without it.
+  If DsiPanelWrite(#DSI_PANEL_REG_BL_COMMIT, 1) = 0
+    ProcedureReturn 0
+  EndIf
+
+  dsi_panel_bl = level
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Readers. Every one of these reports what was ASKED FOR, because the MCU
+;  offers nothing to read back - there is no register in Linux's driver
+;  that is ever read. Do not let a caller mistake these for measurements.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelReady()
+  ProcedureReturn dsi_panel_ready
+EndProcedure
+
+; DsiPanelBacklightAsked() - the last level passed to DsiPanelBacklight,
+; or -1 if none was. NOT a reading off the panel.
+Procedure.i DsiPanelBacklightAsked()
+  ProcedureReturn dsi_panel_bl
+EndProcedure
+
+; DsiPanelEnableAsked() - the last value written to 0xAD, or -1. NOT a
+; reading off the panel.
+Procedure.i DsiPanelEnableAsked()
+  ProcedureReturn dsi_panel_on
+EndProcedure
+
+Procedure.i DsiPanelBusCode()
+  ProcedureReturn dsi_panel_buscode
+EndProcedure
+
+Procedure.i DsiPanelWriteCount()
+  ProcedureReturn dsi_panel_writes
+EndProcedure

@@ -1,0 +1,493 @@
+; ======================================================================
+;  hw_gpio_q.pi4 - the Arduino UNO Q HwGpio* backend. THE BOARD SIDE OF
+;  THE HwGpio* SEAM declared in Anvil/Hal/hal.pbi.
+;
+;  Anvil/Core/gpio_cmd.pbi (the `gpio` command) calls these names and
+;  never touches a register, a mux value or a raw pull code; this file is
+;  thin wrappers over ArduinoQ/Lib/tlmm.unoq, whose header carries all the
+;  register-level reasoning - the $00500000 base, the 4 KB per-pin
+;  stride, the 4-bit mux field, the keeper-that-is-not-a-pull-up, and the
+;  eGPIO ownership bit.
+;
+;  INCLUDE ORDER, and it is not arbitrary:
+;    * ArduinoQ/Lib/tlmm.unoq  BEFORE this file - it defines TlmmModeGet,
+;      TlmmRead, TlmmPullGet, TlmmFuncGet and the #TLMM_* raw codes this
+;      file translates. A library never includes a library (house rule
+;      10), so board.pi4 lists both, tlmm.pi4 first.
+;    * Anvil/Hal/hal.pbi      BEFORE this file - the #HW_* vocabulary
+;      these wrappers return.
+;
+; ----------------------------------------------------------------------
+;  WHAT CHANGED, AND WHY THE OLD ANSWER WAS WRONG
+; ----------------------------------------------------------------------
+;  board.pi4 used to say, and qstubs_q.pi4 used to implement:
+;
+;      #CAP_GPIO = 0   ; NOT REACHABLE. The UNO Q's header pins are owned
+;                      ; by the STM32U585 co-processor, and the QCM2290's
+;                      ; own TLMM is not driven. Anvil has no pins here
+;                      ; at all.
+;
+;  The first half of that is TRUE and survives - see NO USER HEADER
+;  below. The second half was the error, and it is the same shape of
+;  error the console blocker was: a true fact about one path was allowed
+;  to stand for a conclusion about all of them. The QCM2290 has 127 TLMM
+;  lines of its own at $00500000, thirty of which are demonstrably in use
+;  by on-board functions, and they are reachable by plain MMIO from a
+;  UEFI application at EL1. "Anvil has no pins here at all" was false.
+;
+;  MEASURED, not assumed - the same discipline the ConOut/GOP question
+;  got. Anvil's own `memory` command reads arbitrary addresses, so the
+;  TLMM was read on the running board with the image that was already
+;  deployed, before a line of this file was allowed to run.
+;
+; ----------------------------------------------------------------------
+;  NO USER HEADER - HwGpioUserMax() RETURNS -1, AND THAT IS A FINDING
+; ----------------------------------------------------------------------
+;  ***THE ARDUINO HEADERS ON THIS BOARD DO NOT REACH THE QCM2290.*** They
+;  are wired to the STM32U585 co-processor, which Anvil does not drive.
+;  So there is no "user header" in the sense hal.pi4 means - no range of
+;  TLMM pins an operator can put a jumper on - and this backend says so
+;  by returning -1 rather than inventing a plausible-looking range.
+;
+;  THIS IS NOT AN INFERENCE. It was traced pin by pin through the
+;  schematic (UNO-Q-ABX00162-schematics.pdf sheet 20, "IO"), and every
+;  one of the thirty-two pins on JDIGITAL1 and JANALOG1 lands on an
+;  STM32U585 ball - D13 is the MCU's SPI2 clock on PB13, A0 is PA4, D0
+;  and D1 are the MCU's USART1, and even IOREF and RESET are the MCU's
+;  3.3 V rail and its NRST. There is no mux, no buffer and no alternate
+;  path: the only parts in the way are 0-ohm series resistors. The
+;  datasheet says the same in section 9.6/9.7, and the Qwiic connector is
+;  on the MCU's I2C4 as well.
+;
+;  So a bare-metal TLMM driver on this SoC cannot toggle a single Arduino
+;  header pin, and no amount of work on this file changes that. Reaching
+;  D0..D13 means going THROUGH the STM32 - over the SPI bridge on serial
+;  engine 5 or the LPUART bridge on serial engine 2 - which is a
+;  different piece of work with a protocol at the far end.
+;
+;  WHAT THE SoC DOES EXPOSE, for whoever wants a pin to wave at: the
+;  60-pin JMISC1 mezzanine carries twelve TLMM lines at 1.8 V - GPIO 0,
+;  1, 2, 3, 82 and 86 on its odd pins 37..47, GPIO 18 and 28 on 49 and
+;  51, and GPIO 98..101 on 46..52 (schematic sheet 9 for the ball
+;  assignments, sheet 20 for the connector). Of those, 0 and 1 are in use
+;  as I2C bus 0 and are reserved below; 98..101 are eGPIO pins whose
+;  ownership must be claimed before they can be driven, which
+;  TlmmModeSet() does. That mezzanine, not the Arduino header, is where a
+;  jumper would go on this board.
+;
+;  That -1 is not a gap in this file; it is the honest answer, and the
+;  core already knows what to do with it. Anvil/Core/gpio_cmd.pbi:159-166
+;  prints "This board has general-purpose I/O but no user header this
+;  command knows about ... Type gpio all to see every line" instead of
+;  silently reporting an empty range. A board that returned, say, 27 here
+;  to make `gpio` look more like the Pi 4 would be inviting an operator
+;  to drive pins that are not where they think they are.
+;
+;  Every one of the 127 lines is still READABLE and reportable through
+;  `gpio all`, and the free ones are still drivable by number. What does
+;  not exist is a header to call them.
+;
+; ----------------------------------------------------------------------
+;  WHERE THE RESERVED LIST COMES FROM
+; ----------------------------------------------------------------------
+;  From TWO sources that know different things, and the union of them,
+;  because taking either one alone leaves a hole big enough to stop the
+;  board booting.
+;
+;    1. THE RUNNING BOARD'S OWN DEVICE TREE, extracted over SSH from
+;       /proc/device-tree while Debian was up and saved as
+;       ArduinoQ/Reference/unoq-live-device-tree.dts (model "Arduino
+;       SA,Imola"). That file describes THIS board, which qrb2210-rb1.dts
+;       - the Qualcomm reference board - does not: the RB1 has an LT9611
+;       HDMI bridge where the UNO Q has an ANX7625 on USB-C, so taking
+;       the RB1's pin usage would have reserved the wrong pins.
+;    2. THE SCHEMATIC, UNO-Q-ABX00162-schematics.pdf, sheet 9
+;       ("QRB2210-GPIO") for the SoC ball-to-net map, sheet 20 ("IO") for
+;       the connectors and sheet 24 for the display bridge, plus the
+;       datasheet's section 9.5.
+;
+;  ***WHY BOTH, AND WHAT USING ONLY THE FIRST COST.*** The device tree is
+;  authoritative about what LINUX owns, and completely silent about what
+;  the SoC reads at RESET. Boot straps are sampled by the boot ROM before
+;  an operating system exists, so no driver claims them and no node
+;  mentions them. Built from the device tree alone, this list declared
+;  GPIO 48, 50, 51, 53, 61 and 62 FREE TO DRIVE - and the schematic shows
+;  the first four are the BOOT_CONFIG straps that decide where the SoC
+;  boots from and the last two are the board-identity straps. Those are
+;  in Tier 0 below now.
+;
+;  The device tree knows the drivers. The schematic knows the copper.
+;  Neither alone is the list.
+;
+;  Every entry below cites the line in that file that owns the pin. The
+;  list is deliberately WIDER than "pins some driver has claimed", and
+;  the tiers say why each pin is in it, because the cost of the two kinds
+;  of mistake is not symmetric: refusing a pin that was actually free
+;  costs an operator one command, and allowing a pin that carries the
+;  console costs the whole session with no way to see what happened.
+;
+;  TIER A - actively owned by an enabled node in the live device tree.
+;  TIER B - named for the STM32U585 bridge by an orphaned pinctrl state:
+;           the state exists and names the pin, but nothing in the tree
+;           references it, because THE STM32 IS NOT IN THE DEVICE TREE AT
+;           ALL (zero hits for "stm32" in 3487 lines - the bridge is
+;           managed outside the kernel). The names are still evidence,
+;           and mcu_nrst on GPIO 38 is a pin that resets the co-processor
+;           if it is driven. Reserved on the strength of the names, with
+;           the uncertainty stated rather than hidden.
+;  TIER C - the alternate-function partners of buses that are enabled on
+;           their OTHER pins, or pins belonging to a disabled controller.
+;           Free by the letter of the device tree; likely to have board
+;           traces on them. Reserved, and said to be advisory.
+;
+;  READING ANY PIN STAYS ALLOWED - this gates WRITES only, exactly as the
+;  seam specifies. The status report deliberately shows these pins,
+;  because that is how you see that the console is on a qup function and
+;  the display bridge's interrupt is pulled up. What is refused is
+;  RE-configuring them out from under the running machine.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Extent.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioCount()
+  ; Every TLMM line the QCM2290 has - 127, numbered 0..126.
+  ; agatti.dtsi:473 `gpio-ranges = <&tlmm 0 0 127>`, and independently
+  ; pinctrl-qcm2290.c:1089 `.ngpios = 127`. The live board's own device
+  ; tree says it a third time (unoq-live-device-tree.dts:1414).
+  ProcedureReturn #TLMM_PIN_COUNT
+EndProcedure
+
+Procedure.i HwGpioUserMax()
+  ; -1 = this board has no user header the QCM2290 can see. See NO USER
+  ; HEADER above; this is a measured fact about the board, not a gap.
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Mode - normalised to the #HW_GPIO_* vocabulary.
+;
+;  TlmmModeGet already asks the two questions in the right order (is the
+;  mux non-zero, and only then what does OE say), so this is a plain
+;  mapping. It is written out rather than passed through for the reason
+;  hw_gpio.pi4 gives on the Pi 4: the two enumerations live in different
+;  files and a future divergence must fail here, visibly.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioModeGet(pin.i)
+  Define m.i
+  m = TlmmModeGet(pin)
+  If m < 0
+    ProcedureReturn -1
+  EndIf
+  If m = #TLMM_INPUT
+    ProcedureReturn #HW_GPIO_IN
+  EndIf
+  If m = #TLMM_OUTPUT
+    ProcedureReturn #HW_GPIO_OUT
+  EndIf
+  ProcedureReturn #HW_GPIO_ALT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwGpioAltGet - the alternate-function NUMBER for an ALT pin, or -1 for
+;  a bad pin or a plain input/output.
+;
+;  ON THIS PART THE ALT NUMBER IS THE MUX FIELD, UNCHANGED. There is no
+;  table to undo here, and that is worth saying because the Pi 4's
+;  counterpart is nothing but such a table - the BCM2711's ALT4 and ALT5
+;  are the raw codes 3 and 2, so its HwGpioAltGet is a six-way Select
+;  that puts them back in order. The QCM2290 has no such quirk: the mux
+;  field holds the function INDEX directly (pinctrl-msm.c:237 writes the
+;  index, `val |= i << g->mux_bit`), so 1 means the pin's first alternate
+;  function, 2 its second, and so on up to 15.
+;
+;  WHAT THAT NUMBER MEANS IS PER-PIN, and this backend does not pretend
+;  otherwise. Each pin has its own function list in pinctrl-qcm2290.c, so
+;  function 1 is "qup0" on GPIO 0 and something else entirely on GPIO 40.
+;  Naming them would mean carrying a 127 x 10 table of Qualcomm function
+;  names into a board file; the number is what a reader checks against
+;  the device tree's pinmux nodes anyway, and it is what the seam asks
+;  for.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioAltGet(pin.i)
+  Define f.i
+  f = TlmmFuncGet(pin)
+  If f < 0
+    ProcedureReturn -1
+  EndIf
+  If f = #TLMM_FUNC_GPIO
+    ProcedureReturn -1         ; a plain GPIO is not an alternate function
+  EndIf
+  ProcedureReturn f
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Level - the actual pad, read back, which is what the `gpio` command
+;  promises its reader. TlmmRead returns 0/1/-1 already.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioLevelGet(pin.i)
+  ProcedureReturn TlmmRead(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pull.
+;
+;  ***THE KEEPER IS REPORTED AS "NO PULL", DELIBERATELY.*** The QCM2290's
+;  two-bit pull field has four states and hal.pi4's portable vocabulary
+;  has three: the silicon's value 2 is a BUS KEEPER (a weak latch that
+;  holds the last level) and there is no #HW_PULL_KEEPER to map it to.
+;  Of the three available answers, "none" is the only one that is not a
+;  lie - a keeper is not a resistor to a rail, so calling it a pull-up or
+;  a pull-down would misstate the electrical condition of the pin to
+;  someone deciding whether they need an external resistor.
+;
+;  Losing information at a seam is acceptable; inventing it is not. The
+;  raw four-state value stays available from TlmmPullGet for anything
+;  that wants it, and the day the portable vocabulary grows a keeper this
+;  is the one line that changes.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioPullGet(pin.i)
+  Define p.i
+  p = TlmmPullGet(pin)
+  If p < 0
+    ProcedureReturn -1
+  EndIf
+  If p = #TLMM_PULL_NONE
+    ProcedureReturn #HW_PULL_NONE
+  EndIf
+  If p = #TLMM_PULL_DOWN
+    ProcedureReturn #HW_PULL_DOWN
+  EndIf
+  If p = #TLMM_PULL_UP
+    ProcedureReturn #HW_PULL_UP
+  EndIf
+  ; #TLMM_KEEPER - see above.
+  ProcedureReturn #HW_PULL_NONE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The write seam.
+;
+;  HwGpioMode takes a #HW_GPIO_* code. #HW_GPIO_ALT is refused (returns
+;  0): "make this pin some alternate function" is not a whole
+;  instruction - WHICH alternate is, and that is TlmmFuncSet's job, which
+;  a later HwGpioAlt(pin, n) will expose. Refusing the ambiguous case
+;  rather than guessing a function is the same discipline the Pi 4
+;  backend uses.
+;
+;  These are NOT gated by the reserved list. The gating happens one layer
+;  up: Anvil/Core/gpio_cmd.pbi calls HwGpioReservedReason first and
+;  refuses before it reaches these, which is what the seam specifies.
+;  Putting the check in both places would mean two lists to keep in step.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioMode(pin.i, mode.i)
+  If mode = #HW_GPIO_IN
+    ProcedureReturn TlmmModeSet(pin, #TLMM_INPUT)
+  EndIf
+  If mode = #HW_GPIO_OUT
+    ProcedureReturn TlmmModeSet(pin, #TLMM_OUTPUT)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwGpioWrite(pin.i, level.i)
+  ProcedureReturn TlmmWrite(pin, level)
+EndProcedure
+
+Procedure.i HwGpioToggle(pin.i)
+  ProcedureReturn TlmmToggle(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwGpioReservedReason - the pins the BOARD ITSELF is using, that the
+;  `gpio` write subcommands must refuse to reconfigure.
+;
+;  Returns 0 for a pin free to drive, or the address of a lowercase
+;  fragment naming the function that owns it. The fragment reads after
+;  "GPIO n is " and the core prints it with UartWriteStr, exactly as
+;  RequireCap prints its *reason - so the core never learns which pins
+;  these are.
+;
+;  Ordered most-dangerous first, so a reader meets the console before
+;  anything else. See WHERE THE RESERVED LIST COMES FROM for the tiers
+;  and the citations.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioReservedReason(pin.i)
+
+  ; ---- TIER 0: STRAPS AND POWER. THE ONES THE DEVICE TREE CANNOT TELL
+  ;      YOU ABOUT, AND THE ONES THAT DO NOT MERELY BREAK A DRIVER -----
+  ;
+  ;  ***THESE WERE MISSING FROM THE FIRST VERSION OF THIS LIST, AND THAT
+  ;  IS THE WHOLE LESSON OF THIS SECTION.*** The first list was built from
+  ;  the running board's device tree, which is authoritative about what
+  ;  LINUX owns and says NOTHING about what the SoC reads at reset. Boot
+  ;  straps are sampled by the boot ROM before any operating system
+  ;  exists, so no driver ever claims them and no device tree ever
+  ;  mentions them - they looked FREE, and six of them were in the list of
+  ;  pins this backend was about to declare safe to drive.
+  ;
+  ;  They come from the SCHEMATIC instead (UNO-Q-ABX00162-schematics.pdf,
+  ;  sheet 9 "QRB2210-GPIO", with the connector side on sheet 20 and the
+  ;  display bridge on sheet 24) and from the datasheet's section 9.5.
+  ;  Two sources that disagree about which pins matter, and the union is
+  ;  the only safe answer: the device tree knows the drivers, the
+  ;  schematic knows the copper.
+  If pin = 48 Or pin = 50 Or pin = 51 Or pin = 53
+    ProcedureReturn "one of the four BOOT_CONFIG straps the boot ROM samples at reset to decide where the SoC boots from: no operating system ever claims these, so nothing in the device tree warns you, and driving one can stop the board booting at all"
+  EndIf
+  If pin = 61 Or pin = 62
+    ProcedureReturn "one of the two board-identity straps that firmware reads to tell which board it is running on, set by fixed dividers on the schematic"
+  EndIf
+  ;  Tier 0 too, ruled 2026-09-02: the eGPIO range. Pads 105..126 are the
+  ;  TLMM's eGPIO lines, co-owned by another subsystem (function 9), and on
+  ;  THIS board 107..126 have no copper at all - sheet 9 draws 105..112 as
+  ;  no-connects and 113..126 are absent from the symbol. GPIO 109 and 110
+  ;  were seen changing with nothing attached: the other owner driving a pad
+  ;  that goes nowhere. None of the thirteen SoC-to-STM32 link pins (highest
+  ;  is 80) is in the range, so reserving it costs the bridge nothing.
+  If pin >= 107 And pin <= 126
+    ProcedureReturn "an eGPIO line shared with another subsystem that has no copper on this board: 109 and 110 change on their own with nothing attached, because the other owner is driving a pad that goes nowhere"
+  EndIf
+  If pin = 94 Or pin = 95
+    ProcedureReturn "part of the forced-USB-boot (emergency download) strap pair: driving it can drop the board into its firmware recovery mode instead of booting"
+  EndIf
+  If pin = 45
+    ProcedureReturn "the only SoC-driven power enable on this board: it gates the regulator feeding the ANX7625 DisplayPort bridge, so driving it powers that part down"
+  EndIf
+  If pin = 44 Or pin = 90
+    ProcedureReturn "a control line of the ANX7625 DisplayPort bridge (its reset and its hot-plug-detect), which fights the USB-C power-delivery state machine if it is driven"
+  EndIf
+  If pin = 89
+    ProcedureReturn "a USB PHY control line"
+  EndIf
+  If pin >= 102 And pin <= 104
+    ProcedureReturn "part of the I2S audio bus carrying sound to the DisplayPort bridge, which the datasheet lists as interface-dedicated and not available as general-purpose I/O"
+  EndIf
+
+  ; ---- TIER A: actively owned by an enabled node ----------------------
+
+  ; The console. unoq-live-device-tree.dts:795-804 (serial@4a90000,
+  ; "qcom,geni-debug-uart", status okay), :1710 (qup-uart4-default-state,
+  ; pins gpio12/gpio13), :2882 (serial0 alias) and :3011
+  ; (stdout-path = "serial0"). Three independent statements that this is
+  ; the debug console, and it is the wire this transcript is on.
+  If pin = 12 Or pin = 13
+    ProcedureReturn "the serial console this session's transcript is travelling on: the QUP serial engine 4 UART is muxed onto GPIO 12 and 13, and driving either would cut the console mid-command with no way to see why"
+  EndIf
+
+  ; Bluetooth. serial@4a8c000 (SE3) is a WCN3988 HCI UART with flow
+  ; control on 8..11 (dts:618-627, :1585), and its enable line is
+  ; GPIO 87 (dts:638, enable-gpios).
+  If pin >= 8 And pin <= 11
+    ProcedureReturn "part of the Bluetooth controller's HCI UART: the WCN3988 is wired to QUP serial engine 3 on GPIO 8 to 11, with hardware flow control"
+  EndIf
+  If pin = 87
+    ProcedureReturn "the Wi-Fi and Bluetooth module's control line: the device tree uses it as the radio's enable and the schematic names it as the antenna switch control, so driving it disturbs the radio either way"
+  EndIf
+
+  ; The second UART. serial@4a88000 (SE2), a four-wire port on 6, 7, 71
+  ; and 80 (dts:809-818, :1417).
+  If pin = 6 Or pin = 7 Or pin = 71 Or pin = 80
+    ProcedureReturn "part of a second on-board UART: QUP serial engine 2 is muxed onto GPIO 6, 7, 71 and 80 as a four-wire port"
+  EndIf
+
+  ; The two I2C buses, both enabled. i2c@4a80000 on 0/1 (dts:504-517,
+  ; :1506) and i2c@4a84000 on 4/5 (dts:693-706, :1679) - the latter is
+  ; the bus carrying the display bridge and seven other devices, and is
+  ; the bus Anvil's own `i2c` command drives.
+  If pin = 0 Or pin = 1
+    ProcedureReturn "the SDA and SCL of I2C bus 0: QUP serial engine 0 is an I2C master on GPIO 0 and 1, and Anvil's own i2c command drives it"
+  EndIf
+  If pin = 4 Or pin = 5
+    ProcedureReturn "the SDA and SCL of I2C bus 1: QUP serial engine 1 is the board's populated I2C bus on GPIO 4 and 5, carrying the display bridge and seven other devices"
+  EndIf
+
+  ; SPI 5 and its handshake pin. spi@4a94000 on 14..17 (dts:540-552,
+  ; :1695) with a spidev child whose extra line is GPIO 37 (dts:556-559,
+  ; :1493). GPIO 37 is ALSO named mcu-boot0-state (dts:1726) - the same
+  ; pin under two names, which is the strongest hint in the whole file
+  ; that this SPI port is the STM32 link.
+  If pin >= 14 And pin <= 17
+    ProcedureReturn "part of the SPI bus on QUP serial engine 5, GPIO 14 to 17, which carries the board's SPI device"
+  EndIf
+  If pin = 37
+    ProcedureReturn "claimed twice over: it is the SPI device's handshake line on serial engine 5, and it is also the pin the device tree names as the co-processor's BOOT0, so driving it may put the STM32U585 into its bootloader"
+  EndIf
+
+  ; The display bridge. encoder@58 is the ANX7625 DSI-to-DisplayPort
+  ; bridge on i2c-1 (dts:710-719); its interrupt is GPIO 81
+  ; (dts:715, interrupts-extended) and its cable-detect is GPIO 46
+  ; (dts:712 with the state at :1602).
+  If pin = 81
+    ProcedureReturn "the interrupt line from the ANX7625 DisplayPort bridge, the part that drives the USB-C video output"
+  EndIf
+  If pin = 46
+    ProcedureReturn "the cable-detect input of the ANX7625 DisplayPort bridge, which tells it whether anything is plugged into the USB-C port"
+  EndIf
+
+  ; The LEDs. dts:2474-2520, each a gpios= property on a leds child.
+  ; Cosmetic to drive, but they are owned, and one of them is the panic
+  ; indicator - a light that lies is worse than no light.
+  If pin = 39
+    ProcedureReturn "the red panic LED, driven by the operating system as its panic indicator"
+  EndIf
+  If pin = 40
+    ProcedureReturn "the green Wi-Fi activity LED"
+  EndIf
+  If pin = 41 Or pin = 42 Or pin = 60
+    ProcedureReturn "one of the three user LEDs (red, green and blue) the operating system owns"
+  EndIf
+  If pin = 47
+    ProcedureReturn "the blue Bluetooth LED, tied to the radio's power state"
+  EndIf
+
+  ; The two buttons, both wakeup sources. dts:2838 and :2847.
+  If pin = 36 Or pin = 96
+    ProcedureReturn "one of the two volume buttons, which are wakeup sources for the operating system"
+  EndIf
+
+  ; ---- TIER B: the STM32U585 bridge, by name only ---------------------
+  ;
+  ; Five orphaned pinctrl states name these pins for the co-processor -
+  ; mcu-swdio (dts:1500), mcu-swclk (:1651), mcu-nrst (:1703),
+  ; mcu-spi-rdy (:1687) - plus two more of unclear purpose,
+  ; jmisc-gpio28 (:1579) and qup_spi0_jmisc (:1563, which adds GPIO 82
+  ; and 86). NOTHING in the device tree references any of them, because
+  ; the STM32 is not described in the device tree at all. The names are
+  ; the only evidence there is, and they are enough: a pin called
+  ; mcu_nrst resets the co-processor if it is driven.
+  If pin = 25 Or pin = 26
+    ProcedureReturn "part of the co-processor's SWD debug port (the device tree names GPIO 25 as its data line and 26 as its clock), so driving it interferes with debugging the STM32U585"
+  EndIf
+  If pin = 38
+    ProcedureReturn "the co-processor's reset line by name in the device tree, so driving it would reset the STM32U585 and whatever it is running"
+  EndIf
+  If pin = 70
+    ProcedureReturn "named as the co-processor's SPI ready handshake, an input the STM32U585 drives to say it has data"
+  EndIf
+  If pin = 28 Or pin = 82 Or pin = 86
+    ProcedureReturn "named by a board-specific pin group in the device tree whose purpose is not stated there, so it is refused rather than driven blind"
+  EndIf
+
+  ; ---- TIER C: advisory - partners of live buses, disabled blocks -----
+  ;
+  ; Free by the letter of the device tree, but they are the alternate
+  ; pins of controllers that are live on their other pins, or belong to
+  ; a controller that is merely disabled rather than absent. Traces
+  ; almost certainly exist.
+  If pin = 2 Or pin = 3
+    ProcedureReturn "an alternate-function pin of the serial engine that is currently running I2C bus 0 on its other two pins, so the board very likely has it routed"
+  EndIf
+  If pin = 22 Or pin = 23 Or pin = 29 Or pin = 30
+    ProcedureReturn "a camera-control bus pin: the controller is disabled in the device tree rather than absent, so the pins are routed and something may still be attached"
+  EndIf
+  If pin = 69
+    ProcedureReturn "the alternate SPI pin of the serial engine that is currently running I2C bus 1, so the board very likely has it routed"
+  EndIf
+  If pin = 97
+    ProcedureReturn "the alternate SPI pin of the console's serial engine, whose partner pin is already in use as a volume button"
+  EndIf
+
+  ; Everything else is free to drive.
+  ProcedureReturn 0
+EndProcedure

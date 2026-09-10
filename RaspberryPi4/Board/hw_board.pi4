@@ -1,0 +1,114 @@
+; ======================================================================
+;  hw_board.pi4 - the Pi 4 backend for the HwBoard* seam.
+;
+;  Three facts the payload ABI (Anvil/Hal/abi.pbi) needs and no command
+;  family does: what this board is called, how to reset it, and what state
+;  its MMU and caches are in.
+;
+;  THEY HAVE NO #CAP_ FLAG, for the same reason HwAddr* has none: every
+;  board has an identity, a way to reset and a cache state, so there is
+;  nothing that could be absent. What differs is what the board KNOWS, and
+;  that is an answer, not a capability.
+;
+;  INCLUDE ORDER: after RaspberryPi4/Lib/safety.pi4 (SafetyToFirmware),
+;  RaspberryPi4/Lib/mmu.pi4 (MmuSctlrEl2) and RaspberryPi4/Board/cache.pi4
+;  (gCacheOn), and before Anvil/Hal/abi.pbi, which calls all three.
+;  House rule 10: this file includes nothing itself.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  HwBoardName()
+;
+;  THE FULL MARKETING NAME AND NOT A SHORT CODE, because the one place it
+;  is rendered is a diagnostic screen or a roadside inspection screen,
+;  where a person reads it. A payload that wants to make a DECISION asks
+;  SvcCapGet, never this.
+;
+;  Returned as a POINTER. Printed with UartWriteStr and never Print() -
+;  Print picks its formatter from the argument TYPE, an untyped pointer is
+;  not a .s, and Print(p) would put the ADDRESS on the screen in decimal.
+;  The trap is documented at PutClockRow, at UsbDiskUp and in
+;  settings_cmd.pi4; this is it avoided once more.
+; ----------------------------------------------------------------------
+Procedure.i HwBoardName()
+  ProcedureReturn "Raspberry Pi 4 Model B"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwReboot() - reset the board. Does not return.
+;
+;  THE SAME PATH `reset` TAKES, and deliberately the same one: two ways to
+;  reset a board are two behaviours to keep in step, and the day they
+;  diverge is the day a payload's reset leaves something running that the
+;  operator's reset stops.
+;
+;  SafetyToFirmware lights the PM watchdog's fuse and spins; the firmware
+;  then reloads KERNEL8.IMG, which is this monitor. Nothing in memory
+;  survives, which is the point.
+; ----------------------------------------------------------------------
+Procedure HwReboot()
+  UartDrain()
+  SafetyToFirmware()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmuState() - bit 0 MMU on, bit 1 D-cache on, bit 2 I-cache on.
+;
+;  READ OUT OF SCTLR_EL2 RATHER THAN OUT OF gCacheOn, and that difference
+;  is the whole reason this is a seam and not a getter on a global.
+;  gCacheOn is what the MONITOR BELIEVES it did; SCTLR_EL2 is what the
+;  PROCESSOR IS ACTUALLY DOING. A payload asking this question is asking
+;  the second one - it has just been handed a machine that a `cache off`,
+;  a RunAt handover and possibly its own earlier code have all touched,
+;  and the honest answer is the register.
+;
+;  SCTLR_EL2 bit 0 is M (MMU enable), bit 2 is C (data cacheability) and
+;  bit 12 is I (instruction cacheability) - ARM ARM D13.2.106. The bit
+;  positions are remapped onto the ABI's own 0/1/2 here so that the
+;  payload never learns an ARM field number, which is exactly what the
+;  portable vocabulary is for.
+; ----------------------------------------------------------------------
+Procedure.i HwMmuState()
+  Define s.i
+  Define r.i
+  s = MmuSctlrEl2()
+  r = 0
+  If (s & 1) <> 0
+    r = r | 1
+  EndIf
+  If (s & 4) <> 0
+    r = r | 2
+  EndIf
+  If (s & 4096) <> 0
+    r = r | 4
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMicros() - monotonic microseconds since Anvil started.
+;
+;  Anvil/Lib/timer.pi4's Micros() exactly, exported under the seam name so
+;  that Anvil/Hal/abi.pbi - which is core and compiles for both boards -
+;  does not have to name a Pi 4 library. NEVER GOES BACKWARDS AND NEVER
+;  JUMPS: it is the architectural counter, zero-based per boot, and it is
+;  the only clock the payload ABI promises.
+; ----------------------------------------------------------------------
+Procedure.i HwMicros()
+  ProcedureReturn Micros()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPet() - pet the deadman.
+;
+;  ANVIL NEVER PETS IT ON THE PAYLOAD'S BEHALF - the payload calls this in
+;  its own loop, and that is the whole reason the deadman makes a bricked
+;  truck impossible. A monitor that petted a watchdog for a program it is
+;  not running has disarmed the one thing standing between a hung payload
+;  and a board that needs a laptop.
+;
+;  Safe when nothing is armed: SafetyWatchdogPet returns immediately.
+; ----------------------------------------------------------------------
+Procedure HwPet()
+  SafetyWatchdogPet()
+EndProcedure

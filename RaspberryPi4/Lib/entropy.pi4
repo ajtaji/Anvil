@@ -1,0 +1,1194 @@
+; ======================================================================
+;  entropy.pi4 - THE BCM2711 HARDWARE RANDOM NUMBER GENERATOR (RNG200)
+; ======================================================================
+;
+;      #SOC_TARGET = 2711                       ; only if soc.pi4 is used
+;      XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
+;
+;      Procedure Main()
+;        Define st.i
+;        Define n.i
+;        Global Dim seed.a[48]
+;        st = EntropyBegin()
+;        If st < 0
+;          ; refuse to continue - see THE REFUSALS below
+;        EndIf
+;        n = EntropyBytes(@seed[0], 48, #ENTROPY_SPINS)
+;        ; n = 48 on success, negative on refusal
+;      EndProcedure
+;
+;  This is the file drbg.pi4's header spent seventy lines asking for. It
+;  enables the BCM2711's RNG200 block, waits out the warm-up the block
+;  documents, reads its FIFO only when the block says the FIFO has
+;  something in it, and offers a dead-block detector that is honest
+;  about being a dead-block detector and nothing more.
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NONE. This file includes no other library (house rule: a library
+;  never includes a library - the MAIN file lists what it needs). It
+;  uses PeekN/PokeN, integer arithmetic, and the a64_barrier()
+;  intrinsic from RaspberryPi4/Intrinsics/bcm2711_hardware.def.
+;
+;  It does NOT use timer.pi4, and that is a decision rather than an
+;  omission - see THE WAITS ARE COUNTED IN SPINS below. Nor bits.pi4,
+;  whose popcount this file would otherwise want - see the note above
+;  entropy_Popcount32.
+;
+;  NO SYMBOL HERE COLLIDES with anything else in RaspberryPi4/Lib, and
+;  that is a BUILD rather than an inspection: checked 2026-08-28 by
+;  compiling one main that includes soc, bits, memory, timer, uart,
+;  sort, math, string, string_f32, sha256, hmac, entropy and drbg
+;  together and calls into this file.
+;
+;  ======================================================================
+;   WHERE THE BLOCK IS, AND WHY IT IS *NOT* THE PI 3's RNG
+;  ======================================================================
+;
+;  Datasheets/pi4/bcm2711.dtsi:125-128
+;
+;      rng@7e104000 {
+;          compatible = "brcm,bcm2711-rng200";
+;          reg = <0x7e104000 0x28>;
+;      };
+;
+;  Bus $7E104000 is ARM physical $FE104000 - the soc node's own ranges
+;  property, Datasheets/pi4/bcm2711.dtsi:41. That is the same window
+;  every other peripheral in this library set is reached through, and
+;  RaspberryPi4/Lib/soc.pi4 carries the same address as #SOC_RNG_BASE
+;  with the same citation.
+;
+;  THE PART NUMBER IN THAT compatible STRING IS THE WHOLE WARNING. The
+;  Pi 3 and everything before it carry Broadcom's ORIGINAL RNG, driven
+;  by Linux as bcm2835-rng. The Pi 4 carries an RNG200, driven as
+;  iproc-rng200. THE TWO REGISTER MAPS ARE DIFFERENT AND THEY OVERLAP,
+;  which is the dangerous kind of different:
+;
+;    offset  bcm2835 RNG (Pi 3)        RNG200 (Pi 4, this file)
+;    ------  ------------------------  -------------------------------
+;    $00     RNG_CTRL, enable = bit 0  RNG_CTRL, enable = bit 0
+;    $04     RNG_STATUS. Word count    RNG_SOFT_RESET
+;            in bits 31:24, AND the
+;            warm-up count is WRITTEN
+;            here
+;    $08     RNG_DATA - the data!      RBG_SOFT_RESET
+;    $10     RNG_INT_MASK              RNG_TOTAL_BIT_COUNT_THRESHOLD
+;    $20     -                         RNG_FIFO_DATA
+;    $24     -                         RNG_FIFO_COUNT
+;
+;  Both are compared here from files in this repository:
+;  RaspberryPi4/Reference/v6.12_bcm2835-rng.c:17-26 for the left column,
+;  RaspberryPi4/Reference/rpi-6.12.y_iproc-rng200.c:21-48 for the right.
+;
+;  READ THE TABLE AGAIN AND NOTICE WHAT WOULD HAPPEN. A program written
+;  against the Pi 3 map, running on a Pi 4, would take its data from
+;  $08 - which on this part is RBG_SOFT_RESET - and would write its
+;  warm-up count into $04, which on this part is RNG_SOFT_RESET. It
+;  would not fault. $FE104000 is real, powered peripheral space, so
+;  every one of those accesses returns or accepts a number. The output
+;  would be a stream of whatever RBG_SOFT_RESET reads as, and it would
+;  go straight into a seed. This is exactly the failure drbg.pi4's
+;  header refused to risk, and it is why this file cites a line number
+;  for every offset below rather than a chip family for all of them.
+;
+;  ======================================================================
+;   THE THREE SOURCES, AND WHERE THEY DISAGREE
+;  ======================================================================
+;
+;  Three drivers for this block are in RaspberryPi4/Reference/. All
+;  three were fetched on 2026-08-28 because NOTHING under Datasheets/
+;  documents the RNG200: bcm2711-peripherals.pdf, which is the
+;  register-level authority for this chip, does not contain its
+;  register map, and drbg.pi4's header records that search.
+;
+;    A. rpi-6.12.y_iproc-rng200.c   Raspberry Pi's own kernel fork.
+;                                   THE AUTHORITY FOR THIS FILE.
+;    B. v6.12_iproc-rng200.c        mainline Linux 6.12.
+;    C. v2025.01_iproc_rng200.c     U-Boot v2025.01.
+;
+;  A, B and C AGREE, CHARACTER FOR CHARACTER, ON EVERY REGISTER OFFSET
+;  AND EVERY BIT MASK they have in common. Three independent trees
+;  carrying the same numbers is as close to a datasheet as this block
+;  has here. B and C are register-map witnesses only; neither is
+;  followed for behaviour, and the next paragraph is why.
+;
+;  THEY DO NOT AGREE ON HOW TO START IT, AND THE DIFFERENCE IS THE
+;  WARM-UP. B and C enable the block by setting one bit and start
+;  reading. A has a SEPARATE code path selected by name for this exact
+;  part - `of_device_is_compatible(dev->of_node, "brcm,bcm2711-rng200")`
+;  at rpi-6.12.y_iproc-rng200.c:254-256, choosing bcm2711_rng200_init
+;  and bcm2711_rng200_read instead of the generic pair - and that path
+;  configures a warm-up and waits for it.
+;
+;  A FORK-SPECIFIC CODE PATH SELECTED BY THE PART NAME IS NOT AN
+;  OPTIMISATION. Raspberry Pi added it for their own silicon; mainline
+;  does not have it. This file follows A.
+;
+;  ======================================================================
+;   THE WARM-UP. THIS IS THE PART THAT IS EASY TO SKIP AND EXPENSIVE.
+;  ======================================================================
+;
+;  THE NUMBER IS $40000 - 262144 - AND IT IS A COUNT OF BITS, NOT OF
+;  WORDS AND NOT OF SAMPLES. It is written to
+;  RNG_TOTAL_BIT_COUNT_THRESHOLD at offset $10:
+;
+;      rpi-6.12.y_iproc-rng200.c:212-214
+;          /* initial numbers generated are "less random" so will be
+;             discarded */
+;          val = 0x40000;
+;          iowrite32(val, priv->base +
+;                    RNG_TOTAL_BIT_COUNT_THRESHOLD_OFFSET);
+;
+;  SO THE DISCARD IS DONE BY THE HARDWARE, NOT BY THE DRIVER, and that
+;  is the single most important sentence in this file. There is no
+;  "read N words and throw them away" loop anywhere in any of the three
+;  drivers. The threshold is programmed once, before the block is
+;  enabled, and the block itself withholds the early output. A port
+;  that reproduces a software discard loop instead of writing $10 has
+;  reproduced the comment and not the mechanism.
+;
+;  THE SOFTWARE SIDE OF IT IS A DIFFERENT NUMBER AND A DIFFERENT
+;  REGISTER, and both are needed:
+;
+;      rpi-6.12.y_iproc-rng200.c:176-182
+;          /* ensure warm up period has elapsed */
+;          while (1) {
+;                  val = ioread32(priv->base +
+;                                 RNG_TOTAL_BIT_COUNT_OFFSET);
+;                  if (val > 16)
+;                          break;
+;                  cpu_relax();
+;          }
+;
+;  RNG_TOTAL_BIT_COUNT is at $0C and is a read-only running count. The
+;  driver waits for it to pass 16 before its FIRST read. EntropyBegin()
+;  writes the threshold; EntropyWarmupWait() is that loop, bounded.
+;
+;  WHAT IS *NOT* CLAIMED HERE, because none of the three files says it:
+;  the internal semantics of the threshold register. Whether the block
+;  suppresses FIFO fills until TOTAL_BIT_COUNT reaches the threshold,
+;  or raises the TOTAL_BITS_COUNT interrupt at that point and something
+;  else does the suppressing, is not stated by any source on this disk.
+;  What IS stated is the comment quoted above, in Raspberry Pi's own
+;  driver, next to the write. This file reproduces the write, the value
+;  and the ordering exactly, and does not paraphrase the mechanism.
+;
+;  THE $40000 IS A COINCIDENCE WORTH KNOWING ABOUT. bcm2835-rng.c:26
+;  carries `#define RNG_WARMUP_COUNT 0x40000` with a nearly identical
+;  comment - and writes it to RNG_STATUS at offset $04, which on THIS
+;  part is RNG_SOFT_RESET. Same number, different register, different
+;  block. Anybody who remembers "the Pi warm-up is 0x40000" and writes
+;  it to the Pi 3's offset has just asked the RNG200 to soft-reset
+;  itself on a schedule. The number carried over; the address did not.
+;
+;  ======================================================================
+;   THE FIFO. NEVER READ IT BEFORE THE BLOCK SAYS IT HAS SOMETHING.
+;  ======================================================================
+;
+;  RNG_FIFO_COUNT at $24, low eight bits, is how many 32-bit words are
+;  waiting (rpi-6.12.y_iproc-rng200.c:46-47). RNG_FIFO_DATA at $20 is
+;  the data. Every read in this file is guarded:
+;
+;      rpi-6.12.y_iproc-rng200.c:184-192
+;          /* ensure fifo is not empty */
+;          while (1) {
+;                  num_words = ioread32(priv->base +
+;                                       RNG_FIFO_COUNT_OFFSET) &
+;                              RNG_FIFO_COUNT_RNG_FIFO_COUNT_MASK;
+;                  if (num_words) break;
+;                  ...
+;
+;  A READ OF AN EMPTY FIFO RETURNS SOMETHING. It is a register in a
+;  live block; it returns a number, probably the last word, possibly
+;  zero, and nothing in the hardware complains. That number then looks
+;  exactly like entropy to everything downstream. There is no version
+;  of this that fails loudly on its own, which is why the guard is not
+;  optional and why EntropyWords() counts what it actually got instead
+;  of trusting that it got what it asked for.
+;
+;  THE FIFO THRESHOLD at $24 bits 15:8 is written to 2 by the driver
+;  (rpi-6.12.y_iproc-rng200.c:215-217, "min fifo count to generate full
+;  interrupt"). This file writes it too, for one reason only: to keep
+;  the enable sequence byte-for-byte the same as the driver's. Nothing
+;  here uses interrupts. Leaving one write out of a sequence that is
+;  known to work, on the grounds that it looks unnecessary, is how a
+;  reproduction stops being a reproduction.
+;
+;  ======================================================================
+;   THE ENABLE WORD, AND THE TWO FIELDS IN IT
+;  ======================================================================
+;
+;      rpi-6.12.y_iproc-rng200.c:218-220
+;          /* enable the rng - 1Mhz sample rate */
+;          val = (0x3 << RNG_CTRL_RNG_DIV_CTRL_SHIFT) |
+;                RNG_CTRL_RNG_RBGEN_MASK;
+;          iowrite32(val, priv->base + RNG_CTRL_OFFSET);
+;
+;  RNG_CTRL_RNG_DIV_CTRL_SHIFT is 13 (:24) and RNG_CTRL_RNG_RBGEN_MASK
+;  is $00001FFF (:22). So the word is $00007FFF: divider field 3, and
+;  ALL THIRTEEN bits of the RBGEN field set.
+;
+;  NOTE THAT THE FORK SETS THE WHOLE THIRTEEN-BIT FIELD AND MAINLINE
+;  SETS ONE BIT. Mainline's iproc_rng200_enable_set clears the mask and
+;  ORs in RNG_CTRL_RNG_RBGEN_ENABLE = 1 (v6.12_iproc-rng200.c:52-58).
+;  Raspberry Pi's bcm2711 path ORs in the whole mask. This file writes
+;  $00007FFF because it follows the fork, and the difference is
+;  recorded here rather than smoothed over: if a future silicon run
+;  finds the block behaving oddly, "which of the two enable words did
+;  we write" is a question somebody will need answered, and the answer
+;  should not have to be reconstructed from a diff.
+;
+;  ======================================================================
+;   THE ALREADY-ENABLED CASE, AND WHY IT GETS ITS OWN RETURN VALUE
+;  ======================================================================
+;
+;      rpi-6.12.y_iproc-rng200.c:209-210
+;          if (ioread32(priv->base + RNG_CTRL_OFFSET) &
+;              RNG_CTRL_RNG_RBGEN_MASK)
+;                  return 0;
+;
+;  The driver leaves an already-running block alone. So does
+;  EntropyBegin() - re-programming the threshold under a running block
+;  would restart a warm-up that had already been paid for, and might do
+;  worse.
+;
+;  BUT "SOMEBODY ELSE ENABLED IT" IS NOT THE SAME FACT AS "THE WARM-UP
+;  WAS CONFIGURED", and this file will not let those two be confused.
+;  U-Boot's driver enables this block by setting bit 0 and NEVER writes
+;  the threshold at $10 (v2025.01_iproc_rng200.c:39-52, :140) - it has
+;  no bcm2711 path at all. A Pi 4 that came up through a U-Boot which
+;  touched the RNG therefore has a RUNNING block whose warm-up
+;  threshold is whatever reset left there, and this file cannot know
+;  what that is.
+;
+;  So EntropyBegin() returns #ENTROPY_ALREADY - a distinct, POSITIVE,
+;  non-#ENTROPY_OK value - and the caller decides. A caller that wants
+;  the documented warm-up regardless calls EntropyRestart(), which
+;  performs the soft-reset sequence and then the full enable. The
+;  alternative designs were both worse: silently re-initialising would
+;  throw away a good warm-up, and silently accepting would hand back
+;  words from a block that may never have discarded anything.
+;
+;  ======================================================================
+;   HEALTH: THE TWO STATUS BITS THAT MEAN "DO NOT USE THIS OUTPUT"
+;  ======================================================================
+;
+;  RNG_INT_STATUS at $18 carries (rpi-6.12.y_iproc-rng200.c:36-40):
+;
+;      $80000000  MASTER_FAIL_LOCKOUT
+;      $00020000  STARTUP_TRANSITIONS_MET
+;      $00000020  NIST_FAIL
+;      $00000001  TOTAL_BITS_COUNT
+;
+;  Mainline checks MASTER_FAIL_LOCKOUT | NIST_FAIL before every read
+;  and restarts the block once if either is set
+;  (v6.12_iproc-rng200.c:106-115). RASPBERRY PI'S bcm2711 READ PATH
+;  DOES NOT - it checks neither.
+;
+;  THIS FILE KEEPS THE CHECK, and departs from its own authority to do
+;  it. The reason is one-directional: a block that has declared its own
+;  output failed is the single case where continuing produces bytes
+;  that look perfect and are not. Skipping the check costs nothing
+;  visible and can only ever lose; keeping it costs one register read
+;  per word and can only ever refuse output that the hardware has
+;  already condemned. Where two cited sources differ and one of them
+;  refuses more, this project takes the refusal.
+;
+;  STARTUP_TRANSITIONS_MET IS NOT USED AS A GATE and that is
+;  deliberate. It is named in the fork and in mainline, and NEITHER
+;  driver ever tests it - mainline defines the mask and reads it in no
+;  expression, the fork the same. Nothing on this disk says what
+;  "transitions met" means, whether it latches, or whether it is set on
+;  a part where the startup test is disabled. EntropyIntStatus()
+;  exposes the whole register so a bench run can print it and find out;
+;  it is not wired into a decision on the strength of its name.
+;
+;  ======================================================================
+;   THE WAITS ARE COUNTED IN SPINS, NOT MICROSECONDS
+;  ======================================================================
+;
+;  Every wait in this file takes a spin budget and gives up. Nothing
+;  here can hang the board, and that is worth more than a wait
+;  expressed in real time would be.
+;
+;  Using timer.pi4 would give real time and would cost a mandatory
+;  dependency (and TimerInit() having been called) on a file whose
+;  whole job is to be callable from a bring-up program before anything
+;  else works. A spin count is not a duration - it depends on the core
+;  clock, on the cache state and on whether the MMU is on - so DO NOT
+;  read #ENTROPY_SPINS as a timeout in seconds. It is a bound that
+;  makes a dead block report itself instead of freezing the machine.
+;  #ENTROPY_SPINS is generous by construction; see its comment.
+;
+;  ======================================================================
+;   EntropyStuckCheck - WHAT IT PROVES AND WHAT IT DOES NOT
+;  ======================================================================
+;
+;  READ THIS BEFORE QUOTING ITS RESULT ANYWHERE.
+;
+;  IT IS A STUCK-AT / DEAD-BLOCK DETECTOR. IT IS NOT A RANDOMNESS TEST
+;  AND MUST NEVER BE DESCRIBED AS ONE.
+;
+;  WHAT IT ACTUALLY DOES, on a caller-supplied buffer of N 32-bit
+;  words that EntropyWords() filled:
+;
+;    1. ALL WORDS IDENTICAL. Sets #ENTROPY_STUCK_ALLEQUAL.
+;    2. SHORT REPEATING CYCLE. For each period p from 2 to
+;       #ENTROPY_STUCK_MAXCYCLE, tests whether w[i] = w[i-p] for every
+;       i. Any p that holds sets #ENTROPY_STUCK_CYCLE.
+;    3. ONES/ZEROS BALANCE. Counts set bits over all 32N bits and
+;       requires the count to lie within #ENTROPY_STUCK_BIAS_PPT parts
+;       per thousand of half. Outside that, sets #ENTROPY_STUCK_BIAS.
+;
+;  It also records, for printing rather than for judging: the set-bit
+;  count, the total bit count, the period it found if any, and how many
+;  words were exactly $00000000 and exactly $FFFFFFFF.
+;
+;  WHAT A PASS ESTABLISHES: the block is running, the FIFO is
+;  advancing, the data lines are not tied, the output is not one value
+;  repeated, and it is not grossly biased toward ones or zeros. That
+;  is the failure mode that actually happens - a block that was never
+;  enabled, a base address off by a page, a read of a register that is
+;  not the FIFO - and every one of those produces output that a casual
+;  eye reads as fine.
+;
+;  WHAT A PASS DOES NOT ESTABLISH, and this list is not padding:
+;
+;    * NOT that the output is random. A 32-bit counter passes all
+;      three tests. So does the low half of any decent PRNG. So does
+;      AES in counter mode under a key an attacker chose.
+;    * NOT that the output is unpredictable. Nothing here looks for
+;      structure beyond period 64.
+;    * NOT an entropy rate. It cannot distinguish 32 bits of entropy
+;      per word from 1.
+;    * NOT NIST SP 800-90B health testing. There is no repetition-count
+;      test and no adaptive-proportion test here, and the block's own
+;      NIST_FAIL bit - which IS such a test, in hardware - is checked
+;      separately and is not part of this verdict.
+;    * NOT a statement about any word other than the ones in the
+;      buffer. It is a sample, taken once.
+;
+;  THE BIAS BAND IS A DEAD-BLOCK THRESHOLD, NOT A STATISTICAL TEST.
+;  #ENTROPY_STUCK_BIAS_PPT is 10, so a run is refused only if the set-
+;  bit fraction leaves 49.0%..51.0%. At the recommended 4096 words that
+;  is 131072 bits, where the standard deviation of the set-bit count
+;  for a fair source is 181 bits, and the band is +/- 1310 - about
+;  seven standard deviations. IT IS CHOSEN TO NEVER FIRE ON A HEALTHY
+;  SOURCE, because a self-test that cries wolf gets disabled. It will
+;  therefore MISS a source that is merely bad. That is the correct
+;  trade for this instrument and it is the reason the list above says
+;  what it says.
+;
+;  THERE IS NO ORACLE FOR THIS. Every other gate in this tree checks an
+;  implementation against an independent one - NIST vectors, a Python
+;  model, a second driver. A hardware entropy source has no expected
+;  output by definition, so there is nothing to compare against and no
+;  gate can ever say the numbers were right. What CAN be gated is this
+;  detector's own logic, and tools/a64/a64_entropy_check.py does that
+;  by feeding it constructed streams whose verdict is known. Say that
+;  plainly wherever the result is reported.
+;
+;  ======================================================================
+;   WHAT HAS BEEN PROVEN - 2026-08-28
+;  ======================================================================
+;
+;  PROVEN, under the project's independent A64 model
+;  (tools/a64/a64_interp.py) with the RNG200 registers emulated by
+;  tools/a64/a64_entropy_check.py, which is NOT hardware:
+;
+;    * The enable sequence writes exactly the four words the driver
+;      writes, to exactly the four offsets, IN THE DRIVER'S ORDER, and
+;      writes nothing else. The gate records every MMIO access and
+;      compares the transcript.
+;    * EntropyBegin() on an already-enabled block writes NOTHING and
+;      returns #ENTROPY_ALREADY.
+;    * EntropyRestart() reproduces the soft-reset transcript.
+;    * No FIFO read is ever issued while the modelled FIFO_COUNT is 0.
+;      The gate faults the run if one is.
+;    * The warm-up wait does not return before TOTAL_BIT_COUNT passes
+;      16, and gives up rather than spinning for ever.
+;    * MASTER_FAIL_LOCKOUT and NIST_FAIL each stop the read.
+;    * The stuck detector's verdict on eight constructed streams -
+;      constant, alternating, period 7, period 64, period 65 (which it
+;      must NOT catch, and the gate asserts it does not), all-ones,
+;      all-zeros, and a counter (which it must NOT catch either).
+;
+;  NOT PROVEN:
+;    * NOTHING HERE HAS RUN ON SILICON. Not one register of the real
+;      block has been read. Every offset is a citation, not a
+;      measurement.
+;    * NO STATEMENT ABOUT THE QUALITY OF THE HARDWARE'S OUTPUT, of any
+;      kind, has been made or can be made here.
+;    * The spin budgets have never been measured against a real block's
+;      latency. #ENTROPY_SPINS is generous, not calibrated.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  THE BASE. Kept as a literal here rather than taken from soc.pi4's
+;  #SOC_RNG_BASE, for the same reason uart.pi4:476-488 keeps its two:
+;  a bring-up program that wants entropy should not be forced to define
+;  #SOC_TARGET and include soc.pi4 as well.
+;
+;  THE DUPLICATION IS MACHINE-CHECKED, NOT TRUSTED.
+;  tools/a64/a64_entropy_check.py reads #SOC_RNG_BASE out of soc.pi4
+;  and FAILS if this line disagrees with it. (uart.pi4 claims the same
+;  arrangement for its two bases and names a gate,
+;  tools/a64/a64_socbase_check.py, that is not in the tree - so that
+;  pair really is trusted rather than checked. Reported, not fixed
+;  here; uart.pi4 is not this task's file.)
+;
+;  bcm2711.dtsi:125 rng@7e104000, translated by bcm2711.dtsi:41.
+; ----------------------------------------------------------------------
+#ENTROPY_BASE = $FE104000
+
+; ----------------------------------------------------------------------
+;  RNG200 REGISTER OFFSETS AND BIT MASKS.
+;
+;  Every line cites RaspberryPi4/Reference/rpi-6.12.y_iproc-rng200.c,
+;  which is Raspberry Pi's own kernel fork and the only one of the
+;  three drivers with a code path written for this part by name. The
+;  mainline and U-Boot copies in the same folder agree on all of them.
+;
+;  32-BIT REGISTERS, PeekN / PokeN ONLY. A bare Peek would be a 64-bit
+;  access - two registers at once on a device aperture, which is a
+;  fatal unaligned-width access with the MMU off and is not a thing
+;  device space is required to service at all. PeekN and not PeekL
+;  because these are unsigned patterns: MASTER_FAIL_LOCKOUT is bit 31,
+;  and PeekL sign-extends since 2026-08-25, which would make
+;  `status & $80000000` fire on a sign extension rather than on the
+;  bit. That is the whole reason .n exists.
+;
+;  The dtsi says the block is $28 bytes long (bcm2711.dtsi:127) and the
+;  highest offset below is $24, four bytes wide. The two agree exactly,
+;  which is a cheap independent check that this map is the map for this
+;  node and not for some other RNG200 instance.
+; ----------------------------------------------------------------------
+#RNG_CTRL_OFF           = $00        ; :21
+#RNG_CTRL_RBGEN_MASK    = $00001FFF  ; :22
+#RNG_CTRL_RBGEN_ENABLE  = $00000001  ; :23
+#RNG_CTRL_DIV_SHIFT     = 13         ; :24  RNG_CTRL_RNG_DIV_CTRL_SHIFT
+
+#RNG_SOFT_RESET_OFF     = $04        ; :26
+#RNG_SOFT_RESET_BIT     = $00000001  ; :27
+
+#RBG_SOFT_RESET_OFF     = $08        ; :29
+#RBG_SOFT_RESET_BIT     = $00000001  ; :30
+
+#RNG_TOTAL_BITS_OFF     = $0C        ; :32  RNG_TOTAL_BIT_COUNT
+#RNG_TOTAL_BITS_THR_OFF = $10        ; :34  ..._THRESHOLD
+
+#RNG_INT_STATUS_OFF     = $18        ; :36
+#RNG_INT_MASTER_FAIL    = $80000000  ; :37  MASTER_FAIL_LOCKOUT
+#RNG_INT_STARTUP_MET    = $00020000  ; :38  STARTUP_TRANSITIONS_MET
+#RNG_INT_NIST_FAIL      = $00000020  ; :39  NIST_FAIL
+#RNG_INT_TOTAL_BITS     = $00000001  ; :40  TOTAL_BITS_COUNT
+#RNG_INT_CLEAR_ALL      = $FFFFFFFF  ; the driver's restart writes this
+
+#RNG_INT_ENABLE_OFF     = $1C        ; :42  named, never written here
+
+#RNG_FIFO_DATA_OFF      = $20        ; :44
+#RNG_FIFO_COUNT_OFF     = $24        ; :46
+#RNG_FIFO_COUNT_MASK    = $000000FF  ; :47
+#RNG_FIFO_THR_SHIFT     = 8          ; :48  RNG_FIFO_THRESHOLD_SHIFT
+
+; ----------------------------------------------------------------------
+;  THE THREE VALUES THE bcm2711 PATH PROGRAMS.
+;
+;  Spelled as the finished words rather than as shifts, because a
+;  constant declaration in this language may not contain arithmetic
+;  (soc.pi4's header records the refusal). The derivation is written
+;  beside each one so the literal can be checked by eye, and
+;  a64_entropy_check.py re-derives all three from the shifts above and
+;  fails if they disagree.
+; ----------------------------------------------------------------------
+
+;  $40000 = 262144 bits. rpi-6.12.y_iproc-rng200.c:213.
+#ENTROPY_WARMUP_BITS = $00040000
+
+;  2 << #RNG_FIFO_THR_SHIFT  =  2 << 8  =  $200.  :216-217.
+#ENTROPY_FIFO_THR_WORD = $00000200
+
+;  (3 << #RNG_CTRL_DIV_SHIFT) | #RNG_CTRL_RBGEN_MASK
+;    = (3 << 13) | $1FFF  =  $6000 | $1FFF  =  $7FFF.  :219.
+#ENTROPY_ENABLE_WORD = $00007FFF
+
+;  The driver's own software-side warm-up gate: TOTAL_BIT_COUNT > 16.
+;  :178-180.
+#ENTROPY_READY_BITS = 16
+
+; ----------------------------------------------------------------------
+;  RETURN CODES. Every refusal is negative and every success is
+;  positive, so one comparison separates them - the same rule
+;  drbg.pi4 states for itself.
+;
+;  #ENTROPY_ALREADY is POSITIVE because the block IS usable; it is a
+;  fact about provenance, not a failure. A caller that does not care
+;  writes `If st < 0`; a caller that does care tests for it by name.
+; ----------------------------------------------------------------------
+#ENTROPY_OK          =  1
+#ENTROPY_ALREADY     =  2
+#ENTROPY_ERR_TIMEOUT = -1   ; a bounded wait ran out of spins
+#ENTROPY_ERR_HEALTH  = -2   ; MASTER_FAIL_LOCKOUT or NIST_FAIL is set
+#ENTROPY_ERR_OFF     = -3   ; the block is not enabled
+#ENTROPY_ERR_ARG     = -4   ; a null pointer or a non-positive count
+
+; ----------------------------------------------------------------------
+;  THE DEFAULT SPIN BUDGET. NOT A DURATION - see the header.
+;
+;  Four million iterations of a loop whose body is one device read. On
+;  a 1.5 GHz Cortex-A72 with the MMU off, a Device-nGnRnE load is not
+;  cached and not merged, so this is somewhere between a fraction of a
+;  second and several seconds. The block is documented as sampling at
+;  1 MHz (rpi-6.12.y_iproc-rng200.c:218), so one 32-bit FIFO word is
+;  about 32 microseconds of sampling and the whole $40000-bit warm-up
+;  is about a quarter of a second. The budget has to clear that with
+;  room, and it does.
+; ----------------------------------------------------------------------
+#ENTROPY_SPINS = 4000000
+
+; ----------------------------------------------------------------------
+;  STUCK-DETECTOR VERDICT BITS. Zero means every check passed.
+;  A verdict is a BITMASK, not a code: two failures are two bits.
+; ----------------------------------------------------------------------
+#ENTROPY_STUCK_OK       = 0
+#ENTROPY_STUCK_ALLEQUAL = 1   ; every word identical
+#ENTROPY_STUCK_CYCLE    = 2   ; repeats with a period of 2..64
+#ENTROPY_STUCK_BIAS     = 4   ; set-bit fraction outside 49.0%..51.0%
+#ENTROPY_STUCK_SHORT    = 8   ; fewer than two words to look at
+
+;  The longest period the cycle test looks for. 64 words is 2048 bits,
+;  which is far more state than any plausible stuck-at or wiring
+;  failure carries, and the test costs 64 passes over the buffer.
+#ENTROPY_STUCK_MAXCYCLE = 64
+
+;  The bias band, in parts per thousand either side of half. See the
+;  header: this is a dead-block threshold, deliberately far too wide
+;  to be a statistical test.
+#ENTROPY_STUCK_BIAS_PPT = 10
+
+; ----------------------------------------------------------------------
+;  MEASUREMENTS FROM THE LAST EntropyStuckCheck, for printing.
+;
+;  Globals, so they are zero at reset (the __a64_bss_zero loop in the
+;  standard prologue). They are OUTPUTS OF THE LAST RUN and mean
+;  nothing before the first one; EntropyStuckWords() is 0 until then,
+;  which is how a caller tells.
+;
+;  They exist because a verdict of "failed" that cannot say WHAT it saw
+;  sends the next person back to the board to find out. Printing the
+;  set-bit count next to the total is one line and answers most of it.
+; ----------------------------------------------------------------------
+Global entStuckWords.i        ; how many words the last check looked at
+Global entStuckOnes.i         ; set bits counted across them
+Global entStuckBits.i         ; total bits looked at (words * 32)
+Global entStuckPeriod.i       ; the repeating period found, else 0
+Global entStuckZeroWords.i    ; words that were exactly $00000000
+Global entStuckOnesWords.i    ; words that were exactly $FFFFFFFF
+
+; ----------------------------------------------------------------------
+;  Counters that survive across calls, for a bring-up print.
+;  entTimeouts is the one worth watching: a board that produces
+;  entropy but times out sometimes is a different problem from a board
+;  that produces none.
+; ----------------------------------------------------------------------
+Global entWordsRead.i         ; FIFO words this program has consumed
+Global entTimeouts.i          ; bounded waits that ran out
+Global entHealthStops.i       ; reads stopped by a health bit
+
+; ======================================================================
+;  THE REGISTER LAYER
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  EntropyBarrier() - dsb sy + isb, from
+;  RaspberryPi4/Intrinsics/bcm2711_hardware.def.
+;
+;  Exposed as a procedure for the same reason GpioBarrier() is: so a
+;  caller sequencing this block against another peripheral has one
+;  place to reach for, and so there is one line to change if the
+;  barrier ever needs to be weaker.
+;
+;  WHY THERE IS ONE AROUND EVERY ACCESS HERE AND NOT ONLY AT THE EDGES.
+;  This block is not like GPIO, where a burst of writes to one
+;  peripheral can share a barrier. Every read of RNG_FIFO_DATA has a
+;  SIDE EFFECT - it consumes a word - and its result depends on a
+;  RNG_FIFO_COUNT read that must have completed first. Letting those
+;  two be reordered or merged is precisely the way to read an empty
+;  FIFO while believing the guard held.
+; ----------------------------------------------------------------------
+Procedure EntropyBarrier()
+  a64_barrier()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyReg(off) / EntropySetReg(off, v) - one 32-bit register.
+;
+;  INTERNAL. The public accessors below name the registers; these two
+;  exist so the barrier discipline lives in one place instead of at
+;  thirty call sites.
+; ----------------------------------------------------------------------
+Procedure.i EntropyReg(off.i)
+  Protected v.i
+  EntropyBarrier()
+  v = PeekN(#ENTROPY_BASE + off)
+  EntropyBarrier()
+  ProcedureReturn v & $FFFFFFFF
+EndProcedure
+
+Procedure EntropySetReg(off.i, v.i)
+  EntropyBarrier()
+  PokeN(#ENTROPY_BASE + off, v & $FFFFFFFF)
+  EntropyBarrier()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The named readers. All four are public because a bring-up program
+;  that can print these four numbers can diagnose this block without
+;  another build.
+; ----------------------------------------------------------------------
+Procedure.i EntropyCtrl()
+  ProcedureReturn EntropyReg(#RNG_CTRL_OFF)
+EndProcedure
+
+Procedure.i EntropyIntStatus()
+  ProcedureReturn EntropyReg(#RNG_INT_STATUS_OFF)
+EndProcedure
+
+Procedure.i EntropyTotalBits()
+  ProcedureReturn EntropyReg(#RNG_TOTAL_BITS_OFF)
+EndProcedure
+
+Procedure.i EntropyFifoCount()
+  ProcedureReturn EntropyReg(#RNG_FIFO_COUNT_OFF) & #RNG_FIFO_COUNT_MASK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyEnabled() - 1 if any bit of the RBGEN field is set.
+;
+;  THE TEST IS THE MASK, NOT BIT 0, because the fork's enable word sets
+;  all thirteen and mainline's sets one. Testing bit 0 alone would
+;  still be right for both today - bit 0 is in both words - but the
+;  driver's own already-enabled test is written against the mask
+;  (rpi-6.12.y_iproc-rng200.c:209) and this reproduces it.
+; ----------------------------------------------------------------------
+Procedure.i EntropyEnabled()
+  If (EntropyCtrl() & #RNG_CTRL_RBGEN_MASK) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyHealthy() - 0 if the block has condemned its own output.
+;
+;  MASTER_FAIL_LOCKOUT or NIST_FAIL. See the header for why this check
+;  is kept when Raspberry Pi's own bcm2711 read path drops it.
+; ----------------------------------------------------------------------
+Procedure.i EntropyHealthy()
+  Protected s.i
+  s = EntropyIntStatus()
+  If (s & #RNG_INT_MASTER_FAIL) <> 0
+    ProcedureReturn 0
+  EndIf
+  If (s & #RNG_INT_NIST_FAIL) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  STARTING THE BLOCK
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  entropy_Program() - the four writes, in the driver's order.
+;
+;  INTERNAL, and the order is the point. The threshold and the FIFO
+;  threshold are written BEFORE the enable word, exactly as
+;  rpi-6.12.y_iproc-rng200.c:212-220 writes them. Programming a warm-up
+;  threshold into a block that is already generating would be asking a
+;  different question, and it is not the question the driver asks.
+; ----------------------------------------------------------------------
+Procedure entropy_Program()
+  EntropySetReg(#RNG_TOTAL_BITS_THR_OFF, #ENTROPY_WARMUP_BITS)
+  EntropySetReg(#RNG_FIFO_COUNT_OFF, #ENTROPY_FIFO_THR_WORD)
+  EntropySetReg(#RNG_CTRL_OFF, #ENTROPY_ENABLE_WORD)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyBegin() - enable the block if nobody else has.
+;
+;  Returns #ENTROPY_OK if this call programmed and enabled it, or
+;  #ENTROPY_ALREADY if it was already running and was left alone. Both
+;  are positive; see the header for why the distinction is handed back
+;  rather than swallowed.
+;
+;  IT CANNOT FAIL, because nothing it does can fail: three writes to
+;  registers that are always there. Failures show up at the first read,
+;  which is where they can be attributed.
+; ----------------------------------------------------------------------
+Procedure.i EntropyBegin()
+  If EntropyEnabled() = 1
+    ProcedureReturn #ENTROPY_ALREADY
+  EndIf
+  entropy_Program()
+  ProcedureReturn #ENTROPY_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyRestart() - disable, clear, soft-reset both cores, re-enable.
+;
+;  The sequence is iproc_rng200_restart, v6.12_iproc-rng200.c:61-88,
+;  which U-Boot carries identically at v2025.01_iproc_rng200.c:54-82.
+;  Two independent trees, same eight accesses, same order:
+;
+;      disable (clear the RBGEN field in RNG_CTRL)
+;      write $FFFFFFFF to RNG_INT_STATUS          - clear all status
+;      set   RBG_SOFT_RESET bit in $08
+;      set   RNG_SOFT_RESET bit in $04
+;      clear RNG_SOFT_RESET bit in $04
+;      clear RBG_SOFT_RESET bit in $08
+;      enable
+;
+;  THE ORDER IS ASYMMETRIC AND THAT IS NOT A TYPO IN THE DRIVER. RBG is
+;  asserted first and released last; RNG is asserted second and
+;  released first. Both copies do it that way. It is reproduced, not
+;  tidied - a reset sequence is exactly the kind of thing where the
+;  order is the whole content and nobody remembers why.
+;
+;  WHAT IS DIFFERENT HERE: this file's last step is the FULL bcm2711
+;  enable - the warm-up threshold, the FIFO threshold, then $7FFF -
+;  where the two drivers' restart re-enables with their own generic
+;  one-bit write. Restarting is precisely the moment the warm-up has
+;  to be re-established, and a restart that left the threshold to
+;  whatever it was is the silent half of the bug this file exists to
+;  avoid.
+;
+;  Returns #ENTROPY_OK. Like EntropyBegin() it cannot fail; the first
+;  read is where a dead block reports itself.
+; ----------------------------------------------------------------------
+Procedure.i EntropyRestart()
+  Protected v.i
+
+  ; disable: clear the whole RBGEN field, keep everything else
+  v = EntropyCtrl()
+  v = v & ~#RNG_CTRL_RBGEN_MASK
+  EntropySetReg(#RNG_CTRL_OFF, v)
+
+  EntropySetReg(#RNG_INT_STATUS_OFF, #RNG_INT_CLEAR_ALL)
+
+  v = EntropyReg(#RBG_SOFT_RESET_OFF)
+  EntropySetReg(#RBG_SOFT_RESET_OFF, v | #RBG_SOFT_RESET_BIT)
+
+  v = EntropyReg(#RNG_SOFT_RESET_OFF)
+  EntropySetReg(#RNG_SOFT_RESET_OFF, v | #RNG_SOFT_RESET_BIT)
+
+  v = EntropyReg(#RNG_SOFT_RESET_OFF)
+  EntropySetReg(#RNG_SOFT_RESET_OFF, v & ~#RNG_SOFT_RESET_BIT)
+
+  v = EntropyReg(#RBG_SOFT_RESET_OFF)
+  EntropySetReg(#RBG_SOFT_RESET_OFF, v & ~#RBG_SOFT_RESET_BIT)
+
+  entropy_Program()
+  ProcedureReturn #ENTROPY_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyStop() - clear the RBGEN field and stop generating.
+;
+;  iproc_rng200_cleanup, v6.12_iproc-rng200.c:160-165. Present so that
+;  a diagnostic can put the block back the way it found it, and so
+;  that a program which has finished with entropy is not leaving a
+;  noise source running. It does NOT reset anything: a later
+;  EntropyBegin() will see the block disabled and program the warm-up
+;  again, which is the correct restart.
+; ----------------------------------------------------------------------
+Procedure EntropyStop()
+  Protected v.i
+  v = EntropyCtrl()
+  v = v & ~#RNG_CTRL_RBGEN_MASK
+  EntropySetReg(#RNG_CTRL_OFF, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyWarmupWait(spins) - block until TOTAL_BIT_COUNT passes 16.
+;
+;  rpi-6.12.y_iproc-rng200.c:176-182, bounded. Returns #ENTROPY_OK,
+;  #ENTROPY_ERR_TIMEOUT, or #ENTROPY_ERR_OFF if the block is not even
+;  enabled - because waiting for a counter to move in a block that is
+;  switched off is the wait that would otherwise burn the whole budget
+;  and then report a timeout, which is a true answer to the wrong
+;  question.
+;
+;  THE DRIVER'S LOOP IS UNBOUNDED. This one is not, and the difference
+;  is the whole argument for the spin budget: the kernel has a
+;  watchdog, a console and a scheduler. A bare-metal image at $200000
+;  with no exception vector has none of those, and an unbounded wait
+;  on a dead peripheral is indistinguishable from a hang.
+; ----------------------------------------------------------------------
+Procedure.i EntropyWarmupWait(spins.i)
+  Protected left.i
+
+  If EntropyEnabled() = 0
+    ProcedureReturn #ENTROPY_ERR_OFF
+  EndIf
+
+  left = spins
+  While left > 0
+    If EntropyTotalBits() > #ENTROPY_READY_BITS
+      ProcedureReturn #ENTROPY_OK
+    EndIf
+    left = left - 1
+  Wend
+  entTimeouts = entTimeouts + 1
+  ProcedureReturn #ENTROPY_ERR_TIMEOUT
+EndProcedure
+
+; ======================================================================
+;  READING
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  EntropyWords(dst, count, spins) - count 32-bit words into dst.
+;
+;  Returns the number of words WRITTEN, which is `count` on success, or
+;  a negative refusal having written however many it managed. A caller
+;  that ignores the return value and uses the buffer anyway is using
+;  whatever was in it, which is a bug it can find - the same argument
+;  DrbgGenerate() makes for writing nothing at all when it refuses.
+;
+;  THE LOOP IS: check health, wait for FIFO_COUNT > 0 within the
+;  budget, read one word, repeat. It does NOT read the count and then
+;  drain that many words in a burst the way the driver does, and that
+;  is deliberate: the burst form has to trust a count it read earlier,
+;  and re-reading the count per word costs one device access against a
+;  block that is producing about one word every thirty microseconds
+;  anyway. Correctness first where the cost is invisible.
+;
+;  ONE RESTART, AT MOST, AND NOT HERE. Mainline restarts the block once
+;  per read call when it sees a health bit
+;  (v6.12_iproc-rng200.c:110-114). This file refuses instead and leaves
+;  the restart to the caller, because a restart discards the warm-up
+;  and a library that silently re-warms in the middle of filling a seed
+;  buffer would produce a buffer whose two halves came from two
+;  differently-conditioned runs. EntropyRestart() is public; the caller
+;  can retry, and can say so.
+;
+;  ALIGNMENT: dst must be 4-byte aligned. PokeN of an unaligned address
+;  is a fatal access with the MMU off - the rule
+;  tools/a64/a64_interp.py has held since 2026-08-28 - and this file
+;  does not check it, exactly as string.pi4 does not check its
+;  destinations. A .a array or any Global is aligned.
+; ----------------------------------------------------------------------
+Procedure.i EntropyWords(dst.i, count.i, spins.i)
+  Protected got.i
+  Protected left.i
+  Protected ready.i
+
+  If dst = 0
+    ProcedureReturn #ENTROPY_ERR_ARG
+  EndIf
+  If count <= 0
+    ProcedureReturn #ENTROPY_ERR_ARG
+  EndIf
+  If EntropyEnabled() = 0
+    ProcedureReturn #ENTROPY_ERR_OFF
+  EndIf
+
+  got = 0
+  While got < count
+    If EntropyHealthy() = 0
+      entHealthStops = entHealthStops + 1
+      ProcedureReturn #ENTROPY_ERR_HEALTH
+    EndIf
+
+    ; wait for at least one word, bounded
+    ready = 0
+    left = spins
+    While left > 0
+      If EntropyFifoCount() > 0
+        ready = 1
+        left = 0
+      Else
+        left = left - 1
+      EndIf
+    Wend
+    If ready = 0
+      entTimeouts = entTimeouts + 1
+      ProcedureReturn #ENTROPY_ERR_TIMEOUT
+    EndIf
+
+    PokeN(dst + (got * 4), EntropyReg(#RNG_FIFO_DATA_OFF))
+    got = got + 1
+    entWordsRead = entWordsRead + 1
+  Wend
+  ProcedureReturn got
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyBytes(dst, nbytes, spins) - nbytes of entropy into dst.
+;
+;  Returns nbytes on success or a negative refusal. Any number of bytes
+;  is allowed; a partial final word is taken from the low end of one
+;  FIFO word and THE REST OF THAT WORD IS DISCARDED.
+;
+;  DISCARDING IT IS THE POINT. Keeping the leftover for the next call
+;  would mean the library held entropy in a global between calls, which
+;  is state an attacker's fault-injection story can reach and which
+;  makes two calls correlated in a way neither caller asked for. The
+;  cost of throwing it away is at most three bytes per call from a
+;  block that makes about a megabit a second.
+;
+;  BYTE ORDER: little-endian within the word - byte 0 of the output is
+;  bits 7:0 of the FIFO word. That is the natural order on this part
+;  and it is the order the driver's memcpy produces
+;  (v6.12_iproc-rng200.c:129-132). It does not matter for entropy, and
+;  it is written down because "it does not matter" is exactly the sort
+;  of claim that later has to be checked against a wire format.
+; ----------------------------------------------------------------------
+Procedure.i EntropyBytes(dst.i, nbytes.i, spins.i)
+  Protected done.i
+  Protected w.i
+  Protected r.i
+  Protected k.i
+  Protected st.i
+  Protected wordbuf.i
+
+  If dst = 0
+    ProcedureReturn #ENTROPY_ERR_ARG
+  EndIf
+  If nbytes <= 0
+    ProcedureReturn #ENTROPY_ERR_ARG
+  EndIf
+
+  done = 0
+  While done < nbytes
+    wordbuf = 0
+    st = EntropyWords(@wordbuf, 1, spins)
+    If st < 0
+      ProcedureReturn st
+    EndIf
+    w = PeekN(@wordbuf)
+    r = nbytes - done
+    If r > 4
+      r = 4
+    EndIf
+    k = 0
+    While k < r
+      PokeB(dst + done + k, (w >> (k * 8)) & 255)
+      k = k + 1
+    Wend
+    done = done + r
+  Wend
+  ProcedureReturn done
+EndProcedure
+
+; ======================================================================
+;  THE STUCK-AT / DEAD-BLOCK DETECTOR
+; ======================================================================
+;
+;  Read the header section of the same name before quoting any result
+;  from this. It is not a randomness test.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  entropy_Popcount32(v) - set bits in the low 32 of v.
+;
+;  INTERNAL. A plain shift-and-test loop rather than the SWAR trick or
+;  the A64 `cnt` instruction, because 32 iterations over a few thousand
+;  words is nothing on an A72 and this file will not carry a clever
+;  bit-twiddle that nothing in the tree can check independently.
+;  bits.pi4 has a popcount; using it would make bits.pi4 a mandatory
+;  include for anybody who wants entropy, which is the trade uart.pi4
+;  declines for its bases and this file declines here.
+; ----------------------------------------------------------------------
+Procedure.i entropy_Popcount32(v.i)
+  Protected n.i
+  Protected x.i
+  x = v & $FFFFFFFF
+  n = 0
+  While x <> 0
+    n = n + (x & 1)
+    x = x >> 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EntropyStuckCheck(buf, words) - the verdict, as a bitmask.
+;
+;  buf is a caller-owned array of `words` 32-bit words, already filled
+;  by EntropyWords(). This routine performs NO hardware access at all -
+;  which is what lets tools/a64/a64_entropy_check.py drive it with
+;  constructed streams and know the answer in advance.
+;
+;  Returns #ENTROPY_STUCK_OK (0) or the OR of the failure bits, and
+;  leaves its measurements in the entStuck* globals for printing.
+;
+;  A run of fewer than two words cannot say anything, and says so with
+;  #ENTROPY_STUCK_SHORT rather than passing vacuously. A gate that
+;  reports success on an empty sample is the shape of test this project
+;  keeps a whole vault note about.
+; ----------------------------------------------------------------------
+Procedure.i EntropyStuckCheck(buf.i, words.i)
+  Protected verdict.i
+  Protected i.i
+  Protected p.i
+  Protected same.i
+  Protected w.i
+  Protected ones.i
+  Protected bits.i
+  Protected half.i
+  Protected band.i
+  Protected diff.i
+
+  entStuckWords    = 0
+  entStuckOnes     = 0
+  entStuckBits     = 0
+  entStuckPeriod   = 0
+  entStuckZeroWords = 0
+  entStuckOnesWords = 0
+
+  If buf = 0
+    ProcedureReturn #ENTROPY_STUCK_SHORT
+  EndIf
+  If words < 2
+    ProcedureReturn #ENTROPY_STUCK_SHORT
+  EndIf
+
+  verdict = #ENTROPY_STUCK_OK
+  entStuckWords = words
+
+  ; --- the ones count, and the two degenerate word values -----------
+  ones = 0
+  i = 0
+  While i < words
+    w = PeekN(buf + (i * 4))
+    ones = ones + entropy_Popcount32(w)
+    If w = 0
+      entStuckZeroWords = entStuckZeroWords + 1
+    EndIf
+    If w = $FFFFFFFF
+      entStuckOnesWords = entStuckOnesWords + 1
+    EndIf
+    i = i + 1
+  Wend
+  bits = words * 32
+  entStuckOnes = ones
+  entStuckBits = bits
+
+  ; --- period 1: every word identical -------------------------------
+  ;  Tested separately from the cycle loop so the verdict can say WHICH
+  ;  of the two it was. A stuck data bus and a short shift-register
+  ;  cycle are different repairs.
+  same = 1
+  i = 1
+  While i < words
+    If PeekN(buf + (i * 4)) <> PeekN(buf)
+      same = 0
+      i = words
+    Else
+      i = i + 1
+    EndIf
+  Wend
+  If same = 1
+    verdict = verdict | #ENTROPY_STUCK_ALLEQUAL
+    entStuckPeriod = 1
+  EndIf
+
+  ; --- periods 2..#ENTROPY_STUCK_MAXCYCLE ---------------------------
+  ;  A period p is only meaningful if the buffer holds more than p
+  ;  words - "w[i] = w[i-p] for every i" is vacuously true when there
+  ;  is no such i, and reporting a period the sample cannot support
+  ;  would be the vacuous-pass failure again, in the other direction.
+  If entStuckPeriod = 0
+    p = 2
+    While p <= #ENTROPY_STUCK_MAXCYCLE
+      If words > p
+        same = 1
+        i = p
+        While i < words
+          If PeekN(buf + (i * 4)) <> PeekN(buf + ((i - p) * 4))
+            same = 0
+            i = words
+          Else
+            i = i + 1
+          EndIf
+        Wend
+        If same = 1
+          verdict = verdict | #ENTROPY_STUCK_CYCLE
+          entStuckPeriod = p
+          p = #ENTROPY_STUCK_MAXCYCLE
+        EndIf
+      EndIf
+      p = p + 1
+    Wend
+  EndIf
+
+  ; --- the balance band ---------------------------------------------
+  ;  half = bits/2, band = bits * PPT / 1000 / 2... written out as
+  ;  (bits / 1000) * PPT / 2 would lose precision on small samples, so
+  ;  it is (bits * PPT) / 2000 with the multiply first. bits is at most
+  ;  a few hundred thousand here and .i is 64 bits, so the product
+  ;  cannot overflow.
+  half = bits / 2
+  band = (bits * #ENTROPY_STUCK_BIAS_PPT) / 2000
+  diff = ones - half
+  If diff < 0
+    diff = 0 - diff
+  EndIf
+  If diff > band
+    verdict = verdict | #ENTROPY_STUCK_BIAS
+  EndIf
+
+  ProcedureReturn verdict
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The measurements from the last EntropyStuckCheck, readable.
+;
+;  Print these next to the verdict. A failure that says only "failed"
+;  costs somebody a trip to the board; "127 words, period 7" does not.
+; ----------------------------------------------------------------------
+Procedure.i EntropyStuckWords()
+  ProcedureReturn entStuckWords
+EndProcedure
+
+Procedure.i EntropyStuckOnes()
+  ProcedureReturn entStuckOnes
+EndProcedure
+
+Procedure.i EntropyStuckBits()
+  ProcedureReturn entStuckBits
+EndProcedure
+
+Procedure.i EntropyStuckPeriod()
+  ProcedureReturn entStuckPeriod
+EndProcedure
+
+Procedure.i EntropyStuckZeroWords()
+  ProcedureReturn entStuckZeroWords
+EndProcedure
+
+Procedure.i EntropyStuckOnesWords()
+  ProcedureReturn entStuckOnesWords
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Lifetime counters, readable. Same argument DrbgSeedBytes() makes:
+;  a program that thinks it read entropy and reports 0 words has found
+;  a real bug in one line.
+; ----------------------------------------------------------------------
+Procedure.i EntropyWordsRead()
+  ProcedureReturn entWordsRead
+EndProcedure
+
+Procedure.i EntropyTimeouts()
+  ProcedureReturn entTimeouts
+EndProcedure
+
+Procedure.i EntropyHealthStops()
+  ProcedureReturn entHealthStops
+EndProcedure

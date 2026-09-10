@@ -1,0 +1,982 @@
+; ======================================================================
+;  dhcp.pi4 - a DHCP client, RFC 2131 / RFC 2132, the build-and-parse
+;  half only.
+;
+;  net.pi4's header says it out loud: "NO DHCP ... DHCP in particular is
+;  deliberately absent: it is a separate job." This is that separate job,
+;  and it rides on net.pi4's UDP exactly as tftp.pi4 does - it builds a
+;  DISCOVER or a REQUEST into its own buffer and parses an OFFER or an
+;  ACK the caller hands it, and it does no I/O. Anvil runs the pump.
+;
+;  THE ONE THING DHCP NEEDS THAT AN ORDINARY UDP EXCHANGE DOES NOT is to
+;  send and receive before this board has an address at all. Two pieces
+;  of machinery outside this file make that possible and both are named
+;  here so the shape is not a surprise:
+;
+;    * net.pi4's NetUdpBuildBcast() builds a datagram from 0.0.0.0 to the
+;      all-ones broadcast with a broadcast destination MAC, requiring
+;      only that our own hardware address is known - NOT a configured IP.
+;      That is how DISCOVER and REQUEST go out.
+;    * net.pi4's NetDhcpMode(kind, 1) lets its receive path accept a datagram
+;      addressed to the all-ones broadcast while we are still
+;      unconfigured. That is how the OFFER and ACK get in. It is a flag
+;      that defaults OFF and is turned on only around a DHCP exchange, so
+;      no other command's receive behaviour changes.
+;
+;  WE SET THE BROADCAST FLAG (bit 15 of `flags`), which asks the server
+;  to BROADCAST its replies rather than unicast them to an address we do
+;  not yet own and cannot ARP for. RFC 2131 s4.1 describes exactly this
+;  for "a client that cannot receive unicast IP datagrams until ... its
+;  network software has been configured". A server that honours the flag
+;  is the assumption; one that ignores it and unicasts to yiaddr will not
+;  be heard, and that limitation is stated in the command's own output
+;  rather than left to be discovered.
+;
+;  WHAT IT ASKS FOR: the subnet mask (1), the router (3), the DNS servers
+;  (6) and the lease time (51), through the Parameter Request List (55).
+;  What it keeps from the reply: yiaddr, and options 1, 3 (first router),
+;  6 (first DNS server), 51 and 54 (the server identifier, which the
+;  REQUEST must echo). Anything else the server sends is stepped over.
+;
+;  ENDIANNESS as everywhere in this stack: multi-byte fields go through
+;  net.pi4's net_GetBE16/net_GetBE32/net_PutBE16/net_PutBE32, and an
+;  address is held first-octet-in-the-top-byte so it feeds PutIp().
+; ======================================================================
+
+; ---- ports and the BOOTP/DHCP frame [RFC 2131, uncited] ----
+#DHCP_PORT_SERVER = 67
+#DHCP_PORT_CLIENT = 68
+
+#DHCP_OP_REQUEST  = 1         ; BOOTREQUEST, a client to a server
+#DHCP_OP_REPLY    = 2         ; BOOTREPLY, a server to a client
+#DHCP_HTYPE_ETHER = 1
+#DHCP_HLEN_ETHER  = 6
+#DHCP_FLAG_BCAST  = $8000     ; ask the server to broadcast its reply
+#DHCP_COOKIE      = $63825363 ; the magic cookie at offset 236
+
+; The fixed part is 236 bytes, then the 4-byte cookie, then options.
+#DHCP_FIXED       = 236
+#DHCP_MIN_LEN     = 300       ; pad DISCOVER/REQUEST to here; some relays
+                             ; and older servers drop shorter BOOTP
+#DHCP_OUT_MAX     = 576       ; the RFC 2131 minimum reassembly size, and
+                             ; far more than we ever build
+
+; ---- offsets into the fixed part ----
+#DHCP_OFF_OP     = 0
+#DHCP_OFF_HTYPE  = 1
+#DHCP_OFF_HLEN   = 2
+#DHCP_OFF_HOPS   = 3
+#DHCP_OFF_XID    = 4
+#DHCP_OFF_SECS   = 8
+#DHCP_OFF_FLAGS  = 10
+#DHCP_OFF_CIADDR = 12
+#DHCP_OFF_YIADDR = 16
+#DHCP_OFF_SIADDR = 20
+#DHCP_OFF_GIADDR = 24
+#DHCP_OFF_CHADDR = 28         ; 16 bytes; first 6 are the MAC
+#DHCP_OFF_COOKIE = 236
+
+; ---- DHCP message types, option 53 [RFC 2132, uncited] ----
+#DHCP_DISCOVER = 1
+#DHCP_OFFER    = 2
+#DHCP_REQUEST  = 3
+#DHCP_DECLINE  = 4
+#DHCP_ACK      = 5
+#DHCP_NAK      = 6
+#DHCP_RELEASE  = 7
+
+; ---- option codes ----
+#DHCP_OPT_PAD          = 0
+#DHCP_OPT_SUBNET       = 1
+#DHCP_OPT_ROUTER       = 3
+#DHCP_OPT_DNS          = 6
+#DHCP_OPT_REQ_IP       = 50
+#DHCP_OPT_LEASE        = 51
+#DHCP_OPT_MSG_TYPE     = 53
+#DHCP_OPT_SERVER_ID    = 54
+#DHCP_OPT_PARAM_LIST   = 55
+#DHCP_OPT_T1           = 58
+#DHCP_OPT_T2           = 59
+#DHCP_OPT_END          = 255
+
+; ---- the build buffer ----
+Global Dim dhcp_out.a[#DHCP_OUT_MAX]
+Global dhcp_outLen.i
+
+; ---- what the last parsed reply yielded ----
+Global dhcp_msgType.i         ; option 53: OFFER, ACK, NAK...
+Global dhcp_yourIp.i          ; yiaddr
+Global dhcp_mask.i            ; option 1
+Global dhcp_gw.i              ; option 3, first router
+Global dhcp_dns.i             ; option 6, first server
+Global dhcp_lease.i           ; option 51, seconds
+Global dhcp_serverId.i        ; option 54
+Global dhcp_t1.i              ; option 58, seconds (0 means derive)
+Global dhcp_t2.i              ; option 59, seconds (0 means derive)
+Global dhcp_err.i
+
+; ---- refusals ----
+#DHCP_E_NONE      =    0
+#DHCP_E_ARG       = -300
+#DHCP_E_SHORT     = -301      ; shorter than the fixed part + cookie
+#DHCP_E_NOT_REPLY = -302      ; op is not BOOTREPLY
+#DHCP_E_XID       = -303      ; the transaction id is not ours
+#DHCP_E_COOKIE    = -304      ; the magic cookie is wrong or absent
+#DHCP_E_NO_TYPE   = -305      ; no option 53 - not a DHCP message at all
+#DHCP_E_MALFORMED = -306      ; an option length runs past the end
+#DHCP_E_CLIENT    = -307      ; hardware identity is not this client
+#DHCP_E_STATE     = -308      ; reply is not valid for client state
+#DHCP_E_SERVER    = -309      ; wrong or missing server identifier
+#DHCP_E_ADDRESS   = -310      ; missing or changed offered address
+#DHCP_E_LEASE     = -311      ; absent lease or invalid T1/T2 ordering
+
+#DHCP_PHASE_SELECTING  = 1
+#DHCP_PHASE_REQUESTING = 2
+#DHCP_PHASE_RENEWING   = 3
+#DHCP_PHASE_REBINDING  = 4
+#DHCP_PHASE_REBOOTING  = 5
+
+; ----------------------------------------------------------------------
+;  dhcp_Base - zero the fixed part and fill the fields common to every
+;  message we send. Returns the offset just past the cookie, where
+;  options begin.
+; ----------------------------------------------------------------------
+Procedure.i dhcp_Base(xid.i, *mac)
+  Protected i.i
+
+  i = 0
+  While i < #DHCP_OFF_COOKIE + 4
+    dhcp_out[i] = 0
+    i = i + 1
+  Wend
+
+  dhcp_out[#DHCP_OFF_OP]    = #DHCP_OP_REQUEST
+  dhcp_out[#DHCP_OFF_HTYPE] = #DHCP_HTYPE_ETHER
+  dhcp_out[#DHCP_OFF_HLEN]  = #DHCP_HLEN_ETHER
+  dhcp_out[#DHCP_OFF_HOPS]  = 0
+  net_PutBE32(@dhcp_out[#DHCP_OFF_XID], xid & $FFFFFFFF)
+  net_PutBE16(@dhcp_out[#DHCP_OFF_SECS], 0)
+  net_PutBE16(@dhcp_out[#DHCP_OFF_FLAGS], #DHCP_FLAG_BCAST)
+  ; ciaddr/yiaddr/siaddr/giaddr stay zero
+
+  i = 0
+  While i < 6
+    dhcp_out[#DHCP_OFF_CHADDR + i] = PeekA(*mac + i) & $FF
+    i = i + 1
+  Wend
+
+  net_PutBE32(@dhcp_out[#DHCP_OFF_COOKIE], #DHCP_COOKIE)
+  ProcedureReturn #DHCP_OFF_COOKIE + 4
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  dhcp_ParamList - write option 55, the four things we ask for, at `p`.
+;  Returns the offset after it.
+; ----------------------------------------------------------------------
+Procedure.i dhcp_ParamList(p.i)
+  dhcp_out[p + 0] = #DHCP_OPT_PARAM_LIST
+  dhcp_out[p + 1] = 4
+  dhcp_out[p + 2] = #DHCP_OPT_SUBNET
+  dhcp_out[p + 3] = #DHCP_OPT_ROUTER
+  dhcp_out[p + 4] = #DHCP_OPT_DNS
+  dhcp_out[p + 5] = #DHCP_OPT_LEASE
+  ProcedureReturn p + 6
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  dhcp_Pad - write the END option and pad with PAD to #DHCP_MIN_LEN.
+;  Sets dhcp_outLen.
+; ----------------------------------------------------------------------
+Procedure dhcp_Pad(p.i)
+  dhcp_out[p] = #DHCP_OPT_END
+  p = p + 1
+  While p < #DHCP_MIN_LEN
+    dhcp_out[p] = #DHCP_OPT_PAD
+    p = p + 1
+  Wend
+  dhcp_outLen = p
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DhcpBuildDiscover - the first message. Returns its length.
+; ----------------------------------------------------------------------
+Procedure.i DhcpBuildDiscover(xid.i, *mac)
+  Protected p.i
+  dhcp_err = #DHCP_E_NONE
+  dhcp_outLen = 0
+  If *mac = 0
+    dhcp_err = #DHCP_E_ARG
+    ProcedureReturn 0
+  EndIf
+
+  p = dhcp_Base(xid, *mac)
+  dhcp_out[p + 0] = #DHCP_OPT_MSG_TYPE
+  dhcp_out[p + 1] = 1
+  dhcp_out[p + 2] = #DHCP_DISCOVER
+  p = p + 3
+  p = dhcp_ParamList(p)
+  dhcp_Pad(p)
+  ProcedureReturn dhcp_outLen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DhcpBuildRequest - accept the offer. It echoes the offered address
+;  (option 50) and the server that made the offer (option 54), which is
+;  how a server on a segment with several servers knows the offer was
+;  taken and the others know it was not. Returns its length.
+; ----------------------------------------------------------------------
+Procedure.i DhcpBuildRequest(xid.i, *mac, offeredIp.i, serverId.i)
+  Protected p.i
+  dhcp_err = #DHCP_E_NONE
+  dhcp_outLen = 0
+  If *mac = 0
+    dhcp_err = #DHCP_E_ARG
+    ProcedureReturn 0
+  EndIf
+
+  p = dhcp_Base(xid, *mac)
+  dhcp_out[p + 0] = #DHCP_OPT_MSG_TYPE
+  dhcp_out[p + 1] = 1
+  dhcp_out[p + 2] = #DHCP_REQUEST
+  p = p + 3
+
+  dhcp_out[p + 0] = #DHCP_OPT_REQ_IP
+  dhcp_out[p + 1] = 4
+  net_PutBE32(@dhcp_out[p + 2], offeredIp & $FFFFFFFF)
+  p = p + 6
+
+  dhcp_out[p + 0] = #DHCP_OPT_SERVER_ID
+  dhcp_out[p + 1] = 4
+  net_PutBE32(@dhcp_out[p + 2], serverId & $FFFFFFFF)
+  p = p + 6
+
+  p = dhcp_ParamList(p)
+  dhcp_Pad(p)
+  ProcedureReturn dhcp_outLen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DhcpBuildRenew - a REQUEST from BOUND/RENEWING or REBINDING.
+;
+;  RFC 2131 section 4.3.2 is exact about this form: ciaddr is the bound
+;  address and options 50 (requested address) and 54 (server identifier)
+;  MUST NOT be present.  RENEWING is normally unicast; REBINDING sets the
+;  broadcast flag and is sent to 255.255.255.255 by the caller.
+; ----------------------------------------------------------------------
+Procedure.i DhcpBuildRenew(xid.i, *mac, currentIp.i, broadcast.i)
+  Protected p.i
+  dhcp_err = #DHCP_E_NONE
+  dhcp_outLen = 0
+  If *mac = 0 Or currentIp = 0
+    dhcp_err = #DHCP_E_ARG
+    ProcedureReturn 0
+  EndIf
+
+  p = dhcp_Base(xid, *mac)
+  net_PutBE32(@dhcp_out[#DHCP_OFF_CIADDR], currentIp & $FFFFFFFF)
+  If broadcast = 0
+    net_PutBE16(@dhcp_out[#DHCP_OFF_FLAGS], 0)
+  EndIf
+  dhcp_out[p + 0] = #DHCP_OPT_MSG_TYPE
+  dhcp_out[p + 1] = 1
+  dhcp_out[p + 2] = #DHCP_REQUEST
+  p = p + 3
+  p = dhcp_ParamList(p)
+  dhcp_Pad(p)
+  ProcedureReturn dhcp_outLen
+EndProcedure
+
+; INIT-REBOOT asks whether a still-live lease may be reused after its
+; interface returns. ciaddr and server-id are zero; option 50 names the
+; remembered address and the request is broadcast (RFC 2131 4.3.2).
+Procedure.i DhcpBuildReboot(xid.i, *mac, rememberedIp.i)
+  Protected p.i
+  dhcp_err = #DHCP_E_NONE
+  dhcp_outLen = 0
+  If *mac = 0 Or rememberedIp = 0
+    dhcp_err = #DHCP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  p = dhcp_Base(xid, *mac)
+  dhcp_out[p + 0] = #DHCP_OPT_MSG_TYPE
+  dhcp_out[p + 1] = 1
+  dhcp_out[p + 2] = #DHCP_REQUEST
+  p = p + 3
+  dhcp_out[p + 0] = #DHCP_OPT_REQ_IP
+  dhcp_out[p + 1] = 4
+  net_PutBE32(@dhcp_out[p + 2], rememberedIp & $FFFFFFFF)
+  p = p + 6
+  p = dhcp_ParamList(p)
+  dhcp_Pad(p)
+  ProcedureReturn dhcp_outLen
+EndProcedure
+
+Procedure.i DhcpBuf()
+  ProcedureReturn @dhcp_out[0]
+EndProcedure
+
+Procedure.i DhcpLen()
+  ProcedureReturn dhcp_outLen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DhcpParseReply - read a BOOTREPLY for transaction `xid`. Returns the
+;  DHCP message type (OFFER, ACK, NAK...) on success, or a negative
+;  #DHCP_E_* otherwise.
+;
+;  A reply whose xid is not ours returns #DHCP_E_XID rather than being
+;  parsed - another client's exchange on the same broadcast segment is
+;  not an error, just not ours, and the caller keeps pumping.
+;
+;  EVERY OPTION LENGTH IS BOUNDED against the datagram before its value
+;  is read. A length that runs past the end is #DHCP_E_MALFORMED, not a
+;  read into the next buffer.
+; ----------------------------------------------------------------------
+Procedure.i DhcpParseReplyFor(*p, n.i, xid.i, *mac)
+  Protected pos.i
+  Protected code.i
+  Protected len.i
+
+  dhcp_err = #DHCP_E_NONE
+  dhcp_msgType = 0
+  dhcp_yourIp = 0
+  dhcp_mask = 0
+  dhcp_gw = 0
+  dhcp_dns = 0
+  dhcp_lease = 0
+  dhcp_serverId = 0
+  dhcp_t1 = 0
+  dhcp_t2 = 0
+
+  If *p = 0 Or n < (#DHCP_OFF_COOKIE + 4)
+    dhcp_err = #DHCP_E_SHORT
+    ProcedureReturn #DHCP_E_SHORT
+  EndIf
+  If PeekA(*p + #DHCP_OFF_OP) <> #DHCP_OP_REPLY
+    dhcp_err = #DHCP_E_NOT_REPLY
+    ProcedureReturn #DHCP_E_NOT_REPLY
+  EndIf
+  If net_GetBE32(*p + #DHCP_OFF_XID) <> (xid & $FFFFFFFF)
+    dhcp_err = #DHCP_E_XID
+    ProcedureReturn #DHCP_E_XID
+  EndIf
+  If *mac <> 0
+    If PeekA(*p + #DHCP_OFF_HTYPE) <> #DHCP_HTYPE_ETHER Or PeekA(*p + #DHCP_OFF_HLEN) <> #DHCP_HLEN_ETHER
+      dhcp_err = #DHCP_E_CLIENT
+      ProcedureReturn #DHCP_E_CLIENT
+    EndIf
+    pos = 0
+    While pos < 6
+      If (PeekA(*p + #DHCP_OFF_CHADDR + pos) & $FF) <> (PeekA(*mac + pos) & $FF)
+        dhcp_err = #DHCP_E_CLIENT
+        ProcedureReturn #DHCP_E_CLIENT
+      EndIf
+      pos = pos + 1
+    Wend
+  EndIf
+  If net_GetBE32(*p + #DHCP_OFF_COOKIE) <> #DHCP_COOKIE
+    dhcp_err = #DHCP_E_COOKIE
+    ProcedureReturn #DHCP_E_COOKIE
+  EndIf
+
+  dhcp_yourIp = net_GetBE32(*p + #DHCP_OFF_YIADDR)
+
+  ; ---- walk the options ----
+  pos = #DHCP_OFF_COOKIE + 4
+  Repeat
+    If pos >= n
+      Break                                 ; ran out with no END; tolerate
+    EndIf
+    code = PeekA(*p + pos) & $FF
+    If code = #DHCP_OPT_END
+      Break
+    EndIf
+    If code = #DHCP_OPT_PAD
+      pos = pos + 1
+      Continue
+    EndIf
+    If (pos + 2) > n
+      dhcp_err = #DHCP_E_MALFORMED
+      ProcedureReturn #DHCP_E_MALFORMED
+    EndIf
+    len = PeekA(*p + pos + 1) & $FF
+    If (pos + 2 + len) > n
+      dhcp_err = #DHCP_E_MALFORMED
+      ProcedureReturn #DHCP_E_MALFORMED
+    EndIf
+
+    If code = #DHCP_OPT_MSG_TYPE
+      If len >= 1
+        dhcp_msgType = PeekA(*p + pos + 2) & $FF
+      EndIf
+    ElseIf code = #DHCP_OPT_SUBNET
+      If len >= 4
+        dhcp_mask = net_GetBE32(*p + pos + 2)
+      EndIf
+    ElseIf code = #DHCP_OPT_ROUTER
+      If len >= 4
+        dhcp_gw = net_GetBE32(*p + pos + 2)   ; the first router only
+      EndIf
+    ElseIf code = #DHCP_OPT_DNS
+      If len >= 4
+        dhcp_dns = net_GetBE32(*p + pos + 2)  ; the first server only
+      EndIf
+    ElseIf code = #DHCP_OPT_LEASE
+      If len >= 4
+        dhcp_lease = net_GetBE32(*p + pos + 2)
+      EndIf
+    ElseIf code = #DHCP_OPT_SERVER_ID
+      If len >= 4
+        dhcp_serverId = net_GetBE32(*p + pos + 2)
+      EndIf
+    ElseIf code = #DHCP_OPT_T1
+      If len >= 4
+        dhcp_t1 = net_GetBE32(*p + pos + 2)
+      EndIf
+    ElseIf code = #DHCP_OPT_T2
+      If len >= 4
+        dhcp_t2 = net_GetBE32(*p + pos + 2)
+      EndIf
+    EndIf
+
+    pos = pos + 2 + len
+  ForEver
+
+  If dhcp_msgType = 0
+    ; A BOOTREPLY with the cookie but no option 53 is a plain BOOTP
+    ; reply, not DHCP. We cannot complete the handshake with it.
+    dhcp_err = #DHCP_E_NO_TYPE
+    ProcedureReturn #DHCP_E_NO_TYPE
+  EndIf
+
+  ProcedureReturn dhcp_msgType
+EndProcedure
+
+; Compatibility for the existing synchronous command while its caller
+; is migrated to the interface client.  New code always supplies the
+; interface MAC through DhcpParseReplyFor.
+Procedure.i DhcpParseReply(*p, n.i, xid.i)
+  ProcedureReturn DhcpParseReplyFor(*p, n, xid, 0)
+EndProcedure
+
+; Validate the parsed message against the exchange that is actually in
+; flight. XID and chaddr are checked by DhcpParseReplyFor; this closes
+; the other half of the identity: selected server, offered address and
+; the lease timers. An ACK cannot silently move a client to a different
+; lease than the OFFER it selected.
+Procedure.i DhcpValidateReply(phase.i, expectedIp.i, expectedServer.i)
+  If dhcp_msgType = #DHCP_NAK
+    If phase <> #DHCP_PHASE_REQUESTING And phase <> #DHCP_PHASE_RENEWING And phase <> #DHCP_PHASE_REBINDING And phase <> #DHCP_PHASE_REBOOTING
+      dhcp_err = #DHCP_E_STATE
+      ProcedureReturn 0
+    EndIf
+    If dhcp_serverId = 0
+      dhcp_err = #DHCP_E_SERVER
+      ProcedureReturn 0
+    EndIf
+    If phase <> #DHCP_PHASE_REBINDING And phase <> #DHCP_PHASE_REBOOTING And dhcp_serverId <> expectedServer
+      dhcp_err = #DHCP_E_SERVER
+      ProcedureReturn 0
+    EndIf
+    If dhcp_yourIp <> 0
+      dhcp_err = #DHCP_E_ADDRESS
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndIf
+
+  If phase = #DHCP_PHASE_SELECTING
+    If dhcp_msgType <> #DHCP_OFFER
+      dhcp_err = #DHCP_E_STATE
+      ProcedureReturn 0
+    EndIf
+    If dhcp_serverId = 0
+      dhcp_err = #DHCP_E_SERVER
+      ProcedureReturn 0
+    EndIf
+    If dhcp_yourIp = 0
+      dhcp_err = #DHCP_E_ADDRESS
+      ProcedureReturn 0
+    EndIf
+  Else
+    If dhcp_msgType <> #DHCP_ACK
+      dhcp_err = #DHCP_E_STATE
+      ProcedureReturn 0
+    EndIf
+    If dhcp_serverId = 0
+      dhcp_err = #DHCP_E_SERVER
+      ProcedureReturn 0
+    EndIf
+    If phase <> #DHCP_PHASE_REBINDING And phase <> #DHCP_PHASE_REBOOTING And dhcp_serverId <> expectedServer
+      dhcp_err = #DHCP_E_SERVER
+      ProcedureReturn 0
+    EndIf
+    If dhcp_yourIp = 0 Or dhcp_yourIp <> expectedIp
+      dhcp_err = #DHCP_E_ADDRESS
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  If dhcp_lease = 0
+    dhcp_err = #DHCP_E_LEASE
+    ProcedureReturn 0
+  EndIf
+  If dhcp_lease <> $FFFFFFFF
+    If dhcp_t1 = 0
+      dhcp_t1 = dhcp_lease / 2
+    EndIf
+    If dhcp_t2 = 0
+      dhcp_t2 = (dhcp_lease * 7) / 8
+    EndIf
+    If dhcp_t1 <= 0 Or dhcp_t2 <= dhcp_t1 Or dhcp_t2 >= dhcp_lease
+      dhcp_err = #DHCP_E_LEASE
+      ProcedureReturn 0
+    EndIf
+  Else
+    dhcp_t1 = $FFFFFFFF
+    dhcp_t2 = $FFFFFFFF
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DhcpMsgType()
+  ProcedureReturn dhcp_msgType
+EndProcedure
+
+Procedure.i DhcpYourIp()
+  ProcedureReturn dhcp_yourIp
+EndProcedure
+
+Procedure.i DhcpMask()
+  ProcedureReturn dhcp_mask
+EndProcedure
+
+Procedure.i DhcpGateway()
+  ProcedureReturn dhcp_gw
+EndProcedure
+
+Procedure.i DhcpDns()
+  ProcedureReturn dhcp_dns
+EndProcedure
+
+Procedure.i DhcpLease()
+  ProcedureReturn dhcp_lease
+EndProcedure
+
+Procedure.i DhcpServerId()
+  ProcedureReturn dhcp_serverId
+EndProcedure
+
+Procedure.i DhcpT1()
+  ProcedureReturn dhcp_t1
+EndProcedure
+
+Procedure.i DhcpT2()
+  ProcedureReturn dhcp_t2
+EndProcedure
+
+Procedure.i DhcpError()
+  ProcedureReturn dhcp_err
+EndProcedure
+
+Procedure.i DhcpErrorText()
+  Select dhcp_err
+    Case #DHCP_E_NONE
+      ProcedureReturn "dhcp: no refusal recorded"
+    Case #DHCP_E_ARG
+      ProcedureReturn "dhcp: REFUSED - a null hardware address was given to the builder"
+    Case #DHCP_E_SHORT
+      ProcedureReturn "dhcp: REFUSED - the reply is shorter than the 240-byte fixed part it must have"
+    Case #DHCP_E_NOT_REPLY
+      ProcedureReturn "dhcp: REFUSED - the message is not a server reply"
+    Case #DHCP_E_XID
+      ProcedureReturn "dhcp: it belongs to another client's exchange, not ours"
+    Case #DHCP_E_COOKIE
+      ProcedureReturn "dhcp: REFUSED - the magic cookie is missing, so this is not a DHCP message"
+    Case #DHCP_E_NO_TYPE
+      ProcedureReturn "dhcp: REFUSED - a BOOTP reply with no DHCP message type, which cannot complete the handshake"
+    Case #DHCP_E_MALFORMED
+      ProcedureReturn "dhcp: REFUSED - an option length runs past the end of the datagram"
+    Case #DHCP_E_CLIENT
+      ProcedureReturn "dhcp: it names another client's hardware identity, not ours"
+    Case #DHCP_E_STATE
+      ProcedureReturn "dhcp: the reply is not valid in the client's current state"
+    Case #DHCP_E_SERVER
+      ProcedureReturn "dhcp: the reply is missing the selected server or names another one"
+    Case #DHCP_E_ADDRESS
+      ProcedureReturn "dhcp: the reply is missing or changed the address being leased"
+    Case #DHCP_E_LEASE
+      ProcedureReturn "dhcp: the lease is absent or its T1/T2 deadlines are invalid"
+    Default
+      ProcedureReturn "dhcp: an unnumbered refusal, which is itself a defect"
+  EndSelect
+EndProcedure
+
+; ======================================================================
+;  ONE DHCP CLIENT PER INTERFACE
+; ======================================================================
+; The codec above remains buffer-oriented. This table is the protocol
+; state that used to be split between one synchronous wired command and
+; a second radio-only implementation. Each row owns its MAC, XID,
+; selected server, address and lease clocks. Callers perform I/O, but no
+; caller decides whether a packet is valid in the current state.
+
+#DHCPC_IFS        = 6
+#DHCPC_INIT       = 0
+#DHCPC_SELECTING  = 1
+#DHCPC_REQUESTING = 2
+#DHCPC_BOUND      = 3
+#DHCPC_RENEWING   = 4
+#DHCPC_REBINDING  = 5
+#DHCPC_OFFLINE    = 6
+#DHCPC_REBOOTING  = 7
+
+#DHCPC_ACT_NONE      = 0
+#DHCPC_ACT_DISCOVER  = 1
+#DHCPC_ACT_SELECT    = 2
+#DHCPC_ACT_BOUND     = 3
+#DHCPC_ACT_RENEW     = 4
+#DHCPC_ACT_REBIND    = 5
+#DHCPC_ACT_DROP      = 6
+#DHCPC_ACT_REBOOT    = 7
+
+Global Dim dhcpc_state.a[#DHCPC_IFS]
+Global Dim dhcpc_mac.a[#DHCPC_IFS * 6]
+Global Dim dhcpc_xid.i[#DHCPC_IFS]
+Global Dim dhcpc_ip.i[#DHCPC_IFS]
+Global Dim dhcpc_mask.i[#DHCPC_IFS]
+Global Dim dhcpc_gw.i[#DHCPC_IFS]
+Global Dim dhcpc_dns.i[#DHCPC_IFS]
+Global Dim dhcpc_server.i[#DHCPC_IFS]
+Global Dim dhcpc_lease.i[#DHCPC_IFS]
+Global Dim dhcpc_t1.i[#DHCPC_IFS]
+Global Dim dhcpc_t2.i[#DHCPC_IFS]
+Global Dim dhcpc_leaseLeft.i[#DHCPC_IFS]
+Global Dim dhcpc_t1Left.i[#DHCPC_IFS]
+Global Dim dhcpc_t2Left.i[#DHCPC_IFS]
+Global Dim dhcpc_lastTick.i[#DHCPC_IFS]
+Global Dim dhcpc_tickCarry.i[#DHCPC_IFS]
+Global Dim dhcpc_linkUp.a[#DHCPC_IFS]
+; One transport-visible transition per interface. The common frame
+; dispatcher records it when it consumes port 68; a synchronous command
+; or the background lease worker takes it exactly once. Keeping this in
+; the client row prevents two receive loops from both acting on one ACK.
+Global Dim dhcpc_event.a[#DHCPC_IFS]
+Global dhcpc_generation.i
+
+Procedure.i dhcpc_Valid(kind.i)
+  If kind <= 0 Or kind >= #DHCPC_IFS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure DhcpClientReset(kind.i)
+  Define i.i
+  If dhcpc_Valid(kind) = 0
+    ProcedureReturn
+  EndIf
+  dhcpc_state[kind] = #DHCPC_INIT
+  dhcpc_xid[kind] = 0
+  dhcpc_ip[kind] = 0
+  dhcpc_mask[kind] = 0
+  dhcpc_gw[kind] = 0
+  dhcpc_dns[kind] = 0
+  dhcpc_server[kind] = 0
+  dhcpc_lease[kind] = 0
+  dhcpc_t1[kind] = 0
+  dhcpc_t2[kind] = 0
+  dhcpc_leaseLeft[kind] = 0
+  dhcpc_t1Left[kind] = 0
+  dhcpc_t2Left[kind] = 0
+  dhcpc_lastTick[kind] = 0
+  dhcpc_tickCarry[kind] = 0
+  dhcpc_linkUp[kind] = 0
+  dhcpc_event[kind] = #DHCPC_ACT_NONE
+  i = 0
+  While i < 6
+    dhcpc_mac[kind * 6 + i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+
+; Begin a fresh selecting exchange. XIDs are per row and change on every
+; restart; they combine the low 32-bit clock, interface identity, client
+; hardware identity and a generation so simultaneous rows cannot alias.
+Procedure.i DhcpClientBegin(kind.i, *mac, now.i)
+  Define i.i
+  Define xid.i
+  If dhcpc_Valid(kind) = 0 Or *mac = 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  DhcpClientReset(kind)
+  For i = 0 To 5
+    dhcpc_mac[kind * 6 + i] = PeekA(*mac + i) & $FF
+  Next
+  dhcpc_generation = (dhcpc_generation + 1) & $FFFFFFFF
+  xid = (now & $FFFFFFFF) ! ((kind & $FF) << 24) ! dhcpc_generation
+  For i = 0 To 5
+    xid = ((xid << 5) ! (xid >> 27) ! (dhcpc_mac[kind * 6 + i] & $FF)) & $FFFFFFFF
+  Next
+  If xid = 0
+    xid = 1
+  EndIf
+  dhcpc_xid[kind] = xid
+  dhcpc_lastTick[kind] = now & $FFFFFFFF
+  dhcpc_linkUp[kind] = 1
+  dhcpc_state[kind] = #DHCPC_SELECTING
+  ProcedureReturn #DHCPC_ACT_DISCOVER
+EndProcedure
+
+Procedure.i DhcpClientBuild(kind.i, action.i)
+  If dhcpc_Valid(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  If action = #DHCPC_ACT_DISCOVER
+    ProcedureReturn DhcpBuildDiscover(dhcpc_xid[kind], @dhcpc_mac[kind * 6])
+  EndIf
+  If action = #DHCPC_ACT_SELECT
+    ProcedureReturn DhcpBuildRequest(dhcpc_xid[kind], @dhcpc_mac[kind * 6], dhcpc_ip[kind], dhcpc_server[kind])
+  EndIf
+  If action = #DHCPC_ACT_RENEW
+    ProcedureReturn DhcpBuildRenew(dhcpc_xid[kind], @dhcpc_mac[kind * 6], dhcpc_ip[kind], 0)
+  EndIf
+  If action = #DHCPC_ACT_REBIND
+    ProcedureReturn DhcpBuildRenew(dhcpc_xid[kind], @dhcpc_mac[kind * 6], dhcpc_ip[kind], 1)
+  EndIf
+  If action = #DHCPC_ACT_REBOOT
+    ProcedureReturn DhcpBuildReboot(dhcpc_xid[kind], @dhcpc_mac[kind * 6], dhcpc_ip[kind])
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Consume one DHCP payload. The return is the next transport/application
+; action. A packet for another row, XID, client, server or state returns
+; NONE and changes nothing.
+Procedure.i DhcpClientInput(kind.i, *p, n.i, now.i)
+  Define phase.i
+  Define mt.i
+  Define i.i
+  If dhcpc_Valid(kind) = 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  mt = DhcpParseReplyFor(*p, n, dhcpc_xid[kind], @dhcpc_mac[kind * 6])
+  If mt < 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  If dhcpc_state[kind] = #DHCPC_SELECTING
+    phase = #DHCP_PHASE_SELECTING
+  ElseIf dhcpc_state[kind] = #DHCPC_REQUESTING
+    phase = #DHCP_PHASE_REQUESTING
+  ElseIf dhcpc_state[kind] = #DHCPC_RENEWING
+    phase = #DHCP_PHASE_RENEWING
+  ElseIf dhcpc_state[kind] = #DHCPC_REBINDING
+    phase = #DHCP_PHASE_REBINDING
+  ElseIf dhcpc_state[kind] = #DHCPC_REBOOTING
+    phase = #DHCP_PHASE_REBOOTING
+  Else
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  If DhcpValidateReply(phase, dhcpc_ip[kind], dhcpc_server[kind]) = 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+
+  If mt = #DHCP_NAK
+    DhcpClientReset(kind)
+    dhcpc_event[kind] = #DHCPC_ACT_DROP
+    ProcedureReturn #DHCPC_ACT_DROP
+  EndIf
+  If mt = #DHCP_OFFER
+    dhcpc_ip[kind] = dhcp_yourIp
+    dhcpc_mask[kind] = dhcp_mask
+    dhcpc_gw[kind] = dhcp_gw
+    dhcpc_dns[kind] = dhcp_dns
+    dhcpc_server[kind] = dhcp_serverId
+    dhcpc_lease[kind] = dhcp_lease
+    dhcpc_t1[kind] = dhcp_t1
+    dhcpc_t2[kind] = dhcp_t2
+    dhcpc_state[kind] = #DHCPC_REQUESTING
+    dhcpc_event[kind] = #DHCPC_ACT_SELECT
+    ProcedureReturn #DHCPC_ACT_SELECT
+  EndIf
+
+  ; ACK parameters are authoritative, but an omitted optional address is
+  ; retained from the selected lease. A first bind still requires a mask.
+  If dhcp_mask <> 0
+    dhcpc_mask[kind] = dhcp_mask
+  EndIf
+  If phase = #DHCP_PHASE_REQUESTING And dhcpc_mask[kind] = 0
+    dhcp_err = #DHCP_E_ADDRESS
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  dhcpc_ip[kind] = dhcp_yourIp
+  dhcpc_gw[kind] = dhcp_gw
+  dhcpc_dns[kind] = dhcp_dns
+  dhcpc_server[kind] = dhcp_serverId
+  dhcpc_lease[kind] = dhcp_lease
+  dhcpc_t1[kind] = dhcp_t1
+  dhcpc_t2[kind] = dhcp_t2
+  dhcpc_leaseLeft[kind] = dhcp_lease
+  dhcpc_t1Left[kind] = dhcp_t1
+  dhcpc_t2Left[kind] = dhcp_t2
+  ; Lease time begins at the ACK, not at DISCOVER. The injected clock is
+  ; also what makes acquisition-delay and wrap behavior executable tests
+  ; rather than assumptions about how quickly a server normally replies.
+  dhcpc_lastTick[kind] = now & $FFFFFFFF
+  dhcpc_tickCarry[kind] = 0
+  dhcpc_state[kind] = #DHCPC_BOUND
+  dhcpc_event[kind] = #DHCPC_ACT_BOUND
+  ProcedureReturn #DHCPC_ACT_BOUND
+EndProcedure
+
+; Return and clear the transition most recently produced by input. The
+; payload has already been copied into this interface's state row, so no
+; pointer into a driver's single receive buffer escapes the dispatcher.
+Procedure.i DhcpClientTakeEvent(kind.i)
+  Define action.i
+  If dhcpc_Valid(kind) = 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  action = dhcpc_event[kind]
+  dhcpc_event[kind] = #DHCPC_ACT_NONE
+  ProcedureReturn action
+EndProcedure
+
+Procedure dhcpc_SubSeconds(kind.i, seconds.i)
+  If seconds <= 0 Or dhcpc_leaseLeft[kind] = $FFFFFFFF
+    ProcedureReturn
+  EndIf
+  If seconds >= dhcpc_leaseLeft[kind]
+    dhcpc_leaseLeft[kind] = 0
+  Else
+    dhcpc_leaseLeft[kind] = dhcpc_leaseLeft[kind] - seconds
+  EndIf
+  If seconds >= dhcpc_t1Left[kind]
+    dhcpc_t1Left[kind] = 0
+  Else
+    dhcpc_t1Left[kind] = dhcpc_t1Left[kind] - seconds
+  EndIf
+  If seconds >= dhcpc_t2Left[kind]
+    dhcpc_t2Left[kind] = 0
+  Else
+    dhcpc_t2Left[kind] = dhcpc_t2Left[kind] - seconds
+  EndIf
+EndProcedure
+
+; Advance with an injected low-32-bit millisecond clock and current link
+; state. Modular subtraction survives wrap; the millisecond carry avoids
+; losing lease time when this is polled more often than once a second.
+Procedure.i DhcpClientTick(kind.i, now.i, linkUp.i)
+  Define delta.i
+  Define total.i
+  Define seconds.i
+  If dhcpc_Valid(kind) = 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  If dhcpc_state[kind] >= #DHCPC_BOUND
+    delta = (now - dhcpc_lastTick[kind]) & $FFFFFFFF
+    dhcpc_lastTick[kind] = now & $FFFFFFFF
+    total = dhcpc_tickCarry[kind] + delta
+    seconds = total / 1000
+    dhcpc_tickCarry[kind] = total % 1000
+    dhcpc_SubSeconds(kind, seconds)
+    If dhcpc_leaseLeft[kind] = 0
+      DhcpClientReset(kind)
+      ProcedureReturn #DHCPC_ACT_DROP
+    EndIf
+  Else
+    dhcpc_lastTick[kind] = now & $FFFFFFFF
+  EndIf
+
+  If linkUp = 0
+    If dhcpc_linkUp[kind] <> 0 And dhcpc_state[kind] >= #DHCPC_BOUND
+      dhcpc_linkUp[kind] = 0
+      dhcpc_state[kind] = #DHCPC_OFFLINE
+      ProcedureReturn #DHCPC_ACT_DROP
+    EndIf
+    ; An OFFER is not a lease. If the carrier disappears while selecting,
+    ; requesting or verifying an in-session lease, abandon that transaction
+    ; instead of retransmitting its old XID when another segment appears.
+    If dhcpc_linkUp[kind] <> 0 And dhcpc_state[kind] <> #DHCPC_INIT
+      DhcpClientReset(kind)
+      ProcedureReturn #DHCPC_ACT_DROP
+    EndIf
+    dhcpc_linkUp[kind] = 0
+    ProcedureReturn #DHCPC_ACT_NONE
+  EndIf
+  If dhcpc_linkUp[kind] = 0 And dhcpc_state[kind] = #DHCPC_OFFLINE
+    dhcpc_linkUp[kind] = 1
+    dhcpc_generation = (dhcpc_generation + 1) & $FFFFFFFF
+    dhcpc_xid[kind] = (dhcpc_xid[kind] ! now ! dhcpc_generation) & $FFFFFFFF
+    If dhcpc_xid[kind] = 0
+      dhcpc_xid[kind] = 1
+    EndIf
+    dhcpc_state[kind] = #DHCPC_REBOOTING
+    ProcedureReturn #DHCPC_ACT_REBOOT
+  EndIf
+  dhcpc_linkUp[kind] = 1
+  If dhcpc_state[kind] = #DHCPC_BOUND And dhcpc_t1Left[kind] = 0
+    dhcpc_generation = (dhcpc_generation + 1) & $FFFFFFFF
+    dhcpc_xid[kind] = (dhcpc_xid[kind] ! now ! dhcpc_generation) & $FFFFFFFF
+    dhcpc_state[kind] = #DHCPC_RENEWING
+    ProcedureReturn #DHCPC_ACT_RENEW
+  EndIf
+  If dhcpc_state[kind] = #DHCPC_RENEWING And dhcpc_t2Left[kind] = 0
+    dhcpc_state[kind] = #DHCPC_REBINDING
+    ProcedureReturn #DHCPC_ACT_REBIND
+  EndIf
+  ProcedureReturn #DHCPC_ACT_NONE
+EndProcedure
+
+Procedure.i DhcpClientState(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn #DHCPC_INIT : EndIf
+  ProcedureReturn dhcpc_state[kind]
+EndProcedure
+Procedure.i DhcpClientXid(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_xid[kind]
+EndProcedure
+Procedure.i DhcpClientIp(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_ip[kind]
+EndProcedure
+Procedure.i DhcpClientMask(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_mask[kind]
+EndProcedure
+Procedure.i DhcpClientGateway(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_gw[kind]
+EndProcedure
+Procedure.i DhcpClientDns(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_dns[kind]
+EndProcedure
+Procedure.i DhcpClientServer(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_server[kind]
+EndProcedure
+Procedure.i DhcpClientLeaseLeft(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_leaseLeft[kind]
+EndProcedure
+Procedure.i DhcpClientT1Left(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_t1Left[kind]
+EndProcedure
+Procedure.i DhcpClientT2Left(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_t2Left[kind]
+EndProcedure
+Procedure.i DhcpClientLease(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_lease[kind]
+EndProcedure
+Procedure.i DhcpClientT1(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_t1[kind]
+EndProcedure
+Procedure.i DhcpClientT2(kind.i)
+  If dhcpc_Valid(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn dhcpc_t2[kind]
+EndProcedure

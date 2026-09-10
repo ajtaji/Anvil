@@ -1,0 +1,124 @@
+; ======================================================================
+;  hw_id_q.pi4 - Arduino UNO Q HwId backend: WHAT THIS COMPUTER IS.
+;
+;  Forum 575. This board is the one the defect was found on: run against
+;  a core that stated the Pi 4's facts as literal prose, the first line
+;  this monitor ever printed on real Q silicon said it was a Raspberry
+;  Pi 4, named a PL011 at 00000000 that does not exist here, and asserted
+;  exception level 2 on a processor sitting at EL1.
+;
+;  The board file answered that by carrying its own QBanner() and its own
+;  CmdQVersion(), with a comment saying in as many words that the core
+;  hard-coding one board's facts was a real defect in the core and was not
+;  fixed from there. Both are gone now: the core asks, this file answers,
+;  and a third board answers for itself rather than inheriting whichever
+;  board happened to be written first.
+;
+;  INCLUDE ORDER: after Board/qefi_q.pi4 (the loaded-image record),
+;  Board/hwinfo_q.pi4 (HwInfoEl), Core/format.pi4 (PutAddr), and before
+;  Core/flow_cmd.pi4 and Core/help.pi4, which are the two callers.
+; ======================================================================
+
+Procedure.i HwIdBoard()
+  ProcedureReturn "Arduino UNO Q"
+EndProcedure
+
+Procedure.i HwIdCpu()
+  ProcedureReturn "Cortex-A53"
+EndProcedure
+
+Procedure.i HwIdTarget()
+  ProcedureReturn "unoq"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdEl() - READ, never assumed. This is the value that made the case:
+;  the core printed the digit 2 and CurrentEL on this board reads 0x4,
+;  which is EL1. HwInfoEl() (Board/hwinfo_q.pi4) decodes bits 3:2 of the
+;  register, so the banner states what the running processor is, and a
+;  firmware that one day handed the app a different level would move the
+;  printed number with it instead of quietly contradicting it.
+; ----------------------------------------------------------------------
+Procedure.i HwIdEl()
+  ProcedureReturn HwInfoEl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdSayConsole() - there is no serial port on this bench, and saying
+;  so is most of what an operator needs from this paragraph: they are
+;  reading it out of a log file on a disk, not off a wire, and the reason
+;  is a 1.8 V header they cannot reach.
+; ----------------------------------------------------------------------
+Procedure HwIdSayConsole()
+  PrintN("The console is the firmware's own: UEFI Simple Text Output and Input,")
+  PrintN("with boot services still up. There is no UART in it - the GENI SE4 is")
+  PrintN("1.8 V and unreachable on this bench - so the session transcript is")
+  PrintN("written to \EFI\anvil\anvil.log on the EFI System Partition, which")
+  PrintN("is where anyone reading this is reading it from.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdSayImage() - the image contract, which is the half of `version`
+;  that really is different between the two boards. The A64 backend is
+;  the SAME one, and saying so is the point: somebody who reads "unoq"
+;  and goes looking for a second code generator will not find one.
+; ----------------------------------------------------------------------
+Procedure HwIdSayImage()
+  PrintN("  The A64 backend is the same one the Pi 4 uses, because the A53 and")
+  PrintN("  the A72 are both ARMv8.0-A. Only the image contract differs: this is")
+  PrintN("  an AArch64 UEFI application, entered with boot services up, and not")
+  PrintN("  a kernel8.img.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdImageBase() / HwIdImageLen() - forum 586, the content stamp.
+;
+;  On this board the firmware chooses where the image goes and how much
+;  of it there is, and it will say so: EFI_LOADED_IMAGE_PROTOCOL carries
+;  ImageBase and ImageSize, which Board/qefi_q.pi4 reads back at run time.
+;  That is why the answer here is measured rather than constant, and why
+;  a firmware that refuses to answer gets a 0 and an honest sentence
+;  instead of a guessed extent - the same rule `boot` already follows on
+;  this board when it refuses every payload for want of the same record.
+; ----------------------------------------------------------------------
+Procedure.i HwIdImageBase()
+  If QEfiImageKnown() = 1
+    ProcedureReturn QEfiImageBase()
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwIdImageLen()
+  If QEfiImageKnown() = 1
+    ProcedureReturn QEfiImageSize()
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdSayImageWhere() - and here the provenance carries a WARNING as
+;  well as a source, which is why it runs to four lines and why the seam
+;  lets the board PRINT it instead of returning one long fragment.
+;
+;  The digest the core computes from this extent is over the image AS
+;  UEFI LOADED IT, not over the file on the EFI System Partition: a PE
+;  loader relocates and pads, so the two are not the same bytes, and
+;  comparing this number against a host-side digest of the .efi file
+;  would fail on a perfectly good image. It still tells two builds apart,
+;  which is what 586 asked for, and this says exactly that much and no
+;  more - a digest offered as more than it is would be the confident
+;  wrong answer in a new place.
+; ----------------------------------------------------------------------
+Procedure HwIdSayImageWhere()
+  If QEfiImageKnown() = 1
+    PrintN("  That extent is the firmware's own loaded-image record, so the digest")
+    PrintN("  covers the image AS LOADED and not the file on the EFI System")
+    PrintN("  Partition - a PE loader relocates and pads. It tells two builds")
+    PrintN("  apart; it will NOT match a host-side digest of the .efi file.")
+    ProcedureReturn
+  EndIf
+  PrintN("  The firmware would not say where it loaded this image. That is the")
+  PrintN("  same answer that makes boot refuse every payload on this board, and")
+  PrintN("  it is the safe direction: an extent this monitor cannot prove is one")
+  PrintN("  it will not hash.")
+EndProcedure

@@ -1,0 +1,912 @@
+; usbmsc.pi4 - USB Mass Storage, Bulk-Only Transport, over xhci.pi4.
+;
+; WHAT THIS IS FOR. The bench boots from a USB stick and always will.
+; fat.pi4 has been able to parse FAT32 since the day it was written, and
+; has been reading a fabricated image in memory because nothing could
+; hand it real blocks. This file is the thing that hands it real blocks.
+;
+; The seam it plugs into is fat.pi4's, unchanged:
+;
+;     FatSetBlockReader(@MscReadBlock)
+;
+; MscReadBlock has exactly SdReadBlock's shape - (lba, *buf) -> 1 or 0 -
+; because fat.pi4's author wrote that contract down and said in the
+; header that a USB block source would be "one more procedure of the
+; same shape and NOT ONE LINE OF THIS FILE CHANGES". It was, and it is.
+;
+; ======================================================================
+;  WHAT BULK-ONLY TRANSPORT ACTUALLY IS
+; ======================================================================
+;  USB Mass Storage Class Bulk-Only Transport, rev 1.0, and it is a
+;  three-step conversation on two bulk endpoints:
+;
+;    1. the host writes a 31-byte Command Block Wrapper to bulk OUT
+;    2. data moves, in whichever direction the CBW declared, if any
+;    3. the device writes a 13-byte Command Status Wrapper to bulk IN
+;
+;  Every step is mandatory. Skipping the CSW read because the data
+;  arrived leaves the device waiting to send it, and the NEXT command's
+;  data phase then returns the previous command's status - which reads
+;  as corruption rather than as a protocol error.
+;
+;  THE CBW, 31 bytes, all little-endian:
+;
+;     0   dCBWSignature        $43425355, the ASCII "USBC"
+;     4   dCBWTag              echoed back in the CSW; used to detect
+;                              a reply to a different command
+;     8   dCBWDataTransferLength
+;    12   bmCBWFlags           $80 = device to host, 0 = host to device
+;    13   bCBWLUN              low four bits
+;    14   bCBWCBLength         low five bits, 1..16
+;    15   CBWCB[16]            the SCSI command itself
+;
+;  THE CSW, 13 bytes:
+;
+;     0   dCSWSignature        $53425355, the ASCII "USBS"
+;     4   dCSWTag
+;     8   dCSWDataResidue      bytes NOT transferred
+;    12   bCSWStatus           0 pass, 1 fail, 2 phase error
+;
+;  A phase error is not a failed command. It means the two ends have
+;  lost track of whose turn it is, and the only correct response is a
+;  reset - which is why it gets its own error code here instead of
+;  being folded into "command failed".
+;
+; ======================================================================
+;  THE SCSI COMMANDS, AND WHY THESE SIX
+; ======================================================================
+;  The heading here said FOUR and listed four, while the file has always
+;  defined six (#SCSI_* at :171-176). INQUIRY and WRITE (10) were both
+;  missing from the prose. Corrected 2026-08-27 - a header that
+;  undercounts what a file does is the same class of defect as one that
+;  overstates what has been proven, and it is easier to fix than to
+;  notice.
+;  TEST UNIT READY ($00) - "are you there". Costs nothing and is the
+;  only way to find out that a device needs its start-up time. A stick
+;  that has just been powered will fail this several times before
+;  passing, which is normal and NOT an error; MscInit retries.
+;
+;  REQUEST SENSE ($03) - why the last command failed. Mandatory after a
+;  failure: many devices refuse everything else until the sense data is
+;  collected. Skipping it turns one recoverable failure into a device
+;  that never works again this session.
+;
+;  INQUIRY ($12) - vendor, product and revision strings. Not needed to
+;  move a block, and worth its few lines anyway: it is what turns "a
+;  medium answered" into "Samsung  Flash Drive FIT" on the console, and
+;  a name is the difference between knowing which device replied and
+;  assuming.
+;
+;  READ CAPACITY (10) ($25) - the last LBA and the block size, both
+;  BIG-endian, which is the opposite of everything else here. SCSI is
+;  big-endian and USB is little-endian and they meet in this file.
+;
+;  READ (10) ($28) - the original job.
+;
+;  WRITE (10) ($2A) - added later. MscWriteBlock() is the counterpart of
+;  MscReadBlock() and has the same shape, so fat.pi4 takes it through
+;  FatSetBlockWriter(@MscWriteBlock) exactly as it takes the reader.
+;
+;  THIS PARAGRAPH USED TO SAY "Writing is deliberately absent. A
+;  bootloader reads." That was the design and it stopped being true, and
+;  it is worth a line about WHY, because the reason is not scope creep.
+;  The bench boots from a USB stick and there is no second medium: the
+;  radio needs three firmware files on that stick and not one of them is
+;  there to be replaced, so without a writer the stick has to come out
+;  and go into another machine - the exact dependency the monitor's
+;  `save` exists to remove. A bootloader that cannot write is a
+;  bootloader that needs hands.
+;
+; ======================================================================
+;  WHAT HAS RUN ON SILICON - and this file had no status section at all
+; ======================================================================
+;  It needed one. This is one of the most thoroughly exercised files in
+;  the directory and a reader could not tell that from the header, which
+;  is the same defect as a stale "nothing has run" banner with the sign
+;  flipped: a file that says nothing about its own evidence gets weighed
+;  by guesswork.
+;
+;  READING, 2026-08-26. Through a real VL805, a real xHCI controller and
+;  a real Samsung Flash Drive FIT, at the monitor prompt:
+;
+;      mounted USB: Samsung  Flash Drive FIT   119 GB
+;      medium    USB, 250626566 blocks of 512 bytes
+;      volume    FAT32 on partition 1, cluster 4096 bytes
+;
+;  CONFIG.TXT came back at 813 bytes and matched the boot partition's
+;  actual file; START4.ELF came back at 2,298,048 bytes.
+;
+;  WRITING, 2026-08-26. Three firmware files were created on that stick
+;  through MscWriteBlock and each was read back off the volume into a
+;  DIFFERENT address and CRC-checked on the board. The 609,309-byte
+;  radio image later CRC'd to $B8B12CED - the value the host computed
+;  before it was ever sent.
+;
+;  AND IT IS LOAD-BEARING AT EVERY BOOT: the firmware loads KERNEL8.IMG
+;  off this stick, and everything the monitor loads afterwards comes
+;  through here.
+;
+;  ---- THE BUG THAT COST THE MOST, because the shape recurs ----------
+;
+;  FALSE SHARING ON A CACHE LINE, and it wore three disguises first.
+;  Every Bulk-Only command returned a status wrapper of thirteen ZERO
+;  bytes while the controller correctly reported a thirteen-byte short
+;  packet - so the device was answering and the answer was being
+;  destroyed. It was blamed on SuperSpeed, then on short packets, then
+;  on the retry loop supplying time. All three were wrong.
+;
+;  What settled it was asking for 64 bytes instead of 13: a real device
+;  answers a short packet of exactly 13, and a fabricated completion
+;  returns whatever was asked for. It returned 13.
+;
+;  msc_csw sat forty bytes into its cache line with the tail of msc_cbw
+;  in the same line. msc_cbw is written by the CPU immediately before
+;  each command and msc_csw by the DEVICE immediately after. ONE LINE,
+;  TWO WRITERS - and no amount of cleaning or invalidating helps,
+;  because both operate on the whole line. That is why the buffers below
+;  are separate arrays rather than fields in a structure, and why the
+;  comment under BUFFERS LIVE HERE says "cache-line aligned" rather than
+;  merely "global".
+;
+;  ---- WHAT IS NOT PROVEN --------------------------------------------
+;
+;    * ONE DEVICE. Everything above is one Samsung stick on one port.
+;      Start-up timing, LUN handling, sense-data recovery and phase
+;      errors are all exercised only as far as that device provokes
+;      them, and a phase error has never actually occurred.
+;    * DURABILITY. A write that returns 1 has been ACCEPTED, not
+;      necessarily committed to flash - there is no flush in the
+;      Bulk-Only contract and none is issued here. fat.pi4's ordering
+;      rules are only as good as this device's honesty about completion.
+;    * NOTHING HAS BEEN INTERRUPTED MID-WRITE and inspected afterwards.
+; ======================================================================
+;  BUFFERS LIVE HERE, NOT ON THE STACK
+; ======================================================================
+;  Every buffer the controller touches is a global, because a bulk
+;  transfer is DMA and the controller must be able to reach the memory
+;  after this procedure's frame is gone. They are also cache-line
+;  aligned by being separate arrays rather than fields in a structure.
+;
+;  Needs, in the main file: uart.pi4, timer.pi4, pcie.pi4, xhci.pi4.
+
+; ----------------------------------------------------------------------
+;  Constants
+; ----------------------------------------------------------------------
+#MSC_CBW_BYTES = 31
+#MSC_CSW_BYTES = 13
+#MSC_CBW_SIG   = $43425355      ; "USBC"
+#MSC_CSW_SIG   = $53425355      ; "USBS"
+#MSC_DIR_IN    = $80            ; bmCBWFlags
+
+#MSC_BLOCK_BYTES = 512          ; what fat.pi4's contract requires
+
+#SCSI_TEST_UNIT_READY = $00
+#SCSI_REQUEST_SENSE   = $03
+#SCSI_INQUIRY         = $12
+#SCSI_READ_CAPACITY10 = $25
+#SCSI_READ10          = $28
+#SCSI_WRITE10         = $2A
+
+; How many times TEST UNIT READY may fail before the device is declared
+; absent. A stick coming out of reset commonly needs a handful.
+#MSC_READY_TRIES = 40
+
+#MSC_ERR_NONE       = 0
+#MSC_ERR_NOT_READY  = -1   ; the bulk endpoints were never configured
+#MSC_ERR_CBW        = -2   ; the CBW did not go out whole
+#MSC_ERR_DATA       = -3   ; the data phase moved the wrong amount
+#MSC_ERR_CSW        = -4   ; no CSW, or a short one
+#MSC_ERR_CSW_SIG    = -5   ; the CSW signature was not "USBS"
+#MSC_ERR_CSW_TAG    = -6   ; the CSW answered a different command
+#MSC_ERR_FAILED     = -7   ; bCSWStatus 1 - the command failed
+#MSC_ERR_PHASE      = -8   ; bCSWStatus 2 - the ends disagree
+#MSC_ERR_NO_MEDIUM  = -9   ; TEST UNIT READY never passed
+#MSC_ERR_CAPACITY   = -10  ; READ CAPACITY returned nonsense
+#MSC_ERR_BLOCKSIZE  = -11  ; the medium is not 512-byte blocks
+#MSC_ERR_ARG        = -12  ; a caller mistake
+#MSC_ERR_RANGE      = -13  ; the LBA is past the end of the medium
+
+; ----------------------------------------------------------------------
+;  State. All DMA buffers are globals - see the header.
+; ----------------------------------------------------------------------
+; ======================================================================
+;  EVERY DMA BUFFER GETS ITS OWN CACHE LINE. THIS IS NOT TIDINESS.
+; ======================================================================
+;  These used to be three plain global arrays, and the status wrapper
+;  came back as thirteen zero bytes every single time while the
+;  controller correctly reported a thirteen-byte short packet. The
+;  device was answering; the answer was being destroyed.
+;
+;  The buffers landed at whatever address the linker chose. msc_csw was
+;  at $480C68 - forty bytes into its 64-byte cache line - and the tail
+;  of msc_cbw was in that same line. msc_cbw is written by the CPU
+;  immediately before every command; msc_csw is written by the DEVICE
+;  immediately after. One cache line, two writers, and the CPU's copy
+;  wins whenever it is written back.
+;
+;  That is false sharing, and on a non-coherent DMA path it is not a
+;  performance problem, it is data loss. No amount of cleaning and
+;  invalidating fixes it, because the granularity of both operations is
+;  the LINE: there is no way to write back the CBW half without also
+;  writing back the CPU's stale idea of the CSW half.
+;
+;  The tell was that control transfers worked perfectly through the same
+;  driver. Those DMA into the xhci arena, which is bump-allocated with
+;  64-byte alignment - so its buffers never share a line with anything.
+;  The rule was already there and these three globals were simply
+;  outside it.
+;
+;  SO: one backing array, and every buffer carved out of it on a 64-byte
+;  boundary with a whole number of lines each. The extra #MSC_ALIGN
+;  bytes are the slack the run-time alignment needs, because the
+;  compiler's BSS is only guaranteed 16.
+; ----------------------------------------------------------------------
+#MSC_ALIGN     = 64
+#MSC_OFF_CBW   = 0            ; 64 bytes - one line
+#MSC_OFF_CSW   = 64           ; 64 bytes - one line
+#MSC_OFF_DATA  = 128          ; 512 bytes - eight lines
+#MSC_OFF_BLOCK = 640          ; 512 bytes - see MscReadBlock
+#MSC_POOL_USED = 1152
+#MSC_POOL_BYTES = 1216        ; #MSC_POOL_USED + #MSC_ALIGN of slack
+
+Global Dim msc_pool.a[#MSC_POOL_BYTES]
+Global msc_base.i = 0           ; the aligned base, 0 until MscBuffers()
+
+; Carve the pool. Idempotent, and called from everything that needs a
+; buffer so no caller can forget.
+Procedure MscBuffers()
+  If msc_base <> 0
+    ProcedureReturn
+  EndIf
+  msc_base = (@msc_pool[0] + (#MSC_ALIGN - 1)) / #MSC_ALIGN
+  msc_base = msc_base * #MSC_ALIGN
+EndProcedure
+
+Procedure.i msc_Cbw()
+  MscBuffers()
+  ProcedureReturn msc_base + #MSC_OFF_CBW
+EndProcedure
+
+Procedure.i msc_Csw()
+  MscBuffers()
+  ProcedureReturn msc_base + #MSC_OFF_CSW
+EndProcedure
+
+Procedure.i msc_Data()
+  MscBuffers()
+  ProcedureReturn msc_base + #MSC_OFF_DATA
+EndProcedure
+
+Procedure.i msc_Block()
+  MscBuffers()
+  ProcedureReturn msc_base + #MSC_OFF_BLOCK
+EndProcedure
+Global msc_tag.i     = 0        ; increments per command
+Global msc_err.i     = 0
+Global msc_ready.i   = 0        ; 1 once capacity is known
+Global msc_blocks.i  = 0        ; how many blocks the medium has
+Global msc_blockSz.i = 0
+Global msc_lastStatus.i = 0     ; the last bCSWStatus seen
+Global msc_senseKey.i   = 0     ; from the last REQUEST SENSE
+Global msc_senseAsc.i   = 0
+Global msc_lastIn.i     = 0   ; bytes the last CSW read reported
+Global msc_firstErr.i   = 0   ; why the FIRST TEST UNIT READY failed.
+                              ; The fortieth failure is never the
+                              ; interesting one; the first is.
+Global Dim msc_vendor.a[16]     ; INQUIRY strings, NUL-terminated
+Global Dim msc_product.a[24]
+
+Procedure.i msc_Fail(code.i)
+  msc_err = code
+  ProcedureReturn 0
+EndProcedure
+
+; DIAGNOSTIC ACCESSORS. The wrappers are the protocol, and when the two
+; ends fall out of step the only way to see why is to look at the bytes
+; that actually arrived rather than at a decoded field.
+Procedure.i MscCswAddr() : ProcedureReturn msc_Csw() : EndProcedure
+Procedure.i MscCbwAddr() : ProcedureReturn msc_Cbw() : EndProcedure
+
+Procedure.i MscError()
+  ProcedureReturn msc_err
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Little-endian and big-endian helpers.
+;
+;  Spelled out per byte rather than done with a 32-bit poke, because the
+;  two orders live side by side in this file - USB is little-endian and
+;  SCSI is big-endian - and a reader has to be able to see which is
+;  which at the point of use.
+; ----------------------------------------------------------------------
+Procedure msc_PutLe32(*p, off.i, v.i)
+  PokeA(*p + off + 0, v & $FF)
+  PokeA(*p + off + 1, (v >> 8) & $FF)
+  PokeA(*p + off + 2, (v >> 16) & $FF)
+  PokeA(*p + off + 3, (v >> 24) & $FF)
+EndProcedure
+
+Procedure.i msc_GetLe32(*p, off.i)
+  ProcedureReturn PeekA(*p + off + 0) | (PeekA(*p + off + 1) << 8) | (PeekA(*p + off + 2) << 16) | (PeekA(*p + off + 3) << 24)
+EndProcedure
+
+Procedure msc_PutBe32(*p, off.i, v.i)
+  PokeA(*p + off + 0, (v >> 24) & $FF)
+  PokeA(*p + off + 1, (v >> 16) & $FF)
+  PokeA(*p + off + 2, (v >> 8) & $FF)
+  PokeA(*p + off + 3, v & $FF)
+EndProcedure
+
+Procedure.i msc_GetBe32(*p, off.i)
+  ProcedureReturn (PeekA(*p + off + 0) << 24) | (PeekA(*p + off + 1) << 16) | (PeekA(*p + off + 2) << 8) | PeekA(*p + off + 3)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  msc_Command - one whole CBW / data / CSW exchange.
+;
+;  *cdb is the SCSI command, cdbLen its length. dir is #MSC_DIR_IN or 0.
+;  *buf/len describe the data phase and may be 0/0.
+;
+;  Returns 1 on a command that both transferred and reported success.
+;  Anything else sets msc_err and returns 0 - including a command that
+;  moved its data perfectly and then reported failure, because that is
+;  what bCSWStatus is for.
+; ----------------------------------------------------------------------
+Procedure.i msc_Command(*cdb, cdbLen.i, dir.i, *buf, len.i)
+  Define i.i
+  Define n.i
+  Define sig.i
+  Define tag.i
+
+  If XhciBulkReady() = 0
+    ProcedureReturn msc_Fail(#MSC_ERR_NOT_READY)
+  EndIf
+  If cdbLen < 1 Or cdbLen > 16
+    ProcedureReturn msc_Fail(#MSC_ERR_ARG)
+  EndIf
+
+  msc_tag = msc_tag + 1
+
+  ; ---- the CBW ------------------------------------------------------
+  i = 0
+  While i < #MSC_CBW_BYTES
+    PokeA(msc_Cbw() + i, 0)
+    i = i + 1
+  Wend
+  msc_PutLe32(msc_Cbw(), 0, #MSC_CBW_SIG)
+  msc_PutLe32(msc_Cbw(), 4, msc_tag)
+  msc_PutLe32(msc_Cbw(), 8, len)
+  PokeA(msc_Cbw() + 12, dir & $80)
+  PokeA(msc_Cbw() + 13, 0)              ; LUN 0
+  PokeA(msc_Cbw() + 14, cdbLen & $1F)
+  i = 0
+  While i < cdbLen
+    PokeA(msc_Cbw() + 15 + i, PeekA(*cdb + i))
+    i = i + 1
+  Wend
+
+  n = XhciBulkOut(msc_Cbw(), #MSC_CBW_BYTES)
+  If n <> #MSC_CBW_BYTES
+    ProcedureReturn msc_Fail(#MSC_ERR_CBW)
+  EndIf
+
+  ; ---- the data phase, if any ---------------------------------------
+  If len > 0 And *buf <> 0
+    If (dir & #MSC_DIR_IN) <> 0
+      n = XhciBulkIn(*buf, len)
+    Else
+      n = XhciBulkOut(*buf, len)
+    EndIf
+    ; A SHORT data phase is not automatically an error - the residue in
+    ; the CSW is the authority - but a NEGATIVE one is, and so is a
+    ; stall. Let the CSW below decide about a short read; refuse only
+    ; on a transfer that did not happen.
+    If n < 0
+      ProcedureReturn msc_Fail(#MSC_ERR_DATA)
+    EndIf
+  EndIf
+
+  ; ---- the CSW ------------------------------------------------------
+  ; ALWAYS read it, even after a failed data phase. The device has one
+  ; queued and will hand it to the next command's data phase otherwise.
+  ; ASK FOR MORE THAN A STATUS WRAPPER IS, ON PURPOSE.
+  ;
+  ; A CSW is 13 bytes. Requesting exactly 13 makes "the device sent 13"
+  ; and "the controller invented 13 because that is what we asked for"
+  ; indistinguishable - and the buffer was arriving as zeros with the
+  ; transfer reporting success, so telling those apart is the whole
+  ; question. Request 64 and a real device answers with a SHORT PACKET
+  ; of exactly 13; anything reporting 64 moved is not the device
+  ; talking.
+  n = XhciBulkIn(msc_Csw(), 64)
+  msc_lastIn = n
+  If n < #MSC_CSW_BYTES
+    ProcedureReturn msc_Fail(#MSC_ERR_CSW)
+  EndIf
+  sig = msc_GetLe32(msc_Csw(), 0)
+  If sig <> #MSC_CSW_SIG
+    ProcedureReturn msc_Fail(#MSC_ERR_CSW_SIG)
+  EndIf
+  tag = msc_GetLe32(msc_Csw(), 4)
+  If tag <> msc_tag
+    ; The reply belongs to an earlier command. Continuing would attach
+    ; this status to the wrong request.
+    ProcedureReturn msc_Fail(#MSC_ERR_CSW_TAG)
+  EndIf
+
+  msc_lastStatus = PeekA(msc_Csw() + 12)
+  If msc_lastStatus = 1
+    ProcedureReturn msc_Fail(#MSC_ERR_FAILED)
+  EndIf
+  If msc_lastStatus = 2
+    ProcedureReturn msc_Fail(#MSC_ERR_PHASE)
+  EndIf
+
+  msc_err = #MSC_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscRequestSense - collect the sense data after a failure.
+;
+;  Called by MscInit's retry loop. Many devices will refuse every
+;  command until this is done, so a driver that skips it after the first
+;  failure never recovers.
+; ----------------------------------------------------------------------
+Procedure.i MscRequestSense()
+  Dim cdb.a[16]
+  Define i.i
+  i = 0
+  While i < 16
+    cdb[i] = 0
+    i = i + 1
+  Wend
+  cdb[0] = #SCSI_REQUEST_SENSE
+  cdb[4] = 18
+  If msc_Command(@cdb[0], 6, #MSC_DIR_IN, msc_Data(), 18) = 0
+    ProcedureReturn 0
+  EndIf
+  ; Sense key is the low nibble of byte 2; the additional sense code is
+  ; byte 12. Together they say things like "not ready, becoming ready",
+  ; which is the normal answer from a stick that is still spinning up.
+  msc_senseKey = PeekA(msc_Data() + 2) & $0F
+  msc_senseAsc = PeekA(msc_Data() + 12)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i MscLastIn() : ProcedureReturn msc_lastIn : EndProcedure
+Procedure.i MscFirstError() : ProcedureReturn msc_firstErr : EndProcedure
+Procedure.i MscSenseKey()  : ProcedureReturn msc_senseKey : EndProcedure
+Procedure.i MscSenseAsc()  : ProcedureReturn msc_senseAsc : EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscTestUnitReady - one poll. 1 if the unit answered ready.
+; ----------------------------------------------------------------------
+Procedure.i MscTestUnitReady()
+  Dim cdb.a[16]
+  Define i.i
+  i = 0
+  While i < 16
+    cdb[i] = 0
+    i = i + 1
+  Wend
+  cdb[0] = #SCSI_TEST_UNIT_READY
+  ProcedureReturn msc_Command(@cdb[0], 6, 0, 0, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscInquiry - who is this. Fills the vendor and product strings.
+; ----------------------------------------------------------------------
+Procedure.i MscInquiry()
+  Dim cdb.a[16]
+  Define i.i
+  i = 0
+  While i < 16
+    cdb[i] = 0
+    i = i + 1
+  Wend
+  cdb[0] = #SCSI_INQUIRY
+  cdb[4] = 36
+  If msc_Command(@cdb[0], 6, #MSC_DIR_IN, msc_Data(), 36) = 0
+    ProcedureReturn 0
+  EndIf
+  ; Bytes 8..15 are the vendor and 16..31 the product, space-padded
+  ; ASCII with no terminator. Copied out and terminated here so callers
+  ; can print them without knowing that.
+  i = 0
+  While i < 8
+    msc_vendor[i] = PeekA(msc_Data() + 8 + i)
+    i = i + 1
+  Wend
+  msc_vendor[8] = 0
+  i = 0
+  While i < 16
+    msc_product[i] = PeekA(msc_Data() + 16 + i)
+    i = i + 1
+  Wend
+  msc_product[16] = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i MscVendor()  : ProcedureReturn @msc_vendor[0]  : EndProcedure
+Procedure.i MscProduct() : ProcedureReturn @msc_product[0] : EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscReadCapacity - the last LBA and the block size, BOTH BIG-ENDIAN.
+;
+;  READ CAPACITY(10) returns the address of the LAST block, not the
+;  count. Off by one here means the last block of the medium is
+;  unreadable, which on a FAT volume is usually in the middle of the
+;  data area and presents as one corrupt file.
+; ----------------------------------------------------------------------
+Procedure.i MscReadCapacity()
+  Dim cdb.a[16]
+  Define i.i
+  Define lastLba.i
+  i = 0
+  While i < 16
+    cdb[i] = 0
+    i = i + 1
+  Wend
+  cdb[0] = #SCSI_READ_CAPACITY10
+  If msc_Command(@cdb[0], 10, #MSC_DIR_IN, msc_Data(), 8) = 0
+    ProcedureReturn 0
+  EndIf
+  lastLba     = msc_GetBe32(msc_Data(), 0) & $FFFFFFFF
+  msc_blockSz = msc_GetBe32(msc_Data(), 4) & $FFFFFFFF
+  If msc_blockSz <= 0 Or lastLba <= 0
+    ProcedureReturn msc_Fail(#MSC_ERR_CAPACITY)
+  EndIf
+  ; fat.pi4's contract is 512-byte blocks. A 4096-byte medium is a real
+  ; thing and would need the filesystem layer to know; refusing is the
+  ; honest answer rather than reading a quarter of every cluster.
+  If msc_blockSz <> #MSC_BLOCK_BYTES
+    ProcedureReturn msc_Fail(#MSC_ERR_BLOCKSIZE)
+  EndIf
+  msc_blocks = lastLba + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i MscBlockCount() : ProcedureReturn msc_blocks  : EndProcedure
+Procedure.i MscBlockSize()  : ProcedureReturn msc_blockSz : EndProcedure
+Procedure.i MscReady()      : ProcedureReturn msc_ready   : EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscInit - bring the logical unit up. The bulk endpoints must already
+;  be configured by XhciConfigureBulk.
+;
+;  Returns 1, or 0 with MscError() set.
+; ----------------------------------------------------------------------
+Procedure.i MscInit()
+  Define tries.i
+
+  msc_ready = 0
+  msc_blocks = 0
+  msc_blockSz = 0
+  If XhciBulkReady() = 0
+    ProcedureReturn msc_Fail(#MSC_ERR_NOT_READY)
+  EndIf
+
+  ; TEST UNIT READY, repeatedly. The first few failures are expected on
+  ; a device that has just been reset and are NOT reported as errors -
+  ; only running out of patience is. Sense data is collected after each
+  ; failure because some devices will not proceed until it is.
+  ; LET THE DEVICE SETTLE AFTER SET_CONFIGURATION.
+  ;
+  ; The very first Bulk-Only exchange after Configure Endpoint came back
+  ; with a status wrapper that was not USBS, every time, on two different
+  ; code paths - and every exchange after it worked. A probe that
+  ; happened to issue one throwaway command first "worked", which is a
+  ; horrible thing to depend on and was the clue: the retry loop was
+  ; quietly supplying time, not recovering from anything.
+  ;
+  ; USB 2.0 section 9.2.6.4 allows a device up to 5 ms of recovery after
+  ; a SET_CONFIGURATION before it must respond. Nothing above waits, so
+  ; the wait is here, once, before the first command. Generous rather
+  ; than minimal: this happens exactly once per device and the cost of
+  ; being wrong is a device that never works.
+  delay(50)
+
+  tries = 0
+  msc_firstErr = 0
+  While tries < #MSC_READY_TRIES
+    If MscTestUnitReady() = 1
+      Break
+    EndIf
+    ; KEEP THE FIRST REASON. Reporting only "never became ready" after
+    ; forty attempts hides whether the very first one failed in the
+    ; command wrapper, the data phase or the status phase - and those
+    ; are three unrelated faults that a retry loop turns into one
+    ; useless sentence.
+    If tries = 0
+      msc_firstErr = msc_err
+    EndIf
+    MscRequestSense()
+    delay(50)
+    tries = tries + 1
+  Wend
+  If tries >= #MSC_READY_TRIES
+    ProcedureReturn msc_Fail(#MSC_ERR_NO_MEDIUM)
+  EndIf
+
+  If MscInquiry() = 0
+    ProcedureReturn 0
+  EndIf
+  If MscReadCapacity() = 0
+    ProcedureReturn 0
+  EndIf
+
+  msc_ready = 1
+  msc_err = #MSC_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+
+; A 192-byte scratch for one configuration descriptor. Small, and its
+; own so MscSetupCurrent does not borrow the command data buffer that a
+; concurrent read might be using.
+Global Dim msc_cfg.a[192]
+Global msc_slot.i = 0           ; the xHCI slot the stick was set up on
+
+; ----------------------------------------------------------------------
+;  MscSetupCurrent - is the CURRENTLY ADDRESSED xHCI device a USB mass-
+;  storage stick, and if so, make it usable. Returns 1 if this slot is
+;  now a working block device, 0 if it is not mass storage (leave it for
+;  the caller to try as HID) or could not be brought up.
+;
+;  THIS IS WHAT LETS THE MOUSE, THE KEYBOARD AND THE STICK SHARE ONE
+;  CONTROLLER. The enumeration walk addresses every device once; for
+;  each it offers the slot here, and a stick is configured on the spot
+;  without a second controller bring-up. Bulk transfers already target
+;  xh_mscSlot (set by XhciConfigureBulk) and HID control transfers target
+;  the per-poll xh_slot, so the two never collide once both are up.
+;
+;  NO PRINTING - it runs inside the walk and a device that is simply not
+;  a stick is not news.
+; ----------------------------------------------------------------------
+Procedure.i MscSetupCurrent()
+  Define got.i
+  Define total.i
+  Define cfgVal.i
+  Define off.i
+  Define len.i
+  Define typ.i
+  Define cls.i
+  Define sub.i
+  Define prot.i
+  Define epOut.i
+  Define epIn.i
+  Define mpsOut.i
+  Define mpsIn.i
+
+  ; A stick is already set up. If it is this same slot, done; a second
+  ; stick on another slot is not something one bulk pair can serve.
+  If XhciBulkReady() <> 0
+    If XhciBulkReady() = XhciSlot()
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  got = XhciGetDescriptor(2, 0, 0, 64)
+  If got < 9
+    ProcedureReturn 0
+  EndIf
+  If XhciCopyIn(@msc_cfg[0], got) <= 0
+    ProcedureReturn 0
+  EndIf
+  total = PeekA(@msc_cfg[0] + 2) | (PeekA(@msc_cfg[0] + 3) << 8)
+  If total > got
+    ProcedureReturn 0
+  EndIf
+  cfgVal = PeekA(@msc_cfg[0] + 5)
+
+  cls = 0
+  sub = 0
+  prot = 0
+  epOut = 0
+  epIn = 0
+  mpsOut = 0
+  mpsIn = 0
+  off = 0
+  While off < total
+    len = PeekA(@msc_cfg[0] + off)
+    typ = PeekA(@msc_cfg[0] + off + 1)
+    If len = 0
+      Break
+    EndIf
+    If typ = 4
+      cls  = PeekA(@msc_cfg[0] + off + 5)
+      sub  = PeekA(@msc_cfg[0] + off + 6)
+      prot = PeekA(@msc_cfg[0] + off + 7)
+    ElseIf typ = 5 And cls = 8
+      If (PeekA(@msc_cfg[0] + off + 3) & 3) = 2
+        If (PeekA(@msc_cfg[0] + off + 2) & $80) <> 0
+          epIn  = PeekA(@msc_cfg[0] + off + 2)
+          mpsIn = PeekA(@msc_cfg[0] + off + 4) | (PeekA(@msc_cfg[0] + off + 5) << 8)
+        Else
+          epOut  = PeekA(@msc_cfg[0] + off + 2)
+          mpsOut = PeekA(@msc_cfg[0] + off + 4) | (PeekA(@msc_cfg[0] + off + 5) << 8)
+        EndIf
+      EndIf
+    EndIf
+    off = off + len
+  Wend
+
+  ; SCSI transparent (6) over Bulk-Only ($50). Anything else on class 8
+  ; is not something MscInit's command set can speak to.
+  If cls <> 8 Or sub <> 6 Or prot <> $50
+    ProcedureReturn 0
+  EndIf
+  If epOut = 0 Or epIn = 0
+    ProcedureReturn 0
+  EndIf
+  If XhciSetConfiguration(cfgVal) = 0
+    ProcedureReturn 0
+  EndIf
+  If XhciConfigureBulk(epOut, mpsOut, epIn, mpsIn) = 0
+    ProcedureReturn 0
+  EndIf
+  If MscInit() = 0
+    ProcedureReturn 0
+  EndIf
+  msc_slot = XhciSlot()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscReadBlock - fat.pi4's block reader, exactly.
+;
+;      Procedure.i Reader(lba.i, *buf)   -> 1 or 0
+;
+;  Pass @MscReadBlock to FatSetBlockReader and the filesystem is reading
+;  the USB stick. Nothing in fat.pi4 changes, which is what its seam was
+;  built for.
+; ----------------------------------------------------------------------
+Procedure.i MscReadBlock(lba.i, *buf)
+  Dim cdb.a[16]
+  Define i.i
+
+  If *buf = 0
+    ProcedureReturn msc_Fail(#MSC_ERR_ARG)
+  EndIf
+  If msc_ready = 0
+    ProcedureReturn msc_Fail(#MSC_ERR_NOT_READY)
+  EndIf
+  If lba < 0 Or lba >= msc_blocks
+    ProcedureReturn msc_Fail(#MSC_ERR_RANGE)
+  EndIf
+
+  i = 0
+  While i < 16
+    cdb[i] = 0
+    i = i + 1
+  Wend
+  cdb[0] = #SCSI_READ10
+  ; The LBA is big-endian at bytes 2..5 and the block COUNT is
+  ; big-endian at bytes 7..8. One block.
+  msc_PutBe32(@cdb[0], 2, lba)
+  cdb[7] = 0
+  cdb[8] = 1
+
+  ; BOUNCE THROUGH AN ALIGNED BUFFER. *buf belongs to the caller - for
+  ; fat.pi4 it is a sector cache inside that file - and nothing here can
+  ; promise it is cache-line aligned, or that it does not share a line
+  ; with something the CPU writes. That is exactly the false sharing
+  ; that made the status wrapper arrive as thirteen zero bytes; see the
+  ; buffer pool at the top. A 512-byte copy is nothing beside a USB
+  ; transfer, and it means a caller cannot get this wrong.
+  If msc_Command(@cdb[0], 10, #MSC_DIR_IN, msc_Block(), #MSC_BLOCK_BYTES) = 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < #MSC_BLOCK_BYTES
+    PokeA(*buf + i, PeekA(msc_Block() + i))
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscWriteBlock - the counterpart of MscReadBlock. Same shape.
+;
+;  WRITING WAS DELIBERATELY ABSENT UNTIL NOW, and the header above still
+;  says "a bootloader reads". That was true while Anvil was loaded by
+;  U-Boot. It stopped being true the moment Anvil became the boot image:
+;  updating Anvil then means writing to the medium it boots from, and
+;  the alternative is a second machine and a pulled stick every time.
+;
+;  IT IS STILL NOT A GENERAL WRITE PATH. There is no cluster allocation
+;  here and none above it; see FatSaveInPlace. This writes one block
+;  that something else has already decided belongs to the file.
+;
+;  WRITE(10) is READ(10) with a different opcode and the data going the
+;  other way. The LBA is big-endian at bytes 2..5 and the block count
+;  big-endian at 7..8, exactly as for the read.
+; ----------------------------------------------------------------------
+Procedure.i MscWriteBlock(lba.i, *buf)
+  Dim cdb.a[16]
+  Define i.i
+
+  If *buf = 0
+    ProcedureReturn msc_Fail(#MSC_ERR_ARG)
+  EndIf
+  If msc_ready = 0
+    ProcedureReturn msc_Fail(#MSC_ERR_NOT_READY)
+  EndIf
+  If lba < 0 Or lba >= msc_blocks
+    ProcedureReturn msc_Fail(#MSC_ERR_RANGE)
+  EndIf
+
+  ; Through the aligned bounce buffer, for the same reason the read is:
+  ; the caller's memory carries no cache-line promise, and a DMA buffer
+  ; sharing a line with something the CPU writes loses data. On the way
+  ; out the danger is the mirror image of the read's - our own stale
+  ; line written back over what we meant to send.
+  i = 0
+  While i < #MSC_BLOCK_BYTES
+    PokeA(msc_Block() + i, PeekA(*buf + i))
+    i = i + 1
+  Wend
+
+  i = 0
+  While i < 16
+    cdb[i] = 0
+    i = i + 1
+  Wend
+  cdb[0] = #SCSI_WRITE10
+  msc_PutBe32(@cdb[0], 2, lba)
+  cdb[7] = 0
+  cdb[8] = 1
+
+  ProcedureReturn msc_Command(@cdb[0], 10, 0, msc_Block(), #MSC_BLOCK_BYTES)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MscErrorText - one sentence per code, naming the STAGE.
+; ----------------------------------------------------------------------
+Procedure.i MscErrorText()
+  Select msc_err
+    Case #MSC_ERR_NONE
+      ProcedureReturn "msc: ok"
+    Case #MSC_ERR_NOT_READY
+      ProcedureReturn "msc: the bulk endpoints are not configured - XhciConfigureBulk first"
+    Case #MSC_ERR_CBW
+      ProcedureReturn "msc: the 31-byte command wrapper did not go out whole"
+    Case #MSC_ERR_DATA
+      ProcedureReturn "msc: the data phase failed"
+    Case #MSC_ERR_CSW
+      ProcedureReturn "msc: no status wrapper came back, or it was short"
+    Case #MSC_ERR_CSW_SIG
+      ProcedureReturn "msc: the status wrapper's signature was not USBS - the two ends are out of step"
+    Case #MSC_ERR_CSW_TAG
+      ProcedureReturn "msc: the status wrapper answered a different command"
+    Case #MSC_ERR_FAILED
+      ProcedureReturn "msc: the device reported the command failed"
+    Case #MSC_ERR_PHASE
+      ProcedureReturn "msc: phase error - the device and host disagree about whose turn it is, and only a reset fixes that"
+    Case #MSC_ERR_NO_MEDIUM
+      ; Name the FIRST failure, not the last. See MscFirstError.
+      Select msc_firstErr
+        Case #MSC_ERR_CSW_SIG
+          ProcedureReturn "msc: the unit never became ready, and the first status wrapper was not USBS - the bulk endpoints are not carrying data"
+        Case #MSC_ERR_CSW
+          ProcedureReturn "msc: the unit never became ready, and no status wrapper came back at all"
+        Case #MSC_ERR_CBW
+          ProcedureReturn "msc: the unit never became ready, and the command wrapper would not go out"
+        Case #MSC_ERR_CSW_TAG
+          ProcedureReturn "msc: the unit never became ready, and the status wrappers are answering earlier commands - the two ends are one reply apart"
+        Case #MSC_ERR_FAILED
+          ProcedureReturn "msc: the unit reported not-ready every time - it is talking, but it has no medium"
+      EndSelect
+      ProcedureReturn "msc: the unit never became ready"
+    Case #MSC_ERR_CAPACITY
+      ProcedureReturn "msc: READ CAPACITY returned a size that cannot be right"
+    Case #MSC_ERR_BLOCKSIZE
+      ProcedureReturn "msc: the medium does not use 512-byte blocks, which the filesystem layer requires"
+    Case #MSC_ERR_ARG
+      ProcedureReturn "msc: bad argument"
+    Case #MSC_ERR_RANGE
+      ProcedureReturn "msc: that block is past the end of the medium"
+  EndSelect
+  ProcedureReturn "msc: unknown error"
+EndProcedure

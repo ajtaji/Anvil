@@ -1,0 +1,21 @@
+; Production boundary probe: no test backend macro, therefore no physical
+; device can be reached and instance creation reports incompatible driver.
+#ANVIL_VK_TEST_BACKEND = 0
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+
+#VKP_OUT = $06000000
+
+Procedure.i Main()
+  Define handle.i
+  Define rc.i
+  Define fail.i
+  handle = 123
+  fail = 0
+  If AnvilVkBackendAvailable() <> 0 : fail = fail + 1 : EndIf
+  rc = AnvilVkInstanceCreate(@handle)
+  If rc <> #VK_ERROR_INCOMPATIBLE_DRIVER : fail = fail + 1 : EndIf
+  If handle <> #VK_NULL_HANDLE : fail = fail + 1 : EndIf
+  PokeN(#VKP_OUT + 0, $564B5052) ; "VKPR"
+  PokeN(#VKP_OUT + 8, fail)
+  ProcedureReturn fail
+EndProcedure

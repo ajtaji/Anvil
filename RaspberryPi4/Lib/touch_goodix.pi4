@@ -1,0 +1,707 @@
+; ======================================================================
+; GOODIX GT9xx CAPACITIVE TOUCH CONTROLLER for the Raspberry Pi 4 -
+; library, not a compiler builtin. Up to TEN simultaneous touches, I2C.
+; ----------------------------------------------------------------------
+; Written for the touch half of the Waveshare 10.1" MIPI DSI panel, which
+; carries a Goodix part on the SAME I2C pair the display connector brings
+; out. It is not panel-specific: any GT9xx that answers at 0x5D or 0x14
+; and speaks the register map below will work.
+;
+; USE - all three includes, in this order, in the MAIN file:
+;     XIncludeFile "RaspberryPi4/Lib/gpio.pi4"       ; i2c.pi4 needs it
+;     XIncludeFile "RaspberryPi4/Lib/i2c.pi4"        ; REQUIRED, before this
+;     XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
+;
+; Libraries do not include libraries (project ruling, 2026-07-30), so this
+; file names no other .pi4. If i2c.pi4 is missing above it, the build
+; fails LOUDLY on an undefined I2cWriteRead, which is the designed failure.
+;
+;     I2cSelectBus(#I2C_BUS_DISPLAY) : I2cUp()
+;     If Gt9Begin() <> 0
+;       If Gt9Poll() > 0
+;         rx = Gt9RawX(0) : ry = Gt9RawY(0)     ; the CONTROLLER's units
+;       EndIf
+;     EndIf
+;
+; ======================================================================
+; THIS FILE REPORTS THE CONTROLLER'S OWN COORDINATES AND NOTHING ELSE
+; ======================================================================
+; There is no screen transform in here, and its absence is the design.
+;
+; A touch point becomes a point on a SCREEN by going through the display
+; layer's rotation and its scale - the same rotation and the same scale
+; the console's own pixels go through, in ONE place
+; (RaspberryPi4/Board/screen_geom.pi4, ScrTouchX / ScrTouchY). A second
+; copy of that arithmetic living in the touch driver would be a second
+; opinion about which way up the panel is, and the two would disagree the
+; first time somebody typed `screen rotate`.
+;
+; So: this file answers "where on the CONTROLLER", in the controller's
+; own units, with Gt9XMax() and Gt9YMax() saying how big those units are.
+; The board maps it. A driver that knew which connector it was on, or
+; which way up the frame was bolted to a bench, would be the wrong shape.
+;
+; ======================================================================
+; THE CONTROLLER'S RESOLUTION IS READ, NOT ASSUMED
+; ======================================================================
+; goodix.c:1072 goodix_read_config reads the config block and takes the
+; touch resolution straight out of it:
+;
+;     x_max = le16(config[RESOLUTION_LOC])      RESOLUTION_LOC   = 1
+;     y_max = le16(config[RESOLUTION_LOC + 2])
+;     max_touch_num = min(config[MAX_CONTACTS_LOC] & 0x0f, 10)
+;                                               MAX_CONTACTS_LOC = 5
+;     int_trigger_type = config[TRIGGER_LOC] & 0x03
+;                                               TRIGGER_LOC      = 6
+;
+; and byte 0 of the same block is the config VERSION. Seven bytes at
+; 0x8047 carry all five numbers, so Gt9Begin reads seven.
+;
+; THAT MATTERS MORE THAN IT LOOKS. The device tree for the panel on this
+; bench (10_1_inch_a) sets NO touchscreen-size-x, NO touchscreen-size-y
+; and no axis override at all - see the table below - so the controller's
+; own config block is the ONLY statement of its resolution anywhere. A
+; driver that hardcoded 800 by 1280 would be right about this panel by
+; luck and silently wrong about the next one, and being wrong about it
+; does not look like an error: it looks like a finger that lands a
+; hand's width from where it touched.
+;
+; ======================================================================
+; WHAT THE OVERLAY SAYS ABOUT THE PANEL ON THIS BENCH, LINE BY LINE
+; ======================================================================
+; RaspberryPi4/Reference/rpi-6.12.y_vc4-kms-dsi-waveshare-panel-v2-overlay.dts
+;
+;     touch: goodix@5d {
+;         compatible = "goodix,gt9271";
+;         reg = <0x5d>;
+;         reset-gpio = <&display_mcu 9 GPIO_ACTIVE_HIGH>;
+;     };
+;
+; Three things follow and every one of them shapes this file:
+;
+;   1. THE ADDRESS IS 0x5D AND THE BOARD DECIDED IT. A GT9xx picks 0x5D
+;      or 0x14 from the level on its INT pin while RESET is released.
+;      goodix.c:783 goodix_reset_no_int_sync is the code that drives
+;      that dance - and it runs only when the driver has BOTH an INT and
+;      a RESET line (goodix.c:1055). This node declares a reset and NO
+;      interrupt, so goodix_get_gpio_config leaves irq_pin_access_method
+;      at IRQ_PIN_ACCESS_NONE (goodix.c:1047) and probe never calls
+;      goodix_reset at all (goodix.c:1396, guarded by
+;      reset_controller_at_probe, which only that branch sets).
+;
+;      SO THERE IS NO HANDSHAKE TO PERFORM HERE, and that is not a gap
+;      in this driver: the reference driver does not perform one on this
+;      wiring either. The address is a fact about the board. This file
+;      PROBES for it - 0x5D first, then 0x14 - and never tries to move
+;      one.
+;
+;   2. THE RESET LINE IS NOT ON ANY Pi GPIO. It is bit 9 of the GPIO
+;      expander inside the panel's own micro at 0x45, ten addresses away
+;      on the same bus. THE GOODIX CANNOT ANSWER UNTIL THAT MICRO HAS
+;      BEEN WRITTEN: the regulator's probe writes the shadow 0x0300 -
+;      VCC on, touch reset released - and waits 20 ms before anything
+;      else happens on the bus (waveshare-panel-regulator.c:232-236).
+;      A touch scan that runs first reads as a dead bus on a perfectly
+;      good panel. That write is the caller's job; Gt9Begin() cannot do
+;      it, because which micro sits on which bus is board knowledge.
+;
+;   3. THERE IS NO INTERRUPT, SO POLL ON A CLOCK. Neither Waveshare
+;      overlay gives the Goodix node an `interrupts` or an
+;      `interrupt-parent` property. Linux handles exactly this wiring
+;      with a polled timer at GOODIX_POLL_INTERVAL_MS = 17, commented
+;      "17ms = 60fps" (goodix.c:51). So Gt9Poll() belongs on a tick at
+;      about 60 Hz, not in a tight loop: each call is up to three I2C
+;      transactions and every one can spend its full spin guard when the
+;      bus does not answer. A finger is slower than 60 Hz and always
+;      will be.
+;
+; AND THE AXES ARE NOT OVERRIDDEN FOR THIS PANEL. The v2 overlay's
+; __overrides__ list gives touchscreen-inverted-x to 9_0_inch_b,
+; touchscreen-inverted-y to 10_1_inch_b, and swapped-x-y + inverted-y to
+; 12_3_inch_a_4lane - and gives 10_1_inch_a, the panel on this bench,
+; NOTHING. So the controller's axes are the panel's scan axes: touch x
+; runs with the panel's 800 across and touch y with its 1280 down. The
+; board's mapping starts from that and the board carries the per-panel
+; correction (`touch axes`, stored) for a panel where it is not true -
+; which is the same structure the overlay itself uses, one line per
+; panel, and not a knob invented here.
+;
+; ======================================================================
+; THE REPEATED START IS NOT OPTIONAL
+; ======================================================================
+; The register pointer is SIXTEEN BITS and it is written as two bytes,
+; HIGH BYTE FIRST. The controller then expects the read to follow WITHOUT
+; A STOP - a repeated start (goodix.c:171, two i2c_msg, the second
+; I2C_M_RD, one i2c_transfer).
+;
+; Put a STOP in between and the pointer is forgotten. The read still
+; succeeds. It still returns bytes. They are simply from wherever the
+; pointer happened to be, which after a previous read is somewhere
+; plausible in the same register map. That is the silent-wrong-answer
+; shape in its purest form: a driver that appears to work, tracks
+; nothing, and blames the panel.
+;
+; i2c.pi4's two-transaction I2cWrite-then-I2cRead path therefore CANNOT
+; be used here, and this file calls I2cWriteRead() instead. That
+; procedure did not exist until this driver needed it; its comment block
+; carries the recipe out of BCM2711 ARM Peripherals section 3.3.2.
+;
+; The WRITE direction has no such problem - pointer and data go out in
+; one write transaction with a normal STOP at the end - so Gt9WriteReg
+; uses plain I2cWrite.
+;
+; ======================================================================
+; THE PRODUCT ID IS THE PROBE, NOT AN ADDRESS ACK
+; ======================================================================
+; An address ACK says "something is here". The four ASCII bytes at
+; 0x8140 say what: a GT911 answers "911" and a GT9271 answers "9271"
+; (goodix.c:98-118 lists every id the reference driver knows). On a bus
+; that also carries a panel micro, the weaker answer is the one that
+; misleads, so Gt9TryAddr reads the identity and keeps it.
+;
+; WHICH ADDRESS ANSWERED ALSO SUGGESTS THE PANEL GENERATION, and on a
+; first bring-up that is worth more than the touch itself:
+;
+;     0x5D  -> GT9271 -> the "DSI-TOUCH" v2 family, 800x1280 portrait,
+;                        a panel that needs a 200-command DCS table
+;     0x14  -> GT911  -> the v1 family, 1280x800 landscape, a panel that
+;                        needs no DSI init sequence at all
+;
+; It is suggestive and not conclusive - the address is chosen by a pin
+; and the same part number ships both ways - which is exactly why the id
+; string is read rather than the address believed.
+;
+; ======================================================================
+; THE BUFFER-READY FLAG MUST BE CLEARED, OR THE SAME TOUCH REPEATS FOREVER
+; ======================================================================
+; Register 0x814E's high bit says "a frame is ready" and the low nibble is
+; the touch count. The controller produces no further frame until that
+; register is written back as 0 (goodix.c:515, :529).
+;
+; Gt9Poll() clears it on every path THAT SAW A FRAME - including the frame
+; that reported zero touches, and including the one where the coordinate
+; read then failed.
+;
+; It deliberately does NOT clear when the high bit was low. That is not a
+; missed path: a low high bit means the controller is still assembling a
+; frame, and writing 0 over that throws away the frame being built.
+;
+; AND THE FLAG IS LATE. goodix.c: "The 'buffer status' bit ... is not set
+; as soon as the interrupt is raised, but slightly after. This takes
+; around 10 ms to happen, so we poll for 20 ms." That is why a single
+; read that finds the bit clear means "not yet", never "no touch", and
+; why #GT9_ENOTREADY is the commonest return this file has.
+;
+; ======================================================================
+; WHERE THE REGISTER MAP COMES FROM (do not guess - rule 21)
+; ======================================================================
+; RaspberryPi4/Reference/rpi-6.12.y_goodix.h and _goodix.c, fetched
+; 2026-09-06 from
+; https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/
+; drivers/input/touchscreen/goodix.{c,h}
+;
+;   goodix.h:34  GOODIX_REG_COMMAND         0x8040
+;   goodix.h:38  GOODIX_REG_SW_WDT          0x8041
+;   goodix.h:48  GOODIX_REG_STATUS          0x8044
+;   goodix.h:51  GOODIX_GT9X_REG_CONFIG_DATA 0x8047
+;   goodix.h:52  GOODIX_REG_ID              0x8140
+;   goodix.h:53  GOODIX_READ_COOR_ADDR      0x814E
+;   goodix.h:56  GOODIX_ID_MAX_LEN          4
+;   goodix.c:34  GOODIX_CONTACT_SIZE        8
+;   goodix.c:36  GOODIX_MAX_CONTACTS        10
+;   goodix.c:43  GOODIX_BUFFER_STATUS_READY BIT(7)
+;   goodix.c:45  GOODIX_BUFFER_STATUS_TIMEOUT 20   (milliseconds)
+;   goodix.c:47  RESOLUTION_LOC 1, MAX_CONTACTS_LOC 5, TRIGGER_LOC 6
+;   goodix.c:51  GOODIX_POLL_INTERVAL_MS    17
+;   goodix.c:171 goodix_i2c_read  - two-byte big-endian pointer, then a
+;                                   repeated-start read
+;   goodix.c:412 goodix_ts_report_touch_8b - id in bits 3..0 of byte 0,
+;                                   X at [1..2] LE, Y at [3..4] LE,
+;                                   width at [5..6] LE
+;   goodix.c:515 the buffer release: write 0 to GOODIX_READ_COOR_ADDR
+;   goodix.c:1111 goodix_read_version - four id bytes then a 16-bit LE
+;                                   firmware version at [4..5]
+;
+; The 9-byte contact variant in goodix.c exists only behind a DMI quirk
+; list for x86 tablets (goodix.c:1236). This part is not one, and a
+; contact size that is a setting nobody can check is worse than a
+; constant that is cited, so 8 is a constant here.
+;
+; House prior art on two other targets, same chip family, and worth
+; reading before changing anything here: RP2350/Lib/gt911.pico2 and
+; RP2040/Lib/gt911.pico. They cap at five points because their panel
+; does; this one goes to ten because the controller does and the
+; Waveshare panel is sold on it.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  The two addresses, and what each one suggests about the panel.
+; ----------------------------------------------------------------------
+#GT9_ADDR_HIGH  = $5D         ; GT9271 - Waveshare v2, 800x1280 portrait
+#GT9_ADDR_LOW   = $14         ; GT911  - Waveshare v1, 1280x800 landscape
+
+; ----------------------------------------------------------------------
+;  Registers. Sixteen bits, written high byte first.
+; ----------------------------------------------------------------------
+#GT9_REG_COMMAND = $8040
+#GT9_REG_STATUS  = $8044
+#GT9_REG_CONFIG  = $8047      ; the config block - see the header
+#GT9_REG_ID      = $8140      ; 4 ASCII id bytes, then 2 bytes of version
+#GT9_REG_COOR    = $814E      ; the buffer-status byte, then the contacts
+
+#GT9_CMD_SCREEN_OFF = $05     ; goodix.h:35, written to #GT9_REG_COMMAND
+
+#GT9_STATUS_READY = $80       ; bit 7 of the byte at #GT9_REG_COOR
+#GT9_COUNT_MASK   = $0F       ; bits 3..0 of the same byte
+
+#GT9_CONTACT_SIZE = 8
+#GT9_MAX_POINTS   = 10
+#GT9_ID_LEN       = 4
+
+; The config block's first seven bytes carry every number this driver
+; wants out of it. goodix.c reads 186 or 240 depending on the part
+; because it also CHECKSUMS and REWRITES the block; nothing here writes
+; a config, so nothing here needs the rest of it.
+#GT9_CFG_HEAD     = 7
+#GT9_CFG_RES      = 1         ; RESOLUTION_LOC   - x_max, then y_max, LE16
+#GT9_CFG_CONTACTS = 5         ; MAX_CONTACTS_LOC - low nibble
+#GT9_CFG_TRIGGER  = 6         ; TRIGGER_LOC      - low two bits
+
+; The largest single read this driver ever does: the one-byte header plus
+; ten contacts plus the trailing key byte. Sized once, here, so no call
+; site has to get the arithmetic right.
+#GT9_BUF_BYTES = 1 + (#GT9_CONTACT_SIZE * #GT9_MAX_POINTS) + 1
+
+; ----------------------------------------------------------------------
+;  Result codes. Gt9Begin returns an ADDRESS or 0; these are for the
+;  procedures that report a reason.
+; ----------------------------------------------------------------------
+#GT9_OK        = 0
+#GT9_ENODEV    = -1           ; Gt9Begin has not found a controller
+#GT9_EBUS      = -2           ; the transfer failed - see Gt9LastBusCode()
+#GT9_ENOTREADY = -3           ; no frame was ready this poll (not an error)
+#GT9_EPROTO    = -4           ; the controller reported more touches than
+                              ; its own config block has slots for
+
+; ----------------------------------------------------------------------
+;  State.
+; ----------------------------------------------------------------------
+Global gt9_addr.i             ; 0 = nothing found yet
+Global gt9_count.i            ; touches in the last frame that HAD one
+Global gt9_fw.i               ; 16-bit firmware version from 0x8140+4
+Global gt9_cfg.i              ; config version byte from 0x8047, -1 unread
+Global gt9_xmax.i             ; the controller's own x range, 0 if unread
+Global gt9_ymax.i             ; and its y range
+Global gt9_maxpts.i           ; contact slots the config block declares
+Global gt9_trigger.i          ; the trigger type it declares, -1 if unread
+Global gt9_buscode.i          ; the last #I2C_* code any transfer returned
+Global gt9_codehigh.i         ; what $5D said when Gt9Begin last asked
+Global gt9_codelow.i          ; what $14 said, or #I2C_OK if never asked
+Global gt9_frames.i           ; frames seen since Gt9Begin
+Global gt9_badframes.i        ; frames refused for an impossible count
+
+Global Dim gt9_buf.a[#GT9_BUF_BYTES]
+Global Dim gt9_idstr.a[#GT9_ID_LEN + 1]
+Global Dim gt9_id.i[#GT9_MAX_POINTS]
+Global Dim gt9_x.i[#GT9_MAX_POINTS]
+Global Dim gt9_y.i[#GT9_MAX_POINTS]
+Global Dim gt9_sz.i[#GT9_MAX_POINTS]
+
+; ----------------------------------------------------------------------
+;  Gt9ReadReg(reg, n) - read n bytes from a 16-bit register into gt9_buf.
+;
+;  ONE transaction with a repeated start. See the header for why a STOP
+;  here would return believable rubbish instead of failing.
+;
+;  Returns 1, or 0 with the bus code left in gt9_buscode.
+; ----------------------------------------------------------------------
+Procedure.i Gt9ReadReg(reg.i, n.i)
+  Define hdr0.a
+  Define hdr1.a
+  Define r.i
+  Dim hdr.a[2]
+
+  If gt9_addr = 0 Or n < 1 Or n > #GT9_BUF_BYTES
+    gt9_buscode = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+
+  ; HIGH byte first. The other order reads a completely different part of
+  ; the map and returns numbers that look like data.
+  hdr0 = (reg >> 8) & $FF
+  hdr1 = reg & $FF
+  hdr[0] = hdr0
+  hdr[1] = hdr1
+
+  r = I2cWriteRead(gt9_addr, @hdr, 2, @gt9_buf, n)
+  gt9_buscode = r
+  If r <> #I2C_OK
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Gt9WriteReg(reg, v) - write one byte to a 16-bit register.
+;
+;  A plain write transaction: pointer and data go out together and the
+;  STOP at the end is correct. No repeated start is involved.
+; ----------------------------------------------------------------------
+Procedure.i Gt9WriteReg(reg.i, v.i)
+  Define r.i
+  Dim pkt.a[3]
+
+  If gt9_addr = 0
+    gt9_buscode = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+  pkt[0] = (reg >> 8) & $FF
+  pkt[1] = reg & $FF
+  pkt[2] = v & $FF
+
+  r = I2cWrite(gt9_addr, @pkt, 3)
+  gt9_buscode = r
+  If r <> #I2C_OK
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Gt9TryAddr(a) - is there a controller at this address? Reads the six
+;  identity bytes and keeps them if it worked.
+;
+;  A PRODUCT ID READ IS THE PROBE, not an address ACK. See the header.
+; ----------------------------------------------------------------------
+Procedure.i Gt9TryAddr(a.i)
+  Define i.i
+
+  gt9_addr = a
+  If Gt9ReadReg(#GT9_REG_ID, 6) = 0
+    gt9_addr = 0
+    ProcedureReturn 0
+  EndIf
+
+  i = 0
+  While i < #GT9_ID_LEN
+    gt9_idstr[i] = gt9_buf[i] & $FF
+    i = i + 1
+  Wend
+  gt9_idstr[#GT9_ID_LEN] = 0
+
+  ; goodix.c:1125 - get_unaligned_le16(&buf[4]).
+  gt9_fw = (gt9_buf[4] & $FF) | ((gt9_buf[5] & $FF) << 8)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Gt9ReadConfig() - the config block's first seven bytes: the version,
+;  the touch resolution, the contact count and the trigger type.
+;
+;  FAILURE HERE IS NOT FATAL and that is deliberate. The controller is
+;  present and answering identity; a driver that refused to start
+;  because seven more bytes would not read has turned a diagnostic into
+;  an outage. What it costs is the resolution, and the accessors say so
+;  by answering 0 rather than a plausible number - see Gt9XMax().
+;
+;  Returns 1 if the block read, else 0.
+; ----------------------------------------------------------------------
+Procedure.i Gt9ReadConfig()
+  Define n.i
+
+  gt9_cfg = -1
+  gt9_xmax = 0
+  gt9_ymax = 0
+  gt9_maxpts = #GT9_MAX_POINTS
+  gt9_trigger = -1
+
+  If Gt9ReadReg(#GT9_REG_CONFIG, #GT9_CFG_HEAD) = 0
+    ProcedureReturn 0
+  EndIf
+
+  gt9_cfg = gt9_buf[0] & $FF
+
+  ; LITTLE-endian, both of them, exactly like the coordinates and unlike
+  ; the register ADDRESS that fetched them.
+  gt9_xmax = (gt9_buf[#GT9_CFG_RES] & $FF) | ((gt9_buf[#GT9_CFG_RES + 1] & $FF) << 8)
+  gt9_ymax = (gt9_buf[#GT9_CFG_RES + 2] & $FF) | ((gt9_buf[#GT9_CFG_RES + 3] & $FF) << 8)
+
+  ; goodix.c:1093 - min(config[5] & 0x0f, GOODIX_MAX_CONTACTS). A zero
+  ; there is a config block that has not been programmed, and zero slots
+  ; would refuse every frame the controller ever sends, so it falls back
+  ; to the part's maximum the same way goodix.c:1229 does.
+  n = gt9_buf[#GT9_CFG_CONTACTS] & $0F
+  If n < 1 Or n > #GT9_MAX_POINTS
+    n = #GT9_MAX_POINTS
+  EndIf
+  gt9_maxpts = n
+
+  gt9_trigger = gt9_buf[#GT9_CFG_TRIGGER] & $03
+
+  ; A resolution of zero in either axis is what an unprogrammed block
+  ; reads as, and goodix.c:1213 treats exactly that as "invalid config,
+  ; using defaults". Nothing here invents a number in its place: the
+  ; caller is told 0 and can say so, because a made-up resolution puts
+  ; every finger in the wrong place with no error anywhere.
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Gt9Begin() - find the controller, learn what it is, and clear whatever
+;  frame was left over from before we arrived.
+;
+;  Returns the 7-bit address found, or 0 for "no Goodix on this bus".
+;
+;  0x5D IS TRIED FIRST because that is the address the panel on this
+;  bench answers on - the v2 overlay's goodix@5d node - and trying the
+;  other one costs one failed transfer and means a v1 board is
+;  IDENTIFIED rather than reported missing.
+;
+;  THE CALLER BRINGS THE BUS UP, AND ON A v2 PANEL THE CALLER MUST ALSO
+;  HAVE WRITTEN THE PANEL MICRO FIRST. The touch controller's reset is
+;  expander bit 9 inside that micro and nothing else on the board
+;  reaches it; see point 2 of the header. Which bus the panel is on, and
+;  whether its micro has been powered, are the board's questions and not
+;  this driver's.
+; ----------------------------------------------------------------------
+Procedure.i Gt9Begin()
+  gt9_addr = 0
+  gt9_count = 0
+  gt9_fw = 0
+  gt9_cfg = -1
+  gt9_xmax = 0
+  gt9_ymax = 0
+  gt9_maxpts = #GT9_MAX_POINTS
+  gt9_trigger = -1
+  gt9_frames = 0
+  gt9_badframes = 0
+  gt9_buscode = #I2C_OK
+  gt9_codehigh = #I2C_OK
+  gt9_codelow = #I2C_OK
+  gt9_idstr[0] = 0
+
+  ; BOTH CODES ARE KEPT, not just the last one. When nothing answers, a
+  ; single "last bus code" is always the SECOND address's, and the
+  ; second is the one we did not expect - so the interesting failure is
+  ; the one that gets overwritten. A NACK at $5D means no chip there;
+  ; anything else is a defect in the transfer and not a missing panel.
+  If Gt9TryAddr(#GT9_ADDR_HIGH) = 0
+    gt9_codehigh = gt9_buscode
+    If Gt9TryAddr(#GT9_ADDR_LOW) = 0
+      gt9_codelow = gt9_buscode
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  Gt9ReadConfig()
+
+  ; Whatever frame was pending before we arrived is not ours.
+  Gt9WriteReg(#GT9_REG_COOR, 0)
+  ProcedureReturn gt9_addr
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Gt9Poll() - read one frame if one is ready.
+;
+;  Returns the number of touches now down (0 to 10), or a negative
+;  #GT9_E* code. ZERO IS NORMAL and means "a frame arrived and nothing is
+;  touching the panel". #GT9_ENOTREADY means "no frame yet", which is also
+;  normal and is what most calls return - the buffer-ready bit lags the
+;  touch by about ten milliseconds.
+;
+;  Call this from a tick at about 60 Hz. See the header.
+; ----------------------------------------------------------------------
+Procedure.i Gt9Poll()
+  Define st.i
+  Define n.i
+  Define i.i
+  Define base.i
+
+  gt9_count = 0
+  If gt9_addr = 0
+    ProcedureReturn #GT9_ENODEV
+  EndIf
+
+  If Gt9ReadReg(#GT9_REG_COOR, 1) = 0
+    ProcedureReturn #GT9_EBUS
+  EndIf
+  st = gt9_buf[0] & $FF
+
+  ; High bit clear: the controller is still assembling. NOTHING TO READ
+  ; AND NOTHING TO CLEAR - writing 0 here would discard the frame being
+  ; built. This is the common return.
+  If (st & #GT9_STATUS_READY) = 0
+    ProcedureReturn #GT9_ENOTREADY
+  EndIf
+
+  gt9_frames = gt9_frames + 1
+  n = st & #GT9_COUNT_MASK
+
+  If n > gt9_maxpts
+    ; More contacts than the controller's own config block says it has
+    ; slots for is not that many fingers, it is a corrupt read
+    ; (goodix.c:280 returns -EPROTO on exactly this). Clear the flag so
+    ; the controller is not left wedged on it, count it, and say so -
+    ; rather than indexing off the end of four arrays.
+    gt9_badframes = gt9_badframes + 1
+    Gt9WriteReg(#GT9_REG_COOR, 0)
+    ProcedureReturn #GT9_EPROTO
+  EndIf
+
+  If n > 0
+    If Gt9ReadReg(#GT9_REG_COOR + 1, n * #GT9_CONTACT_SIZE) = 0
+      ; The frame was real and we lost it. Still clear, or no further
+      ; frame is ever produced.
+      Gt9WriteReg(#GT9_REG_COOR, 0)
+      ProcedureReturn #GT9_EBUS
+    EndIf
+    i = 0
+    While i < n
+      base = i * #GT9_CONTACT_SIZE
+      ; LITTLE-endian here, unlike the register ADDRESS above which is
+      ; BIG-endian. Getting those two the same way round is the classic
+      ; GT9xx mistake: the coordinates then track the finger and land in
+      ; the wrong place, which reads as a calibration problem for a week.
+      gt9_id[i] = gt9_buf[base] & $0F
+      gt9_x[i] = (gt9_buf[base + 1] & $FF) | ((gt9_buf[base + 2] & $FF) << 8)
+      gt9_y[i] = (gt9_buf[base + 3] & $FF) | ((gt9_buf[base + 4] & $FF) << 8)
+      gt9_sz[i] = (gt9_buf[base + 5] & $FF) | ((gt9_buf[base + 6] & $FF) << 8)
+      i = i + 1
+    Wend
+    gt9_count = n
+  EndIf
+
+  ; ALWAYS clear on a frame that was seen, including the zero-touch frame.
+  Gt9WriteReg(#GT9_REG_COOR, 0)
+  ProcedureReturn gt9_count
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Gt9ScreenOff() - ask the controller to stop scanning. It wakes on the
+;  next successful register read. Returns 1 or 0.
+; ----------------------------------------------------------------------
+Procedure.i Gt9ScreenOff()
+  ProcedureReturn Gt9WriteReg(#GT9_REG_COMMAND, #GT9_CMD_SCREEN_OFF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Accessors. An out-of-range index returns -1 rather than whatever is in
+;  the array, so a caller that ignores the count gets an obviously wrong
+;  number instead of a stale coordinate from the previous frame.
+; ----------------------------------------------------------------------
+Procedure.i Gt9Addr()
+  ProcedureReturn gt9_addr
+EndProcedure
+
+Procedure.i Gt9Count()
+  ProcedureReturn gt9_count
+EndProcedure
+
+; Gt9ProdId() - the address of the four id bytes plus a terminating zero.
+; "9271" or "911" on the parts this was written for. 0 if nothing
+; answered.
+Procedure.i Gt9ProdId()
+  If gt9_addr = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn @gt9_idstr
+EndProcedure
+
+Procedure.i Gt9Firmware()
+  ProcedureReturn gt9_fw
+EndProcedure
+
+; Gt9ConfigVersion() - the config block's version byte, or -1 if it would
+; not read. -1 is not a failure of the driver; the controller is present.
+Procedure.i Gt9ConfigVersion()
+  ProcedureReturn gt9_cfg
+EndProcedure
+
+; Gt9XMax() / Gt9YMax() - the controller's OWN coordinate range, out of
+; its config block. ZERO MEANS IT WOULD NOT SAY - either the block did
+; not read or the block is unprogrammed - and zero is returned rather
+; than a plausible default because the board scales every touch by these
+; two numbers, and a made-up one puts every finger in the wrong place
+; with nothing anywhere reporting an error.
+Procedure.i Gt9XMax()
+  ProcedureReturn gt9_xmax
+EndProcedure
+
+Procedure.i Gt9YMax()
+  ProcedureReturn gt9_ymax
+EndProcedure
+
+; Gt9MaxPoints() - contact slots the config block declares, capped at the
+; part's ten. This is the number a frame's touch count is refused
+; against.
+Procedure.i Gt9MaxPoints()
+  ProcedureReturn gt9_maxpts
+EndProcedure
+
+; Gt9IntTrigger() - the trigger type the config block asks for, 0..3, or
+; -1 if the block would not read. RECORDED, NOT ACTED ON: there is no
+; interrupt line to this controller on this board, so this driver polls
+; whatever the number says. It is printed because a controller
+; configured for a trigger nobody wired is worth seeing on a bring-up.
+Procedure.i Gt9IntTrigger()
+  ProcedureReturn gt9_trigger
+EndProcedure
+
+Procedure.i Gt9LastBusCode()
+  ProcedureReturn gt9_buscode
+EndProcedure
+
+; Gt9CodeHigh() / Gt9CodeLow() - what each address said the last time
+; Gt9Begin asked it. #I2C_OK means it was never asked, or it answered.
+Procedure.i Gt9CodeHigh()
+  ProcedureReturn gt9_codehigh
+EndProcedure
+
+Procedure.i Gt9CodeLow()
+  ProcedureReturn gt9_codelow
+EndProcedure
+
+Procedure.i Gt9Frames()
+  ProcedureReturn gt9_frames
+EndProcedure
+
+Procedure.i Gt9BadFrames()
+  ProcedureReturn gt9_badframes
+EndProcedure
+
+; Gt9RawX / Gt9RawY - THE CONTROLLER'S OWN UNITS, 0 .. Gt9XMax()-1 and
+; 0 .. Gt9YMax()-1. Not screen pixels: see the second block of the
+; header for why the screen transform is not in this file.
+Procedure.i Gt9RawX(i.i)
+  If i < 0 Or i >= gt9_count
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gt9_x[i]
+EndProcedure
+
+Procedure.i Gt9RawY(i.i)
+  If i < 0 Or i >= gt9_count
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gt9_y[i]
+EndProcedure
+
+; Gt9Size(i) - how big the contact patch is; roughly, how hard.
+Procedure.i Gt9Size(i.i)
+  If i < 0 Or i >= gt9_count
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gt9_sz[i]
+EndProcedure
+
+; Gt9Id(i) - the tracking id. The controller keeps the same id on one
+; finger while it slides, which is how a drag is followed and how a
+; DOWN, a MOVE and an UP are told apart.
+Procedure.i Gt9Id(i.i)
+  If i < 0 Or i >= gt9_count
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gt9_id[i]
+EndProcedure

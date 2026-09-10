@@ -1,0 +1,340 @@
+; ======================================================================
+;  console.pi4 - THE ONE CONSOLE CORE.
+;
+;  Anvil's console is ONE thing with several ENDPOINTS, not several
+;  parallel consoles. This file is the core: the output hub's terminal
+;  MODEL - a character grid with a cursor, wrap and scroll - maintained
+;  ONCE, hardware-agnostic. Every endpoint attaches to it:
+;
+;    * SCREEN endpoints (DMA, V3D, CPU) are RENDERERS of this one grid.
+;      They differ only in how they paint it - the DMA renderer blits the
+;      cells and DMA-scrolls, the V3D renderer GPU-renders them - and they
+;      draw byte-identical content because they read the same grid.
+;    * SERIAL / WIFI / ETHERNET endpoints are byte-stream adapters over the
+;      same output; they are fed straight off the UART, not from here.
+;
+;  ONE CONSUMER OF THE OUTPUT STREAM. ConDrainRing() is the ONLY thing
+;  that reads the UART mirror ring into the grid. The renderers never
+;  consume the ring - they paint whatever the grid says. That is the whole
+;  fix for the bugs a second, private V3D grid caused: the boot log is in
+;  the grid whichever renderer is active, there is no double-consume, and
+;  the scroll happens once. Switch renderers and the SAME grid appears,
+;  differing only in sharpness.
+;
+;  THIS FILE KNOWS NOTHING ABOUT ANY MEDIUM. It has no framebuffer, no
+;  V3D, no pixels - just the grid, the cursor, and dirty/scroll bookkeeping
+;  the renderers read to paint efficiently. A board that has no display
+;  registers no screen renderer and this core still runs (harmlessly) or is
+;  simply never pumped; the serial and wireless endpoints are unaffected.
+; ======================================================================
+
+#CON_MAXCOLS = 256
+#CON_MAXROWS = 80
+#CON_CELLS   = 20480              ; 256 * 80
+
+Global Dim gConGrid.a[#CON_CELLS]        ; one byte per cell, ASCII (space = blank)
+Global Dim gConRowDirty.a[#CON_MAXROWS]  ; 1 if a row's content changed since paint
+Global Dim gConRowBuf.a[#CON_MAXCOLS + 2] ; a renderer's scratch for one NUL-terminated row
+Global gConCols.i   = 0
+Global gConRows.i   = 0
+Global gConCurR.i   = 0                  ; the TEXT cursor (where the next char lands)
+Global gConCurC.i   = 0
+Global gConScrollN.i = 0                 ; net rows scrolled UP since the last paint,
+                                         ; so a renderer can hardware-scroll to match
+Global gConFullClear.i = 0               ; the whole console was cleared
+Global gConDirty.i  = 0                  ; anything at all changed since the last paint
+Global gConReady.i  = 0                  ; geometry has been set
+
+Procedure ConGridMarkAll()
+  Define r.i
+  r = 0
+  While r < gConRows
+    gConRowDirty[r] = 1
+    r = r + 1
+  Wend
+  gConDirty = 1
+EndProcedure
+
+Procedure ConGridClear()
+  Define i.i
+  Define n.i
+  n = gConCols * gConRows
+  i = 0
+  While i < n
+    gConGrid[i] = 32
+    i = i + 1
+  Wend
+  gConCurR = 0
+  gConCurC = 0
+  gConFullClear = 1
+  gConScrollN = 0
+  ConGridMarkAll()
+EndProcedure
+
+; ConGridInit - set the grid geometry (columns x rows) and clear it. The
+; CALLER works out cols/rows from the display; the model just holds them,
+; so it needs nothing board-specific.
+Procedure ConGridInit(cols.i, rows.i)
+  If cols > #CON_MAXCOLS
+    cols = #CON_MAXCOLS
+  EndIf
+  If rows > #CON_MAXROWS
+    rows = #CON_MAXROWS
+  EndIf
+  If cols < 1
+    cols = 1
+  EndIf
+  If rows < 1
+    rows = 1
+  EndIf
+  gConCols = cols
+  gConRows = rows
+  ConGridClear()
+  gConReady = 1
+EndProcedure
+
+; Scroll the whole grid up one row. The dirty flags shift with the content
+; so a renderer that hardware-scrolls the picture only has to repaint the
+; rows that genuinely changed, exactly like the DMA console always did.
+Procedure ConGridScroll()
+  Define r.i
+  Define c.i
+  r = 0
+  While r < gConRows - 1
+    c = 0
+    While c < gConCols
+      gConGrid[r * gConCols + c] = gConGrid[(r + 1) * gConCols + c]
+      c = c + 1
+    Wend
+    gConRowDirty[r] = gConRowDirty[r + 1]
+    r = r + 1
+  Wend
+  c = 0
+  While c < gConCols
+    gConGrid[(gConRows - 1) * gConCols + c] = 32
+    c = c + 1
+  Wend
+  gConRowDirty[gConRows - 1] = 1
+  gConScrollN = gConScrollN + 1
+  gConDirty = 1
+EndProcedure
+
+Procedure ConGridNewline()
+  gConCurC = 0
+  gConCurR = gConCurR + 1
+  If gConCurR >= gConRows
+    ConGridScroll()
+    gConCurR = gConRows - 1
+  EndIf
+EndProcedure
+
+; The terminal state machine, one byte at a time. Newline, carriage
+; return, backspace, tab, wrap and scroll - the ordinary console rules,
+; kept ONCE here for every renderer.
+Procedure ConGridPutc(c.i)
+  Define t.i
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  If c = 13                          ; CR
+    gConCurC = 0
+    ProcedureReturn
+  EndIf
+  If c = 10                          ; LF
+    ConGridNewline()
+    ProcedureReturn
+  EndIf
+  If c = 8 Or c = 127                ; backspace / delete
+    If gConCurC > 0
+      gConCurC = gConCurC - 1
+      gConGrid[gConCurR * gConCols + gConCurC] = 32
+      gConRowDirty[gConCurR] = 1
+      gConDirty = 1
+    EndIf
+    ProcedureReturn
+  EndIf
+  If c = 9                           ; tab -> next multiple of 8
+    t = (gConCurC + 8) - ((gConCurC + 8) % 8)
+    While gConCurC < t And gConCurC < gConCols
+      gConGrid[gConCurR * gConCols + gConCurC] = 32
+      gConCurC = gConCurC + 1
+    Wend
+    gConRowDirty[gConCurR] = 1
+    gConDirty = 1
+    If gConCurC >= gConCols
+      ConGridNewline()
+    EndIf
+    ProcedureReturn
+  EndIf
+  If c < 32 Or c > 126               ; other control bytes: ignore
+    ProcedureReturn
+  EndIf
+  gConGrid[gConCurR * gConCols + gConCurC] = c
+  gConRowDirty[gConCurR] = 1
+  gConDirty = 1
+  gConCurC = gConCurC + 1
+  If gConCurC >= gConCols
+    ConGridNewline()
+  EndIf
+EndProcedure
+
+; ConDrainRing - THE ONE CONSUMER of the UART mirror ring. Drains it into
+; the grid. ScreenPump calls it before painting, and uart.pi4 may call it as
+; a MODEL-ONLY producer-side drain at a line boundary / high-water mark. It
+; never renders and never prints, so that callback is safe inside UartWrite.
+Procedure ConDrainRing()
+  Define n.i
+  Define i.i
+  Define c.i
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  n = UartMirrorCount()
+  i = 0
+  While i < n
+    c = UartMirrorGet()
+    If c < 0
+      Break
+    EndIf
+    ConGridPutc(c)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ---- read-only accessors for the renderers ---------------------------
+Procedure.i ConGridReady()
+  ProcedureReturn gConReady
+EndProcedure
+Procedure.i ConGridCols()
+  ProcedureReturn gConCols
+EndProcedure
+Procedure.i ConGridRows()
+  ProcedureReturn gConRows
+EndProcedure
+Procedure.i ConGridCell(r.i, c.i)
+  If r < 0 Or r >= gConRows Or c < 0 Or c >= gConCols
+    ProcedureReturn 32
+  EndIf
+  ProcedureReturn gConGrid[r * gConCols + c] & $FF
+EndProcedure
+Procedure.i ConGridRowDirty(r.i)
+  If r < 0 Or r >= gConRows
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn gConRowDirty[r]
+EndProcedure
+Procedure.i ConGridScrollN()
+  ProcedureReturn gConScrollN
+EndProcedure
+Procedure.i ConGridFullClear()
+  ProcedureReturn gConFullClear
+EndProcedure
+Procedure.i ConGridDirty()
+  ProcedureReturn gConDirty
+EndProcedure
+Procedure.i ConGridCurR()
+  ProcedureReturn gConCurR
+EndProcedure
+Procedure.i ConGridCurC()
+  ProcedureReturn gConCurC
+EndProcedure
+
+; Build a NUL-terminated string of one grid row into a caller's buffer,
+; trimmed of trailing spaces. Returns the length (0 for a blank row). The
+; renderers use this to paint a row and to know how much of it is ink.
+Procedure.i ConGridRowText(r.i, *dst)
+  Define c.i
+  Define last.i
+  Define g.i
+  If r < 0 Or r >= gConRows
+    PokeA(*dst, 0)
+    ProcedureReturn 0
+  EndIf
+  last = -1
+  c = 0
+  While c < gConCols
+    g = gConGrid[r * gConCols + c] & $FF
+    If g = 0
+      g = 32
+    EndIf
+    PokeA(*dst + c, g)
+    If g <> 32
+      last = c
+    EndIf
+    c = c + 1
+  Wend
+  PokeA(*dst + last + 1, 0)
+  ProcedureReturn last + 1
+EndProcedure
+
+; Called by a renderer once it has painted the grid, to clear the change
+; bookkeeping. The NEXT change re-sets it.
+Procedure ConGridClearDirty()
+  Define r.i
+  r = 0
+  While r < gConRows
+    gConRowDirty[r] = 0
+    r = r + 1
+  Wend
+  gConScrollN = 0
+  gConFullClear = 0
+  gConDirty = 0
+EndProcedure
+
+; ======================================================================
+;  THE SCREEN ENDPOINT REGISTRY + THE PUMP.
+;
+;  A SCREEN renderer is an endpoint that paints the grid. Exactly one is
+;  active at a time (the current display tier); it registers itself with
+;  ConSetRenderer(@its_paint_proc). The core calls it through the pointer,
+;  so it knows nothing about V3D, DMA or CPU - a new renderer type is added
+;  by writing a paint proc and registering it, touching nothing here. With
+;  no display, no renderer is registered and the pump paints nothing; the
+;  serial and wireless endpoints, fed straight off the UART, are unaffected.
+; ======================================================================
+Global *gConPaint = 0            ; the active screen renderer's paint proc
+
+Procedure ConSetRenderer(*fn)
+  *gConPaint = *fn
+EndProcedure
+Procedure ConNoRenderer()
+  *gConPaint = 0
+EndProcedure
+
+; Take the grid down (the screen went away). Output keeps flowing to the
+; serial and wireless endpoints; there is just nothing painting the grid.
+Procedure ConGridStop()
+  gConReady = 0
+  *gConPaint = 0
+EndProcedure
+
+; ScreenPump - THE HUB. Drain the one output stream into the one grid, then
+; let the active screen renderer paint what changed. This is the single
+; entry every caller (the prompt, the boot log, the payload boundary) uses;
+; the name is kept because four files already call it.
+Procedure ScreenPump()
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  ConDrainRing()
+  If gConDirty = 0
+    ProcedureReturn
+  EndIf
+  If *gConPaint <> 0
+    gConPaint()
+  EndIf
+EndProcedure
+
+; ConRepaint - force the whole grid to be repainted by the current
+; renderer (used the instant a new tier takes over, so the freshly
+; registered renderer shows the existing grid rather than a blank screen).
+Procedure ConRepaint()
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  ConGridMarkAll()
+  gConFullClear = 1
+  If *gConPaint <> 0
+    gConPaint()
+  EndIf
+EndProcedure

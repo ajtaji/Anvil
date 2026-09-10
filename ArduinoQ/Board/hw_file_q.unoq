@@ -1,0 +1,388 @@
+; ======================================================================
+;  hw_file_q.pi4 - the Arduino UNO Q's HwFile* backend: the file-level
+;  storage seam (Anvil/Hal/hal.pbi) implemented over UEFI's
+;  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL on the EFI System Partition.
+;
+;  THIS IS THE FILE THAT MAKES #CAP_STORAGE = 1 ON THIS BOARD, and the
+;  reason it could be written at all is the one measured fact the whole Q
+;  port rests on: Anvil runs here as a UEFI application with BOOT SERVICES
+;  STILL UP. The firmware therefore keeps publishing its protocols, and
+;  one of them opens files by name on the partition this image was
+;  launched from. ArduinoQ/Board/qefi_q.unoq already rode that chain -
+;  LoadedImage -> DeviceHandle -> SimpleFileSystem -> OpenVolume -> Open -
+;  to write the session transcript. Everything below is that same chain
+;  answering to the names the core asks in.
+;
+;  WHAT THIS BOARD STILL DOES NOT HAVE, so that #CAP_STORAGE = 1 is not
+;  read as a bigger claim than it is:
+;
+;    * NO BLOCK DEVICE. Anvil has no driver for the QCM2290's SDHCI-MSM
+;      controller and none is written here. #CAP_MMC stays 0, and the raw
+;      `mmc` family still refuses, correctly - that family reads SECTORS
+;      and there are none to read. Two different capabilities over one
+;      piece of silicon is exactly the distinction hal.pi4 draws between
+;      #CAP_MMC and #CAP_STORAGE, and the Q is the board that makes the
+;      distinction concrete rather than theoretical.
+;    * NO FAT PARSER OF OURS ANYWHERE IN THE PICTURE. RaspberryPi4/Lib/fat.pi4
+;      is not included in the Q build and must never be: the firmware owns
+;      the volume, and a second party walking the same FAT while the
+;      firmware has it open is how a filesystem gets corrupted.
+;    * NO DIRECTORY LISTING. `fatls` needs a directory iterator and the
+;      seam has none, so `fatls` is not dispatched on this board.
+;
+;  THE NAME RULE, and it is board knowledge which is why it lives here.
+;  The core passes bare names - "APP.PMF", "SETTINGS.TXT" - because that
+;  is what a Pi 4 boot medium's root directory holds. On the Q the
+;  volume's root is the whole EFI System Partition, which belongs to the
+;  firmware and to systemd-boot and to Debian, and dropping Anvil's files
+;  into it would be rude at best. Anvil already owns a directory there -
+;  \EFI\anvil, where the transcript and the staged script live - so a bare
+;  name is resolved INSIDE IT. A name that starts with a backslash is
+;  taken as an absolute ESP path and used unchanged, so nothing is
+;  unreachable; that is the escape hatch, and it is the only one.
+;
+;  INCLUDE ORDER: after ArduinoQ/Board/qefi_q.unoq and after
+;  Anvil/Hal/hal.pbi (for the #HW_FILE_* vocabulary), before any core file
+;  that calls HwFile*.
+; ======================================================================
+
+Global gHwFileErr.i
+Global gHwFileOpen.i
+
+; The resolved path. #QW-sized is overkill; a path plus the prefix cannot
+; approach it, and the slack costs nothing in a board with 2 GB of DRAM.
+Global Dim gQPath.b[320]
+
+Procedure.i HwFileLastError()
+  ProcedureReturn gHwFileErr
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwStorageUp() - the seam's bring-up step, and on this board there is
+;  nothing to bring up.
+;
+;  The Pi 4's version enumerates PCIe, then xHCI, then a USB mass-storage
+;  LUN, then mounts a FAT volume, and prints a paragraph about each. Here
+;  the firmware has had this volume open since before Anvil existed -
+;  Anvil was LOADED off it - so the whole of "bring the medium up" is
+;  resolving the protocol chain once, which QEspRoot() does and caches.
+;
+;  IT IS STILL A REAL CHECK AND NOT A HARDCODED 1. If the LoadedImage or
+;  SimpleFileSystem handles will not resolve there genuinely is no medium,
+;  and a command that was told "yes" and then found no files would be the
+;  silent wrong answer this monitor exists to refuse.
+; ----------------------------------------------------------------------
+Procedure.i HwStorageUp()
+  If QEspRoot() = 0
+    PrintN("!! the firmware's file service could not be reached, so the EFI System")
+    PrintN("   Partition is not available and no file on it can be read or written.")
+    PrintN("   This is the volume Anvil itself was loaded from, so it being absent")
+    PrintN("   means the firmware has taken it away since boot rather than that")
+    PrintN("   anything is unplugged. Nothing was done.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  hwfileq_Path(*name) - a bare name resolved inside \EFI\anvil, or an
+;  absolute ESP path passed through. Returns the address of the resolved
+;  NUL-terminated path, or 0 if the name will not fit or is empty.
+;
+;  IT UPPERCASES NOTHING AND FOLDS NOTHING. FAT is case-insensitive and
+;  UEFI's file protocol inherits that, so "app.pmf" and "APP.PMF" already
+;  find the same file. Folding here would be a second opinion about a
+;  question the firmware has already answered, and the one thing it could
+;  add is a disagreement.
+; ----------------------------------------------------------------------
+Procedure.i hwfileq_Path(*name)
+  Define i.i
+  Define j.i
+  Define c.i
+
+  If *name = 0
+    ProcedureReturn 0
+  EndIf
+  If PeekA(*name) = 0
+    ProcedureReturn 0
+  EndIf
+
+  j = 0
+  If PeekA(*name) <> 92                    ; 92 = '\'
+    ; The prefix, byte by byte. A literal cannot be @'d in this language,
+    ; and this is eleven characters, so it is spelled out rather than
+    ; copied from one.
+    PokeB(@gQPath[0] + 0,  92)             ; \
+    PokeB(@gQPath[0] + 1,  69)             ; E
+    PokeB(@gQPath[0] + 2,  70)             ; F
+    PokeB(@gQPath[0] + 3,  73)             ; I
+    PokeB(@gQPath[0] + 4,  92)             ; \
+    PokeB(@gQPath[0] + 5,  97)             ; a
+    PokeB(@gQPath[0] + 6, 110)             ; n
+    PokeB(@gQPath[0] + 7, 118)             ; v
+    PokeB(@gQPath[0] + 8, 105)             ; i
+    PokeB(@gQPath[0] + 9, 108)             ; l
+    PokeB(@gQPath[0] + 10, 92)             ; \
+    j = 11
+  EndIf
+
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0
+      Break
+    EndIf
+    If j >= 300
+      ProcedureReturn 0                    ; too long - refuse, never clip
+    EndIf
+    PokeB(@gQPath[0] + j, c)
+    j = j + 1
+    i = i + 1
+  ForEver
+  PokeB(@gQPath[0] + j, 0)
+  ProcedureReturn @gQPath[0]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwFileOpen(*name) - open a file on the ESP for reading.
+;
+;  THERE IS NO MEDIUM TO BRING UP. The Pi 4's backend calls StorageUp()
+;  here, which enumerates USB and mounts a volume and prints a paragraph.
+;  On the Q the firmware has had the volume open since before Anvil was
+;  loaded - Anvil was loaded OFF it - so the equivalent step is
+;  QEspRoot(), which resolves the protocol chain once and caches it. When
+;  that fails there genuinely is no medium, and the seam says so with the
+;  same code the Pi 4 would use.
+; ----------------------------------------------------------------------
+Procedure.i HwFileOpen(*name)
+  Define p.i
+
+  gHwFileErr = #HW_FILE_OK
+  gHwFileOpen = 0
+
+  p = hwfileq_Path(*name)
+  If p = 0
+    gHwFileErr = #HW_FILE_BADNAME
+    ProcedureReturn 0
+  EndIf
+  If QEspRoot() = 0
+    gHwFileErr = #HW_FILE_NOMEDIUM
+    ProcedureReturn 0
+  EndIf
+  If QEspOpenRead(p) = 0
+    ; EVERY Open FAILURE IS REPORTED AS "not there", and that needs
+    ; saying rather than hiding. EFI_FILE_PROTOCOL.Open returns
+    ; EFI_NOT_FOUND for a missing file and a handful of other statuses
+    ; for a damaged volume or a device that went away, and this backend
+    ; does not currently tell them apart - it has one number, gQFileOpenSt,
+    ; and no table to read it against. Calling all of them "not there" is
+    ; the honest generalisation because it is the overwhelmingly common
+    ; case and because the alternative, calling them all "the medium
+    ; failed", would make a first boot with no SETTINGS.TXT look like a
+    ; broken board. The raw status is printed by HwFileErrorText below, so
+    ; the distinction is available to a reader even though the code does
+    ; not encode it.
+    gHwFileErr = #HW_FILE_NOTFOUND
+    ProcedureReturn 0
+  EndIf
+  gHwFileOpen = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwFileSize()
+  If gHwFileOpen = 0
+    gHwFileErr = #HW_FILE_NOTOPEN
+    ProcedureReturn 0
+  EndIf
+  gHwFileErr = #HW_FILE_OK
+  ProcedureReturn QEspFileSize()
+EndProcedure
+
+Procedure.i HwFileReadAt(off.i, dst.i, n.i)
+  Define got.i
+  If gHwFileOpen = 0
+    gHwFileErr = #HW_FILE_NOTOPEN
+    ProcedureReturn -1
+  EndIf
+  gHwFileErr = #HW_FILE_OK
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  got = QEspReadAt(off, dst, n)
+  If got < 0
+    gHwFileErr = #HW_FILE_IO
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn got
+EndProcedure
+
+Procedure HwFileClose()
+  If gHwFileOpen <> 0
+    QEspFileClose()
+    gHwFileOpen = 0
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwFileWritable() - yes, and it is the measured answer rather than an
+;  optimistic one: the very first thing this port proved on silicon was
+;  that Open(CREATE) and Write on the ESP both return EFI_SUCCESS, which
+;  is how the session transcript reaches anybody at all. If the protocol
+;  chain will not resolve there is no medium and therefore nothing
+;  writable, which is what the QEspRoot test says.
+; ----------------------------------------------------------------------
+Procedure.i HwFileWritable()
+  If QEspRoot() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwFileWriteAll(*name, src, n) - replace a whole file on the ESP.
+;
+;  QEspWrite already does exactly this and does the awkward part
+;  correctly: EFI_FILE_PROTOCOL.Open with CREATE does NOT truncate, so a
+;  shorter write would leave the tail of the previous contents behind, and
+;  it therefore DELETES an existing file before creating it. A settings
+;  file that shrank by one line and kept the old last line would be a
+;  silent wrong answer of exactly the kind this monitor exists to refuse,
+;  so that behaviour is load-bearing here and not merely tidy.
+; ----------------------------------------------------------------------
+Procedure.i HwFileWriteAll(*name, src.i, n.i)
+  Define p.i
+
+  gHwFileErr = #HW_FILE_OK
+  p = hwfileq_Path(*name)
+  If p = 0
+    gHwFileErr = #HW_FILE_BADNAME
+    ProcedureReturn 0
+  EndIf
+  If n < 0
+    gHwFileErr = #HW_FILE_TOOBIG
+    ProcedureReturn 0
+  EndIf
+  If QEspRoot() = 0
+    gHwFileErr = #HW_FILE_NOMEDIUM
+    ProcedureReturn 0
+  EndIf
+  ; A FILE BEING WRITTEN MUST NOT ALSO BE OPEN FOR READING through this
+  ; seam. UEFI does not forbid it and the firmware would probably cope,
+  ; but "probably" over the partition this board boots from is not a
+  ; standard worth adopting.
+  If gHwFileOpen <> 0
+    QEspFileClose()
+    gHwFileOpen = 0
+  EndIf
+  If QEspWrite(p, src, n) = 0
+    gHwFileErr = #HW_FILE_IO
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwFileErrorText() - the last failure as a whole sentence, as a POINTER
+;  for UartWriteStr. Never Print or PrintN: those pick a formatter from
+;  the argument type and would print the address in decimal.
+; ----------------------------------------------------------------------
+Procedure.i HwFileErrorText()
+  If gHwFileErr = #HW_FILE_OK
+    ProcedureReturn "nothing went wrong"
+  EndIf
+  If gHwFileErr = #HW_FILE_NOMEDIUM
+    ProcedureReturn "the firmware's file service could not be reached, so the EFI System Partition is not available to this monitor at all"
+  EndIf
+  If gHwFileErr = #HW_FILE_NOTOPEN
+    ProcedureReturn "no file was open when one was read from, which is a fault in this monitor and not in the medium"
+  EndIf
+  If gHwFileErr = #HW_FILE_BADNAME
+    ProcedureReturn "that name is empty, or the path it makes is longer than this monitor will build"
+  EndIf
+  If gHwFileErr = #HW_FILE_NOTFOUND
+    ProcedureReturn "the firmware would not open a file of that name in \EFI\anvil on the EFI System Partition"
+  EndIf
+  If gHwFileErr = #HW_FILE_TOOBIG
+    ProcedureReturn "that length is not one this monitor will write"
+  EndIf
+  ProcedureReturn "the firmware refused the transfer part way through"
+EndProcedure
+
+; ======================================================================
+;  THE DIRECTORY ITERATOR - declared, and honestly empty.
+;
+;  HwFileCanList() answers 0 here, so Anvil/Core/fs_cmd.pbi's `fatls`
+;  refuses in a whole sentence and never calls the four procedures below.
+;  They exist because the core is compiled ONCE for every board and calls
+;  them by name - hal.pi4 is explicit that a command degrades at run time
+;  through its gate rather than being compiled out per board, and a
+;  command compiled out is a command whose absence nobody can explain to
+;  the operator.
+;
+;  WHY IT IS 0 WHEN THE Q CAN CLEARLY OPEN FILES. Because listing and
+;  opening are different operations over UEFI. Open takes a name and gives
+;  a handle. Enumerating means opening the DIRECTORY as a file and calling
+;  Read on it repeatedly, each call returning a variable-length
+;  EFI_FILE_INFO record whose filename is a CHAR16 string at the end of a
+;  structure whose size the firmware reports by failing the first call
+;  with EFI_BUFFER_TOO_SMALL (UEFI 2.10 s13.5). That is a real piece of
+;  work, it is perfectly possible on this board, and it is not written.
+;  Saying so is the whole point of the flag.
+;
+;  THEY RETURN THE "nothing here" ANSWERS AND NOT PLAUSIBLE ONES. If the
+;  gate is ever bypassed by a mistake upstairs, `fatls` prints an empty
+;  directory with a zero total - which is visibly odd - rather than a
+;  believable listing of garbage.
+; ======================================================================
+Procedure.i HwFileCanList()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDirRewind()
+  gHwFileErr = #HW_FILE_NOMEDIUM
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDirNext()
+  ProcedureReturn 0              ; 0 = the end of the directory
+EndProcedure
+
+Procedure HwDirName(*d)
+  Define i.i
+  ; Eleven spaces - a blank 8.3 name. Not left as whatever the caller's
+  ; buffer held, which would print as a random name.
+  i = 0
+  While i < 11
+    PokeB(*d + i, 32)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i HwDirIsDir()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDirSize()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  HwStorageReport() - what this board's boot medium IS.
+;
+;  The Pi 4's version prints a block count, a FAT type and a cluster size.
+;  Not one of those three exists here, and printing them as zeroes would
+;  be the confident wrong answer this monitor refuses. What is true here
+;  is a firmware file service on the partition Anvil itself was loaded
+;  from, and that is what it says.
+; ======================================================================
+Procedure HwStorageReport()
+  PrintN("The boot medium is the EFI System Partition this image was loaded from,")
+  PrintN("reached through the firmware's own file service rather than through a")
+  PrintN("filesystem this monitor parses. There is no block count and no cluster")
+  PrintN("size to report: Anvil never sees a sector on this board.")
+  PrintN("  Anvil's files live in \EFI\anvil on it, and a bare name is resolved")
+  PrintN("  there - so load APP.PMF reads \EFI\anvil\APP.PMF. A name that starts")
+  PrintN("  with a backslash is taken as a path from the root of the partition.")
+  PrintN("  Reading and writing both work. Listing a directory does not, so fatls")
+  PrintN("  refuses - you have to know the name.")
+EndProcedure

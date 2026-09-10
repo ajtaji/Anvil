@@ -1,0 +1,321 @@
+; ======================================================================
+;  hw_usb.pi4 - the Pi 4 HwUsb* backend. THE ONE FILE THAT KNOWS THE
+;  VL805 + xHCI + Bulk-Only stack; the `usb` command above it knows only
+;  the portable #HW_USB_* vocabulary in Anvil/Hal/hal.pbi.
+;
+;  This is the board side of the HwUsb* seam declared in Anvil/Hal/hal.pbi.
+;  Anvil/Core/usb_cmd.pbi (the `usb` diagnostics command) calls these names
+;  and never touches Xhci*, Msc*, Pcie* or Hid* directly; this file is thin
+;  wrappers over the EXISTING host stack:
+;
+;    RaspberryPi4/Lib/pcie.pi4     the PCIe root complex and the VL805 id
+;    RaspberryPi4/Lib/xhci.pi4     the xHCI host, ports, slots, descriptors
+;    RaspberryPi4/Lib/usbmsc.pi4   the Bulk-Only mass-storage LUN
+;    RaspberryPi4/Board/cursor_input.pi4  UsbEnumerate() - the ONE bring-up
+;                                  and hub-aware attach walk, run once
+;
+;  IT EXPOSES, IT DOES NOT RE-DRIVE. Every device on this bus is brought
+;  up exactly once by UsbEnumerate() - the same walk the cursor and the
+;  boot stick already ride. This file adds no second enumeration and
+;  resets no port; it reads back what that walk left in the stack's state
+;  and, for the vendor/product/class the walk read but discarded, re-reads
+;  the 18-byte device descriptor on endpoint zero. That re-read is a
+;  read-only control transfer issued at the prompt, between HID polls, so
+;  it disturbs neither the live cursor nor the mounted filesystem.
+;
+;  INCLUDE ORDER, and it is not arbitrary:
+;    * Lib/pcie.pi4, Lib/xhci.pi4, Lib/usbmsc.pi4, Lib/hid.pi4 BEFORE this
+;      file - they define the Xhci*/Msc*/Pcie*/Hid* entry points wrapped
+;      here. board.pi4 lists all four far above (a library never includes
+;      a library, house rule).
+;    * Anvil/Hal/hal.pbi BEFORE this file - it defines the #HW_USB_*
+;      vocabulary these wrappers return.
+;    * RaspberryPi4/Board/cursor_input.pi4 BEFORE this file - it defines
+;      UsbEnumerate(), the single bring-up HwUsbEnumerate() rides.
+;
+;  #CAP_USB IS 1 ON THIS BOARD, so this real backend is what runs. A board
+;  that declares #CAP_USB = 0 provides no HwUsb backend and RequireCap in
+;  Anvil/Core/usb_cmd.pbi refuses the command before any of these are
+;  reached - so these wrappers never have to defend against being called
+;  on a board with no USB host.
+;
+;  NOT HARDWARE-VERIFIED IN THIS SESSION. The underlying stack HAS run on
+;  silicon (usbmsc.pi4's header records a real Samsung stick read and
+;  written 2026-08-26, and xhci.pi4 records real port/descriptor reads);
+;  this file is COMPILE-VERIFIED ONLY here. A real device listing is owed
+;  a Pi 4 with a stick and/or a keyboard attached - the enumeration and
+;  the descriptor re-reads cannot be exercised on a bench with no silicon.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  hwusb_MapSpeed - the controller's raw xHCI speed id, normalised to the
+;  portable #HW_USB_SPEED_* vocabulary. xhci.pi4's #XHCI_SPEED_* are the
+;  PORTSC-encoded values (FULL 1, LOW 2, HIGH 3, SUPER 4); undoing that
+;  ordering here is exactly why the core is handed a #HW_USB_SPEED_* code
+;  and not a raw port-status field.
+; ----------------------------------------------------------------------
+Procedure.i hwusb_MapSpeed(xs.i)
+  Select xs
+    Case #XHCI_SPEED_LOW
+      ProcedureReturn #HW_USB_SPEED_LOW
+    Case #XHCI_SPEED_FULL
+      ProcedureReturn #HW_USB_SPEED_FULL
+    Case #XHCI_SPEED_HIGH
+      ProcedureReturn #HW_USB_SPEED_HIGH
+    Case #XHCI_SPEED_SUPER
+      ProcedureReturn #HW_USB_SPEED_SUPER
+  EndSelect
+  ProcedureReturn #HW_USB_SPEED_UNKNOWN
+EndProcedure
+
+; ======================================================================
+;  THE DEVICE INVENTORY - one flat list of addressed devices.
+;
+;  The enumeration walk records what it found in three places - HID
+;  handles, the "other" slot list, and the mass-storage slot - each
+;  keyed differently. This flattens them into one slot-keyed table so the
+;  `usb tree` command can walk devices without knowing any of that. Built
+;  once (a bench does not hotplug), from the state the walk already left.
+; ----------------------------------------------------------------------
+#HWUSB_MAX = 16
+Global Dim hwusb_slot.i[#HWUSB_MAX]
+Global Dim hwusb_kind.i[#HWUSB_MAX]
+Global Dim hwusb_speed.i[#HWUSB_MAX]
+Global Dim hwusb_route.i[#HWUSB_MAX]
+Global Dim hwusb_addr.i[#HWUSB_MAX]
+Global Dim hwusb_vid.i[#HWUSB_MAX]
+Global Dim hwusb_pid.i[#HWUSB_MAX]
+Global Dim hwusb_class.i[#HWUSB_MAX]
+Global hwusb_count.i = 0
+Global hwusb_built.i = 0
+Global Dim hwusb_desc.a[32]     ; a device descriptor, re-read per slot
+
+Procedure.i hwusb_Find(slot.i)
+  Define i.i
+  i = 0
+  While i < hwusb_count
+    If hwusb_slot[i] = slot
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; Record one device by slot, reading back its speed, route, address and -
+; via a fresh 18-byte device-descriptor read - its vendor, product and
+; class. A slot already in the table is a COMPOSITE (a keyboard and a
+; mouse on one receiver share a slot); promote OTHER to a concrete kind
+; but never rewrite one concrete kind with another.
+Procedure hwusb_Add(slot.i, kind.i)
+  Define idx.i
+  Define n.i
+  If slot <= 0
+    ProcedureReturn
+  EndIf
+  idx = hwusb_Find(slot)
+  If idx >= 0
+    If hwusb_kind[idx] = #HW_USB_KIND_OTHER And kind <> #HW_USB_KIND_OTHER
+      hwusb_kind[idx] = kind
+    EndIf
+    ProcedureReturn
+  EndIf
+  If hwusb_count >= #HWUSB_MAX
+    ProcedureReturn
+  EndIf
+  idx = hwusb_count
+  hwusb_slot[idx]  = slot
+  hwusb_kind[idx]  = kind
+  hwusb_speed[idx] = #HW_USB_SPEED_UNKNOWN
+  hwusb_route[idx] = 0
+  hwusb_addr[idx]  = 0
+  hwusb_vid[idx]   = -1
+  hwusb_pid[idx]   = -1
+  hwusb_class[idx] = -1
+  ; XhciUseSlot restores this slot's recorded speed, one-tier route and
+  ; endpoint-0 context, so speed/route/address are free. The descriptor
+  ; is the part the walk did not keep; HidAttach already corrected this
+  ; slot's ep0 max packet, so the full 18 bytes come back on every speed.
+  If XhciUseSlot(slot) <> 0
+    hwusb_speed[idx] = hwusb_MapSpeed(XhciSlotSpeed())
+    hwusb_route[idx] = XhciSlotRoute()
+    hwusb_addr[idx]  = XhciDeviceAddress()
+    n = XhciGetDeviceDescriptor(@hwusb_desc[0], 18)
+    If n >= 5
+      hwusb_class[idx] = PeekA(@hwusb_desc[0] + 4)
+    EndIf
+    If n >= 12
+      hwusb_vid[idx] = PeekA(@hwusb_desc[0] + 8) | (PeekA(@hwusb_desc[0] + 9) << 8)
+      hwusb_pid[idx] = PeekA(@hwusb_desc[0] + 10) | (PeekA(@hwusb_desc[0] + 11) << 8)
+    EndIf
+  EndIf
+  hwusb_count = idx + 1
+EndProcedure
+
+Procedure HwUsbBuild()
+  Define h.i
+  Define i.i
+  Define slot.i
+  Define proto.i
+  Define kind.i
+  If hwusb_built <> 0
+    ProcedureReturn
+  EndIf
+  If XhciReady() = 0
+    ProcedureReturn
+  EndIf
+  hwusb_count = 0
+  ; The internal / root hub heads the list the way it heads the topology:
+  ; every low/full-speed device on this controller hangs off it.
+  If XhciHubSlot() <> 0
+    hwusb_Add(XhciHubSlot(), #HW_USB_KIND_HUB)
+  EndIf
+  ; The HID devices, by their attached handles.
+  h = 1
+  While h <= #HID_MAX_DEVS
+    slot = HidSlot(h)
+    If slot <> 0
+      proto = HidProtocol(h)
+      If proto = #HID_PROTO_KEYBOARD
+        kind = #HW_USB_KIND_KEYBOARD
+      ElseIf proto = #HID_PROTO_MOUSE
+        kind = #HW_USB_KIND_MOUSE
+      Else
+        kind = #HW_USB_KIND_OTHER
+      EndIf
+      hwusb_Add(slot, kind)
+    EndIf
+    h = h + 1
+  Wend
+  ; Every other addressed slot the walk noted but did not keep as HID.
+  ; The mass-storage LUN is one of these; name it storage, the rest OTHER.
+  i = 0
+  While i < HidOtherCount()
+    slot = HidOtherSlot(i)
+    If slot <> 0 And slot = XhciBulkReady()
+      hwusb_Add(slot, #HW_USB_KIND_STORAGE)
+    Else
+      hwusb_Add(slot, #HW_USB_KIND_OTHER)
+    EndIf
+    i = i + 1
+  Wend
+  ; Belt and braces: if a mass-storage LUN is up but its slot did not
+  ; come through the "other" list, still name it.
+  If XhciBulkReady() <> 0 And hwusb_Find(XhciBulkReady()) < 0
+    hwusb_Add(XhciBulkReady(), #HW_USB_KIND_STORAGE)
+  EndIf
+  ; Leave the storage slot selected if there is one, so nothing that
+  ; follows has to re-select it. Harmless when there is none.
+  If XhciBulkReady() <> 0
+    XhciUseSlot(XhciBulkReady())
+  EndIf
+  hwusb_built = 1
+EndProcedure
+
+; ======================================================================
+;  THE SEAM - the HwUsb* entry points the core calls.
+; ======================================================================
+
+; The one-time bring-up. UsbEnumerate() starts PCIe and the xHCI host and
+; runs the hub-aware attach walk exactly once; 1 if the host came up (with
+; or without devices), 0 if PCIe or xHCI would not start.
+Procedure.i HwUsbEnumerate()
+  ProcedureReturn UsbEnumerate()
+EndProcedure
+
+; Ensure enumerated, build the inventory, return the device count - or -1
+; if the host is not up (so the command can say so rather than print an
+; empty tree).
+Procedure.i HwUsbTree()
+  If HwUsbEnumerate() = 0
+    ProcedureReturn -1
+  EndIf
+  If XhciReady() = 0
+    ProcedureReturn -1
+  EndIf
+  HwUsbBuild()
+  ProcedureReturn hwusb_count
+EndProcedure
+
+; ---- the host controller ---------------------------------------------
+Procedure.i HwUsbHostPresent() : ProcedureReturn XhciReady() : EndProcedure
+Procedure.i HwUsbHostVid()     : ProcedureReturn XhciDeviceId() & $FFFF : EndProcedure
+Procedure.i HwUsbHostPid()     : ProcedureReturn (XhciDeviceId() >> 16) & $FFFF : EndProcedure
+Procedure.i HwUsbHostVersion() : ProcedureReturn XhciVersion() : EndProcedure
+
+; ---- the root ports --------------------------------------------------
+Procedure.i HwUsbPortCount()       : ProcedureReturn XhciMaxPorts() : EndProcedure
+Procedure.i HwUsbPortConnected(p.i) : ProcedureReturn XhciPortConnected(p) : EndProcedure
+Procedure.i HwUsbPortSpeed(p.i)    : ProcedureReturn hwusb_MapSpeed(XhciPortSpeed(p)) : EndProcedure
+
+; ---- the internal / root hub -----------------------------------------
+Procedure.i HwUsbHubPresent()   : ProcedureReturn Bool(XhciHubSlot() <> 0) : EndProcedure
+Procedure.i HwUsbHubRootPort()  : ProcedureReturn XhciHubRootPort() : EndProcedure
+Procedure.i HwUsbHubPorts()     : ProcedureReturn XhciHubPorts() : EndProcedure
+Procedure.i HwUsbHubPortConnected(p.i) : ProcedureReturn XhciHubPortConnected(p) : EndProcedure
+Procedure.i HwUsbHubPortSpeed(p.i)     : ProcedureReturn hwusb_MapSpeed(XhciHubPortSpeed(p)) : EndProcedure
+
+; ---- the device inventory --------------------------------------------
+Procedure.i HwUsbDevCount() : ProcedureReturn hwusb_count : EndProcedure
+
+Procedure.i hwusb_Ok(i.i)
+  If i < 0 Or i >= hwusb_count
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwUsbDevSlot(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn hwusb_slot[i]
+EndProcedure
+Procedure.i HwUsbDevKind(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn #HW_USB_KIND_OTHER : EndIf
+  ProcedureReturn hwusb_kind[i]
+EndProcedure
+Procedure.i HwUsbDevSpeed(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn #HW_USB_SPEED_UNKNOWN : EndIf
+  ProcedureReturn hwusb_speed[i]
+EndProcedure
+; The one-tier route: 0 means the device is on a root port; anything else
+; is the downstream port number of the internal hub.
+Procedure.i HwUsbDevRoute(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn hwusb_route[i]
+EndProcedure
+Procedure.i HwUsbDevAddress(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn hwusb_addr[i]
+EndProcedure
+Procedure.i HwUsbDevVid(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn hwusb_vid[i]
+EndProcedure
+Procedure.i HwUsbDevPid(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn hwusb_pid[i]
+EndProcedure
+Procedure.i HwUsbDevClass(i.i)
+  If hwusb_Ok(i) = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn hwusb_class[i]
+EndProcedure
+
+; ---- the mass-storage LUN --------------------------------------------
+Procedure.i HwUsbStorageReady()      : ProcedureReturn MscReady() : EndProcedure
+Procedure.i HwUsbStorageVendor()     : ProcedureReturn MscVendor() : EndProcedure
+Procedure.i HwUsbStorageProduct()    : ProcedureReturn MscProduct() : EndProcedure
+Procedure.i HwUsbStorageBlockSize()  : ProcedureReturn MscBlockSize() : EndProcedure
+Procedure.i HwUsbStorageBlockCount() : ProcedureReturn MscBlockCount() : EndProcedure
+Procedure.i HwUsbStorageError()      : ProcedureReturn MscErrorText() : EndProcedure
+
+; ---- the raw block read ----------------------------------------------
+; A raw block read IS exposed on this board: usbmsc.pi4 gives MscReadBlock,
+; which range-checks the LBA and bounces through an aligned DMA buffer.
+Procedure.i HwUsbReadAvailable() : ProcedureReturn 1 : EndProcedure
+
+Procedure.i HwUsbReadBlock(lba.i, *buf)
+  If XhciBulkReady() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MscReadBlock(lba, *buf)
+EndProcedure

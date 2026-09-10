@@ -1,0 +1,1804 @@
+; ======================================================================
+;  dsi_host.pi4 - the BCM2711's DSI1 host controller, its PHY, and the
+;  three clocks that feed them.
+; ----------------------------------------------------------------------
+;  WHAT THIS IS FOR. The firmware on this part lights a DSI panel only
+;  for the one panel it has a driver for, and on the bench board it
+;  lights none at all - `screen displays` answers 0 and there is no
+;  MAIN_LCD. So everything a DSI panel needs has to be programmed here:
+;  the link clock, the D-PHY, the escape-mode command path that carries
+;  the panel's DCS init table, and then video mode.
+;
+;  THIS FILE IS THE SoC HALF ONLY. The panel's own registers - its power
+;  rails through the MCU at I2C $45, and its 200-command DCS init table -
+;  are dsi_panel_v2.pi4 and dsi_panel_v2_dcs.pi4. The split is on
+;  purpose: everything here is true of any panel on DSI1, and nothing
+;  here knows what is on the other end of the ribbon.
+;
+;  ---- USE ------------------------------------------------------------
+;
+;    XIncludeFile "RaspberryPi4/Lib/timer.pi4"     ; delay(), millis()
+;    XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"   ; the power domain
+;    XIncludeFile "RaspberryPi4/Lib/dsi_host.pi4"
+;
+;    DsiDomainOn()                   ; FIRST. Nothing below moves without it
+;    DsiClocksRead()                 ; what CPRMAN holds now - reads only
+;    DsiModePlan(70000000)           ; pick the divider, adjust hblank
+;    DsiClocksSet()                  ; program PLLD_DSI1, escape, pixel
+;    DsiHostBringUp()                ; CTRL, AFE, the eighteen timings
+;    ...the panel's DCS init table through DsiDcsWrite()...
+;    DsiVideoOn()                    ; DISP0 ENABLE - pixels start
+;
+;  House rule 10: a library never includes a library. board.pi4 lists
+;  timer.pi4 ahead of this file and a main file that forgets it fails
+;  loudly at compile time on an undefined delay().
+;
+;  ---- WHERE EVERY NUMBER COMES FROM (do not guess - rule 21) ----------
+;
+;  RaspberryPi4/Reference/rpi-6.12.y_vc4_dsi.c, the Linux driver for
+;  this exact block, and the only published description of it. Broadcom
+;  document nothing about DSI in the BCM2711 peripherals PDF. Cited
+;  below as vc4_dsi.c:<line>.
+;
+;  RaspberryPi4/Reference/rpi-6.12.y_vc4_regs.h and _vc4_drv.h for
+;  VC4_SET_FIELD, which is FIELD_PREP: the shift comes from the MASK,
+;  not from the _SHIFT constant beside it. Where the two disagree in the
+;  header - and for DSI1_PHY_AFEC0_IDR_DLANE1 they DO, mask (27,23)
+;  against a stated shift of 23, overlapping DLANE2's (28,26) - the MASK
+;  is what the driver actually uses and what is reproduced here.
+;
+;  The clock manager's register map is not in the peripherals PDF
+;  either. It comes from the downstream kernel's clock driver, fetched
+;  2026-09-06 from
+;  https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/
+;  drivers/clk/bcm/clk-bcm2835.c
+;  and cited below as clk-bcm2835.c:<line>. pwm.pi4 already uses the
+;  same file for CM_PWMCTL, so this is a second consumer of a map this
+;  tree already trusts.
+;
+;  ---- THE ONE THING THAT MUST NOT BE DONE, AND WHY -------------------
+;
+;  PLLD ITSELF IS NEVER TOUCHED. The driver says so in as many words at
+;  vc4_dsi.c:851-857: "PLLD is set to 2Ghz, and may not be changed by the
+;  display driver since most peripherals are hanging off of the PLLD_PER
+;  divider." On this board PLLD_PER is what the UART, the SD host and
+;  most of the rest are derived from, so moving PLLD would take the
+;  console away mid-command and there would be no way to find out what
+;  had happened.
+;
+;  What IS programmed here is the PLLD_DSI1 CHANNEL divider - an 8-bit
+;  integer divider off PLLD's VCO that nothing else on the part reads -
+;  and the two DSI1-only clocks in CPRMAN. So the blast radius of every
+;  write in this file is DSI1. That is a much smaller claim than the
+;  campaign plan's stage 5 made, and it is the reason this stage is safe
+;  to run over a wireless console.
+;
+;  The price of not moving PLLD is that the link rate lands on whatever
+;  an integer divider can reach, which is FASTER than the panel's stated
+;  70 MHz pixel clock, and the horizontal blanking is stretched to put
+;  the refresh rate back where it belongs. That is not a workaround
+;  invented here; it is vc4_dsi_bridge_mode_fixup() (:864-915), and the
+;  comment there says the firmware does the same thing.
+;
+;  ---- THE READ THAT IS NOT A READ ------------------------------------
+;
+;  DSI1_ID at offset $8C reads $00647369, ASCII "\0dsi". So does every
+;  other unclaimed offset in the block - the driver says so at
+;  vc4_dsi.c:530-532: "Actually, all registers in the range that aren't
+;  otherwise claimed will return the ID." So reading the ID proves the
+;  block answers and NOTHING ELSE. It cannot tell a live block from a
+;  dead one, and a bring-up that stops there has measured nothing.
+;
+;  DsiHostProveWritable() is the honest version: write a value into a
+;  CLAIMED register that has no side effects until video starts
+;  (HS_DLT5's INIT field, 24 bits wide), read it back, and put the
+;  driver's own value there afterwards. A block that is powered down
+;  reads back zero; a block that is not there reads back the ID string.
+;  Both are distinguishable from the value that was written.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  THE DSI1 REGISTER BLOCK. Base from bcm283x.dtsi's dsi1@7e700000,
+;  which is $FE700000 in the ARM's view of the peripherals on this part
+;  (the same $7E -> $FE rebase every other file here uses).
+;
+;  OFFSETS ARE THE DSI1 ONES AND DSI0'S ARE DIFFERENT FOR THE SAME
+;  REGISTER NAME. vc4_dsi.c carries two maps and picks between them with
+;  DSI_PORT_*; getting this wrong reads STAT and writes PHYC. Every
+;  offset below is from the DSI1 half, vc4_dsi.c:389-533.
+; ----------------------------------------------------------------------
+#DSI1_BASE = $FE700000
+
+#DSI1_CTRL_OFF           = $00
+#DSI1_TXPKT1C_OFF        = $04
+#DSI1_TXPKT1H_OFF        = $08
+#DSI1_TXPKT2C_OFF        = $0C
+#DSI1_TXPKT2H_OFF        = $10
+#DSI1_RXPKT1H_OFF        = $14
+#DSI1_RXPKT2H_OFF        = $18
+#DSI1_TXPKT_CMD_FIFO_OFF = $1C
+#DSI1_TXPKT_PIX_FIFO_OFF = $20
+#DSI1_RXPKT_FIFO_OFF     = $24
+#DSI1_DISP0_CTRL_OFF     = $28
+#DSI1_DISP1_CTRL_OFF     = $2C
+#DSI1_INT_STAT_OFF       = $30
+#DSI1_INT_EN_OFF         = $34
+#DSI1_STAT_OFF           = $38
+#DSI1_HSTX_TO_CNT_OFF    = $3C
+#DSI1_LPRX_TO_CNT_OFF    = $40
+#DSI1_TA_TO_CNT_OFF      = $44
+#DSI1_PR_TO_CNT_OFF      = $48
+#DSI1_PHYC_OFF           = $4C
+#DSI1_HS_CLT0_OFF        = $50
+#DSI1_HS_CLT1_OFF        = $54
+#DSI1_HS_CLT2_OFF        = $58
+#DSI1_HS_DLT3_OFF        = $5C
+#DSI1_HS_DLT4_OFF        = $60
+#DSI1_HS_DLT5_OFF        = $64
+#DSI1_HS_DLT6_OFF        = $68
+#DSI1_HS_DLT7_OFF        = $6C
+#DSI1_PHY_AFEC0_OFF      = $70
+#DSI1_PHY_AFEC1_OFF      = $74
+#DSI1_TST_SEL_OFF        = $78
+#DSI1_TST_MON_OFF        = $7C
+#DSI1_PHY_TST1_OFF       = $80
+#DSI1_PHY_TST2_OFF       = $84
+#DSI1_PHY_FIFO_STAT_OFF  = $88
+#DSI1_ID_OFF             = $8C
+
+; vc4_dsi.c:387. ASCII "\0dsi", and see THE READ THAT IS NOT A READ.
+#DSI_ID_VALUE = $00647369
+
+; CTRL, vc4_dsi.c:389-425. The DSI1 spellings only.
+#DSI_CTRL_EN                  = $0001   ; bit 0
+#DSI_CTRL_DISABLE_DISP_ECCC   = $0002   ; bit 1
+#DSI_CTRL_DISABLE_DISP_CRCC   = $0004   ; bit 2
+#DSI_CTRL_CLR_CDF             = $0010   ; bit 4
+#DSI_CTRL_CLR_PDF             = $0020   ; bit 5
+#DSI_CTRL_CLR_RXF             = $0040   ; bit 6
+#DSI_CTRL_CLR_LDF             = $0080   ; bit 7
+#DSI_CTRL_INV_BYTE            = $0100   ; bit 8
+#DSI_CTRL_CAL_BYTE            = $0200   ; bit 9
+#DSI_CTRL_SOFT_RESET_CFG      = $0400   ; bit 10
+#DSI_CTRL_HSDT_EOT_DISABLE    = $0800   ; bit 11
+#DSI_CTRL_LPDT_EOT_DISABLE    = $1000   ; bit 12
+#DSI_CTRL_RX_LPDT_EOT_DISABLE = $2000   ; bit 13
+
+; DSI1_CTRL_RESET_FIFOS, vc4_dsi.c:422-425: CLR_LDF | CLR_RXF | CLR_PDF
+; | CLR_CDF = $80 | $40 | $20 | $10. Written as the literal because a
+; constant defined from other constants is refused by this compiler.
+#DSI_CTRL_RESET_FIFOS = $00F0
+
+; THE CTRL WORD THIS FILE MEANS, WRITTEN OUT RATHER THAN READ BACK.
+;
+; vc4_dsi.c reaches CAL_BYTE with `READ(CTRL) | CAL_BYTE` (:1142-1144)
+; and the FIFO reset with `READ(CTRL) | RESET_FIFOS` (:1397-1399). Both
+; are read-modify-writes, and this block has already been caught holding
+; a register that does NOT read back what was put in it: PHY_AFEC0,
+; whose readable bits measured $0001B700 with every bias field gone.
+;
+; CTRL has never been proven to read back on this part. If it does not,
+; `READ(CTRL) | CAL_BYTE` writes a word with DSI_CTRL_EN CLEARED - a
+; disabled block, which would latch CMD_EN and do nothing with it, which
+; is the observed symptom exactly. So the word is COMPOSED. It is the
+; same value the read-modify-write produces on a register that reads
+; back, and it is the right value on one that does not.
+#DSI_CTRL_BASE    = $00002801   ; EN | HSDT_EOT_DISABLE | RX_LPDT_EOT_DISABLE
+#DSI_CTRL_RUNNING = $00002A01   ; the above | CAL_BYTE
+#DSI_CTRL_REFIFO  = $00002AF1   ; the above | RESET_FIFOS
+
+; INT_STAT / INT_EN, DSI1 half, vc4_dsi.c:231-289.
+#DSI1_INT_TXPKT1_END   = $00000001   ; bit 0
+#DSI1_INT_TXPKT1_DONE  = $00000002   ; bit 1
+#DSI1_INT_RXPKT1       = $00000010   ; bit 4
+#DSI1_INT_ERR_SYNC_ESC = $00000040   ; bit 6
+#DSI1_INT_ERR_CONTROL  = $00000080   ; bit 7
+#DSI1_INT_ERR_CONT_LP0 = $00000100   ; bit 8
+#DSI1_INT_ERR_CONT_LP1 = $00000200   ; bit 9
+#DSI1_INT_HSTX_TO      = $00000400   ; bit 10
+#DSI1_INT_LPRX_TO      = $00000800   ; bit 11
+#DSI1_INT_TA_TO        = $00001000   ; bit 12
+#DSI1_INT_PR_TO        = $00002000   ; bit 13
+#DSI1_INT_PHY_DIR_FTR  = $00020000   ; bit 17
+#DSI1_INT_PHY_DIR_RTF  = $00200000   ; bit 21
+#DSI1_INT_FIFO_ERR     = $00400000   ; bit 22
+
+; The eight bits the driver treats as errors, vc4_dsi.c:1609-1626:
+; ERR_SYNC_ESC | ERR_CONTROL | ERR_CONT_LP0 | ERR_CONT_LP1 | HSTX_TO |
+; LPRX_TO | TA_TO | PR_TO = $40|$80|$100|$200|$400|$800|$1000|$2000.
+#DSI1_INT_ERROR_BITS = $00003FC0
+
+; A transfer is finished when either of these appears: TXPKT1_DONE for a
+; write, PHY_DIR_RTF for a read that has turned the bus around.
+; vc4_dsi.c:1633-1637. $2 | $200000.
+#DSI1_INT_XFER_DONE = $00200002
+
+; STAT, DSI1 half, vc4_dsi.c:437-470. Only the ones this file reports.
+#DSI1_STAT_TXPKT1_END   = $00000001   ; bit 0
+#DSI1_STAT_TXPKT1_DONE  = $00000002   ; bit 1
+#DSI1_STAT_TXPKT1_BUSY  = $00000004   ; bit 2
+#DSI1_STAT_RXPKT1       = $00000040   ; bit 6
+#DSI1_STAT_ERR_SYNC_ESC = $00000100   ; bit 8
+#DSI1_STAT_ERR_CONTROL  = $00000200   ; bit 9
+#DSI1_STAT_ERR_CONT_LP1 = $00000800   ; bit 11
+#DSI1_STAT_PHY_CLOCK_STOP = $00010000 ; bit 16
+#DSI1_STAT_PHY_CLOCK_HS   = $00020000 ; bit 17
+#DSI1_STAT_PHY_D0_STOP    = $01000000 ; bit 24
+#DSI1_STAT_PHY_D1_STOP    = $04000000 ; bit 26
+#DSI1_STAT_PHY_CLOCK_ULPS = $00040000 ; bit 18
+#DSI1_STAT_PHY_D0_ULPS    = $02000000 ; bit 25
+#DSI1_STAT_PHY_D1_ULPS    = $08000000 ; bit 27
+
+; The three STOP bits and the three ULPS bits for a two-lane link with a
+; NON-CONTINUOUS clock, which is what this panel asks for. vc4_dsi.c
+; builds exactly these two masks at :754-764.
+#DSI1_STAT_STOP_2LANE = $05010000
+#DSI1_STAT_ULPS_2LANE = $0A040000
+
+; PHYC, DSI1 half, vc4_dsi.c:299-318.
+#DSI_PHYC_DLANE0_ENABLE      = $00000001   ; bit 0
+#DSI_PHYC_DLANE1_ENABLE      = $00000010   ; bit 4
+#DSI_PHYC_DLANE2_ENABLE      = $00000100   ; bit 8
+#DSI_PHYC_DLANE3_ENABLE      = $00001000   ; bit 12
+#DSI1_PHYC_CLANE_ENABLE      = $00010000   ; bit 16
+#DSI1_PHYC_HS_CLK_CONTINUOUS = $00040000   ; bit 18
+#DSI1_PHYC_ESC_CLK_LPDT_SHIFT = 20         ; bits 25:20
+
+; The ULPS REQUEST bits. These are how a lane is COMMANDED to change
+; state, and they are the only documented way to make one move on
+; demand. vc4_dsi.c:299-318: DLANE0_ULPS bit 1, DLANE1_ULPS bit 5,
+; DSI1's CLANE_ULPS bit 17. The clock lane is included here because this
+; panel runs a non-continuous clock, which is the same condition vc4
+; uses at :746-752.
+#DSI_PHYC_DLANE0_ULPS  = $00000002   ; bit 1
+#DSI_PHYC_DLANE1_ULPS  = $00000020   ; bit 5
+#DSI1_PHYC_CLANE_ULPS  = $00020000   ; bit 17
+#DSI1_PHYC_ULPS_2LANE  = $00020022   ; the three above
+
+; DLANE0_FORCE_STOP, vc4_dsi.c:316, bit 2. The reference driver never
+; writes it. It is here because it is the most direct order this block
+; accepts: not "negotiate a state change with the far end" but "put lane
+; zero in stop", entirely inside the SoC. A lane that ignores THAT has
+; nothing outside the part to blame.
+#DSI_PHYC_DLANE0_FORCE_STOP = $00000004
+
+; PHY_AFEC0, DSI1 half, vc4_dsi.c:328-374.
+#DSI1_PHY_AFEC0_RESET = $00002000   ; bit 13
+#DSI1_PHY_AFEC0_PD    = $00001000   ; bit 12
+
+; DISP0_CTRL, vc4_dsi.c:135-167. Field positions are shared with DSI0.
+#DSI_DISP0_ENABLE            = $0001   ; bit 0
+#DSI_DISP0_COMMAND_MODE      = $0002   ; bit 1
+#DSI_DISP0_PFORMAT_SHIFT     = 2       ; bits 3:2
+#DSI_DISP0_ST_END            = $0010   ; bit 4
+#DSI_DISP0_LP_STOP_CTRL_SHIFT = 11     ; bits 12:11
+#DSI_DISP0_PIX_CLK_DIV_SHIFT  = 13     ; bits 21:13
+#DSI_PFORMAT_RGB888          = 3
+#DSI_DISP0_LP_STOP_PERFRAME  = 2
+
+; DISP1_CTRL, vc4_dsi.c:168-184. DSI1's command FIFO is three bytes
+; wide, so the 24-bit pixel format is the right one here - the 32-bit
+; branch in the driver is DSI0's.
+#DSI_DISP1_ENABLE            = $0001   ; bit 0
+#DSI1_DISP1_PFORMAT_32BIT_LE = 2       ; bits 2:1, value 2
+;
+;  THE COMMAND FIFO ON THIS PART IS FOUR BYTES WIDE, NOT THREE, and the
+;  first version of this file had it the other way round. The variant
+;  table settles it: `bcm2711_dsi1_variant` has `.cmd_fifo_width = 4`
+;  (vc4_dsi.c:1541-1547), and the driver picks the 32-bit little-endian
+;  pixel format for exactly that case (:1155-1165). Three is the BCM2835
+;  DSI0 figure.
+;
+;  It matters only for a LONG packet, whose tail goes through the pixel
+;  FIFO, and this panel's table has none - so it is not the reason
+;  nothing transmits. It is fixed because a wrong constant with a
+;  citation next to it is worse than no constant at all.
+#DSI1_DISP1_CTRL_VALUE       = $0005   ; (2 << 1) | ENABLE
+
+; TXPKT1C, vc4_dsi.c:51-92.
+#DSI_TXPKT1C_CMD_EN          = $0001   ; bit 0
+#DSI_TXPKT1C_CMD_TE_EN       = $0002   ; bit 1
+#DSI_TXPKT1C_CMD_TYPE_LONG   = $0004   ; bit 2
+#DSI_TXPKT1C_CMD_MODE_LP     = $0008   ; bit 3
+#DSI_TXPKT1C_CMD_CTRL_SHIFT  = 4       ; bits 5:4
+#DSI_TXPKT1C_CMD_CTRL_TX     = 0
+#DSI_TXPKT1C_CMD_CTRL_RX     = 1
+#DSI_TXPKT1C_CMD_REPEAT_SHIFT = 10     ; bits 23:10
+#DSI_TXPKT1C_DISPLAY_NO_SHIFT = 8      ; bits 9:8, 0 = SHORT
+
+; TXPKT1H, vc4_dsi.c:93-101: data type in 7:0, the two parameter bytes
+; in 23:8, the command-FIFO byte count in 31:24.
+#DSI_TXPKT1H_BC_PARAM_SHIFT   = 8
+#DSI_TXPKT1H_BC_CMDFIFO_SHIFT = 24
+
+; RXPKT1H, vc4_dsi.c:102-120.
+#DSI_RXPKT1H_PKT_TYPE_LONG = $01000000   ; bit 24
+#DSI_RXPKT1H_SHORT_0_SHIFT = 8           ; bits 15:8
+#DSI_RXPKT1H_SHORT_1_SHIFT = 16          ; bits 23:16
+#DSI_RXPKT1H_ERR_BITS      = $F0000000   ; CRC/DET/ECC/COR, bits 31:28
+
+; The MIPI DSI data types this file sends. From include/video/mipi_display.h,
+; which mipi_dsi_create_packet() maps message types onto; the three that a
+; DCS init table and one status read need.
+#MIPI_DSI_DCS_SHORT_WRITE       = $05   ; command, no parameter
+#MIPI_DSI_DCS_SHORT_WRITE_PARAM = $15   ; command + one parameter
+#MIPI_DSI_DCS_LONG_WRITE        = $39   ; command + two or more
+#MIPI_DSI_DCS_READ              = $06   ; command, reply expected
+#MIPI_DSI_SET_MAX_RETURN_SIZE   = $37
+
+; ----------------------------------------------------------------------
+;  THE CLOCK MANAGER. Base and password as pwm.pi4 already documents
+;  them; the four offsets below are the DSI1 ones and are cited from the
+;  clock driver because the peripherals PDF stops at the general-purpose
+;  clocks.
+;
+;    clk-bcm2835.c:172  CM_PLLD    0x10c   the PLLD channel load/hold bits
+;    clk-bcm2835.c:195  CM_DSI1ECTL 0x158  escape clock control
+;    clk-bcm2835.c:196  CM_DSI1EDIV 0x15c  escape clock divider
+;    clk-bcm2835.c:197  CM_DSI1PCTL 0x160  pixel clock control
+;    clk-bcm2835.c:198  CM_DSI1PDIV 0x164  pixel clock divider
+;    clk-bcm2835.c:208  A2W_PLLD_CTRL 0x1140  PLLD's NDIV and PDIV
+;    clk-bcm2835.c:252  A2W_PLLD_FRAC 0x1240  PLLD's 20-bit fraction
+;    clk-bcm2835.c:274  A2W_PLLD_PER  0x1540  the PER channel divider
+;    clk-bcm2835.c:275  A2W_PLLD_DSI1 0x1640  the DSI1 channel divider
+; ----------------------------------------------------------------------
+#DSI_CM_BASE   = $FE101000
+#DSI_CM_PASSWD = $5A000000
+
+#CM_PLLD_OFF      = $010C
+#CM_DSI1ECTL_OFF  = $0158
+#CM_DSI1EDIV_OFF  = $015C
+#CM_DSI1PCTL_OFF  = $0160
+#CM_DSI1PDIV_OFF  = $0164
+#A2W_PLLD_CTRL_OFF = $1140
+#A2W_PLLD_FRAC_OFF = $1240
+#A2W_PLLD_PER_OFF  = $1540
+#A2W_PLLD_DSI1_OFF = $1640
+
+; CM_PLLD's per-channel load and hold bits, clk-bcm2835.c:172-180.
+#CM_PLLD_LOADDSI1 = $04   ; bit 2
+#CM_PLLD_HOLDDSI1 = $08   ; bit 3
+
+; A2W channel divider: eight bits of divider in 7:0 and a disable in
+; bit 8. clk-bcm2835.c:258-260.
+#A2W_PLL_CHANNEL_DISABLE = $0100
+
+; PLLD's own control word, clk-bcm2835.c:211-216: NDIV in 9:0, PDIV in
+; 14:12. The fraction register is twenty bits, :255-256.
+#A2W_PLL_CTRL_NDIV_MASK  = $000003FF
+#A2W_PLL_CTRL_PDIV_SHIFT = 12
+#A2W_PLL_CTRL_PDIV_MASK  = $00007000
+#A2W_PLL_FRAC_MASK       = $000FFFFF
+
+; CM_*CTL bits, clk-bcm2835.c:124-136 - the same layout pwm.pi4 cites
+; from Tables 99 and 100.
+#CM_CTL_SRC_MASK = $0F
+#CM_CTL_ENABLE   = $10   ; bit 4
+#CM_CTL_KILL     = $20   ; bit 5
+#CM_CTL_GATE     = $40   ; bit 6
+#CM_CTL_BUSY     = $80   ; bit 7
+
+; The source numbering, clk-bcm2835.c:137-150 for the general mux and
+; :1710-1721 for DSI1's own. They are DIFFERENT muxes on the same field:
+; a per-clock like the escape clock takes PLLD_PER at 6, while the DSI1
+; pixel clock's mux is a list of the PHY's own outputs, and index 8 in
+; THAT list is "dsi1_byte".
+#CM_SRC_OSC      = 1
+#CM_SRC_PLLD_PER = 6
+#CM_SRC_DSI1_BYTE = 8
+
+; ----------------------------------------------------------------------
+;  THE CRYSTAL IS 54 MHz ON THIS PART, not 19.2. bcm2711.dtsi:618-620
+;  overrides bcm283x.dtsi's 19200000, and this tree has measured the
+;  same 54 MHz independently at CNTFRQ_EL0 (Lib/timer.pi4, 2026-08-24).
+;  pwm.pi4 carries the same constant for the same reason.
+; ----------------------------------------------------------------------
+#DSI_XOSC_HZ = 54000000
+
+; ----------------------------------------------------------------------
+;  THE PANEL'S MODE. 800x1280 portrait, from the driver's
+;  ws_panel_10_1_a_mode (panel-waveshare-dsi-v2.c:1812-1824), which is
+;  the mode the "10_1_inch_a" descriptor names - the same string the
+;  bench board's overlay line carries, and the same 10.1 inches the MCU
+;  reports in its own size register.
+;
+;    clock 70000 kHz    hdisplay 800   hsync 840..860   htotal 880
+;                       vdisplay 1280  vsync 1300..1320 vtotal 1324
+;
+;  70,000,000 / (880 * 1324) = 60.08 Hz.
+; ----------------------------------------------------------------------
+#DSI_PANEL_HZ      = 70000000
+#DSI_PANEL_HDISP   = 800
+#DSI_PANEL_HSYNC_S = 840
+#DSI_PANEL_HSYNC_E = 860
+#DSI_PANEL_HTOTAL  = 880
+#DSI_PANEL_VDISP   = 1280
+#DSI_PANEL_VSYNC_S = 1300
+#DSI_PANEL_VSYNC_E = 1320
+#DSI_PANEL_VTOTAL  = 1324
+
+; Two lanes, RGB888, so the bits-per-pixel-per-lane divider is 24/2.
+; vc4_dsi.c:1451-1453; the panel descriptor's .lanes = 2 and
+; .format = MIPI_DSI_FMT_RGB888 at panel-waveshare-dsi-v2.c:2160-2162.
+#DSI_LANES   = 2
+#DSI_DIVIDER = 12
+
+; Minimum LP state duration in escape-clock cycles: dsi_esc_timing(60)
+; with a 10 ns escape period is 6. vc4_dsi.c:971 and :810-816.
+#DSI_LPX = 6
+
+; ----------------------------------------------------------------------
+;  HOW LONG ONE TRANSFER IS ALLOWED, and why it is not the driver's 500.
+;
+;  The driver waits half a second, which is right for a kernel that has
+;  something else to do meanwhile. This monitor does not: it polls, and
+;  while it polls the wireless console is not serviced.
+;
+;  On 2026-09-07 that cost a hundred seconds of a board that answered
+;  neither the console nor a ping, because two hundred DCS commands each
+;  waited the full 500 ms. The board had not hung - its uptime went UP
+;  across the episode - but there was no way to know that at the time,
+;  and "unreachable" is what a hang looks like.
+;
+;  60 ms is still more than a hundred times the longest short packet at
+;  this escape clock, so it cannot turn a slow success into a failure.
+; ----------------------------------------------------------------------
+#DSI_XFER_MS = 60
+
+; ----------------------------------------------------------------------
+;  STATE. Everything a probe would want to print after the fact, so that
+;  a command can report what was programmed without re-reading hardware
+;  that the act of reading might disturb.
+; ----------------------------------------------------------------------
+Global dsi_plld_vco.i      = 0    ; PLLD's VCO rate in Hz, as read
+Global dsi_plld_per.i      = 0    ; the PER channel's rate in Hz
+Global dsi_chan_div.i      = 0    ; the PLLD_DSI1 divider now in the part
+Global dsi_pll_div.i       = 0    ; the divider this file chose
+Global dsi_phy_hz.i        = 0    ; the link rate that divider gives
+Global dsi_pixel_hz.i      = 0    ; phy / 12, the real pixel clock
+Global dsi_esc_hz.i        = 0    ; the escape clock as programmed
+Global dsi_htotal.i        = 0    ; the stretched horizontal total
+Global dsi_hsync_s.i       = 0
+Global dsi_hsync_e.i       = 0
+Global dsi_planned.i       = 0    ; 1 once DsiModePlan has run
+Global dsi_up.i            = 0    ; 1 once DsiHostBringUp has run
+Global dsi_video.i         = 0    ; 1 once DISP0_ENABLE is set
+Global dsi_xfers.i         = 0    ; DCS transfers attempted
+Global dsi_xfer_fails.i    = 0    ; and how many did not complete
+Global dsi_last_int.i      = 0    ; INT_STAT at the end of the last one
+Global dsi_last_stat.i     = 0    ; and STAT, which no enable mask gates
+Global dsi_last_rxpkt.i    = 0    ; RXPKT1H after the last read
+Global dsi_afec0_want.i    = 0    ; the AFE word that was composed
+Global dsi_afec0_seen.i    = 0    ; and what came back IMMEDIATELY after
+                                  ; it was written - see step 4 below
+Global dsi_ctrl_seen.i     = 0    ; CTRL read back one instruction after
+                                  ; the composed word was written to it
+Global dsi_stat_release.i  = 0    ; STAT 20 ms after the AFE left reset,
+                                  ; with the clear taken BEFORE the
+                                  ; release - see step 10 below
+Global dsi_stat_settled.i  = 0    ; and STAT over a second 20 ms window,
+                                  ; cleared after the release, which is
+                                  ; what the old code measured alone
+Global dsi_ulps_ran.i      = 0    ; 1 once DsiUlpsCycle has been run
+Global dsi_ulps_enter.i    = 0    ; STAT after the ULPS request, or -1
+Global dsi_ulps_exit.i     = 0    ; STAT after the request was removed
+Global dsi_ulps_rc.i        = 0   ; 0 neither, 1 entered, 2 both
+Global dsi_fs_ran.i        = 0    ; 1 once DsiForceStopCycle has been run
+Global dsi_fs_phyc_was.i   = 0    ; PHYC before the order
+Global dsi_fs_phyc_back.i  = 0    ; PHYC read back WITH the order in it
+Global dsi_fs_stat.i       = 0    ; STAT after waiting for D0_STOP
+Global dsi_fs_rc.i         = 0    ; 1 the lane reported STOP, 0 it did not
+
+; ======================================================================
+;  THE FIRMWARE POWER DOMAIN, AND IT IS THE FIRST THING THAT HAS TO
+;  HAPPEN. Measured on the bench 2026-09-08.
+;
+;  DSI1's ANALOGUE front end sits in a power domain the VideoCore
+;  firmware owns, and that domain is OFF at boot. Until it is turned on,
+;  every register in this file reads back exactly the value written to
+;  it and NOTHING MOVES: no lane reaches STOP, ULPS is neither entered
+;  nor left, a DCS read gets no byte back. The digital register file
+;  answers from a different power island than the analogue drive, so a
+;  complete, correct bring-up verified write-by-write against the vendor
+;  driver drives nothing at all. That cost two days before it was found.
+;
+;  THE DRIVER ASKS BEFORE IT WRITES: vc4_dsi.c:937,
+;  pm_runtime_resume_and_get(dev) is the FIRST statement of
+;  vc4_dsi_bridge_pre_enable, ahead of every register write.
+;
+;  THE INDEX IS 19, NOT 18. The device-tree binding index and the
+;  firmware's own index are not the same number:
+;    bcm2835-rpi.dtsi:82-84   &dsi1 power-domains = <&power RPI_POWER_DOMAIN_DSI1>
+;    raspberrypi-power.h:30   RPI_POWER_DOMAIN_DSI1  18
+;    raspberrypi-power.h:9-11 "the firmware interface's indices minus one"
+;    raspberrypi-power.c:120  dom->domain = xlate_index + 1     ->  19
+;
+;  AND A ZERO IS NOT NECESSARILY AN ANSWER. raspberrypi-power.c:137-159:
+;  "The firmware doesn't actually return an error on an unknown tag, and
+;  just skips over it" - so a firmware that has never heard of this tag
+;  hands the buffer back unchanged, and an untouched state word of 0
+;  looks exactly like a domain that is genuinely off. DsiDomainProbe()
+;  below is the kernel's own test for that, and it lives here rather
+;  than in a command file because everything that depends on the domain
+;  has to be able to ask.
+;
+;  WHY THIS IS IN THE LIBRARY AND NOT IN THE `dsi domain` COMMAND, WHICH
+;  IS WHERE IT WAS FIRST WRITTEN. A console command is something a
+;  person types. The boot path cannot type, and a boot path that
+;  reimplemented the message would be a second implementation of the one
+;  thing this whole campaign turned on. The command is now a PRINTER
+;  over these procedures: it reports the words they recorded, and the
+;  words are composed once.
+;
+;  REQUIRES mailbox.pi4, ahead of this file in the main source. House
+;  rule 10: this library does not include it, and a main file that
+;  forgets it fails loudly on an undefined MailboxBegin.
+; ======================================================================
+
+; The four tags. raspberrypi-firmware-soc.h's tag enum.
+#DSI_TAG_GET_POWER_STATE  = $00020001
+#DSI_TAG_SET_POWER_STATE  = $00028001
+#DSI_TAG_GET_DOMAIN_STATE = $00030030
+#DSI_TAG_SET_DOMAIN_STATE = $00038030
+
+; Firmware domain indices = binding index + 1. See above.
+#DSI_DOMAIN_DSI0 = 18   ; RPI_POWER_DOMAIN_DSI0 17, plus one
+#DSI_DOMAIN_DSI1 = 19   ; RPI_POWER_DOMAIN_DSI1 18, plus one
+#DSI_DOMAIN_ARM  = 23   ; RPI_POWER_DOMAIN_ARM  22, plus one
+
+; The number the kernel's implemented-or-not probe ACTUALLY sends. It is
+; the binding index with no `+ 1` - raspberrypi-power.c:151 against :120,
+; which is an inconsistency in the kernel and not in this transcription.
+; Only used as a fallback by the probe, never by a SET.
+#DSI_DOMAIN_ARM_BINDING = 22
+
+; The OLD interface takes DEVICE ids, which are a different table
+; entirely. raspberrypi-firmware-soc.h does NOT list them and there is no
+; DSI device in it - only raspberrypi-power.c's two survivors, USB 3 and
+; V3D 10, are named anywhere on this disk. So there is no old-interface
+; call to make for DSI1, and nothing here invents one. Device 3 is READ,
+; never written, purely to prove the device path answers at all -
+; without that control, a silent DSI answer and a dead tag look alike.
+#DSI_OLD_DEVICE_USB = 3
+
+#DSI_MBX_TWO_WORDS = 8
+#DSI_MBX_STATE_ON  = 1
+
+; The last transaction, kept so a command file can PRINT every word that
+; went out and came back without composing the message a second time.
+Global dsi_dom_tag.i   = 0
+Global dsi_dom_id.i    = 0
+Global dsi_dom_req.i   = 0    ; the state word actually sent
+Global dsi_dom_w0.i    = 0    ; the reply's word 0
+Global dsi_dom_w1.i    = 0    ; and word 1
+Global dsi_dom_nb.i    = 0    ; response bytes
+Global dsi_dom_on.i    = 0    ; 1 once DSI1's domain has READ BACK on
+
+; ======================================================================
+;  THE TWO ACCESSORS. Everything in this file goes through them, so
+;  there is one place a barrier can be missing from.
+;
+;  PeekN reads FOUR bytes - one 32-bit load, which is what a peripheral
+;  register wants. The mask is not decoration: a register with bit 31
+;  set arrives sign-extended and every comparison after it is wrong.
+; ======================================================================
+; ----------------------------------------------------------------------
+;  DsiDomainXact - ONE power-domain mailbox transaction, and the only
+;  place one is composed. Returns the reply's state word, or -1 if the
+;  message could not be sent at all. Every word of it - the tag, the id,
+;  what was sent, what came back and how many bytes came back - is left
+;  in the dsi_dom_* globals for whoever wants to print it.
+;
+;  sendState = 0 means "send zero as the state word", which is what a
+;  plain GET does; 1 means send `state` as given, which both a SET and
+;  the seeded ~0 probe need.
+; ----------------------------------------------------------------------
+Procedure.i DsiDomainXact(tag.i, id.i, state.i, sendState.i)
+  dsi_dom_tag = tag
+  dsi_dom_id  = id
+  dsi_dom_req = 0
+  If sendState <> 0
+    dsi_dom_req = state
+  EndIf
+  dsi_dom_w0 = 0
+  dsi_dom_w1 = 0
+  dsi_dom_nb = 0
+
+  If MailboxReady() = 0
+    If MailboxInit() = 0
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  If MailboxBegin(tag, #DSI_MBX_TWO_WORDS, #DSI_MBX_TWO_WORDS) = 0
+    ProcedureReturn -1
+  EndIf
+  MailboxSetWord(0, id)
+  MailboxSetWord(1, dsi_dom_req)
+  If MailboxSend() = 0
+    ProcedureReturn -1
+  EndIf
+
+  dsi_dom_w0 = MailboxWord(0)
+  dsi_dom_w1 = MailboxWord(1)
+  dsi_dom_nb = MailboxRespBytes()
+  ProcedureReturn dsi_dom_w1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDomainGet - the state of one firmware power domain, or -1 if the
+;  question could not be asked.
+; ----------------------------------------------------------------------
+Procedure.i DsiDomainGet(id.i)
+  ProcedureReturn DsiDomainXact(#DSI_TAG_GET_DOMAIN_STATE, id, 0, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDomainProbe - IS THIS INTERFACE IMPLEMENTED AT ALL?
+;
+;  raspberrypi-power.c:137-159's own test, not an invention of this
+;  bench: ask for a domain that must be on, with the state word
+;  pre-seeded to $FFFFFFFF, and see whether the word comes back
+;  DIFFERENT. A firmware that skipped the tag hands back what it was
+;  given. The ARM domain is the one asked, because this board is running
+;  on it, so any firmware maintaining the table at all has to say 1.
+;
+;  Returns 1 implemented, 0 not, -1 the message would not go.
+; ----------------------------------------------------------------------
+Procedure.i DsiDomainProbe()
+  Define v.i
+
+  v = DsiDomainXact(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_ARM, $FFFFFFFF, 1)
+  If v < 0
+    ProcedureReturn -1
+  EndIf
+  If v <> $FFFFFFFF
+    ProcedureReturn 1
+  EndIf
+  ; Unchanged at firmware index 23. Before calling a whole interface
+  ; absent, ask the number the kernel's own probe sends: :151 sends the
+  ; BINDING index 22, without the +1 it applies at :120. If 23 is past
+  ; the end of this firmware's table, an unanswered word is exactly what
+  ; that looks like.
+  v = DsiDomainXact(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_ARM_BINDING, $FFFFFFFF, 1)
+  If v < 0
+    ProcedureReturn -1
+  EndIf
+  If v <> $FFFFFFFF
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDomainOn - POWER DSI1, and prove it by reading it back.
+;
+;  This is the one call the boot path makes. It returns 1 only when the
+;  domain READS BACK on, never on the strength of the SET's own reply:
+;  the reply to a skipped tag is the request handed back, so a SET that
+;  "succeeded" against a firmware which ignored it is indistinguishable
+;  from one that worked, and only the read-back separates them.
+;
+;  It is idempotent and cheap - one mailbox round trip when the domain
+;  is already known on - so anything that needs the block powered can
+;  simply call it.
+; ----------------------------------------------------------------------
+Procedure.i DsiDomainOn()
+  Define v.i
+
+  If dsi_dom_on <> 0
+    ProcedureReturn 1
+  EndIf
+  If DsiDomainXact(#DSI_TAG_SET_DOMAIN_STATE, #DSI_DOMAIN_DSI1, #DSI_MBX_STATE_ON, 1) < 0
+    ProcedureReturn 0
+  EndIf
+  v = DsiDomainGet(#DSI_DOMAIN_DSI1)
+  If v = 1
+    dsi_dom_on = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DsiDomainIsOn() : ProcedureReturn dsi_dom_on : EndProcedure
+Procedure.i DsiDomTag()     : ProcedureReturn dsi_dom_tag : EndProcedure
+Procedure.i DsiDomId()      : ProcedureReturn dsi_dom_id  : EndProcedure
+Procedure.i DsiDomReq()     : ProcedureReturn dsi_dom_req : EndProcedure
+Procedure.i DsiDomW0()      : ProcedureReturn dsi_dom_w0  : EndProcedure
+Procedure.i DsiDomW1()      : ProcedureReturn dsi_dom_w1  : EndProcedure
+Procedure.i DsiDomBytes()   : ProcedureReturn dsi_dom_nb  : EndProcedure
+
+Procedure.i DsiRd(off.i)
+  ProcedureReturn PeekN(#DSI1_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure DsiWr(off.i, v.i)
+  PokeN(#DSI1_BASE + off, v & $FFFFFFFF)
+  a64_barrier()
+EndProcedure
+
+Procedure.i DsiCmRd(off.i)
+  ProcedureReturn PeekN(#DSI_CM_BASE + off) & $FFFFFFFF
+EndProcedure
+
+; Every clock-manager write carries the password in 31:24 or is
+; discarded silently. One procedure so it cannot be forgotten at a call
+; site - the argument is the VALUE and the password is added here.
+;
+; NOTE the width: pwm.pi4's equivalent masks the value to 24 bits
+; because CM_*CTL and CM_*DIV have nothing above bit 23. The A2W
+; registers DO - the channel divider's disable bit is bit 8 and the PLL
+; control word runs to bit 14 - but nothing this file writes goes above
+; bit 23 either, so the same mask holds and is kept for the same reason.
+Procedure DsiCmWr(off.i, v.i)
+  PokeN(#DSI_CM_BASE + off, #DSI_CM_PASSWD | (v & $00FFFFFF))
+  a64_barrier()
+EndProcedure
+
+; ======================================================================
+;  THE CLOCKS
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  DsiPllVcoHz() - PLLD's VCO rate, computed from what the part holds.
+;
+;  bcm2835_pll_get_rate (clk-bcm2835.c:592-620) with
+;  bcm2835_pll_rate_from_divisors (:565-577):
+;
+;      rate = parent * ((ndiv << 20) + fdiv) / pdiv >> 20
+;
+;  THE PRE-DIVIDER IS NOT READ, and that is correct on this part rather
+;  than a shortcut. bcm2835_pll_get_prediv_mask (:520-533) returns 0 for
+;  SOC_BCM2711 with the comment "On BCM2711 there isn't a pre-divisor
+;  available in the PLL feedback loop. Bits 13:14 of ANA1 have been
+;  re-purposed for VCO RANGE bits." Reading ANA1 here and doubling ndiv
+;  on a set bit would halve the answer on a part where those bits mean
+;  something else entirely.
+;
+;  Returns 0 if PDIV reads zero, which the driver also treats as "no
+;  rate" rather than dividing by it.
+; ----------------------------------------------------------------------
+Procedure.i DsiPllVcoHz()
+  Define ctl.i
+  Define ndiv.i
+  Define pdiv.i
+  Define fdiv.i
+  Define whole.i
+  Define frac.i
+
+  ctl  = DsiCmRd(#A2W_PLLD_CTRL_OFF)
+  fdiv = DsiCmRd(#A2W_PLLD_FRAC_OFF) & #A2W_PLL_FRAC_MASK
+  ndiv = ctl & #A2W_PLL_CTRL_NDIV_MASK
+  pdiv = (ctl & #A2W_PLL_CTRL_PDIV_MASK) >> #A2W_PLL_CTRL_PDIV_SHIFT
+
+  If pdiv = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Split so the intermediate stays far away from the top of a signed
+  ; 64-bit integer. 54e6 * 1023 is 5.5e10 and 54e6 * fdiv is at most
+  ; 5.7e13, where the single-expression form would reach 5.8e16 - safe
+  ; today and one wider PLL away from not being.
+  whole = (#DSI_XOSC_HZ * ndiv) / pdiv
+  frac  = ((#DSI_XOSC_HZ * fdiv) / pdiv) >> 20
+  ProcedureReturn whole + frac
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiClocksRead() - what CPRMAN holds RIGHT NOW. Reads only; writes
+;  nothing; safe on a board whose display state is unknown, which is the
+;  whole point of having it separate from DsiClocksSet().
+; ----------------------------------------------------------------------
+Procedure DsiClocksRead()
+  Define perdiv.i
+
+  dsi_plld_vco = DsiPllVcoHz()
+
+  perdiv = DsiCmRd(#A2W_PLLD_PER_OFF) & $FF
+  If perdiv = 0
+    ; An eight-bit field reading zero means 256 in this part's dividers
+    ; (clk-bcm2835.c:876-878 folds max_div back to 0 on the way in).
+    perdiv = 256
+  EndIf
+  dsi_plld_per = dsi_plld_vco / perdiv
+
+  dsi_chan_div = DsiCmRd(#A2W_PLLD_DSI1_OFF) & $FF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiModePlan(pixelHz) - choose the PLLD_DSI1 divider and stretch the
+;  horizontal blanking to keep the refresh rate.
+;
+;  This is vc4_dsi_bridge_mode_fixup (vc4_dsi.c:864-915), transcribed.
+;  The loop finds the largest divider whose NEXT step would fall below
+;  the wanted link rate - so the rate it picks is at or above what was
+;  asked for, never below. A DSI link that is slightly fast with the
+;  blanking stretched to match shows a correct picture; one that is slow
+;  underruns the FIFO and tears.
+;
+;  Sets the globals and returns the pixel clock it landed on, or 0 if
+;  PLLD could not be read at all.
+; ----------------------------------------------------------------------
+Procedure.i DsiModePlan(pixelHz.i)
+  Define want.i
+  Define parent.i
+  Define d.i
+  Define pll.i
+
+  DsiClocksRead()
+  parent = dsi_plld_vco
+  If parent = 0
+    dsi_planned = 0
+    ProcedureReturn 0
+  EndIf
+
+  want = pixelHz * #DSI_DIVIDER
+
+  d = 1
+  While d < 255
+    If (parent / (d + 1)) < want
+      Break
+    EndIf
+    d = d + 1
+  Wend
+
+  pll = parent / d
+
+  dsi_pll_div  = d
+  dsi_phy_hz   = pll
+  dsi_pixel_hz = pll / #DSI_DIVIDER
+
+  ; The blanking stretch, :908-913. The driver works in kHz because a
+  ; drm mode's clock is in kHz; this works in Hz, which is the same
+  ; arithmetic with the rounding step removed.
+  dsi_htotal  = (dsi_pixel_hz * #DSI_PANEL_HTOTAL) / #DSI_PANEL_HZ
+  dsi_hsync_s = #DSI_PANEL_HSYNC_S + (dsi_htotal - #DSI_PANEL_HTOTAL)
+  dsi_hsync_e = #DSI_PANEL_HSYNC_E + (dsi_htotal - #DSI_PANEL_HTOTAL)
+
+  dsi_planned = 1
+  ProcedureReturn dsi_pixel_hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiCmStop(ctl) / DsiCmStart(ctl, src, div) - a CPRMAN clock generator,
+;  stopped and started the way bcm2835_clock_off/on do it
+;  (clk-bcm2835.c:1096-1130).
+;
+;  THE WAIT ON BUSY IS NOT POLITENESS. Table 99 on ENAB: the output
+;  clock does not stop immediately because the cycle must complete, and
+;  BUSY goes low when the final one has. Changing SRC or DIV while BUSY
+;  is set glitches the output, and on a clock feeding a PHY that is a
+;  glitch nothing downstream reports.
+;
+;  The wait is bounded. A clock that never goes idle is a fault to
+;  report, not a reason to spin at a prompt for ever.
+; ----------------------------------------------------------------------
+Procedure.i DsiCmStop(ctlOff.i)
+  Define spin.i
+  Define c.i
+
+  c = DsiCmRd(ctlOff)
+  DsiCmWr(ctlOff, c & ~(#CM_CTL_ENABLE | #CM_CTL_GATE))
+
+  spin = 100000
+  While spin > 0
+    If (DsiCmRd(ctlOff) & #CM_CTL_BUSY) = 0
+      ProcedureReturn 1
+    EndIf
+    spin = spin - 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure DsiCmStart(ctlOff.i, divOff.i, src.i, div.i)
+  DsiCmWr(divOff, div)
+  DsiCmWr(ctlOff, src & #CM_CTL_SRC_MASK)
+  DsiCmWr(ctlOff, (src & #CM_CTL_SRC_MASK) | #CM_CTL_ENABLE | #CM_CTL_GATE)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiClocksSet() - program the three clocks DSI1 needs.
+;
+;  ONE: the link clock, PLLD_DSI1. bcm2835_pll_divider_set_rate
+;  (clk-bcm2835.c:866-890) writes the raw divider to the A2W channel
+;  register - which also clears the channel's disable bit, because that
+;  bit is bit 8 and a divider under 256 does not reach it - and then
+;  pulses LOADDSI1 in CM_PLLD. bcm2835_pll_divider_on (:824-840) then
+;  clears the channel disable and the HOLD bit.
+;
+;  TWO: the escape clock. vc4_dsi.c only enables it and never sets its
+;  rate, because on a Linux system the firmware has already put it at
+;  100 MHz - and the driver's own timing arithmetic is written around
+;  that: "ESC always runs at 100Mhz" (:810-811) with ESC_TIME_NS 10.
+;  Nothing has configured it on a board where the firmware owns no
+;  display, so it is programmed here, from PLLD_PER, and the rate it
+;  actually reached is reported rather than assumed.
+;
+;  THREE: the pixel clock, DSI1P. It has no divider at all - int_bits
+;  and frac_bits are both zero (clk-bcm2835.c:2273-2280) - so it is a
+;  pure mux, and setting its "rate" means choosing which of the PHY's
+;  own outputs to take. The driver asks for phy/8, which is the BYTE
+;  clock, and spends a paragraph on why it is the byte rate and not the
+;  pixel rate (vc4_dsi.c:1052-1058).
+;
+;  Returns 1 if every step completed, 0 if a clock would not go idle.
+; ----------------------------------------------------------------------
+Procedure.i DsiClocksSet()
+  Define cm.i
+  Define fixed.i
+  Define escdiv.i
+  Define ok.i
+
+  If dsi_planned = 0
+    ProcedureReturn 0
+  EndIf
+  ok = 1
+
+  ; ---- the link clock ------------------------------------------------
+  DsiCmWr(#A2W_PLLD_DSI1_OFF, dsi_pll_div & $FF)
+  cm = DsiCmRd(#CM_PLLD_OFF)
+  DsiCmWr(#CM_PLLD_OFF, cm | #CM_PLLD_LOADDSI1)
+  DsiCmWr(#CM_PLLD_OFF, cm & ~#CM_PLLD_LOADDSI1)
+
+  DsiCmWr(#A2W_PLLD_DSI1_OFF, dsi_pll_div & $FF)   ; channel disable clear
+  cm = DsiCmRd(#CM_PLLD_OFF)
+  DsiCmWr(#CM_PLLD_OFF, cm & ~#CM_PLLD_HOLDDSI1)
+
+  dsi_chan_div = DsiCmRd(#A2W_PLLD_DSI1_OFF) & $FF
+
+  ; ---- the escape clock ----------------------------------------------
+  ; bcm2835_clock_choose_div (clk-bcm2835.c:900-940): the divider is a
+  ; 12-bit fixed point, integer in 23:12 and fraction in 11:0, of which
+  ; only the top frac_bits are used - four integer bits and eight
+  ; fractional ones for this clock (:2257-2264). So the unused low four
+  ; bits are cleared, exactly as the driver's unused_frac_mask does.
+  If dsi_plld_per > 0
+    fixed = (dsi_plld_per << 12) / 100000000
+    fixed = fixed & $0000FFF0
+    If fixed < $1000
+      fixed = $1000          ; never divide by less than one
+    EndIf
+    If fixed > $F000
+      fixed = $F000          ; four integer bits is the field's whole width
+    EndIf
+    escdiv = fixed
+    dsi_esc_hz = (dsi_plld_per << 12) / escdiv
+    If DsiCmStop(#CM_DSI1ECTL_OFF) = 0
+      ok = 0
+    EndIf
+    DsiCmStart(#CM_DSI1ECTL_OFF, #CM_DSI1EDIV_OFF, #CM_SRC_PLLD_PER, escdiv)
+  Else
+    dsi_esc_hz = 0
+    ok = 0
+  EndIf
+
+  ; ---- the pixel clock -----------------------------------------------
+  If DsiCmStop(#CM_DSI1PCTL_OFF) = 0
+    ok = 0
+  EndIf
+  DsiCmStart(#CM_DSI1PCTL_OFF, #CM_DSI1PDIV_OFF, #CM_SRC_DSI1_BYTE, 0)
+
+  ProcedureReturn ok
+EndProcedure
+
+; ======================================================================
+;  THE PHY TIMINGS
+;
+;  dsi_hs_timing(ui_ns, ns, ui) = roundup(ui + ceil(ns / ui_ns), 8),
+;  vc4_dsi.c:800-807, rounded up to a multiple of eight "because we're
+;  using the byte clock".
+;
+;  ui_ns is how many nanoseconds one unit interval is, and it is
+;  DIV_ROUND_UP(500000000, hs_clock) - five hundred million rather than
+;  a thousand million because the clock is DDR, so there is an extra
+;  divide by two folded in (:1064-1067).
+;
+;  At any link rate this bench will use, ui_ns rounds up to 1, which
+;  makes every `ns` term equal to itself. The arithmetic is written out
+;  in full anyway rather than folded to constants: a panel with a slower
+;  link would give ui_ns = 2 and every one of these numbers would change.
+; ======================================================================
+Procedure.i DsiUiNs(hsClock.i)
+  If hsClock <= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn (500000000 + hsClock - 1) / hsClock
+EndProcedure
+
+Procedure.i DsiHsTiming(uiNs.i, ns.i, ui.i)
+  Define v.i
+  If uiNs <= 0
+    uiNs = 1
+  EndIf
+  v = ui + ((ns + uiNs - 1) / uiNs)
+  ProcedureReturn ((v + 7) / 8) * 8
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiHostProveWritable() - the readback the block cannot fake.
+;
+;  Reading DSI1_ID proves nothing (see the header). This writes a
+;  pattern into HS_DLT5's 24-bit INIT field, reads it back, restores
+;  whatever was there, and returns 1 only if the value came back.
+;
+;  HS_DLT5 is chosen because it is a claimed register with no effect
+;  until the PHY starts a transfer, so a wrong value here cannot damage
+;  anything and does not survive DsiHostBringUp(), which writes the
+;  driver's own value over it.
+; ----------------------------------------------------------------------
+Procedure.i DsiHostProveWritable()
+  Define was.i
+  Define got.i
+
+  was = DsiRd(#DSI1_HS_DLT5_OFF)
+  DsiWr(#DSI1_HS_DLT5_OFF, $00A5C300)
+  got = DsiRd(#DSI1_HS_DLT5_OFF)
+  DsiWr(#DSI1_HS_DLT5_OFF, was)
+
+  If got = $00A5C300
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiHostBringUp() - vc4_dsi_bridge_pre_enable (vc4_dsi.c:917-1190),
+;  transcribed, minus the two pieces that do not apply.
+;
+;  WHAT IS LEFT OUT, and why each is safe to leave out:
+;
+;  * The interrupt enables. Every one of them is there so that a Linux
+;    completion can be woken; this file polls INT_STAT instead and the
+;    same bits are just as readable from the ARM. Nothing else in the
+;    monitor wants a DSI interrupt.
+;
+;  * vc4_dsi_ulps(dsi, false) at :1177. It IS a no-op on this path, and
+;    the transcription that left it out was right about the outcome and
+;    wrong about the reason, which matters enough to correct here.
+;
+;    THE OLD REASON WAS VOID. It said the call returns immediately
+;    because PHY_AFEC0's LATCH_ULPS bit is left clear four steps
+;    earlier - i.e. it rested on READING that bit. LATCH_ULPS is bit 14
+;    and this part's PHY_AFEC0 has measured readable bits of $0001B700,
+;    which does not include bit 14. The bit cannot be read at all. The
+;    conclusion happens to hold - an unreadable bit reads zero, so the
+;    driver's `ulps == ulps_currently_enabled` test is satisfied and it
+;    returns - but it holds because the readback is BROKEN, not because
+;    the state was known.
+;
+;    The consequence is the part worth keeping: on this part NOTHING in
+;    either driver ever commands a lane to change state. vc4's ULPS exit
+;    is dead code here. So DsiUlpsCycle() below exists as an instrument -
+;    it does the enter-then-exit explicitly, without consulting the bit
+;    that cannot be read, and reports what STAT says at each end. That is
+;    the only documented way to ask the D-PHY's lane state machines
+;    whether they respond to anything at all.
+;
+;  THE ORDER IS NOT NEGOTIABLE and the driver's comments say why at each
+;  step; the numbering below matches the campaign plan's stage-3 list so
+;  a reader can check one against the other.
+; ----------------------------------------------------------------------
+Procedure.i DsiHostBringUp()
+  Define uiNs.i
+  Define afec0.i
+  Define phyc.i
+
+  If dsi_planned = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 1. The block must be ENABLED for the FIFO resets to trigger - that
+  ;    is the driver's own comment at :986-988, and it is why this write
+  ;    and the next one are not one write.
+  DsiWr(#DSI1_CTRL_OFF, #DSI_CTRL_SOFT_RESET_CFG | #DSI_CTRL_RESET_FIFOS)
+
+  ; 2. Enable, with both end-of-transmission packets suppressed.
+  DsiWr(#DSI1_CTRL_OFF, #DSI_CTRL_BASE)
+  dsi_ctrl_seen = DsiRd(#DSI1_CTRL_OFF)
+
+  ; 3. Clear every sticky status bit, so that what appears afterwards is
+  ;    attributable to this bring-up and not to whatever ran last.
+  DsiWr(#DSI1_STAT_OFF, DsiRd(#DSI1_STAT_OFF))
+
+  ; 4. The analogue front end. The composed value is
+  ;    PTATADJ 7 | CTATADJ 7 | IDR 6 on the clock lane and all four data
+  ;    lanes, the unused lanes powered down, and RESET held.
+  ;
+  ;    Every field is placed with its MASK's low bit, which is what
+  ;    FIELD_PREP does, and for IDR_DLANE1 that mask is (27,23) even
+  ;    though the header's _SHIFT beside it says the same 23 while
+  ;    overlapping DLANE2's (28,26). The masked result is what the
+  ;    driver writes, so it is what is written here.
+  afec0 = (7 << 4) | 7
+  afec0 = afec0 | (6 << 17)                    ; IDR_CLANE,  mask 19:17
+  afec0 = afec0 | (6 << 20)                    ; IDR_DLANE0, mask 22:20
+  afec0 = afec0 | ((6 << 23) & $0F800000)      ; IDR_DLANE1, mask 27:23
+  afec0 = afec0 | ((6 << 26) & $1C000000)      ; IDR_DLANE2, mask 28:26
+  afec0 = afec0 | ((6 << 29) & $E0000000)      ; IDR_DLANE3, mask 31:29
+  afec0 = afec0 | $00000100                    ; PD_DLANE3 - two lanes
+  afec0 = afec0 | $00000200                    ; PD_DLANE2 - two lanes
+  afec0 = afec0 | #DSI1_PHY_AFEC0_RESET
+  dsi_afec0_want = afec0
+  DsiWr(#DSI1_PHY_AFEC0_OFF, afec0)
+
+  ; READ IT STRAIGHT BACK, AND KEEP BOTH NUMBERS.
+  ;
+  ; On 2026-09-07 this register held $00000300 after the whole bring-up
+  ; - the two lane power-downs and nothing else - with every bias and
+  ; drive field zero, and the PHY then refused to start a single packet.
+  ; There are two ways that can happen and they need different fixes:
+  ; the write did not take, or the fields do not read back and step 10's
+  ; read-modify-write wiped them. Storing what the register says HERE,
+  ; one instruction after the write, tells the two apart instead of
+  ; leaving it to be argued about.
+  dsi_afec0_seen = DsiRd(#DSI1_PHY_AFEC0_OFF)
+
+  DsiWr(#DSI1_PHY_AFEC1_OFF, 0)
+  delay(1)                                     ; AFEC reset hold time
+
+  ; 5. The eighteen timing fields. hs_clock is the link rate the divider
+  ;    actually gave, not the one that was asked for.
+  uiNs = DsiUiNs(dsi_phy_hz)
+
+  DsiWr(#DSI1_HS_CLT0_OFF, (DsiHsTiming(uiNs, 262, 0) << 18) | (DsiHsTiming(uiNs, 0, 8) << 9) | DsiHsTiming(uiNs, 38, 0))
+  DsiWr(#DSI1_HS_CLT1_OFF, (DsiHsTiming(uiNs, 60, 0) << 9) | DsiHsTiming(uiNs, 60, 52))
+  DsiWr(#DSI1_HS_CLT2_OFF, DsiHsTiming(uiNs, 1000000, 0))
+  DsiWr(#DSI1_HS_DLT3_OFF, (DsiHsTiming(uiNs, 100, 0) << 18) | (DsiHsTiming(uiNs, 105, 6) << 9) | DsiHsTiming(uiNs, 40, 4))
+
+  ; HS_DLT4's TRAIL is the larger of two candidates, :1099-1102, and the
+  ; ANLAT field is a literal zero in the driver.
+  If DsiHsTiming(uiNs, 0, 8) > DsiHsTiming(uiNs, 60, 4)
+    DsiWr(#DSI1_HS_DLT4_OFF, (DsiHsTiming(uiNs, 0, 8) << 9) | DsiHsTiming(uiNs, #DSI_LPX * 10, 0))
+  Else
+    DsiWr(#DSI1_HS_DLT4_OFF, (DsiHsTiming(uiNs, 60, 4) << 9) | DsiHsTiming(uiNs, #DSI_LPX * 10, 0))
+  EndIf
+
+  ; T_INIT: five milliseconds of STOP after power-up. The D-PHY spec
+  ; asks 100 us; the driver keeps the firmware's "extremely conservative
+  ; 5ms" (:1103-1110) and so does this. Do not optimise it on a first
+  ; bring-up - it is the window the panel uses to notice the master.
+  DsiWr(#DSI1_HS_DLT5_OFF, DsiHsTiming(uiNs, 5000000, 0))
+
+  DsiWr(#DSI1_HS_DLT6_OFF, ((#DSI_LPX * 5) << 24) | (#DSI_LPX << 16) | ((#DSI_LPX * 4) << 8) | #DSI_LPX)
+
+  ; LP_WUP is escape-clock timing, not HS timing: 1 ms at 10 ns a tick.
+  DsiWr(#DSI1_HS_DLT7_OFF, 100000)
+
+  ; 6. The lanes. Two data lanes and the clock lane, and NO continuous
+  ;    clock, because this panel asks for MIPI_DSI_CLOCK_NON_CONTINUOUS
+  ;    (panel-waveshare-dsi-v2.c:2159-2160).
+  phyc = #DSI_PHYC_DLANE0_ENABLE | #DSI_PHYC_DLANE1_ENABLE | #DSI1_PHYC_CLANE_ENABLE
+  phyc = phyc | ((#DSI_LPX - 1) << #DSI1_PHYC_ESC_CLK_LPDT_SHIFT)
+  DsiWr(#DSI1_PHYC_OFF, phyc)
+
+  ; 7. Byte-clock calibration. COMPOSED, NOT READ-MODIFY-WRITTEN - see
+  ;    #DSI_CTRL_RUNNING at the top of this file for why a read-back this
+  ;    block has never been proven to give is not something to build the
+  ;    enable bit on.
+  DsiWr(#DSI1_CTRL_OFF, #DSI_CTRL_RUNNING)
+
+  ; 8. The four timeouts, :1145-1152. HS transmit timeout disabled; the
+  ;    other three as the driver sets them.
+  DsiWr(#DSI1_HSTX_TO_CNT_OFF, 0)
+  DsiWr(#DSI1_LPRX_TO_CNT_OFF, $FFFFFF)
+  DsiWr(#DSI1_TA_TO_CNT_OFF, 100000)
+  DsiWr(#DSI1_PR_TO_CNT_OFF, 100000)
+
+  ; 9. DISP1 carries the overflow of a long command payload through the
+  ;    pixel FIFO. Enabled even though this bring-up sends nothing long,
+  ;    because the driver enables it unconditionally and a half-set-up
+  ;    FIFO is a worse thing to leave behind than an idle one.
+  DsiWr(#DSI1_DISP1_CTRL_OFF, #DSI1_DISP1_CTRL_VALUE)
+
+  ; 10. The AFE comes out of reset LAST. Everything above is
+  ;     configuration; this is the switch.
+  ;
+  ;     THE COMPOSED VALUE IS WRITTEN, NOT A READ-MODIFY-WRITE, and the
+  ;     difference is the whole of the first night's failure. The driver
+  ;     does `READ(PHY_AFEC0) & ~RESET` here, which is only safe on a
+  ;     register that reads back what was put in it. On this part, after
+  ;     that read-modify-write, the register held $00000300 - every bias
+  ;     and drive field gone - and the PHY would not start a packet, so
+  ;     all two hundred DCS commands timed out at 500 ms each and made
+  ;     the board unreachable for a hundred seconds.
+  ;
+  ;     Writing the value this procedure composed is correct whichever
+  ;     way the register actually behaves: if it reads back, this is the
+  ;     same word the read-modify-write would have produced; if it does
+  ;     not, this is the only way to keep the fields.
+  ;
+  ;     CLEAR STAT IMMEDIATELY BEFORE THE RELEASE, NOT AFTER IT. That
+  ;     ordering is the whole of a measurement defect this file used to
+  ;     have, and it is worth spelling out because it produced the
+  ;     campaign's headline claim.
+  ;
+  ;     STAT's lane bits are latched EVENTS - "signalled when the lane
+  ;     enters the given state" (vc4_dsi.c:245-252) - and a lane that
+  ;     comes up into LP-11 and stays there enters STOP exactly ONCE, at
+  ;     the instant the AFE leaves reset. The old code cleared STAT after
+  ;     that instant had passed and then waited 20 ms for an edge that
+  ;     could no longer happen. An empty STAT was then read as "no lane
+  ;     ever reaches STOP" - and a PHY sitting correctly in LP-11 gives
+  ;     precisely that reading.
+  ;
+  ;     So the window is opened first and the release happens inside it.
+  DsiWr(#DSI1_STAT_OFF, DsiRd(#DSI1_STAT_OFF))
+  DsiWr(#DSI1_PHY_AFEC0_OFF, dsi_afec0_want & ~#DSI1_PHY_AFEC0_RESET)
+  delay(20)
+  dsi_stat_release = DsiRd(#DSI1_STAT_OFF)
+
+  ; 11. DISP0 in video mode, but NOT enabled. The pixel-clock divider
+  ;     field carries the 24/lanes divider, the format is RGB888, and
+  ;     LP-STOP happens once per frame.
+  DsiWr(#DSI1_DISP0_CTRL_OFF, (#DSI_DIVIDER << #DSI_DISP0_PIX_CLK_DIV_SHIFT) | (#DSI_PFORMAT_RGB888 << #DSI_DISP0_PFORMAT_SHIFT) | (#DSI_DISP0_LP_STOP_PERFRAME << #DSI_DISP0_LP_STOP_CTRL_SHIFT) | #DSI_DISP0_ST_END)
+
+  ; 12. THE SECOND WINDOW, KEPT ON PURPOSE, AND IT MEANS THE OPPOSITE.
+  ;
+  ;     Clear STAT again now that the AFE has been out of reset for
+  ;     20 ms, and watch another 20 ms. A lane resting in LP-11 has no
+  ;     further transitions to make, so THIS window being empty is the
+  ;     EXPECTED reading and says nothing about whether the PHY drives.
+  ;
+  ;     Both numbers are kept because together they separate two states
+  ;     that a single reading cannot: STOP latched in the first window
+  ;     and not the second is a PHY that came up and settled, which is
+  ;     right; empty in BOTH is a PHY that never drove at all.
+  DsiWr(#DSI1_STAT_OFF, DsiRd(#DSI1_STAT_OFF))
+  delay(20)
+  dsi_stat_settled = DsiRd(#DSI1_STAT_OFF)
+
+  dsi_up = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiUlpsCycle() - COMMAND the lanes into ultra-low-power state and back
+;  out, and report what STAT says at each end.
+;
+;  WHY THIS EXISTS. Every reading taken so far is passive: the host is
+;  configured, the AFE is released, and STAT is watched to see whether
+;  anything happens on its own. Nothing does, and two different faults
+;  produce that - a transmitter that is not driving, and a transmitter
+;  driving LP-11 into a cable that cannot carry it. A passive reading
+;  cannot separate them, and neither can another one.
+;
+;  This asks the PHY a question instead. PHYC's ULPS bits are the only
+;  documented way to make a lane change state on demand (vc4_dsi.c:745-
+;  800). The sequence is the driver's own, with one deliberate
+;  difference: it does NOT consult PHY_AFEC0's LATCH_ULPS bit, which on
+;  this part does not read back, so the driver's early-out - which is
+;  what makes its ULPS exit dead code here - cannot fire.
+;
+;    clear STAT's ULPS bits
+;    PHYC |= the three ULPS requests
+;    wait for STAT's ULPS bits, bounded
+;    clear STAT's STOP bits
+;    PHYC &= ~the requests
+;    wait for STAT's STOP bits, bounded
+;
+;  WHAT EACH OUTCOME MEANS, written down before it is run:
+;
+;    both waits satisfied - the lane state machines respond to a
+;      command, so the digital half of the PHY is alive and the fault is
+;      downstream of it: the analogue drive, or the cable.
+;    ULPS entered, STOP never returns - the PHY drives but will not come
+;      back to LP-11, which is a lane held by something external. That
+;      is the cable.
+;    neither - the lane state machines do not move at all. Nothing
+;      outside the SoC can cause that, so it is the PHY, and the
+;      write-only bias is the only remaining candidate in it.
+;
+;  It leaves PHYC exactly as it found it, whichever way it goes: the
+;  request bits are removed on every exit path including the failing
+;  one, the same way the driver does at :776-780.
+;
+;  Returns 0, 1 or 2 - how many of the two waits were satisfied.
+; ----------------------------------------------------------------------
+Procedure.i DsiUlpsCycle()
+  Define phyc.i
+  Define t0.i
+  Define rc.i
+
+  If dsi_up = 0
+    ProcedureReturn -1
+  EndIf
+
+  rc = 0
+  dsi_ulps_ran = 1
+  phyc = DsiRd(#DSI1_PHYC_OFF)
+
+  ; ---- into ULPS -----------------------------------------------------
+  DsiWr(#DSI1_STAT_OFF, #DSI1_STAT_ULPS_2LANE)
+  DsiWr(#DSI1_PHYC_OFF, phyc | #DSI1_PHYC_ULPS_2LANE)
+
+  t0 = millis()
+  While (millis() - t0) < 50
+    If (DsiRd(#DSI1_STAT_OFF) & #DSI1_STAT_ULPS_2LANE) = #DSI1_STAT_ULPS_2LANE
+      Break
+    EndIf
+  Wend
+  dsi_ulps_enter = DsiRd(#DSI1_STAT_OFF)
+  If (dsi_ulps_enter & #DSI1_STAT_ULPS_2LANE) = #DSI1_STAT_ULPS_2LANE
+    rc = 1
+  EndIf
+
+  ; ---- back out ------------------------------------------------------
+  DsiWr(#DSI1_STAT_OFF, #DSI1_STAT_STOP_2LANE)
+  DsiWr(#DSI1_PHYC_OFF, phyc)
+
+  t0 = millis()
+  While (millis() - t0) < 50
+    If (DsiRd(#DSI1_STAT_OFF) & #DSI1_STAT_STOP_2LANE) = #DSI1_STAT_STOP_2LANE
+      Break
+    EndIf
+  Wend
+  dsi_ulps_exit = DsiRd(#DSI1_STAT_OFF)
+  If rc = 1 And (dsi_ulps_exit & #DSI1_STAT_STOP_2LANE) = #DSI1_STAT_STOP_2LANE
+    rc = 2
+  EndIf
+
+  ; PHYC is put back whatever happened - a lane left with a standing
+  ; ULPS request would make every later reading a reading of this probe.
+  DsiWr(#DSI1_PHYC_OFF, phyc)
+
+  dsi_ulps_rc = rc
+  ProcedureReturn rc
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiForceStopCycle() - order data lane 0 into STOP and watch for it.
+;
+;  WHY THIS IS A SEPARATE PROBE FROM THE ULPS ONE. ULPS is a state the
+;  lane negotiates on the wire: both lines are driven low, and although
+;  nothing outside the part can prevent a transmitter REPORTING that it
+;  entered it, the doubt has been recorded honestly - if STAT's lane bits
+;  turn out to be line-state detectors rather than the transmitter's own
+;  view, a cable fault could suppress them.
+;
+;  FORCE_STOP has no such reading. It is an order to one lane's state
+;  machine, issued and observed entirely inside the SoC, and vc4 never
+;  uses it, so nothing about the far end is involved even in principle.
+;  A block that latches the request in PHYC and never reports the state
+;  is a block whose lane state machine is not running.
+;
+;  THE LATCH IS CLEARED BEFORE THE ORDER, NOT AFTER. STAT's lane bits are
+;  latched ENTRY events (vc4_dsi.c:245-252), so a clear taken after the
+;  edge erases the only evidence the probe exists to collect. That
+;  mistake cost this campaign a day and it is written up in
+;  [[Recurring bug shapes]] under "the latch was cleared after the edge it
+;  was watching for". The order below is: clear, order, wait, read.
+;
+;  PHYC is restored on every path. Returns 1 if D0_STOP appeared, 0 if it
+;  did not, and -1 if the host was not up to ask.
+; ----------------------------------------------------------------------
+Procedure.i DsiForceStopCycle()
+  Define phyc.i
+  Define t0.i
+
+  If dsi_up = 0
+    ProcedureReturn -1
+  EndIf
+
+  dsi_fs_ran = 1
+  dsi_fs_rc  = 0
+  phyc = DsiRd(#DSI1_PHYC_OFF)
+  dsi_fs_phyc_was = phyc
+
+  DsiWr(#DSI1_STAT_OFF, #DSI1_STAT_PHY_D0_STOP)
+  DsiWr(#DSI1_PHYC_OFF, phyc | #DSI_PHYC_DLANE0_FORCE_STOP)
+  dsi_fs_phyc_back = DsiRd(#DSI1_PHYC_OFF)
+
+  t0 = millis()
+  While (millis() - t0) < 50
+    If (DsiRd(#DSI1_STAT_OFF) & #DSI1_STAT_PHY_D0_STOP) <> 0
+      Break
+    EndIf
+  Wend
+  dsi_fs_stat = DsiRd(#DSI1_STAT_OFF)
+  If (dsi_fs_stat & #DSI1_STAT_PHY_D0_STOP) <> 0
+    dsi_fs_rc = 1
+  EndIf
+
+  DsiWr(#DSI1_PHYC_OFF, phyc)
+  ProcedureReturn dsi_fs_rc
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPoke(off, v) - write ONE 32-bit word into the DSI1 block by hand.
+;
+;  THIS IS AN INSTRUMENT AND IT IS DELIBERATELY BLUNT. `mmio` reads and
+;  refuses to write, on the grounds that a monitor command that can put
+;  any word at any address turns a wrong keystroke into a dead board.
+;  That argument holds for the whole address space and does not hold
+;  inside one 140-byte register block whose behaviour is the open
+;  question of the campaign.
+;
+;  It exists because PHY_AFEC0 accepted three of the bits written to it
+;  and dropped the rest, and no amount of reading the driver will say
+;  whether the others are write-only, unimplemented, or refused. Two
+;  pokes and two reads answer it.
+;
+;  Refuses anything outside 0..$8C or not a multiple of four: past $8C
+;  there are no registers, only the identity string, and an unaligned
+;  write to a peripheral is not the write anybody meant.
+; ----------------------------------------------------------------------
+Procedure.i DsiPoke(off.i, v.i)
+  If off < 0 Or off > $8C
+    ProcedureReturn 0
+  EndIf
+  If (off & 3) <> 0
+    ProcedureReturn 0
+  EndIf
+  DsiWr(off, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiVideoOn() / DsiVideoOff() - the last bit, on its own.
+;
+;  Separate from the bring-up because the panel's DCS init table has to
+;  run BETWEEN them: the panel is talked to in escape mode with the
+;  video generator stopped, and only then told to show pixels.
+; ----------------------------------------------------------------------
+Procedure DsiVideoOn()
+  DsiWr(#DSI1_DISP0_CTRL_OFF, DsiRd(#DSI1_DISP0_CTRL_OFF) | #DSI_DISP0_ENABLE)
+  dsi_video = 1
+EndProcedure
+
+Procedure DsiVideoOff()
+  DsiWr(#DSI1_DISP0_CTRL_OFF, DsiRd(#DSI1_DISP0_CTRL_OFF) & ~#DSI_DISP0_ENABLE)
+  dsi_video = 0
+EndProcedure
+
+; ======================================================================
+;  THE ESCAPE-MODE COMMAND PATH
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  DsiXferReset() - the driver's own recovery from a transfer that never
+;  finished (vc4_dsi.c:1394-1400): drop CMD_EN, wait, reset the FIFOs,
+;  zero the packet control register.
+;
+;  It is called on every failing exit rather than only on a timeout, for
+;  the reason the I2C library learned the hard way on this same bench: a
+;  transfer that stops half way leaves the controller in a state the
+;  NEXT command inherits, and then every second reading comes off
+;  hardware nobody has put back.
+; ----------------------------------------------------------------------
+Procedure DsiXferReset()
+  DsiWr(#DSI1_TXPKT1C_OFF, DsiRd(#DSI1_TXPKT1C_OFF) & ~#DSI_TXPKT1C_CMD_EN)
+  delayMicroseconds(1)
+  ; The composed word, not READ(CTRL) | RESET_FIFOS. Same argument as
+  ; step 7 of the bring-up: a read-modify-write on a register that has
+  ; not been proven to read back can clear DSI_CTRL_EN, and doing that
+  ; inside the recovery path would disable the block for every command
+  ; after the first failure.
+  DsiWr(#DSI1_CTRL_OFF, #DSI_CTRL_REFIFO)
+  DsiWr(#DSI1_CTRL_OFF, #DSI_CTRL_RUNNING)
+  DsiWr(#DSI1_TXPKT1C_OFF, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiXfer(dt, b0, b1, wantRx) - one SHORT packet, sent and waited for.
+;
+;  Every command in this panel's init table is one or two bytes, and one
+;  status read comes back the same way, so the whole of what this bench
+;  needs is the short-packet path: the header carries the data type and
+;  both parameter bytes, and neither FIFO is involved at all
+;  (vc4_dsi.c:1231-1234).
+;
+;  LOW POWER MODE IS ALWAYS SET. The panel descriptor asks for
+;  MIPI_DSI_MODE_LPM (panel-waveshare-dsi-v2.c:2159), so every command
+;  goes out in escape mode rather than on the high-speed lanes.
+;
+;  Returns 1 on completion, 0 otherwise, and leaves the reason in
+;  DsiLastInt(). A stall is NOT a hang: every wait here is bounded by
+;  both a spin count and a millisecond deadline, because a poll with one
+;  bound is a poll that hangs when that bound is the wrong kind.
+; ----------------------------------------------------------------------
+Procedure.i DsiXferOnce(dt.i, b0.i, b1.i, wantRx.i)
+  Define pkth.i
+  Define pktc.i
+  Define t0.i
+  Define spin.i
+  Define st.i
+  Define done.i
+
+  dsi_xfers = dsi_xfers + 1
+
+  pkth = (dt & $FF) | (((b0 & $FF) | ((b1 & $FF) << 8)) << #DSI_TXPKT1H_BC_PARAM_SHIFT)
+
+  pktc = #DSI_TXPKT1C_CMD_EN | #DSI_TXPKT1C_CMD_MODE_LP
+  pktc = pktc | (1 << #DSI_TXPKT1C_CMD_REPEAT_SHIFT)
+  If wantRx <> 0
+    pktc = pktc | (#DSI_TXPKT1C_CMD_CTRL_RX << #DSI_TXPKT1C_CMD_CTRL_SHIFT)
+  EndIf
+
+  ; Clear the two completion bits so what is polled for is this
+  ; transfer's and not the previous one's, and clear STAT's copies too -
+  ; both are write-one-to-clear and STAT is the one that cannot be
+  ; masked away.
+  DsiWr(#DSI1_INT_STAT_OFF, #DSI1_INT_XFER_DONE)
+  DsiWr(#DSI1_STAT_OFF, #DSI1_STAT_TXPKT1_DONE | #DSI1_STAT_TXPKT1_END)
+
+  ; ENABLE THE COMPLETION INTERRUPTS EVEN THOUGH NOTHING SERVICES THEM.
+  ;
+  ; The first version of this file did not, on the reasoning that a
+  ; poller does not need an interrupt. That reasoning is only sound if
+  ; INT_STAT latches regardless of INT_EN, and on many blocks of this
+  ; family it does not - it is the ENABLED interrupts that appear there.
+  ; The driver writes INT_EN before every transfer (vc4_dsi.c:1330-1340)
+  ; and this now does the same, so the polled register is one the
+  ; hardware is actually being asked to fill in.
+  ;
+  ; $3FC2 is the eight error bits the driver always enables plus
+  ; TXPKT1_DONE, and $200000 is PHY_DIR_RTF, which is what completes a
+  ; READ. Both are enabled for every transfer rather than choosing
+  ; between them, because an interrupt nobody services costs nothing and
+  ; a completion nobody can see costs a night.
+  DsiWr(#DSI1_INT_EN_OFF, $00203FC2)
+
+  DsiWr(#DSI1_TXPKT1H_OFF, pkth)
+  DsiWr(#DSI1_TXPKT1C_OFF, pktc)
+
+  ; ======================================================================
+  ;  WHAT COUNTS AS DONE DEPENDS ON WHETHER A REPLY WAS ASKED FOR, AND
+  ;  FOR ONE DAY IT DID NOT. THIS IS THE FIX FOR A FALSE POSITIVE ON THE
+  ;  MOST IMPORTANT MEASUREMENT IN THE WHOLE DSI CAMPAIGN.
+  ;
+  ;  This loop used to accept #DSI1_INT_XFER_DONE - TXPKT1_DONE OR
+  ;  PHY_DIR_RTF - for EVERY transfer, read or write. TXPKT1_DONE means
+  ;  "the packet I sent has gone out". On a read it fires almost at once
+  ;  and long before the panel could have turned the bus around, so the
+  ;  loop exited on the TRANSMIT, sampled RXPKT1H while it was still
+  ;  empty, and handed DsiDcsRead a register full of zeros. DsiDcsRead
+  ;  shifted that into a byte and `dsi power` printed
+  ;
+  ;      Power Mode = 00
+  ;      A BYTE CAME BACK FROM THE PANEL.
+  ;
+  ;  with INT_STAT reading 00000002 - TXPKT1_DONE alone, PHY_DIR_RTF
+  ;  (bit 21) and RXPKT1 (bit 4) both clear. Nothing came back at all.
+  ;  A read that reports success against a panel that never answered is
+  ;  worse than no read: it is the one test that was supposed to be
+  ;  impossible to fake.
+  ;
+  ;  THE DRIVER DOES NOT DO THIS, and it is explicit about it.
+  ;  vc4_dsi.c:1327-1336 CHOOSES the completion interrupt by whether a
+  ;  reply is expected:
+  ;
+  ;      if (msg->rx_len) {
+  ;              DSI_PORT_WRITE(INT_EN, (DSI1_INTERRUPTS_ALWAYS_ENABLED |
+  ;                                      DSI1_INT_PHY_DIR_RTF));
+  ;      } else {
+  ;              DSI_PORT_WRITE(INT_EN, (DSI1_INTERRUPTS_ALWAYS_ENABLED |
+  ;                                      DSI1_INT_TXPKT1_DONE));
+  ;      }
+  ;
+  ;  and only once that completion arrives does it read RXPKT1H at
+  ;  :1358-1385. TXPKT1_DONE is never a read's completion there.
+  ;
+  ;  So the mask is chosen the same way here. The interrupt ENABLES stay
+  ;  broad - an interrupt nobody services costs nothing - but what this
+  ;  loop WAITS FOR narrows to the one bit that means what is being
+  ;  claimed. RXPKT1 (bit 4) is accepted alongside PHY_DIR_RTF because a
+  ;  received packet is a received packet however the block announces it.
+  ; ======================================================================
+  If wantRx <> 0
+    done = #DSI1_INT_PHY_DIR_RTF | #DSI1_INT_RXPKT1
+  Else
+    done = #DSI1_INT_TXPKT1_DONE
+  EndIf
+
+  t0 = millis()
+  spin = 4000000
+  Repeat
+    ; POLL BOTH. INT_STAT is what the driver's handler reads, and STAT
+    ; is the raw status that no enable mask gates. Either one saying the
+    ; packet is done is the packet being done.
+    ;
+    ; STAT's TXPKT1_DONE is folded in ONLY for a write. On a read it is
+    ; the very bit that produced the false positive above, and STAT has
+    ; no copy of PHY_DIR_RTF to offer instead.
+    st = DsiRd(#DSI1_INT_STAT_OFF)
+    dsi_last_stat = DsiRd(#DSI1_STAT_OFF)
+    If wantRx = 0 And (dsi_last_stat & #DSI1_STAT_TXPKT1_DONE) <> 0
+      st = st | #DSI1_INT_TXPKT1_DONE
+    EndIf
+    If (st & done) <> 0
+      dsi_last_int = st
+      DsiWr(#DSI1_INT_STAT_OFF, st)
+      If (st & #DSI1_INT_ERROR_BITS) <> 0
+        dsi_xfer_fails = dsi_xfer_fails + 1
+        DsiXferReset()
+        ProcedureReturn 0
+      EndIf
+      If wantRx <> 0
+        dsi_last_rxpkt = DsiRd(#DSI1_RXPKT1H_OFF)
+      EndIf
+      ProcedureReturn 1
+    EndIf
+    If (st & #DSI1_INT_ERROR_BITS) <> 0
+      dsi_last_int = st
+      DsiWr(#DSI1_INT_STAT_OFF, st)
+      dsi_xfer_fails = dsi_xfer_fails + 1
+      DsiXferReset()
+      ProcedureReturn 0
+    EndIf
+    spin = spin - 1
+  Until spin <= 0 Or (millis() - t0) > #DSI_XFER_MS
+
+  dsi_last_int = DsiRd(#DSI1_INT_STAT_OFF)
+  dsi_last_stat = DsiRd(#DSI1_STAT_OFF)
+  dsi_xfer_fails = dsi_xfer_fails + 1
+  DsiXferReset()
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiXfer(dt, b0, b1, wantRx) - one packet, with the REFERENCE DRIVER'S
+;  OWN RECOVERY behind it.
+;
+;  THIS IS THE ONE THING vc4_dsi.c DOES IN THE FAILING PATH THAT THIS
+;  FILE DID NOT, and it exists in the driver for exactly the symptom this
+;  bench is looking at. vc4_dsi_host_transfer (:1405-1438):
+;
+;      ret = vc4_dsi_transfer(dsi, msg, false);
+;      if (ret == -ETIMEDOUT) {
+;              DSI_PORT_WRITE(STAT, STAT_ERR_CONT_LP1);
+;              if (!(disp0_ctrl & DSI_DISP0_ENABLE)) {
+;                      /* If video mode not enabled, then try recovering
+;                       * by enabling it briefly to clear FIFOs and the
+;                       * state. */
+;                      ...ENABLE, 30 ms, clear, 30 ms, retry once...
+;
+;  Read that comment again: the driver's authors found that a transfer
+;  can time out while DISP0 is not enabled, and that turning video mode
+;  on for thirty milliseconds unsticks the block. Every command this
+;  bench has sent has been sent with DISP0 not enabled, and every one has
+;  timed out with CMD_EN latched and the packet never started. That is
+;  the condition the workaround names.
+;
+;  It is deliberately NOT a loop. One retry, exactly as the driver does,
+;  so a link that carries nothing costs a command about a fifth of a
+;  second rather than an unbounded number of thirty-millisecond stalls.
+;
+;  DISP0's ENABLE bit is the only bit touched, and it is put back. That
+;  is safe with no pixel source behind it: the pixel valve is not
+;  running, so the block has nothing to scan out and simply drains.
+; ----------------------------------------------------------------------
+Procedure.i DsiXfer(dt.i, b0.i, b1.i, wantRx.i)
+  Define disp0.i
+
+  If DsiXferOnce(dt, b0, b1, wantRx) <> 0
+    ProcedureReturn 1
+  EndIf
+
+  ; Only the timeout case gets the recovery. An error bit means the link
+  ; answered something, and re-driving it would lose the reason.
+  If (dsi_last_int & #DSI1_INT_ERROR_BITS) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  DsiWr(#DSI1_STAT_OFF, #DSI1_STAT_ERR_CONT_LP1)
+
+  disp0 = DsiRd(#DSI1_DISP0_CTRL_OFF)
+  If (disp0 & #DSI_DISP0_ENABLE) <> 0
+    ; Already in video mode; the driver does not retry in that case
+    ; either, it just reports.
+    ProcedureReturn 0
+  EndIf
+
+  DsiWr(#DSI1_DISP0_CTRL_OFF, disp0 | #DSI_DISP0_ENABLE)
+  delay(30)
+  DsiWr(#DSI1_DISP0_CTRL_OFF, disp0)
+  delay(30)
+
+  ProcedureReturn DsiXferOnce(dt, b0, b1, wantRx)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDcsWrite(cmd, param, nparam) - a DCS write with zero or one
+;  parameter, which is every command in this panel's table.
+;
+;  The data type is chosen the way mipi_dsi_dcs_write does: no parameter
+;  is a SHORT_WRITE, one parameter is a SHORT_WRITE_PARAM. Anything
+;  longer would be a long packet and this procedure refuses it rather
+;  than sending a short packet with the tail missing.
+; ----------------------------------------------------------------------
+Procedure.i DsiDcsWrite(cmd.i, param.i, nparam.i)
+  If nparam = 0
+    ProcedureReturn DsiXfer(#MIPI_DSI_DCS_SHORT_WRITE, cmd, 0, 0)
+  EndIf
+  If nparam = 1
+    ProcedureReturn DsiXfer(#MIPI_DSI_DCS_SHORT_WRITE_PARAM, cmd, param, 0)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDcsRead(cmd) - one DCS read, returning 0..255, or -1.
+;
+;  THIS IS THE MEASUREMENT THE WHOLE STAGE EXISTS FOR. Every write in
+;  this file can succeed against a panel that is not there: the host
+;  will happily clock a packet into a disconnected ribbon and report
+;  TXPKT1_DONE. A read cannot. The bus has to turn around, the panel has
+;  to drive it, and the byte that comes back was composed by the part on
+;  the other end.
+;
+;  The reply to a short read arrives in RXPKT1H's SHORT_0 field
+;  (vc4_dsi.c:1372-1382), not in the RX FIFO - the FIFO is for long
+;  replies. A long reply to a one-byte read is a protocol error here and
+;  is reported as one rather than being decoded anyway.
+; ----------------------------------------------------------------------
+Procedure.i DsiDcsRead(cmd.i)
+  Define rx.i
+
+  ; Tell the panel how much it may send back. Without it a panel is
+  ; entitled to return its own idea of a maximum and overrun the reply.
+  If DsiXfer(#MIPI_DSI_SET_MAX_RETURN_SIZE, 1, 0, 0) = 0
+    ProcedureReturn -1
+  EndIf
+
+  If DsiXfer(#MIPI_DSI_DCS_READ, cmd, 0, 1) = 0
+    ProcedureReturn -1
+  EndIf
+
+  ; THE COMPLETION MUST HAVE BEEN A READ'S COMPLETION. DsiXferOnce now
+  ; only exits a wantRx transfer on PHY_DIR_RTF or RXPKT1, so this can no
+  ; longer be false - it is here so that it CANNOT BECOME false again.
+  ; The bug this replaces returned $00 from an all-zero RXPKT1H and the
+  ; monitor printed "A BYTE CAME BACK FROM THE PANEL"; nothing below
+  ; distinguishes a genuine zero byte from an empty register, so the
+  ; distinction has to be made from the interrupt that says a packet
+  ; arrived, which is what vc4_dsi.c:1327-1358 waits on.
+  If (dsi_last_int & (#DSI1_INT_PHY_DIR_RTF | #DSI1_INT_RXPKT1)) = 0
+    ProcedureReturn -1
+  EndIf
+
+  rx = dsi_last_rxpkt
+  If (rx & #DSI_RXPKT1H_ERR_BITS) <> 0
+    ProcedureReturn -1
+  EndIf
+  If (rx & #DSI_RXPKT1H_PKT_TYPE_LONG) <> 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn (rx >> #DSI_RXPKT1H_SHORT_0_SHIFT) & $FF
+EndProcedure
+
+; ======================================================================
+;  READERS - so a command file can report without touching hardware.
+; ======================================================================
+Procedure.i DsiPlldVco()   : ProcedureReturn dsi_plld_vco   : EndProcedure
+Procedure.i DsiPlldPer()   : ProcedureReturn dsi_plld_per   : EndProcedure
+Procedure.i DsiChanDiv()   : ProcedureReturn dsi_chan_div   : EndProcedure
+Procedure.i DsiPllDiv()    : ProcedureReturn dsi_pll_div    : EndProcedure
+Procedure.i DsiPhyHz()     : ProcedureReturn dsi_phy_hz     : EndProcedure
+Procedure.i DsiPixelHz()   : ProcedureReturn dsi_pixel_hz   : EndProcedure
+Procedure.i DsiEscHz()     : ProcedureReturn dsi_esc_hz     : EndProcedure
+Procedure.i DsiHtotal()    : ProcedureReturn dsi_htotal     : EndProcedure
+Procedure.i DsiHsyncS()    : ProcedureReturn dsi_hsync_s    : EndProcedure
+Procedure.i DsiHsyncE()    : ProcedureReturn dsi_hsync_e    : EndProcedure
+Procedure.i DsiPlanned()   : ProcedureReturn dsi_planned    : EndProcedure
+Procedure.i DsiIsUp()      : ProcedureReturn dsi_up         : EndProcedure
+Procedure.i DsiVideoIsOn() : ProcedureReturn dsi_video      : EndProcedure
+Procedure.i DsiXferCount() : ProcedureReturn dsi_xfers      : EndProcedure
+Procedure.i DsiXferFails() : ProcedureReturn dsi_xfer_fails : EndProcedure
+Procedure.i DsiLastInt()   : ProcedureReturn dsi_last_int   : EndProcedure
+Procedure.i DsiLastStat()  : ProcedureReturn dsi_last_stat  : EndProcedure
+Procedure.i DsiAfec0Want() : ProcedureReturn dsi_afec0_want : EndProcedure
+Procedure.i DsiAfec0Seen() : ProcedureReturn dsi_afec0_seen : EndProcedure
+Procedure.i DsiLastRxPkt() : ProcedureReturn dsi_last_rxpkt : EndProcedure
+Procedure.i DsiCtrlSeen()    : ProcedureReturn dsi_ctrl_seen    : EndProcedure
+Procedure.i DsiStatRelease() : ProcedureReturn dsi_stat_release : EndProcedure
+Procedure.i DsiStatSettled() : ProcedureReturn dsi_stat_settled : EndProcedure
+Procedure.i DsiUlpsRan()     : ProcedureReturn dsi_ulps_ran     : EndProcedure
+Procedure.i DsiUlpsEnter()   : ProcedureReturn dsi_ulps_enter   : EndProcedure
+Procedure.i DsiUlpsExit()    : ProcedureReturn dsi_ulps_exit    : EndProcedure
+Procedure.i DsiUlpsRc()      : ProcedureReturn dsi_ulps_rc      : EndProcedure
+Procedure.i DsiFsRan()       : ProcedureReturn dsi_fs_ran       : EndProcedure
+Procedure.i DsiFsPhycWas()   : ProcedureReturn dsi_fs_phyc_was  : EndProcedure
+Procedure.i DsiFsPhycBack()  : ProcedureReturn dsi_fs_phyc_back : EndProcedure
+Procedure.i DsiFsStat()      : ProcedureReturn dsi_fs_stat      : EndProcedure
+Procedure.i DsiFsRc()        : ProcedureReturn dsi_fs_rc        : EndProcedure

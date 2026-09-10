@@ -1,0 +1,974 @@
+; ======================================================================
+;  safety.pi4 - A PROGRAM THAT HANGS MUST STILL HAND THE BOARD BACK.
+; ======================================================================
+;
+;  This is RP2350/Lib/safety.pico2's design on different silicon. The
+;  names and the shape are deliberately identical - SafetyBoot(),
+;  SafetyOk(), SafetyPet(), SafetyPulse(), SafetyRequirePulse(),
+;  SafetyArmed(), SafetyOff() - so that a reader who knows one knows the
+;  other and a program can be ported by changing an include line.
+;
+;      XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+;
+;      Procedure Main()
+;        SafetyBoot()               ; FIRST line of Main()
+;        If UartInit(115200) = 0
+;          SafetyToFirmware()       ; a failure you can SEE from the host
+;        EndIf
+;        SafetyOk()                 ; we got somewhere real - clear the count
+;        SafetyRequirePulse(#SAFETY_SRC_APP, 30)
+;        Repeat
+;          SafetyPet()
+;          ; ... your work ...  and SafetyPulse(#SAFETY_SRC_APP) wherever
+;          ;                    the work produces an OBSERVABLE effect
+;        ForEver
+;      EndProcedure
+;
+;  DEPENDENCIES: NONE. This file includes no other library, per the house
+;  rule - a library never includes a library, the MAIN file lists what it
+;  needs. It reads two ARM system registers and one word of DRAM and
+;  touches no peripheral at all.
+;
+;  ==================================================================
+;   THE HARDWARE HALF LANDED 2026-08-25. HERE IS THE CITATION.
+;  ==================================================================
+;
+;  This file used to say the PM write was not here, because PM_RSTC's
+;  offset, PM_WDOG's offset and the password value were in no document
+;  in Datasheets/ - and an escape hatch built on a guessed bit position
+;  is worse than none, since it writes to a real powered block, does not
+;  fault, and does not reset.
+;
+;  That gap is closed, and it was closed by citing SOURCE rather than a
+;  datasheet, which is the route the PCIe and XHCI work took too:
+;
+;      Datasheets/pi4/uboot/v2025.01_bcm2835_wdt.c
+;      U-Boot v2025.01, drivers/watchdog/bcm2835_wdt.c
+;      compatible "brcm,bcm2835-pm", "brcm,bcm2835-pm-wdt"
+;
+;  That is not a third-party blog repeating a magic number. It is the
+;  driver inside the very loader printed on this board's console at
+;  every boot - "U-Boot 2025.01-3+deb13u1" - so these are the numbers
+;  demonstrably driving this exact silicon today.
+;
+;  Every constant, and the line it came from:
+;
+;      PM_RSTC                  0x1c         line 14
+;      PM_WDOG                  0x24         line 15
+;      PM_PASSWORD              0x5a000000   line 17
+;      PM_WDOG_MAX_TICKS        0x000fffff   line 22   (~15.999 s)
+;      PM_RSTC_WRCFG_CLR        0xffffffcf   line 23
+;      PM_RSTC_WRCFG_FULL_RESET 0x00000020   line 24
+;      PM_RSTC_RESET            0x00000102   line 25   (this STOPS it)
+;      MS_TO_WDOG_TICKS(x)      ((x) << 16) / 1000     line 27
+;
+;  The base was always citable and is unchanged:
+;
+;      watchdog@7e100000  ->  ARM physical $FE100000
+;      Datasheets/pi4/bcm2711.dtsi, node "pm: watchdog@7e100000",
+;      reg = <0x7e100000 0x114>, ...
+;
+;  THE TICK IS 1/65536 OF A SECOND, which is what MS_TO_WDOG_TICKS says
+;  read as (ms * 65536) / 1000. The counter is 20 bits, so the longest
+;  timeout the hardware can hold is 0xfffff ticks - a shade under 16
+;  seconds. Ask for more and you get 16: this file CLAMPS and reports
+;  it, because a 20-bit field silently truncating a 30-second request
+;  into 0.9 seconds is exactly the quiet wrong answer the rest of this
+;  file exists to prevent.
+;
+;  ARMING IS TWO WRITES AND BOTH ARE REQUIRED. Writing PM_WDOG alone
+;  loads the counter and nothing else; the reset only happens because
+;  PM_RSTC's WRCFG field says FULL_RESET. Read PM_RSTC, clear WRCFG with
+;  the CLR mask, OR in FULL_RESET, write it back with the password.
+;  Slamming a constant in instead of read-modify-write would clobber
+;  whatever else lives in that register - the sort of thing that works
+;  on this bench and fails on someone else's board.
+;
+;  STOPPING IS ONE WRITE of PM_PASSWORD | PM_RSTC_RESET. Note the name:
+;  in the driver "RESET" there means reset the WATCHDOG BLOCK, not the
+;  chip. Reading it the other way round produces a procedure called
+;  Stop that reboots the board, so it is worth the sentence.
+;
+;  AN IMMEDIATE RESET IS AN ARM WITH A TINY TIMEOUT. The driver's
+;  expire_now uses 10 ticks, about 150 microseconds, then waits. There
+;  is no "reset now" register: you light a fuse and let it burn.
+;  Anything that must reach the wire first - a UART drain above all -
+;  has to happen BEFORE the arm, never after.
+;
+;  ======================================================================
+;   THE FIVE THINGS THAT ARE NOT THE SAME AS RP2350/Lib/safety.pico2
+;  ======================================================================
+;
+;  1. THERE IS NO BOOTSEL. See above. SafetyToBootsel() is therefore NOT
+;     the name here - the procedure is SafetyToFirmware(), because a
+;     reader who greps for SafetyToBootsel on this target should find
+;     nothing rather than find a procedure that does something else.
+;
+;  2. THERE IS NO SCRATCH REGISTER. The RP2350 keeps the boot count in
+;     WATCHDOG_SCRATCH0, a register the silicon preserves across a
+;     watchdog reset, and three paragraphs of that file are about which
+;     scratch registers the bootrom owns. THIS PART HAS NO EQUIVALENT
+;     THIS FILE CAN CITE. The PM block has scratch-like registers; they
+;     are in the same undocumented space as PM_RSTC.
+;
+;     So the count lives in A WORD OF DRAM:
+;
+;         #SAFETY_COUNT_ADDR = $00001000
+;
+;     WHY THAT ADDRESS. It is the only place in the map that nothing
+;     claims. Working from anvil.pi4's memory map, which is measured
+;     from U-Boot's own bdinfo on this board:
+;
+;         $00000000..$00000FFF  firmware spin table and the secondary
+;                               cores' release mailboxes   DO NOT TOUCH
+;         $00001000..$000FFFFF  the monitor's stack, growing DOWN from
+;                               $00100000
+;         $00200000..$003FFFFF  the monitor image and its BSS
+;         $00400000..$07EFFFFF  payload window - loaders write here
+;         $40000000..$FBFFFFFF  payload window - loaders write here
+;
+;     $00001000 is the first word ABOVE the firmware's spin table and the
+;     BOTTOM of a stack corridor that grows down from a megabyte above
+;     it. Reaching it would need ~1 MiB of live frames, and this
+;     language allocates procedure locals STATICALLY - the stack carries
+;     little more than link registers. No loader window covers it. A
+;     payload built for $200000 has its BSS at $280000 (#A64_BSS_GAP is
+;     512 KiB above the load base), nowhere near.
+;
+;     IT CANNOT BE A GLOBAL. _start zeroes the whole of .bss before
+;     calling main - read from the emitted assembly, the __a64_bss_zero
+;     loop - so a Global here would be 0 on every boot and the ladder
+;     would have no rungs. That is why this one value is poked into raw
+;     DRAM when everything else in this file is an ordinary variable.
+;
+;  3. WHETHER THE COUNT SURVIVES A RESET IS UNVERIFIED, AND THAT IS THE
+;     HONEST STATE OF IT. On the RP2350 the datasheet says in as many
+;     words which reset preserves the scratch registers. Here the reset
+;     goes all the way back to the firmware, which re-runs, re-trains and
+;     re-initialises DRAM and reloads the image from the boot medium.
+;     WHETHER $00001000 STILL HOLDS WHAT WE WROTE ON THE OTHER SIDE OF
+;     THAT IS A QUESTION ONLY THE BOARD CAN ANSWER.
+;
+;     THE DEGRADATION IS SAFE AND IT ANNOUNCES ITSELF. If the word does
+;     not survive, every boot reads no magic, counts as boot 1, and the
+;     ladder simply never climbs: the board never escapes by itself, and
+;     it also never parks a healthy board by mistake. SafetyBoot()
+;     RETURNS THE BOOT NUMBER for exactly this reason - print it. If a
+;     board that has just reset itself reports boot 1, the word did not
+;     survive and you have learned something the documents cannot tell
+;     you.
+;
+;  4. THE LADDER CANNOT TELL A HANG FROM A POWER-ON, so SafetyOk() is
+;     not optional here - it is load-bearing.
+;
+;     The RP2350 gates the count on WATCHDOG_REASON: "only a
+;     WATCHDOG-FIRED restart adds to that count ... without it, a quick
+;     replug or a supply that bounced during the ramp arrives here as
+;     'boot two' and parks a healthy board." THE BCM2711's RESET-REASON
+;     REGISTER IS PM_RSTS, WHICH IS IN THE SAME UNDOCUMENTED BLOCK as
+;     everything else above, so there is no gate to apply.
+;
+;     Consequence, stated plainly: EVERY boot increments the count -
+;     power-on, reset button, warm restart, all of them. A program that
+;     never reaches SafetyOk() therefore spends its allowance on
+;     ordinary reruns and not just on hangs. Call SafetyOk() as soon as
+;     the program has genuinely got somewhere, which is the same advice
+;     as on the RP2350 and matters more here.
+;
+;  5. SafetyPet() DOES NOT FEED ANYTHING.
+;
+;     CORRECTED 2026-08-27, and the correction narrows the claim rather
+;     than reversing it. This note used to say "There is no armed
+;     watchdog for it to reload", which stopped being true on
+;     2026-08-25 when the PM half landed - THERE IS ONE, and Anvil arms
+;     it around every payload. What is still true, and is the actual
+;     point, is that SafetyPet() DOES NOT RELOAD IT: the arm/stop pair
+;     lives in the caller, this file never re-arms from inside a loop,
+;     and nothing in the API reloads a running counter. So on a healthy
+;     program SafetyPet() is very nearly a no-op, for a different reason
+;     than the one written here.
+;
+;     THE PRACTICAL CONSEQUENCE, and it is worth being blunt about
+;     because the old wording hid it: a payload that runs longer than
+;     the armed deadman IS RESET WHILE HEALTHY. Anvil's ceiling is about
+;     16 seconds. Calling SafetyPet() in the loop does not extend that
+;     and was never going to.
+;
+;     It is still the right call to keep in every long loop, for two
+;     reasons that survive all of the above: it is where the liveness
+;     contract is EVALUATED, and it is what writes the ladder forward
+;     when the contract refuses - so the report a starved program can
+;     make, and the escape it will make the day the PM write lands, both
+;     depend on it already being in the loop. Do not remove it "because
+;     it does nothing"; it does the accounting, and the accounting is the
+;     part that has to already be right.
+;
+;  ======================================================================
+;   THE LIVENESS CONTRACT - A RELOAD HAS TO BE EARNED
+;  ======================================================================
+;
+;  Carried over whole from the RP2350 file, including the reason it
+;  exists, because the reason is about software and not about silicon.
+;
+;  WHAT WENT WRONG, 2026-08-14, on the RP2350. A TCP instrument wedged:
+;  USB still enumerated but accepting no writes at all, and the radio
+;  disassociated. Every way in was shut. And the main loop KEPT CALLING
+;  SafetyPet(), so the watchdog never fired and the board never escaped.
+;  The escape hatch kept the corpse warm.
+;
+;  The defect is not in the watchdog. It is in what SafetyPet() MEANS.
+;  "This line of code was reached" is a far weaker claim than anybody
+;  reads it as. A loop that has lost every output it exists to produce
+;  still reaches its own instructions perfectly well.
+;
+;  So a pet can be made CONDITIONAL:
+;
+;      SafetyRequirePulse(#SAFETY_SRC_APP | #SAFETY_SRC_RADIO, 30)
+;
+;  means: from now on, a pet is granted only if, within the last 30
+;  seconds, at least ONE of the named sources reported an effect.
+;  Sources are OR-ed deliberately - losing ALL of them is what means
+;  dead.
+;
+;  WHAT COUNTS AS A PULSE MUST BE AN EFFECT, NOT AN INTENTION.
+;  SafetyPulse() belongs where a write DRAINED, where an association was
+;  confirmed, where the counter that proves progress actually moved -
+;  never where one was merely queued. A pulse on "I called the write
+;  function" measures what SafetyPet() already measured and buys nothing.
+;
+;  THE THREE SOURCE NAMES ARE THE RP2350's, kept for portability rather
+;  than renamed to suit this board. On a Pi 4 the natural readings are:
+;
+;      #SAFETY_SRC_USB    a byte actually left the UART, or a host write
+;                         drained - anything the far end demonstrably took
+;      #SAFETY_SRC_RADIO  a link this program depends on is up
+;      #SAFETY_SRC_APP    an application progress marker advanced
+;
+;  It is a bitmask and the meanings are yours; what is NOT yours is the
+;  rule that a pulse marks an EFFECT.
+;
+;  IT IS OPT-IN. With no SafetyRequirePulse() call the mask is zero and
+;  SafetyPet() behaves exactly as it did before. Every existing program
+;  is untouched.
+;
+;  ======================================================================
+;   THE TIME BASE - CNTPCT_EL0, AND WHY NOT A SPIN COUNT
+;  ======================================================================
+;
+;  The staleness window is in SECONDS, so this file needs a clock that is
+;  running before anything has been initialised - including on the
+;  failure paths, which is where a safety library spends its interesting
+;  moments.
+;
+;  CNTPCT_EL0 IS THAT CLOCK. It is the ARMv8-A architectural physical
+;  counter, readable at EL2 with no trap and no setup, and CNTFRQ_EL0
+;  gives its frequency. Both are lifted verbatim from anvil.pi4's
+;  Ticks()/TickHz(), which is the silicon-proven form on this board. This
+;  is deliberately NOT the BCM2711 system timer at 0x7e003000: that is a
+;  peripheral, it is in the MMIO aperture, and a safety library should
+;  not need the peripheral bus to be working in order to decide that the
+;  peripheral bus is not working.
+;
+;  A SPIN COUNT WOULD NOT DO. It would have to be calibrated against a
+;  CPU frequency the firmware is free to change underneath us, and "30
+;  seconds" would quietly become forty on a board that thermally
+;  throttled.
+;
+;  CNTFRQ_EL0 IS TAKEN ON TRUST WITH A SANITY CHECK. It is a register the
+;  firmware writes and nothing enforces; the monitor already treats an
+;  implausible value as 54 MHz, which is what this board reports, and
+;  this file does the same. A wrong frequency does not break anything
+;  structurally - it stretches or compresses the staleness window - but
+;  it would make the window a lie, so the fallback is a named constant
+;  and not a magic number in a branch.
+;
+;  DELTAS, NEVER RAW COMPARISONS. Every interval here is taken between
+;  consecutive reads. Under the 64-bit model that is merely correct;
+;  under the 32-bit model it is what makes this file work AT ALL, because
+;  a 64-bit counter truncated into a 32-bit .i wraps every ~79 seconds at
+;  54 MHz. A negative delta is treated as "no time passed", which loses
+;  at most one wrap's worth of accounting and never invents 79 seconds of
+;  staleness. Comparing raw timestamps instead is the defect that passes
+;  every bench test and fails on a soak.
+;
+;  ======================================================================
+;   CITATIONS
+;  ======================================================================
+;   $FE100000            the PM / watchdog block base. bcm2711.dtsi,
+;                        "pm: watchdog@7e100000", reg = <0x7e100000
+;                        0x114>. Bus $7Ennnnnn -> ARM $FEnnnnnn.
+;                        ~~NOTHING IN THIS FILE WRITES TO IT.~~ STALE
+;                        since 2026-08-25: the hardware half landed that
+;                        day and SafetyWatchdogStart/Stop write PM_WDOG
+;                        and PM_RSTC here. See THE HARDWARE HALF LANDED
+;                        at the top, which is the section that replaced
+;                        it - this line is one of two that were left
+;                        behind when it did.
+;   CNTPCT_EL0/CNTFRQ_EL0  ARMv8-A architectural registers. Not BCM2711
+;                        registers and not in any Broadcom document.
+;                        Copied from anvil.pi4.
+;   the memory map       anvil.pi4's MEMORY MAP section, which
+;                        records U-Boot's own bdinfo measured on THIS
+;                        board.
+;   .bss is zeroed       the __a64_bss_zero loop in the emitted _start,
+;                        read out of RaspberryPi4/Monitor/anvil.img.asm.
+;
+;   NOT CITED AND THEREFORE NOT PRESENT: PM_RSTC, PM_WDOG, PM_RSTS, the
+;   PM password, and every bit position inside them.
+;
+;  ======================================================================
+;   WHAT HAS BEEN TESTED
+;  ======================================================================
+;   THE WATCHDOG HALF RUNS ON THIS BOARD. THE BOOT-COUNT LADDER DOES
+;   NOT. Two halves, two different states, and the single sentence that
+;   used to be here - "NOTHING IN THIS FILE HAS RUN ON SILICON" - could
+;   not carry both once the PM write landed on 2026-08-25.
+;
+;   ---- WHAT RUNS, AND WHERE -----------------------------------------
+;
+;   SafetyWatchdogStart() AND SafetyWatchdogStop() ARE ANVIL'S DEADMAN.
+;   RaspberryPi4/Monitor/anvil.pi4:1792-1805 arms the PM watchdog
+;   immediately before jumping into a payload and stops it immediately
+;   after the payload returns - the only window in which a hang is
+;   expected. Leaving it armed at the prompt would reboot the board
+;   while somebody was reading the last dump. That path has run on
+;   silicon repeatedly since 2026-08-26, and the vault records it
+;   behaving on that day's GENET runs: "armed on entry, stopped on
+;   return". SafetyWatchdogTicks() is read back and printed.
+;
+;   THE CLAMP IS REAL AND VISIBLE. The counter is 20 bits at 65536/s, so
+;   the ceiling is ~15.999 s; `deadman 30` is accepted, clamped, and
+;   REPORTED AS 15 - the floor, never the request - because a deadman
+;   that fires earlier than it said it would is worse than none.
+;
+;   SafetyBoot() IS COMPILED INTO ANVIL AND IS NEVER CALLED BY IT. The
+;   monitor includes this file for its PM half only and says so at its
+;   own include line, because #SAFETY_COUNT_ADDR = $00001000 sits inside
+;   the window Anvil calls its stack. So the ladder has been BUILT into
+;   a booting image many times and EXECUTED never.
+;
+;   ---- WHAT HAS NEVER BEEN WITNESSED, and this is the one that
+;        matters, because the whole file is an escape hatch -----------
+;
+;   NO WATCHDOG RESET HAS EVER BEEN SEEN TO FIRE ON THIS BOARD. Arm and
+;   stop are proven; EXPIRY IS NOT. The one hang on this bench that
+;   needed it - 2026-08-26, pi4FbAsk built without --entry-returns and
+;   running off its own end - was the run where the deadman had NOT been
+;   armed, so a recoverable hang became a power cycle and a request to a
+;   human. The rescue path had been built earlier the same day, by the
+;   same session, specifically so that hangs would not need hands, and
+;   then went unused.
+;
+;   That is a live gap rather than a footnote. U-Boot is gone from the
+;   stick and cannot be chainloaded, so THERE IS NO RECOVERY PATH ON
+;   THIS BOARD THAT DOES NOT INVOLVE PHYSICAL ACCESS, and every bit of
+;   that cover rests on an expiry nobody has watched happen.
+;
+;   THE RUN THAT WOULD SETTLE IT is cheap, deliberate and settles the
+;   other open question at the same time: print SafetyBoot()'s return
+;   value, type `deadman 5`, run a payload that hangs on purpose
+;   (RaspberryPi4/Examples/Diagnostics/pi4Hang.pi4), and time the reset.
+;   Five seconds later the board should come back through the firmware
+;   on its own - and the first thing the next boot prints answers note 3
+;   above as well.
+;
+;   ---- AND THE MEASUREMENT ONLY HARDWARE CAN MAKE -------------------
+;
+;   Does $00001000 still hold the magic after a reset back through the
+;   firmware? Unanswered. See note 3; everything in it turns on that one
+;   number, and the run described just above produces it for free.
+;
+;   ---- WHAT WAS ESTABLISHED BEFORE ANY OF IT RAN --------------------
+;
+;   It builds clean, with no warnings, under BOTH the 32-bit pmfc.exe
+;   this file was started against and the 64-bit one that landed while it
+;   was being written (2026-08-24, ~20:58). The emitted assembly was read
+;   under the 64-bit build and confirms:
+;
+;     * the boot-count word at $00001000 is "ldr w" / "str w" - a
+;       32-BIT access. On the 64-bit model a bare Peek/Poke here would
+;       have been eight bytes and would have stamped on $00001004 as
+;       well, which nothing would have noticed.
+;     * safety_Ticks() and safety_TickHz() emit "mrs x0, cntpct_el0" and
+;       "mrs x0, cntfrq_el0" with nothing between them and the return -
+;       the whole 64-bit counter, the same form as anvil.pi4.
+;     * the magic is $5A1E0000 at every one of the seven sites that
+;       touch the word, and SafetyPet()'s starvation write is
+;       $5A1E0001 = magic | (#SAFETY_MAXBOOTS - 1).
+;     * the frequency guard's two bounds assemble to 54000000 and
+;       1000000000.
+;
+;   That is reading, not running - and it is still all the evidence the
+;   BOOT-COUNT half has, three days on.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  The boot-count word. A 32-bit DRAM location - see note 2.
+;
+;  PeekL/PokeL, NEVER a bare Peek/Poke: .i is EIGHT bytes on this target,
+;  so a bare one would read and write eight bytes here and stamp on
+;  $00001004 as well. Nothing else is known to live there, which is
+;  precisely why nobody would notice.
+; ----------------------------------------------------------------------
+#SAFETY_COUNT_ADDR = $00001000
+
+; Marks OUR counter, so a word left holding something else - and after a
+; firmware reload that word could hold anything at all - is not mistaken
+; for a boot count. Same magic as the RP2350 twin, on purpose.
+#SAFETY_MAGIC = $5A1E0000
+
+; Boots without reaching health before handing the board back. 2 means:
+; one free retry (a flaky first boot is common), then out.
+#SAFETY_MAXBOOTS = 2
+
+; The PM / watchdog block. USED, as of 2026-08-25 - see the top of this
+; file for the citation behind every offset below.
+#SAFETY_PM_BASE = $FE100000
+
+; PM / watchdog registers, all of them from
+; Datasheets/pi4/uboot/v2025.01_bcm2835_wdt.c - see the header.
+#SAFETY_PM_RSTC        = $1C            ; offset from #SAFETY_PM_BASE
+#SAFETY_PM_WDOG        = $24
+#SAFETY_PM_PASSWORD    = $5A000000      ; required in the top byte of
+                                        ; EVERY write to this block
+#SAFETY_WDOG_MAX_TICKS = $000FFFFF      ; 20 bits, ~15.999 s
+#SAFETY_RSTC_WRCFG_CLR = $FFFFFFCF      ; clears the WRCFG field
+#SAFETY_RSTC_FULL      = $00000020      ; WRCFG = full reset
+#SAFETY_RSTC_STOP      = $00000102      ; stops the WATCHDOG, not the chip
+#SAFETY_WDOG_EXPIRE    = 10             ; ~150 us, the driver expire_now
+#SAFETY_WDOG_HZ        = 65536          ; ticks per second
+
+; CNTFRQ_EL0 fallback, and the range outside which it is not believed.
+; 54 MHz is what this board reports; the bounds are the same shape as
+; anvil.pi4's.
+#SAFETY_HZ_FALLBACK = 54000000
+#SAFETY_HZ_MAX      = 1000000000
+
+; Pulse sources. A bitmask, so an instrument names the ones it has.
+#SAFETY_SRC_USB   = 1     ; a write DRAINED - the far end took the bytes
+#SAFETY_SRC_RADIO = 2     ; a link this program depends on is up
+#SAFETY_SRC_APP   = 4     ; an application progress marker advanced
+
+Global safety_hz.i            ; counter frequency, 0 until first read
+Global safety_last_t.i        ; last raw counter value, for the delta
+Global safety_accum_t.i       ; sub-second remainder, in ticks
+Global safety_now_s.i         ; monotonic seconds since the first read
+
+Global safety_req_mask.i      ; which sources are required; 0 = contract off
+Global safety_req_secs.i      ; how stale a pulse may be and still count
+Global safety_pulse_usb.i     ; seconds-stamp of the last pulse, per source
+Global safety_pulse_radio.i
+Global safety_pulse_app.i
+
+Global safety_starved.i       ; 1 once a pet has been REFUSED
+Global safety_wdog_ticks.i    ; last armed timeout in 1/65536 s; 0 means
+                              ; we have never armed it
+Global safety_wdog_on.i       ; 1 while we believe it is counting
+Global safety_escape.i        ; 1 once an escape has been asked for and
+                              ; could not be performed
+
+; ======================================================================
+;  The clock. Two instructions each, copied from anvil.pi4.
+; ======================================================================
+
+Procedure.i safety_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i safety_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  safety_Tick() - advance the monotonic seconds counter. Internal.
+;
+;  Lazily establishes the frequency, so every public entry point below
+;  can call this without anybody having had to initialise anything. That
+;  matters: SafetyPulse() may legitimately be the first call a failure
+;  path makes, before SafetyBoot() on a program that got the ordering
+;  wrong, and dividing by a zero frequency there would turn a diagnostic
+;  into a fault.
+; ----------------------------------------------------------------------
+Procedure safety_Tick()
+  Define t.i
+  Define d.i
+
+  If safety_hz <= 0
+    safety_hz = safety_TickHz()
+    If safety_hz <= 0 Or safety_hz > #SAFETY_HZ_MAX
+      safety_hz = #SAFETY_HZ_FALLBACK
+    EndIf
+    ; Prime the delta so the first interval is measured from HERE and not
+    ; from zero. Without this the first call would see the whole counter
+    ; as elapsed time and jump the seconds counter by years.
+    safety_last_t = safety_Ticks()
+    ProcedureReturn 0
+  EndIf
+
+  t = safety_Ticks()
+  d = t - safety_last_t
+  safety_last_t = t
+  ; A negative delta is the 32-bit model's counter wrapping (see THE TIME
+  ; BASE in the header). Treat it as no time passed rather than as a
+  ; hundred years.
+  If d < 0
+    d = 0
+  EndIf
+  safety_accum_t = safety_accum_t + d
+  While safety_accum_t >= safety_hz
+    safety_accum_t = safety_accum_t - safety_hz
+    safety_now_s = safety_now_s + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyNow() - monotonic seconds since this library first looked at the
+;  clock. A bench instrument: it is what makes a starvation report
+;  readable ("no pulse for 41 s") instead of a bare verdict.
+; ----------------------------------------------------------------------
+Procedure.i SafetyNow()
+  safety_Tick()
+  ProcedureReturn safety_now_s
+EndProcedure
+
+; ======================================================================
+;  The escape.
+; ======================================================================
+
+; ======================================================================
+;  The watchdog. Three primitives and one escape, all on the PM block.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  safety_WdogArm - the two writes, exactly as the driver does them.
+;  Internal: callers use SafetyWatchdogStart/Pet or SafetyToFirmware.
+; ----------------------------------------------------------------------
+Procedure safety_WdogArm(ticks.i)
+  Define cur.i
+  PokeL(#SAFETY_PM_BASE + #SAFETY_PM_WDOG, #SAFETY_PM_PASSWORD | (ticks & #SAFETY_WDOG_MAX_TICKS))
+  ; READ-MODIFY-WRITE, not a slam. WRCFG is a field inside PM_RSTC and
+  ; the other bits belong to someone else.
+  cur = PeekN(#SAFETY_PM_BASE + #SAFETY_PM_RSTC) & $FFFFFFFF
+  PokeL(#SAFETY_PM_BASE + #SAFETY_PM_RSTC, #SAFETY_PM_PASSWORD | (cur & #SAFETY_RSTC_WRCFG_CLR) | #SAFETY_RSTC_FULL)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyWatchdogTicks(seconds) - seconds to ticks, CLAMPED, and the
+;  clamp is visible to the caller because it returns what it will
+;  actually use rather than what it was asked for.
+;
+;  Multiply before the shift is not an option here: seconds * 65536 for
+;  any sane input is far inside 64 bits on this target, so this is the
+;  simple form and there is nothing to lose to overflow. On a 32-bit
+;  backend it would need care; this is the Pi 4 and .i is 64 bits.
+; ----------------------------------------------------------------------
+Procedure.i SafetyWatchdogTicks(seconds.i)
+  Define t.i
+  If seconds < 1
+    ProcedureReturn #SAFETY_WDOG_EXPIRE
+  EndIf
+  t = seconds * #SAFETY_WDOG_HZ
+  If t > #SAFETY_WDOG_MAX_TICKS
+    t = #SAFETY_WDOG_MAX_TICKS
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyWatchdogStart(seconds) - arm it. Returns the seconds it will
+;  ACTUALLY wait, which is not always what was asked: the hardware
+;  cannot hold more than ~16 s, and a caller that asked for 60 needs to
+;  find that out from the return value rather than from a reboot.
+;
+;  From here the board reboots after that long unless something calls
+;  SafetyWatchdogPet() or SafetyWatchdogStop(). That is the whole point,
+;  and it is also the whole danger: arm this and then sit at a prompt
+;  and the board will reset underneath you.
+; ----------------------------------------------------------------------
+Procedure.i SafetyWatchdogStart(seconds.i)
+  safety_wdog_ticks = SafetyWatchdogTicks(seconds)
+  safety_wdog_on = 1
+  safety_WdogArm(safety_wdog_ticks)
+  ProcedureReturn safety_wdog_ticks / #SAFETY_WDOG_HZ
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyWatchdogPet() - restart the countdown at the last armed value.
+;  Returns 0 and does nothing if it was never started, because petting a
+;  watchdog that is not running should not quietly start one.
+; ----------------------------------------------------------------------
+Procedure.i SafetyWatchdogPet()
+  If safety_wdog_on = 0
+    ProcedureReturn 0
+  EndIf
+  safety_WdogArm(safety_wdog_ticks)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyWatchdogStop() - stop the watchdog. Does NOT reset the chip;
+;  see the note on PM_RSTC_RESET's name in the header.
+; ----------------------------------------------------------------------
+Procedure SafetyWatchdogStop()
+  PokeL(#SAFETY_PM_BASE + #SAFETY_PM_RSTC, #SAFETY_PM_PASSWORD | #SAFETY_RSTC_STOP)
+  safety_wdog_on = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyWatchdogRunning() - 1 if we armed it and have not stopped it.
+;
+;  BELIEF, NOT MEASUREMENT, and the name would be a lie if it claimed
+;  otherwise. Nothing here reads the counter back: PM_RSTC's WRCFG field
+;  says what WILL happen on expiry, not whether anything is counting,
+;  and the PM block has no citable "is it running" bit in the source
+;  this file is built on. If you need proof, the proof is a reboot.
+; ----------------------------------------------------------------------
+Procedure.i SafetyWatchdogRunning()
+  ProcedureReturn safety_wdog_on
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyToFirmware() - hand the board back, from running code.
+;
+;  RETURNS 0 TODAY, AND THAT RETURN IS THE POINT. Its RP2350 counterpart
+;  SafetyToBootsel() does not return, and this one will not either the
+;  day the PM sequence at $FE100000 can be written from a citation. Until
+;  then there is no mechanism, so it reports that rather than pretending.
+;
+;  WHY IT DOES NOT PARK. Parking in a loop would match the "does not
+;  return" contract and would be the wrong thing by a distance: with no
+;  reset behind it the park is a permanent wedge, on a board whose only
+;  recovery is then a human at the mains. The RP2350 file has a whole
+;  ruling about exactly this - a park with no backstop wedged a board on
+;  2026-08-18 and cost the physical button. Here EVERY park would be that
+;  park. So this returns, the caller decides, and a program that wants to
+;  stop can stop for its own reasons rather than because a library
+;  decided to.
+;
+;  WHAT IT DOES DO:
+;    * clears the boot counter. A deliberate escape knows the previous
+;      run was not a hang, and whatever runs next deserves a clean slate.
+;      This is the same rule as the RP2350 twin, which learned it the
+;      hard way (tid 424): a counter left loaded by an escape that ran
+;      before SafetyOk() was found by the NEXT image's first boot, and
+;      that image parked before running a line - which on the bench read
+;      as "it needed flashing twice", with nothing in any log.
+;    * records that an escape was WANTED, so SafetyEscapeWanted() can be
+;      printed. On a board with no automatic route home, a program that
+;      says "I decided I was dead and could not leave" is worth a great
+;      deal more than one that just stops.
+; ----------------------------------------------------------------------
+Procedure.i SafetyToFirmware()
+  PokeL(#SAFETY_COUNT_ADDR, 0)
+  safety_escape = 1
+
+  ; THE FUSE. Arm with the driver's expire_now timeout - 10 ticks, about
+  ; 150 microseconds - and then do nothing at all until it burns.
+  ;
+  ; CALLERS MUST DRAIN THE UART BEFORE CALLING THIS. There is no "reset
+  ; now" register to write, so there is no moment after this line where
+  ; a last message could still be pushed out; the loop below is not
+  ; allowed to do anything except wait. A byte still in the PL011 FIFO
+  ; when the chip resets is a byte nobody ever sees, and the last line
+  ; before a reset is usually the one that mattered.
+  safety_wdog_ticks = #SAFETY_WDOG_EXPIRE
+  safety_wdog_on = 1
+  safety_WdogArm(#SAFETY_WDOG_EXPIRE)
+
+  ; This procedure DOES NOT RETURN, unlike every previous build of it.
+  ; The old one returned 0 because there was nothing it could do; this
+  ; one has lit the fuse, and returning would let the caller run on for
+  ; 150 microseconds of undefined usefulness first.
+  Repeat
+  ForEver
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyEscapeWanted() - has anything asked to leave? 1 or 0.
+; ----------------------------------------------------------------------
+Procedure.i SafetyEscapeWanted()
+  ProcedureReturn safety_escape
+EndProcedure
+
+; ======================================================================
+;  The ladder.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  SafetyBoot() - call FIRST in Main(). Returns the boot number, 1 on a
+;  clean start.
+;
+;  PRINT THE RETURN VALUE. It is the only way to find out whether the
+;  count survives a reset on this part (note 3 in the header), and it
+;  costs one line.
+;
+;  NOTE WHAT IS MISSING COMPARED TO THE RP2350: there is no
+;  WATCHDOG_REASON gate, because PM_RSTS is not citable (note 4). Every
+;  boot counts. That makes SafetyOk() mandatory rather than advisable.
+;
+;  AND NOTE WHAT HAPPENS AT THE LIMIT. On the RP2350, reaching
+;  #SAFETY_MAXBOOTS means the program does not run at all - the board
+;  goes to BOOTSEL before a line executes, and the check cannot be
+;  skipped by whatever hung last time. Here SafetyToFirmware() cannot
+;  actually leave, so this DOES run the program anyway, having recorded
+;  that it wanted out.
+;
+;  THAT INVERSION IS DELIBERATE AND IT IS THE LESSER EVIL. Refusing to
+;  run with nowhere to go leaves a board that is permanently dead and
+;  silent - it cannot even tell you why - whereas running gives the
+;  program a chance to reach its console and say "boot 2, no escape
+;  available". The moment SafetyToFirmware() can genuinely reset, this
+;  path stops returning and the RP2350's behaviour is restored with no
+;  other change. Do not "fix" the inversion before then.
+; ----------------------------------------------------------------------
+Procedure.i SafetyBoot()
+  Define n.i
+  Define cnt.i
+
+  safety_Tick()                  ; establish the clock before anything else
+
+  n = PeekN(#SAFETY_COUNT_ADDR)
+  If (n & $FFFF0000) = #SAFETY_MAGIC
+    cnt = n & $FFFF
+  Else
+    ; No magic. Either a genuine first boot, or the word did not survive
+    ; the firmware reload, and this file cannot tell those apart - see
+    ; note 3. Both mean "start the ladder".
+    cnt = 0
+  EndIf
+  cnt = cnt + 1
+  PokeL(#SAFETY_COUNT_ADDR, #SAFETY_MAGIC | cnt)
+
+  ; ==================================================================
+  ;  THE AUTOMATIC ESCAPE LADDER WAS REMOVED 2026-08-28, BY
+  ;  INSTRUCTION. DO NOT PUT IT BACK.
+  ;
+  ;  In words: "theres a deadman or watchdog for this reason, you dont
+  ;  prevent a upload of new firmware over hangs", and "on all the
+  ;  boards, I didnt ask for it and all its going to do is break
+  ;  development for thousands of people".
+  ;
+  ;  It counted boots and, past the limit, handed the board to the
+  ;  bootloader on its own. The count lives in a word that survives a
+  ;  reset, so FLASHING DID NOT CLEAR IT: once tripped, the next image
+  ;  booted, the count rose again, and the board went straight back.
+  ;  A known-good build would vanish with nothing printed, and the
+  ;  obvious conclusion was that your own code was broken. That happened
+  ;  on a Pico 2 W during the session this was removed in.
+  ;
+  ;  THE WATCHDOG ALREADY COVERS A HANG - that is its whole job, and it
+  ;  does it without deciding for you that your program should stop
+  ;  running. The explicit escape below remains and is unchanged: a
+  ;  program that WANTS to hand the board back says so, in one visible
+  ;  line, where a reader can find it.
+  ;
+  ;  The counter is still maintained and still readable, so a program
+  ;  can look at it and decide for itself. Nothing acts on it here.
+  ; ==================================================================
+
+  ProcedureReturn cnt
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyOk() - call once the program has demonstrably got somewhere
+;  real. Clears the boot counter.
+;
+;  NOT OPTIONAL DECORATION, and on this part less optional than on the
+;  RP2350 - see note 4. It is what tells the ladder the difference
+;  between a boot that worked and a boot that did not, and with no
+;  reset-reason gate underneath it, a program that never calls it climbs
+;  the ladder on ordinary reruns.
+;
+;  A counter never cleared eventually reports a healthy board as failing.
+;  A counter cleared too early protects nothing. "The console printed its
+;  banner" is usually the right moment.
+; ----------------------------------------------------------------------
+Procedure SafetyOk()
+  PokeL(#SAFETY_COUNT_ADDR, 0)
+EndProcedure
+
+; ======================================================================
+;  The liveness contract.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  SafetyPulse(source) - record that something OBSERVABLE just happened.
+;
+;  Call it at the point of EFFECT. Harmless and nearly free when no
+;  contract is armed.
+; ----------------------------------------------------------------------
+Procedure SafetyPulse(source.i)
+  safety_Tick()
+  If (source & #SAFETY_SRC_USB) <> 0
+    safety_pulse_usb = safety_now_s
+  EndIf
+  If (source & #SAFETY_SRC_RADIO) <> 0
+    safety_pulse_radio = safety_now_s
+  EndIf
+  If (source & #SAFETY_SRC_APP) <> 0
+    safety_pulse_app = safety_now_s
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyRequirePulse(mask, seconds) - arm the contract.
+;
+;  Pass every source the instrument can genuinely produce. mask = 0
+;  disarms and restores the unconditional pet.
+;
+;  EVERY NAMED SOURCE IS STAMPED FRESH AT THE MOMENT OF ARMING, so the
+;  window starts now. Without that, arming a 30 second contract on a
+;  program whose link comes up 40 seconds later would condemn the board
+;  during its own bring-up - a self-inflicted wound that looks exactly
+;  like the bug this exists to catch.
+;
+;  CHOOSING `seconds`: comfortably LONGER than the slowest legitimate gap
+;  between pulses, and comfortably SHORTER than the time you are willing
+;  to leave a wedged board sitting there.
+;
+;  ON THE RP2350 THIS HAD AN ORDERING TRAP - it had to be called after
+;  clock bring-up or the time base was frozen and every source looked
+;  permanently fresh. THAT TRAP DOES NOT EXIST HERE. CNTPCT_EL0 is
+;  running before any of this program did, and needs no ticks block, no
+;  divider and no enable. Call it wherever it reads best.
+; ----------------------------------------------------------------------
+Procedure SafetyRequirePulse(mask.i, seconds.i)
+  safety_Tick()
+  safety_req_mask = mask
+  safety_req_secs = seconds
+  safety_starved = 0
+  If (mask & #SAFETY_SRC_USB) <> 0
+    safety_pulse_usb = safety_now_s
+  EndIf
+  If (mask & #SAFETY_SRC_RADIO) <> 0
+    safety_pulse_radio = safety_now_s
+  EndIf
+  If (mask & #SAFETY_SRC_APP) <> 0
+    safety_pulse_app = safety_now_s
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyLive() - would a pet be granted right now? 1 yes, 0 no.
+;
+;  Separate from SafetyPet() so an instrument can PRINT the verdict on
+;  the way past without changing it. A board that is about to let itself
+;  be given up on should say so first, while it still can.
+; ----------------------------------------------------------------------
+Procedure.i SafetyLive()
+  If safety_req_mask = 0
+    ProcedureReturn 1
+  EndIf
+  safety_Tick()
+  If (safety_req_mask & #SAFETY_SRC_USB) <> 0
+    If (safety_now_s - safety_pulse_usb) <= safety_req_secs
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If (safety_req_mask & #SAFETY_SRC_RADIO) <> 0
+    If (safety_now_s - safety_pulse_radio) <= safety_req_secs
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If (safety_req_mask & #SAFETY_SRC_APP) <> 0
+    If (safety_now_s - safety_pulse_app) <= safety_req_secs
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyStarved() - has a pet ever been refused on this boot? 1 or 0.
+;
+;  A bench instrument: it lets a program report that it is dying and why,
+;  in the time it has left.
+; ----------------------------------------------------------------------
+Procedure.i SafetyStarved()
+  ProcedureReturn safety_starved
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyPet() - call regularly inside any long-running loop.
+;
+;  ON THE RP2350 THIS RELOADS A HARDWARE WATCHDOG. HERE THERE IS NONE TO
+;  RELOAD - see note 5 - so on a healthy program this does the
+;  bookkeeping and returns. Keep calling it anyway: it is where the
+;  contract is evaluated, and it is what writes the ladder forward when
+;  the contract refuses.
+;
+;  A REFUSED PET REVOKES THIS BOOT'S HEALTHY VERDICT. Do not remove that:
+;  without it the contract turns a wedge into an ENDLESS RESET LOOP
+;  instead of an escape, and the board never reaches safety.
+;
+;  MEASURED ON SILICON, 2026-08-14, on the RP2040 twin of this design.
+;  The proof image armed the contract, stopped pulsing, and the watchdog
+;  fired exactly as designed - and then the board came back, ran,
+;  starved, and reset again, for ever. It never escalated. The cause is
+;  that SafetyOk() and this mechanism disagree about what a boot is:
+;  every instrument calls SafetyOk() ONCE at bring-up, so each starvation
+;  reset arrived at SafetyBoot() with a CLEARED count, and the limit was
+;  never reached. The ladder had no rung to climb.
+;
+;  So the first refusal writes the counter to one short of the limit. The
+;  next boot takes it to the limit inside SafetyBoot(). That is the
+;  behaviour the day the PM write lands, and it is written now so it is
+;  already right then.
+; ----------------------------------------------------------------------
+Procedure SafetyPet()
+  If safety_req_mask = 0
+    ProcedureReturn 0
+  EndIf
+  If SafetyLive() = 1
+    ProcedureReturn 0
+  EndIf
+  If safety_starved = 0
+    PokeL(#SAFETY_COUNT_ADDR, #SAFETY_MAGIC | (#SAFETY_MAXBOOTS - 1))
+  EndIf
+  safety_starved = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyArmed() - is anything actually going to rescue this board? 1/0.
+;
+;  This used to return 0 unconditionally, because nothing could be armed
+;  from a citation. It now returns whether SafetyWatchdogStart() has run
+;  and SafetyWatchdogStop() has not.
+;
+;  IT IS STILL BELIEF, NOT MEASUREMENT. Its RP2350 counterpart exists
+;  because on that part a watchdog can be enabled and still count
+;  nothing, and "the ladder looks armed, reports armed, and does nothing
+;  at all" is precisely the failure it was written to expose. That
+;  failure is NOT ruled out here: PM_RSTC's WRCFG field says what will
+;  happen when the counter expires, not whether the counter is moving,
+;  and the driver this file is built on exposes no "is it running" bit
+;  to read back. So this answers "did we arm it", which is a weaker
+;  claim than the name suggests and is the strongest one available.
+;
+;  The proof is a reboot. tools/a64/a64_watchdog_check.py checks the
+;  register writes; only the board checks the countdown.
+; ----------------------------------------------------------------------
+Procedure.i SafetyArmed()
+  ProcedureReturn safety_wdog_on
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SafetyOff() - disarm entirely: the contract is dropped and the boot
+;  counter is cleared, so the next start begins at one.
+;
+;  ONE legitimate use, the same as on the RP2350: single-stepping, where
+;  the safety machinery is the only thing getting in your way. Any other
+;  call has quietly thrown away the escape hatch, and on this target it
+;  throws away the REPORT as well - which today is all there is.
+; ----------------------------------------------------------------------
+Procedure SafetyOff()
+  safety_req_mask = 0
+  safety_starved = 0
+  PokeL(#SAFETY_COUNT_ADDR, 0)
+EndProcedure

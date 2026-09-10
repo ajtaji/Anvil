@@ -1,0 +1,145 @@
+
+; ======================================================================
+;  hw_addr.pi4 - the Pi 4's answer to "is this address safe to touch".
+;
+;  The core asks HwAddrCheck() before every command that takes an address
+;  from the operator (Anvil/Core/addrsafe.pbi, and the contract in
+;  Anvil/Hal/hal.pbi). ON THIS BOARD THE ANSWER IS ALWAYS SAFE, and this
+;  file exists to say so deliberately rather than by omission.
+;
+; ----------------------------------------------------------------------
+;  WHY SAFE FOR EVERYTHING, AND WHAT THAT CLAIM IS AND IS NOT
+; ----------------------------------------------------------------------
+;  The seam exists because on the Arduino UNO Q's QCM2290 an MMIO access
+;  to a clock-gated block STALLS THE INTERCONNECT - the instruction never
+;  retires and the board needs its power removing. THE BCM2711 DOES NOT
+;  BEHAVE THAT WAY, and that is a measured difference and not an
+;  assumption about it:
+;
+;    * Every peripheral in the $FE000000 window is behind clocks the
+;      firmware has already started before Anvil is entered. `memory
+;      FE201000 20` reading the PL011 is how the mini-UART routing bug
+;      was cornered, and that read is in this monitor's own history as a
+;      thing that WORKED - see the note at CmdMem in Anvil/Core/memcmd.pbi.
+;    * The V3D, DMA, mailbox, GENET, PCIe/xHCI, EMMC and SDIO register
+;      blocks are all read by this monitor's own drivers, at this
+;      exception level, with no special preparation beyond what those
+;      drivers do. The register windows answer.
+;    * DRAM answers everywhere. `mtest` writes and reads it back.
+;    * An address with NOTHING behind it reads as a value and does not
+;      hang. It is a wrong answer rather than a hang, and the monitor has
+;      always said out loud that reading such an address is the
+;      operator's risk to take.
+;
+;  SO THE CLAIM IS NARROW AND IT IS TRUE: no address on this board is
+;  known to stall the bus. It is NOT the claim that every address holds
+;  something useful, and it is NOT the claim that a write anywhere is a
+;  good idea - the monitor's own window refusals (HitsMonitor,
+;  InPayload) are unchanged and still run, because they answer a
+;  completely different question: not "will this access complete" but
+;  "will it destroy the thing that is running".
+;
+; ----------------------------------------------------------------------
+;  WHY THIS IS A FILE AND NOT THREE LINES AT THE FOOT OF THE MEMORY MAP
+; ----------------------------------------------------------------------
+;  Two reasons, and the second is the load-bearing one.
+;
+;  It needs #HW_ADDR_SAFE, which is defined in Anvil/Hal/hal.pbi, and
+;  RaspberryPi4/Board/memmap.pi4 is included BEFORE hal.pi4 by
+;  RaspberryPi4/Examples/Diagnostics/pi4BootContainerSelfTest.pi4. Putting
+;  the answer in the memory map would break that diagnostic's build for
+;  no reason at all.
+;
+;  And a board that answers "everything is fine" should have to write
+;  that down somewhere a reader will find it. An empty implementation is
+;  indistinguishable from a forgotten one, and the next person to bring
+;  up a third target will read this file to find out what the seam is
+;  for. If the Pi 4 ever grows a block that has to be voted for - a
+;  power-domain the firmware leaves collapsed, say - the table goes here
+;  and nothing else in the tree changes.
+; ======================================================================
+
+; NOTHING MATCHED, SO THERE IS NOTHING TO REPORT. These three exist
+; because hal.pi4 defines them as part of the seam and a board must
+; supply the whole seam, not the parts it happens to use. They are only
+; ever read after an answer that was not SAFE, which cannot happen here.
+Procedure.i HwAddrReason()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwAddrBlockLo()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwAddrBlockHi()
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrCheck(lo, hi, forWrite) - the Pi 4's answer.
+;
+;  THE ARGUMENTS ARE ACCEPTED AND NOT USED, and that is the honest shape
+;  for this board. Naming them keeps the seam's signature identical
+;  across boards, which is what makes a backend a swap rather than a
+;  rewrite, and it puts the reader of THIS file in front of the exact
+;  question the other board answers differently.
+; ----------------------------------------------------------------------
+Procedure.i HwAddrCheck(lo.i, hi.i, forWrite.i)
+  ProcedureReturn #HW_ADDR_SAFE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrReport() - what `info` prints about this board's answer.
+;
+;  Every board prints its own table here, with where each row came from.
+;  This one has no table, so it says that, and says why - a blank section
+;  under a heading in `info` reads as a monitor that failed to fill it in.
+;
+;  AND IT PRINTS WHERE THE MONITOR IS, because the sentence below sends
+;  the reader straight to "the monitor's own window guards" and there was
+;  no way to ask what those windows are. Two questions meet in this
+;  section and they are not the same one: HwAddrCheck answers "will this
+;  access complete" - here, always yes - and the monitor window answers
+;  "will this access destroy the thing that is running", which is the one
+;  that still refuses writes on this board. The extent was reachable only
+;  by tripping over it: aim a write inside the monitor and the refusal
+;  names the window. A number an operator can only find by hitting it is
+;  not reported, it is hidden.
+;
+;  IT ASKS HwMonLo()/HwMonHi() RATHER THAN READING THE CONSTANTS, even
+;  though on this board they ARE the constants. Those two procedures are
+;  what the overlap test itself asks, so this prints the answer that will
+;  actually be used - and a board that told `info` one thing and the
+;  guard another would then have to be made to disagree on purpose,
+;  rather than by an oversight in one of them.
+; ----------------------------------------------------------------------
+Procedure HwAddrReport()
+  ; WHERE THE MONITOR IS. First, because it is the concrete answer and
+  ; the prose below it explains a refusal that never happens here.
+  ; EVERY REGION, THROUGH THE ONE PRINTER THE MAP HAS - 2026-09-08.
+  ; This block used to print the code window and the data window from
+  ; constants and then say the pair "come from COMPILE-TIME CONSTANTS on
+  ; this board and cannot be wrong". That sentence was true of the data
+  ; window and FALSE of the code window from the moment the monitor
+  ; stopped having a fixed top: its extent is now the size of the image
+  ; the firmware loaded, measured by the running program. A section of
+  ; `info` that explained the old certainty would have been the most
+  ; confident wrong paragraph in the monitor.
+  PutMonitorMap()
+  PrintN("            A write into any of that is refused and the refusal names")
+  PrintN("            the region. The first line is MEASURED, not declared: the")
+  PrintN("            image carries the address of its own end, so the monitor")
+  PrintN("            reserves exactly what it is and there is no maximum size.")
+  PrintN("            Type map for the same numbers with the payload windows.")
+  PrintN("addresses   every address on this board answers SAFE, so the commands")
+  PrintN("            that take an address from you are refused by nothing but")
+  PrintN("            the monitor's own window guards, exactly as they always")
+  PrintN("            have been here. Nothing on this board is known to stall")
+  PrintN("            the bus: the peripheral window is clocked by the firmware")
+  PrintN("            before this monitor is entered, DRAM answers everywhere,")
+  PrintN("            and an address with nothing behind it reads a value")
+  PrintN("            rather than hanging. Anvil asks the question because its")
+  PrintN("            other target is not like this - there, one read of a")
+  PrintN("            gated block stops the processor until the power is")
+  PrintN("            pulled - and one core asks every board the same thing.")
+EndProcedure

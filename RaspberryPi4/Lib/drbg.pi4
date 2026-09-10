@@ -1,0 +1,830 @@
+; ======================================================================
+;  drbg.pi4 - HMAC-DRBG (SHA-256), ON THE RASPBERRY PI 4
+; ======================================================================
+;
+;  Translated from BearSSL (c) 2016 Thomas Pornin - MIT licence.
+;  The notice ships as licenses/BearSSL-LICENSE.txt (release condition).
+;
+;     XIncludeFile "Anvil/Core/sha256.pbi"   ; REQUIRED, include first
+;     XIncludeFile "RaspberryPi4/Lib/hmac.pi4"     ; REQUIRED, include second
+;     XIncludeFile "RaspberryPi4/Lib/entropy.pi4"  ; REQUIRED, include third
+;     XIncludeFile "RaspberryPi4/Lib/drbg.pi4"
+;
+;
+;  HMAC-DRBG with SHA-256 (NIST SP 800-90A section 10.1.2). This is the
+;  generator that would feed every TLS random on this part - the engine
+;  only ever sees DRBG output, never the raw entropy source.
+;
+;  API:
+;    DrbgInit(seed.i, slen.i)      instantiate: K = $00*32, V = $01*32,
+;                                  then Update(seed). The seed is the
+;                                  concatenation of entropy + nonce +
+;                                  personalisation THE CALLER HAS
+;                                  GATHERED. Returns #DRBG_OK, or
+;                                  #DRBG_WARN_SHORT_SEED (instantiated
+;                                  but under strength), or a negative
+;                                  refusal - SEE THE ENTROPY SECTION.
+;    DrbgReseed(seed.i, slen.i)    reseed with fresh entropy. Same
+;                                  return values as DrbgInit.
+;    DrbgGenerate(dst.i, len.i)    produce len pseudorandom bytes into
+;                                  dst and roll the state forward.
+;                                  Returns len, or #DRBG_ERR_UNSEEDED
+;                                  having written NOTHING.
+;    DrbgSeeded()                  1 once instantiated, 0 before
+;    DrbgSeedBytes()               how many seed bytes it was given
+;    DrbgEntropyAvailable()        1 if this library can obtain entropy
+;                                  by itself. IT RETURNS 1 SINCE
+;                                  2026-08-28 - see below.
+;    DrbgAutoSeed()                instantiate from the BCM2711's own
+;                                  hardware RNG, with no seed from the
+;                                  caller. THE ROUTINE THIS FILE SPENT
+;                                  THREE MONTHS UNABLE TO WRITE.
+;    DrbgAutoReseed()              reseed from the same source.
+;    DrbgEntropyStatus()           what entropy.pi4 said the last time
+;                                  either of those two ran.
+;
+;  REQUIRES sha256.pi4, hmac.pi4 AND entropy.pi4, INCLUDED BEFORE THIS
+;  FILE and in that order: the DRBG is built entirely on HmacKey/
+;  HmacBegin/HmacUpdate/HmacEnd, and DrbgAutoSeed is built on
+;  EntropyBegin/EntropyWarmupWait/EntropyBytes. A library never includes
+;  a library (house rule) - the MAIN file lists sha256, hmac, entropy,
+;  then this file. If any is missing, this file fails loudly at compile
+;  time, naming the procedure it cannot find. No stub.
+;
+;  entropy.pi4 IS A NEW REQUIREMENT AS OF 2026-08-28 and it is a real
+;  cost: a program that only wants to run the known-answer vectors now
+;  has to include a file that touches a peripheral. It was taken
+;  anyway, because the alternative is DrbgAutoSeed() living somewhere
+;  else, and then the one procedure a caller must NOT get wrong is not
+;  in the file whose header explains why. Nothing in entropy.pi4 runs
+;  unless DrbgAutoSeed or DrbgAutoReseed is called.
+;
+;  sha256 already turns EnableExplicit on for the whole program; every
+;  variable here is declared, as that pragma requires.
+;
+;  ======================================================================
+;   THE ENTROPY SOURCE EXISTS NOW - 2026-08-28. READ THIS ANYWAY.
+;  ======================================================================
+;
+;  THIS LIBRARY CAN SEED ITSELF ON THIS PART. DrbgAutoSeed() enables the
+;  BCM2711's RNG200 hardware random number generator through
+;  RaspberryPi4/Lib/entropy.pi4, waits out the warm-up that block
+;  documents, takes 48 bytes and instantiates from them.
+;
+;  IT IS STILL TRUE THAT WHATEVER YOU HAND DrbgInit IS THE WHOLE OF THE
+;  UNPREDICTABILITY IN EVERY BYTE THE GENERATOR WILL EVER PRODUCE. That
+;  sentence did not stop being true when the source arrived; it just
+;  acquired a right answer. If you hand it the same seed twice you get
+;  the same TLS keys twice, and nothing in the protocol will notice.
+;
+;  ======================================================================
+;   WHAT THE SEEDING CONTRACT IS, EXACTLY
+;  ======================================================================
+;
+;  DrbgAutoSeed() reads 48 BYTES from the hardware and calls DrbgInit
+;  with all 48 as one seed string. The split is:
+;
+;    32 bytes  ENTROPY INPUT. SP 800-90A section 10.1 and Table 2:
+;              HMAC_DRBG with SHA-256 supports a 256-bit security
+;              strength, and instantiation requires at least
+;              security_strength bits of entropy input. 256 bits is 32
+;              bytes, which is #DRBG_SEED_STRENGTH.
+;
+;    16 bytes  NONCE. SP 800-90A section 8.6.7 allows a nonce of at
+;              least security_strength/2 bits from the entropy source.
+;              128 bits is 16 bytes.
+;
+;    0 bytes   PERSONALISATION STRING. There is none, and that is a
+;              decision rather than an omission. A personalisation
+;              string is meant to be something SPECIFIC TO THIS DEVICE
+;              AND THIS INSTANTIATION - a serial number, a MAC address,
+;              a boot count - and this file cannot obtain any of those
+;              without depending on the mailbox, the Ethernet block or
+;              the RTC. A caller that has one gathers its own bytes
+;              with EntropyBytes(), appends it, and calls DrbgInit
+;              directly; the seed is a byte string and DrbgInit does
+;              not care where the pieces came from.
+;
+;  THE 48 BYTES ARE HASHED TOGETHER BY HMAC_DRBG_Update, so the split
+;  above is about WHERE THE REQUIREMENT COMES FROM rather than about
+;  the arithmetic - the entropy input and the nonce are concatenated
+;  and fed in as one string, which is exactly what SP 800-90A section
+;  10.1.2.3 specifies.
+;
+;  THE SEED BUFFER IS WIPED AFTER USE. secDrbgSeed is zeroed the
+;  instant DrbgInit returns. It is BSS on a board with no MMU and no
+;  memory protection, so anything that can read memory can read it;
+;  wiping does not make that safe, it makes the window short. It is
+;  named sec* like K and V so a future scrubber can find it.
+;
+;  ======================================================================
+;   WHAT AUTO-SEEDING DOES *NOT* CHECK, AND WHY THAT IS DELIBERATE
+;  ======================================================================
+;
+;  DrbgAutoSeed() DOES NOT RUN entropy.pi4's STUCK DETECTOR. Collecting
+;  the few thousand words that detector wants costs about an eighth of
+;  a second of sampling at the block's documented 1 MHz rate, on a path
+;  that runs at boot before anything else can happen. Paying that on
+;  every boot to catch a fault that is permanent when it happens is the
+;  wrong trade.
+;
+;  WHAT IT RELIES ON INSTEAD, and this is not nothing: DrbgSeedUsable's
+;  existing #DRBG_ERR_CONSTSEED check runs over all 48 bytes. A block
+;  that is dead, unpowered, held in reset or being read at the wrong
+;  address produces a constant, and a constant 48 bytes is refused BY
+;  NAME before the DRBG is instantiated. That is the failure that
+;  actually happens.
+;
+;  IT WILL NOT CATCH A BLOCK THAT IS MERELY BAD - biased, short-cycled,
+;  or a counter. RUN
+;  RaspberryPi4/Examples/Diagnostics/pi4Entropy.pi4 ON THE BOARD ONCE
+;  and read what it prints, including the paragraph about what its
+;  verdict does not establish. That diagnostic exists so that this
+;  shortcut is a considered one rather than a hidden one.
+;
+;  ======================================================================
+;   WHAT THE OLD VERSION OF THIS SECTION SAID, AND WHY IT IS KEPT
+;  ======================================================================
+;
+;  Until 2026-08-28 the block here was seventy lines beginning "THERE IS
+;  NO ENTROPY SOURCE HERE", and it ended with a concrete instruction:
+;  get RNG_CTRL's offset and enable bit, RNG_STATUS's offset and its
+;  FIFO-count field, RNG_FIFO_DATA's offset and the documented warm-up
+;  discard FROM A SOURCE YOU CAN CITE; then write DrbgAutoSeed(), make
+;  DrbgEntropyAvailable() return 1 in the same commit, and delete the
+;  block.
+;
+;  THAT IS EXACTLY WHAT HAPPENED, and the five numbers came from
+;  RaspberryPi4/Reference/rpi-6.12.y_iproc-rng200.c with two more
+;  drivers agreeing. entropy.pi4's header carries every citation with a
+;  line number.
+;
+;  ONE THING THE OLD BLOCK GOT WRONG IS WORTH KEEPING. It said the
+;  numbers were not in any document in Datasheets/ and concluded they
+;  were uncitable. The first half was true - bcm2711-peripherals.pdf
+;  really does not contain the RNG200 register map, and that was
+;  checked rather than assumed. The second half was the mistake: a
+;  register map that is not on the disk can be FETCHED, and the vault's
+;  own rule says to fetch it and record it rather than to stop. Three
+;  drivers arrived in ten minutes. "I cannot cite this" was the right
+;  standard applied to the wrong conclusion, which is the same shape
+;  the Reference-sources map records for the mailbox tag.
+;
+;  THE OTHER WARNING IN THAT BLOCK STILL STANDS AND IS NOT SOFTENED:
+;  $FE104000 is real, powered peripheral space, and a read of the wrong
+;  offset in a live block returns A NUMBER - not a fault, not a zero
+;  you would notice. That number would go straight into a seed and look
+;  exactly like entropy. It is why entropy.pi4 cites a line number for
+;  every offset instead of a chip family for all of them, and why it
+;  spells out how the Pi 3's map overlaps this one.
+;
+;  AND SO DOES THIS: the ARM generic timer (CNTPCT_EL0, which
+;  RaspberryPi4/Lib/timer.pi4 reads) is a counter, and a counter read at
+;  boot is roughly the same number every boot. The VideoCore temperature
+;  tag in mailbox.pi4 moves by a degree or two. Neither is entropy.
+;  Mixing them in ALONGSIDE a real source is fine and even sensible;
+;  using either as the source is the constant-seed defect wearing a
+;  disguise.
+;
+;  ======================================================================
+;   HOW THIS FILE REFUSES, AND WHY IT REFUSES RATHER THAN COPING
+;  ======================================================================
+;
+;  A DRBG THAT QUIETLY PROCEEDS FROM NO SEED IS THE DEFECT. The RP2350
+;  copy's DrbgInit takes any seed at all, including a null pointer and a
+;  zero length, and comes back looking successful; the generator then
+;  emits a completely deterministic stream that passes every statistical
+;  test anybody would think to run on it. THIS COPY WILL NOT DO THAT.
+;
+;    seed = 0, or slen <= 0        #DRBG_ERR_NOSEED
+;                                  NOT instantiated. DrbgSeeded() stays
+;                                  0 and DrbgGenerate() refuses.
+;
+;    every seed byte identical     #DRBG_ERR_CONSTSEED
+;                                  NOT instantiated. This is the
+;                                  32-zero-bytes case and the
+;                                  fill-the-buffer-with-$FF case - the
+;                                  two shapes an uninitialised or
+;                                  never-populated buffer actually has.
+;                                  It cannot catch a subtler constant
+;                                  and does not pretend to; it catches
+;                                  the two that happen by accident.
+;
+;    0 < slen < #DRBG_SEED_STRENGTH
+;                                  #DRBG_WARN_SHORT_SEED
+;                                  INSTANTIATED, and it works. SP
+;                                  800-90A section 10.1 asks for at
+;                                  least security-strength bits of
+;                                  entropy, which is 256 bits - 32
+;                                  bytes - for HMAC_DRBG with SHA-256.
+;                                  A shorter seed is a real weakness
+;                                  but it is the caller's call, not
+;                                  this file's, so it is ANNOUNCED
+;                                  rather than refused. The published
+;                                  known-answer vectors this port is
+;                                  gated against include seeds shorter
+;                                  than 32 bytes, and a library that
+;                                  refused to run its own test vectors
+;                                  would be its own kind of wrong.
+;
+;    otherwise                     #DRBG_OK
+;
+;  DrbgGenerate() RETURNS #DRBG_ERR_UNSEEDED AND WRITES NOTHING if there
+;  has been no successful instantiate. Writing nothing matters: a caller
+;  that ignores the return value gets whatever was already in its
+;  buffer, which is a bug it can find, instead of a smooth stream of
+;  predictable bytes, which is a bug nobody finds.
+;
+;  ALL REFUSALS ARE NEGATIVE AND DrbgGenerate's SUCCESS VALUE IS A BYTE
+;  COUNT, so one comparison separates them.
+;
+;  ======================================================================
+;   THE 64-BIT .i, AND THE COUNTERS THAT ARE NOT HERE
+;  ======================================================================
+;
+;  THERE IS NO 32-BIT WORD ARITHMETIC IN THIS FILE EITHER. HMAC-DRBG is
+;  defined over byte strings; K and V are 32-byte buffers, the domain
+;  separators are single bytes, and the only numbers are lengths. So
+;  there is nothing here for #SHA256_W32 to be applied to. The 64-bit
+;  masking work for this stack lives entirely in
+;  Anvil/Core/sha256.pbi, whose header carries the account.
+;
+;  THE SP 800-90A reseed_counter DOES NOT EXIST IN THIS
+;  IMPLEMENTATION, and it does not exist in the RP2350, RP2040 or RA4M1
+;  copies either - BearSSL's hmac_drbg does not keep one. That is
+;  recorded here as a GAP rather than left to be discovered: SP 800-90A
+;  section 10.1.2 requires that a generate request after
+;  reseed_interval requests returns a reseed-required indication, and
+;  nothing in this file will ever return one. It generates forever from
+;  one seed. Adding the counter is a real piece of work and it belongs
+;  in all four copies at once, not smuggled into the 64-bit port.
+;
+;  So: there was no 32-bit counter here to mask, which is the honest
+;  answer to "what did you do about the DRBG's counters". The offsets
+;  and remainders in DrbgGenerate are LENGTHS and want to be
+;  machine-width, which on this target they are.
+;
+;  ======================================================================
+;   CONSTANT TIME
+;  ======================================================================
+;
+;  K and V are secret DRBG state (sec-named); every step is an HMAC,
+;  which is straight-line, and all control in the generate path is
+;  driven by the requested length (public), never by state bytes.
+;
+;  THE TWO SEED CHECKS ADDED BY THIS PORT DO LOOK AT SEED BYTES, and
+;  that is worth being explicit about rather than quiet. The
+;  constant-seed test accumulates every byte's difference from the
+;  first with OR and tests the accumulator ONCE at the end - the same
+;  shape as CtEqual in hmac.pi4 - so it never returns early and its
+;  running time depends only on slen. The one branch it does take
+;  reveals a single public bit: "this seed was degenerate", which is a
+;  bit the caller is being told anyway, in the return value. NO OTHER
+;  BRANCH IN THIS FILE LOOKS AT A SECRET.
+;
+;  As in the rest of this stack the claim is STRUCTURAL, read off the
+;  source. No cycle-counting harness exists for this backend.
+;
+;  ======================================================================
+;   WHAT HAS BEEN PROVEN, AND WHAT HAS NOT - 2026-08-25, ENTROPY 2026-08-28
+;  ======================================================================
+;
+;  PROVEN, by known-answer test under the project's own A64 oracle
+;  (tools/a64/a64_interp.py) on a real image built by pmfc.exe for
+;  -t pi4 at $200000, against the vector set the RP2350/RP2040/RA4M1
+;  copies are already gated on so that the four targets stay comparable
+;  (RP2350/Examples/Diagnostics/drbgVectors.pico2):
+;
+;    * The NIST CAVP HMAC_DRBG SHA-256 known-answer vector WITH RESEED:
+;      instantiate from an 80-byte seed, reseed with 32 bytes, generate
+;      128 bytes twice, keep the second - the CAVP known-answer shape.
+;    * The same vector without the reseed.
+;      The second 128 bytes of the reseeded case:
+;        f92d4cf99a535b20222a52a68db04c5af6f5ffc7b66a473a37a256bd8d298f9b
+;        4aa4af7e8d181e02367903f93bdb744c6c2f3f3472626b40ce9bd6a70e7b8f93
+;        992a16a76fab6b5f162568e08ee6c3e804aefd952ddd3acb791c50f2ad69e9a0
+;        4028a06a9c01d3a62aca2aaf6efe69ed97a016213a2dd642b4886764072d9cbe
+;      and of the no-reseed case:
+;        6575565bf16ae725531cbe32c6548be5f07e46280713a213ca663c383867d5ac
+;        ae5bcfc9298ac357e051bb815b0ebca3ac6dbf6ef1482ff928e857cca7b09719
+;        c43a8b8d16aec2fef44804e25dc4453a873a645478ddd8fbcc53fb20b8bbace8
+;        4362c4d2705d55455afff5233036d6f6aed04a5c350f9f24a9c0ee2557db9da8
+;
+;    * Twenty further cases from an independent reimplementation of SP
+;      800-90A HMAC_DRBG anchored to that NIST vector, with seed
+;      lengths from 19 to 63 bytes and generate lengths from 12 to 152,
+;      so the partial-final-block path is covered. 22 of 22.
+;    * EVERY REFUSAL IN THIS FILE, as a negative test, run BEFORE any
+;      instantiate so the gate starts from the real reset state:
+;        DrbgSeeded() before init            0
+;        DrbgGenerate() unseeded            -4  and wrote nothing
+;        DrbgInit(0, 0)                     -2
+;        DrbgInit(32 zero bytes)            -3
+;        DrbgSeeded() after both refusals    0  - neither one took
+;        DrbgReseed() while unseeded        -4
+;    * The short-seed ANNOUNCEMENT, incidentally and usefully: five of
+;      the twenty random vectors have seeds under 32 bytes, and all five
+;      returned #DRBG_WARN_SHORT_SEED from DrbgInit and then produced
+;      the right answer. That is the announce-do-not-refuse path being
+;      exercised by real data rather than by a test written for it.
+;
+;
+;  ADDED 2026-08-28, THE ENTROPY PATH. The two negative tests that used
+;  to sit in the list above - DrbgEntropyAvailable() = 0 and
+;  DrbgAutoSeed() = -5 - are GONE, because both were assertions that
+;  this file could not seed itself and both are now false. They are
+;  named here rather than silently deleted: a test that disappears
+;  between two versions of a header is indistinguishable from a test
+;  somebody removed because it started failing.
+;
+;    * DrbgEntropyAvailable() returns 1, in the same change that made
+;      DrbgAutoSeed() work, which is the condition the old comment set.
+;    * The entropy path itself is gated by
+;      tools/a64/a64_entropy_check.py - 210 checks, 13 of 13 mutations
+;      caught - which proves the register sequence against three vendor
+;      drivers and proves the stuck detector against constructed
+;      streams. IT PROVES NOTHING ABOUT THE QUALITY OF THE HARDWARE'S
+;      OUTPUT, because there is no oracle for that.
+;
+;  NOT PROVEN:
+;    * NOTHING HERE HAS RUN ON SILICON. RE-CHECKED 2026-08-28 AND
+;      STILL TRUE: nothing under RaspberryPi4/ includes this file, so
+;      no image that has booted contains a line of it. Dated on purpose
+;      - an undated "nothing has run" reads as present tense for ever,
+;      and an audit on 2026-08-27 found nine banners in this directory
+;      that had gone false exactly that way.
+;    * THE ENTROPY SOURCE HAS NEVER BEEN READ. Every register offset in
+;      entropy.pi4 is a citation, not a measurement, and no word has
+;      ever come out of the real block. THE LIST ABOVE IS STILL NOT
+;      PERMISSION TO SHIP A TLS STACK ON THIS PART - what has changed is
+;      that the missing piece is now a piece that exists and has not
+;      been run, rather than a piece that does not exist.
+;    * NOTHING ANYWHERE ESTABLISHES THAT THE RNG200'S OUTPUT IS GOOD.
+;      entropy.pi4's stuck detector is a dead-block detector and its own
+;      header spends a page on what it does not prove. A 32-bit counter
+;      passes it.
+;    * The constant-seed check catches a uniform buffer and nothing
+;      subtler. A seed of 32 bytes counting 0,1,2,... passes it, and
+;      that is the whole of what stands between DrbgAutoSeed() and a
+;      block that is merely bad rather than dead.
+;    * The constant-time claim is structural, not measured.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  #DRBG_SEED_STRENGTH - SP 800-90A section 10.1 / Table 2: HMAC_DRBG
+;  with SHA-256 supports a 256-bit security strength, and the entropy
+;  input for instantiation must be at least security_strength bits.
+;  256 bits is 32 bytes.
+; ----------------------------------------------------------------------
+; ==== PORTABLE CORE A64 BEGIN ====
+#DRBG_SEED_STRENGTH = 32
+
+#DRBG_OK               =  1
+#DRBG_WARN_SHORT_SEED  = -1
+#DRBG_ERR_NOSEED       = -2
+#DRBG_ERR_CONSTSEED    = -3
+#DRBG_ERR_UNSEEDED     = -4
+#DRBG_ERR_NOSOURCE     = -5
+#DRBG_ERR_ENTROPY      = -6   ; the hardware source refused - ask
+                              ; DrbgEntropyStatus() which way
+
+; ----------------------------------------------------------------------
+;  THE AUTO-SEED SIZES. See WHAT THE SEEDING CONTRACT IS in the header
+;  for the citation behind each one; they are spelled as literals
+;  because a constant declaration in this language may not contain
+;  arithmetic, so #DRBG_AUTOSEED_BYTES cannot be written as the sum.
+; ----------------------------------------------------------------------
+#DRBG_NONCE_BYTES    = 16     ; SP 800-90A 8.6.7, strength/2 bits
+#DRBG_AUTOSEED_BYTES = 48     ; = #DRBG_SEED_STRENGTH + #DRBG_NONCE_BYTES
+#DRBG_RESEED_BYTES   = 32     ; a reseed needs strength bits, no nonce
+
+; ----------------------------------------------------------------------
+;  STATE - the two 32-byte HMAC-DRBG working registers, plus a one-byte
+;  buffer for the $00 / $01 domain separators the update mixes in. K and
+;  V are secret; DrbgOne carries only a public constant.
+;
+;  drbgSeeded and drbgSeedLen are the instantiate gate. They are
+;  ordinary Globals and therefore zero at reset (the __a64_bss_zero loop
+;  in the standard prologue), which is the safe state: not seeded.
+; ----------------------------------------------------------------------
+Global Dim secDrbgK.a[32]            ; the DRBG Key register
+Global Dim secDrbgV.a[32]            ; the DRBG Value register
+Global Dim DrbgOne.a[1]              ; single-byte separator ($00 or $01)
+Global drbgSeeded.i                  ; 0 until a seed was accepted
+Global drbgSeedLen.i                 ; how many seed bytes were accepted
+
+; ----------------------------------------------------------------------
+;  The auto-seed staging buffer, and the last thing entropy.pi4 said.
+;
+;  secDrbgSeed is SECRET while it is full and is wiped the moment
+;  DrbgInit has consumed it - see the header. drbgEntStatus is the
+;  entropy library's own return code, kept so that a caller who got
+;  #DRBG_ERR_ENTROPY can find out WHICH failure it was without a second
+;  run: a timeout, a health bit, or a block that would not start are
+;  three different repairs.
+; ----------------------------------------------------------------------
+Global Dim secDrbgSeed.a[48]
+Global drbgEntStatus.i
+
+; ----------------------------------------------------------------------
+;  DrbgSeedUsable(seed, slen) - the gate, in one place.
+;
+;  Returns #DRBG_OK, #DRBG_WARN_SHORT_SEED, or a negative refusal.
+;  Instantiation is allowed for the first two.
+;
+;  THE DEGENERATE TEST IS CONSTANT TIME. It ORs every byte's difference
+;  from the first byte into one accumulator and tests that accumulator
+;  once, so it never returns early and never reveals WHERE the seed
+;  stopped being constant. Same shape as CtEqual in hmac.pi4, and for
+;  the same reason.
+; ----------------------------------------------------------------------
+Procedure.i DrbgSeedUsable(seed.i, slen.i)
+  Protected i.i
+  Protected first.i
+  Protected diff.i
+
+  If seed = 0
+    ProcedureReturn #DRBG_ERR_NOSEED
+  EndIf
+  If slen <= 0
+    ProcedureReturn #DRBG_ERR_NOSEED
+  EndIf
+
+  first = PeekA(seed) & 255
+  diff = 0
+  i = 1
+  While i < slen
+    diff = diff | ((PeekA(seed + i) & 255) ! first)
+    i = i + 1
+  Wend
+  If diff = 0
+    ; every byte the same - all zeros, all $FF, or a buffer somebody
+    ; memset and never filled. Not entropy under any reading.
+    ProcedureReturn #DRBG_ERR_CONSTSEED
+  EndIf
+
+  If slen < #DRBG_SEED_STRENGTH
+    ProcedureReturn #DRBG_WARN_SHORT_SEED
+  EndIf
+  ProcedureReturn #DRBG_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgUpdate(seed, slen) - the SP 800-90A HMAC_DRBG_Update
+;  (section 10.1.2.2).
+;
+;    K = HMAC(K, V || $00 || seed) ; V = HMAC(K, V)
+;    if seed non-empty:
+;    K = HMAC(K, V || $01 || seed) ; V = HMAC(K, V)
+;
+;  Each HMAC completes before the next begins; the key is re-derived from
+;  the new K after each K assignment (HmacKey caches the ipad/opad states,
+;  and the running HMAC uses those cached states, so writing the new K into
+;  secDrbgK after HmacEnd never disturbs the MAC that just produced it).
+;
+;  INTERNAL. It does no gating - the callers do that. It is not part of
+;  the API and a caller reaching past DrbgInit/DrbgReseed to it is
+;  bypassing the seed checks.
+; ----------------------------------------------------------------------
+Procedure.i DrbgUpdate(seed.i, slen.i)
+  ; 1. K = HMAC(K, V || $00 || seed)
+  HmacKey(@secDrbgK[0], 32)
+  HmacBegin()
+  HmacUpdate(@secDrbgV[0], 32)
+  DrbgOne[0] = $00
+  HmacUpdate(@DrbgOne[0], 1)
+  HmacUpdate(seed, slen)
+  HmacEnd(@secDrbgK[0], 32)
+  HmacKey(@secDrbgK[0], 32)
+
+  ; 2. V = HMAC(K, V)
+  HmacBegin()
+  HmacUpdate(@secDrbgV[0], 32)
+  HmacEnd(@secDrbgV[0], 32)
+
+  ; 3. an empty seed stops here
+  If slen = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; 4. K = HMAC(K, V || $01 || seed)
+  HmacBegin()
+  HmacUpdate(@secDrbgV[0], 32)
+  DrbgOne[0] = $01
+  HmacUpdate(@DrbgOne[0], 1)
+  HmacUpdate(seed, slen)
+  HmacEnd(@secDrbgK[0], 32)
+  HmacKey(@secDrbgK[0], 32)
+
+  ; 5. V = HMAC(K, V)
+  HmacBegin()
+  HmacUpdate(@secDrbgV[0], 32)
+  HmacEnd(@secDrbgV[0], 32)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgInit(seed, slen) - instantiate (SP 800-90A section 10.1.2.3).
+;  K = $00*32, V = $01*32, then the first Update mixes the seed material
+;  in.
+;
+;  The seed is entropy_input || nonce || personalization_string, already
+;  concatenated by the caller - this file does not gather any of the
+;  three and cannot.
+;
+;  A REFUSAL LEAVES THE STATE UNTOUCHED AND UNSEEDED. It does not zero
+;  K and V and then fail, because a half-instantiated DRBG whose
+;  DrbgSeeded() says 0 but whose registers look plausible is a trap for
+;  the next reader.
+; ----------------------------------------------------------------------
+Procedure.i DrbgInit(seed.i, slen.i)
+  Protected i.i
+  Protected verdict.i
+
+  verdict = DrbgSeedUsable(seed, slen)
+  If verdict < 0 And verdict <> #DRBG_WARN_SHORT_SEED
+    ProcedureReturn verdict
+  EndIf
+
+  i = 0
+  While i < 32
+    secDrbgK[i] = $00
+    secDrbgV[i] = $01
+    i = i + 1
+  Wend
+  DrbgUpdate(seed, slen)
+  drbgSeeded = 1
+  drbgSeedLen = slen
+  ProcedureReturn verdict
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgReseed(seed, slen) - reseed (SP 800-90A section 10.1.2.4). A
+;  reseed is exactly an Update with the new entropy (+ any additional
+;  input) as its seed material.
+;
+;  RESEEDING AN UNSEEDED DRBG IS REFUSED rather than treated as an
+;  instantiate. The two are different operations with different
+;  starting states, and quietly promoting one to the other would let a
+;  program that never called DrbgInit look like it had.
+;
+;  A REFUSED RESEED LEAVES A WORKING DRBG WORKING. It is a failure to
+;  add entropy, not a reason to stop generating; the caller is told and
+;  decides.
+; ----------------------------------------------------------------------
+Procedure.i DrbgReseed(seed.i, slen.i)
+  Protected verdict.i
+
+  If drbgSeeded = 0
+    ProcedureReturn #DRBG_ERR_UNSEEDED
+  EndIf
+
+  verdict = DrbgSeedUsable(seed, slen)
+  If verdict < 0 And verdict <> #DRBG_WARN_SHORT_SEED
+    ProcedureReturn verdict
+  EndIf
+
+  DrbgUpdate(seed, slen)
+  If slen > drbgSeedLen
+    drbgSeedLen = slen
+  EndIf
+  ProcedureReturn verdict
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgGenerate(dst, len) - produce len pseudorandom bytes
+;  (SP 800-90A section 10.1.2.5), then roll the state forward with an
+;  empty-additional Update (inlined here, exactly as BearSSL does, to
+;  avoid re-deriving the key context an extra time).
+;
+;    while len: V = HMAC(K, V); emit V (or its head on the last block)
+;    K = HMAC(K, V || $00) ; V = HMAC(K, V)
+;
+;  Control is length-driven only; the state bytes are never branched on.
+;  Returns len, or #DRBG_ERR_UNSEEDED having written nothing at all.
+;
+;  THERE IS NO reseed_interval CHECK. See the header - this
+;  implementation, like all three of its siblings, keeps no
+;  reseed_counter and will generate forever from one seed.
+; ----------------------------------------------------------------------
+Procedure.i DrbgGenerate(dst.i, len.i)
+  Protected off.i
+  Protected rem.i
+  Protected clen.i
+  Protected i.i
+
+  If drbgSeeded = 0
+    ProcedureReturn #DRBG_ERR_UNSEEDED
+  EndIf
+  If len <= 0
+    ProcedureReturn 0
+  EndIf
+
+  HmacKey(@secDrbgK[0], 32)
+
+  off = 0
+  rem = len
+  While rem > 0
+    ; V = HMAC(K, V)
+    HmacBegin()
+    HmacUpdate(@secDrbgV[0], 32)
+    HmacEnd(@secDrbgV[0], 32)
+
+    clen = 32
+    If clen > rem
+      clen = rem
+    EndIf
+    i = 0
+    While i < clen
+      PokeB(dst + off + i, secDrbgV[i] & 255)
+      i = i + 1
+    Wend
+    off = off + clen
+    rem = rem - clen
+  Wend
+
+  ; roll forward: K = HMAC(K, V || $00) ; V = HMAC(K, V)
+  HmacBegin()
+  HmacUpdate(@secDrbgV[0], 32)
+  DrbgOne[0] = $00
+  HmacUpdate(@DrbgOne[0], 1)
+  HmacEnd(@secDrbgK[0], 32)
+  HmacKey(@secDrbgK[0], 32)
+  HmacBegin()
+  HmacUpdate(@secDrbgV[0], 32)
+  HmacEnd(@secDrbgV[0], 32)
+  ProcedureReturn len
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgSeeded() / DrbgSeedBytes() - the instantiate state, readable.
+;
+;  Print DrbgSeedBytes() at bring-up. A program that thinks it seeded a
+;  DRBG and reports 0 has found a real bug in one line, which is the
+;  same argument SafetyBoot() makes for returning its boot number.
+; ----------------------------------------------------------------------
+Procedure.i DrbgSeeded()
+  ProcedureReturn drbgSeeded
+EndProcedure
+
+Procedure.i DrbgSeedBytes()
+  ProcedureReturn drbgSeedLen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgEntropyAvailable() - can this library obtain entropy by itself?
+;
+;  IT RETURNS 1 SINCE 2026-08-28, in the same commit that made
+;  DrbgAutoSeed() work, which is the condition the previous version of
+;  this comment set for changing it.
+;
+;  IT IS A STATEMENT ABOUT THE LIBRARY, NOT ABOUT THE SILICON. It says
+;  "a hardware entropy path is compiled in and DrbgAutoSeed will try
+;  it". It does NOT say the block answered - that is DrbgAutoSeed's
+;  return value, and it can still fail. A caller writing "seed from
+;  hardware if you can, otherwise refuse to start the TLS stack" needs
+;  to branch on BOTH: this one to know the path exists, and the
+;  auto-seed's own result to know it worked.
+; ----------------------------------------------------------------------
+Procedure.i DrbgEntropyAvailable()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  drbg_GatherWipe() - zero the staging buffer.
+;
+;  INTERNAL. Called on every exit from the two auto routines, the
+;  failures included: a partly-filled buffer is still whatever the
+;  hardware produced before it stopped, and leaving that lying in BSS
+;  because the call did not succeed is the sort of thing nobody looks
+;  for afterwards.
+; ----------------------------------------------------------------------
+Procedure drbg_GatherWipe()
+  Protected i.i
+  i = 0
+  While i < #DRBG_AUTOSEED_BYTES
+    secDrbgSeed[i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  drbg_Gather(n) - n bytes of hardware entropy into secDrbgSeed.
+;
+;  INTERNAL. Returns #DRBG_OK or #DRBG_ERR_ENTROPY, leaving the entropy
+;  library's own code in drbgEntStatus either way.
+;
+;  THE ORDER IS: start the block, wait out the warm-up, then read. Each
+;  step is separate because each fails differently and the caller has
+;  to be able to tell which. EntropyBegin() returning
+;  #ENTROPY_ALREADY - somebody else had already enabled the block, so
+;  the warm-up threshold is not known to have been programmed - is NOT
+;  treated as a failure here, and that is a judgement worth stating:
+;  entropy.pi4 hands that distinction back precisely so a caller can
+;  decide, and this file decides to accept it, because the alternative
+;  is to call EntropyRestart() and throw away a warm-up that has very
+;  probably already been paid. A program that wants the stronger
+;  guarantee calls EntropyRestart() itself before DrbgAutoSeed().
+; ----------------------------------------------------------------------
+Procedure.i drbg_Gather(n.i)
+  Protected st.i
+
+  st = EntropyBegin()
+  drbgEntStatus = st
+  If st < 0
+    ProcedureReturn #DRBG_ERR_ENTROPY
+  EndIf
+
+  st = EntropyWarmupWait(#ENTROPY_SPINS)
+  drbgEntStatus = st
+  If st < 0
+    ProcedureReturn #DRBG_ERR_ENTROPY
+  EndIf
+
+  st = EntropyBytes(@secDrbgSeed[0], n, #ENTROPY_SPINS)
+  drbgEntStatus = st
+  If st <> n
+    ProcedureReturn #DRBG_ERR_ENTROPY
+  EndIf
+  ProcedureReturn #DRBG_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgAutoSeed() - instantiate from the BCM2711's hardware RNG.
+;
+;  Returns whatever DrbgInit returned - #DRBG_OK, or one of its
+;  refusals - or #DRBG_ERR_ENTROPY if the hardware never produced the
+;  48 bytes. It does not touch the DRBG state unless it has all 48.
+;
+;  #DRBG_ERR_CONSTSEED IS THE INTERESTING FAILURE and it is the reason
+;  this routine can be as short as it is. A dead block, a block held in
+;  reset, a base address off by a page and a FIFO read that is really
+;  reading some other register all produce the same 48 bytes over and
+;  over, and DrbgSeedUsable refuses a constant seed BY NAME before
+;  anything is instantiated. See WHAT AUTO-SEEDING DOES NOT CHECK in
+;  the header for what that does and does not cover.
+;
+;  RE-SEEDING AN ALREADY-SEEDED DRBG through this entry point is
+;  allowed and is a full re-instantiate: K and V go back to their
+;  starting constants. If what you wanted was to ADD entropy to a
+;  running generator, that is DrbgAutoReseed().
+; ----------------------------------------------------------------------
+Procedure.i DrbgAutoSeed()
+  Protected st.i
+
+  st = drbg_Gather(#DRBG_AUTOSEED_BYTES)
+  If st < 0
+    drbg_GatherWipe()
+    ProcedureReturn st
+  EndIf
+
+  st = DrbgInit(@secDrbgSeed[0], #DRBG_AUTOSEED_BYTES)
+  drbg_GatherWipe()
+  ProcedureReturn st
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgAutoReseed() - add 32 fresh hardware bytes to a running DRBG.
+;
+;  SP 800-90A section 10.1.2.4. A reseed needs security_strength bits
+;  of entropy input and NO nonce - the nonce exists to make two
+;  instantiations of the same device different, and a reseed is not an
+;  instantiation.
+;
+;  Refuses with #DRBG_ERR_UNSEEDED if there is nothing to reseed, which
+;  is DrbgReseed's own rule and is not weakened here: quietly promoting
+;  a reseed to an instantiate would let a program that never called
+;  DrbgAutoSeed look like it had.
+; ----------------------------------------------------------------------
+Procedure.i DrbgAutoReseed()
+  Protected st.i
+
+  If drbgSeeded = 0
+    ProcedureReturn #DRBG_ERR_UNSEEDED
+  EndIf
+
+  st = drbg_Gather(#DRBG_RESEED_BYTES)
+  If st < 0
+    drbg_GatherWipe()
+    ProcedureReturn st
+  EndIf
+
+  st = DrbgReseed(@secDrbgSeed[0], #DRBG_RESEED_BYTES)
+  drbg_GatherWipe()
+  ProcedureReturn st
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrbgEntropyStatus() - entropy.pi4's own last word.
+;
+;  The value of the LAST entropy call either auto routine made, so a
+;  #DRBG_ERR_ENTROPY can be attributed without a second run:
+;  #ENTROPY_ERR_TIMEOUT means the block never produced,
+;  #ENTROPY_ERR_HEALTH means it condemned its own output, and a
+;  positive number smaller than the byte count means it stopped part
+;  way. 0 before either has run.
+; ----------------------------------------------------------------------
+Procedure.i DrbgEntropyStatus()
+  ProcedureReturn drbgEntStatus
+EndProcedure
+; ==== PORTABLE CORE A64 END ====

@@ -1,0 +1,4302 @@
+; ======================================================================
+; SDIO for the Raspberry Pi 4 - the bus the on-board WiFi part sits on.
+; Library, not a compiler builtin.
+; ----------------------------------------------------------------------
+; This drives the SECOND SD controller on the BCM2711 - the Arasan
+; SDHCI block at ARM $FE300000 - and speaks SDIO to whatever is wired to
+; it. On a Pi 4 Model B that is exactly one thing: the Cypress /
+; Infineon CYW43455 combo radio, soldered down, on GPIO 34..39.
+;
+; IT IS NOT emmc.pi4 AND IT MUST NOT BECOME emmc.pi4. That file drives
+; EMMC2 at $FE340000, which is the micro-SD socket. Two different
+; controllers, two different pin groups, two different devices, and the
+; only thing they share is that both are SDHCI-class. Nothing in this
+; file touches $FE340000 and nothing in emmc.pi4 touches $FE300000.
+;
+; ======================================================================
+; USE - this file names no other file (house rule: a library never
+; includes a library). The MAIN program lists what it needs:
+;
+;     XIncludeFile "RaspberryPi4/Lib/uart.pi4"     ; to PRINT the reason
+;     XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"  ; REQUIRED - see below
+;     XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+;
+;     MailboxInit()
+;     SdioSetBaseClockKhz(...)      ; see THE BASE CLOCK below
+;     ; WL_ON is no longer the caller's job - see THE POWER RAIL below.
+;
+;     If SdioInit() = 0
+;       PutS(SdioErrorText())
+;       PutS(" cmd=") : PutHex2(SdioLastCmd())
+;       PutS(" intr=") : PutHex8(SdioLastIntr())
+;       PutS(" state=") : PutHex8(SdioLastStatus())
+;     EndIf
+;
+; MAILBOX.PI4 IS NOW A HARD REQUIREMENT AND IT DID NOT USED TO BE.
+; Until 2026-08-26 this file touched nothing but memory-mapped registers,
+; and asserting WL_ON was left to whoever included it. The board then
+; ran the diagnostic for the first time and said that the one step this
+; file did NOT own - the radio's enable pin - is the step that decides
+; whether CMD5 has anywhere to land. Owning half of a bring-up produces
+; a driver that succeeds at every stage it can see and finds nothing.
+;
+; So SdioInit() now asserts WL_ON itself, and asks the firmware about
+; the EMMC clock and the SD power device, before it forms any opinion
+; about the controller. It does that through the property mailbox's
+; PUBLIC ESCAPE HATCH - MailboxBegin / MailboxSetWord / MailboxSend /
+; MailboxWord - and adds no wrapper, because mailbox.pi4 is another
+; worker's file today and because that file's own header (see its
+; ESCAPE HATCH section) says plainly that an unwrapped tag is the
+; caller's to issue. NOTHING HERE EDITS mailbox.pi4.
+;
+; The precedent for one library calling a sibling's public procedures
+; without including it is clocks.pi4, which calls MailboxClockRate() and
+; MailboxClockRateMeasured() exactly this way.
+;
+; IF THE MAILBOX IS NOT READY NONE OF IT IS FATAL. Every mailbox step is
+; guarded by MailboxReady(), records its own outcome, and carries on. A
+; caller that never calls MailboxInit() gets the old behaviour and a set
+; of accessors that say "not attempted" rather than "failed".
+;
+; ======================================================================
+; WHAT HAS AND HAS NOT RUN ON SILICON. READ THIS FIRST.
+; ======================================================================
+; THIS FILE CARRIES THE CYW43455. Everything the Wi-Fi radio has ever
+; done on this board went through the transport in this file, and the
+; radio has been scanned, associated and read back from. The section
+; below used to say the first probe run "IS THE ONLY MEASUREMENT THIS
+; FILE HAS"; that was written on 2026-08-26 at about midday and was
+; overtaken the same evening. It is kept, in order, because the ladder
+; from a refusal to an association is the useful record.
+;
+; ---- WHAT IS PROVEN, IN THE ORDER IT WAS PROVEN ---------------------
+;
+;   2026-08-26 evening - CMD53 BLOCK MODE, and both bugs were ours.
+;   From the board, `pi4WifiUp`/`pi4SdioProbe`:
+;
+;       byte-mode max              64      the number that was wrong
+;       card can multi-block        1      CCCR CAPS bit SMB
+;       byte-mode read (want 1)     1      THE CONTROL. Previously 0.
+;       control mismatches          0      and not "NOT COMPARED"
+;       block-mode read (want 1)    1      bytes compared 256, 0 bad
+;
+;   So a CMD5 HAS been answered, an OCR busy bit HAS set, an RCA HAS
+;   been published, CCCR bytes HAVE been read back, and 256 bytes HAVE
+;   crossed the Buffer Data Port in one block-mode transfer. Every item
+;   on the old "STILL NEVER OBSERVED" list below is now observed.
+;
+;   The two defects were both this file's:
+;     * 512 IS THE PROTOCOL'S BYTE-MODE CEILING, NOT THE FUNCTION'S.
+;       Linux takes the minimum of three bounds
+;       (v6.12_linux_mmc_sdio_io.c:189-202): the host's max_blk_size
+;       (512), the FUNCTION's current block size (64), and a flat 512.
+;       Sixty-four. Every CMD53 this project had ever issued before was
+;       a 4-byte backplane register read, so the bound had never been
+;       reachable - the caller that used a length nobody had tried is
+;       what exposed it, not the refactor.
+;     * AN R5 REFUSAL LEFT THE DATA LINE INHIBITED. sdio_CheckR5 had
+;       returned without resetting DAT since the file was written and
+;       had never fired, because no card had ever been handed a CMD53 it
+;       was willing to refuse. The controller reported Command Complete
+;       with no error bit, so nothing reset anything; DAT Inhibit stayed
+;       asserted and every later command died of SDIO_ERR_INHIBIT with
+;       `intr $00000000`. Fixed in sdio_Cmd53Xfer. THE REFUSAL IS THE
+;       FAULT AND THE NEVER-STARTED COMMAND IS THE WRECKAGE - a stuck
+;       bus makes every subsequent symptom a lie, including
+;       Cyw43PrepareDownload's "32-bit backplane read failed" two files
+;       away.
+;
+;   2026-08-26 late - 609,309 BYTES OF FIRMWARE ACROSS THIS TRANSPORT,
+;   verified byte for byte against a read-back, NVRAM cooked from 2074
+;   to 1748 bytes and placed at the top of the radio's RAM, and the
+;   CYW43455's ARM released:
+;
+;       EMMC clock Hz (id 1)  250000000    base clock kHz  250000
+;       SdioInit / enable F1 / Cyw43Attach     1 1 1
+;       block mode on                          1
+;       Cyw43UploadFirmware / UploadNvram      1 1
+;       Cyw43Start                             1
+;       ram base $00198000   ram size 819200 ($C8000)
+;
+;   2026-08-27 - the radio SCANNED (two networks, five escan records)
+;   and ASSOCIATED on 2.4 GHz, with four read-backs against a baseline
+;   taken before the join: BSSID 04:42:1A:A5:BC:90 byte for byte,
+;   SSID, channel 2, RSSI -35 dBm. Every one of those bytes travelled
+;   through this file.
+;
+; ---- SdioInit NEEDS A CLOCK FROM THE MAILBOX AND SAYS SO ------------
+;
+; On a BCM2711 the SDHCI Capabilities register reads back ZERO for the
+; base-clock field, so the controller cannot be asked how fast it is
+; fed; only the VideoCore firmware knows. CLOCK ID 1 IS EMMC, NOT
+; EMMC2 - different clocks feeding different controllers. Getting it
+; wrong does not refuse; it yields a plausible number and a bus at the
+; wrong speed, which reads as bad silicon.
+;
+; ---- THE FIRST RUN, kept because it is where the address was settled -
+;
+; Written 2026-08-25 with no board. On 2026-08-26 the bench ran
+; RaspberryPi4/Examples/Diagnostics/pi4SdioProbe.pi4 for the first time
+; and it REFUSED:
+;
+;     mailbox init (want 1)     1
+;     WL_ON asserted (want 1)   0
+;     EMMC clock Hz (id 1)      250000000
+;     SdioInit (want 1)         0
+;     sdio: Capabilities register all-zero or all-ones - wrong device?
+;     last cmd $FF  last intr $00000000  last state $000F0001
+;
+; and then, read by hand from the monitor prompt:
+;
+;     SDIO  $FE300000 (base+00) = $00000000
+;     SDIO  $FE300040 (CAPS)    = $00000000
+;     SDIO  $FE300044 (CAPS_HI) = $00000000
+;     SDIO  $FE3000FC           = $99020000   <- HOST VERSION ANSWERS
+;     EMMC2 $FE340000 (base+00) = $00000000
+;     EMMC2 $FE340040 (CAPS)    = $45EE6432   <- the neighbour is fine
+;     EMMC2 $FE3400FC           = $10020000
+;     SDHOST $FE202000          = $00000000
+;
+; SO THE ADDRESS IS RIGHT AND THE BLOCK IS DECODING. $FE3000FC is the
+; word holding Slot Interrupt Status at $FC and Host Controller Version
+; at $FE; the top half is $9902, which is specification version 2 -
+; SDHCI 3.00 - and vendor version $99. Two independent facts fall out of
+; that single word: reads of this window reach real silicon, and the
+; silicon they reach identifies itself as an SDHCI host. The EMMC2 line
+; is the control: the same code, the same translation, $40000 higher, a
+; populated Capabilities register. NOBODY SHOULD EVER AGAIN GO LOOKING
+; AT THE BASE ADDRESS OR AT THE LOW-PERIPHERAL TRANSLATION BECAUSE OF A
+; ZERO CAPABILITIES REGISTER, and the paragraph after next is why.
+;
+; ~~STILL NEVER OBSERVED, not once: a CMD5 answered, an OCR busy bit~~
+; ~~setting, an RCA published, a CCCR byte read back, a byte crossing~~
+; ~~the Buffer Data Port.~~
+;
+; ALL FIVE WERE OBSERVED THE SAME EVENING. That list is struck through
+; rather than deleted because it is the exact shape of what a first
+; silicon run leaves open, and it was answered in one session - a
+; reminder that this kind of list expires fast and must be dated.
+;
+; ---- WHAT IS STILL NOT PROVEN ---------------------------------------
+;
+;   * A COLD POWER-ON OF THE RADIO. `WL_ON asserted 1` is in the good
+;     transcripts, but it is proven only on the path this board takes -
+;     WL_ON SHORT-CIRCUITS when the pin is already an output and already
+;     high, which on this board it always is. That short-circuit is the
+;     fix for the original `WL_ON asserted (want 1) 0`: we had been
+;     failing because we could not SET something that was already SET.
+;     So the code that actually DRIVES the line from low to high has
+;     still never been the thing that turned the radio on here.
+;   * ANY SD CARD. This file drives the SDIO block at $FE300000, which
+;     on a Pi 4 is the Wi-Fi chip. The card slot is EMMC2 at $FE340000
+;     and belongs to emmc.pi4 - read its header, not this one.
+;   * 4-BIT BUS WIDTH ABOVE THE RATES USED SO FAR, high-speed modes, and
+;     1.8V signalling. Nothing here has been pushed past what the
+;     firmware upload needed.
+;
+; Also: it compiles, and tools/a64/a64_sdio_check.py runs the diagnostic
+; against a modelled SDHCI controller whose expected register offsets
+; and command encodings are parsed OUT OF THE VENDOR SOURCES rather than
+; out of this file, so the gate and the library are two independent
+; readings of one document and can disagree.
+;
+; ======================================================================
+; THE CAPABILITIES REGISTER READS ZERO HERE AND THAT IS NOT A FAULT
+; ======================================================================
+; This file used to refuse with #SDIO_ERR_NO_CAPS - "Capabilities
+; register all-zero or all-ones - wrong device?" - and that refusal cost
+; the bench an afternoon looking at an address that was correct. The
+; refusal is gone. Here is the argument for removing it, which is
+; stronger than the argument that put it in.
+;
+; THE DRIVER RASPBERRY PI SHIPS FOR THIS EXACT BLOCK NEVER READS THAT
+; REGISTER. mmcnr@7e300000's first compatible string is
+; "brcm,bcm2835-mmc" and the driver behind it is on this disk:
+; Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm2835-mmc.c. In that whole file
+; SDHCI_CAPABILITIES appears once, at lines 255-257, inside
+; bcm2835_dumpregs()'s pr_debug block. It is printed and it is never
+; used. Specifically:
+;
+;   * THE BASE CLOCK does not come from Capabilities bits 13:8. Line
+;     1452: "host->max_clk = clk_get_rate(clk);" - the device tree's
+;     clock, which for this node is BCM2835_CLOCK_EMMC (bcm270x.dtsi
+;     line 42), which is firmware clock id 1. Line 1295 then derives
+;     f_min from it. This file already had to ask the mailbox for that
+;     number - see THE BASE CLOCK below - so it was never depending on
+;     Capabilities for it either.
+;
+;   * THE 3.3 VOLT RAIL is not gated on SDHCI_CAN_VDD_330. Lines
+;     1180-1182 write SDHCI_POWER_330 | SDHCI_POWER_ON unconditionally.
+;
+;   * THE HOST CAPABILITY FLAGS are hard-coded, lines 1302-1306:
+;     MMC_CAP_CMD23, MMC_CAP_NEEDS_POLL, MMC_CAP_SDIO_IRQ, the two
+;     HIGHSPEED bits and MMC_CAP2_SDIO_IRQ_NOTHREAD, all assigned, none
+;     read from the controller.
+;
+; A driver that consults a register for nothing is a driver that has
+; been written against silicon which does not populate it. An all-zero
+; Capabilities on this block is therefore EXPECTED, not diagnostic, and
+; a bring-up that stops there stops for no reason.
+;
+; WHAT REPLACES THE REFUSAL: the value is READ, RECORDED and REPORTED -
+; SdioCaps0(), SdioCaps1() and SdioCapsAreZero() - and the sequence
+; carries on. The remaining plausibility test is the Host Controller
+; Version register, which on this board did answer, and which is the
+; only register in the window with a value this file can argue about.
+;
+; #SDIO_ERR_NO_CAPS IS RETIRED, NOT RENUMBERED. Nothing raises it any
+; more. Its number stays 4 and its slot stays occupied because the
+; codes below it are printed into bench logs and referenced by
+; tools/a64/a64_sdio_check.py, and shifting thirty numbers to reclaim
+; one would silently rewrite the meaning of every log already filed.
+;
+; ======================================================================
+; THE CONTROLLER, AND WHY THE BRIEF'S "SDHOST" IS THE WRONG BLOCK
+; ======================================================================
+; This work was commissioned as "EMMC/SDHOST, mmcnr@7e300000". Those are
+; two different controllers and only one of them is the right one. It is
+; worth writing down which, because picking the wrong one produces the
+; exact failure this project keeps paying for: stores to a real, powered,
+; idle peripheral that produce no output and no error.
+;
+; THE BCM2711 HAS THREE SD CONTROLLERS:
+;
+;   sdhost   mmc@7e202000, "brcm,bcm2835-sdhost"
+;            Datasheets/pi4/bcm283x.dtsi lines 314-320.
+;            DISABLED on a Pi 4 Model B -
+;            Datasheets/pi4/bcm2711-rpi-4-b.dts lines 416-418:
+;                &sdhost { status = "disabled"; };
+;
+;   sdhci    mmc@7e300000, "brcm,bcm2835-sdhci"
+;            Datasheets/pi4/bcm283x.dtsi lines 423-429.
+;            The Arasan block. THIS ONE.
+;
+;   emmc2    mmc@7e340000, "brcm,bcm2711-emmc2"
+;            Datasheets/pi4/bcm2711.dtsi lines 426-431.
+;            The micro-SD socket. emmc.pi4 owns it.
+;
+; AND SDHOST CANNOT DO SDIO AT ALL. Not "is not used for"; cannot. From
+; the header of the driver itself,
+; Datasheets/pi4/uboot/v2025.01_bcm2835_sdhost.c lines 5-13:
+;
+;     "The 2835 has two SD controllers: The Arasan sdhci controller
+;      (supported by the iproc driver) and a custom sdhost controller
+;      (supported by this driver).
+;      The sdhci controller supports both sdcard and sdio.  The sdhost
+;      controller supports the sdcard only, but has better performance.
+;      Also note that the rpi3 has sdio wifi, so driving the sdcard with
+;      the sdhost controller allows to use the sdhci controller for wifi
+;      support."
+;
+; That file was fetched for this work and it is kept, because it is the
+; citation for a NEGATIVE claim and negative claims are the ones that
+; rot fastest. It is not the register map for anything here.
+;
+; WHAT mmcnr@7e300000 ACTUALLY IS: a second device-tree node over the
+; SAME registers as sdhci, marked non-removable, so the downstream
+; kernel can bind a different driver to it.
+; Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm270x.dtsi lines 49-60:
+;
+;     /* A clone of mmc but with non-removable set */
+;     mmcnr: mmcnr@7e300000 {
+;         compatible = "brcm,bcm2835-mmc", "brcm,bcm2835-sdhci";
+;         reg = <0x7e300000 0x100>;
+;         ...
+;         non-removable;
+;
+; and the WiFi part hangs off it -
+; Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm2711-rpi-ds.dtsi lines 189-198:
+;
+;     &mmcnr {
+;         ...
+;         brcmf: wifi@1 {
+;             reg = <1>;
+;             compatible = "brcm,bcm4329-fmac";
+;         };
+;     };
+;
+; So: SDHCI registers, at bus $7E300000, window $100 bytes.
+;
+; THE BUS-TO-ARM TRANSLATION is the one already proven on this bench for
+; two other peripherals. bcm2711.dtsi's soc node carries
+; ranges = <0x7e000000 0x0 0xfe000000 0x01800000>, so bus $7Enn_nnnn is
+; ARM $FEnn_nnnn in Low Peripheral mode; $300000 is inside the
+; $01800000 window. uart.pi4 reaches the PL011 at $FE201000 and has
+; PRINTED ON SILICON, and emmc.pi4 uses $FE340000 from the same
+; translation. If the PL011 is where this map says it is, so is this.
+;
+; $FE300000 + $FF is the last byte this file may touch. The highest
+; offset used is $FE, the Host Controller Version register.
+;
+; ======================================================================
+; THE REGISTER MAP - WHERE IT CAME FROM, AND WHY IT IS BETTER SOURCED
+; THAN emmc.pi4's
+; ======================================================================
+; emmc.pi4's header has to say, honestly, that its offsets come from the
+; SD Host Controller Simplified Specification and that that document is
+; not in this repository. This file does not have that problem, and the
+; difference is worth a paragraph because it is the reason this file
+; was allowed to exist at all under the cite-or-refuse rule.
+;
+; The node's compatible string is "brcm,bcm2835-mmc" first. That binds
+; to a real driver whose source was fetched for this work:
+;
+;     Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm2835-mmc.c
+;     raspberrypi/linux rpi-6.12.y, drivers/mmc/host/bcm2835-mmc.c
+;
+; and that driver's register names come from
+;
+;     Datasheets/pi4/rpi-linux/rpi-6.12.y_sdhci.h
+;     raspberrypi/linux rpi-6.12.y, drivers/mmc/host/sdhci.h
+;
+; EVERY offset and EVERY bit below carries a line number in that header.
+; That is a file on this disk, not a specification somebody else has.
+;
+; TWO RULES THE BCM2711's ARASAN BLOCK IMPOSES, both read out of
+; bcm2835-mmc.c, both of which will silently corrupt a register if
+; ignored:
+;
+;   1. THIRTY-TWO BIT ACCESSES ONLY. bcm2835-mmc.c has no byte or
+;      halfword store to this block at all: bcm2835_mmc_writeb (lines
+;      178-186) and bcm2835_mmc_writew (lines 161-176) both READ the
+;      enclosing 32-bit word, splice the field in, and write 32 bits
+;      back. Everything here uses PeekN / PokeL, which are 32-bit, and
+;      every 8- or 16-bit SDHCI register is reached by read-modify-write
+;      of the word it lives in.
+;
+;   2. THE COMMAND REGISTER IS SHADOWED WITH TRANSFER MODE.
+;      TRANSFER_MODE is 16 bits at $0C and COMMAND is 16 bits at $0E, so
+;      they share one word. bcm2835_mmc_writew (line 162) keeps a
+;      software shadow of TRANSFER_MODE and only commits it WHEN COMMAND
+;      IS WRITTEN, because writing $0C on its own would also rewrite
+;      $0E and re-issue the previous command. This file composes the
+;      whole 32-bit word - transfer mode in the low half, command in the
+;      high half - and writes it once, which is the same thing done
+;      without the shadow, and is also exactly what emmc.pi4 does with
+;      its CMDTM word.
+;
+; ======================================================================
+; THE PINS - GPIO 34..39, ALT3, AND THIS FILE MUXES THEM ITSELF
+; ======================================================================
+; Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm2711-rpi-ds.dtsi lines 317-321:
+;
+;     sdio_pins: sdio_pins {
+;         brcm,pins =     <34 35 36 37 38 39>;
+;         brcm,function = <BCM2835_FSEL_ALT3>; // alt3 = SD1
+;         brcm,pull =     <0 2 2 2 2 2>;
+;     };
+;
+; and Datasheets/pi4/bcm2711-rpi-4-b.dts lines 271-276 attaches exactly
+; that group to &mmcnr with bus-width = <4>.
+;
+; BCM2835_FSEL_ALT3 IS 7, not 3, and getting that wrong is a whole
+; afternoon. Datasheets/pi4/rpi-linux/rpi-6.12.y_dt-bindings_pinctrl_bcm2835.h
+; line 20:  #define BCM2835_FSEL_ALT3   7
+; The device-tree names count in the order the FSEL field encodes, which
+; is IN, OUT, ALT5, ALT4, ALT0, ALT1, ALT2, ALT3 - so ALT3 is the last
+; encoding, 0b111.
+;
+; ======================================================================
+; THE PULL ENCODING IS INVERTED BETWEEN THE DEVICE TREE AND THE BCM2711,
+; AND THIS FILE HAD IT WRONG UNTIL 2026-08-26
+; ======================================================================
+; THE SENTENCE THAT USED TO BE HERE SAID THE OPPOSITE OF THE TRUTH. It
+; read: "The same header gives the pulls: BCM2835_PUD_OFF 0,
+; BCM2835_PUD_DOWN 1, BCM2835_PUD_UP 2 (lines 22-24), and those values
+; are also what the BCM2711's GPIO_PUP_PDN_CNTRL registers take." The
+; last clause is false. It is preserved here, in full, because a
+; correction that deletes the mistake teaches nobody why the mistake was
+; easy.
+;
+; THE DEVICE TREE'S NUMBERING,
+; Datasheets/pi4/rpi-linux/rpi-6.12.y_dt-bindings_pinctrl_bcm2835.h
+; lines 22-24:
+;
+;     #define BCM2835_PUD_OFF     0
+;     #define BCM2835_PUD_DOWN    1
+;     #define BCM2835_PUD_UP      2
+;
+; THE HARDWARE'S NUMBERING, Datasheets/bcm2711-peripherals.txt Table 90
+; at line 6304, the field description at lines 6315-6318:
+;
+;     00 = No resistor is selected
+;     01 = Pull up resistor is selected
+;     10 = Pull down resistor is selected
+;     11 = Reserved
+;
+; UP AND DOWN ARE SWAPPED. The device tree says up is 2; the register
+; says 2 is down. Both documents are correct about their own subject -
+; the device tree value is consumed by a pinctrl driver that translates
+; it, and this file has no pinctrl driver, so this file must write the
+; register's numbering and not the device tree's.
+;
+; WHAT THAT DID. The source group says <0 2 2 2 2 2> and this file wrote
+; those numbers straight through, so GPIO35..39 - CMD and DAT0..3 - were
+; programmed b10, PULL DOWN, on lines that must idle HIGH. The board's
+; answer to CMD5 was $00048000: SDHCI_INT_ERROR plus SDHCI_INT_END_BIT,
+; a Command End Bit Error. The end bit of an SD response is the last bit
+; before the card releases the line, and it must be 1; a pull-down
+; dragging CMD towards 0 at exactly that moment is a textbook cause. The
+; response arrived - that is what makes an end-bit error different from
+; a timeout - and its final bit was wrong.
+;
+; THE CORROBORATION IS IN THIS TREE AND IT HAS PRINTED ON SILICON.
+; RaspberryPi4/Lib/uart.pi4 lines 269-273 quotes Table 90 correctly and
+; writes b01 for the pull-up on GPIO15. That file's output is how this
+; bench reads every one of these logs. The precedent this file claimed
+; to be following was right all along; only the transcription was wrong.
+;
+; SO THE PULLS ARE: GPIO34 (CLK) no resistor, GPIO35..39 (CMD, DAT0..3)
+; PULL UP, written as #SDIO_PULL_UP, which is 1. That asymmetry is not
+; an accident and it is not ours to tidy: a clock line is driven at both
+; ends and wants no resistor, while a command or data line that nobody
+; is driving must idle high or the controller reads a permanent start
+; condition.
+;
+; AND THE ROLES ARE UNCHANGED, ONLY THE ENCODING. Do not "fix" this by
+; changing which pins get pulled; the device tree's INTENT - none on the
+; clock, up on the other five - was always right and is what is
+; implemented. What changed is the number that means "up".
+;
+; WHY THIS FILE MUXES ITS OWN PINS instead of calling gpio.pi4's
+; PinAlt() and PinPull(): the house rule is that a library never
+; includes a library, and this is a bring-up dependency, not an optional
+; extra - a driver that cannot reach its own pins is not a driver. The
+; precedent is uart.pi4's uart_MuxPins(), which does the same thing for
+; GPIO 14/15 for the same reason. sdio_MuxPins() below is that
+; procedure's shape with different numbers.
+;
+; GPIO 34..39 ARE ALL IN GPFSEL3. GPFSEL registers hold ten pins each,
+; three bits per pin, so pin p lives in GPFSEL(p/10) at bit (p%10)*3.
+; 34..39 are pins 4..9 of GPFSEL3, bits 12 through 29. Bits 30 and 31 of
+; that register are reserved and are left alone.
+;
+; THE PULL REGISTER IS THE BCM2711's, NOT THE BCM2835's. GPIO_PUP_PDN_CNTRL_REG0
+; is at GPIO base + $E4 and holds sixteen pins, two bits each - so 34..39
+; are in REG2 at base + $EC, bits 4 through 15. There is NO GPPUD /
+; GPPUDCLK clock-and-wait dance on this part; if you are porting Pi 3
+; code and it has two delay loops in it, the delays are not the part to
+; keep, the register is wrong. uart.pi4's header makes the same point at
+; more length and it was learned there first.
+;
+; ======================================================================
+; AN OPEN QUESTION: EVERY EXPANDER *GET* PASSES AND EVERY EXPANDER *SET*
+; COMES BACK AS #MBX_ERR_TAG. TWO EXPLANATIONS FIT AND THEY ARE
+; OPPOSITES. DO NOT ACT ON EITHER YET.
+; ======================================================================
+; THIS SECTION USED TO STATE A PLATFORM CONSTRAINT AND IT NO LONGER
+; DOES. It said, in as many words, that this firmware lets a bare-metal
+; program observe the expander and not command it. That conclusion was
+; withdrawn on 2026-08-26 before it could be acted on, and the reason it
+; is worth recording as a near-miss is that it was about to be written
+; into this file as settled fact on the strength of one symptom.
+;
+; WHAT WAS MEASURED, and this part is not in doubt. Four expander
+; property tags were sent to firmware GPIO 129 in one run:
+;
+;     GET_GPIO_CONFIG  $00030043   passed. direction 1, polarity 0.
+;     GET_GPIO_STATE   $00030041   passed. level 1.
+;     SET_GPIO_CONFIG  $00038043   came back as #MBX_ERR_TAG.
+;     SET_GPIO_STATE   $00038041   came back as #MBX_ERR_TAG.
+;
+; EXPLANATION ONE - THE FIRMWARE DECLINES THE WRITES. #MBX_ERR_TAG is
+; raised by mailbox.pi4 when the transaction completed, the whole-buffer
+; code said SUCCESS, and that tag's own response bit was left clear.
+; That is the property protocol's way of saying "received and not
+; serviced". If it is the right reading, the expander is readable and
+; not writable from here, and no amount of retrying would change it.
+;
+; EXPLANATION TWO - WE ARE MISREADING A SUCCESS. mailbox.pi4 checks
+; EVERY INDIVIDUAL TAG's response bit and its own header records that
+; this is STRICTER THAN U-BOOT, which checks only the whole-buffer code.
+; A set-type tag has nothing it needs to return. If this firmware
+; answers a SET with a zero-length response and the bit clear, our check
+; would report #MBX_ERR_TAG on a tag the firmware actually honoured. On
+; that reading all three sets worked and we disowned them. Another
+; worker is testing this now; it is their question, not this file's.
+;
+; ---- WHAT THIS FILE'S OWN EVIDENCE SAYS ABOUT THE TWO ---------------
+; Recorded here because it bears directly on somebody else's
+; investigation, and stated as evidence rather than as a verdict.
+;
+;   1. A SET-TYPE TAG PASSED THE PER-TAG CHECK ON THIS FIRMWARE, IN THIS
+;      RUN. SET_CLOCK_STATE $00038001 came back MBX_OK with a reply word
+;      of 1. So the strict per-tag check does not reject set-type tags
+;      as a class, and whatever is happening to the two GPIO sets is not
+;      simply "mailbox.pi4 is strict about SETs". That is the strongest
+;      single fact either way and it argues for explanation one.
+;
+;   2. ALL THREE SETS ARE DOCUMENTED TO RETURN A PAYLOAD, so none of
+;      them is the zero-length case in the abstract. The expander
+;      driver reads set_out.gpio back and tests it - lines 124-127 for
+;      the config path, lines 191-194 for the state path - which it
+;      could not do if the firmware returned nothing. That is what the
+;      KERNEL expects, though, not what this firmware was seen to do.
+;
+;   3. WL_ON READING BACK HIGH IS NOT EVIDENCE FOR EITHER. It was
+;      already high before this file wrote anything: the level came from
+;      GET_GPIO_STATE at rung 6, ahead of both sets. The firmware had
+;      powered the radio at boot, which is consistent with
+;      bcm2711-rpi-4-b.dts lines 268-270 deleting the wifi-pwrseq node.
+;      A successful write and a no-op write are indistinguishable on a
+;      pin that was already in the wanted state, so this observation
+;      discriminates nothing.
+;
+; ---- HOW TO SETTLE IT, CHEAPLY --------------------------------------
+; SdioWlOnConfigRespBytes() and SdioClockSetRespBytes() report
+; MailboxRespBytes() captured straight after each set - the length field
+; of that tag's own code word. A zero length beside a cleared response
+; bit is explanation two's signature; a set-type tag that returns its
+; documented eight bytes while still failing the check is not.
+;
+; ---- AND SO NOTHING HERE DEPENDS ON THE ANSWER ----------------------
+; SdioAssertWlOn() reads first and writes only if it must, and on this
+; board it sends no write at all. That is correct under BOTH readings,
+; which is why it was safe to land while the question is open. If
+; explanation two turns out to be right, nothing in this file has to
+; change; only this section does.
+;
+; ======================================================================
+; THE POWER RAIL - WL_ON, AND THIS FILE NOW ASSERTS IT
+; ======================================================================
+; The CYW43455's enable pin is not on any GPIO this file can reach. It
+; is on the firmware-owned GPIO expander:
+; Datasheets/pi4/bcm2711-rpi-4-b.dts lines 61-70,
+;
+;     &expgpio {
+;         gpio-line-names = "BT_ON",        /*  0 */
+;                           "WL_ON",
+;                           ...
+;
+; and that expander is only reachable through the VideoCore property
+; mailbox. Datasheets/pi4/rpi-linux/rpi-6.12.y_gpio-raspberrypi-exp.c
+; line 20 gives the offset that turns an expander pin into a firmware
+; GPIO number:
+;
+;     #define RPI_EXP_GPIO_BASE   128
+;
+; used at line 111 as "set_out.gpio = off + RPI_EXP_GPIO_BASE". So
+; WL_ON is firmware GPIO 129, and driving it high is
+; RPI_FIRMWARE_SET_GPIO_CONFIG ($00038043,
+; Datasheets/pi4/raspberrypi-firmware.h line 88) with the six-word
+; payload from that file's struct gpio_set_config (lines 32-39):
+;
+;     gpio, direction, polarity, term_en, term_pull_up, state
+;
+; with direction = OUT and state = 1. Thereafter
+; RPI_FIRMWARE_SET_GPIO_STATE ($00038041, header line 85) with
+; { gpio, state } is enough to toggle it (struct gpio_get_set_state,
+; lines 49-52 of the expander driver).
+;
+; THE 128 IS CORROBORATED BY A SECOND, INDEPENDENT SOURCE, and it is
+; worth writing down because the whole radio hangs off that one number.
+; Datasheets/pi4/hdmi/firmware-Mailbox-property-interface.md documents
+; tags $00030041 and $00038041 under their ORIGINAL name, "Get/Set
+; onboard LED status", and lists the legal pin numbers at lines 322-324:
+; "42: status led" and "130: power led". Expander line 2 is named
+; "PWR_LED_OFF" in bcm2711-rpi-4-b.dts line 64. 128 + 2 = 130. Two
+; documents written years apart, for two different purposes, agree on
+; the base. The tag was later generalised from LEDs to the whole
+; expander, which is why the modern kernel header calls the same numbers
+; GET_GPIO_STATE and SET_GPIO_STATE.
+;
+; THE PAYLOAD SIZES ARE NOT ALL THE SAME AND GETTING ONE WRONG IS A
+; SILENT REFUSAL. rpi_firmware_property() sends ONE size that serves as
+; both the request length and the response buffer length -
+; Datasheets/pi4/raspberrypi-firmware.c line 172,
+; "header->buf_size = buf_size" - and that size is sizeof() of the
+; struct the caller passed. The three structs, from the expander driver:
+;
+;     struct gpio_set_config      lines 32-39   6 words   24 bytes
+;     struct gpio_get_config      lines 41-47   5 words   20 bytes
+;     struct gpio_get_set_state   lines 49-52   2 words    8 bytes
+;
+; GET_GPIO_CONFIG IS TWENTY BYTES, NOT TWENTY-FOUR. The set struct has a
+; trailing "state" field and the get struct does not. The diagnostic
+; asked for 24 on its first ever run and WL_ON came back 0; that is the
+; leading suspect and it is fixed in both files.
+;
+; WHY THIS FILE DOES IT NOW. The old text here said sdio.pi4 could not,
+; because it would then only compile beside mailbox.pi4. That trade was
+; taken and it was the wrong one - see MAILBOX.PI4 IS NOW A HARD
+; REQUIREMENT above. The sequence is: read the polarity back with
+; GET_GPIO_CONFIG and keep it (the expander driver does exactly this at
+; lines 117-120, "Retain existing setting" - inventing a polarity is a
+; one-in-two chance of switching the radio OFF while reporting success),
+; then SET_GPIO_CONFIG with direction OUT and state 1, then
+; SET_GPIO_STATE with state 1 as well. The last of those three is
+; belt-and-braces and costs one transaction: the config call is what
+; rpi_exp_gpio_dir_out() does and the state call is what
+; rpi_exp_gpio_set() does, and a driver that has never seen this
+; firmware answer should do both rather than assume the first implies
+; the second.
+;
+; AND WL_ON IS NOT ASSERTED FOR US AT BOOT. bcm2711-rpi-4-b.dts lines
+; 268-270 delete the wifi-pwrseq node outright, so Linux does not
+; sequence it on this board either; the firmware owns it. The board has
+; now said what that means in practice for a bare-metal image, and the
+; answer was "WL_ON asserted (want 1) 0" - the very first thing the
+; diagnostic printed. Whatever start4.elf leaves behind, it is not a
+; radio this file can assume is awake.
+;
+; ======================================================================
+; IS THE CONTROLLER ITSELF POWER-GATED OR CLOCK-GATED? - WHAT THE
+; SOURCES ON THIS DISK DO AND DO NOT SETTLE
+; ======================================================================
+; The question that produced this section: the Host Controller Version
+; register answered and Capabilities read zero, so is the block being
+; held unpowered or unclocked? The answer turned out to be that the
+; premise was wrong - see THE CAPABILITIES REGISTER READS ZERO above -
+; but the power and clock questions were worth asking and the answers
+; are worth keeping, because the next person will ask them too.
+;
+; THERE IS NO SD OR SDIO POWER DOMAIN. The newer firmware interface,
+; SET_DOMAIN_STATE $00038030 / GET_DOMAIN_STATE $00030030
+; (Datasheets/pi4/hdmi/raspberrypi-firmware-downstream.h lines 77 and
+; 86), takes a domain index from
+; Datasheets/pi4/v3d/linux/rpi-power-bindings.h lines 12-36. That list
+; is twenty-three entries long - I2C0, I2C1, I2C2, VIDEO_SCALER, VPU1,
+; HDMI, USB, VEC, JPEG, H264, V3D, ISP, UNICAM0, UNICAM1, CCP2RX, CSI2,
+; CPI, DSI0, DSI1, TRANSPOSER, CCP2TX, CDP, ARM - and there is no SD, no
+; SDIO, no EMMC and no MMC anywhere in it. So the domain interface is
+; not the route to this controller and this file does not send that tag.
+;
+; THE OLDER INTERFACE HAS A DEVICE ID THAT MIGHT BE THIS BLOCK, AND
+; NOTHING ON THIS DISK SAYS WHETHER IT IS. SET_POWER_STATE $00028001
+; and GET_POWER_STATE $00020001 take a device id, and id 0 is named two
+; different things by the two sources here:
+;
+;     Datasheets/pi4/uboot/v2025.01_mbox.h line 177
+;         #define BCM2835_MBOX_POWER_DEVID_SDHCI   0
+;     Datasheets/pi4/hdmi/firmware-Mailbox-property-interface.md line 168
+;         * 0x00000000: SD Card
+;
+; "SDHCI" would be the Arasan block this file drives. "SD Card" would be
+; the micro-SD socket, which on a BCM2711 is EMMC2 and is emmc.pi4's.
+; Those are different controllers and the two documents do not agree
+; about which one id 0 means. The same doc then lists ids 9 and 10 as
+; "Unknown (RPi4)" (lines 177-178), which is a written admission that
+; the device-id table was never updated for this part.
+;
+; SO THIS FILE ASKS RATHER THAN ASSERTS. sdio_QueryPower() sends
+; GET_POWER_STATE for one device id and records the two answer bits -
+; bit 0 on/off, bit 1 "device does not exist"
+; (firmware-Mailbox-property-interface.md lines 190-193). SdioInit()
+; queries id 0, and the diagnostic sweeps 0 through 10 and prints the
+; table, because one bench run settles what no file here does.
+;
+; THE ONLY THING THIS FILE WILL SET is device id 0 to ON, and only when
+; the firmware has just said that id 0 exists and is OFF. Turning
+; something on that is already on is a no-op; turning the SD card's
+; controller on when it is already running the boot medium is the same
+; no-op. Nothing here ever sends state 0, to any device id, ever. A
+; driver for the radio has no business switching the boot medium off,
+; and if id 0 does mean "SD Card" that is exactly what an "off" would
+; do.
+;
+; THE CLOCK. mmcnr@7e300000 declares BCM2835_CLOCK_EMMC
+; (Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm270x.dtsi line 42) and the
+; mailbox id for that clock is 1
+; (Datasheets/pi4/uboot/v2025.01_bcm283x_mbox.h line 229). See THE BASE
+; CLOCK below for why it is 1 and not 12.
+;
+; AND THE 250 MHz THE FIRST BENCH RUN PRINTED DOES NOT MEAN THE CLOCK IS
+; RUNNING. GET_CLOCK_RATE $00030002 is documented at
+; firmware-Mailbox-property-interface.md line 310 as: "Next enable rate
+; should be returned even if the clock is not running." It is the rate
+; the clock WOULD have. A gated clock answers that question with a
+; number and tells you nothing. The tag that answers the real question
+; is GET_CLOCK_STATE $00030001, whose response bit 0 is 0=off / 1=on and
+; whose bit 1 is 0=exists / 1=does not exist (same document, lines
+; 257-271); SET_CLOCK_STATE $00038001 takes the same two words back
+; (lines 273-292). Both numbers are also in
+; Datasheets/pi4/hdmi/raspberrypi-firmware-downstream.h at lines 55 and
+; 81. A second, independent witness costs one more transaction:
+; GET_CLOCK_MEASURED $00030047 reports what the firmware OBSERVES rather
+; than what it intends, and mailbox.pi4 already wraps it as
+; MailboxClockRateMeasured(). A configured 250 MHz beside a measured 0
+; would be a gated clock saying so out loud.
+;
+; THIS FILE TURNS CLOCK 1 ON IF, AND ONLY IF, THE FIRMWARE SAYS IT
+; EXISTS AND IS OFF. It never turns a clock off.
+;
+; ======================================================================
+; THE BASE CLOCK - THE WEAKEST NUMBER HERE, AND IT REFUSES
+; ======================================================================
+; SDHCI puts the base clock in the Capabilities register:
+; rpi-6.12.y_sdhci.h lines 214-215, SDHCI_CLOCK_BASE_MASK is bits 13:8
+; in MHz. A zero there means "not obtainable from this register", which
+; is what Broadcom's blocks report, and it is why U-Boot's driver for
+; the neighbouring controller asks the firmware instead:
+; v2025.01_bcm2835_sdhost.c line 784,
+;
+;     host->max_clk = bcm2835_get_mmc_clock(BCM2835_MBOX_CLOCK_ID_CORE);
+;
+; THE CLOCK ID FOR THIS CONTROLLER IS *EMMC*, NOT EMMC2 AND NOT CORE.
+; bcm270x.dtsi line 42 gives mmcnr clocks = <&clocks BCM2835_CLOCK_EMMC>,
+; and the mailbox id for that is 1 -
+; Datasheets/pi4/uboot/v2025.01_bcm283x_mbox.h line 229:
+;
+;     #define BCM2835_MBOX_CLOCK_ID_EMMC   1
+;
+; while EMMC2, the micro-SD controller emmc.pi4 drives, is 12 (line
+; 239). THOSE ARE DIFFERENT CLOCKS AND THEY DO NOT HAVE TO BE THE SAME
+; RATE. The 250000 kHz that fat.pi4's header records as measured for
+; EMMC2 is EMMC2's number. Do not paste it in here; ask the mailbox for
+; clock 1 and pass what it says.
+;
+; SO: if Capabilities reports zero and nobody has called
+; SdioSetBaseClockKhz(), SdioInit() REFUSES with #SDIO_ERR_BASECLK
+; rather than inventing a divisor. A wrong base clock does not fail
+; loudly - it produces a bus running at some other speed, which works
+; for CMD0 and fails somewhere much later and much less obviously.
+;
+; ======================================================================
+; WHAT THIS FILE DELIBERATELY DOES NOT DO
+; ======================================================================
+;   NO DMA, NO SDMA, NO ADMA. Polled PIO through the Buffer Data Port,
+;   like emmc.pi4. The transfers this bus needs for chip identification
+;   are four bytes at a time; a scatter-gather engine for that would be
+;   ceremony.
+;
+;   NO CARD INTERRUPT. SDIO's asynchronous interrupt (SDHCI_INT_CARD_INT,
+;   sdhci.h line 145) is how a radio says "I have a packet". Nothing here
+;   fields it, because nothing here has anything to receive - see
+;   cyw43.pi4 and the firmware wall. The bit is left MASKED, deliberately,
+;   so that a stuck level-triggered card interrupt cannot wedge the
+;   polling loops.
+;
+;   NO HIGH SPEED, NO UHS, NO 1.8V SWITCH. The bus runs at Default Speed.
+;   Signal-voltage switching needs a regulator this file cannot reach and
+;   a tuning sequence it cannot verify.
+;
+;   NO ODD TRANSFER SIZES ON CMD53. Whole 4-byte units only, in both
+;   byte mode and block mode - see the CMD53 section for why the Buffer
+;   Data Port's width makes that a real limit rather than a lazy one.
+;
+;   BLOCK MODE ON CMD53 EXISTS AS OF 2026-08-26 and this entry used to
+;   say it did not. The old text - "byte mode only ... that is enough
+;   for every register access above it" - was true while the only
+;   caller was a chip-identification path moving four bytes at a time.
+;   It stopped being true the moment a 609 KB firmware image landed on
+;   the disk, because 609 KB in 512-byte byte-mode commands is over a
+;   thousand commands, and a 1520-byte WLAN frame cannot be expressed in
+;   byte mode at all. SdioCmd53ReadBlocks / SdioCmd53WriteBlocks are the
+;   entry points; the byte-mode pair still takes the same path it was
+;   proven on.
+;
+;   NO CIS PARSING. The card's tuple chain is not read. Nothing in this
+;   project needs the manufacturer ID that badly, and a parser for a
+;   structure nobody can test is a liability.
+;
+; ======================================================================
+; CITATIONS - THE FULL LIST
+; ======================================================================
+;   Datasheets/pi4/rpi-linux/rpi-6.12.y_sdhci.h
+;       every register offset and controller bit. Line numbers inline.
+;   Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm2835-mmc.c
+;       32-bit-access rule, the COMMAND/TRANSFER_MODE shadow, the
+;       transfer-mode composition, and the NEGATIVE claim that carries
+;       the most weight in this file: Capabilities is read only to be
+;       printed (255-257), max_clk comes from the clock (1452), the
+;       3.3V rail is written unconditionally (1180-1182) and the host
+;       capability flags are hard-coded (1302-1306).
+;   Datasheets/pi4/hdmi/firmware-Mailbox-property-interface.md
+;       the power device-id list and its two "Unknown (RPi4)" entries,
+;       the GET/SET_POWER_STATE and GET/SET_CLOCK_STATE payloads and
+;       state bits, "next enable rate ... even if the clock is not
+;       running", and the LED pin numbers that corroborate the
+;       expander's base of 128.
+;   Datasheets/pi4/hdmi/raspberrypi-firmware-downstream.h
+;       the full tag enum: GET/SET_POWER_STATE, GET/SET_CLOCK_STATE,
+;       GET/SET_DOMAIN_STATE, GET/SET_GPIO_STATE, GET/SET_GPIO_CONFIG.
+;   Datasheets/pi4/v3d/linux/rpi-power-bindings.h
+;       the twenty-three power domains, none of which is an SD or SDIO
+;       one. Filed under v3d because that is what it was fetched for.
+;   Datasheets/pi4/v3d/linux/raspberrypi-power.c
+;       how a domain is asked for, and that the old SET_POWER_STATE
+;       interface and the new SET_DOMAIN_STATE interface are two
+;       different numbering schemes over one transport.
+;   Datasheets/pi4/uboot/v2025.01_mbox.h
+;       BCM2835_MBOX_POWER_DEVID_SDHCI = 0, and the set/get power tag
+;       structures.
+;   Datasheets/pi4/raspberrypi-firmware.c
+;       one buf_size serves as both request and response length.
+;   Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm270x.dtsi
+;       mmcnr@7e300000, its compatible strings and its clock.
+;   Datasheets/pi4/rpi-linux/rpi-6.12.y_bcm2711-rpi-ds.dtsi
+;       sdio_pins, and the wifi@1 child node.
+;   Datasheets/pi4/rpi-linux/rpi-6.12.y_dt-bindings_pinctrl_bcm2835.h
+;       BCM2835_FSEL_ALT3 = 7, the pull encodings.
+;   Datasheets/pi4/rpi-linux/rpi-6.12.y_gpio-raspberrypi-exp.c
+;       RPI_EXP_GPIO_BASE = 128, the SET_GPIO_CONFIG payload.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_sdio.h
+;       CMD5/CMD52/CMD53 opcodes, the argument layouts, R4 and R5, CCCR.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_sdio_ops.c
+;       the exact CMD52 and CMD53 argument packing, and sdio_reset.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_sdio_io.c
+;       sdio_enable_func - IOEx then poll IORx.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_core_sdio.c
+;       the attach order, the 4-bit switch, functions-from-R4.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_mmc.h
+;       CMD0, CMD7, MMC_CARD_BUSY.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_sd.h
+;       CMD3.
+;   Datasheets/pi4/brcmfmac/v6.12_linux_mmc_sd_ops.c
+;       RCA is resp[0] >> 16.
+;   Datasheets/pi4/uboot/v2025.01_bcm2835_sdhost.c
+;       the NEGATIVE claim: sdhost cannot do SDIO.
+;   Datasheets/pi4/uboot/v2025.01_bcm283x_mbox.h
+;       BCM2835_MBOX_CLOCK_ID_EMMC = 1.
+;   Datasheets/pi4/bcm283x.dtsi, bcm2711.dtsi, bcm2711-rpi-4-b.dts
+;       the three controllers, and sdhost being disabled on this board.
+;   Datasheets/pi4/raspberrypi-firmware.h
+;       the two GPIO property tags.
+;   CNTPCT_EL0 / CNTFRQ_EL0
+;       ARMv8-A architectural registers. Not Broadcom's, not in any
+;       Broadcom document. The form is anvil.pi4's, by way of
+;       emmc.pi4 and safety.pi4.
+;
+;   NOT CITED AND THEREFORE NOT PRESENT: any 1.8V signalling sequence,
+;   any tuning sequence, any DMA descriptor format, the CIS tuple
+;   format, and every CCCR register above $17.
+; ======================================================================
+
+
+; ======================================================================
+;  THE CONTROLLER
+; ======================================================================
+
+; mmcnr@7e300000 -> ARM $FE300000. See THE CONTROLLER above.
+#SDIO_BASE = $FE300000
+
+; ----------------------------------------------------------------------
+;  SDHCI register offsets. Every one from rpi-6.12.y_sdhci.h, line given.
+;
+;  The 8- and 16-bit registers are named at their SPEC offsets here even
+;  though nothing accesses them at those widths - see rule 1 in the
+;  header. The word they live in is (offset & ~3).
+; ----------------------------------------------------------------------
+#SDIO_ARG2        = $00   ; SDHCI_DMA_ADDRESS / ARGUMENT2      h:26
+#SDIO_BLKSIZECNT  = $04   ; BLOCK_SIZE(16)@$04 + BLOCK_COUNT(16)@$06
+                          ;                                    h:30, h:33
+#SDIO_ARG1        = $08   ; SDHCI_ARGUMENT                     h:35
+#SDIO_CMDTM       = $0C   ; TRANSFER_MODE(16)@$0C + COMMAND(16)@$0E
+                          ;                                    h:37, h:45
+#SDIO_RESP0       = $10   ; SDHCI_RESPONSE                     h:61
+#SDIO_RESP1       = $14
+#SDIO_RESP2       = $18
+#SDIO_RESP3       = $1C
+#SDIO_BUFFER      = $20   ; SDHCI_BUFFER                       h:63
+#SDIO_STATUS      = $24   ; SDHCI_PRESENT_STATE                h:65
+#SDIO_CONTROL0    = $28   ; HOST_CONTROL(8)@$28 + POWER_CONTROL(8)@$29
+                          ;                                    h:82, h:98
+#SDIO_CONTROL1    = $2C   ; CLOCK_CONTROL(16)@$2C + TIMEOUT(8)@$2E
+                          ;             + SOFTWARE_RESET(8)@$2F
+                          ;                            h:118, h:128, h:130
+#SDIO_INT_STATUS  = $30   ; SDHCI_INT_STATUS                   h:135
+#SDIO_INT_ENABLE  = $34   ; SDHCI_INT_ENABLE                   h:136
+#SDIO_SIG_ENABLE  = $38   ; SDHCI_SIGNAL_ENABLE                h:137
+#SDIO_CAPS0       = $40   ; SDHCI_CAPABILITIES                 h:210
+#SDIO_CAPS1       = $44   ; SDHCI_CAPABILITIES_1               h:231
+#SDIO_HOST_VER    = $FC   ; SDHCI_HOST_VERSION is $FE          h:279
+                          ; - the 16-bit register in the TOP half of the
+                          ; word at $FC, which is what gets read.
+
+; ----------------------------------------------------------------------
+;  Present State, sdhci.h lines 66-72.
+; ----------------------------------------------------------------------
+#SDIO_ST_CMD_INHIBIT = $00000001   ; SDHCI_CMD_INHIBIT        h:66
+#SDIO_ST_DAT_INHIBIT = $00000002   ; SDHCI_DATA_INHIBIT       h:67
+#SDIO_ST_SPACE_AVAIL = $00000400   ; SDHCI_SPACE_AVAILABLE    h:70
+#SDIO_ST_DATA_AVAIL  = $00000800   ; SDHCI_DATA_AVAILABLE     h:71
+
+; ----------------------------------------------------------------------
+;  Host Control and Power Control, both bytes of the word at $28.
+;  Host Control is byte 0, Power Control is byte 1, so a Power Control
+;  value goes in at bits 15:8.
+; ----------------------------------------------------------------------
+#SDIO_HC_4BITBUS  = $00000002      ; SDHCI_CTRL_4BITBUS       h:85
+#SDIO_HC_HISPD    = $00000004      ; SDHCI_CTRL_HISPD         h:86  unused
+#SDIO_PWR_ON      = $00000100      ; SDHCI_POWER_ON      $01  h:99
+#SDIO_PWR_330     = $00000E00      ; SDHCI_POWER_330     $0E  h:102
+#SDIO_PWR_MASK    = $0000FF00
+
+; ----------------------------------------------------------------------
+;  Clock Control / Timeout Control / Software Reset - the word at $2C.
+;  Clock Control is bits 15:0, Timeout Control bits 23:16, Software
+;  Reset bits 31:24.
+; ----------------------------------------------------------------------
+#SDIO_CLK_INT_EN     = $00000001   ; SDHCI_CLOCK_INT_EN       h:127
+#SDIO_CLK_INT_STABLE = $00000002   ; SDHCI_CLOCK_INT_STABLE   h:126
+#SDIO_CLK_CARD_EN    = $00000004   ; SDHCI_CLOCK_CARD_EN      h:125
+; SDHCI_DIVIDER_SHIFT 8 (h:119), SDHCI_DIVIDER_HI_SHIFT 6 (h:120),
+; SDHCI_DIV_MASK $FF (h:121), SDHCI_DIV_HI_MASK $300 (h:123). The low
+; eight divisor bits sit at word bits 15:8 and the high two at 7:6.
+#SDIO_TIMEOUT_MAX    = $000E0000   ; Timeout Control = $E, the longest
+                                   ; the field encodes. The register is
+                                   ; named at sdhci.h:128; the value is a
+                                   ; choice, and it is the same choice
+                                   ; emmc.pi4 makes for the same reason -
+                                   ; a short data timeout on a bus that
+                                   ; has never run is a self-inflicted
+                                   ; wound.
+#SDIO_SRST_ALL       = $01000000   ; SDHCI_RESET_ALL          h:131
+#SDIO_SRST_CMD       = $02000000   ; SDHCI_RESET_CMD          h:132
+#SDIO_SRST_DATA      = $04000000   ; SDHCI_RESET_DATA         h:133
+
+; ----------------------------------------------------------------------
+;  Interrupt Status bits, sdhci.h lines 138-158.
+; ----------------------------------------------------------------------
+#SDIO_INT_RESPONSE    = $00000001  ; SDHCI_INT_RESPONSE       h:138
+#SDIO_INT_DATA_END    = $00000002  ; SDHCI_INT_DATA_END       h:139
+#SDIO_INT_SPACE_AVAIL = $00000010  ; SDHCI_INT_SPACE_AVAIL    h:142
+#SDIO_INT_DATA_AVAIL  = $00000020  ; SDHCI_INT_DATA_AVAIL     h:143
+#SDIO_INT_CARD_INT    = $00000100  ; SDHCI_INT_CARD_INT       h:146
+#SDIO_INT_ERROR       = $00008000  ; SDHCI_INT_ERROR          h:150
+#SDIO_INT_TIMEOUT     = $00010000  ; SDHCI_INT_TIMEOUT        h:151
+#SDIO_INT_CRC         = $00020000  ; SDHCI_INT_CRC            h:152
+#SDIO_INT_END_BIT     = $00040000  ; SDHCI_INT_END_BIT        h:153
+#SDIO_INT_INDEX       = $00080000  ; SDHCI_INT_INDEX          h:154
+#SDIO_INT_ERROR_MASK  = $FFFF8000  ; SDHCI_INT_ERROR_MASK     h:166
+#SDIO_INT_ALL         = $FFFFFFFF  ; SDHCI_INT_ALL_MASK       h:172
+
+; ----------------------------------------------------------------------
+;  THE FOUR COMMAND-ERROR BITS ARE NOT THE FOUR DATA-ERROR BITS, AND
+;  LINUX'S NAMES DO NOT SAY SO. sdhci.h calls the command ones
+;  SDHCI_INT_TIMEOUT / _CRC / _END_BIT / _INDEX with no "CMD" in the
+;  name (lines 151-154), and the data ones SDHCI_INT_DATA_TIMEOUT /
+;  _DATA_CRC / _DATA_END_BIT (lines 155-157). Reading a status word by
+;  eye and landing on the wrong group of four is easy, which is why
+;  SdioIntBitName() below exists and why the diagnostic prints names
+;  instead of a hexadecimal word.
+;
+;  $00048000, which is what this board answered CMD5 with, is
+;  SDHCI_INT_ERROR (bit 15, the summary) plus SDHCI_INT_END_BIT (bit
+;  18) - a COMMAND End Bit Error. Not a data one, and not a timeout.
+;  A timeout would have meant nothing on the bus answered at all; an
+;  end-bit error means a response arrived and its last bit was not 1.
+; ----------------------------------------------------------------------
+
+; Enable every status bit EXCEPT the card interrupt. See "NO CARD
+; INTERRUPT" in the header - a level-triggered SDIO interrupt that
+; nobody services stays asserted for ever, and the poll loops below all
+; test the whole status word.
+#SDIO_INT_ENABLE_SET  = $FFFFFEFF
+
+; ----------------------------------------------------------------------
+;  The 32-bit CMDTM word: transfer mode in the low half, command in the
+;  high half.
+;
+;  sdhci.h line 57 defines the 16-bit command register as
+;      SDHCI_MAKE_CMD(c, f) = ((c & 0xff) << 8) | (f & 0xff)
+;  and that register is bits 31:16 of this word, so the command INDEX
+;  lands at bits 31:24 and the command FLAGS at bits 23:16.
+;
+;  The flags, from sdhci.h lines 47-55, shifted left 16:
+; ----------------------------------------------------------------------
+#SDIO_CMD_RSP_NONE  = $00000000    ; SDHCI_CMD_RESP_NONE  $00 h:52
+#SDIO_CMD_RSP_136   = $00010000    ; SDHCI_CMD_RESP_LONG  $01 h:53
+#SDIO_CMD_RSP_48    = $00020000    ; SDHCI_CMD_RESP_SHORT $02 h:54
+#SDIO_CMD_RSP_48B   = $00030000    ; ..._SHORT_BUSY       $03 h:55
+#SDIO_CMD_RSP_MASK  = $00030000    ; SDHCI_CMD_RESP_MASK  $03 h:46
+#SDIO_CMD_CRCCHK    = $00080000    ; SDHCI_CMD_CRC        $08 h:47
+#SDIO_CMD_IXCHK     = $00100000    ; SDHCI_CMD_INDEX      $10 h:48
+#SDIO_CMD_ISDATA    = $00200000    ; SDHCI_CMD_DATA       $20 h:49
+#SDIO_CMD_INDEX_STEP = $01000000   ; one command index
+
+; Transfer mode, sdhci.h lines 38-44, in the low half of the word.
+#SDIO_TM_BLKCNT_EN  = $00000002    ; SDHCI_TRNS_BLK_CNT_EN    h:39
+#SDIO_TM_READ       = $00000010    ; SDHCI_TRNS_READ          h:42
+; MULTI is set whenever the transfer is more than ONE block, and the
+; rule is bcm2835-mmc.c line 632's, not a guess:
+;     if ((mmc_op_multi(cmd->opcode) || data->blocks > 1))
+;         mode |= SDHCI_TRNS_MULTI;
+; mmc_op_multi() is false for CMD53 - it names CMD18, CMD25, CMD12 and
+; CMD23 only - so for this file the whole condition reduces to
+; "blocks > 1", which is exactly how sdio_Cmd53Xfer applies it.
+#SDIO_TM_MULTI      = $00000020    ; SDHCI_TRNS_MULTI         h:44
+
+; AUTO CMD12 IS DELIBERATELY NEVER SET, and this is worth stating because
+; a multi-block transfer on an SD MEMORY card would need it. CMD53 is not
+; an open-ended memory read: the block count in the argument tells the
+; card exactly how many blocks are coming and it stops on its own. There
+; is no CMD12 in the SDIO protocol at all - the abort mechanism is a
+; CMD52 write to CCCR $06 (#SDIO_CCCR_ABORT), which SdioInit already
+; issues as its card-reset step at line 3180 below. In
+; bcm2835-mmc.c the flag guarding it (SDHCI_AUTO_CMD12, line 125) is
+; declared and TESTED at line 639 but never SET anywhere in the file, so
+; even for memory that driver does not use it.
+
+; ----------------------------------------------------------------------
+;  THE COMMANDS. Index * $01000000, then the flags.
+;
+;  Which flags each command gets is not a free choice: CRC check and
+;  index check may only be enabled for responses that CARRY a CRC and an
+;  index. R1, R5, R6 and R7 do; R2 carries a CRC but no index; R3 and R4
+;  carry neither, and turning the checks on for them makes the controller
+;  reject a perfectly good response. That rule is why CMD5 below looks
+;  bare next to CMD3.
+; ----------------------------------------------------------------------
+
+; CMD0 GO_IDLE_STATE. No response at all.
+;   MMC_GO_IDLE_STATE 0 - v6.12_linux_mmc_mmc.h line 31.
+#SDIO_CMD0  = $00000000
+
+; CMD3 SEND_RELATIVE_ADDR, R6. Checked both ways.
+;   SD_SEND_RELATIVE_ADDR 3 - v6.12_linux_mmc_sd.h line 14.
+#SDIO_CMD3  = $031A0000
+
+; CMD5 IO_SEND_OP_COND, R4. NO CRC, NO index check - R4 has neither.
+;   SD_IO_SEND_OP_COND 5 - v6.12_linux_mmc_sdio.h line 12.
+#SDIO_CMD5  = $05020000
+
+; CMD7 SELECT_CARD, R1b. The busy period is on DAT0 after the response.
+;   MMC_SELECT_CARD 7 - v6.12_linux_mmc_mmc.h line 38.
+#SDIO_CMD7  = $071B0000
+
+; CMD52 IO_RW_DIRECT, R5. Index $34.
+;   SD_IO_RW_DIRECT 52 - v6.12_linux_mmc_sdio.h line 13.
+#SDIO_CMD52 = $341A0000
+
+; CMD53 IO_RW_EXTENDED, R5, with data. Index $35. The low half carries
+; the transfer mode: block-count enable always (bcm2835-mmc.c line 630
+; sets SDHCI_TRNS_BLK_CNT_EN unconditionally whenever there is data),
+; plus the read bit for a read.
+;   SD_IO_RW_EXTENDED 53 - v6.12_linux_mmc_sdio.h line 14.
+#SDIO_CMD53_READ  = $353A0012
+#SDIO_CMD53_WRITE = $353A0002
+
+; The same two commands for a transfer of MORE THAN ONE BLOCK: identical
+; except for SDHCI_TRNS_MULTI ($20) in the transfer-mode half. Written
+; out as whole constants rather than composed with an Or at the call
+; site, for the same reason the two single-block forms are: the transfer
+; mode and the command index must reach the controller as ONE 32-bit
+; store, and a value assembled in four places is a value that can differ
+; in one of them.
+#SDIO_CMD53_READ_MULTI  = $353A0032
+#SDIO_CMD53_WRITE_MULTI = $353A0022
+
+; ----------------------------------------------------------------------
+;  CMD52 / CMD53 argument layout.
+;
+;  v6.12_linux_mmc_sdio_ops.c lines 75-80, mmc_io_rw_direct_host:
+;      cmd.arg  = write ? 0x80000000 : 0x00000000;
+;      cmd.arg |= fn << 28;
+;      cmd.arg |= (write && out) ? 0x08000000 : 0;      <- the RAW flag
+;      cmd.arg |= addr << 9;
+;      cmd.arg |= in;
+;  and line 72 bounds the address: "if (addr & ~0x1FFFF) return -EINVAL".
+;
+;  v6.12_linux_mmc_sdio_ops.c lines 136-143, mmc_io_rw_extended:
+;      cmd.arg  = write ? 0x80000000 : 0x00000000;
+;      cmd.arg |= fn << 28;
+;      cmd.arg |= incr_addr ? 0x04000000 : 0;
+;      cmd.arg |= addr << 9;
+;      if (blocks == 0) cmd.arg |= (blksz == 512) ? 0 : blksz;  byte mode
+;      else             cmd.arg |= 0x08000000 | blocks;         block mode
+;
+;  NOTE THE COLLISION AT BIT 27 and do not let it bite: in CMD52 it is
+;  the RAW (read-after-write) flag, in CMD53 it is BLOCK MODE. Same bit,
+;  two unrelated meanings, and the two constants are named apart here so
+;  a copy-paste between the two builders cannot go quiet.
+; ----------------------------------------------------------------------
+#SDIO_ARG_WRITE     = $80000000
+#SDIO_ARG_FN_STEP   = $10000000    ; fn << 28
+#SDIO_ARG_RAW       = $08000000    ; CMD52 only
+#SDIO_ARG_BLOCKMODE = $08000000    ; CMD53 only - NOT the same thing
+#SDIO_ARG_INCR      = $04000000    ; CMD53 only
+#SDIO_ARG_ADDR_STEP = $00000200    ; addr << 9
+#SDIO_ADDR_MAX      = $0001FFFF    ; sdio_ops.c line 72
+
+; ----------------------------------------------------------------------
+;  THE TWO LENGTH FIELDS ARE BOTH NINE BITS AND THEY DO NOT MEAN THE
+;  SAME THING, which is the whole reason block mode exists here.
+;
+;  In BYTE mode the nine bits are a BYTE count, so one command moves at
+;  most 512 bytes and 512 is spelled 0.
+;
+;  In BLOCK mode the nine bits are a BLOCK count, so one command moves
+;  at most (blocks * block size) bytes. With F1's 64-byte block that is
+;  32,704 bytes per command; with F2's 512-byte block it is 261,632.
+;  Zero here means "keep going until an abort", which this file does not
+;  implement and therefore refuses - an infinite transfer that nothing
+;  ever stops is a hung bus, not a fast one.
+;
+;  511 rather than 512: 512 does not fit in nine bits either way, and
+;  unlike the byte-mode case there is no "0 means 512" convention to
+;  fall back on, because 0 is already taken by the infinite form.
+;  sdio_ops.c line 142 is the block-mode line and it has no special case
+;  at all:
+;      cmd.arg |= 0x08000000 | blocks;
+; ----------------------------------------------------------------------
+#SDIO_BLOCKS_MAX    = 511
+; The SDHCI BLOCK_COUNT register is sixteen bits wide (h:33) and
+; bcm2835-mmc.c line 583 says so too - "BUG_ON(data->blocks > 65535)".
+; The 511 above is therefore the CARD's limit, not the host's, and it is
+; the tighter of the two. Both are recorded because a future reader
+; comparing this file with that one should not have to work out which
+; number bit.
+#SDIO_HOST_BLOCKS_MAX = 65535
+
+; ----------------------------------------------------------------------
+;  R5, the CMD52/CMD53 response. v6.12_linux_mmc_sdio.h lines 55-61.
+;  Bits 7:0 are the data byte; 15:8 are the status flags.
+; ----------------------------------------------------------------------
+#SDIO_R5_CRC_ERROR   = $00008000   ; R5_COM_CRC_ERROR         s:55
+#SDIO_R5_ILLEGAL_CMD = $00004000   ; R5_ILLEGAL_COMMAND       s:56
+#SDIO_R5_ERROR       = $00000800   ; R5_ERROR                 s:57
+#SDIO_R5_FUNC_NUMBER = $00000200   ; R5_FUNCTION_NUMBER       s:58
+#SDIO_R5_OUT_OF_RANGE = $00000100  ; R5_OUT_OF_RANGE          s:59
+; R5_STATUS(x) is (x & 0xCB00) - line 60. Every one of those five bits
+; means the card refused, so they are tested as one mask.
+#SDIO_R5_BAD         = $0000CB00
+
+; ----------------------------------------------------------------------
+;  R4, the CMD5 response. v6.12_linux_mmc_sdio.h lines 37-38 and
+;  v6.12_linux_mmc_core_sdio.c line 1269.
+;
+;      [31]    busy / initialisation complete   (MMC_CARD_BUSY,
+;              v6.12_linux_mmc_mmc.h line 206 - and note the name is
+;              backwards: SET means DONE, not busy)
+;      [30:28] number of I/O functions          (ocr & 0x70000000) >> 28
+;      [27]    memory present                   R4_MEMORY_PRESENT
+;      [24]    1.8V present                     R4_18V_PRESENT
+;      [23:0]  the I/O OCR
+; ----------------------------------------------------------------------
+#SDIO_R4_READY     = $80000000     ; MMC_CARD_BUSY            m:206
+#SDIO_R4_NFUNC     = $70000000     ; core/sdio.c:1269
+#SDIO_R4_MEMORY    = $08000000     ; R4_MEMORY_PRESENT (1<<27) s:38
+#SDIO_R4_18V       = $01000000     ; R4_18V_PRESENT    (1<<24) s:37
+#SDIO_R4_OCR_MASK  = $00FFFFFF
+
+; The voltage window asked for in the second CMD5. 3.2-3.4V, which is
+; what this board supplies and all this file will run at - see "NO
+; HIGH SPEED, NO UHS, NO 1.8V SWITCH". Bit n of the OCR is the window
+; (n+15)/10 .. (n+16)/10 volts; bits 20 and 21 are 3.2-3.3 and 3.3-3.4.
+#SDIO_OCR_32_34 = $00300000
+
+; ----------------------------------------------------------------------
+;  CCCR - the function-0 common registers.
+;  v6.12_linux_mmc_sdio.h, line numbers given.
+; ----------------------------------------------------------------------
+#SDIO_CCCR_CCCR    = $00           ; s:67
+#SDIO_CCCR_IOEx    = $02           ; s:87   function enable
+#SDIO_CCCR_IORx    = $03           ; s:88   function ready
+#SDIO_CCCR_IENx    = $04           ; s:90   interrupt enable
+#SDIO_CCCR_INTx    = $05           ; s:91
+#SDIO_CCCR_ABORT   = $06           ; s:93   abort / card reset
+#SDIO_CCCR_IF      = $07           ; s:95   bus interface control
+#SDIO_CCCR_CAPS    = $08           ; s:108
+#SDIO_CCCR_SPEED   = $13           ; s:134
+
+#SDIO_BUS_WIDTH_MASK = $03         ; SDIO_BUS_WIDTH_MASK      s:97
+#SDIO_BUS_WIDTH_1BIT = $00         ; s:98
+#SDIO_BUS_WIDTH_4BIT = $02         ; s:100
+#SDIO_BUS_CD_DISABLE = $80         ; s:106
+
+; The abort/reset bit. sdio_ops.c lines 209-215, sdio_reset(): read
+; CCCR_ABORT, OR in $08, write it back; if the read failed, write a bare
+; $08. Its comment cites "SDIO Simplified Specification V2.0, 4.4 Reset
+; for SDIO".
+#SDIO_ABORT_RES    = $08
+
+; FBR - the per-function block-size registers.
+; SDIO_FBR_BASE(f) = f * 0x100  (s:171), SDIO_FBR_BLKSIZE = 0x10 (s:192),
+; two bytes, little end first.
+#SDIO_FBR_STEP     = $100
+#SDIO_FBR_BLKSIZE  = $10
+
+; ----------------------------------------------------------------------
+;  Clocks. Both of these are ceilings, so the divisor rounds UP.
+; ----------------------------------------------------------------------
+#SDIO_CLK_IDENT_KHZ = 400          ; identification. The SD physical
+                                   ; layer's 400 kHz limit, the same
+                                   ; number emmc.pi4 uses.
+#SDIO_CLK_XFER_KHZ  = 25000        ; Default Speed. Not 50 MHz: high
+                                   ; speed is not enabled here.
+
+; ----------------------------------------------------------------------
+;  Timeouts, in milliseconds. Every wait in this file is bounded.
+; ----------------------------------------------------------------------
+#SDIO_TMO_RESET_MS   = 100
+#SDIO_TMO_CLOCK_MS   = 100
+#SDIO_TMO_INHIBIT_MS = 500
+#SDIO_TMO_CMD_MS     = 200
+#SDIO_TMO_DATA_MS    = 500
+; CMD5 polling. The SDIO card has to bring its own regulators up. Linux
+; gives it 100 tries at 10 ms apart (sdio_ops.c lines 27-53), so one
+; second is the number that source implies.
+#SDIO_TMO_OPCOND_MS  = 1000
+; sdio_enable_func's default enable timeout in Linux comes from the
+; function's CIS; with no CIS parser here, this is a choice, and it is
+; generous on purpose.
+#SDIO_TMO_ENABLE_MS  = 1000
+
+; CNTFRQ_EL0 sanity bound. Same shape as safety.pi4's.
+#SDIO_HZ_MAX = 1000000000
+
+; ----------------------------------------------------------------------
+;  The radio's power cycle, in milliseconds. BENCH-PROVEN NUMBERS, from
+;  a different SoC and the same part family:
+;  RP2040/Lib/cyw43.pico lines 1990-1992, Cyw43Power().
+;
+;  20 ms low, because ">= 10 ms guarantees the regulator has actually
+;  dropped, so a warm restart looks like a cold one" - that file's own
+;  comment at line 1973. 150 ms high, because it is "the largest of the
+;  three numbers the datasheet gives (3/50/150)" - line 1975.
+;
+;  The Pi 4 reaches the enable pin through the firmware's expander
+;  rather than through a GPIO, so each edge here costs a property
+;  transaction; the WAITS are the part that came from the proven driver
+;  and the waits are what the regulator cares about.
+; ----------------------------------------------------------------------
+#SDIO_WL_ON_LOW_MS  = 20
+#SDIO_WL_ON_HIGH_MS = 150
+
+; ----------------------------------------------------------------------
+;  GPIO, for the pin mux only. See THE PINS.
+; ----------------------------------------------------------------------
+#SDIO_GPFSEL3 = $FE20000C          ; GPIO base $FE200000 + 3*4. Pins
+                                   ; 30..39; 34..39 are bits 12..29.
+#SDIO_GPPUP2  = $FE2000EC          ; GPIO_PUP_PDN_CNTRL_REG2, base + $EC.
+                                   ; Pins 32..47; 34..39 are bits 4..15.
+
+; ----------------------------------------------------------------------
+;  THE PULL VALUES, IN THE HARDWARE'S OWN ENCODING AND NOT THE DEVICE
+;  TREE'S. THESE TWO NUMBERINGS ARE INVERTED. See THE PULL ENCODING IS
+;  INVERTED in the header for what that cost.
+;
+;  bcm2711-peripherals.txt lines 6315-6318, Table 90 at line 6304:
+;      00 = No resistor is selected
+;      01 = Pull up resistor is selected
+;      10 = Pull down resistor is selected
+;      11 = Reserved
+; ----------------------------------------------------------------------
+#SDIO_PULL_NONE = 0
+#SDIO_PULL_UP   = 1
+#SDIO_PULL_DOWN = 2
+
+; ======================================================================
+;  THE FIRMWARE PROPERTY TAGS THIS FILE ISSUES ITSELF
+;
+;  Through mailbox.pi4's escape hatch, not through any wrapper. See THE
+;  POWER RAIL and IS THE CONTROLLER ITSELF POWER-GATED in the header for
+;  the whole argument; these are just the numbers.
+;
+;  Tag numbers: Datasheets/pi4/hdmi/raspberrypi-firmware-downstream.h,
+;  line given against each. The same numbers appear in
+;  Datasheets/pi4/raspberrypi-firmware.h for the four that file carries.
+;
+;  Payload sizes: one size serves as both the request length and the
+;  response buffer length - raspberrypi-firmware.c line 172,
+;  "header->buf_size = buf_size" - and it is sizeof() of the struct.
+; ----------------------------------------------------------------------
+#SDIO_TAG_GET_POWER_STATE  = $00020001   ; downstream h:52
+#SDIO_TAG_SET_POWER_STATE  = $00028001   ; downstream h:54
+#SDIO_TAG_GET_CLOCK_STATE  = $00030001   ; downstream h:55
+#SDIO_TAG_SET_CLOCK_STATE  = $00038001   ; downstream h:81
+#SDIO_TAG_GET_GPIO_STATE   = $00030041   ; downstream h:87
+#SDIO_TAG_SET_GPIO_STATE   = $00038041   ; downstream h:88
+#SDIO_TAG_GET_GPIO_CONFIG  = $00030043   ; downstream h:90
+#SDIO_TAG_SET_GPIO_CONFIG  = $00038043   ; downstream h:91
+
+; struct gpio_set_config, six words - expander driver lines 32-39.
+#SDIO_MBX_SET_CFG_BYTES = 24
+; struct gpio_get_config, FIVE words, no trailing state - lines 41-47.
+; This is the size the diagnostic had wrong on its first bench run.
+#SDIO_MBX_GET_CFG_BYTES = 20
+; struct gpio_get_set_state, two words - lines 49-52. Also the shape of
+; both power-state tags and both clock-state tags: id then state.
+#SDIO_MBX_TWO_WORDS = 8
+
+; RPI_EXP_GPIO_BASE, expander driver line 20, used at line 111 as
+; "off + RPI_EXP_GPIO_BASE".
+#SDIO_EXP_GPIO_BASE = 128
+; Expander line 1 is "WL_ON" - bcm2711-rpi-4-b.dts lines 61-70, where
+; line 0 is "BT_ON" and line 1 is the next one named.
+#SDIO_EXP_LINE_WL_ON = 1
+; 128 + 1. Written out rather than computed so that a grep for the
+; number people actually quote finds something.
+#SDIO_WL_ON_GPIO = 129
+; RPI_EXP_GPIO_DIR_OUT, expander driver line 23. DIR_IN is 0, line 22 -
+; and note that the two are 0 and 1 in that order, which is the opposite
+; of the way most GPIO blocks on this chip encode direction.
+#SDIO_EXP_DIR_OUT = 1
+
+; Mailbox power device id 0. Named SDHCI by
+; Datasheets/pi4/uboot/v2025.01_mbox.h line 177 and "SD Card" by
+; firmware-Mailbox-property-interface.md line 168. See the header: this
+; file queries it and only ever turns it ON.
+#SDIO_PWR_DEVID_SDHCI = 0
+; The highest device id any source on this disk names - the property
+; document stops at 10 and calls 9 and 10 "Unknown (RPi4)", lines
+; 177-178. The diagnostic sweeps 0..10 for that reason.
+#SDIO_PWR_DEVID_MAX = 10
+
+; Mailbox clock id 1, EMMC - v2025.01_bcm283x_mbox.h line 229. This
+; controller's clock. NOT 12, which is EMMC2's.
+#SDIO_CLOCK_ID_EMMC = 1
+
+; The state words. Bit 0 is on/off in every one of these four tags; bit
+; 1 means "does not exist" in a RESPONSE and "wait for the rail to
+; settle" in a SET_POWER_STATE REQUEST. Two different meanings for one
+; bit position in one tag pair, which is why they are named separately.
+; firmware-Mailbox-property-interface.md lines 187-193 (get power
+; response), 212-232 (set power request and response), 257-292 (clock
+; state, both directions).
+#SDIO_MBX_STATE_ON     = 1
+#SDIO_MBX_STATE_NODEV  = 2
+#SDIO_MBX_PWRREQ_WAIT  = 2
+
+; ----------------------------------------------------------------------
+;  Error codes.
+; ----------------------------------------------------------------------
+#SDIO_ERR_NONE          = 0
+#SDIO_ERR_NO_CNTFRQ     = 1
+#SDIO_ERR_NO_CONTROLLER = 2
+#SDIO_ERR_BAD_VERSION   = 3
+; RETIRED 2026-08-26, NOT RENUMBERED. Nothing raises this any more; see
+; THE CAPABILITIES REGISTER READS ZERO in the header. The slot stays
+; occupied because every code below it appears in bench logs already
+; filed and in tools/a64/a64_sdio_check.py.
+#SDIO_ERR_NO_CAPS       = 4
+#SDIO_ERR_BASECLK       = 5
+#SDIO_ERR_RESET         = 6
+#SDIO_ERR_CLOCK         = 7
+#SDIO_ERR_INHIBIT       = 8
+#SDIO_ERR_CMD_TIMEOUT   = 9
+#SDIO_ERR_CMD_ERROR     = 10
+#SDIO_ERR_CMD_STUCK     = 11
+#SDIO_ERR_NO_CARD       = 12
+#SDIO_ERR_NO_IO_FUNCS   = 13
+#SDIO_ERR_OPCOND_TMO    = 14
+#SDIO_ERR_CMD3          = 15
+#SDIO_ERR_BAD_RCA       = 16
+#SDIO_ERR_CMD7          = 17
+#SDIO_ERR_R5            = 18
+#SDIO_ERR_BAD_FUNC      = 19
+#SDIO_ERR_BAD_ADDR      = 20
+#SDIO_ERR_BAD_LEN       = 21
+#SDIO_ERR_ALIGN         = 22
+#SDIO_ERR_NULL_BUF      = 23
+#SDIO_ERR_DATA_TMO      = 24
+#SDIO_ERR_DATA_ERROR    = 25
+#SDIO_ERR_XFER_TMO      = 26
+#SDIO_ERR_BUSY_TMO      = 27
+#SDIO_ERR_NOT_READY     = 28
+#SDIO_ERR_ENABLE_TMO    = 29
+#SDIO_ERR_BUS_WIDTH     = 30
+; Added 2026-08-26 with block-mode CMD53. A SEPARATE code from
+; #SDIO_ERR_BAD_LEN on purpose: "your block size is wrong" and "your
+; block count is wrong" send a caller to two different lines of their
+; own code, and one shared code would have made the block-mode
+; arithmetic harder to debug than the transfer it describes.
+#SDIO_ERR_BAD_COUNT     = 31
+
+; ----------------------------------------------------------------------
+;  State. Readable through accessors; not meant to be poked at.
+; ----------------------------------------------------------------------
+Global sdio_ready.i    = 0
+Global sdio_err.i      = #SDIO_ERR_NONE
+Global sdio_lastCmd.i  = -1
+Global sdio_lastIntr.i = 0
+Global sdio_lastStat.i = 0
+Global sdio_lastR5.i   = 0
+
+; Which block of a multi-block CMD53 was in flight when it went wrong,
+; counted from 1, or 0 if no block-mode transfer has failed. A 511-block
+; transfer that dies has to say WHERE: "block 1" is a command or block-
+; size fault and "block 437" is a starved FIFO or a timeout budget that
+; is too tight, and those are not the same bug. Left alone by a
+; successful transfer so it can be read after the fact.
+Global sdio_lastXferBlock.i = 0
+
+Global sdio_hz.i        = 0    ; CNTFRQ_EL0
+Global sdio_tickPerMs.i = 0
+
+Global sdio_baseKhz.i  = 0
+Global sdio_userBase.i = 0
+Global sdio_clkKhz.i   = 0
+Global sdio_divisor.i  = 0
+
+Global sdio_ver.i    = 0       ; Host Controller spec version field
+Global sdio_vendor.i = 0
+Global sdio_caps0.i  = 0
+Global sdio_caps1.i  = 0
+Global sdio_hostVerRaw.i = 0   ; the whole word at $FC, as found
+Global sdio_gpfsel3.i = 0      ; GPFSEL3 as sdio_MuxPins left it
+Global sdio_gppup2.i  = 0      ; GPIO_PUP_PDN_CNTRL_REG2, likewise
+
+; ----------------------------------------------------------------------
+;  What the firmware said, and whether it was asked at all.
+;
+;  EVERY ONE OF THESE STARTS AT -1 AND -1 MEANS "NOT ATTEMPTED", which
+;  is a different fact from "the firmware answered 0". A run with no
+;  MailboxInit() must be distinguishable in the log from a run where the
+;  firmware said the clock is off, and a single 0 cannot carry both.
+; ----------------------------------------------------------------------
+Global sdio_mbxUsed.i    = 0    ; 1 if any property tag was sent
+Global sdio_wlOnStep.i   = -1   ; how far probe/assert got: see
+                                ; SdioWlOnStep for the ladder
+Global sdio_clkState.i   = -1   ; GET_CLOCK_STATE reply word 1, as found
+Global sdio_clkStateAfter.i = -1 ; ... and after any SET
+Global sdio_pwrState.i   = -1   ; GET_POWER_STATE(0) reply word 1
+Global sdio_pwrStateAfter.i = -1
+Global sdio_wlOnPolarity.i = -1 ; what GET_GPIO_CONFIG said, and what
+                                ; was written back unchanged
+Global sdio_wlOnLevel.i  = -1   ; GET_GPIO_STATE readback after the set
+Global sdio_wlOnDirFound.i = -1 ; the direction GET_GPIO_CONFIG reported
+Global sdio_wlOnLevelFound.i = -1  ; the level GET_GPIO_STATE reported
+                                ; BEFORE anything was written to the pin
+Global sdio_wlOnMbxErr.i = -1   ; MailboxError() captured at the rung
+                                ; that stopped the ladder, so that a
+                                ; refused tag and a timed-out transport
+                                ; are distinguishable in the log
+; SET_GPIO_CONFIG is ADVISORY as of the second bench run - it came back
+; as #MBX_ERR_TAG while both GETs on the same pin passed. Whether that
+; is a refusal or a misread success is OPEN - see AN OPEN QUESTION in
+; the header. These record what happened, either way.
+Global sdio_wlOnCfgOk.i  = -1
+Global sdio_wlOnCfgErr.i = -1
+; MailboxRespBytes() captured straight after each set-type tag: the
+; length field out of that tag's own code word. THIS IS THE
+; DISCRIMINATOR for the open question in the header - a zero length
+; beside a cleared response bit is what a legitimately empty reply looks
+; like, and eight bytes beside a cleared bit is not.
+Global sdio_wlOnCfgResp.i  = -1
+Global sdio_wlOnSetResp.i  = -1
+Global sdio_clkSetResp.i   = -1
+; 1 once WL_ON has been asserted SUCCESSFULLY in this run. It makes the
+; second call a no-op, and that matters more than it looks - see the
+; ONCE PER RUN paragraph above SdioAssertWlOn.
+Global sdio_wlOnDone.i   = 0
+
+; What SET_CLOCK_STATE actually DID, as opposed to what the state looked
+; like afterwards. "The state did not change" and "the firmware refused
+; the request" are different findings with different next steps, and the
+; first bench log could not tell them apart.
+Global sdio_clkSetReply.i = -1  ; the reply's state word, or -1 if the
+                                ; transaction never completed at all
+Global sdio_clkSetErr.i   = -1  ; MailboxError() straight after it
+Global sdio_clkMeasured.i = -1  ; GET_CLOCK_MEASURED for clock 1
+
+Global sdio_ocr.i    = 0       ; the I/O OCR the card published
+Global sdio_nfunc.i  = 0       ; I/O functions, 1..7
+Global sdio_mem.i    = 0       ; memory present bit
+Global sdio_18v.i    = 0       ; 1.8V present bit - reported, never used
+Global sdio_rca.i    = 0
+Global sdio_width4.i = 0       ; 1 once the bus is four bits wide
+
+Global sdio_resp0.i = 0
+Global sdio_resp1.i = 0
+Global sdio_resp2.i = 0
+Global sdio_resp3.i = 0
+
+
+; ======================================================================
+;  The clock. Two instructions each. Same form as emmc.pi4 and
+;  safety.pi4, and for the same reason: these registers need no setup,
+;  so a driver that must bound every wait can do it without owing
+;  anything to another file.
+; ======================================================================
+
+Procedure.i sdio_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i sdio_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; Spin for approximately n microseconds. Used only where a settling
+; delay is required and there is no status bit to poll instead. It is
+; never a substitute for a poll.
+Procedure sdio_DelayUs(us.i)
+  Define t0.i
+  Define want.i
+  If sdio_hz <= 0
+    ProcedureReturn
+  EndIf
+  want = (sdio_hz / 1000000) * us
+  If want < 1
+    want = 1
+  EndIf
+  t0 = sdio_Ticks()
+  While (sdio_Ticks() - t0) < want
+  Wend
+EndProcedure
+
+
+; ======================================================================
+;  Register access. THIRTY-TWO BITS, ALWAYS - see rule 1 in the header.
+;
+;  PeekN, not PeekL. PeekN is the unsigned 32-bit read; PeekL is signed
+;  and .i is 64 bits on this target, so PeekL on a status word with bit
+;  31 set comes back negative and every subsequent mask and compare is
+;  wrong. Half the bits this file cares about live above bit 15.
+; ======================================================================
+
+Procedure.i sdio_Rd(off.i)
+  ProcedureReturn PeekN(#SDIO_BASE + off)
+EndProcedure
+
+Procedure sdio_Wr(off.i, v.i)
+  PokeL(#SDIO_BASE + off, v)
+EndProcedure
+
+; Read-modify-write one byte lane of a 32-bit register, which is how
+; every 8-bit SDHCI register on this block has to be written. Modelled
+; on bcm2835_mmc_writeb, rpi-6.12.y_bcm2835-mmc.c lines 178-186.
+Procedure sdio_WrByte(off.i, v.i)
+  Define word.i
+  Define shift.i
+  Define cur.i
+  word = off & (~3)
+  shift = (off & 3) * 8
+  cur = sdio_Rd(word)
+  cur = cur & (~($FF << shift))
+  cur = cur | ((v & $FF) << shift)
+  sdio_Wr(word, cur)
+EndProcedure
+
+
+; ======================================================================
+;  Failure bookkeeping. One place, so every refusal captures the same
+;  three things: which error, the raw interrupt word, and the raw
+;  Present State. A report naming only the error code sends somebody to
+;  look at the wiring when the answer was in the status bits.
+; ======================================================================
+
+Procedure.i sdio_Fail(code.i)
+  sdio_err      = code
+  sdio_lastIntr = sdio_Rd(#SDIO_INT_STATUS)
+  sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+  ProcedureReturn 0
+EndProcedure
+
+
+; ======================================================================
+;  sdio_MuxPins - GPIO 34..39 to ALT3, with the device tree's pulls.
+;
+;  READ-MODIFY-WRITE, and the masks matter. GPFSEL3 holds pins 30..39;
+;  writing the whole register would return GPIO 30..33 to plain inputs,
+;  and on a Pi 4 those four are the Bluetooth UART's CTS/RTS pair and
+;  two of the SD card's own lines on some board variants. Six pins to
+;  change, four to leave alone.
+;
+;  ALT3 = 7. Not 3. See THE PINS in the header - this is the single
+;  easiest number in this file to get wrong, because the device tree
+;  spells it "ALT3" and the encoding is 0b111.
+;
+;  THE PULLS ARE THE DEVICE TREE'S, NOT A CHOICE: <0 2 2 2 2 2> from
+;  rpi-6.12.y_bcm2711-rpi-ds.dtsi line 320, which is OFF on the clock
+;  and UP on CMD and the four data lines. uart.pi4 makes its pull
+;  decisions itself and says so; this file does not, because unlike a
+;  console UART there IS a vendor group for these six pins and
+;  second-guessing it would be inventing.
+; ======================================================================
+Procedure sdio_MuxPins()
+  Define v.i
+  Define i.i
+
+  ; --- function select: six fields of three bits, at 12, 15, 18, 21,
+  ;     24 and 27. Clear bits 29:12 ($3FFFF000), then set 7 in each.
+  v = PeekN(#SDIO_GPFSEL3)
+  v = v & (~$3FFFF000)
+  For i = 0 To 5
+    v = v | (7 << (12 + i * 3))
+  Next
+  PokeL(#SDIO_GPFSEL3, v)
+
+  ; --- pulls: six fields of two bits, at 4, 6, 8, 10, 12 and 14.
+  ;     GPIO34 = b00 (no resistor), GPIO35..39 = b01 (PULL UP).
+  ;     Clear bits 15:4 ($FFF0), then set the five fields.
+  ;
+  ;     THE VALUE IS 1 AND IT USED TO BE 2. See THE PULL ENCODING IS
+  ;     INVERTED in the header: on a BCM2711, b01 is pull-UP and b10 is
+  ;     pull-DOWN, which is the opposite way round from the device
+  ;     tree's BCM2835_PUD_* numbering that the source group is written
+  ;     in. Writing the device tree's 2 here put a pull-DOWN on CMD and
+  ;     on all four DAT lines.
+  v = PeekN(#SDIO_GPPUP2)
+  v = v & (~$0000FFF0)
+  For i = 1 To 5
+    v = v | (#SDIO_PULL_UP << (4 + i * 2))
+  Next
+  PokeL(#SDIO_GPPUP2, v)
+  ; Recorded so the diagnostic can print what was actually programmed.
+  ; A pin-mux that is asserted rather than shown is a pin-mux nobody
+  ; checks, and this register is now known to be worth checking.
+  sdio_gppup2 = PeekN(#SDIO_GPPUP2)
+  sdio_gpfsel3 = PeekN(#SDIO_GPFSEL3)
+EndProcedure
+
+
+; ======================================================================
+;  THE FIRMWARE HALF OF THE BRING-UP
+;
+;  Everything from here to SdioAssertWlOn() talks to the VideoCore
+;  through mailbox.pi4's public escape hatch. Read THE POWER RAIL and IS
+;  THE CONTROLLER ITSELF POWER-GATED in the header before changing any
+;  of it; the numbers all have citations there and none of them was
+;  recalled.
+;
+;  THREE RULES HOLD FOR EVERY PROCEDURE BELOW.
+;
+;  1. NOT ASKING AND BEING TOLD NO ARE DIFFERENT ANSWERS. A query
+;     returns -1 when the transaction did not happen at all - no
+;     MailboxInit(), a buffer that would not lay out, a send that never
+;     saw a reply - and returns the firmware's own word otherwise, even
+;     when that word is 0. The globals start at -1 for the same reason.
+;     A log that cannot tell "we never asked" from "it said off" sends
+;     the next person to the wrong half of the board.
+;
+;  2. NOTHING HERE IS FATAL. The mailbox is not this file's subject. A
+;     firmware that refuses every tag should still leave the register
+;     work below it running and reporting, because the register work is
+;     what this file is for and because a reader needs to see how far it
+;     got.
+;
+;  3. NOTHING HERE EVER TURNS ANYTHING OFF. Not a clock, not a power
+;     device, not a GPIO - except WL_ON, deliberately, for the 20 ms of
+;     its own power cycle. See the header for why an "off" sent to power
+;     device id 0 could be an "off" sent to the boot medium.
+; ======================================================================
+
+
+; ----------------------------------------------------------------------
+;  sdio_EnsureTimebase - make sdio_DelayUs work before SdioInit has run.
+;
+;  sdio_DelayUs returns immediately when sdio_hz is zero, which is
+;  correct - a delay loop with no idea how fast the counter runs is not
+;  a delay - but it means the WL_ON power cycle would be instantaneous
+;  if a caller asserted WL_ON before SdioInit. SdioInit sets these two
+;  as its first act; this makes the public entry point safe as well, and
+;  it is idempotent.
+;
+;  Returns 1 if the counter is usable, 0 if it is not.
+; ----------------------------------------------------------------------
+Procedure.i sdio_EnsureTimebase()
+  If sdio_hz > 0 And sdio_tickPerMs > 0
+    ProcedureReturn 1
+  EndIf
+  sdio_hz = sdio_TickHz()
+  If sdio_hz <= 0 Or sdio_hz > #SDIO_HZ_MAX
+    sdio_hz = 0
+    sdio_tickPerMs = 0
+    ProcedureReturn 0
+  EndIf
+  sdio_tickPerMs = sdio_hz / 1000
+  If sdio_tickPerMs < 1
+    sdio_hz = 0
+    sdio_tickPerMs = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  sdio_DelayMs - milliseconds, for the radio's power cycle.
+;
+;  sdio_DelayUs multiplies by (sdio_hz / 1000000), which on this part is
+;  54 ticks per microsecond, so a 150 ms argument in microseconds is
+;  150000 and the product is well inside 64 bits. It is written as its
+;  own procedure anyway because the two call sites read as milliseconds
+;  in every source they came from and translating at each of them is how
+;  a factor of a thousand goes missing.
+; ----------------------------------------------------------------------
+Procedure sdio_DelayMs(ms.i)
+  sdio_DelayUs(ms * 1000)
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  sdio_MbxIdState - the shape four of these eight tags share.
+;
+;  GET_POWER_STATE, SET_POWER_STATE, GET_CLOCK_STATE and SET_CLOCK_STATE
+;  all carry { u32 id, u32 state } in both directions, eight bytes -
+;  firmware-Mailbox-property-interface.md lines 180-232 for the power
+;  pair and 257-292 for the clock pair. A GET's documented request
+;  length is 4 rather than 8, but the buffer still has to be eight bytes
+;  wide to receive the reply, and the firmware is handed ONE size for
+;  both purposes (raspberrypi-firmware.c line 172). Eight is that size.
+;  MailboxBegin zeroes the value words, so the unsent second word of a
+;  GET goes out as 0 rather than as whatever the last tag left there.
+;
+;  sendState = 0 for a query, 1 for a set.
+;
+;  Returns the reply's state word, or -1 if the transaction did not
+;  complete. Rule 1 above.
+; ----------------------------------------------------------------------
+Procedure.i sdio_MbxIdState(tag.i, id.i, state.i, sendState.i)
+  If MailboxReady() = 0
+    ProcedureReturn -1
+  EndIf
+  sdio_mbxUsed = 1
+  If MailboxBegin(tag, #SDIO_MBX_TWO_WORDS, #SDIO_MBX_TWO_WORDS) = 0
+    ProcedureReturn -1
+  EndIf
+  MailboxSetWord(0, id)
+  If sendState <> 0
+    MailboxSetWord(1, state)
+  EndIf
+  If MailboxSend() = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  SdioQueryPowerState(id) - GET_POWER_STATE for one device id.
+;
+;  PUBLIC, because the one thing no file on this disk can tell us is
+;  which physical controller device id 0 gates on a BCM2711, and a sweep
+;  of 0 through #SDIO_PWR_DEVID_MAX answers it in one bench run. The
+;  diagnostic prints that table.
+;
+;  Returns the state word: bit 0 on/off, bit 1 set means the firmware
+;  has no such device. -1 if it was not asked.
+; ----------------------------------------------------------------------
+Procedure.i SdioQueryPowerState(id.i)
+  ProcedureReturn sdio_MbxIdState(#SDIO_TAG_GET_POWER_STATE, id, 0, 0)
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  SdioQueryClockState(id) - GET_CLOCK_STATE for one clock id.
+;
+;  PUBLIC for the same reason, and it is the tag that answers the
+;  question the first bench run could not: GET_CLOCK_RATE returned
+;  250000000 for clock 1, and the property document says at line 310
+;  that a rate comes back "even if the clock is not running". Bit 0 of
+;  this reply is the running/not-running fact itself.
+; ----------------------------------------------------------------------
+Procedure.i SdioQueryClockState(id.i)
+  ProcedureReturn sdio_MbxIdState(#SDIO_TAG_GET_CLOCK_STATE, id, 0, 0)
+EndProcedure
+
+
+; ======================================================================
+;  WHAT THE SECOND BENCH RUN SAID ABOUT THESE STATE TAGS, AND WHY THIS
+;  PROCEDURE NO LONGER TOUCHES THE POWER DEVICES
+;  ---------------------------------------------------------------------
+;  The board ran the sweep on 2026-08-26 and answered:
+;
+;      power devid 0        state 1   exists, ON
+;      power devid 1..10    state 0   exists, off   (all ten of them)
+;
+;      EMMC  clock (id 1)   state 0   off
+;      EMMC  clock measured 250000496 Hz
+;      EMMC2 clock (id 12)  state 1   on
+;
+;  READ DEVID 1 AGAIN. Device id 1 is UART0 - the property document's
+;  own list, firmware-Mailbox-property-interface.md line 169. UART0 is
+;  the PL011 that PRINTED THAT LINE. The firmware reported a peripheral
+;  as powered off in a message the peripheral was in the middle of
+;  transmitting. That is not a subtle inference; it is the log
+;  contradicting itself in two adjacent rows.
+;
+;  SO THE POWER TABLE IS NOT MAINTAINED ON A BCM2711 and this procedure
+;  will not act on it. It reads devid 0, records it, and sends nothing.
+;  Acting on a table that calls a transmitting UART "off" is acting on
+;  noise, and the one entry that might have mattered - devid 0 - came
+;  back ON anyway, so there was never anything to switch. The sweep
+;  stays in the diagnostic because the shape of the answer is itself the
+;  finding, and because a future firmware might start maintaining it.
+;
+;  AND THE CLOCK ROW CONTRADICTS ITSELF THE SAME WAY. GET_CLOCK_STATE
+;  says clock 1 is off; GET_CLOCK_MEASURED says it is running at
+;  250000496 Hz. That is a MEASUREMENT - the firmware counts edges to
+;  produce it, which is the whole reason the tag exists separately from
+;  GET_CLOCK_RATE (see THE BASE CLOCK) - and it carries 496 Hz of real
+;  jitter off the nominal 250 MHz. A gated clock cannot be measured at
+;  250.000496 MHz. Something is generating that clock.
+;
+;  THE HONEST READING, and it is a reading and not a citation: on this
+;  part the state bit appears to mean "some client has claimed this
+;  clock" rather than "the generator is running", exactly as the power
+;  bits appear to mean nothing at all. EMMC2 reads state 1 because the
+;  firmware's own SD driver claimed it at boot; nothing has claimed the
+;  Arasan block's clock because on a Pi 4 nothing in the firmware uses
+;  that controller.
+;
+;  THE SET IS STILL ATTEMPTED, EVERY RUN. Two reasons. The reading above
+;  could be wrong, and it costs one transaction to find out. And if the
+;  firmware refuses the tag outright then that refusal is a fact worth
+;  having in the log, which it was not before - the first run recorded
+;  only that the state had not changed, which is compatible with the set
+;  never being sent, being sent and refused, or being accepted and
+;  ignored. Those now print differently.
+;
+;  ---- AND THE BOARD SETTLED IT, 2026-08-26 ---------------------------
+;  It was sent, it was ACCEPTED, and the state did not move:
+;
+;      clock state before   0
+;      clock set reply      1        the firmware replied "on"
+;      clock set mbx err    0        MBX_OK - the transaction completed
+;      clock state after    0        and the state bit is still off
+;      clock Hz measured    249987312
+;
+;  So the third of the three stories. Not a refusal - SET_CLOCK_STATE
+;  passed mailbox.pi4's per-tag check and answered "on" in its own reply
+;  word. The state bit simply does not become 1 and stay 1.
+;
+;  AND THAT FACT IS NOW LOAD-BEARING SOMEWHERE ELSE. It is the strongest
+;  evidence this file holds on the open question about the two expander
+;  set tags: a set-type tag DID pass the per-tag check on this firmware
+;  in this run, so "mailbox.pi4 is too strict about set-type tags"
+;  cannot by itself explain why the two GPIO sets did not. See AN OPEN
+;  QUESTION in the header, and do not let this paragraph drift from
+;  that one.
+;
+;  AND THE CLOCK IS RUNNING THE WHOLE TIME. 249987312 Hz measured, on a
+;  nominal 250 MHz: 12688 Hz low, about fifty parts per million, which
+;  is a crystal's tolerance and not a rounding artefact. Two separate
+;  runs measured two different values - 250000496 the first time and
+;  249987312 this time - which is what independent measurements of a
+;  live oscillator look like and is not what a constant returned from a
+;  table looks like.
+;
+;  THE READING ABOVE IS THEREFORE CONFIRMED, by three witnesses that
+;  agree: the state bit means SOMETHING HAS CLAIMED THIS CLOCK, not
+;  "the generator is turning". Clock 12 reads claimed because the
+;  firmware's own SD driver claimed it at boot; clock 1 reads unclaimed
+;  because nothing in the firmware drives the Arasan block; the counter
+;  says both are turning. The power table said the same thing about a
+;  transmitting UART0. And the controller itself is the fourth witness -
+;  SdioInit() gets past sdio_SetClock(), which spins on Internal Clock
+;  Stable in the block's own CONTROL1 register, and that bit cannot come
+;  up in an unclocked block.
+;
+;  NOTHING FURTHER IS OWED TO THIS. The clock question is closed: the
+;  block is clocked. The set stays because it is cheap and honest, and
+;  because a firmware that starts honouring it would show up here as a
+;  change rather than as a mystery.
+; ----------------------------------------------------------------------
+;  sdio_EnableClockAndPower - ask about the EMMC clock, try to claim it,
+;  and record precisely what happened. Read the power device; set
+;  nothing.
+;
+;  Records everything and returns nothing. Rule 2 - nothing here is
+;  fatal and nothing below depends on any of it.
+; ----------------------------------------------------------------------
+Procedure sdio_EnableClockAndPower()
+  Define s.i
+
+  ; --- the clock -------------------------------------------------------
+  ; GET_CLOCK_STATE, eight bytes: { u32 clock id, u32 state }.
+  ; firmware-Mailbox-property-interface.md lines 257-271.
+  s = SdioQueryClockState(#SDIO_CLOCK_ID_EMMC)
+  sdio_clkState = s
+  sdio_clkStateAfter = s
+
+  ; The second witness, and the one that contradicted the first. Already
+  ; wrapped by mailbox.pi4, so no escape hatch is needed for it.
+  sdio_clkMeasured = MailboxClockRateMeasured(#SDIO_CLOCK_ID_EMMC)
+
+  If s >= 0
+    If (s & #SDIO_MBX_STATE_NODEV) = 0 And (s & #SDIO_MBX_STATE_ON) = 0
+      ; SET_CLOCK_STATE, eight bytes, same two words in both directions -
+      ; same document, lines 273-292. State bit 0 = 1 is "on"; bit 1 in a
+      ; REQUEST is reserved here and is left clear, which is what line
+      ; 283 asks for ("reserved for future use (set to 0)").
+      sdio_clkSetReply = sdio_MbxIdState(#SDIO_TAG_SET_CLOCK_STATE, #SDIO_CLOCK_ID_EMMC, #SDIO_MBX_STATE_ON, 1)
+      ; CAPTURED IMMEDIATELY, before any other transaction can overwrite
+      ; it. MailboxError() is cleared at the start of every
+      ; MailboxBegin(), so one more property call anywhere between the
+      ; set and the read would erase the only evidence of why the set
+      ; failed. That is the whole bug the bench asked to have fixed.
+      sdio_clkSetErr  = MailboxError()
+      sdio_clkSetResp = MailboxRespBytes()
+      sdio_clkStateAfter = SdioQueryClockState(#SDIO_CLOCK_ID_EMMC)
+    EndIf
+  EndIf
+
+  ; --- the power device: READ ONLY -------------------------------------
+  ; See the long comment above. Nothing is sent. #SDIO_TAG_SET_POWER_STATE
+  ; and #SDIO_MBX_PWRREQ_WAIT stay declared because the sweep's printed
+  ; explanation refers to them and because removing a cited constant to
+  ; make an unused-symbol warning go away is how a citation gets lost.
+  s = SdioQueryPowerState(#SDIO_PWR_DEVID_SDHCI)
+  sdio_pwrState = s
+  sdio_pwrStateAfter = s
+EndProcedure
+
+
+; ======================================================================
+;  WL_ON - WHAT THE SECOND BENCH RUN CHANGED HERE
+;  ---------------------------------------------------------------------
+;  The first version of this procedure did GET_GPIO_CONFIG, then
+;  SET_GPIO_CONFIG with direction OUT and state LOW, then a 20 ms wait,
+;  then SET_GPIO_STATE HIGH. The board ran it and stopped at rung 3,
+;  which was "the polarity was read and SET_GPIO_CONFIG did not go".
+;
+;  SO THE ORDER WAS WRONG, AND SO WAS THE DEPENDENCY. Three separate
+;  faults, all fixed below.
+;
+;  1. IT MADE THE WHOLE SEQUENCE DEPEND ON THE ONE TAG THE BOARD
+;     REFUSES. GET_GPIO_CONFIG worked - it returned a polarity, and
+;     word 0 came back 0, which is the firmware accepting pin 129. So
+;     the pin number is right, the +128 base is right, the transport is
+;     right, and the twenty-byte payload fix from this morning was
+;     right. Only SET_GPIO_CONFIG failed. That tag is now ADVISORY: it
+;     is still sent, its outcome is still recorded, and nothing waits
+;     for it. The mandatory path is GET_GPIO_STATE, SET_GPIO_STATE,
+;     GET_GPIO_STATE - three uses of ONE eight-byte struct, which is the
+;     payload shape least likely to be the thing that is wrong.
+;
+;     This is also what the kernel does when it only wants to move a pin
+;     it is not reconfiguring: rpi_exp_gpio_set(), expander driver lines
+;     178-195, sends SET_GPIO_STATE and nothing else. WL_ON is a pin the
+;     firmware already owns and has already configured as an output, so
+;     the config call was always the belt and the state call the braces,
+;     and this file had them the wrong way round.
+;
+;  2. IT DROVE THE PIN LOW BEFORE IT KNEW THE HIGH WOULD WORK. If the
+;     low had gone through and the high had not, the radio would have
+;     been left switched OFF by a procedure whose job is to switch it
+;     on, and the log would have said "asserted 0" with no hint that it
+;     had made things worse. THE LOW PHASE NOW ONLY HAPPENS WHEN THE
+;     READBACK SAYS THE PIN IS ALREADY HIGH - which is the only case
+;     where a power cycle is what is wanted anyway. A pin found low is
+;     already in the state the cycle would put it in, so there is
+;     nothing to cycle and nothing to risk: it is driven high and that
+;     is the whole operation. On this board the pin was found low.
+;
+;     It also settles the Bluetooth worry recorded above: with the pin
+;     found low there is no BT link to disturb, because there is no
+;     radio powered to be carrying one.
+;
+;  3. RUNG 3 MEANT TWO DIFFERENT THINGS. It covered both "MailboxBegin
+;     would not lay the message out" and "MailboxSend did not complete",
+;     which have completely different causes - a buffer that will not
+;     fit versus a firmware that refused. Every rung below is now one
+;     event, and MailboxError() is captured at whichever rung stopped,
+;     so a refused tag (#MBX_ERR_TAG) is distinguishable from a
+;     transport timeout (#MBX_ERR_TXTIMEOUT) in the printed log.
+;
+;  THE READBACK IS NOW THE DEFINITION OF SUCCESS. This returns 1 only
+;  when GET_GPIO_STATE says the pin is high afterwards. "The firmware
+;  accepted my write" was never the claim worth making.
+; ----------------------------------------------------------------------
+;  SdioAssertWlOn - power the radio, through the firmware's expander.
+;
+;  PUBLIC, and also called by SdioInit. The diagnostic calls it
+;  explicitly first so that the ladder is printed before the bus work
+;  starts, and SdioInit's later call is then a no-op.
+;
+;  ONCE PER RUN, AND THE GUARD IS NOT AN OPTIMISATION. "Calling it twice
+;  is harmless" is what this comment used to say and it stopped being
+;  true the moment the low phase became conditional on the pin being
+;  found high. The first call leaves the pin HIGH; a second call
+;  therefore finds it high, decides a warm radio needs a clean cycle,
+;  and switches the radio off and on again - 170 ms later, with the chip
+;  back at its power-on state, moments before CMD5. That is a self-
+;  inflicted reset that no caller asked for, and the simulation caught
+;  it: the gate flagged a LOW write on a board where the pin was found
+;  LOW, which is exactly the footprint of a second cycle.
+;
+;  So sdio_wlOnDone latches on success and the second call returns 1
+;  without sending anything, leaving every recorded value from the first
+;  call intact for the log. SdioForgetWlOn() clears the latch for a
+;  caller that genuinely wants the radio power-cycled again.
+;
+;  THE LADDER IS RECORDED IN sdio_wlOnStep AND EVERY RUNG HAS A SENTENCE
+;  in SdioWlOnStepText(). That text lives in this file, not in a report,
+;  because the person reading a serial log at midnight does not have the
+;  report.
+;
+;  THE PAYLOAD SIZES, EVERY ONE OF THEM RE-CHECKED against the structs
+;  after the first run got one wrong. rpi_firmware_property() hands the
+;  firmware a single size that serves as both the request length and the
+;  response buffer length - Datasheets/pi4/raspberrypi-firmware.c line
+;  172, "header->buf_size = buf_size" - and that size is sizeof() of the
+;  struct the kernel passes. From
+;  Datasheets/pi4/rpi-linux/rpi-6.12.y_gpio-raspberrypi-exp.c:
+;
+;    struct gpio_set_config     lines 32-39  gpio, direction, polarity,
+;                                            term_en, term_pull_up,
+;                                            state
+;                                            SIX words, 24 bytes.
+;                                            Passed at line 93 and line
+;                                            122 as sizeof(set_in) /
+;                                            sizeof(set_out).
+;
+;    struct gpio_get_config     lines 41-47  gpio, direction, polarity,
+;                                            term_en, term_pull_up
+;                                            FIVE words, 20 bytes - no
+;                                            trailing state. Passed at
+;                                            line 64 and line 142 as
+;                                            sizeof(get).
+;
+;    struct gpio_get_set_state  lines 49-52  gpio, state
+;                                            TWO words, 8 bytes. Passed
+;                                            at line 167 and line 189 as
+;                                            sizeof(get) / sizeof(set).
+;
+;  Each call site below names its own size and its own struct again, so
+;  that a reader checking one call does not have to trust this list.
+;
+;  THE POLARITY IS READ BACK AND WRITTEN BACK UNCHANGED, wherever it is
+;  written at all. The expander driver does this at lines 117-120 with
+;  the comment "Retain existing setting". Inventing a polarity is a
+;  one-in-two chance of turning the radio off while reporting success.
+;
+;  DIRECTION IS 1, NOT 0. Expander driver lines 22-23:
+;
+;      #define RPI_EXP_GPIO_DIR_IN   0
+;      #define RPI_EXP_GPIO_DIR_OUT  1
+;
+;  Returns 1 only if the readback says the pin is high.
+; ----------------------------------------------------------------------
+Procedure.i SdioAssertWlOn()
+  Define polarity.i
+  Define level.i
+
+  ; See ONCE PER RUN above. Everything the first call recorded is left
+  ; exactly as it was, because that is what the diagnostic prints.
+  If sdio_wlOnDone = 1
+    ProcedureReturn 1
+  EndIf
+
+  sdio_wlOnStep       = 0
+  sdio_wlOnLevel      = -1
+  sdio_wlOnLevelFound = -1
+  sdio_wlOnDirFound   = -1
+  sdio_wlOnPolarity   = -1
+  sdio_wlOnMbxErr     = -1
+  sdio_wlOnCfgOk      = -1
+  sdio_wlOnCfgErr     = -1
+  sdio_EnsureTimebase()
+
+  If MailboxReady() = 0
+    ProcedureReturn 0
+  EndIf
+  sdio_mbxUsed = 1
+
+  ; --- rungs 1..3: GET_GPIO_CONFIG -------------------------------------
+  ; struct gpio_get_config, FIVE words, 20 bytes. Expander driver lines
+  ; 41-47, sent at line 64 as sizeof(get).
+  sdio_wlOnStep = 1
+  If MailboxBegin(#SDIO_TAG_GET_GPIO_CONFIG, #SDIO_MBX_GET_CFG_BYTES, #SDIO_MBX_GET_CFG_BYTES) = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #SDIO_WL_ON_GPIO)
+  sdio_wlOnStep = 2
+  If MailboxSend() = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnStep = 3
+  ; Word 0 comes back 0 on success. The expander driver tests exactly
+  ; that - "if (ret || get.gpio != 0)", line 66 - because the firmware
+  ; reports a rejected pin number by echoing it instead of clearing it.
+  If MailboxWord(0) <> 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnDirFound = MailboxWord(1)
+  polarity          = MailboxWord(2)
+  sdio_wlOnPolarity = polarity
+
+  ; --- rungs 4..6: GET_GPIO_STATE, the level as found ------------------
+  ; struct gpio_get_set_state, TWO words, 8 bytes. Expander driver lines
+  ; 49-52, sent at line 167 as sizeof(get).
+  ;
+  ; THIS READ IS WHY THE PROCEDURE IS SAFE. Everything after it depends
+  ; on knowing whether there is a powered radio to cycle or a dead one
+  ; to switch on, and those need different sequences.
+  sdio_wlOnStep = 4
+  If MailboxBegin(#SDIO_TAG_GET_GPIO_STATE, #SDIO_MBX_TWO_WORDS, #SDIO_MBX_TWO_WORDS) = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #SDIO_WL_ON_GPIO)
+  sdio_wlOnStep = 5
+  If MailboxSend() = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnStep = 6
+  If MailboxWord(0) <> 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  level = MailboxWord(1)
+  sdio_wlOnLevelFound = level
+
+  ; --- THE SHORT CIRCUIT, AND ON THIS BOARD IT IS THE WHOLE ANSWER -----
+  ; If the pin is ALREADY an output and ALREADY high, the radio is
+  ; already powered and there is nothing to do. Land on the success rung
+  ; with the level the read just returned and send no write at all.
+  ;
+  ; THE BOARD FAILED FOR WANT OF THIS, on 2026-08-26:
+  ;
+  ;     WL_ON dir as found     1     already an output
+  ;     WL_ON level as found   1     already high
+  ;     WL_ON step             8     SET_GPIO_STATE HIGH did not complete
+  ;     WL_ON mailbox err      8     MBX_ERR_TAG
+  ;
+  ; The firmware had powered the radio at boot, we asked it to set a pin
+  ; that was already set, the set came back as #MBX_ERR_TAG, and this
+  ; procedure reported failure over a state of affairs that was exactly
+  ; what it wanted. That is the worst kind of bug in a bring-up: it
+  ; reports the goal as unreached while standing on it.
+  ;
+  ; AND THIS SHORT CIRCUIT IS RIGHT WHICHEVER WAY THE OPEN QUESTION IN
+  ; THE HEADER GOES. If the firmware really does decline expander
+  ; writes, skipping the write is the only thing that can work. If we
+  ; have instead been misreading a successful set, skipping it is still
+  ; correct, because the write was a no-op on an already-correct pin.
+  ; A fix that does not depend on an unsettled question is a fix that
+  ; can land while the question is unsettled.
+  ;
+  ; IT IS ALSO STRICTLY SAFER. On the common path there is now no write
+  ; to the expander at all, so the sequence cannot disturb a radio that
+  ; is already running, and the Bluetooth question raised further up
+  ; stops being a question.
+  If level = 1 And sdio_wlOnDirFound = #SDIO_EXP_DIR_OUT
+    sdio_wlOnLevel = level
+    sdio_wlOnStep  = 13
+    sdio_wlOnDone  = 1
+    ProcedureReturn 1
+  EndIf
+
+  ; --- ADVISORY: SET_GPIO_CONFIG, direction OUT ------------------------
+  ; struct gpio_set_config, SIX words, 24 bytes. Expander driver lines
+  ; 32-39, sent at line 122 as sizeof(set_out).
+  ;
+  ; THE STATE WORD IS THE LEVEL WE JUST READ, NOT A NEW ONE. This call
+  ; is about the DIRECTION; making it also move the pin would give a tag
+  ; the board reports as #MBX_ERR_TAG a say in whether the radio ends
+  ; up powered. Writing back the level that is already there means the call
+  ; changes nothing if it succeeds and nothing if it fails, which is
+  ; what "advisory" has to mean to be worth sending at all.
+  ;
+  ; NOT FATAL, and no rung. This tag came back as #MBX_ERR_TAG on
+  ; 2026-08-26 while both GETs on the same pin passed, and the sequence
+  ; below does not need it either way. See AN OPEN QUESTION.
+  sdio_wlOnCfgOk = 0
+  If MailboxBegin(#SDIO_TAG_SET_GPIO_CONFIG, #SDIO_MBX_SET_CFG_BYTES, #SDIO_MBX_SET_CFG_BYTES) <> 0
+    MailboxSetWord(0, #SDIO_WL_ON_GPIO)
+    MailboxSetWord(1, #SDIO_EXP_DIR_OUT)
+    MailboxSetWord(2, polarity)
+    MailboxSetWord(3, 0)            ; term_en      - n/a for an output
+    MailboxSetWord(4, 0)            ; term_pull_up - no termination
+    MailboxSetWord(5, level)        ; state - unchanged, deliberately
+    If MailboxSend() <> 0
+      If MailboxWord(0) = 0
+        sdio_wlOnCfgOk = 1
+      EndIf
+    EndIf
+  EndIf
+  sdio_wlOnCfgErr  = MailboxError()
+  sdio_wlOnCfgResp = MailboxRespBytes()
+
+  ; --- the low phase, ONLY if there is something to cycle --------------
+  ; See fault 2 in the block above. A pin found HIGH means a radio that
+  ; has been running, and the Pico driver's reason for the cycle applies
+  ; - ">= 10 ms guarantees the regulator has actually dropped, so a warm
+  ; restart looks like a cold one", RP2040/Lib/cyw43.pico line 1973. A
+  ; pin found LOW is already where the cycle would put it, so the cycle
+  ; is skipped and the pin is only ever driven towards ON.
+  If level = 1
+    If MailboxBegin(#SDIO_TAG_SET_GPIO_STATE, #SDIO_MBX_TWO_WORDS, #SDIO_MBX_TWO_WORDS) <> 0
+      MailboxSetWord(0, #SDIO_WL_ON_GPIO)
+      MailboxSetWord(1, 0)
+      MailboxSend()
+    EndIf
+    sdio_DelayMs(#SDIO_WL_ON_LOW_MS)
+  EndIf
+
+  ; --- rungs 7..9: SET_GPIO_STATE, HIGH. The one that matters ----------
+  ; struct gpio_get_set_state again, TWO words, 8 bytes - expander
+  ; driver lines 49-52, sent at line 189 as sizeof(set). This is
+  ; rpi_exp_gpio_set()'s whole body.
+  sdio_wlOnStep = 7
+  If MailboxBegin(#SDIO_TAG_SET_GPIO_STATE, #SDIO_MBX_TWO_WORDS, #SDIO_MBX_TWO_WORDS) = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #SDIO_WL_ON_GPIO)
+  MailboxSetWord(1, 1)
+  sdio_wlOnStep = 8
+  If MailboxSend() = 0
+    sdio_wlOnMbxErr  = MailboxError()
+    sdio_wlOnSetResp = MailboxRespBytes()
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnSetResp = MailboxRespBytes()
+  sdio_wlOnStep = 9
+  If MailboxWord(0) <> 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+
+  ; 150 ms, "the largest of the three numbers the datasheet gives
+  ; (3/50/150)" - RP2040/Lib/cyw43.pico line 1975, and that driver has
+  ; run. Spent here whether or not the low phase happened, because it is
+  ; the time the radio needs to come up, not the time the rail needs to
+  ; fall.
+  sdio_DelayMs(#SDIO_WL_ON_HIGH_MS)
+
+  ; --- rungs 10..12: GET_GPIO_STATE, the readback ----------------------
+  ; struct gpio_get_set_state, TWO words, 8 bytes, expander driver lines
+  ; 49-52 and line 167.
+  sdio_wlOnStep = 10
+  If MailboxBegin(#SDIO_TAG_GET_GPIO_STATE, #SDIO_MBX_TWO_WORDS, #SDIO_MBX_TWO_WORDS) = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #SDIO_WL_ON_GPIO)
+  sdio_wlOnStep = 11
+  If MailboxSend() = 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnStep = 12
+  If MailboxWord(0) <> 0
+    sdio_wlOnMbxErr = MailboxError()
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnLevel = MailboxWord(1)
+  sdio_wlOnStep = 13
+
+  ; SUCCESS IS THE READBACK, not the acceptance. A firmware that took
+  ; every write and still reports the pin low has told us something, and
+  ; it is not "yes".
+  If sdio_wlOnLevel = 1
+    sdio_wlOnDone = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  SdioForgetWlOn - clear the once-per-run latch so the next
+;  SdioAssertWlOn() really does power-cycle the radio again.
+;
+;  Nothing in this project calls it. It exists because the latch is a
+;  behaviour change and a latch with no way out is a trap: a caller
+;  recovering from a wedged radio has a legitimate reason to want the
+;  cycle repeated, and without this it would have to reboot the board.
+; ----------------------------------------------------------------------
+Procedure SdioForgetWlOn()
+  sdio_wlOnDone = 0
+EndProcedure
+
+
+; ======================================================================
+;  sdio_ControllerPlausible - is there an SDHCI controller at
+;  #SDIO_BASE, and is it a DIFFERENT one from the SD card's?
+;
+;  The first half is emmc.pi4's sd_ControllerPlausible(), for the same
+;  reason: a store to a real, powered, idle peripheral produces no
+;  output and no error. Host Controller Version all-zero or all-ones
+;  means nothing is decoding here; a specification-version field above 4
+;  is not a version number, so this is not that register, so this is not
+;  the controller.
+;
+;  IT USED TO CHECK CAPABILITIES AS WELL AND IT NO LONGER DOES. That
+;  second check was the same argument from a different offset, and the
+;  board proved the offset does not support the argument. Capabilities
+;  is now read, recorded and reported. See the body.
+;
+;  THE SECOND HALF IS NEW AND IT IS THIS FILE'S OWN HAZARD. There are
+;  two SDHCI-class controllers on this chip, $40000 apart, and a
+;  one-digit slip in the base constant lands on the micro-SD card's
+;  controller - which WILL answer all three checks above, perfectly,
+;  because it is a real SDHCI controller. Everything after that would
+;  then reset and reconfigure the boot medium while reporting success.
+;
+;  There is no register that says "I am the Arasan one and not the
+;  emmc2 one". What there is:
+;
+;    * emmc2 is "brcm,bcm2711-emmc2" and reports a spec version of 3;
+;      the Arasan block is older silicon. That is not a discriminator
+;      that can be relied on and it is not used as one.
+;
+;    * WHAT IS USED: the CARD DETECT bits. The Arasan controller's
+;      device-tree node is marked non-removable (bcm270x.dtsi line 58)
+;      and the CYW43455 is soldered to it; emmc2 drives a socket. So
+;      this records both Present State card bits AS FOUND and hands
+;      them to the caller through SdioCardDetectBit() and
+;      SdioCardPinLevel() rather than acting on them.
+;
+;  THAT IS A REPORT, NOT A GUARD, and calling it a guard would be a lie.
+;  Nothing on this disk can distinguish the two blocks by register
+;  content. The defence against a wrong base address is the citation
+;  chain in the header, and the honest statement of the risk is here.
+;
+;  Returns 1 if it looks like a controller, 0 with sdio_err set.
+; ======================================================================
+Procedure.i sdio_ControllerPlausible()
+  Define v.i
+  Define c.i
+
+  ; SDHCI_HOST_VERSION is the 16-bit register at $FE, so it is the top
+  ; half of the word at $FC. SDHCI_SPEC_VER_MASK $00FF and
+  ; SDHCI_VENDOR_VER_MASK $FF00 (sdhci.h lines 280-283) apply to that
+  ; halfword, hence the >> 16 first.
+  v = sdio_Rd(#SDIO_HOST_VER)
+  sdio_hostVerRaw = v
+  If v = 0 Or v = $FFFFFFFF
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NO_CONTROLLER)
+  EndIf
+  sdio_ver    = (v >> 16) & $FF
+  sdio_vendor = (v >> 24) & $FF
+  If sdio_ver > 4
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_VERSION)
+  EndIf
+
+  ; CAPABILITIES IS RECORDED AND NOT JUDGED. This used to refuse with
+  ; #SDIO_ERR_NO_CAPS when the register read all-zero, and on 2026-08-26
+  ; the board read exactly that while $FE3000FC returned $99020000 - a
+  ; perfectly good Host Controller Version - and the refusal sent the
+  ; bench to check an address that was correct.
+  ;
+  ; The full argument is THE CAPABILITIES REGISTER READS ZERO HERE AND
+  ; THAT IS NOT A FAULT, in the header. The short form: the driver
+  ; Raspberry Pi binds to this node, rpi-6.12.y_bcm2835-mmc.c, mentions
+  ; SDHCI_CAPABILITIES once in the entire file, at lines 255-257, inside
+  ; a pr_debug register dump. It takes the base clock from the clock
+  ; framework instead (line 1452), writes the 3.3V rail without asking
+  ; whether the controller claims to support it (lines 1180-1182), and
+  ; hard-codes its capability flags (lines 1302-1306). A register that
+  ; the vendor's own driver reads only to print is not a register this
+  ; file may refuse over.
+  c = sdio_Rd(#SDIO_CAPS0)
+  sdio_caps0 = c
+  sdio_caps1 = sdio_Rd(#SDIO_CAPS1)
+
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  The base clock. See THE BASE CLOCK in the header. This is allowed to
+;  say "I do not know" and it is the only number here that is.
+;
+;  sdhci.h lines 214-215: SDHCI_CLOCK_BASE_MASK is GENMASK(13, 8) -
+;  bits 13:8 - at SDHCI_CLOCK_BASE_SHIFT 8, in MHz. Later versions of
+;  the specification widened that field to bits 15:8 on a 3.00
+;  controller; the Linux header carries only the narrow form, so the
+;  narrow form is what is used, and a controller reporting more than 63
+;  MHz through the wide field would come back truncated rather than
+;  wrong-by-a-factor. Zero means "not obtainable here".
+;
+;  Returns kHz, or 0 for unknown.
+; ======================================================================
+Procedure.i sdio_BaseClockKhz()
+  Define mhz.i
+  If sdio_userBase > 0
+    ProcedureReturn sdio_userBase
+  EndIf
+  mhz = (sdio_caps0 >> 8) & $3F
+  If mhz = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn mhz * 1000
+EndProcedure
+
+
+; ======================================================================
+;  sdio_DivisorFor - the N the Clock Control register wants.
+;
+;  10-bit Divided Clock Mode: SDCLK = base / (2 * N), N = 0 meaning the
+;  base clock undivided. The field is split - sdhci.h lines 119-123 put
+;  N[7:0] at SDHCI_DIVIDER_SHIFT 8 and N[9:8] at SDHCI_DIVIDER_HI_SHIFT
+;  6 - which is why sdio_SetClock below assembles it in two pieces.
+;
+;  Rounds N UP, always. Both frequencies this file asks for are
+;  CEILINGS: 400 kHz is the identification limit and 25 MHz is Default
+;  Speed. A bus a little slow works; a bus a little fast is out of spec.
+; ======================================================================
+Procedure.i sdio_DivisorFor(baseKhz.i, wantKhz.i)
+  Define n.i
+  Define twice.i
+  If wantKhz <= 0
+    ProcedureReturn 1023
+  EndIf
+  If baseKhz <= wantKhz
+    ProcedureReturn 0
+  EndIf
+  twice = 2 * wantKhz
+  n = (baseKhz + twice - 1) / twice
+  If n < 1
+    n = 1
+  EndIf
+  If n > 1023
+    n = 1023
+  EndIf
+  ProcedureReturn n
+EndProcedure
+
+
+; ======================================================================
+;  sdio_SetClock - stop the clock, program a divisor, start it again.
+;
+;  CONTROL1 IS REBUILT WHOLE rather than read-modify-written. The word
+;  carries three registers - Clock Control, Timeout Control and Software
+;  Reset - and a read-modify-write would carry whatever happened to be
+;  in the Software Reset byte back into the register. Composing it from
+;  scratch means the bits that go in are exactly the bits named here.
+;
+;  THE ORDER IS NOT NEGOTIABLE:
+;    1. clear SD Clock Enable  (never change a divisor while the clock
+;       is running - the card sees a runt pulse and loses sync)
+;    2. write divisor + Internal Clock Enable
+;    3. wait for Internal Clock Stable
+;    4. set SD Clock Enable
+;
+;  Returns 1, or 0 with sdio_err set if the clock never stabilised.
+; ======================================================================
+Procedure.i sdio_SetClock(wantKhz.i)
+  Define n.i
+  Define c1.i
+  Define lo.i
+  Define hi.i
+  Define t0.i
+  Define budget.i
+
+  n = sdio_DivisorFor(sdio_baseKhz, wantKhz)
+  sdio_divisor = n
+  If n = 0
+    sdio_clkKhz = sdio_baseKhz
+  Else
+    sdio_clkKhz = sdio_baseKhz / (2 * n)
+  EndIf
+
+  ; 1
+  c1 = sdio_Rd(#SDIO_CONTROL1) & (~#SDIO_CLK_CARD_EN)
+  sdio_Wr(#SDIO_CONTROL1, c1)
+
+  ; 2. N[7:0] to word bits 15:8, N[9:8] to word bits 7:6.
+  lo = (n & $FF) << 8
+  hi = ((n >> 8) & 3) << 6
+  c1 = #SDIO_TIMEOUT_MAX | lo | hi | #SDIO_CLK_INT_EN
+  sdio_Wr(#SDIO_CONTROL1, c1)
+
+  ; 3
+  budget = #SDIO_TMO_CLOCK_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  While (sdio_Rd(#SDIO_CONTROL1) & #SDIO_CLK_INT_STABLE) = 0
+    If (sdio_Ticks() - t0) > budget
+      ProcedureReturn sdio_Fail(#SDIO_ERR_CLOCK)
+    EndIf
+  Wend
+
+  ; 4
+  c1 = sdio_Rd(#SDIO_CONTROL1) | #SDIO_CLK_CARD_EN
+  sdio_Wr(#SDIO_CONTROL1, c1)
+
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  sdio_WaitInhibit - do not issue a command into a busy controller.
+;
+;  Command Inhibit (CMD), Present State bit 0 (sdhci.h line 66), is set
+;  while the CMD line is in use. Command Inhibit (DAT), bit 1 (line 67),
+;  is set while the DAT line is in use or while the card is signalling
+;  busy. A command issued while either is set is not queued - it is
+;  lost, silently.
+; ======================================================================
+Procedure.i sdio_WaitInhibit(needDat.i)
+  Define mask.i
+  Define t0.i
+  Define budget.i
+  mask = #SDIO_ST_CMD_INHIBIT
+  If needDat <> 0
+    mask = mask | #SDIO_ST_DAT_INHIBIT
+  EndIf
+  budget = #SDIO_TMO_INHIBIT_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  While (sdio_Rd(#SDIO_STATUS) & mask) <> 0
+    If (sdio_Ticks() - t0) > budget
+      ProcedureReturn sdio_Fail(#SDIO_ERR_INHIBIT)
+    EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  sdio_ResetLine - recover CMD (and optionally DAT) after an error, so
+;  one bad command does not poison every command after it.
+;
+;  Software Reset For CMD Line and For DAT Line are self-clearing bits
+;  in the Software Reset register at $2F (sdhci.h lines 130-133), which
+;  is the top byte of the CONTROL1 word. They reset that part of the
+;  controller WITHOUT disturbing the clock setup, which is why an error
+;  path uses these two and not Software Reset For All.
+;
+;  Bounded, but its failure is not reported: it already runs inside a
+;  failure path, and replacing the caller's error code with a second one
+;  would hide the original problem.
+; ======================================================================
+Procedure sdio_ResetLine(alsoData.i)
+  Define bits.i
+  Define t0.i
+  Define budget.i
+  bits = #SDIO_SRST_CMD
+  If alsoData <> 0
+    bits = bits | #SDIO_SRST_DATA
+  EndIf
+  sdio_Wr(#SDIO_CONTROL1, sdio_Rd(#SDIO_CONTROL1) | bits)
+  budget = #SDIO_TMO_RESET_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  While (sdio_Rd(#SDIO_CONTROL1) & bits) <> 0
+    If (sdio_Ticks() - t0) > budget
+      Break
+    EndIf
+  Wend
+EndProcedure
+
+
+; ======================================================================
+;  sdio_Command - issue one command and collect its response.
+;
+;  cmdtm     one of the #SDIO_CMDn words above, complete, including the
+;            transfer-mode half for a data command
+;  arg       the 32-bit argument
+;  tmoIsOk   1 if a Command Timeout is an EXPECTED answer here. Two
+;            callers need it: the CMD52 that resets the card before
+;            anything is known to be there, and the first CMD5, which is
+;            how this file discovers whether the slot is populated at
+;            all. Shouting about either would turn a normal outcome into
+;            a reported fault.
+;
+;  Returns  1  completed; sdio_resp0..3 are valid
+;           0  failed; sdio_err says how
+;          -1  timed out and tmoIsOk was set. sdio_err is NOT set - the
+;              caller asked for this outcome. -1 rather than 0 so that a
+;              caller which ignores the distinction still sees "not
+;              success".
+;
+;  THE DATA PHASE IS NOT DONE HERE. A CMD53 leaves the buffer waiting;
+;  sdio_Cmd53 below pumps it. Splitting them keeps this procedure the
+;  same shape as emmc.pi4's sd_Command, which is a file somebody has
+;  already read.
+; ======================================================================
+Procedure.i sdio_Command(cmdtm.i, arg.i, tmoIsOk.i)
+  Define intr.i
+  Define t0.i
+  Define budget.i
+  Define needDat.i
+  Define rsp.i
+
+  sdio_lastCmd = (cmdtm >> 24) & $3F
+
+  needDat = 0
+  rsp = cmdtm & #SDIO_CMD_RSP_MASK
+  If rsp = #SDIO_CMD_RSP_48B
+    needDat = 1
+  EndIf
+  If (cmdtm & #SDIO_CMD_ISDATA) <> 0
+    needDat = 1
+  EndIf
+
+  If sdio_WaitInhibit(needDat) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Clear everything, so the poll below cannot see a stale bit from the
+  ; previous command and call it success.
+  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_ALL)
+
+  sdio_Wr(#SDIO_ARG1, arg)
+  ; ONE 32-BIT WRITE, transfer mode and command together. See rule 2 in
+  ; the header: writing $0C alone would rewrite $0E and re-issue the
+  ; previous command.
+  sdio_Wr(#SDIO_CMDTM, cmdtm)
+
+  budget = #SDIO_TMO_CMD_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  Repeat
+    intr = sdio_Rd(#SDIO_INT_STATUS)
+    If (intr & (#SDIO_INT_RESPONSE | #SDIO_INT_ERROR_MASK)) <> 0
+      Break
+    EndIf
+    If (sdio_Ticks() - t0) > budget
+      sdio_lastIntr = intr
+      sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+      sdio_err = #SDIO_ERR_CMD_STUCK
+      sdio_ResetLine(1)
+      ProcedureReturn 0
+    EndIf
+  ForEver
+
+  If (intr & #SDIO_INT_ERROR_MASK) <> 0
+    sdio_lastIntr = intr
+    sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+    sdio_Wr(#SDIO_INT_STATUS, intr)      ; write-1-to-clear what we saw
+    sdio_ResetLine(1)
+    ; A bare Command Timeout with nothing else set is the "no answer"
+    ; case, and it is the one some callers expect.
+    If (intr & #SDIO_INT_ERROR_MASK) = #SDIO_INT_TIMEOUT
+      If tmoIsOk <> 0
+        ProcedureReturn -1
+      EndIf
+      sdio_err = #SDIO_ERR_CMD_TIMEOUT
+      ProcedureReturn 0
+    EndIf
+    sdio_err = #SDIO_ERR_CMD_ERROR
+    ProcedureReturn 0
+  EndIf
+
+  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_RESPONSE)
+
+  sdio_resp0 = 0
+  sdio_resp1 = 0
+  sdio_resp2 = 0
+  sdio_resp3 = 0
+  If rsp <> #SDIO_CMD_RSP_NONE
+    sdio_resp0 = sdio_Rd(#SDIO_RESP0)
+    If rsp = #SDIO_CMD_RSP_136
+      sdio_resp1 = sdio_Rd(#SDIO_RESP1)
+      sdio_resp2 = sdio_Rd(#SDIO_RESP2)
+      sdio_resp3 = sdio_Rd(#SDIO_RESP3)
+    EndIf
+  EndIf
+
+  ; An R1b's busy period follows the response on DAT0 and ends with
+  ; Transfer Complete, not with Command Complete. Waiting only for the
+  ; latter lets the next command be issued into a card that is still
+  ; busy. CMD7 is the only R1b this file sends and it is enough to make
+  ; this necessary.
+  If rsp = #SDIO_CMD_RSP_48B
+    budget = #SDIO_TMO_DATA_MS * sdio_tickPerMs
+    t0 = sdio_Ticks()
+    Repeat
+      intr = sdio_Rd(#SDIO_INT_STATUS)
+      If (intr & #SDIO_INT_DATA_END) <> 0
+        sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_DATA_END)
+        Break
+      EndIf
+      If (intr & #SDIO_INT_ERROR_MASK) <> 0
+        sdio_lastIntr = intr
+        sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+        sdio_Wr(#SDIO_INT_STATUS, intr)
+        sdio_ResetLine(1)
+        sdio_err = #SDIO_ERR_CMD_ERROR
+        ProcedureReturn 0
+      EndIf
+      ; Some controllers end an R1b busy by dropping the DAT inhibit and
+      ; never raising Transfer Complete. Accept that rather than time
+      ; out on a card that is, observably, no longer busy.
+      If (sdio_Rd(#SDIO_STATUS) & #SDIO_ST_DAT_INHIBIT) = 0
+        Break
+      EndIf
+      If (sdio_Ticks() - t0) > budget
+        sdio_lastIntr = intr
+        sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+        sdio_err = #SDIO_ERR_BUSY_TMO
+        ProcedureReturn 0
+      EndIf
+    ForEver
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  sdio_CheckR5 - did the card accept the command?
+;
+;  A CMD52 or CMD53 that the CONTROLLER completed without error can
+;  still have been REFUSED by the card, and the refusal is in the
+;  response, not in the interrupt register. sdio_ops.c lines 90-95 tests
+;  three of the five flags one at a time to get distinct error numbers;
+;  this tests all five at once, because a caller here gets one error
+;  code and the raw R5 through SdioLastR5().
+;
+;  THIS IS THE CHECK THAT IS EASIEST TO LEAVE OUT AND WORST TO LEAVE
+;  OUT. Without it a CMD52 to a function that does not exist returns
+;  whatever garbage was in the data byte, and the layer above believes
+;  it. Returns 1 if the card accepted it, 0 with sdio_err set otherwise.
+; ======================================================================
+Procedure.i sdio_CheckR5()
+  sdio_lastR5 = sdio_resp0 & $FFFF
+  If (sdio_lastR5 & #SDIO_R5_BAD) <> 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_R5)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  PUBLIC - CMD52, single-byte register access.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  SdioCmd52Read(fn, addr) - one byte out of function fn's register
+;  space. Returns 0..255, or -1 with sdio_err set.
+;
+;  -1 AND NOT 0 FOR FAILURE, because 0 is a perfectly ordinary register
+;  value and a caller that cannot tell them apart will happily decide a
+;  chip is absent because a bus error looked like a zero. Every caller
+;  in cyw43.pi4 tests for -1.
+;
+;  THE ARGUMENT IS BUILT EXACTLY AS sdio_ops.c LINE 76-80 BUILDS IT, and
+;  note what a read does NOT set: no write bit, no RAW bit, and the data
+;  byte is zero. Setting the RAW bit on a read is meaningless and some
+;  cards treat the whole argument as malformed.
+; ----------------------------------------------------------------------
+Procedure.i SdioCmd52Read(fn.i, addr.i)
+  Define arg.i
+  If fn < 0 Or fn > 7
+    sdio_Fail(#SDIO_ERR_BAD_FUNC)
+    ProcedureReturn -1
+  EndIf
+  If addr < 0 Or addr > #SDIO_ADDR_MAX
+    sdio_Fail(#SDIO_ERR_BAD_ADDR)
+    ProcedureReturn -1
+  EndIf
+
+  arg = (fn * #SDIO_ARG_FN_STEP) | (addr * #SDIO_ARG_ADDR_STEP)
+  If sdio_Command(#SDIO_CMD52, arg, 0) <> 1
+    ProcedureReturn -1
+  EndIf
+  If sdio_CheckR5() = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn sdio_resp0 & $FF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioCmd52Write(fn, addr, val) - one byte in. Returns 1 or 0.
+;
+;  THE RAW FLAG IS SET. sdio_ops.c line 78 sets it when the caller asked
+;  for the read-back value; this file always asks, because the byte the
+;  card returns after a write is free evidence that the write landed,
+;  and it is recorded in sdio_lastR5 whether anybody looks or not. It is
+;  NOT compared against what was written: plenty of SDIO registers are
+;  write-1-to-clear, or self-clearing, or read back a different field
+;  entirely, and a driver that insisted on an echo would refuse half the
+;  legitimate writes in cyw43.pi4.
+; ----------------------------------------------------------------------
+Procedure.i SdioCmd52Write(fn.i, addr.i, val.i)
+  Define arg.i
+  If fn < 0 Or fn > 7
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_FUNC)
+  EndIf
+  If addr < 0 Or addr > #SDIO_ADDR_MAX
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_ADDR)
+  EndIf
+
+  arg = #SDIO_ARG_WRITE | #SDIO_ARG_RAW
+  arg = arg | (fn * #SDIO_ARG_FN_STEP)
+  arg = arg | (addr * #SDIO_ARG_ADDR_STEP)
+  arg = arg | (val & $FF)
+  If sdio_Command(#SDIO_CMD52, arg, 0) <> 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn sdio_CheckR5()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioCmd52ReadRaw(fn, addr) - the same read, but a command timeout is
+;  not an error and returns -2.
+;
+;  For the one caller that legitimately expects no answer: the reset
+;  CMD52 sent before anything is known to be on the bus.
+; ----------------------------------------------------------------------
+Procedure.i SdioCmd52ReadRaw(fn.i, addr.i)
+  Define arg.i
+  Define r.i
+  arg = (fn * #SDIO_ARG_FN_STEP) | (addr * #SDIO_ARG_ADDR_STEP)
+  r = sdio_Command(#SDIO_CMD52, arg, 1)
+  If r = -1
+    ProcedureReturn -2
+  EndIf
+  If r <> 1
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn sdio_resp0 & $FF
+EndProcedure
+
+
+; ======================================================================
+;  PUBLIC - CMD53, multi-byte and multi-BLOCK transfer.
+;
+;  TWO MODES, ONE BODY. Both are whole 4-byte units, and that single
+;  restriction is the only one left:
+;
+;    * BYTE MODE moves 4 to 512 bytes in one command. This is what every
+;      backplane register access uses - a 32-bit read is a 4-byte byte-
+;      mode CMD53 - and it is the mode that has run on silicon.
+;
+;    * BLOCK MODE moves 1 to 511 blocks of a size the CARD was told
+;      beforehand with SdioSetBlockSize(). This is what moves a firmware
+;      image or a WLAN frame, and it is why this section was reopened on
+;      2026-08-26.
+;
+;  WHY THE 4-BYTE UNIT SURVIVES BOTH MODES. The Buffer Data Port is 32
+;  bits wide. A trailing 1, 2 or 3 bytes would need a partial final
+;  word, which means reading four bytes and discarding some - fine for a
+;  read, WRONG for a write, where the discarded bytes are real bus
+;  traffic to real registers. Rather than have the two directions behave
+;  differently, both refuse. In practice nothing asks: F1's block size
+;  is 64 and F2's is 512 (bcmsdh.c lines 44-45), and a backplane
+;  register is four bytes by construction.
+;
+;  WHAT CHANGED, AND WHAT THE OLD COMMENT HERE SAID. Until today this
+;  section carried a reasoned refusal of block mode whose third bullet
+;  was "there is no firmware image here (see cyw43.pi4) and there are no
+;  packets, so block mode would be untestable code in the path of every
+;  transfer." That reasoning was sound and it has EXPIRED, not been
+;  overruled: the image is on the disk now, so block mode is testable,
+;  and the argument that kept it out is the argument that now requires
+;  it. The two premises it turned on are both recorded above so that a
+;  reader meeting this code cold can see it was a decision and not an
+;  oversight.
+;
+;  BLOCK MODE IS NOT IN THE PATH OF EVERY TRANSFER even so. The byte-
+;  mode entry points still take the identical path they took when they
+;  were proven, with blocks = 1 - the loop below simply runs once. That
+;  was a deliberate constraint on this change: no new code executes on
+;  the path that already works.
+;
+;  A caller asking for something outside the contract gets
+;  #SDIO_ERR_BAD_LEN, #SDIO_ERR_BAD_COUNT or #SDIO_ERR_ALIGN. It does
+;  not get a silently truncated transfer.
+;
+; ======================================================================
+;  512 IS THE PROTOCOL'S BYTE-MODE CEILING. IT IS NOT THE CARD'S.
+;  READ THIS BEFORE ASKING FOR A LONG BYTE-MODE TRANSFER.
+; ======================================================================
+;  This file will accept any byte-mode length up to 512 because that is
+;  all the nine-bit count field can express. THE CARD IS ENTITLED TO
+;  REFUSE A SHORTER ONE, and on 2026-08-26 this board's CYW43455 did:
+;  a 256-byte byte-mode read of function 1 came back with an R5 refusal.
+;
+;  Linux never issues one, and the reason is sdio_max_byte_size() at
+;  v6.12_linux_mmc_sdio_io.c lines 189-202:
+;
+;      unsigned mval = func->card->host->max_blk_size;
+;      if (mmc_blksz_for_byte_mode(func->card))
+;              mval = min(mval, func->cur_blksize);
+;      else
+;              mval = min(mval, func->max_blksize);
+;      ...
+;      return min(mval, 512u);   /* maximum size for byte mode */
+;
+;  Three separate bounds, and the smallest wins. On this board the host
+;  bound is 512 (bcm2835-mmc.c line 1360, "mmc->max_blk_size = 512"),
+;  and the FUNCTION bound is the one that bites: function 1's block size
+;  is 64 (bcmsdh.c line 44), so a byte-mode transfer to function 1 is at
+;  most 64 bytes however much the argument field could hold.
+;
+;  WHY THIS FILE DOES NOT ENFORCE IT. It does not know the block size -
+;  SdioSetBlockSize writes it and nothing reads it back, and the CIS
+;  that carries a function's MAXIMUM block size is not parsed here (see
+;  "NO CIS PARSING" in the header). Enforcing a bound this file cannot
+;  measure would mean inventing one. So the bound is DOCUMENTED here and
+;  APPLIED by the caller that does know: cyw43.pi4 reads function 1's
+;  block size back out of the card in Cyw43Attach and chunks its
+;  byte-mode transfers to it.
+;
+;  THE CONSERVATIVE BRANCH IS THE ONE TO TAKE when the maximum is
+;  unknown. min(host, cur_blksize) is the mmc_blksz_for_byte_mode branch
+;  and it is provably no larger than the other branch, because a
+;  function's current block size can never exceed its maximum. A caller
+;  that uses it cannot ask for too much; it can only ask for too little,
+;  and too little costs speed on a path that exists to be slow and
+;  obviously correct.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  sdio_Cmd53Xfer - the common body for both modes.
+;
+;    dir        1 = read from the card, 0 = write to it
+;    blksz      bytes per block. In byte mode this IS the whole
+;               transfer length.
+;    blocks     how many. Must be 1 in byte mode.
+;    blockMode  0 = byte mode, 1 = block mode
+;    incr       1 walks the card's address, 0 hammers one address
+;
+;  THE BLOCK SIZE / BLOCK COUNT REGISTER. BLOCK_SIZE is 16 bits at $04
+;  and BLOCK_COUNT is 16 bits at $06 (sdhci.h lines 30 and 33), so the
+;  word is (count << 16) | size. In byte mode the whole transfer is one
+;  "block" of nbytes and the count is 1; in block mode both fields mean
+;  what they say.
+;
+;  THE DMA BOUNDARY FIELD AT BITS 14:12 IS LEFT AT ZERO IN BOTH MODES,
+;  and the difference from Linux is deliberate. SDHCI_MAKE_BLKSZ
+;  (sdhci.h line 31) puts a 3-bit "host SDMA buffer boundary" there and
+;  bcm2835-mmc.c line 607 passes SDHCI_DEFAULT_BOUNDARY_ARG, which
+;  sdhci.h lines 301-302 compute as ilog2(512 * 1024) - 12 = 7. That
+;  field tells the controller when to raise a DMA Interrupt so the
+;  driver can reprogram the system address mid-transfer. THIS FILE IS
+;  PIO ONLY - SDHCI_TRNS_DMA is never set and SDHCI_DMA_ADDRESS is never
+;  written - so the field selects the boundary of a DMA that does not
+;  happen. Writing 7 would be copying a value for its own sake; writing
+;  0 keeps one rule for both modes and leaves the byte-mode path
+;  bit-identical to the one already proven on the board.
+;
+;  BLOCK COUNT ENABLE IS SET even for one block, because bcm2835-mmc.c
+;  line 630 sets it unconditionally whenever a command carries data:
+;      mode = SDHCI_TRNS_BLK_CNT_EN;
+;  It is folded into the four #SDIO_CMD53_* constants rather than being
+;  written separately, because transfer mode and command must go out as
+;  one 32-bit store.
+;
+;  THE ARGUMENT'S LENGTH FIELD, sdio_ops.c lines 141-142:
+;      if (blocks == 0) cmd.arg |= (blksz == 512) ? 0 : blksz;
+;      else             cmd.arg |= 0x08000000 | blocks;
+;  Byte mode encodes the BYTE count in nine bits, and 512 does not fit
+;  in nine bits, so 512 is spelled 0. This file does not special-case
+;  that, because it does not have to: 512 & $1FF is already 0. The
+;  masking is written out anyway rather than left implicit, so that the
+;  next person to read the line does not have to rediscover the
+;  coincidence.
+;
+;  THE PER-BLOCK WAIT. Buffer Read Ready and Buffer Write Ready are
+;  raised ONCE PER BLOCK by an SDHCI controller, not once per transfer,
+;  and each is cleared by writing it back. So the wait sits inside the
+;  block loop and the flag is tested once per block rather than once per
+;  word: the interrupt means a WHOLE block's worth of the FIFO is
+;  available. bcm2835-mmc.c reaches the same place from the other
+;  direction - its transfer_pio (line 454) loops on the PRESENT_STATE
+;  bit and decrements host->blocks once per pass.
+;
+;  EVERY BLOCK GETS THE FULL #SDIO_TMO_DATA_MS BUDGET, not a share of
+;  one budget for the whole transfer. A 511-block transfer is not 511
+;  times more likely to stall in any one place, and a budget divided by
+;  the block count would make a large transfer fail for being large.
+; ----------------------------------------------------------------------
+Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMode.i, incr.i)
+  Define arg.i
+  Define cmdtm.i
+  Define words.i
+  Define i.i
+  Define b.i
+  Define intr.i
+  Define t0.i
+  Define budget.i
+  Define want.i
+  Define p.i
+
+  If *buf = 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NULL_BUF)
+  EndIf
+  If (*buf & 3) <> 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_ALIGN)
+  EndIf
+  If fn < 0 Or fn > 7
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_FUNC)
+  EndIf
+  If addr < 0 Or addr > #SDIO_ADDR_MAX
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_ADDR)
+  EndIf
+  If blksz < 4 Or blksz > 512 Or (blksz & 3) <> 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_LEN)
+  EndIf
+  If blocks < 1 Or blocks > #SDIO_BLOCKS_MAX
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_COUNT)
+  EndIf
+  ; Byte mode has no block count to carry. Silently accepting blocks = 3
+  ; and moving one block would be the exact shape of quiet wrong answer
+  ; this file exists to refuse, so the contradiction is refused instead.
+  If blockMode = 0 And blocks <> 1
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_COUNT)
+  EndIf
+
+  arg = 0
+  If dir = 0
+    arg = #SDIO_ARG_WRITE
+  EndIf
+  arg = arg | (fn * #SDIO_ARG_FN_STEP)
+  If incr <> 0
+    arg = arg | #SDIO_ARG_INCR
+  EndIf
+  arg = arg | (addr * #SDIO_ARG_ADDR_STEP)
+  If blockMode <> 0
+    arg = arg | #SDIO_ARG_BLOCKMODE
+    arg = arg | (blocks & $1FF)
+  Else
+    arg = arg | (blksz & $1FF)
+  EndIf
+
+  sdio_Wr(#SDIO_BLKSIZECNT, (blocks << 16) | (blksz & $FFF))
+
+  If dir = 1
+    If blocks > 1
+      cmdtm = #SDIO_CMD53_READ_MULTI
+    Else
+      cmdtm = #SDIO_CMD53_READ
+    EndIf
+  Else
+    If blocks > 1
+      cmdtm = #SDIO_CMD53_WRITE_MULTI
+    Else
+      cmdtm = #SDIO_CMD53_WRITE
+    EndIf
+  EndIf
+
+  If sdio_Command(cmdtm, arg, 0) <> 1
+    ; No reset here: sdio_Command resets the line itself on every path
+    ; that can leave the controller mid-transfer - the error-interrupt
+    ; branch and the command-stuck branch both call sdio_ResetLine(1)
+    ; before returning. Adding a second reset would be harmless and
+    ; would also be a claim that the first one is not trusted.
+    ProcedureReturn 0
+  EndIf
+
+  ; ====================================================================
+  ;  THE CARD REFUSED THE COMMAND, AND THE DATA LINE MUST BE RESET.
+  ;
+  ;  FOUND ON SILICON 2026-08-26. This is the one failure the controller
+  ;  does not consider a failure: Command Complete is raised, no error
+  ;  bit is set anywhere, the response is perfectly well formed - and
+  ;  what it SAYS is that the card is not going to do it. The data phase
+  ;  the controller has been told to expect will therefore never happen,
+  ;  so DAT Inhibit stays asserted for ever, and sdio_WaitInhibit at the
+  ;  top of the NEXT data command spins until its budget runs out.
+  ;
+  ;  WHAT THAT LOOKS LIKE ON A BENCH, because it is deeply misleading:
+  ;  one command fails with #SDIO_ERR_R5, and then EVERY command after
+  ;  it fails with #SDIO_ERR_INHIBIT and an interrupt status of
+  ;  $00000000 - no bits set at all, because nothing ever started. The
+  ;  second symptom is louder, arrives more often, and has nothing to do
+  ;  with the actual fault. A bench log on 2026-08-26 showed exactly
+  ;  that: a refused 256-byte byte-mode read, then an inhibit timeout on
+  ;  the very next transfer, then "a 32-bit backplane read failed" three
+  ;  procedures away in cyw43.pi4, all from this one missing line.
+  ;
+  ;  THIS BUG PREDATES BLOCK MODE. The R5 check has returned without a
+  ;  reset since this file was written; it had simply never fired,
+  ;  because until today every CMD53 in this project was a four-byte
+  ;  backplane register access that no card would refuse. The block-mode
+  ;  work did not introduce it, it produced the first command the card
+  ;  was willing to say no to.
+  ; ====================================================================
+  If sdio_CheckR5() = 0
+    sdio_ResetLine(1)
+    ProcedureReturn 0
+  EndIf
+
+  ; --- the data phase -------------------------------------------------
+  If dir = 1
+    want = #SDIO_INT_DATA_AVAIL
+  Else
+    want = #SDIO_INT_SPACE_AVAIL
+  EndIf
+
+  words = blksz / 4
+  p = *buf
+
+  For b = 1 To blocks
+    budget = #SDIO_TMO_DATA_MS * sdio_tickPerMs
+    t0 = sdio_Ticks()
+    Repeat
+      intr = sdio_Rd(#SDIO_INT_STATUS)
+      If (intr & want) <> 0
+        sdio_Wr(#SDIO_INT_STATUS, want)
+        Break
+      EndIf
+      If (intr & #SDIO_INT_ERROR_MASK) <> 0
+        sdio_lastXferBlock = b
+        sdio_lastIntr = intr
+        sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+        sdio_Wr(#SDIO_INT_STATUS, intr)
+        sdio_ResetLine(1)
+        sdio_err = #SDIO_ERR_DATA_ERROR
+        ProcedureReturn 0
+      EndIf
+      If (sdio_Ticks() - t0) > budget
+        sdio_lastXferBlock = b
+        sdio_lastIntr = intr
+        sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+        sdio_err = #SDIO_ERR_DATA_TMO
+        ProcedureReturn 0
+      EndIf
+    ForEver
+
+    If dir = 1
+      For i = 0 To words - 1
+        PokeL(p, sdio_Rd(#SDIO_BUFFER))
+        p = p + 4
+      Next
+    Else
+      For i = 0 To words - 1
+        sdio_Wr(#SDIO_BUFFER, PeekN(p))
+        p = p + 4
+      Next
+    EndIf
+  Next
+
+  ; --- Transfer Complete ----------------------------------------------
+  ; ONE Transfer Complete for the WHOLE command, however many blocks it
+  ; carried. The controller raises it when the last block's CRC status
+  ; has been seen, which is why it is waited for out here and not inside
+  ; the loop.
+  budget = #SDIO_TMO_DATA_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  Repeat
+    intr = sdio_Rd(#SDIO_INT_STATUS)
+    If (intr & #SDIO_INT_DATA_END) <> 0
+      sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_DATA_END)
+      Break
+    EndIf
+    If (intr & #SDIO_INT_ERROR_MASK) <> 0
+      sdio_lastXferBlock = blocks
+      sdio_lastIntr = intr
+      sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+      sdio_Wr(#SDIO_INT_STATUS, intr)
+      sdio_ResetLine(1)
+      sdio_err = #SDIO_ERR_DATA_ERROR
+      ProcedureReturn 0
+    EndIf
+    If (sdio_Ticks() - t0) > budget
+      sdio_lastXferBlock = blocks
+      sdio_lastIntr = intr
+      sdio_lastStat = sdio_Rd(#SDIO_STATUS)
+      sdio_err = #SDIO_ERR_XFER_TMO
+      ProcedureReturn 0
+    EndIf
+  ForEver
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  sdio_Cmd53 - the byte-mode form, kept as its own name because two
+;  call sites and one bench log already use it. One block of nbytes.
+; ----------------------------------------------------------------------
+Procedure.i sdio_Cmd53(dir.i, fn.i, addr.i, *buf, nbytes.i, incr.i)
+  ProcedureReturn sdio_Cmd53Xfer(dir, fn, addr, *buf, nbytes, 1, 0, incr)
+EndProcedure
+
+; incr = 1 walks the card's address as it goes; incr = 0 hammers one
+; address, which is how a FIFO is drained. See SDIOH_DATA_FIX /
+; SDIOH_DATA_INC, Datasheets/pi4/brcmfmac/v6.12_brcmfmac_sdio.h lines
+; 133-134.
+Procedure.i SdioCmd53Read(fn.i, addr.i, *buf, nbytes.i, incr.i)
+  ProcedureReturn sdio_Cmd53(1, fn, addr, *buf, nbytes, incr)
+EndProcedure
+
+Procedure.i SdioCmd53Write(fn.i, addr.i, *buf, nbytes.i, incr.i)
+  ProcedureReturn sdio_Cmd53(0, fn, addr, *buf, nbytes, incr)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PUBLIC - the block-mode pair.
+;
+;  THE CARD MUST ALREADY AGREE ABOUT blkSize. It is not carried in the
+;  command; it comes from the function's FBR block-size register, which
+;  SdioSetBlockSize() writes. Pass a blkSize here that differs from the
+;  one the card holds and the transfer does not fail cleanly - the
+;  controller and the card simply count different numbers of bytes, and
+;  what comes back is misaligned data with no error bit anywhere. That
+;  is the single most dangerous mistake available in this file, which is
+;  why it is stated here and not left to the caller to infer.
+;
+;  Total bytes moved is blkSize * blocks. With F1's 64 that is at most
+;  32,704 per call and with F2's 512 at most 261,632; a 609 KB firmware
+;  image is therefore about nineteen calls at F1's block size, and the
+;  windowing loop above this one in cyw43.pi4 will cut it finer than
+;  that anyway because the backplane window is only 32 KB.
+; ----------------------------------------------------------------------
+Procedure.i SdioCmd53ReadBlocks(fn.i, addr.i, *buf, blkSize.i, blocks.i, incr.i)
+  ProcedureReturn sdio_Cmd53Xfer(1, fn, addr, *buf, blkSize, blocks, 1, incr)
+EndProcedure
+
+Procedure.i SdioCmd53WriteBlocks(fn.i, addr.i, *buf, blkSize.i, blocks.i, incr.i)
+  ProcedureReturn sdio_Cmd53Xfer(0, fn, addr, *buf, blkSize, blocks, 1, incr)
+EndProcedure
+
+; Which block was in flight when the last block-mode transfer failed,
+; counted from 1. Zero means none has. See sdio_lastXferBlock.
+Procedure.i SdioLastXferBlock()
+  ProcedureReturn sdio_lastXferBlock
+EndProcedure
+
+; The card-side ceiling on a single block-mode command's block count.
+; Exposed so a caller can size its own chunking loop from the library
+; rather than from a number typed into two files.
+Procedure.i SdioMaxBlocks()
+  ProcedureReturn #SDIO_BLOCKS_MAX
+EndProcedure
+
+
+; ======================================================================
+;  PUBLIC - function enable, block size, bus width.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  SdioEnableFunction(fn) - turn an I/O function on and wait for it to
+;  say it is ready.
+;
+;  sdio_io.c lines 70-91, sdio_enable_func():
+;      read CCCR_IOEx, OR in (1 << fn), write it back;
+;      then poll CCCR_IORx until (1 << fn) is set, or time out.
+;
+;  READ-MODIFY-WRITE, NOT A SLAM, and the reason matters here more than
+;  usual: IOEx holds one bit per function, so writing a bare (1 << fn)
+;  DISABLES every other function. On a CYW43455 that means enabling the
+;  data function turns the backplane function off underneath the driver
+;  that is using it.
+;
+;  THE POLL IS NOT OPTIONAL EITHER. IOEx is a request; IORx is the
+;  answer. The part takes real time to bring a function up, and a driver
+;  that writes IOEx and carries straight on gets a run of failed CMD52s
+;  that look like a wiring fault.
+; ----------------------------------------------------------------------
+Procedure.i SdioEnableFunction(fn.i)
+  Define reg.i
+  Define t0.i
+  Define budget.i
+
+  If fn < 1 Or fn > 7
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_FUNC)
+  EndIf
+
+  reg = SdioCmd52Read(0, #SDIO_CCCR_IOEx)
+  If reg < 0
+    ProcedureReturn 0
+  EndIf
+  If SdioCmd52Write(0, #SDIO_CCCR_IOEx, reg | (1 << fn)) = 0
+    ProcedureReturn 0
+  EndIf
+
+  budget = #SDIO_TMO_ENABLE_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  Repeat
+    reg = SdioCmd52Read(0, #SDIO_CCCR_IORx)
+    If reg < 0
+      ProcedureReturn 0
+    EndIf
+    If (reg & (1 << fn)) <> 0
+      ProcedureReturn 1
+    EndIf
+    If (sdio_Ticks() - t0) > budget
+      ProcedureReturn sdio_Fail(#SDIO_ERR_ENABLE_TMO)
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioDisableFunction(fn) - the same read-modify-write, inverted. No
+;  poll: IORx clearing is not something the specification promises a
+;  deadline for, and a driver that hangs waiting to turn something OFF
+;  has made a bad situation worse.
+; ----------------------------------------------------------------------
+Procedure.i SdioDisableFunction(fn.i)
+  Define reg.i
+  If fn < 1 Or fn > 7
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_FUNC)
+  EndIf
+  reg = SdioCmd52Read(0, #SDIO_CCCR_IOEx)
+  If reg < 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn SdioCmd52Write(0, #SDIO_CCCR_IOEx, reg & (~(1 << fn)))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioSetBlockSize(fn, bytes) - the function's FBR block size.
+;
+;  SDIO_FBR_BASE(f) is f * $100 (sdio.h line 171) and SDIO_FBR_BLKSIZE
+;  is $10 within it (line 192), two bytes, low byte first.
+;
+;  This file never uses block mode, so this changes nothing about how
+;  IT talks to the card. It is here because the CYW43455's firmware
+;  reads these registers to decide its own framing, and cyw43.pi4 has to
+;  be able to set them - see brcmf_sdiod_probe, which sets 64 bytes on
+;  both functions before doing anything else.
+; ----------------------------------------------------------------------
+Procedure.i SdioSetBlockSize(fn.i, bytes.i)
+  Define base.i
+  If fn < 0 Or fn > 7
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_FUNC)
+  EndIf
+  If bytes < 1 Or bytes > 2048
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_LEN)
+  EndIf
+  base = fn * #SDIO_FBR_STEP + #SDIO_FBR_BLKSIZE
+  If SdioCmd52Write(0, base, bytes & $FF) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn SdioCmd52Write(0, base + 1, (bytes >> 8) & $FF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  sdio_SetBusWidth4 - four data lines, card first then controller.
+;
+;  core/sdio.c lines 329-341, sdio_enable_4bit_bus(): read CCCR_IF,
+;  clear the width field, set SDIO_BUS_WIDTH_4BIT, write it back. Then
+;  the HOST is told, which is the order that matters: tell the
+;  controller first and it starts driving four lines at a card that is
+;  still listening on one.
+;
+;  THE CARD-DETECT DISABLE BIT IS ALSO SET. SDIO_BUS_CD_DISABLE ($80,
+;  sdio.h line 106) turns off the card's pull-up on DAT3. In one-bit
+;  mode DAT3 is the card-detect resistor; in four-bit mode it is a data
+;  line, and leaving a pull-up on a driven data line is exactly the
+;  thing uart.pi4's header complains about on a driven TX pin. Linux
+;  does the same at core/sdio.c line 337.
+;
+;  A FAILURE HERE IS NOT FATAL TO THE CALLER, and that is deliberate:
+;  the bus works at one bit, just slower. SdioInit reports it through
+;  SdioBusWidth() rather than refusing, because a radio that talks
+;  slowly is worth a great deal more than one that does not talk.
+; ----------------------------------------------------------------------
+Procedure.i sdio_SetBusWidth4()
+  Define ctrl.i
+  Define hc.i
+
+  ctrl = SdioCmd52Read(0, #SDIO_CCCR_IF)
+  If ctrl < 0
+    ProcedureReturn 0
+  EndIf
+  ctrl = ctrl & (~#SDIO_BUS_WIDTH_MASK)
+  ctrl = ctrl | #SDIO_BUS_WIDTH_4BIT | #SDIO_BUS_CD_DISABLE
+  If SdioCmd52Write(0, #SDIO_CCCR_IF, ctrl) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Host Control is byte 0 of the word at $28.
+  hc = sdio_Rd(#SDIO_CONTROL0)
+  sdio_Wr(#SDIO_CONTROL0, hc | #SDIO_HC_4BITBUS)
+  sdio_width4 = 1
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  PUBLIC - configuration a caller supplies.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  SdioSetBaseClockKhz(khz) - hand this file the base clock the
+;  Capabilities register does not carry. See THE BASE CLOCK.
+;
+;  ASK THE MAILBOX FOR CLOCK ID 1 (EMMC), NOT 12 (EMMC2). Those are
+;  different clocks on this chip and only one of them feeds this
+;  controller. Pasting emmc.pi4's number in here is the mistake this
+;  paragraph exists to stop.
+;
+;      MailboxInit()
+;      SdioSetBaseClockKhz(MailboxClockRate(1) / 1000)
+;
+;  Zero or negative clears it and puts the Capabilities register back in
+;  charge, which means SdioInit() will refuse again if it says nothing.
+; ----------------------------------------------------------------------
+Procedure SdioSetBaseClockKhz(khz.i)
+  If khz > 0
+    sdio_userBase = khz
+  Else
+    sdio_userBase = 0
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  SdioInit - the whole bring-up.
+;
+;  THE ORDER IS THE SDIO SPECIFICATION'S, by way of
+;  v6.12_linux_mmc_core_sdio.c. Its own comment at lines 633-646 is
+;  worth having here, because it explains a step that looks redundant:
+;
+;      "sdio_reset() is technically not needed. Having just powered up
+;       the card ... The CMD5 reset (mmc_send_io_op_cond()), according
+;       to the SDIO spec ..."
+;
+;  and it does it anyway, because a card that was left running by an
+;  earlier boot has not just powered up. On a bare-metal image loaded by
+;  U-Boot on a board that has been on for a while, that is the NORMAL
+;  case, not the exception - so the reset stays.
+;
+;      1. CNTFRQ sanity. Refuse if the clock is lying: every "bounded"
+;         wait below is unbounded without it.
+;      1a. THE FIRMWARE HALF, added 2026-08-26 and all of it advisory:
+;         the EMMC clock and power device 0 turned on if the firmware
+;         says they exist and are off, then WL_ON power-cycled and
+;         driven high. None of it can fail this procedure - see rule 2
+;         at THE FIRMWARE HALF OF THE BRING-UP - but all of it happens
+;         BEFORE the pins are muxed and the controller is inspected,
+;         because a radio that is coming up needs its 150 ms and the
+;         register work below is the natural place to spend it.
+;      2. Mux the pins.
+;      3. Is there a controller here at all? VERSION ONLY. Capabilities
+;         is recorded, not judged; see sdio_ControllerPlausible.
+;      4. Base clock, or refuse.
+;      5. Software Reset For All.
+;      6. Power the bus at 3.3V.
+;      7. Clock at 400 kHz.
+;      8. Unmask the status bits (but not the card interrupt).
+;      9. CMD52 abort/reset - a timeout here is EXPECTED and ignored.
+;     10. CMD0 GO_IDLE_STATE.
+;     11. CMD5 with argument 0 - the probe. A timeout means no card.
+;     12. CMD5 with the voltage window, until the card says ready.
+;     13. CMD3 - the card publishes an RCA.
+;     14. CMD7 - select it.
+;     15. Clock up to 25 MHz.
+;     16. Four-bit bus, if the card will.
+;
+;  WHAT IS NOT HERE: no function is enabled and no block size is set.
+;  Both are the DEVICE's business, not the BUS's, and cyw43.pi4 does
+;  them. A generic SDIO bring-up that turned function 1 on would be
+;  making an assumption about what is plugged in.
+;
+;  Returns 1, or 0 with sdio_err set.
+; ======================================================================
+Procedure.i SdioInit()
+  Define t0.i
+  Define budget.i
+  Define r.i
+  Define v.i
+
+  sdio_ready = 0
+  sdio_err   = #SDIO_ERR_NONE
+  sdio_width4 = 0
+  sdio_rca   = 0
+  sdio_ocr   = 0
+  sdio_nfunc = 0
+
+  ; --- 1 ---------------------------------------------------------------
+  sdio_hz = sdio_TickHz()
+  If sdio_hz <= 0 Or sdio_hz > #SDIO_HZ_MAX
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NO_CNTFRQ)
+  EndIf
+  sdio_tickPerMs = sdio_hz / 1000
+  If sdio_tickPerMs < 1
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NO_CNTFRQ)
+  EndIf
+
+  ; --- 1a --------------------------------------------------------------
+  ; Advisory, every line of it. If mailbox.pi4 was never initialised
+  ; these three calls do nothing at all and leave their accessors saying
+  ; "not attempted"; if the firmware refuses a tag they record the
+  ; refusal and carry on. Nothing below depends on any of it succeeding,
+  ; and that is deliberate: this file's subject is the controller.
+  sdio_EnableClockAndPower()
+  SdioAssertWlOn()
+
+  ; --- 2 ---------------------------------------------------------------
+  sdio_MuxPins()
+
+  ; --- 3 ---------------------------------------------------------------
+  If sdio_ControllerPlausible() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; --- 4 ---------------------------------------------------------------
+  sdio_baseKhz = sdio_BaseClockKhz()
+  If sdio_baseKhz <= 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BASECLK)
+  EndIf
+
+  ; --- 5 ---------------------------------------------------------------
+  ; Software Reset For All clears the clock setup as well, which is why
+  ; the clock is programmed AFTER it and not before.
+  sdio_Wr(#SDIO_CONTROL1, #SDIO_SRST_ALL)
+  budget = #SDIO_TMO_RESET_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  While (sdio_Rd(#SDIO_CONTROL1) & #SDIO_SRST_ALL) <> 0
+    If (sdio_Ticks() - t0) > budget
+      ProcedureReturn sdio_Fail(#SDIO_ERR_RESET)
+    EndIf
+  Wend
+
+  ; --- 6 ---------------------------------------------------------------
+  ; Power Control is byte 1 of the word at $28. Set the voltage FIRST
+  ; and the on bit in the same write - the specification allows one
+  ; write, and staging it in two leaves a moment at an undefined
+  ; voltage.
+  v = sdio_Rd(#SDIO_CONTROL0) & (~#SDIO_PWR_MASK)
+  sdio_Wr(#SDIO_CONTROL0, v | #SDIO_PWR_330 | #SDIO_PWR_ON)
+  ; The rail has to settle. There is no status bit for this; the SD
+  ; specification's own figure is a millisecond, and a millisecond spent
+  ; here once is not worth optimising.
+  sdio_DelayUs(1000)
+
+  ; --- 7 ---------------------------------------------------------------
+  If sdio_SetClock(#SDIO_CLK_IDENT_KHZ) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; --- 8 ---------------------------------------------------------------
+  ; Status bits on, SIGNAL enable off. Nothing here uses interrupts; the
+  ; distinction is that INT_ENABLE controls what appears in
+  ; INT_STATUS at all, while SIGNAL_ENABLE controls what reaches the
+  ; interrupt controller. Leaving INT_ENABLE clear is a classic way to
+  ; write a polling driver that polls a register that never changes.
+  sdio_Wr(#SDIO_INT_ENABLE, #SDIO_INT_ENABLE_SET)
+  sdio_Wr(#SDIO_SIG_ENABLE, 0)
+  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_ALL)
+
+  ; --- 9 ---------------------------------------------------------------
+  ; sdio_ops.c lines 209-215. The read is allowed to fail; if it does,
+  ; a bare $08 is written, which is what that function does too.
+  r = SdioCmd52ReadRaw(0, #SDIO_CCCR_ABORT)
+  If r < 0
+    r = 0
+  EndIf
+  ; Built in a variable, not inline: a call argument list has to fit on
+  ; one line on this parser, and this one does not.
+  v = #SDIO_ARG_WRITE | (#SDIO_CCCR_ABORT * #SDIO_ARG_ADDR_STEP)
+  v = v | (r | #SDIO_ABORT_RES)
+  sdio_Command(#SDIO_CMD52, v, 1)
+
+  ; --- 10 --------------------------------------------------------------
+  ; CMD0 has no response, so there is nothing to check beyond the
+  ; controller accepting it. A failure here is the CONTROLLER, not the
+  ; card - the card cannot refuse a command it does not answer.
+  If sdio_Command(#SDIO_CMD0, 0, 0) <> 1
+    ProcedureReturn 0
+  EndIf
+
+  ; --- 11 --------------------------------------------------------------
+  ; The probe. sdio_ops.c line 33: "if we're just probing, do a single
+  ; pass". A timeout is the answer "nothing is there", not a fault.
+  r = sdio_Command(#SDIO_CMD5, 0, 1)
+  If r = -1
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NO_CARD)
+  EndIf
+  If r <> 1
+    ProcedureReturn 0
+  EndIf
+
+  sdio_ocr   = sdio_resp0 & #SDIO_R4_OCR_MASK
+  sdio_nfunc = (sdio_resp0 & #SDIO_R4_NFUNC) >> 28
+  sdio_mem   = 0
+  If (sdio_resp0 & #SDIO_R4_MEMORY) <> 0
+    sdio_mem = 1
+  EndIf
+  sdio_18v = 0
+  If (sdio_resp0 & #SDIO_R4_18V) <> 0
+    sdio_18v = 1
+  EndIf
+
+  ; core/sdio.c line 1269 reads the same field and line 1275 iterates
+  ; over it. Zero I/O functions means whatever answered is not an SDIO
+  ; device, and pressing on would enumerate nothing while reporting
+  ; success.
+  If sdio_nfunc < 1
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NO_IO_FUNCS)
+  EndIf
+
+  ; --- 12 --------------------------------------------------------------
+  ; Ask for the intersection of what the card offers and what this board
+  ; supplies. Asking for a window the card does not support is how a
+  ; card is told to go permanently inactive, which needs a power cycle
+  ; to undo - so the AND is not a nicety.
+  v = sdio_ocr & #SDIO_OCR_32_34
+  If v = 0
+    ; The card published an OCR with nothing in the 3.2-3.4V range. On
+    ; this board that means a 1.8V-only part, and there is no way from
+    ; here to switch it - see "NO HIGH SPEED, NO UHS, NO 1.8V SWITCH".
+    ProcedureReturn sdio_Fail(#SDIO_ERR_NO_CARD)
+  EndIf
+
+  budget = #SDIO_TMO_OPCOND_MS * sdio_tickPerMs
+  t0 = sdio_Ticks()
+  Repeat
+    If sdio_Command(#SDIO_CMD5, v, 0) <> 1
+      ProcedureReturn 0
+    EndIf
+    If (sdio_resp0 & #SDIO_R4_READY) <> 0
+      Break
+    EndIf
+    If (sdio_Ticks() - t0) > budget
+      sdio_ocr = sdio_resp0 & #SDIO_R4_OCR_MASK
+      ProcedureReturn sdio_Fail(#SDIO_ERR_OPCOND_TMO)
+    EndIf
+    ; sdio_ops.c line 53 waits 10 ms between tries. Hammering CMD5 at
+    ; bus speed is not faster; it is the same wait with more traffic.
+    sdio_DelayUs(10000)
+  ForEver
+  sdio_ocr = sdio_resp0 & #SDIO_R4_OCR_MASK
+
+  ; --- 13 --------------------------------------------------------------
+  ; sd_ops.c lines 267-283: "*rca = cmd.resp[0] >> 16".
+  If sdio_Command(#SDIO_CMD3, 0, 0) <> 1
+    sdio_err = #SDIO_ERR_CMD3
+    ProcedureReturn 0
+  EndIf
+  sdio_rca = (sdio_resp0 >> 16) & $FFFF
+  ; RCA 0 is the broadcast address. A card that publishes it cannot be
+  ; selected, and CMD7 with argument 0 DESELECTS everything - so this
+  ; would look like a working select and leave the bus idle.
+  If sdio_rca = 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_BAD_RCA)
+  EndIf
+
+  ; --- 14 --------------------------------------------------------------
+  ; CMD7's argument is the RCA in bits 31:16 (v6.12_linux_mmc_mmc.h line
+  ; 38: "ac [31:16] RCA").
+  If sdio_Command(#SDIO_CMD7, sdio_rca << 16, 0) <> 1
+    sdio_err = #SDIO_ERR_CMD7
+    ProcedureReturn 0
+  EndIf
+
+  ; --- 15 --------------------------------------------------------------
+  If sdio_SetClock(#SDIO_CLK_XFER_KHZ) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; --- 16 --------------------------------------------------------------
+  ; Not fatal - see sdio_SetBusWidth4's note. The error code is cleared
+  ; afterwards so a caller does not read a stale failure out of
+  ; SdioLastError() on a successful init.
+  If sdio_SetBusWidth4() = 0
+    sdio_err = #SDIO_ERR_NONE
+  EndIf
+
+  sdio_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  PUBLIC - what happened. All read-only.
+; ======================================================================
+
+Procedure.i SdioReady()
+  ProcedureReturn sdio_ready
+EndProcedure
+
+Procedure.i SdioLastError()
+  ProcedureReturn sdio_err
+EndProcedure
+
+; The command INDEX of the last command issued, or -1 if none.
+Procedure.i SdioLastCmd()
+  ProcedureReturn sdio_lastCmd
+EndProcedure
+
+; The raw Interrupt Status word as it stood when something went wrong.
+Procedure.i SdioLastIntr()
+  ProcedureReturn sdio_lastIntr
+EndProcedure
+
+; The raw Present State word, likewise.
+Procedure.i SdioLastStatus()
+  ProcedureReturn sdio_lastStat
+EndProcedure
+
+; The low sixteen bits of the last R5 response - the card's own verdict
+; on the last CMD52 or CMD53. Distinct from SdioLastIntr(), which is the
+; CONTROLLER's verdict, and the two disagree more often than anyone
+; expects.
+Procedure.i SdioLastR5()
+  ProcedureReturn sdio_lastR5
+EndProcedure
+
+Procedure.i SdioHostVersion()
+  ProcedureReturn sdio_ver
+EndProcedure
+
+Procedure.i SdioHostVendor()
+  ProcedureReturn sdio_vendor
+EndProcedure
+
+Procedure.i SdioCaps0()
+  ProcedureReturn sdio_caps0
+EndProcedure
+
+Procedure.i SdioCaps1()
+  ProcedureReturn sdio_caps1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The evidence a reader needs in order to disbelieve this file.
+;
+;  These exist because of one bench day. The diagnostic printed an error
+;  string and four status words, and NONE of the four was the register
+;  the error was actually about, so the two numbers that mattered -
+;  $FE3000FC and $FE300040 - had to be read out of a monitor prompt by
+;  hand before anybody could tell what had happened. Anything a refusal
+;  is based on should be printable without a second tool.
+; ----------------------------------------------------------------------
+
+; The whole word at $FC: Slot Interrupt Status in the low half, Host
+; Controller Version in the high half. On this board, $99020000.
+Procedure.i SdioHostVersionRaw()
+  ProcedureReturn sdio_hostVerRaw
+EndProcedure
+
+; 1 when the Capabilities register read all-zero or all-ones. THIS IS
+; NOT AN ERROR - it was until 2026-08-26 and the board said otherwise.
+; See THE CAPABILITIES REGISTER READS ZERO in the header.
+Procedure.i SdioCapsAreZero()
+  If sdio_caps0 = 0 Or sdio_caps0 = $FFFFFFFF
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; 1 if any firmware property tag was sent by this file at all. 0 means
+; the mailbox was never ready, so every state accessor below is -1
+; because it was never asked, not because the answer was no.
+Procedure.i SdioMailboxUsed()
+  ProcedureReturn sdio_mbxUsed
+EndProcedure
+
+; GET_CLOCK_STATE for clock 1 (EMMC), as found and after any set. Bit 0
+; on/off, bit 1 "does not exist". -1 means not asked.
+Procedure.i SdioClockStateBefore()
+  ProcedureReturn sdio_clkState
+EndProcedure
+
+Procedure.i SdioClockStateAfter()
+  ProcedureReturn sdio_clkStateAfter
+EndProcedure
+
+; GET_POWER_STATE for device 0, same encoding, same -1.
+Procedure.i SdioPowerStateBefore()
+  ProcedureReturn sdio_pwrState
+EndProcedure
+
+Procedure.i SdioPowerStateAfter()
+  ProcedureReturn sdio_pwrStateAfter
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioWlOnStep - how far SdioAssertWlOn() got, and SdioWlOnStepText -
+;  the same thing as an English sentence.
+;
+;  THE SENTENCES LIVE IN THIS FILE ON PURPOSE. The bench asked for the
+;  ladder to be printed by the program rather than looked up in a
+;  report, and that is right: the person reading a serial log has the
+;  log and nothing else. Every rung below is ONE event - the previous
+;  version folded "the message would not lay out" together with "the
+;  send did not complete" into a single number, and the board landed on
+;  exactly that number, which cost a round trip to disambiguate.
+;
+;  Pair it with SdioWlOnMailboxError(), which is MailboxError() captured
+;  at whichever rung stopped: #MBX_ERR_TAG (8) means the FIRMWARE
+;  declined the tag, #MBX_ERR_TXTIMEOUT (4) or #MBX_ERR_RXTIMEOUT (5)
+;  mean the TRANSPORT did not complete, and those lead different places.
+; ----------------------------------------------------------------------
+Procedure.i SdioWlOnStep()
+  ProcedureReturn sdio_wlOnStep
+EndProcedure
+
+; The rung, as a full sentence. The caller prints it; nothing here
+; assumes a particular output library.
+Procedure.i SdioWlOnStepText()
+  Select sdio_wlOnStep
+    Case 0
+      ProcedureReturn "wl_on: the mailbox was never ready, so nothing at all was sent - call MailboxInit() first"
+    Case 1
+      ProcedureReturn "wl_on: the GET_GPIO_CONFIG message could not be laid out in the mailbox buffer - that is this side of the link, not the firmware"
+    Case 2
+      ProcedureReturn "wl_on: GET_GPIO_CONFIG was sent and the transaction did not complete - read the mailbox error printed beside this line"
+    Case 3
+      ProcedureReturn "wl_on: GET_GPIO_CONFIG completed but the firmware echoed the pin number back instead of clearing it, which is how it rejects a pin - this firmware does not accept GPIO 129"
+    Case 4
+      ProcedureReturn "wl_on: the GET_GPIO_STATE message could not be laid out in the mailbox buffer"
+    Case 5
+      ProcedureReturn "wl_on: GET_GPIO_STATE was sent and the transaction did not complete - read the mailbox error beside this line"
+    Case 6
+      ProcedureReturn "wl_on: GET_GPIO_STATE completed but the firmware rejected pin 129 by echoing it back"
+    Case 7
+      ProcedureReturn "wl_on: the pin was read; the SET_GPIO_STATE HIGH message could not be laid out in the mailbox buffer"
+    Case 8
+      ProcedureReturn "wl_on: SET_GPIO_STATE HIGH was sent and the transaction did not complete - this is the write that powers the radio, so the mailbox error beside this line is the finding"
+    Case 9
+      ProcedureReturn "wl_on: SET_GPIO_STATE HIGH completed but the firmware rejected pin 129 by echoing it back"
+    Case 10
+      ProcedureReturn "wl_on: driven high; the GET_GPIO_STATE readback could not be laid out in the mailbox buffer"
+    Case 11
+      ProcedureReturn "wl_on: driven high; the readback was sent and the transaction did not complete"
+    Case 12
+      ProcedureReturn "wl_on: driven high; the readback completed but the firmware rejected pin 129"
+    Case 13
+      ProcedureReturn "wl_on: every transaction completed - the level beside this line is what the firmware says the pin is, and 1 is a powered radio"
+  EndSelect
+  ProcedureReturn "wl_on: SdioAssertWlOn has not been called in this run"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioMailboxErrorText(code) - one of mailbox.pi4's #MBX_ERR_* numbers,
+;  as a sentence.
+;
+;  The numbers and their meanings are mailbox.pi4 lines 819-835. This
+;  file does not own them and does not redefine them; it prints them,
+;  because sdio.pi4 is now the file that issues property tags and a
+;  refusal that arrives as a bare integer is a refusal nobody reads.
+;
+;  IF mailbox.pi4 EVER GAINS ITS OWN MailboxErrorText(), DELETE THIS AND
+;  CALL THAT. Two tables of the same numbers is exactly the drift this
+;  project has been bitten by before. This one exists only because that
+;  file belongs to another worker today and must not be edited.
+; ----------------------------------------------------------------------
+Procedure.i SdioMailboxErrorText(code.i)
+  Select code
+    Case -1
+      ProcedureReturn "no failure recorded here - either the step succeeded or it was never reached"
+    Case 0
+      ProcedureReturn "MBX_OK - the transaction completed"
+    Case 1
+      ProcedureReturn "MBX_ERR_NOINIT - MailboxInit() was not called, or it failed"
+    Case 2
+      ProcedureReturn "MBX_ERR_ADDRESS - the buffer sits above 1 GiB and the VideoCore cannot name it"
+    Case 3
+      ProcedureReturn "MBX_ERR_TOOBIG - the value buffer this tag asked for does not fit"
+    Case 4
+      ProcedureReturn "MBX_ERR_TXTIMEOUT - mailbox 1 stayed FULL; the firmware is not draining it"
+    Case 5
+      ProcedureReturn "MBX_ERR_RXTIMEOUT - mailbox 0 stayed EMPTY; the firmware never answered"
+    Case 6
+      ProcedureReturn "MBX_ERR_ECHO - the reply named a different buffer, so it answers somebody else's request"
+    Case 7
+      ProcedureReturn "MBX_ERR_STATUS - the firmware marked the whole message an error rather than SUCCESS"
+    Case 8
+      ProcedureReturn "MBX_ERR_TAG - the transport worked, the message came back, and this tag's own response bit was left clear. Usually that means the firmware received the tag and did not service it - but see AN OPEN QUESTION in sdio.pi4: a set-type tag that legitimately returns nothing would look identical, and mailbox.pi4's per-tag check is stricter than U-Boot's."
+    Case 9
+      ProcedureReturn "MBX_ERR_MODE - a single-tag call was made while a multi-tag list was open"
+    Case 10
+      ProcedureReturn "MBX_ERR_EMPTY - a list was sent with no tags in it"
+  EndSelect
+  ProcedureReturn "unknown mailbox error code"
+EndProcedure
+
+; MailboxError() as captured at the rung that stopped the WL_ON ladder.
+; -1 means no mailbox call failed - either the ladder finished, or it
+; stopped at rung 0 before anything was sent.
+Procedure.i SdioWlOnMailboxError()
+  ProcedureReturn sdio_wlOnMbxErr
+EndProcedure
+
+; The direction and the level the firmware reported for WL_ON BEFORE
+; this file wrote anything to the pin. -1 for either means that read did
+; not happen. Direction follows the expander driver's enum, lines 22-23:
+; 0 is RPI_EXP_GPIO_DIR_IN and 1 is RPI_EXP_GPIO_DIR_OUT.
+Procedure.i SdioWlOnDirectionFound()
+  ProcedureReturn sdio_wlOnDirFound
+EndProcedure
+
+Procedure.i SdioWlOnLevelFound()
+  ProcedureReturn sdio_wlOnLevelFound
+EndProcedure
+
+; SET_GPIO_CONFIG is advisory - see the block above SdioAssertWlOn.
+; 1 if the firmware honoured it, 0 if it did not, -1 if it was not
+; reached. SdioWlOnConfigError() is MailboxError() straight afterwards.
+Procedure.i SdioWlOnConfigOk()
+  ProcedureReturn sdio_wlOnCfgOk
+EndProcedure
+
+Procedure.i SdioWlOnConfigError()
+  ProcedureReturn sdio_wlOnCfgErr
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE THREE RESPONSE LENGTHS, and why they are worth a bench run.
+;
+;  Each is MailboxRespBytes() captured immediately after one set-type
+;  tag: the length the firmware wrote into that tag's own code word.
+;  They exist to settle AN OPEN QUESTION in the header without anybody
+;  having to guess.
+;
+;    length 0 beside #MBX_ERR_TAG   the firmware returned nothing, so a
+;                                   cleared response bit may simply mean
+;                                   "no payload" rather than "refused" -
+;                                   and mailbox.pi4's per-tag check,
+;                                   which its own header records as
+;                                   stricter than U-Boot's, would be
+;                                   reporting a success as a failure.
+;
+;    length 8 beside #MBX_ERR_TAG   the firmware wrote its documented
+;                                   two words and STILL left the bit
+;                                   clear. That is not the empty-reply
+;                                   case and explanation two would not
+;                                   cover it.
+;
+;    length 8 beside MBX_OK         serviced, plainly. This is what
+;                                   SET_CLOCK_STATE is expected to show,
+;                                   and if it does then set-type tags
+;                                   are not rejected as a class here.
+;
+;  -1 means the tag was never sent in this run.
+; ----------------------------------------------------------------------
+Procedure.i SdioWlOnConfigRespBytes()
+  ProcedureReturn sdio_wlOnCfgResp
+EndProcedure
+
+Procedure.i SdioWlOnSetRespBytes()
+  ProcedureReturn sdio_wlOnSetResp
+EndProcedure
+
+Procedure.i SdioClockSetRespBytes()
+  ProcedureReturn sdio_clkSetResp
+EndProcedure
+
+; What SET_CLOCK_STATE replied with, and the mailbox error captured
+; immediately after it. A reply of -1 means the transaction never
+; completed, so the error code beside it is the reason.
+Procedure.i SdioClockSetReply()
+  ProcedureReturn sdio_clkSetReply
+EndProcedure
+
+Procedure.i SdioClockSetError()
+  ProcedureReturn sdio_clkSetErr
+EndProcedure
+
+; GET_CLOCK_MEASURED for clock 1. This is the number that contradicted
+; GET_CLOCK_STATE on the bench; see the block above
+; sdio_EnableClockAndPower.
+Procedure.i SdioClockMeasured()
+  ProcedureReturn sdio_clkMeasured
+EndProcedure
+
+; The polarity GET_GPIO_CONFIG reported and SET_GPIO_CONFIG wrote back
+; unchanged. -1 means it was never read.
+Procedure.i SdioWlOnPolarity()
+  ProcedureReturn sdio_wlOnPolarity
+EndProcedure
+
+; The level GET_GPIO_STATE reported after the assertion. -1 means the
+; ladder never reached the readback.
+Procedure.i SdioWlOnLevel()
+  ProcedureReturn sdio_wlOnLevel
+EndProcedure
+
+Procedure.i SdioBaseClockKhz()
+  ProcedureReturn sdio_baseKhz
+EndProcedure
+
+Procedure.i SdioClockKhz()
+  ProcedureReturn sdio_clkKhz
+EndProcedure
+
+Procedure.i SdioDivisor()
+  ProcedureReturn sdio_divisor
+EndProcedure
+
+; The I/O OCR the card published, 24 bits.
+Procedure.i SdioOcr()
+  ProcedureReturn sdio_ocr
+EndProcedure
+
+; How many I/O functions the card reports, 1..7. A CYW43455 reports 2.
+Procedure.i SdioFunctionCount()
+  ProcedureReturn sdio_nfunc
+EndProcedure
+
+; 1 if the card also has a memory part. A WiFi module does not.
+Procedure.i SdioMemoryPresent()
+  ProcedureReturn sdio_mem
+EndProcedure
+
+; 1 if the card advertised 1.8V support. REPORTED AND NEVER ACTED ON -
+; see "NO HIGH SPEED, NO UHS, NO 1.8V SWITCH".
+Procedure.i Sdio18vCapable()
+  ProcedureReturn sdio_18v
+EndProcedure
+
+Procedure.i SdioRca()
+  ProcedureReturn sdio_rca
+EndProcedure
+
+; 4 or 1. See sdio_SetBusWidth4 - one bit is a degraded success, not a
+; failure, and this is how a caller finds out which it got.
+Procedure.i SdioBusWidth()
+  If sdio_width4 <> 0
+    ProcedureReturn 4
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Present State bit 16, Card Inserted. See sdio_ControllerPlausible:
+; this is REPORTED, not acted on. The device on this controller is
+; soldered down and the node is marked non-removable.
+Procedure.i SdioCardDetectBit()
+  ProcedureReturn (sdio_Rd(#SDIO_STATUS) >> 16) & 1
+EndProcedure
+
+; Present State bit 18, Card Detect Pin Level. Likewise.
+Procedure.i SdioCardPinLevel()
+  ProcedureReturn (sdio_Rd(#SDIO_STATUS) >> 18) & 1
+EndProcedure
+
+; ======================================================================
+;  SdioIntBitName(bit) - the SDHCI Interrupt Status bits, by name.
+;
+;  EVERY NAME AND EVERY POSITION IS FROM
+;  Datasheets/pi4/rpi-linux/rpi-6.12.y_sdhci.h lines 138-161, and the
+;  line number is on each case. Nothing here is recalled.
+;
+;  WHY A DECODER AND NOT A HEXADECIMAL WORD IN THE LOG. The bench read
+;  $00048000 by hand and had to be told what it meant, and the person
+;  who decoded it had to be careful about a real trap: Linux names the
+;  COMMAND error bits SDHCI_INT_TIMEOUT, _CRC, _END_BIT and _INDEX with
+;  no "CMD" anywhere in them (lines 151-154), while the DATA ones are
+;  spelled out as _DATA_TIMEOUT, _DATA_CRC and _DATA_END_BIT (lines
+;  155-157). Two adjacent groups of four, one of them named as though it
+;  were the general case. Every name below therefore says CMD or DATA
+;  out loud, whatever the header calls it.
+;
+;  Returns a name for a bit index 0..31, or a marker for the ones the
+;  specification reserves.
+; ======================================================================
+Procedure.i SdioIntBitName(bit.i)
+  Select bit
+    Case 0
+      ProcedureReturn "COMMAND COMPLETE"              ; h:138
+    Case 1
+      ProcedureReturn "TRANSFER COMPLETE"             ; h:139
+    Case 2
+      ProcedureReturn "BLOCK GAP EVENT"               ; h:140
+    Case 3
+      ProcedureReturn "DMA INTERRUPT"                 ; h:141
+    Case 4
+      ProcedureReturn "BUFFER WRITE READY"            ; h:142
+    Case 5
+      ProcedureReturn "BUFFER READ READY"             ; h:143
+    Case 6
+      ProcedureReturn "CARD INSERTION"                ; h:144
+    Case 7
+      ProcedureReturn "CARD REMOVAL"                  ; h:145
+    Case 8
+      ProcedureReturn "CARD INTERRUPT"                ; h:146
+    Case 12
+      ProcedureReturn "RE-TUNING EVENT"               ; h:147
+    Case 14
+      ProcedureReturn "COMMAND QUEUING EVENT"         ; h:148
+    Case 15
+      ProcedureReturn "ERROR INTERRUPT (summary - the reason is one of the bits above 15)"
+                                                      ; h:150
+    Case 16
+      ProcedureReturn "CMD TIMEOUT ERROR - nothing answered the command at all"
+                                                      ; h:151
+    Case 17
+      ProcedureReturn "CMD CRC ERROR - a response arrived and its checksum was wrong"
+                                                      ; h:152
+    Case 18
+      ProcedureReturn "CMD END BIT ERROR - a response arrived and its last bit was not 1. Something IS on the bus; the framing is wrong. Look at the clock, the pin pulls and the bus width, not at whether the device is present."
+                                                      ; h:153
+    Case 19
+      ProcedureReturn "CMD INDEX ERROR - the response echoed a different command index"
+                                                      ; h:154
+    Case 20
+      ProcedureReturn "DATA TIMEOUT ERROR"            ; h:155
+    Case 21
+      ProcedureReturn "DATA CRC ERROR"                ; h:156
+    Case 22
+      ProcedureReturn "DATA END BIT ERROR"            ; h:157
+    Case 23
+      ProcedureReturn "CURRENT LIMIT ERROR (bus power)"
+                                                      ; h:158
+    Case 24
+      ProcedureReturn "AUTO CMD ERROR"                ; h:159
+    Case 25
+      ProcedureReturn "ADMA ERROR"                    ; h:160
+    Case 26
+      ProcedureReturn "TUNING ERROR"                  ; h:161
+  EndSelect
+  ProcedureReturn "reserved"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Whether a bit index is one the header names at all, so a caller can
+;  print only the meaningful ones and not twenty rows of "reserved".
+; ----------------------------------------------------------------------
+Procedure.i SdioIntBitIsNamed(bit.i)
+  If bit >= 0 And bit <= 8
+    ProcedureReturn 1
+  EndIf
+  If bit = 12 Or bit = 14
+    ProcedureReturn 1
+  EndIf
+  If bit >= 15 And bit <= 26
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  SdioR5BitName(bit) - the R5 response's STATUS byte, by name.
+;
+;  ADDED 2026-08-26, THE DAY IT WAS NEEDED. A bench run printed "the
+;  card REFUSED the command - see SdioLastR5" and that is the point at
+;  which the diagnostic stopped being one: it named a variable and made
+;  a person go and look it up. The five bits mean five completely
+;  different faults with five different fixes, so which one is set is
+;  the entire content of the message.
+;
+;  EVERY NAME AND POSITION IS FROM
+;  Datasheets/pi4/brcmfmac/v6.12_linux_mmc_sdio.h lines 55-60. R5's
+;  layout is: bits 7:0 are the data byte, bits 15:8 are these flags.
+;  R5_STATUS(x) is (x & 0xCB00) at line 60 - the five bits below - and
+;  every one of them means the card declined.
+; ======================================================================
+Procedure.i SdioR5BitName(bit.i)
+  Select bit
+    Case 8
+      ProcedureReturn "OUT OF RANGE - the byte or block count runs past what this function accepts. On a CYW43 function 1 the byte-mode ceiling is the FUNCTION's block size, 64, not the protocol's 512."
+                                                      ; s:59
+    Case 9
+      ProcedureReturn "INVALID FUNCTION NUMBER - the command addressed a function this card does not have, or one that is not enabled"
+                                                      ; s:58
+    Case 11
+      ProcedureReturn "GENERAL ERROR - an unspecified error occurred during the transfer"
+                                                      ; s:57
+    Case 14
+      ProcedureReturn "ILLEGAL COMMAND - not legal for the card's current state"
+                                                      ; s:56
+    Case 15
+      ProcedureReturn "COM CRC ERROR - the CRC of the previous command failed"
+                                                      ; s:55
+  EndSelect
+  ProcedureReturn "reserved, or part of the response's data byte"
+EndProcedure
+
+; The five bits above are the whole of R5_STATUS, sdio.h line 60's mask
+; $CB00. Bits 0 to 7 are the DATA byte and are not a fault at all, which
+; is why they are excluded here rather than reported as unnamed.
+Procedure.i SdioR5BitIsNamed(bit.i)
+  If bit = 8 Or bit = 9
+    ProcedureReturn 1
+  EndIf
+  If bit = 11 Or bit = 14
+    ProcedureReturn 1
+  EndIf
+  If bit = 15
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  What the controller's clock and bus registers were actually set to,
+;  read live rather than remembered.
+;
+;  The bench asked for the divider that was really programmed, and it
+;  was right to ask for the register rather than the variable: this file
+;  computing 313 and the register holding 313 are two different claims,
+;  and only one of them is about the hardware.
+; ----------------------------------------------------------------------
+
+; The whole word at $2C: Clock Control in bits 15:0, Timeout Control in
+; 23:16, Software Reset in 31:24.
+Procedure.i SdioControl1Raw()
+  ProcedureReturn sdio_Rd(#SDIO_CONTROL1)
+EndProcedure
+
+; The whole word at $28: Host Control in byte 0, Power Control in byte 1.
+Procedure.i SdioControl0Raw()
+  ProcedureReturn sdio_Rd(#SDIO_CONTROL0)
+EndProcedure
+
+; The divisor read back OUT of Clock Control, reassembled from its two
+; halves. sdhci.h lines 119-123: N[7:0] at SDHCI_DIVIDER_SHIFT 8 and
+; N[9:8] at SDHCI_DIVIDER_HI_SHIFT 6, so the high two bits sit BELOW the
+; low eight in the word. SDCLK = base / (2 * N), and N = 0 means the
+; base clock undivided.
+Procedure.i SdioDivisorProgrammed()
+  Define v.i
+  Define n.i
+  v = sdio_Rd(#SDIO_CONTROL1)
+  n = (v >> 8) & $FF
+  n = n | (((v >> 6) & $3) << 8)
+  ProcedureReturn n
+EndProcedure
+
+; GPFSEL3 and GPIO_PUP_PDN_CNTRL_REG2 as sdio_MuxPins left them. The
+; pull register is worth printing on every run now: it held a pull-DOWN
+; on CMD and DAT0..3 for the whole of this bring-up because two
+; documents number up and down in opposite orders. See THE PULL ENCODING
+; IS INVERTED in the header.
+Procedure.i SdioGpfsel3()
+  ProcedureReturn sdio_gpfsel3
+EndProcedure
+
+Procedure.i SdioGppup2()
+  ProcedureReturn sdio_gppup2
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  SdioErrorText - a NUL-terminated English sentence for
+;  SdioLastError(). Print it with whatever the MAIN file's UART library
+;  provides.
+;
+;  The text names the STAGE, not the fix. The fix usually needs
+;  SdioLastIntr() as well, and a driver that guessed at causes in a
+;  string would be wrong out loud.
+; ----------------------------------------------------------------------
+Procedure.i SdioErrorText()
+  Select sdio_err
+    Case #SDIO_ERR_NONE
+      ProcedureReturn "sdio: ok"
+    Case #SDIO_ERR_NO_CNTFRQ
+      ProcedureReturn "sdio: CNTFRQ_EL0 is not a usable frequency - cannot bound any wait, nothing attempted"
+    Case #SDIO_ERR_NO_CONTROLLER
+      ProcedureReturn "sdio: the word at $FE3000FC is all-zero or all-ones, so nothing decodes here - THIS one really is the address or the peripheral window; compare EMMC2 at $FE3400FC, which reads $10020000"
+    Case #SDIO_ERR_BAD_VERSION
+      ProcedureReturn "sdio: the Host Controller Version register answered but its spec-version field is above 4, which is not a version any SDHCI specification defines - see SdioHostVersionRaw"
+    Case #SDIO_ERR_NO_CAPS
+      ProcedureReturn "sdio: RETIRED CODE - an all-zero Capabilities register is normal on this block and is no longer a refusal; if you are reading this, something set sdio_err by hand"
+    Case #SDIO_ERR_BASECLK
+      ProcedureReturn "sdio: base clock unknown - Capabilities says 0, call SdioSetBaseClockKhz with mailbox clock id 1 (EMMC, NOT EMMC2)"
+    Case #SDIO_ERR_RESET
+      ProcedureReturn "sdio: Software Reset For All never self-cleared"
+    Case #SDIO_ERR_CLOCK
+      ProcedureReturn "sdio: Internal Clock Stable never came up"
+    Case #SDIO_ERR_INHIBIT
+      ProcedureReturn "sdio: Command Inhibit never cleared - controller or card still busy"
+    Case #SDIO_ERR_CMD_TIMEOUT
+      ProcedureReturn "sdio: command timed out - no response"
+    Case #SDIO_ERR_CMD_ERROR
+      ProcedureReturn "sdio: command error - see SdioLastIntr for CRC / end bit / index"
+    Case #SDIO_ERR_CMD_STUCK
+      ProcedureReturn "sdio: no Command Complete and no error bit - the controller is wedged"
+    Case #SDIO_ERR_NO_CARD
+      ProcedureReturn "sdio: nothing answered CMD5 - check SdioWlOnStep (want 9) and SdioWlOnLevel (want 1); firmware GPIO 129 is the radio's enable pin"
+    Case #SDIO_ERR_NO_IO_FUNCS
+      ProcedureReturn "sdio: the card answered CMD5 but reports zero I/O functions - not an SDIO device"
+    Case #SDIO_ERR_OPCOND_TMO
+      ProcedureReturn "sdio: CMD5 never reported ready - see SdioOcr"
+    Case #SDIO_ERR_CMD3
+      ProcedureReturn "sdio: CMD3 SEND_RELATIVE_ADDR failed"
+    Case #SDIO_ERR_BAD_RCA
+      ProcedureReturn "sdio: card published RCA 0, which cannot be selected"
+    Case #SDIO_ERR_CMD7
+      ProcedureReturn "sdio: CMD7 SELECT_CARD failed"
+    Case #SDIO_ERR_R5
+      ProcedureReturn "sdio: the card REFUSED the command - see SdioLastR5 for CRC / illegal / function / range"
+    Case #SDIO_ERR_BAD_FUNC
+      ProcedureReturn "sdio: function number out of range"
+    Case #SDIO_ERR_BAD_ADDR
+      ProcedureReturn "sdio: register address above 17 bits - SDIO addresses are 17 bits"
+    Case #SDIO_ERR_BAD_LEN
+      ProcedureReturn "sdio: length or block size must be 4 to 512 bytes and a multiple of 4 - the buffer data port is 32 bits wide, see the CMD53 section"
+    Case #SDIO_ERR_BAD_COUNT
+      ProcedureReturn "sdio: block count must be 1 to 511, and exactly 1 in byte mode - a count of 0 means an infinite transfer, which this file does not implement"
+    Case #SDIO_ERR_ALIGN
+      ProcedureReturn "sdio: buffer is not 4-byte aligned"
+    Case #SDIO_ERR_NULL_BUF
+      ProcedureReturn "sdio: null buffer"
+    Case #SDIO_ERR_DATA_TMO
+      ProcedureReturn "sdio: buffer ready never arrived"
+    Case #SDIO_ERR_DATA_ERROR
+      ProcedureReturn "sdio: data error - see SdioLastIntr for CRC / end bit / data timeout"
+    Case #SDIO_ERR_XFER_TMO
+      ProcedureReturn "sdio: Transfer Complete never arrived"
+    Case #SDIO_ERR_BUSY_TMO
+      ProcedureReturn "sdio: the card's busy signal never ended"
+    Case #SDIO_ERR_NOT_READY
+      ProcedureReturn "sdio: not initialised - SdioInit did not succeed"
+    Case #SDIO_ERR_ENABLE_TMO
+      ProcedureReturn "sdio: the function never reported ready in CCCR IORx"
+    Case #SDIO_ERR_BUS_WIDTH
+      ProcedureReturn "sdio: the card would not switch to a four-bit bus"
+  EndSelect
+  ProcedureReturn "sdio: unknown error code"
+EndProcedure

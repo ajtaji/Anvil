@@ -1,0 +1,522 @@
+; touch_goodix_compile.pi4 - WHAT IS ON THE DISPLAY CONNECTOR'S I2C BUS, AND
+; DOES THE TOUCH CONTROLLER ANSWER?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THE QUESTION. A Waveshare MIPI DSI panel puts two devices on the same
+; I2C pair: a panel-control microcontroller at 0x45 and a Goodix touch
+; controller at 0x14 or 0x5D. WHICH touch address answers, and what the
+; product ID string reads, identifies the panel revision - and the panel
+; revision decides whether the display needs a DSI initialisation table at
+; all. So this probe answers a display question before it answers a touch
+; one, and it is worth running even if nobody wants touch yet.
+;
+; It also exercises the repeated-start transfer I2cWriteRead(). Every
+; register read below goes through it. The emitted-code model grades the
+; bus shape; real-wire behavior remains a separate bench obligation.
+;
+; WHAT IT PRINTS
+;   1. the bus, as found - which pins, on which function, at what rate
+;   2. a scan of the four addresses that matter, and what each one means
+;   3. the panel MCU: the opening sequence, a backlight ladder, enable
+;   4. the touch controller: address, product ID, firmware version
+;   5. the config block: the coordinate range, the contact slots and the
+;      trigger type the controller reports about ITSELF
+;   6. a bounded poll: every frame that arrives, in the controller's own
+;      units
+;
+; Lines that assert start "  ok   " or "  FAIL "; the count is printed at
+; the end. Nothing here loops forever.
+;
+; ***THERE IS NO SCREEN TRANSFORM IN THIS PROBE ANY MORE.*** Section 5
+; used to check one, and both it and the driver's copy of it are gone:
+; a contact becomes a screen pixel in the DISPLAY layer now, through the
+; same rotation and scale the console's own pixels go through
+; (RaspberryPi4/Board/screen_geom.pi4, ScrTouchX / ScrTouchY). It is
+; graded at all four rotations and every corner by section I of
+; the display emitted gates, beside the pixel map it is the inverse of.
+;
+; WHICH BUS, AND WHY THIS ONE ON PURPOSE. i2c.pi4 drives BOTH BSC
+; masters now - the monitor's own `touch` uses BSC0 on GPIO 44/45 at
+; ALT1, the display connector's pair, with no jumper wires. THIS PROBE
+; DELIBERATELY DOES NOT SELECT A BUS, so it runs on the library's
+; default, the 40-pin header's BSC1 on GPIO 2 and 3. Two reasons:
+;
+;   a) it is the wiring the overlay's own i2c1 override describes - "Use
+;      i2c-1 with jumper wires from GPIOs 2&3 (pins 3&5)" - which is the
+;      cheapest way to put a touch controller on a wire with no DSI link
+;      at all;
+;   b) it is the bus tools/a64/touch_emitted_check.py models, register by
+;      register. A probe that selected the connector's bus would be
+;      ungradeable on a machine with no BCM2711 in it.
+;
+;   SO ON A STOCK BOARD WITH THE PANEL IN THE DISPLAY SOCKET AND NO
+;   JUMPERS, THIS PROBE FINDS NOTHING, AND THAT IS NOT A FAULT.
+;
+; It prints the pins it is actually using, so a run that found nothing
+; cannot be mistaken for a run against the right wires.
+;
+; ***IT DRIVES THE v1 PANEL MICRO, AND THE BENCH PANEL IS A v2.*** That
+; is deliberate and it is a limit worth knowing before running it: the
+; v1 register file at $AB/$AD/$C0/$C2/$AC is OUTSIDE the v2 micro's
+; regmap, and on a v2 board the Goodix is held in reset by that micro's
+; expander bit 9 until it is written the v2 way - so this probe will not
+; wake the touch controller on the panel that is plugged in. This file
+; is the vehicle the emulator gate drives against a modelled bus, and
+; the instrument for the real panel is the monitor's own `touch`.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN. It is sent
+; to a resident Anvil and RETURNS to it, so a wrong answer costs a few
+; lines of output rather than a power cycle:
+;
+;   pmfc RaspberryPi4/Tests/touch_goodix_compile.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o touch.img
+;
+; ARM THE DEADMAN FIRST. `deadman 15` immediately before `run 400000`.
+;
+; WHAT IT LEAVES BEHIND. The I2C pins on alt0 and the divider as it was
+; found. If a panel MCU answered, THE BACKLIGHT IS LEFT ON AND THE PANEL
+; LEFT ENABLED - deliberately, because a probe that lights a screen and
+; then darkens it before anyone looks has proved nothing to the one
+; instrument that can judge it.
+
+; THE ORDER IS LOAD-BEARING (house rule 10 - a library never includes a
+; library, so this file lists every one it needs, in a sequence that
+; works). i2c.pi4 calls PinAlt out of gpio.pi4 and the two clock getters
+; out of mailbox.pi4, so both must be parsed BEFORE it. dsi_panel.pi4 and
+; touch_goodix.pi4 both call into i2c.pi4, so they come after it.
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+; The model also grades the legacy v1 MCU sequence. It is a TEST FIXTURE,
+; not the v2 backend the shipping board uses.
+XIncludeFile "RaspberryPi4/Tests/Fixtures/dsi_panel_v1.pi4"
+XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; How many times to ask for a frame before giving up. The buffer-ready bit
+; lags a touch by about ten milliseconds and there may be no finger at
+; all, so this is a bound and not an expectation: running out is a normal
+; result and is printed as one.
+#TP_POLLS = 240
+
+; Microseconds between polls. Linux polls this controller at 17 ms for
+; "60fps"; 20 ms is 50 Hz, which is faster than a finger and slower than
+; anything that would starve the bus.
+#TP_POLL_US = 20000
+
+Global tpFails.i
+Global tpChecks.i
+
+; ======================================================================
+;  Output. The same PL011 primitives every diagnostic in this directory
+;  carries; they are repeated rather than shared because a diagnostic that
+;  needs a library to print cannot report a failure in that library.
+; ======================================================================
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define nib.i
+  i = digits - 1
+  While i >= 0
+    nib = (v >> (i * 4)) & $F
+    If nib < 10
+      PutC(48 + nib)
+    Else
+      PutC(55 + nib)
+    EndIf
+    i = i - 1
+  Wend
+EndProcedure
+
+Procedure Row(*name, v.i)
+  PutS("  ")
+  PutS(*name)
+  PutS(" = ")
+  PutDec(v)
+  PutS("   ($")
+  PutHex(v, 8)
+  PutS(")")
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  ASSERTIONS. Every one prints its own line whether it passes or fails,
+;  because a diagnostic that only speaks up when something is wrong cannot
+;  be distinguished from one that did not run.
+; ======================================================================
+
+Procedure.i Chk(*name, got.i, want.i)
+  tpChecks = tpChecks + 1
+  If got = want
+    PutS("  ok   ")
+    PutS(*name)
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+  tpFails = tpFails + 1
+  PutS("  FAIL ")
+  PutS(*name)
+  PutS("   got ")
+  PutDec(got)
+  PutS("  want ")
+  PutDec(want)
+  PutNl()
+  ProcedureReturn 0
+EndProcedure
+
+; A NOTE is a finding, not a verdict. Nothing that depends on a panel
+; being plugged in is allowed to be a Chk, or the probe would report FAIL
+; for the ordinary case of a bench with no panel on it.
+Procedure Note(*s)
+  PutS("  note ")
+  PutS(*s)
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  What each address on this bus would mean.
+; ======================================================================
+
+Procedure SayAddress(a.i)
+  PutS("  $")
+  PutHex(a, 2)
+  PutS("  ")
+  If a = $45
+    PutS("a Waveshare panel-control MCU (v1) or GPIO expander (v2)")
+  ElseIf a = $14
+    PutS("a Goodix GT911 - the v1 panel, 1280x800 landscape")
+  ElseIf a = $5D
+    PutS("a Goodix GT9271 - the v2 panel, 800x1280 portrait")
+  ElseIf a = $41
+    PutS("an Ilitek ILI251x - a 13.3 inch board")
+  Else
+    PutS("something this probe does not have a name for")
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE CONFIG BLOCK - the numbers every mapped coordinate is scaled by.
+;
+;  ***THE SCREEN TRANSFORM IS NOT IN THIS PROBE ANY MORE, AND IT IS NOT
+;  IN THE DRIVER EITHER.*** It moved into the display layer, where the
+;  console's own pixels are turned - RaspberryPi4/Board/screen_geom.pi4,
+;  ScrTouchX / ScrTouchY - because there is ONE rotation on this board
+;  and a touch path with a second one would disagree with the picture
+;  the first time somebody typed `screen rotate`. It is graded, at all
+;  four rotations and at every corner, by section I of
+;  RaspberryPi4/Examples/Diagnostics/pi4DsiScreenProbe.pi4 under
+;  tools/a64/a64_dsiscreen_check.py.
+;
+;  What IS this probe's business is the numbers the controller itself
+;  reports, because they are the input to that mapping and a wrong one
+;  does not look like an error - it looks like a finger landing a hand's
+;  width from where it touched.
+;
+;  goodix.c:1072 reads exactly these, at exactly these offsets:
+;      [0]     the config VERSION
+;      [1..2]  x_max, little-endian        RESOLUTION_LOC
+;      [3..4]  y_max, little-endian
+;      [5]     max contacts, low nibble    MAX_CONTACTS_LOC
+;      [6]     trigger type, low two bits  TRIGGER_LOC
+; ======================================================================
+
+Procedure CheckConfig()
+  PutS("-- 5. the config block the controller reports --")
+  PutNl()
+
+  If Gt9Addr() = 0
+    Note("skipped - no controller answered.")
+    ProcedureReturn
+  EndIf
+
+  Row("config version", Gt9ConfigVersion())
+  Row("x range", Gt9XMax())
+  Row("y range", Gt9YMax())
+  Row("contact slots", Gt9MaxPoints())
+  Row("trigger type asked for", Gt9IntTrigger())
+
+  ; A RANGE OF ZERO IS NOT A COORDINATE SPACE. goodix.c:1213 treats
+  ; exactly this as "invalid config" and falls back to a default; this
+  ; driver does not invent a number, because an invented range puts
+  ; every finger in the wrong place with nothing reporting an error.
+  Chk("the x range is a usable number", Gt9XMax() > 0, 1)
+  Chk("the y range is a usable number", Gt9YMax() > 0, 1)
+
+  ; goodix.c:1093 - min(config[5] & 0x0f, GOODIX_MAX_CONTACTS).
+  Chk("the contact count is at least one", Gt9MaxPoints() >= 1, 1)
+  Chk("and no more than the part's ten", Gt9MaxPoints() <= 10, 1)
+
+  ; goodix.c:1092 - config[6] & 0x03, so it cannot exceed 3.
+  Chk("the trigger type is in range", Gt9IntTrigger() <= 3, 1)
+  Note("nothing on this board is wired to that trigger, so the driver")
+  Note("polls - which is what the reference driver does on this wiring.")
+EndProcedure
+
+; ======================================================================
+
+Procedure.i Main()
+  Define i.i
+  Define n.i
+  Define a.i
+  Define found.i
+  Define hz.i
+  Define addr.i
+  Define polls.i
+  Define frames.i
+  Define r.i
+  Define *idp
+
+  tpFails = 0
+  tpChecks = 0
+
+  PutNl()
+  PutS("=== touch_goodix_compile - the display connector's I2C bus ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  PutS("-- 1. the bus, as found --")
+  PutNl()
+
+  I2cUp()
+  Row("sda pin", #I2C_PIN_SDA)
+  Row("scl pin", #I2C_PIN_SCL)
+  Chk("both pads are on their alt function", I2cPinsMuxed(), 1)
+  hz = I2cGetSpeed()
+  Row("scl hz", hz)
+  Row("divider source hz", I2cSourceHz())
+  Row("timeouts since boot", I2cTimeoutCount())
+
+  Note("these are GPIO 2 and 3 - the 40-pin header, not the display FPC.")
+  Note("the panel reaches BSC0 on GPIO 44/45 at ALT1, and i2c.pi4 drives")
+  Note("that master too - but this probe stays on the header bus on")
+  Note("purpose, because that is the wiring the overlay's own i2c1")
+  Note("override describes and the one the emulator gate models. Jumper")
+  Note("the panel to header pins 3 and 5 to use this probe, or use the")
+  Note("monitor's own `touch`, which drives the connector's bus.")
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  PutS("-- 2. who is on the bus --")
+  PutNl()
+
+  found = 0
+  i = 0
+  While i < 4
+    If i = 0
+      a = $14
+    ElseIf i = 1
+      a = $41
+    ElseIf i = 2
+      a = $45
+    Else
+      a = $5D
+    EndIf
+    r = I2cProbe(a)
+    SayAddress(a)
+    If r = #I2C_OK
+      PutS("   ANSWERED")
+      found = found + 1
+    ElseIf r = #I2C_NACK
+      PutS("   -")
+    Else
+      PutS("   bus fault, code ")
+      PutDec(r)
+    EndIf
+    PutNl()
+    i = i + 1
+  Wend
+  Row("addresses that answered", found)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  PutS("-- 3. the panel control MCU at $45 --")
+  PutNl()
+
+  If DsiPanelBegin() = 0
+    Note("no MCU answered the opening sequence. Nothing was enabled.")
+    Row("last bus code", DsiPanelBusCode())
+  Else
+    PutS("  ok   the opening sequence was acknowledged")
+    PutNl()
+    Chk("three writes went out", DsiPanelWriteCount(), 3)
+
+    ; A ladder rather than one value, because a backlight that only ever
+    ; sees 255 cannot show whether the inversion is right way round: 0 and
+    ; 255 are each other's mirror image and both "work".
+    If DsiPanelBacklight(0) <> 0
+      Note("backlight asked for 0 - the panel should be DARK now")
+      delay(400)
+    EndIf
+    If DsiPanelBacklight(128) <> 0
+      Note("backlight asked for 128 - the panel should be HALF now")
+      delay(400)
+    EndIf
+    If DsiPanelBacklight(255) <> 0
+      Note("backlight asked for 255 - the panel should be FULL now")
+    EndIf
+    Chk("the level the driver last asked for", DsiPanelBacklightAsked(), 255)
+    ; Three opening writes plus two per backlight step, three steps.
+    Chk("nine writes have gone out", DsiPanelWriteCount(), 9)
+
+    If DsiPanelEnable(1) <> 0
+      PutS("  ok   the panel was enabled")
+      PutNl()
+    EndIf
+    Chk("the enable value last written", DsiPanelEnableAsked(), 1)
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  PutS("-- 4. the touch controller --")
+  PutNl()
+
+  addr = Gt9Begin()
+  If addr = 0
+    Note("no Goodix answered at $5D or $14.")
+    Row("code at $5D", Gt9CodeHigh())
+    Row("code at $14", Gt9CodeLow())
+    Note("a code of -2 is a NACK, which means nothing is there;")
+    Note("-8 means the repeated start could not be issued, which would")
+    Note("be a defect in I2cWriteRead and not a missing panel.")
+  Else
+    Row("address", addr)
+    PutS("  product id = ")
+    *idp = Gt9ProdId()
+    If *idp <> 0
+      PutS(*idp)
+    EndIf
+    PutNl()
+    Row("firmware version", Gt9Firmware())
+    Row("config version", Gt9ConfigVersion())
+    If addr = $14
+      Note("$14 and a GT911 means the v1 panel: 1280x800, and the display")
+      Note("needs NO DSI initialisation sequence.")
+    Else
+      Note("$5D and a GT9271 means the v2 panel: 800x1280, and the display")
+      Note("needs a long DCS init table this tree does not have.")
+    EndIf
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  CheckConfig()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  PutS("-- 6. frames --")
+  PutNl()
+
+  If addr = 0
+    Note("skipped - no controller answered.")
+  Else
+    polls = 0
+    frames = 0
+    While polls < #TP_POLLS
+      n = Gt9Poll()
+      If n >= 0
+        frames = frames + 1
+        If n > 0
+          PutS("  frame with ")
+          PutDec(n)
+          PutS(" touch(es)")
+          PutNl()
+          i = 0
+          While i < n
+            PutS("    id ")
+            PutDec(Gt9Id(i))
+            PutS("  raw ")
+            PutDec(Gt9RawX(i))
+            PutS(",")
+            PutDec(Gt9RawY(i))
+            PutS("  size ")
+            PutDec(Gt9Size(i))
+            PutNl()
+            i = i + 1
+          Wend
+        EndIf
+      ElseIf n = #GT9_EPROTO
+        Note("a frame claimed more than ten touches and was refused.")
+      ElseIf n = #GT9_EBUS
+        Note("a transfer failed mid-frame.")
+        Row("last bus code", Gt9LastBusCode())
+      EndIf
+      delay(#TP_POLL_US / 1000)
+      polls = polls + 1
+    Wend
+    Row("polls", polls)
+    Row("frames seen", Gt9Frames())
+    Row("frames refused for an impossible count", Gt9BadFrames())
+    If Gt9Frames() = 0
+      Note("no frame ever became ready. With a controller that answered")
+      Note("its product id, that means nothing touched the panel - or the")
+      Note("buffer-ready bit is never being cleared, which would show as")
+      Note("the FIRST frame arriving and then nothing.")
+    EndIf
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  Row("checks", tpChecks)
+  Row("failures", tpFails)
+  If tpFails = 0
+    PutS("=== done, no failures ===")
+  Else
+    PutS("=== done, WITH FAILURES ===")
+  EndIf
+  PutNl()
+  ProcedureReturn tpFails
+EndProcedure

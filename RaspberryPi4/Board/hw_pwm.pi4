@@ -1,0 +1,422 @@
+; ======================================================================
+;  hw_pwm.pi4 - the Pi 4 HwPwm* and HwTemp* backend. THE BOARD SIDE OF
+;  the seam declared in Anvil/Hal/hal.pbi; the `fan` command above it
+;  (Anvil/Core/fan_cmd.pbi) knows pin numbers, hertz, permille and the
+;  portable #HW_PWM_* / #HW_TEMP_* codes - never a CTL register, never
+;  the clock manager's password, never an alternate-function number.
+;
+;  It is thin wrappers over two libraries, whose headers carry all the
+;  register-level reasoning:
+;    RaspberryPi4/Lib/pwm.pi4      the two PWM blocks, CPRMAN's PWM
+;                                  clock, and the software toggle
+;    RaspberryPi4/Lib/thermal.pi4  the AVS monitor register and the
+;                                  firmware temperature tags
+;  The curve above it is Core (Anvil/Core/fan.pbi) and nothing here
+;  knows about it.
+;
+;  INCLUDE ORDER, and it is not arbitrary (house rule 10 - a library
+;  never includes a library, so board.pi4 lists every one of these):
+;    * RaspberryPi4/Lib/gpio.pi4    BEFORE Lib/pwm.pi4 - pwm.pi4 muxes
+;      the pin through PinAlt and drives the software channel through
+;      PinHigh/PinLow.
+;    * RaspberryPi4/Lib/timer.pi4   BEFORE Lib/pwm.pi4 - Micros() is the
+;      software channel's clock and the clock manager's timeout.
+;    * RaspberryPi4/Lib/mailbox.pi4 BEFORE Lib/thermal.pi4 - the
+;      fallback temperature and the throttle temperature are mailbox
+;      tags.
+;    * RaspberryPi4/Lib/pwm.pi4 and Lib/thermal.pi4 BEFORE this file.
+;    * Anvil/Hal/hal.pbi            BEFORE this file - it defines the
+;      #HW_PWM_* and #HW_TEMP_* vocabulary these wrappers return.
+;
+;  WHY MAP THE CODES BY HAND when Lib/pwm.pi4's #PWM_ERR_* happen to
+;  equal hal.pi4's #HW_PWM_*. The same reason hw_gpio.pi4 maps the pull
+;  codes and hw_i2c.pi4 maps the bus codes: the two enumerations live in
+;  different files for different reasons, and a future divergence in
+;  either must fail here, in one reviewable Select, rather than silently
+;  mislabel a refusal.
+;
+;  #CAP_PWM IS 1 ON THIS BOARD (board.pi4), so this real backend is what
+;  runs. A board that declares #CAP_PWM = 0 supplies stubs and
+;  RequireCap in the `fan` command refuses before any of these is
+;  reached - so nothing here has to defend against being called on a
+;  board with no fan.
+;
+;  HARDWARE-VERIFIED (2026-09-06, pi4-fan-silicon). Both libraries
+;  underneath have now run on the part: a four-wire fan on GPIO 18 at
+;  25 kHz through PWM0 channel 1, and the AVS temperature register read
+;  directly. See RaspberryPi4/Lib/pwm.pi4's THE SILICON FACT for the
+;  defect that pass found - a driver whose every readback was honest and
+;  whose pin never moved.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  WHICH PINS THIS BOARD OFFERS FOR A FAN, AND WHY THE LIST IS SHORTER
+;  THAN THE SILICON'S.
+;
+;  Lib/pwm.pi4 knows nine pins with a PWM function: 12, 13, 18, 19, 40,
+;  41, 45, 52 and 53. Only the first four reach the 40-pin header - the
+;  rest are above the Pi 4 product datasheet's "28x user GPIO" and are
+;  die lines with on-board uses. A fan is wired to the header by hand,
+;  so offering GPIO 52 in a list an operator picks from would be
+;  inviting them to drive something soldered down.
+;
+;  THE OTHER 24 HEADER PINS ARE STILL OFFERED, through the software
+;  channel. The requirement this was built to was "a free gpio pin", and
+;  a 2-wire fan on a transistor does not care which pin its base sees -
+;  so the list is every user pin, with the four that get a real
+;  modulator marked. The core prints the distinction; this file decides
+;  it.
+;
+;  A RESERVED PIN IS NOT IN THE LIST AND IS ALSO REFUSED IF NAMED. Both,
+;  because the list is a convenience and the refusal is the guarantee.
+; ----------------------------------------------------------------------
+
+; The four header pins with a real PWM channel behind them, in the order
+; a reader of the header would meet them.
+#PI4_PWM_HEADER_0 = 12
+#PI4_PWM_HEADER_1 = 13
+#PI4_PWM_HEADER_2 = 18
+#PI4_PWM_HEADER_3 = 19
+
+; The frequency a four-pin fan's control input is specified for. Named
+; here rather than in the core because it is a fact about the connector
+; this board's header is wired to, and a board whose fan is a different
+; part answers differently.
+#PI4_FAN_HZ_DEFAULT = 25000
+
+; ----------------------------------------------------------------------
+;  PwmMapCode - Lib/pwm.pi4's #PWM_* result into hal.pi4's #HW_PWM_*.
+; ----------------------------------------------------------------------
+Procedure.i PwmMapCode(c.i)
+  Select c
+    Case #PWM_OK
+      ProcedureReturn #HW_PWM_OK
+    Case #PWM_ERR_PIN
+      ProcedureReturn #HW_PWM_PIN
+    Case #PWM_ERR_HZ
+      ProcedureReturn #HW_PWM_HZ
+    Case #PWM_ERR_DUTY
+      ProcedureReturn #HW_PWM_DUTY
+    Case #PWM_ERR_BUSY
+      ProcedureReturn #HW_PWM_BUSY
+    Case #PWM_ERR_STATE
+      ProcedureReturn #HW_PWM_STATE
+    Case #PWM_ERR_SOFT
+      ProcedureReturn #HW_PWM_INUSE
+    Case #PWM_ERR_CLOCK
+      ; The clock generator would not start. There is no HAL code for
+      ; "the peripheral clock did not come up" and inventing one would
+      ; put a BCM2711 fact into hal.pi4, so it maps to BUSY - the code
+      ; whose sentence is about the modulator not being available - and
+      ; the distinction is kept in Lib/pwm.pi4 where it belongs.
+      ProcedureReturn #HW_PWM_BUSY
+    Case #PWM_ERR_START
+      ; The channel would not begin transmitting. Same reasoning.
+      ProcedureReturn #HW_PWM_BUSY
+  EndSelect
+  ; An unmapped value is a backend bug, not a hardware fault. Surface it
+  ; as BUSY - the "something is wrong we cannot name" code - rather than
+  ; letting an unknown negative pass through as if it were success.
+  ProcedureReturn #HW_PWM_BUSY
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPwmPinCount / HwPwmPinAt - the pins offered, hardware ones first.
+;
+;  HARDWARE FIRST IS DELIBERATE. The list is printed in order and the
+;  first entry is what a `fan pin` with no argument would suggest; a
+;  reader scanning it should meet the four that give a clean 25 kHz
+;  before the twenty-four that give a coarse toggle.
+; ----------------------------------------------------------------------
+; HwPwmPinIsHardRaw - the silicon question, with no header filtering, so
+; the counting loop and the list below agree by construction.
+Procedure.i HwPwmPinIsHardRaw(pin.i)
+  If pin = #PI4_PWM_HEADER_0 Or pin = #PI4_PWM_HEADER_1
+    ProcedureReturn 1
+  EndIf
+  If pin = #PI4_PWM_HEADER_2 Or pin = #PI4_PWM_HEADER_3
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPwmPinCount()
+  ; Four hardware pins, then every user pin that is neither one of those
+  ; four nor reserved by the board. HwGpioUserMax() is 27 on this board,
+  ; so the candidates are 0..27; 14 and 15 are the console. The count is
+  ; computed rather than written down so it cannot drift from the list.
+  Define n.i
+  Define p.i
+  n = 4
+  p = 0
+  While p <= HwGpioUserMax()
+    If HwPwmPinIsHardRaw(p) = 0 And HwGpioReservedReason(p) = 0
+      n = n + 1
+    EndIf
+    p = p + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i HwPwmPinAt(i.i)
+  Define n.i
+  Define p.i
+  If i < 0
+    ProcedureReturn -1
+  EndIf
+  Select i
+    Case 0
+      ProcedureReturn #PI4_PWM_HEADER_0
+    Case 1
+      ProcedureReturn #PI4_PWM_HEADER_1
+    Case 2
+      ProcedureReturn #PI4_PWM_HEADER_2
+    Case 3
+      ProcedureReturn #PI4_PWM_HEADER_3
+  EndSelect
+  n = 4
+  p = 0
+  While p <= HwGpioUserMax()
+    If HwPwmPinIsHardRaw(p) = 0 And HwGpioReservedReason(p) = 0
+      If n = i
+        ProcedureReturn p
+      EndIf
+      n = n + 1
+    EndIf
+    p = p + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; HwPwmPinIsHard(pin) - 1 hardware, 0 software only, -1 not a pin this
+; board will drive at all. The three answers are three different
+; sentences in the command above, which is why this is not a predicate.
+Procedure.i HwPwmPinIsHard(pin.i)
+  If pin < 0 Or pin > HwGpioUserMax()
+    ProcedureReturn -1
+  EndIf
+  If HwGpioReservedReason(pin) <> 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn HwPwmPinIsHardRaw(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPwmDefaultPin() - MINUS ONE, AND THAT IS THE HONEST ANSWER.
+;
+;  A Raspberry Pi 4's fan is whatever somebody wired to the header. The
+;  board carries no fan connector this software can identify and the
+;  firmware does not report one, so there is no pin this file KNOWS.
+;  Returning 18 because it is the popular choice would mean `fan auto`
+;  on a board wired to 13 drives a pin with something else on it.
+;
+;  The command's job when this is -1 is to say the pin has not been set
+;  and to name `fan pin <gpio>`. The day this board grows a known fan
+;  header - or the day the operator's choice is in the settings store,
+;  which is where it actually goes - this still answers -1, because it
+;  answers for the BOARD and the settings are the operator's.
+; ----------------------------------------------------------------------
+Procedure.i HwPwmDefaultPin()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmHzDefault()
+  ProcedureReturn #PI4_FAN_HZ_DEFAULT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE ENVELOPE, per pin, because the two mechanisms have different
+;  ones and the command has to be able to print the reachable range in
+;  its refusal rather than just saying no.
+;
+;  Hardware: 1 Hz is the slowest the divisor and range bounds together
+;  can make, and the top is the oscillator over the smallest legal range
+;  - both computed by Lib/pwm.pi4's own arithmetic rather than restated
+;  here, so a change to either bound moves this with it.
+; ----------------------------------------------------------------------
+Procedure.i HwPwmHzMin(pin.i)
+  If HwPwmPinIsHard(pin) = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn #PWM_SOFT_HZ_MIN
+EndProcedure
+
+Procedure.i HwPwmHzMax(pin.i)
+  If HwPwmPinIsHard(pin) = 1
+    ProcedureReturn #PWM_OSC_HZ / #PWM_RANGE_MIN
+  EndIf
+  ProcedureReturn #PWM_SOFT_HZ_MAX
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPwmReservedReason(pin) - the board's own list, and it is the SAME
+;  list the `gpio` command refuses writes against, asked through the
+;  same procedure rather than copied.
+;
+;  Copying it would be two lists to keep in step, and the failure mode
+;  of them drifting is a fan command that reconfigures the console pin
+;  while `gpio set 14` still refuses to.
+; ----------------------------------------------------------------------
+Procedure.i HwPwmReservedReason(pin.i)
+  ProcedureReturn HwGpioReservedReason(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPwmBegin(pin, hz) - claim a pin at a frequency.
+;
+;  THE MECHANISM IS CHOSEN HERE AND NOT BY THE CALLER. A pin with a real
+;  PWM channel gets one; every other offered pin gets the software
+;  toggle. The core is told WHICH through HwPwmKind() and prints it, so
+;  nothing is hidden - but "which of my two modulators should this pin
+;  use" is a question only the board can answer and the core should
+;  never be asked to.
+;
+;  THE SOFTWARE CHANNEL'S IDLE LEVEL IS HIGH. Lib/pwm.pi4 parks the pin
+;  there when the tick stops arriving, and for a fan HIGH is the safe
+;  end: a transistor driven on runs the fan, and a fan running when
+;  nobody asked is a noise, while a fan stopped when nobody is looking
+;  is a throttled board. The choice is made here because "which level is
+;  safe" is a wiring fact and wiring is the board's.
+; ----------------------------------------------------------------------
+Procedure.i HwPwmBegin(pin.i, hz.i)
+  Define hard.i
+  hard = HwPwmPinIsHard(pin)
+  If hard < 0
+    ProcedureReturn #HW_PWM_PIN
+  EndIf
+  If hard = 1
+    ProcedureReturn PwmMapCode(PwmBegin(pin, hz))
+  EndIf
+  ProcedureReturn PwmMapCode(PwmSoftBegin(pin, hz, 1))
+EndProcedure
+
+Procedure.i HwPwmDuty(permille.i)
+  If PwmKind() = #PWM_KIND_HARD
+    ProcedureReturn PwmMapCode(PwmDuty(permille))
+  EndIf
+  If PwmKind() = #PWM_KIND_SOFT
+    ProcedureReturn PwmMapCode(PwmSoftDuty(permille))
+  EndIf
+  ProcedureReturn #HW_PWM_STATE
+EndProcedure
+
+Procedure.i HwPwmEnd()
+  If PwmKind() = #PWM_KIND_HARD
+    ProcedureReturn PwmMapCode(PwmEnd())
+  EndIf
+  If PwmKind() = #PWM_KIND_SOFT
+    ProcedureReturn PwmMapCode(PwmSoftEnd())
+  EndIf
+  ProcedureReturn #HW_PWM_STATE
+EndProcedure
+
+; HwPwmService() - the tick's call. A hardware channel needs nothing and
+; this costs one compare; the software one does all its work here.
+Procedure HwPwmService()
+  If PwmKind() = #PWM_KIND_SOFT
+    PwmSoftService()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  What is running. Mapped, not passed through, for the reason in the
+;  header.
+; ----------------------------------------------------------------------
+Procedure.i HwPwmKind()
+  Select PwmKind()
+    Case #PWM_KIND_HARD
+      ProcedureReturn #HW_PWM_KIND_HARD
+    Case #PWM_KIND_SOFT
+      ProcedureReturn #HW_PWM_KIND_SOFT
+  EndSelect
+  ProcedureReturn #HW_PWM_KIND_NONE
+EndProcedure
+
+Procedure.i HwPwmPin()
+  ProcedureReturn PwmPin()
+EndProcedure
+
+Procedure.i HwPwmHz()
+  ProcedureReturn PwmHz()
+EndProcedure
+
+Procedure.i HwPwmDutyNow()
+  ProcedureReturn PwmDutyNow()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPwmDetail(which) - the diagnostic numbers, behind one selector.
+;
+;  Each returns -1 where it does not apply, which is how the report
+;  omits a line rather than printing a zero that reads as a measurement.
+;  The source clock is READ BACK from the clock manager rather than
+;  recomputed, for the same reason the `i2c` seam had to start doing it
+;  (forum 622): a rate derived from a constant while the hardware is
+;  running at another one is a confident wrong answer.
+; ----------------------------------------------------------------------
+Procedure.i HwPwmDetail(which.i)
+  Select which
+    Case #HW_PWM_DETAIL_RANGE
+      If PwmKind() <> #PWM_KIND_HARD
+        ProcedureReturn -1
+      EndIf
+      ProcedureReturn PwmRange()
+    Case #HW_PWM_DETAIL_DIVISOR
+      If PwmKind() <> #PWM_KIND_HARD
+        ProcedureReturn -1
+      EndIf
+      ProcedureReturn PwmDivisor()
+    Case #HW_PWM_DETAIL_SRCHZ
+      If PwmKind() <> #PWM_KIND_HARD
+        ProcedureReturn -1
+      EndIf
+      ProcedureReturn PwmClockHz()
+    Case #HW_PWM_DETAIL_STALLS
+      If PwmKind() <> #PWM_KIND_SOFT
+        ProcedureReturn -1
+      EndIf
+      ProcedureReturn PwmSoftStalls()
+    Case #HW_PWM_DETAIL_EDGES
+      If PwmKind() <> #PWM_KIND_SOFT
+        ProcedureReturn -1
+      EndIf
+      ProcedureReturn PwmSoftEdges()
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; ======================================================================
+;  THE TEMPERATURE HALF
+; ======================================================================
+;  #THERM_NONE and #HW_TEMP_NONE are the same number and are still
+;  translated, because they are two definitions in two files and the
+;  translation is what makes a future divergence a compile-time question
+;  instead of a silent one.
+; ----------------------------------------------------------------------
+Procedure.i HwTempMilliC()
+  Define t.i
+  t = ThermalMilliC()
+  If t = #THERM_NONE
+    ProcedureReturn #HW_TEMP_NONE
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+Procedure.i HwTempMaxMilliC()
+  Define t.i
+  t = ThermalMaxMilliC()
+  If t = #THERM_NONE
+    ProcedureReturn #HW_TEMP_NONE
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+Procedure.i HwTempSource()
+  Select ThermalSource()
+    Case #THERM_SRC_REGISTER
+      ProcedureReturn #HW_TEMP_SRC_REGISTER
+    Case #THERM_SRC_MAILBOX
+      ProcedureReturn #HW_TEMP_SRC_FIRMWARE
+  EndSelect
+  ProcedureReturn #HW_TEMP_SRC_NONE
+EndProcedure

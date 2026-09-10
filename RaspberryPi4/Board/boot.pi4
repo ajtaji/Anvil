@@ -1,0 +1,210 @@
+; ======================================================================
+;  THE BOARD COMES UP IN TWO HALVES, AND THE SCREEN SITS BETWEEN THEM.
+;
+;  BootConfigUp() is USB, the boot medium and SETTINGS.TXT. BootNetUp()
+;  is the network. Main() runs the first, brings the screen up, then runs
+;  the second.
+;
+;  WHY IT IS SPLIT - AND THIS IS A CHANGE OF ORDER, SO IT HAS TO JUSTIFY
+;  ITSELF AGAINST WHAT WAS HERE. The screen used to come up before all of
+;  this, so that a board hanging in PCIe or in the radio would say so on
+;  the monitor. That is still worth having and it is still true of the
+;  radio, which is the long, hang-prone half and is still on the far side
+;  of the screen.
+;
+;  What changed is that the screen is CONFIGURED HARDWARE now. Which
+;  screen the console goes on and which way up it sits on the DSI panel
+;  are settings, and a screen brought up before the settings store exists
+;  can only come up in a default and then be torn down and rebuilt when
+;  the real answer arrives - which erases the boot log it was brought up
+;  early to show. One correctly configured bring-up beats two, and the
+;  fan's boot has been ordered against the settings store on exactly this
+;  reasoning since it was written.
+;
+;  THE COST, STATED: the USB and boot-medium lines now reach the wire and
+;  the network console before the glass exists, so they are not on the
+;  panel. They are two or three short lines, the wire is the complete
+;  record either way, and a board that hangs in USB has no settings and
+;  therefore no configured screen to have shown them on.
+; ======================================================================
+Procedure BootConfigUp()
+  Define up.i
+  gBootLog = 1
+  ; ------------------------------------------------------------------
+  ; ARM THE LINK-LOCAL SURRENDER HOOK, before anything can take an
+  ; address. RFC 3927 section 2.5 requires a host that sees a SECOND
+  ; conflicting ARP inside ten seconds to stop using the address. The
+  ; one defence it is allowed is staged inside the IP layer and goes out
+  ; from any pump without the monitor knowing; ACTING on the surrender -
+  ; dropping the address, taking the console down with it and picking
+  ; another - is a monitor act, and the prompt's spin is where it has to
+  ; happen. That spin (Anvil/Core/parse.pbi) is compiled long before
+  ; Anvil/Core/netll.pbi exists, because netll.pi4 uses its parser, so
+  ; it reaches it through this pointer. One line here; the reasoning is
+  ; in netll.pi4 and netconsole.pi4.
+  ; ------------------------------------------------------------------
+  NetConsoleSetLlTick(@NetLinkLocalTick)
+  PrintN("Bringing up the board - each line names what it is starting, so a")
+  PrintN("hang or a failure shows exactly where.")
+  ; PCI Express, the xHCI host and the USB devices, each a one-liner.
+  UsbEnumerate()
+  ; The boot medium prints its own name and size - that IS its log line.
+  up = StorageUp()
+  If up <> 0
+    ; SettingsLoad is silent, so it gets a kernel-style line of its own.
+    BootStep("settings")
+    SettingsLoad()
+    BootOk("read from SETTINGS.TXT")
+  EndIf
+  ; Networking is not a property of the boot medium. The socket table and
+  ; HTTP client have non-zero defaults even though their BSS storage is a
+  ; valid CLOSED table, so initialise them whether or not a card mounted.
+  ; This is what lets a board with missing or damaged storage remain
+  ; reachable over its always-available wired interface.
+  TcpInit()
+  HttpInit()
+  gBootLog = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BootNetUp - the network half, with the screen already up so every
+;  line of it lands on the glass as it happens.
+;
+;  It reads the mount flag rather than being handed BootConfigUp's own
+;  answer: a board with no medium has no stored network configuration
+;  either, and the two halves are separately callable, so a value passed
+;  between them would be a fact about the past rather than about now.
+; ----------------------------------------------------------------------
+Procedure BootNetUp()
+  gBootLog = 1
+  ; Ethernet is recovery infrastructure, not stored configuration. Bring
+  ; it up on every boot; EthBootWired is bounded and falls back to the
+  ; direct-cable address/server when no upstream DHCP server answers.
+    ; ------------------------------------------------------------------
+    ; THE WIRED LINK FIRST, IF A CABLE IS IN. 2026-09-07.
+    ;
+    ; A board on a cable must be reachable on that cable with nothing
+    ; typed at it. Until today it was not: the console could only ride
+    ; the radio, and the wired side took no address until a command was
+    ; typed - over the console that did not exist. With the PC on another
+    ; subnet and the serial adapter failing enumeration, that left a
+    ; board physically wired to the machine trying to reach it with no
+    ; way in at all.
+    ;
+    ; WIRED FIRST AND NOT LAST, because the interface order is
+    ; wired-first when both hold an address (LinkSelect) and the console
+    ; follows whichever interface the one IP layer is configured for.
+    ; Taking the wired lease first means the wireless join that follows
+    ; adds a second interface without moving the console off the cable,
+    ; which is the behaviour the preference order promises.
+    ;
+    ; IT CANNOT STRAND THE BOARD. EthBootWired is bounded in every arm -
+    ; milliseconds with no cable, the five-second link wait with one,
+    ; plus at most one DHCP exchange - it prints what it is waiting for
+    ; before it waits, and it gives up loudly and returns. The console
+    ; arms on whatever ends up holding an address, so giving up here
+    ; costs nothing that a later lease does not recover.
+    ; ------------------------------------------------------------------
+  EthBootWired()
+  ScreenPump()
+  NetConsoleRearm()
+  ScreenPump()
+
+  ; Wi-Fi needs a saved network identity. Never invent one and never
+  ; reuse a lease from SETTINGS.TXT as if it were DHCP state: the common
+  ; client starts a fresh transaction after the radio joins.
+  If SettingsWifiSlotCount() = 0
+    If gFatUp = 0
+      PrintN("Wi-Fi was not started: the settings medium is unavailable, so no saved")
+      PrintN("network credentials can be read. Wired Ethernet remains available.")
+    Else
+      PrintN("Wi-Fi was not started: SETTINGS.TXT contains no saved Wi-Fi network.")
+      PrintN("Wired Ethernet remains available; add a Wi-Fi setting to enable radio boot.")
+    EndIf
+    ScreenPump()
+    gBootLog = 0
+    ProcedureReturn
+  EndIf
+    ; The Wi-Fi join and DHCP print their own detailed progress. Each
+    ; prints to the mirror ring; pump after each so the join, the key
+    ; exchange and the address land on the screen as they happen and not
+    ; all at once when the prompt finally arrives. (wifi.pi4 stays free of
+    ; any screen dependency - the pumps live here, in the monitor.)
+  If WifiJoinKnown() <> 0
+      ScreenPump()
+      ; One bounded foreground slice starts the shared per-interface DHCP
+      ; machine. If the access point answers later, that same transaction
+      ; continues in the prompt; boot does not create a second retry loop.
+      WifiDhcp()
+      ScreenPump()
+      ; ----------------------------------------------------------------
+      ; AND THE RADIO GETS THE SAME ANSWER THE CABLE DOES.  2026-09-07.
+      ;
+      ; "EITHER ONE TO TALK TO THE CONSOLE" was the requirement, in those
+      ; words, and a rule that applied to one link and not the other
+      ; would be exactly the half-delivery
+      ; Memories\nothing-is-delivered-half-done is about. A radio joined
+      ; to an access point with no DHCP server on it - a phone hotspot
+      ; with sharing off, an isolated AP, a server that is simply down -
+      ; is the same board with the same problem as a bare cable, so it
+      ; takes the same RFC 3927 address by the same machine.
+      ;
+      ; ONLY WHEN THE RADIO HAS NO ADDRESS - AND THE CABLE'S IS NOT ITS
+      ; BUSINESS ANY MORE.  Changed 2026-09-07, and the change is the
+      ; whole per-interface layer in one condition.
+      ;
+      ; WHAT WAS HERE was `gWifiHaveIp = 0 And NetIPv4() = 0`, and the
+      ; second half of that was right at the time and is wrong now. It
+      ; meant "and the board has no address at all", because there was
+      ; ONE IP layer: a link-local address claimed for the radio would
+      ; have moved that single layer onto the radio and taken the
+      ; console off the cable it had just come up on.
+      ;
+      ; With one address record PER INTERFACE (Anvil/Core/netif.pbi)
+      ; that cost is gone. The radio taking an address of its own leaves
+      ; the cable holding exactly what it held, the console goes on
+      ; answering on both, and outbound still prefers the wire whenever
+      ; the cable is up. So the question narrows to the only one that
+      ; was ever really being asked: does THIS INTERFACE have an
+      ; address. A cable-only condition here would be the radio being
+      ; denied an address because another link has one, which is the
+      ; same defect wearing the other coat.
+      ;
+      ; A LEASE ON THE RADIO STILL WINS LATER: WifiLinkTick re-leases
+      ; when the access point comes back, and NetAddressBound replaces
+      ; the radio's link-local address with the lease - on the radio's
+      ; record, and nowhere else.
+      ; ----------------------------------------------------------------
+      If gWifiHaveIp = 0 And NetIfHas(#HW_LINK_WIFI) = 0
+        PrintN("The radio is joined but nothing offered it a lease, so it takes an")
+        PrintN("address of its own the same way the cable does.")
+        If NetLinkLocalAcquire(#HW_LINK_WIFI) <> 0
+          Print("wifi: link-local ")
+          PutIp(NetIPv4(#HW_LINK_WIFI))
+          PrintN(" (no DHCP answer).")
+        EndIf
+        ScreenPump()
+      EndIf
+      ; ARM FROM THE BOARD'S STATE, NOT FROM THIS PATH'S OWN RESULT.
+      ; NetConsoleRearm arms when the IP layer holds an address that
+      ; belongs to an interface able to carry a frame - whichever path
+      ; put it there, and whichever interface it is - and is a no-op
+      ; otherwise. What was here was `If gWifiHaveIp <> 0 :
+      ; WifiConsoleStart()`, a one-shot read of one flag, which is the
+      ; shape of defect that left the board addressed and the console
+      ; deaf (bench, 2026-09-06). The prompt re-derives it on every spin
+      ; as well; this call is so the arming line lands in the boot log,
+      ; where an operator looks first.
+      ;
+      ; ON A BOARD WITH BOTH LINKS UP THIS SAYS NOTHING, and that is
+      ; right: the console is already listening on the cable, which is
+      ; the preferred interface, and the wireless join has not moved it.
+      NetConsoleRearm()
+      ScreenPump()
+  Else
+    PrintN("Wi-Fi did not join any saved network. The radio/firmware diagnostics above")
+    PrintN("name the failed stage; wired Ethernet remains available for recovery.")
+    ScreenPump()
+  EndIf
+  gBootLog = 0
+EndProcedure

@@ -1,0 +1,344 @@
+; ======================================================================
+;  dsi_panel_v2_dcs.pi4 - the 202-entry DCS initialisation table the
+;  second-generation Waveshare 10.1 inch panel needs before it will show
+;  anything, and the prepare sequence around it.
+; ----------------------------------------------------------------------
+;  WHY THIS IS A SEPARATE FILE FROM dsi_panel_v2.pi4. That file is the
+;  MCU at I2C $45 - the rails, the resets and the backlight, all of it
+;  over a two-wire bus that works with no DSI link at all. This file is
+;  the PANEL, and every byte in it goes out over the DSI link in escape
+;  mode. They are two different buses to two different parts, and the
+;  first one working tells you nothing about the second.
+;
+;  It is also why the bench could be in the exact state it was left in
+;  on 2026-09-06: the MCU answering, the rails up, the backlight
+;  commanded on, and the glass showing nothing. Nothing had ever been
+;  said to the panel itself.
+;
+;  ---- USE ------------------------------------------------------------
+;
+;    XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/dsi_host.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2_dcs.pi4"
+;
+;    DsiV2Begin()          ; the MCU, over I2C
+;    ...DsiHostBringUp()   ; the link, so escape mode exists
+;    DsiPanelPrepare()     ; rails, the panel's own reset, then the table
+;
+;  House rule 10: a library never includes a library. This one calls
+;  into three others and the main file lists all of them ahead of it.
+;
+;  ---- WHERE THE TABLE COMES FROM (do not guess - rule 21) ------------
+;
+;  RaspberryPi4/Reference/rpi-6.12.y_panel-waveshare-dsi-v2.c, lines
+;  356-560: ws_panel_10_1_a_init[], which is the init member of
+;  ws_panel_10_1_inch_a_desc (:2156-2163) - the descriptor the
+;  "10_1_inch_a" overlay string selects (:2288), which is the string the
+;  bench board's own overlay line carries.
+;
+;  IT WAS EXTRACTED MECHANICALLY, NOT TYPED. Two hundred entries
+;  transcribed by eye would contain a mistake and there would be no way
+;  to find it: a wrong gamma byte does not fail, it just makes the
+;  picture subtly wrong for ever. The bytes below were generated from
+;  the C source by a script that refuses any line it cannot parse, so
+;  either every entry is right or nothing was emitted.
+;
+;  ---- THE ENCODING, AND WHY IT IS A BYTE STREAM ----------------------
+;
+;  There is no array of structures to put in a DataSection here, so the
+;  table is a stream of variable-length records read by one loop:
+;
+;      $01 cmd            a DCS command with no parameter
+;      $02 cmd param      a DCS command with one parameter
+;      $FE ms             wait that many milliseconds
+;      $FF                the end
+;
+;  The count byte comes FIRST so the reader never has to look ahead to
+;  know how far to step. The two markers are $FE and $FF because no DCS
+;  command byte in THIS table is $FE or $FF - which is a property of
+;  this table, checked by the generator, and not a property of DCS. A
+;  table that grew such a command would need an escape and this loop
+;  would need to be told about it.
+;
+;  ---- WHAT THE LAST FOUR ENTRIES ARE ---------------------------------
+;
+;  The table ends with $11 (Sleep Out), 120 ms, $29 (Display On), 60 ms.
+;  Those two commands and those two delays are the standard MIPI DCS
+;  wake-up and they are IN the table rather than after it, so the whole
+;  sequence is one thing that either ran or did not. Everything before
+;  them is this panel's own controller configuration - page selects at
+;  $E0, then gamma, then the gate and source mapping.
+; ======================================================================
+
+EnableExplicit
+
+; The two record markers above.
+#DSI_INIT_END   = $FF
+#DSI_INIT_DELAY = $FE
+
+; Rail and reset delays, from ws_panel_prepare
+; (panel-waveshare-dsi-v2.c:1743-1771): iovcc then 20 ms, avdd then
+; 20 ms, reset low 60 ms, reset high 60 ms. dsi_panel_v2.pi4 carries the
+; same measured numbers for its own half; they are stated separately
+; here because a constant defined from another constant is refused by
+; this compiler, and both statements cite the same source line.
+#DSI_PANEL_MS_RAIL  = 20
+#DSI_PANEL_MS_RESET = 60
+
+; The three expander bits this file drives, by the device-tree property
+; that names each one (rpi-6.12.y_vc4-kms-dsi-waveshare-panel-v2-overlay.dts).
+;   :50  reset-gpio = <&display_mcu 1>   the PANEL's reset
+;   :51  iovcc-gpio = <&display_mcu 4>
+;   :52  avdd-gpio  = <&display_mcu 0>
+; BIT 1 IS THE PANEL AND BIT 9 IS THE TOUCH CONTROLLER. They live one
+; apart in the same 16-bit shadow, and writing the wrong one leaves a
+; perfectly good panel dark while the touch controller quietly reboots.
+#DSI_PANEL_BIT_AVDD  = 0
+#DSI_PANEL_BIT_RESET = 1
+#DSI_PANEL_BIT_IOVCC = 4
+
+; ----------------------------------------------------------------------
+;  HOW MANY FAILURES IN A ROW BEFORE THE TABLE GIVES UP.
+;
+;  Not one - the whole point of running on past a failure is to tell
+;  "the link carries nothing" from "one command in the middle failed",
+;  and stopping at the first throws that away.
+;
+;  But not two hundred either. On 2026-09-07 every command failed, and
+;  because each one waited out its own timeout the board answered
+;  nothing - not the console, not a ping - for a hundred seconds. It had
+;  not hung; there was simply no way to tell from outside.
+;
+;  Five in a row is enough to have established which of the two worlds
+;  this is, and short enough that the console comes back while somebody
+;  is still watching.
+; ----------------------------------------------------------------------
+#DSI_PANEL_GIVE_UP = 5
+
+Global dsi_panel_sent.i   = 0    ; DCS commands that completed
+Global dsi_panel_failed.i = 0    ; and how many did not
+Global dsi_panel_failat.i = -1   ; the index of the first that did not
+Global dsi_panel_gaveup.i = 0    ; 1 if it stopped early, on a run
+
+; ----------------------------------------------------------------------
+;  DsiPanelInitTable() - walk the stream and send it.
+;
+;  IT DOES NOT STOP AT THE FIRST FAILURE, and that is deliberate on a
+;  bring-up. Linux gives up on the first error (:1731-1737) because a
+;  half-initialised panel is no use to a running system. The question
+;  being answered here is whether this link carries commands at all, and
+;  "the first one failed and so did the other 199" is a completely
+;  different answer from "one in the middle failed". The index of the
+;  first failure is kept so the two cannot be confused.
+;
+;  Returns the number of commands that completed.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelInitTable()
+  Define i.i
+  Define b.i
+  Define idx.i
+  Define run.i
+
+  dsi_panel_sent   = 0
+  dsi_panel_failed = 0
+  dsi_panel_failat = -1
+  dsi_panel_gaveup = 0
+
+  i   = 0
+  idx = 0
+  run = 0
+  Repeat
+    b = PeekA(?dsi_panel_v2_init + i) & $FF
+
+    If b = #DSI_INIT_END
+      Break
+    EndIf
+
+    If b = #DSI_INIT_DELAY
+      delay(PeekA(?dsi_panel_v2_init + i + 1) & $FF)
+      i = i + 2
+      Continue
+    EndIf
+
+    If b = 1
+      If DsiDcsWrite(PeekA(?dsi_panel_v2_init + i + 1) & $FF, 0, 0) = 0
+        dsi_panel_failed = dsi_panel_failed + 1
+        run = run + 1
+        If dsi_panel_failat < 0
+          dsi_panel_failat = idx
+        EndIf
+      Else
+        dsi_panel_sent = dsi_panel_sent + 1
+        run = 0
+      EndIf
+      i = i + 2
+      idx = idx + 1
+      If run >= #DSI_PANEL_GIVE_UP
+        dsi_panel_gaveup = 1
+        Break
+      EndIf
+      Continue
+    EndIf
+
+    If b = 2
+      If DsiDcsWrite(PeekA(?dsi_panel_v2_init + i + 1) & $FF, PeekA(?dsi_panel_v2_init + i + 2) & $FF, 1) = 0
+        dsi_panel_failed = dsi_panel_failed + 1
+        run = run + 1
+        If dsi_panel_failat < 0
+          dsi_panel_failat = idx
+        EndIf
+      Else
+        dsi_panel_sent = dsi_panel_sent + 1
+        run = 0
+      EndIf
+      i = i + 3
+      idx = idx + 1
+      If run >= #DSI_PANEL_GIVE_UP
+        dsi_panel_gaveup = 1
+        Break
+      EndIf
+      Continue
+    EndIf
+
+    ; A record length that is not 1, 2, $FE or $FF means the stream has
+    ; been mis-stepped, and carrying on would send whatever byte came
+    ; next as if it were a command. Stop rather than transmit noise.
+    dsi_panel_failed = dsi_panel_failed + 1
+    Break
+  ForEver
+
+  ProcedureReturn dsi_panel_sent
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanelPrepare() - ws_panel_prepare (:1743-1771): the rails, the
+;  panel's own reset, and then the table.
+;
+;  THE CALLER OWNS THE I2C BUS. This selects nothing and restores
+;  nothing, because the display bus has to be selected before it is
+;  called and the caller is the only one that knows what to put back.
+;  Same contract touch_cmd.pi4 already uses.
+;
+;  Returns 1 only if every expander write ACKed AND every DCS command
+;  completed. A 0 with DsiPanelSent() at zero is a link that carried
+;  nothing; a 0 with the expander failing is a panel that was never
+;  powered, and those are not the same fault.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelRails()
+  Define ok.i
+
+  ok = 1
+
+  If DsiV2Pin(#DSI_PANEL_BIT_IOVCC, 1) = 0
+    ok = 0
+  EndIf
+  delay(#DSI_PANEL_MS_RAIL)
+
+  If DsiV2Pin(#DSI_PANEL_BIT_AVDD, 1) = 0
+    ok = 0
+  EndIf
+  delay(#DSI_PANEL_MS_RAIL)
+
+  If DsiV2Pin(#DSI_PANEL_BIT_RESET, 0) = 0
+    ok = 0
+  EndIf
+  delay(#DSI_PANEL_MS_RESET)
+
+  If DsiV2Pin(#DSI_PANEL_BIT_RESET, 1) = 0
+    ok = 0
+  EndIf
+  delay(#DSI_PANEL_MS_RESET)
+
+  ProcedureReturn ok
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanelPrepare() - the rails, then the table.
+;
+;  THE TWO HALVES ARE SEPARATE PROCEDURES because the order between them
+;  and the DSI host's own bring-up is a question this bench has not
+;  answered yet. A powered panel holds its lanes at a defined level; an
+;  unpowered one does not, and a host brought up against undriven lanes
+;  latches a contention error before anything has been asked of it.
+;  Being able to run the rails FIRST, without sending a single command,
+;  is what makes that testable.
+; ----------------------------------------------------------------------
+Procedure.i DsiPanelPrepare()
+  Define ok.i
+
+  ok = DsiPanelRails()
+
+  DsiPanelInitTable()
+  If dsi_panel_failed <> 0
+    ok = 0
+  EndIf
+
+  ProcedureReturn ok
+EndProcedure
+
+Procedure.i DsiPanelSent()   : ProcedureReturn dsi_panel_sent   : EndProcedure
+Procedure.i DsiPanelFailed() : ProcedureReturn dsi_panel_failed : EndProcedure
+Procedure.i DsiPanelFailAt() : ProcedureReturn dsi_panel_failat : EndProcedure
+Procedure.i DsiPanelGaveUp() : ProcedureReturn dsi_panel_gaveup : EndProcedure
+
+; ======================================================================
+;  THE TABLE. Generated from ws_panel_10_1_a_init[]
+;  (panel-waveshare-dsi-v2.c:356-560): 200 DCS commands and 2 delays,
+;  603 bytes including the $FF terminator.
+; ======================================================================
+DataSection
+  dsi_panel_v2_init:
+    Data.b $02, $E0, $00, $02, $E1, $93, $02, $E2, $65, $02, $E3, $F8
+    Data.b $02, $80, $01, $02, $E0, $01, $02, $00, $00, $02, $01, $38
+    Data.b $02, $03, $10, $02, $04, $38, $02, $0C, $74, $02, $17, $00
+    Data.b $02, $18, $AF, $02, $19, $00, $02, $1A, $00, $02, $1B, $AF
+    Data.b $02, $1C, $00, $02, $35, $26, $02, $37, $09, $02, $38, $04
+    Data.b $02, $39, $00, $02, $3A, $01, $02, $3C, $78, $02, $3D, $FF
+    Data.b $02, $3E, $FF, $02, $3F, $7F, $02, $40, $06, $02, $41, $A0
+    Data.b $02, $42, $81, $02, $43, $1E, $02, $44, $0D, $02, $45, $28
+    Data.b $02, $55, $02, $02, $57, $69, $02, $59, $0A, $02, $5A, $2A
+    Data.b $02, $5B, $17, $02, $5D, $7F, $02, $5E, $6A, $02, $5F, $5B
+    Data.b $02, $60, $4F, $02, $61, $4A, $02, $62, $3D, $02, $63, $41
+    Data.b $02, $64, $2A, $02, $65, $44, $02, $66, $43, $02, $67, $44
+    Data.b $02, $68, $62, $02, $69, $52, $02, $6A, $59, $02, $6B, $4C
+    Data.b $02, $6C, $48, $02, $6D, $3A, $02, $6E, $26, $02, $6F, $00
+    Data.b $02, $70, $7F, $02, $71, $6A, $02, $72, $5B, $02, $73, $4F
+    Data.b $02, $74, $4A, $02, $75, $3D, $02, $76, $41, $02, $77, $2A
+    Data.b $02, $78, $44, $02, $79, $43, $02, $7A, $44, $02, $7B, $62
+    Data.b $02, $7C, $52, $02, $7D, $59, $02, $7E, $4C, $02, $7F, $48
+    Data.b $02, $80, $3A, $02, $81, $26, $02, $82, $00, $02, $E0, $02
+    Data.b $02, $00, $42, $02, $01, $42, $02, $02, $40, $02, $03, $40
+    Data.b $02, $04, $5E, $02, $05, $5E, $02, $06, $5F, $02, $07, $5F
+    Data.b $02, $08, $5F, $02, $09, $57, $02, $0A, $57, $02, $0B, $77
+    Data.b $02, $0C, $77, $02, $0D, $47, $02, $0E, $47, $02, $0F, $45
+    Data.b $02, $10, $45, $02, $11, $4B, $02, $12, $4B, $02, $13, $49
+    Data.b $02, $14, $49, $02, $15, $5F, $02, $16, $41, $02, $17, $41
+    Data.b $02, $18, $40, $02, $19, $40, $02, $1A, $5E, $02, $1B, $5E
+    Data.b $02, $1C, $5F, $02, $1D, $5F, $02, $1E, $5F, $02, $1F, $57
+    Data.b $02, $20, $57, $02, $21, $77, $02, $22, $77, $02, $23, $46
+    Data.b $02, $24, $46, $02, $25, $44, $02, $26, $44, $02, $27, $4A
+    Data.b $02, $28, $4A, $02, $29, $48, $02, $2A, $48, $02, $2B, $5F
+    Data.b $02, $2C, $01, $02, $2D, $01, $02, $2E, $00, $02, $2F, $00
+    Data.b $02, $30, $1F, $02, $31, $1F, $02, $32, $1E, $02, $33, $1E
+    Data.b $02, $34, $1F, $02, $35, $17, $02, $36, $17, $02, $37, $37
+    Data.b $02, $38, $37, $02, $39, $08, $02, $3A, $08, $02, $3B, $0A
+    Data.b $02, $3C, $0A, $02, $3D, $04, $02, $3E, $04, $02, $3F, $06
+    Data.b $02, $40, $06, $02, $41, $1F, $02, $42, $02, $02, $43, $02
+    Data.b $02, $44, $00, $02, $45, $00, $02, $46, $1F, $02, $47, $1F
+    Data.b $02, $48, $1E, $02, $49, $1E, $02, $4A, $1F, $02, $4B, $17
+    Data.b $02, $4C, $17, $02, $4D, $37, $02, $4E, $37, $02, $4F, $09
+    Data.b $02, $50, $09, $02, $51, $0B, $02, $52, $0B, $02, $53, $05
+    Data.b $02, $54, $05, $02, $55, $07, $02, $56, $07, $02, $57, $1F
+    Data.b $02, $58, $40, $02, $5B, $30, $02, $5C, $00, $02, $5D, $34
+    Data.b $02, $5E, $05, $02, $5F, $02, $02, $63, $00, $02, $64, $6A
+    Data.b $02, $67, $73, $02, $68, $07, $02, $69, $08, $02, $6A, $6A
+    Data.b $02, $6B, $08, $02, $6C, $00, $02, $6D, $00, $02, $6E, $00
+    Data.b $02, $6F, $88, $02, $75, $FF, $02, $77, $DD, $02, $78, $2C
+    Data.b $02, $79, $15, $02, $7A, $17, $02, $7D, $14, $02, $7E, $82
+    Data.b $02, $E0, $04, $02, $00, $0E, $02, $02, $B3, $02, $09, $61
+    Data.b $02, $0E, $48, $02, $37, $58, $02, $2B, $0F, $02, $E0, $00
+    Data.b $02, $E6, $02, $02, $E7, $0C, $01, $11, $FE, $78, $01, $29
+    Data.b $FE, $3C, $FF
+EndDataSection

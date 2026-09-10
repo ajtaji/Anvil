@@ -1,0 +1,141 @@
+; Emitted-code probe for two display-pipeline invariants which are easy to
+; regress and impossible to prove with source-token checks alone:
+;
+;   1. logical screenshot sampling reads the physical presented raster through
+;      the common rotation transform and computes the real run-stream CRC;
+;   2. a synchronous 45,150-byte console burst drains into the terminal model
+;      without overflowing the 8 KiB staging ring and without painting inside
+;      the output producer.
+;
+; The host gate seeds ordinary modelled DRAM. This source performs no UART,
+; display, DMA, V3D or other MMIO operation.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Board/console.pi4"
+XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+
+#CC_PANEL_W = 5
+#CC_PANEL_H = 7
+#CC_FB       = $07000000
+#CC_FB_STEP  = $00001000
+#CC_OUT      = $07100000
+#CC_OUT_STEP = $00000080
+#CC_RUN      = $07200000
+#CC_MODEL    = $07101000
+#CC_MAGIC    = $43415043             ; "CAPC"
+
+Global gCcPaints.i
+
+Procedure CcPaint()
+  gCcPaints = gCcPaints + 1
+  ConGridClearDirty()
+EndProcedure
+
+Procedure.i CcCapture(slot.i, deg.i)
+  Define fb.i
+  Define out.i
+  Define lw.i
+  Define lh.i
+  Define x.i
+  Define y.i
+  Define cur.i
+  Define px.i
+  Define run.i
+  Define runs.i
+  Define crc.i
+
+  fb = #CC_FB + slot * #CC_FB_STEP
+  out = #CC_OUT + slot * #CC_OUT_STEP
+  lw = ScrLogicalW(deg, #CC_PANEL_W, #CC_PANEL_H)
+  lh = ScrLogicalH(deg, #CC_PANEL_W, #CC_PANEL_H)
+  crc = $FFFFFFFF
+  runs = 0
+
+  PokeN(out + 0, deg)
+  PokeN(out + 8, lw)
+  PokeN(out + 16, lh)
+  PokeN(out + 24, ScrCapturePixel(fb, #CC_PANEL_W * 4, deg, #CC_PANEL_W, #CC_PANEL_H, 0, 0))
+  PokeN(out + 32, ScrCapturePixel(fb, #CC_PANEL_W * 4, deg, #CC_PANEL_W, #CC_PANEL_H, lw - 1, 0))
+  PokeN(out + 40, ScrCapturePixel(fb, #CC_PANEL_W * 4, deg, #CC_PANEL_W, #CC_PANEL_H, 0, lh - 1))
+  PokeN(out + 48, ScrCapturePixel(fb, #CC_PANEL_W * 4, deg, #CC_PANEL_W, #CC_PANEL_H, lw - 1, lh - 1))
+
+  y = 0
+  While y < lh
+    x = 0
+    cur = ScrCapturePixel(fb, #CC_PANEL_W * 4, deg, #CC_PANEL_W, #CC_PANEL_H, 0, y)
+    run = 0
+    While x < lw
+      px = ScrCapturePixel(fb, #CC_PANEL_W * 4, deg, #CC_PANEL_W, #CC_PANEL_H, x, y)
+      If px = cur
+        run = run + 1
+      Else
+        PokeL(#CC_RUN, run)
+        PokeL(#CC_RUN + 4, cur)
+        crc = Crc32Part(crc, #CC_RUN, 8)
+        runs = runs + 1
+        cur = px
+        run = 1
+      EndIf
+      x = x + 1
+    Wend
+    If run > 0
+      PokeL(#CC_RUN, run)
+      PokeL(#CC_RUN + 4, cur)
+      crc = Crc32Part(crc, #CC_RUN, 8)
+      runs = runs + 1
+    EndIf
+    y = y + 1
+  Wend
+  PokeN(out + 56, runs)
+  PokeN(out + 64, (crc ! $FFFFFFFF) & $FFFFFFFF)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure CcConsoleBurst()
+  Define n.i
+  Define c.i
+  Define ch.i
+  Define p.i
+
+  ConGridInit(160, 4)
+  ConSetRenderer(@CcPaint)
+  UartMirrorSetDrain(@ConDrainRing)
+  UartMirror(1)
+  n = 0
+  While n < 301
+    ch = 65 + (n % 26)
+    c = 0
+    While c < 149
+      uart_MirrorPut(ch)
+      c = c + 1
+    Wend
+    uart_MirrorPut(10)
+    n = n + 1
+  Wend
+
+  PokeN(#CC_MODEL + 0, UartMirrorLost())
+  PokeN(#CC_MODEL + 8, UartMirrorCount())
+  PokeN(#CC_MODEL + 16, ConGridScrollN())
+  PokeN(#CC_MODEL + 24, ConGridDirty())
+  PokeN(#CC_MODEL + 32, gCcPaints)
+  p = 0
+  While p < 640
+    PokeA(#CC_MODEL + 64 + p, ConGridCell(p / 160, p % 160))
+    p = p + 1
+  Wend
+  ScreenPump()
+  PokeN(#CC_MODEL + 40, gCcPaints)
+  PokeN(#CC_MODEL + 48, ConGridScrollN())
+EndProcedure
+
+Procedure.i Main()
+  PokeN(#CC_OUT - 8, #CC_MAGIC)
+  CcCapture(0, 0)
+  CcCapture(1, 90)
+  CcCapture(2, 180)
+  CcCapture(3, 270)
+  CcConsoleBurst()
+  ProcedureReturn 0
+EndProcedure

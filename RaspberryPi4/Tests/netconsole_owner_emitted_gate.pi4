@@ -1,0 +1,356 @@
+; Executable emitted-code gate for network-console session ownership.
+; Real net/netif/netconsole code receives byte-valid UDP frames from two
+; synthetic interfaces. Main returns the first failing assertion.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+#HW_LINK_UART  = 3
+#HW_LINK_USB   = 4
+#HW_LINK_FILE  = 5
+#NETCON_PORT = 5555
+#LINK_RX_BUDGET = 64
+
+Global gate_ms.i
+Global Dim gate_ready.a[6]
+Global Dim gate_mac.a[36]
+Global Dim gate_tx.a[1600]
+Global gate_txLen.i
+Global gate_txKind.i
+Global gate_pin.i
+
+Procedure.i millis()
+  ProcedureReturn gate_ms
+EndProcedure
+Procedure.i Micros()
+  ProcedureReturn gate_ms * 1000
+EndProcedure
+Procedure delay(ms.i)
+  gate_ms = gate_ms + ms
+EndProcedure
+Procedure delayMicroseconds(us.i)
+EndProcedure
+
+Procedure.i LinkPin()
+  ProcedureReturn gate_pin
+EndProcedure
+
+Procedure.i HwLinkHas(kind.i)
+  If kind = #HW_LINK_WIRED Or kind = #HW_LINK_WIFI
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwLinkReady(kind.i)
+  ProcedureReturn gate_ready[kind] & $FF
+EndProcedure
+Procedure.i HwLinkMacPtr(kind.i)
+  ProcedureReturn @gate_mac[kind * 6]
+EndProcedure
+Procedure.i HwLinkTxMax(kind.i)
+  If HwLinkHas(kind) <> 0 : ProcedureReturn 1514 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwLinkName(kind.i)
+  If kind = #HW_LINK_WIRED : ProcedureReturn "wired" : EndIf
+  If kind = #HW_LINK_WIFI : ProcedureReturn "wifi" : EndIf
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwLinkSend(kind.i, *buf, n.i, ms.i)
+  Define i.i
+  If *buf = 0 Or n < 1 Or n > 1600 Or gate_ready[kind] = 0
+    ProcedureReturn 0
+  EndIf
+  gate_txKind = kind
+  gate_txLen = n
+  For i = 0 To n - 1
+    gate_tx[i] = PeekA(*buf + i) & $FF
+  Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i HwLinkRecv(kind.i, *buf, max.i, ms.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwLinkRxPtr(kind.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwLinkOfferRaw(kind.i, *frame, n.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure HwLinkNoteRx(kind.i, rc.i)
+EndProcedure
+Procedure HwLinkConsoleArmed(kind.i, on.i)
+EndProcedure
+
+; netfmt diagnostics name drivers not present in this gate.
+Procedure.i GenetErrorText() : ProcedureReturn "" : EndProcedure
+Procedure.i TftpErrorText() : ProcedureReturn "" : EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "RaspberryPi4/Lib/net.pi4"
+XIncludeFile "Anvil/Core/netfmt.pbi"
+XIncludeFile "Anvil/Core/netif.pbi"
+XIncludeFile "RaspberryPi4/Lib/dhcp.pi4"
+XIncludeFile "Anvil/Core/dhcpd.pbi"
+
+Procedure NetAddressBound(kind.i, ip.i, mask.i, gw.i, src.i)
+  NetIfSet(kind, ip, mask, gw, src)
+EndProcedure
+Procedure NetAddressLost(kind.i)
+  NetIfClear(kind)
+EndProcedure
+
+; The ownership gate injects UDP only; TCP remains a distinct dispatcher
+; owner and is represented by its two no-op service seams here.
+Procedure TcpInput()
+EndProcedure
+Procedure TcpTick()
+EndProcedure
+
+XIncludeFile "Anvil/Core/netconsole.pbi"
+
+Global Dim gate_frame.a[256]
+
+Procedure GatePut16(*p, v.i)
+  PokeA(*p, (v >> 8) & $FF)
+  PokeA(*p + 1, v & $FF)
+EndProcedure
+Procedure GatePut32(*p, v.i)
+  PokeA(*p, (v >> 24) & $FF)
+  PokeA(*p + 1, (v >> 16) & $FF)
+  PokeA(*p + 2, (v >> 8) & $FF)
+  PokeA(*p + 3, v & $FF)
+EndProcedure
+Procedure.i GateGet16(*p)
+  ProcedureReturn ((PeekA(*p) & $FF) << 8) | (PeekA(*p + 1) & $FF)
+EndProcedure
+Procedure.i GateGet32(*p)
+  ProcedureReturn ((PeekA(*p) & $FF) << 24) | ((PeekA(*p + 1) & $FF) << 16) | ((PeekA(*p + 2) & $FF) << 8) | (PeekA(*p + 3) & $FF)
+EndProcedure
+Procedure.i GateSum(*p, n.i)
+  Define i.i
+  Define sum.i
+  sum = 0
+  i = 0
+  While i < n
+    sum = sum + ((PeekA(*p + i) & $FF) << 8) + (PeekA(*p + i + 1) & $FF)
+    i = i + 2
+  Wend
+  While (sum >> 16) <> 0
+    sum = (sum & $FFFF) + (sum >> 16)
+  Wend
+  ProcedureReturn ($FFFF - sum) & $FFFF
+EndProcedure
+
+; Build and parse one UDP datagram. IPv4 permits checksum zero for UDP;
+; the independently computed IPv4 header checksum is still mandatory.
+Procedure.i GateFeed(kind.i, srcIp.i, dstIp.i, srcPort.i, macSeed.i, *payload, plen.i)
+  Define i.i
+  Define n.i
+  Define rc.i
+  For i = 0 To 255 : gate_frame[i] = 0 : Next
+  For i = 0 To 5
+    gate_frame[i] = gate_mac[kind * 6 + i]
+    gate_frame[6 + i] = (macSeed + i) & $FF
+  Next
+  GatePut16(@gate_frame[12], $0800)
+  gate_frame[14] = $45
+  GatePut16(@gate_frame[16], 20 + 8 + plen)
+  GatePut16(@gate_frame[18], $2200 + kind)
+  gate_frame[22] = 64
+  gate_frame[23] = 17
+  GatePut32(@gate_frame[26], srcIp)
+  GatePut32(@gate_frame[30], dstIp)
+  GatePut16(@gate_frame[24], GateSum(@gate_frame[14], 20))
+  GatePut16(@gate_frame[34], srcPort)
+  GatePut16(@gate_frame[36], #NETCON_PORT)
+  GatePut16(@gate_frame[38], 8 + plen)
+  GatePut16(@gate_frame[40], 0)
+  For i = 0 To plen - 1
+    gate_frame[42 + i] = PeekA(*payload + i) & $FF
+  Next
+  n = 42 + plen
+  If n < 60 : n = 60 : EndIf
+  rc = NetInput(kind, @gate_frame[0], n)
+  If rc <> #NET_IN_UDP
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn NetConsoleTakeUdp(@gate_frame[0], kind)
+EndProcedure
+
+Procedure GateNoTx()
+  gate_txLen = 0
+  gate_txKind = #HW_LINK_NONE
+EndProcedure
+
+Procedure.i GateBusyTo(kind.i, ip.i, port.i)
+  If gate_txKind <> kind Or gate_txLen < 48
+    ProcedureReturn 0
+  EndIf
+  If GateGet32(@gate_tx[30]) <> ip Or GateGet16(@gate_tx[36]) <> port
+    ProcedureReturn 0
+  EndIf
+  If gate_tx[42] <> 66 Or gate_tx[43] <> 85 Or gate_tx[44] <> 83 Or gate_tx[45] <> 89
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define wiredIp.i
+  Define wiredAlias.i
+  Define wifiIp.i
+  Define peer1.i
+  Define peer2.i
+  Define peer3.i
+  Define oldXid.i
+  Define delayMs.i
+  Dim p1.a[4]
+  Dim p2.a[4]
+  Dim ackish.a[4]
+
+  wiredIp = $A9FEAAFA
+  wiredAlias = $C0A88901
+  wifiIp = $C0A80110
+  peer1 = $C0A88902
+  peer2 = $C0A88903
+  peer3 = $C0A8010F
+  p1[0] = 111 : p1[1] = 110 : p1[2] = 101 : p1[3] = 13
+  p2[0] = 116 : p2[1] = 119 : p2[2] = 111 : p2[3] = 13
+  ackish[0] = $41 : ackish[1] = $43 : ackish[2] = $4B : ackish[3] = 13
+
+  For i = 0 To 5
+    gate_mac[#HW_LINK_WIRED * 6 + i] = $20 + i
+    gate_mac[#HW_LINK_WIFI * 6 + i] = $40 + i
+  Next
+  gate_ready[#HW_LINK_WIRED] = 1
+  gate_ready[#HW_LINK_WIFI] = 1
+  gate_ms = 1000
+  NetInit()
+  NetIfReset()
+  If NetSetMac(#HW_LINK_WIRED, @gate_mac[#HW_LINK_WIRED * 6]) = 0 : ProcedureReturn 1 : EndIf
+  If NetSetMac(#HW_LINK_WIFI, @gate_mac[#HW_LINK_WIFI * 6]) = 0 : ProcedureReturn 2 : EndIf
+  NetAddressBound(#HW_LINK_WIRED, wiredIp, $FFFF0000, 0, #NET_ADDR_LINKLOCAL)
+  NetSetIPv4Alt(#HW_LINK_WIRED, wiredAlias, $FFFFFF00)
+  NetAddressBound(#HW_LINK_WIFI, wifiIp, $FFFFFF00, $C0A80102, #NET_ADDR_LEASE)
+  NetIfSetLease(#HW_LINK_WIFI, 3600, gate_ms)
+  NetUdpListen(#HW_LINK_WIRED, #NETCON_PORT, 1)
+  NetUdpListen(#HW_LINK_WIFI, #NETCON_PORT, 1)
+  gConOn = 1
+  gConKind = #HW_LINK_WIRED
+  gConIp = wiredIp
+
+  ; First datagram acquires the exact five-part network endpoint.
+  If GateFeed(#HW_LINK_WIRED, peer1, wiredAlias, 40001, $A0, @p1[0], 4) <> 1 : ProcedureReturn 3 : EndIf
+  If gConOwner <> #NETCON_OWNER_NET Or gConPeerKind <> #HW_LINK_WIRED : ProcedureReturn 4 : EndIf
+  If gConPeerIp <> peer1 Or gConPeerPort <> 40001 Or gConPeerDstIp <> wiredAlias : ProcedureReturn 5 : EndIf
+  If NetConsoleGetc() <> 111 : ProcedureReturn 6 : EndIf
+  NetConsoleGetc() : NetConsoleGetc() : NetConsoleGetc()
+
+  ; Same interface, different port: explicit BUSY to the rejected tuple,
+  ; no steal and no delayed input.
+  GateNoTx()
+  If GateFeed(#HW_LINK_WIRED, peer2, wiredAlias, 40002, $B0, @p2[0], 4) <> 1 : ProcedureReturn 7 : EndIf
+  If GateBusyTo(#HW_LINK_WIRED, peer2, 40002) = 0 : ProcedureReturn 8 : EndIf
+  If gConPeerIp <> peer1 Or gConPeerPort <> 40001 : ProcedureReturn 9 : EndIf
+  If NetConsoleGetc() <> -1 : ProcedureReturn 10 : EndIf
+
+  ; A payload that resembles a binary ACK has no special privilege.
+  GateNoTx()
+  GateFeed(#HW_LINK_WIRED, peer2, wiredAlias, 40002, $B0, @ackish[0], 4)
+  If GateBusyTo(#HW_LINK_WIRED, peer2, 40002) = 0 Or NetConsoleGetc() <> -1 : ProcedureReturn 11 : EndIf
+
+  ; Same IP/port but a different MAC is a different endpoint too.
+  GateNoTx()
+  GateFeed(#HW_LINK_WIRED, peer1, wiredAlias, 40001, $C0, @p2[0], 4)
+  If GateBusyTo(#HW_LINK_WIRED, peer1, 40001) = 0 : ProcedureReturn 12 : EndIf
+  If gConPeerMac[0] <> $A0 : ProcedureReturn 13 : EndIf
+
+  ; A second interface cannot redirect the session, even with familiar
+  ; port values; BUSY leaves through that second interface explicitly.
+  GateNoTx()
+  GateFeed(#HW_LINK_WIFI, peer3, wifiIp, 40001, $D0, @p2[0], 4)
+  If GateBusyTo(#HW_LINK_WIFI, peer3, 40001) = 0 : ProcedureReturn 14 : EndIf
+  If gConPeerKind <> #HW_LINK_WIRED Or gConPeerDstIp <> wiredAlias : ProcedureReturn 15 : EndIf
+
+  ; An empty prompt-probe CR from another peer neither steals nor queues.
+  GateNoTx()
+  GateFeed(#HW_LINK_WIRED, peer2, wiredAlias, 40002, $B0, @p2[3], 1)
+  If GateBusyTo(#HW_LINK_WIRED, peer2, 40002) = 0 : ProcedureReturn 16 : EndIf
+  If gConPeerIp <> peer1 Or NetConsoleGetc() <> -1 : ProcedureReturn 17 : EndIf
+
+  ; Exact owner traffic continues to reach the interpreter.
+  GateNoTx()
+  GateFeed(#HW_LINK_WIRED, peer1, wiredAlias, 40001, $A0, @p1[0], 4)
+  If gate_txLen <> 0 Or NetConsoleGetc() <> 111 : ProcedureReturn 18 : EndIf
+
+  ; Local input cancels the partial network line safely, warns its former
+  ; owner, and becomes explicit owner. Network traffic stays BUSY.
+  GateNoTx()
+  NetConsoleClaimLocal()
+  If gConOwner <> #NETCON_OWNER_LOCAL Or gConPeerOk <> 0 : ProcedureReturn 19 : EndIf
+  If GateBusyTo(#HW_LINK_WIRED, peer1, 40001) = 0 : ProcedureReturn 20 : EndIf
+  If NetConsoleGetc() <> -1 : ProcedureReturn 21 : EndIf
+  GateNoTx()
+  GateFeed(#HW_LINK_WIFI, peer3, wifiIp, 40003, $D0, @p2[0], 4)
+  If gConOwner <> #NETCON_OWNER_LOCAL Or GateBusyTo(#HW_LINK_WIFI, peer3, 40003) = 0 : ProcedureReturn 22 : EndIf
+
+  ; Prompt completion releases ownership; a different peer can acquire
+  ; immediately, without any queued command from its earlier attempts.
+  NetConsoleCommandDone()
+  If gConOwner <> #NETCON_OWNER_NONE Or gConPeerOk <> 0 : ProcedureReturn 23 : EndIf
+  GateNoTx()
+  GateFeed(#HW_LINK_WIRED, peer2, wiredAlias, 40002, $B0, @p2[0], 4)
+  If gConPeerIp <> peer2 Or gConPeerPort <> 40002 Or gate_txLen <> 0 : ProcedureReturn 24 : EndIf
+
+  ; Losing the exact local address releases that session even while the
+  ; interface keeps its primary address and Wi-Fi keeps the console up.
+  NetSetIPv4Alt(#HW_LINK_WIRED, 0, 0)
+  NetConsoleRearm()
+  If gConOwner <> #NETCON_OWNER_NONE Or gConPeerOk <> 0 : ProcedureReturn 25 : EndIf
+  GateNoTx()
+  GateFeed(#HW_LINK_WIFI, peer3, wifiIp, 40003, $D0, @p2[0], 4)
+  If gConOwner <> #NETCON_OWNER_NET Or gConPeerKind <> #HW_LINK_WIFI Or gConPeerIp <> peer3 : ProcedureReturn 26 : EndIf
+  NetConsoleCommandDone()
+  If gConOwner <> #NETCON_OWNER_NONE : ProcedureReturn 27 : EndIf
+
+  ; The common DHCP worker owns one independent transport schedule per
+  ; interface. Both initial DISCOVERs are really serialized and handed to
+  ; their own synthetic wire in one worker tick.
+  NetDhcpCancel(#HW_LINK_WIRED)
+  NetDhcpCancel(#HW_LINK_WIFI)
+  GateNoTx()
+  If NetDhcpStart(#HW_LINK_WIRED, 1) <> 1 : ProcedureReturn 28 : EndIf
+  If NetDhcpStart(#HW_LINK_WIFI, 1) <> 1 : ProcedureReturn 29 : EndIf
+  If DhcpClientXid(#HW_LINK_WIRED) = DhcpClientXid(#HW_LINK_WIFI) : ProcedureReturn 30 : EndIf
+  NetDhcpTick()
+  If netdhcp_tx[#HW_LINK_WIRED] <> 1 Or netdhcp_tx[#HW_LINK_WIFI] <> 1 : ProcedureReturn 31 : EndIf
+  If netdhcp_attempts[#HW_LINK_WIRED] <> 1 Or netdhcp_attempts[#HW_LINK_WIFI] <> 1 : ProcedureReturn 32 : EndIf
+  If gate_txKind <> #HW_LINK_WIFI Or gate_txLen < #DHCP_MIN_LEN : ProcedureReturn 33 : EndIf
+
+  ; A prolonged outage never turns the exponential shift into an
+  ; overflow/wrap retry storm; it stays inside the documented 1..64 s
+  ; cadence after any number of attempts.
+  netdhcp_attempts[#HW_LINK_WIRED] = 100
+  delayMs = netdhcp_RetryDelay(#HW_LINK_WIRED, #DHCPC_ACT_DISCOVER)
+  If delayMs < 1000 Or delayMs > #NETDHCP_RETRY_MAX_MS : ProcedureReturn 34 : EndIf
+
+  ; Carrier loss while SELECTING abandons the transaction. Automatic mode
+  ; waits while down, then begins one fresh transaction on link return;
+  ; it does not replay the stale XID/offer state or add an outer retry loop.
+  oldXid = DhcpClientXid(#HW_LINK_WIRED)
+  gate_ready[#HW_LINK_WIRED] = 0
+  NetDhcpLinkDown(#HW_LINK_WIRED)
+  If DhcpClientState(#HW_LINK_WIRED) <> #DHCPC_INIT Or netdhcp_pending[#HW_LINK_WIRED] <> #DHCPC_ACT_NONE : ProcedureReturn 35 : EndIf
+  NetDhcpTick()
+  If DhcpClientState(#HW_LINK_WIRED) <> #DHCPC_INIT : ProcedureReturn 36 : EndIf
+  gate_ready[#HW_LINK_WIRED] = 1
+  gate_ms = gate_ms + 1
+  NetDhcpTick()
+  If DhcpClientState(#HW_LINK_WIRED) <> #DHCPC_SELECTING Or DhcpClientXid(#HW_LINK_WIRED) = oldXid : ProcedureReturn 37 : EndIf
+  NetDhcpCancel(#HW_LINK_WIRED)
+  NetDhcpCancel(#HW_LINK_WIFI)
+  ProcedureReturn 0
+EndProcedure

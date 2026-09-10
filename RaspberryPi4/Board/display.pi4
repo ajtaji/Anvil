@@ -1,0 +1,1147 @@
+
+; ======================================================================
+;  h - help
+; ======================================================================
+
+; ======================================================================
+;  f - load a file off the SD card.  THE LAST THING U-BOOT DID FOR US.
+; ======================================================================
+;  r - reset the board     d - the deadman that covers the next payload
+;
+;  WHY BOTH. A bare-metal bench has exactly one recovery from a wedged
+;  program, and until 2026-08-25 it was a human reaching for the mains.
+;  Every hang cost a walk to the board, and a hang while nobody was
+;  watching cost the whole run. These two commands are that walk,
+;  automated, and they are the reason the monitor can now be trusted
+;  with code that might not come back.
+;
+;  r  is the deliberate one: reset now, because I asked.
+;  d  is the automatic one: reset later, because nothing asked in time.
+;
+;  Both sit on the BCM2711 PM block via Lib/safety.pi4, whose header
+;  carries the citation for every register and bit - U-Boot v2025.01's
+;  drivers/watchdog/bcm2835_wdt.c, the driver in the loader printed on
+;  this board's own console at every boot.
+; ======================================================================
+;  THE LOGO
+; ======================================================================
+;  An anvil in the top right, the way U-Boot puts a raspberry there.
+;
+;  IT LIVES IN A RESERVED BAND, NOT ON THE CONSOLE. DisplayCls clears
+;  only the console rectangle and scrolling only moves the console
+;  rectangle, so the console is placed BELOW #LOGO_BAND and the band
+;  above it belongs to the logo alone. Draw the logo into the console
+;  area instead and the second screenful of output erases it - which is
+;  the whole reason the band exists rather than just a set of
+;  coordinates.
+;
+;  THE FULL SCREEN IS CLEARED ONCE, by hand, before the console is
+;  narrowed. DisplayCls cannot do it: at that moment the console does
+;  not cover the band, so the band would keep whatever the firmware left
+;  in it.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  THE ANVIL PICTURE.
+;
+;  The real photo, scaled on the host by tools/gen_anvil_pic.py into the
+;  anvilPix DataSection (RaspberryPi4/Monitor/anvil_logo.pi4) - R,G,B per
+;  pixel, #ANVIL_PIC_W x #ANVIL_PIC_H, pre-composited on the banner colour
+;  so the anti-aliased edges fade into the band rather than into a box.
+;
+;  IT REPLACED A 32x19 ONE-BIT SILHOUETTE (gen_anvil_logo.py, superseded).
+;  The board could scale the photo itself with V3D, but V3dInit poisons
+;  the firmware property mailbox until a reset and this resident monitor
+;  needs that mailbox (info's temperature and clock), so the scaling is
+;  done once at build time and the board only blits fixed pixels.
+; ----------------------------------------------------------------------
+
+; DrawAnvilPic - blit the embedded picture to the framebuffer at (x0,y0).
+;
+;  A straight PokeL into the surface, one pass, because this runs ONCE at
+;  boot with caches off: there is no per-pixel cache flush to pay - the
+;  cost that made the old silhouette coalesce runs of set bits instead of
+;  drawing pixels. Reads the data with PeekA(?anvilPix + ...), never
+;  Read/Restore, which strides two bytes whatever the element width (an
+;  open bug on every target - Bugs/Open bugs.md).
+Procedure DrawAnvilPic(x0.i, y0.i)
+  Define base.i
+  Define pitch.i
+  Define bpp.i
+  Define r.i
+  Define c.i
+  Define off.i
+  Define src.i
+  Define sx.i
+  Define sy.i
+  base = DisplayBase()
+  If base = 0
+    ProcedureReturn
+  EndIf
+  pitch = DisplayPitch()
+  bpp = DisplayBytesPerPixel()
+  src = ?anvilPix
+  r = 0
+  While r < #ANVIL_PIC_H
+    sy = y0 + r
+    If sy >= 0 And sy < DisplayHeight()
+      c = 0
+      While c < #ANVIL_PIC_W
+        sx = x0 + c
+        If sx >= 0 And sx < DisplayWidth()
+          off = src + (r * #ANVIL_PIC_W + c) * 3
+          If bpp = 4
+            PokeL(base + sy * pitch + sx * 4, DisplayRGB(PeekA(off), PeekA(off + 1), PeekA(off + 2)))
+          Else
+            DisplayPixel(sx, sy, DisplayRGB(PeekA(off), PeekA(off + 1), PeekA(off + 2)))
+          EndIf
+        EndIf
+        c = c + 1
+      Wend
+    EndIf
+    r = r + 1
+  Wend
+EndProcedure
+
+; Restore a small rectangle of the baked anvil, in its own local coordinates.
+; The animation uses this instead of redrawing the whole 76x74 picture (or the
+; whole banner) between glint positions. The source is already composited on
+; gScreenBg, so restoration is pixel-exact at anti-aliased edges.
+Procedure DrawAnvilPicRect(x0.i, y0.i, rx.i, ry.i, rw.i, rh.i)
+  Define base.i
+  Define pitch.i
+  Define bpp.i
+  Define r.i
+  Define c.i
+  Define off.i
+  Define sx.i
+  Define sy.i
+
+  base = DisplayBase()
+  If base = 0 Or rw < 1 Or rh < 1
+    ProcedureReturn
+  EndIf
+  pitch = DisplayPitch()
+  bpp = DisplayBytesPerPixel()
+  r = ry
+  While r < (ry + rh)
+    If r >= 0 And r < #ANVIL_PIC_H
+      sy = y0 + r
+      If sy >= 0 And sy < DisplayHeight()
+        c = rx
+        While c < (rx + rw)
+          If c >= 0 And c < #ANVIL_PIC_W
+            sx = x0 + c
+            If sx >= 0 And sx < DisplayWidth()
+              off = ?anvilPix + (r * #ANVIL_PIC_W + c) * 3
+              If bpp = 4
+                PokeL(base + sy * pitch + sx * 4, DisplayRGB(PeekA(off), PeekA(off + 1), PeekA(off + 2)))
+              Else
+                DisplayPixel(sx, sy, DisplayRGB(PeekA(off), PeekA(off + 1), PeekA(off + 2)))
+              EndIf
+            EndIf
+          EndIf
+          c = c + 1
+        Wend
+      EndIf
+    EndIf
+    r = r + 1
+  Wend
+EndProcedure
+
+; Restore the same source-photo rectangle on the ACTUAL presented surface.
+; Unlike DrawAnvilPicRect this does not assume DisplayBase's current layout is
+; also the scan layout; that distinction matters while sideways DSI V3D owns
+; its physical back buffer. Used only by the tiny service glint below.
+Procedure DrawAnvilPresentedRect(x0.i, y0.i, rx.i, ry.i, rw.i, rh.i)
+  Define r.i
+  Define c.i
+  Define off.i
+  r = ry
+  While r < (ry + rh)
+    If r >= 0 And r < #ANVIL_PIC_H
+      c = rx
+      While c < (rx + rw)
+        If c >= 0 And c < #ANVIL_PIC_W
+          off = ?anvilPix + (r * #ANVIL_PIC_W + c) * 3
+          ScrPresentedPixel(x0 + c, y0 + r, DisplayRGB(PeekA(off), PeekA(off + 1), PeekA(off + 2)))
+        EndIf
+        c = c + 1
+      Wend
+    EndIf
+    r = r + 1
+  Wend
+EndProcedure
+
+; The banner is a FIXED height, deliberately. It used to be derived from
+; DisplayCharHeight(), which changes with DisplayScale - and the banner
+; draws its title at scale 3. Deriving the console's origin from a value
+; the banner itself perturbs is a good way to get a console that moves
+; depending on what was drawn above it.
+#LOGO_SCALE  = 3
+#LOGO_MARGIN = 12
+#BANNER_H    = 120
+
+Procedure.i LogoHeight()
+  ProcedureReturn #BANNER_H
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrawLogo - the anvil picture, then its name under it, right-aligned.
+;
+;  `name` is the colour of the "A N V I L" label; the picture carries its
+;  own colours. The unused first parameter is kept so DrawBanner's call
+;  site does not have to change with the silhouette gone.
+; ----------------------------------------------------------------------
+Procedure DrawLogo(metal.i, name.i)
+  Define x0.i
+  Define y0.i
+  Define tw.i
+
+  ; Right-aligned, with the same margin from the top and the right edge.
+  x0 = DisplayWidth() - #ANVIL_PIC_W - #LOGO_MARGIN
+  y0 = #LOGO_MARGIN
+  If x0 < 0
+    x0 = 0
+  EndIf
+
+  DrawAnvilPic(x0, y0)
+
+  ; The name, centred under the anvil. Transparent, so it sits on the
+  ; background rather than in a box of its own.
+  tw = DisplayTextWidth("A N V I L")
+  DisplayTextClear(x0 + ((#ANVIL_PIC_W - tw) / 2), y0 + #ANVIL_PIC_H + 6, "A N V I L", name)
+EndProcedure
+
+; ======================================================================
+;  SMOOTH FONTS - anti-aliased text from the baked coverage maps.
+;
+;  Three DejaVu faces (RaspberryPi4/Monitor/anvil_fonts.pi4): font 0 the
+;  banner sans, 1 a serif, 2 a condensed sans. Each glyph is a 4-bit
+;  coverage map; DrawSmoothText blends it from the ink colour to a given
+;  background, so edges are smooth instead of the 8x16 font's stair-steps.
+;
+;  BLENDS AGAINST A PASSED BACKGROUND, not the pixel already there. The
+;  banner is a flat colour so this is exact, and it avoids reading the
+;  framebuffer back - the pixel order of a read word is the display's
+;  business, and a write goes through DisplayRGB which already handles it.
+;
+;  BYTE READS ONLY. The maps and the metrics are read with PeekA; with
+;  the MMU off, memory is Device and an unaligned .l load faults. The
+;  framebuffer write is a .l but a 32bpp pixel is always 4-aligned.
+; ======================================================================
+
+Global gFntMeta.i
+Global gFntPix.i
+Global gFntFirst.i
+Global gFntCount.i
+
+Procedure FontSelect(fid.i)
+  If fid = 1
+    gFntMeta = ?fontSerifMeta
+    gFntPix = ?fontSerifPix
+    gFntFirst = #FONT_serif_FIRST
+    gFntCount = #FONT_serif_COUNT
+  ElseIf fid = 2
+    gFntMeta = ?fontCondMeta
+    gFntPix = ?fontCondPix
+    gFntFirst = #FONT_cond_FIRST
+    gFntCount = #FONT_cond_COUNT
+  Else
+    gFntMeta = ?fontSansMeta
+    gFntPix = ?fontSansPix
+    gFntFirst = #FONT_sans_FIRST
+    gFntCount = #FONT_sans_COUNT
+  EndIf
+EndProcedure
+
+; The width a string will draw to, for centring or for placing the next
+; run after it. Sums the advance byte of each glyph's metrics record.
+Procedure.i SmoothTextWidth(*s, fid.i)
+  Define i.i
+  Define c.i
+  Define w.i
+  FontSelect(fid)
+  i = 0
+  w = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    If c >= gFntFirst And c < gFntFirst + gFntCount
+      w = w + PeekA(gFntMeta + (c - gFntFirst) * 8)
+    EndIf
+    i = i + 1
+  ForEver
+  ProcedureReturn w
+EndProcedure
+
+; Draw `*s` in font `fid`, ink colour `fg`, blended onto background `bg`,
+; with `base` the baseline row (so descenders fall below it). Returns the
+; width drawn, same as DisplayText.
+Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i)
+  Define fbBase.i
+  Define pitch.i
+  Define fgR.i
+  Define fgG.i
+  Define fgB.i
+  Define bgR.i
+  Define bgG.i
+  Define bgB.i
+  Define i.i
+  Define ch.i
+  Define rec.i
+  Define adv.i
+  Define gw.i
+  Define gh.i
+  Define dx.i
+  Define dy.i
+  Define off.i
+  Define row.i
+  Define col.i
+  Define bpr.i
+  Define bytev.i
+  Define nib.i
+  Define cov.i
+  Define gx.i
+  Define gy.i
+  Define outR.i
+  Define outG.i
+  Define outB.i
+  Define x0.i
+
+  fbBase = DisplayBase()
+  If fbBase = 0
+    ProcedureReturn 0
+  EndIf
+  If DisplayBytesPerPixel() <> 4
+    ProcedureReturn 0
+  EndIf
+  pitch = DisplayPitch()
+
+  fgR = (fg >> 16) & $FF
+  fgG = (fg >> 8) & $FF
+  fgB = fg & $FF
+  bgR = (bg >> 16) & $FF
+  bgG = (bg >> 8) & $FF
+  bgB = bg & $FF
+
+  FontSelect(fid)
+  x0 = x
+  i = 0
+  Repeat
+    ch = PeekB(*s + i) & $FF
+    If ch = 0
+      Break
+    EndIf
+    i = i + 1
+    If ch < gFntFirst Or ch >= gFntFirst + gFntCount
+      Continue
+    EndIf
+    rec = gFntMeta + (ch - gFntFirst) * 8
+    adv = PeekA(rec)
+    gw = PeekA(rec + 1)
+    gh = PeekA(rec + 2)
+    dx = PeekA(rec + 3)
+    If dx > 127
+      dx = dx - 256
+    EndIf
+    dy = PeekA(rec + 4)
+    If dy > 127
+      dy = dy - 256
+    EndIf
+    off = PeekA(rec + 5) | (PeekA(rec + 6) << 8) | (PeekA(rec + 7) << 16)
+    If gw > 0 And gh > 0
+      bpr = (gw + 1) / 2
+      row = 0
+      While row < gh
+        gy = base + dy + row
+        If gy >= 0 And gy < DisplayHeight()
+          col = 0
+          While col < gw
+            bytev = PeekA(gFntPix + off + row * bpr + (col >> 1))
+            If (col & 1) = 0
+              nib = (bytev >> 4) & $F
+            Else
+              nib = bytev & $F
+            EndIf
+            If nib <> 0
+              gx = x + dx + col
+              If gx >= 0 And gx < DisplayWidth()
+                cov = nib * 17
+                outR = bgR + (fgR - bgR) * cov / 255
+                outG = bgG + (fgG - bgG) * cov / 255
+                outB = bgB + (fgB - bgB) * cov / 255
+                PokeL(fbBase + gy * pitch + gx * 4, DisplayRGB(outR, outG, outB))
+              EndIf
+            EndIf
+            col = col + 1
+          Wend
+        EndIf
+        row = row + 1
+      Wend
+    EndIf
+    x = x + adv
+  ForEver
+  ProcedureReturn x - x0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DrawBanner - the whole top band: title, subtitle, rule, and the anvil.
+;
+;  THE TITLE IS DRAWN FOUR TIMES and that is the entire trick. There is
+;  one font here, 8x16, and no way to load another - so "fancy" has to
+;  come from how it is used rather than from a typeface:
+;
+;    * SCALED to 3x, which turns 8x16 into 24x48 and makes it a title
+;      instead of a line of text
+;    * a DROP SHADOW, the same string offset down and right in near
+;      black, drawn first so the bright pass lands on top of it
+;    * TWO COLOURS, steel for "PureMetal" and forge orange for "Forge",
+;      which is the product's own name split where it wants to split
+;    * TRANSPARENT passes, so the shadow shows through the gaps in the
+;      glyphs instead of being boxed out by the second pass's background
+;
+;  DisplayTextClear is what makes the last two possible: DisplayText
+;  paints a background cell per character and would erase the shadow.
+;
+;  THE SCALE IS PUT BACK before returning. dsp_scale is global state and
+;  the console's geometry is computed from it - leaving it at 3 gives a
+;  76-column console and a very confused line editor.
+; ----------------------------------------------------------------------
+Procedure DrawBanner()
+  Define x.i
+  Define y.i
+  Define wid.i
+  Define steel.i
+  Define orange.i
+  Define base.i
+  Define faint.i     ; not 'dim' - that is the Dim keyword, and the
+                     ; parser says only "Expected variable name after define"
+  Define savedScale.i
+
+  ; The fixed banner layout is independent of the console's selected zoom.
+  ; Restore it below so a redraw cannot alter console rows or character size.
+  savedScale = dsp_scale
+  DisplayScale(1)
+
+  steel  = DisplayRGB(226, 232, 240)
+  orange = DisplayRGB(255, 148, 48)
+  faint  = DisplayRGB(120, 132, 150)
+
+  ; ---- the title, smooth --------------------------------------------
+  ; Font 0 (DejaVu Sans Bold) blended onto the band. No drop shadow: the
+  ; anti-aliased edges carry the weight the 8x16-at-3x pass faked with
+  ; one, and a shadow blended onto the band beneath a second blended pass
+  ; would let the band show through the glyph edges, not the shadow.
+  x = 26
+  y = 14
+  base = 60
+  DrawSmoothText(x, base, "PureMetal", 0, steel, gScreenBg)
+  wid = SmoothTextWidth("PureMetal ", 0)
+  DrawSmoothText(x + wid, base, "Forge", 0, orange, gScreenBg)
+
+  ; ---- the subtitle (the 8x16 font, which is fine small) --------------
+  DisplayTextClear(28, y + (16 * 3) + 8, "bare-metal monitor   -   Raspberry Pi 4   -   BCM2711   -   AArch64 at EL2", faint)
+
+  ; Identity is permanently visible above the scrolling console and uses
+  ; exactly the constants printed by `version`, including zero-padded time.
+  DisplayTextClear(28, 94, AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME), steel)
+
+  ; ---- the rule that separates the banner from the console ------------
+  ; Two lines rather than one: a bright hairline over a dim one reads as
+  ; an edge instead of as a stray row of pixels.
+  DisplayHLine(24, #BANNER_H - 6, DisplayWidth() - 48, orange)
+  DisplayHLine(24, #BANNER_H - 5, DisplayWidth() - 48, DisplayRGB(60, 40, 20))
+
+  ; ---- and the anvil, on the right -----------------------------------
+  DrawLogo(DisplayRGB(200, 208, 220), DisplayRGB(255, 176, 64))
+  DisplayScale(savedScale)
+EndProcedure
+
+; ======================================================================
+;  A SMALL SERVICE-DRIVEN "ALIVE" GLINT
+;
+;  This is intentionally not an interrupt animation and not a private loop.
+;  The prompt's ordinary core-service spin calls ScreenBannerTick; if that
+;  service stops making progress, the glint stops too. Network traffic does
+;  not advance it. Each accepted tick restores two 5x5 pieces of the original
+;  photo, draws five pixels, and presents only their logical row union. The
+;  title, label, rule and layout are never repainted or moved.
+;
+;  DSI/HDMI and CPU/DMA/V3D all meet at ScrPresentedPixel here. It maps each
+;  logical overlay pixel onto the actual scan surface, without interpreting a
+;  renderer-owned back buffer. A later V3D frame preserves/redraws the banner
+;  exactly as before.
+; ======================================================================
+#BANNER_ANIM_MS = 350
+#BANNER_ANIM_PHASES = 8
+#BANNER_ANIM_PATCH = 5
+
+Global gBannerAnimPhase.i = -1
+Global gBannerAnimMs.i = 0
+
+Procedure.i BannerGlintX(phase.i)
+  ProcedureReturn 13 + phase * 7
+EndProcedure
+
+Procedure.i BannerGlintY(phase.i)
+  If phase < 3
+    ProcedureReturn 17 - phase * 3
+  EndIf
+  If phase < 6
+    ProcedureReturn 9 + (phase - 3)
+  EndIf
+  ProcedureReturn 13 + (phase - 6) * 2
+EndProcedure
+
+Procedure ScreenBannerTick()
+  Define now.i
+  Define phase.i
+  Define oldX.i
+  Define oldY.i
+  Define newX.i
+  Define newY.i
+  Define logoX.i
+  Define logoY.i
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+  Define steel.i
+  Define warm.i
+
+  If gScreen = 0 Or DisplayBase() = 0
+    ProcedureReturn
+  EndIf
+  now = millis()
+  If gBannerAnimPhase >= 0 And (now - gBannerAnimMs) < #BANNER_ANIM_MS
+    ProcedureReturn
+  EndIf
+
+  phase = gBannerAnimPhase + 1
+  If phase >= #BANNER_ANIM_PHASES
+    phase = 0
+  EndIf
+  logoX = DisplayWidth() - #ANVIL_PIC_W - #LOGO_MARGIN
+  If logoX < 0
+    logoX = 0
+  EndIf
+  logoY = #LOGO_MARGIN
+  newX = BannerGlintX(phase)
+  newY = BannerGlintY(phase)
+  If gBannerAnimPhase >= 0
+    oldX = BannerGlintX(gBannerAnimPhase)
+    oldY = BannerGlintY(gBannerAnimPhase)
+  Else
+    oldX = newX
+    oldY = newY
+  EndIf
+
+  x0 = logoX + oldX - 2
+  If (logoX + newX - 2) < x0
+    x0 = logoX + newX - 2
+  EndIf
+  y0 = logoY + oldY - 2
+  If (logoY + newY - 2) < y0
+    y0 = logoY + newY - 2
+  EndIf
+  x1 = logoX + oldX + 2
+  If (logoX + newX + 2) > x1
+    x1 = logoX + newX + 2
+  EndIf
+  y1 = logoY + oldY + 2
+  If (logoY + newY + 2) > y1
+    y1 = logoY + newY + 2
+  EndIf
+
+  ; A CPU cursor uses save-under; a DSI V3D cursor is part of the physical
+  ; front. In either case, leave this tick pending rather than touching an
+  ; intersecting cursor and making its restoration stale.
+  If gCurShown <> 0
+    If gCurX < (x1 + 1) And (gCurX + #CUR_W) > x0 And gCurY < (y1 + 1) And (gCurY + #CUR_H) > y0
+      gBannerAnimMs = now
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  DrawAnvilPresentedRect(logoX, logoY, oldX - 2, oldY - 2, #BANNER_ANIM_PATCH, #BANNER_ANIM_PATCH)
+  DrawAnvilPresentedRect(logoX, logoY, newX - 2, newY - 2, #BANNER_ANIM_PATCH, #BANNER_ANIM_PATCH)
+  steel = DisplayRGB(226, 232, 240)
+  warm = DisplayRGB(255, 176, 64)
+  ScrPresentedPixel(logoX + newX, logoY + newY, warm)
+  ScrPresentedPixel(logoX + newX - 1, logoY + newY, steel)
+  ScrPresentedPixel(logoX + newX + 1, logoY + newY, steel)
+  ScrPresentedPixel(logoX + newX, logoY + newY - 1, steel)
+  ScrPresentedPixel(logoX + newX, logoY + newY + 1, steel)
+  a64_barrier()
+  gBannerAnimPhase = phase
+  gBannerAnimMs = now
+EndProcedure
+
+; ======================================================================
+;  s - the screen. Anvil on HDMI as well as the serial line.
+;
+;  WHY MIRROR RATHER THAN MOVE. The serial console is the one that works
+;  when nothing else does - no display, no firmware mode, no cable - and
+;  it is the one this monitor was debugged over. Replacing it with a
+;  screen would trade a console that always works for one that usually
+;  does. So both, always, with the wire as the source of truth: a
+;  character reaches the screen only if it reached the UART first.
+;
+;  HOW IT IS PLUMBED. uart.pi4 keeps a ring of everything it wrote, off
+;  by default, and knows nothing about displays. This file drains that
+;  ring into the framebuffer console. The dependency points from the
+;  screen to the UART and never the other way, which is why uart.pi4 is
+;  still usable by a program that has no display and runs before the
+;  firmware has one.
+;
+;  THE FIRMWARE ONLY LOOKS FOR A MONITOR AT BOOT. A screen plugged in
+;  after power-up reports no display at all - num displays 0, mode 0x0 -
+;  and DisplayInit fails at its first tag with the firmware answering
+;  $80000001. That is not a bug here and no amount of retrying fixes
+;  it; the cable has to be in before the board powers on. ScreenUp()
+;  says so rather than failing quietly, because the failure looks
+;  identical to a broken driver.
+; ======================================================================
+
+; The firmware's own pixel order, read through the property mailbox.
+; Tag $00040006, GET_PIXEL_ORDER: 0 is BGR, 1 is RGB. mailbox.pi4 does
+; not wrap this tag and says at its head that any cited tag can be
+; issued through MailboxBegin/MailboxSend at the call site, which is
+; what this does. Returns -1 if the firmware will not say.
+Procedure.i ScreenPixelOrder()
+  If MailboxBegin($00040006, 4, 4) = 0
+    ProcedureReturn -1
+  EndIf
+  MailboxSetWord(0, 0)
+  If MailboxSend() = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn MailboxWord(0)
+EndProcedure
+
+; ======================================================================
+;  WHICH OF THE TWO HDMI SOCKETS - added 2026-08-26
+;
+;  A Pi 4 has two HDMI sockets and until today Anvil never chose
+;  between them. It took whichever display the firmware had picked at
+;  boot, could not report which that was, and - worst of all - its "no
+;  framebuffer" message used to assert that HDMI0 was the one that was
+;  not connected. That was not a deduction. It was a habit, and for
+;  anybody with the cable in the other socket it sent them to the wrong
+;  end of the board.
+;
+;  display.pi4 can now enumerate the displays the firmware found, choose
+;  one before the framebuffer is set up, and say which one we are on
+;  when that can honestly be established. These three procedures are the
+;  monitor's side of that: they print it, in sentences, and they say "it
+;  cannot be established" when it cannot rather than picking a socket.
+;
+;  THE NUMBERS THE OPERATOR TYPES ARE INDEXES, NOT SOCKET NUMBERS, and
+;  the two are not the same thing. "screen on 1" means the SECOND
+;  display the firmware found. With one cable in HDMI1 there is exactly
+;  one display, its index is 0, and "screen on 0" is the way to ask for
+;  it. That is why every report below prints the index AND the socket it
+;  turned out to be; a report that printed only one of the two would be
+;  the same trap in a new place.
+; ======================================================================
+
+; The name of one DispmanX display identifier, as words. The identifiers
+; are the firmware's, from the table at
+; Datasheets/pi4/hdmi/vc4_firmware_kms.c:343-356; mailbox.pi4 carries
+; the two this board can use as #MBX_FB_DISPLAY_HDMI0 / _HDMI1 and lists
+; the rest in a comment. Anything not named is printed as its number
+; rather than guessed at.
+Procedure ScreenPutDisplayName(id.i)
+  If id = #MBX_FB_DISPLAY_HDMI0
+    Print("HDMI socket 0")
+  ElseIf id = #MBX_FB_DISPLAY_HDMI1
+    Print("HDMI socket 1")
+  ElseIf id = #MBX_FB_DISPLAY_MAIN_LCD
+    ; NAMED 2026-09-06, AND FINDING ONE HERE IS A RESULT. It means the
+    ; firmware brought a DSI or DPI panel up on its own, which is the
+    ; whole question the Waveshare panel work turns on - and if it did,
+    ; "screen on <this index>" already works, because the display-select
+    ; path was never HDMI-specific.
+    Print("a DSI or DPI panel, the firmware's main LCD")
+  ElseIf id = #MBX_FB_DISPLAY_AUX_LCD
+    Print("a DSI panel, the firmware's auxiliary LCD")
+  ElseIf id < 0
+    Print("a display the firmware would not identify")
+  Else
+    Print("the display the firmware calls number ")
+    PrintDec(id)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Every screen this monitor could put a console on - and there are TWO
+;  KINDS OF THEM, which is why this reads the way it does.
+;
+;  The firmware's displays are the ones it found and owns, and they are
+;  the only ones it can be asked about. The DSI panel is NOT one of
+;  them: the firmware never brings DSI1 up on this board, so it owns no
+;  DSI display and its census correctly answers zero even with the panel
+;  lit and scanning. That panel is Anvil's own, out of Anvil's own
+;  memory.
+;
+;  SO THE ZERO IS NOT A CONTRADICTION AND MUST NOT BE HIDDEN. Reporting
+;  the panel inside the firmware's list would be inventing a display the
+;  firmware does not have, and that is the exact habit the header above
+;  this section was written against. They are listed separately, and
+;  each is said to be what it is.
+; ----------------------------------------------------------------------
+Procedure ScreenReportDisplays()
+  Define n.i
+  Define i.i
+  Define id.i
+
+  ; ---- Anvil's own, first, because it is the one that is plugged in --
+  If ScrDsiPanelSeen() = 1
+    Print("A DSI panel is plugged into the display connector")
+    If gScrDsiUp <> 0
+      PrintN(" and this monitor has it")
+      PrintN("  lit and scanning. Type screen on dsi to put the console on it.")
+    Else
+      PrintN(". This monitor can light it")
+      PrintN("  itself - type screen on dsi. The firmware has nothing to do with")
+      PrintN("  it and will not list it below.")
+    EndIf
+  EndIf
+
+  ; The tag slots have to be filled before any of this can be asked, and
+  ; the operator may be running "screen" before the screen has ever been
+  ; brought up. Filling them is idempotent and costs nothing.
+  DisplayStandardTags()
+
+  n = DisplayCount()
+  If n < 0
+    PrintN("The firmware would not say how many displays it found.")
+    ProcedureReturn
+  EndIf
+  If n = 0
+    PrintN("The firmware found no displays of its own. That is the whole truth")
+    PrintN("about the firmware and it says nothing about the DSI panel, which")
+    PrintN("this monitor drives without asking the firmware for a display.")
+    ProcedureReturn
+  EndIf
+  Print("The firmware found ")
+  PrintDec(n)
+  If n = 1
+    PrintN(" display, and this is it:")
+  Else
+    PrintN(" displays:")
+  EndIf
+  i = 0
+  While i < n
+    id = DisplayIdAt(i)
+    Print("  display ")
+    PrintDec(i)
+    Print(" is ")
+    ScreenPutDisplayName(id)
+    If i = DisplaySelected()
+      Print(", and Anvil asked for this one")
+    EndIf
+    PrintN(".")
+    i = i + 1
+  Wend
+EndProcedure
+
+; The size of the screen, as one line. Factored out of ScreenUpOn() on
+; 2026-08-26 because it had to be said on MORE THAN ONE PATH and was
+; only being said on one - see THE SILENT screen on REGRESSION on
+; ScreenUpOn(). A procedure rather than a copied pair of lines so the
+; two paths cannot drift into reporting the same screen differently.
+; A length in thousandths of an inch, printed as inches. Everything a
+; person reads on this board is in US customary units, and a glyph
+; height is one of the numbers this monitor now reports, so it needs a
+; way to say "0.107 inch" out of the integer 107 - there is no floating
+; point on this path and there does not need to be.
+Procedure ScreenPutThou(v.i)
+  Define f.i
+  If v < 0
+    v = 0
+  EndIf
+  PrintDec(v / 1000)
+  Print(".")
+  f = v % 1000
+  If f < 100
+    Print("0")
+  EndIf
+  If f < 10
+    Print("0")
+  EndIf
+  PrintDec(f)
+EndProcedure
+
+; A screen's diagonal, which the hardware states in TENTHS of an inch, as
+; inches. A separate procedure from ScreenPutThou above rather than a
+; multiply into it: 101 tenths through that one comes out "10.100
+; inches", which is three digits of precision the panel never claimed.
+Procedure ScreenPutTenths(v.i)
+  If v < 0
+    v = 0
+  EndIf
+  PrintDec(v / 10)
+  Print(".")
+  PrintDec(v % 10)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenPutScale - HOW BIG THE TYPE IS AND WHY IT IS THAT BIG.
+;
+;  Printed by the boot log and by `screen`, from one procedure, because
+;  the bench grades this by looking at the glass and then wants to know
+;  whether the number the monitor believes matches what it can see.
+;
+;  It says the density, whether that density was READ or ASSUMED, the
+;  magnification, and the height of a line of text in inches. The last
+;  one is the number that makes the fix checkable from the console: it
+;  is the same on this panel whichever way the console is turned, and it
+;  used to double.
+; ----------------------------------------------------------------------
+Procedure ScreenPutScale()
+  Define ppi.i
+
+  ppi = ScrPpi(gScrSrc)
+  Print("The type is ")
+  ScreenPutThou(ScrGlyphThou(gScrScale, ppi))
+  Print(" inch to a line - magnification ")
+  PrintDec(gScrScale)
+  Print(" of an 8 x 16")
+  PrintNl()
+  Print("font, so ")
+  PrintDec(DisplayCharWidth())
+  Print(" by ")
+  PrintDec(DisplayCharHeight())
+  Print(" pixels a character, on a screen of ")
+  PrintDec(ppi)
+  PrintN(" pixels")
+  Print("to the inch")
+  If ScrDiagMeasured(gScrSrc) <> 0
+    Print(" - the panel's own microcontroller says it is ")
+    ScreenPutTenths(ScrDiagTenths(gScrSrc))
+    PrintN(" inches")
+    PrintN("across the diagonal.")
+  Else
+    Print(" - NOTHING ON THIS SCREEN CAN SAY HOW BIG IT IS,")
+    PrintNl()
+    Print("so ")
+    ScreenPutTenths(ScrDiagTenths(gScrSrc))
+    PrintN(" inches diagonally is assumed. If that is wrong the type will")
+    PrintN("be the wrong size, and screen scale <n> sets it by hand and saves.")
+  EndIf
+  If ScrScaleOk(ScrScaleStored()) <> 0
+    Print("That magnification was typed rather than computed: screen.scale in")
+    PrintNl()
+    Print("the settings store says ")
+    PrintDec(ScrScaleStored())
+    Print(", and the calculation would have picked ")
+    PrintDec(ScrScaleComputed(gScrSrc, DisplayWidth()))
+    PrintN(".")
+    PrintN("Type screen scale auto to go back to the calculation.")
+  EndIf
+EndProcedure
+
+Procedure ScreenPutGeometry()
+  ; CALLED AS THE TAIL OF A SENTENCE somebody else started, which is why
+  ; it opens with ". It is" and not with a capital letter. Three callers
+  ; share it so that one screen cannot be described two different ways.
+  PrintN(".")
+  Print("It is ")
+  PrintDec(DisplayWidth())
+  Print(" pixels across and ")
+  PrintDec(DisplayHeight())
+  PrintN(" down, which leaves room for")
+  Print("  ")
+  PrintDec(DisplayCols())
+  Print(" characters on a line and ")
+  PrintDec(DisplayRows())
+  PrintN(" lines of text.")
+  ScreenPutScale()
+  ; WHO IS MOVING THE PIXELS, because it is the question the speed of
+  ; this console actually turns on and there was previously no way to
+  ; ask it. display.pi4's own note on its counters makes the case: every
+  ; accelerated primitive falls back to the processor and DRAWS THE
+  ; RIGHT PICTURE, so a board whose blitter never started is
+  ; indistinguishable from one whose blitter is working except by a
+  ; frame time nobody is measuring.
+  If gScrSrc = #SCR_SRC_DSI And ScrSideways(gScrRot) <> 0
+    ; SAY THE COST WHERE THE SPEED IS BEING DESCRIBED. Both tiers retain a
+    ; contiguous logical/back surface: the framebuffer tier can DMA-scroll
+    ; that surface before its damage transpose, while V3D rotates geometry
+    ; directly into a physical back surface and DMA-presents the frame.
+    Print("The console is turned ")
+    PrintDec(gScrRot)
+    PrintN(" degrees. The framebuffer tier transposes damage;")
+    PrintN("the V3D tier transforms geometry into the panel's physical back buffer.")
+    PrintN("The HVS has no 90 degree turn. screen rotate 0 or 180 removes that")
+    PrintN("presentation cost and stands the console on its side on this bench.")
+  EndIf
+  If gDma = 1
+    PrintN("The SoC DMA engine is up for scrolling, large fills and frame presents.")
+  Else
+    PrintN("The processor is drawing it; the DMA engine is not in use, so")
+    PrintN("scrolling is about forty times slower than it needs to be.")
+  EndIf
+EndProcedure
+
+; Which display the picture is actually going to, when that can be
+; established at all. See DisplayActiveId() in display.pi4: there is no
+; firmware tag that asks the question, so the honest answer with two
+; displays connected and no choice made is that we do not know.
+Procedure ScreenReportActive()
+  Define id.i
+
+  ; THE DSI PANEL IS NOT A QUESTION FOR THE FIRMWARE. When the console is
+  ; on it, which screen the picture is going to is not established by
+  ; asking - it is known, because this monitor composed the surface and
+  ; pointed pixel valve 1 at the panel itself. Falling through to the
+  ; firmware census here would print "cannot be established" about the
+  ; one screen whose answer is certain.
+  If gScrSrc = #SCR_SRC_DSI
+    PrintN("The picture is going to the DSI panel, which this monitor is driving")
+    PrintN("itself - its own framebuffer, its own display list, its own pixel")
+    Print("valve. The panel scans ")
+    PrintDec(#MON_FB_PANEL_W)
+    Print(" by ")
+    PrintDec(#MON_FB_PANEL_H)
+    PrintN(" whatever the console does; the")
+    Print("console is turned ")
+    PrintDec(gScrRot)
+    PrintN(" degrees on it. Type screen rotate to change that.")
+    ProcedureReturn
+  EndIf
+
+  id = DisplayActiveId()
+  If id >= 0
+    Print("The picture is going to ")
+    ScreenPutDisplayName(id)
+    If DisplaySelected() >= 0
+      Print(", which was chosen with screen on ")
+      PrintDec(DisplaySelected())
+    ElseIf DisplayCount() = 1
+      ; ONLY SAY THIS WHEN IT IS TRUE. The census is asked rather than
+      ; assumed, because on a board with both sockets in use "the only
+      ; display there is" would be a confident wrong answer about the
+      ; very thing the operator is trying to establish.
+      Print(", which is the only display there is")
+    Else
+      Print(", which the firmware chose by itself")
+    EndIf
+    PrintN(".")
+    ProcedureReturn
+  EndIf
+  PrintN("Which display the picture is going to cannot be established. No")
+  PrintN("display was chosen here, so the firmware picked one when the board")
+  PrintN("powered on, and there is no way to ask it which. Choose one with")
+  PrintN("screen on 0 or screen on 1 and it will be known for certain.")
+EndProcedure
+
+; ======================================================================
+;  ScreenDmaUp - bring the blitter up and point it at the framebuffer.
+;
+;  Called once, from ScreenUpOn(), after the framebuffer exists and
+;  before anything is drawn on it. Returns 1 if the engine is usable.
+;
+;  THE ORDER IS FIXED AND display.pi4 STATES IT: DisplayInit,
+;  DmaSetScratch, DisplayDmaBind, DmaInit, DisplayUseDma. Bind before
+;  Init because DmaInit() refuses until the bounds are declared, and
+;  DisplayDmaBind() is used rather than DmaSetBounds() directly because
+;  it takes the base and the length from the firmware's own answer
+;  instead of from a number typed here. Getting either wrong is the one
+;  fault on this board whose symptom is a machine that stops answering.
+;
+;  IT SAYS SO WHEN IT FAILS, and that is not decoration. Every
+;  accelerated primitive in display.pi4 falls back to the CPU and DRAWS
+;  THE RIGHT PICTURE when the engine declines, so a monitor with a dead
+;  blitter looks exactly like a monitor with a live one except for a
+;  frame time nobody is measuring. A silent fallback here would put the
+;  half-second scroll back and leave no trace of why.
+; ======================================================================
+Procedure.i ScreenDmaUp()
+  Define base.i
+
+  ; Round the Global's address up to the 256 the engine wants. The mask
+  ; is written as a subtraction rather than as "& $FFFFFF00", which is a
+  ; 32-BIT literal on this target and would clear the top half of a
+  ; 64-bit address along with the low eight bits - the same trap
+  ; dma.pi4 records against its own rounding.
+  base = @gDmaScratch[0] + 255
+  base = base - (base % 256)
+
+  If DmaSetScratch(base, #MON_DMA_SCRATCH) = 0
+    PrintN("The blitter's scratch block was refused, so the screen will be drawn")
+    PrintN("by the processor. Nothing else is affected.")
+    ProcedureReturn 0
+  EndIf
+  If DisplayDmaBind() = 0
+    PrintN("The blitter could not be pointed at the framebuffer, so the screen")
+    PrintN("will be drawn by the processor. Nothing else is affected.")
+    ProcedureReturn 0
+  EndIf
+  ; A DSI present legitimately writes both fixed framebuffer surfaces: the
+  ; logical/physical draw buffer and the HVS scan buffer. They occupy the one
+  ; declared #MON_FB_LO..#MON_FB_HI safety window. HDMI keeps the firmware
+  ; allocation's exact bound installed by DisplayDmaBind above.
+  If gScrSrc = #SCR_SRC_DSI
+    If DmaSetBounds(#MON_FB_LO, (#MON_FB_HI - #MON_FB_LO) + 1) = 0
+      PrintN("The blitter could not cover both DSI framebuffer surfaces, so the")
+      PrintN("screen will be drawn by the processor. Nothing else is affected.")
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  If DmaInit() = 0
+    Print("The blitter would not start, so the screen will be drawn by the")
+    PrintN(" processor.")
+    Print("   ")
+    PrintN(DmaErrorText())
+    ProcedureReturn 0
+  EndIf
+
+  DisplayUseDma(1)
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  ScreenFastScroll - move the console up by n text rows, with the
+;  engine, and nothing else.
+;
+;  Returns 1 if the engine did it, 0 if it declined - and 0 means the
+;  caller must fall back to the library, never that the screen is now
+;  wrong. Neither transfer is started unless the one before it landed.
+;
+;  ====================================================================
+;   THE SCROLL, AND WHY IT IS PRE-EMPTED RATHER THAN LEFT TO THE
+;   LIBRARY. THIS IS A MARKED, TEMPORARY WORK-AROUND.
+;  ====================================================================
+;  display.pi4's DisplayScroll() ALREADY has an accelerated path and it
+;  is a good one - it detects that this console's rows are contiguous
+;  and hands the whole block to the engine in a single linear transfer.
+;  This procedure exists because of what surrounds that transfer, and
+;  the numbers are from silicon on 2026-08-28, one chunk-8 scroll of
+;  this exact console, by
+;  RaspberryPi4/Examples/Diagnostics/pi4ScrollFast.pi4:
+;
+;      the monitor as it stood, CPU                527.9 ms
+;      DisplayScroll with the engine linked        216.6 ms
+;      the same two transfers, nothing around them  12.0 ms
+;
+;  The 204 ms of difference is cache maintenance: DspDmaSpanUp cleans
+;  the union of the two rectangles before the copy and invalidates the
+;  destination after it, which over this console is 7.37 MB and then
+;  6.39 MB of "dc civac".
+;
+;  TWO SEPARATE FACTS ABOUT THAT MAINTENANCE, AND THEY ARE DIFFERENT
+;  FACTS:
+;
+;    1  IT MAINTAINS NOTHING HERE. This monitor runs with the MMU off,
+;       so every access is Device memory and there is no cached copy of
+;       a framebuffer byte anywhere to clean or to drop. That is an
+;       argument, and it was turned into evidence rather than left as
+;       one: pi4ScrollFast.pi4 section 2 paints a distinct colour into
+;       all sixty text rows with the CPU, scrolls with the engine and
+;       NO maintenance at all, and reads back three columns of every
+;       row. 180 sample points, 0 wrong.
+;
+;    2  THE WALK IS ALSO FAR MORE EXPENSIVE THAN IT SHOULD BE, AND THAT
+;       PART IS A DEFECT IN dma.pi4 RATHER THAN A COST OF THE
+;       OPERATION. Section 4 of the same run, over 99,840 lines:
+;
+;           DmaCacheRange as it stands       83.1 ms   832 ns per line
+;           the same loop with NO dc civac   92.6 ms   928 ns per line
+;
+;       Removing the cache instruction entirely does not make the loop
+;       faster. All 832 nanoseconds are the scaffolding - dma.pi4's
+;       DmaCacheLines() writes a Global and CALLS DmaCacheLine() once
+;       per sixty-four bytes, and with the MMU off instruction fetch is
+;       Device memory too, so every instruction executed is its own
+;       read from DRAM. The fix is four instructions in one ASM loop
+;       instead of roughly thirty across a call boundary, it is worth
+;       about 8x, and it helps every user of the engine including the
+;       ones that DO have the MMU on. It belongs in dma.pi4, which this
+;       session does not own.
+;
+;  SO THIS IS A WORK-AROUND AND IT IS LABELLED AS ONE. It exists
+;  because both of those fixes belong in files this session did not
+;  own, and it should be DELETED - along with its call site in
+;  ScreenPump() - the day DisplayScroll() is fast enough on its own.
+;
+;  WHAT "FAST ENOUGH" WILL TAKE, AND THE HONEST STATE OF EACH HALF.
+;  Fixing the walk's loop shape alone is NOT expected to be sufficient
+;  and this comment will not repeat the mistake it is documenting by
+;  guessing that it is. DisplayScroll() maintains about 14.7 MB per
+;  scroll across its three calls; at the measured 13 ns a byte that is
+;  191 ms, and a loop fix worth the 30-instructions-to-4 ratio would
+;  leave something on the order of thirty milliseconds, not twelve.
+;  Getting to twelve needs the SECOND fact as well - a seam by which a
+;  main file can tell display.pi4 that its surface is not cacheable, in
+;  the same shape as #DSP_DMA_LINKED, so the maintenance is skipped
+;  rather than hurried. NEITHER NUMBER ABOVE IS MEASURED; they are
+;  arithmetic on numbers that are, and the deletion of this procedure
+;  should follow a measurement and not this paragraph.
+;
+;  Do not build anything else on it.
+;
+;  WHAT MAKES IT SAFE MEANWHILE:
+;    * it runs only when gDma is 1, so a board whose engine did not
+;      start behaves exactly as this monitor did before;
+;    * either transfer refusing returns 0, and the caller then does the
+;      ordinary DisplayPutC(10) - a refusal costs speed, never a
+;      picture;
+;    * the geometry is read from display.pi4's own accessors, so it
+;      cannot drift from the console the library thinks it has;
+;    * the destination is inside the framebuffer by construction and
+;      DmaSetBounds() is holding the same line underneath.
+; ======================================================================
+Procedure.i ScreenFastScroll(n.i)
+  Define pitch.i
+  Define chgt.i
+  Define rows.i
+  Define keep.i
+  Define dst.i
+  Define src.i
+
+  If gDma = 0 Or n < 1
+    ProcedureReturn 0
+  EndIf
+  rows = DisplayRows()
+  If n >= rows
+    ; A scroll that would clear the screen is not this procedure's
+    ; business - DisplayScroll() turns it into DisplayCls(), which is
+    ; already accelerated now that the engine is bound.
+    ProcedureReturn 0
+  EndIf
+  pitch = DisplayPitch()
+  chgt  = DisplayCharHeight()
+  keep  = (rows - n) * chgt
+
+  ; The console starts at the left edge and spans the full width, so
+  ; the block being moved is ONE run of bytes. That is the same
+  ; condition DisplayScroll() tests before taking its contiguous branch;
+  ; it holds because this file built the console that way, and it is
+  ; re-derived here from the surface rather than assumed.
+  If DisplayCharWidth() * DisplayCols() * DisplayBytesPerPixel() <> pitch
+    ProcedureReturn 0
+  EndIf
+
+  dst = DisplayBase() + (LogoHeight() * pitch)
+  src = dst + (n * chgt * pitch)
+
+  If DmaCopy(dst, src, keep * pitch) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaFill32(dst + (keep * pitch), pitch, DisplayWidth(), n * chgt, gScreenBg) = 0
+    ; THE COPY HAS ALREADY LANDED, so returning 0 here would be wrong:
+    ; the caller's fallback would print the line feed, the library would
+    ; scroll a SECOND time, and the console would have jumped 2n rows
+    ; while looking perfectly tidy. The vacated rows are finished by
+    ; hand instead - DisplayFillRect clips, takes the engine itself when
+    ; it can and the processor when it cannot, and either way the screen
+    ; that comes out is the one a scroll of n rows owes.
+    DisplayFillRect(0, LogoHeight() + keep, DisplayWidth(), n * chgt, gScreenBg)
+  EndIf
+  ProcedureReturn 1
+EndProcedure

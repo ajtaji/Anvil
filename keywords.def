@@ -1,0 +1,765 @@
+; ======================================================================
+; keywords.def - THE language keyword authority.
+;
+; The IDE's Language Reference (HelpViewer.pbi) is GENERATED from this
+; file, so this file is the only place a keyword needs describing and
+; the reference can never drift away from it.
+;
+; FORMAT
+;   @KEYWORD <name>      starts a block
+;   @DOC     <text>      one description; continuation lines that start
+;                        with neither '@' nor ';' are appended to it
+;   @EXAMPLE <code>      a line of real, compilable source. REPEAT the
+;                        directive for a multi-line snippet - the lines
+;                        are shown in order, in a code block, exactly as
+;                        written here (leading spaces are preserved).
+;
+; RULES FOR @EXAMPLE (asked for by a tester who could not tell from the
+; reference where parentheses, quotes and commas were required):
+;   - it must be code that actually compiles, not pseudo-code;
+;   - show the punctuation: brackets, quotes, commas, the '\' of a field;
+;   - if a keyword is NOT implemented, say so in @DOC and still give the
+;     syntax, so a reader can recognise it in someone else's source.
+;
+; WHERE A KEYWORD WORKS is measured, not guessed - see the capability
+; matrix in HelpViewer.pbi (HelpArchCapabilityHTML) and the note on how
+; it was measured. Anything marked "not implemented" below was verified
+; by compiling it for every target.
+; ======================================================================
+
+; ======================================================================
+; STANDARD COMPILER KEYWORDS
+; ======================================================================
+
+@KEYWORD Print
+@DOC Prints its argument. THE COMPILER CHOOSES THE FORMATTER FROM THE ARGUMENT'S TYPE, so one statement handles every kind of value - Print("text"), Print(count), Print(someStringVar) all work and none of them needs a different spelling. There is no separate PrintDec/PrintHex/PrintStr to pick between. The ROUTER is on every backend; before 2026-07-31 the routing existed only on the 8-bit backends and Print on the ARM targets took a string pointer and nothing else, so Print(42) walked address 42 as if it were text. ON THE AVR IT WORKS IN A BARE FILE. ON THE THREE ARM TARGETS IT DOES NOT - the formatters live in a library, and a program that only writes Print(x) is refused at compile time with a message naming the file to include. For the Pico that is RP2040/Lib/string_out_uart.pico (with clocks, timer, uart and safety beneath it) or RP2040/Lib/string_out.pico when the output is the USB CDC port, and for the Uno R4 it is RA4M1AndRelated/Lib/string_out.unor4 over gpio, timer, safety and usb_cdc. The refusal is deliberate: the two sinks need different hardware brought up, and guessing which one you meant would silently print into a peripheral you never configured. Print does NOT end the line and, on the USB targets, does not flush - so a line can be assembled in pieces without paying for a packet per fragment. Use PrintN for the last piece. REDIRECTING IT: on the AVR, declaring a procedure called PrintChar(c) switches the whole router to the sink_* formatters, so every string, number and newline goes to your procedure instead of the UART - an SPI display, a bit-banged pin, a capture buffer. Include Atmel328pAndRelated/Lib/print_sink.avrb for those formatters. Declare nothing and the serial path is used exactly as before. A direct serial_print(...) call is deliberately never redirected, because naming the serial routine is a request for the UART. NEGATIVE 32-BIT VALUES: fixed 2026-08-03. A .l is a SIGNED type, but the 32-bit formatter printed the magnitude only, so 'Global a.l = -1 : PrintN(a)' came out as 4294967295 while the same -1 in a .w or a .b printed correctly. The 16-bit path gets its minus sign from the code generator, which holds the value in a register; the 32-bit path is handed an ADDRESS, so the sign had to be emitted where the four bytes are first read, and was not. There is no unsigned 32-bit type here - .a and .u are the only unsigned ones and both are narrower - so nothing was gained by the old behaviour. Checked at the boundaries: 0, 1, 65536, 100000, 2147483647, -2147483648 and -1 all print correctly now.
+@EXAMPLE Print("count = ")
+@EXAMPLE Print(total)
+@EXAMPLE Global big.l = -12345
+@EXAMPLE PrintN(big)              ; -12345, not 4294954951
+
+@KEYWORD PrintN
+@DOC Print followed by a line ending, and on the USB targets it FLUSHES. The flush is not a nicety: USB CDC moves data one packet at a time, so a program that prints a short line and then idles produces NOTHING AT ALL until something forces the packet out - a failure indistinguishable from a board that crashed on its first instruction. Ending a line is the natural commit point, so PrintN is where it happens. Written with no argument at all - PrintN() - it emits a blank line. Both CR and LF are sent, because the usual reader is a terminal.
+@EXAMPLE PrintN("done")
+@EXAMPLE PrintN(total)
+@EXAMPLE PrintN()
+
+; flash_read_byte lived here until 2026-08-01 and should not have. It is an
+; INTRINSIC, not a keyword - the parser has no Case for it - and listing it
+; here reserved the name, so no library could ever declare a procedure called
+; flash_read_byte. That is the same trap that broke Lib/string.avrb when Len,
+; Left and Mid were added here for documentation (749bf3f, undone in f78aa37).
+; Its documentation now lives with the intrinsic, in every AVR part file.
+
+@KEYWORD #CRLF$
+@DOC The two-character line ending, carriage return then line feed. A trailing '$' on a name means it is a STRING, and these are the built-in ones: #CRLF$, #LF$, #CR$, #TAB$ and #EMPTY$. Added 2026-07-31 - before that they did not exist at all, and writing one failed in the LEXER with "'$' with no hexadecimal digits", an error naming a hex number on a line containing none. Both characters rather than just LF, because the usual reader is a terminal on the CDC port and the ones this project is tested against want the pair. There is deliberately NO #DQUOTE$: the string table has no escape for a quote, so it could not survive the round trip - use Chr(34).
+@EXAMPLE Print(#CRLF$)
+
+@KEYWORD #LF$
+@DOC A single line feed, character 10. See #CRLF$ for the full set of built-in string constants.
+@EXAMPLE Print(#LF$)
+
+@KEYWORD #CR$
+@DOC A single carriage return, character 13. See #CRLF$.
+@EXAMPLE Print(#CR$)
+
+@KEYWORD #TAB$
+@DOC A single tab, character 9. See #CRLF$.
+@EXAMPLE Print(#TAB$)
+
+@KEYWORD #EMPTY$
+@DOC The empty string. Useful where a string is required but nothing should be emitted. See #CRLF$.
+@EXAMPLE Print(#EMPTY$)
+
+@KEYWORD EnableFixedPoint
+@DOC Chooses the fixed-point precision this program uses. It sets the WIDTH OF THE .fx TYPE ITSELF - 2 bytes for EnableFixedPoint(8,8), 4 for (16,16), 8 for (32,32) or a bare EnableFixedPoint - scales fractional literals to that format, and selects which multiply and divide the backend emits. ONLY THE TIER YOU CHOOSE IS COMPILED IN, on both counts: the maths library picks its code from your choice and the rest is stripped before code generation, and the built-in .fx arithmetic is emitted at that width and no other. A Q8.8 program costs about a fifteenth of the flash a Q32.32 one does, which is what makes usage predictable on a 32 KB part. CORRECTED 2026-07-31: until then the width reached only the maths library - the .fx type was hardwired to 8 bytes in every backend, so a program that asked for Q8.8 and used .fx silently got the Q32.32 machinery, with the compiler having accepted the choice it then ignored. Any other pair of widths is refused by name - only Q8.8, Q16.16 and Q32.32 exist, and EnableFixedPoint(24,8) says so rather than rounding to something near it. Put it on its own line ABOVE any XIncludeFile, because includes are spliced in before this is read. THE .fx TYPE IS AVR-ONLY. Corrected 2026-08-05: this entry claimed all seven 8-bit backends and was measurably wrong - HC11, 6809, 8080, Z80, 6502 and 8051 all refuse a .fx declaration by name ("this backend has no fixed-point type"), and so do all three ARM targets. The pragma itself is accepted anywhere, because it only records a choice; it is the declaration that is refused. Scale to integers yourself on those parts, or build for the AVR.
+@EXAMPLE EnableFixedPoint(16, 16)
+@EXAMPLE Define ratio.fx = 1.5
+
+@KEYWORD DisableFixedPoint
+@DOC Turns off the default fixed-point tagging that EnableFixedPoint switched on, so fractional literals after this line are no longer scaled to the .fx format. Takes no arguments. It does not remove the .fx type or change any declaration already made - it changes only what an untyped literal like 1.5 means from here on. The usual program has one Enable line at the top and never needs this.
+@EXAMPLE DisableFixedPoint
+
+@KEYWORD DisableCodeStripping
+@DOC Emits every procedure, whether the program can reach it or not. Takes no arguments. The DEFAULT, since 2026-07-31 on the AVR backends, is the opposite: a procedure nothing calls is not emitted, and costs no flash and no SRAM - so including a library you barely use costs only the part you use. Measured on the full five-file Wiring surface plus a bare blink: 19320 bytes before, 1044 after. Reachability starts at your file-scope code and follows every call, including the ones the compiler generates for you, so the formatters behind a Print are kept even though your source never names them. Interrupt handlers and Naked procedures are always kept, because hardware reaches those and nothing in the program mentions them by name. You want this keyword in two situations: to A/B a program that misbehaved after a library grew, and for a procedure reached by something the compiler cannot see, such as a hand-built jump table whose entries are computed rather than written. For that second case, marking the one procedure Naked is the narrower fix. If the stripper is ever wrong the assembler refuses the build by name rather than branching to address 0, so the failure is loud. Put it on its own line ABOVE any XIncludeFile. EnableCodeStripping turns stripping back on.
+@EXAMPLE DisableCodeStripping
+
+@KEYWORD EnableCodeStripping
+@DOC Removes procedures the program cannot reach, so an include costs only what you use. This is the DEFAULT on the AVR backends; the keyword exists to undo a DisableCodeStripping earlier in the same source. Takes no arguments. See DisableCodeStripping for what is always kept, and why.
+@EXAMPLE EnableCodeStripping
+
+@KEYWORD EnableFloatingPoint
+@DOC Chooses the floating-point precision this program uses, and makes fractional literals default to it. Written bare it means IEEE-754 binary32 (.f), which is what it has always meant; EnableFloatingPoint(16) selects binary16 half precision instead, and EnableFloatingPoint(32) is the same as bare. Only the width you choose is compiled in. YOU ALMOST CERTAINLY WANT THIS LINE if your program contains any fractional literal at all: without it a literal like 2.0 is compiled as fixed-point, and mixing that with a .f variable is a compile error that names this keyword as the fix. Put it on its own line ABOVE any XIncludeFile. Verified on AVR (software float, bit-exact) and accepted on all three ARM targets. The six classic 8-bit backends (HC11, 6809, 8080, Z80, 6502, 8051) refuse .f with a loud error - see the chip reference.
+@EXAMPLE EnableFloatingPoint
+@EXAMPLE Define x.f = 3.5
+
+@KEYWORD DisableFloatingPoint
+@DOC Turns off the default floating-point tagging that EnableFloatingPoint switched on, so fractional literals after this line go back to being fixed-point. Takes no arguments. It does NOT remove the .f type or uncompile anything already emitted - it changes only what an untyped literal like 2.0 means from here on. You need it very rarely: the usual shape is one Enable line at the top of the file and nothing else.
+@EXAMPLE DisableFloatingPoint
+
+@KEYWORD EnableDecimal
+@DOC Turns on the .dec type - BASE-10 decimal, an int64 significand scaled by 10^4, eight bytes. Added to this reference 2026-08-05; it has worked for longer and was simply never written down. USE IT FOR MONEY AND FOR ANYTHING ELSE WHERE A ROUNDING ERROR IS A BUG RATHER THAN A NUISANCE: 0.1 + 0.2 is exactly 0.3 here, which it is not in .f, because the value is held in powers of ten rather than powers of two. It is the slowest arithmetic in the compiler - every operation is a 64-bit integer operation plus scaling - so reach for it when exactness is the point, not for general maths. THE AVR IS THE ONLY BACKEND THAT HAS IT. The six classic 8-bit backends and all three ARM targets refuse a .dec declaration by name, and the message says to store pence rather than pounds instead. Like the other precision pragmas it goes on its own line ABOVE any XIncludeFile, and it publishes #PM_DECIMAL_ENABLED so a library can select its own code from it.
+@EXAMPLE EnableDecimal
+@EXAMPLE Global price.dec = 19.99
+@EXAMPLE price = price + 0.01
+
+@KEYWORD DisableDecimal
+@DOC Turns off the decimal tagging that EnableDecimal switched on. Takes no arguments. See EnableDecimal; the same note applies as for DisableFloatingPoint - it changes what an untyped fractional literal means from this line on, and nothing else.
+@EXAMPLE DisableDecimal
+
+@KEYWORD XIncludeFile
+@DOC Splices another source file in at this point, ONCE, however many times it is named. Added to this reference 2026-08-05; it is the single most-used directive in the language and had no entry at all, which is how a beginner ends up unable to print on a Pico. The path is a STRING IN QUOTES and is relative to the file doing the including, so a library beside your source is just "wiring.avrb" and one a directory up is "../Lib/wiring.avrb". THE INCLUDE IS TEXTUAL AND HAPPENS FIRST, before the pragmas and before the parser - which is the whole reason EnableFloatingPoint, EnableFixedPoint, EnableDecimal and the code-stripping pragmas must sit ABOVE the includes in your file. Put one below and the library has already been read with the wrong precision. Use IncludeFile if you genuinely want the same file spliced in more than once; you almost never do.
+@EXAMPLE EnableFloatingPoint                              ; pragmas FIRST
+@EXAMPLE XIncludeFile "Atmel328pAndRelated/Lib/gpio.avrb"
+@EXAMPLE XIncludeFile "Atmel328pAndRelated/Lib/string.avrb"
+
+@KEYWORD IncludeFile
+@DOC The same as XIncludeFile except that it does NOT guard against being included twice - name the same file from two places and its text is spliced in twice, which normally means every procedure in it is declared twice and the build fails. XIncludeFile is what you want in almost every case; this exists for the rare file that is meant to be pasted repeatedly, such as a table generated between two markers.
+@EXAMPLE IncludeFile "Atmel328pAndRelated/Lib/gpio.avrb"
+
+@KEYWORD Procedure
+@DOC Defines the beginning of a reusable subroutine block. Parentheses are ALWAYS required, even with no parameters. A return type is written as a suffix on the keyword itself; parameters are comma-separated and each carries its own type suffix. There is no separate "Function" keyword - a Procedure with a return type IS the function, and ProcedureReturn hands the value back. PARAMETERS GO IN ONE DIRECTION ONLY. They are passed BY VALUE: the procedure gets a copy, and assigning to a parameter changes only that copy, never the caller's variable. A parameter is therefore not a way to get a result back out. AND A PARAMETER SHADOWS A GLOBAL OF THE SAME NAME - inside the procedure the name means the parameter, so `Global ByteB` plus `Procedure P(ByteB.a)` gives you two different variables, and writing to ByteB inside P leaves the Global untouched. That combination is the usual reason a value seems to vanish on the way out; it was reported from the forum (#116) after costing someone an afternoon. To hand a result back, use ProcedureReturn. To hand back more than one, assign to Globals that are NOT named in the parameter list. Verified on hardware - see Examples/ATmega328P/ProcedureReturnTest.avr328p, 5/5 on an Uno.
+@EXAMPLE Procedure.w AddTwo(a.w, b.w)
+@EXAMPLE   ProcedureReturn a + b
+@EXAMPLE EndProcedure
+@EXAMPLE Global total.w
+@EXAMPLE total = AddTwo(37, 5)
+@EXAMPLE ; The trap: the parameter shadows the Global, so the Global never changes.
+@EXAMPLE Global ByteB.a
+@EXAMPLE Procedure WrongWay(ByteB.a)
+@EXAMPLE   ByteB = 42
+@EXAMPLE EndProcedure
+
+@KEYWORD EndProcedure
+@DOC Closes an active Procedure block. Takes no arguments.
+@EXAMPLE EndProcedure
+
+@KEYWORD ProcedureReturn
+@DOC Exits the current Procedure immediately and optionally returns a value. The value is an expression with no parentheses of its own. Note this is NOT the same keyword as Return, which belongs to Gosub. THIS IS HOW A PROCEDURE GIVES A VALUE BACK - writing to a parameter does not, because parameters are copies. The Procedure's own type suffix declares what comes back (Procedure.a returns a byte, Procedure.w a word, and so on; with no suffix it is .w). The call can be used anywhere an expression can, not only on the right of an assignment.
+@EXAMPLE ProcedureReturn a + b
+@EXAMPLE ProcedureReturn
+@EXAMPLE ; the returned value used directly in a larger expression
+@EXAMPLE Global total.w
+@EXAMPLE total = AddTwo(1, 2) + AddTwo(3, 4)
+
+@KEYWORD Global
+@DOC Declares a variable that is accessible globally across the entire program. Write it outside any Procedure. The type suffix goes on the name and the types are the ones listed under Define, including the .s{n} string with its 1..255 size limit; an initial value is optional, and one name per line. A Global IS visible inside a Procedure and can be assigned there - that is a normal way to hand back a second or third result. BUT ONLY IF NO PARAMETER HAS THE SAME NAME: a parameter shadows a Global for the whole body, so the assignment then lands on the parameter's copy and the Global keeps its old value. If you mean to write to the Global, do not also name it in the parameter list. See Procedure.
+@EXAMPLE Global counter.w = 0
+@EXAMPLE ; a second result, handed back through a Global the parameters do not shadow
+@EXAMPLE Global sum.w
+@EXAMPLE Procedure AddInto(a.w, b.w)
+@EXAMPLE   sum = a + b
+@EXAMPLE EndProcedure
+
+@KEYWORD Define
+@DOC Declares a variable. Written inside a Procedure it is local to it; written at file scope it is a file-scope variable. Without a type suffix the variable is a native integer (.i) - 2 bytes on the 8-bit targets, 4 on ARM - so write the suffix whenever the width matters. ONE NAME PER LINE: 'Define a.w = 1, b.w = 2' is refused, because the comma form would have to guess whether the type carries over to the second name. THE TYPES, with their sizes in bytes: .b signed 1, .a UNSIGNED 1, .c character 1 (signed, the same width as .b - a different name for code that means a character), .w signed 2, .u UNSIGNED 2, .l signed 4, .n UNSIGNED 4 (0..4294967295 - pi4/rp2350rv/rp2040/rp2350/ra4m1/sam3x ONLY, refused with an explanation on the seven 8-bit targets, which have no unsigned 32-bit compare), .f float 4 (needs EnableFloatingPoint), .q signed 8, .x UNSIGNED 8 (0..18446744073709551615 - pi4 ONLY, because pi4 is the only 64-bit target; refused with an explanation everywhere else, where there is no 64-bit register, no 64-bit unsigned compare and no unsigned 64-bit divide), .i native 2 or 4 depending on the target, .fx fixed-point 2/4/8 depending on EnableFixedPoint, .dec decimal 8 (AVR only, needs EnableDecimal), .d double 8 (refused on the AVR - use .f or .fx), .s a string. The unsigned ladder is complete as of 2026-08-25 - .a, .u, .n, .x - but the wide two are target-gated, so read their entries before reaching for one. STRINGS ARE FIXED-CAPACITY BUFFERS, not handles: '.s' on its own reserves 32 bytes, and '.s{n}' reserves n. The declared size must be 1 to 255 and anything outside that is refused at the declaration on every target - the string runtime keeps its length in a single byte, so a 256-byte string could not record its own length. Assigning one string to another copies the characters.
+@EXAMPLE Define i.w = 0
+@EXAMPLE Define flags.a = 255
+@EXAMPLE Define name.s{16}       ; 16 bytes; the size must be 1..255
+@EXAMPLE Define big.l = 100000
+
+@KEYWORD Protected
+@DOC Declares a variable local to the enclosing Procedure, with the same syntax and the same type suffixes as Define - see Define for the full list of types and for the string size rule. Its value does NOT survive the call; use Static for one that does. It also SHADOWS a global of the same name for the whole body, exactly as a parameter does, so if you meant to write to the global do not redeclare its name here. Use it when you want to be explicit that a name is local, which matters most in a long procedure where a reader cannot see the whole body at once.
+@EXAMPLE Procedure.w Scale(v.w)
+@EXAMPLE   Protected temp.w = 0
+@EXAMPLE   temp = v * 2
+@EXAMPLE   ProcedureReturn temp
+@EXAMPLE EndProcedure
+
+@KEYWORD Dim
+@DOC Declares a fixed-size array. The size goes in SQUARE brackets or in ROUND brackets - the two spellings mean exactly the same thing, and indexing accepts either one whichever way the array was declared, so "Dim a.w[8]" can be read as a(3) and "Dim a.w(8)" as a[3]. The size is the element COUNT and indices run 0..count-1; an out-of-range constant index is a compile-time error. Arrays are fixed-size once declared - there is no heap. Round brackets are resolved the way the host language resolves them: "name(i)" is an ARRAY ELEMENT when name is a declared array, and a procedure or intrinsic call otherwise. A name that is both an array and a procedure is refused rather than guessed at, and square brackets can never be ambiguous, so they stay the spelling to reach for when a name is doing something clever. IMPLEMENTED ON ALL TEN BACKENDS as of 2026-08-03; until that day the six classic 8-bit backends refused them. That refusal turned out to be standing on top of a silent fault - every slot was two bytes whatever it held, so "Dim a.w[4]" reserved TWO bytes and every element past the first landed on the next variable. Removing the guard without finding that would have replaced a loud refusal with quiet memory corruption on six backends at once. The size may be a number, a #constant, or an expression built from those and SizeOf/OffsetOf - anything that does not reduce to a constant is refused, because a size that silently became zero is the same corruption again. An ARRAY OF STRINGS is refused in either spelling - "Dim s.s[4]" and "Dim s.s(4)" give the same error. ONLY A Dim DECLARES SOMETHING AN INDEX CAN WALK, and since 2026-09-05 indexing anything else is REFUSED rather than compiled (bug tracker tid 606). "buf[offset]" where buf is a plain scalar, or a pointer parameter holding an address, used to build cleanly and read the storage of buf itself and then whatever the allocator had placed after it - a plausible spelling that answers numbers unrelated to the data. Both subscript spellings are covered, because the parser builds the same node for a[i] and a(i). The refusal names the variable and its type and gives the two repairs: declare it with Dim and a size known at compile time, or - if the name really holds an ADDRESS - read through it with PeekA(name + offset), the bare name being the address. An indirect CALL through a declared pointer, "*p" called as "p(args)", is a supported feature and is deliberately left alone.
+@EXAMPLE Global Dim grid.w[16]
+@EXAMPLE Global Dim pool.a[SizeOf(Ent) * 8]
+@EXAMPLE Dim tbl.w[8]
+@EXAMPLE tbl[0] = 100
+@EXAMPLE Define first.w = tbl[0]
+@EXAMPLE Dim rtbl.w(8)
+@EXAMPLE rtbl(0) = 100
+@EXAMPLE Define alsoFirst.w = rtbl(0)
+
+@KEYWORD If
+@DOC Begins a conditional block that executes if the given expression is true. No parentheses are needed around the condition, and there is no 'Then'. Close every If with EndIf.
+@EXAMPLE If count > 10
+@EXAMPLE   count = 0
+@EXAMPLE EndIf
+
+@KEYWORD ElseIf
+@DOC Evaluates an alternative condition if the preceding If/ElseIf blocks were false.
+@EXAMPLE If x > 10
+@EXAMPLE   y = 1
+@EXAMPLE ElseIf x > 5
+@EXAMPLE   y = 2
+@EXAMPLE EndIf
+
+@KEYWORD Else
+@DOC Executes a block of code if all preceding If/ElseIf conditions were false. Takes no condition.
+@EXAMPLE If x > 10
+@EXAMPLE   y = 1
+@EXAMPLE Else
+@EXAMPLE   y = 0
+@EXAMPLE EndIf
+
+@KEYWORD EndIf
+@DOC Closes an active If conditional block. Takes no arguments.
+@EXAMPLE EndIf
+
+@KEYWORD Select
+@DOC Begins a block that evaluates a single expression against multiple potential matches. The expression follows the keyword directly, with no parentheses. THERE IS NO FALL-THROUGH: the matching branch runs and control then leaves the block, so no Break is needed at the end of a Case and writing one would break the enclosing loop instead. The expression is evaluated ONCE. ONE VALUE PER CASE - 'Case 1, 2, 3' and 'Case 1 To 5' are refused by name; see Case. Default, if present, must come LAST. Close the block with EndSelect.
+@EXAMPLE Select mode
+@EXAMPLE   Case 1
+@EXAMPLE     x = 10
+@EXAMPLE   Default
+@EXAMPLE     x = 0
+@EXAMPLE EndSelect
+
+@KEYWORD Case
+@DOC Specifies a matching value within a Select block. The value follows the keyword directly; the statements belonging to it run until the next Case, Default or EndSelect, and then leave the block - there is no fall-through and no Break to write. ONE VALUE ONLY. 'Case 1, 2, 3' and 'Case 1 To 5' are both refused, by name, telling you to write each value as its own branch - so the comma list you may be used to from other BASICs is not available here. That is worth knowing before you design a wide dispatch: several values sharing one action means several Case branches, or an If with Or. Note the contrast with CompilerCase, which DOES take a comma list, because that one is resolved at compile time and costs nothing at run time.
+@EXAMPLE Case 2
+@EXAMPLE   x = 20
+
+@KEYWORD Default
+@DOC Executes if no preceding Case statements matched the Select expression. Takes no value. IT MUST BE THE LAST BRANCH - a Case written after a Default is refused, because the block is already closed by then. It is optional: a Select whose value matches nothing and has no Default simply does nothing at all, which is a quiet outcome worth a Default even when you expect every value to be covered.
+@EXAMPLE Default
+@EXAMPLE   x = 0
+
+@KEYWORD EndSelect
+@DOC Closes an active Select block. Takes no arguments.
+@EXAMPLE EndSelect
+
+@KEYWORD While
+@DOC Begins a loop that executes as long as the condition evaluates to true. The condition is tested BEFORE the first pass, so the body may run zero times. No parentheses.
+@EXAMPLE While i < 10
+@EXAMPLE   i = i + 1
+@EXAMPLE Wend
+
+@KEYWORD Wend
+@DOC Closes an active While loop. Takes no arguments.
+@EXAMPLE Wend
+
+@KEYWORD Repeat
+@DOC Begins a loop that executes at least once and continues until a condition is met. The test is at the BOTTOM, so the body always runs at least one pass.
+@EXAMPLE Repeat
+@EXAMPLE   i = i + 1
+@EXAMPLE Until i > 5
+
+@KEYWORD Until
+@DOC Closes a Repeat loop and evaluates the exit condition. The loop ends when the condition becomes TRUE - the opposite sense to While.
+@EXAMPLE Until i > 5
+
+@KEYWORD For
+@DOC Begins a loop that iterates a variable from a starting value to an ending target. The bounds are INCLUSIVE, so 0 To 7 runs eight times. Close with Next. THE TEST HAPPENS BEFORE THE BODY, so an empty range runs ZERO times: For i = 5 To 4 does not execute the body at all, and neither does For i = 5 To n when n holds 4. That matters when the bounds are variables and a run can legitimately have nothing to do. On a normal exit the counter is left one Step PAST the limit - after For i = 1 To 5 the counter is 6. THE COUNTER IS AN ORDINARY VARIABLE, not a copy stacked at loop entry the way Commodore BASIC did it: assigning to it inside the body really does change the loop, so adding 1 to it in a 1 To 10 loop gives five iterations, not ten. The LIMIT is re-read every time round as well, so changing the variable it came from shortens or lengthens the loop in progress. Both behaviours are deliberate and measured - see Examples/ATmega328P/ForLoopEdgeTest.avr328p, which pins fourteen of these edges on hardware.
+@EXAMPLE For i = 0 To 7
+@EXAMPLE   total = total + i
+@EXAMPLE Next
+@EXAMPLE ; empty range: the body never runs
+@EXAMPLE For i = 5 To 4
+@EXAMPLE   total = total + 1
+@EXAMPLE Next
+
+@KEYWORD To
+@DOC Specifies the target ending value in a For loop. The value is INCLUDED, so 0 To 7 runs eight times, not seven. It may be a variable or an expression rather than a literal, and it is re-read on every pass - see For. It is also the word that separates the two halves of the loop header; it has no meaning anywhere else, and in particular a Select Case does not accept 'Case 1 To 5'.
+@EXAMPLE For i = 1 To 10
+
+@KEYWORD Step
+@DOC Specifies the increment or decrement amount for a For loop variable. Written after the To value; omit it for a step of 1. There is no Downto keyword - A NEGATIVE STEP IS HOW YOU COUNT DOWN, and the loop then runs while the counter is still at or above the limit. For i = 10 To 0 Step -2 runs six times. The step does not have to divide the range evenly; the loop simply stops on the first value past the limit, so For i = 0 To 9 Step 2 runs five times and leaves the counter at 10. The step may be a VARIABLE rather than a literal, and a variable holding a negative value still counts down correctly - the direction is then decided at run time, which costs two extra comparisons per iteration. A literal step, which is almost always what you write, pays nothing for that. A step of 0 never reaches the limit and loops forever; nothing rejects it, so do not compute one by accident. Bounds and direction are measured in Examples/ATmega328P/ForLoopEdgeTest.avr328p.
+@EXAMPLE For i = 0 To 10 Step 2
+@EXAMPLE ; counting down: a negative Step, no Downto keyword
+@EXAMPLE For i = 10 To 0 Step -2
+@EXAMPLE   total = total + i
+@EXAMPLE Next
+
+@KEYWORD Next
+@DOC Closes an active For loop, adds the Step to the counter and jumps back to the test. Takes no arguments: 'Next i' is not the spelling here, just 'Next' on its own. It is also where a Continue lands, which is why a Continue in a For still advances the counter and a Continue in a While may not.
+@EXAMPLE Next
+
+@KEYWORD Break
+@DOC Exits the current loop immediately, bypassing any remaining iterations. Takes no arguments. IT LEAVES THE INNERMOST LOOP ONLY - there is no 'Break 2' and no label to name, so escaping two nested loops takes a flag you test in the outer one, or a Goto to a label after it. It works in For, While and Repeat alike. Note that a Select needs no Break: its branches do not fall through, and a Break written inside one would leave the LOOP that Select sits in, which is rarely what was meant.
+@EXAMPLE If done = 1
+@EXAMPLE   Break
+@EXAMPLE EndIf
+
+@KEYWORD enableinterrupts
+@DOC Enables global hardware interrupts (SEI on the AVR, CPSIE I on ARM). A statement on its own line, with no parentheses. It flips the GLOBAL enable only - each peripheral still has its own mask bit, so this on its own makes nothing fire. The usual order is: set the peripheral up, enable its own interrupt, then call this once. Interrupts are off when a program starts, so a handler that never runs is very often just a missing EnableInterrupts.
+@EXAMPLE EnableInterrupts
+
+@KEYWORD disableinterrupts
+@DOC Disables global hardware interrupts (CLI on the AVR, CPSID I on ARM). A statement on its own line, with no parentheses. Use it to bracket a read of something an interrupt also writes - a multi-byte counter read half-updated is a value that never existed. KEEP THE BRACKET SHORT: everything between the two lines is time the machine cannot respond, and a long one loses characters on a serial port or misses a timer tick. Copy the value out, re-enable, then work on the copy.
+@EXAMPLE DisableInterrupts
+
+@KEYWORD Nop
+@DOC Emits exactly ONE no-operation instruction - the shortest thing the part can execute - and nothing else. A statement on its own line, with no parentheses; an empty pair is accepted too. Before this existed (forum tid 146) the only way to write a no-op was an ASM block containing a single nop, which for many programs was the ONLY reason they contained any inline assembly at all. Nop is what you reach for when a signal has to be held steady for a known handful of cycles, when a bit-banged bus needs one more beat of setup, or when a patch needs somewhere to land. It is NOT a delay: for anything measured in microseconds use delay_us, which works the length out from the board's clock instead of leaving you to count instructions again every time the crystal changes. WHAT IT COSTS, per family, in clock cycles - AND ON THE ARM CORES THAT IS NOT A FIXED NUMBER, which is the single most important thing on this page. AVR (both the classic AVRe+ and the AVRxt core of the AVR-DD parts) 1, from the part's own instruction table. RISC-V Hazard3 1 - it assembles to addi x0, x0, 0, an ordinary ALU instruction that has to execute, so this one is a real number. 68HC11 2; Motorola 6809 2; MOS 6502 2; Zilog Z80 4 T-states; Intel 8080 4 states; Intel 8051 one machine cycle, which is 12 clocks on this core. NOW THE ARM CORES. The architecture defines NOP as a HINT and says the processor may remove it from the pipeline before it ever reaches the execution stage, so what it costs is a property of the core and not of the instruction. Cortex-M33: 1 clock when the core issues it, and AS LITTLE AS HALF A CLOCK when it does not - measured on an RP2350 at 150 MHz on 2026-09-05, 128 no-ops in 78 cycles and 256 in 144, which is 0.52 each, identical in every warm round of every run. (An inline ladder caught it first at 71 and 136, 0.508; the figure published here is the same measurement taken through a procedure call, which cancels in a marginal, and it is the one the compiler's own cycle gate reads.) That core fetches two halfwords per clock and discards both. Cortex-M0+: 1 clock, and that one is MEASURED - a Pico W at 133 MHz, 128 no-ops in 145 cycles and 256 in 275, which is 1.02 each, so this core really does issue them. Cortex-M3 and Cortex-M4: 1 clock, PUBLISHED AND UNMEASURED - neither core has been put on a cycle counter here, the same architectural wording applies to both, and the figure is printed as what the document says rather than as something anybody has seen. SO DO NOT COUNT NO-OPS TO MAKE A LENGTH ON AN ARM CORE. Write delay_us, which is built out of an instruction that cannot be discarded and states its own accuracy; a run of no-ops is a hint that the core is free to ignore. On AArch64 - the Raspberry Pi 4 and the Arduino UNO Q - a Cortex-A72 is out-of-order and superscalar, so a no-op costs no fixed number of cycles at all: it is emitted, it retires, and how long that took is not a question the part answers. Use the generic timer, or delay_us, if you need a length. Nop is a barrier to the optimiser, so it is never folded away, never merged with a neighbour and never moved - which is the whole point of writing one.
+@EXAMPLE Nop
+@EXAMPLE Nop()
+
+@KEYWORD delay_us
+@DOC Busy-waits for a whole number of MICROSECONDS, 1 to 65535, worked out at compile time from the selected board's ClockSpeed and this part's own instruction timings - so the same source delays the same length on a 1 MHz part and a 133 MHz one, and re-crystalling a board does not silently change every timing in the program. Added for forum tid 147, where the two workarounds in real test programs were a dummy loop reading a pin purely to burn time and a procedure holding 71 nop instructions in one asm block. THE CONTRACT: delay_us NEVER RETURNS EARLY. It waits at least the microseconds asked for, and at most that plus the time of one Nop on this part - because a wait that is slightly long is invisible while a wait that is slightly short is a fault that shows up on one board in ten. In practice the bound is tighter than that: the leftover cycles are paid with an instruction that costs exactly one clock, so the emitted sequence is the requested cycle count and the only overshoot left is the sub-cycle rounding of microseconds into cycles. IT DID NOT USED TO BE. Until 2026-09-05 the leftover was paid in no-ops, and on a Cortex-M33 a no-op can cost half a clock or nothing at all, so every delay on that part landed two cycles SHORT - 13 nanoseconds, and the one direction this contract forbids. Measured on an RP2350; see the Nop entry for the ladder. Nothing in the toolchain could see it, because the published figure, the planner and the cycle gate were all reading the same table. Four departures from exact, all of them in the LONG direction and all listed in the Beginner's Guide's hardware chapter: on the 6502 a taken branch costs one extra cycle if the loop crosses a page boundary; on Cortex-M3 and Cortex-M4 ARM specifies the taken-branch refill as 1 to 3 cycles rather than a fixed number; on Cortex-M0+ and Cortex-M33 the first pass through the loop can be slower while the XIP cache fills; on Cortex-M0+ and Cortex-M33 the whole delay has been measured on silicon and lands on the plan (7 of 7 rows on a Pico W, and no row short on a Pico 2 W); and on AArch64 there is no cycle counting at all - the Raspberry Pi 4 and the UNO Q read the architected generic timer (CNTPCT_EL0 against CNTFRQ_EL0), which is the most accurate of the lot and the only one that does not depend on the board file being right about the clock. THE ARGUMENT MUST BE A COMPILE-TIME CONSTANT - a literal or a declared constant. A value that only exists at run time is refused with code PM1004, because every guarantee above is arithmetic done while compiling, and a runtime number can be checked against none of it; write your own loop around a constant delay_us, or use delay_ms, which does take a variable. Four more refusals, each naming what to do instead: PM1001 when the delay is shorter than the part can express (one instruction already takes longer), PM1002 when it is longer than one loop can count or outside 1..65535, PM1003 when no board clock is known, and PM1011 when the compiler's own cycle table for that part would pay the leftover with an instruction that can cost less than a whole clock - a defect in the toolchain rather than in your program, refused rather than emitted short. The delay clobbers the condition flags and no registers - whatever it borrows, it saves and restores.
+@EXAMPLE delay_us(50)
+@EXAMPLE #SETUP_US = 40
+@EXAMPLE delay_us(#SETUP_US)
+
+@KEYWORD org
+@DOC Sets the origin address the compiled binary is laid out from. The address is a literal, normally hexadecimal with a leading '$' - '$8000', not '0x8000'. It matters on the classic 8-bit parts, where you are deciding where in a memory map the image sits; on the AVR and the ARM targets the layout is fixed by the part, so you will not normally write one. Getting it wrong does not fail loudly at compile time: the image is simply built for an address it will never be loaded at, so check it against the map file.
+@EXAMPLE org $8000
+
+@KEYWORD LoadAddress
+@DOC States the address this image is LINKED for - where it will actually be loaded and run. The address is a literal, normally hexadecimal with a leading '$' ('$200000'); '0x200000' and plain decimal are accepted too. This is NOT org. Org on an ARM target moves the assembler's cursor forward inside an image that has already been linked somewhere; LoadAddress decides where that somewhere is, and the emitter materialises absolute addresses from it, so the image runs at this address and nowhere else. It is legal ONLY where placement is genuinely a decision - today the Raspberry Pi 4 and the Arduino UNO Q, whose images are placed by firmware, by a loader or by UEFI. On every fixed-layout part it is a compile error saying that the part decides its own layout, because there the answer is a silicon fact and a source that named one would either repeat it or contradict it. Write it at most once; a second one is an error rather than a silent overwrite. The value is checked, not accepted on trust: it must be 4-byte aligned, clear of the firmware's spin table and of the peripheral apertures, and inside the part's address map, and a wrong one is refused with the reason. Its whole point is that the IDE has no command line - a source that says where it runs builds correctly from the IDE and from pmfc alike. If a --load-addr flag is also given and the two DISAGREE, the build stops and names both values; it never quietly picks one.
+@EXAMPLE LoadAddress $200000
+
+@KEYWORD BssAddress
+@DOC States where this image's VARIABLES go - the base of the zero-initialised data the startup code clears. Same literal forms as LoadAddress. Without it, BSS follows the image: the assembler measures where the code ends and places BSS on the next 64 KiB boundary after it, never below the load address plus 512 KiB. That is right for a program that owns the machine and wrong for one whose CODE has to live inside a window somebody else's numbers define - a monitor linked low, with more of its image going to variables than to instructions, has to put them somewhere else entirely. Legal only where placement is a decision (Raspberry Pi 4, Arduino UNO Q); a compile error on any fixed-layout part, which lays its BSS out for you. At most one per program. Checked, not trusted: 16-byte aligned, clear of the spin table and the peripheral apertures, inside the address map - and, once both regions have a size, refused loudly if the BSS would land inside the image or grow into it, naming both ranges. A --bss-addr flag that disagrees with this line stops the build and names both values.
+@EXAMPLE BssAddress $8200000
+
+@KEYWORD StackAddress
+@DOC States the initial stack TOP - the value loaded into the stack pointer before the first generated push. Same literal forms as LoadAddress. The stack grows DOWN from here, so the address itself is one past the highest byte the stack ever uses. It matters as soon as two images share a machine: a resident monitor and the payload it calls would otherwise both start their stacks at the same default, and the payload's first push lands in the middle of the monitor's live frame - nothing faults, the monitor simply does not survive its payload returning. Legal only where placement is a decision (Raspberry Pi 4, Arduino UNO Q); on every other part the initial stack pointer comes from the part's own reset behaviour and this is a compile error. At most one per program. Checked, not trusted: 16-byte alignment is architectural on AArch64, not a convention, so a misaligned value is refused rather than rounded, and a stack top that sits inside this image or inside its BSS is refused with both ranges named. A --stack-addr flag that disagrees with this line stops the build and names both values.
+@EXAMPLE StackAddress $8000000
+
+@KEYWORD DataSection
+@DOC Begins a block used for storing constant data in ROM. Only labels and Data statements may appear inside it. Read/Restore against a DataSection are implemented on the AVR backend AND all three ARM targets (RP2040, RP2350, RA4M1); the six classic 8-bit backends refuse them by name, saying that taking the address of a Data label needs flash-table reads they do not implement. That refusal also catches STRING LITERALS on those parts, because a literal is stored as a Data label and assigning one takes its address. Data.s places a string: each item is a FIXED 32-BYTE RECORD - the characters, a NUL terminator, then zero padding - so a Data.s entry costs 32 bytes of program memory whatever its length, which is what keeps a mixed table's offsets predictable. At most 31 characters; a longer literal is a compile error and is never truncated. The escapes are translated exactly as in a string literal. (Corrected 2026-07-31 - this said AVR-only, which was wrong.)
+@EXAMPLE DataSection
+@EXAMPLE   tbl:
+@EXAMPLE   Data.w 11, 22, 33
+@EXAMPLE EndDataSection
+
+@KEYWORD EndDataSection
+@DOC Closes an active DataSection block. Takes no arguments.
+@EXAMPLE EndDataSection
+
+@KEYWORD Data
+@DOC Defines constant data values within a DataSection. The type suffix goes on the keyword and values are comma-separated. EACH ELEMENT OCCUPIES ITS TYPE'S FULL WIDTH - Data.b one byte, Data.w two, Data.l four - so a Read of the same type steps correctly through the table. A RUN ENDS AT THE END OF ITS LINE, and there is NO continuation character - but you do not need one: write as many Data lines as you like under ONE label and the bytes land contiguously, in order, with blank lines and comments between them allowed. A single Restore of that label then reads straight through the lot, which is how you lay out a font a glyph to a line. Asked on the forum 2026-08-02; the leading underscore that gets tried is a desktop-BASIC habit and means nothing here, which the error now says out loud.
+@EXAMPLE Data.b 1, 2, 3
+@EXAMPLE Data.w 1000, 2000
+@EXAMPLE Data.a 0, 0, 6, 95, 6, 0, 0, 0
+@EXAMPLE Data.l 100000, 200000
+
+@KEYWORD asm
+@DOC Begins a block of raw, architecture-specific assembly. What you write is passed to that target's assembler UNCHANGED, so the block is not portable and a file containing one builds for exactly one CPU unless you guard it with CompilerIf. THE COMPILER CANNOT SEE INSIDE IT. The type checker, the width analysis and the register allocator all stop at the 'asm' line, so a block that clobbers a register the surrounding code was using produces a wrong answer with nothing to point at. That is the reason to prefer ordinary statements wherever they can express the same thing, and to keep a block that must exist as short as it can be. Verified on hardware on the AVR; on the other targets it assembles but has not been hardware-checked. Close it with endasm.
+@EXAMPLE asm
+@EXAMPLE   nop
+@EXAMPLE endasm
+
+@KEYWORD endasm
+@DOC Closes an active inline assembly block. Takes no arguments.
+@EXAMPLE endasm
+
+@KEYWORD Continue
+@DOC Skips the remaining code in the current loop iteration and starts the next one. Takes no arguments, and like Break it applies to the INNERMOST loop only. Where it jumps to depends on the loop: in a For it goes to the increment, so the counter still advances and the loop still ends - and in a While or Repeat it goes straight to the test, so whatever would have moved the loop along has been SKIPPED. That is the classic way to hang a program: a Continue above the line that increments a While counter loops for ever.
+@EXAMPLE If skip = 1
+@EXAMPLE   Continue
+@EXAMPLE EndIf
+
+@KEYWORD Structure
+@DOC Defines a custom, grouped data type composed of multiple fields. Fields are declared one per line with their own type suffix, and are reached with a BACKSLASH. IMPLEMENTED ON ALL TEN BACKENDS. Corrected 2026-08-05: this entry said the six classic 8-bit backends refused structures, and they no longer do - the same day's work that opened Dim to them opened this. Fields are packed with NO padding, so a field's offset is the running total of the sizes before it and OffsetOf simply reports that. A structure may not be named after a type suffix letter: 'Structure U' is refused by name, because .u is a type.
+@EXAMPLE Structure Point
+@EXAMPLE   x.w
+@EXAMPLE   y.w
+@EXAMPLE EndStructure
+@EXAMPLE Define p.Point
+@EXAMPLE p\x = 3
+
+@KEYWORD EndStructure
+@DOC Closes an active Structure block. Takes no arguments.
+@EXAMPLE EndStructure
+
+@KEYWORD Enumeration
+@DOC Begins a block of sequentially auto-assigned integer constants. Each name inside starts with '#' and takes the next value, BEGINNING AT 0. You may set one explicitly with '= value', and the numbering CONTINUES FROM THERE - so #A, #B = 10, #C makes #C eleven, not two. There is no start value or step on the Enumeration line itself: 'Enumeration 5 Step 2' is refused. The constants are resolved at compile time and cost nothing at run time; they are the right way to name the states of a machine or the entries of a table, and they can be used as a Dim size. Close with EndEnumeration.
+@EXAMPLE Enumeration
+@EXAMPLE   #RED            ; 0
+@EXAMPLE   #GREEN          ; 1
+@EXAMPLE   #BLUE = 10      ; set it explicitly
+@EXAMPLE   #WHITE          ; 11 - the count carries on from 10
+@EXAMPLE EndEnumeration
+
+@KEYWORD EndEnumeration
+@DOC Closes an active Enumeration block. Takes no arguments.
+@EXAMPLE EndEnumeration
+
+@KEYWORD Declare
+@DOC States the signature of a Procedure ahead of its body. Same shape as the Procedure line it stands in for, with no body and no EndProcedure. BE AWARE OF WHAT IT DOES NOT DO. You do not need it to call a procedure defined later in the file - the whole file is read before any code is generated, so a forward call already resolves on every target, with or without this line. And the declaration is not currently checked against the body: a Declare whose parameters disagree with the Procedure it names is accepted in silence. So treat it as a note to the reader about the shape of the code, not as a guarantee the compiler is enforcing. Measured on the AVR, the Pico and the HC11, 2026-08-05.
+@EXAMPLE Declare.w AddTwo(a.w, b.w)
+
+@KEYWORD Restore
+@DOC Points the internal data cursor at a label inside a DataSection, so the next Read starts there. The label is named WITHOUT its colon. There is ONE cursor for the whole program, not one per label, so a Restore in one procedure moves the cursor another procedure is reading from - if two pieces of code walk two tables, each must Restore its own label before its own run of Reads. Reading past the end of a table does not stop: the cursor simply carries on into whatever was laid down next, so let the table's length decide how many times you Read. Implemented on the AVR backend and all three ARM targets (RP2040, RP2350, RA4M1); refused on the six classic 8-bit backends.
+@EXAMPLE Restore tbl
+
+@KEYWORD Read
+@DOC Reads the next value from a DataSection into a variable and advances the cursor by exactly ONE ELEMENT. HOW WIDE ONE ELEMENT IS: write the width and that is the width - 'Read.b v' steps one byte, 'Read.l v' steps four - because the width you write is a statement about the TABLE, and the table is what the cursor walks. Write no width and the DESTINATION'S OWN DECLARED TYPE decides: 'Read d' into a .a steps one byte, into a .l steps four, into a .fx steps whatever EnableFixedPoint chose. Read the same type the Data was written as, or the cursor steps by the wrong width and every later Read in the program is in the wrong place. Until 2026-08-08 the untyped form stepped a fixed TWO bytes whatever the destination was, so a Data.a table read with 'Read d' returned every OTHER byte and a Data.l table returned overlapping halves - .w and .u were the only widths that worked, and only because 2 is their size. A WIDTH YOU WRITE THAT DIFFERS FROM THE DESTINATION is allowed within one kind of number and converts on the store exactly as an assignment does: 'Read.b n' into a .w widens and sign-extends, 'Read.l n' into a .w truncates. Across KINDS it is refused by name - an integer element into a float destination, a float element into an integer, or either against .fx or .dec - because those bytes do not mean the same thing and the store would be a silent reinterpretation. With a .s destination Read copies one whole 32-byte record and advances by 32; the width need not be written, as Read into a .s variable is promoted automatically. Read.s requires a .s destination, and Read.b/.w/.l into a .s destination is refused - either mismatch would advance the cursor by less than a record and put every later Read in the program in the wrong place. The destination's own declared size still bounds the copy, but the cursor always steps a full record. Implemented on the AVR backend and all three ARM targets (RP2040, RP2350, RA4M1); refused on the six classic 8-bit backends.
+@EXAMPLE Restore tbl
+@EXAMPLE Read value
+
+@KEYWORD EnableExplicit
+@DOC Requires every variable to be declared before it is used. Put it on the first line; it takes no arguments. WHAT IT BUYS YOU IS THE TYPO. Without it, assigning to a name that does not exist quietly creates it, so 'couner = counter + 1' compiles, runs, and does nothing you wanted. With it, that line is refused and names the variable and the line. The message also points at your includes, because the offending name can come from a library rather than from the file you are looking at. Worth turning on before a program gets long enough to hide one.
+@EXAMPLE EnableExplicit
+
+@KEYWORD ProcedureNaked
+@DOC Defines a Procedure that compiles with NO prologue and NO epilogue at all. Nothing is pushed, nothing is restored, and - this is the part that catches people - NO RETURN INSTRUCTION IS EMITTED. You write the return yourself, in inline assembly. A Naked procedure with an empty body compiles perfectly happily and then runs straight off the end into whatever was assembled next, which is a crash with no message and no obvious cause; the compiler cannot warn about it, because emitting nothing is exactly what you asked for. Use it for an entry point that hardware reaches directly, or for a routine where the calling convention is yours to define. It is also never removed by the code stripper, since nothing in the program need name it. If you are reaching for this to save a few cycles in ordinary code, use a normal Procedure instead. WHERE IT WORKS, measured 2026-08-24: every target - the AVR family, the RP2040, the ARM RP2350, the RISC-V RP2350, the RA4M1, the SAM3X, the Raspberry Pi 4, and all six classic 8-bit backends. THAT SENTENCE WAS NOT TRUE UNTIL THAT DATE, and the way it was untrue is the reason it is now spelled out. The keyword parsed everywhere and was READ BY ONE BACKEND, the AVR. On the other eleven targets the flag was set and dropped on the floor: the build succeeded, no diagnostic of any kind was printed, and an ORDINARY procedure came out of it carrying a full prologue, a full epilogue and a return - the exact three things this keyword exists to remove. That is the worst shape a compiler fault can have. The symptom on a bench is a hand-written entry point that pops a word nobody pushed and returns into it, i.e. a board that resets or wanders, with the source reading exactly as the documentation said it should. Every target was re-checked by compiling one program twice, once with the keyword and once without, and diffing the emitted assembly; the only difference in each pair is the prologue, the epilogue and the return. ONE LIMIT, AND IT IS THE AVR'S: on the AVR family a Naked procedure that declares LOCAL VARIABLES - or that takes PARAMETERS, which are frame slots there too - is REFUSED at compile time, and the message names the variable. On this backend a local lives at Y+offset in a stack frame, so 'emits no prologue' and 'declares a local' are directly contradictory: the frame the local needs is exactly the thing the keyword promises not to emit. Until 2026-08-24 the contradiction was resolved silently and in the worst direction - the naked prologue and epilogue were suppressed, and a separate injection pass then wrote 'push r28 / push r29', the frame allocation and eight matching pops around your body anyway, directly under a comment saying the compiler had yielded stack control to you. Measured on an ATmega328P with three .w locals. THAT IS A LIMIT OF THIS BACKEND, NOT OF THE CHIP, and the refusal is AVR-only on purpose: the other eleven targets put a local in static RAM, where there is no frame to build and nothing to push, so a Naked procedure with locals compiles and works there and is not refused - forbidding it everywhere would break working code to fix an AVR problem. On an AVR, use static Globals for the values, or make it an ordinary Procedure and let the compiler own the frame. Three things that read like locals are not frame slots and stay legal on the AVR: a Static (it is hoisted to a static slot), a .s parameter (its 32-byte buffer lives in static SRAM), and anything declared inside a Naked Main(), because Main is the global thread on this backend and its locals are statics already. A ProcedureReturn WRITTEN INSIDE a Naked procedure is REFUSED, on every target. There is no frame to unwind and no return instruction is emitted for it, so lowering it would place the return value and then run straight on past the ProcedureReturn into whatever follows - a statement that looks like a return and is not. Write the exit yourself beside the value, in inline assembly, or make it an ordinary Procedure and let the compiler own the exit. PARAMETERS ARRIVE NORMALLY WHERE THEY ARE ALLOWED. The ABI receivers that copy the incoming registers into the parameters' storage are part of the body, not the prologue, and they are still emitted - so on the eleven non-AVR targets a Naked procedure with parameters reads them as usual. On the AVR family a parameter is a frame slot and is refused along with the locals; take the arguments out of the registers by hand there. A procedure that is entered by hardware rather than by a call should simply take none.
+@EXAMPLE ProcedureNaked FastPath()
+@EXAMPLE   asm
+@EXAMPLE     ret
+@EXAMPLE   endasm
+@EXAMPLE EndProcedure
+
+@KEYWORD ProcedureInterrupt
+@DOC Defines an Interrupt Service Routine. The compiler analyses the block and automatically saves and restores the registers it touches - only those, which is what keeps a small handler small. WHERE IT WORKS, measured through 2026-08-06: every AVR target, the RP2040 and the ARM RP2350. The separate RP2350 RISC-V/Hazard3 target, the RA4M1 and all six classic 8-bit backends refuse it at compile time, and say it is a limit of THIS COMPILER rather than of the chip - the handler would be built into the binary and then never called by anything, so refusing is the honest answer. NAME IT AFTER THE TARGET'S OWN VECTOR, because the name is what wires it up: on the AVR that is the part's vector spelling, TIMER0_COMPA_vect and its family; the RP2040 has 26 IRQs of its own, including TIMER_IRQ_0 to TIMER_IRQ_3, PWM_IRQ_WRAP and USBCTRL_IRQ; and the RP2350 has 52 IRQs with different names and numbers, including TIMER0_IRQ_0 and UART0_IRQ. A vector name from the wrong chip is refused BY NAME, with the correct target's whole list printed, rather than compiled into a procedure nothing can reach. IT CAN CALL YOUR PROCEDURES, since 2026-08-03; before that date every call inside one was refused, because the prologue could only see what the ISR's own instructions dirtied and a call hides the callee's registers behind one instruction. The compiler now follows the CALL GRAPH and saves what everything reachable from the handler will disturb, including the arithmetic helpers behind a 32-bit divide or a float. AN ISR THAT CALLS NOTHING IS UNCHANGED, byte for byte - measured across 25 programs - so nothing you already have got slower. One that does call pays for what it reaches: an interrupt containing a single 32-bit divide grew from 1706 to 1738 bytes, and 11 registers are saved where 2 were before. THAT OLD 2 WAS WRONG - the divide helper writes nine registers and none were being saved - so this also closes a fault that had been corrupting the interrupted program. THREE THINGS ARE STILL REFUSED, by name, because no push list can fix them: calling one procedure from BOTH an ISR and your main code (its locals live at fixed addresses and are not reentrant), reaching a .l/.f/.fx RETURN VALUE from both (one shared buffer), and an ISR with more than one exit - an early ProcedureReturn leaves by the wrong instruction and restores nothing.
+@EXAMPLE ProcedureInterrupt TIMER0_COMPA_vect()
+@EXAMPLE   ticks = ticks + 1
+@EXAMPLE EndProcedure
+@EXAMPLE
+@EXAMPLE Procedure Recalc()      ; calling this from an ISR works now
+@EXAMPLE   total = total / 7
+@EXAMPLE EndProcedure
+@EXAMPLE ProcedureInterrupt TIMER1_COMPA_vect()
+@EXAMPLE   Recalc()
+@EXAMPLE EndProcedure
+@EXAMPLE
+@EXAMPLE ; on an RP2040 the vector names are the RP2040's own, not the AVR's
+@EXAMPLE ProcedureInterrupt TIMER_IRQ_0()
+@EXAMPLE   ticks = ticks + 1
+@EXAMPLE EndProcedure
+@EXAMPLE
+@EXAMPLE ; the RP2350 has its own names too - TIMER0_IRQ_0, not TIMER_IRQ_0
+@EXAMPLE ProcedureInterrupt TIMER0_IRQ_0()
+@EXAMPLE   ticks = ticks + 1
+@EXAMPLE EndProcedure
+
+; init_timer0_millis lived here until 2026-08-01 and should not have, for the
+; same reason as flash_read_byte above: it is an intrinsic, the parser has no
+; Case for it, and reserving the name had a measured cost. It is why the
+; library replacement had to be called timer0_millis_init instead - every OTHER
+; moved intrinsic keeps its own name so that including the library silently
+; upgrades the call, and this one could not. The reservation is gone now; the
+; library may take the name back whenever someone is willing to keep an alias
+; for the programs that already call timer0_millis_init.
+; Documentation: atmega328p_hardware.def, and the eight other AVR part files.
+
+@KEYWORD ForEver
+@DOC Closes a Repeat loop that has no exit condition, so the body runs for ever. Takes no arguments, and it is the alternative to Until, not an addition to it - a Repeat ends with one or the other. THIS IS THE NORMAL SHAPE OF AN EMBEDDED PROGRAM: there is no operating system to return to, so the main loop is meant never to end, and falling off the bottom of a program leaves the processor executing whatever follows. Break still leaves it, which is how you exit one deliberately.
+@EXAMPLE Repeat
+@EXAMPLE   Loop()
+@EXAMPLE ForEver
+
+; ======================================================================
+; NEW KEYWORDS - PureMetal Frontend Expansion
+; ======================================================================
+
+@KEYWORD ForEach
+@DOC Begins a loop that iterates over every element of a linked List. NOT IMPLEMENTED ON ANY BACKEND - it parses, then the code generator refuses it, because no target has the dynamic-allocation runtime a linked list needs. Use a Dim array instead.
+@EXAMPLE ForEach items()
+@EXAMPLE Next
+
+@KEYWORD NewList
+@DOC Declares a dynamically-growable linked List. NOT IMPLEMENTED ON ANY BACKEND - it raises a compile-time error everywhere, not only on AVR, because no target in this compiler has a heap. Use a fixed-size Dim array and an element count instead.
+@EXAMPLE NewList items.w()
+
+@KEYWORD NewMap
+@DOC Declares a dynamically-growable associative Map. NOT IMPLEMENTED ON ANY BACKEND - same reason as NewList: there is no dynamic-allocation runtime on any target. Use a fixed-size Dim array and search it directly.
+@EXAMPLE NewMap lookup.w()
+
+@KEYWORD ReDim
+@DOC Resizes an existing dynamic Array. NOT IMPLEMENTED ON ANY BACKEND - arrays are fixed-size once Dim'd, because resizing needs a heap allocator that does not exist here. Declare the array at its maximum needed size instead. Note the size is in ROUND brackets here, unlike Dim.
+@EXAMPLE ReDim tbl(16)
+
+@KEYWORD Goto
+@DOC Jumps unconditionally to a label declared in the SAME scope, where a label is a name followed by a colon on a line of its own. Jumping forward is allowed. WORKS ON ALL TEN BACKENDS. Corrected 2026-08-05: this entry said RP2040 only, which is no longer true - every backend lowers it. A Goto naming a label in another Procedure is a compile error, not a jump - it would skip that procedure's prologue and land with the wrong stack frame, and the compiler says exactly that instead of branching anyway. Unlike Gosub there is no return address to store, so it costs exactly one branch instruction. A label is a bare name and a colon; the ':' is also the statement separator, which is why a label and the statements after it can share a line.
+@EXAMPLE Global n.w = 0
+@EXAMPLE Top:
+@EXAMPLE n = n + 1
+@EXAMPLE If n < 3
+@EXAMPLE   Goto Top
+@EXAMPLE EndIf
+
+@KEYWORD Gosub
+@DOC Jumps to a named label and pushes a return address. NOT IMPLEMENTED ON ANY BACKEND - the code generator refuses it, because the return address would have to live exactly where the procedure return already keeps its own (the link register on ARM, the hardware stack on AVR), so a Gosub inside a Procedure would destroy that procedure's way back. Use a Procedure, or Goto for a plain jump with no return.
+@EXAMPLE Gosub myLabel
+
+@KEYWORD Return
+@DOC Returns execution to the statement after the most recent Gosub. NOT IMPLEMENTED ON ANY BACKEND, for the same reason as Gosub. This is NOT the keyword that returns a value from a Procedure - that is ProcedureReturn.
+@EXAMPLE Return
+
+@KEYWORD Shared
+@DOC Grants a Procedure direct read/write access to one or more variables declared in the global scope. On the 8-bit backends every global is already reachable by name, so this is accepted and does nothing. The three ARM backends do NOT map it and refuse the program - omit it there and use the global directly.
+@EXAMPLE Shared counter
+
+@KEYWORD Swap
+@DOC Exchanges the contents of two variables, array elements or structure fields. Added 2026-08-03 and works on every backend, because it is not a backend feature at all - semantic analysis rewrites it into three ordinary assignments through a temporary it declares for you. THE TEMPORARY TAKES THE TYPE OF WHAT IS BEING SWAPPED, which is why this is resolved after the declarations rather than while parsing: a guessed type would truncate a .l and corrupt a .f without saying so. Both sides must therefore be DECLARED BEFORE the Swap. Refused by name on STRINGS - a string variable here is a character buffer rather than a handle, so exchanging two of them means copying the characters both ways and needs a third buffer; use the string library if that is what you want. Both sides must be assignable: a variable, an array element or a structure field, never an expression.
+@EXAMPLE Swap a, b
+@EXAMPLE Swap grid[i], grid[j]
+@EXAMPLE Swap p\X, p\Y
+
+@KEYWORD SizeOf
+@DOC The number of BYTES a type or a Structure occupies, resolved at COMPILE TIME into a plain number - so "SizeOf(Ent) * 4" reaches the backend as a single constant and costs nothing at run time. Takes a TYPE written with its dot, SizeOf(.w), or a STRUCTURE NAME, SizeOf(Ent). It deliberately does NOT take a variable: structures are collected before variables are, so a variable's size is not known at the point this is answered, and answering some spellings while silently mis-answering others would be worse than refusing the shape - write the type or the structure name instead. SizeOf(.s) is the whole character buffer, not the pointer, because the question is how much space the thing occupies. Added 2026-08-03; it could not have been trusted before then, because until that same day every Structure reported 32 bytes whatever its fields were.
+@EXAMPLE Print(SizeOf(.w))
+@EXAMPLE Dim pool.a[SizeOf(Ent) * 8]
+
+@KEYWORD OffsetOf
+@DOC How many bytes from the start of a Structure a given field begins, resolved at COMPILE TIME into a plain number. Written OffsetOf(Structure\field) - the structure's NAME on the left of the backslash, not a variable of that type. Useful for laying a structure over a hardware register block or a received packet, and for checking by eye that a structure is packed the way you meant. Fields on this compiler are packed with NO padding, so an offset is simply the running total of the sizes before it. Added 2026-08-03.
+@EXAMPLE Print(OffsetOf(Ent\Y))
+
+@KEYWORD Bool
+@DOC Turns any expression into 1 or 0. Bool(x) is 1 whenever x is non-zero, so it is the way to get a clean flag out of a value rather than the value itself - assigning x directly would store 7, not 1. Passing a comparison, Bool(a > b), is allowed and simply hands back what the comparison already produced. Rewritten by the parser into "expression <> 0", which is the comparison every backend already generates, so it works on all ten backends and adds no new machinery. Added 2026-08-03.
+@EXAMPLE Global flag.b
+@EXAMPLE flag = Bool(count)          ; 1 whenever count is non-zero
+@EXAMPLE Global ready.w
+@EXAMPLE ready = Bool(temp > limit)
+
+@KEYWORD Static
+@DOC Declares a local variable whose value PERSISTS between calls to the enclosing Procedure - a counter that keeps counting, a flag that remembers it has already run. The initialiser runs ONCE, where globals are initialised, not on every call. Works on every backend as of 2026-08-03, and before that on none of them. It is not a backend feature: the declaration is hoisted out to file scope under a name carrying the procedure's own, and every reference inside that procedure is renamed to match - so two procedures can each have a Static called n and never meet. That also means it costs exactly what a Global costs, because that is what it becomes. It is still SCOPED to the procedure: nothing outside can name it.
+@EXAMPLE Procedure Tick()
+@EXAMPLE   Static calls.w = 0   ; initialised ONCE, not on every call
+@EXAMPLE   calls = calls + 1
+@EXAMPLE EndProcedure
+
+@KEYWORD NoClear
+@DOC A qualifier written IN FRONT OF Global that keeps the variable out of the block the startup code zeroes, so whatever the memory already held is still there when Main() begins. Every image this compiler emits starts by clearing its variable memory - on the Raspberry Pi 4 that is the __a64_bss_zero loop in _start, walking __bss_start__ to __bss_end__ - so an ordinary Global is 0 on every run, every restart and every re-entry, with nothing to say so. A NoClear Global is placed AFTER __bss_end__, between __noclear_start__ and __noclear_end__, which the loop never reaches; the addresses are in the .sym file if you want to see it for yourself. RASPBERRY PI 4 ONLY as of 2026-08-25: every other target refuses the program by name rather than accepting the word and zeroing the variable anyway, because a qualifier that is silently ignored is indistinguishable from one that works. IT DOES NOT PROMISE THE DATA SURVIVES, and that is why it is not called Preserve. The compiler can promise exactly one thing - that it does not clear the variable. Whether the memory keeps its contents across a particular reset is the hardware's business, and on this part it is undocumented and unverified. THE VALUE ON A COLD BOOT IS WHATEVER THE RAM POWERED UP AS, not zero - zeroing it once would defeat the whole point - SO A PROGRAM MUST BE ABLE TO TELL "left by the last run" FROM "garbage", AND THAT CHECK IS YOURS TO WRITE. The way to do it is a magic number stored beside the data, exactly as RaspberryPi4/Lib/safety.pi4 does with $5A1E0000: write magic|value, and on the way in accept the value only when the magic bits match. Without such a check the first cold boot reads a random number and believes it. AN INITIALISER IS REFUSED - 'NoClear Global n.l = 0' cannot mean anything, because the initialiser runs at startup and would overwrite the one thing being kept. Scalars, Dim arrays and structure instances are all accepted; STRINGS ARE REFUSED in either spelling, because a .s keeps its length in a leading byte and an uninitialised length sends every string operation off the end of its buffer. Only Global takes it - Define, Protected, Static and a bare Dim are refused by name.
+@EXAMPLE ; a boot counter that survives a restart - see RaspberryPi4/Lib/safety.pi4
+@EXAMPLE #BOOT_MAGIC = $5A1E0000
+@EXAMPLE NoClear Global bootWord.l
+@EXAMPLE NoClear Global Dim trail.l[8]
+@EXAMPLE Procedure Main()
+@EXAMPLE   Define n.l
+@EXAMPLE   n = 0
+@EXAMPLE   If (bootWord & $FFFF0000) = #BOOT_MAGIC   ; garbage cannot fake this
+@EXAMPLE     n = bootWord & $FFFF
+@EXAMPLE   EndIf
+@EXAMPLE   n = n + 1
+@EXAMPLE   bootWord = #BOOT_MAGIC | n
+@EXAMPLE EndProcedure
+
+@KEYWORD With
+@DOC Begins a block in which '\field' on its own means that field of the target, so a run of accesses to one structure does not repeat its name. Works on every backend as of 2026-08-03, and before that on none of them - it is resolved in the frontend, where each '\field' is rewritten into the plain 'target\field' it stood for, so no code generator has to know the shorthand exists. WITH BLOCKS NEST, and the innermost target wins. The target may be any structure access, including an array element - 'With items[i]' works. A '\field' outside any With block is refused by name rather than guessed at.
+@EXAMPLE With p
+@EXAMPLE   \X = 3
+@EXAMPLE   \Y = 4
+@EXAMPLE EndWith
+
+@KEYWORD EndWith
+@DOC Closes an active With block. See With.
+@EXAMPLE EndWith
+
+@KEYWORD CompilerSelect
+@DOC Chooses ONE of several blocks at COMPILE TIME, by the value of a constant expression. The branches that lose are skipped at the token level and never compiled, so a dead branch does not have to be valid for the current target - which is the point: one file can carry the code for parts that share no instructions. Closed with CompilerEndSelect. Added 2026-08-03; CompilerIf has worked for longer and this is the same machinery.
+@EXAMPLE EnableFixedPoint(16, 16)
+@EXAMPLE CompilerSelect #PM_FIXED_FRAC_BITS
+@EXAMPLE   CompilerCase 8
+@EXAMPLE     scale = 256
+@EXAMPLE   CompilerCase 16, 32
+@EXAMPLE     scale = 65536
+@EXAMPLE   CompilerDefault
+@EXAMPLE     scale = 1
+@EXAMPLE CompilerEndSelect
+
+@KEYWORD CompilerCase
+@DOC One branch of a CompilerSelect, taken when its value equals the selector. Several values may be listed, separated by commas. There is NO fall-through: the first matching branch is the only one compiled.
+@EXAMPLE CompilerCase 1, 2, 3
+
+@KEYWORD CompilerDefault
+@DOC The branch of a CompilerSelect taken when no CompilerCase matched. Optional; without it, a selector matching nothing simply compiles none of the branches.
+@EXAMPLE CompilerDefault
+
+@KEYWORD CompilerEndSelect
+@DOC Closes a CompilerSelect.
+@EXAMPLE CompilerEndSelect
+
+@KEYWORD Extends
+@DOC Used on a Structure declaration to include another Structure's fields FIRST, at their own offsets, before this one's. That ordering is the point: a Derived can be handed to anything expecting a Base and every inherited field is found in the same place. Written 'Structure Derived Extends Base'; the base must be declared EARLIER in the file, because its fields are copied in. Works on every backend as of 2026-08-03. Before that the words were not recognised at all and fell into the field list, where 'Extends' and the base's name each became a junk field of their own and the inherited fields did not exist - the structure was silently the wrong size and the wrong shape.
+@EXAMPLE Structure Derived Extends Base
+@EXAMPLE   Z.w
+@EXAMPLE EndStructure
+
+@KEYWORD StructureUnion
+@DOC Begins a group of Structure fields that all START AT THE SAME OFFSET - one piece of storage read as more than one type. The structure grows by the LARGEST member of the group, not by their total. Closed with EndStructureUnion. Works on every backend as of 2026-08-03; before that neither word was recognised and each became a field named after the keyword, so a union silently became two junk fields plus its members laid end to end.
+@EXAMPLE StructureUnion
+@EXAMPLE   AsWord.w
+@EXAMPLE   AsLong.l
+@EXAMPLE EndStructureUnion
+
+@KEYWORD EndStructureUnion
+@DOC Closes a StructureUnion. See StructureUnion.
+@EXAMPLE EndStructureUnion
+
+@KEYWORD Macro
+@DOC Defines a reusable, parameterized template of statements that is expanded inline at each call site. Parameters are named without type suffixes and are substituted as text. Expansion happens before semantic analysis, so a macro costs nothing at run time.
+@EXAMPLE Macro Twice(x)
+@EXAMPLE   x = x + x
+@EXAMPLE EndMacro
+@EXAMPLE Twice(count)
+
+@KEYWORD EndMacro
+@DOC Closes an active Macro definition. Takes no arguments.
+@EXAMPLE EndMacro
+
+@KEYWORD PeekB
+@DOC Reads a single byte from a raw memory address, into a .b. Sugar for *addr.b. The full family is PeekA/PeekB/PeekC/PeekW/PeekU/PeekN/PeekX/PeekI/PeekL and the matching Pokes. The signed/unsigned pairs are .b/.a at 8 bits, .w/.u at 16, .l/.n at 32 and .q/.x at 64 (PeekX is pi4-only, because pi4 is the only 64-bit target). SIGNEDNESS - READ THIS ONCE FOR THE WHOLE FAMILY. A Peek FOLLOWS ITS TYPE LETTER. PeekB, PeekC and PeekW name the language's SIGNED types (.b is -128..127, .w is a signed 16-bit) and they SIGN-EXTEND; PeekA and PeekU are the UNSIGNED spellings and they zero-extend. That is the whole rule and it holds on all thirteen backends. So PeekB on a byte holding 200 gives -56 and PeekA on the same byte gives 200 - reach for PeekA whenever the byte is raw data, which is most of the time: a sensor reading, a port, a packet, a buffer. RULED 2026-08-25, and it was a CORRECTION. For a day this entry said the opposite - that a Peek was a raw unsigned accessor - which would have made PeekA an exact synonym of PeekB and PeekU of PeekW, leaving two of these seven keywords with nothing to do. Measurement settled it: every 8-bit backend (AVR, Z80, 6502, HC11, 8080, 8051, 6809) already sign-extended, the 6809 with a literal 'sex' instruction, while every 32/64-bit backend (RP2040, RP2350, RP2350RV, RA4M1, SAM3X, Pi 4) did not - because a narrow ARM or RISC-V load widens by itself and nobody had asked what the TYPE wanted. The six were corrected, not the seven. NO EXCEPTIONS, as of 2026-08-25. For one day PeekL was one, because the unsigned ladder stopped at 16 bits and there was nowhere to send a caller who wanted an unsigned peripheral word. .n closed that hole and PeekL joined the rule the same day. THIS IS ONLY OBSERVABLE FOR PeekL WHERE .i IS WIDER THAN THE ACCESS - on the 32-bit targets a 32-bit Peek fills the whole register and the question cannot arise; on the Raspberry Pi 4, where .i is 64-bit, it can. Examples\RaspberryPi4\SignWidth.pi4 measures every outcome, and tools/peek_sign_check.py holds all thirteen backends to the rule. IMPLEMENTED ON ALL TEN BACKENDS. Corrected 2026-08-05: this said the six classic 8-bit backends refuse pointer access, and they do not - Peek and Poke compile on every target. What those six still refuse is a DataSection, which is a different thing (see DataSection).
+@EXAMPLE Define v.b = PeekB(address)
+
+@KEYWORD PeekW
+@DOC Reads a 16-bit word from a raw memory address, into a .w. Sugar for *addr.w. Implemented on all ten backends. Two bytes. SIGNED, and it SIGN-EXTENDS - see PeekB for the family's signedness rule, which is simply that a Peek follows its type letter. PeekU is the unsigned spelling and the one to reach for when the word is raw data. Corrected 2026-08-25 on the six 32/64-bit backends, which used to zero-extend here while all seven 8-bit backends already did this correctly.
+@EXAMPLE Define v.w = PeekW(address)
+
+@KEYWORD PeekL
+@DOC Reads a 32-bit long from a raw memory address, into a .l. Sugar for *addr.l. Implemented on all ten backends. Four bytes, SIGNED, and it sign-extends like every other Peek named after a signed type - see PeekB for the family rule. Use PeekN for a peripheral register or anything else where the top bit is data rather than a sign. Between 2026-08-24 and 2026-08-25 this was the family's one exception, read raw because .n did not exist yet; it is not an exception any more. THIS ONE BITES ON THE RASPBERRY PI 4 and nowhere else, because .i is 64-bit there and a 32-bit read no longer fills the register: PeekL($FE201018) on a word with bit 31 set gives 2147483649, while the same four bytes read through a .l array element give -2147483647. Both are correct and they are different jobs. Mask a .l with $FFFFFFFF for the unsigned value; there is still no unsigned 32-bit TYPE to read one into, so on the Pi 4 use .i, which is wide enough to hold the unsigned range exactly.
+@EXAMPLE Define v.l = PeekL(address)
+
+@KEYWORD PeekA
+@DOC Reads a single UNSIGNED byte (.a) from a raw memory address. THE ONE TO REACH FOR when the byte is raw data - a sensor reading, a port, a packet, a buffer - because that is nearly always what you mean. PeekB reads the SAME byte SIGNED, so anything from 128 upwards comes back negative: PeekB on a byte holding 200 gives -56, where PeekA gives 200. That is true on every one of the thirteen backends as of 2026-08-25; before then the 32/64-bit backends wrongly made the two identical. See the signedness rule on PeekB. Added 2026-08-02.
+@EXAMPLE Global v.w
+@EXAMPLE PokeB(300, 200)
+@EXAMPLE v = PeekA(300)          ; 200
+@EXAMPLE v = PeekB(300)          ; -56, the SAME byte read signed
+
+@KEYWORD PeekC
+@DOC Reads a single character (.c) from a raw memory address. Signed, the same width as .b - the different name is for code that means a character rather than a small number.
+@EXAMPLE Global ch.w
+@EXAMPLE ch = PeekC(address)
+
+@KEYWORD PeekU
+@DOC Reads an UNSIGNED 16-bit word (.u) from a raw memory address. The 16-bit twin of PeekA, with the same recommendation: PeekW reads signed, so a word holding 64536 comes back as -1000, while PeekU gives 64536. True on every backend as of 2026-08-25. On the 8-bit parts PeekW and PeekU emit IDENTICAL code and that is correct, not a bug - .i is itself 16 bits there, so the load already fills the register and there is nothing to extend. See the signedness rule on PeekB. Added 2026-08-02.
+@EXAMPLE Global v.u
+@EXAMPLE v = PeekU(address)      ; 0..65535
+
+@KEYWORD PeekN
+@DOC Reads an UNSIGNED 32-bit value (.n) from a raw memory address. THE ONE TO REACH FOR when the four bytes are a peripheral register, a hardware flag word, or anything else whose top bit is DATA rather than a sign - the VideoCore mailbox FULL flag IS bit 31 and its success code IS $80000000. PeekL reads the same four bytes SIGNED, so those come back negative. Added 2026-08-25 to complete the unsigned ladder: PeekA at 8 bits, PeekU at 16, PeekN at 32. Its absence was the reason PeekL had to be an exception to the family signedness rule for a day; adding it retired the exception. ONLY ON pi4 AND rp2350rv, and REFUSED with an explanation on the other eleven backends. That is not an oversight. A .n is only useful if the target can COMPARE one, and only those two IR cores emit unsigned relational branches wired to the signedness predicate; the four 32-bit ARM backends emit no unsigned branch at all, and the seven 8-bit backends use a widen-by-one-size trick that is implemented for 1- and 2-byte operands only. On the others a .n would compare in the WRONG ORDER with no diagnostic, so it is refused rather than accepted-and-wrong. To add a target: give its IR core an unsigned relational branch and add it to PMTargetSupportsUnsigned32. On a 32-bit target .l and .n hold the same bits and differ only in comparison and division; on the Pi 4, where .i is 64-bit, they differ at the load too.
+@EXAMPLE Global flags.n
+@EXAMPLE flags = PeekN($FE00B898)      ; 0..4294967295, bit 31 is data
+
+@KEYWORD PokeN
+@DOC Writes an UNSIGNED 32-bit value (.n) to a raw memory address. The write twin of PeekN, and subject to the same target restriction - see PeekN. Writing is where the signedness matters least (the same four bytes land either way) but the TYPE is what keeps the value unsigned everywhere else in the expression, which is the point.
+@EXAMPLE PokeN($FE00B8A0, $80000000)
+
+@KEYWORD PeekX
+@DOC Reads an UNSIGNED 64-bit value (.x) from a raw memory address. The top of the ladder: PeekA at 8 bits, PeekU at 16, PeekN at 32, PeekX at 64. Added 2026-08-25. REACH FOR IT when the eight bytes are a full-width address, a 64-bit hardware register or a hash word - anything whose bit 63 is DATA rather than a sign. PeekI reads the SAME eight bytes on the Raspberry Pi 4 and emits the identical instruction, but into the signed .i, so a value at or above 9223372036854775808 comes back negative and then compares, shifts and DIVIDES that way. Measured in the project's A64 oracle: $8000000000000000 > 7 is FALSE through .i and TRUE through .x, and $FFFFFFFFFFFFFFFF / 2 is 0 through .i and 9223372036854775807 through .x. ONLY ON pi4, and REFUSED with an explanation on the other twelve backends - the BCM2711 is the only 64-bit target this compiler has, so nowhere else has a register to hold one, a 64-bit unsigned compare to order one, or an unsigned 64-bit divide. .q, the SIGNED 64-bit type, is refused on those parts too. To add a target it needs all three, and the DIVIDE is the one to check rather than assume: see PMTargetSupportsUnsigned64.
+@EXAMPLE Global addr.x
+@EXAMPLE addr = PeekX($FF841000)       ; 0..18446744073709551615, bit 63 is data
+
+@KEYWORD PokeX
+@DOC Writes an UNSIGNED 64-bit value (.x) to a raw memory address. The write twin of PeekX, and subject to the same pi4-only restriction - see PeekX. The same eight bytes land whichever of PokeX and PokeI is used; what the TYPE buys is that the value stays unsigned everywhere ELSE in the expression, which is where the difference is observable.
+@EXAMPLE PokeX($FF841000, $FFFFFFFFFFFFFFFF)
+
+@KEYWORD PeekI
+@DOC Reads a native integer (.i) from a raw memory address - TWO bytes on the 8-bit parts, FOUR on the ARM and RISC-V targets, and EIGHT on the Raspberry Pi 4, whose .i became 64-bit on 2026-08-24. Being the native width, it fills the register, so the signedness question on PeekB does not arise for this one. That is the point of it and also the catch: the same source reads a different width per target, so use PeekW or PeekL when the width is part of what you mean. Added 2026-08-02.
+@EXAMPLE Global v.i
+@EXAMPLE v = PeekI(address)
+
+@KEYWORD PokeA
+@DOC Writes a single UNSIGNED byte (.a) to a raw memory address. Two arguments, comma-separated: address first, then value. See PeekA for why the unsigned form matters. Added 2026-08-02.
+@EXAMPLE PokeA(address, 200)
+
+@KEYWORD PokeC
+@DOC Writes a single character (.c) to a raw memory address. Address first, then value. Added 2026-08-02.
+@EXAMPLE PokeC(address, 65)
+
+@KEYWORD PokeU
+@DOC Writes an UNSIGNED 16-bit word (.u) to a raw memory address. Address first, then value. Added 2026-08-02.
+@EXAMPLE PokeU(address, 65000)
+
+@KEYWORD PokeI
+@DOC Writes a native integer (.i) to a raw memory address - two bytes on the 8-bit parts, four on ARM. Address first, then value. Added 2026-08-02.
+@EXAMPLE PokeI(address, 1234)
+
+@KEYWORD PokeB
+@DOC Writes a single byte (.b) to a raw memory address. Sugar for *addr.b = value. Two arguments, comma-separated: address first, then value.
+@EXAMPLE PokeB(address, 42)
+
+@KEYWORD PokeW
+@DOC Writes a 16-bit word (.w) to a raw memory address. Sugar for *addr.w = value.
+@EXAMPLE PokeW(address, 1000)
+
+@KEYWORD PokeL
+@DOC Writes a 32-bit long (.l) to a raw memory address. Sugar for *addr.l = value.
+@EXAMPLE PokeL(address, 100000)
+
+@KEYWORD CompilerIf
+@DOC Begins a compile-time-only conditional block, resolved before Macro expansion or semantic analysis. The condition must fold to a constant - only #NAME constants and literals, no variables. Whichever branch's condition is true survives; every other branch's statements are discarded and never reach the rest of the compiler, so they cost no ROM and are not even type-checked.
+@EXAMPLE #DEBUG = 1                 ; the constant has to exist first
+@EXAMPLE CompilerIf #DEBUG = 1
+@EXAMPLE   serial_write(65)
+@EXAMPLE CompilerEndIf
+
+@KEYWORD CompilerElseIf
+@DOC Evaluates an alternative compile-time-constant condition if the preceding CompilerIf/CompilerElseIf branches were false.
+@EXAMPLE CompilerElseIf #LEVEL = 2
+
+@KEYWORD CompilerElse
+@DOC The compile-time branch taken if all preceding CompilerIf/CompilerElseIf conditions were false. Takes no condition.
+@EXAMPLE CompilerElse
+
+@KEYWORD CompilerEndIf
+@DOC Closes an active CompilerIf conditional block. Takes no arguments.
+@EXAMPLE CompilerEndIf
+
+; ======================================================================
+; LOGICAL OPERATORS - the four spelled as WORDS
+;
+; Added 2026-08-01 after a forum report from Carter (JC): a program doing
+;
+;     ByteB = ByteA AND %00000001
+;
+; lit the wrong LED, because AND here is a LOGICAL operator and the
+; answer to "is 204 non-zero and is 1 non-zero" is true, which is 1 -
+; not the masked-off 0 the bit pattern in the source suggests.
+;
+; Nothing described any operator at all before that, so there was nowhere
+; for a reader to find that out. That was the real defect; these entries
+; are the fix for it.
+;
+; ONLY THESE FOUR BELONG HERE. They are words: they highlight, and a
+; procedure cannot be named Or. The SYMBOL operators - & | ! ~ << >> and
+; the compound assignments - live in operator.def, because an @KEYWORD
+; name is copied into the syntax highlighter's word map and punctuation
+; has no business in it.
+; ======================================================================
+
+@KEYWORD And
+@DOC LOGICAL and - true when BOTH sides are non-zero, and it produces 1 or 0, NOT a bit pattern. Each side must itself be a comparison (or another logical operator, or Not): since 2026-08-01 the compiler REFUSES anything else and names '&' in the error, because the alternative is a silent wrong answer. What it refuses, and why: ByteA = 204 : ByteB = ByteA And %00000001 used to compile and set ByteB to 1 - both sides are non-zero, so the logical answer really is true - even though 204 AND 1 as BITS is 0. Reported by Carter, 2026-08-01, after it lit the wrong LED. Write ByteB = ByteA & %00000001 to mask bits. The same split exists in the desktop BASIC, where '&' is bitwise and And is logical; That language is stricter still and refuses And outside If/While/Until/Bool() even when both sides are comparisons; this compiler allows it in any value context, so "ok = a > 0 And b > 0" is accepted here and Bool() is not needed to make it legal. Bool() does exist, since 2026-08-02, and is the way to say you meant a 1-or-0 on purpose. Both sides are always evaluated; do not rely on the right-hand side being skipped.
+@EXAMPLE If count > 0 And ready = 1
+@EXAMPLE   PrintN("go")
+@EXAMPLE EndIf
+
+@KEYWORD Or
+@DOC LOGICAL or - true when EITHER side is non-zero, producing 1 or 0. Each side must be a comparison, or the compiler refuses it and points at '|' - see And for the full account. For combining bits use '|': value = 4 Or 2 would be 1, not 6, which is why it is no longer accepted.
+@EXAMPLE If failed = 1 Or timedOut = 1
+@EXAMPLE   PrintN("retry")
+@EXAMPLE EndIf
+
+@KEYWORD XOr
+@DOC LOGICAL exclusive-or - true when EXACTLY ONE side is non-zero, producing 1 or 0. Each side must be a comparison, or the compiler refuses it and points at '!' - see And. For flipping bits use '!': 12 XOr 10 would be 0 (both are non-zero, so not exactly one) while 12 ! 10 is 6, which is why it is no longer accepted.
+@EXAMPLE ; BOTH sides must be comparisons - 'If aOn XOr bOn' is refused.
+@EXAMPLE If aOn <> 0 XOr bOn <> 0
+@EXAMPLE   PrintN("exactly one")
+@EXAMPLE EndIf
+
+@KEYWORD Not
+@DOC LOGICAL negation - 1 when its operand is zero, 0 otherwise. For flipping every bit of a value use '~'. Not 204 is 0; ~204 is -205.
+@EXAMPLE If Not ready
+@EXAMPLE   PrintN("waiting")
+@EXAMPLE EndIf
+
+; ======================================================================
+; STRINGS - AND WHY THERE ARE NO STRING ENTRIES BELOW
+;
+; This banner was added 2026-08-01 after Carter (JC) asked how to
+; "Globally Dim a buffer" for Left/Len/Mid/NumToStr. He did not need one:
+; the language has a fixed-capacity string type, and none of those calls
+; were documented anywhere.
+;
+; The entries that were written under this banner have been removed, and
+; the banner is kept only to say why - because it promised examples that
+; are not here, and a heading over nothing reads like a file that got
+; truncated.
+;
+; LEN, LEFT, RIGHT, MID, CHR, STR, HEX, BIN, SPACE and StringField ARE
+; LIBRARY PROCEDURES, NOT KEYWORDS. The parser has no Case for any of
+; them. Naming one here would RESERVE it - every @KEYWORD goes into
+; CompilerKeywords() - and that is not a documentation choice, it is a
+; language change: it stops any library from declaring a procedure with
+; that name. It has already been done once and had to be undone, because
+; it broke Lib/string.avrb outright (749bf3f, reverted in f78aa37). The
+; same trap took flash_read_byte and init_timer0_millis out of this file;
+; see the notes beside Print and ProcedureInterrupt.
+;
+; They are documented where they are implemented, in the string library
+; for each target.
+;
+; What IS a compiler rule, and is documented in this file, lives with the
+; declaration keywords instead - see Define and Global for the .s type and
+; the 1..255 size limit, and DataSection for Data.s and the 32-byte record.
+; ======================================================================

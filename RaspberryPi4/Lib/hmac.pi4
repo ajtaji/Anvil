@@ -1,0 +1,429 @@
+; ======================================================================
+;  hmac.pi4 - HMAC-SHA-256 AND THE TLS 1.2 PRF, ON THE RASPBERRY PI 4
+; ======================================================================
+;
+;  Translated from BearSSL (c) 2016 Thomas Pornin - MIT licence.
+;  The notice ships as licenses/BearSSL-LICENSE.txt (release condition).
+;
+;     XIncludeFile "Anvil/Core/sha256.pbi"   ; REQUIRED, include first
+;     XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
+;
+;
+;  HMAC-SHA-256 (RFC 2104) and the TLS 1.2 P_SHA256 PRF (RFC 5246 s5).
+;  This is RP2350/Lib/hmac.pico2's design on 64-bit silicon; the names,
+;  the shape and the semantics are deliberately identical, so a program
+;  ports by changing an include line.
+;
+;  API (module-global context - one MAC in progress at a time):
+;    HmacKey(key.i, keylen.i)      set the key: derive and CACHE the ipad
+;                                  and opad SHA-256 states, then begin a
+;                                  fresh MAC. Keys longer than 64 bytes are
+;                                  SHA-256'd first (RFC 2104).
+;    HmacBegin()                   start another MAC reusing the cached key
+;                                  (no re-derivation) - what a DRBG needs
+;                                  when it runs many MACs under one key.
+;    HmacUpdate(src.i, len.i)      absorb len message bytes at src
+;    HmacEnd(dst.i, outlen.i)      finish; writes min(outlen,32) MAC bytes
+;                                  at dst (outlen<=0 means the full 32).
+;                                  Returns the number of bytes written.
+;    HmacOf(key,keylen,msg,msglen,dst)  the one-shot full 32-byte MAC
+;    PrfSha256(secret,slen, label,llen, seed,slen2, dst,outlen)
+;                                  TLS 1.2 P_SHA256 expansion: outlen bytes
+;                                  of PRF(secret, label + seed) into dst
+;    CtEqual(a.i, b.i, len.i)      CONSTANT-TIME byte compare, returns 1 if
+;                                  the len bytes match, 0 otherwise. Use it
+;                                  for every comparison of a computed MAC
+;                                  against an expected one - it accumulates
+;                                  the differences and tests once at the end,
+;                                  so it never leaks WHERE two MACs differ.
+;
+;  REQUIRES Anvil/Core/sha256.pbi, INCLUDED BEFORE THIS FILE. HMAC
+;  is built entirely on Sha256Begin/Update/End and the Sha256Snapshot/
+;  Restore pair. The ipad and opad blocks are hashed once at key time and
+;  their running SHA-256 states snapshotted; each MAC then Restores the
+;  right one instead of re-absorbing a 64-byte pad.
+;
+;  A library never includes a library (house rule) - the MAIN file lists
+;  sha256 then this file, in that order. If sha256 is missing, this file
+;  fails loudly at compile time with the Sha256* procedures named, which
+;  is the house rule working and is the correct outcome, not a gap.
+;  There is deliberately no stub.
+;
+;  sha256 already turns EnableExplicit on for the whole program; every
+;  variable here is declared, as that pragma requires.
+;
+;  ======================================================================
+;   WHAT THE 64-BIT .i CHANGED IN THIS FILE: NOTHING, AND THAT IS A
+;   FINDING RATHER THAN AN ABSENCE
+; ======================================================================
+;
+;  Anvil/Core/sha256.pbi's header carries the long account of what
+;  a 64-bit .i does to a 32-bit algorithm. NONE OF IT APPLIES HERE, and
+;  the reason is worth one paragraph so that nobody goes looking for the
+;  masks and concludes they were forgotten.
+;
+;  THERE IS NOT ONE PIECE OF 32-BIT WORD ARITHMETIC IN THIS FILE. HMAC
+;  is defined on BYTES: XOR a key byte with $36, XOR a key byte with
+;  $5C, concatenate, hash. Every number in here is either a LENGTH (a
+;  count of bytes, which wants to be as wide as the machine and is) or a
+;  BYTE (0..255, which cannot overflow anything). The only arithmetic is
+;  incrementing loop counters and clamping an output length. There is no
+;  addition modulo 2^32, no rotate, and no shift of a 32-bit word - so
+;  there is nothing for #SHA256_W32 to be applied to, and applying it
+;  anywhere here would be cargo cult.
+;
+;  THE ONE 64-BIT HAZARD THAT DOES REACH THIS FILE IS THE SIGN OF A
+;  BYTE, and it reaches every crypto file on this target. Ruled
+;  2026-08-25: PeekB/PeekC/PeekW SIGN-EXTEND; PeekA/PeekU are the
+;  unsigned spellings. A key byte of $80 read with PeekB is -128, and
+;  (-128 ! $36) is not (128 ! $36) - it is a negative number whose low
+;  byte is right and whose upper 56 bits are ones, which then goes into
+;  a .a array slot that truncates it back. On THIS file the truncation
+;  would hide it; in CtEqual it would not, because the XOR is
+;  accumulated into a full-width word and a sign-extended difference in
+;  the high bits would make two EQUAL buffers compare equal anyway but
+;  two DIFFERING ones differ in a wider register - harmless here, but
+;  the habit is what matters and half a habit is worse than none.
+;
+;  EVERY RAW BYTE READ IN THIS FILE IS PeekA. Reading key bytes with
+;  PeekB was measured on the sha256 side of this port: 16 of 23
+;  known-answer vectors fail. It is not a theoretical concern.
+;
+;  The .a array reads (secHmacMac[i], secPrfTmp[i]) keep their "& 255"
+;  from the RP2350 copy. An .a element is unsigned by declaration so the
+;  mask is redundant; it is kept because it states the width at the
+;  point of use and costs an instruction the optimiser can see through.
+;
+;  ======================================================================
+;   CONSTANT TIME - THE PORT KEEPS BearSSL'S IDENTITY OR IT IS NOT A PORT
+;  ======================================================================
+;
+;  The key BYTES are never branched on and never used as an index - only
+;  the key LENGTH drives control, and a key length is public in every
+;  TLS use. The pad build XORs key bytes straight-line; the MAC math is
+;  SHA-256, which is itself straight-line. Secret-carrying buffers are
+;  named with a sec prefix so a reviewer can grep the taint.
+;
+;  CtEqual is the one place where a shortcut would be a real leak, and
+;  it does not take one: it never returns early, so its running time
+;  depends only on len.
+;
+;  NO CYCLE-COUNTING TOOL WAS RUN AGAINST THIS FILE. The RP2350 copy is
+;  gated by tools/ct_ab.py; there is no equivalent for this backend
+;  today, and the A64 oracle used to run the vectors does not model
+;  caches or a pipeline, so it could not answer the question even if it
+;  were asked. The constant-time claim here is STRUCTURAL - read off the
+;  source, not measured - and it should be read as exactly that.
+;
+;  ======================================================================
+;   WHAT HAS BEEN PROVEN, AND WHAT HAS NOT - 2026-08-25
+;  ======================================================================
+;
+;  PROVEN, by known-answer test under the project's own A64 oracle
+;  (tools/a64/a64_interp.py) on a real image built by pmfc.exe for
+;  -t pi4 at $200000:
+;
+;    * RFC 4231 sections 4.2 to 4.8 - HMAC-SHA-256 test cases 1 to 7,
+;      the whole published set. That includes case 3's and case 4's
+;      50-byte $DD and $CD messages (bytes with bit 7 set, which is what
+;      catches a PeekB), case 5's 128-bit truncation, and cases 6 and 7
+;      with the 131-byte keys that exercise the RFC 2104 long-key path.
+;
+;        1  b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+;        2  5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+;        3  773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe
+;        4  82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b
+;        5  a3b6167473100ee06e0c796c2955552b            (truncated, 128 bits)
+;        6  60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54
+;        7  9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2
+;
+;    * Each of those seven run twice: the message in one shot, and the
+;      message fed ONE BYTE AT A TIME, so a bad split point would show.
+;    * CtEqual accepting the right MAC and rejecting a one-bit flip, on
+;      every one of the seven.
+;    * ALL 57 vectors the other three families are gated on
+;      (RP2350/Examples/Diagnostics/hmacVectors.pico2 - the same seven
+;      plus fifty random key/message pairs), one-shot. 57 of 57. The
+;      vector file was re-checked against a host HMAC before use.
+;
+;  NOT PROVEN:
+;    * NOTHING HERE HAS RUN ON SILICON. RE-CHECKED 2026-08-27 AND
+;      STILL TRUE: nothing under RaspberryPi4/ includes this file, so
+;      no image that has booted contains a line of it. Dated on purpose
+;      - an undated "nothing has run" reads as present tense for ever,
+;      and an audit on that date found nine banners in this directory
+;      that had gone false exactly that way.
+;    * PrfSha256 IS UNTESTED ON THIS TARGET. It is carried across
+;      unchanged from a copy that passes prfSelfTest on the RP2350, and
+;      it is built entirely out of the HmacKey/HmacBegin/HmacUpdate/
+;      HmacEnd calls that ARE tested here - but the published TLS 1.2
+;      PRF-SHA256 vector was not run against this build. Do not treat
+;      the TLS 1.2 PRF as gated on this part. TLS 1.3 does not use it;
+;      RaspberryPi4/Lib/hkdf.pi4 is the 1.3 key schedule and that one is
+;      gated against RFC 5869.
+;    * The constant-time claim is structural, not measured. See above.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  STATE - flat Global arrays, house style. All secret-derived, sec-named.
+;
+;  secHmacIpad / secHmacOpad hold the two 104-byte SHA-256 snapshots taken
+;  after the ipad and opad pad blocks were absorbed. secHmacBlk is the
+;  64-byte pad block under construction. secHmacKeyBuf holds a long key's
+;  SHA-256 digest. secHmacInner / secHmacMac hold the inner and final MAC.
+;
+;  THE SNAPSHOT BUFFERS ARE 104 BYTES ON THIS TARGET TOO. sha256.pi4
+;  keeps the snapshot image 32-bit even though .i went 64-bit, precisely
+;  so that these two do not have to grow and so that a snapshot can move
+;  between families. If that image ever widens, these two numbers and
+;  every reader of them widen with it.
+; ----------------------------------------------------------------------
+; ==== PORTABLE CORE A64 BEGIN ====
+Global Dim secHmacIpad.a[104]        ; SHA state after ipad block, cached
+Global Dim secHmacOpad.a[104]        ; SHA state after opad block, cached
+Global Dim secHmacBlk.a[64]          ; pad block under construction
+Global Dim secHmacKeyBuf.a[32]       ; digest of an over-long key
+Global Dim secHmacInner.a[32]        ; inner hash SHA256(ipad || message)
+Global Dim secHmacMac.a[32]          ; final MAC SHA256(opad || inner)
+Global Dim secPrfA.a[32]             ; PRF running A(i), secret-derived
+Global Dim secPrfTmp.a[32]           ; PRF expansion block, secret-derived
+
+; ----------------------------------------------------------------------
+;  CtEqual(a, b, len) - constant-time equality of two byte buffers.
+;
+;  Accumulates every byte difference into one word with OR, then tests that
+;  word once. It never returns early, so its running time depends only on
+;  len (public), never on WHERE - or WHETHER - the buffers differ. The one
+;  final branch reveals only the public yes/no verdict a MAC check exists to
+;  produce.
+;
+;  BOTH LOADS ARE PeekA. With PeekB a byte of $80 in one buffer and $80 in
+;  the other would still compare equal, so this would not fail a test - it
+;  would just be accumulating sign-extension noise into the difference
+;  word. Correct by accident is the thing this project files bugs about.
+; ----------------------------------------------------------------------
+Procedure.i CtEqual(a.i, b.i, len.i)
+  Protected i.i
+  Protected diff.i
+  diff = 0
+  i = 0
+  While i < len
+    diff = diff | ((PeekA(a + i) & 255) ! (PeekA(b + i) & 255))
+    i = i + 1
+  Wend
+  If diff = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HmacBegin() - start a MAC reusing the key cached by the last HmacKey.
+;
+;  Restores the ipad SHA-256 state (one 64-byte block already absorbed,
+;  byte count 64), so the following HmacUpdate calls continue the inner
+;  hash SHA256(ipad || message). No pad block is re-hashed.
+;
+;  CALLING THIS BEFORE ANY HmacKey RESTORES A ZEROED BUFFER, which is a
+;  SHA-256 state with H = 0 and a byte count of 0 - not a valid state and
+;  not an error either. It is the caller's job to set a key first; every
+;  entry point that needs one says so.
+; ----------------------------------------------------------------------
+Procedure HmacBegin()
+  Sha256Restore(@secHmacIpad[0])
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HmacUpdate(src, len) - absorb len message bytes at src into the inner
+;  hash. Arbitrary split points behave exactly like one shot (SHA-256's
+;  own property, and it is asserted rather than assumed - every RFC 4231
+;  case in the gate is run one-byte-at-a-time as well as in one shot).
+; ----------------------------------------------------------------------
+Procedure HmacUpdate(src.i, len.i)
+  Sha256Update(src, len)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HmacEnd(dst, outlen) - finish the MAC.
+;
+;  inner = SHA256(ipad || message); then, from the cached opad state,
+;  MAC = SHA256(opad || inner). Sha256End runs on a copy, so restoring the
+;  opad state after it is clean. Writes min(outlen,32) bytes; outlen<=0
+;  means the full 32. Returns the number of bytes written.
+;
+;  THE TRUNCATION IS RFC 2104 SECTION 5 AND RFC 4231 CASE 5, not a
+;  convenience: a truncated HMAC is a legitimate construction and TLS
+;  uses one. Truncation always takes the LEADING bytes.
+; ----------------------------------------------------------------------
+Procedure.i HmacEnd(dst.i, outlen.i)
+  Protected i.i
+  Protected n.i
+
+  Sha256End(@secHmacInner[0])
+  Sha256Restore(@secHmacOpad[0])
+  Sha256Update(@secHmacInner[0], 32)
+  Sha256End(@secHmacMac[0])
+
+  n = outlen
+  If n <= 0
+    n = 32
+  EndIf
+  If n > 32
+    n = 32
+  EndIf
+  i = 0
+  While i < n
+    PokeB(dst + i, secHmacMac[i] & 255)
+    i = i + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HmacKey(key, keylen) - set the key and begin the first MAC.
+;
+;  Long keys (> 64 bytes, one SHA-256 block) are hashed to 32 bytes first
+;  (RFC 2104). The ipad block is key XOR $36 padded with $36; the opad
+;  block is key XOR $5C padded with $5C. Each is absorbed as one 64-byte
+;  SHA-256 block and its running state snapshotted, so later MACs Restore a
+;  state instead of re-hashing a pad. Only the key LENGTH drives the loops;
+;  the key BYTES are XORed straight-line, never branched on or indexed by.
+;
+;  THE KEY IS READ WITH PeekA. RFC 4231 cases 6 and 7 use 131 bytes of
+;  $AA - bit 7 set on every one of them - so the long-key path in the
+;  gate is also the sign-extension path, and it is checked twice over.
+; ----------------------------------------------------------------------
+Procedure HmacKey(key.i, keylen.i)
+  Protected i.i
+  Protected kb.i
+  Protected klen.i
+
+  If keylen > 64
+    Sha256Of(key, keylen, @secHmacKeyBuf[0])
+    kb = @secHmacKeyBuf[0]
+    klen = 32
+  Else
+    kb = key
+    klen = keylen
+  EndIf
+
+  ; ipad block: key XOR $36, then $36 padding
+  i = 0
+  While i < klen
+    secHmacBlk[i] = (PeekA(kb + i) & 255) ! $36
+    i = i + 1
+  Wend
+  While i < 64
+    secHmacBlk[i] = $36
+    i = i + 1
+  Wend
+  Sha256Begin()
+  Sha256Update(@secHmacBlk[0], 64)
+  Sha256Snapshot(@secHmacIpad[0])
+
+  ; opad block: key XOR $5C, then $5C padding
+  i = 0
+  While i < klen
+    secHmacBlk[i] = (PeekA(kb + i) & 255) ! $5C
+    i = i + 1
+  Wend
+  While i < 64
+    secHmacBlk[i] = $5C
+    i = i + 1
+  Wend
+  Sha256Begin()
+  Sha256Update(@secHmacBlk[0], 64)
+  Sha256Snapshot(@secHmacOpad[0])
+
+  HmacBegin()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HmacOf(key, keylen, msg, msglen, dst) - one-shot full 32-byte MAC.
+; ----------------------------------------------------------------------
+Procedure HmacOf(key.i, keylen.i, msg.i, msglen.i, dst.i)
+  HmacKey(key, keylen)
+  HmacUpdate(msg, msglen)
+  HmacEnd(dst, 32)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PrfSha256(secret, slen, label, llen, seed, slen2, dst, outlen)
+;
+;  TLS 1.2 P_SHA256 (RFC 5246 s5): expand the secret over the public
+;  (label + seed) into outlen bytes at dst. With SHA-256 the only hash,
+;  P_hash IS the PRF. Faithful to the BearSSL two-step: zero dst, then XOR
+;  each HMAC block in (a single P_hash, so the XOR equals assignment).
+;
+;    A(0) = label + seed
+;    A(i) = HMAC(secret, A(i-1))
+;    out  = HMAC(secret, A(1) + label + seed)
+;         + HMAC(secret, A(2) + label + seed) + ...
+;
+;  secret is secret; label and seed are public; the running A and each
+;  HMAC block are secret-derived, so they are sec-named. The key is set
+;  once (HmacKey) and every block reuses it via HmacBegin.
+;
+;  UNTESTED ON THIS TARGET. See the header. It is here because removing
+;  it would make this file's API differ from its three siblings for no
+;  reason, and because everything under it is gated - but the published
+;  PRF vector has not been run against this build, and TLS 1.2 on this
+;  part is not gated until it has been.
+; ----------------------------------------------------------------------
+Procedure.i PrfSha256(secret.i, slen.i, label.i, llen.i, seed.i, slen2.i, dst.i, outlen.i)
+  Protected i.i
+  Protected u.i
+  Protected off.i
+  Protected rem.i
+
+  If outlen <= 0
+    ProcedureReturn 0
+  EndIf
+
+  ; dst starts zeroed - the XOR below then equals assignment
+  i = 0
+  While i < outlen
+    PokeB(dst + i, 0)
+    i = i + 1
+  Wend
+
+  HmacKey(secret, slen)
+
+  ; secPrfA = A(1) = HMAC(secret, label + seed)
+  HmacBegin()
+  HmacUpdate(label, llen)
+  HmacUpdate(seed, slen2)
+  HmacEnd(@secPrfA[0], 32)
+
+  off = 0
+  rem = outlen
+  Repeat
+    ; secPrfTmp = HMAC(secret, A(i) + label + seed)
+    HmacBegin()
+    HmacUpdate(@secPrfA[0], 32)
+    HmacUpdate(label, llen)
+    HmacUpdate(seed, slen2)
+    HmacEnd(@secPrfTmp[0], 32)
+
+    u = 32
+    If u > rem
+      u = rem
+    EndIf
+    i = 0
+    While i < u
+      PokeB(dst + off + i, PeekA(dst + off + i) ! (secPrfTmp[i] & 255))
+      i = i + 1
+    Wend
+    off = off + u
+    rem = rem - u
+    If rem = 0
+      ProcedureReturn outlen
+    EndIf
+
+    ; A(i+1) = HMAC(secret, A(i))
+    HmacBegin()
+    HmacUpdate(@secPrfA[0], 32)
+    HmacEnd(@secPrfA[0], 32)
+  ForEver
+EndProcedure
+; ==== PORTABLE CORE A64 END ====

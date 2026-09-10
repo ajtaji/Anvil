@@ -1,0 +1,453 @@
+; ======================================================================
+;  qcon_q.pi4 - Arduino UNO Q: THE CONSOLE. Both halves of it.
+;
+;  This is the file ArduinoQ/Board/README.md said could not be written:
+;
+;      "Anvil's core is a command loop over a line editor: it needs to
+;       *read* bytes as well as write them. qsink.pi4 is a write-only
+;       2 KB buffer flushed once, at exit ... The endpoint that would
+;       provide one - the GENI SE4 UART at 0x04A90000 - is 1.8 V and
+;       deferred for want of a level shifter, so this is a hardware
+;       blocker, not an afternoon's typing."
+;
+;  That reasoning was sound and its conclusion was wrong, because it only
+;  considered ONE byte path. The Q runs Anvil as a UEFI application with
+;  BOOT SERVICES STILL UP, and UEFI is obliged to publish a console while
+;  they are: EFI_SIMPLE_TEXT_INPUT_PROTOCOL on SystemTable->ConIn is a
+;  keyboard, and it needs no level shifter. The probe
+;  (ArduinoQ/Examples/Diagnostics/anvilqconprobe.pi4, run on the board
+;  2026-09-02) confirmed ConIn is alive: a real WaitForKey event, and
+;  ReadKeyStroke correctly answering EFI_NOT_READY when no key is waiting.
+;
+;  So the console seam is real. What the SAME probe also measured, and
+;  what this file is honest about:
+;
+;    * GOP IS ABSENT (LocateProtocol -> EFI_NOT_FOUND). There is no
+;      framebuffer, so the firmware's console text goes to its serial
+;      stdout - the 1.8 V SE4 UART. ConOut ACCEPTS our bytes (status 0)
+;      but NOBODY ON THIS BENCH CAN SEE THEM. We write to it anyway:
+;      refusing to drive a console the board actually has would be wrong,
+;      and the moment a 1.8 V adapter is attached it becomes a live
+;      terminal with no code change.
+;    * NOTHING WAS TYPING. Six seconds of polling, 600 attempts, no key.
+;      With ConOut invisible and no USB keyboard bound to ConIn, the
+;      interactive path exists but has no operator on it today.
+;
+;  Hence TWO INPUT SOURCES, tried in this order, and the design that makes
+;  the Q usable right now:
+;
+;    1. ConIn keystrokes - the real interactive path, live the instant
+;       anything is attached to the firmware console.
+;    2. A STAGED COMMAND SCRIPT, read once at startup from
+;       \EFI\anvil\anvil.in on the EFI System Partition. That file is
+;       written from Linux over SSH. It is not a simulation of input: the
+;       bytes go through the same UartRead() the line editor would get
+;       from a UART, into the same ReadLine(), the same parser and the
+;       same dispatcher. Only the wire is different.
+;
+;  and ONE OBSERVABLE OUTPUT: every byte Anvil prints is also appended to
+;  a transcript in DRAM, which is flushed to \EFI\anvil\anvil.log on the
+;  ESP and read back over SSH. The probe proved ESP file write works end
+;  to end. This replaces qsink.pi4's 2 KB UEFI variable - U-Boot's whole
+;  variable store on this board is about 1.5 KB, which will not hold a
+;  monitor session.
+;
+;  THE NAMES IN THIS FILE ARE NOT ARBITRARY. Anvil has no HwUart* seam -
+;  there is no such group in Anvil/Hal/hal.pbi and no such procedure in
+;  the tree. The console seam IS this exact name set, substituted at the
+;  file level, and the compiler resolves Print()/PrintN() to three of them
+;  BY LOWERCASED NAME (str_print_at, printdec, printnl). Rename any one
+;  and the build fails in a way that does not mention this file.
+;  RaspberryPi4/Lib/uart.pi4 is the reference implementation.
+;
+;  REQUIRES: ArduinoQ/Board/qefi_q.unoq included FIRST.
+; ======================================================================
+
+; The transcript. BSS is a zero tail in this image format, so a generous
+; buffer costs file size nothing and a monitor session costs far more than
+; the 2 KB the phase-1 variable sink allowed.
+#Q_LOG_MAX  = 131072            ; 128 KB of session transcript
+#Q_IN_MAX   = 8192              ; a staged command script
+#Q_LINE_MAX = 256               ; the ConOut line-batching buffer
+
+Global Dim gQLog.b[#Q_LOG_MAX]
+Global gQLogLen.i
+Global gQLogLost.i              ; bytes dropped after the transcript filled
+
+Global Dim gQIn.b[#Q_IN_MAX]    ; the staged script
+Global gQInLen.i
+Global gQInPos.i
+Global gQInUsed.i               ; 1 if a script was found at startup
+
+Global Dim gQLineBuf.b[#Q_LINE_MAX]
+Global gQLineLen.i
+
+Global gQPend.i                 ; one-key pushback, -1 = empty
+Global gQKeysSeen.i             ; how many real ConIn keystrokes arrived
+Global gQIdleUs.i               ; microseconds spent waiting with no input
+
+; ----------------------------------------------------------------------
+;  gQTyping - IS THE SCRIPT ALLOWED TO BE TYPING RIGHT NOW?
+;
+;  This flag exists because of a bug the first board run produced, and it
+;  is worth writing down because the core was RIGHT and the seam was
+;  wrong.
+;
+;  Anvil lets the operator abort a long-running command by pressing a
+;  key: Anvil/Core/rxbreak.pbi's OutBreak() polls UartReadReady() while a
+;  command prints, and any waiting byte means "stop". On a real terminal
+;  that is exactly correct. With a staged script it is a disaster,
+;  because THE NEXT COMMAND'S BYTES ARE ALREADY WAITING. The first run on
+;  the board showed it precisely:
+;
+;      pmf> memory 13FDE8F20 40
+;      Stopped, because a key was pressed.
+;      pmf> rc32 13FDE8F20 100        <- the 'c' of crc32 was eaten
+;      ...
+;      pmf> xit                       <- the 'e' of exit was eaten
+;
+;  Every command aborted immediately and each abort consumed one
+;  character of the following line.
+;
+;  The fix is not to weaken the break detector - that would cost the
+;  operator the abort key on every board. It is to model the script
+;  honestly: a script is a TYPIST, and a typist does not type while
+;  reading the output of the last command. So script bytes are delivered
+;  only while the line editor is actually collecting a line, which
+;  board.pi4 marks by setting this flag around ReadLine(). ConIn
+;  keystrokes are NOT gated - a real person interrupting a long command
+;  is exactly what the break detector is for, and that still works.
+; ----------------------------------------------------------------------
+Global gQTyping.i               ; 1 while ReadLine() is collecting a line
+
+; ----------------------------------------------------------------------
+;  THE DEADMAN, and why a console on this board must have one.
+;
+;  On the Pi 4 UartRead() blocks for ever, which is right: the operator is
+;  sitting at a terminal and the board is theirs until they reset it. On
+;  the Q the situation is inverted. Anvil is a ONE-SHOT boot entry; Debian
+;  is the default and the board comes back on the next boot only if this
+;  image RETURNS. If the staged script runs out and no key is attached,
+;  a for-ever blocking read would hang the Q with no console anyone can
+;  see and no way back short of pulling the power.
+;
+;  So an idle read that goes this long flushes the transcript and resets
+;  to Debian. It is a safety property of the platform, not a timeout on
+;  the operator: any keystroke resets the count, so a real terminal is
+;  never cut off mid-session.
+; ----------------------------------------------------------------------
+#Q_IDLE_LIMIT_US = 45000000     ; 45 seconds
+
+Global gQExitWanted.i           ; set by the `exit` command / the deadman
+Global gQExitReason.i           ; 0 none, 1 script end, 2 idle deadman, 3 exit cmd
+
+; ----------------------------------------------------------------------
+;  QLogFlush - land the transcript on the ESP.
+;
+;  Called after every command, so a session that ends badly still leaves
+;  everything up to the last completed command on disk. QEspWrite deletes
+;  before it creates, so the file never keeps a stale tail.
+; ----------------------------------------------------------------------
+Procedure QLogFlush()
+  QEspWrite("\EFI\anvil\anvil.log", @gQLog[0], gQLogLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QConFlushLine - push the pending line at the firmware console.
+;
+;  Output is batched per line rather than per character because each
+;  OutputString is a firmware call. It is flushed on newline, when the
+;  line buffer fills, and before any read - that last one matters, because
+;  a prompt has no newline after it ("pmf> ") and must appear BEFORE the
+;  monitor starts waiting for the answer to it.
+; ----------------------------------------------------------------------
+Procedure QConFlushLine()
+  If gQLineLen > 0
+    QEfiOutRun(@gQLineBuf[0], gQLineLen)
+    gQLineLen = 0
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE WRITE HALF - the same five names RaspberryPi4/Lib/uart.pi4 exports.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UartWrite(c) - the ONE transport dependency, same name and shape as
+;  uart.pi4's. Every byte goes two places: the transcript (which is what
+;  anyone can actually read) and the firmware console (which is real, and
+;  invisible on this bench). Returns 1 like the PL011 version.
+; ----------------------------------------------------------------------
+Procedure UartWrite(c.i)
+  c = c & $FF
+  If gQLogLen < #Q_LOG_MAX
+    gQLog[gQLogLen] = c
+    gQLogLen = gQLogLen + 1
+  Else
+    gQLogLost = gQLogLost + 1
+  EndIf
+
+  ; A bare LF is expanded to CR LF for the firmware console only; the
+  ; transcript keeps exactly what the core emitted.
+  If c = 10
+    If gQLineLen < #Q_LINE_MAX - 2
+      gQLineBuf[gQLineLen] = 13
+      gQLineLen = gQLineLen + 1
+      gQLineBuf[gQLineLen] = 10
+      gQLineLen = gQLineLen + 1
+    EndIf
+    QConFlushLine()
+    ProcedureReturn 1
+  EndIf
+  If c = 13
+    ProcedureReturn 1              ; the LF that follows emits both
+  EndIf
+
+  gQLineBuf[gQLineLen] = c
+  gQLineLen = gQLineLen + 1
+  If gQLineLen >= #Q_LINE_MAX - 2
+    QConFlushLine()
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure UartWriteStr(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    UartWrite(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure UartWriteNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure
+
+; UartInit(baud) - the firmware already owns this console and there is no
+; baud rate to set on it, so this is honest about doing nothing and
+; reports success. The argument is accepted so the core's Main() and the
+; `baud` command keep the same shape on every board.
+Procedure.i UartInit(baud.i)
+  gQPend = -1
+  ProcedureReturn 1
+EndProcedure
+
+; UartDrain() - the Pi 4 waits for the PL011 FIFO to empty. Here the
+; equivalent is making sure a part-built line has reached ConOut.
+Procedure UartDrain()
+  QConFlushLine()
+EndProcedure
+
+; ======================================================================
+;  THE READ HALF - the part that did not exist on this board before.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  QInLoad - read the staged command script off the ESP, once, at startup.
+;  A missing file is not an error: it means "there is no script, use the
+;  keyboard", which is the normal case for an attached terminal.
+; ----------------------------------------------------------------------
+Procedure QInLoad()
+  Define n.i
+  gQInLen = 0
+  gQInPos = 0
+  gQInUsed = 0
+  n = QEspRead("\EFI\anvil\anvil.in", @gQIn[0], #Q_IN_MAX)
+  If n > 0
+    gQInLen = n
+    gQInUsed = 1
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartReadReady() - 1 if a byte is waiting, and it NEVER blocks.
+;
+;  Matches uart.pi4:899 exactly, including the absence of a return-type
+;  sigil - it is `Procedure`, not `Procedure.i`, and the line editor at
+;  Anvil/Core/parse.pbi:46 tests it with `<> 0`.
+;
+;  A ConIn key polled here is stashed in gQPend rather than dropped:
+;  ReadKeyStroke CONSUMES the key, so asking "is one ready?" and then
+;  reading it later would lose exactly one keystroke per line - the
+;  classic peek-versus-consume bug in a line editor.
+; ----------------------------------------------------------------------
+Procedure UartReadReady()
+  Define k.i
+  If gQPend >= 0
+    ProcedureReturn 1
+  EndIf
+  If gQTyping <> 0 And gQInPos < gQInLen
+    ProcedureReturn 1
+  EndIf
+  QConFlushLine()
+  k = QEfiReadKey()
+  If k >= 0
+    gQPend = k
+    gQKeysSeen = gQKeysSeen + 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartRead() - one byte. Blocks until there is one, or until the deadman
+;  above decides nobody is coming.
+;
+;  When the deadman fires it does NOT hang and it does NOT return
+;  garbage: it sets gQExitWanted and returns a carriage return, so the
+;  line editor completes the line it was building, the command loop gets
+;  one clean iteration, and Main() sees the flag and shuts down properly
+;  with the transcript flushed. An abrupt exit from inside the line editor
+;  would lose the tail of the session, which is the one thing a capture
+;  cannot afford to lose.
+; ----------------------------------------------------------------------
+Procedure.i UartRead()
+  Define k.i
+  Define c.i
+  gQIdleUs = 0
+  Repeat
+    If gQPend >= 0
+      c = gQPend
+      gQPend = -1
+      ProcedureReturn c
+    EndIf
+    If gQTyping <> 0 And gQInPos < gQInLen
+      c = gQIn[gQInPos] & $FF
+      gQInPos = gQInPos + 1
+      ProcedureReturn c
+    EndIf
+
+    ; The script has been fully typed and there is no terminal on this
+    ; board's console. Waiting out the deadman would add 45 seconds of
+    ; nothing to every scripted run, so an exhausted script ends the
+    ; session directly - and says which of the two it was, because
+    ; "the script finished" and "nobody was there" are different facts.
+    If gQTyping <> 0 And gQInUsed <> 0 And gQInPos >= gQInLen
+      gQExitWanted = 1
+      gQExitReason = 1
+      ProcedureReturn 13
+    EndIf
+
+    QConFlushLine()
+    k = QEfiReadKey()
+    If k >= 0
+      gQKeysSeen = gQKeysSeen + 1
+      gQIdleUs = 0
+      ProcedureReturn k
+    EndIf
+
+    If gQExitWanted <> 0
+      ProcedureReturn 13
+    EndIf
+
+    QEfiStall(2000)
+    gQIdleUs = gQIdleUs + 2000
+    If gQIdleUs >= #Q_IDLE_LIMIT_US
+      gQExitWanted = 1
+      gQExitReason = 2
+      ProcedureReturn 13
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartReadWait(spins) - a byte, or -1 if none arrives within roughly
+;  `spins` polls. uart.pi4:933's contract; the transfer protocol and the
+;  break detector use it so they can time out instead of hanging.
+; ----------------------------------------------------------------------
+Procedure.i UartReadWait(spins.i)
+  Define i.i
+  i = 0
+  While i < spins
+    If UartReadReady() <> 0
+      ProcedureReturn UartRead()
+    EndIf
+    QEfiStall(100)
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; ======================================================================
+;  THE PRINT ROUTER'S THREE PROCEDURES.
+;
+;  The compiler resolves Print()/PrintN() to these BY LOWERCASED NAME:
+;  str_print_at, printdec, printnl (RaspberryPi4/IRCore_A64.pbi:4515,
+;  4537, 4541). They are uart.pi4's, transport swapped. Renaming one does
+;  not give a link error - it gives the front end's
+;  "Print()/PrintN() needs ... (it defines printdec)".
+; ======================================================================
+
+; str_print_at(p) - the raw-address string walk behind Print("literal").
+Procedure str_print_at(p.i)
+  Define c.i
+  c = PeekB(p) & $FF
+  While c <> 0
+    UartWrite(c)
+    p = p + 1
+    c = PeekB(p) & $FF
+  Wend
+EndProcedure
+
+; PrintDec(v) - a SIGNED integer in base 10. uart.pi4's version verbatim
+; (the run-time-built, checked 19-digit scale that survives a stale 32-bit
+; compiler), transport swapped to UartWrite.
+Procedure PrintDec(v.i)
+  Define d.i
+  Define scale.i
+  Define started.i
+  If v < 0
+    UartWrite(45)                ; '-'
+    v = 0 - v
+  EndIf
+  If v = 0
+    UartWrite(48)                ; '0'
+    ProcedureReturn
+  EndIf
+  scale = 1000000000
+  scale = scale * 1000000000
+  If scale <= 0
+    scale = 1000000000
+  EndIf
+  started = 0
+  While scale > 0
+    d = (v / scale) % 10
+    If d <> 0 Or started <> 0
+      UartWrite(48 + d)
+      started = 1
+    EndIf
+    scale = scale / 10
+  Wend
+EndProcedure
+
+Procedure PrintNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QConInit - bring the console up. Called by Main() after QEfiInit.
+;  Clears the firmware screen (harmless when nothing is displaying it),
+;  loads any staged script, and arms the pushback.
+; ----------------------------------------------------------------------
+Procedure QConInit()
+  gQPend = -1
+  gQLogLen = 0
+  gQLogLost = 0
+  gQLineLen = 0
+  gQKeysSeen = 0
+  gQExitWanted = 0
+  gQExitReason = 0
+  If gQConOut <> 0
+    QCall(PeekI(gQConOut + #QTXO_CLEARSCREEN), gQConOut, 0, 0, 0, 0)
+    QCall(PeekI(gQConOut + #QTXO_ENABLECURSOR), gQConOut, 1, 0, 0, 0)
+  EndIf
+  QInLoad()
+EndProcedure

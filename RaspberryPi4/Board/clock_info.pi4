@@ -1,0 +1,257 @@
+; ======================================================================
+;  PutRevision(r) - a Raspberry Pi firmware revision code, decoded.
+;
+;  IT LIVES HERE, NOT IN THE CORE, and that is forum 575 in a quieter
+;  place than the banner. It was in Anvil/Core/uptime.pbi until now: a
+;  table of this vendor's board names and this vendor's part numbers,
+;  compiled into every board's image, in the file that is supposed to
+;  contain no chip at all. Its only caller has always been the line a
+;  few dozen lines below this one.
+; ======================================================================
+Procedure PutRevision(r.i)
+  Define t.i
+  Define p.i
+  Define mem.i
+  Define mb.i
+  ; NEW-STYLE CODES ONLY. Bit 23 says which scheme this is; an old-style
+  ; code is a small board number from a table this decoder does not
+  ; carry, and inventing an answer for it would be worse than saying so.
+  If (r & $00800000) = 0
+    Print("an old-style revision code, which this monitor does not decode")
+    ProcedureReturn
+  EndIf
+  ; Every one of these shifts is of a positive value (r is a firmware
+  ; word below $01000000 here), so ">>" being arithmetic cannot bite.
+  t   = (r >> 4) & $FF
+  p   = (r >> 12) & $F
+  mem = (r >> 20) & 7
+
+  ; THE BOARD TABLE STOPS AT THE BCM2711 FAMILY. See the note on i in
+  ; the header: a decoder that names a board it has never met is a
+  ; confident wrong answer, and the SoC and memory below are decoded
+  ; from their own fields and stay correct whatever this says.
+  If t = $11
+    Print("Pi 4 Model B")
+  ElseIf t = $13
+    Print("Pi 400")
+  ElseIf t = $14
+    Print("Compute Module 4")
+  ElseIf t = $15
+    Print("Compute Module 4S")
+  Else
+    Print("a board this monitor does not have a name for, type $")
+    PutHex2(t)
+  EndIf
+
+  Print(", ")
+  If p = 0
+    Print("BCM2835")
+  ElseIf p = 1
+    Print("BCM2836")
+  ElseIf p = 2
+    Print("BCM2837")
+  ElseIf p = 3
+    Print("BCM2711")
+  ElseIf p = 4
+    Print("BCM2712")
+  Else
+    Print("a processor this monitor does not have a name for, type $")
+    PutHex2(p)
+  EndIf
+
+  ; The memory field is a power of two multiplying 256 MB, so it needs
+  ; no table and cannot go stale when a new size appears.
+  Print(", ")
+  mb = 256 << mem
+  If mb >= 1024
+    PrintDec(mb / 1024)
+    Print(" GB")
+  Else
+    PrintDec(mb)
+    Print(" MB")
+  EndIf
+
+  Print(", rev 1.")
+  PrintDec(r & $F)
+EndProcedure
+
+Procedure CmdInfo()
+  Define rev.i
+  Define tc.i
+  Define tmax.i
+
+  ; WHAT THIS BOARD SAYS ABOUT ADDRESSES, printed FIRST and outside the
+  ; mailbox check on purpose. It is board knowledge that needs no
+  ; firmware to answer, and it is the one section of `info` an operator
+  ; is sent here to read - the refusals that a command can print all end
+  ; by saying "info lists what this board does know". A section that
+  ; disappeared because the mailbox was not up would make that a lie on
+  ; exactly the boards where things are already going wrong.
+  HwAddrReport()
+
+  If MbxUp() = 0
+    ProcedureReturn
+  EndIf
+
+  rev = MailboxBoardRevision()
+  Print("board       ")
+  If rev = 0
+    PrintN("the firmware would not say what board this is.")
+    PutMailboxWhy(MailboxError())
+  Else
+    PutRevision(rev)
+    Print("   (revision code $")
+    PutHex8(rev)
+    PrintN(")")
+  EndIf
+
+  tc = MailboxTemperature()
+  tmax = MailboxTemperatureMax()
+  Print("temperature ")
+  If tc = 0
+    PrintN("the firmware would not give a temperature reading.")
+  Else
+    ; The READING gets the bracket - Fahrenheit first, then the celsius
+    ; and the raw millidegrees the firmware sent, so this line can be
+    ; checked against another tool. The THROTTLE POINT is a threshold
+    ; the firmware states rather than a measurement, so it is Fahrenheit
+    ; alone.
+    PutTempReadF(tc)
+    Print(" inside the chip")
+    If tmax > 0
+      Print(", and the firmware")
+      PrintNl()
+      Print("            starts slowing the board down at ")
+      PutTempF(tmax)
+    EndIf
+    PrintN(".")
+  EndIf
+
+  ; CONFIGURED AND MEASURED ARE DIFFERENT QUESTIONS - see the header.
+  ; The configured rate is the firmware's intention; the measured rate
+  ; is its observation, and the governor moves the two apart without
+  ; telling anybody.
+  PrintN("clock rates. The configured rate is what the firmware intends and the")
+  PrintN("measured rate is what it observes; the governor moves the two apart")
+  PrintN("without telling anybody, so both are shown.")
+  Print("  the processor cores       ")  : PutClockRow(#MBX_CLK_ARM)
+  Print("  the VideoCore and buses   ")  : PutClockRow(#MBX_CLK_CORE)
+  Print("  the SD card interface     ")  : PutClockRow(#MBX_CLK_EMMC)
+  Print("  the serial port           ")  : PutClockRow(#MBX_CLK_UART)
+
+  ; Not a mailbox number: CNTFRQ_EL0, read straight off the core. It is
+  ; here because every timeout in this monitor is counted in it, so when
+  ; a transfer times out too early this is the first line to look at.
+  Print("  the tick counter          ")
+  PrintDec(TickHz())
+  PrintN(" Hz")
+  PrintN("Every timeout in this monitor is counted on that last one, and it runs")
+  PrintN("at its own fixed rate no matter what the processor clock is doing. If a")
+  PrintN("transfer gives up far too early, that is the number to look at first.")
+
+  ; THE I2C BUS'S PINS. Printed here because `info` is where an operator
+  ; is sent to find out what this board is, and until 2026-09-03 there was
+  ; nowhere at all to find out whether the two bus pads were actually
+  ; connected to the I2C controller - they were not, for the whole life of
+  ; the command, and every symptom pointed at the wiring instead (forum
+  ; 584). One line in `info` and one in `i2c speed`, both rendered by the
+  ; same procedure so they cannot drift apart.
+  ;
+  ; AND THE BUS'S RATE, added 2026-09-03 for forum 622 and printed
+  ; directly under the clock rows above on purpose. This command was
+  ; already measuring the VideoCore clock four lines up while `i2c speed`
+  ; was dividing a datasheet constant three times smaller, and neither
+  ; looked at the other. Both now render from I2cSayRate, so the source
+  ; clock and the bus rate sit on one screen and any disagreement between
+  ; them would be visible rather than something to be worked out.
+  PrintN("i2c bus.")
+  I2cSayRate(HwI2cDefaultBus())
+  I2cSayPins(HwI2cDefaultBus())
+EndProcedure
+
+Procedure CmdClock()
+  Define want.i
+  Define applied.i
+  Define got.i
+  If MbxUp() = 0
+    ProcedureReturn
+  EndIf
+
+  want = ParseDec()
+  If gParseOk = 0
+    If gParseOver <> 0
+      PrintN("!! that rate has more digits than a 64-bit number can hold. The")
+      PrintN("   clock is unchanged. Give the rate in hertz, in decimal - a Pi 4")
+      PrintN("   runs at 1500000000 hertz when it is running flat out.")
+      ProcedureReturn
+    EndIf
+    ; Bare clock - report, change nothing.
+    Print("The processor clock is configured to run at ")
+    PutRate(ClockHz(#MBX_CLK_ARM))
+    PrintN(".")
+    Print("  The slowest the firmware will set it to is ")
+    PutRate(ClockMinHz(#MBX_CLK_ARM))
+    PrintN(",")
+    Print("  and the fastest is ")
+    PutRate(ClockMaxHz(#MBX_CLK_ARM))
+    PrintN(".")
+    Print("  Right now it is actually measured at ")
+    PutRate(ClockMeasuredHz(#MBX_CLK_ARM))
+    PrintN(".")
+    PrintN("  Type clock <rate> to change it. The rate is in hertz and it is the")
+    PrintN("  one argument in this monitor that is DECIMAL rather than hex; put a")
+    PrintN("  dollar sign or an 0x in front of it if you really do mean hex.")
+    ProcedureReturn
+  EndIf
+
+  If want <= 0
+    PrintN("!! a clock rate has to be a positive number of hertz, so the clock is")
+    PrintN("   unchanged. A Pi 4 runs at 1500000000 hertz flat out and boots at")
+    PrintN("   600000000; anything between the two is worth asking for.")
+    ProcedureReturn
+  EndIf
+
+  Print("You asked for ")
+  PutRate(want)
+  PrintN(".")
+
+  applied = ClockSetHz(#MBX_CLK_ARM, want)
+  If applied = 0
+    PrintN("!! the firmware would not set the clock at all, so it is running at")
+    PrintN("   whatever it was running at before. Nothing has changed.")
+    PutMailboxWhy(MailboxError())
+    ProcedureReturn
+  EndIf
+
+  ; NEVER JUST "ok". The firmware CLAMPS a rate it dislikes and reports
+  ; SUCCESS - ask for 2.5 GHz on a 1.5 GHz part and you are told success
+  ; and given 1500000000. So the applied rate is printed whether or not
+  ; it matches, and the mismatch is named.
+  Print("The firmware applied ")
+  PutRate(applied)
+  PrintN(".")
+  If applied <> want
+    PrintN("!! that is not what you asked for. The firmware clamped it and still")
+    PrintN("   reported success, which it always does - asking a 1.5 GHz part for")
+    PrintN("   2.5 GHz is answered with success and 1500000000. The ceiling comes")
+    PrintN("   from arm_freq_max in config.txt on the boot medium, not from the")
+    PrintN("   silicon. Type clock with no argument to see what the limits are.")
+  EndIf
+
+  ; And the applied rate is still only an intention. The on-demand
+  ; governor can walk the clock back down between these two lines, for
+  ; thermal or undervoltage reasons, with no notification at all.
+  got = ClockMeasuredHz(#MBX_CLK_ARM)
+  Print("Measuring it now gives ")
+  PutRate(got)
+  PrintN(".")
+  If got < applied - (applied / 20)
+    PrintN("!! the measured rate is well under the applied one. Something is")
+    PrintN("   holding the clock down: the on-demand governor, the thermal limit,")
+    PrintN("   or an undervoltage warning from the power supply. Type info to see")
+    PrintN("   the temperature. This is not a fault in the monitor.")
+  EndIf
+  PrintN("  No timeout in this monitor has changed. They are all counted on the")
+  PrintN("  tick counter, which runs at its own fixed rate whatever the processor")
+  PrintN("  clock is set to.")
+EndProcedure
