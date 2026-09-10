@@ -123,6 +123,9 @@ settings save
 the common manual clock and zone commands, not network synchronization.
 See [wall-clock commands and trust boundaries](docs/WALL_CLOCK.md).
 
+The [panel/touch boot trace](docs/BOOT_I2C_TRACE.md) explains `touch trace`,
+which reads retained failure evidence without initiating another hardware probe.
+
 Returning applications have an explicit
 [hardware ownership and Ethernet recovery contract](docs/PAYLOAD_LIFECYCLE.md).
 The monitor stops active Ethernet DMA before entry and rebuilds the previously
