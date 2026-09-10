@@ -2080,9 +2080,17 @@ Procedure Main()
   ; bounded RAM history, not extra probes; disable retains it for touch trace.
   I2cTraceEnable(1)
   ScreenUp()
-  ScreenEarlyLogFinish()
   TouchBoot()
   I2cTraceEnable(0)
+  ; Switch the established surface to the preferred V3D renderer before the
+  ; long network bring-up paints its progress. ScreenUp's initial banner is
+  ; necessarily drawn once by the CPU/DMA tier because V3D needs that live
+  ; surface; the queued boot log is not drained until after this activation.
+  ; Failure is non-fatal: V3dConAutoStart leaves the DMA/CPU renderer active.
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  V3dConAutoStart()
+  CompilerEndIf
+  ScreenEarlyLogFinish()
   GenetSetProgressHook(@ScreenServiceTick)
   NetWaitSetProgressHook(@ScreenServiceTick)
   WifiSetProgressHook(@ScreenServiceTick)
@@ -2101,18 +2109,6 @@ Procedure Main()
   ; fails its magic so the persisted target is what acts.
   BootWait()
   BootFileWait()
-
-  ; THE CONSOLE TIER, chosen by driver availability with V3D PREFERRED.
-  ; The DMA/CPU framebuffer console carried the boot log above; now, after
-  ; every other driver is up (so V3dInit never contends with the Wi-Fi
-  ; bring-up's mailbox), bring the 3D stack up. If it initialises, the V3D
-  ; GPU console becomes the default the operator meets at the prompt; if
-  ; not, the framebuffer console stays - DMA-accelerated, or plain CPU if
-  ; the DMA engine did not bind. See V3dConAutoStart for the honest cost.
-  CompilerIf #ANVIL_V3D_CONSOLE = 1
-  V3dConAutoStart()
-  ScreenServiceTick()
-  CompilerEndIf
 
   ; THE FAN, LAST, AND AFTER THE SETTINGS ARE IN. FanBoot() resets the
   ; curve to its documented defaults, lets SETTINGS.TXT override what it
