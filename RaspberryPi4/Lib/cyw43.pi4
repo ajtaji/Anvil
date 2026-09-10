@@ -715,7 +715,9 @@
 ; order, so tosbmailboxdata is $048.
 #CYW43_SD_INTSTATUS_OFF  = $020       ; s:216
 #CYW43_SD_HOSTINTMASK    = $024       ; s:217
+#CYW43_SD_TOSBMAILBOX    = $040       ; s:223
 #CYW43_SD_TOSBMBDATA     = $048       ; s:225
+#CYW43_SD_TOHOSTMBDATA   = $04C       ; s:226
 
 ; The host protocol version the driver announces to the firmware, and
 ; where in the mailbox word it goes. sdio.c lines 290 and 260.
@@ -728,6 +730,44 @@
 ; because the two halves come from lines sixteen apart in the source and
 ; an Or at the point of use would put the citation in the wrong place.
 #CYW43_HOSTINTMASK       = $200000F0  ; c:780, c:211, c:229
+
+; Device-core interrupt allocation, v6.12 brcmfmac sdio.c lines 267-270.
+; These are CYW43/SDPCM semantics, distinct from SDHCI CARD_INT below.
+#CYW43_I_HMB_FC_STATE  = $00000010
+#CYW43_I_HMB_FC_CHANGE = $00000020
+#CYW43_I_HMB_FRAME_IND = $00000040
+#CYW43_I_HMB_HOST_INT  = $00000080
+#CYW43_I_CHIPACTIVE    = $20000000
+
+; The host mailbox acknowledgement and data bits, sdio.c lines 253-283.
+#CYW43_SMB_INT_ACK       = $00000002
+#CYW43_HMB_NAKHANDLED    = $00000001
+#CYW43_HMB_DEVREADY      = $00000002
+#CYW43_HMB_FC            = $00000004
+#CYW43_HMB_FWREADY       = $00000008
+#CYW43_HMB_FWHALT        = $00000010
+#CYW43_HMB_VERSION_MASK  = $00FF0000
+#CYW43_HMB_VERSION_SHIFT = 16
+
+; Optional SDIO host-readiness callback ABI. sdio.pi4 deliberately repeats
+; these values: libraries do not include libraries in this project.
+#CYW43_RXIRQ_ARM      = 1
+#CYW43_RXIRQ_PENDING  = 2
+#CYW43_RXIRQ_QUIESCE  = 3
+#CYW43_RXIRQ_REARM    = 4
+#CYW43_RXIRQ_DISABLE  = 5
+
+#CYW43_RXIRQ_FAULT_NONE      = 0
+#CYW43_RXIRQ_FAULT_PENDING   = 1
+#CYW43_RXIRQ_FAULT_QUIESCE   = 2
+#CYW43_RXIRQ_FAULT_STATUS_RD = 3
+#CYW43_RXIRQ_FAULT_STATUS_WR = 4
+#CYW43_RXIRQ_FAULT_FC_RD     = 5
+#CYW43_RXIRQ_FAULT_MAIL_RD   = 6
+#CYW43_RXIRQ_FAULT_MAIL_ACK  = 7
+#CYW43_RXIRQ_FAULT_REARM     = 8
+#CYW43_RXIRQ_FAULT_ARM       = 9
+#CYW43_RXIRQ_FAULT_RESTORE   = 10
 
 ; How long to wait for the HT clock. PMU_MAX_TRANSITION_DLY again -
 ; sdio.c lines 311-312 - the same one microsecond-count the ALP wait
@@ -1324,6 +1364,9 @@
 ; transport, this blames the bytes. The raw word is in Cyw43ClmStatus().
 #CYW43_IO_CLMBAD  = -5
 #CYW43_IO_PENDING = -6       ; received data retained; caller must drain it
+; A destructive transport-generation change was refused while the optional
+; readiness callback still owns card/host state from the old generation.
+#CYW43_IO_OWNED   = -7
 
 ; What Cyw43ScanPoll returns.
 #CYW43_SCAN_RUNNING = 0
@@ -1741,6 +1784,7 @@
 #CYW43_ERR_HT_TMO      = 28   ; the chip never reported HT available
 #CYW43_ERR_F2_TMO      = 29   ; F2 never reported ready - firmware did not run
 #CYW43_ERR_NOT_LOADED  = 30   ; Cyw43Start before an image was uploaded
+#CYW43_ERR_RXIRQ_OWNED = 31   ; verified telemetry disable required first
 
 ; ======================================================================
 ;  State.
@@ -1750,6 +1794,43 @@ Global *cyw43_rb        ; Rb(fn, addr) -> 0..255 or negative
 Global *cyw43_wb        ; Wb(fn, addr, val) -> 1/0
 Global *cyw43_rd        ; Rd(fn, addr, *buf, n, incr) -> 1/0
 Global *cyw43_wr        ; Wr(fn, addr, *buf, n, incr) -> 1/0
+
+; Optional host/card readiness operation callback. It is separately wired and
+; default-off so an existing program which supplies only the four data
+; primitives has byte-for-byte the old receive schedule. See
+; Cyw43SetRxIrqIo/Cyw43RxIrqTelemetry.
+Global *cyw43_rxIrqOp
+Global cyw43_rxIrqActive.i = 0
+Global cyw43_rxIrqNeedsDisable.i = 0
+Global cyw43_rxIrqBusy.i = 0
+Global cyw43_rxIrqCore.i = 0
+Global cyw43_rxIrqPending.i = 0
+Global cyw43_rxIrqFault.i = #CYW43_RXIRQ_FAULT_NONE
+Global cyw43_rxIrqRestoreFailed.i = 0
+Global cyw43_rxIrqObserveCalls.i = 0
+Global cyw43_rxIrqNested.i = 0
+Global cyw43_rxIrqRawReady.i = 0
+Global cyw43_rxIrqCaptures.i = 0
+Global cyw43_rxIrqZeroCause.i = 0
+Global cyw43_rxIrqFrameInd.i = 0
+Global cyw43_rxIrqHostInt.i = 0
+Global cyw43_rxIrqFcChange.i = 0
+Global cyw43_rxIrqFcState.i = 0
+Global cyw43_rxIrqChipActive.i = 0
+Global cyw43_rxIrqMailbox.i = 0
+Global cyw43_rxIrqMailboxLast.i = 0
+Global cyw43_rxIrqNakHandled.i = 0
+Global cyw43_rxIrqDevReady.i = 0
+Global cyw43_rxIrqFwReady.i = 0
+Global cyw43_rxIrqFwHalt.i = 0
+Global cyw43_rxIrqVersion.i = -1
+Global cyw43_rxIrqRearmReady.i = 0
+Global cyw43_rxIrqFirstPending.i = 0
+Global cyw43_rxIrqFirstNoPending.i = 0
+Global cyw43_rxIrqNonemptyPending.i = 0
+Global cyw43_rxIrqNonemptyNoPending.i = 0
+Global cyw43_rxIrqEmptyPending.i = 0
+Global cyw43_rxIrqEmptyNoPending.i = 0
 
 ; The OPTIONAL block-mode pair, added 2026-08-26. Separate from the four
 ; above and separately installed, because they are separately optional:
@@ -1890,6 +1971,17 @@ Procedure.i cyw43_Fail(code.i)
   ProcedureReturn 0
 EndProcedure
 
+; One ownership predicate guards every public operation which can replace an
+; I/O callback, rebuild core metadata or reset framed transport state. Active
+; capture and failed-restore ownership are equally binding: only a verified
+; Cyw43RxIrqTelemetry(0) may release the old generation.
+Procedure.i cyw43_RxIrqGenerationOwned()
+  If cyw43_rxIrqActive <> 0 Or cyw43_rxIrqNeedsDisable <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 
 ; ======================================================================
 ;  PUBLIC - Cyw43SetIo. Hand this file its four SDIO primitives.
@@ -1899,6 +1991,9 @@ EndProcedure
 ;  zero" is a much worse symptom than "you did not wire the bus up".
 ; ======================================================================
 Procedure.i Cyw43SetIo(*rb, *wb, *rd, *wr)
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
   If *rb = 0 Or *wb = 0 Or *rd = 0 Or *wr = 0
     *cyw43_rb = 0
     *cyw43_wb = 0
@@ -2399,6 +2494,14 @@ Procedure.i Cyw43EnumerateCores()
   Define wrap.i
   Define steps.i
 
+  ; This public walk replaces the core table which an active readiness
+  ; observer addresses. Refuse before clearing the old count or issuing the
+  ; first EROM read; Cyw43Attach has the same outer guard, but direct callers
+  ; need the generation boundary here as well.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
+
   cyw43_ncores = 0
 
   If cyw43_socitype <> #CYW43_SOCI_AI
@@ -2542,6 +2645,12 @@ Procedure.i Cyw43Attach()
   Define blkHi.i
   Define blk.i
   Define caps.i
+
+  ; Refuse before attached/core/window state is changed or any I/O is issued.
+  ; The active readiness observer addresses the old enumerated SDIO core.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
 
   cyw43_attached = 0
   cyw43_err = #CYW43_ERR_NONE
@@ -2902,6 +3011,9 @@ EndProcedure
 ;  anywhere. See the warning on SdioCmd53WriteBlocks.
 ; ----------------------------------------------------------------------
 Procedure.i Cyw43SetBlockIo(*rdb, *wrb)
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
   If *rdb = 0 Or *wrb = 0
     *cyw43_rdb = 0
     *cyw43_wrb = 0
@@ -3576,6 +3688,13 @@ Procedure.i Cyw43ReadRamInfo()
   Define total.i
   Define ok.l
 
+  ; Selecting CR4 RAM banks and replacing the published RAM geometry belong
+  ; to the download generation. Preserve the old observer/core generation
+  ; before either metadata is cleared or a bank-select write is attempted.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
+
   cyw43_rambase = 0
   cyw43_ramsize = 0
 
@@ -3731,6 +3850,12 @@ Procedure.i Cyw43PrepareDownload()
   Define val.i
   Define ok.l
 
+  ; Core reset begins a new device generation. Do not strand the old
+  ; readiness snapshot or let an observer retain an address into reset cores.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
+
   If cyw43_attached = 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NOT_ATTACHED)
   EndIf
@@ -3827,6 +3952,12 @@ Procedure.i Cyw43UploadFirmware(*image, length.i, *scratch, scratchLen.i)
   Define bad.i
   Define hw.i
   Define toff.i
+
+  ; Firmware RAM and its reset vector are generation-owned state. Refuse
+  ; before clearing the old publication record or writing any device RAM.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
 
   cyw43_fwLoaded = 0
   cyw43_rstvec = 0
@@ -4143,6 +4274,13 @@ Procedure.i Cyw43UploadNvram(*text, length.i, *work, workMax.i, *scratch, scratc
   Define token.i
   Define ok.l
 
+  ; The NVRAM image occupies the running firmware generation's top-of-RAM.
+  ; Preserve its publication record and bytes until readiness ownership has
+  ; been released by a verified disable.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
+
   cyw43_nvLoaded = 0
   cyw43_nvBytes = 0
   Cyw43ClearVerifyRecord()
@@ -4244,6 +4382,12 @@ EndProcedure
 Procedure.i Cyw43Start()
   Define idx.i
   Define sd.i
+
+  ; Clearing device interrupt state and releasing the CR4 are a generation
+  ; boundary, so the old readiness owner must be gone first.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
 
   If cyw43_attached = 0
     ProcedureReturn cyw43_Fail(#CYW43_ERR_NOT_ATTACHED)
@@ -5128,6 +5272,282 @@ Procedure cyw43_EvrClear()
 EndProcedure
 
 
+; ======================================================================
+;  OPTIONAL RECEIVE-READINESS CAPTURE, TELEMETRY ONLY.
+;
+;  Portions of the CYW43-specific interrupt/mailbox interpretation adapt
+;  Linux brcmfmac's ISC-licensed SDIO transport. Broadcom copyright and the
+;  complete ISC notice are retained at this file's header and in
+;  licenses/Broadcom-brcmfmac-ISC.txt. Generic SDHCI/MMC code was used only
+;  as a behavioural cross-check; none is copied here.
+;
+;  The invariant for this evidence-collection slice is intentionally simple:
+;  capture may observe, acknowledge and count the card/device causes, but its
+;  answer NEVER authorizes or suppresses an F2 read. cyw43_RxFrame performs
+;  exactly the legacy FIRSTREAD after this returns, even when readiness is
+;  quiet or telemetry has disabled itself after a fault.
+; ======================================================================
+
+Procedure.i cyw43_RxIrqFail(code.i)
+  Define r.i
+  cyw43_rxIrqFault = code
+  If *cyw43_rxIrqOp <> 0
+    r = cyw43_rxIrqOp(#CYW43_RXIRQ_DISABLE)
+    If r <> 1
+      cyw43_rxIrqRestoreFailed = cyw43_rxIrqRestoreFailed + 1
+    Else
+      cyw43_rxIrqNeedsDisable = 0
+      cyw43_rxIrqCore = 0
+    EndIf
+  EndIf
+  cyw43_rxIrqActive = 0
+  cyw43_rxIrqPending = 0
+  cyw43_rxIrqBusy = 0
+  ProcedureReturn -1
+EndProcedure
+
+
+Procedure.i cyw43_RxIrqObserve()
+  Define r.i
+  Define bits.i
+  Define fresh.i
+  Define mail.i
+  Define savedErr.i
+  Define ok.l
+
+  If cyw43_rxIrqActive = 0 Or *cyw43_rxIrqOp = 0
+    ProcedureReturn 0
+  EndIf
+  ; Instrumentation must not replace the transport diagnostic which was
+  ; current when the shared receive path entered. The raw backplane helpers
+  ; use cyw43_Fail() because that is correct for ordinary callers; this
+  ; optional observer records its own fault separately and restores the
+  ; caller-visible transport error before returning. A later real F2 failure
+  ; still runs after this procedure and therefore becomes the new error.
+  savedErr = cyw43_err
+  cyw43_rxIrqObserveCalls = cyw43_rxIrqObserveCalls + 1
+  If cyw43_rxIrqBusy <> 0
+    ; A nested caller never touches the shared card/core interrupt state. The
+    ; outer owner will rearm it; this telemetry slice still allows the nested
+    ; caller's legacy F2 read below.
+    cyw43_rxIrqNested = cyw43_rxIrqNested + 1
+    ProcedureReturn 0
+  EndIf
+  cyw43_rxIrqBusy = 1
+
+  r = cyw43_rxIrqOp(#CYW43_RXIRQ_PENDING)
+  If r < 0
+    r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_PENDING)
+    cyw43_err = savedErr
+    ProcedureReturn r
+  EndIf
+  If r = 0
+    cyw43_rxIrqBusy = 0
+    cyw43_err = savedErr
+    ProcedureReturn 0
+  EndIf
+  cyw43_rxIrqRawReady = cyw43_rxIrqRawReady + 1
+
+  If cyw43_rxIrqOp(#CYW43_RXIRQ_QUIESCE) <> 1
+    r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_QUIESCE)
+    cyw43_err = savedErr
+    ProcedureReturn r
+  EndIf
+
+  bits = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, @ok)
+  If ok = 0
+    r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_STATUS_RD)
+    cyw43_err = savedErr
+    ProcedureReturn r
+  EndIf
+  bits = bits & #CYW43_HOSTINTMASK
+  If bits = 0
+    cyw43_rxIrqZeroCause = cyw43_rxIrqZeroCause + 1
+  Else
+    If Cyw43Write32(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, bits) = 0
+      r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_STATUS_WR)
+      cyw43_err = savedErr
+      ProcedureReturn r
+    EndIf
+    cyw43_rxIrqCaptures = cyw43_rxIrqCaptures + 1
+    cyw43_rxIrqPending = cyw43_rxIrqPending | bits
+  EndIf
+
+  If (bits & #CYW43_I_HMB_FRAME_IND) <> 0
+    cyw43_rxIrqFrameInd = cyw43_rxIrqFrameInd + 1
+  EndIf
+  If (bits & #CYW43_I_CHIPACTIVE) <> 0
+    cyw43_rxIrqChipActive = cyw43_rxIrqChipActive + 1
+    cyw43_rxIrqPending = cyw43_rxIrqPending & (~#CYW43_I_CHIPACTIVE)
+  EndIf
+
+  ; FC_CHANGE is edge information. Clear it once more, then reread the state
+  ; so a change crossing the acknowledgement is not mistaken for the old
+  ; value. If CHANGE is still set, treating flow control as on is the safe
+  ; diagnostic interpretation used by the vendor driver.
+  If (bits & #CYW43_I_HMB_FC_CHANGE) <> 0
+    cyw43_rxIrqFcChange = cyw43_rxIrqFcChange + 1
+    If Cyw43Write32(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, #CYW43_I_HMB_FC_CHANGE) = 0
+      r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_STATUS_WR)
+      cyw43_err = savedErr
+      ProcedureReturn r
+    EndIf
+    fresh = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_INTSTATUS_OFF, @ok)
+    If ok = 0
+      r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_FC_RD)
+      cyw43_err = savedErr
+      ProcedureReturn r
+    EndIf
+    fresh = fresh & #CYW43_HOSTINTMASK
+    cyw43_rxIrqPending = cyw43_rxIrqPending | fresh
+    If (fresh & (#CYW43_I_HMB_FC_STATE | #CYW43_I_HMB_FC_CHANGE)) <> 0
+      cyw43_rxIrqFcState = 1
+    Else
+      cyw43_rxIrqFcState = 0
+    EndIf
+  ElseIf (bits & #CYW43_I_HMB_FC_STATE) <> 0
+    cyw43_rxIrqFcState = 1
+  Else
+    cyw43_rxIrqFcState = 0
+  EndIf
+  cyw43_rxIrqPending = cyw43_rxIrqPending & (~(#CYW43_I_HMB_FC_STATE | #CYW43_I_HMB_FC_CHANGE))
+
+  If (cyw43_rxIrqPending & #CYW43_I_HMB_HOST_INT) <> 0
+    cyw43_rxIrqHostInt = cyw43_rxIrqHostInt + 1
+    mail = cyw43_Read32Raw(cyw43_rxIrqCore + #CYW43_SD_TOHOSTMBDATA, @ok)
+    If ok = 0
+      r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_MAIL_RD)
+      cyw43_err = savedErr
+      ProcedureReturn r
+    EndIf
+    If Cyw43Write32(cyw43_rxIrqCore + #CYW43_SD_TOSBMAILBOX, #CYW43_SMB_INT_ACK) = 0
+      r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_MAIL_ACK)
+      cyw43_err = savedErr
+      ProcedureReturn r
+    EndIf
+    cyw43_rxIrqMailbox = cyw43_rxIrqMailbox + 1
+    cyw43_rxIrqMailboxLast = mail
+    If (mail & #CYW43_HMB_NAKHANDLED) <> 0
+      cyw43_rxIrqNakHandled = cyw43_rxIrqNakHandled + 1
+      ; The firmware has recomposed a frame after NAK. Keep the same software
+      ; readiness fact as an ordinary FRAME_IND until an all-zero header.
+      cyw43_rxIrqPending = cyw43_rxIrqPending | #CYW43_I_HMB_FRAME_IND
+    EndIf
+    If (mail & #CYW43_HMB_DEVREADY) <> 0
+      cyw43_rxIrqDevReady = cyw43_rxIrqDevReady + 1
+    EndIf
+    If (mail & #CYW43_HMB_FWREADY) <> 0
+      cyw43_rxIrqFwReady = cyw43_rxIrqFwReady + 1
+    EndIf
+    If (mail & #CYW43_HMB_FWHALT) <> 0
+      cyw43_rxIrqFwHalt = cyw43_rxIrqFwHalt + 1
+    EndIf
+    cyw43_rxIrqVersion = (mail & #CYW43_HMB_VERSION_MASK) >> #CYW43_HMB_VERSION_SHIFT
+    cyw43_rxIrqPending = cyw43_rxIrqPending & (~#CYW43_I_HMB_HOST_INT)
+  EndIf
+
+  r = cyw43_rxIrqOp(#CYW43_RXIRQ_REARM)
+  If r < 0
+    r = cyw43_RxIrqFail(#CYW43_RXIRQ_FAULT_REARM)
+    cyw43_err = savedErr
+    ProcedureReturn r
+  EndIf
+  If r <> 0
+    ; A new cause arrived while the host status bit was quiesced. It remains
+    ; level asserted and will be captured on the next shared receive pass.
+    cyw43_rxIrqRearmReady = cyw43_rxIrqRearmReady + 1
+  EndIf
+  cyw43_rxIrqBusy = 0
+  cyw43_err = savedErr
+  ProcedureReturn 1
+EndProcedure
+
+
+; Enable or disable optional receive-readiness telemetry. This is deliberately
+; separate from Cyw43SetRxIrqIo: installing a callback is inert, and a caller
+; must explicitly opt in after the SDIO device core and function 2 are ready.
+; Failure never changes cyw43_err or the transport's link-up verdict.
+Procedure.i Cyw43RxIrqTelemetry(on.i)
+  Define idx.i
+  Define r.i
+  Define savedErr.i
+
+  If on <> 0
+    If cyw43_rxIrqActive <> 0
+      ProcedureReturn 1
+    EndIf
+    If cyw43_rxIrqNeedsDisable <> 0
+      ProcedureReturn 0
+    EndIf
+    If *cyw43_rxIrqOp = 0 Or cyw43_attached = 0
+      ProcedureReturn 0
+    EndIf
+    idx = Cyw43FindCore(#CYW43_CORE_SDIO_DEV)
+    If idx < 0
+      ProcedureReturn 0
+    EndIf
+    ; Own the callback conservatively before ARM. A refusing ARM may have
+    ; changed card/host state and then failed its own rollback; only a
+    ; verified DISABLE may release that snapshot ownership.
+    cyw43_rxIrqNeedsDisable = 1
+    savedErr = cyw43_err
+    r = cyw43_rxIrqOp(#CYW43_RXIRQ_ARM)
+    If r <> 1
+      cyw43_rxIrqFault = #CYW43_RXIRQ_FAULT_ARM
+      r = cyw43_rxIrqOp(#CYW43_RXIRQ_DISABLE)
+      If r = 1
+        cyw43_rxIrqNeedsDisable = 0
+        cyw43_rxIrqCore = 0
+      Else
+        cyw43_rxIrqFault = #CYW43_RXIRQ_FAULT_RESTORE
+        cyw43_rxIrqRestoreFailed = cyw43_rxIrqRestoreFailed + 1
+      EndIf
+      cyw43_err = savedErr
+      ProcedureReturn 0
+    EndIf
+    cyw43_err = savedErr
+    cyw43_rxIrqCore = cyw43_coreBase[idx]
+    cyw43_rxIrqPending = 0
+    cyw43_rxIrqFault = #CYW43_RXIRQ_FAULT_NONE
+    cyw43_rxIrqActive = 1
+    ProcedureReturn 1
+  EndIf
+
+  If cyw43_rxIrqActive = 0 And cyw43_rxIrqNeedsDisable = 0
+    ProcedureReturn 1
+  EndIf
+  If *cyw43_rxIrqOp = 0
+    ProcedureReturn 0
+  EndIf
+  savedErr = cyw43_err
+  r = cyw43_rxIrqOp(#CYW43_RXIRQ_DISABLE)
+  cyw43_err = savedErr
+  cyw43_rxIrqActive = 0
+  cyw43_rxIrqBusy = 0
+  cyw43_rxIrqPending = 0
+  If r <> 1
+    cyw43_rxIrqFault = #CYW43_RXIRQ_FAULT_RESTORE
+    cyw43_rxIrqRestoreFailed = cyw43_rxIrqRestoreFailed + 1
+    ProcedureReturn 0
+  EndIf
+  cyw43_rxIrqNeedsDisable = 0
+  cyw43_rxIrqCore = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Register or remove the optional readiness callback. Registration alone does
+; nothing to the card and does not change receive scheduling. An active
+; telemetry session must be disabled before its callback can be replaced, so
+; the exact SDIO snapshot remains owned by the function that captured it.
+Procedure.i Cyw43SetRxIrqIo(*op)
+  If cyw43_rxIrqActive <> 0 Or cyw43_rxIrqNeedsDisable <> 0
+    ProcedureReturn 0
+  EndIf
+  *cyw43_rxIrqOp = *op
+  ProcedureReturn 1
+EndProcedure
+
+
 ; ----------------------------------------------------------------------
 ;  Retained receive frames.
 ;
@@ -5281,7 +5701,13 @@ EndProcedure
 ;
 ;  Sequence 0 and credit 1. See the declarations for why the 1 matters.
 ; ----------------------------------------------------------------------
-Procedure Cyw43TransportReset()
+Procedure.i Cyw43TransportReset()
+  ; The sequence/request/queue state below belongs to the same firmware
+  ; generation as the readiness latch. Never zero one while the other still
+  ; owns card/host state from that generation.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    ProcedureReturn cyw43_Fail(#CYW43_ERR_RXIRQ_OWNED)
+  EndIf
   cyw43_seq = 0
   cyw43_credit = 1
   cyw43_reqid = 0
@@ -5351,6 +5777,7 @@ Procedure Cyw43TransportReset()
   cyw43_evType = -1
   cyw43_evStatus = -1
   cyw43_evDatalen = 0
+  ProcedureReturn 1
 EndProcedure
 
 
@@ -5668,6 +6095,7 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
   Define gi.i
   Define gp.i
   Define gn.i
+  Define irqAtRead.i
 
   fromQueue = 0
   cyw43_rxFrameSeqDone = 0
@@ -5691,6 +6119,23 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
       EndIf
     EndIf
 
+    ; Observe the optional card/device readiness path, then perform the exact
+    ; legacy first read regardless of the answer. This ordering is the central
+    ; negative guarantee of the telemetry slice: readiness does not yet gate
+    ; delivery, polling, control replies, credit waits, events or gloms.
+    irqAtRead = 0
+    If cyw43_rxIrqActive <> 0
+      cyw43_RxIrqObserve()
+      If cyw43_rxIrqActive <> 0
+        If (cyw43_rxIrqPending & #CYW43_I_HMB_FRAME_IND) <> 0
+          irqAtRead = 1
+          cyw43_rxIrqFirstPending = cyw43_rxIrqFirstPending + 1
+        Else
+          cyw43_rxIrqFirstNoPending = cyw43_rxIrqFirstNoPending + 1
+        EndIf
+      EndIf
+    EndIf
+
     ; The first read. Its length is fixed because the frame's own length
     ; is not known yet.
     cyw43_rxFirstReads = cyw43_rxFirstReads + 1
@@ -5702,6 +6147,26 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
   EndIf
 
   comp = cyw43_RxLE16(#CYW43_SDPCM_OFF_COMP)
+
+  ; Correlate the captured readiness fact with what the unchanged F2 read
+  ; actually returned. Queued frames never enter this block: they are already
+  ; software-owned and perform no F2 transfer.
+  If fromQueue = 0 And cyw43_rxIrqActive <> 0
+    If size = 0 And comp = 0
+      If irqAtRead <> 0
+        cyw43_rxIrqEmptyPending = cyw43_rxIrqEmptyPending + 1
+      Else
+        cyw43_rxIrqEmptyNoPending = cyw43_rxIrqEmptyNoPending + 1
+      EndIf
+      ; Like brcmf_sdio_readframes' rxpending, only the all-zero header means
+      ; the firmware has no further frame in this burst.
+      cyw43_rxIrqPending = cyw43_rxIrqPending & (~#CYW43_I_HMB_FRAME_IND)
+    ElseIf irqAtRead <> 0
+      cyw43_rxIrqNonemptyPending = cyw43_rxIrqNonemptyPending + 1
+    Else
+      cyw43_rxIrqNonemptyNoPending = cyw43_rxIrqNonemptyNoPending + 1
+    EndIf
+  EndIf
 
   ; sdio.c lines 1382-1385, and the order of these two tests is the
   ; whole point: all-zero is EMPTY, not corrupt.
@@ -7101,8 +7566,17 @@ EndProcedure
 Procedure.i Cyw43WifiUp(*clm, clmLen.i, evMask.i, timeoutMs.i)
   Define r.i
 
+  ; TransportReset is the framed-generation boundary. Refuse before even the
+  ; normal trace is advanced, then retain the reset's own check as the single
+  ; source of truth for direct and future callers.
+  If cyw43_RxIrqGenerationOwned() <> 0
+    cyw43_err = #CYW43_ERR_RXIRQ_OWNED
+    ProcedureReturn #CYW43_IO_OWNED
+  EndIf
   cyw43_Trace(#CYW43_TR_WIFIUP)
-  Cyw43TransportReset()
+  If Cyw43TransportReset() = 0
+    ProcedureReturn #CYW43_IO_OWNED
+  EndIf
   cyw43_Trace(#CYW43_TR_RESET_DONE)
 
   ; A full comparison on each side of the And, per the house rule that
@@ -7544,6 +8018,118 @@ EndProcedure
 
 Procedure.i Cyw43RxAbortFault()
   ProcedureReturn cyw43_rxAbortFault
+EndProcedure
+
+Procedure.i Cyw43RxIrqActive()
+  ProcedureReturn cyw43_rxIrqActive
+EndProcedure
+
+Procedure.i Cyw43RxIrqRestorePending()
+  ProcedureReturn cyw43_rxIrqNeedsDisable
+EndProcedure
+
+Procedure.i Cyw43RxIrqFault()
+  ProcedureReturn cyw43_rxIrqFault
+EndProcedure
+
+Procedure.i Cyw43RxIrqRestoreFailures()
+  ProcedureReturn cyw43_rxIrqRestoreFailed
+EndProcedure
+
+Procedure.i Cyw43RxIrqObserveCalls()
+  ProcedureReturn cyw43_rxIrqObserveCalls
+EndProcedure
+
+Procedure.i Cyw43RxIrqNestedCalls()
+  ProcedureReturn cyw43_rxIrqNested
+EndProcedure
+
+Procedure.i Cyw43RxIrqRawReady()
+  ProcedureReturn cyw43_rxIrqRawReady
+EndProcedure
+
+Procedure.i Cyw43RxIrqCaptures()
+  ProcedureReturn cyw43_rxIrqCaptures
+EndProcedure
+
+Procedure.i Cyw43RxIrqZeroCause()
+  ProcedureReturn cyw43_rxIrqZeroCause
+EndProcedure
+
+Procedure.i Cyw43RxIrqFrameIndications()
+  ProcedureReturn cyw43_rxIrqFrameInd
+EndProcedure
+
+Procedure.i Cyw43RxIrqHostInterrupts()
+  ProcedureReturn cyw43_rxIrqHostInt
+EndProcedure
+
+Procedure.i Cyw43RxIrqFlowChanges()
+  ProcedureReturn cyw43_rxIrqFcChange
+EndProcedure
+
+Procedure.i Cyw43RxIrqFlowState()
+  ProcedureReturn cyw43_rxIrqFcState
+EndProcedure
+
+Procedure.i Cyw43RxIrqChipActive()
+  ProcedureReturn cyw43_rxIrqChipActive
+EndProcedure
+
+Procedure.i Cyw43RxIrqMailboxCount()
+  ProcedureReturn cyw43_rxIrqMailbox
+EndProcedure
+
+Procedure.i Cyw43RxIrqMailboxLast()
+  ProcedureReturn cyw43_rxIrqMailboxLast
+EndProcedure
+
+Procedure.i Cyw43RxIrqNakHandled()
+  ProcedureReturn cyw43_rxIrqNakHandled
+EndProcedure
+
+Procedure.i Cyw43RxIrqDevReady()
+  ProcedureReturn cyw43_rxIrqDevReady
+EndProcedure
+
+Procedure.i Cyw43RxIrqFwReady()
+  ProcedureReturn cyw43_rxIrqFwReady
+EndProcedure
+
+Procedure.i Cyw43RxIrqFwHalt()
+  ProcedureReturn cyw43_rxIrqFwHalt
+EndProcedure
+
+Procedure.i Cyw43RxIrqVersion()
+  ProcedureReturn cyw43_rxIrqVersion
+EndProcedure
+
+Procedure.i Cyw43RxIrqRearmReady()
+  ProcedureReturn cyw43_rxIrqRearmReady
+EndProcedure
+
+Procedure.i Cyw43RxIrqFirstPending()
+  ProcedureReturn cyw43_rxIrqFirstPending
+EndProcedure
+
+Procedure.i Cyw43RxIrqFirstNoPending()
+  ProcedureReturn cyw43_rxIrqFirstNoPending
+EndProcedure
+
+Procedure.i Cyw43RxIrqNonemptyPending()
+  ProcedureReturn cyw43_rxIrqNonemptyPending
+EndProcedure
+
+Procedure.i Cyw43RxIrqNonemptyNoPending()
+  ProcedureReturn cyw43_rxIrqNonemptyNoPending
+EndProcedure
+
+Procedure.i Cyw43RxIrqEmptyPending()
+  ProcedureReturn cyw43_rxIrqEmptyPending
+EndProcedure
+
+Procedure.i Cyw43RxIrqEmptyNoPending()
+  ProcedureReturn cyw43_rxIrqEmptyNoPending
 EndProcedure
 
 Procedure.i Cyw43RxUnknownChannel()
@@ -10026,6 +10612,8 @@ Procedure.i Cyw43ErrorText()
       ProcedureReturn "cyw43: function 2 never reported ready, which is the firmware saying it did not boot - the image and the NVRAM both verified, so look at the reset vector and at whether the ARM actually left reset"
     Case #CYW43_ERR_NOT_LOADED
       ProcedureReturn "cyw43: Cyw43Start refused - releasing the ARM needs BOTH a verified image and a verified NVRAM, and one of them has not been uploaded"
+    Case #CYW43_ERR_RXIRQ_OWNED
+      ProcedureReturn "cyw43: receive-readiness generation still owned - verify Cyw43RxIrqTelemetry(0) before replacing I/O, attaching, resetting cores or restarting transport"
   EndSelect
   ProcedureReturn "cyw43: unknown error code"
 EndProcedure

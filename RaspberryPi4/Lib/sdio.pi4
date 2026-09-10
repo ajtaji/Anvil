@@ -961,6 +961,17 @@
 #SDIO_INT_ERROR_MASK  = $FFFF8000  ; SDHCI_INT_ERROR_MASK     h:166
 #SDIO_INT_ALL         = $FFFFFFFF  ; SDHCI_INT_ALL_MASK       h:172
 
+; Card Interrupt is the one exception to SDHCI's normal write-one-to-clear
+; interrupt status. It reflects the SDIO card's level-sensitive interrupt
+; and is retired by servicing the function-specific cause, not by writing
+; bit 8 back to this register. Keep a named W1C mask so command cleanup can
+; never accidentally claim it cleared CARD_INT once receive telemetry arms
+; that status bit. SD Host Controller Simplified Specification 3.00,
+; Interrupt Status register; Linux's generic and bcm2835 SDHCI handlers make
+; the same distinction but are reference evidence only, not source copied
+; into this implementation.
+#SDIO_INT_W1C        = $FFFFFEFF
+
 ; ----------------------------------------------------------------------
 ;  THE FOUR COMMAND-ERROR BITS ARE NOT THE FOUR DATA-ERROR BITS, AND
 ;  LINUX'S NAMES DO NOT SAY SO. sdhci.h calls the command ones
@@ -1190,6 +1201,33 @@
 #SDIO_CCCR_CAPS    = $08           ; s:108
 #SDIO_CCCR_SPEED   = $13           ; s:134
 
+; CCCR IENx/INTx, SDIO Simplified Specification 3.00 section 6.9. Bit zero
+; is the master enable; bits one and two are the function-1 and function-2
+; enables/pending indications. The CYW43455 uses F1 for its device-core
+; interrupt and F2 for WLAN data. Both are enabled, matching the card-level
+; contract rather than treating F2 as a second packet consumer.
+#SDIO_IEN_MASTER = $01
+#SDIO_IEN_F1     = $02
+#SDIO_IEN_F2     = $04
+
+; One operation-style callback is the complete optional seam exported to
+; cyw43.pi4. These values are an ABI: cyw43.pi4 deliberately repeats them
+; because libraries do not include libraries in this project.
+#SDIO_RXIRQ_ARM      = 1
+#SDIO_RXIRQ_PENDING  = 2
+#SDIO_RXIRQ_QUIESCE  = 3
+#SDIO_RXIRQ_REARM    = 4
+#SDIO_RXIRQ_DISABLE  = 5
+
+#SDIO_RXIRQ_ERR_NONE       = 0
+#SDIO_RXIRQ_ERR_NOT_READY  = 1
+#SDIO_RXIRQ_ERR_FUNCTIONS  = 2
+#SDIO_RXIRQ_ERR_IEN_READ   = 3
+#SDIO_RXIRQ_ERR_IEN_WRITE  = 4
+#SDIO_RXIRQ_ERR_HOST_WRITE = 5
+#SDIO_RXIRQ_ERR_RESTORE    = 6
+#SDIO_RXIRQ_ERR_BAD_OP     = 7
+
 #SDIO_BUS_WIDTH_MASK = $03         ; SDIO_BUS_WIDTH_MASK      s:97
 #SDIO_BUS_WIDTH_1BIT = $00         ; s:98
 #SDIO_BUS_WIDTH_4BIT = $02         ; s:100
@@ -1393,6 +1431,10 @@
 ; own code, and one shared code would have made the block-mode
 ; arithmetic harder to debug than the transfer it describes.
 #SDIO_ERR_BAD_COUNT     = 31
+; A readiness experiment owns exact card/host enable snapshots until DISABLE
+; verifies their restoration. Reinitialising underneath that owner would erase
+; the only values capable of putting the old transport back as it was.
+#SDIO_ERR_RXIRQ_OWNED   = 32
 
 ; ----------------------------------------------------------------------
 ;  State. Readable through accessors; not meant to be poked at.
@@ -1511,6 +1553,28 @@ Global sdio_cmd53ReadyTicks.i = 0
 Global sdio_cmd53ReadyMaxTicks.i = 0
 Global sdio_cmd53EndTicks.i = 0
 Global sdio_cmd53EndMaxTicks.i = 0
+
+; Optional receive-interrupt telemetry. Default-off: no caller in this file
+; arms it. The saved values are exact snapshots, not inferred defaults, so a
+; failed or disabled experiment can put both the card and host status mask
+; back exactly as it found them. If either restore cannot be verified,
+; sdio_rxIrqRestoreFailed says so. A best-effort CARD_INT quiesce is attempted
+; and verified separately; sdio_rxIrqQuiesceFailed records when even that
+; containment could not be established.
+Global sdio_rxIrqArmed.i = 0
+Global sdio_rxIrqSaved.i = 0
+Global sdio_rxIrqSavedIen.i = 0
+Global sdio_rxIrqSavedHost.i = 0
+Global sdio_rxIrqLastError.i = #SDIO_RXIRQ_ERR_NONE
+Global sdio_rxIrqArmCount.i = 0
+Global sdio_rxIrqArmFailed.i = 0
+Global sdio_rxIrqRestoreFailed.i = 0
+Global sdio_rxIrqQuiesceFailed.i = 0
+Global sdio_rxIrqRawChecks.i = 0
+Global sdio_rxIrqRawPending.i = 0
+Global sdio_rxIrqQuiesceCount.i = 0
+Global sdio_rxIrqRearmCount.i = 0
+Global sdio_rxIrqRearmPending.i = 0
 
 
 ; ======================================================================
@@ -2630,9 +2694,11 @@ Procedure.i sdio_Command(cmdtm.i, arg.i, tmoIsOk.i)
     ProcedureReturn 0
   EndIf
 
-  ; Clear everything, so the poll below cannot see a stale bit from the
-  ; previous command and call it success.
-  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_ALL)
+  ; Clear every W1C command/data status bit, so the poll below cannot see a
+  ; stale completion and call it success. CARD_INT is level/ROC and is never
+  ; included in a W1C write; servicing the card's function-specific cause is
+  ; what retires it.
+  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_W1C)
 
   sdio_Wr(#SDIO_ARG1, arg)
   ; ONE 32-BIT WRITE, transfer mode and command together. See rule 2 in
@@ -2659,7 +2725,7 @@ Procedure.i sdio_Command(cmdtm.i, arg.i, tmoIsOk.i)
   If (intr & #SDIO_INT_ERROR_MASK) <> 0
     sdio_lastIntr = intr
     sdio_lastStat = sdio_Rd(#SDIO_STATUS)
-    sdio_Wr(#SDIO_INT_STATUS, intr)      ; write-1-to-clear what we saw
+    sdio_Wr(#SDIO_INT_STATUS, intr & #SDIO_INT_W1C)
     sdio_ResetLine(1)
     ; A bare Command Timeout with nothing else set is the "no answer"
     ; case, and it is the one some callers expect.
@@ -2706,7 +2772,7 @@ Procedure.i sdio_Command(cmdtm.i, arg.i, tmoIsOk.i)
       If (intr & #SDIO_INT_ERROR_MASK) <> 0
         sdio_lastIntr = intr
         sdio_lastStat = sdio_Rd(#SDIO_STATUS)
-        sdio_Wr(#SDIO_INT_STATUS, intr)
+        sdio_Wr(#SDIO_INT_STATUS, intr & #SDIO_INT_W1C)
         sdio_ResetLine(1)
         sdio_err = #SDIO_ERR_CMD_ERROR
         ProcedureReturn 0
@@ -3164,7 +3230,7 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
         sdio_lastXferBlock = b
         sdio_lastIntr = intr
         sdio_lastStat = sdio_Rd(#SDIO_STATUS)
-        sdio_Wr(#SDIO_INT_STATUS, intr)
+        sdio_Wr(#SDIO_INT_STATUS, intr & #SDIO_INT_W1C)
         sdio_ResetLine(1)
         sdio_err = #SDIO_ERR_DATA_ERROR
         waitTicks = sdio_Ticks() - t0
@@ -3225,7 +3291,7 @@ Procedure.i sdio_Cmd53Xfer(dir.i, fn.i, addr.i, *buf, blksz.i, blocks.i, blockMo
       sdio_lastXferBlock = blocks
       sdio_lastIntr = intr
       sdio_lastStat = sdio_Rd(#SDIO_STATUS)
-      sdio_Wr(#SDIO_INT_STATUS, intr)
+      sdio_Wr(#SDIO_INT_STATUS, intr & #SDIO_INT_W1C)
       sdio_ResetLine(1)
       sdio_err = #SDIO_ERR_DATA_ERROR
       waitTicks = sdio_Ticks() - t0
@@ -3389,6 +3455,244 @@ Procedure.i SdioDisableFunction(fn.i)
   ProcedureReturn SdioCmd52Write(0, #SDIO_CCCR_IOEx, reg & (~(1 << fn)))
 EndProcedure
 
+
+; ======================================================================
+;  OPTIONAL SDIO RECEIVE-INTERRUPT TELEMETRY SEAM.
+;
+;  THIS DOES NOT INSTALL A CPU INTERRUPT HANDLER. SIGNAL_ENABLE remains
+;  untouched (and is zero after SdioInit). It only makes CARD_INT visible in
+;  SDHCI Interrupt Status so the CYW43 transport can compare a real card
+;  readiness indication with the legacy F2 reads it already performs.
+;
+;  The SDIO card interrupt is level-sensitive. CCCR IENM and each function's
+;  IENx authorize the card to present it; CCCR INTx reports the function(s)
+;  still pending. At the host, CARD_INT Status Enable is cleared while the
+;  function-specific cause is serviced, then set again and sampled
+;  immediately. CARD_INT itself is never W1C'd.
+;
+;  ARM AND DISABLE ARE TRANSACTIONS. ARM snapshots the exact card IENx and
+;  host INT_ENABLE values. Every partial failure attempts to restore both.
+;  A restore that cannot be read back is reported as a restore failure. A
+;  best-effort CARD_INT quiesce is then attempted and verified, with an
+;  explicit unresolved-state counter if its write also fails. Nothing is
+;  described as restored or contained merely because a write was attempted.
+; ======================================================================
+
+Procedure.i sdio_RxIrqRestore()
+  Define ien.i
+  Define host.i
+  Define cardOk.i
+  Define hostOk.i
+
+  If sdio_rxIrqSaved = 0
+    sdio_rxIrqArmed = 0
+    ProcedureReturn 1
+  EndIf
+
+  ; Attempt to quiesce first. Its write is not trusted: exact restoration or
+  ; the best-effort containment result is verified explicitly below.
+  host = sdio_Rd(#SDIO_INT_ENABLE)
+  sdio_Wr(#SDIO_INT_ENABLE, host & (~#SDIO_INT_CARD_INT))
+
+  cardOk = 0
+  If SdioCmd52Write(0, #SDIO_CCCR_IENx, sdio_rxIrqSavedIen) <> 0
+    ien = SdioCmd52Read(0, #SDIO_CCCR_IENx)
+    If ien = sdio_rxIrqSavedIen
+      cardOk = 1
+    EndIf
+  EndIf
+
+  hostOk = 0
+  If cardOk <> 0
+    sdio_Wr(#SDIO_INT_ENABLE, sdio_rxIrqSavedHost)
+    If sdio_Rd(#SDIO_INT_ENABLE) = sdio_rxIrqSavedHost
+      hostOk = 1
+    EndIf
+  Else
+    ; Preserve every current host status-enable except CARD_INT. Exact restore
+    ; was impossible, so fail safely and say so.
+    host = sdio_Rd(#SDIO_INT_ENABLE)
+    sdio_Wr(#SDIO_INT_ENABLE, host & (~#SDIO_INT_CARD_INT))
+  EndIf
+
+  ; Even a failed exact host restore must make one explicit best-effort
+  ; quiesce and verify it. Do not claim the card interrupt is contained when
+  ; the host write itself did not land; expose that unresolved state through
+  ; a separate counter while retaining the original snapshot for retry.
+  If hostOk = 0
+    host = sdio_Rd(#SDIO_INT_ENABLE)
+    sdio_Wr(#SDIO_INT_ENABLE, host & (~#SDIO_INT_CARD_INT))
+    If (sdio_Rd(#SDIO_INT_ENABLE) & #SDIO_INT_CARD_INT) <> 0
+      sdio_rxIrqQuiesceFailed = sdio_rxIrqQuiesceFailed + 1
+    EndIf
+  EndIf
+
+  sdio_rxIrqArmed = 0
+  If cardOk <> 0 And hostOk <> 0
+    sdio_rxIrqSaved = 0
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_NONE
+    ProcedureReturn 1
+  EndIf
+
+  sdio_rxIrqRestoreFailed = sdio_rxIrqRestoreFailed + 1
+  sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_RESTORE
+  ProcedureReturn 0
+EndProcedure
+
+
+Procedure.i sdio_RxIrqArm()
+  Define funcs.i
+  Define enabled.i
+  Define ien.i
+  Define host.i
+  Define want.i
+  Define ok.i
+
+  If sdio_rxIrqArmed <> 0
+    ProcedureReturn 1
+  EndIf
+  If sdio_rxIrqSaved <> 0
+    ; A prior rollback was not proven. Do not overwrite its snapshot.
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_RESTORE
+    ProcedureReturn 0
+  EndIf
+  If sdio_ready = 0
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_NOT_READY
+    ProcedureReturn 0
+  EndIf
+
+  ; A ready indication alone is insufficient: both functions must still be
+  ; enabled in IOEx as well as ready in IORx before their interrupt enables
+  ; are changed.
+  enabled = SdioCmd52Read(0, #SDIO_CCCR_IOEx)
+  funcs = SdioCmd52Read(0, #SDIO_CCCR_IORx)
+  If enabled < 0 Or funcs < 0
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_FUNCTIONS
+    ProcedureReturn 0
+  EndIf
+  If (enabled & (#SDIO_IEN_F1 | #SDIO_IEN_F2)) <> (#SDIO_IEN_F1 | #SDIO_IEN_F2) Or (funcs & (#SDIO_IEN_F1 | #SDIO_IEN_F2)) <> (#SDIO_IEN_F1 | #SDIO_IEN_F2)
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_FUNCTIONS
+    ProcedureReturn 0
+  EndIf
+
+  ien = SdioCmd52Read(0, #SDIO_CCCR_IENx)
+  If ien < 0
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_IEN_READ
+    ProcedureReturn 0
+  EndIf
+  host = sdio_Rd(#SDIO_INT_ENABLE)
+  sdio_rxIrqSavedIen = ien
+  sdio_rxIrqSavedHost = host
+  sdio_rxIrqSaved = 1
+
+  ; Host first, card second: no card indication becomes visible during a
+  ; half-configured transaction.
+  sdio_Wr(#SDIO_INT_ENABLE, host & (~#SDIO_INT_CARD_INT))
+  If sdio_Rd(#SDIO_INT_ENABLE) <> (host & (~#SDIO_INT_CARD_INT))
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_HOST_WRITE
+    If sdio_RxIrqRestore() <> 0
+      sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_HOST_WRITE
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  want = ien | #SDIO_IEN_MASTER | #SDIO_IEN_F1 | #SDIO_IEN_F2
+  ok = SdioCmd52Write(0, #SDIO_CCCR_IENx, want)
+  If ok = 0 Or SdioCmd52Read(0, #SDIO_CCCR_IENx) <> want
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_IEN_WRITE
+    If sdio_RxIrqRestore() <> 0
+      sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_IEN_WRITE
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  sdio_Wr(#SDIO_INT_ENABLE, host | #SDIO_INT_CARD_INT)
+  If sdio_Rd(#SDIO_INT_ENABLE) <> (host | #SDIO_INT_CARD_INT)
+    sdio_rxIrqArmFailed = sdio_rxIrqArmFailed + 1
+    sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_HOST_WRITE
+    If sdio_RxIrqRestore() <> 0
+      sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_HOST_WRITE
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  sdio_rxIrqArmed = 1
+  sdio_rxIrqArmCount = sdio_rxIrqArmCount + 1
+  sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_NONE
+  ProcedureReturn 1
+EndProcedure
+
+
+; One integer operation keeps the CYW43/SDIO boundary a single optional
+; callback. Return conventions:
+;   ARM/QUIESCE/DISABLE: 1 success, 0 failure
+;   PENDING:             1 pending, 0 quiet, -1 unavailable
+;   REARM:               1 immediately pending, 0 quiet, -1 failure
+Procedure.i SdioRxIrqOp(op.i)
+  Define host.i
+  Define pending.i
+
+  Select op
+    Case #SDIO_RXIRQ_ARM
+      ProcedureReturn sdio_RxIrqArm()
+
+    Case #SDIO_RXIRQ_PENDING
+      If sdio_rxIrqArmed = 0
+        ProcedureReturn -1
+      EndIf
+      sdio_rxIrqRawChecks = sdio_rxIrqRawChecks + 1
+      pending = sdio_Rd(#SDIO_INT_STATUS) & #SDIO_INT_CARD_INT
+      If pending <> 0
+        sdio_rxIrqRawPending = sdio_rxIrqRawPending + 1
+        ProcedureReturn 1
+      EndIf
+      ProcedureReturn 0
+
+    Case #SDIO_RXIRQ_QUIESCE
+      If sdio_rxIrqArmed = 0
+        ProcedureReturn 0
+      EndIf
+      host = sdio_Rd(#SDIO_INT_ENABLE)
+      sdio_Wr(#SDIO_INT_ENABLE, host & (~#SDIO_INT_CARD_INT))
+      If (sdio_Rd(#SDIO_INT_ENABLE) & #SDIO_INT_CARD_INT) <> 0
+        sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_HOST_WRITE
+        ProcedureReturn 0
+      EndIf
+      sdio_rxIrqQuiesceCount = sdio_rxIrqQuiesceCount + 1
+      ProcedureReturn 1
+
+    Case #SDIO_RXIRQ_REARM
+      If sdio_rxIrqArmed = 0
+        ProcedureReturn -1
+      EndIf
+      host = sdio_Rd(#SDIO_INT_ENABLE)
+      sdio_Wr(#SDIO_INT_ENABLE, host | #SDIO_INT_CARD_INT)
+      If (sdio_Rd(#SDIO_INT_ENABLE) & #SDIO_INT_CARD_INT) = 0
+        sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_HOST_WRITE
+        ProcedureReturn -1
+      EndIf
+      sdio_rxIrqRearmCount = sdio_rxIrqRearmCount + 1
+      pending = sdio_Rd(#SDIO_INT_STATUS) & #SDIO_INT_CARD_INT
+      If pending <> 0
+        sdio_rxIrqRearmPending = sdio_rxIrqRearmPending + 1
+        ProcedureReturn 1
+      EndIf
+      ProcedureReturn 0
+
+    Case #SDIO_RXIRQ_DISABLE
+      ProcedureReturn sdio_RxIrqRestore()
+  EndSelect
+
+  sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_BAD_OP
+  ProcedureReturn 0
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  SdioSetBlockSize(fn, bytes) - the function's FBR block size.
 ;
@@ -3543,6 +3847,17 @@ Procedure.i SdioInit()
   Define r.i
   Define v.i
 
+  ; A previous readiness generation still owns the exact CCCR IENx and host
+  ; INT_ENABLE snapshots. Refuse BEFORE clearing readiness, transport or
+  ; diagnostic state and before touching a register. The caller must first
+  ; run Cyw43RxIrqTelemetry(0) through the still-working old transport and
+  ; receive its verified success. A failed restore deliberately leaves the
+  ; snapshot here for another DISABLE attempt.
+  If sdio_rxIrqArmed <> 0 Or sdio_rxIrqSaved <> 0
+    sdio_err = #SDIO_ERR_RXIRQ_OWNED
+    ProcedureReturn 0
+  EndIf
+
   sdio_ready = 0
   sdio_err   = #SDIO_ERR_NONE
   sdio_width4 = 0
@@ -3562,6 +3877,20 @@ Procedure.i SdioInit()
   sdio_cmd53ReadyMaxTicks = 0
   sdio_cmd53EndTicks = 0
   sdio_cmd53EndMaxTicks = 0
+  sdio_rxIrqArmed = 0
+  sdio_rxIrqSaved = 0
+  sdio_rxIrqSavedIen = 0
+  sdio_rxIrqSavedHost = 0
+  sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_NONE
+  sdio_rxIrqArmCount = 0
+  sdio_rxIrqArmFailed = 0
+  sdio_rxIrqRestoreFailed = 0
+  sdio_rxIrqQuiesceFailed = 0
+  sdio_rxIrqRawChecks = 0
+  sdio_rxIrqRawPending = 0
+  sdio_rxIrqQuiesceCount = 0
+  sdio_rxIrqRearmCount = 0
+  sdio_rxIrqRearmPending = 0
 
   ; --- 1 ---------------------------------------------------------------
   sdio_hz = sdio_TickHz()
@@ -3633,7 +3962,7 @@ Procedure.i SdioInit()
   ; write a polling driver that polls a register that never changes.
   sdio_Wr(#SDIO_INT_ENABLE, #SDIO_INT_ENABLE_SET)
   sdio_Wr(#SDIO_SIG_ENABLE, 0)
-  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_ALL)
+  sdio_Wr(#SDIO_INT_STATUS, #SDIO_INT_W1C)
 
   ; --- 9 ---------------------------------------------------------------
   ; sdio_ops.c lines 209-215. The read is allowed to fail; if it does,
@@ -3791,6 +4120,50 @@ EndProcedure
 ; expects.
 Procedure.i SdioLastR5()
   ProcedureReturn sdio_lastR5
+EndProcedure
+
+Procedure.i SdioRxIrqArmed()
+  ProcedureReturn sdio_rxIrqArmed
+EndProcedure
+
+Procedure.i SdioRxIrqLastError()
+  ProcedureReturn sdio_rxIrqLastError
+EndProcedure
+
+Procedure.i SdioRxIrqArmCount()
+  ProcedureReturn sdio_rxIrqArmCount
+EndProcedure
+
+Procedure.i SdioRxIrqArmFailures()
+  ProcedureReturn sdio_rxIrqArmFailed
+EndProcedure
+
+Procedure.i SdioRxIrqRestoreFailures()
+  ProcedureReturn sdio_rxIrqRestoreFailed
+EndProcedure
+
+Procedure.i SdioRxIrqQuiesceFailures()
+  ProcedureReturn sdio_rxIrqQuiesceFailed
+EndProcedure
+
+Procedure.i SdioRxIrqRawChecks()
+  ProcedureReturn sdio_rxIrqRawChecks
+EndProcedure
+
+Procedure.i SdioRxIrqRawPending()
+  ProcedureReturn sdio_rxIrqRawPending
+EndProcedure
+
+Procedure.i SdioRxIrqQuiesces()
+  ProcedureReturn sdio_rxIrqQuiesceCount
+EndProcedure
+
+Procedure.i SdioRxIrqRearms()
+  ProcedureReturn sdio_rxIrqRearmCount
+EndProcedure
+
+Procedure.i SdioRxIrqRearmPending()
+  ProcedureReturn sdio_rxIrqRearmPending
 EndProcedure
 
 Procedure.i SdioHostVersion()
@@ -4450,6 +4823,8 @@ Procedure.i SdioErrorText()
       ProcedureReturn "sdio: the function never reported ready in CCCR IORx"
     Case #SDIO_ERR_BUS_WIDTH
       ProcedureReturn "sdio: the card would not switch to a four-bit bus"
+    Case #SDIO_ERR_RXIRQ_OWNED
+      ProcedureReturn "sdio: receive-readiness snapshot still owned - verify Cyw43RxIrqTelemetry(0) before starting a new transport generation"
   EndSelect
   ProcedureReturn "sdio: unknown error code"
 EndProcedure
