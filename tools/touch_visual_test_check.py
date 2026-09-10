@@ -35,6 +35,23 @@ need("no transaction-changing recovery", all(x not in code for x in
      ("HwTouchRestart(", "HwTouchUp(", "I2c", "Reset(", "PinAlt", "DsiV2")))
 need("normal renderer restored", "ConRepaint()" in vis and
      "ConSetRenderer(*wasPaint)" in vis and "gV3dConOn = 1" in vis)
+def banner_restore_order(text):
+    start = text.index("Procedure.i TouchVisualTest")
+    banner = text.index("  DrawBanner()", start)
+    present = text.index("  ScrPresentAll()", banner)
+    renderer = text.index("  ConSetRenderer(*wasPaint)", banner)
+    repaint = text.index("  ConRepaint()", renderer)
+    return banner < present < renderer < repaint
+
+need("banner reaches DSI front before V3D preserves it",
+     banner_restore_order(vis))
+anchor = "  ScrPresentAll()\n  ConSetRenderer(*wasPaint)"
+need("banner-order mutation anchor unique", vis.count(anchor) == 1)
+if vis.count(anchor) == 1:
+    mutant = vis.replace(anchor,
+                         "  ConSetRenderer(*wasPaint)\n  ScrPresentAll()", 1)
+    need("present-after-renderer mutation rejected",
+         not banner_restore_order(mutant))
 
 if fails:
     print("touch_visual_test_check: FAIL")

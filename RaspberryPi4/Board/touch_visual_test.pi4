@@ -172,6 +172,11 @@ Procedure.i TouchVisualTest()
   DrawBanner()
   DisplayConsole(oldCox, oldCoy, oldCols * DisplayCharWidth(), oldRows * DisplayCharHeight())
   DisplayLocate(oldCx, oldCy)
+  ; Establish the restored banner on the SCANNED DSI surface before V3D is
+  ; allowed to repaint. The V3D DSI path preserves its banner by copying the
+  ; current front strip into #MON_FB_DRAW; without this present it faithfully
+  ; preserved the diagnostic header/dots and overwrote DrawBanner's result.
+  ScrPresentAll()
   ConSetRenderer(*wasPaint)
   CompilerIf #ANVIL_V3D_CONSOLE = 1
   If wasV3d <> 0

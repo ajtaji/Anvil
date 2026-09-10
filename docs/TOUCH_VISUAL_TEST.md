@@ -22,3 +22,6 @@ into a minutes-long command. The prior console region, colours, cursor location,
 cursor visibility and renderer are restored and repainted. The diagnostic is
 visual hardware evidence, not a synthetic input test, and it performs no
 additional probe, reset, or pin configuration beyond normal touch polling.
+On rotated DSI the restored banner is explicitly presented to the scanned
+surface before V3D repaint resumes, so V3D preserves the Anvil banner rather
+than the diagnostic pixels that previously occupied its strip.
