@@ -127,6 +127,9 @@ Procedure.i TouchVisualTest()
   DisplayClear($101020)
   d0 = HwTouchDowns() : m0 = HwTouchMoves() : u0 = HwTouchUps()
   TouchVisualHeader(cap, 0, 0, 0, 0, 0)
+  ; Drawing and scanout differ on rotated DSI. Complete the frame through the
+  ; same presentation seam used by the normal framebuffer console.
+  ScrPresentAll()
   deadline = Ticks() + TickHz() * 30
 
   While polls < #TOUCH_VISUAL_POLLS And Ticks() < deadline
@@ -159,6 +162,7 @@ Procedure.i TouchVisualTest()
     Next
     While HwTouchPoll(@ev[0]) = 1 : Wend
     TouchVisualHeader(cap, n, peak, HwTouchDowns() - d0, HwTouchMoves() - m0, HwTouchUps() - u0)
+    ScrPresentAll()
     delay(#TOUCH_VISUAL_MS)
     polls = polls + 1
   Wend

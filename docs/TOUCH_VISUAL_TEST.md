@@ -11,6 +11,10 @@ trail while it moves; a released ID gets a white endpoint. This makes ten
 simultaneous fingers visible independently instead of reducing them to the
 normal console's single primary-contact cursor.
 
+Each diagnostic frame goes through `ScrPresentAll`, including the initial
+screen. Rotated DSI draws into a logical buffer distinct from physical scanout;
+drawing without presenting can count all ten contacts while displaying none.
+
 Press any serial, network-console, or already-attached USB-keyboard key to exit.
 Both a 1,500-poll bound and an
 independent 30-second counter deadline apply, so slow drawing cannot turn it
