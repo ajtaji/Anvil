@@ -27,6 +27,7 @@ Global gate_wipes.i
 Global gate_serviceTurns.i
 Global gate_blockModeRc.i
 Global gate_settingsWrites.i
+Global gate_clockHz.i
 Global Dim gate_phaseForOp.i[24]
 
 ; The association globals touched by the shared cancellation seam are present
@@ -108,6 +109,10 @@ Procedure.i WifiClockHz()
   If GateOp(3, 1) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 54000000
 EndProcedure
+Procedure.i MailboxClockRate(id.i)
+  If GateOp(3, 1) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn gate_clockHz
+EndProcedure
 Procedure SdioSetBaseClockKhz(khz.i) : GateOp(4, 1) : EndProcedure
 Procedure.i SdioAssertWlOn() : ProcedureReturn GateOp(5, 1) : EndProcedure
 Procedure.i SdioInit() : ProcedureReturn GateOp(6, 1) : EndProcedure
@@ -156,7 +161,7 @@ Procedure GateReset()
   gate_restoreActive = 0 : gate_restorePending = 0 : gate_restoreRc = 1
   gate_down = 0 : gate_dhcpStarts = 0 : gate_recCancels = 0 : gate_wipes = 0
   gate_settingsWrites = 0
-  gate_serviceTurns = 0 : gate_blockModeRc = 1
+  gate_serviceTurns = 0 : gate_blockModeRc = 1 : gate_clockHz = 54000000
   gWifiUp = 0 : gWifiLinkOn = 1 : gWifiHealOn = 1 : gWifiHealPend = 0
   gWifiKeyed = 1 : gWifiHaveIp = 1 : gWifiSecDone = 1
   gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = 0 : gWifiRecStepGeneration = 0
@@ -164,6 +169,7 @@ Procedure GateReset()
   gWifiRinitPhase = #WIFI_RINIT_IDLE : gWifiRinitGeneration = 10
   gWifiRinitStepGeneration = 0 : gWifiRinitAt = 0 : gWifiRinitAttempts = 0
   gWifiRinitClockHz = 0 : gWifiRinitAnnounce = 0
+  gWifiRinitClockTry = 0 : gWifiRinitClockAt = 0
   gWifiRinitLastFailPhase = #WIFI_RINIT_IDLE : gWifiRinitLastFailRc = 0
   gWifiRinitLastSdio = 0 : gWifiRinitLastCyw = 0
   gWifiRinitRoamRc = 0 : gWifiRinitPowerRc = 0 : gWifiRinitFwCalls = 0
@@ -171,7 +177,7 @@ Procedure GateReset()
 
   gate_phaseForOp[1] = #WIFI_RINIT_BLOBS
   gate_phaseForOp[2] = #WIFI_RINIT_MBX_INIT
-  gate_phaseForOp[3] = #WIFI_RINIT_CLOCK
+  gate_phaseForOp[3] = #WIFI_RINIT_CLOCK_TRY
   gate_phaseForOp[4] = #WIFI_RINIT_CLOCK_SET
   gate_phaseForOp[5] = #WIFI_RINIT_WLON
   gate_phaseForOp[6] = #WIFI_RINIT_SDIO
@@ -245,6 +251,10 @@ Procedure.i Main()
   If gWifiRinitPhase <> #WIFI_RINIT_BLOBS Or gate_calls <> 0 : ProcedureReturn 6 : EndIf
   For expected = 1 To 22
     before = gate_calls
+    If expected = 3
+      GateOuterTick()
+      If gate_calls <> before Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY : ProcedureReturn 7 : EndIf
+    EndIf
     GateOuterTick()
     If gate_calls <> before + 1 Or gate_lastOp <> expected : ProcedureReturn 7 : EndIf
     If expected = 14 And gWifiRinitFwCalls <> 1 : ProcedureReturn 8 : EndIf
@@ -253,7 +263,7 @@ Procedure.i Main()
   If gWifiRinitPhase <> #WIFI_RINIT_READY Or gWifiRinitFwCalls <> 1 : ProcedureReturn 10 : EndIf
   GateOuterTick()
   If gWifiUp <> 1 Or WifiRadioInitActive() <> 0 Or gWifiRecPhase <> #WIFI_REC_LEAVE : ProcedureReturn 11 : EndIf
-  If gate_serviceTurns <> 26 : ProcedureReturn 30 : EndIf
+  If gate_serviceTurns <> 27 : ProcedureReturn 30 : EndIf
 
   ; Explicit reconcile events choose exactly one owner from current truth.
   GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : WifiRecoveryReconcile(0)
@@ -280,6 +290,55 @@ Procedure.i Main()
   GateReset() : gWifiUp = 1 : gWifiKeyed = 1 : gWifiHaveIp = 0 : WifiConfigChanged()
   If gWifiKeyed = 0 Or gWifiRecPhase <> #WIFI_REC_IDLE Or gate_dhcpStarts <> 1 : ProcedureReturn 42 : EndIf
 
+  ; Cooperative clock retry owns one mailbox transaction per TRY. Failed
+  ; replies wait without bus work; the deadline is unsigned-wrap safe.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY) : gate_clockHz = 0
+  GateOuterTick()
+  If gate_calls <> 1 Or gWifiRinitClockTry <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT : ProcedureReturn 43 : EndIf
+  gate_ms = gate_ms + #WIFI_CLOCK_GAP_MS - 1 : GateOuterTick()
+  If gate_calls <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT : ProcedureReturn 44 : EndIf
+  gate_ms = gate_ms + 1 : GateOuterTick()
+  If gate_calls <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY : ProcedureReturn 45 : EndIf
+  gate_clockHz = 54000000 : GateOuterTick()
+  If gate_calls <> 2 Or gWifiRinitClockHz <> 54000000 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_SET : ProcedureReturn 46 : EndIf
+  If gate_serviceTurns <> 4 : ProcedureReturn 46 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY) : gate_clockHz = 0
+  For expected = 1 To #WIFI_CLOCK_TRIES
+    WifiRadioInitTick()
+    If gate_calls <> expected : ProcedureReturn 47 : EndIf
+    If expected < #WIFI_CLOCK_TRIES
+      If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT : ProcedureReturn 47 : EndIf
+      gate_ms = gate_ms + #WIFI_CLOCK_GAP_MS : WifiRadioInitTick()
+    EndIf
+  Next
+  If gWifiRinitPhase <> #WIFI_RINIT_BACKOFF Or gWifiRinitLastFailPhase <> #WIFI_RINIT_CLOCK_TRY : ProcedureReturn 48 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY)
+  gWifiRinitClockTry = #WIFI_CLOCK_TRIES - 1 : gate_clockHz = 54000000
+  WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_SET Or gWifiRinitClockHz <> 54000000 Or gWifiRinitClockTry <> (#WIFI_CLOCK_TRIES - 1) : ProcedureReturn 52 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_WAIT)
+  gWifiRinitClockAt = $FFFFFF00
+  gate_ms = ($FFFFFF00 + #WIFI_CLOCK_GAP_MS - 1) & $FFFFFFFF : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT Or gate_calls <> 0 : ProcedureReturn 49 : EndIf
+  gate_ms = ($FFFFFF00 + #WIFI_CLOCK_GAP_MS) & $FFFFFFFF : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY Or gate_calls <> 0 : ProcedureReturn 49 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY)
+  gate_cancelOp = 3 : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_IDLE Or gWifiRinitClockHz <> 0 Or gate_calls <> 1 : ProcedureReturn 50 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_BEGIN) : gWifiRinitClockTry = 7
+  WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY Or gWifiRinitClockTry <> 0 Or gate_calls <> 0 : ProcedureReturn 51 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_WAIT)
+  gWifiRinitClockAt = gate_ms : WifiRadioInitCancel()
+  gate_ms = gate_ms + #WIFI_CLOCK_GAP_MS : WifiRadioInitTick()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 53 : EndIf
+
   ; Verified readiness restoration is a hard predecessor. Failure performs no
   ; destructive primitive, records exact diagnostics and remains retryable.
   GateReset() : GateOwnPhase(#WIFI_RINIT_RESTORE)
@@ -296,7 +355,7 @@ Procedure.i Main()
   ; CLOCK_SET/VERIFY_MODE are void; BLOCK_MODE returns the selected mode and
   ; zero is the supported byte-mode result, so none is an error result row.
   For op = 1 To 20
-    If op <> 4 And op <> 11 And op <> 13
+    If op <> 3 And op <> 4 And op <> 11 And op <> 13
       GateReset() : GateOwnPhase(gate_phaseForOp[op]) : gate_failOp = op
       WifiRadioInitTick()
       If gWifiRinitPhase <> #WIFI_RINIT_BACKOFF Or gWifiUp <> 0 : ProcedureReturn 16 : EndIf

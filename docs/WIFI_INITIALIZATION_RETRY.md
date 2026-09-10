@@ -74,7 +74,7 @@ The following are implementation bounds, not latency promises:
 
 | Current operation | Existing bound and atomicity | Cooperative boundary |
 | --- | --- | --- |
-| one property-mailbox transaction | `MailboxSend()` has a 1000 ms transport budget plus a spin guard | Inherently atomic with the single mailbox buffer. Return before servicing wired work. `WifiClockHz()` can attempt eight such calls and adds a 25 ms gap after each zero result, so its enclosing call is not a 200 ms operation. |
+| one property-mailbox transaction | `MailboxSend()` has a 1000 ms transport budget plus a spin guard | Inherently atomic with the single mailbox buffer. The synchronous foreground `WifiClockHz()` path can still attempt eight calls. The cooperative initializer issues one clock query per TRY phase and returns through a wrap-safe 25 ms WAIT before another attempt. |
 | WL_ON | several one-second mailbox transactions, an optional 20 ms low interval and a mandatory 150 ms high interval | The property transactions are atomic. The low/high settle intervals can become deadline phases, but a cancelled attempt that has driven the rail low must still finish the high write/readback or explicitly report the radio left off. |
 | controller reset/clock | reset and clock-stable waits are 100 ms each | A reset request and its completion proof are one phase. Do not service the same SDIO controller between them. |
 | one CMD52/CMD53 command | command/data inhibit up to 500 ms, command response up to 200 ms; R1b or final data completion up to 500 ms | One issued command plus its response/data completion and error-line recovery is atomic. It cannot be abandoned with controller inhibit or FIFO ownership unresolved. |
@@ -113,7 +113,7 @@ A complete target phase order is:
 IDLE / WAIT_POLICY / BACKOFF
 RESTORE_737
 BLOBS
-MAILBOX / CLOCK
+MAILBOX / CLOCK_BEGIN / CLOCK_TRY / CLOCK_WAIT
 WLON_READ / WLON_LOW_SETTLE / WLON_HIGH_SETTLE / WLON_VERIFY
 SDIO_RESET / SDIO_IDENT / SDIO_OPCOND / SDIO_SELECT / SDIO_WIDTH
 F1_ENABLE
@@ -185,9 +185,9 @@ This cut is intentionally smaller than adding resumable firmware, staged SDIO,
 and asynchronous control at once. Those follow only after the orchestration and
 cancellation ownership pass independently.
 
-The focused emitted candidate gate currently passes 42 scenario assertions,
-17 mandatory phase-failure rows and 23 cancellation boundaries over 94,189
-executed A64 instructions. It rejects 15 emitted product mutations and 10
+The focused emitted candidate gate currently passes 53 scenario assertions,
+17 mandatory phase-failure rows and 23 cancellation boundaries over 104,638
+executed A64 instructions. It rejects 21 emitted product mutations and 10
 structural command-branch mutations. A second emitted fixture executes the
 extracted real `CmdWifi` control flow for 16 success/refusal/foreground-policy
 assertions over 13,437 A64 instructions and rejects a hook moved before setter
@@ -197,6 +197,15 @@ not physical radio acceptance. The gate includes the supported
 forum-737 preflight, and cancellation after GTK publication but before DHCP:
 the live keyed session remains valid and reconciliation explicitly hands the
 unaddressed interface to the common DHCP client.
+
+The clock-retry candidate preserves synchronous foreground behavior but removes
+the eight-query loop from cooperative prompt service. Radio-generation state
+owns only the retry count, last failed-query time and accepted positive rate.
+Each `MailboxClockRate` transaction remains atomic; generation ownership is
+checked immediately after it returns. Cancellation clears those scalars, so a
+stale positive reply cannot reach CLOCK_SET and a stale failure cannot arm a
+WAIT. Exhaustion records CLOCK_TRY as the exact failing phase and returns to
+ordinary radio backoff; a new hardware generation always begins at try zero.
 
 ## Generic configuration revision
 

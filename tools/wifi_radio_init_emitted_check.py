@@ -69,6 +69,7 @@ def probe_source(source: str | None = None) -> str:
             "#WIFI_FW_ADDR", "#WIFI_FW_LEN", "#WIFI_NV_ADDR", "#WIFI_NV_LEN",
             "#WIFI_CLM_ADDR", "#WIFI_CLM_LEN", "#WIFI_NV_WORK",
             "#WIFI_NV_WORK_MAX", "#WIFI_SCRATCH", "#WIFI_SCRATCH_LEN",
+            "#WIFI_CLOCK_ID_EMMC", "#WIFI_CLOCK_TRIES", "#WIFI_CLOCK_GAP_MS",
             "#WIFI_HEAL_MS", "#WIFI_REC_IDLE", "#WIFI_REC_LEAVE", "#WIFI_REC_EAPOL_BEGIN",
             "#WIFI_REC_GTK_INSTALL",
         )
@@ -260,6 +261,36 @@ def main() -> int:
     )
     mutations = (
         (
+            "coarse clock retry",
+            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)",
+            "      r = WifiClockHz()",
+        ),
+        (
+            "clock wait deadline",
+            "      If ((millis() - gWifiRinitClockAt) & $FFFFFFFF) < #WIFI_CLOCK_GAP_MS",
+            "      If ((millis() - gWifiRinitClockAt) & $FFFFFFFF) < 0",
+        ),
+        (
+            "clock retry accumulation",
+            "    Case #WIFI_RINIT_CLOCK_TRY\n      ; One complete mailbox transaction remains atomic.",
+            "    Case #WIFI_RINIT_CLOCK_TRY\n      gWifiRinitClockTry = 0\n      ; One complete mailbox transaction remains atomic.",
+        ),
+        (
+            "clock zero refusal",
+            "      If r <= 0\n        gWifiRinitClockTry = gWifiRinitClockTry + 1",
+            "      If r < 0\n        gWifiRinitClockTry = gWifiRinitClockTry + 1",
+        ),
+        (
+            "clock stale generation",
+            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)\n      If wifi_RadioInitStillOwned(generation) = 0\n        ProcedureReturn\n      EndIf",
+            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)",
+        ),
+        (
+            "clock new-generation reset",
+            "    Case #WIFI_RINIT_CLOCK_BEGIN\n      gWifiRinitClockTry = 0",
+            "    Case #WIFI_RINIT_CLOCK_BEGIN\n      ; old retry count retained",
+        ),
+        (
             "stale generation",
             "      If wifi_RadioInitStillOwned(generation) = 0\n"
             "        ProcedureReturn\n"
@@ -420,7 +451,7 @@ def main() -> int:
                 return 1
 
     print(
-        "wifi_radio_init_emitted_check: PASS - 42 scenario assertions, "
+        "wifi_radio_init_emitted_check: PASS - 53 scenario assertions, "
         "17 mandatory phase-failure rows, 23 cancellation boundaries, "
         f"{steps:,} emitted A64 instructions; {len(mutations)} emitted mutants and "
         f"10 structural command mutants and 1 executed early-hook mutant rejected; "
