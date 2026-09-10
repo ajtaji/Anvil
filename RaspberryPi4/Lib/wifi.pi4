@@ -1806,6 +1806,22 @@ Global gWifiDropReq.i  = 0     ; test hook: force the next tick to rejoin
 Global gWifiHealPend.i = 0     ; a rejoin failed part-way; keep retrying on the cadence
 Global gWifiHealLast.i = 0     ; millis() of the last automatic heal retry
 
+; Record the link-down truth independently of the policy that decides
+; whether to re-associate. Observation mode may suppress healing, but it
+; must not leave a dead association keyed, addressed and route-eligible.
+Procedure wifi_RecordLinkDown()
+  NetDhcpLinkDown(#HW_LINK_WIFI)
+  gWifiKeyed = 0
+  gWifiHaveIp = 0
+  gWifiSecDone = 0
+  gWifiBadReads = 0
+  gWifiTeardown = 0
+  gWifiVerify = 0
+  gWifiHealPend = 0
+  gWifiKaProbes = 0
+  gWifiKaLast = 0
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  WifiRejoin - re-associate and re-lease after the link was lost.
 ;
@@ -1828,14 +1844,7 @@ Procedure.i WifiRejoin(announce.i)
   ; Record the down edge before the blocking association path can bring it
   ; back. The common client retains only a genuinely bound lease and will
   ; verify that lease with INIT-REBOOT after the new association keys.
-  NetDhcpLinkDown(#HW_LINK_WIFI)
-  gWifiKeyed   = 0
-  gWifiHaveIp  = 0
-  gWifiSecDone = 0
-  gWifiBadReads = 0
-  ; Any teardown still latched belonged to the association that ended.
-  gWifiTeardown = 0
-  gWifiVerify = 0
+  wifi_RecordLinkDown()
 
   If announce <> 0
     PrintN("Wi-Fi: the link to the access point is gone. Re-associating...")
@@ -1973,10 +1982,6 @@ Procedure WifiLinkTick()
   Define age.i
   Define rr.i
 
-  If gWifiLinkOn = 0
-    ProcedureReturn
-  EndIf
-
   ; ------------------------------------------------------------------
   ; SERVICE THE RADIO FIRST, EVERY SPIN, RATE LIMIT OR NOT.
   ;
@@ -2005,11 +2010,20 @@ Procedure WifiLinkTick()
     Print(" (reason ")
     PrintDec(er)
     PrintN(") - the link really is gone.")
-    If gWifiHealOn <> 0
+    If gWifiLinkOn <> 0 And gWifiHealOn <> 0
       WifiRejoin(1)
       ProcedureReturn
     EndIf
-    PrintN("Wi-Fi: auto-heal is OFF, so the link is being left down.")
+    wifi_RecordLinkDown()
+    PrintN("Wi-Fi: automatic recovery is OFF, so the link is being left down.")
+    ProcedureReturn
+  EndIf
+
+  ; `wifi link off` disables the keepalive, health detector and automatic
+  ; recovery policy. It does not disable radio service or link-down truth:
+  ; EAPOL rekeys and teardown events still leave the finite firmware queue,
+  ; and the definitive event above still invalidates a dead live identity.
+  If gWifiLinkOn = 0
     ProcedureReturn
   EndIf
 
@@ -2085,7 +2099,9 @@ Procedure WifiLinkTick()
         WifiRejoin(1)
         ProcedureReturn
       EndIf
+      wifi_RecordLinkDown()
       PrintN("Wi-Fi: firmware reports NOT associated, but auto-heal is OFF.")
+      ProcedureReturn
     EndIf
   EndIf
 
@@ -2109,9 +2125,12 @@ Procedure WifiLinkTick()
       WifiRejoin(1)
       ProcedureReturn
     EndIf
-    ; heal off (observation): leave the clock stale so this re-detects and
-    ; keeps saying "dead" every cycle - the persistent-death evidence.
+    ; Observation suppresses reassociation, not the link-down truth. The
+    ; counters and message retain the evidence while the dead row is no
+    ; longer advertised as usable.
+    wifi_RecordLinkDown()
     PrintN("Wi-Fi: auto-heal is OFF, so the death is being left to observe.")
+    ProcedureReturn
   EndIf
 
   ; --- keepalive: one over-the-air frame so the AP does not idle us out.

@@ -444,11 +444,14 @@ EndProcedure
 ;  straight back from the other side.
 ; ----------------------------------------------------------------------
 Procedure HwLinkConsoleArmed(kind.i, on.i)
-  If kind = #HW_LINK_WIFI And on <> 0
-    WifiSetConsoleOwnsRx(1)
-    ProcedureReturn
+  ; This notification is ABOUT `kind`. A wired notification must not
+  ; silently change the radio's consumer bit: the wildcard console can be
+  ; pumping both interfaces at once, independently of which one is named as
+  ; preferred. The common console explicitly sends Wi-Fi's own off edge when
+  ; that interface leaves its addressed membership.
+  If kind = #HW_LINK_WIFI
+    WifiSetConsoleOwnsRx(on)
   EndIf
-  WifiSetConsoleOwnsRx(0)
 EndProcedure
 
 ; HwLinkNoteRx - what the IP layer made of the frame. A REPLY WE ASKED

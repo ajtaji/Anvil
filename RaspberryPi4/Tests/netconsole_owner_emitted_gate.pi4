@@ -18,6 +18,8 @@ Global Dim gate_tx.a[1600]
 Global gate_txLen.i
 Global gate_txKind.i
 Global gate_pin.i
+Global gate_wifiConsoleOwns.i
+Global gate_wifiConsoleEdges.i
 
 Procedure.i millis()
   ProcedureReturn gate_ms
@@ -80,6 +82,14 @@ EndProcedure
 Procedure HwLinkNoteRx(kind.i, rc.i)
 EndProcedure
 Procedure HwLinkConsoleArmed(kind.i, on.i)
+  If kind = #HW_LINK_WIFI
+    gate_wifiConsoleEdges = gate_wifiConsoleEdges + 1
+    If on <> 0
+      gate_wifiConsoleOwns = 1
+    Else
+      gate_wifiConsoleOwns = 0
+    EndIf
+  EndIf
 EndProcedure
 
 ; netfmt diagnostics name drivers not present in this gate.
@@ -200,6 +210,41 @@ Procedure.i GateBusyTo(kind.i, ip.i, port.i)
   ProcedureReturn 1
 EndProcedure
 
+; Byte-valid server reply for the common client's current transaction.
+; This uses the production DHCP server serializer only as a packet oracle;
+; the production client parser, event handoff and worker consume the bytes.
+Procedure.i GateDhcpReply(kind.i, msg.i, ip.i, xid.i)
+  Define i.i
+  dhcpd_rqXid = xid
+  dhcpd_rqFlags = #DHCP_FLAG_BCAST
+  dhcpd_rqCiaddr = 0
+  For i = 0 To 5
+    dhcpd_rqMac[i] = gate_mac[kind * 6 + i]
+  Next
+  ProcedureReturn dhcpd_Build(msg, ip)
+EndProcedure
+
+Procedure GateOfflineLease(kind.i, ip.i, at.i)
+  Define i.i
+  dhcpc_state[kind] = #DHCPC_OFFLINE
+  For i = 0 To 5
+    dhcpc_mac[kind * 6 + i] = gate_mac[kind * 6 + i]
+  Next
+  dhcpc_ip[kind] = ip
+  dhcpc_mask[kind] = $FFFFFF00
+  dhcpc_gw[kind] = $C0A80102
+  dhcpc_server[kind] = $C0A80102
+  dhcpc_lease[kind] = 3600
+  dhcpc_t1[kind] = 1800
+  dhcpc_t2[kind] = 3150
+  dhcpc_leaseLeft[kind] = 3600
+  dhcpc_t1Left[kind] = 1800
+  dhcpc_t2Left[kind] = 3150
+  dhcpc_lastTick[kind] = at
+  dhcpc_linkUp[kind] = 0
+  netdhcp_auto[kind] = 1
+EndProcedure
+
 Procedure.i Main()
   Define i.i
   Define wiredIp.i
@@ -210,6 +255,9 @@ Procedure.i Main()
   Define peer3.i
   Define oldXid.i
   Define delayMs.i
+  Define rebootAt.i
+  Define wiredBefore.i
+  Define wiredAltBefore.i
   Dim p1.a[4]
   Dim p2.a[4]
   Dim ackish.a[4]
@@ -319,6 +367,24 @@ Procedure.i Main()
   NetConsoleCommandDone()
   If gConOwner <> #NETCON_OWNER_NONE : ProcedureReturn 27 : EndIf
 
+  ; Receive ownership follows wildcard-console membership, not the
+  ; preferred announcement. With both rows usable, wired is preferred but
+  ; the console still consumes Wi-Fi and its independent pump must stand
+  ; down. Address loss and reacquisition hand that one queue back and forth.
+  NetConsoleRearm()
+  NetConsolePump()
+  If gConKind <> #HW_LINK_WIRED Or gate_wifiConsoleOwns <> 1 : ProcedureReturn 38 : EndIf
+  NetAddressLost(#HW_LINK_WIFI)
+  NetConsoleRearm()
+  gate_ms = gate_ms + 5
+  NetConsolePump()
+  If gConOn = 0 Or gate_wifiConsoleOwns <> 0 : ProcedureReturn 39 : EndIf
+  NetAddressBound(#HW_LINK_WIFI, wifiIp, $FFFFFF00, $C0A80102, #NET_ADDR_LEASE)
+  NetConsoleRearm()
+  gate_ms = gate_ms + 5
+  NetConsolePump()
+  If gate_wifiConsoleOwns <> 1 : ProcedureReturn 40 : EndIf
+
   ; The common DHCP worker owns one independent transport schedule per
   ; interface. Both initial DISCOVERs are really serialized and handed to
   ; their own synthetic wire in one worker tick.
@@ -355,5 +421,60 @@ Procedure.i Main()
   If DhcpClientState(#HW_LINK_WIRED) <> #DHCPC_SELECTING Or DhcpClientXid(#HW_LINK_WIRED) = oldXid : ProcedureReturn 37 : EndIf
   NetDhcpCancel(#HW_LINK_WIRED)
   NetDhcpCancel(#HW_LINK_WIFI)
+
+  ; A server with no record of an INIT-REBOOT client may remain silent.
+  ; Verify through a low-32-bit tick wrap: the remembered request remains
+  ; active just before the one-minute bound, then is atomically replaced by
+  ; a fresh DISCOVER/new XID at the bound. The other interface is untouched.
+  NetAddressLost(#HW_LINK_WIFI)
+  wiredBefore = NetIPv4(#HW_LINK_WIRED)
+  wiredAltBefore = NetIPv4Alt(#HW_LINK_WIRED)
+  rebootAt = $FFFFFF00
+  GateOfflineLease(#HW_LINK_WIFI, wifiIp, rebootAt)
+  gate_ms = rebootAt
+  GateNoTx()
+  NetDhcpTick()
+  oldXid = DhcpClientXid(#HW_LINK_WIFI)
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_REBOOTING Or netdhcp_pending[#HW_LINK_WIFI] <> #DHCPC_ACT_REBOOT : ProcedureReturn 41 : EndIf
+  If gate_txKind <> #HW_LINK_WIFI Or netdhcp_attempts[#HW_LINK_WIFI] <> 1 : ProcedureReturn 42 : EndIf
+  gate_ms = (rebootAt + #NETDHCP_REBOOT_WINDOW_MS - 1) & $FFFFFFFF
+  NetDhcpTick()
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_REBOOTING Or DhcpClientXid(#HW_LINK_WIFI) <> oldXid : ProcedureReturn 43 : EndIf
+  gate_ms = (rebootAt + #NETDHCP_REBOOT_WINDOW_MS) & $FFFFFFFF
+  GateNoTx()
+  NetDhcpTick()
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_SELECTING Or netdhcp_pending[#HW_LINK_WIFI] <> #DHCPC_ACT_DISCOVER : ProcedureReturn 44 : EndIf
+  If DhcpClientXid(#HW_LINK_WIFI) = oldXid Or netdhcp_attempts[#HW_LINK_WIFI] <> 1 : ProcedureReturn 45 : EndIf
+  If gate_txKind <> #HW_LINK_WIFI Or gate_txLen < 42 + #DHCP_MIN_LEN : ProcedureReturn 46 : EndIf
+  If NetIPv4(#HW_LINK_WIRED) <> wiredBefore Or NetIPv4Alt(#HW_LINK_WIRED) <> wiredAltBefore : ProcedureReturn 47 : EndIf
+
+  ; A byte-valid ACK received just before the conservative deadline wins.
+  ; The parser records BOUND, and the common worker applies that event rather
+  ; than replacing it with DISCOVER merely because the next tick is due.
+  NetDhcpCancel(#HW_LINK_WIFI)
+  NetAddressLost(#HW_LINK_WIFI)
+  rebootAt = 100000
+  gate_ms = rebootAt
+  GateOfflineLease(#HW_LINK_WIFI, wifiIp, rebootAt)
+  NetDhcpTick()
+  oldXid = DhcpClientXid(#HW_LINK_WIFI)
+  gate_ms = rebootAt + #NETDHCP_REBOOT_WINDOW_MS - 1
+  gate_txLen = GateDhcpReply(#HW_LINK_WIFI, #DHCP_ACK, wifiIp, oldXid)
+  If DhcpClientInput(#HW_LINK_WIFI, @dhcpd_out[0], gate_txLen, gate_ms) <> #DHCPC_ACT_BOUND : ProcedureReturn 48 : EndIf
+  NetDhcpTick()
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_BOUND Or NetIPv4(#HW_LINK_WIFI) <> wifiIp Or netdhcp_pending[#HW_LINK_WIFI] <> #DHCPC_ACT_NONE : ProcedureReturn 49 : EndIf
+
+  ; A valid NAK takes the other protocol-defined path immediately: discard
+  ; the remembered address and begin fresh discovery without waiting for the
+  ; silence deadline.
+  gate_ms = gate_ms + 1
+  NetDhcpLinkDown(#HW_LINK_WIFI)
+  NetDhcpTick()
+  oldXid = DhcpClientXid(#HW_LINK_WIFI)
+  gate_txLen = GateDhcpReply(#HW_LINK_WIFI, #DHCP_NAK, 0, oldXid)
+  If DhcpClientInput(#HW_LINK_WIFI, @dhcpd_out[0], gate_txLen, gate_ms) <> #DHCPC_ACT_DROP : ProcedureReturn 50 : EndIf
+  NetDhcpTick()
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_SELECTING Or DhcpClientXid(#HW_LINK_WIFI) = oldXid Or NetIPv4(#HW_LINK_WIFI) <> 0 : ProcedureReturn 51 : EndIf
+
   ProcedureReturn 0
 EndProcedure

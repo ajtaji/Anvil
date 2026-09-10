@@ -31,7 +31,7 @@ def main() -> int:
     if result:
         print(f"netconsole_owner_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"netconsole_owner_emitted_check: PASS - 37 assertions, {steps:,} A64 instructions")
+    print(f"netconsole_owner_emitted_check: PASS - 51 assertions, {steps:,} A64 instructions")
     return 0
 
 

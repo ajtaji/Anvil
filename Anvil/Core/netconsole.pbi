@@ -167,6 +167,10 @@ Global gConOn.i = 0                ; the console is listening
 ; `info` and the boot log have one line to put first.
 Global gConKind.i = #HW_LINK_NONE
 Global gConIp.i = 0
+; Bit set for each interface the last actual receive walk consumed. This is
+; dispatcher ownership, not route preference, and is published to drivers
+; that otherwise run an independent hardware receive pump.
+Global gConMemberMask.i = 0
 Global gConPeerOk.i = 0            ; a peer has been seen
 Global gConPeerIp.i = 0
 Global gConPeerPort.i = 0
@@ -729,11 +733,20 @@ EndProcedure
 ; ACK changes the state or the next RFC deadline changes the action.
 #NETDHCP_RETRY_BASE_MS = 4000
 #NETDHCP_RETRY_MAX_MS  = 64000
+; RFC 2131 section 3.2 gives retransmitting over about one minute as an
+; example bound for verifying a remembered configuration. A server with no
+; record of this client MUST stay silent (section 4.3.2), so REBOOT cannot
+; use the ordinary indefinitely-capped retry cadence. The RFC permits reuse
+; of the unexpired address after that silence; Anvil deliberately chooses
+; the conservative alternative and discovers afresh rather than using an
+; address the present network never confirmed.
+#NETDHCP_REBOOT_WINDOW_MS = 60000
 Global Dim netdhcp_pending.a[#DHCPC_IFS]
 Global Dim netdhcp_sentAt.i[#DHCPC_IFS]
 Global Dim netdhcp_sent.a[#DHCPC_IFS]
 Global Dim netdhcp_due.i[#DHCPC_IFS]
 Global Dim netdhcp_attempts.i[#DHCPC_IFS]
+Global Dim netdhcp_phaseAt.i[#DHCPC_IFS]
 Global Dim netdhcp_auto.a[#DHCPC_IFS]
 Global Dim netdhcp_tx.i[#DHCPC_IFS]
 Global Dim netdhcp_txFail.i[#DHCPC_IFS]
@@ -860,6 +873,7 @@ Procedure.i NetDhcpStart(kind.i, automatic.i)
   netdhcp_sent[kind] = 0
   netdhcp_attempts[kind] = 0
   netdhcp_due[kind] = millis()
+  netdhcp_phaseAt[kind] = netdhcp_due[kind]
   ProcedureReturn 1
 EndProcedure
 
@@ -871,6 +885,7 @@ Procedure NetDhcpCancel(kind.i)
   netdhcp_pending[kind] = #DHCPC_ACT_NONE
   netdhcp_sent[kind] = 0
   netdhcp_attempts[kind] = 0
+  netdhcp_phaseAt[kind] = 0
   NetDhcpMode(kind, 0)
   NetUdpListen(kind, #DHCP_PORT_CLIENT, 0)
   DhcpClientReset(kind)
@@ -926,6 +941,7 @@ Procedure NetDhcpTick()
       netdhcp_pending[kind] = #DHCPC_ACT_SELECT
       netdhcp_sent[kind] = 0
       netdhcp_attempts[kind] = 0
+      netdhcp_phaseAt[kind] = now
     ElseIf event = #DHCPC_ACT_DROP
       netdhcp_Drop(kind)
       state = DhcpClientState(kind)
@@ -936,6 +952,8 @@ Procedure NetDhcpTick()
           NetDhcpMode(kind, 1)
           netdhcp_pending[kind] = DhcpClientBegin(kind, HwLinkMacPtr(kind), now)
           netdhcp_sent[kind] = 0
+          netdhcp_attempts[kind] = 0
+          netdhcp_phaseAt[kind] = now
         EndIf
       EndIf
     EndIf
@@ -950,6 +968,8 @@ Procedure NetDhcpTick()
           NetDhcpMode(kind, 1)
           netdhcp_pending[kind] = DhcpClientBegin(kind, HwLinkMacPtr(kind), now)
           netdhcp_sent[kind] = 0
+          netdhcp_attempts[kind] = 0
+          netdhcp_phaseAt[kind] = now
         EndIf
       EndIf
       Continue
@@ -958,12 +978,31 @@ Procedure NetDhcpTick()
       netdhcp_pending[kind] = action
       netdhcp_sent[kind] = 0
       netdhcp_attempts[kind] = 0
+      netdhcp_phaseAt[kind] = now
       If action = #DHCPC_ACT_REBOOT
         NetDhcpMode(kind, 1)
       EndIf
     EndIf
 
     action = netdhcp_pending[kind]
+    ; A silent INIT-REBOOT server is not evidence that the remembered
+    ; address is valid. Once the bounded verification window closes,
+    ; discard that protocol state and start a new DISCOVER with a new XID.
+    ; NetConsolePump runs before this worker at the prompt, so a valid ACK
+    ; already received at the deadline has become BOUND above and wins.
+    If action = #DHCPC_ACT_REBOOT
+      If ((now - netdhcp_phaseAt[kind]) & $FFFFFFFF) >= #NETDHCP_REBOOT_WINDOW_MS
+        DhcpClientReset(kind)
+        NetSetMac(kind, HwLinkMacPtr(kind))
+        NetUdpListen(kind, #DHCP_PORT_CLIENT, 1)
+        NetDhcpMode(kind, 1)
+        action = DhcpClientBegin(kind, HwLinkMacPtr(kind), now)
+        netdhcp_pending[kind] = action
+        netdhcp_sent[kind] = 0
+        netdhcp_attempts[kind] = 0
+        netdhcp_phaseAt[kind] = now
+      EndIf
+    EndIf
     If action <> #DHCPC_ACT_NONE
       If netdhcp_sent[kind] = 0 Or netdhcp_IsDue(now, netdhcp_due[kind]) <> 0
         If netdhcp_Send(kind, action) <> 0
@@ -1129,6 +1168,7 @@ EndProcedure
 
 Procedure NetConsolePump()
   Define k.i
+  Define members.i
   If gConOn = 0
     ProcedureReturn
   EndIf
@@ -1147,11 +1187,28 @@ Procedure NetConsolePump()
   ; THE WALK IS NetIfNext's so that the pump, the arming and `net`
   ; cannot disagree about which interfaces are in play.
   ; ------------------------------------------------------------------
+  members = 0
   k = NetIfNext(0)
   While k <> #HW_LINK_NONE
+    members = members | (1 << k)
+    ; Publish the on edge before consuming this queue, so the driver pump
+    ; cannot also consume it later in the same prompt spin.
+    If (gConMemberMask & (1 << k)) = 0
+      HwLinkConsoleArmed(k, 1)
+    EndIf
     netcon_PumpOne(k)
     k = NetIfNext(k)
   Wend
+
+  ; Rows absent from this completed walk are no longer console consumers.
+  ; No extra HwLinkReady/PHY query is made: membership is derived from the
+  ; exact NetIfNext walk the console already had to perform.
+  For k = 1 To #NETIF_KINDS - 1
+    If (gConMemberMask & (1 << k)) <> 0 And (members & (1 << k)) = 0
+      HwLinkConsoleArmed(k, 0)
+    EndIf
+  Next
+  gConMemberMask = members
 
   NetConsoleFlush()
 EndProcedure
@@ -1337,6 +1394,19 @@ Procedure NetConsoleSayLinks()
   Wend
 EndProcedure
 
+; Publish an all-off edge without querying hardware. Used only when the
+; wildcard listener itself is disarmed; ordinary membership is derived by
+; NetConsolePump from its existing interface walk.
+Procedure netcon_PublishDisarmed()
+  Define k.i
+  For k = 1 To #NETIF_KINDS - 1
+    If (gConMemberMask & (1 << k)) <> 0
+      HwLinkConsoleArmed(k, 0)
+    EndIf
+  Next
+  gConMemberMask = 0
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  NetConsoleStart - listen, on this kind, at the address the IP layer
 ;  holds. Idempotent: it prints its announcement exactly once per arming.
@@ -1369,18 +1439,11 @@ Procedure NetConsoleStart(kind.i)
   UartAuxSetFlush(@NetConsoleFlush)
   gConOn = 1
   gConArms = gConArms + 1
-  ; TELL THE BOARD, ABOUT EVERY INTERFACE THE CONSOLE IS NOW CONSUMING
-  ; FRAMES FROM. On a board whose radio services its own rekeys from a
-  ; pump of its own, that pump must stand down while this one is the
-  ; thing consuming the radio's frames - two consumers of one queue means
-  ; the keystrokes the other one reads are simply lost. The cable has no
-  ; such pump and answers this harmlessly; the loop is what makes a
-  ; console armed on BOTH links not silently break the radio's own.
-  k = NetIfNext(0)
-  While k <> #HW_LINK_NONE
-    HwLinkConsoleArmed(k, 1)
-    k = NetIfNext(k)
-  Wend
+  ; DRIVER RECEIVE OWNERSHIP IS PUBLISHED BY NetConsolePump's ACTUAL WALK,
+  ; not by this announcement. On a board whose radio services its own
+  ; rekeys, that pump stands down immediately before this console consumes
+  ; the radio queue; route preference and the sentence printed below have
+  ; no authority over hardware ownership.
   PrintN("Network console listening on UDP, on every interface that holds an")
   PrintN("address:")
   NetConsoleSayLinks()
@@ -1396,15 +1459,10 @@ Procedure netcon_Disarm()
   If gConOn = 0
     ProcedureReturn
   EndIf
-  Define k.i
-  ; Every interface it was consuming from, not just the announced one.
-  k = NetIfNext(0)
-  While k <> #HW_LINK_NONE
-    HwLinkConsoleArmed(k, 0)
-    k = NetIfNext(k)
-  Wend
-  HwLinkConsoleArmed(gConKind, 0)
   gConOn = 0
+  ; gConOn is already clear, so every row receives its exact off edge even
+  ; if its address disappeared before the console itself was disarmed.
+  netcon_PublishDisarmed()
   gConKind = #HW_LINK_NONE
   gConIp = 0
   gConPeerKind = #HW_LINK_NONE
@@ -1475,7 +1533,6 @@ Procedure NetConsoleRearm()
     If k <> gConKind Or NetIPv4(k) <> gConIp
       gConKind = k
       gConIp = NetIPv4(k)
-      HwLinkConsoleArmed(k, 1)
       PrintN("The network console is now listening on:")
       NetConsoleSayLinks()
     EndIf
