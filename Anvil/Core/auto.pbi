@@ -90,6 +90,9 @@ Procedure BootWait()
     PrintN("   DRAM across a reset, so it can be corrupted by something else; that")
     PrintN("   is why it is checked again here and not only when it was armed.")
     AutoSet(0)
+    ; This is a completed boot decision, not producer-side output. Put the
+    ; refusal on any screen that already exists before returning to startup.
+    ScreenServiceTick()
     ProcedureReturn
   EndIf
 
@@ -97,6 +100,9 @@ Procedure BootWait()
   PutAddr(e)
   PrintN(" in about two seconds.")
   Print("Press any key now to stop it and get a prompt instead ")
+  ; The label has to be visible before the wait it names. On a board with no
+  ; screen the common service seam is an honest no-op.
+  ScreenServiceTick()
 
   hz = TickHz()
   If hz <= 0
@@ -117,14 +123,21 @@ Procedure BootWait()
       PrintNl()
       PrintN("Stopped by a keypress. Autoboot is still armed - type autoboot to see")
       PrintN("where it points, or autoboot 0 to clear it.")
+      ScreenServiceTick()
       ProcedureReturn
     EndIf
     If (Ticks() - t0) > (quarter * (dots + 1))
       UartWrite(46)
       dots = dots + 1
+      ; A dot is the bounded progress cadence: batch one completed output
+      ; update, never render from UartWrite itself.
+      ScreenServiceTick()
     EndIf
   Wend
 
   PrintNl()
+  ; RunAt is allowed never to return. Service the completed countdown before
+  ; control leaves the monitor or its final line can remain model-only forever.
+  ScreenServiceTick()
   RunAt(e)
 EndProcedure

@@ -126,6 +126,9 @@ Procedure.i netll_Watch(ms.i)
       ProcedureReturn -1
     EndIf
     LinkPumpNet(#NETLL_SLICE_MS)
+    ; LinkPumpNet has completed its receive transaction. Service only at this
+    ; boundary; never render while the link backend owns a frame pointer.
+    netwait_Progress()
     If NetLlConflict() <> 0
       ProcedureReturn 1
     EndIf

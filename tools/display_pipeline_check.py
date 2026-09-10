@@ -120,7 +120,7 @@ def main() -> None:
     assert "DrawBanner()" not in tick
     assert "ConRepaint()" not in tick
     assert "delay(" not in tick
-    assert "ScreenBannerTick()" in CORE_PARSE
+    assert "ScreenServiceTick()" in CORE_PARSE
 
     # Font scale is one source of truth for both renderer tiers.
     for face in ("UI", "SMALL", "MONO", "BOLD"):

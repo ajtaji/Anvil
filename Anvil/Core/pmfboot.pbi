@@ -193,6 +193,7 @@
 #PMF_HDR_LEN   = 96            ; bytes of header before the image
 #PMF_VERSION   = 1             ; the only version this monitor reads
 #PMF_DIGEST    = 32            ; SHA-256, in bytes
+#PMF_PROGRESS_CHUNK = 65536    ; completed file/hash work between services
 
 ; Field offsets. Named, so a reader can check each against the table in
 ; the header above and so the parser reads as a list of facts.
@@ -639,11 +640,14 @@ Procedure.i PmfVerifyPlaced()
       ProcedureReturn 0
     EndIf
     chunk = gPmfImgLen - done
-    If chunk > 65536
-      chunk = 65536              ; 64 KiB between break checks, as crc32
+    If chunk > #PMF_PROGRESS_CHUNK
+      chunk = #PMF_PROGRESS_CHUNK ; 64 KiB between break/service checks
     EndIf
     Sha256Update(gPmfLoad + done, chunk)
     done = done + chunk
+    ; Sha256Update has returned: no compression round or partial block copy
+    ; is live across this cooperative display boundary.
+    ScreenServiceTick()
   Wend
   Sha256End(@gPmfGot[0])
 
@@ -784,6 +788,10 @@ Procedure PmfEnter()
     gGoX0 = 0
   EndIf
 
+  ; RunAt may never return. All validation, digest and ABI prose is complete,
+  ; so present it now rather than waiting for a prompt a healthy payload is
+  ; not required to give back.
+  ScreenServiceTick()
   RunAt(gPmfEntry)
 EndProcedure
 
@@ -897,6 +905,8 @@ EndProcedure
 Procedure.i PmfBootFile(*name)
   Define fileLen.i
   Define got.i
+  Define part.i
+  Define chunk.i
 
   If HwStorageUp() = 0
     PrintN("!! nothing was booted, because no medium came up and the container")
@@ -978,7 +988,32 @@ Procedure.i PmfBootFile(*name)
   PrintN(".")
   UartDrain()
 
-  got = HwFileReadAt(#PMF_HDR_LEN, gPmfLoad, gPmfImgLen)
+  ; Show the phase before entering the first potentially long medium read.
+  ScreenServiceTick()
+  got = 0
+  While got < gPmfImgLen
+    chunk = gPmfImgLen - got
+    If chunk > #PMF_PROGRESS_CHUNK
+      chunk = #PMF_PROGRESS_CHUNK
+    EndIf
+    part = HwFileReadAt(#PMF_HDR_LEN + got, gPmfLoad + got, chunk)
+    If part < 0
+      If got = 0
+        got = part
+      EndIf
+      Break
+    EndIf
+    If part = 0
+      Break
+    EndIf
+    got = got + part
+    ; HwFileReadAt is an offset transaction and has returned. No medium or
+    ; file backend scratch is live when the display service runs.
+    ScreenServiceTick()
+    If part <> chunk
+      Break
+    EndIf
+  Wend
   HwFileClose()
 
   If got <> gPmfImgLen

@@ -18,11 +18,13 @@
 ;  to the one group that had been left at block level because only one
 ;  board had ever needed it.
 ;
-;  THE PI 4'S BEHAVIOUR IS UNCHANGED, deliberately and checkably. Every
-;  procedure below performs exactly the sequence the calling command
-;  performed before, in the same order, with the same guards. The one
-;  thing that MOVED rather than stayed is where the block writer is armed
-;  - see HwFileWriteAll.
+;  THE PI 4'S OFFSET BEHAVIOUR IS PRESERVED, deliberately and checkably.
+;  Reads at repeated or random offsets still seek and every old guard is
+;  retained. The one optimized case is a sequential read that begins at the
+;  exact cursor left by the preceding successful seam read; avoiding a seek
+;  there prevents a chunked multi-megabyte load from repeatedly walking the
+;  FAT chain from its first cluster. See HwFileReadAt's validity contract.
+;  The block writer is still armed only inside HwFileWriteAll.
 ;
 ;  IT DOES NOT BRING THE MEDIUM UP, AND THAT IS AN EXISTING CONTRACT
 ;  RATHER THAN A SHORTCUT. Anvil/Core/settings.pbi's SettingsLoad has
@@ -58,6 +60,15 @@ Global gHwFileErr.i
 ; open. The two agree in normal operation and the disagreement is the
 ; interesting case.
 Global gHwFileOpen.i
+
+; 1 only when the FAT cursor left by the last successful seam operation is
+; known to be the continuation point for this seam's open file. This is not
+; inferred from FatTell() alone: FatRead may advance fat_pos and then fail
+; while resolving the next cluster, leaving a position that looks current
+; and a cursor that is not. Open establishes a valid position at zero;
+; every seek/read attempt clears this first and restores it only after the
+; operation has completed successfully.
+Global gHwFileReadCont.i
 
 ; 1 when the medium that is currently mounted can be written to.
 ;
@@ -150,6 +161,7 @@ EndProcedure
 Procedure.i HwFileOpen(*name)
   gHwFileErr = #HW_FILE_OK
   gHwFileOpen = 0
+  gHwFileReadCont = 0
   If *name = 0
     gHwFileErr = #HW_FILE_BADNAME
     ProcedureReturn 0
@@ -163,6 +175,7 @@ Procedure.i HwFileOpen(*name)
     ProcedureReturn 0
   EndIf
   gHwFileOpen = 1
+  gHwFileReadCont = 1
   ProcedureReturn 1
 EndProcedure
 
@@ -178,17 +191,23 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  HwFileReadAt(off, dst, n) - n bytes from byte offset `off`.
 ;
-;  FatSeek THEN FatRead, and the seek is not optional even for off = 0:
-;  the seam promises an OFFSET and not a stream position, so a caller that
-;  reads the header at 0 and then the image at 96 must get the image, and
-;  a caller that reads 0 twice must get the same bytes twice. Relying on
-;  the cursor happening to be in the right place is how the container
-;  reader would silently read the header a second time into the payload
-;  window and hash it.
+;  FatSeek unless the preceding successful operation left the FAT cursor at
+;  exactly `off`, then FatRead. The seam still promises an OFFSET and not a
+;  stream position: a repeated or random offset takes the seek path. The
+;  narrow continuation case matters for a large sequential PMF load because
+;  FatSeek rebuilds its cursor from the first cluster, making one seek per
+;  fixed-size chunk a quadratic chain walk.
+;
+;  FatTell() equality is necessary but not sufficient. FatRead can copy data,
+;  advance fat_pos to a cluster boundary, and then fail to resolve the next
+;  cluster. The continuation bit is therefore cleared before either FatSeek
+;  or FatRead and restored only after a nonnegative FatRead result.
 ; ----------------------------------------------------------------------
 Procedure.i HwFileReadAt(off.i, dst.i, n.i)
   Define got.i
+  Define canContinue.i
   If gHwFileOpen = 0
+    gHwFileReadCont = 0
     gHwFileErr = #HW_FILE_NOTOPEN
     ProcedureReturn -1
   EndIf
@@ -196,19 +215,32 @@ Procedure.i HwFileReadAt(off.i, dst.i, n.i)
   If n <= 0
     ProcedureReturn 0
   EndIf
-  If FatSeek(off) = 0
-    gHwFileErr = hwfile_MapFat()
-    ProcedureReturn -1
+
+  canContinue = 0
+  If gHwFileReadCont <> 0
+    If FatTell() = off
+      canContinue = 1
+    EndIf
+  EndIf
+  gHwFileReadCont = 0
+
+  If canContinue = 0
+    If FatSeek(off) = 0
+      gHwFileErr = hwfile_MapFat()
+      ProcedureReturn -1
+    EndIf
   EndIf
   got = FatRead(dst, n)
   If got < 0
     gHwFileErr = hwfile_MapFat()
     ProcedureReturn -1
   EndIf
+  gHwFileReadCont = 1
   ProcedureReturn got
 EndProcedure
 
 Procedure HwFileClose()
+  gHwFileReadCont = 0
   If gHwFileOpen <> 0
     FatClose()
     gHwFileOpen = 0
@@ -261,6 +293,10 @@ Procedure.i HwFileWriteAll(*name, src.i, n.i)
   Define opened.i
 
   gHwFileErr = #HW_FILE_OK
+  ; FatOpen/FatCreate below replace fat.pi4's single live file and FatClose
+  ; releases it. No read continuation can survive this operation, including
+  ; any refusal before the writer is armed.
+  gHwFileReadCont = 0
   If *name = 0
     gHwFileErr = #HW_FILE_BADNAME
     ProcedureReturn 0

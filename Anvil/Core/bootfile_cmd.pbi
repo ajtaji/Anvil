@@ -155,6 +155,7 @@ Procedure BootFileWait()
         PrintN("!! the settings could not be read, so any persisted boot target on this")
         PrintN("   medium was not acted on and the prompt follows as usual.")
         SettingsSayWhyNot()
+        ScreenServiceTick()
       EndIf
       ProcedureReturn
     EndIf
@@ -203,6 +204,7 @@ Procedure BootFileWait()
     PrintN("   boot clear to stop booting this file at all. boot status shows all")
     PrintN("   four settings.")
     PrintNl()
+    ScreenServiceTick()
     ProcedureReturn
   EndIf
 
@@ -226,6 +228,9 @@ Procedure BootFileWait()
     PrintN(" - nothing has confirmed a good boot yet)")
   EndIf
   Print("Press any key now to stop it and get a prompt instead ")
+  ; Put the complete announcement on any attached display before entering
+  ; the wait it describes. The target's service seam is a no-op when absent.
+  ScreenServiceTick()
 
   If secs > 0
     hz = TickHz()
@@ -246,11 +251,13 @@ Procedure BootFileWait()
         PrintN(" is still the boot target -")
         PrintN("type boot status to see it, or boot clear to stop booting it.")
         PrintN("The failure counter was NOT touched: nothing was attempted.")
+        ScreenServiceTick()
         ProcedureReturn
       EndIf
       If (Ticks() - t0) > (quarter * (dots + 1))
         UartWrite(46)
         dots = dots + 1
+        ScreenServiceTick()
       EndIf
     Wend
   EndIf
@@ -268,6 +275,7 @@ Procedure BootFileWait()
     SettingsSayWhyNot()
     PrintN("   The prompt follows. boot <name> still works by hand, because you are")
     PrintN("   here to stop it.")
+    ScreenServiceTick()
     ProcedureReturn
   EndIf
   Print("  attempt ")
@@ -277,6 +285,10 @@ Procedure BootFileWait()
   PrintN(" recorded on the medium, so a payload that never comes")
   PrintN("  back cannot be retried for ever. Type boot ok once it is up.")
 
+  ; PmfBootFile may transfer control permanently. Flush the final monitor
+  ; state before it opens/validates/enters the payload, not after a return
+  ; which a healthy payload is not required to make.
+  ScreenServiceTick()
   PmfBootFile(@gPmfName[0])
 
   ; Reached when the boot was refused, or when the payload returned. Both

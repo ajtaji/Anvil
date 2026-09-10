@@ -727,6 +727,46 @@ EndProcedure
 ; ======================================================================
 ; PER-INTERFACE DHCP LEASE WORKER
 ; ======================================================================
+; Optional cooperative service for bounded foreground network waits. The
+; callback is deliberately not a network pump: the board may use it to paint
+; an already-up display after a complete receive/protocol iteration. It must
+; not call back into networking. Unset is inert, and the busy guard refuses a
+; recursive service call.
+#NETWAIT_PROGRESS_MS = 50
+Global *gNetWaitProgressHook = 0
+Global gNetWaitProgressBusy.i = 0
+Global gNetWaitProgressAt.i = 0
+
+Procedure.i NetWaitSetProgressHook(*fn)
+  Define old.i
+  old = *gNetWaitProgressHook
+  *gNetWaitProgressHook = *fn
+  gNetWaitProgressBusy = 0
+  If *fn <> 0
+    ; Make the first completed iteration due immediately. All arithmetic is
+    ; in the 32-bit millis domain so registration beside a wrap is ordinary.
+    gNetWaitProgressAt = (millis() - #NETWAIT_PROGRESS_MS) & $FFFFFFFF
+  EndIf
+  ProcedureReturn old
+EndProcedure
+
+Procedure netwait_Progress()
+  Define now.i
+  Define elapsed.i
+  If *gNetWaitProgressHook = 0 Or gNetWaitProgressBusy <> 0
+    ProcedureReturn
+  EndIf
+  now = millis() & $FFFFFFFF
+  elapsed = (now - gNetWaitProgressAt) & $FFFFFFFF
+  If elapsed < #NETWAIT_PROGRESS_MS
+    ProcedureReturn
+  EndIf
+  gNetWaitProgressAt = now
+  gNetWaitProgressBusy = 1
+  gNetWaitProgressHook()
+  gNetWaitProgressBusy = 0
+EndProcedure
+
 ; The codec/state machine owns protocol validity; this layer owns only
 ; transport and applying a completed transition. It runs from the prompt
 ; and never waits. One pending action per interface is retried until an
@@ -1033,6 +1073,9 @@ Procedure.i NetDhcpAcquire(kind.i, waitMs.i, keepRunning.i)
   Repeat
     netcon_PumpOne(kind)
     NetDhcpTick()
+    ; Both calls above have returned: no receive pointer or partially handled
+    ; protocol transition is live across the cooperative service boundary.
+    netwait_Progress()
     If DhcpClientState(kind) = #DHCPC_BOUND And NetIfSrc(kind) = #NET_ADDR_LEASE
       ; A successfully acquired lease is always maintained and reacquired
       ; after expiry; keepRunning controls only an unanswered foreground

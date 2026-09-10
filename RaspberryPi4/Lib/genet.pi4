@@ -1459,6 +1459,17 @@ Global genet_anegRestarts.i
 Global genet_linkDrops.i
 Global genet_pauseApplied.i
 
+; Optional cooperative service hook for long PHY discovery/link waits. The
+; hook runs only after a complete MDIO transaction (or read pair) and must not
+; call back into GENET/network code. It is inert when unset and recursion is
+; refused. Fifty milliseconds is a service target plus one complete atomic
+; MDIO iteration and the callback's own cost, not a hard interrupt deadline.
+#GENET_PROGRESS_MS = 50
+Global *genet_progressHook = 0
+Global genet_progressBusy.i = 0
+Global genet_progressAt.i = 0
+Global genet_progressStep.i = 0
+
 ; ======================================================================
 ;  THE CANARY - did a 64-bit address survive the compiler?
 ; ======================================================================
@@ -1536,6 +1547,33 @@ Procedure.i GenetTimeoutTicks(ms.i)
     hz = #GENET_HZ_FALLBACK
   EndIf
   ProcedureReturn (hz / 1000) * ms
+EndProcedure
+
+Procedure.i GenetSetProgressHook(*fn)
+  Define old.i
+  old = *genet_progressHook
+  *genet_progressHook = *fn
+  genet_progressBusy = 0
+  If *fn <> 0
+    genet_progressStep = GenetTimeoutTicks(#GENET_PROGRESS_MS)
+    genet_progressAt = genet_Ticks() - genet_progressStep
+  EndIf
+  ProcedureReturn old
+EndProcedure
+
+Procedure genet_Progress()
+  Define now.i
+  If *genet_progressHook = 0 Or genet_progressBusy <> 0
+    ProcedureReturn
+  EndIf
+  now = genet_Ticks()
+  If (now - genet_progressAt) < genet_progressStep
+    ProcedureReturn
+  EndIf
+  genet_progressAt = now
+  genet_progressBusy = 1
+  genet_progressHook()
+  genet_progressBusy = 0
 EndProcedure
 
 ; Ticks since `start`. CNTPCT_EL0 is 64 bits; at 54 MHz it takes over
@@ -1946,6 +1984,7 @@ Procedure.i GenetPhyScan()
   genet_err = #GENET_ERR_NONE
 
   id = GenetPhyIdAt(#GENET_PHY_ADDR)
+  genet_Progress()
   If id > 0
     genet_phyAddr = #GENET_PHY_ADDR
     genet_phyId = id
@@ -1956,6 +1995,7 @@ Procedure.i GenetPhyScan()
   While a <= #GENET_PHY_ADDR_MAX
     If a <> #GENET_PHY_ADDR
       id = GenetPhyIdAt(a)
+      genet_Progress()
       If id > 0
         genet_phyAddr = a
         genet_phyId = id
@@ -2421,6 +2461,9 @@ Procedure.i GenetPhyWaitLink(ms.i)
     If bmsr < 0
       ProcedureReturn bmsr
     EndIf
+    ; The latched/live BMSR pair is complete. The display callback therefore
+    ; cannot reenter while START_BUSY or a half-read link sample is live.
+    genet_Progress()
 
     If (bmsr & #GENET_BMSR_LSTATUS) <> 0
       If canAneg = 0
