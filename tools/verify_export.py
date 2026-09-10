@@ -184,6 +184,11 @@ def inspect_text(relative: PurePosixPath) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--for-publication",
+        action="store_true",
+        help="also require the recorded publication review to be cleared",
+    )
+    parser.add_argument(
         "--working-tree",
         action="store_true",
         help="check all tracked and non-ignored candidate files before staging",
@@ -199,6 +204,15 @@ def main() -> int:
 
     if manifest.get("schema") != 2:
         failures.append("PROVENANCE.json must use schema 2")
+    review = manifest.get("publication_review", {})
+    if not isinstance(review, dict):
+        review = {}
+    review_status = review.get("status", "unrecorded")
+    if args.for_publication and review_status != "cleared":
+        failures.append(
+            "publication review is not cleared: "
+            + str(review.get("reason", "no completed review is recorded"))
+        )
     policy = manifest.get("current_tree")
     if not isinstance(policy, dict) or policy.get("manifest") != "git-index":
         failures.append("PROVENANCE.json has no git-index current-tree policy")
@@ -276,7 +290,12 @@ def main() -> int:
     counts = ", ".join(f"{entry}: {count}" for entry, count in closure_counts)
     print(
         f"Public-tree verification passed: {mode}, {len(selected)} files; "
-        f"include closures complete ({counts}); boundaries and notices intact."
+        f"include closures complete ({counts}); file boundaries checked and "
+        "required notice files present."
+    )
+    print(
+        f"Publication review: {review_status}. Packaging checks do not determine "
+        "license compatibility or grant publication authority."
     )
     return 0
 

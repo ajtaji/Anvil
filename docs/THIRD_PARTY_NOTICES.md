@@ -4,6 +4,33 @@ Anvil includes or derives material from the projects listed below. The
 repository MIT license does not replace these terms. The complete retained
 license texts are in [`licenses/`](../licenses/).
 
+**Publication review is open.** The source-export gate checks packaging, not
+license compatibility. The GENET derivation and the remaining driver closure
+are being reviewed before further public pushes. See
+[`PUBLICATION_REVIEW.md`](PUBLICATION_REVIEW.md); the project MIT declaration
+must not be read as resolving that review.
+
+## Broadcom brcmfmac source
+
+`RaspberryPi4/Lib/cyw43.pi4` adapts protocol and transport code from Linux
+`drivers/net/wireless/broadcom/brcm80211/brcmfmac/`. The reviewed upstream
+revision is Linux v6.12, commit
+`adc218676eef25575469234709c2d87185ca223a`:
+
+| Source | Retained copyright | SPDX identifier |
+| --- | --- | --- |
+| `bcmsdh.c`, `sdio.c`, `bcdc.c` | 2010 Broadcom Corporation | ISC |
+| `fwil.h` | 2012 Broadcom Corporation | ISC |
+| `chip.c` | 2014 Broadcom Corporation | ISC |
+
+The complete [ISC notice](../licenses/Broadcom-brcmfmac-ISC.txt) accompanies
+these adaptations. This is separate from the binary CYW43455 firmware license
+below. Retaining these confirmed source notices does not claim that the entire
+driver dependency/provenance audit is complete.
+
+Sources: [pinned brcmfmac directory](https://github.com/torvalds/linux/tree/adc218676eef25575469234709c2d87185ca223a/drivers/net/wireless/broadcom/brcm80211/brcmfmac),
+[pinned license text](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/LICENSES/deprecated/ISC).
+
 ## Raspberry Pi firmware stub
 
 `RaspberryPi4/Board/armstub8.asm` is a translation and modification of
