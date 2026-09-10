@@ -1,0 +1,134 @@
+; Returning diagnostic: MCU45 register97 pointer write, 10 ms, one-byte READ.
+; No Goodix, GPIO, panel power/reset, UART or storage access. Only the selected
+; read-only MCU register pointer is written. FIFO is read once only if RXD.
+; Refuse unless BSC0 starts exactly enabled-idle with a running counter.
+; Record the read lifecycle before bounded production recovery can erase it.
+; Diagnostic, NOT monitor firmware. Root must verify a fresh map/image hash
+; and arm the external payload watchdog before execution.
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+
+#PROBE_MAGIC = $49324D52           ; I2MR
+#PROBE_ADDR = $45
+#PROBE_WAIT_US = 20000
+#PROBE_SPINS = 200000
+
+Global probe_done.i
+Global probe_write_result.i = -10
+Global probe_read_result.i = -10
+Global probe_recover_result.i = -1
+Global probe_before_c.i
+Global probe_before_s.i
+Global probe_start_c.i
+Global probe_hz.i
+Global probe_start.i
+Global probe_elapsed.i
+Global probe_polls.i
+Global probe_last_s.i
+Global probe_received.i
+Global probe_byte.i = -1
+Global probe_ta_tick.i
+Global probe_ta_s.i
+Global probe_rxd_tick.i
+Global probe_rxd_s.i
+Global probe_done_tick.i
+Global probe_done_s.i
+Global probe_err_tick.i
+Global probe_err_s.i
+Global probe_clkt_tick.i
+Global probe_clkt_s.i
+Global Dim probe_pointer.a[1]
+Global Dim probe_before_recover.l[7]
+Global Dim probe_after.l[7]
+
+Procedure.i Main()
+  Define s.i
+  Define now.i
+  Define deadline.i
+  Define spins.i
+  Define finished.i
+  probe_done = 0
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  probe_before_c = I2cRd(#BSC_C_OFF)
+  probe_before_s = I2cRd(#BSC_S_OFF)
+  probe_hz = I2cCounterHz()
+  If probe_before_c <> #BSC_C_I2CEN Or (probe_before_s & #BSC_S_TA) <> 0 Or probe_hz <= 0
+    probe_done = #PROBE_MAGIC
+    ProcedureReturn 0
+  EndIf
+  probe_pointer[0] = $97
+  probe_write_result = I2cWrite(#PROBE_ADDR, @probe_pointer[0], 1)
+  If probe_write_result <> #I2C_OK
+    probe_recover_result = I2cRecover()
+    I2cSnapshot(@probe_after[0])
+    probe_done = #PROBE_MAGIC
+    ProcedureReturn 0
+  EndIf
+  delay(10)
+  If I2cEnsureIdle() = 0
+    probe_read_result = #I2C_TIMEOUT
+    I2cSnapshot(@probe_after[0])
+    probe_done = #PROBE_MAGIC
+    ProcedureReturn 0
+  EndIf
+
+  ; Match I2cXfer's normal standalone-read setup; no repeated START.
+  I2cWr(#BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
+  I2cWr(#BSC_A_OFF, #PROBE_ADDR)
+  I2cWr(#BSC_DLEN_OFF, 1)
+  probe_start = I2cCounterTicks()
+  deadline = I2cDeadlineUs(#PROBE_WAIT_US)
+  spins = #PROBE_SPINS
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR | #BSC_C_ST | #BSC_C_READ)
+  probe_start_c = I2cRd(#BSC_C_OFF)
+  probe_read_result = #I2C_TIMEOUT
+  Repeat
+    s = I2cRd(#BSC_S_OFF)
+    now = I2cCounterTicks() - probe_start
+    probe_polls = probe_polls + 1
+    probe_last_s = s
+    If probe_ta_tick = 0 And (s & #BSC_S_TA) <> 0
+      probe_ta_tick = now : probe_ta_s = s
+    EndIf
+    If probe_rxd_tick = 0 And (s & #BSC_S_RXD) <> 0
+      probe_rxd_tick = now : probe_rxd_s = s
+    EndIf
+    If probe_done_tick = 0 And (s & #BSC_S_DONE) <> 0
+      probe_done_tick = now : probe_done_s = s
+    EndIf
+    If probe_err_tick = 0 And (s & #BSC_S_ERR) <> 0
+      probe_err_tick = now : probe_err_s = s
+    EndIf
+    If probe_clkt_tick = 0 And (s & #BSC_S_CLKT) <> 0
+      probe_clkt_tick = now : probe_clkt_s = s
+    EndIf
+    If (s & #BSC_S_ERR) <> 0
+      probe_read_result = #I2C_NACK : finished = 1
+    ElseIf (s & #BSC_S_CLKT) <> 0
+      probe_read_result = #I2C_CLKT : finished = 1
+    ElseIf probe_received = 0 And (s & #BSC_S_RXD) <> 0
+      probe_byte = I2cRd(#BSC_FIFO_OFF) & $FF
+      probe_received = 1
+      deadline = I2cDeadlineUs(#PROBE_WAIT_US)
+      spins = #PROBE_SPINS
+    ElseIf (s & #BSC_S_DONE) <> 0
+      If probe_received = 1 : probe_read_result = #I2C_OK : EndIf
+      finished = 1
+    Else
+      spins = spins - 1
+      If spins <= 0 Or I2cDeadlinePassed(deadline) <> 0 : finished = 1 : EndIf
+    EndIf
+  Until finished <> 0
+
+  probe_elapsed = I2cCounterTicks() - probe_start
+  I2cSnapshot(@probe_before_recover[0])
+  If probe_read_result <> #I2C_OK
+    probe_recover_result = I2cRecover()
+  EndIf
+  I2cSnapshot(@probe_after[0])
+  probe_done = #PROBE_MAGIC
+  ProcedureReturn 0
+EndProcedure
