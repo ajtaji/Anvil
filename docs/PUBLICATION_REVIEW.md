@@ -25,6 +25,22 @@ provenance closure still needs review, including register headers and the
 MMU/SDIO implementation; a hardware register citation is not automatically
 code derivation, and each case needs inspection.
 
+Follow-up source-header checks extend the inventory beyond GENET:
+`mmu.pi4` explicitly names its all-level set/way loop as ported from
+U-Boot [`cache.S`](https://github.com/u-boot/u-boot/blob/6d41f0a39d6423c8e57e92ebbe9f8c0333a63f72/arch/arm/cpu/armv8/cache.S),
+whose header is GPL-2.0-or-later. The V3D source describes transcribed routines
+from Linux
+[`v3d_gem.c`](https://github.com/torvalds/linux/blob/adc218676eef25575469234709c2d87185ca223a/drivers/gpu/drm/v3d/v3d_gem.c);
+that file, `v3d_regs.h`, and `drivers/pmdomain/bcm/bcm2835-power.c` at the same
+revision carry GPL-2.0-or-later headers. Distinguish register facts from copied
+implementation when reviewing each routine; no whole-file legal conclusion is
+inferred solely from a reference to a register header.
+
+The owner has been asked whether to retain applicable GPL components with
+their obligations alongside MIT original code, or pursue a permissive-only
+replacement. That choice is pending. Network and touch development continue
+locally, with no public push or historical rewrite.
+
 ## Candidate replacement basis, not an accepted replacement
 
 OpenBSD has a GENET implementation under a two-clause BSD notice. Review is
