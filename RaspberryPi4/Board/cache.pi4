@@ -126,12 +126,12 @@ EndProcedure
 ;  THE CACHE, BEHIND A FLAG
 ;
 ;  #ANVIL_CACHE compiles in the runtime `cache` command. The D-cache is
-;  OFF at boot, ALWAYS - nothing here runs before the prompt - so the
-;  resident monitor still enters with the stub's $30C50830 every time and
-;  a wrong enable is recovered by a power cycle rather than being a brick.
-;  Turning caches on is `cache on` at the prompt; the payload jump path
-;  (RunAt) flushes and disables before handing the board over and brings
-;  the monitor's caches back after.
+;  OFF on entry, ALWAYS, so the resident monitor still enters with the
+;  stub's $30C50830 every time and a wrong enable is recovered by a power
+;  cycle rather than being a brick. V3D console initialization may enable
+;  it before the prompt; `cache on` can enable it explicitly at the prompt.
+;  The payload jump path (RunAt) flushes and disables before handing the
+;  board over and brings the monitor's caches back after.
 ;
 ;  COHERENCE WITH THE D-CACHE ON (the M4 work, done 2026-08-29). Every
 ;  region a bus master shares with the CPU is handled so caches-on is fully
@@ -169,6 +169,25 @@ Procedure.i CacheTablesBase()
   ProcedureReturn ((@gMmuTables[0] + 4095) / 4096) * 4096
 EndProcedure
 
+; List every region that must remain coherent with a bus master. The DSI
+; scan and draw surfaces have fixed board-owned addresses even when only one
+; of them is the currently adopted DisplayBase, so map their complete reserved
+; window independently of source and rotation. The adopted display mapping is
+; retained for the firmware-owned HDMI framebuffer.
+Procedure CacheMapNc()
+  MmuClearNc()
+  MmuAddNc(#MON_FB_LO, #MON_FB_HI + 1)
+  If DisplayReady() <> 0 And DisplayBase() > 0
+    MmuAddNc(DisplayBase(), DisplayBase() + DisplaySize())
+  EndIf
+  ; The GENET receive ring - the ethernet DMA writes frames straight into
+  ; it. genet.pi4 also carries dc civac maintenance for this; the NC mapping
+  ; is belt-and-braces so the RX path is coherent by construction. The
+  ; literal is #ETH_RX_BASE .. +#ETH_RX_BYTES because eth_globals.pi4 is
+  ; included after this file.
+  MmuAddNc($08100000, $08180000)
+EndProcedure
+
 ; Turn the cached MMU on. Rebuilds the tables every time (a returned
 ; payload may have overwritten their DRAM), and MmuEnableCached()
 ; invalidates the unknown reset-state D-cache before it sets M|C|I.
@@ -184,20 +203,7 @@ Procedure.i CacheEnable()
   EndIf
   ; MAP THE DMA-SHARED REGIONS NON-CACHEABLE, so the CPU is coherent with
   ; every bus master that bypasses the D-cache without any dc maintenance.
-  MmuClearNc()
-  ; The framebuffer, if a screen is up: base .. base+size covers a double-
-  ; height V3D surface too. Coherent with V3D, the DMA engine and the
-  ; display controller.
-  If DisplayReady() <> 0 And DisplayBase() > 0
-    MmuAddNc(DisplayBase(), DisplayBase() + DisplaySize())
-  EndIf
-  ; The GENET receive ring - the ethernet DMA writes frames straight into
-  ; it. genet.pi4 also carries dc civac maintenance for this; the NC mapping
-  ; is belt-and-braces so the RX path is coherent by construction. The
-  ; literal is #ETH_RX_BASE .. +#ETH_RX_BYTES (eth_globals.pi4: $08100000,
-  ; 512 KiB) written out because that file is included AFTER this one, so
-  ; its constants are not yet in scope here.
-  MmuAddNc($08100000, $08180000)
+  CacheMapNc()
   rc = MmuBuildTables(CacheTablesBase())
   If rc <> 0
     ProcedureReturn 0
