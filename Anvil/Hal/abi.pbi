@@ -341,27 +341,22 @@
 ;  capability that had not been invented when this Anvil was built, and it
 ;  is what lets a newer payload run on an older monitor.
 ;
-;  ID 9 WAS #SVCCAP_CAN UNTIL 2026-09-04, when the engine port was moved
-;  to a second unit and the group became the VEHICLE LINK. The
-;  NUMBER did not move, and refusing to move it is the point: nothing had
-;  shipped, so renumbering was free - and the habit of renumbering a
-;  frozen id when it is free starts here or never.
+;  THE IDS THEMSELVES MOVED TO Anvil/Hal/seams.pbi ON 2026-09-10 and
+;  their values did not change. They were declared here because this
+;  table was their only consumer. A driver module gives them two more:
+;  the seam registry, which a board composition includes near the top -
+;  long before this table exists - so that a driver can ask whether a
+;  module has replaced it; and the MODULE, which is separately compiled
+;  and must not include this file at all. `seams.pbi` is the published
+;  contract a module is built against, and it carries the ids, the
+;  function-index vocabulary per seam, and the two slot numbers below.
+;
+;  Include it before this file. It is constants only and defines nothing
+;  else, so including it costs nothing where the table is absent - the
+;  same property abi_version.pbi was split out for.
 ; ----------------------------------------------------------------------
-#SVCCAP_STORAGE  = 0
-#SVCCAP_NET      = 1
-#SVCCAP_GPIO     = 2
-#SVCCAP_I2C      = 3
-#SVCCAP_MMC      = 4
-#SVCCAP_USB      = 5
-#SVCCAP_BOOT_EL1 = 6
-#SVCCAP_TOUCH    = 7
-#SVCCAP_GNSS     = 8
-#SVCCAP_VEHLINK  = 9      ; was _CAN; renamed 2026-09-04, id unchanged
-#SVCCAP_SPI      = 10
-#SVCCAP_UART     = 11
-#SVCCAP_RTC      = 12
-#SVCCAP_CONSOLE  = 13
-#SVCCAP_MAX      = 13     ; anything above this answers 0, not an error
+;   see Anvil/Hal/seams.pbi for #SVCCAP_STORAGE .. #SVCCAP_THERMAL
+;   and for #SVCCAP_MAX
 
 ; Informational board identity. SvcBoardId's answer. A PAYLOAD THAT
 ; BRANCHES ON IT HAS BROKEN THE WHOLE POINT and the gate looks for exactly
@@ -544,6 +539,32 @@ Procedure.i SvcCapGet(cap.i)
   If cap = #SVCCAP_UART     : ProcedureReturn #CAP_UART     : EndIf
   If cap = #SVCCAP_RTC      : ProcedureReturn #CAP_RTC      : EndIf
   If cap = #SVCCAP_CONSOLE  : ProcedureReturn #CAP_CONSOLE  : EndIf
+  ; ------------------------------------------------------------------
+  ;  THE IDS A MODULE CAN REACH - NEW AT 1.1, AND ANSWERED DIFFERENTLY.
+  ;
+  ;  Every id above is a COMPILE-TIME #CAP_* from the board's own
+  ;  board.pi4: "this board was built with that code in it". These two
+  ;  cannot be, because whether the seam is reachable is decided at RUN
+  ;  time by whether a module filled it, and a constant cannot answer a
+  ;  question whose answer changes while the board is running.
+  ;
+  ;  SO THE ANSWER IS CORE-OR-MODULE, from two sources and one answer.
+  ;  HwSeamCore() is "the core reaches this with no module at all",
+  ;  which is #CAP_*'s meaning narrowed to exactly what it can still
+  ;  honestly claim; ModSeamHas() is "something has filled it". Either
+  ;  one is a yes, and a caller that needs to know WHICH asks the seam.
+  ;
+  ;  A NEW ID DOES NOT CHANGE AN OLD ANSWER, which is what makes adding
+  ;  them an abi_minor bump rather than a major one: a payload built at
+  ;  1.0 never asks these, and one built at 1.1 asking an older monitor
+  ;  gets 0 - the honest "this board does not offer it".
+  ; ------------------------------------------------------------------
+  If cap = #SVCCAP_PWM Or cap = #SVCCAP_THERMAL
+    If HwSeamCore(cap) <> 0 Or ModSeamHas(cap) <> 0
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -777,6 +798,60 @@ EndProcedure
 ; HwI2cPinFunc() both carry the same warning about.
 Procedure.i SvcErrDetail()
   ProcedureReturn gSvcDetail
+EndProcedure
+
+; ======================================================================
+;  SLOTS 14 AND 15 - THE MODULE HALF OF THE TABLE. NEW AT ABI 1.1.
+; ----------------------------------------------------------------------
+;  THE TABLE IS ONE THING READ IN TWO DIRECTIONS. A payload READS it: it
+;  is handed the pointer and calls slots. A module WRITES it: it is
+;  handed the same pointer and publishes the services it implements.
+;  Every slot above this point is the reading direction; these two are
+;  the writing one, and they are the ONLY two, because everything else a
+;  module needs it already has.
+;
+;  THEY GO IN THE CORE GROUP'S SPARE SLOTS AND CHANGE NOTHING. The group
+;  reserved sixteen and used fourteen; filling 14 and 15 appends without
+;  moving a single existing index, so entry_count stays 184 and no slot
+;  changes meaning. That is the definition of an abi_minor bump, and it
+;  is why a module or payload built at 1.0 still runs here unmodified.
+;
+;  BOTH DELEGATE TO Anvil/Core/mod_registry.pbi AND HOLD NO STATE. The
+;  table is an ABI, not a place to keep things; the registry is included
+;  near the top of a board composition precisely so that drivers far
+;  above this file can ask it the same questions.
+; ======================================================================
+
+; Slot 14. A module publishing one function into one seam.
+;
+; EVERY REFUSAL IS A CONTRACT VIOLATION BY THE MODULE and the registry
+; decides which: a fill from outside an init call, a seam the module's
+; own header did not declare, a seam another module already owns, a
+; function index outside the seam's shape, or a null function. The
+; module gets the code back and its init is expected to return it, at
+; which point the loader unwinds everything it had already published.
+;
+; THE MODULE DOES NOT NAME ITSELF. It cannot be trusted to, and it does
+; not need to: the loader opened the publish window for exactly one
+; init call, so the registry already knows whose call this is.
+Procedure.i SvcSeamFill(seam.i, index.i, fn.i)
+  gSvcDetail = 0
+  ProcedureReturn ModSeamFill(seam, index, fn)
+EndProcedure
+
+; Slot 15. Reading back what fills a seam - a module that needs another
+; module's service, or a payload that wants to call a loaded driver
+; directly rather than through the group's own slots.
+;
+; ZERO MEANS NOTHING FILLS IT and the caller must test for it. There is
+; no refusal stub here the way an unused table slot points at
+; SvcUnimplemented, because a seam's function signatures are not
+; uniform - a stub could not return the right kind of nothing for all of
+; them - and because a caller that has to test anyway is a caller that
+; can fall back to whatever it did before the module existed.
+Procedure.i SvcSeamGet(seam.i, index.i)
+  gSvcDetail = 0
+  ProcedureReturn ModSeamFn(seam, index)
 EndProcedure
 
 ; ======================================================================
@@ -1948,6 +2023,12 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CORE + 11] = @SvcUptimeUs
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CORE + 12] = @SvcErrText
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CORE + 13] = @SvcErrDetail
+  ; 14 and 15 are the module half, new at 1.1. #SVC_SEAM_SLOT_FILL and
+  ; #SVC_SEAM_SLOT_GET in Anvil/Hal/seams.pbi are the SAME two numbers,
+  ; published to module authors who cannot see this file; a module reads
+  ; the pointer out of the table at that index and calls it.
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CORE + #SVC_SEAM_SLOT_FILL] = @SvcSeamFill
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CORE + #SVC_SEAM_SLOT_GET]  = @SvcSeamGet
 
   ; --- clock, base 16 -------------------------------------------------
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CLOCK + 0] = @SvcTicks

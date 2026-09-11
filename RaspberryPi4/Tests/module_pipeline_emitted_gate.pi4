@@ -1,0 +1,638 @@
+; ======================================================================
+;  THE DRIVER-MODULE PIPELINE, END TO END, AS EMITTED A64
+; ----------------------------------------------------------------------
+;  RUN IT WITH: python tools/module_pipeline_check.py
+;
+;  It compiles THIS file - which includes the REAL Core and Hal sources,
+;  not copies - and executes the emitted A64 in tools/a64/a64_interp.py.
+;  The driver it loads is the REAL THERMAL.MOD, compiled from
+;  RaspberryPi4/Modules/thermal_avs.pi4 by the same pmfc, embedded here
+;  as bytes by the check script.
+;
+;  WHAT IS REAL AND WHAT IS MODELLED, stated plainly because the
+;  difference is the whole value of the claim:
+;
+;    REAL   the container parser, every validation, the relocator, the
+;           arena allocator, the seam registry, the lifecycle, the
+;           manifest reader, and the CONSUMER - RaspberryPi4/Lib/
+;           thermal.pi4 as it ships, calling through the seam.
+;
+;    REAL   the driver. THERMAL.MOD is the shipped module, compiled by
+;           pmfc --module, placed and executed by this loader. Its probe
+;           and its init are the code that will run on the board.
+;
+;    MODELLED  the medium (a table of byte arrays instead of FAT), the
+;           service table (two slots, filled the way abi.pbi fills them),
+;           the board's memory map, and THE DEVICE REGISTER - the AVS
+;           status word is a location in interpreter RAM that this gate
+;           pokes. Everything about the register except the silicon is
+;           exercised: the address arithmetic, the validity bits, the
+;           negative slope, and the driver's refusal when it is invalid.
+;
+;    NOT CLAIMED  that any of this has run on a Pi 4. Cache maintenance
+;           is a stub that answers 1; there is no MMU, no DMA and no
+;           firmware here. This is a desk proof of the pipeline's logic
+;           and of the driver's arithmetic, and it is labelled as one.
+;
+;  EVERY CHECK IS A FAILURE COUNT. Main() answers the number of checks
+;  that did not hold, so the interpreter's x0 at return is the verdict
+;  and a zero cannot be produced by falling off the end.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE MODELLED MAP. Every address here is interpreter RAM and none of
+;  them is a board address; the point of the two "reserved" ranges is to
+;  give ModArenaInit() something real to refuse.
+; ----------------------------------------------------------------------
+#GATE_DEV_BLOCK   = $07000000     ; the modelled device's register base
+#GATE_STAGE       = $06000000     ; where a container is read and judged
+#GATE_STAGE_BYTES = $00010000
+#GATE_ARENA_A     = $06100000
+#GATE_ARENA_B     = $06200000
+#GATE_ARENA_BYTES = $00040000
+#GATE_RESERVED_LO = $06400000     ; a region the modelled board reserves
+#GATE_RESERVED_HI = $064FFFFF
+#GATE_MON_LO      = $00200000     ; the modelled monitor image
+#GATE_MON_HI      = $004FFFFF
+#GATE_PAY_LO      = $00500000     ; the modelled payload window
+#GATE_PAY_HI      = $05FFFFFF
+
+; A status word with both validity bits set and code 760, which the
+; device tree's line turns into 39920 millidegrees - the exact reading
+; a Pi 4 produced on 2026-09-06 with this driver's arithmetic compiled
+; into the core. -487 * 760 + 410040 = 39920.
+#GATE_AVS_GOOD = $106F8
+#GATE_AVS_CODE = 760
+#GATE_AVS_MILLI = 39920
+
+; What the modelled firmware answers, so a fallback is distinguishable
+; from a seam reading by its value alone.
+#GATE_MAILBOX_MILLI = 51500
+#GATE_MAILBOX_MAX   = 85000
+
+Global gateArenaBase.i
+Global gateArenaBytes.i
+Global gateArenaRegion.i
+Global gateSyncOk.i
+Global gateSyncCalls.i
+Global gateManifestFx.i
+Global gateOpenFx.i
+Global gateOpenAt.i
+Global gateMailbox.i
+Global gateFails.i
+Global gateStep.i
+
+; ======================================================================
+;  THE FIXTURES. Generated beside this file by tools/module_pipeline_check.py
+;  and included rather than pasted, so the containers in it are always the
+;  ones the current compiler produced from the current module source.
+; ======================================================================
+XIncludeFile "build/tests/module_pipeline/module_pipeline_fixtures.pi4"
+
+; ======================================================================
+;  THE CONTRACT AND THE REGISTRY - the real files, in the real order.
+; ======================================================================
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+
+; ----------------------------------------------------------------------
+;  THE MODELLED BOARD. Every procedure here is one the loader's header
+;  lists as a board contract, and nothing else.
+; ----------------------------------------------------------------------
+Procedure.i HwModArenaBase()
+  ProcedureReturn gateArenaBase
+EndProcedure
+
+Procedure.i HwModArenaBytes()
+  ProcedureReturn gateArenaBytes
+EndProcedure
+
+Procedure.i HwModArenaRegion()
+  ProcedureReturn gateArenaRegion
+EndProcedure
+
+Procedure.i HwModStageAddr()
+  ProcedureReturn #GATE_STAGE
+EndProcedure
+
+Procedure.i HwModStageBytes()
+  ProcedureReturn #GATE_STAGE_BYTES
+EndProcedure
+
+; A stub, and the gate can make it refuse. On the board this is
+; CacheFlushRange over the code extent; here there are no caches, so
+; answering 1 is modelling and not a proof of anything.
+Procedure.i HwModCodeSync(base.i, bytes.i)
+  gateSyncCalls = gateSyncCalls + 1
+  ProcedureReturn gateSyncOk
+EndProcedure
+
+Procedure.i HwMonRegions()
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i HwMonRegionLo(i.i)
+  Select i
+    Case 0 : ProcedureReturn #GATE_MON_LO
+    Case 1 : ProcedureReturn #GATE_RESERVED_LO
+  EndSelect
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwMonRegionHi(i.i)
+  Select i
+    Case 0 : ProcedureReturn #GATE_MON_HI
+    Case 1 : ProcedureReturn #GATE_RESERVED_HI
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwMonRegionSay(i.i)
+EndProcedure
+
+Procedure.i HwPayWindows()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPayLo(i.i)
+  ProcedureReturn #GATE_PAY_LO
+EndProcedure
+
+Procedure.i HwPayHi(i.i)
+  ProcedureReturn #GATE_PAY_HI
+EndProcedure
+
+; The device list. One device, the same compatible id the Pi 4 board
+; declares, with a handle that points at interpreter RAM instead of at
+; the AVS block - which is exactly the substitution the token exists to
+; make possible.
+Procedure.i HwDevCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwDevIdAddr(i.i)
+  Select i
+    Case 0 : ProcedureReturn "brcm,bcm2711-thermal"
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDevSeam(i.i)
+  Select i
+    Case 0 : ProcedureReturn #SVCCAP_THERMAL
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwDevToken(i.i)
+  Select i
+    Case 0 : ProcedureReturn #GATE_DEV_BLOCK
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwDevSay(i.i)
+EndProcedure
+
+Procedure.i HwSeamCore(id.i)
+  Select id
+    Case #SVCCAP_THERMAL : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwSeamPossible(id.i)
+  Select id
+    Case #SVCCAP_THERMAL : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE MODELLED MEDIUM. A fixture table instead of FAT, with the same
+;  four-call shape the storage seam publishes.
+; ----------------------------------------------------------------------
+Procedure.i GateNameIs(a.i, b.i)
+  Define i.i
+  Define ca.i
+  Define cb.i
+  i = 0
+  While i < 32
+    ca = PeekA(a + i) & 255
+    cb = PeekA(b + i) & 255
+    If ca <> cb
+      ProcedureReturn 0
+    EndIf
+    If ca = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwFileOpen(name.i)
+  Define i.i
+  gateOpenFx = -1
+  gateOpenAt = 0
+  If GateNameIs(name, "MODULES.TXT")
+    gateOpenFx = gateManifestFx
+    ProcedureReturn 1
+  EndIf
+  i = 0
+  While i < #FX_COUNT
+    If GateNameIs(name, GateFxName(i))
+      gateOpenFx = i
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwFileLastError()
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i HwFileSize()
+  If gateOpenFx < 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn GateFxLen(gateOpenFx)
+EndProcedure
+
+Procedure.i HwFileReadAt(off.i, dst.i, n.i)
+  Define src.i
+  Define i.i
+  If gateOpenFx < 0
+    ProcedureReturn -1
+  EndIf
+  src = GateFxAddr(gateOpenFx) + off
+  i = 0
+  While i < n
+    PokeB(dst + i, PeekA(src + i) & 255)
+    i = i + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure HwFileClose()
+  gateOpenFx = -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE MODELLED SERVICE TABLE. Two header words and 184 slots, with the
+;  two module slots filled the way Anvil/Hal/abi.pbi fills them and every
+;  other slot left zero - a module that reached for one would read zero
+;  and refuse, which is what the real table's refusal stubs achieve by a
+;  different route.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+
+Global Dim gateTab.i[2 + #SVC_SLOT_COUNT]
+
+Procedure.i SvcSeamFill(sid.i, index.i, fn.i)
+  ProcedureReturn ModSeamFill(sid, index, fn)
+EndProcedure
+
+Procedure.i SvcSeamGet(sid.i, index.i)
+  ProcedureReturn ModSeamFn(sid, index)
+EndProcedure
+
+Procedure.i SvcTableAddr()
+  ProcedureReturn @gateTab[0]
+EndProcedure
+
+Procedure GateBuildTable()
+  gateTab[0] = 0
+  gateTab[1] = #SVC_ABI_MINOR | (#SVC_SLOT_COUNT << 32)
+  gateTab[2 + #SVC_SEAM_SLOT_FILL] = @SvcSeamFill
+  gateTab[2 + #SVC_SEAM_SLOT_GET] = @SvcSeamGet
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CONSOLE AND FORMATTING THE REFUSALS USE. The gate never calls a
+;  refusal's prose - it checks codes - so these exist to let the real
+;  files compile unmodified rather than to be exercised.
+; ----------------------------------------------------------------------
+; Print()/PrintN() are resolved by the compiler BY NAME onto three
+; procedures a console library supplies - str_print_at, printdec and
+; printnl. Supplying them here rather than pulling in uart.pi4 is what
+; keeps the gate off the hardware: a UART write in the interpreter would
+; spin on a status bit nothing ever clears.
+Procedure str_print_at(p.i)
+EndProcedure
+
+Procedure UartWriteStr(s.i)
+EndProcedure
+
+Procedure PrintDec(v.i)
+EndProcedure
+
+Procedure PrintNl()
+EndProcedure
+
+Procedure PutHex8(v.i)
+EndProcedure
+
+; ======================================================================
+;  THE LOADER, THE LIFECYCLE AND THE MANIFEST - the real files.
+; ======================================================================
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+
+; ======================================================================
+;  THE CONSUMER - RaspberryPi4/Lib/thermal.pi4 exactly as it ships, over
+;  a modelled firmware property interface.
+; ======================================================================
+Procedure.i MailboxTemperature()
+  ProcedureReturn gateMailbox
+EndProcedure
+
+Procedure.i MailboxTemperatureMax()
+  ProcedureReturn #GATE_MAILBOX_MAX
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/thermal.pi4"
+
+; ======================================================================
+;  THE HARNESS
+; ======================================================================
+Procedure Expect(got.i, want.i)
+  gateStep = gateStep + 1
+  If got <> want
+    gateFails = gateFails + 1
+  EndIf
+EndProcedure
+
+; Each placement below models a separate cold boot. Product code cannot
+; reset a READY arena - doing so would forget live records - so this is a
+; test-only reset of the engine globals, and it is the one thing in this
+; file that no shipped path may ever do.
+Procedure GateColdBoot(base.i, bytes.i, region.i)
+  gModArenaReady = 0
+  gModArenaBase = 0
+  gModArenaBytes = 0
+  gModArenaEnd = 0
+  gModArenaNext = 0
+  gModRecordCount = 0
+  gModLastRecord = -1
+  gModPrepared = 0
+  gateArenaBase = base
+  gateArenaBytes = bytes
+  gateArenaRegion = region
+  gateSyncOk = 1
+  gateSyncCalls = 0
+  gateMailbox = #GATE_MAILBOX_MILLI
+  therm_source = #THERM_SRC_NONE
+  therm_seamFails = 0
+  therm_bind = -1
+  ModSeamReset()
+  ModLifecycleReset()
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define baseA.i
+  Define baseB.i
+  Define t.i
+
+  gateFails = 0
+  gateStep = 0
+  GateBuildTable()
+
+  ; ==================================================================
+  ;  1. THE DEVICE REGISTER AND THE DRIVER'S ARITHMETIC.
+  ; ==================================================================
+  PokeN(#GATE_DEV_BLOCK + $200, #GATE_AVS_GOOD)
+
+  ; ==================================================================
+  ;  2. NEGATIVE CONTAINERS. Every one of these must be refused before a
+  ;     byte of arena, a bump of the allocator or a record can change.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  Expect(ModArenaInit(), #MOD_OK)
+  PokeB(#GATE_ARENA_A, $A5)
+
+  Expect(ModLoadFile("BADMAGIC.MOD"), #MOD_ERR_MAGIC)
+  Expect(ModLoadFile("BADMINOR.MOD"), #MOD_ERR_ABI_MINOR)
+  Expect(ModLoadFile("BADHASH.MOD"), #MOD_ERR_HASH)
+  Expect(ModLoadFile("RELOVL.MOD"), #MOD_ERR_RELOC)
+  Expect(ModLoadFile("RELRNG.MOD"), #MOD_ERR_RELOC)
+  Expect(ModLoadFile("NOSUCH.MOD"), #MOD_ERR_FILE)
+  Expect(PeekA(#GATE_ARENA_A) & 255, $A5)
+  Expect(gModArenaNext, #GATE_ARENA_A)
+  Expect(gModRecordCount, 0)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+
+  ; ==================================================================
+  ;  3. AN ARENA THE BOARD'S OWN MAP FORBIDS.
+  ; ==================================================================
+  ; Inside a region the board reserves, and not declared as its own.
+  GateColdBoot(#GATE_RESERVED_LO, $1000, -1)
+  Expect(ModArenaInit(), #MOD_ERR_REGION)
+  Expect(gModErrorIndex, 1)
+  Expect(gModRegionKind, 0)
+  Expect(gModArenaReady, 0)
+
+  ; Overlapping only its top edge is still overlapping.
+  GateColdBoot(#GATE_RESERVED_HI - $FFF, $2000, -1)
+  Expect(ModArenaInit(), #MOD_ERR_REGION)
+
+  ; Inside a payload window, where a `boot` would land on it.
+  GateColdBoot(#GATE_PAY_HI - $FFFF, $10000, -1)
+  Expect(ModArenaInit(), #MOD_ERR_REGION)
+  Expect(gModRegionKind, 1)
+
+  ; THE SAME RANGE, now declared BY the board as the arena's own region:
+  ; accepted, because a range necessarily overlaps itself and the skip is
+  ; by index rather than by comparing addresses.
+  GateColdBoot(#GATE_RESERVED_LO, $1000, 1)
+  Expect(ModArenaInit(), #MOD_OK)
+
+  ; A board that offers no arena at all gets its own code.
+  GateColdBoot(0, 0, -1)
+  Expect(ModArenaInit(), #MOD_ERR_NOARENA)
+
+  ; ==================================================================
+  ;  4. THE WHOLE PIPELINE, DRIVEN BY THE MANIFEST.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  gateManifestFx = #FX_MODULES_GOOD
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModManifestWalk(), 1)
+  Expect(gModManifestState, 1)
+  Expect(gModRecordCount, 1)
+  Expect(gModRecState[0], #MOD_STATE_ACTIVE)
+  Expect(gModRecInitCalls[0], 1)
+  Expect(gModRecDevice[0], 0)
+  Expect(gModRecToken[0], #GATE_DEV_BLOCK)
+  Expect(gModRecMatched[0], 0)
+  Expect(gateSyncCalls, 1)
+  baseA = gModRecBase[0]
+  Expect(baseA, #GATE_ARENA_A)
+
+  ; The service is published, owned, and reachable.
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 1)
+  Expect(ModSeamOwner(#SVCCAP_THERMAL), 0)
+  Expect(ModSeamFilledCount(#SVCCAP_THERMAL), 1)
+
+  ; A CONSUMER USES IT. This is RaspberryPi4/Lib/thermal.pi4 as it ships:
+  ; it finds the seam, calls the loaded driver, and reports the source.
+  t = ThermalMilliC()
+  Expect(t, #GATE_AVS_MILLI)
+  Expect(ThermalSource(), #THERM_SRC_REGISTER)
+  Expect(ThermalWholeC(t), 40)
+  ; ... and it took a binding on first use, which is what makes the
+  ; unload below refusable rather than a coin toss.
+  Expect(ModSeamBindCount(#SVCCAP_THERMAL), 1)
+  Expect(ModSeamDepth(#SVCCAP_THERMAL), 0)
+
+  ; The maximum is still the firmware's - a sensor has no throttle field,
+  ; so the module could not have supplied it and does not pretend to.
+  Expect(ThermalMaxMilliC(), #GATE_MAILBOX_MAX)
+
+  ; DOUBLE INIT. Refused without calling anything; the count proves it.
+  Expect(ModActivate(0), #MOD_ERR_STATE)
+  Expect(gModRecInitCalls[0], 1)
+  Expect(gModRecState[0], #MOD_STATE_ACTIVE)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 1)
+
+  ; UNLOAD WHILE A CONSUMER HOLDS IT. Refused, by name, state unchanged.
+  Expect(ModUnload(0), #MOD_ERR_BOUND)
+  Expect(gModErrorValue, #SVCCAP_THERMAL)
+  Expect(gModRecState[0], #MOD_STATE_ACTIVE)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 1)
+
+  ; DETACH, then unload. The consumer is asked to let go and does.
+  Expect(ModSeamDetachAll(#SVCCAP_THERMAL), 0)
+  Expect(ModSeamBindCount(#SVCCAP_THERMAL), 0)
+  Expect(ModUnload(0), #MOD_OK)
+  Expect(gModRecState[0], #MOD_STATE_QUIESCED)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+  Expect(ModSeamOwner(#SVCCAP_THERMAL), #MOD_SEAM_NONE)
+
+  ; THE CONSUMER FALLS BACK, with no notification and no failure. This is
+  ; the property that made the conversion safe to do without a board.
+  Expect(ThermalMilliC(), #GATE_MAILBOX_MILLI)
+  Expect(ThermalSource(), #THERM_SRC_MAILBOX)
+
+  ; The stranded arena is still protected: unloading did not hand the
+  ; bytes back, and an operator's `fill` over them is still refused.
+  Expect(ModHitsRange(baseA, baseA + $FFF), 1)
+  Expect(ModUnload(0), #MOD_ERR_STATE)
+
+  ; ==================================================================
+  ;  5. THE SAME CONTAINER AT A SECOND BASE.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_B, #GATE_ARENA_BYTES, -1)
+  gateManifestFx = #FX_MODULES_GOOD
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModManifestWalk(), 1)
+  baseB = gModRecBase[0]
+  Expect(baseB, #GATE_ARENA_B)
+  Expect(gModRecState[0], #MOD_STATE_ACTIVE)
+  ; The driver answers the same number from a different address, which is
+  ; the position-independence claim made on a real driver rather than on
+  ; a synthetic image.
+  Expect(ThermalMilliC(), #GATE_AVS_MILLI)
+  Expect(ThermalSource(), #THERM_SRC_REGISTER)
+
+  ; ==================================================================
+  ;  6. THE PROBE DECLINES. Nothing is initialised and nothing published.
+  ; ==================================================================
+  PokeN(#GATE_DEV_BLOCK + $200, 0)
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  gateManifestFx = #FX_MODULES_GOOD
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModManifestWalk(), #MOD_ERR_PROBE)
+  Expect(gModManifestState, 2)
+  Expect(gModManifestLine, 3)
+  Expect(gModRecState[0], #MOD_STATE_FAILED)
+  Expect(gModRecInitCalls[0], 0)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+  Expect(ThermalMilliC(), #GATE_MAILBOX_MILLI)
+  PokeN(#GATE_DEV_BLOCK + $200, #GATE_AVS_GOOD)
+
+  ; ==================================================================
+  ;  7. FAILED INIT UNWINDS WHAT IT HAD ALREADY PUBLISHED.
+  ;     FAILINIT.MOD fills the seam and THEN returns 77.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModLoadFile("FAILINIT.MOD"), #MOD_OK)
+  Expect(ModRecEnabledSeams(0), 1)
+  Expect(ModActivate(0), #MOD_ERR_INIT)
+  Expect(gModErrorValue, 77)
+  Expect(gModRecState[0], #MOD_STATE_FAILED)
+  Expect(gModRecInitCalls[0], 1)
+  ; The unwind: the function it published is gone, the seam has no owner,
+  ; and no consumer can reach a driver that gave up halfway.
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+  Expect(ModSeamOwner(#SVCCAP_THERMAL), #MOD_SEAM_NONE)
+  Expect(ModSeamFn(#SVCCAP_THERMAL, #SEAM_THERMAL_READ), 0)
+  Expect(ThermalMilliC(), #GATE_MAILBOX_MILLI)
+
+  ; ==================================================================
+  ;  8. TWO OWNERS OF ONE SEAM, and a manifest that narrows.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModLoadAndActivate("THERMAL.MOD", -1), #MOD_OK)
+  Expect(ModSeamOwner(#SVCCAP_THERMAL), 0)
+  Expect(ModLoadAndActivate("THERMAL.MOD", -1), #MOD_ERR_SEAM_TAKEN)
+  Expect(gModRecordCount, 2)
+  Expect(gModRecState[1], #MOD_STATE_FAILED)
+  ; The FIRST module is untouched by the second one's refusal.
+  Expect(ModSeamOwner(#SVCCAP_THERMAL), 0)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 1)
+
+  ; A narrowing naming a seam the header does not declare is refused
+  ; before the device is matched.
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModLoadAndActivate("THERMAL.MOD", #SVCCAP_I2C), #MOD_ERR_SEAM_UNDECLARED)
+  Expect(gModRecState[0], #MOD_STATE_FAILED)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+  ; Narrowing TO the seam it does declare is a no-op that still loads.
+  Expect(ModLoadAndActivate("THERMAL.MOD", #SVCCAP_THERMAL), #MOD_OK)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 1)
+
+  ; ==================================================================
+  ;  9. A MANIFEST LINE THAT CANNOT BE ACTED ON STOPS THE WALK.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  gateManifestFx = #FX_MODULES_BADSEAM
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModManifestWalk(), #MOD_ERR_MANIFEST)
+  Expect(gModManifestState, 2)
+  Expect(gModManifestLine, 2)
+  Expect(gModRecordCount, 0)
+
+  ; ==================================================================
+  ;  10. A CACHE-SYNC FAILURE COMMITS NOTHING AND EXECUTES NOTHING.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  Expect(ModArenaInit(), #MOD_OK)
+  gateSyncOk = 0
+  Expect(ModLoadFile("THERMAL.MOD"), #MOD_ERR_SYNC)
+  Expect(gModRecordCount, 0)
+  Expect(gModArenaNext, #GATE_ARENA_A)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+
+  ; ==================================================================
+  ;  11. A FILL FROM OUTSIDE AN INIT IS REFUSED. This is what makes
+  ;      "a probe is side-effect-free" a rule rather than a request.
+  ; ==================================================================
+  GateColdBoot(#GATE_ARENA_A, #GATE_ARENA_BYTES, -1)
+  Expect(ModArenaInit(), #MOD_OK)
+  Expect(ModSeamFill(#SVCCAP_THERMAL, 0, @ThermalMilliC), #MOD_ERR_STATE)
+  Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
+
+  ProcedureReturn gateFails
+EndProcedure

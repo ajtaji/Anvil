@@ -27,17 +27,26 @@ between them. Relocation destination spans may not overlap.
 Before including `Anvil/Core/mod_arena.pbi`, a board composition must provide:
 
 ```text
-HwModArenaBase()            ; 4 KiB-aligned first byte
+HwModArenaBase()            ; 4 KiB-aligned first byte, or 0 for "no arena here"
 HwModArenaBytes()           ; byte length of a reserved, guarded range
+HwModArenaRegion()          ; which HwMonRegion* index IS the arena, or -1
+HwModStageAddr()            ; where one container is read and judged
+HwModStageBytes()           ; the largest container this board accepts
 HwModCodeSync(base, bytes)  ; clean D-cache/invalidate I-cache; return 1
 ```
 
-The board must prove the range is disjoint from the live image, BSS/data,
-payload/staging windows, DMA/display buffers, firmware reservations, and every
-other owner. The obsolete Pi range `$08A00000..$091FFFFF` is the DSI framebuffer
-and is explicitly forbidden. `ModArenaInit()` is cold-start-only; calling it
-again is refused because forgetting READY records would amount to an unsafe
-unload.
+The range must be disjoint from the live image, BSS/data, payload/staging
+windows, DMA/display buffers, firmware reservations, and every other owner.
+`ModArenaInit()` now **checks that rather than trusting it**: it walks the
+board's own `HwMonRegion*()` list and `HwPay*()` windows and refuses an arena
+that overlaps one, skipping only the index the board names as the arena's own
+region. The obsolete Pi range `$08A00000..$091FFFFF` is the DSI framebuffer and
+is rejected by that check, not only by a paragraph. A board that offers no
+arena answers 0 and gets `#MOD_ERR_NOARENA`, which is a different sentence from
+a misaligned one.
+
+`ModArenaInit()` is cold-start-only; calling it again is refused because
+forgetting READY records would amount to an unsafe unload.
 
 Loading is transactional with respect to allocator and record state: all
 preflight/allocation/source-overlap checks happen before destination mutation,
@@ -45,11 +54,33 @@ and a relocation or cache-sync failure commits no bump pointer or READY row.
 An uncommitted destination span can be written and then cleared during such a
 failure, so it must remain private arena memory.
 
-## Deliberately outside this phase
+## The board also declares its devices
 
-This engine does not read files or manifests, discover devices, choose a module
-for hardware, execute probe/init/quiesce wrappers, initialize module globals,
-or publish service functions. Reload remains unsupported. A future reload
-design requires stable core trampolines, in-flight call accounting, driver
-quiescence, and an atomic group swap; changing a record pointer is not safe
-when callers may retain function pointers.
+A module states what it is FOR, in digest-covered compatible ids. The board
+states what is PRESENT:
+
+```text
+HwDevCount()        how many devices the board will name
+HwDevIdAddr(i)      a NUL-terminated ASCII compatible id
+HwDevSeam(i)        the #SVCCAP_* group it belongs to
+HwDevToken(i)       the handle a driver needs - a register base, on a
+                    memory-mapped part
+HwDevSay(i)         prints the device's own name, in the board's words
+HwSeamCore(id)      does the core reach this seam with no module at all
+HwSeamPossible(id)  is the hardware here, whether or not anything reaches it
+```
+
+Matching an id against that table is core arithmetic and carries no board
+knowledge. The token is what removes the last hard-wired address from a
+converted driver: the module reads its registers from what it was handed.
+
+## What the loader does now
+
+Discovery, matching, lifecycle and service publication are implemented; see
+`docs/MODULE_PIPELINE.md` for the states, the refusals and what is proven.
+Reload is still unsupported, and unload strands the arena it used: the
+allocator has no free list, and handing that memory to a later module would
+put it where a stale pointer still names. A future reload design requires
+stable core trampolines, in-flight call accounting, driver quiescence, and an
+atomic group swap; changing a record pointer is not safe when callers may
+retain function pointers.

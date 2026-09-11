@@ -485,8 +485,17 @@ were removed from the table because they no longer describe that file, and the
 move is recorded in `PROVENANCE.json` under `third_party.relocations` with the
 classifications they had. The destination is not tracked yet, so it cannot be
 classified here; the check script reports it as a note and will refuse the
-moment it is committed unlisted. `RaspberryPi4/Board/hw_mod.pi4`, from the same
-lane, is in the same state.
+moment it is committed unlisted. `RaspberryPi4/Board/hw_mod.pi4` and
+`RaspberryPi4/Tests/module_pipeline_emitted_gate.pi4`, from the same lane, are
+in the same state: `hw_mod.pi4` carries the device-tree address translation in
+its device table and the gate restates the conversion so it can check its
+direction.
+
+**The removal and the split have to land in ONE commit.** This check reads the
+WORKING tree, so a committed `thermal.pi4` that still cites the documents with
+the rows already deleted is just as red as the reverse - which is exactly how
+the rows came to be restored once already. Classify the three destinations in
+that same commit, here and in `PROVENANCE.json`.
 
 This is what the gate is for. A file-level inventory written once is stale the
 week after; one that is recomputed on every run survives other people working.
@@ -584,8 +593,12 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Core/help.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/thermal.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation (the AVS register half is being moved to a module; see relocations) |
-| `RaspberryPi4/Lib/thermal.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | vendor-spec | vendor document | cite the document; no notice obligation |
+| `RaspberryPi4/Modules/thermal_avs.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Modules/thermal_avs.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Tests/module_pipeline_emitted_gate.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/memcmd.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/memcmd.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |

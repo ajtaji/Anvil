@@ -313,6 +313,22 @@
 @DOC States the initial stack TOP - the value loaded into the stack pointer before the first generated push. Same literal forms as LoadAddress. The stack grows DOWN from here, so the address itself is one past the highest byte the stack ever uses. It matters as soon as two images share a machine: a resident monitor and the payload it calls would otherwise both start their stacks at the same default, and the payload's first push lands in the middle of the monitor's live frame - nothing faults, the monitor simply does not survive its payload returning. Legal only where placement is a decision (Raspberry Pi 4, Arduino UNO Q); on every other part the initial stack pointer comes from the part's own reset behaviour and this is a compile error. At most one per program. Checked, not trusted: 16-byte alignment is architectural on AArch64, not a convention, so a misaligned value is refused rather than rounded, and a stack top that sits inside this image or inside its BSS is refused with both ranges named. A --stack-addr flag that disagrees with this line stops the build and names both values.
 @EXAMPLE StackAddress $8000000
 
+@KEYWORD Module
+@DOC Declares that this source builds an Anvil PMFMOD driver module. The quoted id names the project in diagnostics; PMFMOD v1 hardware selection comes from ModuleMatch records. It is valid only for an AArch64 module build and must appear exactly once.
+@EXAMPLE Module "pi4.fan"
+
+@KEYWORD ModuleABI
+@DOC Declares the Anvil service-table ABI major and minor required by a PMFMOD driver module. Both are unsigned 32-bit literals and the declaration appears exactly once.
+@EXAMPLE ModuleABI 1, 0
+
+@KEYWORD ModuleMatch
+@DOC Adds one hardware compatible id to a PMFMOD driver module. PMFMOD v1 requires one to eight unique printable ids; paths are refused.
+@EXAMPLE ModuleMatch "brcm,bcm2711"
+
+@KEYWORD Seam
+@DOC Declares one service seam group implemented by a PMFMOD driver module. The value is a published #constant or a literal unsigned 32-bit id; PMFMOD v1 permits at most four unique seams.
+@EXAMPLE Seam #SVCCAP_PWM
+
 @KEYWORD DataSection
 @DOC Begins a block used for storing constant data in ROM. Only labels and Data statements may appear inside it. Read/Restore against a DataSection are implemented on the AVR backend AND all three ARM targets (RP2040, RP2350, RA4M1); the six classic 8-bit backends refuse them by name, saying that taking the address of a Data label needs flash-table reads they do not implement. That refusal also catches STRING LITERALS on those parts, because a literal is stored as a Data label and assigning one takes its address. Data.s places a string: each item is a FIXED 32-BYTE RECORD - the characters, a NUL terminator, then zero padding - so a Data.s entry costs 32 bytes of program memory whatever its length, which is what keeps a mixed table's offsets predictable. At most 31 characters; a longer literal is a compile error and is never truncated. The escapes are translated exactly as in a string literal. (Corrected 2026-07-31 - this said AVR-only, which was wrong.)
 @EXAMPLE DataSection
@@ -348,13 +364,21 @@
 @EXAMPLE EndIf
 
 @KEYWORD Structure
-@DOC Defines a custom, grouped data type composed of multiple fields. Fields are declared one per line with their own type suffix, and are reached with a BACKSLASH. IMPLEMENTED ON ALL TEN BACKENDS. Corrected 2026-08-05: this entry said the six classic 8-bit backends refused structures, and they no longer do - the same day's work that opened Dim to them opened this. Fields are packed with NO padding, so a field's offset is the running total of the sizes before it and OffsetOf simply reports that. A structure may not be named after a type suffix letter: 'Structure U' is refused by name, because .u is a type.
+@DOC Defines a custom, grouped data type composed of multiple fields. Fields are declared one per line with their own type suffix, and are reached with a BACKSLASH. Ordinary scalar-field structures work on every backend. The default is PACKED: no padding is inserted, preserving existing packet and hardware layouts. An explicit Align clause changes the data layout; see Align. On the A64 targets (Raspberry Pi 4 and Arduino UNO Q), fields may also be inline structures, typed pointers such as *next.Node, or fixed arrays such as values.n[4]. A fixed field array has exactly the stated positive number of elements, indexed from zero; this is not a Dim upper bound. Use item\values[index] or item\child\field. Inline structure types must be declared earlier; a typed pointer may refer to its own enclosing structure. A whole inline structure or field array is not a scalar value: take its address with @ or access one member. New nested/pointer/field-array forms are refused on backends that do not emit them. A structure may not be named after a type suffix letter: 'Structure U' is refused because .u is a type. Use SizeOf and OffsetOf to verify the selected layout.
 @EXAMPLE Structure Point
 @EXAMPLE   x.w
 @EXAMPLE   y.w
 @EXAMPLE EndStructure
 @EXAMPLE Define p.Point
 @EXAMPLE p\x = 3
+
+@KEYWORD Align
+@DOC Selects the data alignment on a Structure declaration, after Extends if present. With no clause the structure remains packed. Align 1, 2, 4, 8 or 16 places every field on the stated byte boundary and rounds the final structure size to that boundary. On the A64 targets, Align #PB_Structure_AlignC instead uses natural LP64 C data alignment: pointers and .i are eight bytes, .n and .l are four, and nested structures keep their own alignment. The final size includes tail padding so arrays keep each element aligned. Unions align their shared start and size for their strictest member. This selects DATA LAYOUT, not a C compiler, linker, runtime or foreign procedure calling convention. AlignC is refused on other targets until their ABI layouts are implemented. Taking a typed pointer does not align memory for you: its address must satisfy the declared structure alignment. Packed layouts may contain unaligned fields; a target that cannot safely emit an access refuses it rather than silently moving the field.
+@EXAMPLE Structure NativeRecord Align #PB_Structure_AlignC
+@EXAMPLE   kind.n
+@EXAMPLE   *next
+@EXAMPLE EndStructure
+@EXAMPLE ; On A64: OffsetOf(NativeRecord\next) = 8; SizeOf(NativeRecord) = 16.
 
 @KEYWORD EndStructure
 @DOC Closes an active Structure block. Takes no arguments.
@@ -491,7 +515,7 @@
 @EXAMPLE Dim pool.a[SizeOf(Ent) * 8]
 
 @KEYWORD OffsetOf
-@DOC How many bytes from the start of a Structure a given field begins, resolved at COMPILE TIME into a plain number. Written OffsetOf(Structure\field) - the structure's NAME on the left of the backslash, not a variable of that type. Useful for laying a structure over a hardware register block or a received packet, and for checking by eye that a structure is packed the way you meant. Fields on this compiler are packed with NO padding, so an offset is simply the running total of the sizes before it. Added 2026-08-03.
+@DOC How many bytes from the start of a Structure a given field begins, resolved at COMPILE TIME into a plain number. Written OffsetOf(Structure\field) - the structure's NAME on the left of the backslash, not a variable of that type. It reports the actual declared layout, including any padding selected by Align; structures without Align remain packed. On A64 a path through inline structures, such as OffsetOf(Rect\extent\height), adds the nested field offsets. A path cannot cross a pointer, a scalar or an unindexed field array: those do not identify one inline subobject at a constant offset. Useful for checking hardware, packet and native API layouts alongside SizeOf.
 @EXAMPLE Print(OffsetOf(Ent\Y))
 
 @KEYWORD Bool
@@ -566,7 +590,7 @@
 @EXAMPLE EndStructure
 
 @KEYWORD StructureUnion
-@DOC Begins a group of Structure fields that all START AT THE SAME OFFSET - one piece of storage read as more than one type. The structure grows by the LARGEST member of the group, not by their total. Closed with EndStructureUnion. Works on every backend as of 2026-08-03; before that neither word was recognised and each became a field named after the keyword, so a union silently became two junk fields plus its members laid end to end.
+@DOC Begins a group of Structure fields that all START AT THE SAME OFFSET - one piece of storage read as more than one type. The structure grows by the LARGEST member of the group, not by their total. With an explicit Align layout, the shared start and union size also include the padding required by the strictest member. The default packed layout is unchanged. Close the group with EndStructureUnion; nested or unclosed union groups are refused. Scalar union fields work on every backend; inline structures and fixed field arrays require the A64 structure support described under Structure.
 @EXAMPLE StructureUnion
 @EXAMPLE   AsWord.w
 @EXAMPLE   AsLong.l

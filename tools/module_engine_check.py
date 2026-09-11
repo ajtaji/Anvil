@@ -210,8 +210,19 @@ def make_source(blobs: dict[str, bytes], has_writer_fixture: bool) -> None:
 
     source = f'''EnableExplicit
 
+XIncludeFile "Anvil/Hal/seams.pbi"
 XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
+
+; Print()/PrintN() resolve by name onto a console library. The registry
+; carries one procedure that prints the owners of a binding for a
+; refusal sentence; this harness never calls it and supplies the name so
+; that no UART is linked in.
+Procedure str_print_at(p.i)
+EndProcedure
+
+XIncludeFile "Anvil/Core/mod_registry.pbi"
 
 {labels}
 
@@ -238,6 +249,38 @@ Procedure.i HwModCodeSync(base.i, bytes.i)
   ProcedureReturn gTestSyncOk
 EndProcedure
 
+; ModArenaInit() checks the arena against the board's own reserved map
+; and payload windows. This harness models a board that reserves nothing,
+; so the check is present and passes; the arena/map refusals themselves
+; are gated by tools/module_pipeline_check.py against a board that does.
+Procedure.i HwModArenaRegion()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwMonRegions()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwMonRegionLo(i.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwMonRegionHi(i.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPayWindows()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPayLo(i.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPayHi(i.i)
+  ProcedureReturn 0
+EndProcedure
+
 XIncludeFile "Anvil/Core/mod_container.pbi"
 XIncludeFile "Anvil/Core/mod_arena.pbi"
 
@@ -259,6 +302,7 @@ Procedure TestColdReset()
   gModRecordCount = 0
   gModLastRecord = -1
   gModPrepared = 0
+  ModSeamReset()
 EndProcedure
 
 Procedure.i Main()

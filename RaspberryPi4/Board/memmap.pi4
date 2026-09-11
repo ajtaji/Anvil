@@ -312,6 +312,82 @@ EndProcedure
 #MON_FB_PANEL_H = 1280
 #MON_FB_BYTES   = 4096000      ; 800 * 1280 * 4, one screen
 
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE REGION - NEW 2026-09-10.
+;
+;  WHERE A LOADED DRIVER LIVES, and one 8 MiB region holding two windows:
+;  the ARENA, where verified modules are placed and executed, and the
+;  STAGING window, where a container is read to and judged before any of
+;  it is believed. They are separate because the digest covers the
+;  header, and the relocation table and the compatible ids sit AFTER the
+;  image - so the whole file has to be in one place before any of it can
+;  be trusted, and reading it into the arena first would mean writing
+;  unverified bytes into the range live drivers occupy.
+;
+;  THE ADDRESS IN THE 2026-09-06 DESIGN NOTE IS FORBIDDEN AND THAT IS THE
+;  FIRST THING TO SAY. It proposed $08A00000..$091FFFFF, argued four
+;  ways, and every one of those arguments was true when it was written.
+;  Two days later main allocated exactly that range for the DSI
+;  framebuffer (#MON_FB_LO above), for four nearly identical reasons - it
+;  is the first round megabyte above the monitor's own variables, inside
+;  the HVS's gigabyte, outside both payload windows. A module loaded
+;  there would be scanned out as pixels and then branched into. The
+;  proposal is struck, the reason is kept here rather than deleted, and
+;  ModArenaInit() now CHECKS the arena against this file's own region
+;  list rather than trusting a paragraph - because the paragraph was
+;  right and went stale anyway.
+;
+;  FIVE REQUIREMENTS, THE SAME FIVE #MON_FB_LO IS ARGUED UNDER:
+;
+;    present on every Pi 4          - so not bank 1 ($40000000 up), which
+;                                     a 1 GB board does not have. This is
+;                                     the recovery path; it may not need
+;                                     the big board.
+;    outside BOTH payload windows   - or a `load`, a `net recv` or a
+;                                     staged upload would land on a
+;                                     loaded driver and InPayload() would
+;                                     ALLOW it. #PAY0 ends $07EFFFFF and
+;                                     #PAY1 starts $40000000.
+;    above the payload's own stack  - which grows DOWN from $08000000
+;    clear of every other owner     - the Globals ($08200000..$089FFFFF),
+;                                     the GENET receive ring
+;                                     ($08100000..$0817FFFF, written by a
+;                                     bus master on its own schedule),
+;                                     the DSI framebuffer
+;                                     ($08A00000..$091FFFFF), and the V3D
+;                                     engine's arena ($0A000000, 16 MiB,
+;                                     RaspberryPi4/Board/v3d_console.pi4)
+;    a round megabyte               - so the refusal reads as a window
+;
+;  $09200000 IS THE FIRST ROUND MEGABYTE ABOVE THE FRAMEBUFFER, and the
+;  8 MiB it takes ends at $099FFFFF - six clear megabytes below the V3D
+;  arena, in the band this map calls "free, but DELIBERATELY NOT
+;  OFFERED". The largest driver anybody has proposed converting is about
+;  600 KiB, so six megabytes of arena holds every module this board is
+;  likely to carry several times over.
+;
+;  THE SPLIT IS 6 MiB ARENA AND 2 MiB STAGING. Staging is a cap on how
+;  big a single container this board will read, and two megabytes is
+;  three times the largest driver in the tree.
+;
+;  IT IS DECLARED AS A MONITOR REGION, which is what protects it: `w`,
+;  `fill` and `copy` are not window-checked and go through
+;  HitsMonitor(), so a typo cannot scribble on a running driver. That
+;  matters more here than for the framebuffer - a corrupted picture is
+;  visible and a corrupted driver is a wild branch later with no message.
+; ----------------------------------------------------------------------
+#MOD_REGION_LO   = $09200000   ; the whole module region, 8 MiB
+#MOD_REGION_HI   = $099FFFFF
+#MOD_ARENA_LO    = $09200000   ; where verified modules are placed
+#MOD_ARENA_BYTES = $00600000   ; 6 MiB
+#MOD_STAGE_LO    = $09800000   ; where one container is read and judged
+#MOD_STAGE_BYTES = $00200000   ; 2 MiB - the largest container accepted
+
+; The index this region has in HwMonRegion*(). ModArenaInit() skips it
+; when it checks the arena against the rest of the map, because a range
+; necessarily overlaps itself; every other region is a real clash.
+#MON_REGION_MODULES = 5
+
 ; ======================================================================
 ;  MonImage*() - THE IMAGE MEASURES ITSELF
 ; ----------------------------------------------------------------------
@@ -446,7 +522,7 @@ EndProcedure
 ;  one whose extent moved.
 ; ======================================================================
 Procedure.i HwMonRegions()
-  ProcedureReturn 5
+  ProcedureReturn 6
 EndProcedure
 
 Procedure.i HwMonRegionLo(i.i)
@@ -456,6 +532,7 @@ Procedure.i HwMonRegionLo(i.i)
     Case 2 : ProcedureReturn #AB_BASE
     Case 3 : ProcedureReturn #MON_FB_LO
     Case 4 : ProcedureReturn #CORE_RAW_STACK_LO
+    Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_LO
   EndSelect
   ; A region index this board does not have. Answering an address here
   ; would make HitsMonitor() refuse a range for a region that does not
@@ -471,6 +548,7 @@ Procedure.i HwMonRegionHi(i.i)
     Case 2 : ProcedureReturn #AB_BASE + #AB_BYTES - 1
     Case 3 : ProcedureReturn #MON_FB_HI
     Case 4 : ProcedureReturn #CORE_RAW_STACK_HI
+    Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_HI
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -491,6 +569,8 @@ Procedure HwMonRegionSay(i.i)
       Print("the DSI framebuffer")
     Case 4
       Print("the reserved raw-secondary stacks")
+    Case #MON_REGION_MODULES
+      Print("the driver-module arena and its staging window")
     Default
       Print("a region this board does not have")
   EndSelect

@@ -13,5 +13,29 @@
 ;  procedure and no global, so it costs nothing where the table is absent.
 ; ======================================================================
 #SVC_ABI_MAJOR   = 1
-#SVC_ABI_MINOR   = 0
+
+; ----------------------------------------------------------------------
+;  1.1 - 2026-09-10. THE MODULE HALF OF THE TABLE.
+;
+;  Core slots 14 and 15 - SvcSeamFill and SvcSeamGet - were filled, and
+;  #SVCCAP_PWM (14, reserved) and #SVCCAP_THERMAL (15) were appended to
+;  the capability ids in Anvil/Hal/seams.pbi.
+;
+;  IT IS A MINOR BUMP BECAUSE NOTHING EXISTING CHANGED MEANING. The core
+;  group had reserved sixteen slots and used fourteen; the two that were
+;  filled were already pointing at SvcUnimplemented, so a payload built
+;  at 1.0 finds every slot it knows exactly where it left it, and one
+;  built at 1.1 running on a 1.0 monitor gets #SVC_ENOSYS from the two
+;  new ones and 0 from the two new capability ids - both honest answers.
+;  #SVC_SLOT_COUNT does not move: the slots existed, they were empty.
+;
+;  A MODULE IS CHECKED THE OTHER WAY ROUND from a payload. A payload
+;  refuses ITSELF on entry, because it runs with the machine handed over
+;  and nothing is left to refuse it. A module is refused BY THE LOADER,
+;  before init, because the code that loads it is still in charge: a
+;  different major at all, or a minor HIGHER than this monitor
+;  publishes. A lower minor loads - within a major, slots are only ever
+;  appended.
+; ----------------------------------------------------------------------
+#SVC_ABI_MINOR   = 1
 #SVC_SLOT_COUNT  = 184         ; slots at 1.0; the boot code sizes its check by it

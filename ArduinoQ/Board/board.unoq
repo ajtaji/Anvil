@@ -145,6 +145,18 @@ StackAddress $68000000
 ;     names the core wants.
 ; ----------------------------------------------------------------------
 XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE CONTRACT AND THE SEAM REGISTRY, AS EARLY AS THEY CAN
+;  GO - the same four files, in the same order, as the Pi 4 composition.
+;  All four are constants and one table; none reads hardware or calls
+;  anything else in this program. They are here rather than beside the
+;  loader because a driver that a module can replace has to be able to
+;  ask, inside its own file, whether one has.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
 XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
 XIncludeFile "ArduinoQ/Board/qcon_q.unoq"
 XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
@@ -364,6 +376,9 @@ XIncludeFile "Anvil/Core/wallclock.pbi"
 ; IT MUST COME BEFORE Anvil/Core/pmfboot.pbi, which is the one caller of
 ; BuildServiceTable().
 XIncludeFile "ArduinoQ/Board/hw_board_q.unoq"
+; This board's half of the driver-module contract. Before abi.pbi because
+; SvcCapGet asks it whether the core reaches the two new seams.
+XIncludeFile "ArduinoQ/Board/hw_mod_q.unoq"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 XIncludeFile "Anvil/Hal/abi.pbi"
 
@@ -426,6 +441,23 @@ XIncludeFile "Anvil/Core/sha256.pbi"
 ; THE BOOTLOADER - the payload container, the `boot` family, and the
 ; persisted-boot-target countdown Main() runs before the prompt.
 XIncludeFile "Anvil/Core/pmfboot.pbi"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE LOADER, IDENTICAL TO THE Pi 4's. Every file here is
+;  portable core: the container reader, the validator, the relocator, the
+;  arena, the lifecycle, the manifest reader and the console. What this
+;  board supplies differently is hw_mod_q.unoq above, which today says
+;  there is no arena - so the whole of this compiles and links, `mod`
+;  answers honestly, and nothing is executed from memory nobody reserved.
+;
+;  THAT IS THE BUILD-CLOSURE CLAIM AND ITS EXACT LIMIT: this proves the
+;  core has no board-specific fork, and it does not prove a module loads
+;  on Q silicon, which needs a Q.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+XIncludeFile "Anvil/Core/mod_cmd.pbi"
 ; ... and its console side: the `boot` command word, the four boot.*
 ; settings, and BootFileWait(). Separate from the engine above so the
 ; engine can be built - and gated - without a line editor.
@@ -758,6 +790,14 @@ Procedure Main()
   PrintN("  Type help for what works, or info for why an absent one is absent.")
   PrintNl()
 
+  ; THE DRIVER MODULES, before the boot countdown, for the Pi 4's reason:
+  ; a payload entered with the service table is entitled to find the seams
+  ; a loaded module fills, so loading them afterwards would make the same
+  ; medium produce two different machines depending on timing. On this
+  ; board it currently does nothing and prints nothing - hw_mod_q.unoq
+  ; declares no arena - and `mod` says so in one sentence when asked.
+  ModBoot()
+
   ; THE PERSISTED BOOT TARGET. Anvil/Core/pmfboot.pbi's BootFileWait()
   ; reads boot.file out of SETTINGS.TXT on the ESP, counts down, and boots
   ; the container it names - or returns at once when nothing is armed.
@@ -938,6 +978,11 @@ Procedure Main()
       CmdI2c()
     ElseIf WordIs("fan") <> 0
       CmdFan()
+    ; mod - the driver-module loader. Portable core; this board's own
+    ; hw_mod_q.unoq is what says whether an arena exists here yet.
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+
     ElseIf WordIs("mmc") <> 0
       CmdMmc()
     ElseIf WordIs("usb") <> 0

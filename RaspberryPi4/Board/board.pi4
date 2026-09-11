@@ -1179,6 +1179,26 @@ StackAddress $8000000
 ; ======================================================================
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE CONTRACT AND THE SEAM REGISTRY, AS EARLY AS THEY CAN
+;  GO. All four are constants and one table; none of them reads hardware,
+;  prints at boot, or calls anything else in this program.
+;
+;  THEY ARE HERE AND NOT BESIDE THE LOADER because a driver that a module
+;  can REPLACE has to be able to ask, inside its own file, whether one
+;  has - RaspberryPi4/Lib/thermal.pi4 does exactly that further down. The
+;  alternative is a hook pointer bolted on beside each such driver and
+;  set from below, which is a second path around a contract rather than
+;  the contract.
+;
+;  seams.pbi is also the ONLY Anvil file a driver module includes: it is
+;  the published contract, it carries no monitor source, and
+;  RaspberryPi4/Modules/thermal_avs.pi4 is built against it alone.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
 XIncludeFile "Anvil/Core/wallclock.pbi"
 XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
 XIncludeFile "RaspberryPi4/Lib/clocks.pi4"
@@ -1714,6 +1734,11 @@ XIncludeFile "Anvil/Core/memrange.pbi"
 XIncludeFile "RaspberryPi4/Board/hw_addr.pi4"
 XIncludeFile "Anvil/Core/addrsafe.pbi"
 XIncludeFile "RaspberryPi4/Board/cache.pi4"
+; The board's half of the driver-module contract: where a module may
+; live, how to make written bytes executable, what devices are here, and
+; which seams the core reaches without one. After cache.pi4 because it
+; calls CacheFlushRange, and before abi.pbi because SvcCapGet asks it.
+XIncludeFile "RaspberryPi4/Board/hw_mod.pi4"
 XIncludeFile "Anvil/Core/xfer.pbi"
 XIncludeFile "Anvil/Core/memcmd.pbi"
 XIncludeFile "RaspberryPi4/Board/mailbox_info.pi4"
@@ -1896,6 +1921,21 @@ XIncludeFile "RaspberryPi4/Board/hw_con.pi4"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 XIncludeFile "Anvil/Hal/abi.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE LOADER. After pmfboot.pbi because the two are the
+;  same job on two container formats and this is the order a reader wants
+;  them in; after abi.pbi because a module is entered with the service
+;  table's address; after format.pbi, parse.pbi and argfmt.pbi because
+;  the console file uses all three.
+;
+;  The SEAM REGISTRY is not here - it is at the top of this file, with
+;  the contract, for the reason given there.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+XIncludeFile "Anvil/Core/mod_cmd.pbi"
 ; ... and its console side: the `boot` command word, the four boot.*
 ; settings, and BootFileWait(). Separate from the engine above so the
 ; engine can be built - and gated - without a line editor.
@@ -2109,6 +2149,34 @@ Procedure Main()
   ; network bring-up behind it - until the first prompt.
   ScreenServiceTick()
   BootNetUp()
+
+  ; ------------------------------------------------------------------
+  ;  THE DRIVER MODULES, HERE, AND THE POSITION IS THE WHOLE ARGUMENT.
+  ;
+  ;  AFTER THE CONSOLE so that a refusal is seen. A module that will not
+  ;  load is exactly the thing an operator has to be told about, and a
+  ;  walk that ran before the glass and the wire were up would print its
+  ;  sentences into a buffer nobody reads.
+  ;
+  ;  BEFORE BootWait() so that a driver is in place before autoboot can
+  ;  hand the whole board to a payload. A payload entered with the
+  ;  service table is entitled to find the seams a loaded module fills;
+  ;  loading them afterwards would mean the same card produced two
+  ;  different machines depending on how fast somebody pressed a key.
+  ;
+  ;  BEFORE FanBoot() for the same reason one step smaller: the fan
+  ;  policy reads a temperature, and whether that reading comes off the
+  ;  part or out of the firmware is decided by whether THERMAL.MOD
+  ;  loaded. Running the walk afterwards would start the fan on the slow
+  ;  source and silently keep it there.
+  ;
+  ;  IT IS NEVER FATAL. No manifest, no module, or a refused module all
+  ;  reach the prompt: every seam a module would fill has a core answer
+  ;  or an honest refusal behind it.
+  ; ------------------------------------------------------------------
+  ModBoot()
+  ScreenServiceTick()
+
   ; THE DRAM AUTOBOOT RECORD FIRST, THE PERSISTED BOOT TARGET SECOND, and
   ; the order is the precedence. BootWait() takes `autoboot <addr>`, which
   ; somebody typed at this prompt during THIS power cycle and which lives
@@ -2533,6 +2601,14 @@ Procedure Main()
     ; thermometer too, where it degrades to the honest refusal.
     ElseIf WordIs("fan") <> 0
       CmdFan()
+
+    ; mod - the driver-module loader. A whole word only and no
+    ; single-letter alias: m is memory and d is deadman, and a monitor
+    ; that guesses which destructive command a letter meant is not one
+    ; anybody should trust. The handler is Core; the board supplies the
+    ; arena, the cache maintenance and the device list.
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
 
     ; mmc - raw SD/eMMC block access. Core, gates on #CAP_MMC through
     ; RequireCap, so this same line compiles and dispatches on a board with
