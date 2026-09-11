@@ -46,6 +46,13 @@ defaults use UTC; a named zone is an explicit saved setting, not an inference
 from a server location. Boards without a network backend retain the common
 manual clock and timezone interface. See [WALL_CLOCK.md](WALL_CLOCK.md).
 
+The prompt spin also takes the part's temperature once a second, armed fan or
+not, and publishes it for anything that only wants to show one. A reader on a
+paint path cannot ask a seam: a seam call is a call through the service table,
+so the compiler must assume it reaches everything in that table, and the screen
+service is reached from the boot walk. See
+[BANNER_STATUS_ROW.md](BANNER_STATUS_ROW.md).
+
 On the Pi, `ScreenServiceTick` pumps pending output and bounded banner updates.
 Boot and long radio phases invoke it at cooperative boundaries, outside the
 character producer and cryptographic primitive internals. Early output is
@@ -128,6 +135,13 @@ HDMI and DSI are presentation surfaces; Neon/V3D is an optional rendering
 tier, and CPU/DMA paths remain valid fallbacks. Logical console geometry and
 physical scanout orientation are distinct so landscape text, capture, cursor,
 and touch can share one mapping contract.
+
+The touch keyboard's draw list is a consequence of that separation: an item is a
+label and a box, and each renderer picks the face it has. The framebuffer
+renderer sets key labels in an anti-aliased face and falls back to the cell font
+only where that face does not fit; the GPU tier draws the cell font it shares
+with the console text around it. See
+[TOUCH_KEYBOARD_LABELS.md](TOUCH_KEYBOARD_LABELS.md).
 
 `Anvil/Graphics/Vulkan/` builds above that separation. It currently provides a
 partial registry-derived core-1.0 vocabulary, native object and command-buffer

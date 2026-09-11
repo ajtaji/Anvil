@@ -1648,6 +1648,44 @@ Procedure.i HwTempWholeF(milliC.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  THE LAST SAMPLE - the temperature as a VALUE, for a reader that must
+;  not take the reading itself.
+;
+;  HwTempMilliC() is a seam. On a board whose thermal implementation is
+;  loadable, the call goes through a pointer held in the service table,
+;  and a pointer is a call to every procedure whose address that table
+;  can hold - so a reader reachable from the boot walk or from the screen
+;  service cannot ask the seam at all without closing a call loop that
+;  does not exist at run time. That is a true statement about the shape
+;  of the program, not a limitation to be argued with: the reading is a
+;  side effect of touching hardware, and a repaint is not the place for
+;  one.
+;
+;  SO THE READING AND THE READER ARE SEPARATED. One periodic owner takes
+;  the sample - once a second, on the path that already touches hardware
+;  for a living - and publishes it here in the seam's own unit,
+;  millidegrees Celsius, unconverted, because that is what the board said.
+;  Anything that only wants to SHOW a temperature reads this and does no
+;  hardware at all.
+;
+;  IT STARTS AT #HW_TEMP_NONE and it means it: before the first sample
+;  there is no reading, and a caller must make the same sentinel test it
+;  would make on the seam's own answer. A zero here would be 32 F on the
+;  panel of a board that has never been asked.
+;
+;  THE VOCABULARY IS THE HAL'S because the unit and the sentinel are. A
+;  second board defines the sample the same way whether or not it has a
+;  fan, and a board with no thermometer at all simply never publishes
+;  one and reads the sentinel forever.
+; ----------------------------------------------------------------------
+Global gHwTempSampledMilliC.i = #HW_TEMP_NONE
+
+; The last published sample, in millidegrees Celsius, or #HW_TEMP_NONE.
+Procedure.i HwTempSampled()
+  ProcedureReturn gHwTempSampledMilliC
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  THE ADDRESS-SAFETY VOCABULARY - what HwAddrCheck() answers.
 ;
 ;  THREE ANSWERS AND NOT TWO, and the third one is the whole reason this

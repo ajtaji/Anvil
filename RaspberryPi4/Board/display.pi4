@@ -216,8 +216,12 @@ EndProcedure
 ; ======================================================================
 ;  SMOOTH FONTS - anti-aliased text from the baked coverage maps.
 ;
-;  Three DejaVu faces (RaspberryPi4/Monitor/anvil_fonts.pi4): font 0 the
-;  banner sans, 1 a serif, 2 a condensed sans. Each glyph is a 4-bit
+;  Four DejaVu faces (RaspberryPi4/Monitor/anvil_fonts.pi4): font 0 the
+;  banner sans, 1 a serif, 2 a condensed sans - all three 48 px - and
+;  font 3 a 30 px bold sans for the touch keyboard's key labels, which
+;  is a smaller face and not a scaled one: a coverage map enlarged is a
+;  soft edge, and the whole point of the key labels changing face is
+;  that they are not soft. Each glyph is a 4-bit
 ;  coverage map; DrawSmoothText blends it from the ink colour to a given
 ;  background, so edges are smooth instead of the 8x16 font's stair-steps.
 ;
@@ -247,6 +251,13 @@ Procedure FontSelect(fid.i)
     gFntPix = ?fontCondPix
     gFntFirst = #FONT_cond_FIRST
     gFntCount = #FONT_cond_COUNT
+  ElseIf fid = 3
+    ; The 30 px sans for the touch keyboard's key labels - the banner
+    ; faces are 48 px and would not fit inside a key.
+    gFntMeta = ?fontKeysMeta
+    gFntPix = ?fontKeysPix
+    gFntFirst = #FONT_keys_FIRST
+    gFntCount = #FONT_keys_COUNT
   Else
     gFntMeta = ?fontSansMeta
     gFntPix = ?fontSansPix
@@ -538,9 +549,11 @@ Procedure DrawBanner()
   DisplayTextClear(28, 94, AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME), steel)
 
   ; The live clock shares the identity row without moving the title, build
-  ; label, rule or anvil. Copy now: WallClockCaption's buffer is temporary.
+  ; label, rule or anvil, and the temperature and fan duty ride on the same
+  ; caption (RaspberryPi4/Board/banner_status.pi4). Copy now: the caption's
+  ; buffer is temporary.
   BannerClockLayout()
-  BannerClockCopy(@gBannerClockText[0], WallClockCaption(), gBannerClockChars)
+  BannerClockCopy(@gBannerClockText[0], BannerCaptionLast(), gBannerClockChars)
   BannerClockDrawLogical(@gBannerClockText[0])
   gBannerClockMs = millis()
 

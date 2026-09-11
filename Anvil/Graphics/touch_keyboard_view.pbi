@@ -1043,6 +1043,13 @@ Procedure.i TkbArenaLabel(*src, maxChars.i)
   ProcedureReturn @gTkbArena[at]
 EndProcedure
 
+; A TEXT ITEM IS A LABEL CENTRED IN A BOX (x, y, w, h). The renderer
+; chooses the face - the board's smooth face when the box has room for
+; it, the bitmap font at `scale` otherwise - and centres what it draws.
+; `scale` is the integer magnification the layout found fits the box in
+; the bitmap font, so a renderer with no other face draws with that. The
+; view never knows a font's metrics beyond the bitmap cell it laid the
+; keys out with.
 Procedure TkbText(x.i, y.i, w.i, h.i, fg.i, bg.i, *label, scale.i)
   If gTkbDrawN >= #TKB_MAX_DRAW
     gTkbOverflow = 1
@@ -1112,9 +1119,8 @@ Procedure TkbKeyItems(i.i)
     EndIf
     len = len + 1
   Wend
-  tw = len * #TKB_FONT_W * s
-  th = #TKB_FONT_H * s
-  TkbText(gTkbKeyX[i] + (gTkbKeyW[i] - tw) / 2, gTkbKeyY[i] + (gTkbKeyH[i] - th) / 2, tw, th, ink, face, lab, s)
+  ; The box is the face inside its padding; the renderer centres in it.
+  TkbText(gTkbKeyX[i] + #TKB_PAD, gTkbKeyY[i] + #TKB_PAD, gTkbKeyW[i] - 2 * #TKB_PAD, gTkbKeyH[i] - 2 * #TKB_PAD, ink, face, lab, s)
 EndProcedure
 
 ; The down-chevron. It is DRAWN FROM RECTANGLES and not looked up in the

@@ -182,7 +182,7 @@ Procedure BannerClockTick()
   If (now - gBannerClockMs) < 1000
     ProcedureReturn
   EndIf
-  BannerClockCopy(@gBannerClockNext[0], WallClockCaption(), gBannerClockChars)
+  BannerClockCopy(@gBannerClockNext[0], BannerCaption(), gBannerClockChars)
   gBannerClockMs = now
   If BannerClockSame(@gBannerClockNext[0], @gBannerClockText[0]) <> 0
     ProcedureReturn
@@ -311,6 +311,13 @@ Procedure TouchKeyboardOverlayReset()
   gTkbTried = 0
 EndProcedure
 
+; ANVIL-TOUCH-KEYBOARD-COMPOSE-BEGIN
+; THIS PROCEDURE IS LIFTED VERBATIM by tools/keyboard_face_emitted_check.py
+; and compiled into RaspberryPi4/Tests/keyboard_face_emitted_gate.pi4, where
+; it runs over the real key model and the real view with the board's drawing
+; leaves recorded instead of performed. Nothing is copied and nothing is
+; paraphrased: the gate goes red if the fences move, and what it executes is
+; this text. Keep the fences where they are.
 Procedure TouchKeyboardComposeCpu()
   Define n.i
   Define i.i
@@ -322,8 +329,13 @@ Procedure TouchKeyboardComposeCpu()
   Define savedScale.i
   Define x.i
   Define y.i
+  Define w.i
+  Define h.i
   Define p.i
   Define c.i
+  Define len.i
+  Define sw.i
+  Define drawn.i
   Define hadCur.i
   Define y0.i
   Define y1.i
@@ -381,25 +393,54 @@ Procedure TouchKeyboardComposeCpu()
     If k = #TKB_DRAW_RECT
       DisplayFillRect(TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawW(i), TouchKeyboardDrawH(i), fg)
     ElseIf k = #TKB_DRAW_TEXT
-      If TouchKeyboardDrawScale(i) <> s
-        s = TouchKeyboardDrawScale(i)
-        ; THE EXISTING INTEGER BITMAP-FONT MAGNIFICATION. A whole number
-        ; of pixels per glyph pixel, never a filtered enlargement of a
-        ; finished bitmap - a filtered 1-bit glyph is a blurred glyph.
-        DisplayScale(s)
-      EndIf
+      ; A TEXT ITEM IS A LABEL CENTRED IN A BOX. The box is the key's
+      ; face inside its padding; the renderer picks the face and centres
+      ; what it draws, so the view never has to know a font's metrics.
       col = TouchKeyboardDrawBg(i)
       bg  = DisplayRGB((col >> 16) & $FF, (col >> 8) & $FF, col & $FF)
       x = TouchKeyboardDrawX(i)
       y = TouchKeyboardDrawY(i)
+      w = TouchKeyboardDrawW(i)
+      h = TouchKeyboardDrawH(i)
       p = TouchKeyboardDrawText(i)
-      c = PeekA(p) & $FF
-      While c <> 0
-        DisplayChar(x, y, c, fg, bg)
-        x = x + DisplayCharWidth()
-        p = p + 1
+      drawn = 0
+      ; THE SMOOTH FACE FIRST - the 30 px anti-aliased sans (font 3),
+      ; the same renderer that draws "PureMetal Forge" in the banner,
+      ; blended onto the key's own face colour - whenever the box has
+      ; room for its line height and the label's real width. Project
+      ; ruling, 2026-09-11: the cell font magnified was called blocky and
+      ; the key labels are to be set in the same kind of face the banner
+      ; title is.
+      If h >= #FONT_keys_LINEH
+        sw = SmoothTextWidth(p, 3)
+        If sw <= w
+          DrawSmoothText(x + (w - sw) / 2, y + (h - #FONT_keys_LINEH) / 2 + #FONT_keys_ASC, p, 3, fg, bg)
+          drawn = 1
+        EndIf
+      EndIf
+      If drawn = 0
+        ; THE BITMAP FONT AT INTEGER MAGNIFICATION, for a box the smooth
+        ; face does not fit: a whole number of pixels per glyph pixel,
+        ; never a filtered enlargement of a finished bitmap - a filtered
+        ; 1-bit glyph is a blurred glyph.
+        If TouchKeyboardDrawScale(i) <> s
+          s = TouchKeyboardDrawScale(i)
+          DisplayScale(s)
+        EndIf
+        len = 0
+        While PeekA(p + len) <> 0
+          len = len + 1
+        Wend
+        x = x + (w - len * DisplayCharWidth()) / 2
+        y = y + (h - DisplayCharHeight()) / 2
         c = PeekA(p) & $FF
-      Wend
+        While c <> 0
+          DisplayChar(x, y, c, fg, bg)
+          x = x + DisplayCharWidth()
+          p = p + 1
+          c = PeekA(p) & $FF
+        Wend
+      EndIf
     EndIf
     i = i + 1
   Wend
@@ -452,6 +493,7 @@ Procedure TouchKeyboardComposeCpu()
   EndIf
   ScrPresent(y0, y1)
 EndProcedure
+; ANVIL-TOUCH-KEYBOARD-COMPOSE-END
 
 ; ----------------------------------------------------------------------
 ;  The surface measurements the layout is computed from, read from the

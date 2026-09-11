@@ -35,6 +35,71 @@ Global probeCleanCalls.i
 Global probeMirrorOn.i
 Global probePumpCalls.i
 
+; ----------------------------------------------------------------------
+;  THE KEYBOARD LAYER banner_clock.pi4 ALSO CARRIES.
+;
+;  The file gained the touch keyboard's board adapter, so it no longer
+;  compiles against a world with no dispatcher, no editor, no key model
+;  and no view. Those four are included REAL rather than stubbed - a
+;  vocabulary invented here would be a second definition of #TKB_* and
+;  the point of the gate is that it runs the shipped file. Nothing below
+;  exercises them; the overlay clock is still this gate's subject, and
+;  the keyboard has gates of its own.
+; ----------------------------------------------------------------------
+Global gLastCR.i = 0
+Global probeTicks.i = 0
+Procedure.i Ticks()
+  probeTicks = probeTicks + 1
+  ProcedureReturn probeTicks
+EndProcedure
+Procedure UartWrite(c.i) : EndProcedure
+Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
+Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
+
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+XIncludeFile "Anvil/Graphics/touch_keyboard_view.pbi"
+XIncludeFile "RaspberryPi4/Monitor/anvil_fonts.pi4"
+
+; The console core's leaves. The real one is NOT included: it owns
+; ScreenPump, and this gate counts pumps to prove the early-log window
+; arms and disarms. The console has its own gates; what is needed here is
+; that the shipped banner_clock.pi4 compiles and runs.
+Procedure.i ConGridReady() : ProcedureReturn 1 : EndProcedure
+Procedure.i ConsoleRows() : ProcedureReturn 8 : EndProcedure
+Procedure ConMarkViewRowQuiet(r.i) : EndProcedure
+Procedure ConOverlayDamage() : EndProcedure
+Procedure.i ConOverlayTakeWhole() : ProcedureReturn 0 : EndProcedure
+Procedure ConSetLiveBoot(on.i) : EndProcedure
+Procedure ConSetOverlay(paint.i, reset.i) : EndProcedure
+Procedure ConSetViewRows(rows.i) : EndProcedure
+Procedure ConViewRelease() : EndProcedure
+Procedure BootTranscriptStart() : EndProcedure
+Procedure BootTranscriptStop() : EndProcedure
+
+; The surface, the density and the drawing leaves the keyboard half of
+; banner_clock.pi4 stands on. Inert: this gate draws its overlay through
+; PresentedOverlayPixel and never through the display library.
+Global gScrSrc.i = 1
+Global gScrScale.i = 1
+Global dsp_scale.i = 1
+Procedure.i ScrDiagMeasured(src.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i ScrPpi(src.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i HwTouchReady() : ProcedureReturn 0 : EndProcedure
+Procedure.i DisplayWidth() : ProcedureReturn #BC_PANEL_W : EndProcedure
+Procedure.i DisplayHeight() : ProcedureReturn #BC_PANEL_H : EndProcedure
+Procedure.i LogoHeight() : ProcedureReturn 0 : EndProcedure
+Procedure.i DisplayBase() : ProcedureReturn 0 : EndProcedure
+Procedure.i DisplayCharWidth() : ProcedureReturn 8 * dsp_scale : EndProcedure
+Procedure.i DisplayCharHeight() : ProcedureReturn 16 * dsp_scale : EndProcedure
+Procedure DisplayScale(s.i) : dsp_scale = s : EndProcedure
+Procedure DisplayFillRect(x.i, y.i, w.i, h.i, c.i) : EndProcedure
+Procedure DisplayChar(x.i, y.i, c.i, fg.i, bg.i) : EndProcedure
+Procedure.i SmoothTextWidth(*s, fid.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i) : ProcedureReturn 0 : EndProcedure
+
 ; Hardware/service boundaries used by banner_clock.pi4 but not exercised here.
 Procedure.i DisplayRGB(r.i, g.i, b.i) : ProcedureReturn ($FF000000 | (r << 16)) | (g << 8) | b : EndProcedure
 Procedure MmuCleanRange(addr.i, bytes.i)
@@ -44,6 +109,7 @@ Procedure MmuCleanRange(addr.i, bytes.i)
 EndProcedure
 Procedure.i millis() : ProcedureReturn 0 : EndProcedure
 Procedure.i WallClockCaption() : ProcedureReturn ?probeCaption : EndProcedure
+Procedure.i BannerCaption() : ProcedureReturn ?probeCaption : EndProcedure
 Procedure BannerClockCopy(dst.i, src.i, lim.i) : EndProcedure
 Procedure.i BannerClockSame(a.i, b.i) : ProcedureReturn 1 : EndProcedure
 Procedure CursorRestore(x.i, y.i) : EndProcedure

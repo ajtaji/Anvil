@@ -1161,7 +1161,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 53        ; pmf:build
+#ANVIL_BUILD = 56        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1170,7 +1170,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260911   ; pmf:builddate
-#ANVIL_BUILD_TIME = 062509     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 072939     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -1347,6 +1347,22 @@ XIncludeFile "RaspberryPi4/Lib/display.pi4"
 ;  QPU assembler are the same three libraries the pi4Neon* diagnostics use.
 ; ----------------------------------------------------------------------
 #ANVIL_V3D_CONSOLE = 1
+
+; ----------------------------------------------------------------------
+;  THE FAN IN THE BANNER, behind #ANVIL_BANNER_FAN.
+;
+;  The banner's identity row carries the part's temperature beside the
+;  clock on every board - every Pi 4 has the sensor. The fan's duty rides
+;  beside it only when this constant is 1 AND a fan pin is actually being
+;  driven (`fan pin`), so a board with no fan wired shows nothing about a
+;  fan. Most boards have no PWM fan; a board file that never will can set
+;  this to 0 and the fan half is not even compiled. Project ruling,
+;  2026-09-11: the duty is wanted in the banner where one is being
+;  driven, and most of these boards will never have a modulated fan, so
+;  the fan half is behind a switch rather than behind a run-time test
+;  alone.
+; ----------------------------------------------------------------------
+#ANVIL_BANNER_FAN = 1
 CompilerIf #ANVIL_V3D_CONSOLE = 1
 XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
@@ -1790,6 +1806,7 @@ XIncludeFile "Anvil/Core/auto.pbi"
 XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
 XIncludeFile "RaspberryPi4/Board/screen_source.pi4"
 XIncludeFile "RaspberryPi4/Board/hw_touch.pi4"
+XIncludeFile "RaspberryPi4/Board/banner_status.pi4"
 XIncludeFile "RaspberryPi4/Board/display.pi4"
 ; THE ONE CONSOLE CORE - the shared terminal grid + the output hub
 ; (ScreenPump). Every screen renderer below paints THIS grid; serial and

@@ -13,6 +13,10 @@ warning. `time` status still prints the restored floor and its full provenance.
 A manual caption begins with `Manual:`; a validated SNTP caption is the compact
 live date/time and zone.
 
+The clock's caption is the first part of the banner's status row, which also
+carries the part's temperature and, where one is driven, the fan's duty. See
+[BANNER_STATUS_ROW.md](BANNER_STATUS_ROW.md).
+
 The service is asynchronous. Boot only initializes state; the prompt service
 performs bounded DNS, ARP and SNTP steps. Missing configuration, an offline
 link, an unanswered neighbour, a lost DHCP lease and a reply timeout all enter

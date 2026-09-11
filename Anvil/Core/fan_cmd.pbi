@@ -384,6 +384,63 @@ Procedure FanApply(permille.i)
 EndProcedure
 
 ; ======================================================================
+;  TAKING THE SAMPLE
+; ======================================================================
+;  ONE PLACE IN THE MONITOR READS THE TEMPERATURE SEAM PERIODICALLY, and
+;  this is it. Everything that only wants to SHOW a temperature reads
+;  HwTempSampled() instead - see the sample's declaration in
+;  Anvil/Hal/hal.pbi for why a reader on a repaint path cannot ask the
+;  seam at all.
+;
+;  THE SAMPLER LIVES HERE BECAUSE THE FAN ALREADY OWNED THE CADENCE. The
+;  policy has been reading the part's temperature twice a second since it
+;  existed; a second periodic reader beside it would be two round trips
+;  on a board whose temperature comes from a firmware transaction, and
+;  two answers a second apart that a person could see disagree. So the
+;  policy's read IS the sample - it goes through the same call, which
+;  publishes - and the independent tick below only fires on a board where
+;  the policy is not running at all.
+;
+;  HOW OFTEN, WHEN NOTHING IS ARMED: once a second, because a second is
+;  the cadence of the thing that shows it and there is no sense reading
+;  faster than anybody looks. A board with no thermometer pays one
+;  seam call a second that answers with the sentinel, which is a load and
+;  a compare, and the alternative - remembering that a board answered the
+;  sentinel once and never asking again - would never notice a thermal
+;  implementation arriving later.
+; ----------------------------------------------------------------------
+#HW_TEMP_SAMPLE_MS = 1000
+
+; WHEN the last sample was taken. The sampler's own cadence, so it lives
+; with the sampler; the VALUE is the hardware layer's vocabulary and
+; lives there. Starting a whole period in the past makes the first call
+; due, so a board comes up with a real reading rather than with a second
+; of sentinel.
+Global gHwTempSampleMs.i = -#HW_TEMP_SAMPLE_MS
+
+; Read the seam and publish what it said. Returns the reading, in the
+; seam's own unit, so a caller that needs it does not read twice.
+Procedure.i HwTempSampleNow()
+  gHwTempSampledMilliC = HwTempMilliC()
+  gHwTempSampleMs = millis()
+  ProcedureReturn gHwTempSampledMilliC
+EndProcedure
+
+; HwTempSampleTick() - called from the prompt's idle spin beside
+; FanTick(), and from nowhere else. It runs whether or not a fan is
+; armed; on an armed board the policy has already refreshed the sample
+; well inside the period and this is a millis() read and a compare.
+;
+; THE ELAPSED TEST IS A SUBTRACTION, right across a wrap of millis(),
+; the same shape as every other tick in the spin.
+Procedure HwTempSampleTick()
+  If millis() - gHwTempSampleMs < #HW_TEMP_SAMPLE_MS
+    ProcedureReturn
+  EndIf
+  HwTempSampleNow()
+EndProcedure
+
+; ======================================================================
 ;  THE TICK
 ; ======================================================================
 ;  FanTick() - called from the prompt's idle spin, next to the Wi-Fi
@@ -435,7 +492,10 @@ Procedure FanTick()
   ; report - is Fahrenheit, and this is the line that makes it so. The
   ; raw Celsius is kept as well, because the read line prints it as the
   ; evidence behind the Fahrenheit.
-  t = HwTempMilliC()
+  ;
+  ; THE READ GOES THROUGH THE SAMPLER, so the policy's reading is also
+  ; the one the banner shows and an armed board reads the seam once.
+  t = HwTempSampleNow()
   have = 1
   If t = #HW_TEMP_NONE
     have = 0
@@ -567,7 +627,7 @@ Procedure FanStatus()
   Define p.i
   Define d.i
 
-  t = HwTempMilliC()
+  t = HwTempSampleNow()
   tmax = HwTempMaxMilliC()
 
   Print("temperature   ")
@@ -980,7 +1040,7 @@ Procedure FanCmdMode(mode.i, permille.i)
   If gFanArmed <> 0
     Define t.i
     Define have.i
-    t = HwTempMilliC()
+    t = HwTempSampleNow()
     have = 1
     If t = #HW_TEMP_NONE
       have = 0

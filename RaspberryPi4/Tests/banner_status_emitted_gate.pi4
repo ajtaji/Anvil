@@ -1,0 +1,190 @@
+; ======================================================================
+;  banner_status_emitted_gate.pi4
+;
+;  Executes the REAL banner status caption (RaspberryPi4/Board/
+;  banner_status.pi4) over the REAL temperature vocabulary and the REAL
+;  one conversion (Anvil/Hal/hal.pbi) on the A64 oracle.
+;
+;  WHAT IT IS FOR. The identity row of the banner now carries the part's
+;  temperature beside the clock, and the fan's duty beside that when a
+;  modulator is being driven. Three things have to be true of that and
+;  none of them can be read off the source:
+;
+;    1. the caption says what the board said, in whole Fahrenheit,
+;       through the one conversion and with the sentinel still meaning
+;       "no thermometer" rather than minus four hundred and fifty nine;
+;    2. the fan half appears only when a modulator is actually running,
+;       and carries the duty it is running at;
+;    3. THE CAPTION NEVER READS THE TEMPERATURE SEAM. It reads the
+;       published sample. A seam is a call through a pointer out of the
+;       service table, and this caption is composed from the screen
+;       service, which the boot walk reaches - so a seam call here is a
+;       call loop the compiler must refuse. The gate proves the absence
+;       by EXECUTION: it supplies a counting HwTempMilliC() and requires
+;       the count to still be zero when the captions are composed.
+;
+;  DIAGNOSTIC. No MMIO, GPU submission, DMA or cache operation occurs.
+; ======================================================================
+
+#BS_OUT   = $06000000       ; one caption slot per scenario
+#BS_SLOT  = $100
+#BS_META  = $06010000
+
+; The fan half is behind this constant on a real board file. It is
+; declared here so the gate can compile itself BOTH ways and prove that
+; at 0 the fan half is not merely skipped but absent from the image.
+#ANVIL_BANNER_FAN = 1
+
+; ---- printing is inert ------------------------------------------------
+; Print/PrintN resolve by name onto a console library's own leaves. The
+; only thing below that would ever print is the capability refusal in
+; hal.pbi, and nothing here refuses; supplying the leaves is what keeps
+; the gate off a UART whose status bit nothing in the model ever clears.
+Procedure str_print_at(p.i) : EndProcedure
+Procedure PrintNl() : EndProcedure
+Procedure PrintDec(v.i) : EndProcedure
+Procedure UartWriteStr(p.i) : EndProcedure
+
+; The real vocabulary, the real sentinel, the real conversion, and the
+; real published sample with its accessor.
+XIncludeFile "Anvil/Hal/hal.pbi"
+
+; ---- the board seam, as values the probe sets -------------------------
+Global probePwmKind.i = #HW_PWM_KIND_NONE
+Global probePwmDuty.i = -1
+Global probeLong.i    = 0
+Global probeSeamCalls.i = 0
+
+; THE SEAM ITSELF, COUNTED AND NEVER EXPECTED TO RUN. It answers a
+; temperature that no correct caption can ever show, so a caption that
+; reaches it is wrong twice over - once in the count and once in the
+; degrees.
+Procedure.i HwTempMilliC()
+  probeSeamCalls = probeSeamCalls + 1
+  ProcedureReturn 99000
+EndProcedure
+
+Procedure.i HwPwmKind()
+  ProcedureReturn probePwmKind
+EndProcedure
+
+Procedure.i HwPwmDutyNow()
+  ProcedureReturn probePwmDuty
+EndProcedure
+
+; The clock's own caption, in the shape WallClockCaption actually
+; produces, and a long one that already fills the row.
+Procedure.i WallClockCaption()
+  If probeLong <> 0
+    ProcedureReturn "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+  EndIf
+  ProcedureReturn "2026-09-11 06:53:40 CDT"
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Board/banner_status.pi4"
+
+; Copy one composed caption into its slot, bounded by the slot and not by
+; the caption, so a caption that overran its own buffer is recorded as
+; the overrun it is rather than truncated into looking correct.
+Procedure ProbeRecord(slot.i, p.i)
+  Define i.i
+  Define c.i
+  i = 0
+  c = PeekA(p)
+  While c <> 0 And i < (#BS_SLOT - 1)
+    PokeA(#BS_OUT + slot * #BS_SLOT + i, c)
+    i = i + 1
+    c = PeekA(p + i)
+  Wend
+  PokeA(#BS_OUT + slot * #BS_SLOT + i, 0)
+EndProcedure
+
+Procedure.i Main()
+  ; 0 - BEFORE ANY TICK a repaint gets the clock alone. The buffer is
+  ; .bss and a repaint can happen before the first service tick.
+  ProbeRecord(0, BannerCaptionLast())
+
+  ; 13 - AND A BOARD THAT HAS NOT SAMPLED YET HAS NO TEMPERATURE TO SHOW.
+  ; Nothing below has run, so the published sample is whatever it was
+  ; declared as; the sentinel is the only declaration that is true, and a
+  ; zero there would put 32 F on the panel of a board nobody has asked.
+  ProbeRecord(13, BannerCaption())
+
+  ; 1 - a board with a thermometer and no modulator running: the
+  ; temperature and nothing about a fan. 44.5 C is 112 F.
+  gHwTempSampledMilliC = 44500
+  probePwmKind = #HW_PWM_KIND_NONE
+  probePwmDuty = -1
+  ProbeRecord(1, BannerCaption())
+
+  ; 2 - the same reading with a hardware modulator at 62.5 percent. The
+  ; duty is permille and the banner is a whole percent, rounded.
+  probePwmKind = #HW_PWM_KIND_HARD
+  probePwmDuty = 625
+  ProbeRecord(2, BannerCaption())
+
+  ; 3 - a claimed pin at rest is still a fan that is being used, so it is
+  ; shown at zero rather than hidden. A hidden fan and a stopped fan look
+  ; the same on the glass and they are not the same thing.
+  probePwmDuty = 0
+  ProbeRecord(3, BannerCaption())
+
+  ; 4 - software modulation at full.
+  probePwmKind = #HW_PWM_KIND_SOFT
+  probePwmDuty = 1000
+  ProbeRecord(4, BannerCaption())
+
+  ; 5 - NO THERMOMETER. The sentinel is not a reading: the temperature
+  ; half is absent and the fan half is unaffected.
+  gHwTempSampledMilliC = #HW_TEMP_NONE
+  ProbeRecord(5, BannerCaption())
+
+  ; 6 - below freezing, which is an unheated workshop in winter and is
+  ; not hypothetical. -5 C is 23 F, and it is the rounding rule's other
+  ; side.
+  gHwTempSampledMilliC = -5000
+  probePwmKind = #HW_PWM_KIND_NONE
+  probePwmDuty = -1
+  ProbeRecord(6, BannerCaption())
+
+  ; 7 - a modulator that is running but answers a negative duty says
+  ; nothing a person could read, so it says nothing.
+  gHwTempSampledMilliC = 44500
+  probePwmKind = #HW_PWM_KIND_HARD
+  probePwmDuty = -1
+  ProbeRecord(7, BannerCaption())
+
+  ; 8 - AND THE REPAINT GETS THE LAST COMPOSITION, not a fresh one. This
+  ; is slot 7's caption read back through the repaint accessor.
+  ProbeRecord(8, BannerCaptionLast())
+
+  ; 9 - a released pin whose modulator still reads back its last duty is
+  ; not a fan being driven. The kind is the test, not the duty.
+  probePwmKind = #HW_PWM_KIND_NONE
+  probePwmDuty = 300
+  ProbeRecord(9, BannerCaption())
+
+  ; 10, 11 - the rounding, either side of a whole degree, through the one
+  ; conversion: 37.999 C is 100 F and 38.056 C is 101 F.
+  probePwmKind = #HW_PWM_KIND_NONE
+  probePwmDuty = -1
+  gHwTempSampledMilliC = 37999
+  ProbeRecord(10, BannerCaption())
+  gHwTempSampledMilliC = 38056
+  ProbeRecord(11, BannerCaption())
+
+  ; 12 - THE BOUND IS REAL. A clock caption that already fills the row
+  ; leaves the appends almost nothing to write, and the buffer must still
+  ; be terminated inside itself with nothing written past its end.
+  probeLong = 1
+  gHwTempSampledMilliC = 44500
+  probePwmKind = #HW_PWM_KIND_HARD
+  probePwmDuty = 625
+  ProbeRecord(12, BannerCaption())
+  probeLong = 0
+
+  ; The seam count, which every scenario above had to leave at zero.
+  PokeI(#BS_META, probeSeamCalls)
+  PokeI(#BS_META + 8, #BANNER_STATUS_MAX)
+  ProcedureReturn 0
+EndProcedure

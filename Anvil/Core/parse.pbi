@@ -266,6 +266,26 @@ Procedure ReadLine()
     ;
     ; IT PRINTS NOTHING, EVER. It runs while a line is half typed.
     FanTick()
+    ; AND TAKE THE TEMPERATURE, once a second, whether or not a fan is
+    ; armed - the board has a thermometer either way and the banner shows
+    ; what it says.
+    ;
+    ; IT IS HERE AND NOT IN THE SCREEN SERVICE, and that is the whole
+    ; reason it is a separate call rather than a line inside the thing
+    ; that paints. Reading the temperature goes through a seam, and a
+    ; seam is a call through a pointer the compiler must assume can be
+    ; any procedure whose address the service table holds. The screen
+    ; service is reached from the boot walk, which reaches the USB
+    ; enumeration, whose entry is in that table - so a sample taken from
+    ; the painter closes a call loop that cannot happen at run time and
+    ; the build is refused, correctly. This spin is reached from nothing
+    ; in the table, which is also why FanTick has always been able to
+    ; read the seam from here.
+    ;
+    ; EVERY BOARD REACHES IT. This loop is the one prompt in the monitor
+    ; and every board file includes the fan command beside it, so a board
+    ; that never grows a fan still publishes a temperature.
+    HwTempSampleTick()
   ForEver
   ; The three things the old inline editor did at the end of the line -
   ; terminate the buffer, publish its length, and end the echoed line -

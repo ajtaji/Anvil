@@ -314,6 +314,7 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure TouchKeyboardComposeNeon()
   Define n.i
+  Define len.i
   Define i.i
   Define k.i
   Define col.i
@@ -340,7 +341,24 @@ Procedure TouchKeyboardComposeNeon()
         face = at
         NeonFontSetup(#NEON_FONT_MONO, face, 0)
       EndIf
-      Neon_Text(#NEON_FONT_MONO, TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawText(i), Neon_RGBA((col >> 16) & $FF, (col >> 8) & $FF, col & $FF, 255))
+      ; The item is a label centred in a box; the mono face at `at` is
+      ; the bitmap cell magnified, so the centring is arithmetic.
+      ;
+      ; THE CELL FONT HERE, THE SMOOTH FACE ON THE CPU RENDERER, AND THAT
+      ; IS NOT AN OVERSIGHT. The engine this layer is drawn with has one
+      ; face - a one-bit cell at four integer scales - and it is the face
+      ; the console text ALL AROUND these keys is drawn with on this
+      ; path. Smooth key labels in a frame of blocky console text would
+      ; be the one place in the picture that did not match, and giving
+      ; the engine a coverage-map face is a change to the engine, not to
+      ; the keyboard. The renderer that paints the panel the keyboard is
+      ; actually touched on picks the smooth face; see the composer in
+      ; RaspberryPi4/Board/banner_clock.pi4.
+      len = 0
+      While PeekA(TouchKeyboardDrawText(i) + len) <> 0
+        len = len + 1
+      Wend
+      Neon_Text(#NEON_FONT_MONO, TouchKeyboardDrawX(i) + (TouchKeyboardDrawW(i) - len * 8 * at) / 2, TouchKeyboardDrawY(i) + (TouchKeyboardDrawH(i) - 16 * at) / 2, TouchKeyboardDrawText(i), Neon_RGBA((col >> 16) & $FF, (col >> 8) & $FF, col & $FF, 255))
     EndIf
     i = i + 1
   Wend
