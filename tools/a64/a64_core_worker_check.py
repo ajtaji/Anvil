@@ -68,6 +68,26 @@ def proc(text: str, name: str) -> str:
     return match.group(0)
 
 
+def mon_regions(memmap):
+    """The board's own region count, read from memmap.pi4 rather than typed here: the
+    reservation this gate protects is one region among however many the map has today,
+    and a gate that counts them stops being about the reservation."""
+    m = re.search(r"Procedure\.i HwMonRegions\(\)\s*\r?\n\s*ProcedureReturn (\d+)", memmap)
+    if not m:
+        raise SystemExit("memmap.pi4 no longer declares HwMonRegions() with a literal count")
+    return int(m.group(1))
+
+
+def stack_region(memmap):
+    """The region index the map gives the raw-secondary stack reservation, read from
+    HwMonRegionLo's own Case list. The mutants below shrink the count to exactly this
+    index, which drops the reservation from the enumeration and nothing else."""
+    m = re.search(r"Case (\d+) : ProcedureReturn #CORE_RAW_STACK_LO", memmap)
+    if not m:
+        raise SystemExit("memmap.pi4 no longer enumerates #CORE_RAW_STACK_LO as a region")
+    return int(m.group(1))
+
+
 def in_order(c: Checks, text: str, needles: list[str], where: str) -> None:
     cursor = -1
     for needle in needles:
@@ -180,11 +200,11 @@ def source_checks(c: Checks, core: str, mmu: str, memmap: str) -> None:
         "Case 1 : ProcedureReturn #CORE_RAW_STACK_LO",
         "Case 2 : ProcedureReturn #CORE_RAW_STACK_LO + #CORE_RAW_STACK_PAGE",
         "Case 3 : ProcedureReturn #CORE_RAW_STACK_LO + (#CORE_RAW_STACK_PAGE * 2)",
-        "ProcedureReturn 5",
         "Case 4 : ProcedureReturn #CORE_RAW_STACK_LO",
         "Case 4 : ProcedureReturn #CORE_RAW_STACK_HI",
     ):
         c.yes(token in memmap, f"board stack reservation missing {token}")
+    c.yes(stack_region(memmap) < mon_regions(memmap), "the board map must still count the raw-secondary stack reservation among its regions")
     for forbidden in ("Print", "Uart", "Safety", "Genet", "Dma", "Display"):
         c.yes(forbidden not in secondary + join,
               f"secondary path must not touch {forbidden}")
@@ -544,7 +564,7 @@ def mutation_checks(c: Checks, core: str, mmu: str, memmap: str) -> None:
         ("stack owner check", "If CoreRawStackOwned(core, stackBase, stackBytes) = 0", "If 0 = 1"),
         ("exact stack pair", "If stackBase <> owned Or stackBytes <> bytes", "If 0 = 1"),
         ("running monitor overlap", "If stackBase <= HwMonHi() And HwMonLo() < top", "If 0 = 1"),
-        ("monitor reservation", "  ProcedureReturn 5\nEndProcedure", "  ProcedureReturn 4\nEndProcedure"),
+        ("monitor reservation", "  ProcedureReturn %d\nEndProcedure" % mon_regions(memmap), "  ProcedureReturn %d\nEndProcedure" % stack_region(memmap)),
     ]
     for name, old, new in mutations:
         owner = core if old in core else (mmu if old in mmu else memmap)
@@ -877,8 +897,8 @@ def main() -> int:
                 (
                     "monitor_region",
                     "RaspberryPi4/Board/memmap.pi4",
-                    "Procedure.i HwMonRegions()\n  ProcedureReturn 5",
-                    "Procedure.i HwMonRegions()\n  ProcedureReturn 4",
+                    "Procedure.i HwMonRegions()\n  ProcedureReturn %d" % mon_regions(memmap),
+                    "Procedure.i HwMonRegions()\n  ProcedureReturn %d" % stack_region(memmap),
                     5,
                     LOAD,
                 ),

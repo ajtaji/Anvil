@@ -25,7 +25,9 @@ Procedure.i Main()
   If HwCoreRawStackBytes(1) <> $1000 Or HwCoreRawStackBytes(0) <> 0 Or HwCoreRawStackBase(4) <> 0
     ProcedureReturn 4
   EndIf
-  If HwMonRegions() <> 5 Or HwMonRegionLo(4) <> $001FC000 Or HwMonRegionHi(4) <> $001FEFFF
+  ; The reservation is region 4 of however many the map has: the count may grow (a
+  ; sixth region arrived with the driver-module arena), the reservation may not move.
+  If HwMonRegions() <= 4 Or HwMonRegionLo(4) <> $001FC000 Or HwMonRegionHi(4) <> $001FEFFF
     ProcedureReturn 5
   EndIf
   If CoreRawStackOwned(1, $001FC000, $1000) = 0 Or CoreRawStackOwned(2, $001FD000, $1000) = 0 Or CoreRawStackOwned(3, $001FE000, $1000) = 0
