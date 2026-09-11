@@ -561,6 +561,68 @@ Procedure.i ModTokenIs(p.i, n.i, name.i)
   ProcedureReturn 1
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  ModRecFindByName(name) - the record an operator means by a file name.
+;
+;  THE SAME FILE CAN HAVE SEVERAL RECORDS IN ONE POWER CYCLE, because an
+;  unloaded module's bytes stay where they are and a later `mod load` of
+;  the same file lands a second copy at a second base. Only one of them
+;  can be doing anything. The first board run of this loader typed
+;  `mod unload THERMAL.MOD` with a stranded copy at record 0 and the
+;  live one at record 1, and the lookup answered the stranded one: the
+;  unload was refused as "not in a state that allows that" while the
+;  module it was aimed at kept running.
+;
+;  THE RULE: an ACTIVE record of that name first, because that is the
+;  one a command can act on; failing that a FAILED one, which unload can
+;  still tidy; failing that the newest record of the name, so `mod info`
+;  describes the last thing that happened to that file. Case-insensitive,
+;  because a FAT 8.3 name is upper case on the medium and nobody types
+;  it that way. -1 when no record carries the name.
+; ----------------------------------------------------------------------
+Procedure.i ModRecNameLen(p.i)
+  Define n.i
+  n = 0
+  While (PeekA(p + n) & 255) <> 0 And n < #MOD_NAME_MAX
+    n = n + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i ModRecFindByName(name.i)
+  Define i.i
+  Define n.i
+  Define active.i
+  Define failed.i
+  Define newest.i
+  If name = 0
+    ProcedureReturn -1
+  EndIf
+  n = ModRecNameLen(name)
+  active = -1
+  failed = -1
+  newest = -1
+  i = 0
+  While i < gModRecordCount
+    If ModTokenIs(ModRecNameAddr(i), n, name) <> 0 And ModRecNameLen(ModRecNameAddr(i)) = n
+      newest = i
+      If gModRecState[i] = #MOD_STATE_ACTIVE
+        active = i
+      ElseIf gModRecState[i] = #MOD_STATE_FAILED
+        failed = i
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If active >= 0
+    ProcedureReturn active
+  EndIf
+  If failed >= 0
+    ProcedureReturn failed
+  EndIf
+  ProcedureReturn newest
+EndProcedure
+
 ; The seam id for a name, or -1. The manifest's narrowing column and the
 ; `mod` command both take the same words the refusals print, so an
 ; operator can copy one into the other.

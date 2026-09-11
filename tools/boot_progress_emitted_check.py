@@ -168,8 +168,7 @@ Global gNetWaitProgressBusy.i
 Global gNetWaitProgressAt.i
 Global gate_ms.i
 Global gate_netProgress.i
-Global gate_netDepth.i
-Global gate_netMaxDepth.i
+Global gate_netBusySeen.i
 Global gate_netPumps.i
 Global gate_netTicks.i
 Global gate_netCancels.i
@@ -186,8 +185,8 @@ Global gate_mdioStep.i
 Global gate_mdioReads.i
 Global gate_mdioLinkAt.i
 Global gate_genetProgress.i
-Global gate_genetDepth.i
-Global gate_genetMaxDepth.i
+Global gate_genetBusySeen.i
+Global gate_genetBusyRefused.i
 
 Procedure GateBump() : gate_output = gate_output + 1 : EndProcedure
 Procedure str_print_at(v.i) : GateBump() : EndProcedure
@@ -317,12 +316,13 @@ Procedure.i NetIfSrc(kind.i)
 EndProcedure
 Procedure NetDhcpCancel(kind.i) : gate_netCancels = gate_netCancels + 1 : EndProcedure
 Global Dim netdhcp_auto.i[6]
+; No call back into netwait_Progress() from the hook: the compiler
+; refuses that loop (see ProbeGenetProgress below). The hook records that
+; the busy guard is armed while it runs; the main body arms the guard by
+; hand and shows a call under it reaches no hook.
 Procedure ProbeNetProgress()
-  gate_netDepth = gate_netDepth + 1
-  If gate_netDepth > gate_netMaxDepth : gate_netMaxDepth = gate_netDepth : EndIf
   gate_netProgress = gate_netProgress + 1
-  netwait_Progress()
-  gate_netDepth = gate_netDepth - 1
+  If gNetWaitProgressBusy <> 0 : gate_netBusySeen = gate_netBusySeen + 1 : EndIf
 EndProcedure
 
 Procedure.i genet_Ticks() : ProcedureReturn gate_genetTicks : EndProcedure
@@ -335,12 +335,16 @@ Procedure.i GenetMdioRead(a.i, r.i)
   EndIf
   ProcedureReturn #GENET_BMSR_ANEGCAPABLE
 EndProcedure
+; The hook does not call genet_Progress() back. It used to, to show a
+; second entry was refused at depth one, and the compiler now refuses
+; that loop itself - a call through the hook variable is a call to every
+; procedure assigned to it, and this one led straight back. The guard
+; is proven the other way round: the hook records that the busy flag is
+; armed while it runs, and the main body arms the flag by hand and shows
+; a call under it reaches no hook at all.
 Procedure ProbeGenetProgress()
-  gate_genetDepth = gate_genetDepth + 1
-  If gate_genetDepth > gate_genetMaxDepth : gate_genetMaxDepth = gate_genetDepth : EndIf
   gate_genetProgress = gate_genetProgress + 1
-  genet_Progress()
-  gate_genetDepth = gate_genetDepth - 1
+  If genet_progressBusy <> 0 : gate_genetBusySeen = gate_genetBusySeen + 1 : EndIf
 EndProcedure
 '''
 
@@ -366,16 +370,16 @@ EndProcedure
 
 Procedure GateNetReset()
   NetWaitSetProgressHook(0)
-  gate_ms = 1000 : gate_netProgress = 0 : gate_netDepth = 0
-  gate_netMaxDepth = 0 : gate_netPumps = 0 : gate_netTicks = 0
+  gate_ms = 1000 : gate_netProgress = 0 : gate_netBusySeen = 0
+  gate_netPumps = 0 : gate_netTicks = 0
   gate_netCancels = 0 : gate_netBindAfter = 0
 EndProcedure
 
 Procedure GateGenetReset()
   GenetSetProgressHook(0)
   gate_genetTicks = 0 : gate_mdioStep = 10 : gate_mdioReads = 0
-  gate_mdioLinkAt = 9 : gate_genetProgress = 0 : gate_genetDepth = 0
-  gate_genetMaxDepth = 0 : genet_phyAddr = 1 : genet_err = 0
+  gate_mdioLinkAt = 9 : gate_genetProgress = 0 : gate_genetBusySeen = 0
+  gate_genetBusyRefused = 0 : genet_phyAddr = 1 : genet_err = 0
 EndProcedure
 
 Procedure.i Main()
@@ -456,7 +460,7 @@ Procedure.i Main()
   NetWaitSetProgressHook(@ProbeNetProgress)
   rc = NetDhcpAcquire(1, 200, 0)
   If rc <> 0 Or gate_netPumps <> offPumps Or gate_netTicks <> offTicks Or gate_netCancels <> offCancels : ProcedureReturn 9 : EndIf
-  If gate_netProgress < 2 Or gate_netMaxDepth <> 1 : ProcedureReturn 10 : EndIf
+  If gate_netProgress < 2 Or gate_netBusySeen <> gate_netProgress : ProcedureReturn 10 : EndIf
 
   ; 32-bit millis wrap: immediate first service, not at +49 ms, then at +50.
   GateNetReset()
@@ -469,10 +473,19 @@ Procedure.i Main()
   If gate_netProgress <> 1 : ProcedureReturn 12 : EndIf
   gate_ms = $22
   netwait_Progress()
-  If gate_netProgress <> 2 Or gate_netMaxDepth <> 1 : ProcedureReturn 13 : EndIf
+  If gate_netProgress <> 2 Or gate_netBusySeen <> 2 : ProcedureReturn 13 : EndIf
+  ; A call under an armed guard reaches no hook; the next call without it does.
+  gate_ms = $60
+  gNetWaitProgressBusy = 1
+  netwait_Progress()
+  gNetWaitProgressBusy = 0
+  If gate_netProgress <> 2 : ProcedureReturn 19 : EndIf
+  netwait_Progress()
+  If gate_netProgress <> 3 : ProcedureReturn 20 : EndIf
 
   ; GENET callback-off preserves the exact completed MDIO-read sequence and
-  ; link result. Recursive progress is refused at depth one.
+  ; link result. The busy guard is armed for the whole of every hook call,
+  ; and a call made while it is armed reaches no hook.
   GateGenetReset()
   rc = GenetPhyWaitLink(500)
   offReads = gate_mdioReads
@@ -481,7 +494,15 @@ Procedure.i Main()
   GenetSetProgressHook(@ProbeGenetProgress)
   rc = GenetPhyWaitLink(500)
   If rc <> 1 Or gate_mdioReads <> offReads : ProcedureReturn 15 : EndIf
-  If gate_genetProgress < 1 Or gate_genetMaxDepth <> 1 : ProcedureReturn 16 : EndIf
+  If gate_genetProgress < 1 Or gate_genetBusySeen <> gate_genetProgress : ProcedureReturn 16 : EndIf
+  gate_genetBusyRefused = gate_genetProgress
+  genet_progressBusy = 1
+  genet_progressAt = genet_Ticks() - genet_progressStep
+  genet_Progress()
+  genet_progressBusy = 0
+  If gate_genetProgress <> gate_genetBusyRefused : ProcedureReturn 17 : EndIf
+  genet_Progress()
+  If gate_genetProgress <> gate_genetBusyRefused + 1 : ProcedureReturn 18 : EndIf
 
   ProcedureReturn 0
 EndProcedure

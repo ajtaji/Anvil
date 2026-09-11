@@ -512,10 +512,51 @@ Procedure.i Main()
   ; DETACH, then unload. The consumer is asked to let go and does.
   Expect(ModSeamDetachAll(#SVCCAP_THERMAL), 0)
   Expect(ModSeamBindCount(#SVCCAP_THERMAL), 0)
+
+  ; THE SEAM IS CLOSED TO NEW USE BETWEEN THE DETACH AND THE UNLOAD. The
+  ; module is still ACTIVE and its function is still in the row, but a
+  ; consumer reading now finds the seam empty, falls back, and takes no
+  ; binding; a binding asked for outright is refused. On the board the
+  ; fan policy reads on a timer, and without this it bound again between
+  ; the operator's detach and the operator's unload, so the unload was
+  ; refused by the consumer that had just been asked to let go.
+  Expect(gModRecState[0], #MOD_STATE_ACTIVE)
+  Expect(ModSeamClosed(#SVCCAP_THERMAL), 1)
+  Expect(ModSeamFn(#SVCCAP_THERMAL, #SEAM_THERMAL_READ), 0)
+  Expect(ThermalMilliC(), #GATE_MAILBOX_MILLI)
+  Expect(ThermalSource(), #THERM_SRC_MAILBOX)
+  Expect(ModSeamBindCount(#SVCCAP_THERMAL), 0)
+  Expect(ModSeamBind(#SVCCAP_THERMAL, @ThermalSaySelf, @ThermalSeamDetach), #MOD_ERR_STATE)
+  Expect(ModSeamBindCount(#SVCCAP_THERMAL), 0)
+
   Expect(ModUnload(0), #MOD_OK)
   Expect(gModRecState[0], #MOD_STATE_QUIESCED)
   Expect(ModSeamHas(#SVCCAP_THERMAL), 0)
   Expect(ModSeamOwner(#SVCCAP_THERMAL), #MOD_SEAM_NONE)
+  ; Releasing the owner is what reopens the seam, so a module loaded
+  ; later can fill it and be used.
+  Expect(ModSeamClosed(#SVCCAP_THERMAL), 0)
+
+  ; THE SAME FILE LOADED AGAIN lands a second record at a second base
+  ; while the first stays stranded, and an operator naming the file
+  ; means the live one. On the board the lookup answered the stranded
+  ; record and `mod unload` was refused for a module still running.
+  Expect(ModLoadAndActivate("THERMAL.MOD", -1), #MOD_OK)
+  Expect(gModRecordCount, 2)
+  Expect(gModRecState[0], #MOD_STATE_QUIESCED)
+  Expect(gModRecState[1], #MOD_STATE_ACTIVE)
+  Expect(ModRecFindByName("THERMAL.MOD"), 1)
+  Expect(ModRecFindByName("thermal.mod"), 1)
+  Expect(ThermalMilliC(), #GATE_AVS_MILLI)
+  Expect(ModSeamBindCount(#SVCCAP_THERMAL), 1)
+  Expect(ModSeamDetachAll(#SVCCAP_THERMAL), 0)
+  Expect(ModUnload(ModRecFindByName("THERMAL.MOD")), #MOD_OK)
+  Expect(gModRecState[1], #MOD_STATE_QUIESCED)
+  ; Both stranded: the name now means the newest, and a name nothing
+  ; carries means nothing.
+  Expect(ModRecFindByName("THERMAL.MOD"), 1)
+  Expect(ModRecFindByName("NOSUCH.MOD"), -1)
+  Expect(ThermalMilliC(), #GATE_MAILBOX_MILLI)
 
   ; THE CONSUMER FALLS BACK, with no notification and no failure. This is
   ; the property that made the conversion safe to do without a board.

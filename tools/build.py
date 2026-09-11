@@ -18,11 +18,13 @@ TARGETS = {
         "source": Path("RaspberryPi4/Board/board.pi4"),
         "output": Path("build/pi4/anvil.img"),
         "args": [],
+        "bump": True,
     },
     "unoq": {
         "source": Path("ArduinoQ/Board/board.unoq"),
         "output": Path("build/unoq/anvil.img"),
         "args": ["--entry-returns"],
+        "bump": True,
     },
     "armstub": {
         "source": Path("RaspberryPi4/Board/armstub8.asm"),
@@ -57,7 +59,21 @@ def find_compiler(explicit: str | None) -> str:
     )
 
 
-def build(compiler: str, target: str) -> None:
+def build(compiler: str, target: str, bump: bool = True) -> None:
+    """Build one target.
+
+    EVERY MONITOR BUILD RAISES THE BOARD'S BUILD NUMBER. Ruled 2026-09-11,
+    after three images in one night all announced themselves as build 41
+    and nothing on the board could say which one was running: `version`
+    exists so a person watching a board can tell the images apart without
+    hashing anything, and that only works if the number moves with every
+    build. The compiler owns the bump (`pmfc --bump-build`: after a
+    SUCCESSFUL build it raises the marked constant in the board file by
+    one and writes the date and time beside it), so this tool asks for it
+    on the board targets and on nothing else - a gate fixture or the ARM
+    stub has no build number to move. Pass --no-bump for a verification
+    build that must not touch the tree.
+    """
     spec = TARGETS[target]
     source = ROOT / spec["source"]
     output = ROOT / spec["output"]
@@ -73,6 +89,7 @@ def build(compiler: str, target: str) -> None:
         "-t",
         spec.get("target", target),
         *spec["args"],
+        *(["--bump-build"] if bump and spec.get("bump") else []),
         "-o",
         str(output),
     ]
@@ -110,6 +127,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("all", *TARGETS), nargs="?", default="all")
     parser.add_argument("--pmfc", help="path or command name for the external compiler")
+    parser.add_argument(
+        "--no-bump",
+        action="store_true",
+        help="do not raise the board's build number (verification builds only)",
+    )
     args = parser.parse_args()
 
     compiler = find_compiler(args.pmfc)
@@ -119,7 +141,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-pmfc-") as temporary:
         isolated_compiler = staged_compiler(compiler, Path(temporary))
         for target in selected:
-            build(isolated_compiler, target)
+            build(isolated_compiler, target, bump=not args.no_bump)
     return 0
 
 

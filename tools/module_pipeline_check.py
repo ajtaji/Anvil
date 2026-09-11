@@ -42,6 +42,7 @@ DRIVER_SRC = ROOT / "RaspberryPi4/Modules/thermal_avs.pi4"
 FAILINIT_SRC = ROOT / "RaspberryPi4/Tests/module_failinit_gate.pi4"
 SEAMS = ROOT / "Anvil/Hal/seams.pbi"
 RUNTIME = ROOT / "Anvil/Hal/module_runtime.pbi"
+ABI = ROOT / "Anvil/Hal/abi.pbi"
 
 LOAD = 0x00200000
 STACK = 0x03000000
@@ -115,7 +116,39 @@ def check_vocabulary() -> list[str]:
     thermal = constant(SEAMS, "SVCCAP_THERMAL")
     if thermal > seam_max:
         raise SystemExit("module pipeline gate: #SVCCAP_THERMAL is outside the registry")
+    notes.append(check_table_built_on_first_use())
     return notes
+
+
+def check_table_built_on_first_use() -> str:
+    """The real table must be filled before its address is handed out.
+
+    This gate models the service table and fills its model by hand, so it
+    cannot see whether the monitor's own table is built when the loader
+    asks for it. On 2026-09-11 it was not: the only builder call was the
+    payload boot path, the module walk runs before any payload, and the
+    first module on silicon read a zero out of the seam-fill slot and
+    refused itself. The owning fix is that the address getter builds the
+    table on first use. That is a property of the real source this gate
+    does not compile, so it is asserted here on the source itself: the
+    getter tests the built flag and calls the builder, and it is defined
+    after the builder, because a procedure must be defined before it is
+    called in this language.
+    """
+    text = ABI.read_text(encoding="utf-8", errors="replace")
+    builder_at = text.find("Procedure BuildServiceTable()")
+    getter_at = text.find("Procedure.i SvcTableAddr()")
+    if builder_at < 0 or getter_at < 0:
+        raise SystemExit("module pipeline gate: abi.pbi no longer defines the builder or the getter by those names")
+    if getter_at < builder_at:
+        raise SystemExit("module pipeline gate: SvcTableAddr is defined above BuildServiceTable, so it cannot build on first use")
+    body = text[getter_at:text.find("EndProcedure", getter_at)]
+    if "gSvcBuilt = 0" not in body or "BuildServiceTable()" not in body:
+        raise SystemExit(
+            "module pipeline gate: SvcTableAddr does not build the table on first use - a module "
+            "initialised before a payload boot would read zeros"
+        )
+    return "the real table is built on first use of its address"
 
 
 def build_module(compiler: Path, source: Path, output: Path) -> bytes:

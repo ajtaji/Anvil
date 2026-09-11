@@ -463,16 +463,6 @@ Global gSvcClipW.i
 Global gSvcClipH.i
 
 ; ======================================================================
-;  SvcTableAddr() - where the table is.
-;
-;  A procedure and not a constant, because the address is a link-time fact
-;  the compiler owns and nothing in this tree should be spelling it out.
-; ======================================================================
-Procedure.i SvcTableAddr()
-  ProcedureReturn @gSvcTab[0]
-EndProcedure
-
-; ======================================================================
 ;  SvcUnimplemented() - what every reserved slot points at.
 ;
 ;  IT RETURNS A CODE RATHER THAN FAULTING, and that is the whole reason
@@ -2166,4 +2156,34 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CRYPTO + 0] = @SvcSha256
 
   gSvcBuilt = 1
+EndProcedure
+
+; ======================================================================
+;  SvcTableAddr() - where the table is, BUILT.
+;
+;  A procedure and not a constant, because the address is a link-time fact
+;  the compiler owns and nothing in this tree should be spelling it out.
+;
+;  IT BUILDS THE TABLE THE FIRST TIME ANYTHING ASKS FOR IT. Until the
+;  night of 2026-09-11 the only builder call was the payload boot path,
+;  so the table was an array of zeros from power-on until the first
+;  `boot`. The driver-module loader hands this address to every module
+;  it initialises, at monitor boot and at `mod load`, and both happen
+;  before any payload: the first module on real silicon read a zero out
+;  of the seam-fill slot and refused itself with -2, while the desk gate,
+;  which models the table, had filled its model by hand and never saw it.
+;  Whoever holds this address holds a table with every slot filled; that
+;  is the contract, and this is the one place it can be kept. The payload
+;  boot path still rebuilds it on every entry, which is cheap and
+;  idempotent, so the pointers a payload gets are the ones this monitor
+;  has at that moment.
+;
+;  IT SITS BELOW BuildServiceTable BECAUSE IT CALLS IT. A procedure has
+;  to be defined before it is called in this language.
+; ======================================================================
+Procedure.i SvcTableAddr()
+  If gSvcBuilt = 0
+    BuildServiceTable()
+  EndIf
+  ProcedureReturn @gSvcTab[0]
 EndProcedure

@@ -69,6 +69,19 @@ Global Dim gSeamFilled.i[#MOD_SEAM_ROWS]
 ; return address into memory about to be reused.
 Global Dim gSeamDepth.i[#MOD_SEAM_ROWS]
 
+; 1 while a seam is CLOSED TO NEW USE: `mod detach` has asked its
+; consumers to let go and the module that fills it is on its way out.
+; A closed seam answers ModSeamFn with zero and refuses a binding, so a
+; consumer that reads on a timer finds the seam empty and falls back
+; instead of taking the service straight back. Without this, a detach
+; on this bench was undone by the fan policy's next tick before the
+; operator's `mod unload` could be typed: detach released the binding,
+; the tick read through the still-filled seam and bound again, and the
+; unload was refused a second time by the very consumer that had just
+; been asked to let go. The flag clears when the owning record is
+; released, which is the only way the seam becomes fillable again.
+Global Dim gSeamClosed.i[#MOD_SEAM_ROWS]
+
 ; The durable bindings. gBindSeam[] is #MOD_SEAM_NONE for a free row.
 Global Dim gBindSeam.i[#MOD_BIND_MAX]
 Global Dim gBindSay.i[#MOD_BIND_MAX]      ; a procedure that prints the owner
@@ -123,6 +136,7 @@ Procedure ModSeamReset()
     gSeamAllow[i] = #MOD_SEAM_NONE
     gSeamFilled[i] = 0
     gSeamDepth[i] = 0
+    gSeamClosed[i] = 0
     i = i + 1
   Wend
   i = 0
@@ -249,7 +263,19 @@ Procedure.i ModSeamFn(sid.i, index.i)
   If ModSeamIdOk(sid) = 0 Or index < 0 Or index >= #MOD_SEAM_FNS
     ProcedureReturn 0
   EndIf
+  ; A closed seam reads as empty. See gSeamClosed.
+  If gSeamClosed[sid] <> 0
+    ProcedureReturn 0
+  EndIf
   ProcedureReturn gSeamFn[sid * #MOD_SEAM_FNS + index]
+EndProcedure
+
+; 1 while the seam is closed to new use by `mod detach`. See gSeamClosed.
+Procedure.i ModSeamClosed(sid.i)
+  If ModSeamIdOk(sid) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn gSeamClosed[sid]
 EndProcedure
 
 ; 1 when anything at all fills this seam.
@@ -331,6 +357,11 @@ Procedure.i ModSeamBind(sid.i, saySelf.i, detach.i)
   If gSeamFilled[sid] = 0
     ProcedureReturn ModSeamFail(#MOD_ERR_NOSERVICE, sid, 0)
   EndIf
+  ; Closed to new use: the consumers were asked to let go and the module
+  ; is on its way out. A binding taken now would undo the detach.
+  If gSeamClosed[sid] <> 0
+    ProcedureReturn ModSeamFail(#MOD_ERR_STATE, sid, 0)
+  EndIf
   If saySelf = 0 Or detach = 0
     ProcedureReturn ModSeamFail(#MOD_ERR_STATE, sid, 0)
   EndIf
@@ -406,11 +437,23 @@ EndProcedure
 ;  the binding existed to prevent. A detach that does not unbind is a
 ;  defect in the consumer and leaves the count where it was, so the
 ;  unload that provoked it is still refused.
+;
+;  IT CLOSES THE SEAM FIRST, and the order matters: a consumer that
+;  reads on a timer, or one whose detach hook reads once more on the
+;  way out, must find the seam already empty, or it takes the service
+;  straight back and the unload this detach exists to allow is refused
+;  again. The seam stays closed until the owning record is released.
 ; ----------------------------------------------------------------------
 Procedure.i ModSeamDetachAll(sid.i)
   Define i.i
   Define *fn
   Define n.i
+  If ModSeamIdOk(sid) = 0
+    ProcedureReturn 0
+  EndIf
+  If gSeamFilled[sid] <> 0
+    gSeamClosed[sid] = 1
+  EndIf
   i = 0
   While i < #MOD_BIND_MAX
     If gBindSeam[i] = sid
@@ -455,6 +498,7 @@ Procedure.i ModSeamReleaseOwner(owner.i)
       gSeamFilled[sid] = 0
       gSeamOwner[sid] = #MOD_SEAM_NONE
       gSeamDepth[sid] = 0
+      gSeamClosed[sid] = 0
       j = 0
       While j < #MOD_BIND_MAX
         If gBindSeam[j] = sid

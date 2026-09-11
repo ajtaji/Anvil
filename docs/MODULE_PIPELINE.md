@@ -94,7 +94,8 @@ be reused.
 
 The binding is the third answer. `mod unload` is refused while any binding is
 held or while a call is on the stack inside the driver, and the refusal names
-the seam, the count and the owners. `mod detach <seam>` asks each owner to let
+the seam, the count and the owners. `mod detach <seam>` closes the seam to new
+use until its module is unloaded, then asks each owner to let
 go - each falls back to whatever it used before the module was loaded - and
 then the unload can act. Quiesce is allowed to say no: a driver that cannot put
 its hardware into a safe state refuses, and the unload refuses with it, because

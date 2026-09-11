@@ -31,24 +31,12 @@ Procedure.i ModArgIs(a.i, name.i)
   ProcedureReturn ModTokenIs(a, StrLenZ(a), name)
 EndProcedure
 
-; A record by the file name the operator typed, or -1. Case-insensitive,
-; because a FAT 8.3 name is upper case on the medium and nobody types it
-; that way.
+; A record by the file name the operator typed, or -1. The policy - the
+; live record of that name before a stranded one - is the lifecycle's,
+; in ModRecFindByName, where the states it reads are defined and where
+; the module pipeline gate can reach it.
 Procedure.i ModFindByName(a.i)
-  Define i.i
-  Define n.i
-  If a = 0
-    ProcedureReturn -1
-  EndIf
-  n = StrLenZ(a)
-  i = 0
-  While i < gModRecordCount
-    If ModTokenIs(ModRecNameAddr(i), n, a) <> 0 And StrLenZ(ModRecNameAddr(i)) = n
-      ProcedureReturn i
-    EndIf
-    i = i + 1
-  Wend
-  ProcedureReturn -1
+  ProcedureReturn ModRecFindByName(a)
 EndProcedure
 
 Procedure ModPutDigest(rec.i)
@@ -318,6 +306,9 @@ Procedure ModCmdSeams()
         Print("a loaded module (")
         ModSayName(ModSeamOwner(sid))
         Print(")")
+        If ModSeamClosed(sid) <> 0
+          Print(", closed to new use until it is unloaded")
+        EndIf
       ElseIf HwSeamCore(sid) <> 0
         Print("the core, with no module")
       Else
@@ -421,6 +412,15 @@ Procedure ModCmdDetach(a.i)
     Print("nothing is bound to the ")
     ModSaySeam(sid)
     PrintN(" seam; there was nothing to release.")
+    ; Close it anyway when a module fills it, for the consumer that has
+    ; not read yet: without this the first read after the operator's
+    ; detach binds, and the unload is refused by a consumer that was
+    ; never asked. See gSeamClosed in Anvil/Core/mod_registry.pbi.
+    If ModSeamHas(sid) <> 0
+      ModSeamDetachAll(sid)
+      PrintN("  The seam is closed to new use until its module is unloaded, so")
+      PrintN("  nothing can bind between now and `mod unload`.")
+    EndIf
     ProcedureReturn
   EndIf
   left = ModSeamDetachAll(sid)
@@ -441,7 +441,9 @@ Procedure ModCmdDetach(a.i)
   ModSaySeam(sid)
   PrintN(" seam released.")
   PrintN("  Everything that used it has fallen back to whatever it used before")
-  PrintN("  the module was loaded. `mod unload` can act now.")
+  PrintN("  the module was loaded, and the seam is closed to new use until its")
+  PrintN("  module is unloaded, so nothing can bind again in the meantime.")
+  PrintN("  `mod unload` can act now.")
 EndProcedure
 
 Procedure ModCmdHelp()
