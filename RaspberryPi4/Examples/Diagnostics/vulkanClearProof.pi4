@@ -120,8 +120,24 @@
 ; ======================================================================
 ;  THE REPORT
 ; ======================================================================
-;  x0 comes back as the address of a 64-word block. Read it with
-;  `memory <that> 64`. Slot 0 is the magic $564B4350 ("VKCP"), slot 1 is
+;  x0 comes back as the address of sixty-four 64-BIT slots - 512 bytes.
+;  Read it with
+;
+;      md.l <that> 200
+;
+;  and READ SLOT N AT WORD 2N. The monitor's dump has three widths and no
+;  64-bit one, and its count is in BYTES whichever is chosen, so a 64-bit
+;  slot shows as its value followed by a zero word. $200 hex is the 512
+;  bytes the block occupies.
+;
+;  TAKING WORD N FOR SLOT N IS HOW A LATER RUN OF vulkanTriangleProof.pi4
+;  WAS MISREAD - the addresses in the middle of its block were taken for
+;  its pixel readbacks and neither verdict was read at all. That
+;  diagnostic's report is 32 bits wide now, one slot to one word, for
+;  exactly this reason; this one's numbering is left alone because board
+;  runs 2 and 3 are recorded against it.
+;
+;  Slot 0 is the magic $564B4350 ("VKCP"), slot 1 is
 ;  the GPU verdict and slot 47 the present verdict.
 
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"

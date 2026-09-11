@@ -112,12 +112,61 @@
 ;    DSI control registers, the GENET ring or the driver-module region.
 ;
 ; ======================================================================
-;  THE REPORT
+;  THE REPORT, AND HOW TO READ IT
 ; ======================================================================
-;  x0 comes back as the address of a 64-word block. Read it with
-;  `memory <that> 64`. Slot 0 is the magic $564B5452 ("VKTR"), slot 1 is
-;  the uniform-colour verdict, slot 4 the per-vertex-colour verdict and
-;  slot 47 the present verdict.
+;  x0 comes back as the address of SIXTY-FOUR 32-BIT WORDS - 256 bytes.
+;  ONE SLOT IS ONE WORD, so the slot number below is the word number in
+;  the dump. Read it with
+;
+;      md.l <x0> 100
+;
+;  and NOT with a bare `md`: the dump's count is in BYTES whichever width
+;  is chosen, so 100 hex is 256 bytes is 64 words, and a bare `md` groups
+;  by one byte. $100 is written in hex because every argument of that
+;  command is.
+;
+;  Slot 0 is $564B5452 ("VKTR") and slot 63 is $52544B56, the same four
+;  letters backwards. A dump that does not show BOTH did not show the
+;  whole report, and the verdicts near the end of it were not read.
+;
+;    0  magic $564B5452          32 layout after pass one
+;    1  UNIFORM-COLOUR VERDICT   33 bin OOM count
+;    2  detail                   34 bin error status
+;    3  detail 2                 35 render error status
+;    4  PER-VERTEX VERDICT       36 MMU fault count
+;    5  surface (guard) base     37 MMU violation address
+;    6  Vulkan window base       38 guard sum before
+;    7  Vulkan window bytes      39 guard sum after
+;    8  image address            40 submit result, pass one
+;    9  image size               41 wait result, pass one
+;   10  image row pitch          42 submit result, pass two
+;   11  vertex buffer address    43 wait result, pass two
+;   12  pipeline A code base     44 backend native error
+;   13  pipeline B code base     45 validation fault count
+;   14  expected clear word      46 validation fault text
+;   15  expected red word        47 PRESENT VERDICT
+;   16  expected green word      48 DisplayLastError()
+;   17  pass 1, inside  (400,500)   49 engine arena needed
+;   18  pass 1, inside  (400,700)   50 backend can draw
+;   19  pass 1, inside  (400,900)   51 backend name
+;   20  pass 1, outside (100,100)   52 image layout after
+;   21  pass 1, outside (700,1200)  53 microseconds, submit 1
+;   22  pass 1, outside (400,200)   54 microseconds, submit 2
+;   23  pass 2, inside  (400,500)   55 draws the backend ran
+;   24  pass 2, inside  (400,700)   56 last shader record address
+;   25  pass 2, inside  (400,900)   57 command buffer failure text
+;   26  pass 2, outside (100,100)   58 shutdown reached
+;   27  pass 2, outside (700,1200)  59 emitter step, if it refused
+;   28  pass 2, outside (400,200)   60 encoder code, if it refused
+;   29  bin jobs before             61 HIGHEST STEP REACHED (1..10)
+;   30  bin jobs after              62 report length in bytes (256)
+;   31  render jobs before          63 tail magic $52544B56
+;
+;  SLOT 61 IS THE ONE TO READ FIRST when anything is wrong. It is the
+;  number of the step that was running, 1 to 10, and 10 means the whole
+;  payload ran including the present. It exists because the first board
+;  run of this diagnostic left a reader asking whether step eight had
+;  been reached, and nothing in the report could answer.
 
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
@@ -133,7 +182,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 
-#VTP_MAGIC = $564B5452
+#VTP_MAGIC = $564B5452                 ; "VKTR", slot 0
+#VTP_TAIL_MAGIC = $52544B56            ; "VKTR" reversed, slot 63
 
 #VTP_ARENA = $0A000000
 #VTP_ARENA_BYTES = $01000000
@@ -286,8 +336,38 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VTP_S_SHUTDOWN = 58
 #VTP_S_EMIT_STAGE = 59
 #VTP_S_QPU_ERR = 60
+; HOW FAR THE PAYLOAD GOT. Bumped at the head of every numbered step, so
+; a report always says which step was running - no reader ever has to
+; infer it from which slots look written. It is the answer to "was step
+; eight reached", and it costs one store per step.
+#VTP_S_STEP = 61
+; The block's own length in bytes, and a tail magic. A dump that stops
+; short does not reach the tail, so "I read the whole report" stops being
+; something a reader has to take on trust.
+#VTP_S_BYTES = 62
+#VTP_S_TAIL = 63
 
-Global Dim vtpReport.i[64]
+; ======================================================================
+;  THE REPORT IS 32 BITS WIDE AND THAT IS NOT A DETAIL
+; ======================================================================
+;  The monitor's dump has three widths - md.b, md.w and md.l - AND NO
+;  64-BIT ONE, and its count is in BYTES whichever is chosen
+;  (Anvil/Core/memcmd.pbi, the width table). A report of 64-bit slots can
+;  therefore only ever be read as 128 32-bit words, and slot N appears at
+;  word 2N with a zero word beside it. That is exactly how the first
+;  board run of this diagnostic was misread: twelve words that decoded
+;  perfectly as slots 9 to 14 were read as slots 17 to 28, so the
+;  addresses and sizes in the middle of the block were taken for the
+;  pixel readbacks, and the two verdicts - which live at words 2 and 8 -
+;  were never read at all.
+;
+;  So the block is 32-BIT WORDS. One slot is one word, `md.l` shows them
+;  one per column, and the slot number in this file is the word number in
+;  the dump. Every value it carries fits: the addresses are payload and
+;  window addresses below 4 GiB, the pixels are 32-bit words by
+;  definition, and the guard sum is masked to 32 bits below.
+; ======================================================================
+Global Dim vtpReport.l[64]
 Global Dim vtpClear.l[4]
 Global Dim vtpPush.l[4]
 
@@ -300,7 +380,25 @@ Procedure vtpPut(slot.i, value.i)
   If slot < 0 Or slot > 63
     ProcedureReturn
   EndIf
-  vtpReport[slot] = value
+  vtpReport[slot] = value & $FFFFFFFF
+EndProcedure
+
+; Read a slot back WITHOUT the sign of a 32-bit load leaking into a
+; 64-bit comparison. A pixel of $FFFF0000 read from a .l is -65536, and
+; comparing that against the constant $FFFF0000 would fail on every
+; correct run - which is the one way a width change like this turns a
+; green board into a red one.
+Procedure.i vtpGet(slot.i)
+  If slot < 0 Or slot > 63
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn vtpReport[slot] & $FFFFFFFF
+EndProcedure
+
+; Mark the numbered step that is now running. The report carries the
+; highest one reached, so a run that stopped says where.
+Procedure vtpStep(n.i)
+  vtpPut(#VTP_S_STEP, n)
 EndProcedure
 
 Procedure.i vtpStop(status.i)
@@ -316,7 +414,7 @@ Procedure.i vtpSum(base.i, bytes.i)
   s = 0
   i = 0
   While i < bytes
-    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFFFFFF
+    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFF
     i = i + 4
   Wend
   ProcedureReturn s
@@ -414,6 +512,9 @@ Procedure.i Main()
   Define bufOffset.q
 
   vtpPut(#VTP_S_MAGIC, #VTP_MAGIC)
+  vtpPut(#VTP_S_TAIL, #VTP_TAIL_MAGIC)
+  vtpPut(#VTP_S_BYTES, 256)
+  vtpStep(0)
   vtpPut(#VTP_S_STATUS, #VTP_ERR_NEON)
   vtpPut(#VTP_S_STATUS2, #VTP_NOT_TRIED)
   vtpPut(#VTP_S_PRESENT, #VTP_P_NOT_TRIED)
@@ -436,6 +537,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  1. The graphics engine, over memory this payload owns.
   ; ------------------------------------------------------------------
+  vtpStep(1)
   If NeonArena(#VTP_ARENA, #VTP_ARENA_BYTES) <> #NEON_OK
     vtpPut(#VTP_S_DETAIL, Neon_Error())
     ProcedureReturn vtpStop(#VTP_ERR_NEON)
@@ -455,6 +557,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  2. The Vulkan device, over the memory above the surface.
   ; ------------------------------------------------------------------
+  vtpStep(2)
   rc = AnvilVkV3dWindow(#VTP_WIN_BASE, #VTP_WIN_BYTES)
   If rc <> #VK_SUCCESS
     vtpPut(#VTP_S_DETAIL, rc)
@@ -506,6 +609,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  3. The colour attachment at the panel's native extent.
   ; ------------------------------------------------------------------
+  vtpStep(3)
   imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
   imgci\imageType = #VK_IMAGE_TYPE_2D
   imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
@@ -603,6 +707,7 @@ Procedure.i Main()
   ;     declares one attribute over the same stride and simply never
   ;     fetches the colour.
   ; ------------------------------------------------------------------
+  vtpStep(4)
   bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
   bufci\size = 3 * #VTP_STRIDE
   bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
@@ -645,6 +750,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  5. Four shader modules, two layouts, two pipelines.
   ; ------------------------------------------------------------------
+  vtpStep(5)
   bytesA = vtpBuildVsA()
   bytesB = vtpBuildFsA()
   bytesC = vtpBuildVsB()
@@ -799,6 +905,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  6. PASS ONE: the uniform-colour triangle.
   ; ------------------------------------------------------------------
+  vtpStep(6)
   PokeL(@vtpClear[0] + 0, #VTP_CLEAR_R)
   PokeL(@vtpClear[0] + 4, #VTP_CLEAR_G)
   PokeL(@vtpClear[0] + 8, #VTP_CLEAR_B)
@@ -883,6 +990,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  7. PASS TWO: the per-vertex-colour triangle, over the same image.
   ; ------------------------------------------------------------------
+  vtpStep(7)
   vkResetFences(dev, 1, @fenceArray)
   vkResetCommandBuffer(cmd, 0)
   If vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS
@@ -915,12 +1023,12 @@ Procedure.i Main()
           vtpPut(#VTP_S_P2_OUT2, vtpPixel(imgBase, pitch, #VTP_OUT2X, #VTP_OUT2Y))
           badIn = 0
           badOut = 0
-          If vtpReport[#VTP_S_P2_IN0] <> #VTP_GREEN_WORD : badIn = badIn + 1 : EndIf
-          If vtpReport[#VTP_S_P2_IN1] <> #VTP_GREEN_WORD : badIn = badIn + 1 : EndIf
-          If vtpReport[#VTP_S_P2_IN2] <> #VTP_GREEN_WORD : badIn = badIn + 1 : EndIf
-          If vtpReport[#VTP_S_P2_OUT0] <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
-          If vtpReport[#VTP_S_P2_OUT1] <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
-          If vtpReport[#VTP_S_P2_OUT2] <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
+          If vtpGet(#VTP_S_P2_IN0) <> #VTP_GREEN_WORD : badIn = badIn + 1 : EndIf
+          If vtpGet(#VTP_S_P2_IN1) <> #VTP_GREEN_WORD : badIn = badIn + 1 : EndIf
+          If vtpGet(#VTP_S_P2_IN2) <> #VTP_GREEN_WORD : badIn = badIn + 1 : EndIf
+          If vtpGet(#VTP_S_P2_OUT0) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
+          If vtpGet(#VTP_S_P2_OUT1) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
+          If vtpGet(#VTP_S_P2_OUT2) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
           If badIn <> 0
             vtpPut(#VTP_S_STATUS2, #VTP_ERR_PIXELS_IN)
           ElseIf badOut <> 0
@@ -948,6 +1056,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  8. Present what is on the image now - the second triangle.
   ; ------------------------------------------------------------------
+  vtpStep(8)
   rc = DisplayAdopt(#VTP_DSI_SCAN, #VTP_PANEL_PITCH, #VTP_PANEL_W, #VTP_PANEL_H, 32)
   vtpPut(#VTP_S_DISPLAY_ERR, DisplayLastError())
   If rc = #DSP_OK
@@ -962,6 +1071,7 @@ Procedure.i Main()
   ; ------------------------------------------------------------------
   ;  9. Ordered teardown, then hand the V3D MMU back.
   ; ------------------------------------------------------------------
+  vtpStep(9)
   vkDeviceWaitIdle(dev)
   vkDestroyFence(dev, fence, 0)
   vkDestroyPipeline(dev, pipeA, 0)
@@ -990,30 +1100,31 @@ Procedure.i Main()
   ;      way to be wrong, and they are checked in the order that makes
   ;      the earliest real cause the one reported.
   ; ------------------------------------------------------------------
-  If vtpReport[#VTP_S_BIN_AFTER] <= vtpReport[#VTP_S_BIN_BEFORE] Or vtpReport[#VTP_S_RENDER_AFTER] <= vtpReport[#VTP_S_RENDER_BEFORE]
+  vtpStep(10)
+  If vtpGet(#VTP_S_BIN_AFTER) <= vtpGet(#VTP_S_BIN_BEFORE) Or vtpGet(#VTP_S_RENDER_AFTER) <= vtpGet(#VTP_S_RENDER_BEFORE)
     ProcedureReturn vtpStop(#VTP_ERR_NO_JOBS)
   EndIf
-  If vtpReport[#VTP_S_BIN_OOM] <> 0 Or vtpReport[#VTP_S_MMU_FAULTS] <> 0
+  If vtpGet(#VTP_S_BIN_OOM) <> 0 Or vtpGet(#VTP_S_MMU_FAULTS) <> 0
     ProcedureReturn vtpStop(#VTP_ERR_V3D_FAULT)
   EndIf
-  If vtpReport[#VTP_S_GUARD_AFTER] <> vtpReport[#VTP_S_GUARD_BEFORE]
+  If vtpGet(#VTP_S_GUARD_AFTER) <> vtpGet(#VTP_S_GUARD_BEFORE)
     ProcedureReturn vtpStop(#VTP_ERR_GUARD_CHANGED)
   EndIf
   badIn = 0
   badOut = 0
-  If vtpReport[#VTP_S_P1_IN0] <> #VTP_RED_WORD : badIn = badIn + 1 : EndIf
-  If vtpReport[#VTP_S_P1_IN1] <> #VTP_RED_WORD : badIn = badIn + 1 : EndIf
-  If vtpReport[#VTP_S_P1_IN2] <> #VTP_RED_WORD : badIn = badIn + 1 : EndIf
-  If vtpReport[#VTP_S_P1_OUT0] <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
-  If vtpReport[#VTP_S_P1_OUT1] <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
-  If vtpReport[#VTP_S_P1_OUT2] <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
+  If vtpGet(#VTP_S_P1_IN0) <> #VTP_RED_WORD : badIn = badIn + 1 : EndIf
+  If vtpGet(#VTP_S_P1_IN1) <> #VTP_RED_WORD : badIn = badIn + 1 : EndIf
+  If vtpGet(#VTP_S_P1_IN2) <> #VTP_RED_WORD : badIn = badIn + 1 : EndIf
+  If vtpGet(#VTP_S_P1_OUT0) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
+  If vtpGet(#VTP_S_P1_OUT1) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
+  If vtpGet(#VTP_S_P1_OUT2) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
   If badIn <> 0
     ProcedureReturn vtpStop(#VTP_ERR_PIXELS_IN)
   EndIf
   If badOut <> 0
     ProcedureReturn vtpStop(#VTP_ERR_PIXELS_OUT)
   EndIf
-  If vtpReport[#VTP_S_LAYOUT_AFTER] <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  If vtpGet(#VTP_S_LAYOUT_AFTER) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
     ProcedureReturn vtpStop(#VTP_ERR_FENCE)
   EndIf
   ProcedureReturn vtpStop(#VTP_OK)

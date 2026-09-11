@@ -81,7 +81,12 @@
 ;    slot, releases a core, or touches the monitor, its variables, the
 ;    DSI control registers, the GENET ring or the driver-module region.
 ;
-;  x0 comes back as the address of a 64-word block; `memory <that> 64`.
+;  x0 comes back as the address of a 64-word block; `md.l <that> 200` - the block is sixty-four 64-BIT
+;  slots, the monitor's dump has no 64-bit width and counts BYTES, so
+;  slot N appears at WORD 2N with a zero word beside it and $200 hex is
+;  the 512 bytes it occupies. Reading it as one word per slot is how a
+;  later run of vulkanTriangleProof.pi4 was misread; that diagnostic's
+;  report is 32 bits wide for exactly this reason.
 ;  Slot 0 is the magic $564B4352 ("VKCR") and slot 1 the overall verdict.
 ;  Slots 2..15 are one status word per rule: 1 means it answered as
 ;  required, 0 means it did not.
