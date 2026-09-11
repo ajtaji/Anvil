@@ -172,7 +172,7 @@ EndProcedure
 ;
 ;  THE BOARD SAYS WHICH BOARD IT IS (forum 575). Every fact below that
 ;  names a computer - the product name, the processor, the exception
-;  level, the pmfc target word, the kind of image - comes from the HwId*
+;  level, the compiler's target word, the kind of image - comes from the HwId*
 ;  seam the board supplies (Anvil/Hal/hal.pbi). Not one of them is a
 ;  literal in this file any more. It used to say "the Raspberry Pi 4
 ;  serial monitor" and "for target pi4" as prose, so the second board
@@ -193,7 +193,7 @@ EndProcedure
 ;  produced, so a board that had just been flashed and a board that had
 ;  not looked identical from the prompt, and the only way to be sure was
 ;  to hash the image against the host file. #ANVIL_BUILD is raised by one
-;  by every successful build in the IDE (and by `pmfc --bump-build`), so
+;  by every successful build, in the editor or on the command line, so
 ;  two images are now different at a glance and the difference is a
 ;  number a person can read out over a phone.
 ;
@@ -514,7 +514,7 @@ Procedure CmdVersion()
   ; and it is the worst line in this command to get wrong - somebody
   ; diagnosing a bad image reads it and goes looking where it points. It
   ; is the board's word, never a literal here.
-  Print("  Built by pmfc for target ")
+  Print("  Built by PureMetal Forge for target ")
   UartWriteStr(HwIdTarget())
   PrintN(".")
   HwIdSayImage()

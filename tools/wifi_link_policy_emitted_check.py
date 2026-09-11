@@ -4,7 +4,7 @@
 The probe extracts the complete production procedure bodies instead of
 maintaining a test copy. Hardware-facing calls are deterministic stubs; the
 compiled AArch64 therefore proves policy/order/state mutations without SDIO.
-Requires PMFC and PMF_A64_INTERP (or --pmfc/--interp).
+Requires PMF_COMPILER and PMF_A64_INTERP (or --compiler/--interp).
 """
 
 from __future__ import annotations
@@ -455,15 +455,15 @@ EndProcedure
     return prelude + "\n" + cyw_bodies + "\n" + wifi_bodies + "\n" + main
 
 
-def build(pmfc: Path, work: Path, probe: Path) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, probe: Path) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards", dirs_exist_ok=True)
     image = work / "wifi_link_policy_gate.img"
     command = [
-        str(staged), str(probe), "-t", "pi4",
+        str(staged), "--compile", str(probe), "-t", "pi4",
         "--load-addr", hex(emitted.LOAD),
         "--stack-addr", hex(emitted.STACK),
         "--entry-returns", "-o", str(image), "-s",
@@ -481,10 +481,10 @@ def build(pmfc: Path, work: Path, probe: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
     boot_source = BOOT.read_text(encoding="utf-8")
@@ -518,7 +518,7 @@ def main() -> int:
         probe = work / "wifi_link_policy_gate.pi4"
         exact_source = probe_source()
         probe.write_text(exact_source, encoding="utf-8", newline="\n")
-        image = build(pmfc, work, probe)
+        image = build(compiler, work, probe)
         result, steps = emitted.execute(a64, image)
         if result == 0:
             ownership = "If WifiRecoveryActive() <> 0 And gWifiRecPhase <> #WIFI_REC_DHCP_WAIT"
@@ -526,7 +526,7 @@ def main() -> int:
                 raise SystemExit("wifi link policy gate: ownership boundary not found for negative control")
             mutated = exact_source.replace(ownership, "If 0 <> 0 And gWifiRecPhase <> #WIFI_REC_DHCP_WAIT", 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            negative_image = build(pmfc, work, probe)
+            negative_image = build(compiler, work, probe)
             negative_result, _ = emitted.execute(a64, negative_image)
             if negative_result != 8:
                 print(f"wifi_link_policy_emitted_check: FAIL negative control returned {negative_result}, expected 8")
@@ -541,7 +541,7 @@ def main() -> int:
                 raise SystemExit("wifi link policy gate: callback-reentry mutation site not found")
             mutated = exact_source.replace(helper, reentrant, 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            negative_image = build(pmfc, work, probe)
+            negative_image = build(compiler, work, probe)
             negative_result, _ = emitted.execute(a64, negative_image)
             if negative_result != 26:
                 print(
@@ -556,7 +556,7 @@ def main() -> int:
                 )
             mutated = exact_source.replace(radio_hook, "    ; radio-init retry hook removed", 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            negative_image = build(pmfc, work, probe)
+            negative_image = build(compiler, work, probe)
             negative_result, _ = emitted.execute(a64, negative_image)
             if negative_result != 19:
                 print(
@@ -569,7 +569,7 @@ def main() -> int:
                 raise SystemExit("wifi link policy gate: settings observer mutation site is not unique")
             mutated = exact_source.replace(observer, "  If 0 <> 0", 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            negative_image = build(pmfc, work, probe)
+            negative_image = build(compiler, work, probe)
             negative_result, _ = emitted.execute(a64, negative_image)
             if negative_result != 31:
                 print(

@@ -131,15 +131,15 @@ EndProcedure
     return prelude + "\n" + bodies + "\n" + main
 
 
-def build(pmfc: Path, work: Path, probe: Path) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, probe: Path) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
     image = work / "netconsole_membership_gate.img"
     command = [
-        str(staged), str(probe), "-t", "pi4",
+        str(staged), "--compile", str(probe), "-t", "pi4",
         "--load-addr", hex(emitted.LOAD),
         "--stack-addr", hex(emitted.STACK),
         "--entry-returns", "-o", str(image), "-s",
@@ -157,17 +157,17 @@ def build(pmfc: Path, work: Path, probe: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-netconsole-membership-emitted-") as temporary:
         work = Path(temporary)
         probe = work / "netconsole_membership_gate.pi4"
         probe.write_text(probe_source(), encoding="utf-8", newline="\n")
-        image = build(pmfc, work, probe)
+        image = build(compiler, work, probe)
         result, steps = emitted.execute(a64, image)
     if result:
         print(f"netconsole_membership_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")

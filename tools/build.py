@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build Anvil targets with an external PureMetal command-line compiler."""
+"""Build Anvil targets with the PureMetal application in command-line mode.
+
+The editor and the compiler are one program: `PureMetalForge.exe --compile`
+builds without opening a window. Point at it with --compiler or PMF_COMPILER.
+"""
 
 from __future__ import annotations
 
@@ -36,27 +40,63 @@ TARGETS = {
 }
 
 
+# The one application is both the editor and the compiler. On Windows it is
+# PureMetalForge.exe; the Linux build of the same sources answers to
+# PureMetalForge.linux, and a plain PureMetalForge is what an installed copy
+# is often called. All three are the same program.
+COMPILER_NAMES = ("PureMetalForge.exe", "PureMetalForge.linux", "PureMetalForge")
+
+# THE RETIRED CONSOLE COMPILER. Ruled 2026-09-11: "the standard ide now
+# replaces pmfc. no more using pmfc." It is gone from the toolchain, and the
+# reason to REFUSE it by name rather than quietly run it is that an old binary
+# left on a bench still compiles - it just compiles with a frontend nobody is
+# fixing any more, and every result made with it would read as evidence about
+# the compiler that ships. A stale path in a script or an environment variable
+# is exactly how that happens, so the path says so out loud.
+RETIRED_COMPILER_STEMS = ("pmfc",)
+
+
+def refuse_retired(path: Path) -> None:
+    stem = path.stem.lower()
+    if any(stem == retired or stem.startswith(retired + "_") or
+           stem.startswith(retired + ".") for retired in RETIRED_COMPILER_STEMS):
+        raise SystemExit(
+            f"{path} is the retired console compiler. It was replaced on "
+            "2026-09-11 by the one application, which compiles from the "
+            "command line: pass --compiler <PureMetalForge.exe> or set "
+            "PMF_COMPILER to it. Anvil does not build with pmfc any more, and "
+            "an image built with it is not evidence about the compiler that "
+            "ships."
+        )
+
+
 def find_compiler(explicit: str | None) -> str:
-    requested = explicit or os.environ.get("PMFC")
+    """Resolve the one PureMetal application that also compiles."""
+    requested = explicit or os.environ.get("PMF_COMPILER")
     if requested:
         candidate = Path(requested).expanduser()
         if candidate.is_file():
-            return str(candidate.resolve())
+            resolved_path = candidate.resolve()
+            refuse_retired(resolved_path)
+            return str(resolved_path)
         resolved = shutil.which(requested)
         if resolved:
+            refuse_retired(Path(resolved))
             return resolved
         raise SystemExit(
             f"The requested PureMetal compiler was not found: {requested}. "
-            "Check --pmfc or PMFC."
+            "Check --compiler or PMF_COMPILER."
         )
 
-    for name in ("pmfc", "pmfc.exe"):
+    for name in COMPILER_NAMES:
         resolved = shutil.which(name)
         if resolved:
             return resolved
     raise SystemExit(
-        "PureMetal compiler not found. Put pmfc on PATH, set PMFC, or pass "
-        "--pmfc /path/to/pmfc."
+        "PureMetal compiler not found. Put PureMetalForge on PATH, set "
+        "PMF_COMPILER, or pass --compiler /path/to/PureMetalForge.exe. The "
+        "same application is the IDE and the command-line compiler; --compile "
+        "selects the build."
     )
 
 
@@ -71,7 +111,7 @@ def build(compiler: str, target: str) -> None:
     build.
 
     ONE MECHANISM, AND IT IS tools/build_count.py. This tool used to pass
-    `pmfc --bump-build` and let the compiler raise the marker in the file
+    the compiler's own `--bump-build` and let it raise the marker in the file
     it had been handed. That counted the builds made this way and missed
     every build made any other way: a gate compiles the whole monitor from
     a temporary copy, so the compiler's bump landed on a file in a
@@ -98,7 +138,7 @@ def build(compiler: str, target: str) -> None:
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
     command = [
-        compiler,
+        compiler, "--compile",
         spec["source"].as_posix(),
         "-t",
         spec.get("target", target),
@@ -146,14 +186,17 @@ def staged_compiler(compiler: str, directory: Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("all", *TARGETS), nargs="?", default="all")
-    parser.add_argument("--pmfc", help="path or command name for the external compiler")
+    parser.add_argument("--compiler",
+                        default=os.environ.get("PMF_COMPILER"),
+                        help="path or command name of PureMetalForge (or set "
+                             "PMF_COMPILER); it is run with --compile")
     args = parser.parse_args()
 
-    compiler = find_compiler(args.pmfc)
+    compiler = find_compiler(args.compiler)
     # Experimental boot firmware is an explicit build, never an implicit
     # part of the ordinary monitor pair. Building does not install it.
     selected = ("pi4", "unoq") if args.target == "all" else (args.target,)
-    with tempfile.TemporaryDirectory(prefix="anvil-pmfc-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="anvil-compiler-") as temporary:
         isolated_compiler = staged_compiler(compiler, Path(temporary))
         for target in selected:
             build(isolated_compiler, target)

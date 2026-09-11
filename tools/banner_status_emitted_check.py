@@ -18,7 +18,7 @@ one at a time, and requires the gate to go red for each; and it makes the
 same demand of the source-level statements about where the sample is
 taken, which are what keeps the caption out of the seam.
 
-  PMFC=<pmfc.exe> PMF_A64_INTERP=<a64_interp.py> \
+  PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
       py -3 tools/banner_status_emitted_check.py
 """
 
@@ -305,7 +305,7 @@ def stage(work: pathlib.Path, status_text: str, hal_text: str, gate_text: str) -
 def build(compiler: pathlib.Path, work: pathlib.Path, source: pathlib.Path) -> bytes:
     image = work / "banner_status_gate.img"
     command = [
-        str(compiler), source.relative_to(work).as_posix(),
+        str(compiler), "--compile", source.relative_to(work).as_posix(),
         "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -409,12 +409,12 @@ def run_once(a64, compiler, status_text, hal_text, gate_text, work_root, tag):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pmfc")
+    parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--no-mutate", action="store_true")
     args = parser.parse_args()
 
-    compiler = locate("PMFC", args.pmfc, [ROOT / "pmfc.exe", ROOT / "pmfc"])
+    compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))
 

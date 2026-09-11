@@ -24,7 +24,7 @@ removing their BSS slots would invalidate this and other existing libraries.
 Run the independent emitted-code check:
 
 ```powershell
-python tools/dma_cache_walk_emitted_check.py --pmfc C:\path\to\pmfc.exe
+python tools/dma_cache_walk_emitted_check.py --compiler C:\path\to\PureMetalForge.exe
 ```
 
 The check extracts the four actual maintenance procedures and compiles both

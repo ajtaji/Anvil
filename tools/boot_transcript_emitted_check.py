@@ -14,13 +14,13 @@ def fixture(core: str) -> str:
         raise SystemExit("boot transcript gate: fixture marker drifted")
     return text.replace(marker, core)
 
-def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
-    staged = work / pmfc.name
-    if not staged.exists(): shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
+    staged = work / compiler.name
+    if not staged.exists(): shutil.copy2(compiler, staged)
     if (ROOT / "Boards").is_dir() and not (work / "Boards").exists(): shutil.copytree(ROOT / "Boards", work / "Boards")
     src = work / f"{stem}.pi4"; src.write_text(text, encoding="utf-8", newline="\n")
     image = work / f"{stem}.img"
-    run = subprocess.run([str(staged), str(src), "-t", "pi4", "--load-addr", hex(emitted.LOAD), "--stack-addr", hex(emitted.STACK), "--entry-returns", "-o", str(image), "-s"], cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)}, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    run = subprocess.run([str(staged), "--compile", str(src), "-t", "pi4", "--load-addr", hex(emitted.LOAD), "--stack-addr", hex(emitted.STACK), "--entry-returns", "-o", str(image), "-s"], cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)}, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if run.returncode or "pmfc: OK" not in run.stdout:
         raise SystemExit(f"boot transcript gate: {stem} compile failed\n{run.stdout}")
     return image
@@ -30,8 +30,8 @@ def mutate_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 def main() -> int:
-    p=argparse.ArgumentParser(); p.add_argument("--pmfc",default=os.environ.get("PMFC")); p.add_argument("--interp",default=os.environ.get("PMF_A64_INTERP")); a=p.parse_args()
-    pmfc=emitted.required_path(a.pmfc,"PMFC"); interp=emitted.required_path(a.interp,"PMF_A64_INTERP"); a64=emitted.load_interpreter(interp)
+    p=argparse.ArgumentParser(); p.add_argument("--compiler",default=os.environ.get("PMF_COMPILER")); p.add_argument("--interp",default=os.environ.get("PMF_A64_INTERP")); a=p.parse_args()
+    compiler=emitted.required_path(a.compiler,"PMF_COMPILER"); interp=emitted.required_path(a.interp,"PMF_A64_INTERP"); a64=emitted.load_interpreter(interp)
     core=CORE.read_text(encoding="utf-8")
     mutations=(
         ("missing store", "  gBootTranscript[gBootTranscriptCount] = c & $FF", "  ; store removed"),
@@ -41,11 +41,11 @@ def main() -> int:
         ("start keeps the previous epoch's overflow", "  gBootTranscriptLost = 0\n  gBootTranscriptActive = 0", "  gBootTranscriptActive = 0"),
     )
     with tempfile.TemporaryDirectory(prefix="anvil-boot-transcript-") as td:
-        work=Path(td); result,steps=emitted.execute(a64,build(pmfc,work,fixture(core),"boot_transcript_gate"))
+        work=Path(td); result,steps=emitted.execute(a64,build(compiler,work,fixture(core),"boot_transcript_gate"))
         if result: print(f"boot_transcript_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions"); return 1
         killed=[]
         for i,(label,old,new) in enumerate(mutations,1):
-            mutant=mutate_once(core,old,new,label); r,used=emitted.execute(a64,build(pmfc,work,fixture(mutant),f"boot_transcript_mutant_{i}"))
+            mutant=mutate_once(core,old,new,label); r,used=emitted.execute(a64,build(compiler,work,fixture(mutant),f"boot_transcript_mutant_{i}"))
             if r==0: print(f"boot_transcript_emitted_check: FAIL {label} mutant survived"); return 1
             killed.append(f"{label}:{r}")
     print(f"boot_transcript_emitted_check: PASS - 18 assertions, {steps:,} A64 instructions; 5 mutants rejected ({', '.join(killed)})")

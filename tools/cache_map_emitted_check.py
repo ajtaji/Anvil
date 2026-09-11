@@ -118,10 +118,10 @@ def replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
-def build(pmfc: Path, work: Path, name: str, source: str):
+def build(compiler: Path, work: Path, name: str, source: str):
     src, image = work / (name + ".pi4"), work / (name + ".img")
     src.write_text(fixture(source), encoding="utf-8")
-    run = subprocess.run([str(pmfc), str(src), "-t", "pi4", "-s", "--entry-returns",
+    run = subprocess.run([str(compiler), "--compile", str(src), "-t", "pi4", "-s", "--entry-returns",
                           "--load-addr", hex(LOAD), "--bss-addr", hex(BSS),
                           "--stack-addr", hex(STACK), "-o", str(image)],
                          cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -225,21 +225,21 @@ def check_product(a64, product):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", type=Path, default=ROOT / "tools/a64/a64_interp.py")
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     a64 = emitted.load_interpreter(args.interp)
     source = CACHE.read_text(encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="anvil-cache-map-") as temp:
         work = Path(temp)
         compiler_dir = work / "compiler"
         compiler_dir.mkdir()
-        staged_pmfc = Path(anvil_build.staged_compiler(str(pmfc), compiler_dir))
-        count, steps = check_product(a64, build(staged_pmfc, work, "fixed", source))
+        staged = Path(anvil_build.staged_compiler(str(compiler), compiler_dir))
+        count, steps = check_product(a64, build(staged, work, "fixed", source))
         mutant = replace_once(source, "  MmuAddNc(#MON_FB_LO, #MON_FB_HI + 1)\n",
                               "  MmuAddNc(#MON_FB_SCAN, #MON_FB_SCAN + #MON_FB_BYTES)\n")
-        mutant_product = build(staged_pmfc, work, "missing_dsi_window", mutant)
+        mutant_product = build(staged, work, "missing_dsi_window", mutant)
         try:
             check_product(a64, mutant_product)
         except DescriptorMismatch:

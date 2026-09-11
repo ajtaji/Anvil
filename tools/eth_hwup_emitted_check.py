@@ -608,7 +608,7 @@ def main() -> int:
     if not __debug__:
         raise SystemExit("This acceptance gate must not run with Python assertion optimization.")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc")
+    parser.add_argument("--compiler")
     parser.add_argument("--image", type=Path,
                         help="full Pi monitor image with its exact .sym sidecar")
     parser.add_argument("--image-sha256")
@@ -622,7 +622,7 @@ def main() -> int:
     else:
         with tempfile.TemporaryDirectory(prefix="anvil-eth-hwup-") as name:
             image = emitted.build(
-                emitted.anvil_build.find_compiler(args.pmfc), Path(name))
+                emitted.anvil_build.find_compiler(args.compiler), Path(name))
             check(a64, image)
     return 0
 

@@ -64,7 +64,7 @@ def validate_order(text: str) -> None:
         raise AssertionError("boot arm/trace/screen order changed")
 
 
-def build(pmfc: Path, work: Path, text: str, feature: int):
+def build(compiler: Path, work: Path, text: str, feature: int):
     fixture = (f"EnableExplicit\n#ANVIL_V3D_CONSOLE={feature}\n#SCR_SRC_NONE=0\n#SCR_SRC_HDMI=1\n#SCR_SRC_DSI=2\n"
                "Global gScrSrc.i\nGlobal cacheCalls.i\n"
                "Global gScreenDsiEarlyCacheArm.i\n"
@@ -76,7 +76,7 @@ def build(pmfc: Path, work: Path, text: str, feature: int):
                "Procedure.i Main()\n ProcedureReturn Probe(#SCR_SRC_DSI,1)\nEndProcedure\n")
     src, image = work / f"early{feature}.pi4", work / f"early{feature}.img"
     src.write_text(fixture, encoding="utf-8")
-    run = subprocess.run([str(pmfc), str(src), "-t", "pi4", "-s", "--entry-returns",
+    run = subprocess.run([str(compiler), "--compile", str(src), "-t", "pi4", "-s", "--entry-returns",
                           "--load-addr", hex(LOAD), "--bss-addr", hex(BSS),
                           "--stack-addr", hex(STACK), "-o", str(image)], cwd=ROOT,
                          capture_output=True, text=True, timeout=120)
@@ -88,7 +88,7 @@ def build(pmfc: Path, work: Path, text: str, feature: int):
     # gate's reading of its own fixture. If this gate ever compiles a board file
     # instead, the count follows it with nothing to remember.
     build_count.record_build(src, "pi4", image,
-                             by="tools/screen_early_cache_check.py", compiler=pmfc)
+                             by="tools/screen_early_cache_check.py", compiler=compiler)
     entries = {}
     for line in Path(str(image) + ".dbg").read_text(encoding="utf-8-sig").splitlines():
         fields = line.split("|")
@@ -111,15 +111,15 @@ def execute(a64, product, src: int, armed: int) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     ap.add_argument("--interp", type=Path, default=ROOT / "tools/a64/a64_interp.py")
     args = ap.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     a64 = emitted.load_interpreter(args.interp)
     text = SOURCE.read_text(encoding="utf-8")
     validate_order(text)
     with tempfile.TemporaryDirectory(prefix="anvil-screen-early-cache-") as td:
-        products = [build(pmfc, Path(td), text, feature) for feature in (0, 1)]
+        products = [build(compiler, Path(td), text, feature) for feature in (0, 1)]
         results = [[execute(a64, product, src, armed)
                     for armed in (0, 1) for src in (0, 1, 2)] for product in products]
     if results != [[0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 1]]:

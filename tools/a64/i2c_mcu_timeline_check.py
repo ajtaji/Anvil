@@ -48,15 +48,15 @@ def read_u32(cpu, addr):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pmfc", default=os.environ.get("PMFC"),
-                    help="path to external PureMetal compiler (or set PMFC)")
+    ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
+                    help="path to external PureMetal compiler (or set PMF_COMPILER)")
     args = ap.parse_args()
-    if not args.pmfc:
-        raise SystemExit("i2c MCU timeline gate: pass --pmfc or set PMFC")
-    touch.PMFC = pathlib.Path(args.pmfc).expanduser().resolve()
-    if not touch.PMFC.is_file():
+    if not args.compiler:
+        raise SystemExit("i2c MCU timeline gate: pass --compiler or set PMF_COMPILER")
+    touch.PMF_COMPILER = pathlib.Path(args.compiler).expanduser().resolve()
+    if not touch.PMF_COMPILER.is_file():
         raise SystemExit("i2c MCU timeline gate: compiler not found: %s"
-                         % touch.PMFC)
+                         % touch.PMF_COMPILER)
 
     WORK.mkdir(parents=True, exist_ok=True)
     img = WORK / "i2c_mcu_timeline.img"

@@ -329,7 +329,7 @@
 ;
 ;  PROVEN, by known-answer test - the only kind of test that counts for
 ;  a hash - under the project's own A64 oracle, tools/a64/a64_interp.py,
-;  running a real image built by pmfc.exe for -t pi4 at $200000:
+;  running a real image built for -t pi4 at $200000:
 ;
 ;    * FIPS 180-4: the empty message, "abc", and the 56-byte
 ;      "abcdbcdecdef..." multi-block message.

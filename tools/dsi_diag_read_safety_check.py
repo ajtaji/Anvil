@@ -194,14 +194,14 @@ def put64(memory: dict[int, int], address: int, value: int) -> None:
         memory[address + byte] = (value >> (byte * 8)) & 0xFF
 
 
-def build(pmfc: str, work: Path) -> Path:
+def build(compiler: str, work: Path) -> Path:
     compiler_dir = work / "compiler"
     compiler_dir.mkdir(parents=True)
-    compiler = anvil_build.staged_compiler(pmfc, compiler_dir)
+    staged = anvil_build.staged_compiler(compiler, compiler_dir)
     image = work / "dsi-diag.img"
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
-    command = [compiler, BOARD.relative_to(ROOT).as_posix(), "-t", "pi4",
+    command = [staged, "--compile", BOARD.relative_to(ROOT).as_posix(), "-t", "pi4",
                "-S", "-s", "-o", str(image)]
     result = subprocess.run(command, cwd=ROOT, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -341,7 +341,7 @@ def emitted_checks(c: Checks, a64, image: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP")
                         or str(INTERP))
     args = parser.parse_args()
@@ -351,10 +351,10 @@ def main() -> int:
         source_checks(checks, text)
         mutation_checks(checks, text)
         model_checks(checks)
-        pmfc = anvil_build.find_compiler(args.pmfc)
+        compiler = anvil_build.find_compiler(args.compiler)
         interpreter = load_interpreter(Path(args.interp).resolve())
         with tempfile.TemporaryDirectory(prefix="anvil-dsi-diag-") as name:
-            emitted_checks(checks, interpreter, build(pmfc, Path(name)))
+            emitted_checks(checks, interpreter, build(compiler, Path(name)))
     except (AssertionError, OSError, RuntimeError,
             subprocess.SubprocessError) as error:
         print(f"dsi_diag_read_safety_check: FAIL after {checks.count} checks: {error}")

@@ -56,7 +56,10 @@ def fixture(source: str) -> str:
         raise AssertionError("real BCM2711 cache-line contract is not exactly 64 bytes")
     parts = [proc(source, name) for name in
              ("DmaCacheLine", "DmaCacheLines", "DmaCacheRange", "DmaCacheRect")]
-    return ("EnableExplicit\n" + constants[0] + "\nGlobal dma_flushaddr.i\n" +
+    # The walk's bounds are file-scope in the real library, not the walk's own
+    # locals: automatic storage has no address inline assembly can name.
+    return ("EnableExplicit\n" + constants[0] +
+            "\nGlobal dma_flushaddr.i\nGlobal dma_walklo.i\nGlobal dma_walkhi.i\n" +
             "\n\n".join(parts) + """
 Procedure.i Main()
   DmaCacheRange($100000, 64)
@@ -66,11 +69,11 @@ EndProcedure
 """)
 
 
-def build(pmfc: Path, work: Path, name: str, text: str):
+def build(compiler: Path, work: Path, name: str, text: str):
     source, image = work / (name + ".pi4"), work / (name + ".img")
     source.write_text(text, encoding="utf-8")
     result = subprocess.run([
-        str(pmfc), str(source), "-t", "pi4", "-s", "--entry-returns",
+        str(compiler), "--compile", str(source), "-t", "pi4", "-s", "--entry-returns",
         "--load-addr", hex(LOAD), "--bss-addr", hex(BSS),
         "--stack-addr", hex(STACK), "-o", str(image),
     ], cwd=ROOT, capture_output=True, text=True, timeout=120)
@@ -224,9 +227,9 @@ def main():
     if not __debug__:
         raise SystemExit("refusing -O: guard checks require assertions")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     a64 = emitted.load_interpreter(ROOT / "tools/a64/a64_interp.py")
     source = SOURCE.read_text(encoding="utf-8")
     fixed = proc(source, "DmaCacheLines")
@@ -235,7 +238,7 @@ def main():
     matrix = cases()
     with tempfile.TemporaryDirectory(prefix="anvil-dma-cache-walk-") as name:
         work = Path(name)
-        products = [build(pmfc, work, "legacy", legacy), build(pmfc, work, "candidate", candidate)]
+        products = [build(compiler, work, "legacy", legacy), build(compiler, work, "candidate", candidate)]
         totals = []
         for product in products:
             total = 0
@@ -262,7 +265,7 @@ def main():
         for label, old, new in mutations:
             # Narrow loads target the loop's unique spelling, not DmaCacheLine.
             mutated = replace_once(candidate, old, new)
-            product = build(pmfc, work, "mutant_" + label.replace(" ", "_"), mutated)
+            product = build(compiler, work, "mutant_" + label.replace(" ", "_"), mutated)
             caught = False
             for entry, arguments, expected in matrix:
                 try:

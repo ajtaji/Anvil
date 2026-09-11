@@ -13,7 +13,7 @@ pixels, so the strongest thing this checker does is read the image memory
 itself and require that every poisoned word survived - if any CPU clear
 were hiding in the driver, that check would go red.
 
-  PMFC=<pmfc.exe> PMF_A64_INTERP=<a64_interp.py> \\
+  PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \\
       py -3 tools/vulkan_resource_check.py
 
 Add --mutate to apply a list of plausible mistakes to the driver sources,
@@ -304,7 +304,7 @@ def stage(work: pathlib.Path, sources: dict[str, str]) -> pathlib.Path:
 def build(compiler: pathlib.Path, work: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
     image = work / "vulkan_resource_gate.img"
     command = [
-        str(compiler), source.relative_to(work).as_posix(),
+        str(compiler), "--compile", source.relative_to(work).as_posix(),
         "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -472,12 +472,12 @@ def run_once(a64, compiler, sources: dict[str, str]):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pmfc")
+    parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
     args = parser.parse_args()
 
-    compiler = locate("PMFC", args.pmfc, [ROOT / "pmfc.exe", ROOT / "pmfc"])
+    compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))
 

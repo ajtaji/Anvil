@@ -3,8 +3,8 @@
 and the repeated-start transfer they both needed, executed against a model
 of the bus.
 
-      python tools/a64/touch_emitted_check.py --pmfc C:/path/to/pmfc.exe
-      python tools/a64/touch_emitted_check.py --pmfc C:/path/to/pmfc.exe --mutate
+      python tools/a64/touch_emitted_check.py --compiler C:/path/to/PureMetalForge.exe
+      python tools/a64/touch_emitted_check.py --compiler C:/path/to/PureMetalForge.exe --mutate
 
 WHAT THIS PROVES
 
@@ -75,7 +75,7 @@ from a64_target import TARGETS                        # noqa: E402
 
 print("[gate] tree under test: %s" % ROOT, file=sys.stderr)
 
-PMFC = None
+PMF_COMPILER = None
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "touch_goodix_compile.pi4"
 ABORT_PROBE = (ROOT / "RaspberryPi4" / "Tests" /
                "i2c_abort_resume_probe.pi4")
@@ -845,11 +845,11 @@ def install(cpu, bsc, console):
 
 def build(probe_rel, out, bss_addr=None, load_addr=LOAD, stack_addr=STACK):
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(PMFC), probe_rel, "-t", G["flag"],
+    cmd = [str(PMF_COMPILER), "--compile", probe_rel, "-t", G["flag"],
            "--load-addr", hex(load_addr), "--stack-addr", hex(stack_addr),
            "--entry-returns", "-o", str(out)]
     if bss_addr is not None:
-        cmd[6:6] = ["--bss-addr", hex(bss_addr)]
+        cmd[7:7] = ["--bss-addr", hex(bss_addr)]
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
     r = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
@@ -1927,9 +1927,9 @@ SRC_OF = {"touch": DRV_TOUCH, "panel": DRV_PANEL, "i2c": DRV_I2C}
 
 
 def mutate_one(job):
-    global PMFC
+    global PMF_COMPILER
     idx, which, name, old, new, compiler = job
-    PMFC = pathlib.Path(compiler)
+    PMF_COMPILER = pathlib.Path(compiler)
     d = WORK / "mut" / str(idx)
     d.mkdir(parents=True, exist_ok=True)
 
@@ -2003,7 +2003,7 @@ def mutate_one(job):
 
 def run_mutations():
     from concurrent.futures import ProcessPoolExecutor
-    jobs = [(i, w, n, o, x, str(PMFC))
+    jobs = [(i, w, n, o, x, str(PMF_COMPILER))
             for i, (w, n, o, x) in enumerate(MUTATIONS)]
     workers = max(1, min(len(jobs), (os.cpu_count() or 4) - 2))
     print("negative control: %d mutations across %d workers"
@@ -2041,12 +2041,12 @@ def run_mutations():
 
 
 def main():
-    global PMFC
+    global PMF_COMPILER
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--pmfc", default=os.environ.get("PMFC"),
-        help="path to the external PureMetal compiler (or set PMFC)")
+        "--compiler", default=os.environ.get("PMF_COMPILER"),
+        help="path to the external PureMetal compiler (or set PMF_COMPILER)")
     ap.add_argument("--mutate", action="store_true",
                     help="run the negative control (all cores)")
     ap.add_argument(
@@ -2069,13 +2069,13 @@ def main():
         print("           DLEN/DONE/RXR/RXF advance independently of FIFO reads.")
         return 0
 
-    if args.pmfc:
-        PMFC = pathlib.Path(args.pmfc).expanduser().resolve()
+    if args.compiler:
+        PMF_COMPILER = pathlib.Path(args.compiler).expanduser().resolve()
     else:
-        PMFC = ROOT / "pmfc.exe"
-    if not PMFC.is_file():
+        PMF_COMPILER = ROOT / "PureMetalForge.exe"
+    if not PMF_COMPILER.is_file():
         raise SystemExit(
-            "touch emitted gate: compiler not found; pass --pmfc or set PMFC")
+            "touch emitted gate: compiler not found; pass --compiler or set PMF_COMPILER")
 
     WORK.mkdir(parents=True, exist_ok=True)
     if args.abort_resume_only:

@@ -148,7 +148,7 @@ the firmware property interface.
 Build and install it:
 
 ```text
-pmfc RaspberryPi4/Modules/thermal_avs.pi4 -t pi4 --module -o THERMAL.MOD
+PureMetalForge.exe --compile RaspberryPi4/Modules/thermal_avs.pi4 -t pi4 --module -o THERMAL.MOD
 ```
 
 then copy `THERMAL.MOD` to the root of the boot medium and add a line naming it
@@ -162,7 +162,7 @@ the conversion safe to do with no board attached.
 ## What is proven, and where
 
 `tools/module_pipeline_check.py` compiles the real driver with
-`pmfc --module`, mutates copies of the resulting container into the negative
+`--compile --module`, mutates copies of the resulting container into the negative
 cases, compiles the real Core and Hal sources against a modelled board and
 medium, and runs the emitted A64 in the project's instruction interpreter.
 

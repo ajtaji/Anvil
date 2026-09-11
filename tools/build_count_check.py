@@ -24,10 +24,10 @@ finishes, which is itself checked at the end:
                            compiler that produced it, the source that was
                            compiled, the tool that asked and the compile's own
                            fingerprint.
-  names the compiler       a counted build with no pmfc named is refused. The
+  names the compiler       a counted build with no compiler named is refused. The
                            compiler is rebuilt on this bench while gates are
                            running, so a build number alone is half an
-                           identity; a staged copy of pmfc hashes the same as
+                           identity; a staged copy hashes the same as
                            the original, which is what every gate runs.
   every caller's shape     each place in tools/ that compiles a board file is
                            driven through record_build with the arguments it
@@ -61,7 +61,7 @@ its compiler - each mutation is applied to a copy of build_count.py, and the
 check that owns that property must fail against it. A gate that passes against a
 broken module proves nothing about the working one.
 
-THE END-TO-END COMPILE. With PMFC set, this gate also copies the repository
+THE END-TO-END COMPILE. With PMF_COMPILER set, this gate also copies the repository
 into a temporary directory and runs `tools/build.py pi4` there for real, then
 checks that the temporary copy's board file went up by exactly one and that the
 ledger line carries the sha256 of the image that was actually produced. THAT
@@ -134,8 +134,9 @@ def temp_repo(where: Path) -> Path:
     return root
 
 
-# A STAND-IN FOR pmfc. The ledger records the sha256 of the executable that
-# produced the image, and these fixtures produce no image with a real compiler -
+# A STAND-IN FOR THE COMPILER. The ledger records the sha256 of the executable
+# that produced the image, and these fixtures produce no image with a real
+# compiler -
 # so they name a file whose bytes are known, and the checks below assert the
 # ledger carried that file's digest. What is proven is that the compiler's
 # identity reaches the line, not that this file is a compiler.
@@ -143,7 +144,7 @@ COMPILER_BYTES = b"not a compiler - the fixtures need a file with known bytes"
 
 
 def stand_in_compiler(where: Path) -> Path:
-    path = where / "pmfc.exe"
+    path = where / "PureMetalForge.exe"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.is_file():
         path.write_bytes(COMPILER_BYTES)
@@ -263,7 +264,7 @@ def check_ledger(module, c: Checks, where: Path) -> None:
           "the ledger line does not name the real board file that moved")
     c.yes(field(line, "sha256") == hashlib.sha256(payload).hexdigest(),
           "the ledger line does not carry the sha256 of the image that was produced")
-    c.yes(field(line, "pmfc") == hashlib.sha256(COMPILER_BYTES).hexdigest(),
+    c.yes(field(line, "compiler") == hashlib.sha256(COMPILER_BYTES).hexdigest(),
           "the ledger line does not carry the sha256 of the compiler that made it. "
           "The compiler is rebuilt on this bench while gates run, so a build number "
           "without it is half an identity.")
@@ -444,7 +445,7 @@ def check_counted_once(module, c: Checks, where: Path) -> None:
 def check_compiler_named(module, c: Checks, where: Path) -> None:
     """A counted build names the compiler that made it, or it is refused.
 
-    Which pmfc emitted an image is half of what identifies it, and the compiler
+    Which compiler emitted an image is half of what identifies it, and the compiler
     is rebuilt on this bench while gates are running - it was rebuilt in the
     middle of the first sweep this mechanism ever ran. Writing the line without
     it would record a number and lose what the number is of.
@@ -464,7 +465,7 @@ def check_compiler_named(module, c: Checks, where: Path) -> None:
     c.yes(board.read_bytes() == before, "the refused build moved the number anyway")
     c.yes(ledger_lines(root) == [], "the refused build wrote a ledger line anyway")
 
-    missing = where / "gone" / "pmfc.exe"
+    missing = where / "gone" / "PureMetalForge.exe"
     try:
         module.record_build(board, "pi4", image, by="tools/build.py",
                             compiler=missing, root=root)
@@ -477,7 +478,7 @@ def check_compiler_named(module, c: Checks, where: Path) -> None:
     # The digest is of the BYTES, so a staged copy under another name records
     # the same compiler - which is what every gate actually runs.
     original = stand_in_compiler(where)
-    staged = where / "staged" / "pmfc.exe"
+    staged = where / "staged" / "PureMetalForge.exe"
     staged.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(original, staged)
     first = module.record_build(board, "pi4", image, by="tools/build.py",
@@ -487,7 +488,7 @@ def check_compiler_named(module, c: Checks, where: Path) -> None:
                                  by="tools/build.py", compiler=staged, root=root)
     c.yes(first.counted and second.counted, "a named build did not count")
     lines = ledger_lines(root)
-    c.yes(field(lines[0], "pmfc") == field(lines[1], "pmfc"),
+    c.yes(field(lines[0], "compiler") == field(lines[1], "compiler"),
           "a staged copy of the compiler was recorded as a different compiler")
 
 
@@ -725,7 +726,7 @@ def check_end_to_end(c: Checks, where: Path, compiler: str) -> str:
     board = root / reference.BOARDS["pi4"]
     start = value_of(reference, board)
     completed = subprocess.run(
-        [sys.executable, "tools/build.py", "pi4", "--pmfc", compiler],
+        [sys.executable, "tools/build.py", "pi4", "--compiler", compiler],
         cwd=root, capture_output=True, text=True)
     c.yes(completed.returncode == 0,
           "the end-to-end build failed:\n" + completed.stdout + completed.stderr)
@@ -777,7 +778,7 @@ MUTANTS = (
     ("a malformed marker is ignored", "check_refusals",
      lambda text: text.replace("        if not site.valid:", "        if False:")),
     ("the compiler is left out of the ledger line", "check_ledger",
-     lambda text: text.replace('        f"pmfc={built_by}",' + chr(10), "")),
+     lambda text: text.replace('        f"compiler={built_by}",' + chr(10), "")),
     ("a build may be counted without naming its compiler", "check_compiler_named",
      lambda text: text.replace("    if compiler is None:", "    if False:")),
 )
@@ -809,7 +810,7 @@ CHECKS = (
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--fast", action="store_true",
                         help="skip the real 70-second monitor compile")
     arguments = parser.parse_args()
@@ -849,12 +850,12 @@ def main() -> int:
                     raise AssertionError(f"mutation survived: {label}")
                 checks.count += 1
 
-            if arguments.fast or not arguments.pmfc:
-                end_to_end = ("skipped - pass --pmfc (or set PMFC) without --fast to "
+            if arguments.fast or not arguments.compiler:
+                end_to_end = ("skipped - pass --compiler (or set PMF_COMPILER) without --fast to "
                               "compile the monitor once, on a copy")
             else:
                 compiled_for_real = True
-                end_to_end = check_end_to_end(checks, where / "endtoend", arguments.pmfc)
+                end_to_end = check_end_to_end(checks, where / "endtoend", arguments.compiler)
     except (AssertionError, OSError, subprocess.SubprocessError,
             reference.BuildCountError) as error:
         print(f"build_count_check: FAIL after {checks.count} checks: {error}")

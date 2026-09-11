@@ -721,6 +721,19 @@ Global dma_ybias.i    = 1      ; 0 if YLENGTH is a count, 1 if it is N-1.
                                ; -1 means "unknown, measure it".
 Global dma_burst.i    = 8      ; TI.BURST_LENGTH. See DmaSetBurst().
 Global dma_flushaddr.i = 0     ; the one line DmaCacheLine() maintains
+; The bounds DmaCacheLines()'s walk reads. They are FILE-SCOPE and not the
+; procedure's own locals, and that changed on 2026-09-11 when the compiler
+; stopped giving automatic storage a fixed address: a local now lives in the
+; invocation's frame, so inline assembly naming one as an absolute symbol is
+; refused, and rightly - the name would have meant a different place on every
+; call. The walk still has to see the bounds from assembly, so the bounds
+; move to the layer that can honestly own an address, beside dma_flushaddr,
+; which this file has always carried for exactly the same reason.
+; THEY ARE THIS FILE'S SCRATCH AND HAVE THE SAME ONE-CALLER-AT-A-TIME
+; CONTRACT dma_flushaddr has: the pair is written and consumed inside one
+; call and means nothing between calls.
+Global dma_walklo.i = 0        ; first line of the walk, rounded down
+Global dma_walkhi.i = 0        ; exclusive end of the walk
 Global dma_lastTicks.i = 0     ; CNTPCT_EL0 elapsed over the last wait
 Global dma_lastCs.i   = 0      ; CS as it read at the end of the last wait
 Global dma_lastDebug.i = 0     ; DEBUG likewise
@@ -846,17 +859,24 @@ Procedure DmaCacheLines(addr.i, len.i)
   EndIf
   a = (addr / #DMA_CACHE_LINE) * #DMA_CACHE_LINE
   e = addr + len
+  ; Hand the bounds to the walk through this file's own storage. The walk
+  ; reads them from assembly and an automatic local has no address assembly
+  ; can name - it lives in the frame of one invocation - so the two values
+  ; are written to dma_walklo/dma_walkhi here, one store each, before the
+  ; loop starts.
+  dma_walklo = a
+  dma_walkhi = e
   ; Load the full-width bounds once. The hot loop has no procedure call or
   ; shared scratch store per cache line; maintenance still uses CIVAC and
   ; the public range/rectangle caller still owns its final barrier. These
   ; are positive physical addresses with a non-overflowing exclusive end,
   ; exactly the existing range contract. BCM2711's D-cache line is 64 bytes.
   ASM
-    adrp x9, dmacachelines_a
-    add  x9, x9, #:lo12:dmacachelines_a
+    adrp x9, global_dma_walklo
+    add  x9, x9, #:lo12:global_dma_walklo
     ldr  x9, [x9]
-    adrp x10, dmacachelines_e
-    add  x10, x10, #:lo12:dmacachelines_e
+    adrp x10, global_dma_walkhi
+    add  x10, x10, #:lo12:global_dma_walkhi
     ldr  x10, [x10]
     cmp  x9, x10
     b.ge dmaCacheWalkDone

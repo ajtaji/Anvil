@@ -111,7 +111,7 @@ print all sixteen hexadecimal digits of payload `x0` before resetting.
 Run the focused gate with the same compiler used for the monitor:
 
 ```text
-python tools/payload_lifecycle_check.py --pmfc <path-to-pmfc>
+python tools/payload_lifecycle_check.py --compiler <path-to-PureMetalForge.exe>
 ```
 
 It compiles the real Pi 4 monitor with `-S`, checks the emitted A64 call order,
@@ -132,8 +132,8 @@ Two companion gates execute decoded instructions from the real monitor rather
 than relying on the separate lifecycle state model:
 
 ```text
-python tools/payload_return_emitted_check.py --pmfc <path-to-pmfc>
-python tools/eth_hwup_emitted_check.py --pmfc <path-to-pmfc>
+python tools/payload_return_emitted_check.py --compiler <path-to-PureMetalForge.exe>
+python tools/eth_hwup_emitted_check.py --compiler <path-to-PureMetalForge.exe>
 ```
 
 The return gate executes `RunAt`, `CallAddr` and the Ethernet lifecycle through

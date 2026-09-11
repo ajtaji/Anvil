@@ -954,13 +954,13 @@ EndProcedure
     return prelude + "\n" + eapol_state + "\n" + constants + "\n" + globals_ + "\n" + radio_globals + "\n" + radio_cancel_stub + "\n" + bodies + "\n" + tests
 
 
-def build(pmfc: Path, work: Path, probe: Path) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, probe: Path) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
     image = work / "wifi_recovery_gate.img"
-    command = [str(staged), str(probe), "-t", "pi4",
+    command = [str(staged), "--compile", str(probe), "-t", "pi4",
                "--load-addr", hex(emitted.LOAD), "--stack-addr", hex(emitted.STACK),
                "--entry-returns", "-o", str(image), "-s"]
     env = os.environ.copy()
@@ -974,10 +974,10 @@ def build(pmfc: Path, work: Path, probe: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-wifi-recovery-emitted-") as temporary:
@@ -985,7 +985,7 @@ def main() -> int:
         probe = work / "wifi_recovery_gate.pi4"
         exact_source = probe_source()
         probe.write_text(exact_source, encoding="utf-8", newline="\n")
-        image = build(pmfc, work, probe)
+        image = build(compiler, work, probe)
         result, steps = emitted.execute(a64, image)
         if result == 0:
             helper = procedure(exact_source, "wifi_RecoverSupplicantSendFail")
@@ -996,7 +996,7 @@ def main() -> int:
                 raise SystemExit("wifi recovery gate: cached-PMK owner mutation site not found")
             mutated = exact_source.replace(helper, wrong_owner, 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            mutant_image = build(pmfc, work, probe)
+            mutant_image = build(compiler, work, probe)
             mutant_result, _ = emitted.execute(a64, mutant_image)
             if mutant_result != 82:
                 print(
@@ -1014,7 +1014,7 @@ def main() -> int:
                 raise SystemExit("wifi recovery gate: foreground M2 result mutation site not found")
             mutated = exact_source.replace(handshake, unchecked_m2, 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            mutant_image = build(pmfc, work, probe)
+            mutant_image = build(compiler, work, probe)
             mutant_result, _ = emitted.execute(a64, mutant_image)
             if mutant_result != 84:
                 print(
@@ -1032,7 +1032,7 @@ def main() -> int:
                 raise SystemExit("wifi recovery gate: foreground PMK owner mutation site not found")
             mutated = exact_source.replace(borrower, steals_candidate, 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            mutant_image = build(pmfc, work, probe)
+            mutant_image = build(compiler, work, probe)
             mutant_result, _ = emitted.execute(a64, mutant_image)
             if mutant_result != 101:
                 print(
@@ -1054,7 +1054,7 @@ def main() -> int:
                 raise SystemExit("wifi recovery gate: cache-decode mutation site not found")
             mutated = exact_source.replace(candidate, unchecked_cache, 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            mutant_image = build(pmfc, work, probe)
+            mutant_image = build(compiler, work, probe)
             mutant_result, _ = emitted.execute(a64, mutant_image)
             if mutant_result != 103:
                 print(
@@ -1072,7 +1072,7 @@ def main() -> int:
                 raise SystemExit("wifi recovery gate: steady M2 result mutation site not found")
             mutated = exact_source.replace(service, unchecked_rekey_m2, 1)
             probe.write_text(mutated, encoding="utf-8", newline="\n")
-            mutant_image = build(pmfc, work, probe)
+            mutant_image = build(compiler, work, probe)
             mutant_result, _ = emitted.execute(a64, mutant_image)
             if mutant_result != 86:
                 print(

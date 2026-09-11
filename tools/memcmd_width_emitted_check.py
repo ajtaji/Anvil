@@ -199,15 +199,15 @@ def emitted_checks(c: Checks, asm: str, target: str) -> None:
           f"{target}: DumpMem rereads target bytes outside ReadWidth")
 
 
-def compile_target(pmfc: str, work: Path, target: str,
+def compile_target(compiler: str, work: Path, target: str,
                    source: Path, extra: list[str]) -> str:
     compiler_dir = work / f"compiler-{target}"
     compiler_dir.mkdir(parents=True)
-    compiler = anvil_build.staged_compiler(pmfc, compiler_dir)
+    staged = anvil_build.staged_compiler(compiler, compiler_dir)
     image = work / f"memcmd-{target}.img"
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
-    command = [compiler, source.relative_to(ROOT).as_posix(), "-t", target,
+    command = [staged, "--compile", source.relative_to(ROOT).as_posix(), "-t", target,
                *extra, "-S", "-s", "-o", str(image)]
     result = subprocess.run(command, cwd=ROOT, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -226,7 +226,7 @@ def compile_target(pmfc: str, work: Path, target: str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     args = parser.parse_args()
     checks = Checks()
     try:
@@ -234,7 +234,7 @@ def main() -> int:
         source_checks(checks, text)
         mutation_checks(checks, text)
         model_checks(checks)
-        compiler = anvil_build.find_compiler(args.pmfc)
+        compiler = anvil_build.find_compiler(args.compiler)
         with tempfile.TemporaryDirectory(prefix="anvil-memcmd-width-") as name:
             for target, source, extra in TARGETS:
                 emitted_checks(

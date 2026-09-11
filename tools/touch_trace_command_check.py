@@ -209,7 +209,7 @@ def check(image, a64):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--pmfc')
+    ap.add_argument('--compiler')
     ap.add_argument('--image', type=Path, help='already-built full Pi monitor image and symbol sidecar')
     args = ap.parse_args()
     a64 = emitted.load_interpreter(emitted.INTERP)
@@ -217,7 +217,7 @@ def main():
         check(args.image.resolve(), a64)
     else:
         with tempfile.TemporaryDirectory(prefix='anvil-touch-trace-command-') as td:
-            check(emitted.build(emitted.anvil_build.find_compiler(args.pmfc), Path(td)), a64)
+            check(emitted.build(emitted.anvil_build.find_compiler(args.compiler), Path(td)), a64)
     return 0
 
 

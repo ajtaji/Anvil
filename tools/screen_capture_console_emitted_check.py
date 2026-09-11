@@ -58,7 +58,7 @@ def build(compiler: pathlib.Path) -> pathlib.Path:
     work.mkdir(parents=True, exist_ok=True)
     image = work / "capture_console.img"
     cmd = [
-        str(compiler), PROBE.relative_to(ROOT).as_posix(), "-t", "pi4",
+        str(compiler), "--compile", PROBE.relative_to(ROOT).as_posix(), "-t", "pi4",
         "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -197,7 +197,7 @@ def check(cpu) -> None:
 
 
 def main() -> int:
-    compiler = locate("PMFC", ROOT / "pmfc.exe")
+    compiler = locate("PMF_COMPILER", ROOT / "PureMetalForge.exe")
     interp = locate("PMF_A64_INTERP", ROOT / "tools" / "a64" / "a64_interp.py")
     image = build(compiler)
     cpu, rc, steps = execute(load_interpreter(interp), image)

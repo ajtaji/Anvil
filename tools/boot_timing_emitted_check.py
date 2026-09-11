@@ -11,7 +11,7 @@ fixture, so the address under test is derived the same way the product derives
 it. The cache clean, the architectural counter and the printing leaves are the
 only stubs; every offset, every guard and every refusal is the shipped body.
 
-  PMFC=<pmfc> PMF_A64_INTERP=<a64_interp.py> python tools/boot_timing_emitted_check.py
+  PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> python tools/boot_timing_emitted_check.py
 """
 from __future__ import annotations
 
@@ -62,17 +62,17 @@ def product_source() -> str:
     return text[:cut]
 
 
-def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
-    staged = work / pmfc.name
+def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
+    staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(pmfc, staged)
+        shutil.copy2(compiler, staged)
     if (ROOT / "Boards").is_dir() and not (work / "Boards").exists():
         shutil.copytree(ROOT / "Boards", work / "Boards")
     src = work / f"{stem}.pi4"
     src.write_text(text, encoding="utf-8", newline="\n")
     image = work / f"{stem}.img"
     run = subprocess.run(
-        [str(staged), str(src), "-t", "pi4",
+        [str(staged), "--compile", str(src), "-t", "pi4",
          "--load-addr", hex(emitted.LOAD), "--stack-addr", hex(emitted.STACK),
          "--entry-returns", "-o", str(image), "-s"],
         cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)},
@@ -193,10 +193,10 @@ MUTATIONS = (
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     a64 = emitted.load_interpreter(emitted.required_path(args.interp, "PMF_A64_INTERP"))
 
     window = memmap_constants()
@@ -210,14 +210,14 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="anvil-boot-timing-") as td:
         work = Path(td)
-        result, steps = execute(a64, build(pmfc, work, fixture(product, window), "boot_timing_gate"), lo, hi)
+        result, steps = execute(a64, build(compiler, work, fixture(product, window), "boot_timing_gate"), lo, hi)
         if result:
             print(f"boot_timing_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
             return 1
         killed = []
         for i, (label, old, new) in enumerate(MUTATIONS, 1):
             mutant = mutate(product, old, new, label)
-            r, _ = execute(a64, build(pmfc, work, fixture(mutant, window), f"boot_timing_mutant_{i}"), lo, hi)
+            r, _ = execute(a64, build(compiler, work, fixture(mutant, window), f"boot_timing_mutant_{i}"), lo, hi)
             if r == 0:
                 print(f"boot_timing_emitted_check: FAIL {label} mutant survived")
                 return 1

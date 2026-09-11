@@ -2,7 +2,7 @@
 """Compile and execute the production multi-interface TCP ownership gate.
 
 Requires external tools; neither is copied into the product tree:
-  PMFC=<path-to-pmfc> PMF_A64_INTERP=<path-to-a64_interp.py> \
+  PMF_COMPILER=<path-to-PureMetalForge.exe> PMF_A64_INTERP=<path-to-a64_interp.py> \
       python tools/tcp_multiif_emitted_check.py
 """
 
@@ -60,9 +60,9 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
         raise SystemExit("tcp multi-if gate: compiler symbol map has no BSS bounds") from exc
 
 
-def build(pmfc: Path, work: Path, mutation: str = "") -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, mutation: str = "") -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
@@ -94,7 +94,7 @@ def build(pmfc: Path, work: Path, mutation: str = "") -> Path:
         probe = work / "tcp_multiif_old_wait.pi4"
         probe.write_text(source.replace(include, f'XIncludeFile "{mutated.as_posix()}"'), encoding="utf-8")
     command = [
-        str(staged),
+        str(staged), "--compile",
         str(probe),
         "-t", "pi4",
         "--load-addr", hex(LOAD),
@@ -164,27 +164,27 @@ def execute(a64, image: Path) -> tuple[int, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-tcp-multiif-emitted-") as temporary:
-        image = build(pmfc, Path(temporary))
+        image = build(compiler, Path(temporary))
         result, steps = execute(a64, image)
     if result:
         print(f"tcp_multiif_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     with tempfile.TemporaryDirectory(prefix="anvil-tcp-old-wait-") as temporary:
-        mutant = build(pmfc, Path(temporary), mutation="old_wait")
+        mutant = build(compiler, Path(temporary), mutation="old_wait")
         mutation_result, mutation_steps = execute(a64, mutant)
     if mutation_result != 109:
         print(f"tcp_multiif_emitted_check: FAIL old-wait mutation returned {mutation_result}; expected assertion 109")
         return 1
     for mutation, expected in (("no_close", 115), ("last_ack_only", 162)):
         with tempfile.TemporaryDirectory(prefix=f"anvil-tcp-{mutation}-") as temporary:
-            mutant = build(pmfc, Path(temporary), mutation=mutation)
+            mutant = build(compiler, Path(temporary), mutation=mutation)
             mutation_result, mutation_steps = execute(a64, mutant)
         if mutation_result != expected:
             print(f"tcp_multiif_emitted_check: FAIL {mutation} mutation returned {mutation_result}; expected assertion {expected}")

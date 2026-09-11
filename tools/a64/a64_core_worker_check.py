@@ -583,16 +583,16 @@ def mutation_checks(c: Checks, core: str, mmu: str, memmap: str) -> None:
             c.yes(False, f"mutation survived: {name}")
 
 
-def build(pmfc: str, work: Path, fixture: Path = FIXTURE,
+def build(compiler: str, work: Path, fixture: Path = FIXTURE,
           stem: str = "core_worker", source_root: Path = ROOT,
           load_addr: int = LOAD) -> tuple[Path, str]:
     compiler_dir = work / "compiler"
     compiler_dir.mkdir(parents=True, exist_ok=True)
-    staged = anvil_build.staged_compiler(pmfc, compiler_dir)
+    staged = anvil_build.staged_compiler(compiler, compiler_dir)
     image = work / f"{stem}.img"
     env = os.environ.copy()
     env["PMF_ROOT"] = str(source_root)
-    cmd = [staged, str(fixture.relative_to(source_root)).replace("\\", "/"),
+    cmd = [staged, "--compile", str(fixture.relative_to(source_root)).replace("\\", "/"),
            "-t", "pi4", "--load-addr", hex(load_addr), "--stack-addr", hex(STACK),
            "--entry-returns", "-S", "-s", "-o", str(image)]
     result = subprocess.run(cmd, cwd=source_root, env=env, text=True,
@@ -805,7 +805,7 @@ def main_fixture_check(c: Checks, a64, image: Path,
     raise AssertionError("primary ownership fixture did not return")
 
 
-def build_ownership_mutant(pmfc: str, work: Path, label: str,
+def build_ownership_mutant(compiler: str, work: Path, label: str,
                            owner: str, old: str, new: str,
                            load_addr: int = LOAD) -> tuple[Path, str]:
     root = work / f"ownership-mutant-{label}"
@@ -833,7 +833,7 @@ def build_ownership_mutant(pmfc: str, work: Path, label: str,
         )
     path.write_text(source.replace(old, new, 1), encoding="utf-8", newline="\n")
     return build(
-        pmfc,
+        compiler,
         root / "out",
         root / "RaspberryPi4" / "Tests" / "core_worker_emitted_gate.pi4",
         f"core_worker_{label}",
@@ -847,7 +847,7 @@ def main() -> int:
         print("a64_core_worker_check: FAIL - Python -O disables interpreter assertions")
         return 1
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=str(INTERP))
     args = parser.parse_args()
     checks = Checks()
@@ -858,7 +858,7 @@ def main() -> int:
         source_checks(checks, core, mmu, memmap)
         model_checks(checks)
         mutation_checks(checks, core, mmu, memmap)
-        compiler = anvil_build.find_compiler(args.pmfc)
+        compiler = anvil_build.find_compiler(args.compiler)
         with tempfile.TemporaryDirectory(prefix="anvil-core-worker-") as name:
             work = Path(name)
             image, asm = build(compiler, work / "real")

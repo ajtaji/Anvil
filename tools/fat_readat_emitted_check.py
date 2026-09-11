@@ -333,15 +333,15 @@ EndDataSection
 '''
 
 
-def build(pmfc: Path, work: Path, source: Path, stem: str) -> Path:
-    staged = work / pmfc.name
+def build(compiler: Path, work: Path, source: Path, stem: str) -> Path:
+    staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(pmfc, staged)
+        shutil.copy2(compiler, staged)
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
     image = work / f"{stem}.img"
     command = [
-        str(staged), str(source), "-t", "pi4",
+        str(staged), "--compile", str(source), "-t", "pi4",
         "--load-addr", hex(emitted.LOAD),
         "--stack-addr", hex(emitted.STACK),
         "--entry-returns", "-o", str(image), "-s",
@@ -357,11 +357,11 @@ def build(pmfc: Path, work: Path, source: Path, stem: str) -> Path:
     return image
 
 
-def run_probe(a64, pmfc: Path, work: Path, bodies: str, stem: str) -> tuple[int, int]:
+def run_probe(a64, compiler: Path, work: Path, bodies: str, stem: str) -> tuple[int, int]:
     source = work / f"{stem}.pi4"
     source.write_text(PRELUDE + "\n" + bodies + "\n" + MAIN,
                       encoding="utf-8", newline="\n")
-    return emitted.execute(a64, build(pmfc, work, source, stem))
+    return emitted.execute(a64, build(compiler, work, source, stem))
 
 
 def audit_exclusive_cursor() -> None:
@@ -389,10 +389,10 @@ def audit_exclusive_cursor() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP") or str(LOCAL_INTERP))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
     audit_exclusive_cursor()
@@ -400,7 +400,7 @@ def main() -> int:
     hw = HWFILE.read_text(encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="anvil-fat-readat-emitted-") as temporary:
         work = Path(temporary)
-        result, steps = run_probe(a64, pmfc, work, production_bodies(hw), "fat_readat_gate")
+        result, steps = run_probe(a64, compiler, work, production_bodies(hw), "fat_readat_gate")
 
         mutants = (
             (
@@ -423,7 +423,7 @@ def main() -> int:
         for index, (label, old, new) in enumerate(mutants):
             mutant_hw = replace_once(hw, old, new, label)
             mutant_result, used = run_probe(
-                a64, pmfc, work, production_bodies(mutant_hw), f"fat_readat_mutant_{index}"
+                a64, compiler, work, production_bodies(mutant_hw), f"fat_readat_mutant_{index}"
             )
             mutant_steps += used
             if mutant_result == 0:

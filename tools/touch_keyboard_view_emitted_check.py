@@ -8,7 +8,7 @@ PROPERTIES of the record the image left in DRAM.  Nothing here re-implements
 the layout: the checker does not know how a key rectangle is produced, only
 what has to be true of the set of them.
 
-  PMFC=<pmfc.exe> PMF_A64_INTERP=<a64_interp.py> \
+  PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
       py -3.12 tools/touch_keyboard_view_emitted_check.py
 
 Add --mutate to also apply a list of plausible mistakes to the product
@@ -216,7 +216,7 @@ def stage(work: pathlib.Path, view_text: str, console_text: str) -> pathlib.Path
 def build(compiler: pathlib.Path, work: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
     image = work / "touch_keyboard_view_gate.img"
     command = [
-        str(compiler),
+        str(compiler), "--compile",
         source.relative_to(work).as_posix(),
         "-t", "pi4",
         "--load-addr", hex(LOAD),
@@ -593,14 +593,14 @@ def run_once(a64, compiler, view_text: str, console_text: str, label: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pmfc")
+    parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--geometry", action="store_true",
                         help="print what the layout actually computed, in pixels and in inches")
     args = parser.parse_args()
 
-    compiler = locate("PMFC", args.pmfc, [ROOT / "pmfc.exe", ROOT / "pmfc"])
+    compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp, [ROOT / "tools" / "a64" / "a64_interp.py"]))
 
     view_text = VIEW.read_text(encoding="utf-8")

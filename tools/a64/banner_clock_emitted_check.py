@@ -67,14 +67,14 @@ def pixel(cpu, base: int, rot: int, x: int, y: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP") or str(INTERP))
     args = parser.parse_args()
-    pmfc, a64 = path(args.pmfc, "PMFC"), module(path(args.interp, "PMF_A64_INTERP"))
+    compiler, a64 = path(args.compiler, "PMF_COMPILER"), module(path(args.interp, "PMF_A64_INTERP"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-banner-clock-") as temporary:
         image = pathlib.Path(temporary) / "banner_clock.img"
-        command = [str(pmfc), str(PROBE.relative_to(ROOT)).replace("\\", "/"),
+        command = [str(compiler), "--compile", str(PROBE.relative_to(ROOT)).replace("\\", "/"),
                    "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
                    "--entry-returns", "-o", str(image), "-s"]
         env = os.environ.copy()

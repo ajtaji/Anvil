@@ -141,7 +141,7 @@ that the default was already right.
 ## Validation and limits
 
 ```text
-PMFC=<pmfc> PMF_A64_INTERP=<a64_interp.py> python tools/boot_timing_emitted_check.py
+PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> python tools/boot_timing_emitted_check.py
 ```
 
 It compiles and EXECUTES the shipped bodies on the project's A64 model, with the

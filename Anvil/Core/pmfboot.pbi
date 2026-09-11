@@ -46,7 +46,7 @@
 ;  the operator was being asked to retype it from memory.
 ;
 ; ----------------------------------------------------------------------
-;  THE HEADER, AS EMITTED BY pmfc INTO <image>.pmf
+;  THE HEADER, AS EMITTED BY THE COMPILER INTO <image>.pmf
 ; ----------------------------------------------------------------------
 ;  A .pmf file is the 96-byte header below followed immediately by the
 ;  flat image bytes. Every multi-byte field is LITTLE-ENDIAN, which is
@@ -688,8 +688,8 @@ EndProcedure
 ;  PmfZeroBss() - clear the payload's zero-init region.
 ;
 ;  WHY THE MONITOR DOES THIS AND DOES NOT LEAVE IT TO THE PAYLOAD. Because
-;  a flat image has no loader of its own. On silicon, a payload built by
-;  pmfc reaches _start with its BSS holding whatever the last program left
+;  a flat image has no loader of its own. On silicon, a built payload
+;  reaches _start with its BSS holding whatever the last program left
 ;  in that DRAM, and every uninitialised global reads as that. The one
 ;  thing a container carrying a BSS extent is FOR is that somebody can
 ;  act on it, and the monitor is the only somebody in the room.

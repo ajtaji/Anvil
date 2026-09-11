@@ -4,7 +4,7 @@
 The fixture supplies deterministic hardware seams. Constants, globals and
 procedure bodies are extracted from RaspberryPi4/Lib/wifi.pi4, so ordering and
 cancellation assertions execute the emitted product code rather than a model
-copy. Requires PMFC and PMF_A64_INTERP (or --pmfc/--interp).
+copy. Requires PMF_COMPILER and PMF_A64_INTERP (or --compiler/--interp).
 """
 
 from __future__ import annotations
@@ -133,16 +133,16 @@ def command_probe(source: str) -> str:
     return template.replace(marker, body)
 
 
-def build(pmfc: Path, work: Path, probe: Path, stem: str) -> Path:
-    staged = work / pmfc.name
+def build(compiler: Path, work: Path, probe: Path, stem: str) -> Path:
+    staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(pmfc, staged)
+        shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir() and not (work / "Boards").exists():
         shutil.copytree(boards, work / "Boards")
     image = work / f"{stem}.img"
     command = [
-        str(staged), str(probe), "-t", "pi4",
+        str(staged), "--compile", str(probe), "-t", "pi4",
         "--load-addr", hex(emitted.LOAD),
         "--stack-addr", hex(emitted.STACK),
         "--entry-returns", "-o", str(image), "-s",
@@ -158,10 +158,10 @@ def build(pmfc: Path, work: Path, probe: Path, stem: str) -> Path:
     return image
 
 
-def run_source(a64, pmfc: Path, work: Path, source: str, stem: str) -> tuple[int, int]:
+def run_source(a64, compiler: Path, work: Path, source: str, stem: str) -> tuple[int, int]:
     probe = work / f"{stem}.pi4"
     probe.write_text(source, encoding="utf-8", newline="\n")
-    return emitted.execute(a64, build(pmfc, work, probe, stem))
+    return emitted.execute(a64, build(compiler, work, probe, stem))
 
 
 def mutate_once(source: str, old: str, new: str, label: str) -> str:
@@ -208,10 +208,10 @@ def command_seam_error(source: str) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
 
@@ -423,7 +423,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-wifi-radio-init-emitted-") as temporary:
         work = Path(temporary)
         command_result, command_steps = run_source(
-            a64, pmfc, work, command_exact, "wifi_cmd_ownership_gate"
+            a64, compiler, work, command_exact, "wifi_cmd_ownership_gate"
         )
         if command_result:
             print(
@@ -447,13 +447,13 @@ def main() -> int:
         )
         early_source = command_source.replace(command_body, early_hook_body, 1)
         early_result, early_steps = run_source(
-            a64, pmfc, work, command_probe(early_source), "wifi_cmd_early_hook_mutant"
+            a64, compiler, work, command_probe(early_source), "wifi_cmd_early_hook_mutant"
         )
         if early_result == 0:
             print("wifi_radio_init_emitted_check: FAIL command early-hook mutant survived")
             return 1
 
-        result, steps = run_source(a64, pmfc, work, exact, "wifi_radio_init_gate")
+        result, steps = run_source(a64, compiler, work, exact, "wifi_radio_init_gate")
         if result:
             print(
                 f"wifi_radio_init_emitted_check: FAIL assertion {result} "
@@ -465,7 +465,7 @@ def main() -> int:
         for index, (label, old, new) in enumerate(mutations, 1):
             mutant = mutate_once(exact, old, new, label)
             mutant_result, used = run_source(
-                a64, pmfc, work, mutant, f"wifi_radio_init_mutant_{index}"
+                a64, compiler, work, mutant, f"wifi_radio_init_mutant_{index}"
             )
             mutant_steps += used
             if mutant_result == 0:

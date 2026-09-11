@@ -2,7 +2,7 @@
 """Execute the shared banner identity formatter, without board or MMIO access.
 
 Uses the same guarded image/BSS/stack executor as the packet-state probes.
-Pass --pmfc and --interp, or set PMFC and PMF_A64_INTERP.
+Pass --compiler and --interp, or set PMF_COMPILER and PMF_A64_INTERP.
 """
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ import tcp_multiif_emitted_check as emitted
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    compiler = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interpreter = emitted.load_interpreter(
         emitted.required_path(args.interp, "PMF_A64_INTERP")
     )

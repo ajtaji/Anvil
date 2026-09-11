@@ -58,7 +58,7 @@ succeeded:
 
 ```python
 build_count.record_build(source, target, image,
-                         by="tools/<this tool>.py", compiler=pmfc)
+                         by="tools/<this tool>.py", compiler=compiler)
 ```
 
 It is handed the path that was compiled - the real board file, or a copy of it
@@ -73,7 +73,7 @@ in a temporary directory - and it
 3. honours `off`;
 4. appends one line to the ledger.
 
-**Why not `pmfc --bump-build`.** The compiler's own bumper raises the marker in
+**Why not the compiler's own `--bump-build`.** The compiler's own bumper raises the marker in
 **the file it was handed**. For `tools/build.py` that is the real board file,
 so it worked; for a gate it is a copy in a temporary directory that is deleted
 seconds later, so ten monitor builds a gate run were never counted. That is
@@ -112,19 +112,19 @@ one build. Two real builds that produce identical bytes are still two builds.
 `build/BUILDS.log`, one line per recorded build:
 
 ```
-2026-09-11T21:33:07Z target=pi4 build=57 stamp=20260911-213307 board=RaspberryPi4/Board/board.pi4 source=<compiled path> image=<artifact> sha256=<64 hex> pmfc=<64 hex> by=tools/build.py compile=<16 hex>
+2026-09-11T21:33:07Z target=pi4 build=57 stamp=20260911-213307 board=RaspberryPi4/Board/board.pi4 source=<compiled path> image=<artifact> sha256=<64 hex> compiler=<64 hex> by=tools/build.py compile=<16 hex>
 ```
 
 The leading timestamp is UTC so two workers' lines sort against each other;
 `stamp` is the local date and time written into the board file, which is what
 the board prints. A frozen build carries a trailing `frozen=yes`.
 
-`pmfc=` is the sha256 of the compiler that produced the image, and a counted
+`compiler=` is the sha256 of the compiler that produced the image, and a counted
 build that does not name one is refused. The compiler is rebuilt on this bench
 while gates are running - it was rebuilt in the middle of the first sweep this
 mechanism ever ran - so "build 58 of board.pi4" is only half an identity; the
 other half is which compiler emitted it, and that is not recoverable after the
-fact. A gate stages a copy of `pmfc` beside this repository's board profiles,
+fact. A gate stages a copy of the compiler beside this repository's board profiles,
 and a copy hashes the same as the original, so what is recorded is the compiler
 and not the path it was run from.
 
@@ -178,6 +178,6 @@ file as a path calls `record_build` after its own success guard, nothing asks
 for `--bump-build`, and nothing offers `--no-bump`.
 
 ```sh
-PMFC=<path-to-pmfc> python tools/build_count_check.py        # with the real compile
+PMF_COMPILER=<PureMetalForge.exe> python tools/build_count_check.py   # with the real compile
 python tools/build_count_check.py --fast                     # mechanism and wiring only
 ```

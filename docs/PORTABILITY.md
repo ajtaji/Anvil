@@ -45,7 +45,9 @@ avoids that mismatch without requiring a compiler change.
 
 ## External dependencies
 
-- PureMetal command-line compiler (`pmfc`/`pmfc.exe`), supplied separately.
+- The PureMetal application (`PureMetalForge.exe`, or `PureMetalForge.linux`
+  on Linux) in command-line mode, supplied separately. The editor and the
+  compiler are one program; `--compile` selects a build with no window.
 - Python 3 for the host build and verification scripts (standard library only).
 - UNO Q UEFI wrapping uses `tools/unoq_efi_wrap.py` (standard library only).
 - Emitted AArch64 development gates additionally require the independently

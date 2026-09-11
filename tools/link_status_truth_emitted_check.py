@@ -159,10 +159,10 @@ def mutate(parts: dict[str, str], name: str) -> dict[str, str]:
     raise SystemExit(f"link status truth gate: unknown mutation {name}")
 
 
-def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
-    staged = work / pmfc.name
+def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
+    staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(pmfc, staged)
+        shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir() and not (work / "Boards").exists():
         shutil.copytree(boards, work / "Boards")
@@ -170,7 +170,7 @@ def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
     source.write_text(text, encoding="utf-8", newline="\n")
     image = work / f"{stem}.img"
     command = [
-        str(staged),
+        str(staged), "--compile",
         str(source),
         "-t", "pi4",
         "--load-addr", hex(emitted.LOAD),
@@ -199,10 +199,10 @@ def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
 
@@ -219,7 +219,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="anvil-link-status-truth-") as temporary:
         work = Path(temporary)
-        image = build(pmfc, work, fixture(parts), "link_status_truth_gate")
+        image = build(compiler, work, fixture(parts), "link_status_truth_gate")
         result, steps = emitted.execute(a64, image)
         if result:
             print(
@@ -231,7 +231,7 @@ def main() -> int:
         killed = []
         for name, expected in mutations:
             mutant = fixture(mutate(parts, name))
-            mutant_image = build(pmfc, work, mutant, f"link_status_truth_mutant_{name}")
+            mutant_image = build(compiler, work, mutant, f"link_status_truth_mutant_{name}")
             mutant_result, mutant_steps = emitted.execute(a64, mutant_image)
             if mutant_result != expected:
                 print(

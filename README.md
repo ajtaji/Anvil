@@ -58,14 +58,18 @@ HAL contract.
 
 ## Build
 
-The PureMetal command-line compiler (`pmfc` or `pmfc.exe`) is an external
-dependency and is not included. Python 3 is used by the repository wrapper and
-host checks; those scripts use only the standard library.
+The PureMetal application (`PureMetalForge.exe`, or `PureMetalForge.linux` on
+Linux) is an external dependency and is not included. The editor and the
+compiler are one program: `--compile` builds from the command line with no
+window, and there is no separate console compiler. Python 3 is used by the
+repository wrapper and host checks; those scripts use only the standard
+library.
 
-Put `pmfc` on `PATH`, set the `PMFC` environment variable, or pass it directly:
+Put `PureMetalForge` on `PATH`, set the `PMF_COMPILER` environment variable, or
+pass it directly:
 
 ```sh
-python3 tools/build.py all --pmfc pmfc
+python3 tools/build.py all --compiler /path/to/PureMetalForge.exe
 python3 tools/build.py pi4
 python3 tools/build.py unoq
 ```
@@ -73,7 +77,7 @@ python3 tools/build.py unoq
 On PowerShell, use `python` if that is how Python is installed:
 
 ```powershell
-$env:PMFC = "pmfc.exe"
+$env:PMF_COMPILER = "C:\PureMetal\PureMetalForge.exe"
 python tools/build.py all
 ```
 
@@ -92,9 +96,9 @@ The optional Pi 4 stub has a separate, explicit build using a compiler with
 `--armstub` support:
 
 ```sh
-python3 tools/build.py armstub --pmfc pmfc
-python3 tools/a64/a64_el3_check.py --pmfc /path/to/pmfc
-python3 tools/a64/el3_runtime_emitted_check.py --pmfc /path/to/pmfc
+python3 tools/build.py armstub --compiler /path/to/PureMetalForge.exe
+python3 tools/a64/a64_el3_check.py --compiler /path/to/PureMetalForge.exe
+python3 tools/a64/el3_runtime_emitted_check.py --compiler /path/to/PureMetalForge.exe
 ```
 
 This produces `build/pi4/armstub8.bin`; it is not part of `all` and is **not

@@ -55,14 +55,14 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
         raise SystemExit("cyw43 F2 FIFO gate: compiler symbol map has no BSS bounds") from exc
 
 
-def build(pmfc: Path, work: Path) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
     image = work / "cyw43_f2_fifo_gate.img"
-    command = [str(staged), PROBE.relative_to(ROOT).as_posix(), "-t", "pi4",
+    command = [str(staged), "--compile", PROBE.relative_to(ROOT).as_posix(), "-t", "pi4",
                "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
                "--entry-returns", "-o", str(image), "-s"]
     env = os.environ.copy()
@@ -120,14 +120,14 @@ def execute(a64, image: Path) -> tuple[int, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-cyw43-f2-fifo-") as temporary:
-        image = build(pmfc, Path(temporary))
+        image = build(compiler, Path(temporary))
         result, steps = execute(a64, image)
     if result:
         print(f"cyw43_f2_fifo_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")

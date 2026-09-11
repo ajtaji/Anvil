@@ -95,7 +95,7 @@ contract yet.
 Run:
 
 ```text
-python tools/a64/a64_core_worker_check.py --pmfc <path-to-pmfc>
+python tools/a64/a64_core_worker_check.py --compiler <path-to-PureMetalForge.exe>
 ```
 
 The gate refuses Python `-O`, compiles the real fixture with emitted assembly,

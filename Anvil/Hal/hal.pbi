@@ -777,8 +777,9 @@
 ;                                        short fragment, the same way
 ;                                        HwAddrReason() returns one
 ;                 HwIdCpu()              the core, "Cortex-A72"
-;                 HwIdTarget()           the word that follows `pmfc -t`.
-;                                        This one is a CHECKABLE CLAIM
+;                 HwIdTarget()           the word that follows `-t` on the
+;                                        compiler's command line. This one
+;                                        is a CHECKABLE CLAIM
 ;                                        about how the image was produced,
 ;                                        and the worst line in `version` to
 ;                                        get wrong

@@ -5,6 +5,7 @@ This proves what the diagnostic does, not how the real MCU answers. Faults
 are explicit modeled inputs; no GPIO, firmware, or hardware access is used.
 """
 import argparse
+import os
 import pathlib
 import sys
 import tempfile
@@ -57,9 +58,12 @@ class ReadFaultBus(touch.Bsc):
             # asserting that a correct DLEN=1 controller would receive 12.
             self.rxbuf = bytearray(b'\xA6' * 12)
 
+    # The FIFO read is counted by the base model (one place, unconditional),
+    # and this subclass used to count it a second time on its way past - so
+    # every expectation here was off by a factor of two. Nothing caught it
+    # because the gate could not be run from a sweep at all: it demanded its
+    # compiler as an option and ignored the environment every other gate uses.
     def read32(self, offset):
-        if offset == touch.C['BSC_FIFO_OFF']:
-            self.fifo_reads += 1
         if (offset == touch.C['BSC_S_OFF'] and self.active and self.is_read
                 and not self.abort_pending
                 and self.mode in ('stall', 'one-byte-no-done', 'threshold-no-done')):
@@ -75,10 +79,17 @@ class ReadFaultBus(touch.Bsc):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pmfc', required=True)
+    # Every other gate in this tree takes the compiler from PMF_COMPILER when
+    # the option is absent, so a whole-set sweep sets it once. This one asked
+    # for the option and nothing else, which made it the single gate a sweep
+    # could not run.
+    ap.add_argument('--compiler', default=os.environ.get('PMF_COMPILER'))
     args = ap.parse_args()
-    touch.PMFC = pathlib.Path(args.pmfc).resolve()
-    if not touch.PMFC.is_file():
+    if not args.compiler:
+        raise SystemExit('i2c MCU read timeline gate: pass --compiler or set '
+                         'PMF_COMPILER')
+    touch.PMF_COMPILER = pathlib.Path(args.compiler).resolve()
+    if not touch.PMF_COMPILER.is_file():
         raise SystemExit('compiler not found')
     cases, steps_total = 0, 0
     with tempfile.TemporaryDirectory(prefix='anvil-i2c-read-gate-') as td:

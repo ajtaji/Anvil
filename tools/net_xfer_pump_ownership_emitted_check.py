@@ -31,7 +31,7 @@ assertion:
                   names, which doubles every packet from then on
 
 Requires external tools; neither is copied into the product tree:
-  PMFC=<path-to-pmfc> PMF_A64_INTERP=<path-to-a64_interp.py> \
+  PMF_COMPILER=<path-to-PureMetalForge.exe> PMF_A64_INTERP=<path-to-a64_interp.py> \
       python tools/net_xfer_pump_ownership_emitted_check.py
 """
 
@@ -287,10 +287,10 @@ def execute(a64, image: Path) -> tuple[int, int]:
     raise SystemExit(f"pump ownership gate: no return in {STEP_LIMIT:,} instructions")
 
 
-def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
-    staged = work / pmfc.name
+def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
+    staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(pmfc, staged)
+        shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir() and not (work / "Boards").exists():
         shutil.copytree(boards, work / "Boards")
@@ -298,7 +298,7 @@ def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
     source.write_text(text, encoding="utf-8", newline="\n")
     image = work / f"{stem}.img"
     command = [
-        str(staged),
+        str(staged), "--compile",
         str(source),
         "-t", "pi4",
         "--load-addr", hex(emitted.LOAD),
@@ -327,10 +327,10 @@ def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
 
@@ -349,7 +349,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="anvil-pump-ownership-") as temporary:
         work = Path(temporary)
-        image = build(pmfc, work, fixture(blocks), "net_xfer_pump_ownership_gate")
+        image = build(compiler, work, fixture(blocks), "net_xfer_pump_ownership_gate")
         result, steps = execute(a64, image)
         if result:
             print(
@@ -361,7 +361,7 @@ def main() -> int:
         killed = []
         for name, expected in mutations:
             mutant = fixture(mutate(blocks, name))
-            mutant_image = build(pmfc, work, mutant, f"pump_ownership_mutant_{name}")
+            mutant_image = build(compiler, work, mutant, f"pump_ownership_mutant_{name}")
             mutant_result, mutant_steps = execute(a64, mutant_image)
             if mutant_result != expected:
                 print(
@@ -372,7 +372,7 @@ def main() -> int:
             killed.append((name, expected, mutant_steps))
 
         mutant = tftp_mutant(work, fixture(blocks))
-        mutant_image = build(pmfc, work, mutant, "pump_ownership_mutant_dup_ack")
+        mutant_image = build(compiler, work, mutant, "pump_ownership_mutant_dup_ack")
         mutant_result, mutant_steps = execute(a64, mutant_image)
         if mutant_result != 65:
             print(

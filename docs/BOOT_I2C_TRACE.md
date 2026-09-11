@@ -56,9 +56,9 @@ it does not mean that the touch hardware passed.
 The emitted-code checks are:
 
 ```text
-python tools/a64/i2c_boot_trace_emitted_check.py --pmfc /path/to/pmfc
-python tools/touch_trace_command_check.py --pmfc /path/to/pmfc
-python tools/a64/touch_emitted_check.py --pmfc /path/to/pmfc
+python tools/a64/i2c_boot_trace_emitted_check.py --compiler /path/to/PureMetalForge.exe
+python tools/touch_trace_command_check.py --compiler /path/to/PureMetalForge.exe
+python tools/a64/touch_emitted_check.py --compiler /path/to/PureMetalForge.exe
 ```
 
 They check trace-off/trace-on wire equivalence in the controller model,

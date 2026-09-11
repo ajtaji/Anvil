@@ -319,9 +319,10 @@ class AlignmentFault(Exception):
 #  NAMING THE CULPRIT.  "alignment fault at $00484EDA" sends someone
 #  hunting; "cyw43seteventmask+332, cyw43.pi4 line 4762" ends the search.
 #
-#  pmfc writes a `.dbg` beside every image: one line per symbol, as
-#  `kind|offset|name|source file and line`, kind 1 being a procedure and
-#  the offset an IMAGE offset, so the absolute address is LOAD + offset.
+#  The compiler writes a `.dbg` beside every image: one line per symbol,
+#  as `kind|offset|name|source file and line`, kind 1 being a procedure
+#  and the offset an IMAGE offset, so the absolute address is LOAD +
+#  offset.
 #
 #  READ THE `.dbg`, NOT THE `.sym`, FOR THIS.  A64Assembler.pbi:1994-1997
 #  exports a BSS symbol as its ABSOLUTE address and a code symbol as its

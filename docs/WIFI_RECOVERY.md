@@ -80,8 +80,8 @@ this recovery change does not claim to have solved it.
 
 ## Desk gates
 
-Set `PMFC` to the product compiler and `PMF_A64_INTERP` to the external A64
-interpreter, or pass the equivalent `--pmfc` and `--interp` options:
+Set `PMF_COMPILER` to the product compiler and `PMF_A64_INTERP` to the external A64
+interpreter, or pass the equivalent `--compiler` and `--interp` options:
 
 ```text
 python tools/wifi_recovery_emitted_check.py

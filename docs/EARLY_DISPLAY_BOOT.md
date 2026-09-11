@@ -158,10 +158,10 @@ python tools/boot_display_order_check.py
 python tools/boot_v3d_order_check.py
 python tools/screen_composition_check.py
 python tools/display_pipeline_check.py
-PMFC=... PMF_A64_INTERP=... python tools/screen_restore_emitted_check.py
-PMFC=... PMF_A64_INTERP=... python tools/boot_timing_emitted_check.py
-PMFC=... PMF_A64_INTERP=... python tools/boot_transcript_emitted_check.py
-PMFC=... PMF_A64_INTERP=... python tools/screen_readopt_emitted_check.py
+PMF_COMPILER=... PMF_A64_INTERP=... python tools/screen_restore_emitted_check.py
+PMF_COMPILER=... PMF_A64_INTERP=... python tools/boot_timing_emitted_check.py
+PMF_COMPILER=... PMF_A64_INTERP=... python tools/boot_transcript_emitted_check.py
+PMF_COMPILER=... PMF_A64_INTERP=... python tools/screen_readopt_emitted_check.py
 python tools/screen_readopt_check.py
 ```
 

@@ -432,7 +432,7 @@ so. That is a measurement, not a failure.
 | | |
 |---|---|
 | Source | `RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4` |
-| Build | `pmfc RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4 -t pi4 --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns -s -o pi4CoreWitness.img` |
+| Build | `PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4 -t pi4 --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns -s -o pi4CoreWitness.img` |
 | Raw image | **4,768 bytes**, SHA-256 `15b1e361b93689ef2edd38e72fa842a91c3266ce23ca8a9ce6baf54f80c17179` |
 | Container | **4,864 bytes**, SHA-256 `91b645502eeb6b271c2fa40d3c501b2f0f2c711a2e731f06a8495d6c2ca92a75` |
 | Code | `$00500000..$0050129F` |

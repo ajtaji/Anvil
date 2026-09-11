@@ -2,7 +2,7 @@
 """touch_keyboard_integration_emitted_check.py - the touch keyboard JOIN,
 compiled with the real compiler and executed on the A64 interpreter.
 
-      PMFC=<path-to-pmfc.exe> PMF_A64_INTERP=<path-to-a64_interp.py> \
+      PMF_COMPILER=<path-to-PureMetalForge.exe> PMF_A64_INTERP=<path-to-a64_interp.py> \
           py -3.12 tools/touch_keyboard_integration_emitted_check.py
 
 WHAT THIS PROVES
@@ -400,7 +400,7 @@ def stage(work: pathlib.Path, lifted: str) -> pathlib.Path:
 def build(compiler: pathlib.Path, work: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
     image = work / "touch_keyboard_integration_gate.img"
     command = [
-        str(compiler),
+        str(compiler), "--compile",
         source.relative_to(work).as_posix(),
         "-t", "pi4",
         "--load-addr", hex(LOAD),
@@ -475,10 +475,10 @@ def run_once(a64, compiler, lifted: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    compiler = locate("PMFC", args.pmfc, [ROOT / "pmfc.exe", ROOT / "pmfc"])
+    compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))
 

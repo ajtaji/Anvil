@@ -50,10 +50,10 @@ def load_interpreter(path: pathlib.Path):
     return module
 
 
-def build(pmfc: pathlib.Path, work: pathlib.Path) -> pathlib.Path:
+def build(compiler: pathlib.Path, work: pathlib.Path) -> pathlib.Path:
     image = work / "el3_runtime.img"
     cmd = [
-        str(pmfc), str(PROBE.relative_to(ROOT)).replace("\\", "/"),
+        str(compiler), "--compile", str(PROBE.relative_to(ROOT)).replace("\\", "/"),
         "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -92,11 +92,11 @@ def execute(a64, image: pathlib.Path, el: int, sctlr2: int, sctlr3: int):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP")
                         or str(INTERP))
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     interpreter = load_interpreter(required_path(args.interp, "PMF_A64_INTERP"))
 
     # Bit 0 differs so MmuEnabled independently proves it used the same bank.
@@ -116,7 +116,7 @@ def main() -> int:
     )
     total_steps = 0
     with tempfile.TemporaryDirectory(prefix="anvil-el3-runtime-") as temporary:
-        image = build(pmfc, pathlib.Path(temporary))
+        image = build(compiler, pathlib.Path(temporary))
         for el, sctlr2, sctlr3, expected, expected_banks in cases:
             got, banks, steps = execute(interpreter, image, el, sctlr2, sctlr3)
             total_steps += steps

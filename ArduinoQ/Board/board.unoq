@@ -1,7 +1,8 @@
 ; ======================================================================
 ;  board.pi4 - THE ARDUINO UNO Q COMPILE TARGET.
 ;
-;      pmfc ArduinoQ/Board/board.unoq -t unoq --entry-returns -o anvil-q.img
+;      PureMetalForge.exe --compile ArduinoQ/Board/board.unoq -t unoq \
+;           --entry-returns -o anvil-q.img
 ;      python tools/unoq_efi_wrap.py anvil-q.img anvil-q.efi \
 ;           --load-addr 0x70000000
 ;
@@ -73,7 +74,7 @@
 ; ----------------------------------------------------------------------
 ;  0. WHERE THIS IMAGE RUNS. THE FILE SAYS IT.              2026-09-02
 ; ----------------------------------------------------------------------
-;  Until now these were pmfc flags and nothing else:
+;  Until now these were command-line flags and nothing else:
 ;
 ;    --load-addr 0x70000000 --stack-addr 0x68000000
 ;
@@ -119,9 +120,9 @@ StackAddress $68000000
 
 ; ----------------------------------------------------------------------
 ;  THE BUILD NUMBER (forum 586). An ordinary constant that CmdVersion()
-;  prints; the trailing marker is what makes the IDE - and `pmfc
-;  --bump-build` - raise it by one after a build that succeeded, writing
-;  back that one line and nothing else.
+;  prints; the trailing marker is what makes a successful build - from the
+;  editor or with `--bump-build` on the command line - raise it by one,
+;  writing back that one line and nothing else.
 ;
 ;  THE Q COUNTS ITS OWN BUILDS. This board file is its own project, so it
 ;  carries its own number and the Pi 4's number does not move when this
@@ -132,9 +133,9 @@ StackAddress $68000000
 ;  Full write-up: the vault's Environment/Build number note, and the
 ;  header of BuildNumber.pbi in the compiler tree.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 22        ; pmf:build
+#ANVIL_BUILD = 26        ; pmf:build
 #ANVIL_BUILD_DATE = 20260911   ; pmf:builddate
-#ANVIL_BUILD_TIME = 091043     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 164103     ; pmf:buildtime
 
 ; ----------------------------------------------------------------------
 ;  1. THE Q'S HARDWARE BACKENDS.
@@ -420,7 +421,7 @@ XIncludeFile "Anvil/Core/memcmd.pbi"
 XIncludeFile "Anvil/Core/uptime.pbi"
 ; hw_id_q - THIS BOARD'S IDENTITY (forum 575). The core's banner and
 ; `version` ask the HwId* seam what board this is, what processor it has,
-; what its console is, what pmfc target built it and where its own image
+; what its console is, what compiler target built it and where its own image
 ; lives; this file is the answer. After qefi_q.pi4 (the loaded-image
 ; record), hwinfo_q.pi4 (HwInfoEl) and format.pi4 (PutAddr), all above,
 ; and before the two files that call it.
@@ -579,7 +580,7 @@ EndProcedure
 ;      "PureMetal Forge - Anvil, the Raspberry Pi 4 serial monitor."
 ;      "The serial port is the PL011 at 00000000"
 ;      "The processor is in AArch64 at exception level 2."
-;      "Built by pmfc for target pi4."
+;      "Built by PureMetal Forge for target pi4."
 ;
 ;  Four claims, all false here: this is not a Pi 4, there is no PL011
 ;  (the console is a UEFI protocol, and 00000000 is #UART_BASE having no
@@ -642,7 +643,7 @@ EndProcedure
 ; ======================================================================
 ;  Main() - the Q's entry point.
 ;
-;  UEFI enters at x0 = ImageHandle, x1 = SystemTable, which pmfc's
+;  UEFI enters at x0 = ImageHandle, x1 = SystemTable, which the
 ;  --entry-returns _start preserves into Main(). Those two registers are
 ;  captured in the FIRST instructions, before anything can clobber them.
 ;

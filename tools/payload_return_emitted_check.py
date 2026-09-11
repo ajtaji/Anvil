@@ -518,7 +518,7 @@ def main():
     if not __debug__:
         raise SystemExit("This acceptance gate must not run with Python assertion optimization.")
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--pmfc")
+    ap.add_argument("--compiler")
     ap.add_argument("--image", type=Path, help="full Pi monitor image with its exact symbol sidecar")
     ap.add_argument("--image-sha256", help="required pinned digest when using an existing image")
     ap.add_argument("--symbols-sha256", help="required pinned digest for that image's exact symbol sidecar")
@@ -530,7 +530,7 @@ def main():
         check(a64, args.image.resolve(), args.image_sha256, args.symbols_sha256)
     else:
         with tempfile.TemporaryDirectory(prefix="anvil-payload-control-") as name:
-            check(a64, emitted.build(emitted.anvil_build.find_compiler(args.pmfc), Path(name)))
+            check(a64, emitted.build(emitted.anvil_build.find_compiler(args.compiler), Path(name)))
     return 0
 
 

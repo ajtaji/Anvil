@@ -38,7 +38,8 @@
 ;
 ; THE BUILD LINE, AND IT IS NOW A PLAIN ONE:
 ;
-;   pmfc RaspberryPi4/Board/board.pi4 -t pi4 -o RaspberryPi4/Monitor/anvil.img
+;   PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4
+;       -o RaspberryPi4/Monitor/anvil.img
 ;
 ; It used to carry --load-addr 0x200000 --bss-addr 0x8200000 and it no
 ; longer needs to: this file DECLARES its own placement, further down,
@@ -444,7 +445,7 @@
 ;                             gate exists because every number in the
 ;                             other one is, today, also consistent with
 ;                             a ceiling that never left.
-;   pmfc                      MaxROM is 0 for pi4 and unoq. It was a
+;   the command-line build    MaxROM is 0 for pi4 and unoq. It was a
 ;                             64 MiB "soft image-size budget" on parts
 ;                             with no ROM.
 ;   the native emulator       no longer caps an image at 8 MiB, and its
@@ -508,7 +509,8 @@
 ;   the monitor as it ships - the placement comes from this file's own
 ;   LoadAddress / BssAddress / StackAddress lines, so there is nothing
 ;   to pass
-;     pmfc RaspberryPi4/Board/board.pi4 -t pi4 -o RaspberryPi4/Monitor/anvil.img
+;     PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4
+;         -o RaspberryPi4/Monitor/anvil.img
 ;
 ;   the same thing with BSS BACK INSIDE THE IMAGE, which is what the
 ;   54-percent figure above describes and is the layout every earlier
@@ -516,7 +518,8 @@
 ;   by leaving a flag off, because the source now says where BSS goes:
 ;   comment out the BssAddress line and build. (A --bss-addr flag will
 ;   not do it either - one that disagrees with the source is refused.)
-;     pmfc RaspberryPi4/Board/board.pi4 -t pi4 -o anvil_contiguous.img
+;     PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4
+;         -o anvil_contiguous.img
 ;
 ;   the whole-tree build, which is the 59-percent figure: take a COPY of
 ;   this file, add EnableFloatingPoint above the first XIncludeFile (
@@ -572,7 +575,7 @@
 ;                    number in the map above describes. It costs a
 ;                    power cycle or a reset.
 ;
-;   somewhere else   pmfc ... --load-addr 0x2000000 puts a second copy
+;   somewhere else   a build with --load-addr 0x2000000 puts a second copy
 ;                    in the LOW PAYLOAD WINDOW, where the resident
 ;                    monitor is willing to write it, and "g 2000000"
 ;                    hands over with no reset at all.
@@ -616,7 +619,7 @@
 ; materialises absolute addresses; it does not emit position-independent
 ; code. So a payload in the high window has to be BUILT for it:
 ;
-;   pmfc ... -t pi4 --load-addr 0x40000000
+;   PureMetalForge.exe --compile ... -t pi4 --load-addr 0x40000000
 ;
 ; ONE THING THE WINDOW CHECK DOES NOT COVER, and it is easy to miss: the
 ; image's BSS is placed 512 KiB above its load base (#A64_BSS_GAP), and
@@ -1088,7 +1091,7 @@
 ;  WHERE THIS IMAGE RUNS. THE FILE SAYS IT.                  2026-09-02
 ; ======================================================================
 ;  These three lines are the placement this program has always needed
-;  and could previously only be GIVEN, on a pmfc command line:
+;  and could previously only be GIVEN, on the compiler's command line:
 ;
 ;    --load-addr 0x200000 --bss-addr 0x8200000
 ;
@@ -1138,7 +1141,8 @@ StackAddress $8000000
 ;  #ANVIL_BUILD is an ordinary integer constant - CmdVersion() prints it
 ;  and it costs no RAM. The trailing marker is what makes the tools treat
 ;  it as THIS project's build number: a successful build in the IDE, or a
-;  `pmfc --bump-build`, raises it by exactly one and writes that one line
+;  a `--bump-build` on the command line, raises it by exactly one and
+;  writes that one line
 ;  back, byte for byte identical everywhere else.
 ;
 ;  IT IS DECLARED HERE, IN THE BOARD FILE, and not in Anvil/Core. The core
@@ -1161,7 +1165,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 57        ; pmf:build
+#ANVIL_BUILD = 67        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1170,7 +1174,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260911   ; pmf:builddate
-#ANVIL_BUILD_TIME = 083316     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 165026     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file

@@ -55,15 +55,15 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
         raise SystemExit("CYW43 readiness gate: compiler symbol map has no BSS bounds") from exc
 
 
-def build(pmfc: Path, work: Path, source_root: Path = ROOT, probe: Path = PROBE) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, source_root: Path = ROOT, probe: Path = PROBE) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
     image = work / "cyw43_rx_readiness_gate.img"
     command = [
-        str(staged), probe.relative_to(source_root).as_posix(), "-t", "pi4",
+        str(staged), "--compile", probe.relative_to(source_root).as_posix(), "-t", "pi4",
         "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -91,7 +91,7 @@ def procedure_bounds(source: str, name: str) -> tuple[int, int]:
     return first, last + len("\nEndProcedure")
 
 
-def build_guard_mutant(pmfc: Path, work: Path, name: str) -> Path:
+def build_guard_mutant(compiler: Path, work: Path, name: str) -> Path:
     root = work / f"{name.lower()}-mutant"
     lib = root / "RaspberryPi4" / "Lib"
     tests = root / "RaspberryPi4" / "Tests"
@@ -118,9 +118,9 @@ def build_guard_mutant(pmfc: Path, work: Path, name: str) -> Path:
     shutil.copy2(ROOT / "RaspberryPi4" / "Lib" / "cyw43_rx_glom.pi4", lib)
     probe = tests / PROBE.name
     shutil.copy2(PROBE, probe)
-    return build(pmfc, root, root, probe)
+    return build(compiler, root, root, probe)
 
-def build_busy_mutant(pmfc: Path, work: Path) -> Path:
+def build_busy_mutant(compiler: Path, work: Path) -> Path:
     """The observer without its re-entry guard.
 
     The probe cannot observe from inside the callback - that is a loop
@@ -141,23 +141,46 @@ def build_busy_mutant(pmfc: Path, work: Path) -> Path:
     (lib / "cyw43.pi4").write_text(source.replace(old, "  If 0 <> 0", 1), encoding="utf-8", newline="\n")
     shutil.copy2(ROOT / "RaspberryPi4/Lib/cyw43_rx_glom.pi4", lib)
     probe = tests / PROBE.name; shutil.copy2(PROBE, probe)
-    return build(pmfc, root, root, probe)
+    return build(compiler, root, root, probe)
 
 
-def build_scratch_mutant(pmfc: Path, work: Path) -> Path:
+# THE SCRATCH MUTATION GIVES THE QUIET CLASSIFICATION A LIFE LONGER THAN ONE
+# CALL. It used to be "delete the `quietNonempty = 0` reset", and on 2026-09-11
+# that stopped being a defect anybody can write: automatic storage moved into
+# the invocation's own frame, so a value cannot survive a return and deleting
+# the reset changes nothing this probe can observe. A negative control that
+# cannot fail is not a control - it is a permanent red that teaches nothing.
+#
+# What checks 98 and 100 actually refuse is a classification that is SHARED
+# between calls, so that is what the mutation builds: file-scope storage and no
+# per-call reset, which is what this scratch would look like if somebody moved
+# it out of the procedure. Verified to be caught, and to be caught for the
+# right reason - the mutant returns 98, the queued frame inheriting the
+# preceding wire frame's quiet classification.
+SCRATCH_MUTATION = (
+    ("Global cyw43_rxIrqPrevNext.i = 0",
+     "Global cyw43_rxIrqPrevNext.i = 0\nGlobal quietNonempty.i = 0"),
+    ("  Define quietNonempty.i\n", ""),
+    ("  quietNonempty = 0\n", ""),
+)
+
+
+def build_scratch_mutant(compiler: Path, work: Path) -> Path:
     root = work / "scratch-mutant"
     lib = root / "RaspberryPi4" / "Lib"; tests = root / "RaspberryPi4" / "Tests"
     lib.mkdir(parents=True); tests.mkdir(parents=True)
     shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
     shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", root / "RaspberryPi4" / "Intrinsics")
     source = (ROOT / "RaspberryPi4/Lib/cyw43.pi4").read_text(encoding="utf-8")
-    old = "  quietNonempty = 0"
-    if source.count(old) != 1:
-        raise SystemExit("CYW43 readiness gate: scratch reset mutation site drifted")
-    (lib / "cyw43.pi4").write_text(source.replace(old, "  ; quiet scratch reset removed", 1), encoding="utf-8", newline="\n")
+    for old, new in SCRATCH_MUTATION:
+        if source.count(old) != 1:
+            raise SystemExit(
+                "CYW43 readiness gate: scratch mutation site drifted: " + old.strip())
+        source = source.replace(old, new, 1)
+    (lib / "cyw43.pi4").write_text(source, encoding="utf-8", newline="\n")
     shutil.copy2(ROOT / "RaspberryPi4/Lib/cyw43_rx_glom.pi4", lib)
     probe = tests / PROBE.name; shutil.copy2(PROBE, probe)
-    return build(pmfc, root, root, probe)
+    return build(compiler, root, root, probe)
 
 
 def execute(a64, image: Path) -> tuple[int, int]:
@@ -219,15 +242,15 @@ def execute(a64, image: Path) -> tuple[int, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-cyw43-ready-") as temporary:
         work = Path(temporary)
-        image = build(pmfc, work)
+        image = build(compiler, work)
         result, steps = execute(a64, image)
         expected = {
             "Cyw43EnumerateCores": 81,
@@ -237,7 +260,7 @@ def main() -> int:
         }
         mutant_steps = 0
         for name, want in expected.items():
-            mutant = build_guard_mutant(pmfc, work, name)
+            mutant = build_guard_mutant(compiler, work, name)
             mutant_result, used = execute(a64, mutant)
             mutant_steps += used
             if mutant_result != want:
@@ -246,12 +269,12 @@ def main() -> int:
                     f"mutant returned {mutant_result}, expected {want}"
                 )
                 return 1
-        scratch = build_scratch_mutant(pmfc, work)
+        scratch = build_scratch_mutant(compiler, work)
         scratch_result, scratch_steps = execute(a64, scratch)
         if scratch_result == 0:
-            print("cyw43_rx_readiness_emitted_check: FAIL per-call scratch mutant survived")
+            print("cyw43_rx_readiness_emitted_check: FAIL shared-scratch mutant survived")
             return 1
-        busy = build_busy_mutant(pmfc, work)
+        busy = build_busy_mutant(compiler, work)
         busy_result, busy_steps = execute(a64, busy)
         if busy_result != 106:
             print(
@@ -268,7 +291,7 @@ def main() -> int:
     print(
         f"cyw43_rx_readiness_emitted_check: PASS - 111 labeled assertions, "
         f"{steps:,} A64 instructions; four generation-guard mutants, the "
-        f"scratch-reset mutant and the re-entry-guard mutant rejected in "
+        f"shared-scratch mutant and the re-entry-guard mutant rejected in "
         f"{mutant_steps + scratch_steps + busy_steps:,} instructions"
     )
     return 0

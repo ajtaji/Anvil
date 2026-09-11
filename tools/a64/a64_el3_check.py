@@ -192,18 +192,21 @@ def run(args: list[str], *, expect: int = 0) -> subprocess.CompletedProcess[str]
     return result
 
 
-def locate_pmfc(explicit: str | None) -> Path:
+def locate_compiler(explicit: str | None) -> Path:
     """Find the external compiler without embedding a developer-machine path."""
-    requested = explicit or os.environ.get("PMFC")
+    requested = explicit or os.environ.get("PMF_COMPILER")
     if requested:
         path = Path(requested).expanduser().resolve()
         if path.is_file():
             return path
         raise SystemExit("EL3 gate: compiler not found: %s" % path)
-    found = shutil.which("pmfc") or shutil.which("pmfc.exe")
+    found = (shutil.which("PureMetalForge.exe") or
+             shutil.which("PureMetalForge.linux") or
+             shutil.which("PureMetalForge"))
     if found:
         return Path(found).resolve()
-    raise SystemExit("EL3 gate: pass --pmfc, set PMFC, or put pmfc on PATH")
+    raise SystemExit("EL3 gate: pass --compiler, set PMF_COMPILER, or put "
+                     "PureMetalForge on PATH")
 
 
 def u32(blob: bytes, off: int) -> int:
@@ -600,7 +603,7 @@ def check_level_probe() -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", help="external PureMetal compiler (or set PMFC)")
+    parser.add_argument("--compiler", help="external PureMetal compiler (or set PMF_COMPILER)")
     parser.add_argument(
         "--image", type=Path,
         help="verify an existing armstub8.bin; skips compiler-door checks")
@@ -612,13 +615,13 @@ def main() -> int:
             stub = args.image.expanduser().resolve()
             if not stub.is_file():
                 raise SystemExit("EL3 gate: image not found: %s" % stub)
-            pmfc = None
+            compiler = None
             print("[gate] verifying supplied image; source rebuild not claimed",
                   file=sys.stderr)
         else:
-            pmfc = locate_pmfc(args.pmfc)
+            compiler = locate_compiler(args.compiler)
             stub = temp / "armstub8.bin"
-            run([str(pmfc), "--armstub", "-t", "pi4", STUB_SRC,
+            run([str(compiler), "--compile", "--armstub", "-t", "pi4", STUB_SRC,
                  "-o", str(stub)])
         blob = stub.read_bytes()
 
@@ -632,11 +635,11 @@ def main() -> int:
         # precedes the load address - so a build that forgot the flag
         # fails loudly instead of producing a file with the fixed block
         # 512 KiB from where the firmware will look for it.
-        if pmfc is not None:
+        if compiler is not None:
             print()
             print("F. explicit-door negative controls")
             bad = subprocess.run(
-                [str(pmfc), "-t", "pi4", STUB_SRC,
+                [str(compiler), "--compile", "-t", "pi4", STUB_SRC,
                  "-o", str(temp / "nostub.bin")],
                 cwd=ROOT, text=True, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, check=False)
@@ -648,7 +651,7 @@ def main() -> int:
             not_asm = temp / "not_a_stub.pi4"
             not_asm.write_text("Procedure Main()\nEndProcedure\n", encoding="ascii")
             bad = subprocess.run(
-                [str(pmfc), "--armstub", "-t", "pi4", str(not_asm),
+                [str(compiler), "--compile", "--armstub", "-t", "pi4", str(not_asm),
                  "-o", str(temp / "not_a_stub.bin")],
                 cwd=ROOT, text=True, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, check=False)

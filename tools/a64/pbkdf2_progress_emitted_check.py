@@ -42,17 +42,17 @@ def load_interpreter(path: pathlib.Path):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP")
                         or str(INTERP))
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     a64 = load_interpreter(required_path(args.interp, "PMF_A64_INTERP"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-pbkdf2-progress-") as temporary:
         image = pathlib.Path(temporary) / "pbkdf2_progress.img"
         command = [
-            str(pmfc), str(PROBE.relative_to(ROOT)).replace("\\", "/"),
+            str(compiler), "--compile", str(PROBE.relative_to(ROOT)).replace("\\", "/"),
             "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
             "--entry-returns", "-o", str(image), "-s",
         ]

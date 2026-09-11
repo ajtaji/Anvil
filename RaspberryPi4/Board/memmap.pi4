@@ -399,44 +399,57 @@ EndProcedure
 ;  a symbol from anywhere in +/-4 GB, and it is what _start already uses
 ;  for __bss_start__.
 ;
-;  WHY THE ANSWER GOES THROUGH A LOCAL AND NOT A GLOBAL. On this backend
-;  a procedure's locals are static slots in BSS, so `v` has an address the
-;  assembler can name (`monimagelo_v`) exactly like a Global's. A local is
-;  the better home because it makes the value UNCACHEABLE by construction:
-;  it is written by the ASM block and read on the next line, having never
-;  been read before, so there is nothing for the emitter's register map to
-;  hold and the read must come from memory. A Global read earlier in the
-;  same procedure would not have that property.
+;  WHY THE ANSWER GOES THROUGH FILE-SCOPE STORAGE. It used to go through
+;  a procedure local, because on this backend a local was a static slot in
+;  BSS and had an address the assembler could name. THAT IS NO LONGER TRUE,
+;  and the change is right: as of 2026-09-11 automatic storage lives in the
+;  invocation's frame, so a name for it would mean a different place on
+;  every call, and the compiler refuses inline assembly that takes one as
+;  an absolute symbol. The two slots below are therefore file-scope, which
+;  is the layer that can honestly own an address.
+;
+;  THE VALUE IS STILL UNCACHEABLE BY CONSTRUCTION. Each slot is written by
+;  its ASM block and read on the very next line, and nothing in the
+;  procedure reads it beforehand, so the emitter's register map holds
+;  nothing for it and the read must come from memory. That was the point of
+;  the local and it survives the move; what would break it is a read
+;  EARLIER in the same procedure, and there is none.
+;
+;  EACH PROCEDURE HAS ITS OWN SLOT. They hold link-time constants - the
+;  same bytes on every call - so two cores asking at once cannot disagree,
+;  and separate slots keep that true without either procedure having to
+;  know about the other.
 ;
 ;  x16 and x17 are the scratch pair the emitted preamble itself uses for
 ;  the stack switch and the FP gate; A64X() hands out x9..x13 for IR
 ;  temporaries, so neither can be live across an ASM block here.
 ; ======================================================================
+Global monimage_lo.i = 0       ; written by MonImageLo()'s ASM, read next line
+Global monimage_end.i = 0      ; written by MonImageEnd()'s ASM, read next line
+
 Procedure.i MonImageLo()
-  Define v.i
   ASM
     adrp x16, __image_start__
     add  x16, x16, #:lo12:__image_start__
-    adrp x17, monimagelo_v
-    add  x17, x17, #:lo12:monimagelo_v
+    adrp x17, global_monimage_lo
+    add  x17, x17, #:lo12:global_monimage_lo
     str  x16, [x17]
   EndASM
-  ProcedureReturn v
+  ProcedureReturn monimage_lo
 EndProcedure
 
 ; ONE PAST THE LAST BYTE OF THE IMAGE. Not the last byte - this is the
 ; end the linker states, and the arithmetic below is written against a
 ; half-open range for the same reason the assembler's own codeEnd is.
 Procedure.i MonImageEnd()
-  Define v.i
   ASM
     adrp x16, __image_end__
     add  x16, x16, #:lo12:__image_end__
-    adrp x17, monimageend_v
-    add  x17, x17, #:lo12:monimageend_v
+    adrp x17, global_monimage_end
+    add  x17, x17, #:lo12:global_monimage_end
     str  x16, [x17]
   EndASM
-  ProcedureReturn v
+  ProcedureReturn monimage_end
 EndProcedure
 
 ; HOW BIG THIS MONITOR IS, in bytes, measured rather than recorded. It is

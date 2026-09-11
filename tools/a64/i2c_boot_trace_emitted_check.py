@@ -156,17 +156,17 @@ def records(cpu, syms):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pmfc", default=os.environ.get("PMFC"),
-                    help="external PureMetal compiler (or set PMFC)")
+    ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
+                    help="external PureMetal compiler (or set PMF_COMPILER)")
     ap.add_argument("--skip-mutations", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
-    if not args.pmfc:
-        raise SystemExit("pass --pmfc or set PMFC")
-    pmfc = pathlib.Path(args.pmfc).expanduser().resolve()
-    if not pmfc.is_file():
-        raise SystemExit("compiler not found: %s" % pmfc)
+    if not args.compiler:
+        raise SystemExit("pass --compiler or set PMF_COMPILER")
+    compiler = pathlib.Path(args.compiler).expanduser().resolve()
+    if not compiler.is_file():
+        raise SystemExit("compiler not found: %s" % compiler)
 
-    touch.PMFC = pmfc
+    touch.PMF_COMPILER = compiler
     WORK.mkdir(parents=True, exist_ok=True)
     touch.build(PROBE.relative_to(ROOT).as_posix(), IMAGE,
                 bss_addr=BSS, load_addr=LOAD, stack_addr=STACK)
@@ -332,8 +332,8 @@ def main():
             with tempfile.TemporaryDirectory(prefix="anvil-i2c-trace-mutant-") as td:
                 staged = pathlib.Path(td)
                 shutil.copytree(ROOT / "RaspberryPi4", staged / "RaspberryPi4")
-                shutil.copy2(pmfc.parent / "keywords.def", staged / "keywords.def")
-                compiler_intrinsics = pmfc.parent / "RaspberryPi4/Intrinsics"
+                shutil.copy2(compiler.parent / "keywords.def", staged / "keywords.def")
+                compiler_intrinsics = compiler.parent / "RaspberryPi4/Intrinsics"
                 if compiler_intrinsics.is_dir():
                     shutil.copytree(compiler_intrinsics,
                                     staged / "RaspberryPi4/Intrinsics",
@@ -344,7 +344,7 @@ def main():
                 env["PMF_REPO"] = str(staged)
                 run_mutant = subprocess.run(
                     [sys.executable, str(pathlib.Path(__file__).resolve()),
-                     "--pmfc", str(pmfc), "--skip-mutations"], env=env,
+                     "--compiler", str(compiler), "--skip-mutations"], env=env,
                     capture_output=True, text=True, timeout=120)
                 if run_mutant.returncode == 0:
                     raise SystemExit("compiled mutation survived: " + label)

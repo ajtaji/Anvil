@@ -11,7 +11,7 @@ ScreenDsiReadoptStart / Service / Abandon and ScreenHdmiRescale bodies over the
 actual Anvil/Core/boot_transcript.pbi, with counting stubs for the surface, the
 renderer, the HVS and the timing record. No board, no display, no GPU.
 
-  PMFC=<pmfc> PMF_A64_INTERP=<a64_interp.py> python tools/screen_restore_emitted_check.py
+  PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> python tools/screen_restore_emitted_check.py
 """
 from __future__ import annotations
 
@@ -59,17 +59,17 @@ def fixture(bodies: str) -> str:
     return text.replace("; @@BODY@@", bodies, 1)
 
 
-def build(pmfc: Path, work: Path, text: str, stem: str) -> Path:
-    staged = work / pmfc.name
+def build(compiler: Path, work: Path, text: str, stem: str) -> Path:
+    staged = work / compiler.name
     if not staged.exists():
-        shutil.copy2(pmfc, staged)
+        shutil.copy2(compiler, staged)
     if (ROOT / "Boards").is_dir() and not (work / "Boards").exists():
         shutil.copytree(ROOT / "Boards", work / "Boards")
     src = work / f"{stem}.pi4"
     src.write_text(text, encoding="utf-8", newline="\n")
     image = work / f"{stem}.img"
     run = subprocess.run(
-        [str(staged), str(src), "-t", "pi4",
+        [str(staged), "--compile", str(src), "-t", "pi4",
          "--load-addr", hex(emitted.LOAD), "--stack-addr", hex(emitted.STACK),
          "--entry-returns", "-o", str(image), "-s"],
         cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)},
@@ -169,10 +169,10 @@ MUTATIONS = (
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     a64 = emitted.load_interpreter(emitted.required_path(args.interp, "PMF_A64_INTERP"))
 
     source = PRODUCT.read_text(encoding="utf-8")
@@ -180,14 +180,14 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="anvil-screen-restore-") as td:
         work = Path(td)
-        result, steps = emitted.execute(a64, build(pmfc, work, fixture(bodies), "screen_restore_gate"))
+        result, steps = emitted.execute(a64, build(compiler, work, fixture(bodies), "screen_restore_gate"))
         if result:
             print(f"screen_restore_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
             return 1
         killed = []
         for i, (label, old, new) in enumerate(MUTATIONS, 1):
             mutant = mutate(bodies, old, new, label)
-            r, _ = emitted.execute(a64, build(pmfc, work, fixture(mutant), f"screen_restore_mutant_{i}"))
+            r, _ = emitted.execute(a64, build(compiler, work, fixture(mutant), f"screen_restore_mutant_{i}"))
             if r == 0:
                 print(f"screen_restore_emitted_check: FAIL {label} mutant survived")
                 return 1

@@ -406,7 +406,7 @@ EndDataSection
 
 
 def build(compiler: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="anvil-module-pmfc-") as name:
+    with tempfile.TemporaryDirectory(prefix="anvil-module-compiler-") as name:
         stage = Path(name)
         staged = stage / compiler.name
         shutil.copy2(compiler, staged)
@@ -414,7 +414,7 @@ def build(compiler: Path) -> None:
         env = os.environ.copy()
         env["PMF_ROOT"] = str(ROOT)
         command = [
-            str(staged), SOURCE.relative_to(ROOT).as_posix(), "-t", "pi4",
+            str(staged), "--compile", SOURCE.relative_to(ROOT).as_posix(), "-t", "pi4",
             "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
             "--entry-returns", "-o", str(IMAGE), "-s",
         ]
@@ -456,7 +456,7 @@ def main() -> int:
         help="optional PMFMOD produced by the independent compiler writer",
     )
     args = parser.parse_args()
-    compiler = locate_required("PMFC", "pmfc.exe")
+    compiler = locate_required("PMF_COMPILER", "PureMetalForge.exe")
     interpreter = locate_required("PMF_A64_INTERP", "tools/a64/a64_interp.py")
     fixture = None
     if args.writer_fixture is not None:

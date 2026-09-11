@@ -76,9 +76,9 @@ def u64(memory: dict[int, int], address: int) -> int:
     return sum(memory.get(address + i, 0) << (8 * i) for i in range(8))
 
 
-def compile_probe(pmfc: pathlib.Path, source: pathlib.Path, image: pathlib.Path) -> None:
+def compile_probe(compiler: pathlib.Path, source: pathlib.Path, image: pathlib.Path) -> None:
     command = [
-        str(pmfc), str(source.relative_to(ROOT)).replace("\\", "/") if source.is_relative_to(ROOT) else str(source),
+        str(compiler), "--compile", str(source.relative_to(ROOT)).replace("\\", "/") if source.is_relative_to(ROOT) else str(source),
         "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -113,12 +113,12 @@ def execute_bounded(a64, image: pathlib.Path, limit: int) -> tuple[int, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     parser.add_argument("--calibrate-only", action="store_true",
                         help="measure one 16-PRF slice and print the derived full-run ceiling")
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     a64 = load_interpreter(required_path(args.interp, "PMF_A64_INTERP"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-pbkdf2-step-") as temporary:
@@ -126,7 +126,7 @@ def main() -> int:
         calibration_source = work / "pbkdf2_step_calibration.pi4"
         calibration_source.write_text(CALIBRATION, encoding="utf-8", newline="\n")
         calibration_image = work / "pbkdf2_step_calibration.img"
-        compile_probe(pmfc, calibration_source, calibration_image)
+        compile_probe(compiler, calibration_source, calibration_image)
         calibration_rc, calibration_steps = execute_bounded(a64, calibration_image, CALIBRATION_LIMIT)
         if calibration_rc != 0:
             raise SystemExit(f"PBKDF2 step calibration failed code {calibration_rc}")
@@ -137,7 +137,7 @@ def main() -> int:
             return 0
 
         image = work / "pbkdf2_step.img"
-        compile_probe(pmfc, PROBE, image)
+        compile_probe(compiler, PROBE, image)
         cpu, symbols = fresh_cpu(a64, image)
         raw_symbols = parse_symbols(image)
         started = time.monotonic()

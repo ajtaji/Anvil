@@ -74,13 +74,13 @@ def load_interpreter(path: pathlib.Path):
 
 def locate_compiler() -> pathlib.Path:
     choices = []
-    if os.environ.get("PMFC"):
-        choices.append(pathlib.Path(os.environ["PMFC"]))
-    choices.append(ROOT / "pmfc.exe")
+    if os.environ.get("PMF_COMPILER"):
+        choices.append(pathlib.Path(os.environ["PMF_COMPILER"]))
+    choices.append(ROOT / "PureMetalForge.exe")
     for path in choices:
         if path.is_file():
             return path
-    raise SystemExit("display emitted gate: pmfc.exe was not found; set PMFC")
+    raise SystemExit("display emitted gate: PureMetalForge.exe was not found; set PMF_COMPILER")
 
 
 def build() -> pathlib.Path:
@@ -89,7 +89,7 @@ def build() -> pathlib.Path:
     work.mkdir(parents=True, exist_ok=True)
     image = work / "orientation.img"
     cmd = [
-        str(compiler),
+        str(compiler), "--compile",
         str(PROBE.relative_to(ROOT)).replace("\\", "/"),
         "-t",
         "pi4",

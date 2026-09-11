@@ -22,7 +22,7 @@ copy, the pointer left alone on a tier with no save-under, and the
 carried rectangle checked against the checker's own arithmetic over the
 panel's geometry.
 
-  PMFC=<pmfc.exe> PMF_A64_INTERP=<a64_interp.py> \
+  PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
       py -3 tools/keyboard_gpu_face_emitted_check.py
 """
 
@@ -276,7 +276,7 @@ def stage(work: pathlib.Path, compose: str, keep: str) -> pathlib.Path:
 
 def build(compiler: pathlib.Path, work: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
     image = work / "keyboard_gpu_face_gate.img"
-    command = [str(compiler), source.relative_to(work).as_posix(),
+    command = [str(compiler), "--compile", source.relative_to(work).as_posix(),
                "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
                "--entry-returns", "-o", str(image), "-s"]
     env = os.environ.copy()
@@ -561,14 +561,14 @@ def run_once(a64, compiler, compose: str, keep: str, work_root: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pmfc")
+    parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--no-mutate", action="store_true")
     parser.add_argument("--record", action="store_true",
                         help="print every label, its box and the face it was set in")
     args = parser.parse_args()
 
-    compiler = locate("PMFC", args.pmfc, [ROOT / "pmfc.exe", ROOT / "pmfc"])
+    compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))
     advances = parse_key_advances()

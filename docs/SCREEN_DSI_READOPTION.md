@@ -68,8 +68,8 @@ would be detached again one line later.
 ```text
 python tools/screen_readopt_check.py
 python tools/screen_composition_check.py
-PMFC=... PMF_A64_INTERP=... python tools/screen_readopt_emitted_check.py
-PMFC=... PMF_A64_INTERP=... python tools/screen_restore_emitted_check.py
+PMF_COMPILER=... PMF_A64_INTERP=... python tools/screen_readopt_emitted_check.py
+PMF_COMPILER=... PMF_A64_INTERP=... python tools/screen_restore_emitted_check.py
 ```
 
 The first two are structural. The third executes the actual mirror/pending/

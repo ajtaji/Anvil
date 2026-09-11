@@ -158,10 +158,10 @@ The gates compile the production PureMetal sources and execute the
 emitted AArch64 image in an external register/FIFO model:
 
 ```
-python tools/sdio_rx_readiness_emitted_check.py --pmfc PMFC --interp PMF_A64_INTERP
-python tools/cyw43_rx_readiness_emitted_check.py --pmfc PMFC --interp PMF_A64_INTERP
-python tools/cyw43_f2_fifo_emitted_check.py --pmfc PMFC --interp PMF_A64_INTERP
-python tools/cyw43_rx_glom_transport_emitted_check.py --pmfc PMFC --interp PMF_A64_INTERP
+python tools/sdio_rx_readiness_emitted_check.py --compiler PMF_COMPILER --interp PMF_A64_INTERP
+python tools/cyw43_rx_readiness_emitted_check.py --compiler PMF_COMPILER --interp PMF_A64_INTERP
+python tools/cyw43_f2_fifo_emitted_check.py --compiler PMF_COMPILER --interp PMF_A64_INTERP
+python tools/cyw43_rx_glom_transport_emitted_check.py --compiler PMF_COMPILER --interp PMF_A64_INTERP
 ```
 
 The focused gates cover exact snapshots and rollback, failed rollback and

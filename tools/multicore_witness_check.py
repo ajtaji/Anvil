@@ -120,14 +120,14 @@ def mutant_root(work: Path, label: str, source_root: Path,
     return root
 
 
-def build(pmfc: str, work: Path, source_root: Path, stem: str) -> Path:
+def build(compiler: str, work: Path, source_root: Path, stem: str) -> Path:
     compiler_dir = work / f"compiler-{stem}"
     compiler_dir.mkdir(parents=True, exist_ok=True)
-    staged = anvil_build.staged_compiler(pmfc, compiler_dir)
+    staged = anvil_build.staged_compiler(compiler, compiler_dir)
     image = work / f"{stem}.img"
     env = os.environ.copy()
     env["PMF_ROOT"] = str(source_root)
-    cmd = [staged, WITNESS.as_posix(), "-t", "pi4",
+    cmd = [staged, "--compile", WITNESS.as_posix(), "-t", "pi4",
            "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
            "--entry-returns", "-S", "-s", "-o", str(image)]
     done = subprocess.run(cmd, cwd=source_root, env=env, text=True,
@@ -407,11 +407,11 @@ def main() -> int:
               "assertions this gate is made of")
         return 1
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--verbose", action="store_true",
                         help="print which check killed each mutant")
     args = parser.parse_args()
-    compiler = anvil_build.find_compiler(args.pmfc)
+    compiler = anvil_build.find_compiler(args.compiler)
 
     c = Checks()
     a64 = load_interp(ROOT / "tools" / "a64" / "a64_interp.py")

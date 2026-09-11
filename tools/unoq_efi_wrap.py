@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ======================================================================
-#  unoq_efi_wrap.py - wrap a flat pmfc A64 image as a minimal AArch64
+#  unoq_efi_wrap.py - wrap a flat A64 image as a minimal AArch64
 #                     PE/COFF UEFI application for the Arduino UNO Q.
 #
-#  pmfc emits a flat, position-independent A64 image: every global is
+#  The compiler emits a flat, position-independent A64 image: every global is
 #  reached with adrp/#:lo12: (PC-relative) and BSS lives at a fixed
 #  RELATIVE offset above the code (load + 0x80000 by default), so the
 #  image can be loaded at any address as long as code and BSS keep their
@@ -13,7 +13,7 @@
 #  UEFI enters an application at AddressOfEntryPoint with
 #     x0 = EFI_HANDLE        ImageHandle
 #     x1 = EFI_SYSTEM_TABLE* SystemTable
-#  and reads EFI_STATUS back from x0. pmfc's --entry-returns _start
+#  and reads EFI_STATUS back from x0. The compiler's --entry-returns _start
 #  preserves x0/x1 into Main() and returns Main()'s value in x0, so this
 #  is a well-formed EFI application entry.
 #
@@ -22,7 +22,7 @@
 #     RVA 0x1000  flat image, _start first  ->  AddressOfEntryPoint
 #                 section VirtualSize spans through __bss_end__; the tail
 #                 past the file bytes is BSS (zero-filled by the loader,
-#                 and re-zeroed by pmfc's _start).
+#                 and re-zeroed by the compiler's _start).
 #
 #  Usage:
 #     unoq_efi_wrap.py <flat.img> <out.efi> [--load-addr 0x70000000]
@@ -59,7 +59,7 @@ def parse_args(argv):
     return a
 
 def read_sym_bss_end(path):
-    # pmfc .sym is "name=value" tokens (space and/or newline separated).
+    # The .sym file is "name=value" tokens (space and/or newline separated).
     try:
         txt = open(path, "r", errors="replace").read()
     except OSError:

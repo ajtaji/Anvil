@@ -27,14 +27,14 @@ CNTFRQ = 54_000_000
 UTC = dt.timezone.utc
 
 
-def build(pmfc: Path, work: Path) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards")
     image = work / "wallclock_gate.img"
     command = [
-        str(staged), PROBE.relative_to(ROOT).as_posix(), "-t", "pi4",
+        str(staged), "--compile", PROBE.relative_to(ROOT).as_posix(), "-t", "pi4",
         "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -109,15 +109,15 @@ def run(a64, image: Path, ticks_per_step: int, stop: bytes | None = None,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
 
     with tempfile.TemporaryDirectory(prefix="anvil-wallclock-emitted-") as temporary:
-        image = build(pmfc, Path(temporary))
+        image = build(compiler, Path(temporary))
         text, steps = run(a64, image, 1)
         moving, moving_steps = run(a64, image, 54_000,
                                    b"--- monotonic done ---\r\n")

@@ -487,14 +487,14 @@ def emitted_checks(checks: Checks, assembly: str) -> None:
     in_order(checks, hwup, ["bl netmacset", "bl netdefaults", "bl netarpflush", "bl netsetmac"], "eth_HwUp emitted A64")
 
 
-def compile_assembly(pmfc: str, temporary: Path) -> str:
+def compile_assembly(compiler: str, temporary: Path) -> str:
     compiler_dir = temporary / "compiler"
     compiler_dir.mkdir(parents=True, exist_ok=True)
-    compiler = anvil_build.staged_compiler(pmfc, compiler_dir)
+    staged = anvil_build.staged_compiler(compiler, compiler_dir)
     output = temporary / "anvil.img"
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
-    command = [compiler, "RaspberryPi4/Board/board.pi4", "-t", "pi4", "-S", "-o", str(output)]
+    command = [staged, "--compile", "RaspberryPi4/Board/board.pi4", "-t", "pi4", "-S", "-o", str(output)]
     completed = subprocess.run(command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     if completed.returncode:
         raise AssertionError(f"Pi 4 emitted build failed ({completed.returncode}):\n{completed.stdout}")
@@ -514,7 +514,7 @@ def compile_assembly(pmfc: str, temporary: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"), help="PureMetal compiler path or command")
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"), help="PureMetal compiler path or command")
     parser.add_argument("--assembly", help="check an existing full-monitor .asm instead of compiling")
     args = parser.parse_args()
     checks = Checks()
@@ -525,7 +525,7 @@ def main() -> int:
         if args.assembly:
             assembly = Path(args.assembly).read_text(encoding="utf-8")
         else:
-            compiler = anvil_build.find_compiler(args.pmfc)
+            compiler = anvil_build.find_compiler(args.compiler)
             with tempfile.TemporaryDirectory(prefix="anvil-payload-lifecycle-") as name:
                 assembly = compile_assembly(compiler, Path(name))
         emitted_checks(checks, assembly)

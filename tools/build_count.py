@@ -10,7 +10,7 @@ anything. That only works if the number moves for EVERY build of the monitor -
 the one the flasher makes, and the ten a gate run makes from temporary copies.
 
 WHAT WAS WRONG BEFORE THIS FILE. tools/build.py asked the compiler to bump
-(`pmfc --bump-build`), so the compiler raised the marker in THE FILE IT WAS
+(the compiler's own `--bump-build`), so it raised the marker in THE FILE IT WAS
 GIVEN. A gate compiles the monitor from a temporary export with a staged
 compiler, so the file it was given was a copy in a temporary directory that is
 deleted seconds later. The real board file never moved and the count was not
@@ -98,12 +98,12 @@ build/ rather than _work/ because the artifacts these lines hash are already
 in build/, so the evidence sits beside what it is evidence of; _work/ is lane
 scratch that gets cleared.
 
-THE COMPILER THAT MADE IT IS PART OF THE RECORD. `pmfc=` carries the sha256 of
+THE COMPILER THAT MADE IT IS PART OF THE RECORD. `compiler=` carries the sha256 of
 the executable that produced the image. The compiler is rebuilt on this bench
 while gates are running - it was rebuilt in the middle of the first sweep this
 mechanism ever ran - so "build 58 of board.pi4" is only half an identity: the
 other half is which compiler emitted it. Two images with the same build number
-and different pmfc hashes is exactly the confusion the build number exists to
+and different compiler hashes is exactly the confusion the build number exists to
 end, and it is not recoverable after the fact. A counted build with no compiler
 named is refused rather than written down half-known.
 
@@ -111,7 +111,7 @@ THE LEDGER LINE, one per counted build:
 
   2026-09-11T21:33:07Z target=pi4 build=57 stamp=20260911-213307
   board=RaspberryPi4/Board/board.pi4 source=<the path that was compiled>
-  image=<the artifact> sha256=<64 hex> pmfc=<64 hex> by=<tool>
+  image=<the artifact> sha256=<64 hex> compiler=<64 hex> by=<tool>
   compile=<16 hex>
 
 written on ONE line. The time at the front is UTC so that two workers' lines
@@ -592,7 +592,8 @@ _COMPILER_DIGESTS: dict[tuple, str] = {}
 def compiler_digest(compiler) -> str:
     """The sha256 of the executable that produced the image.
 
-    A gate stages a COPY of pmfc beside this repository's board profiles, so the
+    A gate stages a COPY of the compiler beside this repository's board
+    profiles, so the
     path varies from run to run and the bytes do not: the digest is what
     identifies the compiler, and it is the same for the copy and the original.
     """
@@ -625,7 +626,8 @@ def record_build(source, target: str, image, by: str | None = None,
     `source` is the path that was handed to the compiler - the real board file
     or a temporary copy of it. `target` is pi4 or unoq. `image` is what the
     compile produced. `by` names the tool doing the asking, and defaults to the
-    script that is running. `compiler` is the pmfc that was run - required for a
+    script that is running. `compiler` is the executable that was run - required
+    for a
     build that counts, because which compiler emitted an image is half of what
     identifies it, and this bench rebuilds the compiler while gates are running.
 
@@ -649,7 +651,7 @@ def record_build(source, target: str, image, by: str | None = None,
             f"ANVIL-BLD-001: a build of {board.name} was reported but the compiler that "
             f"made it was not named, so the ledger line would say which build it is and "
             f"not what built it. Nothing was changed and no build was recorded. Pass "
-            f"compiler=<the pmfc that was run> to record_build; the compiler is rebuilt "
+            f"compiler=<the compiler that was run> to record_build; the compiler is rebuilt "
             f"on this bench while gates are running, so two images can share a build "
             f"number and not share a compiler."
         )
@@ -759,7 +761,7 @@ def _ledger_line(target: str, build: int, stamp_date: str, stamp_time: str,
         f"source={_relative(source, root)}",
         f"image={_relative(artifact, root)}",
         f"sha256={digest}",
-        f"pmfc={built_by}",
+        f"compiler={built_by}",
         f"by={who}",
         f"compile={fingerprint}",
     ]

@@ -2,7 +2,7 @@
 """touch_keyboard_emitted_check.py - the layout-independent touch keyboard,
 compiled with the real compiler and executed on the A64 interpreter.
 
-      PMFC=<path-to-pmfc.exe> PMF_A64_INTERP=<path-to-a64_interp.py> \
+      PMF_COMPILER=<path-to-PureMetalForge.exe> PMF_A64_INTERP=<path-to-a64_interp.py> \
           py -3.12 tools/touch_keyboard_emitted_check.py
 
 WHAT THIS PROVES
@@ -124,7 +124,7 @@ MUTATIONS = {
 }
 
 
-def build(pmfc: Path, work: Path, mutation: str = "") -> Path:
+def build(compiler: Path, work: Path, mutation: str = "") -> Path:
     """Compile the gate, optionally against a mutated copy of the product."""
     gate_source = GATE.read_text(encoding="utf-8")
     include = 'XIncludeFile "Anvil/Core/touch_keyboard.pbi"'
@@ -146,7 +146,7 @@ def build(pmfc: Path, work: Path, mutation: str = "") -> Path:
     probe = work / f"touch_keyboard_gate{('_' + mutation) if mutation else ''}.pi4"
     probe.write_text(gate_source, encoding="utf-8")
     emitted.PROBE = probe
-    return emitted.build(pmfc, work)
+    return emitted.build(compiler, work)
 
 
 def describe(result: int) -> str:
@@ -157,15 +157,15 @@ def describe(result: int) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = emitted.required_path(args.pmfc, "PMFC")
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
 
     with tempfile.TemporaryDirectory(prefix="anvil-touch-kb-") as temporary:
-        image = build(pmfc, Path(temporary))
+        image = build(compiler, Path(temporary))
         result, steps = emitted.execute(a64, image)
     if result:
         print(
@@ -176,7 +176,7 @@ def main() -> int:
 
     for mutation, (_, _, expected) in MUTATIONS.items():
         with tempfile.TemporaryDirectory(prefix=f"anvil-touch-kb-{mutation}-") as temporary:
-            mutant = build(pmfc, Path(temporary), mutation=mutation)
+            mutant = build(compiler, Path(temporary), mutation=mutation)
             mutant_result, mutant_steps = emitted.execute(a64, mutant)
         if mutant_result == 0:
             print(

@@ -94,15 +94,15 @@ def symbol_bounds(sym_path: Path) -> tuple[int, int]:
         raise SystemExit("SDIO readiness gate: compiler symbol map has no BSS bounds") from exc
 
 
-def build(pmfc: Path, work: Path, source_root: Path = ROOT, probe: Path = PROBE) -> Path:
-    staged = work / pmfc.name
-    shutil.copy2(pmfc, staged)
+def build(compiler: Path, work: Path, source_root: Path = ROOT, probe: Path = PROBE) -> Path:
+    staged = work / compiler.name
+    shutil.copy2(compiler, staged)
     boards = ROOT / "Boards"
     if boards.is_dir():
         shutil.copytree(boards, work / "Boards")
     image = work / "sdio_rx_readiness_gate.img"
     command = [
-        str(staged), probe.relative_to(source_root).as_posix(), "-t", "pi4",
+        str(staged), "--compile", probe.relative_to(source_root).as_posix(), "-t", "pi4",
         "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
@@ -128,7 +128,7 @@ def replace_once(source: str, old: str, new: str, label: str) -> str:
     return source.replace(old, new, 1)
 
 
-def build_mask_mutant(pmfc: Path, work: Path) -> Path:
+def build_mask_mutant(compiler: Path, work: Path) -> Path:
     root = work / "first-mask-mutant"
     lib = root / "RaspberryPi4" / "Lib"
     tests = root / "RaspberryPi4" / "Tests"
@@ -153,7 +153,7 @@ def build_mask_mutant(pmfc: Path, work: Path) -> Path:
     (lib / "sdio.pi4").write_text(source, encoding="utf-8", newline="\n")
     probe = tests / PROBE.name
     shutil.copy2(PROBE, probe)
-    return build(pmfc, root, root, probe)
+    return build(compiler, root, root, probe)
 
 
 class SdioModel:
@@ -336,17 +336,17 @@ def execute(a64, image: Path) -> tuple[int, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmfc", default=os.environ.get("PMFC"))
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    pmfc = required_path(args.pmfc, "PMFC")
+    compiler = required_path(args.compiler, "PMF_COMPILER")
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-sdio-ready-") as temporary:
         work = Path(temporary)
-        image = build(pmfc, work)
+        image = build(compiler, work)
         result, steps = execute(a64, image)
-        mutant = build_mask_mutant(pmfc, work)
+        mutant = build_mask_mutant(compiler, work)
         mutant_result, mutant_steps = execute(a64, mutant)
     if result:
         print(
