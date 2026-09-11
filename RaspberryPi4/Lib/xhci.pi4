@@ -1287,6 +1287,84 @@ Global xh_evF3.i = 0
 Global xh_cacheaddr.i = 0
 
 ; ======================================================================
+;  WHICH PART OF THE BRING-UP IS RUNNING - added 2026-09-11.
+;
+;  WHY A DRIVER CARRIES THIS AT ALL. Every wait in this file is bounded,
+;  so every FAILURE here is a refusal with a code and a sentence. A board
+;  that stops inside XhciInit() with no sentence is therefore not a
+;  failure this file can describe - it is the machine wedging on an
+;  access, and the only thing that can name where is a marker set BEFORE
+;  the access rather than a code returned after it.
+;
+;  That is what it is for. The boot log's one line for this step -
+;  "USB host (xHCI) ....." - covers seven distinct pieces of work, three
+;  of which touch a bus that can stall: the config-space walk, the first
+;  read of the controller's own registers through the outbound window,
+;  and the reset. Without a marker, all seven look identical from the
+;  panel: a label with no result.
+;
+;  THE HOOK TAKES NO ARGUMENT, and that is deliberate. It is the shape
+;  genet.pi4's progress hook already has and the one this tree has run on
+;  silicon; the phase is read back through XhciPhase() by whoever
+;  installed it. A hook is only installed by a caller that wants the
+;  progress printed, so nothing is printed on the lazy path after boot.
+;
+;  THE MARKER IS FILE-SCOPE AND NOT A LOCAL. Automatic storage lives in
+;  the invocation's frame as of 2026-09-11 and is gone when the call
+;  returns; a marker whose whole job is to survive the call that set it -
+;  and to be readable by a hook running underneath it - has to live on a
+;  layer that outlives the frame. Same rule, same reason, as the cache
+;  walk's bounds in dma.pi4.
+; ======================================================================
+#XHCI_PH_IDLE    = 0
+#XHCI_PH_CLOCK   = 1     ; CNTFRQ_EL0, before anything that can wait
+#XHCI_PH_ARENA   = 2     ; the arena's base, and the 3 GiB reachability test
+#XHCI_PH_LOCATE  = 3     ; PCI config: the id, bus master, BAR0
+#XHCI_PH_CAPS    = 4     ; the FIRST read through the outbound window
+#XHCI_PH_RESET   = 5     ; halt, HCRST, Controller Not Ready
+#XHCI_PH_CONFIG  = 6     ; the enabled device slot count
+#XHCI_PH_MEMORY  = 7     ; rings, contexts, ERST, scratchpad
+#XHCI_PH_RUN     = 8     ; CMD_RUN and the wait for HCHalted to clear
+#XHCI_PH_DONE    = 9
+
+Global xh_phaseAt.i = #XHCI_PH_IDLE
+Global *xh_phaseHook = 0
+
+Procedure.i XhciPhase() : ProcedureReturn xh_phaseAt : EndProcedure
+
+; The word for a phase. Present tense, because it is printed as the work
+; starts and it is what the operator is looking at when it stops.
+Procedure.i XhciPhaseText(p.i)
+  Select p
+    Case #XHCI_PH_CLOCK  : ProcedureReturn "clock"
+    Case #XHCI_PH_ARENA  : ProcedureReturn "arena"
+    Case #XHCI_PH_LOCATE : ProcedureReturn "config"
+    Case #XHCI_PH_CAPS   : ProcedureReturn "registers"
+    Case #XHCI_PH_RESET  : ProcedureReturn "reset"
+    Case #XHCI_PH_CONFIG : ProcedureReturn "slots"
+    Case #XHCI_PH_MEMORY : ProcedureReturn "rings"
+    Case #XHCI_PH_RUN    : ProcedureReturn "run"
+    Case #XHCI_PH_DONE   : ProcedureReturn "ok"
+  EndSelect
+  ProcedureReturn "idle"
+EndProcedure
+
+; Install a hook, get the old one back. Zero removes it.
+Procedure.i XhciSetPhaseHook(*fn)
+  Define old.i
+  old = *xh_phaseHook
+  *xh_phaseHook = *fn
+  ProcedureReturn old
+EndProcedure
+
+Procedure xh_Phase(p.i)
+  xh_phaseAt = p
+  If *xh_phaseHook <> 0
+    xh_phaseHook()
+  EndIf
+EndProcedure
+
+; ======================================================================
 ;  THE CLOCK. Two lines of assembly and no dependency on any other
 ;  file, exactly as emmc.pi4 does it and for the same reason:
 ;  CNTPCT_EL0 and CNTFRQ_EL0 are readable with no trap and no setup at
@@ -2647,6 +2725,7 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
   ; without it. 1 MHz is the floor: the Pi 4's generic timer runs at
   ; 54 MHz and a plausible ARM system timer is never below 1 MHz, so a
   ; value under that is a register that is not answering.
+  xh_Phase(#XHCI_PH_CLOCK)
   xh_hz = xh_TickHz()
   If xh_hz < 1000000 Or xh_hz > 1000000000
     ProcedureReturn xh_Fail(#XHCI_ERR_NO_CNTFRQ)
@@ -2655,6 +2734,7 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
   ; The arena. Aligned at run time, because the compiler's BSS is only
   ; ".align 16" and the order of globals within it is not this file's
   ; to assume.
+  xh_Phase(#XHCI_PH_ARENA)
   xh_base = (@xh_arena[0] + (#XHCI_ALIGN - 1)) / #XHCI_ALIGN
   xh_base = xh_base * #XHCI_ALIGN
   xh_end  = @xh_arena[0] + #XHCI_ARENA_BYTES
@@ -2666,14 +2746,21 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
     ProcedureReturn xh_Fail(#XHCI_ERR_DMA_RANGE)
   EndIf
 
+  xh_Phase(#XHCI_PH_LOCATE)
   If xh_Locate() = 0
     xh_FailStop()
     ProcedureReturn 0
   EndIf
+  ; THE FIRST ACCESS THROUGH THE OUTBOUND WINDOW is the next line, and it
+  ; is the one access in this whole file that can wedge the machine rather
+  ; than answer: a read with no completion does not abort here, it stalls.
+  ; That is why the marker is set BEFORE it.
+  xh_Phase(#XHCI_PH_CAPS)
   If xh_ReadCaps() = 0
     xh_FailStop()
     ProcedureReturn 0
   EndIf
+  xh_Phase(#XHCI_PH_RESET)
   If xh_Reset() = 0
     xh_FailStop()
     ProcedureReturn 0
@@ -2682,21 +2769,25 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
   ; CONFIG - the number of device slots enabled. xhci_lowlevel_init()
   ; programs the maximum the controller reports, preserving the
   ; reserved bits 8:31.
+  xh_Phase(#XHCI_PH_CONFIG)
   maxs = xh_maxSlots & $FF
   v = xh_Rd(xh_op, #XHCI_CONFIG)
   v = maxs | (v & (~$FF))
   xh_Wr(xh_op, #XHCI_CONFIG, v)
 
+  xh_Phase(#XHCI_PH_MEMORY)
   If xh_MemInit() = 0
     xh_FailStop()
     ProcedureReturn 0
   EndIf
+  xh_Phase(#XHCI_PH_RUN)
   If xh_Start() = 0
     xh_FailStop()
     ProcedureReturn 0
   EndIf
 
   xh_ready = 1
+  xh_Phase(#XHCI_PH_DONE)
   ProcedureReturn 1
 EndProcedure
 

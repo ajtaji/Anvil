@@ -240,8 +240,45 @@ Procedure BootOk(*name)
   EndIf
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  THE xHCI STEP SAYS WHICH PART OF ITSELF IS RUNNING - added 2026-09-11.
+;
+;  BootStep's contract is "if the board hangs during a step, the name sits
+;  on the screen with no result and names exactly what wedged". For every
+;  other step that is enough, because a step is one thing. The xHCI step
+;  is seven, and three of them touch a bus that can STALL rather than
+;  answer - the config-space walk, the first read of the controller's own
+;  registers through the PCIe outbound window, and the reset. All seven
+;  produce the same picture from the panel: a label and no result.
+;
+;  Every wait inside xhci.pi4 is bounded and every failure it can describe
+;  comes back as a code with a sentence, so a stop with NO sentence is by
+;  construction not a refusal - it is the machine wedging. The only thing
+;  that can say where is a word printed BEFORE the access. This prints it.
+;
+;  The words go on the same line as the label, after its dots, so a
+;  completed step reads as one line and a wedged one ends at the word for
+;  the piece it was doing. The hook is removed the moment the step is
+;  over: nothing prints on the lazy path a `usb` command takes later.
+; ----------------------------------------------------------------------
+Procedure UsbPhaseWord()
+  If gBootLog = 0
+    ProcedureReturn
+  EndIf
+  If XhciPhase() = #XHCI_PH_DONE
+    ; BootOk prints the result for this line. Two "ok"s would be a lie
+    ; about how many things finished.
+    ProcedureReturn
+  EndIf
+  UartWriteStr(XhciPhaseText(XhciPhase()))
+  UartWrite(32)
+  UartDrain()
+  ScreenServiceTick()
+EndProcedure
+
 Procedure.i UsbEnumerate()
   Define i.i
+  Define phase.i
   If gUsbEnum <> 0
     ProcedureReturn 1
   EndIf
@@ -256,10 +293,13 @@ Procedure.i UsbEnumerate()
   EndIf
   BootOk("ok")
   BootStep("USB host (xHCI)")
+  phase = XhciSetPhaseHook(@UsbPhaseWord)
   If XhciInit() = 0
+    XhciSetPhaseHook(phase)
     BootOk("FAILED - the controller would not start")
     ProcedureReturn 0
   EndIf
+  XhciSetPhaseHook(phase)
   BootOk("ok")
   BootStep("USB devices")
   HidFindAndAttachAll()

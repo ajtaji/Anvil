@@ -409,9 +409,19 @@
 ;    parenthesised.
 ;  * >> IS ARITHMETIC on a signed .i. The only right shift here is on a
 ;    physical address, which is positive.
-;  * Procedure locals are statically allocated. Nothing here is
-;    reentrant, and there is ONE shared buffer: do not call into this
-;    library from an interrupt that can land on top of a MailboxSend().
+;  * PROCEDURE LOCALS LIVE IN THE INVOCATION'S FRAME. This line used to
+;    say they were statically allocated; that stopped being true on
+;    2026-09-11 and the correction matters here more than most places,
+;    because it is the half of the reentrancy story this file owns that
+;    CHANGED. The other half did not: there is still ONE shared property
+;    buffer (mbxBuf) and one shared tag list, so this library is still not
+;    reentrant, and the rule is unchanged - do not call into it from an
+;    interrupt that can land on top of a MailboxSend(). What changed is
+;    only that the locals are no longer part of the problem.
+;    A consequence worth stating: mbxBuf is file-scope and always was,
+;    which is why the VideoCore may hold its address across a call. A
+;    property buffer built in a local would now be a frame the firmware
+;    reads after the call that made it has returned.
 ;
 ; ======================================================================
 ;  WHAT HAS BEEN VERIFIED - 2026-08-24
