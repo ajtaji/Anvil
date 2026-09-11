@@ -236,7 +236,29 @@ to that list in future without a board proof prints `OWED` and fails the gate.
 format or tiling or mip or layer or sample count, no asynchrony, no concurrency,
 no caches-on/caches-off pair, no fault injection, and no repeat or soak.
 
-**2026-09-11, run 4 — REQUESTED, NOT TAKEN.**
+**2026-09-11, run 4 — TAKEN, AND NOT MEASURED.** The payload ran, returned in
+12.4 s with `x0` inside its own BSS, faulted nothing and left the console clean.
+Its report was then read at the wrong offsets: the block was sixty-four 64-BIT
+slots and the monitor's dump has no 64-bit width and counts bytes, so slot N
+appears at word 2N. Twelve dumped words decode exactly as slots 9 to 14 - an
+image size of 4,096,000, a pitch of 3200, a vertex array at `$067D0000` and two
+pipeline bases 8 KiB apart - and were read as slots 17 to 28, which is where the
+pixel readbacks live. Under the same doubling the two verdicts sit at words 2
+and 8; the values read as "slot 1" and "slot 4" were the zero halves of the
+magic and of a detail slot, and "slot 47" was the zero half of slot 23.
+
+**Neither verdict, and no pixel readback, was read. Run 4 established nothing
+about whether the triangles rendered** - not a pass and not a failure. The
+diagnostic's own header was the cause: it said to read the block with a bare
+`memory <that> 64`, which is sixty-four BYTES.
+
+The report is 32-bit words now, one slot to one word, with the step it reached
+in slot 61 and a tail magic in slot 63 so a short dump says so (Anvil
+`338ea23`). The two clear proofs carry the same wrong instruction, corrected in
+place; their numbering is unchanged because runs 2 and 3 are recorded against
+it.
+
+**2026-09-11, run 5 — REQUESTED, NOT TAKEN.**
 `RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4` is built and waiting
 for a board slot. It assembles four SPIR-V modules in the payload, creates two
 graphics pipelines through the public entry points, and renders one triangle
