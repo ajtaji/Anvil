@@ -32,7 +32,7 @@ Global gate_irqPendingCalls.i
 Global gate_irqQuiesceCalls.i
 Global gate_irqRearmCalls.i
 Global gate_irqDisableCalls.i
-Global gate_irqNested.i
+Global gate_irqBusySeen.i
 Global gate_baseIoCalls.i
 
 XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
@@ -201,17 +201,26 @@ Procedure.i GateWr(fn.i, addr.i, *src, n.i, incr.i)
   ProcedureReturn 1
 EndProcedure
 
+; The callback records whether the observer's re-entry guard is armed while
+; the callback runs. It does NOT observe from in here. A step written
+; 'cyw43_rxIrqOp(...)' is a call through a variable, so it is a call to every
+; procedure the variable can hold, and an observation made from the callback
+; would be a loop back into the observer that the backend refuses outright -
+; parameters live in globals, not in a per-call frame, so a second entry
+; would overwrite the first one's arguments. The guard is proven from both
+; ends instead: this counter shows the flag is armed for every operation the
+; observer issues, and the main body arms the flag by hand and shows an
+; observation made under it is refused without reaching the device at all.
 Procedure.i GateIrqOp(op.i)
+  If cyw43_rxIrqBusy <> 0
+    gate_irqBusySeen = gate_irqBusySeen + 1
+  EndIf
   Select op
     Case #CYW43_RXIRQ_ARM
       gate_irqArmCalls = gate_irqArmCalls + 1
       ProcedureReturn gate_irqArm
     Case #CYW43_RXIRQ_PENDING
       gate_irqPendingCalls = gate_irqPendingCalls + 1
-      If gate_irqNested <> 0
-        gate_irqNested = 0
-        cyw43_RxIrqObserve()
-      EndIf
       If gate_irqPendingCalls > 1 : ProcedureReturn gate_irqPendingAfter : EndIf
       ProcedureReturn gate_irqPending
     Case #CYW43_RXIRQ_QUIESCE
@@ -246,7 +255,7 @@ Procedure GateIrqScriptReset()
   gate_irqQuiesce = 1
   gate_irqRearm = 0
   gate_irqDisable = 1
-  gate_irqNested = 0
+  gate_irqBusySeen = 0
   gate_irqArmCalls = 0
   gate_irqPendingCalls = 0
   gate_irqQuiesceCalls = 0
@@ -304,6 +313,8 @@ Procedure.i Main()
   Define observes.i
   Define restores.i
   Define ioCalls.i
+  Define ops.i
+  Define nested.i
   Define *p
 
   gate_coreBase = #CYW43_ENUM_BASE + $2000
@@ -425,16 +436,34 @@ Procedure.i Main()
   If Cyw43Receive(0) <> 0 Or Cyw43RxIrqRearmReady() <> 1 : ProcedureReturn 23 : EndIf
   If gate_irqRearmCalls <> 1 Or gate_f2Reads <> 1 : ProcedureReturn 24 : EndIf
 
-  ; A nested observation from the callback is refused without touching the
-  ; device state. The outer observation still completes once.
+  ; A nested observation is refused without touching the device state, and
+  ; the outer observation still completes once. The callback cannot make the
+  ; nested call itself - see the note above GateIrqOp - so the guard is shown
+  ; from both ends: every operation the outer observation issues runs with the
+  ; flag armed, and an observation made under a hand-armed flag is counted as
+  ; nested, returns zero and issues no operation at all, while the same call
+  ; with the flag down reaches the device again.
   GateFifoReset()
   GateIrqScriptReset()
-  gate_irqNested = 1
   gate_irqPending = 1
   gate_statusFirst = #CYW43_I_HMB_FRAME_IND
   GateAppendEmpty()
   If Cyw43Receive(0) <> 0 : ProcedureReturn 25 : EndIf
-  If Cyw43RxIrqNestedCalls() <> 1 Or gate_irqQuiesceCalls <> 1 Or gate_irqRearmCalls <> 1 : ProcedureReturn 26 : EndIf
+  If gate_irqQuiesceCalls <> 1 Or gate_irqRearmCalls <> 1 : ProcedureReturn 26 : EndIf
+  If gate_irqArmCalls <> 0 Or gate_irqDisableCalls <> 0 : ProcedureReturn 103 : EndIf
+  ops = gate_irqPendingCalls + gate_irqQuiesceCalls + gate_irqRearmCalls
+  If gate_irqBusySeen <> ops : ProcedureReturn 104 : EndIf
+  nested = Cyw43RxIrqNestedCalls()
+  observes = Cyw43RxIrqObserveCalls()
+  cyw43_rxIrqBusy = 1
+  If cyw43_RxIrqObserve() <> 0 : ProcedureReturn 105 : EndIf
+  cyw43_rxIrqBusy = 0
+  If Cyw43RxIrqNestedCalls() <> nested + 1 : ProcedureReturn 106 : EndIf
+  If Cyw43RxIrqObserveCalls() <> observes + 1 : ProcedureReturn 107 : EndIf
+  If gate_irqPendingCalls + gate_irqQuiesceCalls + gate_irqRearmCalls <> ops : ProcedureReturn 108 : EndIf
+  If gate_irqArmCalls <> 0 Or gate_irqDisableCalls <> 0 : ProcedureReturn 109 : EndIf
+  If cyw43_RxIrqObserve() <> 0 : ProcedureReturn 110 : EndIf
+  If gate_irqPendingCalls + gate_irqQuiesceCalls + gate_irqRearmCalls <> ops + 1 : ProcedureReturn 111 : EndIf
 
   ; A retained frame is software-ready. It neither probes readiness nor reads
   ; F2, and its already-accounted sequence/window metadata stays authoritative.

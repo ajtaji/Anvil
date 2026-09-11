@@ -101,6 +101,12 @@ ERET_BANKS = {
 }
 
 
+# MRS Xt, CNTPCT_EL0 - op0 3, op1 3, CRn 14, CRm 0, op2 1, with Rt in
+# bits 4:0.  See the note on `cntpct` for why this one is answered and
+# CNTFRQ_EL0 (the same quadruple with op2 0) is not.
+CNTPCT_EL0_READ = 0xD53BE020
+
+
 _CRC_TABLES: dict[int, list[int]] = {}
 
 
@@ -503,6 +509,39 @@ class A64:
     erets: List[Tuple[int, int, int]] = field(default_factory=list)
 
     # ------------------------------------------------------------------
+    #  THE GENERIC TIMER'S COUNT - CNTPCT_EL0 - added 2026-09-11
+    # ------------------------------------------------------------------
+    #  MODELLED HERE, ALWAYS, AND NOT IN THE STORE ABOVE.  Nothing writes
+    #  CNTPCT_EL0, so a store that answers it with whatever was last
+    #  written answers zero forever, and a counter that does not move is
+    #  a WRONG answer rather than an absent one: a program that waits for
+    #  it never finishes, and a program that timestamps with it records
+    #  the same instant for every event.  The architecture defines the
+    #  BEHAVIOUR of this register completely - a 64-bit count that only
+    #  ever increases - and says nothing about its value, so a model can
+    #  honour it in full without inventing anything.
+    #
+    #  It advances once per EXECUTED INSTRUCTION rather than once per
+    #  read, so that work done between two reads shows as elapsed time
+    #  and a spin that only reads still terminates.  THE RATE IS A MODEL
+    #  CHOICE AND MEANS NOTHING IN REAL TIME; `cntpct_per_instruction`
+    #  exists so that a gate measuring a deadline can say what it is
+    #  measuring in rather than reaching around step().
+    #
+    #  CNTFRQ_EL0 IS DELIBERATELY NOT HERE, and the asymmetry is the
+    #  point.  Its value is board data programmed by firmware - 54 MHz on
+    #  the Pi 4, 19.2 MHz on the UNO Q - and it is arithmetic a program
+    #  DIVIDES BY, so a baked-in default would silently hand one board's
+    #  frequency to another board's image and call the resulting duration
+    #  a result.  There is a gate whose whole job is to catch 54 MHz
+    #  baked in somewhere.  A gate that reads CNTFRQ_EL0 is doing time
+    #  arithmetic and must therefore declare its frequency; a gate that
+    #  only timestamps needs nothing, which is why one is answered here
+    #  and the other is still refused by name at the foot of step().
+    cntpct: int = 0
+    cntpct_per_instruction: int = 1
+
+    # ------------------------------------------------------------------
     #  THE LOCAL EXCLUSIVE MONITOR - added 2026-08-28 with the atomics
     # ------------------------------------------------------------------
     #  WHAT THIS IS FOR, AND WHAT IT HONESTLY CANNOT BE FOR.
@@ -846,6 +885,10 @@ class A64:
         ins = self.fetch(here)
         self.pc = (self.pc + 4) & MASK64
 
+        # The generic timer's count moves with every instruction executed,
+        # including this one.  See the note on `cntpct`.
+        self.cntpct = (self.cntpct + self.cntpct_per_instruction) & MASK64
+
         # Hints: nop, wfe, wfi, sev. (wfi added 2026-08-24.)
         if ins in (0xD503201F, 0xD503205F, 0xD503207F, 0xD503209F):
             return
@@ -933,6 +976,16 @@ class A64:
         # has no asynchronous exception source, so these are ordering/state
         # no-ops after their encoding has been independently checked.
         if (ins & 0xFFFFF0FF) in (0xD50340DF, 0xD50340FF):
+            return
+
+        # MRS Xt, CNTPCT_EL0.  ABOVE the opt-in store on purpose: nothing
+        # writes this register, so the store would answer it with the zero
+        # it has never been given and the count would stand still for a
+        # gate that had opted in.  See the note on `cntpct`.
+        if (ins & 0xFFFFFFE0) == CNTPCT_EL0_READ:
+            rt = ins & 31
+            if rt != 31:
+                self.x[rt] = self.cntpct
             return
 
         # ------------------------------------------------------------------
@@ -1561,6 +1614,30 @@ class A64:
                 "honestly means transcribing FPAdd, FPMul, FPDiv, "
                 "FPRound, FPUnpackBase and FPProcessNaNs from the "
                 "architecture's own pseudocode.")
+
+        # An MRS or MSR of a register this model does not answer.  NAME IT.
+        # The encoding carries the architecture's own five-tuple, so the
+        # refusal can say which register was asked for and what to do about
+        # it; a bare hex word makes somebody decode it by hand before they
+        # can even start, and that is the one thing this message was for.
+        if (ins & 0xFFF00000) in (0xD5100000, 0xD5300000):
+            rt = ins & 31
+            register = "S%d_%d_C%d_C%d_%d" % (
+                2 + ((ins >> 19) & 1), (ins >> 16) & 7,
+                (ins >> 12) & 15, (ins >> 8) & 15, (ins >> 5) & 7)
+            if ins & self.SYSREG_READ_BIT:
+                asked = "mrs x%d, %s" % (rt, register)
+            else:
+                asked = "msr %s, x%d" % (register, rt)
+            raise RuntimeError(
+                f"A64 word {ins:08x} at {here:#x} is `{asked}`, a system "
+                "register this model does not answer. It models CNTPCT_EL0 "
+                "on its own, and enable_system_registers() adds a store "
+                "that reads back what the program under test has written. "
+                "Everything else - CNTFRQ_EL0 included, because its value "
+                "is board data and not architecture - has to be answered "
+                "by the gate, above step(), where the value it chooses is "
+                "visible next to the claim it supports.")
 
         raise RuntimeError(f"unsupported A64 word {ins:08x} at {here:#x}")
 
@@ -2837,9 +2914,72 @@ def selftest() -> None:
                 "0x%08X (%s) was executed instead of refused" % (word, wanted)
             )
 
+    # THE GENERIC TIMER'S COUNT, and the frequency that is still refused.
+    # 2026-09-11. Before this, `mrs x0, cntpct_el0` reached the generic
+    # unsupported-word fault, and the ten gates that meet it each carried
+    # a private answer above step() - so the eleventh, which only needed a
+    # timestamp, went red with a bare hex word for a reason nobody could
+    # read. Four properties, and the fourth is the reason the first three
+    # are safe to have: the frequency is NOT answered here.
+    #
+    #   movz x9,#0x200 ; mrs x0,cntpct_el0 ; nop ; nop ; mrs x1,cntpct_el0
+    clock = A64(pc=0x7000)
+    load_words(clock, [0xD2804009, 0xD53BE020, 0xD503201F, 0xD503201F,
+                       0xD53BE021], base=0x7000)
+    for _ in range(5):
+        clock.step()
+    #   1. It reads, into the register the encoding names.
+    assert clock.x[0] == 2, clock.x[0]
+    #   2. It only ever goes up, and
+    #   3. the work between two reads is what it went up BY - a counter
+    #      that moved only when read would call these two reads adjacent.
+    assert clock.x[1] == 5, clock.x[1]
+    assert clock.x[1] - clock.x[0] == 3
+    #      The rate is the model's, and a gate that measures a deadline
+    #      says what it is measuring in.
+    fast = A64(pc=0x7000)
+    fast.cntpct_per_instruction = 64
+    load_words(fast, [0xD53BE020, 0xD503201F, 0xD53BE021], base=0x7000)
+    for _ in range(3):
+        fast.step()
+    assert (fast.x[0], fast.x[1]) == (64, 192), (fast.x[0], fast.x[1])
+    #      Rt = 31 is XZR here, not x31: the count is discarded, and no
+    #      general register moves. (There are 31 of them; x[31] does not
+    #      exist, which is the point.)
+    zr = A64(pc=0x7000)
+    load_words(zr, [0xD53BE03F], base=0x7000)
+    quiet_before = list(zr.x)
+    zr.step()
+    assert zr.pc == 0x7004 and zr.x == quiet_before
+    #   4. CNTFRQ_EL0 - the same quadruple with op2 0 - is REFUSED, and
+    #      the refusal names the register and says who has to answer it.
+    #      Its value is board data; see the note on `cntpct`.
+    frequency = A64(pc=0x7000)
+    load_words(frequency, [0xD53BE000], base=0x7000)
+    try:
+        frequency.step()
+    except RuntimeError as failure:
+        assert "mrs x0, S3_3_C14_C0_0" in str(failure), str(failure)
+        assert "CNTFRQ_EL0" in str(failure) and "board data" in str(failure)
+    else:
+        raise AssertionError(
+            "CNTFRQ_EL0 was answered. Its value is 54 MHz on one board and "
+            "19.2 MHz on another, and a program divides by it - an invented "
+            "default is a wrong duration reported as a measurement.")
+    #      And the same naming for a write nobody models.
+    write = A64(pc=0x7000)
+    load_words(write, [0xD51BE021], base=0x7000)     # msr S3_3_C14_C0_1, x1
+    try:
+        write.step()
+    except RuntimeError as failure:
+        assert "msr S3_3_C14_C0_1, x1" in str(failure), str(failure)
+    else:
+        raise AssertionError("an unmodelled MSR was executed instead of refused")
+
     print("PASS: A64 interpreter fixed-word oracle (ALU, div/rem, memory, branch, call/return)")
     print("PASS: A64 interpreter cache/TLB maintenance decoded as no-ops")
     print("PASS: A64 interpreter refuses AT and SVC/HVC/SMC/BRK/HLT by name")
+    print("PASS: A64 interpreter counts CNTPCT_EL0 and refuses CNTFRQ_EL0 by name")
 
     align_selftest()
 

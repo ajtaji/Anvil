@@ -120,6 +120,30 @@ def build_guard_mutant(pmfc: Path, work: Path, name: str) -> Path:
     shutil.copy2(PROBE, probe)
     return build(pmfc, root, root, probe)
 
+def build_busy_mutant(pmfc: Path, work: Path) -> Path:
+    """The observer without its re-entry guard.
+
+    The probe cannot observe from inside the callback - that is a loop
+    through the operation pointer and the backend refuses it - so the
+    guard is killed from the other end: with the test gone, the gate's
+    hand-armed observation walks straight into the device operations
+    instead of being counted as nested and returning zero.
+    """
+    root = work / "busy-mutant"
+    lib = root / "RaspberryPi4" / "Lib"; tests = root / "RaspberryPi4" / "Tests"
+    lib.mkdir(parents=True); tests.mkdir(parents=True)
+    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
+    shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", root / "RaspberryPi4" / "Intrinsics")
+    source = (ROOT / "RaspberryPi4/Lib/cyw43.pi4").read_text(encoding="utf-8")
+    old = "  If cyw43_rxIrqBusy <> 0"
+    if source.count(old) != 1:
+        raise SystemExit("CYW43 readiness gate: re-entry guard mutation site drifted")
+    (lib / "cyw43.pi4").write_text(source.replace(old, "  If 0 <> 0", 1), encoding="utf-8", newline="\n")
+    shutil.copy2(ROOT / "RaspberryPi4/Lib/cyw43_rx_glom.pi4", lib)
+    probe = tests / PROBE.name; shutil.copy2(PROBE, probe)
+    return build(pmfc, root, root, probe)
+
+
 def build_scratch_mutant(pmfc: Path, work: Path) -> Path:
     root = work / "scratch-mutant"
     lib = root / "RaspberryPi4" / "Lib"; tests = root / "RaspberryPi4" / "Tests"
@@ -227,6 +251,14 @@ def main() -> int:
         if scratch_result == 0:
             print("cyw43_rx_readiness_emitted_check: FAIL per-call scratch mutant survived")
             return 1
+        busy = build_busy_mutant(pmfc, work)
+        busy_result, busy_steps = execute(a64, busy)
+        if busy_result != 106:
+            print(
+                "cyw43_rx_readiness_emitted_check: FAIL re-entry guard mutant "
+                f"returned {busy_result}, expected 106"
+            )
+            return 1
     if result:
         print(
             f"cyw43_rx_readiness_emitted_check: FAIL assertion {result} "
@@ -234,9 +266,10 @@ def main() -> int:
         )
         return 1
     print(
-        f"cyw43_rx_readiness_emitted_check: PASS - 89 labeled assertions, "
-        f"{steps:,} A64 instructions; four generation-guard mutants and "
-        f"scratch-reset mutant rejected in {mutant_steps + scratch_steps:,} instructions"
+        f"cyw43_rx_readiness_emitted_check: PASS - 111 labeled assertions, "
+        f"{steps:,} A64 instructions; four generation-guard mutants, the "
+        f"scratch-reset mutant and the re-entry-guard mutant rejected in "
+        f"{mutant_steps + scratch_steps + busy_steps:,} instructions"
     )
     return 0
 
