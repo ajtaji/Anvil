@@ -33,6 +33,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 GATE = ROOT / "RaspberryPi4" / "Tests" / "vulkan_v3d_backend_emitted_gate.pi4"
 BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_backend.pi4"
+# The board diagnostic is not executed here - it needs the GPU - but it is
+# BUILT, so it cannot rot silently between slots. A diagnostic that no
+# longer compiles is discovered on the bench otherwise, which is the most
+# expensive place to discover it.
+DIAGNOSTIC = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanClearProof.pi4"
 
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -113,11 +118,13 @@ def load_interpreter(path: pathlib.Path):
     return module
 
 
-def build(compiler: pathlib.Path, root: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
-    image = pathlib.Path(tempfile.gettempdir()) / "anvil_vk_v3d_backend.img"
+def build(compiler: pathlib.Path, root: pathlib.Path, source: pathlib.Path,
+          load: int = LOAD, stack: int = STACK, name: str = "anvil_vk_v3d_backend.img"
+          ) -> pathlib.Path:
+    image = pathlib.Path(tempfile.gettempdir()) / name
     command = [
         str(compiler), source.relative_to(root).as_posix(),
-        "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
+        "-t", "pi4", "--load-addr", hex(load), "--stack-addr", hex(stack),
         "--entry-returns", "-o", str(image), "-s",
     ]
     env = os.environ.copy()
@@ -252,6 +259,18 @@ def main() -> int:
             print("  " + failure)
         return 1
 
+    # The board diagnostic must at least build, at its own load address.
+    try:
+        build(compiler, ROOT, DIAGNOSTIC, 0x500000, 0x4F00000,
+              "anvil_vulkan_clear_proof.img")
+        diagnostic_built = True
+    except SystemExit as exc:
+        print("vulkan_v3d_backend_check: FAIL")
+        print("  the board diagnostic no longer builds, so the next GPU slot would")
+        print("  have been spent discovering that on the bench:")
+        print("  " + str(exc).splitlines()[0][:160])
+        return 1
+
     cpu, rc, steps = execute(a64, build(compiler, ROOT, GATE))
     g = grade(cpu, rc)
     if g.failures:
@@ -268,6 +287,9 @@ def main() -> int:
     print("  NOT ONE MMIO ACCESS was made reaching that answer")
     print("  the backend lowers only through NeonRetarget/NeonFrameBegin/NeonFrameEnd and")
     print("  holds no processor-side or DMA image fallback")
+    if diagnostic_built:
+        print("  the board diagnostic vulkanClearProof.pi4 builds at $500000 (not executed:")
+        print("  it needs the GPU, and that is a slot)")
 
     if not args.mutate:
         print("  (run with --mutate to also require every plausible mistake to be caught)")

@@ -80,7 +80,28 @@ one gets a compile-time refusal naming it.
 
 None of these prove GPU execution, displayed output, concurrency, memory
 visibility, WSI, shader correctness or conformance. The only thing that can is
-the board diagnostic, and it has not been run.
+the board diagnostic.
+
+### Board runs
+
+**2026-09-11, run 1 — no GPU result.** `vulkanClearProof.pi4` (container
+`3a6cde76…`) returned in 1.16 s with status `#VCP_ERR_DISPLAY`, detail `-19`
+(`#DSP_ESEND`). It never reached V3D. The cause was in the diagnostic, not in
+the driver and not in the display library: it called `DisplayInit`, which
+**asks the firmware for a display**, and on this bench the firmware has none —
+the DSI panel is brought up and driven by the monitor, which installs its
+framebuffer with `DisplayAdopt` instead. The nine-tag property transaction had
+nothing to allocate against and failed. The console restored cleanly.
+
+That run also exposed a structural fault worth more than the bug: the GPU proof
+had been made to **depend** on taking the screen, so a display refusal reported
+nothing at all about V3D. The diagnostic now runs the whole GPU proof in memory
+the payload owns — no display, no firmware, no framebuffer — and presentation is
+a separate step with its own verdict. A present that cannot happen can no longer
+hide a GPU result that did.
+
+**Run 2 — not yet run.** Until it is, nothing in this document claims V3D
+executes a Vulkan clear.
 
 ## Required architecture
 
