@@ -584,6 +584,8 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Core/help.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/thermal.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation (the AVS register half is being moved to a module; see relocations) |
+| `RaspberryPi4/Lib/thermal.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/memcmd.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/memcmd.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
