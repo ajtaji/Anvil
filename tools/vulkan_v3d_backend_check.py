@@ -89,9 +89,15 @@ MUTANTS = (
 BOARD_ONLY = (
     ("the backend stops refusing the buffer the display is scanning out",
      "with the engine down Neon_SurfaceBase() is zero and the engine-not-ready "
-     "refusal answers first, so no desk run reaches that comparison"),
+     "refusal answers first, so no desk run reaches that comparison. Board run 2 "
+     "(2026-09-11) evaluated it with a live engine and it correctly did NOT fire - "
+     "the image was at $063E8000 and the surface at $06000000 - so the false-positive "
+     "direction is proven and the REFUSING direction is still owed"),
     ("the backend stops matching the render geometry Neon was initialised with",
-     "the width, height and pitch it compares against only exist after NeonInit"),
+     "the width, height and pitch it compares against only exist after NeonInit. "
+     "Board run 2 evaluated it at 800x1280 pitch 3200 against a surface of exactly "
+     "that, so it correctly did not fire; a mismatched extent has never been offered "
+     "to it on silicon and the REFUSING direction is still owed"),
 )
 
 

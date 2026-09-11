@@ -62,7 +62,7 @@ one gets a compile-time refusal naming it.
 | Public API | The entry points in the table above, validating `sType`, `pNext`, flags, counts, pointers, parents and host-synchronization rules before entering the object engine. Invalid usage that core Vulkan leaves undefined returns an Anvil code far outside `VkResult`'s range, with a whole sentence naming the code and the next thing to check; void commands record that sentence and, where the specification allows, invalidate the command buffer. | There is no loader, `vkGetInstanceProcAddr`, `vkGetDeviceProcAddr`, dispatch table, layer interface, extension negotiation or `VkAllocationCallbacks` support. Host allocation callbacks are refused rather than ignored. `vkMapMemory` does not exist; `AnvilVkImageAddress` is an Anvil answer and is named as one. Concurrent host calls are still unsafe — see the prerequisites. |
 | Instance and device discovery | Typed generation handles reject stale handles and wrong owners across all nine object types. One instance, physical device, device and transfer queue, over whichever backend is linked. | A production Pi build still enumerates a device only when the graphics engine is up and an offscreen window has been declared. UNO Q links `vk_backend_none.pbi` and enumerates nothing. |
 | Command lifecycle | Pools and primary/secondary buffers across initial, recording, executable, pending, invalid, reset, free and destroy. Resources a submission references are retained until it completes, and reset, free, pool reset and pool destroy all refuse while a buffer is pending. Exactly one submission may be outstanding. | Secondary execution and inheritance, simultaneous use, array allocation, externally synchronized host access, and the rest of the command set are absent. |
-| Pi 4 V3D backend | `vk_v3d_backend.pi4` lowers one validated whole-image clear to `NeonRetarget` + `NeonFrameBegin` + `NeonFrameEnd`, which build and submit real V3D bin and render control lists, wait for both, clean the V3D caches and maintain the processor's view of the target. It saves and restores the engine's previous target even when the frame fails, refuses the buffer the display is scanning out, and reports a native failure as `VK_ERROR_DEVICE_LOST` with the engine's own code. There is no processor-side and no DMA image fallback anywhere under it. | It clears only an image whose width, height and row pitch are the render geometry `NeonInit` was given: `NeonFrameBegin`/`NeonFrameEnd` render at that geometry and `NeonRetarget` rebinds only the target address. Any other extent is refused at record time with `VK_ERROR_FEATURE_NOT_PRESENT`. Lifting that needs a new primitive in `RaspberryPi4/Lib/v3d.pi4` to rebind the render geometry and re-size the tile pools between frames. Execution has **no silicon acceptance recorded here yet**; the board proof is `RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4`. |
+| Pi 4 V3D backend | `vk_v3d_backend.pi4` lowers one validated whole-image clear to `NeonRetarget` + `NeonFrameBegin` + `NeonFrameEnd`, which build and submit real V3D bin and render control lists, wait for both, clean the V3D caches and maintain the processor's view of the target. It saves and restores the engine's previous target even when the frame fails, refuses the buffer the display is scanning out, and reports a native failure as `VK_ERROR_DEVICE_LOST` with the engine's own code. There is no processor-side and no DMA image fallback anywhere under it. | It clears only an image whose width, height and row pitch are the render geometry `NeonInit` was given: `NeonFrameBegin`/`NeonFrameEnd` render at that geometry and `NeonRetarget` rebinds only the target address. Any other extent is refused at record time with `VK_ERROR_FEATURE_NOT_PRESENT`. Lifting that needs a new primitive in `RaspberryPi4/Lib/v3d.pi4` to rebind the render geometry and re-size the tile pools between frames. Execution is **accepted on silicon as of board run 2, 2026-09-11** (see Board runs): every one of 1,024,000 pixels correct, both V3D jobs advanced, no fault, guard buffer untouched. That is one clear at one geometry with no shader and no draw, and nothing beyond it is claimed. |
 | Pi 4 renderer | The existing Pi driver initializes V3D 4.2, GPU page tables, QPU encoding, bin/render control lists, TFU and CSD submission, bounded waits, cache maintenance, OOM handling, and fault evidence. Neon builds fixed UI shaders and geometry for boxes, lines, glyphs, textures, clipping, rotation, and console chrome. The console has exercised the underlying V3D bin/render path on hardware. | Neon is an engine API, not Vulkan fixed-function state. Its built-in shaders are not SPIR-V, shader modules, descriptor-backed programs, or general graphics/compute pipelines. Direct polling and single-owner global arenas are not a Vulkan queue scheduler. A working console does not prove arbitrary Vulkan commands or shaders. |
 | Memory and resources | One heap, taken whole from the backend and suballocated first-fit with page-granular alignment. `VkDeviceMemory` and `VkImage` are real objects with generations, owners, bind counts and in-flight counts. Row pitch and image size come from the backend's rule, not from the width. Memory still bound to an image, or referenced by an outstanding submission, cannot be freed. | There are no buffers, buffer views, image views, samplers, descriptors, mip levels, array layers, tilings other than linear, aliasing, dedicated allocations, sparse memory, `vkMapMemory`, flush/invalidate of mapped ranges, or formats other than `B8G8R8A8_UNORM`. There is one queue family, so queue-family ownership transfer is refused rather than implemented. |
 | Synchronization | `VkFence` with its two states and its one owner: unsignalled and unused at submit, signalled at completion, refusing reset and destroy while in use. `vkWaitForFences` honours its timeout and is bounded twice so a stalled backend cannot hang the caller. Image memory barriers with layout tracking that is checked at record time against the recording and at submit time against the image, and access/stage scopes that must actually cover the transfer the barrier precedes. | There are no semaphores, events, timeline semaphores, global or buffer memory barriers, multi-submit dependencies, or concurrent queues. Submission on the V3D backend is synchronous: the bounded waits are inside `NeonFrameEnd`, so nothing is genuinely in flight when `vkQueueSubmit` returns. A wait that could be satisfied by another host thread is not implemented and would need reentrant call frames first. |
@@ -78,9 +78,9 @@ one gets a compile-time refusal naming it.
 | `tools/vulkan_resource_check.py` | PASS — 394 independent property checks over 816,892 executed A64 instructions; `--mutate` rejects all 30 plausible mistakes | The resource, layout, fence, retention, submission and error-reporting contracts, executed through the public entry points, with an MMIO hard stop armed; and that every byte of the bound image still held its poison, so no processor-side clear exists anywhere in the path |
 | `tools/vulkan_v3d_backend_check.py` | PASS — 51 property checks over 69,676 executed A64 instructions; `--mutate` rejects all 4 desk-reachable mistakes and names 2 board-only rules it cannot reach | That the whole closure links against the real display, V3D, QPU and Neon implementation, that a build with the engine down enumerates no device, and that reaching that answer makes not one MMIO access |
 
-None of these prove GPU execution, displayed output, concurrency, memory
-visibility, WSI, shader correctness or conformance. The only thing that can is
-the board diagnostic.
+None of these desk gates prove GPU execution, displayed output, concurrency,
+memory visibility, WSI, shader correctness or conformance. Only the board
+diagnostic can, and as of run 2 it has proved exactly one of them: execution.
 
 ### Board runs
 
@@ -100,8 +100,64 @@ the payload owns — no display, no firmware, no framebuffer — and presentatio
 a separate step with its own verdict. A present that cannot happen can no longer
 hide a GPU result that did.
 
-**Run 2 — not yet run.** Until it is, nothing in this document claims V3D
-executes a Vulkan clear.
+**2026-09-11, run 2 — PASSED. V3D executes a Vulkan colour clear.** Container
+`a06b43e5…`, `screen dma` first, returned in 12.25 s with the report at
+`$0058EB00`, magic `564B4350`, **slot 1 = 0**.
+
+What that verdict is computed from, and therefore what it asserts:
+
+- **Every pixel.** 1,024,000 words of an 800x1280 `VK_FORMAT_B8G8R8A8_UNORM`
+  image, each compared against `$FF3380B2`: slot 14 mismatches = **0**, slot 15
+  first-bad-offset = **-1** (the never-set sentinel), slots 12 and 13 (the first
+  and last words) both `$FF3380B2`, equal to slot 11, which the driver computed
+  rather than the test. Every one of those words held `$00CC7F4D` before the
+  submit. The clear value went in as four binary32 patterns
+  (`0.2f, 0.5f, 0.7f, 1.0f`), through the integer UNORM conversion, into the
+  packed word, into the tile store, and came back as the B, G, R, A byte order
+  this format requires — **the whole colour path is correct on silicon**.
+- **The GPU did it.** The verdict returns `#VCP_ERR_NO_JOBS` unless both the bin
+  and the render completion counters advanced, and `#VCP_ERR_V3D_FAULT` on any
+  binner OOM or V3D MMU fault. Status 0 means both jobs ran and neither faulted.
+  There is no processor-side or DMA fallback anywhere under this path.
+- **It wrote nowhere else.** The verdict returns `#VCP_ERR_GUARD_CHANGED` unless
+  the screen-sized guard buffer below the image is byte-identical afterwards. It
+  was. The backend's save and restore of the engine's previous render target
+  works on hardware.
+- **The fence and the layout.** Status 0 requires the wait to have succeeded and
+  the image's layout to have advanced to `VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`.
+- **A production Pi build enumerated a real GPU device for the first time**:
+  slot 42 (`AnvilVkBackendIsGpu`) = 1.
+- **Not one validation fault in the whole run**: slot 44 = 0. Every public `vk*`
+  call on the path succeeded; no refusal was taken.
+- Presented: slot 47 = 1, slot 45 = `#DSP_OK`. `DisplayAdopt` on the scanout
+  buffer, one `DisplayBlit`, and a person saw the colour.
+- Measured: 115.2 ms to submit and complete the clear, 867.4 ms to read
+  4,096,000 bytes back and compare them. The engine needed 10.52 MiB of its
+  16 MiB arena (slot 46).
+
+**What run 2 does NOT prove, and none of it may be inferred from the pass:**
+
+- **No shader.** No SPIR-V, no `VkShaderModule`, no pipeline, no QPU program was
+  compiled or run. A tile clear and a tile store are fixed-function; the frame
+  was submitted with **no draws**. Internal clear lowering is not a shader
+  compiler.
+- **No draw.** Zero primitives were binned. Nothing about vertices, geometry,
+  rasterisation or the QPU path is touched by this result.
+- **One geometry only.** 800x1280 at pitch 3200 — the render geometry `NeonInit`
+  was given. No other extent, format, tiling, mip level, array layer or sample
+  count has ever reached the GPU.
+- **The two refusal rules were exercised only in the accepting direction.** The
+  image was at `$063E8000` and the surface at `$06000000`, and the extents
+  matched exactly, so the "is this the scanned buffer?" and "is this the render
+  geometry?" checks both correctly did not fire. That they *would* fire on a bad
+  request is still unproven on silicon and is the next board run.
+- **No asynchrony.** `NeonFrameEnd` waits for both jobs, so the fence was already
+  signalled when `vkQueueSubmit` returned. The pending command-buffer state has
+  never been observed on hardware.
+- **One run, one cache state.** No repeat, no soak, no caches-on/caches-off pair,
+  and no fault injection: an unmapped address requiring a bounded fault rather
+  than a hang is still owed. Resource reuse across submissions was not exercised
+  either — only one submission happened.
 
 ## Required architecture
 
