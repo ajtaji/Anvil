@@ -207,6 +207,31 @@ Procedure ReadLine()
     EndIf
     MouseTick()
     TouchTick()
+    CompilerIf #CAP_TOUCH = 1
+    ; THE SOFT KEYBOARD'S SERVICE, IMMEDIATELY AFTER THE ONE DRAIN AND
+    ; NOWHERE ELSE.
+    ;
+    ; TouchTick above is the single drain of the hardware touch ring; it
+    ; hands every record to the dispatcher, which decides - once, at the
+    ; DOWN - whose contact it is. This is the keyboard emptying ITS OWN
+    ; lane in the same pass, which is why there is no second poll of the
+    ; controller anywhere in this monitor.
+    ;
+    ; IT IS IN THIS LOOP AND NOT IN ScreenServiceTick, although that is
+    ; called from more places and would look tidier. This loop is the
+    ; prompt: it is the only moment at which a keystroke has an editor to
+    ; go to. Servicing the keyboard from the screen tick would queue
+    ; keystrokes taken during a boot step, a long transfer or a payload
+    ; and apply them to whatever line was typed next - which is the
+    ; design's "queued touches cannot execute a command after upload",
+    ; and the way to honour it is not to take them at all.
+    ;
+    ; ON A BOARD WITH NO TOUCH SURFACE THIS IS NOT COMPILED. #CAP_TOUCH
+    ; is 0 there and the layer, the model's board adapter and the panel
+    ; it draws on do not exist - the same shape as the NtpServiceTick
+    ; call below, for the same reason.
+    TouchKeyboardServiceTick()
+    CompilerEndIf
     ; A restrained glint on the anvil is also a service-progress indicator:
     ; it advances only from this core spin, stops if the monitor stalls, and
     ; is internally rate-limited/damage-bounded. It is not driven by network

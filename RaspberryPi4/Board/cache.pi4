@@ -370,6 +370,18 @@ Procedure RunAt(a.i)
   ; a partial line in the ring.
   NetConsoleFlush()
 
+  ; PUT THE TOUCH KEYBOARD AWAY BEFORE THE MACHINE CHANGES HANDS.
+  ; It is a UI layer over a console this monitor is about to stop owning,
+  ; and its state is spread across three places: contacts and modifiers
+  ; in the key model, a reserved band in the console, and a hit rectangle
+  ; and a capture table in the input dispatcher. One call clears all
+  ; three, ending with InputCancelAll(#AIC_PAYLOAD) so that nothing the
+  ; dispatcher still held can be delivered to an editor that is not
+  ; running. The half-typed command line is deliberately NOT cleared:
+  ; cancellation is about contacts and modifiers, and text belongs to
+  ; whoever typed it.
+  TouchKeyboardPayloadSuspend()
+
   ; STOP THE ETHERNET BEFORE THE MACHINE CHANGES HANDS. The receive DMA
   ; engine is a bus master writing into #ETH_RX_BASE on its own schedule.
   ; EthPayloadQuiesce records whether the port must be restored, stops the
@@ -486,6 +498,14 @@ Procedure RunAt(a.i)
       PrintN("works; scrolling is slow again. Reset the board to get it back.")
     EndIf
   EndIf
+
+  ; THE MONITOR OWNS ITS OWN SCREEN AGAIN, so the keyboard layer may
+  ; exist again - and only now, after the caches are back and the display
+  ; DMA channel has been reclaimed or given up. It starts from nothing:
+  ; the surface every key rectangle was derived from was in the payload's
+  ; hands, so the layout is invalidated and re-derived rather than
+  ; trusted. Nothing is shown; the operator asks for it again.
+  TouchKeyboardPayloadResume()
 
   ; Restore only a controller that was active before the handoff. GENET was
   ; already reclaimed immediately after CallAddr. This is a

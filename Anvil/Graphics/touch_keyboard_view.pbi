@@ -34,12 +34,22 @@
 ;    cancellation are the input dispatcher's. This file is asked what the
 ;    keys look like and where they are, and answers.
 ;
-;  THE PLACEHOLDER MODEL. The fenced block below implements the seven
-;  model accessors over a static table so that the monitor BUILDS today,
-;  before Anvil/Core/touch_keyboard.pbi exists. It is NOT the character
-;  coverage contract and it is not a second implementation to be kept in
-;  step: when the model lands, DELETE the whole fenced block and keep the
-;  names. There must only ever be one definition of those accessors.
+;  THE MODEL IS Anvil/Core/touch_keyboard.pbi AND THERE IS ONLY ONE OF IT.
+;  A fenced placeholder model used to sit below, implementing the eight
+;  accessors over a static table so that the monitor built before the
+;  model existed. The model has landed, so the placeholder is gone: this
+;  file now ASKS the real model for its keys and its labels, and the
+;  character coverage contract is the model's alone. The accessors this
+;  file calls are TouchKeyboardKeyCount, KeyRow, KeyColumn, KeyWidthUnits,
+;  KeyKind, KeyLabel, KeyIsArmed, KeyIsLatched and KeyIsAccent.
+;
+;  THE HIDE CHEVRON IS THE MODEL'S HIDE KEY, laid out like every other
+;  key and then published separately as TouchKeyboardHide{X,Y,W,H} so the
+;  integration can ask "was this the chevron" without knowing what a key
+;  kind is. It used to be a rectangle this file CARVED OUT of row 0 for
+;  itself, which was right while the placeholder had no hide key and
+;  became a second dismiss button the moment the real model - whose
+;  utility row ends in one - arrived. One key, one rectangle, one label.
 ; ======================================================================
 
 ; ----------------------------------------------------------------------
@@ -192,7 +202,17 @@ Global gTkbHideX.i = 0
 Global gTkbHideY.i = 0
 Global gTkbHideW.i = 0
 Global gTkbHideH.i = 0
-Global gTkbHideDirty.i = 0
+Global gTkbHideAt.i = -1              ; which key the chevron IS, or -1
+
+; The prompt row, and the rectangle that owns touch while the band is
+; down. THE DISPATCHER HOLDS ONE RECTANGLE PER OWNER, so the keyboard's
+; rectangle is the band while it is up and this one while it is not:
+; that is how a tap on the editable prompt line reaches the keyboard
+; through the one dispatcher instead of through a second poll.
+Global gTkbPromptY.i = 0
+Global gTkbPromptH.i = 0
+Global gTkbIdleY.i = 0
+Global gTkbIdleH.i = 0
 
 Global gTkbBtnX.i = 0
 Global gTkbBtnY.i = 0
@@ -224,199 +244,6 @@ Global gTkbArenaAt.i = 0
 Global Dim gTkbArena.a[#TKB_ARENA + 4]
 Global gTkbOverflow.i = 0             ; a list or arena ran out - loud, never silent
 
-; ======================================================================
-;  ---- PLACEHOLDER MODEL -----------------------------------------------
-;  DELETE THIS WHOLE FENCED BLOCK when Anvil/Core/touch_keyboard.pbi
-;  lands, and keep the names. It exists so the monitor builds and so this
-;  file's gate has something to lay out; it is NOT the ASCII coverage
-;  contract, which is the model's.
-; ======================================================================
-#TKB_PAGE_ABC     = 0
-#TKB_PAGE_SYMBOL  = 1
-#TKB_PAGE_COMPACT = 2           ; the smallest supported arrangement
-
-Global gTkbMKeys.i = 0
-Global gTkbMPage.i = -1
-Global gTkbMArmed.i = -1
-Global Dim gTkbMRow.i[#TKB_MAX_KEYS]
-Global Dim gTkbMCol.i[#TKB_MAX_KEYS]
-Global Dim gTkbMUnits.i[#TKB_MAX_KEYS]
-Global Dim gTkbMLatch.a[#TKB_MAX_KEYS]
-Global Dim gTkbMAccent.a[#TKB_MAX_KEYS]
-Global Dim gTkbMLabel.a[#TKB_MAX_KEYS * #TKB_LABEL_MAX]
-Global Dim gTkbMRowFill.i[#TKB_MAX_ROWS]
-Global Dim gTkbMChar.a[4]
-
-Procedure TkbModelDef(row.i, units.i, accent.i, *label)
-  Define i.i
-  Define at.i
-  Define c.i
-  If gTkbMKeys >= #TKB_MAX_KEYS Or row < 0 Or row >= #TKB_MAX_ROWS
-    ProcedureReturn
-  EndIf
-  i = gTkbMKeys
-  gTkbMRow[i]    = row
-  gTkbMCol[i]    = gTkbMRowFill[row]
-  gTkbMUnits[i]  = units
-  gTkbMLatch[i]  = 0
-  gTkbMAccent[i] = accent
-  gTkbMRowFill[row] = gTkbMRowFill[row] + 1
-  at = 0
-  While at < (#TKB_LABEL_MAX - 1)
-    c = PeekA(*label + at) & $FF
-    If c = 0
-      Break
-    EndIf
-    gTkbMLabel[i * #TKB_LABEL_MAX + at] = c
-    at = at + 1
-  Wend
-  gTkbMLabel[i * #TKB_LABEL_MAX + at] = 0
-  gTkbMKeys = i + 1
-EndProcedure
-
-; A one-character key given by its ASCII CODE rather than as a literal.
-; Backslash and double quote are the two characters a source literal
-; argues with, and a command line needs both.
-Procedure TkbModelDefCode(row.i, units.i, code.i)
-  gTkbMChar[0] = code
-  gTkbMChar[1] = 0
-  TkbModelDef(row, units, 0, @gTkbMChar[0])
-EndProcedure
-
-Procedure TkbModelUtilityRow()
-  TkbModelDef(0, 6, 0, "Esc")
-  TkbModelDef(0, 6, 0, "Tab")
-  TkbModelDef(0, 6, 0, "Ctrl")
-  TkbModelDef(0, 6, 0, "Home")
-  TkbModelDef(0, 4, 0, "<-")
-  TkbModelDef(0, 4, 0, "->")
-  TkbModelDef(0, 6, 0, "End")
-  TkbModelDef(0, 6, 0, "Del")
-EndProcedure
-
-; TouchKeyboardModelSelect - choose the arrangement. An unknown page
-; leaves NO keys, which the layout refuses in a whole sentence rather
-; than drawing an empty band.
-Procedure.i TouchKeyboardModelSelect(page.i)
-  Define r.i
-  gTkbMKeys = 0
-  gTkbMArmed = -1
-  gTkbMPage = page
-  For r = 0 To #TKB_MAX_ROWS - 1
-    gTkbMRowFill[r] = 0
-  Next
-  If page = #TKB_PAGE_ABC
-    TkbModelUtilityRow()
-    TkbModelDef(1, 4, 0, "1") : TkbModelDef(1, 4, 0, "2") : TkbModelDef(1, 4, 0, "3")
-    TkbModelDef(1, 4, 0, "4") : TkbModelDef(1, 4, 0, "5") : TkbModelDef(1, 4, 0, "6")
-    TkbModelDef(1, 4, 0, "7") : TkbModelDef(1, 4, 0, "8") : TkbModelDef(1, 4, 0, "9")
-    TkbModelDef(1, 4, 0, "0")
-    TkbModelDef(2, 4, 0, "q") : TkbModelDef(2, 4, 0, "w") : TkbModelDef(2, 4, 0, "e")
-    TkbModelDef(2, 4, 0, "r") : TkbModelDef(2, 4, 0, "t") : TkbModelDef(2, 4, 0, "y")
-    TkbModelDef(2, 4, 0, "u") : TkbModelDef(2, 4, 0, "i") : TkbModelDef(2, 4, 0, "o")
-    TkbModelDef(2, 4, 0, "p")
-    TkbModelDef(3, 4, 0, "a") : TkbModelDef(3, 4, 0, "s") : TkbModelDef(3, 4, 0, "d")
-    TkbModelDef(3, 4, 0, "f") : TkbModelDef(3, 4, 0, "g") : TkbModelDef(3, 4, 0, "h")
-    TkbModelDef(3, 4, 0, "j") : TkbModelDef(3, 4, 0, "k") : TkbModelDef(3, 4, 0, "l")
-    TkbModelDef(4, 7, 0, "Shift")
-    TkbModelDef(4, 4, 0, "z") : TkbModelDef(4, 4, 0, "x") : TkbModelDef(4, 4, 0, "c")
-    TkbModelDef(4, 4, 0, "v") : TkbModelDef(4, 4, 0, "b") : TkbModelDef(4, 4, 0, "n")
-    TkbModelDef(4, 4, 0, "m")
-    TkbModelDef(4, 9, 0, "Bksp")
-    TkbModelDef(5, 6, 0, "?123")
-    TkbModelDef(5, 4, 0, "/") : TkbModelDef(5, 4, 0, ".")
-    TkbModelDef(5, 16, 0, "Space")
-    TkbModelDef(5, 4, 0, "-")
-    TkbModelDef(5, 8, 1, "Enter")
-  ElseIf page = #TKB_PAGE_SYMBOL
-    TkbModelUtilityRow()
-    TkbModelDef(1, 4, 0, "!") : TkbModelDef(1, 4, 0, "@") : TkbModelDef(1, 4, 0, "#")
-    TkbModelDef(1, 4, 0, "$") : TkbModelDef(1, 4, 0, "%") : TkbModelDef(1, 4, 0, "^")
-    TkbModelDef(1, 4, 0, "&") : TkbModelDef(1, 4, 0, "*") : TkbModelDef(1, 4, 0, "(")
-    TkbModelDef(1, 4, 0, ")")
-    TkbModelDef(2, 4, 0, "~") : TkbModelDef(2, 4, 0, "`") : TkbModelDef(2, 4, 0, "|")
-    TkbModelDefCode(2, 4, 92) : TkbModelDef(2, 4, 0, ":") : TkbModelDef(2, 4, 0, ";")
-    TkbModelDef(2, 4, 0, "'") : TkbModelDefCode(2, 4, 34) : TkbModelDef(2, 4, 0, "?")
-    TkbModelDef(2, 4, 0, ",")
-    TkbModelDef(3, 4, 0, "_") : TkbModelDef(3, 4, 0, "=") : TkbModelDef(3, 4, 0, "+")
-    TkbModelDef(3, 4, 0, "[") : TkbModelDef(3, 4, 0, "]") : TkbModelDef(3, 4, 0, "{")
-    TkbModelDef(3, 4, 0, "}") : TkbModelDef(3, 4, 0, "<") : TkbModelDef(3, 4, 0, ">")
-    TkbModelDef(4, 7, 0, "Shift")
-    TkbModelDef(4, 4, 0, "0") : TkbModelDef(4, 4, 0, "x") : TkbModelDef(4, 4, 0, "A")
-    TkbModelDef(4, 4, 0, "B") : TkbModelDef(4, 4, 0, "C") : TkbModelDef(4, 4, 0, "D")
-    TkbModelDef(4, 4, 0, "E")
-    TkbModelDef(4, 9, 0, "Bksp")
-    TkbModelDef(5, 6, 0, "ABC")
-    TkbModelDef(5, 4, 0, "/") : TkbModelDef(5, 4, 0, ".")
-    TkbModelDef(5, 16, 0, "Space")
-    TkbModelDef(5, 4, 0, "-")
-    TkbModelDef(5, 8, 1, "Enter")
-  ElseIf page = #TKB_PAGE_COMPACT
-    ; The smallest supported arrangement: the utility row split in two and
-    ; a single letter block. This is what a narrow screen is offered
-    ; before the layout is allowed to refuse.
-    TkbModelDef(0, 6, 0, "Esc")
-    TkbModelDef(0, 6, 0, "Tab")
-    TkbModelDef(0, 6, 0, "Ctrl")
-    TkbModelDef(0, 6, 0, "Del")
-    TkbModelDef(1, 4, 0, "<-") : TkbModelDef(1, 4, 0, "->")
-    TkbModelDef(1, 6, 0, "Home") : TkbModelDef(1, 6, 0, "End")
-    TkbModelDef(2, 7, 0, "Shift")
-    TkbModelDef(2, 4, 0, "a") : TkbModelDef(2, 4, 0, "b") : TkbModelDef(2, 4, 0, "c")
-    TkbModelDef(2, 9, 0, "Bksp")
-    TkbModelDef(3, 6, 0, "?123")
-    TkbModelDef(3, 16, 0, "Space")
-    TkbModelDef(3, 8, 1, "Enter")
-  EndIf
-  ProcedureReturn gTkbMKeys
-EndProcedure
-
-Procedure.i TouchKeyboardKeyCount()
-  If gTkbMPage < 0
-    TouchKeyboardModelSelect(#TKB_PAGE_ABC)
-  EndIf
-  ProcedureReturn gTkbMKeys
-EndProcedure
-Procedure.i TouchKeyboardKeyRow(i.i)
-  If i < 0 Or i >= gTkbMKeys : ProcedureReturn -1 : EndIf
-  ProcedureReturn gTkbMRow[i]
-EndProcedure
-Procedure.i TouchKeyboardKeyColumn(i.i)
-  If i < 0 Or i >= gTkbMKeys : ProcedureReturn -1 : EndIf
-  ProcedureReturn gTkbMCol[i]
-EndProcedure
-Procedure.i TouchKeyboardKeyWidthUnits(i.i)
-  If i < 0 Or i >= gTkbMKeys : ProcedureReturn 0 : EndIf
-  ProcedureReturn gTkbMUnits[i]
-EndProcedure
-Procedure.i TouchKeyboardKeyLabel(i.i)
-  If i < 0 Or i >= gTkbMKeys : ProcedureReturn 0 : EndIf
-  ProcedureReturn @gTkbMLabel[i * #TKB_LABEL_MAX]
-EndProcedure
-Procedure.i TouchKeyboardKeyIsArmed(i.i)
-  ProcedureReturn Bool(i >= 0 And i = gTkbMArmed)
-EndProcedure
-Procedure.i TouchKeyboardKeyIsLatched(i.i)
-  If i < 0 Or i >= gTkbMKeys : ProcedureReturn 0 : EndIf
-  ProcedureReturn gTkbMLatch[i]
-EndProcedure
-; The eighth accessor the VIEW needs and the design implies: Enter and an
-; active modifier are drawn in the accent, everything else is not.
-Procedure.i TouchKeyboardKeyIsAccent(i.i)
-  If i < 0 Or i >= gTkbMKeys : ProcedureReturn 0 : EndIf
-  ProcedureReturn gTkbMAccent[i]
-EndProcedure
-Procedure TouchKeyboardModelArm(i.i)
-  gTkbMArmed = i
-EndProcedure
-Procedure TouchKeyboardModelLatch(i.i, on.i)
-  If i >= 0 And i < gTkbMKeys
-    gTkbMLatch[i] = Bool(on <> 0)
-  EndIf
-EndProcedure
-; ======================================================================
-;  ---- END PLACEHOLDER MODEL -------------------------------------------
-; ======================================================================
 
 
 ; ----------------------------------------------------------------------
@@ -543,6 +370,41 @@ Procedure.i TouchKeyboardHideW()
 EndProcedure
 Procedure.i TouchKeyboardHideH()
   ProcedureReturn gTkbHideH
+EndProcedure
+
+; Which key the chevron is, so a caller that wants to know can ask rather
+; than re-derive it from the kinds. -1 before anything is laid out.
+Procedure.i TouchKeyboardHideKey()
+  ProcedureReturn gTkbHideAt
+EndProcedure
+
+; The editable prompt line, and the rectangle that owns touch while the
+; band is down. Both are full width: a finger aimed at a command line is
+; aimed at a LINE, and asking it to find an eight pixel tall cell is the
+; kind of target the density policy exists to refuse.
+Procedure.i TouchKeyboardPromptX()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i TouchKeyboardPromptY()
+  ProcedureReturn gTkbPromptY
+EndProcedure
+Procedure.i TouchKeyboardPromptW()
+  ProcedureReturn gTkbLW
+EndProcedure
+Procedure.i TouchKeyboardPromptH()
+  ProcedureReturn gTkbPromptH
+EndProcedure
+Procedure.i TouchKeyboardIdleX()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i TouchKeyboardIdleY()
+  ProcedureReturn gTkbIdleY
+EndProcedure
+Procedure.i TouchKeyboardIdleW()
+  ProcedureReturn gTkbLW
+EndProcedure
+Procedure.i TouchKeyboardIdleH()
+  ProcedureReturn gTkbIdleH
 EndProcedure
 
 Procedure.i TouchKeyboardButtonX()
@@ -785,27 +647,17 @@ Procedure.i TouchKeyboardLayout(*m.TouchKeyboardMetrics)
     r = r + 1
   Wend
 
-  ; ---- 6. the down-chevron, carved out of row 0 before the keys -------
-  ; It is the VIEW's, not the model's, so an arrangement can never arrive
-  ; without a way to dismiss it. Carving it out first is what makes its
-  ; rectangle provably disjoint from every key's.
-  gTkbHideW = gTkbPrefPx
-  gTkbHideH = gTkbRowH[0]
-  gTkbHideY = gTkbRowY[0]
-  gTkbHideX = lw - gTkbGutter - gTkbHideW
-
-  ; ---- 7. the keys ----------------------------------------------------
+  ; ---- 6. the keys ----------------------------------------------------
+  ; EVERY ROW IS LAID OUT THE SAME WAY, including row 0. There used to be
+  ; a chevron carved out of row 0 before the keys, because the placeholder
+  ; model had no hide key; the real model's utility row ends in one, so
+  ; carving a second rectangle here would have drawn two dismiss buttons
+  ; side by side. The chevron is found among the keys below instead.
   at = 0
   r = 0
   While r < rows
     slots = gTkbRowCount[r]
-    If r = 0
-      slots = slots + 1
-    EndIf
     usable = lw - (slots + 1) * gTkbGutter
-    If r = 0
-      usable = usable - gTkbHideW
-    EndIf
     ; THERE IS ONE WIDTH GUARD AND IT IS PER KEY, below. A second one on
     ; the row's total would be a weaker statement of the same thing - a
     ; row whose total fits can still hold a key that does not - and a
@@ -831,6 +683,34 @@ Procedure.i TouchKeyboardLayout(*m.TouchKeyboardMetrics)
     at = at + gTkbRowCount[r]
     r = r + 1
   Wend
+
+  ; ---- 7. the chevron IS one of those keys ----------------------------
+  ; The model says which - it is the key whose KIND is the hide kind - and
+  ; this file republishes its rectangle under the chevron's own name. The
+  ; integration can then ask "was this DOWN the chevron" without knowing
+  ; what a key kind is, and the rectangle it is asking about is provably
+  ; the same one the picture was drawn at, because it is a key's.
+  ;
+  ; AN ARRANGEMENT WITH NO WAY OUT IS REFUSED. A page whose model forgot
+  ; its hide key would be a keyboard that covers the prompt and cannot be
+  ; put away, so it is named as the defect it is rather than shown.
+  gTkbHideAt = -1
+  i = 0
+  While i < n
+    If TouchKeyboardKeyKind(i) = #TK_KIND_HIDE
+      gTkbHideAt = i
+      Break
+    EndIf
+    i = i + 1
+  Wend
+  If gTkbHideAt < 0
+    gTkbRefusal = "the touch keyboard key model offered a page with no hide key on it, so the keyboard would have covered the prompt with no way to put it away again; every page's utility row must end in the hide chevron."
+    ProcedureReturn 0
+  EndIf
+  gTkbHideX = gTkbKeyX[gTkbHideAt]
+  gTkbHideY = gTkbKeyY[gTkbHideAt]
+  gTkbHideW = gTkbKeyW[gTkbHideAt]
+  gTkbHideH = gTkbKeyH[gTkbHideAt]
 
   ; ---- 8. the label sizes --------------------------------------------
   ; The largest WHOLE magnification of the 8 x 16 bitmap that still fits
@@ -880,7 +760,22 @@ Procedure.i TouchKeyboardLayout(*m.TouchKeyboardMetrics)
   gTkbBtnY = kbY - gTkbBtnH
   gTkbBtnYHidden = lh - gTkbBtnH
   gTkbBtnDirty = 1
-  gTkbHideDirty = 1
+
+  ; ---- 10. the prompt row, and what owns touch while the band is down -
+  ; The console paints whole rows from the bottom of the banner, so with
+  ; nothing reserved the editable prompt line is the LAST whole row on the
+  ; screen. The idle rectangle is that row together with the keyboard
+  ; button, which is taller than a row and reaches further up; the union
+  ; is what the dispatcher is given as the keyboard's region while the
+  ; band is down, so a deliberate tap on either lands on this layer and
+  ; on nothing underneath it.
+  gTkbPromptH = ch
+  gTkbPromptY = bh + ((lh - bh) / ch - 1) * ch
+  gTkbIdleY = gTkbPromptY
+  If gTkbBtnYHidden < gTkbIdleY
+    gTkbIdleY = gTkbBtnYHidden
+  EndIf
+  gTkbIdleH = lh - gTkbIdleY
 
   gTkbOk = 1
   ProcedureReturn 1
@@ -922,9 +817,13 @@ Procedure.i TouchKeyboardHideHit(x.i, y.i)
   ProcedureReturn 1
 EndProcedure
 
+; THE BUTTON IS NOT THERE WHILE THE BAND IS UP. It is not drawn then -
+; the chevron is the affordance once the keyboard is open - and a hit
+; test that still answered for it would be a hit on a picture that is not
+; on the glass.
 Procedure.i TouchKeyboardButtonHit(x.i, y.i)
   Define by.i
-  If gTkbOk = 0
+  If gTkbOk = 0 Or gTkbVisible <> 0
     ProcedureReturn 0
   EndIf
   by = TouchKeyboardButtonY()
@@ -932,6 +831,22 @@ Procedure.i TouchKeyboardButtonHit(x.i, y.i)
     ProcedureReturn 0
   EndIf
   If y < by Or y >= (by + gTkbBtnH)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The editable prompt line, while the band is down. A DELIBERATE TOUCH IN
+; A FOCUSED EDITABLE LOCAL FIELD is the design's one auto-open trigger,
+; and this is that field's rectangle.
+Procedure.i TouchKeyboardPromptHit(x.i, y.i)
+  If gTkbOk = 0 Or gTkbVisible <> 0
+    ProcedureReturn 0
+  EndIf
+  If x < 0 Or x >= gTkbLW
+    ProcedureReturn 0
+  EndIf
+  If y < gTkbPromptY Or y >= (gTkbPromptY + gTkbPromptH)
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
@@ -966,8 +881,10 @@ Procedure TouchKeyboardMarkKey(i.i)
   gTkbKeyDirty[i] = 1
 EndProcedure
 
+; The chevron is a key, so marking it changed is marking that key changed.
+; One flag, so the two can never disagree about whether it needs redrawing.
 Procedure TouchKeyboardMarkHide()
-  gTkbHideDirty = 1
+  TouchKeyboardMarkKey(gTkbHideAt)
 EndProcedure
 
 Procedure TouchKeyboardMarkButton()
@@ -981,7 +898,6 @@ Procedure TouchKeyboardMarkAll()
     gTkbKeyDirty[i] = 1
     i = i + 1
   Wend
-  gTkbHideDirty = 1
   gTkbBtnDirty = 1
 EndProcedure
 
@@ -1345,10 +1261,19 @@ Procedure.i TouchKeyboardPaint(renderer.i, damage.i)
     TkbDamage(0, gTkbBandY, gTkbLW, gTkbBandH)
   EndIf
 
+  ; ONE DRAW PATH PER KEY. The chevron is a key like the others - the
+  ; model's hide key - so it is drawn in this loop, at its own rectangle,
+  ; from its own dirty flag. It gets a triangle instead of a label
+  ; because the bitmap font has no chevron in it, and that is the whole
+  ; of the difference between it and every other key.
   i = 0
   While i < gTkbKeys
     If whole <> 0 Or gTkbKeyDirty[i] <> 0
-      TkbKeyItems(i)
+      If i = gTkbHideAt
+        TkbHideItems()
+      Else
+        TkbKeyItems(i)
+      EndIf
       If whole = 0
         TkbDamage(gTkbKeyX[i], gTkbKeyY[i], gTkbKeyW[i], gTkbKeyH[i])
       EndIf
@@ -1357,19 +1282,13 @@ Procedure.i TouchKeyboardPaint(renderer.i, damage.i)
     i = i + 1
   Wend
 
-  If whole <> 0 Or gTkbHideDirty <> 0
-    TkbHideItems()
-    If whole = 0
-      TkbDamage(gTkbHideX, gTkbHideY, gTkbHideW, gTkbHideH)
-    EndIf
-    gTkbHideDirty = 0
-  EndIf
-
-  If whole <> 0 Or gTkbBtnDirty <> 0
-    TkbButtonItems()
-    TkbDamage(gTkbBtnX, TouchKeyboardButtonY(), gTkbBtnW, gTkbBtnH)
-    gTkbBtnDirty = 0
-  EndIf
+  ; THE BUTTON BESIDE THE PROMPT IS NOT DRAWN WHILE THE BAND IS UP. It is
+  ; how the keyboard is ASKED FOR, and once it is open the chevron is how
+  ; it is put away; drawing both would leave a button on the glass that
+  ; does nothing when it is tapped, which the design forbids in as many
+  ; words. Its flag is cleared rather than left set, so the hidden pass
+  ; that follows a hide is not told the button is stale for ever.
+  gTkbBtnDirty = 0
 
   ProcedureReturn gTkbDrawN
 EndProcedure

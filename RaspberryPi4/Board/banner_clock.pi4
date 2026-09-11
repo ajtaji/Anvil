@@ -264,6 +264,33 @@ Global gTkbTried.i = 0
 ; lays nothing out and draws nothing until its owner turns it on, once.
 Global gTkbEnabled.i = 0
 
+; ANVIL-TOUCH-KEYBOARD-STATE-BEGIN
+; What the dispatcher currently holds as this layer's ONE rectangle:
+; 0 nothing, 1 the prompt line and the keyboard button, 2 the band.
+Global gTkbRegion.i = 0
+; The view layout generation that rectangle was taken from. A change
+; means the rectangle in the dispatcher describes a band that has moved.
+Global gTkbLayoutGen.i = -1
+; And the generation CANCELLATION is judged against, which is a different
+; question with a different answer: a layout this layer asked for is not
+; the surface going away underneath a finger, and only the second one
+; releases contacts. Two numbers because they are two facts; one number
+; would have to mean both and would be wrong about one of them.
+Global gTkbCancelGen.i = -1
+; A fold over everything the band's PICTURE depends on, so a repaint is
+; asked for when something actually changed and not once a frame.
+Global gTkbSig.i = -1
+; Layouts this surface refused since the last one it accepted. A refusal
+; is a whole sentence waiting in TouchKeyboardRefusal(); this is how many
+; times it has been produced, so a silent non-appearing keyboard is not
+; silent.
+Global gTkbShowRefused.i = 0
+; Set while a payload owns the processor. Nothing in this layer may run,
+; and the flag is what stops the attach path turning it back on under a
+; payload that is still executing.
+Global gTkbSuspended.i = 0
+; ANVIL-TOUCH-KEYBOARD-STATE-END
+
 Procedure TouchKeyboardScreenEnable(on.i)
   gTkbEnabled = Bool(on <> 0)
   gTkbTried = 0
@@ -320,7 +347,9 @@ Procedure TouchKeyboardComposeCpu()
   ; The button beside the prompt sits inside the console rectangle, which
   ; the renderer hardware-scrolls and repaints row by row, so it is
   ; redrawn every pass rather than tracked. It is a dozen small fills.
-  TouchKeyboardMarkButton()
+  If TouchKeyboardViewVisible() = 0
+    TouchKeyboardMarkButton()
+  EndIf
 
   n = TouchKeyboardPaint(#TKB_RENDER_CPU, gTkbCpuDamage)
   gTkbCpuDamage = #TKB_DAMAGE_CHANGED
@@ -389,15 +418,21 @@ Procedure TouchKeyboardComposeCpu()
   ; renderer repaints those rows from the grid, and this pass draws the
   ; button again. That is what stops a trail of buttons walking up the
   ; screen, and it costs three row repaints rather than the scroll itself.
-  y0 = (TouchKeyboardButtonY() - LogoHeight()) / DisplayCharHeight()
-  y1 = (TouchKeyboardButtonY() + TouchKeyboardButtonH() - 1 - LogoHeight()) / DisplayCharHeight()
-  If y0 < 0
-    y0 = 0
+  ; ONLY WHILE THE BUTTON IS ON THE GLASS. It is not drawn once the band
+  ; is up - the chevron is the affordance then - and marking rows for a
+  ; picture that is not being painted would repaint three console rows on
+  ; every pass for nothing.
+  If TouchKeyboardViewVisible() = 0
+    y0 = (TouchKeyboardButtonY() - LogoHeight()) / DisplayCharHeight()
+    y1 = (TouchKeyboardButtonY() + TouchKeyboardButtonH() - 1 - LogoHeight()) / DisplayCharHeight()
+    If y0 < 0
+      y0 = 0
+    EndIf
+    While y0 <= y1
+      ConMarkViewRowQuiet(y0)
+      y0 = y0 + 1
+    Wend
   EndIf
-  While y0 <= y1
-    ConMarkViewRowQuiet(y0)
-    y0 = y0 + 1
-  Wend
 
   ; THE SEAM. On HDMI and on the panel at 0 and 180 this is a comparison
   ; and a return; on a turned panel it is the one pass that puts these
@@ -461,6 +496,17 @@ Procedure TouchKeyboardScreenAttach()
     ConSetOverlay(@TouchKeyboardComposeCpu, @TouchKeyboardOverlayReset)
     gTkbOverlayBound = 1
   EndIf
+  ; THE LAYER TURNS ITSELF ON THE MOMENT THERE IS A FINGER THAT CAN REACH
+  ; IT. The flag above was written while the model and the dispatcher did
+  ; not exist yet and a button beside the prompt would have been a picture
+  ; of a feature. Both exist now: a tap on that button opens a keyboard
+  ; that types into the same editor a serial byte does. So the test is the
+  ; one the flag's own comment named - can this board be touched at all -
+  ; and on a board with no touch controller HwTouchReady() is 0 and
+  ; nothing here draws, exactly as before.
+  If gTkbEnabled = 0 And gTkbSuspended = 0 And HwTouchReady() <> 0
+    gTkbEnabled = 1
+  EndIf
   If gTkbEnabled = 0 Or gTkbTried <> 0 Or gScreen = 0 Or ConGridReady() = 0
     ProcedureReturn
   EndIf
@@ -514,6 +560,398 @@ Procedure TouchKeyboardScreenHide()
   gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
   ConOverlayDamage()
 EndProcedure
+
+; ANVIL-TOUCH-KEYBOARD-INTEGRATION-BEGIN
+; ======================================================================
+;  THE KEYBOARD'S SERVICE - WHERE THE MODEL, THE VIEW AND THE ONE
+;  DISPATCHER ARE ACTUALLY JOINED
+; ======================================================================
+;  THE TWO FENCED SECTIONS OF THIS FILE - the layer's state above and
+;  everything down to the matching END comment below - ARE LIFTED
+;  VERBATIM by tools/touch_keyboard_integration_emitted_check.py and
+;  compiled into RaspberryPi4/Tests/touch_keyboard_integration_emitted_
+;  gate.pi4, where they run against the real model, the real view, the
+;  real dispatcher and the real editor with the board's leaves stubbed.
+;  Nothing is copied and nothing is paraphrased: the gate goes red if the
+;  fences move, and what it executes is this text. Keep the section free
+;  of anything that needs a register, and keep the fences where they are.
+; ======================================================================
+;  Three files were built to be provable on their own and none of them
+;  reaches for another: the model (Anvil/Core/touch_keyboard.pbi) asks
+;  the view one question and emits into its own ring; the view
+;  (Anvil/Graphics/touch_keyboard_view.pbi) is integer arithmetic over
+;  one layout result; the dispatcher (Anvil/Core/input_events.pbi) routes
+;  contacts and carries the one input queue. This is the board adapter
+;  that joins them, and it is the only place that knows all three exist.
+;
+;  IT RUNS FROM THE PROMPT'S SPIN AND FROM NOWHERE ELSE. Anvil/Core/
+;  parse.pbi's ReadLine calls it immediately after TouchTick(), which is
+;  the one drain of the hardware ring. That ordering is the whole design:
+;  the hardware is drained once, the dispatcher decides who owns each
+;  contact, and then each owner empties its OWN lane inside the same
+;  pass. There is no second poll of anything here.
+;
+;  AND IT RUNS AT THE PROMPT AND NOT DURING A COMMAND. A keystroke
+;  serviced while a payload, an upload or a long boot step owns the
+;  processor would sit in the input queue and be applied to the next
+;  line - which is the design's "queued touches cannot execute a command
+;  after upload", and it is prevented by not servicing them at all
+;  rather than by filtering them afterwards.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  ONE RECTANGLE PER OWNER, AND THIS LAYER'S CHANGES WITH ITS STATE.
+;
+;  The dispatcher holds exactly one hit rectangle for each owner and
+;  decides ownership once, at the DOWN. While the band is up, this
+;  layer's rectangle IS the band - so a contact that starts on a key
+;  belongs to the keyboard until it ends, even dragged outside, and can
+;  never click the console underneath. While the band is down, the
+;  rectangle is the editable prompt line together with the keyboard
+;  button, because a deliberate tap on either is how the keyboard is
+;  asked for - and asking for it through the SAME dispatcher is what
+;  stops this being a second poll of the touch stream.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardRegionInstall(which.i)
+  If which = 2
+    InputRegionSet(#AIO_KEYBOARD, TouchKeyboardBandX(), TouchKeyboardBandY(), TouchKeyboardBandW(), TouchKeyboardBandH())
+  ElseIf which = 1
+    InputRegionSet(#AIO_KEYBOARD, TouchKeyboardIdleX(), TouchKeyboardIdleY(), TouchKeyboardIdleW(), TouchKeyboardIdleH())
+  Else
+    InputRegionClear(#AIO_KEYBOARD)
+  EndIf
+  gTkbRegion = which
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  A LAYOUT GENERATION CHANGE CANCELS EVERYTHING IN FLIGHT.
+;
+;  "Rotation, screen switch, resizing, renderer reset or loss of focused
+;  client cancels all active contacts/modifiers/repeat state before new
+;  hit geometry is installed. Retain typed text." The view bumps its
+;  generation on every layout and every invalidation, so that number is
+;  the one thing that has to be watched - not five separate events, each
+;  of which somebody has to remember to hook.
+;
+;  IT CANCELS ONLY WHAT IS ACTUALLY HELD. Showing and hiding the keyboard
+;  lays it out again, so an unconditional cancel here would bump the
+;  focus generation every time the band moved and send the editor a
+;  cancellation notice for a finger nobody had on the glass.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardGenerationTick()
+  Define gen.i
+  gen = TouchKeyboardLayoutGeneration()
+  If gen = gTkbCancelGen
+    ProcedureReturn 0
+  EndIf
+  gTkbCancelGen = gen
+  If TouchKeyboardContactCount() > 0
+    TouchKeyboardCancelAll(#TK_CANCEL_VIEW)
+  EndIf
+  If InputCaptureCount() > 0
+    InputCancelAll(#AIC_LAYOUT_CHANGE)
+  EndIf
+  gTkbSig = -1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE BAND FOLLOWS THE MODEL'S INTENT, AND THE MODEL IS ITS ONLY WRITER.
+;
+;  TouchKeyboardShow and TouchKeyboardHide in the model write INTENT, not
+;  state; this reads that intent and makes the screen and the dispatcher
+;  agree with it. Reading the DESIRED state rather than the current one
+;  is deliberate: the model's own state machine only advances on its
+;  tick, and a chevron tapped half way through a drain has to stop taking
+;  keystrokes in that same pass rather than one pass later.
+;
+;  THERE IS NO SLIDE. The design allows one and equally allows presenting
+;  the final layout directly; this monitor composes the band into the
+;  console's own frame, so an interpolated band would be an extra full
+;  repaint per frame for a 110 ms decoration. The model still carries the
+;  transition, and TouchKeyboardSlidePermille is still the seam a
+;  renderer with frames to spare would read.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardLayerReconcile()
+  Define want.i
+  Define asked.i
+
+  want = 0
+  asked = 0
+  If gTkbEnabled <> 0 And gTkbSuspended = 0 And TouchKeyboardLayoutOk() <> 0
+    want = 1
+    If TouchKeyboardDesiredState() <> #TK_STATE_HIDDEN
+      want = 2
+    EndIf
+    If want = 2 And TouchKeyboardViewVisible() = 0
+      asked = 1
+      If TouchKeyboardScreenShow() = 0
+        ; THE SURFACE REFUSED IT, IN A WHOLE SENTENCE. Put the model back
+        ; where it was rather than leave it believing it is open with no
+        ; band on the glass, and count the refusal so a keyboard that never
+        ; appears is not a keyboard that failed in silence.
+        gTkbShowRefused = gTkbShowRefused + 1
+        TouchKeyboardHide()
+        want = 1
+      EndIf
+    ElseIf want = 1 And TouchKeyboardViewVisible() <> 0
+      asked = 1
+      TouchKeyboardScreenHide()
+    EndIf
+  ElseIf TouchKeyboardViewVisible() <> 0
+    ; The layer may not exist any more - it was suspended for a payload,
+    ; or the geometry it was laid out against has been invalidated - and a
+    ; band left on the glass over a console that is not reserving rows for
+    ; it is the stale overlay the design forbids.
+    asked = 1
+    TouchKeyboardScreenHide()
+  EndIf
+
+  ; A LAYOUT THIS LAYER ASKED FOR IS NOT THE SURFACE GOING AWAY. Showing
+  ; and hiding both lay the keyboard out again and both move the view's
+  ; generation, and treating that as "the world changed underneath a
+  ; finger" would cancel the very contact that tapped the prompt line to
+  ; open the keyboard. Adopt it instead, and leave the cancellation for
+  ; the generation changes this layer did NOT cause: a rotation, a screen
+  ; switch, a renderer reset, a console geometry change.
+  If asked <> 0
+    gTkbCancelGen = TouchKeyboardLayoutGeneration()
+  EndIf
+  TouchKeyboardGenerationTick()
+
+  If want <> gTkbRegion Or TouchKeyboardLayoutGeneration() <> gTkbLayoutGen
+    TouchKeyboardRegionInstall(want)
+    gTkbLayoutGen = TouchKeyboardLayoutGeneration()
+  EndIf
+EndProcedure
+
+Procedure.i TouchKeyboardRefusedCount()
+  ProcedureReturn gTkbShowRefused
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WHY THE KEYBOARD CANCELLED, SAID IN THE DISPATCHER'S OWN VOCABULARY.
+;
+;  The model's reasons and the dispatcher's reasons are two different
+;  lists that happen to start at 1, and handing one to the other would
+;  print a correct-looking sentence about the wrong event. They are
+;  translated here, by name, once - so a new reason on either side is a
+;  hole in this Select and not a wrong sentence on a screen.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardCancelReasonFor(tk.i)
+  Select tk
+    Case #TK_CANCEL_TOUCH
+      ProcedureReturn #AIC_TOUCH_LOST
+    Case #TK_CANCEL_HIDDEN
+      ProcedureReturn #AIC_FOCUS_CHANGE
+    Case #TK_CANCEL_GENERATION
+      ProcedureReturn #AIC_FOCUS_CHANGE
+    Case #TK_CANCEL_OVERFLOW
+      ProcedureReturn #AIC_QUEUE_FULL
+    Case #TK_CANCEL_CONTACTS
+      ProcedureReturn #AIC_CONTACT_LOST
+    Case #TK_CANCEL_CLIENT
+      ProcedureReturn #AIC_PAYLOAD
+    Case #TK_CANCEL_VIEW
+      ProcedureReturn #AIC_LAYOUT_CHANGE
+  EndSelect
+  ProcedureReturn #AIC_CONTACT_LOST
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ONE ROUTED CONTACT EVENT. The record is the dispatcher's 40-byte one
+;  and its first four fields are the HAL's, in the HAL's order, which is
+;  why the model can be handed the same pointer without a translation.
+;
+;  THE ORDER OF THE THREE QUESTIONS IS THE BEHAVIOUR:
+;
+;    a CANCEL always reaches the model, whatever is on screen, because a
+;    lost contact that nobody releases is a stuck Shift;
+;
+;    with the band down, a DOWN on the prompt line or on the keyboard
+;    button OPENS it and nothing else happens - no key is armed, because
+;    there are no keys on the glass to arm;
+;
+;    with the band up, a DOWN on the chevron HIDES IT AND EMITS NOTHING.
+;    It is asked first, so the contact is never armed and the editor
+;    never sees a keystroke: putting the keyboard away is not typing.
+;    The model carries the same rule as its own hide key, which is what
+;    its own gate proves; the view answers first, so in the monitor that
+;    path is not the one taken.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardRouteOne(*rev)
+  Define st.i
+  Define x.i
+  Define y.i
+
+  st = PeekL(*rev + #AIT_EV_ST)
+  x  = PeekL(*rev + #AIT_EV_X)
+  y  = PeekL(*rev + #AIT_EV_Y)
+
+  If st = #AIT_CANCEL
+    TouchKeyboardRouteTouch(*rev)
+    ProcedureReturn
+  EndIf
+
+  If TouchKeyboardViewVisible() = 0
+    If st <> #AIT_DOWN
+      ProcedureReturn
+    EndIf
+    If TouchKeyboardButtonHit(x, y) <> 0 Or TouchKeyboardPromptHit(x, y) <> 0
+      TouchKeyboardShow(#AIF_COMMAND_LINE, gScrSrc)
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If st = #AIT_DOWN
+    If TouchKeyboardHideHit(x, y) <> 0
+      TouchKeyboardHide()
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  TouchKeyboardRouteTouch(*rev)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PICTURE FOLLOWS THE MODEL, AND ONLY WHEN THE MODEL MOVED.
+;
+;  A key's face changes when it is armed, when a modifier latches and
+;  when the page switches, and nothing else about the band changes at
+;  all. This folds those three into one number and repaints when it
+;  differs - so a finger sliding across the glass at the controller's
+;  full rate costs one repaint per key it crosses instead of one per
+;  report, and a finger resting still costs none.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardPictureTick()
+  Define sig.i
+  Define i.i
+  Define n.i
+  sig = TouchKeyboardShiftState() + 8 * TouchKeyboardCtrlState() + 64 * TouchKeyboardPage()
+  n = TouchKeyboardKeyCount()
+  i = 0
+  While i < n
+    If TouchKeyboardKeyIsArmed(i) <> 0
+      sig = sig + (i + 1) * 1024
+    EndIf
+    i = i + 1
+  Wend
+  If sig = gTkbSig
+    ProcedureReturn
+  EndIf
+  gTkbSig = sig
+  TouchKeyboardMarkAll()
+  ConOverlayDamage()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchKeyboardServiceTick - the whole join, in the order it has to be
+;  in.
+;
+;  1  THE CLOCK FIRST. The model is told the time once per pass and every
+;     timing rule in it is arithmetic on that number; its own header says
+;     the service loop must tick before it drains touch, because routing
+;     uses the last value tick was given.
+;  2  THE FOCUS GENERATION. The dispatcher owns it; the model is handed
+;     it and cancels itself if it moved underneath.
+;  3  RECONCILE, so the rectangle the dispatcher is about to be asked
+;     about is the one that matches what is on the glass.
+;  4  DRAIN THIS LAYER'S OWN LANE. One pop at a time, routed once.
+;  5  RECONCILE AGAIN, because a chevron or a prompt tap inside that
+;     drain changed what should be on the glass.
+;  6  HAND THE MODEL'S EVENTS TO THE ONE INPUT QUEUE, in the order it
+;     produced them, so a soft keystroke and a serial byte that arrived
+;     in the same pass reach the editor in the order they happened.
+;  7  REPAINT, if the picture changed.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardServiceTick()
+  Define k.i
+  Define rc.i
+  Dim rev.a[#AIT_EVSZ]
+  Dim ev.a[#AIE_EVSZ]
+
+  If gTkbEnabled = 0 Or gTkbSuspended <> 0
+    ProcedureReturn
+  EndIf
+
+  TouchKeyboardTick(millis())
+  TouchKeyboardSetGeneration(InputFocusGeneration())
+  TouchKeyboardLayerReconcile()
+
+  While InputTouchPop(#AIO_KEYBOARD, @rev[0]) = 1
+    TouchKeyboardRouteOne(@rev[0])
+  Wend
+
+  TouchKeyboardLayerReconcile()
+
+  While TouchKeyboardPop() <> 0
+    k = TouchKeyboardEventKind()
+    If k = #AIE_CANCEL
+      rc = InputEventInit(@ev[0], #AIE_CANCEL, TouchKeyboardEventSource(), TouchKeyboardCancelReasonFor(TouchKeyboardEventCode()), 0)
+    Else
+      rc = InputEventInit(@ev[0], k, TouchKeyboardEventSource(), TouchKeyboardEventCode(), TouchKeyboardEventModifiers())
+    EndIf
+    If rc = #AIE_OK
+      rc = InputEventsPush(@ev[0])
+    EndIf
+    If rc <> #AIE_OK
+      ; THE QUEUE REFUSED A KEYSTROKE AND SAID SO. On saturation it has
+      ; already cancelled everything it owns and bumped the generation;
+      ; the keyboard's own contacts, modifiers and repeats have to go the
+      ; same way, or a finger would still be holding a key in a world
+      ; that has been reset underneath it.
+      TouchKeyboardCancelAll(#TK_CANCEL_OVERFLOW)
+      Break
+    EndIf
+  Wend
+
+  If TouchKeyboardViewVisible() <> 0
+    TouchKeyboardPictureTick()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PAYLOAD HANDOVER. Called from RunAt, on both sides of the jump.
+;
+;  "At raw upload or exclusive payload execution, disable/hide keyboard
+;  and cancel held events before handoff. Restore it only after the
+;  monitor regains valid ownership."
+;
+;  EVERYTHING GOES, IN THE ORDER THAT LEAVES NOTHING BEHIND: the model's
+;  contacts and modifiers first, then its intent, then the band and the
+;  console rows it reserved, then this layer's rectangle in the
+;  dispatcher, and last the dispatcher's own captures and queue. Typed
+;  text is NOT touched - InputCancelAll is explicit that a cancellation
+;  is about contacts and modifiers, and the half-typed command belongs to
+;  whoever typed it.
+;
+;  THE SUSPENDED FLAG IS WHAT MAKES IT STICK. Without it the next
+;  TouchKeyboardScreenAttach would turn the layer straight back on,
+;  because the board still has a touch controller - and the point is not
+;  that touch is gone, it is that this monitor is not the thing running.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardPayloadSuspend()
+  TouchKeyboardCancelAll(#TK_CANCEL_CLIENT)
+  TouchKeyboardHide()
+  If TouchKeyboardViewVisible() <> 0
+    TouchKeyboardScreenHide()
+  EndIf
+  TouchKeyboardRegionInstall(0)
+  gTkbSuspended = 1
+  gTkbEnabled = 0
+  gTkbSig = -1
+  InputCancelAll(#AIC_PAYLOAD)
+EndProcedure
+
+; The monitor has its caches, its console and its DMA channel back. The
+; layer is allowed to exist again - and it starts from nothing, because
+; the surface it was laid out against was in the payload's hands and
+; every rectangle derived from it is now a guess.
+Procedure TouchKeyboardPayloadResume()
+  gTkbSuspended = 0
+  TouchKeyboardOverlayReset()
+EndProcedure
+; ANVIL-TOUCH-KEYBOARD-INTEGRATION-END
 
 ; Safe boot/prompt service boundary. Call after a meaningful progress line
 ; or driver phase tick, never for every character and never from UartWrite.

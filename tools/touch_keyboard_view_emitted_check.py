@@ -31,6 +31,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 GATE = ROOT / "RaspberryPi4" / "Tests" / "touch_keyboard_view_emitted_gate.pi4"
 VIEW = ROOT / "Anvil" / "Graphics" / "touch_keyboard_view.pbi"
+MODEL = ROOT / "Anvil" / "Core" / "touch_keyboard.pbi"
 CONSOLE = ROOT / "RaspberryPi4" / "Board" / "console.pi4"
 
 LOAD = 0x00400000
@@ -78,15 +79,15 @@ DMG_CHGN = 0x06000808
 DMG_X, DMG_Y, DMG_W, DMG_H = 0x06000810, 0x06000818, 0x06000820, 0x06000828
 DMG_KEY, DMG_OUTSIDE, DMG_ITEMS = 0x06000830, 0x06000838, 0x06000840
 
-PAGE_ABC, PAGE_SYMBOL, PAGE_COMPACT = 0, 1, 2
+PAGE_ABC, PAGE_SYMBOL = 0, 1
 
 # slot, page, logicalW, logicalH, ppi, displayScale, must lay out
 SCENARIOS = (
     (0, PAGE_ABC, 1280, 800, 149, 1, True, "bench panel, landscape, the shipped default"),
     (1, PAGE_ABC, 800, 1280, 149, 1, True, "the panel's own portrait scan"),
     (2, PAGE_ABC, 1280, 800, 149, 2, True, "landscape at the large-text setting"),
-    (3, PAGE_COMPACT, 640, 480, 149, 1, True, "the smallest supported layout"),
-    (4, PAGE_ABC, 520, 800, 149, 1, False, "too narrow for this arrangement"),
+    (3, PAGE_ABC, 640, 480, 149, 1, True, "the smallest screen this arrangement fits"),
+    (4, PAGE_ABC, 480, 800, 149, 1, False, "too narrow for this arrangement"),
     (5, PAGE_ABC, 400, 300, 149, 1, False, "too short for a safe key"),
     (6, PAGE_ABC, 1280, 800, 0, 1, True, "density unknown: the display-scale fallback"),
     (7, PAGE_SYMBOL, 1280, 800, 149, 1, True, "the symbol page, landscape"),
@@ -123,6 +124,12 @@ MUTANTS = (
         "view",
         "        TkbDamage(gTkbKeyX[i], gTkbKeyY[i], gTkbKeyW[i], gTkbKeyH[i])\n",
         "        TkbDamage(0, gTkbBandY, gTkbLW, gTkbBandH)\n",
+    ),
+    (
+        "the chevron stops being the model's hide key",
+        "view",
+        "    If TouchKeyboardKeyKind(i) = #TK_KIND_HIDE\n",
+        "    If TouchKeyboardKeyKind(i) = #TK_KIND_SHIFT\n",
     ),
     (
         "the minimum key width is not enforced",
@@ -181,8 +188,10 @@ def load_interpreter(path: pathlib.Path):
 # mutation never touches the repository.
 def stage(work: pathlib.Path, view_text: str, console_text: str) -> pathlib.Path:
     (work / "Anvil" / "Graphics").mkdir(parents=True, exist_ok=True)
+    (work / "Anvil" / "Core").mkdir(parents=True, exist_ok=True)
     (work / "RaspberryPi4" / "Board").mkdir(parents=True, exist_ok=True)
     (work / "RaspberryPi4" / "Tests").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(MODEL, work / "Anvil" / "Core" / MODEL.name)
     (work / "Anvil" / "Graphics" / "touch_keyboard_view.pbi").write_text(view_text, encoding="utf-8")
     (work / "RaspberryPi4" / "Board" / "console.pi4").write_text(console_text, encoding="utf-8")
     shutil.copy2(GATE, work / "RaspberryPi4" / "Tests" / GATE.name)
@@ -401,7 +410,11 @@ def grade_scenario(cpu, g: Grader, slot, page, lw, lh, ppi, ds, expect_ok, note)
                 overlaps.append((i, j))
     g.need(f"{tag} no two key rectangles overlap", overlaps, [])
 
-    # The down-chevron is the view's own and must be disjoint from them all.
+    # THE DOWN-CHEVRON IS THE MODEL'S HIDE KEY, laid out like every other
+    # key and republished under its own name. So the property is no longer
+    # "disjoint from every key" - it is "exactly one key's rectangle", which
+    # is the stronger statement: there is one dismiss target on the glass
+    # and the picture and the hit test are the same rectangle by identity.
     hx, hy, hw, hh = (u64(cpu, b + f) for f in (F_HIDEX, F_HIDEY, F_HIDEW, F_HIDEH))
     g.want_true(
         f"{tag} the hide chevron is inside the band",
@@ -409,9 +422,10 @@ def grade_scenario(cpu, g: Grader, slot, page, lw, lh, ppi, ds, expect_ok, note)
         f"({hx},{hy},{hw},{hh}) band {bandY}+{bandH}",
     )
     g.want_true(f"{tag} the hide chevron is a real target", hw >= minPx and hh >= minPx, f"{hw}x{hh}")
-    clash = [i for i, (x, y, w, h, _r, _s) in enumerate(rects)
-             if x < hx + hw and hx < x + w and y < hy + hh and hy < y + h]
-    g.need(f"{tag} the hide chevron overlaps no key", clash, [])
+    same = [i for i, (x, y, w, h, _r, _s) in enumerate(rects)
+            if (x, y, w, h) == (hx, hy, hw, hh)]
+    g.need(f"{tag} the hide chevron is exactly one key's rectangle", len(same), 1)
+    g.need(f"{tag} the hide chevron is on the utility row", rects[same[0]][4] if same else -1, 0)
 
     # The keyboard button beside the prompt is OUTSIDE the band.
     bx, by, bw, bh = (u64(cpu, b + f) for f in (F_BTNX, F_BTNY, F_BTNW, F_BTNH))
@@ -529,8 +543,12 @@ def grade(cpu, rc: int) -> Grader:
     b7 = SCEN + 7 * STRIDE
     key = u64(cpu, DMG_KEY)
     at = b7 + F_KEYTAB + key * 48
-    g.need("a whole pass damages the band and the prompt button, and nothing per key",
-           u64(cpu, DMG_ALLN), 2)
+    # ONE RECTANGLE, NOT ONE PER KEY - and not two: the keyboard button
+    # beside the prompt is not drawn while the band is up, because the
+    # chevron is the affordance then and a button that does nothing when
+    # it is tapped is a button the design forbids.
+    g.need("a whole pass damages the band and nothing per key",
+           u64(cpu, DMG_ALLN), 1)
     g.need("one changed key damages one rectangle", u64(cpu, DMG_CHGN), 1)
     g.need("that rectangle is exactly the changed key's",
            (u64(cpu, DMG_X), u64(cpu, DMG_Y), u64(cpu, DMG_W), u64(cpu, DMG_H)),

@@ -1194,6 +1194,50 @@ Procedure.i TouchKeyboardKeyIsLatched(index.i)
   ProcedureReturn 0
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  TouchKeyboardKeyIsAccent - is this key drawn in the accent colour?
+;
+;  THE EIGHTH ACCESSOR THE VIEW ASKS FOR, and it is the MODEL's answer
+;  because the accent is a statement about what a key MEANS and not
+;  about where it is. The design names exactly two things that get it:
+;  "an accent for Enter and active modifiers".
+;
+;  ENTER IS ALWAYS ACCENTED because Enter is always the key that ends
+;  the command, whatever the keyboard is doing. A MODIFIER IS ACCENTED
+;  ONLY WHILE IT IS ACTUALLY DOING SOMETHING - a one-shot Shift, Caps
+;  Lock, a physically held Shift, an armed Ctrl - so the accent is a
+;  reading of the state and never decoration. A modifier that is off
+;  looks like every other key, which is what makes the ones that are on
+;  worth looking at.
+;
+;  IT IS COMPUTED FROM THE SAME THREE GLOBALS TouchKeyboardKeyIsLatched
+;  reads, not from a parallel flag, so the two can never disagree about
+;  whether Shift is on.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardKeyIsAccent(index.i)
+  Define f.i
+  f = TkFlat(index)
+  If f < 0
+    ProcedureReturn 0
+  EndIf
+  If gTkKeyKind[f] = #TK_KIND_KEY And gTkKeyBase[f] = #AIK_ENTER
+    ProcedureReturn 1
+  EndIf
+  If gTkKeyKind[f] = #TK_KIND_SHIFT
+    If TkShiftNow() <> 0 Or TkCapsNow() <> 0
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If gTkKeyKind[f] = #TK_KIND_CTRL
+    If TkCtrlNow() <> 0
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i TouchKeyboardShiftState()
   ProcedureReturn gTkShift
 EndProcedure

@@ -5,6 +5,14 @@
 ;  touch_keyboard_view.pbi) and the REAL console core (RaspberryPi4/
 ;  Board/console.pi4) on the A64 oracle.
 ;
+;  IT RUNS THE REAL KEY MODEL TOO. The view used to carry a fenced
+;  placeholder model so that it could be laid out before Anvil/Core/
+;  touch_keyboard.pbi existed; the model has landed and the placeholder
+;  is gone, so this gate compiles the real one and lays out the real
+;  pages. The arrangement graded below is therefore the arrangement the
+;  monitor shows, and the key indices the hit test returns are the
+;  indices the model arms.
+;
 ;  DIAGNOSTIC. No MMIO, no framebuffer, no GPU submission, no DMA and no
 ;  cache operation occurs, and the harness arms a hard stop on any MMIO
 ;  access - which is what makes running this off the board mean anything.
@@ -57,8 +65,22 @@
 Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
 Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
 
+; The key model first: the view asks it for its keys, its labels and
+; which of them is the hide chevron, and console.pi4 includes the view.
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
 XIncludeFile "RaspberryPi4/Board/console.pi4"
 
+; The dispatcher's 40-byte routed contact record. Its first four fields
+; are the HAL's, in the HAL's order, which is why the model reads this
+; and the board's record through the same four offsets.
+#AIT_EVSZ  = 40
+#AIT_EV_X  = 0
+#AIT_EV_Y  = 4
+#AIT_EV_ID = 8
+#AIT_EV_ST = 12
+#AIT_DOWN  = 0
+
+Global Dim gKvRec.a[#AIT_EVSZ]
 Global gKvM.TouchKeyboardMetrics
 Global gKvPaintCalls.i = 0
 Global gKvOverlayCalls.i = 0
@@ -106,7 +128,9 @@ Procedure.i KvScenario(slot.i, page.i, lw.i, lh.i, ppi.i, ds.i, fullScan.i)
   Define kh.i
 
   b = #KV_SCEN + slot * #KV_STRIDE
-  TouchKeyboardModelSelect(page)
+  ; The REAL model's page, chosen the way the keyboard chooses it.
+  TouchKeyboardInit()
+  TkSetPage(page)
   TouchKeyboardViewSetVisible(0)
   gKvM\logicalW     = lw
   gKvM\logicalH     = lh
@@ -252,14 +276,37 @@ Procedure.i KvDamage()
   If n < 1
     ProcedureReturn 202
   EndIf
-  ; A whole pass damages the band and the button beside the prompt, which
-  ; is outside it. Two rectangles, never one per key.
-  If TouchKeyboardDamageCount() <> 2
+  ; A whole pass damages THE BAND. One rectangle, never one per key - and
+  ; never two, because the keyboard button beside the prompt is not drawn
+  ; while the band is up: the chevron is the way out once it is open, and
+  ; a button drawn there that did nothing when tapped is the nonfunctional
+  ; button the design forbids.
+  If TouchKeyboardDamageCount() <> 1
     ProcedureReturn 203
   EndIf
 
+  ; ARM A KEY THE WAY A FINGER DOES. There is no setter for this on the
+  ; real model and there should not be one: a key is armed by a contact
+  ; going down on it, and routing one here proves that the index the
+  ; view's hit test returns is the index the model arms - which is the
+  ; single joint between these two files.
   key = 5
-  TouchKeyboardModelArm(key)
+  TouchKeyboardShow(1, 1)
+  TouchKeyboardTick(1000)
+  TouchKeyboardTick(1000 + #TK_SLIDE_MS)
+  If TouchKeyboardState() <> #TK_STATE_VISIBLE
+    ProcedureReturn 211
+  EndIf
+  PokeL(@gKvRec[0] + #AIT_EV_X, TouchKeyboardKeyX(key) + TouchKeyboardKeyW(key) / 2)
+  PokeL(@gKvRec[0] + #AIT_EV_Y, TouchKeyboardKeyY(key) + TouchKeyboardKeyH(key) / 2)
+  PokeL(@gKvRec[0] + #AIT_EV_ID, 7)
+  PokeL(@gKvRec[0] + #AIT_EV_ST, #AIT_DOWN)
+  If TouchKeyboardRouteTouch(@gKvRec[0]) <> 1
+    ProcedureReturn 212
+  EndIf
+  If TouchKeyboardKeyIsArmed(key) = 0
+    ProcedureReturn 213
+  EndIf
   TouchKeyboardMarkKey(key)
   n = TouchKeyboardPaint(#TKB_RENDER_CPU, #TKB_DAMAGE_CHANGED)
   PokeI(#KV_DMG_CHGN, TouchKeyboardDamageCount())
@@ -308,7 +355,7 @@ Procedure.i KvDamage()
   If TouchKeyboardDrawOverflowed() <> 0
     ProcedureReturn 210
   EndIf
-  TouchKeyboardModelArm(-1)
+  TouchKeyboardCancelAll(#TK_CANCEL_CLIENT)
   ProcedureReturn 0
 EndProcedure
 
@@ -531,33 +578,33 @@ Procedure.i Main()
   PokeI(#KV_MAGIC_AT, #KV_MAGIC)
 
   ; 0  landscape on the bench panel, the shipped default - FULL SCAN
-  rc = KvScenario(0, #TKB_PAGE_ABC, 1280, 800, 149, 1, 1)
+  rc = KvScenario(0, #TK_PAGE_ABC, 1280, 800, 149, 1, 1)
   If rc <> 0 : ProcedureReturn 100 + rc : EndIf
   ; 1  the panel's own portrait scan - FULL SCAN
-  rc = KvScenario(1, #TKB_PAGE_ABC, 800, 1280, 149, 1, 1)
+  rc = KvScenario(1, #TK_PAGE_ABC, 800, 1280, 149, 1, 1)
   If rc <> 0 : ProcedureReturn 110 + rc : EndIf
   ; 2  landscape at the large-text setting
-  rc = KvScenario(2, #TKB_PAGE_ABC, 1280, 800, 149, 2, 0)
+  rc = KvScenario(2, #TK_PAGE_ABC, 1280, 800, 149, 2, 0)
   If rc <> 0 : ProcedureReturn 120 + rc : EndIf
-  ; 3  the smallest supported layout: the compact page - FULL SCAN
-  rc = KvScenario(3, #TKB_PAGE_COMPACT, 640, 480, 149, 1, 1)
+  ; 3  the smallest screen the shipped arrangement still fits - FULL SCAN
+  rc = KvScenario(3, #TK_PAGE_ABC, 640, 480, 149, 1, 1)
   If rc <> 0 : ProcedureReturn 130 + rc : EndIf
   ; 4  a screen too narrow for the arrangement it was given - REFUSAL
-  rc = KvScenario(4, #TKB_PAGE_ABC, 520, 800, 149, 1, 0)
+  rc = KvScenario(4, #TK_PAGE_ABC, 480, 800, 149, 1, 0)
   If rc <> 0 : ProcedureReturn 140 + rc : EndIf
   ; 5  a screen too short for a safe key - REFUSAL
-  rc = KvScenario(5, #TKB_PAGE_ABC, 400, 300, 149, 1, 0)
+  rc = KvScenario(5, #TK_PAGE_ABC, 400, 300, 149, 1, 0)
   If rc <> 0 : ProcedureReturn 150 + rc : EndIf
   ; 6  a screen that cannot say how big it is: the display-scale fallback
-  rc = KvScenario(6, #TKB_PAGE_ABC, 1280, 800, 0, 1, 0)
+  rc = KvScenario(6, #TK_PAGE_ABC, 1280, 800, 0, 1, 0)
   If rc <> 0 : ProcedureReturn 160 + rc : EndIf
   ; 8  the panel's portrait scan at the large-text setting
-  rc = KvScenario(8, #TKB_PAGE_ABC, 800, 1280, 149, 2, 0)
+  rc = KvScenario(8, #TK_PAGE_ABC, 800, 1280, 149, 2, 0)
   If rc <> 0 : ProcedureReturn 180 + rc : EndIf
   ; 7  the symbol page, landscape, so a second arrangement is laid out.
   ; KvDamage below works on whatever was laid out LAST, so this one stays
   ; last and the checker grades the damage against slot 7's key table.
-  rc = KvScenario(7, #TKB_PAGE_SYMBOL, 1280, 800, 149, 1, 0)
+  rc = KvScenario(7, #TK_PAGE_SYM, 1280, 800, 149, 1, 0)
   If rc <> 0 : ProcedureReturn 170 + rc : EndIf
 
   rc = KvDamage()
