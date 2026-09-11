@@ -403,14 +403,14 @@
 ;  buffer for the $00 / $01 domain separators the update mixes in. K and
 ;  V are secret; DrbgOne carries only a public constant.
 ;
-;  drbgSeeded and drbgSeedLen are the instantiate gate. They are
+;  gDrbgSeeded and drbgSeedLen are the instantiate gate. They are
 ;  ordinary Globals and therefore zero at reset (the __a64_bss_zero loop
 ;  in the standard prologue), which is the safe state: not seeded.
 ; ----------------------------------------------------------------------
 Global Dim secDrbgK.a[32]            ; the DRBG Key register
 Global Dim secDrbgV.a[32]            ; the DRBG Value register
 Global Dim DrbgOne.a[1]              ; single-byte separator ($00 or $01)
-Global drbgSeeded.i                  ; 0 until a seed was accepted
+Global gDrbgSeeded.i                  ; 0 until a seed was accepted
 Global drbgSeedLen.i                 ; how many seed bytes were accepted
 
 ; ----------------------------------------------------------------------
@@ -553,7 +553,7 @@ Procedure.i DrbgInit(seed.i, slen.i)
     i = i + 1
   Wend
   DrbgUpdate(seed, slen)
-  drbgSeeded = 1
+  gDrbgSeeded = 1
   drbgSeedLen = slen
   ProcedureReturn verdict
 EndProcedure
@@ -575,7 +575,7 @@ EndProcedure
 Procedure.i DrbgReseed(seed.i, slen.i)
   Protected verdict.i
 
-  If drbgSeeded = 0
+  If gDrbgSeeded = 0
     ProcedureReturn #DRBG_ERR_UNSEEDED
   EndIf
 
@@ -613,7 +613,7 @@ Procedure.i DrbgGenerate(dst.i, len.i)
   Protected clen.i
   Protected i.i
 
-  If drbgSeeded = 0
+  If gDrbgSeeded = 0
     ProcedureReturn #DRBG_ERR_UNSEEDED
   EndIf
   If len <= 0
@@ -664,7 +664,7 @@ EndProcedure
 ;  same argument SafetyBoot() makes for returning its boot number.
 ; ----------------------------------------------------------------------
 Procedure.i DrbgSeeded()
-  ProcedureReturn drbgSeeded
+  ProcedureReturn gDrbgSeeded
 EndProcedure
 
 Procedure.i DrbgSeedBytes()
@@ -799,7 +799,7 @@ EndProcedure
 Procedure.i DrbgAutoReseed()
   Protected st.i
 
-  If drbgSeeded = 0
+  If gDrbgSeeded = 0
     ProcedureReturn #DRBG_ERR_UNSEEDED
   EndIf
 

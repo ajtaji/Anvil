@@ -276,7 +276,7 @@
 ;  locals are static .bss slots on this backend.
 ; ======================================================================
 Global neon_err.i      = #NEON_OK
-Global neon_ready.i    = 0        ; NeonInit() completed
+Global gNeonReady.i    = 0        ; NeonInit() completed
 Global neon_inFrame.i  = 0
 
 ; ---- the arena -------------------------------------------------------
@@ -304,7 +304,7 @@ Global neon_cy.i       = 0
 
 ; ---- the carved buffers ---------------------------------------------
 Global neon_pt.i       = 0        ; V3D page table
-Global neon_ptBytes.i  = 0
+Global gNeonPtBytes.i  = 0
 Global neon_illegal.i  = 0        ; the page every unmapped PTE points at
 Global neon_code.i     = 0        ; three QPU programs
 Global neon_codeBytes.i = 0
@@ -317,7 +317,7 @@ Global neon_tallocBytes.i = 0
 Global neon_overflow.i = 0
 Global neon_overflowBytes.i = 0
 Global neon_bcl.i      = 0
-Global neon_bclBytes.i = 0
+Global gNeonBclBytes.i = 0
 Global neon_tilelist.i = 0
 Global neon_tilelistBytes.i = 0
 Global neon_rcl.i      = 0
@@ -326,7 +326,7 @@ Global neon_shrec.i    = 0        ; #NEON_MAX_DRAWS records
 Global neon_shrecBytes.i = 0
 Global neon_unif.i     = 0        ; #NEON_MAX_DRAWS fragment uniform blocks
 Global neon_unifBytes.i = 0
-Global neon_verts.i    = 0
+Global gNeonVerts.i    = 0
 Global neon_vertsBytes.i = 0
 Global neon_guard.i    = 0        ; DELIBERATELY NOT MAPPED. See NeonInit().
 Global neon_top.i      = 0        ; one past everything above
@@ -343,10 +343,10 @@ Global neon_nClipped.i = 0        ; primitives the clip rejected outright
 ;  Four numbers, because "the frame took 265 ms" names nothing. The
 ;  A72 building lists and the V3D rasterising them are different
 ;  problems with different fixes, and the clean is a third.
-Global neon_usBegin.i  = 0        ; V3dRclBuild plus the bin prologue
-Global neon_usClean.i  = 0        ; the cache maintenance before submit
-Global neon_usBin.i    = 0        ; submit and wait, the binner
-Global neon_usRender.i = 0        ; submit and wait, the renderer
+Global gNeonUsBegin.i  = 0        ; V3dRclBuild plus the bin prologue
+Global gNeonUsClean.i  = 0        ; the cache maintenance before submit
+Global gNeonUsBin.i    = 0        ; submit and wait, the binner
+Global gNeonUsRender.i = 0        ; submit and wait, the renderer
 
 ; ---- the clip rectangle ---------------------------------------------
 ;  Neon_ScissorSet lowers to V3D's CLIP_WINDOW packet, which is
@@ -400,8 +400,8 @@ Global neon_emitNP.i    = 0
 ; ---- the atlas, once built (lazily, from the current font) ------------
 Global neon_texBuilt.i    = 0     ; the atlas has been filled and tiled
 Global neon_texFontBits.i = 0     ; the font it was built for; a change rebuilds
-Global neon_atlasW.i      = 0     ; always #NEON_ATLAS_W
-Global neon_atlasH.i      = 0     ; padded to a power of two
+Global gNeonAtlasW.i      = 0     ; always #NEON_ATLAS_W
+Global gNeonAtlasH.i      = 0     ; padded to a power of two
 Global neon_atlasCols.i   = 0     ; #NEON_ATLAS_W / cell width
 Global neon_atlasGlyphs.i = 0     ; last - first + 1
 
@@ -440,7 +440,7 @@ Procedure.i Neon_Error()
 EndProcedure
 
 Procedure.i Neon_Ready()
-  ProcedureReturn neon_ready
+  ProcedureReturn gNeonReady
 EndProcedure
 
 Procedure.i Neon_Draws()
@@ -483,19 +483,19 @@ Procedure.i Neon_Clipped()
 EndProcedure
 
 Procedure.i Neon_UsBegin()
-  ProcedureReturn neon_usBegin
+  ProcedureReturn gNeonUsBegin
 EndProcedure
 
 Procedure.i Neon_UsClean()
-  ProcedureReturn neon_usClean
+  ProcedureReturn gNeonUsClean
 EndProcedure
 
 Procedure.i Neon_UsBin()
-  ProcedureReturn neon_usBin
+  ProcedureReturn gNeonUsBin
 EndProcedure
 
 Procedure.i Neon_UsRender()
-  ProcedureReturn neon_usRender
+  ProcedureReturn gNeonUsRender
 EndProcedure
 
 Procedure.i Neon_ArenaNeed()
@@ -514,7 +514,7 @@ EndProcedure
 ; the board needs them; they are here so a check that reads the
 ; engine's output out of memory does not have to guess the layout.
 Procedure.i Neon_VertsAddr()
-  ProcedureReturn neon_verts
+  ProcedureReturn gNeonVerts
 EndProcedure
 
 Procedure.i Neon_ShrecAddr()
@@ -530,11 +530,11 @@ Procedure.i Neon_BclAddr()
 EndProcedure
 
 Procedure.i Neon_PtBytes()
-  ProcedureReturn neon_ptBytes
+  ProcedureReturn gNeonPtBytes
 EndProcedure
 
 Procedure.i Neon_BclBytes()
-  ProcedureReturn neon_bclBytes
+  ProcedureReturn gNeonBclBytes
 EndProcedure
 
 Procedure.i Neon_SurfaceW()
@@ -861,7 +861,7 @@ Procedure.i NeonArena(base.i, bytes.i)
   EndIf
   neon_arena    = base
   neon_arenaEnd = base + bytes
-  neon_ready    = 0
+  gNeonReady    = 0
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -902,7 +902,7 @@ Procedure.i NeonSurfaceOriented(base.i, w.i, h.i, pitch.i, rot.i)
   neon_fbMapBytes = neon_fbBytes    ; default: map exactly one screen
   neon_cx        = pw / 2
   neon_cy        = ph / 2
-  neon_ready     = 0
+  gNeonReady     = 0
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -941,7 +941,7 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i NeonRetarget(base.i, bytes.i)
   Protected r.i
-  If neon_ready = 0
+  If gNeonReady = 0
     neon_err = #NEON_ERR_ARENA
     ProcedureReturn #NEON_ERR_ARENA
   EndIf
@@ -1651,7 +1651,7 @@ Procedure.i NeonInit()
   Protected fbPage0.i
   Protected fbMapEnd.i
 
-  neon_ready = 0
+  gNeonReady = 0
   neon_err   = #NEON_OK
 
   If neon_arena = 0
@@ -1699,7 +1699,7 @@ Procedure.i NeonInit()
   If neon_arenaEnd > maxVa
     maxVa = neon_arenaEnd
   EndIf
-  neon_ptBytes = neon_RoundPage((maxVa / 4096) * 4)
+  gNeonPtBytes = neon_RoundPage((maxVa / 4096) * 4)
 
   ; ------------------------------------------------------------------
   ;  4. CARVE. Everything is page aligned, because the V3D MMU maps
@@ -1709,7 +1709,7 @@ Procedure.i NeonInit()
   p = neon_arena
 
   neon_pt = p
-  p = p + neon_ptBytes
+  p = p + gNeonPtBytes
 
   neon_illegal = p
   p = p + 4096
@@ -1749,9 +1749,9 @@ Procedure.i NeonInit()
   ; and each clip change a CLIP_WINDOW (9). Thirty-two bytes per draw
   ; is twice the worst case and the readahead slack is inside it. The
   ; textured draws share this list, so their maximum is budgeted too.
-  neon_bclBytes = neon_RoundPage(((#NEON_MAX_DRAWS + #NEON_MAX_TDRAWS) * 32) + 8192)
+  gNeonBclBytes = neon_RoundPage(((#NEON_MAX_DRAWS + #NEON_MAX_TDRAWS) * 32) + 8192)
   neon_bcl = p
-  p = p + neon_bclBytes
+  p = p + gNeonBclBytes
 
   neon_tilelistBytes = 4096
   neon_tilelist = p
@@ -1774,7 +1774,7 @@ Procedure.i NeonInit()
   p = p + neon_unifBytes
 
   neon_vertsBytes = #NEON_MAX_VERTS * #NEON_VERT_BYTES
-  neon_verts = p
+  gNeonVerts = p
   p = p + neon_vertsBytes
 
   ; ------------------------------------------------------------------
@@ -1839,7 +1839,7 @@ Procedure.i NeonInit()
   ; ------------------------------------------------------------------
   ;  5. THE PAGE TABLE. Identity, VA = PA, everything except the guard.
   ; ------------------------------------------------------------------
-  r = V3dMmuInit(neon_pt, neon_ptBytes, neon_illegal)
+  r = V3dMmuInit(neon_pt, gNeonPtBytes, neon_illegal)
   If r <> #V3D_OK
     neon_err = #NEON_ERR_V3D
     ProcedureReturn #NEON_ERR_V3D
@@ -1858,7 +1858,7 @@ Procedure.i NeonInit()
     r = V3dMmuMap(neon_overflow, neon_overflow, neon_overflowBytes)
   EndIf
   If r = #V3D_OK
-    r = V3dMmuMap(neon_bcl, neon_bcl, neon_bclBytes)
+    r = V3dMmuMap(neon_bcl, neon_bcl, gNeonBclBytes)
   EndIf
   If r = #V3D_OK
     r = V3dMmuMap(neon_tilelist, neon_tilelist, neon_tilelistBytes)
@@ -1873,7 +1873,7 @@ Procedure.i NeonInit()
     r = V3dMmuMap(neon_unif, neon_unif, neon_unifBytes)
   EndIf
   If r = #V3D_OK
-    r = V3dMmuMap(neon_verts, neon_verts, neon_vertsBytes)
+    r = V3dMmuMap(gNeonVerts, gNeonVerts, neon_vertsBytes)
   EndIf
   ; The textured path's buffers (M3): the raster atlas the TFU reads,
   ; the tiled atlas the TMU reads, the texture/sampler state, and the
@@ -2029,7 +2029,7 @@ Procedure.i NeonInit()
     n = n + 1
   Wend
 
-  neon_ready = 1
+  gNeonReady = 1
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -2078,11 +2078,11 @@ EndProcedure
 ;  broken.
 ; ======================================================================
 Procedure.i NeonShutdown()
-  If neon_ready = 0
+  If gNeonReady = 0
     ProcedureReturn #NEON_OK
   EndIf
   neon_inFrame = 0
-  neon_ready   = 0
+  gNeonReady   = 0
   ProcedureReturn V3dMmuOff()
 EndProcedure
 
@@ -2225,7 +2225,7 @@ Procedure.i NeonFrameBegin(colour.i)
     hz = 1
   EndIf
   t0 = V3dTicks()
-  If neon_ready = 0
+  If gNeonReady = 0
     neon_err = #NEON_ERR_ARENA
     ProcedureReturn #NEON_ERR_ARENA
   EndIf
@@ -2262,7 +2262,7 @@ Procedure.i NeonFrameBegin(colour.i)
     ProcedureReturn #NEON_ERR_LIST
   EndIf
 
-  r = V3dBclBegin(neon_bcl, neon_bclBytes)
+  r = V3dBclBegin(neon_bcl, gNeonBclBytes)
   If r <> #V3D_OK
     neon_err = #NEON_ERR_LIST
     ProcedureReturn #NEON_ERR_LIST
@@ -2275,7 +2275,7 @@ Procedure.i NeonFrameBegin(colour.i)
   EndIf
 
   neon_inFrame = 1
-  neon_usBegin = (V3dTicks() - t0) / hz
+  gNeonUsBegin = (V3dTicks() - t0) / hz
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -2329,7 +2329,7 @@ Procedure.i NeonFrameEnd()
     V3dCacheRange(neon_unif, neon_nDraws * #NEON_UNIF_STRIDE)
   EndIf
   If neon_nVerts > 0
-    V3dCacheRange(neon_verts, neon_nVerts * #NEON_VERT_BYTES)
+    V3dCacheRange(gNeonVerts, neon_nVerts * #NEON_VERT_BYTES)
   EndIf
   ; The textured path's per-frame writes. The atlas and the texture
   ; state were cleaned when the atlas was built; only the records,
@@ -2342,7 +2342,7 @@ Procedure.i NeonFrameEnd()
     V3dCacheRange(neon_tverts, neon_nTVerts * #NEON_TVERT_BYTES)
   EndIf
   V3dBarrier()
-  neon_usClean = (V3dTicks() - t0) / hz
+  gNeonUsClean = (V3dTicks() - t0) / hz
   t0 = V3dTicks()
 
   r = V3dBinSubmit()
@@ -2355,7 +2355,7 @@ Procedure.i NeonFrameEnd()
     neon_err = #NEON_ERR_BIN
     ProcedureReturn #NEON_ERR_BIN
   EndIf
-  neon_usBin = (V3dTicks() - t0) / hz
+  gNeonUsBin = (V3dTicks() - t0) / hz
   t0 = V3dTicks()
 
   r = V3dRenderSubmit()
@@ -2368,7 +2368,7 @@ Procedure.i NeonFrameEnd()
     neon_err = #NEON_ERR_RENDER
     ProcedureReturn #NEON_ERR_RENDER
   EndIf
-  neon_usRender = (V3dTicks() - t0) / hz
+  gNeonUsRender = (V3dTicks() - t0) / hz
 
   ProcedureReturn #NEON_OK
 EndProcedure
@@ -2440,7 +2440,7 @@ Procedure neon_Vertex(x.i, y.i)
     yc = neon_F32Ratio(py - neon_cy, neon_cy)
   EndIf
 
-  b = neon_verts + (neon_nVerts * #NEON_VERT_BYTES)
+  b = gNeonVerts + (neon_nVerts * #NEON_VERT_BYTES)
   PokeN(b +  0, xc)
   PokeN(b +  4, yc)
   PokeN(b +  8, ((px - neon_cx) * 256) & $FFFFFFFF)
@@ -2618,7 +2618,7 @@ Procedure.i neon_Record(slot.i)
 
   k = 0
   While k < #NEON_ATTRS
-    V3dAttrRecord(k, neon_verts + (k * 4), #NEON_VERT_BYTES, #NEON_MAX_VERTS - 1, 1, 1)
+    V3dAttrRecord(k, gNeonVerts + (k * 4), #NEON_VERT_BYTES, #NEON_MAX_VERTS - 1, 1, 1)
     k = k + 1
   Wend
   V3dAttrRecordType(2, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
@@ -2841,7 +2841,7 @@ Procedure neon_Rect(x.i, y.i, w.i, h.i)
   ys0 = ((y  - neon_cy) * 256) & $FFFFFFFF
   ys1 = ((y1 - neon_cy) * 256) & $FFFFFFFF
 
-  b = neon_verts + (neon_nVerts * #NEON_VERT_BYTES)
+  b = gNeonVerts + (neon_nVerts * #NEON_VERT_BYTES)
 
   ; (x, y)
   PokeN(b +  0, xc0) : PokeN(b +  4, yc0) : PokeN(b +  8, xs0) : PokeN(b + 12, ys0)
@@ -3554,8 +3554,8 @@ Procedure.i neon_TexEnsure()
     ProcedureReturn #NEON_ERR_ARGS
   EndIf
 
-  neon_atlasW      = #NEON_ATLAS_W
-  neon_atlasH      = paddedH
+  gNeonAtlasW      = #NEON_ATLAS_W
+  gNeonAtlasH      = paddedH
   neon_atlasCols   = cols
   neon_atlasGlyphs = nGlyph
 
@@ -3563,7 +3563,7 @@ Procedure.i neon_TexEnsure()
   ;  The raster atlas. Transparent everywhere first - this also clears
   ;  the padded rows above the last glyph row - then ink white.
   ; ------------------------------------------------------------------
-  n = neon_atlasW * neon_atlasH
+  n = gNeonAtlasW * gNeonAtlasH
   i = 0
   While i < n
     PokeN(neon_texSrc + (i * 4), $00000000)
@@ -3583,7 +3583,7 @@ Procedure.i neon_TexEnsure()
       tx = 0
       While tx < neon_fw
         If (bits & (128 >> tx)) <> 0
-          off = (((cellY0 + ty) * neon_atlasW) + (cellX0 + tx)) * 4
+          off = (((cellY0 + ty) * gNeonAtlasW) + (cellX0 + tx)) * 4
           PokeN(neon_texSrc + off, $FFFFFFFF)
         EndIf
         tx = tx + 1
@@ -3601,10 +3601,10 @@ Procedure.i neon_TexEnsure()
   While g < nGlyph
     cellX0 = (g % cols) * neon_fw
     cellY0 = (g / cols) * neon_fh
-    PokeN(neon_glyphUV + (g * 16) +  0, neon_F32Ratio(cellX0,            neon_atlasW))
-    PokeN(neon_glyphUV + (g * 16) +  4, neon_F32Ratio(cellX0 + neon_fw,  neon_atlasW))
-    PokeN(neon_glyphUV + (g * 16) +  8, neon_F32Ratio(cellY0,            neon_atlasH))
-    PokeN(neon_glyphUV + (g * 16) + 12, neon_F32Ratio(cellY0 + neon_fh,  neon_atlasH))
+    PokeN(neon_glyphUV + (g * 16) +  0, neon_F32Ratio(cellX0,            gNeonAtlasW))
+    PokeN(neon_glyphUV + (g * 16) +  4, neon_F32Ratio(cellX0 + neon_fw,  gNeonAtlasW))
+    PokeN(neon_glyphUV + (g * 16) +  8, neon_F32Ratio(cellY0,            gNeonAtlasH))
+    PokeN(neon_glyphUV + (g * 16) + 12, neon_F32Ratio(cellY0 + neon_fh,  gNeonAtlasH))
     g = g + 1
   Wend
 
@@ -3623,8 +3623,8 @@ Procedure.i neon_TexEnsure()
     i = i + 1
   Wend
   PokeN(texState +  0, neon_tex)
-  PokeN(texState +  4, (neon_atlasW << 26))
-  PokeN(texState +  8, (neon_atlasH << 8) | (1 << 22))
+  PokeN(texState +  4, (gNeonAtlasW << 26))
+  PokeN(texState +  8, (gNeonAtlasH << 8) | (1 << 22))
   PokeN(texState + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))
   PokeN(sampState +  0, 1 | 2 | $80)
   PokeN(sampState +  4, (1 << 16) | (1 << 19))
@@ -3633,11 +3633,11 @@ Procedure.i neon_TexEnsure()
   ;  Tile the raster atlas to UBLINEAR_2 with the TFU, and clean the
   ;  three static buffers the TMU will read.
   ; ------------------------------------------------------------------
-  bytes = neon_atlasW * neon_atlasH * 4
+  bytes = gNeonAtlasW * gNeonAtlasH * 4
   V3dBarrier()
-  r = V3dTfuBegin(neon_atlasW, neon_atlasH, #V3D_TEXFMT_RGBA8)
+  r = V3dTfuBegin(gNeonAtlasW, gNeonAtlasH, #V3D_TEXFMT_RGBA8)
   If r = #V3D_OK
-    r = V3dTfuSourceRaster(neon_texSrc, neon_atlasW, bytes)
+    r = V3dTfuSourceRaster(neon_texSrc, gNeonAtlasW, bytes)
   EndIf
   If r = #V3D_OK
     r = V3dTfuDest(neon_tex, #V3D_TFU_OFMT_UBLINEAR_2, bytes)
@@ -3672,11 +3672,11 @@ EndProcedure
 
 ; The dimensions of the built atlas, for a diagnostic's report.
 Procedure.i Neon_AtlasW()
-  ProcedureReturn neon_atlasW
+  ProcedureReturn gNeonAtlasW
 EndProcedure
 
 Procedure.i Neon_AtlasH()
-  ProcedureReturn neon_atlasH
+  ProcedureReturn gNeonAtlasH
 EndProcedure
 
 Procedure.i Neon_AtlasBase()
@@ -5837,7 +5837,7 @@ Global neon_listW.i = 0
 Global neon_listH.i = 0
 Global neon_listRowH.i = 0
 Global neon_listRow.i = 0
-Global neon_listTop.i = 0
+Global gNeonListTop.i = 0
 Global neon_listInside.i = 0
 
 Procedure Neon_ListBegin(id.i, x.i, y.i, w.i, h.i, rowH.i)
@@ -5883,7 +5883,7 @@ Procedure Neon_ListBegin(id.i, x.i, y.i, w.i, h.i, rowH.i)
     top = maxTop
   EndIf
   Neon_StateSet(#NEON_ST_SCROLL, id, top)
-  neon_listTop = top
+  gNeonListTop = top
 
   Neon_Box(x, y, w, h, Neon_C_ListBg)
   Neon_ScissorSet(x, y, w - Neon_S(10), h)
@@ -5914,7 +5914,7 @@ Procedure.i Neon_ListItem(*label, depth.i, selected.i, group.i, *detail)
   idx = neon_listRow
   neon_listRow = neon_listRow + 1
 
-  rowY = neon_listY + ((idx - neon_listTop) * neon_listRowH)
+  rowY = neon_listY + ((idx - gNeonListTop) * neon_listRowH)
   If (rowY + neon_listRowH) < neon_listY
     ProcedureReturn 0
   EndIf
@@ -6008,10 +6008,10 @@ EndProcedure
 ;  The engine takes *ClosedIndex as a ninth argument and this backend
 ;  passes at most eight, so it is an accessor. That is the only change.
 ; ======================================================================
-Global neon_tabClosed.i = -1
+Global gNeonTabClosed.i = -1
 
 Procedure.i Neon_TabClosed()
-  ProcedureReturn neon_tabClosed
+  ProcedureReturn gNeonTabClosed
 EndProcedure
 
 ; Copy field `n` of a '|' separated list into `*out`, zero terminated.
@@ -6103,7 +6103,7 @@ Procedure.i Neon_TabStrip(id.i, x.i, y.i, w.i, h.i, *labels, active.i, withClose
   Protected onX.i
   Protected skip.i
 
-  neon_tabClosed = -1
+  gNeonTabClosed = -1
   Neon_Box(x, y, w, h, Neon_C_Bg)
   Neon_Box(x, y + h - 1, w, 1, Neon_C_Line)
 
@@ -6167,7 +6167,7 @@ Procedure.i Neon_TabStrip(id.i, x.i, y.i, w.i, h.i, *labels, active.i, withClose
       EndIf
       Neon_Text(#NEON_FONT_SMALL, bx, by - 1, "x", Neon_C_Dim)
       If onX <> 0 And Neon_MouseClicked <> 0
-        neon_tabClosed = i
+        gNeonTabClosed = i
         skip = 1                             ; close beats select, :1147
       EndIf
     EndIf

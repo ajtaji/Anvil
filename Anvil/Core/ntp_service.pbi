@@ -63,7 +63,7 @@ Global ntps_serverSource.i
 Global ntps_dnsPort.i
 Global ntps_localPort.i
 Global ntps_qid.i
-Global ntps_due.i
+Global gNtpsDue.i
 Global ntps_deadline.i
 Global ntps_failures.i
 Global ntps_queries.i
@@ -178,7 +178,7 @@ Procedure ntps_ScheduleFailure(code.i, now.i)
     delay = delay << (ntps_failures - 1)
   EndIf
   If delay > #NTP_RETRY_MAX_MS : delay = #NTP_RETRY_MAX_MS : EndIf
-  ntps_due = (now + delay) & $FFFFFFFF
+  gNtpsDue = (now + delay) & $FFFFFFFF
   ntps_state = #NTP_SERVICE_SELECT
   ntps_kind = #HW_LINK_NONE
   ntps_localIp = 0
@@ -321,7 +321,7 @@ Procedure ntps_DnsSend(now.i)
   If NetUdpBuild(ntps_kind, ntps_dnsIp, #DNS_PORT, ntps_dnsPort, DnsQueryBuf(), n) = 0
     If NetError() = #NET_E_NO_ARP
       ntps_SendArp(ntps_kind, ntps_dnsIp)
-      ntps_due = (now + 250) & $FFFFFFFF
+      gNtpsDue = (now + 250) & $FFFFFFFF
       ProcedureReturn
     EndIf
     ntps_ScheduleFailure(#NTP_SERVICE_E_BUILD, now)
@@ -368,7 +368,7 @@ Procedure ntps_NtpSend(now.i)
   If NetUdpBuild(ntps_kind, ntps_serverIp, #SNTP_PORT, ntps_localPort, @ntps_request[0], n) = 0
     If NetError() = #NET_E_NO_ARP
       ntps_SendArp(ntps_kind, ntps_serverIp)
-      ntps_due = (now + 250) & $FFFFFFFF
+      gNtpsDue = (now + 250) & $FFFFFFFF
       ProcedureReturn
     EndIf
     ntps_ScheduleFailure(#NTP_SERVICE_E_BUILD, now)
@@ -402,7 +402,7 @@ Procedure.i NtpServiceInput(kind.i)
       ntps_serverIp = DnsResultIp(0)
       ntps_attemptDeadline = 0
       ntps_state = #NTP_SERVICE_NTP_SEND
-      ntps_due = millis()
+      gNtpsDue = millis()
     Else
       ntps_rejects = ntps_rejects + 1
       ntps_lastError = #NTP_SERVICE_E_DNS_REPLY
@@ -416,7 +416,7 @@ Procedure.i NtpServiceInput(kind.i)
       ntps_pendingFraction = SntpReplyFraction()
       ntps_replyTick = Ticks()
       ntps_state = #NTP_SERVICE_APPLY
-      ntps_due = millis()
+      gNtpsDue = millis()
     Else
       ntps_rejects = ntps_rejects + 1
       ntps_lastError = #NTP_SERVICE_E_SNTP_REPLY
@@ -450,7 +450,7 @@ Procedure NtpServiceTick()
     EndIf
     ProcedureReturn
   EndIf
-  If ntps_Due(now, ntps_due) = 0
+  If ntps_Due(now, gNtpsDue) = 0
     ProcedureReturn
   EndIf
 
@@ -501,7 +501,7 @@ Procedure NtpServiceTick()
     ntps_failures = 0
     ntps_lastError = #NTP_SERVICE_OK
     ntps_lastSyncMs = now
-    ntps_due = (now + #NTP_REFRESH_MS) & $FFFFFFFF
+    gNtpsDue = (now + #NTP_REFRESH_MS) & $FFFFFFFF
     ntps_state = #NTP_SERVICE_HOLD
     ntps_kind = #HW_LINK_NONE
     ntps_localIp = 0
@@ -523,7 +523,7 @@ Procedure NtpServiceReload()
   ntps_localIp = 0
   ntps_failures = 0
   ntps_attemptDeadline = 0
-  ntps_due = millis()
+  gNtpsDue = millis()
 EndProcedure
 
 Procedure NtpServiceBoot()
@@ -540,7 +540,7 @@ Procedure NtpServiceRequestNow()
   ntps_localIp = 0
   ntps_failures = 0
   ntps_attemptDeadline = 0
-  ntps_due = millis()
+  gNtpsDue = millis()
 EndProcedure
 
 Procedure.i NtpServiceState() : ProcedureReturn ntps_state : EndProcedure

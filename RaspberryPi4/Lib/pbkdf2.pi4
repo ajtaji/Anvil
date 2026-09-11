@@ -273,7 +273,7 @@ Global Dim secPbkdf2Int.a[4]        ; INT(i), four octets, big-endian
 Global Dim secPbkdf2StepU.a[20]
 Global Dim secPbkdf2StepT.a[20]
 Global Dim secPbkdf2StepInt.a[4]
-Global pbkdf2StepState.i = #PBKDF2_STEP_IDLE
+Global gPbkdf2StepState.i = #PBKDF2_STEP_IDLE
 Global pbkdf2StepPw.i = 0
 Global pbkdf2StepPwLen.i = 0
 Global pbkdf2StepSalt.i = 0
@@ -344,7 +344,7 @@ Procedure Pbkdf2StepWipe()
   For i = 0 To 3
     secPbkdf2StepInt[i] = 0
   Next
-  pbkdf2StepState = #PBKDF2_STEP_IDLE
+  gPbkdf2StepState = #PBKDF2_STEP_IDLE
   pbkdf2StepPw = 0
   pbkdf2StepPwLen = 0
   pbkdf2StepSalt = 0
@@ -362,7 +362,7 @@ EndProcedure
 ; The pointer lifetimes and the one-active-operation rule are explicit: a
 ; second begin is refused until the owner cancels or consumes completion.
 Procedure.i Pbkdf2StepBegin(pw.i, pwlen.i, salt.i, saltlen.i, iters.i, dst.i, dklen.i)
-  If pbkdf2StepState = #PBKDF2_STEP_RUNNING
+  If gPbkdf2StepState = #PBKDF2_STEP_RUNNING
     ProcedureReturn #PBKDF2_STEP_ERROR
   EndIf
   If dst = 0 Or pwlen < 0 Or saltlen < 0
@@ -387,8 +387,8 @@ Procedure.i Pbkdf2StepBegin(pw.i, pwlen.i, salt.i, saltlen.i, iters.i, dst.i, dk
   pbkdf2StepBlock = 1
   pbkdf2StepIter = 0
   pbkdf2StepOff = 0
-  pbkdf2StepState = #PBKDF2_STEP_RUNNING
-  ProcedureReturn pbkdf2StepState
+  gPbkdf2StepState = #PBKDF2_STEP_RUNNING
+  ProcedureReturn gPbkdf2StepState
 EndProcedure
 
 ; Execute at most `budget` complete PRFs. It never calls a progress or network
@@ -398,11 +398,11 @@ Procedure.i Pbkdf2Step(budget.i)
   Protected k.i
   Protected want.i
 
-  If pbkdf2StepState <> #PBKDF2_STEP_RUNNING
-    ProcedureReturn pbkdf2StepState
+  If gPbkdf2StepState <> #PBKDF2_STEP_RUNNING
+    ProcedureReturn gPbkdf2StepState
   EndIf
   If budget < 1
-    ProcedureReturn pbkdf2StepState
+    ProcedureReturn gPbkdf2StepState
   EndIf
 
   ; Restore our PRF key in case a complete HMAC user ran between slices.
@@ -472,13 +472,13 @@ Procedure.i Pbkdf2Step(budget.i)
     pbkdf2StepBlock = 0
     pbkdf2StepIter = 0
     pbkdf2StepOff = 0
-    pbkdf2StepState = #PBKDF2_STEP_DONE
+    gPbkdf2StepState = #PBKDF2_STEP_DONE
   EndIf
-  ProcedureReturn pbkdf2StepState
+  ProcedureReturn gPbkdf2StepState
 EndProcedure
 
 Procedure.i Pbkdf2StepState()
-  ProcedureReturn pbkdf2StepState
+  ProcedureReturn gPbkdf2StepState
 EndProcedure
 
 ; WPA2's argument contract around the generic resumable engine.
