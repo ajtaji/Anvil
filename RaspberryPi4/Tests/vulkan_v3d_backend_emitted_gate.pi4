@@ -1,0 +1,119 @@
+; ======================================================================
+;  Emitted gate: the real Pi 4 V3D Vulkan backend, linked and refusing
+; ======================================================================
+; This image links the ACTUAL display, V3D, QPU and Neon implementation
+; together with the Vulkan object engine and the V3D backend, and then
+; executes the production boundary with an MMIO hard stop armed.
+;
+; It proves three things and claims nothing else:
+;
+;   1. the whole closure LINKS - every symbol the Vulkan surface needs
+;      from the Pi driver is there, at the revision in the tree;
+;   2. with the graphics engine not initialised the backend enumerates
+;      NO physical device, so vkCreateInstance reports an incompatible
+;      driver and every downstream object is unreachable;
+;   3. reaching that answer touches NO HARDWARE. Not one MMIO access is
+;      made, which is what makes this safe to run on a desk.
+;
+; It does NOT prove that a clear executes. That needs the GPU and it is
+; RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4, on the board.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VKB_OUT = $06000000
+#VKB_ROWS = $06000100
+#VKB_TEXT = $06002000
+
+Global vkbChecks.i = 0
+Global vkbFails.i = 0
+
+Procedure Vkb(ok.i)
+  PokeN(#VKB_ROWS + (vkbChecks * 8), ok)
+  vkbChecks = vkbChecks + 1
+  If ok = 0
+    vkbFails = vkbFails + 1
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i
+  Define count.i
+  Define ici.VkInstanceCreateInfo
+  Define mp.VkPhysicalDeviceMemoryProperties
+
+  ; The engine has not been initialised and no window has been declared.
+  Vkb(Neon_Ready() = 0)
+  Vkb(avkBackendCaps() = 0)
+  Vkb(AnvilVkBackendAvailable() = 0)
+  Vkb(AnvilVkBackendIsGpu() = 0)
+  Vkb(AnvilVkBackendName() <> 0)
+
+  ; The window declaration refuses a base that is not page aligned and a
+  ; window smaller than one page, each with its own sentence.
+  Vkb(AnvilVkV3dWindow($00200001, $10000) = #ANVIL_VK_ERR_ARGS)
+  PokeI(#VKB_TEXT + 0, AnvilVkFaultText())
+  Vkb(AnvilVkV3dWindow($00200000, 512) = #ANVIL_VK_ERR_ARGS)
+  PokeI(#VKB_TEXT + 8, AnvilVkFaultText())
+  Vkb(AnvilVkV3dWindow($00200000, $10000) = #VK_SUCCESS)
+
+  ; A declared window is still not a device: the engine is not up, so
+  ; the backend advertises nothing and vkCreateDevice would be refused.
+  Vkb(avkBackendCaps() = 0)
+  Vkb(AnvilVkBackendAvailable() = 0)
+  Vkb(avkBackendPrepare() = #VK_ERROR_INITIALIZATION_FAILED)
+  PokeI(#VKB_TEXT + 16, AnvilVkFaultText())
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  inst = 123
+  Vkb(vkCreateInstance(@ici, 0, @inst) = #VK_ERROR_INCOMPATIBLE_DRIVER)
+  Vkb(inst = #VK_NULL_HANDLE)
+  count = 4
+  Vkb(vkEnumeratePhysicalDevices(#VK_NULL_HANDLE, @count, 0) = #ANVIL_VK_ERR_HANDLE)
+
+  ; The heap the backend would offer is the declared window, and nothing
+  ; else. One memory type, device local and host visible, NOT coherent.
+  Vkb(avkBackendHeapBase() = $00200000)
+  Vkb(avkBackendHeapBytes() = $10000)
+  Vkb(avkBackendMemoryTypeCount() = 1)
+  Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) <> 0)
+  Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) <> 0)
+  Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) = 0)
+  Vkb(avkBackendHeapCount() = 1)
+  Vkb(avkBackendHeapSizeOf(0) = $10000)
+  Vkb(avkBackendImageAlignment() = 4096)
+
+  ; With the engine down there is no surface pitch to match, so the row
+  ; pitch falls back to the tight one and a clear of any extent at all
+  ; is refused rather than attempted.
+  Vkb(avkBackendRowPitchFor(64) = 256)
+  Vkb(avkBackendClearSupported($00200000, 16384, 64, 64, 256) = #VK_ERROR_DEVICE_LOST)
+  Vkb(avkBackendSubmitClear($00200000, 16384, 64, 64, 256, $FF112233) < 0)
+  Vkb(avkBackendLastNativeError() = #VK_ERROR_DEVICE_LOST)
+  Vkb(avkBackendJobs() = 0)
+
+  ; The V3D driver is linked and answers its own identity questions from
+  ; state, not from registers: nothing here has read a single one yet.
+  Vkb(V3dReady() = 0)
+  Vkb(V3dBinJobs() = 0)
+  Vkb(V3dRenderJobs() = 0)
+  Vkb(V3dTfuJobs() = 0)
+  Vkb(Neon_Draws() = 0)
+  Vkb(DisplayReady() = 0)
+
+  PokeN(#VKB_OUT + 0, $564B4233) ; "VKB3"
+  PokeN(#VKB_OUT + 8, vkbChecks)
+  PokeN(#VKB_OUT + 16, vkbFails)
+  PokeI(#VKB_OUT + 24, AnvilVkBackendName())
+  PokeN(#VKB_OUT + 32, AnvilVkFaultCount())
+  ProcedureReturn vkbFails
+EndProcedure

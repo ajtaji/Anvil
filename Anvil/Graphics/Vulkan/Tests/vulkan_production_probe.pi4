@@ -1,20 +1,32 @@
-; Production boundary probe: no test backend macro, therefore no physical
-; device can be reached and instance creation reports incompatible driver.
-#ANVIL_VK_TEST_BACKEND = 0
-XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+; Production boundary probe: it links the ABSENT backend, so no physical
+; device can be reached and instance creation reports an incompatible
+; driver. This is the build any target without a graphics backend gets,
+; and it is here so "no device" is a linked, executed answer rather than
+; the absence of a file.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_none.pbi"
 
 #VKP_OUT = $06000000
 
 Procedure.i Main()
   Define handle.i
+  Define count.i
   Define rc.i
   Define fail.i
+  Define ici.VkInstanceCreateInfo
   handle = 123
   fail = 0
   If AnvilVkBackendAvailable() <> 0 : fail = fail + 1 : EndIf
-  rc = AnvilVkInstanceCreate(@handle)
+  If AnvilVkBackendIsGpu() <> 0 : fail = fail + 1 : EndIf
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @handle)
   If rc <> #VK_ERROR_INCOMPATIBLE_DRIVER : fail = fail + 1 : EndIf
   If handle <> #VK_NULL_HANDLE : fail = fail + 1 : EndIf
+  ; An enumeration against the null instance must not invent a device.
+  count = 4
+  If vkEnumeratePhysicalDevices(#VK_NULL_HANDLE, @count, 0) <> #ANVIL_VK_ERR_HANDLE : fail = fail + 1 : EndIf
+  If AnvilVkBackendName() = 0 : fail = fail + 1 : EndIf
   PokeN(#VKP_OUT + 0, $564B5052) ; "VKPR"
   PokeN(#VKP_OUT + 8, fail)
   ProcedureReturn fail

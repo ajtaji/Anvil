@@ -1,0 +1,728 @@
+; ======================================================================
+;  Emitted gate: Vulkan resources, layouts, fences and submission
+; ======================================================================
+; Built by the real compiler and executed on the A64 interpreter with an
+; MMIO hard stop armed. It links the EXPLICIT TEST BACKEND, which owns no
+; GPU and never writes a pixel, so everything below is state, ordering,
+; ownership and error reporting - and the image memory it poisons is
+; still poison at the end, which is how this gate proves that no CPU
+; clear is hiding inside the driver.
+;
+; Every call goes through a public vk* entry point where one exists.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VKR_OUT = $06000000
+#VKR_ROWS = $06000100
+#VKR_TEXT = $06002000
+#VKR_CONV = $06003000
+
+#VKR_HEAP = $00200000
+#VKR_HEAP_BYTES = $00010000      ; 64 KiB: four 64x64 images exactly
+#VKR_W = 64
+#VKR_H = 64
+#VKR_PITCH = 256                 ; align(64 * 4, 64)
+#VKR_IMG_BYTES = 16384           ; 256 * 64
+#VKR_POISON = $A5C3F00D
+
+; IEEE-754 binary32 bit patterns. The engine converts these to 8-bit
+; UNORM without touching the floating-point unit.
+#VKR_F_ZERO = $00000000          ; 0.0  -> 0
+#VKR_F_ONE = $3F800000           ; 1.0  -> 255
+#VKR_F_HALF = $3F000000          ; 0.5  -> 128
+#VKR_F_02 = $3E4CCCCD            ; 0.2  -> 51
+#VKR_F_07 = $3F333333            ; 0.7  -> 178
+#VKR_F_1_255 = $3B808081         ; 1/255 -> 1
+#VKR_F_NEG = $BF800000           ; -1.0 -> 0
+#VKR_F_TWO = $40000000           ; 2.0  -> 255
+#VKR_F_INF = $7F800000           ; +inf -> 255
+#VKR_F_NAN = $7FC00000           ; NaN  -> 0
+#VKR_F_SUB = $00000001           ; smallest subnormal -> 0
+
+Global vkrChecks.i = 0
+Global vkrFails.i = 0
+Global vkrTexts.i = 0
+
+Procedure Vkr(ok.i)
+  PokeN(#VKR_ROWS + (vkrChecks * 8), ok)
+  vkrChecks = vkrChecks + 1
+  If ok = 0
+    vkrFails = vkrFails + 1
+  EndIf
+EndProcedure
+
+; Record the sentence the last refusal produced, so the checker can read
+; the bytes out of the image and judge them itself.
+Procedure Sentence()
+  PokeI(#VKR_TEXT + (vkrTexts * 8), AnvilVkFaultText())
+  vkrTexts = vkrTexts + 1
+EndProcedure
+
+Global Dim vkrColor.l[4]
+
+Procedure SetColor(r.i, g.i, b.i, a.i)
+  PokeL(@vkrColor[0] + 0, r)
+  PokeL(@vkrColor[0] + 4, g)
+  PokeL(@vkrColor[0] + 8, b)
+  PokeL(@vkrColor[0] + 12, a)
+EndProcedure
+
+Procedure Poison(base.i, bytes.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeL(base + i, #VKR_POISON)
+    i = i + 4
+  Wend
+EndProcedure
+
+Procedure.i PoisonIntact(base.i, bytes.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    If (PeekL(base + i) & $FFFFFFFF) <> #VKR_POISON
+      ProcedureReturn 0
+    EndIf
+    i = i + 4
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define cmd2.i
+  Define img.i
+  Define img2.i
+  Define mem.i
+  Define memA.i
+  Define memB.i
+  Define memC.i
+  Define fence.i
+  Define fence2.i
+  Define count.i
+  Define i.i
+  Define offA.i
+  Define offC.i
+  Define imgBase.i
+
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define bar.VkImageMemoryBarrier
+  Define pbargs.AnvilVkPipelineBarrierArgs
+  Define range.VkImageSubresourceRange
+  Define cbHandle.i
+  Define cb2Handle.i
+  Define si2.VkSubmitInfo
+  Define fenceArray.i
+
+  ; ------------------------------------------------------------------
+  ;  0. The pure binary32 -> UNORM8 conversion, at its edges.
+  ; ------------------------------------------------------------------
+  PokeI(#VKR_CONV + 0, avkUnorm8FromF32Bits(#VKR_F_ZERO))
+  PokeI(#VKR_CONV + 8, avkUnorm8FromF32Bits(#VKR_F_ONE))
+  PokeI(#VKR_CONV + 16, avkUnorm8FromF32Bits(#VKR_F_HALF))
+  PokeI(#VKR_CONV + 24, avkUnorm8FromF32Bits(#VKR_F_02))
+  PokeI(#VKR_CONV + 32, avkUnorm8FromF32Bits(#VKR_F_07))
+  PokeI(#VKR_CONV + 40, avkUnorm8FromF32Bits(#VKR_F_1_255))
+  PokeI(#VKR_CONV + 48, avkUnorm8FromF32Bits(#VKR_F_NEG))
+  PokeI(#VKR_CONV + 56, avkUnorm8FromF32Bits(#VKR_F_TWO))
+  PokeI(#VKR_CONV + 64, avkUnorm8FromF32Bits(#VKR_F_INF))
+  PokeI(#VKR_CONV + 72, avkUnorm8FromF32Bits(#VKR_F_NAN))
+  PokeI(#VKR_CONV + 80, avkUnorm8FromF32Bits(#VKR_F_SUB))
+
+  ; ------------------------------------------------------------------
+  ;  1. Bring the explicit test backend up and reach a device.
+  ; ------------------------------------------------------------------
+  AnvilVkTestBackendHeap(#VKR_HEAP, #VKR_HEAP_BYTES)
+  AnvilVkTestBackendLimits(4096, 64)
+  Vkr(AnvilVkBackendAvailable() = 1)
+  Vkr(AnvilVkBackendIsGpu() = 0)
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  Vkr(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  count = 1
+  Vkr(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS)
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  Vkr(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  Vkr(queue <> #VK_NULL_HANDLE)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  Vkr(vkCreateCommandPool(dev, @pci, 0, @pool) = #VK_SUCCESS)
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  Vkr(vkAllocateCommandBuffers(dev, @cbai, @cmd) = #VK_SUCCESS)
+
+  ; ------------------------------------------------------------------
+  ;  2. vkCreateImage: what is implemented and what is refused.
+  ; ------------------------------------------------------------------
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #VKR_W
+  imgci\extent\height = #VKR_H
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+
+  imgci\format = #VK_FORMAT_R8G8B8A8_UNORM
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Sentence()
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Sentence()
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\mipLevels = 2
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 6
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_2_BIT
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_CONCURRENT
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\imageType = #VK_IMAGE_TYPE_3D
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\extent\depth = 4
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_ARGS)
+  imgci\extent\depth = 1
+  imgci\usage = #VK_IMAGE_USAGE_SAMPLED_BIT
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_GENERAL
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_ARGS)
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  imgci\flags = 1
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  imgci\flags = 0
+  Vkr(vkCreateImage(dev, @imgci, @imgci, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  imgci\pNext = @imgci
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
+  imgci\pNext = 0
+
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_SUCCESS)
+  Vkr(img <> #VK_NULL_HANDLE)
+  Vkr(avkTokenKind(img) = #ANVIL_VK_TYPE_IMAGE)
+  Vkr(AnvilVkImageLayout(img) = #VK_IMAGE_LAYOUT_UNDEFINED)
+
+  ; ------------------------------------------------------------------
+  ;  3. vkGetImageMemoryRequirements: exact size, pitch and alignment.
+  ; ------------------------------------------------------------------
+  ; A width whose tight row is NOT already a multiple of the backend's
+  ; row alignment: 50 texels is 200 bytes, which must be padded to 256.
+  ; Without this the 64-wide image alone would hide a pitch rule that
+  ; ignored the alignment entirely, because 64 * 4 is already aligned.
+  imgci\extent\width = 50
+  imgci\extent\height = 4
+  Vkr(vkCreateImage(dev, @imgci, 0, @img2) = #VK_SUCCESS)
+  Vkr(AnvilVkImageRowPitch(img2) = 256)
+  vkGetImageMemoryRequirements(dev, img2, @req)
+  Vkr(req\size = 1024)
+  Vkr(req\alignment = 4096)
+  vkDestroyImage(dev, img2, 0)
+  imgci\extent\width = #VKR_W
+  imgci\extent\height = #VKR_H
+
+  vkGetImageMemoryRequirements(dev, img, @req)
+  Vkr(req\size = #VKR_IMG_BYTES)
+  Vkr(req\alignment = 4096)
+  Vkr(req\memoryTypeBits = 3)
+  Vkr(AnvilVkImageRowPitch(img) = #VKR_PITCH)
+  Vkr(AnvilVkImageAddress(img) = 0)
+
+  ; ------------------------------------------------------------------
+  ;  4. vkAllocateMemory and the heap.
+  ; ------------------------------------------------------------------
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 9
+  Vkr(vkAllocateMemory(dev, @mai, 0, @mem) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  mai\memoryTypeIndex = 1
+  mai\allocationSize = 0
+  Vkr(vkAllocateMemory(dev, @mai, 0, @mem) = #ANVIL_VK_ERR_ARGS)
+  mai\allocationSize = req\size
+  Vkr(vkAllocateMemory(dev, @mai, 0, @mem) = #VK_SUCCESS)
+  Vkr(AnvilVkMemoryAddress(mem) = #VKR_HEAP)
+  Vkr(AnvilVkMemorySize(mem) = #VKR_IMG_BYTES)
+
+  ; The heap holds exactly four of these. The fifth is a real
+  ; VK_ERROR_OUT_OF_DEVICE_MEMORY, not a silent overlap.
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memB) = #VK_SUCCESS)
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memC) = #VK_SUCCESS)
+  Vkr(vkAllocateMemory(dev, @mai, 0, @fence2) = #VK_ERROR_OUT_OF_DEVICE_MEMORY)
+  Vkr(fence2 = #VK_NULL_HANDLE)
+
+  ; RESOURCE REUSE: free one out of the middle and the next allocation
+  ; takes exactly that hole back, not a fresh bump past the end.
+  offA = AnvilVkMemoryAddress(memA)
+  vkFreeMemory(dev, memA, 0)
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
+  offC = AnvilVkMemoryAddress(memA)
+  Vkr(offC = offA)
+  vkFreeMemory(dev, memA, 0)
+  vkFreeMemory(dev, memB, 0)
+  vkFreeMemory(dev, memC, 0)
+
+  ; ------------------------------------------------------------------
+  ;  5. vkBindImageMemory: every binding rule.
+  ; ------------------------------------------------------------------
+  ; A misaligned offset with PLENTY of room behind it. In a tight
+  ; allocation the too-small rule answers for the alignment rule and
+  ; hides it, so this allocation is deliberately twice the image.
+  mai\allocationSize = #VKR_IMG_BYTES * 2
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
+  Vkr(vkCreateImage(dev, @imgci, 0, @img2) = #VK_SUCCESS)
+  Vkr(vkBindImageMemory(dev, img2, memA, 64) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkBindImageMemory(dev, img2, memA, 4096) = #VK_SUCCESS)
+  Vkr(AnvilVkImageAddress(img2) = AnvilVkMemoryAddress(memA) + 4096)
+  vkDestroyImage(dev, img2, 0)
+  vkFreeMemory(dev, memA, 0)
+  mai\allocationSize = #VKR_IMG_BYTES
+
+  Vkr(vkBindImageMemory(dev, img, mem, 64) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkBindImageMemory(dev, img, mem, 4096) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkBindImageMemory(dev, img, #VK_NULL_HANDLE, 0) = #ANVIL_VK_ERR_HANDLE)
+  Vkr(vkBindImageMemory(dev, img, mem, 0) = #VK_SUCCESS)
+  Vkr(AnvilVkImageAddress(img) = #VKR_HEAP)
+  Vkr(vkBindImageMemory(dev, img, mem, 0) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+
+  ; Freeing memory an image is bound to is refused, and the allocation
+  ; is still there afterwards.
+  AnvilVkFaultClear()
+  vkFreeMemory(dev, mem, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(AnvilVkMemoryAddress(mem) = #VKR_HEAP)
+  Vkr(AnvilVkImageAddress(img) = #VKR_HEAP)
+
+  imgBase = AnvilVkImageAddress(img)
+  Poison(imgBase, #VKR_IMG_BYTES)
+  PokeI(#VKR_OUT + 80, imgBase)
+  PokeI(#VKR_OUT + 88, #VKR_IMG_BYTES)
+
+  ; ------------------------------------------------------------------
+  ;  6. Recording: the barrier's own rules.
+  ; ------------------------------------------------------------------
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\image = img
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\baseMipLevel = 0
+  bar\subresourceRange\levelCount = 1
+  bar\subresourceRange\baseArrayLayer = 0
+  bar\subresourceRange\layerCount = 1
+  pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  pbargs\imageMemoryBarrierCount = 1
+  pbargs\pImageMemoryBarriers = @bar
+
+  ; A barrier into TRANSFER_DST_OPTIMAL with no transfer write in its
+  ; destination access scope is the classic silently-wrong barrier.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  bar\dstAccessMask = 0
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(AnvilVkCommandBufferFailureText(cmd) <> 0)
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; ... and one whose destination stage omits the transfer stage.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  pbargs\dstStageMask = #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A queue-family ownership transfer on a one-family device.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  bar\srcQueueFamilyIndex = 0
+  bar\dstQueueFamilyIndex = 1
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A depth aspect on a colour image, and a subresource range that is
+  ; not the whole of a single-level, single-layer image.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_DEPTH_BIT
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  bar\subresourceRange\baseMipLevel = 1
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  bar\subresourceRange\baseMipLevel = 0
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A global memory barrier and a buffer memory barrier are refused.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  pbargs\memoryBarrierCount = 1
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  pbargs\memoryBarrierCount = 0
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A barrier that claims a layout the recording did not put the image in.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  bar\oldLayout = #VK_IMAGE_LAYOUT_GENERAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_GENERAL
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; ------------------------------------------------------------------
+  ;  7. Recording: the clear's own rules.
+  ; ------------------------------------------------------------------
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\baseMipLevel = 0
+  range\levelCount = 1
+  range\baseArrayLayer = 0
+  range\layerCount = 1
+  SetColor(#VKR_F_02, #VKR_F_HALF, #VKR_F_07, #VKR_F_ONE)
+
+  ; Clearing an image the recording has not transitioned, while claiming
+  ; a layout it is not in.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A layout a clear may never be issued in.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; An image created without VK_IMAGE_USAGE_TRANSFER_DST_BIT.
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  Vkr(vkCreateImage(dev, @imgci, 0, @img2) = #VK_SUCCESS)
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
+  Vkr(vkBindImageMemory(dev, img2, memA, 0) = #VK_SUCCESS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdClearColorImage(cmd, img2, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  vkDestroyImage(dev, img2, 0)
+  vkFreeMemory(dev, memA, 0)
+
+  ; More than one subresource range.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 2, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; ------------------------------------------------------------------
+  ;  8. The good path, with a fence, held by the backend so the pending
+  ;     state is actually observable.
+  ; ------------------------------------------------------------------
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  fci\flags = 8
+  Vkr(vkCreateFence(dev, @fci, 0, @fence) = #ANVIL_VK_ERR_ARGS)
+  fci\flags = #VK_FENCE_CREATE_SIGNALED_BIT
+  Vkr(vkCreateFence(dev, @fci, 0, @fence2) = #VK_SUCCESS)
+  Vkr(vkGetFenceStatus(dev, fence2) = #VK_SUCCESS)
+  fci\flags = 0
+  Vkr(vkCreateFence(dev, @fci, 0, @fence) = #VK_SUCCESS)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_NOT_READY)
+
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+  ; Nothing has run yet, so the image's layout has not moved.
+  Vkr(AnvilVkImageLayout(img) = #VK_IMAGE_LAYOUT_UNDEFINED)
+
+  Vkr(vkAllocateCommandBuffers(dev, @cbai, @cmd2) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd2, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrierArgs(cmd2, @pbargs)
+  vkCmdClearColorImage(cmd2, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd2) = #VK_SUCCESS)
+  cb2Handle = cmd2
+  si2\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si2\commandBufferCount = 1
+  si2\pCommandBuffers = @cb2Handle
+
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cbHandle
+
+  ; A fence that is already signalled may not be handed to a submission.
+  Vkr(vkQueueSubmit(queue, 1, @si, fence2) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  ; Semaphores are refused before anything is claimed.
+  si\waitSemaphoreCount = 1
+  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Sentence()
+  si\waitSemaphoreCount = 0
+  Vkr(vkQueueSubmit(queue, 2, @si, fence) = #ANVIL_VK_ERR_UNSUPPORTED)
+
+  AnvilVkTestBackendHold(1)
+  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #VK_SUCCESS)
+  Vkr(AnvilVkSubmissionOutstanding() = 1)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_PENDING)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_NOT_READY)
+  Vkr(AnvilVkTestBackendCalls() = 1)
+
+  ; While the submission is outstanding every object it references is
+  ; retained, and every attempt to take one away is refused out loud.
+  fenceArray = fence
+  Vkr(vkWaitForFences(dev, 1, @fenceArray, 1, 0) = #VK_TIMEOUT)
+  AnvilVkFaultClear()
+  vkDestroyImage(dev, img, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(AnvilVkImageAddress(img) = #VKR_HEAP)
+  AnvilVkFaultClear()
+  vkFreeMemory(dev, mem, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  AnvilVkFaultClear()
+  vkDestroyFence(dev, fence, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(vkResetFences(dev, 1, @fenceArray) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #ANVIL_VK_ERR_STATE)
+  Vkr(AnvilVkCommandPoolReset(dev, pool, 0) = #ANVIL_VK_ERR_STATE)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  ; A DIFFERENT, executable command buffer is refused too: one
+  ; submission at a time is the queue's rule, not the pending buffer's.
+  Vkr(vkQueueSubmit(queue, 1, @si2, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(AnvilVkTestBackendCalls() = 1)
+  Vkr(AnvilVkCommandBufferState(cmd2) = #ANVIL_VK_CB_EXECUTABLE)
+  ; A timed wait honours its timeout and comes back, it does not hang.
+  Vkr(vkWaitForFences(dev, 1, @fenceArray, 1, 20000) = #VK_TIMEOUT)
+
+  ; Release it: the fence signals, the command buffer leaves the pending
+  ; state and the image's layout becomes what the recording said.
+  AnvilVkTestBackendHold(0)
+  Vkr(vkWaitForFences(dev, 1, @fenceArray, 1, 1000000) = #VK_SUCCESS)
+  Vkr(AnvilVkSubmissionOutstanding() = 0)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_SUCCESS)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+  Vkr(AnvilVkImageLayout(img) = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+  Vkr(AnvilVkCompleteCount() = 1)
+  Vkr(AnvilVkTestBackendLastBase() = #VKR_HEAP)
+  Vkr(AnvilVkTestBackendLastWidth() = #VKR_W)
+  Vkr(AnvilVkTestBackendLastHeight() = #VKR_H)
+  Vkr(AnvilVkTestBackendLastPitch() = #VKR_PITCH)
+  Vkr(AnvilVkTestBackendLastBytes() = #VKR_IMG_BYTES)
+  ; 0.2, 0.5, 0.7, 1.0 -> R=51 G=128 B=178 A=255 -> $FF3380B2
+  Vkr(AnvilVkTestBackendLastColor() = $FF3380B2)
+
+  ; THE IMAGE IS UNTOUCHED. The driver asked a backend to clear it and
+  ; that backend owns no GPU, so every poisoned word must still be there.
+  Vkr(PoisonIntact(imgBase, #VKR_IMG_BYTES) = 1)
+  PokeI(#VKR_OUT + 72, PoisonIntact(imgBase, #VKR_IMG_BYTES))
+
+  ; A fence may be reset and reused once its submission is done.
+  Vkr(vkResetFences(dev, 1, @fenceArray) = #VK_SUCCESS)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_NOT_READY)
+
+  ; ------------------------------------------------------------------
+  ;  9. Submit again: the entry layout is now checked against the image.
+  ; ------------------------------------------------------------------
+  ; This recording assumes the image starts in GENERAL. It does not, so
+  ; the refusal happens at submit and nothing reaches the backend.
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #ANVIL_VK_ERR_STATE)
+  Sentence()
+  Vkr(AnvilVkTestBackendCalls() = 1)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_NOT_READY)
+
+  ; The same recording, claiming the layout the image really is in, runs.
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  SetColor(#VKR_F_ONE, #VKR_F_ZERO, #VKR_F_ZERO, #VKR_F_ONE)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #VK_SUCCESS)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_SUCCESS)
+  Vkr(AnvilVkTestBackendCalls() = 2)
+  ; Opaque red in VK_FORMAT_B8G8R8A8_UNORM is the word $FFFF0000.
+  Vkr(AnvilVkTestBackendLastColor() = $FFFF0000)
+  Vkr(AnvilVkImageLayout(img) = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+
+  ; ------------------------------------------------------------------
+  ;  10. A device fault: the command buffer is invalid, the fence is
+  ;      still signalled, and the layout does NOT advance.
+  ; ------------------------------------------------------------------
+  Vkr(vkResetFences(dev, 1, @fenceArray) = #VK_SUCCESS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_GENERAL
+  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  AnvilVkTestBackendFailNext(-77)
+  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #VK_ERROR_DEVICE_LOST)
+  Sentence()
+  Vkr(AnvilVkBackendNativeError() = -77)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+  Vkr(vkGetFenceStatus(dev, fence) = #VK_SUCCESS)
+  Vkr(AnvilVkImageLayout(img) = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+  Vkr(AnvilVkSubmissionOutstanding() = 0)
+  Vkr(PoisonIntact(imgBase, #VKR_IMG_BYTES) = 1)
+
+  ; ------------------------------------------------------------------
+  ;  11. The backend refuses an extent it cannot render, at RECORD time,
+  ;      so an unsupported clear never reaches a queue.
+  ; ------------------------------------------------------------------
+  AnvilVkTestBackendClearExtent(#VKR_W, #VKR_H)
+  imgci\extent\width = 32
+  imgci\extent\height = 32
+  Vkr(vkCreateImage(dev, @imgci, 0, @img2) = #VK_SUCCESS)
+  vkGetImageMemoryRequirements(dev, img2, @req)
+  Vkr(req\size = 4096)
+  mai\allocationSize = req\size
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
+  Vkr(vkBindImageMemory(dev, img2, memA, 0) = #VK_SUCCESS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdClearColorImage(cmd, img2, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Sentence()
+  Vkr(AnvilVkTestBackendCalls() = 3)
+  AnvilVkTestBackendClearExtent(0, 0)
+
+  ; ------------------------------------------------------------------
+  ;  12. The recorded-command pool is finite and says so.
+  ; ------------------------------------------------------------------
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  i = 0
+  While i < (#ANVIL_VK_MAX_OPS + 4)
+    vkCmdPipelineBarrierArgs(cmd, @pbargs)
+    i = i + 1
+  Wend
+  Vkr(vkEndCommandBuffer(cmd) = #VK_ERROR_OUT_OF_HOST_MEMORY)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A second image in one command buffer is retained; a third is refused.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  bar\image = img2
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  bar\image = img
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; ------------------------------------------------------------------
+  ;  13. Ordered teardown, and a stale handle that never revives.
+  ; ------------------------------------------------------------------
+  Vkr(vkDeviceWaitIdle(dev) = #VK_SUCCESS)
+  AnvilVkFaultClear()
+  vkDestroyImage(dev, img, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_OK)
+  Vkr(AnvilVkImageLayout(img) = #ANVIL_VK_ERR_HANDLE)
+  vkDestroyImage(dev, img, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Sentence()
+  AnvilVkFaultClear()
+  vkFreeMemory(dev, mem, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_OK)
+  Vkr(AnvilVkMemoryAddress(mem) = 0)
+  vkDestroyFence(dev, fence, 0)
+  vkDestroyFence(dev, fence2, 0)
+  Vkr(vkGetFenceStatus(dev, fence) = #ANVIL_VK_ERR_HANDLE)
+  Vkr(AnvilVkCommandPoolDestroy(dev, pool) = #VK_SUCCESS)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_ERR_HANDLE)
+  Vkr(AnvilVkInstanceDestroy(inst) = #VK_SUCCESS)
+  Vkr(AnvilVkImageLayout(img2) = #ANVIL_VK_ERR_HANDLE)
+
+  PokeN(#VKR_OUT + 0, $564B5247) ; "VKRG"
+  PokeN(#VKR_OUT + 8, vkrChecks)
+  PokeN(#VKR_OUT + 16, vkrFails)
+  PokeN(#VKR_OUT + 24, AnvilVkTestBackendCalls())
+  PokeI(#VKR_OUT + 32, AnvilVkTestBackendLastColor())
+  PokeI(#VKR_OUT + 40, AnvilVkTestBackendLastBase())
+  PokeN(#VKR_OUT + 48, vkrTexts)
+  PokeN(#VKR_OUT + 56, AnvilVkFaultCount())
+  PokeI(#VKR_OUT + 64, AnvilVkBackendName())
+  ProcedureReturn vkrFails
+EndProcedure

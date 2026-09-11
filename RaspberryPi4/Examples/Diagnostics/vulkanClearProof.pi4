@@ -1,0 +1,623 @@
+; vulkanClearProof.pi4 - the Vulkan colour clear, executed on V3D and read back.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. It is an instrument, not a how-to.
+;
+;   pmfc RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4 -t pi4 \
+;        --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;        -o vulkanclearproof.img
+;
+; ======================================================================
+;  WHAT IT PROVES, ON THE SILICON
+; ======================================================================
+;  Through Anvil's PUBLIC vk* entry points, and nothing private:
+;
+;    vkCreateInstance, vkEnumeratePhysicalDevices,
+;    vkGetPhysicalDeviceMemoryProperties, vkCreateDevice, vkGetDeviceQueue,
+;    vkCreateImage, vkGetImageMemoryRequirements, vkAllocateMemory,
+;    vkBindImageMemory, vkCreateCommandPool, vkAllocateCommandBuffers,
+;    vkBeginCommandBuffer, vkCmdPipelineBarrierArgs, vkCmdClearColorImage,
+;    vkEndCommandBuffer, vkCreateFence, vkQueueSubmit, vkWaitForFences,
+;    vkGetFenceStatus, vkDeviceWaitIdle and the ordered teardown.
+;
+;  it creates one VK_FORMAT_B8G8R8A8_UNORM image at the panel's own
+;  extent in an offscreen window, clears it to a known colour ON THE GPU,
+;  waits on the submission's fence, reads back EVERY PIXEL, and then
+;  copies the finished image onto the live framebuffer so a person can
+;  see it. It also captures the live framebuffer's checksum before and
+;  after the submission, so "the GPU wrote only the image it was given"
+;  is a measurement rather than an assumption.
+;
+;  THE EXPECTED BYTES. The clear value is
+;      R = 0.2f  ($3E4CCCCD)  ->  51 = $33
+;      G = 0.5f  ($3F000000)  -> 128 = $80
+;      B = 0.7f  ($3F333333)  -> 178 = $B2
+;      A = 1.0f  ($3F800000)  -> 255 = $FF
+;  VK_FORMAT_B8G8R8A8_UNORM stores B, G, R, A in ascending byte order, so
+;  every texel in memory is the four bytes  B2 80 33 FF  and every 32-bit
+;  word read on this little-endian part is  $FF3380B2.
+;  Slot 11 of the report carries that expected word, computed by the
+;  driver rather than written here, and slot 12 the first word actually
+;  found in the image.
+;
+;  THERE IS NO PROCESSOR-SIDE FALLBACK ANYWHERE UNDER THIS. If V3D does
+;  not write those bytes, the readback fails; nothing in the Vulkan path
+;  can fill an image with the processor.
+;
+; ======================================================================
+;  BEFORE RUNNING IT
+; ======================================================================
+;  * TAKE THE ACCELERATED CONSOLE OFF V3D FIRST: `screen dma`. This
+;    payload initialises the graphics engine itself, and two owners of
+;    one V3D page table is not a thing that can be made to work. The
+;    arena it uses is $0A000000, the SAME 16 MiB region the V3D console
+;    vets and owns - RaspberryPi4/Board/memmap.pi4 names it as "the V3D
+;    engine's arena ($0A000000, 16 MiB)" in its driver-module region
+;    note, which is the map's own word for it and not this file's. It is
+;    clear of the monitor image, both payload windows, the payload
+;    stack, the GENET receive ring, the monitor's variables, the fixed
+;    DSI framebuffer and the new driver-module region at $09200000. It
+;    is safe precisely BECAUSE the console is not using it, so a run
+;    with the V3D console still up is the one way to get this wrong.
+;  * IT RE-INITIALISES THE DISPLAY, at the panel's own mode, with a
+;    double-height virtual surface. On return the display is left at
+;    virtual offset 0 showing the cleared picture.
+;  * IT CALLS NeonShutdown() BEFORE RETURNING, which hands the V3D MMU
+;    back. A payload that left the V3D MMU enabled with its own page
+;    table would fault the next owner.
+;  * RECOVERY: `screen on` re-initialises the framebuffer and `screen
+;    v3d` brings the accelerated console back. Neither needs a reset.
+;    Nothing here writes a core spin slot, releases a core, or touches
+;    the monitor, its BSS, the DSI control registers or the reserved
+;    regions.
+;
+; ======================================================================
+;  THE REPORT
+; ======================================================================
+;  x0 comes back as the address of a 64-word block. Read it with
+;  `memory <that> 64`. Slot 0 is the magic $564B4350 ("VKCP") and slot 1
+;  is the status; every other slot is listed beside its constant below.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VCP_MAGIC = $564B4350
+
+; The arena the V3D console itself vets and owns. See the header.
+#VCP_ARENA = $0A000000
+#VCP_ARENA_BYTES = $01000000
+
+; The clear value, as IEEE-754 binary32 bit patterns in R, G, B, A order.
+#VCP_F_R = $3E4CCCCD      ; 0.2  -> 51
+#VCP_F_G = $3F000000      ; 0.5  -> 128
+#VCP_F_B = $3F333333      ; 0.7  -> 178
+#VCP_F_A = $3F800000      ; 1.0  -> 255
+#VCP_EXPECT = $FF3380B2   ; (A<<24)|(R<<16)|(G<<8)|B, stored B,G,R,A
+
+; How long the finished picture is left on the glass before returning.
+#VCP_SHOW_MS = 6000
+
+; Status codes. Every one of them is a stop, and the slot that explains
+; it is named beside it.
+#VCP_OK = 0
+#VCP_ERR_DISPLAY = 1          ; slot 2 holds DisplayLastError()
+#VCP_ERR_NOT_32BPP = 2
+#VCP_ERR_NO_DOUBLE = 3        ; the firmware would not give two screens
+#VCP_ERR_FB_UNALIGNED = 4     ; slot 2 holds the framebuffer base
+#VCP_ERR_SCREEN_UNALIGNED = 5 ; slot 3 holds pitch * height
+#VCP_ERR_NEON = 6             ; slot 2 holds Neon_Error()
+#VCP_ERR_WINDOW = 7           ; slot 2 holds the AnvilVkV3dWindow code
+#VCP_ERR_INSTANCE = 8
+#VCP_ERR_DEVICE = 9
+#VCP_ERR_IMAGE = 10
+#VCP_ERR_MEMORY = 11
+#VCP_ERR_BIND = 12
+#VCP_ERR_RECORD = 13
+#VCP_ERR_SUBMIT = 14          ; slot 2 holds the VkResult, slot 3 the native code
+#VCP_ERR_FENCE = 15
+#VCP_ERR_PIXELS = 16          ; slot 14 holds the mismatch count
+#VCP_ERR_FRONT_CHANGED = 17   ; the GPU wrote outside the image it was given
+#VCP_ERR_NO_JOBS = 18         ; V3D reported no bin or no render job
+#VCP_ERR_V3D_FAULT = 19       ; an MMU violation, an OOM or an error status
+
+; Report slots.
+#VCP_S_MAGIC = 0
+#VCP_S_STATUS = 1
+#VCP_S_DETAIL = 2
+#VCP_S_DETAIL2 = 3
+#VCP_S_FB_BASE = 4
+#VCP_S_PITCH = 5
+#VCP_S_WIDTH = 6
+#VCP_S_HEIGHT = 7
+#VCP_S_WIN_BASE = 8
+#VCP_S_WIN_BYTES = 9
+#VCP_S_IMG_ADDR = 10
+#VCP_S_EXPECT = 11
+#VCP_S_FIRST = 12
+#VCP_S_LAST = 13
+#VCP_S_MISMATCH = 14
+#VCP_S_FIRST_BAD = 15
+#VCP_S_IMG_SIZE = 16
+#VCP_S_IMG_PITCH = 17
+#VCP_S_IMG_ALIGN = 18
+#VCP_S_MEM_TYPES = 19
+#VCP_S_HEAP_BYTES = 20
+#VCP_S_BIN_BEFORE = 21
+#VCP_S_BIN_AFTER = 22
+#VCP_S_RENDER_BEFORE = 23
+#VCP_S_RENDER_AFTER = 24
+#VCP_S_BIN_OOM = 25
+#VCP_S_BIN_ERRSTAT = 26
+#VCP_S_RENDER_ERRSTAT = 27
+#VCP_S_MMU_FAULTS = 28
+#VCP_S_MMU_VIOADDR = 29
+#VCP_S_MMU_VIOID = 30
+#VCP_S_FRONT_SUM_BEFORE = 31
+#VCP_S_FRONT_SUM_AFTER = 32
+#VCP_S_LAYOUT_BEFORE = 33
+#VCP_S_LAYOUT_AFTER = 34
+#VCP_S_FENCE_BEFORE = 35
+#VCP_S_FENCE_AFTER = 36
+#VCP_S_SUBMIT_RC = 37
+#VCP_S_WAIT_RC = 38
+#VCP_S_NATIVE = 39
+#VCP_S_US_SUBMIT = 40
+#VCP_S_US_READBACK = 41
+#VCP_S_BACKEND_GPU = 42
+#VCP_S_BACKEND_NAME = 43
+#VCP_S_FAULT_TEXT = 44
+#VCP_S_FAULT_COUNT = 45
+#VCP_S_PRESENTED = 46
+#VCP_S_SHUTDOWN = 47
+#VCP_S_END = 48
+
+Global Dim vcpReport.i[64]
+Global Dim vcpColor.l[4]
+
+Procedure vcpPut(slot.i, value.i)
+  If slot < 0 Or slot > 63
+    ProcedureReturn
+  EndIf
+  vcpReport[slot] = value
+EndProcedure
+
+Procedure.i vcpStop(status.i)
+  vcpPut(#VCP_S_STATUS, status)
+  vcpPut(#VCP_S_FAULT_TEXT, AnvilVkFaultText())
+  vcpPut(#VCP_S_FAULT_COUNT, AnvilVkFaultCount())
+  ProcedureReturn @vcpReport[0]
+EndProcedure
+
+; A cheap running sum over a buffer, used only to tell "unchanged" from
+; "changed". It is not a hash and is not called one.
+Procedure.i vcpSum(base.i, bytes.i)
+  Define i.i
+  Define s.i
+  s = 0
+  i = 0
+  While i < bytes
+    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFFFFFF
+    i = i + 4
+  Wend
+  ProcedureReturn s
+EndProcedure
+
+Procedure.i Main()
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define fb.i
+  Define screenBytes.i
+  Define winBase.i
+  Define winBytes.i
+  Define rc.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define img.i
+  Define mem.i
+  Define fence.i
+  Define count.i
+  Define imgBase.i
+  Define i.i
+  Define bad.i
+  Define firstBad.i
+  Define word.i
+  Define t0.i
+  Define hz.i
+  Define typeIndex.i
+
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define bar.VkImageMemoryBarrier
+  Define pbargs.AnvilVkPipelineBarrierArgs
+  Define range.VkImageSubresourceRange
+  Define mp.VkPhysicalDeviceMemoryProperties
+  Define cbHandle.i
+  Define fenceArray.i
+
+  vcpPut(#VCP_S_MAGIC, #VCP_MAGIC)
+  vcpPut(#VCP_S_STATUS, #VCP_ERR_DISPLAY)
+  TimerInit()
+  hz = TickHz() / 1000000
+  If hz < 1
+    hz = 1
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  1. The panel, then the same mode again with two screens stacked.
+  ;     This is the sequence the V3D console's own double buffer uses.
+  ; ------------------------------------------------------------------
+  DisplayStandardTags()
+  DisplayInit(1920, 1080, 32)
+  If DisplayReady() = 0
+    vcpPut(#VCP_S_DETAIL, DisplayLastError())
+    ProcedureReturn vcpStop(#VCP_ERR_DISPLAY)
+  EndIf
+  If DisplayBytesPerPixel() <> 4
+    vcpPut(#VCP_S_DETAIL, DisplayBytesPerPixel())
+    ProcedureReturn vcpStop(#VCP_ERR_NOT_32BPP)
+  EndIf
+  w = DisplayWidth()
+  h = DisplayHeight()
+  DisplaySetVirtMul(2)
+  DisplayStandardTags()
+  DisplayInit(w, h, 32)
+  If DisplayReady() = 0
+    vcpPut(#VCP_S_DETAIL, DisplayLastError())
+    ProcedureReturn vcpStop(#VCP_ERR_DISPLAY)
+  EndIf
+  w = DisplayWidth()
+  h = DisplayHeight()
+  pitch = DisplayPitch()
+  fb = DisplayBase()
+  screenBytes = pitch * h
+  vcpPut(#VCP_S_FB_BASE, fb)
+  vcpPut(#VCP_S_PITCH, pitch)
+  vcpPut(#VCP_S_WIDTH, w)
+  vcpPut(#VCP_S_HEIGHT, h)
+  If DisplayVirtualHeight() < (h * 2)
+    vcpPut(#VCP_S_DETAIL, DisplayVirtualHeight())
+    ProcedureReturn vcpStop(#VCP_ERR_NO_DOUBLE)
+  EndIf
+
+  ; THE OFFSCREEN WINDOW IS THE SECOND SCREEN, AND IT MUST BE WHOLE
+  ; PAGES. The V3D MMU maps pages; rounding the window inwards would
+  ; leave the image short of its own last row, which is a wrong picture
+  ; rather than a refusal. Both real panel modes on this board are exact
+  ; page multiples (1920x1080x4 is 2025 pages, 800x1280x4 is 1000), so a
+  ; mode that is not is a case nobody has measured and it stops here.
+  If (fb % 4096) <> 0
+    vcpPut(#VCP_S_DETAIL, fb)
+    ProcedureReturn vcpStop(#VCP_ERR_FB_UNALIGNED)
+  EndIf
+  If (screenBytes % 4096) <> 0
+    vcpPut(#VCP_S_DETAIL2, screenBytes)
+    ProcedureReturn vcpStop(#VCP_ERR_SCREEN_UNALIGNED)
+  EndIf
+  winBase = fb + screenBytes
+  winBytes = screenBytes
+  vcpPut(#VCP_S_WIN_BASE, winBase)
+  vcpPut(#VCP_S_WIN_BYTES, winBytes)
+
+  ; ------------------------------------------------------------------
+  ;  2. The graphics engine, with BOTH screens inside the V3D page table.
+  ; ------------------------------------------------------------------
+  If NeonArena(#VCP_ARENA, #VCP_ARENA_BYTES) <> #NEON_OK
+    vcpPut(#VCP_S_DETAIL, Neon_Error())
+    ProcedureReturn vcpStop(#VCP_ERR_NEON)
+  EndIf
+  If NeonSurface(fb, w, h, pitch) <> #NEON_OK
+    vcpPut(#VCP_S_DETAIL, Neon_Error())
+    ProcedureReturn vcpStop(#VCP_ERR_NEON)
+  EndIf
+  NeonSurfaceMapSpan(screenBytes * 2)
+  If NeonInit() <> #NEON_OK
+    vcpPut(#VCP_S_DETAIL, Neon_Error())
+    ProcedureReturn vcpStop(#VCP_ERR_NEON)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  3. The Vulkan device, over that offscreen window.
+  ; ------------------------------------------------------------------
+  rc = AnvilVkV3dWindow(winBase, winBytes)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_WINDOW)
+  EndIf
+  vcpPut(#VCP_S_BACKEND_GPU, AnvilVkBackendIsGpu())
+  vcpPut(#VCP_S_BACKEND_NAME, AnvilVkBackendName())
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @inst)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_INSTANCE)
+  EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_INSTANCE)
+  EndIf
+  vkGetPhysicalDeviceMemoryProperties(phys, @mp)
+  vcpPut(#VCP_S_MEM_TYPES, mp\memoryTypeCount)
+  vcpPut(#VCP_S_HEAP_BYTES, mp\memoryHeaps[0]\size)
+  typeIndex = 0
+
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @dev)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_DEVICE)
+  EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_DEVICE)
+  EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_DEVICE)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  4. One image at the panel's own extent, backed by real memory.
+  ; ------------------------------------------------------------------
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = w
+  imgci\extent\height = h
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(dev, @imgci, 0, @img)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_IMAGE)
+  EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  vcpPut(#VCP_S_IMG_SIZE, req\size)
+  vcpPut(#VCP_S_IMG_ALIGN, req\alignment)
+  vcpPut(#VCP_S_IMG_PITCH, AnvilVkImageRowPitch(img))
+
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = typeIndex
+  rc = vkAllocateMemory(dev, @mai, 0, @mem)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_MEMORY)
+  EndIf
+  rc = vkBindImageMemory(dev, img, mem, 0)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_BIND)
+  EndIf
+  imgBase = AnvilVkImageAddress(img)
+  vcpPut(#VCP_S_IMG_ADDR, imgBase)
+
+  ; POISON IT FIRST. An image that already held the answer would prove
+  ; nothing at all, so every word is set to the complement of the
+  ; expected one before the GPU is asked to do anything.
+  i = 0
+  While i < req\size
+    PokeL(imgBase + i, ~#VCP_EXPECT)
+    i = i + 4
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  5. Record the transition and the clear.
+  ; ------------------------------------------------------------------
+  PokeL(@vcpColor[0] + 0, #VCP_F_R)
+  PokeL(@vcpColor[0] + 4, #VCP_F_G)
+  PokeL(@vcpColor[0] + 8, #VCP_F_B)
+  PokeL(@vcpColor[0] + 12, #VCP_F_A)
+
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = img
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\baseMipLevel = 0
+  bar\subresourceRange\levelCount = 1
+  bar\subresourceRange\baseArrayLayer = 0
+  bar\subresourceRange\layerCount = 1
+  pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  pbargs\imageMemoryBarrierCount = 1
+  pbargs\pImageMemoryBarriers = @bar
+
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\baseMipLevel = 0
+  range\levelCount = 1
+  range\baseArrayLayer = 0
+  range\layerCount = 1
+
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_RECORD)
+  EndIf
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vcpColor[0], 1, @range)
+  rc = vkEndCommandBuffer(cmd)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_RECORD)
+  EndIf
+
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  fci\flags = 0
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_FENCE)
+  EndIf
+  vcpPut(#VCP_S_FENCE_BEFORE, vkGetFenceStatus(dev, fence))
+  vcpPut(#VCP_S_LAYOUT_BEFORE, AnvilVkImageLayout(img))
+
+  ; ------------------------------------------------------------------
+  ;  6. Submit, on the GPU, and wait on the fence.
+  ; ------------------------------------------------------------------
+  vcpPut(#VCP_S_BIN_BEFORE, V3dBinJobs())
+  vcpPut(#VCP_S_RENDER_BEFORE, V3dRenderJobs())
+  vcpPut(#VCP_S_FRONT_SUM_BEFORE, vcpSum(fb, screenBytes))
+
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cbHandle
+  t0 = Ticks()
+  rc = vkQueueSubmit(queue, 1, @si, fence)
+  vcpPut(#VCP_S_SUBMIT_RC, rc)
+  vcpPut(#VCP_S_NATIVE, AnvilVkBackendNativeError())
+  vcpPut(#VCP_S_US_SUBMIT, (Ticks() - t0) / hz)
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    vcpPut(#VCP_S_DETAIL2, AnvilVkBackendNativeError())
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_SUBMIT)
+  EndIf
+  fenceArray = fence
+  rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+  vcpPut(#VCP_S_WAIT_RC, rc)
+  vcpPut(#VCP_S_FENCE_AFTER, vkGetFenceStatus(dev, fence))
+  vcpPut(#VCP_S_LAYOUT_AFTER, AnvilVkImageLayout(img))
+  If rc <> #VK_SUCCESS
+    vcpPut(#VCP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcpStop(#VCP_ERR_FENCE)
+  EndIf
+
+  vcpPut(#VCP_S_BIN_AFTER, V3dBinJobs())
+  vcpPut(#VCP_S_RENDER_AFTER, V3dRenderJobs())
+  vcpPut(#VCP_S_BIN_OOM, V3dBinOomCount())
+  vcpPut(#VCP_S_BIN_ERRSTAT, V3dBinErrStat())
+  vcpPut(#VCP_S_RENDER_ERRSTAT, V3dRenderErrStat())
+  vcpPut(#VCP_S_MMU_FAULTS, V3dMmuFaultsNow())
+  vcpPut(#VCP_S_MMU_VIOADDR, V3dMmuVioAddrNow())
+  vcpPut(#VCP_S_MMU_VIOID, V3dMmuVioIdNow())
+  vcpPut(#VCP_S_FRONT_SUM_AFTER, vcpSum(fb, screenBytes))
+
+  ; ------------------------------------------------------------------
+  ;  7. EVERY PIXEL.
+  ; ------------------------------------------------------------------
+  t0 = Ticks()
+  bad = 0
+  firstBad = -1
+  i = 0
+  While i < req\size
+    word = PeekL(imgBase + i) & $FFFFFFFF
+    If word <> #VCP_EXPECT
+      bad = bad + 1
+      If firstBad < 0
+        firstBad = i
+      EndIf
+    EndIf
+    i = i + 4
+  Wend
+  vcpPut(#VCP_S_US_READBACK, (Ticks() - t0) / hz)
+  vcpPut(#VCP_S_EXPECT, #VCP_EXPECT)
+  vcpPut(#VCP_S_FIRST, PeekL(imgBase) & $FFFFFFFF)
+  vcpPut(#VCP_S_LAST, PeekL(imgBase + req\size - 4) & $FFFFFFFF)
+  vcpPut(#VCP_S_MISMATCH, bad)
+  vcpPut(#VCP_S_FIRST_BAD, firstBad)
+
+  ; ------------------------------------------------------------------
+  ;  8. Present it, by COPY. A non-zero virtual offset scans out blurred
+  ;     on this firmware - the V3D console found that and presents by
+  ;     copying for the same reason - so the shown half stays at offset
+  ;     zero and the finished image is copied onto it.
+  ; ------------------------------------------------------------------
+  DisplayBlit(imgBase, pitch, 0, 0, w, h)
+  DisplayFlush()
+  vcpPut(#VCP_S_PRESENTED, 1)
+  delay(#VCP_SHOW_MS)
+
+  ; ------------------------------------------------------------------
+  ;  9. Ordered teardown, then hand the V3D MMU back.
+  ; ------------------------------------------------------------------
+  vkDeviceWaitIdle(dev)
+  vkDestroyFence(dev, fence, 0)
+  vkDestroyImage(dev, img, 0)
+  vkFreeMemory(dev, mem, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+  NeonShutdown()
+  vcpPut(#VCP_S_SHUTDOWN, 1)
+
+  ; ------------------------------------------------------------------
+  ;  10. The verdict. Every one of these is a separate way to be wrong.
+  ; ------------------------------------------------------------------
+  If vcpReport[#VCP_S_BIN_AFTER] <= vcpReport[#VCP_S_BIN_BEFORE] Or vcpReport[#VCP_S_RENDER_AFTER] <= vcpReport[#VCP_S_RENDER_BEFORE]
+    ProcedureReturn vcpStop(#VCP_ERR_NO_JOBS)
+  EndIf
+  If vcpReport[#VCP_S_BIN_OOM] <> 0 Or vcpReport[#VCP_S_MMU_FAULTS] <> 0
+    ProcedureReturn vcpStop(#VCP_ERR_V3D_FAULT)
+  EndIf
+  If bad <> 0
+    ProcedureReturn vcpStop(#VCP_ERR_PIXELS)
+  EndIf
+  ; The front buffer is measured BEFORE the present, so a change here is
+  ; the GPU having written outside the image it was handed.
+  If vcpReport[#VCP_S_FRONT_SUM_AFTER] <> vcpReport[#VCP_S_FRONT_SUM_BEFORE]
+    ProcedureReturn vcpStop(#VCP_ERR_FRONT_CHANGED)
+  EndIf
+  If vcpReport[#VCP_S_LAYOUT_AFTER] <> #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    ProcedureReturn vcpStop(#VCP_ERR_FENCE)
+  EndIf
+  ProcedureReturn vcpStop(#VCP_OK)
+EndProcedure

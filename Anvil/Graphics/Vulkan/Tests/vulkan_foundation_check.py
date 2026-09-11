@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Registry and emitted-A64 gate for Anvil's Vulkan foundation."""
+"""Registry and emitted-A64 gate for Anvil's Vulkan ABI and lifecycle.
+
+This gate answers two questions and no others:
+
+  1. does every constant, structure member name, member order and member
+     type in Anvil's vocabulary match the PINNED Khronos registry, and
+  2. does the compiled AArch64 code give every one of those structures
+     the exact size and offsets the C ABI requires, and does the public
+     vk* surface refuse what it does not implement.
+
+It does NOT prove GPU execution. The behavioural gate for the resource,
+layout, fence and submission engine is tools/vulkan_resource_check.py,
+and the backend link gate is tools/vulkan_v3d_backend_check.py.
+
+  VULKAN_REGISTRY=<pinned v1.4.350 registry/vk.xml> PMFC=<pmfc.exe> \\
+      py -3 Anvil/Graphics/Vulkan/Tests/vulkan_foundation_check.py
+"""
 
 from __future__ import annotations
 
@@ -19,12 +35,10 @@ ROOT = HERE.parents[3]
 VOCAB = HERE.parent / "vk_core_1_0.pbi"
 PROBE = HERE / "vulkan_foundation.pi4"
 PRODUCTION_PROBE = HERE / "vulkan_production_probe.pi4"
-V3D_DEVELOPMENT_PROBE = HERE / "vulkan_v3d_development.pi4"
-V3D_LINK_PROBE = HERE / "vulkan_v3d_link.pi4"
-V3D_DEVELOPMENT = HERE.parent / "vk_v3d_development.pi4"
+V3D_BACKEND = HERE.parent / "vk_v3d_backend.pi4"
 LOAD, STACK, RETURN = 0x400000, 0x3000000, 0xDEAD0000
 OUT = 0x06000000
-DEV_OUT = 0x06010000
+MMIO = 0xFC000000
 REGISTRY_SHA256 = "50bd8c0f316eabf73d1c5fe3add2d89eaa480dbda9282c12c289e80e9d081e08"
 
 
@@ -51,8 +65,38 @@ CONSTANTS = {
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO",
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO",
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO",
-    "VK_FORMAT_B8G8R8A8_UNORM", "VK_IMAGE_LAYOUT_UNDEFINED",
-    "VK_IMAGE_LAYOUT_GENERAL", "VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
+    "VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO", "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO",
+    "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO", "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
+    "VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER", "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER",
+    "VK_FORMAT_UNDEFINED", "VK_FORMAT_R8G8B8A8_UNORM", "VK_FORMAT_B8G8R8A8_UNORM",
+    "VK_IMAGE_LAYOUT_UNDEFINED", "VK_IMAGE_LAYOUT_GENERAL",
+    "VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL",
+    "VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL", "VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
+    "VK_IMAGE_LAYOUT_PREINITIALIZED",
+    "VK_IMAGE_TYPE_1D", "VK_IMAGE_TYPE_2D", "VK_IMAGE_TYPE_3D",
+    "VK_IMAGE_TILING_OPTIMAL", "VK_IMAGE_TILING_LINEAR",
+    "VK_SHARING_MODE_EXCLUSIVE", "VK_SHARING_MODE_CONCURRENT",
+    "VK_SAMPLE_COUNT_1_BIT", "VK_SAMPLE_COUNT_2_BIT",
+    "VK_IMAGE_USAGE_TRANSFER_SRC_BIT", "VK_IMAGE_USAGE_TRANSFER_DST_BIT",
+    "VK_IMAGE_USAGE_SAMPLED_BIT", "VK_IMAGE_USAGE_STORAGE_BIT",
+    "VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT",
+    "VK_IMAGE_ASPECT_COLOR_BIT", "VK_IMAGE_ASPECT_DEPTH_BIT",
+    "VK_IMAGE_ASPECT_STENCIL_BIT", "VK_IMAGE_ASPECT_METADATA_BIT",
+    "VK_MAX_MEMORY_TYPES", "VK_MAX_MEMORY_HEAPS",
+    "VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT", "VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT",
+    "VK_MEMORY_PROPERTY_HOST_COHERENT_BIT", "VK_MEMORY_PROPERTY_HOST_CACHED_BIT",
+    "VK_MEMORY_HEAP_DEVICE_LOCAL_BIT",
+    "VK_QUEUE_GRAPHICS_BIT", "VK_QUEUE_COMPUTE_BIT", "VK_QUEUE_TRANSFER_BIT",
+    "VK_QUEUE_SPARSE_BINDING_BIT",
+    "VK_ACCESS_TRANSFER_READ_BIT", "VK_ACCESS_TRANSFER_WRITE_BIT",
+    "VK_ACCESS_HOST_READ_BIT", "VK_ACCESS_HOST_WRITE_BIT",
+    "VK_ACCESS_MEMORY_READ_BIT", "VK_ACCESS_MEMORY_WRITE_BIT",
+    "VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT", "VK_PIPELINE_STAGE_TRANSFER_BIT",
+    "VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT", "VK_PIPELINE_STAGE_HOST_BIT",
+    "VK_PIPELINE_STAGE_ALL_COMMANDS_BIT",
+    "VK_DEPENDENCY_BY_REGION_BIT", "VK_FENCE_CREATE_SIGNALED_BIT",
+    "VK_QUEUE_FAMILY_IGNORED", "VK_REMAINING_MIP_LEVELS",
+    "VK_REMAINING_ARRAY_LAYERS",
 }
 
 STRUCTS = {
@@ -123,6 +167,41 @@ STRUCTS = {
                      ("VkCommandBuffer", "pCommandBuffers"),
                      ("uint32_t", "signalSemaphoreCount"),
                      ("VkSemaphore", "pSignalSemaphores")),
+    "VkMemoryAllocateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
+                             ("VkDeviceSize", "allocationSize"),
+                             ("uint32_t", "memoryTypeIndex")),
+    "VkMemoryRequirements": (("VkDeviceSize", "size"), ("VkDeviceSize", "alignment"),
+                             ("uint32_t", "memoryTypeBits")),
+    "VkMemoryType": (("VkMemoryPropertyFlags", "propertyFlags"), ("uint32_t", "heapIndex")),
+    "VkMemoryHeap": (("VkDeviceSize", "size"), ("VkMemoryHeapFlags", "flags")),
+    "VkPhysicalDeviceMemoryProperties": (("uint32_t", "memoryTypeCount"),
+                                         ("VkMemoryType", "memoryTypes"),
+                                         ("uint32_t", "memoryHeapCount"),
+                                         ("VkMemoryHeap", "memoryHeaps")),
+    "VkQueueFamilyProperties": (("VkQueueFlags", "queueFlags"), ("uint32_t", "queueCount"),
+                                ("uint32_t", "timestampValidBits"),
+                                ("VkExtent3D", "minImageTransferGranularity")),
+    "VkImageCreateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
+                          ("VkImageCreateFlags", "flags"), ("VkImageType", "imageType"),
+                          ("VkFormat", "format"), ("VkExtent3D", "extent"),
+                          ("uint32_t", "mipLevels"), ("uint32_t", "arrayLayers"),
+                          ("VkSampleCountFlagBits", "samples"), ("VkImageTiling", "tiling"),
+                          ("VkImageUsageFlags", "usage"), ("VkSharingMode", "sharingMode"),
+                          ("uint32_t", "queueFamilyIndexCount"),
+                          ("uint32_t", "pQueueFamilyIndices"),
+                          ("VkImageLayout", "initialLayout")),
+    "VkImageSubresourceRange": (("VkImageAspectFlags", "aspectMask"),
+                                ("uint32_t", "baseMipLevel"), ("uint32_t", "levelCount"),
+                                ("uint32_t", "baseArrayLayer"), ("uint32_t", "layerCount")),
+    "VkImageMemoryBarrier": (("VkStructureType", "sType"), ("void", "pNext"),
+                             ("VkAccessFlags", "srcAccessMask"),
+                             ("VkAccessFlags", "dstAccessMask"),
+                             ("VkImageLayout", "oldLayout"), ("VkImageLayout", "newLayout"),
+                             ("uint32_t", "srcQueueFamilyIndex"),
+                             ("uint32_t", "dstQueueFamilyIndex"), ("VkImage", "image"),
+                             ("VkImageSubresourceRange", "subresourceRange")),
+    "VkFenceCreateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
+                          ("VkFenceCreateFlags", "flags")),
 }
 
 PB_SUFFIX = {
@@ -133,10 +212,24 @@ PB_SUFFIX = {
     "VkCommandBufferLevel": ".l", "VkQueryControlFlags": ".l",
     "VkQueryPipelineStatisticFlags": ".l", "VkCommandBufferUsageFlags": ".l",
     "VkPipelineStageFlags": ".l", "float": ".f",
+    "VkImageCreateFlags": ".l", "VkImageType": ".l", "VkFormat": ".l",
+    "VkSampleCountFlagBits": ".l", "VkImageTiling": ".l",
+    "VkImageUsageFlags": ".l", "VkSharingMode": ".l", "VkImageLayout": ".l",
+    "VkImageAspectFlags": ".l", "VkAccessFlags": ".l",
+    "VkMemoryPropertyFlags": ".l", "VkMemoryHeapFlags": ".l",
+    "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l",
+    "VkDeviceSize": ".q", "uint64_t": ".q",
     "VkCommandPool": ".i", "VkRenderPass": ".i", "VkFramebuffer": ".i",
-    "VkSemaphore": ".i", "VkCommandBuffer": ".i",
+    "VkSemaphore": ".i", "VkCommandBuffer": ".i", "VkImage": ".i",
+    "VkDeviceMemory": ".i", "VkFence": ".i",
     "VkOffset2D": ".VkOffset2D", "VkExtent2D": ".VkExtent2D",
+    "VkExtent3D": ".VkExtent3D",
+    "VkImageSubresourceRange": ".VkImageSubresourceRange",
+    "VkMemoryType": ".VkMemoryType", "VkMemoryHeap": ".VkMemoryHeap",
 }
+
+# The registry writes its all-ones sentinels as C expressions.
+C_SENTINELS = {"(~0U)": 0xFFFFFFFF, "(~0ULL)": 0xFFFFFFFFFFFFFFFF, "(~0U-1)": 0xFFFFFFFE}
 
 
 def registry_path() -> pathlib.Path:
@@ -150,8 +243,11 @@ def registry_path() -> pathlib.Path:
 
 
 def number(node: ET.Element, by_name: dict[str, ET.Element]) -> int:
-    if node.get("value") is not None:
-        return int(node.get("value"), 0)
+    value = node.get("value")
+    if value is not None:
+        if value in C_SENTINELS:
+            return C_SENTINELS[value]
+        return int(value, 0)
     if node.get("bitpos") is not None:
         return 1 << int(node.get("bitpos"))
     alias = node.get("alias")
@@ -196,9 +292,14 @@ def expected_pbi_member(member: ET.Element) -> str:
         return "*" + name
     enum = member.findtext("enum")
     if enum:
-        if c_type != "char":
-            raise ValueError("unsupported fixed array type " + c_type)
-        return "%s.a[#%s]" % (name, enum)
+        # A fixed array keeps the registry's own extent constant, so a
+        # changed VK_MAX_MEMORY_TYPES cannot be missed by this gate.
+        if c_type == "char":
+            return "%s.a[#%s]" % (name, enum)
+        try:
+            return "%s%s[#%s]" % (name, PB_SUFFIX[c_type], enum)
+        except KeyError as exc:
+            raise ValueError("no expected PureMetal mapping for array of " + c_type) from exc
     try:
         return name + PB_SUFFIX[c_type]
     except KeyError as exc:
@@ -253,6 +354,12 @@ def check_registry(failures: list[str]) -> int:
                 failures.append("%s declaration %r, registry requires %r" %
                                 (name, pbi_structs.get(name), expected_decl))
         checks += 2
+    # Anvil declares no Vulkan union, and must not: PureMetal has no
+    # union, and one arm of VkClearColorValue masquerading as the whole
+    # type is exactly the silent wrong answer this project refuses.
+    if "VkClearColorValue" in pbi_structs:
+        failures.append("vk_core_1_0.pbi declares VkClearColorValue as a structure; it is a union")
+    checks += 1
     return checks
 
 
@@ -292,7 +399,30 @@ def run_image(image: pathlib.Path):
         cpu.memory[LOAD + i] = byte
     module.attach_symbols(cpu, image, LOAD)
     cpu.pc, cpu.sp, cpu.x[30] = LOAD, STACK, RETURN
-    for steps in range(5_000_000):
+
+    # AN MMIO HARD STOP. Neither of these probes may touch hardware: one
+    # links the test backend and one links no backend at all.
+    def guard(addr: int, write: bool) -> None:
+        if addr >= MMIO:
+            kind = "write" if write else "read"
+            raise SystemExit(
+                "vulkan_foundation_check: unexpected MMIO %s at $%08X - this probe "
+                "is supposed to touch no hardware at all" % (kind, addr))
+
+    def load(addr: int, size: int) -> int:
+        cpu.align_guard(addr, size, False)
+        guard(addr, False)
+        return sum(cpu.memory.get(addr + i, 0) << (8 * i) for i in range(size))
+
+    def store(addr: int, value: int, size: int) -> None:
+        cpu.align_guard(addr, size, True)
+        guard(addr, True)
+        for i in range(size):
+            cpu.memory[addr + i] = (value >> (8 * i)) & 0xFF
+
+    cpu.load = load
+    cpu.store = store
+    for steps in range(20_000_000):
         if cpu.pc == RETURN:
             return cpu, cpu.x[0], steps
         cpu.step()
@@ -306,15 +436,21 @@ def u64(cpu, addr: int) -> int:
 def main() -> int:
     failures = []
     checks = check_registry(failures)
-    dev_source = V3D_DEVELOPMENT.read_text(encoding="utf-8")
+
+    # The Pi backend must lower through the engine this tree proves on
+    # silicon, and must not contain a processor-side or DMA fallback: a
+    # fallback would let a green board test be a test of memcpy.
+    backend_source = V3D_BACKEND.read_text(encoding="utf-8")
     for required in ("NeonRetarget", "NeonFrameBegin", "NeonFrameEnd"):
-        if required not in dev_source:
-            failures.append("V3D development lowering omits " + required)
+        if required not in backend_source:
+            failures.append("the Pi 4 V3D backend omits " + required)
         checks += 1
-    for forbidden in ("Poke", "DspCopy", "DmaCopy", "DisplayClear"):
-        if forbidden in dev_source:
-            failures.append("V3D development lowering contains CPU/DMA fallback token " + forbidden)
+    for forbidden in ("PokeN(", "PokeI(", "PokeL(", "DspCopy", "DmaCopy", "DisplayClear",
+                      "DspDmaFill"):
+        if forbidden in backend_source:
+            failures.append("the Pi 4 V3D backend contains the fallback token " + forbidden)
         checks += 1
+
     cpu, rc, steps = run_image(build(PROBE, "anvil_vk_foundation.img"))
     magic, model_checks, model_fails = u64(cpu, OUT), u64(cpu, OUT + 8), u64(cpu, OUT + 16)
     checks += 3 + model_checks
@@ -326,52 +462,30 @@ def main() -> int:
                        if u64(cpu, OUT + 0x100 + i * 8) == 0]
         failures.append("emitted failed check rows: " + ",".join(failed_rows))
         failures.append("handles: " + ",".join("$%016X" % u64(cpu, OUT + p)
-                                                for p in (24, 32, 40, 48)))
-    if model_checks < 50:
-        failures.append("emitted probe ran only %d lifecycle checks" % model_checks)
+                                               for p in (24, 32, 40, 48)))
+    if model_checks < 100:
+        failures.append("emitted probe ran only %d checks" % model_checks)
+
     prod_cpu, prod_rc, prod_steps = run_image(
-        build(PRODUCTION_PROBE, "anvil_vk_production.img")
-    )
+        build(PRODUCTION_PROBE, "anvil_vk_production.img"))
     checks += 3
     if u64(prod_cpu, OUT) != 0x564B5052:
         failures.append("production probe magic is wrong")
     if prod_rc != 0 or u64(prod_cpu, OUT + 8) != 0:
-        failures.append("production probe exposed a backend/device")
-    dev_cpu, dev_rc, dev_steps = run_image(
-        build(V3D_DEVELOPMENT_PROBE, "anvil_vk_v3d_development.img")
-    )
-    dev_magic = u64(dev_cpu, DEV_OUT)
-    dev_checks = u64(dev_cpu, DEV_OUT + 8)
-    dev_fails = u64(dev_cpu, DEV_OUT + 16)
-    checks += 3 + dev_checks
-    if dev_magic != 0x564B4431:
-        failures.append("V3D development probe magic is wrong")
-    if dev_rc != 0 or dev_fails != 0:
-        failures.append("V3D development probe rc=%d failures=%d" % (dev_rc, dev_fails))
-        failed_rows = [str(i + 1) for i in range(dev_checks)
-                       if u64(dev_cpu, DEV_OUT + 0x100 + i * 8) == 0]
-        failures.append("V3D development failed check rows: " + ",".join(failed_rows))
-    link_cpu, link_rc, link_steps = run_image(
-        build(V3D_LINK_PROBE, "anvil_vk_v3d_link.img")
-    )
-    checks += 1
-    if link_rc != 0:
-        failures.append("real Neon/V3D link probe returned %d" % link_rc)
+        failures.append("production probe exposed a backend or a device")
+
     if failures:
         print("vulkan_foundation_check: FAIL")
         for failure in failures:
             print("  " + failure)
         return 1
     print("vulkan_foundation_check: PASS")
-    print("  pinned registry values/member order checked")
-    print("  %d emitted lifecycle checks, %d interpreted A64 instructions" % (model_checks, steps))
-    print("  production boundary executed in %d A64 instructions" % prod_steps)
-    print("  production device count remains zero; synthetic backend is test-only")
-    print("  %d V3D development lowering checks, %d interpreted A64 instructions" %
-          (dev_checks, dev_steps))
-    print("  Neon submit calls are stubbed only at the hardware boundary in this host gate")
-    print("  real Neon/V3D implementation linked; no MMIO executed (%d A64 instructions)" %
-          link_steps)
+    print("  pinned registry values, member names, member order and member types checked")
+    print("  %d emitted ABI and lifecycle checks, %d interpreted A64 instructions, no MMIO"
+          % (model_checks, steps))
+    print("  production boundary executed in %d A64 instructions; device count stays zero"
+          % prod_steps)
+    print("  the Pi 4 V3D backend lowers through Neon/V3D and holds no CPU or DMA fallback")
     return 0
 
 

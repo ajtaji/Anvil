@@ -1,0 +1,268 @@
+; ======================================================================
+;  The Raspberry Pi 4 V3D graphics backend for Anvil's Vulkan surface
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; This is the hardware half of the seam declared in vk_foundation.pbi. It
+; turns one closed, already validated colour clear into real V3D work and
+; it does nothing else. It is the ONLY file in the Vulkan tree that knows
+; what a render target, a control list or a tile is.
+;
+; THE EXECUTION PATH IS THE ONE THIS TREE ALREADY PROVES ON SILICON.
+; NeonRetarget points the engine at the image; NeonFrameBegin sets the
+; clear colour and builds a bin list with no draws; NeonFrameEnd cleans
+; the caches for what it produced, submits the bin job (V3dBinSubmit),
+; waits for it (V3dBinWait), submits the render job (V3dRenderSubmit) and
+; waits for it (V3dRenderWait). The tile clear and the tile store are
+; what write the image; V3dRenderWait performs the V3D cache clean and
+; the processor-side maintenance for the target. The console and
+; NeonArcade drive the same path at 1920x1080 on this board.
+;
+; THERE IS NO PROCESSOR-SIDE AND NO DMA FALLBACK. If the GPU does not do
+; it, this file reports a device loss and the image is left alone. A
+; fallback here would mean a green test could be a test of memcpy.
+;
+; WHAT THIS BACKEND CANNOT DO, and says so through
+; avkBackendClearSupported rather than by guessing:
+;   * an image whose width, height and row pitch are not the render
+;     geometry NeonInit was given. NeonFrameBegin/NeonFrameEnd render at
+;     the geometry V3dRenderBegin was handed at initialisation, and
+;     NeonRetarget rebinds only the target address and size - the tile
+;     counts, the tile-state and tile-allocation pools and the clipper
+;     scaling all belong to that one geometry. Lifting this needs a new
+;     primitive in RaspberryPi4/Lib/v3d.pi4; its exact specification is
+;     in this lane's report and the file is owned elsewhere tonight.
+;   * an image that is the framebuffer the display is scanning out. This
+;     backend is offscreen by contract; presentation stays with the
+;     display layer, which is where the page flip and the rotation live.
+;
+; PROVENANCE. Semantics come from the Vulkan specification:
+;   https://docs.vulkan.org/spec/latest/chapters/clears.html  (a colour
+;   clear outside a render pass, and the layouts it is permitted in)
+;   https://docs.vulkan.org/spec/latest/chapters/memory.html   (the heap
+;   and allocation contract this backend reports into)
+;
+; The hardware behaviour comes from THIS TREE'S OWN V3D driver, read for
+; what the engine does rather than re-derived:
+;   RaspberryPi4/Lib/v3d.pi4    blob 032047a96ec132a7d64a7535d0d4787eebc96afd
+;   RaspberryPi4/Lib/neon.pi4   blob 5116984292bf5840aae2d27d66cad80312b86cdb
+;   RaspberryPi4/Lib/v3dqpu.pi4 blob 9b493319fca51449e6ea49880804d42d5904b185
+; all three unchanged across Anvil main 887681a..73a7e01. Two findings in
+; them are load-bearing here and are quoted where they are used: that the
+; clear colour reaches memory verbatim because TILE_RENDERING_MODE_CFG
+; carries a packed word (v3d.pi4, V3dClTrmcClearColor1), and that the
+; display wants byte 0 to be blue (neon.pi4, the CHANNEL ORDER note,
+; measured on this board).
+;
+; Those files cite the Mesa sources and the V3D packet documentation they
+; were written against, next to each packet. Mesa was consulted for how
+; the hardware behaves and is NOT a runtime dependency; NO third-party
+; code is used here and nothing is copied from any implementation.
+; PROVENANCE.json therefore owes this file one `mesa-24.3.4: consulted`
+; row, the same classification vk_core_1_0.pbi carries for khronos-vulkan.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+
+; The clear colour word this backend hands V3dRenderClear lands in the
+; target VERBATIM: TILE_RENDERING_MODE_CFG carries a packed word, not
+; four components, so nothing reorders it (RaspberryPi4/Lib/v3d.pi4,
+; V3dClTrmcClearColor1 and the CHANNEL ORDER note in neon.pi4 at Anvil
+; main 887681a, both measured on this board). The engine hands over
+; (A<<24)|(R<<16)|(G<<8)|B, whose little-endian bytes are B, G, R, A -
+; which is exactly VK_FORMAT_B8G8R8A8_UNORM storage order. Neon's
+; red/blue swap setting changes only SHADER colours and cannot reach a
+; clear, so this path does not depend on it.
+
+Global avkV3dWindowBase.i = 0
+Global avkV3dWindowBytes.i = 0
+Global avkV3dNative.i = 0
+Global avkV3dJobs.i = 0
+
+; Declare the offscreen window this backend may suballocate as Vulkan
+; device memory. It must already be inside the span NeonSurfaceMapSpan
+; covered before NeonInit built the V3D page table, because the GPU
+; reaches it through that identity mapping and an unmapped page is an
+; MMU fault rather than a wrong picture. Nothing here maps memory and
+; nothing here takes display ownership.
+Procedure.i AnvilVkV3dWindow(base.i, bytes.i)
+  If base <= 0 Or (base % 4096) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was given an offscreen window that is not page aligned (Anvil code -20001, invalid window); the V3D MMU maps 4096-byte pages, so the window base must be a multiple of 4096.")
+  EndIf
+  If bytes < 4096
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was given an offscreen window smaller than one page (Anvil code -20001, invalid window); reserve at least one whole screen of memory above the framebuffer and map it with NeonSurfaceMapSpan before NeonInit.")
+  EndIf
+  avkV3dWindowBase = base
+  avkV3dWindowBytes = bytes
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkBackendCaps()
+  If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
+  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU
+EndProcedure
+
+Procedure.i avkBackendName()
+  ProcedureReturn "the Raspberry Pi 4 V3D 4.2 backend: colour clears are executed by the GPU through the bin and render control lists, and nothing is cleared on the processor"
+EndProcedure
+
+Procedure.i avkBackendPrepare()
+  If Neon_Ready() = 0
+    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateDevice found the Pi 4 graphics engine not initialised (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no device was created. Call NeonArena, NeonSurface, NeonSurfaceMapSpan and NeonInit, and check Neon_Error(), before creating a Vulkan device.")
+    ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
+  EndIf
+  If avkV3dWindowBase <= 0
+    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateDevice found no offscreen window declared for the Pi 4 Vulkan backend (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no device was created. Call AnvilVkV3dWindow with a page-aligned region that NeonSurfaceMapSpan already mapped.")
+    ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkBackendHeapBase()
+  ProcedureReturn avkV3dWindowBase
+EndProcedure
+
+Procedure.i avkBackendHeapBytes()
+  ProcedureReturn avkV3dWindowBytes
+EndProcedure
+
+; The processor and the GPU share DRAM on this part and the window is
+; identity mapped in the V3D page table, so the one memory type is both
+; device local and host visible. It is NOT reported host coherent: the
+; caches are maintained explicitly around a job, which is a real
+; property of this device and not a detail to paper over.
+Procedure.i avkBackendMemoryTypeCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendMemoryTypeFlags(index.i)
+  If index <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn #VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+EndProcedure
+
+Procedure.i avkBackendMemoryTypeHeap(index.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendHeapCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendHeapSizeOf(index.i)
+  If index <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkV3dWindowBytes
+EndProcedure
+
+Procedure.i avkBackendHeapFlagsOf(index.i)
+  If index <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn #VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+EndProcedure
+
+; Page granular, because the V3D MMU is.
+Procedure.i avkBackendImageAlignment()
+  ProcedureReturn 4096
+EndProcedure
+
+; The row pitch an image of this width must have. At the surface's own
+; width it is the surface's own pitch, which is what the render target
+; is configured with; at any other width it is the tight pitch, and
+; avkBackendClearSupported then refuses the clear rather than letting a
+; caller build an image this backend could never write.
+Procedure.i avkBackendRowPitchFor(width.i)
+  If Neon_Ready() <> 0 And width = Neon_SurfacePhysicalW()
+    ProcedureReturn Neon_SurfacePitch()
+  EndIf
+  ProcedureReturn width * 4
+EndProcedure
+
+Procedure.i avkBackendMaxImageDimension2D()
+  ProcedureReturn 4096
+EndProcedure
+
+Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+  If Neon_Ready() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
+  If base <= 0 Or bytes <= 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ; Inside the declared window, written as differences so that a base
+  ; plus size which wraps cannot pass the check.
+  If base < avkV3dWindowBase Or bytes > avkV3dWindowBytes : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If (base - avkV3dWindowBase) > (avkV3dWindowBytes - bytes) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ; The render geometry is fixed at NeonInit and NeonRetarget does not
+  ; change it. An image of another shape cannot be rendered by this path.
+  If w <> Neon_SurfacePhysicalW() Or h <> Neon_SurfacePhysicalH() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If pitch <> Neon_SurfacePitch() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If bytes < (pitch * h) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ; This backend is offscreen. The buffer the engine is currently
+  ; targeting is the display's, and rendering into it from here would
+  ; take ownership the presentation layer holds.
+  If base = Neon_SurfaceBase() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Run the clear. The engine's previous target is saved and restored even
+; when the frame fails, because leaving the console pointed at a Vulkan
+; image would be a far worse failure than the one that caused it.
+Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+  Define rc.i
+  Define restoreRc.i
+  Define oldBase.i
+  Define oldBytes.i
+
+  avkV3dNative = 0
+  rc = avkBackendClearSupported(base, bytes, w, h, pitch)
+  If rc <> #VK_SUCCESS
+    avkV3dNative = rc
+    ProcedureReturn -1
+  EndIf
+
+  oldBase = Neon_SurfaceBase()
+  oldBytes = Neon_SurfacePitch() * Neon_SurfacePhysicalH()
+
+  rc = NeonRetarget(base, pitch * h)
+  If rc = #NEON_OK
+    rc = NeonFrameBegin(bgra)
+  EndIf
+  If rc = #NEON_OK
+    rc = NeonFrameEnd()
+  EndIf
+  If rc <> #NEON_OK : avkV3dNative = rc : EndIf
+
+  restoreRc = NeonRetarget(oldBase, oldBytes)
+  If restoreRc <> #NEON_OK And avkV3dNative = 0
+    avkV3dNative = restoreRc
+  EndIf
+  If rc <> #NEON_OK Or restoreRc <> #NEON_OK
+    ProcedureReturn -1
+  EndIf
+
+  avkV3dJobs = avkV3dJobs + 1
+  ; NeonFrameEnd already waited for both jobs and did the cache
+  ; maintenance, so the work is finished by the time this returns. That
+  ; is a real property of the current engine, not an assumption: the
+  ; waits are bounded inside V3dBinWait and V3dRenderWait, and a timeout
+  ; there comes back as a Neon error above rather than as a completion.
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendPoll()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendLastNativeError()
+  ProcedureReturn avkV3dNative
+EndProcedure
+
+Procedure.i avkBackendJobs()
+  ProcedureReturn avkV3dJobs
+EndProcedure
+
+; Microseconds from the architected generic timer, through the V3D
+; library's own reader. The guard is the one V3D and Neon already use:
+; CNTFRQ_EL0 is 54,000,000 on this part and zero on a part where nothing
+; set it, and dividing by zero in a wait loop is a board that stops
+; answering.
+Procedure.i avkBackendTicksUs()
+  Define hz.i
+  hz = V3dCounterHz() / 1000000
+  If hz < 1 : hz = 1 : EndIf
+  ProcedureReturn V3dTicks() / hz
+EndProcedure

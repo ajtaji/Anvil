@@ -24,11 +24,21 @@
 #VK_MAX_DESCRIPTION_SIZE = 256
 #VK_UUID_SIZE = 16
 
-; Values used by the first development-only transfer lowering.
+; VkFormat -- only the two 8-bit-per-channel colour formats this slice names.
+; B8G8R8A8_UNORM is the one it implements; R8G8B8A8_UNORM is declared so a
+; caller asking for it is refused against a real registry value rather than
+; against an unknown number.
+#VK_FORMAT_UNDEFINED = 0
+#VK_FORMAT_R8G8B8A8_UNORM = 37
 #VK_FORMAT_B8G8R8A8_UNORM = 44
+
+; VkImageLayout -- the core-1.0 entries the layout tracker understands.
 #VK_IMAGE_LAYOUT_UNDEFINED = 0
 #VK_IMAGE_LAYOUT_GENERAL = 1
+#VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2
+#VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = 6
 #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL = 7
+#VK_IMAGE_LAYOUT_PREINITIALIZED = 8
 
 ; VkResult -- VK_VERSION_1_0 entries.
 #VK_SUCCESS = 0
@@ -56,10 +66,75 @@
 #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2
 #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3
 #VK_STRUCTURE_TYPE_SUBMIT_INFO = 4
+#VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
+#VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8
+#VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
 #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39
 #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40
 #VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO = 41
 #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = 42
+#VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER = 44
+#VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER = 45
+#VK_STRUCTURE_TYPE_MEMORY_BARRIER = 46
+
+; Image creation vocabulary.
+#VK_IMAGE_TYPE_1D = 0
+#VK_IMAGE_TYPE_2D = 1
+#VK_IMAGE_TYPE_3D = 2
+#VK_IMAGE_TILING_OPTIMAL = 0
+#VK_IMAGE_TILING_LINEAR = 1
+#VK_SHARING_MODE_EXCLUSIVE = 0
+#VK_SHARING_MODE_CONCURRENT = 1
+#VK_SAMPLE_COUNT_1_BIT = $00000001
+#VK_SAMPLE_COUNT_2_BIT = $00000002
+#VK_IMAGE_USAGE_TRANSFER_SRC_BIT = $00000001
+#VK_IMAGE_USAGE_TRANSFER_DST_BIT = $00000002
+#VK_IMAGE_USAGE_SAMPLED_BIT = $00000004
+#VK_IMAGE_USAGE_STORAGE_BIT = $00000008
+#VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT = $00000010
+#VK_IMAGE_ASPECT_COLOR_BIT = $00000001
+#VK_IMAGE_ASPECT_DEPTH_BIT = $00000002
+#VK_IMAGE_ASPECT_STENCIL_BIT = $00000004
+#VK_IMAGE_ASPECT_METADATA_BIT = $00000008
+
+; Device memory vocabulary.
+#VK_MAX_MEMORY_TYPES = 32
+#VK_MAX_MEMORY_HEAPS = 16
+#VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = $00000001
+#VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = $00000002
+#VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = $00000004
+#VK_MEMORY_PROPERTY_HOST_CACHED_BIT = $00000008
+#VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = $00000001
+
+; Queue family vocabulary.
+#VK_QUEUE_GRAPHICS_BIT = $00000001
+#VK_QUEUE_COMPUTE_BIT = $00000002
+#VK_QUEUE_TRANSFER_BIT = $00000004
+#VK_QUEUE_SPARSE_BINDING_BIT = $00000008
+
+; Synchronization vocabulary. The access and stage bits are the core-1.0
+; values; this slice implements only the transfer-write dependency and the
+; host read that follows it, and refuses every other combination out loud.
+#VK_ACCESS_TRANSFER_READ_BIT = $00000800
+#VK_ACCESS_TRANSFER_WRITE_BIT = $00001000
+#VK_ACCESS_HOST_READ_BIT = $00002000
+#VK_ACCESS_HOST_WRITE_BIT = $00004000
+#VK_ACCESS_MEMORY_READ_BIT = $00008000
+#VK_ACCESS_MEMORY_WRITE_BIT = $00010000
+#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT = $00000001
+#VK_PIPELINE_STAGE_TRANSFER_BIT = $00001000
+#VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT = $00002000
+#VK_PIPELINE_STAGE_HOST_BIT = $00004000
+#VK_PIPELINE_STAGE_ALL_COMMANDS_BIT = $00010000
+#VK_DEPENDENCY_BY_REGION_BIT = $00000001
+#VK_FENCE_CREATE_SIGNALED_BIT = $00000001
+
+; The registry spells these (~0U). They are written here as the exact 32-bit
+; pattern, because PureMetal's native integer is 64 bits on AArch64 and an
+; unqualified ~0 would not compare equal to a uint32_t member read back.
+#VK_QUEUE_FAMILY_IGNORED = $FFFFFFFF
+#VK_REMAINING_MIP_LEVELS = $FFFFFFFF
+#VK_REMAINING_ARRAY_LAYERS = $FFFFFFFF
 
 ; Command pool and command buffer vocabulary.
 #VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0
@@ -225,3 +300,99 @@ Structure VkSubmitInfo Align #PB_Structure_AlignC
   signalSemaphoreCount.l
   *pSignalSemaphores
 EndStructure
+
+; ----------------------------------------------------------------------
+;  Resource, memory and synchronization records.
+;
+;  VkDeviceSize is uint64_t, so it is .q and not .i: .i is the target's
+;  native width and would be four bytes on a 32-bit backend, which would
+;  move every member after it.
+; ----------------------------------------------------------------------
+Structure VkMemoryAllocateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  allocationSize.q
+  memoryTypeIndex.l
+EndStructure
+
+Structure VkMemoryRequirements Align #PB_Structure_AlignC
+  size.q
+  alignment.q
+  memoryTypeBits.l
+EndStructure
+
+Structure VkMemoryType Align #PB_Structure_AlignC
+  propertyFlags.l
+  heapIndex.l
+EndStructure
+
+Structure VkMemoryHeap Align #PB_Structure_AlignC
+  size.q
+  flags.l
+EndStructure
+
+Structure VkPhysicalDeviceMemoryProperties Align #PB_Structure_AlignC
+  memoryTypeCount.l
+  memoryTypes.VkMemoryType[#VK_MAX_MEMORY_TYPES]
+  memoryHeapCount.l
+  memoryHeaps.VkMemoryHeap[#VK_MAX_MEMORY_HEAPS]
+EndStructure
+
+Structure VkQueueFamilyProperties Align #PB_Structure_AlignC
+  queueFlags.l
+  queueCount.l
+  timestampValidBits.l
+  minImageTransferGranularity.VkExtent3D
+EndStructure
+
+Structure VkImageCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  imageType.l
+  format.l
+  extent.VkExtent3D
+  mipLevels.l
+  arrayLayers.l
+  samples.l
+  tiling.l
+  usage.l
+  sharingMode.l
+  queueFamilyIndexCount.l
+  *pQueueFamilyIndices
+  initialLayout.l
+EndStructure
+
+Structure VkImageSubresourceRange Align #PB_Structure_AlignC
+  aspectMask.l
+  baseMipLevel.l
+  levelCount.l
+  baseArrayLayer.l
+  layerCount.l
+EndStructure
+
+Structure VkImageMemoryBarrier Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  srcAccessMask.l
+  dstAccessMask.l
+  oldLayout.l
+  newLayout.l
+  srcQueueFamilyIndex.l
+  dstQueueFamilyIndex.l
+  image.i
+  subresourceRange.VkImageSubresourceRange
+EndStructure
+
+Structure VkFenceCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+EndStructure
+
+; VkClearColorValue IS A UNION and is deliberately NOT declared here.
+; PureMetal has no union declaration, and a structure with one arm of it
+; would silently be the wrong type for the other two. vkCmdClearColorImage
+; takes `const VkClearColorValue*`, so the adapter reads the caller's
+; sixteen bytes as four binary32 components - which is what the union's
+; float32 arm is - and says so at the call site.

@@ -16,28 +16,43 @@ versioned Mesa sources cited next to packet/register code in
 `RaspberryPi4/Lib/v3d.pi4`. Mesa is a reference, not an Anvil runtime
 dependency.
 
-## Executable development slice
+## The implemented slice
 
-`vk_v3d_development.pi4` lowers one internal two-operation command sequence:
+`vk_v3d_backend.pi4` executes exactly one recorded operation on the GPU: a
+whole-image colour clear of one `VK_FORMAT_B8G8R8A8_UNORM`, linear, single-mip,
+single-layer 2D image bound to real `VkDeviceMemory` in an offscreen window.
+It is reached through the public `vkCmdClearColorImage` and `vkQueueSubmit`,
+after a public `vkCmdPipelineBarrier`-shaped transition, and its completion is
+observed through a public `VkFence`.
 
-1. discard-only `UNDEFINED` to `TRANSFER_DST_OPTIMAL` transition;
-2. full-image color clear of one externally owned, contiguous, identity-mapped
-   `B8G8R8A8_UNORM` 2D image with one mip level and one array layer.
+The execution path is `NeonRetarget`, `NeonFrameBegin` and `NeonFrameEnd` with
+no draws. That builds and submits real V3D bin and render control lists:
+`V3dBinSubmit`, `V3dBinWait`, `V3dRenderSubmit` and `V3dRenderWait` launch,
+wait, clean the V3D caches and maintain the processor's view of the target.
+The tile clear and the tile store are what write the image. There is no
+processor-side and no DMA image fallback anywhere under this path, and the
+desk gate checks the source for one.
 
-The color inputs are already quantized to exact 8-bit UNORM values. The
-backend accepts only an offscreen image with the initialized Neon's physical
-width, height, and pitch. It calls `NeonRetarget`, then `NeonFrameBegin` and
-`NeonFrameEnd` with no draws, then restores the prior target. This is a real
-V3D bin/render clear path: `V3dBinSubmit`, `V3dBinWait`, `V3dRenderSubmit`, and
-`V3dRenderWait` build, launch, wait, clean V3D caches, and maintain the CPU
-view of the target. There is no CPU or DMA image clear fallback.
+### What this backend still cannot do, and says so
 
-This is not yet the public `vkCmdClearColorImage` entry point. It has no
-`VkImage` object, `VkDeviceMemory`, subresource-range array, general-layout
-dependency, queue-family transfer, fence, semaphore, or concurrent submit.
-Submission is synchronous and exclusive. The explicit development enable does
-not change `AnvilVkBackendAvailable()` and does not make a production physical
-device visible.
+- **Any extent but one.** `NeonFrameBegin`/`NeonFrameEnd` render at the
+  geometry `V3dRenderBegin` was handed inside `NeonInit`, and `NeonRetarget`
+  rebinds only the target address and size. The tile counts, the tile-state
+  and tile-allocation pools and the clipper scaling all belong to that one
+  geometry. An image of any other width, height or row pitch is refused at
+  **record time** with `VK_ERROR_FEATURE_NOT_PRESENT`, so it never reaches a
+  queue. Lifting this needs a new primitive in `RaspberryPi4/Lib/v3d.pi4`;
+  its exact specification is in the lane report, and that file is owned by
+  the display lane.
+- **The buffer the display is scanning out.** This backend is offscreen by
+  contract. Presentation stays with the display layer.
+- **Asynchrony.** `NeonFrameEnd` waits for both jobs before it returns, so
+  nothing is genuinely in flight when `vkQueueSubmit` returns. The engine
+  models the pending state correctly and the test backend exercises it, but on
+  V3D the fence is signalled inside the submit. Real asynchrony needs
+  interrupt-driven completion rather than the current bounded polls.
+- **More than one clear per submission, and more than one submission at a
+  time.** Both are refused, not truncated.
 
 ## API and object gaps
 
@@ -70,6 +85,12 @@ display ownership.
 
 ## Memory and resource gaps
 
+Implemented since 2026-09-10 and therefore **not** in this list: one heap and
+its types, exact `VkMemoryRequirements`, allocate and free with first-fit reuse
+of released holes, bind with alignment/range/double-bind/parent/type rules, and
+per-image layout and queue-family ownership for the one image shape above.
+Everything below remains missing.
+
 - Enumerated heaps/types and exact `VkMemoryRequirements`; allocate/free,
   suballocation, bind, map/unmap, flush/invalidate mapped ranges, coherent vs.
   non-coherent behavior, aliasing, dedicated allocations, and device-address
@@ -85,7 +106,14 @@ display ownership.
 
 ## Synchronization and command gaps
 
-- Fences, binary semaphores, events, pipeline barriers, memory/buffer/image
+Implemented since 2026-09-10 and therefore **not** in this list: `VkFence` with
+its two states and its single owner, `vkResetFences`, `vkGetFenceStatus`, a
+doubly bounded `vkWaitForFences`, `vkDeviceWaitIdle`, image memory barriers
+with layout transitions checked against the recording and against the image,
+and the access/stage scope rules that make the clear after a transition
+correct. Everything below remains missing.
+
+- Binary semaphores, events, pipeline barriers, memory/buffer/image
   barriers, access masks, stage masks, queue-family transfers, availability and
   visibility, host/device domains, and simultaneous queue submissions.
 - General command allocation arrays, secondary execution and inheritance,
@@ -143,13 +171,33 @@ coverage machine-readable.
   or conformance claim is permitted before the mandatory baseline and CTS
   requirements for that claim are actually satisfied.
 
-## Root-only hardware proof for the development clear
+## The board proof for the clear
 
-Reserve a mapped offscreen image and guards without overlapping display or
-module memory. Poison the image, submit the transition+clear, and require both
-bin and render completion counters to advance, no MMU/OOM/cache error, every
-pixel to equal the expected little-endian B,G,R,A bytes, and both guards to
-remain intact. Repeat with D-cache off and on. Confirm the previously active
-Neon target is restored and the HDMI/DSI front buffer is byte-for-byte
-unchanged. Inject an unmapped address in a disposable run and require a bounded
-fault rather than a hang. Only root performs this board proof.
+`RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4` is the only thing that
+can show this path executes. It reserves the second half of a double-height
+framebuffer as the offscreen window, creates the image through the public
+entry points, poisons every word of it with the complement of the expected
+value, submits the transition and the clear, waits on the fence, and then:
+
+- requires both the bin and the render completion counters to have advanced;
+- requires no binner OOM and no V3D MMU fault, and records the error status,
+  violation address and violation id whether or not they are zero;
+- compares EVERY pixel against the exact expected little-endian B, G, R, A
+  bytes, and reports the mismatch count and the first bad offset;
+- compares a checksum of the LIVE framebuffer taken before the submission
+  against one taken after it, so "the GPU wrote only the image it was given"
+  is measured rather than assumed;
+- copies the finished image onto the shown half so a person can see it, which
+  is a copy and not a page flip because a non-zero virtual offset scans out
+  blurred on this firmware;
+- calls `NeonShutdown()` before returning, handing the V3D MMU back.
+
+It must be run with the accelerated console taken off V3D first (`screen dma`),
+because it initialises the graphics engine itself and two owners of one V3D
+page table cannot be made to work. Recovery is `screen on` then `screen v3d`;
+nothing in it releases a core, writes a spin slot, or touches the monitor, its
+variables, the DSI control registers or any reserved region.
+
+Still owed after that run, and not claimed by it: caches on as well as off,
+an injected unmapped address requiring a bounded fault rather than a hang, and
+a second submission after the first to show the resources were really released.

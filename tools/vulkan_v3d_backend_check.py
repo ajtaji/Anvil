@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Link and production-boundary gate for the Pi 4 V3D Vulkan backend.
+
+It builds RaspberryPi4/Tests/vulkan_v3d_backend_emitted_gate.pi4 against
+the REAL display, V3D, QPU and Neon implementation, runs it on the A64
+interpreter with an MMIO hard stop armed, and requires that reaching the
+"no device" answer touches no hardware at all.
+
+This gate deliberately proves nothing about GPU execution. The backend's
+clear is proved on the board by
+RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4.
+
+  PMFC=<pmfc.exe> PMF_A64_INTERP=<a64_interp.py> \\
+      py -3 tools/vulkan_v3d_backend_check.py
+
+Add --mutate to require the gate to notice a backend that claims a
+device it does not have.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+HERE = pathlib.Path(__file__).resolve().parent
+ROOT = HERE.parent
+GATE = ROOT / "RaspberryPi4" / "Tests" / "vulkan_v3d_backend_emitted_gate.pi4"
+BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_backend.pi4"
+
+LOAD = 0x00400000
+STACK = 0x03000000
+LOADER_LR = 0xDEAD0000
+STEP_LIMIT = 200_000_000
+MMIO = 0xFC000000
+
+OUT = 0x06000000
+ROWS = 0x06000100
+TEXTS = 0x06002000
+MAGIC = 0x564B4233  # "VKB3"
+
+# A backend that lowers a clear anywhere but through the engine this tree
+# proves on silicon, or that keeps a processor-side fallback, is not the
+# thing the board diagnostic tests.
+REQUIRED_CALLS = ("NeonRetarget", "NeonFrameBegin", "NeonFrameEnd",
+                  "Neon_SurfacePhysicalW", "Neon_SurfacePhysicalH", "Neon_SurfacePitch")
+FORBIDDEN_TOKENS = ("PokeN(", "PokeI(", "PokeL(", "PokeA(", "DspCopy", "DmaCopy",
+                    "DisplayClear", "DspDmaFill", "DisplayFillRect", "CopyMemory")
+
+MUTANTS = (
+    (
+        "the backend claims a device with the engine down",
+        "  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf\n"
+        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU\n",
+        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU\n",
+    ),
+    (
+        "vkCreateDevice no longer checks that the engine is initialised",
+        "Procedure.i avkBackendPrepare()\n  If Neon_Ready() = 0\n",
+        "Procedure.i avkBackendPrepare()\n  If Neon_Ready() < 0\n",
+    ),
+    (
+        "a window that is not page aligned is accepted",
+        "  If base <= 0 Or (base % 4096) <> 0\n",
+        "  If base <= 0\n",
+    ),
+    (
+        "a clear is attempted with no geometry to render it at",
+        "  If Neon_Ready() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n",
+        "  If Neon_Ready() < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n",
+    ),
+)
+
+# RULES THIS DESK GATE CANNOT REACH, and it says so rather than pretending
+# they passed. Each becomes observable only once the graphics engine is
+# initialised, which needs the GPU; they are proved by
+# RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4 in a board slot.
+BOARD_ONLY = (
+    ("the backend stops refusing the buffer the display is scanning out",
+     "with the engine down Neon_SurfaceBase() is zero and the engine-not-ready "
+     "refusal answers first, so no desk run reaches that comparison"),
+    ("the backend stops matching the render geometry Neon was initialised with",
+     "the width, height and pitch it compares against only exist after NeonInit"),
+)
+
+
+def locate(env_name: str, explicit, fallbacks) -> pathlib.Path:
+    choices = []
+    if explicit:
+        choices.append(pathlib.Path(explicit))
+    if os.environ.get(env_name):
+        choices.append(pathlib.Path(os.environ[env_name]))
+    choices.extend(fallbacks)
+    for path in choices:
+        if path.is_file():
+            return path.resolve()
+    raise SystemExit(f"vulkan V3D backend gate: {env_name} was not found; set it or pass its option")
+
+
+def load_interpreter(path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location("anvil_vkv3d_a64_interp", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"vulkan V3D backend gate: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def build(compiler: pathlib.Path, root: pathlib.Path, source: pathlib.Path) -> pathlib.Path:
+    image = pathlib.Path(tempfile.gettempdir()) / "anvil_vk_v3d_backend.img"
+    command = [
+        str(compiler), source.relative_to(root).as_posix(),
+        "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
+        "--entry-returns", "-o", str(image), "-s",
+    ]
+    env = os.environ.copy()
+    env["PMF_ROOT"] = str(root)
+    run = subprocess.run(command, cwd=root, env=env, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    if run.returncode or "pmfc: OK" not in run.stdout:
+        raise SystemExit("vulkan V3D backend gate: compile failed\n" + run.stdout)
+    return image
+
+
+def execute(a64, image: pathlib.Path):
+    cpu = a64.A64()
+    for i, byte in enumerate(image.read_bytes()):
+        cpu.memory[LOAD + i] = byte
+    a64.attach_symbols(cpu, image, LOAD)
+    cpu.pc, cpu.sp, cpu.x[30] = LOAD, STACK, LOADER_LR
+    seen = []
+
+    def guard(addr: int, write: bool) -> None:
+        if addr >= MMIO:
+            seen.append((addr, write))
+            kind = "write" if write else "read"
+            raise SystemExit(
+                f"vulkan V3D backend gate: MMIO {kind} at ${addr:08X} - reaching the "
+                "'no device' answer must touch no hardware, so this image is not safe "
+                "to run on a desk and the refusal path has started talking to V3D")
+
+    def load(addr: int, size: int) -> int:
+        cpu.align_guard(addr, size, False)
+        guard(addr, False)
+        return sum(cpu.memory.get(addr + i, 0) << (8 * i) for i in range(size))
+
+    def store(addr: int, value: int, size: int) -> None:
+        cpu.align_guard(addr, size, True)
+        guard(addr, True)
+        for i in range(size):
+            cpu.memory[addr + i] = (value >> (8 * i)) & 0xFF
+
+    cpu.load = load
+    cpu.store = store
+    for steps in range(STEP_LIMIT):
+        if cpu.pc == LOADER_LR:
+            return cpu, cpu.x[0] & 0xFFFFFFFFFFFFFFFF, steps
+        cpu.step()
+    raise SystemExit(f"vulkan V3D backend gate: the probe did not return in {STEP_LIMIT} steps")
+
+
+def u64(cpu, addr: int) -> int:
+    return sum(cpu.memory.get(addr + i, 0) << (8 * i) for i in range(8))
+
+
+def cstr(cpu, addr: int, limit: int = 1024) -> str:
+    out = []
+    for i in range(limit):
+        b = cpu.memory.get(addr + i, 0)
+        if b == 0:
+            break
+        out.append(chr(b))
+    return "".join(out)
+
+
+class Grader:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+        self.checks = 0
+
+    def need(self, name, got, want) -> None:
+        self.checks += 1
+        if got != want:
+            self.failures.append(f"{name}: got {got!r}, wanted {want!r}")
+
+    def want_true(self, name, cond, detail="") -> None:
+        self.checks += 1
+        if not cond:
+            self.failures.append(f"{name}{(': ' + detail) if detail else ''}")
+
+
+def grade(cpu, rc) -> Grader:
+    g = Grader()
+    g.need("gate magic", hex(u64(cpu, OUT)), hex(MAGIC))
+    rows = u64(cpu, OUT + 8)
+    fails = u64(cpu, OUT + 16)
+    g.need("gate return code", rc, 0)
+    g.need("in-image failures", fails, 0)
+    g.want_true("the gate ran its checks", rows >= 30, str(rows))
+    if fails:
+        bad = [str(i + 1) for i in range(rows) if u64(cpu, ROWS + i * 8) == 0]
+        g.failures.append("failed in-image rows: " + ",".join(bad))
+    for _ in range(rows):
+        g.checks += 1
+
+    name = cstr(cpu, u64(cpu, OUT + 24))
+    g.want_true("the backend names the part and the path it uses",
+                "V3D" in name and "GPU" in name and "processor" in name, repr(name[:110]))
+
+    for i in range(3):
+        ptr = u64(cpu, TEXTS + i * 8)
+        g.want_true(f"refusal {i + 1} has a sentence", ptr != 0)
+        if not ptr:
+            continue
+        text = cstr(cpu, ptr)
+        g.want_true(f"refusal {i + 1} ends as a sentence", text.endswith("."), repr(text[:70]))
+        g.want_true(f"refusal {i + 1} is not a bare code", len(text.split()) >= 14, repr(text[:70]))
+        g.want_true(f"refusal {i + 1} names its code",
+                    ("Anvil code -200" in text) or ("VkResult -" in text), repr(text[:110]))
+    return g
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pmfc")
+    parser.add_argument("--interp")
+    parser.add_argument("--mutate", action="store_true")
+    args = parser.parse_args()
+
+    compiler = locate("PMFC", args.pmfc, [ROOT / "pmfc.exe", ROOT / "pmfc"])
+    a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
+                                  [ROOT / "tools" / "a64" / "a64_interp.py"]))
+
+    original = BACKEND.read_text(encoding="utf-8")
+    source_failures = []
+    for call in REQUIRED_CALLS:
+        if call not in original:
+            source_failures.append("the backend never calls " + call)
+    for token in FORBIDDEN_TOKENS:
+        if token in original:
+            source_failures.append("the backend holds a processor-side fallback token " + token)
+    if source_failures:
+        print("vulkan_v3d_backend_check: FAIL")
+        for failure in source_failures:
+            print("  " + failure)
+        return 1
+
+    cpu, rc, steps = execute(a64, build(compiler, ROOT, GATE))
+    g = grade(cpu, rc)
+    if g.failures:
+        print(f"vulkan_v3d_backend_check: FAIL ({g.checks} checks, {steps:,} instructions)")
+        for failure in g.failures:
+            print("  " + failure)
+        return 1
+
+    print(f"vulkan_v3d_backend_check: PASS - {g.checks} property checks over "
+          f"{steps:,} executed A64 instructions")
+    print("  the real display, V3D, QPU and Neon implementation is linked with the Vulkan")
+    print("  object engine and the V3D backend; the whole closure resolves at this revision")
+    print("  with the engine down the backend enumerates no device and refuses every clear")
+    print("  NOT ONE MMIO ACCESS was made reaching that answer")
+    print("  the backend lowers only through NeonRetarget/NeonFrameBegin/NeonFrameEnd and")
+    print("  holds no processor-side or DMA image fallback")
+
+    if not args.mutate:
+        print("  (run with --mutate to also require every plausible mistake to be caught)")
+        return 0
+
+    print()
+    missed = 0
+    with tempfile.TemporaryDirectory(prefix="anvil-vkv3d-") as td:
+        work = pathlib.Path(td)
+        for name, fixed, broken in MUTANTS:
+            if original.count(fixed) != 1:
+                print(f"  STALE  {name} - its anchor appears "
+                      f"{original.count(fixed)} times; not tested")
+                missed += 1
+                continue
+            BACKEND.write_text(original.replace(fixed, broken, 1), encoding="utf-8")
+            try:
+                mcpu, mrc, msteps = execute(a64, build(compiler, ROOT, GATE))
+                mg = grade(mcpu, mrc)
+                red = bool(mg.failures)
+                first = mg.failures[0][:100] if mg.failures else ""
+            except SystemExit as exc:
+                # An MMIO stop or a build failure IS the gate noticing.
+                red, first = True, str(exc).splitlines()[0][:100]
+            finally:
+                BACKEND.write_text(original, encoding="utf-8")
+            if red:
+                print(f"  RED    {name} - {first}")
+            else:
+                print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
+                missed += 1
+
+    for name, why in BOARD_ONLY:
+        print(f"  OWED   {name}")
+        print(f"         not reachable from a desk: {why}")
+
+    if missed:
+        print(f"\nvulkan_v3d_backend_check: {missed} of {len(MUTANTS)} mutations were not caught")
+        return 1
+    print(f"\nvulkan_v3d_backend_check: all {len(MUTANTS)} desk-reachable mutations rejected; "
+          f"{len(BOARD_ONLY)} rules are board-only and are listed above, not claimed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

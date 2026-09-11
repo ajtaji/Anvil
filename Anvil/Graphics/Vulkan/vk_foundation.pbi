@@ -1,16 +1,41 @@
 ; ======================================================================
 ;  Native Vulkan object/lifecycle foundation for Anvil
 ; ======================================================================
-; This is the executable ownership and command-buffer state engine beneath a
-; future Vulkan entry surface. Public create-info records now have checked
-; AArch64 C layout, but vk* entry procedures remain outside this bounded slice.
+; SPDX-License-Identifier: MIT
 ;
-; The including program must define #ANVIL_VK_TEST_BACKEND as 0 for production
-; or 1 for the explicit test backend. That backend owns no GPU and accepts
-; only empty command buffers, completing them synchronously.
+; This is the executable ownership and command-buffer state engine beneath
+; Anvil's public vk* entry points (vk_api.pbi). It owns handles, parents,
+; generations and command-buffer states, and it contains no V3D register,
+; packet, address or display assumption of any kind.
+;
+; THE BACKEND IS A SEAM AND IT IS STATIC. Exactly one backend file must be
+; included by the program:
+;
+;   Anvil/Graphics/Vulkan/vk_backend_none.pbi   no device is enumerated
+;   Anvil/Graphics/Vulkan/vk_backend_test.pbi   state only, owns no GPU
+;   Anvil/Graphics/Vulkan/vk_v3d_backend.pi4    the real Pi 4 V3D backend
+;
+; The seam is Declared here and defined there, so a build that forgets a
+; backend fails to link rather than quietly enumerating nothing. Including
+; two backends declares the same procedures twice and fails as well: there
+; is no run-time registration to get wrong.
+;
+; Semantics come from the Vulkan specification, read at
+; https://docs.vulkan.org/spec/latest/chapters/fundamentals.html (object
+; model, valid usage, return codes) and .../cmdbuffers.html (the command
+; buffer lifecycle). Nothing is copied from any implementation.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 
+; ----------------------------------------------------------------------
+;  Anvil result codes.
+;
+;  Core Vulkan leaves most invalid usage UNDEFINED and gives a command no
+;  result code for it. Anvil will not have undefined behaviour, so every
+;  such case returns one of these instead. They are far outside VkResult's
+;  core-1.0 range (-12 .. 5), so no caller can confuse one with a Vulkan
+;  code and none of them can ever be mistaken for success.
+; ----------------------------------------------------------------------
 #ANVIL_VK_OK = 0
 #ANVIL_VK_ERR_ARGS = -20001
 #ANVIL_VK_ERR_HANDLE = -20002
@@ -18,9 +43,14 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_ERR_STATE = -20004
 #ANVIL_VK_ERR_UNSUPPORTED = -20005
 
-#ANVIL_VK_BACKEND_NONE = 0
-#ANVIL_VK_BACKEND_TEST = 1
-#ANVIL_VK_BACKEND_V3D_DEVELOPMENT = 2
+; Backend capability bits, reported by avkBackendCaps().
+#ANVIL_VK_CAP_DEVICE = $0001        ; a physical device may be enumerated
+#ANVIL_VK_CAP_CLEAR_COLOR = $0002   ; vkCmdClearColorImage can be executed
+#ANVIL_VK_CAP_GPU = $0004           ; that execution is real GPU work
+
+; avkBackendSubmitClear() answers.
+#ANVIL_VK_JOB_DONE = 0
+#ANVIL_VK_JOB_PENDING = 1
 
 #ANVIL_VK_TYPE_INSTANCE = 1
 #ANVIL_VK_TYPE_PHYSICAL_DEVICE = 2
@@ -28,6 +58,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TYPE_QUEUE = 4
 #ANVIL_VK_TYPE_COMMAND_POOL = 5
 #ANVIL_VK_TYPE_COMMAND_BUFFER = 6
+#ANVIL_VK_TYPE_DEVICE_MEMORY = 7
+#ANVIL_VK_TYPE_IMAGE = 8
+#ANVIL_VK_TYPE_FENCE = 9
 
 #ANVIL_VK_CB_INITIAL = 0
 #ANVIL_VK_CB_RECORDING = 1
@@ -40,7 +73,12 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_DEVICES = 4
 #ANVIL_VK_MAX_QUEUES = 4
 #ANVIL_VK_MAX_COMMAND_POOLS = 16
-#ANVIL_VK_MAX_COMMAND_BUFFERS = 128
+#ANVIL_VK_MAX_COMMAND_BUFFERS = 32
+
+; The one queue family this slice exposes. It is transfer-capable and
+; nothing else; a graphics or compute bit here would be a claim about
+; draws and dispatches that no part of this tree implements.
+#ANVIL_VK_QUEUE_FAMILY = 0
 
 #ANVIL_VK_TOKEN_MAGIC = $564B000000000000
 #ANVIL_VK_TOKEN_MAGIC_MASK = $FFFF000000000000
@@ -48,29 +86,98 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TOKEN_GEN_MASK = $00000000FFFF0000
 #ANVIL_VK_TOKEN_SLOT_MASK = $000000000000FFFF
 
-Global Dim avkInstLive.a[#ANVIL_VK_MAX_INSTANCES]
-Global Dim avkInstGen.i[#ANVIL_VK_MAX_INSTANCES]
-Global Dim avkPhysLive.a[#ANVIL_VK_MAX_PHYSICAL_DEVICES]
-Global Dim avkPhysGen.i[#ANVIL_VK_MAX_PHYSICAL_DEVICES]
-Global Dim avkPhysInst.i[#ANVIL_VK_MAX_PHYSICAL_DEVICES]
-Global Dim avkDevLive.a[#ANVIL_VK_MAX_DEVICES]
-Global Dim avkDevGen.i[#ANVIL_VK_MAX_DEVICES]
-Global Dim avkDevPhys.i[#ANVIL_VK_MAX_DEVICES]
-Global Dim avkQueueLive.a[#ANVIL_VK_MAX_QUEUES]
-Global Dim avkQueueGen.i[#ANVIL_VK_MAX_QUEUES]
-Global Dim avkQueueDev.i[#ANVIL_VK_MAX_QUEUES]
-Global Dim avkPoolLive.a[#ANVIL_VK_MAX_COMMAND_POOLS]
-Global Dim avkPoolGen.i[#ANVIL_VK_MAX_COMMAND_POOLS]
-Global Dim avkPoolDev.i[#ANVIL_VK_MAX_COMMAND_POOLS]
-Global Dim avkPoolFlags.i[#ANVIL_VK_MAX_COMMAND_POOLS]
-Global Dim avkCmdLive.a[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global Dim avkCmdGen.i[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global Dim avkCmdPool.i[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global Dim avkCmdLevel.i[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global Dim avkCmdState.i[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global Dim avkCmdBeginFlags.i[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global Dim avkCmdOps.i[#ANVIL_VK_MAX_COMMAND_BUFFERS]
-Global avkBackendKind.i = #ANVIL_VK_BACKEND_NONE
+; ----------------------------------------------------------------------
+;  THE BACKEND SEAM.
+; ----------------------------------------------------------------------
+Declare.i avkBackendCaps()
+Declare.i avkBackendName()
+Declare.i avkBackendPrepare()
+Declare.i avkBackendHeapBase()
+Declare.i avkBackendHeapBytes()
+Declare.i avkBackendMemoryTypeCount()
+Declare.i avkBackendMemoryTypeFlags(index.i)
+Declare.i avkBackendMemoryTypeHeap(index.i)
+Declare.i avkBackendHeapCount()
+Declare.i avkBackendHeapSizeOf(index.i)
+Declare.i avkBackendHeapFlagsOf(index.i)
+Declare.i avkBackendImageAlignment()
+Declare.i avkBackendRowPitchFor(width.i)
+Declare.i avkBackendMaxImageDimension2D()
+Declare.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+Declare.i avkBackendPoll()
+Declare.i avkBackendLastNativeError()
+Declare.i avkBackendTicksUs()
+
+; EVERY SLOT TABLE IS ONE ELEMENT LONGER THAN ITS MAXIMUM. Slot 0 means
+; "no object", so live slots run 1..MAX and a table dimensioned to MAX
+; would have its last slot land one element past the end. That is exactly
+; what the first version of this file did, on every object type at once,
+; and it is invisible until the table is full - the allocator only ever
+; reaches the last slot when everything before it is taken.
+Global Dim avkInstLive.a[#ANVIL_VK_MAX_INSTANCES + 1]
+Global Dim avkInstGen.i[#ANVIL_VK_MAX_INSTANCES + 1]
+Global Dim avkPhysLive.a[#ANVIL_VK_MAX_PHYSICAL_DEVICES + 1]
+Global Dim avkPhysGen.i[#ANVIL_VK_MAX_PHYSICAL_DEVICES + 1]
+Global Dim avkPhysInst.i[#ANVIL_VK_MAX_PHYSICAL_DEVICES + 1]
+Global Dim avkDevLive.a[#ANVIL_VK_MAX_DEVICES + 1]
+Global Dim avkDevGen.i[#ANVIL_VK_MAX_DEVICES + 1]
+Global Dim avkDevPhys.i[#ANVIL_VK_MAX_DEVICES + 1]
+Global Dim avkQueueLive.a[#ANVIL_VK_MAX_QUEUES + 1]
+Global Dim avkQueueGen.i[#ANVIL_VK_MAX_QUEUES + 1]
+Global Dim avkQueueDev.i[#ANVIL_VK_MAX_QUEUES + 1]
+Global Dim avkPoolLive.a[#ANVIL_VK_MAX_COMMAND_POOLS + 1]
+Global Dim avkPoolGen.i[#ANVIL_VK_MAX_COMMAND_POOLS + 1]
+Global Dim avkPoolDev.i[#ANVIL_VK_MAX_COMMAND_POOLS + 1]
+Global Dim avkPoolFlags.i[#ANVIL_VK_MAX_COMMAND_POOLS + 1]
+Global Dim avkCmdLive.a[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCmdGen.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCmdPool.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCmdLevel.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCmdState.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCmdBeginFlags.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCmdOps.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+
+; ----------------------------------------------------------------------
+;  THE VALIDATION FAULT RECORD.
+;
+;  Vulkan's void commands - vkCmdPipelineBarrier, vkCmdClearColorImage,
+;  vkFreeMemory, vkDestroyImage, vkDestroyFence - have no return value,
+;  and the specification's answer to misuse is undefined behaviour. Anvil
+;  records a numeric code and a WHOLE SENTENCE here instead, and where the
+;  specification allows it (a recording error) the command buffer is moved
+;  to the invalid state so vkEndCommandBuffer reports the failure. Nothing
+;  in this engine ever proceeds as though a refused call had succeeded.
+; ----------------------------------------------------------------------
+Global avkFaultCode.i = #ANVIL_VK_OK
+Global avkFaultText.i = 0
+Global avkFaultCount.i = 0
+
+Procedure.i avkFault(code.i, text.i)
+  avkFaultCode = code
+  avkFaultText = text
+  avkFaultCount = avkFaultCount + 1
+  ProcedureReturn code
+EndProcedure
+
+Procedure AnvilVkFaultClear()
+  avkFaultCode = #ANVIL_VK_OK
+  avkFaultText = 0
+EndProcedure
+
+Procedure.i AnvilVkFaultCode()
+  ProcedureReturn avkFaultCode
+EndProcedure
+
+; A whole sentence naming the numeric code, what it means and the first
+; thing to check, or 0 if no call has been refused.
+Procedure.i AnvilVkFaultText()
+  ProcedureReturn avkFaultText
+EndProcedure
+
+Procedure.i AnvilVkFaultCount()
+  ProcedureReturn avkFaultCount
+EndProcedure
 
 Procedure.i avkNextGen(v.i)
   v = (v + 1) & $FFFF
@@ -107,6 +214,13 @@ Procedure.i avkTokenShape(h.i, kind.i, cap.i)
     ProcedureReturn 0
   EndIf
   ProcedureReturn s
+EndProcedure
+
+; Read a uint32_t member without the sign of PeekL's signed 32-bit load
+; leaking into a 64-bit comparison. VK_QUEUE_FAMILY_IGNORED is $FFFFFFFF
+; and must compare equal to the constant of the same name.
+Procedure.i avkU32(*p)
+  ProcedureReturn PeekL(*p) & $FFFFFFFF
 EndProcedure
 
 Procedure.i avkInstSlot(h.i)
@@ -151,33 +265,34 @@ Procedure.i avkCmdSlot(h.i)
   ProcedureReturn s
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  Capability answers.
+;
+;  AnvilVkBackendAvailable() is the production question and it is answered
+;  by the linked backend, not by a flag any caller can set. A build that
+;  links vk_backend_none.pbi answers 0 here and refuses instance creation
+;  with VK_ERROR_INCOMPATIBLE_DRIVER, exactly as a loader does when no ICD
+;  is installed.
+; ----------------------------------------------------------------------
 Procedure.i AnvilVkBackendAvailable()
-  ; Production registration is deliberately absent. Development and test
-  ; backends never turn this capability answer into a production claim.
+  If (avkBackendCaps() & #ANVIL_VK_CAP_DEVICE) <> 0
+    ProcedureReturn 1
+  EndIf
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i avkBackendEnable(kind.i)
-  If kind <> #ANVIL_VK_BACKEND_TEST And kind <> #ANVIL_VK_BACKEND_V3D_DEVELOPMENT
-    ProcedureReturn #ANVIL_VK_ERR_ARGS
+; 1 when the linked backend executes clears on a GPU, 0 when it models
+; state only. A gate uses this to refuse to call a state-only backend's
+; result silicon.
+Procedure.i AnvilVkBackendIsGpu()
+  If (avkBackendCaps() & #ANVIL_VK_CAP_GPU) <> 0
+    ProcedureReturn 1
   EndIf
-  If avkBackendKind <> #ANVIL_VK_BACKEND_NONE And avkBackendKind <> kind
-    ProcedureReturn #ANVIL_VK_ERR_STATE
-  EndIf
-  avkBackendKind = kind
-  ProcedureReturn #ANVIL_VK_OK
+  ProcedureReturn 0
 EndProcedure
 
-Procedure.i AnvilVkBackendKind()
-  ProcedureReturn avkBackendKind
-EndProcedure
-
-Procedure.i AnvilVkTestBackendEnable()
-  CompilerIf #ANVIL_VK_TEST_BACKEND = 1
-  ProcedureReturn avkBackendEnable(#ANVIL_VK_BACKEND_TEST)
-  CompilerElse
-  ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
-  CompilerEndIf
+Procedure.i AnvilVkBackendName()
+  ProcedureReturn avkBackendName()
 EndProcedure
 
 Procedure.i AnvilVkInstanceCreate(*out)
@@ -185,7 +300,7 @@ Procedure.i AnvilVkInstanceCreate(*out)
   Define p.i
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
-  If avkBackendKind = #ANVIL_VK_BACKEND_NONE : ProcedureReturn #VK_ERROR_INCOMPATIBLE_DRIVER : EndIf
+  If AnvilVkBackendAvailable() = 0 : ProcedureReturn #VK_ERROR_INCOMPATIBLE_DRIVER : EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_INSTANCES And avkInstLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_INSTANCES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
@@ -235,10 +350,14 @@ Procedure.i AnvilVkDeviceCreate(physical.i, *out)
   Define p.i
   Define s.i
   Define q.i
+  Define rc.i
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, 0)
   p = avkPhysSlot(physical)
   If p = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  ; The backend gets its one chance to refuse before any object exists.
+  rc = avkBackendPrepare()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_DEVICES And avkDevLive[s] <> 0 : s = s + 1 : Wend
   q = 1
@@ -320,194 +439,9 @@ Procedure.i AnvilVkCommandBufferAllocate(device.i, pool.i, level.i, *out)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-Procedure.i AnvilVkCommandBufferBegin(commandBuffer.i, flags.i)
-  Define c.i
-  c = avkCmdSlot(commandBuffer)
-  If c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If avkCmdState[c] <> #ANVIL_VK_CB_INITIAL : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  If (flags & (~(#VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | #VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT | #VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))) <> 0
-    ProcedureReturn #ANVIL_VK_ERR_ARGS
-  EndIf
-  If avkCmdLevel[c] = #VK_COMMAND_BUFFER_LEVEL_PRIMARY And (flags & #VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) <> 0
-    ProcedureReturn #ANVIL_VK_ERR_ARGS
-  EndIf
-  avkCmdBeginFlags[c] = flags
-  avkCmdOps[c] = 0
-  avkCmdState[c] = #ANVIL_VK_CB_RECORDING
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkTestRecordUnsupported(commandBuffer.i)
-  Define c.i
-  c = avkCmdSlot(commandBuffer)
-  If c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  avkCmdOps[c] = avkCmdOps[c] + 1
-  ProcedureReturn #ANVIL_VK_OK
-EndProcedure
-
-Procedure.i AnvilVkCommandBufferEnd(commandBuffer.i)
-  Define c.i
-  c = avkCmdSlot(commandBuffer)
-  If c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  avkCmdState[c] = #ANVIL_VK_CB_EXECUTABLE
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkCommandBufferReset(commandBuffer.i, flags.i)
-  Define c.i
-  Define p.i
-  c = avkCmdSlot(commandBuffer)
-  If c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If (flags & (~#VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT)) <> 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
-  p = avkCmdPool[c]
-  If (avkPoolFlags[p] & #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT) = 0
-    ProcedureReturn #ANVIL_VK_ERR_STATE
-  EndIf
-  If avkCmdState[c] = #ANVIL_VK_CB_PENDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  avkCmdState[c] = #ANVIL_VK_CB_INITIAL
-  avkCmdBeginFlags[c] = 0
-  avkCmdOps[c] = 0
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkCommandPoolReset(device.i, pool.i, flags.i)
-  Define d.i
-  Define p.i
-  Define c.i
-  d = avkDevSlot(device)
-  p = avkPoolSlot(pool)
-  If d = 0 Or p = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If (flags & (~#VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT)) <> 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
-  If avkPoolDev[p] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
-  c = 1
-  While c <= #ANVIL_VK_MAX_COMMAND_BUFFERS
-    If avkCmdLive[c] <> 0 And avkCmdPool[c] = p
-      If avkCmdState[c] = #ANVIL_VK_CB_PENDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-    EndIf
-    c = c + 1
-  Wend
-  c = 1
-  While c <= #ANVIL_VK_MAX_COMMAND_BUFFERS
-    If avkCmdLive[c] <> 0 And avkCmdPool[c] = p
-      avkCmdState[c] = #ANVIL_VK_CB_INITIAL
-      avkCmdBeginFlags[c] = 0
-      avkCmdOps[c] = 0
-    EndIf
-    c = c + 1
-  Wend
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkQueueSubmitEmpty(queue.i, commandBuffer.i)
-  Define q.i
-  Define c.i
-  Define p.i
-  q = avkQueueSlot(queue)
-  c = avkCmdSlot(commandBuffer)
-  If q = 0 Or c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  p = avkCmdPool[c]
-  If avkQueueDev[q] <> avkPoolDev[p] : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
-  If avkCmdLevel[c] <> #VK_COMMAND_BUFFER_LEVEL_PRIMARY : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  If avkCmdState[c] <> #ANVIL_VK_CB_EXECUTABLE : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  If avkCmdOps[c] <> 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
-  avkCmdState[c] = #ANVIL_VK_CB_PENDING
-  ; The test backend has no asynchronous work. Completion is immediate.
-  If (avkCmdBeginFlags[c] & #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) <> 0
-    avkCmdState[c] = #ANVIL_VK_CB_INVALID
-  Else
-    avkCmdState[c] = #ANVIL_VK_CB_EXECUTABLE
-  EndIf
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
 Procedure.i AnvilVkCommandBufferState(commandBuffer.i)
   Define c.i
   c = avkCmdSlot(commandBuffer)
   If c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   ProcedureReturn avkCmdState[c]
-EndProcedure
-
-Procedure.i AnvilVkCommandBufferFree(device.i, pool.i, commandBuffer.i)
-  Define d.i
-  Define p.i
-  Define c.i
-  d = avkDevSlot(device)
-  p = avkPoolSlot(pool)
-  c = avkCmdSlot(commandBuffer)
-  If d = 0 Or p = 0 Or c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If avkPoolDev[p] <> d Or avkCmdPool[c] <> p : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
-  If avkCmdState[c] = #ANVIL_VK_CB_PENDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-  avkCmdLive[c] = 0
-  avkCmdState[c] = #ANVIL_VK_CB_INVALID
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkCommandPoolDestroy(device.i, pool.i)
-  Define d.i
-  Define p.i
-  Define c.i
-  d = avkDevSlot(device)
-  p = avkPoolSlot(pool)
-  If d = 0 Or p = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If avkPoolDev[p] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
-  c = 1
-  While c <= #ANVIL_VK_MAX_COMMAND_BUFFERS
-    If avkCmdLive[c] <> 0 And avkCmdPool[c] = p
-      If avkCmdState[c] = #ANVIL_VK_CB_PENDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
-      avkCmdLive[c] = 0
-      avkCmdState[c] = #ANVIL_VK_CB_INVALID
-    EndIf
-    c = c + 1
-  Wend
-  avkPoolLive[p] = 0
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkDeviceDestroy(device.i)
-  Define d.i
-  Define p.i
-  Define q.i
-  d = avkDevSlot(device)
-  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  p = 1
-  While p <= #ANVIL_VK_MAX_COMMAND_POOLS
-    If avkPoolLive[p] <> 0 And avkPoolDev[p] = d
-      AnvilVkCommandPoolDestroy(device, avkToken(#ANVIL_VK_TYPE_COMMAND_POOL, p, avkPoolGen[p]))
-    EndIf
-    p = p + 1
-  Wend
-  q = 1
-  While q <= #ANVIL_VK_MAX_QUEUES
-    If avkQueueLive[q] <> 0 And avkQueueDev[q] = d : avkQueueLive[q] = 0 : EndIf
-    q = q + 1
-  Wend
-  avkDevLive[d] = 0
-  ProcedureReturn #VK_SUCCESS
-EndProcedure
-
-Procedure.i AnvilVkInstanceDestroy(instance.i)
-  Define s.i
-  Define p.i
-  Define d.i
-  s = avkInstSlot(instance)
-  If s = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  d = 1
-  While d <= #ANVIL_VK_MAX_DEVICES
-    If avkDevLive[d] <> 0
-      p = avkDevPhys[d]
-      If avkPhysLive[p] <> 0 And avkPhysInst[p] = s
-        AnvilVkDeviceDestroy(avkToken(#ANVIL_VK_TYPE_DEVICE, d, avkDevGen[d]))
-      EndIf
-    EndIf
-    d = d + 1
-  Wend
-  p = 1
-  While p <= #ANVIL_VK_MAX_PHYSICAL_DEVICES
-    If avkPhysLive[p] <> 0 And avkPhysInst[p] = s : avkPhysLive[p] = 0 : EndIf
-    p = p + 1
-  Wend
-  avkInstLive[s] = 0
-  ProcedureReturn #VK_SUCCESS
 EndProcedure
