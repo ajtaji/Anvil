@@ -47,6 +47,11 @@
 ;                      sentence `net` prints under it.
 ;      leaseSecs       what a server granted, 0 when it was not a lease
 ;      leaseAt         millis() when it was granted
+;      rxOwner         WHICH interface a running command is taking frames
+;                      off, so that the console's pump does not read the
+;                      same queue and throw away what it cannot deliver.
+;                      See ONE CONSUMER OF AN INTERFACE'S RECEIVE QUEUE
+;                      below for the transfer this was measured on.
 ;
 ;  and the POLICY questions, which are the reason a caller comes here at
 ;  all: does this interface hold an address, can it carry a frame right
@@ -463,6 +468,73 @@ Procedure.i NetIfNext(after.i)
   ProcedureReturn #HW_LINK_NONE
 EndProcedure
 
+; ======================================================================
+;  ONE CONSUMER OF AN INTERFACE'S RECEIVE QUEUE AT A TIME
+; ======================================================================
+;  A frame comes off a queue exactly once. So a queue with two readers
+;  has a rule whether anybody writes one down or not, and when nobody
+;  does, the rule is "whichever reader got there first decides" - which
+;  means the reader that cannot deliver what it took throws it away and
+;  nothing anywhere reports a loss.
+;
+;  THAT RULE IS ALREADY WRITTEN ONCE IN THIS TREE, one layer down, in
+;  HwLinkConsoleArmed's header: "two consumers of one firmware queue
+;  means whichever one does not deliver keystrokes silently eats them",
+;  which is why the radio's own rekey pump stands down when the console
+;  consumes the radio's queue. This is the same rule for the other pair
+;  of readers, and it was missing.
+;
+;  WHAT IT COST - MEASURED ON THE BOARD, 2026-09-11, build 55.
+;  `put` over the direct cable acknowledged three blocks and then stalled
+;  for its whole retransmit budget with "every retry was spent with no
+;  answer". There are two frame consumers inside a transfer's loop: the
+;  transfer's own pump, and the CONSOLE's pump, which every turn of that
+;  loop reaches through OutBreak() while asking whether a key has been
+;  pressed. The console's pump drains the whole queue, hands each frame
+;  to the one dispatcher, and drops whatever the dispatcher does not
+;  claim - and a transfer's acknowledgement is exactly that: a datagram
+;  no automatic service owns, because a command is waiting for it. One
+;  stolen acknowledgement was enough. The board went on resending the
+;  same block into a receiver that does not answer a duplicate, so the
+;  two ends sat in silence until the budget ran out.
+;
+;  SO A RUNNING COMMAND SAYS WHICH QUEUE IS ITS OWN, and the console's
+;  pump leaves that one alone for as long as it is claimed. Nothing is
+;  lost by standing down: the command's pump feeds the SAME dispatcher,
+;  so console keystrokes, ARP, ICMP, TCP and the DHCP service are all
+;  still answered on that interface during the command - and the
+;  console's output flush is not a consumer of the queue at all and
+;  keeps running.
+;
+;  ONE SCALAR, BECAUSE THERE IS ONE COMMAND. This monitor runs one
+;  command at a time and a transfer holds one interface, so an owner is
+;  a single kind rather than a flag per interface - a table would be a
+;  second way to say something that cannot be true twice. The other
+;  interfaces are untouched: a transfer on the cable does not stop the
+;  console pumping the radio.
+;
+;  IT IS RELEASED BY THE COMMAND THAT TOOK IT, on every way out. A claim
+;  that leaked would be a console that had gone deaf on one interface
+;  with nothing to see, so the release is not left to a success path.
+; ======================================================================
+Global netif_rxOwner.i = #HW_LINK_NONE
+
+Procedure NetIfClaimRx(kind.i)
+  If netif_Valid(kind) = 0
+    ProcedureReturn
+  EndIf
+  netif_rxOwner = kind
+EndProcedure
+
+Procedure NetIfReleaseRx()
+  netif_rxOwner = #HW_LINK_NONE
+EndProcedure
+
+; Which interface a running command is consuming, or #HW_LINK_NONE.
+Procedure.i NetIfRxOwner()
+  ProcedureReturn netif_rxOwner
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  NetIfReset - forget every interface. Called from the same places
 ;  NetInit() is: a controller that has been restarted holds nothing.
@@ -470,6 +542,11 @@ EndProcedure
 ;  THE ADDRESSES ARE net.pi4's AND NetReset() CLEARS THEM. This clears
 ;  the provenance beside them, and the two are called together for the
 ;  same reason they are written together.
+;
+;  THE RECEIVE CLAIM GOES WITH THEM. A controller that has been
+;  restarted is carrying nobody's conversation, so a claim that survived
+;  it would silence the console's pump on an interface with no command
+;  behind it.
 ; ----------------------------------------------------------------------
 Procedure NetIfReset()
   Define k.i
@@ -478,4 +555,5 @@ Procedure NetIfReset()
     netif_leaseSecs[k] = 0
     netif_leaseAt[k] = 0
   Next
+  netif_rxOwner = #HW_LINK_NONE
 EndProcedure

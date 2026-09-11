@@ -239,9 +239,15 @@ EndProcedure
 ;  WHY THIS EXISTS. Until ping, dns and dhcp were added, this bring-up
 ;  was one inline body inside EthUp. Those three need the SAME controller
 ;  bring-up with different amounts of configuration on top: dhcp needs no
-;  IP at all (it has none yet), ping and dns need three addresses and not
-;  the TFTP server, get and put need all four. One shared core is the
-;  reason the four paths cannot drift about how the GENET comes up.
+;  IP at all (it has none yet), ping and dns need a destination, and get
+;  and put need the TFTP server. One shared core is the reason the four
+;  paths cannot drift about how the GENET comes up.
+;
+;  THAT SENTENCE USED TO END "get and put need all four", which stopped
+;  being true on 2026-09-10: none of these four commands reads an address
+;  out of the settings store on its way in any more. Each asks which
+;  interface can reach the machine it is talking to and sources from what
+;  that interface is already holding.
 ;
 ;  IT CLEARS NO ADDRESS ROW. It used to call NetInit(), which reset the
 ;  whole stack, and was narrowed to NetClearIPv4(WIRED). That was still

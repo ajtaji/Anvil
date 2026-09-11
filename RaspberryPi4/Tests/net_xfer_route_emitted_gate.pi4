@@ -63,6 +63,14 @@ Global gate_bindAllow.i
 Global gate_tftpInits.i
 Global gate_sayInterfaces.i
 Global gate_millis.i
+; The receive-queue claim. A transfer pumps its own interface from the
+; resolve onwards, so it must take that interface's queue before the
+; first frame can arrive - otherwise the console's pump reads the same
+; queue and drops what no automatic service owns, which is exactly a
+; transfer's acknowledgement. See ONE CONSUMER OF AN INTERFACE'S RECEIVE
+; QUEUE in Anvil/Core/netif.pbi.
+Global gate_claimCalls.i
+Global gate_claimKind.i
 
 Procedure GateClear()
   Define k.i
@@ -94,6 +102,8 @@ Procedure GateClear()
   gate_bindAllow = 1
   gate_tftpInits = 0
   gate_sayInterfaces = 0
+  gate_claimCalls = 0
+  gate_claimKind = #HW_LINK_NONE
   gEthSrv = 0
   ; gXferKind is NOT cleared here. It is declared by the production block
   ; below this procedure, and EthStart clears it on entry - which is part
@@ -281,6 +291,11 @@ Procedure.i LinkKind()
   ProcedureReturn gate_selected
 EndProcedure
 
+Procedure NetIfClaimRx(kind.i)
+  gate_claimCalls = gate_claimCalls + 1
+  gate_claimKind = kind
+EndProcedure
+
 Procedure.i NetResolveHop(k.i, ip.i)
   gate_resolveCalls = gate_resolveCalls + 1
   gate_resolveKind = k
@@ -344,6 +359,13 @@ Procedure.i Main()
   If gate_ip[#HW_LINK_WIRED] <> $A9FEAAFA : ProcedureReturn 10 : EndIf
   If gate_altIp[#HW_LINK_WIRED] <> $C0A88901 : ProcedureReturn 11 : EndIf
   If gate_ip[#HW_LINK_WIFI] <> $C0A80114 : ProcedureReturn 12 : EndIf
+  ; THE INTERFACE'S RECEIVE QUEUE IS CLAIMED, AND BEFORE ANYTHING PUMPS.
+  ; Everything from the resolve onwards waits for frames on this
+  ; interface, and a second reader of the same queue drops what no
+  ; automatic service owns - which is every reply this transfer is
+  ; waiting for. Measured on the board 2026-09-11, build 55.
+  If gate_claimCalls <> 1 : ProcedureReturn 13 : EndIf
+  If gate_claimKind <> #HW_LINK_WIRED : ProcedureReturn 14 : EndIf
 
   ; ------------------------------------------------------------------
   ; 2. THE SERVER IS ON THE RADIO'S SUBNET WHILE THE CABLE IS SELECTED.
@@ -356,11 +378,13 @@ Procedure.i Main()
   gate_haveServer = 1
   gate_serverText = $C0A8010F                  ; 192.168.1.15
   port = EthStart()
-  If port = 0 : ProcedureReturn 13 : EndIf
-  If XferKind() <> #HW_LINK_WIFI : ProcedureReturn 14 : EndIf
-  If gate_resolveKind <> #HW_LINK_WIFI : ProcedureReturn 15 : EndIf
-  If gate_bindKind <> #HW_LINK_WIFI : ProcedureReturn 16 : EndIf
-  If gate_setIpCalls <> 0 : ProcedureReturn 17 : EndIf
+  If port = 0 : ProcedureReturn 15 : EndIf
+  If XferKind() <> #HW_LINK_WIFI : ProcedureReturn 16 : EndIf
+  If gate_resolveKind <> #HW_LINK_WIFI : ProcedureReturn 17 : EndIf
+  If gate_bindKind <> #HW_LINK_WIFI : ProcedureReturn 18 : EndIf
+  If gate_setIpCalls <> 0 : ProcedureReturn 19 : EndIf
+  ; The queue claimed is the ROUTED one, not the selected one.
+  If gate_claimKind <> #HW_LINK_WIFI : ProcedureReturn 20 : EndIf
 
   ; ------------------------------------------------------------------
   ; 3. THE LINK-LOCAL PRIMARY, not the alias. A server that has given
@@ -372,9 +396,9 @@ Procedure.i Main()
   gate_haveServer = 1
   gate_serverText = $A9FEB743                  ; 169.254.183.67
   port = EthStart()
-  If port = 0 : ProcedureReturn 18 : EndIf
-  If XferKind() <> #HW_LINK_WIRED : ProcedureReturn 19 : EndIf
-  If gate_bindKind <> #HW_LINK_WIRED : ProcedureReturn 20 : EndIf
+  If port = 0 : ProcedureReturn 21 : EndIf
+  If XferKind() <> #HW_LINK_WIRED : ProcedureReturn 22 : EndIf
+  If gate_bindKind <> #HW_LINK_WIRED : ProcedureReturn 23 : EndIf
 
   ; ------------------------------------------------------------------
   ; 4. A LEASE IS NOT SPECIAL. The same board, wired holding an ordinary
@@ -391,9 +415,9 @@ Procedure.i Main()
   gate_haveServer = 1
   gate_serverText = $8CB84D22                  ; 140.184.77.34, off-link
   port = EthStart()
-  If port = 0 : ProcedureReturn 21 : EndIf
-  If XferKind() <> #HW_LINK_WIRED : ProcedureReturn 22 : EndIf
-  If gate_setIpCalls <> 0 : ProcedureReturn 23 : EndIf
+  If port = 0 : ProcedureReturn 24 : EndIf
+  If XferKind() <> #HW_LINK_WIRED : ProcedureReturn 25 : EndIf
+  If gate_setIpCalls <> 0 : ProcedureReturn 26 : EndIf
 
   ; ------------------------------------------------------------------
   ; 5. NO SERVER AT ALL. The one refusal a transfer is entitled to, and
@@ -402,27 +426,28 @@ Procedure.i Main()
   GateSeedBench()
   gate_selected = #HW_LINK_WIRED
   gate_haveServer = 0
-  If EthStart() <> 0 : ProcedureReturn 24 : EndIf
-  If gate_openCalls <> 0 : ProcedureReturn 25 : EndIf
-  If gate_resolveCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 26 : EndIf
-  If gate_tftpInits <> 0 : ProcedureReturn 27 : EndIf
-  If XferKind() <> #HW_LINK_NONE : ProcedureReturn 28 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 27 : EndIf
+  If gate_openCalls <> 0 : ProcedureReturn 28 : EndIf
+  If gate_resolveCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 29 : EndIf
+  If gate_tftpInits <> 0 : ProcedureReturn 30 : EndIf
+  If XferKind() <> #HW_LINK_NONE : ProcedureReturn 31 : EndIf
+  If gate_claimCalls <> 0 : ProcedureReturn 32 : EndIf
 
   ; 6. 0.0.0.0 is not a machine.
   GateSeedBench()
   gate_selected = #HW_LINK_WIRED
   gate_haveServer = 1
   gate_serverText = 0
-  If EthStart() <> 0 : ProcedureReturn 29 : EndIf
-  If gate_openCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 30 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 33 : EndIf
+  If gate_openCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 34 : EndIf
 
   ; 7. A value that is not four numbers separated by full stops.
   GateSeedBench()
   gate_selected = #HW_LINK_WIRED
   gate_haveServer = 1
   gate_serverText = -1
-  If EthStart() <> 0 : ProcedureReturn 31 : EndIf
-  If gate_openCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 32 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 35 : EndIf
+  If gate_openCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 36 : EndIf
 
   ; ------------------------------------------------------------------
   ; 8. NO INTERFACE CAN REACH IT. The board holds a link-local address
@@ -437,12 +462,16 @@ Procedure.i Main()
   gate_selected = #HW_LINK_WIRED
   gate_haveServer = 1
   gate_serverText = $0A0A0A0A
-  If EthStart() <> 0 : ProcedureReturn 33 : EndIf
-  If gate_openCalls <> 1 : ProcedureReturn 34 : EndIf
-  If gate_sayInterfaces <> 1 : ProcedureReturn 35 : EndIf
-  If gate_resolveCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 36 : EndIf
-  If XferKind() <> #HW_LINK_NONE : ProcedureReturn 37 : EndIf
-  If gate_setIpCalls <> 0 : ProcedureReturn 38 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 37 : EndIf
+  If gate_openCalls <> 1 : ProcedureReturn 38 : EndIf
+  If gate_sayInterfaces <> 1 : ProcedureReturn 39 : EndIf
+  If gate_resolveCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 40 : EndIf
+  If XferKind() <> #HW_LINK_NONE : ProcedureReturn 41 : EndIf
+  If gate_setIpCalls <> 0 : ProcedureReturn 42 : EndIf
+  ; Nothing was routed, so no queue was taken: a claim left behind here
+  ; would be a console that had stopped reading an interface for a
+  ; transfer that never began.
+  If gate_claimCalls <> 0 : ProcedureReturn 43 : EndIf
 
   ; 9. The board refuses to open any interface at all.
   GateSeedBench()
@@ -450,9 +479,10 @@ Procedure.i Main()
   gate_haveServer = 1
   gate_serverText = $C0A88902
   gate_openAllow = 0
-  If EthStart() <> 0 : ProcedureReturn 39 : EndIf
-  If gate_openCalls <> 1 : ProcedureReturn 40 : EndIf
-  If gate_resolveCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 41 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 44 : EndIf
+  If gate_openCalls <> 1 : ProcedureReturn 45 : EndIf
+  If gate_resolveCalls <> 0 Or gate_bindCalls <> 0 : ProcedureReturn 46 : EndIf
+  If gate_claimCalls <> 0 : ProcedureReturn 47 : EndIf
 
   ; 10. The next hop never answers. The session interface was chosen, so
   ;     the refusal is about the neighbour and not about the route; the
@@ -462,9 +492,12 @@ Procedure.i Main()
   gate_haveServer = 1
   gate_serverText = $C0A88902
   gate_resolveAllow = 0
-  If EthStart() <> 0 : ProcedureReturn 42 : EndIf
-  If gate_resolveCalls <> 1 Or gate_resolveKind <> #HW_LINK_WIRED : ProcedureReturn 43 : EndIf
-  If gate_bindCalls <> 0 : ProcedureReturn 44 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 48 : EndIf
+  If gate_resolveCalls <> 1 Or gate_resolveKind <> #HW_LINK_WIRED : ProcedureReturn 49 : EndIf
+  If gate_bindCalls <> 0 : ProcedureReturn 50 : EndIf
+  ; The claim is taken BEFORE the resolve, because the resolve is the
+  ; first thing that pumps.
+  If gate_claimCalls <> 1 Or gate_claimKind <> #HW_LINK_WIRED : ProcedureReturn 51 : EndIf
 
   ; 11. The stack will not listen on the transfer's own port.
   GateSeedBench()
@@ -472,8 +505,8 @@ Procedure.i Main()
   gate_haveServer = 1
   gate_serverText = $C0A88902
   gate_bindAllow = 0
-  If EthStart() <> 0 : ProcedureReturn 45 : EndIf
-  If gate_bindCalls <> 1 Or gate_bindKind <> #HW_LINK_WIRED : ProcedureReturn 46 : EndIf
+  If EthStart() <> 0 : ProcedureReturn 52 : EndIf
+  If gate_bindCalls <> 1 Or gate_bindKind <> #HW_LINK_WIRED : ProcedureReturn 53 : EndIf
 
   ; ------------------------------------------------------------------
   ; 12. THE COUNTERS ARE RESET BY EVERY START, including a refused one,
@@ -484,8 +517,8 @@ Procedure.i Main()
   gate_selected = #HW_LINK_WIRED
   gate_haveServer = 0
   EthStart()
-  If gEthFrames <> 0 Or gEthUdp <> 0 : ProcedureReturn 47 : EndIf
-  If gEthArpOut <> 0 Or gEthSendFail <> 0 : ProcedureReturn 48 : EndIf
+  If gEthFrames <> 0 Or gEthUdp <> 0 : ProcedureReturn 54 : EndIf
+  If gEthArpOut <> 0 Or gEthSendFail <> 0 : ProcedureReturn 55 : EndIf
 
   ProcedureReturn 0
 EndProcedure

@@ -907,6 +907,17 @@ Procedure.i EthStart()
   PrintN(",")
   PrintN("  which is the interface that can reach that server.")
 
+  ; ---- AND FROM HERE THIS COMMAND OWNS THAT INTERFACE'S QUEUE -------
+  ; Everything below pumps: the resolve waits for an ARP reply, and the
+  ; transfer waits for every acknowledgement. A second reader of the same
+  ; queue takes frames this command is waiting for and drops the ones no
+  ; automatic service claims - which is precisely a transfer's own
+  ; acknowledgement. See ONE CONSUMER OF AN INTERFACE'S RECEIVE QUEUE in
+  ; Anvil/Core/netif.pbi for the board run that measured it. The claim is
+  ; released at NetConsoleCommandDone, the point every arm of every
+  ; command converges on.
+  NetIfClaimRx(k)
+
   If NetResolveHop(k, gEthSrv) = 0
     ProcedureReturn 0
   EndIf
@@ -1448,14 +1459,38 @@ Procedure CmdNet()
       PrintN("  further down says where it came from.")
     EndIf
 
-    If set < 4
-      PrintN("Not all four addresses are in the settings store, so get and put would")
-      PrintN("refuse - they need a TFTP server and three addresses of their own. Set")
-      PrintN("them with net address, net netmask, net gateway and net server. Use")
+    ; ------------------------------------------------------------------
+    ; WHAT A TRANSFER ACTUALLY NEEDS, AND IT IS ONE LINE OF THE FOUR.
+    ; 2026-09-11.
+    ;
+    ; This paragraph said "not all four addresses are in the settings
+    ; store, so get and put would refuse" and it was TRUE until
+    ; 2026-09-10, when the transfer path stopped validating its
+    ; configuration by applying it and started routing by the server.
+    ; It went on being printed for a day after it stopped being true,
+    ; under a board that was holding three usable addresses and had just
+    ; completed the route it said would refuse - which is the monitor
+    ; telling somebody to type three things they do not need.
+    ;
+    ; THE THREE ARE STILL WORTH SETTING and this says what for: they are
+    ; the address this board answers to when no DHCP server does, saved
+    ; so a reset brings it back. They are simply not a precondition of
+    ; anything any more.
+    ; ------------------------------------------------------------------
+    If SettingsGet(EthKeyServer()) = 0
+      PrintN("No TFTP server is set, so get and put have nowhere to go. Set one with")
+      PrintN("net server <a.b.c.d> and they will work: a transfer needs THAT and")
+      PrintN("nothing else, because the board already knows which of its own")
+      PrintN("addresses can reach it and which interface carries them.")
+    ElseIf set < 4
+      PrintN("The server is set, so get and put will work. The other three are this")
+      PrintN("board's OWN address, saved for a link where nothing hands one out -")
+      PrintN("set them with net address, net netmask and net gateway, and use")
       PrintN("0.0.0.0 for the gateway when there is no router, which is the truth on")
-      PrintN("a cable straight between this board and one other machine. None of this")
-      PrintN("affects ping, the network console or net recv: those use whatever")
-      PrintN("address the board is holding, however it got it.")
+      PrintN("a cable straight between this board and one other machine. They are")
+      PrintN("not needed for a transfer and they are not needed by ping, the")
+      PrintN("network console or net recv: those use whatever address the board is")
+      PrintN("holding, however it got it.")
     EndIf
 
     If gEthMacKnown = 1
@@ -1819,16 +1854,42 @@ Procedure CmdNet()
     If SettingsHas(EthKeyServer()) <> 0
       n = n + 1
     EndIf
+    ; ------------------------------------------------------------------
+    ; THIS SAID "N OF THE FOUR ADDRESSES ARE STILL NOT SET, SO GET AND
+    ; PUT WOULD REFUSE" AND IT WAS NOT TRUE ANY MORE. 2026-09-11.
+    ;
+    ; It was true until 2026-09-10, when the transfer path stopped
+    ; validating its configuration by applying it. A transfer now asks
+    ; which interface can reach the server and sources from the address
+    ; that interface already holds, so the server is the only address it
+    ; waits on. The sentence stayed for a day, and the board printed it
+    ; on the bench the moment `net server` was typed - directly above a
+    ; `put` that then went out over the cable exactly as the fix says.
+    ; A monitor that tells somebody to type three keys they do not need,
+    ; in the same breath as doing the thing it says is impossible, is
+    ; the silent-wrong-answer failure wearing an instruction's clothes.
+    ; ------------------------------------------------------------------
+    If SettingsHas(EthKeyServer()) = 0
+      PrintN("  There is no TFTP server set, and that is the one address get and")
+      PrintN("  put cannot do without. Set it with net server <a.b.c.d>. The other")
+      PrintN("  three are this board's own address and no transfer waits on them.")
+      ProcedureReturn
+    EndIf
     If n < 4
+      PrintN("  get and put have what they need. A transfer asks which interface")
+      PrintN("  can reach that server, leaves by it, and sources from the address")
+      PrintN("  that interface is already holding, so the server is the only")
+      PrintN("  address it waits on. Type net to see what this board holds.")
       Print("  ")
       PrintDec(4 - n)
-      PrintN(" of the four addresses are still not set, so get and put would")
-      PrintN("  refuse. Type net to see which.")
+      PrintN(" of the four are still not in the store, and the missing ones")
+      PrintN("  are this board's OWN address - which a link with no DHCP server on")
+      PrintN("  it needs in order to come back with one after a reset.")
       ProcedureReturn
     EndIf
     If EthConfig() = 1
-      PrintN("  All four addresses are set and they agree with each other. get and")
-      PrintN("  put will bring the Ethernet up by themselves from here.")
+      PrintN("  All four are set and this board's own three agree with each other.")
+      PrintN("  get and put need the server alone, and it is there.")
     EndIf
     ProcedureReturn
   EndIf
@@ -1860,8 +1921,10 @@ Procedure CmdNet()
     Print("Forgotten ")
     PrintDec(n)
     PrintN(" of the four network addresses. The Ethernet itself is")
-    PrintN("untouched and stays up if it was up; it is the configuration that has")
-    PrintN("gone, and get and put will refuse until it is set again.")
+    PrintN("untouched and stays up if it was up, and the addresses the board is")
+    PrintN("HOLDING are untouched too - a lease and a link-local address are not")
+    PrintN("in the store and were not forgotten. What has gone is the saved copy,")
+    PrintN("so get and put refuse only if the TFTP server was one of them.")
     PrintN("  A copy is still in SETTINGS.TXT on the medium until you type")
     PrintN("  settings save. Until then a reset and a settings load bring it back.")
     ProcedureReturn
@@ -2078,6 +2141,12 @@ Procedure.i ResolveName(name.i)
     EndIf
   EndIf
 
+  ; This lookup pumps its own interface from here on, so it owns that
+  ; queue until the command ends - the same rule a transfer takes, and
+  ; for the same reason: a DNS reply is a datagram no automatic service
+  ; claims, so a second reader of the queue would drop it. See ONE
+  ; CONSUMER OF AN INTERFACE'S RECEIVE QUEUE in Anvil/Core/netif.pbi.
+  NetIfClaimRx(LinkKind())
   If NetResolveHop(LinkKind(), dnsIp) = 0
     ProcedureReturn -1
   EndIf
@@ -2241,6 +2310,10 @@ Procedure CmdPing()
   If NetLinkUpSay(1) = 0
     ProcedureReturn
   EndIf
+  ; An echo reply is not a datagram any automatic service owns either, so
+  ; this command takes its interface's queue for as long as it pumps it.
+  ; See ONE CONSUMER OF AN INTERFACE'S RECEIVE QUEUE in netif.pbi.
+  NetIfClaimRx(LinkKind())
   If NetResolveHop(LinkKind(), ip) = 0
     ProcedureReturn
   EndIf

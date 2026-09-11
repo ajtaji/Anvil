@@ -1,0 +1,1223 @@
+; Executable emitted-code gate for WHO READS AN INTERFACE'S RECEIVE
+; QUEUE WHILE A TRANSFER IS RUNNING.
+;
+; tools/net_xfer_pump_ownership_emitted_check.py replaces the markers
+; below with these production procedures, extracted verbatim:
+;
+;   NetServiceInput, netcon_PumpOne, NetConsolePump,
+;   NetConsoleCommandDone            Anvil/Core/netconsole.pbi
+;   OutBreakByte, OutBreak           Anvil/Core/rxbreak.pbi
+;   NetXferSend, NetXferPump, NetXferRun   Anvil/Core/net_cmd.pbi
+;
+; and it includes the REAL RaspberryPi4/Lib/net.pi4, Anvil/Core/netif.pbi,
+; RaspberryPi4/Lib/tftp.pi4 and RaspberryPi4/Lib/link.pi4 underneath them.
+; No protocol rule is reimplemented here: the TFTP client, the IPv4/UDP/ARP
+; layer, the interface policy and both pumps are the shipped code.
+;
+; WHAT IS BEING PROVED, and it is the defect measured on the board on
+; 2026-09-11 with build 55 flashed.
+; ----------------------------------------------------------------------
+; `put ktrc55.bin 57E00000 1000` over the direct cable acknowledged three
+; blocks - 1536 bytes - and then stalled for its whole retransmit budget:
+; "frames received 5, datagrams for us 3, blocks 3, retransmissions 11,
+; gave up - every retry was spent with no answer". Twice, identically.
+;
+; There are TWO consumers of the wired queue inside a transfer's loop.
+; NetXferRun calls OutBreak() on every turn to ask whether a key has been
+; pressed, OutBreak reaches the console's own pump, and that pump DRAINS
+; the interface and drops every datagram its dispatcher does not claim -
+; which is precisely a transfer's acknowledgement, because a command is
+; waiting for it and no automatic service owns it. The board holds an
+; address on the cable AND on the radio, so LinkPumpAllNet spends each
+; 200 ms slice blocked on ONE of them; a reply that lands on the other
+; one during that slice is still in the queue when OutBreak next runs,
+; and the console's pump takes it. One stolen acknowledgement is enough:
+; the receiver does not answer a duplicate data block, so both ends then
+; sit in silence until the budget runs out.
+;
+; THE FIXTURE REPRODUCES THAT EXACTLY rather than describing it. The
+; modelled interface hands a frame back only when its delivery time has
+; come, and a blocking receive advances the clock - so a reply that
+; becomes due while the pump is parked on the other interface is left in
+; the queue, which is the whole of the race. The fairness cursor is
+; placed on the radio before each case, which is where it is half the
+; time on a two-interface board.
+;
+; THE MODELLED SERVER IS THE BENCH'S OWN, including the two behaviours
+; that turn one lost acknowledgement into a deadlock: it serves one
+; client at a time and ignores a repeated request, and it does not
+; answer a duplicate data block. Both are settable, so the gate can also
+; show the ordinary case where a lost acknowledgement is recovered by
+; the sender's own timer.
+;
+; WHAT IS NOT PROVED HERE: no hardware is touched. The wire, the peer
+; machine and the console's keystroke ring are modelled seams.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+#HW_LINK_UART  = 3
+#HW_LINK_USB   = 4
+#HW_LINK_FILE  = 5
+#HW_LINK_SPEED_UNKNOWN = -1
+#HW_LINK_DUPLEX_UNKNOWN = -1
+#LINK_RX_BUDGET = 64
+
+; Anvil/Hal/hal.pbi's console port and Anvil/Core/netconsole.pbi's
+; receive buffer size, restated because this fixture does not include
+; either file. The DHCP ports are net.pi4's.
+#NETCON_PORT     = 5555
+#NETCON_RX_MAX   = 1536
+#DHCP_PORT_SERVER = 67
+#DHCP_PORT_CLIENT = 68
+#DHCPC_INIT       = 0
+
+; RaspberryPi4/Board/eth_globals.pi4's transfer budget, restated: a
+; 200 ms slice, a 2 s retransmit timer, eight retries, a ten-minute
+; ceiling and a dot every 64 blocks.
+#ETH_SLICE_MS   = 200
+#ETH_RETRY_MS   = 2000
+#ETH_RETRIES    = 8
+#ETH_MAX_MS     = 600000
+#ETH_DOT_BLOCKS = 64
+
+; ======================================================================
+;  THE CLOCK
+; ======================================================================
+;  Milliseconds, advanced only by a blocking receive and by the fixture.
+;  Nothing here reads real time, so a two-second retransmit timer costs
+;  no wall clock at all.
+Global gate_now.i
+
+Procedure.i millis()
+  ProcedureReturn gate_now
+EndProcedure
+
+Procedure.i Micros()
+  ProcedureReturn gate_now * 1000
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/net.pi4"
+
+; ======================================================================
+;  THE MODELLED INTERFACE - A QUEUE PER KIND, WITH A DELIVERY TIME
+; ======================================================================
+#GATE_FRAME = 640                 ; the largest frame either side builds
+#GATE_SLOTS = 12                  ; frames a queue can hold
+
+Global Dim gate_qBuf.a[2 * #GATE_SLOTS * #GATE_FRAME]
+Global Dim gate_qLen.i[2 * #GATE_SLOTS]
+Global Dim gate_qDue.i[2 * #GATE_SLOTS]
+Global Dim gate_qHead.i[3]
+Global Dim gate_qTail.i[3]
+Global Dim gate_ready.a[6]
+Global Dim gate_mac.a[36]
+Global Dim gate_rxPtr.i[6]
+Global Dim gate_scratch.a[#GATE_FRAME]
+
+Global gate_txFrames.i
+Global gate_dropped.i             ; frames a queue had no room for
+
+Procedure.i gate_Slot(kind.i, i.i)
+  ProcedureReturn ((kind - 1) * #GATE_SLOTS) + (i % #GATE_SLOTS)
+EndProcedure
+
+Procedure GateQueueClear()
+  Define k.i
+  For k = 0 To 2
+    gate_qHead[k] = 0
+    gate_qTail[k] = 0
+  Next
+EndProcedure
+
+; Put one built frame on `kind`'s queue, deliverable `delay` ms from now.
+Procedure GateQueue(kind.i, *src, n.i, delay.i)
+  Define s.i
+  Define i.i
+  If kind < 1 Or kind > 2 Or n < 14 Or n > #GATE_FRAME
+    gate_dropped = gate_dropped + 1
+    ProcedureReturn
+  EndIf
+  If (gate_qTail[kind] - gate_qHead[kind]) >= #GATE_SLOTS
+    gate_dropped = gate_dropped + 1
+    ProcedureReturn
+  EndIf
+  s = gate_Slot(kind, gate_qTail[kind])
+  i = 0
+  While i < n
+    gate_qBuf[s * #GATE_FRAME + i] = PeekA(*src + i) & $FF
+    i = i + 1
+  Wend
+  gate_qLen[s] = n
+  gate_qDue[s] = gate_now + delay
+  gate_qTail[kind] = gate_qTail[kind] + 1
+EndProcedure
+
+; Hand back the head of `kind`'s queue if its time has come. 0 otherwise.
+Procedure.i gate_Take(kind.i, buf.i, max.i)
+  Define s.i
+  Define n.i
+  Define i.i
+  If gate_qHead[kind] >= gate_qTail[kind]
+    ProcedureReturn 0
+  EndIf
+  s = gate_Slot(kind, gate_qHead[kind])
+  If (gate_now - gate_qDue[s]) < 0
+    ProcedureReturn 0
+  EndIf
+  n = gate_qLen[s]
+  If n > max
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < n
+    PokeA(buf + i, gate_qBuf[s * #GATE_FRAME + i] & $FF)
+    i = i + 1
+  Wend
+  gate_qHead[kind] = gate_qHead[kind] + 1
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i HwLinkHas(kind.i)
+  If kind = #HW_LINK_WIRED Or kind = #HW_LINK_WIFI
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkReady(kind.i)
+  ProcedureReturn gate_ready[kind] & $FF
+EndProcedure
+
+Procedure.i HwLinkTxMax(kind.i)
+  If HwLinkHas(kind) <> 0
+    ProcedureReturn 1514
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkMacPtr(kind.i)
+  ProcedureReturn @gate_mac[kind * 6]
+EndProcedure
+
+Procedure.i HwLinkName(kind.i)
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn "the wired Ethernet"
+  EndIf
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn "the Wi-Fi radio"
+  EndIf
+  ProcedureReturn "no interface"
+EndProcedure
+
+Procedure.i HwLinkSpeed(kind.i)
+  ProcedureReturn 1000
+EndProcedure
+
+Procedure.i HwLinkDuplex(kind.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwLinkWhyText(kind.i)
+  ProcedureReturn ""
+EndProcedure
+
+Procedure.i HwLinkOfferRaw(kind.i, *frame, n.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwLinkNoteRx(kind.i, rc.i)
+EndProcedure
+
+Procedure HwLinkConsoleArmed(kind.i, on.i)
+EndProcedure
+
+Procedure.i HwLinkRxPtr(kind.i)
+  ProcedureReturn gate_rxPtr[kind]
+EndProcedure
+
+; The peer machine is defined below and is what a transmitted frame
+; reaches. Declared to the reader here; the language resolves it.
+Declare GatePeer(kind.i, *frame, n.i)
+
+Procedure.i HwLinkSend(kind.i, *buf, n.i, ms.i)
+  If HwLinkHas(kind) = 0 Or gate_ready[kind] = 0 Or *buf = 0
+    ProcedureReturn 0
+  EndIf
+  If n < 14 Or n > #GATE_FRAME
+    ProcedureReturn 0
+  EndIf
+  gate_txFrames = gate_txFrames + 1
+  GatePeer(kind, *buf, n)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkRecv - THE SHAPE OF THE RACE, AND THE ONLY PLACE TIME PASSES.
+;
+;  A frame is handed back only once its delivery time has come. A
+;  BLOCKING receive (ms > 0) advances the clock by its whole slice and
+;  then looks once more - so a frame that became deliverable on ANOTHER
+;  interface during that slice is still sitting in its own queue when
+;  the caller returns, which is exactly what the board does while
+;  LinkPumpAllNet is parked on the radio. A poll (ms = 0) never moves
+;  the clock, which is what both pumps use for their non-blocking looks.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkRecv(kind.i, buf.i, max.i, ms.i)
+  Define n.i
+  gate_rxPtr[kind] = 0
+  If HwLinkHas(kind) = 0 Or gate_ready[kind] = 0
+    ProcedureReturn 0
+  EndIf
+  n = gate_Take(kind, buf, max)
+  If n > 0
+    gate_rxPtr[kind] = buf
+    ProcedureReturn n
+  EndIf
+  If ms > 0
+    gate_now = gate_now + ms
+    n = gate_Take(kind, buf, max)
+    If n > 0
+      gate_rxPtr[kind] = buf
+      ProcedureReturn n
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "Anvil/Core/netif.pbi"
+XIncludeFile "RaspberryPi4/Lib/tftp.pi4"
+
+; ======================================================================
+;  THE CONSOLE'S SEAMS - EVERYTHING THE TWO PUMPS TOUCH THAT IS NOT
+;  ABOUT WHO OWNS THE QUEUE
+; ======================================================================
+Global gConOn.i
+Global gConLastPump.i
+Global gConMemberMask.i
+Global gConRxFrames.i
+Global gConRxFull.i
+Global Dim gConRx.a[#NETCON_RX_MAX]
+
+; The keystroke ring the console's dispatcher fills and OutBreak reads.
+#GATE_CON_RING = 64
+Global Dim gate_conRing.a[#GATE_CON_RING]
+Global gate_conIn.i
+Global gate_conOut.i
+Global gate_conTaken.i            ; console datagrams the dispatcher took
+Global gate_serviceTaken.i        ; DHCP-service datagrams it took
+Global gate_flushes.i
+Global gate_forgotten.i
+
+Procedure NetConsoleFlush()
+  gate_flushes = gate_flushes + 1
+EndProcedure
+
+Procedure netcon_ForgetOwner()
+  gate_forgotten = gate_forgotten + 1
+EndProcedure
+
+Procedure netcon_SendStaged(kind.i)
+  LinkTxStagedOn(kind)
+EndProcedure
+
+Procedure NetConsoleClaimLocal()
+EndProcedure
+
+Procedure.i NetConsoleGetc()
+  Define c.i
+  If gate_conOut >= gate_conIn
+    ProcedureReturn -1
+  EndIf
+  c = gate_conRing[gate_conOut % #GATE_CON_RING] & $FF
+  gate_conOut = gate_conOut + 1
+  ProcedureReturn c
+EndProcedure
+
+; The console's own take, modelled: port 67 belongs to the direct-cable
+; DHCP server this board runs, port 5555 to the console, and everything
+; else belongs to whichever command bound it. That last answer - zero -
+; is the one this gate is about.
+Procedure.i NetConsoleOfferUdp(*frame, kind.i)
+  Define i.i
+  Define pd.i
+  If NetUdpRxDstPort() = #DHCP_PORT_SERVER
+    gate_serviceTaken = gate_serviceTaken + 1
+    ProcedureReturn 1
+  EndIf
+  If gConOn = 0
+    ProcedureReturn 0
+  EndIf
+  If NetUdpRxDstPort() <> #NETCON_PORT
+    ProcedureReturn 0
+  EndIf
+  gate_conTaken = gate_conTaken + 1
+  pd = NetUdpRxData()
+  i = 0
+  While i < NetUdpRxLen()
+    gate_conRing[gate_conIn % #GATE_CON_RING] = PeekA(pd + i) & $FF
+    gate_conIn = gate_conIn + 1
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; Neither of these runs in this gate: no TCP segment and no DHCP client
+; transaction is ever queued. They are here because NetServiceInput is
+; extracted verbatim and names them.
+Procedure TcpInput()
+EndProcedure
+
+Procedure.i DhcpClientState(kind.i)
+  ProcedureReturn #DHCPC_INIT
+EndProcedure
+
+Procedure DhcpClientInput(kind.i, *p, n.i, now.i)
+EndProcedure
+
+Procedure.i NtpServiceInput(kind.i)
+  ProcedureReturn 0
+EndProcedure
+
+; @@PRODUCTION_SERVICE_INPUT@@
+
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+
+; ======================================================================
+;  PRINTING AND THE SERIAL SIDE ARE INERT
+; ======================================================================
+Procedure str_print_at(p.i) : EndProcedure
+Procedure PrintNl() : EndProcedure
+Procedure PrintDec(v.i) : EndProcedure
+Procedure UartWriteStr(p.i) : EndProcedure
+Procedure UartWrite(c.i) : EndProcedure
+Procedure UartDrain() : EndProcedure
+Procedure PutIp(ip.i) : EndProcedure
+
+; The serial console never has a byte waiting in this gate, so every
+; cancellation the fixture arranges arrives over the network - which is
+; the path that matters here.
+Procedure.i UartReadReady()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i UartRead()
+  ProcedureReturn -1
+EndProcedure
+
+; The transfer's counters, RaspberryPi4/Board/eth_globals.pi4's.
+Global gEthFrames.i
+Global gEthUdp.i
+Global gEthSendFail.i
+
+; @@PRODUCTION_CONSOLE_PUMP@@
+
+; @@PRODUCTION_COMMAND_DONE@@
+
+; @@PRODUCTION_OUTBREAK@@
+
+; @@PRODUCTION_XFER@@
+
+; ======================================================================
+;  THE PEER MACHINE
+; ======================================================================
+;  One host on the other end of the cable: it answers ARP for itself, it
+;  is the TFTP server, and it can be told to interleave a console or a
+;  DHCP-service datagram in the middle of a transfer.
+;
+;  IT IS THE BENCH'S OWN RECEIVER by default, in the two ways that
+;  matter and that the transcript of 2026-09-11 depends on:
+;
+;    * ONE CLIENT AT A TIME. The request socket is not read again while a
+;      transfer is in progress, so a retransmitted request is answered by
+;      nobody at all - which is why the first attempt of that night timed
+;      out at byte zero on the receiver rather than part way through.
+;    * NO ANSWER TO A DUPLICATE BLOCK. A data block it has already stored
+;      is skipped in silence, and its own idle timer is restarted by that
+;      block's arrival, so it never re-acknowledges. Set
+;      gate_srvDupAnswer to 1 for an ordinary receiver that does.
+; ======================================================================
+Global gate_peerIp.i
+Global gate_srvPort.i             ; the ephemeral port the server answers from
+Global gate_srvActive.i
+Global gate_srvBoardIp.i          ; the address the request came FROM
+Global gate_srvBoardPort.i
+Global gate_srvMode.i             ; 1 the board is writing, 2 the board is reading
+Global gate_srvBlock.i
+Global gate_srvBytes.i
+Global gate_srvSum.i
+Global gate_srvFileLen.i
+Global gate_srvLastLen.i          ; the length of the block just served
+Global gate_srvDone.i
+Global gate_srvRequests.i
+Global gate_srvDupData.i
+Global gate_srvDupAnswer.i
+Global gate_srvDropAck.i          ; drop the acknowledgement for this block, once
+Global gate_srvDelay.i            ; how long a reply takes to arrive
+Global gate_srvInjectAt.i         ; after this block, inject the datagram below
+Global gate_srvInjectKind.i       ; 1 console, 2 DHCP service, 0 none
+Global gate_srvArpAnswers.i
+Global gate_srvReplies.i
+; A server whose acknowledgement arrives twice - a duplicated frame on
+; the segment, which is ordinary. The sender must NOT answer the second
+; copy by resending: that is the Sorcerer's Apprentice bug and it
+; doubles every packet for the rest of the transfer.
+Global gate_srvDoubleAck.i
+
+Global Dim gate_peerMac.a[6]
+Global Dim gate_out.a[#GATE_FRAME]
+Global Dim gate_src.a[4096]
+Global Dim gate_dest.a[4096]
+Global Dim gate_name.a[16]
+
+Procedure GatePut16(p.i, v.i)
+  PokeA(p, (v >> 8) & $FF)
+  PokeA(p + 1, v & $FF)
+EndProcedure
+
+Procedure GatePut32(p.i, v.i)
+  PokeA(p, (v >> 24) & $FF)
+  PokeA(p + 1, (v >> 16) & $FF)
+  PokeA(p + 2, (v >> 8) & $FF)
+  PokeA(p + 3, v & $FF)
+EndProcedure
+
+Procedure.i GateGet16(p.i)
+  ProcedureReturn ((PeekA(p) & $FF) << 8) | (PeekA(p + 1) & $FF)
+EndProcedure
+
+Procedure.i GateGet32(p.i)
+  ProcedureReturn ((PeekA(p) & $FF) << 24) | ((PeekA(p + 1) & $FF) << 16) | ((PeekA(p + 2) & $FF) << 8) | (PeekA(p + 3) & $FF)
+EndProcedure
+
+Procedure.i GateCksum(p.i, n.i)
+  Define i.i
+  Define sum.i
+  sum = 0
+  i = 0
+  While i + 1 < n
+    sum = sum + (((PeekA(p + i) & $FF) << 8) | (PeekA(p + i + 1) & $FF))
+    i = i + 2
+  Wend
+  If i < n
+    sum = sum + ((PeekA(p + i) & $FF) << 8)
+  EndIf
+  While (sum >> 16) <> 0
+    sum = (sum & $FFFF) + (sum >> 16)
+  Wend
+  ProcedureReturn ($FFFF - sum) & $FFFF
+EndProcedure
+
+; Build one Ethernet+IPv4+UDP frame from the peer to the board and put it
+; on `kind`'s queue. The UDP checksum is left at zero, which IPv4 UDP
+; permits and net.pi4 accepts unchecked.
+Procedure GateSendUdp(kind.i, srcIp.i, dstIp.i, srcPort.i, dstPort.i, *payload, plen.i, delay.i)
+  Define p.i
+  Define i.i
+  p = @gate_out[0]
+  For i = 0 To #GATE_FRAME - 1
+    PokeA(p + i, 0)
+  Next
+  For i = 0 To 5
+    PokeA(p + i, gate_mac[kind * 6 + i] & $FF)
+    PokeA(p + 6 + i, gate_peerMac[i] & $FF)
+  Next
+  GatePut16(p + 12, $0800)
+  PokeA(p + 14, $45)
+  GatePut16(p + 16, 20 + 8 + plen)
+  GatePut16(p + 18, $1234)
+  PokeA(p + 22, 64)
+  PokeA(p + 23, 17)
+  GatePut32(p + 26, srcIp)
+  GatePut32(p + 30, dstIp)
+  GatePut16(p + 24, GateCksum(p + 14, 20))
+  GatePut16(p + 34, srcPort)
+  GatePut16(p + 36, dstPort)
+  GatePut16(p + 38, 8 + plen)
+  i = 0
+  While i < plen
+    PokeA(p + 42 + i, PeekA(*payload + i) & $FF)
+    i = i + 1
+  Wend
+  gate_srvReplies = gate_srvReplies + 1
+  GateQueue(kind, p, 42 + plen, delay)
+EndProcedure
+
+; An ARP request from the peer for `target`, which net.pi4 answers and -
+; the part this gate needs - which teaches the board the peer's hardware
+; address, so the first datagram can be addressed at all.
+Procedure GateSendArpRequest(kind.i, senderIp.i, target.i)
+  Define p.i
+  Define i.i
+  p = @gate_out[0]
+  For i = 0 To #GATE_FRAME - 1
+    PokeA(p + i, 0)
+  Next
+  For i = 0 To 5
+    PokeA(p + i, $FF)
+    PokeA(p + 6 + i, gate_peerMac[i] & $FF)
+  Next
+  GatePut16(p + 12, $0806)
+  GatePut16(p + 14, 1)
+  GatePut16(p + 16, $0800)
+  PokeA(p + 18, 6)
+  PokeA(p + 19, 4)
+  GatePut16(p + 20, 1)
+  For i = 0 To 5
+    PokeA(p + 22 + i, gate_peerMac[i] & $FF)
+  Next
+  GatePut32(p + 28, senderIp)
+  GatePut32(p + 38, target)
+  GateQueue(kind, p, 42, 0)
+EndProcedure
+
+Procedure GateSrvSendAck(kind.i, block.i, delay.i)
+  Define p.i
+  p = @gate_scratch[0]
+  GatePut16(p, 4)
+  GatePut16(p + 2, block & $FFFF)
+  GateSendUdp(kind, gate_peerIp, gate_srvBoardIp, gate_srvPort, gate_srvBoardPort, p, 4, delay)
+  If gate_srvDoubleAck <> 0
+    GatePut16(p, 4)
+    GatePut16(p + 2, block & $FFFF)
+    GateSendUdp(kind, gate_peerIp, gate_srvBoardIp, gate_srvPort, gate_srvBoardPort, p, 4, delay)
+  EndIf
+EndProcedure
+
+Procedure GateSrvSendData(kind.i, block.i, delay.i)
+  Define p.i
+  Define off.i
+  Define len.i
+  Define i.i
+  p = @gate_scratch[0]
+  off = (block - 1) * 512
+  len = gate_srvFileLen - off
+  If len < 0
+    len = 0
+  EndIf
+  If len > 512
+    len = 512
+  EndIf
+  GatePut16(p, 3)
+  GatePut16(p + 2, block & $FFFF)
+  gate_srvLastLen = len
+  i = 0
+  While i < len
+    ; The served file is a byte pattern the fixture can check against.
+    PokeA(p + 4 + i, (off + i) & $FF)
+    i = i + 1
+  Wend
+  GateSendUdp(kind, gate_peerIp, gate_srvBoardIp, gate_srvPort, gate_srvBoardPort, p, 4 + len, delay)
+EndProcedure
+
+; A datagram that is NOT this transfer's, delivered in the middle of it.
+Procedure GateInject(kind.i)
+  Define p.i
+  p = @gate_scratch[0]
+  If gate_srvInjectKind = 1
+    ; Somebody typing at the network console. It must reach the keystroke
+    ; ring THROUGH the transfer's own pump, and it cancels the transfer -
+    ; which is what typing during a transfer is supposed to do.
+    PokeA(p, 27)
+    GateSendUdp(kind, gate_peerIp, gate_srvBoardIp, 40000, #NETCON_PORT, p, 1, gate_srvDelay)
+  ElseIf gate_srvInjectKind = 2
+    ; The laptop renewing its lease from the server this board runs on
+    ; the same cable. An automatic service owns it and takes it.
+    PokeA(p, 1)
+    GateSendUdp(kind, gate_peerIp, gate_srvBoardIp, #DHCP_PORT_CLIENT, #DHCP_PORT_SERVER, p, 1, gate_srvDelay)
+  EndIf
+  gate_srvInjectKind = 0
+EndProcedure
+
+Procedure GatePeerTftp(kind.i, srcIp.i, srcPort.i, dstPort.i, p.i, plen.i)
+  Define op.i
+  Define blk.i
+  Define dlen.i
+  Define i.i
+  If plen < 4
+    ProcedureReturn
+  EndIf
+  op = GateGet16(p)
+
+  If dstPort = 69
+    ; THE REQUEST SOCKET, AND IT IS READ ONLY WHEN NOTHING IS RUNNING.
+    ; A repeated request during a transfer reaches a server that is not
+    ; listening for one, and is answered by nobody.
+    gate_srvRequests = gate_srvRequests + 1
+    If gate_srvActive <> 0
+      ProcedureReturn
+    EndIf
+    gate_srvActive = 1
+    gate_srvBoardIp = srcIp
+    gate_srvBoardPort = srcPort
+    gate_srvBlock = 0
+    gate_srvBytes = 0
+    gate_srvSum = 0
+    gate_srvDone = 0
+    If op = 2
+      gate_srvMode = 1
+      GateSrvSendAck(kind, 0, gate_srvDelay)
+    ElseIf op = 1
+      gate_srvMode = 2
+      gate_srvBlock = 1
+      GateSrvSendData(kind, 1, gate_srvDelay)
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If dstPort <> gate_srvPort Or gate_srvActive = 0
+    ProcedureReturn
+  EndIf
+  blk = GateGet16(p + 2)
+
+  If op = 3 And gate_srvMode = 1
+    dlen = plen - 4
+    If blk <> ((gate_srvBlock + 1) & $FFFF)
+      ; Already stored, or out of order. The bench receiver skips it in
+      ; silence and restarts its own idle timer by doing so.
+      gate_srvDupData = gate_srvDupData + 1
+      If gate_srvDupAnswer <> 0
+        GateSrvSendAck(kind, gate_srvBlock, gate_srvDelay)
+      EndIf
+      ProcedureReturn
+    EndIf
+    i = 0
+    While i < dlen
+      gate_srvSum = (gate_srvSum + (PeekA(p + 4 + i) & $FF)) & $FFFFFF
+      i = i + 1
+    Wend
+    gate_srvBytes = gate_srvBytes + dlen
+    gate_srvBlock = blk
+    If dlen < 512
+      gate_srvDone = 1
+    EndIf
+    If gate_srvDropAck = blk
+      ; One acknowledgement lost on the wire, once.
+      gate_srvDropAck = -1
+    Else
+      GateSrvSendAck(kind, blk, gate_srvDelay)
+    EndIf
+    If gate_srvBlock = gate_srvInjectAt
+      GateInject(kind)
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If op = 4 And gate_srvMode = 2
+    If blk <> gate_srvBlock
+      gate_srvDupData = gate_srvDupData + 1
+      ProcedureReturn
+    EndIf
+    ; A SHORT BLOCK ENDED IT, AND ZERO IS SHORT. A file whose length is
+    ; an exact multiple of 512 ends on a four-byte data packet carrying
+    ; nothing, so "the offset has reached the length" is NOT the test -
+    ; the length of the block just served is.
+    If gate_srvLastLen < 512
+      gate_srvDone = 1
+      gate_srvActive = 0
+      ProcedureReturn
+    EndIf
+    gate_srvBlock = (gate_srvBlock + 1) & $FFFF
+    If gate_srvDropAck = gate_srvBlock
+      gate_srvDropAck = -1
+    Else
+      GateSrvSendData(kind, gate_srvBlock, gate_srvDelay)
+    EndIf
+    If gate_srvBlock = gate_srvInjectAt
+      GateInject(kind)
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If op = 5
+    gate_srvActive = 0
+  EndIf
+EndProcedure
+
+Procedure GatePeer(kind.i, *frame, n.i)
+  Define t.i
+  Define ihl.i
+  Define p.i
+  Define srcIp.i
+  Define dstIp.i
+  Define i.i
+  t = GateGet16(*frame + 12)
+
+  If t = $0806
+    ; An ARP request from the board. Answer it if it is for the peer.
+    If GateGet16(*frame + 20) <> 1
+      ProcedureReturn
+    EndIf
+    If GateGet32(*frame + 38) <> gate_peerIp
+      ProcedureReturn
+    EndIf
+    gate_srvArpAnswers = gate_srvArpAnswers + 1
+    p = @gate_out[0]
+    For i = 0 To #GATE_FRAME - 1
+      PokeA(p + i, 0)
+    Next
+    For i = 0 To 5
+      PokeA(p + i, gate_mac[kind * 6 + i] & $FF)
+      PokeA(p + 6 + i, gate_peerMac[i] & $FF)
+    Next
+    GatePut16(p + 12, $0806)
+    GatePut16(p + 14, 1)
+    GatePut16(p + 16, $0800)
+    PokeA(p + 18, 6)
+    PokeA(p + 19, 4)
+    GatePut16(p + 20, 2)
+    For i = 0 To 5
+      PokeA(p + 22 + i, gate_peerMac[i] & $FF)
+      PokeA(p + 32 + i, gate_mac[kind * 6 + i] & $FF)
+    Next
+    GatePut32(p + 28, gate_peerIp)
+    GatePut32(p + 38, GateGet32(*frame + 28))
+    GateQueue(kind, p, 42, gate_srvDelay)
+    ProcedureReturn
+  EndIf
+
+  If t <> $0800
+    ProcedureReturn
+  EndIf
+  ihl = (PeekA(*frame + 14) & $0F) * 4
+  If PeekA(*frame + 23) <> 17
+    ProcedureReturn
+  EndIf
+  srcIp = GateGet32(*frame + 26)
+  dstIp = GateGet32(*frame + 30)
+  If dstIp <> gate_peerIp
+    ProcedureReturn
+  EndIf
+  p = *frame + 14 + ihl
+  GatePeerTftp(kind, srcIp, GateGet16(p), GateGet16(p + 2), p + 8, GateGet16(p + 4) - 8)
+EndProcedure
+
+; ======================================================================
+;  THE BENCH, SET UP THE WAY THE BOARD ACTUALLY WAS
+; ======================================================================
+;  `net` on build 55, 2026-09-11: the cable holds a probed link-local
+;  169.254.170.250/16 AND the served alias 192.168.137.1/24; the radio
+;  holds a 192.168.1.20/24 lease. Both interfaces usable is not
+;  incidental - it is why LinkPumpAllNet spends a slice on one of them
+;  at a time, which is the window the console's pump reaches into.
+; ----------------------------------------------------------------------
+Procedure GateSeedBench()
+  Define i.i
+  NetInit()
+  NetIfReset()
+  GateQueueClear()
+  gate_now = 1000
+  gate_txFrames = 0
+  gate_dropped = 0
+  gate_conIn = 0
+  gate_conOut = 0
+  gate_conTaken = 0
+  gate_serviceTaken = 0
+  gate_flushes = 0
+  gate_forgotten = 0
+  gConOn = 1
+  gConLastPump = 0
+  gConMemberMask = 0
+  gConRxFrames = 0
+  gConRxFull = 0
+  gEthFrames = 0
+  gEthUdp = 0
+  gEthSendFail = 0
+  gAbort = 0
+  gBreakNetPump = 0
+  gate_srvPort = 60134
+  gate_srvActive = 0
+  gate_srvRequests = 0
+  gate_srvDupData = 0
+  gate_srvDupAnswer = 0
+  gate_srvDropAck = -1
+  gate_srvDelay = 1
+  gate_srvInjectAt = -1
+  gate_srvInjectKind = 0
+  gate_srvArpAnswers = 0
+  gate_srvReplies = 0
+  gate_srvDoubleAck = 0
+  gate_srvLastLen = 512
+  gate_srvDone = 0
+
+  gate_ready[#HW_LINK_WIRED] = 1
+  gate_ready[#HW_LINK_WIFI] = 1
+  ; DC:A6:32:5B:77:C8 is the board's own wired address, off the same
+  ; transcript. The radio's and the peer's are this fixture's.
+  gate_mac[#HW_LINK_WIRED * 6 + 0] = $DC
+  gate_mac[#HW_LINK_WIRED * 6 + 1] = $A6
+  gate_mac[#HW_LINK_WIRED * 6 + 2] = $32
+  gate_mac[#HW_LINK_WIRED * 6 + 3] = $5B
+  gate_mac[#HW_LINK_WIRED * 6 + 4] = $77
+  gate_mac[#HW_LINK_WIRED * 6 + 5] = $C8
+  For i = 0 To 5
+    gate_mac[#HW_LINK_WIFI * 6 + i] = $20 + i
+    gate_peerMac[i] = $02 + i
+  Next
+
+  NetIfSet(#HW_LINK_WIRED, $A9FEAAFA, $FFFF0000, 0, #NET_ADDR_LINKLOCAL)
+  NetIfSetAlt(#HW_LINK_WIRED, $C0A88901, $FFFFFF00)
+  NetIfSet(#HW_LINK_WIFI, $C0A80114, $FFFFFF00, $C0A80102, #NET_ADDR_LEASE)
+
+  ; The board is the DHCP server on this cable, so port 67 is a
+  ; persistent owner on the wired interface - Anvil/Core/dhcpd.pbi does
+  ; exactly this when it starts.
+  NetUdpListen(#HW_LINK_WIRED, #DHCP_PORT_SERVER, 1)
+  ; And one turn of the prompt's own pump, which is what publishes the
+  ; console's membership and takes port 5555 as a listener on every
+  ; addressed interface. Nothing is queued yet, so it reads nothing.
+  gConLastPump = 0
+  gate_now = gate_now + 10
+  NetConsolePump()
+
+  gate_name[0] = 107 : gate_name[1] = 116 : gate_name[2] = 114
+  gate_name[3] = 99  : gate_name[4] = 0
+
+  For i = 0 To 4095
+    gate_src[i] = (i * 7) & $FF
+    gate_dest[i] = 0
+  Next
+EndProcedure
+
+; The expected byte sum of `n` bytes of the source pattern, so the gate
+; can say the server got what was in memory and not merely a count.
+Procedure.i GateSrcSum(n.i)
+  Define i.i
+  Define s.i
+  s = 0
+  i = 0
+  While i < n
+    s = (s + ((i * 7) & $FF)) & $FFFFFF
+    i = i + 1
+  Wend
+  ProcedureReturn s
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Teach the board the peer's hardware address the way the wire does:
+;  the peer asks who has the address the transfer will source from, and
+;  net.pi4 answers and records the asker. Nothing here reaches into the
+;  ARP table.
+; ----------------------------------------------------------------------
+Procedure GateLearnPeer(kind.i, target.i)
+  GateSendArpRequest(kind, gate_peerIp, target)
+  LinkPumpAllNet(0)
+  LinkPumpAllNet(0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One whole transfer, driven exactly as CmdPut and CmdGet drive one
+;  after EthStart has routed it: the timer, the port, the bind, the
+;  queue claim, the first packet, and then NetXferRun until it is over.
+; ----------------------------------------------------------------------
+Procedure.i GateBeginSession(kind.i)
+  Define port.i
+  TftpInit()
+  TftpSetTimeout(#ETH_RETRY_MS, #ETH_RETRIES)
+  port = TftpSuggestPort(millis())
+  NetUdpBind(kind, port)
+  NetIfClaimRx(kind)
+  ; THE FAIRNESS CURSOR ON THE RADIO. LinkPumpAllNet blocks its whole
+  ; slice on one interface, and this is where the cursor is half the
+  ; time. Placing it makes the race deterministic instead of lucky.
+  gLinkPumpNext = #HW_LINK_WIFI
+  ProcedureReturn port
+EndProcedure
+
+Procedure.i GateRunPut(kind.i, srvIp.i, n.i)
+  Define port.i
+  port = GateBeginSession(kind)
+  If TftpBeginWrite(srvIp, @gate_name[0], port, @gate_src[0], n) = 0
+    ProcedureReturn -1
+  EndIf
+  If NetXferSend(kind) = 0
+    ProcedureReturn -2
+  EndIf
+  ProcedureReturn NetXferRun(kind)
+EndProcedure
+
+Procedure.i GateRunGet(kind.i, srvIp.i)
+  Define port.i
+  port = GateBeginSession(kind)
+  If TftpSetMemory(@gate_dest[0], 4096) = 0
+    ProcedureReturn -1
+  EndIf
+  If TftpBeginRead(srvIp, @gate_name[0], port) = 0
+    ProcedureReturn -2
+  EndIf
+  If NetXferSend(kind) = 0
+    ProcedureReturn -3
+  EndIf
+  ProcedureReturn NetXferRun(kind)
+EndProcedure
+
+; What the fetched bytes should be: the server serves its own offset
+; pattern, so this checks the file and not just the length.
+Procedure.i GateDestOk(n.i)
+  Define i.i
+  i = 0
+  While i < n
+    If (gate_dest[i] & $FF) <> (i & $FF)
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+
+  ; ------------------------------------------------------------------
+  ; 1. THE BENCH CASE, EXACTLY. A put over the cable to the machine this
+  ;    board serves DHCP to, so every reply comes back to the ALIAS
+  ;    192.168.137.1 - the address the board picked for itself as that
+  ;    machine's neighbour. 1300 bytes is two full blocks and a short
+  ;    one, so the transfer ends the ordinary way.
+  ;
+  ;    Under the defect this is the transfer that acknowledged three
+  ;    blocks and stopped. It must complete.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902                      ; 192.168.137.2
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 1300)
+  If r <> 1 : ProcedureReturn 1 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 2 : EndIf
+  If TftpBytes() <> 1300 : ProcedureReturn 3 : EndIf
+  If gate_srvBytes <> 1300 : ProcedureReturn 4 : EndIf
+  If gate_srvSum <> GateSrcSum(1300) : ProcedureReturn 5 : EndIf
+  If gate_srvDone <> 1 : ProcedureReturn 6 : EndIf
+  ; The server answered from its ephemeral port and the board followed it
+  ; for every packet after the request: one request reached port 69.
+  If gate_srvRequests <> 1 : ProcedureReturn 7 : EndIf
+  If TftpServerPort() <> 60134 : ProcedureReturn 8 : EndIf
+  ; Every reply was addressed to the alias, and the board accepted it
+  ; there. The primary was never used for this conversation.
+  If gate_srvBoardIp <> $C0A88901 : ProcedureReturn 9 : EndIf
+  ; Nothing was lost, so nothing was retransmitted and no duplicate
+  ; block ever reached the server.
+  If TftpRetransmitCount() <> 0 : ProcedureReturn 10 : EndIf
+  If gate_srvDupData <> 0 : ProcedureReturn 11 : EndIf
+  If gate_dropped <> 0 : ProcedureReturn 12 : EndIf
+  ; The claim is still held: only the end of the command releases it.
+  If NetIfRxOwner() <> #HW_LINK_WIRED : ProcedureReturn 13 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 2. THE SAME PUT, BUT TO A SERVER ON THE LINK-LOCAL SUBNET, so every
+  ;    reply comes back to the OTHER address the cable holds. A board
+  ;    that only recognised one of its two addresses would stall here
+  ;    and nowhere else.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $A9FEB743                      ; 169.254.183.67
+  GateLearnPeer(#HW_LINK_WIRED, $A9FEAAFA)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 2048)
+  If r <> 1 : ProcedureReturn 14 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 15 : EndIf
+  If gate_srvBoardIp <> $A9FEAAFA : ProcedureReturn 16 : EndIf
+  If gate_srvBytes <> 2048 : ProcedureReturn 17 : EndIf
+  If gate_srvSum <> GateSrcSum(2048) : ProcedureReturn 18 : EndIf
+  ; 2048 is an exact multiple of 512, so the transfer ends on a
+  ; four-byte data packet carrying nothing - and the server must have
+  ; seen five blocks, not four.
+  If gate_srvBlock <> 5 : ProcedureReturn 19 : EndIf
+  If gate_srvDone <> 1 : ProcedureReturn 20 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 3. A GET, WITH THE FILE ARRIVING AT THE ALIAS. The reading direction
+  ;    reaches the same queue through the same two pumps.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  gate_srvFileLen = 1300
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunGet(#HW_LINK_WIRED, gate_peerIp)
+  If r <> 1 : ProcedureReturn 21 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 22 : EndIf
+  If TftpBytes() <> 1300 : ProcedureReturn 23 : EndIf
+  If GateDestOk(1300) = 0 : ProcedureReturn 24 : EndIf
+  If gate_srvBoardIp <> $C0A88901 : ProcedureReturn 25 : EndIf
+  If TftpServerPort() <> 60134 : ProcedureReturn 26 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 4. A GET AT THE LINK-LOCAL ADDRESS, exact multiple of 512 again so
+  ;    the empty final block is the thing that ends it.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $A9FEB743
+  gate_srvFileLen = 1024
+  GateLearnPeer(#HW_LINK_WIRED, $A9FEAAFA)
+  r = GateRunGet(#HW_LINK_WIRED, gate_peerIp)
+  If r <> 1 : ProcedureReturn 27 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 28 : EndIf
+  If TftpBytes() <> 1024 : ProcedureReturn 29 : EndIf
+  If GateDestOk(1024) = 0 : ProcedureReturn 30 : EndIf
+  If gate_srvBoardIp <> $A9FEAAFA : ProcedureReturn 31 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 5. AN ACKNOWLEDGEMENT IS LOST ON THE WIRE, and the sender's own
+  ;    timer is what recovers it. The server answers the duplicate here,
+  ;    which is what an ordinary receiver does; the bench's does not,
+  ;    and case 7 is about that.
+  ;
+  ;    This is the half of the Sorcerer's Apprentice fix that must still
+  ;    work after the queue is claimed: exactly one retransmission, and
+  ;    exactly one duplicate block at the server. Two would mean the
+  ;    sender had answered a duplicate acknowledgement by resending.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  gate_srvDupAnswer = 1
+  gate_srvDropAck = 2
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 1300)
+  If r <> 1 : ProcedureReturn 32 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 33 : EndIf
+  If TftpBytes() <> 1300 : ProcedureReturn 34 : EndIf
+  If gate_srvSum <> GateSrcSum(1300) : ProcedureReturn 35 : EndIf
+  If TftpRetransmitCount() <> 1 : ProcedureReturn 36 : EndIf
+  If gate_srvDupData <> 1 : ProcedureReturn 37 : EndIf
+  If TftpDupCount() <> 0 : ProcedureReturn 38 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 6. A DHCP-SERVICE DATAGRAM IN THE MIDDLE OF THE TRANSFER. The laptop
+  ;    renews the lease this board is serving it, on the same cable, in
+  ;    the same second. The transfer's pump feeds the SAME dispatcher the
+  ;    console's pump does, so the service is answered while the command
+  ;    owns the queue - which is the reason standing down costs nothing.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  gate_srvInjectAt = 1
+  gate_srvInjectKind = 2
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 1300)
+  If r <> 1 : ProcedureReturn 39 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 40 : EndIf
+  If gate_serviceTaken <> 1 : ProcedureReturn 41 : EndIf
+  If gate_srvSum <> GateSrcSum(1300) : ProcedureReturn 42 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 7. A CONSOLE DATAGRAM IN THE MIDDLE OF THE TRANSFER. Somebody types
+  ;    at the network console while the command owns the wire. It has to
+  ;    ARRIVE - a command that went deaf to the console would be the
+  ;    stand-down doing harm - and a keystroke during a transfer stops
+  ;    the transfer, which is what it means.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  gate_srvInjectAt = 1
+  gate_srvInjectKind = 1
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 1300)
+  If r <> 0 : ProcedureReturn 43 : EndIf
+  If gate_conTaken <> 1 : ProcedureReturn 44 : EndIf
+  If OutBroke() <> 1 : ProcedureReturn 45 : EndIf
+  If TftpComplete() = 1 : ProcedureReturn 46 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 8. THE BENCH'S OWN RECEIVER, WITH NOTHING LOST. It serves one client
+  ;    at a time and never answers a duplicate block, so this is the
+  ;    shape that turned one stolen acknowledgement into sixteen seconds
+  ;    of silence. With the queue claimed, nothing is stolen and the
+  ;    transfer completes with no retransmission at all.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  gate_srvDupAnswer = 0
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 4096)
+  If r <> 1 : ProcedureReturn 47 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 48 : EndIf
+  If TftpBytes() <> 4096 : ProcedureReturn 49 : EndIf
+  If gate_srvSum <> GateSrcSum(4096) : ProcedureReturn 50 : EndIf
+  If TftpRetransmitCount() <> 0 : ProcedureReturn 51 : EndIf
+  If gate_srvRequests <> 1 : ProcedureReturn 52 : EndIf
+  ; The counters the board printed. "datagrams for us" is one per block
+  ; plus the acknowledgement of the request itself.
+  If gEthUdp <> 10 : ProcedureReturn 53 : EndIf
+  If gEthSendFail <> 0 : ProcedureReturn 54 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 9. THE CLAIM IS RELEASED WHEN THE COMMAND ENDS, and the console's
+  ;    pump reads that interface again. A claim that leaked would be a
+  ;    board that answered its console until the first transfer and
+  ;    never again, with nothing anywhere to say so.
+  ; ------------------------------------------------------------------
+  If NetIfRxOwner() <> #HW_LINK_WIRED : ProcedureReturn 55 : EndIf
+  NetConsoleCommandDone()
+  If NetIfRxOwner() <> #HW_LINK_NONE : ProcedureReturn 56 : EndIf
+  If gate_forgotten <> 1 : ProcedureReturn 57 : EndIf
+  gate_conIn = 0
+  gate_conOut = 0
+  gate_conTaken = 0
+  gate_srvInjectKind = 1
+  gate_srvBoardIp = $C0A88901
+  gate_srvBoardPort = 5555
+  GateInject(#HW_LINK_WIRED)
+  gate_now = gate_now + 50
+  gConLastPump = 0
+  NetConsolePump()
+  If gate_conTaken <> 1 : ProcedureReturn 58 : EndIf
+  If NetConsoleGetc() <> 27 : ProcedureReturn 59 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 10. AND A QUEUE NOBODY CLAIMED IS STILL THE CONSOLE'S. The radio was
+  ;     never part of any of this, and the console's pump must have gone
+  ;     on reading it throughout - standing down is about ONE interface.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  NetIfClaimRx(#HW_LINK_WIRED)
+  gate_srvBoardIp = $C0A80114
+  gate_srvBoardPort = 5555
+  gate_peerIp = $C0A80114
+  gate_srvInjectKind = 1
+  GateInject(#HW_LINK_WIFI)
+  gate_now = gate_now + 50
+  gConLastPump = 0
+  NetConsolePump()
+  If gate_conTaken <> 1 : ProcedureReturn 60 : EndIf
+  If NetConsoleGetc() <> 27 : ProcedureReturn 61 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 11. EVERY ACKNOWLEDGEMENT ARRIVES TWICE. A duplicated frame on the
+  ;     segment is ordinary, and the rule RFC 1123 states is that the
+  ;     sender must NEVER resend the current block on receipt of a
+  ;     duplicate acknowledgement - it answers its own timer and nothing
+  ;     else. A sender that resends here doubles every packet for the
+  ;     rest of the transfer, and the server would see duplicate blocks.
+  ;     It sees none.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  gate_srvDoubleAck = 1
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  r = GateRunPut(#HW_LINK_WIRED, gate_peerIp, 1300)
+  If r <> 1 : ProcedureReturn 62 : EndIf
+  If TftpComplete() <> 1 : ProcedureReturn 63 : EndIf
+  If gate_srvSum <> GateSrcSum(1300) : ProcedureReturn 64 : EndIf
+  If gate_srvDupData <> 0 : ProcedureReturn 65 : EndIf
+  If TftpRetransmitCount() <> 0 : ProcedureReturn 66 : EndIf
+  If TftpDupCount() < 3 : ProcedureReturn 67 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 12. AND THE STATE BEHIND CASE 7, SAID DIRECTLY. A command binds its
+  ;     own reply port on the interface it routed onto, and that bind is
+  ;     the ONE movable filter the IP layer has. The console is reachable
+  ;     during that command only because its port is a persistent
+  ;     LISTENER beside the direct-cable DHCP server's, on every
+  ;     interface the console's own walk found - not a passenger on a
+  ;     filter the next command displaces.
+  ; ------------------------------------------------------------------
+  GateSeedBench()
+  gate_peerIp = $C0A88902
+  GateLearnPeer(#HW_LINK_WIRED, $C0A88901)
+  If NetUdpListening(#HW_LINK_WIRED, #NETCON_PORT) <> 1 : ProcedureReturn 68 : EndIf
+  If NetUdpListening(#HW_LINK_WIFI, #NETCON_PORT) <> 1 : ProcedureReturn 69 : EndIf
+  GateBeginSession(#HW_LINK_WIRED)
+  If NetUdpBoundPort(#HW_LINK_WIRED) = #NETCON_PORT : ProcedureReturn 70 : EndIf
+  If NetUdpListening(#HW_LINK_WIRED, #NETCON_PORT) <> 1 : ProcedureReturn 71 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

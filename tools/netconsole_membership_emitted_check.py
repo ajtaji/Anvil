@@ -65,6 +65,12 @@ Global Dim gate_alt.i[6]
 Global Dim gate_usable.a[6]
 Global gate_notify.i
 Global gate_wifiOwner.i
+; The console's port is a PERSISTENT LISTENER, taken and given back on the
+; same membership edges as driver receive ownership - so a disarm that
+; published an off edge and left the port owned would leave the IP layer
+; delivering to a console that is no longer there.
+Global gate_listen.i
+Global gate_listenCalls.i
 
 Procedure str_print_at(p.i) : EndProcedure
 Procedure PrintNl() : EndProcedure
@@ -73,6 +79,12 @@ Procedure.i NetIfUsable(kind.i) : ProcedureReturn gate_usable[kind] & $FF : EndP
 Procedure.i NetIPv4(kind.i) : ProcedureReturn gate_ip[kind] : EndProcedure
 Procedure.i NetIPv4Alt(kind.i) : ProcedureReturn gate_alt[kind] : EndProcedure
 Procedure NetUdpBind(kind.i, port.i) : EndProcedure
+Procedure NetUdpListen(kind.i, port.i, on.i)
+  gate_listenCalls = gate_listenCalls + 1
+  If kind = #HW_LINK_WIFI And port = #NETCON_PORT
+    gate_listen = on
+  EndIf
+EndProcedure
 Procedure NetConsoleSayLinks() : EndProcedure
 Procedure NetConsoleStart(kind.i) : EndProcedure
 Procedure netcon_ForgetOwner() : gConOwner = #NETCON_OWNER_NONE : EndProcedure
@@ -99,14 +111,20 @@ Procedure.i Main()
   If gConKind <> #HW_LINK_WIFI Or gConMemberMask <> 0 Or gate_notify <> 0 Or gate_wifiOwner <> 0 : ProcedureReturn 1 : EndIf
   netcon_Disarm()
   If gate_notify <> 0 Or gate_wifiOwner <> 0 Or gConMemberMask <> 0 : ProcedureReturn 2 : EndIf
+  ; Nothing was a member, so no port was given back either.
+  If gate_listenCalls <> 0 : ProcedureReturn 4 : EndIf
 
   ; A queue that an actual receive walk recorded is explicitly released.
   gConOn = 1
   gConMemberMask = 1 << #HW_LINK_WIFI
   gate_wifiOwner = 1
   gate_notify = 0
+  gate_listen = 1
+  gate_listenCalls = 0
   netcon_Disarm()
   If gate_notify <> 1 Or gate_wifiOwner <> 0 Or gConMemberMask <> 0 : ProcedureReturn 3 : EndIf
+  ; THE PORT GOES BACK WITH THE MEMBERSHIP, on the same edge and once.
+  If gate_listen <> 0 Or gate_listenCalls <> 1 : ProcedureReturn 5 : EndIf
   ProcedureReturn 0
 EndProcedure
 '''
@@ -154,7 +172,7 @@ def main() -> int:
     if result:
         print(f"netconsole_membership_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
-    print(f"netconsole_membership_emitted_check: PASS - 3 assertions, {steps:,} A64 instructions")
+    print(f"netconsole_membership_emitted_check: PASS - 5 assertions, {steps:,} A64 instructions")
     return 0
 
 

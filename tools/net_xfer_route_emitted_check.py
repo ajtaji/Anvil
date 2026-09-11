@@ -14,6 +14,9 @@ an isolated generated source and requires the gate to reject it:
   selection     the route read off LinkKind() instead of the destination
   bind          the transfer's own port bound on the selected interface
   resolve       the next hop resolved against the selected interface
+  no-claim      the routed interface's receive queue never claimed, so the
+                console's pump goes on reading it and drops the transfer's
+                own acknowledgements (measured on the board 2026-09-11)
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "net_xfer_route_emitted_gate.pi4"
 SERVER_MARKER = "; @@PRODUCTION_NET_XFER_SERVER@@"
 START_MARKER = "; @@PRODUCTION_ETH_START@@"
 
-ASSERTIONS = 48
+ASSERTIONS = 55
 
 # The precondition that used to stand in front of every transfer. Restored
 # verbatim in shape: all four keys or nothing happens.
@@ -76,7 +79,8 @@ def production() -> tuple[str, str]:
     session_start = cmd.index(session_header)
     start = extract(cmd[session_start:], "Procedure.i EthStart()", "EthStart")
     block = cmd[session_start : session_start + cmd[session_start:].index(start)] + start
-    for required in ("Procedure.i XferKind()", "NetIfForDest(gEthSrv)", "NetXferServer()"):
+    for required in ("Procedure.i XferKind()", "NetIfForDest(gEthSrv)", "NetXferServer()",
+                     "NetIfClaimRx(k)"):
         if required not in block:
             raise SystemExit(f"net xfer route gate: EthStart block lost {required!r}")
     return server, block
@@ -107,6 +111,9 @@ def mutate(start: str, name: str) -> str:
     elif name == "resolve":
         needle = "  If NetResolveHop(k, gEthSrv) = 0\n"
         replacement = "  If NetResolveHop(LinkKind(), gEthSrv) = 0\n"
+    elif name == "no-claim":
+        needle = "  NetIfClaimRx(k)\n"
+        replacement = "  ; NetIfClaimRx removed by mutation\n"
     else:
         raise SystemExit(f"net xfer route gate: unknown mutation {name}")
     if start.count(needle) != 1:
@@ -169,9 +176,10 @@ def main() -> int:
     # Each mutation names the first assertion that must reject it.
     mutations = (
         ("four-key", 1),
-        ("selection", 14),
-        ("bind", 16),
-        ("resolve", 15),
+        ("selection", 16),
+        ("bind", 18),
+        ("resolve", 17),
+        ("no-claim", 13),
     )
 
     with tempfile.TemporaryDirectory(prefix="anvil-net-xfer-route-") as temporary:

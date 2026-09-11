@@ -64,7 +64,12 @@ keys then had to be removed again by hand.
    refuses with the board's own address list if none can;
 4. publishes that interface as the transfer session's `gXferKind`, readable
    through `XferKind()`;
-5. resolves the next hop and binds the transfer's own port **on that
+5. takes that interface's receive queue with `NetIfClaimRx(kind)` **before
+   anything pumps**, so the console's own pump does not read the same queue
+   and drop the replies this command is waiting for — see
+   [NET_RECEIVE_OWNERSHIP.md](NET_RECEIVE_OWNERSHIP.md); the claim is
+   released at `NetConsoleCommandDone`;
+6. resolves the next hop and binds the transfer's own port **on that
    interface**.
 
 `NetResolveHop(kind, ip)`, `NetXferSend(kind)`, `NetXferPump(kind, ms)` and
@@ -111,11 +116,12 @@ off the link.
 
 ```text
 tools/net_xfer_route_emitted_check.py
-  PASS - 48 assertions, 15,055 A64 instructions
+  PASS - 55 assertions, 17,317 A64 instructions
   four-key mutation rejected at assertion 1
-  selection mutation rejected at assertion 14
-  bind mutation rejected at assertion 16
-  resolve mutation rejected at assertion 15
+  selection mutation rejected at assertion 16
+  bind mutation rejected at assertion 18
+  resolve mutation rejected at assertion 17
+  no-claim mutation rejected at assertion 13
 
 tools/link_status_truth_emitted_check.py
   PASS - 44 assertions, 6,658 A64 instructions
@@ -130,9 +136,24 @@ mutants restore the exact historical behaviour rather than a paraphrase of
 it. The link, the route, the settings store and the interface rows are
 modelled seams, so neither gate is a hardware result.
 
+## The first board run, and what it found behind this
+
+2026-09-11, monitor build 55. The precondition is gone: with no address of
+the board's own typed, `net server` alone was set and `put` went out over the
+cable from `192.168.137.1` - the address the board was already holding and
+serving DHCP on - and the wired row was not rewritten. Points 1 and 2 of the
+ladder below are met.
+
+The transfer itself then stalled after three blocks, and the cause was a
+second reader of the same receive queue rather than anything about the route.
+That is a separate repair with its own document,
+[NET_RECEIVE_OWNERSHIP.md](NET_RECEIVE_OWNERSHIP.md), and `EthStart` now takes
+the routed interface's receive queue before it resolves. The rest of the
+ladder is still owed.
+
 ## What is owed on the board
 
-Nothing here has run on silicon. The wired ladder is:
+The wired ladder is:
 
 1. `net` with no `net.*` keys set at all — confirm the three addresses the
    board holds are printed and that the address sentence names the selected

@@ -679,7 +679,17 @@ EndProcedure
 ; Called after the completed command's prompt has been flushed. This is
 ; the only normal release point, so error returns and every command arm
 ; converge without each handler having to remember session cleanup.
+;
+; THE RECEIVE CLAIM IS RELEASED HERE FOR THAT EXACT REASON - 2026-09-11.
+; A command that pumps an interface itself takes that interface's queue
+; (Anvil/Core/netif.pbi, ONE CONSUMER OF AN INTERFACE'S RECEIVE QUEUE),
+; and `get` alone has six ways out after it has taken one. Six releases
+; is five chances to leak a claim, and a leaked claim is a console that
+; has stopped reading one interface with nothing anywhere to say so. The
+; convergence point this procedure already is, is where it belongs; the
+; release happens before ReadLine, which is the next thing that pumps.
 Procedure NetConsoleCommandDone()
+  NetIfReleaseRx()
   netcon_ForgetOwner()
 EndProcedure
 
@@ -1178,11 +1188,35 @@ EndProcedure
 ;  wired Ethernet" on 2026-09-07 with a laptop on the cable that could
 ;  no longer see it at all.
 ; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  A CLAIMED QUEUE BELONGS TO THE COMMAND THAT CLAIMED IT - 2026-09-11.
+;
+;  This procedure DRAINS an interface and drops whatever the dispatcher
+;  does not claim, which is right at a prompt and destructive during a
+;  command: a command's reply is precisely a datagram no automatic
+;  service owns. Every turn of a transfer's, a ping's or a resolve's
+;  pump loop reaches here through OutBreak(), asking whether a key has
+;  been pressed - so at the bench on 2026-09-11 a `put` had an
+;  acknowledgement taken off the wired queue and thrown away here, and
+;  then spent its whole retransmit budget resending the block that
+;  acknowledgement was for. Read ONE CONSUMER OF AN INTERFACE'S RECEIVE
+;  QUEUE in Anvil/Core/netif.pbi; it is the same rule
+;  HwLinkConsoleArmed already applies to the radio's own pump.
+;
+;  NOTHING GOES UNANSWERED WHILE IT STANDS DOWN. The owner's pump hands
+;  its frames to the SAME NetServiceInput below, so console keystrokes,
+;  ARP, ICMP, TCP and the DHCP service are all still served on this
+;  interface for as long as the command runs - and NetConsoleFlush, which
+;  is this file's OUTPUT and consumes no queue, is not touched.
+; ----------------------------------------------------------------------
 Procedure netcon_PumpOne(kind.i)
   Define nRx.i
   Define rc.i
   Define p.i
   Define took.i
+  If NetIfRxOwner() = kind
+    ProcedureReturn
+  EndIf
   took = 0
   While took < #LINK_RX_BUDGET
     nRx = HwLinkRecv(kind, @gConRx[0], #NETCON_RX_MAX, 0)
@@ -1236,8 +1270,27 @@ Procedure NetConsolePump()
     members = members | (1 << k)
     ; Publish the on edge before consuming this queue, so the driver pump
     ; cannot also consume it later in the same prompt spin.
+    ;
+    ; AND TAKE THE CONSOLE'S PORT AS A PERSISTENT LISTENER. 2026-09-11.
+    ; NetUdpBind is ONE movable filter and it belongs to whichever
+    ; synchronous command is waiting for a reply - `get`, `put`, `ping`,
+    ; `dns` each bind their own port on their way in. The console was
+    ; riding that same filter, so for the whole of every one of those
+    ; commands the IP layer dropped port 5555 three layers below anything
+    ; that could notice, and a board running a transfer could not be
+    ; TYPED AT over the network at all: no cancellation, no second tool,
+    ; nothing, until the prompt's next rearm put the filter back. That
+    ; rearm is the workaround this replaces.
+    ;
+    ; A console is a permanent service on an interface, exactly like the
+    ; direct-cable DHCP server beside it, and NetUdpListen's own header
+    ; names "a console plus a DHCP client" as what the table is for. It
+    ; is registered and removed on the same two edges the driver's
+    ; receive ownership is, so the two cannot come to disagree about
+    ; which interfaces the console is on.
     If (gConMemberMask & (1 << k)) = 0
       HwLinkConsoleArmed(k, 1)
+      NetUdpListen(k, #NETCON_PORT, 1)
     EndIf
     netcon_PumpOne(k)
     k = NetIfNext(k)
@@ -1249,6 +1302,7 @@ Procedure NetConsolePump()
   For k = 1 To #NETIF_KINDS - 1
     If (gConMemberMask & (1 << k)) <> 0 And (members & (1 << k)) = 0
       HwLinkConsoleArmed(k, 0)
+      NetUdpListen(k, #NETCON_PORT, 0)
     EndIf
   Next
   gConMemberMask = members
@@ -1445,6 +1499,9 @@ Procedure netcon_PublishDisarmed()
   For k = 1 To #NETIF_KINDS - 1
     If (gConMemberMask & (1 << k)) <> 0
       HwLinkConsoleArmed(k, 0)
+      ; The persistent listener goes with the membership. A console that
+      ; has been disarmed must not leave a port owned on an interface.
+      NetUdpListen(k, #NETCON_PORT, 0)
     EndIf
   Next
   gConMemberMask = 0
@@ -1552,10 +1609,18 @@ Procedure NetConsoleRearm()
     If k = #HW_LINK_NONE
       ; No interface holds a usable address at this instant - a lease
       ; being renewed, a cable pulled, a command that took the interface
-      ; down. KEEP LISTENING and put the bound port back: tearing the
-      ; console down for a gap that usually closes within a command is
-      ; how a board becomes unreachable for the one minute somebody
-      ; needed it.
+      ; down. KEEP LISTENING: tearing the console down for a gap that
+      ; usually closes within a command is how a board becomes
+      ; unreachable for the one minute somebody needed it.
+      ;
+      ; THIS LINE IS THE PROMPT'S FILTER AND NOT THE CONSOLE'S REACH ANY
+      ; MORE - 2026-09-11. It used to be the only thing that made port
+      ; 5555 deliverable, so it was also the repair for a command having
+      ; displaced it, and the console was therefore unreachable for the
+      ; whole of that command and only came back here. The port is a
+      ; persistent listener now (see NetConsolePump's walk), so what this
+      ; does is put the movable filter back to the console's port between
+      ; commands, which is what it should have been doing all along.
       NetUdpBind(#HW_LINK_NONE, #NETCON_PORT)
       ProcedureReturn
     EndIf
