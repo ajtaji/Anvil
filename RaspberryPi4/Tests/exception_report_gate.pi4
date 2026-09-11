@@ -1,0 +1,24 @@
+; Host gate inserts the real exception_support source at the marker below.
+; Only the normal console mirror names are redirected to these test counters.
+Global gate_mirror.i
+Procedure GatePrint(p.i) : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure GatePrintN(p.i) : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure PrintNl() : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure PutHex16(v.i) : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure.i ExceptionEl() : ProcedureReturn 3 : EndProcedure
+Procedure.i ExceptionSlot() : ProcedureReturn 4 : EndProcedure
+Procedure.i ExceptionEsr() : ProcedureReturn $96000021 : EndProcedure
+Procedure.i ExceptionPc() : ProcedureReturn $FEDCBA9876543210 : EndProcedure
+Procedure.i ExceptionFar() : ProcedureReturn $123456789ABCDEF0 : EndProcedure
+Procedure.i ExceptionSp() : ProcedureReturn $100000 : EndProcedure
+Procedure ExceptionSetReporter(p.i) : EndProcedure
+Procedure ExceptionSetIrqHandler(p.i) : EndProcedure
+Procedure.i ExceptionInstall() : ProcedureReturn 3 : EndProcedure
+Procedure.i ExceptionVbar() : ProcedureReturn $80000 : EndProcedure
+Procedure.i InterruptInit(p.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i InterruptDispatch() : ProcedureReturn 1 : EndProcedure
+; @SUPPORT@
+Procedure.i Main()
+  HwExceptionReport()
+  ProcedureReturn gate_mirror
+EndProcedure

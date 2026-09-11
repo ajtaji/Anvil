@@ -1732,6 +1732,7 @@ XIncludeFile "Anvil/Core/state.pbi"
 XIncludeFile "RaspberryPi4/Board/display_globals.pi4"
 XIncludeFile "Anvil/Core/format.pbi"
 XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "RaspberryPi4/Board/banner_identity.pi4"
 XIncludeFile "Anvil/Core/rxbreak.pbi"
 XIncludeFile "RaspberryPi4/Lib/http.pi4"
 XIncludeFile "Anvil/Core/crc.pbi"
@@ -2011,6 +2012,9 @@ XIncludeFile "Anvil/Core/mmc_cmd.pbi"
 XIncludeFile "Anvil/Core/usb_cmd.pbi"
 XIncludeFile "Anvil/Core/help.pbi"
 XIncludeFile "RaspberryPi4/Board/boot.pi4"
+XIncludeFile "RaspberryPi4/Lib/exceptions.pi4"
+XIncludeFile "RaspberryPi4/Lib/interrupts.pi4"
+XIncludeFile "RaspberryPi4/Board/exception_support.pi4"
 
 Procedure Main()
   Define c.i
@@ -2067,7 +2071,21 @@ Procedure Main()
   ; baud command can raise it afterwards; coming up at anything else
   ; would mean the first line out is unreadable to a host that has not
   ; been told yet.
+  ; Capture synchronous failures from the earliest driver initialization.
+  ; This installs only the current EL's vectors; it never unmasks IRQs.
+  HwExceptionPrepare()
   UartInit(115200)
+  If gExceptionReady = 0
+    Print("!! Processor exception installation failed with code ")
+    PrintDec(ExceptionError()) : PrintNl()
+    PrintN("   Processor exception vectors could not be installed. Check the")
+    PrintN("   primary-core EL2/EL3 boot configuration before using this image.")
+  EndIf
+  HwInterruptPrepare()
+  If gInterruptReady = 0
+    PrintN("!! The interrupt controller was not prepared; IRQs remain masked.")
+    PrintN("   Polling remains available. Check the GIC identity and vector setup.")
+  EndIf
 
   ; THE ARM CLOCK, BEFORE ANYTHING THAT IS SLOW.
   ;

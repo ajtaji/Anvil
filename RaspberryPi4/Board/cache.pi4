@@ -326,6 +326,10 @@ Procedure CallAddr()
     blr  x9
 
     ; --- it came back --------------------------------------------
+    ; Reclaim exception ownership before any device/service work. Returning
+    ; payloads are same-level trusted code, not an isolation boundary. They
+    ; must leave the monitor's code/BSS and memory mapping accessible.
+    msr daifset, #15
     ; The whole of x0, not its low half. adrp/add do not touch x0, so it
     ; is still the payload's return value when the str runs.
     adrp x10, global_ggorc
@@ -335,6 +339,15 @@ Procedure CallAddr()
     add  x10, x10, #:lo12:global_gsp
     ldr  x11, [x10]
     mov  sp, x11
+    ; The private monitor stack is back. Reinstall this level's VBAR and
+    ; restore SIMD access before a later exception can enter our vectors.
+    ; ExceptionInstall uses integer code; gGoRc already holds the return.
+    bl exceptioninstall
+    cbnz x0, calladdr_vectors_ready
+calladdr_vector_failure:
+    wfe
+    b calladdr_vector_failure
+calladdr_vectors_ready:
     ; sp is ours again, so the epilogue below reloads OUR link register
     ; from OUR frame.
   EndASM

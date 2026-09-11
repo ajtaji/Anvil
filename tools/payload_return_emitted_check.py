@@ -57,7 +57,7 @@ def admit(image: Path, image_hash: str | None = None, symbols_hash: str | None =
     sym = emitted.parse_symbols(image)
     required = ("__image_start__", "__image_end__", "__bss_start__", "__bss_end__",
                 "runat", "calladdr", "ethpayloadquiesce", "ethpayloadreclaim",
-                "ethpayloadresume", "eth_hwup") + HOOK_NAMES + tuple("global_" + name for name in GLOBAL_NAMES)
+                "ethpayloadresume", "eth_hwup", "exceptioninstall", "exception_vectors_2", "exception_vectors_3") + HOOK_NAMES + tuple("global_" + name for name in GLOBAL_NAMES)
     missing = [name for name in required if name not in sym]
     if missing:
         raise AssertionError("required symbols missing: " + ", ".join(missing))
@@ -161,6 +161,7 @@ def reachable_calls(blob: bytes, entry: int, target: int) -> list[int]:
 @dataclass(frozen=True)
 class Case:
     name: str
+    el: int = 2
     active: int = 1
     driver_active: int | None = None
     cached: int = 1
@@ -187,6 +188,10 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
     sym = emitted.parse_symbols(image)
     blob = image.read_bytes()
     cpu = emitted.fresh_cpu(a64, image)
+    vbar = {2: 0xD51CC000, 3: 0xD51EC000}
+    cptr = {2: 0xD51C1140, 3: 0xD51E1140}
+    cpu.enable_system_registers(el=case.el, preset={0xD51800A0:0,
+        vbar[2]:0x8800,vbar[3]:0x9800,cptr[2]:0x33FF,cptr[3]:0})
     bss = (sym["__bss_start__"], sym["__bss_end__"])
     stack = (emitted.STACK - 0x100000, emitted.STACK)
     code = (emitted.LOAD, emitted.LOAD + len(blob))
@@ -313,6 +318,12 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
         # A returning payload may leave its own stack active. Real CallAddr
         # must restore monitor SP before its generated epilogue reads a frame.
         inner.sp = 0x007FFF00
+        # Deliberately leave foreign vector ownership and FP traps behind.
+        # ExceptionInstall is NOT hooked: real emitted code must repair them.
+        inner.system_registers[vbar[case.el]] = 0xDEAD0800
+        inner.system_registers[cptr[case.el]] |= 0x400
+        return_word = int.from_bytes(blob[inner.x[30]-emitted.LOAD:inner.x[30]-emitted.LOAD+4], 'little')
+        assert return_word == 0xD5034FDF, 'return does not immediately mask DAIF'
         return PAYLOAD_RC
     install(PAYLOAD_ENTRY, payload)
 
@@ -385,7 +396,8 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
 
     if mutant:
         # Patch only the one BL in RunAt, never the source or on-disk image.
-        matches = reachable_calls(blob, sym["runat"], sym[mutant])
+        owner = "calladdr" if mutant == "exceptioninstall" else "runat"
+        matches = reachable_calls(blob, sym[owner], sym[mutant])
         if len(matches) != 1:
             raise AssertionError(f"expected one mutation site for {mutant}, got {matches}")
         instruction = (0xD2800020 if mutant == "ethpayloadreclaim" else 0xD503201F)
@@ -464,6 +476,10 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
             if not must_reset and mmio != expected_mmio:
                 raise AssertionError("final modeled GENET state does not match restart success/refusal")
         assert get("gGoRc") == PAYLOAD_RC and printed_rc == [PAYLOAD_RC]
+        expected_vector = emitted.LOAD + sym[f"exception_vectors_{case.el}"]
+        assert cpu.sysreg(vbar[case.el]) == expected_vector, 'payload vector ownership not restored'
+        assert cpu.sysreg(cptr[case.el]) == (0x33FF if case.el == 2 else 0), 'payload FP trap state not restored'
+        assert cpu.current_el == case.el, 'payload changed exception level'
     if events != expected:
         raise AssertionError(f"{case.name}: actual events {events}, expected {expected}")
     assert reset == must_reset
@@ -478,7 +494,7 @@ def check(a64, image: Path, image_hash=None, symbols_hash=None):
     admit(image, image_hash, symbols_hash)
     admission_count = admission_checks(image)
     base = Case("active cached return")
-    cases = [base, replace(base, name="inactive uncached return", active=0, cached=0, dma=0),
+    cases = [base, replace(base,name="EL3 vector return",el=3), replace(base, name="inactive uncached return", active=0, cached=0, dma=0),
              replace(base, name="interface-only active flag", driver_active=0),
              replace(base, name="driver-only active flag", active=0, driver_active=1),
              replace(base, name="entry-stop refusal", entry_stop=False),
@@ -510,7 +526,11 @@ def check(a64, image: Path, image_hash=None, symbols_hash=None):
                 raise AssertionError(f"{mutant}: not an expected ordering rejection: {error}") from error
         else:
             raise AssertionError("missing recovery operation survived: " + mutant)
-    print(f"payload_return_emitted_check: PASS {len(cases)} machine-code routes, 4 killed mutations, {admission_count} admission refusals, 7 memory guards, {steps:,} returned-route instructions")
+    for el in (2,3):
+        must_refuse(lambda el=el: check_case(a64,image,replace(base,el=el),"exceptioninstall"),
+                    "payload vector ownership not restored")
+    print(f"payload_return_emitted_check: PASS {len(cases)} machine-code routes, 6 killed mutations, {admission_count} admission refusals, 7 memory guards, {steps:,} returned-route instructions")
+    print("  Real EL2/EL3 ExceptionInstall restores poisoned VBAR/TFP; DAIF instruction checked, asynchronous masking not simulated.")
     print("  Hardware/printing/network-service seams modeled; no physical DMA, DHCP-expiry or board claim.")
 
 

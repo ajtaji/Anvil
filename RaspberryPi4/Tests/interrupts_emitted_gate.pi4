@@ -1,0 +1,22 @@
+XIncludeFile "RaspberryPi4/Lib/interrupts.pi4"
+Procedure.i TestHandler()
+  PokeI($6000100, PeekI($6000100) + 1)
+  ProcedureReturn 1
+EndProcedure
+Procedure Main()
+  PokeI($6000000, InterruptInit($8000))
+  PokeI($6000040, InterruptClaim(-1, @TestHandler))
+  PokeI($6000048, InterruptClaim(256, @TestHandler))
+  PokeI($6000050, InterruptDisable(29))
+  PokeI($6000058, InterruptStart())
+  PokeI($6000008, InterruptClaim(29, @TestHandler))
+  PokeI($6000070, InterruptClaim(40, @TestHandler))
+  PokeI($6000078, InterruptEnable(40))
+  PokeI($6000080, InterruptClaim(255, @TestHandler))
+  PokeI($6000088, InterruptEnable(255))
+  PokeI($6000010, InterruptEnable(29))
+  PokeI($6000060, InterruptStart())
+  PokeI($6000068, InterruptStop())
+  PokeI($6000018, InterruptDispatch())
+  PokeI($6000020, InterruptShutdown())
+EndProcedure

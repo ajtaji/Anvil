@@ -20,6 +20,34 @@ Companion records:
 
 ## What was inventoried, and how
 
+### EL3 additions (2026-09-11)
+
+`RaspberryPi4/Lib/interrupts.pi4` is independently implemented against the
+GICv2 register contract. Arm IHI 0048B supplies the register roles, interrupt
+ID rules, group semantics and acknowledge/end-of-interrupt requirements.
+[Arm DDI 0471B, section 3.6.1](https://documentation-service.arm.com/static/5e8f15e27100066a414f7424)
+supplies the GIC-400 CPU-interface identification fields. The pinned
+[Raspberry Pi firmware stub](https://github.com/raspberrypi/tools/blob/439b6198a9b340de5998dd14a26a0d9d38a6bcac/armstubs/armstub8.S)
+supplies the inherited secure-view controller values used for compatibility.
+These entries are `hardware-facts`; no third-party driver body was imported.
+
+`RaspberryPi4/Lib/exceptions.pi4` records AArch64 architectural facts under
+`vendor-spec`: exception-vector layout, exception-level register banks and
+exception return state. These premises were inherited from the project's
+existing exception, stub and multicore implementation and checked against its
+instruction model; the new implementation session did not directly consult
+an Arm manual. A subsequent architectural review directly checked Arm
+102412_0103_02, Cortex-A72 TRM 100095_0003_06 and DDI0595 ID092421; the exact
+official URLs, pages and verified properties are recorded in
+[the EL3 startup review](EL3_STARTUP_REVIEW.md). This is post-implementation
+verification, not imported handler code or silicon proof. Its primary-only
+frame ownership, callback policy and
+bounded failure reporting are Anvil implementation choices, not an imported
+exception-handler implementation.
+
+The counts below remain the explicitly dated historical snapshot, not a
+claim that the new files existed in that inventory.
+
 Every Git-tracked `.pi4`, `.pbi`, `.unoq`, `.asm` and `.def` file in this
 repository: **218 source files, 207,715 lines** at local `main` `baddc30`.
 Other lanes commit to this tree continuously — that count rose by five while
@@ -808,6 +836,9 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/mailbox.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mailbox.pi4` | consulted | uboot-v2025.01 | GPL-2.0-or-later | cite the source; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/exceptions.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/interrupts.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/interrupts.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | llvm-19.1.0 | Apache-2.0 WITH LLVM-exception | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |

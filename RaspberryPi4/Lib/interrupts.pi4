@@ -1,0 +1,353 @@
+; Pi 4 GIC-400 primary-core interrupt ownership. Dependencies: none.
+; Arm IHI 0048B GICv2: distributor/CPU interface register definitions;
+; Raspberry Pi tools armstub8.S (439b6198), setup_gic, secure control values.
+; No initialization operation clears DAIF. Composition installs the dispatcher
+; in its exception vectors separately. Hardware validation is still required.
+; Parameterless handlers return 1 only after servicing their device source.
+; GICC_IIDR fields: Arm DDI0471B section3.6.1 (revision field is ignored).
+; https://documentation-service.arm.com/static/5e8f15e27100066a414f7424
+#IG_D = $FF841000
+#IG_C = $FF842000
+Global ig_ready.i
+Global ig_el.i
+Global ig_vbar.i
+Global ig_count.i
+Global ig_saved_d.i
+Global ig_saved_c.i
+Global ig_saved_pmr.i
+Dim ig_handlers.i(256)
+Dim ig_enabled.i(256)
+Dim ig_priority.i(256)
+Dim ig_target.i(256)
+
+Procedure.i InterruptLevel()
+  ASM
+    mrs x0, currentel
+    lsr x0, x0, #2
+  EndASM
+EndProcedure
+
+Procedure.i InterruptCore()
+  ASM
+    mrs x0, mpidr_el1
+    movz x1, #255
+    and x0, x0, x1
+  EndASM
+EndProcedure
+
+Procedure.i InterruptMask()
+  ASM
+    mrs x0, daif
+  EndASM
+EndProcedure
+
+Procedure.i InterruptVbar()
+  If InterruptLevel() = 3
+    ASM
+      mrs x0, vbar_el3
+    EndASM
+  Else
+    ASM
+      mrs x0, vbar_el2
+    EndASM
+  EndIf
+EndProcedure
+
+Procedure InterruptBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+Procedure.i InterruptContext()
+  If ig_ready = 0 Or InterruptCore() <> 0
+    ProcedureReturn 0
+  EndIf
+  If InterruptLevel() <> ig_el Or InterruptVbar() <> ig_vbar
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure InterruptRestoreControl()
+  PokeL(#IG_C + 4, ig_saved_pmr)
+  PokeL(#IG_C, ig_saved_c)
+  PokeL(#IG_D, ig_saved_d)
+  InterruptBarrier()
+EndProcedure
+
+Procedure.i InterruptInit(expectedVbar.i)
+  Protected level.i
+  Protected count.i
+  Protected n.i
+  If ig_ready <> 0 Or InterruptCore() <> 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  level = InterruptLevel()
+  If level <> 2 And level <> 3
+    ProcedureReturn 0
+  EndIf
+  If expectedVbar = 0 Or (expectedVbar & 2047) <> 0
+    ProcedureReturn 0
+  EndIf
+  If InterruptVbar() <> expectedVbar
+    ProcedureReturn 0
+  EndIf
+  ; GICv2 architecture ID, bounded to this Pi4 driver's 256 slots.
+  If ((PeekL(#IG_D + $FE8) >> 4) & 15) <> 2
+    ProcedureReturn 0
+  EndIf
+  If (PeekL(#IG_D + 8) & $FFF) <> $43B
+    ProcedureReturn 0
+  EndIf
+  If (PeekL(#IG_C + $FC) & $FFFF0FFF) <> $0202043B
+    ProcedureReturn 0
+  EndIf
+  If level = 3 And (PeekL(#IG_D + 4) & $400) = 0
+    ProcedureReturn 0
+  EndIf
+  count = ((PeekL(#IG_D + 4) & 31) + 1) * 32
+  If count > 256
+    ProcedureReturn 0
+  EndIf
+  ig_saved_d = PeekL(#IG_D)
+  ig_saved_c = PeekL(#IG_C)
+  ig_saved_pmr = PeekL(#IG_C + 4)
+  ig_el = level
+  ig_vbar = expectedVbar
+  ig_count = count
+  For n = 0 To 255
+    ig_handlers(n) = 0
+    ig_enabled(n) = 0
+  Next
+  If level = 3
+    PokeL(#IG_D, 3)
+    PokeL(#IG_C, $1E7)
+  Else
+    PokeL(#IG_D, 1)
+    PokeL(#IG_C, 1)
+  EndIf
+  PokeL(#IG_C + 4, $F0)
+  InterruptBarrier()
+  If level = 3
+    If PeekL(#IG_D) <> 3 Or PeekL(#IG_C) <> $1E7
+      InterruptRestoreControl()
+      ProcedureReturn 0
+    EndIf
+  Else
+    If PeekL(#IG_D) <> 1 Or PeekL(#IG_C) <> 1
+      InterruptRestoreControl()
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  If PeekL(#IG_C + 4) <> $F0
+    InterruptRestoreControl()
+    ProcedureReturn 0
+  EndIf
+  ig_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i InterruptClaim(id.i, handler.i)
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  If id < 16 Or id >= ig_count Or handler = 0 Or (handler & 3) <> 0
+    ProcedureReturn 0
+  EndIf
+  If ig_handlers(id) <> 0
+    ProcedureReturn 0
+  EndIf
+  ; Never take ownership of a previously enabled line or change its group.
+  If (PeekL(#IG_D + $100 + (id / 32) * 4) & (1 << (id & 31))) <> 0
+    ProcedureReturn 0
+  EndIf
+  If (PeekL(#IG_D + $300 + (id / 32) * 4) & (1 << (id & 31))) <> 0
+    ProcedureReturn 0
+  EndIf
+  If ig_el = 3
+    If (PeekL(#IG_D + $80 + (id / 32) * 4) & (1 << (id & 31))) = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ig_priority(id) = PeekA(#IG_D + $400 + id) & 255
+  If id >= 32
+    ig_target(id) = PeekA(#IG_D + $800 + id) & 255
+    PokeA(#IG_D + $800 + id, 1)
+  EndIf
+  PokeA(#IG_D + $400 + id, $A0)
+  InterruptBarrier()
+  If PeekA(#IG_D + $400 + id) <> $A0
+    PokeA(#IG_D + $400 + id, ig_priority(id))
+    If id >= 32
+      PokeA(#IG_D + $800 + id, ig_target(id))
+    EndIf
+    InterruptBarrier()
+    ProcedureReturn 0
+  EndIf
+  If id >= 32
+    If PeekA(#IG_D + $800 + id) <> 1
+      PokeA(#IG_D + $400 + id, ig_priority(id))
+      PokeA(#IG_D + $800 + id, ig_target(id))
+      InterruptBarrier()
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ig_handlers(id) = handler
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i InterruptEnable(id.i)
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  If id < 16 Or id >= ig_count
+    ProcedureReturn 0
+  EndIf
+  If ig_handlers(id) = 0
+    ProcedureReturn 0
+  EndIf
+  If PeekA(#IG_D + $400 + id) <> $A0
+    ProcedureReturn 0
+  EndIf
+  If id >= 32
+    If PeekA(#IG_D + $800 + id) <> 1
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  If ig_el = 3
+    If (PeekL(#IG_D + $80 + (id / 32) * 4) & (1 << (id & 31))) = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  PokeL(#IG_D + $100 + (id / 32) * 4, 1 << (id & 31))
+  InterruptBarrier()
+  If (PeekL(#IG_D + $100 + (id / 32) * 4) & (1 << (id & 31))) = 0
+    ProcedureReturn 0
+  EndIf
+  ig_enabled(id) = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i InterruptDisable(id.i)
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  If id < 16 Or id >= ig_count
+    ProcedureReturn 0
+  EndIf
+  If ig_handlers(id) = 0
+    ProcedureReturn 0
+  EndIf
+  PokeL(#IG_D + $180 + (id / 32) * 4, 1 << (id & 31))
+  InterruptBarrier()
+  If (PeekL(#IG_D + $100 + (id / 32) * 4) & (1 << (id & 31))) <> 0
+    ProcedureReturn 0
+  EndIf
+  ig_enabled(id) = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i InterruptInvoke(handler.i)
+  ASM
+    blr x0
+  EndASM
+EndProcedure
+
+; Composition must install InterruptDispatch in the validated exception table
+; before Start. No production caller starts this driver before silicon gates.
+Procedure.i InterruptStart()
+  Protected n.i
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  For n = 16 To ig_count - 1
+    If ig_enabled(n) <> 0 And ig_handlers(n) <> 0
+      InterruptBarrier()
+      ASM
+        msr daifclr, #2
+        isb
+      EndASM
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i InterruptStop()
+  If InterruptContext() = 0
+    ProcedureReturn 0
+  EndIf
+  ASM
+    msr daifset, #2
+    isb
+  EndASM
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i InterruptDispatch()
+  Protected raw.i
+  Protected id.i
+  Protected result.i
+  If InterruptContext() = 0
+    ProcedureReturn 0
+  EndIf
+  raw = PeekL(#IG_C + $C)
+  id = raw & 1023
+  If id >= 1020
+    ProcedureReturn 1
+  EndIf
+  result = 0
+  If id >= 16 And id < ig_count
+    If ig_handlers(id) <> 0 And ig_enabled(id) <> 0
+      result = InterruptInvoke(ig_handlers(id))
+    EndIf
+    If result <> 1
+      PokeL(#IG_D + $180 + (id / 32) * 4, 1 << (id & 31))
+      ig_enabled(id) = 0
+    EndIf
+  EndIf
+  ; Full IAR token retains source CPU bits. SGIs cannot be disabled with
+  ; ICENABLER; unknown SGIs return fatal rather than claiming containment.
+  InterruptBarrier()
+  PokeL(#IG_C + $10, raw)
+  InterruptBarrier()
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i InterruptShutdown()
+  Protected n.i
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  For n = 16 To ig_count - 1
+    If ig_enabled(n)
+      If InterruptDisable(n) = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    If ig_handlers(n) <> 0
+      PokeA(#IG_D + $400 + n, ig_priority(n))
+      If n >= 32
+        PokeA(#IG_D + $800 + n, ig_target(n))
+      EndIf
+      InterruptBarrier()
+      If (PeekA(#IG_D + $400 + n) & 255) <> ig_priority(n)
+        ProcedureReturn 0
+      EndIf
+      If n >= 32
+        If (PeekA(#IG_D + $800 + n) & 255) <> ig_target(n)
+          ProcedureReturn 0
+        EndIf
+      EndIf
+      ig_handlers(n) = 0
+    EndIf
+  Next
+  InterruptRestoreControl()
+  If PeekL(#IG_D) <> ig_saved_d Or PeekL(#IG_C) <> ig_saved_c Or PeekL(#IG_C + 4) <> ig_saved_pmr
+    ProcedureReturn 0
+  EndIf
+  ig_ready = 0
+  ProcedureReturn 1
+EndProcedure
