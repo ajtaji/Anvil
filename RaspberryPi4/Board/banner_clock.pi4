@@ -231,6 +231,290 @@ Procedure BannerClockTick()
   EndIf
 EndProcedure
 
+; ======================================================================
+;  THE TOUCH KEYBOARD, COMPOSED INTO THE FRAMEBUFFER RENDERER'S FRAME.
+;
+;  This is the CPU/DMA tier's half of the keyboard. The V3D tier's half
+;  is inside its GPU frame (v3d_console.pi4, TouchKeyboardComposeNeon);
+;  there is one layout result and one draw list behind both, so the two
+;  tiers draw the same keyboard at the same pixels and a finger cannot
+;  land on geometry only one of them used.
+;
+;  WHY IT IS HERE. This file is already where a presented overlay is
+;  composed - the banner clock is one - and it is included after both
+;  renderers, so it can see whichever one is active. It adds no second
+;  poll, no second queue and no second presentation path.
+;
+;  WHO OWNS THE FRAME, AND THE ONE TEST THAT DECIDES IT. gCursorGpuOwned
+;  is 1 exactly when V3D is compositing the frame itself, and that is the
+;  same discriminator BannerClockTick uses above. When it is set, this
+;  pass writes NOTHING: the layer is already inside the GPU's frame and a
+;  CPU write here would race a render and a DMA copy.
+; ======================================================================
+Global gTkbMetrics.TouchKeyboardMetrics
+Global gTkbCpuDamage.i   = #TKB_DAMAGE_ALL
+Global gTkbOverlayBound.i = 0
+Global gTkbTried.i = 0
+
+; NOTHING IS DRAWN UNTIL SOMETHING CAN USE IT. The design says in as many
+; words: do not add nonfunctional buttons. Until the input dispatcher
+; routes a contact to this layer and the key model drives show and hide,
+; a keyboard button beside the prompt would be a picture of a feature -
+; it would appear on the glass, be tapped, and do nothing. So the layer
+; lays nothing out and draws nothing until its owner turns it on, once.
+Global gTkbEnabled.i = 0
+
+Procedure TouchKeyboardScreenEnable(on.i)
+  gTkbEnabled = Bool(on <> 0)
+  gTkbTried = 0
+EndProcedure
+
+Procedure.i TouchKeyboardScreenEnabled()
+  ProcedureReturn gTkbEnabled
+EndProcedure
+
+; The console core's geometry stopped meaning anything - a new console
+; size, or the screen going away. Everything the view laid out against it
+; is refused from here until it is laid out again, which is what stops a
+; contact being tested against rectangles describing a screen that is no
+; longer being drawn on.
+Procedure TouchKeyboardOverlayReset()
+  TouchKeyboardLayoutInvalidate()
+  gTkbCpuDamage = #TKB_DAMAGE_ALL
+  gTkbTried = 0
+EndProcedure
+
+Procedure TouchKeyboardComposeCpu()
+  Define n.i
+  Define i.i
+  Define k.i
+  Define col.i
+  Define fg.i
+  Define bg.i
+  Define s.i
+  Define savedScale.i
+  Define x.i
+  Define y.i
+  Define p.i
+  Define c.i
+  Define hadCur.i
+  Define y0.i
+  Define y1.i
+
+  If gScreen = 0 Or DisplayBase() = 0
+    ProcedureReturn
+  EndIf
+  If gCursorGpuOwned <> 0
+    ProcedureReturn
+  EndIf
+  If TouchKeyboardLayoutOk() = 0
+    ProcedureReturn
+  EndIf
+
+  ; A renderer that cleared the whole console rectangle erased the band,
+  ; so this pass has to draw itself whole. The latch is the only way to
+  ; know: the renderer clears its own full-clear flag before this runs.
+  If ConOverlayTakeWhole() <> 0
+    gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  EndIf
+  ; The button beside the prompt sits inside the console rectangle, which
+  ; the renderer hardware-scrolls and repaints row by row, so it is
+  ; redrawn every pass rather than tracked. It is a dozen small fills.
+  TouchKeyboardMarkButton()
+
+  n = TouchKeyboardPaint(#TKB_RENDER_CPU, gTkbCpuDamage)
+  gTkbCpuDamage = #TKB_DAMAGE_CHANGED
+  If n < 1
+    ProcedureReturn
+  EndIf
+
+  ; Lift the pointer, exactly as the framebuffer renderer does, so the
+  ; keyboard is drawn UNDER it and its save-under never keeps keyboard
+  ; pixels. This is the established pointer mechanism; the keyboard
+  ; itself saves nothing under anything.
+  hadCur = gCurShown
+  If hadCur <> 0
+    CursorRestore(gCurX, gCurY)
+    gCurShown = 0
+  EndIf
+
+  ; Whatever magnification the library was on, not whatever the screen
+  ; settings say it should be - those two can differ while a command is
+  ; part way through changing one, and this pass must put back exactly
+  ; what it found.
+  savedScale = dsp_scale
+  s = 0
+  i = 0
+  While i < n
+    k   = TouchKeyboardDrawKind(i)
+    col = TouchKeyboardDrawFg(i)
+    fg  = DisplayRGB((col >> 16) & $FF, (col >> 8) & $FF, col & $FF)
+    If k = #TKB_DRAW_RECT
+      DisplayFillRect(TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawW(i), TouchKeyboardDrawH(i), fg)
+    ElseIf k = #TKB_DRAW_TEXT
+      If TouchKeyboardDrawScale(i) <> s
+        s = TouchKeyboardDrawScale(i)
+        ; THE EXISTING INTEGER BITMAP-FONT MAGNIFICATION. A whole number
+        ; of pixels per glyph pixel, never a filtered enlargement of a
+        ; finished bitmap - a filtered 1-bit glyph is a blurred glyph.
+        DisplayScale(s)
+      EndIf
+      col = TouchKeyboardDrawBg(i)
+      bg  = DisplayRGB((col >> 16) & $FF, (col >> 8) & $FF, col & $FF)
+      x = TouchKeyboardDrawX(i)
+      y = TouchKeyboardDrawY(i)
+      p = TouchKeyboardDrawText(i)
+      c = PeekA(p) & $FF
+      While c <> 0
+        DisplayChar(x, y, c, fg, bg)
+        x = x + DisplayCharWidth()
+        p = p + 1
+        c = PeekA(p) & $FF
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+  DisplayScale(savedScale)
+
+  If hadCur <> 0
+    CursorSave(gCurX, gCurY)
+    CursorDraw(gCurX, gCurY)
+    gCurShown = 1
+    DisplayFlushRect(gCurX, gCurY, #CUR_W, #CUR_H)
+  EndIf
+
+  ; THE BUTTON IS INSIDE THE ROWS THE RENDERER HARDWARE-SCROLLS. Leave a
+  ; quiet repaint flag on them: when the console scrolls, the flag travels
+  ; with the picture to wherever the moved copy of the button landed, the
+  ; renderer repaints those rows from the grid, and this pass draws the
+  ; button again. That is what stops a trail of buttons walking up the
+  ; screen, and it costs three row repaints rather than the scroll itself.
+  y0 = (TouchKeyboardButtonY() - LogoHeight()) / DisplayCharHeight()
+  y1 = (TouchKeyboardButtonY() + TouchKeyboardButtonH() - 1 - LogoHeight()) / DisplayCharHeight()
+  If y0 < 0
+    y0 = 0
+  EndIf
+  While y0 <= y1
+    ConMarkViewRowQuiet(y0)
+    y0 = y0 + 1
+  Wend
+
+  ; THE SEAM. On HDMI and on the panel at 0 and 180 this is a comparison
+  ; and a return; on a turned panel it is the one pass that puts these
+  ; rows on the glass, and it covers the damage and nothing else.
+  y0 = TouchKeyboardDamageTop()
+  y1 = TouchKeyboardDamageBottom()
+  If y0 < 0 Or y1 < y0
+    ProcedureReturn
+  EndIf
+  If hadCur <> 0
+    If gCurY < y0
+      y0 = gCurY
+    EndIf
+    If (gCurY + #CUR_H - 1) > y1
+      y1 = gCurY + #CUR_H - 1
+    EndIf
+  EndIf
+  ScrPresent(y0, y1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The surface measurements the layout is computed from, read from the
+;  display and screen seams and from nowhere else.
+;
+;  THE DENSITY IS A READING OR IT IS NOTHING. ScrDiagMeasured() is 1 only
+;  when the screen actually said how big it is - the DSI panel's own
+;  microcontroller does, over I2C. HDMI's 24 inch figure is a stated
+;  assumption, and an assumption is not a measurement to size a finger
+;  target from, so this hands the view 0 and the view falls back to the
+;  existing explicit display scale. Nothing here asserts a guessed inch.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardScreenMetrics()
+  gTkbMetrics\logicalW     = DisplayWidth()
+  gTkbMetrics\logicalH     = DisplayHeight()
+  gTkbMetrics\bannerH      = LogoHeight()
+  gTkbMetrics\cellW        = DisplayCharWidth()
+  gTkbMetrics\cellH        = DisplayCharHeight()
+  gTkbMetrics\displayScale = gScrScale
+  If ScrDiagMeasured(gScrSrc) <> 0
+    gTkbMetrics\ppi = ScrPpi(gScrSrc)
+  Else
+    gTkbMetrics\ppi = 0
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchKeyboardScreenAttach - register the layer, and lay it out ONCE so
+;  the button beside the prompt exists before anybody asks for a keyboard.
+;
+;  ONLY ON A BOARD THAT CAN BE TOUCHED. A button an operator cannot tap is
+;  worse than no button: it says this monitor has a touch keyboard on a
+;  screen that has no touch controller. HwTouchReady() is the whole test,
+;  and on a board without one nothing here draws at all.
+;
+;  Tried ONCE per geometry, not once per service tick. A refusal is a fact
+;  about this screen and re-deriving it sixty times a second would only
+;  spend the tick budget to reach the same sentence.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardScreenAttach()
+  If gTkbOverlayBound = 0
+    ConSetOverlay(@TouchKeyboardComposeCpu, @TouchKeyboardOverlayReset)
+    gTkbOverlayBound = 1
+  EndIf
+  If gTkbEnabled = 0 Or gTkbTried <> 0 Or gScreen = 0 Or ConGridReady() = 0
+    ProcedureReturn
+  EndIf
+  If HwTouchReady() = 0
+    ProcedureReturn
+  EndIf
+  gTkbTried = 1
+  TouchKeyboardScreenMetrics()
+  If TouchKeyboardLayout(@gTkbMetrics) <> 0
+    TouchKeyboardViewSetVisible(0)
+    gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+    ConOverlayDamage()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Show the keyboard: lay it out against the live surface and RESERVE the
+;  bottom of the console for it. Returns 1, or 0 with a whole-sentence
+;  refusal waiting in TouchKeyboardRefusal() for the caller to print -
+;  nothing in this file prints, because it runs from the service tick.
+;
+;  NOT ONE STORED CELL IS TOUCHED. ConSetViewRows changes how much of the
+;  grid is painted and nothing else; the history, the scroll position and
+;  the text cursor are exactly where they were.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardScreenShow()
+  If gScreen = 0 Or ConGridReady() = 0
+    ProcedureReturn 0
+  EndIf
+  ; Being asked to show it IS the statement that something can use it.
+  gTkbEnabled = 1
+  TouchKeyboardScreenAttach()
+  TouchKeyboardScreenMetrics()
+  If TouchKeyboardLayout(@gTkbMetrics) = 0
+    ProcedureReturn 0
+  EndIf
+  TouchKeyboardViewSetVisible(1)
+  ConSetViewRows(TouchKeyboardConsoleRows())
+  TouchKeyboardMarkAll()
+  gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  ConOverlayDamage()
+  ProcedureReturn 1
+EndProcedure
+
+; Hide it. The revealed rows are repainted FROM THE RETAINED CONTENT -
+; there is nothing to reconstruct, because nothing was ever taken out.
+Procedure TouchKeyboardScreenHide()
+  TouchKeyboardViewSetVisible(0)
+  ConViewRelease()
+  TouchKeyboardMarkAll()
+  gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  ConOverlayDamage()
+EndProcedure
+
 ; Safe boot/prompt service boundary. Call after a meaningful progress line
 ; or driver phase tick, never for every character and never from UartWrite.
 Procedure ScreenServiceTick()
@@ -238,6 +522,7 @@ Procedure ScreenServiceTick()
     ProcedureReturn
   EndIf
   gScreenServiceBusy = 1
+  TouchKeyboardScreenAttach()
   ScreenPump()
   BannerClockTick()
   ScreenBannerTick()

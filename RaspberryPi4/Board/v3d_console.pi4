@@ -291,6 +291,67 @@ Procedure V3dConRenderCursor()
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  TouchKeyboardComposeNeon - the touch keyboard as a layer INSIDE the
+;  GPU frame.
+;
+;  IT IS DRAWN HERE AND NOT AFTER THE PRESENT, and that is the whole
+;  rule. While V3D owns the frame, a CPU write to the framebuffer races
+;  the GPU's render and the DMA copy that follows it, and the losing
+;  order is invisible until a key is missing from one frame in ten. So
+;  the keyboard's draw list is walked with the ENGINE's own primitives,
+;  between the console text and the pointer - a final UI layer below the
+;  pointer, which is what the design asks for - and it reaches the glass
+;  through the one present this frame already had. No save-under, no
+;  second framebuffer writer, no independent presentation.
+;
+;  THE WHOLE LAYER, EVERY FRAME, AND THAT IS NOT A FULL-SCREEN REPAINT.
+;  A V3D frame is rebuilt from nothing every time it is drawn at all
+;  (ConPaintV3d has always redrawn the entire grid), so a damage list
+;  would name rectangles inside a frame that no longer holds what was
+;  under them. The keyboard adds about 180 boxes and labels to a frame
+;  that already carries forty rows of text. The CPU renderer, where a
+;  partial repaint IS meaningful, uses the damage list instead.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardComposeNeon()
+  Define n.i
+  Define i.i
+  Define k.i
+  Define col.i
+  Define face.i
+  Define at.i
+
+  If TouchKeyboardLayoutOk() = 0
+    ProcedureReturn
+  EndIf
+  n = TouchKeyboardPaint(#TKB_RENDER_GPU, #TKB_DAMAGE_ALL)
+  If n < 1
+    ProcedureReturn
+  EndIf
+  face = 0
+  i = 0
+  While i < n
+    k = TouchKeyboardDrawKind(i)
+    col = TouchKeyboardDrawFg(i)
+    If k = #TKB_DRAW_RECT
+      Neon_Box(TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawW(i), TouchKeyboardDrawH(i), Neon_RGBA((col >> 16) & $FF, (col >> 8) & $FF, col & $FF, 255))
+    ElseIf k = #TKB_DRAW_TEXT
+      at = TouchKeyboardDrawScale(i)
+      If at <> face
+        face = at
+        NeonFontSetup(#NEON_FONT_MONO, face, 0)
+      EndIf
+      Neon_Text(#NEON_FONT_MONO, TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawText(i), Neon_RGBA((col >> 16) & $FF, (col >> 8) & $FF, col & $FF, 255))
+    EndIf
+    i = i + 1
+  Wend
+  ; Put the mono face back the size the console set it to, or the next
+  ; thing that asks the engine for monospaced text gets the keyboard's.
+  If face <> 0
+    NeonFontSetup(#NEON_FONT_MONO, gScrScale, 0)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  V3dConRenderGridFrame - the GPU half of a frame: clear to the ground and
 ;  Neon_Text the SHARED console grid, one row per non-blank row, below the
 ;  banner band. Reads the same grid (ConGrid*) and lays it out at the same
@@ -320,6 +381,10 @@ Procedure.i V3dConRenderGridFrame()
     EndIf
     r = r + 1
   Wend
+  ; The UI layer, then the pointer on top of it. This order is the layer
+  ; order the design states and it is the only place it is decided on
+  ; this tier.
+  TouchKeyboardComposeNeon()
   V3dConRenderCursor()
   ProcedureReturn NeonFrameEnd()
 EndProcedure
@@ -754,11 +819,18 @@ Procedure.i V3dConStart()
   Print(" us, wall ")
   PrintDec(V3dConUsWall())
   PrintN(" us.")
+  ; THE STORED GRID, NOT THE VIEWPORT. This line reports how much text the
+  ; console holds, which does not change when the touch keyboard reserves
+  ; the bottom of the screen; ConGridRows() would have answered how many
+  ; rows are currently VISIBLE and quietly turned this into a different
+  ; sentence the moment a keyboard came up.
   Print("  The GPU frame is redrawn only when the screen changes. Grid is ")
-  PrintDec(ConGridCols())
+  PrintDec(ConContentCols())
   Print(" x ")
-  PrintDec(ConGridRows())
-  PrintN(" characters.")
+  PrintDec(ConContentRows())
+  Print(" characters, showing ")
+  PrintDec(ConViewRows())
+  PrintN(" rows.")
   PrintN("  Type screen dma to return to the DMA/CPU console; info still works")
   PrintN("  (the firmware mailbox survives V3D). Type screenshot to capture it.")
   ProcedureReturn 1
@@ -796,6 +868,12 @@ Procedure V3dConStop()
   DisplayClear(gScreenBg)
   DrawBanner()
   DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+  ; THE CLEAR ABOVE TOOK THE KEYBOARD WITH IT. The UI layer was inside the
+  ; GPU's frame a moment ago and is about to be composed by the CPU
+  ; renderer instead; without this latch its next pass would draw only the
+  ; keys it thinks changed, onto a band that is no longer there.
+  ConOverlayMarkWhole()
+  ConOverlayDamage()
   PrintN("The console is back on the DMA/CPU backend. The V3D engine stays loaded,")
   PrintN("so screen v3d switches back to it without re-initialising.")
   CompilerEndIf
