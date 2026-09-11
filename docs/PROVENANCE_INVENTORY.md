@@ -593,6 +593,8 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Core/help.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Core/help.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Board/boot_timing.pi4` | hardware-facts | vendor-spec | vendor document | cite the document; no notice obligation |
+| `RaspberryPi4/Board/screen_cmd.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document (HVS behaviour read); no notice obligation |
 | `Anvil/Graphics/Vulkan/vk_v3d_backend.pi4` | consulted | mesa-24.3.4 | MIT | reference read for V3D behaviour; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_v3d_backend.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for semantics; cite; no code taken |
 | `RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4` | hardware-facts | vendor-spec | vendor document | cite the document; no notice obligation |

@@ -252,8 +252,8 @@ raw-core gate's owner, and it is red on `main` now.
 
 ## 4. Compiler reentrancy — REPORT ONLY
 
-Nothing in the compiler was changed. Paths are in the private compiler tree,
-`C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\`.
+Nothing in the compiler was changed. File and line references below are into the
+private compiler tree (not part of this repository).
 
 **The procedures a secondary core executes today are the two naked ASM blocks in
 §2.1, and neither is affected by anything below.** This section is the contract
