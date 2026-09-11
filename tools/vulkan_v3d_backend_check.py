@@ -85,22 +85,31 @@ MUTANTS = (
     ),
 )
 
-# RULES THIS DESK GATE CANNOT REACH, and it says so rather than pretending
-# they passed. Each becomes observable only once the graphics engine is
-# initialised, which needs the GPU; they are proved by
-# RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4 in a board slot.
-BOARD_ONLY = (
-    ("the backend stops refusing the buffer the display is scanning out",
+# RULES THIS DESK GATE CANNOT REACH. Each compares against a number that
+# only exists once the graphics engine is initialised, so no desk run can
+# mutate-test it - the engine-not-ready refusal answers first. They are
+# NOT therefore unproven: each carries the board run that settled it, in
+# BOTH directions. A rule added here without a proof prints as OWED and
+# FAILS the gate, so it stays visible until it has one.
+DESK_UNREACHABLE = (
+    ("the backend refuses the buffer the display is scanning out",
      "with the engine down Neon_SurfaceBase() is zero and the engine-not-ready "
-     "refusal answers first, so no desk run reaches that comparison. Board run 2 "
-     "(2026-09-11) evaluated it with a live engine and it correctly did NOT fire - "
-     "the image was at $063E8000 and the surface at $06000000 - so the false-positive "
-     "direction is proven and the REFUSING direction is still owed"),
-    ("the backend stops matching the render geometry Neon was initialised with",
-     "the width, height and pitch it compares against only exist after NeonInit. "
-     "Board run 2 evaluated it at 800x1280 pitch 3200 against a surface of exactly "
-     "that, so it correctly did not fire; a mismatched extent has never been offered "
-     "to it on silicon and the REFUSING direction is still owed"),
+     "refusal answers first, so no desk run reaches that comparison",
+     "PROVEN BOTH DIRECTIONS on silicon. Accepting: board run 2 (2026-09-11, "
+     "container a06b43e5, vulkanClearProof) cleared an image at $063E8000 against "
+     "a surface at $06000000 and the rule correctly did not fire. Refusing: board "
+     "run 3 (2026-09-11, container 504bd049, vulkanClearRefusals) offered it an "
+     "image of EXACTLY the render geometry placed at the surface base, so every "
+     "earlier check passed and only this rule could answer - vkEndCommandBuffer "
+     "returned VK_ERROR_FEATURE_NOT_PRESENT (-8); report slot 2 = 1, slot 3 = -8"),
+    ("the backend refuses any extent but the render geometry NeonInit was given",
+     "the width, height and pitch it compares against only exist after NeonInit",
+     "PROVEN BOTH DIRECTIONS on silicon. Accepting: board run 2 ran 800x1280 "
+     "pitch 3200 against a surface of exactly that and the rule did not fire. "
+     "Refusing: board run 3 offered a 640x480 image at $063E8000 - not the "
+     "surface base, so the scanned-buffer rule could not be what answered - and "
+     "vkEndCommandBuffer returned VK_ERROR_FEATURE_NOT_PRESENT (-8); report "
+     "slot 4 = 1, slot 5 = -8"),
 )
 
 
@@ -332,15 +341,29 @@ def main() -> int:
                 print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
                 missed += 1
 
-    for name, why in BOARD_ONLY:
-        print(f"  OWED   {name}")
-        print(f"         not reachable from a desk: {why}")
+    owed = 0
+    for name, why, proof in DESK_UNREACHABLE:
+        if proof:
+            print(f"  BOARD  {name}")
+            print(f"         {proof}")
+        else:
+            owed += 1
+            print(f"  OWED   {name}")
+            print(f"         not reachable from a desk, and not proven on one: {why}")
 
     if missed:
-        print(f"\nvulkan_v3d_backend_check: {missed} of {len(MUTANTS)} mutations were not caught")
+        print()
+        print(f"vulkan_v3d_backend_check: {missed} of {len(MUTANTS)} mutations were not caught")
         return 1
-    print(f"\nvulkan_v3d_backend_check: all {len(MUTANTS)} desk-reachable mutations rejected; "
-          f"{len(BOARD_ONLY)} rules are board-only and are listed above, not claimed")
+    if owed:
+        print()
+        print(f"vulkan_v3d_backend_check: all {len(MUTANTS)} desk-reachable mutations rejected, "
+              f"but {owed} desk-unreachable rule(s) have no board proof and are not claimed")
+        return 1
+    print()
+    print(f"vulkan_v3d_backend_check: all {len(MUTANTS)} desk-reachable mutations rejected; "
+          f"the {len(DESK_UNREACHABLE)} desk-unreachable rules are proven on silicon in both "
+          f"directions, above")
     return 0
 
 

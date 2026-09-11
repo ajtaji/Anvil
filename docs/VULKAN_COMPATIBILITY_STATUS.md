@@ -146,11 +146,8 @@ What that verdict is computed from, and therefore what it asserts:
 - **One geometry only.** 800x1280 at pitch 3200 — the render geometry `NeonInit`
   was given. No other extent, format, tiling, mip level, array layer or sample
   count has ever reached the GPU.
-- **The two refusal rules were exercised only in the accepting direction.** The
-  image was at `$063E8000` and the surface at `$06000000`, and the extents
-  matched exactly, so the "is this the scanned buffer?" and "is this the render
-  geometry?" checks both correctly did not fire. That they *would* fire on a bad
-  request is still unproven on silicon and is the next board run.
+- **The two refusal rules were exercised only in the accepting direction** by
+  this run. Board run 3 below closed that.
 - **No asynchrony.** `NeonFrameEnd` waits for both jobs, so the fence was already
   signalled when `vkQueueSubmit` returned. The pending command-buffer state has
   never been observed on hardware.
@@ -158,6 +155,54 @@ What that verdict is computed from, and therefore what it asserts:
   and no fault injection: an unmapped address requiring a bounded fault rather
   than a hang is still owed. Resource reuse across submissions was not exercised
   either — only one submission happened.
+
+**2026-09-11, run 3 — PASSED. The two refusal rules, in the direction that
+matters.** `vulkanClearRefusals.pi4`, container `504bd049…`, `screen dma` first,
+returned in 5.8 s with the report at `$00581868`, magic `564B4352`,
+**slot 1 = 0**. It submits nothing: every refusal here happens at record time,
+inside `vkCmdClearColorImage`, so `avkBackendSubmitClear` is never reached.
+
+`avkBackendClearSupported` checks in a fixed order — engine ready, base and size
+sane, inside the window, extent, pitch, size against the extent, and last the
+scanned-buffer rule. A request that trips two proves only the earlier one, so
+each request was built to trip exactly one, which needed a Vulkan window
+spanning both screens:
+
+| Rule | The request | Result |
+|---|---|---|
+| refuses the buffer the display is scanning out | an 800x1280 image at pitch 3200 — *exactly* the render geometry — placed at the surface base `$06000000`, so every earlier check passes and only this rule can answer | slot 2 = 1, slot 3 = **-8** (`VK_ERROR_FEATURE_NOT_PRESENT`) |
+| refuses any extent but the render geometry | a 640x480 image at `$063E8000`, which is *not* the surface base, so the scanned-buffer rule cannot be what answers | slot 4 = 1, slot 5 = **-8** |
+| the refusals discriminate | an 800x1280 image at `$063E8000` — right extent, not the scanned buffer | slot 9 = 1, slot 10 = `VK_SUCCESS`; recorded and thrown away unsubmitted |
+
+Also settled by the same run, each of which needs a live engine:
+
+- **The live row pitch.** `avkBackendRowPitchFor(800)` = 3200, the surface's own
+  pitch; `(640)` = 2560, the tight pitch. Slot 6 = 1. This is what makes run 2's
+  slot 17 mean something.
+- **The live capability answer.** Slot 12 = **7** — `DEVICE | CLEAR_COLOR | GPU`.
+  A desk run can only ever prove 0.
+- **The backend's microsecond clock is real.** `V3dCounterHz()` = 54,000,000 and
+  the counter advanced across the run. Slot 13 = 1. That clock is what bounds
+  `vkWaitForFences`; a stalled one would leave only the poll cap between a dead
+  device and a hang.
+- **Allocator reuse on silicon.** Freeing the 640x480 allocation and placing a
+  full-geometry image in the hole it left returned the same address,
+  `$063E8000`. Slot 27 = 1. Run 2 never exercised reuse.
+- **Nothing reached the GPU.** Slot 16 = 1: `V3dBinJobs`, `V3dRenderJobs`,
+  `V3dTfuJobs` and `avkBackendJobs` all still 0, and both screen-sized buffers
+  byte-identical to the pattern they were filled with (slot 31 delta = 0).
+- Exactly two validation faults recorded (slot 34), which is the two refusals
+  and nothing else. The engine needed the same 10.52 MiB arena.
+
+**With run 3, both rules `tools/vulkan_v3d_backend_check.py` lists as
+desk-unreachable are proven on silicon in both directions**, and that gate now
+prints them as `BOARD` with their containers rather than as `OWED`. A rule added
+to that list in future without a board proof prints `OWED` and fails the gate.
+
+**Still owed after run 3, and unchanged by it:** no shader, no draw, no other
+format or tiling or mip or layer or sample count, no asynchrony, no concurrency,
+no caches-on/caches-off pair, no fault injection, and no repeat or soak.
+
 
 ## Required architecture
 
