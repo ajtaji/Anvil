@@ -821,5 +821,60 @@ Procedure.i Main()
     ProcedureReturn 127
   EndIf
 
+  ; ---------------- 130..139  the operator's own hand ------------------
+  ; `screen keyboard show` and `screen keyboard hide` exist because the
+  ; band could otherwise only be asked for with a finger, and a console
+  ; that can do everything except the one thing on the screen has a hole
+  ; in it. What has to be true is that it is THE SAME PATH a tap takes -
+  ; the model's intent, then the service tick - and that is what these
+  ; check: after it, the dispatcher holds the band, the console has
+  ; reserved the rows, and a key typed on the glass still reaches the
+  ; editor. A command that reached past the model into the screen half
+  ; would pass a "is it visible" test and fail every one of these.
+  If TouchKeyboardRequest(0) <> 0
+    ProcedureReturn 130
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn 131
+  EndIf
+  If InputRegionOwnerAt(40, TouchKeyboardPromptY() + 2) <> #AIO_KEYBOARD
+    ProcedureReturn 132
+  EndIf
+  If TouchKeyboardRequest(1) <> 1
+    ProcedureReturn 133
+  EndIf
+  If TouchKeyboardViewVisible() = 0
+    ProcedureReturn 134
+  EndIf
+  ; The band is the dispatcher's rectangle for this layer now, which is
+  ; what stops a contact on a key reaching the console underneath.
+  If InputRegionOwnerAt(TouchKeyboardBandX() + 4, TouchKeyboardBandY() + 4) <> #AIO_KEYBOARD
+    ProcedureReturn 135
+  EndIf
+  If ConViewRows() <> TouchKeyboardConsoleRows()
+    ProcedureReturn 136
+  EndIf
+  ; And it is a keyboard, not a picture of one: a key tapped on a band
+  ; opened from the console types into the same line the wire does.
+  TextEditBegin()
+  InputFocusSet(#AIF_COMMAND_LINE)
+  k = GateFindLabel("g")
+  If k < 0
+    ProcedureReturn 137
+  EndIf
+  GateContact(GateKeyCx(k), GateKeyCy(k), 21, #AIT_DOWN)
+  GateContact(GateKeyCx(k), GateKeyCy(k), 21, #AIT_UP)
+  GateSpin()
+  If TextEditLength() <> 1
+    ProcedureReturn 138
+  EndIf
+  ; Put away from the same command, and the rows come back.
+  If TouchKeyboardRequest(0) <> 0
+    ProcedureReturn 139
+  EndIf
+  If ConViewReserved() <> 0
+    ProcedureReturn 140
+  EndIf
+
   ProcedureReturn 0
 EndProcedure

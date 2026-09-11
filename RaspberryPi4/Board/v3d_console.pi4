@@ -291,26 +291,35 @@ Procedure V3dConRenderCursor()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  TouchKeyboardComposeNeon - the touch keyboard as a layer INSIDE the
-;  GPU frame.
+;  TouchKeyboardComposeNeon - WHAT OF THE KEYBOARD IS STILL DRAWN INSIDE
+;  THE GPU FRAME, which is now the keyboard BUTTON and nothing else.
 ;
-;  IT IS DRAWN HERE AND NOT AFTER THE PRESENT, and that is the whole
-;  rule. While V3D owns the frame, a CPU write to the framebuffer races
-;  the GPU's render and the DMA copy that follows it, and the losing
-;  order is invisible until a key is missing from one frame in ten. So
-;  the keyboard's draw list is walked with the ENGINE's own primitives,
-;  between the console text and the pointer - a final UI layer below the
-;  pointer, which is what the design asks for - and it reaches the glass
-;  through the one present this frame already had. No save-under, no
-;  second framebuffer writer, no independent presentation.
+;  THE BAND IS NOT DRAWN HERE ANY MORE, and the reason is the face on the
+;  keys. This engine has ONE face - a one-bit cell at four integer
+;  scales - and a cell font can only be enlarged by whole pixels, so at
+;  three or four times a letter is a staircase. That is what the panel
+;  was showing, and it is what was called blocky. The engine cannot be
+;  given a coverage-map face cheaply: the 4.2 TMU cannot sample the
+;  linear atlas the baked faces live in, which is the same reason the
+;  banner - photo, smooth title and all - is not a GPU texture either.
 ;
-;  THE WHOLE LAYER, EVERY FRAME, AND THAT IS NOT A FULL-SCREEN REPAINT.
-;  A V3D frame is rebuilt from nothing every time it is drawn at all
-;  (ConPaintV3d has always redrawn the entire grid), so a damage list
-;  would name rectangles inside a frame that no longer holds what was
-;  under them. The keyboard adds about 180 boxes and labels to a frame
-;  that already carries forty rows of text. The CPU renderer, where a
-;  partial repaint IS meaningful, uses the damage list instead.
+;  SO THE BAND TAKES THE BANNER'S ROUTE, exactly. The CPU composes it in
+;  LOGICAL coordinates through display.pi4 (DrawSmoothText and the rest),
+;  ScrPresent puts it on the panel through the one transpose this monitor
+;  owns, and every GPU frame after that CARRIES THOSE PIXELS ALONG -
+;  ScrGpuKeepLogicalBand copies them back out of the presented front in
+;  ConPaintV3d, the same way ScrGpuKeepBanner carries the banner. No
+;  second renderer, no second rotation formula, no race: the CPU never
+;  writes a byte the GPU is rendering into, because the band it draws is
+;  the console's own logical surface and the copy that carries it happens
+;  after NeonFrameEnd has waited.
+;
+;  WHAT STAYS HERE. The button beside the prompt, which lives INSIDE the
+;  console rectangle the GPU repaints wholesale every frame - there is no
+;  band-shaped hole to carry it in, and it is rectangles rather than
+;  type. Its "KB" fallback label is a 16 x 16 box, which could not hold
+;  the 30 px face on any tier; the same fallback rule the framebuffer
+;  composer states puts the cell font in it.
 ; ----------------------------------------------------------------------
 Procedure TouchKeyboardComposeNeon()
   Define n.i
@@ -322,6 +331,13 @@ Procedure TouchKeyboardComposeNeon()
   Define at.i
 
   If TouchKeyboardLayoutOk() = 0
+    ProcedureReturn
+  EndIf
+  ; THE BAND IS THE CPU COMPOSER'S, AND IT IS ALREADY ON THE PANEL. See
+  ; the header: drawing it here as well would put a frame of blocky
+  ; labels on the glass for the length of one present, every time the
+  ; console repainted, and then replace them.
+  If TouchKeyboardViewVisible() <> 0
     ProcedureReturn
   EndIf
   n = TouchKeyboardPaint(#TKB_RENDER_GPU, #TKB_DAMAGE_ALL)
@@ -343,17 +359,6 @@ Procedure TouchKeyboardComposeNeon()
       EndIf
       ; The item is a label centred in a box; the mono face at `at` is
       ; the bitmap cell magnified, so the centring is arithmetic.
-      ;
-      ; THE CELL FONT HERE, THE SMOOTH FACE ON THE CPU RENDERER, AND THAT
-      ; IS NOT AN OVERSIGHT. The engine this layer is drawn with has one
-      ; face - a one-bit cell at four integer scales - and it is the face
-      ; the console text ALL AROUND these keys is drawn with on this
-      ; path. Smooth key labels in a frame of blocky console text would
-      ; be the one place in the picture that did not match, and giving
-      ; the engine a coverage-map face is a change to the engine, not to
-      ; the keyboard. The renderer that paints the panel the keyboard is
-      ; actually touched on picks the smooth face; see the composer in
-      ; RaspberryPi4/Board/banner_clock.pi4.
       len = 0
       While PeekA(TouchKeyboardDrawText(i) + len) <> 0
         len = len + 1
@@ -367,6 +372,19 @@ Procedure TouchKeyboardComposeNeon()
   If face <> 0
     NeonFontSetup(#NEON_FONT_MONO, gScrScale, 0)
   EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConKeepKeyboardBand - the keyboard band's half of the banner's
+;  deal, in one place so ConPaintV3d says it once for both buffered
+;  paths. Nothing to carry when the band is down; the GPU frame then
+;  owns every row it used to cover.
+; ----------------------------------------------------------------------
+Procedure V3dConKeepKeyboardBand(renderBase.i)
+  If TouchKeyboardLayoutOk() = 0 Or TouchKeyboardViewVisible() = 0
+    ProcedureReturn
+  EndIf
+  ScrGpuKeepLogicalBand(renderBase, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -523,6 +541,11 @@ Procedure ConPaintV3d()
       Else
         V3dConBlitBanner(renderBase)
       EndIf
+      ; AND THE KEYBOARD BAND THE SAME WAY. It is CPU-composed in logical
+      ; coordinates and already on the panel; this carries it through a
+      ; frame the GPU cleared, so the console repaint that follows a
+      ; keystroke does not blank the keys and make them be redrawn.
+      V3dConKeepKeyboardBand(renderBase)
       shown = ScrGpuPresent(renderBase, bytes)
       If shown <> 0
         V3dConCursorRefresh()
@@ -536,6 +559,12 @@ Procedure ConPaintV3d()
     If r = #NEON_OK
       V3dConBlitBanner(DisplayBase())
       V3dConCursorRefresh()
+      ; NOTHING TO CARRY THE KEYBOARD BAND IN. This frame was rendered
+      ; straight into the shown surface, so the clear at the top of it
+      ; took the band with it and there is no second buffer to copy the
+      ; presented band out of. Say so, and the composer that runs next
+      ; draws itself whole - the same latch a full console clear sets.
+      ConOverlayMarkWhole()
       shown = 1
     EndIf
   EndIf

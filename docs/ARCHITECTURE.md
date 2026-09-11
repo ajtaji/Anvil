@@ -137,11 +137,13 @@ physical scanout orientation are distinct so landscape text, capture, cursor,
 and touch can share one mapping contract.
 
 The touch keyboard's draw list is a consequence of that separation: an item is a
-label and a box, and each renderer picks the face it has. The framebuffer
-renderer sets key labels in an anti-aliased face and falls back to the cell font
-only where that face does not fit; the GPU tier draws the cell font it shares
-with the console text around it. See
-[TOUCH_KEYBOARD_LABELS.md](TOUCH_KEYBOARD_LABELS.md).
+label and a box, and the renderer picks the face and centres what it draws. Key
+labels are set in an anti-aliased face on both tiers, falling back to the cell
+font only where that face does not fit the box. On the GPU tier the band is
+composed by the CPU in logical coordinates and presented through the one
+transpose, and each GPU frame carries the presented band back into its render
+target - the same arrangement that puts the banner's photo and smooth title on
+that tier. See [TOUCH_KEYBOARD_LABELS.md](TOUCH_KEYBOARD_LABELS.md).
 
 `Anvil/Graphics/Vulkan/` builds above that separation. It currently provides a
 partial registry-derived core-1.0 vocabulary, native object and command-buffer

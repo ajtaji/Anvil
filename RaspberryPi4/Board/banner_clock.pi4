@@ -311,15 +311,70 @@ Procedure TouchKeyboardOverlayReset()
   gTkbTried = 0
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  THE POINTER, ON A TIER WHERE IT HAS NO SAVE-UNDER.
+;
+;  While V3D composes the frame the pointer is drawn INSIDE it, by
+;  V3dConRenderCursor, and there is no CPU save-under to lift and put
+;  back - that is what gCursorGpuOwned says. A band composed after that
+;  frame was presented therefore lands ON TOP of the pointer, and the
+;  design's layer order is the other way round.
+;
+;  So the mask is written again, into the surface that is actually being
+;  scanned, through the one logical-to-physical map - which is exactly
+;  what BannerClockTick does when the clock advances underneath a
+;  pointer, and it is the same two calls. NOTHING about the save-under
+;  mechanism changes here, because on this tier there is not one.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardPresentedCursor(y0.i, y1.i)
+  Define base.i
+  Define lw.i
+  Define lh.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  If gCurY > y1 Or (gCurY + #CUR_H - 1) < y0
+    ProcedureReturn
+  EndIf
+  If ScrCaptureSnapshot(@base, @lw, @lh, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    ProcedureReturn
+  EndIf
+  PresentedOverlayCursor(base, pitch, rot, panelW, panelH)
+  gPresentedOverlayRect\x = gCurX
+  gPresentedOverlayRect\y = gCurY
+  gPresentedOverlayRect\w = #CUR_W
+  gPresentedOverlayRect\h = #CUR_H
+  PresentedOverlaySyncRect(base, pitch, rot, panelW, panelH, @gPresentedOverlayRect)
+EndProcedure
+
 ; ANVIL-TOUCH-KEYBOARD-COMPOSE-BEGIN
 ; THIS PROCEDURE IS LIFTED VERBATIM by tools/keyboard_face_emitted_check.py
-; and compiled into RaspberryPi4/Tests/keyboard_face_emitted_gate.pi4, where
-; it runs over the real key model and the real view with the board's drawing
-; leaves recorded instead of performed. Nothing is copied and nothing is
-; paraphrased: the gate goes red if the fences move, and what it executes is
+; and by tools/keyboard_gpu_face_emitted_check.py, and compiled into
+; RaspberryPi4/Tests/keyboard_face_emitted_gate.pi4 and
+; RaspberryPi4/Tests/keyboard_gpu_face_emitted_gate.pi4, where it runs over
+; the real key model and the real view with the board's drawing leaves
+; recorded instead of performed - the first over the framebuffer tier, the
+; second over the V3D tier's target buffer. Nothing is copied and nothing is
+; paraphrased: the gates go red if the fences move, and what they execute is
 ; this text. Keep the fences where they are.
+;
+; ONE COMPOSER, BOTH TIERS. It used to return at once when the GPU owned the
+; frame, and the V3D tier drew its own keyboard with the engine's cell face -
+; which is the face that was called blocky, on the panel this monitor is
+; actually used on. The band is now composed HERE for both tiers and reaches
+; the panel the way the banner's smooth title already does: drawn in logical
+; coordinates, presented through ScrPresent's transpose, and carried through
+; every later GPU frame by ScrGpuKeepLogicalBand. See the header of
+; TouchKeyboardComposeNeon in RaspberryPi4/Board/v3d_console.pi4.
 Procedure TouchKeyboardComposeCpu()
   Define n.i
+  Define gpu.i
   Define i.i
   Define k.i
   Define col.i
@@ -343,10 +398,19 @@ Procedure TouchKeyboardComposeCpu()
   If gScreen = 0 Or DisplayBase() = 0
     ProcedureReturn
   EndIf
-  If gCursorGpuOwned <> 0
+  If TouchKeyboardLayoutOk() = 0
     ProcedureReturn
   EndIf
-  If TouchKeyboardLayoutOk() = 0
+  ; WHICH TIER IS UNDERNEATH, ASKED ONCE. gCursorGpuOwned is 1 exactly
+  ; while V3D is compositing the frame itself, and it is the same
+  ; discriminator BannerClockTick uses.
+  gpu = Bool(gCursorGpuOwned <> 0)
+  If gpu <> 0 And TouchKeyboardViewVisible() = 0
+    ; NOTHING OUTSIDE THE BAND IS THIS PASS'S ON THAT TIER. The button
+    ; beside the prompt sits inside the console rectangle, which the GPU
+    ; repaints wholesale every frame; it is drawn there, and a CPU pass
+    ; over those rows would have to be presented with them and would
+    ; carry the frame's other pixels with it.
     ProcedureReturn
   EndIf
 
@@ -354,6 +418,16 @@ Procedure TouchKeyboardComposeCpu()
   ; so this pass has to draw itself whole. The latch is the only way to
   ; know: the renderer clears its own full-clear flag before this runs.
   If ConOverlayTakeWhole() <> 0
+    gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  EndIf
+  ; AND ON THE GPU TIER IT IS ALWAYS WHOLE. What the presentation seam
+  ; moves is a range of LOGICAL ROWS, and underneath those rows on a
+  ; turned panel lies the GPU's PHYSICAL frame - so every pixel in them
+  ; has to have been painted by this pass or the transpose carries the
+  ; last frame's bytes onto the glass. A whole-band paint per picture
+  ; change is also less work than the tier already does: it used to
+  ; redraw all ~180 keys inside every console frame.
+  If gpu <> 0
     gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
   EndIf
   ; The button beside the prompt sits inside the console rectangle, which
@@ -374,6 +448,13 @@ Procedure TouchKeyboardComposeCpu()
   ; pixels. This is the established pointer mechanism; the keyboard
   ; itself saves nothing under anything.
   hadCur = gCurShown
+  If gpu <> 0
+    ; THERE IS NO SAVE-UNDER TO LIFT ON THIS TIER - the pointer is inside
+    ; the GPU's frame. It is written again over the finished band below,
+    ; through the presented-overlay seam, and this pass leaves the
+    ; pointer mechanism exactly as it found it.
+    hadCur = 0
+  EndIf
   If hadCur <> 0
     CursorRestore(gCurX, gCurY)
     gCurShown = 0
@@ -491,7 +572,21 @@ Procedure TouchKeyboardComposeCpu()
       y1 = gCurY + #CUR_H - 1
     EndIf
   EndIf
+  If gpu <> 0
+    ; THE DRAIN BEFORE THE COPY, and it is the same statement
+    ; V3dConBlitBanner makes for the banner it has just drawn: with the
+    ; framebuffer mapped Normal Non-Cacheable these writes go through a
+    ; store buffer that may gather and reorder them, so the transpose -
+    ; and the DMA copy that carries this band through the next GPU frame
+    ; - could read the band before its glyphs have reached DRAM. dsb sy
+    ; makes them complete to the point of coherency first. Harmless with
+    ; caches off, where the writes were already Device-ordered.
+    a64_barrier()
+  EndIf
   ScrPresent(y0, y1)
+  If gpu <> 0
+    TouchKeyboardPresentedCursor(y0, y1)
+  EndIf
 EndProcedure
 ; ANVIL-TOUCH-KEYBOARD-COMPOSE-END
 
@@ -950,6 +1045,62 @@ Procedure TouchKeyboardServiceTick()
   If TouchKeyboardViewVisible() <> 0
     TouchKeyboardPictureTick()
   EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE OPERATOR'S OWN HAND, ON THE PATH A FINGER USES AND NOT BESIDE IT.
+;
+;  `screen keyboard show` and `screen keyboard hide` exist because until
+;  now the ONLY way to put the band on the glass was to touch it, so
+;  every proof of what the keyboard looks like needed somebody standing
+;  at the bench - and a monitor whose console can do everything except
+;  the one thing that is on the screen is a monitor with a hole in it.
+;
+;  IT IS THE SAME PATH, NOT A SECOND ONE. TouchKeyboardRouteOne calls
+;  TouchKeyboardShow(#AIF_COMMAND_LINE, gScrSrc) when a finger lands on
+;  the button or the prompt line, and TouchKeyboardHide() when it lands
+;  on the chevron; this writes the SAME intent into the SAME model and
+;  then runs the SAME service tick, so the focus generation, the
+;  viewport move, the dispatcher's rectangle, the refusal counter and the
+;  repaint all happen exactly as they do for a tap. A command that
+;  reached past the model into TouchKeyboardScreenShow would be a test
+;  hook wearing a command's name, and the first thing it would fail to
+;  reproduce is the one that matters - what a finger actually does.
+;
+;  want: 1 show, 0 hide, -1 ask only.
+;  Returns 1 when the band is up afterwards and 0 when it is down.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardRequest(want.i)
+  If want = 1
+    If gTkbSuspended <> 0
+      ProcedureReturn 0
+    EndIf
+    ; BEING ASKED FOR IT IS THE STATEMENT THAT SOMETHING CAN USE IT, the
+    ; same sentence TouchKeyboardScreenShow makes for a tap.
+    gTkbEnabled = 1
+    TouchKeyboardShow(#AIF_COMMAND_LINE, gScrSrc)
+  ElseIf want = 0
+    TouchKeyboardHide()
+  EndIf
+  TouchKeyboardServiceTick()
+  ProcedureReturn Bool(TouchKeyboardViewVisible() <> 0)
+EndProcedure
+
+; What the layer currently holds, for a report that does not have to
+; guess: 0 nothing, 1 the prompt line and the button, 2 the band.
+Procedure.i TouchKeyboardLayerRegion()
+  ProcedureReturn gTkbRegion
+EndProcedure
+
+; 1 while a payload owns the processor and this layer may not exist.
+Procedure.i TouchKeyboardLayerSuspended()
+  ProcedureReturn gTkbSuspended
+EndProcedure
+
+; 1 once something has turned the layer on - a touch controller answering
+; at attach, a tap, or the command above.
+Procedure.i TouchKeyboardLayerEnabled()
+  ProcedureReturn gTkbEnabled
 EndProcedure
 
 ; ----------------------------------------------------------------------

@@ -1887,6 +1887,172 @@ Procedure CmdScreenScale()
   EndIf
 EndProcedure
 
+; ======================================================================
+;  screen keyboard show | hide | state - THE TOUCH KEYBOARD FROM THE
+;  CONSOLE, BECAUSE UNTIL NOW IT COULD ONLY BE ASKED FOR WITH A FINGER.
+;
+;  Every other thing on this screen can be driven from any of the
+;  monitor's console channels - serial, network, the screen itself - and
+;  the keyboard could not. That made every proof of what it looks like a
+;  trip to the bench, and it made the band unreachable from the wire on a
+;  board sitting somewhere else.
+;
+;  IT IS A REAL COMMAND, NOT A TEST HOOK. It writes the model's intent
+;  and runs the service tick, which is exactly what a tap on the prompt
+;  line does: the same focus generation, the same viewport move, the same
+;  dispatcher rectangle, the same refusal counter, the same repaint. See
+;  TouchKeyboardRequest in RaspberryPi4/Board/banner_clock.pi4, which is
+;  inside the fenced section the touch keyboard integration gate lifts
+;  and executes.
+;
+;  NOTHING HERE PRINTS FROM THE SERVICE TICK. The layer never prints; a
+;  refusal is a whole sentence waiting in TouchKeyboardRefusal() and this
+;  is the caller that prints it.
+; ======================================================================
+; The refusal is a whole sentence or it is nothing at all - gTkbRefusal is
+; 0 until a layout actually refuses one. Printing a null pointer as a
+; string is how a report about a failure becomes a second failure.
+Procedure ScreenKeyboardSayRefusal()
+  If TouchKeyboardRefusal() = 0
+    PrintN("   (the layer recorded no reason, which means the refusal did not come")
+    PrintN("   from the layout - screen keyboard state prints what it believes.)")
+    ProcedureReturn
+  EndIf
+  Print("   ")
+  PrintN(TouchKeyboardRefusal())
+EndProcedure
+
+Procedure CmdScreenKeyboard()
+  Define up.i
+
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If gScreen = 0
+    PrintN("!! there is no screen up, so there is no keyboard to show. The serial")
+    PrintN("   line and the wireless/network consoles are unaffected - the screen is")
+    PrintN("   one optional channel among them. Type screen on first.")
+    ProcedureReturn
+  EndIf
+  If HwTouchReady() = 0
+    PrintN("!! this board has no touch controller, so the touch keyboard is not laid")
+    PrintN("   out and nothing can be tapped on the glass. Type touch status to see")
+    PrintN("   what the controller answered.")
+    ProcedureReturn
+  EndIf
+  If TouchKeyboardLayerSuspended() <> 0
+    PrintN("!! a payload owns the processor, so the touch keyboard layer is suspended")
+    PrintN("   and may not be brought back until the monitor has its screen again.")
+    ProcedureReturn
+  EndIf
+
+  ; The layer lays itself out from the prompt spin; ask for that here too,
+  ; so the first command after a reset does not have to be typed twice.
+  TouchKeyboardScreenAttach()
+
+  If WordIs("show") <> 0 Or WordIs("on") <> 0 Or WordIs("up") <> 0
+    up = TouchKeyboardRequest(1)
+    If up <> 0
+      Print("The touch keyboard is up: ")
+      PrintDec(TouchKeyboardKeys())
+      Print(" keys in ")
+      PrintDec(TouchKeyboardRows())
+      Print(" rows, a band ")
+      PrintDec(TouchKeyboardBandW())
+      Print(" x ")
+      PrintDec(TouchKeyboardBandH())
+      Print(" at row ")
+      PrintDec(TouchKeyboardBandY())
+      Print(", and the console is showing ")
+      PrintDec(TouchKeyboardConsoleRows())
+      PrintN(" rows.")
+      PrintN("  It types into the same line a serial byte does. The chevron on the")
+      PrintN("  utility row puts it away, and so does screen keyboard hide.")
+    Else
+      PrintN("!! the touch keyboard was asked for and the surface refused it:")
+      ScreenKeyboardSayRefusal()
+      Print("   Refused ")
+      PrintDec(TouchKeyboardRefusedCount())
+      PrintN(" times since the last layout that was accepted.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If WordIs("hide") <> 0 Or WordIs("off") <> 0 Or WordIs("down") <> 0
+    up = TouchKeyboardRequest(0)
+    If up = 0
+      PrintN("The touch keyboard is down and the console has its rows back - nothing")
+      PrintN("was taken out of the grid to put it up, so the text that was under it")
+      PrintN("is the text that is there.")
+    Else
+      PrintN("!! the touch keyboard was asked to hide and it is still up. That is a")
+      PrintN("   defect; screen keyboard state prints what the layer believes.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  ; ---- screen keyboard, or screen keyboard state ----------------------
+  If gWordLen > 0 And WordIs("state") = 0 And WordIs("status") = 0
+    PrintN("!! screen keyboard takes show, hide or state.")
+    ProcedureReturn
+  EndIf
+  Print("Touch keyboard: ")
+  If TouchKeyboardLayoutOk() = 0
+    PrintN("not laid out for this screen, so nothing is on the glass.")
+    Print("  Refused ")
+    PrintDec(TouchKeyboardRefusedCount())
+    PrintN(" times. The last reason, if there was one:")
+    ScreenKeyboardSayRefusal()
+    ProcedureReturn
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    PrintN("up.")
+  Else
+    PrintN("down - the button beside the prompt is how a finger asks for it.")
+  EndIf
+  Print("  Band ")
+  PrintDec(TouchKeyboardBandW())
+  Print(" x ")
+  PrintDec(TouchKeyboardBandH())
+  Print(" at row ")
+  PrintDec(TouchKeyboardBandY())
+  Print(", ")
+  PrintDec(TouchKeyboardKeys())
+  Print(" keys in ")
+  PrintDec(TouchKeyboardRows())
+  Print(" rows, targets at least ")
+  PrintDec(TouchKeyboardTargetMinPx())
+  PrintN(" pixels.")
+  Print("  The density was ")
+  If TouchKeyboardDensityKnown() <> 0
+    Print("MEASURED - the panel said how big it is. ")
+  Else
+    Print("not available, so the display scale decided the size. ")
+  EndIf
+  Print("The dispatcher holds ")
+  If TouchKeyboardLayerRegion() = 2
+    PrintN("the band.")
+  ElseIf TouchKeyboardLayerRegion() = 1
+    PrintN("the prompt line and the button.")
+  Else
+    PrintN("nothing.")
+  EndIf
+  Print("  Renderer: ")
+  If gCursorGpuOwned <> 0
+    PrintN("the V3D tier composes the band with the CPU and carries it")
+    PrintN("  through each GPU frame, so the key labels are the 30 px anti-aliased")
+    PrintN("  face - the same kind the banner's title is set in.")
+  Else
+    PrintN("the framebuffer tier, key labels in the 30 px anti-aliased")
+    PrintN("  face wherever the key has room for them.")
+  EndIf
+  Print("  Refused ")
+  PrintDec(TouchKeyboardRefusedCount())
+  PrintN(" times since the last layout that was accepted.")
+EndProcedure
+
 Procedure CmdScreen()
   Define n.i
 
@@ -1938,6 +2104,11 @@ Procedure CmdScreen()
   ; ---- screen scale ---------------------------------------------------
   If WordIs("scale") <> 0 Or WordIs("font") <> 0 Or WordIs("size") <> 0
     CmdScreenScale()
+    ProcedureReturn
+  EndIf
+  ; ---- screen keyboard -------------------------------------------------
+  If WordIs("keyboard") <> 0 Or WordIs("keys") <> 0 Or WordIs("kb") <> 0
+    CmdScreenKeyboard()
     ProcedureReturn
   EndIf
   If WordIs("displays") <> 0
@@ -2032,6 +2203,10 @@ Procedure CmdScreen()
     PrintN("  screen off         turn it off. The serial line is unaffected")
     PrintN("  screen displays    list every screen this board has and say which")
     PrintN("                     one the picture is going to")
+    PrintN("  screen keyboard    show, hide or describe the touch keyboard - the")
+    PrintN("                     same path a finger on the prompt line takes, so")
+    PrintN("                     it can be opened from the serial line or over")
+    PrintN("                     the network. show | hide | state")
     PrintN("  screen rotate <n>  turn the console 0, 90, 180 or 270 degrees on")
     PrintN("                     the DSI panel, and remember it. With no number,")
     PrintN("                     say what it is now and what each one costs")

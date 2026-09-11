@@ -857,6 +857,146 @@ Procedure.i ScrGpuKeepBanner(renderBase.i)
   ProcedureReturn 1
 EndProcedure
 
+; ANVIL-SCR-KEEP-LOGICAL-BAND-BEGIN
+; THIS PROCEDURE IS LIFTED VERBATIM by
+; tools/keyboard_gpu_face_emitted_check.py and compiled into
+; RaspberryPi4/Tests/keyboard_gpu_face_emitted_gate.pi4, where it runs over
+; the real rotation arithmetic with the copy recorded instead of performed.
+; Keep the fences where they are.
+; ======================================================================
+;  ScrGpuKeepLogicalBand - CARRY A CPU-COMPOSED LOGICAL ROW BAND THROUGH
+;  A GPU FRAME, which is what ScrGpuKeepBanner already does for the
+;  banner and is now asked for by name for a second layer.
+;
+;  WHY A LAYER EVER NEEDS THIS. A picture drawn by the CPU is drawn in
+;  LOGICAL coordinates - it is the only coordinates the display library
+;  has - and a GPU render target on a turned panel is in PHYSICAL layout.
+;  At 90 and 270 a logical row is a physical column, so the CPU cannot
+;  draw into that target at all, and there is exactly ONE transpose in
+;  this monitor: ScrPresent's. So a CPU layer is drawn ONCE, into the
+;  console's own logical surface, and ScrPresent puts it on the panel in
+;  the panel's own layout; from then on every GPU frame carries those
+;  pixels along by copying them back out of the PRESENTED FRONT, where
+;  they already are, correctly turned, with no second renderer and no
+;  second rotation formula anywhere.
+;
+;  It is also why this is a COPY and not a repaint: the band is redrawn
+;  only when its picture changes, not once per console frame.
+;
+;  y0..y1 are LOGICAL rows, inclusive, full width - the same shape
+;  ScrPresent takes and the same shape a damage rectangle answers in.
+;
+;  Returns 1 when the band is in renderBase, 0 when there was nothing to
+;  do or the request does not describe this surface.
+; ======================================================================
+Procedure.i ScrGpuKeepLogicalBand(renderBase.i, y0.i, y1.i)
+  Define front.i
+  Define pitch.i
+  Define pw.i
+  Define ph.i
+  Define lw.i
+  Define lh.i
+  Define rot.i
+  Define loX.i
+  Define hiX.i
+  Define loY.i
+  Define hiY.i
+  Define v.i
+  Define row.i
+  Define wide.i
+  Define tall.i
+  Define src.i
+  Define dst.i
+
+  If gScrSrc = #SCR_SRC_DSI
+    If gScrDsiUp = 0 Or renderBase <> #MON_FB_DRAW
+      ProcedureReturn 0
+    EndIf
+    front = #MON_FB_SCAN
+    pw = #MON_FB_PANEL_W
+    ph = #MON_FB_PANEL_H
+    pitch = pw * 4
+    rot = gScrRot
+  ElseIf gScrSrc = #SCR_SRC_HDMI
+    front = DisplayBase()
+    pw = DisplayWidth()
+    ph = DisplayHeight()
+    pitch = DisplayPitch()
+    rot = 0
+  Else
+    ProcedureReturn 0
+  EndIf
+  ; RENDERING STRAIGHT INTO THE FRONT IS THE SINGLE-BUFFERED TIER, and
+  ; there the band is already where it has to be.
+  If front = 0 Or renderBase = 0 Or renderBase = front
+    ProcedureReturn 0
+  EndIf
+
+  lw = ScrLogicalW(rot, pw, ph)
+  lh = ScrLogicalH(rot, pw, ph)
+  If y0 < 0
+    y0 = 0
+  EndIf
+  If y1 > lh - 1
+    y1 = lh - 1
+  EndIf
+  If lw < 1 Or y1 < y0
+    ProcedureReturn 0
+  EndIf
+
+  ; THE PHYSICAL RECTANGLE the full-width logical band occupies, taken
+  ; through the ONE map every presented overlay in this monitor goes
+  ; through. All four corners, because a bounding box built from two of
+  ; them is only right for the rotations that happen to be diagonal.
+  loX = ScrMapX(rot, 0, y0, pw, ph)
+  hiX = loX
+  loY = ScrMapY(rot, 0, y0, pw, ph)
+  hiY = loY
+  v = ScrMapX(rot, lw - 1, y0, pw, ph)
+  If v < loX : loX = v : EndIf
+  If v > hiX : hiX = v : EndIf
+  v = ScrMapX(rot, 0, y1, pw, ph)
+  If v < loX : loX = v : EndIf
+  If v > hiX : hiX = v : EndIf
+  v = ScrMapX(rot, lw - 1, y1, pw, ph)
+  If v < loX : loX = v : EndIf
+  If v > hiX : hiX = v : EndIf
+  v = ScrMapY(rot, lw - 1, y0, pw, ph)
+  If v < loY : loY = v : EndIf
+  If v > hiY : hiY = v : EndIf
+  v = ScrMapY(rot, 0, y1, pw, ph)
+  If v < loY : loY = v : EndIf
+  If v > hiY : hiY = v : EndIf
+  v = ScrMapY(rot, lw - 1, y1, pw, ph)
+  If v < loY : loY = v : EndIf
+  If v > hiY : hiY = v : EndIf
+
+  If loX < 0 Or loY < 0 Or hiX > pw - 1 Or hiY > ph - 1
+    ProcedureReturn 0
+  EndIf
+  wide = (hiX - loX + 1) * 4
+  tall = hiY - loY + 1
+  src = front + loY * pitch + loX * 4
+  dst = renderBase + loY * pitch + loX * 4
+
+  If gDma <> 0
+    If DmaCopy2D(dst, pitch, src, pitch, wide, tall) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+
+  row = 0
+  While row < tall
+    DspCopyUp(dst + row * pitch, src + row * pitch, wide)
+    row = row + 1
+  Wend
+  ; The GPU has finished before this runs, so the only reader of these
+  ; CPU writes is the present that follows. Make them complete first.
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+; ANVIL-SCR-KEEP-LOGICAL-BAND-END
+
 ; Present one complete GPU frame. DSI has a fixed physical back buffer and
 ; no mailbox page flip: DMA copies it to the HVS front after render complete.
 ; If the DMA tier is unavailable, the existing unrolled CPU mover is the
