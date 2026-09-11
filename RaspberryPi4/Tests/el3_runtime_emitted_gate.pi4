@@ -6,6 +6,11 @@ XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
 #EL3_GATE_OUT = $06000000
 
 Procedure.i Main()
+  ; Nonzero, distinct witnesses: this is an interpreter-only register gate,
+  ; not a valid page-table setup and must never be loaded onto hardware.
+  mmu_ttbr = $07000000
+  mmu_tcr = #MMU_TCR_EL2
+  mmu_mair = #MMU_MAIR_EL2
   PokeI(#EL3_GATE_OUT + 0,  MmuEl())
   PokeI(#EL3_GATE_OUT + 8,  MmuAtEl3())
   PokeI(#EL3_GATE_OUT + 16, MmuSctlr())

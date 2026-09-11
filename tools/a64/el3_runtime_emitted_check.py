@@ -28,6 +28,12 @@ STEP_LIMIT = 2_000_000
 SCTLR_EL2 = 0xD51C1000
 SCTLR_EL3 = 0xD51E1000
 STUB_SCTLR = 0x30C50830
+# Architectural MSR encodings, independent of the compiler's register table.
+TRANSLATION = {
+    2: (0xD51C2000, 0xD51C2040, 0xD51CA200),
+    3: (0xD51E2000, 0xD51E2040, 0xD51EA200),
+}
+TRANSLATION_VALUES = (0x07000000, 0x8081351C, 0xFF440C0400)
 
 
 def required_path(value: str | None, label: str) -> pathlib.Path:
@@ -85,6 +91,13 @@ def execute(a64, image: pathlib.Path, el: int, sctlr2: int, sctlr3: int):
         if cpu.pc == RETURN_PC:
             values = [u64(cpu, OUT + i * 8) for i in range(7)]
             banks = [cpu.sysreg(SCTLR_EL2), cpu.sysreg(SCTLR_EL3)]
+            for level, registers in TRANSLATION.items():
+                actual = tuple(cpu.sysreg(reg) for reg in registers)
+                expected = TRANSLATION_VALUES if level == el else (None,) * 3
+                if actual != expected:
+                    raise AssertionError(
+                        f"EL{el} execution changed the wrong translation bank or "
+                        f"loaded incorrect values: EL{level} {actual}, expected {expected}")
             return values, banks, steps
         cpu.step()
     raise SystemExit("EL3 runtime gate: probe did not return")
@@ -125,7 +138,34 @@ def main() -> int:
                       "banks %r/%r" %
                       (el, got, expected, banks, expected_banks))
                 return 1
-    print("el3_runtime_emitted_check: PASS - 36 checks, %d emitted A64 instructions" %
+        # Change each selected-bank MSR into its other-level equivalent in
+        # the actual emitted bytes. A green baseline alone cannot prove that
+        # the assertions would detect a wrong-bank emitter or runtime arm.
+        original = image.read_bytes()
+        for level, registers in TRANSLATION.items():
+            for index, reg in enumerate(registers):
+                mutant = bytearray(original)
+                hits = 0
+                for offset in range(0, len(mutant) - 3, 4):
+                    word = int.from_bytes(mutant[offset:offset + 4], "little")
+                    if word & ~31 == reg:
+                        replacement = TRANSLATION[5 - level][index] | (word & 31)
+                        mutant[offset:offset + 4] = replacement.to_bytes(4, "little")
+                        hits += 1
+                if hits == 0:
+                    raise AssertionError(f"No emitted MSR found for {reg:#x}")
+                image.write_bytes(mutant)
+                try:
+                    execute(interpreter, image, level, STUB_SCTLR, STUB_SCTLR)
+                except AssertionError as error:
+                    if "translation bank" not in str(error):
+                        raise
+                else:
+                    raise AssertionError(f"Wrong-bank mutation survived: {reg:#x}")
+                finally:
+                    image.write_bytes(original)
+    print("el3_runtime_emitted_check: PASS - 36 original checks, 24 translation-register checks, "
+          "6 wrong-bank mutations rejected, %d emitted A64 instructions" %
           total_steps)
     return 0
 
