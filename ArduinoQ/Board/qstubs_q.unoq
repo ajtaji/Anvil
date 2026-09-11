@@ -307,11 +307,43 @@ EndProcedure
 ;  the address is called through the same indirect-call shape every UEFI
 ;  call in this port uses. It does not come back unless the payload
 ;  returns, which is the Pi 4's contract too.
+;
+;  IT STANDS THE INPUT DISPATCHER DOWN FIRST, for the same reason
+;  RaspberryPi4/Board/cache.pi4's RunAt does: a payload takes the whole
+;  machine, and anything Anvil/Core/input_events.pbi is still holding
+;  when it goes - a byte already queued, a key-down whose release will
+;  never arrive - would be delivered to a line editor that is not
+;  running and could execute a command the moment the payload handed the
+;  prompt back. InputPayloadSuspend() cancels the queue and the captures
+;  and bumps the focus generation, so an event produced before the jump
+;  can no longer be popped after it.
+;
+;  THE TOUCH HALF OF THE PI 4's HANDOVER HAS NO COUNTERPART HERE and
+;  none is faked. That board calls TouchKeyboardPayloadSuspend(), which
+;  puts a soft keyboard away, gives back the console rows it reserved
+;  and withdraws its hit rectangle before ending in the same
+;  cancellation. The Q has no touch controller and no soft keyboard -
+;  TouchTick() above is a no-op and #CAP_TOUCH is 0 - so there is no
+;  layer to put away, and only the dispatcher itself is stood down.
+;
+;  AND NOTHING IS RESTORED AFTERWARDS, because nothing was suspended:
+;  the cancellation is a one-shot that leaves a #AIE_CANCEL in the ring
+;  and a new generation behind it. The Pi 4 has a Resume twin only
+;  because its keyboard layer carries a sticky flag; this board has no
+;  such flag to clear, and adding one to look symmetrical would be a
+;  state nothing reads.
+;
+;  THE ETHERNET HALF HAS NO COUNTERPART EITHER: the Pi 4 quiesces GENET
+;  around the jump because its receive DMA is a bus master writing into
+;  DRAM on its own schedule. Anvil drives no network hardware on the Q
+;  (#CAP_NET is 0 and the console pumps above are no-ops), so there is
+;  no bus master of Anvil's to stop.
 ; ----------------------------------------------------------------------
 Procedure RunAt(a.i)
   If a = 0
     ProcedureReturn
   EndIf
+  InputPayloadSuspend()
   QCall(a, 0, 0, 0, 0, 0)
 EndProcedure
 

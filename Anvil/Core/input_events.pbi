@@ -505,6 +505,49 @@ Procedure InputCancelAll(reason.l)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  InputPayloadSuspend - the machine is about to change hands.
+;
+;  ONE NAME FOR "A PAYLOAD IS BEING ENTERED", SO THAT NO BOARD HAS TO
+;  SPELL THE REASON ITSELF. A payload takes the whole machine; anything
+;  this dispatcher is still holding when it goes - a queued byte, a
+;  routed contact, a capture whose UP will never arrive - would
+;  otherwise be delivered to an editor that is not running, or worse,
+;  executed as a command after the payload returns. That is the same
+;  hazard on every board, so the cancellation belongs here and not in
+;  each board's jump.
+;
+;  IT CANCELS AND NOTHING ELSE. There is no suspended flag to clear
+;  afterwards and therefore no Resume twin: InputCancelAll bumps the
+;  generation and leaves one #AIE_CANCEL in the ring, so a consumer
+;  learns its world was reset by reading its normal input, and the next
+;  producer stamps the new generation without being told to. A board
+;  with a UI layer on top - the Pi 4's touch keyboard - needs more than
+;  this and has its own suspend/resume pair for the parts of that layer
+;  this file knows nothing about; that pair's suspend half ends in the
+;  very same InputCancelAll(#AIC_PAYLOAD) call. It still writes the call
+;  itself rather than coming through here, which is one spelling too
+;  many and is owed - the Pi 4 image is deliberately unchanged by the
+;  commit that added this seam, so that the Q's fix could be proven to
+;  have moved nothing on the board that was already correct.
+;
+;  WHY A PROCEDURE AND NOT THE BARE InputCancelAll(#AIC_PAYLOAD) CALL.
+;  Not style: the compiler settles it. A board file may call a procedure
+;  this file defines later in the include order, because procedure names
+;  are resolved across the whole build - but it may NOT name a constant
+;  that has not been declared yet, and a constant cannot be forward
+;  declared. ArduinoQ/Board/qstubs_q.unoq is included ahead of this file
+;  (it declares gLastCR, which InputFeedByte below reads, so it has to
+;  be), and its RunAt was therefore unable to write the #AIC_PAYLOAD
+;  spelling at all. A seam that takes no argument keeps the #AIC_
+;  vocabulary inside the layer that defines it, which is where it should
+;  have been anyway: the board says WHAT HAPPENED, and this file decides
+;  what that means.
+; ----------------------------------------------------------------------
+Procedure InputPayloadSuspend()
+  InputCancelAll(#AIC_PAYLOAD)
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  InputFocusSet - point typed input at a client.
 ;
 ;  SETTING IT TO WHAT IT ALREADY IS DOES NOTHING AT ALL, and that is the
