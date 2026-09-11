@@ -614,6 +614,42 @@ EndProcedure
 ;  IT IS NOT RATE LIMITED HERE. HwTouchTick() limits itself to one
 ;  controller read every 17 ms, because it has three callers and a limit
 ;  per caller would be three cadences against one part.
+;
+; ======================================================================
+;  THERE IS ONE DRAIN OF THE HARDWARE QUEUE, AND THIS IS IT
+; ======================================================================
+;  This procedure used to end with
+;
+;      While HwTouchPoll(@ev) = 1
+;      Wend
+;
+;  and a comment explaining that it drained the ring so the console
+;  consumer could not fill it. Every one of those events was thrown
+;  away: the pointer takes its position from HwTouchContacts() and the
+;  frame, not from the stream, so the stream had nowhere to go.
+;
+;  A SOFT KEYBOARD CANNOT BE GIVEN A SECOND DRAIN OF THE SAME RING. Two
+;  consumers polling one queue is a coin toss over which of them sees
+;  each event, and hal.pbi is explicit about why the queue exists at
+;  all: "a tap that begins and ends between two UI frames must still be
+;  seen". Half of them being seen by the wrong consumer is the same loss.
+;
+;  So the drain stayed exactly here, where it always was, and what
+;  changed is where the events GO: each one is handed to
+;  InputTouchDispatch() in Anvil/Core/input_events.pbi, which decides -
+;  once, at the DOWN, from one hit rectangle per owner - whose contact
+;  it is, and puts it in that owner's own lane. The pointer then drains
+;  ITS lane, which is the same "drain and discard" it always did, for
+;  the same reason.
+;
+;  THE RECONCILE AFTER THE DRAIN IS NOT TIDYING. HwTouchFlush() runs on
+;  every screen change and the hardware ring drops its oldest record
+;  when it overflows, so an UP can be swallowed - and a capture whose UP
+;  never arrives is a finger some surface believes is still pressed.
+;  Marking the contacts the controller reports NOW and cancelling the
+;  captures that were not marked is the same argument this file already
+;  makes for taking the button from HwTouchContacts() rather than from
+;  the events.
 ; ======================================================================
 Procedure TouchTick()
   Define n.i
@@ -625,10 +661,16 @@ Procedure TouchTick()
   Define tx.i
   Define ty.i
   Dim ev.a[#HW_TOUCH_EVSZ]
+  Dim rev.a[#AIT_EVSZ]
 
   If gScreen = 0 Or gScrSrc <> #SCR_SRC_DSI
     gPtrBtnTouch = 0
     gTouchPrimaryId = -1
+    ; The touch surface is not on screen any more. Anything that was
+    ; holding a contact is holding one that can no longer be lifted.
+    If InputCaptureCount() > 0
+      InputCancelAll(#AIC_SCREEN_CHANGE)
+    EndIf
     ProcedureReturn
   EndIf
   If gTouchTried = 0
@@ -677,6 +719,11 @@ Procedure TouchTick()
       gTouchOk = 0
       gPtrBtnTouch = 0
       gTouchPrimaryId = -1
+      ; THE SURFACE IS GONE, SO NOTHING MAY STILL OWN A CONTACT ON IT.
+      ; Without this a modifier held on a soft keyboard when the ribbon
+      ; was pulled would stay latched for the rest of the session, and
+      ; the design names a stuck Shift as the failure to prevent.
+      InputCancelAll(#AIC_TOUCH_LOST)
       PrintN("The panel's touch controller stopped answering, so a finger no")
       PrintN("longer moves the cursor. `touch` re-probes it and says what the")
       PrintN("bus reported; `touch panel reset` pulses its reset line.")
@@ -718,10 +765,35 @@ Procedure TouchTick()
     found = 1
   EndIf
 
-  ; Drain what is waiting so the console consumer cannot fill the ring.
+  ; THE ONE DRAIN. Every record leaves the hardware ring here and is
+  ; routed to exactly one owner - see this procedure's header. The
+  ; coordinates are handed over as the fields they already are: they
+  ; were rotated and scaled by the display layer before they were
+  ; queued, and nothing downstream of here transforms a coordinate a
+  ; second time.
+  ;
   ; Multitouch programs own this queue while they run; this tick executes
   ; only in the interactive console's input wait.
   While HwTouchPoll(@ev) = 1
+    InputTouchDispatch(PeekL(@ev + #HW_TOUCH_EV_X), PeekL(@ev + #HW_TOUCH_EV_Y), PeekL(@ev + #HW_TOUCH_EV_ID), PeekL(@ev + #HW_TOUCH_EV_ST), PeekI(@ev + #HW_TOUCH_EV_TICK), PeekL(@ev + #HW_TOUCH_EV_PRES))
+  Wend
+
+  ; RECONCILE AGAINST THE FRAME THAT IS TRUE NOW. A flush or a full ring
+  ; can swallow an UP; this is what stops the capture outliving the
+  ; finger. gTouchPrevN is the frame HwTouchTick just read.
+  InputCaptureReconcileBegin()
+  i = 0
+  While i < contacts
+    InputCaptureSeen(HwTouchPointId(i))
+    i = i + 1
+  Wend
+  InputCaptureReconcileEnd(#AIC_CONTACT_LOST)
+
+  ; And the pointer empties its OWN lane. It reads its position from the
+  ; frame above rather than from these records - see THE BUTTON IS THE
+  ; CONTACT COUNT - so draining is all it has to do, exactly as the old
+  ; drain of the hardware ring was.
+  While InputTouchPop(#AIO_POINTER, @rev) = 1
   Wend
 
   If found <> 0
