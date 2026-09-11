@@ -19,6 +19,7 @@ import sys
 import tempfile
 
 import build as anvil_build
+import build_count
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -500,6 +501,14 @@ def compile_assembly(pmfc: str, temporary: Path) -> str:
     asm = Path(str(output) + ".asm")
     if not asm.is_file():
         raise AssertionError("compiler succeeded but did not write the requested assembly")
+    # THE FIXTURE IS THE WHOLE MONITOR, so this is a build of Anvil and it
+    # counts (ruled 2026-09-11, "gate builds do count"). The compile happened
+    # here, so the count happens here - not in a summary afterwards that could
+    # be skipped by an early return.
+    counted = build_count.record_build("RaspberryPi4/Board/board.pi4", "pi4", output,
+                                       by="tools/payload_lifecycle_check.py",
+                                       compiler=compiler)
+    print(f"  build count: {counted.message}")
     return asm.read_text(encoding="utf-8")
 
 

@@ -11,6 +11,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_count  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = {
@@ -18,13 +21,11 @@ TARGETS = {
         "source": Path("RaspberryPi4/Board/board.pi4"),
         "output": Path("build/pi4/anvil.img"),
         "args": [],
-        "bump": True,
     },
     "unoq": {
         "source": Path("ArduinoQ/Board/board.unoq"),
         "output": Path("build/unoq/anvil.img"),
         "args": ["--entry-returns"],
-        "bump": True,
     },
     "armstub": {
         "source": Path("RaspberryPi4/Board/armstub8.asm"),
@@ -59,7 +60,7 @@ def find_compiler(explicit: str | None) -> str:
     )
 
 
-def build(compiler: str, target: str, bump: bool = True) -> None:
+def build(compiler: str, target: str) -> None:
     """Build one target.
 
     EVERY MONITOR BUILD RAISES THE BOARD'S BUILD NUMBER. Ruled 2026-09-11,
@@ -67,12 +68,25 @@ def build(compiler: str, target: str, bump: bool = True) -> None:
     and nothing on the board could say which one was running: `version`
     exists so a person watching a board can tell the images apart without
     hashing anything, and that only works if the number moves with every
-    build. The compiler owns the bump (`pmfc --bump-build`: after a
-    SUCCESSFUL build it raises the marked constant in the board file by
-    one and writes the date and time beside it), so this tool asks for it
-    on the board targets and on nothing else - a gate fixture or the ARM
-    stub has no build number to move. Pass --no-bump for a verification
-    build that must not touch the tree.
+    build.
+
+    ONE MECHANISM, AND IT IS tools/build_count.py. This tool used to pass
+    `pmfc --bump-build` and let the compiler raise the marker in the file
+    it had been handed. That counted the builds made this way and missed
+    every build made any other way: a gate compiles the whole monitor from
+    a temporary copy, so the compiler's bump landed on a file in a
+    temporary directory and the real board file never moved. Ten monitor
+    builds a gate run went unrecorded, and the ruling that followed was
+    "gate builds do count... I want real build tracking, not estimated".
+    The flag is therefore NOT passed here any more - record_build() below
+    raises the real board file, stamps the date and time, and writes the
+    ledger line, and it is the only thing in this repository that does.
+    Asking for both would bump twice for one build and take two different
+    locks over one file.
+
+    THERE IS NO WAY TO BUILD WITHOUT COUNTING. `--no-bump` is gone: a
+    build made to verify something is still a build of the monitor, and
+    the number moving is how anyone can tell later that it happened.
     """
     spec = TARGETS[target]
     source = ROOT / spec["source"]
@@ -89,7 +103,6 @@ def build(compiler: str, target: str, bump: bool = True) -> None:
         "-t",
         spec.get("target", target),
         *spec["args"],
-        *(["--bump-build"] if bump and spec.get("bump") else []),
         "-o",
         str(output),
     ]
@@ -105,6 +118,13 @@ def build(compiler: str, target: str, bump: bool = True) -> None:
             f"{spec['output']}."
         )
     print(f"Built {spec['output']} ({output.stat().st_size} bytes).")
+
+    # AFTER a successful build, never before: the image exists, so the build
+    # happened, so it counts. A target with no board file of its own (the ARM
+    # stub) answers counted=False and nothing moves.
+    counted = build_count.record_build(source, spec.get("target", target), output,
+                                       by="tools/build.py", compiler=compiler)
+    print(f"  {counted.message}")
 
 
 def staged_compiler(compiler: str, directory: Path) -> str:
@@ -127,11 +147,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("all", *TARGETS), nargs="?", default="all")
     parser.add_argument("--pmfc", help="path or command name for the external compiler")
-    parser.add_argument(
-        "--no-bump",
-        action="store_true",
-        help="do not raise the board's build number (verification builds only)",
-    )
     args = parser.parse_args()
 
     compiler = find_compiler(args.pmfc)
@@ -141,7 +156,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-pmfc-") as temporary:
         isolated_compiler = staged_compiler(compiler, Path(temporary))
         for target in selected:
-            build(isolated_compiler, target, bump=not args.no_bump)
+            build(isolated_compiler, target)
     return 0
 
 

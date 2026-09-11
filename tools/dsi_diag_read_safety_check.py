@@ -15,6 +15,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build as anvil_build  # noqa: E402
+import build_count  # noqa: E402
 
 SOURCE = ROOT / "RaspberryPi4" / "Board" / "dsi_cmd.pi4"
 BOARD = ROOT / "RaspberryPi4" / "Board" / "board.pi4"
@@ -206,6 +207,12 @@ def build(pmfc: str, work: Path) -> Path:
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode or not image.is_file():
         raise AssertionError("Pi emitted build failed:\n" + result.stdout)
+    # board.pi4 compiled end to end is a build of the monitor, and every build
+    # of the monitor counts (ruled 2026-09-11).
+    counted = build_count.record_build(BOARD, "pi4", image,
+                                       by="tools/dsi_diag_read_safety_check.py",
+                                       compiler=compiler)
+    print(f"  build count: {counted.message}")
     return image
 
 

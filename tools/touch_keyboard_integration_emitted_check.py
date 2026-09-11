@@ -56,6 +56,9 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 
+sys.path.insert(0, str(HERE))
+import build_count  # noqa: E402
+
 GATE = ROOT / "RaspberryPi4" / "Tests" / "touch_keyboard_integration_emitted_gate.pi4"
 ADAPTER = ROOT / "RaspberryPi4" / "Board" / "banner_clock.pi4"
 PARSE = ROOT / "Anvil" / "Core" / "parse.pbi"
@@ -414,6 +417,14 @@ def build(compiler: pathlib.Path, work: pathlib.Path, source: pathlib.Path) -> p
     )
     if run.returncode or "pmfc: OK" not in run.stdout:
         raise SystemExit("touch keyboard integration gate: compile failed\n" + run.stdout)
+    # EVERY COMPILE IN tools/ ASKS THE COUNTER. This one builds a fixture, so
+    # record_build() answers "not a board file" and nothing moves - the decision
+    # about what is a build of the monitor belongs to one module, not to each
+    # gate's reading of its own fixture. If this gate ever compiles a board file
+    # instead, the count follows it with nothing to remember.
+    build_count.record_build(source, "pi4", image,
+                             by="tools/touch_keyboard_integration_emitted_check.py",
+                             compiler=compiler)
     return image
 
 

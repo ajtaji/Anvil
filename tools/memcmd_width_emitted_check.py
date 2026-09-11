@@ -14,6 +14,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build as anvil_build  # noqa: E402
+import build_count  # noqa: E402
 
 SOURCE = ROOT / "Anvil" / "Core" / "memcmd.pbi"
 TARGETS = (
@@ -212,6 +213,14 @@ def compile_target(pmfc: str, work: Path, target: str,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode or not Path(str(image) + ".asm").is_file():
         raise AssertionError(f"{target} emitted build failed:\n{result.stdout}")
+    # THIS GATE BUILDS THE WHOLE MONITOR, TWICE, AND BOTH BUILDS COUNT. Ruled
+    # 2026-09-11: "gate builds do count". The fixture here is not a lifted
+    # procedure - it is board.pi4 and board.unoq compiled end to end, so each
+    # run of this gate is two builds of Anvil and the board files say so.
+    counted = build_count.record_build(source, target, image,
+                                       by="tools/memcmd_width_emitted_check.py",
+                                       compiler=compiler)
+    print(f"  build count: {counted.message}")
     return Path(str(image) + ".asm").read_text(encoding="utf-8")
 
 

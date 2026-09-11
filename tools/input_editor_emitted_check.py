@@ -26,6 +26,9 @@ import tempfile
 
 import tcp_multiif_emitted_check as emitted
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_count  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "input_editor_emitted_gate.pi4"
@@ -501,6 +504,13 @@ def build(pmfc: Path, work: Path, mutation: str = "") -> Path:
         raise SystemExit("input editor gate: compile failed\n" + run.stdout)
     if not image.is_file() or not image.with_suffix(image.suffix + ".sym").is_file():
         raise SystemExit("input editor gate: compiler omitted image or symbol map")
+    # EVERY COMPILE IN tools/ ASKS THE COUNTER. This one builds a fixture,
+    # so record_build() answers "not a board file" and nothing moves - but the
+    # decision about what is a build of the monitor belongs to one module, not
+    # to each gate's own reading of its fixture. The day this gate compiles a
+    # board file instead, the count follows it without anyone remembering to.
+    build_count.record_build(probe, "pi4", image,
+                             by="tools/input_editor_emitted_check.py", compiler=staged)
     return image
 
 
