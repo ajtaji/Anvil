@@ -24,8 +24,8 @@ path is outside the public boundary, a required file is untracked, a source
 include escapes the repository, a dependency is absent from the selected set,
 or a common sensitive/generated filename is selected.
 
-Before files have been staged, maintainers can check the non-ignored candidate
-tree explicitly:
+Before files have been staged, the non-ignored candidate tree can be checked
+explicitly:
 
 ```sh
 python3 tools/verify_export.py --working-tree
@@ -53,6 +53,14 @@ runtime firmware with its original notices, and focused reproducible host or
 emitted-code tests. It must not contain compiler executables or implementation
 source, build products, credentials, NVRAM/calibration data, local settings,
 private keys, machine-specific paths, worktree scratch, or bench transcripts.
+
+A source repository and a release ZIP are different artifacts, and the
+diagnostics boundary applies to each in its own way: this repository deliberately
+tracks its `RaspberryPi4/Tests/` gates and declares two
+`RaspberryPi4/Examples/Diagnostics/` programs as public entry points, because a
+reproducible test is how a reader checks what the source claims, while release
+ZIPs exclude `Diagnostics` entirely — the staging pass refuses any path with a
+`Diagnostics` segment and the finished stage is swept again to prove it.
 
 The repository MIT license applies only where no more specific notice exists.
 CYW43455 firmware, Khronos Registry-derived material, DejaVu-derived glyph

@@ -221,16 +221,13 @@
 ; smallest, and a window is only as wide as its narrowest translation.
 ;
 ; --- THE INBOUND WINDOW, AND THE ERRATUM ----------------------------
-; `bcm2711.dtsi` lines 577-583, inside pcie0, comment included verbatim
-; because it is the citation:
-;
-;     /*
-;      * The wrapper around the PCIe block has a bug
-;      * preventing it from accessing beyond the first 3GB of
-;      * memory.
-;      */
-;     dma-ranges = <0x02000000 0x0 0x00000000  0x0 0x00000000
-;                   0x0 0xc0000000>;
+; The hardware fact, in our own words; the reference below is a pointer
+; to where it can be checked, not a passage carried across. Inside the
+; pcie0 node, `bcm2711.dtsi` lines 577-583 record the erratum and size
+; the window it forces: the wrapper around the PCIe block cannot reach
+; past the first 3 GiB of memory, so that node's inbound translation is
+; declared over PCI memory space as bus $0000_0000 to CPU $0000_0000
+; with a length of $C000_0000.
 ;
 ; Split the same way: PCI bus $0000_0000 maps to CPU $0000_0000, for
 ; $C000_0000 = 3 GiB. So inbound DMA is IDENTITY-MAPPED and CAPPED at

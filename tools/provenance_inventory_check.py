@@ -8,12 +8,17 @@ the source tree.
 
 It answers three questions, and it is deliberately not clever about any of them.
 
-  1. DOES EVERY DERIVED FILE CARRY ITS NOTICE?
-     A file classified `derived` or `verbatim` against an upstream is, on this
-     project's own reading, a derivative work of it. Its upstream must declare
-     `notice_required`, must name a notice section, and that section must exist
-     in `docs/THIRD_PARTY_NOTICES.md`. Where the upstream also names a retained
-     license text, that file must be on disk.
+  1. IS EVERY PAIR CONSULTED, AND DOES IT CITE WHAT IT CONSULTED?
+     It was confirmed on 2026-09-10 that no third-party code was used; the
+     references were read for how the hardware behaves. So the only class this
+     tree may carry against an upstream implementation is `consulted`, and
+     `derived` and `verbatim` are refusals: a copied or derived block is not
+     permitted here, it is restated in our own words or removed. A `consulted`
+     pair needs no notice — nothing was taken, so nothing is owed — but it must
+     CITE the source it consulted, because the citation is the provenance of the
+     fact and is how a reader checks it. Where an upstream names a retained
+     license text or an acknowledgment section, those must still exist: a
+     dangling acknowledgment is as misleading as a missing one.
 
   2. DOES ANY SOURCE FILE CITE AN UPSTREAM THE INVENTORY DOES NOT LIST?
      Every tracked source file is re-scanned with the citation patterns stored
@@ -28,11 +33,12 @@ It answers three questions, and it is deliberately not clever about any of them.
      and every JSON entry must have a row. A table that drifts from the data it
      describes is worse than no table, because it is read and believed.
 
-WHAT IT DOES NOT DO, SAID OUT LOUD. It cannot find a derivation that was never
-cited. It finds unlisted CITATIONS, not uncited COPIES. A block translated from
-somewhere and committed with no comment is invisible to this script and to every
-other check in this repository, and the only thing that catches it is a person
-reading the code. Nor does it decide license compatibility: it reports what
+WHAT IT DOES NOT DO, SAID OUT LOUD. It finds unlisted CITATIONS, not uncited
+copies. It enforces the ruling on what the inventory RECORDS; it cannot look at
+a procedure and tell you how it was written. A block that was copied and
+committed with no comment is invisible to this script and to every other check
+in this repository, and the only thing that catches it is a person reading the
+code. Nor does it decide license compatibility: it reports what
 `PROVENANCE.json` records, and that record is an engineering reading, not a
 legal determination.
 
@@ -58,7 +64,13 @@ INVENTORY = ROOT / "docs" / "PROVENANCE_INVENTORY.md"
 NOTICES = ROOT / "docs" / "THIRD_PARTY_NOTICES.md"
 
 SOURCE_SUFFIXES = (".pi4", ".pbi", ".unoq", ".asm", ".def")
-DERIVED_CLASSES = ("derived", "verbatim")
+
+CONSULTED = "consulted"
+REFUSED_CLASSES = ("derived", "verbatim")
+REFUSAL = (
+    "a copied or derived block is not permitted in this tree; restate it or "
+    "remove it"
+)
 
 # A table row: | `path` | class | source-id | license | obligation |
 ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*([a-z-]+)\s*\|\s*([A-Za-z0-9._-]+)\s*\|")
@@ -133,77 +145,102 @@ def heading_anchors(text: str) -> set[str]:
     return anchors
 
 
-def check_notices(third_party: dict, report: Report) -> None:
-    """1. Every file with a derived or verbatim block must carry its notice."""
+def check_classes(third_party: dict, report: Report) -> None:
+    """1. Every pair is a permitted class, and every consulted pair cites."""
     sources = third_party["sources"]
+    classifications = third_party.get("classifications", {})
     notices_text = NOTICES.read_text(encoding="utf-8") if NOTICES.exists() else ""
     if not notices_text:
-        report.fail(f"third-party notices file is missing: {NOTICES.relative_to(ROOT)}")
+        report.fail(
+            f"references-consulted file is missing: {NOTICES.relative_to(ROOT)}"
+        )
         return
     anchors = heading_anchors(notices_text)
 
-    derived_pairs = [
-        (path, src)
-        for path, entry in third_party["derived_files"].items()
-        for src, cls in entry.items()
-        if cls in DERIVED_CLASSES
-    ]
-    if not derived_pairs:
-        report.fail("no derived or verbatim blocks are recorded; that cannot be right")
+    consulted_pairs = []
+    for path, entry in third_party["classified_files"].items():
+        for src, cls in entry.items():
+            if cls in REFUSED_CLASSES:
+                report.fail(
+                    f"{path}: classified '{cls}' against '{src}'. {REFUSAL}. It was "
+                    f"confirmed on 2026-09-10 that no third-party code was used; the "
+                    f"references were read for how the hardware behaves, so the only "
+                    f"class this tree carries against an implementation is "
+                    f"'{CONSULTED}'."
+                )
+            elif cls not in classifications:
+                report.fail(
+                    f"{path}: classified '{cls}' against '{src}', which is not one of "
+                    f"the classes PROVENANCE.json defines: {sorted(classifications)}"
+                )
+            elif cls == CONSULTED:
+                consulted_pairs.append((path, src))
+
+    if not consulted_pairs:
+        report.fail("no consulted pairs are recorded; that cannot be right")
         return
 
-    for path, src in derived_pairs:
+    for path, src in consulted_pairs:
         meta = sources.get(src)
         if meta is None:
-            report.fail(f"{path}: derived from unknown source id '{src}'")
+            report.fail(f"{path}: consulted an unknown source id '{src}'")
             continue
-        if not meta.get("notice_required"):
+
+        # A consulted pair needs no notice. It does need its citation: that is
+        # the provenance of the fact and the only way a reader can check it.
+        pattern = meta.get("citation_pattern")
+        if not pattern:
             report.fail(
-                f"{path}: classified {third_party['derived_files'][path][src]} against "
-                f"'{src}', but that source is recorded as needing no notice. A "
-                f"derivative work needs one, or the classification is wrong."
+                f"{path}: source '{src}' has no citation_pattern, so the citation "
+                f"this consulted pair rests on cannot be checked"
             )
             continue
-        ref = meta.get("notice")
-        if not ref:
-            report.fail(f"{path}: source '{src}' requires a notice but names none")
+        try:
+            cited = re.search(
+                pattern, (ROOT / path).read_text(encoding="utf-8", errors="replace"),
+                re.IGNORECASE,
+            )
+        except (OSError, re.error) as error:
+            report.fail(f"{path}: cannot check the citation of '{src}': {error}")
             continue
-        anchor = anchor_of(ref)
-        if anchor and anchor not in anchors:
+        if not cited:
             report.fail(
-                f"{path}: source '{src}' points at notice section '{ref}', and "
-                f"docs/THIRD_PARTY_NOTICES.md has no such heading"
+                f"{path}: classified {CONSULTED} against '{src}' and cites nothing "
+                f"of it. A consulted pair must cite the source the fact came from."
             )
             continue
+
         text = meta.get("license_text")
-        if text:
-            if not (ROOT / text).exists():
-                report.fail(f"{path}: source '{src}' names retained text '{text}', which is not on disk")
-                continue
-        elif not meta.get("license_text_pending_decision"):
+        if text and not (ROOT / text).exists():
             report.fail(
-                f"{path}: source '{src}' ships no license text and is not marked "
-                f"as pending the publication decision"
+                f"{path}: source '{src}' names retained text '{text}', which is not "
+                f"on disk"
             )
             continue
+        ref = meta.get("acknowledgment")
+        if ref:
+            anchor = anchor_of(ref)
+            if anchor and anchor not in anchors:
+                report.fail(
+                    f"{path}: source '{src}' points at acknowledgment section "
+                    f"'{ref}', and docs/THIRD_PARTY_NOTICES.md has no such heading"
+                )
+                continue
         report.ok()
 
-    pending = sorted(
-        {src for _, src in derived_pairs if sources[src].get("license_text_pending_decision")}
+    by_source = sorted({src for _, src in consulted_pairs})
+    report.note(
+        f"{len(consulted_pairs)} consulted pair(s) across {len(by_source)} source(s): "
+        f"{', '.join(by_source)}. No licence election is made or owed for any of "
+        f"them, and no corresponding source is owed. The retained texts under "
+        f"licenses/ acknowledge references consulted, not incorporated code."
     )
-    for src in pending:
-        files = sorted({p for p, s in derived_pairs if s == src})
-        report.note(
-            f"{src}: license text is NOT shipped, by design. {len(files)} file(s) "
-            f"derive from it and the retain-or-replace decision is open. Shipping a "
-            f"license text before that decision would itself be an election."
-        )
 
 
 def check_citations(third_party: dict, report: Report) -> tuple[list[str], list[str]]:
     """2. Every citation in the tree must be listed in the inventory."""
     sources = third_party["sources"]
-    listed = third_party["derived_files"]
+    listed = third_party["classified_files"]
     patterns = {}
     for src, meta in sources.items():
         pattern = meta.get("citation_pattern")
@@ -241,7 +278,7 @@ def check_citations(third_party: dict, report: Report) -> tuple[list[str], list[
             if src not in entry:
                 report.fail(
                     f"{path}: cites '{src}' and the inventory does not list it. "
-                    f"Classify it in PROVENANCE.json third_party.derived_files and "
+                    f"Classify it in PROVENANCE.json third_party.classified_files and "
                     f"add its row to docs/PROVENANCE_INVENTORY.md."
                 )
             else:
@@ -285,7 +322,7 @@ def check_document(third_party: dict, report: Report) -> None:
 
     expected = {
         (path, src): cls
-        for path, entry in third_party["derived_files"].items()
+        for path, entry in third_party["classified_files"].items()
         for src, cls in entry.items()
     }
 
@@ -306,7 +343,7 @@ def check_document(third_party: dict, report: Report) -> None:
                 f"PROVENANCE.json"
             )
 
-    for name in ("The decision this hold is waiting on", "Proven versus reasoned"):
+    for name in ("The 2026-09-10 confirmation, and what it means", "Proven versus reasoned"):
         if name not in text:
             report.fail(f"the inventory no longer contains its '{name}' section")
         else:
@@ -337,7 +374,7 @@ def main() -> int:
             "block. The inventory lives there; see docs/PROVENANCE_INVENTORY.md."
         )
         return 1
-    for key in ("sources", "derived_files", "inventory"):
+    for key in ("sources", "classified_files", "inventory"):
         if key not in third_party:
             report.fail(f"PROVENANCE.json third_party is missing '{key}'")
 
@@ -346,7 +383,7 @@ def main() -> int:
             print(f"  - {failure}")
         return 1
 
-    check_notices(third_party, report)
+    check_classes(third_party, report)
     files, uncited = check_citations(third_party, report)
     check_document(third_party, report)
 
@@ -355,10 +392,10 @@ def main() -> int:
 
     print(
         f"Scanned {len(files)} tracked source files: "
-        f"{len(third_party['derived_files'])} carry a citation, {len(uncited)} carry none."
+        f"{len(third_party['classified_files'])} carry a citation, {len(uncited)} carry none."
     )
     counts: dict[str, int] = {}
-    for entry in third_party["derived_files"].values():
+    for entry in third_party["classified_files"].values():
         for cls in entry.values():
             counts[cls] = counts.get(cls, 0) + 1
     print("Classified pairs: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
@@ -384,8 +421,9 @@ def main() -> int:
     if held:
         print(
             "Publication review: held. This check proves the inventory and the "
-            "notices agree with the source tree. It does not determine license "
-            "compatibility and it does not grant publication authority."
+            "acknowledgments agree with the source tree, and that nothing in it is "
+            "recorded as copied or derived. It does not grant publication authority: "
+            "publishing is a separate, explicit instruction."
         )
     return 0
 
