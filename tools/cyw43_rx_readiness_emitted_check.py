@@ -120,6 +120,21 @@ def build_guard_mutant(pmfc: Path, work: Path, name: str) -> Path:
     shutil.copy2(PROBE, probe)
     return build(pmfc, root, root, probe)
 
+def build_scratch_mutant(pmfc: Path, work: Path) -> Path:
+    root = work / "scratch-mutant"
+    lib = root / "RaspberryPi4" / "Lib"; tests = root / "RaspberryPi4" / "Tests"
+    lib.mkdir(parents=True); tests.mkdir(parents=True)
+    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
+    shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", root / "RaspberryPi4" / "Intrinsics")
+    source = (ROOT / "RaspberryPi4/Lib/cyw43.pi4").read_text(encoding="utf-8")
+    old = "  quietNonempty = 0"
+    if source.count(old) != 1:
+        raise SystemExit("CYW43 readiness gate: scratch reset mutation site drifted")
+    (lib / "cyw43.pi4").write_text(source.replace(old, "  ; quiet scratch reset removed", 1), encoding="utf-8", newline="\n")
+    shutil.copy2(ROOT / "RaspberryPi4/Lib/cyw43_rx_glom.pi4", lib)
+    probe = tests / PROBE.name; shutil.copy2(PROBE, probe)
+    return build(pmfc, root, root, probe)
+
 
 def execute(a64, image: Path) -> tuple[int, int]:
     blob = image.read_bytes()
@@ -207,6 +222,11 @@ def main() -> int:
                     f"mutant returned {mutant_result}, expected {want}"
                 )
                 return 1
+        scratch = build_scratch_mutant(pmfc, work)
+        scratch_result, scratch_steps = execute(a64, scratch)
+        if scratch_result == 0:
+            print("cyw43_rx_readiness_emitted_check: FAIL per-call scratch mutant survived")
+            return 1
     if result:
         print(
             f"cyw43_rx_readiness_emitted_check: FAIL assertion {result} "
@@ -215,8 +235,8 @@ def main() -> int:
         return 1
     print(
         f"cyw43_rx_readiness_emitted_check: PASS - 89 labeled assertions, "
-        f"{steps:,} A64 instructions; four generation-guard mutants "
-        f"rejected in {mutant_steps:,} instructions"
+        f"{steps:,} A64 instructions; four generation-guard mutants and "
+        f"scratch-reset mutant rejected in {mutant_steps + scratch_steps:,} instructions"
     )
     return 0
 

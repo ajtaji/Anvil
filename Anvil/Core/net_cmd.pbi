@@ -383,9 +383,7 @@ EndProcedure
 ;  and the warning that the hardware address is a made-up one.
 ; ----------------------------------------------------------------------
 Procedure.i NetLinkUpFull()
-  If EthConfig() = 0
-    ProcedureReturn 0
-  EndIf
+  Define k.i
   If HwLinkOpen(1) = 0
     ProcedureReturn 0
   EndIf
@@ -394,13 +392,20 @@ Procedure.i NetLinkUpFull()
   Print("  Frames leave with the hardware address ")
   PutLinkMac()
   PrintN(".")
-  If LinkKind() = #HW_LINK_WIRED
+  ; THE ADDRESSES COME OFF THE INTERFACE THAT WON, NOT OUT OF THE WIRED
+  ; SETTINGS GLOBALS. gEthIp/gEthMask/gEthGw describe the wired settings
+  ; page and were printed here under whichever link had been selected,
+  ; so a board carrying traffic over the radio reported the cable's
+  ; numbers as "its address". net.pi4's row for `k` is the address this
+  ; interface will actually source from.
+  k = LinkKind()
+  If k <> #HW_LINK_NONE
     Print("  Its address is ")
-    PutIp(gEthIp)
+    PutIp(NetIPv4(k))
     Print(", netmask ")
-    PutIp(gEthMask)
+    PutIp(NetMask(k))
     Print(", gateway ")
-    PutIp(gEthGw)
+    PutIp(NetGateway(k))
     PrintN(".")
   EndIf
   HwLinkSayDetail()
@@ -437,22 +442,23 @@ EndProcedure
 ;  move except the one line that printed one board's MAC driver's error
 ;  text, which is now LinkWhySay over the seam.
 ; ----------------------------------------------------------------------
-Procedure.i NetResolveHop(ip.i)
-  Define k.i
+Procedure.i NetResolveHop(k.i, ip.i)
   Define hop.i
   Define tries.i
   Define deadline.i
   Define r.i
 
-  ; THE INTERFACE IS THE ONE THE REQUEST WILL PHYSICALLY LEAVE BY, and it
-  ; has to be: LinkTxStaged below transmits over LinkKind(), so asking
-  ; net.pi4 for any other interface's next hop would resolve an address
-  ; against one interface's subnet and gateway and then put the frame out
-  ; of another. Every caller of this procedure has already chosen a link
-  ; through HwLinkOpen - NetLinkUpFull for get and put, NetLinkUpSay for
-  ; ping and dns - so the choice is made and this reads it rather than
-  ; making a second one that could differ.
-  k = LinkKind()
+  ; THE INTERFACE IS THE ONE THE REQUEST WILL PHYSICALLY LEAVE BY, and
+  ; since 2026-09-10 IT IS A PARAMETER rather than a read of LinkKind().
+  ; It has to be: resolving an address against one interface's subnet and
+  ; gateway and then putting the frame out of another is the whole class
+  ; of fault the per-interface rows exist to make unsayable, and
+  ; LinkKind() is the board's DEFAULT outbound door, not an answer about
+  ; a particular destination. The caller has the destination in its hand,
+  ; so the caller asks NetIfForDest() and passes what it was told - the
+  ; same shape `tcp connect` has used since 2026-09-08. A procedure that
+  ; read the selection would silently disagree with a caller that had
+  ; routed, and the disagreement would present as ARP that never answers.
   hop = NetNextHop(k, ip)
   If hop = 0
     PrintN("!! there is no route to that address at all, so nothing was sent. It")
@@ -481,9 +487,11 @@ Procedure.i NetResolveHop(ip.i)
       EthWhyNet()
       ProcedureReturn 0
     EndIf
-    If LinkTxStaged() <> 1
+    ; OVER THE INTERFACE THIS RESOLVE IS ABOUT, not over the selected
+    ; one. LinkTxStagedOn(k) is the same transmit with the kind named.
+    If LinkTxStagedOn(k) <> 1
       Print("!! the address request would not go out over ")
-      UartWriteStr(LinkName())
+      UartWriteStr(HwLinkName(k))
       PrintN(", so nothing")
       PrintN("   was sent. The link is up, so this is the interface itself and not")
       PrintN("   the cable or the access point.")
@@ -494,9 +502,12 @@ Procedure.i NetResolveHop(ip.i)
     ; SUBTRACT AND COMPARE AGAINST ZERO rather than comparing the two
     ; numbers, so the wait is correct across a wrap of the millisecond
     ; counter. Same reasoning, same shape, as tftp.pi4:1946-1951.
+    ; EVERY ADDRESSED INTERFACE IS PUMPED while we wait, because the
+    ; reply arrives on whichever interface it arrives on and a wait that
+    ; listened only to the selected one would sit out its whole budget.
     deadline = millis() + #ETH_ARP_MS
     While (millis() - deadline) < 0
-      r = LinkPumpNet(50)
+      r = LinkPumpAllNet(50)
       If r <> #LINK_RX_NONE
         gEthFrames = gEthFrames + 1
       EndIf
@@ -543,15 +554,20 @@ EndProcedure
 ;  same port so that a datagram for anything else is dropped before
 ;  tftp.pi4 ever sees it.
 ; ----------------------------------------------------------------------
-Procedure.i NetXferSend()
+;  THE INTERFACE IS A PARAMETER, and it is the one EthStart routed this
+;  transfer onto. It was LinkKind() until 2026-09-10 - the board's
+;  default outbound door - which is a different question from "which
+;  interface can reach this server" the moment a board holds an address
+;  on more than one.
+Procedure.i NetXferSend(kind.i)
   If TftpOutLen() = 0
     ProcedureReturn 0
   EndIf
-  If NetUdpBuild(LinkKind(), TftpOutIp(), TftpOutPort(), TftpLocalPort(), TftpOutBuf(), TftpOutLen()) = 0
+  If NetUdpBuild(kind, TftpOutIp(), TftpOutPort(), TftpLocalPort(), TftpOutBuf(), TftpOutLen()) = 0
     gEthSendFail = gEthSendFail + 1
     ProcedureReturn 0
   EndIf
-  If LinkTxStaged() <> 1
+  If LinkTxStagedOn(kind) <> 1
     gEthSendFail = gEthSendFail + 1
     ProcedureReturn 0
   EndIf
@@ -590,23 +606,30 @@ EndProcedure
 ;  line of output per stranger would let anybody on the segment fill the
 ;  terminal. TftpStrangerCount() is in the tally at the end.
 ; ----------------------------------------------------------------------
-Procedure.i NetXferPump(ms.i)
+;  IT PUMPS EVERY ADDRESSED INTERFACE, NOT THE SELECTED ONE. It called
+;  LinkPumpNet until 2026-09-10, which reads gLinkKind, so a transfer
+;  routed onto the radio while the cable was preferred would have sat
+;  through its whole retransmit budget without ever looking at the wire
+;  the answers were on. LinkPumpAllNet hands NetInput the interface each
+;  frame actually arrived on and leaves the operator's outbound
+;  preference alone, which is the same rule the console's pump follows.
+Procedure.i NetXferPump(kind.i, ms.i)
   Define r.i
   Define t.i
 
-  r = LinkPumpNet(ms)
+  r = LinkPumpAllNet(ms)
   If r <> #LINK_RX_NONE
     gEthFrames = gEthFrames + 1
     If r = #NET_IN_UDP
       gEthUdp = gEthUdp + 1
       TftpInput(NetUdpRxFrom(), NetUdpRxPort(), NetUdpRxDstPort(), NetUdpRxData(), NetUdpRxLen())
-      NetXferSend()
+      NetXferSend(kind)
     EndIf
   EndIf
 
   t = TftpTick(millis())
   If t = 1
-    NetXferSend()
+    NetXferSend(kind)
   EndIf
 
   If TftpComplete() = 1
@@ -636,7 +659,7 @@ EndProcedure
 ;  the transfer open, which matters when the next thing the operator
 ;  does is try again.
 ; ----------------------------------------------------------------------
-Procedure.i NetXferRun()
+Procedure.i NetXferRun(kind.i)
   Define deadline.i
   Define dots.i
   Define blocks.i
@@ -649,7 +672,7 @@ Procedure.i NetXferRun()
         PrintNl()
       EndIf
       If TftpCancel() = 1
-        NetXferSend()
+        NetXferSend(kind)
       EndIf
       PrintN("The transfer was stopped part way and NOTHING IS COMPLETE. For a get,")
       PrintN("what is at the destination is the beginning of a file with whatever")
@@ -658,7 +681,7 @@ Procedure.i NetXferRun()
       ProcedureReturn 0
     EndIf
 
-    If NetXferPump(#ETH_SLICE_MS) = 1
+    If NetXferPump(kind, #ETH_SLICE_MS) = 1
       If dots > 0
         PrintNl()
       EndIf
@@ -684,7 +707,7 @@ Procedure.i NetXferRun()
       PrintN("sixteen seconds - it means blocks kept arriving and the file never")
       PrintN("ended. Nothing is complete and the destination holds part of a file.")
       If TftpCancel() = 1
-        NetXferSend()
+        NetXferSend(kind)
       EndIf
       ProcedureReturn 0
     EndIf
@@ -815,18 +838,76 @@ EndProcedure
 ;  addressed to any other port of ours is dropped before tftp.pi4 sees
 ;  it.
 ; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  THE TRANSFER SESSION'S INTERFACE. One transfer runs at a time -
+;  tftp.pi4 keeps one transfer's state - so this is a field of that
+;  session, written by EthStart and by nothing else, and read once by
+;  each command before being passed down as a parameter. It is NOT a
+;  second copy of the link selection: LinkKind() is still the board's
+;  default outbound door and this is the answer to "which interface can
+;  reach THIS server", which is a different question.
+; ----------------------------------------------------------------------
+Global gXferKind.i = #HW_LINK_NONE
+
+Procedure.i XferKind()
+  ProcedureReturn gXferKind
+EndProcedure
+
 Procedure.i EthStart()
   Define port.i
+  Define k.i
 
   gEthFrames = 0
   gEthUdp = 0
   gEthArpOut = 0
   gEthSendFail = 0
+  gXferKind = #HW_LINK_NONE
 
-  If NetLinkUpFull() = 0
+  ; ---- THE ONE FACT THE BOARD CANNOT DERIVE -------------------------
+  ; Which machine is serving the file. Everything else a transfer needs
+  ; is already per-interface state. See NetXferServer in netcfg.pbi for
+  ; what this replaced and what typing four keys cost on 2026-09-10.
+  gEthSrv = NetXferServer()
+  If gEthSrv = 0
     ProcedureReturn 0
   EndIf
-  If NetResolveHop(gEthSrv) = 0
+
+  ; ---- MAKE SURE SOMETHING IS UP ------------------------------------
+  ; HwLinkOpen is the board's live re-check: one MDIO read on a link
+  ; already up, the five-second bring-up only when it is worth paying.
+  ; It selects the DEFAULT door and prints its own refusal; the route
+  ; below is what decides where this transfer goes.
+  If HwLinkOpen(1) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- AND WHICH INTERFACE CAN REACH THAT SERVER --------------------
+  ; The destination's subnet decides, exactly as it does for `tcp
+  ; connect`. A board holding a probed link-local address on the cable,
+  ; a served alias beside it and a lease on the radio has three usable
+  ; source addresses and only one of them can reach a given server.
+  k = NetIfForDest(gEthSrv)
+  If k = #HW_LINK_NONE
+    Print("!! no interface on this board can reach ")
+    PutIp(gEthSrv)
+    PrintN(", so nothing was")
+    PrintN("   transferred. That address is on none of this board's own segments")
+    PrintN("   and no interface holding an address has a gateway to send it")
+    PrintN("   through. These are the addresses this board holds right now:")
+    NetSayInterfaces()
+    PrintN("   Either give the server an address on one of those segments, or set")
+    PrintN("   a gateway on the interface that should carry it.")
+    ProcedureReturn 0
+  EndIf
+  gXferKind = k
+  Print("The transfer goes out over ")
+  UartWriteStr(HwLinkName(k))
+  Print(" from ")
+  PutIp(NetSrcFor(k, gEthSrv))
+  PrintN(",")
+  PrintN("  which is the interface that can reach that server.")
+
+  If NetResolveHop(k, gEthSrv) = 0
     ProcedureReturn 0
   EndIf
 
@@ -839,7 +920,7 @@ Procedure.i EthStart()
   EndIf
 
   port = TftpSuggestPort(millis())
-  If NetUdpBind(LinkKind(), port) = 0
+  If NetUdpBind(k, port) = 0
     PrintN("!! the network stack would not listen on this transfer's own port, so")
     PrintN("   nothing was transferred.")
     EthWhyNet()
@@ -974,7 +1055,7 @@ Procedure CmdGet()
   ; The read request, and it is the ONE packet in a transfer that goes
   ; to port 69 [rfc1350.txt:206]. Everything after it goes to whatever
   ; port the server answers from.
-  If NetXferSend() = 0
+  If NetXferSend(XferKind()) = 0
     PrintN("!! the read request would not go out on the wire, so nothing was")
     PrintN("   transferred.")
     EthWhyNet()
@@ -982,7 +1063,7 @@ Procedure CmdGet()
     ProcedureReturn
   EndIf
 
-  If NetXferRun() = 0
+  If NetXferRun(XferKind()) = 0
     PrintN("The transfer did not complete.")
     EthWhyTftp()
     EthSayServer()
@@ -1146,7 +1227,7 @@ Procedure CmdPut()
     EthWhyTftp()
     ProcedureReturn
   EndIf
-  If NetXferSend() = 0
+  If NetXferSend(XferKind()) = 0
     PrintN("!! the write request would not go out on the wire, so nothing was")
     PrintN("   transferred.")
     EthWhyNet()
@@ -1154,7 +1235,7 @@ Procedure CmdPut()
     ProcedureReturn
   EndIf
 
-  If NetXferRun() = 0
+  If NetXferRun(XferKind()) = 0
     PrintN("The transfer did not complete, so the file on the server is either")
     PrintN("absent or part of what was meant to be sent. Do not trust it.")
     EthWhyTftp()
@@ -1472,9 +1553,9 @@ Procedure CmdNet()
     ; the first question anybody has about a board that has gone quiet.
     ; Nothing is printed when nothing has been bound, because "no address
     ; has been bound" is already the subject of every line above.
-    If gEthAddrFrom <> #NET_ADDR_NONE
+    If NetIfSrc(LinkKind()) <> #NET_ADDR_NONE
       Print("  ")
-      UartWriteStr(NetAddrFromText())
+      UartWriteStr(NetAddrFromText(LinkKind()))
       PrintNl()
     EndIf
 
@@ -1528,9 +1609,9 @@ Procedure CmdNet()
       ; The decision is not stale any more - a stored address is applied
       ; the moment it is complete - and this line says which kind of
       ; address the answer is about.
-      If gEthAddrFrom <> #NET_ADDR_NONE
+      If NetIfSrc(LinkKind()) <> #NET_ADDR_NONE
         Print("  ")
-        UartWriteStr(NetAddrFromText())
+        UartWriteStr(NetAddrFromText(LinkKind()))
         PrintNl()
       EndIf
       NetConsoleSay()
@@ -1997,7 +2078,7 @@ Procedure.i ResolveName(name.i)
     EndIf
   EndIf
 
-  If NetResolveHop(dnsIp) = 0
+  If NetResolveHop(LinkKind(), dnsIp) = 0
     ProcedureReturn -1
   EndIf
 
@@ -2160,7 +2241,7 @@ Procedure CmdPing()
   If NetLinkUpSay(1) = 0
     ProcedureReturn
   EndIf
-  If NetResolveHop(ip) = 0
+  If NetResolveHop(LinkKind(), ip) = 0
     ProcedureReturn
   EndIf
 

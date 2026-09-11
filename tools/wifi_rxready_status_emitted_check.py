@@ -23,6 +23,7 @@ def main():
     ws=WIFI.read_text(encoding='utf-8'); cs=CMD.read_text(encoding='utf-8'); out=FIX.read_text(encoding='utf-8')
     gl='\n'.join(x for x in ws.splitlines() if x.startswith('Global gWifiRxReady'))+'\nGlobal gWifiRinitGeneration.i'
     names=('WifiRxReadyActive','WifiRxReadyGeneration','WifiRxReadyGenerationValid','WifiRxReadyElapsed','WifiRxReadyRawDelta','WifiRxReadyFrameDelta','WifiRxReadyEmptyDelta','WifiRxReadyFirstDelta','WifiRxReadyCmd53Delta','WifiRxReadyFirstPendingDelta','WifiRxReadyFirstQuietDelta','WifiRxReadyNonPendingDelta','WifiRxReadyNonQuietDelta','WifiRxReadyEmptyPendingDelta','WifiRxReadyEmptyQuietDelta')
+    names += ('WifiRxReadyInheritedDelta','WifiRxReadyNewDelta','WifiRxReadyQDataDelta','WifiRxReadyQControlDelta','WifiRxReadyQEventDelta','WifiRxReadyQGlomDelta','WifiRxReadyQUnknownDelta','WifiRxReadyQMalformedDelta','WifiRxReadyQPrevNextDelta','WifiRxReadyQSeqOkDelta','WifiRxReadyQSeqGapDelta','WifiRxReadyQPostPendingDelta','WifiRxReadyQPostQuietDelta','WifiRxReadyQPostFailDelta')
     helpers='\n'.join(proc(ws,n) for n in names)
     status=proc(cs,'WifiRxReadyStatus').replace('PrintN(','GatePrintN(').replace('Print(','GatePrint(')
     out=out.replace('; @@GLOBALS@@',gl).replace('; @@HELPERS@@',helpers).replace('; @@STATUS@@',status)
@@ -35,5 +36,5 @@ def main():
         if r.returncode or 'pmfc: OK' not in r.stdout: raise SystemExit('rxready status gate: compile failed\n'+r.stdout)
         result,steps=emitted.execute(a64,img)
     if result: print(f'wifi_rxready_status_emitted_check: FAIL assertion {result} after {steps:,} instructions'); return 1
-    print(f'wifi_rxready_status_emitted_check: PASS - off/pending/current/mismatch and six delta cells, {steps:,} instructions'); return 0
+    print(f'wifi_rxready_status_emitted_check: PASS - off/pending/current/mismatch and 20 session delta cells, {steps:,} instructions'); return 0
 if __name__=='__main__': sys.exit(main())

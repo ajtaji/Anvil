@@ -1831,6 +1831,16 @@ Global cyw43_rxIrqNonemptyPending.i = 0
 Global cyw43_rxIrqNonemptyNoPending.i = 0
 Global cyw43_rxIrqEmptyPending.i = 0
 Global cyw43_rxIrqEmptyNoPending.i = 0
+Global cyw43_rxIrqFirstInherited.i = 0
+Global cyw43_rxIrqFirstNew.i = 0
+Global cyw43_rxIrqQuietData.i = 0 : Global cyw43_rxIrqQuietControl.i = 0
+Global cyw43_rxIrqQuietEvent.i = 0 : Global cyw43_rxIrqQuietGlom.i = 0
+Global cyw43_rxIrqQuietUnknown.i = 0 : Global cyw43_rxIrqQuietMalformed.i = 0
+Global cyw43_rxIrqQuietPrevNext.i = 0
+Global cyw43_rxIrqQuietSeqOk.i = 0 : Global cyw43_rxIrqQuietSeqGap.i = 0
+Global cyw43_rxIrqQuietPostPending.i = 0 : Global cyw43_rxIrqQuietPostQuiet.i = 0
+Global cyw43_rxIrqQuietPostFail.i = 0
+Global cyw43_rxIrqPrevNext.i = 0
 
 ; The OPTIONAL block-mode pair, added 2026-08-26. Separate from the four
 ; above and separately installed, because they are separately optional:
@@ -5744,6 +5754,12 @@ Procedure.i Cyw43TransportReset()
   cyw43_rxUnknown = 0
   cyw43_rxNextLen = 0
   cyw43_rxNextLenMax = 0
+  cyw43_rxIrqFirstInherited=0 : cyw43_rxIrqFirstNew=0
+  cyw43_rxIrqQuietData=0 : cyw43_rxIrqQuietControl=0 : cyw43_rxIrqQuietEvent=0 : cyw43_rxIrqQuietGlom=0
+  cyw43_rxIrqQuietUnknown=0 : cyw43_rxIrqQuietMalformed=0 : cyw43_rxIrqQuietPrevNext=0
+  cyw43_rxIrqQuietSeqOk=0 : cyw43_rxIrqQuietSeqGap=0
+  cyw43_rxIrqQuietPostPending=0 : cyw43_rxIrqQuietPostQuiet=0 : cyw43_rxIrqQuietPostFail=0
+  cyw43_rxIrqPrevNext=0
   cyw43_rxSeqSeen = 0
   cyw43_rxSeqExpect = 0
   cyw43_rxSeqMismatch = 0
@@ -6096,8 +6112,22 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
   Define gp.i
   Define gn.i
   Define irqAtRead.i
+  Define irqInherited.i
+  Define irqFrame0.i
+  Define quietNonempty.i
+  Define post.i
+  Define savedErr.i
+  Define prevNextAtRead.i
+  Define quietSeqOk.i
 
   fromQueue = 0
+  quietNonempty = 0
+  prevNextAtRead = 0
+  irqAtRead = 0
+  irqInherited = 0
+  irqFrame0 = 0
+  post = 0
+  quietSeqOk = 0
   cyw43_rxFrameSeqDone = 0
   cyw43_rxFrameCreditDone = 0
   If allowQueued <> 0 And cyw43_rxqCount > 0
@@ -6107,6 +6137,8 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
     EndIf
     fromQueue = 1
   Else
+    prevNextAtRead = cyw43_rxIrqPrevNext
+    cyw43_rxIrqPrevNext = 0
     ; Finish a prior malformed-frame termination before asking F2 for a
     ; new header. One observation per call keeps this recovery nonblocking.
     If cyw43_rxAbortActive <> 0
@@ -6125,11 +6157,15 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
     ; delivery, polling, control replies, credit waits, events or gloms.
     irqAtRead = 0
     If cyw43_rxIrqActive <> 0
+      irqInherited = Bool((cyw43_rxIrqPending & #CYW43_I_HMB_FRAME_IND) <> 0)
+      irqFrame0 = cyw43_rxIrqFrameInd
       cyw43_RxIrqObserve()
       If cyw43_rxIrqActive <> 0
         If (cyw43_rxIrqPending & #CYW43_I_HMB_FRAME_IND) <> 0
           irqAtRead = 1
           cyw43_rxIrqFirstPending = cyw43_rxIrqFirstPending + 1
+          If irqInherited <> 0 : cyw43_rxIrqFirstInherited=cyw43_rxIrqFirstInherited+1 : EndIf
+          If cyw43_rxIrqFrameInd <> irqFrame0 : cyw43_rxIrqFirstNew=cyw43_rxIrqFirstNew+1 : EndIf
         Else
           cyw43_rxIrqFirstNoPending = cyw43_rxIrqFirstNoPending + 1
         EndIf
@@ -6165,16 +6201,33 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
       cyw43_rxIrqNonemptyPending = cyw43_rxIrqNonemptyPending + 1
     Else
       cyw43_rxIrqNonemptyNoPending = cyw43_rxIrqNonemptyNoPending + 1
+      quietNonempty = 1
+      If prevNextAtRead <> 0 : cyw43_rxIrqQuietPrevNext=cyw43_rxIrqQuietPrevNext+1 : EndIf
+      ; Correlation sample only. It neither acknowledges a cause nor proves
+      ; that an asserted host bit was caused by this FIFO frame.
+      savedErr = cyw43_err
+      post = cyw43_rxIrqOp(#CYW43_RXIRQ_PENDING)
+      cyw43_err = savedErr
+      If post > 0
+        cyw43_rxIrqQuietPostPending=cyw43_rxIrqQuietPostPending+1
+      ElseIf post = 0
+        cyw43_rxIrqQuietPostQuiet=cyw43_rxIrqQuietPostQuiet+1
+      Else
+        cyw43_rxIrqQuietPostFail=cyw43_rxIrqQuietPostFail+1
+      EndIf
     EndIf
   EndIf
 
   ; sdio.c lines 1382-1385, and the order of these two tests is the
   ; whole point: all-zero is EMPTY, not corrupt.
   If size = 0 And comp = 0
+    cyw43_rxIrqPrevNext = 0
     cyw43_rxEmpty = cyw43_rxEmpty + 1
     ProcedureReturn 0
   EndIf
   If (size ! comp) <> $FFFF
+    If quietNonempty<>0 : cyw43_rxIrqQuietMalformed=cyw43_rxIrqQuietMalformed+1 : EndIf
+    cyw43_rxIrqPrevNext = 0
     cyw43_rxBadHdr = cyw43_rxBadHdr + 1
     cyw43_rxBadLastSize = size
     cyw43_rxBadLastComp = comp
@@ -6186,6 +6239,8 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
     ProcedureReturn 3
   EndIf
   If size < #CYW43_SDPCM_HDRLEN
+    If quietNonempty<>0 : cyw43_rxIrqQuietMalformed=cyw43_rxIrqQuietMalformed+1 : EndIf
+    cyw43_rxIrqPrevNext = 0
     cyw43_rxShort = cyw43_rxShort + 1
     If fromQueue = 0
       If cyw43_RxAbortStart() = 0
@@ -6195,6 +6250,8 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
     ProcedureReturn 3
   EndIf
   If size > #CYW43_MAX_FRAME
+    If quietNonempty<>0 : cyw43_rxIrqQuietMalformed=cyw43_rxIrqQuietMalformed+1 : EndIf
+    cyw43_rxIrqPrevNext = 0
     ; REFUSED, NOT TRUNCATED. A truncated scan result parses into a
     ; plausible network with a wrong name, which is worse than no
     ; network at all.
@@ -6245,6 +6302,7 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
   ; rule. brcmfmac likewise records a mismatch and keeps draining. A gap
   ; here says the loss is below TCP; a continuous sequence with TCP holes
   ; moves the investigation above this layer.
+  If quietNonempty<>0 And (cyw43_rxSeqSeen=0 Or seq=cyw43_rxSeqExpect) : quietSeqOk=1 : EndIf
   If cyw43_rxFrameSeqDone = 0
     If cyw43_rxSeqSeen <> 0
       If seq <> cyw43_rxSeqExpect
@@ -6277,8 +6335,28 @@ Procedure.i cyw43_RxFrame(wantId.i, allowQueued.i)
   ; The data offset is where the payload starts, measured from the start
   ; of the SDPCM header. It must be inside the frame.
   If hlen < #CYW43_SDPCM_HDRLEN Or hlen > size
+    If quietNonempty<>0 : cyw43_rxIrqQuietMalformed=cyw43_rxIrqQuietMalformed+1 : EndIf
     cyw43_rxShort = cyw43_rxShort + 1
     ProcedureReturn 3
+  EndIf
+
+  ; Only a fully bounded wire header may classify a quiet result or advertise
+  ; the following wire frame. Queued frames and malformed DOFF never become
+  ; predecessor evidence.
+  If fromQueue=0
+    cyw43_rxIrqPrevNext = Bool(nextlen<>0)
+    If quietNonempty<>0
+      If chan=#CYW43_CHAN_DATA : cyw43_rxIrqQuietData=cyw43_rxIrqQuietData+1
+      ElseIf chan=#CYW43_CHAN_CONTROL : cyw43_rxIrqQuietControl=cyw43_rxIrqQuietControl+1
+      ElseIf chan=#CYW43_CHAN_EVENT : cyw43_rxIrqQuietEvent=cyw43_rxIrqQuietEvent+1
+      ElseIf chan=#CYW43_CHAN_GLOM : cyw43_rxIrqQuietGlom=cyw43_rxIrqQuietGlom+1
+      Else : cyw43_rxIrqQuietUnknown=cyw43_rxIrqQuietUnknown+1 : EndIf
+      If quietSeqOk<>0
+        cyw43_rxIrqQuietSeqOk=cyw43_rxIrqQuietSeqOk+1
+      Else
+        cyw43_rxIrqQuietSeqGap=cyw43_rxIrqQuietSeqGap+1
+      EndIf
+    EndIf
   EndIf
 
   If chan = #CYW43_CHAN_CONTROL
@@ -8131,6 +8209,20 @@ EndProcedure
 Procedure.i Cyw43RxIrqEmptyNoPending()
   ProcedureReturn cyw43_rxIrqEmptyNoPending
 EndProcedure
+Procedure.i Cyw43RxIrqFirstInherited() : ProcedureReturn cyw43_rxIrqFirstInherited : EndProcedure
+Procedure.i Cyw43RxIrqFirstNew() : ProcedureReturn cyw43_rxIrqFirstNew : EndProcedure
+Procedure.i Cyw43RxIrqQuietData() : ProcedureReturn cyw43_rxIrqQuietData : EndProcedure
+Procedure.i Cyw43RxIrqQuietControl() : ProcedureReturn cyw43_rxIrqQuietControl : EndProcedure
+Procedure.i Cyw43RxIrqQuietEvent() : ProcedureReturn cyw43_rxIrqQuietEvent : EndProcedure
+Procedure.i Cyw43RxIrqQuietGlom() : ProcedureReturn cyw43_rxIrqQuietGlom : EndProcedure
+Procedure.i Cyw43RxIrqQuietUnknown() : ProcedureReturn cyw43_rxIrqQuietUnknown : EndProcedure
+Procedure.i Cyw43RxIrqQuietMalformed() : ProcedureReturn cyw43_rxIrqQuietMalformed : EndProcedure
+Procedure.i Cyw43RxIrqQuietPrevNext() : ProcedureReturn cyw43_rxIrqQuietPrevNext : EndProcedure
+Procedure.i Cyw43RxIrqQuietSeqOk() : ProcedureReturn cyw43_rxIrqQuietSeqOk : EndProcedure
+Procedure.i Cyw43RxIrqQuietSeqGap() : ProcedureReturn cyw43_rxIrqQuietSeqGap : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostPending() : ProcedureReturn cyw43_rxIrqQuietPostPending : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostQuiet() : ProcedureReturn cyw43_rxIrqQuietPostQuiet : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostFail() : ProcedureReturn cyw43_rxIrqQuietPostFail : EndProcedure
 
 Procedure.i Cyw43RxUnknownChannel()
   ProcedureReturn cyw43_rxUnknown

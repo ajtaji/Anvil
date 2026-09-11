@@ -24,12 +24,26 @@ Procedure.i Cyw43RxIrqZeroCause() : ProcedureReturn 31 : EndProcedure
 Procedure.i Cyw43RxIrqRearmReady() : ProcedureReturn 32 : EndProcedure
 Procedure.i Cyw43RxIrqNestedCalls() : ProcedureReturn 33 : EndProcedure
 Procedure.i Cyw43RxIrqFault() : ProcedureReturn 34 : EndProcedure
+Procedure.i Cyw43RxIrqFirstInherited() : ProcedureReturn gWifiRxReadyInherited+107 : EndProcedure
+Procedure.i Cyw43RxIrqFirstNew() : ProcedureReturn gWifiRxReadyNew+108 : EndProcedure
+Procedure.i Cyw43RxIrqQuietData() : ProcedureReturn gWifiRxReadyQData+109 : EndProcedure
+Procedure.i Cyw43RxIrqQuietControl() : ProcedureReturn gWifiRxReadyQControl+110 : EndProcedure
+Procedure.i Cyw43RxIrqQuietEvent() : ProcedureReturn gWifiRxReadyQEvent+111 : EndProcedure
+Procedure.i Cyw43RxIrqQuietGlom() : ProcedureReturn gWifiRxReadyQGlom+112 : EndProcedure
+Procedure.i Cyw43RxIrqQuietUnknown() : ProcedureReturn gWifiRxReadyQUnknown+113 : EndProcedure
+Procedure.i Cyw43RxIrqQuietMalformed() : ProcedureReturn gWifiRxReadyQMalformed+114 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPrevNext() : ProcedureReturn gWifiRxReadyQPrevNext+115 : EndProcedure
+Procedure.i Cyw43RxIrqQuietSeqOk() : ProcedureReturn gWifiRxReadyQSeqOk+116 : EndProcedure
+Procedure.i Cyw43RxIrqQuietSeqGap() : ProcedureReturn gWifiRxReadyQSeqGap+117 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostPending() : ProcedureReturn gWifiRxReadyQPostPending+118 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostQuiet() : ProcedureReturn gWifiRxReadyQPostQuiet+119 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostFail() : ProcedureReturn gWifiRxReadyQPostFail+120 : EndProcedure
 Procedure GatePrint(p.i) : EndProcedure
 Procedure GatePrintN(p.i) : gate_lines=gate_lines+1 : EndProcedure
 Procedure PrintNl() : gate_lines=gate_lines+1 : EndProcedure
 Procedure PrintDec(v.i)
   gate_decCalls=gate_decCalls+1
-  If v>=101 And v<=106 : gate_decMask=gate_decMask | (1 << (v-101)) : EndIf
+  If v>=101 And v<=120 : gate_decMask=gate_decMask | (1 << (v-101)) : EndIf
 EndProcedure
 
 ; @@HELPERS@@
@@ -55,10 +69,10 @@ Procedure.i Main()
   gate_raw=21 : gate_frames=32 : gate_empty=43 : gate_first=54 : gate_cmd=65
   gate_fp=161 : gate_fq=172 : gate_np=183 : gate_nq=194 : gate_ep=205 : gate_eq=216
   ResetOutput() : WifiRxReadyStatus()
-  If gate_decMask<>$3F : ProcedureReturn 3 : EndIf
+  If gate_decMask<>$FFFFF : ProcedureReturn 3 : EndIf
   If gWifiRxReadyFirstPending<>60 Or gWifiRxReadyEmptyQuiet<>110 : ProcedureReturn 4 : EndIf
   ResetOutput() : WifiRxReadyStatus()
-  If gate_decMask<>$3F : ProcedureReturn 5 : EndIf
+  If gate_decMask<>$FFFFF : ProcedureReturn 5 : EndIf
 
   ; A mismatched generation prints a refusal and no numeric correlation.
   gWifiRinitGeneration=8 : ResetOutput() : WifiRxReadyStatus()

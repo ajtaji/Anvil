@@ -138,6 +138,15 @@ Capture places CARD_INT/frame indications beside legacy first/empty F2 reads
 and CMD53 calls. It does not change `cyw43_RxFrame`; every case still performs
 the legacy read. This is observation, not a scheduler or performance fix.
 
+Quiet-nonempty first reads are further bucketed by parsed SDPCM channel (or
+malformed header), preceding accepted wire-frame NEXTLEN, and receive-sequence
+continuity. The report distinguishes a FRAME_IND latch inherited from an
+earlier pass from one newly captured by the current observation. After a
+quiet-nonempty result it takes one additional raw host PENDING sample only; it
+does not quiesce, acknowledge, or issue another F2 read. A post-read assertion
+is consistent with a timing race but is not proof: the asserted host cause may
+be unrelated to the frame just read. These fields are correlations only.
+
 Physical acceptance sequence: arm; capture an idle interval; capture around
 ping, control/event, TCP and glom-producing traffic; then disable. `wifi bus`
 remains the cumulative transport view. Any nonempty F2 read without readiness

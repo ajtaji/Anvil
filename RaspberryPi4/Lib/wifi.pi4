@@ -90,6 +90,11 @@ Global gWifiRxReadyCmd53.i = 0
 Global gWifiRxReadyFirstPending.i = 0 : Global gWifiRxReadyFirstQuiet.i = 0
 Global gWifiRxReadyNonPending.i = 0 : Global gWifiRxReadyNonQuiet.i = 0
 Global gWifiRxReadyEmptyPending.i = 0 : Global gWifiRxReadyEmptyQuiet.i = 0
+Global gWifiRxReadyInherited.i : Global gWifiRxReadyNew.i
+Global gWifiRxReadyQData.i : Global gWifiRxReadyQControl.i : Global gWifiRxReadyQEvent.i : Global gWifiRxReadyQGlom.i
+Global gWifiRxReadyQUnknown.i : Global gWifiRxReadyQMalformed.i : Global gWifiRxReadyQPrevNext.i
+Global gWifiRxReadyQSeqOk.i : Global gWifiRxReadyQSeqGap.i
+Global gWifiRxReadyQPostPending.i : Global gWifiRxReadyQPostQuiet.i : Global gWifiRxReadyQPostFail.i
 
 ; Optional cooperative service hook. The radio remains independent of the
 ; screen: it only announces completed lines and bounded wait slices. The board
@@ -3913,6 +3918,14 @@ Procedure.i WifiRxReadyArm()
   gWifiRxReadyFirstPending=Cyw43RxIrqFirstPending() : gWifiRxReadyFirstQuiet=Cyw43RxIrqFirstNoPending()
   gWifiRxReadyNonPending=Cyw43RxIrqNonemptyPending() : gWifiRxReadyNonQuiet=Cyw43RxIrqNonemptyNoPending()
   gWifiRxReadyEmptyPending=Cyw43RxIrqEmptyPending() : gWifiRxReadyEmptyQuiet=Cyw43RxIrqEmptyNoPending()
+  gWifiRxReadyInherited=Cyw43RxIrqFirstInherited() : gWifiRxReadyNew=Cyw43RxIrqFirstNew()
+  gWifiRxReadyQData=Cyw43RxIrqQuietData() : gWifiRxReadyQControl=Cyw43RxIrqQuietControl()
+  gWifiRxReadyQEvent=Cyw43RxIrqQuietEvent() : gWifiRxReadyQGlom=Cyw43RxIrqQuietGlom()
+  gWifiRxReadyQUnknown=Cyw43RxIrqQuietUnknown() : gWifiRxReadyQMalformed=Cyw43RxIrqQuietMalformed()
+  gWifiRxReadyQPrevNext=Cyw43RxIrqQuietPrevNext()
+  gWifiRxReadyQSeqOk=Cyw43RxIrqQuietSeqOk() : gWifiRxReadyQSeqGap=Cyw43RxIrqQuietSeqGap()
+  gWifiRxReadyQPostPending=Cyw43RxIrqQuietPostPending() : gWifiRxReadyQPostQuiet=Cyw43RxIrqQuietPostQuiet()
+  gWifiRxReadyQPostFail=Cyw43RxIrqQuietPostFail()
   If Cyw43RxIrqTelemetry(1) = 0
     ; A failed ARM may retain the old transport snapshot. Only unregister when
     ; verified cleanup says there is no retryable ownership.
@@ -3975,3 +3988,17 @@ Procedure.i WifiRxReadyNonPendingDelta() : ProcedureReturn Cyw43RxIrqNonemptyPen
 Procedure.i WifiRxReadyNonQuietDelta() : ProcedureReturn Cyw43RxIrqNonemptyNoPending()-gWifiRxReadyNonQuiet : EndProcedure
 Procedure.i WifiRxReadyEmptyPendingDelta() : ProcedureReturn Cyw43RxIrqEmptyPending()-gWifiRxReadyEmptyPending : EndProcedure
 Procedure.i WifiRxReadyEmptyQuietDelta() : ProcedureReturn Cyw43RxIrqEmptyNoPending()-gWifiRxReadyEmptyQuiet : EndProcedure
+Procedure.i WifiRxReadyInheritedDelta() : ProcedureReturn Cyw43RxIrqFirstInherited()-gWifiRxReadyInherited : EndProcedure
+Procedure.i WifiRxReadyNewDelta() : ProcedureReturn Cyw43RxIrqFirstNew()-gWifiRxReadyNew : EndProcedure
+Procedure.i WifiRxReadyQDataDelta() : ProcedureReturn Cyw43RxIrqQuietData()-gWifiRxReadyQData : EndProcedure
+Procedure.i WifiRxReadyQControlDelta() : ProcedureReturn Cyw43RxIrqQuietControl()-gWifiRxReadyQControl : EndProcedure
+Procedure.i WifiRxReadyQEventDelta() : ProcedureReturn Cyw43RxIrqQuietEvent()-gWifiRxReadyQEvent : EndProcedure
+Procedure.i WifiRxReadyQGlomDelta() : ProcedureReturn Cyw43RxIrqQuietGlom()-gWifiRxReadyQGlom : EndProcedure
+Procedure.i WifiRxReadyQUnknownDelta() : ProcedureReturn Cyw43RxIrqQuietUnknown()-gWifiRxReadyQUnknown : EndProcedure
+Procedure.i WifiRxReadyQMalformedDelta() : ProcedureReturn Cyw43RxIrqQuietMalformed()-gWifiRxReadyQMalformed : EndProcedure
+Procedure.i WifiRxReadyQPrevNextDelta() : ProcedureReturn Cyw43RxIrqQuietPrevNext()-gWifiRxReadyQPrevNext : EndProcedure
+Procedure.i WifiRxReadyQSeqOkDelta() : ProcedureReturn Cyw43RxIrqQuietSeqOk()-gWifiRxReadyQSeqOk : EndProcedure
+Procedure.i WifiRxReadyQSeqGapDelta() : ProcedureReturn Cyw43RxIrqQuietSeqGap()-gWifiRxReadyQSeqGap : EndProcedure
+Procedure.i WifiRxReadyQPostPendingDelta() : ProcedureReturn Cyw43RxIrqQuietPostPending()-gWifiRxReadyQPostPending : EndProcedure
+Procedure.i WifiRxReadyQPostQuietDelta() : ProcedureReturn Cyw43RxIrqQuietPostQuiet()-gWifiRxReadyQPostQuiet : EndProcedure
+Procedure.i WifiRxReadyQPostFailDelta() : ProcedureReturn Cyw43RxIrqQuietPostFail()-gWifiRxReadyQPostFail : EndProcedure

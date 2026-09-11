@@ -197,6 +197,28 @@
 #LINK_WHY_NONE_AT_ALL = 6  ; neither
 #LINK_WHY_ONLY_ONE   = 7   ; this board has exactly one link and it is it
 #LINK_WHY_NOT_HERE   = 8   ; the kind asked for is not on this board
+; ----------------------------------------------------------------------
+;  THE OPERATOR'S PIN IS A REASON IN ITS OWN RIGHT - 2026-09-10.
+;
+;  There was no code for it, so HwLinkOpen expressed the pin by HIDING
+;  the other interface's facts from LinkSelect: `net link wifi` passed
+;  wiredLink = 0 and wiredIp = 0. LinkSelect then reached its "Wi-Fi and
+;  the cable is out" arm and STAMPED #LINK_WHY_WIFI_NOCBL, so `net` on a
+;  board with a cable plugged in, negotiated and holding two addresses
+;  answered "there is nothing plugged into the Ethernet socket". That is
+;  the recorded misleading-status defect, and it was not a wording
+;  mistake: the sentence was a correct reading of a fact that had been
+;  falsified one layer up to express something else.
+;
+;  A pin is not a fact about a cable. It gets its own codes, LinkSelect
+;  is told the pin instead of being lied to about the hardware, and the
+;  sentences below say nothing about the other interface - because when
+;  an interface is pinned, what the other one is doing is exactly what
+;  the operator asked the board to stop considering.
+; ----------------------------------------------------------------------
+#LINK_WHY_PINNED     = 9   ; pinned, up, and holding an address
+#LINK_WHY_PIN_BARE   = 10  ; pinned and up, but holding no address yet
+#LINK_WHY_PIN_DOWN   = 11  ; pinned to an interface that is not up
 
 ; The largest 802.3 frame this file will hand to either driver. 1514 is
 ; the classic Ethernet maximum without the FCS. The RADIO's own limit is
@@ -259,12 +281,53 @@ Global gLinkPumpNext.i = 1
 ;  does that, because the address to apply is the caller's to know and
 ;  applying the wrong one silently is exactly what this seam exists to
 ;  stop.
+;
+;  THE PIN IS THE FIFTH FACT AND IT IS PASSED IN - 2026-09-10. It used
+;  to be applied by the caller zeroing the other interface's two facts
+;  before calling, which produced a stored reason that described
+;  hardware rather than the instruction that was actually given. See the
+;  #LINK_WHY_PIN* block above for what that printed. Every fact this
+;  procedure is given is now true, and the pin is one of them.
 ; ----------------------------------------------------------------------
-Procedure.i LinkSelect(wiredLink.i, wiredIp.i, wifiUp.i, wifiIp.i)
+Procedure.i LinkSelect(pin.i, wiredLink.i, wiredIp.i, wifiUp.i, wifiIp.i)
   Define k.i
   Define w.i
+  Define up.i
+  Define ip.i
   k = #HW_LINK_NONE
   w = #LINK_WHY_NONE_AT_ALL
+
+  ; ---- PINNED: one interface, its own two facts, and no opinion about
+  ; ---- the other one. "Use the cable" and "use whatever works" are
+  ; ---- different instructions and only one of them was given.
+  If pin <> #HW_LINK_NONE
+    up = 0
+    ip = 0
+    If pin = #HW_LINK_WIRED
+      up = wiredLink
+      ip = wiredIp
+    ElseIf pin = #HW_LINK_WIFI
+      up = wifiUp
+      ip = wifiIp
+    EndIf
+    If up = 0
+      k = #HW_LINK_NONE
+      w = #LINK_WHY_PIN_DOWN
+    ElseIf ip = 0
+      k = pin
+      w = #LINK_WHY_PIN_BARE
+    Else
+      k = pin
+      w = #LINK_WHY_PINNED
+    EndIf
+    If k <> gLinkKind
+      gLinkSwaps = gLinkSwaps + 1
+      gLinkSince = millis()
+    EndIf
+    gLinkKind = k
+    gLinkWhy = w
+    ProcedureReturn k
+  EndIf
 
   If wiredLink <> 0 And wiredIp <> 0
     k = #HW_LINK_WIRED
@@ -443,6 +506,12 @@ Procedure.i LinkWhyText()
       ProcedureReturn "this board has exactly one interface Anvil can reach, and that is the one carrying traffic - there is nothing to prefer it over"
     Case #LINK_WHY_NOT_HERE
       ProcedureReturn "the interface this board was asked to use is not one it has, so nothing is carrying traffic - check which link the board file declares in HwLinkHas"
+    Case #LINK_WHY_PINNED
+      ProcedureReturn "the operator pinned this interface with net link and it is up and holds an address, so nothing else is considered at all - whatever the other interface is doing is deliberately not part of this answer"
+    Case #LINK_WHY_PIN_BARE
+      ProcedureReturn "the operator pinned this interface with net link and it is up, but no address is set for it yet - run dhcp, or set one with net address, and nothing else will be tried in the meantime because a pin refuses rather than falls back"
+    Case #LINK_WHY_PIN_DOWN
+      ProcedureReturn "the operator pinned an interface with net link and that interface is not up, so nothing is carrying traffic - a pin REFUSES rather than falling back to the other interface, and net link auto undoes it"
     Default
       ProcedureReturn "no link has been chosen yet - run net, ping, dhcp or any other network command and one will be"
   EndSelect
