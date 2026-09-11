@@ -94,3 +94,83 @@ translations or adaptations of BearSSL algorithms and generated material.
 The original per-file copyright notices remain in the source. The complete
 [BearSSL MIT license](../licenses/BearSSL-LICENSE.txt) accompanies the tree and
 also covers the derived X.509 VM blob.
+
+## Mesa derived V3D material
+
+`RaspberryPi4/Lib/v3d.pi4`, `RaspberryPi4/Lib/v3dqpu.pi4` and
+`RaspberryPi4/Lib/neon.pi4` derive V3D control-list packet layouts, QPU
+instruction field and opcode tables, the instruction-restriction list, tiling
+and TFU descriptions, and the register-write order of job submission from the
+Broadcom V3D backend of Mesa. The reviewed upstream is tag `mesa-24.3.4`,
+commit `769e51468b49b2a42f0a0eaf71cf9eed5ff4e5de`.
+
+Mesa's cited files carry per-file MIT notices. The complete retained text is in
+[`licenses/Mesa-MIT.txt`](../licenses/Mesa-MIT.txt). No Mesa source file is
+vendored here. Per-routine classification is in
+[`PROVENANCE_INVENTORY.md`](PROVENANCE_INVENTORY.md).
+
+## Das U-Boot GPL-2.0-or-later under review
+
+**This section discloses a derivation. It is not a license election.**
+
+Several files translate or structurally follow U-Boot v2025.01, commit
+`6d41f0a39d6423c8e57e92ebbe9f8c0333a63f72`, whose relevant sources carry
+`GPL-2.0-or-later` SPDX headers:
+
+| Anvil file | Upstream |
+| --- | --- |
+| `RaspberryPi4/Lib/genet.pi4` | `drivers/net/bcmgenet.c` — named by the file as its primary source |
+| `RaspberryPi4/Lib/mmu.pi4` | `arch/arm/cpu/armv8/cache.S`, `cache_v8.c` — the all-level set/way routines |
+| `RaspberryPi4/Lib/display.pi4`, `RaspberryPi4/Lib/mailbox.pi4` | `drivers/video/bcm2835/msg.c`, `bcm2835_mbox.h` |
+| `RaspberryPi4/Lib/tftp.pi4` | `net/tftp.c` |
+| `RaspberryPi4/Lib/xhci.pi4`, `RaspberryPi4/Lib/pcie.pi4` | `drivers/usb/host/xhci*.c`, `drivers/pci/pcie_brcmstb.c` |
+| `RaspberryPi4/Board/hw_boot.pi4` | `arch/arm/cpu/armv8/transition.S` |
+| `RaspberryPi4/Lib/hid.pi4` | `common/usb.c` — one retry and delay behaviour |
+
+Register definitions, mailbox tag numbers and the arm64 `Image` header layout
+taken from the same tree are hardware and interface facts and are cited as such;
+the table above lists only the blocks classified as derived.
+
+The GPL-2.0 license text is **deliberately not shipped in this repository yet.**
+The choice between retaining these components with their terms and replacing
+them with independently derived work is open, and shipping a license text would
+itself be a decision. See
+[`PUBLICATION_REVIEW.md`](PUBLICATION_REVIEW.md) and
+[`PROVENANCE_INVENTORY.md`](PROVENANCE_INVENTORY.md). Public pushes are held
+until it is resolved. Nothing here is relicensed by the repository's MIT terms.
+
+## Linux kernel GPL-2.0 under review
+
+**This section discloses a derivation. It is not a license election.**
+
+Files deriving from Linux v6.12, commit
+`adc218676eef25575469234709c2d87185ca223a`, and from the Raspberry Pi
+`rpi-6.12.y` fork, under `GPL-2.0-only` or `GPL-2.0-or-later` per file:
+
+| Anvil file | Upstream |
+| --- | --- |
+| `RaspberryPi4/Lib/v3d.pi4` | `drivers/gpu/drm/v3d/v3d_gem.c`, `drivers/pmdomain/bcm/bcm2835-power.c` |
+| `RaspberryPi4/Lib/sdio.pi4` | `drivers/mmc/host/bcm2835-mmc.c`, `sdhci.h`, the MMC core |
+| `RaspberryPi4/Lib/touch_goodix.pi4` | `drivers/input/touchscreen/goodix.c` (**GPL-2.0-only**) |
+| `RaspberryPi4/Lib/dsi_panel_v2.pi4`, `dsi_panel_v2_dcs.pi4`, `RaspberryPi4/Tests/Fixtures/dsi_panel_v1.pi4` | `drivers/gpu/drm/panel/panel-waveshare-dsi-v2.c`, `panel-raspberrypi-touchscreen.c` |
+| `RaspberryPi4/Lib/entropy.pi4` | `drivers/char/hw_random/iproc-rng200.c` |
+
+The brcmfmac protocol and transport sources in the same tree are ISC, not GPL,
+and are covered separately above. Register headers such as `v3d_regs.h` are
+tables of definitions and are cited as hardware facts.
+
+As with U-Boot, the license text is not shipped yet and the retain-or-replace
+decision is open.
+
+## BCM2711 device tree quotation
+
+`RaspberryPi4/Lib/pcie.pi4` reproduces five lines of `bcm2711.dtsi` verbatim
+inside a comment — the PCIe wrapper's 3 GiB DMA erratum note and the
+`dma-ranges` property it explains — introduced in the source as "comment
+included verbatim because it is the citation". `bcm2711.dtsi` carries SPDX
+`GPL-2.0`. The quotation is attributed where it appears. It is recorded here so
+that the review covers it rather than passing over the tree's one verbatim copy.
+
+Block addresses, interrupt numbers, `phy-mode` and panel timings read from the
+same device tree elsewhere in the tree are hardware description and are cited as
+hardware facts.

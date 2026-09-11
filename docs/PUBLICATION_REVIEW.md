@@ -8,6 +8,14 @@ No project-wide license change or public-history rewrite is authorized by it.
 local packaging, but its `--for-publication` mode refuses while that review is
 not recorded as cleared. Neither mode is a substitute for the actual review.
 
+**The file- and function-level inventory is complete and lives in
+[`PROVENANCE_INVENTORY.md`](PROVENANCE_INVENTORY.md)**, with the same data in
+machine-readable form under `PROVENANCE.json`'s `third_party` block and a gate,
+`tools/provenance_inventory_check.py`, that fails if a derived file loses its
+notice or if any source file cites an upstream the inventory does not list.
+Acceptance item 1 below is met by it; items 2 to 4 are not, and cannot be until
+the owner answers the question in the next section.
+
 ## Confirmed discrepancy
 
 The existing GENET driver describes structural translation from U-Boot,
@@ -41,6 +49,51 @@ their obligations alongside MIT original code, or pursue a permissive-only
 replacement. That choice is pending. Network and touch development continue
 locally, with no public push or historical rewrite.
 
+## The exact decision, restated after the full inventory
+
+The inventory did not change the question; it bounded it. Sixteen upstreams are
+cited across the tree. Thirteen of them need no decision at all: MIT, ISC,
+BSD-3-Clause, the Khronos registry, DejaVu, the separately licensed Cypress
+binaries, and the specification documents are all either compatible with the
+project's MIT terms or already carried under their own retained notices, and
+their notices and texts now all ship.
+
+**The decision is only about the files derived from U-Boot and from the Linux
+kernel, and it is per driver:**
+
+> Retain those components under their GPL-2.0 terms — shipping the license
+> text, a per-file notice, and an offer of corresponding source — **or** replace
+> the derived blocks with independently derived or permissively licensed work.
+
+Seventeen files carry such a block. The per-driver table in
+[`PROVENANCE_INVENTORY.md`](PROVENANCE_INVENTORY.md) lists, for each, exactly
+which procedures would have to be rewritten under "replace" and exactly which
+notices would have to ship under "retain". Three separable groups fall out of
+it:
+
+1. **GENET, xHCI and PCIe** — the expensive replacements. GENET is the largest
+   and it carries the console, so a replacement is also a network regression
+   risk. The OpenBSD basis remains a candidate and remains unwritten.
+2. **MMU set/way, the V3D cache and power sequences, `hw_boot`'s EL2→EL1 block,
+   the mailbox and display message composition, TFTP's retransmission policy,
+   the RNG enable order, one USB retry constant** — small, bounded, and
+   re-derivable from the Arm ARM, the firmware interface, the RFCs and the
+   register semantics that are already cited beside them.
+3. **The U-Boot-shaped console command set** — no U-Boot code is present. What
+   is at stake is whether a deliberately compatible command vocabulary and
+   argument grammar is disclosed as derivation. This costs nothing to decide and
+   should be decided rather than assumed.
+
+No GPL license text has been added to this repository, and that is deliberate:
+shipping one would itself be an election. `PROVENANCE.json` marks those sources
+`license_text_pending_decision`, and the inventory check reports it as a note
+rather than a failure for exactly as long as the hold stands.
+
+The relevant derivations are now disclosed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) under their own sections.
+Disclosure is not election: it states what the code is, which was the gap the
+original notice had, and it is correct under either answer.
+
 ## Candidate replacement basis, not an accepted replacement
 
 OpenBSD has a GENET implementation under a two-clause BSD notice. Review is
@@ -65,7 +118,13 @@ current source is replaced. No historical commits have been removed.
 
 ## Acceptance still owed
 
-1. Finish the file-level provenance inventory and retained notices.
+1. ~~Finish the file-level provenance inventory and retained notices.~~ **Done,
+   2026-09-10:** [`PROVENANCE_INVENTORY.md`](PROVENANCE_INVENTORY.md),
+   `PROVENANCE.json` `third_party`, `tools/provenance_inventory_check.py`, and
+   two newly retained texts (`licenses/Mesa-MIT.txt`,
+   `licenses/RaspberryPi-armstub8-BSD-3-Clause.txt`). The Mesa-derived V3D
+   material and the Raspberry Pi stub's binary-distribution obligation were both
+   undisclosed before this pass.
 2. Resolve the GENET implementation and license compatibility while preserving
    the user-selected MIT terms for original Anvil code.
 3. Verify any replacement against the public include closure and real board
