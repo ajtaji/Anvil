@@ -1,0 +1,600 @@
+; vulkanClearRefusals.pi4 - the refusals only a LIVE V3D backend can answer.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. It is an instrument, not a how-to.
+;
+;   pmfc RaspberryPi4/Examples/Diagnostics/vulkanClearRefusals.pi4 -t pi4 \
+;        --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;        -o vulkanClearRefusals.img
+;
+; ======================================================================
+;  WHY THIS FILE EXISTS
+; ======================================================================
+;  tools/vulkan_v3d_backend_check.py lists two rules it CANNOT reach from
+;  a desk, because both compare against numbers that only exist once the
+;  graphics engine is initialised:
+;
+;    1. the backend refuses to clear the buffer the display is scanning
+;       out - `If base = Neon_SurfaceBase()`
+;    2. the backend refuses any extent that is not the render geometry
+;       NeonInit was given - `If w <> Neon_SurfacePhysicalW() ...`
+;
+;  Board run 2 of vulkanClearProof.pi4 evaluated BOTH of them with a live
+;  engine and neither fired, because that run's request was valid: the
+;  image was at $063E8000 and the surface at $06000000, and the extents
+;  matched exactly. So the accepting direction is proven and the REFUSING
+;  direction is not. Deleting either check would have produced a
+;  byte-identical run, which is the definition of a rule a test does not
+;  cover.
+;
+;  This file offers each of them a request it must refuse, and checks the
+;  refusal is the right one for the right reason.
+;
+; ======================================================================
+;  NOTHING REACHES THE GPU, AND THAT IS CHECKED
+; ======================================================================
+;  Every refusal here happens at RECORD time, inside vkCmdClearColorImage,
+;  so avkBackendSubmitClear is never called and no control list is ever
+;  built. The run ends by requiring V3dBinJobs(), V3dRenderJobs(),
+;  V3dTfuJobs() and avkBackendJobs() to all still be ZERO, and both
+;  screen-sized buffers to be byte-identical to the pattern they were
+;  filled with. The engine is brought up - that is the whole point, these
+;  rules are unreachable without it - but not one job is submitted.
+;
+; ======================================================================
+;  THE TWO REQUESTS, AND WHY EACH IS UNAMBIGUOUS
+; ======================================================================
+;  avkBackendClearSupported checks in a fixed order: engine ready, base
+;  and size sane, inside the declared window, extent, pitch, size against
+;  the extent, and LAST the scanned-buffer rule. A request that trips two
+;  of them proves only the earlier one, so each request below is built to
+;  trip exactly one:
+;
+;    RULE 1  an 800x1280 image at pitch 3200 - the render geometry
+;            EXACTLY - placed at the surface base. Every earlier check
+;            passes, so only the scanned-buffer rule can refuse it.
+;
+;    RULE 2  a 640x480 image placed at $063E8000, which is NOT the
+;            surface base. The scanned-buffer rule cannot fire, so only
+;            the extent rule can refuse it.
+;
+;  THE WINDOW THEREFORE COVERS BOTH SCREENS. Rule 1 needs the Vulkan heap
+;  to reach the surface base and rule 2 needs an address that is not it,
+;  and one window spanning both is the only shape that gives both without
+;  re-declaring a heap - which cannot be done anyway, because the heap is
+;  bound once at the first allocation and never re-read.
+;
+; ======================================================================
+;  BEFORE RUNNING IT
+; ======================================================================
+;  Identical to vulkanClearProof.pi4, and for the same reasons:
+;  * `screen dma` FIRST - this payload initialises the graphics engine
+;    and two owners of one V3D page table cannot be made to work. The
+;    arena is $0A000000, the 16 MiB region memmap.pi4 names as "the V3D
+;    engine's arena", free precisely because the console is not on V3D.
+;  * The two screen-sized buffers are at $06000000 in the payload window,
+;    above this image, its BSS and the stack top; 8,192,000 bytes end at
+;    $067D0000, well inside #PAY0.
+;  * It asks the firmware for nothing, initialises no display, and does
+;    not present - there is nothing to look at, every request is refused.
+;  * NeonShutdown() hands the V3D MMU back before it returns.
+;  * RECOVERY: `screen v3d`. No reset. Nothing here writes a core spin
+;    slot, releases a core, or touches the monitor, its variables, the
+;    DSI control registers, the GENET ring or the driver-module region.
+;
+;  x0 comes back as the address of a 64-word block; `memory <that> 64`.
+;  Slot 0 is the magic $564B4352 ("VKCR") and slot 1 the overall verdict.
+;  Slots 2..15 are one status word per rule: 1 means it answered as
+;  required, 0 means it did not.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VCR_MAGIC = $564B4352
+
+#VCR_ARENA = $0A000000
+#VCR_ARENA_BYTES = $01000000
+
+; The engine's surface is the lower screen; the Vulkan window covers both.
+#VCR_SURFACE = $06000000
+#VCR_PANEL_W = 800
+#VCR_PANEL_H = 1280
+#VCR_PANEL_PITCH = 3200
+#VCR_SCREEN_BYTES = 4096000
+#VCR_WINDOW_BYTES = 8192000       ; both screens
+#VCR_UPPER = $063E8000            ; #VCR_SURFACE + #VCR_SCREEN_BYTES
+
+; The small image that is the wrong shape for this render geometry.
+#VCR_SMALL_W = 640
+#VCR_SMALL_H = 480
+#VCR_SMALL_PITCH = 2560           ; 640 * 4, the tight pitch off the surface width
+#VCR_SMALL_BYTES = 1228800        ; 2560 * 480
+
+#VCR_PATTERN = $3C5AA5C3
+
+; A colour, never actually cleared with. Any legal value does.
+#VCR_F_R = $3E4CCCCD
+#VCR_F_G = $3F000000
+#VCR_F_B = $3F333333
+#VCR_F_A = $3F800000
+
+; The overall verdict, slot 1.
+#VCR_OK = 0
+#VCR_ERR_NEON = 1             ; slot 33 holds Neon_Error()
+#VCR_ERR_WINDOW = 2           ; slot 33 holds the AnvilVkV3dWindow code
+#VCR_ERR_DEVICE = 3           ; slot 33 holds the VkResult
+#VCR_ERR_SETUP = 4            ; an image, allocation or bind that should
+                              ; have worked did not; slot 33 says which
+#VCR_ERR_RULE = 5             ; a rule did not answer as required - read
+                              ; slots 2..15, the zero is the one
+#VCR_ERR_GPU_TOUCHED = 6      ; a V3D job was submitted, or a buffer
+                              ; changed. Slots 17..20 and 31 say which.
+
+; Setup stage markers, slot 33 when slot 1 is #VCR_ERR_SETUP.
+#VCR_SETUP_IMAGE_A = 10
+#VCR_SETUP_MEM_A = 11
+#VCR_SETUP_BIND_A = 12
+#VCR_SETUP_IMAGE_B = 13
+#VCR_SETUP_MEM_B = 14
+#VCR_SETUP_BIND_B = 15
+#VCR_SETUP_IMAGE_C = 16
+#VCR_SETUP_MEM_C = 17
+#VCR_SETUP_BIND_C = 18
+#VCR_SETUP_POOL = 19
+#VCR_SETUP_CMD = 20
+#VCR_SETUP_BEGIN = 21
+
+#VCR_S_MAGIC = 0
+#VCR_S_STATUS = 1
+#VCR_S_R1 = 2                 ; the scanned-buffer rule refused
+#VCR_S_R1_RC = 3              ; what vkEndCommandBuffer actually returned
+#VCR_S_R2 = 4                 ; the render-geometry rule refused
+#VCR_S_R2_RC = 5
+#VCR_S_R3 = 6                 ; the live row-pitch rule
+#VCR_S_R3_P800 = 7            ; avkBackendRowPitchFor(800)
+#VCR_S_R3_P640 = 8            ; avkBackendRowPitchFor(640)
+#VCR_S_R4 = 9                 ; a VALID offscreen request is still accepted
+#VCR_S_R4_RC = 10
+#VCR_S_R5 = 11                ; the live capability answer
+#VCR_S_R5_CAPS = 12
+#VCR_S_R6 = 13                ; the backend's microsecond clock advances
+#VCR_S_R6_HZ = 14             ; V3dCounterHz()
+#VCR_S_R6_DELTA = 15          ; microseconds elapsed across the run
+#VCR_S_NOGPU = 16             ; nothing was submitted and nothing changed
+#VCR_S_BIN_JOBS = 17
+#VCR_S_RENDER_JOBS = 18
+#VCR_S_TFU_JOBS = 19
+#VCR_S_BACKEND_JOBS = 20
+#VCR_S_SURFACE = 21
+#VCR_S_WIN_BASE = 22
+#VCR_S_WIN_BYTES = 23
+#VCR_S_IMG_A = 24             ; the full-geometry image, at the surface base
+#VCR_S_IMG_B = 25             ; the 640x480 image, above it
+#VCR_S_IMG_C = 26             ; the accepted offscreen image
+#VCR_S_REUSE = 27             ; C took the hole B left
+#VCR_S_TEXT1 = 28             ; rule 1's refusal sentence
+#VCR_S_TEXT2 = 29             ; rule 2's refusal sentence
+#VCR_S_ARENA_NEED = 30
+#VCR_S_SUM_DELTA = 31         ; 0 when both screens are unchanged
+#VCR_S_SHUTDOWN = 32
+#VCR_S_DETAIL = 33
+#VCR_S_FAULTS = 34
+
+Global Dim vcrReport.i[64]
+Global Dim vcrColor.l[4]
+
+Procedure vcrPut(slot.i, value.i)
+  If slot < 0 Or slot > 63
+    ProcedureReturn
+  EndIf
+  vcrReport[slot] = value
+EndProcedure
+
+Procedure.i vcrStop(status.i)
+  vcrPut(#VCR_S_STATUS, status)
+  vcrPut(#VCR_S_FAULTS, AnvilVkFaultCount())
+  ProcedureReturn @vcrReport[0]
+EndProcedure
+
+Procedure.i vcrSum(base.i, bytes.i)
+  Define i.i
+  Define s.i
+  s = 0
+  i = 0
+  While i < bytes
+    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFFFFFF
+    i = i + 4
+  Wend
+  ProcedureReturn s
+EndProcedure
+
+Procedure vcrFill(base.i, bytes.i, word.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeL(base + i, word)
+    i = i + 4
+  Wend
+EndProcedure
+
+; Record barrier + clear into a fresh command buffer against `img`, and
+; return what vkEndCommandBuffer says. Every refusal this file is about
+; is a RECORDING error, so this is the one shape it needs.
+Procedure.i vcrRecordClear(dev.i, cmd.i, img.i)
+  Define bi.VkCommandBufferBeginInfo
+  Define bar.VkImageMemoryBarrier
+  Define pbargs.AnvilVkPipelineBarrierArgs
+  Define range.VkImageSubresourceRange
+
+  If vkResetCommandBuffer(cmd, 0) <> #VK_SUCCESS
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = img
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\baseMipLevel = 0
+  bar\subresourceRange\levelCount = 1
+  bar\subresourceRange\baseArrayLayer = 0
+  bar\subresourceRange\layerCount = 1
+  pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  pbargs\imageMemoryBarrierCount = 1
+  pbargs\pImageMemoryBarriers = @bar
+  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\baseMipLevel = 0
+  range\levelCount = 1
+  range\baseArrayLayer = 0
+  range\layerCount = 1
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vcrColor[0], 1, @range)
+
+  ProcedureReturn vkEndCommandBuffer(cmd)
+EndProcedure
+
+Procedure.i vcrMakeImage(dev.i, w.i, h.i, *out)
+  Define imgci.VkImageCreateInfo
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = w
+  imgci\extent\height = h
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  ProcedureReturn vkCreateImage(dev, @imgci, 0, *out)
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define imgA.i
+  Define imgB.i
+  Define imgC.i
+  Define memA.i
+  Define memB.i
+  Define memC.i
+  Define count.i
+  Define t0.i
+  Define t1.i
+  Define sum0.i
+  Define sum1.i
+  Define baseB.i
+  Define ok.i
+
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+
+  vcrPut(#VCR_S_MAGIC, #VCR_MAGIC)
+  vcrPut(#VCR_S_STATUS, #VCR_ERR_NEON)
+  vcrPut(#VCR_S_SURFACE, #VCR_SURFACE)
+  vcrPut(#VCR_S_WIN_BASE, #VCR_SURFACE)
+  vcrPut(#VCR_S_WIN_BYTES, #VCR_WINDOW_BYTES)
+  TimerInit()
+
+  PokeL(@vcrColor[0] + 0, #VCR_F_R)
+  PokeL(@vcrColor[0] + 4, #VCR_F_G)
+  PokeL(@vcrColor[0] + 8, #VCR_F_B)
+  PokeL(@vcrColor[0] + 12, #VCR_F_A)
+
+  ; Both screens get a pattern. Nothing in this run may change a byte of
+  ; either, and the sum at the end is what says so.
+  vcrFill(#VCR_SURFACE, #VCR_WINDOW_BYTES, #VCR_PATTERN)
+  sum0 = vcrSum(#VCR_SURFACE, #VCR_WINDOW_BYTES)
+
+  ; ------------------------------------------------------------------
+  ;  The engine. These rules do not exist until it is up.
+  ; ------------------------------------------------------------------
+  If NeonArena(#VCR_ARENA, #VCR_ARENA_BYTES) <> #NEON_OK
+    vcrPut(#VCR_S_DETAIL, Neon_Error())
+    ProcedureReturn vcrStop(#VCR_ERR_NEON)
+  EndIf
+  If NeonSurface(#VCR_SURFACE, #VCR_PANEL_W, #VCR_PANEL_H, #VCR_PANEL_PITCH) <> #NEON_OK
+    vcrPut(#VCR_S_DETAIL, Neon_Error())
+    ProcedureReturn vcrStop(#VCR_ERR_NEON)
+  EndIf
+  NeonSurfaceMapSpan(#VCR_WINDOW_BYTES)
+  If NeonInit() <> #NEON_OK
+    vcrPut(#VCR_S_DETAIL, Neon_Error())
+    ProcedureReturn vcrStop(#VCR_ERR_NEON)
+  EndIf
+  vcrPut(#VCR_S_ARENA_NEED, Neon_ArenaNeed())
+  t0 = avkBackendTicksUs()
+
+  ; ------------------------------------------------------------------
+  ;  RULE 5 - the live capability answer. A desk run proves this is 0;
+  ;  only a board proves it is all three bits.
+  ; ------------------------------------------------------------------
+  rc = AnvilVkV3dWindow(#VCR_SURFACE, #VCR_WINDOW_BYTES)
+  If rc <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_WINDOW)
+  EndIf
+  vcrPut(#VCR_S_R5_CAPS, avkBackendCaps())
+  If avkBackendCaps() = (#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU) And AnvilVkBackendIsGpu() = 1
+    vcrPut(#VCR_S_R5, 1)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  RULE 3 - the row pitch the backend chooses comes from the LIVE
+  ;  surface at the surface's own width, and from the width alone at any
+  ;  other. Only a live engine can answer the first.
+  ; ------------------------------------------------------------------
+  vcrPut(#VCR_S_R3_P800, avkBackendRowPitchFor(#VCR_PANEL_W))
+  vcrPut(#VCR_S_R3_P640, avkBackendRowPitchFor(#VCR_SMALL_W))
+  If avkBackendRowPitchFor(#VCR_PANEL_W) = Neon_SurfacePitch() And avkBackendRowPitchFor(#VCR_SMALL_W) = (#VCR_SMALL_W * 4)
+    vcrPut(#VCR_S_R3, 1)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  The device, and one command buffer to record into.
+  ; ------------------------------------------------------------------
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @inst)
+  If rc <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_DEVICE)
+  EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1
+    vcrPut(#VCR_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_DEVICE)
+  EndIf
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @dev)
+  If rc <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_DEVICE)
+  EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_POOL)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_CMD)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+
+  ; ==================================================================
+  ;  RULE 1 - THE BUFFER THE DISPLAY IS SCANNING OUT.
+  ;
+  ;  An image of EXACTLY the render geometry, at heap offset 0, which is
+  ;  the surface base. Every earlier check in avkBackendClearSupported
+  ;  passes, so the only thing left that can refuse it is the rule under
+  ;  test.
+  ; ==================================================================
+  If vcrMakeImage(dev, #VCR_PANEL_W, #VCR_PANEL_H, @imgA) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_IMAGE_A)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  vkGetImageMemoryRequirements(dev, imgA, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @memA) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_MEM_A)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  If vkBindImageMemory(dev, imgA, memA, 0) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_BIND_A)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  vcrPut(#VCR_S_IMG_A, AnvilVkImageAddress(imgA))
+
+  rc = vcrRecordClear(dev, cmd, imgA)
+  vcrPut(#VCR_S_R1_RC, rc)
+  vcrPut(#VCR_S_TEXT1, AnvilVkCommandBufferFailureText(cmd))
+  ; It must be refused, it must be refused with THIS code, the command
+  ; buffer must be invalid, and it must have been at the surface base.
+  If rc = #VK_ERROR_FEATURE_NOT_PRESENT And AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID And AnvilVkImageAddress(imgA) = Neon_SurfaceBase() And AnvilVkCommandBufferFailureText(cmd) <> 0
+    vcrPut(#VCR_S_R1, 1)
+  EndIf
+
+  ; ==================================================================
+  ;  RULE 2 - AN EXTENT THAT IS NOT THE RENDER GEOMETRY.
+  ;
+  ;  640x480, placed above image A, so its base is NOT the surface base
+  ;  and the scanned-buffer rule cannot be what answers.
+  ; ==================================================================
+  If vcrMakeImage(dev, #VCR_SMALL_W, #VCR_SMALL_H, @imgB) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_IMAGE_B)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  vkGetImageMemoryRequirements(dev, imgB, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memB) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_MEM_B)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  If vkBindImageMemory(dev, imgB, memB, 0) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_BIND_B)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  baseB = AnvilVkImageAddress(imgB)
+  vcrPut(#VCR_S_IMG_B, baseB)
+
+  rc = vcrRecordClear(dev, cmd, imgB)
+  vcrPut(#VCR_S_R2_RC, rc)
+  vcrPut(#VCR_S_TEXT2, AnvilVkCommandBufferFailureText(cmd))
+  If rc = #VK_ERROR_FEATURE_NOT_PRESENT And AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID And baseB <> Neon_SurfaceBase() And AnvilVkCommandBufferFailureText(cmd) <> 0
+    vcrPut(#VCR_S_R2, 1)
+  EndIf
+
+  ; ==================================================================
+  ;  RULE 4 - THE REFUSALS ARE DISCRIMINATING, NOT A BLANKET NO.
+  ;
+  ;  Free B, then place a full-geometry image in the hole it left. That
+  ;  base is not the surface base and the extent is right, so it must be
+  ;  ACCEPTED at record time - and it proves the allocator reuses a
+  ;  freed hole on silicon, which the clear proof never exercised.
+  ;
+  ;  IT IS RECORDED AND THEN THROWN AWAY. Nothing is submitted.
+  ; ==================================================================
+  vkDestroyImage(dev, imgB, 0)
+  vkFreeMemory(dev, memB, 0)
+  If vcrMakeImage(dev, #VCR_PANEL_W, #VCR_PANEL_H, @imgC) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_IMAGE_C)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  vkGetImageMemoryRequirements(dev, imgC, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memC) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_MEM_C)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  If vkBindImageMemory(dev, imgC, memC, 0) <> #VK_SUCCESS
+    vcrPut(#VCR_S_DETAIL, #VCR_SETUP_BIND_C)
+    NeonShutdown()
+    ProcedureReturn vcrStop(#VCR_ERR_SETUP)
+  EndIf
+  vcrPut(#VCR_S_IMG_C, AnvilVkImageAddress(imgC))
+  If AnvilVkImageAddress(imgC) = baseB
+    vcrPut(#VCR_S_REUSE, 1)
+  EndIf
+
+  rc = vcrRecordClear(dev, cmd, imgC)
+  vcrPut(#VCR_S_R4_RC, rc)
+  If rc = #VK_SUCCESS And AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE And AnvilVkImageAddress(imgC) = #VCR_UPPER
+    vcrPut(#VCR_S_R4, 1)
+  EndIf
+  ; Throw it away without submitting: this file submits nothing.
+  vkResetCommandBuffer(cmd, 0)
+
+  ; ------------------------------------------------------------------
+  ;  RULE 6 - the backend's microsecond clock is real and advances. It
+  ;  is what bounds vkWaitForFences, and a clock that never moved would
+  ;  leave only the poll cap between a stalled device and a hang.
+  ; ------------------------------------------------------------------
+  t1 = avkBackendTicksUs()
+  vcrPut(#VCR_S_R6_HZ, V3dCounterHz())
+  vcrPut(#VCR_S_R6_DELTA, t1 - t0)
+  If V3dCounterHz() > 0 And t1 > t0
+    vcrPut(#VCR_S_R6, 1)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  Teardown, then hand the V3D MMU back.
+  ; ------------------------------------------------------------------
+  vkDeviceWaitIdle(dev)
+  vkDestroyImage(dev, imgC, 0)
+  vkFreeMemory(dev, memC, 0)
+  vkDestroyImage(dev, imgA, 0)
+  vkFreeMemory(dev, memA, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+
+  ; ------------------------------------------------------------------
+  ;  NOTHING REACHED THE GPU. Read the counters before the shutdown, so
+  ;  a shutdown that submitted something could not hide inside it.
+  ; ------------------------------------------------------------------
+  vcrPut(#VCR_S_BIN_JOBS, V3dBinJobs())
+  vcrPut(#VCR_S_RENDER_JOBS, V3dRenderJobs())
+  vcrPut(#VCR_S_TFU_JOBS, V3dTfuJobs())
+  vcrPut(#VCR_S_BACKEND_JOBS, avkBackendJobs())
+  sum1 = vcrSum(#VCR_SURFACE, #VCR_WINDOW_BYTES)
+  vcrPut(#VCR_S_SUM_DELTA, sum1 - sum0)
+  If V3dBinJobs() = 0 And V3dRenderJobs() = 0 And V3dTfuJobs() = 0 And avkBackendJobs() = 0 And sum1 = sum0
+    vcrPut(#VCR_S_NOGPU, 1)
+  EndIf
+
+  NeonShutdown()
+  vcrPut(#VCR_S_SHUTDOWN, 1)
+
+  ; ------------------------------------------------------------------
+  ;  The verdict. Every rule must have answered as required, and nothing
+  ;  may have reached the GPU.
+  ; ------------------------------------------------------------------
+  If vcrReport[#VCR_S_NOGPU] <> 1
+    ProcedureReturn vcrStop(#VCR_ERR_GPU_TOUCHED)
+  EndIf
+  ok = vcrReport[#VCR_S_R1] + vcrReport[#VCR_S_R2] + vcrReport[#VCR_S_R3] + vcrReport[#VCR_S_R4] + vcrReport[#VCR_S_R5] + vcrReport[#VCR_S_R6] + vcrReport[#VCR_S_REUSE]
+  If ok <> 7
+    ProcedureReturn vcrStop(#VCR_ERR_RULE)
+  EndIf
+  ProcedureReturn vcrStop(#VCR_OK)
+EndProcedure
