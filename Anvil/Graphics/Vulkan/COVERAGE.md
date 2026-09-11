@@ -65,13 +65,34 @@ silently use packed layout.
 > for the prototype, and it disappears the day the A64 backend emits stack
 > arguments.
 
+## 2026-09-11: the SPIR-V front end and the first graphics pipeline
+
+`vk_spirv.pbi` walks a SPIR-V module, validates it against the Vulkan
+environment, refuses by name everything outside one declared subset - a
+pass-through vertex shader and a flat or interpolated fragment shader - and
+lowers what is left to a small plan. `vk_v3d_shader.pi4` turns that plan into
+three QPU programs, their uniform streams and a GL shader state record.
+`vk_pipeline.pbi` adds buffers, shader modules, pipeline layouts, render passes,
+image views, framebuffers, graphics pipelines and the render-pass recording
+commands. `docs/VULKAN_COMPATIBILITY_STATUS.md` has the entry-point table, the
+fixed-function state a pipeline may declare and the gate results.
+
+**None of it has run on silicon.** The desk gates prove the subset, the
+refusals, the plan and the record bytes; board run 4 is requested and not taken,
+and until it is, no claim about a drawn triangle belongs anywhere.
+
+It is an EMITTER and not a compiler: no target-neutral IR, no register
+allocator, no scheduler, no instruction selection, and no arithmetic in an
+accepted shader. The refusals are what keeps that honest.
+
 ## Next real backend layers
 
 The next stages are per-object GPU virtual addressing and residency above
-today's single window, SPIR-V validation and native QPU compilation,
-descriptors and immutable pipeline state, command lowering into V3D bin/render
-jobs with dependencies, interrupt-driven completion so submission is genuinely
-asynchronous, and then WSI against Anvil's existing HDMI/DSI present seam.
+today's single window, arithmetic in the shader front end and the typed IR that
+needs, descriptors and immutable pipeline state, command lowering into V3D
+bin/render jobs with dependencies, interrupt-driven completion so submission is
+genuinely asynchronous, and then WSI against Anvil's existing HDMI/DSI present
+seam.
 Mesa's V3D documentation is a semantic and hardware reference, not a Linux
 runtime dependency and not a source of code. Passing the Khronos CTS and
 claiming a Vulkan version come only after those capabilities exist and are

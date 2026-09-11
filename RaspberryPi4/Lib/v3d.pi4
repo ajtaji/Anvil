@@ -4374,6 +4374,7 @@ EndProcedure
 #V3D_PKT_CFG_BITS              = 96   ; :732
 #V3D_PKT_ZERO_ALL_FLATSHADE    = 97   ; :769
 #V3D_PKT_ZERO_ALL_NONPERSP     = 99   ; :778
+#V3D_PKT_NONPERSP_FLAGS        = 100  ; :781, the set-a-mask form of 99
 #V3D_PKT_POINT_SIZE            = 104  ; :787
 #V3D_PKT_LINE_WIDTH            = 105  ; :791
 #V3D_PKT_CLIP_WINDOW           = 107  ; :801
@@ -4763,6 +4764,38 @@ EndProcedure
 
 Procedure V3dClZeroAllCentroidFlags()
   v3d_ClU8(#V3D_PKT_ZERO_ALL_CENTROID)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dClNonperspFlags - declare which varyings are NOT interpolated
+;  perspective correct. Packet 100, five bytes.
+;
+;  The zeroing packet above says "none of them"; this one names a set,
+;  and a shader that reads a varying with a plain FADD against r5 - no
+;  multiply by W - needs its varying in that set.
+;
+;  THE CONTROL BYTE IS $50 AND IT IS NOT A MAGIC NUMBER. The payload is
+;  one control byte and a 24-bit flag field for one group of twenty-four
+;  varyings. In the control byte the two high bit pairs are the actions
+;  for the flags of the varyings ABOVE and BELOW this group, and the low
+;  nibble is the group's own offset; $50 is therefore "zero everything
+;  outside this group, group zero", which is what a shader with a
+;  handful of varyings wants. That exact byte, with a flag field of $03,
+;  is what this tree's own engine already emits for its two textured
+;  varyings and has run on this board - RaspberryPi4/Lib/neon.pi4,
+;  neon_TexNonpersp - so the byte is carried over verbatim and only the
+;  flag field is generalised here.
+; ----------------------------------------------------------------------
+Procedure V3dClNonperspFlags(mask.i)
+  If mask < 0 Or mask > $FFFFFF
+    v3d_clErr = #V3D_ERR_CL_ARGS
+    ProcedureReturn
+  EndIf
+  v3d_ClU8(#V3D_PKT_NONPERSP_FLAGS)
+  v3d_ClU8($50)
+  v3d_ClU8(mask & $FF)
+  v3d_ClU8((mask >> 8) & $FF)
+  v3d_ClU8((mask >> 16) & $FF)
 EndProcedure
 
 ; --- 2 bytes ----------------------------------------------------------

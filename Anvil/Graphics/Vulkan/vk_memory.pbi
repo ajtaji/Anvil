@@ -38,6 +38,10 @@ Global Dim avkMemOffset.i[#ANVIL_VK_MAX_MEMORY + 1]
 Global Dim avkMemSize.i[#ANVIL_VK_MAX_MEMORY + 1]
 Global Dim avkMemBinds.i[#ANVIL_VK_MAX_MEMORY + 1]
 Global Dim avkMemInFlight.i[#ANVIL_VK_MAX_MEMORY + 1]
+; 1 for an allocation this implementation made for itself - a compiled
+; pipeline's shaders and records. No handle names one; see INTERNAL
+; ALLOCATIONS below.
+Global Dim avkMemInternal.a[#ANVIL_VK_MAX_MEMORY + 1]
 
 Global Dim avkImgLive.a[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgGen.i[#ANVIL_VK_MAX_IMAGES + 1]
@@ -64,6 +68,11 @@ Procedure.i avkMemSlot(h.i)
   Define s.i
   s = avkTokenShape(h, #ANVIL_VK_TYPE_DEVICE_MEMORY, #ANVIL_VK_MAX_MEMORY)
   If s = 0 Or avkMemLive[s] = 0 Or avkMemGen[s] <> avkTokenGen(h) : ProcedureReturn 0 : EndIf
+  ; An internal allocation has no handle, so a token that reaches one is
+  ; a forgery or a slot reused after a pipeline took it. Either way it is
+  ; not this caller's memory and it is refused here rather than in every
+  ; entry point that takes a VkDeviceMemory.
+  If avkMemInternal[s] <> 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn s
 EndProcedure
 
@@ -197,6 +206,62 @@ Procedure.i AnvilVkMemoryAllocate(device.i, size.i, typeIndex.i, *out)
   avkMemInFlight[s] = 0
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_DEVICE_MEMORY, s, avkMemGen[s]))
   ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  INTERNAL ALLOCATIONS.
+;
+;  A pipeline's compiled shaders, its shader record and its uniform
+;  blocks have to live in memory the GPU can reach, which on this device
+;  is the same heap the application allocates from. They are NOT a
+;  VkDeviceMemory: no handle names one, vkFreeMemory cannot reach one and
+;  vkGetPhysicalDeviceMemoryProperties does not hide one - the heap size
+;  it reports is the whole window, and an internal allocation is simply
+;  part of it that is in use, the way a driver's own objects always are.
+;
+;  They take ordinary slots in the same table so that avkHeapAlloc's
+;  overlap search sees them. That is the whole reason they are here and
+;  not in a table of their own: two allocators over one heap is a bug
+;  waiting for the day the two ranges meet.
+; ----------------------------------------------------------------------
+; Returns a memory slot, or 0. The caller has already called avkHeapBind.
+Procedure.i avkInternalAlloc(bytes.i)
+  Define s.i
+  Define off.i
+  If bytes <= 0 : ProcedureReturn 0 : EndIf
+  If avkHeapReady = 0 : ProcedureReturn 0 : EndIf
+  s = 1
+  While s <= #ANVIL_VK_MAX_MEMORY And avkMemLive[s] <> 0 : s = s + 1 : Wend
+  If s > #ANVIL_VK_MAX_MEMORY : ProcedureReturn 0 : EndIf
+  off = avkHeapAlloc(bytes, avkBackendImageAlignment())
+  If off < 0 : ProcedureReturn 0 : EndIf
+  avkMemGen[s] = avkNextGen(avkMemGen[s])
+  avkMemLive[s] = 1
+  avkMemDev[s] = 0
+  avkMemType[s] = 0
+  avkMemOffset[s] = off
+  avkMemSize[s] = bytes
+  avkMemBinds[s] = 0
+  avkMemInFlight[s] = 0
+  avkMemInternal[s] = 1
+  ProcedureReturn s
+EndProcedure
+
+Procedure avkInternalFree(s.i)
+  If s < 1 Or s > #ANVIL_VK_MAX_MEMORY
+    ProcedureReturn
+  EndIf
+  If avkMemInternal[s] = 0
+    ProcedureReturn
+  EndIf
+  avkMemLive[s] = 0
+  avkMemInternal[s] = 0
+EndProcedure
+
+Procedure.i avkInternalBase(s.i)
+  If s < 1 Or s > #ANVIL_VK_MAX_MEMORY : ProcedureReturn 0 : EndIf
+  If avkMemInternal[s] = 0 Or avkHeapReady = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkHeapBase + avkMemOffset[s]
 EndProcedure
 
 ; The ARM address of an allocation's first byte. This is an Anvil answer,

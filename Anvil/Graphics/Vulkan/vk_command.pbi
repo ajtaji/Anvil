@@ -66,6 +66,37 @@ Global Dim avkRefSlot.i[#ANVIL_VK_MAX_COMMAND_BUFFERS * #ANVIL_VK_MAX_CB_REFS]
 Global Dim avkRefEntry.i[#ANVIL_VK_MAX_COMMAND_BUFFERS * #ANVIL_VK_MAX_CB_REFS]
 Global Dim avkRefCur.i[#ANVIL_VK_MAX_COMMAND_BUFFERS * #ANVIL_VK_MAX_CB_REFS]
 
+; ----------------------------------------------------------------------
+;  THE RECORDED DRAW.
+;
+;  A render pass with a draw in it is not a list of ops: it is one job,
+;  and the state below is what that job is made of. It lives here, next
+;  to the rest of the command-buffer state, so that avkCbClear() cannot
+;  forget a piece of it - the one failure this engine has already had
+;  once, on a table that lived somewhere else.
+;
+;  It is FILLED by vk_pipeline.pbi, which owns the pipeline objects and
+;  the recording rules, and it is READ here at submit time. The two
+;  procedures that bridge the two files are declared here and defined
+;  there, the same seam shape the backend uses.
+; ----------------------------------------------------------------------
+Global Dim avkCbPipe.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbVtxBuf.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbVtxOffset.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbRpActive.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbRpDone.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbFb.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbClearWord.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDrawCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDrawFirst.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDrawVerts.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbPushBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbPushWord.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * 4]
+
+Declare.i avkDrawSubmit(c.i)
+Declare avkDrawRetain(c.i)
+Declare avkDrawRelease(c.i)
+
 ; The single outstanding submission.
 Global avkFlightActive.i = 0
 Global avkFlightCb.i = 0
@@ -112,6 +143,22 @@ Procedure avkCbClear(c.i)
   avkCmdBeginFlags[c] = 0
   avkCmdOps[c] = 0
   avkCmdState[c] = #ANVIL_VK_CB_INITIAL
+  avkCbPipe[c] = 0
+  avkCbVtxBuf[c] = 0
+  avkCbVtxOffset[c] = 0
+  avkCbRpActive[c] = 0
+  avkCbRpDone[c] = 0
+  avkCbFb[c] = 0
+  avkCbClearWord[c] = 0
+  avkCbDrawCount[c] = 0
+  avkCbDrawFirst[c] = 0
+  avkCbDrawVerts[c] = 0
+  avkCbPushBytes[c] = 0
+  k = 0
+  While k < 4
+    avkCbPushWord[(c * 4) + k] = 0
+    k = k + 1
+  Wend
 EndProcedure
 
 ; A RECORDING ERROR DOES NOT RETURN. vkCmd* commands are void, so the
@@ -245,6 +292,10 @@ Procedure.i AnvilVkCommandBufferEnd(commandBuffer.i)
     ProcedureReturn avkCbFailCode[c]
   EndIf
   If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkCbRpActive[c] <> 0
+    avkCmdState[c] = #ANVIL_VK_CB_INVALID
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkEndCommandBuffer was called inside a render pass (Anvil code -20004, render pass still open); the specification requires every vkCmdBeginRenderPass to be matched by a vkCmdEndRenderPass before the recording ends, and a pass left open would have had its store operation skipped.")
+  EndIf
   ; A reference whose layout was never established inside the recording
   ; leaves the image exactly as it found it.
   k = 0
@@ -370,14 +421,14 @@ EndProcedure
 
 Procedure.i avkStagesKnown(mask.i)
   If mask = 0 : ProcedureReturn 0 : EndIf
-  If (mask & (~(#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | #VK_PIPELINE_STAGE_HOST_BIT | #VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))) <> 0
+  If (mask & (~(#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | #VK_PIPELINE_STAGE_HOST_BIT | #VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | #VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | #VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT))) <> 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkAccessKnown(mask.i)
-  If (mask & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT | #VK_ACCESS_HOST_READ_BIT | #VK_ACCESS_HOST_WRITE_BIT | #VK_ACCESS_MEMORY_READ_BIT | #VK_ACCESS_MEMORY_WRITE_BIT))) <> 0
+  If (mask & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT | #VK_ACCESS_HOST_READ_BIT | #VK_ACCESS_HOST_WRITE_BIT | #VK_ACCESS_MEMORY_READ_BIT | #VK_ACCESS_MEMORY_WRITE_BIT | #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT))) <> 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
@@ -389,6 +440,7 @@ Procedure.i avkLayoutKnown(v.i)
   If v = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : ProcedureReturn 1 : EndIf
   If v = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : ProcedureReturn 1 : EndIf
   If v = #VK_IMAGE_LAYOUT_PREINITIALIZED : ProcedureReturn 1 : EndIf
+  If v = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : ProcedureReturn 1 : EndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -633,6 +685,7 @@ EndProcedure
 Procedure avkFlightReleaseRefs(c.i)
   Define k.i
   Define s.i
+  avkDrawRelease(c)
   k = 0
   While k < avkCbRefCount[c]
     s = avkRefSlot[avkRefIndex(c, k)]
@@ -756,6 +809,16 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
   If clears > 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one clear (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This slice lowers one clear per submission, so record one clear per command buffer until the backend carries a command list.")
   EndIf
+  ; A command buffer is either a transfer or a render pass, never both.
+  ; The backend seam carries ONE job, and running the clear and throwing
+  ; the draw away - or the other way round - would be a silent partial
+  ; submission, which is the one answer this engine never gives.
+  If avkCbDrawCount[c] > 0 And clears > 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding both a vkCmdClearColorImage and a render pass (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The backend seam carries one job per submission, so record the clear and the render pass in separate command buffers.")
+  EndIf
+  If avkCbRpDone[c] <> 0 And avkCbDrawCount[c] = 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer whose render pass contains no draw (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A render pass with no draw would be a clear wearing a render pass's clothes, and vkCmdClearColorImage is the honest way to ask for that.")
+  EndIf
   f = 0
   If fence <> #VK_NULL_HANDLE
     f = avkFenceAcquire(d, fence)
@@ -766,7 +829,20 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
   avkFlightFence = f
   avkCmdState[c] = #ANVIL_VK_CB_PENDING
   avkFlightRetain(c)
+  avkDrawRetain(c)
   avkSubmitCount = avkSubmitCount + 1
+  If avkCbDrawCount[c] > 0
+    job = avkDrawSubmit(c)
+    If job < 0
+      avkFlightComplete(0)
+      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a draw (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own code, and on the Pi 4 that is the Neon/V3D error - check the bin and render fault registers, the binner overflow count and the MMU violation address before resubmitting.")
+      ProcedureReturn #VK_ERROR_DEVICE_LOST
+    EndIf
+    If job = #ANVIL_VK_JOB_DONE
+      avkFlightComplete(1)
+    EndIf
+    ProcedureReturn #VK_SUCCESS
+  EndIf
   If clears = 0
     ; Barriers alone. There is nothing for the device to do, so the
     ; submission completes here rather than being handed to a backend

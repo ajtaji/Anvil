@@ -65,8 +65,8 @@ MUTANTS = (
     (
         "the backend claims a device with the engine down",
         "  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf\n"
-        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU\n",
-        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU\n",
+        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW\n",
+        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW\n",
     ),
     (
         "vkCreateDevice no longer checks that the engine is initialised",

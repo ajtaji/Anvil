@@ -33,6 +33,9 @@ Global avkTbBusy.i = 0
 Global avkTbFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
+; The test backend reports a draw capability as well as a clear one, so
+; a desk gate can drive the whole pipeline path. It is still not a GPU
+; and it still writes no pixels.
 Global avkTbPolls.i = 0
 Global avkTbLastBase.i = 0
 Global avkTbLastBytes.i = 0
@@ -106,7 +109,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
   If avkTbHeapBase <= 0 Or avkTbHeapBytes <= 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR
+  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -221,4 +224,123 @@ EndProcedure
 Procedure.i avkBackendTicksUs()
   avkTbTicks = avkTbTicks + 1
   ProcedureReturn avkTbTicks
+EndProcedure
+
+; ======================================================================
+;  THE GRAPHICS HALF -- still no pixels
+; ======================================================================
+;  It records what a pipeline was compiled from and what a draw asked
+;  for, and it writes NOTHING into the render target or the vertex
+;  buffer. A gate can therefore check that the whole public path from
+;  vkCreateShaderModule to vkQueueSubmit reaches the backend with the
+;  right numbers, and then check that the image still holds its poison.
+Global avkTbPipelines.i = 0
+Global avkTbDraws.i = 0
+Global avkTbPipeBytes.i = 8192
+Global avkTbDrawFail.i = 0
+Global avkTbLastPipe.i = 0
+Global avkTbLastPipeBase.i = 0
+Global avkTbLastVertexBase.i = 0
+Global avkTbLastStride.i = 0
+Global avkTbLastVertexCount.i = 0
+Global avkTbLastFirstVertex.i = 0
+Global avkTbLastPushBase.i = 0
+Global avkTbLastDrawColour.i = 0
+Global Dim avkTbPipeBase.i[8]
+
+Procedure AnvilVkTestBackendDrawFailNext()
+  avkTbDrawFail = 1
+EndProcedure
+
+Procedure.i AnvilVkTestBackendPipelines()
+  ProcedureReturn avkTbPipelines
+EndProcedure
+
+Procedure.i AnvilVkTestBackendDraws()
+  ProcedureReturn avkTbDraws
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastVertexBase()
+  ProcedureReturn avkTbLastVertexBase
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastStride()
+  ProcedureReturn avkTbLastStride
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastVertexCount()
+  ProcedureReturn avkTbLastVertexCount
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastFirstVertex()
+  ProcedureReturn avkTbLastFirstVertex
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastPushBase()
+  ProcedureReturn avkTbLastPushBase
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastDrawColor()
+  ProcedureReturn avkTbLastDrawColour
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastPipelineBase()
+  ProcedureReturn avkTbLastPipeBase
+EndProcedure
+
+Procedure.i avkBackendPipelineBytes()
+  ProcedureReturn avkTbPipeBytes
+EndProcedure
+
+Procedure.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
+  If pipe < 1 Or pipe > 7 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If base <= 0 Or bytes < avkTbPipeBytes : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  avkTbPipeBase[pipe] = base
+  avkTbLastPipe = pipe
+  avkTbLastPipeBase = base
+  avkTbPipelines = avkTbPipelines + 1
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure avkBackendPipelineRelease(pipe.i)
+  If pipe < 1 Or pipe > 7
+    ProcedureReturn
+  EndIf
+  avkTbPipeBase[pipe] = 0
+  If avkTbPipelines > 0 : avkTbPipelines = avkTbPipelines - 1 : EndIf
+EndProcedure
+
+Procedure.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+  ProcedureReturn avkBackendClearSupported(base, bytes, w, h, pitch)
+EndProcedure
+
+Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
+  If *d = 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  avkTbDraws = avkTbDraws + 1
+  avkTbLastBase = *d\targetBase
+  avkTbLastBytes = *d\targetBytes
+  avkTbLastW = *d\width
+  avkTbLastH = *d\height
+  avkTbLastPitch = *d\pitch
+  avkTbLastDrawColour = *d\clearBgra
+  avkTbLastVertexBase = *d\vertexBase
+  avkTbLastStride = *d\vertexStride
+  avkTbLastVertexCount = *d\vertexCount
+  avkTbLastFirstVertex = *d\firstVertex
+  avkTbLastPushBase = *d\pushBase
+  avkTbTicks = avkTbTicks + 1
+  If avkTbDrawFail <> 0
+    avkTbNative = -777
+    avkTbDrawFail = 0
+    ProcedureReturn -1
+  EndIf
+  avkTbNative = 0
+  ; NOTHING IS WRITTEN TO targetBase. See the header.
+  If avkTbHold <> 0
+    avkTbBusy = 1
+    ProcedureReturn #ANVIL_VK_JOB_PENDING
+  EndIf
+  avkTbBusy = 0
+  ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure

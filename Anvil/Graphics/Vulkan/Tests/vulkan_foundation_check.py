@@ -13,7 +13,7 @@ It does NOT prove GPU execution. The behavioural gate for the resource,
 layout, fence and submission engine is tools/vulkan_resource_check.py,
 and the backend link gate is tools/vulkan_v3d_backend_check.py.
 
-  VULKAN_REGISTRY=<pinned v1.4.350 registry/vk.xml> PMFC=<pmfc.exe> \\
+  VULKAN_REGISTRY=<pinned v1.4.350 registry/vk.xml> PMF_COMPILER=<PureMetalForge.exe> \\
       py -3 Anvil/Graphics/Vulkan/Tests/vulkan_foundation_check.py
 """
 
@@ -204,6 +204,154 @@ STRUCTS = {
                           ("VkFenceCreateFlags", "flags")),
 }
 
+# The graphics pipeline structures, added 2026-09-11. Written out here by
+# hand, from the registry, so that this file and vk_core_1_0.pbi are two
+# independent transcriptions of one layout and a typo in either is a
+# failure rather than a silent agreement.
+STRUCTS.update({
+    "VkShaderModuleCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkShaderModuleCreateFlags", "flags"), ("size_t", "codeSize"),
+        ("uint32_t", "pCode")),
+    "VkSpecializationMapEntry": (
+        ("uint32_t", "constantID"), ("uint32_t", "offset"), ("size_t", "size")),
+    "VkSpecializationInfo": (
+        ("uint32_t", "mapEntryCount"), ("VkSpecializationMapEntry", "pMapEntries"),
+        ("size_t", "dataSize"), ("void", "pData")),
+    "VkPipelineShaderStageCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineShaderStageCreateFlags", "flags"),
+        ("VkShaderStageFlagBits", "stage"), ("VkShaderModule", "module"),
+        ("char", "pName"), ("VkSpecializationInfo", "pSpecializationInfo")),
+    "VkVertexInputBindingDescription": (
+        ("uint32_t", "binding"), ("uint32_t", "stride"),
+        ("VkVertexInputRate", "inputRate")),
+    "VkVertexInputAttributeDescription": (
+        ("uint32_t", "location"), ("uint32_t", "binding"),
+        ("VkFormat", "format"), ("uint32_t", "offset")),
+    "VkPipelineVertexInputStateCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineVertexInputStateCreateFlags", "flags"),
+        ("uint32_t", "vertexBindingDescriptionCount"),
+        ("VkVertexInputBindingDescription", "pVertexBindingDescriptions"),
+        ("uint32_t", "vertexAttributeDescriptionCount"),
+        ("VkVertexInputAttributeDescription", "pVertexAttributeDescriptions")),
+    "VkPipelineInputAssemblyStateCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineInputAssemblyStateCreateFlags", "flags"),
+        ("VkPrimitiveTopology", "topology"), ("VkBool32", "primitiveRestartEnable")),
+    "VkPipelineViewportStateCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineViewportStateCreateFlags", "flags"),
+        ("uint32_t", "viewportCount"), ("VkViewport", "pViewports"),
+        ("uint32_t", "scissorCount"), ("VkRect2D", "pScissors")),
+    "VkPipelineRasterizationStateCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineRasterizationStateCreateFlags", "flags"),
+        ("VkBool32", "depthClampEnable"), ("VkBool32", "rasterizerDiscardEnable"),
+        ("VkPolygonMode", "polygonMode"), ("VkCullModeFlags", "cullMode"),
+        ("VkFrontFace", "frontFace"), ("VkBool32", "depthBiasEnable"),
+        ("float", "depthBiasConstantFactor"), ("float", "depthBiasClamp"),
+        ("float", "depthBiasSlopeFactor"), ("float", "lineWidth")),
+    "VkPipelineMultisampleStateCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineMultisampleStateCreateFlags", "flags"),
+        ("VkSampleCountFlagBits", "rasterizationSamples"),
+        ("VkBool32", "sampleShadingEnable"), ("float", "minSampleShading"),
+        ("VkSampleMask", "pSampleMask"), ("VkBool32", "alphaToCoverageEnable"),
+        ("VkBool32", "alphaToOneEnable")),
+    "VkPipelineColorBlendAttachmentState": (
+        ("VkBool32", "blendEnable"), ("VkBlendFactor", "srcColorBlendFactor"),
+        ("VkBlendFactor", "dstColorBlendFactor"), ("VkBlendOp", "colorBlendOp"),
+        ("VkBlendFactor", "srcAlphaBlendFactor"),
+        ("VkBlendFactor", "dstAlphaBlendFactor"), ("VkBlendOp", "alphaBlendOp"),
+        ("VkColorComponentFlags", "colorWriteMask")),
+    "VkPipelineColorBlendStateCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineColorBlendStateCreateFlags", "flags"),
+        ("VkBool32", "logicOpEnable"), ("VkLogicOp", "logicOp"),
+        ("uint32_t", "attachmentCount"),
+        ("VkPipelineColorBlendAttachmentState", "pAttachments"),
+        ("float", "blendConstants")),
+    "VkPushConstantRange": (
+        ("VkShaderStageFlags", "stageFlags"), ("uint32_t", "offset"),
+        ("uint32_t", "size")),
+    "VkPipelineLayoutCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineLayoutCreateFlags", "flags"), ("uint32_t", "setLayoutCount"),
+        ("VkDescriptorSetLayout", "pSetLayouts"),
+        ("uint32_t", "pushConstantRangeCount"),
+        ("VkPushConstantRange", "pPushConstantRanges")),
+    "VkGraphicsPipelineCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkPipelineCreateFlags", "flags"), ("uint32_t", "stageCount"),
+        ("VkPipelineShaderStageCreateInfo", "pStages"),
+        ("VkPipelineVertexInputStateCreateInfo", "pVertexInputState"),
+        ("VkPipelineInputAssemblyStateCreateInfo", "pInputAssemblyState"),
+        ("VkPipelineTessellationStateCreateInfo", "pTessellationState"),
+        ("VkPipelineViewportStateCreateInfo", "pViewportState"),
+        ("VkPipelineRasterizationStateCreateInfo", "pRasterizationState"),
+        ("VkPipelineMultisampleStateCreateInfo", "pMultisampleState"),
+        ("VkPipelineDepthStencilStateCreateInfo", "pDepthStencilState"),
+        ("VkPipelineColorBlendStateCreateInfo", "pColorBlendState"),
+        ("VkPipelineDynamicStateCreateInfo", "pDynamicState"),
+        ("VkPipelineLayout", "layout"), ("VkRenderPass", "renderPass"),
+        ("uint32_t", "subpass"), ("VkPipeline", "basePipelineHandle"),
+        ("int32_t", "basePipelineIndex")),
+    "VkAttachmentDescription": (
+        ("VkAttachmentDescriptionFlags", "flags"), ("VkFormat", "format"),
+        ("VkSampleCountFlagBits", "samples"), ("VkAttachmentLoadOp", "loadOp"),
+        ("VkAttachmentStoreOp", "storeOp"), ("VkAttachmentLoadOp", "stencilLoadOp"),
+        ("VkAttachmentStoreOp", "stencilStoreOp"),
+        ("VkImageLayout", "initialLayout"), ("VkImageLayout", "finalLayout")),
+    "VkAttachmentReference": (
+        ("uint32_t", "attachment"), ("VkImageLayout", "layout")),
+    "VkSubpassDescription": (
+        ("VkSubpassDescriptionFlags", "flags"),
+        ("VkPipelineBindPoint", "pipelineBindPoint"),
+        ("uint32_t", "inputAttachmentCount"),
+        ("VkAttachmentReference", "pInputAttachments"),
+        ("uint32_t", "colorAttachmentCount"),
+        ("VkAttachmentReference", "pColorAttachments"),
+        ("VkAttachmentReference", "pResolveAttachments"),
+        ("VkAttachmentReference", "pDepthStencilAttachment"),
+        ("uint32_t", "preserveAttachmentCount"),
+        ("uint32_t", "pPreserveAttachments")),
+    "VkSubpassDependency": (
+        ("uint32_t", "srcSubpass"), ("uint32_t", "dstSubpass"),
+        ("VkPipelineStageFlags", "srcStageMask"),
+        ("VkPipelineStageFlags", "dstStageMask"),
+        ("VkAccessFlags", "srcAccessMask"), ("VkAccessFlags", "dstAccessMask"),
+        ("VkDependencyFlags", "dependencyFlags")),
+    "VkRenderPassCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkRenderPassCreateFlags", "flags"), ("uint32_t", "attachmentCount"),
+        ("VkAttachmentDescription", "pAttachments"), ("uint32_t", "subpassCount"),
+        ("VkSubpassDescription", "pSubpasses"), ("uint32_t", "dependencyCount"),
+        ("VkSubpassDependency", "pDependencies")),
+    "VkImageViewCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkImageViewCreateFlags", "flags"), ("VkImage", "image"),
+        ("VkImageViewType", "viewType"), ("VkFormat", "format"),
+        ("VkComponentMapping", "components"),
+        ("VkImageSubresourceRange", "subresourceRange")),
+    "VkFramebufferCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkFramebufferCreateFlags", "flags"), ("VkRenderPass", "renderPass"),
+        ("uint32_t", "attachmentCount"), ("VkImageView", "pAttachments"),
+        ("uint32_t", "width"), ("uint32_t", "height"), ("uint32_t", "layers")),
+    "VkRenderPassBeginInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkRenderPass", "renderPass"), ("VkFramebuffer", "framebuffer"),
+        ("VkRect2D", "renderArea"), ("uint32_t", "clearValueCount"),
+        ("VkClearValue", "pClearValues")),
+    "VkBufferCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkBufferCreateFlags", "flags"), ("VkDeviceSize", "size"),
+        ("VkBufferUsageFlags", "usage"), ("VkSharingMode", "sharingMode"),
+        ("uint32_t", "queueFamilyIndexCount"), ("uint32_t", "pQueueFamilyIndices")),
+})
+
 PB_SUFFIX = {
     "uint32_t": ".l", "int32_t": ".l", "VkBool32": ".l",
     "VkComponentSwizzle": ".l", "VkStructureType": ".l",
@@ -226,6 +374,33 @@ PB_SUFFIX = {
     "VkExtent3D": ".VkExtent3D",
     "VkImageSubresourceRange": ".VkImageSubresourceRange",
     "VkMemoryType": ".VkMemoryType", "VkMemoryHeap": ".VkMemoryHeap",
+    # The graphics pipeline vocabulary, added 2026-09-11. size_t is the
+    # target's own width, which is what PureMetal's .i is.
+    "size_t": ".i",
+    "VkShaderModuleCreateFlags": ".l", "VkPipelineShaderStageCreateFlags": ".l",
+    "VkShaderStageFlagBits": ".l", "VkShaderStageFlags": ".l",
+    "VkShaderModule": ".i", "VkPipelineLayout": ".i", "VkPipeline": ".i",
+    "VkImageView": ".i", "VkDescriptorSetLayout": ".i",
+    "VkVertexInputRate": ".l",
+    "VkPipelineVertexInputStateCreateFlags": ".l",
+    "VkPipelineInputAssemblyStateCreateFlags": ".l",
+    "VkPrimitiveTopology": ".l",
+    "VkPipelineViewportStateCreateFlags": ".l",
+    "VkPipelineRasterizationStateCreateFlags": ".l",
+    "VkPolygonMode": ".l", "VkCullModeFlags": ".l", "VkFrontFace": ".l",
+    "VkPipelineMultisampleStateCreateFlags": ".l", "VkSampleMask": ".l",
+    "VkPipelineColorBlendStateCreateFlags": ".l",
+    "VkBlendFactor": ".l", "VkBlendOp": ".l", "VkLogicOp": ".l",
+    "VkColorComponentFlags": ".l",
+    "VkPipelineLayoutCreateFlags": ".l", "VkPipelineCreateFlags": ".l",
+    "VkAttachmentDescriptionFlags": ".l", "VkAttachmentLoadOp": ".l",
+    "VkAttachmentStoreOp": ".l", "VkSubpassDescriptionFlags": ".l",
+    "VkPipelineBindPoint": ".l", "VkRenderPassCreateFlags": ".l",
+    "VkDependencyFlags": ".l",
+    "VkImageViewCreateFlags": ".l", "VkImageViewType": ".l",
+    "VkFramebufferCreateFlags": ".l", "VkBufferCreateFlags": ".l",
+    "VkBufferUsageFlags": ".l",
+    "VkComponentMapping": ".VkComponentMapping", "VkRect2D": ".VkRect2D",
 }
 
 # The registry writes its all-ones sentinels as C expressions.
@@ -284,12 +459,39 @@ def parse_pbi_structs() -> dict[str, tuple[str, ...]]:
     return found
 
 
+def members(node):
+    """The members of a structure AS THIS API SEES THEM.
+
+    vk.xml carries Vulkan SC variants of some members side by side with
+    the Vulkan ones, distinguished only by an `api` attribute - and
+    VkGraphicsPipelineCreateInfo.pStages is one of them. Taking every
+    <member> would give a structure two of it, so the wrong count is
+    compared against the right one and a correct declaration fails.
+    """
+    out = []
+    for m in node.findall("member"):
+        api = m.get("api")
+        if api is None or "vulkan" in api.split(","):
+            out.append(m)
+    return out
+
+
 def expected_pbi_member(member: ET.Element) -> str:
     c_type = member.findtext("type")
     name = member.findtext("name")
     raw = "".join(member.itertext())
     if "*" in raw or c_type.startswith("PFN_"):
         return "*" + name
+    # A LITERAL array extent. `float blendConstants[4]` carries its
+    # extent in the member's own text and not as an <enum>, so the
+    # branch below would silently expect a scalar and a four-element
+    # array would pass as one float.
+    if raw.endswith("]") and member.findtext("enum") is None:
+        extent = raw[raw.rindex("[") + 1:-1]
+        try:
+            return "%s%s[%s]" % (name, PB_SUFFIX[c_type], extent)
+        except KeyError as exc:
+            raise ValueError("no expected PureMetal mapping for array of " + c_type) from exc
     enum = member.findtext("enum")
     if enum:
         # A fixed array keeps the registry's own extent constant, so a
@@ -346,10 +548,10 @@ def check_registry(failures: list[str]) -> int:
         if node is None:
             failures.append("registry has no structure " + name)
         else:
-            got = tuple((m.findtext("type"), m.findtext("name")) for m in node.findall("member"))
+            got = tuple((m.findtext("type"), m.findtext("name")) for m in members(node))
             if got != want:
                 failures.append("%s members %r, wanted %r" % (name, got, want))
-            expected_decl = tuple(expected_pbi_member(m) for m in node.findall("member"))
+            expected_decl = tuple(expected_pbi_member(m) for m in members(node))
             if pbi_structs.get(name) != expected_decl:
                 failures.append("%s declaration %r, registry requires %r" %
                                 (name, pbi_structs.get(name), expected_decl))
@@ -373,12 +575,12 @@ def locate(name: str, local: pathlib.Path) -> pathlib.Path:
 
 
 def build(probe: pathlib.Path, output_name: str) -> pathlib.Path:
-    compiler = locate("PMFC", ROOT / "pmfc.exe")
+    compiler = locate("PMF_COMPILER", ROOT / "PureMetalForge.exe")
     image = pathlib.Path(tempfile.gettempdir()) / output_name
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
     run = subprocess.run(
-        [str(compiler), str(probe.relative_to(ROOT)).replace("\\", "/"),
+        [str(compiler), "--compile", str(probe.relative_to(ROOT)).replace("\\", "/"),
          "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
          "--entry-returns", "-o", str(image), "-s"],
         cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

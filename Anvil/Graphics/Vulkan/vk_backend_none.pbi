@@ -91,3 +91,24 @@ EndProcedure
 Procedure.i avkBackendTicksUs()
   ProcedureReturn 0
 EndProcedure
+
+; The graphics half of the seam. There is no device here, so there is no
+; pipeline either, and each of the four says so rather than being absent.
+Procedure.i avkBackendPipelineBytes()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
+  ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+EndProcedure
+
+Procedure avkBackendPipelineRelease(pipe.i)
+EndProcedure
+
+Procedure.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+  ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+EndProcedure
+
+Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
+  ProcedureReturn -1
+EndProcedure

@@ -24,7 +24,7 @@
 ;     XIncludeFile "<exactly one backend>"
 ; The backend defines the seam this engine calls; see vk_foundation.pbi.
 
-XIncludeFile "Anvil/Graphics/Vulkan/vk_command.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_pipeline.pbi"
 
 ; VkAllocationCallbacks is not implemented. A caller that passes one is
 ; refused rather than quietly ignored, because Vulkan's contract is that
@@ -528,4 +528,262 @@ Procedure.i vkQueueSubmit(queue.i, submitCount.i, *pSubmits.VkSubmitInfo, fence.
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit was given more than one command buffer in a VkSubmitInfo (Anvil code -20005, multi-buffer submission not implemented); submit them one at a time, because executing only the first would be a silent partial submission.")
   EndIf
   ProcedureReturn AnvilVkQueueSubmitOne(queue, PeekI(*pSubmits\pCommandBuffers), fence)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BUFFERS
+; ----------------------------------------------------------------------
+Procedure.i vkCreateBuffer(device.i, *pCreateInfo.VkBufferCreateInfo, *pAllocator, *pBuffer)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pBuffer = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateBuffer was given a VkBufferCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO.")
+  EndIf
+  If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was given a VkBufferCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no buffer was created.")
+  EndIf
+  If (*pCreateInfo\flags & $FFFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was given creation flags (Anvil code -20005, unsupported flags); the sparse binding and residency flags are the only ones core 1.0 defines here and none of them is implemented.")
+  EndIf
+  ProcedureReturn AnvilVkBufferCreate(device, *pCreateInfo\size, *pCreateInfo\usage & $FFFFFFFF, *pCreateInfo\sharingMode & $FFFFFFFF, *pBuffer)
+EndProcedure
+
+Procedure vkDestroyBuffer(device.i, buffer.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkBufferDestroy(device, buffer)
+EndProcedure
+
+Procedure vkGetBufferMemoryRequirements(device.i, buffer.i, *pMemoryRequirements.VkMemoryRequirements)
+  If *pMemoryRequirements = 0
+    ProcedureReturn
+  EndIf
+  *pMemoryRequirements\size = AnvilVkBufferSize(buffer)
+  *pMemoryRequirements\alignment = AnvilVkBufferAlignment(buffer)
+  *pMemoryRequirements\memoryTypeBits = avkImageMemoryTypeBits()
+EndProcedure
+
+Procedure.i vkBindBufferMemory(device.i, buffer.i, memory.i, memoryOffset.i)
+  ProcedureReturn AnvilVkBufferBindMemory(device, buffer, memory, memoryOffset)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SHADER MODULES
+; ----------------------------------------------------------------------
+Procedure.i vkCreateShaderModule(device.i, *pCreateInfo.VkShaderModuleCreateInfo, *pAllocator, *pShaderModule)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pShaderModule = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateShaderModule was given a VkShaderModuleCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO.")
+  EndIf
+  If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateShaderModule was given a VkShaderModuleCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no shader module was created.")
+  EndIf
+  If (*pCreateInfo\flags & $FFFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateShaderModule was given creation flags (Anvil code -20005, unsupported flags); VkShaderModuleCreateFlags is reserved in core 1.0 and must be zero.")
+  EndIf
+  ProcedureReturn AnvilVkShaderModuleCreate(device, *pCreateInfo\pCode, *pCreateInfo\codeSize, *pShaderModule)
+EndProcedure
+
+Procedure vkDestroyShaderModule(device.i, shaderModule.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkShaderModuleDestroy(device, shaderModule)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PIPELINE LAYOUT, RENDER PASS, IMAGE VIEW, FRAMEBUFFER
+; ----------------------------------------------------------------------
+Procedure.i vkCreatePipelineLayout(device.i, *pCreateInfo.VkPipelineLayoutCreateInfo, *pAllocator, *pPipelineLayout)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pPipelineLayout = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreatePipelineLayout was given a VkPipelineLayoutCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO.")
+  EndIf
+  If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreatePipelineLayout was given a VkPipelineLayoutCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no layout was created.")
+  EndIf
+  ProcedureReturn AnvilVkPipelineLayoutCreate(device, *pCreateInfo\setLayoutCount & $FFFFFFFF, *pCreateInfo\pushConstantRangeCount & $FFFFFFFF, *pCreateInfo\pPushConstantRanges, *pPipelineLayout)
+EndProcedure
+
+Procedure vkDestroyPipelineLayout(device.i, pipelineLayout.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkPipelineLayoutDestroy(device, pipelineLayout)
+EndProcedure
+
+Procedure.i vkCreateRenderPass(device.i, *pCreateInfo.VkRenderPassCreateInfo, *pAllocator, *pRenderPass)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pRenderPass = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateRenderPass was given a VkRenderPassCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO.")
+  EndIf
+  If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given a VkRenderPassCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no render pass was created.")
+  EndIf
+  If (*pCreateInfo\attachmentCount & $FFFFFFFF) <> 1 Or *pCreateInfo\pAttachments = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given other than exactly one attachment (Anvil code -20005, unsupported render pass); this slice renders to one colour attachment and has no depth, no resolve and no second target.")
+  EndIf
+  If (*pCreateInfo\subpassCount & $FFFFFFFF) <> 1 Or *pCreateInfo\pSubpasses = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given other than exactly one subpass (Anvil code -20005, unsupported render pass); multiple subpasses need the tile-buffer preservation rules this slice does not implement.")
+  EndIf
+  If (*pCreateInfo\dependencyCount & $FFFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateRenderPass was given subpass dependencies (Anvil code -20005, subpass dependencies not implemented); with one subpass and one submission in flight there is nothing for a dependency to order, and honouring one would need a scheduler this implementation does not have.")
+  EndIf
+  ProcedureReturn AnvilVkRenderPassCreate(device, *pCreateInfo\pAttachments, *pCreateInfo\pSubpasses, *pRenderPass)
+EndProcedure
+
+Procedure vkDestroyRenderPass(device.i, renderPass.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkRenderPassDestroy(device, renderPass)
+EndProcedure
+
+Procedure.i vkCreateImageView(device.i, *pCreateInfo.VkImageViewCreateInfo, *pAllocator, *pView)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pView = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImageView was given a VkImageViewCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO.")
+  EndIf
+  If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImageView was given a VkImageViewCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no view was created.")
+  EndIf
+  If (*pCreateInfo\components\r & $FFFFFFFF) <> #VK_COMPONENT_SWIZZLE_IDENTITY Or (*pCreateInfo\components\g & $FFFFFFFF) <> #VK_COMPONENT_SWIZZLE_IDENTITY Or (*pCreateInfo\components\b & $FFFFFFFF) <> #VK_COMPONENT_SWIZZLE_IDENTITY Or (*pCreateInfo\components\a & $FFFFFFFF) <> #VK_COMPONENT_SWIZZLE_IDENTITY
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImageView was given a component swizzle (Anvil code -20005, unsupported swizzle); the tile store writes the shader's components in the attachment's own order, so a swizzle would be declared and not carried out.")
+  EndIf
+  If (*pCreateInfo\subresourceRange\aspectMask & $FFFFFFFF) <> #VK_IMAGE_ASPECT_COLOR_BIT
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImageView was given a subresource aspect other than colour (Anvil code -20001, wrong aspect); a colour view names VK_IMAGE_ASPECT_COLOR_BIT and nothing else.")
+  EndIf
+  If (*pCreateInfo\subresourceRange\baseMipLevel & $FFFFFFFF) <> 0 Or (*pCreateInfo\subresourceRange\baseArrayLayer & $FFFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImageView was given a subresource range that does not start at mip level zero, array layer zero (Anvil code -20005, unsupported subresource range); every image here has one mip level and one array layer.")
+  EndIf
+  ProcedureReturn AnvilVkImageViewCreate(device, *pCreateInfo\image, *pCreateInfo\viewType & $FFFFFFFF, *pCreateInfo\format & $FFFFFFFF, *pView)
+EndProcedure
+
+Procedure vkDestroyImageView(device.i, imageView.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkImageViewDestroy(device, imageView)
+EndProcedure
+
+Procedure.i vkCreateFramebuffer(device.i, *pCreateInfo.VkFramebufferCreateInfo, *pAllocator, *pFramebuffer)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pFramebuffer = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateFramebuffer was given a VkFramebufferCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO.")
+  EndIf
+  If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateFramebuffer was given a VkFramebufferCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no framebuffer was created.")
+  EndIf
+  If (*pCreateInfo\attachmentCount & $FFFFFFFF) <> 1 Or *pCreateInfo\pAttachments = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateFramebuffer was given other than exactly one attachment (Anvil code -20005, unsupported framebuffer); the render pass has one attachment, so a framebuffer for it has one view.")
+  EndIf
+  ProcedureReturn AnvilVkFramebufferCreate(device, *pCreateInfo\renderPass, PeekI(*pCreateInfo\pAttachments), *pCreateInfo\width & $FFFFFFFF, *pCreateInfo\height & $FFFFFFFF, *pCreateInfo\layers & $FFFFFFFF, *pFramebuffer)
+EndProcedure
+
+Procedure vkDestroyFramebuffer(device.i, framebuffer.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkFramebufferDestroy(device, framebuffer)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE GRAPHICS PIPELINE
+;
+;  vkCreateGraphicsPipelines takes an array and this slice creates one at
+;  a time. A count above one is REFUSED rather than partly honoured: the
+;  specification says a failure writes VK_NULL_HANDLE into the rest, and
+;  creating the first and silently stopping would be exactly the silent
+;  partial success this engine never gives.
+; ----------------------------------------------------------------------
+Procedure.i vkCreateGraphicsPipelines(device.i, pipelineCache.i, createInfoCount.i, *pCreateInfos.VkGraphicsPipelineCreateInfo, *pAllocator, *pPipelines)
+  Define rc.i
+  If *pCreateInfos = 0 Or *pPipelines = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If pipelineCache <> #VK_NULL_HANDLE
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a VkPipelineCache (Anvil code -20005, pipeline cache not implemented); there is no vkCreatePipelineCache here, so pass VK_NULL_HANDLE.")
+  EndIf
+  If createInfoCount <> 1
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked to create other than exactly one pipeline in one call (Anvil code -20005, batched creation not implemented); create them one at a time, because creating the first and stopping would be a silent partial success.")
+  EndIf
+  ProcedureReturn AnvilVkGraphicsPipelineCreate(device, *pCreateInfos, *pPipelines)
+EndProcedure
+
+Procedure vkDestroyPipeline(device.i, pipeline.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkPipelineDestroy(device, pipeline)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE RENDER PASS COMMANDS. All void, exactly as the registry declares.
+; ----------------------------------------------------------------------
+Procedure vkCmdBeginRenderPass(commandBuffer.i, *pRenderPassBegin.VkRenderPassBeginInfo, contents.i)
+  If *pRenderPassBegin = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given a null VkRenderPassBeginInfo (Anvil code -20001, invalid argument); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If *pRenderPassBegin\sType <> #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given a VkRenderPassBeginInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO.")
+    ProcedureReturn
+  EndIf
+  If *pRenderPassBegin\pNext <> 0
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBeginRenderPass was given a VkRenderPassBeginInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If contents <> #VK_SUBPASS_CONTENTS_INLINE
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBeginRenderPass was asked for VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS (Anvil code -20005, secondary execution not implemented); record the draw inline in the primary command buffer.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdBeginRenderPass(commandBuffer, *pRenderPassBegin\renderPass, *pRenderPassBegin\framebuffer, @*pRenderPassBegin\renderArea, *pRenderPassBegin\clearValueCount & $FFFFFFFF, *pRenderPassBegin\pClearValues)
+EndProcedure
+
+Procedure vkCmdBindPipeline(commandBuffer.i, pipelineBindPoint.i, pipeline.i)
+  AnvilVkCmdBindPipeline(commandBuffer, pipelineBindPoint, pipeline)
+EndProcedure
+
+Procedure vkCmdBindVertexBuffers(commandBuffer.i, firstBinding.i, bindingCount.i, *pBuffers, *pOffsets)
+  If *pBuffers = 0 Or *pOffsets = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdBindVertexBuffers was given a null pBuffers or pOffsets (Anvil code -20001, invalid argument); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If bindingCount <> 1
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindVertexBuffers was asked to bind other than exactly one binding (Anvil code -20005, unsupported binding count); this slice has one vertex input binding, so binding two would leave one of them unread.")
+    ProcedureReturn
+  EndIf
+  ; VkDeviceSize is uint64_t and the native integer is 64 bits on this
+  ; part, so one PeekI reads the whole offset.
+  AnvilVkCmdBindVertexBuffer(commandBuffer, firstBinding, PeekI(*pBuffers), PeekI(*pOffsets))
+EndProcedure
+
+Procedure vkCmdPushConstants(commandBuffer.i, layout.i, stageFlags.i, offset.i, size.i, *pValues)
+  AnvilVkCmdPushConstants(commandBuffer, layout, stageFlags, offset, size, *pValues)
+EndProcedure
+
+Procedure vkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstVertex.i, firstInstance.i)
+  AnvilVkCmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance)
+EndProcedure
+
+Procedure vkCmdEndRenderPass(commandBuffer.i)
+  AnvilVkCmdEndRenderPass(commandBuffer)
 EndProcedure

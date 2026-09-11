@@ -1,0 +1,74 @@
+; ======================================================================
+;  The emitted SPIR-V front-end gate
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; A DESK INSTRUMENT. It does not ship and it never runs on the board.
+;
+; It walks a table of SPIR-V modules the CHECKER assembled - byte by
+; byte, from the specification's own opcode numbers - and writes what
+; the front end made of each one into a report the checker reads back.
+; The checker then compares every field against what it independently
+; expects, and mutates both the modules and the front end's source to
+; require that every plausible mistake is noticed.
+;
+; NOTHING IS HARD CODED HERE. The fixtures come in through memory, so
+; adding one is a change to the checker and not to this file, and the
+; expectation is built by a different piece of code from the one that
+; produces the answer.
+;
+;   PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
+;       py -3 tools/vulkan_spirv_check.py --mutate
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_none.pbi"
+
+; The fixture table, and the report. Both are in the payload window, and
+; the gate writes only inside the report.
+#SPVG_IN = $06000000
+#SPVG_OUT = $06100000
+#SPVG_MAGIC = $564B5350          ; "VKSP"
+#SPVG_SLOTS = 16                 ; 128 bytes of report per fixture
+#SPVG_HEAD = 64
+
+Procedure.i Main()
+  Define n.i
+  Define i.i
+  Define addr.i
+  Define bytes.i
+  Define rc.i
+  Define base.i
+
+  PokeI(#SPVG_OUT, #SPVG_MAGIC)
+  n = PeekI(#SPVG_IN)
+  If n < 0 : n = 0 : EndIf
+  If n > 64 : n = 64 : EndIf
+  PokeI(#SPVG_OUT + 8, n)
+
+  i = 0
+  While i < n
+    addr = PeekI(#SPVG_IN + 8 + (i * 16))
+    bytes = PeekI(#SPVG_IN + 16 + (i * 16))
+    AnvilVkFaultClear()
+    rc = AnvilVkSpirvWalk(addr, bytes)
+    base = #SPVG_OUT + #SPVG_HEAD + (i * #SPVG_SLOTS * 8)
+    PokeI(base + 0, rc)
+    PokeI(base + 8, AnvilVkSpirvLastOpcode())
+    PokeI(base + 16, AnvilVkSpirvStage())
+    PokeI(base + 24, AnvilVkSpirvInputCount())
+    PokeI(base + 32, AnvilVkSpirvOutputCount())
+    PokeI(base + 40, AnvilVkSpirvPositionAttr())
+    PokeI(base + 48, AnvilVkSpirvColourSource())
+    PokeI(base + 56, AnvilVkSpirvInstructions())
+    PokeI(base + 64, AnvilVkFaultText())
+    PokeI(base + 72, AnvilVkSpirvInputComponents(0))
+    PokeI(base + 80, AnvilVkSpirvInputComponents(1))
+    PokeI(base + 88, AnvilVkSpirvOutputComponents(0))
+    PokeI(base + 96, AnvilVkSpirvOutputSourceAttr(0))
+    PokeI(base + 104, AnvilVkSpirvUsesPushConstants())
+    PokeI(base + 112, AnvilVkSpirvColourConstant(0))
+    PokeI(base + 120, AnvilVkSpirvBound())
+    i = i + 1
+  Wend
+  ProcedureReturn #SPVG_OUT
+EndProcedure

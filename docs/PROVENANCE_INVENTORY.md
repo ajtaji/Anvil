@@ -597,6 +597,10 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Board/screen_cmd.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document (HVS behaviour read); no notice obligation |
 | `Anvil/Graphics/Vulkan/vk_v3d_backend.pi4` | consulted | mesa-24.3.4 | MIT | reference read for V3D behaviour; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_v3d_backend.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for semantics; cite; no code taken |
+| `Anvil/Graphics/Vulkan/vk_spirv.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | SPIR-V specification and the Vulkan environment appendix read for the binary layout, the opcode numbers and the enumerants; cite; no code taken |
+| `Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | SPIR-V specification read for the module layout the hand-assembled fixtures follow; cite; no code taken |
+| `Anvil/Graphics/Vulkan/vk_v3d_shader.pi4` | consulted | mesa-24.3.4 | MIT | reference read for the shaded-vertex layout, the VPM segment rule and the thread-end ordering; cite; no code taken |
+| `RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
 | `RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4` | hardware-facts | vendor-spec | vendor document | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
@@ -608,6 +612,7 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Core/memcmd.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/memcmd.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `Anvil/Core/net_cmd.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `RaspberryPi4/Tests/net_xfer_pump_ownership_emitted_gate.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/net_cmd.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/netcfg.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/netconsole.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |

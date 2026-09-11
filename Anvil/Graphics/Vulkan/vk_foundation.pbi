@@ -61,6 +61,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TYPE_DEVICE_MEMORY = 7
 #ANVIL_VK_TYPE_IMAGE = 8
 #ANVIL_VK_TYPE_FENCE = 9
+#ANVIL_VK_TYPE_BUFFER = 10
+#ANVIL_VK_TYPE_SHADER_MODULE = 11
+#ANVIL_VK_TYPE_PIPELINE_LAYOUT = 12
+#ANVIL_VK_TYPE_RENDER_PASS = 13
+#ANVIL_VK_TYPE_IMAGE_VIEW = 14
+#ANVIL_VK_TYPE_FRAMEBUFFER = 15
+#ANVIL_VK_TYPE_PIPELINE = 16
 
 #ANVIL_VK_CB_INITIAL = 0
 #ANVIL_VK_CB_RECORDING = 1
@@ -86,6 +93,38 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TOKEN_GEN_MASK = $00000000FFFF0000
 #ANVIL_VK_TOKEN_SLOT_MASK = $000000000000FFFF
 
+; The capability bit a backend sets when it can execute a graphics
+; pipeline: a vertex fetch, a rasterised primitive and a fragment shader.
+; It is separate from CLEAR_COLOR because a backend that clears is not
+; thereby a backend that draws, and the first one written could do one
+; and not the other for a whole evening.
+#ANVIL_VK_CAP_DRAW = $0008
+
+; ----------------------------------------------------------------------
+;  ONE CLOSED DRAW, handed to the backend.
+;
+;  The portable layer validates everything in this record and the backend
+;  executes it or reports a device loss. It is a record and not thirteen
+;  arguments because a gate compares its bytes against an expectation
+;  built independently, and because the AArch64 calling convention has
+;  eight argument registers.
+; ----------------------------------------------------------------------
+Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
+  pipeline.i          ; the backend's own pipeline slot
+  targetBase.i        ; the colour attachment's first byte
+  targetBytes.i
+  width.i
+  height.i
+  pitch.i
+  clearBgra.i         ; the render pass's clear value, already packed
+  vertexBase.i        ; the bound vertex buffer, plus its bind offset
+  vertexStride.i
+  vertexCount.i
+  firstVertex.i
+  pushBase.i          ; the push-constant block, or 0
+  pushBytes.i
+EndStructure
+
 ; ----------------------------------------------------------------------
 ;  THE BACKEND SEAM.
 ; ----------------------------------------------------------------------
@@ -108,6 +147,16 @@ Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
 Declare.i avkBackendPoll()
 Declare.i avkBackendLastNativeError()
 Declare.i avkBackendTicksUs()
+
+; The graphics half of the seam. A backend with no #ANVIL_VK_CAP_DRAW bit
+; still defines all four: they answer "not on this backend" rather than
+; being absent, so a build that reaches one links and refuses instead of
+; failing to resolve a symbol at the worst possible moment.
+Declare.i avkBackendPipelineBytes()
+Declare.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
+Declare avkBackendPipelineRelease(pipe.i)
+Declare.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+Declare.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
 
 ; EVERY SLOT TABLE IS ONE ELEMENT LONGER THAN ITS MAXIMUM. Slot 0 means
 ; "no object", so live slots run 1..MAX and a table dimensioned to MAX
@@ -223,6 +272,35 @@ Procedure.i avkU32(*p)
   ProcedureReturn PeekL(*p) & $FFFFFFFF
 EndProcedure
 
+; A binary32 bit pattern as a whole number, or -1 when it is not one.
+;
+; VkViewport's four fields are floats and this slice renders at whole
+; pixel viewports, so a viewport of 799.5 has to be refused rather than
+; rounded - the emitted coordinate shader would scale by a number the
+; caller did not ask for and the triangle would land half a pixel out.
+; Done on the BIT PATTERN for the same reason avkUnorm8FromF32Bits is:
+; the portable layer must not need a live floating-point unit.
+Procedure.i avkIntFromF32Bits(bits.i)
+  Define exp.i
+  Define man.i
+  Define e.i
+  Define shift.i
+  bits = bits & $FFFFFFFF
+  If bits = 0 : ProcedureReturn 0 : EndIf
+  If (bits >> 31) <> 0 : ProcedureReturn -1 : EndIf
+  exp = (bits >> 23) & $FF
+  man = bits & $7FFFFF
+  If exp = 0 : ProcedureReturn -1 : EndIf                 ; subnormal
+  If exp = $FF : ProcedureReturn -1 : EndIf               ; infinity or NaN
+  e = exp - 127
+  If e < 0 : ProcedureReturn -1 : EndIf                   ; below one
+  If e > 15 : ProcedureReturn -1 : EndIf                  ; above 65535
+  man = $800000 | man
+  shift = 23 - e
+  If (man & ((1 << shift) - 1)) <> 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn man >> shift
+EndProcedure
+
 Procedure.i avkInstSlot(h.i)
   Define s.i
   s = avkTokenShape(h, #ANVIL_VK_TYPE_INSTANCE, #ANVIL_VK_MAX_INSTANCES)
@@ -286,6 +364,15 @@ EndProcedure
 ; result silicon.
 Procedure.i AnvilVkBackendIsGpu()
   If (avkBackendCaps() & #ANVIL_VK_CAP_GPU) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; 1 when the linked backend executes a graphics pipeline. A backend that
+; only clears answers 0 here and vkCreateGraphicsPipelines refuses.
+Procedure.i AnvilVkBackendCanDraw()
+  If (avkBackendCaps() & #ANVIL_VK_CAP_DRAW) <> 0
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0

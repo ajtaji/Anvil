@@ -1,0 +1,701 @@
+; ======================================================================
+;  The emitted graphics-pipeline gate
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; A DESK INSTRUMENT. It does not ship and it never runs on the board.
+;
+; It drives the WHOLE public path - vkCreateShaderModule through
+; vkQueueSubmit - over the state-only test backend, and then compiles the
+; same two pipelines with the REAL V3D QPU emitter and builds their real
+; GL shader state records. The checker reads those bytes back and
+; compares them against records it builds itself from the documented V3D
+; field layout, so the expectation and the answer come from two different
+; pieces of code.
+;
+; NO MMIO. The test backend owns no hardware and the QPU emitter is
+; arithmetic and memory writes; the checker arms a hard stop on any
+; access above the peripheral base and the gate must never reach it.
+;
+; The two SPIR-V modules are written into memory by the checker, which
+; assembles them word by word from the specification's own numbers. This
+; file never contains a module.
+;
+;   PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
+;       py -3 tools/vulkan_pipeline_check.py --mutate
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+
+; The checker's fixture table, the heap the test backend suballocates,
+; and the report.
+#PG_IN = $06000000
+#PG_HEAP = $06200000
+#PG_HEAP_BYTES = $00100000
+#PG_OUT = $06100000
+#PG_MAGIC = $564B5047                ; "VKPG"
+
+; The render target the gate draws into, and the vertex layout.
+#PG_W = 64
+#PG_H = 64
+#PG_POISON = $A5C30FF0
+#PG_CLEAR_R = $3E4CCCCD              ; 0.2 -> 51
+#PG_CLEAR_G = $3F000000              ; 0.5 -> 128
+#PG_CLEAR_B = $3F333333              ; 0.7 -> 178
+#PG_CLEAR_A = $3F800000              ; 1.0 -> 255
+#PG_PUSH_R = $3F800000
+#PG_PUSH_G = $3F000000
+#PG_PUSH_B = $00000000
+#PG_PUSH_A = $3F800000
+
+#PG_STRIDE1 = 24                     ; vec2 position + vec4 colour
+#PG_STRIDE2 = 8                      ; vec2 position
+
+Global Dim pgReport.i[64]
+Global Dim pgClear.l[4]
+Global Dim pgPush.l[4]
+
+Procedure pgPut(slot.i, value.i)
+  If slot < 0 Or slot > 63
+    ProcedureReturn
+  EndIf
+  pgReport[slot] = value
+EndProcedure
+
+Procedure.i pgStop(status.i)
+  pgPut(1, status)
+  pgPut(32, AnvilVkFaultText())
+  pgPut(31, AnvilVkFaultCount())
+  ProcedureReturn @pgReport[0]
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define img.i
+  Define mem.i
+  Define view.i
+  Define rp.i
+  Define fb.i
+  Define buf.i
+  Define bmem.i
+  Define fence.i
+  Define count.i
+  Define vsA.i
+  Define fsA.i
+  Define vsB.i
+  Define fsB.i
+  Define layA.i
+  Define layB.i
+  Define pipeA.i
+  Define pipeB.i
+  Define bad.i
+  Define vaddr.i
+  Define i.i
+
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo
+  Define bufci.VkBufferCreateInfo
+  Define img2.i
+  Define mem2.i
+  Define bar.VkImageMemoryBarrier
+  Define pbargs.AnvilVkPipelineBarrierArgs
+  Define range.VkImageSubresourceRange
+  Define smci.VkShaderModuleCreateInfo
+  Define plci.VkPipelineLayoutCreateInfo
+  Define pcr.VkPushConstantRange
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define bind.VkVertexInputBindingDescription
+  Define Dim attrs.VkVertexInputAttributeDescription[2]
+  Define vi.VkPipelineVertexInputStateCreateInfo
+  Define ia.VkPipelineInputAssemblyStateCreateInfo
+  Define vpstate.VkPipelineViewportStateCreateInfo
+  Define vp.VkViewport
+  Define sc.VkRect2D
+  Define rs.VkPipelineRasterizationStateCreateInfo
+  Define ms.VkPipelineMultisampleStateCreateInfo
+  Define cba.VkPipelineColorBlendAttachmentState
+  Define cb.VkPipelineColorBlendStateCreateInfo
+  Define gp.VkGraphicsPipelineCreateInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define cbHandle.i
+  Define fenceArray.i
+  Define bufHandle.i
+  Define bufOffset.q
+
+  pgPut(0, #PG_MAGIC)
+  ; THE BOARD DIAGNOSTIC'S OWN MODULES, assembled by the same file the
+  ; diagnostic includes and reported here so the checker can compare
+  ; every word against a module its own assembler built. The board is a
+  ; bad place to discover that one of those words was wrong.
+  pgPut(57, vtpBuildVsA())
+  pgPut(56, @vtpVsA[0])
+  pgPut(59, vtpBuildFsA())
+  pgPut(58, @vtpFsA[0])
+  pgPut(61, vtpBuildVsB())
+  pgPut(60, @vtpVsB[0])
+  pgPut(63, vtpBuildFsB())
+  pgPut(62, @vtpFsB[0])
+  AnvilVkTestBackendHeap(#PG_HEAP, #PG_HEAP_BYTES)
+  pgPut(38, AnvilVkBackendCanDraw())
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS
+    ProcedureReturn pgStop(1)
+  EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS
+    ProcedureReturn pgStop(2)
+  EndIf
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS
+    ProcedureReturn pgStop(3)
+  EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS
+    ProcedureReturn pgStop(4)
+  EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS
+    ProcedureReturn pgStop(5)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  The colour attachment, its view, the render pass and the framebuffer.
+  ; ------------------------------------------------------------------
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #PG_W
+  imgci\extent\height = #PG_H
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS
+    ProcedureReturn pgStop(6)
+  EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @mem) <> #VK_SUCCESS
+    ProcedureReturn pgStop(7)
+  EndIf
+  If vkBindImageMemory(dev, img, mem, 0) <> #VK_SUCCESS
+    ProcedureReturn pgStop(8)
+  EndIf
+  pgPut(3, AnvilVkImageAddress(img))
+  pgPut(4, req\size)
+  pgPut(5, AnvilVkImageRowPitch(img))
+  ; POISON IT. Nothing in this path may write one byte of the image: the
+  ; test backend owns no GPU and the gate checks the poison afterwards.
+  i = 0
+  While i < req\size
+    PokeL(AnvilVkImageAddress(img) + i, #PG_POISON)
+    i = i + 4
+  Wend
+
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = img
+  ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1
+  ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS
+    ProcedureReturn pgStop(9)
+  EndIf
+
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM
+  att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0
+  aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1
+  sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1
+  rpci\pAttachments = @att
+  rpci\subpassCount = 1
+  rpci\pSubpasses = @sub
+  If vkCreateRenderPass(dev, @rpci, 0, @rp) <> #VK_SUCCESS
+    ProcedureReturn pgStop(10)
+  EndIf
+
+  ; A render pass whose loadOp is LOAD must be refused.
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_LOAD
+  pgPut(46, vkCreateRenderPass(dev, @rpci, 0, @bad))
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = rp
+  fbci\attachmentCount = 1
+  fbci\pAttachments = @view
+  fbci\width = #PG_W
+  fbci\height = #PG_H
+  fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS
+    ProcedureReturn pgStop(11)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  The vertex buffer, and three vertices in it.
+  ; ------------------------------------------------------------------
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  ; SIX vertices, not three. A draw of four must be refused for being
+  ; an incomplete triangle and NOT for running off the end of the
+  ; buffer, and those are two different rules.
+  bufci\size = 6 * #PG_STRIDE1
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+  bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  If vkCreateBuffer(dev, @bufci, 0, @buf) <> #VK_SUCCESS
+    ProcedureReturn pgStop(12)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, buf, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @bmem) <> #VK_SUCCESS
+    ProcedureReturn pgStop(13)
+  EndIf
+  If vkBindBufferMemory(dev, buf, bmem, 0) <> #VK_SUCCESS
+    ProcedureReturn pgStop(14)
+  EndIf
+  vaddr = AnvilVkBufferAddress(buf)
+  pgPut(6, vaddr)
+  i = 0
+  While i < (6 * #PG_STRIDE1)
+    PokeL(vaddr + i, 0)
+    i = i + 4
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  Two shader modules from the checker's fixture table, two layouts,
+  ;  two pipelines.
+  ; ------------------------------------------------------------------
+  smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  smci\pCode = PeekI(#PG_IN + 0)
+  smci\codeSize = PeekI(#PG_IN + 8)
+  If vkCreateShaderModule(dev, @smci, 0, @vsA) <> #VK_SUCCESS
+    ProcedureReturn pgStop(15)
+  EndIf
+  smci\pCode = PeekI(#PG_IN + 16)
+  smci\codeSize = PeekI(#PG_IN + 24)
+  If vkCreateShaderModule(dev, @smci, 0, @fsA) <> #VK_SUCCESS
+    ProcedureReturn pgStop(16)
+  EndIf
+  smci\pCode = PeekI(#PG_IN + 32)
+  smci\codeSize = PeekI(#PG_IN + 40)
+  If vkCreateShaderModule(dev, @smci, 0, @vsB) <> #VK_SUCCESS
+    ProcedureReturn pgStop(17)
+  EndIf
+  smci\pCode = PeekI(#PG_IN + 48)
+  smci\codeSize = PeekI(#PG_IN + 56)
+  If vkCreateShaderModule(dev, @smci, 0, @fsB) <> #VK_SUCCESS
+    ProcedureReturn pgStop(18)
+  EndIf
+
+  plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  If vkCreatePipelineLayout(dev, @plci, 0, @layA) <> #VK_SUCCESS
+    ProcedureReturn pgStop(19)
+  EndIf
+  pcr\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  pcr\offset = 0
+  pcr\size = 16
+  plci\pushConstantRangeCount = 1
+  plci\pPushConstantRanges = @pcr
+  If vkCreatePipelineLayout(dev, @plci, 0, @layB) <> #VK_SUCCESS
+    ProcedureReturn pgStop(20)
+  EndIf
+
+  ; The state every pipeline here shares.
+  ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+  ia\primitiveRestartEnable = #VK_FALSE
+  PokeL(@vp\x, $00000000)
+  PokeL(@vp\y, $00000000)
+  PokeL(@vp\width, $42800000)          ; 64.0
+  PokeL(@vp\height, $42800000)         ; 64.0
+  PokeL(@vp\minDepth, $00000000)
+  PokeL(@vp\maxDepth, $3F800000)
+  sc\offset\x = 0
+  sc\offset\y = 0
+  sc\extent\width = #PG_W
+  sc\extent\height = #PG_H
+  vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  vpstate\viewportCount = 1
+  vpstate\pViewports = @vp
+  vpstate\scissorCount = 1
+  vpstate\pScissors = @sc
+  rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+  rs\polygonMode = #VK_POLYGON_MODE_FILL
+  rs\cullMode = #VK_CULL_MODE_NONE
+  rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE
+  PokeL(@rs\lineWidth, $3F800000)
+  ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+  ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+  cba\blendEnable = #VK_FALSE
+  cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+  cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+  cb\attachmentCount = 1
+  cb\pAttachments = @cba
+
+  stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT
+  stages[0]\module = vsA
+  stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT
+  stages[1]\module = fsA
+
+  bind\binding = 0
+  bind\stride = #PG_STRIDE1
+  bind\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[0]\location = 0
+  attrs[0]\binding = 0
+  attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[0]\offset = 0
+  attrs[1]\location = 1
+  attrs[1]\binding = 0
+  attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+  attrs[1]\offset = 8
+  vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+  vi\vertexBindingDescriptionCount = 1
+  vi\pVertexBindingDescriptions = @bind
+  vi\vertexAttributeDescriptionCount = 2
+  vi\pVertexAttributeDescriptions = @attrs[0]
+
+  gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+  gp\stageCount = 2
+  gp\pStages = @stages[0]
+  gp\pVertexInputState = @vi
+  gp\pInputAssemblyState = @ia
+  gp\pViewportState = @vpstate
+  gp\pRasterizationState = @rs
+  gp\pMultisampleState = @ms
+  gp\pColorBlendState = @cb
+  gp\layout = layA
+  gp\renderPass = rp
+  gp\subpass = 0
+  gp\basePipelineIndex = -1
+  If vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeA) <> #VK_SUCCESS
+    ProcedureReturn pgStop(21)
+  EndIf
+
+  ; A pipeline that asks for blending must be refused.
+  cba\blendEnable = #VK_TRUE
+  pgPut(42, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  cba\blendEnable = #VK_FALSE
+  ; So must a fragment module offered at the vertex stage.
+  stages[0]\module = fsA
+  AnvilVkFaultClear()
+  pgPut(47, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(55, AnvilVkFaultText())
+  stages[0]\module = vsA
+  ; An attribute whose format has fewer components than the shader input
+  ; at the same location.
+  attrs[1]\format = #VK_FORMAT_R32G32B32_SFLOAT
+  pgPut(53, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+
+  ; The second pipeline: a position-only vertex shader and a fragment
+  ; shader that reads the push-constant block.
+  stages[0]\module = vsB
+  stages[1]\module = fsB
+  bind\stride = #PG_STRIDE2
+  vi\vertexAttributeDescriptionCount = 1
+  gp\layout = layB
+  If vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeB) <> #VK_SUCCESS
+    ProcedureReturn pgStop(22)
+  EndIf
+  ; The same pipeline on a layout with no push constant range is refused.
+  gp\layout = layA
+  pgPut(49, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  gp\layout = layB
+  ; A fragment shader that reads a varying its vertex shader never writes.
+  stages[1]\module = fsA
+  AnvilVkFaultClear()
+  pgPut(54, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(50, AnvilVkFaultText())
+  stages[1]\module = fsB
+
+  ; ------------------------------------------------------------------
+  ;  Compile both with the real V3D emitter, into the pipelines' own
+  ;  device memory, and build their real shader records.
+  ; ------------------------------------------------------------------
+  pgPut(19, AnvilVkV3dShaderRecordOffset())
+  If AnvilVkV3dCompile(1, AnvilVkPipelineCodeBase(pipeA), AnvilVkPipelineCodeBytes(pipeA)) <> #VK_SUCCESS
+    pgPut(2, AnvilVkV3dShaderStage())
+    ProcedureReturn pgStop(23)
+  EndIf
+  AnvilVkV3dFragmentUniforms(1, AnvilVkV3dCodeBase(1), 0, AnvilVkPipelineColourSource(1))
+  If AnvilVkV3dBuildRecord(1, AnvilVkPipelineCodeBase(pipeA), vaddr, #PG_STRIDE1, 2, AnvilVkV3dVaryingComponents(1)) <> #V3D_OK
+    ProcedureReturn pgStop(24)
+  EndIf
+  pgPut(7, AnvilVkV3dCodeBase(1))
+  pgPut(8, AnvilVkV3dRecordCount(1))
+  pgPut(9, AnvilVkV3dVaryingComponents(1))
+  pgPut(10, AnvilVkV3dProgramBytes(1, 0))
+  pgPut(11, AnvilVkV3dProgramBytes(1, 1))
+  pgPut(12, AnvilVkV3dProgramBytes(1, 2))
+  pgPut(33, AnvilVkPipelineColourSource(1))
+  pgPut(40, AnvilVkPipelineAttrCount(1))
+  pgPut(51, AnvilVkPipelineViewportWidth(1))
+
+  PokeL(@pgPush[0] + 0, #PG_PUSH_R)
+  PokeL(@pgPush[0] + 4, #PG_PUSH_G)
+  PokeL(@pgPush[0] + 8, #PG_PUSH_B)
+  PokeL(@pgPush[0] + 12, #PG_PUSH_A)
+  If AnvilVkV3dCompile(2, AnvilVkPipelineCodeBase(pipeB), AnvilVkPipelineCodeBytes(pipeB)) <> #VK_SUCCESS
+    pgPut(2, AnvilVkV3dShaderStage())
+    ProcedureReturn pgStop(25)
+  EndIf
+  AnvilVkV3dFragmentUniforms(2, AnvilVkV3dCodeBase(2), @pgPush[0], AnvilVkPipelineColourSource(2))
+  If AnvilVkV3dBuildRecord(2, AnvilVkPipelineCodeBase(pipeB), vaddr, #PG_STRIDE2, 2, AnvilVkV3dVaryingComponents(2)) <> #V3D_OK
+    ProcedureReturn pgStop(26)
+  EndIf
+  pgPut(13, AnvilVkV3dCodeBase(2))
+  pgPut(14, AnvilVkV3dRecordCount(2))
+  pgPut(15, AnvilVkV3dVaryingComponents(2))
+  pgPut(16, AnvilVkV3dProgramBytes(2, 0))
+  pgPut(17, AnvilVkV3dProgramBytes(2, 1))
+  pgPut(18, AnvilVkV3dProgramBytes(2, 2))
+  pgPut(34, AnvilVkPipelineColourSource(2))
+  pgPut(41, AnvilVkPipelineAttrCount(2))
+  pgPut(52, AnvilVkPipelineViewportWidth(2))
+
+  ; ------------------------------------------------------------------
+  ;  Record one render pass with one draw, and submit it.
+  ; ------------------------------------------------------------------
+  PokeL(@pgClear[0] + 0, #PG_CLEAR_R)
+  PokeL(@pgClear[0] + 4, #PG_CLEAR_G)
+  PokeL(@pgClear[0] + 8, #PG_CLEAR_B)
+  PokeL(@pgClear[0] + 12, #PG_CLEAR_A)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp
+  rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #PG_W
+  rpbi\renderArea\extent\height = #PG_H
+  rpbi\clearValueCount = 1
+  rpbi\pClearValues = @pgClear[0]
+
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS
+    ProcedureReturn pgStop(27)
+  EndIf
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle = buf
+  bufOffset = 0
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  rc = vkEndCommandBuffer(cmd)
+  If rc <> #VK_SUCCESS
+    pgPut(2, rc)
+    ProcedureReturn pgStop(28)
+  EndIf
+
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS
+    ProcedureReturn pgStop(29)
+  EndIf
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cbHandle
+  rc = vkQueueSubmit(queue, 1, @si, fence)
+  pgPut(28, rc)
+  fenceArray = fence
+  pgPut(29, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(30, AnvilVkImageLayout(img))
+  pgPut(20, AnvilVkLastDrawRecord())
+  pgPut(21, AnvilVkTestBackendDraws())
+  pgPut(22, AnvilVkTestBackendPipelines())
+  pgPut(23, AnvilVkTestBackendLastVertexBase())
+  pgPut(24, AnvilVkTestBackendLastStride())
+  pgPut(25, AnvilVkTestBackendLastVertexCount())
+  pgPut(26, AnvilVkTestBackendLastFirstVertex())
+  pgPut(27, AnvilVkTestBackendLastPushBase())
+  pgPut(37, AnvilVkTestBackendLastDrawColor())
+
+  ; Every word of the image must still be the poison: nothing in this
+  ; path may write a pixel, and a gate that proved otherwise would be a
+  ; gate proving that the gate draws.
+  bad = 0
+  i = 0
+  While i < AnvilVkImageSize(img)
+    If (PeekL(AnvilVkImageAddress(img) + i) & $FFFFFFFF) <> #PG_POISON
+      bad = bad + 1
+    EndIf
+    i = i + 4
+  Wend
+  pgPut(39, bad)
+
+  ; ------------------------------------------------------------------
+  ;  The recording refusals, each on its own fresh command buffer.
+  ; ------------------------------------------------------------------
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 2, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(43, vkEndCommandBuffer(cmd))
+
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 4, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(44, vkEndCommandBuffer(cmd))
+
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 4, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(45, vkEndCommandBuffer(cmd))
+
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  pgPut(48, vkEndCommandBuffer(cmd))
+
+  ; ------------------------------------------------------------------
+  ;  ONE JOB PER SUBMISSION. A command buffer that holds both a transfer
+  ;  clear and a render pass is refused at vkQueueSubmit, because the
+  ;  backend seam carries one job and running only one of them would be
+  ;  a silent partial submission. It needs a SECOND image: the clear and
+  ;  the render pass each claim a layout, and on one image the earlier
+  ;  layout rule would answer first and prove the wrong thing.
+  ; ------------------------------------------------------------------
+  If vkCreateImage(dev, @imgci, 0, @img2) = #VK_SUCCESS
+    vkGetImageMemoryRequirements(dev, img2, @req)
+    mai\allocationSize = req\size
+    If vkAllocateMemory(dev, @mai, 0, @mem2) = #VK_SUCCESS
+      If vkBindImageMemory(dev, img2, mem2, 0) = #VK_SUCCESS
+        bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+        bar\srcAccessMask = 0
+        bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+        bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+        bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+        bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+        bar\image = img2
+        bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+        bar\subresourceRange\levelCount = 1
+        bar\subresourceRange\layerCount = 1
+        pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+        pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+        pbargs\imageMemoryBarrierCount = 1
+        pbargs\pImageMemoryBarriers = @bar
+        range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+        range\levelCount = 1
+        range\layerCount = 1
+        vkResetCommandBuffer(cmd, 0)
+        vkBeginCommandBuffer(cmd, @bi)
+        vkCmdPipelineBarrierArgs(cmd, @pbargs)
+        vkCmdClearColorImage(cmd, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @pgClear[0], 1, @range)
+        vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+        vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+        vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+        vkCmdDraw(cmd, 3, 1, 0, 0)
+        vkCmdEndRenderPass(cmd)
+        If vkEndCommandBuffer(cmd) = #VK_SUCCESS
+          vkResetFences(dev, 1, @fenceArray)
+          pgPut(36, vkQueueSubmit(queue, 1, @si, fence))
+        Else
+          pgPut(36, -1)
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  vkDestroyImage(dev, img2, 0)
+  vkFreeMemory(dev, mem2, 0)
+
+  ; ------------------------------------------------------------------
+  ;  Ordered teardown.
+  ; ------------------------------------------------------------------
+  vkDeviceWaitIdle(dev)
+  vkDestroyFence(dev, fence, 0)
+  vkDestroyPipeline(dev, pipeA, 0)
+  vkDestroyPipeline(dev, pipeB, 0)
+  vkDestroyPipelineLayout(dev, layA, 0)
+  vkDestroyPipelineLayout(dev, layB, 0)
+  vkDestroyShaderModule(dev, vsA, 0)
+  vkDestroyShaderModule(dev, fsA, 0)
+  vkDestroyShaderModule(dev, vsB, 0)
+  vkDestroyShaderModule(dev, fsB, 0)
+  vkDestroyFramebuffer(dev, fb, 0)
+  vkDestroyRenderPass(dev, rp, 0)
+  vkDestroyImageView(dev, view, 0)
+  vkDestroyBuffer(dev, buf, 0)
+  vkFreeMemory(dev, bmem, 0)
+  vkDestroyImage(dev, img, 0)
+  vkFreeMemory(dev, mem, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+  ProcedureReturn pgStop(0)
+EndProcedure

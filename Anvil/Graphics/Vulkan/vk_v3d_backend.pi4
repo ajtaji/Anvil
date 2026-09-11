@@ -61,6 +61,13 @@
 ; PROVENANCE.json therefore owes this file one `mesa-24.3.4: consulted`
 ; row, the same classification vk_core_1_0.pbi carries for khronos-vulkan.
 
+; REQUIRES Anvil/Graphics/Vulkan/vk_v3d_shader.pi4, INCLUDED BEFORE THIS
+; FILE. That is the QPU emitter, and the three pipeline entries of the
+; seam below are thin wrappers over it. It is not included from here:
+; house rule 10 says a library does not include another library, so the
+; main source lists both and a build that forgets the emitter fails to
+; resolve AnvilVkV3dCompile by name rather than linking something odd.
+
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 
 ; The clear colour word this backend hands V3dRenderClear lands in the
@@ -99,7 +106,7 @@ EndProcedure
 Procedure.i avkBackendCaps()
   If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU
+  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW
 EndProcedure
 
 Procedure.i avkBackendName()
@@ -265,4 +272,189 @@ Procedure.i avkBackendTicksUs()
   hz = V3dCounterHz() / 1000000
   If hz < 1 : hz = 1 : EndIf
   ProcedureReturn V3dTicks() / hz
+EndProcedure
+
+; ======================================================================
+;  THE GRAPHICS HALF: one render pass, one triangle list
+; ======================================================================
+;  It runs the SAME frame the clear already proves on silicon, with one
+;  draw added between the prologue and the submit:
+;
+;    NeonRetarget       point the engine at the colour attachment
+;    NeonFrameBegin     build the render list, set the clear colour and
+;                       write the frame prologue - clip window, clipper
+;                       scaling, viewport offset, write masks
+;    (this file)        undo the prologue's alpha blend, declare the
+;                       varyings' interpolation, clean the caches for
+;                       what the processor wrote, then emit GL_SHADER_
+;                       STATE and VERTEX_ARRAY_PRIMS
+;    NeonFrameEnd       submit the bin job, wait, submit the render job,
+;                       wait, and maintain the caches
+;    NeonRetarget       put the engine's previous target back
+;
+;  THE PROLOGUE'S BLEND IS TURNED OFF HERE AND THAT IS DELIBERATE. The
+;  engine's frame prologue enables SRC_ALPHA / INV_SRC_ALPHA blending,
+;  because every rectangle a user interface draws wants it.
+;  vkCreateGraphicsPipelines refuses a pipeline that asks for blending,
+;  so leaving the prologue's equation in place would blend a triangle
+;  the caller asked to be written straight through - a picture that is
+;  right everywhere the background is opaque and wrong everywhere it is
+;  not. Both packets that carry it are re-emitted: CFG_BITS without its
+;  blend-enable bit, and BLEND_ENABLES with no render target selected.
+;
+;  THE VIEWPORT MUST BE THE RENDER GEOMETRY. The clipper's half width
+;  and the viewport offset are written by the prologue from the engine's
+;  own surface, and the emitted coordinate shader scales by the
+;  pipeline's viewport. If those two disagree the clipper and the
+;  rasteriser work on different geometry, which is a wrong picture and
+;  not a slow one, so the draw is refused rather than reconciled.
+
+; Neon's frame prologue writes CFG_BITS with both facings enabled, no
+; clockwise winding and depth function ALWAYS, and then ORs in the blend
+; enable at bit 19. These two constants are that same word without the
+; blend bit, and the empty render-target mask that goes with it.
+#AVK_V3D_CFG_FWD = 1
+#AVK_V3D_CFG_REV = 1
+#AVK_V3D_CFG_CW = 0
+#AVK_V3D_CFG_DEPTH_ALWAYS = 7
+
+Global avkV3dDraws.i = 0
+Global avkV3dLastRecord.i = 0
+
+; The three pipeline entries of the seam are thin: the emitter owns the
+; encoding and this file owns the hardware.
+Procedure.i avkBackendPipelineBytes()
+  ProcedureReturn AnvilVkV3dPipelineBytes()
+EndProcedure
+
+Procedure.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
+  ProcedureReturn AnvilVkV3dCompile(pipe, base, bytes)
+EndProcedure
+
+Procedure avkBackendPipelineRelease(pipe.i)
+  AnvilVkV3dRelease(pipe)
+EndProcedure
+
+Procedure.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+  ; The rules are the clear's, in the same order and for the same
+  ; reasons: the render target is configured once at NeonInit and this
+  ; backend is offscreen by contract.
+  ProcedureReturn avkBackendClearSupported(base, bytes, w, h, pitch)
+EndProcedure
+
+Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
+  Define rc.i
+  Define restoreRc.i
+  Define oldBase.i
+  Define oldBytes.i
+  Define pipe.i
+  Define pbase.i
+  Define varyComps.i
+  Define lastVertex.i
+  Define vertexBytes.i
+
+  avkV3dNative = 0
+  If *d = 0
+    ProcedureReturn -1
+  EndIf
+  pipe = *d\pipeline
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw naming a pipeline slot it never compiled (Anvil code -20001, invalid pipeline); nothing was submitted.")
+    ProcedureReturn -1
+  EndIf
+  pbase = AnvilVkV3dCodeBase(pipe)
+  If pbase = 0
+    avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 Vulkan backend was handed a draw for a pipeline whose compiled shaders have been released (Anvil code -20004, pipeline not compiled); nothing was submitted. Create the pipeline again before drawing with it.")
+    ProcedureReturn -1
+  EndIf
+
+  rc = avkBackendDrawSupported(*d\targetBase, *d\targetBytes, *d\width, *d\height, *d\pitch)
+  If rc <> #VK_SUCCESS
+    avkV3dNative = rc
+    ProcedureReturn -1
+  EndIf
+  If AnvilVkPipelineViewportWidth(pipe) <> Neon_SurfacePhysicalW() Or AnvilVkPipelineViewportHeight(pipe) <> Neon_SurfacePhysicalH()
+    avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw whose viewport is not the render geometry the graphics engine was initialised with (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The clipper's scaling is written from the engine's surface and the emitted coordinate shader scales by the pipeline's viewport, so the two must be the same rectangle.")
+    avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+    ProcedureReturn -1
+  EndIf
+
+  ; The vertex array must be inside the window the GPU can reach. The
+  ; portable layer has already checked it is inside its own VkBuffer;
+  ; this is the check that the buffer is inside the mapped span, which
+  ; only this file knows about.
+  lastVertex = *d\firstVertex + *d\vertexCount
+  vertexBytes = lastVertex * *d\vertexStride
+  If *d\vertexStride <= 0 Or vertexBytes <= 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with no vertex stride or no vertices (Anvil code -20001, empty draw); nothing was submitted.")
+    ProcedureReturn -1
+  EndIf
+  If *d\vertexBase < avkV3dWindowBase Or (*d\vertexBase - avkV3dWindowBase) > (avkV3dWindowBytes - vertexBytes)
+    avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw whose vertex array is outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The vertex fetcher reaches memory through that mapping, and an unmapped page is an MMU fault rather than a wrong picture.")
+    avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+    ProcedureReturn -1
+  EndIf
+
+  varyComps = avkqVaryComps[pipe]
+  AnvilVkV3dFragmentUniforms(pipe, pbase, *d\pushBase, AnvilVkPipelineColourSource(pipe))
+  rc = AnvilVkV3dBuildRecord(pipe, pbase, *d\vertexBase, *d\vertexStride, lastVertex - 1, varyComps)
+  If rc <> #V3D_OK
+    avkV3dNative = rc
+    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 Vulkan backend could not build this draw's GL shader state record (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); nothing was submitted. V3dError() carries the control-list builder's own code.")
+    ProcedureReturn -1
+  EndIf
+  avkV3dLastRecord = pbase + #AVKQ_OFF_SHREC
+
+  oldBase = Neon_SurfaceBase()
+  oldBytes = Neon_SurfacePitch() * Neon_SurfacePhysicalH()
+
+  rc = NeonRetarget(*d\targetBase, *d\pitch * *d\height)
+  If rc = #NEON_OK
+    rc = NeonFrameBegin(*d\clearBgra)
+  EndIf
+  If rc = #NEON_OK
+    ; Undo the prologue's alpha blend, both packets that carry it.
+    V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
+    V3dClBlendEnables(0)
+    ; The varyings this fragment shader reads with a plain add against
+    ; r5 are non-perspective ones. With every W equal to one the two
+    ; interpolations are the same number, and this is the shape the
+    ; engine's textured program already runs on this board.
+    If varyComps > 0
+      V3dClNonperspFlags((1 << varyComps) - 1)
+    EndIf
+    V3dCacheRange(pbase, #AVKQ_BYTES)
+    V3dCacheRange(*d\vertexBase, vertexBytes)
+    V3dClGlShaderState(pbase + #AVKQ_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
+    V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+    If V3dClError() <> #V3D_OK
+      rc = #NEON_ERR_LIST
+    EndIf
+  EndIf
+  If rc = #NEON_OK
+    rc = NeonFrameEnd()
+  EndIf
+  If rc <> #NEON_OK : avkV3dNative = rc : EndIf
+
+  restoreRc = NeonRetarget(oldBase, oldBytes)
+  If restoreRc <> #NEON_OK And avkV3dNative = 0
+    avkV3dNative = restoreRc
+  EndIf
+  If rc <> #NEON_OK Or restoreRc <> #NEON_OK
+    ProcedureReturn -1
+  EndIf
+
+  avkV3dJobs = avkV3dJobs + 1
+  avkV3dDraws = avkV3dDraws + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendDraws()
+  ProcedureReturn avkV3dDraws
+EndProcedure
+
+; Where the last draw's GL shader state record was built, so a board
+; diagnostic can read the bytes the GPU was pointed at.
+Procedure.i AnvilVkV3dLastShaderRecord()
+  ProcedureReturn avkV3dLastRecord
 EndProcedure

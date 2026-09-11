@@ -396,3 +396,367 @@ EndStructure
 ; takes `const VkClearColorValue*`, so the adapter reads the caller's
 ; sixteen bytes as four binary32 components - which is what the union's
 ; float32 arm is - and says so at the call site.
+
+; ======================================================================
+;  GRAPHICS PIPELINE VOCABULARY
+; ======================================================================
+;  Added when the first real pipeline landed. Every value and every
+;  member below is the pinned registry's own, in the registry's order and
+;  at the registry's width, the same rule the rest of this file follows.
+;
+;  VkClearValue IS A UNION, like VkClearColorValue above, and is
+;  deliberately NOT declared. VkRenderPassBeginInfo.pClearValues points
+;  at an array of them and the adapter reads each one's sixteen bytes as
+;  the colour arm's four binary32 components, which is what a colour
+;  attachment's clear value is, and says so at the call site.
+
+; VkStructureType, the pipeline block.
+#VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = 12
+#VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15
+#VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16
+#VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO = 18
+#VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO = 19
+#VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO = 20
+#VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO = 21
+#VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO = 22
+#VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO = 23
+#VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO = 24
+#VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO = 25
+#VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO = 26
+#VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO = 27
+#VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO = 28
+#VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO = 30
+#VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO = 37
+#VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO = 38
+#VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO = 43
+
+; VkFormat, the vertex-attribute entries this slice names.
+#VK_FORMAT_R32G32_SFLOAT = 103
+#VK_FORMAT_R32G32B32_SFLOAT = 106
+#VK_FORMAT_R32G32B32A32_SFLOAT = 109
+
+; VkShaderStageFlagBits.
+#VK_SHADER_STAGE_VERTEX_BIT = $00000001
+#VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT = $00000002
+#VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT = $00000004
+#VK_SHADER_STAGE_GEOMETRY_BIT = $00000008
+#VK_SHADER_STAGE_FRAGMENT_BIT = $00000010
+#VK_SHADER_STAGE_COMPUTE_BIT = $00000020
+#VK_SHADER_STAGE_ALL_GRAPHICS = $0000001F
+
+; VkPrimitiveTopology.
+#VK_PRIMITIVE_TOPOLOGY_POINT_LIST = 0
+#VK_PRIMITIVE_TOPOLOGY_LINE_LIST = 1
+#VK_PRIMITIVE_TOPOLOGY_LINE_STRIP = 2
+#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 3
+#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP = 4
+#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN = 5
+
+; VkVertexInputRate, VkPolygonMode, VkCullModeFlagBits, VkFrontFace.
+#VK_VERTEX_INPUT_RATE_VERTEX = 0
+#VK_VERTEX_INPUT_RATE_INSTANCE = 1
+#VK_POLYGON_MODE_FILL = 0
+#VK_POLYGON_MODE_LINE = 1
+#VK_POLYGON_MODE_POINT = 2
+#VK_CULL_MODE_NONE = 0
+#VK_CULL_MODE_FRONT_BIT = $00000001
+#VK_CULL_MODE_BACK_BIT = $00000002
+#VK_CULL_MODE_FRONT_AND_BACK = $00000003
+#VK_FRONT_FACE_COUNTER_CLOCKWISE = 0
+#VK_FRONT_FACE_CLOCKWISE = 1
+
+; VkAttachmentLoadOp, VkAttachmentStoreOp, VkPipelineBindPoint,
+; VkSubpassContents, VkImageViewType, VkComponentSwizzle.
+#VK_ATTACHMENT_LOAD_OP_LOAD = 0
+#VK_ATTACHMENT_LOAD_OP_CLEAR = 1
+#VK_ATTACHMENT_LOAD_OP_DONT_CARE = 2
+#VK_ATTACHMENT_STORE_OP_STORE = 0
+#VK_ATTACHMENT_STORE_OP_DONT_CARE = 1
+#VK_PIPELINE_BIND_POINT_GRAPHICS = 0
+#VK_PIPELINE_BIND_POINT_COMPUTE = 1
+#VK_SUBPASS_CONTENTS_INLINE = 0
+#VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS = 1
+#VK_SUBPASS_EXTERNAL = $FFFFFFFF
+#VK_IMAGE_VIEW_TYPE_1D = 0
+#VK_IMAGE_VIEW_TYPE_2D = 1
+#VK_IMAGE_VIEW_TYPE_3D = 2
+#VK_COMPONENT_SWIZZLE_IDENTITY = 0
+
+; VkBufferUsageFlagBits and VkColorComponentFlagBits.
+#VK_BUFFER_USAGE_TRANSFER_SRC_BIT = $00000001
+#VK_BUFFER_USAGE_TRANSFER_DST_BIT = $00000002
+#VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT = $00000010
+#VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = $00000020
+#VK_BUFFER_USAGE_INDEX_BUFFER_BIT = $00000040
+#VK_BUFFER_USAGE_VERTEX_BUFFER_BIT = $00000080
+#VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT = $00000100
+#VK_COLOR_COMPONENT_R_BIT = $00000001
+#VK_COLOR_COMPONENT_G_BIT = $00000002
+#VK_COLOR_COMPONENT_B_BIT = $00000004
+#VK_COLOR_COMPONENT_A_BIT = $00000008
+
+; The stage and access bits a colour attachment needs.
+#VK_PIPELINE_STAGE_VERTEX_INPUT_BIT = $00000004
+#VK_PIPELINE_STAGE_VERTEX_SHADER_BIT = $00000008
+#VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT = $00000080
+#VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT = $00000400
+#VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT = $00000002
+#VK_ACCESS_UNIFORM_READ_BIT = $00000008
+#VK_ACCESS_COLOR_ATTACHMENT_READ_BIT = $00000080
+#VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT = $00000100
+
+Structure VkShaderModuleCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  codeSize.i
+  *pCode
+EndStructure
+
+Structure VkSpecializationMapEntry Align #PB_Structure_AlignC
+  constantID.l
+  offset.l
+  size.i
+EndStructure
+
+Structure VkSpecializationInfo Align #PB_Structure_AlignC
+  mapEntryCount.l
+  *pMapEntries
+  dataSize.i
+  *pData
+EndStructure
+
+Structure VkPipelineShaderStageCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  stage.l
+  module.i
+  *pName
+  *pSpecializationInfo
+EndStructure
+
+Structure VkVertexInputBindingDescription Align #PB_Structure_AlignC
+  binding.l
+  stride.l
+  inputRate.l
+EndStructure
+
+Structure VkVertexInputAttributeDescription Align #PB_Structure_AlignC
+  location.l
+  binding.l
+  format.l
+  offset.l
+EndStructure
+
+Structure VkPipelineVertexInputStateCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  vertexBindingDescriptionCount.l
+  *pVertexBindingDescriptions
+  vertexAttributeDescriptionCount.l
+  *pVertexAttributeDescriptions
+EndStructure
+
+Structure VkPipelineInputAssemblyStateCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  topology.l
+  primitiveRestartEnable.l
+EndStructure
+
+Structure VkPipelineViewportStateCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  viewportCount.l
+  *pViewports
+  scissorCount.l
+  *pScissors
+EndStructure
+
+Structure VkPipelineRasterizationStateCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  depthClampEnable.l
+  rasterizerDiscardEnable.l
+  polygonMode.l
+  cullMode.l
+  frontFace.l
+  depthBiasEnable.l
+  depthBiasConstantFactor.f
+  depthBiasClamp.f
+  depthBiasSlopeFactor.f
+  lineWidth.f
+EndStructure
+
+Structure VkPipelineMultisampleStateCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  rasterizationSamples.l
+  sampleShadingEnable.l
+  minSampleShading.f
+  *pSampleMask
+  alphaToCoverageEnable.l
+  alphaToOneEnable.l
+EndStructure
+
+Structure VkPipelineColorBlendAttachmentState Align #PB_Structure_AlignC
+  blendEnable.l
+  srcColorBlendFactor.l
+  dstColorBlendFactor.l
+  colorBlendOp.l
+  srcAlphaBlendFactor.l
+  dstAlphaBlendFactor.l
+  alphaBlendOp.l
+  colorWriteMask.l
+EndStructure
+
+Structure VkPipelineColorBlendStateCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  logicOpEnable.l
+  logicOp.l
+  attachmentCount.l
+  *pAttachments
+  blendConstants.f[4]
+EndStructure
+
+Structure VkPushConstantRange Align #PB_Structure_AlignC
+  stageFlags.l
+  offset.l
+  size.l
+EndStructure
+
+Structure VkPipelineLayoutCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  setLayoutCount.l
+  *pSetLayouts
+  pushConstantRangeCount.l
+  *pPushConstantRanges
+EndStructure
+
+Structure VkGraphicsPipelineCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  stageCount.l
+  *pStages
+  *pVertexInputState
+  *pInputAssemblyState
+  *pTessellationState
+  *pViewportState
+  *pRasterizationState
+  *pMultisampleState
+  *pDepthStencilState
+  *pColorBlendState
+  *pDynamicState
+  layout.i
+  renderPass.i
+  subpass.l
+  basePipelineHandle.i
+  basePipelineIndex.l
+EndStructure
+
+Structure VkAttachmentDescription Align #PB_Structure_AlignC
+  flags.l
+  format.l
+  samples.l
+  loadOp.l
+  storeOp.l
+  stencilLoadOp.l
+  stencilStoreOp.l
+  initialLayout.l
+  finalLayout.l
+EndStructure
+
+Structure VkAttachmentReference Align #PB_Structure_AlignC
+  attachment.l
+  layout.l
+EndStructure
+
+Structure VkSubpassDescription Align #PB_Structure_AlignC
+  flags.l
+  pipelineBindPoint.l
+  inputAttachmentCount.l
+  *pInputAttachments
+  colorAttachmentCount.l
+  *pColorAttachments
+  *pResolveAttachments
+  *pDepthStencilAttachment
+  preserveAttachmentCount.l
+  *pPreserveAttachments
+EndStructure
+
+Structure VkSubpassDependency Align #PB_Structure_AlignC
+  srcSubpass.l
+  dstSubpass.l
+  srcStageMask.l
+  dstStageMask.l
+  srcAccessMask.l
+  dstAccessMask.l
+  dependencyFlags.l
+EndStructure
+
+Structure VkRenderPassCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  attachmentCount.l
+  *pAttachments
+  subpassCount.l
+  *pSubpasses
+  dependencyCount.l
+  *pDependencies
+EndStructure
+
+Structure VkImageViewCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  image.i
+  viewType.l
+  format.l
+  components.VkComponentMapping
+  subresourceRange.VkImageSubresourceRange
+EndStructure
+
+Structure VkFramebufferCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  renderPass.i
+  attachmentCount.l
+  *pAttachments
+  width.l
+  height.l
+  layers.l
+EndStructure
+
+Structure VkRenderPassBeginInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  renderPass.i
+  framebuffer.i
+  renderArea.VkRect2D
+  clearValueCount.l
+  *pClearValues
+EndStructure
+
+Structure VkBufferCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  size.q
+  usage.l
+  sharingMode.l
+  queueFamilyIndexCount.l
+  *pQueueFamilyIndices
+EndStructure
