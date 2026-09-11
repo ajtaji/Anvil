@@ -1992,7 +1992,7 @@ EndProcedure
 ;  nothing handed one over; it is reported and never used for drawing.
 ;  `size` is the bytes known to be there.
 ; ======================================================================
-Procedure.i DspInstall(base.i, bus.i, size.i, pitch.i, w.i, h.i, depth.i)
+Procedure.i DspValidate(base.i, size.i, pitch.i, w.i, h.i, depth.i)
   Define bpp.i
 
   ; The firmware is allowed to give a depth other than the one asked
@@ -2003,7 +2003,6 @@ Procedure.i DspInstall(base.i, bus.i, size.i, pitch.i, w.i, h.i, depth.i)
   ElseIf depth = 16
     bpp = 2
   Else
-    dsp_err = #DSP_EDEPTH
     ProcedureReturn #DSP_EDEPTH
   EndIf
 
@@ -2015,7 +2014,6 @@ Procedure.i DspInstall(base.i, bus.i, size.i, pitch.i, w.i, h.i, depth.i)
   ; response bit can detect - and on the adopted path they are the ONLY
   ; line, because nobody else looked at the numbers at all.
   If w < 1 Or h < 1
-    dsp_err = #DSP_EMODE
     ProcedureReturn #DSP_EMODE
   EndIf
 
@@ -2035,21 +2033,47 @@ Procedure.i DspInstall(base.i, bus.i, size.i, pitch.i, w.i, h.i, depth.i)
   ; line below which the geometry stops being arithmetic and starts
   ; being nonsense.
   If w < 8 Or h < 16
-    dsp_err = #DSP_EMODE
     ProcedureReturn #DSP_EMODE
   EndIf
 
   If base = 0
-    dsp_err = #DSP_ENOBUFFER
     ProcedureReturn #DSP_ENOBUFFER
   EndIf
   If pitch = 0 Or pitch < (w * bpp)
-    dsp_err = #DSP_EPITCH
     ProcedureReturn #DSP_EPITCH
   EndIf
   If size < (pitch * h)
-    dsp_err = #DSP_ESIZE
     ProcedureReturn #DSP_ESIZE
+  EndIf
+  ProcedureReturn #DSP_OK
+EndProcedure
+
+Procedure.i DisplayAdoptValidate(base.i, pitch.i, w.i, h.i, depth.i)
+  If base = 0
+    ProcedureReturn #DSP_ENOBUFFER
+  EndIf
+  If w < 1 Or h < 1
+    ProcedureReturn #DSP_EARGS
+  EndIf
+  If pitch < 1
+    ProcedureReturn #DSP_EPITCH
+  EndIf
+  ProcedureReturn DspValidate(base, pitch * h, pitch, w, h, depth)
+EndProcedure
+
+Procedure.i DspInstall(base.i, bus.i, size.i, pitch.i, w.i, h.i, depth.i)
+  Define bpp.i
+  Define rc.i
+
+  rc = DspValidate(base, size, pitch, w, h, depth)
+  If rc <> #DSP_OK
+    dsp_err = rc
+    ProcedureReturn rc
+  EndIf
+  If depth = 32
+    bpp = 4
+  Else
+    bpp = 2
   EndIf
 
   dsp_bus   = bus
@@ -2433,17 +2457,11 @@ EndProcedure
 ;  for the same defect, so one reporter prints both.
 ; ======================================================================
 Procedure.i DisplayAdopt(base.i, pitch.i, w.i, h.i, depth.i)
-  If base = 0
-    dsp_err = #DSP_ENOBUFFER
-    ProcedureReturn #DSP_ENOBUFFER
-  EndIf
-  If w < 1 Or h < 1
-    dsp_err = #DSP_EARGS
-    ProcedureReturn #DSP_EARGS
-  EndIf
-  If pitch < 1
-    dsp_err = #DSP_EPITCH
-    ProcedureReturn #DSP_EPITCH
+  Define rc.i
+  rc = DisplayAdoptValidate(base, pitch, w, h, depth)
+  If rc <> #DSP_OK
+    dsp_err = rc
+    ProcedureReturn rc
   EndIf
   ; An adopted surface has no VideoCore bus address to report, because
   ; nothing handed one over. DisplayBusBase() answers 0 for it, which is

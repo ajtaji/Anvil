@@ -20,6 +20,7 @@ DISPLAY = (ROOT / "RaspberryPi4/Board/display.pi4").read_text(encoding="utf-8")
 CURSOR = (ROOT / "RaspberryPi4/Board/cursor_input.pi4").read_text(encoding="utf-8")
 UART = (ROOT / "RaspberryPi4/Lib/uart.pi4").read_text(encoding="utf-8")
 CORE_PARSE = (ROOT / "Anvil/Core/parse.pbi").read_text(encoding="utf-8")
+CORE_CONSOLE = (ROOT / "RaspberryPi4/Board/console.pi4").read_text(encoding="utf-8")
 
 
 def body(text: str, name: str) -> str:
@@ -100,14 +101,26 @@ def main() -> None:
     assert SCREEN.count("ScrCaptureSnapshot(@fb") == 2
     assert SCREEN.count("ScrCapturePixel(fb, pitch, rot") == 6
 
-    # Producer-side draining updates only the model. The renderer remains a
-    # ScreenPump concern, which is what turns a 45 KB help into one frame.
+    # Producer-side draining updates only the model AT THE PROMPT. The
+    # renderer remains a ScreenPump concern, which is what turns a 45 KB help
+    # into one frame.
+    #
+    # DURING THE BOOT LOG IT PAINTS, and that is the one exception. The
+    # decision lives in ConMirrorDrain (console.pi4) rather than in the UART,
+    # which still knows nothing about renderers, and the window is opened and
+    # closed by ScreenEarlyLogStart/Finish - so a long command at the prompt
+    # costs exactly what it always did.
     assert "Procedure UartMirrorSetDrain(" in UART
     mirror_put = UART[UART.index("Procedure uart_MirrorPut("):
                       UART.index("EndProcedure", UART.index("Procedure uart_MirrorPut("))]
     assert "uart_mirrorDrain()" in mirror_put
     assert "gConPaint" not in mirror_put
-    assert "UartMirrorSetDrain(@ConDrainRing)" in SCREEN
+    assert "UartMirrorSetDrain(@ConMirrorDrain)" in SCREEN
+    assert "UartMirrorSetDrain(@ConDrainRing)" not in SCREEN
+    at = CORE_CONSOLE.index("Procedure ConMirrorDrain()")
+    drain_cb = CORE_CONSOLE[at:CORE_CONSOLE.index("EndProcedure", at)]
+    assert "gConLiveBoot" in drain_cb and "gConDrainBusy" in drain_cb
+    assert "ScreenPump()" in drain_cb and "ConDrainRing()" in drain_cb
 
     # The alive glint is advanced by the existing core-service spin and has a
     # bounded presented-pixel seam. It must never grow back into a periodic

@@ -236,6 +236,349 @@ Procedure ScreenDsiEarlyCache(armed.i)
   EndIf
 EndProcedure
 
+; ======================================================================
+;  THE SCREEN COMES UP BEFORE THE SETTINGS EXIST, AND IS CORRECTED AFTER
+; ----------------------------------------------------------------------
+;  WHAT THIS REPLACED, AND WHY THE OLD REASONING WAS RIGHT AND STILL HAD
+;  TO GO. boot.pi4's header argued the screen must come up AFTER the
+;  settings store, because which screen the console goes on and which way
+;  up it sits are settings - and a screen brought up on a default would
+;  have to be torn down and rebuilt when the real answer arrived,
+;  "erasing the boot log it was brought up early to carry."
+;
+;  Every clause of that is true. The conclusion followed only because a
+;  rebuild was the only way to change the geometry, and because the boot
+;  log existed nowhere but on the glass. Both of those are now false:
+;
+;    THE GEOMETRY CHANGES IN PLACE. ScrDsiReadoptBegin re-points the HVS
+;    at the other fixed display list and re-installs the drawing surface.
+;    It touches no panel power, no reset, no DSI host, no clock, no pixel
+;    valve and no allocation - the panel never stops scanning. On HDMI
+;    there is no re-adoption at all: the firmware's surface does not
+;    change and only the magnification can, which is a redraw.
+;
+;    THE BOOT LOG EXISTS OFF THE GLASS. Anvil/Core/boot_transcript.pbi
+;    retains the byte stream the console was built from, so a grid
+;    rebuilt at a new geometry is reconstructed from what was SAID.
+;    Restoring from retained state, never from stale pixels: the pixels
+;    are the wrong shape, which is the entire reason the geometry moved.
+;
+;  SO THE COST THAT PARAGRAPH ACCEPTED IS PAID BACK. The USB, PCIe and
+;  boot-medium lines used to reach the wire before the glass existed.
+;  They are now on the panel, as they happen, which is the whole of what
+;  was asked for.
+;
+;  AND THE COMMON CASE COSTS NOTHING. SETTINGS.TXT names no rotation on
+;  this bench, so the stored answer IS the default, ScreenApplyStoredGeometry
+;  finds nothing to change and returns without touching the screen.
+; ======================================================================
+
+Global *gScreenReadoptPaint
+Global gScreenReadoptSuspended.i
+
+; ----------------------------------------------------------------------
+;  ScreenRebuildAtGeometry - THE SHARED COMPOSITION TAIL.
+;
+;  The surface is whatever it now is; this rebuilds everything composed
+;  ON it and puts the retained boot log back. It is the same tail
+;  ScreenUpOn runs after its two acquisition branches, and it is shared
+;  for the same reason: NOTHING after the surface differs between the two
+;  screens, so a second copy of it would be where a DSI assumption and an
+;  HDMI assumption start to diverge.
+;
+;  THE REPLAY GOES STRAIGHT INTO THE GRID AND NOT THROUGH THE RING. The
+;  transcript is taken in ConDrainRing (console.pi4), so feeding it back
+;  through the ring would capture it a second time and double the log on
+;  the next geometry change. ConGridPutc is below that tap, which is also
+;  why capture may stay armed across this: the lines printed after the
+;  rebuild are captured exactly once, in order, as they arrive.
+;
+;  IT ENDS WITH ONE PRESENT OF THE WHOLE SURFACE. Every renderer's own
+;  present covers the band it painted and the banner band is not part of
+;  the grid, so this is the one call that puts the anvil on the glass.
+; ----------------------------------------------------------------------
+Procedure ScreenRebuildAtGeometry()
+  Define i.i
+  Define c.i
+
+  ; THE GPU'S STATE IS DERIVED FROM A GEOMETRY THAT NO LONGER EXISTS, and
+  ; it has to be told so BEFORE anything is drawn - the same statement
+  ; ScreenDetach makes when the console leaves a surface. Ownership goes
+  ; back to the CPU/DMA tier here and the GPU picks the console up again
+  ; the next time it is asked to; a renderer pointer moved out from under
+  ; a GPU that still believed it owned the frame is how a cursor ends up
+  ; drawn by two things at once.
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  V3dConInvalidate()
+  gV3dConOn = 0
+  gCursorGpuOwned = 0
+  CompilerEndIf
+
+  gDma = ScreenDmaUp()
+  DisplayAutoFlush(1)
+  gScreenBg = DisplayRGB(0, 0, 40)
+  DisplayColour(DisplayRGB(226, 232, 240), gScreenBg)
+  DisplayClear(gScreenBg)
+  DrawBanner()
+  DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+  ConGridInit(DisplayCols(), DisplayRows())
+  ConSetRenderer(@ConPaintDma)
+  UartMirrorSetDrain(@ConMirrorDrain)
+
+  ; THE RETAINED LOG, FROM BYTE ZERO, EVERY TIME. There is no cursor to
+  ; get wrong: a rebuild that fails half way clears the grid and walks
+  ; again rather than resuming into a prefix nobody can account for.
+  i = 0
+  While i < BootTranscriptCount()
+    c = BootTranscriptAt(i)
+    If c < 0
+      Break
+    EndIf
+    ConGridPutc(c)
+    i = i + 1
+  Wend
+
+  ; THE KEYBOARD'S RECTANGLES WERE DERIVED FROM THE OLD SURFACE and every
+  ; one of them is now a guess - the same statement TouchKeyboardPayloadResume
+  ; makes about a surface a payload had. The layout is re-taken against
+  ; the live metrics on the next service tick.
+  TouchKeyboardOverlayReset()
+
+  ; AND SO IS EVERY TOUCH EVENT STILL IN THE QUEUE. The rotation or the
+  ; size may have changed a line ago; anything sampled before that was
+  ; mapped against a surface that no longer exists, and a finger that went
+  ; down on the old geometry must not come up on the new one. This is the
+  ; same call, for the same reason, that ScreenUpOn makes after a move.
+  HwTouchFlush()
+
+  ScrPresentAll()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE DSI HALF. Suspend painting, then ask the HVS for the other slot.
+;
+;  RENDERING STAYS SUSPENDED WHILE THE REQUEST IS PENDING, and that is
+;  not caution - it is the only honest state. Linux writes SCALER_DISPLISTX
+;  and does not believe the switch until SCALER_DISPLACTX names that list
+;  (rpi-6.12.y_vc4_hvs.c:1151-1174, 1248-1345); until then the software
+;  geometry and the scanned geometry may disagree, and painting across
+;  that is a frame torn between two shapes.
+; ----------------------------------------------------------------------
+Procedure.i ScreenDsiReadoptStart(rot.i, scale.i)
+  If gScreen = 0 Or gScrSrc <> #SCR_SRC_DSI Or gScreenReadoptSuspended <> 0
+    ProcedureReturn 0
+  EndIf
+  *gScreenReadoptPaint = *gConPaint
+  UartMirrorSetDrain(0)
+  ConSetRenderer(0)
+  PointerHide()
+  gScreenReadoptSuspended = 1
+  If ScrDsiReadoptBegin(rot, scale) = 0
+    ConSetRenderer(*gScreenReadoptPaint)
+    UartMirrorSetDrain(@ConMirrorDrain)
+    gScreenReadoptSuspended = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Service a staged change. 0 while pending, 1 once the requested list is
+; ACTIVE and the console has been rebuilt at the new geometry with the
+; retained boot log back in it.
+Procedure.i ScreenDsiReadoptService()
+  If gScreenReadoptSuspended = 0
+    ProcedureReturn 1
+  EndIf
+  If ScrDsiReadoptResolve() = 0
+    ProcedureReturn 0
+  EndIf
+  ScreenRebuildAtGeometry()
+  gScreenReadoptSuspended = 0
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenDsiReadoptAbandon - the bounded caller gave up.
+;
+;  THE REQUEST CANNOT SIMPLY BE FORGOTTEN. DISPLIST has been written and
+;  the block may latch the staged slot at any later frame. So the staged
+;  slot is rewritten to describe exactly what the ACTIVE one describes
+;  (ScrDsiReadoptAbandon -> HvsFlipAbandon), which makes the two slots
+;  identical and the outcome of a late latch irrelevant - instead of
+;  leaving a picture that might turn itself over minutes later.
+;
+;  The software geometry was never changed while pending, so putting the
+;  old renderer back is putting the console back to what the panel is
+;  actually scanning.
+; ----------------------------------------------------------------------
+Procedure ScreenDsiReadoptAbandon()
+  If gScreenReadoptSuspended = 0
+    ProcedureReturn
+  EndIf
+  ScrDsiReadoptAbandon()
+  ConSetRenderer(*gScreenReadoptPaint)
+  UartMirrorSetDrain(@ConMirrorDrain)
+  gScreenReadoptSuspended = 0
+  ConRepaint()
+  ScrPresentAll()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE HDMI HALF, AND IT IS A DIFFERENT CONTRACT ON PURPOSE.
+;
+;  NOTHING HERE MAY BORROW A DSI ASSUMPTION AND THERE IS NOTHING HERE FOR
+;  DSI TO BORROW. An HDMI surface is the firmware's: this monitor did not
+;  choose its address, its stride or its scanout, there is no HVS display
+;  list of ours pointing at it, there is no second buffer and there is no
+;  transpose. ScrRotPick answers 0 for HDMI whatever the store says - a
+;  console moved off a turned panel must not inherit the panel's turn -
+;  so the only stored geometry an HDMI console can be wrong about is the
+;  MAGNIFICATION, and correcting that is a redraw of the composition and
+;  nothing else.
+;
+;  A rotation reaching here would be a bug in ScrRotPick rather than
+;  something to act on, so it is refused loudly rather than applied.
+; ----------------------------------------------------------------------
+Procedure.i ScreenHdmiRescale(scale.i)
+  If gScreen = 0 Or gScrSrc <> #SCR_SRC_HDMI
+    ProcedureReturn 0
+  EndIf
+  If ScrScaleOk(scale) = 0
+    ProcedureReturn 0
+  EndIf
+  PointerHide()
+  gScrScale = scale
+  DisplayScale(gScrScale)
+  ScreenRebuildAtGeometry()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenApplyStoredGeometry - THE ONE CALL THE BOOT PATH MAKES.
+;
+;  The screen came up on the defaults because the settings store did not
+;  exist yet. It exists now. If it names the same geometry - which is the
+;  case on any board whose SETTINGS.TXT says nothing about the screen -
+;  this returns 0 having touched nothing at all.
+;
+;  Returns 1 when the console was rebuilt, 0 when nothing needed doing or
+;  the change could not be made. Every path prints, because a screen that
+;  changes shape at boot and a screen that does not must be told apart
+;  from the wire.
+; ----------------------------------------------------------------------
+Procedure.i ScreenApplyStoredGeometry()
+  Define rot.i
+  Define scale.i
+  Define deadline.i
+
+  If gScreen = 0
+    ProcedureReturn 0
+  EndIf
+
+  rot = ScrRotWanted(gScrSrc)
+  ; THE WIDTH HANDED TO THE SCALE RULE IS THE CONSOLE'S OWN, AND THE TWO
+  ; SCREENS GET IT FROM DIFFERENT PLACES. It is used for one thing - the
+  ; eighty-column cap - and a wrong one makes the type smaller for no
+  ; reason and then makes this procedure believe the store disagrees with
+  ; the screen at every boot.
+  ;
+  ; On the panel it has to be the width AT THE REQUESTED ROTATION, which
+  ; the live surface does not know yet: turning the console is exactly
+  ; what is being decided here. On HDMI there is no rotation and the live
+  ; surface is the answer - and it is the same expression ScreenUpOn used
+  ; to compute the magnification the screen came up with, so the
+  ; comparison below cannot disagree with the bring-up.
+  If gScrSrc = #SCR_SRC_DSI
+    scale = ScrScaleWanted(gScrSrc, ScrLogicalW(rot, #MON_FB_PANEL_W, #MON_FB_PANEL_H))
+  Else
+    scale = ScrScaleWanted(gScrSrc, DisplayWidth())
+  EndIf
+  If rot = gScrRot And scale = gScrScale
+    ProcedureReturn 0
+  EndIf
+
+  BootTimingMark(#BTM_READOPT_BEGIN, rot, scale)
+
+  ; ---- HDMI: the magnification, and only the magnification -----------
+  If gScrSrc <> #SCR_SRC_DSI
+    If rot <> gScrRot
+      Print("!! the settings store asks for rotation ")
+      PrintDec(rot)
+      PrintN(" on an HDMI display, which")
+      PrintN("   this monitor does not turn - the firmware hands HDMI over already")
+      PrintN("   landscape. The rotation was ignored; nothing on the screen changed.")
+      PrintN("   Rotation is a property of the DSI panel and is applied there only.")
+    EndIf
+    If scale = gScrScale
+      ProcedureReturn 0
+    EndIf
+    Print("The settings store asks for magnification ")
+    PrintDec(scale)
+    Print(" and the screen came up")
+    Print(" at ")
+    PrintDec(gScrScale)
+    PrintN(", so the console is being redrawn at that size now.")
+    If ScreenHdmiRescale(scale) = 0
+      PrintN("!! that magnification was refused, so the console was left exactly as")
+      PrintN("   it was. Only 1 to 8 are accepted; type screen scale to see what is")
+      PrintN("   in the store and screen scale auto to remove it.")
+      ProcedureReturn 0
+    EndIf
+    BootTimingMark(#BTM_READOPT_DONE, BootTranscriptCount(), BootTranscriptLost())
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- the DSI panel: in place, without the panel ever stopping ------
+  Print("The settings store asks for the console turned ")
+  PrintDec(rot)
+  Print(" degrees at")
+  Print(" magnification ")
+  PrintDec(scale)
+  PrintN(". The panel keeps scanning throughout; it")
+  PrintN("is neither powered down nor re-initialised, and the boot log so far is")
+  PrintN("put back from what was printed rather than from what is on the glass.")
+
+  If ScreenDsiReadoptStart(rot, scale) = 0
+    PrintN("!! that geometry was refused before anything was changed, so the")
+    PrintN("   console is still exactly as it came up. The rotation must be 0, 90,")
+    PrintN("   180 or 270 and the magnification 1 to 8; type screen rotate and")
+    PrintN("   screen scale to see what the store actually says.")
+    ProcedureReturn 0
+  EndIf
+
+  ; THE WAIT IS BOUNDED AND THE BOUND IS ARGUED. The HVS latches a newly
+  ; selected display list at a frame boundary, so at this panel's 60 Hz
+  ; the answer is due within about 17 ms; 500 ms is thirty frames. A
+  ; block that has not taken the list in thirty frames is not scanning,
+  ; which is a different fault entirely and one an operator has to be
+  ; told about rather than have the boot hang on.
+  deadline = Ticks() + TickHz() / 2
+  While ScreenDsiReadoptService() = 0
+    If Ticks() > deadline
+      ScreenDsiReadoptAbandon()
+      PrintN("!! the display controller did not take the new display list within")
+      PrintN("   thirty frames, so the console has been left at the geometry it")
+      PrintN("   came up with and the request has been withdrawn - both of the")
+      PrintN("   controller's list slots now describe the picture on the glass, so")
+      PrintN("   a late switch cannot change it. The panel is still scanning and")
+      PrintN("   the serial line is unaffected. Type screen rotate to try again.")
+      ProcedureReturn 0
+    EndIf
+  Wend
+
+  BootTimingMark(#BTM_READOPT_DONE, BootTranscriptCount(), BootTranscriptLost())
+  If BootTranscriptLost() > 0
+    Print("!! the boot log was ")
+    PrintDec(BootTranscriptLost())
+    PrintN(" bytes longer than the retained buffer holds,")
+    PrintN("   so what is on the screen above is the BEGINNING of the log and not")
+    PrintN("   all of it. The earliest lines are the ones kept, deliberately: they")
+    PrintN("   are where a hang shows. The serial line and the network console")
+    PrintN("   received every byte.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i ScreenUpOn(src.i, index.i)
   Define w.i
   Define h.i
@@ -246,6 +589,8 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; not leave permission for a later manual screen command to re-enable cache.
   earlyCache = ScreenDsiEarlyCacheTake()
 
+  BootTimingMark(#BTM_SCREEN_BEGIN, src, index)
+
   ; ---- 0. WHICH SCREEN ------------------------------------------------
   ; The panel that is physically plugged in wins over a firmware default
   ; - see ScrChoose. Asking costs one I2C conversation and the answer is
@@ -255,6 +600,7 @@ Procedure.i ScreenUpOn(src.i, index.i)
     DisplayStandardTags()
     src = ScrChoose(ScrDsiPanelSeen(), DisplayCount())
   EndIf
+  BootTimingMark(#BTM_SRC_CHOSEN, src, 0)
 
   ; ---- 0b. WHICH WAY UP, FOR WHICHEVER SCREEN THAT TURNED OUT TO BE --
   ; ONE ASSIGNMENT, BOTH BRANCHES, AND IT IS DELIBERATELY ABOVE THEM.
@@ -315,6 +661,13 @@ Procedure.i ScreenUpOn(src.i, index.i)
       PrintN("   The screen has been left off and the serial line is unaffected.")
       ProcedureReturn 0
     EndIf
+
+    ; THE PANEL IS LIT AND SCANNING AS OF THIS LINE, and that is a
+    ; separate event from having something to draw on: the seventh-pass
+    ; sequence ended with the pixel valve running, and the surface over
+    ; it is the next step. One tick for both would hide whichever of the
+    ; two is the slow one.
+    BootTimingMark(#BTM_DSI_LIT, 0, 0)
 
     rc = ScrDsiSurface()
     If rc <> #DSP_OK
@@ -470,6 +823,7 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; Waiting longer for a request that is shaped wrong is superstition,
   ; so the wait is not kept "just in case".
   DisplayInit(1920, 1080, 32)
+  BootTimingMark(#BTM_FW_SURFACE, DisplayWidth(), DisplayHeight())
 
   ; A SCREEN TOO SMALL FOR THE BANNER IS NO SCREEN. The console would be
   ; given a negative height and report "0 cols x -7 rows", which is what
@@ -572,7 +926,9 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; NC by CacheEnable. Turning normal code/data caching on here accelerates
   ; the first visible clear/banner without changing panel power/reset or DMA
   ; setup. HDMI deliberately does nothing here; see ScreenDsiEarlyCache.
+  BootTimingMark(#BTM_ACQUIRED, DisplayBase(), DisplayPitch())
   ScreenDsiEarlyCache(earlyCache)
+  BootTimingMark(#BTM_MAPPED, gCacheOn, 0)
 
   ; THE BLITTER, BEFORE ANYTHING IS DRAWN. It has to come after the
   ; surface is installed, whichever way it was got, because it is bound
@@ -586,6 +942,7 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; is the property that makes turning the engine on safe on a program
   ; whose whole job is to still be there when nothing else is.
   gDma = ScreenDmaUp()
+  BootTimingMark(#BTM_DMA_READY, gDma, 0)
 
   ; Per-glyph flushing. The alternative is flushing the whole surface
   ; after every batch, and at 1920x1080x4 that is 8.29 MB of cache
@@ -604,8 +961,13 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; console rectangle, so whatever the firmware left in the logo band
   ; would survive forever if it were not cleared here.
   DisplayClear(DisplayRGB(0, 0, 40))
+  ; INTO RAM. Nothing is on the glass yet at 90 or 270: this cleared the
+  ; buffer the console draws into, and the panel is scanning the other
+  ; one until the present below.
+  BootTimingMark(#BTM_CLEAR_DONE, 0, 0)
 
   DrawBanner()
+  BootTimingMark(#BTM_BANNER_DRAWN, 0, 0)
 
   ; The console starts BELOW the band. Everything printed from here on
   ; scrolls inside that rectangle and cannot reach the anvil.
@@ -643,13 +1005,17 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; 8 KiB staging ring before the prompt pumps again. Drain those bytes into
   ; the shared model as they are produced, but do not render here; ScreenPump
   ; paints the final model once after the command returns.
-  UartMirrorSetDrain(@ConDrainRing)
+  UartMirrorSetDrain(@ConMirrorDrain)
 
   ; THE BANNER BAND IS NOT PART OF THE GRID, so no repaint will ever
   ; present it. On HDMI, and on the panel at 0 and 180, this costs one
   ; comparison; on a rotated panel it is the one pass that puts the
   ; anvil on the glass.
   ScrPresentAll()
+  ; ON THE PANEL. This is the first tick at which the pixels above are the
+  ; pixels being scanned, and the gap between it and #BTM_BANNER_DRAWN is
+  ; what the transpose costs on a turned panel - zero on HDMI and at 0/180.
+  BootTimingMark(#BTM_PRESENTED, gScrRot, gScrScale)
 
   ; Everything from here on - including this header - arrives through the
   ; mirror ring, the one output hub, so it lands in the shared grid whichever
@@ -681,6 +1047,10 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ScreenReportActive()
   PrintN("Everything this monitor prints from now on goes to both the screen and")
   PrintN("this serial line. Type screen off to turn it off again.")
+  ; THE CONSOLE IS LIVE AS OF HERE, which is the event that matters to
+  ; anybody watching a boot: every line printed after this paints as it is
+  ; printed, instead of queueing for a screen that does not exist yet.
+  BootTimingMark(#BTM_CONSOLE_UP, DisplayCols(), DisplayRows())
   ProcedureReturn 1
 EndProcedure
 
@@ -1575,6 +1945,14 @@ Procedure CmdScreen()
     ScreenReportActive()
     ProcedureReturn
   EndIf
+  ; ---- screen timing ---------------------------------------------------
+  ; Reads the retained record and touches no hardware at all: no mailbox,
+  ; no panel, no HVS, no I2C. It is safe on a board whose screen is off
+  ; and safe while a payload's result is still in DRAM.
+  If WordIs("timing") <> 0 Or WordIs("times") <> 0 Or WordIs("boot") <> 0
+    BootTimingReport()
+    ProcedureReturn
+  EndIf
   If WordIs("off") <> 0
     ScreenDown()
     ProcedureReturn
@@ -1662,6 +2040,10 @@ Procedure CmdScreen()
     PrintN("                     are to the inch on the screen; this overrides it")
     PrintN("                     for eyes or a bench distance it does not suit.")
     PrintN("                     screen scale auto goes back to the calculation")
+    PrintN("  screen timing      what this boot spent its milliseconds on, read")
+    PrintN("                     back from the retained record the boot wrote.")
+    PrintN("                     Painting into memory and presenting to the panel")
+    PrintN("                     are separate rows. Touches no hardware")
     PrintN("  The console tier is auto-selected at boot by driver availability,")
     PrintN("  V3D preferred. Override it:")
     CompilerIf #ANVIL_V3D_CONSOLE = 1

@@ -65,21 +65,46 @@ Procedure CacheFlushRange(lo.i, hi.i)
   a64_barrier()                 ; dsb sy + isb
 EndProcedure
 
-Procedure AutoFlush()
-  ; The autoboot record's one line, cleaned to the point of COHERENCY.
-  ; See the note above on why this is civac and the payload flush is
-  ; cvau. #AB_BASE is 4 KiB aligned ($001FF000 since 2026-09-08, when the
-  ; record left the image window because that window stopped having a
-  ; top) and therefore 64-byte aligned, so one line still covers all
-  ; three words.
-  gFlushAddr = #AB_BASE
-  ASM
-    adrp x9, global_gflushaddr
-    add  x9, x9, #:lo12:global_gflushaddr
-    ldr  x9, [x9]
-    dc civac, x9
-  EndASM
+; ----------------------------------------------------------------------
+;  CacheCleanRangePoc - clean a range to the point of COHERENCY.
+;
+;  THE SISTER OF CacheFlushRange AND NOT A DUPLICATE OF IT. That one is
+;  cvau + ic ivau, which is what INSTRUCTION FETCH needs and is all a
+;  payload flush needs. This one is civac, which is what putting bytes in
+;  DRAM for somebody else to read needs - a host after a reset, or a bus
+;  master. Same family, one letter apart, and only one of them is right
+;  for each job; the header above is where that distinction is argued.
+;
+;  The rounding is the same shift-don't-mask rule CacheFlushRange carries
+;  and for the same reason: "& $FFFFFFC0" clears the top half of a
+;  64-bit address as well as the low six bits, so a clean of anything in
+;  the high window would clean lines four gigabytes away, silently and
+;  looking entirely normal in a listing.
+; ----------------------------------------------------------------------
+Procedure CacheCleanRangePoc(lo.i, hi.i)
+  Define a.i
+  a = (lo >> 6) << 6
+  While a <= hi
+    gFlushAddr = a
+    ASM
+      adrp x9, global_gflushaddr
+      add  x9, x9, #:lo12:global_gflushaddr
+      ldr  x9, [x9]
+      dc civac, x9
+    EndASM
+    a = a + 64
+  Wend
   a64_barrier()
+EndProcedure
+
+Procedure AutoFlush()
+  ; The autoboot record's three words, cleaned to the point of COHERENCY.
+  ; #AB_BASE is 4 KiB aligned ($001FF000 since 2026-09-08, when the
+  ; record left the image window because that window stopped having a
+  ; top) and therefore 64-byte aligned, so this is still exactly one
+  ; line - the range is written out rather than assumed so that a record
+  ; that grows past 64 bytes cannot half-reach DRAM.
+  CacheCleanRangePoc(#AB_BASE, #AB_BASE + 23)
 EndProcedure
 
 ; ======================================================================

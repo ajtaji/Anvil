@@ -1,0 +1,542 @@
+; ======================================================================
+;  THE RETAINED BOOT-TIMING RECORD
+; ----------------------------------------------------------------------
+;  WHAT IT IS FOR. The first thing anybody sees of this monitor is the
+;  glass, and "the banner was slow" is not a measurement. This record is
+;  a fixed table of (event, tick) rows written as the boot happens and
+;  left in DRAM afterwards, so the question "where did the seconds go"
+;  is answered by reading the board rather than by watching it.
+;
+;  IT SURVIVES THE BOOT IT DESCRIBES. Every mark is in DRAM before the
+;  next line of code runs, so a board that hangs in the radio still
+;  carries the complete record of everything up to the hang, and a board
+;  that resets carries the previous boot's record until the next boot's
+;  BootTimingBegin() overwrites it. That is the whole reason it is not a
+;  Global: BSS is zeroed four instructions into _start, and a NoClear
+;  Global's address moves whenever anything above it changes size - so a
+;  record read back by a host that has just reflashed the board would be
+;  read at the wrong address, silently.
+;
+;  PAINTING INTO RAM AND PRESENTING TO THE PANEL ARE DIFFERENT EVENTS
+;  AND THEY HAVE DIFFERENT IDS. #BTM_CLEAR_DONE and #BTM_BANNER_DRAWN
+;  are pixels in a buffer; #BTM_PRESENTED is the first time those pixels
+;  are what the panel is scanning. On HDMI, and on the panel at rotation
+;  0 and 180, the two are microseconds apart because the drawn buffer IS
+;  the scanned one; at 90 and 270 they are a whole transpose apart.
+;  Reporting one and calling it the other is how "first paint" gets
+;  claimed for a picture nobody could see.
+;
+; ----------------------------------------------------------------------
+;  WHERE IT LIVES, AND WHY THAT ADDRESS
+; ----------------------------------------------------------------------
+;  IT IS THE LAST PAGE OF THE DSI FRAMEBUFFER WINDOW, which memmap.pi4
+;  reserves as 8 MiB and uses 2 x 4,096,000 bytes of:
+;
+;    #MON_FB_SCAN  $08A00000 .. $08DE7FFF   what the HVS scans
+;    #MON_FB_DRAW  $08E00000 .. $091E7FFF   what a turned console draws
+;    ...spare...   $091E8000 .. $091FFFFF   96 KiB, in memmap.pi4's own
+;                                           words "with 96 KiB to spare"
+;
+;  Every requirement a retained record has is already true of that page,
+;  and true because the DISPLAY owns the window - which is the right
+;  owner for a record about when the display came up:
+;
+;    the address cannot move        - it is arithmetic on a constant in
+;                                     memmap.pi4, not on the image size
+;                                     and not on a BSS layout
+;    _start cannot erase it         - it is not BSS
+;    a payload cannot land on it    - the window is outside #PAY0 and
+;                                     #PAY1, so InPayload() refuses it
+;    `w`/`fill`/`copy` refuse it    - HwMonRegion 3 already names the
+;                                     whole window (memmap.pi4), so no
+;                                     new region has to be declared for
+;                                     this and no typo can reach it
+;    nothing else writes it         - the HVS display list covers
+;                                     #MON_FB_SCAN for #MON_FB_BYTES and
+;                                     the transpose target covers
+;                                     #MON_FB_DRAW for #MON_FB_BYTES;
+;                                     BootTimingClearOfSurfaces() is that
+;                                     statement as arithmetic rather than
+;                                     as this sentence, and the gate
+;                                     executes it
+;
+;  AND IT IS NON-CACHEABLE BY CONSTRUCTION, which is the property that
+;  makes the record trustworthy. CacheEnable() maps
+;  #MON_FB_LO..#MON_FB_HI + 1 Normal Non-Cacheable in ONE range
+;  (Board/cache.pi4:CacheMapNc), for the display's sake, and this page is
+;  inside that range. Before CacheEnable() the D-cache is off entirely.
+;  So a mark is in DRAM the instant the store retires, at every point in
+;  the boot, with the MMU on or off.
+;
+;  THE CLEAN IS STILL DONE AND IT IS NOT SUPERSTITION. BootTimingFlush()
+;  cleans the lines a mark touched to the point of COHERENCY, through the
+;  same primitive the autoboot record uses. If this page ever stops being
+;  covered by CacheMapNc - a narrowed range, a rebuilt table, a
+;  rotation-dependent mapping - the record goes on being correct instead
+;  of going quietly stale, and a stale timing record is worse than none
+;  because it looks like a measurement.
+; ======================================================================
+
+; The last page of the DSI window. Derived, not typed: if memmap.pi4 ever
+; moves or resizes that window this follows it.
+#BTM_BASE  = #MON_FB_HI + 1 - $00001000
+#BTM_BYTES = $00001000
+
+; "BOOTTIME" as eight ASCII bytes, little-endian in a .i, and positive in
+; a signed one so a comparison cannot go negative on a stale read.
+#BTM_MAGIC = $454D4954544F4F42
+
+; Layout version. A reader checks it: a record written by an older image
+; must be REFUSED, not reinterpreted, because a shifted field reads as a
+; plausible number rather than as an error.
+#BTM_VERSION = 1
+
+; ---- the 64-byte header ----------------------------------------------
+#BTM_OFF_MAGIC    = 0     ; #BTM_MAGIC
+#BTM_OFF_VERSION  = 8     ; #BTM_VERSION
+#BTM_OFF_HZ       = 16    ; the architectural counter's frequency, so a
+                          ; host turns ticks into milliseconds without
+                          ; assuming 54 MHz
+#BTM_OFF_COUNT    = 24    ; rows written
+#BTM_OFF_SLOTS    = 32    ; #BTM_SLOTS, so a reader never walks past the
+                          ; end of a record written by a different build
+#BTM_OFF_LOST     = 40    ; rows refused because the table was full
+#BTM_OFF_GUARD    = 48    ; magic ! count ! hz - see BootTimingValid()
+#BTM_OFF_BASE0    = 56    ; the tick the header itself was stamped at,
+                          ; a few instructions before row 0. It is here so
+                          ; a host can see what writing the header cost;
+                          ; the ZERO every row is measured from is row 0's
+                          ; own tick - see BootTimingMsAt
+#BTM_HEADER       = 64
+
+; ---- one 32-byte row --------------------------------------------------
+#BTM_SLOT_BYTES   = 32
+#BTM_SLOT_ID      = 0
+#BTM_SLOT_TICKS   = 8
+#BTM_SLOT_V1      = 16
+#BTM_SLOT_V2      = 24
+; 64 rows is three times what a boot writes. The whole table is
+; 64 + 64 * 32 = 2,112 bytes, inside the 4 KiB page with room to grow.
+#BTM_SLOTS        = 64
+
+; ======================================================================
+;  THE EVENT IDS. THESE ARE A WIRE FORMAT - a host reads them back and
+;  names them. Add at the end; never renumber.
+; ======================================================================
+#BTM_ENTRY         = 1   ; Main: the port adopted, the ARM clock raised
+                         ; and the counter proven to move. The zero of
+                         ; every other row. v1 = measured ARM Hz
+#BTM_SCREEN_BEGIN  = 2   ; ScreenUpOn entered
+#BTM_SRC_CHOSEN    = 3   ; v1 = #SCR_SRC_*, and that decides which of the
+                         ; two acquisition contracts below ran
+#BTM_DSI_LIT       = 4   ; DSI ONLY: the panel is powered, initialised
+                         ; and the pixel valve is running
+#BTM_FW_SURFACE    = 5   ; HDMI ONLY: the firmware handed a framebuffer
+                         ; over. v1 = width, v2 = height
+#BTM_ACQUIRED      = 6   ; a drawing surface is installed, either way.
+                         ; v1 = base, v2 = pitch
+#BTM_MAPPED        = 7   ; the cached MMU is on over it. v1 = rc
+#BTM_DMA_READY     = 8   ; the blitter. v1 = 1 when the engine bound
+#BTM_CLEAR_DONE    = 9   ; INTO RAM: the whole surface is background
+#BTM_BANNER_DRAWN  = 10  ; INTO RAM: the anvil, the title and the build
+#BTM_PRESENTED     = 11  ; ON THE PANEL: the first present of the whole
+                         ; surface has returned
+#BTM_CONSOLE_UP    = 12  ; the grid and a renderer are live, so every
+                         ; later boot line paints as it is printed
+#BTM_CONFIG_BEGIN  = 13  ; BootConfigUp: PCIe, xHCI, USB, the boot medium
+                         ; and SETTINGS.TXT - the slow half
+#BTM_CONFIG_END    = 14
+#BTM_READOPT_BEGIN = 15  ; the store named a geometry the default boot
+                         ; did not use. v1 = rotation, v2 = magnification
+#BTM_READOPT_DONE  = 16  ; that geometry is live and the retained boot
+                         ; transcript has been replayed into it.
+                         ; v1 = transcript bytes, v2 = bytes lost
+#BTM_TOUCH_END     = 17
+#BTM_V3D_END       = 18  ; v1 = 1 when the GPU owns the console
+#BTM_NET_BEGIN     = 19  ; BootNetUp entered
+#BTM_NET_END       = 20
+#BTM_PROMPT        = 21  ; the first "pmf> "
+
+Procedure.i BootTimingSlotAddr(i.i)
+  ProcedureReturn #BTM_BASE + #BTM_HEADER + i * #BTM_SLOT_BYTES
+EndProcedure
+
+; The record's last byte. The table is what is written; the rest of the
+; page is reserved and left alone.
+Procedure.i BootTimingTop()
+  ProcedureReturn #BTM_BASE + #BTM_HEADER + #BTM_SLOTS * #BTM_SLOT_BYTES - 1
+EndProcedure
+
+; THE CLAIM IN THE HEADER, AS ARITHMETIC. 1 when the record's page is
+; inside the reserved DSI window and clear of both scanout surfaces.
+; It is a procedure and not a comment because the constants it compares
+; live in memmap.pi4 and this file is not their owner - so if the window
+; or a surface ever moves, the gate that executes this goes red instead
+; of the record quietly becoming part of the picture.
+Procedure.i BootTimingClearOfSurfaces()
+  If #BTM_BASE < #MON_FB_LO Or BootTimingTop() > #MON_FB_HI
+    ProcedureReturn 0
+  EndIf
+  If #BTM_BASE < (#MON_FB_SCAN + #MON_FB_BYTES) And BootTimingTop() >= #MON_FB_SCAN
+    ProcedureReturn 0
+  EndIf
+  If #BTM_BASE < (#MON_FB_DRAW + #MON_FB_BYTES) And BootTimingTop() >= #MON_FB_DRAW
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The guard. A magic on its own can be met by DRAM that happens to hold
+; the right eight bytes, or by a half-written record whose count field is
+; from the boot before this one - which is exactly the failure the
+; autoboot record's guard exists for (Board/cache.pi4).
+Procedure.i BootTimingGuardFor(count.i, hz.i)
+  ProcedureReturn #BTM_MAGIC ! count ! hz
+EndProcedure
+
+; Clean what a mark touched to the point of COHERENCY. The same primitive
+; the autoboot record uses and right for the same reason: these bytes are
+; going to be read by something that is not this CPU's D-cache.
+Procedure BootTimingFlush(lo.i, hi.i)
+  CacheCleanRangePoc(lo, hi)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BootTimingMark - one row. Cheap enough to call from the boot path and
+;  loud enough to notice when it cannot: a full table COUNTS what it
+;  refused rather than wrapping, because a wrapped table of a boot's
+;  first seconds is a table of its last seconds wearing the same header.
+;
+;  IT REFUSES WHEN THE MAGIC IS NOT THERE, and that is not defensiveness.
+;  A returned payload, or a build whose BootTimingBegin never ran, both
+;  reach here - and appending a row to a record that does not exist would
+;  manufacture a measurement out of whatever DRAM was holding.
+; ----------------------------------------------------------------------
+Procedure BootTimingMark(id.i, v1.i, v2.i)
+  Define n.i
+  Define a.i
+  If PeekI(#BTM_BASE + #BTM_OFF_MAGIC) <> #BTM_MAGIC
+    ProcedureReturn
+  EndIf
+  n = PeekI(#BTM_BASE + #BTM_OFF_COUNT)
+  If n < 0 Or n >= #BTM_SLOTS
+    PokeI(#BTM_BASE + #BTM_OFF_LOST, PeekI(#BTM_BASE + #BTM_OFF_LOST) + 1)
+    BootTimingFlush(#BTM_BASE, #BTM_BASE + #BTM_HEADER - 1)
+    ProcedureReturn
+  EndIf
+  a = BootTimingSlotAddr(n)
+  PokeI(a + #BTM_SLOT_ID, id)
+  PokeI(a + #BTM_SLOT_TICKS, Ticks())
+  PokeI(a + #BTM_SLOT_V1, v1)
+  PokeI(a + #BTM_SLOT_V2, v2)
+  ; THE ROW BEFORE THE COUNT, ALWAYS. A count that names a row which has
+  ; not been written yet presents stale DRAM as an event; a row written
+  ; but not yet counted is simply invisible.
+  BootTimingFlush(a, a + #BTM_SLOT_BYTES - 1)
+  n = n + 1
+  PokeI(#BTM_BASE + #BTM_OFF_COUNT, n)
+  PokeI(#BTM_BASE + #BTM_OFF_GUARD, BootTimingGuardFor(n, PeekI(#BTM_BASE + #BTM_OFF_HZ)))
+  BootTimingFlush(#BTM_BASE, #BTM_BASE + #BTM_HEADER - 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BootTimingBegin - start a new record. Called once, from Main, after
+;  TimerInit() has proved the counter is moving: a record stamped from a
+;  frozen counter is a table of identical numbers that reads as an
+;  instant boot.
+;
+;  THE MAGIC IS CLEARED FIRST AND WRITTEN LAST. Until it is written, a
+;  host reading the page sees no record at all - never a half-built one
+;  carrying this boot's count and the last boot's ticks.
+; ----------------------------------------------------------------------
+Procedure BootTimingBegin(hz.i, armHz.i)
+  PokeI(#BTM_BASE + #BTM_OFF_MAGIC, 0)
+  BootTimingFlush(#BTM_BASE, #BTM_BASE + #BTM_HEADER - 1)
+  If BootTimingClearOfSurfaces() = 0
+    ; The one thing this file may not do is write into the picture. If
+    ; the map has moved under it, no record is a correct outcome and a
+    ; silent one is not - so say it and leave the magic clear, which
+    ; makes every later BootTimingMark a no-op.
+    PrintN("!! the boot-timing record's page is no longer clear of the display")
+    PrintN("   surfaces, so no timing was recorded. Nothing was written and the")
+    PrintN("   picture is unaffected. RaspberryPi4/Board/boot_timing.pi4 derives")
+    PrintN("   its address from memmap.pi4's DSI window; one of the two moved.")
+    ProcedureReturn
+  EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_VERSION, #BTM_VERSION)
+  PokeI(#BTM_BASE + #BTM_OFF_HZ, hz)
+  PokeI(#BTM_BASE + #BTM_OFF_COUNT, 0)
+  PokeI(#BTM_BASE + #BTM_OFF_SLOTS, #BTM_SLOTS)
+  PokeI(#BTM_BASE + #BTM_OFF_LOST, 0)
+  PokeI(#BTM_BASE + #BTM_OFF_GUARD, BootTimingGuardFor(0, hz))
+  PokeI(#BTM_BASE + #BTM_OFF_BASE0, Ticks())
+  PokeI(#BTM_BASE + #BTM_OFF_MAGIC, #BTM_MAGIC)
+  BootTimingFlush(#BTM_BASE, #BTM_BASE + #BTM_HEADER - 1)
+  BootTimingMark(#BTM_ENTRY, armHz, 0)
+EndProcedure
+
+; The first prompt, and only the first. The prompt is printed once per
+; command line; a row for every one of them would fill a fixed table with
+; the least interesting event in the boot and push the display rows out of
+; it as #BTM_LOST rather than keep them. A Global is right here and wrong
+; for the record itself: this flag is about THIS run of the program, and a
+; reset is exactly when it should go back to zero.
+Global gBootTimingPrompted.i
+
+Procedure BootTimingPromptOnce()
+  If gBootTimingPrompted <> 0
+    ProcedureReturn
+  EndIf
+  gBootTimingPrompted = 1
+  BootTimingMark(#BTM_PROMPT, 0, 0)
+EndProcedure
+
+; ---- reading it back --------------------------------------------------
+
+Procedure.i BootTimingValid()
+  Define n.i
+  If PeekI(#BTM_BASE + #BTM_OFF_MAGIC) <> #BTM_MAGIC
+    ProcedureReturn 0
+  EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_VERSION) <> #BTM_VERSION
+    ProcedureReturn 0
+  EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_SLOTS) <> #BTM_SLOTS
+    ProcedureReturn 0
+  EndIf
+  n = PeekI(#BTM_BASE + #BTM_OFF_COUNT)
+  If n < 0 Or n > #BTM_SLOTS
+    ProcedureReturn 0
+  EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_GUARD) <> BootTimingGuardFor(n, PeekI(#BTM_BASE + #BTM_OFF_HZ))
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i BootTimingCount()
+  If BootTimingValid() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekI(#BTM_BASE + #BTM_OFF_COUNT)
+EndProcedure
+
+Procedure.i BootTimingLost()
+  If BootTimingValid() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekI(#BTM_BASE + #BTM_OFF_LOST)
+EndProcedure
+
+Procedure.i BootTimingHz()
+  If BootTimingValid() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekI(#BTM_BASE + #BTM_OFF_HZ)
+EndProcedure
+
+; -1 for a row that does not exist, which is a value no field of a real
+; row can take: every id is positive, every tick is a count since reset,
+; and both values are written by this file.
+Procedure.i BootTimingField(i.i, off.i)
+  If i < 0 Or i >= BootTimingCount()
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn PeekI(BootTimingSlotAddr(i) + off)
+EndProcedure
+
+; Milliseconds since #BTM_ENTRY, which is what somebody asking "how long
+; did the banner take" actually wants. Integer arithmetic on a 54 MHz
+; counter: hz/1000 first, so the divide cannot lose a long boot to an
+; overflow in the multiply that would otherwise be needed.
+Procedure.i BootTimingMsAt(i.i)
+  Define hz.i
+  Define t.i
+  Define zero.i
+  hz = BootTimingHz()
+  t = BootTimingField(i, #BTM_SLOT_TICKS)
+  ; THE ZERO IS ROW 0'S OWN TICK AND NOT THE HEADER'S. #BTM_OFF_BASE0 is
+  ; stamped a few instructions earlier, while the header is being written,
+  ; so measuring from it would make row 0 - the entry - report a nonzero
+  ; time since itself. That is a small number and a confusing one: the
+  ; first row is the origin by definition and has to read as zero.
+  zero = BootTimingField(0, #BTM_SLOT_TICKS)
+  If hz < 1000 Or t < 0 Or zero < 0
+    ProcedureReturn -1
+  EndIf
+  t = t - zero
+  If t < 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn t / (hz / 1000)
+EndProcedure
+
+; ======================================================================
+;  THE VIEWER - `screen timing`
+; ----------------------------------------------------------------------
+;  The record is readable with `m 91FF000 2112` and a host that knows the
+;  layout, and that is deliberately still true - it is the path that works
+;  when the console is the thing being debugged. This is the same numbers
+;  for a person, and the reason it is worth having is that a table of
+;  ticks is not an answer: what somebody wants is "the banner took 340 ms
+;  and the radio took four seconds".
+;
+;  IT PRINTS THE DELTA AS WELL AS THE TOTAL, because the total tells you
+;  where you are and the delta tells you what cost it.
+; ======================================================================
+Procedure BootTimingSayId(id.i)
+  Select id
+    Case #BTM_ENTRY         : Print("monitor entered, clock and counter up")
+    Case #BTM_SCREEN_BEGIN  : Print("screen bring-up entered")
+    Case #BTM_SRC_CHOSEN    : Print("which screen decided")
+    Case #BTM_DSI_LIT       : Print("DSI panel lit and scanning")
+    Case #BTM_FW_SURFACE    : Print("firmware handed over a framebuffer")
+    Case #BTM_ACQUIRED      : Print("drawing surface installed")
+    Case #BTM_MAPPED        : Print("cached MMU on over it")
+    Case #BTM_DMA_READY     : Print("blitter bound")
+    Case #BTM_CLEAR_DONE    : Print("screen cleared INTO RAM")
+    Case #BTM_BANNER_DRAWN  : Print("banner drawn INTO RAM")
+    Case #BTM_PRESENTED     : Print("first present - ON THE PANEL")
+    Case #BTM_CONSOLE_UP    : Print("console live, boot log now paints as printed")
+    Case #BTM_CONFIG_BEGIN  : Print("USB, boot medium and settings started")
+    Case #BTM_CONFIG_END    : Print("USB, boot medium and settings done")
+    Case #BTM_READOPT_BEGIN : Print("stored geometry differs, moving to it")
+    Case #BTM_READOPT_DONE  : Print("stored geometry live, boot log replayed")
+    Case #BTM_TOUCH_END     : Print("touch controller done")
+    Case #BTM_V3D_END       : Print("GPU console activation done")
+    Case #BTM_NET_BEGIN     : Print("network started")
+    Case #BTM_NET_END       : Print("network done")
+    Case #BTM_PROMPT        : Print("first prompt")
+    Default                 : Print("an event this build does not name")
+  EndSelect
+EndProcedure
+
+Procedure BootTimingReport()
+  Define i.i
+  Define n.i
+  Define ms.i
+  Define prev.i
+  Define id.i
+
+  If BootTimingValid() = 0
+    PrintN("There is no boot-timing record in memory. It is written by this")
+    PrintN("monitor's own boot, so this means either that the boot did not reach")
+    PrintN("the point where the record is started - which is immediately after the")
+    PrintN("architectural counter is proved to be running - or that something has")
+    PrintN("overwritten the page since. Reset the board and look again.")
+    ProcedureReturn
+  EndIf
+
+  n = BootTimingCount()
+  Print("The boot this monitor is running took ")
+  ms = BootTimingMsAt(n - 1)
+  PrintDec(ms)
+  Print(" ms to the last event below, measured on the ")
+  PrintDec(BootTimingHz() / 1000000)
+  PrintN(" MHz architectural")
+  PrintN("counter. Times are milliseconds since the monitor was entered; the")
+  PrintN("second column is what that step itself cost.")
+  PrintNl()
+  PrintN("PAINTED INTO RAM AND PRESENTED TO THE PANEL ARE DIFFERENT ROWS. On an")
+  PrintN("HDMI display, and on the panel at 0 and 180 degrees, the buffer drawn")
+  PrintN("into IS the one being scanned and the gap between them is nothing. At")
+  PrintN("90 and 270 the gap is the transpose, which is the whole picture.")
+  PrintNl()
+
+  prev = 0
+  i = 0
+  While i < n
+    ms = BootTimingMsAt(i)
+    id = BootTimingField(i, #BTM_SLOT_ID)
+    Print("  ")
+    PrintDec(ms)
+    Print(" ms  +")
+    PrintDec(ms - prev)
+    Print("  ")
+    BootTimingSayId(id)
+    ; The two values, only where they mean something. A row printing
+    ; "0 0" after every line would bury the four that carry a reading.
+    Select id
+      Case #BTM_ENTRY
+        Print(" (ARM ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V1) / 1000000)
+        Print(" MHz)")
+      Case #BTM_ACQUIRED
+        Print(" (base $")
+        PutHexN(BootTimingField(i, #BTM_SLOT_V1), 8)
+        Print(", pitch ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V2))
+        Print(")")
+      Case #BTM_FW_SURFACE
+        Print(" (")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V1))
+        Print(" by ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V2))
+        Print(")")
+      Case #BTM_PRESENTED
+        Print(" (turned ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V1))
+        Print(" degrees, magnification ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V2))
+        Print(")")
+      Case #BTM_CONSOLE_UP
+        Print(" (")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V1))
+        Print(" columns by ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V2))
+        Print(" lines)")
+      Case #BTM_READOPT_BEGIN
+        Print(" (")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V1))
+        Print(" degrees, magnification ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V2))
+        Print(")")
+      Case #BTM_READOPT_DONE
+        Print(" (")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V1))
+        Print(" bytes replayed, ")
+        PrintDec(BootTimingField(i, #BTM_SLOT_V2))
+        Print(" lost)")
+      Case #BTM_MAPPED
+        If BootTimingField(i, #BTM_SLOT_V1) = 0
+          Print(" (the caches did NOT come on here)")
+        EndIf
+      Case #BTM_DMA_READY
+        If BootTimingField(i, #BTM_SLOT_V1) = 0
+          Print(" (the engine did not start - this console is pure CPU)")
+        EndIf
+      Case #BTM_V3D_END
+        If BootTimingField(i, #BTM_SLOT_V1) = 0
+          Print(" (the GPU did not take it - the CPU/DMA renderer is drawing)")
+        EndIf
+    EndSelect
+    PrintNl()
+    prev = ms
+    i = i + 1
+  Wend
+
+  If BootTimingLost() > 0
+    PrintNl()
+    Print("!! ")
+    PrintDec(BootTimingLost())
+    PrintN(" later events had nowhere to go: the record holds a fixed number")
+    Print("   of rows and this boot produced more than ")
+    PrintDec(#BTM_SLOTS)
+    PrintN(". What is above is the")
+    PrintN("   BEGINNING of the boot, which is the half worth keeping; nothing has")
+    PrintN("   been overwritten and no row above is wrong.")
+  EndIf
+
+  PrintNl()
+  Print("The record is at $")
+  PutHexN(#BTM_BASE, 8)
+  Print(", ")
+  PrintDec(#BTM_HEADER + #BTM_SLOTS * #BTM_SLOT_BYTES)
+  PrintN(" bytes, and it survives a reset")
+  PrintN("until the next boot overwrites it - so a board that hangs can be read")
+  Print("with m ")
+  PutHexN(#BTM_BASE, 8)
+  Print(" ")
+  PrintDec(#BTM_HEADER + #BTM_SLOTS * #BTM_SLOT_BYTES)
+  PrintN(" from a host after a reset into a working image.")
+EndProcedure

@@ -1741,6 +1741,13 @@ XIncludeFile "Anvil/Core/memrange.pbi"
 XIncludeFile "RaspberryPi4/Board/hw_addr.pi4"
 XIncludeFile "Anvil/Core/addrsafe.pbi"
 XIncludeFile "RaspberryPi4/Board/cache.pi4"
+; The retained boot-timing record. After cache.pi4 because it cleans its
+; own page to the point of coherency through CacheCleanRangePoc, and
+; after memmap.pi4 because its fixed address is the last page of the DSI
+; framebuffer window declared there. Before every file that marks - the
+; screen, the console, the GPU adapter and the two boot halves - which is
+; everything below this line.
+XIncludeFile "RaspberryPi4/Board/boot_timing.pi4"
 ; The board's half of the driver-module contract: where a module may
 ; live, how to make written bytes executable, what devices are here, and
 ; which seams the core reaches without one. After cache.pi4 because it
@@ -2104,34 +2111,65 @@ Procedure Main()
   gHaveEntry = 0
   gMbx = 0
 
+  ; THE TIMING RECORD, BEFORE THE FIRST THING WORTH TIMING. TimerInit()
+  ; above has just proved the counter is moving, which is the one
+  ; precondition a table of ticks has. See Board/boot_timing.pi4 - it is
+  ; at a fixed address in the display's own reserved window, it survives
+  ; the boot it describes, and `screen timing` reads it back.
+  BootTimingBegin(hz, ClockMeasuredHz(#MBX_CLK_ARM))
+
   ScreenEarlyLogStart()
   Banner()
 
   ; ------------------------------------------------------------------
-  ;  THE CONFIGURATION, THEN THE SCREEN, THEN THE NETWORK.
+  ;  THE SCREEN FIRST. THEN THE CONFIGURATION. THEN THE NETWORK.
   ;
-  ;  BootConfigUp() is USB, the boot medium and SETTINGS.TXT. It comes
-  ;  first because the screen is configured hardware: which screen the
-  ;  console goes on and which way up it sits on the DSI panel are both
-  ;  settings, and a screen brought up before the store exists could
-  ;  only come up in a default and be rebuilt afterwards - erasing the
-  ;  log it was brought up early to carry. boot.pi4's header carries the
-  ;  whole of that reasoning and the cost it accepts.
+  ;  THIS ORDER IS A CHANGE AND IT HAS TO ANSWER THE ONE THAT WAS HERE.
+  ;  BootConfigUp() - PCIe, the xHCI host, the USB devices, the boot
+  ;  medium and SETTINGS.TXT - used to run FIRST, and the argument was
+  ;  sound: the screen is configured hardware, so a screen brought up
+  ;  before the store existed could only come up in a default and would
+  ;  have to be TORN DOWN AND REBUILT when the real answer arrived,
+  ;  erasing the boot log it was brought up early to carry.
   ;
-  ;  The screen is still ahead of the NETWORK, which is the long,
-  ;  hang-prone half and the one the old ordering really existed for: a
-  ;  board that stalls in the radio says so on the glass. The Wi-Fi
-  ;  bring-up's mailbox query retries past the framebuffer
-  ;  (WifiClockHz), which is what makes that safe.
+  ;  THE CONCLUSION FOLLOWED FROM TWO THINGS THAT ARE NO LONGER TRUE.
+  ;  A geometry change is no longer a teardown: ScrDsiReadoptBegin
+  ;  re-points the HVS at its other fixed display list and re-installs
+  ;  the drawing surface with the panel still scanning - no power, no
+  ;  reset, no DSI host, no pixel valve, no allocation. And the boot log
+  ;  no longer lives only on the glass: Anvil/Core/boot_transcript.pbi
+  ;  retains the byte stream the console was built from, so a grid
+  ;  rebuilt at a new geometry is restored from WHAT WAS SAID rather
+  ;  than from pixels that are the wrong shape.
   ;
-  ;  ScreenUp() is never fatal and it now CHOOSES: the DSI panel if one
+  ;  WHAT IT BUYS, AND IT IS THE WHOLE POINT: the slow half of the boot
+  ;  now PRINTS ON THE PANEL AS IT HAPPENS. USB enumeration and the boot
+  ;  medium are the longest things before the radio and they were the
+  ;  lines nobody could see. The stated cost of the old order - "the USB
+  ;  and boot-medium lines now reach the wire before the glass exists,
+  ;  so they are not on the panel" - is paid back here.
+  ;
+  ;  AND THE COMMON CASE COSTS NOTHING AT ALL. SETTINGS.TXT on this
+  ;  bench names no rotation, so the stored answer IS the default and
+  ;  ScreenApplyStoredGeometry finds nothing to change.
+  ;
+  ;  THE NETWORK IS STILL LAST, which is what the original ordering
+  ;  really existed for: it is the long, hang-prone half, and a board
+  ;  that stalls in the radio says so on the glass.
+  ;
+  ;  ScreenUp() is never fatal and it CHOOSES: the DSI panel if one
   ;  answered on the display connector, else an HDMI display if the
   ;  firmware found one, else none - and it says which. The prompt
   ;  arrives on the wire either way.
+  ;
+  ;  NOTHING IN ScreenUp() READS THE SETTINGS STORE FOR ANYTHING BUT
+  ;  GEOMETRY. The panel is found over I2C, the firmware is asked over
+  ;  the mailbox, and the framebuffers are at fixed addresses this
+  ;  monitor chose - so there is nothing here that needs the boot medium
+  ;  to have mounted. The two things the store can say, rotation and
+  ;  magnification, are exactly the two ScreenApplyStoredGeometry
+  ;  corrects below.
   ; ------------------------------------------------------------------
-  BootConfigUp()
-  TimeBoot()
-  NtpServiceBoot()
   ; Opt in only for the existing panel/touch boot transactions. Capture is
   ; bounded RAM history, not extra probes; disable retains it for touch trace.
   ScreenDsiEarlyCacheArm()
@@ -2139,13 +2177,38 @@ Procedure Main()
   ScreenUp()
   TouchBoot()
   I2cTraceEnable(0)
+  BootTimingMark(#BTM_TOUCH_END, 0, 0)
+  ; Paint whatever the pre-screen lines left queued the instant the glass
+  ; exists, so the banner is followed by the log rather than by a pause.
+  ScreenServiceTick()
+
+  ; The slow half, now with somewhere to print. Every line of it lands on
+  ; the panel as it is produced: StorageUp and UsbEnumerate call
+  ; ScreenServiceTick themselves (boot.pi4), so this is live progress and
+  ; not a buffer flushed at the end.
+  BootTimingMark(#BTM_CONFIG_BEGIN, 0, 0)
+  BootConfigUp()
+  BootTimingMark(#BTM_CONFIG_END, gFatUp, 0)
+
+  ; THE STORE EXISTS NOW. If it names a geometry the default bring-up did
+  ; not use, the console moves to it in place and the retained boot log is
+  ; replayed into the rebuilt grid. Returns without touching anything when
+  ; the stored answer and the default agree.
+  ScreenApplyStoredGeometry()
+  ScreenServiceTick()
+
+  TimeBoot()
+  NtpServiceBoot()
   ; Switch the established surface to the preferred V3D renderer before the
   ; long network bring-up paints its progress. ScreenUp's initial banner is
   ; necessarily drawn once by the CPU/DMA tier because V3D needs that live
-  ; surface; the queued boot log is not drained until after this activation.
-  ; Failure is non-fatal: V3dConAutoStart leaves the DMA/CPU renderer active.
+  ; surface. Failure is non-fatal: V3dConAutoStart leaves the DMA/CPU
+  ; renderer active, which is a readable console and not a degraded one.
   CompilerIf #ANVIL_V3D_CONSOLE = 1
   V3dConAutoStart()
+  BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
+  CompilerElse
+  BootTimingMark(#BTM_V3D_END, 0, 0)
   CompilerEndIf
   ScreenEarlyLogFinish()
   GenetSetProgressHook(@ScreenServiceTick)
@@ -2155,7 +2218,9 @@ Procedure Main()
   ; screen shows it immediately rather than holding it - with the whole
   ; network bring-up behind it - until the first prompt.
   ScreenServiceTick()
+  BootTimingMark(#BTM_NET_BEGIN, 0, 0)
   BootNetUp()
+  BootTimingMark(#BTM_NET_END, 0, 0)
 
   ; ------------------------------------------------------------------
   ;  THE DRIVER MODULES, HERE, AND THE POSITION IS THE WHOLE ARGUMENT.
@@ -2222,6 +2287,10 @@ Procedure Main()
     ;
     ; It is not prose and it is not swept. Do not spell it out, do not
     ; capitalise it, and do not put a newline after it.
+    ; ONE ROW, THE FIRST TIME ONLY. The record has a fixed number of rows
+    ; and a prompt printed every command would fill it with the least
+    ; interesting event in the boot; BootTimingPromptOnce keeps the first.
+    BootTimingPromptOnce()
     Print("pmf> ")
     ; ================================================================
     ;  AND IT HAS TO REACH THE NETWORK CONSOLE TOO.  2026-09-07.

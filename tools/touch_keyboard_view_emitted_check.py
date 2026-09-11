@@ -192,6 +192,11 @@ def stage(work: pathlib.Path, view_text: str, console_text: str) -> pathlib.Path
     (work / "RaspberryPi4" / "Board").mkdir(parents=True, exist_ok=True)
     (work / "RaspberryPi4" / "Tests").mkdir(parents=True, exist_ok=True)
     shutil.copy2(MODEL, work / "Anvil" / "Core" / MODEL.name)
+    # console.pi4 includes the bounded boot transcript beside the drain that
+    # feeds it. Pure storage; nothing here exercises it, but the staged tree
+    # has to resolve the include.
+    shutil.copy2(ROOT / "Anvil" / "Core" / "boot_transcript.pbi",
+                 work / "Anvil" / "Core" / "boot_transcript.pbi")
     (work / "Anvil" / "Graphics" / "touch_keyboard_view.pbi").write_text(view_text, encoding="utf-8")
     (work / "RaspberryPi4" / "Board" / "console.pi4").write_text(console_text, encoding="utf-8")
     shutil.copy2(GATE, work / "RaspberryPi4" / "Tests" / GATE.name)

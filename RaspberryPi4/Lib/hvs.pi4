@@ -223,6 +223,7 @@ EnableExplicit
 ; ----------------------------------------------------------------------
 #HVS_DLIST_OFF   = $4000
 #HVS_DLIST_FIRST = 32
+#HVS_DLIST_SECOND = 41
 
 ; ----------------------------------------------------------------------
 ;  DISPLAY LIST WORD FIELDS, vc4_plane.c:1666-1736 for the VC5 branch
@@ -321,6 +322,11 @@ Global hvs_mode_at_enable.i = 0  ; DISPSTAT0's mode field the instant
                               ; judged - see HvsUp.
 Global hvs_hflip.i     = 0    ; the two mirror bits the next display list
 Global hvs_vflip.i     = 0    ; will carry. See HvsMirror().
+Global hvs_flip_pending.i = 0
+Global hvs_flip_at.i = 0
+Global hvs_flip_fb.i = 0
+Global hvs_flip_hf.i = 0
+Global hvs_flip_vf.i = 0
 
 ; ======================================================================
 ;  ACCESSORS
@@ -468,7 +474,7 @@ EndProcedure
 ;
 ;  Returns the dword index the list starts at.
 ; ----------------------------------------------------------------------
-Procedure.i HvsWriteDlist(idx.i, fb.i, w.i, h.i)
+Procedure.i HvsWriteDlistFor(idx.i, fb.i, w.i, h.i, hf.i, vf.i)
   Define a.i
   Define ctl0.i
   Define pos0.i
@@ -490,14 +496,14 @@ Procedure.i HvsWriteDlist(idx.i, fb.i, w.i, h.i)
   ; it copies a list in (vc4_plane.c:2405-2407).
   ; POS0: x 0, y 0, plus whatever mirrors HvsMirror() asked for.
   pos0 = 0
-  If hvs_hflip <> 0
+  If hf <> 0
     pos0 = pos0 | #SCALER5_POS0_HFLIP
   EndIf
   ; A VERTICAL MIRROR STARTS AT THE BOTTOM ROW. vc4_plane.c:1410-1413.
   ; The pitch below stays positive either way; the block counts down
   ; from the row it is handed.
   ptr = fb
-  If hvs_vflip <> 0
+  If vf <> 0
     pos0 = pos0 | #SCALER5_POS0_VFLIP
     ptr = fb + (h - 1) * w * 4
   EndIf
@@ -513,8 +519,12 @@ Procedure.i HvsWriteDlist(idx.i, fb.i, w.i, h.i)
   PokeN(a + 32, #SCALER_CTL0_END)
   a64_barrier()
 
-  hvs_dlist_at = idx
   ProcedureReturn idx
+EndProcedure
+
+Procedure.i HvsWriteDlist(idx.i, fb.i, w.i, h.i)
+  hvs_dlist_at = HvsWriteDlistFor(idx, fb, w, h, hvs_hflip, hvs_vflip)
+  ProcedureReturn hvs_dlist_at
 EndProcedure
 
 ; ======================================================================
@@ -552,6 +562,7 @@ Procedure.i HvsUp(fb.i, w.i, h.i)
   hvs_w  = w
   hvs_h  = h
   hvs_up = 0
+  hvs_flip_pending = 0
 
   ; The core clock first: everything below runs on it.
   HvsCoreClock()
@@ -773,6 +784,7 @@ Procedure HvsDown()
   HvsWr(#SCALER_DISPCTRL0_OFF, #SCALER_DISPCTRLX_RESET)
   HvsWr(#SCALER_DISPCTRL0_OFF, 0)
   hvs_up = 0
+  hvs_flip_pending = 0
 EndProcedure
 
 ; ======================================================================
@@ -821,6 +833,73 @@ Procedure HvsRepoint(fb.i)
   hvs_fb = fb
   HvsWriteDlist(hvs_dlist_at, fb, hvs_w, hvs_h)
 EndProcedure
+
+; Stage a complete list in the inactive fixed slot, then ask the HVS to
+; adopt it. A zero from HvsFlipResolve means pending, never rolled back:
+; DISPLIST has been written and the hardware may latch it later.
+Procedure.i HvsFlipBegin(fb.i, hf.i, vf.i)
+  Define at.i
+  If hvs_up = 0 Or fb = 0 Or hvs_flip_pending <> 0
+    ProcedureReturn 0
+  EndIf
+  at = #HVS_DLIST_FIRST
+  If hvs_dlist_at = #HVS_DLIST_FIRST
+    at = #HVS_DLIST_SECOND
+  EndIf
+  hvs_flip_hf = Bool(hf <> 0)
+  hvs_flip_vf = Bool(vf <> 0)
+  hvs_flip_fb = fb
+  hvs_flip_at = at
+  HvsWriteDlistFor(at, fb, hvs_w, hvs_h, hvs_flip_hf, hvs_flip_vf)
+  HvsWr(#SCALER_DISPLIST0_OFF, at)
+  hvs_flip_pending = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HvsFlipResolve()
+  If hvs_flip_pending = 0
+    ProcedureReturn 1
+  EndIf
+  If HvsDlistActive() <> hvs_flip_at
+    ProcedureReturn 0
+  EndIf
+  hvs_dlist_at = hvs_flip_at
+  hvs_fb = hvs_flip_fb
+  hvs_hflip = hvs_flip_hf
+  hvs_vflip = hvs_flip_vf
+  hvs_flip_pending = 0
+  ProcedureReturn 1
+EndProcedure
+
+; The caller's bounded wait expired. THE REQUEST CANNOT BE UNMADE:
+; SCALER_DISPLIST0 has already been written and the block may take the
+; staged slot at any later frame. Forgetting it would leave a picture
+; that can change shape on its own, minutes later, with nothing in the
+; software describing why.
+;
+; So the staged slot is REWRITTEN to say exactly what the active slot
+; says - same framebuffer, same size, same mirror bits. The two slots
+; become identical and it stops mattering which of them the hardware
+; ends up on. Nothing is rolled back, because there is nothing the
+; hardware would let us roll back.
+;
+; DISPLIST is deliberately NOT pointed back at the old slot. That would
+; be a second request racing the first, and the block would still be
+; free to latch either.
+Procedure.i HvsFlipAbandon()
+  If hvs_flip_pending = 0
+    ProcedureReturn 1
+  EndIf
+  If hvs_up = 0 Or hvs_fb = 0
+    hvs_flip_pending = 0
+    ProcedureReturn 0
+  EndIf
+  HvsWriteDlistFor(hvs_flip_at, hvs_fb, hvs_w, hvs_h, hvs_hflip, hvs_vflip)
+  hvs_flip_pending = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HvsFlipPending() : ProcedureReturn hvs_flip_pending : EndProcedure
 
 Procedure.i HvsModeAtEnable() : ProcedureReturn hvs_mode_at_enable : EndProcedure
 Procedure.i HvsHFlip()   : ProcedureReturn hvs_hflip    : EndProcedure

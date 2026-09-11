@@ -368,6 +368,10 @@ SOURCES = (
     "Anvil/Core/text_edit.pbi",
     "Anvil/Core/touch_keyboard.pbi",
     "Anvil/Graphics/touch_keyboard_view.pbi",
+    # console.pi4 includes the bounded boot transcript beside the drain that
+    # feeds it, so the staged tree needs it to resolve. It is pure storage
+    # and nothing in this gate exercises it.
+    "Anvil/Core/boot_transcript.pbi",
     "RaspberryPi4/Board/console.pi4",
 )
 

@@ -968,14 +968,34 @@ Procedure ScreenServiceTick()
 EndProcedure
 
 ; Begin mirroring before a surface exists. ConDrainRing refuses while the
-; grid is uninitialised, so these bytes remain queued and are painted once
-; immediately after the panel starts scanning. This is retained history,
-; not a claim that a dark, pre-scan panel displayed its own bring-up live.
+; grid is uninitialised, so the handful of bytes printed before ScreenUp
+; remain queued and are painted the moment the panel starts scanning. This
+; is retained history for those few lines only - it is NOT a claim that a
+; dark, pre-scan panel displayed its own bring-up live, and it is not the
+; boot log: the screen now comes up before the slow half of the boot, so
+; everything after it paints as it is printed.
+;
+; IT ALSO ARMS THE BOOT TRANSCRIPT, which is a different buffer for a
+; different job. The mirror ring is a few kilobytes of bytes not yet
+; consumed; the transcript is the bytes that WERE consumed, kept so a grid
+; rebuilt at a geometry the settings store named can be restored from what
+; was said rather than from pixels of the wrong shape. The tap is in
+; ConDrainRing (console.pi4).
 Procedure ScreenEarlyLogStart()
+  BootTranscriptStart()
+  ; PAINT EVERY BOOT LINE AS IT IS PRINTED. See ConMirrorDrain: outside
+  ; this window the drain is the pure one it has always been.
+  ConSetLiveBoot(1)
   UartMirror(1)
 EndProcedure
 
+; The boot log is finished. Freeze the transcript here: after this line the
+; console is the operator's, and retaining their session would cost the
+; buffer the boot log is the valuable half of - and would replay their
+; typing back at them if the geometry ever moved again.
 Procedure ScreenEarlyLogFinish()
+  BootTranscriptStop()
+  ConSetLiveBoot(0)
   If gScreen = 0
     UartMirror(0)
     ProcedureReturn

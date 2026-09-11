@@ -1,0 +1,44 @@
+#MON_FB_PANEL_W=800 : #MON_FB_PANEL_H=1280 : #MON_FB_SCAN=$4000000 : #MON_FB_DRAW=$4400000 : #DSP_OK=0
+Global gScrReadoptPending.i : Global gScrReadoptRot.i : Global gScrReadoptScale.i : Global gScrReadoptBase.i : Global gScrReadoptPitch.i : Global gScrReadoptW.i : Global gScrReadoptH.i
+Global gScrDsiUp.i : Global gScrRot.i : Global gScrScale.i
+Global gate_hvsUp.i=1 : Global gate_validate.i : Global gate_flipReady.i : Global gate_hf.i : Global gate_vf.i : Global gate_adoptBase.i : Global gate_adoptW.i : Global gate_adoptH.i : Global gate_scale.i
+Procedure.i HvsIsUp() : ProcedureReturn gate_hvsUp : EndProcedure
+Procedure.i ScrRotOk(r.i) : ProcedureReturn Bool(r=0 Or r=90 Or r=180 Or r=270) : EndProcedure
+Procedure.i ScrScaleOk(s.i) : ProcedureReturn Bool(s>=1 And s<=4) : EndProcedure
+Procedure.i ScrSideways(r.i) : ProcedureReturn Bool(r=90 Or r=270) : EndProcedure
+Procedure.i ScrLogicalW(r.i,w.i,h.i) : If ScrSideways(r) : ProcedureReturn h : EndIf : ProcedureReturn w : EndProcedure
+Procedure.i ScrLogicalH(r.i,w.i,h.i) : If ScrSideways(r) : ProcedureReturn w : EndIf : ProcedureReturn h : EndProcedure
+Procedure.i DisplayAdoptValidate(base.i,pitch.i,w.i,h.i,depth.i) : ProcedureReturn gate_validate : EndProcedure
+Procedure.i HvsFlipBegin(base.i,hf.i,vf.i) : gate_hf=hf : gate_vf=vf : ProcedureReturn 1 : EndProcedure
+Procedure.i HvsFlipResolve() : ProcedureReturn gate_flipReady : EndProcedure
+Procedure.i DisplayAdopt(base.i,pitch.i,w.i,h.i,depth.i) : gate_adoptBase=base : gate_adoptW=w : gate_adoptH=h : ProcedureReturn 0 : EndProcedure
+Procedure DisplayScale(s.i) : gate_scale=s : EndProcedure
+; @@BODY@@
+Procedure.i Main()
+ Define old.i : Define want.i : Define i.i : Define j.i
+ Dim rots.i[4] : rots[0]=0 : rots[1]=90 : rots[2]=180 : rots[3]=270
+ gScrDsiUp=1
+ i=0
+ While i<4
+  old=rots[i] : j=0
+  While j<4
+   want=rots[j] : gScrRot=old : gScrScale=1 : gate_flipReady=0 : gScrReadoptPending=0
+   If ScrDsiReadoptBegin(want,2)=0 : ProcedureReturn 1 : EndIf
+   If gScrRot<>old Or ScrDsiReadoptResolve()<>0 Or gScrRot<>old : ProcedureReturn 2 : EndIf
+   gate_flipReady=1
+   If ScrDsiReadoptResolve()<>1 Or gScrRot<>want Or gScrScale<>2 Or gate_scale<>2 : ProcedureReturn 3 : EndIf
+   If want=180
+    If gate_hf<>1 Or gate_vf<>1 : ProcedureReturn 4 : EndIf
+   ElseIf gate_hf<>0 Or gate_vf<>0 : ProcedureReturn 5 : EndIf
+   If ScrSideways(want)
+    If gate_adoptBase<>#MON_FB_DRAW Or gate_adoptW<>1280 Or gate_adoptH<>800 : ProcedureReturn 6 : EndIf
+   ElseIf gate_adoptBase<>#MON_FB_SCAN Or gate_adoptW<>800 Or gate_adoptH<>1280 : ProcedureReturn 7 : EndIf
+   j=j+1
+  Wend
+  i=i+1
+ Wend
+ gate_validate=-13 : old=gScrRot
+ If ScrDsiReadoptBegin(90,2)<>0 Or gScrRot<>old : ProcedureReturn 8 : EndIf
+ If ScrDsiReadoptBegin(45,2)<>0 Or ScrDsiReadoptBegin(90,0)<>0 : ProcedureReturn 9 : EndIf
+ ProcedureReturn 0
+EndProcedure

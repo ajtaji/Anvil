@@ -148,6 +148,16 @@ Global Dim gScrRotBuf.a[16]
 ; sets both from one line.
 Global Dim gScrScaleBuf.a[16]
 
+; A live DSI geometry change is two-phase because the HVS may accept a
+; newly selected display list after the caller's bounded wait expires.
+Global gScrReadoptPending.i
+Global gScrReadoptRot.i
+Global gScrReadoptScale.i
+Global gScrReadoptBase.i
+Global gScrReadoptPitch.i
+Global gScrReadoptW.i
+Global gScrReadoptH.i
+
 ; The bring-up steps, so a failure names itself rather than printing a
 ; number. See ScrDsiBringUp.
 #SCR_DSI_STEP_DOMAIN = 1
@@ -525,6 +535,86 @@ EndProcedure
 Procedure ScrPresentAll()
   ScrPresent(0, ScrLogicalH(gScrRot, #MON_FB_PANEL_W, #MON_FB_PANEL_H) - 1)
 EndProcedure
+
+; Begin an in-place DSI surface re-adoption. No panel, DSI host, pixel valve,
+; clock, reset or allocation operation occurs here. Return 1 when staged, 0
+; when refused. A staged request remains pending until ScrDsiReadoptResolve.
+Procedure.i ScrDsiReadoptBegin(rot.i, scale.i)
+  Define fb.i
+  Define lw.i
+  Define lh.i
+  Define hf.i
+  Define vf.i
+
+  If gScrReadoptPending <> 0 Or gScrDsiUp = 0 Or HvsIsUp() = 0
+    ProcedureReturn 0
+  EndIf
+  If ScrRotOk(rot) = 0 Or ScrScaleOk(scale) = 0
+    ProcedureReturn 0
+  EndIf
+  lw = ScrLogicalW(rot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+  lh = ScrLogicalH(rot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+  fb = #MON_FB_SCAN
+  If ScrSideways(rot) <> 0
+    fb = #MON_FB_DRAW
+  EndIf
+  If DisplayAdoptValidate(fb, lw * 4, lw, lh, 32) <> #DSP_OK
+    ProcedureReturn 0
+  EndIf
+  hf = Bool(rot = 180)
+  vf = hf
+  If HvsFlipBegin(#MON_FB_SCAN, hf, vf) = 0
+    ProcedureReturn 0
+  EndIf
+  gScrReadoptRot = rot
+  gScrReadoptScale = scale
+  gScrReadoptBase = fb
+  gScrReadoptPitch = lw * 4
+  gScrReadoptW = lw
+  gScrReadoptH = lh
+  gScrReadoptPending = 1
+  ProcedureReturn 1
+EndProcedure
+
+; Return 1 only after DISPLACT proves the staged list is active and the
+; prevalidated DisplayAdopt has committed matching software geometry. Zero
+; means still pending; both HVS slots and the old software state stay intact.
+Procedure.i ScrDsiReadoptResolve()
+  If gScrReadoptPending = 0
+    ProcedureReturn 1
+  EndIf
+  If HvsFlipResolve() = 0
+    ProcedureReturn 0
+  EndIf
+  ; This is the same immutable tuple accepted before the HVS request. No
+  ; resource or external state can change its validation between the calls.
+  If DisplayAdopt(gScrReadoptBase, gScrReadoptPitch, gScrReadoptW, gScrReadoptH, 32) <> #DSP_OK
+    ProcedureReturn 0
+  EndIf
+  gScrRot = gScrReadoptRot
+  gScrScale = gScrReadoptScale
+  DisplayScale(gScrScale)
+  gScrReadoptPending = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Withdraw a staged change. The software geometry was never touched while
+; the request was pending, so there is nothing here to put back; the only
+; state that has left this program is the display list the HVS was asked
+; for, and HvsFlipAbandon makes that request harmless rather than
+; pretending it was cancelled. Returns what the HVS half returned, so a
+; caller that cannot even do this much hears about it.
+Procedure.i ScrDsiReadoptAbandon()
+  Define rc.i
+  If gScrReadoptPending = 0
+    ProcedureReturn 1
+  EndIf
+  rc = HvsFlipAbandon()
+  gScrReadoptPending = 0
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i ScrDsiReadoptPending() : ProcedureReturn gScrReadoptPending : EndProcedure
 
 
 ; ======================================================================
