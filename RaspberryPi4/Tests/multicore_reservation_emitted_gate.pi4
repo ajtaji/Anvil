@@ -1,0 +1,158 @@
+; ======================================================================
+;  multicore_reservation_emitted_gate.pi4 - host-interpreted fixture for
+;  the raw-secondary reservation, publication ordering and refusal desk
+;  checks. It is an instrument: it never ships and never runs on a board.
+;
+;  THE FIXTURE ANSWERS; THE HOST DECIDES. Every slot below is a raw
+;  number produced by the SHIPPED board accessor or the SHIPPED core
+;  predicate. The arithmetic that turns those numbers into a verdict -
+;  three exact pages, contiguity, disjointness from every other declared
+;  region and from both payload windows - lives in
+;  tools/multicore_reservation_check.py and is recomputed there from
+;  first principles. A fixture that graded itself could only ever agree
+;  with itself.
+;
+;  IT DOES NOT KNOW HOW MANY REGIONS THE BOARD HAS. It publishes
+;  HwMonRegions() and then #MCR_MAX_REGIONS slots' worth of edges, and
+;  the host reads the first HwMonRegions() of them. A board that gains a
+;  region needs no change here - which is the whole point of the board
+;  enumerating and the core walking, and is why an earlier draft of this
+;  gate that asserted "five regions" went red the day the module arena
+;  was declared.
+;
+;  mcr_mode is written into BSS by the host before entry, so ONE image
+;  answers several machine states:
+;    0  publish the board's reservation/window/refusal table
+;    1  execute CoreRawPrepare on the exact board page and record the
+;       verdict plus MmuEl()/MmuSctlr() as found
+;    2  as 1, and then CoreRawRelease + a bounded CoreRawWaitReady, so
+;       the real primary release ordering is executed rather than read
+; ======================================================================
+
+; Console stubs. memrange.pbi's two map PRINTERS reference them; this
+; fixture calls neither printer, and stubbing them is what keeps the
+; region predicates under test the SHIPPED ones instead of a copy.
+Procedure str_print_at(*text)
+EndProcedure
+Procedure PutAddr(a.i)
+EndProcedure
+Procedure PrintDec(v.i)
+EndProcedure
+Procedure PrintNl()
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+XIncludeFile "Anvil/Core/memrange.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu_secondary.pi4"
+XIncludeFile "RaspberryPi4/Lib/core_worker.pi4"
+
+#MCR_MAX_REGIONS = 12
+#MCR_SLOTS       = 80
+
+Global Dim mcr_out.i[#MCR_SLOTS]
+Global mcr_mode.i
+
+Procedure mcrPut(slot.i, value.i)
+  If slot >= 0 And slot < #MCR_SLOTS
+    mcr_out[slot] = value
+  EndIf
+EndProcedure
+
+; The core's own region walk, reached through the shipped predicate rather
+; than a copy of it. gMonHitWhich is valid only on the instruction after a
+; non-zero return, so it is captured immediately.
+Procedure mcrHit(slot.i, lo.i, hi.i)
+  Define r.i
+  r = HitsMonitor(lo, hi)
+  mcrPut(slot, r)
+  mcrPut(slot + 1, gMonHitWhich)
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define r.i
+  Define bandLo.i
+  Define bandHi.i
+
+  For i = 0 To #MCR_SLOTS - 1
+    mcr_out[i] = -1
+  Next
+
+  bandLo = HwCoreRawStackBase(1)
+  bandHi = HwCoreRawStackBase(3) + HwCoreRawStackBytes(3) - 1
+
+  If mcr_mode = 0
+    ; --- the board's own answers, unretouched -------------------------
+    mcrPut(0, HwMonRegions())
+    For i = 0 To #MCR_MAX_REGIONS - 1
+      mcrPut(1 + i, HwMonRegionLo(i))
+      mcrPut(1 + #MCR_MAX_REGIONS + i, HwMonRegionHi(i))
+    Next
+    mcrPut(25, HwPayWindows())
+    mcrPut(26, HwPayLo(0))
+    mcrPut(27, HwPayHi(0))
+    mcrPut(28, HwPayLo(1))
+    mcrPut(29, HwPayHi(1))
+    mcrPut(30, HwMonLo())
+    mcrPut(31, HwMonHi())
+    For i = 1 To 3
+      mcrPut(31 + i, HwCoreRawStackBase(i))
+      mcrPut(34 + i, HwCoreRawStackBytes(i))
+    Next
+    mcrPut(38, HwCoreRawStackBase(0))
+    mcrPut(39, HwCoreRawStackBase(4))
+    mcrPut(40, HwCoreRawStackBytes(0))
+    mcrPut(41, HwCoreRawStackBytes(4))
+
+    ; --- does the monitor actually refuse these pages? ----------------
+    For i = 1 To 3
+      mcrHit(40 + i * 2, HwCoreRawStackBase(i), HwCoreRawStackBase(i) + HwCoreRawStackBytes(i) - 1)
+    Next
+    mcrHit(48, bandLo, bandHi)
+    mcrPut(50, InPayload(bandLo, bandHi))
+    ; one byte below and one byte above the band, so the edges are proven
+    ; to be edges rather than the middle of something larger
+    mcrHit(51, bandLo - 1, bandLo - 1)
+    mcrHit(53, bandHi + 1, bandHi + 1)
+
+    ; --- the shipped ownership predicate, exact pair and near misses ---
+    For i = 1 To 3
+      mcrPut(54 + i, CoreRawStackOwned(i, HwCoreRawStackBase(i), HwCoreRawStackBytes(i)))
+    Next
+    mcrPut(58, CoreRawStackOwned(1, HwCoreRawStackBase(2), HwCoreRawStackBytes(2)))
+    mcrPut(59, CoreRawStackOwned(1, HwCoreRawStackBase(1) + 16, HwCoreRawStackBytes(1) - 16))
+    mcrPut(60, CoreRawStackOwned(1, HwCoreRawStackBase(1), HwCoreRawStackBytes(1) * 2))
+    mcrPut(61, CoreRawStackOwned(0, HwCoreRawStackBase(1), HwCoreRawStackBytes(1)))
+    ProcedureReturn 0
+  EndIf
+
+  ; --- modes 1 and 2: execute the real primary path -------------------
+  mcrPut(62, MmuEl())
+  mcrPut(63, MmuSctlr())
+  mcrPut(64, CoreRawId())
+  r = CoreRawPrepare(1, HwCoreRawStackBase(1), HwCoreRawStackBytes(1), $C0FFEE)
+  mcrPut(65, r)
+  mcrPut(66, CoreRawErr())
+  mcrPut(67, core_raw_prepared[1])
+  mcrPut(68, core_raw_stackbase[1])
+  mcrPut(69, core_raw_stacktop[1])
+  If r = 0
+    ; A refused preparation must leave the release path unreachable.
+    mcrPut(70, CoreRawRelease(1))
+    mcrPut(71, CoreRawErr())
+    ProcedureReturn 0
+  EndIf
+  If mcr_mode <> 2
+    ProcedureReturn 0
+  EndIf
+  mcrPut(72, CoreRawRelease(1))
+  mcrPut(73, CoreRawErr())
+  mcrPut(74, core_raw_released[1])
+  mcrPut(75, PeekI(CoreRawReleaseAddr(1)))
+  ; No secondary exists in this model, so the bounded wait MUST time out.
+  ; A wait that reported success here would be reading a stale word.
+  mcrPut(76, CoreRawWaitReady(1, 8))
+  mcrPut(77, CoreRawErr())
+  ProcedureReturn 0
+EndProcedure
