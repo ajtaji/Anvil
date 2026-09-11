@@ -230,6 +230,8 @@ private keys, or machine-specific paths.
 
 Original Anvil source and documentation are available under the [MIT
 License](LICENSE). Third-party material is not relicensed. This includes
-CYW43455 firmware, Vulkan Registry-derived vocabulary, DejaVu-derived glyph
-tables, and BearSSL-derived cryptography. See the [licensing guide](docs/LICENSING.md)
+CYW43455 firmware (redistributed under its own terms), vocabulary taken from
+the Khronos Vulkan Registry, and glyph tables generated from DejaVu faces. The
+cryptography is original code; BearSSL was read for its constant-time designs
+and its licence text is kept as an acknowledgment. See the [licensing guide](docs/LICENSING.md)
 and [third-party map](docs/THIRD_PARTY_NOTICES.md).

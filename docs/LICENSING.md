@@ -37,7 +37,7 @@ bundled because it may contain calibration and identity data. Obtain the
 correct file for the board and place it on the Pi boot medium as `BRCMNV.TXT`;
 place the firmware image as `BRCMFW.BIN` and the CLM data as `BRCMCLM.BLB`.
 
-## Khronos-derived Vulkan material
+## Vulkan vocabulary from the Khronos Registry
 
 The Vulkan vocabulary and generator derive names, values, relationships, and
 ordering from the Khronos Vulkan API Registry. That registry is licensed
@@ -60,11 +60,12 @@ original Anvil code. Keep
 with any distribution that contains them. The exact faces and upstream license
 revision are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## BearSSL-derived cryptography
+## Cryptography, and BearSSL as a reference consulted
 
-Anvil contains translated or adapted BearSSL cryptographic algorithms and
-generated material. Source-file notices remain authoritative; the complete
-BearSSL MIT text is retained in
+Anvil's cryptography is original code. BearSSL was read for its constant-time
+designs and test vectors; it was confirmed on 2026-09-10 that no third-party
+code was used. Source-file citations remain the pointers to what was read; the
+BearSSL MIT text is kept as an acknowledgment in
 [`licenses/BearSSL-LICENSE.txt`](../licenses/BearSSL-LICENSE.txt). See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the coverage summary.
 
