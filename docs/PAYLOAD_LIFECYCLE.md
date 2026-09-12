@@ -180,3 +180,29 @@ survived, and a later Wi-Fi time command answered. Continuous uptime confirmed
 there was no intervening reset. This proves the ordinary active-to-active
 return on that board; it does not prove the untested failure/expiry cases or
 full-model performance.
+
+## ABI 1.2 - the console group gains a capture slot (2026-09-11)
+
+`SvcScreenCapture()` is console slot 13 (`#SVC_BASE_CONSOLE + 13`). It keeps
+the frame the screen is showing somewhere a repaint cannot reach, and returns
+`#SVC_OK`, `#SVC_EIO` when there is nothing behind the console to photograph
+or its surface will not fit the board's capture area, or `#SVC_ENOSYS` on a
+monitor older than 1.2 or a board with no console group.
+
+It exists because **a payload's last frame does not survive its own return**:
+the monitor's first printed line on the way back goes through the console grid
+onto that surface. A payload that wants its picture kept calls this before it
+returns; a payload the operator armed a capture for (`shot arm`, or
+`boot mem <addr> shot`) has it taken by the monitor as the first statement
+after the return, before anything is printed.
+
+Call it after `SvcFrameEnd`. It copies and does not present, so a payload that
+has not ended its frame keeps whatever was last presented - which is the
+honest answer rather than a silent flip. The slot reaches the board through
+`HwConCapture()`; the board decides what "the frame the screen is showing"
+means, because on a board whose console is drawn turned the buffer being
+scanned is not the buffer being drawn into.
+
+The minor rose because a reserved slot was filled and nothing existing changed
+meaning. Full write-up of the area, the header and the host tool:
+`docs/BOARD_RUN.md`.

@@ -1313,6 +1313,308 @@ Procedure CmdPic()
 EndProcedure
 
 ; ======================================================================
+;  shot - THE PICTURE THAT OUTLIVED THE PAYLOAD
+; ----------------------------------------------------------------------
+;  `p` photographs the LIVE screen and is unchanged. `shot` photographs
+;  the capture area - the copy of a presented frame that was taken while
+;  it still existed, by ScrCaptureToArea in screen_source.pi4, either
+;  because the payload asked for it through the service table or because
+;  the operator armed a capture on return.
+;
+;  THE TWO COMMANDS EMIT THE SAME MACHINE FORMAT, and that is the point
+;  rather than a convenience. tools/pmfshot.py has decoded PIC/runs/END
+;  since 2026-08-26 and every host that knows how to turn a screenshot
+;  into a PNG knows that and nothing else. A second wire format for the
+;  same picture would be a second decoder to keep right.
+;
+;  THE HEADER GOES OUT FIRST, AS ONE MACHINE LINE. It is what the live
+;  screen does not need and a kept frame does: which run this was, what
+;  the payload returned, which renderer drew it, which way up it was, and
+;  how many bytes were kept. It is deliberately NOT part of the PIC
+;  stream - pmfshot.py's three regular expressions are anchored whole-line
+;  and simply do not match it, so an existing host decodes the picture and
+;  ignores the line, while tools/board_run.py reads both.
+;
+;      SHOT <seq8> <w8> <h8> <pitch8> <rot8> <tier8> <x0:16>
+;           <panelW8> <panelH8> <bpp2> <src2> <who2> <bytes8>
+;
+;  all upper-case hex, single spaces, one line. The same fixed-width
+;  discipline the PIC header is written under and for the same reason.
+;
+;  THE MIRROR IS TURNED OFF for exactly the reason CmdPic explains: the
+;  screen console is fed from the UART mirror, so dumping to the UART
+;  would print the dump onto the screen being described.
+; ======================================================================
+
+; WHICH RENDERER DREW THE FRAME. Asked here rather than in the display
+; seam because gV3dConOn is declared in v3d_console.pi4, which is
+; included after screen_source.pi4; this file is included after both, so
+; this is the first place in the build where both halves of the answer
+; exist. It reads the live state and keeps no copy of it - a second
+; variable saying which tier is up would be a second opinion, and the two
+; would disagree the first time one of them was not updated.
+Procedure.i ScrShotTier()
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  If gV3dConOn <> 0
+    ProcedureReturn #HW_TIER_V3D
+  EndIf
+  CompilerEndIf
+  If gDma <> 0
+    ProcedureReturn #HW_TIER_DMA
+  EndIf
+  ProcedureReturn #HW_TIER_CPU
+EndProcedure
+
+; Take a capture of the live screen right now, on the operator's behalf.
+; The same copy the service slot makes, so `shot now` and a payload's own
+; call leave the area in exactly one shape.
+Procedure.i ScrShotNow(who.i, x0.i)
+  ProcedureReturn ScrCaptureToArea(who, x0, ScrShotTier())
+EndProcedure
+
+Procedure ShotPutHeader()
+  Print("SHOT ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_SEQ), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_W), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_H), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_PITCH), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_ROT), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_TIER), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_X0), 16)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_PANELW), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_PANELH), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_BPP), 2)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_SRC), 2)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_WHO), 2)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_BYTES), 8)
+  PrintNl()
+EndProcedure
+
+Procedure ShotSayNothing()
+  PrintN("!! there is no kept picture to send: the capture area holds no complete")
+  PrintN("   capture, so nothing was streamed. Either no run has been captured")
+  PrintN("   since this board started, or the last attempt was refused because")
+  PrintN("   there was no screen behind the console at the time.")
+  PrintN("   shot arm, then boot the payload, gets one. shot now takes one of the")
+  PrintN("   screen as it is at this instant, which is what p sends live.")
+EndProcedure
+
+Procedure ShotDump()
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define x.i
+  Define y.i
+  Define px.i
+  Define run.i
+  Define cur.i
+  Define runs.i
+  Define wasMirror.i
+  Define termI.i
+
+  If ScrShotValid() = 0
+    ShotSayNothing()
+    ProcedureReturn
+  EndIf
+
+  ; ONE IMMUTABLE DESCRIPTION, READ BEFORE A SINGLE PIXEL. The area is
+  ; not going to change under this loop - nothing else writes it - but
+  ; reading the geometry once is what makes the header line and the
+  ; stream describe the same picture by construction rather than by
+  ; nobody having changed anything in between.
+  fb     = ScrShotPixels()
+  w      = ScrShotField(#MON_SHOT_OFF_W)
+  h      = ScrShotField(#MON_SHOT_OFF_H)
+  pitch  = ScrShotField(#MON_SHOT_OFF_PITCH)
+  rot    = ScrShotField(#MON_SHOT_OFF_ROT)
+  panelW = ScrShotField(#MON_SHOT_OFF_PANELW)
+  panelH = ScrShotField(#MON_SHOT_OFF_PANELH)
+
+  If w < 1 Or h < 1 Or pitch < 4 Or panelW < 1 Or panelH < 1
+    PrintN("!! the kept picture's header does not describe a picture - one of its")
+    PrintN("   sizes is zero or negative - so nothing was streamed. That is a fault")
+    PrintN("   in this monitor rather than anything you typed; take another capture")
+    PrintN("   and say so if it happens again.")
+    ProcedureReturn
+  EndIf
+
+  wasMirror = UartMirrorOn()
+  UartMirror(0)
+
+  ShotPutHeader()
+  UartDrain()
+
+  ; The same two lines CmdPic sends and the same format. See EVERYTHING
+  ; FROM HERE TO "END" IS A MACHINE FORMAT there; it is not repeated.
+  Print("PIC ")
+  PutHexN(w, 8)
+  Print(" ")
+  PutHexN(h, 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_BPP), 2)
+  PrintNl()
+  UartDrain()
+  UartAuxBulk(1)
+
+  runs = 0
+  y = 0
+  While y < h
+    If OutBreakCtrlC() <> 0
+      Break
+    EndIf
+    x = 0
+    cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+    run = 0
+    While x < w
+      px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+      If px = cur
+        run = run + 1
+      Else
+        PutHexN(run, 6)
+        UartWrite(32)
+        PutHexN(cur, 8)
+        PrintNl()
+        runs = runs + 1
+        cur = px
+        run = 1
+      EndIf
+      x = x + 1
+    Wend
+    If run > 0
+      PutHexN(run, 6)
+      UartWrite(32)
+      PutHexN(cur, 8)
+      PrintNl()
+      runs = runs + 1
+    EndIf
+    y = y + 1
+  Wend
+
+  UartAuxBulk(0)
+  termI = 0
+  While termI < 3
+    If OutBroke() <> 0
+      Print("ABORT ")
+    Else
+      Print("END ")
+    EndIf
+    PutHexN(runs, 8)
+    PrintNl()
+    termI = termI + 1
+  Wend
+  UartDrain()
+
+  If wasMirror <> 0
+    UartMirror(0)
+    UartMirror(1)
+  EndIf
+EndProcedure
+
+Procedure ShotStatus()
+  Print("A capture on the next payload return is ")
+  If ShotArmed() <> 0
+    PrintN("ARMED.")
+  Else
+    PrintN("not armed.")
+  EndIf
+  PrintN("  shot arm      arms it for the next run, once")
+  PrintN("  shot disarm   puts it back")
+  PrintN("  boot mem <address> shot   arms it and boots in one line")
+  If ScrShotValid() = 0
+    PrintN("The capture area holds no picture yet.")
+    ProcedureReturn
+  EndIf
+  Print("The capture area holds picture number ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_SEQ))
+  Print(", ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_W))
+  Print(" by ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_H))
+  PrintN(" as the")
+  Print("console saw it, taken ")
+  If ScrShotField(#MON_SHOT_OFF_WHO) = #MON_SHOT_WHO_RETURN
+    Print("by this monitor as a payload returned (its x0 was ")
+    PutHex16(ScrShotField(#MON_SHOT_OFF_X0))
+    PrintN(")")
+  Else
+    PrintN("by the payload itself, through the service table")
+  EndIf
+  Print("from ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_BYTES))
+  Print(" bytes of the ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_PANELW))
+  Print(" by ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_PANELH))
+  Print(" surface the panel was")
+  Print(" scanning, at ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_ROT))
+  PrintN(" degrees.")
+  PrintN("  shot          streams it, in the same format p streams the live screen")
+EndProcedure
+
+Procedure CmdShot()
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If gWordLen = 0
+    ShotDump()
+    ProcedureReturn
+  EndIf
+  If WordIs("arm") <> 0
+    ShotArm(1)
+    PrintN("The next payload this board enters will have its last presented frame")
+    PrintN("copied into the capture area before anything repaints over it, whether")
+    PrintN("or not the payload asks. Read it back afterwards with shot.")
+    PrintN("  It is armed for ONE run. Arm it again for the next one - an arm that")
+    PrintN("  stayed set would overwrite a picture somebody was still reading.")
+    ProcedureReturn
+  EndIf
+  If WordIs("disarm") <> 0 Or WordIs("off") <> 0
+    ShotArm(0)
+    PrintN("The capture on return is disarmed. A payload that asks for a capture")
+    PrintN("itself still gets one; nothing is taken on its way back.")
+    ProcedureReturn
+  EndIf
+  If WordIs("now") <> 0
+    If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) = 0
+      PrintN("!! nothing was captured: there is no screen behind the console, or its")
+      PrintN("   presented surface is larger than the capture area. Type screen on,")
+      PrintN("   then shot now. map prints the area and its size.")
+      ProcedureReturn
+    EndIf
+    Print("Kept the screen as it is now; it is picture number ")
+    PrintDec(ScrShotField(#MON_SHOT_OFF_SEQ))
+    PrintN(".")
+    ProcedureReturn
+  EndIf
+  If WordIs("status") <> 0 Or WordIs("header") <> 0
+    ShotStatus()
+    ProcedureReturn
+  EndIf
+
+  PrintN("? shot takes arm, disarm, now, status, or nothing at all to stream the")
+  PrintN("  kept picture, so nothing was done.")
+EndProcedure
+
+; ======================================================================
 ;  pr - THE RELIABLE SCREENSHOT, for the wireless console.
 ;
 ;  WHY p IS NOT ENOUGH OVER WI-FI, measured on silicon 2026-08-30: p's

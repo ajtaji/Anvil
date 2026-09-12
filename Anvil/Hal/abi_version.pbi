@@ -37,5 +37,22 @@
 ;  publishes. A lower minor loads - within a major, slots are only ever
 ;  appended.
 ; ----------------------------------------------------------------------
-#SVC_ABI_MINOR   = 1
+; ----------------------------------------------------------------------
+;  1.2 - 2026-09-11. THE SCREENSHOT SLOT.
+;
+;  Console slot 13 - SvcScreenCapture - was filled. It keeps the frame the
+;  screen is showing somewhere a repaint cannot reach, which is the only
+;  way a payload's last picture can survive its own return: the monitor's
+;  first printed line on the way back is painted over the surface the
+;  payload left.
+;
+;  IT IS A MINOR BUMP FOR THE SAME REASON 1.1 WAS. The console group
+;  reserved sixteen slots and used thirteen; the one that was filled was
+;  already pointing at SvcUnimplemented, so a payload built at 1.0 or 1.1
+;  finds every slot it knows exactly where it left it, and one built at
+;  1.2 running on an older monitor gets #SVC_ENOSYS from it - the honest
+;  answer for "this Anvil cannot keep a picture for you".
+;  #SVC_SLOT_COUNT does not move: the slot existed, it was empty.
+; ----------------------------------------------------------------------
+#SVC_ABI_MINOR   = 2
 #SVC_SLOT_COUNT  = 184         ; slots at 1.0; the boot code sizes its check by it

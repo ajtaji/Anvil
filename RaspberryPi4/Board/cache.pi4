@@ -467,6 +467,47 @@ Procedure RunAt(a.i)
 
   CallAddr()
 
+  ; ------------------------------------------------------------------
+  ;  THE PICTURE, BEFORE ANYTHING ELSE HAPPENS.
+  ;
+  ;  This is the FIRST statement after the payload came back, and the
+  ;  position is the whole feature. Every line printed below this point
+  ;  goes into the console grid and is painted over the surface the
+  ;  payload left behind, so the frame being asked about is destroyed by
+  ;  the monitor's own report that the payload returned. It has to be
+  ;  copied out of the way before a single character is printed - not
+  ;  after the network is back, not after the caches are, and certainly
+  ;  not at the prompt.
+  ;
+  ;  WHY THE RULING SAYS IT MUST EXIST. A payload ran four times on
+  ;  2026-09-11, returned cleanly every time and put nothing on the
+  ;  panel; the fifth drew a garbled frame. Nothing in any of those five
+  ;  runs came back with evidence of what the screen held, so "clean"
+  ;  and "garbled" were indistinguishable in the transcript. Every board
+  ;  run comes back with a picture now.
+  ;
+  ;  IT ONLY HAPPENS IF SOMEBODY ARMED IT, and the arm is taken here -
+  ;  read and cleared in one call - so a capture cannot be armed once and
+  ;  quietly overwrite the picture of a later run nobody was watching.
+  ;  A payload that wants its own frame kept calls the service slot and
+  ;  does not need this at all.
+  ;
+  ;  NOTHING IS PRINTED ON FAILURE AND THAT IS DELIBERATE HERE. The
+  ;  network has not been reclaimed yet and the console's own state is
+  ;  whatever the payload left; a sentence at this instant would be one
+  ;  more thing that can wedge on the path out of a payload. The result
+  ;  is reported by `shot`, which says plainly that the area holds no
+  ;  picture - and a host tool that armed a capture and got no picture
+  ;  fails its run for exactly that reason.
+  ;
+  ;  x0 IS ALREADY IN gGoRc. CallAddr stored it before anything else it
+  ;  does, so the number in the capture's header is the one the line at
+  ;  the bottom of this procedure prints, by construction.
+  ; ------------------------------------------------------------------
+  If ShotTakeArm() <> 0
+    ScrShotNow(#MON_SHOT_WHO_RETURN, gGoRc)
+  EndIf
+
   ; RECLAIM GENET BEFORE TOUCHING CACHES, DISPLAY DMA OR NETWORK SOFTWARE.
   ; A returning payload may have enabled this bus master even when Ethernet
   ; was down on entry. The checked stop issues a system barrier and reads the

@@ -458,6 +458,126 @@ EndProcedure
 #MON_PHASE_OFF_BOOTS = 24
 #MON_REGION_PHASE = 6
 
+; ----------------------------------------------------------------------
+;  THE SCREENSHOT CAPTURE AREA - NEW 2026-09-11
+;
+;  WHAT IT IS FOR, AND THE EVENING THAT ASKED FOR IT. A payload ran four
+;  times, returned cleanly every time, and nothing reached the panel;
+;  the fifth run drew a garbled frame. Nobody could say which of those
+;  five was which, because the only record of what the panel showed was
+;  a person looking at it. The ruling was that every board run comes
+;  back with a picture.
+;
+;  THE PICTURE CANNOT BE TAKEN AFTER THE FACT. When a payload returns,
+;  the monitor prints, and printing repaints the console over the whole
+;  surface the payload left behind - so by the time a prompt exists to
+;  type `p` at, the frame being asked about is gone. The only way to
+;  keep it is to copy it somewhere the repaint cannot reach, BEFORE the
+;  repaint, and read that copy out afterwards. This is that somewhere.
+;
+;  WHY IT IS A DECLARED REGION AND NOT A GLOBAL ARRAY. It has to survive
+;  the payload, which owns the whole machine while it runs, and it has
+;  to be writable by the monitor after the payload has returned. BSS is
+;  the wrong home twice over: `--bss-addr` moves it when anything above
+;  it changes size, so nothing outside this image could ever name it,
+;  and a payload that scribbles on the monitor's variables would take
+;  the evidence with it. A fixed address in the band this map calls
+;  "free, but DELIBERATELY NOT OFFERED" is the shape the autoboot
+;  record, the phase record and the framebuffer all already have.
+;
+;  FIVE REQUIREMENTS, THE SAME FIVE #MON_FB_LO AND #MOD_REGION_LO ARE
+;  ARGUED UNDER, AND ONE MORE THAT IS THIS REGION'S OWN:
+;
+;    present on every Pi 4          - so not bank 1 ($40000000 up), which
+;                                     a 1 GB board does not have. 176 MiB
+;                                     is inside bank 0 on every part
+;                                     (which reaches ~$3B2FFFFF).
+;    outside BOTH payload windows   - or a `load`, a `net recv` or a
+;                                     staged upload would land on the
+;                                     capture and InPayload() would ALLOW
+;                                     it. #PAY0 ends $07EFFFFF and #PAY1
+;                                     starts $40000000.
+;    above the payload's own stack  - which grows DOWN from $08000000.
+;    clear of every other owner     - the Globals ($08200000..$089FFFFF),
+;                                     the GENET receive ring ($08100000),
+;                                     the DSI framebuffer
+;                                     ($08A00000..$091FFFFF), the module
+;                                     region ($09200000..$099FFFFF) and
+;                                     the V3D engine's arena
+;                                     ($0A000000..$0AFFFFFF,
+;                                     RaspberryPi4/Board/v3d_console.pi4).
+;    a round megabyte               - so the refusal reads as a window.
+;    NOT THE SOURCE OF ITS OWN COPY - it may not be inside the
+;                                     framebuffer window, because the
+;                                     copy reads that window and writes
+;                                     this one and an overlap would be a
+;                                     picture of itself being taken.
+;
+;  $0B000000 IS THE FIRST ROUND MEGABYTE ABOVE THE V3D ARENA, which is
+;  the highest thing this board had claimed, so this region extends the
+;  reserved run upwards instead of planting one in a gap between two
+;  owners that may both want to grow.
+;
+;  THE SIZE IS 12 MiB AND IT IS SIZED BY THE BIGGEST SCREEN, NOT THE
+;  PANEL. The DSI panel is 800 x 1280 x 4 = 4,096,000 bytes and it would
+;  fit in five; the HDMI surface on this bench is 1824 x 984 x 4 =
+;  7,179,264, and a 1920 x 1200 mode would be 9,216,000. A capture area
+;  that silently held only the panel would take a short picture of an
+;  HDMI console and the host would decode a torn frame rather than be
+;  told. So the pixel window is #MON_SHOT_PIX_BYTES, the capture REFUSES
+;  a frame larger than it, and 12 MiB covers every mode this monitor can
+;  bring up with room left.
+;
+;  THE LAYOUT IS ONE HEADER PAGE AND THEN THE PIXELS. The header is the
+;  first 4 KiB - written as 64-bit words in the first two cache lines,
+;  with the rest of the page reserved - and the pixels start at the next
+;  page, so the copy's destination is page aligned and one cache-clean
+;  run covers it. The header is NOT interleaved with the pixels for the
+;  reason every other record here is kept whole: a reader that finds the
+;  magic knows the geometry before it reads a single pixel.
+;
+;  THE MAGIC IS WRITTEN LAST AND CLEARED FIRST. A reader that finds it
+;  is looking at a complete capture; one that finds it absent is looking
+;  at a capture that was interrupted, or at DRAM that powered up. An
+;  instrument that cannot say "there is no picture here" is worse than
+;  none - the same rule the phase record above is written under.
+; ----------------------------------------------------------------------
+#MON_SHOT_LO        = $0B000000    ; the capture area, 12 MiB
+#MON_SHOT_HI        = $0BBFFFFF
+#MON_SHOT_HDR       = $0B000000    ; the header page
+#MON_SHOT_HDR_BYTES = $00001000
+#MON_SHOT_PIX       = $0B001000    ; the physical frame, exactly as scanned
+#MON_SHOT_PIX_BYTES = 12578816     ; $0BBFFFFF - $0B001000 + 1
+#MON_SHOT_MAGIC     = $414E5653484F5431   ; "ANVSHOT1", positive in a signed .i
+#MON_REGION_SHOT    = 7
+
+; The header's words. LOGICAL width and height are what the picture is
+; STREAMED as - the console's own coordinates, the same numbers `p` puts
+; in its PIC line - and the physical trio (pitch, panelW, panelH) plus
+; the rotation are what the bytes actually are, so the stream can be
+; rebuilt from the copy by exactly the map the live screen uses.
+#MON_SHOT_OFF_MAGIC  = 0
+#MON_SHOT_OFF_SEQ    = 8       ; rises by one on every completed capture
+#MON_SHOT_OFF_W      = 16      ; logical width  - what `shot` streams
+#MON_SHOT_OFF_H      = 24      ; logical height
+#MON_SHOT_OFF_PITCH  = 32      ; physical bytes per row of the copy
+#MON_SHOT_OFF_ROT    = 40      ; 0, 90, 180 or 270
+#MON_SHOT_OFF_TIER   = 48      ; #HW_TIER_CPU / _DMA / _V3D
+#MON_SHOT_OFF_X0     = 56      ; the payload's x0, for a capture on return
+#MON_SHOT_OFF_PANELW = 64      ; physical raster width of the copy
+#MON_SHOT_OFF_PANELH = 72      ; physical raster height
+#MON_SHOT_OFF_BPP    = 80      ; bytes per pixel; 4 or the capture refused
+#MON_SHOT_OFF_SRC    = 88      ; #SCR_SRC_HDMI / #SCR_SRC_DSI
+#MON_SHOT_OFF_WHO    = 96      ; 0 the payload asked, 1 the monitor took it
+#MON_SHOT_OFF_BYTES  = 104     ; pixel bytes copied
+
+; Who took the picture, for #MON_SHOT_OFF_WHO. Two words rather than a
+; bare 0/1 so that the console line and the host tool say the same thing
+; about a capture, and so a third source later is an added constant
+; rather than a re-interpreted flag.
+#MON_SHOT_WHO_PAYLOAD = 0      ; the payload called the service slot
+#MON_SHOT_WHO_RETURN  = 1      ; the monitor took it as the payload returned
+
 ; ======================================================================
 ;  MonImage*() - THE IMAGE MEASURES ITSELF
 ; ----------------------------------------------------------------------
@@ -685,7 +805,7 @@ EndProcedure
 ;  one whose extent moved.
 ; ======================================================================
 Procedure.i HwMonRegions()
-  ProcedureReturn 7
+  ProcedureReturn 8
 EndProcedure
 
 Procedure.i HwMonRegionLo(i.i)
@@ -697,6 +817,7 @@ Procedure.i HwMonRegionLo(i.i)
     Case 4 : ProcedureReturn #CORE_RAW_STACK_LO
     Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_LO
     Case #MON_REGION_PHASE : ProcedureReturn #MON_PHASE_LO
+    Case #MON_REGION_SHOT : ProcedureReturn #MON_SHOT_LO
   EndSelect
   ; A region index this board does not have. Answering an address here
   ; would make HitsMonitor() refuse a range for a region that does not
@@ -714,6 +835,7 @@ Procedure.i HwMonRegionHi(i.i)
     Case 4 : ProcedureReturn #CORE_RAW_STACK_HI
     Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_HI
     Case #MON_REGION_PHASE : ProcedureReturn #MON_PHASE_LO + #MON_PHASE_BYTES - 1
+    Case #MON_REGION_SHOT : ProcedureReturn #MON_SHOT_HI
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -738,6 +860,8 @@ Procedure HwMonRegionSay(i.i)
       Print("the driver-module arena and its staging window")
     Case #MON_REGION_PHASE
       Print("the boot phase record")
+    Case #MON_REGION_SHOT
+      Print("the screenshot capture area")
     Default
       Print("a region this board does not have")
   EndSelect

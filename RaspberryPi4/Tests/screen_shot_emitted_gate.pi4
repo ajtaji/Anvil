@@ -1,0 +1,551 @@
+; Executed-code gate for THE PICTURE THAT OUTLIVES THE PAYLOAD.
+;
+; THE RULING THIS EXISTS UNDER, 2026-09-11: a payload ran four times, came
+; back clean every time and put nothing on the panel; the fifth drew a
+; garbled frame, and nothing in any of those five transcripts could tell the
+; five runs apart. Every board run comes back with a picture now.
+;
+; WHAT IS ACTUALLY EXECUTED HERE is the SHIPPED bodies - ScrCaptureToArea,
+; ScrCaptureSnapshot and the three readers from screen_source.pi4, ScrShotTier
+; and ScrShotNow from screen_cmd.pi4, the rotation map from screen_geom.pi4,
+; the whole of RunAt from cache.pi4, and Anvil/Core/shotarm.pbi as included
+; rather than modelled. Every leaf is a stub that COUNTS or RECORDS. There is
+; no hardware, no panel, no mailbox and no GPU.
+;
+; THE TWO THINGS THIS GATE IS FOR, and both are invisible on a quiet bench:
+;
+;   1. THE CAPTURE IS OF THE PRESENTED PHYSICAL FRAME. With the console
+;      sideways the bytes the console draws into are NOT the bytes the panel
+;      scans, and a capture of the drawing buffer is a picture of an
+;      intention. The modelled panel below is deliberately turned, and the
+;      two buffers deliberately hold different pixels, so capturing the
+;      wrong one cannot pass.
+;
+;   2. IT HAPPENS BEFORE THE REPAINT. The monitor's own report that a
+;      payload returned is printed through the console grid onto the
+;      surface being asked about, so on the board that printing IS the
+;      repaint. The printing stubs here look at the capture area at the
+;      FIRST character printed after the payload came back: if the magic
+;      is not there yet, the frame was painted over before it was kept.
+;
+; #MON_FB_PANEL_W/H and the capture area are MODELLED SMALL so the whole
+; thing runs in a few hundred thousand emitted instructions. The real
+; addresses and sizes in RaspberryPi4/Board/memmap.pi4 are checked
+; statically by tools/screen_shot_emitted_check.py, which is the right
+; layer for "is this region clear of every other owner" - that is a question
+; about a list, not about a copy loop.
+
+; THE ARM'S OWN GLOBALS. Anvil/Core/shotarm.pbi is not included here: its
+; five procedure bodies are SPLICED in with the rest of the product, so that
+; a mutant can be made of them too - the one-shot arm is a rule about
+; ordering and a gate that could not mutate it would only be asserting that
+; today's code does what today's code does.
+Global gShotArm.i
+Global gShotSeq.i
+
+; ---- the vocabulary the product files use ----------------------------
+#SCR_SRC_NONE = 0
+#SCR_SRC_HDMI = 1
+#SCR_SRC_DSI  = 2
+#HW_TIER_CPU  = 0
+#HW_TIER_DMA  = 1
+#HW_TIER_V3D  = 2
+#ANVIL_V3D_CONSOLE = 1
+
+; ---- the modelled panel: 8 across, 12 down, portrait ------------------
+#MON_FB_PANEL_W = 8
+#MON_FB_PANEL_H = 12
+#MON_FB_SCAN    = $07000000     ; what the panel scans
+#MON_FB_DRAW    = $07010000     ; what a sideways console draws into
+
+; ---- the modelled capture area ----------------------------------------
+; The pixel window is deliberately tight: 4096 bytes holds the modelled
+; panel's 384 and refuses the oversized HDMI surface below, which is how
+; the refusal path gets executed rather than reasoned about.
+#MON_SHOT_HDR       = $07100000
+#MON_SHOT_PIX       = $07101000
+#MON_SHOT_PIX_BYTES = 4096
+#MON_SHOT_MAGIC     = $414E5653484F5431
+#MON_SHOT_OFF_MAGIC  = 0
+#MON_SHOT_OFF_SEQ    = 8
+#MON_SHOT_OFF_W      = 16
+#MON_SHOT_OFF_H      = 24
+#MON_SHOT_OFF_PITCH  = 32
+#MON_SHOT_OFF_ROT    = 40
+#MON_SHOT_OFF_TIER   = 48
+#MON_SHOT_OFF_X0     = 56
+#MON_SHOT_OFF_PANELW = 64
+#MON_SHOT_OFF_PANELH = 72
+#MON_SHOT_OFF_BPP    = 80
+#MON_SHOT_OFF_SRC    = 88
+#MON_SHOT_OFF_WHO    = 96
+#MON_SHOT_OFF_BYTES  = 104
+#MON_SHOT_WHO_PAYLOAD = 0
+#MON_SHOT_WHO_RETURN  = 1
+
+; where this gate writes its answers for the host to read
+#GATE_OUT = $07200000
+
+; ---- the state the product reads -------------------------------------
+Global gScrSrc.i
+Global gScrRot.i
+Global gScrDsiUp.i
+Global gDma.i
+Global gV3dConOn.i
+
+; the HDMI surface the firmware would have handed over
+Global gate_hdmiBase.i
+Global gate_hdmiW.i
+Global gate_hdmiH.i
+Global gate_hdmiPitch.i
+Global gate_hdmiBpp.i
+
+; what the stubs saw
+Global gate_paints.i           ; every printing primitive the product reached
+Global gate_afterCall.i        ; 1 once the modelled payload has returned
+Global gate_paintsAfter.i      ; printing done AFTER the payload returned
+Global gate_magicAtFirstPaint.i ; was a picture already kept by then?
+Global gate_drain.i
+Global gate_ethQuiesce.i
+Global gate_ethReclaim.i
+Global gate_ethResume.i
+Global gate_kbdSuspend.i
+Global gate_kbdResume.i
+Global gate_cacheOff.i
+Global gate_cacheOn.i
+Global gate_wdStart.i
+Global gate_wdStop.i
+Global gate_calls.i
+Global gate_firmware.i
+Global gate_dhcpTicks.i
+Global gate_rearms.i
+Global gate_dmaResets.i
+Global gate_hitsMonitor.i
+
+Global gDead.i
+Global gCacheOn.i
+Global gGoAddr.i
+Global gGoRc.i
+Global gGoX0.i
+Global gMonHitLo.i
+Global gMonHitHi.i
+Global gsp.i
+Global gate_payloadRc.i        ; what the modelled payload "returns"
+Global gate_hitsAnswer.i       ; what HitsMonitor is to say this time
+
+; ======================================================================
+;  THE LEAVES. Every one counts or records; none touches hardware.
+;
+;  PRINTING IS OBSERVED AT THE PRIMITIVES AND NOT AT Print ITSELF, because
+;  Print and PrintN are statements in this language rather than procedures:
+;  the compiler routes a literal to str_print_at, a number to PrintDec and
+;  the line ending to PrintNl. Stubbing those three is stubbing every way
+;  the monitor can put a character on its console.
+;
+;  AND THE STUB IS WHERE THE ORDERING IS MEASURED. On the real board a
+;  printed line IS the repaint - it goes through the console grid onto the
+;  surface being asked about - so "was the frame kept before anything
+;  repainted over it" is answered by asking, at the FIRST print after the
+;  payload came back, whether the capture area already holds a picture.
+;  Nothing in the capture path prints, so there is no interference.
+; ======================================================================
+Procedure gate_paint()
+  gate_paints = gate_paints + 1
+  If gate_afterCall <> 0
+    gate_paintsAfter = gate_paintsAfter + 1
+    If gate_magicAtFirstPaint = -1
+      gate_magicAtFirstPaint = PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC)
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure str_print_at(p.i) : gate_paint() : EndProcedure
+Procedure UartWriteStr(s.i) : gate_paint() : EndProcedure
+Procedure PrintDec(v.i)     : gate_paint() : EndProcedure
+Procedure PrintNl()         : gate_paint() : EndProcedure
+Procedure PutAddr(a.i)      : gate_paint() : EndProcedure
+Procedure PutHex16(v.i)     : gate_paint() : EndProcedure
+Procedure UartDrain()       : gate_drain = gate_drain + 1 : EndProcedure
+Procedure NetConsoleFlush() : EndProcedure
+Procedure NetConsoleRearm() : gate_rearms = gate_rearms + 1 : EndProcedure
+Procedure NetDhcpTick()    : gate_dhcpTicks = gate_dhcpTicks + 1 : EndProcedure
+Procedure TouchKeyboardPayloadSuspend() : gate_kbdSuspend = gate_kbdSuspend + 1 : EndProcedure
+Procedure TouchKeyboardPayloadResume()  : gate_kbdResume = gate_kbdResume + 1 : EndProcedure
+Procedure.i EthPayloadQuiesce() : gate_ethQuiesce = gate_ethQuiesce + 1 : ProcedureReturn 0 : EndProcedure
+Procedure.i EthPayloadReclaim() : gate_ethReclaim = gate_ethReclaim + 1 : ProcedureReturn 1 : EndProcedure
+Procedure.i EthPayloadResume(was.i) : gate_ethResume = gate_ethResume + 1 : ProcedureReturn 0 : EndProcedure
+Procedure EthWhyGenet()    : EndProcedure
+Procedure SafetyToFirmware() : gate_firmware = gate_firmware + 1 : EndProcedure
+Procedure.i SafetyWatchdogStart(s.i) : gate_wdStart = gate_wdStart + 1 : ProcedureReturn s : EndProcedure
+Procedure SafetyWatchdogStop() : gate_wdStop = gate_wdStop + 1 : EndProcedure
+Procedure CacheDisable()   : gate_cacheOff = gate_cacheOff + 1 : EndProcedure
+Procedure CacheEnable()    : gate_cacheOn = gate_cacheOn + 1 : EndProcedure
+Procedure.i DmaChannelReset() : gate_dmaResets = gate_dmaResets + 1 : ProcedureReturn 1 : EndProcedure
+Procedure.i DisplayUseDma(on.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i HitsMonitor(lo.i, hi.i)
+  gate_hitsMonitor = gate_hitsMonitor + 1
+  ProcedureReturn gate_hitsAnswer
+EndProcedure
+
+; THE PAYLOAD ITSELF. CallAddr in the product is inline assembly that
+; branches into the payload and stores x0 into gGoRc on the way back. The
+; modelled version does exactly what matters to this gate: it hands the
+; return value over in the same global, in the same place, and it opens the
+; window in which the ordering above is being watched.
+Procedure CallAddr()
+  gate_calls = gate_calls + 1
+  gGoRc = gate_payloadRc
+  gate_afterCall = 1
+  gate_paintsAfter = 0
+  gate_magicAtFirstPaint = -1
+EndProcedure
+
+; The HDMI half of the snapshot seam.
+Procedure.i DisplayViewBase()       : ProcedureReturn gate_hdmiBase  : EndProcedure
+Procedure.i DisplayWidth()          : ProcedureReturn gate_hdmiW     : EndProcedure
+Procedure.i DisplayHeight()         : ProcedureReturn gate_hdmiH     : EndProcedure
+Procedure.i DisplayPitch()          : ProcedureReturn gate_hdmiPitch : EndProcedure
+Procedure.i DisplayBytesPerPixel()  : ProcedureReturn gate_hdmiBpp   : EndProcedure
+
+; ======================================================================
+;  THE SHIPPED BODIES GO HERE. tools/screen_shot_emitted_check.py splices
+;  them in at this marker, straight out of the product files.
+; ======================================================================
+; @@BODY@@
+
+; ======================================================================
+;  THE MODELLED SCREEN. Two buffers with DIFFERENT contents, so a capture
+;  of the wrong one cannot look like a capture of the right one.
+; ======================================================================
+Procedure gate_fill(base.i, w.i, h.i, tag.i)
+  Define x.i
+  Define y.i
+  y = 0
+  While y < h
+    x = 0
+    While x < w
+      PokeL(base + y * w * 4 + x * 4, $FF000000 | (tag << 16) | (y << 8) | x)
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+Procedure gate_wipeArea()
+  Define i.i
+  i = 0
+  While i < 128
+    PokeI(#MON_SHOT_HDR + i, 0)
+    i = i + 8
+  Wend
+  i = 0
+  While i < #MON_SHOT_PIX_BYTES
+    PokeI(#MON_SHOT_PIX + i, 0)
+    i = i + 8
+  Wend
+EndProcedure
+
+; 1 when the captured pixels are the SCAN buffer byte for byte.
+Procedure.i gate_copyIsScan(n.i)
+  Define i.i
+  i = 0
+  While i < n
+    If PeekI(#MON_SHOT_PIX + i) <> PeekI(#MON_FB_SCAN + i)
+      ProcedureReturn 0
+    EndIf
+    i = i + 8
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i gate_copyIsDraw(n.i)
+  Define i.i
+  i = 0
+  While i < n
+    If PeekI(#MON_SHOT_PIX + i) <> PeekI(#MON_FB_DRAW + i)
+      ProcedureReturn 0
+    EndIf
+    i = i + 8
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure gate_fresh()
+  gate_paints = 0
+  gate_afterCall = 0
+  gate_paintsAfter = 0
+  gate_magicAtFirstPaint = -1
+  gate_hitsAnswer = 0
+  gate_drain = 0
+  gate_ethQuiesce = 0
+  gate_ethReclaim = 0
+  gate_ethResume = 0
+  gate_kbdSuspend = 0
+  gate_kbdResume = 0
+  gate_cacheOff = 0
+  gate_cacheOn = 0
+  gate_wdStart = 0
+  gate_wdStop = 0
+  gate_calls = 0
+  gate_firmware = 0
+  gate_dhcpTicks = 0
+  gate_rearms = 0
+  gate_dmaResets = 0
+  gate_hitsMonitor = 0
+  gate_wipeArea()
+  ; The two buffers, with different tags. 8 x 12 physical and 12 x 8
+  ; logical are the same 96 pixels, so a wrong-buffer capture is the same
+  ; LENGTH and different BYTES - which is the only shape of this bug that
+  ; ever reaches a panel.
+  gate_fill(#MON_FB_SCAN, #MON_FB_PANEL_W, #MON_FB_PANEL_H, $11)
+  gate_fill(#MON_FB_DRAW, #MON_FB_PANEL_H, #MON_FB_PANEL_W, $22)
+EndProcedure
+
+; Every header word, checked against what the modelled screen was. Answers
+; 0 when they all agree, or the offset of the first that did not, so a
+; failure names the field.
+Procedure.i gate_header(w.i, h.i, pitch.i, rot.i, tier.i, x0.i, pw.i, ph.i, src.i, who.i, nbytes.i, seq.i)
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC) <> #MON_SHOT_MAGIC : ProcedureReturn 1 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_SEQ) <> seq : ProcedureReturn 2 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_W) <> w : ProcedureReturn 3 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_H) <> h : ProcedureReturn 4 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_PITCH) <> pitch : ProcedureReturn 5 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_ROT) <> rot : ProcedureReturn 6 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_TIER) <> tier : ProcedureReturn 7 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_X0) <> x0 : ProcedureReturn 8 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELW) <> pw : ProcedureReturn 9 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELH) <> ph : ProcedureReturn 10 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_BPP) <> 4 : ProcedureReturn 11 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_SRC) <> src : ProcedureReturn 12 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_WHO) <> who : ProcedureReturn 13 : EndIf
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_BYTES) <> nbytes : ProcedureReturn 14 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE GATE
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  Define x.i
+  Define y.i
+  Define live.i
+  Define kept.i
+
+  gShotArm = 0
+  gShotSeq = 0
+  gMonHitLo = $00200000
+  gMonHitHi = $004FFFFF
+
+  ; ---- 1. THE TURNED PANEL, FRAMEBUFFER TIER. The whole feature in one
+  ;         assertion: the copy is the scan buffer and NOT the drawing one.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 1
+  gDma = 1
+  gV3dConOn = 0
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 1 : ProcedureReturn 10 : EndIf
+  rc = gate_header(12, 8, 32, 90, #HW_TIER_DMA, 0, 8, 12, #SCR_SRC_DSI, #MON_SHOT_WHO_PAYLOAD, 384, 1)
+  If rc <> 0 : ProcedureReturn 20 + rc : EndIf
+  If gate_copyIsScan(384) <> 1 : ProcedureReturn 11 : EndIf
+  ; AND IT IS NOT THE DRAWING BUFFER. Said as its own assertion rather than
+  ; implied by the one above, because the two buffers are the same size and
+  ; a mutant that copies the wrong one passes every length check there is.
+  If gate_copyIsDraw(384) <> 0 : ProcedureReturn 12 : EndIf
+  If ScrShotValid() <> 1 : ProcedureReturn 13 : EndIf
+  If ScrShotPixels() <> #MON_SHOT_PIX : ProcedureReturn 14 : EndIf
+  If ScrShotField(#MON_SHOT_OFF_ROT) <> 90 : ProcedureReturn 15 : EndIf
+
+  ; ---- 2. THE KEPT PICTURE READS BACK AS THE LIVE ONE. `shot` streams the
+  ;         capture through the same rotation map `p` streams the screen
+  ;         through, so every logical pixel has to agree at every corner and
+  ;         everywhere between. This is what makes one host decoder correct.
+  y = 0
+  While y < 8
+    x = 0
+    While x < 12
+      live = ScrCapturePixel(#MON_FB_SCAN, 32, 90, 8, 12, x, y)
+      kept = ScrCapturePixel(ScrShotPixels(), ScrShotField(#MON_SHOT_OFF_PITCH), ScrShotField(#MON_SHOT_OFF_ROT), ScrShotField(#MON_SHOT_OFF_PANELW), ScrShotField(#MON_SHOT_OFF_PANELH), x, y)
+      If live <> kept : ProcedureReturn 40 : EndIf
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+
+  ; ---- 3. THE V3D TIER IS RECORDED AS ITSELF, and the frame is still the
+  ;         one the panel scans: the GPU presents its finished physical
+  ;         frame into the same buffer, so there is no second case here and
+  ;         a tier that named the wrong path would make a measured frame
+  ;         time unreadable.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 270
+  gScrDsiUp = 1
+  gDma = 1
+  gV3dConOn = 1
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 1 : ProcedureReturn 50 : EndIf
+  rc = gate_header(12, 8, 32, 270, #HW_TIER_V3D, 0, 8, 12, #SCR_SRC_DSI, #MON_SHOT_WHO_PAYLOAD, 384, 2)
+  If rc <> 0 : ProcedureReturn 60 + rc : EndIf
+  If gate_copyIsScan(384) <> 1 : ProcedureReturn 51 : EndIf
+
+  ; THE SEQUENCE NUMBER ROSE. It is what tells a host "this picture is of
+  ; the run I just asked for" from "this is the picture that was already
+  ; here", and a stale capture is perfectly well formed.
+  If ScrShotField(#MON_SHOT_OFF_SEQ) <> 2 : ProcedureReturn 52 : EndIf
+  If ShotSeq() <> 2 : ProcedureReturn 53 : EndIf
+
+  ; ---- 4. THE CPU TIER, straight through, at rotation 0 where the two
+  ;         buffers are one.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 0
+  gScrDsiUp = 1
+  gDma = 0
+  gV3dConOn = 0
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 1 : ProcedureReturn 70 : EndIf
+  rc = gate_header(8, 12, 32, 0, #HW_TIER_CPU, 0, 8, 12, #SCR_SRC_DSI, #MON_SHOT_WHO_PAYLOAD, 384, 3)
+  If rc <> 0 : ProcedureReturn 80 + rc : EndIf
+
+  ; ---- 5. THE OTHER SCREEN. An HDMI console's presented frame is the
+  ;         firmware's view base and its own geometry, and the header says
+  ;         so - a capture that recorded the panel's numbers on an HDMI run
+  ;         would be decoded at the wrong pitch and look like a fault.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_HDMI
+  gScrRot = 0
+  gate_hdmiBase = #MON_FB_SCAN
+  gate_hdmiW = 8
+  gate_hdmiH = 12
+  gate_hdmiPitch = 32
+  gate_hdmiBpp = 4
+  gDma = 1
+  gV3dConOn = 0
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 1 : ProcedureReturn 90 : EndIf
+  rc = gate_header(8, 12, 32, 0, #HW_TIER_DMA, 0, 8, 12, #SCR_SRC_HDMI, #MON_SHOT_WHO_PAYLOAD, 384, 4)
+  If rc <> 0 : ProcedureReturn 100 + rc : EndIf
+
+  ; ---- 6. A REFUSED CAPTURE ON TOP OF A GOOD ONE. THE AREA IS NOT WIPED
+  ;         FIRST, on purpose: this is the state the board is really in when
+  ;         a run is captured and the next one is refused, and it is the one
+  ;         state in which "the magic is cleared before anything is checked"
+  ;         is the difference between no picture and the previous run's
+  ;         picture presented as this run's.
+  gScrSrc = #SCR_SRC_NONE
+  If ScrShotValid() <> 1 : ProcedureReturn 105 : EndIf
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 0 : ProcedureReturn 106 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 107 : EndIf
+
+  ; ---- 6b. And the same from a clean area, which is the first run's state.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_NONE
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 0 : ProcedureReturn 110 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 111 : EndIf
+  If ShotSeq() <> 4 : ProcedureReturn 112 : EndIf
+
+  ; A DSI console whose panel is not scanning is the same answer.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 0
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 0 : ProcedureReturn 113 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 114 : EndIf
+
+  ; ---- 7. A FRAME BIGGER THAN THE AREA IS REFUSED, not truncated. A short
+  ;         capture decodes as a torn picture and reads as a display fault;
+  ;         a refusal is a fact.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_HDMI
+  gScrRot = 0
+  gate_hdmiBase = #MON_FB_SCAN
+  gate_hdmiW = 64
+  gate_hdmiH = 32
+  gate_hdmiPitch = 256
+  gate_hdmiBpp = 4
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 0 : ProcedureReturn 120 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 121 : EndIf
+
+  ; ---- 8. THE PAYLOAD'S WAY BACK. The arm is set, the payload returns,
+  ;         and the picture is kept BEFORE a single line is printed.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 1
+  gDma = 1
+  gV3dConOn = 0
+  gDead = 5
+  gCacheOn = 1
+  gate_payloadRc = 0
+  ShotArm(1)
+  If RunAt($00500000) <> 1 : ProcedureReturn 130 : EndIf
+  If gate_calls <> 1 : ProcedureReturn 131 : EndIf
+  If ScrShotValid() <> 1 : ProcedureReturn 132 : EndIf
+  ; THE ASSERTION THE WHOLE GATE IS FOR. At the FIRST character the monitor
+  ; printed after the payload came back, the picture was already kept. On
+  ; the board that first character is the repaint; a capture taken after it
+  ; is a picture of the monitor's own report about the run.
+  If gate_magicAtFirstPaint <> #MON_SHOT_MAGIC : ProcedureReturn 133 : EndIf
+  If gate_paintsAfter = 0 : ProcedureReturn 143 : EndIf
+  If gate_copyIsScan(384) <> 1 : ProcedureReturn 134 : EndIf
+  ; AND THE ARM IS SPENT. An arm that survived would overwrite this picture
+  ; with the next run's, and the next run is the one nobody was watching.
+  If ShotArmed() <> 0 : ProcedureReturn 135 : EndIf
+  If ScrShotField(#MON_SHOT_OFF_WHO) <> #MON_SHOT_WHO_RETURN : ProcedureReturn 136 : EndIf
+  ; The monitor's own recovery still happened, in the order it always did.
+  If gate_ethReclaim <> 1 Or gate_cacheOn <> 1 Or gate_kbdResume <> 1 : ProcedureReturn 137 : EndIf
+  If gate_wdStart <> 1 Or gate_wdStop <> 1 : ProcedureReturn 138 : EndIf
+  If gate_paints = 0 : ProcedureReturn 139 : EndIf
+
+  ; ---- 9. THE x0 IN THE HEADER IS THE x0 THE RUN ENDED WITH. A picture
+  ;         and a return value that a host could pair up wrongly are worse
+  ;         than either alone.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 1
+  gDma = 1
+  gate_payloadRc = $65
+  ShotArm(1)
+  If RunAt($00500000) <> 1 : ProcedureReturn 140 : EndIf
+  If ScrShotField(#MON_SHOT_OFF_X0) <> $65 : ProcedureReturn 141 : EndIf
+  If gGoRc <> $65 : ProcedureReturn 142 : EndIf
+
+  ; ---- 10. UNARMED, NOTHING IS TAKEN. The capture is an instrument the
+  ;          operator asks for; a monitor that captured every run would
+  ;          spend a copy of the whole screen on every `run` and overwrite
+  ;          whatever somebody was reading.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 1
+  gDma = 1
+  gate_payloadRc = 0
+  ShotArm(0)
+  If RunAt($00500000) <> 1 : ProcedureReturn 150 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 151 : EndIf
+  If ShotSeq() <> 6 : ProcedureReturn 152 : EndIf
+
+  ; ---- 11. A JUMP INTO THE MONITOR IS STILL REFUSED, and refusing it must
+  ;          not take a capture: nothing ran, so there is no frame to keep.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 1
+  ShotArm(1)
+  gate_hitsAnswer = 1
+  If RunAt($00300000) <> 0 : ProcedureReturn 160 : EndIf
+  If gate_calls <> 0 : ProcedureReturn 161 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 162 : EndIf
+  ; THE ARM SURVIVES A REFUSAL. Nothing ran, so there is no frame to keep,
+  ; and disarming here would mean an operator who mistyped an address had to
+  ; remember to arm again - which is exactly how a run comes back with no
+  ; picture and nobody can say why.
+  If ShotArmed() <> 1 : ProcedureReturn 163 : EndIf
+  ShotArm(0)
+
+  PokeI(#GATE_OUT, gate_paints)
+  PokeI(#GATE_OUT + 8, ShotSeq())
+  ProcedureReturn 0
+EndProcedure
+
+Main()

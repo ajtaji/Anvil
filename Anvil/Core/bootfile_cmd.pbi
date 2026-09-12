@@ -301,6 +301,7 @@ EndProcedure
 ;
 ;    boot <name>        load, verify and enter that container now
 ;    boot mem <addr>    the same, for a container already in memory
+;    boot mem <addr> shot   the same, and keep the frame it leaves behind
 ;    boot ok            clear the failure counter - the payload is good
 ;    boot clear         stop booting a file at start-up
 ;    boot status        show the four settings and what they mean
@@ -525,6 +526,39 @@ Procedure CmdBoot()
     If AddrAllowed(a, a + 95, 0, "boot mem", "booted") = 0
       ProcedureReturn
     EndIf
+
+    ; --- boot mem <addr> shot -----------------------------------------
+    ; ONE LINE THAT ARMS AND BOOTS, because a host tool driving a board
+    ; over a console has to send `shot arm` and `boot mem` as two
+    ; commands and the gap between them is where a board that reset in
+    ; between comes back disarmed and boots anyway - a run that looks
+    ; ordinary and comes back with no picture. Said in one line, the two
+    ; cannot get out of step.
+    ;
+    ; IT IS THE SAME ARM `shot arm` SETS and not a second path: one
+    ; boolean, one place, one board-side capture that takes it. See
+    ; Anvil/Core/shotarm.pbi.
+    ;
+    ; A WORD THIS COMMAND DOES NOT KNOW IS REFUSED rather than ignored.
+    ; `boot mem 3000000 shoot` silently booting without a capture is how
+    ; an operator learns hours later that the typo was theirs.
+    SkipSpace()
+    gWordAt = gPos
+    SkipWord()
+    gWordLen = gPos - gWordAt
+    If gWordLen > 0
+      If WordIs("shot") = 0
+        PrintN("!! boot mem takes an address and, after it, the single word shot -")
+        PrintN("   which keeps the payload's last frame before this monitor repaints")
+        PrintN("   over it. That word was something else, so nothing was booted.")
+        PrintN("   boot mem <address> [shot]")
+        ProcedureReturn
+      EndIf
+      ShotArm(1)
+      PrintN("The frame this payload leaves on the screen will be kept before")
+      PrintN("anything repaints over it. Read it back afterwards with shot.")
+    EndIf
+
     PmfBootAt(a)
     ProcedureReturn
   EndIf

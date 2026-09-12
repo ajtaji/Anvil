@@ -487,6 +487,41 @@ EndProcedure
 ;  the scaler needs is then one clean of a contiguous run rather than
 ;  one per pixel.
 ; ======================================================================
+; ----------------------------------------------------------------------
+;  ScrPresentable() - IS THERE A PATH FROM THE DRAWN BYTES TO THE GLASS?
+;
+;  1 yes, 0 no, and the difference is not academic. Three of the four
+;  answers below are "yes, and it costs nothing": HDMI scans the bytes the
+;  renderer drew into, and so does the DSI panel at rotation 0 and 180
+;  (180 is the scaler's two mirror bits, applied at scan-out). The fourth
+;  is the one that matters - the DSI source selected, the rotation
+;  sideways, and the pipeline NOT SCANNING. Everything still succeeds, the
+;  transpose runs, and nobody sees anything.
+;
+;  IT EXISTS BECAUSE A PAYLOAD HAS TO BE ABLE TO REFUSE. A UI that drew a
+;  complete frame into a buffer with no route to the panel and returned
+;  cleanly is the exact failure that cost four board runs: every number
+;  said the session was fine. The console can afford to present into a
+;  dead channel - it is logging to a UART as well - and a payload that
+;  owns the screen cannot, because the screen is the whole of what it has
+;  to say.
+;
+;  ScrPresent ASKS THIS RATHER THAN RESTATING IT, so there is one place
+;  the rule is written and no way for the two to drift.
+; ----------------------------------------------------------------------
+Procedure.i ScrPresentable()
+  If gScrSrc = #SCR_SRC_HDMI
+    ProcedureReturn 1
+  EndIf
+  If gScrSrc <> #SCR_SRC_DSI
+    ProcedureReturn 0
+  EndIf
+  If gScrDsiUp = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure ScrPresent(y0.i, y1.i)
   Define sy.i
   Define lh.i
@@ -498,7 +533,7 @@ Procedure ScrPresent(y0.i, y1.i)
   If ScrSideways(gScrRot) = 0
     ProcedureReturn
   EndIf
-  If gScrDsiUp = 0
+  If ScrPresentable() = 0
     ProcedureReturn
   EndIf
 
@@ -724,6 +759,166 @@ Procedure.i ScrCaptureSnapshot(*base, *w, *h, *pitch, *rot, *panelW, *panelH, *b
   PokeI(*panelH, ph)
   PokeI(*bpp, d)
   ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  ScrCaptureToArea - KEEP THE PRESENTED FRAME SOMEWHERE A REPAINT
+;  CANNOT REACH.
+; ----------------------------------------------------------------------
+;  THE PROBLEM, IN ONE SENTENCE. A payload's last frame is on the panel
+;  for exactly as long as it takes the monitor to print its first line
+;  afterwards, and the only person who ever saw it was somebody watching
+;  the glass. The ruling of 2026-09-11 is that every board run comes back
+;  with a picture; this is the copy that makes that possible, and
+;  RaspberryPi4/Board/screen_cmd.pi4's `shot` is what reads it out.
+;
+;  IT COPIES THE PHYSICAL SCANOUT AND NOT THE LOGICAL SURFACE, and that
+;  distinction is the whole correctness of this procedure on this bench.
+;  The panel is bolted down landscape, so the console is normally at 90
+;  degrees: it DRAWS into a 1280 x 800 buffer (#MON_FB_DRAW) which the
+;  panel never scans, and ScrPresent transposes the damaged band into the
+;  800 x 1280 buffer the HVS reads (#MON_FB_SCAN). A capture of the
+;  drawing buffer would be a picture of what the console meant, taken
+;  from bytes the panel has never displayed - and on a run where the
+;  present never happened it would show a frame nobody saw. So the source
+;  is ScrCaptureSnapshot's answer, which is the front on either tier:
+;  the HVS scan buffer on DSI (V3D presents its finished physical frame
+;  into the same buffer, so the GPU tier needs no second case), and the
+;  firmware's view base on HDMI.
+;
+;  THE HEADER CARRIES BOTH GEOMETRIES BECAUSE THE COPY IS PHYSICAL. The
+;  bytes are the raster; the rotation, the pitch and the panel's own
+;  width and height are what turn them back into the console's picture,
+;  and they are recorded rather than assumed so that a capture taken at
+;  one rotation can be read after the operator has typed `screen rotate`.
+;
+;  THE MAGIC IS CLEARED FIRST AND WRITTEN LAST. Between those two moments
+;  the area is explicitly not a capture, so a read that happens across an
+;  interrupted copy - a deadman reset in the middle of one, say - finds
+;  no magic and says there is no picture, rather than decoding half of
+;  this run and half of the one before.
+;
+;  NO CACHE MAINTENANCE, AND THAT IS AN ARGUMENT RATHER THAN AN OMISSION.
+;  One core writes this area and the same core reads it back through the
+;  same caches, in the same session; there is no second master and
+;  nothing here survives a reset on purpose. The capture on payload
+;  return happens with the caches OFF (RunAt disables them before the
+;  handover and re-enables them after), so those bytes go straight to
+;  DRAM and the re-enable starts from a cold cache. The source side is
+;  read exactly the way `p` reads the live screen, which is the behaviour
+;  this monitor has been taking screenshots with all along.
+;
+;  IT REFUSES A FRAME LARGER THAN THE AREA rather than writing what fits.
+;  A short capture decodes as a torn picture and looks like a display
+;  fault; a refusal names the numbers. #MON_SHOT_PIX_BYTES covers every
+;  mode this monitor brings up - see THE SCREENSHOT CAPTURE AREA in
+;  RaspberryPi4/Board/memmap.pi4.
+;
+;  who  is #MON_SHOT_WHO_PAYLOAD or #MON_SHOT_WHO_RETURN.
+;  x0   is the payload's return value for a capture on return, and 0
+;       otherwise; it is in the header so that a picture and the number
+;       the run ended with cannot be paired up wrongly by a host.
+;  tier is asked of the caller rather than read here, because the file
+;       that knows which renderer is live (v3d_console.pi4) is included
+;       after this one and a global cannot be read before it is declared.
+;
+;  Returns 1 on a complete capture, 0 having written nothing but the
+;  cleared magic.
+; ======================================================================
+Procedure.i ScrCaptureToArea(who.i, x0.i, tier.i)
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+  Define n.i
+  Define i.i
+  Define dst.i
+
+  ; THERE IS NO PICTURE UNTIL THIS PROCEDURE SAYS SO. Cleared before the
+  ; first check, not after the last one, so every path out of here -
+  ; including the ones that refuse - leaves an area that reads as empty
+  ; rather than as the previous run's.
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC, 0)
+
+  If ScrCaptureSnapshot(@fb, @w, @h, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    ProcedureReturn 0
+  EndIf
+
+  n = pitch * panelH
+  If n < 1 Or n > #MON_SHOT_PIX_BYTES
+    ProcedureReturn 0
+  EndIf
+
+  ; THE WIDEST ACCESS BOTH ENDS CAN TAKE, AND NOT ONE BYTE WIDER. A
+  ; 64-bit load or store to an address that is not eight-aligned is an
+  ; alignment abort on this part with nothing on the console (the same
+  ; reasoning Anvil/Core/memcmd.pbi's DumpMem is written under), and a
+  ; firmware framebuffer's base and pitch are the firmware's choice, not
+  ; this program's. So the width is chosen from the addresses and the
+  ; length rather than assumed from the panel this bench happens to have.
+  dst = #MON_SHOT_PIX
+  i = 0
+  If (fb % 8) = 0 And (dst % 8) = 0 And (n % 8) = 0
+    While i < n
+      PokeI(dst + i, PeekI(fb + i))
+      i = i + 8
+    Wend
+  ElseIf (fb % 4) = 0 And (dst % 4) = 0 And (n % 4) = 0
+    While i < n
+      PokeL(dst + i, PeekL(fb + i))
+      i = i + 4
+    Wend
+  Else
+    While i < n
+      PokeB(dst + i, PeekA(fb + i))
+      i = i + 1
+    Wend
+  EndIf
+
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_SEQ,    ShotNextSeq())
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_W,      w)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_H,      h)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PITCH,  pitch)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_ROT,    rot)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_TIER,   tier)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_X0,     x0)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELW, panelW)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELH, panelH)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_BPP,    bpp)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_SRC,    gScrSrc)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_WHO,    who)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_BYTES,  n)
+
+  ; LAST. Everything above is the description of a picture that is now
+  ; entirely in the area; this word is what makes a reader believe it.
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC, #MON_SHOT_MAGIC)
+  ProcedureReturn 1
+EndProcedure
+
+; Is there a complete capture in the area? The one question every reader
+; asks first, in one place, so that "no picture" is one answer and not
+; three spellings of it.
+Procedure.i ScrShotValid()
+  ProcedureReturn Bool(PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC) = #MON_SHOT_MAGIC)
+EndProcedure
+
+; One header word, by its offset. A reader that wants five of them makes
+; five calls rather than learning the base address, which keeps the area's
+; placement a fact of memmap.pi4 and of nothing else.
+Procedure.i ScrShotField(off.i)
+  ProcedureReturn PeekI(#MON_SHOT_HDR + off)
+EndProcedure
+
+; Where the captured pixels are. Handed to ScrCapturePixel in place of a
+; live framebuffer, with the header's pitch/rotation/panel geometry, so
+; the copy is read back by exactly the map the live screen is read by.
+Procedure.i ScrShotPixels()
+  ProcedureReturn #MON_SHOT_PIX
 EndProcedure
 
 ; Write one LOGICAL overlay pixel straight to the surface being presented.

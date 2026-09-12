@@ -1165,7 +1165,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 69        ; pmf:build
+#ANVIL_BUILD = 82        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1174,7 +1174,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260911   ; pmf:builddate
-#ANVIL_BUILD_TIME = 170525     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 195934     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -1764,6 +1764,14 @@ XIncludeFile "Anvil/Core/memrange.pbi"
 ; operator - which is most of what follows.
 XIncludeFile "RaspberryPi4/Board/hw_addr.pi4"
 XIncludeFile "Anvil/Core/addrsafe.pbi"
+; IS THE MONITOR TO KEEP THE PAYLOAD'S LAST FRAME? One boolean and a
+; sequence number, and they are core rather than board because the
+; question is the same everywhere and only the answer - which bytes the
+; panel is scanning, and where a copy fits - belongs to a board. It comes
+; in before cache.pi4, whose RunAt takes the arm on the way back from a
+; payload, and before bootfile_cmd.pbi, where `boot mem <addr> shot` sets
+; it.
+XIncludeFile "Anvil/Core/shotarm.pbi"
 XIncludeFile "RaspberryPi4/Board/cache.pi4"
 ; The retained boot-timing record. After cache.pi4 because it cleans its
 ; own page to the point of coherency through CacheCleanRangePoc, and
@@ -2744,6 +2752,15 @@ Procedure Main()
 
     ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0   ; d
       CmdDeadman()
+
+    ; shot - the KEPT picture: the capture area, not the live screen.
+    ; A whole word only and no single letter - s is screen and p is the
+    ; live screenshot, and a monitor that guesses which of three screen
+    ; commands a letter meant is not one anybody should trust. It comes
+    ; before pr and p for no reason but that the three belong together;
+    ; WordIs matches whole words, so the order does not decide anything.
+    ElseIf WordIs("shot") <> 0
+      CmdShot()
 
     ; pr - the RELIABLE screenshot, for the wireless console: the same
     ; picture as p, but as acknowledged binary datagrams with a CRC, so a

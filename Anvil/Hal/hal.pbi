@@ -973,6 +973,25 @@
 ;                                        fast and what makes it wrong over
 ;                                        a picture.
 ;                 HwConTextWidth(*s)     measure without drawing
+;                 HwConCapture()         KEEP THE FRAME THE SCREEN IS
+;                                        SHOWING, where something that is
+;                                        not the screen can read it back.
+;                                        1 kept, 0 refused. Added
+;                                        2026-09-11 under the ruling that
+;                                        every board run comes back with a
+;                                        picture: a payload's last frame
+;                                        is destroyed by the monitor's own
+;                                        first printed line on the way
+;                                        back, so a picture that is not
+;                                        taken while it exists cannot be
+;                                        taken at all. THE BOARD DECIDES
+;                                        WHAT "THE FRAME THE SCREEN IS
+;                                        SHOWING" MEANS - on a board whose
+;                                        console is drawn turned, the
+;                                        buffer being scanned is not the
+;                                        buffer being drawn into, and
+;                                        capturing the second one would
+;                                        keep a picture nobody saw.
 ;                 HwConBacklight(pct)    0..100, or -1 if this board
 ;                                        drives no backlight it can set.
 ;                                        -1 AND NOT A SILENT SUCCESS: a

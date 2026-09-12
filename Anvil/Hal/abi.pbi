@@ -374,7 +374,9 @@
 ;    base  group                 reserved  used at 1.0
 ;      0   Core and lifecycle        16        14
 ;     16   Clock                      8         5
-;     24   Console                   16        12
+;     24   Console                   16        12   (14 at 1.2 - slot 12
+;                                                   SvcTextHeight and slot
+;                                                   13 SvcScreenCapture)
 ;     40   Touch                      8         4
 ;     48   File and storage          16        12
 ;     64   Settings                   8         4
@@ -981,7 +983,13 @@ Procedure.i SvcFrameBegin()
     ProcedureReturn #SVC_ESTATE
   EndIf
   If HwConFrameBegin() = 0
-    gSvcDetail = "this board has no framebuffer to draw into"
+    ; TWO THINGS CAN BE MISSING AND THE SENTENCE NAMES BOTH, because they
+    ; send a person to two different places. No surface at all means the
+    ; mailbox never gave the monitor a framebuffer; no route to the glass
+    ; means there IS a surface and nothing is scanning it, which is the
+    ; state that let a payload draw four complete frames and return 0
+    ; with a dark panel.
+    gSvcDetail = "this board has no framebuffer to draw into, or nothing is scanning the one it has - check `screen` on the monitor for the source and whether the panel is up"
     ProcedureReturn #SVC_EIO
   EndIf
   gSvcFrameOpen = 1
@@ -1110,6 +1118,43 @@ EndProcedure
 ; MEASURED FRAME TIME AND THIS IS WHERE IT COMES FROM.
 Procedure.i SvcFrameCostUs()
   ProcedureReturn gSvcFrameUs
+EndProcedure
+
+; KEEP THIS FRAME. Slot 13, appended inside the console group's reserved
+; block on 2026-09-11, which is what that room is for; #SVC_ABI_MINOR
+; rises to 2 because a slot was filled that was #SVC_ENOSYS before, and
+; nothing existing changed meaning.
+;
+; WHY A PAYLOAD WANTS THIS AT ALL, when it could simply not exit. A
+; payload that returns to the monitor has its last frame painted over
+; before a prompt exists: the monitor prints "the payload returned" and
+; that line goes through the console grid onto the same surface. So the
+; only moment at which a payload's own picture can be kept is while the
+; payload is still running, and this is the call that keeps it. A payload
+; that never returns - a monitor twin, a UI that owns the board - has no
+; such deadline and calls this whenever it wants the bench to see what it
+; drew.
+;
+; IT COPIES THE PRESENTED FRAME AND NOT THE PAYLOAD'S DRAWING SURFACE,
+; and on a board whose console is turned those are different bytes. The
+; seam decides; see HwCon* in Anvil/Hal/hal.pbi and the board's own
+; capture for the reasoning.
+;
+; CALL IT AFTER SvcFrameEnd. Nothing here presents, flips or drains: it
+; keeps what the screen is showing at this instant, which for a payload
+; that has not ended its frame is the frame before this one. That is the
+; honest answer to the question asked rather than a silent present.
+;
+; #SVC_OK, #SVC_EIO when the board has a console group but nothing behind
+; it to photograph (no framebuffer, or a surface larger than the area it
+; would be kept in), #SVC_ENOSYS on a board with no capture at all.
+Procedure.i SvcScreenCapture()
+  If HwConCapture() = 0
+    gSvcDetail = "there is no presented frame to keep, or it will not fit the board's capture area"
+    ProcedureReturn #SVC_EIO
+  EndIf
+  gSvcDetail = 0
+  ProcedureReturn #SVC_OK
 EndProcedure
 
 Procedure.i SvcBacklight(pct.i)
@@ -2042,6 +2087,7 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CONSOLE + 10] = @SvcFrameCostUs
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CONSOLE + 11] = @SvcBacklight
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CONSOLE + 12] = @SvcTextHeight
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_CONSOLE + 13] = @SvcScreenCapture
   CompilerEndIf
 
   ; --- touch, base 40 -------------------------------------------------

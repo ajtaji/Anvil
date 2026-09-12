@@ -12,9 +12,54 @@
 ;  discipline hw_usb.pi4 states for the xHCI stack.
 ;
 ;  INCLUDE ORDER: after RaspberryPi4/Lib/display.pi4,
-;  RaspberryPi4/Monitor/anvil_fonts.pi4 and RaspberryPi4/Board/display.pi4
-;  (DrawSmoothText, SmoothTextWidth), and before Anvil/Hal/abi.pbi, which
+;  RaspberryPi4/Monitor/anvil_fonts.pi4, RaspberryPi4/Board/display.pi4
+;  (DrawSmoothText, SmoothTextWidth) and RaspberryPi4/Board/screen_source.pi4
+;  (ScrPresent - see THE PRESENT below), and before Anvil/Hal/abi.pbi, which
 ;  calls this. House rule 10: this file includes nothing itself.
+;
+; ----------------------------------------------------------------------
+;  THE PRESENT, AND THE DAY IT WAS MISSING
+; ----------------------------------------------------------------------
+;  A PAYLOAD'S FRAME HAS TO BE PRESENTED AND THIS FILE IS WHERE THAT
+;  HAPPENS. HwConFrameEnd used to clean a cache line and return, which is
+;  the whole of what an HDMI surface needs - the firmware scans the same
+;  bytes the caller drew into - and is not the whole of what the DSI panel
+;  needs on the rotation this board actually runs at.
+;
+;  The panel scans 800 x 1280 PORTRAIT and nothing changes that. The
+;  console is used landscape, so at 90 and 270 the monitor adopts a
+;  LOGICAL 1280 x 800 surface (#MON_FB_DRAW, pitch 5120) and ScrPresent
+;  transposes the rows that changed into the portrait buffer the scaler
+;  reads (#MON_FB_SCAN, pitch 3200). Every drawing primitive in this file
+;  writes into the adopted surface, which is the logical one - correctly -
+;  and until today NOTHING MOVED THOSE BYTES TO THE PANEL for a payload.
+;
+;  What that cost: a UI payload ran four times returning 0, having drawn
+;  a complete and correctly laid out frame, with the panel showing either
+;  the console it had replaced or a turned mixture of the two. Every
+;  number said the run was clean. The pixels never left the back buffer.
+;
+;  SO THE PAYLOAD'S FRAME CONTRACT IS THE SAME AS THE TOUCH GROUP'S, IN
+;  THE OTHER DIRECTION. The touch seam hands a payload SCREEN pixels
+;  "already turned and scaled, so no payload ever learns which way up the
+;  panel is bolted"; a payload that had to learn the panel's rotation to
+;  put a pixel back would be the same fact discovered twice, in two
+;  places, with two chances to disagree. The payload draws in LOGICAL
+;  screen coordinates - HwConWidth() by HwConHeight() - and the BOARD
+;  turns them. There is no rotation, no pitch and no physical geometry
+;  anywhere in the published console group, deliberately.
+;
+;  IT IS DAMAGE-DRIVEN, for the same reason the console's own present is.
+;  A transpose of the whole panel is 1,024,000 pixels through a processor
+;  loop with the caches off; a UI that repaints one band should pay for
+;  one band. HwConRect and HwConText widen the band, HwConFrameBegin
+;  clears it, HwConFrameEnd presents exactly it. A frame that drew nothing
+;  presents nothing rather than a screenful of unchanged pixels.
+;
+;  AT ROTATION 0 AND 180, AND ON HDMI, ScrPresent RETURNS ON A COMPARISON
+;  and the cost is the cache maintenance alone - the bytes drawn are the
+;  bytes scanned. There is no flag here and no second path: one call,
+;  which the seam below the console knows how to make cheap.
 ;
 ; ----------------------------------------------------------------------
 ;  WHY THE PIXELS ARE WRITTEN BY A PLAIN LOOP AND NOT BY THE DMA ENGINE
@@ -51,6 +96,48 @@
 
 ; The tier vocabulary. In Anvil/Hal/hal.pbi's portable set, restated here
 ; only in the comment: #HW_TIER_V3D / _DMA / _CPU.
+
+; ----------------------------------------------------------------------
+;  THE DAMAGE BAND - logical rows, inclusive, for the frame now open.
+;
+;  hwConDmg = 0 means NOTHING WAS DRAWN, which is a different state from
+;  "row 0 was drawn" and has to be, or every empty frame would transpose
+;  a row nobody touched. The band is in the same logical coordinates the
+;  caller draws in, because that is what ScrPresent takes.
+; ----------------------------------------------------------------------
+Global hwConDmg.i
+Global hwConDmgY0.i
+Global hwConDmgY1.i
+
+; Widen the band by logical rows y .. y + h - 1. Called from every
+; primitive that puts a pixel down, and from nowhere else; a primitive
+; that draws without calling this is a band of the screen that stops
+; updating and nothing in the drawing code is wrong.
+Procedure HwConDamage(y.i, h.i)
+  Define y1.i
+  If h <= 0
+    ProcedureReturn
+  EndIf
+  y1 = y + h - 1
+  If y < 0
+    y = 0
+  EndIf
+  If y1 < y
+    ProcedureReturn
+  EndIf
+  If hwConDmg = 0
+    hwConDmg = 1
+    hwConDmgY0 = y
+    hwConDmgY1 = y1
+    ProcedureReturn
+  EndIf
+  If y < hwConDmgY0
+    hwConDmgY0 = y
+  EndIf
+  If y1 > hwConDmgY1
+    hwConDmgY1 = y1
+  EndIf
+EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  Geometry. Straight from the surface the mailbox allocated.
@@ -93,19 +180,54 @@ Procedure.i HwConFrameBegin()
   If DisplayBase() = 0
     ProcedureReturn 0
   EndIf
+  ; AND THERE HAS TO BE A ROUTE TO THE GLASS, NOT ONLY A SURFACE. A
+  ; payload that drew a complete frame into a buffer nothing scans and
+  ; returned cleanly is the failure that cost four board runs; the
+  ; screen is the whole of what a UI has to say, so it is refused here
+  ; rather than discovered by somebody watching a dark panel. The
+  ; question is asked in screen_source.pi4, which owns the answer.
+  If ScrPresentable() = 0
+    ProcedureReturn 0
+  EndIf
+  ; A NEW FRAME HAS DRAWN NOTHING YET. The band left over from the last
+  ; one would present rows this frame never touched, which is free on a
+  ; correct picture and is exactly how a stale row survives a redraw.
+  hwConDmg = 0
+  hwConDmgY0 = 0
+  hwConDmgY1 = 0
   ProcedureReturn 1
 EndProcedure
 
+; THIS IS THE PAYLOAD'S PRESENT. See THE PRESENT in the header for what
+; it is and for the day it was not here.
+;
+; The cache maintenance covers the rows that were DRAWN, in the surface
+; that was drawn into; ScrPresent then moves those rows onto the panel
+; and does its own maintenance on the bytes it writes there. At rotation
+; 0 and 180 and on HDMI the two surfaces are the same bytes and
+; ScrPresent returns on a comparison, so the flush below is the whole of
+; what those paths need - which is why it is here and not inside the
+; rotation case.
 Procedure.i HwConFrameEnd()
-  ; NOTHING TO FLIP on the direct path, but the barrier is not optional:
-  ; the payload may be running with the D-cache on (SvcMmuState answers
-  ; that question) and the display controller is reading DRAM, not the
-  ; cache. DisplayCacheLine cleans the surface's lines the same way the
-  ; monitor's own console does after a CPU-drawn frame.
+  Define h.i
   If DisplayReady() = 0
     ProcedureReturn 0
   EndIf
-  DisplayCacheLine()
+  If hwConDmg = 0
+    ProcedureReturn 1
+  EndIf
+  If hwConDmgY0 < 0
+    hwConDmgY0 = 0
+  EndIf
+  If hwConDmgY1 > DisplayHeight() - 1
+    hwConDmgY1 = DisplayHeight() - 1
+  EndIf
+  If hwConDmgY1 < hwConDmgY0
+    ProcedureReturn 1
+  EndIf
+  h = hwConDmgY1 - hwConDmgY0 + 1
+  DisplayFlushRect(0, hwConDmgY0, DisplayWidth(), h)
+  ScrPresent(hwConDmgY0, hwConDmgY1)
   ProcedureReturn 1
 EndProcedure
 
@@ -188,6 +310,10 @@ Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
   sg = (argb >> 8) & $FF
   sb = argb & $FF
 
+  ; The band is widened AFTER the clamp above, so it names rows that were
+  ; really written and never rows the clamp threw away.
+  HwConDamage(y, h)
+
   pitch = DisplayPitch()
   row = 0
   While row < h
@@ -229,13 +355,26 @@ EndProcedure
 ;
 ;  Returns the width drawn.
 ; ----------------------------------------------------------------------
+; THE BAND A RUN OF TEXT DAMAGES IS DELIBERATELY GENEROUS AND SAYS SO.
+; y is the baseline, the face has an ascent above it and a descent below,
+; and the console's magnification can make both larger than the unscaled
+; metric this file reports. A band one whole line height above the
+; baseline and half of one below covers the scaled case with room, and
+; the cost of being wrong in the two directions is not symmetrical: a few
+; tens of extra rows in a transpose are microseconds, and a row of
+; letters that never reaches the panel is a screen a driver reads as
+; broken. It is a DAMAGE estimate, not a metric, and nothing lays out
+; against it.
 Procedure.i HwConText(x.i, y.i, *utf8, argb.i, bg.i)
+  Define lh.i
   If DisplayReady() = 0
     ProcedureReturn 0
   EndIf
   If *utf8 = 0
     ProcedureReturn 0
   EndIf
+  lh = HwConTextHeight()
+  HwConDamage(y - lh, lh + lh / 2 + 1)
   ProcedureReturn DrawSmoothText(x, y, *utf8, 0, argb & $00FFFFFF, bg & $00FFFFFF)
 EndProcedure
 
@@ -259,4 +398,34 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i HwConBacklight(pct.i)
   ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConCapture() - KEEP THE FRAME THE PANEL IS SHOWING.
+;
+;  THE PAYLOAD'S OWN WAY TO ASK FOR A PICTURE. A payload that draws
+;  something worth keeping calls the console group's capture slot when it
+;  has finished presenting; this is what that slot reaches. It is the
+;  same copy the operator's `shot now` makes and the same copy the
+;  monitor takes on a payload's way back, so there is one shape of
+;  capture in the area and one decoder on the host.
+;
+;  IT CAPTURES WHAT THE PANEL IS SCANNING, NOT WHAT THE PAYLOAD DREW
+;  INTO. On this board with the console sideways those are two different
+;  buffers, and the one that matters is the one the glass is reading -
+;  see ScrCaptureToArea in RaspberryPi4/Board/screen_source.pi4 for why a
+;  capture of the drawing buffer would be a picture of an intention.
+;
+;  IT IS AFTER THE PRESENT, NOT INSTEAD OF ONE. This copies; it does not
+;  flip, drain or damage anything. A payload that calls it without having
+;  ended its frame keeps whatever was last presented, which is the honest
+;  answer to the question it asked.
+;
+;  1 on a complete capture, 0 when there is no screen behind the console
+;  or its surface will not fit the area. The seam returns a boolean and
+;  the ABI turns it into a code; the reason a capture was refused is a
+;  property of the board and `shot status` prints it.
+; ----------------------------------------------------------------------
+Procedure.i HwConCapture()
+  ProcedureReturn ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0)
 EndProcedure
