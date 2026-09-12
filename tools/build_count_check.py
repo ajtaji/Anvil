@@ -8,10 +8,9 @@ repository that counts a build. This gate proves it counts, counts once, counts
 under two workers at a time, refuses what it cannot count, and is actually
 called by everything that compiles a board file.
 
-WHAT IT PROVES, and every one of them on a TEMPORARY COPY of the two board
-files - the real RaspberryPi4/Board/board.pi4 and ArduinoQ/Board/board.unoq are
-read for their starting contents and are byte-for-byte unchanged when this gate
-finishes, which is itself checked at the end:
+WHAT IT PROVES, and every fixture runs on a TEMPORARY COPY of the board files.
+The real board files are read for their starting contents and checked at the
+end:
 
   raises by exactly one    a recorded build takes 56 to 57, not to 58 and not
                            to 56. The rest of the file comes back byte for
@@ -29,10 +28,11 @@ finishes, which is itself checked at the end:
                            running, so a build number alone is half an
                            identity; a staged copy hashes the same as
                            the original, which is what every gate runs.
-  every caller's shape     each place in tools/ that compiles a board file is
-                           driven through record_build with the arguments it
-                           actually passes, and each one moves the number by
-                           one.
+  every caller's shape     the canonical builder owns one pre-compile identity
+                           transaction around compile, reversible publication
+                           and ledger commit. Older emitted-code gates that
+                           compile the board directly still report their
+                           successful artifact through record_build.
   honours `off`            `; pmf:build off` freezes the number, the build is
                            still recorded, and the line says frozen=yes.
   refuses a malformed
@@ -48,11 +48,12 @@ finishes, which is itself checked at the end:
                            waits for it, deterministically - not "usually, if
                            the timing is right".
   one compile counts once  the same artifact offered twice is one build.
-  the wiring               every tool in tools/ that runs the compiler over a
-                           board file calls record_build after its own
-                           success guard, nothing asks the compiler for
-                           --bump-build any more, and nothing offers a way to
-                           build without counting.
+  the wiring               the canonical builder calls build_identity before
+                           its compiler helper, publishes reversibly, then
+                           completes the ledger while that context is held.
+                           Direct emitted-code gates call record_build after
+                           their success guard. Nothing asks the compiler for
+                           --bump-build and nothing offers a way around counting.
 
 MUTANTS. Drop the lock, drop the date/time stamp, bump by two, stop recognising
 a compile that was already counted, bump a frozen marker, ignore a malformed
@@ -97,7 +98,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build_count as reference  # noqa: E402
 
-REAL_BOARDS = (ROOT / "RaspberryPi4/Board/board.pi4", ROOT / "ArduinoQ/Board/board.unoq")
+REAL_BOARDS = tuple(ROOT / path for path in reference.BOARDS.values())
 
 # Every place in tools/ that compiles a board file, with the target it compiles
 # it for and the name it signs its ledger lines with. The wiring check below
@@ -579,31 +580,64 @@ def check_lock_blocks(module, c: Checks, where: Path) -> None:
 
 
 # ------------------------------------------------------------------ the wiring
-def names_a_board_path(text: str) -> bool:
-    """Does this source hold a board file as a PATH, rather than in a sentence?
+def compiles_a_literal_board(text: str) -> bool:
+    """Does a ``--compile`` argument resolve to a board entry-point path?
 
-    A string constant with no spaces in it that ends in board.pi4 or board.unoq
-    is a path being handed to something. The same words inside a full sentence -
-    an error message naming where a defect would live - are prose, and a gate
-    that cannot tell the two apart demands a build count from a tool that only
-    ever mentions the monitor.
+    Merely reading board.pi4 to check its include order does not build it. The
+    former scan conflated that with passing the board to the compiler and began
+    rejecting fixture-only emitted-code gates. This small resolver follows the
+    ordinary Path/PurePosixPath, ``/``, str(), relative_to() and as_posix()
+    shapes used by these tools, but only from the list that actually contains
+    ``--compile``.
     """
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return False
+    values = {}
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    values[target.id] = node.value
+
+    def resolve(node, seen=()):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            value = node.value.strip()
-            if " " in value or "\n" in value:
-                continue
-            if value.endswith(("board.pi4", "board.unoq")):
-                return True
+            return node.value.replace("\\", "/")
+        if isinstance(node, ast.Name):
+            if node.id == "ROOT":
+                return ""
+            if node.id in seen or node.id not in values:
+                return None
+            return resolve(values[node.id], (*seen, node.id))
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            left, right = resolve(node.left, seen), resolve(node.right, seen)
+            if left is None or right is None:
+                return None
+            return "/".join(part.strip("/") for part in (left, right) if part)
+        if isinstance(node, ast.Call):
+            name = ast.unparse(node.func)
+            if name in {"str", "Path", "pathlib.Path", "PurePosixPath"} and node.args:
+                return resolve(node.args[0], seen)
+            if name.endswith((".as_posix", ".relative_to")):
+                return resolve(node.func.value, seen)
+        return None
+
+    board_names = {path.name.lower() for path in reference.BOARDS.values()}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        for index, item in enumerate(node.elts[:-1]):
+            if isinstance(item, ast.Constant) and item.value == "--compile":
+                source = resolve(node.elts[index + 1])
+                if source is not None and Path(source).name.lower() in board_names:
+                    return True
     return False
 
 
 def compiling_tools() -> list[Path]:
-    """Every tool that runs a subprocess and holds a board file as a path."""
+    """Every known counter caller plus newly discovered literal-board compile."""
     found = []
     for path in sorted(ROOT.joinpath("tools").rglob("*.py")):
         if "__pycache__" in path.parts or "_work" in path.parts:
@@ -611,14 +645,16 @@ def compiling_tools() -> list[Path]:
         if path.name == Path(__file__).name:
             continue
         text = path.read_text(encoding="utf-8")
-        if "subprocess." not in text or not names_a_board_path(text):
+        name = path.relative_to(ROOT).as_posix()
+        accounted = name == "tools/build.py" or "build_count.record_build(" in text
+        if "subprocess." not in text or not (accounted or compiles_a_literal_board(text)):
             continue
         found.append(path)
     return found
 
 
 def check_wiring(c: Checks) -> None:
-    """One mechanism, called from every compile, with no way around it."""
+    """One module, with a transaction for builds and a recorder for old gates."""
     tools = compiling_tools()
     names = {path.relative_to(ROOT).as_posix() for path in tools}
     # The four that compile the monitor itself, by name: if the scan stops
@@ -632,12 +668,40 @@ def check_wiring(c: Checks) -> None:
     for path in tools:
         text = path.read_text(encoding="utf-8")
         name = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(text)
+        if name == "tools/build.py":
+            builds = [node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef) and node.name == "build"]
+            c.yes(len(builds) == 1, "tools/build.py no longer has one build() owner")
+            transactions = []
+            for node in ast.walk(builds[0]):
+                if not isinstance(node, ast.With):
+                    continue
+                for item in node.items:
+                    expression = item.context_expr
+                    if (isinstance(expression, ast.Call) and
+                            ast.unparse(expression.func) == "build_count.build_identity"):
+                        transactions.append(node)
+            c.yes(len(transactions) == 1,
+                  "tools/build.py does not hold exactly one build_identity transaction")
+            calls = [node for node in ast.walk(transactions[0]) if isinstance(node, ast.Call)]
+            compile_calls = [node for node in calls
+                             if ast.unparse(node.func) == "_compile_and_publish"]
+            register_calls = [node for node in calls
+                              if ast.unparse(node.func).endswith(".register_publication")]
+            complete_calls = [node for node in calls
+                              if ast.unparse(node.func).endswith(".complete")]
+            c.yes(len(compile_calls) == len(register_calls) == len(complete_calls) == 1,
+                  "tools/build.py transaction does not compile, register rollback and complete once")
+            c.yes(transactions[0].lineno < compile_calls[0].lineno <
+                  register_calls[0].lineno < complete_calls[0].lineno,
+                  "tools/build.py transaction order is not reserve, compile, rollback hook, complete")
+            continue
         c.yes("build_count.record_build(" in text,
               f"{name} runs the compiler over a tree that holds a board file and never "
               f"asks build_count whether it just built the monitor. A build that is not "
               f"offered to the counter cannot be counted.")
 
-        tree = ast.parse(text)
         for function in [node for node in ast.walk(tree)
                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
             calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
@@ -647,10 +711,15 @@ def check_wiring(c: Checks) -> None:
                     if ast.unparse(node.func).startswith("subprocess.")]
             if not records or not runs:
                 continue
-            c.yes(min(node.lineno for node in records) > max(node.lineno for node in runs),
-                  f"{name}: {function.name} counts the build before it has run the "
-                  f"compiler. A FAILED BUILD NEVER COUNTS, so the count goes after the "
-                  f"compile and after the check that it succeeded.")
+            records.sort(key=lambda node: node.lineno)
+            runs.sort(key=lambda node: node.lineno)
+            c.yes(len(records) == len(runs),
+                  f"{name}: {function.name} has {len(runs)} compiler runs but "
+                  f"{len(records)} artifact records")
+            c.yes(all(run.lineno < record.lineno
+                      for run, record in zip(runs, records)),
+                  f"{name}: {function.name} records an artifact before its matching "
+                  f"compiler run. A failed compile cannot consume a build number.")
 
     # ONE MECHANISM. The compiler's own bumper raises the file it was handed,
     # which for a gate is a copy in a temporary directory; asking for it as well
@@ -677,8 +746,8 @@ def check_wiring(c: Checks) -> None:
               f"monitor, and the number moving is how anyone can tell it happened.")
 
     build_py = (ROOT / "tools/build.py").read_text(encoding="utf-8")
-    c.yes("build_count.record_build(" in build_py,
-          "tools/build.py does not count the build it just made")
+    c.yes("build_count.build_identity(" in build_py,
+          "tools/build.py does not reserve the identity its compiler will embed")
 
     # The real board files must each carry exactly one enabled marker and both
     # siblings, or the numbers this repository reports are not numbers at all.

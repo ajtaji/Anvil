@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_count  # noqa: E402
@@ -64,6 +65,143 @@ TARGETS = {
     },
 }
 TARGET_ALIASES = {"pi3": ("pi3-loader", "pi3-updater")}
+
+
+class PublishedArtifacts:
+    """A reversible, same-volume publication of one compiler result set."""
+
+    def __init__(self, pairs: list[tuple[Path, Path]], token: str) -> None:
+        self.pairs = pairs
+        self.token = token
+        self.backups: dict[Path, Path] = {}
+        self.published: list[Path] = []
+
+    def publish(self) -> None:
+        try:
+            for staged, final in self.pairs:
+                final.parent.mkdir(parents=True, exist_ok=True)
+                if final.exists():
+                    backup = final.with_name(f".{final.name}.build-backup-{self.token}")
+                    os.replace(final, backup)
+                    self.backups[final] = backup
+                os.replace(staged, final)
+                self.published.append(final)
+        except BaseException:
+            self.rollback()
+            raise
+
+    def rollback(self) -> None:
+        for final in reversed(self.published):
+            try:
+                final.unlink()
+            except FileNotFoundError:
+                pass
+        self.published.clear()
+        for final, backup in self.backups.items():
+            if backup.exists():
+                os.replace(backup, final)
+        self.backups.clear()
+
+    def finalize(self) -> None:
+        for backup in self.backups.values():
+            try:
+                backup.unlink()
+            except FileNotFoundError:
+                pass
+        self.backups.clear()
+
+
+def _stage_output(output: Path, token: str) -> Path:
+    """A unique compiler destination beside the eventual atomic destination."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output.with_name(f".{output.name}.build-stage-{token}")
+
+
+def _compile_and_publish(compiler: str, target: str, source: Path,
+                         output: Path, spec: dict) -> PublishedArtifacts:
+    """Compile to private names, validate/pack, then reversibly publish."""
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
+    staged_output = _stage_output(output, token)
+    staged_slot = None
+    staged_slot_json = None
+    env = os.environ.copy()
+    env["PMF_ROOT"] = str(ROOT)
+    command = [
+        compiler, "--compile", spec["source"].as_posix(), "-t",
+        spec.get("target", target), *spec["args"], "-o", str(staged_output),
+    ]
+    print(f"Building {target}: {spec['source']} -> {spec['output']}")
+    try:
+        completed = subprocess.run(command, cwd=ROOT, env=env, check=False)
+        if completed.returncode:
+            raise SystemExit(
+                f"The {target} build failed with exit code {completed.returncode}. "
+                f"Its build identity and prior artifacts were preserved."
+            )
+        if not staged_output.is_file() or staged_output.stat().st_size == 0:
+            raise SystemExit(
+                f"The {target} compiler reported success but did not write a usable "
+                f"{spec['output']}. Its build identity and prior artifacts were preserved."
+            )
+
+        # Every ordinary A64 compiler result has a PMF sidecar. Treat its
+        # absence as an incomplete artifact, before either file is published.
+        staged_pmf = Path(str(staged_output) + ".pmf")
+        if "--armstub" not in spec["args"] and not staged_pmf.is_file():
+            raise SystemExit(
+                f"The {target} compiler wrote an image without its PMF container. "
+                f"Nothing was published and the build number was not consumed."
+            )
+
+        slot_output = spec.get("slot_output")
+        if slot_output is not None:
+            slot, metadata = wrap_monitor(staged_pmf.read_bytes())
+            slot_path = ROOT / slot_output
+            staged_slot = _stage_output(slot_path, token)
+            staged_slot_json = Path(str(staged_slot) + ".json")
+            atomic_write(staged_slot, slot)
+            atomic_write(
+                staged_slot_json,
+                (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("ascii"),
+            )
+
+        compiler_files = sorted(
+            (path for path in staged_output.parent.glob(staged_output.name + "*")
+             if path.is_file()),
+            key=lambda path: (path != staged_output, path.name),
+        )
+        pairs = [
+            (path, output.with_name(output.name + path.name[len(staged_output.name):]))
+            for path in compiler_files
+        ]
+        if staged_slot is not None and staged_slot_json is not None:
+            slot_path = ROOT / spec["slot_output"]
+            pairs.extend(((staged_slot, slot_path),
+                          (staged_slot_json, Path(str(slot_path) + ".json"))))
+        publication = PublishedArtifacts(pairs, token)
+        publication.publish()
+        print(f"Built {spec['output']} ({output.stat().st_size} bytes).")
+        if staged_slot is not None:
+            print(
+                f"Packed {spec['slot_output']} ({(ROOT / spec['slot_output']).stat().st_size} "
+                f"bytes)."
+            )
+        return publication
+    finally:
+        # A failed compiler or packer may leave a partial private set. It is
+        # never a build product and has no reason to survive the refusal.
+        for path in staged_output.parent.glob(staged_output.name + "*"):
+            if path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        for path in (staged_slot, staged_slot_json):
+            if path is not None and path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
 
 
 # The one application is both the editor and the compiler. On Windows it is
@@ -136,19 +274,13 @@ def build(compiler: str, target: str) -> None:
     hashing anything, and that only works if the number moves with every
     build.
 
-    ONE MECHANISM, AND IT IS tools/build_count.py. This tool used to pass
-    the compiler's own `--bump-build` and let it raise the marker in the file
-    it had been handed. That counted the builds made this way and missed
-    every build made any other way: a gate compiles the whole monitor from
-    a temporary copy, so the compiler's bump landed on a file in a
-    temporary directory and the real board file never moved. Ten monitor
-    builds a gate run went unrecorded, and the ruling that followed was
-    "gate builds do count... I want real build tracking, not estimated".
-    The flag is therefore NOT passed here any more - record_build() below
-    raises the real board file, stamps the date and time, and writes the
-    ledger line, and it is the only thing in this repository that does.
-    Asking for both would bump twice for one build and take two different
-    locks over one file.
+    ONE MECHANISM, AND IT IS tools/build_count.py. It reserves the new
+    identity under the global build lock BEFORE the compiler reads the board
+    file, and keeps the lock through staged artifact publication and ledger
+    append. The former after-compile bump made source say build 8 while the
+    first Pi 3 loader and updater truthfully printed build 7. A failed compile,
+    missing sidecar, publication failure or ledger failure restores the exact
+    prior source, ledger and published artifact set.
 
     THERE IS NO WAY TO BUILD WITHOUT COUNTING. `--no-bump` is gone: a
     build made to verify something is still a build of the monitor, and
@@ -161,52 +293,20 @@ def build(compiler: str, target: str) -> None:
         raise SystemExit(f"Target source is missing: {source.relative_to(ROOT)}")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    env = os.environ.copy()
-    env["PMF_ROOT"] = str(ROOT)
-    command = [
-        compiler, "--compile",
-        spec["source"].as_posix(),
-        "-t",
-        spec.get("target", target),
-        *spec["args"],
-        "-o",
-        str(output),
-    ]
-    print(f"Building {target}: {spec['source']} -> {spec['output']}")
-    completed = subprocess.run(command, cwd=ROOT, env=env, check=False)
-    if completed.returncode:
-        raise SystemExit(
-            f"The {target} build failed with exit code {completed.returncode}."
-        )
-    if not output.is_file() or output.stat().st_size == 0:
-        raise SystemExit(
-            f"The {target} compiler reported success but did not write "
-            f"{spec['output']}."
-        )
-    print(f"Built {spec['output']} ({output.stat().st_size} bytes).")
+    count_target = spec.get("count_target", spec.get("target", target))
+    if build_count.board_for(source, count_target, ROOT) is None:
+        publication = _compile_and_publish(compiler, target, source, output, spec)
+        publication.finalize()
+        return
 
-    slot_output = spec.get("slot_output")
-    if slot_output is not None:
-        pmf = Path(str(output) + ".pmf")
-        if not pmf.is_file():
-            raise SystemExit(f"Pi 3 updater PMF sidecar is missing: {pmf}")
-        slot, metadata = wrap_monitor(pmf.read_bytes())
-        slot_path = ROOT / slot_output
-        atomic_write(slot_path, slot)
-        atomic_write(
-            Path(str(slot_path) + ".json"),
-            (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("ascii"),
-        )
-        print(
-            f"Packed {slot_output} ({len(slot)} bytes, SHA-256 "
-            f"{metadata['slotSha256']})."
-        )
-
-    # AFTER a successful build, never before: the image exists, so the build
-    # happened, so it counts. A target with no board file of its own (the ARM
-    # stub) answers counted=False and nothing moves.
-    counted = build_count.record_build(source, spec.get("count_target", spec.get("target", target)), output,
-                                       by="tools/build.py", compiler=compiler)
+    with build_count.build_identity(
+        source, count_target, compiler=compiler, by="tools/build.py", root=ROOT
+    ) as identity:
+        publication = _compile_and_publish(compiler, target, source, output, spec)
+        # Publication happened reversibly. If hashing or ledger append fails,
+        # build_identity invokes this rollback while it still owns the lock.
+        identity.register_publication(publication.rollback, publication.finalize)
+        counted = identity.complete(output)
     print(f"  {counted.message}")
 
 

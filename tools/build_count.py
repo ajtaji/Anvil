@@ -17,16 +17,19 @@ deleted seconds later. The real board file never moved and the count was not
 real - it was the count of the builds that happened to be made one particular
 way. Ten monitor builds a gate run went unrecorded.
 
-WHAT THIS MODULE OWNS, and it is a single sentence: "a board file was built".
-Hand it the source path that was compiled (the real board file or any copy of
-it), the target, the artifact the compiler produced and the name of the tool
-that asked, and it
+WHAT THIS MODULE OWNS is one identity from source through published artifact.
+The canonical builder calls build_identity() before invoking the compiler; a
+direct emitted-code gate that already compiled a whole monitor reports that
+artifact through the legacy record_build() entry point. Both paths identify
+the real board from the compiled source and use the same marker, lock and
+ledger contract. Together they
 
   1. identifies WHICH REAL BOARD FILE in this repository that compile was a
      build of - RaspberryPi4/Board/board.pi4 for pi4, ArduinoQ/Board/board.unoq
      for unoq, or RaspberryPi3/Board/board.pi3 for the experimental Pi 3;
-  2. raises that file's `; pmf:build` marker by exactly one and stamps the
-     `; pmf:builddate` and `; pmf:buildtime` siblings beside it;
+  2. reserve that file's next `; pmf:build` value and stamp the
+     `; pmf:builddate` and `; pmf:buildtime` siblings beside it before the
+     canonical compiler reads it;
   3. honours `; pmf:build off` - a frozen number does not move, and the build
      is still recorded, because a build that happened is evidence whether or
      not the number was allowed to follow it;
@@ -34,13 +37,11 @@ that asked, and it
 
 ONE MECHANISM, NOT TWO. `--bump-build` is NOT passed by anything in tools/ any
 more, including tools/build.py. Every counted build in this repository goes
-through record_build() in this file and through nothing else. Two bumpers -
-the compiler raising the file it was handed while this module raises the file
-that file came from - would double-count the ordinary build and still miss the
-gate builds, and they would take two different locks over one file, which is
-the lost-update shape this module exists to refuse. The compiler's own bumper
-is untouched and is still what the IDE's build action uses; this repository
-simply does not ask for it.
+through this module: build_identity() owns canonical pre-compile transactions,
+and record_build() records older direct whole-monitor gate compiles only after
+they succeed. Two independent bumpers would double-count an ordinary build,
+still miss temporary gate exports, and take unrelated locks over one file -
+the lost-update shape this module exists to refuse.
 
 `--no-bump` IS GONE. The ruling is that every build counts, and a flag whose
 whole purpose is to make a build not count contradicts it. There is no
@@ -74,9 +75,11 @@ this repository builds on. Either all three moved or none did, and a reader -
 the compiler, in another worker's gate run - never sees a half-written board
 file.
 
-TWO WORKERS RUN GATES AT ONCE. Every read-modify-write of a board file and
-every ledger append happens while holding build/BUILDS.lock, so two concurrent
-builds of the same target count TWO: 56 -> 57 -> 58, never 56 -> 57 twice.
+TWO WORKERS RUN GATES AT ONCE. The canonical transaction holds and heartbeats
+build/BUILDS.lock from the pre-compile reservation through reversible artifact
+publication and ledger append. The legacy recorder holds the same lock for its
+read-modify-write and append. Two concurrent builds of the same target count
+TWO: 56 -> 57 -> 58, never 56 -> 57 twice.
 
 ONE COMPILE IS COUNTED ONCE. Each call fingerprints the compile by the
 artifact it produced - its absolute path, its size, its modification time in
@@ -133,6 +136,7 @@ import os
 from pathlib import Path
 import random
 import sys
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,11 +157,13 @@ BOARDS = {
 LEDGER_NAME = Path("build/BUILDS.log")
 LOCK_NAME = Path("build/BUILDS.lock")
 
-# A lock this old belonged to a process that died holding it. Five minutes is
-# far longer than the longest monitor compile on this bench and short enough
-# that a crashed worker does not wedge the next gate run.
+# A lock this old and not being refreshed belonged to a process that died
+# holding it. A counted compile now holds the lock for the complete source ->
+# artifact -> ledger transaction, so the owner refreshes its mtime while the
+# compiler runs. Without that heartbeat a legitimate long compile would be
+# mistaken for a dead owner and a second compiler could consume the same number.
 LOCK_STALE_SECONDS = 300.0
-LOCK_TIMEOUT_SECONDS = 180.0
+LOCK_TIMEOUT_SECONDS = 900.0
 
 # The constant's ceiling: constants are stored in a signed 64-bit integer, so
 # this is the type's limit and not a number chosen to look big.
@@ -451,6 +457,34 @@ def _splice(data: bytes, start: int, length: int, text: str) -> bytes:
     return data[:start] + text.encode("ascii") + data[start + length:]
 
 
+def _identity_data(data: bytes, number: Site, value: int,
+                   stamp_date: str, stamp_time: str) -> bytes:
+    """Return source bytes carrying one exact compile identity.
+
+    Re-scan after each splice because a decimal growing from 9 to 10 moves all
+    following byte offsets. This is the same byte-preserving marker contract
+    used by the legacy post-build recorder below.
+    """
+    data = _splice(data, number.value_start, number.value_len, str(value))
+    for kind, text in (("date", stamp_date), ("time", stamp_time)):
+        site = next((s for s in scan(data) if s.kind == kind and s.valid), None)
+        if site is not None:
+            data = _splice(data, site.value_start, site.value_len, text)
+    return data
+
+
+def _replace_atomic(path: Path, data: bytes) -> None:
+    """Replace one file from a same-directory temporary, byte for byte."""
+    temporary = path.with_name(f"{path.name}.build_count.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(data)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
 def _write_atomic(path: Path, data: bytes) -> None:
     """One temporary file in the same directory, then one os.replace().
 
@@ -458,17 +492,13 @@ def _write_atomic(path: Path, data: bytes) -> None:
     half-written board file, and a crash between the two leaves the old file
     whole rather than a truncated one.
     """
-    temporary = path.with_name(f"{path.name}.build_count.{os.getpid()}.tmp")
     try:
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
+        _replace_atomic(path, data)
     except OSError as error:
-        with contextlib.suppress(OSError):
-            temporary.unlink()
         raise BuildCountError(
-            f"PMF-BLD-004: the build succeeded but the build number in {path.name} "
-            f"could not be raised ({error}). Nothing in it was changed and the "
-            f"program that was just built still carries the number it had. Check "
+            f"PMF-BLD-004: the build identity in {path.name} could not be written "
+            f"atomically ({error}). Nothing was compiled under a new identity and "
+            f"nothing was recorded. Check "
             f"whether the file is read-only, is open in another program that locks "
             f"it, or sits on a drive you cannot write to."
         ) from error
@@ -476,19 +506,26 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 @contextlib.contextmanager
 def _locked(lock: Path):
-    """Hold build/BUILDS.lock for one whole read-modify-write-and-append.
+    """Hold and heartbeat build/BUILDS.lock for one complete transaction.
 
     Two workers may run gates at the same time, and the bump is a read, an add
     and a write of the same file. Outside a lock the second reader would read
     56 while the first had not yet written 57, and one of the two builds would
-    vanish - the lost update this lock exists to refuse.
+    vanish - the lost update this lock exists to refuse. The token check in the
+    heartbeat and finalizer prevents an old owner from touching or deleting a
+    replacement lock after crash recovery.
     """
     lock.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    # No trailing newline: Windows opens this low-level descriptor in text mode
+    # unless O_BINARY is requested, and os.write() would turn LF into CRLF.  The
+    # owner then could not recognize its own token, so it neither heartbeated nor
+    # removed the lock and every following build waited until stale recovery.
+    token = f"{os.getpid()} {time.time():.6f} {random.getrandbits(64):016x}".encode("ascii")
     while True:
         try:
             handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(handle, f"{os.getpid()} {time.time():.3f}\n".encode("ascii"))
+            os.write(handle, token)
             os.close(handle)
             break
         except FileExistsError:
@@ -511,11 +548,30 @@ def _locked(lock: Path):
                     f"is still going, and delete that lock file if nothing is."
                 )
             time.sleep(0.005 + random.random() * 0.02)
+    stopped = threading.Event()
+
+    def heartbeat() -> None:
+        interval = max(1.0, min(10.0, LOCK_STALE_SECONDS / 4.0))
+        while not stopped.wait(interval):
+            try:
+                if lock.read_bytes() != token:
+                    return
+                os.utime(lock, None)
+            except OSError:
+                return
+
+    pulse = threading.Thread(target=heartbeat, name="anvil-build-lock", daemon=True)
+    pulse.start()
     try:
         yield
     finally:
-        with contextlib.suppress(OSError):
-            lock.unlink()
+        stopped.set()
+        pulse.join(timeout=2.0)
+        try:
+            if lock.read_bytes() == token:
+                lock.unlink()
+        except OSError:
+            pass
 
 
 # -------------------------------------------------------------- identification
@@ -719,15 +775,8 @@ def record_build(source, target: str, image, by: str | None = None,
 
         new_value = number.value + 1
 
-        # All three lines are spliced in memory and written once. The number
-        # first, then each sibling re-scanned against the buffer as it now
-        # stands, because splicing a longer or shorter literal moves every
-        # offset after it.
-        data = _splice(data, number.value_start, number.value_len, str(new_value))
-        for kind, text in (("date", stamp_date), ("time", stamp_time)):
-            site = next((s for s in scan(data) if s.kind == kind and s.valid), None)
-            if site is not None:
-                data = _splice(data, site.value_start, site.value_len, text)
+        # All three lines are spliced in memory and written once.
+        data = _identity_data(data, number, new_value, stamp_date, stamp_time)
 
         _write_atomic(board, data)
         line = _ledger_line(target, new_value, stamp_date, stamp_time, board, source,
@@ -790,9 +839,210 @@ def _already_counted(ledger: Path, fingerprint: str) -> bool:
         return any(needle in line for line in handle)
 
 
+# ---------------------------------------------------------- compile transaction
+class BuildIdentityReservation:
+    """One identity held from source stamp through artifact publication.
+
+    Callers publish their staged artifacts, register the publication's rollback
+    hook, then call complete(). The enclosing build_identity() context commits
+    only when all three facts exist together: stamped source, artifact made from
+    that source, and its ledger line.
+    """
+
+    __slots__ = (
+        "target", "board", "source", "value", "previous_value", "stamp_date",
+        "stamp_time", "compiler_sha256", "who", "root", "ledger", "completed",
+        "result", "_rollback", "_finalize",
+    )
+
+    def __init__(self, *, target: str, board: Path, source, value: int,
+                 previous_value: int, stamp_date: str, stamp_time: str,
+                 compiler_sha256: str, who: str, root: Path, ledger: Path) -> None:
+        self.target = target
+        self.board = board
+        self.source = source
+        self.value = value
+        self.previous_value = previous_value
+        self.stamp_date = stamp_date
+        self.stamp_time = stamp_time
+        self.compiler_sha256 = compiler_sha256
+        self.who = who
+        self.root = root
+        self.ledger = ledger
+        self.completed = False
+        self.result = None
+        self._rollback = None
+        self._finalize = None
+
+    def register_publication(self, rollback=None, finalize=None) -> None:
+        """Attach exact-artifact rollback before complete() can write a ledger."""
+        if self.completed:
+            raise BuildCountError(
+                "ANVIL-BLD-002: artifact rollback was registered after the build "
+                "identity was completed. The transaction cannot prove it can undo "
+                "a failed publication."
+            )
+        self._rollback = rollback
+        self._finalize = finalize
+
+    def complete(self, image) -> Result:
+        """Verify the published artifact and append its matching ledger line."""
+        if self.completed:
+            raise BuildCountError(
+                "ANVIL-BLD-002: one build identity was completed twice. A compile "
+                "has exactly one artifact record, so the duplicate was refused."
+            )
+        artifact = _artifact(image)
+        digest = _sha256(artifact)
+        fingerprint = _fingerprint(artifact, digest)
+        if _already_counted(self.ledger, fingerprint):
+            raise BuildCountError(
+                f"ANVIL-BLD-002: artifact compile={fingerprint} is already recorded "
+                f"in {self.ledger.name}; a newly reserved build identity cannot be "
+                f"attached to an old compile. The source and publication will be "
+                f"rolled back."
+            )
+        frozen = self.value == self.previous_value
+        line = _ledger_line(
+            self.target, self.value, self.stamp_date, self.stamp_time,
+            self.board, self.source, artifact, digest, self.compiler_sha256,
+            self.who, fingerprint, frozen=frozen, root=self.root,
+        )
+        _append(self.ledger, line)
+        self.result = Result(
+            counted=not frozen, already=False, frozen=frozen, target=self.target,
+            board=self.board, value=self.previous_value, new_value=self.value,
+            sha256=digest, image=artifact, line=line,
+            message=(
+                f"{self.board.name} build {self.value} was stamped before compilation; "
+                f"the published artifact and ledger now carry that same identity."
+                if not frozen else
+                f"the build number in {self.board.name} is switched off at "
+                f"{self.value}; the compiled artifact and frozen ledger record agree."
+            ),
+        )
+        self.completed = True
+        return self.result
+
+
+def _restore_ledger(ledger: Path, existed: bool, length: int) -> None:
+    """Restore the exact pre-transaction ledger extent while its lock is held."""
+    if existed:
+        with ledger.open("r+b") as handle:
+            handle.truncate(length)
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            ledger.unlink()
+
+
+@contextlib.contextmanager
+def build_identity(source, target: str, *, compiler, by: str | None = None,
+                   root: Path = ROOT, ledger: Path | None = None):
+    """Reserve the number the compiler will embed and commit it transactionally.
+
+    The global build lock is held from the atomic source stamp until complete()
+    verifies the published artifact and appends the ledger. Any exception,
+    missing artifact, failed compile or failed ledger append restores the exact
+    source bytes, ledger extent and any publication registered by the caller.
+    Consequently a number is consumed if and only if a usable artifact carrying
+    that number exists.
+    """
+    if compiler is None:
+        raise BuildCountError(
+            "ANVIL-BLD-001: no compiler was named for the build transaction, so "
+            "nothing was stamped, compiled or recorded."
+        )
+    root = Path(root)
+    board = board_for(source, target, root)
+    if board is None:
+        raise BuildCountError(
+            f"ANVIL-BLD-003: {Path(source).name} is not the {target} board entry "
+            f"point, so it cannot reserve a monitor build identity."
+        )
+    compiler_sha = compiler_digest(compiler)
+    who = by or _caller()
+    ledger_path = Path(ledger) if ledger else root / LEDGER_NAME
+    lock_path = root / LOCK_NAME
+
+    with _locked(lock_path):
+        ledger_existed = ledger_path.is_file()
+        ledger_length = ledger_path.stat().st_size if ledger_existed else 0
+        original, sites = read_sites(board)
+        number = next((site for site in sites if site.kind == "number"), None)
+        if number is None:
+            raise BuildCountError(
+                f"PMF-BLD-006: {board} carries no build-number marker, so no "
+                f"compile identity was reserved and the compiler was not run."
+            )
+        if number.enabled and number.value >= MAX_BUILD:
+            raise BuildCountError(
+                f"PMF-BLD-005: the build number in {board.name} is already "
+                f"{MAX_BUILD}; reserving another would overflow. Nothing changed."
+            )
+
+        now = time.localtime()
+        stamp_date = time.strftime("%Y%m%d", now)
+        stamp_time = time.strftime("%H%M%S", now)
+        next_value = number.value + 1 if number.enabled else number.value
+        stamped = original
+        if number.enabled:
+            stamped = _identity_data(
+                original, number, next_value, stamp_date, stamp_time
+            )
+            _write_atomic(board, stamped)
+
+        reservation = BuildIdentityReservation(
+            target=target, board=board, source=source, value=next_value,
+            previous_value=number.value, stamp_date=stamp_date,
+            stamp_time=stamp_time, compiler_sha256=compiler_sha, who=who,
+            root=root, ledger=ledger_path,
+        )
+        failure = None
+        try:
+            yield reservation
+            if not reservation.completed:
+                raise BuildCountError(
+                    f"ANVIL-BLD-002: build {next_value} of {board.name} left its "
+                    f"transaction without completing an artifact. The source and "
+                    f"ledger were restored and the number was not consumed."
+                )
+        except BaseException as error:
+            failure = error
+            rollback_errors = []
+            if reservation._rollback is not None:
+                try:
+                    reservation._rollback()
+                except BaseException as rollback_error:
+                    rollback_errors.append(f"artifact rollback: {rollback_error}")
+            try:
+                _restore_ledger(ledger_path, ledger_existed, ledger_length)
+            except BaseException as rollback_error:
+                rollback_errors.append(f"ledger rollback: {rollback_error}")
+            if number.enabled:
+                try:
+                    _replace_atomic(board, original)
+                except BaseException as rollback_error:
+                    rollback_errors.append(f"source rollback: {rollback_error}")
+            if rollback_errors:
+                raise BuildCountError(
+                    f"ANVIL-BLD-004: build {next_value} failed ({failure}) and "
+                    f"rollback was incomplete: {'; '.join(rollback_errors)}. Stop "
+                    f"before another build and inspect the named files."
+                ) from error
+            raise
+        else:
+            if reservation._finalize is not None:
+                # Backups are no longer part of correctness once source,
+                # artifact and ledger agree. Cleanup failure leaves a clearly
+                # named backup, not a false failed-build result.
+                with contextlib.suppress(OSError):
+                    reservation._finalize()
+
+
+
 # --------------------------------------------------------------------- reading
 def current(target: str, root: Path = ROOT) -> int:
-    """The build number a board file holds right now - the NEXT build's number."""
+    """The last successfully published identity in this board's source."""
     board = root / BOARDS[target]
     _, sites = read_sites(board)
     site = next((s for s in sites if s.kind == "number"), None)
