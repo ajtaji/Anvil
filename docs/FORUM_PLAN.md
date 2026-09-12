@@ -27,6 +27,7 @@ feature must have an implementation/proof or an explicit unresolved entry.
 | --- | --- | --- |
 | Compatibility and migration | [FORUM_COMPATIBILITY.md](FORUM_COMPATIBILITY.md) | Read-only installation census, feature inventory and proposed interchange/restore contract. No exporter/importer yet. |
 | Verified registration | `Anvil/Applications/Forum/registration.pbi`, [FORUM_REGISTRATION.md](FORUM_REGISTRATION.md) | Domain sequencing plus fake-provider tests. Crypto, transactional persistence, mail and secure transport are not supplied by the domain. |
+| Text rendering | `Anvil/Applications/Forum/html_text.pbi` | Bounded UTF-8 HTML text/quoted-attribute encoder; invalid input and insufficient capacity leave output unchanged. Not a Markdown renderer, URL policy or dynamic forum route. |
 | Scheduling | `Anvil/Kernel/Scheduler/`, [SCHEDULER_PLAN.md](SCHEDULER_PLAN.md) | Tested logical task lifecycle/queues; no context switch or timer preemption yet. |
 | HTTP service | `Anvil/Services/Http/`, [HTTP_SERVER.md](HTTP_SERVER.md) | Native connection-owned GET/HEAD server, queued TCP acceptance, keepalive and bounded servicing; desk-tested and included in the Pi 4 monitor. No TLS, forum routes or Pi 3 hardware proof yet. |
 | Pi 3 | `RaspberryPi3/Board/platform.pbi`, [NEW_BOARD_PORTS.md](NEW_BOARD_PORTS.md) | Identity stub only. No executable board entry, storage/network drivers or hardware proof. |
@@ -50,6 +51,16 @@ subscriptions, unread state, notifications and moderation history. A historical
 principal can preserve authorship without being an active login account.
 Authorization is applied before returning any entity or search result. Imported
 HTML, Markdown, filenames and URLs are untrusted data, never executable input.
+
+`ForumHtmlText(source,length,destination,capacity)` encodes a caller-owned
+UTF-8 RAM span, escaping ampersands, angle brackets and both quote characters.
+It returns the output byte length without a NUL terminator, or -1 without
+writing on refusal. Input/output spans must be valid, disjoint RAM; input is
+limited to 65536 bytes. It rejects malformed UTF-8 and ASCII controls except
+tab/CR/LF. Use it for plain text and quoted attribute values only, never as
+JavaScript, CSS or URL sanitization. Native regression gate:
+`python tools/forum_html_text_check.py --compiler <PureMetalForge executable>`.
+No user-content endpoint is enabled by this helper alone.
 
 The browser UI must preserve category hierarchy, readable topic/post pages,
 code boxes, editing/preview, navigation, search and moderation controls. Use
