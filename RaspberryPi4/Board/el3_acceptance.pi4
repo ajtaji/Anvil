@@ -1,0 +1,395 @@
+; Explicit in-house EL3 acceptance only. Never called during boot.
+; Requires exceptions.pi4, interrupts.pi4, safety.pi4 and Scheduler/timer_el3.pbi.
+; No board service or printing is called while IRQs are unmasked.
+XIncludeFile "RaspberryPi4/Lib/acceptance_lease.pi4"
+Global e3_irq_count.i
+Global e3_irq_spurious.i
+Global e3_irq_bad.i
+Global e3_timer_control.i
+Global e3_timer_daif.i
+Global e3_timer_enabled.i
+Global e3_timer_pending.i
+Global e3_timer_active.i
+Global e3_timer_hppir.i
+Global e3_fault_armed.i
+Global e3_fault_count.i
+Global e3_fault_pc.i
+Global e3_fault_esr.i
+Global e3_fault_el.i
+Global e3_fault_slot.i
+Global e3_fault_old_vbar.i
+
+Procedure.i E3AcceptIrq()
+  Protected result.i
+  result = AtAcknowledge()
+  If result = 1
+    e3_irq_count = e3_irq_count + 1
+    ; One shot: clear source, then disable its line. Dispatch already EOI'd.
+    If AtStop() = 0 : e3_irq_bad = 1 : ProcedureReturn 0 : EndIf
+    ProcedureReturn 1
+  EndIf
+  If result = 2
+    e3_irq_spurious = e3_irq_spurious + 1
+    If e3_irq_spurious <= 8 : ProcedureReturn 1 : EndIf
+  EndIf
+  e3_irq_bad = 1
+  ProcedureReturn 0
+EndProcedure
+
+; Command entry has deliberately no startup registration. Integrator binds
+; only an explicit operator command after checking recovery is available.
+Procedure CmdEl3Accept()
+  Protected result.i
+  PrintN("EL3 acceptance starts a bounded timer test, then one controlled BRK.")
+  result = E3AcceptTimer()
+  If result <> 1
+    Print("EL3 timer acceptance failed or refused with code ") : PrintDec(result)
+    PrintN(". Check EL3, the primary-core vector/controller lease and timer state; no fault test was started.")
+    If result = -4
+      Print("  irq count=") : PrintDec(e3_irq_count)
+      Print(" spurious=") : PrintDec(e3_irq_spurious)
+      Print(" bad=") : PrintDec(e3_irq_bad)
+      Print(" CNTPS_CTL=") : PutAddr(e3_timer_control)
+      Print(" DAIF=") : PutAddr(e3_timer_daif)
+      Print(" HPPIR=") : PrintDec(e3_timer_hppir) : PrintN("")
+      Print("  INTID29 enabled=") : PrintDec(e3_timer_enabled)
+      Print(" pending=") : PrintDec(e3_timer_pending)
+      Print(" active=") : PrintDec(e3_timer_active) : PrintN("")
+    EndIf
+    ProcedureReturn
+  EndIf
+  PrintN("EL3 timer accepted one IRQ with its source stopped; the observation window ended and ownership was restored.")
+  result = E3AcceptFault()
+  If result <> 1
+    Print("EL3 controlled-fault acceptance failed or refused with code ") : PrintDec(result)
+    PrintN(". Check the saved vector lease and the diagnostic record before retrying.")
+    ProcedureReturn
+  EndIf
+  Print("Controlled BRK returned: EL ") : PrintDec(e3_fault_el)
+  Print(" slot ") : PrintDec(e3_fault_slot)
+  Print(" ESR ") : PutAddr(e3_fault_esr)
+  Print(" PC ") : PutAddr(e3_fault_pc)
+  PrintN(". The original exception table is restored.")
+EndProcedure
+
+ProcedureNaked.i E3Frequency()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  EndASM
+EndProcedure
+ProcedureNaked.i E3Ticks()
+  ASM
+    mrs x0, cntpct_el0
+    ret
+  EndASM
+EndProcedure
+ProcedureNaked.i E3StackMode()
+  ASM
+    mrs x0, spsel
+    ret
+  EndASM
+EndProcedure
+
+; Read-only before InterruptInit: that routine changes the global distributor
+; control, so an enabled or active line must be refused before its first write.
+; A disabled level-sensitive device may quite legitimately be pending while the
+; monitor polls it (USB, network and display do this on the Pi 4); pending by
+; itself owns no delivery path and is preserved.  The timer's own INTID29 is
+; checked independently by InterruptClaim.  The shared acceptance leases prove
+; that released secondary cores are not running another acceptance owner;
+; banked SGI/PPI state on another PE cannot be discovered by primary reads.
+Procedure.i E3GicIdleBeforeInit()
+  Protected count.i
+  Protected enabled.i
+  Protected n.i
+  count = ((PeekL(#IG_D + 4) & 31) + 1) * 32
+  If count < 32 Or count > 256 : ProcedureReturn 0 : EndIf
+  For n = 0 To (count / 32) - 1
+    enabled = PeekL(#IG_D + $100 + n * 4)
+    If n = 0 : enabled = enabled & $FFFF0000 : EndIf
+    If enabled <> 0 Or PeekL(#IG_D + $300 + n * 4) <> 0
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Borrow the normal boot-time GIC owner without applying the generic
+; transfer predicate's stronger "no pending bit anywhere" rule.  Anvil's
+; production drivers are polled, so disabled device lines can remain asserted
+; after boot.  No line with a software handler, an enable, or active ownership
+; may coexist with this diagnostic.
+Procedure.i E3GicCanBorrow(expectedVbar.i)
+  Protected n.i
+  If E3GicIdleBeforeInit() = 0 : ProcedureReturn 0 : EndIf
+  If ig_ready = 0 : ProcedureReturn 1 : EndIf
+  If InterruptContext() = 0 Or expectedVbar <> ig_vbar : ProcedureReturn 0 : EndIf
+  For n = 16 To ig_count - 1
+    If ig_handlers(n) <> 0 Or ig_enabled(n) <> 0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; 1 success; -1 unsafe entry, -2 controller lease, -3 timer setup,
+; -4 no delivery/storm, -5 restoration failure. Never hides cleanup failure.
+Procedure.i E3AcceptTimer()
+  Protected oldHandler.i
+  Protected owned.i
+  Protected hz.i
+  Protected start.i
+  Protected now.i
+  Protected n.i
+  Protected result.i
+  Protected leased.i
+  Protected watchdogOwned.i
+  If AtEnvironment() = 0 Or exception_active <> 0 : ProcedureReturn -1 : EndIf
+  If E3StackMode() <> 1 : ProcedureReturn -1 : EndIf
+  If ExceptionEl() <> 3 Or ExceptionVbar() <> InterruptVbar() : ProcedureReturn -1 : EndIf
+  If SafetyWatchdogRunning() <> 0 : ProcedureReturn -2 : EndIf
+  hz = E3Frequency()
+  If hz < 1000 Or hz > 1000000000 : ProcedureReturn -1 : EndIf
+  If AcceptLeaseAcquire(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+    ProcedureReturn -2
+  EndIf
+  leased = 1
+  owned = 0
+  watchdogOwned = 0
+  If E3GicCanBorrow(ExceptionVbar()) = 0
+    If AcceptLeaseRelease(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0 : ProcedureReturn -5 : EndIf
+    ProcedureReturn -2
+  EndIf
+  ; From the first possible controller/timer mutation until every saved byte is
+  ; restored, a failed acceptance command must have a hardware recovery path.
+  If SafetyWatchdogStart(2) <> 2
+    If AcceptLeaseRelease(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0 : ProcedureReturn -5 : EndIf
+    ProcedureReturn -3
+  EndIf
+  watchdogOwned = 1
+  If ig_ready = 0
+    If InterruptInit(ExceptionVbar()) = 0
+      ; InterruptInit may already have changed controller state.  Do not
+      ; disarm recovery or publish the leases as free without proof of restore.
+      ProcedureReturn -5
+    EndIf
+    owned = 1
+  EndIf
+  ; Recheck after initialization: it wrote controller control state and must
+  ; not be trusted merely because the call returned success.
+  If E3GicCanBorrow(ExceptionVbar()) = 0
+    If owned <> 0
+      If InterruptShutdown() = 0 : ProcedureReturn -5 : EndIf
+    EndIf
+    SafetyWatchdogStop()
+    watchdogOwned = 0
+    If AcceptLeaseRelease(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0 : ProcedureReturn -5 : EndIf
+    ProcedureReturn -2
+  EndIf
+  oldHandler = exception_irq_handler
+  result = -3
+  e3_timer_control = -1 : e3_timer_daif = -1
+  e3_timer_enabled = -1 : e3_timer_pending = -1
+  e3_timer_active = -1 : e3_timer_hppir = -1
+  If AtPrepare(hz / 100) <> 0
+    e3_irq_count = 0 : e3_irq_spurious = 0 : e3_irq_bad = 0
+    ExceptionSetIrqHandler(@E3AcceptIrq)
+    If AtArm() <> 0
+      start = E3Ticks()
+      If InterruptStart() <> 0
+        ; Do not WFI: missing IRQ must reach a deadline without an interrupt.
+        For n = 0 To 9999999
+          now = E3Ticks()
+          If now < start Or now - start >= hz / 10 : Break : EndIf
+        Next
+        e3_timer_control = AtControl()
+        e3_timer_daif = InterruptMask()
+        e3_timer_enabled = (PeekL(#IG_D + $100) >> 29) & 1
+        e3_timer_pending = (PeekL(#IG_D + $200) >> 29) & 1
+        e3_timer_active = (PeekL(#IG_D + $300) >> 29) & 1
+        e3_timer_hppir = PeekL(#IG_C + $18) & 1023
+        If InterruptStop() = 0
+          ; A failed mask/context transition is a failed restoration step.
+          ; AtRelease below may still put the source/controller back, but it
+          ; cannot turn this run into success or disarm recovery ownership.
+          result = -5
+        Else
+          result = -4
+          If e3_irq_count = 1 And e3_irq_bad = 0 And e3_irq_spurious <= 8 And now >= start And now - start >= hz / 10
+            result = 1
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    ; Still masked on every failure path, including Arm/Start refusal.
+    If AtRelease() = 0 : result = -5 : EndIf
+    ExceptionSetIrqHandler(oldHandler)
+  EndIf
+  If owned <> 0
+    If InterruptShutdown() = 0 : result = -5 : EndIf
+  EndIf
+  If watchdogOwned <> 0
+    If result <> -5 And InterruptMask() = 960
+      SafetyWatchdogStop()
+    Else
+      result = -5
+    EndIf
+  EndIf
+  If result <> -5 And leased <> 0
+    If AcceptLeaseRelease(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+      result = -5
+    EndIf
+  EndIf
+  ProcedureReturn result
+EndProcedure
+
+; Dedicated temporary vector table: only exact SPx BRK #0x531 may resume.
+; Other exceptions never advance a PC. No change to normal fatal policy.
+ProcedureNaked E3FaultVector()
+  ASM
+    .align 2048
+e3_fault_vectors:
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_sync
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+    b e3_fault_park
+    .space 124
+e3_fault_sync:
+    stp x0, x1, [sp, #-16]!
+    stp x2, x3, [sp, #-16]!
+    stp x4, x5, [sp, #-16]!
+    adrp x0, global_e3_fault_armed
+    add x0, x0, #:lo12:global_e3_fault_armed
+    ldr x1, [x0]
+    cmp x1, #1
+    b.ne e3_fault_park
+    mrs x1, esr_el3
+    movz x2, #0x531
+    movk x2, #0xF200, lsl #16
+    cmp x1, x2
+    b.ne e3_fault_park
+    mrs x2, elr_el3
+    adr x3, e3_fault_site
+    cmp x2, x3
+    b.ne e3_fault_park
+    mrs x3, spsr_el3
+    ; Only prove the AArch64 mode and interrupt masks this test owns.  Other
+    ; implemented PSTATE fields are preserved by ERET and are deliberately not
+    ; assumed zero merely because this Cortex/gate model does not expose them.
+    movz x4, #0x03DF
+    and x3, x3, x4
+    movz x4, #0x03CD
+    cmp x3, x4
+    b.ne e3_fault_park
+    str xzr, [x0]
+    adrp x0, global_e3_fault_esr
+    add x0, x0, #:lo12:global_e3_fault_esr
+    str x1, [x0]
+    adrp x0, global_e3_fault_pc
+    add x0, x0, #:lo12:global_e3_fault_pc
+    str x2, [x0]
+    adrp x0, global_e3_fault_el
+    add x0, x0, #:lo12:global_e3_fault_el
+    mrs x1, currentel
+    lsr x1, x1, #2
+    str x1, [x0]
+    adrp x0, global_e3_fault_slot
+    add x0, x0, #:lo12:global_e3_fault_slot
+    movz x1, #4
+    str x1, [x0]
+    adrp x0, global_e3_fault_count
+    add x0, x0, #:lo12:global_e3_fault_count
+    movz x1, #1
+    str x1, [x0]
+    add x2, x2, #4
+    msr elr_el3, x2
+    ldp x4, x5, [sp], #16
+    ldp x2, x3, [sp], #16
+    ldp x0, x1, [sp], #16
+    eret
+e3_fault_park:
+    msr daifset, #15
+    wfe
+    b e3_fault_park
+  EndASM
+EndProcedure
+
+ProcedureNaked E3FaultTrigger()
+  ASM
+    mrs x0, vbar_el3
+    adrp x1, global_e3_fault_old_vbar
+    add x1, x1, #:lo12:global_e3_fault_old_vbar
+    str x0, [x1]
+    adr x0, e3_fault_vectors
+    msr vbar_el3, x0
+    isb
+    ; Normalize NZCV; the handler masks the SPSR witness to AArch64 EL3h+DAIF.
+    msr nzcv, xzr
+e3_fault_site:
+    brk #0x531
+    adrp x1, global_e3_fault_old_vbar
+    add x1, x1, #:lo12:global_e3_fault_old_vbar
+    ldr x0, [x1]
+    msr vbar_el3, x0
+    isb
+    ret
+  EndASM
+EndProcedure
+
+Procedure.i E3AcceptFault()
+  Protected result.i
+  If AtEnvironment() = 0 Or exception_active <> 0 : ProcedureReturn -1 : EndIf
+  If E3StackMode() <> 1 : ProcedureReturn -1 : EndIf
+  If ExceptionEl() <> 3 Or ExceptionVbar() <> InterruptVbar() : ProcedureReturn -1 : EndIf
+  If SafetyWatchdogRunning() <> 0 : ProcedureReturn -2 : EndIf
+  If E3GicCanBorrow(ExceptionVbar()) = 0 : ProcedureReturn -2 : EndIf
+  If AcceptLeaseAcquire(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+    ProcedureReturn -2
+  EndIf
+  e3_fault_count = 0 : e3_fault_pc = 0 : e3_fault_esr = 0
+  e3_fault_el = 0 : e3_fault_slot = 0
+  e3_fault_armed = 1
+  If SafetyWatchdogStart(2) <> 2
+    e3_fault_armed = 0
+    AcceptLeaseRelease(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG)
+    ProcedureReturn -3
+  EndIf
+  E3FaultTrigger()
+  If InterruptVbar() <> ExceptionVbar() : ProcedureReturn -5 : EndIf
+  If InterruptMask() <> 960 : ProcedureReturn -5 : EndIf
+  If e3_fault_armed <> 0 Or e3_fault_count <> 1 Or e3_fault_el <> 3 Or e3_fault_slot <> 4 Or e3_fault_esr <> $F2000531
+    ProcedureReturn -4
+  EndIf
+  SafetyWatchdogStop()
+  result = 1
+  If AcceptLeaseRelease(#ACCEPT_OWNER_EL3, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+    result = -5
+  EndIf
+  ProcedureReturn result
+EndProcedure

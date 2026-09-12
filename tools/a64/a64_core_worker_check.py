@@ -24,7 +24,7 @@ TOOLS = ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 import build as anvil_build  # noqa: E402
 
-CORE = ROOT / "RaspberryPi4" / "Lib" / "core_worker.pi4"
+CORE = ROOT / "RaspberryPi4" / "Lib" / "core_worker_impl.pi4"
 MMUSEC = ROOT / "RaspberryPi4" / "Lib" / "mmu_secondary.pi4"
 MEMMAP = ROOT / "RaspberryPi4" / "Board" / "memmap.pi4"
 FIXTURE = ROOT / "RaspberryPi4" / "Tests" / "core_worker_emitted_gate.pi4"
@@ -814,6 +814,7 @@ def build_ownership_mutant(compiler: str, work: Path, label: str,
         Path("RaspberryPi4/Lib/mmu.pi4"),
         Path("RaspberryPi4/Lib/mmu_secondary.pi4"),
         Path("RaspberryPi4/Lib/core_worker.pi4"),
+        Path("RaspberryPi4/Lib/core_worker_impl.pi4"),
         Path("RaspberryPi4/Tests/core_worker_emitted_gate.pi4"),
     ):
         target = root / relative
@@ -880,7 +881,7 @@ def main() -> int:
             emitted_mutants = (
                 (
                     "prepare_guard",
-                    "RaspberryPi4/Lib/core_worker.pi4",
+                    "RaspberryPi4/Lib/core_worker_impl.pi4",
                     "If CoreRawStackOwned(core, stackBase, stackBytes) = 0",
                     "If 0 = 1",
                     14,
@@ -888,7 +889,7 @@ def main() -> int:
                 ),
                 (
                     "exact_pair",
-                    "RaspberryPi4/Lib/core_worker.pi4",
+                    "RaspberryPi4/Lib/core_worker_impl.pi4",
                     "If stackBase <> owned Or stackBytes <> bytes",
                     "If 0 = 1",
                     7,
@@ -912,7 +913,7 @@ def main() -> int:
                 ),
                 (
                     "running_image_overlap",
-                    "RaspberryPi4/Lib/core_worker.pi4",
+                    "RaspberryPi4/Lib/core_worker_impl.pi4",
                     "If stackBase <= HwMonHi() And HwMonLo() < top",
                     "If 0 = 1",
                     23,

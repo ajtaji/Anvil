@@ -1165,7 +1165,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 93        ; pmf:build
+#ANVIL_BUILD = 100        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1174,7 +1174,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260912   ; pmf:builddate
-#ANVIL_BUILD_TIME = 074646     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 114507     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -1536,6 +1536,15 @@ XIncludeFile "RaspberryPi4/Monitor/anvil_logo.pi4"
 XIncludeFile "RaspberryPi4/Monitor/anvil_fonts.pi4"
 
 XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+
+; The resident secondary-core acceptance owner is deliberately assembled
+; before cache.pi4: RunAt and the cache command must be able to refuse a
+; machine-policy handoff while cores 1..3 own these rows, stacks and code.
+; Nothing here releases a core at boot; only the explicit `coretest run`
+; command does that.  core_accept selects the job-capable composition of the
+; same raw worker that the standalone emitted gates exercise.
+XIncludeFile "RaspberryPi4/Lib/mmu_secondary.pi4"
+XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
 
 ; ======================================================================
 ;  THIS BOARD'S CAPABILITIES - what it offers Anvil's command families.
@@ -1988,6 +1997,11 @@ XIncludeFile "Anvil/Core/mod_cmd.pbi"
 ; settings, and BootFileWait(). Separate from the engine above so the
 ; engine can be built - and gated - without a line editor.
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+; Text/reporting half of the explicit multicore acceptance command. Its
+; hardware owner was included above cache.pi4 so the payload and cache paths
+; can see the ownership boundary. This reporting half uses the console's real
+; PrintDec routine already included above; it defines no private formatter.
+XIncludeFile "RaspberryPi4/Board/core_accept_cmd.pi4"
 ; fan - the temperature, the curve and the pulse width. Core, chip-free;
 ; it gates on #CAP_PWM through RequireCap (Anvil/Hal/hal.pbi), drives the
 ; pin through the HwPwm* seam and reads the part through HwTemp*. It comes
@@ -2026,6 +2040,10 @@ XIncludeFile "Anvil/Core/help.pbi"
 XIncludeFile "RaspberryPi4/Board/boot.pi4"
 XIncludeFile "RaspberryPi4/Lib/exceptions.pi4"
 XIncludeFile "RaspberryPi4/Lib/interrupts.pi4"
+; Explicit only: neither the secure timer nor its controlled-fault acceptance
+; runs during boot.  `el3test` below is the sole production entry point.
+XIncludeFile "Anvil/Kernel/Scheduler/timer_el3.pbi"
+XIncludeFile "RaspberryPi4/Board/el3_acceptance.pi4"
 XIncludeFile "RaspberryPi4/Board/exception_support.pi4"
 
 Procedure Main()
@@ -2036,9 +2054,10 @@ Procedure Main()
     ; CAPTURE THE FIRMWARE DEVICE-TREE POINTER, FIRST, BEFORE ANYTHING
     ; TOUCHES x0.
     ;
-    ; The Raspberry Pi armstub enters kernel8.img at EL2h with x0 = the
-    ; firmware's flattened-device-tree pointer and x1=x2=x3=0
-    ; (Datasheets/pi4/armstub8.S:163-171: primary_cpu loads w0 from
+    ; The selected Raspberry Pi armstub enters kernel8.img with x0 = the
+    ; firmware's flattened-device-tree pointer and x1=x2=x3=0. The stock stub
+    ; enters EL2h; Anvil's optional checked stub retains EL3. Both use the same
+    ; handoff (Datasheets/pi4/armstub8.S:163-171: primary_cpu loads w0 from
     ; dtb_ptr32, then br x4). Anvil is kernel8.img, so x0 is that DTB at
     ; _start. Nothing between _start and here has touched it:
     ; EmitCore_A64.pbi's preamble uses x9,x10,x16,x17,x18 for the stack,
@@ -2048,7 +2067,7 @@ Procedure Main()
     ;
     ; x1 is a safe scratch: the stub set it to 0 at entry and nothing reads
     ; it here. The store lands in DRAM because the caches are still off (the
-    ; stub's SCTLR_EL2 has C=0 and Anvil has not enabled the MMU yet), which
+    ; selected stub's active SCTLR bank has C=0 and Anvil has not enabled the MMU yet), which
     ; is why HwFirmwareDtb() reads the right value however the D-cache is set
     ; later. global_gbootdtb is gBootDtb (hw_boot.pi4), already zeroed by the
     ; BSS-zero pass that ran before Main; this overwrites that zero.
@@ -2750,6 +2769,42 @@ Procedure Main()
     ElseIf WordIs("usb") <> 0
       CmdUsb()
 
+    ; EL3 acceptance is never a boot side effect.  The whole word, exact
+    ; arity and explicit transcript make a timer interrupt or controlled BRK
+    ; impossible to trigger through an abbreviation or a mistyped tail.
+    ElseIf WordIs("el3test") <> 0
+      SkipSpace()
+      If gLine[gPos] <> 0
+        PrintN("? el3test takes no arguments; nothing was tested.")
+      Else
+        CmdEl3Accept()
+      EndIf
+
+    ; Resident multicore acceptance has an intentionally small grammar.
+    ; A bare word is read-only status. `run` owns cores 1..3 until restart;
+    ; `stop` parks them permanently and still retains that ownership.
+    ElseIf WordIs("coretest") <> 0
+      SkipSpace()
+      gWordAt = gPos
+      SkipWord()
+      gWordLen = gPos - gWordAt
+      If gWordLen = 0
+        CmdCoreAcceptStatus()
+      Else
+        SkipSpace()
+        If gLine[gPos] <> 0
+          PrintN("? coretest takes exactly run, stop, status, or no argument.")
+        ElseIf WordIs("run") <> 0
+          CmdCoreAcceptRun()
+        ElseIf WordIs("stop") <> 0
+          CmdCoreAcceptStop()
+        ElseIf WordIs("status") <> 0
+          CmdCoreAcceptStatus()
+        Else
+          PrintN("? coretest takes run, stop, status, or no argument.")
+        EndIf
+      EndIf
+
     ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0   ; d
       CmdDeadman()
 
@@ -2792,6 +2847,14 @@ Procedure Main()
     ; so this cannot collide with anything else.
     ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0   ; h, ?
       Help()
+      PrintNl()
+      PrintN("PI 4 EL3 ACCEPTANCE")
+      PrintN("  el3test              one bounded secure-timer IRQ, then one controlled BRK")
+      PrintN("  coretest status      resident secondary-core ownership and last result")
+      PrintN("  coretest run         16 coherent job rounds on cores 1, 2 and 3")
+      PrintN("  coretest stop        acknowledge and permanently park those workers")
+      PrintN("These are explicit diagnostics, never boot actions. After coretest run,")
+      PrintN("restart before changing cache policy or entering a payload.")
 
     Else
       ; ECHO WHAT WAS ACTUALLY TYPED. "unknown command" with no subject is

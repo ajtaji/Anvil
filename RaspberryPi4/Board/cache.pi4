@@ -360,6 +360,17 @@ Procedure RunAt(a.i)
   ; The one place a payload is entered, so `g` and the autoboot cannot
   ; drift apart in what they check or what they print.
   ;
+  ; A released secondary is executing code and reading rows inside this
+  ; resident image.  Handing the machine to a payload would disable this
+  ; translation regime and make those addresses cease to mean what the
+  ; workers were given.  Stopped workers are permanently parked in the same
+  ; resident code, so stop does not release ownership.  Only restart does.
+  If CoreAcceptOwnsSecondaries() <> 0
+    PrintN("!! resident secondary cores own this monitor until restart, so no")
+    PrintN("   payload was entered. Restart Anvil before run, go or boot mem.")
+    ProcedureReturn 0
+  EndIf
+  ;
   ; NOT range-checked against the payload windows, on purpose. Jumping
   ; into something the monitor did not load is a legitimate thing to
   ; want - a U-Boot-resident blob, or a stub poked in by hand with a few

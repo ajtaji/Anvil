@@ -102,10 +102,16 @@ python3 tools/a64/el3_runtime_emitted_check.py --compiler /path/to/PureMetalForg
 ```
 
 This produces `build/pi4/armstub8.bin`; it is not part of `all` and is **not
-installed automatically**. The stub and EL2/EL3 MMU selection pass emitted-code
-tests, but EL3 hardware boot is not yet verified. Secure interrupt handling,
-secondary-core activation and the EL3-to-EL1 handoff remain incomplete. Do not
-change boot configuration without physical recovery access. The stub retains
+installed automatically**. Build 98 and the checked stub passed a witnessed
+physical power cycle on Pi 4: EL3 entry, the secure timer, controlled fault,
+USB/storage and DMA/V3D display all passed. The final cleanup build 99 then
+passed EL3, one 16-round run on all three secondary cores, stop acknowledgements
+and the same peripheral checks after deployment. Build 99 then passed its exact
+physical cold-power-cycle run, including cold leases, touch and Wi-Fi. The
+EL3-to-EL1 handoff remains incomplete, so do not
+change boot configuration without physical recovery access. Exact
+artifacts and the remaining boundary are recorded in
+[`docs/EL3_BOOT_ACCEPTANCE.md`](docs/EL3_BOOT_ACCEPTANCE.md). The stub retains
 its upstream [BSD-3-Clause notice](RaspberryPi4/Board/armstub8.asm).
 
 ### Live time and returning applications

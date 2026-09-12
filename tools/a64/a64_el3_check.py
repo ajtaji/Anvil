@@ -129,8 +129,10 @@ EXPECTED_SYSREGS = [
      "itself: the compiler's preamble opens the EL2 gate (CPTR_EL2, "
      "RaspberryPi4/EmitCore_A64.pbi:569-582) and nothing in a compiled "
      "image opens this one."),
-    ("scr_el3",      0x5B1,
-     "RW|HCE|SMD|RES1|RES1|NS, exactly as armstub8.S:59-66 composes it. "
+    ("scr_el3",      0x5B3,
+     "RW|HCE|SMD|RES1|RES1|NS plus IRQ routing to the EL3 monitor. The "
+     "stock 0x5B1 is insufficient when the stub deliberately stays at EL3: "
+     "a physical IRQ is not taken there unless SCR_EL3.IRQ is set. "
      "SMD=1 leaves SMC undefined, which is the right phase-1 answer while "
      "there is no dispatcher for one to reach."),
     ("actlr_el3",    0x73,
@@ -358,6 +360,22 @@ def check_primary(blob: bytes) -> list[str]:
     where = run_until_branch(cpu, 400, len(blob))
     if where < 0:
         return fails + ["core 0 never left the stub in 400 steps"]
+
+    # The first DAIF mask must execute before SCR_EL3 starts routing physical
+    # IRQs to EL3. Checking the machine words and their byte order makes this
+    # a built-artifact contract rather than trusting a source comment.
+    mask_word = struct.pack("<I", 0xD5034FDF)  # msr daifset, #15
+    scr_word = struct.pack("<I", SR["scr_el3"])  # msr scr_el3, x0
+    mask_at = blob.find(mask_word)
+    scr_at = blob.find(scr_word)
+    if mask_at < 0 or scr_at < 0 or mask_at >= scr_at:
+        fails.append(
+            "the built stub does not execute `msr daifset,#15` before its "
+            "SCR_EL3 write. Enabling SCR_EL3.IRQ while an inherited IRQ mask "
+            "is unknown can vector before Anvil has installed a table.")
+    else:
+        print("   DAIF is masked at 0x%X before SCR_EL3 is written at 0x%X"
+              % (mask_at, scr_at))
 
     if where != kernel:
         fails.append(

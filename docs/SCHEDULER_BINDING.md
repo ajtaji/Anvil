@@ -47,8 +47,10 @@ the comparator, control register and interrupt line need an exclusive owner.
    lease. Every failed step rolls back in reverse order. A rollback
    failure is a retained diagnostic state, never reported as successful teardown.
 
-The binding uses `CNTPS_*_EL1`, INTID29 and requires the stub's exact SCR0x5B1
-configuration, the GIC driver's secure Group1 checks, primary core and EL3h.
+The binding uses `CNTPS_*_EL1`, INTID29 and requires the stub's exact SCR0x5B3
+configuration, including `SCR_EL3.IRQ` so a physical IRQ can be taken while the
+monitor remains at EL3. The stub masks DAIF before establishing that route. The
+binding also requires the GIC driver's secure Group1 checks, primary core and EL3h.
 EL2 refuses before timer access. Arm's [Generic Timer guide](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/Generic%20Timer.pdf)
 identifies CNTPS as the EL3 physical timer. The [Pi device tree](https://github.com/raspberrypi/linux/blob/rpi-6.6.y/arch/arm/boot/dts/broadcom/bcm2711.dtsi)
 lists PPI13 first, and the [timer binding](https://github.com/raspberrypi/linux/blob/rpi-6.6.y/Documentation/devicetree/bindings/timer/arm%2Carch_timer.yaml)

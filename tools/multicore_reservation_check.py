@@ -49,12 +49,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 import build as anvil_build  # noqa: E402
 
 FIXTURE = Path("RaspberryPi4/Tests/multicore_reservation_emitted_gate.pi4")
-CORE = Path("RaspberryPi4/Lib/core_worker.pi4")
+CORE = Path("RaspberryPi4/Lib/core_worker_impl.pi4")
 MMUSEC = Path("RaspberryPi4/Lib/mmu_secondary.pi4")
 MEMMAP = Path("RaspberryPi4/Board/memmap.pi4")
 MMU = Path("RaspberryPi4/Lib/mmu.pi4")
 MEMRANGE = Path("Anvil/Core/memrange.pbi")
-COPIED = (FIXTURE, CORE, MMUSEC, MEMMAP, MMU, MEMRANGE)
+COPIED = (FIXTURE, CORE, Path("RaspberryPi4/Lib/core_worker.pi4"), MMUSEC, MEMMAP, MMU, MEMRANGE)
 
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -350,9 +350,17 @@ def protection_checks(c: Checks, mem, sym, band, which) -> None:
     c.eq(slot(mem, sym, 49), which,
          "HitsMonitor named the wrong region for the band")
     c.eq(slot(mem, sym, 50), 0, "the raw-stack band is inside a payload window")
-    c.eq(slot(mem, sym, 51), 0,
-         "HitsMonitor refused the byte below the band - the reservation is "
-         "wider than the board declares")
+    # Adjacent memory can belong to another legitimate reservation (the
+    # retained boot-phase page now does). Grade the actual emitted region
+    # table, rather than assuming the neighbor is unowned forever.
+    below = band[0] - 1
+    owner = next((i + 1 for i in range(slot(mem, sym, 0))
+                  if slot(mem, sym, 1 + i) <= below <=
+                  slot(mem, sym, 1 + MAX_REGIONS + i)), 0)
+    c.eq(slot(mem, sym, 51), owner,
+         "HitsMonitor disagrees with the declared owner below the raw-stack band")
+    c.yes(owner != which + 1,
+          "the raw-stack reservation incorrectly includes the byte below its band")
     c.yes(slot(mem, sym, 53) != 0,
           "the byte above the band is unprotected; the highest raw stack's "
           "initial SP must land in a region the monitor already owns")

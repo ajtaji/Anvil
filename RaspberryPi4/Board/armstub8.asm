@@ -37,8 +37,8 @@
 ;  The stock BCM2711 GIC stub performs the machine setup below, then
 ;  executes ERET to EL2 before branching to kernel8.img. This version
 ;  deliberately omits that exception return, initializes SCTLR_EL3, masks
-;  DAIF explicitly, and enters kernel8.img at EL3. Everything else keeps
-;  the stock order and values.
+;  DAIF before routing IRQ to EL3, and enters kernel8.img at EL3. Everything
+;  else keeps the stock order and values except that required EL3 IRQ route.
 ;
 ;  This file must be assembled only through the external compiler's
 ;  explicit firmware-stub mode. Ordinary program images remain forbidden
@@ -59,10 +59,14 @@
 ;  256-byte boundary, matching the upstream Makefile's binary rule.
 ;
 ;  CPTR_EL3.TFP is cleared so FP/SIMD cannot be trapped by EL3. SCR_EL3
-;  remains the stock 0x5B1: NS selects the state below EL3, while EL3's
-;  own accesses remain Secure. SMD remains set because this phase has no
-;  SMC dispatcher. Both GIC groups are enabled and all INTIDs are placed
-;  in Group 1 exactly as in the stock BCM2711 GIC stub.
+;  starts from the stock 0x5B1, with IRQ added to make 0x5B3: NS selects
+;  the state below EL3, while EL3's own accesses remain Secure. SMD remains
+;  set because this phase has no
+;  SMC dispatcher. IRQ is added because this stub deliberately remains at
+;  EL3: without SCR_EL3.IRQ, a pending physical IRQ is not taken at EL3.
+;  Both GIC groups are enabled and all INTIDs are placed in Group 1 exactly
+;  as in the stock BCM2711 GIC stub; GICC FIQEn remains clear, so the owned
+;  secure timer is delivered through the monitor's IRQ vector.
 ; ======================================================================
 
 ; ----------------------------------------------------------------------
@@ -77,6 +81,12 @@
 ;   OSC_FREQ        54000000     armstub8.S:54   = $0337F980
 
 _start:
+  ; Route nothing to an unprepared vector. Firmware usually arrives masked,
+  ; but an EL3-retaining stub must establish that fact itself before SCR_EL3
+  ; is allowed to route physical IRQ here. InterruptStart is the sole later
+  ; owner that clears DAIF.I after the monitor has installed its vectors.
+  msr  daifset, #15
+
   ; --- the local timer: increment by 1, source the 54 MHz crystal -----
   ; Bit 9 clear = increment by one rather than two; bit 8 clear = the
   ; crystal rather than the APB clock. armstub8.S:93-99.
@@ -111,8 +121,8 @@ _start:
   movz x0, #0
   msr  cptr_el3, x0
 
-  ; --- SCR_EL3. armstub8.S:59-66, 121-123. See the header note --------
-  movz x0, #0x05B1
+  ; --- SCR_EL3. stock value plus IRQ routing retained at EL3 -----------
+  movz x0, #0x05B3
   msr  scr_el3, x0
 
   ; --- ACTLR_EL3. armstub8.S:68-69, 125-127 ---------------------------
@@ -139,9 +149,9 @@ _start:
   msr  sctlr_el3, x0
   isb
 
-  ; --- mask asynchronous exceptions, which the eret used to do --------
-  ; SPSR_EL3 in the stock stub carries D, A, I and F set and the eret
-  ; restores them. There is no eret here, so this says it outright.
+  ; --- assert the entry mask again at the final handoff ----------------
+  ; The first mask makes configuring SCR/GIC safe. This second assertion
+  ; keeps the final boot contract adjacent to the kernel dispatch it guards.
   msr  daifset, #15
 
   ; ====================================================================
@@ -226,20 +236,21 @@ kernel_entry32:
 ;  for why NS=1 does not change that. Every interrupt is put in group 1
 ;  and both groups are enabled at the distributor and the CPU interface.
 ;
-;  WHAT THE MONITOR INHERITS FROM THIS, written down because
-;  RaspberryPi4/Lib/gic.pi4 has to agree with it and today does not:
+;  WHAT THE MONITOR INHERITS FROM THIS. The resident owner is now
+;  RaspberryPi4/Lib/interrupts.pi4; its EL3 path programs and verifies
+;  these same secure-view values before it accepts an interrupt claim:
 ;
 ;    * GICD_CTLR = 3. In the SECURE view bit 0 is EnableGrp0 and bit 1
-;      is EnableGrp1, so 3 is "forward both". The monitor's GicInit
-;      writes 1, which in the Secure view means "group 0 only" and turns
-;      off the group every interrupt on this board is in.
+;      is EnableGrp1, so 3 is "forward both".
 ;    * GICC_CTLR = $1E7 = EnableGrp0 | EnableGrp1 | AckCtl | the four
 ;      bypass-disable bits, with FIQEn CLEAR - so group 0 signals IRQ
 ;      too, and there is no FIQ path to write a handler for. AckCtl is
 ;      the bit that lets a Secure reader acknowledge a group 1
 ;      interrupt through GICC_IAR, which is exactly what an EL3 monitor
 ;      is doing when it services the timer.
-;    * GICC_PMR = $FF, the widest mask. The monitor narrows it to $F0.
+;    * GICC_PMR = $FF, the widest mask. InterruptInit deliberately
+;      narrows it to $F0 while it owns the interface and restores the
+;      inherited value when that ownership ends.
 ;    * GICD_IGROUPR0..7 = all ones: INTIDs 0..255 are group 1. That
 ;      includes PPI 10 / INTID 26, the EL2 physical timer the monitor
 ;      uses, and PPI 13 / INTID 29, the SECURE physical timer an EL3

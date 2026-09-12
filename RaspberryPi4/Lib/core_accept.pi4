@@ -1,0 +1,274 @@
+; Resident-only BCM2711 EL3 coherent-job acceptance owner.
+; Include after board memmap + mmu + mmu_secondary, INSTEAD OF core_worker.
+; The fixed secondary code and all rows must remain resident until restart.
+#CORE_RAW_RESIDENT_JOBS = 1
+XIncludeFile "RaspberryPi4/Lib/core_worker_impl.pi4"
+
+#CORE_ACCEPT_STRIDE = 256
+#CORE_ACCEPT_MAX_WORK = 4096
+#CORE_ACCEPT_ROUNDS = 16
+#CORE_ACCEPT_SPINS = 1000000
+; request, ack, count, seed, result, observed core, status. No shared line
+; between cores. Primary changes input only after prior ack (acquire).
+Global Dim core_accept_rows.i[160]
+Global core_accept_started.i
+Global core_accept_stopped.i
+Global core_accept_fault.i
+Global core_accept_nonce.i
+Global core_accept_runs.i
+Global core_accept_failed_core.i
+Global core_accept_addr.i
+Global core_accept_value.i
+XIncludeFile "RaspberryPi4/Lib/acceptance_lease.pi4"
+
+Procedure.i CoreAcceptOwnsSecondaries()
+  ProcedureReturn accept_secondary_owner
+EndProcedure
+
+Procedure.i CoreAcceptRow(core.i)
+  If core < 1 Or core > 3 : ProcedureReturn 0 : EndIf
+  ProcedureReturn ((@core_accept_rows[0] + 255) & -256) + core * 256
+EndProcedure
+
+Procedure.i coreAcceptTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i coreAcceptHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i coreAcceptSmpen()
+  ; Caller must have proved EL3 before this implementation-defined read.
+  ASM
+    mrs x0, cpuectlr_el1
+    movz x9, #64
+    and x0, x0, x9
+  EndASM
+EndProcedure
+
+Procedure.i coreAcceptAcquire()
+  ASM
+    adrp x9, global_core_accept_addr
+    add x9, x9, #:lo12:global_core_accept_addr
+    ldr x9, [x9]
+    ldar x0, [x9]
+  EndASM
+EndProcedure
+
+Procedure coreAcceptPublish()
+  ASM
+    adrp x9, global_core_accept_addr
+    add x9, x9, #:lo12:global_core_accept_addr
+    ldr x9, [x9]
+    adrp x10, global_core_accept_value
+    add x10, x10, #:lo12:global_core_accept_value
+    ldr x10, [x10]
+    stlr x10, [x9]
+    dsb sy
+    sev
+  EndASM
+EndProcedure
+
+Procedure.i CoreAcceptContext()
+  If acceptLeaseCore() <> 0 : ProcedureReturn 0 : EndIf
+  If (acceptLeaseDaif() & $3C0) <> $3C0 : ProcedureReturn 0 : EndIf
+  If MmuEl() <> 3 : ProcedureReturn 0 : EndIf
+  If (MmuSctlr() & #MMU_SCTLR_MCI) <> #MMU_SCTLR_MCI : ProcedureReturn 0 : EndIf
+  If coreAcceptSmpen() = 0 : ProcedureReturn 0 : EndIf
+  If coreAcceptHz() < 1 Or coreAcceptHz() > 1000000000 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i coreAcceptFail(code.i, core.i)
+  core_accept_fault = code
+  core_accept_failed_core = core
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i coreAcceptWait(core.i, expected.i, ready.i)
+  Define start.i
+  Define limit.i
+  Define spin.i
+  Define value.i
+  start = coreAcceptTicks()
+  limit = coreAcceptHz() * 2
+  For spin = 1 To #CORE_ACCEPT_SPINS
+    If ready <> 0
+      value = CoreRawState(core)
+    Else
+      core_accept_addr = CoreAcceptRow(core) + 8
+      value = coreAcceptAcquire()
+    EndIf
+    If value = expected : ProcedureReturn 1 : EndIf
+    If coreAcceptTicks() - start >= limit : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i CoreAcceptStart()
+  Define core.i
+  Define slot.i
+  Define row.i
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-1, 0) : EndIf
+  If core_accept_started <> 0 Or core_accept_stopped <> 0 Or core_accept_fault <> 0
+    ProcedureReturn coreAcceptFail(-2, 0)
+  EndIf
+  If AcceptLeaseAcquire(#ACCEPT_OWNER_CORE, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+    ProcedureReturn coreAcceptFail(-13, 0)
+  EndIf
+  ; Refuse another owner's secondary before preparing any record.
+  For core = 1 To 3
+    If core_raw_prepared[core] <> 0 Or core_raw_released[core] <> 0 Or PeekI(CoreRawReleaseAddr(core)) <> 0
+      If AcceptLeaseRelease(#ACCEPT_OWNER_CORE, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+        ProcedureReturn coreAcceptFail(-14, core)
+      EndIf
+      ProcedureReturn coreAcceptFail(-3, core)
+    EndIf
+  Next
+  core_accept_started = 1
+  accept_secondary_owner = 1
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    For slot = 0 To 31 : PokeI(row + slot * 8, 0) : Next
+    If CoreRawPrepare(core, HwCoreRawStackBase(core), HwCoreRawStackBytes(core), row) = 0
+      ProcedureReturn coreAcceptFail(-4, core)
+    EndIf
+    MmuCleanRange(row, 256)
+  Next
+  For core = 1 To 3
+    If CoreRawRelease(core) = 0 : ProcedureReturn coreAcceptFail(-5, core) : EndIf
+  Next
+  For core = 1 To 3
+    If coreAcceptWait(core, #CORE_RAW_STATE_READY, 1) = 0
+      ProcedureReturn coreAcceptFail(-6, core)
+    EndIf
+    If CoreRawResult(core, #CORE_RAW_R_CORE) <> core Or CoreRawResult(core, #CORE_RAW_R_CONTEXT) <> CoreAcceptRow(core) Or CoreRawResult(core, #CORE_RAW_R_EL) <> 12 Or CoreRawResult(core, #CORE_RAW_R_SP) <> HwCoreRawStackBase(core) + HwCoreRawStackBytes(core)
+      ProcedureReturn coreAcceptFail(-7, core)
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i coreAcceptRound(count.i)
+  Define core.i
+  Define row.i
+  Define seed.i
+  Define expected.i
+  ; Never replace inputs under an outstanding reader, including after timeout.
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    core_accept_addr = row + 8
+    If coreAcceptAcquire() <> PeekI(row) : ProcedureReturn coreAcceptFail(-8, core) : EndIf
+  Next
+  If core_accept_nonce >= $7FFFFFFF : ProcedureReturn coreAcceptFail(-9, 0) : EndIf
+  core_accept_nonce = core_accept_nonce + 1
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    seed = core_accept_nonce * 257 + core * 17
+    PokeI(row + 16, count)
+    PokeI(row + 24, seed)
+    core_accept_addr = row
+    core_accept_value = core_accept_nonce
+    coreAcceptPublish()
+  Next
+  For core = 1 To 3
+    If coreAcceptWait(core, core_accept_nonce, 0) = 0 : ProcedureReturn coreAcceptFail(-10, core) : EndIf
+    row = CoreAcceptRow(core)
+    If count = 0
+      If PeekI(row + 48) <> 2 : ProcedureReturn coreAcceptFail(-11, core) : EndIf
+    Else
+      seed = core_accept_nonce * 257 + core * 17
+      expected = seed * count + count * (count - 1) / 2 + core
+      If PeekI(row + 32) <> expected Or PeekI(row + 40) <> core Or PeekI(row + 48) <> 1
+        ProcedureReturn coreAcceptFail(-12, core)
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i CoreAcceptRun()
+  Define round.i
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-1, 0) : EndIf
+  If core_accept_stopped <> 0 Or core_accept_fault <> 0 : ProcedureReturn 0 : EndIf
+  If core_accept_started = 0
+    If CoreAcceptStart() = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  For round = 1 To #CORE_ACCEPT_ROUNDS
+    If coreAcceptRound(#CORE_ACCEPT_MAX_WORK - round) = 0 : ProcedureReturn 0 : EndIf
+  Next
+  core_accept_runs = core_accept_runs + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i CoreAcceptStop()
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-1, 0) : EndIf
+  If core_accept_started = 0 Or core_accept_stopped <> 0 : ProcedureReturn 0 : EndIf
+  ; Stop may recover a completed timed-out job, never a pending job or failed join.
+  If core_raw_released[1] = 0 Or core_raw_released[2] = 0 Or core_raw_released[3] = 0 : ProcedureReturn 0 : EndIf
+  If CoreRawState(1) <> 2 Or CoreRawState(2) <> 2 Or CoreRawState(3) <> 2 : ProcedureReturn 0 : EndIf
+  If coreAcceptRound(0) = 0 : ProcedureReturn 0 : EndIf
+  core_accept_stopped = 1
+  ProcedureReturn 1
+EndProcedure
+
+; x0=context (our row), x1=core from the verified raw bootstrap. Only x0..x18
+; used, no generated calls or stack. Requests are consumed once by nonce.
+ProcedureNaked CoreAcceptSecondary()
+  ASM
+    b coreAcceptSecondaryEnd
+coreAcceptSecondaryEntry:
+    movz x3, #0
+coreAcceptSecondaryWait:
+    ldar x4, [x0]
+    cmp x4, x3
+    b.ne coreAcceptSecondaryJob
+    wfe
+    b coreAcceptSecondaryWait
+coreAcceptSecondaryJob:
+    mov x3, x4
+    ldr x5, [x0, #16]
+    cbz x5, coreAcceptSecondaryStop
+    movz x6, #4096
+    cmp x5, x6
+    b.hi coreAcceptSecondaryBad
+    ldr x6, [x0, #24]
+    mov x7, x1
+coreAcceptSecondarySum:
+    add x7, x7, x6
+    add x6, x6, #1
+    subs x5, x5, #1
+    b.ne coreAcceptSecondarySum
+    str x7, [x0, #32]
+    str x1, [x0, #40]
+    movz x8, #1
+    str x8, [x0, #48]
+    add x9, x0, #8
+    stlr x3, [x9]
+    dsb sy
+    sev
+    b coreAcceptSecondaryWait
+coreAcceptSecondaryBad:
+    movz x8, #3
+    b coreAcceptSecondaryParkAck
+coreAcceptSecondaryStop:
+    movz x8, #2
+coreAcceptSecondaryParkAck:
+    str x8, [x0, #48]
+    add x9, x0, #8
+    stlr x3, [x9]
+    dsb sy
+    sev
+coreAcceptSecondaryPark:
+    wfe
+    b coreAcceptSecondaryPark
+coreAcceptSecondaryEnd:
+    ret
+  EndASM
+EndProcedure

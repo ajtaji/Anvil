@@ -31,7 +31,9 @@ ProcedureNaked.i AtEnvironment()
     cmp x0, #960
     b.ne at_bad_env
     mrs x0, scr_el3
-    cmp x0, #1457
+    ; 0x5B3 is the retained-EL3 boot contract: stock machine policy plus
+    ; SCR_EL3.IRQ, which is required for physical IRQ delivery at EL3.
+    cmp x0, #1459
     b.ne at_bad_env
     movz x0, #1
     ret

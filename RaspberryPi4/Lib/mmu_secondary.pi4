@@ -1,9 +1,9 @@
 ; ======================================================================
 ;  mmu_secondary.pi4 - the cache-cold secondary-core join for BCM2711
 ;
-;  Requires RaspberryPi4/Lib/mmu.pi4 before this file.  It is deliberately
-;  separate from the live monitor include graph: this first milestone is a
-;  desk-gated MMU extension, not an activated SMP path.
+;  Requires RaspberryPi4/Lib/mmu.pi4 before this file. The Pi 4 monitor now
+;  includes it for the explicit, bounded `coretest` acceptance path; boot does
+;  not activate it and no general scheduler enters it.
 ;
 ;  The primary getters are valid only under the pinned EL3 entry contract. The raw join is a naked,
 ;  no-parameter ASM procedure.  It owns no BSS, stack, device, watchdog or
@@ -51,7 +51,7 @@ EndProcedure
 ProcedureNaked MmuSecondaryJoinRaw()
   ASM
     ; EL2 cannot safely read the implementation-defined CPUECTLR without an
-    ; exception path. This inactive milestone is the pinned armstub's EL3 path.
+    ; exception path. This is the pinned armstub's explicit EL3-only path.
     mrs  x9, currentel
     lsr  x9, x9, #2
     cmp  x9, #3

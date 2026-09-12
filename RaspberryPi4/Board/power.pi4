@@ -329,6 +329,11 @@ Procedure CmdCache()
       PrintN("The caches are already on.")
       ProcedureReturn
     EndIf
+    If CoreAcceptOwnsSecondaries() <> 0
+      PrintN("!! resident secondary cores own the current cache/MMU regime.")
+      PrintN("   Restart Anvil before changing cache policy; nothing was changed.")
+      ProcedureReturn
+    EndIf
     If CacheEnable() <> 0
       Print("Caches ON. ")
       power_SaySctlr()
@@ -346,6 +351,11 @@ Procedure CmdCache()
   If WordIs("off") <> 0 Or WordIs("disable") <> 0
     If gCacheOn = 0
       PrintN("The caches are already off.")
+      ProcedureReturn
+    EndIf
+    If CoreAcceptOwnsSecondaries() <> 0
+      PrintN("!! resident secondary cores own the current cache/MMU regime.")
+      PrintN("   Restart Anvil before changing cache policy; nothing was changed.")
       ProcedureReturn
     EndIf
     CacheDisable()
