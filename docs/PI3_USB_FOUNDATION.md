@@ -1,4 +1,4 @@
-# Pi3 USB/Ethernet foundation: protocol layer built, transport not wired
+# Pi3 USB/Ethernet foundation: native host desk slice, not boot-wired
 
 Desk-only original source, not boot-wired. `usb_host_core.pbi` implements the
 consumable cold-owner reset transaction for pre-4.20 DWC2 cores. It refuses DMA,
@@ -20,8 +20,8 @@ protocol on timeout. It accepts only a validated 32-bit DMA bus address and does
 not turn an arbitrary source pointer into one.
 
 Named services `Pi3UsbRead`, `Pi3UsbWrite`, `Pi3UsbTime` are supplied by the caller.
-No native adapter exists yet: it must establish primary-core ownership, power,
-clock, MMIO attributes and ordered access before using this core. Software
+The new native adapter establishes its primary-core, power and ordered-access
+contract below before using this core. Software
 deadlines cannot recover an interconnect transaction that never completes.
 
 `usb_protocol.pbi` now owns the USB chapter-9 and hub-class byte protocol. It
@@ -40,8 +40,8 @@ lengths and truncated aggregates are rejected before a frame pointer is
 published. Checksum offload is deliberately absent from this first explicit
 contract.
 
-Native MMIO/DMA adaptation, control-transfer composition, host-mode/FIFO/port
-initialization, exact-length control completion, disconnect cancellation,
+Native DMA adaptation, control-transfer composition,
+exact-length control completion, disconnect cancellation,
 register ownership, MAC/PHY setup and Ethernet traffic remain unimplemented.
 Buffers must be valid caller-owned coherent RAM; nonzero pointers are not a
 memory-safety proof.
@@ -91,8 +91,7 @@ malformed descriptor, -5 wrong identity, -6 duplicate endpoints, -7 missing
 bulk pair. LAN -1 storage/request, -2 transmit length, -3 truncated record, -4
 receive error summary, -5 impossible receive length.
 
-Next: native ordered MMIO, USB firmware power-domain ownership and an emitted
-hostile-MMIO gate; host-mode/PHY/FIFO setup and root-port reset; control-transfer
+Next: silicon admission of the native host slice below; control-transfer
 composition over the bounded buffer-DMA primitive; enumerate 0424:9514,
 power/reset its port 1, then
 enumerate 0424:ec00; exact-length SMSC register transport, reset, MAC/PHY/link
@@ -107,3 +106,76 @@ transfers, network traffic, disconnect/reconnect and recovery pass on the Pi 3
 Model B v1.2. This work does not yet make remote SD updating possible; it makes
 the byte and state contracts underneath that transport testable without the
 board.
+
+## Native host desk slice (2026-09-12)
+
+`usb_native.pbi` supplies `Pi3UsbPowerAcquire`, `Pi3UsbRead`, `Pi3UsbWrite`
+and `Pi3UsbTime`. Include the real timer and mailbox first. The adapter refuses
+before device access unless it measures primary affinity zero (including upper
+affinity levels), EL2 or EL3, masked DAIF and disabled MMU/data cache. This is a
+cold uncached ownership contract, **not** cached DMA admission. Reads/writes are
+32-bit, aligned, limited to the controller register page at ARM physical
+`0x3F980000`, and surrounded by DSB SY / ISB. It never treats the Pi4 xHCI map as
+the Pi3 USB device.
+
+Power acquisition uses firmware USB HCD device 3 with SET_POWER_STATE ON+WAIT,
+validates the response tag/length/device/state, and retains failed ownership.
+It never switches the domain off or cycles another controller owner. The
+mailbox library retains an outstanding timed-out request buffer until reboot.
+Firmware support, a valid resident mailbox buffer and exclusive boot-time use
+remain prerequisites; no software deadline can recover a stalled interconnect.
+
+`usb_host_init.pbi`, included after the adapter and `usb_host_core.pbi`, exposes:
+
+- `Pi3UsbHostInit()`: validate/reset the cold owner; require internal DMA
+  architecture, dynamic FIFO support and UTMI capability; select a supported
+  UTMI width, reset after PHY selection, require measured host mode, restart
+  the PHY clock, configure host mode and bounded FIFO regions, flush TX/RX,
+  power the root port. The BCM RX allocation is 774 words. TX depths come from
+  hardware registers and all three regions must fit reported FIFO RAM.
+- `Pi3UsbRootPortReset()`: refuse active DMA/IRQ/channels, require a connected
+  non-overcurrent port, assert/reset with readback, hold for 50 ms using the
+  timer, deassert with readback, and wait boundedly for connection+enable.
+
+The host slice deliberately leaves global interrupts and DMA disabled. It is
+not an enumerating USB host and cannot yet carry Ethernet. The next transfer
+owner must establish coherent buffer lifetimes before enabling buffer DMA.
+No board includes, `CAP_USB` or `CAP_NET` were changed.
+
+Host state is 0/unstarted, 1/ready, -1/consumed or failed. Failures do not retry
+or silently reacquire hardware. An owned PHY re-reset is explicit through
+`Pi3UsbCoreResetMode(1)` and requires an existing successful core owner; the
+legacy no-argument reset remains the cold-only entry. Error text at a future
+console boundary must describe the cause: -20 context, -21 firmware power,
+-22 MMIO admission, -30 host ownership, -31 power acquisition, -32 unsupported
+hardware shape, -33 write readback, -34 host-mode timeout, -35 FIFO capacity,
+-36 FIFO flush/delay, -37 connection/overcurrent/speed, -38 reset hold timer,
+-39 reset completion. Existing core codes are propagated where applicable.
+
+`python tools/pi3_usb_native_check.py --compiler <PureMetalForge.exe>` passes
+nine hostile native-host scenarios and 28 checks executing actual emitted A64,
+including EL2/EL3, upper-affinity refusal, MMU/cache/DAIF refusal, malformed
+firmware replies, width/address/barrier checks and a missing-DSB binary mutant.
+The frozen timer's finite spin ceiling is exercised in the native host test;
+the interpreter does not claim a real interconnect or PHY model.
+
+The existing foundation gate also passes seven emitted cases, including three
+HPRT0 regression cases. [Bug 780](https://forum.ajtaji.com/topic/780) was logged
+before correction: ordinary control writes must clear ENA as well as the three
+change bits, because reflecting ENA disables an enabled port.
+
+Primary references (facts only; no implementation copied): pinned Raspberry Pi
+Linux `7d1826930811232688a50c99c540fbb137aed081`,
+[`hw.h`](https://github.com/raspberrypi/linux/blob/7d1826930811232688a50c99c540fbb137aed081/drivers/usb/dwc2/hw.h),
+[`core.c`](https://github.com/raspberrypi/linux/blob/7d1826930811232688a50c99c540fbb137aed081/drivers/usb/dwc2/core.c),
+[`hcd.c`](https://github.com/raspberrypi/linux/blob/7d1826930811232688a50c99c540fbb137aed081/drivers/usb/dwc2/hcd.c),
+[`hcd.h`](https://github.com/raspberrypi/linux/blob/7d1826930811232688a50c99c540fbb137aed081/drivers/usb/dwc2/hcd.h),
+[`params.c`](https://github.com/raspberrypi/linux/blob/7d1826930811232688a50c99c540fbb137aed081/drivers/usb/dwc2/params.c),
+and the [firmware power protocol](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface#power).
+
+Remaining silicon proof: verify firmware power response and controller identity,
+capabilities/FIFO sizes, host-mode/PHY transition and connected root-port reset
+on the actual Pi3B v1.2. Then implement and prove control transfers, LAN9514 hub
+and EC00 function enumeration, DMA buffers, MAC/PHY configuration, repeated
+Ethernet traffic and disconnect recovery. No reset, deployment or board access
+was performed for this desk slice.

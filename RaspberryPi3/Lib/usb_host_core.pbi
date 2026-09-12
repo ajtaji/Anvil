@@ -28,7 +28,7 @@ Global p3usb_planned_packets.i
 Procedure.i Pi3UsbPortControl(current.i,setMask.i,clearMask.i)
   Protected writable.i=$000011C0 ; power, reset, suspend and resume only
   Protected value.i=current & $FFFFFFFF
-  value=value & $FFFFFFD5 ; strip CONNDET, ENACHG and OVRCURRCHG
+  value=value & $FFFFFFD1 ; also strip ENA: reflecting it disables the port
   value=value & ~(clearMask & writable)
   value=value | (setMask & writable)
   ProcedureReturn value
@@ -97,13 +97,15 @@ Procedure.i Pi3UsbWait(mask.i, expected.i)
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i Pi3UsbCoreReset()
+Procedure.i Pi3UsbCoreResetMode(owned.i)
   Protected ident.i
   Protected channels.i
   Protected n.i
   Protected cfg.i
   p3usb_error=0
-  If p3usb_state<>0 : p3usb_error=-1 : ProcedureReturn 0 : EndIf
+  If (owned=0 And p3usb_state<>0) Or (owned=1 And p3usb_state<>1) Or owned<0 Or owned>1
+    p3usb_error=-1 : ProcedureReturn 0
+  EndIf
   ident=Pi3UsbRead($40)
   ; This first backend deliberately excludes the 4.20 reset-done protocol.
   If (ident & $FFFF0000)<>$4F540000 Or (ident & $FFFF)>=$420A
@@ -128,6 +130,10 @@ Procedure.i Pi3UsbCoreReset()
   EndIf
   p3usb_state=1
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3UsbCoreReset()
+  ProcedureReturn Pi3UsbCoreResetMode(0)
 EndProcedure
 
 ; Text for these codes belongs at the console boundary.  PureMetal targets do

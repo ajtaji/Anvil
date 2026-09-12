@@ -743,6 +743,10 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Board/hw_touch.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_usb.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi3/Lib/interrupt_timer.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/usb_host_core.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | register semantics consulted; no implementation copied |
+| `RaspberryPi3/Lib/usb_host_init.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | register/PHY/FIFO/reset facts consulted; no implementation copied |
+| `RaspberryPi3/Lib/usb_native.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | device mapping and firmware power-domain facts; no implementation copied |
+| `RaspberryPi3/Lib/usb_native.pbi` | hardware-facts | vendor-spec | vendor/standards document | MMIO/power protocol facts consulted; no implementation copied |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/usb_takeover_compile.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |

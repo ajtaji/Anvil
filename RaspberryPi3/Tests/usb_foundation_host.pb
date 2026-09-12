@@ -126,7 +126,9 @@ If Pi3UsbChannelSizeWord(65535,64,0)<>-1 Or p3usb_error<>-6 : End 59 : EndIf
 If Pi3UsbChannelHaltStatus(#P3_USB_HC_HALTED | #P3_USB_HC_XFER_COMPLETE)<>1 : End 60 : EndIf
 If Pi3UsbChannelHaltStatus(#P3_USB_HC_HALTED | #P3_USB_HC_NAK)<>0 : End 61 : EndIf
 If Pi3UsbChannelHaltStatus(#P3_USB_HC_HALTED | #P3_USB_HC_AHB_ERROR)<>-7 : End 62 : EndIf
-If Pi3UsbPortControl($113F,$1000,0)<>$1115 : End 63 : EndIf
+If Pi3UsbPortControl($113F,$1000,0)<>$1111 : End 63 : EndIf
+If Pi3UsbPortControl(4,$1000,0)<>$1000 : End 163 : EndIf
+If Pi3UsbPortControl($1004,$100,$1000)<>$100 : End 164 : EndIf
 
 ; A complete buffer-DMA submission reaches a terminal halt, reports actual
 ; length, and releases its serialized owner.  No automatic retry is hidden.
