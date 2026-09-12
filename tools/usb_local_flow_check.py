@@ -97,7 +97,7 @@ def main():
  for folder in ('RaspberryPi4/Board','RaspberryPi4/Lib'):
   for path in (old.ROOT/folder).glob('*.pi4'):
    text=path.read_text(encoding='utf-8',errors='replace')
-   for match in re.finditer(r'(?ims)^Procedure(?:\.\w+)?\s+(\w+)\s*\([^\n]*\).*?^EndProcedure',text):
+   for match in re.finditer(r'(?ims)^Procedure(?:\.\w+)?\s+(\w+)\s*\([^\n]*?\).*?\bEndProcedure\b',text):
     name=match[1].lower()
     if name in definitions:duplicates.append(name)
     definitions[name]=(str(path.relative_to(old.ROOT)),text[:match.start()].count('\n'),match[0])
@@ -110,7 +110,7 @@ def main():
   path,offset,body=definitions[name];f,u=analyze(body)
   findings.extend((path,n+offset,proc,kind,detail) for n,proc,kind,detail in f)
   unknown.extend((path,n+offset,proc,why) for n,proc,why in u)
-  for _,line in statements(body):pending.extend(x.lower() for x in old.CALL.findall(line) if x.lower()!=name)
+  for _,line in statements(body):pending.extend(x.lower() for x in old.CALL.findall(line) if x.lower()!=name and x.lower() not in ('if','elseif','and','or','while','until','not'))
  report={'scope':'syntactic UsbEnumerate direct-call closure only; missing callees include intrinsics and dynamic targets','procedures':len(seen-missing),'unresolved_callees':sorted(missing),'duplicate_definitions':duplicates,'review_findings':findings,'unmodeled':unknown}
  if a.report:a.report.write_text(json.dumps(report,indent=2)+'\n')
  print('REVIEW REQUIRED:',len(findings),'findings;',len(unknown),'unmodeled statements;',len(missing),'unresolved callees')
