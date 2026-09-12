@@ -7,6 +7,19 @@ StackAddress $200000
 #ANVIL_BUILD_DATE = 20260912 ; pmf:builddate
 #ANVIL_BUILD_TIME = 154328 ; pmf:buildtime
 XIncludeFile "RaspberryPi3/Board/update_boot_support.pbi"
+Procedure.i Pi3LoaderBootProgress()
+  Protected phase.i=pi3_up_boot_phase
+  Select phase
+    Case 1 : Pi3Say("L1: verify selected slot")
+    Case 2 : Pi3Say("L2: write and read back TRIED record")
+    Case 3 : Pi3Say("L3: reverify selected slot")
+    Case 4 : Pi3Say("L4: copy payload to entry address")
+    Default : ProcedureReturn 0
+  EndSelect
+  ; Alternating steady states preserve a visible last stage if serial is lost.
+  Pi3StatusLed(phase & 1)
+  ProcedureReturn 1
+EndProcedure
 Procedure Main()
   Protected start.i
   Protected now.i
@@ -33,15 +46,17 @@ Procedure Main()
     If now - start >= 3000000 : Break : EndIf
   Next
   If spin > 9999999 : Pi3Say("STOP: timer stalled") : Pi3Park() : EndIf
+  Pi3Say("L0: arm 15-second pre-branch watchdog")
+  If Pi3UpdateBootProgressHandler(@Pi3LoaderBootProgress)=0 : Pi3Say("STOP: boot progress owner refused") : Pi3Park() : EndIf
+  If Pi3UpdateWatchdogArmWindow()=0 : Pi3Say("STOP: pre-branch watchdog could not be armed") : Pi3Park() : EndIf
   If fallback <> 0 : bytes = Pi3UpdateLoadFallback() : Else : bytes = Pi3UpdateLoad() : EndIf
   If bytes = 0
     Pi3Say("STOP: slot load/refallback refused; control records preserved")
     Pi3Park()
   EndIf
+  Pi3Say("L5: write handoff identity") : Pi3StatusLed(1)
   If Pi3UpdatePrepareHandoff(pi3_dtb) = 0 : Pi3Say("STOP: boot identity refused") : Pi3Park() : EndIf
-  If PeekL(@pi3_up_record[0] + Pi3UpdateSlot() * 512 + 64) = #PI3_UPDATE_TRIED
-    If Pi3UpdateWatchdogArm() = 0 : Pi3Say("STOP: trial watchdog could not be armed") : Pi3Park() : EndIf
-  EndIf
+  Pi3Say("L6: watchdog owned; branch to payload") : Pi3StatusLed(0)
   Pi3UpdateEnter()
   Pi3Park()
 EndProcedure

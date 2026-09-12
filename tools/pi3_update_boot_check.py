@@ -74,6 +74,19 @@ def main():
             assert c.call('Pi3UpdateWatchdogStop')==0
             c.store(sym['global_pi3_up_record']+64,3,4)
             assert c.call('Pi3UpdateWatchdogStop')==1 and c.writes[-1]==(0x3f10001c,0x5a000102);checks+=4
+        # The immutable loader acquires one un-fed window before the
+        # post-recovery selected-slot load. A later trial-arm check must not
+        # restart that timer.
+        c=Rig();c.store(sym['global_pi3_up_loaded'],0,8)
+        c.store(sym['global_pi3_up_mounted'],1,8)
+        c.store(sym['global_pi3_up_receiving'],0,8)
+        assert c.call('Pi3UpdateWatchdogArmWindow')==1
+        assert c.writes==[(0x3f100024,0x5a0f0000),(0x3f10001c,0x5a000020)]
+        c.store(sym['global_pi3_up_loaded'],1024,8)
+        assert c.call('Pi3UpdateWatchdogArm')==1
+        assert c.writes==[(0x3f100024,0x5a0f0000),(0x3f10001c,0x5a000020)]
+        assert c.call('Pi3UpdateWatchdogArmWindow')==0
+        assert len(c.writes)==2;checks+=4
         for el,aff in ((1,0),(2,0x100),(2,1<<32)):
             c=Rig(el,aff);assert c.call('Pi3UpdateWatchdogArm')==0 and not c.writes;checks+=1
         c=Rig(ignored=True);assert c.call('Pi3UpdateWatchdogArm')==0;checks+=1

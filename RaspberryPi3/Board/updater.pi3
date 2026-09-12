@@ -19,6 +19,9 @@ Procedure Main()
   ; Identity comes from the loader's CRC-protected fixed handoff, not newest
   ; disk generation or argument registers consumed by the cold startup.
   pi3_dtb = $1000000
+  ; The loader left PL011 configured. This is the first source-level action,
+  ; before SD context, mailbox, mount or confirmation can refuse or wait.
+  pi3ut_WriteLine("C0: candidate Main entered")
   If Pi3UpdateBootStart(0) = 0 : Pi3Park() : EndIf
   If pi3ut_WriteLine("Pi3 update prompt ready; confirming running generation") = 0 : Pi3Park() : EndIf
   If Pi3UpdateConfirmHandoff() = 0 : Pi3Say("STOP: running generation not confirmed") : Pi3Park() : EndIf

@@ -35,6 +35,27 @@ Global pi3_up_max_generation.i
 Global pi3_up_pending.i = -1
 Global pi3_up_baseline.i = -1
 Global pi3_up_handoff_ready.i
+Global pi3_up_boot_phase.i
+
+Procedure.i Pi3NoBootProgress()
+  ProcedureReturn 1
+EndProcedure
+Global pi3_up_boot_progress.i = @Pi3NoBootProgress
+
+Procedure.i Pi3UpdateBootProgressHandler(handler.i)
+  If pi3_up_receiving<>0 Or pi3_up_loaded<>0 Or handler=0 : ProcedureReturn 0 : EndIf
+  pi3_up_boot_progress=handler
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i pi3UpBootProgress(phase.i)
+  If phase<1 Or phase>4 : ProcedureReturn 0 : EndIf
+  pi3_up_boot_phase=phase
+  ; Direct unit/emulator entry does not execute the image initializer. A zero
+  ; hook means observe the phase only; the immutable loader installs its hook.
+  If pi3_up_boot_progress=0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn pi3_up_boot_progress()
+EndProcedure
 
 ; The cold-loader ownership walk is iterative and entirely fixed-storage.  It
 ; admits ordinary nested boot trees (including overlays/) while bounding every
@@ -686,9 +707,11 @@ Procedure.i pi3UpPlace(slot.i)
   Protected n.i
   Protected bytes.i
   Protected p.i
+  If pi3UpBootProgress(3)=0 : ProcedureReturn pi3UpFail(-17) : EndIf
   If pi3UpVerifySlot(slot) = 0 : ProcedureReturn pi3UpFail(-11) : EndIf
   p = @pi3_up_record[0] + slot * 512
   bytes = PeekI(p + 16) - #PI3_UPDATE_HEADER
+  If pi3UpBootProgress(4)=0 : ProcedureReturn pi3UpFail(-17) : EndIf
   For n = 0 To bytes - 1
     PokeA(#PI3_UPDATE_LOAD + n, PeekA(pi3_up_stage + #PI3_UPDATE_HEADER + n))
   Next
@@ -705,9 +728,13 @@ Procedure.i Pi3UpdateLoad()
   slot = pi3_up_pending
   If slot >= 0
     p = @pi3_up_record[0] + slot * 512
+    If PeekI(p + 8) > pi3_up_generation
+      If Pi3UpBootProgress(1)=0 : ProcedureReturn pi3UpFail(-17) : EndIf
+    EndIf
     If PeekI(p + 8) > pi3_up_generation And pi3UpVerifySlot(slot) <> 0
       ; Commit TRIED before copying/branching. A lost or torn acknowledgement
       ; refuses this boot; next boot still has the confirmed fallback.
+      If Pi3UpBootProgress(2)=0 : ProcedureReturn pi3UpFail(-17) : EndIf
       If pi3UpState(slot, #PI3_UPDATE_TRIED) = 0 : ProcedureReturn 0 : EndIf
       ProcedureReturn pi3UpPlace(slot)
     EndIf

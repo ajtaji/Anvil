@@ -123,18 +123,32 @@ while storage/confirmation state is uncertain. A successful request prints
 reset. If UART output/drain fails, no reset is requested. Reaching code after
 the bounded reset wait prints an explicit failure rather than claiming reboot.
 
-Trials arm a 15-second BCM2835 PM watchdog immediately before branch. The
-updater disarms it only after confirmation. Register/password/reset semantics
+After its bounded recovery menu, the immutable loader arms one 15-second
+BCM2835 PM watchdog before the selected-slot load. It does not feed or restart that timer while it
+verifies the slot, writes and reads back TRIED, reverifies, copies, writes the
+handoff or branches. The updater disarms it only after confirmation.
+Register/password/reset semantics
 are checked against the pinned
 [Linux v6.12 watchdog driver](https://github.com/torvalds/linux/blob/v6.12/drivers/watchdog/bcm2835_wdt.c)
 and [U-Boot v2025.01](https://github.com/u-boot/u-boot/blob/v2025.01/drivers/watchdog/bcm2835_wdt.c).
 The immutable loader first stops/adopts reset residue before SD mount or its
 recovery wait. WRCFG bits are configuration, not a foreign-active-owner test;
 arming replaces them with the documented read-modify-write. The trial updater
-does not call the cold-stop path.
+does not call the cold-stop path. Serial milestones `L0` through `L6` name the
+watchdog, first verify, TRIED write/readback, reverify, copy, handoff and branch
+boundaries. Alternating status-LED states preserve a coarse last boundary if
+serial is lost. `C0: candidate Main entered` is the candidate's first
+source-level action, before SD context, mailbox, mount or confirmation work.
 No RSTS/firmware partition-selection writes are made. There is no unlimited
 watchdog feeding; reaching the health point within 15 seconds for a maximum
 size slot, and actual firmware watchdog recovery, remain silicon gates.
+
+This protection is first-stage behavior. An ordinary A/B monitor update cannot
+repair an older `kernel8.img` whose watchdog begins after slot loading. The new
+loader must pass the desk gates and then be installed through the explicit
+card provisioning/replacement path while preserving both confirmed slots and
+control records. The already deployed loader remains immutable until that
+separate, user-authorized replacement.
 
 ## Composition and memory
 
@@ -193,6 +207,7 @@ Run from the repository root, using the installed unified IDE executable:
 python tools/pi3_sdhost_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_update_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_update_boot_check.py --compiler <PureMetalForge.exe>
+python tools/pi3_loader_window_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_update_transport_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_reset_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_drain_host_check.py
