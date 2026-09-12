@@ -3,10 +3,18 @@
 LoadAddress $200000
 BssAddress $1100000
 StackAddress $1F00000
-#ANVIL_BUILD = 9 ; pmf:build
+#ANVIL_BUILD = 11 ; pmf:build
 #ANVIL_BUILD_DATE = 20260912 ; pmf:builddate
-#ANVIL_BUILD_TIME = 161521 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 170222 ; pmf:buildtime
 XIncludeFile "RaspberryPi3/Board/update_boot_support.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_native.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_host_core.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_host_init.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_transfer.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_control.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_enumeration.pbi"
+XIncludeFile "RaspberryPi3/Board/usb_diagnostic.pbi"
 Procedure Main()
   ; Identity comes from the loader's CRC-protected fixed handoff, not newest
   ; disk generation or argument registers consumed by the cold startup.
@@ -15,5 +23,7 @@ Procedure Main()
   If pi3ut_WriteLine("Pi3 update prompt ready; confirming running generation") = 0 : Pi3Park() : EndIf
   If Pi3UpdateConfirmHandoff() = 0 : Pi3Say("STOP: running generation not confirmed") : Pi3Park() : EndIf
   If Pi3UpdateWatchdogStop() = 0 : Pi3Say("STOP: trial watchdog remains armed") : Pi3Park() : EndIf
+  If Pi3UpdateRegisterCommand(@Pi3UsbDiagCommand)=0 : Pi3Park() : EndIf
+  pi3ut_WriteLine("usbdiag: explicit one-shot USB diagnostic; updater recovery stays available")
   Pi3UpdateServe()
 EndProcedure

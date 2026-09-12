@@ -361,6 +361,22 @@ Procedure pi3ut_Status()
   pi3ut_WriteByte(13) : pi3ut_WriteByte(10)
 EndProcedure
 
+; Optional serialized command extension: Procedure.i Handler(), no parameters.
+; Return 1 only for a completely parsed/handled command, otherwise 0. The
+; transport restores the parser before standard dispatch. Register before Serve.
+; The real default handler returns unhandled; the loader registers nothing.
+Procedure.i Pi3NoCommandExtension()
+  ProcedureReturn 0
+EndProcedure
+Global pi3_ut_command_extension.i=@Pi3NoCommandExtension
+Global pi3_ut_extension_registered.i
+Procedure.i Pi3UpdateRegisterCommand(handler.i)
+  If handler=0 Or pi3_ut_extension_registered<>0 : ProcedureReturn 0 : EndIf
+  pi3_ut_command_extension=handler
+  pi3_ut_extension_registered=1
+  ProcedureReturn 1
+EndProcedure
+
 Procedure pi3ut_Command()
   Protected total.i
   If pi3_ut_rx_quarantine <> 0
@@ -368,6 +384,13 @@ Procedure pi3ut_Command()
     ProcedureReturn
   EndIf
   pi3_ut_parse = 0
+  If pi3_ut_command_extension<>0
+    total=pi3_ut_command_extension()
+    If total=1
+      ProcedureReturn
+    EndIf
+    pi3_ut_parse=0
+  EndIf
   If pi3ut_Match("help") <> 0 And pi3ut_End() <> 0
     pi3ut_WriteLine("update begin <length> <sha256> | status | commit | abort; reset")
     ProcedureReturn

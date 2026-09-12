@@ -744,6 +744,8 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Board/hw_usb.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi3/Lib/interrupt_timer.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi3/Lib/usb_host_core.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | register semantics consulted; no implementation copied |
+| `RaspberryPi3/Board/usb_diagnostic.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | BCM2837 DMA bus-range facts only; no implementation copied |
+| `RaspberryPi3/Board/usb_diagnostic.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | pinned BCM2837 device-tree DMA mapping facts only; no implementation copied |
 | `RaspberryPi3/Lib/usb_host_init.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | register/PHY/FIFO/reset facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/usb_native.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | device mapping and firmware power-domain facts; no implementation copied |
 | `RaspberryPi3/Lib/usb_control.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | DWC2 PID/state and bounded control-transfer facts consulted; no implementation copied |
