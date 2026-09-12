@@ -846,6 +846,7 @@ EndProcedure
 ; a bench instrument and not part of a bring-up sequence.
 ; ----------------------------------------------------------------------
 Procedure.i PcieRcPeek(off.i)
+  Define v.i
   If off < 0
     ProcedureReturn #PCIE_ERR_RANGE
   EndIf
@@ -855,7 +856,12 @@ Procedure.i PcieRcPeek(off.i)
   If (off + 4) > #PCIE_RC_SIZE
     ProcedureReturn #PCIE_ERR_RANGE
   EndIf
-  ProcedureReturn PeekN(#PCIE_RC_BASE + off)
+  v = PeekN(#PCIE_RC_BASE + off)
+  ; Linux readl() and U-Boot readl() both apply the Arm I/O read barrier.
+  ; Raw PeekN alone does not. Complete this device read before any code
+  ; acts on the value it returned.
+  a64_barrier()
+  ProcedureReturn v
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1081,6 +1087,8 @@ EndProcedure
 #PCIE_MISC_MISC_CTRL              = $4008
 #PCIE_MISC_CTRL_SCB_ACCESS_EN     = $1000
 #PCIE_MISC_CTRL_CFG_READ_UR_MODE  = $2000
+#PCIE_MISC_CTRL_RCB_64B_MODE      = $80
+#PCIE_MISC_CTRL_RCB_MPS_MODE      = $400
 #PCIE_MISC_CTRL_MAX_BURST_MASK    = $300000
 #PCIE_MISC_CTRL_SCB0_SIZE_MASK    = $F8000000
 #PCIE_MISC_RC_BAR1_CONFIG_LO      = $402C
@@ -1091,8 +1099,13 @@ EndProcedure
 #PCIE_MISC_PCIE_STATUS            = $4068
 #PCIE_STATUS_PHYLINKUP_MASK       = $10
 #PCIE_STATUS_DL_ACTIVE_MASK       = $20
+#PCIE_STATUS_PORT_RC_MASK          = $80
 #PCIE_MISC_HARD_PCIE_HARD_DEBUG   = $4204
 #PCIE_HARD_DEBUG_SERDES_IDDQ      = $08000000
+#PCIE_HARD_DEBUG_CLKREQ_MASK       = $310002
+#PCIE_HARD_DEBUG_REFCLK_OVRD_ENABLE = $10000
+#PCIE_HARD_DEBUG_REFCLK_OVRD_OUT   = $100000
+#PCIE_HARD_DEBUG_CLKREQ_SAFE       = $110000
 #PCIE_MSI_INTR2_CLR               = $4508
 #PCIE_MSI_INTR2_MASK_SET          = $4510
 #PCIE_MISC_WIN0_LO                = $400C
@@ -1105,6 +1118,8 @@ EndProcedure
 #PCIE_CLASS_BRIDGE_PCI            = $060400
 #PCIE_RC_CFG_VENDOR_REG1          = $0188
 #PCIE_VENDOR_REG1_ENDIAN_MASK     = $C
+#PCIE_RC_CFG_PRIV1_LINK_CAPABILITY = $04DC
+#PCIE_LINK_CAPABILITY_ASPM_SUPPORT_MASK = $0C00
 
 ; THE CONFIG-SPACE INDEX/DATA PAIR. These two numbers are the whole
 ; reason this file was blocked: there is no ECAM aperture in the device
@@ -1148,7 +1163,13 @@ Procedure pcie_Poke(off.i, v.i)
   If off < 0 Or (off & 3) <> 0 Or (off + 4) > #PCIE_RC_SIZE
     ProcedureReturn
   EndIf
+  ; Match the ordered writel() used by both upstream drivers. The first
+  ; barrier orders prior normal-memory work before the device write; the
+  ; second makes reset/config transitions complete before a following
+  ; timer or transaction can overtake them.
+  a64_barrier()
   PokeN(#PCIE_RC_BASE + off, v)
+  a64_barrier()
 EndProcedure
 
 Procedure pcie_Modify(off.i, clearMask.i, setMask.i)
@@ -1241,6 +1262,13 @@ Global pcie_adopted.i
 Global pcie_adoptCpu.i
 Global pcie_adoptHalted.i
 Global pcie_enumerated.i
+Global pcie_vl805Ready.i
+Global pcie_resetStarted.i       ; Anvil crossed the fundamental-reset boundary
+Global pcie_barBus.i            ; where the BAR is placed, on the PCI bus
+Global pcie_barCpu.i            ; the same BAR as the CPU sees it
+Global pcie_barSize.i
+Global pcie_dmaOff.i            ; bus = physical address + this offset
+Global pcie_dmaOffRead.i
 #PCIE_ERR_TAKEOVER = -11
 
 ; Existing trained-link ownership is separate from the new DMA mapping.
@@ -1437,13 +1465,103 @@ Procedure.i PciePrepareAdoption()
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i PcieInit()
+; Establish a controller/link configuration owned entirely by Anvil.
+;
+; This is the BCM2711 reset and train sequence used by the Raspberry Pi
+; Linux and U-Boot brcmstb PCIe drivers. The already-trained path in
+; PcieInit deliberately does not call it: that path still belongs to the
+; firmware and must first be stopped by XhciQuiesceAdopted. Once that
+; routine has observed HCHalted and read back BME clear, PcieEnumerate
+; calls this procedure before touching the endpoint again.
+Procedure.i PcieResetAndTrain()
   Define i.i
-  Define ibLo.i                 ; RC_BAR2 readback, adopt path
-  Define ibHi.i
-  Define v.i
-  Define lim.i
 
+  ; A fundamental reset invalidates every cached mapping derived from the
+  ; old link. Publish none of it until retraining and enumeration succeed.
+  pcie_resetStarted = 1
+  pcie_up = 0
+  pcie_enumerated = 0
+  pcie_adopted = 0
+  pcie_adoptCpu = 0
+  pcie_adoptHalted = 0
+  pcie_barBus = 0
+  pcie_barCpu = 0
+  pcie_barSize = 0
+  pcie_dmaOff = 0
+  pcie_dmaOffRead = 0
+  pcie_vl805Ready = 0
+
+  ; Assert bridge software reset and endpoint PERST together, then bring
+  ; the bridge back while keeping the endpoint in fundamental reset.
+  pcie_Phase(#PCIE_PH_PERST)
+  pcie_Modify(#PCIE_RGR1_SW_INIT_1, 0, #PCIE_SW_INIT_1_INIT_MASK | #PCIE_SW_INIT_1_PERST_MASK)
+  delay(1)
+  pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_INIT_MASK, 0)
+
+  ; Power the SerDes and select Linux's explicit "safe" CLKREQ policy:
+  ; no L1 power saving, with refclk and CLKREQ driven unconditionally.
+  ; This prevents inherited firmware power-state policy from surviving
+  ; across the ownership boundary.
+  pcie_Phase(#PCIE_PH_SERDES)
+  pcie_Modify(#PCIE_MISC_HARD_PCIE_HARD_DEBUG, #PCIE_HARD_DEBUG_SERDES_IDDQ | #PCIE_HARD_DEBUG_CLKREQ_MASK, #PCIE_HARD_DEBUG_CLKREQ_SAFE)
+  delay(1)
+
+  ; Linux enables both RCB modes on BCM2711. U-Boot also enables
+  ; RCB_MPS_MODE. Preserve unrelated fields while normalizing all fields
+  ; owned by this driver.
+  pcie_Phase(#PCIE_PH_CTRL)
+  pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_MAX_BURST_MASK | #PCIE_MISC_CTRL_RCB_64B_MODE | #PCIE_MISC_CTRL_RCB_MPS_MODE, #PCIE_MISC_CTRL_SCB_ACCESS_EN | #PCIE_MISC_CTRL_CFG_READ_UR_MODE | #PCIE_MISC_CTRL_RCB_64B_MODE | #PCIE_MISC_CTRL_RCB_MPS_MODE)
+
+  ; Identity-mapped 1 GiB inbound DMA aperture. BAR1/BAR3 and MSI stay
+  ; disabled until a consumer explicitly implements them.
+  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, #PCIE_BAR2_SIZE_1G)
+  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
+  pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_SCB0_SIZE_MASK, #PCIE_BAR2_SIZE_1G << 27)
+  pcie_Modify(#PCIE_MISC_RC_BAR1_CONFIG_LO, #PCIE_RC_BAR_SIZE_MASK, 0)
+  pcie_Modify(#PCIE_MISC_RC_BAR3_CONFIG_LO, #PCIE_RC_BAR_SIZE_MASK, 0)
+  pcie_Poke(#PCIE_MSI_INTR2_MASK_SET, $FFFFFFFF)
+  pcie_Poke(#PCIE_MSI_INTR2_CLR, $FFFFFFFF)
+
+  ; Release PERST and use the upstream 100 ms mandatory settle followed
+  ; by bounded link polling. No config-space or BAR access is permitted
+  ; before both PHYLINKUP and DL_ACTIVE are observed.
+  pcie_Phase(#PCIE_PH_TRAIN)
+  pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_PERST_MASK, 0)
+  delay(100)
+  i = 0
+  While i < 100
+    If PcieLinkUp() <> 0
+      Break
+    EndIf
+    delay(5)
+    i = i + 5
+  Wend
+  If PcieLinkUp() = 0
+    pcie_err = #PCIE_ERR_LINK
+    ProcedureReturn 0
+  EndIf
+  If (PcieRcPeek(#PCIE_MISC_PCIE_STATUS) & #PCIE_STATUS_PORT_RC_MASK) = 0
+    pcie_err = #PCIE_ERR_EP_MODE
+    ProcedureReturn 0
+  EndIf
+
+  pcie_Phase(#PCIE_PH_WINDOW)
+  If PcieProgramWindow() = 0
+    ProcedureReturn 0
+  EndIf
+
+  pcie_Modify(#PCIE_RC_CFG_PRIV1_ID_VAL3, #PCIE_ID_VAL3_CLASS_CODE_MASK, #PCIE_CLASS_BRIDGE_PCI)
+  pcie_Modify(#PCIE_RC_CFG_VENDOR_REG1, #PCIE_VENDOR_REG1_ENDIAN_MASK, 0)
+  ; Anvil does not implement PCIe power management. Match U-Boot's
+  ; bootloader policy and do not advertise ASPM states it will not manage.
+  pcie_Modify(#PCIE_RC_CFG_PRIV1_LINK_CAPABILITY, #PCIE_LINK_CAPABILITY_ASPM_SUPPORT_MASK, 0)
+
+  pcie_up = 1
+  pcie_Phase(#PCIE_PH_UP)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PcieInit()
   pcie_err = 0
   If pcie_up <> 0
     ProcedureReturn 1
@@ -1458,28 +1576,18 @@ Procedure.i PcieInit()
     ProcedureReturn 0
   EndIf
 
-  ; --- DO NOT RESET A LINK THAT IS ALREADY UP -------------------------
-  ; MEASURED, and it cost two boots. This board BOOTS FROM USB: the
-  ; firmware trains this link and enumerates the VL805 before anything of
-  ; ours runs, and U-Boot is itself loaded through it. Asserting PERST
-  ; resets that controller out from under a live system.
-  ;
-  ; The symptom was not immediate. The probe ran, printed, returned to
-  ; the monitor cleanly - and then the board reset on its own a second or
-  ; two later, twice, in the gap before the next command. A fault that
-  ; arrives after the program has finished is the worst kind to attribute,
-  ; and it was only obvious once the same gap failed twice running.
-  ;
-  ; So the reset is now CONDITIONAL. If the link is already trained,
-  ; adopt it: skip the reset, skip PERST, and go straight to programming
-  ; the window. That is the same reasoning uart.pi4 uses for UartAttach
-  ; rather than UartInit - a program started by something that has
-  ; already configured the hardware should adopt it, not re-initialise
-  ; it and throw away what the previous owner set up.
-  ;
-  ; The full sequence below is still correct and still needed for a cold
-  ; link. It is simply not what this board needs, and finding that out on
-  ; a board that boots some other way is a different day's work.
+  ; A previous reset attempt means the firmware owner no longer exists,
+  ; even if the link happened to retrain before that attempt failed. Retry
+  ; our reset sequence; never mistake the half-owned link for adoptable
+  ; firmware state.
+  If pcie_resetStarted <> 0
+    ProcedureReturn PcieResetAndTrain()
+  EndIf
+
+  ; If firmware left a trained link, adopt it only long enough to find and
+  ; stop the live xHCI controller. Resetting here would destroy its BAR
+  ; before XhciQuiesceAdopted can clear Run/Stop and BME. The reset and
+  ; retrain occurs later, in PcieEnumerate, after that ownership proof.
   pcie_Phase(#PCIE_PH_PROBE)
   If PcieLinkUp() <> 0
     pcie_adopted = 1
@@ -1495,71 +1603,7 @@ Procedure.i PcieInit()
     ProcedureReturn 1
   EndIf
 
-  ; 1. assert INIT and PERST together, hold, release INIT only.
-  pcie_Phase(#PCIE_PH_PERST)
-  pcie_Modify(#PCIE_RGR1_SW_INIT_1, 0, #PCIE_SW_INIT_1_INIT_MASK | #PCIE_SW_INIT_1_PERST_MASK)
-  delay(1)
-  pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_INIT_MASK, 0)
-
-  ; 2. take the SerDes out of IDDQ - the PHY is powered down out of reset
-  pcie_Phase(#PCIE_PH_SERDES)
-  pcie_Modify(#PCIE_MISC_HARD_PCIE_HARD_DEBUG, #PCIE_HARD_DEBUG_SERDES_IDDQ, 0)
-  delay(1)
-
-  ; 3. burst size 128, SCB access on, and CFG_READ_UR_MODE. The last
-  ;    makes an unsupported-request config read return all-ones instead
-  ;    of aborting, which is what lets a bus scan probe an empty slot
-  ;    without taking a fault. PcieCfgRead32 depends on it.
-  pcie_Phase(#PCIE_PH_CTRL)
-  pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_MAX_BURST_MASK, #PCIE_MISC_CTRL_SCB_ACCESS_EN | #PCIE_MISC_CTRL_CFG_READ_UR_MODE)
-
-  ; 4. inbound BAR2 - where the controller may reach into OUR memory.
-  ;    dma-ranges in bcm2711.dtsi is identity-mapped and capped at
-  ;    $C0000000, which is the erratum PcieDmaOk exists for, so the
-  ;    offset is zero and only the size field matters.
-  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, #PCIE_BAR2_SIZE_1G)
-  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
-  pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_SCB0_SIZE_MASK, #PCIE_BAR2_SIZE_1G << 27)
-  ;    BAR1 and BAR3 disabled - size field zero
-  pcie_Modify(#PCIE_MISC_RC_BAR1_CONFIG_LO, #PCIE_RC_BAR_SIZE_MASK, 0)
-  pcie_Modify(#PCIE_MISC_RC_BAR3_CONFIG_LO, #PCIE_RC_BAR_SIZE_MASK, 0)
-
-  ; 5. mask and clear MSI. We use no interrupts, and an unmasked
-  ;    controller with no handler is a hang waiting to happen.
-  pcie_Poke(#PCIE_MSI_INTR2_MASK_SET, $FFFFFFFF)
-  pcie_Poke(#PCIE_MSI_INTR2_CLR, $FFFFFFFF)
-
-  ; 6. release PERST - the device may now leave reset - and wait.
-  ;    U-Boot allows 100 ms in 5 ms steps after a flat 100 ms settle.
-  pcie_Phase(#PCIE_PH_TRAIN)
-  pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_PERST_MASK, 0)
-  delay(100)
-  i = 0
-  While i < 100
-    If PcieLinkUp() <> 0
-      Break
-    EndIf
-    delay(5)
-    i = i + 5
-  Wend
-
-  If PcieLinkUp() = 0
-    pcie_err = #PCIE_ERR_LINK
-    ProcedureReturn 0
-  EndIf
-
-  pcie_Phase(#PCIE_PH_WINDOW)
-  If PcieProgramWindow() = 0
-    ProcedureReturn 0
-  EndIf
-
-  ; 8. class code to PCI-to-PCI bridge, and little-endian BAR2.
-  pcie_Modify(#PCIE_RC_CFG_PRIV1_ID_VAL3, #PCIE_ID_VAL3_CLASS_CODE_MASK, #PCIE_CLASS_BRIDGE_PCI)
-  pcie_Modify(#PCIE_RC_CFG_VENDOR_REG1, #PCIE_VENDOR_REG1_ENDIAN_MASK, 0)
-
-  pcie_up = 1
-  pcie_Phase(#PCIE_PH_UP)
-  ProcedureReturn 1
+  ProcedureReturn PcieResetAndTrain()
 EndProcedure
 
 ; 1 if PcieInit ADOPTED an already-trained link rather than resetting it.
@@ -1656,10 +1700,6 @@ EndProcedure
 #PCIE_ERR_BAR_SIZE    = -8      ; the BAR reported an impossible size
 #PCIE_ERR_BAR_SPACE   = -9      ; it will not fit the outbound window
 
-Global pcie_barBus.i            ; where the BAR was placed, ON THE BUS
-Global pcie_barCpu.i            ; the same place, as this CPU sees it
-Global pcie_barSize.i
-
 ; ----------------------------------------------------------------------
 ;  PcieBarSize - how much space does this BAR want?
 ;
@@ -1703,15 +1743,18 @@ EndProcedure
 ;  BUS view - $F8000000 - and the window hardware translates. The CPU
 ;  reaches the same registers at PcieCpuFromBus() of that.
 ; ----------------------------------------------------------------------
-; Requires mailbox.pi4 before this library. Never reset adopted firmware.
-; Linux/U-Boot notify after PCI enumeration and before xHCI register setup;
-; U-Boot waits200us, Linux200-1000us. Preserve the firmware-owned warm path.
+; Requires mailbox.pi4 before this library.  The historical name says "Cold",
+; but the operation is required once per Anvil boot after both a newly trained
+; and an adopted PCIe handover.  U-Boot guards it with a process-local `done`
+; flag rather than link state; Linux invokes its reset provider at xHCI probe.
+; Both send the same notification before xHCI setup. U-Boot waits 200 us and
+; Linux waits 200-1000 us.
 Procedure.i PcieColdFirmwareReady()
   Define hz.i
   Define started.i
   Define spins.i
   Define ticks.i
-  If pcie_adopted <> 0 : ProcedureReturn 1 : EndIf
+  If pcie_vl805Ready <> 0 : ProcedureReturn 1 : EndIf
   hz = pcie_TickHz()
   If hz < 1000000 Or hz > 1000000000
     pcie_err = #PCIE_ERR_VL805_FIRMWARE
@@ -1724,7 +1767,10 @@ Procedure.i PcieColdFirmwareReady()
   ticks = (hz + 4999) / 5000
   started = pcie_Ticks()
   For spins = 0 To 999999
-    If pcie_Ticks() - started >= ticks : ProcedureReturn 1 : EndIf
+    If pcie_Ticks() - started >= ticks
+      pcie_vl805Ready = 1
+      ProcedureReturn 1
+    EndIf
   Next
   pcie_err = #PCIE_ERR_VL805_FIRMWARE
   ProcedureReturn 0
@@ -1748,6 +1794,24 @@ Procedure.i PcieEnumerate()
   If PcieNeedsTakeover() <> 0
     pcie_err = #PCIE_ERR_TAKEOVER
     ProcedureReturn 0
+  EndIf
+
+  ; The firmware-owned controller is halted and BME is now read back
+  ; clear. Cross the ownership boundary exactly as the upstream drivers
+  ; do: fundamental reset, bridge setup, PERST release and retrain before
+  ; any new endpoint transaction. Initial adoption existed only so the
+  ; old controller could be stopped safely.
+  If pcie_adopted <> 0
+    If pcie_adoptHalted = 0
+      pcie_err = #PCIE_ERR_TAKEOVER
+      ProcedureReturn 0
+    EndIf
+    If PcieResetAndTrain() = 0
+      ProcedureReturn 0
+    EndIf
+    pcie_adopted = 0
+    pcie_adoptCpu = 0
+    pcie_adoptHalted = 0
   EndIf
   pcie_Phase(#PCIE_PH_BUSNUM)
 
@@ -1789,22 +1853,6 @@ Procedure.i PcieEnumerate()
     pcie_err = #PCIE_ERR_TAKEOVER
     ProcedureReturn 0
   EndIf
-  If pcie_adopted <> 0
-    lo = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $1F
-    If lo = 0
-      pcie_err = #PCIE_ERR_DMA_OFFSET
-      ProcedureReturn 0
-    EndIf
-    pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, lo)
-    pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
-    If PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) <> lo Or PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_HI) <> 0
-      pcie_err = #PCIE_ERR_DMA_OFFSET
-      ProcedureReturn 0
-    EndIf
-    If PcieProgramWindow() = 0
-      ProcedureReturn 0
-    EndIf
-  EndIf
   pcie_Phase(#PCIE_PH_ENUM)
   lo = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
   is64 = 0
@@ -1842,7 +1890,8 @@ Procedure.i PcieEnumerate()
   EndIf
 
   ; Enable register decode only. The xHCI layer enables bus mastering
-  ; after resetting the controller and installing its own DMA rings.
+  ; after reading the capability header and before its halt/reset path,
+  ; matching the U-Boot PCI xHCI probe ordering.
   cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
   cmd = (cmd | #PCI_CMD_MEM_SPACE) & (~#PCI_CMD_BUS_MASTER)
   PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd)
@@ -2018,9 +2067,6 @@ EndProcedure
 ;  this - confusing the two is exactly the sort of thing that produces a
 ;  plausible number and a dead controller.
 ; ----------------------------------------------------------------------
-
-Global pcie_dmaOff.i           ; bus = phys + this. Read from the RC.
-Global pcie_dmaOffRead.i       ; 1 once it has actually been read
 
 ; ----------------------------------------------------------------------
 ;  PcieReadDmaOffset - pull the inbound offset out of the root complex.

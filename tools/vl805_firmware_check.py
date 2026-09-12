@@ -18,6 +18,7 @@ def main():
 #PCIE_ERR_VL805_FIRMWARE=-15
 Global pcie_adopted.i
 Global pcie_err.i
+Global pcie_vl805Ready.i
 Global mode.i
 Global calls.i
 Global ticks.i
@@ -48,10 +49,13 @@ EndProcedure
     entry='''
 Procedure Main()
  Define i.i
- For i=0 To 4
-  mode=i : calls=0 : ticks=0 : hazard=0 : pcie_err=0 : pcie_adopted=0
+ For i=0 To 5
+  mode=i : calls=0 : ticks=0 : hazard=0 : pcie_err=0 : pcie_adopted=0 : pcie_vl805Ready=0
   If mode=1 : pcie_adopted=1 : EndIf
-  PokeI($6000000+i*40,PcieColdFirmwareReady())
+  Define ready.i
+  ready=PcieColdFirmwareReady()
+  If mode=5 And ready<>0 : ready=PcieColdFirmwareReady() : EndIf
+  PokeI($6000000+i*40,ready)
   PokeI($6000008+i*40,calls)
   PokeI($6000010+i*40,pcie_err)
   PokeI($6000018+i*40,hazard)
@@ -75,9 +79,9 @@ EndProcedure
             if cpu.pc==b.RETURN_PC:break
             cpu.step()
         else:raise AssertionError('Gate exceeded bound.')
-        result=[[b.u64(cpu,0x6000000+j*40+i*8) for i in range(5)] for j in range(5)]
-        expected=[[1,1,0,0,300],[1,0,0,0,0],[0,1,2**64-15,0,0],[0,1,2**64-15,0,0],[0,0,2**64-15,0,0]]
+        result=[[b.u64(cpu,0x6000000+j*40+i*8) for i in range(5)] for j in range(6)]
+        expected=[[1,1,0,0,300],[1,1,0,0,300],[0,1,2**64-15,0,0],[0,1,2**64-15,0,0],[0,0,2**64-15,0,0],[1,1,0,0,300]]
         if mutation=='none':assert result==expected,result
         else:assert result!=expected,'Mutation escaped: '+mutation
-        print('PASS:',mutation,'emitted notification ordering / cold-adopt / mailbox failure / clock refusal')
+        print('PASS:',mutation,'emitted notification ordering / cold+adopt / once-per-boot / mailbox failure / clock refusal')
 if __name__=='__main__':main()

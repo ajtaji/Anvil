@@ -1,8 +1,9 @@
 # Adopted PCIe DMA ownership audit
 
-Desk-only, 2026-09-12. A scoped production fix followed the audit; no board
-access or full-image build. This is a missing handoff precondition, **not proof of the cause
-of the intermittent cold-boot hang**.
+Started as a desk-only audit on 2026-09-12. The ownership correction and the
+ordered-MMIO access layer were subsequently built and exercised on the Pi 4.
+See `docs/USB_HOST_BOOT_HANG_20260912.md` for the pinned upstream sources,
+image hashes, emitted gates and five clean controlled resets.
 
 ## Original ordering (baseline f3d6ebb)
 
@@ -53,9 +54,9 @@ quiescence proof. Compiler SHA256:
 3. Only after HCHalted is observed, disable PCI bus mastering and verify the
    command state. Preserve unrelated command bits; do not accidentally write
    back RW1C status bits in the upper half of the configuration dword.
-4. Disable memory decode for BAR probing/relocation. Reconfigure and verify
-   the inbound/outbound windows, bridge routing and BAR while ownership is
-   stopped. An unsupported or failed readback must leave the controller stopped.
+4. Once the old owner is halted and BME is read back clear, cross the ownership
+   boundary through the BCM2711 bridge/PERST reset and link-retrain sequence.
+   Invalidate every old BAR and DMA cache before publishing a new mapping.
 5. After verified halt and completed remapping, restore bus mastering before
    controller reset/readiness. Install the monitor-owned DMA arena and rings
    before setting Run. Do not enable BME merely to discover the old BAR.
@@ -63,9 +64,10 @@ quiescence proof. Compiler SHA256:
 Use explicit takeover phases owned by the board orchestration or a narrowly
 defined hardware-takeover layer; avoid introducing recursive PCIe/xHCI
 initialization. The non-adopted cold-link path needs its own contract as well.
-The implementation below follows these phases; this is not a fully validated PCIe fabric-drain recipe.
-In particular, a CPU load stalled by a fabric transaction is not made bounded
-merely by putting a software timer around it.
+The implementation below follows these phases. A CPU load stalled by a fabric
+transaction is not made bounded merely by putting a software timer around it;
+the eventual correction was to use the ordered MMIO access contract present in
+the upstream drivers.
 
 ## Primary evidence
 
@@ -91,16 +93,21 @@ bridge routing/decode and CPU window readback before exposing the temporary
 register address. It preserves inbound DMA mapping. XhciQuiesceAdopted uses
 local register addresses, waits for CNR and HCHalted, and only then disables
 and verifies BME through PcieAdoptHalted. Failed readiness/halt/BME verification
-does not permit remapping. PcieEnumerate guards adoption ownership, disables
-decode before BAR probing, then relocates and verifies configuration. New
-controller bus mastering is restored after verified halt/remapping and before
-HCRST, matching PCI host-registration ordering in Linux/U-Boot. Run remains
-clear until the monitor's new rings are installed.
+does not permit reset or remapping. PcieEnumerate guards ownership, performs a
+full bridge/PERST reset and retrain, then enumerates and verifies a fresh BAR,
+the outbound window and bridge routing while programming the inbound window.
+New controller bus mastering is
+restored before the new driver's halt/HCRST path, matching U-Boot's xHCI PCI
+probe. Run remains clear until the monitor's new rings are installed. Ordered
+MMIO accessors provide an ordered Arm device-I/O contract. They are stronger
+than U-Boot's minimum barriers: reads have a post-read barrier and writes have
+both pre- and post-write barriers.
 
 Both production callers, cursor_input.pi4 and storage.pi4, explicitly perform
 handover. Boot output separates link, firmware handover and mapping; retained
 xHCI phases distinguish old-register access, CNR, halt and DMA ownership.
-No restart/watchdog was added.
+No restart/watchdog was added by this ownership correction. Later diagnostic
+images used a watchdog only to preserve the otherwise invisible stall phase.
 
 Run tools/pcie_takeover_check.py with --compiler pointing to the pinned
 compiler above: PASS seventeen emitted cases (ready, delayed ready, never ready,
@@ -116,25 +123,27 @@ mutation. The cold-path case
 models the post-cold-link state, **not physical link training**. Checks cover
 premature DMA mapping/BAR probing/BME disable and status RW1C writes.
 
-The existing tools/xhci_initial_readiness_check.py gate now passes 84,581
+For the historical audit revision, the existing
+tools/xhci_initial_readiness_check.py gate passed 84,581
 instructions with three rejected mutants. RaspberryPi4/Tests/usb_takeover_compile.pi4
 compiles all three complete libraries and the call sequence, producing a
-43,780-byte fixture including the concurrent cold firmware-notify integration,
+43,780-byte fixture including the then-current firmware-notify integration,
 SHA256 a615eb8bcd56dcbb9500918c6ee7565e48265be4c3eb4f9d732cd35fa757a7fe;
 never execute this compile-only fixture on hardware. PcieProgramWindow itself
 now verifies all five outbound fields and returns status; both production
 callers check it. BME handover refusal reports error45, distinct from error44
 when enabling the monitor's new DMA ownership fails.
-No full-image build/deployment was performed. These models do not prove
-fabric completion or the cause of the reported cold boot hang.
+A full-image comparison and five-reset silicon pass followed; see
+`USB_HOST_BOOT_HANG_20260912.md`. A power-removal cold cycle remains owed.
 
 ## Reference-backed BME timing correction
 
 The first takeover patch deferred BME until after reset and memory setup.
 That differed from both the working earlier source and reference drivers.
 The correction retains the protected mapping interval but restores BME before
-host reset. U-Boot v2025.01 enables it in xhci_pci_init before xhci_register,
-which calls xhci_reset; Linux v6.12 sets bus mastering before usb_add_hcd.
+the new driver's halt/reset path. U-Boot v2025.01 enables it in xhci_pci_init
+before xhci_register, which calls the generic halt/reset path; Linux v6.12 sets
+bus mastering before usb_add_hcd.
 Sources: https://raw.githubusercontent.com/u-boot/u-boot/v2025.01/drivers/usb/host/xhci-pci.c
 and https://raw.githubusercontent.com/u-boot/u-boot/v2025.01/drivers/usb/host/xhci.c
 and https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/usb/core/hcd-pci.c .

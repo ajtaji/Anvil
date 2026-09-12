@@ -310,7 +310,9 @@
 ;    so BAR0 gives the CAPABILITY register block, the OPERATIONAL block
 ;    starts CAPLENGTH bytes further on, and BUS MASTER must be enabled
 ;    or every ring this file builds is written for a controller that is
-;    not allowed to read it. All three are done in xh_Locate().
+;    not allowed to read it. xh_Locate() maps BAR0, xh_ReadCaps() reads
+;    CAPLENGTH, then xh_EnableDma() sets MASTER at the same boundary as
+;    U-Boot's xhci_pci_init(), before the generic halt/reset path.
 ;
 ;    BAR0 may be a 64-BIT memory BAR, in which case BAR1 is its high
 ;    half and is NOT a second BAR. That is architectural PCI, and
@@ -1519,11 +1521,20 @@ EndProcedure
 ; ======================================================================
 
 Procedure.i xh_Rd(base.i, off.i)
-  ProcedureReturn PeekN(base + off)
+  Define v.i
+  v = PeekN(base + off)
+  ; xhci_readl() is an ordered readl(), not a raw load.
+  a64_barrier()
+  ProcedureReturn v
 EndProcedure
 
 Procedure xh_Wr(base.i, off.i, v.i)
+  ; xhci_writel() is an ordered writel(). Keep DMA descriptors and prior
+  ; controller state ordered before the command/doorbell write, and finish
+  ; the device write before returning to a dependent operation.
+  a64_barrier()
   PokeN(base + off, v & $FFFFFFFF)
+  a64_barrier()
 EndProcedure
 
 ; A 64-bit register, read as two 32-bit halves. xhci.h, xhci_readq().
@@ -1531,7 +1542,9 @@ Procedure.i xh_Rd64(base.i, off.i)
   Define lo.i
   Define hi.i
   lo = PeekN(base + off)
+  a64_barrier()
   hi = PeekN(base + off + 4)
+  a64_barrier()
   ProcedureReturn lo | (hi << 32)
 EndProcedure
 
@@ -1542,8 +1555,11 @@ EndProcedure
 ; The order is a hardware requirement, not a style choice, and this is
 ; the only place in the file that writes a wide register.
 Procedure xh_Wr64(base.i, off.i, v.i)
+  a64_barrier()
   PokeN(base + off,     v & $FFFFFFFF)
+  a64_barrier()
   PokeN(base + off + 4, (v >> 32) & $FFFFFFFF)
+  a64_barrier()
 EndProcedure
 
 ; ======================================================================
@@ -1608,7 +1624,7 @@ EndProcedure
 ; ======================================================================
 ;  STEP 1 - FIND THE CONTROLLER AND MAP IT
 ; ======================================================================
-; Three things happen here and all three come from
+; BAR discovery and register decoding happen here. Their ordering comes from
 ; v2025.01_xhci-pci.c's xhci_pci_init():
 ;
 ;   hccr = dm_pci_map_bar(dev, PCI_BASE_ADDRESS_0, ...)
@@ -1620,8 +1636,10 @@ EndProcedure
 ; BUS MASTER IS NOT OPTIONAL. Without it the controller is not
 ; permitted to initiate reads, so every ring this file builds is
 ; invisible to it - and, again, the CPU-side view is perfect. It is
-; enabled here, before any ring exists, so that the enable cannot be
-; forgotten on a later path.
+; deliberately left clear while ownership and BAR routing change.
+; XhciInitAt() enables it immediately after xh_ReadCaps(), matching the
+; boundary in U-Boot: BAR mapped and CAPLENGTH read, then MASTER set,
+; then the generic xHCI halt/reset path begins.
 ;
 ; MEMORY SPACE is enabled alongside it. U-Boot's PCI core has usually
 ; done that already by the time xhci_pci_init() runs, which is why the
@@ -2897,15 +2915,17 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
     ProcedureReturn 0
   EndIf
   xh_Phase(#XHCI_PH_RESET)
-  ; The ownership/remapping interval is complete. Prove the host halted
-  ; before restoring BME; match PCI host registration ordering used by
-  ; Linux/U-Boot, which enables bus mastering before HCRST. Run remains
-  ; clear, so no command-ring processing begins until new rings are ready.
-  If xh_Halt() = 0
+  ; Match U-Boot's xhci_pci_init() ordering exactly: after mapping BAR0
+  ; and reading CAPLENGTH, PCI_COMMAND_MASTER is enabled before
+  ; xhci_register() enters the generic halt/reset path.  The previous
+  ; ordering enabled BME only after xh_Halt(), so its claim of matching
+  ; Linux/U-Boot was false.  Run/Stop remains clear; enabling BME here
+  ; does not start command-ring processing.
+  If xh_EnableDma() = 0
     xh_FailStop()
     ProcedureReturn 0
   EndIf
-  If xh_EnableDma() = 0
+  If xh_Halt() = 0
     xh_FailStop()
     ProcedureReturn 0
   EndIf
