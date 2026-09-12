@@ -1,0 +1,1591 @@
+; vulkanVaryingProof.pi4 - a gradient, two vertex buffers, and a
+;                          uniform-buffer descriptor, drawn by V3D.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. It is an instrument, not a how-to.
+;
+;   PureMetalForge.exe --compile \
+;       RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4 -t pi4 \
+;       --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;       -o vulkanVaryingProof.img
+;
+; ======================================================================
+;  WHAT IT PROVES, ON THE SILICON
+; ======================================================================
+;  vulkanTriangleProof.pi4 proved that a SPIR-V module chooses the
+;  shaders and that one triangle goes through the pipeline. Its second
+;  pass gave all three vertices the SAME colour on purpose, so it proved
+;  the varying PATH and nothing about interpolation. This proves the
+;  three things that came next, and each is a different question:
+;
+;    PASS A - A UNIFORM BUFFER FEEDS THE FRAGMENT COLOUR, through the
+;             whole descriptor path: vkCreateDescriptorSetLayout,
+;             vkCreatePipelineLayout with it, vkCreateDescriptorPool,
+;             vkAllocateDescriptorSets, vkUpdateDescriptorSets with a
+;             VkDescriptorBufferInfo, and vkCmdBindDescriptorSets. The
+;             fragment module declares `layout(set = 0, binding = 0)
+;             uniform U { vec4 colour; }` and reads member zero through
+;             an OpAccessChain. A solid magenta triangle: exact, because
+;             every component is 0.0 or 1.0.
+;
+;    PASS B - A REAL GRADIENT. The same geometry with THREE DIFFERENT
+;             per-vertex colours - red at the apex, green at the lower
+;             left, blue at the lower right - carried through the VPM as
+;             a varying and read back with LDVARY. Seven probe pixels,
+;             each with an expected colour computed from the barycentric
+;             weights at that pixel's own centre.
+;
+;    PASS C - THE SAME GRADIENT OUT OF TWO VERTEX BUFFERS. Position in
+;             one buffer at a stride of eight bytes, colour in another
+;             at a stride of sixteen, two vertex input bindings. The
+;             expected pixels are PASS B's, and the verdict includes
+;             "every probe is the same word as pass B's": splitting the
+;             data across two buffers must change where the vertex
+;             fetcher reads and nothing whatever about the picture.
+;
+;  FIVE SPIR-V MODULES ARE ASSEMBLED WORD BY WORD, from the Khronos
+;  specification's own opcode numbers, in
+;  Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi - the same file the
+;  triangle proof uses, and the same file tools/vulkan_pipeline_check.py
+;  compares word for word against a Python assembler at the desk.
+;
+; ======================================================================
+;  WHERE THE EXPECTED GRADIENT PIXELS COME FROM
+; ======================================================================
+;  Anvil/Graphics/Vulkan/vk_interp_expect.pbi. It is integer arithmetic
+;  with no floating point in it at all: the clip-to-screen transform in
+;  units of 1/256 of a pixel, the three edge functions at the centre of
+;  the probe's own pixel, the weighted average of the three vertex
+;  colours, and one rounded division into an 8-bit UNORM. This payload
+;  calls it and puts its answers in the report beside the pixels the GPU
+;  produced, so a reader never has to take the expectation on trust.
+;
+;  tools/vulkan_interp_check.py runs that same module at a desk over
+;  eight triangles and thirty-three probes and compares every number
+;  against a second implementation of the rule written in Python, and
+;  rejects fourteen mutations of it. THE BOARD IS NOT THE FIRST PLACE
+;  THESE NUMBERS ARE CHECKED.
+;
+;  THE TOLERANCE IS TWO 8-BIT STEPS PER CHANNEL, and it is not zero
+;  because the hardware is not exact: V3D delivers a varying through
+;  LDVARY as a binary32 built from a per-primitive slope and a
+;  per-fragment step, the fragment shader packs two lanes into one
+;  2 x f16 result, and the tile buffer converts that to 8-bit UNORM.
+;  Eleven mantissa bits is about a fifth of one 8-bit step. Two is small
+;  enough that it cannot hide a real defect: a varying wired to the
+;  wrong component, a missing interpolation or a flat fill all miss by
+;  tens or hundreds. The report carries the WORST distance and the
+;  number of probes over tolerance, so a marginal run is visible as one.
+;
+;  THE THREE PROBES NEAREST THE VERTICES ARE INSET 40 PIXELS along the
+;  median towards the centroid, and that is deliberate: a probe at a
+;  vertex sits on two edges at once, where the rasteriser's fill rule
+;  and not arithmetic decides whether it is covered. Inset, each is
+;  dominated by its own vertex by more than 200 of 255 - which is what
+;  makes this run able to tell a gradient from a flat fill at all.
+;
+; ======================================================================
+;  WHAT THE OPERATOR SHOULD SEE
+; ======================================================================
+;  A triangle, apex up, on a blue-grey ground, held for six seconds:
+;  RED at the apex, GREEN at the lower left, BLUE at the lower right,
+;  blending smoothly through grey in the middle. In panel pixels the
+;  apex is at (400, 320) and the base runs from (200, 960) to (600, 960).
+;
+;  That is PASS C - the gradient drawn out of TWO buffers. Passes A and
+;  B are drawn into the same image first and overwritten by pass C's
+;  clear, so they are never on the glass and live only in the report.
+;
+;  AN OPERATOR WHO SEES A SOLID MAGENTA TRIANGLE has watched a run where
+;  pass B and pass C did not happen, and slot 125 says which step
+;  stopped it. An operator who sees a solid triangle of any one colour
+;  where a gradient was expected is looking at the defect this run
+;  exists to find.
+;
+; ======================================================================
+;  BEFORE RUNNING IT
+; ======================================================================
+;  * TAKE THE ACCELERATED CONSOLE OFF V3D FIRST: `screen dma`. This
+;    payload initialises the graphics engine itself and uses the SAME
+;    16 MiB arena at $0A000000 that the V3D console vets and owns; two
+;    owners of one V3D page table is not a thing that can be made to
+;    work.
+;  * THE BUFFERS ARE IN THE PAYLOAD WINDOW at $06000000: one screen of
+;    guard and one screen plus 128 KiB of Vulkan window, 8,323,072 bytes
+;    ending at $067EF000 - the same band vulkanClearProof.pi4 and
+;    vulkanTriangleProof.pi4 already used.
+;  * IT DOES NOT RE-INITIALISE THE DISPLAY and asks the firmware for
+;    nothing. It adopts the scanout buffer for the length of one copy.
+;  * IT CALLS NeonShutdown() BEFORE RETURNING, which hands the V3D MMU
+;    back.
+;  * RECOVERY: the console repaints over the presented picture by
+;    itself; `screen on` forces it and `screen v3d` brings the
+;    accelerated console back. Neither needs a reset. Nothing here
+;    writes a core spin slot, releases a core, or touches the monitor,
+;    its variables, the DSI control registers, the GENET ring or the
+;    driver-module region.
+;
+; ======================================================================
+;  THE REPORT, AND HOW TO READ IT
+; ======================================================================
+;  x0 comes back as the address of ONE HUNDRED AND TWENTY-EIGHT 32-BIT
+;  WORDS - 512 bytes. ONE SLOT IS ONE WORD, so the slot number below is
+;  the word number in the dump. Read it with
+;
+;      md.l <x0> 200
+;
+;  and NOT with a bare `md`: the dump's count is in BYTES whichever
+;  width is chosen, so 200 hex is 512 bytes is 128 words, and a bare
+;  `md` groups by one byte. $200 is written in hex because every
+;  argument of that command is.
+;
+;  Slot 0 is $59524156 ("VARY") and slot 127 is $56415259, the same four
+;  letters backwards. A dump that does not show BOTH did not show the
+;  whole report, and the verdicts near the end of it were not read.
+;
+;    0  magic $59524156           64  pass C, outside (100,100)
+;    1  PASS A VERDICT (uniform)  65  pass C, outside (700,1200)
+;    2  PASS B VERDICT (gradient) 66  pass C, outside (400,200)
+;    3  PASS C VERDICT (2 bufs)   67  pass C worst distance
+;    4  detail                    68  pass C probes over tolerance
+;    5  detail 2                  69  probes where C differs from B
+;    6  surface (guard) base      70  refusal: attribute names an
+;    7  Vulkan window base            undescribed binding
+;    8  Vulkan window bytes       71  its sentence
+;    9  image address             72  refusal: a combined image
+;   10  image size                    sampler descriptor
+;   11  image row pitch           73  its sentence
+;   12  interleaved buffer        74  refusal: a uniform draw with no
+;   13  position-only buffer          descriptor set bound
+;   14  colour-only buffer        75  its sentence
+;   15  uniform buffer            76  refusal: a uniform shader on a
+;   16  expected clear word           layout with no set layout
+;   17  expected magenta word     77  its sentence
+;   18  pipeline A code base      78  bin jobs before
+;   19  pipeline B code base      79  bin jobs after
+;   20  pipeline C code base      80  render jobs before
+;   21  screen x0, 1/256 pixel    81  render jobs after
+;   22  screen y0                 82  bin OOM count
+;   23  screen x1                 83  bin error status
+;   24  screen y1                 84  render error status
+;   25  screen x2                 85  MMU fault count
+;   26  screen y2                 86  MMU violation address
+;   27  twice the signed area     87  guard sum before
+;   28  the tolerance (2)         88  guard sum after
+;   29  gradient probe count (7)  89  submit result, pass A
+;   30  expected, probe 0         90  wait result, pass A
+;   31  expected, probe 1         91  submit result, pass B
+;   32  expected, probe 2         92  wait result, pass B
+;   33  expected, probe 3         93  submit result, pass C
+;   34  expected, probe 4         94  wait result, pass C
+;   35  expected, probe 5         95  backend native error
+;   36  expected, probe 6         96  validation fault count
+;   37  pass A, inside (400,500)  97  validation fault text
+;   38  pass A, inside (400,700)  98  PRESENT VERDICT
+;   39  pass A, inside (400,900)  99  DisplayLastError()
+;   40  pass A, outside (100,100) 100  engine arena needed
+;   41  pass A, outside (700,1200)101  backend can draw
+;   42  pass A, outside (400,200) 102  backend name
+;   43  pass B, probe 0           103  image layout after
+;   44  pass B, probe 1           104  microseconds, submit A
+;   45  pass B, probe 2           105  microseconds, submit B
+;   46  pass B, probe 3           106  microseconds, submit C
+;   47  pass B, probe 4           107  draws the backend ran
+;   48  pass B, probe 5           108  last shader record address
+;   49  pass B, probe 6           109  command buffer failure text
+;   50  pass B, outside (100,100) 110  shutdown reached
+;   51  pass B, outside (700,1200)111  emitter step, if it refused
+;   52  pass B, outside (400,200) 112  encoder code, if it refused
+;   53  pass B worst distance     113  descriptor address the draw used
+;   54  pass B probes over tol.   114  descriptor range
+;   55  pass C, probe 0           115  pipeline C binding 0 stride
+;   56  pass C, probe 1           116  pipeline C binding 1 stride
+;   57  pass C, probe 2           117  pipeline C attribute 0 binding
+;   58  pass C, probe 3           118  pipeline C attribute 1 binding
+;   59  pass C, probe 4           119  pipeline C binding count
+;   60  pass C, probe 5           125  HIGHEST STEP REACHED (1..12)
+;   61  pass C, probe 6           126  report length in bytes (512)
+;   62  (spare)                   127  tail magic $56415259
+;   63  (spare)
+;
+;  THE PROBE PIXELS, in panel coordinates:
+;    0 (400, 346)  inset from the apex          - red dominant
+;    1 (213, 946)  inset from the lower left    - green dominant
+;    2 (587, 946)  inset from the lower right   - blue dominant
+;    3 (400, 747)  the centroid                 - equal thirds
+;    4 (400, 500)                               5 (300, 800)
+;    6 (500, 800)
+;  and three OUTSIDE it, which must still hold the clear colour:
+;    (100, 100), (700, 1200), (400, 200)
+;
+;  SLOT 125 IS THE ONE TO READ FIRST when anything is wrong. It is the
+;  number of the step that was running, 1 to 12, and 12 means the whole
+;  payload ran including the present.
+;
+;  THE EXPECTED BYTES. VK_FORMAT_B8G8R8A8_UNORM stores B, G, R, A in
+;  ascending byte order, so a 32-bit word read on this little-endian
+;  part is (A<<24)|(R<<16)|(G<<8)|B.
+;      clear     R 0.2 G 0.5 B 0.7 A 1.0   ->  $FF3380B2
+;      magenta   R 1.0 G 0.0 B 1.0 A 1.0   ->  $FFFF00FF
+;  The gradient's seven expected words are not constants here - they are
+;  computed on the board and reported in slots 30 to 36, and the desk
+;  gate has already checked the module that computes them.
+;
+;  THERE IS NO PROCESSOR-SIDE FALLBACK ANYWHERE UNDER THIS. If V3D does
+;  not rasterise and interpolate, the readback fails.
+;
+; ======================================================================
+;  ONE THING THIS RUN DOES NOT PROVE
+; ======================================================================
+;  THE GPU DOES NOT DEREFERENCE THE DESCRIPTOR. A uniform-buffer
+;  descriptor resolves at submit time to one address and one length, and
+;  the processor reads the four words there into the fragment shader's
+;  uniform stream - so pass A's emitted fragment program is byte for
+;  byte the push-constant one. A conformant implementation would keep
+;  the ADDRESS in the stream and have the QPU fetch through the TMU at
+;  execution time. Nothing in this tree has ever performed a TMU general
+;  load, and a QPU sequence written from a guess is what this project's
+;  rules exist to prevent; it is the named next piece of work.
+;
+;  For every program this slice accepts the two are the same: the buffer
+;  is host-visible, nothing here lets the GPU write a buffer, one
+;  submission is in flight at a time, vkUpdateDescriptorSets is refused
+;  while one is, and the buffer is retained across it. The full
+;  reasoning is in Anvil/Graphics/Vulkan/vk_v3d_shader.pi4's header.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_interp_expect.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VVP_MAGIC = $59524156                 ; "VARY", slot 0
+#VVP_TAIL_MAGIC = $56415259            ; "YRAV", slot 127
+
+#VVP_ARENA = $0A000000
+#VVP_ARENA_BYTES = $01000000
+
+#VVP_SURFACE = $06000000
+#VVP_PANEL_W = 800
+#VVP_PANEL_H = 1280
+#VVP_PANEL_PITCH = 3200
+#VVP_SCREEN_BYTES = 4096000
+#VVP_WIN_BASE = $063E8000              ; $06000000 + 4,096,000
+#VVP_WIN_BYTES = 4227072               ; one screen plus 128 KiB
+#VVP_MAP_SPAN = 8323072
+#VVP_DSI_SCAN = $08A00000
+
+#VVP_GUARD = $5A3C0FF0
+
+#VVP_F_ZERO = $00000000
+#VVP_F_ONE = $3F800000
+#VVP_CLEAR_R = $3E4CCCCD               ; 0.2 -> 51
+#VVP_CLEAR_G = $3F000000               ; 0.5 -> 128
+#VVP_CLEAR_B = $3F333333               ; 0.7 -> 178
+#VVP_CLEAR_A = $3F800000               ; 1.0 -> 255
+#VVP_CLEAR_WORD = $FF3380B2
+#VVP_MAGENTA_WORD = $FFFF00FF
+
+; The triangle, in clip space. +Y is DOWN, which is Vulkan's framebuffer
+; orientation and the V3D rasteriser's. The expectation module is told
+; the same three vertices as exact rationals, so the geometry the report
+; predicts and the geometry the GPU draws come from one set of numbers.
+#VVP_X0 = $00000000                    ;  0.0
+#VVP_Y0 = $BF000000                    ; -0.5
+#VVP_X1 = $BF000000                    ; -0.5
+#VVP_Y1 = $3F000000                    ;  0.5
+#VVP_X2 = $3F000000                    ;  0.5
+#VVP_Y2 = $3F000000                    ;  0.5
+
+; The three layouts. The interleaved one is a vec2 position followed by
+; a vec4 colour; the split pair is the same data in two buffers.
+#VVP_STRIDE_ALL = 24
+#VVP_STRIDE_POS = 8
+#VVP_STRIDE_COL = 16
+#VVP_UNIFORM_BYTES = 16
+
+#VVP_SHOW_MS = 6000
+
+; ----------------------------------------------------------------------
+;  THE VERDICTS. Slots 1, 2 and 3 all use these codes.
+; ----------------------------------------------------------------------
+#VVP_OK = 0
+#VVP_NOT_TRIED = 1
+#VVP_ERR_NEON = 6
+#VVP_ERR_WINDOW = 7
+#VVP_ERR_INSTANCE = 8
+#VVP_ERR_DEVICE = 9
+#VVP_ERR_IMAGE = 10
+#VVP_ERR_MEMORY = 11
+#VVP_ERR_BIND = 12
+#VVP_ERR_VIEW = 13
+#VVP_ERR_RENDERPASS = 14
+#VVP_ERR_FRAMEBUFFER = 15
+#VVP_ERR_BUFFER = 16
+#VVP_ERR_SHADER = 17
+#VVP_ERR_LAYOUT = 18
+#VVP_ERR_PIPELINE = 19
+#VVP_ERR_RECORD = 20
+#VVP_ERR_SUBMIT = 21
+#VVP_ERR_FENCE = 22
+#VVP_ERR_PIXELS_IN = 23
+#VVP_ERR_PIXELS_OUT = 24
+#VVP_ERR_GUARD_CHANGED = 25
+#VVP_ERR_NO_JOBS = 26
+#VVP_ERR_V3D_FAULT = 27
+#VVP_ERR_DESCRIPTOR = 28
+#VVP_ERR_EXPECT = 29
+#VVP_ERR_SPLIT_DIFFERS = 30
+#VVP_ERR_REFUSAL_MISSING = 31
+
+#VVP_P_NOT_TRIED = 0
+#VVP_P_OK = 1
+#VVP_P_ADOPT_REFUSED = 2
+
+; Report slots.
+#VVP_S_MAGIC = 0
+#VVP_S_STATUS_A = 1
+#VVP_S_STATUS_B = 2
+#VVP_S_STATUS_C = 3
+#VVP_S_DETAIL = 4
+#VVP_S_DETAIL2 = 5
+#VVP_S_SURFACE = 6
+#VVP_S_WIN_BASE = 7
+#VVP_S_WIN_BYTES = 8
+#VVP_S_IMG_ADDR = 9
+#VVP_S_IMG_SIZE = 10
+#VVP_S_IMG_PITCH = 11
+#VVP_S_BUF_ALL = 12
+#VVP_S_BUF_POS = 13
+#VVP_S_BUF_COL = 14
+#VVP_S_BUF_UNI = 15
+#VVP_S_CLEAR_WORD = 16
+#VVP_S_MAGENTA_WORD = 17
+#VVP_S_PIPE_A = 18
+#VVP_S_PIPE_B = 19
+#VVP_S_PIPE_C = 20
+#VVP_S_SX0 = 21
+#VVP_S_SY0 = 22
+#VVP_S_SX1 = 23
+#VVP_S_SY1 = 24
+#VVP_S_SX2 = 25
+#VVP_S_SY2 = 26
+#VVP_S_AREA = 27
+#VVP_S_TOL = 28
+#VVP_S_PROBES = 29
+#VVP_S_EXPECT0 = 30                    ; .. 36
+#VVP_S_A_IN0 = 37
+#VVP_S_A_OUT0 = 40
+#VVP_S_B_P0 = 43                       ; .. 49
+#VVP_S_B_OUT0 = 50
+#VVP_S_B_WORST = 53
+#VVP_S_B_OVER = 54
+#VVP_S_C_P0 = 55                       ; .. 61
+#VVP_S_C_OUT0 = 62
+#VVP_S_C_WORST = 67
+#VVP_S_C_OVER = 68
+#VVP_S_C_DIFFERS = 69
+#VVP_S_REF_BINDING = 70
+#VVP_S_REF_BINDING_TEXT = 71
+#VVP_S_REF_DESCTYPE = 72
+#VVP_S_REF_DESCTYPE_TEXT = 73
+#VVP_S_REF_NOSET = 74
+#VVP_S_REF_NOSET_TEXT = 75
+#VVP_S_REF_NOLAYOUT = 76
+#VVP_S_REF_NOLAYOUT_TEXT = 77
+#VVP_S_BIN_BEFORE = 78
+#VVP_S_BIN_AFTER = 79
+#VVP_S_RENDER_BEFORE = 80
+#VVP_S_RENDER_AFTER = 81
+#VVP_S_BIN_OOM = 82
+#VVP_S_BIN_ERRSTAT = 83
+#VVP_S_RENDER_ERRSTAT = 84
+#VVP_S_MMU_FAULTS = 85
+#VVP_S_MMU_VIOADDR = 86
+#VVP_S_GUARD_BEFORE = 87
+#VVP_S_GUARD_AFTER = 88
+#VVP_S_SUBMIT_A = 89
+#VVP_S_WAIT_A = 90
+#VVP_S_SUBMIT_B = 91
+#VVP_S_WAIT_B = 92
+#VVP_S_SUBMIT_C = 93
+#VVP_S_WAIT_C = 94
+#VVP_S_NATIVE = 95
+#VVP_S_FAULT_COUNT = 96
+#VVP_S_FAULT_TEXT = 97
+#VVP_S_PRESENT = 98
+#VVP_S_DISPLAY_ERR = 99
+#VVP_S_ARENA_NEED = 100
+#VVP_S_BACKEND_DRAW = 101
+#VVP_S_BACKEND_NAME = 102
+#VVP_S_LAYOUT_AFTER = 103
+#VVP_S_US_A = 104
+#VVP_S_US_B = 105
+#VVP_S_US_C = 106
+#VVP_S_DRAWS = 107
+#VVP_S_SHREC = 108
+#VVP_S_CB_TEXT = 109
+#VVP_S_SHUTDOWN = 110
+#VVP_S_EMIT_STAGE = 111
+#VVP_S_QPU_ERR = 112
+#VVP_S_DESC_ADDR = 113
+#VVP_S_DESC_RANGE = 114
+#VVP_S_C_STRIDE0 = 115
+#VVP_S_C_STRIDE1 = 116
+#VVP_S_C_ATTR0_BIND = 117
+#VVP_S_C_ATTR1_BIND = 118
+#VVP_S_C_BINDCOUNT = 119
+#VVP_S_STEP = 125
+#VVP_S_BYTES = 126
+#VVP_S_TAIL = 127
+
+; ======================================================================
+;  THE REPORT IS 32 BITS WIDE AND THAT IS NOT A DETAIL
+; ======================================================================
+;  The monitor's dump has three widths - md.b, md.w and md.l - AND NO
+;  64-BIT ONE, and its count is in BYTES whichever is chosen
+;  (Anvil/Core/memcmd.pbi, the width table). A report of 64-bit slots
+;  can therefore only ever be read as twice as many words, with the slot
+;  number in this file landing at word 2N. That is exactly how the first
+;  board run of the triangle proof was misread. So this block is 32-BIT
+;  WORDS: one slot is one word, `md.l` shows them one per column, and
+;  every value fits - the addresses are payload and window addresses
+;  below 4 GiB, the pixels are 32-bit words by definition, and the area
+;  and the guard sum are masked to 32 bits below.
+; ======================================================================
+Global Dim vvpReport.l[128]
+Global Dim vvpClear.l[4]
+Global Dim vvpProbeX.i[7]
+Global Dim vvpProbeY.i[7]
+Global Dim vvpOutX.i[3]
+Global Dim vvpOutY.i[3]
+
+Procedure vvpPut(slot.i, value.i)
+  If slot < 0 Or slot > 127
+    ProcedureReturn
+  EndIf
+  vvpReport[slot] = value & $FFFFFFFF
+EndProcedure
+
+; Read a slot back WITHOUT the sign of a 32-bit load leaking into a
+; 64-bit comparison. A pixel of $FFFF0000 read from a .l is -65536, and
+; comparing that against the constant would fail on every correct run.
+Procedure.i vvpGet(slot.i)
+  If slot < 0 Or slot > 127
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn vvpReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure vvpStep(n.i)
+  vvpPut(#VVP_S_STEP, n)
+EndProcedure
+
+; Stop with a verdict in EVERY pass that has not answered yet, so a
+; report never shows one pass failed and the others simply blank.
+Procedure.i vvpStop(status.i)
+  If vvpGet(#VVP_S_STATUS_A) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_A, status) : EndIf
+  If vvpGet(#VVP_S_STATUS_B) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_B, status) : EndIf
+  If vvpGet(#VVP_S_STATUS_C) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_C, status) : EndIf
+  vvpPut(#VVP_S_FAULT_TEXT, AnvilVkFaultText())
+  vvpPut(#VVP_S_FAULT_COUNT, AnvilVkFaultCount())
+  ProcedureReturn @vvpReport[0]
+EndProcedure
+
+Procedure.i vvpSum(base.i, bytes.i)
+  Define i.i
+  Define s.i
+  s = 0
+  i = 0
+  While i < bytes
+    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFF
+    i = i + 4
+  Wend
+  ProcedureReturn s
+EndProcedure
+
+Procedure vvpFill(base.i, bytes.i, word.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeL(base + i, word)
+    i = i + 4
+  Wend
+EndProcedure
+
+Procedure.i vvpPixel(imgBase.i, pitch.i, x.i, y.i)
+  ProcedureReturn PeekL(imgBase + (y * pitch) + (x * 4)) & $FFFFFFFF
+EndProcedure
+
+; The probe table, written once so passes B and C sample the same points
+; and the expectation module is asked about the same points.
+Procedure vvpProbes()
+  vvpProbeX[0] = 400 : vvpProbeY[0] = 346
+  vvpProbeX[1] = 213 : vvpProbeY[1] = 946
+  vvpProbeX[2] = 587 : vvpProbeY[2] = 946
+  vvpProbeX[3] = 400 : vvpProbeY[3] = 747
+  vvpProbeX[4] = 400 : vvpProbeY[4] = 500
+  vvpProbeX[5] = 300 : vvpProbeY[5] = 800
+  vvpProbeX[6] = 500 : vvpProbeY[6] = 800
+  vvpOutX[0] = 100 : vvpOutY[0] = 100
+  vvpOutX[1] = 700 : vvpOutY[1] = 1200
+  vvpOutX[2] = 400 : vvpOutY[2] = 200
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define img.i
+  Define mem.i
+  Define view.i
+  Define rp.i
+  Define fb.i
+  Define fence.i
+  Define count.i
+  Define imgBase.i
+  Define pitch.i
+  Define hz.i
+  Define t0.i
+  Define k.i
+  Define bad.i
+  Define worst.i
+  Define over.i
+  Define differs.i
+  Define d.i
+  Define got.i
+  Define want.i
+  Define bufAll.i
+  Define bufPos.i
+  Define bufCol.i
+  Define bufUni.i
+  Define memAll.i
+  Define memPos.i
+  Define memCol.i
+  Define memUni.i
+  Define addrAll.i
+  Define addrPos.i
+  Define addrCol.i
+  Define addrUni.i
+  Define vsA.i
+  Define fsA.i
+  Define vsB.i
+  Define fsB.i
+  Define fsC.i
+  Define bytesA.i
+  Define bytesB.i
+  Define bytesC.i
+  Define bytesD.i
+  Define bytesE.i
+  Define dsl.i
+  Define dpool.i
+  Define dset.i
+  Define layU.i
+  Define layP.i
+  Define pipeA.i
+  Define pipeB.i
+  Define pipeC.i
+  Define bad2.i
+
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo
+  Define bufci.VkBufferCreateInfo
+  Define smci.VkShaderModuleCreateInfo
+  Define plci.VkPipelineLayoutCreateInfo
+  Define dslb.VkDescriptorSetLayoutBinding
+  Define dslci.VkDescriptorSetLayoutCreateInfo
+  Define dps.VkDescriptorPoolSize
+  Define dpci.VkDescriptorPoolCreateInfo
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo
+  Define wds.VkWriteDescriptorSet
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define Dim binds.VkVertexInputBindingDescription[2]
+  Define Dim attrs.VkVertexInputAttributeDescription[2]
+  Define vi.VkPipelineVertexInputStateCreateInfo
+  Define ia.VkPipelineInputAssemblyStateCreateInfo
+  Define vpstate.VkPipelineViewportStateCreateInfo
+  Define vp.VkViewport
+  Define sc.VkRect2D
+  Define rs.VkPipelineRasterizationStateCreateInfo
+  Define ms.VkPipelineMultisampleStateCreateInfo
+  Define cba.VkPipelineColorBlendAttachmentState
+  Define cb.VkPipelineColorBlendStateCreateInfo
+  Define gp.VkGraphicsPipelineCreateInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define cbHandle.i
+  Define fenceArray.i
+  Define dsetArray.i
+  Define dslArray.i
+  Define Dim twoBufs.i[2]
+  Define Dim twoOffsets.q[2]
+
+  vvpPut(#VVP_S_MAGIC, #VVP_MAGIC)
+  vvpPut(#VVP_S_TAIL, #VVP_TAIL_MAGIC)
+  vvpPut(#VVP_S_BYTES, 512)
+  vvpStep(0)
+  vvpPut(#VVP_S_STATUS_A, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_STATUS_B, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_STATUS_C, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_PRESENT, #VVP_P_NOT_TRIED)
+  vvpPut(#VVP_S_SURFACE, #VVP_SURFACE)
+  vvpPut(#VVP_S_WIN_BASE, #VVP_WIN_BASE)
+  vvpPut(#VVP_S_WIN_BYTES, #VVP_WIN_BYTES)
+  vvpPut(#VVP_S_CLEAR_WORD, #VVP_CLEAR_WORD)
+  vvpPut(#VVP_S_MAGENTA_WORD, #VVP_MAGENTA_WORD)
+  vvpPut(#VVP_S_PROBES, 7)
+  vvpProbes()
+  TimerInit()
+  hz = TickHz() / 1000000
+  If hz < 1
+    hz = 1
+  EndIf
+  pitch = #VVP_PANEL_PITCH
+
+  ; ------------------------------------------------------------------
+  ;  1. The expected gradient, before anything touches hardware.
+  ;
+  ;     The triangle is given to the expectation module as exact
+  ;     rationals - 0/2, -1/2, 1/2 - and the colours as whole 8-bit
+  ;     values, so nothing here is a floating-point comparison and the
+  ;     answers are the same ones the desk gate already checked.
+  ; ------------------------------------------------------------------
+  vvpStep(1)
+  If AnvilVkInterpBegin(#VVP_PANEL_W, #VVP_PANEL_H) = 0
+    ProcedureReturn vvpStop(#VVP_ERR_EXPECT)
+  EndIf
+  AnvilVkInterpVertex(0, 0, -1, 2)
+  AnvilVkInterpVertex(1, -1, 1, 2)
+  AnvilVkInterpVertex(2, 1, 1, 2)
+  AnvilVkInterpColour(0, 255, 0, 0, 255)
+  AnvilVkInterpColour(1, 0, 255, 0, 255)
+  AnvilVkInterpColour(2, 0, 0, 255, 255)
+  vvpPut(#VVP_S_SX0, AnvilVkInterpScreenX(0))
+  vvpPut(#VVP_S_SY0, AnvilVkInterpScreenY(0))
+  vvpPut(#VVP_S_SX1, AnvilVkInterpScreenX(1))
+  vvpPut(#VVP_S_SY1, AnvilVkInterpScreenY(1))
+  vvpPut(#VVP_S_SX2, AnvilVkInterpScreenX(2))
+  vvpPut(#VVP_S_SY2, AnvilVkInterpScreenY(2))
+  vvpPut(#VVP_S_AREA, AnvilVkInterpArea())
+  vvpPut(#VVP_S_TOL, AnvilVkInterpTolerance())
+  k = 0
+  While k < 7
+    ; EVERY PROBE MUST BE STRICTLY INSIDE. A probe the arithmetic says
+    ; is on an edge or outside would be graded against a colour the
+    ; rasteriser's fill rule decides, and that is an argument with the
+    ; bench rather than a measurement of it.
+    If AnvilVkInterpInside(vvpProbeX[k], vvpProbeY[k]) = 0
+      vvpPut(#VVP_S_DETAIL, k)
+      ProcedureReturn vvpStop(#VVP_ERR_EXPECT)
+    EndIf
+    vvpPut(#VVP_S_EXPECT0 + k, AnvilVkInterpExpect(vvpProbeX[k], vvpProbeY[k]))
+    k = k + 1
+  Wend
+  k = 0
+  While k < 3
+    If AnvilVkInterpInside(vvpOutX[k], vvpOutY[k]) <> 0
+      vvpPut(#VVP_S_DETAIL, 100 + k)
+      ProcedureReturn vvpStop(#VVP_ERR_EXPECT)
+    EndIf
+    k = k + 1
+  Wend
+
+  ; The guard half, filled before anything else touches the engine.
+  vvpFill(#VVP_SURFACE, #VVP_SCREEN_BYTES, #VVP_GUARD)
+
+  ; ------------------------------------------------------------------
+  ;  2. The graphics engine, over memory this payload owns.
+  ; ------------------------------------------------------------------
+  vvpStep(2)
+  If NeonArena(#VVP_ARENA, #VVP_ARENA_BYTES) <> #NEON_OK
+    vvpPut(#VVP_S_DETAIL, Neon_Error())
+    ProcedureReturn vvpStop(#VVP_ERR_NEON)
+  EndIf
+  If NeonSurface(#VVP_SURFACE, #VVP_PANEL_W, #VVP_PANEL_H, pitch) <> #NEON_OK
+    vvpPut(#VVP_S_DETAIL, Neon_Error())
+    ProcedureReturn vvpStop(#VVP_ERR_NEON)
+  EndIf
+  NeonSurfaceMapSpan(#VVP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK
+    vvpPut(#VVP_S_DETAIL, Neon_Error())
+    vvpPut(#VVP_S_DETAIL2, Neon_ArenaNeed())
+    ProcedureReturn vvpStop(#VVP_ERR_NEON)
+  EndIf
+  vvpPut(#VVP_S_ARENA_NEED, Neon_ArenaNeed())
+
+  ; ------------------------------------------------------------------
+  ;  3. The Vulkan device, over the memory above the surface.
+  ; ------------------------------------------------------------------
+  vvpStep(3)
+  rc = AnvilVkV3dWindow(#VVP_WIN_BASE, #VVP_WIN_BYTES)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_WINDOW)
+  EndIf
+  vvpPut(#VVP_S_BACKEND_DRAW, AnvilVkBackendCanDraw())
+  vvpPut(#VVP_S_BACKEND_NAME, AnvilVkBackendName())
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_INSTANCE)
+  EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_INSTANCE)
+  EndIf
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @dev)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DEVICE)
+  EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DEVICE)
+  EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DEVICE)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  4. The colour attachment at the panel's native extent.
+  ; ------------------------------------------------------------------
+  vvpStep(4)
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #VVP_PANEL_W
+  imgci\extent\height = #VVP_PANEL_H
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(dev, @imgci, 0, @img)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_IMAGE)
+  EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(dev, @mai, 0, @mem)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_MEMORY)
+  EndIf
+  If vkBindImageMemory(dev, img, mem, 0) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BIND)
+  EndIf
+  imgBase = AnvilVkImageAddress(img)
+  vvpPut(#VVP_S_IMG_ADDR, imgBase)
+  vvpPut(#VVP_S_IMG_SIZE, req\size)
+  vvpPut(#VVP_S_IMG_PITCH, AnvilVkImageRowPitch(img))
+  ; POISON IT. An image that already held an answer would prove nothing.
+  vvpFill(imgBase, req\size, ~#VVP_CLEAR_WORD)
+
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = img
+  ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1
+  ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_VIEW)
+  EndIf
+
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM
+  att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0
+  aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1
+  sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1
+  rpci\pAttachments = @att
+  rpci\subpassCount = 1
+  rpci\pSubpasses = @sub
+  If vkCreateRenderPass(dev, @rpci, 0, @rp) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_RENDERPASS)
+  EndIf
+
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = rp
+  fbci\attachmentCount = 1
+  fbci\pAttachments = @view
+  fbci\width = #VVP_PANEL_W
+  fbci\height = #VVP_PANEL_H
+  fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_FRAMEBUFFER)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  5. Four buffers: the interleaved one, the split pair, and the
+  ;     uniform buffer the descriptor points into.
+  ; ------------------------------------------------------------------
+  vvpStep(5)
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+  bufci\size = 3 * #VVP_STRIDE_ALL
+  If vkCreateBuffer(dev, @bufci, 0, @bufAll) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufAll, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memAll) <> #VK_SUCCESS Or vkBindBufferMemory(dev, bufAll, memAll, 0) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  bufci\size = 3 * #VVP_STRIDE_POS
+  If vkCreateBuffer(dev, @bufci, 0, @bufPos) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufPos, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memPos) <> #VK_SUCCESS Or vkBindBufferMemory(dev, bufPos, memPos, 0) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  bufci\size = 3 * #VVP_STRIDE_COL
+  If vkCreateBuffer(dev, @bufci, 0, @bufCol) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufCol, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memCol) <> #VK_SUCCESS Or vkBindBufferMemory(dev, bufCol, memCol, 0) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  bufci\usage = #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+  bufci\size = #VVP_UNIFORM_BYTES
+  If vkCreateBuffer(dev, @bufci, 0, @bufUni) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufUni, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memUni) <> #VK_SUCCESS Or vkBindBufferMemory(dev, bufUni, memUni, 0) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_BUFFER)
+  EndIf
+
+  addrAll = AnvilVkBufferAddress(bufAll)
+  addrPos = AnvilVkBufferAddress(bufPos)
+  addrCol = AnvilVkBufferAddress(bufCol)
+  addrUni = AnvilVkBufferAddress(bufUni)
+  vvpPut(#VVP_S_BUF_ALL, addrAll)
+  vvpPut(#VVP_S_BUF_POS, addrPos)
+  vvpPut(#VVP_S_BUF_COL, addrCol)
+  vvpPut(#VVP_S_BUF_UNI, addrUni)
+
+  ; The interleaved array: position then colour, three vertices, and the
+  ; three colours are red, green and blue in that vertex order.
+  PokeL(addrAll + 0, #VVP_X0)
+  PokeL(addrAll + 4, #VVP_Y0)
+  PokeL(addrAll + 8, #VVP_F_ONE)  : PokeL(addrAll + 12, #VVP_F_ZERO)
+  PokeL(addrAll + 16, #VVP_F_ZERO) : PokeL(addrAll + 20, #VVP_F_ONE)
+  PokeL(addrAll + 24, #VVP_X1)
+  PokeL(addrAll + 28, #VVP_Y1)
+  PokeL(addrAll + 32, #VVP_F_ZERO) : PokeL(addrAll + 36, #VVP_F_ONE)
+  PokeL(addrAll + 40, #VVP_F_ZERO) : PokeL(addrAll + 44, #VVP_F_ONE)
+  PokeL(addrAll + 48, #VVP_X2)
+  PokeL(addrAll + 52, #VVP_Y2)
+  PokeL(addrAll + 56, #VVP_F_ZERO) : PokeL(addrAll + 60, #VVP_F_ZERO)
+  PokeL(addrAll + 64, #VVP_F_ONE)  : PokeL(addrAll + 68, #VVP_F_ONE)
+
+  ; The same data split in two: positions at a stride of eight, colours
+  ; at a stride of sixteen, in two separate allocations.
+  PokeL(addrPos + 0, #VVP_X0)  : PokeL(addrPos + 4, #VVP_Y0)
+  PokeL(addrPos + 8, #VVP_X1)  : PokeL(addrPos + 12, #VVP_Y1)
+  PokeL(addrPos + 16, #VVP_X2) : PokeL(addrPos + 20, #VVP_Y2)
+  PokeL(addrCol + 0, #VVP_F_ONE)  : PokeL(addrCol + 4, #VVP_F_ZERO)
+  PokeL(addrCol + 8, #VVP_F_ZERO) : PokeL(addrCol + 12, #VVP_F_ONE)
+  PokeL(addrCol + 16, #VVP_F_ZERO) : PokeL(addrCol + 20, #VVP_F_ONE)
+  PokeL(addrCol + 24, #VVP_F_ZERO) : PokeL(addrCol + 28, #VVP_F_ONE)
+  PokeL(addrCol + 32, #VVP_F_ZERO) : PokeL(addrCol + 36, #VVP_F_ZERO)
+  PokeL(addrCol + 40, #VVP_F_ONE)  : PokeL(addrCol + 44, #VVP_F_ONE)
+
+  ; The uniform block: magenta, in red, green, blue, alpha order.
+  PokeL(addrUni + 0, #VVP_F_ONE)
+  PokeL(addrUni + 4, #VVP_F_ZERO)
+  PokeL(addrUni + 8, #VVP_F_ONE)
+  PokeL(addrUni + 12, #VVP_F_ONE)
+
+  ; ------------------------------------------------------------------
+  ;  6. Five shader modules, a descriptor set layout, a pool, a set,
+  ;     two pipeline layouts and three pipelines.
+  ; ------------------------------------------------------------------
+  vvpStep(6)
+  bytesA = vtpBuildVsA()
+  bytesB = vtpBuildFsA()
+  bytesC = vtpBuildVsB()
+  bytesD = vtpBuildFsB()
+  bytesE = vtpBuildFsC()
+  smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  smci\pCode = @vtpVsA[0] : smci\codeSize = bytesA
+  rc = vkCreateShaderModule(dev, @smci, 0, @vsA)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    vvpPut(#VVP_S_DETAIL2, AnvilVkSpirvLastOpcode())
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_SHADER)
+  EndIf
+  smci\pCode = @vtpFsA[0] : smci\codeSize = bytesB
+  If vkCreateShaderModule(dev, @smci, 0, @fsA) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_SHADER)
+  EndIf
+  smci\pCode = @vtpVsB[0] : smci\codeSize = bytesC
+  If vkCreateShaderModule(dev, @smci, 0, @vsB) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_SHADER)
+  EndIf
+  smci\pCode = @vtpFsB[0] : smci\codeSize = bytesD
+  If vkCreateShaderModule(dev, @smci, 0, @fsB) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_SHADER)
+  EndIf
+  smci\pCode = @vtpFsC[0] : smci\codeSize = bytesE
+  rc = vkCreateShaderModule(dev, @smci, 0, @fsC)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    vvpPut(#VVP_S_DETAIL2, AnvilVkSpirvLastOpcode())
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_SHADER)
+  EndIf
+
+  ; The descriptor set layout: one uniform buffer at binding 0, in the
+  ; fragment stage - which is exactly what fsC's SPIR-V asked for.
+  dslb\binding = 0
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dslb\descriptorCount = 1
+  dslb\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dslci\bindingCount = 1
+  dslci\pBindings = @dslb
+  rc = vkCreateDescriptorSetLayout(dev, @dslci, 0, @dsl)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DESCRIPTOR)
+  EndIf
+
+  ; A combined image sampler must still be refused, by name.
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  AnvilVkFaultClear()
+  vvpPut(#VVP_S_REF_DESCTYPE, vkCreateDescriptorSetLayout(dev, @dslci, 0, @bad2))
+  vvpPut(#VVP_S_REF_DESCTYPE_TEXT, AnvilVkFaultText())
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+
+  dps\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dps\descriptorCount = 1
+  dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  dpci\maxSets = 1
+  dpci\poolSizeCount = 1
+  dpci\pPoolSizes = @dps
+  rc = vkCreateDescriptorPool(dev, @dpci, 0, @dpool)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DESCRIPTOR)
+  EndIf
+  dslArray = dsl
+  dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  dsai\descriptorPool = dpool
+  dsai\descriptorSetCount = 1
+  dsai\pSetLayouts = @dslArray
+  rc = vkAllocateDescriptorSets(dev, @dsai, @dset)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DESCRIPTOR)
+  EndIf
+  dbi\buffer = bufUni
+  dbi\offset = 0
+  dbi\range = #VVP_UNIFORM_BYTES
+  wds\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  wds\dstSet = dset
+  wds\dstBinding = 0
+  wds\dstArrayElement = 0
+  wds\descriptorCount = 1
+  wds\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  wds\pBufferInfo = @dbi
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  If AnvilVkFaultCount() <> 0
+    vvpPut(#VVP_S_DETAIL, AnvilVkFaultCode())
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DESCRIPTOR)
+  EndIf
+  vvpPut(#VVP_S_DESC_ADDR, AnvilVkDescriptorSetAddress(dset, 0))
+  vvpPut(#VVP_S_DESC_RANGE, AnvilVkDescriptorSetRange(dset, 0))
+
+  ; Two pipeline layouts: one that declares the set, one that declares
+  ; nothing at all.
+  plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  plci\setLayoutCount = 1
+  plci\pSetLayouts = @dslArray
+  If vkCreatePipelineLayout(dev, @plci, 0, @layU) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_LAYOUT)
+  EndIf
+  plci\setLayoutCount = 0
+  plci\pSetLayouts = 0
+  If vkCreatePipelineLayout(dev, @plci, 0, @layP) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_LAYOUT)
+  EndIf
+
+  ; The fixed-function state every pipeline here shares.
+  ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+  ia\primitiveRestartEnable = #VK_FALSE
+  PokeL(@vp\x, #VVP_F_ZERO)
+  PokeL(@vp\y, #VVP_F_ZERO)
+  PokeL(@vp\width, $44480000)            ; 800.0
+  PokeL(@vp\height, $44A00000)           ; 1280.0
+  PokeL(@vp\minDepth, #VVP_F_ZERO)
+  PokeL(@vp\maxDepth, #VVP_F_ONE)
+  sc\offset\x = 0
+  sc\offset\y = 0
+  sc\extent\width = #VVP_PANEL_W
+  sc\extent\height = #VVP_PANEL_H
+  vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  vpstate\viewportCount = 1
+  vpstate\pViewports = @vp
+  vpstate\scissorCount = 1
+  vpstate\pScissors = @sc
+  rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+  rs\polygonMode = #VK_POLYGON_MODE_FILL
+  rs\cullMode = #VK_CULL_MODE_NONE
+  rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE
+  PokeL(@rs\lineWidth, #VVP_F_ONE)
+  ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+  ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+  cba\blendEnable = #VK_FALSE
+  cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+  cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+  cb\attachmentCount = 1
+  cb\pAttachments = @cba
+  vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+  vi\pVertexBindingDescriptions = @binds[0]
+  vi\pVertexAttributeDescriptions = @attrs[0]
+  stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT
+  stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT
+  gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+  gp\stageCount = 2
+  gp\pStages = @stages[0]
+  gp\pVertexInputState = @vi
+  gp\pInputAssemblyState = @ia
+  gp\pViewportState = @vpstate
+  gp\pRasterizationState = @rs
+  gp\pMultisampleState = @ms
+  gp\pColorBlendState = @cb
+  gp\renderPass = rp
+  gp\subpass = 0
+  gp\basePipelineIndex = -1
+
+  ; PIPELINE A: position only, colour from the uniform buffer.
+  binds[0]\binding = 0
+  binds[0]\stride = #VVP_STRIDE_POS
+  binds[0]\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[0]\location = 0
+  attrs[0]\binding = 0
+  attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[0]\offset = 0
+  vi\vertexBindingDescriptionCount = 1
+  vi\vertexAttributeDescriptionCount = 1
+  stages[0]\module = vsA
+  stages[1]\module = fsC
+  gp\layout = layU
+  rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeA)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    vvpPut(#VVP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
+    vvpPut(#VVP_S_QPU_ERR, AnvilVkV3dShaderError())
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_PIPELINE)
+  EndIf
+  vvpPut(#VVP_S_PIPE_A, AnvilVkPipelineCodeBase(pipeA))
+  ; The same pipeline on a layout with no descriptor set layout is
+  ; refused, by name.
+  gp\layout = layP
+  AnvilVkFaultClear()
+  vvpPut(#VVP_S_REF_NOLAYOUT, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad2))
+  vvpPut(#VVP_S_REF_NOLAYOUT_TEXT, AnvilVkFaultText())
+
+  ; PIPELINE B: the gradient out of ONE interleaved buffer.
+  binds[0]\stride = #VVP_STRIDE_ALL
+  attrs[1]\location = 1
+  attrs[1]\binding = 0
+  attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+  attrs[1]\offset = 8
+  vi\vertexAttributeDescriptionCount = 2
+  stages[0]\module = vsB
+  stages[1]\module = fsB
+  gp\layout = layP
+  rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeB)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    vvpPut(#VVP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
+    vvpPut(#VVP_S_QPU_ERR, AnvilVkV3dShaderError())
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_PIPELINE)
+  EndIf
+  vvpPut(#VVP_S_PIPE_B, AnvilVkPipelineCodeBase(pipeB))
+
+  ; PIPELINE C: the same gradient out of TWO buffers.
+  binds[0]\stride = #VVP_STRIDE_POS
+  binds[1]\binding = 1
+  binds[1]\stride = #VVP_STRIDE_COL
+  binds[1]\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[1]\binding = 1
+  attrs[1]\offset = 0
+  vi\vertexBindingDescriptionCount = 2
+  ; An attribute that names a binding the pipeline does not describe is
+  ; refused, by name, on the way past.
+  attrs[1]\binding = 2
+  AnvilVkFaultClear()
+  vvpPut(#VVP_S_REF_BINDING, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad2))
+  vvpPut(#VVP_S_REF_BINDING_TEXT, AnvilVkFaultText())
+  attrs[1]\binding = 1
+  rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeC)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    vvpPut(#VVP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
+    vvpPut(#VVP_S_QPU_ERR, AnvilVkV3dShaderError())
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_PIPELINE)
+  EndIf
+  vvpPut(#VVP_S_PIPE_C, AnvilVkPipelineCodeBase(pipeC))
+  vvpPut(#VVP_S_C_BINDCOUNT, AnvilVkPipelineBindingCount(3))
+  vvpPut(#VVP_S_C_STRIDE0, AnvilVkPipelineBindingStride(3, 0))
+  vvpPut(#VVP_S_C_STRIDE1, AnvilVkPipelineBindingStride(3, 1))
+  vvpPut(#VVP_S_C_ATTR0_BIND, AnvilVkPipelineAttrBinding(3, 0))
+  vvpPut(#VVP_S_C_ATTR1_BIND, AnvilVkPipelineAttrBinding(3, 1))
+
+  PokeL(@vvpClear[0] + 0, #VVP_CLEAR_R)
+  PokeL(@vvpClear[0] + 4, #VVP_CLEAR_G)
+  PokeL(@vvpClear[0] + 8, #VVP_CLEAR_B)
+  PokeL(@vvpClear[0] + 12, #VVP_CLEAR_A)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp
+  rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #VVP_PANEL_W
+  rpbi\renderArea\extent\height = #VVP_PANEL_H
+  rpbi\clearValueCount = 1
+  rpbi\pClearValues = @vvpClear[0]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_FENCE)
+  EndIf
+  fenceArray = fence
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cbHandle
+
+  vvpPut(#VVP_S_BIN_BEFORE, V3dBinJobs())
+  vvpPut(#VVP_S_RENDER_BEFORE, V3dRenderJobs())
+  vvpPut(#VVP_S_GUARD_BEFORE, vvpSum(#VVP_SURFACE, #VVP_SCREEN_BYTES))
+
+  ; ------------------------------------------------------------------
+  ;  7. PASS A: the uniform-buffer colour.
+  ;
+  ;     A draw with no descriptor set bound is recorded FIRST, on its
+  ;     own command buffer, so the refusal is exercised live and not
+  ;     merely believed.
+  ; ------------------------------------------------------------------
+  vvpStep(7)
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  twoBufs[0] = bufPos
+  twoOffsets[0] = 0
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  vvpPut(#VVP_S_REF_NOSET, vkEndCommandBuffer(cmd))
+  vvpPut(#VVP_S_REF_NOSET_TEXT, AnvilVkCommandBufferFailureText(cmd))
+
+  vkResetCommandBuffer(cmd, 0)
+  If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_RECORD)
+  EndIf
+  dsetArray = dset
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layU, 0, 1, @dsetArray, 0, 0)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  rc = vkEndCommandBuffer(cmd)
+  If rc <> #VK_SUCCESS
+    vvpPut(#VVP_S_DETAIL, rc)
+    vvpPut(#VVP_S_CB_TEXT, AnvilVkCommandBufferFailureText(cmd))
+    vvpPut(#VVP_S_STATUS_A, #VVP_ERR_RECORD)
+  Else
+    t0 = Ticks()
+    rc = vkQueueSubmit(queue, 1, @si, fence)
+    vvpPut(#VVP_S_SUBMIT_A, rc)
+    vvpPut(#VVP_S_US_A, (Ticks() - t0) / hz)
+    vvpPut(#VVP_S_NATIVE, AnvilVkBackendNativeError())
+    If rc <> #VK_SUCCESS
+      vvpPut(#VVP_S_STATUS_A, #VVP_ERR_SUBMIT)
+    Else
+      rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+      vvpPut(#VVP_S_WAIT_A, rc)
+      If rc <> #VK_SUCCESS
+        vvpPut(#VVP_S_STATUS_A, #VVP_ERR_FENCE)
+      Else
+        vvpPut(#VVP_S_LAYOUT_AFTER, AnvilVkImageLayout(img))
+        vvpPut(#VVP_S_SHREC, AnvilVkV3dLastShaderRecord())
+        vvpPut(#VVP_S_A_IN0 + 0, vvpPixel(imgBase, pitch, 400, 500))
+        vvpPut(#VVP_S_A_IN0 + 1, vvpPixel(imgBase, pitch, 400, 700))
+        vvpPut(#VVP_S_A_IN0 + 2, vvpPixel(imgBase, pitch, 400, 900))
+        k = 0
+        While k < 3
+          vvpPut(#VVP_S_A_OUT0 + k, vvpPixel(imgBase, pitch, vvpOutX[k], vvpOutY[k]))
+          k = k + 1
+        Wend
+        bad = 0
+        k = 0
+        While k < 3
+          If vvpGet(#VVP_S_A_IN0 + k) <> #VVP_MAGENTA_WORD : bad = bad + 1 : EndIf
+          k = k + 1
+        Wend
+        If bad <> 0
+          vvpPut(#VVP_S_STATUS_A, #VVP_ERR_PIXELS_IN)
+        Else
+          bad = 0
+          k = 0
+          While k < 3
+            If vvpGet(#VVP_S_A_OUT0 + k) <> #VVP_CLEAR_WORD : bad = bad + 1 : EndIf
+            k = k + 1
+          Wend
+          If bad <> 0
+            vvpPut(#VVP_S_STATUS_A, #VVP_ERR_PIXELS_OUT)
+          Else
+            vvpPut(#VVP_S_STATUS_A, #VVP_OK)
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  8. PASS B: the gradient out of one interleaved buffer.
+  ; ------------------------------------------------------------------
+  vvpStep(8)
+  vkResetFences(dev, 1, @fenceArray)
+  vkResetCommandBuffer(cmd, 0)
+  If vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS
+    twoBufs[0] = bufAll
+    twoOffsets[0] = 0
+    vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+    vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
+    vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+    vkCmdDraw(cmd, 3, 1, 0, 0)
+    vkCmdEndRenderPass(cmd)
+    rc = vkEndCommandBuffer(cmd)
+    If rc <> #VK_SUCCESS
+      vvpPut(#VVP_S_CB_TEXT, AnvilVkCommandBufferFailureText(cmd))
+      vvpPut(#VVP_S_STATUS_B, #VVP_ERR_RECORD)
+    Else
+      t0 = Ticks()
+      rc = vkQueueSubmit(queue, 1, @si, fence)
+      vvpPut(#VVP_S_SUBMIT_B, rc)
+      vvpPut(#VVP_S_US_B, (Ticks() - t0) / hz)
+      If rc <> #VK_SUCCESS
+        vvpPut(#VVP_S_STATUS_B, #VVP_ERR_SUBMIT)
+      Else
+        rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+        vvpPut(#VVP_S_WAIT_B, rc)
+        If rc <> #VK_SUCCESS
+          vvpPut(#VVP_S_STATUS_B, #VVP_ERR_FENCE)
+        Else
+          worst = 0
+          over = 0
+          k = 0
+          While k < 7
+            got = vvpPixel(imgBase, pitch, vvpProbeX[k], vvpProbeY[k])
+            vvpPut(#VVP_S_B_P0 + k, got)
+            want = vvpGet(#VVP_S_EXPECT0 + k)
+            d = AnvilVkInterpDistance(got, want)
+            If d > worst : worst = d : EndIf
+            If d > AnvilVkInterpTolerance() : over = over + 1 : EndIf
+            k = k + 1
+          Wend
+          vvpPut(#VVP_S_B_WORST, worst)
+          vvpPut(#VVP_S_B_OVER, over)
+          bad = 0
+          k = 0
+          While k < 3
+            vvpPut(#VVP_S_B_OUT0 + k, vvpPixel(imgBase, pitch, vvpOutX[k], vvpOutY[k]))
+            If vvpGet(#VVP_S_B_OUT0 + k) <> #VVP_CLEAR_WORD : bad = bad + 1 : EndIf
+            k = k + 1
+          Wend
+          If over <> 0
+            vvpPut(#VVP_S_STATUS_B, #VVP_ERR_PIXELS_IN)
+          ElseIf bad <> 0
+            vvpPut(#VVP_S_STATUS_B, #VVP_ERR_PIXELS_OUT)
+          Else
+            vvpPut(#VVP_S_STATUS_B, #VVP_OK)
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  Else
+    vvpPut(#VVP_S_STATUS_B, #VVP_ERR_RECORD)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  9. PASS C: the same gradient out of TWO buffers at two strides.
+  ; ------------------------------------------------------------------
+  vvpStep(9)
+  vkResetFences(dev, 1, @fenceArray)
+  vkResetCommandBuffer(cmd, 0)
+  If vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS
+    twoBufs[0] = bufPos
+    twoBufs[1] = bufCol
+    twoOffsets[0] = 0
+    twoOffsets[1] = 0
+    vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+    vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeC)
+    vkCmdBindVertexBuffers(cmd, 0, 2, @twoBufs[0], @twoOffsets[0])
+    vkCmdDraw(cmd, 3, 1, 0, 0)
+    vkCmdEndRenderPass(cmd)
+    rc = vkEndCommandBuffer(cmd)
+    If rc <> #VK_SUCCESS
+      vvpPut(#VVP_S_CB_TEXT, AnvilVkCommandBufferFailureText(cmd))
+      vvpPut(#VVP_S_STATUS_C, #VVP_ERR_RECORD)
+    Else
+      t0 = Ticks()
+      rc = vkQueueSubmit(queue, 1, @si, fence)
+      vvpPut(#VVP_S_SUBMIT_C, rc)
+      vvpPut(#VVP_S_US_C, (Ticks() - t0) / hz)
+      If rc <> #VK_SUCCESS
+        vvpPut(#VVP_S_STATUS_C, #VVP_ERR_SUBMIT)
+      Else
+        rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+        vvpPut(#VVP_S_WAIT_C, rc)
+        If rc <> #VK_SUCCESS
+          vvpPut(#VVP_S_STATUS_C, #VVP_ERR_FENCE)
+        Else
+          worst = 0
+          over = 0
+          differs = 0
+          k = 0
+          While k < 7
+            got = vvpPixel(imgBase, pitch, vvpProbeX[k], vvpProbeY[k])
+            vvpPut(#VVP_S_C_P0 + k, got)
+            want = vvpGet(#VVP_S_EXPECT0 + k)
+            d = AnvilVkInterpDistance(got, want)
+            If d > worst : worst = d : EndIf
+            If d > AnvilVkInterpTolerance() : over = over + 1 : EndIf
+            If got <> vvpGet(#VVP_S_B_P0 + k) : differs = differs + 1 : EndIf
+            k = k + 1
+          Wend
+          vvpPut(#VVP_S_C_WORST, worst)
+          vvpPut(#VVP_S_C_OVER, over)
+          vvpPut(#VVP_S_C_DIFFERS, differs)
+          bad = 0
+          k = 0
+          While k < 3
+            vvpPut(#VVP_S_C_OUT0 + k, vvpPixel(imgBase, pitch, vvpOutX[k], vvpOutY[k]))
+            If vvpGet(#VVP_S_C_OUT0 + k) <> #VVP_CLEAR_WORD : bad = bad + 1 : EndIf
+            k = k + 1
+          Wend
+          If over <> 0
+            vvpPut(#VVP_S_STATUS_C, #VVP_ERR_PIXELS_IN)
+          ElseIf bad <> 0
+            vvpPut(#VVP_S_STATUS_C, #VVP_ERR_PIXELS_OUT)
+          ElseIf differs <> 0 And vvpGet(#VVP_S_STATUS_B) = #VVP_OK
+            ; SPLITTING THE DATA MOVED THE PICTURE. Both passes may be
+            ; inside tolerance and still not be the same word, and that
+            ; is a finding: the two draws run byte-identical programs
+            ; over the same numbers and the GPU is deterministic.
+            vvpPut(#VVP_S_STATUS_C, #VVP_ERR_SPLIT_DIFFERS)
+          Else
+            vvpPut(#VVP_S_STATUS_C, #VVP_OK)
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  Else
+    vvpPut(#VVP_S_STATUS_C, #VVP_ERR_RECORD)
+  EndIf
+
+  vvpPut(#VVP_S_BIN_AFTER, V3dBinJobs())
+  vvpPut(#VVP_S_RENDER_AFTER, V3dRenderJobs())
+  vvpPut(#VVP_S_BIN_OOM, V3dBinOomCount())
+  vvpPut(#VVP_S_BIN_ERRSTAT, V3dBinErrStat())
+  vvpPut(#VVP_S_RENDER_ERRSTAT, V3dRenderErrStat())
+  vvpPut(#VVP_S_MMU_FAULTS, V3dMmuFaultsNow())
+  vvpPut(#VVP_S_MMU_VIOADDR, V3dMmuVioAddrNow())
+  vvpPut(#VVP_S_GUARD_AFTER, vvpSum(#VVP_SURFACE, #VVP_SCREEN_BYTES))
+  vvpPut(#VVP_S_DRAWS, avkBackendDraws())
+
+  ; ------------------------------------------------------------------
+  ;  10. Present what is on the image now - pass C's gradient.
+  ; ------------------------------------------------------------------
+  vvpStep(10)
+  rc = DisplayAdopt(#VVP_DSI_SCAN, #VVP_PANEL_PITCH, #VVP_PANEL_W, #VVP_PANEL_H, 32)
+  vvpPut(#VVP_S_DISPLAY_ERR, DisplayLastError())
+  If rc = #DSP_OK
+    DisplayBlit(imgBase, pitch, 0, 0, #VVP_PANEL_W, #VVP_PANEL_H)
+    DisplayFlush()
+    vvpPut(#VVP_S_PRESENT, #VVP_P_OK)
+    delay(#VVP_SHOW_MS)
+  Else
+    vvpPut(#VVP_S_PRESENT, #VVP_P_ADOPT_REFUSED)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  11. Ordered teardown, then hand the V3D MMU back.
+  ; ------------------------------------------------------------------
+  vvpStep(11)
+  vkDeviceWaitIdle(dev)
+  vkDestroyFence(dev, fence, 0)
+  vkDestroyPipeline(dev, pipeA, 0)
+  vkDestroyPipeline(dev, pipeB, 0)
+  vkDestroyPipeline(dev, pipeC, 0)
+  vkDestroyPipelineLayout(dev, layU, 0)
+  vkDestroyPipelineLayout(dev, layP, 0)
+  vkDestroyDescriptorPool(dev, dpool, 0)
+  vkDestroyDescriptorSetLayout(dev, dsl, 0)
+  vkDestroyShaderModule(dev, vsA, 0)
+  vkDestroyShaderModule(dev, fsA, 0)
+  vkDestroyShaderModule(dev, vsB, 0)
+  vkDestroyShaderModule(dev, fsB, 0)
+  vkDestroyShaderModule(dev, fsC, 0)
+  vkDestroyFramebuffer(dev, fb, 0)
+  vkDestroyRenderPass(dev, rp, 0)
+  vkDestroyImageView(dev, view, 0)
+  vkDestroyBuffer(dev, bufAll, 0)
+  vkFreeMemory(dev, memAll, 0)
+  vkDestroyBuffer(dev, bufPos, 0)
+  vkFreeMemory(dev, memPos, 0)
+  vkDestroyBuffer(dev, bufCol, 0)
+  vkFreeMemory(dev, memCol, 0)
+  vkDestroyBuffer(dev, bufUni, 0)
+  vkFreeMemory(dev, memUni, 0)
+  vkDestroyImage(dev, img, 0)
+  vkFreeMemory(dev, mem, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+  NeonShutdown()
+  vvpPut(#VVP_S_SHUTDOWN, 1)
+
+  ; ------------------------------------------------------------------
+  ;  12. The verdicts that belong to the run as a whole. They are
+  ;      checked in the order that makes the earliest real cause the one
+  ;      reported, and they overwrite a pass verdict only when the whole
+  ;      run is suspect.
+  ; ------------------------------------------------------------------
+  vvpStep(12)
+  If vvpGet(#VVP_S_BIN_AFTER) <= vvpGet(#VVP_S_BIN_BEFORE) Or vvpGet(#VVP_S_RENDER_AFTER) <= vvpGet(#VVP_S_RENDER_BEFORE)
+    ProcedureReturn vvpStop(#VVP_ERR_NO_JOBS)
+  EndIf
+  If vvpGet(#VVP_S_BIN_OOM) <> 0 Or vvpGet(#VVP_S_MMU_FAULTS) <> 0
+    vvpPut(#VVP_S_STATUS_A, #VVP_ERR_V3D_FAULT)
+    vvpPut(#VVP_S_STATUS_B, #VVP_ERR_V3D_FAULT)
+    vvpPut(#VVP_S_STATUS_C, #VVP_ERR_V3D_FAULT)
+    ProcedureReturn vvpStop(#VVP_ERR_V3D_FAULT)
+  EndIf
+  If vvpGet(#VVP_S_GUARD_AFTER) <> vvpGet(#VVP_S_GUARD_BEFORE)
+    vvpPut(#VVP_S_STATUS_A, #VVP_ERR_GUARD_CHANGED)
+    vvpPut(#VVP_S_STATUS_B, #VVP_ERR_GUARD_CHANGED)
+    vvpPut(#VVP_S_STATUS_C, #VVP_ERR_GUARD_CHANGED)
+    ProcedureReturn vvpStop(#VVP_ERR_GUARD_CHANGED)
+  EndIf
+  ; EVERY REFUSAL THAT WAS EXERCISED MUST HAVE REFUSED. A run where one
+  ; of them quietly succeeded is a run where the guard it represents is
+  ; gone, and that is worth a red verdict of its own even if all three
+  ; pictures were right.
+  If vvpGet(#VVP_S_REF_BINDING) = 0 Or vvpGet(#VVP_S_REF_DESCTYPE) = 0 Or vvpGet(#VVP_S_REF_NOSET) = 0 Or vvpGet(#VVP_S_REF_NOLAYOUT) = 0
+    ProcedureReturn vvpStop(#VVP_ERR_REFUSAL_MISSING)
+  EndIf
+  If vvpGet(#VVP_S_LAYOUT_AFTER) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    ProcedureReturn vvpStop(#VVP_ERR_FENCE)
+  EndIf
+  vvpPut(#VVP_S_FAULT_TEXT, AnvilVkFaultText())
+  vvpPut(#VVP_S_FAULT_COUNT, AnvilVkFaultCount())
+  ProcedureReturn @vvpReport[0]
+EndProcedure

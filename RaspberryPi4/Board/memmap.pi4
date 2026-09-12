@@ -388,6 +388,76 @@ EndProcedure
 ; necessarily overlaps itself; every other region is a real clash.
 #MON_REGION_MODULES = 5
 
+; ----------------------------------------------------------------------
+;  THE BOOT PHASE RECORD - NEW 2026-09-11
+;
+;  WHAT IT IS FOR. The boot log names what is starting, so a hang shows
+;  where - on the PANEL, and only while the panel is being serviced. A
+;  board that stops somewhere the screen service itself cannot run leaves
+;  nothing behind at all, and the only way to ask it afterwards is to boot
+;  a DIFFERENT image and look at memory. That needs an address that is the
+;  same in both images, that neither image's `_start` erases, and that
+;  survives the reset between them.
+;
+;  WHY $001FB000. The same four tests the autoboot record at $001FF000 is
+;  placed by, and it passes all four:
+;
+;    no image size can reach it   the image grows UP from #MON_LO
+;                                 ($00200000). There is no number of bytes
+;                                 of code that arrives below its own base.
+;    the stack cannot reach it    #MON_STACK is $00100000 and the monitor's
+;                                 stack grows DOWN from there. This page is
+;                                 a megabyte and a half ABOVE the stack
+;                                 top, on the far side of it.
+;    _start cannot erase it       it is not BSS. The zeroing loop walks
+;                                 __bss_start__..__bss_end__, which
+;                                 BssAddress puts at $08200000.
+;    its address does not move    which is the whole requirement a record
+;                                 read by a possibly DIFFERENT image after
+;                                 a reset has.
+;
+;  AND IT IS THE PAGE BELOW A BAND THAT IS ALREADY SPOKEN FOR, which is
+;  why this address and not a round number lower down: $001FC000..$001FEFFF
+;  is the raw-secondary stack reserve and $001FF000 is the autoboot record,
+;  so $001FB000 extends a reserved run downwards by one page instead of
+;  planting a lone page in the middle of the free band. It is outside both
+;  payload windows (#PAY0 begins a megabyte above the image end), outside
+;  BSS, outside the framebuffer, and outside the module arena.
+;
+;  IT IS DECLARED AS A REFUSED REGION, region 6 below, so `w`, `fill` and
+;  `copy` cannot write it by accident - the same protection the autoboot
+;  record has, for the same reason: a record an operator can overwrite
+;  without being told is a record that will be believed after it has been
+;  destroyed.
+;
+;  DRAM SURVIVES A RESET AND DOES NOT SURVIVE A POWER CUT, and the record
+;  says which happened rather than leaving the reader to guess: the magic
+;  is written once per boot, so a reader that finds it absent knows the
+;  contents are not a previous boot's, they are whatever DRAM powered up
+;  holding. That is the same property #SAFETY_COUNT_ADDR at $00001000
+;  depends on and it is stated here rather than assumed.
+;
+;  THE LAYOUT IS ONE 64-BYTE CACHE LINE, so one maintenance operation
+;  covers the whole record whatever the caches are doing:
+;
+;    +0   the magic, written once per boot
+;    +8   the phase this boot has reached
+;    +16  the phase the PREVIOUS boot reached, carried across
+;    +24  how many boots have written this record
+;
+;  The rest of the line is reserved and left alone.
+; ----------------------------------------------------------------------
+#MON_PHASE_LO    = $001FB000
+#MON_PHASE_BYTES = $00001000   ; the whole page, as #AB_BASE reserves its
+                               ; own: a refusal that names a page is one an
+                               ; operator can act on
+#MON_PHASE_MAGIC = $414E565048415345   ; "ANVPHASE", positive in a signed .i
+#MON_PHASE_OFF_MAGIC = 0
+#MON_PHASE_OFF_NOW   = 8
+#MON_PHASE_OFF_PREV  = 16
+#MON_PHASE_OFF_BOOTS = 24
+#MON_REGION_PHASE = 6
+
 ; ======================================================================
 ;  MonImage*() - THE IMAGE MEASURES ITSELF
 ; ----------------------------------------------------------------------
@@ -450,6 +520,86 @@ Procedure.i MonImageEnd()
     str  x16, [x17]
   EndASM
   ProcedureReturn monimage_end
+EndProcedure
+
+; ======================================================================
+;  THE BOOT PHASE RECORD - the four calls, and the one line they keep
+; ----------------------------------------------------------------------
+;  MonPhaseMark() IS CALLED FROM A PATH THAT MAY BE ABOUT TO WEDGE, so it
+;  does the least it can: one store and one cache-line maintenance. No
+;  branch on state, no printing, no allocation, and nothing that can
+;  itself wait. The rule for an instrument is that it must not be able to
+;  become the fault it is looking for.
+;
+;  THE MAINTENANCE IS NOT OPTIONAL. This monitor can run with caches on
+;  (`cache on`), and a record that is still sitting in this core's
+;  D-cache when the machine wedges is a record that never reaches DRAM
+;  and never survives the reset. "civac" cleans AND invalidates to the
+;  point of coherency, which is what a value another image will read
+;  after a reset needs; it is the same operation and the same one-line
+;  idiom mailbox.pi4 and xhci.pi4 each carry for themselves.
+;
+;  THE FLUSH ADDRESS IS FILE-SCOPE, and that is the frame rule: automatic
+;  storage lives in the invocation's frame as of 2026-09-11, so it has no
+;  address inline assembly can name. Same move, same reason, as
+;  monimage_lo/monimage_end above and the cache walk's bounds in dma.pi4.
+;
+;  x16 IS THE SCRATCH, as in the two blocks above and for the reason
+;  stated there: A64X() hands out x9..x13 for IR temporaries and neither
+;  x16 nor x17 can be live across an ASM block here.
+; ======================================================================
+Global monphase_flush.i = 0
+
+Procedure MonPhaseFlush()
+  ASM
+    adrp x16, global_monphase_flush
+    add  x16, x16, #:lo12:global_monphase_flush
+    ldr  x16, [x16]
+    dc civac, x16
+  EndASM
+EndProcedure
+
+; Start this boot's record, and CARRY THE PREVIOUS BOOT'S LAST PHASE
+; ACROSS. The carry is the whole point: the phase that matters is the one
+; a boot that never finished had reached, and the only reader that can
+; ever see it is the boot after it.
+;
+; A magic that does not match means the page is not a previous boot's
+; record - a power cut, a first boot, or a board somebody else was using -
+; and the carried phase is set to -1 rather than to whatever DRAM powered
+; up holding. An instrument that cannot say "I do not know" is worse than
+; none.
+Procedure MonPhaseBegin()
+  Define boots.i
+  Define prev.i
+  prev = -1
+  boots = 0
+  If PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_MAGIC) = #MON_PHASE_MAGIC
+    prev = PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW)
+    boots = PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_BOOTS)
+  EndIf
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_MAGIC, #MON_PHASE_MAGIC)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW,   0)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_PREV,  prev)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_BOOTS, boots + 1)
+  monphase_flush = #MON_PHASE_LO
+  MonPhaseFlush()
+  a64_barrier()
+EndProcedure
+
+Procedure MonPhaseMark(p.i)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW, p)
+  monphase_flush = #MON_PHASE_LO
+  MonPhaseFlush()
+EndProcedure
+
+; What this boot has reached, what the one before it reached, and whether
+; the record is a record at all.
+Procedure.i MonPhaseNow()   : ProcedureReturn PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW)   : EndProcedure
+Procedure.i MonPhasePrev()  : ProcedureReturn PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_PREV)  : EndProcedure
+Procedure.i MonPhaseBoots() : ProcedureReturn PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_BOOTS) : EndProcedure
+Procedure.i MonPhaseValid()
+  ProcedureReturn Bool(PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_MAGIC) = #MON_PHASE_MAGIC)
 EndProcedure
 
 ; HOW BIG THIS MONITOR IS, in bytes, measured rather than recorded. It is
@@ -535,7 +685,7 @@ EndProcedure
 ;  one whose extent moved.
 ; ======================================================================
 Procedure.i HwMonRegions()
-  ProcedureReturn 6
+  ProcedureReturn 7
 EndProcedure
 
 Procedure.i HwMonRegionLo(i.i)
@@ -546,6 +696,7 @@ Procedure.i HwMonRegionLo(i.i)
     Case 3 : ProcedureReturn #MON_FB_LO
     Case 4 : ProcedureReturn #CORE_RAW_STACK_LO
     Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_LO
+    Case #MON_REGION_PHASE : ProcedureReturn #MON_PHASE_LO
   EndSelect
   ; A region index this board does not have. Answering an address here
   ; would make HitsMonitor() refuse a range for a region that does not
@@ -562,6 +713,7 @@ Procedure.i HwMonRegionHi(i.i)
     Case 3 : ProcedureReturn #MON_FB_HI
     Case 4 : ProcedureReturn #CORE_RAW_STACK_HI
     Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_HI
+    Case #MON_REGION_PHASE : ProcedureReturn #MON_PHASE_LO + #MON_PHASE_BYTES - 1
   EndSelect
   ProcedureReturn 0
 EndProcedure
@@ -584,6 +736,8 @@ Procedure HwMonRegionSay(i.i)
       Print("the reserved raw-secondary stacks")
     Case #MON_REGION_MODULES
       Print("the driver-module arena and its staging window")
+    Case #MON_REGION_PHASE
+      Print("the boot phase record")
     Default
       Print("a region this board does not have")
   EndSelect

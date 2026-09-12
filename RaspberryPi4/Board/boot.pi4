@@ -30,6 +30,15 @@
 Procedure BootConfigUp()
   Define up.i
   gBootLog = 1
+  ; THE PHASE RECORD, BEFORE THE FIRST THING THAT CAN WEDGE. It opens
+  ; this boot's entry and carries the previous boot's last phase across,
+  ; and then the report says what that was - which is the only chance a
+  ; board that hangs in the same place every time has to speak for the
+  ; boot that hung. The screen and the touch panel are already up here,
+  ; so the sentence lands on the glass as well as on the wire.
+  MonPhaseBegin()
+  MonPhaseReport()
+  MonPhaseMark(#BPH_CONFIG_BEGIN)
   ; ------------------------------------------------------------------
   ; ARM THE LINK-LOCAL SURRENDER HOOK, before anything can take an
   ; address. RFC 3927 section 2.5 requires a host that sees a SECOND
@@ -63,6 +72,7 @@ Procedure BootConfigUp()
   ; reachable over its always-available wired interface.
   TcpInit()
   HttpInit()
+  MonPhaseMark(#BPH_CONFIG_END)
   gBootLog = 0
 EndProcedure
 

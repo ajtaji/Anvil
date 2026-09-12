@@ -184,6 +184,19 @@ Global gUsbEnum.i = 0
 ; and names exactly what wedged. gBootLog gates it so the same procedures
 ; can be called silently on the lazy path after boot.
 Global gBootLog.i = 0
+
+; The phase codes the boot writes into the record at #MON_PHASE_LO, and
+; the step counter they carry. Declared here, beside gBootLog and above
+; BootStep, because that is the first thing that marks one.
+#BPH_CONFIG_BEGIN = $0001
+#BPH_CONFIG_END   = $0002
+#BPH_STEP_LABEL   = $0200
+#BPH_STEP_WORK    = $0400
+#BPH_PCIE         = $0500
+#BPH_XHCI         = $0600
+#BPH_STEP_SCREEN  = $0700
+
+Global gBootStepN.i = 0
 Procedure bootStrLen(*s)
   Define n.i
   n = 0
@@ -194,6 +207,11 @@ Procedure bootStrLen(*s)
 EndProcedure
 Procedure BootStep(*name)
   Define i.i
+  ; THE STEP IS COUNTED WHETHER OR NOT IT IS PRINTED, so the number in
+  ; the phase record is the same number on a silent boot as on a logged
+  ; one. A record whose meaning depends on a print flag is not a record.
+  gBootStepN = gBootStepN + 1
+  MonPhaseMark(#BPH_STEP_LABEL | gBootStepN)
   If gBootLog = 0
     ProcedureReturn
   EndIf
@@ -225,7 +243,13 @@ Procedure BootStep(*name)
   ; started before the pause, exactly like the wire now does. The service
   ; also advances bounded banner work, and returns at once with no screen.
   UartDrain()
+  ; THE SCREEN SERVICE IS ITS OWN PHASE. It is the one thing this
+  ; procedure does that can wedge, it runs between the label and the
+  ; work, and a board stopped in it is indistinguishable from a board
+  ; stopped in the work unless the record separates them.
+  MonPhaseMark(#BPH_STEP_SCREEN | gBootStepN)
   ScreenServiceTick()
+  MonPhaseMark(#BPH_STEP_WORK | gBootStepN)
 EndProcedure
 Procedure BootOk(*name)
   ; UartWriteStr, NOT PrintN: *name is a pointer and PrintN routes by
@@ -261,7 +285,128 @@ EndProcedure
 ;  the piece it was doing. The hook is removed the moment the step is
 ;  over: nothing prints on the lazy path a `usb` command takes later.
 ; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  AND IT ALSO GOES SOMEWHERE A DIFFERENT IMAGE CAN READ IT - 2026-09-11
+;  evening, after the board said the RAM twin gets all the way through.
+;
+;  WHAT THE TWIN PROVED AND WHAT IT DID NOT. A build-75 twin entered into
+;  DRAM from a running build 55 reached the last xHCI phase and answered
+;  its own console. So the xHCI bring-up is not broken by anything a
+;  second monitor can reach. What a twin CANNOT reach is everything a
+;  cold flash boot does and it does not: the PCIe cold path (the twin
+;  finds the link already trained and adopts it), and - the one the twin
+;  made obvious - the WHOLE SCREEN SERVICE, because the firmware would
+;  not give the twin the DSI power domain, so gScreen was 0 and
+;  BannerClockTick, ScreenPump and the keyboard composer all returned at
+;  their first line.
+;
+;  THAT MATTERS HERE BECAUSE BootStep() CALLS ScreenServiceTick() AFTER
+;  PRINTING ITS LABEL AND BEFORE THE WORK THE LABEL NAMES. A board that
+;  wedges in that tick shows a label with no result - which is exactly
+;  the picture a board that wedges in the work shows, and the two have
+;  nothing else in common. So the marker distinguishes them.
+;
+;  A WORD ON THE PANEL IS NOT ENOUGH ON ITS OWN. It needs the panel to
+;  still be serviced and it needs somebody watching; it survives nothing.
+;  So every marker also goes to #MON_PHASE_LO, which is raw DRAM below
+;  the load address that no image's _start erases and that survives a
+;  reset - so a monitor that boots afterwards can be asked what the one
+;  before it reached. memmap.pi4 argues the address.
+;
+;  THE CODE IS ONE WORD AND IT READS AS HEX:
+;    $0001 / $0002   the configuration half of the boot, begun / done
+;    $02nn           boot step nn printed its label
+;    $07nn           boot step nn is inside ScreenServiceTick
+;    $04nn           boot step nn is doing the work its label names
+;    $05pp           PCIe sub-phase pp   (PciePhaseText)
+;    $06pp           xHCI sub-phase pp   (XhciPhaseText)
+; ----------------------------------------------------------------------
+
+; Turn a recorded code back into words. Used by the report the NEXT boot
+; prints, so it has to be able to name a code produced by an image that
+; is no longer running - which is why the step is named by its number and
+; not by its label: a label is a pointer and a pointer does not survive a
+; rebuild, while the order of the boot steps is the boot log's own order.
+Procedure MonPhaseSay(p.i)
+  Define grp.i
+  Define sub.i
+  grp = p & $FF00
+  sub = p & $00FF
+  Select grp
+    Case #BPH_STEP_LABEL
+      Print("boot step ") : PrintDec(sub) : Print(", its label printed")
+    Case #BPH_STEP_SCREEN
+      Print("boot step ") : PrintDec(sub) : Print(", inside the screen service")
+    Case #BPH_STEP_WORK
+      Print("boot step ") : PrintDec(sub) : Print(", doing its work")
+    Case #BPH_PCIE
+      Print("PCI Express: ") : UartWriteStr(PciePhaseText(sub))
+    Case #BPH_XHCI
+      Print("USB host: ") : UartWriteStr(XhciPhaseText(sub))
+    Default
+      Select p
+        Case #BPH_CONFIG_BEGIN : Print("the configuration half of the boot, just begun")
+        Case #BPH_CONFIG_END   : Print("the configuration half of the boot, finished")
+        Case 0                 : Print("nothing - it did not reach the first marker")
+        Default                : Print("an unknown phase code")
+      EndSelect
+  EndSelect
+EndProcedure
+
+; The report. Printed once, early, by whoever owns the boot - it is the
+; only chance a board that hangs in the same place every time has to say
+; what happened last time.
+; IT IS SILENT UNLESS IT HAS SOMETHING TO SAY, and the three silences are
+; each a real answer rather than a shrug:
+;
+;   no magic          the power was cut between the two boots, or this is
+;                     the first boot of this record. DRAM holds whatever
+;                     it powered up holding and there is nothing to
+;                     report. This is the NORMAL case for a card swap,
+;                     and a line about it on every cold boot would be
+;                     noise on the one path that always takes it.
+;   no previous phase the record exists and the boot before this one
+;                     never reached a marker.
+;   it finished       the previous boot completed the configuration half.
+;                     Saying so every time would be a line that means
+;                     "nothing happened", printed for ever.
+;
+; Everything else is a boot that started this half and did not finish it,
+; which is the whole reason the record exists.
+Procedure MonPhaseReport()
+  If MonPhaseValid() = 0
+    ProcedureReturn
+  EndIf
+  If MonPhasePrev() < 0 Or MonPhasePrev() = #BPH_CONFIG_END
+    ProcedureReturn
+  EndIf
+  Print("!! the previous boot did not finish this half. It stopped at: ")
+  MonPhaseSay(MonPhasePrev())
+  PrintNl()
+  Print("   (phase record at $001FB000; ")
+  PrintDec(MonPhaseBoots())
+  PrintN(" boots have written it)")
+EndProcedure
+
+Procedure PciePhaseWord()
+  MonPhaseMark(#BPH_PCIE | PciePhase())
+  If gBootLog = 0
+    ProcedureReturn
+  EndIf
+  If PciePhase() = #PCIE_PH_DONE
+    ProcedureReturn
+  EndIf
+  UartWriteStr(PciePhaseText(PciePhase()))
+  UartWrite(32)
+  UartDrain()
+  ScreenServiceTick()
+EndProcedure
+
 Procedure UsbPhaseWord()
+  ; THE MARK FIRST, ALWAYS, and before anything that can wait. An
+  ; instrument that only records when the log is on records nothing on
+  ; the path that matters.
+  MonPhaseMark(#BPH_XHCI | XhciPhase())
   If gBootLog = 0
     ProcedureReturn
   EndIf
@@ -283,14 +428,18 @@ Procedure.i UsbEnumerate()
     ProcedureReturn 1
   EndIf
   BootStep("PCI Express")
+  phase = PcieSetPhaseHook(@PciePhaseWord)
   If PcieInit() = 0
+    PcieSetPhaseHook(phase)
     BootOk("FAILED - the bus would not start")
     ProcedureReturn 0
   EndIf
   If PcieEnumerate() = 0
+    PcieSetPhaseHook(phase)
     BootOk("FAILED - nothing enumerated on the bus")
     ProcedureReturn 0
   EndIf
+  PcieSetPhaseHook(phase)
   BootOk("ok")
   BootStep("USB host (xHCI)")
   phase = XhciSetPhaseHook(@UsbPhaseWord)

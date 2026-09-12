@@ -1238,6 +1238,80 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Global pcie_adopted.i
 
+; ======================================================================
+;  WHICH PART OF THE BRING-UP IS RUNNING - added 2026-09-11.
+;
+;  THE SAME REASONING xhci.pi4 CARRIES, and here it buys more, because
+;  this file has TWO paths and a board only ever takes one of them. A
+;  monitor entered from a running monitor finds the link already trained
+;  and ADOPTS it: three register writes and out. A monitor the firmware
+;  entered from power-on may take the COLD path - PERST, the SerDes out
+;  of IDDQ, the control registers, the inbound BAR, MSI masked, PERST
+;  released and up to 100 ms of link polling. Everything in that second
+;  list is reached on a cold flash boot and on nothing else, so a fault
+;  in it cannot be reproduced by entering a second monitor into RAM, and
+;  the only instrument that can tell the two paths apart from a panel is
+;  a marker that says which one was taken.
+;
+;  The hook takes no argument and the phase is read back through
+;  PciePhase(), which is genet.pi4's shape and the one this tree has run
+;  on silicon. The marker is file-scope storage because automatic storage
+;  lives in the invocation's frame as of 2026-09-11 and a marker whose
+;  job is to outlive the call that set it cannot live there.
+; ======================================================================
+#PCIE_PH_IDLE     = 0
+#PCIE_PH_CANARY   = 1    ; the 64-bit window-base canary
+#PCIE_PH_PROBE    = 2    ; asking whether the link is already up
+#PCIE_PH_ADOPT    = 3    ; adopt: the outbound window
+#PCIE_PH_INBOUND  = 4    ; adopt: the RC_BAR2 offset, and its readback
+#PCIE_PH_PERST    = 5    ; cold: INIT and PERST asserted
+#PCIE_PH_SERDES   = 6    ; cold: the SerDes out of IDDQ
+#PCIE_PH_CTRL     = 7    ; cold: burst size, SCB, inbound BAR, MSI masked
+#PCIE_PH_TRAIN    = 8    ; cold: PERST released, waiting for the link
+#PCIE_PH_WINDOW   = 9    ; cold: the outbound window
+#PCIE_PH_UP       = 10   ; the link is up either way
+#PCIE_PH_BUSNUM   = 11   ; the bridge's secondary/subordinate numbers
+#PCIE_PH_ENUM     = 12   ; the endpoint's id, BAR and command register
+#PCIE_PH_DONE     = 13
+
+Global pcie_phaseAt.i = #PCIE_PH_IDLE
+Global *pcie_phaseHook = 0
+
+Procedure.i PciePhase() : ProcedureReturn pcie_phaseAt : EndProcedure
+
+Procedure.i PciePhaseText(p.i)
+  Select p
+    Case #PCIE_PH_CANARY  : ProcedureReturn "canary"
+    Case #PCIE_PH_PROBE   : ProcedureReturn "probe"
+    Case #PCIE_PH_ADOPT   : ProcedureReturn "adopt"
+    Case #PCIE_PH_INBOUND : ProcedureReturn "inbound"
+    Case #PCIE_PH_PERST   : ProcedureReturn "perst"
+    Case #PCIE_PH_SERDES  : ProcedureReturn "serdes"
+    Case #PCIE_PH_CTRL    : ProcedureReturn "control"
+    Case #PCIE_PH_TRAIN   : ProcedureReturn "train"
+    Case #PCIE_PH_WINDOW  : ProcedureReturn "window"
+    Case #PCIE_PH_UP      : ProcedureReturn "up"
+    Case #PCIE_PH_BUSNUM  : ProcedureReturn "busnum"
+    Case #PCIE_PH_ENUM    : ProcedureReturn "endpoint"
+    Case #PCIE_PH_DONE    : ProcedureReturn "ok"
+  EndSelect
+  ProcedureReturn "idle"
+EndProcedure
+
+Procedure.i PcieSetPhaseHook(*fn)
+  Define old.i
+  old = *pcie_phaseHook
+  *pcie_phaseHook = *fn
+  ProcedureReturn old
+EndProcedure
+
+Procedure pcie_Phase(p.i)
+  pcie_phaseAt = p
+  If *pcie_phaseHook <> 0
+    pcie_phaseHook()
+  EndIf
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  PcieProgramWindow - point the outbound window at our bus range.
 ;
@@ -1279,6 +1353,7 @@ Procedure.i PcieInit()
   ; The canary first. Built by a 32-bit compiler the window base
   ; truncates to zero and every access below would land on the firmware
   ; spin table instead of the bus.
+  pcie_Phase(#PCIE_PH_CANARY)
   If PcieAddrIsWide() = 0
     pcie_err = #PCIE_ERR_NARROW
     ProcedureReturn 0
@@ -1306,8 +1381,10 @@ Procedure.i PcieInit()
   ; The full sequence below is still correct and still needed for a cold
   ; link. It is simply not what this board needs, and finding that out on
   ; a board that boots some other way is a different day's work.
+  pcie_Phase(#PCIE_PH_PROBE)
   If PcieLinkUp() <> 0
     pcie_adopted = 1
+    pcie_Phase(#PCIE_PH_ADOPT)
     ; The window still has to be right - it is ours to use and nothing
     ; guarantees the firmware left it where we want it.
     PcieProgramWindow()
@@ -1344,6 +1421,7 @@ Procedure.i PcieInit()
     ; THE ONLY DEVICE BEHIND THIS ROOT COMPLEX IS THE VL805, soldered
     ; to the board, and it is the device being taken over. So there is
     ; no third party whose mapping is being changed underneath it.
+    pcie_Phase(#PCIE_PH_INBOUND)
     ibLo = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $FFFFFFFF
     pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, ibLo & $1F)
     pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
@@ -1364,15 +1442,18 @@ Procedure.i PcieInit()
     EndIf
 
     pcie_up = 1
+    pcie_Phase(#PCIE_PH_UP)
     ProcedureReturn 1
   EndIf
 
   ; 1. assert INIT and PERST together, hold, release INIT only.
+  pcie_Phase(#PCIE_PH_PERST)
   pcie_Modify(#PCIE_RGR1_SW_INIT_1, 0, #PCIE_SW_INIT_1_INIT_MASK | #PCIE_SW_INIT_1_PERST_MASK)
   delay(1)
   pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_INIT_MASK, 0)
 
   ; 2. take the SerDes out of IDDQ - the PHY is powered down out of reset
+  pcie_Phase(#PCIE_PH_SERDES)
   pcie_Modify(#PCIE_MISC_HARD_PCIE_HARD_DEBUG, #PCIE_HARD_DEBUG_SERDES_IDDQ, 0)
   delay(1)
 
@@ -1380,6 +1461,7 @@ Procedure.i PcieInit()
   ;    makes an unsupported-request config read return all-ones instead
   ;    of aborting, which is what lets a bus scan probe an empty slot
   ;    without taking a fault. PcieCfgRead32 depends on it.
+  pcie_Phase(#PCIE_PH_CTRL)
   pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_MAX_BURST_MASK, #PCIE_MISC_CTRL_SCB_ACCESS_EN | #PCIE_MISC_CTRL_CFG_READ_UR_MODE)
 
   ; 4. inbound BAR2 - where the controller may reach into OUR memory.
@@ -1400,6 +1482,7 @@ Procedure.i PcieInit()
 
   ; 6. release PERST - the device may now leave reset - and wait.
   ;    U-Boot allows 100 ms in 5 ms steps after a flat 100 ms settle.
+  pcie_Phase(#PCIE_PH_TRAIN)
   pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_PERST_MASK, 0)
   delay(100)
   i = 0
@@ -1416,6 +1499,7 @@ Procedure.i PcieInit()
     ProcedureReturn 0
   EndIf
 
+  pcie_Phase(#PCIE_PH_WINDOW)
   PcieProgramWindow()
 
   ; 8. class code to PCI-to-PCI bridge, and little-endian BAR2.
@@ -1423,6 +1507,7 @@ Procedure.i PcieInit()
   pcie_Modify(#PCIE_RC_CFG_VENDOR_REG1, #PCIE_VENDOR_REG1_ENDIAN_MASK, 0)
 
   pcie_up = 1
+  pcie_Phase(#PCIE_PH_UP)
   ProcedureReturn 1
 EndProcedure
 
@@ -1575,6 +1660,7 @@ Procedure.i PcieEnumerate()
     pcie_err = #PCIE_ERR_LINK
     ProcedureReturn 0
   EndIf
+  pcie_Phase(#PCIE_PH_BUSNUM)
 
   ; ---- THE BRIDGE'S BUS NUMBERS, BEFORE ANYTHING ON BUS 1 IS READ ----
   ; A PCI-to-PCI bridge only forwards a configuration cycle downstream
@@ -1606,6 +1692,7 @@ Procedure.i PcieEnumerate()
     ProcedureReturn 0
   EndIf
 
+  pcie_Phase(#PCIE_PH_ENUM)
   lo = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
   is64 = 0
   If (lo & #PCI_BAR_TYPE_MASK) = #PCI_BAR_TYPE_64
@@ -1685,6 +1772,7 @@ Procedure.i PcieEnumerate()
   PcieCfgWrite32(0, 0, 0, #PCI_CFG_COMMAND, bcmd | #PCI_CMD_MEM_SPACE | #PCI_CMD_BUS_MASTER)
 
   pcie_barCpu = PcieCpuFromBus(pcie_barBus)
+  pcie_Phase(#PCIE_PH_DONE)
   ProcedureReturn 1
 EndProcedure
 

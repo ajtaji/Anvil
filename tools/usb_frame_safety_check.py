@@ -61,6 +61,13 @@ USB_PATH = (
     "RaspberryPi4/Lib/dma.pi4",
     "RaspberryPi4/Board/cursor_input.pi4",
     "RaspberryPi4/Board/hw_usb.pi4",
+    # The phase record's own two files, added 2026-09-11 evening. They are
+    # in the list for the same reason as the rest and for one more: the
+    # record exists to be read by a DIFFERENT image after a reset, so a
+    # marker that lived in a frame would not merely be wrong, it would be
+    # wrong in the one direction nobody could check afterwards.
+    "RaspberryPi4/Board/memmap.pi4",
+    "RaspberryPi4/Board/boot.pi4",
 )
 
 # THE SINKS - the calls that hand an address to something other than this CPU,
