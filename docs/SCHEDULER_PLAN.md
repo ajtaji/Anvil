@@ -1,8 +1,9 @@
 # Portable application scheduling
 
-Status: task lifecycle and bounded queues implemented; native A64 cooperative
-contexts now execute under the emitted-code gate. **No preemption, timer
-binding or board acceptance yet**. This is a
+Status: lifecycle, cooperative contexts and a separate EL3 asynchronous
+backend execute under emitted-code gates. Two nonyielding FP loops are
+preempted by modeled timer IRQs. **No production timer binding, whole-runtime
+preemption safety or board acceptance yet**. This is a
 foundation for running a native forum alongside other Anvil applications,
 not a claim that the existing monitor can already do so.
 
@@ -181,3 +182,57 @@ It is not a monitor build and touches no board. The separate context gate
 proves cooperative continuations in emitted instructions. Hardware, interrupt
 races, memory isolation, whole-runtime reentrancy and preemptive fairness
 remain explicitly unproven.
+
+## Asynchronous EL3 backend
+
+`preempt_a64.pbi` is separate from the cooperative backend; do not combine
+their context ownership in one lifecycle instance. Its IRQ path saves all
+31 integer registers, all 32 128-bit SIMD registers, SP, ELR_EL3, SPSR_EL3,
+FPCR and FPSR before running policy on a guarded 16 KiB IRQ stack. ERET
+restores the chosen task's interrupted PC and status, including NZCV and masks.
+Applications need not yield for the timer to switch them. SVE/SME, SMP,
+address-space changes and whole-runtime preemption safety are not supplied.
+
+`ApInstall(expectedVbar,ack,arm,stop,codebase,codesize)` requires EL3h, all
+DAIF masks set and CPTR_EL3 allowing FP/SIMD. It compares VBAR, reserves a
+previously zero TPIDR_EL3 for entry scratch, and installs its vector table
+with readback. It does not start the timer or unmask IRQ. Only current-EL
+SPx IRQs are resumable. Lower privileged ELs refuse before EL3-only reads;
+EL0 calls are outside this privileged contract.
+
+The three timer callbacks are parameterless integer-returning procedures
+in the admitted code interval. `arm()` starts/rearms a quantum; `stop()`
+stops the source; `ack()` verifies the expected IRQ, acknowledges the actual
+interrupt controller and rearms. Return 1 only after success. Callbacks must
+remain on the same core/EL, keep IRQ masked, never sleep/reenter the scheduler,
+perform bounded work and not leave a partially enabled source on failure.
+These are native adapter contracts, not deployed Pi hardware bindings. The
+Pi 3 local-controller timer is EL2 and needs a separate compatible backend.
+
+`ApCreate(entry,argument)` allocates a private 16 KiB stack and generation-bound
+context. Entry is parameterless and integer-returning; `ApArgument()` retrieves
+its argument. `ApRun()` launches tasks and returns to the original kernel
+context when all finish. Timer IRQs rotate FIFO ownership. Entry return records
+`ApResult(handle)`. `ApReap(handle)` clears terminal stack/context ownership;
+only then can `ApUninstall()` restore the vector/thread lease. Saved SP, PC,
+mode and canaries are validated. This detects damage, not memory isolation.
+
+The fatal path is currently a diagnostic fail-stop, **not a wired Anvil panic
+reporter/recovery path**. Bind that path and native timer ownership before
+board use. Live-task waits/cancellation, application resource cleanup and
+serialized services also remain integration work. Preserving registers does
+not make shared compiler runtime or device scratch reentrant.
+
+```text
+python tools/scheduler_context_arch_check.py
+python tools/scheduler_context_preempt_check.py --compiler <PureMetalForge executable> --mutate
+```
+
+The architectural gate checks IRQ-entry/ERET state, masks, stack banks, nested
+entry and invalid returns against
+[Arm's exception model, sections 5 and 6](https://documentation-service.arm.com/static/67ac57fb091bfc3e0a9479cc).
+The execution gate runs two actual nonyielding FP32 loops. A test-only counter
+comparator routes IRQs to EL3; no task progress or results are manufactured.
+The initial run passes 18 execution assertions under 26 IRQs, 26 ownership
+refusals and two corrupt-context source mutations. Interpreter instruction
+ticks are not a silicon frequency or latency measurement.

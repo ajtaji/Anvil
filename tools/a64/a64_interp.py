@@ -482,11 +482,12 @@ class A64:
     #  three gates growing three private copies of a register file is how
     #  three models come to disagree.
     #
-    #  SO IT IS A STORE, NOT A MODEL.  Nothing here acts on a value.
+    #  Most registers remain a store, not a peripheral/MMU model.
     #  Writing SCTLR_ELx.M does not turn on translation; writing SCR_EL3.NS
-    #  does not create a second world; writing VBAR does not install
-    #  vectors.  A register written can be read back and a gate can judge
-    #  it, and that is the whole of it.  Inventing consequences would be
+    #  does not create a second world. The later explicit take_irq/ERET
+    #  subset does honor VBAR, ELR/SPSR, SP banks, NZCV and DAIF, with
+    #  interrupt routing supplied by its caller. Other register values
+    #  can be read back and judged without inventing consequences. That would be
     #  a wrong answer where an absent one is honest - and `mmu_enabled()`
     #  above already says at length why this model must not pretend to
     #  translate.
@@ -502,6 +503,8 @@ class A64:
     # 2 unless a gate says otherwise, because that is where the stock
     # armstub and U-Boot both hand over.
     current_el: int = 2
+    pstate_sp: int = 1
+    stack_banks: Dict[int, int] = field(default_factory=dict)
 
     # Every ERET this run executed, as (from_el, to_el, target_pc).  The
     # stub gate's central claim is a NEGATIVE one - that our stub never
@@ -861,6 +864,58 @@ class A64:
             raise ValueError("exception level must be 0, 1, 2 or 3, not %r" % el)
         self.system_registers = dict(preset or {})
         self.current_el = el
+        self.pstate_sp = 0 if el == 0 else 1
+        self.stack_banks = {}
+        for key, bank in ((0xD5184100, 0), (0xD51C4100, 1), (0xD51E4100, 2)):
+            if key in self.system_registers:
+                self.stack_banks[bank] = self.system_registers[key]
+
+    def _select_stack(self, el: int, selection: int) -> None:
+        old = self.current_el if self.pstate_sp else 0
+        new = el if selection else 0
+        self.stack_banks[old] = self.sp
+        if new != old:
+            self.sp = self.stack_banks.get(new, 0)
+        self.current_el, self.pstate_sp = el, selection
+
+    def pstate(self) -> int:
+        if self.system_registers is None:
+            raise RuntimeError('PSTATE requires the opt-in system-register model.')
+        return ((self.n << 31) | (self.z << 30) | (self.c << 29) |
+                (self.vflag << 28) | (self.system_registers.get(0xD51B4220, 0) & 0x3c0) |
+                (self.current_el << 2) | self.pstate_sp)
+
+    def take_irq(self, target_el: Optional[int] = None) -> bool:
+        """Inject an already-routed physical IRQ between instructions.
+
+        Arm 102412_0103_02 sections5.1/5.2 and6: save PC/PSTATE, choose
+        SP_ELx and vector group, mask DAIF. Routing/controller priority is
+        supplied by the gate, not invented here. Nested IRQ requires software
+        to unmask and save its banked ELR/SPSR first; no hidden context stack.
+        https://documentation-service.arm.com/static/67ac57fb091bfc3e0a9479cc
+        """
+        if self.system_registers is None:
+            raise RuntimeError('IRQ injection requires the opt-in system-register model.')
+        target = self.current_el if target_el is None else target_el
+        if target not in (1, 2, 3):
+            raise ValueError('An IRQ target must be EL1, EL2 or EL3.')
+        if target < self.current_el:
+            return False
+        if target == self.current_el and self.pstate() & 0x80:
+            return False
+        vector_key = {1:0xD518C000, 2:0xD51CC000, 3:0xD51EC000}[target]
+        vector = self.system_registers.get(vector_key, 0)
+        if vector == 0 or vector & 2047:
+            raise RuntimeError('IRQ delivery requires a nonzero 2048-byte-aligned VBAR.')
+        offset = 0x480 if target > self.current_el else (0x280 if self.pstate_sp else 0x80)
+        elr, spsr = ERET_BANKS[target]
+        self.system_registers[elr] = self.pc
+        self.system_registers[spsr] = self.pstate()
+        self._select_stack(target, 1)
+        self.system_registers[0xD51B4220] = 0x3c0
+        self.excl_clear()
+        self.pc = vector + offset
+        return True
 
     def sysreg(self, write_base: int) -> Optional[int]:
         """What a register holds, or None if nothing has written it.
@@ -973,10 +1028,21 @@ class A64:
                 "the source under test."
             )
 
-        # Immediate PSTATE writes used by startup. The subset interpreter
-        # has no asynchronous exception source, so these are ordering/state
-        # no-ops after their encoding has been independently checked.
+        # Immediate mask writes remain no-ops in legacy flat mode; in the
+        # opt-in system model they control explicit routed IRQ injection.
         if (ins & 0xFFFFF0FF) in (0xD50340DF, 0xD50340FF):
+            if self.system_registers is not None:
+                bits = ((ins >> 8) & 15) << 6
+                old = self.system_registers.get(0xD51B4220, 0)
+                self.system_registers[0xD51B4220] = (old | bits) if (ins & 0xFFFFF0FF) == 0xD50340DF else (old & ~bits)
+            return
+
+        if (ins & 0xFFFFFEFF) == 0xD50040BF:
+            if self.system_registers is None:
+                raise RuntimeError('SPSel requires the opt-in system-register model.')
+            if self.current_el == 0:
+                raise RuntimeError('SPSel is privileged and cannot be changed at EL0.')
+            self._select_stack(self.current_el, (ins >> 8) & 1)
             return
 
         # MRS Xt, CNTPCT_EL0.  ABOVE the opt-in store on purpose: nothing
@@ -1016,6 +1082,13 @@ class A64:
                         # model's own level rather than from the store,
                         # because it is not a register anything writes.
                         value = self.current_el << 2
+                    elif base == 0xD5184200:
+                        value = self.pstate_sp
+                    elif base == 0xD51B4200:
+                        value = (self.n << 31) | (self.z << 30) | (self.c << 29) | (self.vflag << 28)
+                    elif base in (0xD5184100, 0xD51C4100, 0xD51E4100):
+                        bank = {0xD5184100:0, 0xD51C4100:1, 0xD51E4100:2}[base]
+                        value = self.sp if bank == (self.current_el if self.pstate_sp else 0) else self.stack_banks.get(bank, 0)
                     else:
                         value = self.system_registers.get(base, 0)
                     if rt != 31:
@@ -1023,6 +1096,19 @@ class A64:
                 else:
                     self.system_registers[base] = (
                         self.x[rt] & MASK64 if rt != 31 else 0)
+                    if base == 0xD51B4200:
+                        value = self.system_registers[base]
+                        self.n, self.z, self.c, self.vflag = ((value >> bit) & 1 for bit in (31, 30, 29, 28))
+                    elif base == 0xD5184200:
+                        if self.current_el == 0:
+                            raise RuntimeError('SPSel is privileged and cannot be changed at EL0.')
+                        self._select_stack(self.current_el, self.system_registers[base] & 1)
+                    if base in (0xD5184100, 0xD51C4100, 0xD51E4100):
+                        bank = {0xD5184100:0, 0xD51C4100:1, 0xD51E4100:2}[base]
+                        value = self.system_registers[base]
+                        self.stack_banks[bank] = value
+                        if bank == (self.current_el if self.pstate_sp else 0):
+                            self.sp = value
                 return
 
             # ERET. The level it returns FROM decides which ELR and SPSR
@@ -1041,6 +1127,10 @@ class A64:
                         "architecture defines, and this model will not "
                         "invent a destination for it.")
                 spsr = self.system_registers.get(spsr_base, 0)
+                if (spsr & 31) not in (0, 4, 5, 8, 9, 12, 13):
+                    raise RuntimeError(f'eret at {here:#x}: invalid or unsupported SPSR mode {spsr & 31:#x}.')
+                if spsr & ~0xF00003CF:
+                    raise RuntimeError(f'eret at {here:#x}: unsupported PSTATE controls in SPSR {spsr:#x}.')
                 if (spsr >> 4) & 1:
                     raise RuntimeError(
                         f"eret at {here:#x} with SPSR.M[4] set asks to "
@@ -1057,8 +1147,12 @@ class A64:
                         "Illegal Exception Return, so it is refused here "
                         "rather than modelled as a level nobody may reach.")
                 target = self.system_registers.get(elr_base, 0)
+                if target & 3:
+                    raise RuntimeError(f'eret at {here:#x}: unaligned A64 return PC {target:#x}.')
                 self.erets.append((self.current_el, to_el, target))
-                self.current_el = to_el
+                self._select_stack(to_el, spsr & 1)
+                self.n, self.z, self.c, self.vflag = ((spsr >> bit) & 1 for bit in (31, 30, 29, 28))
+                self.system_registers[0xD51B4220] = spsr & 0x3c0
                 self.pc = target & MASK64
                 return
 
@@ -1520,7 +1614,7 @@ class A64:
                     n, z, c, v = 1, 0, 0, 0
                 else:
                     n, z, c, v = 0, 0, 1, 0
-                self.n, self.z, self.c, self.v_flag = n, z, c, v
+                self.n, self.z, self.c, self.vflag = n, z, c, v
                 return
 
             # A: two source

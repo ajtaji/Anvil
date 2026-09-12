@@ -1,0 +1,67 @@
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/preempt_a64.pbi"
+Global checks.i
+Global failures.i
+Global stopped.i
+Procedure.i FailArm()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i StopOk()
+  stopped = stopped + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure Check(a.i, b.i)
+  checks = checks + 1
+  If a <> b : failures = failures + 1 : EndIf
+EndProcedure
+Procedure.i Stub()
+  ProcedureReturn 1
+EndProcedure
+Procedure Main()
+  Protected handle.i
+  Check(ApArgument(), 0)
+  Check(ApOwnedSlot(0), -1)
+  Check(ApOwnedSlot(-1), -1)
+  Check(ApInstall($8000, @Stub, @Stub, @Stub, 0, 64), 0)
+  Check(ApInstall($8000, 0, @Stub, @Stub, $400000, $200000), 0)
+  Check(ApInstall($9000, @Stub, @Stub, @Stub, $400000, $200000), 0)
+  PokeI($6000100, 7)
+  Check(ApInstall($8000, @Stub, @Stub, @Stub, $400000, $200000), 0)
+  PokeI($6000100, 8)
+  Check(ApInstall($8000, @Stub, @FailArm, @StopOk, $400000, $200000), 1)
+  Check(ApInstall($8000, @Stub, @Stub, @Stub, $400000, $200000), 0)
+  PokeI($6000100, 1)
+  Check(ApCreate(@Stub, 0), 0)
+  Check(ApRun(), 0)
+  Check(ApUninstall(), 0)
+  PokeI($6000100, 2)
+  PokeI($6000100, 3)
+  Check(ApRun(), 0)
+  Check(ApUninstall(), 0)
+  PokeI($6000100, 4)
+  handle = ApCreate(@Stub, 0)
+  Check(handle > 0, 1)
+  Check(ApOwnedSlot(handle), SchedSlot(handle))
+  Check(ApOwnedSlot(handle + 32), -1)
+  PokeI(ApFrame(SchedSlot(handle)) + 264, 9)
+  Check(ApRun(), 0)
+  Check(ApResult(handle), -1)
+  Check(ApReap(handle), 1)
+  Check(ApOwnedSlot(handle), -1)
+  handle = ApCreate(@Stub, 0)
+  Check(ApRun(), 0)
+  Check(SchedState(handle), #SCHED_READY)
+  Check(stopped, 1)
+  Check(SchedCancel(handle), 1)
+  Check(ApReap(handle), 1)
+  Check(ApReap(handle), 0)
+  PokeI($6000100, 5)
+  Check(ApUninstall(), 0)
+  PokeI($6000100, 6)
+  Check(ApUninstall(), 1)
+  ApEnvironment()
+  Check(ap_vbar, $8000)
+  Check(ap_thread, 0)
+  PokeI($6000000, checks)
+  PokeI($6000008, failures)
+EndProcedure
