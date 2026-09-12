@@ -754,6 +754,8 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | pinned Raspberry Pi USB topology facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | power-good, address-settle and reset timing facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/lan9514_transport.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | SMSC95xx register, MAC and MII transaction facts consulted; no implementation copied |
+| `RaspberryPi3/Lib/lan9514_runtime.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | SMSC9514 reset/configuration, link latch and bulk framing facts consulted; no implementation copied |
+| `RaspberryPi3/Lib/lan9514_runtime.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | generic MII autonegotiation and link-status facts consulted; no implementation copied |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/usb_takeover_compile.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
