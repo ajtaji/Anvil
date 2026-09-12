@@ -601,6 +601,7 @@ all are `original` and are not listed; `--list-original` enumerates them.
 
 | File | Class | Upstream source | License | Obligation |
 | --- | --- | --- | --- | --- |
+| `Anvil/Applications/Forum/http_head.pbi` | protocol-facts | ietf-rfc | RFC publication | cite the document; no copied implementation |
 | `Anvil/Core/argfmt.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `Anvil/Core/auto.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/boot_cmd.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
