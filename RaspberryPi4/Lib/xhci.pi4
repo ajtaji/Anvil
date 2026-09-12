@@ -1760,9 +1760,28 @@ EndProcedure
 ; will be after a power-on reset. The read-modify-write of USBCMD
 ; preserves the reserved bits 4:6 and 12:31, as xhci.h requires.
 ; ======================================================================
+; xHCI 1.2 section 4.2: after hardware reset, incoming CNR must clear
+; before any operational/runtime write. The post-HCRST wait alone is not
+; sufficient when taking over a controller still completing its cold reset.
+; https://cdrdv2-public.intel.com/625472/625472_xHCI_Rev1_2b.pdf
+Procedure.i xh_WaitReady()
+  Define d.i
+  d = xh_Deadline(#XHCI_TMO_RESET_MS)
+  While (xh_Rd(xh_op, #XHCI_USBSTS) & #XHCI_STS_CNR) <> 0
+    If xh_Expired(d) <> 0
+      ProcedureReturn xh_Fail(#XHCI_ERR_CNR)
+    EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i xh_Halt()
   Define cmd.i
   Define d.i
+
+  If xh_WaitReady() = 0
+    ProcedureReturn 0
+  EndIf
 
   If (xh_Rd(xh_op, #XHCI_USBSTS) & #XHCI_STS_HALT) = 0
     cmd = xh_Rd(xh_op, #XHCI_USBCMD)
@@ -2812,10 +2831,15 @@ EndProcedure
 ; ((p & 0xfffffffe) & ~0x2).
 Procedure XhciStop()
   Define t.i
+  xh_ready = 0
   If xh_op = 0
     ProcedureReturn
   EndIf
-  xh_Reset()
+  ; A failed reset may leave CNR set. Cleanup must not issue runtime writes
+  ; after the readiness gate refused them in the initialization path.
+  If xh_Reset() = 0
+    ProcedureReturn
+  EndIf
   t = xh_Rd(xh_op, #XHCI_USBSTS)
   xh_Wr(xh_op, #XHCI_USBSTS, t & (~#XHCI_STS_EINT))
   If xh_ir <> 0
