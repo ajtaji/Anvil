@@ -36,6 +36,10 @@ def main():
                 self.system_registers[key] = old & ~0x80 if word == 0xd50342ff else old | 0x80
             return super().step()
         def store(self, addr, value, size):
+            if addr == 0x6000300:
+                # Test-only device-state injection, never a production register.
+                for offset, case in ((0x200, 1), (0x300, 2), (0x100, 3)):
+                    mod.A64.store(self, d+offset, (1 << 20) if value == case else 0, 4)
             if d <= addr < c + 0x1000:
                 self.writes.append((addr, value & ((1 << (size * 8)) - 1), size))
             if self.reject == (addr,value):
@@ -74,6 +78,8 @@ def main():
                 out = [cpu.load(0x6000000 + i*8,8) for i in range(5)]
                 expected = [1,1,1,int(raw in (29,40,255) or (raw & 1023) >= 1020),1]
                 assert out == expected, (el,raw,out,expected,cpu.writes[-12:])
+                assert [cpu.load(0x6000200+i*8,8) for i in range(8)] == [1,0,0,0,1,1,0,0]
+                assert [cpu.load(0x6000240+i*8,8) for i in range(6)] == [0]*6
                 assert [cpu.load(0x6000040+i*8,8) for i in range(4)] == [0]*4
                 assert [cpu.load(0x6000060+i*8,8) for i in range(2)] == [1,1]
                 assert cpu.irq_masks == [0xd50342ff,0xd50342df]

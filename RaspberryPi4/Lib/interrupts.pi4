@@ -166,6 +166,9 @@ Procedure.i InterruptClaim(id.i, handler.i)
   If (PeekL(#IG_D + $300 + (id / 32) * 4) & (1 << (id & 31))) <> 0
     ProcedureReturn 0
   EndIf
+  If (PeekL(#IG_D + $200 + (id / 32) * 4) & (1 << (id & 31))) <> 0
+    ProcedureReturn 0
+  EndIf
   If ig_el = 3
     If (PeekL(#IG_D + $80 + (id / 32) * 4) & (1 << (id & 31))) = 0
       ProcedureReturn 0
@@ -246,6 +249,79 @@ Procedure.i InterruptDisable(id.i)
     ProcedureReturn 0
   EndIf
   ig_enabled(id) = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Transfer an empty controller's vector lease without reinitializing hardware.
+; Caller installs the new vector between CanTransfer and Transfer. Both calls
+; require IRQ masked; Transfer independently repeats all ownership checks.
+Procedure.i InterruptTransferIdle()
+  Protected n.i
+  Protected enabled.i
+  For n = 0 To (ig_count / 32) - 1
+    enabled = PeekL(#IG_D + $100 + n * 4)
+    If n = 0 : enabled = enabled & $FFFF0000 : EndIf
+    If enabled <> 0 Or PeekL(#IG_D + $200 + n * 4) <> 0 Or PeekL(#IG_D + $300 + n * 4) <> 0
+      ProcedureReturn 0
+    EndIf
+  Next
+  For n = 16 To ig_count - 1
+    If ig_handlers(n) <> 0 Or ig_enabled(n) <> 0
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i InterruptCanTransfer(expected.i)
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  If expected <> ig_vbar : ProcedureReturn 0 : EndIf
+  ProcedureReturn InterruptTransferIdle()
+EndProcedure
+
+Procedure.i InterruptTransfer(expected.i, replacement.i)
+  Protected n.i
+  If ig_ready = 0 Or InterruptCore() <> 0 Or InterruptLevel() <> ig_el
+    ProcedureReturn 0
+  EndIf
+  If (InterruptMask() & $80) = 0 Or expected <> ig_vbar
+    ProcedureReturn 0
+  EndIf
+  If replacement = 0 Or (replacement & 2047) <> 0
+    ProcedureReturn 0
+  EndIf
+  If InterruptVbar() <> replacement : ProcedureReturn 0 : EndIf
+  If InterruptTransferIdle() = 0 : ProcedureReturn 0 : EndIf
+  ig_vbar = replacement
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i InterruptRelease(id.i, expectedHandler.i)
+  If InterruptContext() = 0 Or (InterruptMask() & $80) = 0
+    ProcedureReturn 0
+  EndIf
+  If id < 16 Or id >= ig_count Or expectedHandler = 0
+    ProcedureReturn 0
+  EndIf
+  If ig_handlers(id) <> expectedHandler Or ig_enabled(id) <> 0
+    ProcedureReturn 0
+  EndIf
+  If (PeekL(#IG_D + $100 + (id / 32) * 4) & (1 << (id & 31))) <> 0 Or (PeekL(#IG_D + $200 + (id / 32) * 4) & (1 << (id & 31))) <> 0 Or (PeekL(#IG_D + $300 + (id / 32) * 4) & (1 << (id & 31))) <> 0
+    ProcedureReturn 0
+  EndIf
+  PokeA(#IG_D + $400 + id, ig_priority(id))
+  If id >= 32 : PokeA(#IG_D + $800 + id, ig_target(id)) : EndIf
+  InterruptBarrier()
+  If (PeekA(#IG_D + $400 + id) & 255) <> ig_priority(id)
+    ProcedureReturn 0
+  EndIf
+  If id >= 32
+    If (PeekA(#IG_D + $800 + id) & 255) <> ig_target(id)
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ig_handlers(id) = 0
   ProcedureReturn 1
 EndProcedure
 
