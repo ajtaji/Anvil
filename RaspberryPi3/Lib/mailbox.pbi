@@ -72,21 +72,25 @@ Procedure.i Pi3MailboxCall(buffer.i, bytes.i)
   EndIf
   request = buffer | $C0000008
   Pi3MailboxBarrier()
-  For n = 0 To 999999
+  ; Linux gives a firmware transaction three seconds. Framebuffer allocation
+  ; is a cold display operation, not a register read; the former 100 ms limit
+  ; rejected a merely slow valid reply. The iteration cap remains as a second
+  ; bound if the system timer itself stops advancing.
+  For n = 0 To 9999999
     If (PeekL(#PI3_MBOX + $38) & $80000000) = 0
       Break
     EndIf
     now = Pi3Micros()
-    If now < start Or now - start >= 100000
+    If now < start Or now - start >= 3000000
       ProcedureReturn 0
     EndIf
   Next
-  If n > 999999
+  If n > 9999999
     ProcedureReturn 0
   EndIf
   pi3_mailbox_outstanding = 1
   PokeL(#PI3_MBOX + $20, request)
-  For n = 0 To 999999
+  For n = 0 To 9999999
     If (PeekL(#PI3_MBOX + $18) & $40000000) = 0
       response = PeekL(#PI3_MBOX) & $FFFFFFFF
       If response = request
@@ -99,7 +103,7 @@ Procedure.i Pi3MailboxCall(buffer.i, bytes.i)
       EndIf
     EndIf
     now = Pi3Micros()
-    If now < start Or now - start >= 100000
+    If now < start Or now - start >= 3000000
       ProcedureReturn 0
     EndIf
   Next

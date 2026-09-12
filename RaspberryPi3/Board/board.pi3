@@ -2,9 +2,9 @@
 ; Firmware must reserve [0x80000,0x200000) for this image + stack before entry.
 ; Compile -t pi3 --load-addr 0x80000 --stack-addr 0x200000 (normal startup).
 ; Build gate must prove image+BSS below 0x1F0000. Stack reserves 64 KiB.
-#ANVIL_BUILD = 6 ; pmf:build
+#ANVIL_BUILD = 7 ; pmf:build
 #ANVIL_BUILD_DATE = 20260912 ; pmf:builddate
-#ANVIL_BUILD_TIME = 100057 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 121930 ; pmf:buildtime
 XIncludeFile "RaspberryPi3/Lib/timer.pbi"
 XIncludeFile "RaspberryPi3/Lib/uart.pbi"
 XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
@@ -86,6 +86,21 @@ Procedure Pi3PrintBuild()
   Pi3Say(@pi3_build_text[index])
 EndProcedure
 
+Procedure Pi3SayFramebufferError(code.i)
+  Select code
+    Case #PI3_FB_ERR_OWNERSHIP   : Pi3Say("STOP framebuffer: mailbox or allocation already owned")
+    Case #PI3_FB_ERR_MAILBOX     : Pi3Say("STOP framebuffer: firmware mailbox transaction failed")
+    Case #PI3_FB_ERR_TAG_REPLY   : Pi3Say("STOP framebuffer: required property tag was not returned")
+    Case #PI3_FB_ERR_GEOMETRY    : Pi3Say("STOP framebuffer: firmware refused 640x480x32 offset zero")
+    Case #PI3_FB_ERR_PIXEL_ORDER : Pi3Say("STOP framebuffer: invalid pixel-order response")
+    Case #PI3_FB_ERR_ALPHA_MODE  : Pi3Say("STOP framebuffer: invalid alpha-mode response")
+    Case #PI3_FB_ERR_ALLOCATION  : Pi3Say("STOP framebuffer: invalid base size or pitch")
+    Case #PI3_FB_ERR_VC_RANGE    : Pi3Say("STOP framebuffer: allocation outside VideoCore memory")
+    Case #PI3_FB_ERR_OVERLAP     : Pi3Say("STOP framebuffer: allocation overlaps Anvil or DTB")
+    Default                      : Pi3Say("STOP framebuffer: unclassified refusal")
+  EndSelect
+EndProcedure
+
 Procedure.i Pi3BootMemory()
   Protected buffer.i
   Protected size.i
@@ -126,6 +141,7 @@ EndProcedure
 
 Procedure Main()
   Protected clock.i
+  Protected uartReady.i
   ASM
     adrp x1, global_pi3_dtb
     add x1, x1, #:lo12:global_pi3_dtb
@@ -136,22 +152,36 @@ Procedure Main()
   ; One short flash proves ARM entry and a valid cache-off mailbox context.
   ; Failure to control this optional diagnostic does not stop boot.
   Pi3BootSignal(1)
+  ; Bring up a bounded diagnostic path before framebuffer negotiation. UART
+  ; failure never stops the display path; it only means the screen remains the
+  ; witness. This makes a blank framebuffer failure observable over FTDI.
+  uartReady=0
+  clock=Pi3ClockRate(2)
+  If clock>0
+    uartReady=Pi3UartInit(clock,115200)
+  EndIf
+  If uartReady<>0
+    Pi3Say("Anvil Pi3 early UART diagnostic ready")
+    Pi3PrintBuild()
+  EndIf
   ; No MMU changes and no speculative memory allocation at this entry.
   If Pi3BootMemory() = 0
     pi3_boot_status = -4
+    If uartReady<>0 : Pi3Say("STOP: ARM RAM or DTB validation failed") : EndIf
     Pi3DiagnosticPark(2)
   EndIf
   pi3_boot_status = 2
   If Pi3FbInit(pi3_dtb,pi3_dtb_end)=0
     pi3_boot_status = -5
+    If uartReady<>0 : Pi3SayFramebufferError(Pi3FbError()) : EndIf
     Pi3DiagnosticPark(3)
   EndIf
-  ; Display precedes UART so a missing/failed serial path cannot hide boot.
+  ; The framebuffer remains the primary console. The early UART is only a
+  ; witness for failures that occur before the first safe pixel write.
   Pi3FbLine("Anvil Pi3 experimental cold entry")
   Pi3PrintBuild()
   Pi3FbLine("Framebuffer ready: CPU rendering, no acceleration")
-  clock = Pi3ClockRate(2)
-  If Pi3UartInit(clock,115200) = 0
+  If uartReady = 0
     pi3_boot_status = -2
     Pi3FbLine("STOP: PL011 initialization failed")
     Pi3DiagnosticPark(4)

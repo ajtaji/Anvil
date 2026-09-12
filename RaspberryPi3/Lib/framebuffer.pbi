@@ -8,15 +8,34 @@ Global pi3_fb_attempted.i
 Global pi3_fb_column.i
 Global pi3_fb_row.i
 Global pi3_fb_pixel_order.i
+Global pi3_fb_alpha_mode.i
+Global pi3_fb_error.i
+
+#PI3_FB_ERR_NONE        = 0
+#PI3_FB_ERR_OWNERSHIP   = 1
+#PI3_FB_ERR_MAILBOX     = 2
+#PI3_FB_ERR_TAG_REPLY   = 3
+#PI3_FB_ERR_GEOMETRY    = 4
+#PI3_FB_ERR_PIXEL_ORDER = 5
+#PI3_FB_ERR_ALPHA_MODE  = 6
+#PI3_FB_ERR_ALLOCATION  = 7
+#PI3_FB_ERR_VC_RANGE    = 8
+#PI3_FB_ERR_OVERLAP     = 9
 
 Procedure.i Pi3FbPack(red.i,green.i,blue.i)
+  Protected alpha.i
   red=red & 255 : green=green & 255 : blue=blue & 255
+  ; Alpha mode 0 defines zero as opaque; mode 1 reverses it. Mode 2 ignores
+  ; the byte. The firmware is allowed to return any of the three even when
+  ; the caller requested another, so the stored word follows the reply.
+  alpha=0
+  If pi3_fb_alpha_mode=1 : alpha=255 : EndIf
   If pi3_fb_pixel_order=1
     ; RGB means byte order R,G,B in little-endian framebuffer memory.
-    ProcedureReturn red | (green << 8) | (blue << 16)
+    ProcedureReturn red | (green << 8) | (blue << 16) | (alpha << 24)
   EndIf
   ; BGR means byte order B,G,R.  Both orders are valid firmware replies.
-  ProcedureReturn blue | (green << 8) | (red << 16)
+  ProcedureReturn blue | (green << 8) | (red << 16) | (alpha << 24)
 EndProcedure
 
 Procedure Pi3FbTag(buffer.i,offset.i,tag.i,length.i,a.i,b.i)
@@ -86,8 +105,14 @@ Procedure Pi3FbLine(text.i)
 EndProcedure
 
 Procedure.i Pi3FbReply(buffer.i,offset.i,tag.i,length.i)
+  Protected reply.i
   If PeekL(buffer+offset)<>tag Or PeekL(buffer+offset+4)<>length : ProcedureReturn 0 : EndIf
-  ProcedureReturn (PeekL(buffer+offset+8) & $FFFFFFFF) = ($80000000 | length)
+  reply=PeekL(buffer+offset+8) & $FFFFFFFF
+  If (reply & $80000000)=0 : ProcedureReturn 0 : EndIf
+  ; The official property contract permits a future response length larger
+  ; than the supplied value buffer. Fields through the known prefix remain
+  ; valid; requiring exact equality would reject a compatible firmware.
+  ProcedureReturn Bool((reply & $7FFFFFFF)>=length)
 EndProcedure
 Procedure.i Pi3FbInit(dtb.i,dtbEnd.i)
   Protected p.i
@@ -100,51 +125,88 @@ Procedure.i Pi3FbInit(dtb.i,dtbEnd.i)
   Protected background.i
   ; Cold boot owns one allocation attempt. Never replace a known framebuffer
   ; or implicitly free firmware storage under a renderer on a repeated call.
-  If pi3_fb_attempted<>0 : ProcedureReturn 0 : EndIf
-  If pi3_mailbox_outstanding<>0 : ProcedureReturn 0 : EndIf
+  pi3_fb_error=#PI3_FB_ERR_NONE
+  If pi3_fb_attempted<>0 Or pi3_mailbox_outstanding<>0
+    pi3_fb_error=#PI3_FB_ERR_OWNERSHIP
+    ProcedureReturn 0
+  EndIf
   pi3_fb_attempted=1
   pi3_fb=0
   p=((@pi3_fb_message[0]+15)>>4)<<4
-  For n=0 To 159 Step 4 : PokeL(p+n,0) : Next
-  PokeL(p,156)
+  For n=0 To 175 Step 4 : PokeL(p+n,0) : Next
+  PokeL(p,176)
+  ; This is the same old-scheme framebuffer transaction used by the pinned
+  ; Raspberry Pi Linux bcm2708_fb driver: set geometry/depth/offset, allocate,
+  ; then query pitch. Pixel order, alpha mode and VC memory are GETs so the
+  ; firmware—not a caller preference—defines how returned pixels are packed.
   Pi3FbTag(p,8,$48003,8,640,480)
   Pi3FbTag(p,28,$48004,8,640,480)
   Pi3FbTag(p,48,$48005,4,32,0)
-  Pi3FbTag(p,64,$48006,4,1,0)
-  Pi3FbTag(p,80,$40001,8,4096,0)
-  Pi3FbTag(p,100,$40008,4,0,0)
-  Pi3FbTag(p,116,$10006,8,0,0)
-  Pi3FbTag(p,136,$48007,4,2,0)
-  If Pi3MailboxCall(p,156)=0 : ProcedureReturn 0 : EndIf
-  If Pi3FbReply(p,8,$48003,8)=0 Or Pi3FbReply(p,28,$48004,8)=0 Or Pi3FbReply(p,48,$48005,4)=0 Or Pi3FbReply(p,64,$48006,4)=0
+  Pi3FbTag(p,64,$48009,8,0,0)
+  Pi3FbTag(p,84,$40001,8,4096,0)
+  Pi3FbTag(p,104,$40008,4,0,0)
+  Pi3FbTag(p,120,$40006,4,0,0)
+  Pi3FbTag(p,136,$40007,4,0,0)
+  Pi3FbTag(p,152,$10006,8,0,0)
+  If Pi3MailboxCall(p,176)=0
+    pi3_fb_error=#PI3_FB_ERR_MAILBOX
     ProcedureReturn 0
   EndIf
-  If Pi3FbReply(p,80,$40001,8)=0 Or Pi3FbReply(p,100,$40008,4)=0 Or Pi3FbReply(p,116,$10006,8)=0 Or Pi3FbReply(p,136,$48007,4)=0
+  If Pi3FbReply(p,8,$48003,8)=0 Or Pi3FbReply(p,28,$48004,8)=0 Or Pi3FbReply(p,48,$48005,4)=0 Or Pi3FbReply(p,64,$48009,8)=0
+    pi3_fb_error=#PI3_FB_ERR_TAG_REPLY
     ProcedureReturn 0
   EndIf
-  If PeekL(p+20)<>640 Or PeekL(p+24)<>480 Or PeekL(p+40)<>640 Or PeekL(p+44)<>480 Or PeekL(p+60)<>32 Or PeekL(p+148)<>2
+  If Pi3FbReply(p,84,$40001,8)=0 Or Pi3FbReply(p,104,$40008,4)=0 Or Pi3FbReply(p,120,$40006,4)=0 Or Pi3FbReply(p,136,$40007,4)=0 Or Pi3FbReply(p,152,$10006,8)=0
+    pi3_fb_error=#PI3_FB_ERR_TAG_REPLY
     ProcedureReturn 0
   EndIf
-  ; The property interface may return either supported byte order.  Pi 3
-  ; firmware is known to keep BGR (0) even when RGB (1) was requested.  That
-  ; is a valid framebuffer, not grounds to throw the allocation away.
-  pi3_fb_pixel_order=PeekL(p+76)&$FFFFFFFF
-  If pi3_fb_pixel_order<>0 And pi3_fb_pixel_order<>1 : ProcedureReturn 0 : EndIf
-  base=PeekL(p+92)&$FFFFFFFF : size=PeekL(p+96)&$FFFFFFFF
-  pitch=PeekL(p+112)&$FFFFFFFF
-  vc=PeekL(p+128)&$FFFFFFFF : vcSize=PeekL(p+132)&$FFFFFFFF
-  ; Require the coherent/direct VideoCore bus alias before translation.
-  If (base & $C0000000)<>$C0000000 : ProcedureReturn 0 : EndIf
+  If PeekL(p+20)<>640 Or PeekL(p+24)<>480 Or PeekL(p+40)<>640 Or PeekL(p+44)<>480 Or PeekL(p+60)<>32 Or PeekL(p+76)<>0 Or PeekL(p+80)<>0
+    pi3_fb_error=#PI3_FB_ERR_GEOMETRY
+    ProcedureReturn 0
+  EndIf
+  ; The property interface may report either supported byte order. Query it
+  ; instead of trying to force RGB: current Pi firmware may retain BGR.
+  pi3_fb_pixel_order=PeekL(p+132)&$FFFFFFFF
+  If pi3_fb_pixel_order<>0 And pi3_fb_pixel_order<>1
+    pi3_fb_error=#PI3_FB_ERR_PIXEL_ORDER
+    ProcedureReturn 0
+  EndIf
+  pi3_fb_alpha_mode=PeekL(p+148)&$FFFFFFFF
+  If pi3_fb_alpha_mode<0 Or pi3_fb_alpha_mode>2
+    pi3_fb_error=#PI3_FB_ERR_ALPHA_MODE
+    ProcedureReturn 0
+  EndIf
+  base=PeekL(p+96)&$FFFFFFFF : size=PeekL(p+100)&$FFFFFFFF
+  pitch=PeekL(p+116)&$FFFFFFFF
+  vc=PeekL(p+164)&$FFFFFFFF : vcSize=PeekL(p+168)&$FFFFFFFF
+  ; Linux's bcm2708_fb driver accepts the firmware's returned bus alias and
+  ; clears the top two alias bits before mapping it for the ARM. Requiring the
+  ; $C alias rejected otherwise valid firmware allocations on real Pi 3s.
   base=base & $3FFFFFFF
-  If pitch<2560 Or pitch>4096 Or (pitch & 3)<>0 Or size<pitch*480 Or size>16777216
+  If pitch<2560 Or pitch>4096 Or (pitch & 3)<>0 Or size<pitch*480 Or size>16777216 Or base>$3F000000-size
+    pi3_fb_error=#PI3_FB_ERR_ALLOCATION
     ProcedureReturn 0
   EndIf
-  If vcSize=0 Or vc> $3F000000-vcSize Or base<vc Or base>$3F000000-size
+  ; VC RAM may legally end at the 1 GiB boundary. The BCM2837 peripheral
+  ; window begins at $3F000000, so the FRAMEBUFFER itself must end below it,
+  ; but rejecting the whole enclosing VC reservation for extending to
+  ; $40000000 refused ordinary 1 GiB Pi 3 firmware layouts.
+  If vcSize=0 Or vc>$40000000-vcSize Or base<vc
+    pi3_fb_error=#PI3_FB_ERR_VC_RANGE
     ProcedureReturn 0
   EndIf
-  If base+size>vc+vcSize Or (base & 4095)<>0 : ProcedureReturn 0 : EndIf
-  If base<$200000 And base+size>$80000 : ProcedureReturn 0 : EndIf
-  If base<dtbEnd And base+size>dtb : ProcedureReturn 0 : EndIf
+  If base+size>vc+vcSize Or (base & 4095)<>0
+    pi3_fb_error=#PI3_FB_ERR_VC_RANGE
+    ProcedureReturn 0
+  EndIf
+  If base<$200000 And base+size>$80000
+    pi3_fb_error=#PI3_FB_ERR_OVERLAP
+    ProcedureReturn 0
+  EndIf
+  If base<dtbEnd And base+size>dtb
+    pi3_fb_error=#PI3_FB_ERR_OVERLAP
+    ProcedureReturn 0
+  EndIf
   pi3_fb_pitch=pitch : pi3_fb_size=size : pi3_fb=base
   ; Every write is inside the validated pixel rows; no stride padding touched.
   background=Pi3FbPack(24,12,8)
@@ -153,6 +215,10 @@ Procedure.i Pi3FbInit(dtb.i,dtbEnd.i)
   Next
   Pi3MailboxBarrier()
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3FbError()
+  ProcedureReturn pi3_fb_error
 EndProcedure
 
 Procedure.i Pi3FbPixel(x.i,y.i,colour.i)

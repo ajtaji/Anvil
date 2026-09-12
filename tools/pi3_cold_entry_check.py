@@ -20,8 +20,8 @@ def case(mode):
    if addr==0x3f00b880:return self.req
    return super().load(addr,size)
   def store(self,addr,value,size):
-   if 0x10000000<=addr<0x11000000:
-    assert addr<0x10000000+2560*480,'framebuffer write beyond allocation'
+   if 0x3b800000<=addr<0x3c800000:
+    assert addr<0x3b800000+2560*480,'framebuffer write beyond allocation'
     self.pixels+=1;return
    if addr==0x3f201000:self.text.append(value&255);return
    if addr==0x3f00b8a0:
@@ -37,13 +37,19 @@ def case(mode):
     elif tag==0x30002:super().store(b+16,0x80000008,4);super().store(b+24,48000000,4)
     elif tag==0x10005:super().store(b+16,0x80000008,4);super().store(b+20,0,4);super().store(b+24,0x100000 if mode=='smallram' else 0x8000000,4)
     else:
-     for offset,length in ((8,8),(28,8),(48,4),(64,4),(80,8),(100,4),(116,8),(136,4)):super().store(b+offset+8,0x80000000|length,4)
-     super().store(b+92,0xd0000000,4);super().store(b+96,2560*480,4)
-     super().store(b+112,128 if mode=='badpitch' else 2560,4)
-     super().store(b+128,0x10000000,4);super().store(b+132,0x1000000,4)
+     assert super().load(b,4)==176 and super().load(b+172,4)==0,'bad framebuffer property envelope'
+     for offset,length in ((8,8),(28,8),(48,4),(64,8),(84,8),(104,4),(120,4),(136,4),(152,8)):super().store(b+offset+8,0x80000000|length,4)
+     # Model the normal 1 GiB split: VC owns the upper 76 MiB through
+     # 0x40000000, while the returned framebuffer itself remains below the
+     # BCM2837 peripheral window at 0x3f000000.  The former implementation
+     # rejected this ordinary firmware response before drawing one pixel.
+     super().store(b+96,0xfb800000,4);super().store(b+100,2560*480,4)
+     super().store(b+116,128 if mode=='badpitch' else 2560,4)
+     super().store(b+132,0 if mode=='bgr' else 1,4)
+     super().store(b+148,0 if mode=='bgr' else 2,4)
+     super().store(b+164,0x3b400000,4);super().store(b+168,0x4c00000,4)
      if mode=='baddepth':super().store(b+60,16,4)
-     if mode=='badspan':super().store(b+96,4,4)
-     if mode=='bgr':super().store(b+76,0,4)
+     if mode=='badspan':super().store(b+100,4,4)
     return
    return super().store(addr,value,size)
  cpu=CPU()
@@ -89,7 +95,9 @@ def repeat_gate():
   cpu.step()
  else:raise AssertionError('repeat guard did not return')
  assert cpu.x[0]==0 and base.u64(cpu,address('global_pi3_fb'))==0x10000000
- assert all(v==before.get(k) for k,v in cpu.memory.items() if not 0x1f0000<=k<0x200000),'repeat guard wrote outside stack'
+ error=address('global_pi3_fb_error')
+ assert base.u64(cpu,error)==1,'repeat refusal did not report ownership'
+ assert all(v==before.get(k) for k,v in cpu.memory.items() if not (0x1f0000<=k<0x200000 or error<=k<error+8)),'repeat guard changed state other than its error result'
  print('PASS: emitted repeat init refuses before allocation/MMIO changes;',n,'instructions')
 repeat_gate()
 if args.repeat_only:raise SystemExit(0)

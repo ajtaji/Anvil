@@ -96,16 +96,16 @@ future EL3 stub needs its own Pi3 proof and a recoverable hardware test.
 ## First framebuffer
 
 `RaspberryPi3/Lib/framebuffer.pbi` requests a firmware framebuffer after the
-minimum memory/DTB checks and before UART, so the display is the first console.
-Its one
-transaction requests 640x480 physical/virtual geometry, 32-bit RGB, ignored
-alpha, allocation/pitch and VC memory extent. It requires matching response
-tags and lengths, fixed returned geometry/format, bounded pitch/allocation,
-a recognized VC bus alias, allocation inside firmware-reported VC memory,
-and no image/stack/DTB collision before its first pixel write. Both firmware
-pixel orders are accepted and packed correctly. This matters on Pi 3 firmware,
-which may validly keep BGR even when RGB was requested; refusing BGR made the
-earlier build park without ever drawing a pixel.
+minimum memory/DTB checks. A bounded early PL011 attempt now precedes the
+request only to make pre-display failures observable; UART failure never stops
+the display path. Its one 176-byte transaction sets 640x480 physical/virtual
+geometry, 32-bit depth and zero virtual offset, allocates the buffer, then gets
+pitch, pixel order, alpha mode and VC memory extent. It requires compatible
+response tags and prefix lengths, fixed returned geometry, bounded
+pitch/allocation, allocation inside firmware-reported VC memory, and no
+image/stack/DTB collision before its first pixel write. All four VideoCore bus
+aliases normalize to the same ARM address. Both firmware pixel orders and all
+three documented alpha modes are accepted and packed correctly.
 
 It then clears by CPU and renders an early ASCII console using the original
 shared `Anvil/Graphics/text_glyph.pbi` font: 42 columns, 20 rows, integer scaling,
@@ -171,8 +171,10 @@ failed. Codes repeat five times and then enter the bounded WFE park. LED
 failure is optional and never prevents the display path. The firmware rainbow
 splash is temporarily left enabled so firmware display progress is visible.
 
-The framebuffer is now negotiated and drawn before PL011 initialization. A
-successful screen therefore remains useful even if serial routing is wrong.
+The framebuffer remains the primary console even though PL011 is attempted
+first as a diagnostic witness. A successful screen therefore remains useful
+if serial routing is wrong, while a working FTDI link now names the exact
+framebuffer refusal instead of leaving a silent black display.
 These diagnostics do not advertise scheduler, storage, USB or network support.
 Firmware GPIO protocol facts are derived from the pinned Pi 3B DTS,
 `gpio-raspberrypi-exp.c`, and Raspberry Pi firmware tag definitions; no Linux
@@ -188,6 +190,32 @@ The source marker is now 6 after the counted build. The staged diagnostic
 config SHA256 is
 `3fb2b1b488bf008cbabefaae3d1945a7794bf9d22de29e3e702b9ef46184eb70`.
 This is ready for a card test, not yet silicon acceptance.
+
+Build 5's first physical run reached firmware video handoff but remained black
+and emitted no FTDI bytes. The exact source defect was the VC-memory range
+check: it required the entire firmware-owned VC reservation to end below
+`0x3F000000`. On a 1 GiB Pi 3 the ordinary 76 MiB split can extend to
+`0x40000000`; only the returned framebuffer itself must end below the BCM2837
+peripheral window. The corrected code follows the pinned Linux driver's address
+normalization, accepts a VC reservation through the 1 GiB boundary, checks the
+translated framebuffer independently, and uses Linux's three-second bounded
+property-transaction deadline instead of the former 100 ms deadline.
+
+The corrected counted image contains build 6 and is 27,724 bytes, SHA256
+`83360e81a5eb3b06a0ad549e4368997bc93c3447797487bf7671569fa48d1fe5`.
+The source marker is now 7 after the successful counted build. Its exact emitted
+image passes nine cold-entry cases / 35,541,181 interpreted instructions;
+repeat initialization refuses in 86 instructions while changing only the
+reported ownership error. A separate 71-assertion framebuffer contract gate
+runs 9,338,787 emitted A64 instructions and challenges the exact message shape,
+all bus aliases, all alpha modes and every refusal class before any candidate
+framebuffer write. The host glyph/scroll test and the nine-case early-hardware
+gate also pass. Compiler SHA256 is
+`0c0bac62627184109f3a7f7692919b9523e80e413f50b67b82dfc1867f89d51e`.
+The verified boot folder is
+`C:\Users\rajta\AppData\Local\Temp\anvil-pi3-diagnostic-build6-final`.
+It is ready to replace the files on the dedicated card; silicon framebuffer
+and FTDI acceptance remain open until that card is booted.
 
 ## Primary references (links)
 
