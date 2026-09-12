@@ -86,6 +86,11 @@ EnableExplicit
 #PMF_DELAY_DEFAULT = 2
 #PMF_DELAY_MAX = 30
 #PMF_MAXFAILS_DEFAULT = 3
+#PMF_HDR_LEN_V1 = 96
+#PMF_HDR_LEN_V2 = 128
+#PMF_VERSION_V2 = 2
+#PMF_OFF_VERSION = 8
+#PMF_OFF_HDRLEN = 12
 #PMF_HDR_LEN = 96
 #PMF_DIGEST = 32
 #PMF_PROGRESS_CHUNK = 65536
@@ -151,13 +156,14 @@ Global gate_hashChunks.i
 Global gate_hashNeedsService.i
 Global gate_hashServiced.i
 
-Global Dim gPmfHdr.a[#PMF_HDR_LEN]
+Global Dim gPmfHdr.a[#PMF_HDR_LEN_V2]
 Global Dim gPmfGot.a[#PMF_DIGEST]
 Global Dim gPmfWant.a[#PMF_DIGEST]
 Global gPmfLoad.i
 Global gPmfImgLen.i
 Global gPmfEntry.i
 Global gPmfFlags.i
+Global gPmfHdrLen.i
 Global gEntry.i
 Global gHaveEntry.i
 Global gSvcMayReturn.i
@@ -286,7 +292,8 @@ EndProcedure
 Procedure HwFileClose() : EndProcedure
 Procedure.i HwFileErrorText() : ProcedureReturn ?fileError : EndProcedure
 Procedure.i PmfMagicOk(p.i) : ProcedureReturn 1 : EndProcedure
-Procedure PmfParseAt(p.i) : EndProcedure
+Procedure.i PmfRd32(p.i) : ProcedureReturn 0 : EndProcedure
+Procedure PmfParseAt(p.i) : gPmfHdrLen = #PMF_HDR_LEN_V1 : EndProcedure
 Procedure.i PmfCheckHeader(n.i) : ProcedureReturn 1 : EndProcedure
 Procedure.i PmfCheckPlacement() : ProcedureReturn 1 : EndProcedure
 Procedure UartDrain() : EndProcedure

@@ -1,0 +1,34 @@
+; Read/write calls are intercepted by the desk gate's sparse sector device.
+Procedure.i Pi3SdReadBlock(lba.i, buffer.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Pi3SdWriteBlock(lba.i, buffer.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Pi3SdSetWriteWindow(first.i, count.i)
+  ProcedureReturn 1
+EndProcedure
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "RaspberryPi3/Lib/update_ab.pbi"
+Procedure.i Main()
+  If Pi3UpdateError() = 99
+    Pi3UpdateConfigure($2000000, $100000, 0, $8000000, $1000000, $1000)
+    Pi3UpdateMount()
+    Pi3UpdateMountHandoff()
+    Pi3UpdateResetReady()
+    Pi3UpdateBegin(1024, $1800000)
+    Pi3UpdateChunk(0, $1800100, 512)
+    Pi3UpdateCommit()
+    Pi3UpdateAbort()
+    Pi3UpdateLoad()
+    Pi3UpdateLoadFallback()
+    Pi3UpdateConfirm(0, 1)
+    Pi3UpdatePrepareHandoff($1000000)
+    Pi3UpdateConfirmHandoff()
+    Pi3UpdateReceived()
+    Pi3UpdateSlot()
+    Pi3UpdateGeneration()
+  EndIf
+  ProcedureReturn 0
+EndProcedure

@@ -783,6 +783,11 @@
 ;                                        about how the image was produced,
 ;                                        and the worst line in `version` to
 ;                                        get wrong
+;                 HwPmfTargetId()        the numeric PMFBOOT target identity
+;                                        for this board. Unlike HwIdTarget,
+;                                        this is an admission ABI: the common
+;                                        payload reader compares it exactly
+;                                        against v2 compiler provenance
 ;                 HwIdEl()               the exception level, 0..3, READ
 ;                                        from the running processor. Never
 ;                                        a constant: it was one, and it was

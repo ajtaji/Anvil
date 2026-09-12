@@ -144,6 +144,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # by name, PMF-BLD-003).
 BOARDS = {
     "pi3": Path("RaspberryPi3/Board/board.pi3"),
+    "pi3-loader": Path("RaspberryPi3/Board/loader.pi3"),
+    "pi3-updater": Path("RaspberryPi3/Board/updater.pi3"),
     "pi4": Path("RaspberryPi4/Board/board.pi4"),
     "unoq": Path("ArduinoQ/Board/board.unoq"),
 }

@@ -48,15 +48,18 @@
 ; ----------------------------------------------------------------------
 ;  THE HEADER, AS EMITTED BY THE COMPILER INTO <image>.pmf
 ; ----------------------------------------------------------------------
-;  A .pmf file is the 96-byte header below followed immediately by the
-;  flat image bytes. Every multi-byte field is LITTLE-ENDIAN, which is
-;  the byte order of every machine that will ever read one.
+;  A .pmf file is a fixed header followed immediately by the flat image
+;  bytes. Every multi-byte field is LITTLE-ENDIAN. Version 2 deliberately
+;  leaves the complete 96-byte version-1 prefix unchanged, including the
+;  image digest at offset 64, then appends compiler-owned provenance. An
+;  old container therefore remains unambiguous; it is read by its exact
+;  version-1 contract, not treated as a short version-2 container.
 ;
 ;    offset  size  field
 ;    ------  ----  ---------------------------------------------------
 ;      0      8    magic     the eight bytes "PMFBOOT" and a NUL
-;      8      4    version   header format version. 1.
-;     12      4    hdrlen    bytes of header before the image. 96.
+;      8      4    version   header format version. 1 or 2.
+;     12      4    hdrlen    96 for version 1, 128 for version 2
 ;     16      8    load      where the image bytes must be placed
 ;     24      8    entry     where to branch once they are placed
 ;     32      8    imglen    how many image bytes follow the header
@@ -65,10 +68,18 @@
 ;     56      4    flags     bit 0 the payload returns to the monitor
 ;                            bit 1 the payload expects a device tree
 ;                            bit 2 the payload expects the service table
-;     60      4    reserved  written 0, ignored on read
+;     60      4    reserved  written 0; v2 requires it to remain 0
 ;     64     32    sha256    the digest of the imglen image bytes
 ;    ------  ----  ---------------------------------------------------
-;    96 bytes total, and then the image.
+;    Version 1 ends here (96 bytes total), and then the image.
+;
+;     96      4    arch      compiler architecture ID: 1 = AArch64
+;    100      4    target    compiler target ID: BCM2837=2837,
+;                            BCM2711=2711, QCM2290=2290
+;    104      8    stack     initial stack top compiled into the image
+;    112     16    reserved  written 0 and required 0 on read
+;    ------  ----  ---------------------------------------------------
+;    Version 2 ends here (128 bytes total), and then the image.
 ;
 ;  WHY 96 AND NOT THE 64 THE INVENTORY GUESSED AT. Because a SHA-256
 ;  digest is 32 bytes on its own and this machine's addresses are 64 bits.
@@ -190,10 +201,21 @@
 ; ======================================================================
 
 ; ---- the container, as constants -------------------------------------
-#PMF_HDR_LEN   = 96            ; bytes of header before the image
-#PMF_VERSION   = 1             ; the only version this monitor reads
+#PMF_HDR_LEN_V1 = 96           ; exact v1 header, retained indefinitely
+#PMF_HDR_LEN_V2 = 128          ; v1 prefix plus compiler provenance
+#PMF_HDR_LEN    = #PMF_HDR_LEN_V1 ; legacy/minimum-header alias
+#PMF_VERSION_V1 = 1
+#PMF_VERSION_V2 = 2
+#PMF_VERSION    = #PMF_VERSION_V2 ; newest version this monitor reads
 #PMF_DIGEST    = 32            ; SHA-256, in bytes
 #PMF_PROGRESS_CHUNK = 65536    ; completed file/hash work between services
+
+; Compiler-owned, append-only identifiers. These are metadata values,
+; not board names guessed from a filename or source suffix.
+#PMF_ARCH_AARCH64  = 1
+#PMF_TARGET_BCM2837 = 2837
+#PMF_TARGET_BCM2711 = 2711
+#PMF_TARGET_QCM2290 = 2290
 
 ; Field offsets. Named, so a reader can check each against the table in
 ; the header above and so the parser reads as a list of facts.
@@ -206,7 +228,13 @@
 #PMF_OFF_BSSBASE = 40
 #PMF_OFF_BSSLEN  = 48
 #PMF_OFF_FLAGS   = 56
+#PMF_OFF_RESERVED = 60
 #PMF_OFF_SHA     = 64
+#PMF_OFF_ARCH    = 96
+#PMF_OFF_TARGET  = 100
+#PMF_OFF_STACK   = 104
+#PMF_OFF_EXTRES  = 112
+#PMF_EXTRES_LEN  = 16
 
 ; The flags, as bit VALUES rather than bit numbers, because that is how
 ; they are tested.
@@ -260,6 +288,11 @@ Global gPmfBssLen.i
 Global gPmfFlags.i
 Global gPmfVersion.i
 Global gPmfHdrLen.i
+Global gPmfArchitecture.i
+Global gPmfTarget.i
+Global gPmfStack.i
+Global gPmfReserved.i
+Global gPmfExtReservedOk.i
 
 ; The name of the file being booted, copied out of the line editor's
 ; buffer. gLine is overwritten by the next ReadLine, and the settings
@@ -289,6 +322,18 @@ Procedure.i PmfRd64(a.i)
   ProcedureReturn PmfRd32(a) | (PmfRd32(a + 4) << 32)
 EndProcedure
 
+; Zero means an unknown version. Keeping this mapping in one procedure
+; makes every file-length and image-offset decision use the same contract.
+Procedure.i PmfHeaderLengthForVersion(version.i)
+  Select version
+    Case #PMF_VERSION_V1
+      ProcedureReturn #PMF_HDR_LEN_V1
+    Case #PMF_VERSION_V2
+      ProcedureReturn #PMF_HDR_LEN_V2
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
 ; ======================================================================
 ;  PmfParseAt(h) - read the header at address h into the globals above.
 ;
@@ -307,11 +352,32 @@ Procedure PmfParseAt(h.i)
   gPmfBssBase = PmfRd64(h + #PMF_OFF_BSSBASE)
   gPmfBssLen  = PmfRd64(h + #PMF_OFF_BSSLEN)
   gPmfFlags   = PmfRd32(h + #PMF_OFF_FLAGS)
+  gPmfReserved = PmfRd32(h + #PMF_OFF_RESERVED)
+  gPmfArchitecture = 0
+  gPmfTarget = 0
+  gPmfStack = 0
+  gPmfExtReservedOk = 1
   i = 0
   While i < #PMF_DIGEST
     gPmfWant[i] = PeekA(h + #PMF_OFF_SHA + i)
     i = i + 1
   Wend
+
+  ; Do not even read the extension for v1. A boot-from-memory v1 image is
+  ; allowed to have its first image bytes immediately at offset 96; those
+  ; bytes are image data, not provenance and not reserved space.
+  If gPmfVersion = #PMF_VERSION_V2 And gPmfHdrLen = #PMF_HDR_LEN_V2
+    gPmfArchitecture = PmfRd32(h + #PMF_OFF_ARCH)
+    gPmfTarget = PmfRd32(h + #PMF_OFF_TARGET)
+    gPmfStack = PmfRd64(h + #PMF_OFF_STACK)
+    i = 0
+    While i < #PMF_EXTRES_LEN
+      If PeekA(h + #PMF_OFF_EXTRES + i) <> 0
+        gPmfExtReservedOk = 0
+      EndIf
+      i = i + 1
+    Wend
+  EndIf
 EndProcedure
 
 ; PmfMagicOk(h) - the eight magic bytes, compared one at a time against
@@ -406,6 +472,80 @@ Procedure.i PmfCheckFlags()
 EndProcedure
 
 ; ======================================================================
+;  PmfCheckV2Metadata() - validate compiler provenance, for v2 only.
+;
+;  Version 1 had no architecture, target or stack provenance and remains
+;  readable under that exact historical contract. Version 2 does carry
+;  those facts, so accepting zero, an unknown ID or nonzero reserved bytes
+;  would discard the very guarantee for which the extension was added.
+;  A board-specific slot loader may impose a narrower target requirement
+;  after this common format check (for example BCM2837 for a Pi 3 slot).
+; ======================================================================
+Procedure.i PmfCheckV2Metadata()
+  Define knownTarget.i
+  Define expectedTarget.i
+
+  If gPmfReserved <> 0 Or gPmfExtReservedOk = 0
+    PrintN("!! this version-2 container has nonzero reserved metadata bytes.")
+    PrintN("   They are required to be zero, so the header is damaged or belongs")
+    PrintN("   to a format this monitor does not know. Nothing was loaded.")
+    ProcedureReturn 0
+  EndIf
+
+  If gPmfArchitecture <> #PMF_ARCH_AARCH64
+    Print("!! this version-2 container names architecture ID ")
+    PrintDec(gPmfArchitecture)
+    PrintN(", but this")
+    Print("   monitor accepts AArch64 architecture ID ")
+    PrintDec(#PMF_ARCH_AARCH64)
+    PrintN(". Nothing was loaded.")
+    ProcedureReturn 0
+  EndIf
+
+  knownTarget = 0
+  Select gPmfTarget
+    Case #PMF_TARGET_BCM2837
+      knownTarget = 1
+    Case #PMF_TARGET_BCM2711
+      knownTarget = 1
+    Case #PMF_TARGET_QCM2290
+      knownTarget = 1
+  EndSelect
+  If knownTarget = 0
+    Print("!! this version-2 container names unknown target ID ")
+    PrintDec(gPmfTarget)
+    PrintN(".")
+    PrintN("   This monitor will not guess a board from a filename. Nothing was")
+    PrintN("   loaded; rebuild the payload with a supported compiler target.")
+    ProcedureReturn 0
+  EndIf
+
+  expectedTarget = HwPmfTargetId()
+  If gPmfTarget <> expectedTarget
+    Print("!! this version-2 container was compiled for target ID ")
+    PrintDec(gPmfTarget)
+    PrintN(", but this")
+    Print("   board requires target ID ")
+    PrintDec(expectedTarget)
+    PrintN(". Nothing was loaded. The image may be valid for its own board,")
+    PrintN("   but relabelling or copying it here cannot make its generated MMIO,")
+    PrintN("   memory map and startup code belong to this machine.")
+    ProcedureReturn 0
+  EndIf
+
+  If gPmfStack <= 0 Or (gPmfStack & 15) <> 0
+    Print("!! this version-2 container names stack top ")
+    PutAddr(gPmfStack)
+    PrintN(", which is zero")
+    PrintN("   or not 16-byte aligned as the AArch64 ABI requires. Nothing was")
+    PrintN("   loaded; rebuild the payload rather than guessing a stack address.")
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
 ;  PmfCheckHeader(fileLen) - is this a container this monitor can read?
 ;
 ;  fileLen is the total size of the .pmf, header included, or 0 for the
@@ -413,12 +553,17 @@ EndProcedure
 ;  check against. Prints a whole sentence and returns 0 on any refusal.
 ; ======================================================================
 Procedure.i PmfCheckHeader(fileLen.i)
-  If gPmfVersion <> #PMF_VERSION
+  Define expectedHdr.i
+
+  expectedHdr = PmfHeaderLengthForVersion(gPmfVersion)
+  If expectedHdr = 0
     PrintN("!! this is a payload container, but of a version this monitor cannot")
     Print("   read: it says version ")
     PrintDec(gPmfVersion)
-    Print(" and this monitor reads version ")
-    PrintDec(#PMF_VERSION)
+    Print(" and this monitor reads versions ")
+    PrintDec(#PMF_VERSION_V1)
+    Print(" and ")
+    PrintDec(#PMF_VERSION_V2)
     PrintN(".")
     PrintN("   Nothing was loaded and nothing was entered. The fields may have")
     PrintN("   moved between versions, so reading it anyway and hoping would be a")
@@ -429,18 +574,36 @@ Procedure.i PmfCheckHeader(fileLen.i)
     ProcedureReturn 0
   EndIf
 
-  If gPmfHdrLen <> #PMF_HDR_LEN
+  If gPmfHdrLen <> expectedHdr
     Print("!! this container says its header is ")
     PrintDec(gPmfHdrLen)
     PrintN(" bytes long, and a version")
     Print("   ")
-    PrintDec(#PMF_VERSION)
+    PrintDec(gPmfVersion)
     Print(" header is ")
-    PrintDec(#PMF_HDR_LEN)
+    PrintDec(expectedHdr)
     PrintN(" bytes. It disagrees with itself, so no field")
     PrintN("   in it can be trusted and nothing was loaded. The file is damaged or")
     PrintN("   was written by something that is not this compiler.")
     ProcedureReturn 0
+  EndIf
+
+  If fileLen > 0 And fileLen < gPmfHdrLen
+    Print("!! this version-")
+    PrintDec(gPmfVersion)
+    Print(" container is only ")
+    PrintDec(fileLen)
+    Print(" bytes long, but its")
+    Print(" header requires ")
+    PrintDec(gPmfHdrLen)
+    PrintN(" bytes. Nothing was loaded.")
+    ProcedureReturn 0
+  EndIf
+
+  If gPmfVersion = #PMF_VERSION_V2
+    If PmfCheckV2Metadata() = 0
+      ProcedureReturn 0
+    EndIf
   EndIf
 
   ; THE NINTH GUARD, HERE. After the header length (guard 4) and before
@@ -477,19 +640,19 @@ Procedure.i PmfCheckHeader(fileLen.i)
   EndIf
 
   If fileLen > 0
-    If (#PMF_HDR_LEN + gPmfImgLen) <> fileLen
+    If (gPmfHdrLen + gPmfImgLen) <> fileLen
       Print("!! this container says it holds ")
       PrintDec(gPmfImgLen)
       PrintN(" image bytes, which with its")
       Print("   ")
-      PrintDec(#PMF_HDR_LEN)
+      PrintDec(gPmfHdrLen)
       Print("-byte header makes ")
-      PrintDec(#PMF_HDR_LEN + gPmfImgLen)
+      PrintDec(gPmfHdrLen + gPmfImgLen)
       PrintN(" bytes - but the file on the")
       Print("   medium is ")
       PrintDec(fileLen)
       PrintN(" bytes. Nothing was loaded.")
-      If fileLen < (#PMF_HDR_LEN + gPmfImgLen)
+      If fileLen < (gPmfHdrLen + gPmfImgLen)
         PrintN("   The file is SHORTER than its own header says it should be, which is")
         PrintN("   what a transfer that stopped part way leaves behind. Copy it again.")
       Else
@@ -847,7 +1010,7 @@ Procedure.i PmfBootAt(container.i)
     ProcedureReturn 0
   EndIf
 
-  src = container + #PMF_HDR_LEN
+  src = container + gPmfHdrLen
   dst = gPmfLoad
   n   = gPmfImgLen
 
@@ -907,6 +1070,7 @@ Procedure.i PmfBootFile(*name)
   Define got.i
   Define part.i
   Define chunk.i
+  Define i.i
 
   If HwStorageUp() = 0
     PrintN("!! nothing was booted, because no medium came up and the container")
@@ -943,8 +1107,20 @@ Procedure.i PmfBootFile(*name)
     ProcedureReturn 0
   EndIf
 
-  got = HwFileReadAt(0, @gPmfHdr[0], #PMF_HDR_LEN)
-  If got <> #PMF_HDR_LEN
+  ; Clear the entire maximum header first. This makes a short v2 header
+  ; deterministic and, more importantly, prevents metadata from a prior
+  ; boot attempt surviving into the next parse.
+  i = 0
+  While i < #PMF_HDR_LEN_V2
+    gPmfHdr[i] = 0
+    i = i + 1
+  Wend
+
+  ; Read the common v1 prefix first. Only an exact v2/128 declaration is
+  ; allowed to make us read the extension; for a v1 file, offset 96 is
+  ; already image data and must never be mistaken for provenance.
+  got = HwFileReadAt(0, @gPmfHdr[0], #PMF_HDR_LEN_V1)
+  If got <> #PMF_HDR_LEN_V1
     PrintN("!! the container's header could not be read off the medium, so nothing")
     PrintN("   was loaded and memory is untouched.")
     Print("   The medium said: ")
@@ -965,6 +1141,24 @@ Procedure.i PmfBootFile(*name)
     PrintN("   beside the flat image, and it is the one that knows its own address.")
     HwFileClose()
     ProcedureReturn 0
+  EndIf
+
+  ; Inspect only the two common-prefix fields needed to decide whether a
+  ; tail exists. PmfCheckHeader below still owns all judgement and prints
+  ; the precise refusal for an unknown version or inconsistent length.
+  If PmfRd32(@gPmfHdr[0] + #PMF_OFF_VERSION) = #PMF_VERSION_V2 And PmfRd32(@gPmfHdr[0] + #PMF_OFF_HDRLEN) = #PMF_HDR_LEN_V2
+    If fileLen >= #PMF_HDR_LEN_V2
+      got = HwFileReadAt(#PMF_HDR_LEN_V1, @gPmfHdr[0] + #PMF_HDR_LEN_V1, #PMF_HDR_LEN_V2 - #PMF_HDR_LEN_V1)
+      If got <> (#PMF_HDR_LEN_V2 - #PMF_HDR_LEN_V1)
+        PrintN("!! the container's version-2 metadata could not be read off the")
+        PrintN("   medium, so nothing was loaded and memory is untouched.")
+        Print("   The medium said: ")
+        UartWriteStr(HwFileErrorText())
+        PrintNl()
+        HwFileClose()
+        ProcedureReturn 0
+      EndIf
+    EndIf
   EndIf
 
   PmfParseAt(@gPmfHdr[0])
@@ -996,7 +1190,7 @@ Procedure.i PmfBootFile(*name)
     If chunk > #PMF_PROGRESS_CHUNK
       chunk = #PMF_PROGRESS_CHUNK
     EndIf
-    part = HwFileReadAt(#PMF_HDR_LEN + got, gPmfLoad + got, chunk)
+    part = HwFileReadAt(gPmfHdrLen + got, gPmfLoad + got, chunk)
     If part < 0
       If got = 0
         got = part

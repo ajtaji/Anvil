@@ -1,0 +1,20 @@
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+Procedure.i Pi3ClockRate(id.i) : ProcedureReturn 250000000 : EndProcedure
+XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
+XIncludeFile "RaspberryPi3/Lib/boot_memory.pbi"
+#PI3_UPDATE_TRIED = 2
+#PI3_UPDATE_CONFIRMED = 3
+Procedure.i Pi3UpdateResetReady() : ProcedureReturn 0 : EndProcedure
+Global pi3_up_loaded.i
+Global pi3_up_active.i
+Global Dim pi3_up_record.l[256]
+XIncludeFile "RaspberryPi3/Lib/update_watchdog.pbi"
+Procedure Main()
+  If Pi3SdError() = 99
+    Pi3BootRanges($1000000, 4096)
+    Pi3UpdateWatchdogArm()
+    Pi3UpdateWatchdogColdStop()
+    Pi3UpdateResetNow()
+    Pi3UpdateWatchdogStop()
+  EndIf
+EndProcedure

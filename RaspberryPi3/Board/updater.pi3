@@ -1,0 +1,19 @@
+; Autonomous serial update monitor slot; no full Anvil/network claims.
+; load0x200000 BSS0x1100000 stack0x1F00000; staged container>=0x2000000.
+LoadAddress $200000
+BssAddress $1100000
+StackAddress $1F00000
+#ANVIL_BUILD = 8 ; pmf:build
+#ANVIL_BUILD_DATE = 20260912 ; pmf:builddate
+#ANVIL_BUILD_TIME = 154330 ; pmf:buildtime
+XIncludeFile "RaspberryPi3/Board/update_boot_support.pbi"
+Procedure Main()
+  ; Identity comes from the loader's CRC-protected fixed handoff, not newest
+  ; disk generation or argument registers consumed by the cold startup.
+  pi3_dtb = $1000000
+  If Pi3UpdateBootStart(0) = 0 : Pi3Park() : EndIf
+  If pi3ut_WriteLine("Pi3 update prompt ready; confirming running generation") = 0 : Pi3Park() : EndIf
+  If Pi3UpdateConfirmHandoff() = 0 : Pi3Say("STOP: running generation not confirmed") : Pi3Park() : EndIf
+  If Pi3UpdateWatchdogStop() = 0 : Pi3Say("STOP: trial watchdog remains armed") : Pi3Park() : EndIf
+  Pi3UpdateServe()
+EndProcedure

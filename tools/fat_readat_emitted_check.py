@@ -21,7 +21,7 @@ import tcp_multiif_emitted_check as emitted
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FAT = ROOT / "RaspberryPi4" / "Lib" / "fat.pi4"
+FAT = ROOT / "Anvil" / "Storage" / "fat32.pbi"
 HWFILE = ROOT / "RaspberryPi4" / "Board" / "hw_file.pi4"
 LOCAL_INTERP = ROOT / "tools" / "a64" / "a64_interp.py"
 

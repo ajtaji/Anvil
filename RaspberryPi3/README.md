@@ -1,6 +1,8 @@
 # Raspberry Pi 3 Model B v1.2
 
-Status: **experimental cold-entry image implemented and desk-tested; not a full Anvil monitor or hardware-accepted port**.
+Status: **cold-entry foundation plus an immutable serial A/B updater are
+implemented and desk-tested; final SDHOST/update recovery acceptance on the
+physical Pi remains**.
 
 `Board/platform.pbi` supplies identity and disabled capability declarations.
 It is an include, not a runnable board file. `Board/board.pi3` is the cold-entry
@@ -21,6 +23,8 @@ References:
 
 Boot contract and measured desk coverage: [Pi3 boot](../docs/PI3_BOOT.md).
 Pinned firmware and explicit staging instructions: [boot files](Boot/README.txt).
+The card-stays-in-board build, one-time provision, update and recovery contract:
+[Pi3 self update](../docs/PI3_SELF_UPDATE.md).
 
 - [Official board specification](https://www.raspberrypi.com/products/raspberry-pi-3-model-b/)
 - [Processor documentation](https://www.raspberrypi.com/documentation/computers/processors.html)

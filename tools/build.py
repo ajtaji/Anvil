@@ -8,6 +8,7 @@ builds without opening a window. Point at it with --compiler or PMF_COMPILER.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +18,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_count  # noqa: E402
+from pi3_slot import wrap_monitor  # noqa: E402
+from pi3_slot_pack import atomic_write  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,9 +34,26 @@ TARGETS = {
         "output": Path("build/unoq/anvil.img"),
         "args": ["--entry-returns"],
     },
-    "pi3": {
-        "source": Path("RaspberryPi3/Board/board.pi3"),
+    "pi3-loader": {
+        "source": Path("RaspberryPi3/Board/loader.pi3"),
         "output": Path("build/pi3/kernel8.img"),
+        "target": "pi3",
+        "count_target": "pi3-loader",
+        "args": [],
+    },
+    "pi3-updater": {
+        "source": Path("RaspberryPi3/Board/updater.pi3"),
+        "output": Path("build/pi3/anvil.img"),
+        "slot_output": Path("build/pi3/anvil-slot.img"),
+        "target": "pi3",
+        "count_target": "pi3-updater",
+        "args": [],
+    },
+    "pi3-diagnostic": {
+        "source": Path("RaspberryPi3/Board/board.pi3"),
+        "output": Path("build/pi3-diagnostic/diagnostic.img"),
+        "target": "pi3",
+        "count_target": "pi3",
         "args": ["--load-addr", "0x80000", "--stack-addr", "0x200000"],
     },
     "armstub": {
@@ -43,6 +63,7 @@ TARGETS = {
         "args": ["--armstub"],
     },
 }
+TARGET_ALIASES = {"pi3": ("pi3-loader", "pi3-updater")}
 
 
 # The one application is both the editor and the compiler. On Windows it is
@@ -164,10 +185,27 @@ def build(compiler: str, target: str) -> None:
         )
     print(f"Built {spec['output']} ({output.stat().st_size} bytes).")
 
+    slot_output = spec.get("slot_output")
+    if slot_output is not None:
+        pmf = Path(str(output) + ".pmf")
+        if not pmf.is_file():
+            raise SystemExit(f"Pi 3 updater PMF sidecar is missing: {pmf}")
+        slot, metadata = wrap_monitor(pmf.read_bytes())
+        slot_path = ROOT / slot_output
+        atomic_write(slot_path, slot)
+        atomic_write(
+            Path(str(slot_path) + ".json"),
+            (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("ascii"),
+        )
+        print(
+            f"Packed {slot_output} ({len(slot)} bytes, SHA-256 "
+            f"{metadata['slotSha256']})."
+        )
+
     # AFTER a successful build, never before: the image exists, so the build
     # happened, so it counts. A target with no board file of its own (the ARM
     # stub) answers counted=False and nothing moves.
-    counted = build_count.record_build(source, spec.get("target", target), output,
+    counted = build_count.record_build(source, spec.get("count_target", spec.get("target", target)), output,
                                        by="tools/build.py", compiler=compiler)
     print(f"  {counted.message}")
 
@@ -190,7 +228,12 @@ def staged_compiler(compiler: str, directory: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", choices=("all", *TARGETS), nargs="?", default="all")
+    parser.add_argument(
+        "target",
+        choices=("all", *TARGET_ALIASES, *TARGETS),
+        nargs="?",
+        default="all",
+    )
     parser.add_argument("--compiler",
                         default=os.environ.get("PMF_COMPILER"),
                         help="path or command name of PureMetalForge (or set "
@@ -200,7 +243,10 @@ def main() -> int:
     compiler = find_compiler(args.compiler)
     # Experimental boot firmware is an explicit build, never an implicit
     # part of the ordinary monitor pair. Building does not install it.
-    selected = ("pi4", "unoq") if args.target == "all" else (args.target,)
+    if args.target == "all":
+        selected = ("pi4", "unoq")
+    else:
+        selected = TARGET_ALIASES.get(args.target, (args.target,))
     with tempfile.TemporaryDirectory(prefix="anvil-compiler-") as temporary:
         isolated_compiler = staged_compiler(compiler, Path(temporary))
         for target in selected:
