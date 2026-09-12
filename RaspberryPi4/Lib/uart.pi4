@@ -597,7 +597,16 @@ Global uart_dropped.i          ; characters given up on - see UartDropped()
 ;  than no console - this whole file is written around that idea.
 #UART_MIRROR_BYTES = 8192      ; a comfortable screenful and then some
 
+; SCREEN-ONLY STYLE SIDEBAND. These values never enter the PL011 byte
+; stream and never enter the auxiliary/network mirror. They travel beside
+; each byte in the primary screen mirror so colouring the framebuffer
+; cannot change the console protocol that the host tools consume.
+XIncludeFile "Anvil/Core/console_style.pbi"
+
 Global Dim uart_mirror.a[#UART_MIRROR_BYTES]
+Global Dim uart_mirrorStyle.a[#UART_MIRROR_BYTES]
+Global uart_screenStyle.i
+Global uart_mirrorReadStyle.i
 ; A SECOND, independent output tap. The primary mirror above has one
 ; consumer (the HDMI console drains it with UartMirrorGet); a wireless
 ; console needs the same bytes without stealing them from the screen,
@@ -655,6 +664,18 @@ Procedure.i UartMirrorOn()
   ProcedureReturn uart_mirrorOn
 EndProcedure
 
+; Select the style copied beside subsequently mirrored screen bytes. The
+; raw byte is still written once, unchanged, to PL011 and to the network
+; tap. Unknown styles are deliberately reduced to normal rather than
+; leaking arbitrary state into the renderer.
+Procedure UartScreenStyle(style.i)
+  If style = #UART_SCREEN_STYLE_PROMPT
+    uart_screenStyle = #UART_SCREEN_STYLE_PROMPT
+  Else
+    uart_screenStyle = #UART_SCREEN_STYLE_NORMAL
+  EndIf
+EndProcedure
+
 ; Register the model-only drain called while output is being produced, or 0
 ; for none. The callback runs inside UartWrite and MUST NOT print. A guard is
 ; applied by uart_MirrorPut even though the intended console callback never
@@ -671,6 +692,7 @@ Procedure.i UartMirrorGet()
     ProcedureReturn -1
   EndIf
   c = uart_mirror[uart_mirrorTail] & $FF
+  uart_mirrorReadStyle = uart_mirrorStyle[uart_mirrorTail] & $FF
   uart_mirrorTail = uart_mirrorTail + 1
   If uart_mirrorTail >= #UART_MIRROR_BYTES
     uart_mirrorTail = 0
@@ -721,6 +743,12 @@ Procedure.i UartMirrorCount()
   ProcedureReturn n
 EndProcedure
 
+; Style belonging to the byte most recently returned by UartMirrorGet().
+; The consumer reads it after the byte; no second queue cursor can drift.
+Procedure.i UartMirrorReadStyle()
+  ProcedureReturn uart_mirrorReadStyle
+EndProcedure
+
 ; Leave two KiB of headroom. Newlines normally drain much sooner; this rule
 ; is what makes one unusually long line lossless as well.
 Procedure.i UartMirrorFillHigh()
@@ -754,6 +782,7 @@ Procedure uart_MirrorPut(c.i)
     ProcedureReturn
   EndIf
   uart_mirror[uart_mirrorHead] = c & $FF
+  uart_mirrorStyle[uart_mirrorHead] = uart_screenStyle & $FF
   uart_mirrorHead = nxt
   ; Drain into the shared terminal model while a long synchronous command is
   ; printing. Rendering is intentionally NOT done here: one help dump becomes

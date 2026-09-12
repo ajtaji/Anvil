@@ -375,6 +375,7 @@ SOURCES = (
     # feeds it, so the staged tree needs it to resolve. It is pure storage
     # and nothing in this gate exercises it.
     "Anvil/Core/boot_transcript.pbi",
+    "Anvil/Core/console_style.pbi",
     "RaspberryPi4/Board/console.pi4",
 )
 

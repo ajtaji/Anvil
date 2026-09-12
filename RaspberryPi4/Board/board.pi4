@@ -1165,7 +1165,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 100        ; pmf:build
+#ANVIL_BUILD = 101        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1174,7 +1174,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260912   ; pmf:builddate
-#ANVIL_BUILD_TIME = 114507     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 123959     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2361,7 +2361,12 @@ Procedure Main()
     ; and a prompt printed every command would fill it with the least
     ; interesting event in the boot; BootTimingPromptOnce keeps the first.
     BootTimingPromptOnce()
+    ; Screen colour is sideband metadata on the primary mirror only. The
+    ; five protocol bytes below still reach PL011 and the network tap
+    ; unchanged, so every host tool continues to match exact b"pmf> ".
+    UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
     Print("pmf> ")
+    UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
     ; ================================================================
     ;  AND IT HAS TO REACH THE NETWORK CONSOLE TOO.  2026-09-07.
     ;

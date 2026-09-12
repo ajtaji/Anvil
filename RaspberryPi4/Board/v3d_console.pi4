@@ -123,6 +123,9 @@ EndProcedure
 Procedure.i V3dCon_Ink()
   ProcedureReturn Neon_RGBA(226, 232, 240, 255)
 EndProcedure
+Procedure.i V3dCon_PromptInk()
+  ProcedureReturn Neon_RGBA(80, 255, 120, 255)
+EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  V3dConSetupOnce - bring the engine up over the live framebuffer. Runs
@@ -399,6 +402,9 @@ Procedure.i V3dConRenderGridFrame()
   Define ch.i
   Define n.i
   Define rc.i
+  Define c.i
+  Define cw.i
+  Define ink.i
 
   rc = NeonFrameBegin(V3dCon_Ground())
   If rc <> #NEON_OK
@@ -408,13 +414,25 @@ Procedure.i V3dConRenderGridFrame()
   ; is CPU-blitted after this frame (the TMU on 4.2 cannot sample the linear
   ; font atlas, so the banner cannot be a GPU texture).
   ch = Neon_LineHeight(#NEON_FONT_UI)
+  cw = Neon_CharWidth(#NEON_FONT_UI)
   r = 0
   While r < ConGridRows()
-    n = ConGridRowText(r, @gConRowBuf[0])
-    If n > 0
-      y = LogoHeight() + r * ch
-      Neon_Text(#NEON_FONT_UI, 0, y, @gConRowBuf[0], V3dCon_Ink())
-    EndIf
+    y = LogoHeight() + r * ch
+    c = 0
+    While c < ConGridCols()
+      If ConGridCellStyle(r, c) = #UART_SCREEN_STYLE_PROMPT
+        ink = V3dCon_PromptInk()
+      Else
+        ink = V3dCon_Ink()
+      EndIf
+      n = ConGridStyleRunText(r, c, @gConRowBuf[0])
+      If n > 0
+        Neon_Text(#NEON_FONT_UI, c * cw, y, @gConRowBuf[0], ink)
+        c = c + n
+      Else
+        c = c + 1
+      EndIf
+    Wend
     r = r + 1
   Wend
   ; The UI layer, then the pointer on top of it. This order is the layer

@@ -89,12 +89,14 @@ XIncludeFile "Anvil/Graphics/touch_keyboard_view.pbi"
 ;  file in the include order and needs nothing extra.
 ; ----------------------------------------------------------------------
 XIncludeFile "Anvil/Core/boot_transcript.pbi"
+XIncludeFile "Anvil/Core/console_style.pbi"
 
 #CON_MAXCOLS = 256
 #CON_MAXROWS = 80
 #CON_CELLS   = 20480              ; 256 * 80
 
 Global Dim gConGrid.a[#CON_CELLS]        ; one byte per cell, ASCII (space = blank)
+Global Dim gConStyle.a[#CON_CELLS]       ; screen-only style beside each character
 Global Dim gConRowDirty.a[#CON_MAXROWS]  ; 1 if a row's content changed since paint
 Global Dim gConRowBuf.a[#CON_MAXCOLS + 2] ; a renderer's scratch for one NUL-terminated row
 Global gConCols.i   = 0
@@ -323,6 +325,7 @@ Procedure ConGridClear()
   i = 0
   While i < n
     gConGrid[i] = 32
+    gConStyle[i] = #UART_SCREEN_STYLE_NORMAL
     i = i + 1
   Wend
   gConCurR = 0
@@ -374,6 +377,7 @@ Procedure ConGridScroll()
     c = 0
     While c < gConCols
       gConGrid[r * gConCols + c] = gConGrid[(r + 1) * gConCols + c]
+      gConStyle[r * gConCols + c] = gConStyle[(r + 1) * gConCols + c]
       c = c + 1
     Wend
     gConRowDirty[r] = gConRowDirty[r + 1]
@@ -382,6 +386,7 @@ Procedure ConGridScroll()
   c = 0
   While c < gConCols
     gConGrid[(gConRows - 1) * gConCols + c] = 32
+    gConStyle[(gConRows - 1) * gConCols + c] = #UART_SCREEN_STYLE_NORMAL
     c = c + 1
   Wend
   gConRowDirty[gConRows - 1] = 1
@@ -413,7 +418,7 @@ EndProcedure
 ; The terminal state machine, one byte at a time. Newline, carriage
 ; return, backspace, tab, wrap and scroll - the ordinary console rules,
 ; kept ONCE here for every renderer.
-Procedure ConGridPutc(c.i)
+Procedure ConGridPutcStyle(c.i, style.i)
   Define t.i
   If gConReady = 0
     ProcedureReturn
@@ -430,6 +435,7 @@ Procedure ConGridPutc(c.i)
     If gConCurC > 0
       gConCurC = gConCurC - 1
       gConGrid[gConCurR * gConCols + gConCurC] = 32
+      gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
       gConRowDirty[gConCurR] = 1
       gConDirty = 1
     EndIf
@@ -439,6 +445,7 @@ Procedure ConGridPutc(c.i)
     t = (gConCurC + 8) - ((gConCurC + 8) % 8)
     While gConCurC < t And gConCurC < gConCols
       gConGrid[gConCurR * gConCols + gConCurC] = 32
+      gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
       gConCurC = gConCurC + 1
     Wend
     gConRowDirty[gConCurR] = 1
@@ -452,12 +459,23 @@ Procedure ConGridPutc(c.i)
     ProcedureReturn
   EndIf
   gConGrid[gConCurR * gConCols + gConCurC] = c
+  If style = #UART_SCREEN_STYLE_PROMPT
+    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_PROMPT
+  Else
+    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
+  EndIf
   gConRowDirty[gConCurR] = 1
   gConDirty = 1
   gConCurC = gConCurC + 1
   If gConCurC >= gConCols
     ConGridNewline()
   EndIf
+EndProcedure
+
+; Direct model callers (boot transcript replay and focused gates) produce
+; ordinary console text. Live output uses ConGridPutcStyle below.
+Procedure ConGridPutc(c.i)
+  ConGridPutcStyle(c, #UART_SCREEN_STYLE_NORMAL)
 EndProcedure
 
 ; ConDrainRing - THE ONE CONSUMER of the UART mirror ring. Drains it into
@@ -493,7 +511,7 @@ Procedure ConDrainRing()
       Break
     EndIf
     BootTranscriptPut(c)
-    ConGridPutc(c)
+    ConGridPutcStyle(c, UartMirrorReadStyle())
     i = i + 1
   Wend
 EndProcedure
@@ -519,6 +537,12 @@ Procedure.i ConContentCell(r.i, c.i)
   EndIf
   ProcedureReturn gConGrid[r * gConCols + c] & $FF
 EndProcedure
+Procedure.i ConContentCellStyle(r.i, c.i)
+  If r < 0 Or r >= gConRows Or c < 0 Or c >= gConCols
+    ProcedureReturn #UART_SCREEN_STYLE_NORMAL
+  EndIf
+  ProcedureReturn gConStyle[r * gConCols + c] & $FF
+EndProcedure
 Procedure.i ConContentRowDirty(r.i)
   If r < 0 Or r >= gConRows
     ProcedureReturn 0
@@ -531,6 +555,9 @@ Procedure.i ConGridRows()
 EndProcedure
 Procedure.i ConGridCell(r.i, c.i)
   ProcedureReturn ConContentCell(ConViewTop() + r, c)
+EndProcedure
+Procedure.i ConGridCellStyle(r.i, c.i)
+  ProcedureReturn ConContentCellStyle(ConViewTop() + r, c)
 EndProcedure
 Procedure.i ConGridRowDirty(r.i)
   If r < 0 Or r >= ConViewRows()
@@ -594,6 +621,41 @@ EndProcedure
 ; The same row, addressed the way a renderer addresses it.
 Procedure.i ConGridRowText(r.i, *dst)
   ProcedureReturn ConContentRowText(ConViewTop() + r, *dst)
+EndProcedure
+
+; Copy the contiguous run beginning at column `first` whose cells all have
+; the same style. Renderers advance by the returned count and choose one
+; colour for the whole call. Interior spaces remain; trailing spaces are
+; omitted from the draw string but still count in the returned run length,
+; so the next style begins at its exact cell without painting blank tails.
+Procedure.i ConGridStyleRunText(r.i, first.i, *dst)
+  Define c.i
+  Define n.i
+  Define last.i
+  Define style.i
+  Define g.i
+  If r < 0 Or r >= ConViewRows() Or first < 0 Or first >= gConCols
+    PokeA(*dst, 0)
+    ProcedureReturn 0
+  EndIf
+  style = ConGridCellStyle(r, first)
+  c = first
+  n = 0
+  last = -1
+  While c < gConCols And ConGridCellStyle(r, c) = style
+    g = ConGridCell(r, c)
+    If g = 0
+      g = 32
+    EndIf
+    PokeA(*dst + n, g)
+    If g <> 32
+      last = n
+    EndIf
+    n = n + 1
+    c = c + 1
+  Wend
+  PokeA(*dst + last + 1, 0)
+  ProcedureReturn n
 EndProcedure
 
 ; Called by a renderer once it has painted the grid, to clear the change

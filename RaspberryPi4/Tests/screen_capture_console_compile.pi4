@@ -26,6 +26,7 @@ XIncludeFile "Anvil/Core/crc.pbi"
 #CC_OUT_STEP = $00000080
 #CC_RUN      = $07200000
 #CC_MODEL    = $07101000
+#CC_STYLE    = $07101400
 #CC_MAGIC    = $43415043             ; "CAPC"
 
 Global gCcPaints.i
@@ -132,6 +133,66 @@ Procedure CcConsoleBurst()
   PokeN(#CC_MODEL + 48, ConGridScrollN())
 EndProcedure
 
+; Exercise the real UART-mirror sideband and real terminal state machine.
+; The final shape covers a style boundary at wrap, a tab-filled row, a
+; scroll, and a backspace which must erase both character and old style.
+Procedure CcStylePutStr(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0
+      Break
+    EndIf
+    uart_MirrorPut(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure CcConsoleStyle()
+  Define i.i
+
+  ConGridInit(8, 3)
+  UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  CcStylePutStr("pmf> ")
+  UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+  CcStylePutStr("ab")
+  UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  uart_MirrorPut(88)                    ; X: wrap at the style boundary
+  UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+  uart_MirrorPut(9)                     ; tab: fill the middle row, then wrap
+  UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  CcStylePutStr("12345678")             ; fill bottom row, then scroll it up
+  UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+  uart_MirrorPut(65)                    ; A
+  UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  uart_MirrorPut(66)                    ; B
+  UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+  uart_MirrorPut(8)                     ; erase B and its prompt style
+  UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  uart_MirrorPut(67)                    ; C occupies the erased cell
+  UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+  ConDrainRing()
+
+  PokeN(#CC_STYLE + 0, ConGridCurR())
+  PokeN(#CC_STYLE + 8, ConGridCurC())
+  i = 0
+  While i < 24
+    PokeA(#CC_STYLE + 16 + i, ConGridCell(i / 8, i % 8))
+    PokeA(#CC_STYLE + 40 + i, ConGridCellStyle(i / 8, i % 8))
+    i = i + 1
+  Wend
+
+  ConGridClear()
+  i = 0
+  While i < 24
+    PokeA(#CC_STYLE + 64 + i, ConGridCell(i / 8, i % 8))
+    PokeA(#CC_STYLE + 88 + i, ConGridCellStyle(i / 8, i % 8))
+    i = i + 1
+  Wend
+EndProcedure
+
 Procedure.i Main()
   PokeN(#CC_OUT - 8, #CC_MAGIC)
   CcCapture(0, 0)
@@ -139,5 +200,6 @@ Procedure.i Main()
   CcCapture(2, 180)
   CcCapture(3, 270)
   CcConsoleBurst()
+  CcConsoleStyle()
   ProcedureReturn 0
 EndProcedure

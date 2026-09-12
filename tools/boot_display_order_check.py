@@ -111,12 +111,12 @@ def validate(board: str, banner: str, console: str, boot: str, screen: str) -> N
         raise AssertionError("capture outlives the boot log it is for")
 
     # ONE TAP, ON THE ONE CONSUMER. Capture must sit in ConDrainRing beside
-    # ConGridPutc: at the producer it would catch bytes the grid never got, and
+    # ConGridPutcStyle: at the producer it would catch bytes the grid never got, and
     # in a renderer it would catch them once per repaint.
     drain = body(console, "ConDrainRing")
     if "BootTranscriptPut(c)" not in drain:
         raise AssertionError("the transcript is not taken from the one output consumer")
-    if drain.index("BootTranscriptPut(c)") > drain.index("ConGridPutc(c)"):
+    if drain.index("BootTranscriptPut(c)") > drain.index("ConGridPutcStyle(c, UartMirrorReadStyle())"):
         raise AssertionError("the transcript is taken after the grid, not with it")
     for other in ("ScreenPump", "ConRepaint", "ConGridPutc"):
         if "BootTranscriptPut" in body(console, other):
@@ -165,8 +165,8 @@ MUTATIONS = (
      lambda b, bn, c, bt, sc: (b, once(bn, "  ConSetLiveBoot(0)" + NL, ""), c, bt, sc)),
     ("the transcript taken after the grid instead of with it",
      lambda b, bn, c, bt, sc: (b, bn,
-                               once(c, "    BootTranscriptPut(c)" + NL + "    ConGridPutc(c)" + NL,
-                                    "    ConGridPutc(c)" + NL + "    BootTranscriptPut(c)" + NL),
+                               once(c, "    BootTranscriptPut(c)" + NL + "    ConGridPutcStyle(c, UartMirrorReadStyle())" + NL,
+                                    "    ConGridPutcStyle(c, UartMirrorReadStyle())" + NL + "    BootTranscriptPut(c)" + NL),
                                bt, sc)),
     ("a second transcript tap in the pump",
      lambda b, bn, c, bt, sc: (b, bn,

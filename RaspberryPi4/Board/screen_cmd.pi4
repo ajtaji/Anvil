@@ -20,6 +20,9 @@ Procedure ConPaintDma()
   Define ch.i
   Define fg.i
   Define n.i
+  Define c.i
+  Define cw.i
+  Define style.i
   Define hadCur.i
   Define pLo.i
   Define pHi.i
@@ -28,7 +31,7 @@ Procedure ConPaintDma()
     ProcedureReturn
   EndIf
   ch = DisplayCharHeight()
-  fg = DisplayRGB(226, 232, 240)
+  cw = DisplayCharWidth()
 
   ; Lift the mouse cursor before touching the framebuffer, so a scroll or a
   ; repaint does not smear its save-under; it goes back on top at the end.
@@ -75,10 +78,25 @@ Procedure ConPaintDma()
     If ConGridRowDirty(r) <> 0
       y = LogoHeight() + r * ch
       DisplayFillRect(0, y, DisplayWidth(), ch, gScreenBg)
-      n = ConGridRowText(r, @gConRowBuf[0])
-      If n > 0
-        DisplayTextClear(0, y, @gConRowBuf[0], fg)
-      EndIf
+      ; One draw per contiguous style run. The row was cleared above, and
+      ; x is derived from the run's first cell, so splitting the string
+      ; changes colour only - never spacing or terminal content.
+      c = 0
+      While c < ConGridCols()
+        style = ConGridCellStyle(r, c)
+        n = ConGridStyleRunText(r, c, @gConRowBuf[0])
+        If style = #UART_SCREEN_STYLE_PROMPT
+          fg = DisplayRGB(80, 255, 120)
+        Else
+          fg = DisplayRGB(226, 232, 240)
+        EndIf
+        If n > 0
+          DisplayTextClear(c * cw, y, @gConRowBuf[0], fg)
+          c = c + n
+        Else
+          c = c + 1
+        EndIf
+      Wend
       If y < pLo
         pLo = y
       EndIf

@@ -197,6 +197,8 @@ def stage(work: pathlib.Path, view_text: str, console_text: str) -> pathlib.Path
     # has to resolve the include.
     shutil.copy2(ROOT / "Anvil" / "Core" / "boot_transcript.pbi",
                  work / "Anvil" / "Core" / "boot_transcript.pbi")
+    shutil.copy2(ROOT / "Anvil" / "Core" / "console_style.pbi",
+                 work / "Anvil" / "Core" / "console_style.pbi")
     (work / "Anvil" / "Graphics" / "touch_keyboard_view.pbi").write_text(view_text, encoding="utf-8")
     (work / "RaspberryPi4" / "Board" / "console.pi4").write_text(console_text, encoding="utf-8")
     shutil.copy2(GATE, work / "RaspberryPi4" / "Tests" / GATE.name)

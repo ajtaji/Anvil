@@ -256,6 +256,7 @@ def stage(work: pathlib.Path, compose: str, keep: str) -> pathlib.Path:
         (work / folder).mkdir(parents=True, exist_ok=True)
     for rel in ("Anvil/Core/touch_keyboard.pbi",
                 "Anvil/Core/boot_transcript.pbi",
+                "Anvil/Core/console_style.pbi",
                 "Anvil/Graphics/touch_keyboard_view.pbi",
                 "RaspberryPi4/Board/console.pi4",
                 "RaspberryPi4/Board/screen_geom.pi4",

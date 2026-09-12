@@ -19,12 +19,13 @@ PROBE = ROOT / "RaspberryPi4" / "Tests" / "screen_capture_console_compile.pi4"
 LOAD = 0x00400000
 STACK = 0x03000000
 LOADER_LR = 0xDEAD0000
-STEP_LIMIT = 30_000_000
+STEP_LIMIT = 60_000_000
 FB = 0x07000000
 FB_STEP = 0x1000
 OUT = 0x07100000
 OUT_STEP = 0x80
 MODEL = 0x07101000
+STYLE = 0x07101400
 MAGIC = 0x43415043
 PW, PH = 5, 7
 ROTS = (0, 90, 180, 270)
@@ -195,8 +196,49 @@ def check(cpu) -> None:
     if grid != expected_grid:
         raise SystemExit(f"final shared console grid mismatch: {grid!r}")
 
+    if (u64(cpu, STYLE), u64(cpu, STYLE + 8)) != (2, 2):
+        raise SystemExit("styled console cursor did not survive wrap/tab/scroll")
+    chars = bytes(cpu.memory.get(STYLE + 16 + i, 0) for i in range(24))
+    styles = bytes(cpu.memory.get(STYLE + 40 + i, 0) for i in range(24))
+    expected_chars = b"        12345678AC      "
+    expected_styles = bytes([0] * 8 + [1] * 8 + [0, 1] + [0] * 6)
+    if chars != expected_chars or styles != expected_styles:
+        raise SystemExit(
+            "styled terminal state mismatch after wrap/tab/scroll/backspace\n"
+            f"chars  {chars!r}\nstyles {list(styles)}"
+        )
+    clear_chars = bytes(cpu.memory.get(STYLE + 64 + i, 0) for i in range(24))
+    clear_styles = bytes(cpu.memory.get(STYLE + 88 + i, 0) for i in range(24))
+    if clear_chars != b" " * 24 or clear_styles != bytes(24):
+        raise SystemExit("console clear did not reset characters and styles together")
+
+
+def check_source_contract() -> None:
+    uart = (ROOT / "RaspberryPi4/Lib/uart.pi4").read_text(encoding="utf-8")
+    board = (ROOT / "RaspberryPi4/Board/board.pi4").read_text(encoding="utf-8")
+    dma = (ROOT / "RaspberryPi4/Board/screen_cmd.pi4").read_text(encoding="utf-8")
+    v3d = (ROOT / "RaspberryPi4/Board/v3d_console.pi4").read_text(encoding="utf-8")
+
+    prompt = 'Print("pmf> ")'
+    at = board.index(prompt)
+    before = board.rfind("UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)", 0, at)
+    after = board.find("UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)", at)
+    if before < 0 or after < 0 or at - before > 300 or after - at > 300:
+        raise SystemExit("prompt is not tightly bracketed by screen-only style changes")
+    if "uart_AuxPut(c)" not in uart or "uart_mirrorStyle[uart_mirrorHead]" not in uart:
+        raise SystemExit("UART screen and network fan-out no longer have separate paths")
+    if "uart_auxStyle" in uart or "UartWrite(27)" in board or "\\x1b" in board:
+        raise SystemExit("screen styling leaked into the raw/network protocol")
+    for name, text, colour in (
+        ("DMA", dma, "DisplayRGB(80, 255, 120)"),
+        ("V3D", v3d, "Neon_RGBA(80, 255, 120, 255)"),
+    ):
+        if "ConGridStyleRunText" not in text or colour not in text:
+            raise SystemExit(f"{name} renderer does not paint bright-green style runs")
+
 
 def main() -> int:
+    check_source_contract()
     compiler = locate("PMF_COMPILER", ROOT / "PureMetalForge.exe")
     interp = locate("PMF_A64_INTERP", ROOT / "tools" / "a64" / "a64_interp.py")
     image = build(compiler)
@@ -206,7 +248,7 @@ def main() -> int:
     check(cpu)
     print(
         "screen_capture_console_emitted_check: PASS "
-        f"(4 rotations + RLE CRC, 45150 bytes lossless, {steps} instructions)"
+        f"(4 rotations + RLE CRC, 45150 bytes lossless, styled terminal ops, {steps} instructions)"
     )
     return 0
 
