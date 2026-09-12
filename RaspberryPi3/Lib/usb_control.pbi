@@ -2,6 +2,7 @@
 ; One call to Pi3UsbControlStep() submits at most one bounded DWC2 channel
 ; transaction.  NAK/NYET is returned to the scheduler; this code never spins.
 ; PID encodings are DWC2 HCTSIZ values from the pinned Linux hw.h.
+; Cross-checks: drivers/usb/dwc2/hw.h and v2025.01_uboot_usb.c.
 
 #P3_USB_PID_DATA1 = 2
 #P3_USB_PID_SETUP = 3

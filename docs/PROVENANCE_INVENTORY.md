@@ -746,6 +746,11 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi3/Lib/usb_host_core.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | register semantics consulted; no implementation copied |
 | `RaspberryPi3/Lib/usb_host_init.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | register/PHY/FIFO/reset facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/usb_native.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | device mapping and firmware power-domain facts; no implementation copied |
+| `RaspberryPi3/Lib/usb_control.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | DWC2 PID/state and bounded control-transfer facts consulted; no implementation copied |
+| `RaspberryPi3/Lib/usb_control.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | USB control-stage behavior consulted; no implementation copied |
+| `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | Pi 3 topology, identities, descriptor/status and hub sequencing facts consulted; no implementation copied |
+| `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | pinned Raspberry Pi USB topology facts consulted; no implementation copied |
+| `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | power-good, address-settle and reset timing facts consulted; no implementation copied |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/usb_takeover_compile.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
