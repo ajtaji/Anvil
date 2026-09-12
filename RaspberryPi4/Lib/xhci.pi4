@@ -1518,6 +1518,16 @@ EndProcedure
 ;  sign-extends (ruled 2026-08-25) and would make USBSTS bit 11 and
 ;  PORTSC bit 31 negative; not PeekI or PeekX, which are eight bytes
 ;  and would take the neighbouring register with them.
+;
+; PI 4 USB BOOT HANG, 2026-09-12: the unbarriered driver intermittently
+; stopped at the first USBSTS read after PCI bus mastering was enabled.
+; The BAR, address width, CAPLENGTH read, and emitted automatic frames had
+; already been verified on that path. A controlled image without ordered
+; MMIO failed 2/2 resets; the same ownership/reset policy with ordering
+; passed 5/5, followed by 3/3 passes from the integrated main image. The
+; fix belongs here because every xHCI register access passes here. Do not
+; replace these barriers with delays, watchdog recovery, per-call patches,
+; or an emitter peephole: none of those gives device I/O its ordering.
 ; ======================================================================
 
 Procedure.i xh_Rd(base.i, off.i)

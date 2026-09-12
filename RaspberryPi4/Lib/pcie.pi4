@@ -844,6 +844,13 @@ EndProcedure
 ; citable way from here to find out which. First call on a cold board is
 ; a real experiment, not a formality - which is the honest reason it is
 ; a bench instrument and not part of a bring-up sequence.
+;
+; PI 4 USB BOOT HANG, 2026-09-12: raw PCIe MMIO was one half of an
+; intermittently unordered handover to the VL805. The failing image could
+; reach the xHCI capability registers, then stalled on its first operational
+; status read after bus mastering. Keep device ordering in this owning
+; accessor; a delay, watchdog, call-site patch, or emitter peephole does not
+; repair the MMIO contract. The paired xHCI accessors carry the same rule.
 ; ----------------------------------------------------------------------
 Procedure.i PcieRcPeek(off.i)
   Define v.i
