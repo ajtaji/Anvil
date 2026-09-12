@@ -81,8 +81,12 @@ Global Dim avkRefCur.i[#ANVIL_VK_MAX_COMMAND_BUFFERS * #ANVIL_VK_MAX_CB_REFS]
 ;  there, the same seam shape the backend uses.
 ; ----------------------------------------------------------------------
 Global Dim avkCbPipe.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
-Global Dim avkCbVtxBuf.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
-Global Dim avkCbVtxOffset.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+; ONE BOUND BUFFER PER BINDING. vkCmdBindVertexBuffers names a first
+; binding and a count, so the state it sets is per binding and cannot be
+; one buffer and one offset: a pipeline that reads position from binding
+; zero and colour from binding one has two of each, at two strides.
+Global Dim avkCbVtxBuf.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * #ANVIL_VK_MAX_BINDINGS]
+Global Dim avkCbVtxOffset.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * #ANVIL_VK_MAX_BINDINGS]
 Global Dim avkCbRpActive.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbRpDone.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbFb.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
@@ -90,6 +94,13 @@ Global Dim avkCbClearWord.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawFirst.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawVerts.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+; The one descriptor set vkCmdBindDescriptorSets bound, as a handle, and
+; the pipeline layout it was bound with. Both are kept: the specification
+; says a set is bound THROUGH a layout, and a draw whose pipeline was
+; built against a different layout is reading its uniform through an
+; agreement that was never made.
+Global Dim avkCbDescSet.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDescLayout.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbPushBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbPushWord.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * 4]
 
@@ -144,8 +155,12 @@ Procedure avkCbClear(c.i)
   avkCmdOps[c] = 0
   avkCmdState[c] = #ANVIL_VK_CB_INITIAL
   avkCbPipe[c] = 0
-  avkCbVtxBuf[c] = 0
-  avkCbVtxOffset[c] = 0
+  k = 0
+  While k < #ANVIL_VK_MAX_BINDINGS
+    avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k] = 0
+    avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k] = 0
+    k = k + 1
+  Wend
   avkCbRpActive[c] = 0
   avkCbRpDone[c] = 0
   avkCbFb[c] = 0
@@ -153,6 +168,8 @@ Procedure avkCbClear(c.i)
   avkCbDrawCount[c] = 0
   avkCbDrawFirst[c] = 0
   avkCbDrawVerts[c] = 0
+  avkCbDescSet[c] = 0
+  avkCbDescLayout[c] = 0
   avkCbPushBytes[c] = 0
   k = 0
   While k < 4

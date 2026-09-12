@@ -630,6 +630,9 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | SPIR-V specification read for the module layout the hand-assembled fixtures follow; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_v3d_shader.pi4` | consulted | mesa-24.3.4 | MIT | reference read for the shaded-vertex layout, the VPM segment rule and the thread-end ordering; cite; no code taken |
 | `RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
+| `Anvil/Graphics/Vulkan/vk_descriptor.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification and registry read for the descriptor set layout, pool, allocation and update rules and for the structure members, their order and their widths; cite; no code taken |
+| `Anvil/Graphics/Vulkan/vk_interp_expect.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the single-sample fragment sample position and for VK_FORMAT_B8G8R8A8_UNORM's byte order; cite; no code taken |
+| `RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
 | `RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4` | hardware-facts | vendor-spec | vendor document | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_mod.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |

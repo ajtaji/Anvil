@@ -352,6 +352,9 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Define varyComps.i
   Define lastVertex.i
   Define vertexBytes.i
+  Define b.i
+  Define colourBase.i
+  Define *bind.AnvilVkBackendBinding
 
   avkV3dNative = 0
   If *d = 0
@@ -379,25 +382,47 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     ProcedureReturn -1
   EndIf
 
-  ; The vertex array must be inside the window the GPU can reach. The
-  ; portable layer has already checked it is inside its own VkBuffer;
+  ; EVERY vertex array must be inside the window the GPU can reach. The
+  ; portable layer has already checked each is inside its own VkBuffer;
   ; this is the check that the buffer is inside the mapped span, which
-  ; only this file knows about.
+  ; only this file knows about, and it is made once per binding because
+  ; two bindings are two allocations that were placed separately.
   lastVertex = *d\firstVertex + *d\vertexCount
-  vertexBytes = lastVertex * *d\vertexStride
-  If *d\vertexStride <= 0 Or vertexBytes <= 0
-    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with no vertex stride or no vertices (Anvil code -20001, empty draw); nothing was submitted.")
+  If *d\bindingCount < 1 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS Or *d\bindings = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with no vertex input bindings, more than four, or no binding array at all (Anvil code -20001, invalid draw); nothing was submitted.")
     ProcedureReturn -1
   EndIf
-  If *d\vertexBase < avkV3dWindowBase Or (*d\vertexBase - avkV3dWindowBase) > (avkV3dWindowBytes - vertexBytes)
-    avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw whose vertex array is outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The vertex fetcher reaches memory through that mapping, and an unmapped page is an MMU fault rather than a wrong picture.")
-    avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
-    ProcedureReturn -1
-  EndIf
+  b = 0
+  While b < *d\bindingCount
+    *bind = *d\bindings + (b * SizeOf(AnvilVkBackendBinding))
+    vertexBytes = lastVertex * *bind\stride
+    If *bind\stride <= 0 Or vertexBytes <= 0
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with no vertex stride on one of its bindings, or no vertices (Anvil code -20001, empty draw); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If *bind\base < avkV3dWindowBase Or (*bind\base - avkV3dWindowBase) > (avkV3dWindowBytes - vertexBytes)
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw one of whose vertex arrays is outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The vertex fetcher reaches memory through that mapping, and an unmapped page is an MMU fault rather than a wrong picture.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+    b = b + 1
+  Wend
 
   varyComps = avkqVaryComps[pipe]
-  AnvilVkV3dFragmentUniforms(pipe, pbase, *d\pushBase, AnvilVkPipelineColourSource(pipe))
-  rc = AnvilVkV3dBuildRecord(pipe, pbase, *d\vertexBase, *d\vertexStride, lastVertex - 1, varyComps)
+  ; A DESCRIPTOR COLOUR AND A PUSH COLOUR ARRIVE THE SAME WAY: sixteen
+  ; bytes at an address the portable layer has already validated. Which
+  ; of the two it is decides which address, and the colour source is
+  ; what says so.
+  colourBase = *d\pushBase
+  If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_UNIFORM
+    colourBase = *d\uniformBase
+    If colourBase = 0 Or *d\uniformBytes < 16
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw whose fragment colour comes from a uniform buffer with no address or a range shorter than sixteen bytes (Anvil code -20001, invalid descriptor); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  AnvilVkV3dFragmentUniforms(pipe, pbase, colourBase, AnvilVkPipelineColourSource(pipe))
+  rc = AnvilVkV3dBuildRecord(pipe, pbase, *d, lastVertex - 1, varyComps)
   If rc <> #V3D_OK
     avkV3dNative = rc
     avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 Vulkan backend could not build this draw's GL shader state record (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); nothing was submitted. V3dError() carries the control-list builder's own code.")
@@ -424,7 +449,14 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       V3dClNonperspFlags((1 << varyComps) - 1)
     EndIf
     V3dCacheRange(pbase, #AVKQ_BYTES)
-    V3dCacheRange(*d\vertexBase, vertexBytes)
+    ; One cache maintenance per binding: the processor wrote each of
+    ; these buffers and the vertex fetcher reads all of them.
+    b = 0
+    While b < *d\bindingCount
+      *bind = *d\bindings + (b * SizeOf(AnvilVkBackendBinding))
+      V3dCacheRange(*bind\base, lastVertex * *bind\stride)
+      b = b + 1
+    Wend
     V3dClGlShaderState(pbase + #AVKQ_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
     V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
     If V3dClError() <> #V3D_OK

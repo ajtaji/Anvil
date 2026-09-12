@@ -692,6 +692,39 @@ EndProcedure
 ;  Flat: blue, green, red, alpha and then the tile-buffer configuration
 ;  word, which the TLBU write pulls by itself. Interpolated: the
 ;  configuration word alone.
+;
+; ======================================================================
+;  A DESCRIPTOR'S COLOUR REACHES THE QPU THROUGH THIS STREAM, AND WHAT
+;  THAT DOES AND DOES NOT MEAN
+; ======================================================================
+;  A uniform-buffer descriptor resolves, at submit time, to one address
+;  and one length. The four words at that address are read HERE, by the
+;  processor, and written into the fragment shader's uniform stream, so
+;  the emitted fragment program for a descriptor colour is byte for byte
+;  the program for a push-constant colour. The GPU does not dereference
+;  the descriptor.
+;
+;  THAT IS A REAL DIFFERENCE FROM A CONFORMANT IMPLEMENTATION and it is
+;  written here rather than left to be discovered. A driver that lowered
+;  this properly would keep the ADDRESS in the stream and have the QPU
+;  fetch the words through the TMU at execution time, so a buffer
+;  written after the submission and before the job ran would change the
+;  picture. Here it would not.
+;
+;  It is observationally equivalent for every program THIS slice
+;  accepts, and the reason is worth stating: the buffer is host-visible
+;  memory, nothing in this implementation lets the GPU write a buffer,
+;  one submission is in flight at a time, vkUpdateDescriptorSets is
+;  refused while a submission is in flight, and the buffer is retained
+;  across the submission so it cannot be freed under the job. There is
+;  no accepted program in which the words can change between this read
+;  and the execution.
+;
+;  THE TMU GENERAL LOAD IS THE OWED PIECE. Nothing in this tree has ever
+;  performed one - the engine's textured program uses the TMU's texture
+;  path, which is a different configuration - and a QPU sequence written
+;  from a guess is the thing the project's rules exist to prevent. It is
+;  the next piece of work on this path and it is named in the lane note.
 ; ----------------------------------------------------------------------
 Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i)
   Define r.i
@@ -702,7 +735,16 @@ Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i)
     avkqPoke32(base + #AVKQ_OFF_UNIF_FS, #AVKQ_TLB_CONF)
     ProcedureReturn
   EndIf
-  If colourSrc = #ANVIL_SPV_COLOUR_PUSH And *push <> 0
+  If colourSrc = #ANVIL_SPV_COLOUR_UNIFORM And *push <> 0
+    ; `*push` is the descriptor's resolved address when the colour comes
+    ; from a uniform buffer, and the push-constant staging area when it
+    ; comes from a push constant. One parameter, because at this depth
+    ; they are the same thing: sixteen bytes of red, green, blue, alpha.
+    r = PeekL(*push) & $FFFFFFFF
+    g = PeekL(*push + 4) & $FFFFFFFF
+    b = PeekL(*push + 8) & $FFFFFFFF
+    a = PeekL(*push + 12) & $FFFFFFFF
+  ElseIf colourSrc = #ANVIL_SPV_COLOUR_PUSH And *push <> 0
     r = PeekL(*push) & $FFFFFFFF
     g = PeekL(*push + 4) & $FFFFFFFF
     b = PeekL(*push + 8) & $FFFFFFFF
@@ -723,11 +765,14 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  The GL shader state record and its attribute records, for one draw.
 ;
-;  ONE ATTRIBUTE RECORD PER COMPONENT, which is the layout this tree's
-;  engine already uses: every record points into the same vertex array
-;  and differs only by its four-byte offset within one vertex, so the
-;  base address never moves and VERTEX_ARRAY_PRIMS's first-vertex index
-;  selects the draw's own vertices.
+;  ONE ATTRIBUTE RECORD PER COMPONENT. Every record carries an address,
+;  a stride and a maximum index OF ITS OWN, which is why a pipeline with
+;  two vertex buffers needs nothing new from the hardware at all: the
+;  record for a position component is written against binding zero's
+;  buffer and stride, and the record for a colour component against
+;  binding one's. The draw record says which binding each attribute
+;  reads, and this procedure looks the address and the stride up per
+;  attribute rather than taking one of each.
 ;
 ;  BOTH PHASES READ EVERY RECORD. GFXH-930 requires at least one record
 ;  read by both the coordinate and the vertex shader; reading all of
@@ -735,13 +780,19 @@ EndProcedure
 ;  same number in both programs, which is the property the emitter's
 ;  register assignment is built on.
 ; ----------------------------------------------------------------------
-Procedure.i AnvilVkV3dBuildRecord(pipe.i, base.i, vertexBase.i, stride.i, maxIndex.i, varyComps.i)
+Procedure.i AnvilVkV3dBuildRecord(pipe.i, base.i, *d.AnvilVkBackendDraw, maxIndex.i, varyComps.i)
   Define r.i
   Define k.i
   Define a.i
   Define c.i
   Define n.i
+  Define bidx.i
+  Define vbase.i
+  Define stride.i
   Define singleSegFs.i
+  Define *bind.AnvilVkBackendBinding
+
+  If *d = 0 Or *d\bindings = 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
 
   r = V3dShaderRecordBegin(base + #AVKQ_OFF_SHREC, avkqRecords[pipe])
   If r <> #V3D_OK : ProcedureReturn r : EndIf
@@ -765,9 +816,15 @@ Procedure.i AnvilVkV3dBuildRecord(pipe.i, base.i, vertexBase.i, stride.i, maxInd
   n = 0
   a = 0
   While a < AnvilVkPipelineAttrCount(pipe)
+    bidx = AnvilVkPipelineAttrBinding(pipe, a)
+    If bidx < 0 Or bidx >= *d\bindingCount : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+    *bind = *d\bindings + (bidx * SizeOf(AnvilVkBackendBinding))
+    vbase = *bind\base
+    stride = *bind\stride
+    If vbase = 0 Or stride <= 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
     c = 0
     While c < AnvilVkPipelineAttrComponents(pipe, a)
-      V3dAttrRecord(n, vertexBase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)
+      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)
       n = n + 1
       c = c + 1
     Wend

@@ -44,11 +44,22 @@
 ; Everything else is refused with a real code and a whole sentence.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_command.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_descriptor.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv.pbi"
 
-#ANVIL_VK_MAX_BUFFERS = 4
-#ANVIL_VK_MAX_SHADER_MODULES = 4
-#ANVIL_VK_MAX_LAYOUTS = 4
+; EIGHT BUFFERS AND EIGHT SHADER MODULES, raised from four when the
+; split vertex layout and the descriptor path arrived: one diagnostic
+; now holds an interleaved array, a position array, a colour array and
+; a uniform buffer at once, and five shader modules - three fragment
+; shapes and two vertex ones. A limit that the instruments themselves
+; sit exactly on is a limit that refuses the next honest use of it.
+#ANVIL_VK_MAX_BUFFERS = 8
+#ANVIL_VK_MAX_SHADER_MODULES = 8
+; EIGHT PIPELINE LAYOUTS. The desk gate alone now needs four - one with
+; no descriptor set, one with a push-constant range, one for each of
+; two different descriptor set layouts - and a limit an instrument sits
+; exactly on refuses the next honest use of it.
+#ANVIL_VK_MAX_LAYOUTS = 8
 #ANVIL_VK_MAX_RENDER_PASSES = 4
 #ANVIL_VK_MAX_IMAGE_VIEWS = 4
 #ANVIL_VK_MAX_FRAMEBUFFERS = 4
@@ -85,6 +96,9 @@ Global Dim avkShPosAttr.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShColourSrc.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShColourIdx.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShPush.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShUniform.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShUniformSet.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShUniformBinding.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShInComp.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_ATTRS]
 Global Dim avkShOutComp.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_VARYINGS]
 Global Dim avkShOutSrc.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_VARYINGS]
@@ -97,6 +111,8 @@ Global Dim avkLayLive.a[#ANVIL_VK_MAX_LAYOUTS + 1]
 Global Dim avkLayGen.i[#ANVIL_VK_MAX_LAYOUTS + 1]
 Global Dim avkLayDev.i[#ANVIL_VK_MAX_LAYOUTS + 1]
 Global Dim avkLayPushBytes.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim avkLaySetCount.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim avkLaySetLayout.i[#ANVIL_VK_MAX_LAYOUTS + 1]
 
 Global Dim avkRpLive.a[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 Global Dim avkRpGen.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
@@ -126,12 +142,15 @@ Global Dim avkPipeGen.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeDev.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeLayout.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeRp.i[#ANVIL_VK_MAX_PIPELINES + 1]
-Global Dim avkPipeStride.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeBindCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeBindStride.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_BINDINGS]
+Global Dim avkPipeAttrBinding.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_SPV_MAX_ATTRS]
 Global Dim avkPipeAttrCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipePosAttr.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeVaryCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeColourSrc.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeColourIdx.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeUniformBinding.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewX.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewY.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewW.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -153,6 +172,12 @@ Global Dim avkPipeConst.i[(#ANVIL_VK_MAX_PIPELINES + 1) * 4]
 ; the backend needs an address and a recorded command must not point at
 ; a caller's stack frame that is long gone by the time it is submitted.
 Global Dim avkPushStage.l[4]
+
+; The per-binding addresses and strides the draw record points at, for
+; the same reason the push block is staged: the backend is handed an
+; address and must be able to read it after the caller's own storage is
+; gone. Two integers per binding, which is one AnvilVkBackendBinding.
+Global Dim avkBindStage.i[#ANVIL_VK_MAX_BINDINGS * 2]
 
 Global avkDrawRecord.AnvilVkBackendDraw
 
@@ -221,8 +246,8 @@ Procedure.i AnvilVkBufferCreate(device.i, size.i, usage.i, sharing.i, *out)
   If sharing <> #VK_SHARING_MODE_EXCLUSIVE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was asked for VK_SHARING_MODE_CONCURRENT (Anvil code -20005, unsupported sharing mode); there is one queue family on this device, so concurrent sharing has no second family to share with.")
   EndIf
-  If usage = 0 Or (usage & (~(#VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT | #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))) <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was asked for a buffer usage Anvil does not implement (Anvil code -20005, unsupported usage); only VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_BUFFER_USAGE_TRANSFER_SRC_BIT and VK_BUFFER_USAGE_TRANSFER_DST_BIT exist here, because there is no index buffer, no uniform buffer and no descriptor to reach one through.")
+  If usage = 0 Or (usage & (~(#VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT | #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT))) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was asked for a buffer usage Anvil does not implement (Anvil code -20005, unsupported usage); the four that exist here are VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_BUFFER_USAGE_TRANSFER_SRC_BIT and VK_BUFFER_USAGE_TRANSFER_DST_BIT, because there is no index buffer, no storage buffer and no texel buffer view to reach one through.")
   EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_BUFFERS And avkBufLive[s] <> 0 : s = s + 1 : Wend
@@ -323,6 +348,44 @@ Procedure AnvilVkBufferDestroy(device.i, buffer.i)
   avkBufBound[s] = 0
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  THE SEAM vk_descriptor.pbi DECLARED. Five questions about a VkBuffer,
+;  answered here because the buffer objects live in this file and the
+;  descriptor objects are included before it and must not reach into it.
+; ----------------------------------------------------------------------
+Procedure.i avkDescBufferLive(buffer.i)
+  Define s.i
+  s = avkBufSlot(buffer)
+  If s = 0 Or avkBufBound[s] = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkDescBufferUniform(buffer.i)
+  Define s.i
+  s = avkBufSlot(buffer)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  If (avkBufUsage[s] & #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkDescBufferSize(buffer.i)
+  Define s.i
+  s = avkBufSlot(buffer)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkBufSize[s]
+EndProcedure
+
+Procedure.i avkDescBufferAddress(buffer.i)
+  ProcedureReturn AnvilVkBufferAddress(buffer)
+EndProcedure
+
+Procedure.i avkDescBufferDevice(buffer.i)
+  Define s.i
+  s = avkBufSlot(buffer)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkBufDev[s]
+EndProcedure
+
 ; ======================================================================
 ;  SHADER MODULES
 ; ======================================================================
@@ -353,6 +416,9 @@ Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
   avkShColourSrc[s] = AnvilVkSpirvColourSource()
   avkShColourIdx[s] = AnvilVkSpirvColourIndex()
   avkShPush[s] = AnvilVkSpirvUsesPushConstants()
+  avkShUniform[s] = AnvilVkSpirvUsesUniformBlock()
+  avkShUniformSet[s] = AnvilVkSpirvUniformSet()
+  avkShUniformBinding[s] = AnvilVkSpirvUniformBinding()
   base = s * #ANVIL_SPV_MAX_ATTRS
   k = 0
   While k < #ANVIL_SPV_MAX_ATTRS
@@ -411,16 +477,23 @@ EndProcedure
 ; ======================================================================
 ;  PIPELINE LAYOUT
 ; ======================================================================
-Procedure.i AnvilVkPipelineLayoutCreate(device.i, setCount.i, pushCount.i, *ranges.VkPushConstantRange, *out)
+Procedure.i AnvilVkPipelineLayoutCreate(device.i, setCount.i, *setLayouts, pushCount.i, *ranges.VkPushConstantRange, *out)
   Define d.i
   Define s.i
   Define bytes.i
+  Define dsl.i
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If setCount <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreatePipelineLayout was given descriptor set layouts (Anvil code -20005, descriptor sets not implemented); there is no VkDescriptorSetLayout, no VkDescriptorPool and no vkCmdBindDescriptorSets in this implementation, so a bound set could never be supplied to a shader. Use the push-constant range instead.")
+  dsl = 0
+  If setCount < 0 Or setCount > 1
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreatePipelineLayout was given more than one descriptor set layout (Anvil code -20005, unsupported layout); vkCmdBindDescriptorSets binds one set here and its index is zero, so a second set layout would declare bindings nothing could ever supply.")
+  EndIf
+  If setCount = 1
+    If *setLayouts = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+    dsl = AnvilVkDescriptorSetLayoutSlotOf(PeekI(*setLayouts))
+    If dsl = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   EndIf
   bytes = 0
   If pushCount > 1
@@ -443,6 +516,8 @@ Procedure.i AnvilVkPipelineLayoutCreate(device.i, setCount.i, pushCount.i, *rang
   avkLayLive[s] = 1
   avkLayDev[s] = d
   avkLayPushBytes[s] = bytes
+  avkLaySetCount[s] = setCount
+  avkLaySetLayout[s] = dsl
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_PIPELINE_LAYOUT, s, avkLayGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -745,18 +820,35 @@ EndProcedure
 ; The vertex input state, joined against the vertex shader's own inputs.
 ; A pipeline whose attributes do not match its shader is refused here,
 ; which is the one place where both are in view at the same time.
+;
+; ONE OR MORE BINDINGS, each with its OWN stride. Position in one buffer
+; and colour in another is the layout an application that streams one
+; attribute and keeps the other static writes, and it is the reason the
+; bindings and the attributes are two lists in the specification rather
+; than one. Nothing in V3D ever wanted a single base address: every
+; attribute record it reads carries an address and a stride of its own.
+;
+; EVERY REFUSAL BELOW NAMES THE THING IT REFUSED - the binding number,
+; the location, the format, the offset - because a caller who has just
+; split one buffer into two is looking at eight numbers and needs to be
+; told which one is wrong, not that "the vertex input" is.
 Procedure.i avkPipeVertexInput(pipe.i, vs.i, *vi.VkPipelineVertexInputStateCreateInfo)
   Define n.i
+  Define nb.i
   Define k.i
   Define j.i
   Define loc.i
+  Define bidx.i
   Define fmt.i
   Define comps.i
   Define stride.i
   Define *bind.VkVertexInputBindingDescription
   Define *attr.VkVertexInputAttributeDescription
   Define base.i
+  Define bbase.i
   Define seen.i
+  Define seenBind.i
+  Define usedBind.i
 
   If *vi = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given no pVertexInputState (Anvil code -20001, missing state); a pipeline whose vertex shader reads attributes must declare where they come from.")
@@ -764,17 +856,39 @@ Procedure.i avkPipeVertexInput(pipe.i, vs.i, *vi.VkPipelineVertexInputStateCreat
   If (*vi\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a VkPipelineVertexInputStateCreateInfo whose sType is wrong (Anvil code -20001, wrong sType).")
   EndIf
-  If (*vi\vertexBindingDescriptionCount & $FFFFFFFF) <> 1 Or *vi\pVertexBindingDescriptions = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given other than exactly one vertex input binding (Anvil code -20005, unsupported vertex input); this slice binds one vertex buffer, so every attribute must come out of binding zero.")
+  nb = *vi\vertexBindingDescriptionCount & $FFFFFFFF
+  If nb < 1 Or nb > #ANVIL_VK_MAX_BINDINGS Or *vi\pVertexBindingDescriptions = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given no vertex input bindings or more than four (Anvil code -20005, unsupported vertex input); this slice reads between one and four vertex buffers, one per binding, because it fetches at most four attributes and refuses a binding no attribute reads.")
   EndIf
-  *bind = *vi\pVertexBindingDescriptions
-  If (*bind\binding & $FFFFFFFF) <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a vertex input binding whose number is not zero (Anvil code -20005, unsupported vertex input); the one binding this slice implements is binding zero.")
-  EndIf
-  If (*bind\inputRate & $FFFFFFFF) <> #VK_VERTEX_INPUT_RATE_VERTEX
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a vertex input binding at VK_VERTEX_INPUT_RATE_INSTANCE (Anvil code -20005, instancing not implemented); vkCmdDraw here takes one instance, so a per-instance attribute would be fetched once and would look like a per-vertex one.")
-  EndIf
-  stride = *bind\stride & $FFFFFFFF
+  bbase = pipe * #ANVIL_VK_MAX_BINDINGS
+  k = 0
+  While k < #ANVIL_VK_MAX_BINDINGS
+    avkPipeBindStride[bbase + k] = 0
+    k = k + 1
+  Wend
+  seenBind = 0
+  k = 0
+  While k < nb
+    *bind = *vi\pVertexBindingDescriptions + (k * SizeOf(VkVertexInputBindingDescription))
+    bidx = *bind\binding & $FFFFFFFF
+    If bidx < 0 Or bidx >= nb
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a vertex input binding whose number is not less than the binding count (Anvil code -20005, unsupported vertex input); the bindings this slice implements are numbered 0 to one less than vertexBindingDescriptionCount, with no gaps, so that vkCmdBindVertexBuffers needs no lookup to find one.")
+    EndIf
+    If (seenBind & (1 << bidx)) <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given two vertex input bindings with the same binding number (Anvil code -20001, duplicate binding); each binding is described exactly once, and a second description of one would silently replace the stride the first declared.")
+    EndIf
+    seenBind = seenBind | (1 << bidx)
+    If (*bind\inputRate & $FFFFFFFF) <> #VK_VERTEX_INPUT_RATE_VERTEX
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a vertex input binding at VK_VERTEX_INPUT_RATE_INSTANCE (Anvil code -20005, instancing not implemented); vkCmdDraw here takes one instance, so a per-instance attribute would be fetched once and would look like a per-vertex one.")
+    EndIf
+    stride = *bind\stride & $FFFFFFFF
+    If stride <= 0 Or (stride % 4) <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex input binding whose stride is zero, negative or not a multiple of four (Anvil code -20001, invalid stride); every component is a four-byte binary32 and the vertex fetcher advances by whole components.")
+    EndIf
+    avkPipeBindStride[bbase + bidx] = stride
+    k = k + 1
+  Wend
+
   n = *vi\vertexAttributeDescriptionCount & $FFFFFFFF
   If n < 1 Or n > #ANVIL_SPV_MAX_ATTRS Or *vi\pVertexAttributeDescriptions = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given no vertex attributes or more than four (Anvil code -20005, unsupported vertex input); this slice fetches between one and four attributes.")
@@ -784,12 +898,15 @@ Procedure.i avkPipeVertexInput(pipe.i, vs.i, *vi.VkPipelineVertexInputStateCreat
   EndIf
   base = pipe * #ANVIL_SPV_MAX_ATTRS
   seen = 0
+  usedBind = 0
   k = 0
   While k < n
     *attr = *vi\pVertexAttributeDescriptions + (k * SizeOf(VkVertexInputAttributeDescription))
-    If (*attr\binding & $FFFFFFFF) <> 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a vertex attribute that reads a binding other than zero (Anvil code -20005, unsupported vertex input); there is one binding here and every attribute comes out of it.")
+    bidx = *attr\binding & $FFFFFFFF
+    If bidx < 0 Or bidx >= nb
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex attribute that reads a binding this pipeline does not describe (Anvil code -20001, interface mismatch); VkVertexInputAttributeDescription.binding must name one of the bindings in pVertexBindingDescriptions, and an attribute pointed at a binding nothing declares has no buffer and no stride to be fetched with.")
     EndIf
+    usedBind = usedBind | (1 << bidx)
     loc = *attr\location & $FFFFFFFF
     If loc < 0 Or loc >= n
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex attribute at a location its vertex shader does not declare (Anvil code -20001, interface mismatch); the locations must be 0 to one less than the attribute count, with no gaps.")
@@ -810,14 +927,27 @@ Procedure.i avkPipeVertexInput(pipe.i, vs.i, *vi.VkPipelineVertexInputStateCreat
     If j < 0 Or (j % 4) <> 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex attribute at an offset that is negative or not a multiple of four (Anvil code -20001, misaligned attribute); every component is a four-byte binary32 and the vertex fetcher reads them aligned.")
     EndIf
-    If (j + (comps * 4)) > stride
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex attribute that runs past the end of one vertex (Anvil code -20001, attribute outside the stride); the binding's stride must cover every attribute's offset plus its size.")
+    If (j + (comps * 4)) > avkPipeBindStride[bbase + bidx]
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex attribute that runs past the end of one vertex of ITS OWN binding (Anvil code -20001, attribute outside the stride); the stride that has to cover an attribute is the stride of the binding that attribute names, which is not the same number once a pipeline has two bindings.")
     EndIf
     avkPipeAttrComp[base + loc] = comps
     avkPipeAttrOffset[base + loc] = j
+    avkPipeAttrBinding[base + loc] = bidx
     k = k + 1
   Wend
-  avkPipeStride[pipe] = stride
+  ; A BINDING NOTHING READS IS REFUSED, not ignored. A buffer bound to it
+  ; would be retained across the submission and fetched from never, and
+  ; the usual cause is an attribute whose `binding` was left at zero after
+  ; the buffer was split in two - which is a mistake worth naming rather
+  ; than a layout worth supporting.
+  k = 0
+  While k < nb
+    If (usedBind & (1 << k)) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex input binding that no attribute reads (Anvil code -20001, unused binding); every binding described must be named by at least one attribute. The usual cause is an attribute left at binding zero after the vertex data was split across two buffers.")
+    EndIf
+    k = k + 1
+  Wend
+  avkPipeBindCount[pipe] = nb
   avkPipeAttrCount[pipe] = n
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -993,6 +1123,26 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_VARYING And avkShOutCount[vs] < 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that interpolates a varying its vertex shader never writes (Anvil code -20001, interface mismatch); the vertex stage must write the Location the fragment stage reads.")
   EndIf
+  ; THE DESCRIPTOR INTERFACE. A fragment shader that reads a uniform
+  ; block named a set and a binding in its own SPIR-V; the pipeline
+  ; layout has to declare a descriptor set layout that actually has a
+  ; uniform buffer there, in the fragment stage. This is the one place
+  ; the module and the layout are both in view, and a mismatch caught
+  ; anywhere later is a draw reading an address nothing wrote.
+  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_UNIFORM
+    If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that reads a uniform block through a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); create a VkDescriptorSetLayout with a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER binding at the fragment stage and name it in VkPipelineLayoutCreateInfo.")
+    EndIf
+    If avkShUniformSet[fs] <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose uniform block is at a descriptor set other than zero (Anvil code -20001, layout mismatch); one set is bound here and its index is zero.")
+    EndIf
+    If AnvilVkSetLayoutHasUniform(avkLaySetLayout[lay], avkShUniformBinding[fs]) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose uniform block names a binding its pipeline layout's descriptor set layout does not declare as a fragment-stage uniform buffer (Anvil code -20001, layout mismatch); the Binding decoration in the SPIR-V and the binding number in VkDescriptorSetLayoutBinding are the same number and they must agree.")
+    EndIf
+  EndIf
+  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkLaySetCount[lay] <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a pipeline layout that declares a descriptor set layout for a fragment shader that reads no uniform block (Anvil code -20001, layout mismatch); a declared set has to be allocated, written and bound before every draw, so one nothing reads is work with no picture at the end of it.")
+  EndIf
 
   s = 1
   While s <= #ANVIL_VK_MAX_PIPELINES And avkPipeLive[s] <> 0 : s = s + 1 : Wend
@@ -1008,6 +1158,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   avkPipeVaryCount[s] = avkShOutCount[vs]
   avkPipeColourSrc[s] = avkShColourSrc[fs]
   avkPipeColourIdx[s] = avkShColourIdx[fs]
+  avkPipeUniformBinding[s] = avkShUniformBinding[fs]
   base = s * #ANVIL_SPV_MAX_VARYINGS
   k = 0
   While k < #ANVIL_SPV_MAX_VARYINGS
@@ -1026,6 +1177,14 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   While k < #ANVIL_SPV_MAX_ATTRS
     avkPipeAttrComp[base + k] = 0
     avkPipeAttrOffset[base + k] = 0
+    avkPipeAttrBinding[base + k] = 0
+    k = k + 1
+  Wend
+  avkPipeBindCount[s] = 0
+  base = s * #ANVIL_VK_MAX_BINDINGS
+  k = 0
+  While k < #ANVIL_VK_MAX_BINDINGS
+    avkPipeBindStride[base + k] = 0
     k = k + 1
   Wend
   rc = avkPipeVertexInput(s, vs, *ci\pVertexInputState)
@@ -1113,9 +1272,25 @@ Procedure.i AnvilVkPipelineAttrOffset(pipe.i, k.i)
   ProcedureReturn avkPipeAttrOffset[(pipe * #ANVIL_SPV_MAX_ATTRS) + k]
 EndProcedure
 
-Procedure.i AnvilVkPipelineStride(pipe.i)
+; Which binding attribute k is fetched from, and that binding's stride.
+; The two together are what an attribute record needs, and they are read
+; per attribute rather than per pipeline because two attributes of one
+; pipeline can now come out of two buffers at two strides.
+Procedure.i AnvilVkPipelineAttrBinding(pipe.i, k.i)
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
-  ProcedureReturn avkPipeStride[pipe]
+  If k < 0 Or k >= #ANVIL_SPV_MAX_ATTRS : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeAttrBinding[(pipe * #ANVIL_SPV_MAX_ATTRS) + k]
+EndProcedure
+
+Procedure.i AnvilVkPipelineBindingCount(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeBindCount[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineBindingStride(pipe.i, b.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  If b < 0 Or b >= #ANVIL_VK_MAX_BINDINGS : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeBindStride[(pipe * #ANVIL_VK_MAX_BINDINGS) + b]
 EndProcedure
 
 Procedure.i AnvilVkPipelinePositionAttr(pipe.i)
@@ -1316,8 +1491,8 @@ Procedure AnvilVkCmdBindVertexBuffer(commandBuffer.i, binding.i, buffer.i, offse
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBindVertexBuffers was called on a command buffer that is not recording (Anvil code -20004, wrong command buffer state); call vkBeginCommandBuffer first.")
     ProcedureReturn
   EndIf
-  If binding <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindVertexBuffers was asked to bind a binding other than zero (Anvil code -20005, unsupported binding); this slice has one vertex input binding and its number is zero.")
+  If binding < 0 Or binding >= #ANVIL_VK_MAX_BINDINGS
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindVertexBuffers was asked to bind a binding number this slice does not have (Anvil code -20005, unsupported binding); the bindings are numbered 0 to 3, and a pipeline's own binding count is checked again at vkCmdDraw.")
     ProcedureReturn
   EndIf
   b = avkBufSlot(buffer)
@@ -1341,8 +1516,55 @@ Procedure AnvilVkCmdBindVertexBuffer(commandBuffer.i, binding.i, buffer.i, offse
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindVertexBuffers was given an offset that is negative, past the end of the buffer or not a multiple of four (Anvil code -20001, invalid bind offset); every attribute component is a four-byte binary32 and the vertex fetcher reads them aligned.")
     ProcedureReturn
   EndIf
-  avkCbVtxBuf[c] = buffer
-  avkCbVtxOffset[c] = offset
+  avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + binding] = buffer
+  avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + binding] = offset
+EndProcedure
+
+; vkCmdBindDescriptorSets. One set, at index zero, through the layout the
+; pipeline was created with, and no dynamic offsets.
+Procedure AnvilVkCmdBindDescriptorSet(commandBuffer.i, bindPoint.i, layout.i, firstSet.i, set.i, dynamicCount.i)
+  Define c.i
+  Define lay.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdBindDescriptorSets was given a VkCommandBuffer handle that is not live (Anvil code -20002, stale or foreign handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBindDescriptorSets was called on a command buffer that is not recording (Anvil code -20004, wrong command buffer state); call vkBeginCommandBuffer first.")
+    ProcedureReturn
+  EndIf
+  If bindPoint <> #VK_PIPELINE_BIND_POINT_GRAPHICS
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindDescriptorSets was given a bind point that is not VK_PIPELINE_BIND_POINT_GRAPHICS (Anvil code -20005, unsupported bind point); there is no compute pipeline in this implementation.")
+    ProcedureReturn
+  EndIf
+  If firstSet <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindDescriptorSets was asked to bind a set at an index other than zero (Anvil code -20005, unsupported set index); a pipeline layout here declares one descriptor set layout and its index is zero.")
+    ProcedureReturn
+  EndIf
+  If dynamicCount <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindDescriptorSets was given dynamic offsets (Anvil code -20005, dynamic descriptors not implemented); the dynamic descriptor types are refused where a set layout is created, so there is nothing here for an offset to apply to.")
+    ProcedureReturn
+  EndIf
+  lay = avkLaySlot(layout)
+  If lay = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdBindDescriptorSets was given a VkPipelineLayout handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
+    ProcedureReturn
+  EndIf
+  If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindDescriptorSets was given a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); a set can only be bound through a layout that says what set zero is.")
+    ProcedureReturn
+  EndIf
+  If AnvilVkDescriptorSetLayoutSlot(set) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdBindDescriptorSets was given a VkDescriptorSet handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
+    ProcedureReturn
+  EndIf
+  If AnvilVkDescriptorSetLayoutSlot(set) <> avkLaySetLayout[lay]
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindDescriptorSets was given a descriptor set that was allocated from a different VkDescriptorSetLayout from the one its pipeline layout declares (Anvil code -20001, incompatible descriptor set); the shader's bindings are checked against the pipeline layout, so a set built to a different shape would be read at offsets nobody agreed to.")
+    ProcedureReturn
+  EndIf
+  avkCbDescSet[c] = set
+  avkCbDescLayout[c] = layout
 EndProcedure
 
 Procedure AnvilVkCmdPushConstants(commandBuffer.i, layout.i, stageFlags.i, offset.i, size.i, *values)
@@ -1387,6 +1609,8 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
   Define c.i
   Define p.i
   Define b.i
+  Define k.i
+  Define stride.i
   Define need.i
   c = avkCmdSlot(commandBuffer)
   If c = 0
@@ -1410,11 +1634,18 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with no graphics pipeline bound (Anvil code -20004, no pipeline bound); call vkCmdBindPipeline before drawing, because the pipeline is what says which shaders run.")
     ProcedureReturn
   EndIf
-  b = avkBufSlot(avkCbVtxBuf[c])
-  If b = 0
-    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with no vertex buffer bound (Anvil code -20004, no vertex buffer bound); call vkCmdBindVertexBuffers before drawing, because this pipeline's vertex shader reads attributes.")
-    ProcedureReturn
-  EndIf
+  ; EVERY binding the pipeline describes must have a buffer bound to it.
+  ; One bound buffer and two bindings is the shape that used to be
+  ; impossible to write and is now easy to: the draw would fetch position
+  ; from a live buffer and colour from address zero.
+  k = 0
+  While k < avkPipeBindCount[p]
+    If avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k]) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a binding this pipeline reads that has no vertex buffer bound to it (Anvil code -20004, no vertex buffer bound); call vkCmdBindVertexBuffers for every binding in the pipeline's vertex input state, not only for binding zero.")
+      ProcedureReturn
+    EndIf
+    k = k + 1
+  Wend
   If avkPipeRp[p] <> avkFbRp[avkCbFb[c]]
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a pipeline created for a different render pass from the one that is begun (Anvil code -20001, incompatible render pass); a pipeline may only be used inside a render pass compatible with the one it was created against.")
     ProcedureReturn
@@ -1431,17 +1662,47 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was given a negative firstVertex (Anvil code -20001, invalid argument); the index of the first vertex is an unsigned count from the start of the bound buffer.")
     ProcedureReturn
   EndIf
-  ; Every vertex the draw names must be inside the bound buffer. Written
-  ; as a difference so that an offset plus a length which wraps cannot
-  ; pass, the same shape the image binder uses.
-  need = (firstVertex + vertexCount) * avkPipeStride[p]
-  If avkPipeStride[p] <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[c]) < need
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw names vertices past the end of the bound vertex buffer (Anvil code -20001, vertex range outside the buffer); firstVertex plus vertexCount, multiplied by the binding's stride, must fit between the bind offset and the end of the VkBuffer. Reading past it would be a GPU fetch from memory this allocation does not own.")
-    ProcedureReturn
-  EndIf
+  ; Every vertex the draw names must be inside EVERY bound buffer, each
+  ; against its own binding's stride. Written as a difference so that an
+  ; offset plus a length which wraps cannot pass, the same shape the image
+  ; binder uses. Checking only binding zero would let a short colour
+  ; buffer be fetched past its end for every vertex after the first few.
+  k = 0
+  While k < avkPipeBindCount[p]
+    b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])
+    stride = avkPipeBindStride[(p * #ANVIL_VK_MAX_BINDINGS) + k]
+    need = (firstVertex + vertexCount) * stride
+    If stride <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]) < need
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw names vertices past the end of one of the bound vertex buffers (Anvil code -20001, vertex range outside the buffer); for every binding, firstVertex plus vertexCount multiplied by THAT binding's stride must fit between its bind offset and the end of its VkBuffer. Reading past it would be a GPU fetch from memory this allocation does not own.")
+      ProcedureReturn
+    EndIf
+    k = k + 1
+  Wend
   If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_PUSH And avkCbPushBytes[c] <> #ANVIL_VK_PUSH_BYTES
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader reads the push-constant block, and no push constants were recorded (Anvil code -20004, push constants not set); call vkCmdPushConstants before the draw, because an unset block would be whatever the memory happened to hold.")
     ProcedureReturn
+  EndIf
+  ; A UNIFORM COLOUR NEEDS A SET BOUND AND THAT SET'S BINDING WRITTEN.
+  ; Three separate ways to arrive with nothing to read, and each is
+  ; named: no set bound at all, a set bound through the wrong layout,
+  ; and a set whose binding vkUpdateDescriptorSets never filled.
+  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM
+    If avkCbDescSet[c] = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader reads a uniform buffer, and no descriptor set was bound (Anvil code -20004, no descriptor set bound); call vkCmdBindDescriptorSets before the draw, because the set is what says which buffer the shader reads.")
+      ProcedureReturn
+    EndIf
+    If avkLaySlot(avkCbDescLayout[c]) <> avkPipeLayout[p]
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a descriptor set bound through a different pipeline layout from the one its pipeline was created with (Anvil code -20001, incompatible layout); the layout is the agreement about what set zero holds, and two different ones are two different agreements.")
+      ProcedureReturn
+    EndIf
+    If AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p]) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a descriptor set whose binding has no buffer written into it, or whose buffer has since been destroyed (Anvil code -20004, descriptor not written); call vkUpdateDescriptorSets for the binding the fragment shader's Binding decoration names.")
+      ProcedureReturn
+    EndIf
+    If AnvilVkDescriptorSetRange(avkCbDescSet[c], avkPipeUniformBinding[p]) < #ANVIL_VK_UNIFORM_BYTES
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a descriptor whose range is shorter than the sixteen-byte block the fragment shader reads (Anvil code -20001, range too short); the block is one four-component colour.")
+      ProcedureReturn
+    EndIf
   EndIf
   avkCbDrawVerts[c] = vertexCount
   avkCbDrawFirst[c] = firstVertex
@@ -1474,31 +1735,77 @@ EndProcedure
 ;  the submission engine must not know what a pipeline is and this file
 ;  must not own the flight.
 
+; The VkBuffer this draw's descriptor names, or 0. One procedure, so the
+; retain and the release cannot ever disagree about which buffer it was.
+Procedure.i avkDrawUniformBuffer(c.i, p.i)
+  If avkPipeColourSrc[p] <> #ANVIL_SPV_COLOUR_UNIFORM : ProcedureReturn 0 : EndIf
+  If avkCbDescSet[c] = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn AnvilVkDescriptorSetBuffer(avkCbDescSet[c], avkPipeUniformBinding[p])
+EndProcedure
+
+; EVERY buffer the draw reads is retained, not just the first. A colour
+; buffer destroyed while the submission is in flight is exactly as fatal
+; as a position buffer destroyed then, and the count that stops that is
+; per buffer.
 Procedure avkDrawRetain(c.i)
   Define b.i
+  Define p.i
+  Define k.i
   If avkCbDrawCount[c] = 0
     ProcedureReturn
   EndIf
-  b = avkBufSlot(avkCbVtxBuf[c])
-  If b = 0
+  p = avkPipeSlot(avkCbPipe[c])
+  If p = 0
     ProcedureReturn
   EndIf
-  avkBufInFlight[b] = avkBufInFlight[b] + 1
-  avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
+  k = 0
+  While k < avkPipeBindCount[p]
+    b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])
+    If b <> 0
+      avkBufInFlight[b] = avkBufInFlight[b] + 1
+      avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
+    EndIf
+    k = k + 1
+  Wend
+  ; The uniform buffer a bound descriptor names is read by this draw too,
+  ; so it is retained the same way - vkDestroyBuffer refuses while the
+  ; count is up, and that is what stops a colour being read out of an
+  ; allocation the application has already freed.
+  b = avkBufSlot(avkDrawUniformBuffer(c, p))
+  If b <> 0
+    avkBufInFlight[b] = avkBufInFlight[b] + 1
+    avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
+  EndIf
 EndProcedure
 
 Procedure avkDrawRelease(c.i)
   Define b.i
+  Define p.i
+  Define k.i
   If avkCbDrawCount[c] = 0
     ProcedureReturn
   EndIf
-  b = avkBufSlot(avkCbVtxBuf[c])
-  If b = 0
+  p = avkPipeSlot(avkCbPipe[c])
+  If p = 0
     ProcedureReturn
   EndIf
-  If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
-  If avkMemInFlight[avkBufMemSlot[b]] > 0
-    avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1
+  k = 0
+  While k < avkPipeBindCount[p]
+    b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])
+    If b <> 0
+      If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
+      If avkMemInFlight[avkBufMemSlot[b]] > 0
+        avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1
+      EndIf
+    EndIf
+    k = k + 1
+  Wend
+  b = avkBufSlot(avkDrawUniformBuffer(c, p))
+  If b <> 0
+    If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
+    If avkMemInFlight[avkBufMemSlot[b]] > 0
+      avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1
+    EndIf
   EndIf
 EndProcedure
 
@@ -1513,12 +1820,19 @@ Procedure.i avkDrawSubmit(c.i)
   Define rc.i
 
   p = avkPipeSlot(avkCbPipe[c])
-  b = avkBufSlot(avkCbVtxBuf[c])
   fb = avkCbFb[c]
-  If p = 0 Or b = 0 Or fb = 0
-    avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose pipeline, vertex buffer or framebuffer has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
+  If p = 0 Or fb = 0
+    avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose pipeline or framebuffer has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
     ProcedureReturn -1
   EndIf
+  k = 0
+  While k < avkPipeBindCount[p]
+    If avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k]) = 0
+      avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer one of whose bound vertex buffers has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
+      ProcedureReturn -1
+    EndIf
+    k = k + 1
+  Wend
   img = avkIvImgSlot[avkFbView[fb]]
   If avkImgLive[img] = 0 Or avkImgBound[img] = 0
     avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose colour attachment has since been destroyed or unbound (Anvil code -20004, stale resource reference); re-record the command buffer against live resources.")
@@ -1540,8 +1854,24 @@ Procedure.i avkDrawSubmit(c.i)
   avkDrawRecord\height = avkImgH[img]
   avkDrawRecord\pitch = avkImgPitch[img]
   avkDrawRecord\clearBgra = avkCbClearWord[c]
-  avkDrawRecord\vertexBase = avkHeapBase + avkMemOffset[avkBufMemSlot[b]] + avkBufMemOffset[b] + avkCbVtxOffset[c]
-  avkDrawRecord\vertexStride = avkPipeStride[p]
+  avkDrawRecord\bindingCount = avkPipeBindCount[p]
+  avkDrawRecord\bindings = @avkBindStage[0]
+  k = 0
+  While k < #ANVIL_VK_MAX_BINDINGS
+    If k < avkPipeBindCount[p]
+      b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])
+      avkBindStage[(k * 2) + 0] = avkHeapBase + avkMemOffset[avkBufMemSlot[b]] + avkBufMemOffset[b] + avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]
+      avkBindStage[(k * 2) + 1] = avkPipeBindStride[(p * #ANVIL_VK_MAX_BINDINGS) + k]
+    Else
+      ; A BINDING THIS PIPELINE DOES NOT HAVE IS ZERO, every time. The
+      ; record's bytes are compared against an independent expectation,
+      ; and a stale address left over from the previous draw would make
+      ; that comparison depend on what ran before it.
+      avkBindStage[(k * 2) + 0] = 0
+      avkBindStage[(k * 2) + 1] = 0
+    EndIf
+    k = k + 1
+  Wend
   avkDrawRecord\vertexCount = avkCbDrawVerts[c]
   avkDrawRecord\firstVertex = avkCbDrawFirst[c]
   If avkCbPushBytes[c] = #ANVIL_VK_PUSH_BYTES
@@ -1550,6 +1880,21 @@ Procedure.i avkDrawSubmit(c.i)
   Else
     avkDrawRecord\pushBase = 0
     avkDrawRecord\pushBytes = 0
+  EndIf
+  ; THE DESCRIPTOR IS RESOLVED HERE, at submit time and not at bind time:
+  ; a VkBuffer can be rebound to different memory between the two, so an
+  ; address captured earlier would be the one number in this record that
+  ; was not current. It is zero unless this pipeline's colour comes from
+  ; a uniform buffer, so a backend cannot read a stale one by accident.
+  avkDrawRecord\uniformBase = 0
+  avkDrawRecord\uniformBytes = 0
+  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM And avkCbDescSet[c] <> 0
+    avkDrawRecord\uniformBase = AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p])
+    avkDrawRecord\uniformBytes = AnvilVkDescriptorSetRange(avkCbDescSet[c], avkPipeUniformBinding[p])
+  EndIf
+  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM And avkDrawRecord\uniformBase = 0
+    avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose descriptor set, or the buffer written into it, has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
+    ProcedureReturn -1
   EndIf
 
   rc = avkBackendDrawSupported(avkDrawRecord\targetBase, avkDrawRecord\targetBytes, avkDrawRecord\width, avkDrawRecord\height, avkDrawRecord\pitch)

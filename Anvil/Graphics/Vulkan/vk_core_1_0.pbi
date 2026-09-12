@@ -59,6 +59,11 @@
 #VK_ERROR_TOO_MANY_OBJECTS = -10
 #VK_ERROR_FORMAT_NOT_SUPPORTED = -11
 #VK_ERROR_FRAGMENTED_POOL = -12
+; Promoted into Vulkan 1.1 from VK_KHR_maintenance1, and it is the code
+; the specification requires when a descriptor pool has no room left -
+; VK_ERROR_OUT_OF_HOST_MEMORY would say the host ran out of memory,
+; which is a different thing and sends a caller somewhere else.
+#VK_ERROR_OUT_OF_POOL_MEMORY = -1000069000
 
 ; VkStructureType values used by the stage-1 lifecycle surface.
 #VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
@@ -759,4 +764,120 @@ Structure VkBufferCreateInfo Align #PB_Structure_AlignC
   sharingMode.l
   queueFamilyIndexCount.l
   *pQueueFamilyIndices
+EndStructure
+
+; ======================================================================
+;  DESCRIPTOR VOCABULARY
+; ======================================================================
+;  Added when the first uniform buffer landed. Every value and every
+;  member below is the pinned registry's own, in the registry's order
+;  and at the registry's width, the same rule the rest of this file
+;  follows.
+;
+;  THE WHOLE VkDescriptorType ENUMERATION IS DECLARED even though one
+;  value is implemented. A refusal that names what it refused needs the
+;  name, and a caller who writes VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+;  should be told that Anvil does not implement it rather than that
+;  "3" is not a descriptor type.
+
+; VkStructureType, the descriptor block.
+#VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO = 32
+#VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO = 33
+#VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO = 34
+#VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET = 35
+#VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET = 36
+
+; VkDescriptorType.
+#VK_DESCRIPTOR_TYPE_SAMPLER = 0
+#VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1
+#VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE = 2
+#VK_DESCRIPTOR_TYPE_STORAGE_IMAGE = 3
+#VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER = 4
+#VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER = 5
+#VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6
+#VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7
+#VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC = 8
+#VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC = 9
+#VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT = 10
+
+; VkDescriptorPoolCreateFlagBits.
+#VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT = $00000001
+
+; VK_WHOLE_SIZE is declared once at the top of this file, as -1: the
+; registry writes it (~0ULL) and a 64-bit field holding that reads back
+; as -1 on this part. It is not redeclared here.
+
+Structure VkDescriptorSetLayoutBinding Align #PB_Structure_AlignC
+  binding.l
+  descriptorType.l
+  descriptorCount.l
+  stageFlags.l
+  *pImmutableSamplers
+EndStructure
+
+Structure VkDescriptorSetLayoutCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  bindingCount.l
+  *pBindings
+EndStructure
+
+Structure VkDescriptorPoolSize Align #PB_Structure_AlignC
+  type.l
+  descriptorCount.l
+EndStructure
+
+Structure VkDescriptorPoolCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  maxSets.l
+  poolSizeCount.l
+  *pPoolSizes
+EndStructure
+
+Structure VkDescriptorSetAllocateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  descriptorPool.i
+  descriptorSetCount.l
+  *pSetLayouts
+EndStructure
+
+Structure VkDescriptorBufferInfo Align #PB_Structure_AlignC
+  buffer.i
+  offset.q
+  range.q
+EndStructure
+
+Structure VkDescriptorImageInfo Align #PB_Structure_AlignC
+  sampler.i
+  imageView.i
+  imageLayout.l
+EndStructure
+
+Structure VkWriteDescriptorSet Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  dstSet.i
+  dstBinding.l
+  dstArrayElement.l
+  descriptorCount.l
+  descriptorType.l
+  *pImageInfo
+  *pBufferInfo
+  *pTexelBufferView
+EndStructure
+
+Structure VkCopyDescriptorSet Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  srcSet.i
+  srcBinding.l
+  srcArrayElement.l
+  dstSet.i
+  dstBinding.l
+  dstArrayElement.l
+  descriptorCount.l
 EndStructure

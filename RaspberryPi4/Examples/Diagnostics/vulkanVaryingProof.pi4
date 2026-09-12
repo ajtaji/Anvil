@@ -142,78 +142,112 @@
 ;  letters backwards. A dump that does not show BOTH did not show the
 ;  whole report, and the verdicts near the end of it were not read.
 ;
-;    0  magic $59524156           64  pass C, outside (100,100)
-;    1  PASS A VERDICT (uniform)  65  pass C, outside (700,1200)
-;    2  PASS B VERDICT (gradient) 66  pass C, outside (400,200)
-;    3  PASS C VERDICT (2 bufs)   67  pass C worst distance
-;    4  detail                    68  pass C probes over tolerance
-;    5  detail 2                  69  probes where C differs from B
-;    6  surface (guard) base      70  refusal: attribute names an
-;    7  Vulkan window base            undescribed binding
-;    8  Vulkan window bytes       71  its sentence
-;    9  image address             72  refusal: a combined image
-;   10  image size                    sampler descriptor
-;   11  image row pitch           73  its sentence
-;   12  interleaved buffer        74  refusal: a uniform draw with no
-;   13  position-only buffer          descriptor set bound
-;   14  colour-only buffer        75  its sentence
-;   15  uniform buffer            76  refusal: a uniform shader on a
-;   16  expected clear word           layout with no set layout
-;   17  expected magenta word     77  its sentence
-;   18  pipeline A code base      78  bin jobs before
-;   19  pipeline B code base      79  bin jobs after
-;   20  pipeline C code base      80  render jobs before
-;   21  screen x0, 1/256 pixel    81  render jobs after
-;   22  screen y0                 82  bin OOM count
-;   23  screen x1                 83  bin error status
-;   24  screen y1                 84  render error status
-;   25  screen x2                 85  MMU fault count
-;   26  screen y2                 86  MMU violation address
-;   27  twice the signed area     87  guard sum before
-;   28  the tolerance (2)         88  guard sum after
-;   29  gradient probe count (7)  89  submit result, pass A
-;   30  expected, probe 0         90  wait result, pass A
-;   31  expected, probe 1         91  submit result, pass B
-;   32  expected, probe 2         92  wait result, pass B
-;   33  expected, probe 3         93  submit result, pass C
-;   34  expected, probe 4         94  wait result, pass C
-;   35  expected, probe 5         95  backend native error
-;   36  expected, probe 6         96  validation fault count
-;   37  pass A, inside (400,500)  97  validation fault text
-;   38  pass A, inside (400,700)  98  PRESENT VERDICT
-;   39  pass A, inside (400,900)  99  DisplayLastError()
-;   40  pass A, outside (100,100) 100  engine arena needed
-;   41  pass A, outside (700,1200)101  backend can draw
-;   42  pass A, outside (400,200) 102  backend name
-;   43  pass B, probe 0           103  image layout after
-;   44  pass B, probe 1           104  microseconds, submit A
-;   45  pass B, probe 2           105  microseconds, submit B
-;   46  pass B, probe 3           106  microseconds, submit C
-;   47  pass B, probe 4           107  draws the backend ran
-;   48  pass B, probe 5           108  last shader record address
-;   49  pass B, probe 6           109  command buffer failure text
-;   50  pass B, outside (100,100) 110  shutdown reached
-;   51  pass B, outside (700,1200)111  emitter step, if it refused
-;   52  pass B, outside (400,200) 112  encoder code, if it refused
-;   53  pass B worst distance     113  descriptor address the draw used
-;   54  pass B probes over tol.   114  descriptor range
-;   55  pass C, probe 0           115  pipeline C binding 0 stride
-;   56  pass C, probe 1           116  pipeline C binding 1 stride
-;   57  pass C, probe 2           117  pipeline C attribute 0 binding
-;   58  pass C, probe 3           118  pipeline C attribute 1 binding
-;   59  pass C, probe 4           119  pipeline C binding count
-;   60  pass C, probe 5           125  HIGHEST STEP REACHED (1..12)
-;   61  pass C, probe 6           126  report length in bytes (512)
-;   62  (spare)                   127  tail magic $56415259
-;   63  (spare)
+;     0  magic $59524156 ("VARY")
+;     1  PASS A VERDICT - the uniform-buffer colour
+;     2  PASS B VERDICT - the gradient out of one buffer
+;     3  PASS C VERDICT - the gradient out of two buffers
+;     4  detail
+;     5  detail 2
+;     6  surface (guard) base
+;     7  Vulkan window base
+;     8  Vulkan window bytes
+;     9  image address
+;    10  image size
+;    11  image row pitch
+;    12  interleaved vertex buffer address
+;    13  position-only buffer address
+;    14  colour-only buffer address
+;    15  uniform buffer address
+;    16  expected clear word, $FF3380B2
+;    17  expected magenta word, $FFFF00FF
+;    18  pipeline A code base (uniform colour)
+;    19  pipeline B code base (gradient, one buffer)
+;    20  pipeline C code base (gradient, two buffers)
+;    21  triangle screen x0, in 1/256 of a pixel
+;    22  triangle screen y0
+;    23  triangle screen x1
+;    24  triangle screen y1
+;    25  triangle screen x2
+;    26  triangle screen y2
+;    27  twice the signed area, low 32 bits
+;    28  the tolerance, 2
+;    29  the gradient probe count, 7
+;   30..36  EXPECTED gradient word, probes 0 to 6
+;   37..39  pass A, inside: (400,500) (400,700) (400,900)
+;   40..42  pass A, outside: (100,100) (700,1200) (400,200)
+;   43..49  pass B, gradient probes 0 to 6
+;   50..52  pass B, the three outside probes
+;    53  pass B worst distance, over all seven probes
+;    54  pass B probes over tolerance
+;   55..61  pass C, gradient probes 0 to 6
+;   62..64  pass C, the three outside probes
+;   65, 66  spare
+;    67  pass C worst distance
+;    68  pass C probes over tolerance
+;    69  probes where pass C differs from pass B - must be 0
+;    70  refusal: an attribute names an undescribed binding
+;    71  its sentence
+;    72  refusal: a combined image sampler descriptor type
+;    73  its sentence
+;    74  refusal: a uniform draw with no descriptor set bound
+;    75  its sentence
+;    76  refusal: a uniform shader on a layout with no set layout
+;    77  its sentence
+;    78  bin jobs before
+;    79  bin jobs after
+;    80  render jobs before
+;    81  render jobs after
+;    82  bin OOM count
+;    83  bin error status
+;    84  render error status
+;    85  MMU fault count
+;    86  MMU violation address
+;    87  guard sum before
+;    88  guard sum after
+;    89  submit result, pass A
+;    90  wait result, pass A
+;    91  submit result, pass B
+;    92  wait result, pass B
+;    93  submit result, pass C
+;    94  wait result, pass C
+;    95  backend native error
+;    96  validation fault count
+;    97  validation fault text
+;    98  PRESENT VERDICT
+;    99  DisplayLastError()
+;   100  engine arena needed
+;   101  backend can draw
+;   102  backend name
+;   103  image layout after
+;   104  microseconds, submit A
+;   105  microseconds, submit B
+;   106  microseconds, submit C
+;   107  draws the backend ran
+;   108  last shader record address
+;   109  command buffer failure text
+;   110  shutdown reached
+;   111  emitter step, if a pipeline was refused
+;   112  encoder code, if a pipeline was refused
+;   113  the descriptor address the draw resolved to
+;   114  the descriptor range
+;   115  pipeline C binding 0 stride, 8
+;   116  pipeline C binding 1 stride, 16
+;   117  pipeline C attribute 0 binding, 0
+;   118  pipeline C attribute 1 binding, 1
+;   119  pipeline C binding count, 2
+;   120..124  spare
+;   125  HIGHEST STEP REACHED, 1 to 12
+;   126  report length in bytes, 512
+;   127  tail magic $56415259
 ;
 ;  THE PROBE PIXELS, in panel coordinates:
 ;    0 (400, 346)  inset from the apex          - red dominant
 ;    1 (213, 946)  inset from the lower left    - green dominant
 ;    2 (587, 946)  inset from the lower right   - blue dominant
 ;    3 (400, 747)  the centroid                 - equal thirds
-;    4 (400, 500)                               5 (300, 800)
-;    6 (500, 800)
+;    4 (400, 500)  high on the median
+;    5 (300, 800)  left of centre, low
+;    6 (500, 800)  right of centre, low
 ;  and three OUTSIDE it, which must still hold the clear colour:
 ;    (100, 100), (700, 1200), (400, 200)
 ;
@@ -1079,8 +1113,14 @@ Procedure.i Main()
   wds\descriptorCount = 1
   wds\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
   wds\pBufferInfo = @dbi
+  ; CLEAR THE FAULT COUNTER FIRST. The refusal exercised a moment ago
+  ; raised it on purpose, and a count that is still standing would make
+  ; this write look like it failed.
+  AnvilVkFaultClear()
   vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
-  If AnvilVkFaultCount() <> 0
+  ; THE CODE, NOT THE COUNT: the count is a running total of every refusal
+  ; this payload has made on purpose, and AnvilVkFaultClear() leaves it.
+  If AnvilVkFaultCode() <> #ANVIL_VK_OK
     vvpPut(#VVP_S_DETAIL, AnvilVkFaultCode())
     NeonShutdown()
     ProcedureReturn vvpStop(#VVP_ERR_DESCRIPTOR)
@@ -1580,6 +1620,9 @@ Procedure.i Main()
   ; gone, and that is worth a red verdict of its own even if all three
   ; pictures were right.
   If vvpGet(#VVP_S_REF_BINDING) = 0 Or vvpGet(#VVP_S_REF_DESCTYPE) = 0 Or vvpGet(#VVP_S_REF_NOSET) = 0 Or vvpGet(#VVP_S_REF_NOLAYOUT) = 0
+    vvpPut(#VVP_S_STATUS_A, #VVP_ERR_REFUSAL_MISSING)
+    vvpPut(#VVP_S_STATUS_B, #VVP_ERR_REFUSAL_MISSING)
+    vvpPut(#VVP_S_STATUS_C, #VVP_ERR_REFUSAL_MISSING)
     ProcedureReturn vvpStop(#VVP_ERR_REFUSAL_MISSING)
   EndIf
   If vvpGet(#VVP_S_LAYOUT_AFTER) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL

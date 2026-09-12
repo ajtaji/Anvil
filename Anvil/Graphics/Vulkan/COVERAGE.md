@@ -25,6 +25,8 @@ currently amounts to and where the files are.
 | `vk_api.pbi` | The public `vk*` entry points and their validation. |
 | `vk_backend_none.pbi` | The absent backend: no device is enumerated. UNO Q and any Pi build without V3D link this. |
 | `vk_backend_test.pbi` | The explicit test backend: state and a call log, **no GPU and no pixels ever written**. |
+| `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for one descriptor type, and what a bound set resolves to at submit time. |
+| `vk_interp_expect.pbi` | What an interpolated varying must be at a named pixel, in exact integers. Target neutral, no floating point, and no hardware. |
 | `vk_v3d_backend.pi4` | The real Pi 4 backend: one validated clear lowered to the V3D bin and render control lists through Neon. |
 
 Exactly one backend file is linked per program. There is no run-time
@@ -77,13 +79,45 @@ image views, framebuffers, graphics pipelines and the render-pass recording
 commands. `docs/VULKAN_COMPATIBILITY_STATUS.md` has the entry-point table, the
 fixed-function state a pipeline may declare and the gate results.
 
-**None of it has run on silicon.** The desk gates prove the subset, the
-refusals, the plan and the record bytes; board run 4 is requested and not taken,
-and until it is, no claim about a drawn triangle belongs anywhere.
+**Board run 5, 2026-09-11, PASSED**: both triangles rendered, every pixel probe
+exact, and the picture was presented. That is one uniform-colour triangle and
+one triangle whose three vertices carried the SAME colour through the varying
+path - a proof of the path and not of interpolation.
 
 It is an EMITTER and not a compiler: no target-neutral IR, no register
 allocator, no scheduler, no instruction selection, and no arithmetic in an
 accepted shader. The refusals are what keeps that honest.
+
+## 2026-09-11, the same evening: varyings, a second binding, descriptors
+
+Three things followed the triangle, each with its own desk gate and its own
+question on the board:
+
+| File | What it owns |
+|---|---|
+| `vk_interp_expect.pbi` | What an interpolated varying MUST be at a named pixel: the clip-to-screen transform, the pixel-centre sample point, the three edge functions, the weighted average and the 8-bit UNORM rounding, all in exact integers with no floating point. `tools/vulkan_interp_check.py` runs it against a second implementation of the same rule written in Python. |
+| `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for one descriptor type - `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` - with every other type refused by its own name, and the resolution of a bound set into one address and one length at submit time. |
+
+`vk_pipeline.pbi` gained one to four vertex input bindings, each with its own
+stride, and refuses a binding no attribute reads. `vk_v3d_shader.pi4` builds
+each attribute record against the address and stride of the binding ITS
+attribute names, which is what the hardware always wanted: an attribute record
+carries an address and a stride of its own.
+
+> **THE GPU DOES NOT DEREFERENCE A DESCRIPTOR.** A uniform-buffer descriptor
+> resolves to an address and a length, and the PROCESSOR reads its sixteen
+> bytes into the fragment uniform stream, so the emitted fragment program for a
+> descriptor colour is byte for byte the push-constant one. It is
+> observationally equivalent for every program this slice accepts - the buffer
+> is host-visible, nothing here lets the GPU write a buffer, one submission is
+> in flight at a time, and updates are refused while one is - and it is NOT
+> what a conformant implementation does. The TMU general load that would make
+> it so has never been performed anywhere in this tree. The full argument is in
+> `vk_v3d_shader.pi4`'s header, beside the code it describes.
+
+**None of the three has run on silicon.** The board proof is
+`RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` and it is requested
+and not taken.
 
 ## Next real backend layers
 

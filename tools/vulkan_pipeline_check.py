@@ -43,6 +43,7 @@ PIPELINE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_pipeline.pbi"
 # longer compiles is discovered on the bench otherwise, which is the most
 # expensive place to discover it.
 DIAGNOSTIC = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanTriangleProof.pi4"
+DIAGNOSTIC2 = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanVaryingProof.pi4"
 
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -76,7 +77,17 @@ TLB_CONF = 0xFFFFFFFF
 
 W = H = 64
 STRIDE1, STRIDE2 = 24, 8
+# The split layout: position in one buffer, colour in another, at two
+# different strides. These are the gate's #PG_STRIDE_POS and
+# #PG_STRIDE_COL and they are written here so the two sides of the
+# comparison do not share a constant.
+STRIDE_POS, STRIDE_COL = 8, 16
 PUSH = (0x3F800000, 0x3F000000, 0x00000000, 0x3F800000)   # r, g, b, a
+# The four words in the uniform buffer a descriptor points at. They are
+# the gate's #PG_UNIFORM_* and they are written again here so the two
+# sides of the comparison do not share a constant - and none of them is
+# any of PUSH's, so the two streams cannot be confused for each other.
+UNIFORM = (0x3E800000, 0x3F400000, 0x3F800000, 0x3E000000)
 
 ERR_UNSUPPORTED = -20005
 ERR_ARGS = -20001
@@ -99,9 +110,21 @@ def out_seg(slots: int, vary: int) -> int:
     return min(n, 15)
 
 
-def expected_shader_record(base: int, vertex_base: int, stride: int,
-                           max_index: int, vary: int, records: int) -> bytes:
+def interleaved(vertex_base: int, stride: int, records: int):
+    """The attribute records of a pipeline whose attributes all come out
+    of ONE binding: one record per component, four bytes apart, at one
+    stride."""
+    return [(vertex_base + n * 4, stride) for n in range(records)]
+
+
+def expected_shader_record(base: int, records, max_index: int,
+                           vary: int) -> bytes:
     """The 36-byte record and its attribute records, packed here.
+
+    `records` is one (address, stride) pair per attribute record, which
+    is what the hardware carries: a pipeline reading position from one
+    buffer and colour from another has records with two different bases
+    AND two different strides, and nothing about that is a special case.
 
     The field positions are v3d.pi4's documented ones: flags at 0, the
     VPM configuration at 4, the default-values address at 8, and two
@@ -146,10 +169,9 @@ def expected_shader_record(base: int, vertex_base: int, stride: int,
     out = struct.pack("<9I", *words)
     assert len(out) == SHREC_BYTES
 
-    # One attribute record per component: same base array, one four-byte
-    # step per record, every record read by both phases.
-    for n in range(records):
-        addr = vertex_base + n * 4
+    # One attribute record per component, every record read by both
+    # phases, each with the address and stride its own binding gives it.
+    for addr, stride in records:
         out += struct.pack("<I", addr)
         out += bytes([1 | (ATTR_FLOAT << 2)])     # vec size 1, type float
         out += bytes([(1 & 0xF) | ((1 & 0xF) << 4)])  # read by cs and vs
@@ -233,7 +255,13 @@ def build(compiler: pathlib.Path) -> pathlib.Path:
 
 def modules() -> list[bytes]:
     return [spv.vertex_passthrough(), spv.fragment_varying(),
-            spv.vertex_position_only(), spv.fragment_push()]
+            spv.vertex_position_only(), spv.fragment_push(),
+            spv.fragment_uniform(),
+            # The same uniform fragment shader at BINDING ONE. The gate
+            # offers it against a set layout that has binding zero only,
+            # which is the one way a shader and a layout can disagree
+            # that no other rule in the path can see.
+            spv.fragment_uniform(binding=1)]
 
 
 def execute(a64, image: pathlib.Path):
@@ -354,7 +382,7 @@ def grade(cpu, rc) -> Grader:
     # --- the public path reached the backend with the right numbers ---
     vertex_base = slot(6)
     g.need("one draw reached the backend", slot(21), 1)
-    g.need("two pipelines were compiled by the backend", slot(22), 2)
+    g.need("four pipelines were compiled by the backend", slot(22), 4)
     g.need("the draw named the bound vertex buffer", slot(23), vertex_base)
     g.need("the draw carried the binding's stride", slot(24), STRIDE1)
     g.need("the draw carried its vertex count", slot(25), 3)
@@ -409,7 +437,7 @@ def grade(cpu, rc) -> Grader:
     g.need("[A] the shader record offset", slot(19), OFF_SHREC)
     g.need_bytes("[A] the GL shader state record and its attribute records",
                  blob(cpu, baseA + OFF_SHREC, SHREC_BYTES + 6 * ATTR_BYTES),
-                 expected_shader_record(baseA, vertex_base, STRIDE1, 2, 4, 6))
+                 expected_shader_record(baseA, interleaved(vertex_base, STRIDE1, 6), 2, 4))
     g.need_bytes("[A] the coordinate shader's uniform stream",
                  blob(cpu, baseA + OFF_UNIF_CS, (10 + 4) * 4),
                  expected_vertex_uniforms(10, (W // 2) * 256, (H // 2) * 256))
@@ -431,7 +459,7 @@ def grade(cpu, rc) -> Grader:
     g.need("[B] the colour comes from the push-constant block", slot(34), 1)
     g.need_bytes("[B] the GL shader state record and its attribute records",
                  blob(cpu, baseB + OFF_SHREC, SHREC_BYTES + 2 * ATTR_BYTES),
-                 expected_shader_record(baseB, vertex_base, STRIDE2, 2, 0, 2))
+                 expected_shader_record(baseB, interleaved(vertex_base, STRIDE2, 2), 2, 0))
     g.need_bytes("[B] the coordinate shader's uniform stream",
                  blob(cpu, baseB + OFF_UNIF_CS, (6 + 4) * 4),
                  expected_vertex_uniforms(6, (W // 2) * 256, (H // 2) * 256))
@@ -524,6 +552,181 @@ def grade(cpu, rc) -> Grader:
            nops(baseA + OFF_CS_CODE, csA), nops(baseA + OFF_VS_CODE, vsA))
     g.need("and the same is true of the second pipeline",
            nops(baseB + OFF_CS_CODE, csB), nops(baseB + OFF_VS_CODE, vsB))
+
+    # ------------------------------------------------------------------
+    #  PIPELINE C: the same two attributes out of TWO bindings.
+    # ------------------------------------------------------------------
+    pos_base, col_base = slot(74), slot(75)
+    g.want_true("the position and colour buffers are different allocations",
+                pos_base != col_base and pos_base != 0 and col_base != 0,
+                f"{pos_base:#x} / {col_base:#x}")
+
+    g.need("[C] the pipeline describes two bindings", slot(84), 2)
+    g.need("[C] binding 0 carries the position stride", slot(85), STRIDE_POS)
+    g.need("[C] binding 1 carries the colour stride", slot(86), STRIDE_COL)
+    g.need("[C] the position attribute reads binding 0", slot(87), 0)
+    g.need("[C] the colour attribute reads binding 1", slot(88), 1)
+    g.need("[C] the position attribute is at offset zero of its vertex", slot(89), 0)
+    g.need("[C] the colour attribute is at offset zero of ITS vertex", slot(90), 0)
+    g.need("[C] attributes", slot(91), 2)
+    g.need("[C] the colour comes from a varying", slot(92), 0)
+    g.need("[C] attribute records, one per component", slot(94), 6)
+    g.need("[C] varying components", slot(95), 4)
+
+    # THE RECORD IS THE WHOLE ARGUMENT for this step. Two of its six
+    # attribute records must carry the position buffer's address and
+    # stride and four must carry the colour buffer's, and this checker
+    # packs both from the two addresses it read out of the gate.
+    baseC = slot(93)
+    two_binding_records = ([(pos_base + n * 4, STRIDE_POS) for n in range(2)]
+                           + [(col_base + n * 4, STRIDE_COL) for n in range(4)])
+    g.need_bytes("[C] the GL shader state record, with two attribute bases "
+                 "and two strides",
+                 blob(cpu, baseC + OFF_SHREC, SHREC_BYTES + 6 * ATTR_BYTES),
+                 expected_shader_record(baseC, two_binding_records, 2, 4))
+    # Pipeline A reads the same two attributes out of one binding, so its
+    # programs and uniform streams must be byte for byte the same: the
+    # split is a change to where the data IS and not to what runs.
+    g.need_bytes("[C] the coordinate shader's uniform stream is pipeline A's",
+                 blob(cpu, baseC + OFF_UNIF_CS, (10 + 4) * 4),
+                 blob(cpu, baseA + OFF_UNIF_CS, (10 + 4) * 4))
+    g.need("[C] the coordinate program is the same length as pipeline A's",
+           slot(96), csA)
+    g.need("[C] the vertex program is the same length as pipeline A's",
+           slot(97), vsA)
+    g.need("[C] the fragment program is the same length as pipeline A's",
+           slot(98), fsA)
+    g.need_bytes("[C] the three emitted programs are pipeline A's, byte for byte",
+                 blob(cpu, baseC + OFF_CS_CODE, csA) + blob(cpu, baseC + OFF_VS_CODE, vsA)
+                 + blob(cpu, baseC + OFF_FS_CODE, fsA),
+                 blob(cpu, baseA + OFF_CS_CODE, csA) + blob(cpu, baseA + OFF_VS_CODE, vsA)
+                 + blob(cpu, baseA + OFF_FS_CODE, fsA))
+
+    # --- the refusals the split makes possible ---
+    g.need("an attribute naming a binding the pipeline does not describe "
+           "is refused", slot(76), ERR_ARGS)
+    bind_text = cstr(cpu, u64(cpu, base + 77 * 8))
+    g.want_true("that refusal names the binding as the thing at fault",
+                "binding" in bind_text and "pVertexBindingDescriptions" in bind_text,
+                repr(bind_text[:140]))
+    g.need("a binding no attribute reads is refused", slot(78), ERR_ARGS)
+    unused_text = cstr(cpu, u64(cpu, base + 79 * 8))
+    g.want_true("that refusal says the binding is unused",
+                "unused binding" in unused_text, repr(unused_text[:140]))
+    g.need("two bindings with the same number are refused", slot(80), ERR_ARGS)
+    g.need("a binding stride that is not a whole number of components is "
+           "refused", slot(81), ERR_ARGS)
+    g.need("an attribute past the end of ITS OWN binding's stride is refused",
+           slot(82), ERR_ARGS)
+    stride_text = cstr(cpu, u64(cpu, base + 83 * 8))
+    g.want_true("that refusal says WHICH stride had to cover it",
+                "ITS OWN binding" in stride_text, repr(stride_text[:140]))
+
+    # --- the draw, over two buffers ---
+    g.need("a draw with only binding zero bound is refused", slot(99), ERR_STATE)
+    nobuf_text = cstr(cpu, u64(cpu, base + 100 * 8))
+    g.want_true("that refusal says every binding needs a buffer",
+                "every binding" in nobuf_text, repr(nobuf_text[:140]))
+    g.need("a draw that fits binding zero and overruns binding one is refused",
+           slot(101), ERR_ARGS)
+    g.need("the two-binding draw records cleanly", slot(102), 0)
+    g.need("the two-binding draw submits", slot(103), 0)
+    g.need("its fence signals", slot(104), 0)
+    g.need("the draw reached the backend carrying two bindings", slot(105), 2)
+    g.need("binding 0 carried the position buffer", slot(106), pos_base)
+    g.need("binding 1 carried the colour buffer", slot(107), col_base)
+    g.need("binding 0 carried the position stride", slot(108), STRIDE_POS)
+    g.need("binding 1 carried the colour stride", slot(109), STRIDE_COL)
+    g.need("a binding this pipeline does not have carries no address",
+           slot(110), 0)
+    g.need("and no stride", slot(111), 0)
+    g.need("two draws have now reached the backend", slot(112), 2)
+    g.need("NOT ONE PIXEL was written by the two-binding draw either",
+           slot(113), 0)
+
+    # ------------------------------------------------------------------
+    #  PIPELINE D: the fragment colour comes out of a uniform buffer.
+    # ------------------------------------------------------------------
+    g.need("[D] the descriptor set layout was created", slot(115), 0)
+    g.need("[D] the descriptor pool was created", slot(116), 0)
+    g.need("[D] one descriptor set was allocated", slot(117), 0)
+    g.need("[D] the write raised no fault", slot(118), 0)
+    g.need("[D] a descriptor copy is refused", slot(70), ERR_UNSUPPORTED)
+    uniform_base = slot(69)
+    g.want_true("[D] the uniform buffer has an address", uniform_base != 0,
+                hex(uniform_base))
+    g.need("[D] the descriptor resolves to the buffer's own address",
+           slot(119), uniform_base)
+    g.need("[D] the descriptor's range", slot(120), 16)
+    g.need("[D] the colour comes from a uniform buffer", slot(66), 3)
+    g.need("[D] attributes", slot(73), 1)
+
+    # THE STREAM IS THE PROOF. A descriptor colour reaches the QPU
+    # through the fragment uniform stream in the render target's byte
+    # order, exactly as a push constant does - and the four words are
+    # the ones in the uniform BUFFER, which are not the push block's.
+    baseD = slot(127)
+    g.want_true("[D] the pipeline was compiled by the emitter", baseD != 0,
+                hex(baseD))
+    g.need_bytes("[D] the fragment uniform stream is the uniform buffer's "
+                 "blue, green, red, alpha and then the tile configuration word",
+                 blob(cpu, baseD + OFF_UNIF_FS, 20),
+                 struct.pack("<5I", UNIFORM[2], UNIFORM[1], UNIFORM[0],
+                             UNIFORM[3], TLB_CONF))
+    g.need("the draw carried the descriptor's address to the backend",
+           slot(121), uniform_base)
+    g.need("and its range", slot(122), 16)
+    g.need("three draws have now reached the backend", slot(68), 3)
+
+    # --- the refusals the descriptor path makes possible ---
+    g.need("a combined image sampler descriptor is refused",
+           slot(123), ERR_UNSUPPORTED)
+    sampler_text = cstr(cpu, u64(cpu, base + 71 * 8))
+    g.want_true("that refusal names the descriptor types it refused",
+                "COMBINED_IMAGE_SAMPLER" in sampler_text, repr(sampler_text[:140]))
+    g.need("a uniform-reading shader on a layout with no set layout is "
+           "refused", slot(124), ERR_ARGS)
+    g.need("a draw with no descriptor set bound is refused",
+           slot(125), ERR_STATE)
+    noset_text = cstr(cpu, u64(cpu, base + 72 * 8))
+    g.want_true("that refusal says to bind a set",
+                "vkCmdBindDescriptorSets" in noset_text, repr(noset_text[:140]))
+    g.need("a set bound through a layout the pipeline was not created with "
+           "is refused", slot(126), ERR_ARGS)
+    g.need("the descriptor draw records cleanly", slot(114), 0)
+
+    # --- the rules the mutants found nothing checking ---
+    g.need("a set layout binding at a stage that cannot read it is refused",
+           slot(128), ERR_UNSUPPORTED)
+    g.need("a second set layout of a different shape was created", slot(137), 0)
+    g.need("a pipeline layout for it was created", slot(138), 0)
+    g.need("a write naming a buffer without the uniform usage is refused",
+           slot(129), ERR_ARGS)
+    g.need("a uniform offset that is not a multiple of sixteen is refused",
+           slot(130), ERR_ARGS)
+    g.need("a range shorter than the sixteen-byte block is refused",
+           slot(131), ERR_ARGS)
+    g.need("a write at a binding the set layout has not got is refused",
+           slot(132), ERR_ARGS)
+    g.need("and the write that is right still succeeds after all of them",
+           slot(136), 0)
+    g.need("a layout that declares a set layout no shader reads is refused",
+           slot(133), ERR_ARGS)
+    g.need("a shader at a binding its set layout does not declare is refused",
+           slot(134), ERR_ARGS)
+    nolayout_text = cstr(cpu, u64(cpu, base + 135 * 8))
+    g.want_true("the no-set-layout refusal says the layout declares none",
+                "declares no descriptor set layout" in nolayout_text,
+                repr(nolayout_text[:140]))
+    g.need("a set bound through a layout declaring a set of a different shape "
+           "is refused", slot(139), ERR_ARGS)
+
+    # The fifth hand-assembled module, compared word for word.
+    g.need("the uniform-buffer fragment module is the length this checker "
+           "assembles", slot(65), len(spv.fragment_uniform()))
+    g.need_bytes("the uniform-buffer fragment module, word for word",
+                 blob(cpu, slot(64), min(slot(65), len(spv.fragment_uniform()))),
+                 spv.fragment_uniform())
     return g
 
 
@@ -537,12 +740,15 @@ MUTANTS = (
     ("the fragment program is declared single segment",
      "  singleSegFs = 0\n",
      "  singleSegFs = 1\n"),
+    ("every attribute record is built against the first binding's buffer",
+     "    *bind = *d\\bindings + (bidx * SizeOf(AnvilVkBackendBinding))\n",
+     "    *bind = *d\\bindings\n"),
     ("the attribute records all point at the same component",
-     "      V3dAttrRecord(n, vertexBase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)\n",
-     "      V3dAttrRecord(n, vertexBase + AnvilVkPipelineAttrOffset(pipe, a), stride, maxIndex, 1, 1)\n"),
+     "      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)\n",
+     "      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a), stride, maxIndex, 1, 1)\n"),
     ("an attribute record is no longer read by the coordinate shader",
-     "      V3dAttrRecord(n, vertexBase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)\n",
-     "      V3dAttrRecord(n, vertexBase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 0, 1)\n"),
+     "      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)\n",
+     "      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 0, 1)\n"),
     ("the VPM output segment loses its extra sector for varyings",
      "  If varyComps > 0 : n = n + 1 : EndIf\n",
      "  If varyComps > 99 : n = n + 1 : EndIf\n"),
@@ -567,6 +773,7 @@ MUTANTS = (
 )
 
 COMMAND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_command.pbi"
+DESCRIPTOR = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_descriptor.pbi"
 
 COMMAND_MUTANTS = (
     ("a command buffer may end inside a render pass",
@@ -579,8 +786,62 @@ COMMAND_MUTANTS = (
 
 PIPELINE_MUTANTS = (
     ("a draw may name vertices past the end of its buffer",
-     "  If avkPipeStride[p] <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[c]) < need\n",
-     "  If avkPipeStride[p] <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[c]) < 0\n"),
+     "    If stride <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]) < need\n",
+     "    If stride <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]) < 0\n"),
+    # --- the second binding ---
+    ("every attribute is recorded as reading binding zero",
+     "    avkPipeAttrBinding[base + loc] = bidx\n",
+     "    avkPipeAttrBinding[base + loc] = 0\n"),
+    ("an attribute is measured against binding zero's stride rather than "
+     "against its own",
+     "    If (j + (comps * 4)) > avkPipeBindStride[bbase + bidx]\n",
+     "    If (j + (comps * 4)) > avkPipeBindStride[bbase + 0]\n"),
+    ("a binding no attribute reads is accepted",
+     "    If (usedBind & (1 << k)) = 0\n",
+     "    If (usedBind & (1 << k)) = 99\n"),
+    ("two bindings may carry the same binding number",
+     "    If (seenBind & (1 << bidx)) <> 0\n",
+     "    If (seenBind & (1 << bidx)) = 99\n"),
+    ("a binding number outside the pipeline's own count is accepted",
+     "    If bidx < 0 Or bidx >= nb\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED,",
+     "    If bidx < 0 Or bidx >= 99\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED,"),
+    ("an attribute may name a binding the pipeline does not describe",
+     "    If bidx < 0 Or bidx >= nb\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS,",
+     "    If bidx < 0 Or bidx >= 99\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS,"),
+    ("a draw needs a buffer on binding zero only",
+     "  While k < avkPipeBindCount[p]\n    If avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k]) = 0\n      avkCbFail(",
+     "  While k < 1\n    If avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k]) = 0\n      avkCbFail("),
+    ("the range check is made against binding zero's stride for every binding",
+     "    stride = avkPipeBindStride[(p * #ANVIL_VK_MAX_BINDINGS) + k]\n",
+     "    stride = avkPipeBindStride[(p * #ANVIL_VK_MAX_BINDINGS) + 0]\n"),
+    ("every binding in the draw record is filled from binding zero's buffer",
+     "      b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])\n      avkBindStage[(k * 2) + 0] =",
+     "      b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + 0])\n      avkBindStage[(k * 2) + 0] ="),
+    ("a binding the pipeline does not have keeps the last draw's address",
+     "      avkBindStage[(k * 2) + 0] = 0\n      avkBindStage[(k * 2) + 1] = 0\n",
+     "      avkBindStage[(k * 2) + 0] = avkBindStage[(k * 2) + 0]\n      avkBindStage[(k * 2) + 1] = avkBindStage[(k * 2) + 1]\n"),
+    # --- the descriptor ---
+    ("a uniform-reading shader is accepted on a layout with no set layout",
+     "    If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0\n",
+     "    If avkLaySetCount[lay] < 0 Or avkLaySetLayout[lay] < 0\n"),
+    ("the shader's binding need not be one the set layout declares",
+     "    If AnvilVkSetLayoutHasUniform(avkLaySetLayout[lay], avkShUniformBinding[fs]) = 0\n",
+     "    If AnvilVkSetLayoutHasUniform(avkLaySetLayout[lay], avkShUniformBinding[fs]) = 99\n"),
+    ("a draw may read a uniform buffer with no descriptor set bound",
+     "    If avkCbDescSet[c] = 0\n      avkCbFail(c, #ANVIL_VK_ERR_STATE,",
+     "    If avkCbDescSet[c] = -1\n      avkCbFail(c, #ANVIL_VK_ERR_STATE,"),
+    ("a bound set need not have been allocated from the layout's own shape",
+     "  If AnvilVkDescriptorSetLayoutSlot(set) <> avkLaySetLayout[lay]\n",
+     "  If AnvilVkDescriptorSetLayoutSlot(set) < 0\n"),
+    ("a set may be bound through a layout the pipeline was not built with",
+     "    If avkLaySlot(avkCbDescLayout[c]) <> avkPipeLayout[p]\n",
+     "    If avkLaySlot(avkCbDescLayout[c]) < 0\n"),
+    ("the draw record takes no descriptor address at all",
+     "    avkDrawRecord\\uniformBase = AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p])\n",
+     "    avkDrawRecord\\uniformBase = AnvilVkDescriptorSetAddress(avkCbDescSet[c], 0) + 4\n"),
+    ("a pipeline layout may declare a set layout no shader reads",
+     "  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkLaySetCount[lay] <> 0\n",
+     "  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkLaySetCount[lay] < 0\n"),
     ("a draw of more than one instance is accepted",
      "  If instanceCount <> 1 Or firstInstance <> 0\n",
      "  If instanceCount < 0 Or firstInstance <> 0\n"),
@@ -608,6 +869,31 @@ PIPELINE_MUTANTS = (
 )
 
 
+DESCRIPTOR_MUTANTS = (
+    ("a descriptor type other than a uniform buffer is accepted in a layout",
+     "    If (*bind\\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER\n",
+     "    If (*bind\\descriptorType & $FFFFFFFF) < 0\n"),
+    ("a set layout may declare a binding for a stage that cannot read it",
+     "    If (*bind\\stageFlags & $FFFFFFFF) <> #VK_SHADER_STAGE_FRAGMENT_BIT\n",
+     "    If (*bind\\stageFlags & $FFFFFFFF) < 0\n"),
+    ("a write may name a buffer without the uniform usage",
+     "  If avkDescBufferUniform(buf) = 0\n",
+     "  If avkDescBufferUniform(buf) = 99\n"),
+    ("a uniform buffer may sit at any offset",
+     "  If off < 0 Or off >= size Or (off % #ANVIL_VK_UNIFORM_ALIGN) <> 0\n",
+     "  If off < 0 Or off >= size Or (off % #ANVIL_VK_UNIFORM_ALIGN) < 0\n"),
+    ("a descriptor range shorter than the block is accepted",
+     "  If range < #ANVIL_VK_UNIFORM_BYTES Or (off + range) > size\n",
+     "  If range < 0 Or (off + range) > size\n"),
+    ("a descriptor copy is accepted",
+     "  If copyCount <> 0 Or *pCopies <> 0\n",
+     "  If copyCount < 0 Or *pCopies = -1\n"),
+    ("a write may name a binding the set layout does not declare",
+     "  If b < 0 Or b >= avkDslCount[lay] Or avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + b] <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER\n",
+     "  If b < 0 Or b >= 99\n"),
+)
+
+
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
     return grade(cpu, rc), steps
@@ -627,6 +913,8 @@ def main() -> int:
     # The board diagnostic must at least build, at its own load address.
     compile_one(compiler, DIAGNOSTIC, "anvil_vulkanTriangleProof.img",
                 0x500000, 0x4F00000)
+    compile_one(compiler, DIAGNOSTIC2, "anvil_vulkanVaryingProof.img",
+                0x500000, 0x4F00000)
     g, steps = run(a64, compiler)
     if g.failures:
         print(f"vulkan_pipeline_check: FAIL ({g.checks} checks, {steps:,} instructions)")
@@ -636,14 +924,23 @@ def main() -> int:
 
     print(f"vulkan_pipeline_check: PASS - {g.checks} property checks over "
           f"{steps:,} executed A64 instructions")
-    print("  the whole public path runs: two shader modules, two pipeline layouts, a render")
-    print("  pass, a framebuffer, a vertex buffer, two graphics pipelines, one render pass")
-    print("  holding one draw, a submission and a fence")
-    print("  both pipelines were compiled by the REAL V3D QPU emitter, and every byte of")
-    print("  their shader records, attribute records, uniform streams and default attribute")
-    print("  values matches a record this checker packed itself from the documented layout")
+    print("  the whole public path runs: six shader modules, four pipeline layouts, a")
+    print("  render pass, a framebuffer, four buffers, two descriptor set layouts, a pool")
+    print("  and a set, four graphics pipelines, three render passes each holding one draw,")
+    print("  three submissions and a fence")
+    print("  all four pipelines were compiled by the REAL V3D QPU emitter, and every byte")
+    print("  of their shader records, attribute records, uniform streams and default")
+    print("  attribute values matches a record this checker packed from the documented layout")
+    print("  the third pipeline reads POSITION FROM ONE BUFFER AND COLOUR FROM ANOTHER, at")
+    print("  two different strides: two of its six attribute records carry one base and")
+    print("  stride and four carry the other, and its three emitted programs are byte for")
+    print("  byte the one-buffer pipeline's - the split moves where the data is, not what runs")
+    print("  the fourth takes its colour from a UNIFORM BUFFER through a descriptor set, and")
+    print("  the four words in that buffer reach the fragment uniform stream in the render")
+    print("  target's own byte order")
     print("  NOT ONE PIXEL of the render target was written and NOT ONE MMIO access was made")
-    print("  RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4 builds at $500000")
+    print("  RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4 and")
+    print("  RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4 both build at $500000")
     print("  (not executed: it needs the GPU, and that is a board slot)")
 
     if not args.mutate:
@@ -653,7 +950,8 @@ def main() -> int:
     print()
     missed = 0
     for path, mutants in ((EMITTER, MUTANTS), (PIPELINE, PIPELINE_MUTANTS),
-                          (COMMAND, COMMAND_MUTANTS)):
+                          (COMMAND, COMMAND_MUTANTS),
+                          (DESCRIPTOR, DESCRIPTOR_MUTANTS)):
         original = path.read_text(encoding="utf-8")
         for name, fixed, broken in mutants:
             if original.count(fixed) != 1:
@@ -675,7 +973,8 @@ def main() -> int:
                 print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
                 missed += 1
 
-    total = len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
+    total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
+             + len(DESCRIPTOR_MUTANTS))
     print()
     if missed:
         print(f"vulkan_pipeline_check: {missed} of {total} mutations were not caught")

@@ -68,6 +68,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TYPE_IMAGE_VIEW = 14
 #ANVIL_VK_TYPE_FRAMEBUFFER = 15
 #ANVIL_VK_TYPE_PIPELINE = 16
+#ANVIL_VK_TYPE_DESCRIPTOR_SET_LAYOUT = 17
+#ANVIL_VK_TYPE_DESCRIPTOR_POOL = 18
+#ANVIL_VK_TYPE_DESCRIPTOR_SET = 19
 
 #ANVIL_VK_CB_INITIAL = 0
 #ANVIL_VK_CB_RECORDING = 1
@@ -81,6 +84,38 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_QUEUES = 4
 #ANVIL_VK_MAX_COMMAND_POOLS = 16
 #ANVIL_VK_MAX_COMMAND_BUFFERS = 32
+
+; HOW MANY VERTEX INPUT BINDINGS one pipeline may describe, and therefore
+; how many vertex buffers one draw may read. It lives here rather than in
+; vk_pipeline.pbi because the command layer sizes its per-binding bind
+; state by it and must not include the pipeline layer to learn it.
+;
+; FOUR, because the front end accepts at most four Location inputs and a
+; binding nothing reads is refused: there can be no fifth binding for a
+; fifth attribute that cannot exist.
+#ANVIL_VK_MAX_BINDINGS = 4
+
+; THE DESCRIPTOR FAMILY. One set layout of at most two bindings, one
+; pool, and the sets allocated from it. These live here for the same
+; reason #ANVIL_VK_MAX_BINDINGS does: the command layer holds the bound
+; set and the draw record carries what it resolved to, and neither may
+; include the descriptor layer to learn the shape.
+#ANVIL_VK_MAX_SET_LAYOUTS = 4
+#ANVIL_VK_MAX_DESCRIPTOR_POOLS = 2
+#ANVIL_VK_MAX_DESCRIPTOR_SETS = 4
+#ANVIL_VK_MAX_SET_BINDINGS = 2
+
+; The block a uniform-buffer descriptor supplies: one four-component
+; colour, the same sixteen bytes the push-constant path carries, so the
+; two are interchangeable at the fragment output and the picture is the
+; only thing that tells them apart.
+#ANVIL_VK_UNIFORM_BYTES = 16
+
+; The alignment vkUpdateDescriptorSets requires of a uniform buffer's
+; offset. It is reported as minUniformBufferOffsetAlignment and it is
+; sixteen here because that is the size of the block and the natural
+; alignment of a four-component binary32 vector.
+#ANVIL_VK_UNIFORM_ALIGN = 16
 
 ; The one queue family this slice exposes. It is transfer-capable and
 ; nothing else; a graphics or compute bit here would be a claim about
@@ -109,6 +144,25 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ;  built independently, and because the AArch64 calling convention has
 ;  eight argument registers.
 ; ----------------------------------------------------------------------
+;  ONE VERTEX BUFFER PER BINDING, and that is not a generalisation for
+;  its own sake. Position in one buffer and colour in another, at
+;  different strides, is what an application that streams one attribute
+;  and keeps the other static actually does, and it is the layout a
+;  single base address cannot express. The attribute records V3D reads
+;  carry an address and a stride EACH, so the hardware never wanted one
+;  base; the single `vertexBase` this replaces was the portable layer's
+;  limit.
+;
+;  A COUNT AND A POINTER TO AN ARRAY OF RECORDS, which is the shape every
+;  Vulkan create-info already uses for a list. The array is storage the
+;  portable layer owns and keeps alive across the submission, exactly as
+;  `pushBase` points at a staged copy of the push-constant block rather
+;  than at a caller's frame.
+Structure AnvilVkBackendBinding Align #PB_Structure_AlignC
+  base.i              ; the bound buffer's first byte, plus its bind offset
+  stride.i            ; that binding's own stride, in bytes
+EndStructure
+
 Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   pipeline.i          ; the backend's own pipeline slot
   targetBase.i        ; the colour attachment's first byte
@@ -117,12 +171,18 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   height.i
   pitch.i
   clearBgra.i         ; the render pass's clear value, already packed
-  vertexBase.i        ; the bound vertex buffer, plus its bind offset
-  vertexStride.i
+  bindingCount.i      ; how many AnvilVkBackendBinding records follow
+  bindings.i          ; the address of the first of them
   vertexCount.i
   firstVertex.i
   pushBase.i          ; the push-constant block, or 0
   pushBytes.i
+  ; THE UNIFORM BUFFER THE BOUND DESCRIPTOR SET RESOLVED TO, already
+  ; validated: live, bound, big enough, and named by a set layout that
+  ; matches what the fragment shader asked for. Zero when the pipeline's
+  ; colour does not come from a descriptor.
+  uniformBase.i
+  uniformBytes.i
 EndStructure
 
 ; ----------------------------------------------------------------------

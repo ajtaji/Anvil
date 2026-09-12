@@ -22,7 +22,16 @@
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 
-#ANVIL_VK_MAX_MEMORY = 8
+; SIXTEEN ALLOCATIONS, raised from eight when the descriptor path and the
+; split vertex layout arrived. This table holds the APPLICATION's
+; VkDeviceMemory objects AND the internal allocation each compiled
+; pipeline takes for its shaders, which no handle names - so a program
+; with four pipelines and five allocations needs nine slots, and both
+; instruments in this tree reached exactly that. A limit an instrument
+; sits on refuses the next honest use of it, and the failure it produces
+; is VK_ERROR_OUT_OF_DEVICE_MEMORY on a heap with almost all of itself
+; still free, which reads as the wrong problem entirely.
+#ANVIL_VK_MAX_MEMORY = 16
 #ANVIL_VK_MAX_IMAGES = 8
 
 ; BGRA8 is four bytes per texel. This is the one format this slice knows,

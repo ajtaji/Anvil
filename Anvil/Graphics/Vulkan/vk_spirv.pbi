@@ -39,10 +39,20 @@
 ;
 ;  A FRAGMENT shader:
 ;    * zero or more inputs at a Location
+;    * at most one Uniform-storage variable whose type is an OpTypeStruct
+;      decorated Block, carrying DescriptorSet 0 and a Binding, and whose
+;      first member is a four-component float vector - a uniform buffer
 ;    * exactly one output at Location 0, of four components, written
-;      with either a whole input load (the interpolated varying), a load
-;      of member 0 of the push-constant block (the uniform colour), or a
-;      constant composite of four floats
+;      with one of: a whole input load (the interpolated varying), a
+;      load of member 0 of the push-constant block (the uniform colour),
+;      a load of member 0 of the uniform block through an OpAccessChain,
+;      or a constant composite of four floats
+;
+;  A UNIFORM BLOCK BELONGS TO THE FRAGMENT STAGE ONLY, and a block that
+;  is declared and never read is refused as well: the emitted vertex and
+;  coordinate programs' uniform streams carry the viewport transform and
+;  have no room for a descriptor's words, and a binding nothing reads
+;  would still have to be created, bound and written at draw time.
 ;
 ;  Everything else is refused. The refusal is a whole sentence, it names
 ;  the opcode, capability, decoration, built-in or storage class that
@@ -271,11 +281,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_V_COMPOSITE = 4    ; OpCompositeConstruct
 #ANVIL_SPV_V_EXTRACT = 5      ; OpCompositeExtract of one component
 #ANVIL_SPV_V_CHAIN = 6        ; OpAccessChain into a block variable
+#ANVIL_SPV_V_UNIFORM = 7      ; a load of one member of the uniform block
 
 ; The colour sources a fragment plan can name.
 #ANVIL_SPV_COLOUR_VARYING = 0
 #ANVIL_SPV_COLOUR_PUSH = 1
 #ANVIL_SPV_COLOUR_CONST = 2
+#ANVIL_SPV_COLOUR_UNIFORM = 3
 
 ; ----------------------------------------------------------------------
 ;  WALK STATE. One module is parsed at a time and the result is copied
@@ -296,6 +308,8 @@ Global Dim spvComposite.i[(#ANVIL_SPV_MAX_ID + 1) * 4]
 Global Dim spvDecLocation.i[#ANVIL_SPV_MAX_ID + 1]
 Global Dim spvDecBuiltIn.i[#ANVIL_SPV_MAX_ID + 1]
 Global Dim spvDecBlock.a[#ANVIL_SPV_MAX_ID + 1]
+Global Dim spvDecSet.i[#ANVIL_SPV_MAX_ID + 1]
+Global Dim spvDecBinding.i[#ANVIL_SPV_MAX_ID + 1]
 Global Dim spvMemberBuiltIn.i[(#ANVIL_SPV_MAX_ID + 1) * #ANVIL_SPV_MAX_MEMBERS]
 Global Dim spvStructMember.i[(#ANVIL_SPV_MAX_ID + 1) * #ANVIL_SPV_MAX_MEMBERS]
 
@@ -307,6 +321,9 @@ Global spvEntry.i = 0
 Global spvInstructions.i = 0
 Global spvLastOpcode.i = 0
 Global spvPushVar.i = 0
+Global spvUniformVar.i = 0      ; the Uniform-storage block variable, or 0
+Global spvUniformSet.i = -1
+Global spvUniformBinding.i = -1
 Global spvPosVar.i = 0          ; the Output variable that carries Position
 Global spvPosMember.i = -1      ; -1 when Position is the variable itself
 Global spvPosValue.i = 0        ; the value stored into it
@@ -361,6 +378,8 @@ Procedure avkSpvResetTables()
     spvDecLocation[i] = -1
     spvDecBuiltIn[i] = -1
     spvDecBlock[i] = 0
+    spvDecSet[i] = -1
+    spvDecBinding[i] = -1
     k = 0
     While k < 4
       spvComposite[(i * 4) + k] = 0
@@ -381,6 +400,9 @@ Procedure avkSpvResetTables()
   spvEntry = 0
   spvInstructions = 0
   spvPushVar = 0
+  spvUniformVar = 0
+  spvUniformSet = -1
+  spvUniformBinding = -1
   spvPosVar = 0
   spvPosMember = -1
   spvPosValue = 0
@@ -463,7 +485,7 @@ Procedure.i avkSpvRefuseOpcode(op.i)
     ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a matrix opcode - OpTypeMatrix, OpMatrixTimesVector or OpMatrixTimesMatrix (Anvil code -20005, unsupported instruction); there is no matrix type and no transform in this slice, so a model-view-projection multiply cannot be lowered. Pass positions already in clip space until a vertex arithmetic lowering exists.")
   EndIf
   If op = #SpvOpTypeImage Or op = #SpvOpTypeSampler Or op = #SpvOpTypeSampledImage Or op = #SpvOpImageSampleImplicitLod
-    ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an image or sampler opcode - OpTypeImage, OpTypeSampler, OpTypeSampledImage or OpImageSampleImplicitLod (Anvil code -20005, unsupported instruction); there is no VkImageView, no VkSampler and no descriptor set in this implementation, so nothing can be sampled. Use a per-vertex colour or the push-constant colour instead.")
+    ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an image or sampler opcode - OpTypeImage, OpTypeSampler, OpTypeSampledImage or OpImageSampleImplicitLod (Anvil code -20005, unsupported instruction); the only descriptor type this implementation has is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, there is no VkSampler and no image-view descriptor, and nothing lowers a texture fetch. Use a per-vertex colour, the push-constant colour or a uniform buffer instead.")
   EndIf
   If op = #SpvOpFAdd Or op = #SpvOpFSub Or op = #SpvOpFMul Or op = #SpvOpFDiv Or op = #SpvOpFNegate Or op = #SpvOpVectorTimesScalar Or op = #SpvOpDot
     ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a floating-point arithmetic opcode - OpFAdd, OpFSub, OpFMul, OpFDiv, OpFNegate, OpVectorTimesScalar or OpDot (Anvil code -20005, unsupported instruction); this slice lowers a shader that only moves values, so a shader that computes one cannot be emitted. The QPU arithmetic lowering is the next piece of work and it is not written yet.")
@@ -786,8 +808,20 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       If a = #SpvDecorationRelaxedPrecision Or a = #SpvDecorationOffset Or a = #SpvDecorationColMajor Or a = #SpvDecorationMatrixStride Or a = #SpvDecorationArrayStride
         ProcedureReturn #ANVIL_VK_OK
       EndIf
-      If a = #SpvDecorationDescriptorSet Or a = #SpvDecorationBinding
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused the decoration DescriptorSet or Binding on OpDecorate (Anvil code -20005, unsupported decoration); there is no VkDescriptorSetLayout, no VkDescriptorPool and no vkCmdBindDescriptorSets in this implementation, so a bound resource could never be supplied. Use the push-constant block for a uniform colour.")
+      ; DescriptorSet and Binding are READ now: they name which set and
+      ; which binding of it a Uniform-storage block is supplied through,
+      ; and the pipeline layer checks them against the VkDescriptorSetLayout
+      ; the pipeline layout declares. They are recorded on ANY id here and
+      ; only a Uniform block variable is allowed to carry them, which is
+      ; checked where the variable is validated - a decoration on an
+      ; Input or an Output has no meaning and is caught there.
+      If a = #SpvDecorationDescriptorSet
+        spvDecSet[id] = avkSpvWord(*words, at + 3)
+        ProcedureReturn #ANVIL_VK_OK
+      EndIf
+      If a = #SpvDecorationBinding
+        spvDecBinding[id] = avkSpvWord(*words, at + 3)
+        ProcedureReturn #ANVIL_VK_OK
       EndIf
       If a = #SpvDecorationFlat Or a = #SpvDecorationNoPerspective
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused the interpolation decoration Flat or NoPerspective (Anvil code -20005, unsupported decoration); every varying this slice emits is interpolated the one way the emitted V3D shader record declares, so a module that asks for another would get a picture that did not match what it asked for.")
@@ -798,7 +832,7 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       If a = #SpvDecorationComponent
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused the decoration Component (Anvil code -20005, unsupported decoration); a location is not subdivided here, so two variables cannot share one location.")
       EndIf
-      ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a decoration it does not implement, on OpDecorate (Anvil code -20005, unsupported decoration); the decorations this slice reads are Location, BuiltIn and Block, and it ignores RelaxedPrecision and Offset.")
+      ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a decoration it does not implement, on OpDecorate (Anvil code -20005, unsupported decoration); the decorations this slice reads are Location, BuiltIn, Block, DescriptorSet and Binding, and it ignores RelaxedPrecision and Offset.")
 
     Case #SpvOpMemberDecorate
       id = avkSpvWord(*words, at + 1)
@@ -836,11 +870,14 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       If b = #SpvStorageClassFunction Or b = #SpvStorageClassPrivate Or b = #SpvStorageClassWorkgroup
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in the Function, Private or Workgroup storage class (Anvil code -20005, unsupported storage class); there is no scratch memory for a shader in this slice, so a local variable has nowhere to live. An accepted shader moves values between its inputs and its outputs directly.")
       EndIf
-      If b = #SpvStorageClassUniform Or b = #SpvStorageClassStorageBuffer Or b = #SpvStorageClassUniformConstant
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in the Uniform, StorageBuffer or UniformConstant storage class (Anvil code -20005, unsupported storage class); reaching one needs a descriptor set, and there is no descriptor machinery in this implementation. The push-constant block is the one uniform path that exists.")
+      If b = #SpvStorageClassStorageBuffer
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in the StorageBuffer storage class (Anvil code -20005, unsupported storage class); a storage buffer is written as well as read and this implementation has no descriptor type, no memory barrier and no coherence rule for one. A uniform buffer, declared Uniform with the Block decoration, is the descriptor path that exists.")
       EndIf
-      If b <> #SpvStorageClassInput And b <> #SpvStorageClassOutput And b <> #SpvStorageClassPushConstant
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in a storage class it does not implement (Anvil code -20005, unsupported storage class); the three accepted classes are Input, Output and PushConstant.")
+      If b = #SpvStorageClassUniformConstant
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in the UniformConstant storage class (Anvil code -20005, unsupported storage class); that class holds samplers, images and combined image samplers, and there is no VkSampler, no VkImageView descriptor and no texture unit lowering in this implementation.")
+      EndIf
+      If b <> #SpvStorageClassInput And b <> #SpvStorageClassOutput And b <> #SpvStorageClassPushConstant And b <> #SpvStorageClassUniform
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in a storage class it does not implement (Anvil code -20005, unsupported storage class); the four accepted classes are Input, Output, PushConstant and Uniform.")
       EndIf
       spvKind[id] = #ANVIL_SPV_K_VARIABLE
       spvValueType[id] = spvTypeComp[a]
@@ -850,6 +887,23 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
           ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a second push-constant variable (Anvil code -20005, unsupported module shape); Vulkan permits one push-constant block per stage, and this slice carries exactly that one.")
         EndIf
         spvPushVar = id
+      EndIf
+      ; THE DESCRIPTOR DECORATIONS ARE PLACED HERE, where the storage
+      ; class is finally known. OpDecorate comes first in a module's
+      ; layout, so the decoration itself cannot tell whether it landed on
+      ; a uniform block or on an interface variable - and a DescriptorSet
+      ; on an Input is what a source language emits when a `uniform` was
+      ; meant to be an `in`.
+      If b = #SpvStorageClassUniform
+        If spvUniformVar <> 0
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a second Uniform-storage block variable (Anvil code -20005, unsupported module shape); one uniform buffer reaches one fragment shader here, so a second block would need a second descriptor binding this slice does not lower.")
+        EndIf
+        If spvDecSet[id] < 0 Or spvDecBinding[id] < 0
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a Uniform-storage variable that does not carry both DescriptorSet and Binding (Anvil code -20005, unsupported uniform block); a descriptor is found by the pair, so a block missing either one names no binding at all.")
+        EndIf
+        spvUniformVar = id
+      ElseIf spvDecSet[id] >= 0 Or spvDecBinding[id] >= 0
+        ProcedureReturn avkSpvRefuse(#SpvOpDecorate, "the SPIR-V front end refused a DescriptorSet or Binding decoration on a variable that is not in the Uniform storage class (Anvil code -20005, misplaced decoration); those two decorations say which descriptor supplies a uniform buffer, and on an Input, an Output or a push-constant block they name a binding nothing can ever be bound to.")
       EndIf
       ProcedureReturn #ANVIL_VK_OK
 
@@ -899,7 +953,12 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
           spvValueA[id] = spvValueB[b]
           ProcedureReturn #ANVIL_VK_OK
         EndIf
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpLoad through an access chain into something other than the push-constant block (Anvil code -20005, unsupported load); the only member this slice reads through a chain is a member of the push-constant block.")
+        If spvValueA[b] = spvUniformVar And spvUniformVar <> 0
+          spvValueSrc[id] = #ANVIL_SPV_V_UNIFORM
+          spvValueA[id] = spvValueB[b]
+          ProcedureReturn #ANVIL_VK_OK
+        EndIf
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpLoad through an access chain into something other than the push-constant block or the uniform block (Anvil code -20005, unsupported load); those two are the blocks this slice reads a member of through a chain.")
       EndIf
       ProcedureReturn avkSpvMalformed("a SPIR-V OpLoad named a pointer that is neither a variable nor an access chain declared earlier in the module (Anvil code -20001, malformed module); the pointer operand of OpLoad must be a pointer-valued id the module defines.")
 
@@ -1186,6 +1245,47 @@ Procedure.i avkSpvBuildVertexPlan()
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  THE UNIFORM BLOCK, checked when a fragment shader actually reads one.
+;
+;  The specification's rules for a Vulkan uniform buffer are that the
+;  variable is in the Uniform storage class, its type is a structure
+;  decorated Block, and it carries DescriptorSet and Binding. All four
+;  are required here and each is refused separately, because "your
+;  uniform block is wrong" sends a reader nowhere.
+;
+;  BufferBlock is the storage-buffer spelling and is refused where the
+;  decoration is read, so a module that used the pre-1.3 storage-buffer
+;  form never reaches this procedure.
+; ----------------------------------------------------------------------
+Procedure.i avkSpvCheckUniformBlock()
+  Define t.i
+  Define m.i
+  If spvUniformVar = 0
+    ProcedureReturn avkSpvMalformed("a SPIR-V fragment module reads a uniform block it never declared (Anvil code -20001, malformed module); the pointer an OpAccessChain walks must name a variable the module defines.")
+  EndIf
+  t = spvValueType[spvUniformVar]
+  If avkSpvIdOk(t) = 0 Or spvTypeClass[t] <> #ANVIL_SPV_T_STRUCT
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a Uniform-storage variable whose type is not an OpTypeStruct (Anvil code -20005, unsupported uniform block); a Vulkan uniform buffer is a structure, and a bare vector or scalar in the Uniform class has no offset layout for a descriptor to point at.")
+  EndIf
+  If spvDecBlock[t] = 0
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a Uniform-storage structure that is not decorated Block (Anvil code -20005, unsupported uniform block); the Vulkan environment requires the Block decoration on the type of a uniform buffer variable, and without it the module is asking for something this implementation cannot bind.")
+  EndIf
+  If spvDecSet[spvUniformVar] <> 0
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a Uniform-storage variable at a DescriptorSet other than zero (Anvil code -20005, unsupported descriptor set); vkCmdBindDescriptorSets binds one set here and its index is zero.")
+  EndIf
+  If spvDecBinding[spvUniformVar] < 0 Or spvDecBinding[spvUniformVar] >= #ANVIL_VK_MAX_SET_BINDINGS
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a Uniform-storage variable at a Binding this implementation's descriptor set layout cannot hold (Anvil code -20005, unsupported binding number); the bindings of one set are numbered 0 and 1 here.")
+  EndIf
+  m = spvStructMember[(t * #ANVIL_SPV_MAX_MEMBERS) + 0]
+  If avkSpvIdOk(m) = 0 Or avkSpvIsFloatish(m) = 0 Or avkSpvComponents(m) <> 4
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a uniform block whose first member is not a four-component 32-bit float vector (Anvil code -20005, unsupported uniform block); the sixteen bytes a descriptor supplies here are one colour, and a member of another shape would be read as one anyway.")
+  EndIf
+  spvUniformSet = spvDecSet[spvUniformVar]
+  spvUniformBinding = spvDecBinding[spvUniformVar]
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  THE FRAGMENT PLAN. One output at Location 0, four components.
 ; ----------------------------------------------------------------------
 Procedure.i avkSpvBuildFragmentPlan()
@@ -1230,6 +1330,14 @@ Procedure.i avkSpvBuildFragmentPlan()
     spvPlanColourIdx = 0
     ProcedureReturn #ANVIL_VK_OK
   EndIf
+  If src = #ANVIL_SPV_V_UNIFORM
+    If spvValueA[v] <> 0
+      ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a fragment shader that reads a uniform-block member other than the first (Anvil code -20005, unsupported uniform block); the block a descriptor supplies here is one four-component colour at offset zero, and a second member would be read from bytes the descriptor's range does not promise.")
+    EndIf
+    spvPlanColourSrc = #ANVIL_SPV_COLOUR_UNIFORM
+    spvPlanColourIdx = 0
+    ProcedureReturn avkSpvCheckUniformBlock()
+  EndIf
   If src = #ANVIL_SPV_V_CONST
     spvPlanColourSrc = #ANVIL_SPV_COLOUR_CONST
     spvPlanColourIdx = 0
@@ -1240,7 +1348,7 @@ Procedure.i avkSpvBuildFragmentPlan()
     Wend
     ProcedureReturn #ANVIL_VK_OK
   EndIf
-  ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a fragment shader whose colour is neither an interpolated input, a push-constant member nor a constant (Anvil code -20005, unsupported fragment shader); this slice moves a colour into the tile buffer, it does not compute one.")
+  ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a fragment shader whose colour is not an interpolated input, a push-constant member, a uniform-block member or a constant (Anvil code -20005, unsupported fragment shader); this slice moves a colour into the tile buffer, it does not compute one.")
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1293,6 +1401,24 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
     at = at + count
   Wend
 
+  ; A DESCRIPTOR DECORATION BELONGS TO A UNIFORM BLOCK AND NOWHERE ELSE.
+  ; OpDecorate comes before OpVariable in a module's layout, so which id
+  ; is the uniform block is not known when the decoration is read; the
+  ; placement is therefore checked here, once the whole module is in
+  ; view. A DescriptorSet on an Input or an Output is a real mistake - it
+  ; is what a source language emits when a `uniform` was meant to be an
+  ; `in` - and recording it and ignoring it would be the quiet kind of
+  ; wrong this front end exists to avoid.
+  id = 1
+  While id < spvBound
+    If spvDecSet[id] >= 0 Or spvDecBinding[id] >= 0
+      If id <> spvUniformVar Or spvUniformVar = 0
+        ProcedureReturn avkSpvRefuse(#SpvOpDecorate, "the SPIR-V front end refused a DescriptorSet or Binding decoration on something that is not a Uniform-storage block variable (Anvil code -20005, misplaced decoration); those two decorations say which descriptor supplies a uniform buffer, and on an Input, an Output, a push-constant block or a type they name a binding nothing can ever be bound to.")
+      EndIf
+    EndIf
+    id = id + 1
+  Wend
+
   If spvEntry = 0
     ProcedureReturn avkSpvMalformed("a SPIR-V module declares no entry point (Anvil code -20001, incomplete module); every shader module Vulkan accepts carries at least one OpEntryPoint, and this implementation requires exactly one.")
   EndIf
@@ -1329,12 +1455,29 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
   Wend
 
   If spvStage = #SpvExecutionModelVertex
+    ; A UNIFORM BLOCK IN A VERTEX SHADER is refused rather than ignored.
+    ; The emitted coordinate and vertex programs read their uniform
+    ; stream at fixed offsets that the viewport transform owns, so a
+    ; descriptor's words have nowhere in it to go; a module that
+    ; declared one would have its uniform silently read as zero.
+    If spvUniformVar <> 0
+      ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a Uniform-storage block in a vertex shader (Anvil code -20005, unsupported descriptor stage); the descriptor path in this slice supplies the FRAGMENT colour, and the emitted vertex programs' uniform stream carries the viewport transform and nothing else.")
+    EndIf
     ProcedureReturn avkSpvBuildVertexPlan()
   EndIf
   If spvOriginUpperLeft = 0
     ProcedureReturn avkSpvMalformed("a SPIR-V fragment module does not declare the execution mode OriginUpperLeft (Anvil code -20001, incomplete fragment shader); the Vulkan environment requires a fragment entry point to declare its origin, and OriginUpperLeft is the only one this implementation renders.")
   EndIf
-  ProcedureReturn avkSpvBuildFragmentPlan()
+  rc = avkSpvBuildFragmentPlan()
+  If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
+  ; A BLOCK DECLARED AND NEVER READ is refused too. The pipeline layer
+  ; makes the layout's binding match what the shader asked for, and a
+  ; module that declares a binding it does not use would force a
+  ; descriptor set to be created, bound and written for nothing.
+  If spvUniformVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_UNIFORM
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a fragment shader that declares a Uniform-storage block and never reads it (Anvil code -20005, unused descriptor); a declared binding has to be supplied by a descriptor set at draw time, so one nothing reads is work the caller is made to do for no picture.")
+  EndIf
+  ProcedureReturn #ANVIL_VK_OK
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1409,4 +1552,21 @@ EndProcedure
 Procedure.i AnvilVkSpirvUsesPushConstants()
   If spvPushVar <> 0 : ProcedureReturn 1 : EndIf
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i AnvilVkSpirvUsesUniformBlock()
+  If spvUniformVar <> 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The descriptor set and binding the accepted uniform block named, or -1
+; when the module reads none. The pipeline layer checks these against
+; the VkDescriptorSetLayout its pipeline layout declares, which is the
+; one place the module and the layout are both in view.
+Procedure.i AnvilVkSpirvUniformSet()
+  ProcedureReturn spvUniformSet
+EndProcedure
+
+Procedure.i AnvilVkSpirvUniformBinding()
+  ProcedureReturn spvUniformBinding
 EndProcedure

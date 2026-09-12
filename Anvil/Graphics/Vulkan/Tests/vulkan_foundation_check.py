@@ -97,6 +97,22 @@ CONSTANTS = {
     "VK_DEPENDENCY_BY_REGION_BIT", "VK_FENCE_CREATE_SIGNALED_BIT",
     "VK_QUEUE_FAMILY_IGNORED", "VK_REMAINING_MIP_LEVELS",
     "VK_REMAINING_ARRAY_LAYERS",
+    "VK_ERROR_OUT_OF_POOL_MEMORY",
+    "VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO",
+    "VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO",
+    "VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO",
+    "VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET",
+    "VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET",
+    "VK_DESCRIPTOR_TYPE_SAMPLER", "VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
+    "VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE", "VK_DESCRIPTOR_TYPE_STORAGE_IMAGE",
+    "VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER",
+    "VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER",
+    "VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER", "VK_DESCRIPTOR_TYPE_STORAGE_BUFFER",
+    "VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC",
+    "VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC",
+    "VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT",
+    "VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT",
+    "VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT",
 }
 
 STRUCTS = {
@@ -401,7 +417,70 @@ PB_SUFFIX = {
     "VkFramebufferCreateFlags": ".l", "VkBufferCreateFlags": ".l",
     "VkBufferUsageFlags": ".l",
     "VkComponentMapping": ".VkComponentMapping", "VkRect2D": ".VkRect2D",
+    # The descriptor vocabulary, added 2026-09-11 with the first
+    # descriptor type. VkSampler and VkBufferView appear only as pointer
+    # members of structures this implementation refuses to fill, so they
+    # are here to be REFUSED with a name rather than to be supported.
+    "VkDescriptorType": ".l", "VkDescriptorSetLayoutCreateFlags": ".l",
+    "VkDescriptorPoolCreateFlags": ".l",
+    "VkDescriptorPool": ".i", "VkDescriptorSet": ".i",
+    "VkSampler": ".i", "VkBufferView": ".i", "VkBuffer": ".i",
 }
+
+# The descriptor structures, added 2026-09-11 with the first descriptor
+# type. Written out here by hand, from the registry, for the same reason
+# the pipeline block above is: this file and vk_core_1_0.pbi have to be
+# two independent transcriptions of one layout, so a typo in either is a
+# failure rather than a silent agreement.
+#
+# VK_WHOLE_SIZE is deliberately NOT in CONSTANTS. The registry writes it
+# (~0ULL) and the vocabulary declares it -1, which is the same sixty-four
+# bits and is what a VkDeviceSize field holding it reads back as on this
+# part - but the two spellings are not the same NUMBER, and a check that
+# had to special-case one constant would be a check nobody trusts.
+STRUCTS.update({
+    "VkDescriptorSetLayoutBinding": (
+        ("uint32_t", "binding"), ("VkDescriptorType", "descriptorType"),
+        ("uint32_t", "descriptorCount"), ("VkShaderStageFlags", "stageFlags"),
+        ("VkSampler", "pImmutableSamplers")),
+    "VkDescriptorSetLayoutCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkDescriptorSetLayoutCreateFlags", "flags"),
+        ("uint32_t", "bindingCount"),
+        ("VkDescriptorSetLayoutBinding", "pBindings")),
+    "VkDescriptorPoolSize": (
+        ("VkDescriptorType", "type"), ("uint32_t", "descriptorCount")),
+    "VkDescriptorPoolCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkDescriptorPoolCreateFlags", "flags"), ("uint32_t", "maxSets"),
+        ("uint32_t", "poolSizeCount"), ("VkDescriptorPoolSize", "pPoolSizes")),
+    "VkDescriptorSetAllocateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkDescriptorPool", "descriptorPool"),
+        ("uint32_t", "descriptorSetCount"),
+        ("VkDescriptorSetLayout", "pSetLayouts")),
+    "VkDescriptorBufferInfo": (
+        ("VkBuffer", "buffer"), ("VkDeviceSize", "offset"),
+        ("VkDeviceSize", "range")),
+    "VkDescriptorImageInfo": (
+        ("VkSampler", "sampler"), ("VkImageView", "imageView"),
+        ("VkImageLayout", "imageLayout")),
+    "VkWriteDescriptorSet": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkDescriptorSet", "dstSet"), ("uint32_t", "dstBinding"),
+        ("uint32_t", "dstArrayElement"), ("uint32_t", "descriptorCount"),
+        ("VkDescriptorType", "descriptorType"),
+        ("VkDescriptorImageInfo", "pImageInfo"),
+        ("VkDescriptorBufferInfo", "pBufferInfo"),
+        ("VkBufferView", "pTexelBufferView")),
+    "VkCopyDescriptorSet": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkDescriptorSet", "srcSet"), ("uint32_t", "srcBinding"),
+        ("uint32_t", "srcArrayElement"), ("VkDescriptorSet", "dstSet"),
+        ("uint32_t", "dstBinding"), ("uint32_t", "dstArrayElement"),
+        ("uint32_t", "descriptorCount")),
+})
+
 
 # The registry writes its all-ones sentinels as C expressions.
 C_SENTINELS = {"(~0U)": 0xFFFFFFFF, "(~0ULL)": 0xFFFFFFFFFFFFFFFF, "(~0U-1)": 0xFFFFFFFE}
@@ -428,6 +507,18 @@ def number(node: ET.Element, by_name: dict[str, ET.Element]) -> int:
     alias = node.get("alias")
     if alias:
         return number(by_name[alias], by_name)
+    # AN EXTENSION-NUMBERED ENUMERANT. A value promoted into core from an
+    # extension keeps the extension's arithmetic in the registry rather
+    # than a literal: base + (extension number - 1) * block + offset,
+    # negated when dir is "-". VK_ERROR_OUT_OF_POOL_MEMORY is the first
+    # such value this vocabulary needs, and computing it here is the only
+    # way this gate can check it against the registry at all. The three
+    # constants are the registry's own reservation scheme.
+    offset = node.get("offset")
+    if offset is not None and node.get("extnumber_resolved") is not None:
+        extension = int(node.get("extnumber_resolved"))
+        magnitude = 1000000000 + (extension - 1) * 1000 + int(offset)
+        return -magnitude if node.get("dir") == "-" else magnitude
     raise ValueError("no core value for " + str(node.get("name")))
 
 
@@ -522,6 +613,31 @@ def check_registry(failures: list[str]) -> int:
             continue
         if any(enum.get(key) is not None for key in ("value", "bitpos", "alias")):
             enums[name] = enum
+    # AN ENUMERANT PROMOTED INTO CORE FROM AN EXTENSION keeps the
+    # extension's arithmetic in the registry rather than a literal value,
+    # and it appears in TWO places: inside the extension's own block,
+    # where the number is on the <extension> element, and inside a
+    # <feature> block's "Promoted from ..." require, where the <enum>
+    # carries its own extnumber. Both are collected, the extension one
+    # first so a feature block's copy cannot be missed.
+    for extension in root.findall("./extensions/extension"):
+        extnumber = extension.get("number")
+        if not extnumber:
+            continue
+        for enum in extension.findall(".//enum"):
+            name = enum.get("name")
+            if not name or name in enums or enum.get("offset") is None:
+                continue
+            enum.set("extnumber_resolved", enum.get("extnumber") or extnumber)
+            enums[name] = enum
+    for enum in root.iter("enum"):
+        name = enum.get("name")
+        if not name or name in enums:
+            continue
+        if enum.get("offset") is None or enum.get("extnumber") is None:
+            continue
+        enum.set("extnumber_resolved", enum.get("extnumber"))
+        enums[name] = enum
     pbi = parse_pbi_constants()
     checks = 1
     if pbi.get("VK_API_VERSION_1_0") != 0x00400000:

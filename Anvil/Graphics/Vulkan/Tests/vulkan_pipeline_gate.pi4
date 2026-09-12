@@ -61,13 +61,29 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 
 #PG_STRIDE1 = 24                     ; vec2 position + vec4 colour
 #PG_STRIDE2 = 8                      ; vec2 position
+; THE SPLIT LAYOUT. The same two attributes as pipeline A, but position
+; in one buffer at its own stride and colour in another at a different
+; one - which is what an application that restreams position every frame
+; and keeps a static colour table writes, and what a single base address
+; and a single stride cannot describe.
+#PG_STRIDE_POS = 8                   ; vec2 position, binding 0
+#PG_STRIDE_COL = 16                  ; vec4 colour, binding 1
 
-Global Dim pgReport.i[64]
+; The four words a descriptor's uniform buffer holds. Every one is an
+; exact binary32 and none of them is any of the push-constant block's,
+; so the fragment uniform stream a descriptor builds cannot be confused
+; with the one a push constant builds.
+#PG_UNIFORM_R = $3E800000            ; 0.25
+#PG_UNIFORM_G = $3F400000            ; 0.75
+#PG_UNIFORM_B = $3F800000            ; 1.0
+#PG_UNIFORM_A = $3E000000            ; 0.125
+
+Global Dim pgReport.i[192]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 63
+  If slot < 0 Or slot > 191
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -105,6 +121,25 @@ Procedure.i Main()
   Define layB.i
   Define pipeA.i
   Define pipeB.i
+  Define pipeC.i
+  Define pipeD.i
+  Define fsU.i
+  Define fsW.i
+  Define dsl.i
+  Define dsl2.i
+  Define dpool.i
+  Define dset.i
+  Define layU.i
+  Define layV.i
+  Define bufP.i
+  Define bufC.i
+  Define bufU.i
+  Define pmem.i
+  Define cmem.i
+  Define umem.i
+  Define paddr.i
+  Define caddr.i
+  Define uaddr.i
   Define bad.i
   Define vaddr.i
   Define i.i
@@ -138,7 +173,22 @@ Procedure.i Main()
   Define pcr.VkPushConstantRange
   Define Dim stages.VkPipelineShaderStageCreateInfo[2]
   Define bind.VkVertexInputBindingDescription
+  Define Dim binds.VkVertexInputBindingDescription[2]
   Define Dim attrs.VkVertexInputAttributeDescription[2]
+  Define draw.AnvilVkBackendDraw
+  Define Dim gateBinds.i[#ANVIL_VK_MAX_BINDINGS * 2]
+  Define dslb.VkDescriptorSetLayoutBinding
+  Define Dim dslb2.VkDescriptorSetLayoutBinding[2]
+  Define dslci.VkDescriptorSetLayoutCreateInfo
+  Define dslci2.VkDescriptorSetLayoutCreateInfo
+  Define dps.VkDescriptorPoolSize
+  Define dpci.VkDescriptorPoolCreateInfo
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo
+  Define wds.VkWriteDescriptorSet
+  Define dslArray.i
+  Define dsl2Array.i
+  Define dsetArray.i
   Define vi.VkPipelineVertexInputStateCreateInfo
   Define ia.VkPipelineInputAssemblyStateCreateInfo
   Define vpstate.VkPipelineViewportStateCreateInfo
@@ -154,6 +204,8 @@ Procedure.i Main()
   Define fenceArray.i
   Define bufHandle.i
   Define bufOffset.q
+  Define Dim twoBufs.i[2]
+  Define Dim twoOffsets.q[2]
 
   pgPut(0, #PG_MAGIC)
   ; THE BOARD DIAGNOSTIC'S OWN MODULES, assembled by the same file the
@@ -168,6 +220,8 @@ Procedure.i Main()
   pgPut(60, @vtpVsB[0])
   pgPut(63, vtpBuildFsB())
   pgPut(62, @vtpFsB[0])
+  pgPut(65, vtpBuildFsC())
+  pgPut(64, @vtpFsC[0])
   AnvilVkTestBackendHeap(#PG_HEAP, #PG_HEAP_BYTES)
   pgPut(38, AnvilVkBackendCanDraw())
 
@@ -321,6 +375,77 @@ Procedure.i Main()
     i = i + 4
   Wend
 
+  ; TWO MORE BUFFERS, the split layout: position in one and colour in
+  ; the other, at two different strides. They are separate VkBuffers on
+  ; separate allocations on purpose - two bindings that happened to land
+  ; in one allocation would not prove that two addresses reach the
+  ; attribute records.
+  bufci\size = 6 * #PG_STRIDE_POS
+  If vkCreateBuffer(dev, @bufci, 0, @bufP) <> #VK_SUCCESS
+    ProcedureReturn pgStop(64)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufP, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @pmem) <> #VK_SUCCESS
+    ProcedureReturn pgStop(65)
+  EndIf
+  If vkBindBufferMemory(dev, bufP, pmem, 0) <> #VK_SUCCESS
+    ProcedureReturn pgStop(66)
+  EndIf
+  ; THE COLOUR BUFFER HOLDS THREE VERTICES AND THE POSITION BUFFER SIX.
+  ; That asymmetry is the point: a six-vertex draw fits binding zero
+  ; exactly and runs off the end of binding one, so the range check below
+  ; can only pass by looking at each binding's own stride and size.
+  bufci\size = 3 * #PG_STRIDE_COL
+  If vkCreateBuffer(dev, @bufci, 0, @bufC) <> #VK_SUCCESS
+    ProcedureReturn pgStop(67)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufC, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @cmem) <> #VK_SUCCESS
+    ProcedureReturn pgStop(68)
+  EndIf
+  If vkBindBufferMemory(dev, bufC, cmem, 0) <> #VK_SUCCESS
+    ProcedureReturn pgStop(69)
+  EndIf
+  paddr = AnvilVkBufferAddress(bufP)
+  caddr = AnvilVkBufferAddress(bufC)
+  pgPut(74, paddr)
+  pgPut(75, caddr)
+  i = 0
+  While i < (6 * #PG_STRIDE_POS)
+    PokeL(paddr + i, 0)
+    i = i + 4
+  Wend
+  i = 0
+  While i < (3 * #PG_STRIDE_COL)
+    PokeL(caddr + i, 0)
+    i = i + 4
+  Wend
+
+  ; The uniform buffer a descriptor points into. Its four words are the
+  ; colour a fragment shader will read through set 0, binding 0, and the
+  ; checker knows them.
+  bufci\size = 16
+  bufci\usage = #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+  If vkCreateBuffer(dev, @bufci, 0, @bufU) <> #VK_SUCCESS
+    ProcedureReturn pgStop(71)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, bufU, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @umem) <> #VK_SUCCESS
+    ProcedureReturn pgStop(72)
+  EndIf
+  If vkBindBufferMemory(dev, bufU, umem, 0) <> #VK_SUCCESS
+    ProcedureReturn pgStop(72)
+  EndIf
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+  uaddr = AnvilVkBufferAddress(bufU)
+  PokeL(uaddr + 0, #PG_UNIFORM_R)
+  PokeL(uaddr + 4, #PG_UNIFORM_G)
+  PokeL(uaddr + 8, #PG_UNIFORM_B)
+  PokeL(uaddr + 12, #PG_UNIFORM_A)
+
   ; ------------------------------------------------------------------
   ;  Two shader modules from the checker's fixture table, two layouts,
   ;  two pipelines.
@@ -345,6 +470,14 @@ Procedure.i Main()
   smci\codeSize = PeekI(#PG_IN + 56)
   If vkCreateShaderModule(dev, @smci, 0, @fsB) <> #VK_SUCCESS
     ProcedureReturn pgStop(18)
+  EndIf
+  ; The fifth module: a fragment shader whose colour comes from a
+  ; uniform buffer at set 0, binding 0.
+  smci\pCode = PeekI(#PG_IN + 64)
+  smci\codeSize = PeekI(#PG_IN + 72)
+  If vkCreateShaderModule(dev, @smci, 0, @fsU) <> #VK_SUCCESS
+    pgPut(2, AnvilVkFaultCode())
+    ProcedureReturn pgStop(73)
   EndIf
 
   plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
@@ -480,7 +613,15 @@ Procedure.i Main()
     ProcedureReturn pgStop(23)
   EndIf
   AnvilVkV3dFragmentUniforms(1, AnvilVkV3dCodeBase(1), 0, AnvilVkPipelineColourSource(1))
-  If AnvilVkV3dBuildRecord(1, AnvilVkPipelineCodeBase(pipeA), vaddr, #PG_STRIDE1, 2, AnvilVkV3dVaryingComponents(1)) <> #V3D_OK
+  ; The record builder takes the draw, because a draw is where the
+  ; per-binding addresses and strides live. One binding here.
+  draw\bindingCount = 1
+  draw\bindings = @gateBinds[0]
+  gateBinds[0] = vaddr
+  gateBinds[1] = #PG_STRIDE1
+  gateBinds[2] = 0
+  gateBinds[3] = 0
+  If AnvilVkV3dBuildRecord(1, AnvilVkPipelineCodeBase(pipeA), @draw, 2, AnvilVkV3dVaryingComponents(1)) <> #V3D_OK
     ProcedureReturn pgStop(24)
   EndIf
   pgPut(7, AnvilVkV3dCodeBase(1))
@@ -502,7 +643,11 @@ Procedure.i Main()
     ProcedureReturn pgStop(25)
   EndIf
   AnvilVkV3dFragmentUniforms(2, AnvilVkV3dCodeBase(2), @pgPush[0], AnvilVkPipelineColourSource(2))
-  If AnvilVkV3dBuildRecord(2, AnvilVkPipelineCodeBase(pipeB), vaddr, #PG_STRIDE2, 2, AnvilVkV3dVaryingComponents(2)) <> #V3D_OK
+  draw\bindingCount = 1
+  draw\bindings = @gateBinds[0]
+  gateBinds[0] = vaddr
+  gateBinds[1] = #PG_STRIDE2
+  If AnvilVkV3dBuildRecord(2, AnvilVkPipelineCodeBase(pipeB), @draw, 2, AnvilVkV3dVaryingComponents(2)) <> #V3D_OK
     ProcedureReturn pgStop(26)
   EndIf
   pgPut(13, AnvilVkV3dCodeBase(2))
@@ -514,6 +659,298 @@ Procedure.i Main()
   pgPut(34, AnvilVkPipelineColourSource(2))
   pgPut(41, AnvilVkPipelineAttrCount(2))
   pgPut(52, AnvilVkPipelineViewportWidth(2))
+
+  ; ------------------------------------------------------------------
+  ;  PIPELINE C: THE SAME TWO ATTRIBUTES, OUT OF TWO BINDINGS.
+  ;
+  ;  Position is binding 0 at a stride of eight and colour is binding 1
+  ;  at a stride of sixteen. Every refusal the split makes possible is
+  ;  exercised first, on the same create-info, so the one that succeeds
+  ;  is the only shape that was accepted.
+  ; ------------------------------------------------------------------
+  binds[0]\binding = 0
+  binds[0]\stride = #PG_STRIDE_POS
+  binds[0]\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  binds[1]\binding = 1
+  binds[1]\stride = #PG_STRIDE_COL
+  binds[1]\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[0]\location = 0
+  attrs[0]\binding = 0
+  attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[0]\offset = 0
+  attrs[1]\location = 1
+  attrs[1]\binding = 1
+  attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+  attrs[1]\offset = 0
+  vi\vertexBindingDescriptionCount = 2
+  vi\pVertexBindingDescriptions = @binds[0]
+  vi\vertexAttributeDescriptionCount = 2
+  stages[0]\module = vsA
+  stages[1]\module = fsA
+  gp\layout = layA
+
+  ; An attribute that names a binding nothing describes.
+  attrs[1]\binding = 2
+  AnvilVkFaultClear()
+  pgPut(76, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(77, AnvilVkFaultText())
+  attrs[1]\binding = 1
+  ; A binding no attribute reads: both attributes back on binding zero,
+  ; whose stride is widened so that they genuinely fit there. Without
+  ; that the vec4 would run off the end of an eight-byte vertex and the
+  ; stride refusal would answer first, and this check would be testing
+  ; the wrong rule while looking green.
+  binds[0]\stride = 24
+  attrs[1]\binding = 0
+  attrs[1]\offset = 8
+  AnvilVkFaultClear()
+  pgPut(78, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(79, AnvilVkFaultText())
+  binds[0]\stride = #PG_STRIDE_POS
+  attrs[1]\binding = 1
+  attrs[1]\offset = 0
+  ; Two bindings numbered the same.
+  binds[1]\binding = 0
+  pgPut(80, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  binds[1]\binding = 1
+  ; A stride that is not a whole number of components.
+  binds[1]\stride = 14
+  pgPut(81, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  binds[1]\stride = #PG_STRIDE_COL
+  ; An attribute that runs past the end of ITS OWN binding's vertex -
+  ; a vec4 at offset four inside a stride of sixteen. It fits inside
+  ; binding ZERO's arithmetic only if the wrong stride is used, which is
+  ; the mistake this refusal exists to name.
+  attrs[1]\offset = 4
+  AnvilVkFaultClear()
+  pgPut(82, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(83, AnvilVkFaultText())
+  attrs[1]\offset = 0
+
+  If vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeC) <> #VK_SUCCESS
+    pgPut(2, AnvilVkFaultCode())
+    ProcedureReturn pgStop(70)
+  EndIf
+  pgPut(84, AnvilVkPipelineBindingCount(3))
+  pgPut(85, AnvilVkPipelineBindingStride(3, 0))
+  pgPut(86, AnvilVkPipelineBindingStride(3, 1))
+  pgPut(87, AnvilVkPipelineAttrBinding(3, 0))
+  pgPut(88, AnvilVkPipelineAttrBinding(3, 1))
+  pgPut(89, AnvilVkPipelineAttrOffset(3, 0))
+  pgPut(90, AnvilVkPipelineAttrOffset(3, 1))
+  pgPut(91, AnvilVkPipelineAttrCount(3))
+  pgPut(92, AnvilVkPipelineColourSource(3))
+
+  If AnvilVkV3dCompile(3, AnvilVkPipelineCodeBase(pipeC), AnvilVkPipelineCodeBytes(pipeC)) <> #VK_SUCCESS
+    pgPut(2, AnvilVkV3dShaderStage())
+    ProcedureReturn pgStop(71)
+  EndIf
+  AnvilVkV3dFragmentUniforms(3, AnvilVkV3dCodeBase(3), 0, AnvilVkPipelineColourSource(3))
+  draw\bindingCount = 2
+  draw\bindings = @gateBinds[0]
+  gateBinds[0] = paddr
+  gateBinds[1] = #PG_STRIDE_POS
+  gateBinds[2] = caddr
+  gateBinds[3] = #PG_STRIDE_COL
+  If AnvilVkV3dBuildRecord(3, AnvilVkPipelineCodeBase(pipeC), @draw, 2, AnvilVkV3dVaryingComponents(3)) <> #V3D_OK
+    ProcedureReturn pgStop(72)
+  EndIf
+  pgPut(93, AnvilVkV3dCodeBase(3))
+  pgPut(94, AnvilVkV3dRecordCount(3))
+  pgPut(95, AnvilVkV3dVaryingComponents(3))
+  pgPut(96, AnvilVkV3dProgramBytes(3, 0))
+  pgPut(97, AnvilVkV3dProgramBytes(3, 1))
+  pgPut(98, AnvilVkV3dProgramBytes(3, 2))
+
+  ; ------------------------------------------------------------------
+  ;  PIPELINE D: THE COLOUR COMES OUT OF A UNIFORM BUFFER.
+  ;
+  ;  The whole descriptor path, and the refusals that the path makes
+  ;  possible, on the same create-info.
+  ; ------------------------------------------------------------------
+  dslb\binding = 0
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dslb\descriptorCount = 1
+  dslb\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dslci\bindingCount = 1
+  dslci\pBindings = @dslb
+  pgPut(115, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dsl))
+  ; Every other descriptor type is refused by name, and a combined image
+  ; sampler is the one a caller reaches for first.
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  AnvilVkFaultClear()
+  pgPut(123, vkCreateDescriptorSetLayout(dev, @dslci, 0, @bad))
+  pgPut(71, AnvilVkFaultText())
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+
+  ; A BINDING AT A STAGE THAT CANNOT READ IT. The uniform path supplies
+  ; the fragment colour; a vertex-stage binding would be declared and
+  ; never supplied to anything.
+  dslb\stageFlags = #VK_SHADER_STAGE_VERTEX_BIT
+  pgPut(128, vkCreateDescriptorSetLayout(dev, @dslci, 0, @bad))
+  dslb\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+
+  ; A SECOND SET LAYOUT OF A DIFFERENT SHAPE - two bindings - and a
+  ; pipeline layout that declares it. It exists so a set allocated from
+  ; the one-binding layout can be bound through a layout that agreed to
+  ; something else, which is otherwise unreachable: every OTHER way of
+  ; getting that wrong is caught by an earlier rule.
+  dslb2[0]\binding = 0
+  dslb2[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dslb2[0]\descriptorCount = 1
+  dslb2[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslb2[1]\binding = 1
+  dslb2[1]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dslb2[1]\descriptorCount = 1
+  dslb2[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci2\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dslci2\bindingCount = 2
+  dslci2\pBindings = @dslb2[0]
+  pgPut(137, vkCreateDescriptorSetLayout(dev, @dslci2, 0, @dsl2))
+
+  dps\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dps\descriptorCount = 1
+  dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  dpci\maxSets = 1
+  dpci\poolSizeCount = 1
+  dpci\pPoolSizes = @dps
+  pgPut(116, vkCreateDescriptorPool(dev, @dpci, 0, @dpool))
+  dslArray = dsl
+  dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  dsai\descriptorPool = dpool
+  dsai\descriptorSetCount = 1
+  dsai\pSetLayouts = @dslArray
+  pgPut(117, vkAllocateDescriptorSets(dev, @dsai, @dset))
+  dbi\buffer = bufU
+  dbi\offset = 0
+  dbi\range = 16
+  wds\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  wds\dstSet = dset
+  wds\dstBinding = 0
+  wds\dstArrayElement = 0
+  wds\descriptorCount = 1
+  wds\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  wds\pBufferInfo = @dbi
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  ; THE CODE, NOT THE COUNT. AnvilVkFaultClear() clears the code and the
+  ; sentence; the count is a running total of every refusal this run has
+  ; made on purpose, and it is meant to be.
+  pgPut(118, AnvilVkFaultCode())
+  ; A descriptor COPY is refused: one write per call and no copies.
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 1, @wds)
+  pgPut(70, AnvilVkFaultCode())
+  ; THE FIVE WAYS A WRITE CAN NAME SOMETHING IT MAY NOT, each moved on
+  ; its own and each put back before the next.
+  dbi\buffer = buf                       ; a vertex buffer, not a uniform one
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  pgPut(129, AnvilVkFaultCode())
+  dbi\buffer = bufU
+  dbi\offset = 4                         ; not a multiple of sixteen
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  pgPut(130, AnvilVkFaultCode())
+  dbi\offset = 0
+  dbi\range = 8                          ; shorter than the block
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  pgPut(131, AnvilVkFaultCode())
+  dbi\range = 16
+  wds\dstBinding = 1                     ; a binding this layout has not got
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  pgPut(132, AnvilVkFaultCode())
+  wds\dstBinding = 0
+  ; And the write that is right, again, so the set holds the buffer the
+  ; draw below reads rather than whatever the last refusal left.
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+  pgPut(136, AnvilVkFaultCode())
+  pgPut(119, AnvilVkDescriptorSetAddress(dset, 0))
+  pgPut(120, AnvilVkDescriptorSetRange(dset, 0))
+  pgPut(69, uaddr)
+
+  plci\setLayoutCount = 1
+  plci\pSetLayouts = @dslArray
+  plci\pushConstantRangeCount = 0
+  plci\pPushConstantRanges = 0
+  If vkCreatePipelineLayout(dev, @plci, 0, @layU) <> #VK_SUCCESS
+    ProcedureReturn pgStop(74)
+  EndIf
+  dsl2Array = dsl2
+  plci\pSetLayouts = @dsl2Array
+  pgPut(138, vkCreatePipelineLayout(dev, @plci, 0, @layV))
+  plci\pSetLayouts = @dslArray
+
+  ; Position only, out of one binding, with the uniform colour.
+  binds[0]\binding = 0
+  binds[0]\stride = #PG_STRIDE_POS
+  binds[0]\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[0]\location = 0
+  attrs[0]\binding = 0
+  attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[0]\offset = 0
+  vi\vertexBindingDescriptionCount = 1
+  vi\pVertexBindingDescriptions = @binds[0]
+  vi\vertexAttributeDescriptionCount = 1
+  stages[0]\module = vsB
+  stages[1]\module = fsU
+  gp\layout = layU
+  If vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeD) <> #VK_SUCCESS
+    pgPut(2, AnvilVkFaultCode())
+    ProcedureReturn pgStop(75)
+  EndIf
+  ; The same pipeline through a layout that declares no set layout.
+  gp\layout = layA
+  AnvilVkFaultClear()
+  pgPut(124, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(135, AnvilVkFaultText())
+  gp\layout = layU
+  ; A SHADER WHOSE BINDING THE SET LAYOUT DOES NOT DECLARE. The sixth
+  ; module is the same uniform fragment shader at binding ONE, and this
+  ; layout's set has binding zero only.
+  smci\pCode = PeekI(#PG_IN + 80)
+  smci\codeSize = PeekI(#PG_IN + 88)
+  If vkCreateShaderModule(dev, @smci, 0, @fsW) <> #VK_SUCCESS
+    ProcedureReturn pgStop(77)
+  EndIf
+  stages[1]\module = fsW
+  AnvilVkFaultClear()
+  pgPut(134, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  stages[1]\module = fsU
+  ; A LAYOUT THAT DECLARES A SET NOTHING READS: the interpolated
+  ; fragment shader, through the uniform pipeline layout.
+  stages[0]\module = vsA
+  stages[1]\module = fsA
+  AnvilVkFaultClear()
+  pgPut(133, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  stages[0]\module = vsB
+  stages[1]\module = fsU
+  pgPut(66, AnvilVkPipelineColourSource(4))
+  pgPut(73, AnvilVkPipelineAttrCount(4))
+  If AnvilVkV3dCompile(4, AnvilVkPipelineCodeBase(pipeD), AnvilVkPipelineCodeBytes(pipeD)) <> #VK_SUCCESS
+    pgPut(2, AnvilVkV3dShaderStage())
+    ProcedureReturn pgStop(76)
+  EndIf
+  ; The fragment uniform stream for a descriptor colour is built from
+  ; the descriptor's own address, exactly as the backend builds it.
+  AnvilVkV3dFragmentUniforms(4, AnvilVkV3dCodeBase(4), AnvilVkDescriptorSetAddress(dset, 0), AnvilVkPipelineColourSource(4))
+  pgPut(127, AnvilVkV3dCodeBase(4))
+
+  ; Put the shared create-info back the way pipeline A left it, so the
+  ; recording refusals below still describe pipeline A's own layout.
+  vi\vertexBindingDescriptionCount = 1
+  vi\pVertexBindingDescriptions = @bind
+  vi\vertexAttributeDescriptionCount = 2
+  stages[0]\module = vsA
+  stages[1]\module = fsA
+  gp\layout = layA
+  attrs[1]\binding = 0
+  attrs[1]\offset = 8
+  bind\stride = #PG_STRIDE1
 
   ; ------------------------------------------------------------------
   ;  Record one render pass with one draw, and submit it.
@@ -564,8 +1001,8 @@ Procedure.i Main()
   pgPut(20, AnvilVkLastDrawRecord())
   pgPut(21, AnvilVkTestBackendDraws())
   pgPut(22, AnvilVkTestBackendPipelines())
-  pgPut(23, AnvilVkTestBackendLastVertexBase())
-  pgPut(24, AnvilVkTestBackendLastStride())
+  pgPut(23, AnvilVkTestBackendLastVertexBase(0))
+  pgPut(24, AnvilVkTestBackendLastStride(0))
   pgPut(25, AnvilVkTestBackendLastVertexCount())
   pgPut(26, AnvilVkTestBackendLastFirstVertex())
   pgPut(27, AnvilVkTestBackendLastPushBase())
@@ -621,6 +1058,125 @@ Procedure.i Main()
   vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
   vkCmdDraw(cmd, 3, 1, 0, 0)
   pgPut(48, vkEndCommandBuffer(cmd))
+
+  ; ------------------------------------------------------------------
+  ;  THE TWO-BINDING DRAW, and the two ways it can be got wrong.
+  ; ------------------------------------------------------------------
+  ; Only binding zero bound: the colour attribute would be fetched from
+  ; nothing at all.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeC)
+  twoBufs[0] = bufP
+  twoBufs[1] = bufC
+  twoOffsets[0] = 0
+  twoOffsets[1] = 0
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  AnvilVkFaultClear()
+  pgPut(99, vkEndCommandBuffer(cmd))
+  pgPut(100, AnvilVkCommandBufferFailureText(cmd))
+
+  ; Both bound, but six vertices: that fits binding zero's forty-eight
+  ; bytes exactly and runs twice past the end of binding one.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeC)
+  vkCmdBindVertexBuffers(cmd, 0, 2, @twoBufs[0], @twoOffsets[0])
+  vkCmdDraw(cmd, 6, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(101, vkEndCommandBuffer(cmd))
+
+  ; And the draw that is right.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeC)
+  vkCmdBindVertexBuffers(cmd, 0, 2, @twoBufs[0], @twoOffsets[0])
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(102, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(103, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(104, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(105, AnvilVkTestBackendLastBindingCount())
+  pgPut(106, AnvilVkTestBackendLastVertexBase(0))
+  pgPut(107, AnvilVkTestBackendLastVertexBase(1))
+  pgPut(108, AnvilVkTestBackendLastStride(0))
+  pgPut(109, AnvilVkTestBackendLastStride(1))
+  pgPut(110, AnvilVkTestBackendLastVertexBase(2))
+  pgPut(111, AnvilVkTestBackendLastStride(2))
+  pgPut(112, AnvilVkTestBackendDraws())
+  bad = 0
+  i = 0
+  While i < AnvilVkImageSize(img)
+    If (PeekL(AnvilVkImageAddress(img) + i) & $FFFFFFFF) <> #PG_POISON
+      bad = bad + 1
+    EndIf
+    i = i + 4
+  Wend
+  pgPut(113, bad)
+
+  ; ------------------------------------------------------------------
+  ;  THE DESCRIPTOR DRAW, and the two ways it can be got wrong.
+  ; ------------------------------------------------------------------
+  twoBufs[0] = bufP
+  twoOffsets[0] = 0
+  dsetArray = dset
+  ; No descriptor set bound at all.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeD)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(125, vkEndCommandBuffer(cmd))
+  pgPut(72, AnvilVkCommandBufferFailureText(cmd))
+
+  ; A set bound through a layout that declares no descriptor set at all.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeD)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layA, 0, 1, @dsetArray, 0, 0)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(126, vkEndCommandBuffer(cmd))
+
+  ; A set bound through a layout that declares a set of a DIFFERENT
+  ; SHAPE. Both layouts declare one set, so the rule above cannot see
+  ; this one: only the set's own layout can.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeD)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layV, 0, 1, @dsetArray, 0, 0)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(139, vkEndCommandBuffer(cmd))
+
+  ; And the draw that is right.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeD)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layU, 0, 1, @dsetArray, 0, 0)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(114, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  vkQueueSubmit(queue, 1, @si, fence)
+  vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000)
+  pgPut(121, AnvilVkTestBackendLastUniformBase())
+  pgPut(122, AnvilVkTestBackendLastUniformBytes())
+  pgPut(68, AnvilVkTestBackendDraws())
 
   ; ------------------------------------------------------------------
   ;  ONE JOB PER SUBMISSION. A command buffer that holds both a transfer
@@ -681,17 +1237,32 @@ Procedure.i Main()
   vkDestroyFence(dev, fence, 0)
   vkDestroyPipeline(dev, pipeA, 0)
   vkDestroyPipeline(dev, pipeB, 0)
+  vkDestroyPipeline(dev, pipeC, 0)
+  vkDestroyPipeline(dev, pipeD, 0)
+  vkDestroyDescriptorPool(dev, dpool, 0)
+  vkDestroyDescriptorSetLayout(dev, dsl, 0)
+  vkDestroyDescriptorSetLayout(dev, dsl2, 0)
+  vkDestroyPipelineLayout(dev, layU, 0)
+  vkDestroyPipelineLayout(dev, layV, 0)
   vkDestroyPipelineLayout(dev, layA, 0)
   vkDestroyPipelineLayout(dev, layB, 0)
   vkDestroyShaderModule(dev, vsA, 0)
   vkDestroyShaderModule(dev, fsA, 0)
   vkDestroyShaderModule(dev, vsB, 0)
   vkDestroyShaderModule(dev, fsB, 0)
+  vkDestroyShaderModule(dev, fsU, 0)
+  vkDestroyShaderModule(dev, fsW, 0)
   vkDestroyFramebuffer(dev, fb, 0)
   vkDestroyRenderPass(dev, rp, 0)
   vkDestroyImageView(dev, view, 0)
   vkDestroyBuffer(dev, buf, 0)
   vkFreeMemory(dev, bmem, 0)
+  vkDestroyBuffer(dev, bufP, 0)
+  vkFreeMemory(dev, pmem, 0)
+  vkDestroyBuffer(dev, bufC, 0)
+  vkFreeMemory(dev, cmem, 0)
+  vkDestroyBuffer(dev, bufU, 0)
+  vkFreeMemory(dev, umem, 0)
   vkDestroyImage(dev, img, 0)
   vkFreeMemory(dev, mem, 0)
   vkDestroyCommandPool(dev, pool, 0)

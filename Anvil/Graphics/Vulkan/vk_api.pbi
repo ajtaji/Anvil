@@ -598,6 +598,79 @@ Procedure vkDestroyShaderModule(device.i, shaderModule.i, *pAllocator)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  DESCRIPTOR SET LAYOUTS, POOLS AND SETS
+; ----------------------------------------------------------------------
+Procedure.i vkCreateDescriptorSetLayout(device.i, *pCreateInfo.VkDescriptorSetLayoutCreateInfo, *pAllocator, *pSetLayout)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pSetLayout = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  ProcedureReturn AnvilVkDescriptorSetLayoutCreate(device, *pCreateInfo, *pSetLayout)
+EndProcedure
+
+Procedure vkDestroyDescriptorSetLayout(device.i, descriptorSetLayout.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkDescriptorSetLayoutDestroy(device, descriptorSetLayout)
+EndProcedure
+
+Procedure.i vkCreateDescriptorPool(device.i, *pCreateInfo.VkDescriptorPoolCreateInfo, *pAllocator, *pDescriptorPool)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pDescriptorPool = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  ProcedureReturn AnvilVkDescriptorPoolCreate(device, *pCreateInfo, *pDescriptorPool)
+EndProcedure
+
+Procedure vkDestroyDescriptorPool(device.i, descriptorPool.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkDescriptorPoolDestroy(device, descriptorPool)
+EndProcedure
+
+Procedure.i vkResetDescriptorPool(device.i, descriptorPool.i, flags.i)
+  If flags <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkResetDescriptorPool was given flags (Anvil code -20001, invalid argument); VkDescriptorPoolResetFlags is reserved and must be zero.")
+  EndIf
+  ProcedureReturn AnvilVkDescriptorPoolReset(device, descriptorPool)
+EndProcedure
+
+Procedure.i vkAllocateDescriptorSets(device.i, *pAllocateInfo.VkDescriptorSetAllocateInfo, *pDescriptorSets)
+  If *pAllocateInfo = 0 Or *pDescriptorSets = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  ProcedureReturn AnvilVkDescriptorSetsAllocate(device, *pAllocateInfo, *pDescriptorSets)
+EndProcedure
+
+; vkFreeDescriptorSets EXISTS AND IT REFUSES, which is not the same as
+; not being here: a caller who reaches for it is told that this pool was
+; created without VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT and
+; what to do instead, rather than failing to link.
+Procedure.i vkFreeDescriptorSets(device.i, descriptorPool.i, descriptorSetCount.i, *pDescriptorSets)
+  ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkFreeDescriptorSets was called on a pool that was not created with VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT (Anvil code -20005, individual descriptor-set freeing not implemented); no set was freed. That bit is refused at vkCreateDescriptorPool, so every pool here returns its sets together - call vkResetDescriptorPool or vkDestroyDescriptorPool.")
+EndProcedure
+
+Procedure vkUpdateDescriptorSets(device.i, descriptorWriteCount.i, *pDescriptorWrites.VkWriteDescriptorSet, descriptorCopyCount.i, *pDescriptorCopies)
+  AnvilVkDescriptorSetsUpdate(device, descriptorWriteCount, *pDescriptorWrites, descriptorCopyCount, *pDescriptorCopies)
+EndProcedure
+
+Procedure vkCmdBindDescriptorSets(commandBuffer.i, pipelineBindPoint.i, layout.i, firstSet.i, descriptorSetCount.i, *pDescriptorSets, dynamicOffsetCount.i, *pDynamicOffsets)
+  If *pDescriptorSets = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdBindDescriptorSets was given a null pDescriptorSets (Anvil code -20001, invalid argument); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If descriptorSetCount <> 1
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindDescriptorSets was asked to bind other than exactly one descriptor set (Anvil code -20005, unsupported set count); a pipeline layout here declares one set layout, so binding two would leave one of them unread.")
+    ProcedureReturn
+  EndIf
+  If dynamicOffsetCount <> 0 Or *pDynamicOffsets <> 0
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindDescriptorSets was given dynamic offsets (Anvil code -20005, dynamic descriptors not implemented); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdBindDescriptorSet(commandBuffer, pipelineBindPoint, layout, firstSet, PeekI(*pDescriptorSets), dynamicOffsetCount)
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  PIPELINE LAYOUT, RENDER PASS, IMAGE VIEW, FRAMEBUFFER
 ; ----------------------------------------------------------------------
 Procedure.i vkCreatePipelineLayout(device.i, *pCreateInfo.VkPipelineLayoutCreateInfo, *pAllocator, *pPipelineLayout)
@@ -611,7 +684,7 @@ Procedure.i vkCreatePipelineLayout(device.i, *pCreateInfo.VkPipelineLayoutCreate
   If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreatePipelineLayout was given a VkPipelineLayoutCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no layout was created.")
   EndIf
-  ProcedureReturn AnvilVkPipelineLayoutCreate(device, *pCreateInfo\setLayoutCount & $FFFFFFFF, *pCreateInfo\pushConstantRangeCount & $FFFFFFFF, *pCreateInfo\pPushConstantRanges, *pPipelineLayout)
+  ProcedureReturn AnvilVkPipelineLayoutCreate(device, *pCreateInfo\setLayoutCount & $FFFFFFFF, *pCreateInfo\pSetLayouts, *pCreateInfo\pushConstantRangeCount & $FFFFFFFF, *pCreateInfo\pPushConstantRanges, *pPipelineLayout)
 EndProcedure
 
 Procedure vkDestroyPipelineLayout(device.i, pipelineLayout.i, *pAllocator)
@@ -762,18 +835,29 @@ Procedure vkCmdBindPipeline(commandBuffer.i, pipelineBindPoint.i, pipeline.i)
   AnvilVkCmdBindPipeline(commandBuffer, pipelineBindPoint, pipeline)
 EndProcedure
 
+; The registry's own signature: a first binding, a count, and two arrays.
+; It binds them one at a time through the recording procedure, so one
+; call binding two buffers and two calls binding one each leave the
+; command buffer in exactly the same state - which is what an application
+; that binds its static colour buffer once and restreams position every
+; frame depends on.
 Procedure vkCmdBindVertexBuffers(commandBuffer.i, firstBinding.i, bindingCount.i, *pBuffers, *pOffsets)
+  Define k.i
   If *pBuffers = 0 Or *pOffsets = 0
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdBindVertexBuffers was given a null pBuffers or pOffsets (Anvil code -20001, invalid argument); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If bindingCount <> 1
-    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindVertexBuffers was asked to bind other than exactly one binding (Anvil code -20005, unsupported binding count); this slice has one vertex input binding, so binding two would leave one of them unread.")
+  If bindingCount < 1 Or firstBinding < 0 Or (firstBinding + bindingCount) > #ANVIL_VK_MAX_BINDINGS
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCmdBindVertexBuffers was asked to bind a range of bindings this slice does not have (Anvil code -20005, unsupported binding range); firstBinding plus bindingCount must be at least one and at most four, which is the number of vertex input bindings a pipeline here may describe.")
     ProcedureReturn
   EndIf
   ; VkDeviceSize is uint64_t and the native integer is 64 bits on this
-  ; part, so one PeekI reads the whole offset.
-  AnvilVkCmdBindVertexBuffer(commandBuffer, firstBinding, PeekI(*pBuffers), PeekI(*pOffsets))
+  ; part, so one PeekI reads a whole offset.
+  k = 0
+  While k < bindingCount
+    AnvilVkCmdBindVertexBuffer(commandBuffer, firstBinding + k, PeekI(*pBuffers + (k * 8)), PeekI(*pOffsets + (k * 8)))
+    k = k + 1
+  Wend
 EndProcedure
 
 Procedure vkCmdPushConstants(commandBuffer.i, layout.i, stageFlags.i, offset.i, size.i, *pValues)

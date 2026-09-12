@@ -45,7 +45,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5350
-SLOTS = 16
+SLOTS = 24
 HEAD = 64
 
 # Anvil result codes, from vk_foundation.pbi.
@@ -82,6 +82,8 @@ EM_VERTEX, EM_FRAGMENT, EM_GLCOMPUTE = 0, 4, 5
 MODE_ORIGIN_UPPER_LEFT = 7
 SC_INPUT, SC_OUTPUT, SC_PUSH, SC_FUNCTION, SC_UNIFORM = 1, 3, 9, 7, 2
 DEC_BLOCK, DEC_BUILTIN, DEC_LOCATION, DEC_OFFSET, DEC_DESCRIPTOR_SET = 2, 11, 30, 35, 34
+DEC_BINDING, DEC_BUFFER_BLOCK = 33, 3
+SC_UNIFORM_CONSTANT, SC_STORAGE_BUFFER = 0, 12
 BUILTIN_POSITION, BUILTIN_POINTSIZE = 0, 1
 
 F0 = 0x00000000
@@ -248,6 +250,142 @@ def fragment_push() -> bytes:
         ins(OP["FunctionEnd"]),
     ]
     return module(17, b)
+
+
+def fragment_uniform(set_: int = 0, binding: int = 0, block: bool = True,
+                     storage: int = SC_UNIFORM, member_vec2: bool = False,
+                     decorate: bool = True, read: bool = True,
+                     second_block: bool = False, member1: bool = False) -> bytes:
+    """layout(set, binding) uniform U { vec4 colour; } -> out vec4 colour.
+
+    WITH ITS DEFAULTS THIS IS EXACTLY vk_spirv_fixtures.pbi's vtpBuildFsC,
+    word for word, and the gate reports that module so the two can be
+    compared. Every knob moves ONE thing for a refusal fixture: which
+    set, which binding, whether the struct carries Block, which storage
+    class, whether the first member is a vec2, whether the decorations
+    are there at all, and whether the shader reads what it declared.
+    """
+    bound = 17
+    head = [
+        ins(OP["Capability"], CAP_SHADER),
+        ins(OP["MemoryModel"], ADDR_LOGICAL, MEM_GLSL450),
+        ins(OP["EntryPoint"], EM_FRAGMENT, 13, *lit("main"), 9),
+        ins(OP["ExecutionMode"], 13, MODE_ORIGIN_UPPER_LEFT),
+    ]
+    if block:
+        head.append(ins(OP["Decorate"], 5, DEC_BLOCK))
+    head.append(ins(OP["MemberDecorate"], 5, 0, DEC_OFFSET, 0))
+    if member1:
+        head.append(ins(OP["MemberDecorate"], 5, 1, DEC_OFFSET, 16))
+    if second_block:
+        head.append(ins(OP["Decorate"], 20, DEC_BLOCK))
+        head.append(ins(OP["Decorate"], 22, DEC_DESCRIPTOR_SET, 0))
+        head.append(ins(OP["Decorate"], 22, DEC_BINDING, 1))
+    if decorate:
+        head.append(ins(OP["Decorate"], 8, DEC_DESCRIPTOR_SET, set_))
+        head.append(ins(OP["Decorate"], 8, DEC_BINDING, binding))
+    head.append(ins(OP["Decorate"], 9, DEC_LOCATION, 0))
+
+    member = 4
+    body = head + [
+        ins(OP["TypeVoid"], 1),
+        ins(OP["TypeFunction"], 2, 1),
+        ins(OP["TypeFloat"], 3, 32),
+        ins(OP["TypeVector"], 4, 3, 4),
+    ]
+    if member_vec2:
+        body.append(ins(OP["TypeVector"], 17, 3, 2))
+        member = 17
+        bound = 18
+    if member1:
+        body.append(ins(OP["TypeStruct"], 5, member, member))
+    else:
+        body.append(ins(OP["TypeStruct"], 5, member))
+    body += [
+        ins(OP["TypePointer"], 6, storage, 5),
+        ins(OP["TypePointer"], 7, SC_OUTPUT, 4),
+        ins(OP["TypePointer"], 12, storage, member),
+        ins(OP["TypeInt"], 10, 32, 1),
+        ins(OP["Constant"], 10, 11, 0),
+    ]
+    chain_index = 11
+    if member1:
+        body.append(ins(OP["Constant"], 10, 18, 1))
+        chain_index = 18
+        bound = 19
+    if second_block:
+        body += [
+            ins(OP["TypeStruct"], 20, 4),
+            ins(OP["TypePointer"], 21, storage, 20),
+            ins(OP["Variable"], 21, 22, storage),
+        ]
+        bound = 23
+    if not read:
+        body += [
+            ins(OP["Constant"], 3, 18, FHALF),
+            ins(OP["ConstantComposite"], 4, 19, 18, 18, 18, 18),
+        ]
+        bound = 20
+    body += [
+        ins(OP["Variable"], 6, 8, storage),
+        ins(OP["Variable"], 7, 9, SC_OUTPUT),
+        ins(OP["Function"], 1, 13, 0, 2),
+        ins(OP["Label"], 14),
+    ]
+    if read:
+        body += [
+            ins(OP["AccessChain"], 12, 15, 8, chain_index),
+            ins(OP["Load"], 4, 16, 15),
+            ins(OP["Store"], 9, 16),
+        ]
+    else:
+        body += [ins(OP["Store"], 9, 19)]
+    body += [ins(OP["Return"]), ins(OP["FunctionEnd"])]
+    return module(bound, body)
+
+
+def vertex_uniform() -> bytes:
+    """A uniform block in a VERTEX shader, which has no uniform path."""
+    b = [
+        ins(OP["Capability"], CAP_SHADER),
+        ins(OP["MemoryModel"], ADDR_LOGICAL, MEM_GLSL450),
+        ins(OP["EntryPoint"], EM_VERTEX, 16, *lit("main"), 13, 14),
+        ins(OP["MemberDecorate"], 8, 0, DEC_BUILTIN, BUILTIN_POSITION),
+        ins(OP["Decorate"], 8, DEC_BLOCK),
+        ins(OP["Decorate"], 13, DEC_LOCATION, 0),
+        ins(OP["Decorate"], 20, DEC_BLOCK),
+        ins(OP["Decorate"], 21, DEC_DESCRIPTOR_SET, 0),
+        ins(OP["Decorate"], 21, DEC_BINDING, 0),
+        ins(OP["TypeVoid"], 1),
+        ins(OP["TypeFunction"], 2, 1),
+        ins(OP["TypeFloat"], 3, 32),
+        ins(OP["TypeVector"], 4, 3, 2),
+        ins(OP["TypeVector"], 5, 3, 4),
+        ins(OP["TypePointer"], 6, SC_INPUT, 4),
+        ins(OP["TypeStruct"], 8, 5),
+        ins(OP["TypePointer"], 9, SC_OUTPUT, 8),
+        ins(OP["TypePointer"], 7, SC_OUTPUT, 5),
+        ins(OP["TypeStruct"], 20, 5),
+        ins(OP["TypePointer"], 22, SC_UNIFORM, 20),
+        ins(OP["TypeInt"], 10, 32, 1),
+        ins(OP["Constant"], 10, 11, 0),
+        ins(OP["Constant"], 3, 12, F0),
+        ins(OP["Constant"], 3, 15, F1),
+        ins(OP["Variable"], 6, 13, SC_INPUT),
+        ins(OP["Variable"], 9, 14, SC_OUTPUT),
+        ins(OP["Variable"], 22, 21, SC_UNIFORM),
+        ins(OP["Function"], 1, 16, 0, 2),
+        ins(OP["Label"], 17),
+        ins(OP["Load"], 4, 18, 13),
+        ins(OP["CompositeExtract"], 3, 19, 18, 0),
+        ins(OP["CompositeExtract"], 3, 23, 18, 1),
+        ins(OP["CompositeConstruct"], 5, 24, 19, 23, 12, 15),
+        ins(OP["AccessChain"], 7, 25, 14, 11),
+        ins(OP["Store"], 25, 24),
+        ins(OP["Return"]),
+        ins(OP["FunctionEnd"]),
+    ]
+    return module(26, b)
 
 
 def fragment_constant() -> bytes:
@@ -464,6 +602,16 @@ def build_fixtures() -> list[dict]:
              blob=fragment_constant(),
              rc=OK, stage=4, inputs=0, outputs=1, pos=-1, colour=2,
              comps=(0, 0), outcomp=4, outsrc=-1, push=0, const=FHALF),
+        dict(name="a fragment shader that writes a uniform-buffer colour",
+             blob=fragment_uniform(),
+             rc=OK, stage=4, inputs=0, outputs=1, pos=-1, colour=3,
+             comps=(0, 0), outcomp=4, outsrc=-1, push=0,
+             uniform=1, uset=0, ubinding=0),
+        dict(name="the same, at binding one of set zero",
+             blob=fragment_uniform(binding=1),
+             rc=OK, stage=4, inputs=0, outputs=1, pos=-1, colour=3,
+             comps=(0, 0), outcomp=4, outsrc=-1, push=0,
+             uniform=1, uset=0, ubinding=1),
 
         dict(name="a module whose magic number is not SPIR-V",
              blob=_mutate_words(good_vertex, 0, 0xDEADBEEF),
@@ -499,9 +647,47 @@ def build_fixtures() -> list[dict]:
         dict(name="a fragment shader that declares an image type",
              blob=image, rc=ERR_UNSUPPORTED, opcode=OP["TypeImage"],
              text="OpTypeImage"),
-        dict(name="a shader with a descriptor-set decoration",
+        dict(name="a descriptor-set decoration on an output variable",
              blob=descriptor, rc=ERR_UNSUPPORTED, opcode=OP["Decorate"],
              text="DescriptorSet"),
+        dict(name="a uniform block at a descriptor set other than zero",
+             blob=fragment_uniform(set_=1), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="DescriptorSet other than zero"),
+        dict(name="a uniform block at a binding the set layout cannot hold",
+             blob=fragment_uniform(binding=2), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="Binding this implementation"),
+        dict(name="a uniform structure that is not decorated Block",
+             blob=fragment_uniform(block=False), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="not decorated Block"),
+        dict(name="a uniform block whose first member is a vec2",
+             blob=fragment_uniform(member_vec2=True), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="four-component"),
+        dict(name="a uniform block with no DescriptorSet or Binding",
+             blob=fragment_uniform(decorate=False), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="both DescriptorSet and Binding"),
+        dict(name="a uniform block that is declared and never read",
+             blob=fragment_uniform(read=False), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="never reads it"),
+        dict(name="a module with two Uniform-storage blocks",
+             blob=fragment_uniform(second_block=True), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="second Uniform-storage block"),
+        dict(name="a fragment shader that reads uniform-block member one",
+             blob=fragment_uniform(member1=True), rc=ERR_UNSUPPORTED,
+             opcode=OP["Store"], text="member other than the first"),
+        dict(name="a uniform block in a vertex shader",
+             blob=vertex_uniform(), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="vertex shader"),
+        dict(name="a variable in the StorageBuffer storage class",
+             blob=fragment_uniform(storage=SC_STORAGE_BUFFER),
+             rc=ERR_UNSUPPORTED, opcode=OP["Variable"], text="StorageBuffer"),
+        dict(name="a variable in the UniformConstant storage class",
+             blob=fragment_uniform(storage=SC_UNIFORM_CONSTANT),
+             rc=ERR_UNSUPPORTED, opcode=OP["Variable"], text="UniformConstant"),
+        dict(name="a shader with a BufferBlock decoration",
+             blob=_replace_instruction(fragment_uniform(),
+                                       ins(OP["Decorate"], 5, DEC_BLOCK),
+                                       ins(OP["Decorate"], 5, DEC_BUFFER_BLOCK)),
+             rc=ERR_UNSUPPORTED, opcode=OP["Decorate"], text="BufferBlock"),
         dict(name="a module that declares the Geometry capability",
              blob=_replace_instruction(good_vertex,
                                        ins(OP["Capability"], CAP_SHADER),
@@ -538,11 +724,12 @@ def build_fixtures() -> list[dict]:
                                        ins(OP["Variable"], 5, 7, SC_INPUT),
                                        ins(OP["Variable"], 5, 7, SC_FUNCTION)),
              rc=ERR_UNSUPPORTED, opcode=OP["Variable"], text="Function"),
-        dict(name="a descriptor-backed uniform variable",
+        dict(name="a Uniform-storage variable with no descriptor decorations",
              blob=_replace_instruction(good_fragment,
                                        ins(OP["Variable"], 5, 7, SC_INPUT),
                                        ins(OP["Variable"], 5, 7, SC_UNIFORM)),
-             rc=ERR_UNSUPPORTED, opcode=OP["Variable"], text="Uniform"),
+             rc=ERR_UNSUPPORTED, opcode=OP["Variable"],
+             text="both DescriptorSet and Binding"),
         dict(name="a vertex shader whose gl_Position.z is not zero",
              blob=vertex_passthrough(zbits=FHALF),
              rc=ERR_UNSUPPORTED, text="gl_Position.z"),
@@ -653,6 +840,43 @@ MUTANTS = (
     ("a vertex varying may be computed rather than passed through",
      "    If a < 0\n      ProcedureReturn avkSpvRefuse(#SpvOpStore,",
      "    If a < -1\n      ProcedureReturn avkSpvRefuse(#SpvOpStore,"),
+    # --- the uniform block ---
+    ("a uniform block need not be decorated Block",
+     "  If spvDecBlock[t] = 0\n",
+     "  If spvDecBlock[t] = -1\n"),
+    ("a uniform block may sit at any descriptor set",
+     "  If spvDecSet[spvUniformVar] <> 0\n",
+     "  If spvDecSet[spvUniformVar] < 0\n"),
+    ("a uniform block may sit at a binding the set layout cannot hold",
+     "  If spvDecBinding[spvUniformVar] < 0 Or spvDecBinding[spvUniformVar] >= #ANVIL_VK_MAX_SET_BINDINGS\n",
+     "  If spvDecBinding[spvUniformVar] < 0 Or spvDecBinding[spvUniformVar] >= 99\n"),
+    ("a uniform block's first member may be any width",
+     "  If avkSpvIdOk(m) = 0 Or avkSpvIsFloatish(m) = 0 Or avkSpvComponents(m) <> 4\n",
+     "  If avkSpvIdOk(m) = 0 Or avkSpvIsFloatish(m) = 0 Or avkSpvComponents(m) < 0\n"),
+    ("a Uniform variable need not carry DescriptorSet and Binding",
+     "        If spvDecSet[id] < 0 Or spvDecBinding[id] < 0\n",
+     "        If spvDecSet[id] < -1 Or spvDecBinding[id] < -1\n"),
+    ("a descriptor decoration on an interface variable is ignored",
+     "      ElseIf spvDecSet[id] >= 0 Or spvDecBinding[id] >= 0\n",
+     "      ElseIf spvDecSet[id] >= 99 Or spvDecBinding[id] >= 99\n"),
+    ("a second uniform block is accepted",
+     "        If spvUniformVar <> 0\n          ProcedureReturn avkSpvRefuse(op, \"the SPIR-V front end refused a second Uniform-storage block",
+     "        If spvUniformVar < 0\n          ProcedureReturn avkSpvRefuse(op, \"the SPIR-V front end refused a second Uniform-storage block"),
+    ("a uniform block in a vertex shader is accepted and then read as zero",
+     "    If spvUniformVar <> 0\n      ProcedureReturn avkSpvRefuse(#SpvOpVariable, \"the SPIR-V front end refused a Uniform-storage block in a vertex shader",
+     "    If spvUniformVar < 0\n      ProcedureReturn avkSpvRefuse(#SpvOpVariable, \"the SPIR-V front end refused a Uniform-storage block in a vertex shader"),
+    ("a uniform block declared and never read is accepted",
+     "  If spvUniformVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_UNIFORM\n",
+     "  If spvUniformVar < 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_UNIFORM\n"),
+    ("a uniform-block member other than the first may be read",
+     "    If spvValueA[v] <> 0\n      ProcedureReturn avkSpvRefuse(#SpvOpStore, \"the SPIR-V front end refused a fragment shader that reads a uniform-block member",
+     "    If spvValueA[v] < 0\n      ProcedureReturn avkSpvRefuse(#SpvOpStore, \"the SPIR-V front end refused a fragment shader that reads a uniform-block member"),
+    ("the StorageBuffer storage class is accepted",
+     "      If b = #SpvStorageClassStorageBuffer\n",
+     "      If b = -1\n"),
+    ("the UniformConstant storage class is accepted",
+     "      If b = #SpvStorageClassUniformConstant\n",
+     "      If b = -2\n"),
 )
 
 
@@ -829,6 +1053,12 @@ def grade(cpu, rc, fixtures) -> Grader:
             g.need(f"[{i}] {name} - output 0 components", s64(cpu, base + 88), spec["outcomp"])
             g.need(f"[{i}] {name} - output 0 source", s64(cpu, base + 96), spec["outsrc"])
             g.need(f"[{i}] {name} - push constants used", s64(cpu, base + 104), spec["push"])
+            g.need(f"[{i}] {name} - uniform block used", s64(cpu, base + 128),
+                   spec.get("uniform", 0))
+            g.need(f"[{i}] {name} - uniform descriptor set", s64(cpu, base + 136),
+                   spec.get("uset", -1))
+            g.need(f"[{i}] {name} - uniform binding", s64(cpu, base + 144),
+                   spec.get("ubinding", -1))
             if "const" in spec:
                 g.need(f"[{i}] {name} - constant colour", u64(cpu, base + 112) & 0xFFFFFFFF,
                        spec["const"])

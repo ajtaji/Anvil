@@ -3,15 +3,19 @@
 ; ======================================================================
 ; SPDX-License-Identifier: MIT
 ;
-; The four shader modules the triangle proof feeds Anvil's SPIR-V front
+; The five shader modules the board diagnostics feed Anvil's SPIR-V front
 ; end, written out word by word so a reader can check them against the
 ; specification without a tool.
 ;
-; THEY LIVE HERE RATHER THAN IN THE DIAGNOSTIC because the desk gate
-; walks the SAME four modules and compares them, byte for byte, against
-; modules a Python assembler builds independently. If they lived in the
-; diagnostic, the board would be the first place anybody discovered that
-; one of these words was wrong.
+; THEY LIVE HERE RATHER THAN IN A DIAGNOSTIC because the desk gate walks
+; the SAME five modules and compares them, byte for byte, against modules
+; a Python assembler builds independently. If they lived in a diagnostic,
+; the board would be the first place anybody discovered that one of these
+; words was wrong.
+;
+;   VsA  position-only vertex        VsB  position and colour vertex
+;   FsA  push-constant fragment      FsB  interpolated fragment
+;   FsC  uniform-buffer fragment
 ;
 ; PROVENANCE. The binary layout, the opcode numbers and the enumerants
 ; are the Khronos SPIR-V specification's own (registry.khronos.org/SPIR-V,
@@ -19,13 +23,14 @@
 ; transcribed the way a header's values are. Nothing is copied from any
 ; SPIR-V tool, from SPIRV-Tools, from glslang or from any driver.
 
-; The four modules, and the cursor the assembler below appends through.
+; The five modules, and the cursor the assembler below appends through.
 ; One kilobyte each is far more than any of them needs, and the front end
 ; refuses a module longer than eight.
 Global Dim vtpVsA.l[256]
 Global Dim vtpFsA.l[256]
 Global Dim vtpVsB.l[256]
 Global Dim vtpFsB.l[256]
+Global Dim vtpFsC.l[256]
 Global vtpBuf.i = 0
 Global vtpN.i = 0
 
@@ -78,12 +83,15 @@ Global vtpN.i = 0
 #VTP_EmVertex = 0
 #VTP_EmFragment = 4
 #VTP_ModeOriginUpperLeft = 7
+#VTP_ScUniform = 2
 #VTP_ScInput = 1
 #VTP_ScOutput = 3
 #VTP_ScPushConstant = 9
 #VTP_DecBlock = 2
 #VTP_DecBuiltIn = 11
 #VTP_DecLocation = 30
+#VTP_DecBinding = 33
+#VTP_DecDescriptorSet = 34
 #VTP_DecOffset = 35
 #VTP_BuiltInPosition = 0
 
@@ -276,3 +284,50 @@ Procedure.i vtpBuildFsB()
   ProcedureReturn vtpN * 4
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  The UNIFORM-BUFFER fragment shader:
+;      layout(set = 0, binding = 0) uniform U { vec4 colour; } ubo;
+;      layout(location = 0) out vec4 outColour;
+;      void main() { outColour = ubo.colour; }
+;
+;  Word for word the push-constant shader above with three differences,
+;  and they are the whole of what a descriptor is in SPIR-V: the storage
+;  class is Uniform rather than PushConstant, and the variable carries
+;  DescriptorSet and Binding. The Block decoration on the structure and
+;  the Offset on its member are unchanged, because a push-constant block
+;  and a uniform block are the same kind of structure - which is exactly
+;  why the two can be compared against each other on the bench.
+; ----------------------------------------------------------------------
+Procedure.i vtpBuildFsC()
+  vtpBuf = @vtpFsC[0]
+  vtpHeader(17)
+  vtpIns(#VTP_OpCapability, 1) : vtpW(#VTP_CapShader)
+  vtpIns(#VTP_OpMemoryModel, 2) : vtpW(#VTP_AddrLogical) : vtpW(#VTP_MemGLSL450)
+  vtpIns(#VTP_OpEntryPoint, 5) : vtpW(#VTP_EmFragment) : vtpW(13) : vtpW(#VTP_NAME0) : vtpW(#VTP_NAME1) : vtpW(9)
+  vtpIns(#VTP_OpExecutionMode, 2) : vtpW(13) : vtpW(#VTP_ModeOriginUpperLeft)
+  vtpIns(#VTP_OpDecorate, 2) : vtpW(5) : vtpW(#VTP_DecBlock)
+  vtpIns(#VTP_OpMemberDecorate, 4) : vtpW(5) : vtpW(0) : vtpW(#VTP_DecOffset) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(8) : vtpW(#VTP_DecDescriptorSet) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(8) : vtpW(#VTP_DecBinding) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(9) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpTypeVoid, 1) : vtpW(1)
+  vtpIns(#VTP_OpTypeFunction, 2) : vtpW(2) : vtpW(1)
+  vtpIns(#VTP_OpTypeFloat, 2) : vtpW(3) : vtpW(32)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(4) : vtpW(3) : vtpW(4)
+  vtpIns(#VTP_OpTypeStruct, 2) : vtpW(5) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(6) : vtpW(#VTP_ScUniform) : vtpW(5)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(7) : vtpW(#VTP_ScOutput) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(12) : vtpW(#VTP_ScUniform) : vtpW(4)
+  vtpIns(#VTP_OpTypeInt, 3) : vtpW(10) : vtpW(32) : vtpW(1)
+  vtpIns(#VTP_OpConstant, 3) : vtpW(10) : vtpW(11) : vtpW(0)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(6) : vtpW(8) : vtpW(#VTP_ScUniform)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(7) : vtpW(9) : vtpW(#VTP_ScOutput)
+  vtpIns(#VTP_OpFunction, 4) : vtpW(1) : vtpW(13) : vtpW(0) : vtpW(2)
+  vtpIns(#VTP_OpLabel, 1) : vtpW(14)
+  vtpIns(#VTP_OpAccessChain, 4) : vtpW(12) : vtpW(15) : vtpW(8) : vtpW(11)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(16) : vtpW(15)
+  vtpIns(#VTP_OpStore, 2) : vtpW(9) : vtpW(16)
+  vtpIns(#VTP_OpReturn, 0)
+  vtpIns(#VTP_OpFunctionEnd, 0)
+  ProcedureReturn vtpN * 4
+EndProcedure

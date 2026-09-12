@@ -36,9 +36,11 @@ ROOT = HERE.parent
 
 GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_interp_gate.pi4"
 EXPECT = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_interp_expect.pbi"
-# The board diagnostic is not executed here - it needs the GPU - but it is
-# BUILT, so a slot that rotted is found at a desk and not on a bench.
-DIAGNOSTIC = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanVaryingProof.pi4"
+# THE BOARD DIAGNOSTIC IS NOT BUILT HERE, and that is deliberate: it pulls in
+# the SPIR-V front end and the whole pipeline layer, which tools/vulkan_spirv_check.py
+# and tools/vulkan_pipeline_check.py MUTATE while they run. Building it here
+# would make this gate unable to run beside either of them. The diagnostic is
+# built by tools/vulkan_pipeline_check.py, which owns that closure.
 
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -469,9 +471,6 @@ def main() -> int:
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))
 
-    if DIAGNOSTIC.is_file():
-        compile_one(compiler, DIAGNOSTIC, "anvil_vulkanVaryingProof.img",
-                    0x500000, 0x4F00000)
     g, steps = run(a64, compiler)
     if g.failures:
         print(f"vulkan_interp_check: FAIL ({g.checks} checks, {steps:,} instructions)")
@@ -489,9 +488,6 @@ def main() -> int:
     print("  the weights at every covered probe sum to twice the area, and each corner")
     print("  probe is dominated by its own vertex by more than three tolerances")
     print("  NOT ONE MMIO access was made - this module owns no hardware")
-    if DIAGNOSTIC.is_file():
-        print(f"  {DIAGNOSTIC.relative_to(ROOT).as_posix()} builds at $500000")
-        print("  (not executed: it needs the GPU, and that is a board slot)")
 
     if not args.mutate:
         print("  (run with --mutate to also require every plausible mistake to be caught)")

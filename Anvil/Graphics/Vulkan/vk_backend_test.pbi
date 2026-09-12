@@ -240,11 +240,14 @@ Global avkTbPipeBytes.i = 8192
 Global avkTbDrawFail.i = 0
 Global avkTbLastPipe.i = 0
 Global avkTbLastPipeBase.i = 0
-Global avkTbLastVertexBase.i = 0
-Global avkTbLastStride.i = 0
+Global avkTbLastBindCount.i = 0
+Global Dim avkTbLastVertexBase.i[#ANVIL_VK_MAX_BINDINGS]
+Global Dim avkTbLastStride.i[#ANVIL_VK_MAX_BINDINGS]
 Global avkTbLastVertexCount.i = 0
 Global avkTbLastFirstVertex.i = 0
 Global avkTbLastPushBase.i = 0
+Global avkTbLastUniformBase.i = 0
+Global avkTbLastUniformBytes.i = 0
 Global avkTbLastDrawColour.i = 0
 Global Dim avkTbPipeBase.i[8]
 
@@ -260,12 +263,21 @@ Procedure.i AnvilVkTestBackendDraws()
   ProcedureReturn avkTbDraws
 EndProcedure
 
-Procedure.i AnvilVkTestBackendLastVertexBase()
-  ProcedureReturn avkTbLastVertexBase
+Procedure.i AnvilVkTestBackendLastBindingCount()
+  ProcedureReturn avkTbLastBindCount
 EndProcedure
 
-Procedure.i AnvilVkTestBackendLastStride()
-  ProcedureReturn avkTbLastStride
+; PER BINDING, because the record now carries one address and one stride
+; for each. A reader that only ever showed binding zero would have been
+; green on the day a second binding started pointing at nothing.
+Procedure.i AnvilVkTestBackendLastVertexBase(b.i)
+  If b < 0 Or b >= #ANVIL_VK_MAX_BINDINGS : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkTbLastVertexBase[b]
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastStride(b.i)
+  If b < 0 Or b >= #ANVIL_VK_MAX_BINDINGS : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkTbLastStride[b]
 EndProcedure
 
 Procedure.i AnvilVkTestBackendLastVertexCount()
@@ -278,6 +290,14 @@ EndProcedure
 
 Procedure.i AnvilVkTestBackendLastPushBase()
   ProcedureReturn avkTbLastPushBase
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastUniformBase()
+  ProcedureReturn avkTbLastUniformBase
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastUniformBytes()
+  ProcedureReturn avkTbLastUniformBytes
 EndProcedure
 
 Procedure.i AnvilVkTestBackendLastDrawColor()
@@ -315,6 +335,8 @@ Procedure.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
 EndProcedure
 
 Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
+  Define tbk.i
+  Define *tbb.AnvilVkBackendBinding
   If *d = 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbDraws = avkTbDraws + 1
@@ -324,11 +346,23 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   avkTbLastH = *d\height
   avkTbLastPitch = *d\pitch
   avkTbLastDrawColour = *d\clearBgra
-  avkTbLastVertexBase = *d\vertexBase
-  avkTbLastStride = *d\vertexStride
+  avkTbLastBindCount = *d\bindingCount
+  tbk = 0
+  While tbk < #ANVIL_VK_MAX_BINDINGS
+    avkTbLastVertexBase[tbk] = 0
+    avkTbLastStride[tbk] = 0
+    If *d\bindings <> 0
+      *tbb = *d\bindings + (tbk * SizeOf(AnvilVkBackendBinding))
+      avkTbLastVertexBase[tbk] = *tbb\base
+      avkTbLastStride[tbk] = *tbb\stride
+    EndIf
+    tbk = tbk + 1
+  Wend
   avkTbLastVertexCount = *d\vertexCount
   avkTbLastFirstVertex = *d\firstVertex
   avkTbLastPushBase = *d\pushBase
+  avkTbLastUniformBase = *d\uniformBase
+  avkTbLastUniformBytes = *d\uniformBytes
   avkTbTicks = avkTbTicks + 1
   If avkTbDrawFail <> 0
     avkTbNative = -777
