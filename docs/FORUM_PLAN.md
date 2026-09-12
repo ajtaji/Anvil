@@ -28,7 +28,7 @@ feature must have an implementation/proof or an explicit unresolved entry.
 | Compatibility and migration | [FORUM_COMPATIBILITY.md](FORUM_COMPATIBILITY.md) | Read-only installation census, feature inventory and proposed interchange/restore contract. No exporter/importer yet. |
 | Verified registration | `Anvil/Applications/Forum/registration.pbi`, [FORUM_REGISTRATION.md](FORUM_REGISTRATION.md) | Domain sequencing plus fake-provider tests. Crypto, transactional persistence, mail and secure transport are not supplied by the domain. |
 | Scheduling | `Anvil/Kernel/Scheduler/`, [SCHEDULER_PLAN.md](SCHEDULER_PLAN.md) | Tested logical task lifecycle/queues; no context switch or timer preemption yet. |
-| HTTP admission | `Anvil/Applications/Forum/http_head.pbi` | Bounded request-head grammar/framing admission with caller-owned state; not a socket server. |
+| HTTP service | `Anvil/Services/Http/`, [HTTP_SERVER.md](HTTP_SERVER.md) | Native connection-owned GET/HEAD server, queued TCP acceptance, keepalive and bounded servicing; desk-tested and included in the Pi 4 monitor. No TLS, forum routes or Pi 3 hardware proof yet. |
 | Pi 3 | `RaspberryPi3/Board/platform.pbi`, [NEW_BOARD_PORTS.md](NEW_BOARD_PORTS.md) | Identity stub only. No executable board entry, storage/network drivers or hardware proof. |
 
 The scheduler is a kernel service, not code private to the forum. Applications
@@ -103,10 +103,11 @@ public/private visibility, old links and imported counts by entity/state.
   accepting multi-application hosting. Same-address-space privileged tasks
   are not isolated processes; process isolation needs separate design/proof.
 
-Current TCP has a four-socket pool and selected-socket/shared packet state.
-Neither changing that constant nor calling it from several tasks supplies a
-web-server connection model. Implement listeners/accepted-connection ownership,
-fair servicing and backpressure at the network service layer.
+Current TCP has a sixteen-socket pool and selected-socket/shared packet state.
+The native HTTP service owns a persistent queued listener, accepted children,
+four active HTTP slots, bounded servicing and backpressure. It remains a
+single-owner cooperative service, not safe for direct concurrent task calls.
+See [HTTP_SERVER.md](HTTP_SERVER.md) for deadlines, TIME-WAIT and pool limits.
 
 ## HTTP admission boundary
 
@@ -123,7 +124,9 @@ conflicting/duplicate framing and oversized lengths are rejected. Transfer
 coding returns 501 unless combined with Content-Length, which returns 400.
 Close after every rejection; never reuse a rejected connection's remaining
 bytes. No chunked decoder, upload stream, websocket, TLS, cookie parser,
-complete URI validator or HTTP server is implied by this foundation.
+complete URI validator is implied by this parser alone. The separately
+implemented HTTP service supplies socket ownership and bounded body handling,
+but does not yet supply the missing secure forum services listed above.
 
 Framing rules were checked against [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html),
 sections 2, 3, 5 and 6. Chunked decoding and the remaining server requirements
