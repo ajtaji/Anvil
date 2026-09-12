@@ -30,8 +30,13 @@ host bring-up if it is anywhere:
                                second one is a stack the monitor has to have
                                budgeted for.
 
-WHAT THIS GATE PROVES, AND WHAT IT DOES NOT. It is a structural proof over the
-real sources and, when a listing is offered, over the real emitted code. It
+WHAT THIS GATE CHECKS, AND WHAT IT DOES NOT. It checks direct address spelling,
+selected ASM symbol spelling, and syntactic recursion in the listed files.
+It does NOT track pointer aliases, reads before writes, dynamic calls, or the
+complete pre-USB call graph. The four historical risks above are motivation,
+not four implemented proofs. Use usb_local_flow_check.py for a conservative
+source-flow review report; its unresolved cases must not be called clean.
+When a listing is offered, this script also checks selected emitted frame shapes. It
 compiles nothing by itself, runs nothing on hardware, and says nothing about
 whether a controller answers. It is the gate for the CLASS, not for the board.
 
@@ -159,7 +164,7 @@ def locals_of(params, body):
 
 
 def check_addresses(reports):
-    """A frame slot's address never reaches a sink."""
+    """Reject direct @local spelling on a line containing a named sink."""
     hits = 0
     for path, text in reports:
         for name, params, body in procedures(text):
@@ -410,8 +415,8 @@ def main() -> int:
 
     reports = read_path()
     taken = check_addresses(reports)
-    print("addresses   ok - %d place(s) take the address of automatic storage in the "
-          "USB path and not one reaches a hardware sink" % taken)
+    print("addresses   direct-spelling check only - %d local-address site(s); "
+          "none on a line with a listed sink; aliases NOT checked" % taken)
     blocks = check_assembly(reports)
     print("assembly    ok - %d inline block(s) in the path, every materialised symbol "
           "file-scope or a linker symbol" % blocks)
