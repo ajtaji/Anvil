@@ -5,6 +5,18 @@ Anvil monitor. It initializes PL011 UART, validates firmware ARM memory and
 the device tree, starts a 640x480 framebuffer console, prints its status, and
 parks safely.
 
+FIRST-SILICON DIAGNOSTIC
+The display now comes up before PL011. The firmware rainbow is intentionally
+visible until Anvil replaces it. Pi 3B's activity LED is firmware-controlled:
+  one short flash       ARM entry and mailbox context reached
+  repeating two flashes ARM RAM or device-tree validation failed
+  repeating three       framebuffer negotiation failed
+  repeating four        PL011 initialization failed
+  repeating five        PL011 transmission failed
+Failure codes repeat five times, then the CPU parks. No flashes at all means
+either failure before mailbox access or that the optional firmware LED service
+did not answer; it is not by itself proof that ARM entry was absent.
+
 Required card files:
   bootcode.bin
   start.elf

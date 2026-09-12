@@ -96,12 +96,16 @@ future EL3 stub needs its own Pi3 proof and a recoverable hardware test.
 ## First framebuffer
 
 `RaspberryPi3/Lib/framebuffer.pbi` requests a firmware framebuffer after the
-minimum UART/memory checks, before any remaining service startup. Its one
+minimum memory/DTB checks and before UART, so the display is the first console.
+Its one
 transaction requests 640x480 physical/virtual geometry, 32-bit RGB, ignored
 alpha, allocation/pitch and VC memory extent. It requires matching response
 tags and lengths, fixed returned geometry/format, bounded pitch/allocation,
 a recognized VC bus alias, allocation inside firmware-reported VC memory,
-and no image/stack/DTB collision before its first pixel write.
+and no image/stack/DTB collision before its first pixel write. Both firmware
+pixel orders are accepted and packed correctly. This matters on Pi 3 firmware,
+which may validly keep BGR even when RGB was requested; refusing BGR made the
+earlier build park without ever drawing a pixel.
 
 It then clears by CPU and renders an early ASCII console using the original
 shared `Anvil/Graphics/text_glyph.pbi` font: 42 columns, 20 rows, integer scaling,
@@ -150,6 +154,40 @@ Supervisor reports seven emitted cold-start cases / 11,608,809 instructions plus
 `709af22d957543038255bac7621364e028e924e45380fad00e48cb9dadddb7c5`.
 The earlier build-3 image above remains historical. Card-file verification is
 not hardware boot acceptance. The broader monitor/services remain unfinished.
+
+## First-silicon visible diagnosis
+
+The first physical boot of build 4 produced a powered HDMI signal but a black
+screen. That image had no ACT diagnostic and parked silently before its first
+pixel on every mailbox, UART, memory or DTB failure. It also incorrectly
+required the returned pixel order to be RGB.
+
+The corrected diagnostic uses the Pi 3B board's real firmware-controlled
+STATUS_LED (firmware GPIO 130, expander line 2), not BCM GPIO47. One short flash
+means ARM entered with a valid cache-off mailbox context. A repeated two-flash
+code means the ARM-memory/DTB check failed; three means framebuffer negotiation
+failed; four means PL011 initialization failed; five means PL011 transmit
+failed. Codes repeat five times and then enter the bounded WFE park. LED
+failure is optional and never prevents the display path. The firmware rainbow
+splash is temporarily left enabled so firmware display progress is visible.
+
+The framebuffer is now negotiated and drawn before PL011 initialization. A
+successful screen therefore remains useful even if serial routing is wrong.
+These diagnostics do not advertise scheduler, storage, USB or network support.
+Firmware GPIO protocol facts are derived from the pinned Pi 3B DTS,
+`gpio-raspberrypi-exp.c`, and Raspberry Pi firmware tag definitions; no Linux
+implementation code is copied.
+
+The desk-accepted diagnostic image contains build 5 and is 25,316 bytes,
+SHA256 `3635112fb97ef00d71f09708871ad7281874d34531be494b53524e28c930f57e`.
+Its BSS ends at `0x100180`. Nine emitted cold-entry cases execute 35,347,845
+instructions: RGB and BGR success, optional LED refusal, three ARM/DTB
+failures, and three malformed framebuffer replies. Repeat initialization still
+refuses in 61 emitted instructions without changing the existing allocation.
+The source marker is now 6 after the counted build. The staged diagnostic
+config SHA256 is
+`3fb2b1b488bf008cbabefaae3d1945a7794bf9d22de29e3e702b9ef46184eb70`.
+This is ready for a card test, not yet silicon acceptance.
 
 ## Primary references (links)
 

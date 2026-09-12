@@ -7,6 +7,17 @@ Global pi3_fb_size.i
 Global pi3_fb_attempted.i
 Global pi3_fb_column.i
 Global pi3_fb_row.i
+Global pi3_fb_pixel_order.i
+
+Procedure.i Pi3FbPack(red.i,green.i,blue.i)
+  red=red & 255 : green=green & 255 : blue=blue & 255
+  If pi3_fb_pixel_order=1
+    ; RGB means byte order R,G,B in little-endian framebuffer memory.
+    ProcedureReturn red | (green << 8) | (blue << 16)
+  EndIf
+  ; BGR means byte order B,G,R.  Both orders are valid firmware replies.
+  ProcedureReturn blue | (green << 8) | (red << 16)
+EndProcedure
 
 Procedure Pi3FbTag(buffer.i,offset.i,tag.i,length.i,a.i,b.i)
   PokeL(buffer+offset,tag) : PokeL(buffer+offset+4,length)
@@ -20,15 +31,17 @@ Procedure Pi3FbChar(code.i,x.i,y.i)
   Protected col.i
   Protected sx.i
   Protected sy.i
+  Protected foreground.i
   If pi3_fb=0
     ProcedureReturn
   EndIf
+    foreground=Pi3FbPack(240,224,192)
     glyph=AnvilTextGlyph(code)
     For row=0 To 6
       For col=0 To 3
         If (glyph & (1 << ((6-row)*4+3-col)))<>0
           For sy=0 To 2
-            For sx=0 To 2 : Pi3FbPixel(x+col*3+sx,y+row*3+sy,$00F0E0C0) : Next
+            For sx=0 To 2 : Pi3FbPixel(x+col*3+sx,y+row*3+sy,foreground) : Next
           Next
         EndIf
       Next
@@ -38,6 +51,7 @@ EndProcedure
 Procedure Pi3FbNewline()
   Protected y.i
   Protected x.i
+  Protected background.i
   pi3_fb_column=0 : pi3_fb_row=pi3_fb_row+1
   If pi3_fb_row<20 : ProcedureReturn 0 : EndIf
   ; Upward copy is forward: source is always above destination, no clobber.
@@ -46,8 +60,9 @@ Procedure Pi3FbNewline()
       PokeL(pi3_fb+y*pi3_fb_pitch+x*4,PeekL(pi3_fb+(y+24)*pi3_fb_pitch+x*4))
     Next
   Next
+  background=Pi3FbPack(24,12,8)
   For y=456 To 479
-    For x=0 To 639 : PokeL(pi3_fb+y*pi3_fb_pitch+x*4,$00180C08) : Next
+    For x=0 To 639 : PokeL(pi3_fb+y*pi3_fb_pitch+x*4,background) : Next
   Next
   pi3_fb_row=19
 EndProcedure
@@ -82,6 +97,7 @@ Procedure.i Pi3FbInit(dtb.i,dtbEnd.i)
   Protected vc.i
   Protected vcSize.i
   Protected n.i
+  Protected background.i
   ; Cold boot owns one allocation attempt. Never replace a known framebuffer
   ; or implicitly free firmware storage under a renderer on a repeated call.
   If pi3_fb_attempted<>0 : ProcedureReturn 0 : EndIf
@@ -106,9 +122,14 @@ Procedure.i Pi3FbInit(dtb.i,dtbEnd.i)
   If Pi3FbReply(p,80,$40001,8)=0 Or Pi3FbReply(p,100,$40008,4)=0 Or Pi3FbReply(p,116,$10006,8)=0 Or Pi3FbReply(p,136,$48007,4)=0
     ProcedureReturn 0
   EndIf
-  If PeekL(p+20)<>640 Or PeekL(p+24)<>480 Or PeekL(p+40)<>640 Or PeekL(p+44)<>480 Or PeekL(p+60)<>32 Or PeekL(p+76)<>1 Or PeekL(p+148)<>2
+  If PeekL(p+20)<>640 Or PeekL(p+24)<>480 Or PeekL(p+40)<>640 Or PeekL(p+44)<>480 Or PeekL(p+60)<>32 Or PeekL(p+148)<>2
     ProcedureReturn 0
   EndIf
+  ; The property interface may return either supported byte order.  Pi 3
+  ; firmware is known to keep BGR (0) even when RGB (1) was requested.  That
+  ; is a valid framebuffer, not grounds to throw the allocation away.
+  pi3_fb_pixel_order=PeekL(p+76)&$FFFFFFFF
+  If pi3_fb_pixel_order<>0 And pi3_fb_pixel_order<>1 : ProcedureReturn 0 : EndIf
   base=PeekL(p+92)&$FFFFFFFF : size=PeekL(p+96)&$FFFFFFFF
   pitch=PeekL(p+112)&$FFFFFFFF
   vc=PeekL(p+128)&$FFFFFFFF : vcSize=PeekL(p+132)&$FFFFFFFF
@@ -126,8 +147,9 @@ Procedure.i Pi3FbInit(dtb.i,dtbEnd.i)
   If base<dtbEnd And base+size>dtb : ProcedureReturn 0 : EndIf
   pi3_fb_pitch=pitch : pi3_fb_size=size : pi3_fb=base
   ; Every write is inside the validated pixel rows; no stride padding touched.
+  background=Pi3FbPack(24,12,8)
   For n=0 To 479
-    For p=0 To 639 : PokeL(base+n*pitch+p*4,$00180C08) : Next
+    For p=0 To 639 : PokeL(base+n*pitch+p*4,background) : Next
   Next
   Pi3MailboxBarrier()
   ProcedureReturn 1

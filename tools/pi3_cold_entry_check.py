@@ -10,10 +10,12 @@ assert syms['__bss_end__']<=0x1f0000,'BSS collides with reserved stack'
 assert 0x80000+len(data)<=0x1f0000,'image collides with reserved stack'
 def case(mode):
  class CPU(a64.A64):
-  def __init__(self):super().__init__();self.tick=0;self.req=0;self.text=bytearray();self.pixels=0
+  def __init__(self):super().__init__();self.tick=0;self.req=0;self.text=bytearray();self.pixels=0;self.led=[]
   def load(self,addr,size):
    if addr==0x3f003008:return 0
-   if addr==0x3f003004:self.tick+=1000;return self.tick
+   # Ten-millisecond fake ticks keep the visible diagnostic delays faithful
+   # in ordering while avoiding millions of interpreter-only spin iterations.
+   if addr==0x3f003004:self.tick+=10000;return self.tick
    if addr in (0x3f201018,0x3f200004,0x3f00b898,0x3f00b8b8):return 0
    if addr==0x3f00b880:return self.req
    return super().load(addr,size)
@@ -24,9 +26,16 @@ def case(mode):
    if addr==0x3f201000:self.text.append(value&255);return
    if addr==0x3f00b8a0:
     self.req=value&0xffffffff;b=value&0x3ffffff0;tag=super().load(b+8,4)
-    super().store(b+4,0x80000000,4);super().store(b+16,0x80000008,4)
-    if tag==0x30002:super().store(b+24,48000000,4)
-    elif tag==0x10005:super().store(b+20,0,4);super().store(b+24,0x100000 if mode=='smallram' else 0x8000000,4)
+    super().store(b+4,0x80000000,4)
+    if tag==0x38041:
+     assert super().load(b+12,4)==8 and super().load(b+16,4)==8,'bad status LED tag shape'
+     assert super().load(b+20,4)==130,'Pi3 status LED must use firmware GPIO 130'
+     state=super().load(b+24,4);assert state in (0,1),'invalid status LED state'
+     self.led.append(state)
+     super().store(b+16,0x80000008,4)
+     super().store(b+20,130 if mode=='badled' else 0,4)
+    elif tag==0x30002:super().store(b+16,0x80000008,4);super().store(b+24,48000000,4)
+    elif tag==0x10005:super().store(b+16,0x80000008,4);super().store(b+20,0,4);super().store(b+24,0x100000 if mode=='smallram' else 0x8000000,4)
     else:
      for offset,length in ((8,8),(28,8),(48,4),(64,4),(80,8),(100,4),(116,8),(136,4)):super().store(b+offset+8,0x80000000|length,4)
      super().store(b+92,0xd0000000,4);super().store(b+96,2560*480,4)
@@ -34,6 +43,7 @@ def case(mode):
      super().store(b+128,0x10000000,4);super().store(b+132,0x1000000,4)
      if mode=='baddepth':super().store(b+60,16,4)
      if mode=='badspan':super().store(b+96,4,4)
+     if mode=='bgr':super().store(b+76,0,4)
     return
    return super().store(addr,value,size)
  cpu=CPU()
@@ -48,14 +58,16 @@ def case(mode):
  else:raise AssertionError('did not park')
  assert base.u64(cpu,address('global_pi3_dtb'))==dtb,'startup lost x0'
  validram=mode not in ('smallram','overlap','badmagic')
- expected=2 if validram else 2**64-4
+ validfb=validram and mode not in ('badpitch','baddepth','badspan')
+ expected=2 if validfb else (2**64-5 if validram else 2**64-4)
  assert base.u64(cpu,address('global_pi3_boot_status'))==expected,(mode,cpu.text)
- assert b'UART ready\r\n' in cpu.text
- assert (b'ARM RAM verified' in cpu.text)==validram
- assert (cpu.pixels>=307200)==(mode=='normal'),(mode,cpu.pixels)
- if mode!='normal':assert cpu.pixels==0
+ assert (b'UART ready\r\n' in cpu.text)==validfb
+ assert (b'ARM RAM verified' in cpu.text)==validfb
+ assert (cpu.pixels>=307200)==validfb,(mode,cpu.pixels)
+ if not validfb:assert cpu.pixels==0
+ if mode=='badled':assert cpu.led,'optional LED diagnostic was not attempted'
  assert 0x1f0000<=cpu.sp<=0x200000
- if mode=='normal':
+ if validfb:
   before=cpu.pixels;allocation=base.u64(cpu,address('global_pi3_fb'))
   cpu.pc=address('pi3fbinit');cpu.x[0]=dtb;cpu.x[1]=dtb+4096;cpu.x[30]=base.RETURN_PC
   for retry in range(500):
@@ -81,6 +93,6 @@ def repeat_gate():
  print('PASS: emitted repeat init refuses before allocation/MMIO changes;',n,'instructions')
 repeat_gate()
 if args.repeat_only:raise SystemExit(0)
-steps=sum(case(m) for m in ('normal','smallram','overlap','badmagic','badpitch','baddepth','badspan'))
-print('PASS: 7 cold-entry cases,',steps,'instructions; preserved firmware x0; validated framebuffer writes')
+steps=sum(case(m) for m in ('normal','bgr','badled','smallram','overlap','badmagic','badpitch','baddepth','badspan'))
+print('PASS: 9 cold-entry cases,',steps,'instructions; preserved firmware x0; accepted RGB/BGR; validated framebuffer writes and Pi3 status LED protocol')
 print('SHA256',hashlib.sha256(data).hexdigest())

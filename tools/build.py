@@ -31,6 +31,11 @@ TARGETS = {
         "output": Path("build/unoq/anvil.img"),
         "args": ["--entry-returns"],
     },
+    "pi3": {
+        "source": Path("RaspberryPi3/Board/board.pi3"),
+        "output": Path("build/pi3/kernel8.img"),
+        "args": ["--load-addr", "0x80000", "--stack-addr", "0x200000"],
+    },
     "armstub": {
         "source": Path("RaspberryPi4/Board/armstub8.asm"),
         "output": Path("build/pi4/armstub8.bin"),

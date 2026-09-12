@@ -2,9 +2,9 @@
 ; Firmware must reserve [0x80000,0x200000) for this image + stack before entry.
 ; Compile -t pi3 --load-addr 0x80000 --stack-addr 0x200000 (normal startup).
 ; Build gate must prove image+BSS below 0x1F0000. Stack reserves 64 KiB.
-#ANVIL_BUILD = 4 ; pmf:build
-#ANVIL_BUILD_DATE = 20260911 ; pmf:builddate
-#ANVIL_BUILD_TIME = 202713 ; pmf:buildtime
+#ANVIL_BUILD = 6 ; pmf:build
+#ANVIL_BUILD_DATE = 20260912 ; pmf:builddate
+#ANVIL_BUILD_TIME = 100057 ; pmf:buildtime
 XIncludeFile "RaspberryPi3/Lib/timer.pbi"
 XIncludeFile "RaspberryPi3/Lib/uart.pbi"
 XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
@@ -24,6 +24,27 @@ pi3_cold_park:
     wfe
     b pi3_cold_park
   EndASM
+EndProcedure
+
+Procedure.i Pi3BootSignal(stage.i)
+  Protected pulse.i
+  If stage<1 Or stage>9 : ProcedureReturn 0 : EndIf
+  For pulse=1 To stage
+    If Pi3StatusLed(1)=0 : ProcedureReturn 0 : EndIf
+    If Pi3DelayUs(140000)=0 : ProcedureReturn 0 : EndIf
+    If Pi3StatusLed(0)=0 : ProcedureReturn 0 : EndIf
+    If Pi3DelayUs(140000)=0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn Pi3DelayUs(700000)
+EndProcedure
+
+Procedure Pi3DiagnosticPark(stage.i)
+  Protected repeat.i
+  ; Repeat only five times, then reach the same low-impact WFE park.  If a
+  ; mailbox request itself timed out its buffer remains firmware-owned, so the
+  ; signal refuses rather than retrying an unsafe transaction.
+  For repeat=1 To 5 : Pi3BootSignal(stage) : Next
+  Pi3Park()
 EndProcedure
 
 Procedure.i Pi3Say(text.i)
@@ -112,24 +133,36 @@ Procedure Main()
   EndASM
   pi3_boot_status = 1
   If Pi3MailboxContext() = 0 : Pi3Park() : EndIf
+  ; One short flash proves ARM entry and a valid cache-off mailbox context.
+  ; Failure to control this optional diagnostic does not stop boot.
+  Pi3BootSignal(1)
   ; No MMU changes and no speculative memory allocation at this entry.
-  clock = Pi3ClockRate(2)
-  If Pi3UartInit(clock,115200) = 0 : pi3_boot_status = -2 : Pi3Park() : EndIf
-  If Pi3Say("Anvil Pi3 experimental cold entry: UART ready") = 0 : pi3_boot_status = -3 : Pi3Park() : EndIf
   If Pi3BootMemory() = 0
     pi3_boot_status = -4
-    Pi3Say("STOP: ARM RAM or DTB reservation check failed")
-    Pi3Park()
+    Pi3DiagnosticPark(2)
   EndIf
   pi3_boot_status = 2
   If Pi3FbInit(pi3_dtb,pi3_dtb_end)=0
-    Pi3Say("Framebuffer refused; preserving UART diagnostics")
-  Else
-    Pi3FbLine("Anvil Pi3 experimental cold entry")
-    Pi3PrintBuild()
-    Pi3Say("Framebuffer ready: CPU rendering, no acceleration")
+    pi3_boot_status = -5
+    Pi3DiagnosticPark(3)
+  EndIf
+  ; Display precedes UART so a missing/failed serial path cannot hide boot.
+  Pi3FbLine("Anvil Pi3 experimental cold entry")
+  Pi3PrintBuild()
+  Pi3FbLine("Framebuffer ready: CPU rendering, no acceleration")
+  clock = Pi3ClockRate(2)
+  If Pi3UartInit(clock,115200) = 0
+    pi3_boot_status = -2
+    Pi3FbLine("STOP: PL011 initialization failed")
+    Pi3DiagnosticPark(4)
+  EndIf
+  If Pi3Say("UART ready") = 0
+    pi3_boot_status = -3
+    Pi3FbLine("STOP: PL011 transmit failed")
+    Pi3DiagnosticPark(5)
   EndIf
   Pi3Say("ARM RAM verified; DTB preserved; timer active")
   Pi3Say("No scheduler/network/storage enabled. Parked safely.")
+  Pi3StatusLed(0)
   Pi3Park()
 EndProcedure

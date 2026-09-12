@@ -4,10 +4,10 @@ root=pathlib.Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser();p.add_argument('--purebasic',required=True);args=p.parse_args()
 source=(root/'RaspberryPi3/Lib/framebuffer.pbi').read_text()
 parts=[]
-for name in ('Pi3FbPixel','Pi3FbChar','Pi3FbNewline','Pi3FbLine'):
+for name in ('Pi3FbPack','Pi3FbPixel','Pi3FbChar','Pi3FbNewline','Pi3FbLine'):
  parts.append(re.search(r'(?ms)^Procedure[^\n]*\b'+name+r'\(.*?^EndProcedure',source).group())
 prefix='''OpenConsole()
-Global pi3_fb.i,pi3_fb_pitch.i,pi3_fb_size.i,pi3_fb_column.i,pi3_fb_row.i
+Global pi3_fb.i,pi3_fb_pitch.i,pi3_fb_size.i,pi3_fb_column.i,pi3_fb_row.i,pi3_fb_pixel_order.i
 Procedure Pi3MailboxBarrier()
 EndProcedure
 '''

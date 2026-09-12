@@ -6,6 +6,15 @@ Global Dim pi3_property.l[12]
 ; A timed-out submitted buffer remains firmware-owned until reboot. No retry
 ; or reuse is safe without observing its completion; refuse later requests.
 Global pi3_mailbox_outstanding.i
+
+; Pi 3B's activity LED is not BCM GPIO47.  The board device tree names
+; firmware-expander line 2 STATUS_LED; the firmware GPIO service numbers its
+; eight expander lines from 128, so the board status LED is firmware GPIO 130.
+; SET_GPIO_STATE returns zero in the gpio payload word on success (it does not
+; echo 130).  This optional boot diagnostic must never become a boot
+; prerequisite.  Protocol facts were checked against the pinned Raspberry Pi
+; Linux DTS, gpio-raspberrypi-exp driver and firmware tag definitions.
+#PI3_FIRMWARE_STATUS_LED = 130
 Procedure.i Pi3MailboxContext()
   ASM
     mrs x0, mpidr_el1
@@ -96,6 +105,26 @@ Procedure.i Pi3MailboxCall(buffer.i, bytes.i)
   Next
   ProcedureReturn 0
 EndProcedure
+
+Procedure.i Pi3StatusLed(state.i)
+  Protected buffer.i
+  If pi3_mailbox_outstanding <> 0
+    ProcedureReturn 0
+  EndIf
+  If state <> 0 : state = 1 : EndIf
+  buffer = ((@pi3_property[0] + 15) >> 4) << 4
+  PokeL(buffer,32) : PokeL(buffer + 4,0)
+  PokeL(buffer + 8,$38041) : PokeL(buffer + 12,8)
+  PokeL(buffer + 16,8) : PokeL(buffer + 20,#PI3_FIRMWARE_STATUS_LED)
+  PokeL(buffer + 24,state) : PokeL(buffer + 28,0)
+  If Pi3MailboxCall(buffer,32) = 0 : ProcedureReturn 0 : EndIf
+  If PeekL(buffer + 8) <> $38041 Or PeekL(buffer + 12) <> 8 Or (PeekL(buffer + 16) & $FFFFFFFF) <> $80000008
+    ProcedureReturn 0
+  EndIf
+  ; Firmware replaces the requested GPIO id with its status: zero is success.
+  ProcedureReturn Bool(PeekL(buffer + 20) = 0)
+EndProcedure
+
 Procedure.i Pi3ClockRate(id.i)
   Protected buffer.i
   If pi3_mailbox_outstanding <> 0 Or id < 1 Or id > 14
