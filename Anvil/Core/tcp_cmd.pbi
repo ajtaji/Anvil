@@ -883,8 +883,31 @@ Procedure CmdHttp()
     http_Get()
     ProcedureReturn
   EndIf
-  PrintN("!! http takes one word and it is get, so nothing was fetched.")
+  If WordIs("serve") <> 0
+    HttpServerStartCommand()
+    ProcedureReturn
+  EndIf
+  If WordIs("stop") <> 0
+    If ArgWord() <> 0
+      PrintN("HTTP error 1: Extra arguments. Use http stop without a port or other arguments.")
+      ProcedureReturn
+    EndIf
+    HttpServerStop()
+    PrintN("HTTP server is stopped.")
+    ProcedureReturn
+  EndIf
+  If WordIs("status") <> 0
+    If ArgWord() <> 0
+      PrintN("HTTP error 1: Extra arguments. Use http status without other arguments.")
+      ProcedureReturn
+    EndIf
+    HttpServerStatus()
+    ProcedureReturn
+  EndIf
+  PrintN("!! http expects get, serve, stop or status. No operation was performed.")
   PrintN("   http get http://example.com/")
-  PrintN("   This is PLAIN HTTP over port 80 and there is no TLS here at all, so")
-  PrintN("   an https URL is refused by name rather than fetched in clear.")
+  PrintN("   http serve [port]   default 8080; public static pages only")
+  PrintN("   http status         http stop")
+  PrintN("   These are PLAIN HTTP operations, without TLS. An https URL is")
+  PrintN("   refused by name rather than fetched in clear.")
 EndProcedure

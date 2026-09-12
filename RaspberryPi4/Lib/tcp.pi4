@@ -150,7 +150,7 @@
 ;     sender with no congestion window can be trusted with; a bulk
 ;     transfer across a WAN is not, and nothing here refuses it, so it
 ;     is refused in words.
-;  2. FOUR SOCKETS, NOT ONE, AND NOT MANY. #TCP_SOCKETS entries, one of
+;  2. SIXTEEN SOCKETS, bounded by #TCP_SOCKETS, one of
 ;     which may be a listener. A SYN for a port nobody is listening on
 ;     is answered with a RST, which is the correct thing to say and not
 ;     a silent drop.
@@ -260,16 +260,12 @@
 ; ======================================================================
 ; THE SOCKET TABLE, SIZED BY A CONSTANT.
 ; ======================================================================
-; FOUR IS A CHOSEN NUMBER AND NOT A ROUND ONE: one connection for
-; whatever the operator typed, one for `http get` while that is up, one
-; for a listener, and one spare so that the fourth attempt is refused
-; with a sentence the operator can act on rather than for want of a slot
-; nobody sized. Each entry costs #TCP_RCVBUF + #TCP_SNDBUF plus its
-; reassembly queue, which is about ten kilobytes, so the table is about
-; forty. Every byte of it is reserved once at load: THERE IS NO DYNAMIC
-; ALLOCATION ANYWHERE IN THIS FILE, and that is the property that makes
-; a monitor's memory map knowable rather than hopeful.
-#TCP_SOCKETS = 4
+; Every byte is reserved once at load. There is no dynamic allocation.
+; Legacy passive open converts/rearms its own slot; queued passive open
+; keeps its listener while child TCBs retain independent close/TIME-WAIT.
+; Bounded Pi-family pool: one queued listener plus fifteen child/other TCBs.
+; Approximately 420 KiB including rings, out-of-order buffers and state.
+#TCP_SOCKETS = 16
 
 ; ======================================================================
 ; SIZES, AND THE MSS RULING - RFC 9293 3.7.1.
@@ -476,8 +472,8 @@
 ; a64_tcp_check.py drives two sockets alternately for the case where
 ; reading them does not.
 ;
-; THE RINGS ARE NOT PARKED. Four kilobytes each, twice, four times over
-; is far too much to copy on a socket switch, so the rings and the
+; THE RINGS ARE NOT PARKED. Copying receive/send rings on every socket
+; switch would be wasteful, so the rings and the
 ; reassembly buffers are one flat array apiece and the current socket's
 ; slice is reached through tcp_rcvBase / tcp_sndBase / tcp_oooBase,
 ; which TcpUse sets. Bytes have no width problem, so nothing above
@@ -1617,7 +1613,44 @@ EndProcedure
 ; the state a moment later would otherwise see a clean CLOSED and have
 ; no way to tell an orderly close from a peer that pulled the plug. That
 ; distinction is the whole of the robustness requirement.
+; Per-slot lifecycle identity, deliberately outside parked packet/work fields.
+; Never reset by TcpInit: a retained application handle must not alias a later
+; connection after reinitialization. Saturation makes the public identity zero
+; (unusable), rather than wrapping and reviving an old owner. Pi4 integers64bit.
+Global Dim tcp_generation.i[#TCP_SOCKETS]
+Global Dim tcp_listener_generation.i[#TCP_SOCKETS]
+Global Dim tcp_queued_listener.i[#TCP_SOCKETS]
+Global Dim tcp_parent.i[#TCP_SOCKETS]
+Global Dim tcp_parent_lease.i[#TCP_SOCKETS]
+Global Dim tcp_accepted.i[#TCP_SOCKETS]
+Procedure.i TcpGeneration()
+  If tcp_s < 0 Or tcp_s >= #TCP_SOCKETS
+    ProcedureReturn 0
+  EndIf
+  If tcp_generation[tcp_s] >= $7FFFFFFFFFFFFFFF
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn tcp_generation[tcp_s]
+EndProcedure
+Procedure.i TcpListeningPort()
+  ProcedureReturn tcp_listen_port
+EndProcedure
+Procedure.i TcpListenerGeneration()
+  If tcp_s < 0 Or tcp_s >= #TCP_SOCKETS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn tcp_listener_generation[tcp_s]
+EndProcedure
 Procedure TcpWipe()
+  If tcp_s >= 0 And tcp_s < #TCP_SOCKETS
+    If tcp_generation[tcp_s] < $7FFFFFFFFFFFFFFF
+      tcp_generation[tcp_s] = tcp_generation[tcp_s] + 1
+    EndIf
+    tcp_queued_listener[tcp_s] = 0
+    tcp_parent[tcp_s] = 0
+    tcp_parent_lease[tcp_s] = 0
+    tcp_accepted[tcp_s] = 0
+  EndIf
   tcp_state = #TCP_CLOSED
   tcp_kind = #HW_LINK_NONE
   tcp_lip = 0
@@ -2184,6 +2217,8 @@ Procedure.i tcp_InputCore()
   Define acceptable.i
   Define who.i
   Define nx.l
+  Define parent.i
+  Define child.i
 
   hdr = NetTcpRxSeg()
   hl = NetTcpRxHdrLen()
@@ -2237,6 +2272,28 @@ Procedure.i tcp_InputCore()
     EndIf
     If (tcp_seg_flags & #TCP_SYN) = 0
       ProcedureReturn 0                 ; "any other ... should be dropped"
+    EndIf
+    ; Queued listeners remain wildcard reservations. Each SYN gets a free
+    ; child TCB; exact tuple matching above routes retransmits to that child.
+    ; Pool exhaustion drops SYN for retry without disturbing TIME-WAIT.
+    If tcp_queued_listener[tcp_s] <> 0
+      parent = tcp_s
+      child = TcpAlloc()
+      If child < 0
+        ProcedureReturn 0
+      EndIf
+      TcpWipe()
+      tcp_inuse = 1
+      tcp_listen_port = 0
+      tcp_err = 0
+      tcp_reset_seen = 0
+      tcp_keep_ms = 0
+      tcp_srtt8 = 0
+      tcp_rttvar4 = 0
+      tcp_rtt_valid = 0
+      tcp_rto = #TCP_RTO_INIT_MS
+      tcp_parent[child] = parent + 1
+      tcp_parent_lease[child] = tcp_listener_generation[parent]
     EndIf
     ; A connection request. Latch the peer - including its MAC, which
     ; arrived free in the frame and is why a listener needs no ARP at all.
@@ -3123,6 +3180,11 @@ EndProcedure
 Procedure.i TcpListen(port.i)
   Define i.i
   Define keep.i
+  ; A queued reservation can own pending children. Explicitly unlisten it
+  ; before opening another lease, otherwise those children lose their owner.
+  If tcp_queued_listener[tcp_s] <> 0
+    ProcedureReturn #NET_TCP_E_BUSY
+  EndIf
   If port < 1 Or port > 65535
     ProcedureReturn #NET_TCP_E_PORT
   EndIf
@@ -3150,6 +3212,12 @@ Procedure.i TcpListen(port.i)
   Wend
   TcpUse(keep)
 
+  ; A listener lease survives connection resets/rearms, but not a new Listen
+  ; owner. Refuse exhaustion rather than make a stale lease valid again.
+  If tcp_listener_generation[tcp_s] = $7FFFFFFFFFFFFFFF
+    ProcedureReturn #NET_TCP_E_STATE
+  EndIf
+  tcp_listener_generation[tcp_s] = tcp_listener_generation[tcp_s] + 1
   TcpWipe()
   tcp_inuse = 1
   tcp_err = 0
@@ -3186,6 +3254,20 @@ EndProcedure
 ; TcpAbort, and then this, in that order.
 ; ----------------------------------------------------------------------
 Procedure.i TcpUnlisten()
+  Define keep.i
+  Define n.i
+  Define lease.i
+  keep = tcp_s
+  lease = TcpListenerGeneration()
+  If tcp_queued_listener[keep] <> 0
+    For n = 0 To #TCP_SOCKETS - 1
+      If tcp_parent[n] = keep + 1 And tcp_parent_lease[n] = lease And tcp_accepted[n] = 0
+        TcpUse(n)
+        TcpAbortConnection()
+      EndIf
+    Next
+    TcpUse(keep)
+  EndIf
   tcp_listen_port = 0
   If tcp_state = #TCP_LISTEN
     TcpWipe()
@@ -3235,6 +3317,46 @@ Procedure.i TcpSend(src.i, len.i)
   tcp_snd_cnt = tcp_snd_cnt + n
   TcpOutput()
   ProcedureReturn n
+EndProcedure
+
+; Explicit opt-in: legacy TcpListen still accepts in place and rearms itself.
+Procedure.i TcpListenQueued(port.i)
+  Define result.i
+  result = TcpListen(port)
+  If result = #NET_TCP_OK
+    tcp_queued_listener[tcp_s] = 1
+  EndIf
+  ProcedureReturn result
+EndProcedure
+
+; Returns an established child index or -1, preserving the selected socket.
+; Accepted children do NOT own a listener port and never auto-rearm.
+Procedure.i TcpAccept(listener.i)
+  Define keep.i
+  Define n.i
+  Define result.i
+  Define lease.i
+  keep = tcp_s
+  result = -1
+  If listener < 0 Or listener >= #TCP_SOCKETS
+    ProcedureReturn -1
+  EndIf
+  If tcp_queued_listener[listener] = 0
+    ProcedureReturn -1
+  EndIf
+  lease = tcp_listener_generation[listener]
+  For n = 0 To #TCP_SOCKETS - 1
+    If tcp_parent[n] = listener + 1 And tcp_parent_lease[n] = lease And tcp_accepted[n] = 0
+      TcpUse(n)
+      If tcp_state = #TCP_ESTABLISHED Or tcp_state = #TCP_CLOSE_WAIT
+        tcp_accepted[n] = 1
+        result = n
+        Break
+      EndIf
+    EndIf
+  Next
+  TcpUse(keep)
+  ProcedureReturn result
 EndProcedure
 
 ; TcpRead - RFC 9293 3.10.3. Takes up to maxlen bytes out of the receive
@@ -3348,6 +3470,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i TcpClose()
   If tcp_state = #TCP_LISTEN
+    If tcp_queued_listener[tcp_s] <> 0
+      ProcedureReturn TcpUnlisten()
+    EndIf
     TcpWipe()
     tcp_listen_port = 0
     tcp_inuse = 0
@@ -3378,7 +3503,10 @@ EndProcedure
 
 ; TcpAbort - RFC 9293 3.10.5, ABORT. "Send a reset segment
 ; <SEQ=SND.NXT><CTL=RST> ... and delete the TCB." The hard exit.
-Procedure.i TcpAbort()
+Procedure.i TcpAbortConnection()
+  If tcp_queued_listener[tcp_s] <> 0
+    ProcedureReturn #NET_TCP_E_STATE
+  EndIf
   If tcp_state = #TCP_CLOSED
     tcp_inuse = 0
     ProcedureReturn #NET_TCP_OK
@@ -3400,6 +3528,15 @@ Procedure.i TcpAbort()
 EndProcedure
 
 ; ----------------------------------------------------------------------
+; Queued reservations cancel their pending children through Unlisten;
+; the connection primitive above avoids a recursive call graph.
+Procedure.i TcpAbort()
+  If tcp_queued_listener[tcp_s] <> 0
+    ProcedureReturn TcpUnlisten()
+  EndIf
+  ProcedureReturn TcpAbortConnection()
+EndProcedure
+
 ; TcpPoll(slice_ms) - the engine. Call it in every loop the program can
 ; sit in, exactly as UartAuxFlush() and SafetyPet() are called, and for
 ; the same reason: a protocol that only runs when the application

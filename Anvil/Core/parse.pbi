@@ -196,7 +196,13 @@ Procedure ReadLine()
     ; advances while a command is running is a protocol that stalls the
     ; moment somebody stops typing. TcpTick takes a zero slice, so with
     ; nothing waiting it is a table walk and a return.
-    TcpTick()
+    CompilerIf #CAP_NET = 1
+      ; The service also polls TCP while stopped, and drains accepted
+      ; connections after listener loss. Listener state cannot gate polling.
+      HttpServerPoll()
+    CompilerElse
+      TcpTick()
+    CompilerEndIf
     c = NetConsoleGetc()
     If c >= 0
       ; A BYTE FROM THE PEER DOES NOT CLAIM LOCAL OWNERSHIP, and that
