@@ -1,0 +1,16 @@
+; Compile-only linkage fixture. Never execute on the board.
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+Procedure.i Main()
+  If PcieInit() = 0
+    ProcedureReturn 1
+  EndIf
+  If XhciQuiesceAdopted() = 0
+    ProcedureReturn 2
+  EndIf
+  If PcieEnumerate() = 0
+    ProcedureReturn 3
+  EndIf
+  ProcedureReturn XhciInit()
+EndProcedure

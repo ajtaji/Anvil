@@ -1237,6 +1237,37 @@ EndProcedure
 ;  the monitor now does.
 ; ----------------------------------------------------------------------
 Global pcie_adopted.i
+Global pcie_adoptCpu.i
+Global pcie_adoptHalted.i
+Global pcie_enumerated.i
+#PCIE_ERR_TAKEOVER = -11
+
+; Existing trained-link ownership is separate from the new DMA mapping.
+; PcieEnumerate may not relocate anything until xHCI has proved halted.
+Procedure.i PcieAdoptCpu()
+  ProcedureReturn pcie_adoptCpu
+EndProcedure
+
+Procedure.i PcieNeedsTakeover()
+  ProcedureReturn (pcie_adopted <> 0) And (pcie_adoptHalted = 0)
+EndProcedure
+
+; Called only after the xHCI layer has observed HCHalted (xHCI 4.21.2).
+Procedure.i PcieAdoptHalted()
+  Define cmd.i
+  If pcie_adoptCpu = 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd & (~#PCI_CMD_BUS_MASTER))
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_BUS_MASTER) <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  pcie_adoptHalted = 1
+  ProcedureReturn 1
+EndProcedure
 
 ; ======================================================================
 ;  WHICH PART OF THE BRING-UP IS RUNNING - added 2026-09-11.
@@ -1320,7 +1351,7 @@ EndProcedure
 ;  The firmware sets this up for its own use and nothing says its
 ;  choice matches ours.
 ; ----------------------------------------------------------------------
-Procedure PcieProgramWindow()
+Procedure.i PcieProgramWindow()
   Define v.i
   Define lim.i
   ; the outbound window: CPU $6_0000_0000 -> bus $F8000000, 64 MiB.
@@ -1335,7 +1366,74 @@ Procedure PcieProgramWindow()
   pcie_Poke(#PCIE_MISC_WIN0_BASE_LIMIT, v)
   pcie_Poke(#PCIE_MISC_WIN0_BASE_HI, (#PCIE_OUT_CPU >> 32) & $FF)
   pcie_Poke(#PCIE_MISC_WIN0_LIMIT_HI, (lim >> 32) & $FF)
+  If PcieRcPeek(#PCIE_MISC_WIN0_LO) <> #PCIE_OUT_BUS Or PcieRcPeek(#PCIE_MISC_WIN0_HI) <> 0 Or PcieRcPeek(#PCIE_MISC_WIN0_BASE_LIMIT) <> v Or PcieRcPeek(#PCIE_MISC_WIN0_BASE_HI) <> ((#PCIE_OUT_CPU >> 32) & $FF) Or PcieRcPeek(#PCIE_MISC_WIN0_LIMIT_HI) <> ((lim >> 32) & $FF)
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
 
+; Only config-space and RC accesses until routing is validated. No BAR
+; sizing or relocation while the previous controller owner can DMA.
+Procedure.i PciePrepareAdoption()
+  Define bar.i
+  Define buses.i
+  Define win.i
+  Define first.i
+  Define last.i
+  Define base.i
+  Define lim.i
+  Define v.i
+  pcie_err = #PCIE_ERR_TAKEOVER
+  pcie_adoptCpu = 0
+  buses = PcieCfgRead32(0, 0, 0, $18)
+  If ((buses >> 8) & $FF) <> 1 Or ((buses >> 16) & $FF) < 1
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_MEM_SPACE) = 0
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(1, 0, 0, $08) >> 8) <> $0C0330
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_MEM_SPACE) = 0
+    ProcedureReturn 0
+  EndIf
+  bar = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
+  If (bar & 1) <> 0 Or (bar & 6) = 2 Or (bar & 6) = 6
+    ProcedureReturn 0
+  EndIf
+  If (bar & 6) = 4 And PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR1) <> 0
+    ProcedureReturn 0
+  EndIf
+  bar = bar & $FFFFFFF0
+  If bar = 0 Or bar > $FFFFFE00 Or (bar & $3FFFFFF) > $3FFFE00
+    ProcedureReturn 0
+  EndIf
+  win = PcieCfgRead32(0, 0, 0, $20)
+  first = (win & $FFF0) << 16
+  last = (win & $FFF00000) | $FFFFF
+  If first > last Or bar < first Or bar + 511 > last
+    ProcedureReturn 0
+  EndIf
+  base = bar & $FC000000
+  lim = #PCIE_OUT_CPU + #PCIE_OUT_SIZE - 1
+  pcie_Poke(#PCIE_MISC_WIN0_LO, base)
+  pcie_Poke(#PCIE_MISC_WIN0_HI, 0)
+  v = ((#PCIE_OUT_CPU >> 20) & $FFF) << 4
+  v = v | (((lim >> 20) & $FFF) << 20)
+  pcie_Poke(#PCIE_MISC_WIN0_BASE_LIMIT, v)
+  pcie_Poke(#PCIE_MISC_WIN0_BASE_HI, (#PCIE_OUT_CPU >> 32) & $FF)
+  pcie_Poke(#PCIE_MISC_WIN0_LIMIT_HI, (lim >> 32) & $FF)
+  If PcieRcPeek(#PCIE_MISC_WIN0_LO) <> base Or PcieRcPeek(#PCIE_MISC_WIN0_HI) <> 0
+    ProcedureReturn 0
+  EndIf
+  If PcieRcPeek(#PCIE_MISC_WIN0_BASE_LIMIT) <> v Or PcieRcPeek(#PCIE_MISC_WIN0_BASE_HI) <> ((#PCIE_OUT_CPU >> 32) & $FF) Or PcieRcPeek(#PCIE_MISC_WIN0_LIMIT_HI) <> ((lim >> 32) & $FF)
+    ProcedureReturn 0
+  EndIf
+  pcie_adoptCpu = #PCIE_OUT_CPU + bar - base
+  pcie_err = 0
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i PcieInit()
@@ -1385,59 +1483,9 @@ Procedure.i PcieInit()
   If PcieLinkUp() <> 0
     pcie_adopted = 1
     pcie_Phase(#PCIE_PH_ADOPT)
-    ; The window still has to be right - it is ours to use and nothing
-    ; guarantees the firmware left it where we want it.
-    PcieProgramWindow()
-
-    ; ---- AND THE INBOUND OFFSET, WHICH IS NOT OURS EITHER -----------
-    ; This block exists because leaving it out cost a night of blaming
-    ; a USB controller. XhciInit reached Run/Stop and came back with
-    ; USBSTS $15 - Host System Error, the controller reporting that its
-    ; OWN memory access failed - while reads of that same controller
-    ; had been working perfectly all evening.
-    ;
-    ; RC_BAR2 does not hold a base address. It holds an OFFSET that is
-    ; ADDED to a system address to make the PCI bus address a device
-    ; must use. v2025.01_pcie_brcmstb.c, brcm_pcie_probe():
-    ;
-    ;     rc_bar2_offset = region.bus_start - region.phys_start;
-    ;
-    ; U-Boot had left $4_0000_0000 in it. Every DMA address in this
-    ; project is a plain system address, so every one of them was short
-    ; by four gigabytes and landed outside the window. The device could
-    ; not reach us at all, which is precisely what HSE means.
-    ;
-    ; The non-adopt path below programs offset zero and never had the
-    ; problem. This board never takes that path - the firmware brings
-    ; the link up to boot from USB - so the identity mapping the rest of
-    ; the code assumes was true in the branch we never run and false in
-    ; the branch we always run.
-    ;
-    ; ZERO THE OFFSET, KEEP THE SIZE. The size code is the low five bits
-    ; and belongs to whoever sized the window; re-deriving it would mean
-    ; possibly shrinking the reachable range for no reason. Only the
-    ; offset is wrong, so only the offset is touched.
-    ;
-    ; THE ONLY DEVICE BEHIND THIS ROOT COMPLEX IS THE VL805, soldered
-    ; to the board, and it is the device being taken over. So there is
-    ; no third party whose mapping is being changed underneath it.
-    pcie_Phase(#PCIE_PH_INBOUND)
-    ibLo = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $FFFFFFFF
-    pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, ibLo & $1F)
-    pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
-
-    ; READ IT BACK. A write to this block that does not take is exactly
-    ; the failure being fixed, and it is invisible from the CPU side.
-    ibLo = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $FFFFFFFF
-    ibHi = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_HI) & $FFFFFFFF
-    If (ibLo & $FFFFFFE0) <> 0 Or ibHi <> 0
-      pcie_err = #PCIE_ERR_DMA_OFFSET
-      ProcedureReturn 0
-    EndIf
-    ; A size code of zero means the window is off, and nothing this
-    ; library does afterwards can work. Better here than as an HSE.
-    If (ibLo & $1F) = 0
-      pcie_err = #PCIE_ERR_DMA_OFFSET
+    ; A trained link can still have firmware DMA in flight. Map its
+    ; existing register BAR for takeover, but keep the inbound offset.
+    If PciePrepareAdoption() = 0
       ProcedureReturn 0
     EndIf
 
@@ -1500,7 +1548,9 @@ Procedure.i PcieInit()
   EndIf
 
   pcie_Phase(#PCIE_PH_WINDOW)
-  PcieProgramWindow()
+  If PcieProgramWindow() = 0
+    ProcedureReturn 0
+  EndIf
 
   ; 8. class code to PCI-to-PCI bridge, and little-endian BAR2.
   pcie_Modify(#PCIE_RC_CFG_PRIV1_ID_VAL3, #PCIE_ID_VAL3_CLASS_CODE_MASK, #PCIE_CLASS_BRIDGE_PCI)
@@ -1526,6 +1576,8 @@ Procedure.i PcieErrorText()
       ProcedureReturn "pcie: ok"
     Case #PCIE_ERR_NARROW
       ProcedureReturn "pcie: window base truncated to 32 bits - built by a 32-bit compiler"
+    Case #PCIE_ERR_TAKEOVER
+      ProcedureReturn "pcie: firmware BAR routing or halted DMA ownership could not be verified; remapping refused"
     Case #PCIE_ERR_DMA_OFFSET
       ProcedureReturn "pcie: the inbound DMA offset would not zero - the endpoint cannot reach system memory, and any DMA it attempts will report a host system error"
     Case #PCIE_ERR_LINK
@@ -1656,8 +1708,15 @@ Procedure.i PcieEnumerate()
   Define is64.i
 
   pcie_err = 0
+  If pcie_enumerated <> 0
+    ProcedureReturn 1
+  EndIf
   If pcie_up = 0
     pcie_err = #PCIE_ERR_LINK
+    ProcedureReturn 0
+  EndIf
+  If PcieNeedsTakeover() <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
     ProcedureReturn 0
   EndIf
   pcie_Phase(#PCIE_PH_BUSNUM)
@@ -1687,11 +1746,35 @@ Procedure.i PcieEnumerate()
   EndIf
 
   id = PcieCfgRead32(1, 0, 0, 0)
-  If id = -1 Or id = 0
+  If id = $FFFFFFFF Or id = 0
     pcie_err = #PCIE_ERR_NO_ENDPOINT
     ProcedureReturn 0
   EndIf
 
+  ; Disable endpoint decode and DMA before BAR sizing/relocation. An
+  ; adopted controller has already reached HCHalted before this point.
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd & (~6))
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & 6) <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  If pcie_adopted <> 0
+    lo = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $1F
+    If lo = 0
+      pcie_err = #PCIE_ERR_DMA_OFFSET
+      ProcedureReturn 0
+    EndIf
+    pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, lo)
+    pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
+    If PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) <> lo Or PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_HI) <> 0
+      pcie_err = #PCIE_ERR_DMA_OFFSET
+      ProcedureReturn 0
+    EndIf
+    If PcieProgramWindow() = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
   pcie_Phase(#PCIE_PH_ENUM)
   lo = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
   is64 = 0
@@ -1728,13 +1811,10 @@ Procedure.i PcieEnumerate()
     PcieCfgWrite32(1, 0, 0, #PCI_CFG_BAR1, 0)
   EndIf
 
-  ; MEMORY SPACE FIRST, then bus master. Until the memory-space bit is
-  ; set the device does not answer a read at its own BAR at all - which
-  ; is exactly the abort that started this. Bus master is separate and
-  ; is about the device reaching US; XHCI needs both, because its rings
-  ; live in our DRAM.
-  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND)
-  cmd = cmd | #PCI_CMD_MEM_SPACE | #PCI_CMD_BUS_MASTER
+  ; Enable register decode only. The xHCI layer enables bus mastering
+  ; after resetting the controller and installing its own DMA rings.
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  cmd = (cmd | #PCI_CMD_MEM_SPACE) & (~#PCI_CMD_BUS_MASTER)
   PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd)
 
   ; --- AND THE BRIDGE HAS TO AGREE TO CARRY IT ------------------------
@@ -1768,12 +1848,38 @@ Procedure.i PcieEnumerate()
   ; And the bridge itself must be enabled - the same two COMMAND bits,
   ; on the bridge this time rather than on the endpoint.
   Define bcmd.i
-  bcmd = PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND)
+  bcmd = PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & $FFFF
   PcieCfgWrite32(0, 0, 0, #PCI_CFG_COMMAND, bcmd | #PCI_CMD_MEM_SPACE | #PCI_CMD_BUS_MASTER)
 
+  ; Configuration writes are not ownership proof until read back.
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0) & $FFFFFFF0) <> pcie_barBus Or PcieCfgRead32(0, 0, 0, $20) <> memwin
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  If is64 <> 0 And PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR1) <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & 6) <> #PCI_CMD_MEM_SPACE Or (PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & 6) <> 6
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+
   pcie_barCpu = PcieCpuFromBus(pcie_barBus)
+  pcie_enumerated = 1
   pcie_Phase(#PCIE_PH_DONE)
   ProcedureReturn 1
+EndProcedure
+
+; Only after the new controller rings have been installed.
+Procedure.i PcieEnableDma()
+  Define cmd.i
+  If pcie_enumerated = 0
+    ProcedureReturn 0
+  EndIf
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd | #PCI_CMD_BUS_MASTER)
+  ProcedureReturn (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_BUS_MASTER) <> 0
 EndProcedure
 
 ; Where the endpoint's registers ended up. 0 before PcieEnumerate.

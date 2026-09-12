@@ -1326,6 +1326,10 @@ Global xh_cacheaddr.i = 0
 #XHCI_PH_MEMORY  = 7     ; rings, contexts, ERST, scratchpad
 #XHCI_PH_RUN     = 8     ; CMD_RUN and the wait for HCHalted to clear
 #XHCI_PH_DONE    = 9
+#XHCI_PH_ADOPT_CAPS = 10
+#XHCI_PH_ADOPT_READY = 11
+#XHCI_PH_ADOPT_HALT = 12
+#XHCI_PH_ADOPT_DMA = 13
 
 Global xh_phaseAt.i = #XHCI_PH_IDLE
 Global *xh_phaseHook = 0
@@ -1345,6 +1349,10 @@ Procedure.i XhciPhaseText(p.i)
     Case #XHCI_PH_MEMORY : ProcedureReturn "rings"
     Case #XHCI_PH_RUN    : ProcedureReturn "run"
     Case #XHCI_PH_DONE   : ProcedureReturn "ok"
+    Case #XHCI_PH_ADOPT_CAPS : ProcedureReturn "firmware registers"
+    Case #XHCI_PH_ADOPT_READY : ProcedureReturn "firmware readiness"
+    Case #XHCI_PH_ADOPT_HALT : ProcedureReturn "firmware halt"
+    Case #XHCI_PH_ADOPT_DMA : ProcedureReturn "firmware DMA ownership"
   EndSelect
   ProcedureReturn "idle"
 EndProcedure
@@ -1620,10 +1628,10 @@ Procedure.i xh_Locate()
     ProcedureReturn xh_Fail(#XHCI_ERR_NO_DEVICE)
   EndIf
 
-  ; Command register: memory space + bus master. Read-modify-write, so
-  ; that whatever the firmware or pcie.pi4 already set is preserved.
+  ; Register decode only; PcieEnumerate left bus mastering disabled.
+  ; Mask the status half so RW1C events are not accidentally cleared.
   cmd = PcieCfgRead32(xh_bus, xh_dev, xh_fn, $04)
-  cmd = cmd | $0002 | $0004      ; PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER
+  cmd = (cmd & $FFFF) | $0002    ; DMA stays off until new rings are installed
   PcieCfgWrite32(xh_bus, xh_dev, xh_fn, $04, cmd)
 
   bar = PcieCfgRead32(xh_bus, xh_dev, xh_fn, $10)   ; BAR0
@@ -1795,6 +1803,64 @@ Procedure.i xh_Halt()
       ProcedureReturn xh_Fail(#XHCI_ERR_HALT)
     EndIf
   Wend
+  ProcedureReturn 1
+EndProcedure
+
+; Take over only the already validated firmware BAR. Do not alter live
+; xh_* register pointers/rings: this phase is separate from XhciInit.
+#XHCI_ERR_TAKEOVER = 45
+Procedure.i XhciQuiesceAdopted()
+  Define cpu.i
+  Define cap.i
+  Define op.i
+  Define hz.i
+  Define started.i
+  Define cmd.i
+  If PcieNeedsTakeover() = 0
+    ProcedureReturn 1
+  EndIf
+  cpu = PcieAdoptCpu()
+  If cpu = 0
+    xh_err = #XHCI_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  hz = xh_TickHz()
+  If hz < 1000000 Or hz > 1000000000
+    xh_err = #XHCI_ERR_NO_CNTFRQ
+    ProcedureReturn 0
+  EndIf
+  xh_Phase(#XHCI_PH_ADOPT_CAPS)
+  cap = xh_Rd(cpu, 0)
+  If (cap & $FF) < 32 Or (cap & 3) <> 0 Or ((cap >> 16) & $FFFF) < $0090 Or ((cap >> 16) & $FFFF) > $0120
+    xh_err = #XHCI_ERR_BAR_RANGE
+    ProcedureReturn 0
+  EndIf
+  op = cpu + (cap & $FF)
+  xh_Phase(#XHCI_PH_ADOPT_READY)
+  started = xh_Ticks()
+  While (xh_Rd(op, #XHCI_USBSTS) & #XHCI_STS_CNR) <> 0
+    If xh_Ticks() - started >= (hz / 1000) * #XHCI_TMO_RESET_MS
+      xh_err = #XHCI_ERR_CNR
+      ProcedureReturn 0
+    EndIf
+  Wend
+  xh_Phase(#XHCI_PH_ADOPT_HALT)
+  If (xh_Rd(op, #XHCI_USBSTS) & #XHCI_STS_HALT) = 0
+    cmd = xh_Rd(op, #XHCI_USBCMD)
+    xh_Wr(op, #XHCI_USBCMD, cmd & (~#XHCI_CMD_RUN))
+  EndIf
+  started = xh_Ticks()
+  While (xh_Rd(op, #XHCI_USBSTS) & #XHCI_STS_HALT) = 0
+    If xh_Ticks() - started >= (hz / 1000) * #XHCI_TMO_HALT_MS
+      xh_err = #XHCI_ERR_HALT
+      ProcedureReturn 0
+    EndIf
+  Wend
+  xh_Phase(#XHCI_PH_ADOPT_DMA)
+  If PcieAdoptHalted() = 0
+    xh_err = #XHCI_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -2721,10 +2787,25 @@ Procedure xh_FailStop()
   XhciStop()
 EndProcedure
 
+#XHCI_ERR_DMA_ENABLE = 44
+
+Procedure.i xh_EnableDma()
+  If PcieEnableDma() = 0
+    ProcedureReturn xh_Fail(#XHCI_ERR_DMA_ENABLE)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
   Define maxs.i
   Define v.i
 
+  ; This Pi4 ownership path manages the soldered VL805 only. Refuse
+  ; unsupported BDF before changing driver state or touching hardware.
+  If bus <> 1 Or dev <> 0 Or fn <> 0
+    xh_err = #XHCI_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
   xh_err   = #XHCI_ERR_NONE
   xh_ready = 0
   xh_bus = bus
@@ -2800,6 +2881,10 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
     ProcedureReturn 0
   EndIf
   xh_Phase(#XHCI_PH_RUN)
+  If xh_EnableDma() = 0
+    xh_FailStop()
+    ProcedureReturn 0
+  EndIf
   If xh_Start() = 0
     xh_FailStop()
     ProcedureReturn 0
@@ -5257,6 +5342,10 @@ Procedure.i XhciErrorText()
       ProcedureReturn "xhci: HCSPARAMS1 reports zero ports or zero device slots"
     Case #XHCI_ERR_DMA_RANGE
       ProcedureReturn "xhci: the ring arena is above the 3 GB PCIe DMA limit - the controller could not reach it"
+    Case #XHCI_ERR_DMA_ENABLE
+      ProcedureReturn "xhci: PCI bus mastering enable did not read back; controller was not started"
+    Case #XHCI_ERR_TAKEOVER
+      ProcedureReturn "xhci: firmware register routing or halted DMA handover was not verified"
     Case #XHCI_ERR_ARENA
       ProcedureReturn "xhci: the ring arena ran out - XHCI_ARENA_BYTES is too small for this controller"
     Case #XHCI_ERR_HALT

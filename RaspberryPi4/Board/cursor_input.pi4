@@ -443,6 +443,19 @@ Procedure.i UsbEnumerate()
     BootOk("FAILED - the bus would not start")
     ProcedureReturn 0
   EndIf
+  PcieSetPhaseHook(phase)
+  BootOk("link ready")
+  BootStep("USB firmware handover")
+  phase = XhciSetPhaseHook(@UsbPhaseWord)
+  If XhciQuiesceAdopted() = 0
+    XhciSetPhaseHook(phase)
+    BootOk("FAILED - firmware USB handover refused; DMA mapping preserved")
+    ProcedureReturn 0
+  EndIf
+  XhciSetPhaseHook(phase)
+  BootOk("quiesced")
+  BootStep("PCI Express mapping")
+  phase = PcieSetPhaseHook(@PciePhaseWord)
   If PcieEnumerate() = 0
     PcieSetPhaseHook(phase)
     BootOk("FAILED - nothing enumerated on the bus")
