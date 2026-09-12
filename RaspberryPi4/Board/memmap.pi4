@@ -711,6 +711,10 @@ Procedure MonPhaseMark(p.i)
   PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW, p)
   monphase_flush = #MON_PHASE_LO
   MonPhaseFlush()
+  ; Complete the clean before the instrumented device access can stall.
+  ASM
+    dsb sy
+  EndASM
 EndProcedure
 
 ; What this boot has reached, what the one before it reached, and whether

@@ -204,6 +204,9 @@ Global gBootLog.i = 0
 #BPH_PCIE         = $0500
 #BPH_XHCI         = $0600
 #BPH_STEP_SCREEN  = $0700
+#BPH_XHCI_DETAIL  = $0800
+#BPH_XHCI_SCREEN_ENTER = $0900
+#BPH_XHCI_SCREEN_EXIT = $0A00
 
 Global gBootStepN.i = 0
 Procedure bootStrLen(*s)
@@ -411,6 +414,10 @@ Procedure PciePhaseWord()
   ScreenServiceTick()
 EndProcedure
 
+Procedure UsbTraceWord()
+  MonPhaseMark(#BPH_XHCI_DETAIL | XhciTrace())
+EndProcedure
+
 Procedure UsbPhaseWord()
   ; THE MARK FIRST, ALWAYS, and before anything that can wait. An
   ; instrument that only records when the log is on records nothing on
@@ -427,12 +434,16 @@ Procedure UsbPhaseWord()
   UartWriteStr(XhciPhaseText(XhciPhase()))
   UartWrite(32)
   UartDrain()
+  MonPhaseMark(#BPH_XHCI_SCREEN_ENTER | XhciPhase())
   ScreenServiceTick()
+  MonPhaseMark(#BPH_XHCI_SCREEN_EXIT | XhciPhase())
 EndProcedure
 
 Procedure.i UsbEnumerate()
   Define i.i
   Define phase.i
+  ; Leave the retained-only hook installed for storage's later retry too.
+  XhciSetTraceHook(@UsbTraceWord)
   If gUsbEnum <> 0
     ProcedureReturn 1
   EndIf

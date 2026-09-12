@@ -1372,6 +1372,24 @@ Procedure xh_Phase(p.i)
   EndIf
 EndProcedure
 
+; Optional retained diagnostics, deliberately separate from the printing hook.
+; Callback must not print, allocate, poll hardware, or service the display.
+Global xh_traceAt.i
+Global *xh_traceHook
+Procedure.i XhciTrace() : ProcedureReturn xh_traceAt : EndProcedure
+Procedure.i XhciSetTraceHook(*fn)
+  Define old.i
+  old = *xh_traceHook
+  *xh_traceHook = *fn
+  ProcedureReturn old
+EndProcedure
+Procedure xh_Trace(p.i)
+  xh_traceAt = p
+  If *xh_traceHook <> 0
+    xh_traceHook()
+  EndIf
+EndProcedure
+
 ; ======================================================================
 ;  THE CLOCK. Two lines of assembly and no dependency on any other
 ;  file, exactly as emmc.pi4 does it and for the same reason:
@@ -1868,31 +1886,49 @@ Procedure.i xh_Reset()
   Define cmd.i
   Define d.i
 
+  xh_Trace(1)
   If xh_Halt() = 0
+    xh_Trace(2)
     ProcedureReturn 0
   EndIf
+  xh_Trace(3)
 
+  xh_Trace(4)
   cmd = xh_Rd(xh_op, #XHCI_USBCMD)
+  xh_Trace(5)
   cmd = cmd | #XHCI_CMD_RESET
+  xh_Trace(6)
   xh_Wr(xh_op, #XHCI_USBCMD, cmd)
+  xh_Trace(7)
 
   ; HCRST is self-clearing. xhci.c waits XHCI_MAX_RESET_USEC for it.
   d = xh_Deadline(#XHCI_TMO_RESET_MS)
-  While (xh_Rd(xh_op, #XHCI_USBCMD) & #XHCI_CMD_RESET) <> 0
+  xh_Trace(8)
+  cmd = xh_Rd(xh_op, #XHCI_USBCMD)
+  xh_Trace(9)
+  While (cmd & #XHCI_CMD_RESET) <> 0
     If xh_Expired(d) <> 0
+      xh_Trace(10)
       ProcedureReturn xh_Fail(#XHCI_ERR_RESET)
     EndIf
+    cmd = xh_Rd(xh_op, #XHCI_USBCMD)
   Wend
 
   ; And THEN Controller Not Ready. See the comment above; this is the
   ; wait whose absence produces a silent, plausible-looking failure.
   d = xh_Deadline(#XHCI_TMO_RESET_MS)
-  While (xh_Rd(xh_op, #XHCI_USBSTS) & #XHCI_STS_CNR) <> 0
+  xh_Trace(11)
+  cmd = xh_Rd(xh_op, #XHCI_USBSTS)
+  xh_Trace(12)
+  While (cmd & #XHCI_STS_CNR) <> 0
     If xh_Expired(d) <> 0
+      xh_Trace(13)
       ProcedureReturn xh_Fail(#XHCI_ERR_CNR)
     EndIf
+    cmd = xh_Rd(xh_op, #XHCI_USBSTS)
   Wend
 
+  xh_Trace(14)
   ProcedureReturn 1
 EndProcedure
 

@@ -21,6 +21,14 @@ Global writes.i
 Global ticks.i
 Global failure.i
 Global xh_hz.i=1000000
+Global trace.i
+Global tracefault.i
+Global tracecount.i
+Procedure xh_Trace(p.i)
+ trace=p
+ PokeI($06000100+tracecount*8,p)
+ tracecount=tracecount+1
+EndProcedure
 Procedure.i Cold()
   If mode=0 : ProcedureReturn 1 : EndIf
   ProcedureReturn ticks<4000 And mode=1
@@ -34,6 +42,7 @@ Procedure.i xh_Rd(b.i,off.i)
 EndProcedure
 Procedure xh_Wr(b.i,off.i,value.i)
   writes=writes+1
+  If off=0 And (value & 2)<>0 And trace<>6 : tracefault=tracefault+1 : EndIf
   If (b<>xh_op Or off<>#XHCI_USBSTS) And Cold()<>0 : premature=premature+1 : EndIf
 EndProcedure
 Procedure.i xh_Fail(reason.i)
@@ -53,6 +62,8 @@ Procedure.i Main()
  PokeI($06000010,writes)
  PokeI($06000018,xh_ready)
  PokeI($06000020,failure)
+ PokeI($06000028,tracefault)
+ PokeI($06000030,tracecount)
  ProcedureReturn 0
 EndProcedure
 '''
@@ -70,7 +81,11 @@ def run(work,mode,body=bodies):
   if cpu.pc==base.RETURN_PC:break
   cpu.step()
  else:raise AssertionError('fixture did not terminate')
- out=[base.u64(cpu,base.OUT+8*i) for i in range(5)]
+ out=[base.u64(cpu,base.OUT+8*i) for i in range(6)]
+ assert out[5]==0,('reset write before marker',out)
+ trace=[base.u64(cpu,base.OUT+0x100+i*8) for i in range(base.u64(cpu,base.OUT+0x30))]
+ expected=[1,2]*2 if mode==0 else [1,3,4,5,6,7,8,9,11,12,14]*2
+ assert trace==expected,('trace sequence',mode,trace)
  assert out[1]==0,('premature operational/runtime write',mode,out)
  assert out[3]==0,('ready retained on stop',out)
  if mode==0:assert out[0]==0 and out[2]==0 and out[4]==14,out
@@ -84,5 +99,8 @@ with tempfile.TemporaryDirectory(prefix='xhci-initial-cnr-') as temp:
   try:run(work,0,body)
   except AssertionError:pass
   else:raise AssertionError('mutant survived: '+label)
- print('PASS: 3 initial-CNR/ready cases;',steps,'instructions; 2 readiness/cleanup mutants rejected')
+ try:run(work,2,bodies.replace('  xh_Trace(6)','  xh_Trace(5)',1))
+ except AssertionError:pass
+ else:raise AssertionError('missing pre-write marker mutant survived')
+ print('PASS: 3 initial-CNR/ready cases with exact trace order;',steps,'instructions; 3 readiness/cleanup/marker mutants rejected')
  print('Compiler SHA256',hashlib.sha256(pathlib.Path(args.compiler).read_bytes()).hexdigest())
