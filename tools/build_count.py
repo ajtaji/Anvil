@@ -24,7 +24,7 @@ that asked, and it
 
   1. identifies WHICH REAL BOARD FILE in this repository that compile was a
      build of - RaspberryPi4/Board/board.pi4 for pi4, ArduinoQ/Board/board.unoq
-     for unoq, and nothing else in this tree has a build number at all;
+     for unoq, or RaspberryPi3/Board/board.pi3 for the experimental Pi 3;
   2. raises that file's `; pmf:build` marker by exactly one and stamps the
      `; pmf:builddate` and `; pmf:buildtime` siblings beside it;
   3. honours `; pmf:build off` - a frozen number does not move, and the build
@@ -143,6 +143,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # and a number bumped by all of them counts nothing (the compiler refuses that
 # by name, PMF-BLD-003).
 BOARDS = {
+    "pi3": Path("RaspberryPi3/Board/board.pi3"),
     "pi4": Path("RaspberryPi4/Board/board.pi4"),
     "unoq": Path("ArduinoQ/Board/board.unoq"),
 }
@@ -521,7 +522,7 @@ def board_for(source, target: str | None = None, root: Path = ROOT) -> Path | No
 
     A gate compiles the monitor from a temporary copy, so the path it hands the
     compiler is not the path that has to move. Identity is the board file's own
-    name: this repository has exactly one `board.pi4` and one `board.unoq`, and
+    name: each entry in BOARDS has its own unique board filename, and
     a file called that, compiled for that target, is that monitor - whether it
     sits in the tree or in a temporary export of it. Everything else a gate
     compiles is a fixture: a few lifted procedures around a probe, with no
@@ -624,7 +625,7 @@ def record_build(source, target: str, image, by: str | None = None,
     """Count one successful build of a board file. Call it AFTER the compile.
 
     `source` is the path that was handed to the compiler - the real board file
-    or a temporary copy of it. `target` is pi4 or unoq. `image` is what the
+    or a temporary copy of it. `target` is a key in BOARDS. `image` is what the
     compile produced. `by` names the tool doing the asking, and defaults to the
     script that is running. `compiler` is the executable that was run - required
     for a
