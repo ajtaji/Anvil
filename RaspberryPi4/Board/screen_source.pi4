@@ -259,6 +259,7 @@ EndProcedure
 ;  at a running panel has to do anyway.
 ; ----------------------------------------------------------------------
 Procedure.i ScrDsiBringUp()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define ok.i
 
   gScrDsiUp = 0
@@ -443,6 +444,7 @@ EndProcedure
 ;  #MON_FB_DRAW and ScrPresent moves it.
 ; ----------------------------------------------------------------------
 Procedure.i ScrDsiSurface()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define lw.i
   Define lh.i
   Define fb.i
@@ -510,6 +512,7 @@ EndProcedure
 ;  the rule is written and no way for the two to drift.
 ; ----------------------------------------------------------------------
 Procedure.i ScrPresentable()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   If gScrSrc = #SCR_SRC_HDMI
     ProcedureReturn 1
   EndIf
@@ -575,6 +578,7 @@ EndProcedure
 ; clock, reset or allocation operation occurs here. Return 1 when staged, 0
 ; when refused. A staged request remains pending until ScrDsiReadoptResolve.
 Procedure.i ScrDsiReadoptBegin(rot.i, scale.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define fb.i
   Define lw.i
   Define lh.i
@@ -615,6 +619,7 @@ EndProcedure
 ; prevalidated DisplayAdopt has committed matching software geometry. Zero
 ; means still pending; both HVS slots and the old software state stay intact.
 Procedure.i ScrDsiReadoptResolve()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   If gScrReadoptPending = 0
     ProcedureReturn 1
   EndIf
@@ -663,6 +668,7 @@ Procedure.i ScrDsiReadoptPending() : ProcedureReturn gScrReadoptPending : EndPro
 ;  on the DSI path.
 ; ======================================================================
 Procedure.i ScrGpuBase()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   If gScrSrc = #SCR_SRC_DSI
     ProcedureReturn #MON_FB_DRAW
   EndIf
@@ -719,6 +725,7 @@ EndProcedure
 ; w/h are logical capture dimensions; panelW/panelH/pitch describe the physical
 ; raster beneath them. ScrCapturePixel applies the one common rotation map.
 Procedure.i ScrCaptureSnapshot(*base, *w, *h, *pitch, *rot, *panelW, *panelH, *bpp)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define fb.i
   Define pw.i
   Define ph.i
@@ -827,6 +834,7 @@ EndProcedure
 ;  cleared magic.
 ; ======================================================================
 Procedure.i ScrCaptureToArea(who.i, x0.i, tier.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define fb.i
   Define w.i
   Define h.i
@@ -929,6 +937,7 @@ EndProcedure
 ; damage/present paths. The cache clean is per pixel because callers are tiny
 ; (the alive glint is 5 pixels plus two 5x5 restores), never a raster renderer.
 Procedure.i ScrPresentedPixel(x.i, y.i, colour.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define fb.i
   Define pitch.i
   Define pw.i
@@ -1000,6 +1009,7 @@ EndProcedure
 ; already transformed by the established CPU path, so the photo and smooth
 ; fonts do not acquire a second renderer or a second rotation formula.
 Procedure.i ScrGpuKeepBanner(renderBase.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define x.i
   Define y.i
   Define w.i
@@ -1085,6 +1095,7 @@ EndProcedure
 ;  do or the request does not describe this surface.
 ; ======================================================================
 Procedure.i ScrGpuKeepLogicalBand(renderBase.i, y0.i, y1.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define front.i
   Define pitch.i
   Define pw.i
@@ -1198,6 +1209,7 @@ EndProcedure
 ; correctness fallback. HDMI's double-height allocation is also presented by
 ; a copy, preserving the crisp offset-zero behaviour already proven there.
 Procedure.i ScrGpuPresent(renderBase.i, bytes.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define front.i
 
   If bytes <> ScrGpuBytes()

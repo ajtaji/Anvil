@@ -2098,6 +2098,7 @@ EndProcedure
 
 
 Procedure.i DisplayInit(width.i, height.i, depth.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define aw.i
   Define ah.i
   Define ad.i
@@ -2457,6 +2458,7 @@ EndProcedure
 ;  for the same defect, so one reporter prints both.
 ; ======================================================================
 Procedure.i DisplayAdopt(base.i, pitch.i, w.i, h.i, depth.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define rc.i
   rc = DisplayAdoptValidate(base, pitch, w, h, depth)
   If rc <> #DSP_OK
@@ -2517,7 +2519,17 @@ Procedure.i DisplayBytesPerPixel()
 EndProcedure
 
 ; DisplayBase - ARM physical address of pixel (0,0).
+; Quarantine is independent of the acceleration preference. Disabling DMA
+; cannot make a surface safe while its former writer is still unaccounted for.
+Procedure.i DisplayMemorySafe()
+  CompilerIf #DSP_DMA_LINKED = 1
+    If DmaQuarantined() <> 0 : ProcedureReturn 0 : EndIf
+  CompilerEndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i DisplayBase()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn dsp_base
 EndProcedure
 
@@ -2589,6 +2601,7 @@ EndProcedure
 ; that reads the framebuffer to photograph it (CmdPic) uses this so it
 ; captures the half being displayed after a page flip.
 Procedure.i DisplayViewBase()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn dsp_base + dsp_viewOff
 EndProcedure
 
@@ -2731,6 +2744,9 @@ EndProcedure
 ; rather than a mask, for the 64-bit reason in the header.
 ; ----------------------------------------------------------------------
 Procedure DisplayFlushRect(x.i, y.i, w.i, h.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define x0.i
   Define y0.i
   Define x1.i
@@ -2814,6 +2830,9 @@ Procedure DspFlushSpan(lo.i, n.i)
 EndProcedure
 
 Procedure DisplayFlush()
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   DisplayFlushRect(0, 0, dsp_w, dsp_h)
 EndProcedure
 
@@ -2824,6 +2843,9 @@ EndProcedure
 ; MASTER, which says why cleaning after a hardware transfer is at best
 ; wasted and at worst destructive.
 Procedure DspTouched(x.i, y.i, w.i, h.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   If dsp_auto = 1
     DisplayFlushRect(x, y, w, h)
   EndIf
@@ -3068,6 +3090,7 @@ EndProcedure
 ; (dsp_pitch & 1) = 0, and add a 16bpp group to the gate FIRST.
 ; ----------------------------------------------------------------------
 Procedure.i DspDmaReady()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   If dsp_ready = 0
     ProcedureReturn 0
   EndIf
@@ -3488,6 +3511,9 @@ EndProcedure
 ; DisplayFillRect is this plus the flush.
 ; ----------------------------------------------------------------------
 Procedure DspFillCell(x.i, y.i, w.i, h.i, colour.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define x0.i
   Define y0.i
   Define x1.i
@@ -3556,6 +3582,9 @@ EndProcedure
 ; CACHE COHERENCY WITH A BUS MASTER.
 ; ----------------------------------------------------------------------
 Procedure DisplayFillRect(x.i, y.i, w.i, h.i, colour.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   CompilerIf #DSP_DMA_LINKED = 1
     If DspDmaFill(x, y, w, h, colour) = 1
       ProcedureReturn
@@ -3606,6 +3635,9 @@ EndProcedure
 ; end of the last row of the surface.
 ; ----------------------------------------------------------------------
 Procedure DisplayPixel(x.i, y.i, colour.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define a.i
   If dsp_ready = 0
     ProcedureReturn
@@ -3631,6 +3663,7 @@ EndProcedure
 ; set, so an unmasked read of an opaque white pixel comes back negative.
 ; ----------------------------------------------------------------------
 Procedure.i DisplayGetPixel(x.i, y.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn -1 : EndIf
   Define a.i
   If dsp_ready = 0
     ProcedureReturn -1
@@ -3662,6 +3695,9 @@ EndProcedure
 ; would make every caller pay for one.
 ; ----------------------------------------------------------------------
 Procedure DisplayBlit(*src, srcPitch.i, x.i, y.i, w.i, h.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define row.i
   Define col.i
   Define s.i
@@ -3733,6 +3769,9 @@ EndProcedure
 ; smeared.
 ; ----------------------------------------------------------------------
 Procedure DisplayCopyRect(sx.i, sy.i, dx.i, dy.i, w.i, h.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define row.i
   Define col.i
   Define s.i
@@ -3788,6 +3827,9 @@ Procedure DisplayCopyRect(sx.i, sy.i, dx.i, dy.i, w.i, h.i)
   ; ------------------------------------------------------------------
   CompilerIf #DSP_DMA_LINKED = 1
     If DspDmaCopyRect(sx, sy, dx, dy, cw, chh) = 1
+      ProcedureReturn
+    EndIf
+    If DisplayMemorySafe() = 0
       ProcedureReturn
     EndIf
   CompilerEndIf
@@ -3915,6 +3957,7 @@ EndProcedure
 ; naturally. Parenthesised because & binds tighter than >>.
 ; ----------------------------------------------------------------------
 Procedure.i DisplayChar(x.i, y.i, ch.i, fg.i, bg.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define r.i
   Define col.i
   Define b.i
@@ -4046,6 +4089,7 @@ EndProcedure
 ; picture stamps a rectangle of background colour around every letter.
 ; ----------------------------------------------------------------------
 Procedure.i DisplayCharClear(x.i, y.i, ch.i, fg.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define r.i
   Define col.i
   Define b.i
@@ -4278,6 +4322,9 @@ EndProcedure
 ; the slow one.
 ; ----------------------------------------------------------------------
 Procedure DspCopyUp(dst.i, src.i, n.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define s.i
   Define d.i
   Define k.i
@@ -4388,6 +4435,9 @@ EndProcedure
 ; semantics.
 ; ----------------------------------------------------------------------
 Procedure DisplayScroll(rows.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define chgt.i
   Define cwid.i
   Define keep.i

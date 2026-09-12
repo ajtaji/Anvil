@@ -37,6 +37,9 @@ EndProcedure
 ; Cache maintenance is deliberately absent here; PresentedOverlaySyncRect
 ; batches it by physical row once the complete rectangle has been written.
 Procedure PresentedOverlayPixel(base.i, pitch.i, rot.i, panelW.i, panelH.i, x.i, y.i, colour.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define px.i
   Define py.i
   If x < 0 Or y < 0 Or x >= ScrLogicalW(rot, panelW, panelH) Or y >= ScrLogicalH(rot, panelW, panelH)
@@ -53,6 +56,9 @@ EndProcedure
 ; The rectangle is an explicit context pointer so the call stays under the
 ; compiler's eight-argument ABI without a hidden set-then-call contract.
 Procedure PresentedOverlaySyncRect(base.i, pitch.i, rot.i, panelW.i, panelH.i, *rect.PresentedOverlayRect)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
   Define ax.i
   Define ay.i
   Define bx.i
@@ -1148,7 +1154,17 @@ EndProcedure
 
 ; Safe boot/prompt service boundary. Call after a meaningful progress line
 ; or driver phase tick, never for every character and never from UartWrite.
+Global gScreenMemoryFault.i
 Procedure ScreenServiceTick()
+  If DisplayMemorySafe() = 0
+    If gScreenMemoryFault = 0
+      gScreenMemoryFault = 1
+      UartMirror(0)
+      PrintN("DMA error -20: screen memory is quarantined because DMA has not stopped safely.")
+      PrintN("Drawing is suspended; diagnose the channel before explicitly recovering it.")
+    EndIf
+    ProcedureReturn
+  EndIf
   If gScreenServiceBusy <> 0
     ProcedureReturn
   EndIf

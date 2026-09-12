@@ -563,18 +563,17 @@ Procedure RunAt(a.i)
   ;  run is built on: a payload must not leave a bus master running
   ;  underneath the monitor.
   ;
-  ;  AND IF THE RESET DOES NOT TAKE, THE ENGINE IS GIVEN UP RATHER
-  ;  THAN RETRIED. gDma going to 0 puts this monitor back on exactly
-  ;  the drawing path it had before today - slow, and completely
-  ;  correct - which is the right end state for a console that must
-  ;  still be here when everything else has gone wrong.
+  ;  If reset cannot establish quiescence, suspend screen memory access.
+  ;  Switching to CPU drawing cannot stop outstanding DMA writes.
   If gDma = 1
     If DmaChannelReset() = 0
       gDma = 0
       DisplayUseDma(0)
-      PrintN("The payload left the DMA engine running and it would not reset, so")
-      PrintN("the screen is back to being drawn by the processor. Everything still")
-      PrintN("works; scrolling is slow again. Reset the board to get it back.")
+      UartMirror(0)
+      ConNoRenderer()
+      PrintN("DMA error -20: the payload's DMA channel could not be stopped safely.")
+      PrintN("Screen drawing is suspended; CPU fallback would reuse unsafe buffers.")
+      PrintN("Use the console to diagnose the channel before explicit recovery.")
     EndIf
   EndIf
 

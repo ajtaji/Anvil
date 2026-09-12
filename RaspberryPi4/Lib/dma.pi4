@@ -275,8 +275,8 @@
 ;
 ;   CS bit 28, WAIT_FOR_OUTSTANDING_WRITES (:3050-3070), keeps a tally
 ;   instead: writes stream out freely, and at the very end of the
-;   transfer the engine defers clearing ACTIVE and setting END until
-;   the last write response has come back.
+;   transfer the engine clears ACTIVE but defers setting END until
+;   the last write response has come back. END is the completion witness.
 ;
 ; The second is what a blitter wants: full speed, and a completion flag
 ; that means the pixels are actually in memory rather than in flight.
@@ -406,6 +406,7 @@
 #DMA_DEBUG_FIFO_ERROR     = $00000002  ; bit  1, W1C, :3611-3616
 #DMA_DEBUG_READ_LAST_ERR  = $00000001  ; bit  0, W1C, :3617-3622
 #DMA_DEBUG_ERROR_MASK     = $00000007  ; all three, cleared together
+#DMA_DEBUG_WRITES         = $000000F0  ; Table 45: outstanding write responses
 
 ; Field limits, from the register widths themselves.
 ;   XLENGTH is 15:0        -> at most 65535 bytes in one row
@@ -627,6 +628,7 @@
 #DMA_ERR_OVERLAP   = -17  ; a copy whose source and destination overlap
 #DMA_ERR_ROWLIMIT  = -18  ; a fill row longer than #DMA_FILL_MAX_ROW_BYTES
 #DMA_ERR_BURST     = -19  ; a burst length at or above the bus-locking one
+#DMA_ERR_UNSAFE    = -20  ; channel quiescence could not be established
 
 
 ; ======================================================================
@@ -703,6 +705,7 @@ Global dma_boundsN.i  = 0      ; its length in bytes
 Global dma_haveBounds.i = 0    ; 1 once DmaSetBounds() has been obeyed
 Global dma_chan.i     = 0      ; the channel this file drives
 Global dma_ready.i    = 0      ; 1 once DmaInit() has succeeded
+Global dma_quarantined.i = 0   ; selected channel failed verified quiescence
 Global dma_err.i      = 0      ; the last error, one of #DMA_ERR_*
 ; MEASURED ON SILICON, 2026-08-26, by pi4DmaGate.pi4 on a BCM2711: the
 ; probe's source pointer advanced EIGHT bytes for a one-row request, so
@@ -1161,6 +1164,8 @@ EndProcedure
 ; asserting something it cannot know.
 ; ----------------------------------------------------------------------
 Procedure.i DmaSetScratch(base.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   dma_err = #DMA_ERR_NONE
 
   If base <= 0
@@ -1213,6 +1218,8 @@ EndProcedure
 ; first transfer puts the error next to the mistake.
 ; ----------------------------------------------------------------------
 Procedure.i DmaSetBounds(base.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   dma_err = #DMA_ERR_NONE
 
   If base <= 0
@@ -1268,6 +1275,8 @@ EndProcedure
 ; So 0, 2, 4, 5 and 6 are the five this file will accept.
 ; ----------------------------------------------------------------------
 Procedure.i DmaSetChannel(ch.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   dma_err = #DMA_ERR_NONE
 
   If ch < 0
@@ -1405,42 +1414,45 @@ EndProcedure
 ; CS bit 0 ACTIVE, which "is automatically cleared at the end of the
 ; complete DMA transfer, i.e. after a NEXTCONBK = 0x0000_0000 has been
 ; loaded" (:3201-3210). Every control block this file builds has a zero
-; NEXTCONBK, so ACTIVE going low is the completion signal.
+; NEXTCONBK, but ACTIVE going low is NOT the completion signal.
 ;
-; AND IT MEANS THE PIXELS ARE IN MEMORY, not merely on their way,
-; because every start sets CS.WAIT_FOR_OUTSTANDING_WRITES. The header
-; section on that bit says why it is the right one and TI.WAIT_RESP is
-; not.
+; Table 38 explicitly permits ACTIVE=0 while final writes are outstanding.
+; DmaWait requires END and drained writes; this reader includes outstanding
+; responses as busy. Do not reuse memory merely because ACTIVE cleared.
 ; ----------------------------------------------------------------------
 Procedure.i DmaBusy()
-  If (DmaRegRead(#DMA_CS) & #DMA_CS_ACTIVE) <> 0
-    ProcedureReturn 1
-  EndIf
+  ProcedureReturn Bool(DmaQuiescent() = 0)
+EndProcedure
+
+Procedure.i DmaQuarantined()
+  ProcedureReturn dma_quarantined
+EndProcedure
+
+; Table 38: ACTIVE clears before the last write response; Table 45 counts
+; those responses. This is only the selected legacy channel, never DMA4.
+Procedure.i DmaQuiescent()
+  If (DmaRegRead(#DMA_CS) & (#DMA_CS_ACTIVE | #DMA_CS_WAITING)) <> 0 : ProcedureReturn 0 : EndIf
+  If (DmaRegRead(#DMA_DEBUG) & #DMA_DEBUG_WRITES) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DmaQuarantine()
+  dma_quarantined = 1
+  dma_ready = 0
+  dma_err = #DMA_ERR_UNSAFE
   ProcedureReturn 0
 EndProcedure
 
 ; ----------------------------------------------------------------------
 ; DmaAbort - stop a channel that is not going to finish.
 ;
-; Internal, and called only from the timeout path. The sequence is the
-; PDF's own, from section 4.4 (:5252-5254): "abort the DMA transfer by
-; clearing the NEXTCONBK register and restarting the DMA with the ABORT
-; bit set". NEXTCONBK is already zero in every control block here, so
-; what is left is ABORT and then RESET.
+; Internal checked recovery shared by timeout and hardware-error paths.
+; Pause and drain precede RESET; failed drain quarantines the channel.
 ;
-; RESET as well as ABORT, because ABORT only drops the CURRENT control
-; block - "The DMA will load the next CB and attempt to continue"
-; (:3042-3048) - and a channel that has gone wrong badly enough to miss
-; a two-second deadline should not be left holding any state at all.
+; ABORT alone can load the next CB, so it is not a quiescence proof.
 ; ----------------------------------------------------------------------
-Procedure DmaAbort()
-  DmaRegWrite(#DMA_CS, #DMA_CS_ABORT)
-  a64_barrier()
-  DmaRegWrite(#DMA_CS, #DMA_CS_RESET)
-  a64_barrier()
-  DmaRegWrite(#DMA_DEBUG, #DMA_DEBUG_ERROR_MASK)
-  DmaRegWrite(#DMA_CS, #DMA_CS_END | #DMA_CS_INT)
-  a64_barrier()
+Procedure.i DmaAbort()
+  ProcedureReturn DmaChannelReset()
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1449,7 +1461,8 @@ EndProcedure
 ; Writing 1 to CS bit 31 resets the channel. The bit "cannot be read,
 ; and will self clear" (:3035-3040), so there is nothing to poll for
 ; the reset itself; what CAN be polled is the consequence, which is
-; ACTIVE going low, and that is what this loop waits for.
+; ACTIVE and outstanding writes clear, and those are checked before RESET
+; as well as afterward. Only an explicit successful reset clears quarantine.
 ;
 ; The DEBUG write clears the three sticky error latches. They are
 ; write-1-to-clear and they survive a reset, so a stale READ_ERROR from
@@ -1467,18 +1480,39 @@ EndProcedure
 Procedure.i DmaChannelReset()
   Protected i.i
   Protected cs.i
+  Protected start.i
+  Protected hz.i
+  Protected limit.i
 
+  ; Pause before reset. RESET clears DEBUG's outstanding-write count, so
+  ; polling only after RESET would discard the very evidence we need.
+  ; Table38/Table45; Linux bcm2835_dma_abort corroborates pause/drain order.
+  hz = DmaCounterHz()
+  If hz < 0 Or hz > $FFFFFFFF : hz = 0 : EndIf
+  limit = (hz * 20000 + 999999) / 1000000
+  start = DmaTicks()
+  DmaRegWrite(#DMA_CS, #DMA_CS_WAIT_WRITES)
+  a64_barrier()
+  i = #DMA_RESET_SPINS
+  While DmaQuiescent() = 0
+    i = i - 1
+    If hz > 0
+      If (DmaTicks() - start) >= limit : ProcedureReturn DmaQuarantine() : EndIf
+    Else
+      If i <= 0 : ProcedureReturn DmaQuarantine() : EndIf
+    EndIf
+  Wend
   DmaRegWrite(#DMA_CS, #DMA_CS_RESET)
   a64_barrier()
 
-  i  = 0
-  cs = DmaRegRead(#DMA_CS)
-  While i < #DMA_RESET_SPINS
-    If (cs & #DMA_CS_ACTIVE) = 0
-      i = #DMA_RESET_SPINS
+  start = DmaTicks()
+  i = #DMA_RESET_SPINS
+  While DmaQuiescent() = 0
+    i = i - 1
+    If hz > 0
+      If (DmaTicks() - start) >= limit : ProcedureReturn DmaQuarantine() : EndIf
     Else
-      i  = i + 1
-      cs = DmaRegRead(#DMA_CS)
+      If i <= 0 : ProcedureReturn DmaQuarantine() : EndIf
     EndIf
   Wend
 
@@ -1486,9 +1520,7 @@ Procedure.i DmaChannelReset()
   DmaRegWrite(#DMA_CS, #DMA_CS_END | #DMA_CS_INT)
   a64_barrier()
 
-  If (DmaRegRead(#DMA_CS) & #DMA_CS_ACTIVE) <> 0
-    ProcedureReturn 0
-  EndIf
+  dma_quarantined = 0
   ProcedureReturn 1
 EndProcedure
 
@@ -1525,11 +1557,18 @@ Procedure.i DmaWait(timeoutUs.i)
   Protected rc.i
 
   hz = DmaCounterHz()
+  ; Public API: reject invalid/overflowing durations, but still account for
+  ; the outstanding transfer before returning. CNTFRQ is a 32-bit field.
+  If timeoutUs < 1 Or timeoutUs > $7FFFFFFF Or hz < 0 Or hz > $FFFFFFFF
+    If DmaAbort() = 0 : ProcedureReturn 0 : EndIf
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
   t0 = DmaTicks()
 
   limit = 0
   If hz > 0
-    limit = (hz / 1000000) * timeoutUs
+    limit = (hz * timeoutUs + 999999) / 1000000
   EndIf
 
   rc      = 1
@@ -1539,11 +1578,16 @@ Procedure.i DmaWait(timeoutUs.i)
 
   While waiting = 1
     cs = DmaRegRead(#DMA_CS)
-    If (cs & #DMA_CS_ACTIVE) = 0
+    dbg = DmaRegRead(#DMA_DEBUG)
+    If (cs & #DMA_CS_ERROR) <> 0 Or (dbg & #DMA_DEBUG_ERROR_MASK) <> 0
+      dma_err = #DMA_ERR_HW
+      rc = 0
+      waiting = 0
+    ElseIf (cs & (#DMA_CS_ACTIVE | #DMA_CS_WAITING | #DMA_CS_END)) = #DMA_CS_END And (dbg & #DMA_DEBUG_WRITES) = 0
       waiting = 0
     Else
       spins = spins + 1
-      If spins > #DMA_SPIN_LIMIT
+      If hz <= 0 And spins > #DMA_SPIN_LIMIT
         waiting = 0
         rc      = 0
         dma_err = #DMA_ERR_TIMEOUT
@@ -1565,7 +1609,7 @@ Procedure.i DmaWait(timeoutUs.i)
   dma_lastDebug = dbg
 
   If rc = 0
-    DmaAbort()
+    If DmaAbort() = 0 : ProcedureReturn 0 : EndIf
     ProcedureReturn 0
   EndIf
 
@@ -1617,6 +1661,8 @@ Procedure.i DmaSubmit(ti.i, srcBus.i, dstBus.i, lenWord.i, strideWord.i)
   Protected cb.i
   Protected cs.i
 
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   cb = dma_scratch + #DMA_SCRATCH_CB
 
   PokeL(cb +  0, ti)
@@ -1895,6 +1941,7 @@ Procedure.i DmaInit()
   Protected dbg.i
   Protected cs.i
 
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
   dma_err   = #DMA_ERR_NONE
   dma_ready = 0
 
@@ -2108,6 +2155,8 @@ EndProcedure
 ; caller's because only the caller knows whether the CPU touched it.
 ; ----------------------------------------------------------------------
 Procedure.i DmaFillPattern32(dst.i, pitch.i, rowBytes.i, rows.i, pattern.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   Protected ti.i
   Protected i.i
   Protected p.i
@@ -2239,6 +2288,7 @@ EndProcedure
 ;   caller stage through a temporary.
 ; ----------------------------------------------------------------------
 Procedure.i DmaCopy2D(dst.i, dstPitch.i, src.i, srcPitch.i, rowBytes.i, rows.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
   Protected ti.i
   Protected ylen.i
   Protected lenWord.i
@@ -2319,6 +2369,7 @@ EndProcedure
 ; The overlap rule is DmaCopy2D's.
 ; ----------------------------------------------------------------------
 Procedure.i DmaCopy(dst.i, src.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
   Protected ti.i
 
   dma_err = #DMA_ERR_NONE
@@ -2373,6 +2424,9 @@ EndProcedure
 ;  doing what they expected and no debugger.
 ; ======================================================================
 Procedure.i DmaErrorText()
+  If dma_quarantined <> 0
+    ProcedureReturn "DMA error -20: the channel has not stopped safely. Its buffers must not be reused; check the channel and bus before explicit recovery."
+  EndIf
   Select dma_err
     Case #DMA_ERR_NONE
       ProcedureReturn "dma: ok"
