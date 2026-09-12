@@ -42,6 +42,21 @@ def main():
         build_count.record_build(source,'pi4',image,by='tools/scheduler_context_preempt_check.py',compiler=str(compiler))
         class RefusalModel(m.A64):
             old_vector=0
+            reject_restore=False
+            install_fault=0
+            def step(self):
+                word=self.load(self.pc,4)
+                if self.install_fault and word&~31==0xd51ec000:
+                    super().step()
+                    self.system_registers[0xd51ec000]=0x18000
+                    self.install_fault-=1
+                    return
+                if self.reject_restore and word&~31==0xd51ed040:
+                    self.reject_restore=False
+                    super().step()
+                    self.system_registers[0xd51ed040]=1
+                    return
+                return super().step()
             def store(self,addr,value,size):
                 if addr==0x6000100:
                     if value in (1,2):self.system_registers[0xd51800a0]=1 if value==1 else 0
@@ -50,6 +65,8 @@ def main():
                         self.old_vector=self.system_registers[0xd51ec000];self.system_registers[0xd51ec000]=0x18000
                     if value==6:self.system_registers[0xd51ec000]=self.old_vector
                     if value in (7,8):self.system_registers[0xd51ed040]=1 if value==7 else 0
+                    if value==9:self.reject_restore=True
+                    if value in (10,11):self.install_fault=value-9
                 return super().store(addr,value,size)
         c=RefusalModel();c.memory.update({0x400000+i:b for i,b in enumerate(image.read_bytes())})
         c.pc,c.sp,c.x[30]=0x400000,0x3000000,0x7000000
@@ -59,12 +76,12 @@ def main():
             c.step()
         else:raise AssertionError('Ownership fixture exceeded execution bound.')
         checks,failures=c.load(0x6000000,8),c.load(0x6000008,8)
-        assert checks==31 and failures==0,(checks,failures)
+        assert checks==45 and failures==0,(checks,failures)
         print(f'PASS: {checks} vector/core/mask/span/context/refusal assertions, {steps} instructions.')
         if a.mutate:
             fixture=(ROOT/'Anvil/Kernel/Scheduler/Tests/preempt.pi4').read_text()
             runtime=(ROOT/'Anvil/Kernel/Scheduler/preempt_a64.pbi').read_text()
-            for name,before,after in (('q0_restore','    ldr q0, [x9, #288]','    ldr q0, [x9, #304]'),('saved_pc','    mrs x10, elr_el3','    movz x10, #0')):
+            for name,before,after in (('q0_restore','    ldr q0, [x9, #288]','    ldr q0, [x9, #304]'),('saved_pc','    mrs x10, elr_el3\n    str x10, [x9, #256]','    movz x10, #0\n    str x10, [x9, #256]')):
                 assert runtime.count(before)==1,(name,'mutation anchor not unique')
                 source=Path(d)/(name+'.pi4');image=Path(d)/(name+'.img')
                 source.write_text(fixture.replace('XIncludeFile "Anvil/Kernel/Scheduler/preempt_a64.pbi"',runtime.replace(before,after)))

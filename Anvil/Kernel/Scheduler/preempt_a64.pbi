@@ -38,6 +38,12 @@ Global ap_vbar.i
 Global ap_thread.i
 Global ap_spsel.i
 Global ap_vector.i
+Global ap_fatal_busy.i
+Global ap_restore_pending.i
+Global ap_recovery_vbar.i
+Global ap_fatal_reporter.i
+Global Dim ap_fatal_record.i[8]
+Global Dim ap_fatal_stack.a[16384 + 15]
 Procedure.i ApFrame(slot.i)
   ProcedureReturn ((@ap_frames[0] + 15) & -16) + slot * #AP_BYTES
 EndProcedure
@@ -118,11 +124,64 @@ EndProcedure
 ProcedureNaked ApFatal()
   ASM
     msr daifset, #15
-    brk #0
+    adrp x9, global_ap_fatal_busy
+    add x9, x9, #:lo12:global_ap_fatal_busy
+    ldr x10, [x9]
+    cbnz x10, ap_fatal_park
+    movz x10, #1
+    str x10, [x9]
+    adrp x9, global_ap_fatal_record
+    add x9, x9, #:lo12:global_ap_fatal_record
+    mrs x10, CurrentEL
+    str x10, [x9]
+    mrs x10, esr_el3
+    str x10, [x9, #8]
+    mrs x10, elr_el3
+    str x10, [x9, #16]
+    mrs x10, far_el3
+    str x10, [x9, #24]
+    mov x10, sp
+    str x10, [x9, #32]
+    adrp x10, global_ap_active
+    add x10, x10, #:lo12:global_ap_active
+    ldr x10, [x10]
+    str x10, [x9, #40]
+    adrp x10, global_ap_inirq
+    add x10, x10, #:lo12:global_ap_inirq
+    ldr x10, [x10]
+    str x10, [x9, #48]
+    ; Zero means raw register observation, not a validated fault/task frame.
+    str xzr, [x9, #56]
+    adrp x9, global_ap_fatal_stack
+    add x9, x9, #:lo12:global_ap_fatal_stack
+    movz x10, #16384
+    add x9, x9, x10
+    lsr x9, x9, #4
+    lsl x9, x9, #4
+    mov sp, x9
+    adrp x9, global_ap_fatal_reporter
+    add x9, x9, #:lo12:global_ap_fatal_reporter
+    ldr x9, [x9]
+    cbz x9, ap_fatal_park
+    blr x9
 ap_fatal_park:
     wfe
     b ap_fatal_park
   ENDASM
+EndProcedure
+Procedure.i ApSetFatalReporter(callback.i)
+  If ap_installed = 0 Or ap_active <> 0 Or ap_fatal_busy <> 0
+    ProcedureReturn 0
+  EndIf
+  ApEnvironment()
+  If ap_el <> 12 Or ap_core <> ap_boundcore Or ap_daif <> 960 Or ap_vbar <> ap_vector
+    ProcedureReturn 0
+  EndIf
+  If callback < ap_code Or callback >= ap_code + ap_codesize Or (callback & 3) <> 0
+    ProcedureReturn 0
+  EndIf
+  ap_fatal_reporter = callback
+  ProcedureReturn 1
 EndProcedure
 ProcedureNaked ApVectors()
   ASM
@@ -477,7 +536,20 @@ Procedure.i ApInstall(expectedVbar.i, ack.i, arm.i, stop.i, code.i, codesize.i)
   PokeI(ap_irqtop, $4150475541524421)
   ApInstallVector()
   ApEnvironment()
-  If ap_vbar <> ap_vector : ApRestoreVector() : ProcedureReturn 0 : EndIf
+  If ap_vbar <> ap_vector
+    ; Installation failed after a write: retain ownership until rollback is
+    ; observed, even if the failure left neither the old nor requested VBAR.
+    ap_installed = 1
+    ap_restore_pending = 1
+    ApRestoreVector()
+    ApEnvironment()
+    ap_recovery_vbar = ap_vbar
+    If ap_vbar = ap_oldvbar And ap_thread = ap_oldthread
+      ap_installed = 0
+      ap_restore_pending = 0
+    EndIf
+    ProcedureReturn 0
+  EndIf
   ap_installed = 1
   ProcedureReturn 1
 EndProcedure
@@ -486,7 +558,7 @@ Procedure.i ApCreate(entry.i, argument.i)
   Protected slot.i
   Protected p.i
   Protected n.i
-  If ap_installed = 0 Or ap_active <> 0 Or ApAddress(entry) = 0 : ProcedureReturn 0 : EndIf
+  If ap_installed = 0 Or ap_active <> 0 Or ap_restore_pending <> 0 Or ApAddress(entry) = 0 : ProcedureReturn 0 : EndIf
   ApEnvironment()
   If ap_core <> ap_boundcore Or ap_el <> 12 Or ap_spsel <> 1 Or ap_daif <> 960 : ProcedureReturn 0 : EndIf
   handle = SchedCreate()
@@ -506,10 +578,12 @@ Procedure.i ApCreate(entry.i, argument.i)
 EndProcedure
 Procedure ApOnTick()
   Protected *ack
+  Protected acknowledged.i
   Protected handle.i
   Protected slot.i
   ack = ap_ack
-  If ack() <> 1
+  acknowledged = ack()
+  If acknowledged <> 1 And acknowledged <> 2
     ApFatal()
     ProcedureReturn
   EndIf
@@ -517,12 +591,17 @@ Procedure ApOnTick()
     ApFatal()
     ProcedureReturn
   EndIf
-  ap_ticks = ap_ticks + 1
   slot = SchedSlot(ap_active)
   If slot < 0 Or ApGuard(slot) = 0
     ApFatal()
     ProcedureReturn
   EndIf
+  ; A controller spurious acknowledgment has no scheduling quantum.
+  If acknowledged = 2
+    ap_inirq = 0
+    ProcedureReturn
+  EndIf
+  ap_ticks = ap_ticks + 1
   If SchedYield(ap_active) = 0
     ApFatal()
     ProcedureReturn
@@ -613,7 +692,7 @@ Procedure.i ApRun()
   Protected *timer
   Protected handle.i
   Protected slot.i
-  If ap_installed = 0 Or ap_active <> 0 : ProcedureReturn 0 : EndIf
+  If ap_installed = 0 Or ap_active <> 0 Or ap_restore_pending <> 0 : ProcedureReturn 0 : EndIf
   ApEnvironment()
   If ap_el <> 12 Or ap_core <> ap_boundcore Or ap_spsel <> 1 Or ap_daif <> 960 Or ap_vbar <> ap_vector Or (ap_cptr & 1024) <> 0 : ProcedureReturn 0 : EndIf
   handle = SchedNext()
@@ -659,7 +738,7 @@ Procedure.i ApReap(handle.i)
   ap_owner[slot] = 0 : ap_entry[slot] = 0 : ap_argument[slot] = 0 : ap_result[slot] = 0
   ProcedureReturn 1
 EndProcedure
-Procedure.i ApUninstall()
+Procedure.i ApCanUninstall()
   Protected n.i
   If ap_installed = 0 Or ap_active <> 0 : ProcedureReturn 0 : EndIf
   ApEnvironment()
@@ -667,7 +746,27 @@ Procedure.i ApUninstall()
   For n = 0 To 31
     If ap_owner[n] <> 0 : ProcedureReturn 0 : EndIf
   Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i ApUninstall()
+  If ap_restore_pending = 0
+    If ApCanUninstall() = 0 : ProcedureReturn 0 : EndIf
+    ap_restore_pending = 1
+  Else
+    ApEnvironment()
+    If ap_el <> 12 Or ap_core <> ap_boundcore Or ap_daif <> 960
+      ProcedureReturn 0
+    EndIf
+    If ap_vbar <> ap_vector And ap_vbar <> ap_oldvbar And ap_vbar <> ap_recovery_vbar
+      ProcedureReturn 0
+    EndIf
+  EndIf
   ApRestoreVector()
+  ApEnvironment()
+  ap_recovery_vbar = ap_vbar
+  If ap_vbar <> ap_oldvbar Or ap_thread <> ap_oldthread : ProcedureReturn 0 : EndIf
   ap_installed = 0
+  ap_restore_pending = 0
+  ap_fatal_reporter = 0
   ProcedureReturn 1
 EndProcedure
