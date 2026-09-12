@@ -28,8 +28,8 @@
 ;      slot 3      1/Wc = 1.0
 ;      slot 4..    the varyings
 ;  A FRAGMENT SHADER writing one packed colour to the tile buffer, from
-;  either the uniform stream (a push-constant or a constant colour) or
-;  four interpolated varyings.
+;  either the uniform stream (a push-constant or a constant colour), a
+;  uniform buffer fetched by the TMU, or four interpolated varyings.
 ;
 ; ======================================================================
 ;  THE VIEWPORT TRANSFORM IS THE ONE PIECE OF ARITHMETIC
@@ -104,6 +104,14 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 ; already writes for a single 8-bit render target with no masking; see
 ; the uniform-stream note in RaspberryPi4/Lib/neon.pi4.
 #AVKQ_TLB_CONF = $FFFFFFFF
+
+; V3D 4.2's TMU general-load configuration for one vec4 of 32-bit
+; values, one lookup per active fragment invocation:
+;   $FFFFFF00 | regular-load(0 << 3) | per-pixel(1 << 7) | vec4(4)
+; Mesa 24.3.4 derives the same word in ntq_emit_tmu_general() in
+; nir_to_vir.c. The address is written to TMUAU, so this word is pulled
+; from the uniform stream by the WRTMUC signal on that instruction.
+#AVKQ_TMU_LOAD_VEC4 = $FFFFFF84
 
 ; V3D primitive mode 4 is a triangle list, which is the one topology
 ; vkCreateGraphicsPipelines accepts.
@@ -425,7 +433,7 @@ EndProcedure
 ; ======================================================================
 ;  THE FRAGMENT SHADER
 ; ======================================================================
-;  TWO SHAPES, and which one is emitted is the plan's own answer.
+;  THREE SHAPES, and which one is emitted is the plan's own answer.
 ;
 ;  A FLAT colour - a push constant or a compile-time constant - is four
 ;  uniform words and two VFPACKs, which is byte for byte the shape this
@@ -435,6 +443,15 @@ EndProcedure
 ;  and the same two VFPACKs. That is the shape the engine's textured
 ;  program uses for its two texture coordinates, with the texture unit
 ;  taken out.
+;
+;  A DESCRIPTOR colour keeps the descriptor's ADDRESS in the fragment
+;  uniform stream. LDUNIFRF puts that address in rf8, and one instruction
+;  carries both WRTMUC and a write of rf8 to TMUAU. The former pulls the
+;  general-load configuration word and the latter starts the lookup.
+;  THRSW plus its two delay slots delivers four LDTMU results in shader
+;  component order. Mesa 24.3.4's emit_tmu_general_address_write() and
+;  ntq_emit_tmu_general() are the source for that protocol; its scheduler
+;  explicitly permits WRTMUC beside a TMU write other than TMUC.
 ;
 ;  THE COMPONENT ORDER IS NOT THE SHADER'S. The shader produces red,
 ;  green, blue and alpha, in that order, because that is what a Vulkan
@@ -477,6 +494,51 @@ Procedure.i avkqEmitFragment(pipe.i, base.i, colourSrc.i)
     r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 6, 5)
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
     r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 4, 7)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuProgramEndThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ProcedureReturn V3dQpuProgramEnd()
+  EndIf
+
+  If colourSrc = #ANVIL_SPV_COLOUR_UNIFORM
+    ; The descriptor address is the first stream word. Keep it in the
+    ; register file, not an accumulator: THRSW invalidates accumulators.
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; WRTMUC consumes #AVKQ_TMU_LOAD_VEC4 from the stream while the MUL
+    ; MOV writes rf8 to TMUAU and starts the general lookup.
+    V3dQpuReset()
+    r = V3dQpuSig(#V3DQ_SIG_WRTMUC)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    V3dQpuMul(#V3DQ_M_MOV, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, 0)
+    V3dQpuRaddr(8, 0)
+    r = V3dQpuEmit()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; A TMU result is delivered after a thread switch. The two following
+    ; instructions are its architectural delay slots, not padding.
+    r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    k = 0
+    While k < 4
+      r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, k, 0)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      k = k + 1
+    Wend
+
+    r = V3dQpuLastThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ; The TMU returns red, green, blue, alpha in rf0..rf3. The target
+    ; stores B8G8R8A8, so pack blue/green and then red/alpha.
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 1)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 3)
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
     r = V3dQpuProgramEndThrsw()
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
@@ -691,40 +753,9 @@ EndProcedure
 ;
 ;  Flat: blue, green, red, alpha and then the tile-buffer configuration
 ;  word, which the TLBU write pulls by itself. Interpolated: the
-;  configuration word alone.
-;
-; ======================================================================
-;  A DESCRIPTOR'S COLOUR REACHES THE QPU THROUGH THIS STREAM, AND WHAT
-;  THAT DOES AND DOES NOT MEAN
-; ======================================================================
-;  A uniform-buffer descriptor resolves, at submit time, to one address
-;  and one length. The four words at that address are read HERE, by the
-;  processor, and written into the fragment shader's uniform stream, so
-;  the emitted fragment program for a descriptor colour is byte for byte
-;  the program for a push-constant colour. The GPU does not dereference
-;  the descriptor.
-;
-;  THAT IS A REAL DIFFERENCE FROM A CONFORMANT IMPLEMENTATION and it is
-;  written here rather than left to be discovered. A driver that lowered
-;  this properly would keep the ADDRESS in the stream and have the QPU
-;  fetch the words through the TMU at execution time, so a buffer
-;  written after the submission and before the job ran would change the
-;  picture. Here it would not.
-;
-;  It is observationally equivalent for every program THIS slice
-;  accepts, and the reason is worth stating: the buffer is host-visible
-;  memory, nothing in this implementation lets the GPU write a buffer,
-;  one submission is in flight at a time, vkUpdateDescriptorSets is
-;  refused while a submission is in flight, and the buffer is retained
-;  across the submission so it cannot be freed under the job. There is
-;  no accepted program in which the words can change between this read
-;  and the execution.
-;
-;  THE TMU GENERAL LOAD IS THE OWED PIECE. Nothing in this tree has ever
-;  performed one - the engine's textured program uses the TMU's texture
-;  path, which is a different configuration - and a QPU sequence written
-;  from a guess is the thing the project's rules exist to prevent. It is
-;  the next piece of work on this path and it is named in the lane note.
+;  configuration word alone. Descriptor: the resolved buffer address,
+;  the TMU general vec4-load configuration and the TLB configuration.
+;  The processor never reads or copies the descriptor's four values.
 ; ----------------------------------------------------------------------
 Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i)
   Define r.i
@@ -736,14 +767,12 @@ Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i)
     ProcedureReturn
   EndIf
   If colourSrc = #ANVIL_SPV_COLOUR_UNIFORM And *push <> 0
-    ; `*push` is the descriptor's resolved address when the colour comes
-    ; from a uniform buffer, and the push-constant staging area when it
-    ; comes from a push constant. One parameter, because at this depth
-    ; they are the same thing: sixteen bytes of red, green, blue, alpha.
-    r = PeekL(*push) & $FFFFFFFF
-    g = PeekL(*push + 4) & $FFFFFFFF
-    b = PeekL(*push + 8) & $FFFFFFFF
-    a = PeekL(*push + 12) & $FFFFFFFF
+    ; `*push` is the descriptor's resolved GPU-visible address. Keep it
+    ; in the stream: the QPU dereferences it through the TMU.
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, *push & $FFFFFFFF)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, #AVKQ_TMU_LOAD_VEC4)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 8, #AVKQ_TLB_CONF)
+    ProcedureReturn
   ElseIf colourSrc = #ANVIL_SPV_COLOUR_PUSH And *push <> 0
     r = PeekL(*push) & $FFFFFFFF
     g = PeekL(*push + 4) & $FFFFFFFF

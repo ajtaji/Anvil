@@ -74,6 +74,7 @@ ATTR_FLOAT = 2
 F0 = 0x00000000
 F1 = 0x3F800000
 TLB_CONF = 0xFFFFFFFF
+TMU_GENERAL_VEC4 = 0xFFFFFF84
 
 W = H = 64
 STRIDE1, STRIDE2 = 24, 8
@@ -661,18 +662,53 @@ def grade(cpu, rc) -> Grader:
     g.need("[D] the colour comes from a uniform buffer", slot(66), 3)
     g.need("[D] attributes", slot(73), 1)
 
-    # THE STREAM IS THE PROOF. A descriptor colour reaches the QPU
-    # through the fragment uniform stream in the render target's byte
-    # order, exactly as a push constant does - and the four words are
-    # the ones in the uniform BUFFER, which are not the push block's.
+    # THE STREAM AND THE RAW QPU WORDS ARE THE PROOF. The stream keeps
+    # the descriptor's address and a V3D 4.2 general-load configuration;
+    # it does not contain a processor-side copy of the buffer's colour.
     baseD = slot(127)
     g.want_true("[D] the pipeline was compiled by the emitter", baseD != 0,
                 hex(baseD))
-    g.need_bytes("[D] the fragment uniform stream is the uniform buffer's "
-                 "blue, green, red, alpha and then the tile configuration word",
-                 blob(cpu, baseD + OFF_UNIF_FS, 20),
-                 struct.pack("<5I", UNIFORM[2], UNIFORM[1], UNIFORM[0],
-                             UNIFORM[3], TLB_CONF))
+    g.need_bytes("[D] the fragment uniform stream is address, TMU general "
+                 "vec4-load configuration, then tile configuration",
+                 blob(cpu, baseD + OFF_UNIF_FS, 12),
+                 struct.pack("<3I", uniform_base, TMU_GENERAL_VEC4, TLB_CONF))
+    g.want_true("[D] no processor-side copy of the descriptor colour remains "
+                "in the fragment stream",
+                blob(cpu, baseD + OFF_UNIF_FS, 20).find(
+                    struct.pack("<4I", UNIFORM[2], UNIFORM[1], UNIFORM[0],
+                                UNIFORM[3])) < 0)
+
+    fsD = slot(140)
+    g.need("[D] the descriptor fragment program has the documented nineteen "
+           "instructions", fsD, 19 * 8)
+    raw_d = [u64(cpu, baseD + OFF_FS_CODE + i)
+             for i in range(0, fsD, 8)]
+
+    def sig(word: int) -> int:
+        return (word >> 53) & 0x1F
+
+    def sig_dest(word: int) -> int:
+        return (word >> 46) & 0x7F
+
+    # Signal indices are the V3D 4.2 table in Mesa qpu_pack.c, decoded
+    # here from the raw instruction words rather than through the emitter.
+    g.need("[D] the raw descriptor program's signal sequence",
+           [sig(w) for w in raw_d],
+           [12, 18, 1, 0, 0, 4, 4, 4, 4,
+            1, 1, 0, 0, 0, 0, 1, 0, 0, 0])
+    g.need("[D] LDUNIFRF puts the descriptor address in rf8",
+           sig_dest(raw_d[0]), 8)
+    g.need("[D] four LDTMU signals return RGBA in rf0 through rf3",
+           [sig_dest(raw_d[i]) for i in range(5, 9)], [0, 1, 2, 3])
+    fire = raw_d[1]
+    g.need("[D] the lookup instruction uses the MUL MOV encoding",
+           (fire >> 58) & 0x3F, 15)
+    g.need("[D] the lookup instruction uses a magic destination",
+           (fire >> 45) & 1, 1)
+    g.need("[D] the lookup writes the uniform-configured address port TMUAU",
+           (fire >> 38) & 0x3F, 13)
+    g.need("[D] the lookup address is read from rf8",
+           (fire >> 6) & 0x3F, 8)
     g.need("the draw carried the descriptor's address to the backend",
            slot(121), uniform_base)
     g.need("and its range", slot(122), 16)
@@ -761,6 +797,21 @@ MUTANTS = (
     ("the tile-buffer configuration word is left out of the stream",
      "  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 16, #AVKQ_TLB_CONF)\n",
      "  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 16, 0)\n"),
+    ("the descriptor stream copies the first buffer word instead of keeping its address",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, *push & $FFFFFFFF)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, PeekL(*push) & $FFFFFFFF)\n"),
+    ("the descriptor stream asks the TMU for a vec3 instead of a vec4",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, #AVKQ_TMU_LOAD_VEC4)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, $FFFFFF83)\n"),
+    ("the descriptor lookup uses TMUA instead of uniform-configured TMUAU",
+     "    V3dQpuMul(#V3DQ_M_MOV, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, 0)\n",
+     "    V3dQpuMul(#V3DQ_M_MOV, #V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, 0)\n"),
+    ("the descriptor lookup no longer carries WRTMUC",
+     "    r = V3dQpuSig(#V3DQ_SIG_WRTMUC)\n",
+     "    r = V3dQpuSig(#V3DQ_SIG_NONE)\n"),
+    ("the descriptor lookup starts from the wrong address register",
+     "    V3dQpuRaddr(8, 0)\n",
+     "    V3dQpuRaddr(7, 0)\n"),
     ("the default attribute values end in zero rather than one",
      "  avkqPoke32(base + #AVKQ_OFF_DEFAULTS + 12, #AVKQ_F_ONE)\n",
      "  avkqPoke32(base + #AVKQ_OFF_DEFAULTS + 12, #AVKQ_F_ZERO)\n"),
@@ -935,9 +986,9 @@ def main() -> int:
     print("  two different strides: two of its six attribute records carry one base and")
     print("  stride and four carry the other, and its three emitted programs are byte for")
     print("  byte the one-buffer pipeline's - the split moves where the data is, not what runs")
-    print("  the fourth takes its colour from a UNIFORM BUFFER through a descriptor set, and")
-    print("  the four words in that buffer reach the fragment uniform stream in the render")
-    print("  target's own byte order")
+    print("  the fourth takes its colour from a UNIFORM BUFFER through a descriptor set;")
+    print("  its stream keeps the descriptor address and the raw QPU words decode to a V3D")
+    print("  4.2 TMU general vec4 lookup - no CPU copy of the buffer values remains")
     print("  NOT ONE PIXEL of the render target was written and NOT ONE MMIO access was made")
     print("  RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4 and")
     print("  RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4 both build at $500000")

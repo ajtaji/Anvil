@@ -409,15 +409,26 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Wend
 
   varyComps = avkqVaryComps[pipe]
-  ; A DESCRIPTOR COLOUR AND A PUSH COLOUR ARRIVE THE SAME WAY: sixteen
-  ; bytes at an address the portable layer has already validated. Which
-  ; of the two it is decides which address, and the colour source is
-  ; what says so.
+  ; A push colour is read by the processor into the fragment uniform
+  ; stream. A descriptor colour is not: its GPU-visible address goes in
+  ; the stream and the fragment QPU dereferences it through a TMU general
+  ; load. That makes mapped residency and cache visibility backend rules,
+  ; not assumptions the portable descriptor layer can prove.
   colourBase = *d\pushBase
   If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_UNIFORM
     colourBase = *d\uniformBase
     If colourBase = 0 Or *d\uniformBytes < 16
       avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw whose fragment colour comes from a uniform buffer with no address or a range shorter than sixteen bytes (Anvil code -20001, invalid descriptor); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If avkV3dWindowBytes < 16 Or colourBase < avkV3dWindowBase
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a uniform-buffer descriptor outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A TMU general load reaches the descriptor through that mapping, and an unmapped page is an MMU fault rather than a wrong colour.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+    If (colourBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a uniform-buffer descriptor outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A TMU general load reaches the descriptor through that mapping, and an unmapped page is an MMU fault rather than a wrong colour.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
       ProcedureReturn -1
     EndIf
   EndIf
@@ -449,6 +460,11 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       V3dClNonperspFlags((1 << varyComps) - 1)
     EndIf
     V3dCacheRange(pbase, #AVKQ_BYTES)
+    ; The QPU, not the processor, reads a descriptor-backed colour. Make
+    ; the sixteen bytes visible before the TMU is allowed to fetch them.
+    If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_UNIFORM
+      V3dCacheRange(colourBase, 16)
+    EndIf
     ; One cache maintenance per binding: the processor wrote each of
     ; these buffers and the vertex fetcher reads all of them.
     b = 0

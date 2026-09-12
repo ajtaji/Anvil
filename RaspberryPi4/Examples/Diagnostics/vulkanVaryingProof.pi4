@@ -235,7 +235,11 @@
 ;   117  pipeline C attribute 0 binding, 0
 ;   118  pipeline C attribute 1 binding, 1
 ;   119  pipeline C binding count, 2
-;   120..124  spare
+;   120  descriptor fragment-program bytes, 152
+;   121  descriptor fragment stream word 0: uniform-buffer address
+;   122  descriptor fragment stream word 1: TMU general vec4 config
+;   123  descriptor fragment stream word 2: TLB config
+;   124  descriptor GPU-lowering evidence verdict, 1
 ;   125  HIGHEST STEP REACHED, 1 to 12
 ;   126  report length in bytes, 512
 ;   127  tail magic $56415259
@@ -268,23 +272,20 @@
 ;  not rasterise and interpolate, the readback fails.
 ;
 ; ======================================================================
-;  ONE THING THIS RUN DOES NOT PROVE
+;  THE NEW PIECE THIS RUN MUST PROVE
 ; ======================================================================
-;  THE GPU DOES NOT DEREFERENCE THE DESCRIPTOR. A uniform-buffer
-;  descriptor resolves at submit time to one address and one length, and
-;  the processor reads the four words there into the fragment shader's
-;  uniform stream - so pass A's emitted fragment program is byte for
-;  byte the push-constant one. A conformant implementation would keep
-;  the ADDRESS in the stream and have the QPU fetch through the TMU at
-;  execution time. Nothing in this tree has ever performed a TMU general
-;  load, and a QPU sequence written from a guess is what this project's
-;  rules exist to prevent; it is the named next piece of work.
+;  THE GPU NOW DEREFERENCES THE DESCRIPTOR. The fragment uniform stream
+;  carries the uniform-buffer address, $FFFFFF84 (V3D 4.2 TMU general
+;  vec4, per-pixel load), and the TLB configuration. The QPU writes that
+;  address to TMUAU with WRTMUC, switches threads and reads four LDTMU
+;  results. No processor-side copy of the four colour values remains.
 ;
-;  For every program this slice accepts the two are the same: the buffer
-;  is host-visible, nothing here lets the GPU write a buffer, one
-;  submission is in flight at a time, vkUpdateDescriptorSets is refused
-;  while one is, and the buffer is retained across it. The full
-;  reasoning is in Anvil/Graphics/Vulkan/vk_v3d_shader.pi4's header.
+;  The desk gate independently decodes all nineteen raw QPU words. This
+;  board run adds the part a desk cannot: the stream words are captured
+;  from the submitted shader record in slots 121..123, slot 124 requires
+;  all three to match, and pass A still requires the fetched magenta at
+;  the probe pixels. A failure is #VVP_ERR_DESCRIPTOR_LOWERING, not a
+;  generic wrong-pixel report.
 
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
@@ -327,6 +328,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_CLEAR_A = $3F800000               ; 1.0 -> 255
 #VVP_CLEAR_WORD = $FF3380B2
 #VVP_MAGENTA_WORD = $FFFF00FF
+#VVP_TMU_GENERAL_VEC4 = $FFFFFF84
 
 ; The triangle, in clip space. +Y is DOWN, which is Vulkan's framebuffer
 ; orientation and the V3D rasteriser's. The expectation module is told
@@ -379,6 +381,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_ERR_EXPECT = 29
 #VVP_ERR_SPLIT_DIFFERS = 30
 #VVP_ERR_REFUSAL_MISSING = 31
+#VVP_ERR_DESCRIPTOR_LOWERING = 32
 
 #VVP_P_NOT_TRIED = 0
 #VVP_P_OK = 1
@@ -477,6 +480,11 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_S_C_ATTR0_BIND = 117
 #VVP_S_C_ATTR1_BIND = 118
 #VVP_S_C_BINDCOUNT = 119
+#VVP_S_DESC_FS_BYTES = 120
+#VVP_S_DESC_STREAM_ADDR = 121
+#VVP_S_DESC_STREAM_TMU = 122
+#VVP_S_DESC_STREAM_TLB = 123
+#VVP_S_DESC_LOWERING = 124
 #VVP_S_STEP = 125
 #VVP_S_BYTES = 126
 #VVP_S_TAIL = 127
@@ -632,6 +640,9 @@ Procedure.i Main()
   Define pipeB.i
   Define pipeC.i
   Define bad2.i
+  Define shrec.i
+  Define fsUniform.i
+  Define lowering.i
 
   Define ici.VkInstanceCreateInfo
   Define dci.VkDeviceCreateInfo
@@ -1354,7 +1365,26 @@ Procedure.i Main()
         vvpPut(#VVP_S_STATUS_A, #VVP_ERR_FENCE)
       Else
         vvpPut(#VVP_S_LAYOUT_AFTER, AnvilVkImageLayout(img))
-        vvpPut(#VVP_S_SHREC, AnvilVkV3dLastShaderRecord())
+        shrec = AnvilVkV3dLastShaderRecord()
+        vvpPut(#VVP_S_SHREC, shrec)
+        vvpPut(#VVP_S_DESC_FS_BYTES, AnvilVkV3dProgramBytes(1, 2))
+        lowering = 0
+        If shrec <> 0
+          ; Word 4 of the nine-word GL shader record is the fragment
+          ; uniform-stream address. Read back the exact stream submitted.
+          fsUniform = PeekL(shrec + 16) & $FFFFFFFF
+          vvpPut(#VVP_S_DESC_STREAM_ADDR, PeekL(fsUniform + 0) & $FFFFFFFF)
+          vvpPut(#VVP_S_DESC_STREAM_TMU, PeekL(fsUniform + 4) & $FFFFFFFF)
+          vvpPut(#VVP_S_DESC_STREAM_TLB, PeekL(fsUniform + 8) & $FFFFFFFF)
+          If (PeekL(fsUniform + 0) & $FFFFFFFF) = (addrUni & $FFFFFFFF)
+            If (PeekL(fsUniform + 4) & $FFFFFFFF) = #VVP_TMU_GENERAL_VEC4
+              If (PeekL(fsUniform + 8) & $FFFFFFFF) = $FFFFFFFF
+                lowering = 1
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+        vvpPut(#VVP_S_DESC_LOWERING, lowering)
         vvpPut(#VVP_S_A_IN0 + 0, vvpPixel(imgBase, pitch, 400, 500))
         vvpPut(#VVP_S_A_IN0 + 1, vvpPixel(imgBase, pitch, 400, 700))
         vvpPut(#VVP_S_A_IN0 + 2, vvpPixel(imgBase, pitch, 400, 900))
@@ -1369,7 +1399,9 @@ Procedure.i Main()
           If vvpGet(#VVP_S_A_IN0 + k) <> #VVP_MAGENTA_WORD : bad = bad + 1 : EndIf
           k = k + 1
         Wend
-        If bad <> 0
+        If lowering = 0
+          vvpPut(#VVP_S_STATUS_A, #VVP_ERR_DESCRIPTOR_LOWERING)
+        ElseIf bad <> 0
           vvpPut(#VVP_S_STATUS_A, #VVP_ERR_PIXELS_IN)
         Else
           bad = 0

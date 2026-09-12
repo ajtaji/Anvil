@@ -58,6 +58,10 @@ MAGIC = 0x564B4233  # "VKB3"
 # thing the board diagnostic tests.
 REQUIRED_CALLS = ("NeonRetarget", "NeonFrameBegin", "NeonFrameEnd",
                   "Neon_SurfacePhysicalW", "Neon_SurfacePhysicalH", "Neon_SurfacePitch")
+REQUIRED_DESCRIPTOR_CONTRACT = (
+    "If (colourBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)",
+    "V3dCacheRange(colourBase, 16)",
+)
 FORBIDDEN_TOKENS = ("PokeN(", "PokeI(", "PokeL(", "PokeA(", "DspCopy", "DmaCopy",
                     "DisplayClear", "DspDmaFill", "DisplayFillRect", "CopyMemory")
 
@@ -82,6 +86,16 @@ MUTANTS = (
         "a clear is attempted with no geometry to render it at",
         "  If Neon_Ready() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n",
         "  If Neon_Ready() < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n",
+    ),
+    (
+        "a descriptor-backed TMU load no longer proves its sixteen bytes are mapped",
+        "    If (colourBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)\n",
+        "    If (colourBase - avkV3dWindowBase) > avkV3dWindowBytes\n",
+    ),
+    (
+        "a descriptor-backed TMU load is submitted without a cache clean",
+        "      V3dCacheRange(colourBase, 16)\n",
+        "      V3dCacheRange(colourBase, 0)\n",
     ),
 )
 
@@ -252,6 +266,26 @@ def grade(cpu, rc) -> Grader:
     return g
 
 
+def source_contract(text: str) -> list[str]:
+    """Rules that need a live engine to execute, kept visible at the desk.
+
+    The board diagnostic supplies the silicon half. This source half prevents
+    the mapped-range and cache-maintenance calls from disappearing before the
+    board run can exercise the descriptor lookup.
+    """
+    failures = []
+    for call in REQUIRED_CALLS:
+        if call not in text:
+            failures.append("the backend never calls " + call)
+    for snippet in REQUIRED_DESCRIPTOR_CONTRACT:
+        if snippet not in text:
+            failures.append("the descriptor TMU contract lost: " + snippet)
+    for token in FORBIDDEN_TOKENS:
+        if token in text:
+            failures.append("the backend holds a processor-side fallback token " + token)
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler")
@@ -264,13 +298,7 @@ def main() -> int:
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))
 
     original = BACKEND.read_text(encoding="utf-8")
-    source_failures = []
-    for call in REQUIRED_CALLS:
-        if call not in original:
-            source_failures.append("the backend never calls " + call)
-    for token in FORBIDDEN_TOKENS:
-        if token in original:
-            source_failures.append("the backend holds a processor-side fallback token " + token)
+    source_failures = source_contract(original)
     if source_failures:
         print("vulkan_v3d_backend_check: FAIL")
         for failure in source_failures:
@@ -324,12 +352,17 @@ def main() -> int:
                       f"{original.count(fixed)} times; not tested")
                 missed += 1
                 continue
-            BACKEND.write_text(original.replace(fixed, broken, 1), encoding="utf-8")
+            mutated = original.replace(fixed, broken, 1)
+            BACKEND.write_text(mutated, encoding="utf-8")
             try:
-                mcpu, mrc, msteps = execute(a64, build(compiler, ROOT, GATE))
-                mg = grade(mcpu, mrc)
-                red = bool(mg.failures)
-                first = mg.failures[0][:100] if mg.failures else ""
+                source_red = source_contract(mutated)
+                if source_red:
+                    red, first = True, source_red[0][:100]
+                else:
+                    mcpu, mrc, msteps = execute(a64, build(compiler, ROOT, GATE))
+                    mg = grade(mcpu, mrc)
+                    red = bool(mg.failures)
+                    first = mg.failures[0][:100] if mg.failures else ""
             except SystemExit as exc:
                 # An MMIO stop or a build failure IS the gate noticing.
                 red, first = True, str(exc).splitlines()[0][:100]

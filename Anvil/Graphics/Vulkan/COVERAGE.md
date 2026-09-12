@@ -27,7 +27,8 @@ currently amounts to and where the files are.
 | `vk_backend_test.pbi` | The explicit test backend: state and a call log, **no GPU and no pixels ever written**. |
 | `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for one descriptor type, and what a bound set resolves to at submit time. |
 | `vk_interp_expect.pbi` | What an interpolated varying must be at a named pixel, in exact integers. Target neutral, no floating point, and no hardware. |
-| `vk_v3d_backend.pi4` | The real Pi 4 backend: one validated clear lowered to the V3D bin and render control lists through Neon. |
+| `vk_v3d_shader.pi4` | The Pi 4 QPU emitter for the accepted shader plans, including the V3D 4.2 TMU general vec4 load used by a uniform-buffer descriptor. |
+| `vk_v3d_backend.pi4` | The real Pi 4 backend: validated clears and draws lowered to V3D bin and render control lists through Neon, with mapped-range and cache-visibility rules for GPU-read buffers. |
 
 Exactly one backend file is linked per program. There is no run-time
 registration, so a build with none fails to link and a build with two fails to
@@ -40,7 +41,7 @@ compile — neither can silently enumerate the wrong thing.
 | Generated vocabulary | A pinned core-1.0 generator exists. The checked-in slice contains the exact result, structure-type, command-lifecycle, image, memory, queue-family, access, stage, aspect and fence values this implementation uses, plus 29 scalar, nested, fixed-array, structure-array and pointer-bearing structures. It is not the complete 1.0 vocabulary. `VkClearColorValue` is a union and is deliberately **not** declared, because PureMetal has no union and one arm of it posing as the whole type is the silent wrong answer this project refuses. |
 | Semantic implementation | Opaque typed and generation-tagged handles for nine object types; instance, physical device, device and one transfer queue; device memory and linear `B8G8R8A8_UNORM` images with exact requirements, binding rules and per-image layout; image memory barriers with layout tracking checked at record time and again at submit time; whole-image colour clears; one-at-a-time submission with resource retention; fences with the full two-state contract and a doubly bounded host wait. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
 | Explicit test backend | `vk_backend_test.pbi` models one device over a caller-supplied window. It records the exact clear it was asked for — address, extent, pitch, colour word — and **writes nothing**, so a gate can then read the image back and require that every poisoned byte survived. It can hold a submission outstanding, which is what makes the pending state, the fence state machine and the retention rules reachable from a desk. |
-| V3D execution | `vk_v3d_backend.pi4` lowers one whole-image clear to `NeonRetarget` + `NeonFrameBegin` + `NeonFrameEnd`, which is the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. It clears only an image at the render geometry `NeonInit` was given, and refuses any other extent at record time. **Execution has no silicon acceptance yet**; the board proof is `RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4`. |
+| V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and the accepted graphics draws to `NeonRetarget` + `NeonFrameBegin` + `NeonFrameEnd`, the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. Board runs 2 and 3 proved the clear and its live refusal boundary; board run 5 proved one graphics pipeline and its varying path. The gradient, split vertex binding and descriptor-backed TMU lookup remain board run 6. |
 
 ## Compiler ABI boundary
 
@@ -104,20 +105,21 @@ each attribute record against the address and stride of the binding ITS
 attribute names, which is what the hardware always wanted: an attribute record
 carries an address and a stride of its own.
 
-> **THE GPU DOES NOT DEREFERENCE A DESCRIPTOR.** A uniform-buffer descriptor
-> resolves to an address and a length, and the PROCESSOR reads its sixteen
-> bytes into the fragment uniform stream, so the emitted fragment program for a
-> descriptor colour is byte for byte the push-constant one. It is
-> observationally equivalent for every program this slice accepts - the buffer
-> is host-visible, nothing here lets the GPU write a buffer, one submission is
-> in flight at a time, and updates are refused while one is - and it is NOT
-> what a conformant implementation does. The TMU general load that would make
-> it so has never been performed anywhere in this tree. The full argument is in
-> `vk_v3d_shader.pi4`'s header, beside the code it describes.
+As of 2026-09-12 the descriptor address stays in the fragment uniform stream.
+The Pi 4 fragment program loads it into `rf8`, writes it to `TMUAU` while a
+`WRTMUC` signal consumes the V3D 4.2 general vec4-load configuration, switches
+threads, and reads the four components with `LDTMU`. The backend proves all
+sixteen source bytes are in its mapped window and cleans that range before
+submission. `tools/vulkan_pipeline_check.py` independently decodes the raw
+nineteen-instruction program and the three-word stream and rejects mutations of
+the address, configuration, TMU port, signal and source register. This is desk
+proof of the bytes to be submitted, not proof the silicon executes the load.
 
 **None of the three has run on silicon.** The board proof is
 `RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` and it is requested
-and not taken.
+and not taken. Its report now captures the submitted descriptor stream in slots
+121..123, requires slot 124 to be one, and keeps pass A's pixel proof, so the
+future run distinguishes an emission defect from a TMU execution defect.
 
 ## Next real backend layers
 
