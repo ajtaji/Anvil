@@ -658,6 +658,7 @@ Procedure Main()
   Define st.i
   Define ndev.i
   Define nabs.i
+  Define promptAttr.i
 
   ; ---- capture x0/x1 before anything else runs -----------------------
   ASM
@@ -848,8 +849,15 @@ Procedure Main()
   ;  Host tools match on it. Do not tidy it.
   ; ====================================================================
   Repeat
+    ; The UEFI colour is sideband display state: raw transcript bytes stay
+    ; exactly "pmf> ". Flush while green because qcon batches a line until
+    ; UartDrain(), then restore the firmware's own attribute before ReadLine
+    ; echoes the user's input.
+    promptAttr=QEfiConAttribute()
+    QEfiSetConAttribute(#QTXT_LIGHTGREEN)
     Print("pmf> ")
     UartDrain()
+    QEfiSetConAttribute(promptAttr)
 
     ; gQTyping brackets the line editor and NOTHING else. Outside these
     ; two lines the staged script is invisible to UartReadReady(), which

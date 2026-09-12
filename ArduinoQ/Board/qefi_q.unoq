@@ -81,6 +81,12 @@
 #QTXO_ENABLECURSOR = $40
 #QTXO_MODE         = $48
 
+; EFI text attributes are foreground in bits 0..3 and background in 4..6.
+; Light green on black is the visible Anvil prompt colour on a text-console
+; target; it never becomes a byte in the transcript or serial stream.
+#QTXT_LIGHTGREEN   = $0A
+#QTXT_LIGHTGRAY    = $07
+
 ; EFI_SIMPLE_TEXT_INPUT_PROTOCOL (s12.3)
 #QTXI_RESET       = $00
 #QTXI_READKEY     = $08
@@ -218,6 +224,35 @@ Procedure.i QCall(fn.i, a0.i, a1.i, a2.i, a3.i, a4.i)
   gQCallA4 = a4
   QUefiCall()
   ProcedureReturn gQCallRet
+EndProcedure
+
+Procedure.i QEfiConAttribute()
+  Protected mode.i
+  Protected attribute.i
+  If gQConOut=0
+    ProcedureReturn #QTXT_LIGHTGRAY
+  EndIf
+  mode=PeekI(gQConOut+#QTXO_MODE)
+  If mode=0
+    ProcedureReturn #QTXT_LIGHTGRAY
+  EndIf
+  attribute=PeekL(mode+8)&$FFFFFFFF
+  If attribute<0 Or attribute>$7F
+    ProcedureReturn #QTXT_LIGHTGRAY
+  EndIf
+  ProcedureReturn attribute
+EndProcedure
+
+Procedure.i QEfiSetConAttribute(attribute.i)
+  Protected fn.i
+  If gQConOut=0 Or attribute<0 Or attribute>$7F
+    ProcedureReturn 0
+  EndIf
+  fn=PeekI(gQConOut+#QTXO_SETATTR)
+  If fn=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Bool(QCall(fn,gQConOut,attribute,0,0,0)=#QEFI_SUCCESS)
 EndProcedure
 
 Procedure QPb(base.i, off.i, v.i)
