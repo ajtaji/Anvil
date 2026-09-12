@@ -1852,6 +1852,17 @@ EndProcedure
 ;  not carry: the tag number is cited, a model table would not be.
 ;  Returns 0 on failure; check MailboxError().
 ; ----------------------------------------------------------------------
+; Linux reset-raspberrypi.c and U-Boot arch/arm/mach-bcm283x/msg.c:
+; NOTIFY_XHCI_RESET reloads VL805 firmware after a PCI fundamental reset.
+; https://github.com/raspberrypi/linux/blob/rpi-6.6.y/drivers/reset/reset-raspberrypi.c
+; https://github.com/u-boot/u-boot/blob/master/arch/arm/mach-bcm283x/msg.c
+; Uses the existing owned property buffer and preserves MailboxError on failure.
+Procedure.i MailboxNotifyVl805Reset()
+  If MailboxBegin($00030058, 4, 4) = 0 : ProcedureReturn 0 : EndIf
+  MailboxSetWord(0, $00100000)
+  ProcedureReturn MailboxSend()
+EndProcedure
+
 Procedure.i MailboxBoardRevision()
   ; Request length 0 - this tag takes no argument - but the response is
   ; four bytes, so the value buffer is sized for the response.

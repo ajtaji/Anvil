@@ -1117,6 +1117,7 @@ EndProcedure
 #PCIE_ERR_LINK      = -4        ; the link never came up
 #PCIE_ERR_EP_MODE   = -5        ; controller is in endpoint, not root
 #PCIE_ERR_CFG_BDF   = -6        ; bus/device/function or offset bad
+#PCIE_ERR_VL805_FIRMWARE = -15
 ; Declared HERE and not with the enumeration codes below, because a
 ; constant has to exist before the line that uses it and PcieInit is
 ; above them. Putting it there parsed as 'Expected EndProcedure' on
@@ -1572,6 +1573,8 @@ EndProcedure
 
 Procedure.i PcieErrorText()
   Select pcie_err
+    Case #PCIE_ERR_VL805_FIRMWARE
+      ProcedureReturn "PCIe error -15: VL805 firmware notification or startup timing failed. Check MailboxError and the architectural counter before retrying cold initialization."
     Case 0
       ProcedureReturn "pcie: ok"
     Case #PCIE_ERR_NARROW
@@ -1700,6 +1703,33 @@ EndProcedure
 ;  BUS view - $F8000000 - and the window hardware translates. The CPU
 ;  reaches the same registers at PcieCpuFromBus() of that.
 ; ----------------------------------------------------------------------
+; Requires mailbox.pi4 before this library. Never reset adopted firmware.
+; Linux/U-Boot notify after PCI enumeration and before xHCI register setup;
+; U-Boot waits200us, Linux200-1000us. Preserve the firmware-owned warm path.
+Procedure.i PcieColdFirmwareReady()
+  Define hz.i
+  Define started.i
+  Define spins.i
+  Define ticks.i
+  If pcie_adopted <> 0 : ProcedureReturn 1 : EndIf
+  hz = pcie_TickHz()
+  If hz < 1000000 Or hz > 1000000000
+    pcie_err = #PCIE_ERR_VL805_FIRMWARE
+    ProcedureReturn 0
+  EndIf
+  If MailboxNotifyVl805Reset() = 0
+    pcie_err = #PCIE_ERR_VL805_FIRMWARE
+    ProcedureReturn 0
+  EndIf
+  ticks = (hz + 4999) / 5000
+  started = pcie_Ticks()
+  For spins = 0 To 999999
+    If pcie_Ticks() - started >= ticks : ProcedureReturn 1 : EndIf
+  Next
+  pcie_err = #PCIE_ERR_VL805_FIRMWARE
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i PcieEnumerate()
   Define id.i
   Define sz.i
@@ -1866,12 +1896,13 @@ Procedure.i PcieEnumerate()
   EndIf
 
   pcie_barCpu = PcieCpuFromBus(pcie_barBus)
+  If PcieColdFirmwareReady() = 0 : ProcedureReturn 0 : EndIf
   pcie_enumerated = 1
   pcie_Phase(#PCIE_PH_DONE)
   ProcedureReturn 1
 EndProcedure
 
-; Only after the new controller rings have been installed.
+; After ownership/remapping and a verified halt, before host reset.
 Procedure.i PcieEnableDma()
   Define cmd.i
   If pcie_enumerated = 0
