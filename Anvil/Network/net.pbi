@@ -1,5 +1,5 @@
 ; ======================================================================
-;  net.pi4 - Ethernet II framing, ARP, IPv4, ICMP echo and UDP.
+;  net.pbi - target-neutral Ethernet II, ARP, IPv4, ICMP echo and UDP.
 ; ======================================================================
 ;
 ;  THE BOARD ANSWERS A PING. Proven on silicon 2026-08-26, over a bare
@@ -119,7 +119,7 @@
 ;      XIncludeFile "Anvil/Hal/hal.pbi"          the #HW_LINK_* kinds
 ;      XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 ;      XIncludeFile "RaspberryPi4/Lib/genet.pi4"
-;      XIncludeFile "RaspberryPi4/Lib/net.pi4"
+;      XIncludeFile "Anvil/Network/net.pbi"
 ;      ...
 ;      NetSetMac(#HW_LINK_WIRED, @mymac[0])
 ;      NetSetIPv4(#HW_LINK_WIRED, NetMakeIPv4(192,168,1,50), NetMakeIPv4(255,255,255,0), NetMakeIPv4(192,168,1,1))
@@ -581,7 +581,7 @@
 ; destination filter in net_RecvIp has to let a UNICAST DHCP reply
 ; through at an address this board does not have yet, and that decision
 ; happens three checks before net_RecvUdp reads the UDP header at all.
-; RaspberryPi4/Lib/dhcp.pi4 spells the same number #DHCP_PORT_CLIENT and
+; Anvil/Network/dhcp.pbi spells the same number #DHCP_PORT_CLIENT and
 ; is included AFTER this file, so it cannot be the one definition; the
 ; two are checked against each other by tools/a64/a64_net_check.py.
 ; [RFC 2131 4.1, "DHCP messages ... to the client's port 68"]
@@ -923,7 +923,7 @@ Global net_udpTxCksum.i         ; 1 = compute on transmit. See header.
 ; DHCP bring-up. 0 normally. 1 only while a DHCP exchange is in flight,
 ; when this stack must send from 0.0.0.0 and receive a broadcast reply
 ; before it has an address of its own. See NetDhcpMode() and
-; NetUdpBuildBcast(), and RaspberryPi4/Lib/dhcp.pi4 for the whole story.
+; NetUdpBuildBcast(), and Anvil/Network/dhcp.pbi for the whole story.
 Global Dim net_dhcpMode.a[#NET_IF_KINDS]
 ; ----------------------------------------------------------------------
 ;  WHICH OF OUR ADDRESSES THE DATAGRAM JUST RECEIVED WAS ADDRESSED TO.

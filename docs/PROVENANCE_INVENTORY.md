@@ -794,7 +794,7 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/cyw43.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/cyw43_rx_glom.pi4` | consulted | broadcom-brcmfmac | ISC | cite the source; no notice obligation; `licenses/Broadcom-brcmfmac-ISC.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/cyw43_rx_glom.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/dhcp.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Network/dhcp.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/display.pi4` | reference-only | dejavu-fonts | DejaVu/Bitstream Vera | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/display.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/display.pi4` | consulted | uboot-v2025.01 | GPL-2.0-or-later | cite the source; no notice obligation |
@@ -868,10 +868,10 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu_secondary.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/neon.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
-| `RaspberryPi4/Lib/net.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/net.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/net.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/net.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Network/net.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Network/net.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `Anvil/Network/net.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `Anvil/Network/net.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/pbkdf2.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/pbkdf2.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/pbkdf2.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |

@@ -11,6 +11,7 @@ Global gate_received.i
 Global gate_error.i
 Global gate_slot.i
 Global gate_generation.i
+#PI3_UPDATE_SOURCE_SERIAL = 1
 Procedure.i Pi3UpdateResetReady() : ProcedureReturn 0 : EndProcedure
 Procedure.i Pi3UpdateResetNow() : ProcedureReturn 0 : EndProcedure
 Global gate_pending_slot.i = -1
@@ -21,6 +22,10 @@ Procedure.i Pi3UpdateBegin(length.i, digest.i)
   gate_received = 0 : gate_error = 0
   ProcedureReturn 1
 EndProcedure
+Procedure.i Pi3UpdateBeginFrom(owner.i,length.i,digest.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3UpdateBegin(length,digest)
+EndProcedure
 Procedure.i Pi3UpdateChunk(offset.i, source.i, length.i)
   If offset <> gate_received Or source = 0 Or length < 1 Or length > 1024
     gate_error = 2 : ProcedureReturn 0
@@ -28,12 +33,24 @@ Procedure.i Pi3UpdateChunk(offset.i, source.i, length.i)
   gate_received = gate_received + length
   ProcedureReturn 1
 EndProcedure
+Procedure.i Pi3UpdateChunkFrom(owner.i,offset.i,source.i,length.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3UpdateChunk(offset,source,length)
+EndProcedure
 Procedure.i Pi3UpdateCommit()
   If gate_error <> 0 Or gate_received = 0 : ProcedureReturn 0 : EndIf
   gate_pending_slot = 1 : gate_pending_generation = 2
   ProcedureReturn 1
 EndProcedure
+Procedure.i Pi3UpdateCommitFrom(owner.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3UpdateCommit()
+EndProcedure
 Procedure Pi3UpdateAbort() : gate_received = 0 : EndProcedure
+Procedure.i Pi3UpdateAbortFrom(owner.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  Pi3UpdateAbort() : ProcedureReturn 1
+EndProcedure
 Procedure.i Pi3UpdateReceived() : ProcedureReturn gate_received : EndProcedure
 Procedure.i Pi3UpdateError() : ProcedureReturn gate_error : EndProcedure
 Procedure.i Pi3UpdateSlot() : ProcedureReturn gate_slot : EndProcedure

@@ -40,6 +40,26 @@ Global pi3_ut_parse.i
 Global pi3_ut_line_overflow.i
 Global pi3_ut_rx_quarantine.i
 
+; Cooperative service hook. The serial monitor owns command parsing, but a
+; board transport such as Ethernet must keep moving while no UART byte is
+; available. One call must be bounded and must never enter this serial parser.
+Procedure.i Pi3NoUpdateIdle()
+  ProcedureReturn 1
+EndProcedure
+Global pi3_ut_idle_handler.i=@Pi3NoUpdateIdle
+Global pi3_ut_idle_registered.i
+
+Procedure.i Pi3UpdateRegisterIdle(handler.i)
+  If handler=0 Or pi3_ut_idle_registered<>0 : ProcedureReturn 0 : EndIf
+  pi3_ut_idle_handler=handler
+  pi3_ut_idle_registered=1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure pi3ut_Idle()
+  If pi3_ut_idle_handler<>0 : pi3_ut_idle_handler() : EndIf
+EndProcedure
+
 Procedure.i pi3ut_WriteByte(value.i)
   ProcedureReturn Pi3UartWrite(value & $FF)
 EndProcedure
@@ -101,6 +121,7 @@ Procedure.i pi3ut_ReadLine()
   pi3_ut_line_len = 0
   pi3_ut_line_overflow = 0
   Repeat
+    pi3ut_Idle()
     value = Pi3UartRead()
     If value = -2 : ProcedureReturn 0 : EndIf
     If value = -1
@@ -213,6 +234,7 @@ Procedure.i pi3ut_ReadExact(dst.i, bytes.i)
   If began < 0 : ProcedureReturn 0 : EndIf
   While got < bytes And spin < 20000000
     spin = spin + 1
+    pi3ut_Idle()
     value = Pi3UartRead()
     If value = -2 : ProcedureReturn 0 : EndIf
     If value >= 0
@@ -241,6 +263,7 @@ Procedure pi3ut_DrainAfterFault()
   EndIf
   While count < 16384 And spin < 2000000
     spin = spin + 1
+    pi3ut_Idle()
     value = Pi3UartRead()
     If value = -2
       pi3_ut_rx_quarantine = 1
@@ -292,7 +315,7 @@ Procedure.i pi3ut_ReceiveFrames(total.i)
   Protected status.i
   Repeat
     If pi3ut_ReadExact(@pi3_ut_header[0], #PI3_UT_HEADER_BYTES) = 0
-      Pi3UpdateAbort()
+      Pi3UpdateAbortFrom(#PI3_UPDATE_SOURCE_SERIAL)
       pi3ut_DrainAfterFault()
       ProcedureReturn 0
     EndIf
@@ -318,14 +341,14 @@ Procedure.i pi3ut_ReceiveFrames(total.i)
       made = Crc32(@pi3_ut_payload[0], bytes) & $FFFFFFFF
       If made <> want
         status = #PI3_UT_STATUS_CRC
-      ElseIf Pi3UpdateChunk(offset, @pi3_ut_payload[0], bytes) = 0
+      ElseIf Pi3UpdateChunkFrom(#PI3_UPDATE_SOURCE_SERIAL,offset, @pi3_ut_payload[0], bytes) = 0
         status = Pi3UpdateError()
         If status = 0 : status = #PI3_UT_STATUS_LENGTH : EndIf
       EndIf
     EndIf
     pi3ut_Ack(Pi3UpdateReceived(), status)
     If status <> #PI3_UT_STATUS_OK
-      Pi3UpdateAbort()
+      Pi3UpdateAbortFrom(#PI3_UPDATE_SOURCE_SERIAL)
       ; A header/length refusal can leave payload bytes already queued by the
       ; USB-to-serial adapter. Drain to a bounded quiet interval so those bytes
       ; cannot become commands at the returned prompt.
@@ -421,12 +444,15 @@ Procedure pi3ut_Command()
     ProcedureReturn
   EndIf
   If pi3ut_Match("abort") <> 0 And pi3ut_End() <> 0
-    Pi3UpdateAbort()
+    If Pi3UpdateAbortFrom(#PI3_UPDATE_SOURCE_SERIAL)=0
+      pi3ut_WriteLine("!! update belongs to another transport; nothing was aborted")
+      ProcedureReturn
+    EndIf
     pi3ut_WriteLine("aborted; the selected boot slot did not change")
     ProcedureReturn
   EndIf
   If pi3ut_Match("commit") <> 0 And pi3ut_End() <> 0
-    If Pi3UpdateCommit() = 0
+    If Pi3UpdateCommitFrom(#PI3_UPDATE_SOURCE_SERIAL) = 0
       pi3ut_WriteText("!! commit refused, error ") : pi3ut_WriteInt(Pi3UpdateError())
       pi3ut_WriteByte(13) : pi3ut_WriteByte(10)
       ProcedureReturn
@@ -443,7 +469,7 @@ Procedure pi3ut_Command()
       pi3ut_WriteLine("!! usage: update begin <decimal length> <64 hex sha256>")
       ProcedureReturn
     EndIf
-    If Pi3UpdateBegin(total, @pi3_ut_digest[0]) = 0
+    If Pi3UpdateBeginFrom(#PI3_UPDATE_SOURCE_SERIAL,total, @pi3_ut_digest[0]) = 0
       pi3ut_WriteText("!! update begin refused, error ") : pi3ut_WriteInt(Pi3UpdateError())
       pi3ut_WriteByte(13) : pi3ut_WriteByte(10)
       ProcedureReturn

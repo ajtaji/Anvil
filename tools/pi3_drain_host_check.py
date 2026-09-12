@@ -13,6 +13,7 @@ def main():
 Global reads.i
 Procedure.i Pi3Micros() : ProcedureReturn 0 : EndProcedure
 Procedure.i Pi3UartRead() : reads + 1 : ProcedureReturn -1 : EndProcedure
+Procedure pi3ut_Idle() : EndProcedure
 '''
     suffix='''
 pi3ut_DrainAfterFault()

@@ -1,5 +1,6 @@
 ; ======================================================================
-;  dhcp.pi4 - a DHCP client, RFC 2131 / RFC 2132, the build-and-parse
+;  dhcp.pbi - a target-neutral DHCP client, RFC 2131 / RFC 2132,
+;  the build-and-parse
 ;  half only.
 ;
 ;  net.pi4's header says it out loud: "NO DHCP ... DHCP in particular is

@@ -11,6 +11,9 @@
 #PI3_UPDATE_CONFIRMED = 3
 #PI3_UPDATE_HEADER = 256 ; P3SLOT 128 + PMFBOOT v2 128
 #PI3_UPDATE_HANDOFF = $1FF0000
+#PI3_UPDATE_SOURCE_NONE = 0
+#PI3_UPDATE_SOURCE_SERIAL = 1
+#PI3_UPDATE_SOURCE_ETHERNET = 2
 Global Dim pi3_up_lba.i[5]
 Global Dim pi3_up_span.i[5]
 Global Dim pi3_up_size.i[5]
@@ -36,6 +39,7 @@ Global pi3_up_pending.i = -1
 Global pi3_up_baseline.i = -1
 Global pi3_up_handoff_ready.i
 Global pi3_up_boot_phase.i
+Global pi3_up_source.i
 
 Procedure.i Pi3NoBootProgress()
   ProcedureReturn 1
@@ -85,6 +89,9 @@ Procedure.i Pi3UpdateError()
 EndProcedure
 Procedure.i Pi3UpdateReceived()
   ProcedureReturn pi3_up_received
+EndProcedure
+Procedure.i Pi3UpdateSource()
+  ProcedureReturn pi3_up_source
 EndProcedure
 Procedure.i Pi3UpdateSlot()
   ProcedureReturn pi3_up_active
@@ -605,8 +612,9 @@ Procedure.i Pi3UpdateMountHandoff()
   ProcedureReturn pi3UpMountCommon(1)
 EndProcedure
 
-Procedure.i Pi3UpdateBegin(bytes.i, expectedSha.i)
+Procedure.i Pi3UpdateBeginFrom(source.i,bytes.i,expectedSha.i)
   Protected n.i
+  If source<>#PI3_UPDATE_SOURCE_SERIAL And source<>#PI3_UPDATE_SOURCE_ETHERNET : ProcedureReturn pi3UpFail(-18) : EndIf
   If pi3_up_mounted = 0 Or pi3_up_receiving <> 0 : ProcedureReturn pi3UpFail(-1) : EndIf
   If bytes < #PI3_UPDATE_HEADER + 4 Or bytes > pi3_up_size[0] Or bytes > pi3_up_stage_bytes Or pi3UpRam(expectedSha, 32) = 0 : ProcedureReturn pi3UpFail(-7) : EndIf
   If pi3_up_max_generation >= $7FFFFFFFFFFFFFFE : ProcedureReturn pi3UpFail(-7) : EndIf
@@ -614,14 +622,20 @@ Procedure.i Pi3UpdateBegin(bytes.i, expectedSha.i)
   For n = 0 To 31 : pi3_up_expected[n] = PeekA(expectedSha + n) : Next
   pi3_up_length = bytes
   pi3_up_received = 0
+  pi3_up_source = source
   pi3_up_receiving = 1
   pi3_up_error = 0
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i Pi3UpdateChunk(offset.i, source.i, bytes.i)
+Procedure.i Pi3UpdateBegin(bytes.i,expectedSha.i)
+  ProcedureReturn Pi3UpdateBeginFrom(#PI3_UPDATE_SOURCE_SERIAL,bytes,expectedSha)
+EndProcedure
+
+Procedure.i Pi3UpdateChunkFrom(owner.i,offset.i,source.i,bytes.i)
   Protected n.i
   If pi3_up_receiving = 0 : ProcedureReturn pi3UpFail(-1) : EndIf
+  If owner<>pi3_up_source : ProcedureReturn pi3UpFail(-18) : EndIf
   If offset < 0 Or bytes < 1 Or bytes > 1024 Or bytes > pi3_up_length Or offset > pi3_up_length - bytes Or pi3UpRam(source, bytes) = 0 : ProcedureReturn pi3UpFail(-8) : EndIf
   If offset < pi3_up_received
     If offset + bytes > pi3_up_received Or pi3UpEqual(pi3_up_stage + offset, source, bytes) = 0 : ProcedureReturn pi3UpFail(-8) : EndIf
@@ -636,19 +650,31 @@ Procedure.i Pi3UpdateChunk(offset.i, source.i, bytes.i)
   ProcedureReturn 1
 EndProcedure
 
-Procedure Pi3UpdateAbort()
+Procedure.i Pi3UpdateChunk(offset.i,source.i,bytes.i)
+  ProcedureReturn Pi3UpdateChunkFrom(pi3_up_source,offset,source,bytes)
+EndProcedure
+
+Procedure.i Pi3UpdateAbortFrom(owner.i)
+  If pi3_up_receiving<>0 And owner<>pi3_up_source : ProcedureReturn pi3UpFail(-18) : EndIf
   pi3_up_receiving = 0
   pi3_up_received = 0
   pi3_up_length = 0
+  pi3_up_source = #PI3_UPDATE_SOURCE_NONE
+  ProcedureReturn 1
 EndProcedure
 
-Procedure.i Pi3UpdateCommit()
+Procedure Pi3UpdateAbort()
+  Pi3UpdateAbortFrom(pi3_up_source)
+EndProcedure
+
+Procedure.i Pi3UpdateCommitFrom(owner.i)
   Protected target.i
   Protected offset.i
   Protected n.i
   Protected take.i
   Protected p.i
   If pi3_up_mounted = 0 Or pi3_up_receiving = 0 Or pi3_up_received <> pi3_up_length : ProcedureReturn pi3UpFail(-1) : EndIf
+  If owner<>pi3_up_source : ProcedureReturn pi3UpFail(-18) : EndIf
   Sha256Of(pi3_up_stage, pi3_up_length, @pi3_up_digest[0])
   If pi3UpEqual(@pi3_up_digest[0], @pi3_up_expected[0], 32) = 0 : ProcedureReturn pi3UpFail(-9) : EndIf
   If pi3UpContainer(pi3_up_stage, pi3_up_length) = 0 : ProcedureReturn pi3UpFail(-13) : EndIf
@@ -656,6 +682,7 @@ Procedure.i Pi3UpdateCommit()
   ; Once disk mutation starts, any error forces remount before another attempt.
   pi3_up_mounted = 0
   pi3_up_receiving = 0
+  pi3_up_source = #PI3_UPDATE_SOURCE_NONE
   offset = 0
   While offset < pi3_up_length
     take = pi3_up_length - offset
@@ -686,6 +713,10 @@ Procedure.i Pi3UpdateCommit()
   pi3_up_mounted = 1
   pi3_up_error = 0
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3UpdateCommit()
+  ProcedureReturn Pi3UpdateCommitFrom(pi3_up_source)
 EndProcedure
 
 ; The confirmed other record remains untouched through every state write.

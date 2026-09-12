@@ -22,7 +22,7 @@ def main():
                ('partial-payload',frame(0,b'ab')[:-1],0,1004),('timeout',b'',0,None)]
         for name,data,want,status in cases:
             c=a64.A64();c.memory={base.LOAD+i:b for i,b in enumerate(blob)};c.sp=base.STACK
-            for k,v in [('pi3_up_receiving',1),('pi3_up_length',4),('pi3_up_stage',0x2000000),('pi3_up_ram',0),('pi3_up_ram_bytes',0x8000000)]:c.store(sym['global_'+k],v,8)
+            for k,v in [('pi3_up_receiving',1),('pi3_up_source',1),('pi3_up_length',4),('pi3_up_stage',0x2000000),('pi3_up_ram',0),('pi3_up_ram_bytes',0x8000000)]:c.store(sym['global_'+k],v,8)
             queue=deque(data);out=[];ticks=0
             c.pc=base.LOAD+sym['pi3ut_receiveframes'];c.x[0]=4;c.x[30]=base.RETURN_PC
             hooks={base.LOAD+sym[n]:n for n in ('pi3uartread','pi3uartwrite','pi3micros')}

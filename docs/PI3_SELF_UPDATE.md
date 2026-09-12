@@ -4,9 +4,9 @@ The target is BCM2837 AArch64. Firmware continues loading `kernel8.img` at
 `0x80000`. The existing diagnostic entry remains separate. The permanent
 first-stage loader and replaceable updater are built and checked on the desk.
 One explicit provisioning pass installs them on an already prepared Pi boot
-volume. After that, ordinary Anvil images travel over the Pi 3 PL011 serial
-link; the card stays in the board. Ethernet updating is a later service, not
-part of this storage recovery boundary.
+volume. After that, ordinary Anvil images can travel over the Pi 3 PL011
+serial link or the LAN9514 Ethernet port; the card stays in the board. Both
+transports enter the same storage, hash and A/B transaction boundary.
 
 ## Storage boundary
 
@@ -157,7 +157,8 @@ Source directives own load `0x80000`, BSS `0x180000`, stack `0x200000`.
 Image end must be at most `0x180000`, BSS end at most `0x1F0000`, leaving
 at least 64 KiB downward stack space. `pi3-updater` builds `anvil.img` and
 its compiler `.pmf` sidecar with the slot layout above. This is the autonomous
-serial update monitor, not a claim of complete Pi3 networking/Anvil services.
+serial and Ethernet update monitor, not a claim of complete Pi3
+networking/Anvil services.
 `pi3` and explicit `pi3-diagnostic` retain the earlier diagnostic source.
 Each real loader/updater build has its own central build counter.
 
@@ -194,6 +195,21 @@ replacing exact named files. Normal later updates use:
 python tools/pi3_update.py build/pi3/anvil-slot.img --port COM7 --reboot
 ```
 
+Once the monitor prints the DHCP address and UDP port 5556, Ethernet updates
+use the same validated `P3SLOT` file:
+
+```
+python tools/pi3_net_update.py build/pi3/anvil-slot.img --host <pi3-address> --reboot
+```
+
+The host address is explicit and the board obtains its address by DHCP; no
+laptop subnet or old board address is compiled in. The host tool binds every
+request to a fresh random session and the board binds that session to the
+sender IP and UDP port. Lost BEGIN, DATA and COMMIT replies are replay-safe.
+This protects transaction ownership and stale datagrams but is not
+authentication against a hostile machine on the same LAN. Do not expose UDP
+5556 outside a trusted development network.
+
 Omit `--reboot` to stage and commit without resetting immediately. A failed
 trial is recovered by the immutable loader's watchdog and confirmed fallback;
 hold `U` during its three-second window for the serial recovery monitor or `F`
@@ -209,6 +225,11 @@ python tools/pi3_update_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_update_boot_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_loader_window_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_update_transport_check.py --compiler <PureMetalForge.exe>
+python tools/pi3_net_update_host_check.py
+python tools/pi3_ethernet_update_check.py --image <compiled-updater.img>
+python tools/pi3_lan9514_transport_check.py
+python tools/pi3_lan9514_runtime_check.py
+python tools/pi3_usb_enumeration_check.py
 python tools/pi3_reset_check.py --compiler <PureMetalForge.exe>
 python tools/pi3_drain_host_check.py
 python tools/pi3_update_layout_check.py
@@ -216,7 +237,7 @@ python tools/fat_shared_equivalence_check.py --compiler <PureMetalForge.exe>
 python tools/fat_readat_emitted_check.py --compiler <PureMetalForge.exe>
 ```
 
-At this checkpoint SDHOST passes 149 checks; updater passes 183 checks including
+At this checkpoint SDHOST passes 149 checks; updater passes 189 checks including
 cut/tear, trial/confirmation, malformed containers, root and nested cross-links,
 directory graph/FAT cycles, exact chain lengths, dot links, depth and handoff;
 boot admission/watchdog passes 30 checks. The receive/framing gate executes
@@ -230,8 +251,11 @@ startup to Main and verifies stack, DTB preservation, BSS initialization and
 PMF placement for both counted images. Shared FAT emits byte-identical
 29,672-byte fixture images against the pinned pre-extraction commit;
 the existing FAT read-at gate passes 19 cases and rejects three mutants.
+The Ethernet host framing/retry gate passes 11 cases and the emitted updater
+gate passes 12 peer/session/A-B/replay cases. LAN9514 transport, runtime and
+USB enumeration hostile gates all pass, including emitted AArch64 execution.
 Compiler SHA256:
-`5c87d98c096bd150e1eca45b7fa1a676ef0eaaff008a7a775a3fade9449fc374`.
+`36b322210c55af58d37305d905394d52d741299604bf17e7712d0eee8fe4bc07`.
 
 Updater execution uses actual emitted FAT, CRC and transaction code with a
 sparse sector device. SHA is an explicitly substituted host reference dependency
@@ -239,7 +263,9 @@ in that gate, not claimed native SHA execution. SDHOST execution uses modeled
 MMIO and card responses, not electrical/timing proof. The integrated real
 SDHOST/FAT/SHA/transport fixture also compiles, but is never run on hardware.
 
-Silicon acceptance still needs identification/capacity agreement, read-only
+No Ethernet updater image was flashed at this checkpoint. Silicon acceptance
+still needs LAN9514 enumeration/link, DHCP acquisition, a read-only STATUS
+exchange, identification/capacity agreement, read-only
 filesystem inspection, an explicitly designated inactive-slot write/readback,
 power-interruption recovery and candidate confirmation. Card internal FTL
 behavior and power-loss durability cannot be established by these desk models.
