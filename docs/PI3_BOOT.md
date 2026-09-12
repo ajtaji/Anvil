@@ -214,8 +214,19 @@ gate also pass. Compiler SHA256 is
 `0c0bac62627184109f3a7f7692919b9523e80e413f50b67b82dfc1867f89d51e`.
 The verified boot folder is
 `C:\Users\rajta\AppData\Local\Temp\anvil-pi3-diagnostic-build6-final`.
-It is ready to replace the files on the dedicated card; silicon framebuffer
-and FTDI acceptance remain open until that card is booted.
+It was copied to the dedicated whole-card FAT32 volume and verified byte for
+byte before a safe dismount.
+
+**SILICON PASS, 2026-09-12, Pi 3 Model B v1.2:** build 6 cold-booted from that
+card. HDMI displayed the final `parked safely` status. COM7 at 115200 8N1
+reported the early diagnostic and build 6, then `UART ready`, `ARM RAM
+verified; DTB preserved; timer active`, and the deliberate message that no
+scheduler/network/storage is enabled before parking. The first captured serial
+character was damaged while the port/board came up; the complete remaining
+lines were readable. This proves firmware entry, the corrected framebuffer
+transaction and actual pixel presentation, PL011, the outer RAM/DTB contract
+and the system timer on this board. It does not advertise a command prompt,
+scheduler, storage, USB, Ethernet or accelerated VC4 display on Pi 3 yet.
 
 ## Primary references (links)
 
