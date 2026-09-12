@@ -6,10 +6,12 @@ p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse
 pc=(b.ROOT/'RaspberryPi4/Lib/pcie.pi4').read_text()
 xh=(b.ROOT/'RaspberryPi4/Lib/xhci.pi4').read_text()
 def proc(s,n):return re.search(r'(?ms)^Procedure(?:\.i)? '+n+r'\([^\n]*\).*?^EndProcedure',s).group()
-body='\n'.join(proc(pc,n) for n in ('PcieAdoptCpu','PcieNeedsTakeover','PcieAdoptHalted','PciePrepareAdoption','PcieProgramWindow','PcieEnumerate','PcieEnableDma'))+'\n'+proc(xh,'XhciQuiesceAdopted')+'\n'+proc(xh,'xh_EnableDma')
+body='\n'.join(proc(pc,n) for n in ('PcieAdoptCpu','PcieNeedsTakeover','PcieAdoptHalted','PciePrepareAdoption','PcieProgramWindow','PcieColdFirmwareReady','PcieEnumerate','PcieEnableDma'))+'\n'+proc(xh,'XhciQuiesceAdopted')+'\n'+proc(xh,'xh_EnableDma')
 defs={m[1]:m[0] for m in re.finditer(r'(?m)^#(\w+)\s*=.*$',pc+'\n'+xh)}
 prefix=proc(xh,'XhciInitAt').split('  xh_err   = #XHCI_ERR_NONE')[0]
 body+='\n'+prefix.replace('XhciInitAt(','ProbeBdf(')+'\n ProcedureReturn 1\nEndProcedure\n'
+init_reset=proc(xh,'XhciInitAt').split('  xh_Phase(#XHCI_PH_RESET)')[1].split('  ; CONFIG -')[0]
+body+='\nProcedure.i ProbeInitReset()\n'+init_reset+'\n ProcedureReturn 1\nEndProcedure\n'
 needed=set(re.findall(r'#(\w+)',body));pending=list(needed)
 while pending:
  for dep in re.findall(r'#(\w+)',defs[pending.pop()].split(';')[0])[1:]:
@@ -22,9 +24,22 @@ Global mode.i=MODE
 Global pcie_up.i=1,pcie_enumerated.i,pcie_barBus.i,pcie_barCpu.i,pcie_barSize.i
 Global epbar.i=$C0000004,bridgewin.i=$C000C000
 Global inboundlow.i=15,inboundhigh.i=4
+Global reset_calls.i
 Dim rc.i(10000)
 Procedure xh_Phase(p.i) : EndProcedure
+; Firmware transaction is an explicit successful modeled environment here;
+; its real mailbox handshake has an independent owning gate.
+Procedure.i MailboxNotifyVl805Reset() : ProcedureReturn 1 : EndProcedure
+Procedure.i pcie_TickHz() : ProcedureReturn 1000000 : EndProcedure
+Procedure.i pcie_Ticks() : ticks=ticks+1000 : ProcedureReturn ticks : EndProcedure
 Procedure.i xh_Fail(reason.i) : xh_err=reason : ProcedureReturn 0 : EndProcedure
+Procedure.i xh_Halt() : ProcedureReturn live=0 : EndProcedure
+Procedure xh_FailStop() : EndProcedure
+Procedure.i xh_Reset()
+ reset_calls=reset_calls+1
+ If (cmd & 4)=0 Or live<>0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
 Procedure pcie_Phase(p.i) : EndProcedure
 Procedure.i PcieCpuFromBus(v.i) : ProcedureReturn #PCIE_OUT_CPU+v-#PCIE_OUT_BUS : EndProcedure
 Procedure.i PcieBarSize(b.i,d.i,f.i,o.i)
@@ -60,7 +75,7 @@ Procedure PcieCfgWrite32(b.i,d.i,f.i,o.i,v.i)
  EndIf
 EndProcedure
 Procedure pcie_Poke(o.i,v.i)
- If mode>=9 And o=#PCIE_MISC_WIN0_LO And v=#PCIE_OUT_BUS
+ If (mode=9 Or mode=10) And o=#PCIE_MISC_WIN0_LO And v=#PCIE_OUT_BUS
   ProcedureReturn
  EndIf
  If o=$4034 Or o=$4038
@@ -120,6 +135,7 @@ Procedure.i Main()
  PokeI($6000030,z)
  PokeI($6000038,inboundhigh)
  If mode=8 : PokeI($6000040,xh_EnableDma()) : EndIf
+ If mode>=15 : PokeI($6000040,ProbeInitReset()) : EndIf
  PokeI($6000048,xh_err)
  ProcedureReturn 0
 EndProcedure
@@ -129,13 +145,18 @@ model=re.sub(r'(?m)^Global (.*)$',lambda m:'\n'.join('Global '+v for v in m[1].s
 main=main.replace('Define x.i,y.i','Define x.i\n Define y.i')
 with tempfile.TemporaryDirectory(prefix='pcie-takeover-') as tmp:
  w=pathlib.Path(tmp)
- for mode in range(15):
+ for mode in range(17):
   entry=main
   if mode==10:entry='Procedure.i Main()\n PokeI($6000000,PcieProgramWindow())\n PokeI($6000008,reads)\n PokeI($6000010,inboundhigh)\n ProcedureReturn 0\nEndProcedure'
-  if mode>=11:
+  if 11<=mode<15:
    args_bdf={11:'2,0,0',12:'1,1,0',13:'1,0,1',14:'1,0,0'}[mode]
    entry='Procedure.i Main()\n PokeI($6000000,ProbeBdf('+args_bdf+'))\n PokeI($6000008,xh_err)\n PokeI($6000010,cmd)\n PokeI($6000018,reads)\n ProcedureReturn 0\nEndProcedure'
-  src=w/'test.pi4';out=w/'test.img';src.write_text(const+model.replace('MODE',str(mode))+body+'\n'+entry)
+  gatebody=body
+  if mode==16:
+   early='  If xh_EnableDma() = 0\n    xh_FailStop()\n    ProcedureReturn 0\n  EndIf\n'
+   assert gatebody.count(early)==1
+   gatebody=gatebody.replace(early,'')
+  src=w/'test.pi4';out=w/'test.img';src.write_text(const+model.replace('MODE',str(mode))+gatebody+'\n'+entry)
   env=os.environ.copy();env['PMF_ROOT']=str(b.ROOT)
   r=subprocess.run([a.compiler,'--compile',str(src),'-t','pi4','--entry-returns','--load-addr',hex(b.LOAD),'--stack-addr',hex(b.STACK),'-o',str(out)],env=env,cwd=b.ROOT,capture_output=True,text=True)
   if r.returncode or not out.exists():raise SystemExit(r.stdout+r.stderr)
@@ -148,23 +169,25 @@ with tempfile.TemporaryDirectory(prefix='pcie-takeover-') as tmp:
   else:raise AssertionError('deadline failed')
   v=[b.u64(cpu,b.OUT+8*i) for i in range(10)]
   print(mode,v,n)
-  if mode>=11:
+  if 11<=mode<15:
    assert v[:4]==([1,0,6,0] if mode==14 else [0,45,6,0]),v
    continue
   if mode==10:
    assert v[:3]==[0,0,4],v
    continue
   assert v[2]==0,v
-  if mode in (0,4,8):assert v[:2]==[1,1] and v[3:5]==[1,2],v
+  if mode in (0,4,8,15,16):assert v[:2]==[1,1] and v[3:5]==[1,2],v
   elif mode==9:assert v[:2]==[1,1] and v[3:5]==[1,0],v
   elif mode==7:assert v[:2]==[1,1] and v[3:6]==[0,2,0],v
   else:assert v[1]==0 and v[3]==0,v
   if mode==5:assert v[0]==0 and v[5]==0,v
-  if mode in (0,4,7,8):assert v[6:8]==[1,0],v
+  if mode in (0,4,7,8,15,16):assert v[6:8]==[1,0],v
   elif mode==9:assert v[6:8]==[0,0],v
   else:assert v[6:8]==[0,4],v
   if mode==8:assert v[8:10]==[0,44],v
   if mode==3:assert v[9]==45,v
+  if mode==15:assert v[8]==1,v
+  if mode==16:assert v[8]==0,v
  assert 'If PcieProgramWindow() = 0' in proc(pc,'PcieInit')
  assert 'If PcieProgramWindow() = 0' in proc(pc,'PcieEnumerate')
- print('PASS fifteen cases; compiler SHA256',hashlib.sha256(pathlib.Path(a.compiler).read_bytes()).hexdigest())
+ print('PASS seventeen cases including reset-BME ordering mutant; compiler SHA256',hashlib.sha256(pathlib.Path(a.compiler).read_bytes()).hexdigest())

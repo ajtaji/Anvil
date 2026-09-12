@@ -56,9 +56,9 @@ quiescence proof. Compiler SHA256:
 4. Disable memory decode for BAR probing/relocation. Reconfigure and verify
    the inbound/outbound windows, bridge routing and BAR while ownership is
    stopped. An unsupported or failed readback must leave the controller stopped.
-5. Complete controller reset/readiness, install the monitor-owned DMA arena and
-   rings, then enable bus mastering before starting the controller. Do not
-   enable it merely to discover capabilities or locate the controller.
+5. After verified halt and completed remapping, restore bus mastering before
+   controller reset/readiness. Install the monitor-owned DMA arena and rings
+   before setting Run. Do not enable BME merely to discover the old BAR.
 
 Use explicit takeover phases owned by the board orchestration or a narrowly
 defined hardware-takeover layer; avoid introducing recursive PCIe/xHCI
@@ -93,7 +93,9 @@ local register addresses, waits for CNR and HCHalted, and only then disables
 and verifies BME through PcieAdoptHalted. Failed readiness/halt/BME verification
 does not permit remapping. PcieEnumerate guards adoption ownership, disables
 decode before BAR probing, then relocates and verifies configuration. New
-controller DMA is enabled after its rings are installed, before Run.
+controller bus mastering is restored after verified halt/remapping and before
+HCRST, matching PCI host-registration ordering in Linux/U-Boot. Run remains
+clear until the monitor's new rings are installed.
 
 Both production callers, cursor_input.pi4 and storage.pi4, explicitly perform
 handover. Boot output separates link, firmware handover and mapping; retained
@@ -101,24 +103,40 @@ xHCI phases distinguish old-register access, CNR, halt and DMA ownership.
 No restart/watchdog was added.
 
 Run tools/pcie_takeover_check.py with --compiler pointing to the pinned
-compiler above: PASS fifteen emitted cases (ready, delayed ready, never ready,
+compiler above: PASS seventeen emitted cases (ready, delayed ready, never ready,
 never halted, failed BME readback, invalid routing with zero MMIO reads,
 unguarded enumeration refusal, owned cold-path enumeration, explicit DMA-enable
 error 44, adopted final-window write refusal, and direct cold-window helper
 write refusal, three unsupported-BDF early refusals and valid-BDF acceptance).
-The BDF checks execute the actual initialization prefix, before driver/hardware
+Two added cases execute the actual InitAt reset-phase fragment with an explicit
+controller model requiring BME before reset; removing the early BME enable
+is rejected. This proves the ordering, not that disabled BME caused the board
+hang. The BDF checks execute the actual initialization prefix, before driver/hardware
 mutation. The cold-path case
 models the post-cold-link state, **not physical link training**. Checks cover
 premature DMA mapping/BAR probing/BME disable and status RW1C writes.
 
-The existing tools/xhci_initial_readiness_check.py gate still passes 81,837
-instructions with two rejected mutants. RaspberryPi4/Tests/usb_takeover_compile.pi4
+The existing tools/xhci_initial_readiness_check.py gate now passes 84,581
+instructions with three rejected mutants. RaspberryPi4/Tests/usb_takeover_compile.pi4
 compiles all three complete libraries and the call sequence, producing a
-39,060-byte fixture, SHA256
-863c00c4b5f8f543ca4d91c66e3b1bd3f8b0445899cfe8694aa85d39824dcf9b;
+43,780-byte fixture including the concurrent cold firmware-notify integration,
+SHA256 a615eb8bcd56dcbb9500918c6ee7565e48265be4c3eb4f9d732cd35fa757a7fe;
 never execute this compile-only fixture on hardware. PcieProgramWindow itself
 now verifies all five outbound fields and returns status; both production
 callers check it. BME handover refusal reports error45, distinct from error44
 when enabling the monitor's new DMA ownership fails.
 No full-image build/deployment was performed. These models do not prove
 fabric completion or the cause of the reported cold boot hang.
+
+## Reference-backed BME timing correction
+
+The first takeover patch deferred BME until after reset and memory setup.
+That differed from both the working earlier source and reference drivers.
+The correction retains the protected mapping interval but restores BME before
+host reset. U-Boot v2025.01 enables it in xhci_pci_init before xhci_register,
+which calls xhci_reset; Linux v6.12 sets bus mastering before usb_add_hcd.
+Sources: https://raw.githubusercontent.com/u-boot/u-boot/v2025.01/drivers/usb/host/xhci-pci.c
+and https://raw.githubusercontent.com/u-boot/u-boot/v2025.01/drivers/usb/host/xhci.c
+and https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/usb/core/hcd-pci.c .
+No external implementation code was copied. This does not explain the earlier
+build79 intermittent failure, which predates the BME timing change.

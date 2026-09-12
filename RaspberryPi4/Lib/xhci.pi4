@@ -2897,6 +2897,18 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
     ProcedureReturn 0
   EndIf
   xh_Phase(#XHCI_PH_RESET)
+  ; The ownership/remapping interval is complete. Prove the host halted
+  ; before restoring BME; match PCI host registration ordering used by
+  ; Linux/U-Boot, which enables bus mastering before HCRST. Run remains
+  ; clear, so no command-ring processing begins until new rings are ready.
+  If xh_Halt() = 0
+    xh_FailStop()
+    ProcedureReturn 0
+  EndIf
+  If xh_EnableDma() = 0
+    xh_FailStop()
+    ProcedureReturn 0
+  EndIf
   If xh_Reset() = 0
     xh_FailStop()
     ProcedureReturn 0
@@ -2917,10 +2929,6 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
     ProcedureReturn 0
   EndIf
   xh_Phase(#XHCI_PH_RUN)
-  If xh_EnableDma() = 0
-    xh_FailStop()
-    ProcedureReturn 0
-  EndIf
   If xh_Start() = 0
     xh_FailStop()
     ProcedureReturn 0
