@@ -150,7 +150,7 @@
 ;                 complete or advance a byte within 20 ms. The local
 ;                 architectural counter gives elapsed time independently
 ;                 of CPU/cache speed. A finite spin backstop also remains
-;                 for an unavailable or stopped counter; that fallback
+;                 for an unavailable counter; that fallback
 ;                 alone is not a wall-time guarantee. Abort recovery has
 ;                 its own 20 ms deadline and refuses a new START if TA
 ;                 never clears. See THE WALL-CLOCK BACKSTOP below.
@@ -693,9 +693,8 @@ EndProcedure
 ;
 ;  THE BASE IS CHOSEN HERE, INLINE, and not through I2cBusBase(). These
 ;  two run inside I2cXfer's polling loop - the innermost thing this
-;  library does - and the loop's backstop counts iterations, so making
-;  each one slower lengthens a timeout that is documented in bytes. One
-;  compare and a branch costs nothing and keeps that promise. The
+;  library does. The live-counter deadline is independent of loop cost;
+;  inline selection avoids unnecessary procedure overhead. The
 ;  OFFSETS stay constants: they are the same in every BSC.
 ; ----------------------------------------------------------------------
 Procedure.i I2cRd(off.i)
@@ -1339,7 +1338,7 @@ Procedure.i I2cRecover()
       Break
     EndIf
     spin = spin - 1
-  Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+  Until I2cWaitExpired(deadline, spin) <> 0
 
   If (s & #BSC_S_TA) <> 0
     ; Restore disabled/fail-closed after the bounded no-ST enable attempt. A
@@ -1381,7 +1380,10 @@ Procedure.i I2cDeadlineUs(us.i)
   If hz <= 0
     ProcedureReturn 0
   EndIf
-  ProcedureReturn I2cCounterTicks() + (hz / 1000000) * us
+  ; CNTFRQ is 32-bit and these internal deadlines are 20,000 us. Multiply
+  ; before division and round up: 19.2 MHz must not become 19 MHz, nor may
+  ; a valid sub-MHz counter create an immediately expired deadline.
+  ProcedureReturn I2cCounterTicks() + (hz * us + 999999) / 1000000
 EndProcedure
 
 Procedure.i I2cDeadlinePassed(deadline.i)
@@ -1393,6 +1395,17 @@ Procedure.i I2cDeadlinePassed(deadline.i)
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
+EndProcedure
+
+; A working wall clock, not CPU-dependent loop cost, decides expiry. The
+; finite iteration fallback applies only when no frequency was available.
+; A nonzero but stopped architectural counter violates the clock contract;
+; detecting that requires an independent clock, not a guessed spin duration.
+Procedure.i I2cWaitExpired(deadline.i, spinsRemaining.i)
+  If deadline <> 0
+    ProcedureReturn I2cDeadlinePassed(deadline)
+  EndIf
+  ProcedureReturn Bool(spinsRemaining <= 0)
 EndProcedure
 
 ; Refuse to launch a fresh transaction over one that recovery could not make
@@ -1542,7 +1555,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
 
     ; --- the wall-clock backstop -------------------------------------
     spin = spin - 1
-    If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+    If I2cWaitExpired(deadline, spin) <> 0
       I2cTraceFault(s, #I2C_TIMEOUT)
       a64_barrier()
       i2c_timeouts = i2c_timeouts + 1
@@ -1745,7 +1758,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     spin = spin - 1
-    If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+    If I2cWaitExpired(deadline, spin) <> 0
       i2c_timeouts = i2c_timeouts + 1
       I2cTraceFault(s, #I2C_TIMEOUT)
       I2cRecover()
@@ -1823,7 +1836,7 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     EndIf
 
     spin = spin - 1
-    If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+    If I2cWaitExpired(deadline, spin) <> 0
       i2c_timeouts = i2c_timeouts + 1
       I2cTraceFault(s, #I2C_TIMEOUT)
       I2cRecover()
