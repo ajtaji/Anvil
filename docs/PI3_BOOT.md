@@ -153,10 +153,12 @@ not hardware boot acceptance. The broader monitor/services remain unfinished.
 
 ## Primary references (links)
 
+- [Raspberry Pi Linux driver-reference baseline (`7d182693`)](https://github.com/raspberrypi/linux/tree/7d1826930811232688a50c99c540fbb137aed081)
 - [Raspberry Pi processor documentation](https://www.raspberrypi.com/documentation/computers/processors.html)
 - [Firmware property protocol](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface)
 - [Official firmware AArch64 stub](https://github.com/raspberrypi/tools/blob/master/armstubs/armstub8.S)
 - [Official UART configuration](https://www.raspberrypi.com/documentation/computers/configuration.html)
 - [BCM peripheral register description](https://datasheets.raspberrypi.com/bcm2835/bcm2835-peripherals.pdf)
 
-Register facts were consulted; no Linux/NodeBB implementation code was copied.
+Register facts and the pinned Linux drivers were consulted; no Linux/NodeBB
+implementation code was copied into Anvil.
