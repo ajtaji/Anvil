@@ -166,7 +166,63 @@ the one failure a magic number cannot catch.
 | `tools/screen_shot_emitted_check.py` | the SHIPPED capture, rotation map, tier report and the whole of `RunAt`, executed over a modelled turned panel on both tiers; the header; that the copy is of the scanned buffer and not the drawn one; that the frame is kept before the first character is printed. Plus the capture area's placement, size and protection against `memmap.pi4`'s own constants, and the slot against `abi.pbi` and the Pi 4's `HwCon` seam. Thirteen mutants must be rejected, including one that repaints first and one that captures the logical surface on the turned panel. |
 | `tools/board_run_parse_check.py` | `board_run.py`'s decoders against recorded `p` and `shot` streams, including four that must be refused. The live and kept streams must decode to the same pixels. |
 
-## What only the board can prove
+## Integration checkpoint, 2026-09-11
+
+The earlier screenshot-lane note about an HTTP recursion refusal is historical:
+the corrected HTTP implementation is integrated at `19b757d`. Do not omit HTTP
+or substitute an old export when proving this service against the current tree.
+
+The integrated tree subsequently built through `tools/build.py pi4`, centrally
+counted as 83: 2,752,748 bytes, SHA256
+`cc037774593b3c8cdaa88c0e37776121728b708b871e5381a5b7fcdd2038cde3`.
+This was before the later initial-CNR fix documented in
+`docs/USB_COLD_READINESS.md`; do not describe that artifact as carrying it.
+
+Current focused checks with unified compiler SHA256
+`171afd49dc7c964bdfca86de3c4e11e1d02458a16b13961d533368e47fc492e7`:
+
+- `python tools/screen_shot_emitted_check.py --compiler <unified-IDE> --interp tools/a64/a64_interp.py`:
+  PASS, 325,196 emitted instructions and all 13 mutants rejected.
+- `python tools/board_run_parse_check.py`: PASS, 48 assertions over recorded
+  responses. These are desk checks, not a new board capture.
+
+`Anvil/Core/shotarm.pbi`, `tools/board_run.py`,
+`tools/screen_shot_emitted_check.py` and `tools/board_run_parse_check.py` are
+original project code. They contain no imported third-party implementation;
+the provenance inventory deliberately omits uncited original files from its
+file/upstream-pair table. The capture format and its reserved address are also
+project decisions, not vendor-specified memory assignments.
+
+The additional `memmap.pi4` vendor-spec classification covers architectural
+cache maintenance used for the boot-phase record, not ownership of the chosen
+screenshot region. Its primary reference is Arm's
+[DC CIVAC instruction](https://developer.arm.com/documentation/ddi0601/2024-12/AArch64-Instructions/DC-CIVAC--Data-or-unified-Cache-line-Clean-and-Invalidate-by-VA-to-PoC?lang=en).
+That instruction describes cleaning/invalidation to the point of coherency;
+it does not guarantee DRAM preservation across an arbitrary board reset.
+
+### Existing build 79: non-initializing diagnostics
+
+The command paths in `f3d6ebb` accept these without hardware bring-up:
+
+```
+screen timing
+touch trace
+touch axes
+touch bus
+```
+
+The first two print retained RAM observations. Axes reports the mapping without
+I2C transactions; bare `touch bus` temporarily selects the configured bus in
+software for reporting, then restores the header selection without mux/enable.
+Console output itself can repaint the display, so these are not a substitute
+for capturing an untouched payload frame.
+
+Do not label bare `touch`/`touch status` read-only: they call `I2cUp` and
+`HwTouchRestart`. Likewise `i2c speed` brings the controller up before reporting,
+bare `screen` can turn it on, and `screen keyboard state` first attaches its
+screen layer. None belongs in a non-initializing diagnostic transcript.
+
+## Hardware evidence still required
 
 The gates execute emitted code over a modelled panel. They cannot show that
 the bytes at `#MON_FB_SCAN` are the bytes the glass is lit with, that a real

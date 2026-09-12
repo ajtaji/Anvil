@@ -1,0 +1,86 @@
+"""Run an already-counted cold candidate with fake MMIO, no new compilation."""
+import pathlib,sys,argparse,hashlib
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
+import el3_runtime_emitted_check as base
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('image');p.add_argument('--repeat-only',action='store_true');args=p.parse_args()
+image=pathlib.Path(args.image);data=image.read_bytes();a64=base.load_interpreter(base.INTERP)
+syms={k:int(v,0) for k,v in (s.split('=',1) for s in pathlib.Path(str(image)+'.sym').read_text().splitlines() if '=' in s)}
+def address(name):return syms[name] if name.startswith('global_') else 0x80000+syms[name]
+assert syms['__bss_end__']<=0x1f0000,'BSS collides with reserved stack'
+assert 0x80000+len(data)<=0x1f0000,'image collides with reserved stack'
+def case(mode):
+ class CPU(a64.A64):
+  def __init__(self):super().__init__();self.tick=0;self.req=0;self.text=bytearray();self.pixels=0
+  def load(self,addr,size):
+   if addr==0x3f003008:return 0
+   if addr==0x3f003004:self.tick+=1000;return self.tick
+   if addr in (0x3f201018,0x3f200004,0x3f00b898,0x3f00b8b8):return 0
+   if addr==0x3f00b880:return self.req
+   return super().load(addr,size)
+  def store(self,addr,value,size):
+   if 0x10000000<=addr<0x11000000:
+    assert addr<0x10000000+2560*480,'framebuffer write beyond allocation'
+    self.pixels+=1;return
+   if addr==0x3f201000:self.text.append(value&255);return
+   if addr==0x3f00b8a0:
+    self.req=value&0xffffffff;b=value&0x3ffffff0;tag=super().load(b+8,4)
+    super().store(b+4,0x80000000,4);super().store(b+16,0x80000008,4)
+    if tag==0x30002:super().store(b+24,48000000,4)
+    elif tag==0x10005:super().store(b+20,0,4);super().store(b+24,0x100000 if mode=='smallram' else 0x8000000,4)
+    else:
+     for offset,length in ((8,8),(28,8),(48,4),(64,4),(80,8),(100,4),(116,8),(136,4)):super().store(b+offset+8,0x80000000|length,4)
+     super().store(b+92,0xd0000000,4);super().store(b+96,2560*480,4)
+     super().store(b+112,128 if mode=='badpitch' else 2560,4)
+     super().store(b+128,0x10000000,4);super().store(b+132,0x1000000,4)
+     if mode=='baddepth':super().store(b+60,16,4)
+     if mode=='badspan':super().store(b+96,4,4)
+    return
+   return super().store(addr,value,size)
+ cpu=CPU()
+ for n,b in enumerate(data):cpu.memory[0x80000+n]=b
+ dtb=0x180000 if mode=='overlap' else 0x300000
+ for n,b in enumerate((0 if mode=='badmagic' else 0xd00dfeed).to_bytes(4,'big')+(4096).to_bytes(4,'big')+bytes(32)):cpu.memory[dtb+n]=b
+ cpu.enable_system_registers(el=2,preset={base.SCTLR_EL2:0x30c50830})
+ cpu.pc=0x80000;cpu.sp=0;cpu.x[0]=dtb
+ for n in range(20000000):
+  if cpu.pc==address('pi3_cold_park'):break
+  cpu.step()
+ else:raise AssertionError('did not park')
+ assert base.u64(cpu,address('global_pi3_dtb'))==dtb,'startup lost x0'
+ validram=mode not in ('smallram','overlap','badmagic')
+ expected=2 if validram else 2**64-4
+ assert base.u64(cpu,address('global_pi3_boot_status'))==expected,(mode,cpu.text)
+ assert b'UART ready\r\n' in cpu.text
+ assert (b'ARM RAM verified' in cpu.text)==validram
+ assert (cpu.pixels>=307200)==(mode=='normal'),(mode,cpu.pixels)
+ if mode!='normal':assert cpu.pixels==0
+ assert 0x1f0000<=cpu.sp<=0x200000
+ if mode=='normal':
+  before=cpu.pixels;allocation=base.u64(cpu,address('global_pi3_fb'))
+  cpu.pc=address('pi3fbinit');cpu.x[0]=dtb;cpu.x[1]=dtb+4096;cpu.x[30]=base.RETURN_PC
+  for retry in range(500):
+   if cpu.pc==base.RETURN_PC:break
+   cpu.step()
+  else:raise AssertionError('repeat init did not return')
+  assert cpu.x[0]==0 and cpu.pixels==before
+  assert base.u64(cpu,address('global_pi3_fb'))==allocation,'repeat init discarded allocation'
+ return n
+def repeat_gate():
+ cpu=a64.A64()
+ for n,b in enumerate(data):cpu.memory[0x80000+n]=b
+ cpu.store(address('global_pi3_fb_attempted'),1,8)
+ cpu.store(address('global_pi3_fb'),0x10000000,8)
+ cpu.pc=address('pi3fbinit');cpu.sp=0x200000;cpu.x[30]=base.RETURN_PC
+ before=dict(cpu.memory)
+ for n in range(500):
+  if cpu.pc==base.RETURN_PC:break
+  cpu.step()
+ else:raise AssertionError('repeat guard did not return')
+ assert cpu.x[0]==0 and base.u64(cpu,address('global_pi3_fb'))==0x10000000
+ assert all(v==before.get(k) for k,v in cpu.memory.items() if not 0x1f0000<=k<0x200000),'repeat guard wrote outside stack'
+ print('PASS: emitted repeat init refuses before allocation/MMIO changes;',n,'instructions')
+repeat_gate()
+if args.repeat_only:raise SystemExit(0)
+steps=sum(case(m) for m in ('normal','smallram','overlap','badmagic','badpitch','baddepth','badspan'))
+print('PASS: 7 cold-entry cases,',steps,'instructions; preserved firmware x0; validated framebuffer writes')
+print('SHA256',hashlib.sha256(data).hexdigest())

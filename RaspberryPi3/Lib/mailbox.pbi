@@ -1,0 +1,120 @@
+; BCM2837 property channel, exclusive primary boot owner. Include timer first.
+; Caller buffer must be resident, 16-byte aligned, uncached low ARM RAM.
+; Does not pretend a cache-off diagnostic path supports cached DMA ownership.
+#PI3_MBOX = $3F00B880
+Global Dim pi3_property.l[12]
+; A timed-out submitted buffer remains firmware-owned until reboot. No retry
+; or reuse is safe without observing its completion; refuse later requests.
+Global pi3_mailbox_outstanding.i
+Procedure.i Pi3MailboxContext()
+  ASM
+    mrs x0, mpidr_el1
+    movz x1, #255
+    and x0, x0, x1
+    cbnz x0, pi3_mbx_bad
+    mrs x0, currentel
+    cmp x0, #8
+    b.eq pi3_mbx_el2
+    cmp x0, #12
+    b.ne pi3_mbx_bad
+    mrs x0, sctlr_el3
+    b pi3_mbx_check
+pi3_mbx_el2:
+    mrs x0, sctlr_el2
+pi3_mbx_check:
+    movz x1, #5
+    and x0, x0, x1
+    cbnz x0, pi3_mbx_bad
+    movz x0, #1
+    b pi3_mbx_done
+pi3_mbx_bad:
+    movz x0, #0
+pi3_mbx_done:
+  EndASM
+  ProcedureReturn
+EndProcedure
+Procedure Pi3MailboxBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+Procedure.i Pi3MailboxCall(buffer.i, bytes.i)
+  Protected request.i
+  Protected start.i
+  Protected now.i
+  Protected response.i
+  Protected n.i
+  If pi3_mailbox_outstanding <> 0
+    ProcedureReturn 0
+  EndIf
+  If buffer < $1000 Or (buffer & 15) <> 0 Or bytes < 12 Or bytes > 4096 Or (bytes & 3) <> 0
+    ProcedureReturn 0
+  EndIf
+  If buffer > $3F000000 - bytes Or Pi3MailboxContext() = 0
+    ProcedureReturn 0
+  EndIf
+  If (PeekL(buffer) & $FFFFFFFF) <> bytes Or PeekL(buffer + 4) <> 0
+    ProcedureReturn 0
+  EndIf
+  start = Pi3Micros()
+  If start < 0
+    ProcedureReturn 0
+  EndIf
+  request = buffer | $C0000008
+  Pi3MailboxBarrier()
+  For n = 0 To 999999
+    If (PeekL(#PI3_MBOX + $38) & $80000000) = 0
+      Break
+    EndIf
+    now = Pi3Micros()
+    If now < start Or now - start >= 100000
+      ProcedureReturn 0
+    EndIf
+  Next
+  If n > 999999
+    ProcedureReturn 0
+  EndIf
+  pi3_mailbox_outstanding = 1
+  PokeL(#PI3_MBOX + $20, request)
+  For n = 0 To 999999
+    If (PeekL(#PI3_MBOX + $18) & $40000000) = 0
+      response = PeekL(#PI3_MBOX) & $FFFFFFFF
+      If response = request
+        Pi3MailboxBarrier()
+        pi3_mailbox_outstanding = 0
+        If (PeekL(buffer + 4) & $FFFFFFFF) = $80000000
+          ProcedureReturn 1
+        EndIf
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    now = Pi3Micros()
+    If now < start Or now - start >= 100000
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Pi3ClockRate(id.i)
+  Protected buffer.i
+  If pi3_mailbox_outstanding <> 0 Or id < 1 Or id > 14
+    ProcedureReturn -1
+  EndIf
+  buffer = ((@pi3_property[0] + 15) >> 4) << 4
+  PokeL(buffer, 32)
+  PokeL(buffer + 4, 0)
+  PokeL(buffer + 8, $30002)
+  PokeL(buffer + 12, 8)
+  PokeL(buffer + 16, 4)
+  PokeL(buffer + 20, id)
+  PokeL(buffer + 24, 0)
+  PokeL(buffer + 28, 0)
+  If Pi3MailboxCall(buffer, 32) = 0
+    ProcedureReturn -1
+  EndIf
+  If PeekL(buffer + 8) <> $30002 Or PeekL(buffer + 12) <> 8 Or (PeekL(buffer + 16) & $FFFFFFFF) <> $80000008 Or PeekL(buffer + 20) <> id
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn PeekL(buffer + 24) & $FFFFFFFF
+EndProcedure

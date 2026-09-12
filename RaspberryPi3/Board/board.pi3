@@ -1,0 +1,135 @@
+; Experimental cold entry: not a complete monitor and not deployed.
+; Firmware must reserve [0x80000,0x200000) for this image + stack before entry.
+; Compile -t pi3 --load-addr 0x80000 --stack-addr 0x200000 (normal startup).
+; Build gate must prove image+BSS below 0x1F0000. Stack reserves 64 KiB.
+#ANVIL_BUILD = 4 ; pmf:build
+#ANVIL_BUILD_DATE = 20260911 ; pmf:builddate
+#ANVIL_BUILD_TIME = 202713 ; pmf:buildtime
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/uart.pbi"
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+XIncludeFile "RaspberryPi3/Lib/framebuffer.pbi"
+Global pi3_dtb.i
+Global pi3_dtb_end.i
+Global pi3_ram_base.i
+Global pi3_ram_end.i
+Global pi3_boot_status.i
+Global Dim pi3_build_text.a[32]
+
+Procedure Pi3Park()
+  ASM
+    msr daifset, #15
+pi3_cold_park:
+    wfe
+    b pi3_cold_park
+  EndASM
+EndProcedure
+
+Procedure.i Pi3Say(text.i)
+  Protected n.i
+  Protected value.i
+  Pi3FbLine(text)
+  For n = 0 To 255
+    value = PeekA(text + n)
+    If value = 0
+      If Pi3UartWrite(13) = 0 : ProcedureReturn 0 : EndIf
+      ProcedureReturn Pi3UartWrite(10)
+    EndIf
+    If Pi3UartWrite(value) = 0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3ReadBe32(address.i)
+  ProcedureReturn (PeekA(address) << 24) | (PeekA(address + 1) << 16) | (PeekA(address + 2) << 8) | PeekA(address + 3)
+EndProcedure
+
+Procedure Pi3PrintBuild()
+  Protected value.i
+  Protected index.i
+  Protected quotient.i
+  value=#ANVIL_BUILD : index=30
+  pi3_build_text[31]=0
+  Repeat
+    quotient=value/10
+    pi3_build_text[index]=48+value-quotient*10
+    index=index-1 : value=quotient
+  Until value=0
+  pi3_build_text[index]=32 : index=index-1
+  pi3_build_text[index]=100 : index=index-1
+  pi3_build_text[index]=108 : index=index-1
+  pi3_build_text[index]=105 : index=index-1
+  pi3_build_text[index]=117 : index=index-1
+  pi3_build_text[index]=66
+  Pi3Say(@pi3_build_text[index])
+EndProcedure
+
+Procedure.i Pi3BootMemory()
+  Protected buffer.i
+  Protected size.i
+  Protected total.i
+  If pi3_mailbox_outstanding <> 0 : ProcedureReturn 0 : EndIf
+  buffer = ((@pi3_property[0] + 15) >> 4) << 4
+  PokeL(buffer,32) : PokeL(buffer + 4,0)
+  PokeL(buffer + 8,$10005) : PokeL(buffer + 12,8)
+  PokeL(buffer + 16,0) : PokeL(buffer + 20,0)
+  PokeL(buffer + 24,0) : PokeL(buffer + 28,0)
+  If Pi3MailboxCall(buffer,32) = 0 : ProcedureReturn 0 : EndIf
+  If PeekL(buffer + 8) <> $10005 Or PeekL(buffer + 12) <> 8 Or (PeekL(buffer + 16) & $FFFFFFFF) <> $80000008
+    ProcedureReturn 0
+  EndIf
+  pi3_ram_base = PeekL(buffer + 20) & $FFFFFFFF
+  size = PeekL(buffer + 24) & $FFFFFFFF
+  If pi3_ram_base > $80000 Or size < $200000 Or size > $3F000000
+    ProcedureReturn 0
+  EndIf
+  pi3_ram_end = pi3_ram_base + size
+  If pi3_ram_end < $200000 Or pi3_ram_end > $3F000000 : ProcedureReturn 0 : EndIf
+  ; Do not dereference a firmware pointer until its minimum header is in RAM.
+  If pi3_dtb < $1000 Or pi3_dtb < pi3_ram_base Or pi3_dtb > pi3_ram_end - 40 Or (pi3_dtb & 7) <> 0
+    ProcedureReturn 0
+  EndIf
+  If pi3_dtb >= $80000 And pi3_dtb < $200000 : ProcedureReturn 0 : EndIf
+  If Pi3ReadBe32(pi3_dtb) <> $D00DFEED : ProcedureReturn 0 : EndIf
+  total = Pi3ReadBe32(pi3_dtb + 4)
+  If total < 40 Or total > 1048576 Or total > pi3_ram_end - pi3_dtb
+    ProcedureReturn 0
+  EndIf
+  pi3_dtb_end = pi3_dtb + total
+  If pi3_dtb < $200000 And pi3_dtb_end > $80000 : ProcedureReturn 0 : EndIf
+  ; All RAM remains unallocated. Preserve the entire DTB including reservations.
+  ; This validates its outer span only, not its nodes or reserve-map contents.
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Main()
+  Protected clock.i
+  ASM
+    adrp x1, global_pi3_dtb
+    add x1, x1, #:lo12:global_pi3_dtb
+    str x0, [x1]
+  EndASM
+  pi3_boot_status = 1
+  If Pi3MailboxContext() = 0 : Pi3Park() : EndIf
+  ; No MMU changes and no speculative memory allocation at this entry.
+  clock = Pi3ClockRate(2)
+  If Pi3UartInit(clock,115200) = 0 : pi3_boot_status = -2 : Pi3Park() : EndIf
+  If Pi3Say("Anvil Pi3 experimental cold entry: UART ready") = 0 : pi3_boot_status = -3 : Pi3Park() : EndIf
+  If Pi3BootMemory() = 0
+    pi3_boot_status = -4
+    Pi3Say("STOP: ARM RAM or DTB reservation check failed")
+    Pi3Park()
+  EndIf
+  pi3_boot_status = 2
+  If Pi3FbInit(pi3_dtb,pi3_dtb_end)=0
+    Pi3Say("Framebuffer refused; preserving UART diagnostics")
+  Else
+    Pi3FbLine("Anvil Pi3 experimental cold entry")
+    Pi3PrintBuild()
+    Pi3Say("Framebuffer ready: CPU rendering, no acceleration")
+  EndIf
+  Pi3Say("ARM RAM verified; DTB preserved; timer active")
+  Pi3Say("No scheduler/network/storage enabled. Parked safely.")
+  Pi3Park()
+EndProcedure

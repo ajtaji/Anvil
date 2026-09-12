@@ -742,9 +742,11 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Board/hw_touch.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_touch.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Board/hw_usb.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/interrupt_timer.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Board/memmap.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Board/memmap.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Board/memmap.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Board/memmap.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Board/power.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Board/screen_cmd.pi4` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Board/screen_geom.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
