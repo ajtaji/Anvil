@@ -134,7 +134,24 @@ The shared existing build-count mechanism increments source after successful
 compilation: this fourth image contains build constant 3; source marker is 4.
 Use the image hash/ledger together, not an inferred next build constant.
 
-## Primary references
+## Reproducible boot-card candidate (2026-09-12)
+
+`RaspberryPi3/Boot/config.txt` and `README.txt` define the isolated experimental
+card layout. `firmware.json` pins official firmware commit
+`ae2a7dc5330b7ea2c7107e5c4cb6b2691355bb9c` and all six firmware/license file
+SHA256 values. `tools/pi3_boot_stage.py` validates supplied files read-only by
+default; an explicit new output directory stages verified copies. It neither
+chooses nor formats a disk, overwrites an existing directory, nor invokes a compiler.
+
+Latest candidate contains build 4, from source HEAD `3669c2c`: 23,012 bytes,
+SHA256 `d236518bf333f7aae2a9e51b8fe484ff0c40242c613bc771b92c3fb9fe631769`.
+Supervisor reports seven emitted cold-start cases / 11,608,809 instructions plus
+61 instructions for repeat-init refusal passed. Config SHA256 on the staged card:
+`709af22d957543038255bac7621364e028e924e45380fad00e48cb9dadddb7c5`.
+The earlier build-3 image above remains historical. Card-file verification is
+not hardware boot acceptance. The broader monitor/services remain unfinished.
+
+## Primary references (links)
 
 - [Raspberry Pi processor documentation](https://www.raspberrypi.com/documentation/computers/processors.html)
 - [Firmware property protocol](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface)
