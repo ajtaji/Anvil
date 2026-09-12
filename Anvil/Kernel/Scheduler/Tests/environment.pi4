@@ -1,0 +1,13 @@
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/cooperative_a64.pbi"
+Procedure.i Main()
+  If ScConfigure($400000, $200000) = 0 : ProcedureReturn 0 : EndIf
+  ; Test-only mailbox asks the interpreter to change observed core/FP state.
+  PokeI($6000100, 1)
+  If ScValidEnvironment() <> 0 : ProcedureReturn 11 : EndIf
+  PokeI($6000100, 2)
+  If ScValidEnvironment() <> 0 : ProcedureReturn 12 : EndIf
+  PokeI($6000100, 3)
+  If ScValidEnvironment() <> 1 : ProcedureReturn 13 : EndIf
+  ProcedureReturn 1
+EndProcedure

@@ -1,7 +1,8 @@
 # Portable application scheduling
 
-Status: task lifecycle and bounded queues implemented; **no executing
-multitasking, preemption, timer binding or board acceptance yet**. This is a
+Status: task lifecycle and bounded queues implemented; native A64 cooperative
+contexts now execute under the emitted-code gate. **No preemption, timer
+binding or board acceptance yet**. This is a
 foundation for running a native forum alongside other Anvil applications,
 not a claim that the existing monitor can already do so.
 
@@ -71,6 +72,57 @@ single-core preemptive implementation.
 
 ## Architecture backend contract still to implement
 
+### Cooperative A64 backend
+
+`cooperative_a64.pbi` now supplies real stackful execution, not repeated
+callbacks pretending to resume a procedure. It is initially **EL3 only**, on
+one bound core, with FP/SIMD access already enabled in CPTR_EL3. It refuses
+EL1/EL2 because permission at a higher exception level cannot be proved from
+there without a trusted handoff contract. It is privileged code and must never
+be called from EL0. Pi 3's EL2 boot is therefore not integrated with this backend.
+
+Call `ScConfigure(codebase,codesize)` once with the mapped executable interval,
+then `ScCreate(entry,argument)`. Entry is an aligned address in that interval
+of a parameterless integer-returning procedure; `ScArgument()` retrieves its
+argument. The range admission is not executable-page validation or proof that
+an arbitrary instruction address is a procedure. Composition owns that trust.
+Each task has a fixed 16 KiB private stack and generation-bound saved context.
+
+`ScRunOne()` dispatches one READY context and returns its handle only after it
+yields, waits or finishes. `ScYield()` and `ScWait(key,deadline)` resume at their
+original call site and return 1; invalid calls return 0. Existing Wake/Advance
+make waiting tasks ready. Entry return records `ScResult(handle)` and finishes
+the task. `ScReap(handle)` releases terminal ownership and clears context and
+stack from the kernel stack, never from the stack being released. Application
+resource cleanup must precede reaping; this does not run arbitrary destructors
+for a cancelled task. Do not mix independent SchedCreate/dispatch calls with
+this backend's context ownership.
+
+Both stack ends carry canaries; saved SP is checked for alignment and bounds
+before resume and after suspension. Failure marks a terminal/cancelled task
+with result -1. This detects damage at safe points, not memory isolation or a
+guarantee against a task overflowing through a canary between checks.
+
+The switch stores x18-x30, SP, every 128-bit SIMD register, FPCR/FPSR and DAIF.
+Public calls retain the normal AAPCS64 caller-clobber rules: x0-x17 and NZCV
+cannot carry live values across Yield/Wait, and callers must not infer extra
+public preservation guarantees from the wider internal save. Return values
+arrive in x0. This follows the register/stack constraints in
+[Arm AAPCS64](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst).
+No SVE/SME, address-space, exception-level or thread-pointer switch is supplied.
+
+Focused gate:
+
+```text
+python tools/scheduler_context_check.py --compiler <PureMetalForge executable>
+```
+
+It executes two instances of one procedure with independent persistent locals,
+FIFO yield, event and timeout waits, actual return/cleanup, stale handles and
+stack-canary failure. A naked ABI witness checks callee GPRs and SIMD values
+across Yield. Environment refusal and FP state cases are separate from physical
+hardware proof. The cooperative backend is not wired into boot or IRQ handling.
+
 Common policy must not write target-specific saved registers. A backend owns:
 
 1. Task context allocation, aligned private stacks, guard/canary checking,
@@ -99,7 +151,7 @@ does not establish whole-language preemption safety.
 
 1. **Lifecycle foundation (implemented):** generation validation, capacity,
    FIFO rotation/wake order, deadlines, terminal cleanup and refusals.
-2. **Real cooperative contexts:** distinct stacks and persistent locals;
+2. **Real cooperative contexts (A64 EL3 desk implementation):** distinct stacks and persistent locals;
    two actual applications yield/wait/resume without losing state. This is
    useful bring-up, but an application that never yields can still starve all
    others, so it is not sufficient for the requested forum deployment.
@@ -125,6 +177,7 @@ It compiles an isolated fixture through the unified compiler and executes
 the actual emitted lifecycle procedures under the A64 interpreter. The fixture
 asserts capacity/refusal, generation reuse, stale cancellation, ready FIFO,
 wait FIFO, timeout boundaries, backward-time rejection and terminal reaping.
-It is not a monitor build and touches no board. Hardware, context switching,
-interrupt races, stack isolation, compiler runtime reentrancy and preemptive
-fairness remain explicitly unproven.
+It is not a monitor build and touches no board. The separate context gate
+proves cooperative continuations in emitted instructions. Hardware, interrupt
+races, memory isolation, whole-runtime reentrancy and preemptive fairness
+remain explicitly unproven.
