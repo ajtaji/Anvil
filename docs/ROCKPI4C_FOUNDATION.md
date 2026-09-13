@@ -2,8 +2,13 @@
 
 Status: build 39 reached MiniDP first light on hardware on September 13, 2026.
 The physical monitor displayed the framebuffer. Build 44 subsequently read
-1920x1080 at 148.5 MHz as the attached monitor's preferred timing and reached
-valid video without fallback. Final visual fit is awaiting confirmation.
+1920x1080 at 148.5 MHz and reached transmitter-valid status, but the physical
+picture rolled and corrupted. That is a failed preferred-mode test, not proof
+of a correct display. Its fixed RGB1280 line-buffer mode was incompatible with
+1920-pixel scanout. The correction selects RGB1920X5 through width 1920 and
+RGB2560X4 above it, matching the reference driver's RGB selection rule.
+Raw EDID and final programmed clock/timing registers are now logged to make
+the next board run independently checkable. Visual proof remains pending.
 
 ## Identity and ownership
 

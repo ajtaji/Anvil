@@ -1,8 +1,9 @@
 # ROCK Pi 4C v1.2
 
-Status: **MiniDP first light confirmed on hardware in build 39**. Build 44
-selected the monitor's preferred 1920x1080 timing at 148.5 MHz and reached
-valid video without fallback; final visual fit is awaiting confirmation.
+Status: **MiniDP first light confirmed on hardware in build 39 at 1024x768**.
+Build 44 selected preferred 1920x1080 at 148.5 MHz but the physical picture
+rolled and corrupted. Its fixed 1280-pixel line-buffer setting was wrong for
+that width; the width-dependent correction awaits a fresh visual test.
 
 `Board/board.rockpi4c` is the first runnable composition root. It has an
 explicit RK3399 compiler target, an arm64 U-Boot `Image` wrapper, bounded

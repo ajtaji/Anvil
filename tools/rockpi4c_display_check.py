@@ -491,6 +491,16 @@ def source_contract() -> None:
     require("procedure.i rockvopframebuffer()" in vop and
             "& $fffffffffffffff0" in vop,
             "framebuffer base is not derived at its required 16-byte alignment")
+    line_buffer = vop.split("procedure.i rockvoplinebuffermode(width.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("width < 1 or width > #rock_vop_max_width",
+                  "if width > 1920 : procedurereturn #vop_lb_rgb_2560x4",
+                  "procedurereturn #vop_lb_rgb_1920x5"):
+        require(token in line_buffer,
+                f"pinned VOP line-buffer selection drifted: {token}")
+    require("procedurereturn 5" not in line_buffer,
+            "obsolete RGB1280 line-buffer mode remains selectable")
     vop_valid = vop.split("procedure.i rockvopmodevalid()", 1)[1].split(
         "endprocedure", 1
     )[0]
@@ -501,6 +511,13 @@ def source_contract() -> None:
     vop_up = vop.split("procedure.i rockvopupmode()", 1)[1].split(
         "endprocedure", 1
     )[0]
+    line_buffer_order = ["rockvopmodevalid()",
+                         "linebuffermode=rockvoplinebuffermode(rock_mode_width)",
+                         "if linebuffermode < 0", "rockcruvoprelease()",
+                         "rockvopwrite(#vop_win0_ctrl0,#vop_win_enable | (linebuffermode << #vop_win_lb_mode_shift))"]
+    positions = [vop_up.index(token) for token in line_buffer_order]
+    require(positions == sorted(positions),
+            "WIN0 line-buffer admission/programming moved after hardware release")
     for timing in (
         "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
         "rockvopwrite(#vop_hact,hactiveend | (hactivestart << 16))",
@@ -515,6 +532,25 @@ def source_contract() -> None:
                   "if rock_mode_vsync_positive <> 0 : pinpolarity=pinpolarity | 2",
                   "rockvopfield(#vop_dsp_ctrl1,$000f0000,pinpolarity << 16)"):
         require(token in vop_up, f"dynamic VOP polarity drifted: {token}")
+
+    # RockCruVpllMode is the final DCLK owner. Trace its complete downstream
+    # source path rather than merely validating isolated PLL arithmetic.
+    post_selected_clock = display_up.split("if rockcruvpllmode()=0", 1)[1]
+    for forbidden in ("rockcruvpll65", "rockcrudisplayclocks", "rockcruvpllset",
+                      "rockcrufield", "rockcrugate"):
+        require(forbidden not in post_selected_clock,
+                f"post-selection display path can overwrite DCLK: {forbidden}")
+    vop_release = cru.split("procedure.i rockcruvoprelease()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require(vop_release.count("rockcrureset(") == 2 and
+            "rockcrureset(275,0)" in vop_release and
+            "rockcrureset(279,0)" in vop_release,
+            "VOP release gained a non-reset clock-side effect")
+    for forbidden in ("rockcrufield", "rockcrugate", "rockcruvpll",
+                      "#rock_cru_clksel", "rockcruwrite"):
+        require(forbidden not in vop_release,
+                f"VOP reset release can overwrite selected DCLK: {forbidden}")
     cdn = libraries["cdn_dp.pbi"].lower()
     video_mode = cdn.split("procedure.i rockcdnvideomode()", 1)[1].split(
         "endprocedure", 1
@@ -854,6 +890,21 @@ def arithmetic_contract() -> None:
 
 
 def mode_arithmetic_contract() -> None:
+    def win0_control(width: int) -> int | None:
+        if width < 1 or width > 2560:
+            return None
+        line_buffer_mode = 3 if width > 1920 else 4
+        return 1 | (line_buffer_mode << 5)
+
+    expected_win0 = {0: None, 1280: 0x81, 1920: 0x81,
+                     1921: 0x61, 2560: 0x61, 2561: None}
+    for width, expected_control in expected_win0.items():
+        require(win0_control(width) == expected_control,
+                f"WIN0 line-buffer control drifted at width {width}: "
+                f"{win0_control(width)}")
+    require(win0_control(1920) != 0xA1,
+            "preferred 1080p retained the obsolete RGB1280 line-buffer control")
+
     preferred_dtd = detailed_timing(
         1920, 1080, 148500, 280, 88, 44, 45, 4, 5,
         hsync_positive=True, vsync_positive=True,
@@ -1134,6 +1185,49 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
             f"{result}, {values}")
 
 
+def emitted_line_buffer_contract(image: Path, symbols: dict[str, int]) -> None:
+    """Execute the production line-buffer selector from the full image."""
+    load = 0x02000040
+    returned = 0x06000000
+    procedure = symbols.get("rockvoplinebuffermode")
+    require(procedure is not None,
+            "full image omitted RockVopLineBufferMode")
+    spec = importlib.util.spec_from_file_location(
+        "rockpi4c_line_buffer_a64", ROOT / "tools/a64/a64_interp.py")
+    require(spec is not None and spec.loader is not None,
+            "cannot load the repository A64 interpreter")
+    a64 = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = a64
+    spec.loader.exec_module(a64)
+    blob = image.read_bytes()
+
+    def selected(width: int) -> int:
+        cpu = a64.A64()
+        for offset, byte in enumerate(blob):
+            cpu.memory[load + offset] = byte
+        a64.attach_symbols(cpu, image, load)
+        cpu.pc = load + procedure
+        cpu.sp = 0x05000000
+        cpu.x[0] = width & ((1 << 64) - 1)
+        cpu.x[30] = returned
+        for _ in range(10_000):
+            if cpu.pc == returned:
+                value = cpu.x[0]
+                return value - (1 << 64) if value & (1 << 63) else value
+            cpu.step()
+        raise AssertionError("emitted RockVopLineBufferMode did not return")
+
+    expected = {0: -1, 1280: 4, 1920: 4, 1921: 3, 2560: 3, 2561: -1}
+    for width, mode in expected.items():
+        actual = selected(width)
+        require(actual == mode,
+                f"emitted line-buffer mode drifted at {width}: {actual}, expected {mode}")
+        if mode >= 0:
+            control = 1 | (actual << 5)
+            require(control == (0x81 if width <= 1920 else 0x61),
+                    f"emitted WIN0 control is wrong at {width}: {control:#x}")
+
+
 def compiler_contract(compiler: Path) -> tuple[int, str]:
     with tempfile.TemporaryDirectory(prefix="anvil-rockpi4c-display-") as temp_name:
         emitted_mode_contract(compiler, Path(temp_name))
@@ -1280,6 +1374,8 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                 "64-bit load emitted at a display MMIO base")
         symbols = Path(str(output) + ".sym").read_text(encoding="utf-8")
         values = dict(re.findall(r"^([A-Za-z0-9_]+)=([0-9]+)$", symbols, re.M))
+        emitted_line_buffer_contract(
+            output, {name.lower(): int(value) for name, value in values.items()})
         metadata = Path(str(output) + ".sym.meta").read_text(encoding="utf-8")
         sizes = {name: int(size) for name, size in
                  re.findall(r"^([^|]+)\|([0-9]+)\|", metadata, re.M)}

@@ -82,6 +82,42 @@ Procedure RockDisplayHexLong(value.i)
   RockDisplayHexWord(value & $FFFF)
 EndProcedure
 
+Procedure RockDisplayEdidTelemetry()
+  Protected offset.i
+  If rock_uart_ready = 0 : ProcedureReturn 0 : EndIf
+  For offset=0 To 127
+    If (offset & 15)=0
+      RockUartText("EDID ")
+      RockDisplayHexByte(offset)
+      RockUartText(": ")
+    EndIf
+    RockDisplayHexByte(PeekA(@rock_cdn_edid[0]+offset) & 255)
+    If (offset & 15)=15
+      RockUartByte(13) : RockUartByte(10)
+    Else
+      RockUartByte(32)
+    EndIf
+  Next
+EndProcedure
+
+Procedure RockDisplayScanoutTelemetry()
+  If rock_uart_ready = 0 : ProcedureReturn 0 : EndIf
+  RockUartText("SCAN VPLL ")
+  RockDisplayHexLong(RockCruRead($C0)) : RockUartByte(32)
+  RockDisplayHexLong(RockCruRead($C4)) : RockUartByte(32)
+  RockDisplayHexLong(RockCruRead($C8)) : RockUartByte(32)
+  RockDisplayHexLong(RockCruRead($CC))
+  RockUartText(" DCLK ")
+  RockDisplayHexLong(RockCruRead(#ROCK_CRU_CLKSEL+$C8))
+  RockUartText(" WIN0 ")
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_CTRL0))
+  RockUartText(" HTOTAL ")
+  RockDisplayHexLong(RockVopRead(#VOP_HTOTAL))
+  RockUartText(" VTOTAL ")
+  RockDisplayHexLong(RockVopRead(#VOP_VTOTAL))
+  RockUartByte(13) : RockUartByte(10)
+EndProcedure
+
 Procedure RockDisplaySubsystemTelemetry(text.i, error.i)
   If rock_uart_ready <> 0
     RockUartText(text)
@@ -328,10 +364,12 @@ Procedure.i RockDisplayUp()
   If RockCdnReadEdid()=0
     RockDisplaySubsystemTelemetry("DPE9 CDN ERR ",rock_cdn_error)
     If rock_cdn_error = 30
+      RockDisplayEdidTelemetry()
       RockDisplaySubsystemTelemetry("DPE9 MODE REJECTION REASON ",rock_mode_reason)
     EndIf
     ProcedureReturn RockDisplayFail(9,"DPE9 INVALID EDID OR NO SUPPORTED MODE")
   EndIf
+  RockDisplayEdidTelemetry()
   RockDisplayModeTelemetry("DP05 EDID MODE ")
   If RockCdnTrain()=0
     RockDisplaySubsystemTelemetry("DPEB CDN ERR ",rock_cdn_error)
@@ -365,6 +403,7 @@ Procedure.i RockDisplayUp()
     ProcedureReturn RockDisplayFail(10,"DPEA VOPL FRAMEBUFFER")
   EndIf
   RockDisplayStage("DP06 COLOR BARS AND TEXT ARMED")
+  RockDisplayScanoutTelemetry()
   If RockCdnVideoStatus(1)=0
     RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")

@@ -12,6 +12,12 @@
 #ROCK_FB_MAX_BYTES = #ROCK_FB_MAX_WORDS*4
 #ROCK_FB_ALIGNMENT = 16
 
+; WIN0_CTRL0 line-buffer modes used by the pinned Rockchip RGB helper.
+#VOP_WIN_ENABLE = 1
+#VOP_WIN_LB_MODE_SHIFT = 5
+#VOP_LB_RGB_2560X4 = 3
+#VOP_LB_RGB_1920X5 = 4
+
 #VOP_CFG_DONE = $000
 #VOP_SYS_CTRL = $008
 #VOP_DSP_CTRL0 = $010
@@ -51,6 +57,15 @@ EndProcedure
 Procedure RockVopField(offset.i, mask.i, value.i)
   Protected prior.i = RockVopRead(offset)
   RockVopWrite(offset,(prior & ~mask) | (value & mask))
+EndProcedure
+
+Procedure.i RockVopLineBufferMode(width.i)
+  ; The old fixed $A1 selected LB_RGB_1280X8 and was valid only for the
+  ; proven 1024-pixel milestone. Match scl_vop_cal_lb_mode() exactly for the
+  ; unscaled RGB modes that fit RK3399's little-VOP output limit.
+  If width < 1 Or width > #ROCK_VOP_MAX_WIDTH : ProcedureReturn -1 : EndIf
+  If width > 1920 : ProcedureReturn #VOP_LB_RGB_2560X4 : EndIf
+  ProcedureReturn #VOP_LB_RGB_1920X5
 EndProcedure
 
 Procedure.i RockVopGlyphRow(character.i, row.i)
@@ -223,6 +238,7 @@ EndProcedure
 Procedure.i RockVopUpMode()
   Protected value.i
   Protected pinPolarity.i
+  Protected lineBufferMode.i
   Protected hsyncLength.i
   Protected vsyncLength.i
   Protected hactiveStart.i
@@ -232,6 +248,8 @@ Procedure.i RockVopUpMode()
   rock_vop_ready=0
   rock_vop_error=0
   If RockVopModeValid()=0 : ProcedureReturn 0 : EndIf
+  lineBufferMode=RockVopLineBufferMode(rock_mode_width)
+  If lineBufferMode < 0 : rock_vop_error=80 : ProcedureReturn 0 : EndIf
   hsyncLength=rock_mode_hsync_end-rock_mode_hsync_start
   vsyncLength=rock_mode_vsync_end-rock_mode_vsync_start
   hactiveStart=rock_mode_htotal-rock_mode_hsync_start
@@ -267,7 +285,7 @@ Procedure.i RockVopUpMode()
   RockVopWrite(#VOP_WIN0_DSP_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
   RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
   RockVopWrite(#VOP_WIN0_VIR,rock_mode_pitch >> 2)
-  RockVopWrite(#VOP_WIN0_CTRL0,$A1)
+  RockVopWrite(#VOP_WIN0_CTRL0,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)
   ; Latch the new pixel clock into the VOP only after every timing register and
