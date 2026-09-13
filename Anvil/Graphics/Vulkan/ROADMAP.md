@@ -92,9 +92,10 @@ per-image layout and queue-family ownership for the one image shape above.
 Everything below remains missing.
 
 - Enumerated heaps/types and exact `VkMemoryRequirements`; allocate/free,
-  suballocation, bind, map/unmap, flush/invalidate mapped ranges, coherent vs.
-  non-coherent behavior, aliasing, dedicated allocations, and device-address
-  lifetime. Sparse memory is unsupported until explicitly implemented.
+  suballocation, bind and one checked host mapping are implemented for the
+  bounded heap. Flush/invalidate entry points for a future non-coherent type,
+  aliasing, dedicated allocations, and device-address lifetime remain. Sparse
+  memory is unsupported until explicitly implemented.
 - Buffers and buffer views with bounds, usage, sharing mode, queue-family
   ownership, and texel formats.
 - Images with all core dimensionalities, mip/layer planes, tilings, row/slice

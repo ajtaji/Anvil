@@ -86,6 +86,66 @@ MUTANTS = (
         "  avkImgSize[s] = width * 4 * height\n",
     ),
     (
+        "vkMapMemory accepts a memory type that is not HOST_VISIBLE",
+        "vk_memory.pbi",
+        "  If (avkBackendMemoryTypeFlags(avkMemType[s]) & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) = 0\n",
+        "  If (avkBackendMemoryTypeFlags(avkMemType[s]) & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) = -1\n",
+    ),
+    (
+        "vkMapMemory accepts a second active mapping",
+        "vk_memory.pbi",
+        "  If avkMemMapped[s] <> 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, \"vkMapMemory was called on an allocation that is already host mapped",
+        "  If avkMemMapped[s] < 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, \"vkMapMemory was called on an allocation that is already host mapped",
+    ),
+    (
+        "vkMapMemory ignores the allocation's owning device",
+        "vk_memory.pbi",
+        "  If avkMemDev[s] <> d\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, \"vkMapMemory was called through a device",
+        "  If avkMemDev[s] < 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, \"vkMapMemory was called through a device",
+    ),
+    (
+        "vkMapMemory accepts non-zero core map flags",
+        "vk_memory.pbi",
+        "  If flags <> 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkMapMemory was given non-zero",
+        "  If flags < 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkMapMemory was given non-zero",
+    ),
+    (
+        "vkMapMemory accepts an offset equal to allocation size",
+        "vk_memory.pbi",
+        "  If offset < 0 Or offset >= avkMemSize[s]\n",
+        "  If offset < 0 Or offset > avkMemSize[s]\n",
+    ),
+    (
+        "vkMapMemory accepts a range past the allocation end",
+        "vk_memory.pbi",
+        "    If size <= 0 Or size > (avkMemSize[s] - offset)\n",
+        "    If size <= 0\n",
+    ),
+    (
+        "vkMapMemory returns the allocation base instead of the requested offset",
+        "vk_memory.pbi",
+        "  PokeI(*out, avkHeapBase + avkMemOffset[s] + offset)\n",
+        "  PokeI(*out, avkHeapBase + avkMemOffset[s])\n",
+    ),
+    (
+        "vkUnmapMemory leaves the allocation mapped",
+        "vk_memory.pbi",
+        "  avkMemMapped[s] = 0\n  avkMemMapOffset[s] = 0\n  avkMemMapSize[s] = 0\nEndProcedure\n\n; vkFreeMemory",
+        "  avkMemMapped[s] = 1\n  avkMemMapOffset[s] = 0\n  avkMemMapSize[s] = 0\nEndProcedure\n\n; vkFreeMemory",
+    ),
+    (
+        "vkFreeMemory releases an allocation while it is mapped",
+        "vk_memory.pbi",
+        "  If avkMemMapped[s] <> 0\n    avkFault(#ANVIL_VK_ERR_STATE, \"vkFreeMemory was called while the allocation is host mapped",
+        "  If avkMemMapped[s] < 0\n    avkFault(#ANVIL_VK_ERR_STATE, \"vkFreeMemory was called while the allocation is host mapped",
+    ),
+    (
+        "the public vkMapMemory adapter discards the caller's offset",
+        "vk_api.pbi",
+        "  ProcedureReturn AnvilVkMemoryMap(device, memory, offset, size, flags, *ppData)\n",
+        "  ProcedureReturn AnvilVkMemoryMap(device, memory, 0, size, flags, *ppData)\n",
+    ),
+    (
         "bind accepts an offset that is not a multiple of the alignment",
         "vk_memory.pbi",
         "  If (avkImgAlign[s] < 1) Or ((memoryOffset % avkImgAlign[s]) <> 0)\n",
@@ -270,6 +330,19 @@ MUTANTS = (
 FENCE_UNLIMITED_MUTANTS = frozenset({
     "an unsignalled UINT64_MAX wait falls through to a bounded timeout",
     "an already-signalled UINT64_MAX wait is refused",
+})
+
+MAP_MEMORY_MUTANTS = frozenset({
+    "vkMapMemory accepts a memory type that is not HOST_VISIBLE",
+    "vkMapMemory accepts a second active mapping",
+    "vkMapMemory ignores the allocation's owning device",
+    "vkMapMemory accepts non-zero core map flags",
+    "vkMapMemory accepts an offset equal to allocation size",
+    "vkMapMemory accepts a range past the allocation end",
+    "vkMapMemory returns the allocation base instead of the requested offset",
+    "vkUnmapMemory leaves the allocation mapped",
+    "vkFreeMemory releases an allocation while it is mapped",
+    "the public vkMapMemory adapter discards the caller's offset",
 })
 
 
@@ -492,7 +565,7 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    parser.add_argument("--mutate-only", choices=("fence-unlimited",))
+    parser.add_argument("--mutate-only", choices=("fence-unlimited", "map-memory"))
     args = parser.parse_args()
     if args.mutate_only:
         args.mutate = True
@@ -514,8 +587,9 @@ def main() -> int:
     print(f"vulkan_resource_check: PASS - {g.checks} independent property checks over "
           f"{steps:,} executed A64 instructions")
     print("  the real vkCreateImage, vkGetImageMemoryRequirements, vkAllocateMemory,")
-    print("  vkBindImageMemory, vkCmdPipelineBarrierArgs, vkCmdClearColorImage, vkQueueSubmit,")
-    print("  vkCreateFence, vkGetFenceStatus, vkWaitForFences, vkResetFences and")
+    print("  vkBindImageMemory, vkMapMemory, vkUnmapMemory, vkCmdPipelineBarrierArgs,")
+    print("  vkCmdClearColorImage, vkQueueSubmit, vkCreateFence, vkGetFenceStatus,")
+    print("  vkWaitForFences, vkResetFences and")
     print("  vkDeviceWaitIdle ran; no MMIO, framebuffer, GPU or DMA was touched")
     print("  every byte of the bound image still held its poison: no CPU clear exists")
 
@@ -527,6 +601,8 @@ def main() -> int:
     missed = 0
     for name, where, fixed, broken in MUTANTS:
         if args.mutate_only == "fence-unlimited" and name not in FENCE_UNLIMITED_MUTANTS:
+            continue
+        if args.mutate_only == "map-memory" and name not in MAP_MEMORY_MUTANTS:
             continue
         text = originals.get(where)
         if text is None or text.count(fixed) != 1:
@@ -552,7 +628,12 @@ def main() -> int:
             print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE ({msteps:,} instructions)")
             missed += 1
 
-    total = len(FENCE_UNLIMITED_MUTANTS) if args.mutate_only == "fence-unlimited" else len(MUTANTS)
+    if args.mutate_only == "fence-unlimited":
+        total = len(FENCE_UNLIMITED_MUTANTS)
+    elif args.mutate_only == "map-memory":
+        total = len(MAP_MEMORY_MUTANTS)
+    else:
+        total = len(MUTANTS)
     if missed:
         print(f"\nvulkan_resource_check: {missed} of {total} mutations were not caught")
         return 1

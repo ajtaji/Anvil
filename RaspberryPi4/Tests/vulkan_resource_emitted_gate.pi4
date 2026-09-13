@@ -93,6 +93,7 @@ Procedure.i Main()
   Define inst.i
   Define phys.i
   Define dev.i
+  Define dev2.i
   Define queue.i
   Define pool.i
   Define cmd.i
@@ -110,6 +111,7 @@ Procedure.i Main()
   Define offA.i
   Define offC.i
   Define imgBase.i
+  Define mapped.i
 
   Define ici.VkInstanceCreateInfo
   Define dci.VkDeviceCreateInfo
@@ -284,6 +286,65 @@ Procedure.i Main()
   Vkr(AnvilVkMemoryAddress(mem) = #VKR_HEAP)
   Vkr(AnvilVkMemorySize(mem) = #VKR_IMG_BYTES)
 
+  ; ------------------------------------------------------------------
+  ;  4a. vkMapMemory/vkUnmapMemory: exact range and ownership rules.
+  ; ------------------------------------------------------------------
+  Vkr(vkMapMemory(dev, mem, 16, 64, 0, @mapped) = #VK_SUCCESS)
+  Vkr(mapped = #VKR_HEAP + 16)
+  PokeL(mapped, $12345678)
+  Vkr((PeekL(AnvilVkMemoryAddress(mem) + 16) & $FFFFFFFF) = $12345678)
+  AnvilVkFaultClear()
+  Vkr(vkMapMemory(dev, mem, 0, 16, 0, @mapped) = #ANVIL_VK_ERR_STATE)
+  Vkr(mapped = 0)
+  Sentence()
+  ; A mapped allocation is not silently released.
+  AnvilVkFaultClear()
+  vkFreeMemory(dev, mem, 0)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  Vkr(AnvilVkMemoryAddress(mem) = #VKR_HEAP)
+  Sentence()
+  ; A second real device makes the common-parent rule reachable rather
+  ; than substituting a stale-handle check for it.
+  Vkr(vkCreateDevice(phys, @dci, 0, @dev2) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev2, mem, 0, 16, 0, @mapped) = #ANVIL_VK_ERR_OWNER)
+  Sentence()
+  AnvilVkFaultClear()
+  vkUnmapMemory(dev2, mem)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_OWNER)
+  Sentence()
+  vkDestroyDevice(dev2, 0)
+  vkUnmapMemory(dev, mem)
+  AnvilVkFaultClear()
+  vkUnmapMemory(dev, mem)
+  Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  Sentence()
+
+  mapped = 99
+  Vkr(vkMapMemory(dev, mem, 0, 16, 1, @mapped) = #ANVIL_VK_ERR_ARGS)
+  Vkr(mapped = 0)
+  Sentence()
+  Vkr(vkMapMemory(dev, mem, #VKR_IMG_BYTES, #VK_WHOLE_SIZE, 0, @mapped) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkMapMemory(dev, mem, 0, 0, 0, @mapped) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkMapMemory(dev, mem, #VKR_IMG_BYTES - 8, 16, 0, @mapped) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkMapMemory(dev, mem, 32, #VK_WHOLE_SIZE, 0, @mapped) = #VK_SUCCESS)
+  Vkr(mapped = #VKR_HEAP + 32)
+  vkUnmapMemory(dev, mem)
+
+  ; Type zero exists to make the HOST_VISIBLE rule discriminating.
+  mai\allocationSize = 4096
+  mai\memoryTypeIndex = 0
+  Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, memA, 0, #VK_WHOLE_SIZE, 0, @mapped) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  vkFreeMemory(dev, memA, 0)
+  Vkr(vkMapMemory(dev, memA, 0, 16, 0, @mapped) = #ANVIL_VK_ERR_HANDLE)
+  Sentence()
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 1
+
   ; The heap holds exactly four of these. The fifth is a real
   ; VK_ERROR_OUT_OF_DEVICE_MEMORY, not a silent overlap.
   Vkr(vkAllocateMemory(dev, @mai, 0, @memA) = #VK_SUCCESS)
@@ -339,8 +400,12 @@ Procedure.i Main()
   Vkr(AnvilVkMemoryAddress(mem) = #VKR_HEAP)
   Vkr(AnvilVkImageAddress(img) = #VKR_HEAP)
 
-  imgBase = AnvilVkImageAddress(img)
+  ; Use Vulkan's public mapping path to prepare the host-visible image;
+  ; AnvilVkImageAddress below is retained only as an independent oracle.
+  Vkr(vkMapMemory(dev, mem, 0, #VK_WHOLE_SIZE, 0, @mapped) = #VK_SUCCESS)
+  imgBase = mapped
   Poison(imgBase, #VKR_IMG_BYTES)
+  vkUnmapMemory(dev, mem)
   PokeI(#VKR_OUT + 80, imgBase)
   PokeI(#VKR_OUT + 88, #VKR_IMG_BYTES)
 

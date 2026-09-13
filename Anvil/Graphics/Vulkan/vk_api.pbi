@@ -258,6 +258,14 @@ Procedure vkFreeMemory(device.i, memory.i, *pAllocator)
   AnvilVkMemoryFree(device, memory)
 EndProcedure
 
+Procedure.i vkMapMemory(device.i, memory.i, offset.i, size.i, flags.i, *ppData)
+  ProcedureReturn AnvilVkMemoryMap(device, memory, offset, size, flags, *ppData)
+EndProcedure
+
+Procedure vkUnmapMemory(device.i, memory.i)
+  AnvilVkMemoryUnmap(device, memory)
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  IMAGES
 ; ----------------------------------------------------------------------

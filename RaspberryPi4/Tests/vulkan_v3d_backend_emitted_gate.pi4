@@ -82,13 +82,15 @@ Procedure.i Main()
   Vkb(vkEnumeratePhysicalDevices(#VK_NULL_HANDLE, @count, 0) = #ANVIL_VK_ERR_HANDLE)
 
   ; The heap the backend would offer is the declared window, and nothing
-  ; else. One memory type, device local and host visible, NOT coherent.
+  ; else. One memory type is device local, host visible and host coherent:
+  ; the backend supplies that observable promise through mandatory cache
+  ; maintenance at every submit/completion edge.
   Vkb(avkBackendHeapBase() = $00200000)
   Vkb(avkBackendHeapBytes() = $10000)
   Vkb(avkBackendMemoryTypeCount() = 1)
   Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) <> 0)
   Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) <> 0)
-  Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) = 0)
+  Vkb((avkBackendMemoryTypeFlags(0) & #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) <> 0)
   Vkb(avkBackendHeapCount() = 1)
   Vkb(avkBackendHeapSizeOf(0) = $10000)
   Vkb(avkBackendImageAlignment() = 4096)

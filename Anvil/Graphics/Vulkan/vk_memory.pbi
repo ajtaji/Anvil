@@ -48,6 +48,9 @@ Global Dim avkMemOffset.i[#ANVIL_VK_MAX_MEMORY + 1]
 Global Dim avkMemSize.i[#ANVIL_VK_MAX_MEMORY + 1]
 Global Dim avkMemBinds.i[#ANVIL_VK_MAX_MEMORY + 1]
 Global Dim avkMemInFlight.i[#ANVIL_VK_MAX_MEMORY + 1]
+Global Dim avkMemMapped.a[#ANVIL_VK_MAX_MEMORY + 1]
+Global Dim avkMemMapOffset.i[#ANVIL_VK_MAX_MEMORY + 1]
+Global Dim avkMemMapSize.i[#ANVIL_VK_MAX_MEMORY + 1]
 ; 1 for an allocation this implementation made for itself - a compiled
 ; pipeline's shaders and records. No handle names one; see INTERNAL
 ; ALLOCATIONS below.
@@ -152,10 +155,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  MEMORY TYPES.
 ;
-;  The backend enumerates them; this layer only checks indices and the
-;  memoryTypeBits an image asks for. Every type this slice can expose is
-;  host visible, because the whole point of the first slice is that a
-;  person can read the pixels back and compare them.
+;  The backend enumerates them; this layer checks indices, host visibility
+;  for mapping, and the memoryTypeBits an image asks for. A backend may
+;  expose device-local-only types beside its host-visible ones.
 ; ----------------------------------------------------------------------
 Procedure.i AnvilVkMemoryTypeCount()
   ProcedureReturn avkBackendMemoryTypeCount()
@@ -214,6 +216,10 @@ Procedure.i AnvilVkMemoryAllocate(device.i, size.i, typeIndex.i, *out)
   avkMemSize[s] = size
   avkMemBinds[s] = 0
   avkMemInFlight[s] = 0
+  avkMemMapped[s] = 0
+  avkMemMapOffset[s] = 0
+  avkMemMapSize[s] = 0
+  avkMemInternal[s] = 0
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_DEVICE_MEMORY, s, avkMemGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -253,6 +259,9 @@ Procedure.i avkInternalAlloc(bytes.i)
   avkMemSize[s] = bytes
   avkMemBinds[s] = 0
   avkMemInFlight[s] = 0
+  avkMemMapped[s] = 0
+  avkMemMapOffset[s] = 0
+  avkMemMapSize[s] = 0
   avkMemInternal[s] = 1
   ProcedureReturn s
 EndProcedure
@@ -265,6 +274,7 @@ Procedure avkInternalFree(s.i)
     ProcedureReturn
   EndIf
   avkMemLive[s] = 0
+  avkMemMapped[s] = 0
   avkMemInternal[s] = 0
 EndProcedure
 
@@ -274,11 +284,9 @@ Procedure.i avkInternalBase(s.i)
   ProcedureReturn avkHeapBase + avkMemOffset[s]
 EndProcedure
 
-; The ARM address of an allocation's first byte. This is an Anvil answer,
-; not a Vulkan one: core 1.0's way to reach memory is vkMapMemory, which
-; this slice does not implement. It is here because the heap is already
-; identity mapped and a diagnostic has to be able to read the pixels back
-; without pretending a mapping happened.
+; The ARM address of an allocation's first byte. This remains an internal
+; Anvil diagnostic answer; applications use vkMapMemory so host visibility,
+; range and one-active-mapping rules are checked.
 Procedure.i AnvilVkMemoryAddress(memory.i)
   Define s.i
   s = avkMemSlot(memory)
@@ -292,6 +300,78 @@ Procedure.i AnvilVkMemorySize(memory.i)
   s = avkMemSlot(memory)
   If s = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn avkMemSize[s]
+EndProcedure
+
+; Map one range of one HOST_VISIBLE allocation. The backend heap is already
+; present in the host address space, so mapping allocates no shadow storage:
+; it validates the Vulkan range and returns the identity-mapped address.
+Procedure.i AnvilVkMemoryMap(device.i, memory.i, offset.i, size.i, flags.i, *out)
+  Define d.i
+  Define s.i
+  Define bytes.i
+  If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*out, 0)
+  d = avkDevSlot(device)
+  If d = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkMapMemory was given a VkDevice handle that is not live (Anvil code -20002, stale or foreign device); no host pointer was returned.")
+  EndIf
+  s = avkMemSlot(memory)
+  If s = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkMapMemory was given a VkDeviceMemory handle that is not live (Anvil code -20002, stale or foreign memory); allocate a new memory object before mapping it.")
+  EndIf
+  If avkMemDev[s] <> d
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkMapMemory was called through a device that does not own this allocation (Anvil code -20003, wrong parent); call vkMapMemory through the same VkDevice that allocated it.")
+  EndIf
+  If flags <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkMapMemory was given non-zero VkMemoryMapFlags (Anvil code -20001, invalid flags); core Vulkan 1.0 defines no map flag bits, so pass zero.")
+  EndIf
+  If (avkBackendMemoryTypeFlags(avkMemType[s]) & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkMapMemory was given memory whose type is not HOST_VISIBLE (Anvil code -20001, unmappable memory type); choose a memory type carrying VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT before allocation.")
+  EndIf
+  If avkMemMapped[s] <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkMapMemory was called on an allocation that is already host mapped (Anvil code -20004, duplicate mapping); call vkUnmapMemory before mapping it again.")
+  EndIf
+  If offset < 0 Or offset >= avkMemSize[s]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkMapMemory was given an offset outside the allocation (Anvil code -20001, invalid map offset); offset must be less than the allocation size.")
+  EndIf
+  If size = #VK_WHOLE_SIZE
+    bytes = avkMemSize[s] - offset
+  Else
+    If size <= 0 Or size > (avkMemSize[s] - offset)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkMapMemory was given a zero, negative or out-of-range size (Anvil code -20001, invalid map size); use VK_WHOLE_SIZE or a positive size no greater than allocationSize minus offset.")
+    EndIf
+    bytes = size
+  EndIf
+  If avkHeapReady = 0
+    ProcedureReturn avkFault(#VK_ERROR_MEMORY_MAP_FAILED, "vkMapMemory found that the device heap is no longer available (VkResult -5, VK_ERROR_MEMORY_MAP_FAILED); recreate the device before trying to map this allocation.")
+  EndIf
+  avkMemMapped[s] = 1
+  avkMemMapOffset[s] = offset
+  avkMemMapSize[s] = bytes
+  PokeI(*out, avkHeapBase + avkMemOffset[s] + offset)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure AnvilVkMemoryUnmap(device.i, memory.i)
+  Define d.i
+  Define s.i
+  d = avkDevSlot(device)
+  s = avkMemSlot(memory)
+  If d = 0 Or s = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkUnmapMemory was given a device or memory handle that is not live (Anvil code -20002, stale or foreign handle); no mapping state was changed.")
+    ProcedureReturn
+  EndIf
+  If avkMemDev[s] <> d
+    avkFault(#ANVIL_VK_ERR_OWNER, "vkUnmapMemory was called through a device that does not own this allocation (Anvil code -20003, wrong parent); call vkUnmapMemory through the same VkDevice that allocated it.")
+    ProcedureReturn
+  EndIf
+  If avkMemMapped[s] = 0
+    avkFault(#ANVIL_VK_ERR_STATE, "vkUnmapMemory was called on an allocation that is not host mapped (Anvil code -20004, no active mapping); call vkMapMemory successfully before calling vkUnmapMemory exactly once.")
+    ProcedureReturn
+  EndIf
+  avkMemMapped[s] = 0
+  avkMemMapOffset[s] = 0
+  avkMemMapSize[s] = 0
 EndProcedure
 
 ; vkFreeMemory returns void, so a refusal cannot be a return value. It is
@@ -314,6 +394,10 @@ Procedure AnvilVkMemoryFree(device.i, memory.i)
   EndIf
   If avkMemInFlight[s] <> 0
     avkFault(#ANVIL_VK_ERR_STATE, "vkFreeMemory was called while a submitted command buffer still reads or writes this allocation (Anvil code -20004, resource in use); the allocation was left untouched. Wait on the submission's fence with vkWaitForFences, or call vkDeviceWaitIdle, before freeing.")
+    ProcedureReturn
+  EndIf
+  If avkMemMapped[s] <> 0
+    avkFault(#ANVIL_VK_ERR_STATE, "vkFreeMemory was called while the allocation is host mapped (Anvil code -20004, active mapping); call vkUnmapMemory before freeing it.")
     ProcedureReturn
   EndIf
   If avkMemBinds[s] <> 0

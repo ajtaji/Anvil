@@ -33,6 +33,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 GATE = ROOT / "RaspberryPi4" / "Tests" / "vulkan_v3d_backend_emitted_gate.pi4"
 BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_backend.pi4"
+V3D_CORE = ROOT / "RaspberryPi4" / "Lib" / "v3d.pi4"
 # The board diagnostic is not executed here - it needs the GPU - but it is
 # BUILT, so it cannot rot silently between slots. A diagnostic that no
 # longer compiles is discovered on the bench otherwise, which is the most
@@ -65,6 +66,15 @@ REQUIRED_DESCRIPTOR_CONTRACT = (
 REQUIRED_SAMPLE_MASK_CONTRACT = (
     "If *d\\sampleMask <> 0",
     "V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, *d\\firstVertex)",
+)
+REQUIRED_HOST_COHERENT_BACKEND = (
+    "#VK_MEMORY_PROPERTY_HOST_COHERENT_BIT",
+    "V3dCacheRange(pbase, #AVKQ_BYTES)",
+    "V3dCacheRange(*bind\\base, lastVertex * *bind\\stride)",
+)
+REQUIRED_HOST_COHERENT_COMPLETION = (
+    "v3d_renCleanRc = V3dCleanCaches()",
+    "V3dCacheRange(v3d_rtAddr, v3d_rtBytes)",
 )
 FORBIDDEN_TOKENS = ("PokeN(", "PokeI(", "PokeL(", "PokeA(", "DspCopy", "DmaCopy",
                     "DisplayClear", "DspDmaFill", "DisplayFillRect", "CopyMemory")
@@ -105,6 +115,11 @@ MUTANTS = (
         "sample mask zero still emits a primitive",
         "    If *d\\sampleMask <> 0\n      V3dClGlShaderState",
         "    If *d\\sampleMask >= 0\n      V3dClGlShaderState",
+    ),
+    (
+        "a HOST_COHERENT vertex range reaches the GPU without cache maintenance",
+        "      V3dCacheRange(*bind\\base, lastVertex * *bind\\stride)\n",
+        "      V3dCacheRange(*bind\\base, 0)\n",
     ),
 )
 
@@ -292,6 +307,16 @@ def source_contract(text: str) -> list[str]:
     for snippet in REQUIRED_SAMPLE_MASK_CONTRACT:
         if snippet not in text:
             failures.append("the sample-mask suppression contract lost: " + snippet)
+    for snippet in REQUIRED_HOST_COHERENT_BACKEND:
+        if snippet not in text:
+            failures.append("the HOST_COHERENT submit contract lost: " + snippet)
+    core = V3D_CORE.read_text(encoding="utf-8")
+    start = core.find("Procedure.i V3dRenderWait(us.i)")
+    end = core.find("EndProcedure", start)
+    render_wait = core[start:end] if start >= 0 and end > start else ""
+    for snippet in REQUIRED_HOST_COHERENT_COMPLETION:
+        if snippet not in render_wait:
+            failures.append("the HOST_COHERENT completion contract lost: " + snippet)
     for token in FORBIDDEN_TOKENS:
         if token in text:
             failures.append("the backend holds a processor-side fallback token " + token)
@@ -346,6 +371,7 @@ def main() -> int:
     print("  NOT ONE MMIO ACCESS was made reaching that answer")
     print("  the backend lowers only through NeonRetarget/NeonFrameBegin/NeonFrameEnd and")
     print("  holds no processor-side or DMA image fallback")
+    print("  HOST_COHERENT is backed by required submit and render-completion cache maintenance")
     if diagnostic_built:
         print("  both board diagnostics build at $500000 - vulkanClearProof.pi4 and")
         print("  vulkanClearRefusals.pi4 (not executed: they need the GPU, and that is a slot)")

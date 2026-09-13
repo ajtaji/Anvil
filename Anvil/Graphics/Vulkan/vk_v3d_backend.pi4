@@ -134,17 +134,20 @@ Procedure.i avkBackendHeapBytes()
 EndProcedure
 
 ; The processor and the GPU share DRAM on this part and the window is
-; identity mapped in the V3D page table, so the one memory type is both
-; device local and host visible. It is NOT reported host coherent: the
-; caches are maintained explicitly around a job, which is a real
-; property of this device and not a detail to paper over.
+; identity mapped in the V3D page table. This backend reports HOST_COHERENT
+; because it implements that API promise: every GPU-read pipeline, uniform
+; and vertex range is cleaned before submission, and V3dRenderWait cleans
+; the GPU caches then cleans+invalidates the ARM view of the whole render
+; target before completion is reported. Hardware coherence is not assumed;
+; the mandatory maintenance at the host/device synchronization edges is
+; what supplies the observable coherent behavior.
 Procedure.i avkBackendMemoryTypeCount()
   ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkBackendMemoryTypeFlags(index.i)
   If index <> 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+  ProcedureReturn #VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
 EndProcedure
 
 Procedure.i avkBackendMemoryTypeHeap(index.i)
