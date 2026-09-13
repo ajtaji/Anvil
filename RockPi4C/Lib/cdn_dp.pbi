@@ -90,6 +90,9 @@ Global rock_cdn_dpcd_phase.i
 Global rock_cdn_mailbox_actual_opcode.i
 Global rock_cdn_mailbox_actual_module.i
 Global rock_cdn_mailbox_actual_size.i
+Global rock_cdn_mailbox_actual_size_high.i
+Global rock_cdn_mailbox_actual_size_low.i
+Global rock_cdn_mailbox_header_count.i
 Global rock_cdn_mailbox_expected_opcode.i
 Global rock_cdn_mailbox_expected_module.i
 Global rock_cdn_mailbox_expected_size.i
@@ -99,6 +102,21 @@ Global rock_cdn_mailbox_payload5_valid.i
 Global Dim rock_cdn_mailbox_payload5.a[4]
 Global Dim rock_cdn_edid.a[255]
 Global Dim rock_cdn_message.a[255]
+
+Procedure RockCdnMailboxWitnessReset(module.i, opcode.i, bytes.i)
+  rock_cdn_mailbox_actual_opcode = -1
+  rock_cdn_mailbox_actual_module = -1
+  rock_cdn_mailbox_actual_size = -1
+  rock_cdn_mailbox_actual_size_high = -1
+  rock_cdn_mailbox_actual_size_low = -1
+  rock_cdn_mailbox_header_count = 0
+  rock_cdn_mailbox_expected_opcode = opcode
+  rock_cdn_mailbox_expected_module = module
+  rock_cdn_mailbox_expected_size = bytes
+  rock_cdn_mailbox_drain_count = 0
+  rock_cdn_mailbox_drain_complete = 0
+  rock_cdn_mailbox_payload5_valid = 0
+EndProcedure
 
 Procedure.i RockCdnRead(offset.i)
   ProcedureReturn PeekL(#ROCK_CDN_DP + offset) & $FFFFFFFF
@@ -159,25 +177,23 @@ Procedure.i RockCdnReceive(module.i, opcode.i, bytes.i, destination.i)
   Protected low.i
   Protected count.i
   Protected index.i
-  rock_cdn_mailbox_actual_opcode = -1
-  rock_cdn_mailbox_actual_module = -1
-  rock_cdn_mailbox_actual_size = -1
-  rock_cdn_mailbox_expected_opcode = opcode
-  rock_cdn_mailbox_expected_module = module
-  rock_cdn_mailbox_expected_size = bytes
-  rock_cdn_mailbox_drain_count = 0
-  rock_cdn_mailbox_drain_complete = 0
-  rock_cdn_mailbox_payload5_valid = 0
+  RockCdnMailboxWitnessReset(module,opcode,bytes)
   gotOpcode = RockCdnMailboxGet()
   If gotOpcode < 0 : ProcedureReturn 0 : EndIf
   rock_cdn_mailbox_actual_opcode = gotOpcode
+  rock_cdn_mailbox_header_count = 1
   gotModule = RockCdnMailboxGet()
   If gotModule < 0 : ProcedureReturn 0 : EndIf
   rock_cdn_mailbox_actual_module = gotModule
+  rock_cdn_mailbox_header_count = 2
   high = RockCdnMailboxGet()
   If high < 0 : ProcedureReturn 0 : EndIf
+  rock_cdn_mailbox_actual_size_high = high
+  rock_cdn_mailbox_header_count = 3
   low = RockCdnMailboxGet()
   If low < 0 : ProcedureReturn 0 : EndIf
+  rock_cdn_mailbox_actual_size_low = low
+  rock_cdn_mailbox_header_count = 4
   count = (high << 8) | low
   rock_cdn_mailbox_actual_size = count
   If gotOpcode <> opcode Or gotModule <> module Or count <> bytes
@@ -321,6 +337,7 @@ Procedure.i RockCdnHotPlug()
 EndProcedure
 
 Procedure.i RockCdnLastAuxStatus()
+  RockCdnMailboxWitnessReset(#CDN_MB_DP_TX,#CDN_GET_LAST_AUX_STATUS,1)
   If RockCdnSend(#CDN_MB_DP_TX,#CDN_GET_LAST_AUX_STATUS,0,@rock_cdn_message[0]) = 0 : ProcedureReturn -1 : EndIf
   If RockCdnReceive(#CDN_MB_DP_TX,#CDN_GET_LAST_AUX_STATUS,1,@rock_cdn_message[64]) = 0 : ProcedureReturn -1 : EndIf
   ProcedureReturn PeekA(@rock_cdn_message[64]) & 255
@@ -336,6 +353,7 @@ Procedure.i RockCdnDpcd()
   PokeA(@rock_cdn_message[0]+3,0)
   PokeA(@rock_cdn_message[0]+4,0)
   rock_cdn_aux_status = -1
+  RockCdnMailboxWitnessReset(#CDN_MB_DP_TX,#CDN_READ_DPCD,21)
   For attempt = 0 To 31
     ; A send or receive error can leave a partial command or late response in
     ; the firmware mailbox. It is never safe to put another command behind it.

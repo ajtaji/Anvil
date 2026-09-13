@@ -266,7 +266,11 @@ EndProcedure
 Procedure.i RockTcPhyUp()
   Protected value.i
   rock_tcphy_error = 0
-  ; GRF write-mask fields: normal orientation and TCPHY0 selected for DP.
+  ; Pinned pre-init fields are owned while TCPHY, UPHY and PIPE remain reset.
+  PokeL(#ROCK_GRF+$E588,$40004000)
+  PokeL(#ROCK_GRF+$E580,$00080000)
+  If RockCruReset(149,0) = 0 : rock_tcphy_error=43 : ProcedureReturn 0 : EndIf
+  ; Configure only after the TCPHY register state machine is out of reset.
   PokeL(#ROCK_GRF+$E580,$00010000)
   value = RockTcRead(#TCPHY_TX_ANA1)
   RockTcWrite(#TCPHY_TX_ANA1,value | $1000)
@@ -280,9 +284,9 @@ Procedure.i RockTcPhyUp()
   RockTcDpLane(3,0,0)
   value = RockTcRead(#TCPHY_DP_MODE_CTL)
   RockTcWrite(#TCPHY_DP_MODE_CTL,(value & $FFFFFFF0) | $104)
-  If RockCruReset(149,0) = 0 : rock_tcphy_error=43 : ProcedureReturn 0 : EndIf
-  If RockTcWaitMask(#TCPHY_PMA_CMN_CTRL1,1,1,100000) = 0 : rock_tcphy_error=44 : ProcedureReturn 0 : EndIf
   If RockCruReset(148,0) = 0 : rock_tcphy_error=45 : ProcedureReturn 0 : EndIf
+  If RockTcWaitMask(#TCPHY_PMA_CMN_CTRL1,1,1,100000) = 0 : rock_tcphy_error=44 : ProcedureReturn 0 : EndIf
+  If RockCruReset(332,0) = 0 : rock_tcphy_error=47 : ProcedureReturn 0 : EndIf
   PokeL(#ROCK_GRF+$6268,$00080000)
   If RockTcWaitMask(#TCPHY_DP_MODE_CTL,$40,$40,100000) = 0 : rock_tcphy_error=46 : ProcedureReturn 0 : EndIf
   RockTcAuxCalibrate()

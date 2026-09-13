@@ -212,7 +212,6 @@ Procedure.i RockCruDisplayPrepare()
   RockCruReset(279,1)
   RockCruReset(281,1)
   RockTimerWaitUs(1)
-  If RockCruReset(332,0)=0 : rock_cru_error=64 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure
 

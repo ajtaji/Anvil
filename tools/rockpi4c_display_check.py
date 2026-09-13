@@ -49,6 +49,9 @@ def source_contract() -> None:
     require('xincludefile "raspberrypi4/' not in board,
             "Pi 4 hardware leaked into Rock Pi composition root")
     display = libraries["display.pbi"].lower()
+    display_up = display.split("procedure.i rockdisplayup()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
     order = [
         "rockcrudisplayprepare", "rockcrucadencerelease", "rockcdninternalclocks",
         "rockcdnfirmwareload", "rockcdnfirmwareactive", "rockcdnenableevents",
@@ -57,15 +60,78 @@ def source_contract() -> None:
         "rockvopup1024x768", "rockcdntrain", "rockcdnvideostatus(0)",
         "rockcdnvideo1024x768", "rockcdnvideostatus(1)",
     ]
-    positions = [display.index(token) for token in order]
+    positions = [display_up.index(token) for token in order]
     require(positions == sorted(positions), "cold-to-visible stage order drifted")
-    prepare_failure = display.split("if rockcrudisplayprepare()=0", 1)[1].split(
+    prepare_failure = display_up.split("if prepared=0", 1)[1].split(
         "endif", 1
     )[0]
     require("rockdisplaycrutelemetry()" in prepare_failure and
             prepare_failure.index("rockdisplaycrutelemetry()") <
             prepare_failure.index("rockdisplayfail(1"),
             "DPE1 no longer emits CRU/PMU evidence before refusing")
+    dp_power = display.split("procedure rockdisplaydppowertelemetry()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    firmware_telemetry = display.split(
+        "procedure rockdisplayfirmwaretelemetry()", 1
+    )[1].split("endprocedure", 1)[0]
+    tcphy_telemetry = display.split("procedure rockdisplaytcphytelemetry()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    grf_telemetry = display.split("procedure rockdisplaygrftelemetry()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ('peekl(#rock_gpio1+$50) & $ffffffff',
+                  'rockuarttext("dp_pwr level ")', '(value >> 24) & 1'):
+        require(token in dp_power, f"DP_PWR input witness drifted: {token}")
+    require("pokel" not in dp_power,
+            "DP_PWR telemetry must not drive or reconfigure the board pin")
+    require('rockuarttext("cadence fw ")' in firmware_telemetry and
+            "rockdisplayhexlong(rock_cdn_firmware_version)" in firmware_telemetry,
+            "Cadence firmware-version witness drifted")
+    for token in ('rockuarttext("tcphy cmn ")',
+                  "rocktcread(#tcphy_pma_cmn_ctrl1)",
+                  "rocktcread(#tcphy_dp_mode_ctl)",
+                  "rocktcread(#tcphy_pma_lane_cfg)",
+                  "rocktcread(#tcphy_tx_ana1)"):
+        require(token in tcphy_telemetry, f"TCPHY readback witness drifted: {token}")
+    require("rocktcwrite" not in tcphy_telemetry and "pokel" not in tcphy_telemetry,
+            "TCPHY telemetry gained a functional register write")
+    require('rockuarttext("grf_soc_con26 ")' in grf_telemetry and
+            "peekl(#rock_grf+$6268) & $ffffffff" in grf_telemetry,
+            "GRF_SOC_CON26 readback witness drifted")
+    require("pokel" not in grf_telemetry,
+            "GRF telemetry gained a functional register write")
+    witness_order = [
+        "prepared = rockcrudisplayprepare()", "rockdisplaydppowertelemetry()",
+        "if prepared=0", "rockcdnfirmwareload()", "rockdisplayfirmwaretelemetry()",
+        "rocktcphyup()", "rockdisplaytcphytelemetry()", "$30003000",
+        "rockdisplaygrftelemetry()", "rockcdnhotplug()",
+    ]
+    positions = [display_up.index(token) for token in witness_order]
+    require(positions == sorted(positions),
+            "silicon readbacks moved away from their completed owner stages")
+    failure_witnesses = {
+        "rockcrucadencerelease()": ("dpe3 cru err ", "rock_cru_error"),
+        "rockcdnfirmwareload()": ("dpe4 cdn err ", "rock_cdn_error"),
+        "rockcdnfirmwareactive(1)": ("dpe5 cdn err ", "rock_cdn_error"),
+        "rockcdnenableevents()": ("dpe6 cdn err ", "rock_cdn_error"),
+        "rocktcphyup()": ("dpe2 tcphy err ", "rock_tcphy_error"),
+        "rockcdnhotplug()": ("dpe7 cdn err ", "rock_cdn_error"),
+        "rockcdnhostcapabilities()": ("dpef cdn err ", "rock_cdn_error"),
+        "rockcdnreadedid()": ("dpe9 cdn err ", "rock_cdn_error"),
+        "rockvopup1024x768()": ("dpea vop err ", "rock_vop_error"),
+        "rockcdntrain()": ("dpeb cdn err ", "rock_cdn_error"),
+        "rockcdnvideostatus(0)": ("dpec cdn err ", "rock_cdn_error"),
+        "rockcdnvideo1024x768()": ("dped cdn err ", "rock_cdn_error"),
+        "rockcdnvideostatus(1)": ("dpee cdn err ", "rock_cdn_error"),
+    }
+    for owner_call, (label, error) in failure_witnesses.items():
+        failure = display_up.split(f"if {owner_call}=0", 1)[1].split("endif", 1)[0]
+        require(f'rockdisplaysubsystemtelemetry("{label}",{error})' in failure and
+                failure.index("rockdisplaysubsystemtelemetry") <
+                failure.index("rockdisplayfail"),
+                f"{owner_call} no longer reports its exact subsystem error")
     cru = libraries["cru.pbi"].lower()
     power_order = ["rockpmupoweron(14", "rockpmupoweron(24",
                    "rockpmupoweron(20", "rockpmuidlerelease(8",
@@ -87,6 +153,37 @@ def source_contract() -> None:
     require("gpio1_d0, not gpio1_c0" in cru, "exact MiniDP power pin correction missing")
     require("$00030000" in cru and "$00030001" in cru,
             "GPIO1_D0 input/pull-up pinctrl contract missing")
+    prepare = cru.split("procedure.i rockcrudisplayprepare()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require("rockcrureset(148,1)" in prepare and
+            "rockcrureset(149,1)" in prepare and
+            "rockcrureset(332,1)" in prepare and
+            "rockcrureset(332,0)" not in prepare,
+            "TCPHY/UPHY/PIPE resets are not held through owner pre-init")
+    tcphy = libraries["tcphy.pbi"].lower()
+    tcphy_up = tcphy.split("procedure.i rocktcphyup()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    tcphy_order = [
+        "pokel(#rock_grf+$e588,$40004000)",
+        "pokel(#rock_grf+$e580,$00080000)",
+        "rockcrureset(149,0)",
+        "pokel(#rock_grf+$e580,$00010000)",
+        "rocktcread(#tcphy_tx_ana1)",
+        "rocktccommon24m()", "rocktcwrite(#tcphy_pma_lane_cfg,$5100)",
+        "rocktcdprbrpll()", "rocktcwrite(#tcphy_dp_mode_ctl",
+        "rockcrureset(148,0)",
+        "rocktcwaitmask(#tcphy_pma_cmn_ctrl1,1,1,100000)",
+        "rockcrureset(332,0)", "pokel(#rock_grf+$6268,$00080000)",
+        "rocktcwaitmask(#tcphy_dp_mode_ctl,$40,$40,100000)",
+        "rocktcauxcalibrate()", "rocktcpowerstate(0)",
+    ]
+    positions = [tcphy_up.index(token) for token in tcphy_order]
+    require(positions == sorted(positions),
+            "TCPHY pre-init/config/reset/readiness order drifted from pinned owner")
+    require("rock_tcphy_error=47" in tcphy_up,
+            "PIPE reset-release failure lacks an exact TCPHY refusal code")
     cru_telemetry = display.split("procedure rockdisplaycrutelemetry()", 1)[1].split(
         "endprocedure", 1
     )[0]
@@ -127,6 +224,9 @@ def source_contract() -> None:
         "rockvopwrite(#vop_post_vact,803 | (35 << 16))",
     ):
         require(timing in vop, f"VOP start/end field order drifted: {timing}")
+    require("rockvopfield(#vop_dsp_ctrl1,$000f0000,0)" in vop and
+            "rockvopfield(#vop_dsp_ctrl1,$000f0000,$00080000)" not in vop,
+            "VOP DP clock/pin polarity drifted from the pinned RK3399 path")
     cdn = libraries["cdn_dp.pbi"].lower()
     for timing in (
         "#cdn_sync_negative = $8000",
@@ -228,9 +328,6 @@ def source_contract() -> None:
         "rock_cdn_mailbox_actual_opcode = gotopcode",
         "rock_cdn_mailbox_actual_module = gotmodule",
         "rock_cdn_mailbox_actual_size = count",
-        "rock_cdn_mailbox_expected_opcode = opcode",
-        "rock_cdn_mailbox_expected_module = module",
-        "rock_cdn_mailbox_expected_size = bytes",
         "rock_cdn_mailbox_drain_count = rock_cdn_mailbox_drain_count + 1",
         "rock_cdn_mailbox_drain_complete = 1",
         "if count = 5 : rock_cdn_mailbox_payload5_valid = 1",
@@ -244,10 +341,59 @@ def source_contract() -> None:
             "mailbox drain count advances before a byte was consumed")
     require("if rock_cdn_mailbox_drain_count = count" in mismatch,
             "mailbox drain completeness is not tied to the advertised payload size")
-    require("if rock_cdn_error = 24 : rockdisplaymailboxtelemetry()" in display,
-            "mailbox mismatch telemetry is not attached to DPCD failure")
+    witness_reset = cdn.split("procedure rockcdnmailboxwitnessreset", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("rock_cdn_mailbox_actual_opcode = -1",
+                  "rock_cdn_mailbox_actual_module = -1",
+                  "rock_cdn_mailbox_actual_size = -1",
+                  "rock_cdn_mailbox_actual_size_high = -1",
+                  "rock_cdn_mailbox_actual_size_low = -1",
+                  "rock_cdn_mailbox_header_count = 0",
+                  "rock_cdn_mailbox_drain_count = 0",
+                  "rock_cdn_mailbox_payload5_valid = 0"):
+        require(token in witness_reset, f"mailbox witness reset drifted: {token}")
+    for token in ("rock_cdn_mailbox_header_count = 1",
+                  "rock_cdn_mailbox_header_count = 2",
+                  "rock_cdn_mailbox_actual_size_high = high",
+                  "rock_cdn_mailbox_header_count = 3",
+                  "rock_cdn_mailbox_actual_size_low = low",
+                  "rock_cdn_mailbox_header_count = 4"):
+        require(token in receive, f"partial mailbox header witness drifted: {token}")
+    require(dpcd.index("rockcdnmailboxwitnessreset(#cdn_mb_dp_tx,#cdn_read_dpcd,21)") <
+            dpcd.index("for attempt = 0 to 31"),
+            "DPCD send can expose stale mailbox witness state")
+    last_aux = cdn.split("procedure.i rockcdnlastauxstatus()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require(last_aux.index(
+                "rockcdnmailboxwitnessreset(#cdn_mb_dp_tx,#cdn_get_last_aux_status,1)"
+            ) < last_aux.index("rockcdnsend("),
+            "AUX-status send can expose stale mailbox witness state")
+    dpcd_telemetry = display.split("procedure rockdisplaydpcdtelemetry()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require("rock_cdn_dpcd_phase = #cdn_dpcd_phase_response or "
+            "rock_cdn_dpcd_phase = #cdn_dpcd_phase_aux_mailbox" in dpcd_telemetry and
+            "rockdisplaymailboxtelemetry()" in dpcd_telemetry,
+            "partial mailbox telemetry is not attached to response/AUX-mailbox failures")
+    require("rock_cdn_error = 24" not in dpcd_telemetry,
+            "mailbox telemetry is still limited to complete header mismatches")
+    mailbox_telemetry = display.split("procedure rockdisplaymailboxtelemetry()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for unsafe in ("rockcdnmailboxget", "rockcdnreceive", "rockcdnlastauxstatus",
+                   "rockcdnsend", "pokel"):
+        require(unsafe not in mailbox_telemetry,
+                f"mailbox witness performs an unsafe diagnostic operation: {unsafe}")
+    for token in ("rock_cdn_mailbox_actual_size_high",
+                  "rock_cdn_mailbox_header_count",
+                  'rockuarttext(" header ")', 'rockuarttext("/04")'):
+        require(token in mailbox_telemetry,
+                f"partial mailbox serial diagnostic drifted: {token}")
     for token in ('rockuarttext(" mbox got ")', 'rockuarttext(" expect ")',
-                  'rockuarttext(" drain ")', 'rockuarttext(" payload")'):
+                  'rockuarttext(" header ")', 'rockuarttext(" drain ")',
+                  'rockuarttext(" payload")', 'rockuarttext(" cdnerr ")'):
         require(token in display, f"serial mailbox diagnostic missing: {token}")
 
 
@@ -328,6 +474,34 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         asm = Path(str(output) + ".asm").read_text(encoding="utf-8", errors="replace").lower()
         for token in ("str w", "ldr w", "rockdisplayup"):
             require(token in asm, f"emitted display image lacks {token}")
+        for label in ("rockdisplaydppowertelemetry:",
+                      "rockdisplayfirmwaretelemetry:",
+                      "rockdisplaytcphytelemetry:",
+                      "rockdisplaygrftelemetry:",
+                      "rockdisplaysubsystemtelemetry:",
+                      "rockcdnmailboxwitnessreset:"):
+            require(label in asm, f"emitted silicon witness is missing: {label}")
+        display_up_asm = asm.split("rockdisplayup:", 1)[1].split(
+            "rockdisplaybuffer:", 1
+        )[0]
+        emitted_witnesses = [
+            "bl rockdisplaydppowertelemetry", "bl rockdisplayfirmwaretelemetry",
+            "bl rockdisplaytcphytelemetry", "bl rockdisplaygrftelemetry",
+        ]
+        positions = [display_up_asm.index(call) for call in emitted_witnesses]
+        require(positions == sorted(positions),
+                "emitted stage-local silicon witness order drifted")
+        require(display_up_asm.count("bl rockdisplaysubsystemtelemetry") == 13,
+                "emitted subsystem error witnesses are incomplete")
+        dpcd_telemetry_asm = asm.split("rockdisplaydpcdtelemetry:", 1)[1].split(
+            "rockdisplayup:", 1
+        )[0]
+        require("bl rockdisplaymailboxtelemetry" in dpcd_telemetry_asm,
+                "emitted DPCD failure lost its partial-header witness")
+        for unsafe in ("bl rockcdnmailboxget", "bl rockcdnreceive",
+                       "bl rockcdnlastauxstatus", "bl rockcdnsend"):
+            require(unsafe not in dpcd_telemetry_asm,
+                    f"emitted DPCD telemetry performs unsafe mailbox traffic: {unsafe}")
         power_asm = asm.split("rockcrudisplaypower:", 1)[1].split(
             "rockcrudisplayprepare:", 1
         )[0]
@@ -342,6 +516,30 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                               (power_calls[2][0], power_calls[3][0])):
             require(re.search(r"\bret\b", power_asm[first:second]) is not None,
                     "emitted domain failure cannot return before idle release")
+        prepare_asm = asm.split("rockcrudisplayprepare:", 1)[1].split(
+            "rockcrucadencerelease:", 1
+        )[0]
+        require(len(re.findall(r"\bbl\s+rockcrureset\b", prepare_asm)) == 10,
+                "emitted prepare no longer leaves all asserted display resets held")
+        tcphy_up_asm = asm.split("rocktcphyup:", 1)[1].split(
+            "rockcdnmailboxwitnessreset:", 1
+        )[0]
+        tcphy_resets = [match.start() for match in re.finditer(
+            r"\bbl\s+rockcrureset\b", tcphy_up_asm
+        )]
+        require(len(tcphy_resets) == 3,
+                "emitted TCPHY reset-release count drifted")
+        common = tcphy_up_asm.index("bl rocktccommon24m")
+        pll = tcphy_up_asm.index("bl rocktcdprbrpll")
+        waits = [match.start() for match in re.finditer(
+            r"\bbl\s+rocktcwaitmask\b", tcphy_up_asm
+        )]
+        calibrate = tcphy_up_asm.index("bl rocktcauxcalibrate")
+        power_state = tcphy_up_asm.index("bl rocktcpowerstate")
+        require(len(waits) == 2 and
+                tcphy_resets[0] < common < pll < tcphy_resets[1] < waits[0] <
+                tcphy_resets[2] < waits[1] < calibrate < power_state,
+                "emitted TCPHY config/reset/readiness order drifted")
         video_asm = asm.split("rockcdnvideo1024x768:", 1)[1].split(
             "rockcdnvideostatus:", 1
         )[0]

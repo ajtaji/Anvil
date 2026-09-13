@@ -44,6 +44,61 @@ Procedure RockDisplayHexLong(value.i)
   RockDisplayHexWord(value & $FFFF)
 EndProcedure
 
+Procedure RockDisplaySubsystemTelemetry(text.i, error.i)
+  If rock_uart_ready <> 0
+    RockUartText(text)
+    RockDisplayHexByte(error)
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
+Procedure RockDisplayDpPowerTelemetry()
+  Protected value.i
+  If rock_uart_ready <> 0
+    value = PeekL(#ROCK_GPIO1+$50) & $FFFFFFFF
+    RockUartText("DP_PWR LEVEL ")
+    RockUartByte(48+((value >> 24) & 1))
+    RockUartText(" EXT ")
+    RockDisplayHexLong(value)
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
+Procedure RockDisplayFirmwareTelemetry()
+  If rock_uart_ready <> 0
+    RockUartText("CADENCE FW ")
+    RockDisplayHexLong(rock_cdn_firmware_version)
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
+Procedure RockDisplayTcPhyTelemetry()
+  If rock_uart_ready <> 0
+    RockUartText("TCPHY CMN ")
+    RockDisplayHexLong(RockTcRead(#TCPHY_PMA_CMN_CTRL1))
+    RockUartText(" MODE ")
+    RockDisplayHexLong(RockTcRead(#TCPHY_DP_MODE_CTL))
+    RockUartText(" MAP ")
+    RockDisplayHexLong(RockTcRead(#TCPHY_PMA_LANE_CFG))
+    RockUartText(" AUX ")
+    RockDisplayHexLong(RockTcRead(#TCPHY_TX_ANA1))
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
+Procedure RockDisplayGrfTelemetry()
+  If rock_uart_ready <> 0
+    RockUartText("GRF_SOC_CON26 ")
+    RockDisplayHexLong(PeekL(#ROCK_GRF+$6268) & $FFFFFFFF)
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
 Procedure RockDisplayCruTelemetry()
   If rock_uart_ready <> 0
     RockUartText("DPE1 DETAIL ERR ")
@@ -113,7 +168,12 @@ Procedure RockDisplayMailboxTelemetry()
   EndIf
   RockUartByte(47)
   If rock_cdn_mailbox_actual_size < 0
-    RockUartText("----")
+    If rock_cdn_mailbox_actual_size_high < 0
+      RockUartText("----")
+    Else
+      RockDisplayHexByte(rock_cdn_mailbox_actual_size_high)
+      RockUartText("??")
+    EndIf
   Else
     RockDisplayHexWord(rock_cdn_mailbox_actual_size)
   EndIf
@@ -123,6 +183,9 @@ Procedure RockDisplayMailboxTelemetry()
   RockDisplayHexByte(rock_cdn_mailbox_expected_module)
   RockUartByte(47)
   RockDisplayHexWord(rock_cdn_mailbox_expected_size)
+  RockUartText(" HEADER ")
+  RockDisplayHexByte(rock_cdn_mailbox_header_count)
+  RockUartText("/04")
   RockUartText(" DRAIN ")
   RockDisplayHexWord(rock_cdn_mailbox_drain_count)
   RockUartByte(47)
@@ -151,48 +214,97 @@ Procedure RockDisplayDpcdTelemetry()
     Else
       RockDisplayHexByte(rock_cdn_aux_status)
     EndIf
-    If rock_cdn_error = 24 : RockDisplayMailboxTelemetry() : EndIf
+    RockUartText(" CDNERR ")
+    RockDisplayHexByte(rock_cdn_error)
+    If rock_cdn_dpcd_phase = #CDN_DPCD_PHASE_RESPONSE Or rock_cdn_dpcd_phase = #CDN_DPCD_PHASE_AUX_MAILBOX
+      RockDisplayMailboxTelemetry()
+    EndIf
     RockUartByte(13)
     RockUartByte(10)
   EndIf
 EndProcedure
 
 Procedure.i RockDisplayUp()
+  Protected prepared.i
   rock_display_ready=0
   rock_display_error=0
   RockDisplayStage("DP00 BEGIN COLD MINIDP")
-  If RockCruDisplayPrepare()=0
+  prepared = RockCruDisplayPrepare()
+  RockDisplayDpPowerTelemetry()
+  If prepared=0
     RockDisplayCruTelemetry()
     ProcedureReturn RockDisplayFail(1,"DPE1 CRU OR POWER DOMAIN")
   EndIf
-  If RockCruCadenceRelease()=0 : ProcedureReturn RockDisplayFail(3,"DPE3 CADENCE RESET RELEASE") : EndIf
+  If RockCruCadenceRelease()=0
+    RockDisplaySubsystemTelemetry("DPE3 CRU ERR ",rock_cru_error)
+    ProcedureReturn RockDisplayFail(3,"DPE3 CADENCE RESET RELEASE")
+  EndIf
   RockCdnWrite(#CDN_SW_CLK_H,99)
   RockCdnInternalClocks()
   RockDisplayStage("DP01 CADENCE CLOCKS POWER RESETS READY")
-  If RockCdnFirmwareLoad()=0 : ProcedureReturn RockDisplayFail(4,"DPE4 CADENCE FIRMWARE") : EndIf
-  If RockCdnFirmwareActive(1)=0 : ProcedureReturn RockDisplayFail(5,"DPE5 CADENCE FIRMWARE ACTIVE") : EndIf
-  If RockCdnEnableEvents()=0 : ProcedureReturn RockDisplayFail(6,"DPE6 CADENCE EVENT CONFIG") : EndIf
+  If RockCdnFirmwareLoad()=0
+    RockDisplaySubsystemTelemetry("DPE4 CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(4,"DPE4 CADENCE FIRMWARE")
+  EndIf
+  RockDisplayFirmwareTelemetry()
+  If RockCdnFirmwareActive(1)=0
+    RockDisplaySubsystemTelemetry("DPE5 CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(5,"DPE5 CADENCE FIRMWARE ACTIVE")
+  EndIf
+  If RockCdnEnableEvents()=0
+    RockDisplaySubsystemTelemetry("DPE6 CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(6,"DPE6 CADENCE EVENT CONFIG")
+  EndIf
   RockDisplayStage("DP02 CADENCE FIRMWARE EVENTS READY")
-  If RockTcPhyUp()=0 : ProcedureReturn RockDisplayFail(2,"DPE2 TCPHY0 DP USB SPLIT") : EndIf
+  If RockTcPhyUp()=0
+    RockDisplaySubsystemTelemetry("DPE2 TCPHY ERR ",rock_tcphy_error)
+    ProcedureReturn RockDisplayFail(2,"DPE2 TCPHY0 DP USB SPLIT")
+  EndIf
+  RockDisplayTcPhyTelemetry()
   RockDisplayStage("DP03 TCPHY0 AUX AND TWO LANES READY")
   ; Select the Cadence HPD path only after PHY AUX and firmware are alive.
   PokeL(#ROCK_GRF+$6268,$30003000)
-  If RockCdnHotPlug()=0 : ProcedureReturn RockDisplayFail(7,"DPE7 MINIDP HPD ABSENT") : EndIf
+  RockDisplayGrfTelemetry()
+  If RockCdnHotPlug()=0
+    RockDisplaySubsystemTelemetry("DPE7 CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(7,"DPE7 MINIDP HPD ABSENT")
+  EndIf
   RockDisplayStage("DP04 HPD PRESENT")
-  If RockCdnHostCapabilities()=0 : ProcedureReturn RockDisplayFail(15,"DPEF CADENCE HOST CAPABILITIES") : EndIf
+  If RockCdnHostCapabilities()=0
+    RockDisplaySubsystemTelemetry("DPEF CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(15,"DPEF CADENCE HOST CAPABILITIES")
+  EndIf
   If RockCdnDpcd()=0
     RockDisplayDpcdTelemetry()
     ProcedureReturn RockDisplayFail(8,"DPE8 DPCD AUX READ")
   EndIf
-  If RockCdnReadEdid()=0 : ProcedureReturn RockDisplayFail(9,"DPE9 EDID OR 1024X768 MODE") : EndIf
+  If RockCdnReadEdid()=0
+    RockDisplaySubsystemTelemetry("DPE9 CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(9,"DPE9 EDID OR 1024X768 MODE")
+  EndIf
   RockDisplayStage("DP05 DPCD EDID 1024X768 READY")
-  If RockVopUp1024x768()=0 : ProcedureReturn RockDisplayFail(10,"DPEA VOPL FRAMEBUFFER") : EndIf
+  If RockVopUp1024x768()=0
+    RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
+    ProcedureReturn RockDisplayFail(10,"DPEA VOPL FRAMEBUFFER")
+  EndIf
   RockDisplayStage("DP06 COLOR BARS AND TEXT ARMED")
-  If RockCdnTrain()=0 : ProcedureReturn RockDisplayFail(11,"DPEB DISPLAYPORT LINK TRAIN") : EndIf
+  If RockCdnTrain()=0
+    RockDisplaySubsystemTelemetry("DPEB CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(11,"DPEB DISPLAYPORT LINK TRAIN")
+  EndIf
   RockDisplayStage("DP07 LINK TRAINED")
-  If RockCdnVideoStatus(0)=0 : ProcedureReturn RockDisplayFail(12,"DPEC VIDEO IDLE") : EndIf
-  If RockCdnVideo1024x768()=0 : ProcedureReturn RockDisplayFail(13,"DPED VIDEO TIMING") : EndIf
-  If RockCdnVideoStatus(1)=0 : ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID") : EndIf
+  If RockCdnVideoStatus(0)=0
+    RockDisplaySubsystemTelemetry("DPEC CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(12,"DPEC VIDEO IDLE")
+  EndIf
+  If RockCdnVideo1024x768()=0
+    RockDisplaySubsystemTelemetry("DPED CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(13,"DPED VIDEO TIMING")
+  EndIf
+  If RockCdnVideoStatus(1)=0
+    RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
+  EndIf
   rock_display_width=#ROCK_FB_WIDTH
   rock_display_height=#ROCK_FB_HEIGHT
   rock_display_pitch=#ROCK_FB_WIDTH*4

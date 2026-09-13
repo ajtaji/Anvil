@@ -152,8 +152,9 @@ Procedure.i RockVopUp1024x768()
   ; Route the Cadence transmitter from the little VOP (GRF SOC_CON9 bit12).
   PokeL(#ROCK_GRF+$6224,$10001000)
   RockVopFirstFrame()
-  ; Negative H/V sync and inverted DCLK: DP polarity nibble 8 at bits19:16.
-  RockVopField(#VOP_DSP_CTRL1,$000F0000,$00080000)
+  ; The RK3399 VOP DP pins use uninverted clock/sync polarity for this mode.
+  ; Cadence's MSA/framer negative-sync flags have separate semantics.
+  RockVopField(#VOP_DSP_CTRL1,$000F0000,0)
   value=RockVopRead(#VOP_SYS_CTRL)
   value=(value & $FFBF07FF) | $00000800
   RockVopWrite(#VOP_SYS_CTRL,value)
