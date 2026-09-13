@@ -299,6 +299,11 @@ Global neon_fbMapBytes.i = 0      ; framebuffer bytes to MAP in the V3D page
                                   ; use, so BOTH halves are mapped and the
                                   ; render target can be flipped between them
                                   ; without rebuilding the page table.
+Global neon_mapBase.i   = 0       ; immutable mapped-span base after init
+Global neon_mapBytes.i  = 0       ; immutable mapped-span extent after init
+Global neon_capPhysW.i  = 0       ; largest physical geometry pools can hold
+Global neon_capPhysH.i  = 0
+Global neon_outFmt.i    = #V3D_OFMT_RGBA8
 Global neon_cx.i       = 0        ; physical viewport centre, pixels
 Global neon_cy.i       = 0
 
@@ -563,6 +568,22 @@ EndProcedure
 
 Procedure.i Neon_SurfacePitch()
   ProcedureReturn neon_pitch
+EndProcedure
+
+Procedure.i Neon_SurfaceBytes()
+  ProcedureReturn neon_fbBytes
+EndProcedure
+
+Procedure.i Neon_SurfaceFormat()
+  ProcedureReturn neon_outFmt
+EndProcedure
+
+Procedure.i Neon_CapacityPhysicalW()
+  ProcedureReturn neon_capPhysW
+EndProcedure
+
+Procedure.i Neon_CapacityPhysicalH()
+  ProcedureReturn neon_capPhysH
 EndProcedure
 
 
@@ -876,6 +897,7 @@ EndProcedure
 Procedure.i NeonSurfaceOriented(base.i, w.i, h.i, pitch.i, rot.i)
   Protected pw.i
   Protected ph.i
+  Protected maxDim.i
 
   If rot <> 0 And rot <> 90 And rot <> 180 And rot <> 270
     neon_err = #NEON_ERR_ARGS
@@ -900,9 +922,40 @@ Procedure.i NeonSurfaceOriented(base.i, w.i, h.i, pitch.i, rot.i)
   neon_pitch     = pitch
   neon_fbBytes   = pitch * ph
   neon_fbMapBytes = neon_fbBytes    ; default: map exactly one screen
+  neon_mapBase    = 0
+  neon_mapBytes   = 0
+  neon_outFmt     = #V3D_OFMT_RGBA8
+  ; Vulkan's core maxImageDimension2D is one scalar, so the default render
+  ; capacity is the square of the surface's larger dimension.  That keeps the
+  ; advertised number true in both axes while preserving every existing
+  ; caller that never declares a larger capacity explicitly.
+  maxDim = pw
+  If ph > maxDim : maxDim = ph : EndIf
+  If neon_capPhysW < maxDim : neon_capPhysW = maxDim : EndIf
+  If neon_capPhysH < maxDim : neon_capPhysH = maxDim : EndIf
   neon_cx        = pw / 2
   neon_cy        = ph / 2
   gNeonReady     = 0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; Declare the largest physical render geometry this arena must support.
+; It may be raised before NeonInit, never while the engine is live.  The
+; startup surface remains active; this only sizes tile pools and coordinate
+; tables so a later transactional rebind never moves an arena object.
+Procedure.i NeonRenderCapacity(width.i, height.i)
+  If gNeonReady <> 0 Or neon_inFrame <> 0
+    neon_err = #NEON_ERR_INFRAME
+    ProcedureReturn #NEON_ERR_INFRAME
+  EndIf
+  If width < 8 Or height < 8 Or width > 65535 Or height > 65535
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
+  neon_capPhysW = width
+  neon_capPhysH = height
+  If neon_physW > neon_capPhysW : neon_capPhysW = neon_physW : EndIf
+  If neon_physH > neon_capPhysH : neon_capPhysH = neon_physH : EndIf
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -928,6 +981,157 @@ Procedure NeonSurfaceMapSpan(bytes.i)
   neon_fbMapBytes = bytes
 EndProcedure
 
+; Build the two CPU-side clip-coordinate tables for one physical geometry.
+; The destinations were carved for neon_capPhysW/H, so this routine has no
+; allocation and no failure half-way through a rebind.
+Procedure neon_BuildCoordinateTables(physW.i, physH.i, cx.i, cy.i)
+  Protected n.i
+  n = 0
+  While n < (physW * 3)
+    PokeN(neon_xcTab + (n * 4), neon_F32Ratio(n - physW - cx, cx))
+    n = n + 1
+  Wend
+  n = 0
+  While n < (physH * 3)
+    PokeN(neon_ycTab + (n * 4), neon_F32Ratio(n - physH - cy, cy))
+    n = n + 1
+  Wend
+EndProcedure
+
+; Rebind the complete render surface transactionally.  Every range, capacity
+; and pool check happens before the current V3D state is changed.  If one of
+; the V3D setters nevertheless refuses, the old complete geometry is restored
+; before the error is returned.  Surface globals are published last.
+Procedure.i NeonRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt.i, rot.i)
+  Protected pw.i
+  Protected ph.i
+  Protected cx.i
+  Protected cy.i
+  Protected r.i
+  Protected rollbackRc.i
+  Protected oldBase.i
+  Protected oldW.i
+  Protected oldH.i
+  Protected oldPw.i
+  Protected oldPh.i
+  Protected oldPitch.i
+  Protected oldBytes.i
+  Protected oldFmt.i
+  Protected oldRot.i
+  Protected plan.V3dRenderPlan
+
+  If gNeonReady = 0
+    neon_err = #NEON_ERR_ARENA
+    ProcedureReturn #NEON_ERR_ARENA
+  EndIf
+  If neon_inFrame <> 0
+    neon_err = #NEON_ERR_INFRAME
+    ProcedureReturn #NEON_ERR_INFRAME
+  EndIf
+  If rot <> 0 And rot <> 90 And rot <> 180 And rot <> 270
+    neon_err = #NEON_ERR_ARGS
+    ProcedureReturn #NEON_ERR_ARGS
+  EndIf
+  ; The present shader and tile-store path are RGBA8.  Other V3D formats have
+  ; planner rows, but are not a promise this renderer can make yet.
+  If outFmt <> #V3D_OFMT_RGBA8
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
+  pw = w
+  ph = h
+  If rot = 90 Or rot = 270
+    pw = h
+    ph = w
+  EndIf
+  If base <= 0 Or w < 8 Or h < 8 Or pitch < (pw * 4)
+    neon_err = #NEON_ERR_SURFACE
+    ProcedureReturn #NEON_ERR_SURFACE
+  EndIf
+  If bytes < (pitch * ph)
+    neon_err = #NEON_ERR_SURFACE
+    ProcedureReturn #NEON_ERR_SURFACE
+  EndIf
+  If pw > neon_capPhysW Or ph > neon_capPhysH
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
+  If neon_mapBase <= 0 Or neon_mapBytes <= 0 Or bytes > neon_mapBytes
+    neon_err = #NEON_ERR_SURFACE
+    ProcedureReturn #NEON_ERR_SURFACE
+  EndIf
+  If base < neon_mapBase Or (base - neon_mapBase) > (neon_mapBytes - bytes)
+    neon_err = #NEON_ERR_SURFACE
+    ProcedureReturn #NEON_ERR_SURFACE
+  EndIf
+  r = V3dRenderPlanBuild(pw, ph, outFmt, 1, 0, 0, @plan)
+  If r <> #V3D_OK
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
+  If plan\tileAllocBytes > neon_tallocBytes Or plan\tileStateBytes > neon_tstateBytes
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
+
+  oldBase = neon_fb
+  oldW = neon_w
+  oldH = neon_h
+  oldPw = neon_physW
+  oldPh = neon_physH
+  oldPitch = neon_pitch
+  oldBytes = neon_fbBytes
+  oldFmt = neon_outFmt
+  oldRot = neon_rot
+
+  r = V3dRenderBegin(pw, ph, outFmt)
+  If r = #V3D_OK
+    r = V3dRenderTarget(base, bytes, #V3D_MEMFMT_RASTER, pitch, 0)
+  EndIf
+  If r = #V3D_OK
+    r = V3dRenderPool(neon_talloc, neon_tallocBytes, neon_tstate, neon_tstateBytes)
+  EndIf
+  If r = #V3D_OK
+    r = V3dBinOverflow(neon_overflow, neon_overflowBytes)
+  EndIf
+  If r <> #V3D_OK
+    rollbackRc = V3dRenderBegin(oldPw, oldPh, oldFmt)
+    If rollbackRc = #V3D_OK
+      rollbackRc = V3dRenderTarget(oldBase, oldBytes, #V3D_MEMFMT_RASTER, oldPitch, 0)
+    EndIf
+    If rollbackRc = #V3D_OK
+      rollbackRc = V3dRenderPool(neon_talloc, neon_tallocBytes, neon_tstate, neon_tstateBytes)
+    EndIf
+    If rollbackRc = #V3D_OK
+      rollbackRc = V3dBinOverflow(neon_overflow, neon_overflowBytes)
+    EndIf
+    If rollbackRc <> #V3D_OK
+      gNeonReady = 0
+      neon_err = #NEON_ERR_V3D
+      ProcedureReturn #NEON_ERR_V3D
+    EndIf
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
+
+  cx = pw / 2
+  cy = ph / 2
+  neon_BuildCoordinateTables(pw, ph, cx, cy)
+  neon_fb = base
+  neon_w = w
+  neon_h = h
+  neon_physW = pw
+  neon_physH = ph
+  neon_pitch = pitch
+  neon_fbBytes = bytes
+  neon_outFmt = outFmt
+  neon_rot = rot
+  neon_cx = cx
+  neon_cy = cy
+  neon_err = #NEON_OK
+  ProcedureReturn #NEON_OK
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  NeonRetarget - point the engine at a different framebuffer base WITHOUT
 ;  rebuilding the page table or recompiling the shaders. Cheap: it rebinds
@@ -940,23 +1144,7 @@ EndProcedure
 ;  geometry (one screen), so pass pitch * physicalHeight. Returns #NEON_OK.
 ; ----------------------------------------------------------------------
 Procedure.i NeonRetarget(base.i, bytes.i)
-  Protected r.i
-  If gNeonReady = 0
-    neon_err = #NEON_ERR_ARENA
-    ProcedureReturn #NEON_ERR_ARENA
-  EndIf
-  If base <= 0
-    neon_err = #NEON_ERR_SURFACE
-    ProcedureReturn #NEON_ERR_SURFACE
-  EndIf
-  r = V3dRenderTarget(base, bytes, #V3D_MEMFMT_RASTER, neon_pitch, 0)
-  If r <> #V3D_OK
-    neon_err = #NEON_ERR_GEOMETRY
-    ProcedureReturn #NEON_ERR_GEOMETRY
-  EndIf
-  neon_fb      = base
-  neon_fbBytes = bytes
-  ProcedureReturn #NEON_OK
+  ProcedureReturn NeonRebindSurface(base, neon_w, neon_h, neon_pitch, bytes, neon_outFmt, neon_rot)
 EndProcedure
 
 
@@ -1650,6 +1838,7 @@ Procedure.i NeonInit()
   Protected maxVa.i
   Protected fbPage0.i
   Protected fbMapEnd.i
+  Protected capPlan.V3dRenderPlan
 
   gNeonReady = 0
   neon_err   = #NEON_OK
@@ -1681,6 +1870,13 @@ Procedure.i NeonInit()
     neon_err = #NEON_ERR_GEOMETRY
     ProcedureReturn #NEON_ERR_GEOMETRY
   EndIf
+  If neon_capPhysW < neon_physW : neon_capPhysW = neon_physW : EndIf
+  If neon_capPhysH < neon_physH : neon_capPhysH = neon_physH : EndIf
+  r = V3dRenderPlanBuild(neon_capPhysW, neon_capPhysH, #V3D_OFMT_RGBA8, 1, 0, 0, @capPlan)
+  If r <> #V3D_OK
+    neon_err = #NEON_ERR_GEOMETRY
+    ProcedureReturn #NEON_ERR_GEOMETRY
+  EndIf
 
   ; ------------------------------------------------------------------
   ;  3. The page table's extent, derived rather than reserved. The
@@ -1695,6 +1891,8 @@ Procedure.i NeonInit()
   EndIf
   fbPage0  = (neon_fb / 4096) * 4096
   fbMapEnd = neon_RoundPage(neon_fb + neon_fbMapBytes)
+  neon_mapBase = neon_fb
+  neon_mapBytes = neon_fbMapBytes
   maxVa    = fbMapEnd
   If neon_arenaEnd > maxVa
     maxVa = neon_arenaEnd
@@ -1729,11 +1927,11 @@ Procedure.i NeonInit()
   ; (0,0,0,1) because that is what a missing vec4 should be.
   p = p + 4096
 
-  neon_tstateBytes = neon_RoundPage(V3dTileStateNeeded())
+  neon_tstateBytes = neon_RoundPage(capPlan\tileStateBytes)
   neon_tstate = p
   p = p + neon_tstateBytes
 
-  neon_tallocBytes = neon_RoundPage(V3dTileAllocNeeded())
+  neon_tallocBytes = neon_RoundPage(capPlan\tileAllocBytes)
   neon_talloc = p
   p = p + neon_tallocBytes
 
@@ -1807,9 +2005,9 @@ Procedure.i NeonInit()
   ; V3D MMU: the CPU reads them while it builds vertices and no engine
   ; ever sees them.
   neon_xcTab = p
-  p = p + neon_RoundPage(neon_physW * 3 * 4)
+  p = p + neon_RoundPage(neon_capPhysW * 3 * 4)
   neon_ycTab = p
-  p = p + neon_RoundPage(neon_physH * 3 * 4)
+  p = p + neon_RoundPage(neon_capPhysH * 3 * 4)
 
   ; The per-glyph cell-edge UV table, also CPU-only and unmapped: one
   ; page holds four floats for each of up to 256 glyphs. Built once when
@@ -2018,16 +2216,7 @@ Procedure.i NeonInit()
     neon_byteF32[n] = neon_F32Ratio(n, 255)
     n = n + 1
   Wend
-  n = 0
-  While n < (neon_physW * 3)
-    PokeN(neon_xcTab + (n * 4), neon_F32Ratio(n - neon_physW - neon_cx, neon_cx))
-    n = n + 1
-  Wend
-  n = 0
-  While n < (neon_physH * 3)
-    PokeN(neon_ycTab + (n * 4), neon_F32Ratio(n - neon_physH - neon_cy, neon_cy))
-    n = n + 1
-  Wend
+  neon_BuildCoordinateTables(neon_physW, neon_physH, neon_cx, neon_cy)
 
   gNeonReady = 1
   ProcedureReturn #NEON_OK

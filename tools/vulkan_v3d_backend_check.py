@@ -34,6 +34,7 @@ ROOT = HERE.parent
 GATE = ROOT / "RaspberryPi4" / "Tests" / "vulkan_v3d_backend_emitted_gate.pi4"
 BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_backend.pi4"
 V3D_CORE = ROOT / "RaspberryPi4" / "Lib" / "v3d.pi4"
+NEON_CORE = ROOT / "RaspberryPi4" / "Lib" / "neon.pi4"
 # The board diagnostic is not executed here - it needs the GPU - but it is
 # BUILT, so it cannot rot silently between slots. A diagnostic that no
 # longer compiles is discovered on the bench otherwise, which is the most
@@ -41,6 +42,7 @@ V3D_CORE = ROOT / "RaspberryPi4" / "Lib" / "v3d.pi4"
 DIAGNOSTICS = (
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanClearProof.pi4",
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanClearRefusals.pi4",
+    ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanDynamicGeometryProof.pi4",
 )
 
 LOAD = 0x00400000
@@ -57,8 +59,11 @@ MAGIC = 0x564B4233  # "VKB3"
 # A backend that lowers a clear anywhere but through the engine this tree
 # proves on silicon, or that keeps a processor-side fallback, is not the
 # thing the board diagnostic tests.
-REQUIRED_CALLS = ("NeonRetarget", "NeonFrameBegin", "NeonFrameEnd",
-                  "Neon_SurfacePhysicalW", "Neon_SurfacePhysicalH", "Neon_SurfacePitch")
+REQUIRED_CALLS = ("NeonRebindSurface", "NeonFrameBegin", "NeonFrameEnd",
+                  "Neon_SurfaceW", "Neon_SurfaceH", "Neon_SurfacePitch",
+                  "Neon_SurfaceBytes", "Neon_SurfaceFormat",
+                  "Neon_SurfaceRotation", "Neon_CapacityPhysicalW",
+                  "Neon_CapacityPhysicalH")
 REQUIRED_DESCRIPTOR_CONTRACT = (
     "If (colourBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)",
     "V3dCacheRange(colourBase, 16)",
@@ -123,6 +128,57 @@ MUTANTS = (
     ),
 )
 
+DYNAMIC_MUTANTS = (
+    (
+        "partial right and bottom tiles are truncated instead of rounded outward",
+        V3D_CORE,
+        "  tilesX = (width  + tileW - 1) / tileW\n  tilesY = (height + tileH - 1) / tileH\n",
+        "  tilesX = width / tileW\n  tilesY = height / tileH\n",
+    ),
+    (
+        "the planner loses the binner allocation headroom",
+        V3D_CORE,
+        "  n = n + (512 * 1024)\n  ProcedureReturn n\nEndProcedure\n",
+        "  ProcedureReturn n\nEndProcedure\n",
+    ),
+    (
+        "a geometry change is accepted during an active frame",
+        NEON_CORE,
+        "  Protected plan.V3dRenderPlan\n\n  If gNeonReady = 0\n    neon_err = #NEON_ERR_ARENA\n    ProcedureReturn #NEON_ERR_ARENA\n  EndIf\n  If neon_inFrame <> 0\n",
+        "  Protected plan.V3dRenderPlan\n\n  If gNeonReady = 0\n    neon_err = #NEON_ERR_ARENA\n    ProcedureReturn #NEON_ERR_ARENA\n  EndIf\n  If neon_inFrame < 0\n",
+    ),
+    (
+        "a render target outside the mapped span reaches V3D",
+        NEON_CORE,
+        "  If base < neon_mapBase Or (base - neon_mapBase) > (neon_mapBytes - bytes)\n",
+        "  If base < neon_mapBase And (base - neon_mapBase) > (neon_mapBytes - bytes)\n",
+    ),
+    (
+        "a geometry larger than the carved capacity is accepted",
+        NEON_CORE,
+        "  If pw > neon_capPhysW Or ph > neon_capPhysH\n",
+        "  If pw > neon_capPhysW And ph > neon_capPhysH\n",
+    ),
+    (
+        "a rebind ignores undersized tile pools",
+        NEON_CORE,
+        "  If plan\\tileAllocBytes > neon_tallocBytes Or plan\\tileStateBytes > neon_tstateBytes\n",
+        "  If plan\\tileAllocBytes > neon_tallocBytes And plan\\tileStateBytes > neon_tstateBytes\n",
+    ),
+    (
+        "a failed rebind no longer reinstalls the old geometry",
+        NEON_CORE,
+        "    rollbackRc = V3dRenderBegin(oldPw, oldPh, oldFmt)\n",
+        "    rollbackRc = r\n",
+    ),
+    (
+        "a successful rebind leaves stale coordinate tables",
+        NEON_CORE,
+        "  neon_BuildCoordinateTables(pw, ph, cx, cy)\n",
+        "  ; coordinate tables deliberately left stale\n",
+    ),
+)
+
 # RULES THIS DESK GATE CANNOT REACH. Each compares against a number that
 # only exists once the graphics engine is initialised, so no desk run can
 # mutate-test it - the engine-not-ready refusal answers first. They are
@@ -140,14 +196,16 @@ DESK_UNREACHABLE = (
      "image of EXACTLY the render geometry placed at the surface base, so every "
      "earlier check passed and only this rule could answer - vkEndCommandBuffer "
      "returned VK_ERROR_FEATURE_NOT_PRESENT (-8); report slot 2 = 1, slot 3 = -8"),
-    ("the backend refuses any extent but the render geometry NeonInit was given",
-     "the width, height and pitch it compares against only exist after NeonInit",
-     "PROVEN BOTH DIRECTIONS on silicon. Accepting: board run 2 ran 800x1280 "
-     "pitch 3200 against a surface of exactly that and the rule did not fire. "
-     "Refusing: board run 3 offered a 640x480 image at $063E8000 - not the "
-     "surface base, so the scanned-buffer rule could not be what answered - and "
-     "vkEndCommandBuffer returned VK_ERROR_FEATURE_NOT_PRESENT (-8); report "
-     "slot 4 = 1, slot 5 = -8"),
+    ("dynamic render geometry rebinds completely and restores the display geometry",
+     "the transaction requires an initialised Neon/V3D engine, mapped render memory, "
+     "GPU submission, exact output inspection, and a subsequent display frame",
+     "PROVEN BOTH DIRECTIONS on Pi 4 build 101, 2026-09-13, container "
+     "275fdb26, vulkanDynamicGeometryProof. Accepting: 800x1280, 640x360 and "
+     "partial-tile 257x193 each advanced bin/render once, completed a fence, "
+     "had zero mismatches and exact first/last FF3380B2; a restored ordinary "
+     "800x1280 frame then advanced both jobs and every word was FF2060A0. "
+     "Refusing: 1281x64 returned invalid extent -20001 before either counter "
+     "moved. Fixed report at 05900000 returned status zero"),
 )
 
 
@@ -320,6 +378,27 @@ def source_contract(text: str) -> list[str]:
     for token in FORBIDDEN_TOKENS:
         if token in text:
             failures.append("the backend holds a processor-side fallback token " + token)
+
+    neon = NEON_CORE.read_text(encoding="utf-8")
+    begin = neon.find("Procedure.i NeonRebindSurface(")
+    end = neon.find("EndProcedure", begin)
+    rebind = neon[begin:end] if begin >= 0 and end > begin else ""
+    dynamic_required = (
+        "If neon_inFrame <> 0",
+        "If base < neon_mapBase Or (base - neon_mapBase) > (neon_mapBytes - bytes)",
+        "If pw > neon_capPhysW Or ph > neon_capPhysH",
+        "If plan\\tileAllocBytes > neon_tallocBytes Or plan\\tileStateBytes > neon_tstateBytes",
+        "rollbackRc = V3dRenderBegin(oldPw, oldPh, oldFmt)",
+        "neon_BuildCoordinateTables(pw, ph, cx, cy)",
+    )
+    for snippet in dynamic_required:
+        if snippet not in rebind:
+            failures.append("the transactional geometry contract lost: " + snippet)
+    planned = rebind.find("r = V3dRenderBegin(pw, ph, outFmt)")
+    tabled = rebind.find("neon_BuildCoordinateTables(pw, ph, cx, cy)")
+    published = rebind.find("neon_fb = base")
+    if planned < 0 or tabled < planned or published < tabled:
+        failures.append("the new surface is published before V3D and its coordinate tables are complete")
     return failures
 
 
@@ -369,12 +448,13 @@ def main() -> int:
     print("  object engine and the V3D backend; the whole closure resolves at this revision")
     print("  with the engine down the backend enumerates no device and refuses every clear")
     print("  NOT ONE MMIO ACCESS was made reaching that answer")
-    print("  the backend lowers only through NeonRetarget/NeonFrameBegin/NeonFrameEnd and")
+    print("  the backend lowers only through NeonRebindSurface/NeonFrameBegin/NeonFrameEnd and")
     print("  holds no processor-side or DMA image fallback")
     print("  HOST_COHERENT is backed by required submit and render-completion cache maintenance")
     if diagnostic_built:
-        print("  both board diagnostics build at $500000 - vulkanClearProof.pi4 and")
-        print("  vulkanClearRefusals.pi4 (not executed: they need the GPU, and that is a slot)")
+        print("  all three board diagnostics build at $500000 - vulkanClearProof.pi4,")
+        print("  vulkanClearRefusals.pi4 and vulkanDynamicGeometryProof.pi4")
+        print("  (not executed: they need the GPU, and that is a slot)")
 
     if not args.mutate:
         print("  (run with --mutate to also require every plausible mistake to be caught)")
@@ -412,6 +492,33 @@ def main() -> int:
                 print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
                 missed += 1
 
+        for name, path, fixed, broken in DYNAMIC_MUTANTS:
+            original_dynamic = path.read_text(encoding="utf-8")
+            if original_dynamic.count(fixed) != 1:
+                print(f"  STALE  {name} - its anchor appears "
+                      f"{original_dynamic.count(fixed)} times; not tested")
+                missed += 1
+                continue
+            path.write_text(original_dynamic.replace(fixed, broken, 1), encoding="utf-8")
+            try:
+                source_red = source_contract(BACKEND.read_text(encoding="utf-8"))
+                if source_red:
+                    red, first = True, source_red[0][:100]
+                else:
+                    mcpu, mrc, msteps = execute(a64, build(compiler, ROOT, GATE))
+                    mg = grade(mcpu, mrc)
+                    red = bool(mg.failures)
+                    first = mg.failures[0][:100] if mg.failures else ""
+            except SystemExit as exc:
+                red, first = True, str(exc).splitlines()[0][:100]
+            finally:
+                path.write_text(original_dynamic, encoding="utf-8")
+            if red:
+                print(f"  RED    {name} - {first}")
+            else:
+                print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
+                missed += 1
+
     owed = 0
     for name, why, proof in DESK_UNREACHABLE:
         if proof:
@@ -424,15 +531,15 @@ def main() -> int:
 
     if missed:
         print()
-        print(f"vulkan_v3d_backend_check: {missed} of {len(MUTANTS)} mutations were not caught")
+        print(f"vulkan_v3d_backend_check: {missed} of {len(MUTANTS) + len(DYNAMIC_MUTANTS)} mutations were not caught")
         return 1
     if owed:
         print()
-        print(f"vulkan_v3d_backend_check: all {len(MUTANTS)} desk-reachable mutations rejected, "
+        print(f"vulkan_v3d_backend_check: all {len(MUTANTS) + len(DYNAMIC_MUTANTS)} desk-reachable mutations rejected, "
               f"but {owed} desk-unreachable rule(s) have no board proof and are not claimed")
         return 1
     print()
-    print(f"vulkan_v3d_backend_check: all {len(MUTANTS)} desk-reachable mutations rejected; "
+    print(f"vulkan_v3d_backend_check: all {len(MUTANTS) + len(DYNAMIC_MUTANTS)} desk-reachable mutations rejected; "
           f"the {len(DESK_UNREACHABLE)} desk-unreachable rules are proven on silicon in both "
           f"directions, above")
     return 0

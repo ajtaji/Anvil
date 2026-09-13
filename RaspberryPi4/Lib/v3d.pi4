@@ -6290,6 +6290,33 @@ Global v3d_havePool.i = 0
 Global v3d_haveBcl.i  = 0
 Global v3d_haveRcl.i  = 0
 
+; A complete render-geometry answer.  This is deliberately a value record:
+; V3dRenderPlanBuild changes no live V3D state, so Neon can prove that its
+; already-carved pools can hold a new surface before the current surface is
+; disturbed.
+Structure V3dRenderPlan
+  width.i
+  height.i
+  outFmt.i
+  nrRts.i
+  msaa.i
+  doubleBuffer.i
+  internalType.i
+  internalBpp.i
+  clamp.i
+  tileW.i
+  tileH.i
+  tilesX.i
+  tilesY.i
+  supertileW.i
+  supertileH.i
+  frameSupertilesW.i
+  frameSupertilesH.i
+  layers.i
+  tileAllocBytes.i
+  tileStateBytes.i
+EndStructure
+
 ; Evidence, all of it, remembered across the two waits so that a
 ; failed run prints one table instead of the caller having to know
 ; which register to ask for.
@@ -6331,25 +6358,39 @@ Global v3d_renCleanRc.i  = 0
 ;
 ;  Returns #V3D_OK or #V3D_ERR_CL_ARGS.
 ; ----------------------------------------------------------------------
-Procedure.i V3dRenderBegin(width.i, height.i, outFmt.i)
+Procedure.i V3dRenderPlanBuild(width.i, height.i, outFmt.i, nrRts.i, msaa.i, doubleBuffer.i, *plan.V3dRenderPlan)
   Protected idx.i
   Protected bpp.i
   Protected ty.i
   Protected cl.i
+  Protected tileW.i
+  Protected tileH.i
+  Protected tilesX.i
+  Protected tilesY.i
+  Protected stW.i
+  Protected stH.i
   Protected fw.i
   Protected fh.i
 
-  v3d_haveGeom = 0
-  v3d_haveRt   = 0
-  v3d_haveBcl  = 0
-  v3d_haveRcl  = 0
-
-  If width < 1 Or width > 65535
-    v3d_err = #V3D_ERR_CL_ARGS
+  If *plan = 0
     ProcedureReturn #V3D_ERR_CL_ARGS
   EndIf
-  If height < 1 Or height > 65535
-    v3d_err = #V3D_ERR_CL_ARGS
+  If width < 1 Or width > 65535 Or height < 1 Or height > 65535
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  If nrRts < 1 Or nrRts > 16
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  If msaa <> 0 And msaa <> 1
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  If doubleBuffer <> 0 And doubleBuffer <> 1
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  ; The current packet builders deliberately implement one render target,
+  ; no MSAA and no hardware double-buffer mode.  The planner accepts the
+  ; vocabulary only when the rest of the submission path can encode it.
+  If nrRts <> 1 Or msaa <> 0 Or doubleBuffer <> 0
     ProcedureReturn #V3D_ERR_CL_ARGS
   EndIf
 
@@ -6357,26 +6398,16 @@ Procedure.i V3dRenderBegin(width.i, height.i, outFmt.i)
   bpp = V3dInternalBppFor(outFmt)
   cl  = V3dRtClampFor(outFmt)
   If ty < 0 Or bpp < 0
-    v3d_err = #V3D_ERR_CL_ARGS
     ProcedureReturn #V3D_ERR_CL_ARGS
   EndIf
   If cl < 0
-    v3d_err = #V3D_ERR_CL_ARGS
     ProcedureReturn #V3D_ERR_CL_ARGS
   EndIf
 
-  v3d_rtOutFmt = outFmt
-  v3d_rtType   = ty
-  v3d_rtBpp    = bpp
-  v3d_rtClamp  = cl
-  v3d_jobMaxBpp = bpp
-  v3d_jobLayers = 1
-
-  idx = V3dTileSizeIndex(1, bpp, 0, 0)
-  v3d_jobTileW = V3dTileWidthOf(idx)
-  v3d_jobTileH = V3dTileHeightOf(idx)
-  If v3d_jobTileW < 1 Or v3d_jobTileH < 1
-    v3d_err = #V3D_ERR_CL_ARGS
+  idx = V3dTileSizeIndex(nrRts, bpp, msaa, doubleBuffer)
+  tileW = V3dTileWidthOf(idx)
+  tileH = V3dTileHeightOf(idx)
+  If tileW < 1 Or tileH < 1
     ProcedureReturn #V3D_ERR_CL_ARGS
   EndIf
 
@@ -6384,40 +6415,99 @@ Procedure.i V3dRenderBegin(width.i, height.i, outFmt.i)
   ; tile size. A frame that is not a whole number of tiles renders
   ; partial tiles at its right and bottom edges, which is normal and
   ; is why the store carries a stride rather than a size.
-  v3d_jobW = width
-  v3d_jobH = height
-  v3d_jobTilesX = (width  + v3d_jobTileW - 1) / v3d_jobTileW
-  v3d_jobTilesY = (height + v3d_jobTileH - 1) / v3d_jobTileH
+  tilesX = (width  + tileW - 1) / tileW
+  tilesY = (height + tileH - 1) / tileH
+  ; MULTICORE_RENDERING_SUPERTILE_CFG has twelve bits per tile count.
+  If tilesX > 4095 Or tilesY > 4095
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
 
   ; The supertile sizing loop, v3dx_rcl.c:516-532. Grow the supertile
   ; until the frame needs fewer than 256 of them, always growing the
   ; smaller dimension so they stay as square as they can.
-  v3d_jobStW = 1
-  v3d_jobStH = 1
+  stW = 1
+  stH = 1
   Repeat
-    fw = (v3d_jobTilesX + v3d_jobStW - 1) / v3d_jobStW
-    fh = (v3d_jobTilesY + v3d_jobStH - 1) / v3d_jobStH
+    fw = (tilesX + stW - 1) / stW
+    fh = (tilesY + stH - 1) / stH
     If (fw * fh) < #V3D_MAX_SUPERTILES
       Break
     EndIf
-    If v3d_jobStW < v3d_jobStH
-      v3d_jobStW = v3d_jobStW + 1
+    If stW < stH
+      stW = stW + 1
     Else
-      v3d_jobStH = v3d_jobStH + 1
+      stH = stH + 1
     EndIf
     ; A bound that Mesa does not have. Mesa's loop is unbounded
     ; because its inputs come from a validated framebuffer; here the
     ; width and height are whatever a caller passed and an unbounded
     ; loop on a bad one is a hang with no message, which this file
-    ; refuses to have anywhere. 4096 tiles in a dimension is the
-    ; TILE_COORDINATES field's own limit.
-    If v3d_jobStW > 4096 Or v3d_jobStH > 4096
-      v3d_err = #V3D_ERR_CL_ARGS
+    ; refuses to have anywhere.  The supertile dimensions themselves are
+    ; eight-bit fields, so a value above 256 cannot be encoded as value-1.
+    If stW > 256 Or stH > 256
       ProcedureReturn #V3D_ERR_CL_ARGS
     EndIf
   ForEver
-  v3d_jobFwSt = fw
-  v3d_jobFhSt = fh
+
+  ; Those two fields are eight-bit counts, not minus-one fields.
+  If fw > 255 Or fh > 255
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+
+  *plan\width = width
+  *plan\height = height
+  *plan\outFmt = outFmt
+  *plan\nrRts = nrRts
+  *plan\msaa = msaa
+  *plan\doubleBuffer = doubleBuffer
+  *plan\internalType = ty
+  *plan\internalBpp = bpp
+  *plan\clamp = cl
+  *plan\tileW = tileW
+  *plan\tileH = tileH
+  *plan\tilesX = tilesX
+  *plan\tilesY = tilesY
+  *plan\supertileW = stW
+  *plan\supertileH = stH
+  *plan\frameSupertilesW = fw
+  *plan\frameSupertilesH = fh
+  *plan\layers = 1
+  *plan\tileAllocBytes = V3dTileAllocBytesFor(tilesX, tilesY, 1)
+  *plan\tileStateBytes = V3dTileStateBytesFor(tilesX, tilesY, 1)
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+Procedure.i V3dRenderBegin(width.i, height.i, outFmt.i)
+  Protected plan.V3dRenderPlan
+  Protected r.i
+
+  v3d_haveGeom = 0
+  v3d_haveRt   = 0
+  v3d_haveBcl  = 0
+  v3d_haveRcl  = 0
+
+  r = V3dRenderPlanBuild(width, height, outFmt, 1, 0, 0, @plan)
+  If r <> #V3D_OK
+    v3d_err = r
+    ProcedureReturn r
+  EndIf
+
+  v3d_rtOutFmt = plan\outFmt
+  v3d_rtType = plan\internalType
+  v3d_rtBpp = plan\internalBpp
+  v3d_rtClamp = plan\clamp
+  v3d_jobW = plan\width
+  v3d_jobH = plan\height
+  v3d_jobTileW = plan\tileW
+  v3d_jobTileH = plan\tileH
+  v3d_jobTilesX = plan\tilesX
+  v3d_jobTilesY = plan\tilesY
+  v3d_jobStW = plan\supertileW
+  v3d_jobStH = plan\supertileH
+  v3d_jobFwSt = plan\frameSupertilesW
+  v3d_jobFhSt = plan\frameSupertilesH
+  v3d_jobMaxBpp = plan\internalBpp
+  v3d_jobLayers = plan\layers
 
   v3d_haveGeom = 1
   ProcedureReturn #V3D_OK

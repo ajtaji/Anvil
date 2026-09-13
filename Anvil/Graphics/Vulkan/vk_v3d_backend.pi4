@@ -173,20 +173,18 @@ Procedure.i avkBackendImageAlignment()
   ProcedureReturn 4096
 EndProcedure
 
-; The row pitch an image of this width must have. At the surface's own
-; width it is the surface's own pitch, which is what the render target
-; is configured with; at any other width it is the tight pitch, and
-; avkBackendClearSupported then refuses the clear rather than letting a
-; caller build an image this backend could never write.
+; Linear BGRA8 images use a tight four-byte row.  The transactional Neon
+; rebind installs this pitch in the V3D store packet; it is no longer copied
+; from the display surface.
 Procedure.i avkBackendRowPitchFor(width.i)
-  If Neon_Ready() <> 0 And width = Neon_SurfacePhysicalW()
-    ProcedureReturn Neon_SurfacePitch()
-  EndIf
   ProcedureReturn width * 4
 EndProcedure
 
 Procedure.i avkBackendMaxImageDimension2D()
-  ProcedureReturn 4096
+  Define n.i
+  n = Neon_CapacityPhysicalW()
+  If Neon_CapacityPhysicalH() < n : n = Neon_CapacityPhysicalH() : EndIf
+  ProcedureReturn n
 EndProcedure
 
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
@@ -196,10 +194,9 @@ Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   ; plus size which wraps cannot pass the check.
   If base < avkV3dWindowBase Or bytes > avkV3dWindowBytes : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   If (base - avkV3dWindowBase) > (avkV3dWindowBytes - bytes) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
-  ; The render geometry is fixed at NeonInit and NeonRetarget does not
-  ; change it. An image of another shape cannot be rendered by this path.
-  If w <> Neon_SurfacePhysicalW() Or h <> Neon_SurfacePhysicalH() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
-  If pitch <> Neon_SurfacePitch() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If w < 8 Or h < 8 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If w > Neon_CapacityPhysicalW() Or h > Neon_CapacityPhysicalH() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If pitch <> (w * 4) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   If bytes < (pitch * h) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   ; This backend is offscreen. The buffer the engine is currently
   ; targeting is the display's, and rendering into it from here would
@@ -216,6 +213,11 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
   Define restoreRc.i
   Define oldBase.i
   Define oldBytes.i
+  Define oldW.i
+  Define oldH.i
+  Define oldPitch.i
+  Define oldFormat.i
+  Define oldRotation.i
 
   avkV3dNative = 0
   rc = avkBackendClearSupported(base, bytes, w, h, pitch)
@@ -225,9 +227,14 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
   EndIf
 
   oldBase = Neon_SurfaceBase()
-  oldBytes = Neon_SurfacePitch() * Neon_SurfacePhysicalH()
+  oldBytes = Neon_SurfaceBytes()
+  oldW = Neon_SurfaceW()
+  oldH = Neon_SurfaceH()
+  oldPitch = Neon_SurfacePitch()
+  oldFormat = Neon_SurfaceFormat()
+  oldRotation = Neon_SurfaceRotation()
 
-  rc = NeonRetarget(base, pitch * h)
+  rc = NeonRebindSurface(base, w, h, pitch, bytes, #V3D_OFMT_RGBA8, 0)
   If rc = #NEON_OK
     rc = NeonFrameBegin(bgra)
   EndIf
@@ -236,7 +243,7 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
   EndIf
   If rc <> #NEON_OK : avkV3dNative = rc : EndIf
 
-  restoreRc = NeonRetarget(oldBase, oldBytes)
+  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
   If restoreRc <> #NEON_OK And avkV3dNative = 0
     avkV3dNative = restoreRc
   EndIf
@@ -350,6 +357,11 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Define restoreRc.i
   Define oldBase.i
   Define oldBytes.i
+  Define oldW.i
+  Define oldH.i
+  Define oldPitch.i
+  Define oldFormat.i
+  Define oldRotation.i
   Define pipe.i
   Define pbase.i
   Define varyComps.i
@@ -379,8 +391,8 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     avkV3dNative = rc
     ProcedureReturn -1
   EndIf
-  If AnvilVkPipelineViewportWidth(pipe) <> Neon_SurfacePhysicalW() Or AnvilVkPipelineViewportHeight(pipe) <> Neon_SurfacePhysicalH()
-    avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw whose viewport is not the render geometry the graphics engine was initialised with (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The clipper's scaling is written from the engine's surface and the emitted coordinate shader scales by the pipeline's viewport, so the two must be the same rectangle.")
+  If AnvilVkPipelineViewportWidth(pipe) <> *d\width Or AnvilVkPipelineViewportHeight(pipe) <> *d\height
+    avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw whose viewport is not the framebuffer render geometry (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This tranche requires one whole-frame viewport, so the pipeline viewport and framebuffer must be the same rectangle.")
     avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
     ProcedureReturn -1
   EndIf
@@ -445,9 +457,14 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   avkV3dLastRecord = pbase + #AVKQ_OFF_SHREC
 
   oldBase = Neon_SurfaceBase()
-  oldBytes = Neon_SurfacePitch() * Neon_SurfacePhysicalH()
+  oldBytes = Neon_SurfaceBytes()
+  oldW = Neon_SurfaceW()
+  oldH = Neon_SurfaceH()
+  oldPitch = Neon_SurfacePitch()
+  oldFormat = Neon_SurfaceFormat()
+  oldRotation = Neon_SurfaceRotation()
 
-  rc = NeonRetarget(*d\targetBase, *d\pitch * *d\height)
+  rc = NeonRebindSurface(*d\targetBase, *d\width, *d\height, *d\pitch, *d\targetBytes, #V3D_OFMT_RGBA8, 0)
   If rc = #NEON_OK
     rc = NeonFrameBegin(*d\clearBgra)
   EndIf
@@ -492,7 +509,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   EndIf
   If rc <> #NEON_OK : avkV3dNative = rc : EndIf
 
-  restoreRc = NeonRetarget(oldBase, oldBytes)
+  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
   If restoreRc <> #NEON_OK And avkV3dNative = 0
     avkV3dNative = restoreRc
   EndIf

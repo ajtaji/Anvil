@@ -623,3 +623,29 @@ provenance of any translated driver expression. The public-source provenance
 hold remains in effect: future work must use the Khronos material under its
 retained terms and independently document any hardware-driver source used,
 without copying GPL driver code into MIT-labeled Anvil source.
+
+## Dynamic render geometry — Pi 4 acceptance, 2026-09-13
+
+The V3D layer now has one pure geometry planner used by the live packet path.
+Neon carves tile pools and coordinate tables for a declared pre-init capacity,
+validates the already mapped target span, and rebinds the complete geometry as
+one transaction.  Vulkan saves and restores the full display surface around a
+clear or draw; its linear BGRA8 row pitch is now derived from the image width,
+not copied from the display.
+
+The returning RAM diagnostic
+`RaspberryPi4/Examples/Diagnostics/vulkanDynamicGeometryProof.pi4` passed on
+build 101 with PMFBOOT SHA-256
+`275fdb26db7fe3065b4e7f61f4eb303441dec4d1d71e96f414c44c00a6b74767`.
+At 800x1280, 640x360 and 257x193, each public Vulkan clear mapped, submitted,
+completed its fence, advanced one bin and render job, and produced exact
+`$FF3380B2` pixels with no mismatch or new V3D fault/OOM.  1281x64 was refused
+before either job counter moved.  A subsequent ordinary 800x1280 engine frame
+advanced both counters and produced exact `$FF2060A0`, proving the restored
+geometry remained operational.  The payload returned zero and shut down the
+V3D MMU.
+
+The detailed report and capture are recorded in
+`docs/VULKAN_DYNAMIC_RENDER_GEOMETRY_DESIGN.md`.  This proves the prerequisite
+for an honest image-format-properties query; it does not itself add or claim
+that entry point.

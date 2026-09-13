@@ -51,6 +51,54 @@ Procedure.i Main()
   Define count.i
   Define ici.VkInstanceCreateInfo
   Define mp.VkPhysicalDeviceMemoryProperties
+  Define plan.V3dRenderPlan
+
+  ; The geometry planner is pure: it answers exact packet and pool geometry
+  ; without initialising V3D or changing the live render globals.
+  Vkb(V3dTileW() = 0)
+  Vkb(V3dRenderPlanBuild(800, 1280, #V3D_OFMT_RGBA8, 1, 0, 0, @plan) = #V3D_OK)
+  Vkb(plan\tileW = 64 And plan\tileH = 64)
+  Vkb(plan\tilesX = 13 And plan\tilesY = 20)
+  Vkb(plan\supertileW = 1 And plan\supertileH = 2)
+  Vkb(plan\frameSupertilesW = 13 And plan\frameSupertilesH = 10)
+  Vkb(plan\tileAllocBytes = 552960)
+  Vkb(plan\tileStateBytes = 66560)
+  Vkb(V3dTileW() = 0)
+
+  ; A non-tile-aligned surface must round outward, never truncate the right
+  ; or bottom edge.
+  Vkb(V3dRenderPlanBuild(257, 193, #V3D_OFMT_RGBA8, 1, 0, 0, @plan) = #V3D_OK)
+  Vkb(plan\tilesX = 5 And plan\tilesY = 4)
+  Vkb(plan\frameSupertilesW = 5 And plan\frameSupertilesH = 4)
+  Vkb(plan\tileAllocBytes = 536576)
+  Vkb(plan\tileStateBytes = 5120)
+
+  ; Capacity geometry is larger than the startup panel in both dimensions.
+  Vkb(V3dRenderPlanBuild(1280, 1280, #V3D_OFMT_RGBA8, 1, 0, 0, @plan) = #V3D_OK)
+  Vkb(plan\tilesX = 20 And plan\tilesY = 20)
+  Vkb(plan\supertileW = 1 And plan\supertileH = 2)
+  Vkb(plan\tileAllocBytes = 561152)
+  Vkb(plan\tileStateBytes = 102400)
+
+  ; Every packet mode the submission builder does not implement is refused
+  ; here, before any live state can be touched.
+  Vkb(V3dRenderPlanBuild(0, 64, #V3D_OFMT_RGBA8, 1, 0, 0, @plan) = #V3D_ERR_CL_ARGS)
+  Vkb(V3dRenderPlanBuild(64, 0, #V3D_OFMT_RGBA8, 1, 0, 0, @plan) = #V3D_ERR_CL_ARGS)
+  Vkb(V3dRenderPlanBuild(64, 64, 999, 1, 0, 0, @plan) = #V3D_ERR_CL_ARGS)
+  Vkb(V3dRenderPlanBuild(64, 64, #V3D_OFMT_RGBA8, 2, 0, 0, @plan) = #V3D_ERR_CL_ARGS)
+  Vkb(V3dRenderPlanBuild(64, 64, #V3D_OFMT_RGBA8, 1, 1, 0, @plan) = #V3D_ERR_CL_ARGS)
+  Vkb(V3dRenderPlanBuild(64, 64, #V3D_OFMT_RGBA8, 1, 0, 1, @plan) = #V3D_ERR_CL_ARGS)
+  Vkb(V3dRenderPlanBuild(64, 64, #V3D_OFMT_RGBA8, 1, 0, 0, 0) = #V3D_ERR_CL_ARGS)
+
+  ; The live consumer must install exactly the planner's answer, still with no
+  ; register access: hardware is touched only by submit/wait.
+  Vkb(V3dRenderBegin(257, 193, #V3D_OFMT_RGBA8) = #V3D_OK)
+  Vkb(V3dTileW() = 64 And V3dTileH() = 64)
+  Vkb(V3dTilesX() = 5 And V3dTilesY() = 4)
+  Vkb(V3dSupertileW() = 1 And V3dSupertileH() = 1)
+  Vkb(V3dFrameStW() = 5 And V3dFrameStH() = 4)
+  Vkb(V3dTileAllocNeeded() = 536576)
+  Vkb(V3dTileStateNeeded() = 5120)
 
   ; The engine has not been initialised and no window has been declared.
   Vkb(Neon_Ready() = 0)

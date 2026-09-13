@@ -1,6 +1,8 @@
 # Vulkan dynamic render geometry — bottom-up design
 
-Status: design only. No image-format maximum is advertised from this document.
+Status: implemented and proved on the Pi 4 on 2026-09-13.  The geometry and
+capacity prerequisite is green; the image-format-properties query is the next
+tranche and is not claimed by this document.
 
 ## Why this is a prerequisite
 
@@ -142,3 +144,41 @@ such as 257x193. For every geometry require:
 The negative run asks for one dimension or one row beyond each accepted
 capacity and proves refusal before any V3D submission. No public Vulkan maximum
 is added until both the desk mutants and these board boundaries pass.
+
+## Acceptance record — 2026-09-13
+
+`RaspberryPi4/Examples/Diagnostics/vulkanDynamicGeometryProof.pi4`'s silicon-run
+artifact was rebuilt byte-for-byte with the final unified IDE/compiler SHA-256
+`04D5EE6EF643BE3330D4FC0A0AE8E4B27E6388FAD17643068173C7776B5DD3AF`.
+The PMFBOOT container was 382,124 bytes, SHA-256
+`275fdb26db7fe3065b4e7f61f4eb303441dec4d1d71e96f414c44c00a6b74767`;
+its 381,996-byte image SHA-256 was
+`2c72e249478c6f6a773decb7e0851bbc166026ca76e073fff522c02604d18cee`.
+It ran as a returning RAM payload under the known build-101 monitor and did not
+replace or flash it.
+
+The fixed report at `$05900000` returned status zero in 6.4 seconds.  All three
+geometries — 800x1280, 640x360 and partial-tile 257x193 — reported tight pitch
+and exact size, one bin and one render job, fence `VK_NOT_READY` before submit
+and `VK_SUCCESS` after wait, zero mismatches, and exact first/last word
+`$FF3380B2`.  The memory allocator reused the same mapped address only after
+each prior image and allocation were destroyed.  The 1281x64 negative was
+refused with the implementation's invalid-extent code -20001 while both job
+counters remained unchanged.  The restored 800x1280 ordinary Neon frame then
+advanced each job counter once, contained `$FF2060A0` in every word, presented,
+and shut the V3D MMU down with result zero.
+
+Evidence is under `_work/vulkan-dynamic-20260913/run1/`.  The captured raster is
+1280x800 after the monitor's 90-degree presentation and has pixel SHA-256
+`bd7076afc74b29dc6c55ac1006dc9935efb02bad4569a2ce07a36811b169f68e`.
+The build-101 monitor rewrote the capture header's payload return from the old
+`$595F98` to zero and streamed the new uniform `$FF2060A0` frame, but failed to
+raise its capture sequence from one.  Therefore `board_run.py` correctly marks
+the separate capture-freshness invariant red even though the payload report,
+header change and new pixels prove this geometry run.  That monitor defect is
+not folded into the Vulkan tranche.
+
+The focused desk gate executes 84 properties over 108,668 emitted A64
+instructions without one MMIO access, compiles all three board diagnostics,
+and rejects all sixteen independently injected errors.  The silicon record
+above supplies the one rule that cannot be reached with the engine down.
