@@ -158,6 +158,9 @@ def main():
         checks.yes(call('CoreAcceptRun')==0,'EL3 lease blocks secondary start')
         checks.yes(all(base.u64(mem,0xD8+c*8)==0 for c in (1,2,3)),'lease refusal before release')
         checks.yes(call('AcceptLeaseRelease',arguments=(2,2))==1,'exact owner releases')
+        base.put64(mem,sym['global_accept_secondary_owner'],1)
+        checks.yes(call('AcceptLeaseAcquire',arguments=(2,3))==0,
+                   'persistent secondary ownership refuses even with cleared lease fields')
         # Deadline refusal with an absent secondary; source also has a spin cap.
         mem,_,primary,call = machine()
         primary.cntpct_per_instruction = 1000000
