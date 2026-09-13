@@ -25,8 +25,11 @@ It is reached through the public `vkCmdClearColorImage` and `vkQueueSubmit`,
 after a public `vkCmdPipelineBarrier`-shaped transition, and its completion is
 observed through a public `VkFence`.
 
-The execution path is `NeonRetarget`, `NeonFrameBegin` and `NeonFrameEnd` with
-no draws. That builds and submits real V3D bin and render control lists:
+The execution path is `NeonRebindSurface`, `NeonFrameBegin` and `NeonFrameEnd`
+with no draws. `NeonRebindSurface` plans and validates each accepted geometry,
+rebuilds its coordinate tables, and restores the complete display-owned surface
+after submission. The frame then builds and submits real V3D bin and render
+control lists:
 `V3dBinSubmit`, `V3dBinWait`, `V3dRenderSubmit` and `V3dRenderWait` launch,
 wait, clean the V3D caches and maintain the processor's view of the target.
 The tile clear and the tile store are what write the image. There is no
@@ -35,15 +38,12 @@ desk gate checks the source for one.
 
 ### What this backend still cannot do, and says so
 
-- **Any extent but one.** `NeonFrameBegin`/`NeonFrameEnd` render at the
-  geometry `V3dRenderBegin` was handed inside `NeonInit`, and `NeonRetarget`
-  rebinds only the target address and size. The tile counts, the tile-state
-  and tile-allocation pools and the clipper scaling all belong to that one
-  geometry. An image of any other width, height or row pitch is refused at
-  **record time** with `VK_ERROR_FEATURE_NOT_PRESENT`, so it never reaches a
-  queue. Lifting this needs a new primitive in `RaspberryPi4/Lib/v3d.pi4`;
-  its exact specification is in the lane report, and that file is owned by
-  the display lane.
+- **Extents beyond the proved capacity.** The backend accepts linear BGRA8
+  images through the V3D planner up to the configured equal width/height
+  maximum and derives row pitch from the same rule used by creation and the
+  public image-format query. Zero, overflowing, over-capacity or unmapped
+  geometry is refused before a job counter can move. Mips, array layers,
+  multisampling, optimal tiling and other formats remain unsupported.
 - **The buffer the display is scanning out.** This backend is offscreen by
   contract. Presentation stays with the display layer.
 - **Asynchrony.** `NeonFrameEnd` waits for both jobs before it returns, so
@@ -61,7 +61,8 @@ desk gate checks the source for one.
   extent, optionality rule, and platform guard.
 - Public `vk*` entry points, dispatch tables, `vkGetInstanceProcAddr`, allocator
   callback semantics, extension/layer enumeration, general properties and
-  limits, image-format queries beyond the exact core format-feature query,
+  limits, image-format queries beyond the exact implemented linear-BGRA8
+  combination query,
   queue-family discovery beyond the one implemented family, and deterministic
   unsupported reporting.
 - Full lifetime graph and host synchronization for physical devices, device
@@ -89,7 +90,8 @@ display ownership.
 Implemented since 2026-09-10 and therefore **not** in this list: one heap and
 its types, exact `VkMemoryRequirements`, allocate and free with first-fit reuse
 of released holes, bind with alignment/range/double-bind/parent/type rules, and
-per-image layout and queue-family ownership for the one image shape above.
+  per-image layout and queue-family ownership for the bounded image shapes
+  above.
 Everything below remains missing.
 
 - Enumerated heaps/types and exact `VkMemoryRequirements`; allocate/free,

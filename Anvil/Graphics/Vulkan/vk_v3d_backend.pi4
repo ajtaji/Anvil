@@ -9,8 +9,9 @@
 ; what a render target, a control list or a tile is.
 ;
 ; THE EXECUTION PATH IS THE ONE THIS TREE ALREADY PROVES ON SILICON.
-; NeonRetarget points the engine at the image; NeonFrameBegin sets the
-; clear colour and builds a bin list with no draws; NeonFrameEnd cleans
+; NeonRebindSurface transactionally points the engine at the image and its
+; geometry; NeonFrameBegin sets the clear colour and builds a bin list with no
+; draws; NeonFrameEnd cleans
 ; the caches for what it produced, submits the bin job (V3dBinSubmit),
 ; waits for it (V3dBinWait), submits the render job (V3dRenderSubmit) and
 ; waits for it (V3dRenderWait). The tile clear and the tile store are
@@ -24,14 +25,10 @@
 ;
 ; WHAT THIS BACKEND CANNOT DO, and says so through
 ; avkBackendClearSupported rather than by guessing:
-;   * an image whose width, height and row pitch are not the render
-;     geometry NeonInit was given. NeonFrameBegin/NeonFrameEnd render at
-;     the geometry V3dRenderBegin was handed at initialisation, and
-;     NeonRetarget rebinds only the target address and size - the tile
-;     counts, the tile-state and tile-allocation pools and the clipper
-;     scaling all belong to that one geometry. Lifting this needs a new
-;     primitive in RaspberryPi4/Lib/v3d.pi4; its exact specification is
-;     in this lane's report and the file is owned elsewhere tonight.
+;   * an image whose width, height and row pitch do not fit the declared
+;     render capacity, mapped span and V3D packet fields. The same pure planner
+;     owns these limits for Neon rebind, Vulkan creation and the public image-
+;     format query. Every refusal occurs before live engine state is changed.
 ;   * an image that is the framebuffer the display is scanning out. This
 ;     backend is offscreen by contract; presentation stays with the
 ;     display layer, which is where the page flip and the rotation live.
@@ -290,7 +287,7 @@ EndProcedure
 ;  It runs the SAME frame the clear already proves on silicon, with one
 ;  draw added between the prologue and the submit:
 ;
-;    NeonRetarget       point the engine at the colour attachment
+;    NeonRebindSurface  point the engine at the colour attachment and geometry
 ;    NeonFrameBegin     build the render list, set the clear colour and
 ;                       write the frame prologue - clip window, clipper
 ;                       scaling, viewport offset, write masks
@@ -300,7 +297,7 @@ EndProcedure
 ;                       STATE and VERTEX_ARRAY_PRIMS
 ;    NeonFrameEnd       submit the bin job, wait, submit the render job,
 ;                       wait, and maintain the caches
-;    NeonRetarget       put the engine's previous target back
+;    NeonRebindSurface  put the engine's complete previous surface back
 ;
 ;  THE PROLOGUE'S BLEND IS TURNED OFF HERE AND THAT IS DELIBERATE. The
 ;  engine's frame prologue enables SRC_ALPHA / INV_SRC_ALPHA blending,

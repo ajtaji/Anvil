@@ -17,6 +17,8 @@
 ;
 ; The fixed 32-bit report is at $05900000.  `memory 05900000 100` reads all
 ; 64 slots.  Slot 0 is $56444750 ("VDGP"), slot 1 is zero only on success.
+; Slots 4..8 hold maxImageDimension2D, linear format bits, image-format query
+; result, maxExtent.width and maxResourceSize.
 ; Each successful geometry occupies twelve slots starting at 16, 28 and 40:
 ; width, height, pitch, bytes, image address, bin delta, render delta,
 ; fence-before, fence-after, mismatch count, first word, last word.
@@ -273,6 +275,7 @@ Procedure.i Main()
   Define fenceInfo.VkFenceCreateInfo
   Define limitInfo.VkImageCreateInfo
   Define formatProps.VkFormatProperties
+  Define imageFormatProps.VkImageFormatProperties
 
   vdgFill(#VDG_REPORT, 256, 0)
   vdgPut(0, #VDG_MAGIC)
@@ -304,6 +307,20 @@ Procedure.i Main()
   If rc <> #VK_SUCCESS Or count <> 1 : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_INSTANCE : EndIf
   vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
   vdgPut(5, formatProps\linearTilingFeatures)
+  rc = vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageFormatProps)
+  vdgPut(6, rc)
+  vdgPut(7, imageFormatProps\maxExtent\width)
+  vdgPut(8, imageFormatProps\maxResourceSize)
+  If rc <> #VK_SUCCESS Or imageFormatProps\maxExtent\width <> #VDG_CAPACITY Or imageFormatProps\maxExtent\height <> #VDG_CAPACITY Or imageFormatProps\maxExtent\depth <> 1
+    vdgPut(1, #VDG_ERR_LIMIT)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_LIMIT
+  EndIf
+  If imageFormatProps\maxMipLevels <> 1 Or imageFormatProps\maxArrayLayers <> 1 Or imageFormatProps\sampleCounts <> #VK_SAMPLE_COUNT_1_BIT Or imageFormatProps\maxResourceSize <> #VDG_MAX_IMAGE_BYTES
+    vdgPut(1, #VDG_ERR_LIMIT)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_LIMIT
+  EndIf
 
   priority = 0
   qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO

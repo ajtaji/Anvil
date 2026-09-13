@@ -78,6 +78,7 @@ Procedure SeedWanted()
   WantedStruct("VkComponentMapping") = "VkComponentSwizzle:r,VkComponentSwizzle:g,VkComponentSwizzle:b,VkComponentSwizzle:a"
   WantedStruct("VkRect2D") = "VkOffset2D:offset,VkExtent2D:extent"
   WantedStruct("VkFormatProperties") = "VkFormatFeatureFlags:linearTilingFeatures,VkFormatFeatureFlags:optimalTilingFeatures,VkFormatFeatureFlags:bufferFeatures"
+  WantedStruct("VkImageFormatProperties") = "VkExtent3D:maxExtent,uint32_t:maxMipLevels,uint32_t:maxArrayLayers,VkSampleCountFlags:sampleCounts,VkDeviceSize:maxResourceSize"
   WantedStruct("VkExtensionProperties") = "char:extensionName,uint32_t:specVersion"
   WantedStruct("VkLayerProperties") = "char:layerName,uint32_t:specVersion,uint32_t:implementationVersion,char:description"
   WantedStruct("VkApplicationInfo") = "VkStructureType:sType,void:pNext,char:pApplicationName,uint32_t:applicationVersion,char:pEngineName,uint32_t:engineVersion,uint32_t:apiVersion"
@@ -91,7 +92,7 @@ Procedure SeedWanted()
   WantedStruct("VkCommandBufferInheritanceInfo") = "VkStructureType:sType,void:pNext,VkRenderPass:renderPass,uint32_t:subpass,VkFramebuffer:framebuffer,VkBool32:occlusionQueryEnable,VkQueryControlFlags:queryFlags,VkQueryPipelineStatisticFlags:pipelineStatistics"
   WantedStruct("VkCommandBufferBeginInfo") = "VkStructureType:sType,void:pNext,VkCommandBufferUsageFlags:flags,VkCommandBufferInheritanceInfo:pInheritanceInfo"
   WantedStruct("VkSubmitInfo") = "VkStructureType:sType,void:pNext,uint32_t:waitSemaphoreCount,VkSemaphore:pWaitSemaphores,VkPipelineStageFlags:pWaitDstStageMask,uint32_t:commandBufferCount,VkCommandBuffer:pCommandBuffers,uint32_t:signalSemaphoreCount,VkSemaphore:pSignalSemaphores"
-  WantedStructOrder = "VkExtent2D,VkExtent3D,VkOffset2D,VkOffset3D,VkViewport,VkRect2D,VkFormatProperties," +
+  WantedStructOrder = "VkExtent2D,VkExtent3D,VkOffset2D,VkOffset3D,VkViewport,VkRect2D,VkFormatProperties,VkImageFormatProperties," +
                       "VkComponentMapping,VkExtensionProperties,VkLayerProperties,VkApplicationInfo," +
                       "VkAllocationCallbacks,VkDeviceQueueCreateInfo,VkPhysicalDeviceFeatures,VkDeviceCreateInfo," +
                       "VkInstanceCreateInfo,VkCommandPoolCreateInfo,VkCommandBufferAllocateInfo," +
@@ -161,10 +162,11 @@ EndProcedure
 
 Procedure.s PbSuffix(cType.s)
   Select cType
-    Case "uint32_t", "int32_t", "VkBool32", "VkComponentSwizzle", "VkStructureType", "VkDeviceQueueCreateFlags", "VkDeviceCreateFlags", "VkInstanceCreateFlags", "VkCommandPoolCreateFlags", "VkCommandBufferLevel", "VkQueryControlFlags", "VkQueryPipelineStatisticFlags", "VkCommandBufferUsageFlags", "VkPipelineStageFlags", "VkFormatFeatureFlags" : ProcedureReturn ".l"
+    Case "uint32_t", "int32_t", "VkBool32", "VkComponentSwizzle", "VkStructureType", "VkDeviceQueueCreateFlags", "VkDeviceCreateFlags", "VkInstanceCreateFlags", "VkCommandPoolCreateFlags", "VkCommandBufferLevel", "VkQueryControlFlags", "VkQueryPipelineStatisticFlags", "VkCommandBufferUsageFlags", "VkPipelineStageFlags", "VkFormatFeatureFlags", "VkSampleCountFlags" : ProcedureReturn ".l"
     Case "float" : ProcedureReturn ".f"
     Case "VkCommandPool", "VkRenderPass", "VkFramebuffer", "VkSemaphore", "VkCommandBuffer" : ProcedureReturn ".i"
-    Case "VkOffset2D", "VkExtent2D" : ProcedureReturn "." + cType
+    Case "VkOffset2D", "VkExtent2D", "VkExtent3D" : ProcedureReturn "." + cType
+    Case "VkDeviceSize" : ProcedureReturn ".q"
   EndSelect
   Die("no exact PureMetal scalar mapping for " + cType)
 EndProcedure
@@ -280,7 +282,7 @@ Procedure Main()
   gaps = CreateFile(#PB_Any, outDir + "vk_core_1_0.gaps.txt")
   If gaps = 0 : Die("cannot create gap inventory") : EndIf
   WriteStringN(gaps, "TARGET VK_API_VERSION_1_0 -- NOT AN IMPLEMENTATION CLAIM")
-  WriteStringN(gaps, "GENERATED VOCABULARY: CHECKED 20-STRUCT FOUNDATION SLICE, NOT COMPLETE CORE 1.0")
+  WriteStringN(gaps, "GENERATED VOCABULARY: CHECKED 21-STRUCT FOUNDATION SLICE, NOT COMPLETE CORE 1.0")
   WriteStringN(gaps, "SEMANTIC vk* ENTRY SURFACE: NOT YET EXPORTED")
   WriteStringN(gaps, "PRODUCTION PHYSICAL DEVICES / QUEUES: NONE")
   WriteStringN(gaps, "V3D EXECUTION: DEVELOPMENT-ONLY OFFSCREEN FULL BGRA8 CLEAR; NOT A PRODUCTION DEVICE")

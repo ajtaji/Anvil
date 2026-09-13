@@ -201,6 +201,14 @@ Structure VkFormatProperties Align #PB_Structure_AlignC
   bufferFeatures.l
 EndStructure
 
+Structure VkImageFormatProperties Align #PB_Structure_AlignC
+  maxExtent.VkExtent3D
+  maxMipLevels.l
+  maxArrayLayers.l
+  sampleCounts.l
+  maxResourceSize.q
+EndStructure
+
 Structure VkComponentMapping Align #PB_Structure_AlignC
   r.l
   g.l

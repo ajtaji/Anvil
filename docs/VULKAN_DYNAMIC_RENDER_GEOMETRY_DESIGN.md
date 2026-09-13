@@ -1,23 +1,21 @@
 # Vulkan dynamic render geometry — bottom-up design
 
-Status: implemented and proved on the Pi 4 on 2026-09-13.  The geometry and
-capacity prerequisite is green; the image-format-properties query is the next
-tranche and is not claimed by this document.
+Status: implemented and proved on the Pi 4 on 2026-09-13. The geometry and
+capacity prerequisite is green. The subsequent image-format-properties query
+shares the same limit, pitch and usage owner and has its own desk and silicon
+acceptance record below.
 
 ## Why this is a prerequisite
 
-The V3D 4.2 layer already derives tile and supertile geometry from a width,
-height and render-target format in `V3dRenderBegin()`. The fixed assumption is
-one layer higher: `NeonInit()` calls that procedure once, carves tile allocation
-and tile-state buffers for that one geometry, and builds coordinate tables of
-that one size. `NeonRetarget()` then changes only the target address.
+Before this tranche, the V3D 4.2 layer derived tile and supertile geometry from
+a width, height and render-target format in `V3dRenderBegin()`, but Neon carved
+tile allocation/state buffers and coordinate tables for only its initial
+geometry. `NeonRetarget()` changed only the target address.
 
-Consequently the Vulkan backend can render only an image whose width, height
-and pitch equal the display geometry used by `NeonInit()`. A
-`VkImageFormatProperties.maxExtent` cannot express “exactly this one extent”,
-so `vkGetPhysicalDeviceImageFormatProperties` must remain withheld until the
-engine can rebind geometry safely. Inventing a maximum now would promise legal
-images which the submit path refuses.
+That was why the public maximum had to remain withheld until the engine could
+rebind geometry safely: a `VkImageFormatProperties.maxExtent` cannot express
+“exactly this one extent”. The implemented planner and transactional rebind now
+remove that mismatch rather than inventing a capability.
 
 ## Ownership
 
@@ -86,8 +84,8 @@ Any failure restores the complete old state. A caller must be able to begin and
 finish a frame at the old geometry immediately after a refused rebind. Partial
 publication is a correctness defect, not an error-reporting detail.
 
-The existing address-only `NeonRetarget()` remains as the cheap same-geometry
-operation and can delegate to the new primitive with the current dimensions.
+The existing address-only `NeonRetarget()` remains the cheap same-geometry
+operation and delegates to the new primitive with the current dimensions.
 
 ## Vulkan use
 
@@ -142,8 +140,9 @@ such as 257x193. For every geometry require:
 - successful restoration and a subsequent normal console frame.
 
 The negative run asks for one dimension or one row beyond each accepted
-capacity and proves refusal before any V3D submission. No public Vulkan maximum
-is added until both the desk mutants and these board boundaries pass.
+capacity and proves refusal before any V3D submission. The public Vulkan
+maximum was added only after both the desk mutants and these board boundaries
+passed.
 
 ## Acceptance record — 2026-09-13
 
@@ -177,6 +176,34 @@ raise its capture sequence from one.  Therefore `board_run.py` correctly marks
 the separate capture-freshness invariant red even though the payload report,
 header change and new pixels prove this geometry run.  That monitor defect is
 not folded into the Vulkan tranche.
+
+## Image-format query acceptance — 2026-09-13
+
+The same diagnostic was extended to call the public
+`vkGetPhysicalDeviceImageFormatProperties` entry point before creating its
+images. Its desk gate now checks the exact registry ABI and 179 emitted
+properties, and thirteen independent query mutants go RED if the query invents
+geometry, pitch, mips, layers, samples, image type, tiling, usage, flags,
+transfer-only graphics support, output lifetime, handle lifetime, or diverges
+from image creation's combination owner.
+
+The extended payload was rebuilt byte-for-byte by the final unified
+IDE/compiler SHA-256
+`BF5FDE44797D3F561AA8CC442493FD2A938D01F046F2C02CD1001167C993E01E`.
+Its 385,572-byte PMFBOOT container SHA-256 is
+`96FC0742033BC1E4352543331078CEF31043980786D1103D8570F979AD08AD44`;
+the 385,444-byte image SHA-256 is
+`7371A6168C23B649F2F367C6B745CFE957D5BA645FFBA193293745D47F95C572`.
+
+It ran as a returning RAM payload on build 101 without changing flash. The
+report returned status zero in 6.6 seconds. The query returned `VK_SUCCESS`,
+maximum extent 1280x1280x1, one mip level, one array layer, sample count one,
+and 6,553,600 maximum bytes — exactly 1280 rows of the backend's 5,120-byte
+pitch. The subsequent native, smaller, partial-tile, refusal, fence, cache and
+restoration checks all remained green. The monitor capture sequence advanced
+from one to two and the raster retained pixel SHA-256
+`bd7076afc74b29dc6c55ac1006dc9935efb02bad4569a2ce07a36811b169f68e`.
+Evidence is under `_work/vulkan-image-format-20260913/run1/`.
 
 The focused desk gate executes 84 properties over 108,668 emitted A64
 instructions without one MMIO access, compiles all three board diagnostics,

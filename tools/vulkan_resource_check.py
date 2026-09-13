@@ -88,8 +88,8 @@ MUTANTS = (
     (
         "vkCreateImage accepts a color attachment on a transfer-only backend",
         "vk_memory.pbi",
-        "  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0\n",
-        "  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() < 0\n",
+        "  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0\n    avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED,",
+        "  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() < 0\n    avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED,",
     ),
     (
         "vkMapMemory accepts a memory type that is not HOST_VISIBLE",

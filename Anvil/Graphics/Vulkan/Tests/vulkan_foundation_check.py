@@ -38,6 +38,7 @@ PROBE = HERE / "vulkan_foundation.pi4"
 PRODUCTION_PROBE = HERE / "vulkan_production_probe.pi4"
 V3D_BACKEND = HERE.parent / "vk_v3d_backend.pi4"
 API = HERE.parent / "vk_api.pbi"
+MEMORY = HERE.parent / "vk_memory.pbi"
 LOAD, STACK, RETURN = 0x400000, 0x3000000, 0xDEAD0000
 OUT = 0x06000000
 MMIO = 0xFC000000
@@ -131,6 +132,11 @@ STRUCTS = {
     "VkFormatProperties": (("VkFormatFeatureFlags", "linearTilingFeatures"),
                            ("VkFormatFeatureFlags", "optimalTilingFeatures"),
                            ("VkFormatFeatureFlags", "bufferFeatures")),
+    "VkImageFormatProperties": (("VkExtent3D", "maxExtent"),
+                                ("uint32_t", "maxMipLevels"),
+                                ("uint32_t", "maxArrayLayers"),
+                                ("VkSampleCountFlags", "sampleCounts"),
+                                ("VkDeviceSize", "maxResourceSize")),
     "VkExtensionProperties": (("char", "extensionName"), ("uint32_t", "specVersion")),
     "VkLayerProperties": (("char", "layerName"), ("uint32_t", "specVersion"),
                           ("uint32_t", "implementationVersion"), ("char", "description")),
@@ -429,6 +435,7 @@ PB_SUFFIX = {
     "VkImageUsageFlags": ".l", "VkSharingMode": ".l", "VkImageLayout": ".l",
     "VkImageAspectFlags": ".l", "VkAccessFlags": ".l",
     "VkFormatFeatureFlags": ".l",
+    "VkSampleCountFlags": ".l",
     "VkMemoryPropertyFlags": ".l", "VkMemoryHeapFlags": ".l",
     "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l",
     "VkDeviceSize": ".q", "uint64_t": ".q",
@@ -912,6 +919,79 @@ def format_mutations() -> list[tuple[str, bool, str]]:
     return results
 
 
+def image_format_mutations() -> list[tuple[str, bool, str]]:
+    """Require every reported image limit and every accepted field to be real."""
+    mutants = (
+        ("the maximum extent is hard coded instead of backend owned", API,
+         "  limit = avkBackendMaxImageDimension2D()\n",
+         "  limit = 4096\n"),
+        ("maxResourceSize ignores the backend row-pitch rule", API,
+         "  bytes = AnvilVkImageMaxResourceSize()\n",
+         "  bytes = limit * limit * 4\n"),
+        ("the query advertises mip levels the creator refuses", API,
+         "  *pImageFormatProperties\\maxMipLevels = 1\n",
+         "  *pImageFormatProperties\\maxMipLevels = 2\n"),
+        ("the query advertises array layers the creator refuses", API,
+         "  *pImageFormatProperties\\maxArrayLayers = 1\n",
+         "  *pImageFormatProperties\\maxArrayLayers = 2\n"),
+        ("the query advertises sample counts the creator refuses", API,
+         "  *pImageFormatProperties\\sampleCounts = #VK_SAMPLE_COUNT_1_BIT\n",
+         "  *pImageFormatProperties\\sampleCounts = #VK_SAMPLE_COUNT_2_BIT\n"),
+        ("the query ignores the requested image type", API,
+         "  rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)\n",
+         "  rc = AnvilVkImageFormatSupport(format, #VK_IMAGE_TYPE_2D, tiling, usage, flags)\n"),
+        ("the query ignores the requested tiling", API,
+         "  rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)\n",
+         "  rc = AnvilVkImageFormatSupport(format, imageType, #VK_IMAGE_TILING_LINEAR, usage, flags)\n"),
+        ("the query ignores the requested usage", API,
+         "  rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)\n",
+         "  rc = AnvilVkImageFormatSupport(format, imageType, tiling, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, flags)\n"),
+        ("the query ignores image creation flags", API,
+         "  rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)\n",
+         "  rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, 0)\n"),
+        ("a transfer-only backend advertises colour attachments", MEMORY,
+         "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0\n    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED\n  EndIf\n  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0\n",
+         "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0\n    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED\n  EndIf\n  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() < 0\n"),
+        ("a format refusal leaves a supported maximum behind", API,
+         "  *pImageFormatProperties\\maxExtent\\width = 0\n",
+         "  ; maxExtent.width deliberately left stale\n"),
+        ("a stale physical-device handle reaches the image query", API,
+         "Procedure.i vkGetPhysicalDeviceImageFormatProperties(physicalDevice.i, format.i, imageType.i, tiling.i, usage.i, flags.i, *pImageFormatProperties.VkImageFormatProperties)\n  Define rc.i\n  Define limit.i\n  Define bytes.i\n  If *pImageFormatProperties = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf\n  If avkPhysSlot(physicalDevice) = 0\n",
+         "Procedure.i vkGetPhysicalDeviceImageFormatProperties(physicalDevice.i, format.i, imageType.i, tiling.i, usage.i, flags.i, *pImageFormatProperties.VkImageFormatProperties)\n  Define rc.i\n  Define limit.i\n  Define bytes.i\n  If *pImageFormatProperties = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf\n  If avkPhysSlot(physicalDevice) < 0\n"),
+        ("vkCreateImage no longer enters the query's combination owner", MEMORY,
+         "  rc = AnvilVkImageFormatSupport(format, #VK_IMAGE_TYPE_2D, tiling, usage, 0)\n",
+         "  rc = #VK_SUCCESS\n"),
+    )
+    results = []
+    for name, path, fixed, broken in mutants:
+        original = path.read_text(encoding="utf-8")
+        if original.count(fixed) != 1:
+            results.append((name, False, "mutation anchor is stale"))
+            continue
+        try:
+            path.write_text(original.replace(fixed, broken, 1), encoding="utf-8")
+            memory_text = MEMORY.read_text(encoding="utf-8")
+            shared_create = (
+                "rc = AnvilVkImageFormatSupport(format, #VK_IMAGE_TYPE_2D, "
+                "tiling, usage, 0)"
+            )
+            if shared_create not in memory_text:
+                results.append((name, True, "source contract rejected the divergence"))
+                continue
+            cpu, rc, _ = run_image(build(PROBE, "anvil_vk_foundation_image_format_mutant.img"))
+            count = u64(cpu, OUT + 8)
+            failures = u64(cpu, OUT + 16)
+            failed_rows = [i + 1 for i in range(count)
+                           if u64(cpu, OUT + 0x100 + i * 8) == 0]
+            caught = rc != 0 and failures != 0
+            detail = ("rejected at emitted rows " + ",".join(map(str, failed_rows))
+                      if caught else "stayed green")
+            results.append((name, caught, detail))
+        finally:
+            path.write_text(original, encoding="utf-8")
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutate-queue", action="store_true")
@@ -925,7 +1005,7 @@ def main() -> int:
     # silicon, and must not contain a processor-side or DMA fallback: a
     # fallback would let a green board test be a test of memcpy.
     backend_source = V3D_BACKEND.read_text(encoding="utf-8")
-    for required in ("NeonRetarget", "NeonFrameBegin", "NeonFrameEnd"):
+    for required in ("NeonRebindSurface", "NeonFrameBegin", "NeonFrameEnd"):
         if required not in backend_source:
             failures.append("the Pi 4 V3D backend omits " + required)
         checks += 1
@@ -934,6 +1014,15 @@ def main() -> int:
         if forbidden in backend_source:
             failures.append("the Pi 4 V3D backend contains the fallback token " + forbidden)
         checks += 1
+
+    memory_source = MEMORY.read_text(encoding="utf-8")
+    shared_create = (
+        "rc = AnvilVkImageFormatSupport(format, #VK_IMAGE_TYPE_2D, "
+        "tiling, usage, 0)"
+    )
+    if memory_source.count(shared_create) != 1:
+        failures.append("vkCreateImage does not enter the image-format query's combination owner exactly once")
+    checks += 1
 
     cpu, rc, steps = run_image(build(PROBE, "anvil_vk_foundation.img"))
     magic, model_checks, model_fails = u64(cpu, OUT), u64(cpu, OUT + 8), u64(cpu, OUT + 16)
@@ -988,6 +1077,11 @@ def main() -> int:
                 print("vulkan_foundation_check: GREEN format mutant - " + name + " - " + detail)
                 return 1
             print("  RED format mutant - " + name + " - " + detail)
+        for name, caught, detail in image_format_mutations():
+            if not caught:
+                print("vulkan_foundation_check: GREEN image-format mutant - " + name + " - " + detail)
+                return 1
+            print("  RED image-format mutant - " + name + " - " + detail)
     return 0
 
 

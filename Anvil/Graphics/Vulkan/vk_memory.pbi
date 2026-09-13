@@ -14,11 +14,13 @@
 ; read for the allocation, requirements, binding and layout rules. No
 ; implementation source was consulted or translated.
 ;
-; WHAT THIS SLICE IMPLEMENTS is exactly one image shape:
+; WHAT THIS SLICE IMPLEMENTS is one bounded family of image shapes:
 ;   VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TILING_LINEAR,
 ;   one mip level, one array layer, VK_SAMPLE_COUNT_1_BIT,
 ;   VK_SHARING_MODE_EXCLUSIVE, usage within TRANSFER_SRC | TRANSFER_DST |
-;   COLOR_ATTACHMENT.
+;   COLOR_ATTACHMENT, with width and height limited by the backend and row
+;   pitch derived by that same backend. The public image-format query enters
+;   the same combination and limit owners used by creation.
 ; Everything else is refused with a real error code and a whole sentence.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
@@ -302,6 +304,38 @@ Procedure.i AnvilVkMemorySize(memory.i)
   ProcedureReturn avkMemSize[s]
 EndProcedure
 
+; One owner for the creation combination shared by vkCreateImage and
+; vkGetPhysicalDeviceImageFormatProperties.  The public create path keeps its
+; more specific diagnostic sentences, then must still pass this closed answer;
+; the query cannot drift into advertising a combination creation refuses.
+Procedure.i AnvilVkImageFormatSupport(format.i, imageType.i, tiling.i, usage.i, flags.i)
+  If flags <> 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If imageType <> #VK_IMAGE_TYPE_2D : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If format <> #VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If tiling <> #VK_IMAGE_TILING_LINEAR : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If usage = 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Largest byte extent named by the same scalar geometry and row-pitch owners
+; used by image creation.  It is a resource limit, not a promise that this much
+; memory is currently free in the application's selected heap window.
+Procedure.i AnvilVkImageMaxResourceSize()
+  Define limit.i
+  Define pitch.i
+  limit = avkBackendMaxImageDimension2D()
+  If limit < 1 : ProcedureReturn 0 : EndIf
+  pitch = avkBackendRowPitchFor(limit)
+  If pitch < (limit * #ANVIL_VK_BGRA8_TEXEL_BYTES) : ProcedureReturn 0 : EndIf
+  ProcedureReturn pitch * limit
+EndProcedure
+
 ; Map one range of one HOST_VISIBLE allocation. The backend heap is already
 ; present in the host address space, so mapping allocates no shadow storage:
 ; it validates the Vulkan range and returns the identity-mapped address.
@@ -414,6 +448,7 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
   Define d.i
   Define s.i
   Define pitch.i
+  Define rc.i
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
   d = avkDevSlot(device)
@@ -437,6 +472,10 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
   If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
     avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage was asked for a colour attachment on a backend that has no graphics draw capability (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); vkGetPhysicalDeviceFormatProperties reports no COLOR_ATTACHMENT feature on this backend, so use transfer usage only or select a graphics-capable physical device.")
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  rc = AnvilVkImageFormatSupport(format, #VK_IMAGE_TYPE_2D, tiling, usage, 0)
+  If rc <> #VK_SUCCESS
+    ProcedureReturn avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage reached a format combination its physical-device image-format query refuses (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); this is an internal validation mismatch and no image was created.")
   EndIf
   If initialLayout <> #VK_IMAGE_LAYOUT_UNDEFINED And initialLayout <> #VK_IMAGE_LAYOUT_PREINITIALIZED
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an initialLayout that the specification does not permit (Anvil code -20001, invalid argument); VkImageCreateInfo.initialLayout must be VK_IMAGE_LAYOUT_UNDEFINED or VK_IMAGE_LAYOUT_PREINITIALIZED.")

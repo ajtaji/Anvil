@@ -130,6 +130,42 @@ Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pForm
   EndIf
 EndProcedure
 
+; Exact core-1.0 query for the bounded VkImageCreateInfo family this
+; implementation can create. Every maximum comes from the same backend geometry/row-pitch
+; owners used by creation and submission; unsupported combinations return the
+; registry's VK_ERROR_FORMAT_NOT_SUPPORTED and publish no invented capability.
+Procedure.i vkGetPhysicalDeviceImageFormatProperties(physicalDevice.i, format.i, imageType.i, tiling.i, usage.i, flags.i, *pImageFormatProperties.VkImageFormatProperties)
+  Define rc.i
+  Define limit.i
+  Define bytes.i
+  If *pImageFormatProperties = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetPhysicalDeviceImageFormatProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the properties structure was left untouched, so do not read it.")
+  EndIf
+
+  *pImageFormatProperties\maxExtent\width = 0
+  *pImageFormatProperties\maxExtent\height = 0
+  *pImageFormatProperties\maxExtent\depth = 0
+  *pImageFormatProperties\maxMipLevels = 0
+  *pImageFormatProperties\maxArrayLayers = 0
+  *pImageFormatProperties\sampleCounts = 0
+  *pImageFormatProperties\maxResourceSize = 0
+
+  rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)
+  If rc <> #VK_SUCCESS : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  limit = avkBackendMaxImageDimension2D()
+  bytes = AnvilVkImageMaxResourceSize()
+  If limit < 1 Or bytes < 1 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  *pImageFormatProperties\maxExtent\width = limit
+  *pImageFormatProperties\maxExtent\height = limit
+  *pImageFormatProperties\maxExtent\depth = 1
+  *pImageFormatProperties\maxMipLevels = 1
+  *pImageFormatProperties\maxArrayLayers = 1
+  *pImageFormatProperties\sampleCounts = #VK_SAMPLE_COUNT_1_BIT
+  *pImageFormatProperties\maxResourceSize = bytes
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 ; One queue family. Transfer is implemented by every live backend.
 ; Graphics is advertised only when this particular backend can execute
 ; the draw record; compute remains absent because dispatch does not yet
