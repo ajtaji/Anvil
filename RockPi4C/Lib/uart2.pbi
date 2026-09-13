@@ -5,6 +5,10 @@
 Global rock_uart_ready.i
 Global rock_uart_error.i
 
+#ROCK_UART_LSR_DR = $01
+#ROCK_UART_LSR_RX_ERRORS = $1E
+#ROCK_UART_LSR_TEMT = $40
+
 Procedure.i RockUartAdopt()
   Protected status.i
   rock_uart_ready = 0
@@ -38,6 +42,54 @@ Procedure.i RockUartByte(value.i)
     EndIf
   Next
   rock_uart_error = 2
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RockUartReceive()
+  Protected status.i
+  If rock_uart_ready=0 : ProcedureReturn -1 : EndIf
+  ; RK3399's UART node requires 32-bit accesses. A receive error contaminates
+  ; the command line even when RBR still contains a byte, so consume that byte
+  ; and return a distinct error instead of exposing it to the parser.
+  status=PeekL(#ROCK_UART2+#ROCK_UART_LSR) & $FFFFFFFF
+  If status=$FFFFFFFF
+    rock_uart_error=4
+    ProcedureReturn -2
+  EndIf
+  If (status & #ROCK_UART_LSR_RX_ERRORS)<>0
+    If (status & #ROCK_UART_LSR_DR)<>0
+      status=PeekL(#ROCK_UART2+#ROCK_UART_THR) & $FFFFFFFF
+    EndIf
+    rock_uart_error=5
+    ProcedureReturn -2
+  EndIf
+  If (status & #ROCK_UART_LSR_DR)=0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn PeekL(#ROCK_UART2+#ROCK_UART_THR) & 255
+EndProcedure
+
+Procedure.i RockUartDrain()
+  Protected start.i
+  Protected now.i
+  Protected status.i
+  Protected attempt.i
+  If rock_uart_ready=0 Or rock_timer_frequency=0 : ProcedureReturn 0 : EndIf
+  start=RockTimerTicks()
+  For attempt=0 To 999999
+    status=PeekL(#ROCK_UART2+#ROCK_UART_LSR) & $FFFFFFFF
+    If status=$FFFFFFFF
+      rock_uart_error=4
+      ProcedureReturn 0
+    EndIf
+    ; THRE says only that the holding register is empty. TEMT additionally
+    ; proves that the shift register has put the final stop bit on the wire.
+    If (status & #ROCK_UART_LSR_TEMT)<>0 : ProcedureReturn 1 : EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start>=rock_timer_frequency/10
+      rock_uart_error=6
+      ProcedureReturn 0
+    EndIf
+  Next
+  rock_uart_error=6
   ProcedureReturn 0
 EndProcedure
 

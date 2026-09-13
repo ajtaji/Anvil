@@ -15,8 +15,12 @@ Cadence DPTX firmware, reads DPCD and EDID, trains the link, and scans an ARGB
 framebuffer from VOPL. Build 39 proved 1024x768@60. The mode-aware path selects
 the monitor's first detailed timing within VOPL's 2560x1600 limit, applies its
 clock, stride and sync polarity, and reports any advertised fallback explicitly.
-IRQ remains masked and the monitor
-parks after reporting readiness.
+IRQ remains masked. After display startup (or a late display refusal), the
+UART recovery loop accepts exact `help` and `reboot` commands over FTDI.
+Reboot uses the retained secure firmware's PSCI reset operation, not a guessed
+CRU reset sequence. Early invalid handoffs and fatal exceptions still park.
+This recovery path has not yet been tested on the physical board; there is
+no Rock Pi network command service yet.
 This is the original 4C, not the 4C+ with RK3399-T.
 
 Hardware basis: RK3399, two Cortex-A72 plus four Cortex-A53 cores, Mali-T860.

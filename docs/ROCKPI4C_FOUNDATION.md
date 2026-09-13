@@ -165,6 +165,21 @@ refusals.
 
 ## Desk gates and first board run
 
+### FTDI recovery
+
+After the validated entry/display path, UART2 is polled without unmasking
+interrupts. Exact lowercase `help` and `reboot` lines are accepted. Unknown,
+overlong or UART-error-contaminated lines do not cause a reboot. The reset
+path waits a bounded time for UART LSR TEMT, issues PSCI SYSTEM_RESET through
+SMC to retained EL3 firmware, and reports/fail-stops if firmware unexpectedly
+returns. It never guesses a direct-CRU fallback. A physical cycle is still
+needed after an early fatal failure that cannot service the recovery loop.
+Network-triggered reboot is not implemented on this target.
+
+This new command path requires its own silicon acceptance: `help` must reply,
+invalid lines must not reset, and `reboot` must return the board to the stock
+boot chain without a physical power cycle.
+
 ```text
 python tools/rockpi4c_foundation_check.py --compiler <candidate>
 python tools/rockpi4c_display_check.py --compiler <candidate>
