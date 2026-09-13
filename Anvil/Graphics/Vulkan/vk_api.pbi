@@ -110,6 +110,26 @@ Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperti
   Wend
 EndProcedure
 
+; Report only format behavior the linked backend can execute. The current
+; image path is linear BGRA8; it becomes a colour attachment only when the
+; backend owns a draw path. Optimal tiling, texel-buffer, sampled, storage,
+; depth/stencil, blend and blit behavior are all absent and therefore zero.
+Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pFormatProperties.VkFormatProperties)
+  If *pFormatProperties = 0
+    ProcedureReturn
+  EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetPhysicalDeviceFormatProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the structure was left untouched, so do not read it.")
+    ProcedureReturn
+  EndIf
+  *pFormatProperties\linearTilingFeatures = 0
+  *pFormatProperties\optimalTilingFeatures = 0
+  *pFormatProperties\bufferFeatures = 0
+  If format = #VK_FORMAT_B8G8R8A8_UNORM And AnvilVkBackendCanDraw() <> 0
+    *pFormatProperties\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+  EndIf
+EndProcedure
+
 ; One queue family. Transfer is implemented by every live backend.
 ; Graphics is advertised only when this particular backend can execute
 ; the draw record; compute remains absent because dispatch does not yet

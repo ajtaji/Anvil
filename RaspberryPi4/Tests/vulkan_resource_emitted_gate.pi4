@@ -240,6 +240,16 @@ Procedure.i Main()
   Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)
   imgci\pNext = 0
 
+  ; A transfer-only physical backend reports no colour-attachment format
+  ; feature, so image creation must agree rather than deferring the lie to
+  ; framebuffer or pipeline creation.
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR)
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Sentence()
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW)
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+
   Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_SUCCESS)
   Vkr(img <> #VK_NULL_HANDLE)
   Vkr(avkTokenKind(img) = #ANVIL_VK_TYPE_IMAGE)

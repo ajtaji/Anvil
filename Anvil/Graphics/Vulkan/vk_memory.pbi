@@ -434,6 +434,10 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImage was asked for an image usage Anvil does not implement (Anvil code -20005, unsupported usage); use VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT or VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT. Sampler, storage-image and input-attachment usages are not implemented.")
     ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
   EndIf
+  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
+    avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage was asked for a colour attachment on a backend that has no graphics draw capability (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); vkGetPhysicalDeviceFormatProperties reports no COLOR_ATTACHMENT feature on this backend, so use transfer usage only or select a graphics-capable physical device.")
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
   If initialLayout <> #VK_IMAGE_LAYOUT_UNDEFINED And initialLayout <> #VK_IMAGE_LAYOUT_PREINITIALIZED
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an initialLayout that the specification does not permit (Anvil code -20001, invalid argument); VkImageCreateInfo.initialLayout must be VK_IMAGE_LAYOUT_UNDEFINED or VK_IMAGE_LAYOUT_PREINITIALIZED.")
     ProcedureReturn #ANVIL_VK_ERR_ARGS

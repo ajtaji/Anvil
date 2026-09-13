@@ -32,6 +32,11 @@
 #VK_FORMAT_R8G8B8A8_UNORM = 37
 #VK_FORMAT_B8G8R8A8_UNORM = 44
 
+; VkFormatFeatureFlagBits -- the one core-1.0 format capability this
+; implementation reports. Transfer-source/destination feature bits were
+; promoted after 1.0 and are deliberately not smuggled into this surface.
+#VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT = $00000080
+
 ; VkImageLayout -- the core-1.0 entries the layout tracker understands.
 #VK_IMAGE_LAYOUT_UNDEFINED = 0
 #VK_IMAGE_LAYOUT_GENERAL = 1
@@ -188,6 +193,12 @@ EndStructure
 Structure VkRect2D Align #PB_Structure_AlignC
   offset.VkOffset2D
   extent.VkExtent2D
+EndStructure
+
+Structure VkFormatProperties Align #PB_Structure_AlignC
+  linearTilingFeatures.l
+  optimalTilingFeatures.l
+  bufferFeatures.l
 EndStructure
 
 Structure VkComponentMapping Align #PB_Structure_AlignC

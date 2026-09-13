@@ -43,6 +43,7 @@ Procedure.i Main()
   Define qfCount.l
   Define selectedFamily.i
   Define features.VkPhysicalDeviceFeatures
+  Define formatProps.VkFormatProperties
   Define featureFailures.i
   Define i.i
 
@@ -57,6 +58,9 @@ Procedure.i Main()
   Vkt(SizeOf(VkComponentMapping) = 16)
   Vkt(SizeOf(VkRect2D) = 16)
   Vkt(OffsetOf(VkRect2D\extent\height) = 12)
+  Vkt(SizeOf(VkFormatProperties) = 12)
+  Vkt(OffsetOf(VkFormatProperties\optimalTilingFeatures) = 4)
+  Vkt(OffsetOf(VkFormatProperties\bufferFeatures) = 8)
   Vkt(SizeOf(VkExtensionProperties) = 260)
   Vkt(OffsetOf(VkExtensionProperties\specVersion) = 256)
   Vkt(SizeOf(VkLayerProperties) = 520)
@@ -190,6 +194,24 @@ Procedure.i Main()
   Wend
   Vkt(featureFailures = 0)
 
+  ; Query an exact set, not merely a non-zero one: the current physical
+  ; device renders only linear BGRA8 colour attachments. Poison first so
+  ; every zero field must have been written by the implementation.
+  formatProps\linearTilingFeatures = $FFFFFFFF
+  formatProps\optimalTilingFeatures = $FFFFFFFF
+  formatProps\bufferFeatures = $FFFFFFFF
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
+  Vkt(formatProps\optimalTilingFeatures = 0)
+  Vkt(formatProps\bufferFeatures = 0)
+  formatProps\linearTilingFeatures = $FFFFFFFF
+  formatProps\optimalTilingFeatures = $FFFFFFFF
+  formatProps\bufferFeatures = $FFFFFFFF
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_R8G8B8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = 0)
+  Vkt(formatProps\optimalTilingFeatures = 0)
+  Vkt(formatProps\bufferFeatures = 0)
+
   ; The draw-capable test backend advertises a normal Vulkan graphics
   ; queue as well as transfer. An application scanning queue families
   ; for VK_QUEUE_GRAPHICS_BIT therefore selects family zero.
@@ -218,6 +240,13 @@ Procedure.i Main()
   selectedFamily = -1
   If (qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0 : selectedFamily = 0 : EndIf
   Vkt(selectedFamily = -1)
+  formatProps\linearTilingFeatures = $FFFFFFFF
+  formatProps\optimalTilingFeatures = $FFFFFFFF
+  formatProps\bufferFeatures = $FFFFFFFF
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = 0)
+  Vkt(formatProps\optimalTilingFeatures = 0)
+  Vkt(formatProps\bufferFeatures = 0)
   AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW)
 
   vkGetPhysicalDeviceMemoryProperties(phys, @mp)
@@ -308,6 +337,13 @@ Procedure.i Main()
   Vkt(AnvilVkInstanceDestroy(inst) = #VK_SUCCESS)
   Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_ERR_HANDLE)
   Vkt(AnvilVkDeviceQueue(dev, @queue) = #ANVIL_VK_ERR_HANDLE)
+  formatProps\linearTilingFeatures = 123
+  formatProps\optimalTilingFeatures = 123
+  formatProps\bufferFeatures = 123
+  AnvilVkFaultClear()
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Vkt(formatProps\linearTilingFeatures = 123 And formatProps\optimalTilingFeatures = 123 And formatProps\bufferFeatures = 123)
   Vkt(AnvilVkInstanceDestroy(inst) = #ANVIL_VK_ERR_HANDLE)
 
   ; The test backend was never asked to execute anything here.

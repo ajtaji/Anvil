@@ -62,7 +62,8 @@ Procedure SeedWanted()
           "VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,VK_STRUCTURE_TYPE_SUBMIT_INFO," +
           "VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO," +
           "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO," +
-          "VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL," +
+          "VK_FORMAT_B8G8R8A8_UNORM,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT," +
+          "VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL," +
           "VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL"
   WantedEnumOrder = names
   For i = 1 To CountString(names, ",") + 1
@@ -76,6 +77,7 @@ Procedure SeedWanted()
   WantedStruct("VkViewport") = "float:x,float:y,float:width,float:height,float:minDepth,float:maxDepth"
   WantedStruct("VkComponentMapping") = "VkComponentSwizzle:r,VkComponentSwizzle:g,VkComponentSwizzle:b,VkComponentSwizzle:a"
   WantedStruct("VkRect2D") = "VkOffset2D:offset,VkExtent2D:extent"
+  WantedStruct("VkFormatProperties") = "VkFormatFeatureFlags:linearTilingFeatures,VkFormatFeatureFlags:optimalTilingFeatures,VkFormatFeatureFlags:bufferFeatures"
   WantedStruct("VkExtensionProperties") = "char:extensionName,uint32_t:specVersion"
   WantedStruct("VkLayerProperties") = "char:layerName,uint32_t:specVersion,uint32_t:implementationVersion,char:description"
   WantedStruct("VkApplicationInfo") = "VkStructureType:sType,void:pNext,char:pApplicationName,uint32_t:applicationVersion,char:pEngineName,uint32_t:engineVersion,uint32_t:apiVersion"
@@ -89,7 +91,7 @@ Procedure SeedWanted()
   WantedStruct("VkCommandBufferInheritanceInfo") = "VkStructureType:sType,void:pNext,VkRenderPass:renderPass,uint32_t:subpass,VkFramebuffer:framebuffer,VkBool32:occlusionQueryEnable,VkQueryControlFlags:queryFlags,VkQueryPipelineStatisticFlags:pipelineStatistics"
   WantedStruct("VkCommandBufferBeginInfo") = "VkStructureType:sType,void:pNext,VkCommandBufferUsageFlags:flags,VkCommandBufferInheritanceInfo:pInheritanceInfo"
   WantedStruct("VkSubmitInfo") = "VkStructureType:sType,void:pNext,uint32_t:waitSemaphoreCount,VkSemaphore:pWaitSemaphores,VkPipelineStageFlags:pWaitDstStageMask,uint32_t:commandBufferCount,VkCommandBuffer:pCommandBuffers,uint32_t:signalSemaphoreCount,VkSemaphore:pSignalSemaphores"
-  WantedStructOrder = "VkExtent2D,VkExtent3D,VkOffset2D,VkOffset3D,VkViewport,VkRect2D," +
+  WantedStructOrder = "VkExtent2D,VkExtent3D,VkOffset2D,VkOffset3D,VkViewport,VkRect2D,VkFormatProperties," +
                       "VkComponentMapping,VkExtensionProperties,VkLayerProperties,VkApplicationInfo," +
                       "VkAllocationCallbacks,VkDeviceQueueCreateInfo,VkPhysicalDeviceFeatures,VkDeviceCreateInfo," +
                       "VkInstanceCreateInfo,VkCommandPoolCreateInfo,VkCommandBufferAllocateInfo," +
@@ -159,7 +161,7 @@ EndProcedure
 
 Procedure.s PbSuffix(cType.s)
   Select cType
-    Case "uint32_t", "int32_t", "VkBool32", "VkComponentSwizzle", "VkStructureType", "VkDeviceQueueCreateFlags", "VkDeviceCreateFlags", "VkInstanceCreateFlags", "VkCommandPoolCreateFlags", "VkCommandBufferLevel", "VkQueryControlFlags", "VkQueryPipelineStatisticFlags", "VkCommandBufferUsageFlags", "VkPipelineStageFlags" : ProcedureReturn ".l"
+    Case "uint32_t", "int32_t", "VkBool32", "VkComponentSwizzle", "VkStructureType", "VkDeviceQueueCreateFlags", "VkDeviceCreateFlags", "VkInstanceCreateFlags", "VkCommandPoolCreateFlags", "VkCommandBufferLevel", "VkQueryControlFlags", "VkQueryPipelineStatisticFlags", "VkCommandBufferUsageFlags", "VkPipelineStageFlags", "VkFormatFeatureFlags" : ProcedureReturn ".l"
     Case "float" : ProcedureReturn ".f"
     Case "VkCommandPool", "VkRenderPass", "VkFramebuffer", "VkSemaphore", "VkCommandBuffer" : ProcedureReturn ".i"
     Case "VkOffset2D", "VkExtent2D" : ProcedureReturn "." + cType
@@ -278,7 +280,7 @@ Procedure Main()
   gaps = CreateFile(#PB_Any, outDir + "vk_core_1_0.gaps.txt")
   If gaps = 0 : Die("cannot create gap inventory") : EndIf
   WriteStringN(gaps, "TARGET VK_API_VERSION_1_0 -- NOT AN IMPLEMENTATION CLAIM")
-  WriteStringN(gaps, "GENERATED VOCABULARY: CHECKED 19-STRUCT FOUNDATION SLICE, NOT COMPLETE CORE 1.0")
+  WriteStringN(gaps, "GENERATED VOCABULARY: CHECKED 20-STRUCT FOUNDATION SLICE, NOT COMPLETE CORE 1.0")
   WriteStringN(gaps, "SEMANTIC vk* ENTRY SURFACE: NOT YET EXPORTED")
   WriteStringN(gaps, "PRODUCTION PHYSICAL DEVICES / QUEUES: NONE")
   WriteStringN(gaps, "V3D EXECUTION: DEVELOPMENT-ONLY OFFSCREEN FULL BGRA8 CLEAR; NOT A PRODUCTION DEVICE")

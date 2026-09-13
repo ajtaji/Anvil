@@ -71,6 +71,7 @@ CONSTANTS = {
     "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO", "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
     "VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER", "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER",
     "VK_FORMAT_UNDEFINED", "VK_FORMAT_R8G8B8A8_UNORM", "VK_FORMAT_B8G8R8A8_UNORM",
+    "VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT",
     "VK_IMAGE_LAYOUT_UNDEFINED", "VK_IMAGE_LAYOUT_GENERAL",
     "VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL",
     "VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL", "VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
@@ -127,6 +128,9 @@ STRUCTS = {
     "VkComponentMapping": (("VkComponentSwizzle", "r"), ("VkComponentSwizzle", "g"),
                            ("VkComponentSwizzle", "b"), ("VkComponentSwizzle", "a")),
     "VkRect2D": (("VkOffset2D", "offset"), ("VkExtent2D", "extent")),
+    "VkFormatProperties": (("VkFormatFeatureFlags", "linearTilingFeatures"),
+                           ("VkFormatFeatureFlags", "optimalTilingFeatures"),
+                           ("VkFormatFeatureFlags", "bufferFeatures")),
     "VkExtensionProperties": (("char", "extensionName"), ("uint32_t", "specVersion")),
     "VkLayerProperties": (("char", "layerName"), ("uint32_t", "specVersion"),
                           ("uint32_t", "implementationVersion"), ("char", "description")),
@@ -424,6 +428,7 @@ PB_SUFFIX = {
     "VkSampleCountFlagBits": ".l", "VkImageTiling": ".l",
     "VkImageUsageFlags": ".l", "VkSharingMode": ".l", "VkImageLayout": ".l",
     "VkImageAspectFlags": ".l", "VkAccessFlags": ".l",
+    "VkFormatFeatureFlags": ".l",
     "VkMemoryPropertyFlags": ".l", "VkMemoryHeapFlags": ".l",
     "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l",
     "VkDeviceSize": ".q", "uint64_t": ".q",
@@ -860,10 +865,58 @@ def feature_mutations() -> list[tuple[str, bool, str]]:
     return results
 
 
+def format_mutations() -> list[tuple[str, bool, str]]:
+    """Require exact format output and backend-derived attachment support."""
+    mutants = (
+        ("linear BGRA8 falsely advertises sampled-image support",
+         "    *pFormatProperties\\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT\n",
+         "    *pFormatProperties\\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | $1\n"),
+        ("linear BGRA8 falsely advertises storage-image support",
+         "    *pFormatProperties\\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT\n",
+         "    *pFormatProperties\\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | $2\n"),
+        ("linear BGRA8 falsely advertises depth-stencil support",
+         "    *pFormatProperties\\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT\n",
+         "    *pFormatProperties\\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | $200\n"),
+        ("BGRA8 falsely advertises optimal-tiling support",
+         "  *pFormatProperties\\optimalTilingFeatures = 0\n",
+         "  *pFormatProperties\\optimalTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT\n"),
+        ("an unsupported format inherits BGRA8 support",
+         "  If format = #VK_FORMAT_B8G8R8A8_UNORM And AnvilVkBackendCanDraw() <> 0\n",
+         "  If AnvilVkBackendCanDraw() <> 0\n"),
+        ("a transfer-only backend advertises a color attachment",
+         "  If format = #VK_FORMAT_B8G8R8A8_UNORM And AnvilVkBackendCanDraw() <> 0\n",
+         "  If format = #VK_FORMAT_B8G8R8A8_UNORM\n"),
+        ("a stale physical-device handle is accepted by the format query",
+         "Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pFormatProperties.VkFormatProperties)\n  If *pFormatProperties = 0\n    ProcedureReturn\n  EndIf\n  If avkPhysSlot(physicalDevice) = 0\n",
+         "Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pFormatProperties.VkFormatProperties)\n  If *pFormatProperties = 0\n    ProcedureReturn\n  EndIf\n  If avkPhysSlot(physicalDevice) < 0\n"),
+    )
+    original = API.read_text(encoding="utf-8")
+    results = []
+    for name, fixed, broken in mutants:
+        if original.count(fixed) != 1:
+            results.append((name, False, "mutation anchor is stale"))
+            continue
+        try:
+            API.write_text(original.replace(fixed, broken, 1), encoding="utf-8")
+            cpu, rc, _ = run_image(build(PROBE, "anvil_vk_foundation_format_mutant.img"))
+            count = u64(cpu, OUT + 8)
+            failures = u64(cpu, OUT + 16)
+            failed_rows = [i + 1 for i in range(count)
+                           if u64(cpu, OUT + 0x100 + i * 8) == 0]
+            caught = rc != 0 and failures != 0
+            detail = ("rejected at emitted rows " + ",".join(map(str, failed_rows))
+                      if caught else "stayed green")
+            results.append((name, caught, detail))
+        finally:
+            API.write_text(original, encoding="utf-8")
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutate-queue", action="store_true")
     parser.add_argument("--mutate-features", action="store_true")
+    parser.add_argument("--mutate-formats", action="store_true")
     args = parser.parse_args()
     failures = []
     checks = check_registry(failures)
@@ -929,6 +982,12 @@ def main() -> int:
                 print("vulkan_foundation_check: GREEN feature mutant - " + name + " - " + detail)
                 return 1
             print("  RED feature mutant - " + name + " - " + detail)
+    if args.mutate_formats:
+        for name, caught, detail in format_mutations():
+            if not caught:
+                print("vulkan_foundation_check: GREEN format mutant - " + name + " - " + detail)
+                return 1
+            print("  RED format mutant - " + name + " - " + detail)
     return 0
 
 

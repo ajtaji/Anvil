@@ -60,9 +60,10 @@ desk gate checks the source for one.
   handle, union, structure, function-pointer type, command prototype, array
   extent, optionality rule, and platform guard.
 - Public `vk*` entry points, dispatch tables, `vkGetInstanceProcAddr`, allocator
-  callback semantics, extension/layer enumeration, properties, features,
-  limits, format queries, queue-family discovery, and deterministic unsupported
-  reporting.
+  callback semantics, extension/layer enumeration, general properties and
+  limits, image-format queries beyond the exact core format-feature query,
+  queue-family discovery beyond the one implemented family, and deterministic
+  unsupported reporting.
 - Full lifetime graph and host synchronization for physical devices, device
   queues, memory, buffers, images, views, samplers, shader modules, descriptor
   objects, pipeline objects, render passes, framebuffers, synchronization

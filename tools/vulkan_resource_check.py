@@ -86,6 +86,12 @@ MUTANTS = (
         "  avkImgSize[s] = width * 4 * height\n",
     ),
     (
+        "vkCreateImage accepts a color attachment on a transfer-only backend",
+        "vk_memory.pbi",
+        "  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0\n",
+        "  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() < 0\n",
+    ),
+    (
         "vkMapMemory accepts a memory type that is not HOST_VISIBLE",
         "vk_memory.pbi",
         "  If (avkBackendMemoryTypeFlags(avkMemType[s]) & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) = 0\n",
@@ -345,6 +351,10 @@ MAP_MEMORY_MUTANTS = frozenset({
     "the public vkMapMemory adapter discards the caller's offset",
 })
 
+FORMAT_TRUTH_MUTANTS = frozenset({
+    "vkCreateImage accepts a color attachment on a transfer-only backend",
+})
+
 
 def locate(env_name: str, explicit, fallbacks) -> pathlib.Path:
     choices = []
@@ -565,7 +575,7 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    parser.add_argument("--mutate-only", choices=("fence-unlimited", "map-memory"))
+    parser.add_argument("--mutate-only", choices=("fence-unlimited", "map-memory", "format-truth"))
     args = parser.parse_args()
     if args.mutate_only:
         args.mutate = True
@@ -604,6 +614,8 @@ def main() -> int:
             continue
         if args.mutate_only == "map-memory" and name not in MAP_MEMORY_MUTANTS:
             continue
+        if args.mutate_only == "format-truth" and name not in FORMAT_TRUTH_MUTANTS:
+            continue
         text = originals.get(where)
         if text is None or text.count(fixed) != 1:
             found = 0 if text is None else text.count(fixed)
@@ -632,6 +644,8 @@ def main() -> int:
         total = len(FENCE_UNLIMITED_MUTANTS)
     elif args.mutate_only == "map-memory":
         total = len(MAP_MEMORY_MUTANTS)
+    elif args.mutate_only == "format-truth":
+        total = len(FORMAT_TRUTH_MUTANTS)
     else:
         total = len(MUTANTS)
     if missed:
