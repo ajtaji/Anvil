@@ -7,6 +7,10 @@ or synchronization model. This is not a claim that
 Anvil currently implements Vulkan 1.0, passes the Vulkan CTS, or may be
 described as a conformant Vulkan implementation.
 
+The prerequisite for honest non-native image extents is specified in
+`docs/VULKAN_DYNAMIC_RENDER_GEOMETRY_DESIGN.md`. It is design-only; no
+image-format maximum is inferred from it.
+
 The schema target is `VK_API_VERSION_1_0`. Names and layouts are pinned to the
 official Khronos `Vulkan-Headers` tag `v1.4.350`, commit
 `a33416ed2ce6bf8ef48b4eda821825f66d1850d3`. The pinned `registry/vk.xml` has
@@ -112,7 +116,7 @@ dynamic state. Everything else is refused with a code and a sentence.
 | Pi 4 renderer | The existing Pi driver initializes V3D 4.2, GPU page tables, QPU encoding, bin/render control lists, TFU and CSD submission, bounded waits, cache maintenance, OOM handling, and fault evidence. Neon builds fixed UI shaders and geometry for boxes, lines, glyphs, textures, clipping, rotation, and console chrome. The console has exercised the underlying V3D bin/render path on hardware. | Neon is an engine API, not Vulkan fixed-function state. Its built-in shaders are not SPIR-V, shader modules, descriptor-backed programs, or general graphics/compute pipelines. Direct polling and single-owner global arenas are not a Vulkan queue scheduler. A working console does not prove arbitrary Vulkan commands or shaders. |
 | Memory and resources | One heap, taken whole from the backend and suballocated first-fit with page-granular alignment. `VkDeviceMemory`, `VkImage` and `VkBuffer` are real objects with generations, owners, bind counts and in-flight counts; a compiled pipeline's shaders take an INTERNAL allocation from the same heap that no handle names and `vkFreeMemory` cannot reach. Row pitch and image size come from the backend's rule, not from the width. A host-visible allocation supports one checked `vkMapMemory` range, including `VK_WHOLE_SIZE`, and must be unmapped before free. Pi 4's identity-mapped window is advertised `HOST_COHERENT` because draw submission cleans every GPU-read pipeline, descriptor and vertex range and render completion cleans GPU caches then cleans+invalidates the ARM view of the render target before the fence can signal. | There are no buffer views, samplers, image descriptors, mip levels, array layers, tilings other than linear, aliasing, dedicated allocations, sparse memory, flush/invalidate mapped-range entry points, index buffers, storage buffers, or formats other than `B8G8R8A8_UNORM`. A uniform buffer exists and is reachable through one descriptor type and nothing else. There is one queue family, so queue-family ownership transfer is refused rather than implemented. |
 | Synchronization | `VkFence` with its two states and its one owner: unsignalled and unused at submit, signalled at completion, refusing reset and destroy while in use. `vkWaitForFences` honours finite timeouts and is bounded twice so a stalled backend cannot hang the caller. An already-satisfied `UINT64_MAX` wait succeeds; an unsatisfied one is explicitly refused rather than reported as a false finite timeout. Image memory barriers carry layout tracking checked at record time and again at submit time, with access/stage scopes that must cover the transfer they precede. | There are no semaphores, events, timeline semaphores, global or buffer memory barriers, multi-submit dependencies, or concurrent queues. Submission on the V3D backend is synchronous: the bounded waits are inside `NeonFrameEnd`, so nothing is genuinely in flight when `vkQueueSubmit` returns. A genuinely unlimited wait that could be satisfied by another host thread is not implemented and needs reentrant call frames first. |
-| Shaders and pipelines | A SPIR-V front end parses a module, validates it against the Vulkan environment and refuses by name everything outside one declared subset: a pass-through vertex shader, and a fragment shader whose colour is an interpolated varying, a push-constant member, a uniform-block member or a constant. A V3D emitter turns that subset's plan into the three QPU programs, their uniform streams and a GL shader state record. A uniform-buffer descriptor keeps its GPU-visible address in the fragment stream; a V3D 4.2 TMU general vec4 load dereferences it in the QPU, and the backend proves the range mapped and cleans it before submission. A pipeline object owns the fixed-function state, the stage interface match, the vertex input layout across one to four bindings, and the match between the fragment shader's `DescriptorSet`/`Binding` decorations and the descriptor set layout its pipeline layout declares. A render pass and framebuffer own the colour attachment. | There is no target-neutral shader IR, no register allocator, no scheduler and no instruction selection - the emitter assigns registers by counting, which is enough for the accepted subset and nothing else. There is no arithmetic in an accepted shader, no control flow, no sampler or image descriptor, no storage buffer, no dynamic descriptor, no descriptor array, no descriptor copy, no push descriptor, no specialization constant, no pipeline cache, no derivative pipeline, no compute pipeline, no second subpass, no depth attachment and no blending. The descriptor TMU program and stream are independently decoded at the desk, but have not run on silicon; no GPU execution or memory-visibility claim precedes board run 6. Internal clear lowering is still not a shader compiler and this is still not one either. |
+| Shaders and pipelines | A SPIR-V front end parses a module, validates it against the Vulkan environment and refuses by name everything outside one declared subset: a pass-through vertex shader, and a fragment shader whose colour is an interpolated varying, a push-constant member, a uniform-block member or a constant. A V3D emitter turns that subset's plan into the three QPU programs, their uniform streams and a GL shader state record. A uniform-buffer descriptor keeps its GPU-visible address in the fragment stream; a V3D 4.2 TMU general vec4 load is intended to dereference it in the QPU, and the backend proves the range mapped and cleans it before submission. A pipeline object owns the fixed-function state, the stage interface match, the vertex input layout across one to four bindings, and the match between the fragment shader's `DescriptorSet`/`Binding` decorations and the descriptor set layout its pipeline layout declares. A render pass and framebuffer own the colour attachment. | There is no target-neutral shader IR, no register allocator, no scheduler and no instruction selection - the emitter assigns registers by counting, which is enough for the accepted subset and nothing else. There is no arithmetic in an accepted shader, no control flow, no sampler or image descriptor, no storage buffer, no dynamic descriptor, no descriptor array, no descriptor copy, no push descriptor, no specialization constant, no pipeline cache, no derivative pipeline, no compute pipeline, no second subpass, no depth attachment and no blending. The descriptor TMU program and stream are independently decoded at the desk, but board run 6 fails with `VK_ERROR_DEVICE_LOST` / `NEON_ERR_RENDER`; descriptor-backed GPU execution and memory visibility are explicitly not accepted. Internal clear lowering is still not a shader compiler and this is still not one either. |
 | Presentation | Pi display code owns HDMI/DSI surfaces, physical/logical rotation, cache/DMA presentation, capture, and V3D console retargeting. | There is no `VkSurfaceKHR`, platform extension, surface capability query, swapchain image set, acquire/present synchronization, present mode, resize/loss handling, or ownership transfer. The board diagnostic presents by copying the finished image onto the shown half of the framebuffer, which is the display layer's own path and not WSI. |
 | Driver modules | PMFMOD v1 validates, relocates, zeroes, cache-synchronizes, and records an AArch64 module image in a board-provided arena. | Neither board wires a module arena or file discovery. The engine does not call module probe/init/quiesce entries, bind services, install stable dispatch trampolines, account for in-flight calls, or reload. The Vulkan backend is statically composed, which the layering permits. |
 
@@ -304,9 +308,21 @@ exact whatever the interpolator's precision is. It proves the varying PATH and
 says nothing about interpolation. A shader that read the varying and ignored the
 weights would have passed it.
 
-**2026-09-11, run 6 — REQUESTED, NOT TAKEN.**
-`RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` is built and waiting
-for a board slot.
+**2026-09-12, run 6 — FAILED at the descriptor/TMU render.**
+`RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` was finally run on
+a clean-reset V3D under monitor build 101. The exact untouched-`d8e5f52`
+container was 553,576 bytes, SHA-256
+`773b6678d90693bed4d2917fc3a407bb37c23b0b9f8445dcbf9ae9cd23a5f46a`;
+only its display hold was reduced from six seconds to one so the complete run
+fit under the monitor's 15-second hardware-deadman ceiling. It returned in
+13.74 seconds with the complete magic/tail report and highest step 12, but
+slots 1, 2 and 3 were all 21 (`VVP_ERR_SUBMIT`), submit slots 89, 91 and 93
+were `VK_ERROR_DEVICE_LOST`, and native slot 95 was 13
+(`NEON_ERR_RENDER`). No gradient or descriptor-backed colour is accepted on
+silicon. The descriptor/TMU path remains desk-only and is now a known RED
+silicon gate. A renderer timeout also leaves later V3D payloads dirty until a
+monitor reset; every isolation run after this failure therefore began with a
+fresh reset.
 
 > **The build line**, with the toolchain lane's own mechanism (this is the
 > direct form):
@@ -325,8 +341,8 @@ for a board slot.
 > **Before the run**: `screen dma`. The payload initialises the graphics engine
 > itself and uses the same 16 MiB arena at `$0A000000` the V3D console owns.
 >
-> **Run**: load at `$500000`, `deadman 20` — three passes plus a six-second
-> display of the result.
+> **Run**: load at `$500000`, `deadman 15` — three passes plus a one-second
+> display of the result. Fifteen seconds is the monitor's hardware ceiling.
 >
 > **READ IT WITH `md.l <x0> 200`** — one hundred and twenty-eight 32-bit words,
 > one per slot, the count in hex because every argument of that command is. A
@@ -384,10 +400,37 @@ three times and asks three different questions:
   eight and colour at a stride of sixteen, with the verdict including that every
   probe is the same word as the one-buffer pass produced.
 
-Until that run happens: the gradient, the split binding layout and the
-descriptor path are proved at a desk and nothing more. The tolerance, the probe
-placement and the reason each probe is strictly inside the triangle are in the
-diagnostic's own header and in `vk_interp_expect.pbi`'s.
+That run has happened and failed before producing any of the three pictures.
+The gradient, split binding layout and descriptor path therefore remain proved
+at a desk and nothing more. The tolerance, probe placement and the reason each
+probe is strictly inside the triangle are in the diagnostic's own header and
+in `vk_interp_expect.pbi`.
+
+**2026-09-12, run 7 — PASSED. Format query, host mapping, cache visibility,
+fences and drawing on silicon.** The ordinary triangle diagnostic was extended
+at the source-owned API boundary to require the exact
+`vkGetPhysicalDeviceFormatProperties` answer for linear
+`B8G8R8A8_UNORM`, and to populate both the colour image and vertex allocation
+through `vkMapMemory`/`vkUnmapMemory`. There is deliberately no flush call:
+the vertex fetcher's correct pixels give the Pi 4 backend's advertised
+`HOST_COHERENT` promise a board-visible consequence. The exact container was
+514,072 bytes, SHA-256
+`54f033c86e20b3a66b3d695571aae3edc772d915e432b1239d677d40a401f22a`,
+run under monitor build 101 after a clean reset. The complete report returned
+in 11.92 seconds: both verdicts zero; both submit and wait pairs zero; bin and
+render jobs each advanced twice; no OOM, MMU fault, or guard change; exact red
+then green interior pixels and exact clear exterior pixels; present verdict 1;
+highest step 10 and both magics present. This accepts those APIs and their
+vertex/render cache path at the one proven 800x1280 geometry. It does not make
+the failed descriptor/TMU run green.
+
+The generic `tools/board_run.py` wrapper currently treats any nonzero `x0` as
+a payload failure. These Vulkan diagnostics intentionally return a report
+address in `x0`, so its loud wrapper verdict is not their verdict; the complete
+magic/tail report is. Its capture-sequence comparison also mistakes the first
+capture after a monitor reset for stale when the persisted old sequence was
+higher. Both tool issues are recorded here so neither can be read as a Vulkan
+failure.
 
 
 ## Required architecture

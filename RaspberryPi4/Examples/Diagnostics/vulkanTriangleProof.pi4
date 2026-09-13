@@ -27,6 +27,10 @@
 ;    vkCmdPushConstants, vkCmdDraw, vkCmdEndRenderPass,
 ;    vkEndCommandBuffer, vkCreateFence, vkQueueSubmit, vkWaitForFences,
 ;    vkDeviceWaitIdle and the ordered teardown.
+;  The live physical device's exact linear-format feature word is checked
+;  before image creation, and both allocations are populated through
+;  vkMapMemory/vkUnmapMemory. Correct GPU pixels after those unflushed host
+;  writes are the silicon proof behind this backend's HOST_COHERENT claim.
 ;
 ;  FOUR SPIR-V MODULES ARE ASSEMBLED WORD BY WORD, from the Khronos
 ;  specification's own opcode numbers, in
@@ -269,6 +273,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VTP_ERR_GUARD_CHANGED = 25
 #VTP_ERR_NO_JOBS = 26
 #VTP_ERR_V3D_FAULT = 27
+#VTP_ERR_FORMAT = 28
+#VTP_ERR_MAP = 29
 
 #VTP_P_NOT_TRIED = 0
 #VTP_P_OK = 1
@@ -452,6 +458,7 @@ Procedure.i Main()
   Define count.i
   Define imgBase.i
   Define vaddr.i
+  Define mapped.i
   Define pitch.i
   Define vsA.i
   Define fsA.i
@@ -471,6 +478,7 @@ Procedure.i Main()
   Define badOut.i
 
   Define ici.VkInstanceCreateInfo
+  Define fp.VkFormatProperties
   Define dci.VkDeviceCreateInfo
   Define qci.VkDeviceQueueCreateInfo
   Define prio.l
@@ -577,6 +585,13 @@ Procedure.i Main()
     NeonShutdown()
     ProcedureReturn vtpStop(#VTP_ERR_INSTANCE)
   EndIf
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @fp)
+  If fp\linearTilingFeatures <> #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT Or fp\optimalTilingFeatures <> 0 Or fp\bufferFeatures <> 0
+    vtpPut(#VTP_S_DETAIL, fp\linearTilingFeatures)
+    vtpPut(#VTP_S_DETAIL2, fp\optimalTilingFeatures | fp\bufferFeatures)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_FORMAT)
+  EndIf
   prio = 0
   qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
   qci\queueCount = 1
@@ -649,8 +664,16 @@ Procedure.i Main()
   vtpPut(#VTP_S_IMG_ADDR, imgBase)
   vtpPut(#VTP_S_IMG_SIZE, req\size)
   vtpPut(#VTP_S_IMG_PITCH, AnvilVkImageRowPitch(img))
-  ; POISON IT. An image that already held an answer would prove nothing.
-  vtpFill(imgBase, req\size, ~#VTP_CLEAR_WORD)
+  ; POISON IT through the public mapping API. An image that already held an
+  ; answer would prove nothing, and the map must name the bound image bytes.
+  mapped = 0
+  If vkMapMemory(dev, mem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> imgBase
+    vtpPut(#VTP_S_DETAIL, mapped)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+  vtpFill(mapped, req\size, ~#VTP_CLEAR_WORD)
+  vkUnmapMemory(dev, mem)
 
   ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
   ivci\image = img
@@ -728,24 +751,31 @@ Procedure.i Main()
   EndIf
   vaddr = AnvilVkBufferAddress(buf)
   vtpPut(#VTP_S_VERTEX_ADDR, vaddr)
-  PokeL(vaddr + 0, #VTP_X0)
-  PokeL(vaddr + 4, #VTP_Y0)
-  PokeL(vaddr + 8, #VTP_F_ZERO)
-  PokeL(vaddr + 12, #VTP_F_ONE)
-  PokeL(vaddr + 16, #VTP_F_ZERO)
-  PokeL(vaddr + 20, #VTP_F_ONE)
-  PokeL(vaddr + 24, #VTP_X1)
-  PokeL(vaddr + 28, #VTP_Y1)
-  PokeL(vaddr + 32, #VTP_F_ZERO)
-  PokeL(vaddr + 36, #VTP_F_ONE)
-  PokeL(vaddr + 40, #VTP_F_ZERO)
-  PokeL(vaddr + 44, #VTP_F_ONE)
-  PokeL(vaddr + 48, #VTP_X2)
-  PokeL(vaddr + 52, #VTP_Y2)
-  PokeL(vaddr + 56, #VTP_F_ZERO)
-  PokeL(vaddr + 60, #VTP_F_ONE)
-  PokeL(vaddr + 64, #VTP_F_ZERO)
-  PokeL(vaddr + 68, #VTP_F_ONE)
+  mapped = 0
+  If vkMapMemory(dev, bmem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> vaddr
+    vtpPut(#VTP_S_DETAIL, mapped)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+  PokeL(mapped + 0, #VTP_X0)
+  PokeL(mapped + 4, #VTP_Y0)
+  PokeL(mapped + 8, #VTP_F_ZERO)
+  PokeL(mapped + 12, #VTP_F_ONE)
+  PokeL(mapped + 16, #VTP_F_ZERO)
+  PokeL(mapped + 20, #VTP_F_ONE)
+  PokeL(mapped + 24, #VTP_X1)
+  PokeL(mapped + 28, #VTP_Y1)
+  PokeL(mapped + 32, #VTP_F_ZERO)
+  PokeL(mapped + 36, #VTP_F_ONE)
+  PokeL(mapped + 40, #VTP_F_ZERO)
+  PokeL(mapped + 44, #VTP_F_ONE)
+  PokeL(mapped + 48, #VTP_X2)
+  PokeL(mapped + 52, #VTP_Y2)
+  PokeL(mapped + 56, #VTP_F_ZERO)
+  PokeL(mapped + 60, #VTP_F_ONE)
+  PokeL(mapped + 64, #VTP_F_ZERO)
+  PokeL(mapped + 68, #VTP_F_ONE)
+  vkUnmapMemory(dev, bmem)
 
   ; ------------------------------------------------------------------
   ;  5. Four shader modules, two layouts, two pipelines.

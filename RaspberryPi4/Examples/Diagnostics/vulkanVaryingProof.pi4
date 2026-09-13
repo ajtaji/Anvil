@@ -86,7 +86,7 @@
 ; ======================================================================
 ;  WHAT THE OPERATOR SHOULD SEE
 ; ======================================================================
-;  A triangle, apex up, on a blue-grey ground, held for six seconds:
+;  A triangle, apex up, on a blue-grey ground, held for one second:
 ;  RED at the apex, GREEN at the lower left, BLUE at the lower right,
 ;  blending smoothly through grey in the middle. In panel pixels the
 ;  apex is at (400, 320) and the base runs from (200, 960) to (600, 960).
@@ -181,7 +181,8 @@
 ;    54  pass B probes over tolerance
 ;   55..61  pass C, gradient probes 0 to 6
 ;   62..64  pass C, the three outside probes
-;   65, 66  spare
+;    65  linear-format feature bits reported for B8G8R8A8_UNORM
+;    66  host-visible allocations populated through vkMapMemory, must be 5
 ;    67  pass C worst distance
 ;    68  pass C probes over tolerance
 ;    69  probes where pass C differs from pass B - must be 0
@@ -348,7 +349,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_STRIDE_COL = 16
 #VVP_UNIFORM_BYTES = 16
 
-#VVP_SHOW_MS = 6000
+; Keep the complete three-pass run inside Anvil's hardware-deadman ceiling.
+; The screenshot-on-return gate preserves the frame; a six-second hold could
+; make the watchdog reset the payload before its report exposed a failure.
+#VVP_SHOW_MS = 1000
 
 ; ----------------------------------------------------------------------
 ;  THE VERDICTS. Slots 1, 2 and 3 all use these codes.
@@ -382,6 +386,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_ERR_SPLIT_DIFFERS = 30
 #VVP_ERR_REFUSAL_MISSING = 31
 #VVP_ERR_DESCRIPTOR_LOWERING = 32
+#VVP_ERR_FORMAT = 33
+#VVP_ERR_MAP = 34
 
 #VVP_P_NOT_TRIED = 0
 #VVP_P_OK = 1
@@ -427,6 +433,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_S_B_OVER = 54
 #VVP_S_C_P0 = 55                       ; .. 61
 #VVP_S_C_OUT0 = 62
+#VVP_S_FORMAT_LINEAR = 65
+#VVP_S_MAPS = 66
 #VVP_S_C_WORST = 67
 #VVP_S_C_OVER = 68
 #VVP_S_C_DIFFERS = 69
@@ -621,6 +629,8 @@ Procedure.i Main()
   Define addrPos.i
   Define addrCol.i
   Define addrUni.i
+  Define mapped.i
+  Define maps.i
   Define vsA.i
   Define fsA.i
   Define vsB.i
@@ -645,6 +655,7 @@ Procedure.i Main()
   Define lowering.i
 
   Define ici.VkInstanceCreateInfo
+  Define fp.VkFormatProperties
   Define dci.VkDeviceCreateInfo
   Define qci.VkDeviceQueueCreateInfo
   Define prio.l
@@ -809,6 +820,12 @@ Procedure.i Main()
     NeonShutdown()
     ProcedureReturn vvpStop(#VVP_ERR_INSTANCE)
   EndIf
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @fp)
+  vvpPut(#VVP_S_FORMAT_LINEAR, fp\linearTilingFeatures)
+  If fp\linearTilingFeatures <> #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT Or fp\optimalTilingFeatures <> 0 Or fp\bufferFeatures <> 0
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_FORMAT)
+  EndIf
   prio = 0
   qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
   qci\queueCount = 1
@@ -879,8 +896,17 @@ Procedure.i Main()
   vvpPut(#VVP_S_IMG_ADDR, imgBase)
   vvpPut(#VVP_S_IMG_SIZE, req\size)
   vvpPut(#VVP_S_IMG_PITCH, AnvilVkImageRowPitch(img))
-  ; POISON IT. An image that already held an answer would prove nothing.
-  vvpFill(imgBase, req\size, ~#VVP_CLEAR_WORD)
+  ; POISON IT through Vulkan's public host mapping. An image that already held
+  ; an answer would prove nothing, and using the mapping here makes this run
+  ; exercise the same HOST_COHERENT promise that its GPU-read buffers need.
+  mapped = 0
+  If vkMapMemory(dev, mem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> imgBase
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_MAP)
+  EndIf
+  vvpFill(mapped, req\size, ~#VVP_CLEAR_WORD)
+  vkUnmapMemory(dev, mem)
+  maps = maps + 1
 
   ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
   ivci\image = img
@@ -992,38 +1018,71 @@ Procedure.i Main()
   vvpPut(#VVP_S_BUF_COL, addrCol)
   vvpPut(#VVP_S_BUF_UNI, addrUni)
 
+  ; Populate every GPU-read allocation through Vulkan's public mapping API.
+  ; The buffers are unmapped before submit; no flush call follows. Correct
+  ; pixels therefore exercise the backend's advertised HOST_COHERENT path.
+  mapped = 0
+  If vkMapMemory(dev, memAll, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> addrAll
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_MAP)
+  EndIf
   ; The interleaved array: position then colour, three vertices, and the
   ; three colours are red, green and blue in that vertex order.
-  PokeL(addrAll + 0, #VVP_X0)
-  PokeL(addrAll + 4, #VVP_Y0)
-  PokeL(addrAll + 8, #VVP_F_ONE)  : PokeL(addrAll + 12, #VVP_F_ZERO)
-  PokeL(addrAll + 16, #VVP_F_ZERO) : PokeL(addrAll + 20, #VVP_F_ONE)
-  PokeL(addrAll + 24, #VVP_X1)
-  PokeL(addrAll + 28, #VVP_Y1)
-  PokeL(addrAll + 32, #VVP_F_ZERO) : PokeL(addrAll + 36, #VVP_F_ONE)
-  PokeL(addrAll + 40, #VVP_F_ZERO) : PokeL(addrAll + 44, #VVP_F_ONE)
-  PokeL(addrAll + 48, #VVP_X2)
-  PokeL(addrAll + 52, #VVP_Y2)
-  PokeL(addrAll + 56, #VVP_F_ZERO) : PokeL(addrAll + 60, #VVP_F_ZERO)
-  PokeL(addrAll + 64, #VVP_F_ONE)  : PokeL(addrAll + 68, #VVP_F_ONE)
+  PokeL(mapped + 0, #VVP_X0)
+  PokeL(mapped + 4, #VVP_Y0)
+  PokeL(mapped + 8, #VVP_F_ONE)  : PokeL(mapped + 12, #VVP_F_ZERO)
+  PokeL(mapped + 16, #VVP_F_ZERO) : PokeL(mapped + 20, #VVP_F_ONE)
+  PokeL(mapped + 24, #VVP_X1)
+  PokeL(mapped + 28, #VVP_Y1)
+  PokeL(mapped + 32, #VVP_F_ZERO) : PokeL(mapped + 36, #VVP_F_ONE)
+  PokeL(mapped + 40, #VVP_F_ZERO) : PokeL(mapped + 44, #VVP_F_ONE)
+  PokeL(mapped + 48, #VVP_X2)
+  PokeL(mapped + 52, #VVP_Y2)
+  PokeL(mapped + 56, #VVP_F_ZERO) : PokeL(mapped + 60, #VVP_F_ZERO)
+  PokeL(mapped + 64, #VVP_F_ONE)  : PokeL(mapped + 68, #VVP_F_ONE)
+  vkUnmapMemory(dev, memAll)
+  maps = maps + 1
 
   ; The same data split in two: positions at a stride of eight, colours
   ; at a stride of sixteen, in two separate allocations.
-  PokeL(addrPos + 0, #VVP_X0)  : PokeL(addrPos + 4, #VVP_Y0)
-  PokeL(addrPos + 8, #VVP_X1)  : PokeL(addrPos + 12, #VVP_Y1)
-  PokeL(addrPos + 16, #VVP_X2) : PokeL(addrPos + 20, #VVP_Y2)
-  PokeL(addrCol + 0, #VVP_F_ONE)  : PokeL(addrCol + 4, #VVP_F_ZERO)
-  PokeL(addrCol + 8, #VVP_F_ZERO) : PokeL(addrCol + 12, #VVP_F_ONE)
-  PokeL(addrCol + 16, #VVP_F_ZERO) : PokeL(addrCol + 20, #VVP_F_ONE)
-  PokeL(addrCol + 24, #VVP_F_ZERO) : PokeL(addrCol + 28, #VVP_F_ONE)
-  PokeL(addrCol + 32, #VVP_F_ZERO) : PokeL(addrCol + 36, #VVP_F_ZERO)
-  PokeL(addrCol + 40, #VVP_F_ONE)  : PokeL(addrCol + 44, #VVP_F_ONE)
+  mapped = 0
+  If vkMapMemory(dev, memPos, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> addrPos
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_MAP)
+  EndIf
+  PokeL(mapped + 0, #VVP_X0)  : PokeL(mapped + 4, #VVP_Y0)
+  PokeL(mapped + 8, #VVP_X1)  : PokeL(mapped + 12, #VVP_Y1)
+  PokeL(mapped + 16, #VVP_X2) : PokeL(mapped + 20, #VVP_Y2)
+  vkUnmapMemory(dev, memPos)
+  maps = maps + 1
+
+  mapped = 0
+  If vkMapMemory(dev, memCol, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> addrCol
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_MAP)
+  EndIf
+  PokeL(mapped + 0, #VVP_F_ONE)  : PokeL(mapped + 4, #VVP_F_ZERO)
+  PokeL(mapped + 8, #VVP_F_ZERO) : PokeL(mapped + 12, #VVP_F_ONE)
+  PokeL(mapped + 16, #VVP_F_ZERO) : PokeL(mapped + 20, #VVP_F_ONE)
+  PokeL(mapped + 24, #VVP_F_ZERO) : PokeL(mapped + 28, #VVP_F_ONE)
+  PokeL(mapped + 32, #VVP_F_ZERO) : PokeL(mapped + 36, #VVP_F_ZERO)
+  PokeL(mapped + 40, #VVP_F_ONE)  : PokeL(mapped + 44, #VVP_F_ONE)
+  vkUnmapMemory(dev, memCol)
+  maps = maps + 1
 
   ; The uniform block: magenta, in red, green, blue, alpha order.
-  PokeL(addrUni + 0, #VVP_F_ONE)
-  PokeL(addrUni + 4, #VVP_F_ZERO)
-  PokeL(addrUni + 8, #VVP_F_ONE)
-  PokeL(addrUni + 12, #VVP_F_ONE)
+  mapped = 0
+  If vkMapMemory(dev, memUni, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> addrUni
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_MAP)
+  EndIf
+  PokeL(mapped + 0, #VVP_F_ONE)
+  PokeL(mapped + 4, #VVP_F_ZERO)
+  PokeL(mapped + 8, #VVP_F_ONE)
+  PokeL(mapped + 12, #VVP_F_ONE)
+  vkUnmapMemory(dev, memUni)
+  maps = maps + 1
+  vvpPut(#VVP_S_MAPS, maps)
 
   ; ------------------------------------------------------------------
   ;  6. Five shader modules, a descriptor set layout, a pool, a set,
