@@ -152,6 +152,7 @@ BOARDS = {
     "pi3-updater": Path("RaspberryPi3/Board/updater.pi3"),
     "pi4": Path("RaspberryPi4/Board/board.pi4"),
     "unoq": Path("ArduinoQ/Board/board.unoq"),
+    "rockpi4c": Path("RockPi4C/Board/board.rockpi4c"),
 }
 
 LEDGER_NAME = Path("build/BUILDS.log")

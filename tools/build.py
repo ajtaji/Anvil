@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_count  # noqa: E402
 from pi3_slot import wrap_monitor  # noqa: E402
 from pi3_slot_pack import atomic_write  # noqa: E402
+from rockpi4c_image import wrap as wrap_rockpi4c_image  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,13 @@ TARGETS = {
         "output": Path("build/pi4/armstub8.bin"),
         "target": "pi4",
         "args": ["--armstub"],
+    },
+    "rockpi4c": {
+        "source": Path("RockPi4C/Board/board.rockpi4c"),
+        "output": Path("build/rockpi4c/anvil-flat.img"),
+        "image_output": Path("build/rockpi4c/Image"),
+        "args": ["--load-addr", "0x02000040", "--bss-addr", "0x02800000",
+                 "--stack-addr", "0x03000000"],
     },
 }
 TARGET_ALIASES = {"pi3": ("pi3-loader", "pi3-updater")}
@@ -124,6 +132,8 @@ def _compile_and_publish(compiler: str, target: str, source: Path,
     staged_output = _stage_output(output, token)
     staged_slot = None
     staged_slot_json = None
+    staged_image = None
+    staged_image_json = None
     env = os.environ.copy()
     env["PMF_ROOT"] = str(ROOT)
     command = [
@@ -165,6 +175,18 @@ def _compile_and_publish(compiler: str, target: str, source: Path,
                 (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("ascii"),
             )
 
+        image_output = spec.get("image_output")
+        if image_output is not None:
+            wrapped, metadata = wrap_rockpi4c_image(staged_output.read_bytes())
+            image_path = ROOT / image_output
+            staged_image = _stage_output(image_path, token)
+            staged_image_json = Path(str(staged_image) + ".json")
+            atomic_write(staged_image, wrapped)
+            atomic_write(
+                staged_image_json,
+                (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode("ascii"),
+            )
+
         compiler_files = sorted(
             (path for path in staged_output.parent.glob(staged_output.name + "*")
              if path.is_file()),
@@ -178,6 +200,10 @@ def _compile_and_publish(compiler: str, target: str, source: Path,
             slot_path = ROOT / spec["slot_output"]
             pairs.extend(((staged_slot, slot_path),
                           (staged_slot_json, Path(str(slot_path) + ".json"))))
+        if staged_image is not None and staged_image_json is not None:
+            image_path = ROOT / spec["image_output"]
+            pairs.extend(((staged_image, image_path),
+                          (staged_image_json, Path(str(image_path) + ".json"))))
         publication = PublishedArtifacts(pairs, token)
         publication.publish()
         print(f"Built {spec['output']} ({output.stat().st_size} bytes).")
@@ -186,6 +212,8 @@ def _compile_and_publish(compiler: str, target: str, source: Path,
                 f"Packed {spec['slot_output']} ({(ROOT / spec['slot_output']).stat().st_size} "
                 f"bytes)."
             )
+        if staged_image is not None:
+            print(f"Wrapped {spec['image_output']} ({(ROOT / spec['image_output']).stat().st_size} bytes).")
         return publication
     finally:
         # A failed compiler or packer may leave a partial private set. It is
@@ -196,7 +224,7 @@ def _compile_and_publish(compiler: str, target: str, source: Path,
                     path.unlink()
                 except OSError:
                     pass
-        for path in (staged_slot, staged_slot_json):
+        for path in (staged_slot, staged_slot_json, staged_image, staged_image_json):
             if path is not None and path.is_file():
                 try:
                     path.unlink()
