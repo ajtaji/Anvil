@@ -131,13 +131,23 @@ Register/password/reset semantics
 are checked against the pinned
 [Linux v6.12 watchdog driver](https://github.com/torvalds/linux/blob/v6.12/drivers/watchdog/bcm2835_wdt.c)
 and [U-Boot v2025.01](https://github.com/u-boot/u-boot/blob/v2025.01/drivers/watchdog/bcm2835_wdt.c).
-The immutable loader first stops/adopts reset residue before SD mount or its
-recovery wait. WRCFG bits are configuration, not a foreign-active-owner test;
-arming replaces them with the documented read-modify-write. The trial updater
-does not call the cold-stop path. Serial milestones `L0` through `L6` name the
-watchdog, first verify, TRIED write/readback, reverify, copy, handoff and branch
-boundaries. Alternating status-LED states preserve a coarse last boundary if
-serial is lost. `C0: candidate Main entered` is the candidate's first
+The immutable loader first stops/adopts reset residue. It then arms a separate,
+never-fed 15-second early-storage watchdog before the firmware maximum-core-
+clock request, native SDHOST initialization and cold A/B mount. Milestones
+`E0` through `E6` distinguish arm, clock request/reply, SDHOST entry/ready,
+mount and positive stop. An explicitly returned failure stops that early timer
+and remains parked for diagnosis; a genuinely wedged call is reset by it. The
+timer is positively stopped before the three-second U/F recovery window, and
+the independent 15-second trial window is armed afterward. This closes the
+pre-watchdog hang reproduced by deployed loader build 7 and recorded in forum
+topic 788 without feeding either timer or weakening the A/B state rules.
+
+WRCFG bits are configuration, not a foreign-active-owner test; arming replaces
+them with the documented read-modify-write. The trial updater does not call
+the cold-stop or early-arm paths. Serial milestones `L0` through `L6` name the
+trial watchdog, first verify, TRIED write/readback, reverify, copy, handoff and
+branch boundaries. Alternating status-LED states preserve a coarse last
+boundary if serial is lost. `C0: candidate Main entered` is the candidate's first
 source-level action, before SD context, mailbox, mount or confirmation work.
 No RSTS/firmware partition-selection writes are made. There is no unlimited
 watchdog feeding; reaching the health point within 15 seconds for a maximum
@@ -254,6 +264,14 @@ the existing FAT read-at gate passes 19 cases and rejects three mutants.
 The Ethernet host framing/retry gate passes 11 cases and the emitted updater
 gate passes 12 peer/session/A-B/replay cases. LAN9514 transport, runtime and
 USB enumeration hostile gates all pass, including emitted AArch64 execution.
+The loader watchdog gate passes 41 emitted register/state checks; the whole-
+window gate executes four early-storage success/refusal paths and rejects nine
+ordering/ownership mutants. Candidate immutable loader build 9 is 136,652
+bytes, SHA-256
+`2ad3e750c3303d3f1ae38e250f25035b90c801cfe6d484e01b6dc56be3e7c70c`;
+its PMF is 136,780 bytes, SHA-256
+`91ffc1f3e87b2c3cfe81706890a073ed680520e9aef93cfe30ffbfd2cca4cbac`.
+It has not replaced the deployed build-7 loader.
 Compiler SHA256:
 `36b322210c55af58d37305d905394d52d741299604bf17e7712d0eee8fe4bc07`.
 

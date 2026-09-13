@@ -42,9 +42,59 @@ Procedure.i Pi3BootMaxCoreClock()
   ProcedureReturn PeekL(buffer + 24) & $FFFFFFFF
 EndProcedure
 
-Procedure.i Pi3UpdateBootStart(display.i)
+; The immutable loader owns a separate, never-fed watchdog around the exact
+; cold storage interval that build 7 could enter without recovery coverage.
+; Candidate/updater entry (display=0) already inherits the loader's trial
+; watchdog and must neither restart nor stop it here.
+Procedure.i Pi3BootStorage(display.i)
   Protected clock.i
   Protected mounted.i
+  Protected ready.i
+  If display<>0
+    Pi3Say("E0: arm early 15-second storage watchdog")
+    If Pi3UpdateWatchdogArmEarly()=0
+      Pi3Say("STOP: early storage watchdog could not be armed")
+      ProcedureReturn 0
+    EndIf
+    Pi3Say("E1: request firmware maximum core clock")
+  EndIf
+  clock=Pi3BootMaxCoreClock()
+  If clock<1000000
+    Pi3Say("STOP: maximum core clock request refused")
+  Else
+    If display<>0 : Pi3Say("E2: maximum core clock ready") : Pi3Say("E3: initialize native SDHOST") : EndIf
+    If Pi3SdInit(clock,0,pi3_ram_end)=0
+      Pi3Say("STOP: SDHOST initialization refused")
+    Else
+      If display<>0 : Pi3Say("E4: native SDHOST ready") : EndIf
+      If Pi3UpdateConfigure($2000000,$E00000,0,pi3_ram_end,pi3_dtb,pi3_dtb_end-pi3_dtb)=0
+        Pi3Say("STOP: A/B fixed arenas refused")
+      Else
+        If display<>0 : Pi3Say("E5: mount and verify A/B volume") : EndIf
+        If display<>0 : mounted=Pi3UpdateMount() : Else : mounted=Pi3UpdateMountHandoff() : EndIf
+        If mounted=0
+          Pi3Say("STOP: A/B mount refused; no valid confirmed fallback or unsafe volume")
+          pi3ut_WriteDec(Pi3UpdateError()) : pi3ut_WriteByte(13) : pi3ut_WriteByte(10)
+        Else
+          ready=1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  If display<>0
+    ; Every ordinary refusal stops the early timer and remains parked for
+    ; diagnosis. Only a genuinely wedged call is recovered by its expiry.
+    If Pi3UpdateWatchdogStopEarly()=0
+      Pi3Say("STOP: early storage watchdog could not be stopped")
+      Pi3Park()
+    EndIf
+    Pi3Say("E6: early storage watchdog stopped")
+  EndIf
+  ProcedureReturn ready
+EndProcedure
+
+Procedure.i Pi3UpdateBootStart(display.i)
+  Protected clock.i
   If p3sdContext() = 0 : ProcedureReturn 0 : EndIf
   ; Only the cold immutable loader adopts/stops watchdog reset residue.
   ; A running trial updater retains its watchdog until confirmation.
@@ -66,18 +116,7 @@ Procedure.i Pi3UpdateBootStart(display.i)
   EndIf
   Pi3Say("Anvil Pi3 A/B boot: validated memory, SDHOST next")
   Pi3PrintBuild()
-  clock = Pi3BootMaxCoreClock()
-  If clock < 1000000 Or Pi3SdInit(clock, 0, pi3_ram_end) = 0
-    Pi3Say("STOP: SDHOST initialization refused") : ProcedureReturn 0
-  EndIf
-  If Pi3UpdateConfigure($2000000, $E00000, 0, pi3_ram_end, pi3_dtb, pi3_dtb_end - pi3_dtb) = 0 : ProcedureReturn 0 : EndIf
-  If display <> 0 : mounted = Pi3UpdateMount() : Else : mounted = Pi3UpdateMountHandoff() : EndIf
-  If mounted = 0
-    Pi3Say("STOP: A/B mount refused; no valid confirmed fallback or unsafe volume")
-    pi3ut_WriteDec(Pi3UpdateError()) : pi3ut_WriteByte(13) : pi3ut_WriteByte(10)
-    ProcedureReturn 0
-  EndIf
-  ProcedureReturn 1
+  ProcedureReturn Pi3BootStorage(display)
 EndProcedure
 
 Procedure Pi3UpdateEnter()

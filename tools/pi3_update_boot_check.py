@@ -95,6 +95,20 @@ def main():
         assert c.call('Pi3UpdateWatchdogColdStop')==1 and c.writes==[(0x3f10001c,0x5a000102)];checks+=1
         c=Rig(ignored=True);c.regs[0x3f10001c]=0x20
         assert c.call('Pi3UpdateWatchdogColdStop')==0;checks+=1
+        # The immutable loader's first watchdog covers max-core-clock, SDHOST
+        # and cold mount, then is positively stopped before the U/F window.
+        c=Rig();c.store(sym['global_pi3_up_loaded'],0,8)
+        assert c.call('Pi3UpdateWatchdogArmEarly')==1
+        assert c.writes==[(0x3f100024,0x5a0f0000),(0x3f10001c,0x5a000020)]
+        assert c.load(sym['global_pi3_update_watchdog_early_owned'],8)==1
+        assert c.call('Pi3UpdateWatchdogArmWindow')==0 and len(c.writes)==2
+        assert c.call('Pi3UpdateWatchdogStopEarly')==1
+        assert c.writes[-1]==(0x3f10001c,0x5a000102)
+        assert c.load(sym['global_pi3_update_watchdog_early_owned'],8)==0;checks+=5
+        c=Rig();c.store(sym['global_pi3_up_loaded'],0,8);c.store(sym['global_pi3_up_mounted'],1,8)
+        assert c.call('Pi3UpdateWatchdogArmEarly')==0 and not c.writes;checks+=1
+        c=Rig(ignored=True);c.store(sym['global_pi3_up_loaded'],0,8)
+        assert c.call('Pi3UpdateWatchdogArmEarly')==0;checks+=1
         c=Rig();assert c.call('Pi3UpdateResetNow')==0 and not c.writes;checks+=1
         c=Rig();c.allow_reset=1
         assert c.call('Pi3UpdateResetNow')==0
