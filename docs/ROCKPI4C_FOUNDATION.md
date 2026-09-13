@@ -8,7 +8,11 @@ of a correct display. Its fixed RGB1280 line-buffer mode was incompatible with
 1920-pixel scanout. The correction selects RGB1920X5 through width 1920 and
 RGB2560X4 above it, matching the reference driver's RGB selection rule.
 Raw EDID and final programmed clock/timing registers are now logged to make
-the next board run independently checkable. Visual proof remains pending.
+the board run independently checkable. Build 47 confirmed that corrected
+line-buffer setting and a valid MSI MAG274R EDID: 1920x1080, 148.5 MHz,
+2200x1125 totals, 60 Hz, positive H and negative V sync. The picture still
+rolled and corrupted. The line-buffer defect was real but was not the whole
+failure; preferred-mode output remains broken and under investigation.
 
 ## Identity and ownership
 
@@ -176,9 +180,11 @@ returns. It never guesses a direct-CRU fallback. A physical cycle is still
 needed after an early fatal failure that cannot service the recovery loop.
 Network-triggered reboot is not implemented on this target.
 
-This new command path requires its own silicon acceptance: `help` must reply,
-invalid lines must not reset, and `reboot` must return the board to the stock
-boot chain without a physical power cycle.
+Build 47 passed silicon acceptance: `help` replied, an unknown command and
+an overlong line were rejected without resetting, and `reboot` returned
+through DDR initialization to stock U-Boot without a physical power cycle.
+The separate recovery gate verifies the emitted PSCI sequence and parser
+negative cases. This proof does not imply that the display is correct.
 
 ```text
 python tools/rockpi4c_foundation_check.py --compiler <candidate>

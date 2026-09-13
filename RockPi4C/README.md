@@ -3,7 +3,9 @@
 Status: **MiniDP first light confirmed on hardware in build 39 at 1024x768**.
 Build 44 selected preferred 1920x1080 at 148.5 MHz but the physical picture
 rolled and corrupted. Its fixed 1280-pixel line-buffer setting was wrong for
-that width; the width-dependent correction awaits a fresh visual test.
+that width. Build 47 confirmed the corrected line-buffer setting and valid
+1920x1080 EDID timing, but the picture still rolled and corrupted. Preferred
+mode is not yet working.
 
 `Board/board.rockpi4c` is the first runnable composition root. It has an
 explicit RK3399 compiler target, an arm64 U-Boot `Image` wrapper, bounded
@@ -19,8 +21,9 @@ IRQ remains masked. After display startup (or a late display refusal), the
 UART recovery loop accepts exact `help` and `reboot` commands over FTDI.
 Reboot uses the retained secure firmware's PSCI reset operation, not a guessed
 CRU reset sequence. Early invalid handoffs and fatal exceptions still park.
-This recovery path has not yet been tested on the physical board; there is
-no Rock Pi network command service yet.
+Build 47 proved help, rejection of invalid commands, and firmware reboot
+back to stock U-Boot on the physical board. There is no Rock Pi network
+command service yet.
 This is the original 4C, not the 4C+ with RK3399-T.
 
 Hardware basis: RK3399, two Cortex-A72 plus four Cortex-A53 cores, Mali-T860.
