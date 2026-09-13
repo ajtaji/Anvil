@@ -237,7 +237,6 @@ EndProcedure
 Procedure.i vcrRecordClear(dev.i, cmd.i, img.i)
   Define bi.VkCommandBufferBeginInfo
   Define bar.VkImageMemoryBarrier
-  Define pbargs.AnvilVkPipelineBarrierArgs
   Define range.VkImageSubresourceRange
 
   If vkResetCommandBuffer(cmd, 0) <> #VK_SUCCESS
@@ -262,11 +261,7 @@ Procedure.i vcrRecordClear(dev.i, cmd.i, img.i)
   bar\subresourceRange\levelCount = 1
   bar\subresourceRange\baseArrayLayer = 0
   bar\subresourceRange\layerCount = 1
-  pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
-  pbargs\imageMemoryBarrierCount = 1
-  pbargs\pImageMemoryBarriers = @bar
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
 
   range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   range\baseMipLevel = 0

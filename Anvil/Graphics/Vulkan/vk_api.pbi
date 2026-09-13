@@ -464,52 +464,20 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  RECORDED COMMANDS
 ;
-;  THE ONE COMMAND THAT CANNOT CARRY ITS REGISTRY SIGNATURE HERE.
-;  vkCmdPipelineBarrier takes ten parameters. The PureMetal AArch64
-;  backend passes at most eight, in a0 through a7, and refuses a ninth
-;  at compile time - stack arguments are not emitted yet. So the nine
-;  arguments after the command buffer travel in ONE record, in the
-;  registry's own order and with the registry's own member names and
-;  widths, and the entry point is named vkCmdPipelineBarrierArgs so no
-;  reader can mistake it for the real prototype.
-;
-;  This is a toolchain limitation, not a design choice, and it is in the
-;  capability table with the exact backend change that removes it. Every
-;  other command in this file has its registry signature exactly; only
-;  this one does not fit in eight registers.
+;  This is the exact Vulkan 1.0 registry signature. The AArch64 ABI puts
+;  the first eight arguments in x0..x7 and the final two in the caller's
+;  stack argument area. The compiler has owned that split since
+;  a9f412a6; keeping the former argument-record surrogate here would now
+;  make this API needlessly source-incompatible with Vulkan.
 ; ----------------------------------------------------------------------
-Structure AnvilVkPipelineBarrierArgs Align #PB_Structure_AlignC
-  srcStageMask.l
-  dstStageMask.l
-  dependencyFlags.l
-  memoryBarrierCount.l
-  *pMemoryBarriers
-  bufferMemoryBarrierCount.l
-  *pBufferMemoryBarriers
-  imageMemoryBarrierCount.l
-  *pImageMemoryBarriers
-EndStructure
-
-Procedure vkCmdPipelineBarrierArgs(commandBuffer.i, *a.AnvilVkPipelineBarrierArgs)
+Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, dependencyFlags.i, memoryBarrierCount.i, *pMemoryBarriers, bufferMemoryBarrierCount.i, *pBufferMemoryBarriers, imageMemoryBarrierCount.i, *pImageMemoryBarriers.VkImageMemoryBarrier)
   Define c.i
-  Define srcStageMask.i
-  Define dstStageMask.i
-  Define dependencyFlags.i
-  Define memoryBarrierCount.i
-  Define bufferMemoryBarrierCount.i
-  Define imageMemoryBarrierCount.i
-  Define *pImageMemoryBarriers.VkImageMemoryBarrier
-  If *a = 0
-    avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrierArgs was given a null argument record (Anvil code -20001, invalid argument); nothing was recorded.")
-    ProcedureReturn
-  EndIf
-  srcStageMask = *a\srcStageMask & $FFFFFFFF
-  dstStageMask = *a\dstStageMask & $FFFFFFFF
-  dependencyFlags = *a\dependencyFlags & $FFFFFFFF
-  memoryBarrierCount = *a\memoryBarrierCount & $FFFFFFFF
-  bufferMemoryBarrierCount = *a\bufferMemoryBarrierCount & $FFFFFFFF
-  imageMemoryBarrierCount = *a\imageMemoryBarrierCount & $FFFFFFFF
-  *pImageMemoryBarriers = *a\pImageMemoryBarriers
+  srcStageMask = srcStageMask & $FFFFFFFF
+  dstStageMask = dstStageMask & $FFFFFFFF
+  dependencyFlags = dependencyFlags & $FFFFFFFF
+  memoryBarrierCount = memoryBarrierCount & $FFFFFFFF
+  bufferMemoryBarrierCount = bufferMemoryBarrierCount & $FFFFFFFF
+  imageMemoryBarrierCount = imageMemoryBarrierCount & $FFFFFFFF
   c = avkCmdSlot(commandBuffer)
   If c = 0
     avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdPipelineBarrier was given a VkCommandBuffer handle that is not live (Anvil code -20002, stale or foreign handle); nothing was recorded.")
@@ -520,7 +488,7 @@ Procedure vkCmdPipelineBarrierArgs(commandBuffer.i, *a.AnvilVkPipelineBarrierArg
     ProcedureReturn
   EndIf
   If memoryBarrierCount <> 0 Or bufferMemoryBarrierCount <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a global memory barrier or a buffer memory barrier (Anvil code -20005, unsupported barrier kind); only image memory barriers are implemented, because there are no VkBuffer objects yet.")
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a global memory barrier or a buffer memory barrier (Anvil code -20005, unsupported barrier kind); only image memory barriers are implemented in this slice, so record image barriers only.")
     ProcedureReturn
   EndIf
   If imageMemoryBarrierCount = 0

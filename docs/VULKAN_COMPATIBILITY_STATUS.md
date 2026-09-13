@@ -54,7 +54,7 @@ one gets a compile-time refusal naming it.
 | `vkCreateCommandPool` / `vkDestroyCommandPool` / `vkResetCommandPool` | Implemented. |
 | `vkAllocateCommandBuffers` / `vkFreeCommandBuffers` | Implemented for one buffer per call; array allocation is refused, not faked. |
 | `vkBeginCommandBuffer` / `vkEndCommandBuffer` / `vkResetCommandBuffer` | Implemented. A recording error moves the buffer to invalid and `vkEndCommandBuffer` reports it, as the specification requires. |
-| `vkCmdPipelineBarrier` | **Not callable under its registry name.** See the note below. `vkCmdPipelineBarrierArgs` is the same call with the nine arguments after the command buffer in one record, in registry order. One image memory barrier per call; global and buffer barriers are refused. |
+| `vkCmdPipelineBarrier` | Implemented with its exact ten-parameter registry signature. One image memory barrier per call; global and buffer barriers are refused. The final count and pointer travel through the AArch64 stack argument area and are exercised through emitted code. |
 | `vkCmdClearColorImage` | Implemented with its exact registry signature, for one whole-image range. |
 | `vkCreateFence` / `vkDestroyFence` / `vkResetFences` / `vkGetFenceStatus` / `vkWaitForFences` | Implemented for finite waits. `UINT64_MAX` succeeds immediately when the requested fence condition is already true; an unsatisfied unlimited wait returns `ANVIL_VK_ERR_UNSUPPORTED` until host calls are reentrant. It is never disguised as a bounded `VK_TIMEOUT`. |
 | `vkQueueSubmit` | Implemented for one `VkSubmitInfo`, one command buffer, no semaphores. Batches, multiple buffers and semaphores are refused with `VK_ERROR_FEATURE_NOT_PRESENT`. |
@@ -98,13 +98,12 @@ zero controls that sample; blending disabled and every channel written; no depth
 dynamic state. Everything else is refused with a code and a sentence.
 
 
-> **The ten-parameter problem.** `vkCmdPipelineBarrier` takes ten parameters.
-> The PureMetal AArch64 backend passes at most eight, in `a0`..`a7`, and
-> refuses a ninth at compile time; stack arguments are not emitted yet. This
-> is the only core-1.0 command in the implemented set that cannot carry its
-> registry signature, and it is a toolchain limitation, not a design choice.
-> The exact change that removes it is argument passing on the stack in the
-> A64 backend's call emission.
+`vkCmdPipelineBarrier`'s ten-parameter problem is closed. Compiler revision
+`a9f412a6` added aligned AArch64 stack arguments, so Anvil now exposes the
+registry prototype directly and no longer carries an argument-record adapter.
+The resource gate executes the real call: argument nine is the image-barrier
+count and argument ten is its pointer, making both the caller and callee sides
+observable.
 
 ### The layers
 

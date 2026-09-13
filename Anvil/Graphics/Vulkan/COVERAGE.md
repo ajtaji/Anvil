@@ -60,13 +60,11 @@ padding and flattened substitute members are not used. A compiler that lacks
 this explicit layout mode must reject these declarations loudly; it must not
 silently use packed layout.
 
-> **One command cannot carry its registry signature.** `vkCmdPipelineBarrier`
-> takes ten parameters and this backend passes at most eight, in `a0`..`a7`,
-> refusing a ninth at compile time. `vkCmdPipelineBarrierArgs` is the same call
-> with the nine arguments after the command buffer in one record, in registry
-> order and with registry member names. It is named so nobody can mistake it
-> for the prototype, and it disappears the day the A64 backend emits stack
-> arguments.
+`vkCmdPipelineBarrier` now carries the exact ten-parameter registry signature.
+The first eight arguments use `x0`..`x7`; the compiler passes the image-barrier
+count and pointer through the aligned AArch64 stack argument area. The former
+argument-record surrogate has been removed rather than retained as a second,
+divergent API.
 
 ## 2026-09-11: the SPIR-V front end and the first graphics pipeline
 

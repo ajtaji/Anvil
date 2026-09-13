@@ -39,7 +39,7 @@
 ;    vkGetPhysicalDeviceMemoryProperties, vkCreateDevice, vkGetDeviceQueue,
 ;    vkCreateImage, vkGetImageMemoryRequirements, vkAllocateMemory,
 ;    vkBindImageMemory, vkCreateCommandPool, vkAllocateCommandBuffers,
-;    vkBeginCommandBuffer, vkCmdPipelineBarrierArgs, vkCmdClearColorImage,
+;    vkBeginCommandBuffer, vkCmdPipelineBarrier, vkCmdClearColorImage,
 ;    vkEndCommandBuffer, vkCreateFence, vkQueueSubmit, vkWaitForFences,
 ;    vkGetFenceStatus, vkDeviceWaitIdle and the ordered teardown.
 ;
@@ -344,7 +344,6 @@ Procedure.i Main()
   Define fci.VkFenceCreateInfo
   Define si.VkSubmitInfo
   Define bar.VkImageMemoryBarrier
-  Define pbargs.AnvilVkPipelineBarrierArgs
   Define range.VkImageSubresourceRange
   Define mp.VkPhysicalDeviceMemoryProperties
   Define cbHandle.i
@@ -533,10 +532,6 @@ Procedure.i Main()
   bar\subresourceRange\levelCount = 1
   bar\subresourceRange\baseArrayLayer = 0
   bar\subresourceRange\layerCount = 1
-  pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
-  pbargs\imageMemoryBarrierCount = 1
-  pbargs\pImageMemoryBarriers = @bar
 
   range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   range\baseMipLevel = 0
@@ -550,7 +545,7 @@ Procedure.i Main()
     NeonShutdown()
     ProcedureReturn vcpStop(#VCP_ERR_RECORD)
   EndIf
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
   vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vcpColor[0], 1, @range)
   rc = vkEndCommandBuffer(cmd)
   If rc <> #VK_SUCCESS

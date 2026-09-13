@@ -125,7 +125,6 @@ Procedure.i vdgRunOne(index.i, width.i, height.i)
   Define mai.VkMemoryAllocateInfo
   Define beginInfo.VkCommandBufferBeginInfo
   Define barrier.VkImageMemoryBarrier
-  Define barrierArgs.AnvilVkPipelineBarrierArgs
   Define range.VkImageSubresourceRange
   Define submit.VkSubmitInfo
 
@@ -190,10 +189,6 @@ Procedure.i vdgRunOne(index.i, width.i, height.i)
   barrier\subresourceRange\levelCount = 1
   barrier\subresourceRange\baseArrayLayer = 0
   barrier\subresourceRange\layerCount = 1
-  barrierArgs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-  barrierArgs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
-  barrierArgs\imageMemoryBarrierCount = 1
-  barrierArgs\pImageMemoryBarriers = @barrier
   range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   range\baseMipLevel = 0
   range\levelCount = 1
@@ -203,7 +198,7 @@ Procedure.i vdgRunOne(index.i, width.i, height.i)
   beginInfo\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
   beginInfo\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
   If vkBeginCommandBuffer(vdgCmd, @beginInfo) <> #VK_SUCCESS : ProcedureReturn #VDG_ERR_RECORD : EndIf
-  vkCmdPipelineBarrierArgs(vdgCmd, @barrierArgs)
+  vkCmdPipelineBarrier(vdgCmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @barrier)
   vkCmdClearColorImage(vdgCmd, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vdgColour[0], 1, @range)
   rc = vkEndCommandBuffer(vdgCmd)
   If rc <> #VK_SUCCESS : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_RECORD : EndIf

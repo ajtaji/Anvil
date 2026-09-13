@@ -126,7 +126,9 @@ Procedure.i Main()
   Define fci.VkFenceCreateInfo
   Define si.VkSubmitInfo
   Define bar.VkImageMemoryBarrier
-  Define pbargs.AnvilVkPipelineBarrierArgs
+  Define pbSrcStage.i
+  Define pbDstStage.i
+  Define pbMemoryBarrierCount.i
   Define range.VkImageSubresourceRange
   Define cbHandle.i
   Define cb2Handle.i
@@ -436,16 +438,15 @@ Procedure.i Main()
   bar\subresourceRange\levelCount = 1
   bar\subresourceRange\baseArrayLayer = 0
   bar\subresourceRange\layerCount = 1
-  pbargs\srcStageMask = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
-  pbargs\imageMemoryBarrierCount = 1
-  pbargs\pImageMemoryBarriers = @bar
+  pbSrcStage = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+  pbDstStage = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  pbMemoryBarrierCount = 0
 
   ; A barrier into TRANSFER_DST_OPTIMAL with no transfer write in its
   ; destination access scope is the classic silently-wrong barrier.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   bar\dstAccessMask = 0
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
   Sentence()
@@ -455,18 +456,18 @@ Procedure.i Main()
 
   ; ... and one whose destination stage omits the transfer stage.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
-  pbargs\dstStageMask = #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  pbDstStage = #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
   Sentence()
-  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  pbDstStage = #VK_PIPELINE_STAGE_TRANSFER_BIT
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
   ; A queue-family ownership transfer on a one-family device.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   bar\srcQueueFamilyIndex = 0
   bar\dstQueueFamilyIndex = 1
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
   Sentence()
   bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
@@ -477,34 +478,34 @@ Procedure.i Main()
   ; not the whole of a single-level, single-layer image.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_DEPTH_BIT
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
   Sentence()
   bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   bar\subresourceRange\baseMipLevel = 1
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
   bar\subresourceRange\baseMipLevel = 0
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
   ; A global memory barrier and a buffer memory barrier are refused.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
-  pbargs\memoryBarrierCount = 1
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  pbMemoryBarrierCount = 1
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
   Sentence()
-  pbargs\memoryBarrierCount = 0
+  pbMemoryBarrierCount = 0
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
   ; A barrier that claims a layout the recording did not put the image in.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
   bar\oldLayout = #VK_IMAGE_LAYOUT_GENERAL
   bar\newLayout = #VK_IMAGE_LAYOUT_GENERAL
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_STATE)
   Sentence()
   bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
@@ -524,7 +525,7 @@ Procedure.i Main()
   ; Clearing an image the recording has not transitioned, while claiming
   ; a layout it is not in.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_STATE)
   Sentence()
@@ -574,7 +575,7 @@ Procedure.i Main()
   Vkr(vkGetFenceStatus(dev, fence) = #VK_NOT_READY)
 
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vkrColor[0], 1, @range)
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
   Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
@@ -583,7 +584,7 @@ Procedure.i Main()
 
   Vkr(vkAllocateCommandBuffers(dev, @cbai, @cmd2) = #VK_SUCCESS)
   Vkr(vkBeginCommandBuffer(cmd2, @bi) = #VK_SUCCESS)
-  vkCmdPipelineBarrierArgs(cmd2, @pbargs)
+  vkCmdPipelineBarrier(cmd2, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   vkCmdClearColorImage(cmd2, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vkrColor[0], 1, @range)
   Vkr(vkEndCommandBuffer(cmd2) = #VK_SUCCESS)
   cb2Handle = cmd2
@@ -715,8 +716,8 @@ Procedure.i Main()
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
   bar\newLayout = #VK_IMAGE_LAYOUT_GENERAL
-  pbargs\dstStageMask = #VK_PIPELINE_STAGE_TRANSFER_BIT
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  pbDstStage = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 1, @range)
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
   AnvilVkTestBackendFailNext(-77)
@@ -759,7 +760,7 @@ Procedure.i Main()
   bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
   i = 0
   While i < (#ANVIL_VK_MAX_OPS + 4)
-    vkCmdPipelineBarrierArgs(cmd, @pbargs)
+    vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
     i = i + 1
   Wend
   Vkr(vkEndCommandBuffer(cmd) = #VK_ERROR_OUT_OF_HOST_MEMORY)
@@ -768,9 +769,9 @@ Procedure.i Main()
 
   ; A second image in one command buffer is retained; a third is refused.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   bar\image = img2
-  vkCmdPipelineBarrierArgs(cmd, @pbargs)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
   Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
   bar\image = img
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)

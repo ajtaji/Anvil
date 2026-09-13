@@ -331,6 +331,18 @@ MUTANTS = (
         "  If rangeCount <> 1 Or *pRanges = 0\n",
         "  If *pRanges = 0\n",
     ),
+    (
+        "vkCmdPipelineBarrier discards its ninth stack argument",
+        "vk_api.pbi",
+        "  imageMemoryBarrierCount = imageMemoryBarrierCount & $FFFFFFFF\n",
+        "  imageMemoryBarrierCount = 0\n",
+    ),
+    (
+        "vkCmdPipelineBarrier discards its tenth stack argument",
+        "vk_api.pbi",
+        "  AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, *pImageMemoryBarriers)\n",
+        "  AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, 0)\n",
+    ),
 )
 
 FENCE_UNLIMITED_MUTANTS = frozenset({
@@ -353,6 +365,11 @@ MAP_MEMORY_MUTANTS = frozenset({
 
 FORMAT_TRUTH_MUTANTS = frozenset({
     "vkCreateImage accepts a color attachment on a transfer-only backend",
+})
+
+PIPELINE_BARRIER_ABI_MUTANTS = frozenset({
+    "vkCmdPipelineBarrier discards its ninth stack argument",
+    "vkCmdPipelineBarrier discards its tenth stack argument",
 })
 
 
@@ -575,7 +592,7 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    parser.add_argument("--mutate-only", choices=("fence-unlimited", "map-memory", "format-truth"))
+    parser.add_argument("--mutate-only", choices=("fence-unlimited", "map-memory", "format-truth", "pipeline-barrier-abi"))
     args = parser.parse_args()
     if args.mutate_only:
         args.mutate = True
@@ -597,7 +614,7 @@ def main() -> int:
     print(f"vulkan_resource_check: PASS - {g.checks} independent property checks over "
           f"{steps:,} executed A64 instructions")
     print("  the real vkCreateImage, vkGetImageMemoryRequirements, vkAllocateMemory,")
-    print("  vkBindImageMemory, vkMapMemory, vkUnmapMemory, vkCmdPipelineBarrierArgs,")
+    print("  vkBindImageMemory, vkMapMemory, vkUnmapMemory, vkCmdPipelineBarrier,")
     print("  vkCmdClearColorImage, vkQueueSubmit, vkCreateFence, vkGetFenceStatus,")
     print("  vkWaitForFences, vkResetFences and")
     print("  vkDeviceWaitIdle ran; no MMIO, framebuffer, GPU or DMA was touched")
@@ -615,6 +632,8 @@ def main() -> int:
         if args.mutate_only == "map-memory" and name not in MAP_MEMORY_MUTANTS:
             continue
         if args.mutate_only == "format-truth" and name not in FORMAT_TRUTH_MUTANTS:
+            continue
+        if args.mutate_only == "pipeline-barrier-abi" and name not in PIPELINE_BARRIER_ABI_MUTANTS:
             continue
         text = originals.get(where)
         if text is None or text.count(fixed) != 1:
@@ -646,6 +665,8 @@ def main() -> int:
         total = len(MAP_MEMORY_MUTANTS)
     elif args.mutate_only == "format-truth":
         total = len(FORMAT_TRUTH_MUTANTS)
+    elif args.mutate_only == "pipeline-barrier-abi":
+        total = len(PIPELINE_BARRIER_ABI_MUTANTS)
     else:
         total = len(MUTANTS)
     if missed:
