@@ -19,6 +19,8 @@
 #ROCK_PMU_BUS_IDLE_ACK = $68
 
 Global rock_cru_error.i
+Global rock_cru_gpll_rate.i
+Global rock_cru_dp_core_rate.i
 
 Procedure.i RockCruRead(offset.i)
   ProcedureReturn PeekL(#ROCK_CRU+offset) & $FFFFFFFF
@@ -111,7 +113,7 @@ Procedure RockDpPowerPinctrl()
   ENDASM
 EndProcedure
 
-Procedure.i RockCruRequirePll(offset.i, expected.i, errorCode.i)
+Procedure.i RockCruPllRate(offset.i, integerOnly.i, errorCode.i)
   Protected con0.i = RockCruRead(offset)
   Protected con1.i = RockCruRead(offset+4)
   Protected con2.i = RockCruRead(offset+8)
@@ -120,49 +122,133 @@ Procedure.i RockCruRequirePll(offset.i, expected.i, errorCode.i)
   Protected ref.i = con1 & $3F
   Protected post1.i = (con1 >> 8) & 7
   Protected post2.i = (con1 >> 12) & 7
+  Protected fraction.i
+  Protected scaled.i
+  Protected vco.i
   Protected rate.i
-  ; U-Boot's integer-mode rate formula is valid only for a locked PLL in
-  ; normal mode with DSM disabled.
-  If (con2 & $80000000)=0 Or ((con3 >> 8) & 3)<>1 Or (con3 & 8)=0
+  ; The RK3399 PLL formula used by the pinned Rockchip clock drivers is valid
+  ; only for a powered, locked PLL in normal mode. GPLL must additionally be
+  ; integer-only; the pinned VPLL table deliberately uses its 24-bit fraction.
+  If (con2 & $80000000)=0 Or ((con3 >> 8) & 3)<>1 Or (con3 & 1)<>0
     rock_cru_error=errorCode : ProcedureReturn 0
   EndIf
-  If ref = 0 Or post1 = 0 Or post2 = 0 : rock_cru_error=errorCode+1 : ProcedureReturn 0 : EndIf
-  rate = (24000000/ref)*fb/post1/post2
-  If rate <> expected : rock_cru_error=errorCode+2 : ProcedureReturn 0 : EndIf
-  ProcedureReturn 1
+  If integerOnly<>0 And (con3 & 8)=0 : rock_cru_error=errorCode : ProcedureReturn 0 : EndIf
+  If fb < 16 Or fb > 3200 Or ref = 0 Or post1 = 0 Or post2 = 0
+    rock_cru_error=errorCode+1 : ProcedureReturn 0
+  EndIf
+  If (con3 & 8)=0 : fraction=con2 & $FFFFFF : EndIf
+  scaled = fb*16777216+fraction
+  vco = (24000000*scaled/ref)/16777216
+  rate = vco/post1/post2
+  ; These are the RK3399 PLL limits enforced by the pinned U-Boot driver.
+  If vco < 800000000 Or vco > 3200000000 Or rate < 16000000 Or rate > 3200000000
+    rock_cru_error=errorCode+2 : ProcedureReturn 0
+  EndIf
+  ProcedureReturn rate
 EndProcedure
 
-Procedure.i RockCruRequireDisplayPlls()
-  ; CPLL is 384 MHz and GPLL is 594 MHz in the exact mainline U-Boot handoff.
-  ; Read the live dividers rather than silently relying on that loader policy:
-  ; every display divider below is derived from one of these two rates.
-  If RockCruRequirePll($60,384000000,47)=0 : ProcedureReturn 0 : EndIf
-  If RockCruRequirePll($80,594000000,50)=0 : ProcedureReturn 0 : EndIf
+Procedure.i RockCruCeilingDivider(parent.i, target.i)
+  Protected divider.i
+  If parent <= 0 Or target <= 0 : ProcedureReturn 0 : EndIf
+  divider = (parent+target-1)/target
+  If divider < 1 Or divider > 32 : ProcedureReturn 0 : EndIf
+  ProcedureReturn divider
+EndProcedure
+
+Procedure.i RockCruWait(offset.i, mask.i, wanted.i)
+  Protected start.i = RockTimerTicks()
+  Protected now.i
+  Protected attempt.i
+  For attempt = 0 To 1000000
+    If (RockCruRead(offset) & mask) = wanted : ProcedureReturn 1 : EndIf
+    now = RockTimerTicks()
+    If now < start Or now-start >= rock_timer_frequency/100 : Break : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RockCruVpll65()
+  Protected con2.i
+  Protected rate.i
+  ; VPLL is the display-owned pixel parent. Radxa's VPLL-specific 65 MHz
+  ; table entry is refdiv=1, fbdiv=113, postdiv1=7, postdiv2=6 and
+  ; frac=0xC00000. Follow its slow/powerdown/dividers/fraction/powerup/
+  ; lock/normal sequence. CON2's 24-bit fraction is an ordinary RMW field.
+  RockCruField($CC,$0300,$0000)
+  RockCruField($CC,$0001,$0001)
+  RockCruField($C0,$0FFF,$0071)
+  RockCruField($C4,$773F,$6701)
+  con2 = RockCruRead($C8)
+  RockCruWrite($C8,(con2 & $FF000000) | $00C00000)
+  RockCruField($CC,$0008,$0000)
+  RockCruField($CC,$0001,$0000)
+  If RockCruWait($C8,$80000000,$80000000)=0
+    rock_cru_error=63 : ProcedureReturn 0
+  EndIf
+  RockCruField($CC,$0300,$0100)
+  rate = RockCruPllRate($C0,0,63)
+  If rate <> 65000000 : rock_cru_error=65 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure
 
 Procedure.i RockCruDisplayClocks()
-  If RockCruRequireDisplayPlls() = 0 : ProcedureReturn 0 : EndIf
-  ; TCPHY0 reference: xin24m / 1; TCPHY0 core: GPLL / 12 = 49.5 MHz.
-  RockCruField(#ROCK_CRU_CLKSEL+$100,$9FDF,$00CB)
+  Protected tcpDivider.i
+  Protected dpDivider.i
+  Protected spdifDivider.i
+  Protected aclkDivider.i
+  Protected hclkDivider.i
+  Protected tcpRate.i
+  Protected spdifRate.i
+  Protected aclkRate.i
+  Protected hclkRate.i
+  rock_cru_gpll_rate = RockCruPllRate($80,1,47)
+  If rock_cru_gpll_rate = 0 : ProcedureReturn 0 : EndIf
+  ; Accept the 800 MHz silicon-observed stock handoff and the 594 MHz pinned
+  ; reference configuration. Derive their leaves below, but refuse any other
+  ; parent rather than inventing an unverified tolerance.
+  If rock_cru_gpll_rate <> 594000000 And rock_cru_gpll_rate <> 800000000
+    rock_cru_error=50 : ProcedureReturn 0
+  EndIf
+  ; Derive display-owned leaves from the live GPLL. Ceiling division keeps
+  ; every clock at or below its DT target and supports both proven handoffs:
+  ; private U-Boot's 594 MHz GPLL and stock Android U-Boot's 800 MHz GPLL.
+  tcpDivider = RockCruCeilingDivider(rock_cru_gpll_rate,50000000)
+  dpDivider = RockCruCeilingDivider(rock_cru_gpll_rate,100000000)
+  spdifDivider = RockCruCeilingDivider(rock_cru_gpll_rate,200000000)
+  aclkDivider = RockCruCeilingDivider(rock_cru_gpll_rate,400000000)
+  If tcpDivider=0 Or dpDivider=0 Or spdifDivider=0 Or aclkDivider=0
+    rock_cru_error=51 : ProcedureReturn 0
+  EndIf
+  tcpRate = rock_cru_gpll_rate/tcpDivider
+  rock_cru_dp_core_rate = rock_cru_gpll_rate/dpDivider
+  spdifRate = rock_cru_gpll_rate/spdifDivider
+  aclkRate = rock_cru_gpll_rate/aclkDivider
+  hclkDivider = RockCruCeilingDivider(aclkRate,100000000)
+  If hclkDivider=0 : rock_cru_error=51 : ProcedureReturn 0 : EndIf
+  hclkRate = aclkRate/hclkDivider
+  If (rock_cru_dp_core_rate % 1000000) <> 0
+    rock_cru_error=52 : ProcedureReturn 0
+  EndIf
+  ; TCPHY0 reference: xin24m / 1; core: live GPLL at no more than 50 MHz.
+  RockCruField(#ROCK_CRU_CLKSEL+$100,$9FDF,$00C0 | (tcpDivider-1))
   RockCruGate(13,4,1)
   RockCruGate(13,5,1)
-  ; Cadence core: GPLL / 6 = 99 MHz.
-  RockCruField(#ROCK_CRU_CLKSEL+$B8,$00DF,$0085)
+  ; Cadence core: live GPLL at no more than 100 MHz.
+  RockCruField(#ROCK_CRU_CLKSEL+$B8,$00DF,$0080 | (dpDivider-1))
   RockCruGate(11,8,1)
-  ; SPDIF_REC_DPTX: GPLL / 3 = 198 MHz. Required by the DT clock contract.
-  RockCruField(#ROCK_CRU_CLKSEL+$80,$9F00,$8200)
+  ; SPDIF_REC_DPTX: live GPLL at no more than its 200 MHz DT target.
+  RockCruField(#ROCK_CRU_CLKSEL+$80,$9F00,$8000 | ((spdifDivider-1) << 8))
   RockCruGate(10,6,1)
-  ; VOPL assigned clocks request 400/100 MHz. The exact live 384 MHz CPLL
-  ; supplies the closest integer rates: ACLK /1 = 384, HCLK /4 = 96 MHz.
-  RockCruField(#ROCK_CRU_CLKSEL+$C0,$1FDF,$0340)
+  ; Use GPLL for VOPL too: stock U-Boot leaves CPLL in slow/bypass mode.
+  RockCruField(#ROCK_CRU_CLKSEL+$C0,$1FDF,$0080 | (aclkDivider-1) | ((hclkDivider-1) << 8))
   RockCruGate(10,10,1)
   RockCruGate(10,11,1)
-  ; VOPL pixel clock: GPLL DIV output /1, then exact 65/594 fractional
-  ; division. CLKSEL_CON107 carries numerator:denominator in 16-bit halves.
-  RockCruField(#ROCK_CRU_CLKSEL+$C8,$0BFF,$0200)
-  RockCruWrite(#ROCK_CRU_CLKSEL+$1AC,($41 << 16) | $252)
-  RockCruField(#ROCK_CRU_CLKSEL+$C8,$0800,$0800)
+  ; A Rockchip fractional divider requires denominator >= 20*numerator;
+  ; neither 65/594 nor 13/160 meets that precision contract. Own the
+  ; dedicated VPLL at the pinned exact 65 MHz rate and select its DIV /1.
+  RockCruGate(10,13,0)
+  If RockCruVpll65()=0 : ProcedureReturn 0 : EndIf
+  RockCruField(#ROCK_CRU_CLKSEL+$C8,$0BFF,$0000)
   RockCruGate(10,13,1)
   ; Leaf and NoC clocks for the little VOP.
   RockCruGate(28,7,1)
@@ -198,6 +284,10 @@ EndProcedure
 Procedure.i RockCruDisplayPrepare()
   rock_cru_error = 0
   RockDpPowerPinctrl()
+  ; Hold the VOP before its display-owned VPLL and DCLK are changed.
+  RockCruReset(275,1)
+  RockCruReset(279,1)
+  RockCruReset(281,1)
   If RockCruDisplayClocks() = 0 : ProcedureReturn 0 : EndIf
   If RockCruDisplayPower() = 0 : ProcedureReturn 0 : EndIf
   ; Hold each display block while its driver establishes a known state.
@@ -208,9 +298,6 @@ Procedure.i RockCruDisplayPrepare()
   RockCruReset(259,1)
   RockCruReset(328,1)
   RockCruReset(330,1)
-  RockCruReset(275,1)
-  RockCruReset(279,1)
-  RockCruReset(281,1)
   RockTimerWaitUs(1)
   ProcedureReturn 1
 EndProcedure

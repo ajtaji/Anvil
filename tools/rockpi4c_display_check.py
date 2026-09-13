@@ -36,8 +36,8 @@ def source_contract() -> None:
         "rockpmupoweron(24", "rockpmupoweron(20", "rockpmupoweron(8",
         "rockpmuidlerelease(17", "rockpmuidlerelease(11",
         "rockpmuidlerelease(8", "$30003000", "$10001000",
-        "rockcrurequirepll($60,384000000", "rockcrurequirepll($80,594000000",
-        "$1fdf,$0340",
+        "rock_cru_gpll_rate = rockcrupllrate($80,1,47)",
+        "rockcruvpll65()", "$1fdf,$0080 | (aclkdivider-1)",
         "rockcdnfirmwareload", "rockcdnhotplug", "rockcdndpcd",
         "rockcdnreadedid", "rockcdntrain", "rockcdnvideo1024x768",
         "rockvopup1024x768", "dp08 visible 1024x768",
@@ -189,25 +189,63 @@ def source_contract() -> None:
     )[0]
     for token in (
         'rockuarttext("dpe1 detail err ")', 'rockuarttext(" source ")',
-        'rockuarttext("cpll")', 'rockuarttext("gpll")',
+        'rockuarttext(" cpll ")', 'rockuarttext("gpll")',
         'rockuarttext("vio")', 'rockuarttext("hdcp")',
         'rockuarttext("vo")', 'rockuarttext("vopl")',
-        'rockuarttext("tcpd0")', 'rockuarttext("reset")',
+        'rockuarttext("tcpd0")', 'rockuarttext("vpll")',
         "rockcruread($60)", "rockcruread($64)", "rockcruread($68)",
         "rockcruread($6c)", "rockcruread($80)", "rockcruread($84)",
         "rockcruread($88)", "rockcruread($8c)",
+        "rockcruread($c0)", "rockcruread($c4)",
+        "rockcruread($c8)", "rockcruread($cc)",
         "peekl(#rock_pmu+#rock_pmu_pwrdn_st) & $ffffffff",
         "peekl(#rock_pmu+#rock_pmu_bus_idle_req) & $ffffffff",
         "peekl(#rock_pmu+#rock_pmu_bus_idle_st) & $ffffffff",
         "peekl(#rock_pmu+#rock_pmu_bus_idle_ack) & $ffffffff",
     ):
         require(token in cru_telemetry, f"DPE1 raw witness drifted: {token}")
-    for token in ("rockcrurequirepll($60,384000000,47)",
-                  "rockcrurequirepll($80,594000000,50)",
+    for token in ("rock_cru_gpll_rate = rockcrupllrate($80,1,47)",
+                  "rockcruceilingdivider(rock_cru_gpll_rate,50000000)",
+                  "rockcruceilingdivider(rock_cru_gpll_rate,100000000)",
+                  "rockcruceilingdivider(rock_cru_gpll_rate,200000000)",
+                  "rockcruceilingdivider(rock_cru_gpll_rate,400000000)",
                   "rock_cru_error=errorcode",
                   "rock_cru_error=errorcode+1",
                   "rock_cru_error=errorcode+2"):
         require(token in cru, f"DPE1 PLL refusal mapping drifted: {token}")
+    for token in ("rockcrufield($cc,$0300,$0000)",
+                  "rockcrufield($cc,$0001,$0001)",
+                  "rockcrufield($c0,$0fff,$0071)",
+                  "rockcrufield($c4,$773f,$6701)",
+                  "rockcruwrite($c8,(con2 & $ff000000) | $00c00000)",
+                  "rockcrufield($cc,$0008,$0000)",
+                  "rockcrufield($cc,$0001,$0000)",
+                  "rockcruwait($c8,$80000000,$80000000)",
+                  "rockcrufield($cc,$0300,$0100)",
+                  "rockcrufield(#rock_cru_clksel+$c8,$0bff,$0000)"):
+        require(token in cru, f"exact 65 MHz VPLL owner sequence drifted: {token}")
+    require("#rock_cru_clksel+$1ac" not in cru,
+            "DCLK_VOP1 regressed to an imprecise fractional divider")
+    require("rockcrupllrate($60" not in cru,
+            "display clock admission still depends on bypassed CPLL")
+    require("rockcrugate(10,13,0)" in cru,
+            "VOP DCLK is not gated while its VPLL parent is reprogrammed")
+    display_clocks = cru.split("procedure.i rockcrudisplayclocks()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    dclk_order = ["rockcrugate(10,13,0)", "rockcruvpll65()",
+                  "rockcrufield(#rock_cru_clksel+$c8,$0bff,$0000)",
+                  "rockcrugate(10,13,1)"]
+    positions = [display_clocks.index(token) for token in dclk_order]
+    require(positions == sorted(positions),
+            "VPLL/DCLK gate, parent and enable order drifted")
+    require("rockcdnwrite(#cdn_sw_clk_h,rock_cru_dp_core_rate/1000000)" in display,
+            "Cadence SW clock does not receive the derived core MHz")
+    prepare_clock = prepare.index("rockcrudisplayclocks()")
+    for reset in ("rockcrureset(275,1)", "rockcrureset(279,1)",
+                  "rockcrureset(281,1)"):
+        require(prepare.index(reset) < prepare_clock,
+                f"{reset} does not hold VOP before VPLL/DCLK programming")
     for token in ("rockpmupoweron(14,53)", "rockpmuidlerelease(17,54)",
                   "rockpmupoweron(24,56)", "rockpmuidlerelease(11,57)",
                   "rockpmupoweron(20,59)", "rockpmuidlerelease(8,60)",
@@ -413,6 +451,62 @@ def firmware_contract() -> None:
 
 
 def arithmetic_contract() -> None:
+    def pll_rate(con0: int, con1: int, con2: int, con3: int,
+                 integer_only: bool) -> int | None:
+        # RK3399 PLL_CON fields and formula from the pinned Rockchip drivers.
+        if not con2 & 0x80000000 or ((con3 >> 8) & 3) != 1 or con3 & 1:
+            return None
+        if integer_only and not con3 & 8:
+            return None
+        fb = con0 & 0xFFF
+        ref = con1 & 0x3F
+        post1 = (con1 >> 8) & 7
+        post2 = (con1 >> 12) & 7
+        if not 16 <= fb <= 3200 or not ref or not post1 or not post2:
+            return None
+        fraction = 0 if con3 & 8 else con2 & 0xFFFFFF
+        scaled = fb * 16777216 + fraction
+        vco = (24000000 * scaled // ref) // 16777216
+        rate = vco // post1 // post2
+        if not 800000000 <= vco <= 3200000000:
+            return None
+        if not 16000000 <= rate <= 3200000000:
+            return None
+        return rate
+
+    # The first tuple is the exact stock-silicon capture. The second is the
+    # VPLL-specific 65 MHz entry in Radxa's pinned RK3399 clock table.
+    require(pll_rate(0x64, 0x1301, 0x8000031F, 0x108, True) == 800000000,
+            "captured 800 MHz GPLL decode drifted")
+    require(pll_rate(0x71, 0x6701, 0x80C00000, 0x100, False) == 65000000,
+            "pinned fractional VPLL 65 MHz decode drifted")
+    require(pll_rate(0xC0, 0x1302, 0x8000031F, 0x8, True) is None,
+            "slow-mode CPLL negative control was admitted")
+    require(pll_rate(0x64, 0x1300, 0x8000031F, 0x108, True) is None,
+            "zero REFDIV negative control was admitted")
+    require(pll_rate(0xFFF, 0x1101, 0x80000000, 0x108, True) is None,
+            "out-of-range PLL negative control was admitted")
+
+    def ceiling_divider(parent: int, target: int) -> int:
+        return (parent + target - 1) // target
+
+    expected_clocks = {
+        594000000: (0xCB, 0x85, 0x8200, 0x281, 99),
+        800000000: (0xCF, 0x87, 0x8300, 0x381, 100),
+    }
+    for parent, expected_clock in expected_clocks.items():
+        tcp = ceiling_divider(parent, 50000000)
+        dp = ceiling_divider(parent, 100000000)
+        spdif = ceiling_divider(parent, 200000000)
+        aclk = ceiling_divider(parent, 400000000)
+        hclk = ceiling_divider(parent // aclk, 100000000)
+        actual = (0xC0 | tcp - 1, 0x80 | dp - 1,
+                  0x8000 | ((spdif - 1) << 8),
+                  0x80 | (aclk - 1) | ((hclk - 1) << 8),
+                  (parent // dp) // 1000000)
+        require(actual == expected_clock,
+                f"GPLL-derived display clock plan drifted for {parent}: {actual}")
+
     required_mbps = (65000 * 24 + 999) // 1000
     for rate_mhz in (162, 270, 540):
         for lanes in (1, 2):
@@ -479,7 +573,10 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                       "rockdisplaytcphytelemetry:",
                       "rockdisplaygrftelemetry:",
                       "rockdisplaysubsystemtelemetry:",
-                      "rockcdnmailboxwitnessreset:"):
+                      "rockcdnmailboxwitnessreset:",
+                      "rockcrupllrate:",
+                      "rockcruceilingdivider:",
+                      "rockcruvpll65:"):
             require(label in asm, f"emitted silicon witness is missing: {label}")
         display_up_asm = asm.split("rockdisplayup:", 1)[1].split(
             "rockdisplaybuffer:", 1
@@ -493,6 +590,8 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                 "emitted stage-local silicon witness order drifted")
         require(display_up_asm.count("bl rockdisplaysubsystemtelemetry") == 13,
                 "emitted subsystem error witnesses are incomplete")
+        require("global_rock_cru_dp_core_rate" in display_up_asm,
+                "emitted Cadence setup lost the live core-clock handoff")
         dpcd_telemetry_asm = asm.split("rockdisplaydpcdtelemetry:", 1)[1].split(
             "rockdisplayup:", 1
         )[0]

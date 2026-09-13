@@ -104,9 +104,7 @@ Procedure RockDisplayCruTelemetry()
     RockUartText("DPE1 DETAIL ERR ")
     RockDisplayHexByte(rock_cru_error)
     RockUartText(" SOURCE ")
-    If rock_cru_error >= 47 And rock_cru_error <= 49
-      RockUartText("CPLL")
-    ElseIf rock_cru_error >= 50 And rock_cru_error <= 52
+    If rock_cru_error >= 47 And rock_cru_error <= 52
       RockUartText("GPLL")
     ElseIf rock_cru_error >= 53 And rock_cru_error <= 55
       RockUartText("VIO")
@@ -118,8 +116,8 @@ Procedure RockDisplayCruTelemetry()
       RockUartText("VOPL")
     ElseIf rock_cru_error = 62
       RockUartText("TCPD0")
-    ElseIf rock_cru_error = 64
-      RockUartText("RESET")
+    ElseIf rock_cru_error >= 63 And rock_cru_error <= 65
+      RockUartText("VPLL")
     Else
       RockUartText("UNKNOWN")
     EndIf
@@ -139,6 +137,14 @@ Procedure RockDisplayCruTelemetry()
     RockDisplayHexLong(RockCruRead($88))
     RockUartByte(32)
     RockDisplayHexLong(RockCruRead($8C))
+    RockUartText(" VPLL ")
+    RockDisplayHexLong(RockCruRead($C0))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($C4))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($C8))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($CC))
     RockUartText(" PMU ")
     RockDisplayHexLong(PeekL(#ROCK_PMU+#ROCK_PMU_PWRDN_ST) & $FFFFFFFF)
     RockUartByte(32)
@@ -239,7 +245,8 @@ Procedure.i RockDisplayUp()
     RockDisplaySubsystemTelemetry("DPE3 CRU ERR ",rock_cru_error)
     ProcedureReturn RockDisplayFail(3,"DPE3 CADENCE RESET RELEASE")
   EndIf
-  RockCdnWrite(#CDN_SW_CLK_H,99)
+  ; Cadence consumes the actual integer core clock in MHz, not MHz-1.
+  RockCdnWrite(#CDN_SW_CLK_H,rock_cru_dp_core_rate/1000000)
   RockCdnInternalClocks()
   RockDisplayStage("DP01 CADENCE CLOCKS POWER RESETS READY")
   If RockCdnFirmwareLoad()=0

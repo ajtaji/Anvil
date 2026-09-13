@@ -81,6 +81,27 @@ architectural width. In particular, UART, GIC, CRU, PMU, TCPHY, Cadence and VOP
 
 ## MiniDP first-light contract
 
+The September 13 FTDI run entered Anvil and reached the clock check, then
+refused with `DPE1`, error 47. The inherited CPLL was in slow mode and GPLL
+was locked at 800 MHz. The former check assumed a loader had prepared CPLL
+at 384 MHz and GPLL at 594 MHz. Display clock setup must use the live parent
+rate; this failure is not evidence of a broken serial loader or PLL.
+
+The clock correction uses the decoded live GPLL for the non-pixel display
+clocks and the dedicated VPLL for the exact 65 MHz pixel clock. Rockchip's
+fractional-divider precision requirement is a denominator at least twenty
+times the numerator for a non-integer division; both the former 65/594
+fraction and a proposed 13/160 fraction fall short. The reference RK3399
+65 MHz VPLL-specific tuple is reference divider 1, feedback divider 113,
+post dividers 7 and 6, and fractional feedback 0xC00000 with DSM enabled.
+That yields a 2.73 GHz VCO divided by 42. The DisplayPort firmware clock register receives the actual
+core frequency in whole MHz.
+
+The established deployment chain is stock U-Boot, a serial-capable U-Boot
+loaded into RAM from the removable SD, then Anvil's Image and DTB transferred
+over FTDI/XMODEM. The Anvil image and DTB passed board CRC checks twice before
+entry. Display output has not yet passed a silicon test.
+
 The exact original 4C device tree selects VOPL -> Cadence DP and describes the
 virtual Type-C state as DP with SuperSpeed enabled and no flip. That means two
 DP lanes on TCPHY0 physical lanes 2/3 while USB3 retains lanes 0/1. The
