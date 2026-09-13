@@ -27,7 +27,7 @@ Procedure.i RockUartByte(value.i)
   EndIf
   start = RockTimerTicks()
   For attempt = 0 To 999999
-    If (PeekL(#ROCK_UART2 + #ROCK_UART_LSR) & #ROCK_UART_LSR_THRE) <> 0
+    If ((PeekL(#ROCK_UART2 + #ROCK_UART_LSR) & $FFFFFFFF) & #ROCK_UART_LSR_THRE) <> 0
       PokeL(#ROCK_UART2 + #ROCK_UART_THR, value)
       ProcedureReturn 1
     EndIf

@@ -9,6 +9,7 @@ import struct
 import subprocess
 import tempfile
 
+import build_count
 from rockpi4c_image import (
     BRANCH_TO_PAYLOAD, CODE_BASE, CODE_LIMIT, DTB_ADDRESS, FLAGS,
     HEADER_BYTES, IMAGE_BASE, ImageError, validate, wrap,
@@ -91,6 +92,11 @@ def compiler_contract(compiler: Path) -> None:
         asm = Path(str(output) + ".asm").read_text(encoding="utf-8", errors="replace").lower()
         for token in ("cntfrq_el0", "vbar_el2", "icc_sre_el2"):
             require(token in asm, f"emitted assembly lacks {token}")
+        counted = build_count.record_build(
+            ROOT / "RockPi4C/Board/board.rockpi4c", "rockpi4c", output,
+            by="tools/rockpi4c_foundation_check.py", compiler=compiler,
+        )
+        print(f"  build count: {counted.message}")
 
 
 def main() -> int:

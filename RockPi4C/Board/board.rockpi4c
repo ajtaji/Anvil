@@ -3,9 +3,9 @@
 ; pmf:load $02000040
 ; pmf:bss $02800000
 ; pmf:stack $03000000
-#ANVIL_BUILD = 1 ; pmf:build
+#ANVIL_BUILD = 9 ; pmf:build
 #ANVIL_BUILD_DATE = 20260913 ; pmf:builddate
-#ANVIL_BUILD_TIME = 110745 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 135613 ; pmf:buildtime
 XIncludeFile "RockPi4C/Board/platform.pbi"
 XIncludeFile "RockPi4C/Lib/soc.pbi"
 XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
@@ -13,6 +13,11 @@ XIncludeFile "RockPi4C/Lib/uart2.pbi"
 XIncludeFile "RockPi4C/Lib/boot_contract.pbi"
 XIncludeFile "RockPi4C/Lib/exceptions_el2.pbi"
 XIncludeFile "RockPi4C/Lib/gicv3.pbi"
+XIncludeFile "RockPi4C/Lib/cru.pbi"
+XIncludeFile "RockPi4C/Lib/tcphy.pbi"
+XIncludeFile "RockPi4C/Lib/cdn_dp.pbi"
+XIncludeFile "RockPi4C/Lib/vop.pbi"
+XIncludeFile "RockPi4C/Lib/display.pbi"
 
 Procedure RockPark()
   ASM
@@ -46,6 +51,10 @@ Procedure Main()
   EndIf
   If RockGicInitTimerFoundation() = 0
     If rock_uart_ready <> 0 : RockUartLine("STOP: RK3399 GICV3 FOUNDATION REFUSED") : EndIf
+    RockPark()
+  EndIf
+  If RockDisplayUp() = 0
+    If rock_uart_ready <> 0 : RockUartLine("STOP: RK3399 MINIDP BRING-UP REFUSED") : EndIf
     RockPark()
   EndIf
   If rock_uart_ready <> 0 : RockUartLine("ANVIL ROCK PI 4C FOUNDATION READY; IRQ STILL MASKED") : EndIf
