@@ -34,6 +34,55 @@ Procedure RockDisplayHexByte(value.i)
   EndIf
 EndProcedure
 
+Procedure RockDisplayHexWord(value.i)
+  RockDisplayHexByte((value >> 8) & 255)
+  RockDisplayHexByte(value & 255)
+EndProcedure
+
+Procedure RockDisplayMailboxTelemetry()
+  Protected index.i
+  RockUartText(" MBOX GOT ")
+  If rock_cdn_mailbox_actual_opcode < 0
+    RockUartText("--")
+  Else
+    RockDisplayHexByte(rock_cdn_mailbox_actual_opcode)
+  EndIf
+  RockUartByte(47)
+  If rock_cdn_mailbox_actual_module < 0
+    RockUartText("--")
+  Else
+    RockDisplayHexByte(rock_cdn_mailbox_actual_module)
+  EndIf
+  RockUartByte(47)
+  If rock_cdn_mailbox_actual_size < 0
+    RockUartText("----")
+  Else
+    RockDisplayHexWord(rock_cdn_mailbox_actual_size)
+  EndIf
+  RockUartText(" EXPECT ")
+  RockDisplayHexByte(rock_cdn_mailbox_expected_opcode)
+  RockUartByte(47)
+  RockDisplayHexByte(rock_cdn_mailbox_expected_module)
+  RockUartByte(47)
+  RockDisplayHexWord(rock_cdn_mailbox_expected_size)
+  RockUartText(" DRAIN ")
+  RockDisplayHexWord(rock_cdn_mailbox_drain_count)
+  RockUartByte(47)
+  If rock_cdn_mailbox_actual_size < 0
+    RockUartText("----")
+  Else
+    RockDisplayHexWord(rock_cdn_mailbox_actual_size)
+  EndIf
+  If rock_cdn_mailbox_drain_complete = 0 : RockUartText(" INCOMPLETE") : EndIf
+  If rock_cdn_mailbox_payload5_valid <> 0
+    RockUartText(" PAYLOAD")
+    For index = 0 To 4
+      RockUartByte(32)
+      RockDisplayHexByte(PeekA(@rock_cdn_mailbox_payload5[0]+index) & 255)
+    Next
+  EndIf
+EndProcedure
+
 Procedure RockDisplayDpcdTelemetry()
   If rock_uart_ready <> 0
     RockUartText("DPE8 DPCD PHASE ")
@@ -44,6 +93,7 @@ Procedure RockDisplayDpcdTelemetry()
     Else
       RockDisplayHexByte(rock_cdn_aux_status)
     EndIf
+    If rock_cdn_error = 24 : RockDisplayMailboxTelemetry() : EndIf
     RockUartByte(13)
     RockUartByte(10)
   EndIf

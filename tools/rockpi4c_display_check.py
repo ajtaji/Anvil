@@ -147,6 +147,33 @@ def source_contract() -> None:
             'rockuarttext("dpe8 dpcd phase ")' in display and
             'rockuarttext(" aux ")' in display,
             "serial DPCD phase/AUX telemetry is missing")
+    receive = cdn.split("procedure.i rockcdnreceive", 1)[1].split(
+        "procedure.i rockcdnregwrite", 1)[0]
+    for token in (
+        "rock_cdn_mailbox_actual_opcode = gotopcode",
+        "rock_cdn_mailbox_actual_module = gotmodule",
+        "rock_cdn_mailbox_actual_size = count",
+        "rock_cdn_mailbox_expected_opcode = opcode",
+        "rock_cdn_mailbox_expected_module = module",
+        "rock_cdn_mailbox_expected_size = bytes",
+        "rock_cdn_mailbox_drain_count = rock_cdn_mailbox_drain_count + 1",
+        "rock_cdn_mailbox_drain_complete = 1",
+        "if count = 5 : rock_cdn_mailbox_payload5_valid = 1",
+    ):
+        require(token in receive, f"mailbox mismatch diagnostic drifted: {token}")
+    mismatch = receive.split(
+        "if gotopcode <> opcode or gotmodule <> module or count <> bytes", 1
+    )[1].split("rock_cdn_error = 24", 1)[0]
+    require(mismatch.index("low = rockcdnmailboxget()") <
+            mismatch.index("rock_cdn_mailbox_drain_count = rock_cdn_mailbox_drain_count + 1"),
+            "mailbox drain count advances before a byte was consumed")
+    require("if rock_cdn_mailbox_drain_count = count" in mismatch,
+            "mailbox drain completeness is not tied to the advertised payload size")
+    require("if rock_cdn_error = 24 : rockdisplaymailboxtelemetry()" in display,
+            "mailbox mismatch telemetry is not attached to DPCD failure")
+    for token in ('rockuarttext(" mbox got ")', 'rockuarttext(" expect ")',
+                  'rockuarttext(" drain ")', 'rockuarttext(" payload")'):
+        require(token in display, f"serial mailbox diagnostic missing: {token}")
 
 
 def firmware_contract() -> None:

@@ -87,6 +87,16 @@ Global rock_cdn_link_rate.i
 Global rock_cdn_link_lanes.i
 Global rock_cdn_aux_status.i
 Global rock_cdn_dpcd_phase.i
+Global rock_cdn_mailbox_actual_opcode.i
+Global rock_cdn_mailbox_actual_module.i
+Global rock_cdn_mailbox_actual_size.i
+Global rock_cdn_mailbox_expected_opcode.i
+Global rock_cdn_mailbox_expected_module.i
+Global rock_cdn_mailbox_expected_size.i
+Global rock_cdn_mailbox_drain_count.i
+Global rock_cdn_mailbox_drain_complete.i
+Global rock_cdn_mailbox_payload5_valid.i
+Global Dim rock_cdn_mailbox_payload5.a[4]
 Global Dim rock_cdn_edid.a[255]
 Global Dim rock_cdn_message.a[255]
 
@@ -140,18 +150,46 @@ Procedure.i RockCdnSend(module.i, opcode.i, bytes.i, message.i)
 EndProcedure
 
 Procedure.i RockCdnReceive(module.i, opcode.i, bytes.i, destination.i)
-  Protected gotOpcode.i = RockCdnMailboxGet()
-  Protected gotModule.i = RockCdnMailboxGet()
-  Protected high.i = RockCdnMailboxGet()
-  Protected low.i = RockCdnMailboxGet()
+  Protected gotOpcode.i
+  Protected gotModule.i
+  Protected high.i
+  Protected low.i
   Protected count.i
   Protected index.i
-  If gotOpcode < 0 Or gotModule < 0 Or high < 0 Or low < 0 : ProcedureReturn 0 : EndIf
+  rock_cdn_mailbox_actual_opcode = -1
+  rock_cdn_mailbox_actual_module = -1
+  rock_cdn_mailbox_actual_size = -1
+  rock_cdn_mailbox_expected_opcode = opcode
+  rock_cdn_mailbox_expected_module = module
+  rock_cdn_mailbox_expected_size = bytes
+  rock_cdn_mailbox_drain_count = 0
+  rock_cdn_mailbox_drain_complete = 0
+  rock_cdn_mailbox_payload5_valid = 0
+  gotOpcode = RockCdnMailboxGet()
+  If gotOpcode < 0 : ProcedureReturn 0 : EndIf
+  rock_cdn_mailbox_actual_opcode = gotOpcode
+  gotModule = RockCdnMailboxGet()
+  If gotModule < 0 : ProcedureReturn 0 : EndIf
+  rock_cdn_mailbox_actual_module = gotModule
+  high = RockCdnMailboxGet()
+  If high < 0 : ProcedureReturn 0 : EndIf
+  low = RockCdnMailboxGet()
+  If low < 0 : ProcedureReturn 0 : EndIf
   count = (high << 8) | low
+  rock_cdn_mailbox_actual_size = count
   If gotOpcode <> opcode Or gotModule <> module Or count <> bytes
-    For index = 0 To count-1
-      If RockCdnMailboxGet() < 0 : Break : EndIf
-    Next
+    If count > 0
+      For index = 0 To count-1
+        low = RockCdnMailboxGet()
+        If low < 0 : Break : EndIf
+        If count = 5 : PokeA(@rock_cdn_mailbox_payload5[0]+index,low) : EndIf
+        rock_cdn_mailbox_drain_count = rock_cdn_mailbox_drain_count + 1
+      Next
+    EndIf
+    If rock_cdn_mailbox_drain_count = count
+      rock_cdn_mailbox_drain_complete = 1
+      If count = 5 : rock_cdn_mailbox_payload5_valid = 1 : EndIf
+    EndIf
     rock_cdn_error = 24 : ProcedureReturn 0
   EndIf
   For index = 0 To bytes-1
