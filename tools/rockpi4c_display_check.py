@@ -583,6 +583,11 @@ def source_contract() -> None:
     positions = [vop_up.index(token) for token in line_buffer_order]
     require(positions == sorted(positions),
             "WIN0 line-buffer admission/programming moved after hardware release")
+    outstanding = "rockvopfield(#vop_sys_ctrl1,$0003f000,$0003d000)"
+    require(outstanding in vop_up and
+            vop_up.index("rockcrureset(279,0)") < vop_up.index(outstanding) <
+            vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
+            "VOP 30-read AXI throughput contract is absent or armed too late")
     for timing in (
         "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
         "rockvopwrite(#vop_hact,hactiveend | (hactivestart << 16))",

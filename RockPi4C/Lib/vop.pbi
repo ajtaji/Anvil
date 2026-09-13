@@ -20,6 +20,7 @@
 
 #VOP_CFG_DONE = $000
 #VOP_SYS_CTRL = $008
+#VOP_SYS_CTRL1 = $00C
 #VOP_DSP_CTRL0 = $010
 #VOP_DSP_CTRL1 = $014
 #VOP_WIN0_CTRL0 = $030
@@ -272,6 +273,11 @@ Procedure.i RockVopUpMode()
   RockCruReset(279,1)
   RockTimerWaitUs(20)
   RockCruReset(279,0)
+  ; vop_initial() in the pinned RK3399 driver enables the maximum 30 AXI
+  ; reads outstanding. Reset defaults can feed the proven 1024x768 mode but
+  ; build 57 latched POST_BUF_EMPTY at 1080p. Program the documented VOP
+  ; throughput contract explicitly before scanout is armed.
+  RockVopField(#VOP_SYS_CTRL1,$0003F000,$0003D000)
   ; Route the Cadence transmitter from the little VOP (GRF SOC_CON9 bit12).
   PokeL(#ROCK_GRF+$6224,$10001000)
   RockVopFirstFrame()
