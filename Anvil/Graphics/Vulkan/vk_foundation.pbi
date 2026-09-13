@@ -71,6 +71,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TYPE_DESCRIPTOR_SET_LAYOUT = 17
 #ANVIL_VK_TYPE_DESCRIPTOR_POOL = 18
 #ANVIL_VK_TYPE_DESCRIPTOR_SET = 19
+#ANVIL_VK_TYPE_SAMPLER = 20
 
 #ANVIL_VK_CB_INITIAL = 0
 #ANVIL_VK_CB_RECORDING = 1
@@ -104,6 +105,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_DESCRIPTOR_POOLS = 2
 #ANVIL_VK_MAX_DESCRIPTOR_SETS = 4
 #ANVIL_VK_MAX_SET_BINDINGS = 2
+#ANVIL_VK_MAX_SAMPLERS = 8
 
 ; The block a uniform-buffer descriptor supplies: one four-component
 ; colour, the same sixteen bytes the push-constant path carries, so the

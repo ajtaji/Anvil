@@ -79,6 +79,7 @@
 #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
 #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8
 #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
+#VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO = 31
 #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39
 #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40
 #VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO = 41
@@ -106,6 +107,25 @@
 #VK_IMAGE_ASPECT_DEPTH_BIT = $00000002
 #VK_IMAGE_ASPECT_STENCIL_BIT = $00000004
 #VK_IMAGE_ASPECT_METADATA_BIT = $00000008
+
+; Sampler vocabulary. The first texture slice supports normalized 2D
+; coordinates, nearest or linear filtering, and clamp-to-edge addressing.
+; The other core values are declared so unsupported requests are identified
+; against registry values rather than treated as arbitrary integers.
+#VK_FILTER_NEAREST = 0
+#VK_FILTER_LINEAR = 1
+#VK_SAMPLER_MIPMAP_MODE_NEAREST = 0
+#VK_SAMPLER_MIPMAP_MODE_LINEAR = 1
+#VK_SAMPLER_ADDRESS_MODE_REPEAT = 0
+#VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT = 1
+#VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE = 2
+#VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER = 3
+#VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK = 0
+#VK_BORDER_COLOR_INT_TRANSPARENT_BLACK = 1
+#VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK = 2
+#VK_BORDER_COLOR_INT_OPAQUE_BLACK = 3
+#VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE = 4
+#VK_BORDER_COLOR_INT_OPAQUE_WHITE = 5
 
 ; Device memory vocabulary.
 #VK_MAX_MEMORY_TYPES = 32
@@ -467,6 +487,27 @@ Structure VkImageMemoryBarrier Align #PB_Structure_AlignC
   dstQueueFamilyIndex.l
   image.i
   subresourceRange.VkImageSubresourceRange
+EndStructure
+
+Structure VkSamplerCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  magFilter.l
+  minFilter.l
+  mipmapMode.l
+  addressModeU.l
+  addressModeV.l
+  addressModeW.l
+  mipLodBias.f
+  anisotropyEnable.l
+  maxAnisotropy.f
+  compareEnable.l
+  compareOp.l
+  minLod.f
+  maxLod.f
+  borderColor.l
+  unnormalizedCoordinates.l
 EndStructure
 
 Structure VkFenceCreateInfo Align #PB_Structure_AlignC

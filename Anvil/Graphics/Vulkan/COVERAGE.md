@@ -17,7 +17,7 @@ currently amounts to and where the files are.
 
 | File | What it owns |
 |---|---|
-| `vk_core_1_0.pbi` | Registry-derived vocabulary: constants and 66 naturally aligned AArch64 C-layout structures with the registry's own member names, order and widths. `VkPhysicalDeviceFeatures` is complete even though every member currently reports false; `VkFormatProperties` and `VkImageFormatProperties` are exact and carry only proven format and image limits. |
+| `vk_core_1_0.pbi` | Registry-derived vocabulary: constants and 67 naturally aligned AArch64 C-layout structures with the registry's own member names, order and widths. `VkPhysicalDeviceFeatures` is complete even though every member currently reports false; `VkFormatProperties`, `VkImageFormatProperties` and `VkSamplerCreateInfo` are exact and carry only proven format, image and sampler state. |
 | `vk_foundation.pbi` | Handles, generations, parents; instance, physical device, device, queue, command pool and command buffer tables; the validation-fault record; the backend seam's declarations. |
 | `vk_memory.pbi` | `VkDeviceMemory` and `VkImage`: the device heap, first-fit suballocation with real reuse, one checked host mapping per host-visible allocation, memory requirements, binding rules, image usages including `COLOR_ATTACHMENT`, layout and queue-family ownership. |
 | `vk_sync.pbi` | `VkFence`: two states, one owner while in use, reset and destroy refusals. |
@@ -39,7 +39,7 @@ compile — neither can silently enumerate the wrong thing.
 | Class | Current coverage |
 |---|---|
 | Generated vocabulary | A pinned core-1.0 generator exists. The checked-in slice contains the exact result, structure-type, command-lifecycle, image, format-feature, memory, queue-family, access, stage, aspect and fence values this implementation uses, plus 66 scalar, nested, fixed-array, structure-array and pointer-bearing structures. It is not the complete 1.0 vocabulary. `VkPhysicalDeviceFeatures` carries all 55 core feature members; every member is currently false. `VkClearColorValue` is a union and is deliberately **not** declared, because PureMetal has no union and one arm of it posing as the whole type is the silent wrong answer this project refuses. |
-| Semantic implementation | Opaque typed and generation-tagged handles for nine object types; instance, physical device, device and one queue that always advertises transfer and advertises graphics exactly when its backend owns the draw capability; exact `vkGetPhysicalDeviceFormatProperties` and `vkGetPhysicalDeviceImageFormatProperties` answers for the implemented linear BGRA8 combinations, with geometry, pitch-derived resource size, one mip/layer/sample and every unsupported field refused; device memory and linear `B8G8R8A8_UNORM` images with exact requirements, binding rules, usage and per-image layout; one active `vkMapMemory` range for host-visible allocations with exact/whole-range and owner checks; framebuffer colour attachments must carry `COLOR_ATTACHMENT`; image memory barriers track layouts; whole-image clears retain resources through submission; fences have a bounded finite wait and explicitly refuse an unsatisfied `UINT64_MAX`; one-sample masks suppress primitive emission without suppressing a render-pass clear. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
+| Semantic implementation | Opaque typed and generation-tagged handles for ten object types; instance, physical device, device and one queue that always advertises transfer and advertises graphics exactly when its backend owns the draw capability; exact `vkGetPhysicalDeviceFormatProperties` and `vkGetPhysicalDeviceImageFormatProperties` answers for the implemented linear BGRA8 combinations, with geometry, pitch-derived resource size, one mip/layer/sample and every unsupported field refused; device memory and linear `B8G8R8A8_UNORM` images with exact requirements, binding rules, usage and per-image layout; one active `vkMapMemory` range for host-visible allocations with exact/whole-range and owner checks; framebuffer colour attachments must carry `COLOR_ATTACHMENT`; image memory barriers track layouts; whole-image clears retain resources through submission; fences have a bounded finite wait and explicitly refuse an unsatisfied `UINT64_MAX`; one-sample masks suppress primitive emission without suppressing a render-pass clear; and a bounded, device-owned `VkSampler` object accepts only the state the first texture lowering is intended to consume. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
 | Explicit test backend | `vk_backend_test.pbi` models one device over a caller-supplied window. It records the exact clear it was asked for — address, extent, pitch, colour word — and **writes nothing**, so a gate can then read the image back and require that every poisoned byte survived. It can hold a submission outstanding, which is what makes the pending state, the fence state machine and the retention rules reachable from a desk. |
 | V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and the accepted graphics draws through transactional `NeonRebindSurface` + `NeonFrameBegin` + `NeonFrameEnd`, the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. Board runs 2 and 3 proved the original clear and its live refusal boundary; the 2026-09-13 dynamic-geometry run proved 800x1280, 640x360, partial-tile 257x193, the 1280 scalar capacity boundary, exact display-state restoration and a subsequent ordinary frame. Board run 5 proved one graphics pipeline and its varying path. The 2026-09-13 clean-state descriptor run proved the uniform-buffer TMU lookup, interpolated varying, second vertex binding, cache visibility and three consecutive jobs on Pi 4 silicon. |
 
@@ -55,7 +55,9 @@ sizes and nested `OffsetOf` results, including `VkApplicationInfo` (`pNext` at
 byte 8, size 48), `VkSubmitInfo` (size 72), `VkImageCreateInfo` (extent at 28,
 `initialLayout` at 80, size 88), `VkImageMemoryBarrier` (`image` at 40,
 `subresourceRange` at 48, size 72) and
-`VkPhysicalDeviceMemoryProperties` (`memoryHeaps` at 264, size 520). Hand
+`VkPhysicalDeviceMemoryProperties` (`memoryHeaps` at 264, size 520), and
+`VkSamplerCreateInfo` (`magFilter` at 20, `addressModeW` at 40,
+`unnormalizedCoordinates` at 76, size 80). Hand
 padding and flattened substitute members are not used. A compiler that lacks
 this explicit layout mode must reject these declarations loudly; it must not
 silently use packed layout.
@@ -128,7 +130,8 @@ rules are recorded in `docs/VULKAN_DESCRIPTOR_TMU_PROOF_2026-09-13.md`.
 
 The next stages are per-object GPU virtual addressing and residency above
 today's single window, arithmetic in the shader front end and the typed IR that
-needs, descriptors and immutable pipeline state, command lowering into V3D
+needs, sampled-image descriptors and texture-fetch lowering that consume the
+new sampler object, broader immutable pipeline state, command lowering into V3D
 bin/render jobs with dependencies, interrupt-driven completion so submission is
 genuinely asynchronous, and then WSI against Anvil's existing HDMI/DSI present
 seam.

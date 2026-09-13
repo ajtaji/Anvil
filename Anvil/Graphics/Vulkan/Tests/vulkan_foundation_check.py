@@ -69,7 +69,7 @@ CONSTANTS = {
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO",
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO",
     "VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO", "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO",
-    "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO", "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
+    "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO", "VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO", "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
     "VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER", "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER",
     "VK_FORMAT_UNDEFINED", "VK_FORMAT_R8G8B8A8_UNORM", "VK_FORMAT_B8G8R8A8_UNORM",
     "VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT",
@@ -86,6 +86,13 @@ CONSTANTS = {
     "VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT",
     "VK_IMAGE_ASPECT_COLOR_BIT", "VK_IMAGE_ASPECT_DEPTH_BIT",
     "VK_IMAGE_ASPECT_STENCIL_BIT", "VK_IMAGE_ASPECT_METADATA_BIT",
+    "VK_FILTER_NEAREST", "VK_FILTER_LINEAR",
+    "VK_SAMPLER_MIPMAP_MODE_NEAREST", "VK_SAMPLER_MIPMAP_MODE_LINEAR",
+    "VK_SAMPLER_ADDRESS_MODE_REPEAT", "VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT",
+    "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE", "VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER",
+    "VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK", "VK_BORDER_COLOR_INT_TRANSPARENT_BLACK",
+    "VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK", "VK_BORDER_COLOR_INT_OPAQUE_BLACK",
+    "VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE", "VK_BORDER_COLOR_INT_OPAQUE_WHITE",
     "VK_MAX_MEMORY_TYPES", "VK_MAX_MEMORY_HEAPS",
     "VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT", "VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT",
     "VK_MEMORY_PROPERTY_HOST_COHERENT_BIT", "VK_MEMORY_PROPERTY_HOST_CACHED_BIT",
@@ -272,6 +279,17 @@ STRUCTS = {
                              ("VkImageSubresourceRange", "subresourceRange")),
     "VkFenceCreateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
                           ("VkFenceCreateFlags", "flags")),
+    "VkSamplerCreateInfo": (
+        ("VkStructureType", "sType"), ("void", "pNext"),
+        ("VkSamplerCreateFlags", "flags"), ("VkFilter", "magFilter"),
+        ("VkFilter", "minFilter"), ("VkSamplerMipmapMode", "mipmapMode"),
+        ("VkSamplerAddressMode", "addressModeU"),
+        ("VkSamplerAddressMode", "addressModeV"),
+        ("VkSamplerAddressMode", "addressModeW"), ("float", "mipLodBias"),
+        ("VkBool32", "anisotropyEnable"), ("float", "maxAnisotropy"),
+        ("VkBool32", "compareEnable"), ("VkCompareOp", "compareOp"),
+        ("float", "minLod"), ("float", "maxLod"),
+        ("VkBorderColor", "borderColor"), ("VkBool32", "unnormalizedCoordinates")),
 }
 
 # The graphics pipeline structures, added 2026-09-11. Written out here by
@@ -481,6 +499,9 @@ PB_SUFFIX = {
     "VkDescriptorPoolCreateFlags": ".l",
     "VkDescriptorPool": ".i", "VkDescriptorSet": ".i",
     "VkSampler": ".i", "VkBufferView": ".i", "VkBuffer": ".i",
+    "VkSamplerCreateFlags": ".l", "VkFilter": ".l",
+    "VkSamplerMipmapMode": ".l", "VkSamplerAddressMode": ".l",
+    "VkCompareOp": ".l", "VkBorderColor": ".l",
 }
 
 # The descriptor structures, added 2026-09-11 with the first descriptor

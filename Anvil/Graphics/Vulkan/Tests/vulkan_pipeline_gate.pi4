@@ -131,6 +131,7 @@ Procedure.i Main()
   Define dpool.i
   Define dset.i
   Define dset2.i
+  Define sampler.i
   Define layU.i
   Define layV.i
   Define bufP.i
@@ -189,6 +190,7 @@ Procedure.i Main()
   Define dsai.VkDescriptorSetAllocateInfo
   Define dbi.VkDescriptorBufferInfo
   Define wds.VkWriteDescriptorSet
+  Define sampci.VkSamplerCreateInfo
   Define dslArray.i
   Define dsl2Array.i
   Define dsetArray.i
@@ -247,6 +249,24 @@ Procedure.i Main()
   If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS
     ProcedureReturn pgStop(3)
   EndIf
+  ; The sampler is a real typed Vulkan object before any shader consumes it.
+  ; Its strict state is exactly the subset the first V3D texture lowering can
+  ; represent without silently dropping mip, address or comparison behavior.
+  sampci\sType = #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+  sampci\magFilter = #VK_FILTER_LINEAR
+  sampci\minFilter = #VK_FILTER_NEAREST
+  sampci\mipmapMode = #VK_SAMPLER_MIPMAP_MODE_NEAREST
+  sampci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  sampci\addressModeV = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  sampci\addressModeW = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  pgPut(165, vkCreateSampler(dev, @sampci, 0, @sampler))
+  pgPut(166, avkTokenKind(sampler))
+  pgPut(170, avkSamplerSlot(sampler))
+  sampci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_REPEAT
+  bad = 99
+  pgPut(167, vkCreateSampler(dev, @sampci, 0, @bad))
+  pgPut(168, bad)
+  sampci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
   vkGetDeviceQueue(dev, 0, 0, @queue)
   pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
   pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
@@ -1387,6 +1407,10 @@ Procedure.i Main()
   vkFreeMemory(dev, umem, 0)
   vkDestroyImage(dev, img, 0)
   vkFreeMemory(dev, mem, 0)
+  vkDestroySampler(dev, sampler, 0)
+  AnvilVkFaultClear()
+  vkDestroySampler(dev, sampler, 0)
+  pgPut(169, AnvilVkFaultCode())
   vkDestroyCommandPool(dev, pool, 0)
   vkDestroyDevice(dev, 0)
   vkDestroyInstance(inst, 0)

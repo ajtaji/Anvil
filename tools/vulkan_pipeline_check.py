@@ -92,6 +92,7 @@ UNIFORM = (0x3E800000, 0x3F400000, 0x3F800000, 0x3E000000)
 
 ERR_UNSUPPORTED = -20005
 ERR_ARGS = -20001
+ERR_HANDLE = -20002
 ERR_STATE = -20004
 VK_ERROR_FEATURE_NOT_PRESENT = -8
 
@@ -376,6 +377,12 @@ def grade(cpu, rc) -> Grader:
         return g
 
     g.need("the test backend reports a draw capability", slot(38), 1)
+    g.need("vkCreateSampler accepts the bounded texture sampler", slot(165), 0)
+    g.need("the sampler is a typed Vulkan object", slot(166), 20)
+    g.want_true("the created sampler handle resolves to live state", slot(170) > 0)
+    g.need("an unsupported sampler address mode is refused", slot(167), ERR_UNSUPPORTED)
+    g.need("a refused sampler creation writes VK_NULL_HANDLE", slot(168), 0)
+    g.need("a destroyed sampler handle becomes stale", slot(169), ERR_HANDLE)
     g.need("a transfer-only image remains valid", slot(151), 0)
     g.need("a view of that transfer-only image remains valid", slot(152), 0)
     g.need("a transfer-only image is refused as a framebuffer colour attachment",
@@ -892,6 +899,12 @@ COMMAND_MUTANTS = (
 )
 
 PIPELINE_MUTANTS = (
+    ("a created sampler is left non-live",
+     "  avkSampLive[s] = 1\n  avkSampDev[s] = d\n",
+     "  avkSampLive[s] = 0\n  avkSampDev[s] = d\n"),
+    ("a sampler silently accepts repeat addressing",
+     "  If (*ci\\addressModeU & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE Or (*ci\\addressModeV & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE Or (*ci\\addressModeW & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE\n",
+     "  If (*ci\\addressModeU & $FFFFFFFF) < 0 Or (*ci\\addressModeV & $FFFFFFFF) < 0 Or (*ci\\addressModeW & $FFFFFFFF) < 0\n"),
     ("a supplied zero sample mask is read as all enabled",
      "    PokeI(*outMask, PeekL(*ms\\pSampleMask) & 1)\n",
      "    PokeI(*outMask, 1)\n"),
@@ -1092,7 +1105,7 @@ def main() -> int:
     print(f"vulkan_pipeline_check: PASS - {g.checks} property checks over "
           f"{steps:,} executed A64 instructions")
     print("  the whole public path runs: six shader modules, four pipeline layouts, a")
-    print("  render pass, a framebuffer, four buffers, two descriptor set layouts, a pool")
+    print("  render pass, a framebuffer, four buffers, a sampler, two descriptor set layouts, a pool")
     print("  and a set, five graphics pipelines over four live slots, five render passes each holding one draw,")
     print("  five submissions and a fence")
     print("  all four shader variants were compiled by the REAL V3D QPU emitter, and every byte")

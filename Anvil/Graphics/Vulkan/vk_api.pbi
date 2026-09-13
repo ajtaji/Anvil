@@ -695,6 +695,21 @@ Procedure vkDestroyDescriptorPool(device.i, descriptorPool.i, *pAllocator)
   AnvilVkDescriptorPoolDestroy(device, descriptorPool)
 EndProcedure
 
+Procedure.i vkCreateSampler(device.i, *pCreateInfo.VkSamplerCreateInfo, *pAllocator, *pSampler)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pSampler = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  ProcedureReturn AnvilVkSamplerCreate(device, *pCreateInfo, *pSampler)
+EndProcedure
+
+Procedure vkDestroySampler(device.i, sampler.i, *pAllocator)
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  AnvilVkSamplerDestroy(device, sampler)
+EndProcedure
+
 Procedure.i vkResetDescriptorPool(device.i, descriptorPool.i, flags.i)
   If flags <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkResetDescriptorPool was given flags (Anvil code -20001, invalid argument); VkDescriptorPoolResetFlags is reserved and must be zero.")

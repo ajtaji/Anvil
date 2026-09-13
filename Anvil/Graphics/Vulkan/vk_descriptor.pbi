@@ -118,7 +118,7 @@ EndProcedure
 ; Every descriptor type that is not a uniform buffer, each named.
 Procedure.i avkDescRefuseType(t.i)
   If t = #VK_DESCRIPTOR_TYPE_SAMPLER Or t = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Or t = #VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE Or t = #VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for an image or sampler descriptor - VK_DESCRIPTOR_TYPE_SAMPLER, COMBINED_IMAGE_SAMPLER, SAMPLED_IMAGE or STORAGE_IMAGE (Anvil code -20005, unsupported descriptor type); there is no VkSampler, no image-view descriptor and no texture-unit lowering in the emitted shaders, so a bound image could never be sampled. The one descriptor type this implementation has is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for an image or sampler descriptor - VK_DESCRIPTOR_TYPE_SAMPLER, COMBINED_IMAGE_SAMPLER, SAMPLED_IMAGE or STORAGE_IMAGE (Anvil code -20005, unsupported descriptor type); VkSampler objects exist, but no image-view descriptor or texture-unit lowering reaches them yet, so a bound image could not be sampled. The one descriptor type currently connected to shaders is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER.")
   EndIf
   If t = #VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER Or t = #VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for a texel buffer descriptor - VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER or STORAGE_TEXEL_BUFFER (Anvil code -20005, unsupported descriptor type); a texel buffer is reached through a VkBufferView and there is no VkBufferView object here. The one descriptor type this implementation has is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER.")
@@ -186,7 +186,7 @@ Procedure.i AnvilVkDescriptorSetLayoutCreate(device.i, *ci.VkDescriptorSetLayout
       ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given stage flags other than VK_SHADER_STAGE_FRAGMENT_BIT alone (Anvil code -20005, unsupported stage); the descriptor path in this implementation supplies the fragment colour, and the emitted vertex programs' uniform stream carries the viewport transform and nothing else.")
     EndIf
     If *bind\pImmutableSamplers <> 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given immutable samplers (Anvil code -20005, samplers not implemented); there is no VkSampler object here.")
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given immutable samplers (Anvil code -20005, immutable samplers not implemented); use no immutable samplers until the sampled-image descriptor path is connected.")
     EndIf
     k = k + 1
   Wend

@@ -126,6 +126,15 @@ Global Dim avkIvDev.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 Global Dim avkIvImage.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 Global Dim avkIvImgSlot.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 
+; Samplers are target-neutral Vulkan state. The V3D backend will translate
+; these values into its sampler-state record when the combined-image
+; descriptor path lands; object ownership does not belong in that backend.
+Global Dim avkSampLive.a[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim avkSampGen.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim avkSampDev.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim avkSampMag.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim avkSampMin.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+
 Global Dim avkFbLive.a[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbGen.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbDev.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
@@ -222,6 +231,72 @@ Procedure.i avkFbSlot(h.i)
   s = avkTokenShape(h, #ANVIL_VK_TYPE_FRAMEBUFFER, #ANVIL_VK_MAX_FRAMEBUFFERS)
   If s = 0 Or avkFbLive[s] = 0 Or avkFbGen[s] <> avkTokenGen(h) : ProcedureReturn 0 : EndIf
   ProcedureReturn s
+EndProcedure
+
+Procedure.i avkSamplerSlot(h.i)
+  Define s.i
+  s = avkTokenShape(h, #ANVIL_VK_TYPE_SAMPLER, #ANVIL_VK_MAX_SAMPLERS)
+  If s = 0 Or avkSampLive[s] = 0 Or avkSampGen[s] <> avkTokenGen(h) : ProcedureReturn 0 : EndIf
+  ProcedureReturn s
+EndProcedure
+
+; ======================================================================
+;  SAMPLERS -- the object/lifecycle half of the sampled-image path
+; ======================================================================
+Procedure.i AnvilVkSamplerCreate(device.i, *ci.VkSamplerCreateInfo, *out)
+  Define d.i
+  Define s.i
+  If *ci = 0 Or *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*out, #VK_NULL_HANDLE)
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If (*ci\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateSampler was given a VkSamplerCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO.")
+  EndIf
+  If *ci\pNext <> 0 Or (*ci\flags & $FFFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateSampler was given a pNext chain or creation flags (Anvil code -20005, unsupported sampler extension); use the core structure with pNext null and flags zero.")
+  EndIf
+  If Not ((*ci\magFilter & $FFFFFFFF) = #VK_FILTER_NEAREST Or (*ci\magFilter & $FFFFFFFF) = #VK_FILTER_LINEAR) Or Not ((*ci\minFilter & $FFFFFFFF) = #VK_FILTER_NEAREST Or (*ci\minFilter & $FFFFFFFF) = #VK_FILTER_LINEAR)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateSampler was given a minification or magnification filter outside VkFilter (Anvil code -20001, invalid filter); use VK_FILTER_NEAREST or VK_FILTER_LINEAR.")
+  EndIf
+  If (*ci\mipmapMode & $FFFFFFFF) <> #VK_SAMPLER_MIPMAP_MODE_NEAREST Or (PeekL(@*ci\minLod) & $7FFFFFFF) <> 0 Or (PeekL(@*ci\maxLod) & $7FFFFFFF) <> 0 Or (PeekL(@*ci\mipLodBias) & $7FFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateSampler requested mip filtering or a nonzero LOD range or bias (Anvil code -20005, mipmaps not implemented); this image slice has one mip level, so use NEAREST mip mode and zero for minLod, maxLod and mipLodBias.")
+  EndIf
+  If (*ci\addressModeU & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE Or (*ci\addressModeV & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE Or (*ci\addressModeW & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateSampler requested an address mode other than VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE (Anvil code -20005, unsupported address mode); use clamp-to-edge on U, V and W for this 2D texture slice.")
+  EndIf
+  If *ci\anisotropyEnable <> #VK_FALSE Or *ci\compareEnable <> #VK_FALSE Or *ci\unnormalizedCoordinates <> #VK_FALSE
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateSampler requested anisotropy, comparison sampling or unnormalized coordinates (Anvil code -20005, unsupported sampler mode); leave all three disabled for normalized colour sampling.")
+  EndIf
+  s = 1
+  While s <= #ANVIL_VK_MAX_SAMPLERS And avkSampLive[s] <> 0 : s = s + 1 : Wend
+  If s > #ANVIL_VK_MAX_SAMPLERS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+  avkSampGen[s] = avkNextGen(avkSampGen[s])
+  avkSampLive[s] = 1
+  avkSampDev[s] = d
+  avkSampMag[s] = *ci\magFilter & $FFFFFFFF
+  avkSampMin[s] = *ci\minFilter & $FFFFFFFF
+  PokeI(*out, avkToken(#ANVIL_VK_TYPE_SAMPLER, s, avkSampGen[s]))
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure AnvilVkSamplerDestroy(device.i, sampler.i)
+  Define d.i
+  Define s.i
+  If sampler = #VK_NULL_HANDLE
+    ProcedureReturn
+  EndIf
+  d = avkDevSlot(device)
+  s = avkSamplerSlot(sampler)
+  If s = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkDestroySampler was given a VkSampler handle that is not live (Anvil code -20002, stale or foreign handle); nothing was destroyed.")
+    ProcedureReturn
+  EndIf
+  If d = 0 Or avkSampDev[s] <> d
+    avkFault(#ANVIL_VK_ERR_OWNER, "vkDestroySampler was called through a device that does not own it (Anvil code -20003, wrong parent); destroy the sampler through the VkDevice that created it.")
+    ProcedureReturn
+  EndIf
+  avkSampLive[s] = 0
 EndProcedure
 
 Procedure.i avkPipeSlot(h.i)
