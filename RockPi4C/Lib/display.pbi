@@ -218,9 +218,17 @@ Procedure RockDisplayFrameTelemetry()
   Protected frames.i
   Protected hz.i
   Protected attempts.i
+  Protected settleRaw.i
   ; Pinned RK3399 VOPL RAW_STATUS0 latches frame-start and underrun causes.
   ; Clear uses the VOP write-mask convention: mask in the high half and the
   ; same asserted bits in the low half. CPU interrupts remain disabled.
+  ; The VOP begins scanning before the Cadence stream is made active. Preserve
+  ; that initial state separately, then let both FIFOs run for several frames
+  ; before clearing and measuring the steady path. Otherwise a legitimate
+  ; first-fill POST_BUF_EMPTY latch is indistinguishable from a continuing
+  ; memory/scanout underrun.
+  settleRaw=RockVopRead(#VOP_INTR_RAW_STATUS0)
+  RockTimerWaitUs(200000)
   RockVopWrite(#VOP_INTR_CLEAR0,$08610861)
   start=RockTimerTicks()
   deadline=start+(rock_timer_frequency/2)
@@ -239,7 +247,8 @@ Procedure RockDisplayFrameTelemetry()
   If frames > 0 And now > start
     hz=(frames*rock_timer_frequency)/(now-start)
   EndIf
-  RockUartText("VOP ACTIVITY FRAMES ") : RockDisplayDecimal(frames)
+  RockUartText("VOP SETTLE ") : RockDisplayHexLong(settleRaw)
+  RockUartText(" STABLE FRAMES ") : RockDisplayDecimal(frames)
   RockUartText(" HZ ") : RockDisplayDecimal(hz)
   RockUartText(" RAW/FAULT ") : RockDisplayHexLong(raw) : RockUartByte(32)
   RockDisplayHexLong(faults) : RockUartByte(13) : RockUartByte(10)
