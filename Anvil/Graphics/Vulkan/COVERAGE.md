@@ -41,7 +41,7 @@ compile — neither can silently enumerate the wrong thing.
 | Generated vocabulary | A pinned core-1.0 generator exists. The checked-in slice contains the exact result, structure-type, command-lifecycle, image, format-feature, memory, queue-family, access, stage, aspect and fence values this implementation uses, plus 66 scalar, nested, fixed-array, structure-array and pointer-bearing structures. It is not the complete 1.0 vocabulary. `VkPhysicalDeviceFeatures` carries all 55 core feature members; every member is currently false. `VkClearColorValue` is a union and is deliberately **not** declared, because PureMetal has no union and one arm of it posing as the whole type is the silent wrong answer this project refuses. |
 | Semantic implementation | Opaque typed and generation-tagged handles for nine object types; instance, physical device, device and one queue that always advertises transfer and advertises graphics exactly when its backend owns the draw capability; exact `vkGetPhysicalDeviceFormatProperties` and `vkGetPhysicalDeviceImageFormatProperties` answers for the implemented linear BGRA8 combinations, with geometry, pitch-derived resource size, one mip/layer/sample and every unsupported field refused; device memory and linear `B8G8R8A8_UNORM` images with exact requirements, binding rules, usage and per-image layout; one active `vkMapMemory` range for host-visible allocations with exact/whole-range and owner checks; framebuffer colour attachments must carry `COLOR_ATTACHMENT`; image memory barriers track layouts; whole-image clears retain resources through submission; fences have a bounded finite wait and explicitly refuse an unsatisfied `UINT64_MAX`; one-sample masks suppress primitive emission without suppressing a render-pass clear. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
 | Explicit test backend | `vk_backend_test.pbi` models one device over a caller-supplied window. It records the exact clear it was asked for — address, extent, pitch, colour word — and **writes nothing**, so a gate can then read the image back and require that every poisoned byte survived. It can hold a submission outstanding, which is what makes the pending state, the fence state machine and the retention rules reachable from a desk. |
-| V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and the accepted graphics draws through transactional `NeonRebindSurface` + `NeonFrameBegin` + `NeonFrameEnd`, the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. Board runs 2 and 3 proved the original clear and its live refusal boundary; the 2026-09-13 dynamic-geometry run proved 800x1280, 640x360, partial-tile 257x193, the 1280 scalar capacity boundary, exact display-state restoration and a subsequent ordinary frame. Board run 5 proved one graphics pipeline and its varying path. The descriptor-backed TMU lookup remains a red silicon gate tracked separately. |
+| V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and the accepted graphics draws through transactional `NeonRebindSurface` + `NeonFrameBegin` + `NeonFrameEnd`, the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. Board runs 2 and 3 proved the original clear and its live refusal boundary; the 2026-09-13 dynamic-geometry run proved 800x1280, 640x360, partial-tile 257x193, the 1280 scalar capacity boundary, exact display-state restoration and a subsequent ordinary frame. Board run 5 proved one graphics pipeline and its varying path. The 2026-09-13 clean-state descriptor run proved the uniform-buffer TMU lookup, interpolated varying, second vertex binding, cache visibility and three consecutive jobs on Pi 4 silicon. |
 
 ## Compiler ABI boundary
 
@@ -106,20 +106,25 @@ attribute names, which is what the hardware always wanted: an attribute record
 carries an address and a stride of its own.
 
 As of 2026-09-12 the descriptor address stays in the fragment uniform stream.
-The Pi 4 fragment program loads it into `rf8`, writes it to `TMUAU` while a
-`WRTMUC` signal consumes the V3D 4.2 general vec4-load configuration, switches
-threads, and reads the four components with `LDTMU`. The backend proves all
+The Pi 4 fragment program loads it into `rf8`, then uses the primary
+implementations' ADD-side OR-move to write it to `TMUAU`. That same instruction
+carries the thread switch while its uniform sideband consumes the V3D 4.2
+regular per-quad fragment vec4-load configuration; after the two architectural
+delay slots, four `LDTMU` operations read the components. It deliberately does
+not also assert `WRTMUC`: that would consume a second stream word and displace
+the tile-buffer configuration. The backend proves all
 sixteen source bytes are in its mapped window and cleans that range before
 submission. `tools/vulkan_pipeline_check.py` independently decodes the raw
-nineteen-instruction program and the three-word stream and rejects mutations of
-the address, configuration, TMU port, signal and source register. This is desk
-proof of the bytes to be submitted, not proof the silicon executes the load.
+eighteen-instruction program and the three-word stream and rejects mutations of
+the address, configuration, TMU port, signal and source register.
 
-**None of the three has run on silicon.** The board proof is
-`RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` and it is requested
-and not taken. Its report now captures the submitted descriptor stream in slots
-121..123, requires slot 124 to be one, and keeps pass A's pixel proof, so the
-future run distinguishes an emission defect from a TMU execution defect.
+**All three paths are now proved on Pi 4 silicon.** The 2026-09-13 clean-state
+run of `RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` rendered the
+uniform-buffer colour, the interpolated gradient and the same gradient from two
+vertex bindings. Its report captured the submitted descriptor stream in slots
+121..123 and required slot 124 to be one, so the result proves both the emitted
+bytes and the GPU-side descriptor fetch. The exact payload, report and recovery
+rules are recorded in `docs/VULKAN_DESCRIPTOR_TMU_PROOF_2026-09-13.md`.
 
 ## Next real backend layers
 

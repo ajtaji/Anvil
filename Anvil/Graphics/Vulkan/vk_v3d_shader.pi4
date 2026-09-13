@@ -106,12 +106,14 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #AVKQ_TLB_CONF = $FFFFFFFF
 
 ; V3D 4.2's TMU general-load configuration for one vec4 of 32-bit
-; values, one lookup per active fragment invocation:
-;   $FFFFFF00 | regular-load(0 << 3) | per-pixel(1 << 7) | vec4(4)
-; Mesa 24.3.4 derives the same word in ntq_emit_tmu_general() in
-; nir_to_vir.c. The address is written to TMUAU, so this word is pulled
-; from the uniform stream by the WRTMUC signal on that instruction.
-#AVKQ_TMU_LOAD_VEC4 = $FFFFFF84
+; values, one lookup per fragment quad:
+;   $FFFFFF00 | regular-load(15 << 3) | per-quad(0 << 7) | vec4(4)
+; Mesa's ntq_emit_tmu_general() selects this $7C low byte for fragment
+; loads which include helper invocations. TMUAU consumes this word from
+; the uniform stream itself.
+; Omitting the regular-operation field ($78) leaves a different TMU
+; operation selected and can leave the render job waiting forever.
+#AVKQ_TMU_LOAD_VEC4 = $FFFFFF7C
 
 ; V3D primitive mode 4 is a triangle list, which is the one topology
 ; vkCreateGraphicsPipelines accepts.
@@ -445,13 +447,16 @@ EndProcedure
 ;  taken out.
 ;
 ;  A DESCRIPTOR colour keeps the descriptor's ADDRESS in the fragment
-;  uniform stream. LDUNIFRF puts that address in rf8, and one instruction
-;  carries both WRTMUC and a write of rf8 to TMUAU. The former pulls the
-;  general-load configuration word and the latter starts the lookup.
+;  uniform stream. LDUNIFRF puts that address in rf8, then a write of rf8
+;  to TMUAU starts the lookup. TMUAU's `U` sideband consumes the general-load
+;  configuration word from the uniform stream itself; adding WRTMUC to that
+;  instruction would consume a second word and leave the later TLBU write
+;  reading beyond its three-word stream.
 ;  THRSW plus its two delay slots delivers four LDTMU results in shader
 ;  component order. Mesa 24.3.4's emit_tmu_general_address_write() and
-;  ntq_emit_tmu_general() are the source for that protocol; its scheduler
-;  explicitly permits WRTMUC beside a TMU write other than TMUC.
+;  ntq_emit_tmu_general() are the source for that protocol. py-videocore6's
+;  working general-memory programs independently use the same plain TMUAU
+;  launch: no WRTMUC signal accompanies it.
 ;
 ;  THE COMPONENT ORDER IS NOT THE SHADER'S. The shader produces red,
 ;  green, blue and alpha, in that order, because that is what a Vulkan
@@ -506,20 +511,22 @@ Procedure.i avkqEmitFragment(pipe.i, base.i, colourSrc.i)
     r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
 
-    ; WRTMUC consumes #AVKQ_TMU_LOAD_VEC4 from the stream while the MUL
-    ; MOV writes rf8 to TMUAU and starts the general lookup.
+    ; TMUAU consumes #AVKQ_TMU_LOAD_VEC4 from the stream while the ADD-side
+    ; OR-move writes rf8 and starts the general lookup. The launch itself
+    ; carries THRSW, matching py-videocore6's silicon-tested general-vector
+    ; read; delaying the switch to a separate following instruction can leave
+    ; the render job waiting. Do not add WRTMUC here: that is a second
+    ; sideband-uniform consumer, not part of this launch.
     V3dQpuReset()
-    r = V3dQpuSig(#V3DQ_SIG_WRTMUC)
+    r = V3dQpuSig(#V3DQ_SIG_THRSW)
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
-    V3dQpuMul(#V3DQ_M_MOV, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, 0)
+    V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)
     V3dQpuRaddr(8, 0)
     r = V3dQpuEmit()
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
 
-    ; A TMU result is delivered after a thread switch. The two following
-    ; instructions are its architectural delay slots, not padding.
-    r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
-    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ; The two following instructions are THRSW's architectural delay slots,
+    ; not padding.
     r = V3dQpuNop()
     If r <> #V3DQ_OK : ProcedureReturn r : EndIf
     r = V3dQpuNop()

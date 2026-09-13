@@ -74,7 +74,7 @@ ATTR_FLOAT = 2
 F0 = 0x00000000
 F1 = 0x3F800000
 TLB_CONF = 0xFFFFFFFF
-TMU_GENERAL_VEC4 = 0xFFFFFF84
+TMU_GENERAL_VEC4 = 0xFFFFFF7C
 
 W = H = 64
 STRIDE1, STRIDE2 = 24, 8
@@ -705,8 +705,8 @@ def grade(cpu, rc) -> Grader:
                                 UNIFORM[3])) < 0)
 
     fsD = slot(140)
-    g.need("[D] the descriptor fragment program has the documented nineteen "
-           "instructions", fsD, 19 * 8)
+    g.need("[D] the descriptor fragment program has the documented eighteen "
+           "instructions", fsD, 18 * 8)
     raw_d = [u64(cpu, baseD + OFF_FS_CODE + i)
              for i in range(0, fsD, 8)]
 
@@ -720,21 +720,19 @@ def grade(cpu, rc) -> Grader:
     # here from the raw instruction words rather than through the emitter.
     g.need("[D] the raw descriptor program's signal sequence",
            [sig(w) for w in raw_d],
-           [12, 18, 1, 0, 0, 4, 4, 4, 4,
+           [12, 1, 0, 0, 4, 4, 4, 4,
             1, 1, 0, 0, 0, 0, 1, 0, 0, 0])
     g.need("[D] LDUNIFRF puts the descriptor address in rf8",
            sig_dest(raw_d[0]), 8)
     g.need("[D] four LDTMU signals return RGBA in rf0 through rf3",
-           [sig_dest(raw_d[i]) for i in range(5, 9)], [0, 1, 2, 3])
+           [sig_dest(raw_d[i]) for i in range(4, 8)], [0, 1, 2, 3])
     fire = raw_d[1]
-    g.need("[D] the lookup instruction uses the MUL MOV encoding",
-           (fire >> 58) & 0x3F, 15)
-    g.need("[D] the lookup instruction uses a magic destination",
-           (fire >> 45) & 1, 1)
-    g.need("[D] the lookup writes the uniform-configured address port TMUAU",
-           (fire >> 38) & 0x3F, 13)
-    g.need("[D] the lookup address is read from rf8",
-           (fire >> 6) & 0x3F, 8)
+    # Independently assembled by py-videocore6 as mov(tmuau, rf8). Its
+    # public assembler spells an ADD-side OR of the source with itself.
+    # Comparing the complete word keeps opcode, magic destination, TMUAU,
+    # both muxes and raddr A under one exact gate.
+    g.need("[D] the lookup instruction is the primary-source TMUAU rf8 move",
+           fire, 0x3C20318DB6836200)
     g.need("the draw carried the descriptor's address to the backend",
            slot(121), uniform_base)
     g.need("and its range", slot(122), 16)
@@ -857,15 +855,15 @@ MUTANTS = (
     ("the descriptor stream copies the first buffer word instead of keeping its address",
      "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, *push & $FFFFFFFF)\n",
      "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, PeekL(*push) & $FFFFFFFF)\n"),
-    ("the descriptor stream asks the TMU for a vec3 instead of a vec4",
+    ("the descriptor stream omits the regular-operation field from the TMU config",
      "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, #AVKQ_TMU_LOAD_VEC4)\n",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, $FFFFFF83)\n"),
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, $FFFFFF84)\n"),
     ("the descriptor lookup uses TMUA instead of uniform-configured TMUAU",
-     "    V3dQpuMul(#V3DQ_M_MOV, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, 0)\n",
-     "    V3dQpuMul(#V3DQ_M_MOV, #V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, 0)\n"),
-    ("the descriptor lookup no longer carries WRTMUC",
-     "    r = V3dQpuSig(#V3DQ_SIG_WRTMUC)\n",
-     "    r = V3dQpuSig(#V3DQ_SIG_NONE)\n"),
+     "    V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)\n",
+     "    V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)\n"),
+    ("the descriptor lookup incorrectly adds WRTMUC as a second sideband-uniform consumer",
+     "    r = V3dQpuSig(#V3DQ_SIG_THRSW)\n",
+     "    r = V3dQpuSig(#V3DQ_SIG_THRSW | #V3DQ_SIG_WRTMUC)\n"),
     ("the descriptor lookup starts from the wrong address register",
      "    V3dQpuRaddr(8, 0)\n",
      "    V3dQpuRaddr(7, 0)\n"),
@@ -1061,14 +1059,18 @@ def run(a64, compiler):
 
 
 def main() -> int:
+    all_mutants = (MUTANTS + PIPELINE_MUTANTS + COMMAND_MUTANTS +
+                   DESCRIPTOR_MUTANTS + MEMORY_MUTANTS)
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage",
                                                    "sample-mask", "draw-count"))
+    parser.add_argument("--mutate-name", choices=tuple(m[0] for m in all_mutants),
+                        help="run exactly one named mutation after the green gate")
     args = parser.parse_args()
-    if args.mutate_only:
+    if args.mutate_only or args.mutate_name:
         args.mutate = True
 
     compiler = locate_compiler(args.compiler)
@@ -1120,6 +1122,8 @@ def main() -> int:
                           (MEMORY, MEMORY_MUTANTS)):
         original = path.read_text(encoding="utf-8")
         for name, fixed, broken in mutants:
+            if args.mutate_name and name != args.mutate_name:
+                continue
             if args.mutate_only == "validation-truth" and name not in VALIDATION_TRUTH_MUTANTS:
                 continue
             if args.mutate_only == "image-usage" and name not in IMAGE_USAGE_TRUTH_MUTANTS:
@@ -1147,7 +1151,9 @@ def main() -> int:
                 print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
                 missed += 1
 
-    if args.mutate_only == "validation-truth":
+    if args.mutate_name:
+        total = 1
+    elif args.mutate_only == "validation-truth":
         total = len(VALIDATION_TRUTH_MUTANTS)
     elif args.mutate_only == "image-usage":
         total = len(IMAGE_USAGE_TRUTH_MUTANTS)

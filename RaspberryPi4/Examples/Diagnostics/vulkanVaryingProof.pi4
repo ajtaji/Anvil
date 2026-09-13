@@ -146,8 +146,8 @@
 ;     1  PASS A VERDICT - the uniform-buffer colour
 ;     2  PASS B VERDICT - the gradient out of one buffer
 ;     3  PASS C VERDICT - the gradient out of two buffers
-;     4  detail
-;     5  detail 2
+;     4  detail; render control-list current address when submit A fails
+;     5  detail 2; render control-list status when submit A fails
 ;     6  surface (guard) base
 ;     7  Vulkan window base
 ;     8  Vulkan window bytes
@@ -228,7 +228,8 @@
 ;   109  command buffer failure text
 ;   110  shutdown reached
 ;   111  emitter step, if a pipeline was refused
-;   112  encoder code, if a pipeline was refused
+;   112  encoder code if a pipeline was refused; render control-list end
+;        address when submit A fails
 ;   113  the descriptor address the draw resolved to
 ;   114  the descriptor range
 ;   115  pipeline C binding 0 stride, 8
@@ -236,7 +237,7 @@
 ;   117  pipeline C attribute 0 binding, 0
 ;   118  pipeline C attribute 1 binding, 1
 ;   119  pipeline C binding count, 2
-;   120  descriptor fragment-program bytes, 152
+;   120  descriptor fragment-program bytes, 144
 ;   121  descriptor fragment stream word 0: uniform-buffer address
 ;   122  descriptor fragment stream word 1: TMU general vec4 config
 ;   123  descriptor fragment stream word 2: TLB config
@@ -276,12 +277,13 @@
 ;  THE NEW PIECE THIS RUN MUST PROVE
 ; ======================================================================
 ;  THE GPU NOW DEREFERENCES THE DESCRIPTOR. The fragment uniform stream
-;  carries the uniform-buffer address, $FFFFFF84 (V3D 4.2 TMU general
-;  vec4, per-pixel load), and the TLB configuration. The QPU writes that
-;  address to TMUAU with WRTMUC, switches threads and reads four LDTMU
+;  carries the uniform-buffer address, $FFFFFF7C (V3D 4.2 TMU general
+;  vec4, regular per-quad fragment load), and the TLB configuration. The QPU
+;  writes that address to TMUAU, which consumes the configuration word,
+;  carries that thread switch on the launch and reads four LDTMU
 ;  results. No processor-side copy of the four colour values remains.
 ;
-;  The desk gate independently decodes all nineteen raw QPU words. This
+;  The desk gate independently decodes all eighteen raw QPU words. This
 ;  board run adds the part a desk cannot: the stream words are captured
 ;  from the submitted shader record in slots 121..123, slot 124 requires
 ;  all three to match, and pass A still requires the fetched magenta at
@@ -329,7 +331,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_CLEAR_A = $3F800000               ; 1.0 -> 255
 #VVP_CLEAR_WORD = $FF3380B2
 #VVP_MAGENTA_WORD = $FFFF00FF
-#VVP_TMU_GENERAL_VEC4 = $FFFFFF84
+#VVP_TMU_GENERAL_VEC4 = $FFFFFF7C
 
 ; The triangle, in clip space. +Y is DOWN, which is Vulkan's framebuffer
 ; orientation and the V3D rasteriser's. The expectation module is told
@@ -1415,7 +1417,33 @@ Procedure.i Main()
     vvpPut(#VVP_S_SUBMIT_A, rc)
     vvpPut(#VVP_S_US_A, (Ticks() - t0) / hz)
     vvpPut(#VVP_S_NATIVE, AnvilVkBackendNativeError())
+
+    ; Capture the exact descriptor shader record even when the render job
+    ; times out. A failed submit is precisely when the record and the stopped
+    ; control-list address are most useful; hiding them behind VK_SUCCESS made
+    ; every TMU protocol failure look identical in the returned report.
+    shrec = AnvilVkV3dLastShaderRecord()
+    vvpPut(#VVP_S_SHREC, shrec)
+    vvpPut(#VVP_S_DESC_FS_BYTES, AnvilVkV3dProgramBytes(1, 2))
+    lowering = 0
+    If shrec <> 0
+      fsUniform = PeekL(shrec + 16) & $FFFFFFFF
+      vvpPut(#VVP_S_DESC_STREAM_ADDR, PeekL(fsUniform + 0) & $FFFFFFFF)
+      vvpPut(#VVP_S_DESC_STREAM_TMU, PeekL(fsUniform + 4) & $FFFFFFFF)
+      vvpPut(#VVP_S_DESC_STREAM_TLB, PeekL(fsUniform + 8) & $FFFFFFFF)
+      If (PeekL(fsUniform + 0) & $FFFFFFFF) = (addrUni & $FFFFFFFF)
+        If (PeekL(fsUniform + 4) & $FFFFFFFF) = #VVP_TMU_GENERAL_VEC4
+          If (PeekL(fsUniform + 8) & $FFFFFFFF) = $FFFFFFFF
+            lowering = 1
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    vvpPut(#VVP_S_DESC_LOWERING, lowering)
     If rc <> #VK_SUCCESS
+      vvpPut(#VVP_S_DETAIL, V3dRenderCt1ca())
+      vvpPut(#VVP_S_DETAIL2, V3dRenderCt1cs())
+      vvpPut(#VVP_S_QPU_ERR, V3dRenderCt1ea())
       vvpPut(#VVP_S_STATUS_A, #VVP_ERR_SUBMIT)
     Else
       rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
@@ -1424,26 +1452,6 @@ Procedure.i Main()
         vvpPut(#VVP_S_STATUS_A, #VVP_ERR_FENCE)
       Else
         vvpPut(#VVP_S_LAYOUT_AFTER, AnvilVkImageLayout(img))
-        shrec = AnvilVkV3dLastShaderRecord()
-        vvpPut(#VVP_S_SHREC, shrec)
-        vvpPut(#VVP_S_DESC_FS_BYTES, AnvilVkV3dProgramBytes(1, 2))
-        lowering = 0
-        If shrec <> 0
-          ; Word 4 of the nine-word GL shader record is the fragment
-          ; uniform-stream address. Read back the exact stream submitted.
-          fsUniform = PeekL(shrec + 16) & $FFFFFFFF
-          vvpPut(#VVP_S_DESC_STREAM_ADDR, PeekL(fsUniform + 0) & $FFFFFFFF)
-          vvpPut(#VVP_S_DESC_STREAM_TMU, PeekL(fsUniform + 4) & $FFFFFFFF)
-          vvpPut(#VVP_S_DESC_STREAM_TLB, PeekL(fsUniform + 8) & $FFFFFFFF)
-          If (PeekL(fsUniform + 0) & $FFFFFFFF) = (addrUni & $FFFFFFFF)
-            If (PeekL(fsUniform + 4) & $FFFFFFFF) = #VVP_TMU_GENERAL_VEC4
-              If (PeekL(fsUniform + 8) & $FFFFFFFF) = $FFFFFFFF
-                lowering = 1
-              EndIf
-            EndIf
-          EndIf
-        EndIf
-        vvpPut(#VVP_S_DESC_LOWERING, lowering)
         vvpPut(#VVP_S_A_IN0 + 0, vvpPixel(imgBase, pitch, 400, 500))
         vvpPut(#VVP_S_A_IN0 + 1, vvpPixel(imgBase, pitch, 400, 700))
         vvpPut(#VVP_S_A_IN0 + 2, vvpPixel(imgBase, pitch, 400, 900))
