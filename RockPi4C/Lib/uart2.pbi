@@ -8,7 +8,7 @@ Global rock_uart_error.i
 Procedure.i RockUartAdopt()
   Protected status.i
   rock_uart_ready = 0
-  status = PeekN(#ROCK_UART2 + #ROCK_UART_USR) & $FFFFFFFF
+  status = PeekL(#ROCK_UART2 + #ROCK_UART_USR) & $FFFFFFFF
   If status = $FFFFFFFF
     rock_uart_error = 1
     ProcedureReturn 0
@@ -27,7 +27,7 @@ Procedure.i RockUartByte(value.i)
   EndIf
   start = RockTimerTicks()
   For attempt = 0 To 999999
-    If (PeekN(#ROCK_UART2 + #ROCK_UART_LSR) & #ROCK_UART_LSR_THRE) <> 0
+    If (PeekL(#ROCK_UART2 + #ROCK_UART_LSR) & #ROCK_UART_LSR_THRE) <> 0
       PokeL(#ROCK_UART2 + #ROCK_UART_THR, value)
       ProcedureReturn 1
     EndIf

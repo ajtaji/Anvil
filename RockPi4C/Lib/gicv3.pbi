@@ -47,7 +47,7 @@ Procedure.i RockGicWait(address.i, mask.i, wanted.i)
   Protected attempt.i
   start = RockTimerTicks()
   For attempt = 0 To 999999
-    If (PeekN(address) & mask) = wanted : ProcedureReturn 1 : EndIf
+    If ((PeekL(address) & $FFFFFFFF) & mask) = wanted : ProcedureReturn 1 : EndIf
     now = RockTimerTicks()
     If now < start Or now-start >= rock_timer_frequency/10 : ProcedureReturn 0 : EndIf
   Next
@@ -99,11 +99,11 @@ Procedure.i RockGicInitTimerFoundation()
   If rock_current_el <> 8 Or rock_timer_frequency = 0 Or rock_exception_vbar = 0 Or rock_gic_ready <> 0
     rock_gic_error = 1 : ProcedureReturn 0
   EndIf
-  If (PeekN(#ROCK_GICD + #ROCK_GICD_TYPER) & $1F) < 4
+  If ((PeekL(#ROCK_GICD + #ROCK_GICD_TYPER) & $FFFFFFFF) & $1F) < 4
     rock_gic_error = 3 : ProcedureReturn 0
   EndIf
   If RockGicFindRedistributor() = 0 : ProcedureReturn 0 : EndIf
-  value = PeekN(rock_gicr_this + #ROCK_GICR_WAKER) & $FFFFFFFF
+  value = PeekL(rock_gicr_this + #ROCK_GICR_WAKER) & $FFFFFFFF
   PokeL(rock_gicr_this + #ROCK_GICR_WAKER,value & $FFFFFFFD)
   If RockGicWait(rock_gicr_this + #ROCK_GICR_WAKER,#ROCK_GICR_CHILDREN_ASLEEP,0) = 0
     rock_gic_error = 4 : ProcedureReturn 0
@@ -113,13 +113,13 @@ Procedure.i RockGicInitTimerFoundation()
   PokeL(sgi + #ROCK_GICR_ICENABLER0,mask)
   PokeL(sgi + #ROCK_GICR_ICPENDR0,mask)
   PokeL(sgi + #ROCK_GICR_ICACTIVER0,mask)
-  value = PeekN(sgi + #ROCK_GICR_IGROUPR0) & $FFFFFFFF
+  value = PeekL(sgi + #ROCK_GICR_IGROUPR0) & $FFFFFFFF
   PokeL(sgi + #ROCK_GICR_IGROUPR0,value | mask)
   priority = sgi + #ROCK_GICR_IPRIORITYR0 + (#ROCK_GIC_TIMER_INTID & $FFFFFFFC)
-  value = PeekN(priority) & $FFFFFFFF
+  value = PeekL(priority) & $FFFFFFFF
   value = (value & $FF00FFFF) | $00A00000
   PokeL(priority,value)
-  value = PeekN(#ROCK_GICD + #ROCK_GICD_CTLR) & $FFFFFFFF
+  value = PeekL(#ROCK_GICD + #ROCK_GICD_CTLR) & $FFFFFFFF
   PokeL(#ROCK_GICD + #ROCK_GICD_CTLR,value | #ROCK_GICD_ENABLE_G1NS | #ROCK_GICD_ARE_NS)
   If RockGicWait(#ROCK_GICD + #ROCK_GICD_CTLR,#ROCK_GICD_RWP,0) = 0
     rock_gic_error = 5 : ProcedureReturn 0
