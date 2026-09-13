@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Desk gate for the original Rock Pi 4C RK3399 MiniDP first-light path."""
+"""Desk gate for the Rock Pi 4C RK3399 MiniDP preferred-mode path."""
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 import build_count
@@ -14,6 +17,178 @@ import build_count
 ROOT = Path(__file__).resolve().parents[1]
 ROCK = ROOT / "RockPi4C"
 FIRMWARE_SHA256 = "203c5f061fb5075e4ca5398f8becc74e7cc450b494af857da5400788a7eae20b"
+SAFE_MODE = (1024, 768, 65000000, 1344, 1048, 1184, 806, 771, 777, 0, 0, 4096)
+PREFERRED_1080P = (
+    1920, 1080, 148500000, 2200, 2008, 2052, 1125, 1084, 1089, 1, 1, 7680,
+)
+MAX_MODE_WIDTH = 2560
+MAX_MODE_HEIGHT = 1600
+MAX_MODE_PIXEL_HZ = 360000000
+MAX_FRAMEBUFFER_BYTES = MAX_MODE_WIDTH * MAX_MODE_HEIGHT * 4
+PINNED_VPLL = {
+    594000000: (1, 123, 5, 1, 0, 0xC00000),
+    593406593: (1, 123, 5, 1, 0, 10508804),
+    297000000: (1, 123, 5, 2, 0, 0xC00000),
+    296703297: (1, 123, 5, 2, 0, 10508807),
+    148500000: (1, 129, 7, 3, 0, 0xF00000),
+    148351648: (1, 123, 5, 4, 0, 10508800),
+    106500000: (1, 124, 7, 4, 0, 0x400000),
+    74250000: (1, 129, 7, 6, 0, 0xF00000),
+    74175824: (1, 129, 7, 6, 0, 13550823),
+    65000000: (1, 113, 7, 6, 0, 0xC00000),
+    59340659: (1, 121, 7, 7, 0, 2581098),
+    54000000: (1, 110, 7, 7, 0, 0x400000),
+    27000000: (1, 55, 7, 7, 0, 0x200000),
+    26973027: (1, 55, 7, 7, 0, 1173232),
+}
+
+
+def vpll_reference_plan(pixel_hz: int) -> tuple[int, ...] | None:
+    """Independent integer model of the pinned-first RK3399 VPLL planner."""
+    if pixel_hz == 24000000:
+        return None
+    plan = PINNED_VPLL.get(pixel_hz)
+    if plan is None:
+        post1 = post2 = 0
+        for first in range(1, 8):
+            for second in range(1, 8):
+                vco = pixel_hz * first * second
+                if 800000000 <= vco <= 2000000000:
+                    post1, post2 = first, second
+                    break
+            if post1:
+                break
+        if not post1:
+            return None
+        if pixel_hz % 1000000 == 0:
+            from math import gcd
+            common = gcd(24, vco // 1000000)
+            ref, fb, dsmpd, fraction = 24 // common, vco // 1000000 // common, 1, 0
+        else:
+            from math import gcd
+            vco_mhz = vco // 1000000
+            common = gcd(24, vco_mhz)
+            ref, fb = 24 // common, vco_mhz // common
+            remainder = vco % 1000000
+            divisor = 24000000 // ref
+            fraction = (remainder << 24) // divisor
+            dsmpd = int(fraction == 0)
+        plan = ref, fb, post1, post2, dsmpd, fraction
+    ref, fb, post1, post2, dsmpd, fraction = plan
+    if not (1 <= ref <= 63 and 16 <= fb <= 3200 and
+            1 <= post1 <= 7 and 1 <= post2 <= 7):
+        return None
+    actual = ((24000000 * (fb * 16777216 + fraction) // ref) //
+              (16777216 * post1 * post2))
+    if actual > pixel_hz or pixel_hz - actual > 1:
+        return None
+    return ref, fb, post1, post2, dsmpd, fraction, actual
+
+
+def detailed_timing(
+    width: int, height: int, pixel_khz: int, hblank: int, hfront: int,
+    hsync: int, vblank: int, vfront: int, vsync: int, *,
+    hsync_positive: bool, vsync_positive: bool, interlaced: bool = False,
+) -> bytes:
+    """Generate one EDID detailed-timing descriptor for independent tests."""
+    require(pixel_khz % 10 == 0, "EDID pixel clock is not representable in 10 kHz")
+    require(all(0 <= value < 4096 for value in (width, hblank)),
+            "horizontal DTD field is out of range")
+    require(all(0 <= value < 2048 for value in (height, vblank)),
+            "vertical DTD field is out of range")
+    dtd = bytearray(18)
+    dtd[0:2] = (pixel_khz // 10).to_bytes(2, "little")
+    dtd[2], dtd[3] = width & 255, hblank & 255
+    dtd[4] = ((width >> 8) << 4) | (hblank >> 8)
+    dtd[5], dtd[6] = height & 255, vblank & 255
+    dtd[7] = ((height >> 8) << 4) | (vblank >> 8)
+    dtd[8], dtd[9] = hfront & 255, hsync & 255
+    dtd[10] = ((vfront & 15) << 4) | (vsync & 15)
+    dtd[11] = ((hfront >> 8) << 6) | ((hsync >> 8) << 4) | \
+              ((vfront >> 4) << 2) | (vsync >> 4)
+    # Digital separate sync. Bits 2 and 1 are the vertical and horizontal
+    # positive-polarity flags respectively.
+    dtd[17] = 0x18 | (4 if vsync_positive else 0) | \
+              (2 if hsync_positive else 0) | (0x80 if interlaced else 0)
+    return bytes(dtd)
+
+
+def base_edid(dtd: bytes, *, valid_checksum: bool = True,
+              advertise_fallback: bool = False) -> bytes:
+    """Generate a minimal base EDID with ``dtd`` as its preferred timing."""
+    require(len(dtd) == 18, "EDID DTD must be exactly 18 bytes")
+    edid = bytearray(128)
+    edid[:8] = bytes.fromhex("00 ff ff ff ff ff ff 00")
+    edid[18:20] = bytes((1, 4))
+    edid[24] = 2                 # preferred-timing bit
+    if advertise_fallback:
+        edid[36] |= 8            # established 1024x768@60
+    edid[54:72] = dtd
+    edid[126] = 0               # no extension is needed by these tests
+    edid[127] = (-sum(edid[:127])) & 255
+    if not valid_checksum:
+        edid[127] ^= 1
+    return bytes(edid)
+
+
+def select_reference_mode(edid: bytes) -> tuple[tuple[int, ...] | None, str, str]:
+    """Independent model of the deliberately bounded preferred-DTD policy."""
+    def fallback(reason: str) -> tuple[tuple[int, ...] | None, str, str]:
+        if len(edid) >= 128 and edid[:8] == bytes.fromhex(
+                "00 ff ff ff ff ff ff 00") and not sum(edid[:128]) & 255 and \
+                edid[18] == 1 and edid[19] <= 4 and edid[36] & 8:
+            return SAFE_MODE, "fallback", reason
+        return None, "none", reason
+
+    if len(edid) < 128 or edid[:8] != bytes.fromhex("00 ff ff ff ff ff ff 00"):
+        return None, "none", "header"
+    if sum(edid[:128]) & 255:
+        return None, "none", "checksum"
+    if edid[18] != 1 or edid[19] > 4:
+        return None, "none", "version"
+    dtd = edid[54:72]
+    pixel_hz = int.from_bytes(dtd[:2], "little") * 10000
+    if not pixel_hz:
+        return fallback("no-preferred-dtd")
+    width = dtd[2] | ((dtd[4] >> 4) << 8)
+    hblank = dtd[3] | ((dtd[4] & 15) << 8)
+    height = dtd[5] | ((dtd[7] >> 4) << 8)
+    vblank = dtd[6] | ((dtd[7] & 15) << 8)
+    hfront = dtd[8] | ((dtd[11] >> 6) << 8)
+    hsync = dtd[9] | (((dtd[11] >> 4) & 3) << 8)
+    vfront = (dtd[10] >> 4) | (((dtd[11] >> 2) & 3) << 4)
+    vsync = (dtd[10] & 15) | ((dtd[11] & 3) << 4)
+    flags = dtd[17]
+    if flags & 0x80:
+        return fallback("interlaced")
+    if flags & 0x18 != 0x18:
+        return fallback("non-separate-sync")
+    if flags & 0x61:
+        return fallback("stereo")
+    if (not width or not height or not hblank or not vblank or not hfront or
+            not hsync or not vfront or not vsync or hfront + hsync > hblank or
+            vfront + vsync > vblank):
+        return fallback("geometry")
+    htotal, vtotal = width + hblank, height + vblank
+    hsync_start, hsync_end = width + hfront, width + hfront + hsync
+    vsync_start, vsync_end = height + vfront, height + vfront + vsync
+    if (width > MAX_MODE_WIDTH or height > MAX_MODE_HEIGHT or htotal > 8191 or
+            hsync_start > 8191 or hsync_end > 8191 or vtotal > 8191 or
+            vsync_start > 8191 or vsync_end > 8191):
+        return fallback("vop-limit")
+    pitch = (width * 4 + 15) & ~15
+    if pitch < width * 4 or pitch & 15 or pitch // 4 > 0x3FFF or \
+            pitch * height > MAX_FRAMEBUFFER_BYTES:
+        return fallback("pitch")
+    if pixel_hz * 24 > 2 * 540000000 * 8:
+        return fallback("link-rate")
+    if vpll_reference_plan(pixel_hz) is None:
+        return fallback("vpll-rate")
+    mode = (width, height, pixel_hz, htotal, width + hfront,
+            width + hfront + hsync, vtotal, height + vfront,
+            height + vfront + vsync, 1 if flags & 2 else 0,
+            1 if flags & 4 else 0, pitch)
+    return mode, "preferred", "preferred"
 
 
 def require(condition: bool, message: str) -> None:
@@ -37,10 +212,11 @@ def source_contract() -> None:
         "rockpmuidlerelease(17", "rockpmuidlerelease(11",
         "rockpmuidlerelease(8", "$30003000", "$10001000",
         "rock_cru_gpll_rate = rockcrupllrate($80,1,47)",
-        "rockcruvpll65()", "$1fdf,$0080 | (aclkdivider-1)",
+        "rockcruvpllmode()", "$1fdf,$0080 | (aclkdivider-1)",
         "rockcdnfirmwareload", "rockcdnhotplug", "rockcdndpcd",
-        "rockcdnreadedid", "rockcdntrain", "rockcdnvideo1024x768",
-        "rockvopup1024x768", "dp08 visible 1024x768",
+        "rockcdnreadedid", "rockmodeselect(edid.i)", "rockcdntrain",
+        "rockcdnvideomode", "rockcdnlinkcarriesmode", "rockvopupmode",
+        "dp08 visible ",
     ):
         require(token in joined, f"missing display contract token: {token}")
     board = (ROCK / "Board/board.rockpi4c").read_text(encoding="utf-8").lower()
@@ -57,8 +233,9 @@ def source_contract() -> None:
         "rockcdnfirmwareload", "rockcdnfirmwareactive", "rockcdnenableevents",
         "rocktcphyup", "$30003000", "rockcdnhotplug",
         "rockcdnhostcapabilities", "rockcdndpcd", "rockcdnreadedid",
-        "rockvopup1024x768", "rockcdntrain", "rockcdnvideostatus(0)",
-        "rockcdnvideo1024x768", "rockcdnvideostatus(1)",
+        "rockcdntrain", "rockcdnvideostatus(0)", "rockcdnvideomode",
+        "rockcruvpllmode", "rockvopupmode", "dp06 color bars and text armed",
+        "rockcdnvideostatus(1)", "dp08 visible ",
     ]
     positions = [display_up.index(token) for token in order]
     require(positions == sorted(positions), "cold-to-visible stage order drifted")
@@ -120,18 +297,35 @@ def source_contract() -> None:
         "rockcdnhotplug()": ("dpe7 cdn err ", "rock_cdn_error"),
         "rockcdnhostcapabilities()": ("dpef cdn err ", "rock_cdn_error"),
         "rockcdnreadedid()": ("dpe9 cdn err ", "rock_cdn_error"),
-        "rockvopup1024x768()": ("dpea vop err ", "rock_vop_error"),
         "rockcdntrain()": ("dpeb cdn err ", "rock_cdn_error"),
         "rockcdnvideostatus(0)": ("dpec cdn err ", "rock_cdn_error"),
-        "rockcdnvideo1024x768()": ("dped cdn err ", "rock_cdn_error"),
+        "rockcruvpllmode()": ("dpe1 cru err ", "rock_cru_error"),
+        "rockvopupmode()": ("dpea vop err ", "rock_vop_error"),
         "rockcdnvideostatus(1)": ("dpee cdn err ", "rock_cdn_error"),
     }
     for owner_call, (label, error) in failure_witnesses.items():
-        failure = display_up.split(f"if {owner_call}=0", 1)[1].split("endif", 1)[0]
+        start = display_up.index(f"if {owner_call}=0")
+        end = display_up.index("procedurereturn rockdisplayfail", start)
+        failure = display_up[start:end + len("procedurereturn rockdisplayfail")]
         require(f'rockdisplaysubsystemtelemetry("{label}",{error})' in failure and
                 failure.index("rockdisplaysubsystemtelemetry") <
                 failure.index("rockdisplayfail"),
                 f"{owner_call} no longer reports its exact subsystem error")
+    mode_retry = display_up.split(
+        "configured = rockcdnvideomode()", 1
+    )[1].split("if configured=0", 1)[0]
+    for token in ("rock_cdn_error = 35 or rock_cdn_error = 36",
+                  "modefailure = rock_cdn_error",
+                  "rockmodefallback(@rock_cdn_edid[0],modefailure)",
+                  'rockdisplaymodetelemetry("dp mode fallback ")'):
+        require(token in mode_retry,
+                f"trained-link preferred-mode fallback drifted: {token}")
+    configured_failure = display_up.split("if configured=0", 1)[1].split(
+        "endif", 1
+    )[0]
+    require('rockdisplaysubsystemtelemetry("dped cdn err ",rock_cdn_error)' in
+            configured_failure and "rockdisplayfail(13" in configured_failure,
+            "unsupported selected mode can be mistaken for configured video")
     cru = libraries["cru.pbi"].lower()
     power_order = ["rockpmupoweron(14", "rockpmupoweron(24",
                    "rockpmupoweron(20", "rockpmuidlerelease(8",
@@ -235,17 +429,26 @@ def source_contract() -> None:
                   "rock_cru_error=errorcode+1",
                   "rock_cru_error=errorcode+2"):
         require(token in cru, f"DPE1 PLL refusal mapping drifted: {token}")
-    for token in ("rockcrufield($cc,$0300,$0000)",
-                  "rockcrufield($cc,$0001,$0001)",
-                  "rockcrufield($c0,$0fff,$0071)",
-                  "rockcrufield($c4,$773f,$6701)",
-                  "rockcruwrite($c8,(con2 & $ff000000) | $00c00000)",
-                  "rockcrufield($cc,$0008,$0000)",
-                  "rockcrufield($cc,$0001,$0000)",
-                  "rockcruwait($c8,$80000000,$80000000)",
-                  "rockcrufield($cc,$0300,$0100)",
-                  "rockcrufield(#rock_cru_clksel+$c8,$0bff,$0000)"):
-        require(token in cru, f"exact 65 MHz VPLL owner sequence drifted: {token}")
+    vpll = cru.split("procedure.i rockcruvpllset(pixelhz.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    vpll_order = [
+        "rockcrufield($cc,$0300,$0000)",
+        "rockcrufield($cc,$0001,$0001)",
+        "rockcrufield($c0,$0fff,rock_mode_vpll_fb)",
+        "rockcrufield($c4,$773f,rock_mode_vpll_ref | (rock_mode_vpll_post1 << 8) | (rock_mode_vpll_post2 << 12))",
+        "con2 = rockcruread($c8)",
+        "rockcruwrite($c8,(con2 & $ff000000) | rock_mode_vpll_frac)",
+        "rockcrufield($cc,$0008,rock_mode_vpll_dsmpd << 3)",
+        "rockcrufield($cc,$0001,$0000)",
+        "rockcruwait($c8,$80000000,$80000000)",
+        "rockcrufield($cc,$0300,$0100)",
+        "rate = rockcrupllrate($c0,0,63)",
+        "if rate <> rock_mode_vpll_actual_hz or rate>pixelhz or pixelhz-rate>1",
+    ]
+    positions = [vpll.index(token) for token in vpll_order]
+    require(positions == sorted(positions),
+            "selected VPLL slow/powerdown/program/lock/normal order drifted")
     require("#rock_cru_clksel+$1ac" not in cru,
             "DCLK_VOP1 regressed to an imprecise fractional divider")
     require("rockcrupllrate($60" not in cru,
@@ -261,6 +464,17 @@ def source_contract() -> None:
     positions = [display_clocks.index(token) for token in dclk_order]
     require(positions == sorted(positions),
             "VPLL/DCLK gate, parent and enable order drifted")
+    selected_clock = cru.split("procedure.i rockcruvpllmode()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    selected_order = ["rockcrugate(10,13,0)",
+                      "rockcruvpllset(rock_mode_pixel_hz)",
+                      "rockcrufield(#rock_cru_clksel+$c8,$0bff,$0000)",
+                      "rockcrugate(10,13,1)"]
+    positions = [selected_clock.index(token) for token in selected_order]
+    require(positions == sorted(positions) and
+            "rock_mode_valid=0" in selected_clock,
+            "selected VPLL does not remain gated and validity-bound")
     require("rockcdnwrite(#cdn_sw_clk_h,rock_cru_dp_core_rate/1000000)" in display,
             "Cadence SW clock does not receive the derived core MHz")
     prepare_clock = prepare.index("rockcrudisplayclocks()")
@@ -277,30 +491,46 @@ def source_contract() -> None:
     require("procedure.i rockvopframebuffer()" in vop and
             "& $fffffffffffffff0" in vop,
             "framebuffer base is not derived at its required 16-byte alignment")
+    vop_valid = vop.split("procedure.i rockvopmodevalid()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("#rock_vop_max_width", "#rock_vop_max_height",
+                  "#rock_vop_timing_max", "#rock_vop_stride_word_max",
+                  "rock_mode_pitch*rock_mode_height > #rock_fb_max_bytes"):
+        require(token in vop_valid, f"dynamic VOP admission bound missing: {token}")
+    vop_up = vop.split("procedure.i rockvopupmode()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
     for timing in (
-        "rockvopwrite(#vop_hact,1320 | (296 << 16))",
-        "rockvopwrite(#vop_vact,803 | (35 << 16))",
-        "rockvopwrite(#vop_post_hact,1320 | (296 << 16))",
-        "rockvopwrite(#vop_post_vact,803 | (35 << 16))",
+        "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
+        "rockvopwrite(#vop_hact,hactiveend | (hactivestart << 16))",
+        "rockvopwrite(#vop_vtotal,vsynclength | (rock_mode_vtotal << 16))",
+        "rockvopwrite(#vop_vact,vactiveend | (vactivestart << 16))",
+        "rockvopwrite(#vop_post_hact,hactiveend | (hactivestart << 16))",
+        "rockvopwrite(#vop_post_vact,vactiveend | (vactivestart << 16))",
+        "rockvopwrite(#vop_win0_vir,rock_mode_pitch >> 2)",
     ):
-        require(timing in vop, f"VOP start/end field order drifted: {timing}")
-    require("rockvopfield(#vop_dsp_ctrl1,$000f0000,0)" in vop and
-            "rockvopfield(#vop_dsp_ctrl1,$000f0000,$00080000)" not in vop,
-            "VOP DP clock/pin polarity drifted from the pinned RK3399 path")
+        require(timing in vop_up, f"dynamic VOP timing/stride drifted: {timing}")
+    for token in ("if rock_mode_hsync_positive <> 0 : pinpolarity=pinpolarity | 1",
+                  "if rock_mode_vsync_positive <> 0 : pinpolarity=pinpolarity | 2",
+                  "rockvopfield(#vop_dsp_ctrl1,$000f0000,pinpolarity << 16)"):
+        require(token in vop_up, f"dynamic VOP polarity drifted: {token}")
     cdn = libraries["cdn_dp.pbi"].lower()
-    for timing in (
-        "#cdn_sync_negative = $8000",
-        "rockcdnregwrite(#cdn_framer_sp,3)",
-        "136 | #cdn_sync_negative | (1024 << 16)",
-        "6 | #cdn_sync_negative | (768 << 16)",
-    ):
-        require(timing in cdn,
-                f"Cadence negative-sync encoding drifted: {timing}")
-    require("rockcdnlinkcarries1024x768(linkmhz)" in cdn,
-            "1024x768 link-bandwidth admission check missing")
-    require("requiredmbps.i = (65000 * 24 + 999) / 1000" in cdn and
+    video_mode = cdn.split("procedure.i rockcdnvideomode()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for timing in ("negativeh.i = bool(rock_mode_hsync_positive = 0)",
+                   "negativev.i = bool(rock_mode_vsync_positive = 0)",
+                   "rockcdnregwrite(#cdn_framer_sp,negativeh | (negativev << 1))",
+                   "(rock_mode_hsync_end-rock_mode_hsync_start) | (negativeh << 15)",
+                   "(rock_mode_vsync_end-rock_mode_vsync_start) | (negativev << 15)"):
+        require(timing in video_mode,
+                f"Cadence selected-mode polarity/timing drifted: {timing}")
+    require("rockcdnlinkcarriesmode(linkmhz)" in video_mode,
+            "selected-mode link-bandwidth admission check missing")
+    require("requiredmbps.i = (rock_mode_pixel_hz * 24 + 999999) / 1000000" in cdn and
             "availablembps = linkmhz * rock_cdn_link_lanes * 8" in cdn,
-            "1024x768 link-bandwidth arithmetic drifted")
+            "selected-mode link-bandwidth arithmetic drifted")
     for token in (
         "#cdn_get_last_aux_status = 14", "#cdn_aux_ack = 0",
         "#cdn_aux_nack = 1", "#cdn_aux_defer = 2",
@@ -364,7 +594,7 @@ def source_contract() -> None:
         require(f"if {header} = 0 : procedurereturn 0" in send,
                 f"mailbox header byte is not fail-fast: {header}")
     edid = cdn.split("procedure.i rockcdnreadedidblock", 1)[1].split(
-        "procedure.i rockcdnedidsupports1024x768", 1
+        "procedure.i rockcdnreadedid()", 1
     )[0]
     request_zero = edid.index("pokea(@rock_cdn_message[0],block >> 1)")
     request_one = edid.index("pokea(@rock_cdn_message[0]+1,block & 1)")
@@ -378,6 +608,65 @@ def source_contract() -> None:
             "peeka(@rock_cdn_message[64]+1)" in edid and
             "peeka(@rock_cdn_message[64]+2+index)" in edid,
             "EDID response does not remain disjoint from its request")
+    read_edid = cdn.split("procedure.i rockcdnreadedid()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require("rockmodeselect(@rock_cdn_edid[0])" in read_edid and
+            "rock_cdn_error = 30" in read_edid,
+            "EDID acquisition can bypass fail-closed mode selection")
+    mode = libraries["display_mode.pbi"].lower()
+    for name in ("width", "height", "pixel_hz", "htotal", "hsync_start",
+                 "hsync_end", "vtotal", "vsync_start", "vsync_end",
+                 "hsync_positive", "vsync_positive", "pitch", "source",
+                 "reason", "valid"):
+        require(f"global rock_mode_{name}.i" in mode,
+                f"selected-mode ABI field missing: rock_mode_{name}")
+    for name in ("ref", "fb", "post1", "post2", "dsmpd", "frac", "actual_hz"):
+        require(f"global rock_mode_vpll_{name}.i" in mode,
+                f"selected VPLL plan field missing: rock_mode_vpll_{name}")
+    base_reason = mode.split("procedure.i rockmodeedidbasereason(edid.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("edid=0", "$00", "$ff", "for index=0 to 127",
+                  "if sum<>0", "peeka(edid+18)", "peeka(edid+19)"):
+        require(token in base_reason, f"EDID base-block trust gate missing: {token}")
+    fallback = mode.split("procedure.i rockmodefallback(edid.i,reason.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require("rockmodeedidbasereason(edid)" in fallback and
+            "(peeka(edid+36) & 255) & 8" in fallback and
+            "rockmodecommit(1024,768,65000000,1344,1048,1184,806,771,777,0,0,4096" in fallback,
+            "safe fallback is no longer tied to trusted established 1024x768@60")
+    selector = mode.split("procedure.i rockmodeselect(edid.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("dtd=edid+54", "pixelhz=((peeka(dtd)",
+                  "width=(peeka(dtd+2)", "hblank=(peeka(dtd+3)",
+                  "height=(peeka(dtd+5)", "vblank=(peeka(dtd+6)",
+                  "hoffset=(peeka(dtd+8)", "hwidth=(peeka(dtd+9)",
+                  "voffset=((peeka(dtd+10)", "vwidth=(peeka(dtd+10)",
+                  "(flags & $80)", "(flags & $18)<>$18", "(flags & $61)",
+                  "#rock_mode_reason_h_geometry", "#rock_mode_reason_v_geometry",
+                  "#rock_mode_reason_vop_limit", "#rock_mode_reason_pitch",
+                  "#rock_mode_reason_link_rate", "rockmodecommit(width,height,pixelhz"):
+        require(token in selector, f"preferred-DTD decoder/admission missing: {token}")
+    commit = mode.split("procedure rockmodecommit(", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require(commit.rfind("rock_mode_valid=1") > commit.rfind("rock_mode_reason=reason"),
+            "mode validity is published before the full ABI commit")
+    planner = mode.split("procedure.i rockmodevpllplan(pixelhz.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for pixel_hz in PINNED_VPLL:
+        require(f"case {pixel_hz}" in planner,
+                f"pinned VPLL tuple disappeared: {pixel_hz}")
+    for token in ("if pixelhz=24000000 : procedurereturn 0",
+                  "for postdivider1=1 to 7", "for postdivider2=1 to 7",
+                  "vco>=800000000", "vco<=2000000000",
+                  "rockmodegcd(24", "fraction=(remainder << 24)/divisor",
+                  "pixelhz-actualhz>1", "rockmodevpllpublish("):
+        require(token in planner, f"generic VPLL planner drifted: {token}")
     require("rockdisplaydpcdtelemetry()" in display and
             'rockuarttext("dpe8 dpcd phase ")' in display and
             'rockuarttext(" aux ")' in display,
@@ -564,13 +853,295 @@ def arithmetic_contract() -> None:
             "TU implementation regressed to the kHz/MHz unit defect")
 
 
+def mode_arithmetic_contract() -> None:
+    preferred_dtd = detailed_timing(
+        1920, 1080, 148500, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True,
+    )
+    preferred_edid = base_edid(preferred_dtd)
+    mode, source, reason = select_reference_mode(preferred_edid)
+    require((mode, source, reason) ==
+            (PREFERRED_1080P, "preferred", "preferred"),
+            f"preferred 1080p DTD decoded incorrectly: {mode}, {source}, {reason}")
+
+    # Polarity is semantic, not a synonym for one fixed mode. Exercise all four
+    # separate-sync combinations while retaining the same variable geometry.
+    for hpositive in (False, True):
+        for vpositive in (False, True):
+            candidate = base_edid(detailed_timing(
+                1280, 720, 74250, 370, 110, 40, 30, 5, 5,
+                hsync_positive=hpositive, vsync_positive=vpositive,
+            ))
+            selected, selected_source, selected_reason = select_reference_mode(candidate)
+            require(selected_source == "preferred" and
+                    selected_reason == "preferred" and
+                    selected[9:11] == (int(hpositive), int(vpositive)),
+                    "preferred-mode sync polarity was not preserved")
+            # Cadence encodes negative polarity, while VOP owns positive bits.
+            cdn_h = 0 if hpositive else 0x8000
+            cdn_v = 0 if vpositive else 0x8000
+            vop = (int(hpositive) << 3) | (int(vpositive) << 1)
+            require((bool(cdn_h), bool(cdn_v), vop) ==
+                    (not hpositive, not vpositive,
+                     (int(hpositive) << 3) | (int(vpositive) << 1)),
+                    "VOP/Cadence polarity model drifted")
+
+    malformed = bytearray(preferred_edid)
+    malformed[0] = 1
+    bad_geometry = detailed_timing(
+        1920, 1080, 148500, 100, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True,
+    )
+    oversized = detailed_timing(
+        2564, 1080, 148500, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True,
+    )
+    refused_cases = {
+        "header": bytes(malformed),
+        "checksum": base_edid(preferred_dtd, valid_checksum=False),
+    }
+    for expected_reason, candidate in refused_cases.items():
+        selected, selected_source, selected_reason = select_reference_mode(candidate)
+        require(selected is None and selected_source == "none" and
+                selected_reason == expected_reason,
+                f"untrusted EDID was admitted: {expected_reason} -> "
+                f"{selected_source}, {selected_reason}, {selected}")
+
+    fallback_cases = {
+        "no-preferred-dtd": base_edid(bytes(18), advertise_fallback=True),
+        "interlaced": base_edid(detailed_timing(
+            1920, 1080, 74250, 280, 88, 44, 45, 4, 5,
+            hsync_positive=True, vsync_positive=True, interlaced=True,
+        ), advertise_fallback=True),
+        "non-separate-sync": base_edid(
+            preferred_dtd[:-1] + b"\x00", advertise_fallback=True),
+        "geometry": base_edid(bad_geometry, advertise_fallback=True),
+        "vop-limit": base_edid(oversized, advertise_fallback=True),
+        "vpll-rate": base_edid(detailed_timing(
+            640, 480, 24000, 160, 16, 96, 45, 10, 2,
+            hsync_positive=True, vsync_positive=True,
+        ), advertise_fallback=True),
+    }
+    for expected_reason, candidate in fallback_cases.items():
+        selected, selected_source, selected_reason = select_reference_mode(candidate)
+        require(selected == SAFE_MODE and selected_source == "fallback" and
+                selected_reason == expected_reason,
+                f"invalid preferred DTD did not fail to the safe mode: "
+                f"{expected_reason} -> {selected_source}, {selected_reason}, "
+                f"{selected}")
+
+    no_advertised_fallback = base_edid(oversized)
+    selected, selected_source, selected_reason = select_reference_mode(
+        no_advertised_fallback)
+    require(selected is None and selected_source == "none" and
+            selected_reason == "vop-limit",
+            "unsupported native mode silently succeeded without an advertised fallback")
+
+    padded, padded_source, padded_reason = select_reference_mode(base_edid(
+        detailed_timing(1366, 768, 85500, 426, 70, 143, 30, 3, 3,
+                        hsync_positive=True, vsync_positive=False)))
+    require(padded_source == "preferred" and padded_reason == "preferred" and
+            padded is not None and padded[-1] == 5472,
+            f"non-16-byte native pitch was not safely padded: {padded}")
+
+    require(vpll_reference_plan(65000000) ==
+            (1, 113, 7, 6, 0, 0xC00000, 65000000),
+            "pinned Radxa 65 MHz VPLL tuple drifted")
+    require(vpll_reference_plan(148500000) ==
+            (1, 129, 7, 3, 0, 0xF00000, 148500000),
+            "pinned Radxa 148.5 MHz VPLL tuple drifted")
+    require(vpll_reference_plan(85500000) ==
+            (8, 285, 2, 5, 1, 0, 85500000),
+            "generic integer 85.5 MHz VPLL plan drifted")
+    require(vpll_reference_plan(154000000) ==
+            (2, 77, 1, 6, 1, 0, 154000000),
+            "generic integer 154 MHz VPLL plan drifted")
+    require(vpll_reference_plan(241500000) ==
+            (4, 161, 1, 4, 1, 0, 241500000),
+            "generic integer 241.5 MHz VPLL plan drifted")
+    require(vpll_reference_plan(24000000) is None,
+            "24 MHz fin=fout VPLL negative control was admitted")
+    require(vpll_reference_plan(24010000) ==
+            (1, 35, 5, 7, 0, 244667, 24009999),
+            "24.01 MHz fractional VPLL boundary plan drifted")
+    require(vpll_reference_plan(10000000) is None,
+            "unrepresentable low VPLL rate was admitted")
+
+    def link_carries(pixel_khz: int, link_mhz: int, lanes: int) -> bool:
+        required_mbps = (pixel_khz * 24 + 999) // 1000
+        return required_mbps <= link_mhz * lanes * 8
+
+    require(not link_carries(148500, 162, 2) and
+            link_carries(148500, 270, 2),
+            "1080p link admission can silently accept an undersized 2-lane link")
+    require(link_carries(65000, 162, 2),
+            "safe-mode link admission rejected the baseline 2-lane link")
+
+    def tu_for(pixel_khz: int, link_mhz: int, lanes: int) -> tuple[int, ...] | None:
+        for tu in range(32, 66, 2):
+            scaled = tu * pixel_khz * 24 // (lanes * link_mhz * 8)
+            symbol, remainder = divmod(scaled, 1000)
+            if symbol > 1 and tu - symbol >= 4 and 100 <= remainder <= 850:
+                fifo = ((pixel_khz * (symbol + 1) // 1000) + link_mhz) // \
+                       (lanes * link_mhz)
+                fifo = 8 * (symbol + 1) // 24 - fifo + 2
+                return tu, symbol, remainder, fifo
+        return None
+
+    expected_tu = {
+        (65000, 162, 2): (32, 19, 259, 4),
+        (65000, 270, 2): (32, 11, 555, 5),
+        (148500, 162, 2): None,
+        (148500, 270, 2): (32, 26, 400, 4),
+        (148500, 540, 2): (32, 13, 200, 4),
+    }
+    for inputs, expected in expected_tu.items():
+        require(tu_for(*inputs) == expected,
+                f"variable-mode TU model drifted for {inputs}: {tu_for(*inputs)}")
+
+    require(MAX_FRAMEBUFFER_BYTES == 16384000,
+            "maximum preferred-mode framebuffer size drifted")
+    require(0x02800000 + MAX_FRAMEBUFFER_BYTES + 16 <= 0x04000000,
+            "maximum framebuffer cannot fit in the expanded BSS window")
+    require(0x02800000 < 0x04000000 <= 0x04F00000 < 0x05000000 < 0x05100000,
+            "code/BSS/stack/guard ownership windows overlap")
+
+
+def emitted_mode_contract(compiler: Path, work: Path) -> None:
+    """Execute the real emitted preferred-mode parser in the A64 model."""
+    load = 0x02000040
+    bss = 0x02800000
+    stack = 0x05000000
+    returned = 0x06000000
+    edid_address = 0x07000000
+    fixture = work / "rockpi4c_mode_fixture.rockpi4c"
+    fixture.write_text(
+        '; Desk-only selected-mode fixture. It must never be booted.\n'
+        'XIncludeFile "RockPi4C/Lib/display_mode.pbi"\n\n'
+        'Procedure.i Main()\n'
+        f'  ProcedureReturn RockModeSelect(${edid_address:08X})\n'
+        'EndProcedure\n',
+        encoding="utf-8", newline="\n",
+    )
+    image = work / "rockpi4c_mode_fixture.img"
+    command = [
+        str(compiler), "--compile", str(fixture), "-t", "rockpi4c",
+        "--entry-returns", "--load-addr", hex(load), "--bss-addr", hex(bss),
+        "--stack-addr", hex(stack), "-S", "-s", "-o", str(image),
+    ]
+    run = subprocess.run(
+        command, cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)}, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+    )
+    require(run.returncode == 0 and image.is_file(),
+            "selected-mode fixture compile failed:\n" + run.stdout)
+    symbol_file = Path(str(image) + ".sym")
+    require(symbol_file.is_file(), "selected-mode fixture omitted its symbol map")
+    symbols = {key.lower(): int(value, 0) for key, value in (
+        line.split("=", 1) for line in symbol_file.read_text().splitlines()
+        if "=" in line
+    )}
+    required = ["main", "rockmodeselect", "rockmodecommit", "__bss_start__",
+                "__bss_end__"] + [f"global_rock_mode_{name}" for name in (
+                    "width", "height", "pixel_hz", "htotal", "hsync_start",
+                    "hsync_end", "vtotal", "vsync_start", "vsync_end",
+                    "hsync_positive", "vsync_positive", "pitch", "source",
+                    "reason", "valid")]
+    require(not [name for name in required if name not in symbols],
+            "selected-mode fixture symbols are incomplete")
+
+    interpreter_path = ROOT / "tools/a64/a64_interp.py"
+    spec = importlib.util.spec_from_file_location("rockpi4c_mode_a64", interpreter_path)
+    require(spec is not None and spec.loader is not None,
+            "cannot load the repository A64 interpreter")
+    a64 = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = a64
+    spec.loader.exec_module(a64)
+    blob = image.read_bytes()
+
+    def signed(value: int) -> int:
+        return value - (1 << 64) if value & (1 << 63) else value
+
+    def run_case(edid: bytes) -> tuple[int, tuple[int, ...]]:
+        cpu = a64.A64()
+        for offset, byte in enumerate(blob):
+            cpu.memory[load + offset] = byte
+        for offset, byte in enumerate(edid):
+            cpu.memory[edid_address + offset] = byte
+        a64.attach_symbols(cpu, image, load)
+        cpu.pc = load + symbols["rockmodeselect"]
+        cpu.sp = stack
+        cpu.x[0] = edid_address
+        cpu.x[30] = returned
+        for _ in range(1_000_000):
+            if cpu.pc == returned:
+                break
+            cpu.step()
+        else:
+            raise AssertionError("emitted RockModeSelect did not return")
+        values = []
+        for name in ("width", "height", "pixel_hz", "htotal", "hsync_start",
+                     "hsync_end", "vtotal", "vsync_start", "vsync_end",
+                     "hsync_positive", "vsync_positive", "pitch", "source",
+                     "reason", "valid"):
+            address = symbols[f"global_rock_mode_{name}"]
+            values.append(signed(cpu.load(address, 8)))
+        return signed(cpu.x[0]), tuple(values)
+
+    preferred = base_edid(detailed_timing(
+        1920, 1080, 148500, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True,
+    ))
+    result, values = run_case(preferred)
+    require(result == 1 and values == PREFERRED_1080P + (1, 0, 1),
+            f"emitted parser misdecoded preferred 1080p: {result}, {values}")
+
+    padded = base_edid(detailed_timing(
+        1366, 768, 85500, 426, 70, 143, 30, 3, 3,
+        hsync_positive=True, vsync_positive=False,
+    ))
+    result, values = run_case(padded)
+    expected_padded = (1366, 768, 85500000, 1792, 1436, 1579,
+                       798, 771, 774, 1, 0, 5472, 1, 0, 1)
+    require(result == 1 and values == expected_padded,
+            f"emitted parser lost padded-pitch mode: {result}, {values}")
+
+    no_dtd = base_edid(bytes(18), advertise_fallback=True)
+    result, values = run_case(no_dtd)
+    require(result == 1 and values == SAFE_MODE + (0, 5, 1),
+            f"emitted parser lost advertised fallback: {result}, {values}")
+
+    interlaced = base_edid(detailed_timing(
+        1920, 1080, 74250, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True, interlaced=True,
+    ), advertise_fallback=True)
+    result, values = run_case(interlaced)
+    require(result == 1 and values == SAFE_MODE + (0, 6, 1),
+            f"emitted parser did not reject interlace: {result}, {values}")
+
+    malformed = base_edid(preferred[54:72], valid_checksum=False)
+    result, values = run_case(malformed)
+    require(result == 0 and values[-3:] == (-1, 3, 0),
+            f"emitted parser admitted malformed EDID: {result}, {values}")
+
+    over_link = base_edid(detailed_timing(
+        1920, 1080, 594000, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True,
+    ))
+    result, values = run_case(over_link)
+    require(result == 0 and values[-3:] == (-1, 14, 0),
+            f"emitted parser silently admitted an unsupported native mode: "
+            f"{result}, {values}")
+
+
 def compiler_contract(compiler: Path) -> tuple[int, str]:
     with tempfile.TemporaryDirectory(prefix="anvil-rockpi4c-display-") as temp_name:
+        emitted_mode_contract(compiler, Path(temp_name))
         output = Path(temp_name) / "display.img"
         command = [
             str(compiler), "--compile", "RockPi4C/Board/board.rockpi4c",
             "-t", "rockpi4c", "--load-addr", "0x02000040",
-            "--bss-addr", "0x02800000", "--stack-addr", "0x03000000",
+            "--bss-addr", "0x02800000", "--stack-addr", "0x05000000",
             "--jobs", "auto", "-S", "-o", str(output),
         ]
         run = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
@@ -596,9 +1167,15 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                       "rockdisplaygrftelemetry:",
                       "rockdisplaysubsystemtelemetry:",
                       "rockcdnmailboxwitnessreset:",
+                      "rockmodeselect:",
+                      "rockmodecommit:",
                       "rockcrupllrate:",
                       "rockcruceilingdivider:",
-                      "rockcruvpll65:"):
+                      "rockcruvpllmode:",
+                      "rockvopmodevalid:",
+                      "rockvopupmode:",
+                      "rockcdnlinkcarriesmode:",
+                      "rockcdnvideomode:"):
             require(label in asm, f"emitted silicon witness is missing: {label}")
         display_up_asm = asm.split("rockdisplayup:", 1)[1].split(
             "rockdisplaybuffer:", 1
@@ -610,7 +1187,7 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         positions = [display_up_asm.index(call) for call in emitted_witnesses]
         require(positions == sorted(positions),
                 "emitted stage-local silicon witness order drifted")
-        require(display_up_asm.count("bl rockdisplaysubsystemtelemetry") == 13,
+        require(display_up_asm.count("bl rockdisplaysubsystemtelemetry") == 15,
                 "emitted subsystem error witnesses are incomplete")
         require("global_rock_cru_dp_core_rate" in display_up_asm,
                 "emitted Cadence setup lost the live core-clock handoff")
@@ -661,9 +1238,8 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                 tcphy_resets[0] < common < pll < tcphy_resets[1] < waits[0] <
                 tcphy_resets[2] < waits[1] < calibrate < power_state,
                 "emitted TCPHY config/reset/readiness order drifted")
-        video_asm = asm.split("rockcdnvideo1024x768:", 1)[1].split(
-            "rockcdnvideostatus:", 1
-        )[0]
+        video_asm = asm.split("rockcdnvideomode:", 1)[1].split(
+            "rock_dptx_firmware:", 1)[0]
         reg_writes = [match.start() for match in re.finditer(
             r"\bbl\s+rockcdnregwrite\b", video_asm
         )]
@@ -682,8 +1258,7 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
             require(re.search(r"\bret\b", send_asm[first:second]) is not None,
                     "emitted mailbox header failure can reach its next byte")
         edid_asm = asm.split("rockcdnreadedidblock:", 1)[1].split(
-            "rockcdnedidsupports1024x768:", 1
-        )[0]
+            "rockcdnreadedid:", 1)[0]
         edid_send_call = edid_asm.index("bl rockcdnsend")
         edid_receive_call = edid_asm.index("bl rockcdnreceive")
         require(re.search(r"\bret\b", edid_asm[edid_send_call:edid_receive_call]) is not None,
@@ -696,7 +1271,8 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                        "$ffff00ff", "$ffff0000", "$ff0000ff", "$ff101010",
                        "$ff40ff40"):
             require(colour in vop, f"first-frame colour missing: {colour}")
-        first_frame = asm.split("rockvopfirstframe:", 1)[1].split("rockvopup1024x768:", 1)[0]
+        first_frame = asm.split("rockvopfirstframe:", 1)[1].split(
+            "rockvopmodevalid:", 1)[0]
         require("str w" in first_frame and "rockvoptext" in first_frame,
                 "emitted first-frame renderer lacks pixel stores or text")
         require("ldr x" not in "\n".join(line for line in asm.splitlines()
@@ -711,16 +1287,19 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         bss_end = int(values["__bss_end__"])
         framebuffer_storage = int(values["global_rock_vop_framebuffer"])
         framebuffer = (framebuffer_storage + 15) & ~15
-        require(bss_start == 0x02800000 and bss_end <= 0x02C00000,
+        require(bss_start == 0x02800000 and bss_end <= 0x04000000,
                 f"display BSS escaped its owned window: {bss_start:#x}..{bss_end:#x}")
-        require(framebuffer % 16 == 0 and framebuffer + 1024 * 768 * 4 <= bss_end,
+        require(framebuffer % 16 == 0 and
+                framebuffer + MAX_FRAMEBUFFER_BYTES <= bss_end,
                 f"framebuffer is misaligned or not fully allocated: "
-                f"buffer={framebuffer:#x}, end={framebuffer + 1024 * 768 * 4:#x}, "
+                f"buffer={framebuffer:#x}, "
+                f"end={framebuffer + MAX_FRAMEBUFFER_BYTES:#x}, "
                 f"bss_end={bss_end:#x}")
         storage_size = sizes.get("global_rock_vop_framebuffer")
-        require(storage_size == 1024 * 768 * 4 + 16,
+        require(storage_size == MAX_FRAMEBUFFER_BYTES + 16,
                 "framebuffer storage lacks exactly one alignment unit of slack")
-        require(framebuffer + 1024 * 768 * 4 <= framebuffer_storage + storage_size,
+        require(framebuffer + MAX_FRAMEBUFFER_BYTES <=
+                framebuffer_storage + storage_size,
                 "aligned framebuffer escaped its backing object")
         return output.stat().st_size, hashlib.sha256(output.read_bytes()).hexdigest().upper()
 
@@ -732,11 +1311,12 @@ def main() -> int:
     source_contract()
     firmware_contract()
     arithmetic_contract()
+    mode_arithmetic_contract()
     if args.compiler:
         size, digest = compiler_contract(args.compiler.resolve())
         print(f"emitted image: {size} bytes, SHA-256 {digest}")
     print("ROCK Pi 4C MiniDP desk gate: PASS")
-    print("silicon: NOT RUN; next witness is numbered UART stages then 1024x768 bars/text")
+    print("silicon: NOT RUN; next witness is numbered UART stages then selected-mode bars/text")
     return 0
 
 

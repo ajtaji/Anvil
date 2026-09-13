@@ -327,6 +327,9 @@ Procedure.i RockDisplayUp()
   EndIf
   If RockCdnReadEdid()=0
     RockDisplaySubsystemTelemetry("DPE9 CDN ERR ",rock_cdn_error)
+    If rock_cdn_error = 30
+      RockDisplaySubsystemTelemetry("DPE9 MODE REJECTION REASON ",rock_mode_reason)
+    EndIf
     ProcedureReturn RockDisplayFail(9,"DPE9 INVALID EDID OR NO SUPPORTED MODE")
   EndIf
   RockDisplayModeTelemetry("DP05 EDID MODE ")
