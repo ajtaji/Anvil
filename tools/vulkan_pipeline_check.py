@@ -376,6 +376,14 @@ def grade(cpu, rc) -> Grader:
         return g
 
     g.need("the test backend reports a draw capability", slot(38), 1)
+    g.need("a transfer-only image remains valid", slot(151), 0)
+    g.need("a view of that transfer-only image remains valid", slot(152), 0)
+    g.need("a transfer-only image is refused as a framebuffer colour attachment",
+           slot(153), ERR_ARGS)
+    attachment_usage_text = cstr(cpu, u64(cpu, base + 154 * 8))
+    g.want_true("the framebuffer refusal names COLOR_ATTACHMENT as the missing usage",
+                "VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT" in attachment_usage_text,
+                repr(attachment_usage_text[:170]))
     g.need("the image is the size its pitch and height say",
            slot(4), slot(5) * H)
     g.want_true("the image pitch covers a row", slot(5) >= W * 4, str(slot(5)))
@@ -857,6 +865,7 @@ MUTANTS = (
 
 COMMAND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_command.pbi"
 DESCRIPTOR = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_descriptor.pbi"
+MEMORY = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_memory.pbi"
 
 COMMAND_MUTANTS = (
     ("a command buffer may end inside a render pass",
@@ -868,6 +877,12 @@ COMMAND_MUTANTS = (
 )
 
 PIPELINE_MUTANTS = (
+    ("a transfer-only image is accepted as a framebuffer colour attachment",
+     "  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkCreateFramebuffer was given",
+     "  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = -1\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkCreateFramebuffer was given"),
+    ("a render pass requires TRANSFER_DST instead of COLOR_ATTACHMENT",
+     "  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = 0\n    avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdBeginRenderPass reached",
+     "  If (avkImgUsage[img] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0\n    avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdBeginRenderPass reached"),
     ("a draw may name vertices past the end of its buffer",
      "    If stride <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]) < need\n",
      "    If stride <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]) < 0\n"),
@@ -977,6 +992,13 @@ DESCRIPTOR_MUTANTS = (
 )
 
 
+MEMORY_MUTANTS = (
+    ("COLOR_ATTACHMENT image creation is refused",
+     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0\n",
+     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT))) <> 0 Or usage = 0\n"),
+)
+
+
 # The 2026-09-12 full run exposed six older mutants whose request reached a
 # later rule returning the same code. Keep them as a named focused batch: it
 # makes their repair gate minutes rather than half an hour, while plain
@@ -990,6 +1012,12 @@ VALIDATION_TRUTH_MUTANTS = frozenset({
     "a uniform buffer may sit at any offset",
 })
 
+IMAGE_USAGE_TRUTH_MUTANTS = frozenset({
+    "COLOR_ATTACHMENT image creation is refused",
+    "a transfer-only image is accepted as a framebuffer colour attachment",
+    "a render pass requires TRANSFER_DST instead of COLOR_ATTACHMENT",
+})
+
 
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
@@ -1001,7 +1029,7 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    parser.add_argument("--mutate-only", choices=("validation-truth",))
+    parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage"))
     args = parser.parse_args()
     if args.mutate_only:
         args.mutate = True
@@ -1051,10 +1079,13 @@ def main() -> int:
     missed = 0
     for path, mutants in ((EMITTER, MUTANTS), (PIPELINE, PIPELINE_MUTANTS),
                           (COMMAND, COMMAND_MUTANTS),
-                          (DESCRIPTOR, DESCRIPTOR_MUTANTS)):
+                          (DESCRIPTOR, DESCRIPTOR_MUTANTS),
+                          (MEMORY, MEMORY_MUTANTS)):
         original = path.read_text(encoding="utf-8")
         for name, fixed, broken in mutants:
             if args.mutate_only == "validation-truth" and name not in VALIDATION_TRUTH_MUTANTS:
+                continue
+            if args.mutate_only == "image-usage" and name not in IMAGE_USAGE_TRUTH_MUTANTS:
                 continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
@@ -1077,9 +1108,11 @@ def main() -> int:
 
     if args.mutate_only == "validation-truth":
         total = len(VALIDATION_TRUTH_MUTANTS)
+    elif args.mutate_only == "image-usage":
+        total = len(IMAGE_USAGE_TRUTH_MUTANTS)
     else:
         total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
-                 + len(DESCRIPTOR_MUTANTS))
+                 + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS))
     print()
     if missed:
         print(f"vulkan_pipeline_check: {missed} of {total} mutations were not caught")

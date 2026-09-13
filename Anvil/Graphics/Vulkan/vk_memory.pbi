@@ -17,7 +17,8 @@
 ; WHAT THIS SLICE IMPLEMENTS is exactly one image shape:
 ;   VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TILING_LINEAR,
 ;   one mip level, one array layer, VK_SAMPLE_COUNT_1_BIT,
-;   VK_SHARING_MODE_EXCLUSIVE, usage within TRANSFER_SRC | TRANSFER_DST.
+;   VK_SHARING_MODE_EXCLUSIVE, usage within TRANSFER_SRC | TRANSFER_DST |
+;   COLOR_ATTACHMENT.
 ; Everything else is refused with a real error code and a whole sentence.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
@@ -345,8 +346,8 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an extent outside this device's limits (Anvil code -20001, invalid argument); width and height must be at least one and no more than maxImageDimension2D, which vkGetPhysicalDeviceProperties reports.")
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT))) <> 0 Or usage = 0
-    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImage was asked for an image usage Anvil does not implement (Anvil code -20005, unsupported); only VK_IMAGE_USAGE_TRANSFER_SRC_BIT and VK_IMAGE_USAGE_TRANSFER_DST_BIT exist here, because there is no sampler, no storage image and no attachment path yet.")
+  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImage was asked for an image usage Anvil does not implement (Anvil code -20005, unsupported usage); use VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT or VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT. Sampler, storage-image and input-attachment usages are not implemented.")
     ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
   EndIf
   If initialLayout <> #VK_IMAGE_LAYOUT_UNDEFINED And initialLayout <> #VK_IMAGE_LAYOUT_PREINITIALIZED

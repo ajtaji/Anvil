@@ -165,6 +165,7 @@ Procedure.i Main()
   Define fbci.VkFramebufferCreateInfo
   Define bufci.VkBufferCreateInfo
   Define img2.i
+  Define view2.i
   Define mem2.i
   Define bar.VkImageMemoryBarrier
   Define pbargs.AnvilVkPipelineBarrierArgs
@@ -272,7 +273,10 @@ Procedure.i Main()
   imgci\arrayLayers = 1
   imgci\samples = #VK_SAMPLE_COUNT_1_BIT
   imgci\tiling = #VK_IMAGE_TILING_LINEAR
-  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  ; Rendering permission comes from COLOR_ATTACHMENT. TRANSFER_SRC is
+  ; present because the completed diagnostic image is copied to the
+  ; display after the render pass; TRANSFER_DST is deliberately absent.
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
   imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
   imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
   If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS
@@ -344,6 +348,27 @@ Procedure.i Main()
   fbci\width = #PG_W
   fbci\height = #PG_H
   fbci\layers = 1
+
+  ; A transfer destination remains a valid image, but it is not a render
+  ; target. Its view must therefore be refused at the framebuffer boundary,
+  ; by the COLOR_ATTACHMENT usage rule and not by an unrelated image rule.
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  pgPut(151, vkCreateImage(dev, @imgci, 0, @img2))
+  ivci\image = img2
+  pgPut(152, vkCreateImageView(dev, @ivci, 0, @view2))
+  fbci\pAttachments = @view2
+  AnvilVkFaultClear()
+  pgPut(153, vkCreateFramebuffer(dev, @fbci, 0, @bad))
+  pgPut(154, AnvilVkFaultText())
+  vkDestroyFramebuffer(dev, bad, 0)
+  vkDestroyImageView(dev, view2, 0)
+  vkDestroyImage(dev, img2, 0)
+  img2 = #VK_NULL_HANDLE
+  view2 = #VK_NULL_HANDLE
+  ivci\image = img
+  fbci\pAttachments = @view
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+
   If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS
     ProcedureReturn pgStop(11)
   EndIf
@@ -1236,6 +1261,7 @@ Procedure.i Main()
   ;  the render pass each claim a layout, and on one image the earlier
   ;  layout rule would answer first and prove the wrong thing.
   ; ------------------------------------------------------------------
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
   If vkCreateImage(dev, @imgci, 0, @img2) = #VK_SUCCESS
     vkGetImageMemoryRequirements(dev, img2, @req)
     mai\allocationSize = req\size

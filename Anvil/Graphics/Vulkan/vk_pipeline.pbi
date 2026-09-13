@@ -692,6 +692,9 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   If width <> avkImgW[img] Or height <> avkImgH[img]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateFramebuffer was given a width or height that is not the attachment image's own extent (Anvil code -20001, framebuffer does not match its attachment); a smaller framebuffer over a larger image would render into part of it, and this backend renders the whole render target at one geometry.")
   EndIf
+  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateFramebuffer was given an attachment image that was not created with VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT (Anvil code -20001, missing usage); rendering through a framebuffer writes a colour attachment, while transfer usages authorize only transfer commands.")
+  EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_FRAMEBUFFERS And avkFbLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_FRAMEBUFFERS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
@@ -1428,8 +1431,8 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBeginRenderPass was given a framebuffer whose attachment image has no memory bound to it (Anvil code -20004, image not bound); call vkBindImageMemory before recording a render pass against it.")
     ProcedureReturn
   EndIf
-  If (avkImgUsage[img] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given an attachment image that was not created with VK_IMAGE_USAGE_TRANSFER_DST_BIT (Anvil code -20001, missing usage); this slice has no separate colour-attachment usage bit path, so the render target must name the transfer destination usage the image engine implements.")
+  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass reached an attachment image that was not created with VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT (Anvil code -20001, missing usage); framebuffer creation normally owns this refusal, and transfer usage cannot authorize rendering.")
     ProcedureReturn
   EndIf
   k = avkCbRef(c, avkIvImage[iv], img)
