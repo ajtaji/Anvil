@@ -109,6 +109,9 @@ Procedure RockDisplayScanoutTelemetry()
   RockDisplayHexLong(RockCruRead($CC))
   RockUartText(" DCLK ")
   RockDisplayHexLong(RockCruRead(#ROCK_CRU_CLKSEL+$C8))
+  RockUartText(" CDN TU/SP ")
+  RockDisplayHexLong(PeekL(#ROCK_CDN_DP+#CDN_FRAMER_TU) & $FFFFFFFF) : RockUartByte(32)
+  RockDisplayHexLong(PeekL(#ROCK_CDN_DP+#CDN_FRAMER_SP) & $FFFFFFFF)
   RockUartText(" WIN0 ")
   RockDisplayHexLong(RockVopRead(#VOP_WIN0_CTRL0))
   RockUartText(" HTOTAL ")
@@ -116,6 +119,55 @@ Procedure RockDisplayScanoutTelemetry()
   RockUartText(" VTOTAL ")
   RockDisplayHexLong(RockVopRead(#VOP_VTOTAL))
   RockUartByte(13) : RockUartByte(10)
+  RockUartText("VOP CTRL ")
+  RockDisplayHexLong(RockVopRead(#VOP_SYS_CTRL)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_DSP_CTRL0)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_DSP_CTRL1))
+  RockUartText(" WIN ")
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_CTRL1)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_VIR)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_YRGB_MST)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_SCL_FACTOR))
+  RockUartText(" POST ")
+  RockDisplayHexLong(RockVopRead(#VOP_POST_SCL_FACTOR)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_POST_SCL_CTRL))
+  RockUartByte(13) : RockUartByte(10)
+EndProcedure
+
+Procedure RockDisplayFrameTelemetry()
+  Protected start.i
+  Protected now.i
+  Protected deadline.i
+  Protected raw.i
+  Protected faults.i
+  Protected frames.i
+  Protected hz.i
+  Protected attempts.i
+  ; Pinned RK3399 VOPL RAW_STATUS0 latches frame-start and underrun causes.
+  ; Clear uses the VOP write-mask convention: mask in the high half and the
+  ; same asserted bits in the low half. CPU interrupts remain disabled.
+  RockVopWrite(#VOP_INTR_CLEAR0,$08610861)
+  start=RockTimerTicks()
+  deadline=start+(rock_timer_frequency/2)
+  For attempts=0 To 9999999
+    raw=RockVopRead(#VOP_INTR_RAW_STATUS0)
+    faults=faults | (raw & (#VOP_INTR_BUS_ERROR | #VOP_INTR_WIN0_EMPTY | #VOP_INTR_POST_EMPTY))
+    If (raw & #VOP_INTR_FS) <> 0
+      frames=frames+1
+      RockVopWrite(#VOP_INTR_CLEAR0,$00010001)
+      If frames=8 : Break : EndIf
+    EndIf
+    now=RockTimerTicks()
+    If now < start Or now >= deadline : Break : EndIf
+  Next
+  now=RockTimerTicks()
+  If frames > 0 And now > start
+    hz=(frames*rock_timer_frequency)/(now-start)
+  EndIf
+  RockUartText("VOP ACTIVITY FRAMES ") : RockDisplayDecimal(frames)
+  RockUartText(" HZ ") : RockDisplayDecimal(hz)
+  RockUartText(" RAW/FAULT ") : RockDisplayHexLong(raw) : RockUartByte(32)
+  RockDisplayHexLong(faults) : RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
 Procedure RockDisplaySubsystemTelemetry(text.i, error.i)
@@ -408,6 +460,7 @@ Procedure.i RockDisplayUp()
     RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
   EndIf
+  RockDisplayFrameTelemetry()
   rock_display_width=rock_mode_width
   rock_display_height=rock_mode_height
   rock_display_pitch=rock_mode_pitch
