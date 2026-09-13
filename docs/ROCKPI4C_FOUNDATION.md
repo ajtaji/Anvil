@@ -1,8 +1,9 @@
 # Original ROCK Pi 4C v1.2 foundation
 
 Status: build 39 reached MiniDP first light on hardware on September 13, 2026.
-The physical monitor displayed the framebuffer. Preferred-mode selection is
-the next implementation; its hardware proof is separate from that fixed-mode run.
+The physical monitor displayed the framebuffer. Build 44 subsequently read
+1920x1080 at 148.5 MHz as the attached monitor's preferred timing and reached
+valid video without fallback. Final visual fit is awaiting confirmation.
 
 ## Identity and ownership
 
