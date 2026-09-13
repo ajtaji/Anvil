@@ -75,6 +75,20 @@ def source_contract() -> None:
         "rockvopwrite(#vop_post_vact,803 | (35 << 16))",
     ):
         require(timing in vop, f"VOP start/end field order drifted: {timing}")
+    cdn = libraries["cdn_dp.pbi"].lower()
+    for timing in (
+        "#cdn_sync_negative = $8000",
+        "rockcdnregwrite(#cdn_framer_sp,3)",
+        "136 | #cdn_sync_negative | (1024 << 16)",
+        "6 | #cdn_sync_negative | (768 << 16)",
+    ):
+        require(timing in cdn,
+                f"Cadence negative-sync encoding drifted: {timing}")
+    require("rockcdnlinkcarries1024x768(linkmhz)" in cdn,
+            "1024x768 link-bandwidth admission check missing")
+    require("requiredmbps.i = (65000 * 24 + 999) / 1000" in cdn and
+            "availablembps = linkmhz * rock_cdn_link_lanes * 8" in cdn,
+            "1024x768 link-bandwidth arithmetic drifted")
 
 
 def firmware_contract() -> None:
@@ -93,6 +107,12 @@ def firmware_contract() -> None:
 
 
 def arithmetic_contract() -> None:
+    required_mbps = (65000 * 24 + 999) // 1000
+    for rate_mhz in (162, 270, 540):
+        for lanes in (1, 2):
+            carries = required_mbps <= rate_mhz * lanes * 8
+            require(carries == ((rate_mhz, lanes) != (162, 1)),
+                    f"1024x768 bandwidth admission drift for {rate_mhz} MHz/{lanes} lanes")
     expected = {(162, 2): (32, 19, 259, 4),
                 (270, 2): (32, 11, 555, 5),
                 (540, 2): (32, 5, 777, 4)}
