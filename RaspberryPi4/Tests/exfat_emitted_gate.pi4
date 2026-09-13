@@ -153,8 +153,8 @@ Procedure GateFormat()
     exfat_Put64(@gateDisk[0] + off, 64, 1)
     exfat_Put64(@gateDisk[0] + off, 72, 2048)
     exfat_Put32(@gateDisk[0] + off, 80, 24)
-    exfat_Put32(@gateDisk[0] + off, 84, 1)
-    exfat_Put32(@gateDisk[0] + off, 88, 25)
+    exfat_Put32(@gateDisk[0] + off, 84, 2)
+    exfat_Put32(@gateDisk[0] + off, 88, 26)
     exfat_Put32(@gateDisk[0] + off, 92, 128)
     exfat_Put32(@gateDisk[0] + off, 96, 4)
     exfat_Put32(@gateDisk[0] + off, 100, $12345678)
@@ -173,12 +173,12 @@ Procedure GateFormat()
   exfat_Put32(@gateDisk[0] + off, 4 * 4, $FFFFFFFF)
 
   ; Allocation bitmap in cluster 2: clusters 2, 3 and 4 are allocated.
-  off = (base + 25) * 512
+  off = (base + 26) * 512
   gateDisk[off] = 7
 
   ; Compact up-case table in cluster 3. ASCII lower-case maps to upper-case;
   ; all other UTF-16 code units are identity-mapped with the compressed run.
-  off = (base + 26) * 512
+  off = (base + 27) * 512
   cp = 0
   While cp < 97
     exfat_Put16(@gateDisk[0] + off, cp * 2, cp)
@@ -199,7 +199,7 @@ Procedure GateFormat()
   Wend
 
   ; Root directory in cluster 4: allocation bitmap, up-case table, end.
-  root = (base + 27) * 512
+  root = (base + 28) * 512
   gateDisk[root] = $81
   gateDisk[root + 1] = 0
   exfat_Put32(@gateDisk[0] + root, 20, 2)
@@ -243,7 +243,9 @@ Procedure.i Main()
   ; A read-only mount and unmount never mark the volume or call a writer.
   ExFatSetBlockWriter(0)
   ExFatSetBlockFlusher(0)
-  If ExFatMount(1) = 0 Or ExFatUnmount() = 0 Or gateWrites <> 0 : ProcedureReturn 29 : EndIf
+  If ExFatMount(1) = 0 : ProcedureReturn 2900 + ExFatLastError() : EndIf
+  If ExFatUnmount() = 0 : ProcedureReturn 2950 + ExFatLastError() : EndIf
+  If gateWrites <> 0 : ProcedureReturn 2999 : EndIf
   ; A volume inherited dirty remains readable, but mutation is refused and
   ; Anvil never clears somebody else's dirty state.
   exfat_Put16(@gateDisk[0] + 1 * 512, 106, 2)
@@ -302,13 +304,16 @@ Procedure.i Main()
   ExFatClose()
   If ExFatDirOpen(?nameSub) = 0 : ProcedureReturn 18 : EndIf
   seen = 0
-  While ExFatDirNext() > 0
+  n = ExFatDirNext()
+  While n > 0
     n = ExFatDirNameUtf8(@gateName[0], 1024)
     If n > 0
       seen = seen + 1
     EndIf
+    n = ExFatDirNext()
   Wend
-  If seen <> 5 : ProcedureReturn 19 : EndIf
+  If n < 0 : ProcedureReturn 2000 + seen * 100 + ExFatLastError() : EndIf
+  If seen <> 5 : ProcedureReturn 1900 + seen : EndIf
   If ExFatRemove(?nameGrow1) = 0 : ProcedureReturn 42 : EndIf
   If ExFatRemove(?nameGrow2) = 0 : ProcedureReturn 43 : EndIf
   If ExFatRemove(?nameGrow3) = 0 : ProcedureReturn 44 : EndIf
