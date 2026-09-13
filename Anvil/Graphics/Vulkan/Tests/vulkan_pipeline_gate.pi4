@@ -129,6 +129,7 @@ Procedure.i Main()
   Define dsl2.i
   Define dpool.i
   Define dset.i
+  Define dset2.i
   Define layU.i
   Define layV.i
   Define bufP.i
@@ -189,6 +190,7 @@ Procedure.i Main()
   Define dslArray.i
   Define dsl2Array.i
   Define dsetArray.i
+  Define dset2Array.i
   Define vi.VkPipelineVertexInputStateCreateInfo
   Define ia.VkPipelineInputAssemblyStateCreateInfo
   Define vpstate.VkPipelineViewportStateCreateInfo
@@ -426,7 +428,11 @@ Procedure.i Main()
   ; The uniform buffer a descriptor points into. Its four words are the
   ; colour a fragment shader will read through set 0, binding 0, and the
   ; checker knows them.
-  bufci\size = 16
+  ; Thirty-two bytes make offset four remain in range, so the hostile
+  ; descriptor write below can be refused ONLY for its alignment. With
+  ; a sixteen-byte buffer the range check returned the same error code
+  ; after an alignment mutant and the gate falsely looked green.
+  bufci\size = 32
   bufci\usage = #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
   If vkCreateBuffer(dev, @bufci, 0, @bufU) <> #VK_SUCCESS
     ProcedureReturn pgStop(71)
@@ -711,8 +717,20 @@ Procedure.i Main()
   attrs[1]\offset = 0
   ; Two bindings numbered the same.
   binds[1]\binding = 0
+  AnvilVkFaultClear()
   pgPut(80, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(141, AnvilVkFaultText())
   binds[1]\binding = 1
+  ; A binding NUMBER outside the declared count. Attribute one names the
+  ; same number so every later interface check would otherwise agree;
+  ; only the binding-number rule may answer this request.
+  binds[1]\binding = 2
+  attrs[1]\binding = 2
+  AnvilVkFaultClear()
+  pgPut(142, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(143, AnvilVkFaultText())
+  binds[1]\binding = 1
+  attrs[1]\binding = 1
   ; A stride that is not a whole number of components.
   binds[1]\stride = 14
   pgPut(81, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
@@ -810,9 +828,12 @@ Procedure.i Main()
   pgPut(137, vkCreateDescriptorSetLayout(dev, @dslci2, 0, @dsl2))
 
   dps\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-  dps\descriptorCount = 1
+  ; One descriptor for dset and two for dset2. The second set has the
+  ; two-binding shape of dsl2 and makes a wrong PIPELINE-layout bind
+  ; reachable independently of the wrong SET-layout bind.
+  dps\descriptorCount = 3
   dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
-  dpci\maxSets = 1
+  dpci\maxSets = 2
   dpci\poolSizeCount = 1
   dpci\pPoolSizes = @dps
   pgPut(116, vkCreateDescriptorPool(dev, @dpci, 0, @dpool))
@@ -822,6 +843,10 @@ Procedure.i Main()
   dsai\descriptorSetCount = 1
   dsai\pSetLayouts = @dslArray
   pgPut(117, vkAllocateDescriptorSets(dev, @dsai, @dset))
+  dsl2Array = dsl2
+  dsai\pSetLayouts = @dsl2Array
+  pgPut(150, vkAllocateDescriptorSets(dev, @dsai, @dset2))
+  dsai\pSetLayouts = @dslArray
   dbi\buffer = bufU
   dbi\offset = 0
   dbi\range = 16
@@ -853,6 +878,7 @@ Procedure.i Main()
   AnvilVkFaultClear()
   vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
   pgPut(130, AnvilVkFaultCode())
+  pgPut(149, AnvilVkFaultText())
   dbi\offset = 0
   dbi\range = 8                          ; shorter than the block
   AnvilVkFaultClear()
@@ -1161,6 +1187,24 @@ Procedure.i Main()
   vkCmdDraw(cmd, 3, 1, 0, 0)
   vkCmdEndRenderPass(cmd)
   pgPut(139, vkEndCommandBuffer(cmd))
+  pgPut(146, AnvilVkCommandBufferFailureText(cmd))
+
+  ; A set whose OWN shape matches layV, bound successfully through layV,
+  ; then used with pipeD, which was created through layU. This reaches
+  ; the draw-time pipeline-layout agreement and no earlier set-layout
+  ; rule. The dset2 binding need not be written: layout mismatch is
+  ; checked before descriptor contents.
+  dset2Array = dset2
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeD)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @twoBufs[0], @twoOffsets[0])
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layV, 0, 1, @dset2Array, 0, 0)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(147, vkEndCommandBuffer(cmd))
+  pgPut(148, AnvilVkCommandBufferFailureText(cmd))
 
   ; And the draw that is right.
   vkResetCommandBuffer(cmd, 0)
@@ -1177,6 +1221,11 @@ Procedure.i Main()
   vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000)
   pgPut(121, AnvilVkTestBackendLastUniformBase())
   pgPut(122, AnvilVkTestBackendLastUniformBytes())
+  ; Pipeline C used binding one immediately before pipeline D. These
+  ; fields must be zero now: keeping the previous draw's unused binding
+  ; would retain and expose stale state through the backend record.
+  pgPut(144, AnvilVkTestBackendLastVertexBase(1))
+  pgPut(145, AnvilVkTestBackendLastStride(1))
   pgPut(68, AnvilVkTestBackendDraws())
 
   ; ------------------------------------------------------------------

@@ -615,6 +615,17 @@ def grade(cpu, rc) -> Grader:
     g.want_true("that refusal says the binding is unused",
                 "unused binding" in unused_text, repr(unused_text[:140]))
     g.need("two bindings with the same number are refused", slot(80), ERR_ARGS)
+    duplicate_text = cstr(cpu, u64(cpu, base + 141 * 8))
+    g.want_true("the duplicate-binding refusal is the owning rule, not a later "
+                "unused-binding refusal",
+                "same binding number" in duplicate_text,
+                repr(duplicate_text[:150]))
+    g.need("a binding number outside the pipeline's binding count is refused",
+           slot(142), ERR_UNSUPPORTED)
+    binding_number_text = cstr(cpu, u64(cpu, base + 143 * 8))
+    g.want_true("the out-of-range binding-number refusal names the binding count",
+                "number is not less than the binding count" in binding_number_text,
+                repr(binding_number_text[:150]))
     g.need("a binding stride that is not a whole number of components is "
            "refused", slot(81), ERR_ARGS)
     g.need("an attribute past the end of ITS OWN binding's stride is refused",
@@ -651,6 +662,8 @@ def grade(cpu, rc) -> Grader:
     g.need("[D] the descriptor set layout was created", slot(115), 0)
     g.need("[D] the descriptor pool was created", slot(116), 0)
     g.need("[D] one descriptor set was allocated", slot(117), 0)
+    g.need("[D] a set of the second layout's two-binding shape was allocated",
+           slot(150), 0)
     g.need("[D] the write raised no fault", slot(118), 0)
     g.need("[D] a descriptor copy is refused", slot(70), ERR_UNSUPPORTED)
     uniform_base = slot(69)
@@ -740,6 +753,10 @@ def grade(cpu, rc) -> Grader:
            slot(129), ERR_ARGS)
     g.need("a uniform offset that is not a multiple of sixteen is refused",
            slot(130), ERR_ARGS)
+    offset_text = cstr(cpu, u64(cpu, base + 149 * 8))
+    g.want_true("the offset refusal is specifically the sixteen-byte alignment rule",
+                "not a multiple of sixteen" in offset_text,
+                repr(offset_text[:150]))
     g.need("a range shorter than the sixteen-byte block is refused",
            slot(131), ERR_ARGS)
     g.need("a write at a binding the set layout has not got is refused",
@@ -756,6 +773,21 @@ def grade(cpu, rc) -> Grader:
                 repr(nolayout_text[:140]))
     g.need("a set bound through a layout declaring a set of a different shape "
            "is refused", slot(139), ERR_ARGS)
+    shape_text = cstr(cpu, u64(cpu, base + 146 * 8))
+    g.want_true("the wrong-shape refusal is owned by descriptor-set layout "
+                "compatibility",
+                "allocated from a different VkDescriptorSetLayout" in shape_text,
+                repr(shape_text[:170]))
+    g.need("a correctly shaped set bound through the wrong pipeline layout is "
+           "refused at draw", slot(147), ERR_ARGS)
+    pipeline_layout_text = cstr(cpu, u64(cpu, base + 148 * 8))
+    g.want_true("the wrong-pipeline-layout refusal is the draw-time layout rule",
+                "bound through a different pipeline layout" in pipeline_layout_text,
+                repr(pipeline_layout_text[:170]))
+    g.need("a one-binding descriptor draw clears binding one's old address",
+           slot(144), 0)
+    g.need("a one-binding descriptor draw clears binding one's old stride",
+           slot(145), 0)
 
     # The fifth hand-assembled module, compared word for word.
     g.need("the uniform-buffer fragment module is the length this checker "
@@ -945,6 +977,20 @@ DESCRIPTOR_MUTANTS = (
 )
 
 
+# The 2026-09-12 full run exposed six older mutants whose request reached a
+# later rule returning the same code. Keep them as a named focused batch: it
+# makes their repair gate minutes rather than half an hour, while plain
+# --mutate remains the complete suite and cannot silently omit anything.
+VALIDATION_TRUTH_MUTANTS = frozenset({
+    "two bindings may carry the same binding number",
+    "a binding number outside the pipeline's own count is accepted",
+    "a binding the pipeline does not have keeps the last draw's address",
+    "a bound set need not have been allocated from the layout's own shape",
+    "a set may be bound through a layout the pipeline was not built with",
+    "a uniform buffer may sit at any offset",
+})
+
+
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
     return grade(cpu, rc), steps
@@ -955,7 +1001,10 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
+    parser.add_argument("--mutate-only", choices=("validation-truth",))
     args = parser.parse_args()
+    if args.mutate_only:
+        args.mutate = True
 
     compiler = locate_compiler(args.compiler)
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
@@ -1005,6 +1054,8 @@ def main() -> int:
                           (DESCRIPTOR, DESCRIPTOR_MUTANTS)):
         original = path.read_text(encoding="utf-8")
         for name, fixed, broken in mutants:
+            if args.mutate_only == "validation-truth" and name not in VALIDATION_TRUTH_MUTANTS:
+                continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
                 missed += 1
@@ -1024,8 +1075,11 @@ def main() -> int:
                 print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE")
                 missed += 1
 
-    total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
-             + len(DESCRIPTOR_MUTANTS))
+    if args.mutate_only == "validation-truth":
+        total = len(VALIDATION_TRUTH_MUTANTS)
+    else:
+        total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
+                 + len(DESCRIPTOR_MUTANTS))
     print()
     if missed:
         print(f"vulkan_pipeline_check: {missed} of {total} mutations were not caught")
