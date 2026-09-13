@@ -156,11 +156,17 @@ def source_contract() -> None:
     prepare = cru.split("procedure.i rockcrudisplayprepare()", 1)[1].split(
         "endprocedure", 1
     )[0]
-    require("rockcrureset(148,1)" in prepare and
-            "rockcrureset(149,1)" in prepare and
-            "rockcrureset(332,1)" in prepare and
-            "rockcrureset(332,0)" not in prepare,
+    for token in ("#rock_reset_uphy0_pipe_l00 = 148",
+                  "#rock_reset_uphy0 = 149",
+                  "#rock_reset_p_uphy0_tcphy = 332"):
+        require(token in cru, f"TCPHY reset identity drifted: {token}")
+    require("rockcrureset(#rock_reset_uphy0_pipe_l00,1)" in prepare and
+            "rockcrureset(#rock_reset_uphy0,1)" in prepare and
+            "rockcrureset(#rock_reset_p_uphy0_tcphy,1)" in prepare and
+            "rockcrureset(#rock_reset_p_uphy0_tcphy,0)" not in prepare,
             "TCPHY/UPHY/PIPE resets are not held through owner pre-init")
+    require("rockcrugate(21,5,1)" in cru and "rockcrugate(21,6,1)" in cru,
+            "TCPHY0 APB register clocks TCPHY_G/TCPD_G are not both enabled")
     tcphy = libraries["tcphy.pbi"].lower()
     tcphy_up = tcphy.split("procedure.i rocktcphyup()", 1)[1].split(
         "endprocedure", 1
@@ -168,15 +174,16 @@ def source_contract() -> None:
     tcphy_order = [
         "pokel(#rock_grf+$e588,$40004000)",
         "pokel(#rock_grf+$e580,$00080000)",
-        "rockcrureset(149,0)",
+        "rockcrureset(#rock_reset_p_uphy0_tcphy,0)",
         "pokel(#rock_grf+$e580,$00010000)",
         "rocktcread(#tcphy_tx_ana1)",
         "rocktccommon24m()", "rocktcwrite(#tcphy_pma_lane_cfg,$5100)",
         "rocktcdprbrpll()", "rocktcwrite(#tcphy_dp_mode_ctl",
-        "rockcrureset(148,0)",
-        "rocktcwaitmask(#tcphy_pma_cmn_ctrl1,1,1,100000)",
-        "rockcrureset(332,0)", "pokel(#rock_grf+$6268,$00080000)",
-        "rocktcwaitmask(#tcphy_dp_mode_ctl,$40,$40,100000)",
+        "rockcrureset(#rock_reset_uphy0,0)",
+        "rocktcwaitmask(#tcphy_pma_cmn_ctrl1,1,1,100000,10)",
+        "rockcrureset(#rock_reset_uphy0_pipe_l00,0)",
+        "pokel(#rock_grf+$6268,$00080000)",
+        "rocktcwaitmask(#tcphy_dp_mode_ctl,$40,$40,100000,1000)",
         "rocktcauxcalibrate()", "rocktcpowerstate(0)",
     ]
     positions = [tcphy_up.index(token) for token in tcphy_order]
@@ -184,6 +191,21 @@ def source_contract() -> None:
             "TCPHY pre-init/config/reset/readiness order drifted from pinned owner")
     require("rock_tcphy_error=47" in tcphy_up,
             "PIPE reset-release failure lacks an exact TCPHY refusal code")
+    tcphy_stages = [f'tp0{digit} ' for digit in "0123456789abc"]
+    for stage in tcphy_stages:
+        require(stage in tcphy_up, f"TCPHY serial progress witness missing: {stage}")
+    wait_mask = tcphy.split("procedure.i rocktcwaitmask", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require("attempts = timeoutus/stepus" in wait_mask and
+            "rocktimerwaitus(stepus)" in wait_mask,
+            "TCPHY readiness poll lost its paced finite ceiling")
+    power_state = tcphy.split("procedure.i rocktcpowerstate", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    require("for attempt = 0 to 10000" in power_state and
+            "rocktimerwaitus(10)" in power_state,
+            "TCPHY A0 transition poll lost its pinned pacing/ceiling")
     cru_telemetry = display.split("procedure rockdisplaycrutelemetry()", 1)[1].split(
         "endprocedure", 1
     )[0]

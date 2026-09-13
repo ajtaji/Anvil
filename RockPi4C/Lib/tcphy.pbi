@@ -59,6 +59,10 @@
 
 Global rock_tcphy_error.i
 
+Procedure RockTcStage(text.i)
+  If rock_uart_ready <> 0 : RockUartLine(text) : EndIf
+EndProcedure
+
 Procedure.i RockTcRead(offset.i)
   ProcedureReturn PeekL(#ROCK_TCPHY0+offset) & $FFFFFFFF
 EndProcedure
@@ -241,24 +245,29 @@ Procedure.i RockTcPowerState(state.i)
   value = RockTcRead(#TCPHY_DP_MODE_CTL)
   RockTcWrite(#TCPHY_DP_MODE_CTL,(value & $FFFFFFF0) | request)
   start = RockTimerTicks()
-  For attempt = 0 To 100000
+  For attempt = 0 To 10000
     value = (RockTcRead(#TCPHY_DP_MODE_CTL) >> 4) & $F
     If value = request : ProcedureReturn 1 : EndIf
     now = RockTimerTicks()
     If now < start Or now-start >= rock_timer_frequency/10 : Break : EndIf
+    If RockTimerWaitUs(10)=0 : Break : EndIf
   Next
   rock_tcphy_error=42
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i RockTcWaitMask(offset.i, mask.i, wanted.i, timeoutUs.i)
+Procedure.i RockTcWaitMask(offset.i, mask.i, wanted.i, timeoutUs.i, stepUs.i)
   Protected start.i = RockTimerTicks()
   Protected now.i
   Protected attempt.i
-  For attempt = 0 To 1000000
+  Protected attempts.i
+  If timeoutUs <= 0 Or stepUs <= 0 : ProcedureReturn 0 : EndIf
+  attempts = timeoutUs/stepUs
+  For attempt = 0 To attempts
     If (RockTcRead(offset) & mask) = wanted : ProcedureReturn 1 : EndIf
     now = RockTimerTicks()
     If now < start Or now-start >= (rock_timer_frequency/1000000)*timeoutUs : Break : EndIf
+    If RockTimerWaitUs(stepUs)=0 : Break : EndIf
   Next
   ProcedureReturn 0
 EndProcedure
@@ -266,13 +275,19 @@ EndProcedure
 Procedure.i RockTcPhyUp()
   Protected value.i
   rock_tcphy_error = 0
+  RockTcStage("TP00 TCPHY BEGIN")
   ; Pinned pre-init fields are owned while TCPHY, UPHY and PIPE remain reset.
   PokeL(#ROCK_GRF+$E588,$40004000)
   PokeL(#ROCK_GRF+$E580,$00080000)
-  If RockCruReset(149,0) = 0 : rock_tcphy_error=43 : ProcedureReturn 0 : EndIf
-  ; Configure only after the TCPHY register state machine is out of reset.
+  RockTcStage("TP01 RELEASE TCPHY RESET 332")
+  If RockCruReset(#ROCK_RESET_P_UPHY0_TCPHY,0) = 0 : rock_tcphy_error=43 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP02 TCPHY RESET 332 RELEASED")
+  ; The pinned reset-name binding identifies 332 as uphy-tcphy. It must be
+  ; released before the first TCPHY APB access; UPHY149 and PIPE148 stay held.
   PokeL(#ROCK_GRF+$E580,$00010000)
+  RockTcStage("TP03 FIRST TCPHY MMIO")
   value = RockTcRead(#TCPHY_TX_ANA1)
+  RockTcStage("TP04 FIRST TCPHY MMIO OK")
   RockTcWrite(#TCPHY_TX_ANA1,value | $1000)
   RockTcCommon24M()
   RockTcWrite(#TCPHY_PMA_LANE_CFG,$5100)
@@ -282,15 +297,23 @@ Procedure.i RockTcPhyUp()
   RockTcUsbRxLane(1)
   RockTcDpLane(2,0,0)
   RockTcDpLane(3,0,0)
+  RockTcStage("TP05 TCPHY CONFIG WRITTEN")
   value = RockTcRead(#TCPHY_DP_MODE_CTL)
   RockTcWrite(#TCPHY_DP_MODE_CTL,(value & $FFFFFFF0) | $104)
-  If RockCruReset(148,0) = 0 : rock_tcphy_error=45 : ProcedureReturn 0 : EndIf
-  If RockTcWaitMask(#TCPHY_PMA_CMN_CTRL1,1,1,100000) = 0 : rock_tcphy_error=44 : ProcedureReturn 0 : EndIf
-  If RockCruReset(332,0) = 0 : rock_tcphy_error=47 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP06 RELEASE UPHY RESET 149")
+  If RockCruReset(#ROCK_RESET_UPHY0,0) = 0 : rock_tcphy_error=45 : ProcedureReturn 0 : EndIf
+  If RockTcWaitMask(#TCPHY_PMA_CMN_CTRL1,1,1,100000,10) = 0 : rock_tcphy_error=44 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP07 TCPHY CMN READY")
+  If RockCruReset(#ROCK_RESET_UPHY0_PIPE_L00,0) = 0 : rock_tcphy_error=47 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP08 PIPE RESET 148 RELEASED")
   PokeL(#ROCK_GRF+$6268,$00080000)
-  If RockTcWaitMask(#TCPHY_DP_MODE_CTL,$40,$40,100000) = 0 : rock_tcphy_error=46 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP09 DP SELECT WAIT A2")
+  If RockTcWaitMask(#TCPHY_DP_MODE_CTL,$40,$40,100000,1000) = 0 : rock_tcphy_error=46 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP0A TCPHY A2 ACK")
   RockTcAuxCalibrate()
+  RockTcStage("TP0B TCPHY AUX CALIBRATED")
   If RockTcPowerState(0) = 0 : ProcedureReturn 0 : EndIf
+  RockTcStage("TP0C TCPHY A0 ACK")
   value = RockTcRead(#TCPHY_DP_MODE_CTL) | $F000
   value = value & $FFFFCFFF
   RockTcWrite(#TCPHY_DP_MODE_CTL,value)

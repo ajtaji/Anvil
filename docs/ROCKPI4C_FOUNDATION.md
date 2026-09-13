@@ -102,6 +102,16 @@ loaded into RAM from the removable SD, then Anvil's Image and DTB transferred
 over FTDI/XMODEM. The Anvil image and DTB passed board CRC checks twice before
 entry. Display output has not yet passed a silicon test.
 
+Build 36 passed clocks, power, and Cadence firmware startup on the board,
+then stopped inside PHY initialization. The source audit found a swapped
+reset mapping: TCPHY's register interface is reset 332, UPHY is 149, and
+PIPE is 148. The required release order is 332 before register access,
+149 after configuration, then 148 after common-ready acknowledgement.
+Holding 332 until the end left the register interface in reset during
+configuration. Named reset identities and serial operation witnesses make
+this order explicit. Fatal EL2 faults also report their saved syndrome,
+address, and instruction address instead of parking silently.
+
 The exact original 4C device tree selects VOPL -> Cadence DP and describes the
 virtual Type-C state as DP with SuperSpeed enabled and no flip. That means two
 DP lanes on TCPHY0 physical lanes 2/3 while USB3 retains lanes 0/1. The

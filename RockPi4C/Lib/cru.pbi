@@ -17,6 +17,9 @@
 #ROCK_PMU_BUS_IDLE_REQ = $60
 #ROCK_PMU_BUS_IDLE_ST = $64
 #ROCK_PMU_BUS_IDLE_ACK = $68
+#ROCK_RESET_UPHY0_PIPE_L00 = 148
+#ROCK_RESET_UPHY0 = 149
+#ROCK_RESET_P_UPHY0_TCPHY = 332
 
 Global rock_cru_error.i
 Global rock_cru_gpll_rate.i
@@ -233,6 +236,10 @@ Procedure.i RockCruDisplayClocks()
   RockCruField(#ROCK_CRU_CLKSEL+$100,$9FDF,$00C0 | (tcpDivider-1))
   RockCruGate(13,4,1)
   RockCruGate(13,5,1)
+  ; Linux keeps both UPHY0 APB leaves alive implicitly. Bare Anvil owns them:
+  ; PCLK_UPHY0_TCPHY_G is the direct register interface and TCPD_G its peer.
+  RockCruGate(21,5,1)
+  RockCruGate(21,6,1)
   ; Cadence core: live GPLL at no more than 100 MHz.
   RockCruField(#ROCK_CRU_CLKSEL+$B8,$00DF,$0080 | (dpDivider-1))
   RockCruGate(11,8,1)
@@ -291,9 +298,9 @@ Procedure.i RockCruDisplayPrepare()
   If RockCruDisplayClocks() = 0 : ProcedureReturn 0 : EndIf
   If RockCruDisplayPower() = 0 : ProcedureReturn 0 : EndIf
   ; Hold each display block while its driver establishes a known state.
-  RockCruReset(148,1)
-  RockCruReset(149,1)
-  RockCruReset(332,1)
+  RockCruReset(#ROCK_RESET_UPHY0_PIPE_L00,1)
+  RockCruReset(#ROCK_RESET_UPHY0,1)
+  RockCruReset(#ROCK_RESET_P_UPHY0_TCPHY,1)
   RockCruReset(253,1)
   RockCruReset(259,1)
   RockCruReset(328,1)
