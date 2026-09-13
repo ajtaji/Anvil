@@ -911,15 +911,17 @@ Procedure.i avkFlightPoll()
   ProcedureReturn 1
 EndProcedure
 
-; vkWaitForFences. `timeoutNs` is the caller's nanosecond timeout; -1 is
-; the all-ones pattern the header spells UINT64_MAX and means "no limit",
-; which here means "until the poll bound below is reached".
+; vkWaitForFences. `timeoutNs` is the caller's nanosecond timeout. -1 is
+; the all-ones pattern the header spells UINT64_MAX. This single-threaded
+; object engine cannot honestly promise an infinite wait which another host
+; thread could satisfy: an already-satisfied UINT64_MAX wait succeeds, while
+; an unsatisfied one is explicitly withheld instead of becoming a disguised
+; bounded timeout.
 Procedure.i AnvilVkWaitForFences(device.i, count.i, *handles, waitAll.i, timeoutNs.i)
   Define d.i
   Define s.i
   Define i.i
   Define timeoutUs.i
-  Define unlimited.i
   Define t0.i
   Define polls.i
   Define signalled.i
@@ -933,10 +935,8 @@ Procedure.i AnvilVkWaitForFences(device.i, count.i, *handles, waitAll.i, timeout
     If avkFenceDev[s] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
     i = i + 1
   Wend
-  unlimited = 0
-  If timeoutNs = -1 : unlimited = 1 : EndIf
   timeoutUs = 0
-  If unlimited = 0 And timeoutNs > 0
+  If timeoutNs > 0
     timeoutUs = (timeoutNs + (#ANVIL_VK_NS_PER_US - 1)) / #ANVIL_VK_NS_PER_US
   EndIf
   t0 = avkBackendTicksUs()
@@ -958,13 +958,14 @@ Procedure.i AnvilVkWaitForFences(device.i, count.i, *handles, waitAll.i, timeout
     Else
       If signalled > 0 : ProcedureReturn #VK_SUCCESS : EndIf
     EndIf
+    If timeoutNs = -1
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkWaitForFences was given UINT64_MAX for an unsignalled fence (Anvil code -20005, unlimited host wait not implemented); use a finite timeout and wait again, because the current object engine has no reentrant host thread that can safely satisfy an infinite wait.")
+    EndIf
     polls = polls + 1
     If polls >= #ANVIL_VK_WAIT_MAX_POLLS
       ProcedureReturn avkFault(#VK_TIMEOUT, "vkWaitForFences gave up after its bounded poll count without the fence being signalled (VkResult 2, VK_TIMEOUT); the wait is bounded twice so a backend whose clock never advances cannot hang the caller. Check that the device is still answering before waiting again.")
     EndIf
-    If unlimited = 0
-      If (avkBackendTicksUs() - t0) >= timeoutUs : ProcedureReturn #VK_TIMEOUT : EndIf
-    EndIf
+    If (avkBackendTicksUs() - t0) >= timeoutUs : ProcedureReturn #VK_TIMEOUT : EndIf
   Wend
 EndProcedure
 

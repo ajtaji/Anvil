@@ -224,6 +224,18 @@ MUTANTS = (
         "  If (flags & #VK_FENCE_CREATE_SIGNALED_BIT) >= 0\n    avkFenceSignaled[s] = 1\n",
     ),
     (
+        "an unsignalled UINT64_MAX wait falls through to a bounded timeout",
+        "vk_command.pbi",
+        "    If timeoutNs = -1\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, \"vkWaitForFences was given UINT64_MAX",
+        "    If timeoutNs = -2\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, \"vkWaitForFences was given UINT64_MAX",
+    ),
+    (
+        "an already-signalled UINT64_MAX wait is refused",
+        "vk_command.pbi",
+        "      If signalled >= count : ProcedureReturn #VK_SUCCESS : EndIf\n",
+        "      If signalled >= count And timeoutNs <> -1 : ProcedureReturn #VK_SUCCESS : EndIf\n",
+    ),
+    (
         "semaphores in a VkSubmitInfo are ignored instead of refused",
         "vk_api.pbi",
         "  If *pSubmits\\waitSemaphoreCount <> 0 Or *pSubmits\\signalSemaphoreCount <> 0\n",
@@ -254,6 +266,11 @@ MUTANTS = (
         "  If *pRanges = 0\n",
     ),
 )
+
+FENCE_UNLIMITED_MUTANTS = frozenset({
+    "an unsignalled UINT64_MAX wait falls through to a bounded timeout",
+    "an already-signalled UINT64_MAX wait is refused",
+})
 
 
 def locate(env_name: str, explicit, fallbacks) -> pathlib.Path:
@@ -475,7 +492,10 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
+    parser.add_argument("--mutate-only", choices=("fence-unlimited",))
     args = parser.parse_args()
+    if args.mutate_only:
+        args.mutate = True
 
     compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
@@ -506,6 +526,8 @@ def main() -> int:
     print()
     missed = 0
     for name, where, fixed, broken in MUTANTS:
+        if args.mutate_only == "fence-unlimited" and name not in FENCE_UNLIMITED_MUTANTS:
+            continue
         text = originals.get(where)
         if text is None or text.count(fixed) != 1:
             found = 0 if text is None else text.count(fixed)
@@ -530,10 +552,11 @@ def main() -> int:
             print(f"  GREEN  {name}  <-- THE GATE DID NOT NOTICE ({msteps:,} instructions)")
             missed += 1
 
+    total = len(FENCE_UNLIMITED_MUTANTS) if args.mutate_only == "fence-unlimited" else len(MUTANTS)
     if missed:
-        print(f"\nvulkan_resource_check: {missed} of {len(MUTANTS)} mutations were not caught")
+        print(f"\nvulkan_resource_check: {missed} of {total} mutations were not caught")
         return 1
-    print(f"\nvulkan_resource_check: all {len(MUTANTS)} mutations rejected")
+    print(f"\nvulkan_resource_check: all {total} mutations rejected")
     return 0
 
 

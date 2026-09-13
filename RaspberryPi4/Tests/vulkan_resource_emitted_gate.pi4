@@ -568,6 +568,12 @@ Procedure.i Main()
   Vkr(AnvilVkCommandBufferState(cmd2) = #ANVIL_VK_CB_EXECUTABLE)
   ; A timed wait honours its timeout and comes back, it does not hang.
   Vkr(vkWaitForFences(dev, 1, @fenceArray, 1, 20000) = #VK_TIMEOUT)
+  ; UINT64_MAX is not a finite timeout. This single-threaded object
+  ; engine explicitly withholds an unsatisfied unlimited host wait rather
+  ; than lying that its safety poll cap is Vulkan's infinite wait.
+  AnvilVkFaultClear()
+  Vkr(vkWaitForFences(dev, 1, @fenceArray, 1, -1) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
 
   ; Release it: the fence signals, the command buffer leaves the pending
   ; state and the image's layout becomes what the recording said.
@@ -583,6 +589,9 @@ Procedure.i Main()
   Vkr(AnvilVkTestBackendLastHeight() = #VKR_H)
   Vkr(AnvilVkTestBackendLastPitch() = #VKR_PITCH)
   Vkr(AnvilVkTestBackendLastBytes() = #VKR_IMG_BYTES)
+  ; A UINT64_MAX wait whose condition is already true needs no host
+  ; blocking and therefore remains an immediate success.
+  Vkr(vkWaitForFences(dev, 1, @fenceArray, 1, -1) = #VK_SUCCESS)
   ; 0.2, 0.5, 0.7, 1.0 -> R=51 G=128 B=178 A=255 -> $FF3380B2
   Vkr(AnvilVkTestBackendLastColor() = $FF3380B2)
 
