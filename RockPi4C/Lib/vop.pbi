@@ -1,13 +1,15 @@
-; RK3399 little VOP first-light path. The exact Rock Pi 4C graph routes
-; vopl -> cdn_dp. This milestone intentionally accepts only the standard
-; EDID-established 1024x768@60 mode: 65 MHz, 1344x806 totals, negative sync.
-; The static 32-bpp scan buffer stays inside the compiler-owned BSS window.
+; RK3399 little VOP scanout path. The exact Rock Pi 4C graph routes
+; vopl -> cdn_dp. Mode selection supplies a validated base-block DTD through
+; the rock_mode_* ABI; this layer independently bounds every packed VOP field
+; and the compiler-owned 32-bpp scan buffer before touching VOP MMIO.
 
 #ROCK_VOPL = $FF8F0000
-#ROCK_FB_WIDTH = 1024
-#ROCK_FB_HEIGHT = 768
-#ROCK_FB_WORDS = 786432
-#ROCK_FB_BYTES = #ROCK_FB_WORDS*4
+#ROCK_VOP_MAX_WIDTH = 2560
+#ROCK_VOP_MAX_HEIGHT = 1600
+#ROCK_VOP_TIMING_MAX = 8191
+#ROCK_VOP_STRIDE_WORD_MAX = 16383
+#ROCK_FB_MAX_WORDS = #ROCK_VOP_MAX_WIDTH*#ROCK_VOP_MAX_HEIGHT
+#ROCK_FB_MAX_BYTES = #ROCK_FB_MAX_WORDS*4
 #ROCK_FB_ALIGNMENT = 16
 
 #VOP_CFG_DONE = $000
@@ -32,7 +34,7 @@ Global rock_vop_ready.i
 Global rock_vop_error.i
 ; Global ordering is not an alignment contract. Reserve one alignment unit
 ; of slack and derive the scanout base within this compiler-owned object.
-Global Dim rock_vop_framebuffer.l[#ROCK_FB_WORDS+4]
+Global Dim rock_vop_framebuffer.l[#ROCK_FB_MAX_WORDS+4]
 
 Procedure.i RockVopFramebuffer()
   ProcedureReturn (@rock_vop_framebuffer[0]+#ROCK_FB_ALIGNMENT-1) & $FFFFFFFFFFFFFFF0
@@ -87,14 +89,21 @@ Procedure RockVopGlyph(character.i, x0.i, y0.i, scale.i, colour.i)
   Protected dy.i
   Protected bits.i
   Protected address.i
+  Protected pixelX.i
+  Protected pixelY.i
+  If scale <= 0 : ProcedureReturn 0 : EndIf
   For row=0 To 6
     bits=RockVopGlyphRow(character,row)
     For column=0 To 4
       If (bits & (16 >> column)) <> 0
         For dy=0 To scale-1
-          address=RockVopFramebuffer()+((y0+row*scale+dy)*#ROCK_FB_WIDTH+x0+column*scale)*4
+          pixelY=y0+row*scale+dy
           For dx=0 To scale-1
-            PokeL(address+dx*4,colour)
+            pixelX=x0+column*scale+dx
+            If pixelX >= 0 And pixelX < rock_mode_width And pixelY >= 0 And pixelY < rock_mode_height
+              address=RockVopFramebuffer()+pixelY*rock_mode_pitch+pixelX*4
+              PokeL(address,colour)
+            EndIf
           Next
         Next
       EndIf
@@ -115,11 +124,30 @@ EndProcedure
 Procedure RockVopFirstFrame()
   Protected x.i
   Protected y.i
+  Protected band.i
   Protected colour.i
   Protected address.i
-  For y=0 To #ROCK_FB_HEIGHT-1
-    For x=0 To #ROCK_FB_WIDTH-1
-      Select x >> 7
+  Protected rowWords.i = rock_mode_pitch >> 2
+  Protected footerStart.i = rock_mode_height-(rock_mode_height/6)
+  Protected footerHeight.i = rock_mode_height-footerStart
+  Protected labelScale.i = rock_mode_height/192
+  Protected labelWidth.i
+  Protected labelHeight.i
+  Protected labelX.i
+  Protected labelY.i
+  If labelScale < 1 : labelScale=1 : EndIf
+  If labelScale > 6 : labelScale=6 : EndIf
+  labelWidth=95*labelScale
+  labelHeight=7*labelScale
+  While labelScale > 1 And (labelWidth > rock_mode_width Or labelHeight > footerHeight)
+    labelScale=labelScale-1
+    labelWidth=95*labelScale
+    labelHeight=7*labelScale
+  Wend
+  For y=0 To rock_mode_height-1
+    For x=0 To rowWords-1
+      band=(x*8)/rock_mode_width
+      Select band
         Case 0 : colour=$FFFFFFFF
         Case 1 : colour=$FFFFFF00
         Case 2 : colour=$FF00FFFF
@@ -129,21 +157,87 @@ Procedure RockVopFirstFrame()
         Case 6 : colour=$FF0000FF
         Default : colour=$FF101010
       EndSelect
-      If y >= 640 : colour=$FF101010 : EndIf
-      address=RockVopFramebuffer()+(y*#ROCK_FB_WIDTH+x)*4
+      If x >= rock_mode_width Or y >= footerStart : colour=$FF101010 : EndIf
+      address=RockVopFramebuffer()+y*rock_mode_pitch+x*4
       PokeL(address,colour)
     Next
   Next
-  RockVopText("ANVIL ROCK PI 4C",32,684,4,$FF40FF40)
+  labelX=(rock_mode_width-labelWidth)/2
+  labelY=footerStart+(footerHeight-labelHeight)/2
+  If labelX < 0 : labelX=0 : EndIf
+  If labelY < 0 : labelY=0 : EndIf
+  RockVopText("ANVIL ROCK PI 4C",labelX,labelY,labelScale,$FF40FF40)
   ASM
     dsb sy
   ENDASM
 EndProcedure
 
-Procedure.i RockVopUp1024x768()
+Procedure.i RockVopModeValid()
+  Protected hsyncLength.i
+  Protected vsyncLength.i
+  Protected hactiveStart.i
+  Protected hactiveEnd.i
+  Protected vactiveStart.i
+  Protected vactiveEnd.i
+  If rock_mode_valid=0
+    rock_vop_error=79
+    ProcedureReturn 0
+  EndIf
+  If rock_mode_width < 1 Or rock_mode_width > #ROCK_VOP_MAX_WIDTH Or rock_mode_height < 1 Or rock_mode_height > #ROCK_VOP_MAX_HEIGHT
+    rock_vop_error=72
+    ProcedureReturn 0
+  EndIf
+  If rock_mode_pixel_hz < 1 Or rock_mode_width > rock_mode_hsync_start Or rock_mode_hsync_start >= rock_mode_hsync_end Or rock_mode_hsync_end > rock_mode_htotal
+    rock_vop_error=73
+    ProcedureReturn 0
+  EndIf
+  If rock_mode_height > rock_mode_vsync_start Or rock_mode_vsync_start >= rock_mode_vsync_end Or rock_mode_vsync_end > rock_mode_vtotal
+    rock_vop_error=74
+    ProcedureReturn 0
+  EndIf
+  hsyncLength=rock_mode_hsync_end-rock_mode_hsync_start
+  vsyncLength=rock_mode_vsync_end-rock_mode_vsync_start
+  hactiveStart=rock_mode_htotal-rock_mode_hsync_start
+  hactiveEnd=hactiveStart+rock_mode_width
+  vactiveStart=rock_mode_vtotal-rock_mode_vsync_start
+  vactiveEnd=vactiveStart+rock_mode_height
+  If rock_mode_htotal > #ROCK_VOP_TIMING_MAX Or hsyncLength > #ROCK_VOP_TIMING_MAX Or hactiveStart > #ROCK_VOP_TIMING_MAX Or hactiveEnd > #ROCK_VOP_TIMING_MAX
+    rock_vop_error=75
+    ProcedureReturn 0
+  EndIf
+  If rock_mode_vtotal > #ROCK_VOP_TIMING_MAX Or vsyncLength > #ROCK_VOP_TIMING_MAX Or vactiveStart > #ROCK_VOP_TIMING_MAX Or vactiveEnd > #ROCK_VOP_TIMING_MAX
+    rock_vop_error=76
+    ProcedureReturn 0
+  EndIf
+  If rock_mode_pitch < rock_mode_width*4 Or (rock_mode_pitch & 15) <> 0 Or (rock_mode_pitch >> 2) > #ROCK_VOP_STRIDE_WORD_MAX
+    rock_vop_error=77
+    ProcedureReturn 0
+  EndIf
+  If rock_mode_pitch*rock_mode_height > #ROCK_FB_MAX_BYTES
+    rock_vop_error=78
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RockVopUpMode()
   Protected value.i
+  Protected pinPolarity.i
+  Protected hsyncLength.i
+  Protected vsyncLength.i
+  Protected hactiveStart.i
+  Protected hactiveEnd.i
+  Protected vactiveStart.i
+  Protected vactiveEnd.i
   rock_vop_ready=0
   rock_vop_error=0
+  If RockVopModeValid()=0 : ProcedureReturn 0 : EndIf
+  hsyncLength=rock_mode_hsync_end-rock_mode_hsync_start
+  vsyncLength=rock_mode_vsync_end-rock_mode_vsync_start
+  hactiveStart=rock_mode_htotal-rock_mode_hsync_start
+  hactiveEnd=hactiveStart+rock_mode_width
+  vactiveStart=rock_mode_vtotal-rock_mode_vsync_start
+  vactiveEnd=vactiveStart+rock_mode_height
   If RockCruVopRelease()=0 : rock_vop_error=71 : ProcedureReturn 0 : EndIf
   ; The reference driver pulses the HCLK reset after clocks and power exist.
   RockCruReset(279,1)
@@ -152,24 +246,27 @@ Procedure.i RockVopUp1024x768()
   ; Route the Cadence transmitter from the little VOP (GRF SOC_CON9 bit12).
   PokeL(#ROCK_GRF+$6224,$10001000)
   RockVopFirstFrame()
-  ; The RK3399 VOP DP pins use uninverted clock/sync polarity for this mode.
-  ; Cadence's MSA/framer negative-sync flags have separate semantics.
-  RockVopField(#VOP_DSP_CTRL1,$000F0000,0)
+  ; RK3399 VOP pin polarity uses positive-pulse bits; Cadence's independent
+  ; MSA/framer polarity fields use negative-pulse semantics.
+  pinPolarity=0
+  If rock_mode_hsync_positive <> 0 : pinPolarity=pinPolarity | 1 : EndIf
+  If rock_mode_vsync_positive <> 0 : pinPolarity=pinPolarity | 2 : EndIf
+  RockVopField(#VOP_DSP_CTRL1,$000F0000,pinPolarity << 16)
   value=RockVopRead(#VOP_SYS_CTRL)
   value=(value & $FFBF07FF) | $00000800
   RockVopWrite(#VOP_SYS_CTRL,value)
   RockVopField(#VOP_DSP_CTRL0,$F,0)
-  RockVopWrite(#VOP_HTOTAL,136 | (1344 << 16))
-  RockVopWrite(#VOP_HACT,1320 | (296 << 16))
-  RockVopWrite(#VOP_VTOTAL,6 | (806 << 16))
-  RockVopWrite(#VOP_VACT,803 | (35 << 16))
-  RockVopWrite(#VOP_POST_HACT,1320 | (296 << 16))
-  RockVopWrite(#VOP_POST_VACT,803 | (35 << 16))
-  RockVopWrite(#VOP_WIN0_ACT_INFO,1023 | (767 << 16))
-  RockVopWrite(#VOP_WIN0_DSP_ST,296 | (35 << 16))
-  RockVopWrite(#VOP_WIN0_DSP_INFO,1023 | (767 << 16))
+  RockVopWrite(#VOP_HTOTAL,hsyncLength | (rock_mode_htotal << 16))
+  RockVopWrite(#VOP_HACT,hactiveEnd | (hactiveStart << 16))
+  RockVopWrite(#VOP_VTOTAL,vsyncLength | (rock_mode_vtotal << 16))
+  RockVopWrite(#VOP_VACT,vactiveEnd | (vactiveStart << 16))
+  RockVopWrite(#VOP_POST_HACT,hactiveEnd | (hactiveStart << 16))
+  RockVopWrite(#VOP_POST_VACT,vactiveEnd | (vactiveStart << 16))
+  RockVopWrite(#VOP_WIN0_ACT_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
+  RockVopWrite(#VOP_WIN0_DSP_ST,hactiveStart | (vactiveStart << 16))
+  RockVopWrite(#VOP_WIN0_DSP_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
   RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
-  RockVopWrite(#VOP_WIN0_VIR,1024)
+  RockVopWrite(#VOP_WIN0_VIR,rock_mode_pitch >> 2)
   RockVopWrite(#VOP_WIN0_CTRL0,$A1)
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)

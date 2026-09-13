@@ -19,6 +19,44 @@ Procedure.i RockDisplayFail(code.i, text.i)
   ProcedureReturn 0
 EndProcedure
 
+Procedure RockDisplayDecimal(value.i)
+  Protected divisor.i = 1
+  While value / divisor >= 10
+    divisor = divisor * 10
+  Wend
+  Repeat
+    RockUartByte(48 + value / divisor)
+    value = value % divisor
+    divisor = divisor / 10
+  Until divisor = 0
+EndProcedure
+
+Procedure RockDisplayModeTelemetry(text.i)
+  If rock_uart_ready = 0 : ProcedureReturn 0 : EndIf
+  RockUartText(text)
+  RockDisplayDecimal(rock_mode_width)
+  RockUartByte(88)
+  RockDisplayDecimal(rock_mode_height)
+  RockUartText(" PIXEL HZ ")
+  RockDisplayDecimal(rock_mode_pixel_hz)
+  RockUartText(" SOURCE ")
+  RockDisplayDecimal(rock_mode_source)
+  RockUartText(" REASON ")
+  RockDisplayDecimal(rock_mode_reason)
+  If rock_mode_source = #ROCK_MODE_SOURCE_PREFERRED_DTD
+    RockUartText(" EDID PREFERRED")
+  Else
+    RockUartText(" ADVERTISED FALLBACK; PREFERRED ")
+    RockDisplayDecimal(rock_mode_preferred_width)
+    RockUartByte(88)
+    RockDisplayDecimal(rock_mode_preferred_height)
+    RockUartText(" AT HZ ")
+    RockDisplayDecimal(rock_mode_preferred_pixel_hz)
+  EndIf
+  RockUartByte(13)
+  RockUartByte(10)
+EndProcedure
+
 Procedure RockDisplayHexByte(value.i)
   Protected digit.i = (value >> 4) & 15
   If digit < 10
@@ -232,6 +270,8 @@ EndProcedure
 
 Procedure.i RockDisplayUp()
   Protected prepared.i
+  Protected configured.i
+  Protected modeFailure.i
   rock_display_ready=0
   rock_display_error=0
   RockDisplayStage("DP00 BEGIN COLD MINIDP")
@@ -287,14 +327,9 @@ Procedure.i RockDisplayUp()
   EndIf
   If RockCdnReadEdid()=0
     RockDisplaySubsystemTelemetry("DPE9 CDN ERR ",rock_cdn_error)
-    ProcedureReturn RockDisplayFail(9,"DPE9 EDID OR 1024X768 MODE")
+    ProcedureReturn RockDisplayFail(9,"DPE9 INVALID EDID OR NO SUPPORTED MODE")
   EndIf
-  RockDisplayStage("DP05 DPCD EDID 1024X768 READY")
-  If RockVopUp1024x768()=0
-    RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
-    ProcedureReturn RockDisplayFail(10,"DPEA VOPL FRAMEBUFFER")
-  EndIf
-  RockDisplayStage("DP06 COLOR BARS AND TEXT ARMED")
+  RockDisplayModeTelemetry("DP05 EDID MODE ")
   If RockCdnTrain()=0
     RockDisplaySubsystemTelemetry("DPEB CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(11,"DPEB DISPLAYPORT LINK TRAIN")
@@ -304,20 +339,39 @@ Procedure.i RockDisplayUp()
     RockDisplaySubsystemTelemetry("DPEC CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(12,"DPEC VIDEO IDLE")
   EndIf
-  If RockCdnVideo1024x768()=0
+  ; Resolve the trained link's real bandwidth and TU constraints before
+  ; arming scanout. Never silently send a guessed mode to the monitor.
+  configured = RockCdnVideoMode()
+  If configured = 0 And (rock_cdn_error = 35 Or rock_cdn_error = 36)
+    modeFailure = rock_cdn_error
+    If RockModeFallback(@rock_cdn_edid[0],modeFailure) <> 0
+      RockDisplayModeTelemetry("DP MODE FALLBACK ")
+      configured = RockCdnVideoMode()
+    EndIf
+  EndIf
+  If configured=0
     RockDisplaySubsystemTelemetry("DPED CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(13,"DPED VIDEO TIMING")
   EndIf
+  If RockCruVpllMode()=0
+    RockDisplaySubsystemTelemetry("DPE1 CRU ERR ",rock_cru_error)
+    ProcedureReturn RockDisplayFail(1,"DPE1 SELECTED PIXEL CLOCK")
+  EndIf
+  If RockVopUpMode()=0
+    RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
+    ProcedureReturn RockDisplayFail(10,"DPEA VOPL FRAMEBUFFER")
+  EndIf
+  RockDisplayStage("DP06 COLOR BARS AND TEXT ARMED")
   If RockCdnVideoStatus(1)=0
     RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
   EndIf
-  rock_display_width=#ROCK_FB_WIDTH
-  rock_display_height=#ROCK_FB_HEIGHT
-  rock_display_pitch=#ROCK_FB_WIDTH*4
+  rock_display_width=rock_mode_width
+  rock_display_height=rock_mode_height
+  rock_display_pitch=rock_mode_pitch
   rock_display_buffer=RockVopFramebuffer()
   rock_display_ready=1
-  RockDisplayStage("DP08 VISIBLE 1024X768 COLOR BARS ANVIL ROCK PI 4C")
+  RockDisplayModeTelemetry("DP08 VISIBLE ")
   ProcedureReturn 1
 EndProcedure
 

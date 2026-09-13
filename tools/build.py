@@ -69,7 +69,7 @@ TARGETS = {
         "output": Path("build/rockpi4c/anvil-flat.img"),
         "image_output": Path("build/rockpi4c/Image"),
         "args": ["--load-addr", "0x02000040", "--bss-addr", "0x02800000",
-                 "--stack-addr", "0x03000000"],
+                 "--stack-addr", "0x05000000"],
     },
 }
 TARGET_ALIASES = {"pi3": ("pi3-loader", "pi3-updater")}

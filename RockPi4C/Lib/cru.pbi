@@ -142,7 +142,7 @@ Procedure.i RockCruPllRate(offset.i, integerOnly.i, errorCode.i)
   If (con3 & 8)=0 : fraction=con2 & $FFFFFF : EndIf
   scaled = fb*16777216+fraction
   vco = (24000000*scaled/ref)/16777216
-  rate = vco/post1/post2
+  rate = (24000000*scaled/ref)/(16777216*post1*post2)
   ; These are the RK3399 PLL limits enforced by the pinned U-Boot driver.
   If vco < 800000000 Or vco > 3200000000 Or rate < 16000000 Or rate > 3200000000
     rock_cru_error=errorCode+2 : ProcedureReturn 0
@@ -170,27 +170,44 @@ Procedure.i RockCruWait(offset.i, mask.i, wanted.i)
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i RockCruVpll65()
+Procedure.i RockCruVpllSet(pixelHz.i)
   Protected con2.i
   Protected rate.i
-  ; VPLL is the display-owned pixel parent. Radxa's VPLL-specific 65 MHz
-  ; table entry is refdiv=1, fbdiv=113, postdiv1=7, postdiv2=6 and
-  ; frac=0xC00000. Follow its slow/powerdown/dividers/fraction/powerup/
+  If RockModeVpllPlan(pixelHz)=0 : rock_cru_error=66 : ProcedureReturn 0 : EndIf
+  ; Follow the pinned driver's slow/powerdown/dividers/fraction/powerup/
   ; lock/normal sequence. CON2's 24-bit fraction is an ordinary RMW field.
   RockCruField($CC,$0300,$0000)
   RockCruField($CC,$0001,$0001)
-  RockCruField($C0,$0FFF,$0071)
-  RockCruField($C4,$773F,$6701)
+  RockCruField($C0,$0FFF,rock_mode_vpll_fb)
+  RockCruField($C4,$773F,rock_mode_vpll_ref | (rock_mode_vpll_post1 << 8) | (rock_mode_vpll_post2 << 12))
   con2 = RockCruRead($C8)
-  RockCruWrite($C8,(con2 & $FF000000) | $00C00000)
-  RockCruField($CC,$0008,$0000)
+  RockCruWrite($C8,(con2 & $FF000000) | rock_mode_vpll_frac)
+  RockCruField($CC,$0008,rock_mode_vpll_dsmpd << 3)
   RockCruField($CC,$0001,$0000)
   If RockCruWait($C8,$80000000,$80000000)=0
     rock_cru_error=63 : ProcedureReturn 0
   EndIf
   RockCruField($CC,$0300,$0100)
   rate = RockCruPllRate($C0,0,63)
-  If rate <> 65000000 : rock_cru_error=65 : ProcedureReturn 0 : EndIf
+  If rate <> rock_mode_vpll_actual_hz Or rate>pixelHz Or pixelHz-rate>1
+    rock_cru_error=65 : ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RockCruVpll65()
+  ; The established 1024x768 bootstrap remains fixed until EDID selection.
+  ProcedureReturn RockCruVpllSet(65000000)
+EndProcedure
+
+Procedure.i RockCruVpllMode()
+  ; RockModeSelect publishes validity last. Refuse an unselected mode and
+  ; leave DCLK gated if reprogramming or exact readback fails.
+  If rock_mode_valid=0 : rock_cru_error=66 : ProcedureReturn 0 : EndIf
+  RockCruGate(10,13,0)
+  If RockCruVpllSet(rock_mode_pixel_hz)=0 : ProcedureReturn 0 : EndIf
+  RockCruField(#ROCK_CRU_CLKSEL+$C8,$0BFF,$0000)
+  RockCruGate(10,13,1)
   ProcedureReturn 1
 EndProcedure
 

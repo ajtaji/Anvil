@@ -1,7 +1,8 @@
 # Original ROCK Pi 4C v1.2 foundation
 
-Status: desk proof through the MiniDP first-light implementation. No line in
-this document claims a hardware run.
+Status: build 39 reached MiniDP first light on hardware on September 13, 2026.
+The physical monitor displayed the framebuffer. Preferred-mode selection is
+the next implementation; its hardware proof is separate from that fixed-mode run.
 
 ## Identity and ownership
 
@@ -41,18 +42,20 @@ It parks on every disagreement.
 |---|---|
 | `0x02000000..0x0200003f` | arm64 Image header |
 | `0x02000040..0x027fffff` | linked code window |
-| `0x02800000..0x02bfffff` | compiler BSS window |
-| `0x02f00000..0x02ffffff` | primary cold-entry stack, 1 MiB |
-| `0x03000000..0x030fffff` | held for later exception/multicore ownership |
+| `0x02800000..0x03ffffff` | compiler BSS window, including bounded scanout |
+| `0x04f00000..0x04ffffff` | primary cold-entry stack, 1 MiB |
+| `0x05000000..0x050fffff` | held for later exception/multicore ownership |
 | `0x12000000..0x121fffff` | exact external FDT handoff window |
 
 The compiler refuses placement outside the conservative
 `0x02000000..0x11ffffff` bootstrap envelope. The runtime rejects an FDT or
-firmware reserve-map entry that intersects `0x02000000..0x030fffff`.
+firmware reserve-map entry that intersects `0x02000000..0x050fffff`.
 Installed 4 GiB is not treated as permission to allocate it; widening memory
 ownership requires parsing the live memory and reserved-memory nodes.
-The 1024x768x32 framebuffer is a 3,145,728-byte, 16-byte-aligned static object
-inside that BSS window. The compiler gate proves its complete allocation before
+The framebuffer reserves 2560x1600x32 bits (16,384,000 bytes) plus alignment
+slack inside that BSS window. This is the pinned little-VOP maximum output,
+not an assumption about the attached monitor. Selected pitch and height must
+fit that allocation. The compiler gate proves its complete allocation before
 an image is accepted.
 
 ## Earliest witness, vectors, timer and GIC
@@ -100,7 +103,8 @@ core frequency in whole MHz.
 The established deployment chain is stock U-Boot, a serial-capable U-Boot
 loaded into RAM from the removable SD, then Anvil's Image and DTB transferred
 over FTDI/XMODEM. The Anvil image and DTB passed board CRC checks twice before
-entry. Display output has not yet passed a silicon test.
+entry. Build 39 subsequently passed PHY readiness, EDID, training and video
+valid, and the physical monitor displayed the 1024x768 color bars and title.
 
 Build 36 passed clocks, power, and Cadence firmware startup on the board,
 then stopped inside PHY initialization. The source audit found a swapped
@@ -130,22 +134,26 @@ Cold bring-up is ordered and fail-closed:
    mode and AUX, then release blocks only when their dependencies are live;
 4. load the exact Cadence DPTX IRAM/DRAM firmware, require its keep-alive,
    enable the host/event contract, and require HPD;
-5. read DPCD and a checksum-valid EDID base block, refusing displays that do
-   not advertise the EDID established 1024x768@60 timing;
-6. render eight deterministic ARGB color bars plus `ANVIL ROCK PI 4C`, route
-   VOPL, require the firmware link-training EQ-complete event and valid one- or
-   two-lane link status, program corrected MHz-based transfer-unit arithmetic,
-   then mark video valid.
+5. read DPCD and validate the EDID base block, then select its first detailed
+   timing within the VOP, pixel-clock and two-lane bandwidth limits;
+6. require the firmware link-training EQ-complete event and valid one- or
+   two-lane link status; program transfer-unit and stream timing while idle;
+7. apply the selected dedicated VPLL clock, render eight ARGB color bars plus
+   `ANVIL ROCK PI 4C` with the selected stride, program matching VOP timing and
+   polarity, then mark video valid. A rejected preferred timing falls back to
+   1024x768@60 only if the same valid EDID advertises it. Serial output gives
+   the selected dimensions, pixel frequency, source and rejection reason.
 
-This is intentionally one conservative mode, not a general display mode
-picker. Link training uses the Cadence firmware's fixed PHY settings, matching
+This supports the base EDID preferred progressive separate-sync timing plus
+an explicitly advertised established fallback, not all extension-block modes.
+Link training uses the Cadence firmware's fixed PHY settings, matching
 the reference driver's documented fallback. A silicon failure at training may
 justify adding software training with per-request TCPHY swing/pre-emphasis;
 desk evidence is not permission to add it speculatively.
 
 The UART trace identifies the last completed stage: `DP00` begins the cold
 path, `DP01` through `DP07` identify clocks/power, PHY, firmware, HPD,
-DPCD/EDID, framebuffer, and trained link, and `DP08 VISIBLE 1024x768` is issued
+DPCD/EDID, framebuffer, and trained link, and `DP08 VISIBLE <width>X<height>` is issued
 only after video is marked valid. `DPE1` through `DPEE` are terminal stage
 refusals.
 
@@ -157,14 +165,17 @@ python tools/rockpi4c_display_check.py --compiler <candidate>
 python tools/build.py rockpi4c --compiler <candidate>
 ```
 
-Before the first board run, verify the generated `Image.json` hash, attach a
-known 1024x768-capable MiniDP display before power-on, and retain the proven
-stock-U-Boot recovery media. First-run acceptance is only:
+Before a board run, verify the generated `Image.json` hash, attach the MiniDP
+display before power-on, and retain the proven stock-U-Boot recovery media.
+Preferred-mode acceptance is:
 
 1. the early UART witness appears at 1,500,000 baud;
 2. no refusal appears;
-3. stages `DP00` through `DP08` appear in order;
-4. eight color bars and `ANVIL ROCK PI 4C` are stable at 1024x768;
+3. clock/PHY/EDID stages precede link training (`DP07`), then framebuffer
+   arming (`DP06`) and valid video (`DP08`);
+4. eight color bars and `ANVIL ROCK PI 4C` are stable at the reported preferred
+   resolution; if fallback is required its reason and preferred dimensions
+   are explicit, and full preferred-mode proof remains unmet;
 5. `FOUNDATION READY; IRQ STILL MASKED` appears;
 6. U-Boot recovery still works after a power cycle.
 

@@ -31,7 +31,7 @@ def static_contract() -> None:
     ).lower()
     required = (
         "pmf:target rockpi4c", "pmf:load $02000040", "pmf:bss $02800000",
-        "pmf:stack $03000000", "$ff1a0000", "$fee00000", "$fef00000",
+        "pmf:stack $05000000", "$ff1a0000", "$fee00000", "$fef00000",
         "cntpct_el0", "vbar_el2", "icc_sre_el2", "rockgicfindredistributor",
         "serial2:1500000n8", "irq still masked",
     )
@@ -81,7 +81,7 @@ def compiler_contract(compiler: Path) -> None:
         command = [
             str(compiler), "--compile", "RockPi4C/Board/board.rockpi4c",
             "-t", "rockpi4c", "--load-addr", "0x02000040", "--bss-addr",
-            "0x02800000", "--stack-addr", "0x03000000", "--jobs", "auto",
+            "0x02800000", "--stack-addr", "0x05000000", "--jobs", "auto",
             "-S", "-o", str(output),
         ]
         run = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,

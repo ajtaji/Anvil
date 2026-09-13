@@ -1,6 +1,7 @@
 # ROCK Pi 4C v1.2
 
-Status: **desk-built MiniDP first-light path; not yet run on hardware**.
+Status: **MiniDP first light confirmed on hardware in build 39**. Automatic
+preferred-monitor mode selection is implemented next; its board proof is pending.
 
 `Board/board.rockpi4c` is the first runnable composition root. It has an
 explicit RK3399 compiler target, an arm64 U-Boot `Image` wrapper, bounded
@@ -8,8 +9,11 @@ architectural timing, adopted UART2 at 1,500,000 baud, fail-closed FDT/EL2
 entry validation, an EL2 fatal-vector table, and a GICv3 current-core/timer
 foundation. It then owns the RK3399 display power domains, clocks and resets,
 brings up TCPHY0 in the board's two-lane DP plus USB3 split mode, loads the
-Cadence DPTX firmware, reads DPCD and EDID, trains the link, and scans a fixed
-1024x768@60 ARGB framebuffer from VOPL. IRQ remains masked and the monitor
+Cadence DPTX firmware, reads DPCD and EDID, trains the link, and scans an ARGB
+framebuffer from VOPL. Build 39 proved 1024x768@60. The mode-aware path selects
+the monitor's first detailed timing within VOPL's 2560x1600 limit, applies its
+clock, stride and sync polarity, and reports any advertised fallback explicitly.
+IRQ remains masked and the monitor
 parks after reporting readiness.
 This is the original 4C, not the 4C+ with RK3399-T.
 

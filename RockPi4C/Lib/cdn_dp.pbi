@@ -415,25 +415,12 @@ Procedure.i RockCdnReadEdidBlock(block.i, destination.i)
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i RockCdnEdidSupports1024x768()
-  Protected index.i
-  Protected sum.i
-  For index = 0 To 127
-    sum = (sum + (PeekA(@rock_cdn_edid[0]+index) & 255)) & 255
-  Next
-  If sum <> 0 Or RockCdnLe32(@rock_cdn_edid[0]) <> $FFFFFF00 Or RockCdnLe32(@rock_cdn_edid[0]+4) <> $00FFFFFF
-    rock_cdn_error = 30 : ProcedureReturn 0
-  EndIf
-  ; EDID established timing byte 36 bit 3 is 1024x768 at 60 Hz.
-  If ((PeekA(@rock_cdn_edid[0]+36) & 255) & 8) = 0
-    rock_cdn_error = 31 : ProcedureReturn 0
-  EndIf
-  ProcedureReturn 1
-EndProcedure
-
 Procedure.i RockCdnReadEdid()
   If RockCdnReadEdidBlock(0,@rock_cdn_edid[0]) = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn RockCdnEdidSupports1024x768()
+  If RockModeSelect(@rock_cdn_edid[0]) = 0
+    rock_cdn_error = 30 : ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i RockCdnTrain()
@@ -462,8 +449,8 @@ Procedure.i RockCdnVideoStatus(active.i)
   ProcedureReturn RockCdnSend(#CDN_MB_DP_TX,#CDN_SET_VIDEO,1,@rock_cdn_message[0])
 EndProcedure
 
-Procedure.i RockCdnLinkCarries1024x768(linkMHz.i)
-  Protected requiredMbps.i = (65000 * 24 + 999) / 1000
+Procedure.i RockCdnLinkCarriesMode(linkMHz.i)
+  Protected requiredMbps.i = (rock_mode_pixel_hz * 24 + 999999) / 1000000
   Protected availableMbps.i
   If linkMHz <= 0 Or rock_cdn_link_lanes < 1 Or rock_cdn_link_lanes > 2 : ProcedureReturn 0 : EndIf
   ; DP 1.1/1.2 uses 8b/10b coding. A link-rate code of 162 means 1.62
@@ -472,47 +459,50 @@ Procedure.i RockCdnLinkCarries1024x768(linkMHz.i)
   ProcedureReturn Bool(requiredMbps <= availableMbps)
 EndProcedure
 
-Procedure.i RockCdnVideo1024x768()
+Procedure.i RockCdnVideoMode()
   Protected linkMHz.i
   Protected tu.i = 30
   Protected scaled.i
   Protected symbol.i
   Protected remainder.i
   Protected value.i
+  Protected pixelKHz.i = rock_mode_pixel_hz / 1000
+  Protected negativeH.i = Bool(rock_mode_hsync_positive = 0)
+  Protected negativeV.i = Bool(rock_mode_vsync_positive = 0)
   Select rock_cdn_link_rate
     Case #CDN_LINK_RBR : linkMHz = 162
     Case #CDN_LINK_HBR : linkMHz = 270
     Case #CDN_LINK_HBR2 : linkMHz = 540
     Default : rock_cdn_error = 34 : ProcedureReturn 0
   EndSelect
-  If RockCdnLinkCarries1024x768(linkMHz) = 0 : rock_cdn_error = 35 : ProcedureReturn 0 : EndIf
+  If RockCdnLinkCarriesMode(linkMHz) = 0 : rock_cdn_error = 35 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_BND_HSYNC2VSYNC,$2000) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_HSYNC2VSYNC_POL_CTRL,0) = 0 : ProcedureReturn 0 : EndIf
   Repeat
     tu = tu + 2
-    scaled = (tu * 65000 * 24) / (rock_cdn_link_lanes * linkMHz * 8)
+    scaled = (tu * pixelKHz * 24) / (rock_cdn_link_lanes * linkMHz * 8)
     symbol = scaled / 1000
     remainder = scaled - symbol * 1000
     If tu > 64 : rock_cdn_error = 36 : ProcedureReturn 0 : EndIf
   Until symbol > 1 And tu-symbol >= 4 And remainder <= 850 And remainder >= 100
   If RockCdnRegWrite(#CDN_FRAMER_TU,symbol | (tu << 8) | $8000) = 0 : ProcedureReturn 0 : EndIf
-  value = ((65000 * (symbol+1) / 1000) + linkMHz) / (rock_cdn_link_lanes*linkMHz)
+  value = ((pixelKHz * (symbol+1) / 1000) + linkMHz) / (rock_cdn_link_lanes*linkMHz)
   value = 8*(symbol+1)/24 - value + 2
   If RockCdnRegWrite($2254,value) = 0 : ProcedureReturn 0 : EndIf
   ; Cadence encodes negative sync as one in FRAMER_SP and in MSA bit 15.
   If RockCdnRegWrite(#CDN_FRAMER_PXL_REPR,$102) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_FRAMER_SP,3) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_FRONT_BACK_PORCH,(24 << 16) | 160) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_BYTE_COUNT,3072) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_0,1344 | (296 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_1,136 | #CDN_SYNC_NEGATIVE | (1024 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_MSA_VERTICAL_0,806 | (35 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_MSA_VERTICAL_1,6 | #CDN_SYNC_NEGATIVE | (768 << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_FRAMER_SP,negativeH | (negativeV << 1)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_FRONT_BACK_PORCH,((rock_mode_hsync_start-rock_mode_width) << 16) | (rock_mode_htotal-rock_mode_hsync_end)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_BYTE_COUNT,rock_mode_width*3) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_0,rock_mode_htotal | ((rock_mode_htotal-rock_mode_hsync_start) << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_1,(rock_mode_hsync_end-rock_mode_hsync_start) | (negativeH << 15) | (rock_mode_width << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_MSA_VERTICAL_0,rock_mode_vtotal | ((rock_mode_vtotal-rock_mode_vsync_start) << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_MSA_VERTICAL_1,(rock_mode_vsync_end-rock_mode_vsync_start) | (negativeV << 15) | (rock_mode_height << 16)) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_MSA_MISC,32) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_STREAM_CONFIG,1) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_HORIZONTAL,136 | (1024 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_VERTICAL_0,768 | (35 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_VERTICAL_1,806) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_HORIZONTAL,(rock_mode_hsync_end-rock_mode_hsync_start) | (rock_mode_width << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_VERTICAL_0,rock_mode_height | ((rock_mode_vtotal-rock_mode_vsync_start) << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_VERTICAL_1,rock_mode_vtotal) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn RockCdnRegField(#CDN_VB_ID,2,1,0)
 EndProcedure
 
