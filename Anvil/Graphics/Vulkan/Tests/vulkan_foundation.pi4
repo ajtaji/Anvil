@@ -42,6 +42,9 @@ Procedure.i Main()
   Define qf.VkQueueFamilyProperties
   Define qfCount.l
   Define selectedFamily.i
+  Define features.VkPhysicalDeviceFeatures
+  Define featureFailures.i
+  Define i.i
 
   ; ------------------------------------------------------------------
   ;  Exact AArch64 C layout of every public record.
@@ -65,6 +68,9 @@ Procedure.i Main()
   Vkt(OffsetOf(VkApplicationInfo\pEngineName) = 32)
   Vkt(OffsetOf(VkApplicationInfo\apiVersion) = 44)
   Vkt(SizeOf(VkAllocationCallbacks) = 48)
+  Vkt(SizeOf(VkPhysicalDeviceFeatures) = 220)
+  Vkt(OffsetOf(VkPhysicalDeviceFeatures\robustBufferAccess) = 0)
+  Vkt(OffsetOf(VkPhysicalDeviceFeatures\inheritedQueries) = 216)
   Vkt(SizeOf(VkDeviceQueueCreateInfo) = 40)
   Vkt(OffsetOf(VkDeviceQueueCreateInfo\pNext) = 8)
   Vkt(OffsetOf(VkDeviceQueueCreateInfo\pQueuePriorities) = 32)
@@ -168,6 +174,22 @@ Procedure.i Main()
   Vkt(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS)
   Vkt(count = 1 And phys <> 0)
 
+  ; The query owns the all-false feature record. Poison every byte first:
+  ; merely leaving caller memory untouched cannot look like support for none.
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    PokeL(@features + i, $FFFFFFFF)
+    i = i + 4
+  Wend
+  vkGetPhysicalDeviceFeatures(phys, @features)
+  featureFailures = 0
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    If PeekL(@features + i) <> #VK_FALSE : featureFailures = featureFailures + 1 : EndIf
+    i = i + 4
+  Wend
+  Vkt(featureFailures = 0)
+
   ; The draw-capable test backend advertises a normal Vulkan graphics
   ; queue as well as transfer. An application scanning queue families
   ; for VK_QUEUE_GRAPHICS_BIT therefore selects family zero.
@@ -219,8 +241,26 @@ Procedure.i Main()
   dci\enabledExtensionCount = 1
   Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #VK_ERROR_EXTENSION_NOT_PRESENT)
   dci\enabledExtensionCount = 0
-  dci\pEnabledFeatures = @dci
-  Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #VK_ERROR_FEATURE_NOT_PRESENT)
+
+  ; A non-null all-false structure is explicitly valid. Then turn on
+  ; each of the 55 members in isolation and require every one to be
+  ; refused, so a partial scan cannot masquerade as complete validation.
+  dci\pEnabledFeatures = @features
+  Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+  vkDestroyDevice(dev, 0)
+  featureFailures = 0
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    PokeL(@features + i, #VK_TRUE)
+    dev = #VK_NULL_HANDLE
+    If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_ERROR_FEATURE_NOT_PRESENT
+      featureFailures = featureFailures + 1
+      If dev <> #VK_NULL_HANDLE : vkDestroyDevice(dev, 0) : EndIf
+    EndIf
+    PokeL(@features + i, #VK_FALSE)
+    i = i + 4
+  Wend
+  Vkt(featureFailures = 0)
   dci\pEnabledFeatures = 0
   qci\queueCount = 2
   Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #ANVIL_VK_ERR_ARGS)

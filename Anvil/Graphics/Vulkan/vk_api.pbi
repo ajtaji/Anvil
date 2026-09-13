@@ -143,6 +143,35 @@ Procedure vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice.i, *pQueueFami
   PokeL(*pQueueFamilyPropertyCount, 1)
 EndProcedure
 
+; The structure is part of the core query contract even though this
+; deliberately small device exposes no optional feature bit yet.
+Procedure vkGetPhysicalDeviceFeatures(physicalDevice.i, *pFeatures.VkPhysicalDeviceFeatures)
+  Define i.i
+  If *pFeatures = 0
+    ProcedureReturn
+  EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetPhysicalDeviceFeatures was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the structure was left untouched, so do not read it.")
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    PokeL(*pFeatures + i, #VK_FALSE)
+    i = i + SizeOf(.l)
+  Wend
+EndProcedure
+
+Procedure.i avkFeaturesAllFalse(*pFeatures.VkPhysicalDeviceFeatures)
+  Define i.i
+  If *pFeatures = 0 : ProcedureReturn 1 : EndIf
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    If PeekL(*pFeatures + i) <> #VK_FALSE : ProcedureReturn 0 : EndIf
+    i = i + SizeOf(.l)
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i vkCreateDevice(physicalDevice.i, *pCreateInfo.VkDeviceCreateInfo, *pAllocator, *pDevice)
   Define rc.i
   Define *qi.VkDeviceQueueCreateInfo
@@ -158,8 +187,8 @@ Procedure.i vkCreateDevice(physicalDevice.i, *pCreateInfo.VkDeviceCreateInfo, *p
   If *pCreateInfo\enabledExtensionCount <> 0
     ProcedureReturn avkFault(#VK_ERROR_EXTENSION_NOT_PRESENT, "vkCreateDevice was asked to enable a device extension (VkResult -7, VK_ERROR_EXTENSION_NOT_PRESENT); no device was created. Anvil implements no device extensions, so VK_KHR_swapchain in particular is not available.")
   EndIf
-  If *pCreateInfo\pEnabledFeatures <> 0
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateDevice was asked to enable device features (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no device was created. Every VkPhysicalDeviceFeatures member is false on this device, so pEnabledFeatures must be null or all-false; pass null.")
+  If avkFeaturesAllFalse(*pCreateInfo\pEnabledFeatures) = 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateDevice was asked to enable a VkPhysicalDeviceFeatures bit this device reports false (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no device was created. Query vkGetPhysicalDeviceFeatures and leave every unsupported member false.")
   EndIf
   If *pCreateInfo\queueCreateInfoCount <> 1 Or *pCreateInfo\pQueueCreateInfos = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateDevice was asked for a number of queue families this device does not have (Anvil code -20001, invalid queue request); there is exactly one queue family, so queueCreateInfoCount must be one.")

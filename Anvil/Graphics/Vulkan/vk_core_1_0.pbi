@@ -237,6 +237,67 @@ Structure VkDeviceQueueCreateInfo Align #PB_Structure_AlignC
   *pQueuePriorities
 EndStructure
 
+; Core 1.0 feature query/enable record. Every member is VkBool32: four
+; bytes in the registry ABI. Anvil reports every member false today,
+; but callers may still pass a non-null all-false record to vkCreateDevice.
+Structure VkPhysicalDeviceFeatures Align #PB_Structure_AlignC
+  robustBufferAccess.l
+  fullDrawIndexUint32.l
+  imageCubeArray.l
+  independentBlend.l
+  geometryShader.l
+  tessellationShader.l
+  sampleRateShading.l
+  dualSrcBlend.l
+  logicOp.l
+  multiDrawIndirect.l
+  drawIndirectFirstInstance.l
+  depthClamp.l
+  depthBiasClamp.l
+  fillModeNonSolid.l
+  depthBounds.l
+  wideLines.l
+  largePoints.l
+  alphaToOne.l
+  multiViewport.l
+  samplerAnisotropy.l
+  textureCompressionETC2.l
+  textureCompressionASTC_LDR.l
+  textureCompressionBC.l
+  occlusionQueryPrecise.l
+  pipelineStatisticsQuery.l
+  vertexPipelineStoresAndAtomics.l
+  fragmentStoresAndAtomics.l
+  shaderTessellationAndGeometryPointSize.l
+  shaderImageGatherExtended.l
+  shaderStorageImageExtendedFormats.l
+  shaderStorageImageMultisample.l
+  shaderStorageImageReadWithoutFormat.l
+  shaderStorageImageWriteWithoutFormat.l
+  shaderUniformBufferArrayDynamicIndexing.l
+  shaderSampledImageArrayDynamicIndexing.l
+  shaderStorageBufferArrayDynamicIndexing.l
+  shaderStorageImageArrayDynamicIndexing.l
+  shaderClipDistance.l
+  shaderCullDistance.l
+  shaderFloat64.l
+  shaderInt64.l
+  shaderInt16.l
+  shaderResourceResidency.l
+  shaderResourceMinLod.l
+  sparseBinding.l
+  sparseResidencyBuffer.l
+  sparseResidencyImage2D.l
+  sparseResidencyImage3D.l
+  sparseResidency2Samples.l
+  sparseResidency4Samples.l
+  sparseResidency8Samples.l
+  sparseResidency16Samples.l
+  sparseResidencyAliased.l
+  variableMultisampleRate.l
+  inheritedQueries.l
+EndStructure
+
 Structure VkDeviceCreateInfo Align #PB_Structure_AlignC
   sType.l
   *pNext

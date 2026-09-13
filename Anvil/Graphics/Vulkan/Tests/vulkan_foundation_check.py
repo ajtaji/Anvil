@@ -144,6 +144,48 @@ STRUCTS = {
                                 ("VkDeviceQueueCreateFlags", "flags"),
                                 ("uint32_t", "queueFamilyIndex"),
                                 ("uint32_t", "queueCount"), ("float", "pQueuePriorities")),
+    "VkPhysicalDeviceFeatures": (
+        ("VkBool32", "robustBufferAccess"), ("VkBool32", "fullDrawIndexUint32"),
+        ("VkBool32", "imageCubeArray"), ("VkBool32", "independentBlend"),
+        ("VkBool32", "geometryShader"), ("VkBool32", "tessellationShader"),
+        ("VkBool32", "sampleRateShading"), ("VkBool32", "dualSrcBlend"),
+        ("VkBool32", "logicOp"), ("VkBool32", "multiDrawIndirect"),
+        ("VkBool32", "drawIndirectFirstInstance"), ("VkBool32", "depthClamp"),
+        ("VkBool32", "depthBiasClamp"), ("VkBool32", "fillModeNonSolid"),
+        ("VkBool32", "depthBounds"), ("VkBool32", "wideLines"),
+        ("VkBool32", "largePoints"), ("VkBool32", "alphaToOne"),
+        ("VkBool32", "multiViewport"), ("VkBool32", "samplerAnisotropy"),
+        ("VkBool32", "textureCompressionETC2"),
+        ("VkBool32", "textureCompressionASTC_LDR"),
+        ("VkBool32", "textureCompressionBC"),
+        ("VkBool32", "occlusionQueryPrecise"),
+        ("VkBool32", "pipelineStatisticsQuery"),
+        ("VkBool32", "vertexPipelineStoresAndAtomics"),
+        ("VkBool32", "fragmentStoresAndAtomics"),
+        ("VkBool32", "shaderTessellationAndGeometryPointSize"),
+        ("VkBool32", "shaderImageGatherExtended"),
+        ("VkBool32", "shaderStorageImageExtendedFormats"),
+        ("VkBool32", "shaderStorageImageMultisample"),
+        ("VkBool32", "shaderStorageImageReadWithoutFormat"),
+        ("VkBool32", "shaderStorageImageWriteWithoutFormat"),
+        ("VkBool32", "shaderUniformBufferArrayDynamicIndexing"),
+        ("VkBool32", "shaderSampledImageArrayDynamicIndexing"),
+        ("VkBool32", "shaderStorageBufferArrayDynamicIndexing"),
+        ("VkBool32", "shaderStorageImageArrayDynamicIndexing"),
+        ("VkBool32", "shaderClipDistance"), ("VkBool32", "shaderCullDistance"),
+        ("VkBool32", "shaderFloat64"), ("VkBool32", "shaderInt64"),
+        ("VkBool32", "shaderInt16"), ("VkBool32", "shaderResourceResidency"),
+        ("VkBool32", "shaderResourceMinLod"), ("VkBool32", "sparseBinding"),
+        ("VkBool32", "sparseResidencyBuffer"),
+        ("VkBool32", "sparseResidencyImage2D"),
+        ("VkBool32", "sparseResidencyImage3D"),
+        ("VkBool32", "sparseResidency2Samples"),
+        ("VkBool32", "sparseResidency4Samples"),
+        ("VkBool32", "sparseResidency8Samples"),
+        ("VkBool32", "sparseResidency16Samples"),
+        ("VkBool32", "sparseResidencyAliased"),
+        ("VkBool32", "variableMultisampleRate"),
+        ("VkBool32", "inheritedQueries")),
     "VkDeviceCreateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
                            ("VkDeviceCreateFlags", "flags"),
                            ("uint32_t", "queueCreateInfoCount"),
@@ -783,9 +825,45 @@ def queue_capability_mutation() -> tuple[bool, str]:
         API.write_text(original, encoding="utf-8")
 
 
+def feature_mutations() -> list[tuple[str, bool, str]]:
+    """Require query zeroing, all-false acceptance and a complete enable scan."""
+    mutants = (
+        ("the feature query reports a true bit",
+         "    PokeL(*pFeatures + i, #VK_FALSE)\n",
+         "    PokeL(*pFeatures + i, #VK_TRUE)\n"),
+        ("a non-null all-false feature record is refused",
+         "  If avkFeaturesAllFalse(*pCreateInfo\\pEnabledFeatures) = 0\n",
+         "  If *pCreateInfo\\pEnabledFeatures <> 0\n"),
+        ("only the first feature bit is checked",
+         "Procedure.i avkFeaturesAllFalse(*pFeatures.VkPhysicalDeviceFeatures)\n  Define i.i\n  If *pFeatures = 0 : ProcedureReturn 1 : EndIf\n  i = 0\n  While i < SizeOf(VkPhysicalDeviceFeatures)\n",
+         "Procedure.i avkFeaturesAllFalse(*pFeatures.VkPhysicalDeviceFeatures)\n  Define i.i\n  If *pFeatures = 0 : ProcedureReturn 1 : EndIf\n  i = 0\n  While i < 4\n"),
+    )
+    original = API.read_text(encoding="utf-8")
+    results = []
+    for name, fixed, broken in mutants:
+        if original.count(fixed) != 1:
+            results.append((name, False, "mutation anchor is stale"))
+            continue
+        try:
+            API.write_text(original.replace(fixed, broken, 1), encoding="utf-8")
+            cpu, rc, _ = run_image(build(PROBE, "anvil_vk_foundation_feature_mutant.img"))
+            count = u64(cpu, OUT + 8)
+            failures = u64(cpu, OUT + 16)
+            failed_rows = [i + 1 for i in range(count)
+                           if u64(cpu, OUT + 0x100 + i * 8) == 0]
+            caught = rc != 0 and failures != 0
+            detail = ("rejected at emitted rows " + ",".join(map(str, failed_rows))
+                      if caught else "stayed green")
+            results.append((name, caught, detail))
+        finally:
+            API.write_text(original, encoding="utf-8")
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutate-queue", action="store_true")
+    parser.add_argument("--mutate-features", action="store_true")
     args = parser.parse_args()
     failures = []
     checks = check_registry(failures)
@@ -845,6 +923,12 @@ def main() -> int:
             print("vulkan_foundation_check: GREEN queue capability mutant - " + detail)
             return 1
         print("  RED queue capability mutant - " + detail)
+    if args.mutate_features:
+        for name, caught, detail in feature_mutations():
+            if not caught:
+                print("vulkan_foundation_check: GREEN feature mutant - " + name + " - " + detail)
+                return 1
+            print("  RED feature mutant - " + name + " - " + detail)
     return 0
 
 
