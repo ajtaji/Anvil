@@ -219,6 +219,9 @@ Procedure RockDisplayFrameTelemetry()
   Protected hz.i
   Protected attempts.i
   Protected settleRaw.i
+  Protected busFaultFrames.i
+  Protected win0FaultFrames.i
+  Protected postFaultFrames.i
   ; Pinned RK3399 VOPL RAW_STATUS0 latches frame-start and underrun causes.
   ; Clear uses the VOP write-mask convention: mask in the high half and the
   ; same asserted bits in the low half. CPU interrupts remain disabled.
@@ -226,6 +229,7 @@ Procedure RockDisplayFrameTelemetry()
   ; that initial state separately, then let both FIFOs run for several frames
   ; before clearing and measuring the steady path. Otherwise a legitimate
   ; first-fill POST_BUF_EMPTY latch is indistinguishable from a continuing
+  ; initial POST_BUF_EMPTY latch is indistinguishable from a continuing
   ; memory/scanout underrun.
   settleRaw=RockVopRead(#VOP_INTR_RAW_STATUS0)
   RockTimerWaitUs(200000)
@@ -237,7 +241,10 @@ Procedure RockDisplayFrameTelemetry()
     faults=faults | (raw & (#VOP_INTR_BUS_ERROR | #VOP_INTR_WIN0_EMPTY | #VOP_INTR_POST_EMPTY))
     If (raw & #VOP_INTR_FS) <> 0
       frames=frames+1
-      RockVopWrite(#VOP_INTR_CLEAR0,$00010001)
+      If (raw & #VOP_INTR_BUS_ERROR) <> 0 : busFaultFrames=busFaultFrames+1 : EndIf
+      If (raw & #VOP_INTR_WIN0_EMPTY) <> 0 : win0FaultFrames=win0FaultFrames+1 : EndIf
+      If (raw & #VOP_INTR_POST_EMPTY) <> 0 : postFaultFrames=postFaultFrames+1 : EndIf
+      RockVopWrite(#VOP_INTR_CLEAR0,$08610861)
       If frames=8 : Break : EndIf
     EndIf
     now=RockTimerTicks()
@@ -251,7 +258,10 @@ Procedure RockDisplayFrameTelemetry()
   RockUartText(" STABLE FRAMES ") : RockDisplayDecimal(frames)
   RockUartText(" HZ ") : RockDisplayDecimal(hz)
   RockUartText(" RAW/FAULT ") : RockDisplayHexLong(raw) : RockUartByte(32)
-  RockDisplayHexLong(faults) : RockUartByte(13) : RockUartByte(10)
+  RockDisplayHexLong(faults)
+  RockUartText(" COUNT B/W/P ") : RockDisplayDecimal(busFaultFrames) : RockUartByte(47)
+  RockDisplayDecimal(win0FaultFrames) : RockUartByte(47) : RockDisplayDecimal(postFaultFrames)
+  RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
 Procedure RockDisplaySubsystemTelemetry(text.i, error.i)

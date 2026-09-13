@@ -588,6 +588,11 @@ def source_contract() -> None:
             vop_up.index("rockcrureset(279,0)") < vop_up.index(outstanding) <
             vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
             "VOP 30-read AXI throughput contract is absent or armed too late")
+    gather = "rockvopfield(#vop_win0_ctrl1,#vop_win0_gather_mask,#vop_win0_argb8888_gather)"
+    require(gather in vop_up and
+            vop_up.index("rockvopwrite(#vop_win0_vir") < vop_up.index(gather) <
+            vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
+            "ARGB8888 AXI gather contract is absent or armed after WIN0")
     for timing in (
         "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
         "rockvopwrite(#vop_hact,hactiveend | (hactivestart << 16))",

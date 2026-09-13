@@ -17,6 +17,10 @@
 #VOP_WIN_LB_MODE_SHIFT = 5
 #VOP_LB_RGB_2560X4 = 3
 #VOP_LB_RGB_1920X5 = 4
+; Rockchip's RK3368/RK3399-generation VOP driver programs both gather enables
+; and uses three YRGB gathers plus one CBCR gather for ARGB8888 scanout.
+#VOP_WIN0_GATHER_MASK = $00007F03
+#VOP_WIN0_ARGB8888_GATHER = $00001303
 
 #VOP_CFG_DONE = $000
 #VOP_SYS_CTRL = $008
@@ -302,6 +306,7 @@ Procedure.i RockVopUpMode()
   RockVopWrite(#VOP_WIN0_DSP_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
   RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
   RockVopWrite(#VOP_WIN0_VIR,rock_mode_pitch >> 2)
+  RockVopField(#VOP_WIN0_CTRL1,#VOP_WIN0_GATHER_MASK,#VOP_WIN0_ARGB8888_GATHER)
   RockVopWrite(#VOP_WIN0_CTRL0,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)
