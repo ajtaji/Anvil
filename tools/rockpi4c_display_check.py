@@ -59,6 +59,13 @@ def source_contract() -> None:
     ]
     positions = [display.index(token) for token in order]
     require(positions == sorted(positions), "cold-to-visible stage order drifted")
+    prepare_failure = display.split("if rockcrudisplayprepare()=0", 1)[1].split(
+        "endif", 1
+    )[0]
+    require("rockdisplaycrutelemetry()" in prepare_failure and
+            prepare_failure.index("rockdisplaycrutelemetry()") <
+            prepare_failure.index("rockdisplayfail(1"),
+            "DPE1 no longer emits CRU/PMU evidence before refusing")
     cru = libraries["cru.pbi"].lower()
     power_order = ["rockpmupoweron(14", "rockpmupoweron(24",
                    "rockpmupoweron(20", "rockpmuidlerelease(8",
@@ -68,6 +75,35 @@ def source_contract() -> None:
     require("gpio1_d0, not gpio1_c0" in cru, "exact MiniDP power pin correction missing")
     require("$00030000" in cru and "$00030001" in cru,
             "GPIO1_D0 input/pull-up pinctrl contract missing")
+    cru_telemetry = display.split("procedure rockdisplaycrutelemetry()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in (
+        'rockuarttext("dpe1 detail err ")', 'rockuarttext(" source ")',
+        'rockuarttext("cpll")', 'rockuarttext("gpll")',
+        'rockuarttext("vio")', 'rockuarttext("hdcp")',
+        'rockuarttext("vo")', 'rockuarttext("vopl")',
+        'rockuarttext("tcpd0")', 'rockuarttext("reset")',
+        "rockcruread($60)", "rockcruread($64)", "rockcruread($68)",
+        "rockcruread($6c)", "rockcruread($80)", "rockcruread($84)",
+        "rockcruread($88)", "rockcruread($8c)",
+        "peekl(#rock_pmu+#rock_pmu_pwrdn_st) & $ffffffff",
+        "peekl(#rock_pmu+#rock_pmu_bus_idle_req) & $ffffffff",
+        "peekl(#rock_pmu+#rock_pmu_bus_idle_st) & $ffffffff",
+        "peekl(#rock_pmu+#rock_pmu_bus_idle_ack) & $ffffffff",
+    ):
+        require(token in cru_telemetry, f"DPE1 raw witness drifted: {token}")
+    for token in ("rockcrurequirepll($60,384000000,47)",
+                  "rockcrurequirepll($80,594000000,50)",
+                  "rock_cru_error=errorcode",
+                  "rock_cru_error=errorcode+1",
+                  "rock_cru_error=errorcode+2"):
+        require(token in cru, f"DPE1 PLL refusal mapping drifted: {token}")
+    for token in ("rockpmupoweron(14,53)", "rockpmuidlerelease(17,54)",
+                  "rockpmupoweron(24,56)", "rockpmuidlerelease(11,57)",
+                  "rockpmupoweron(20,59)", "rockpmuidlerelease(8,60)",
+                  "rockpmupoweron(8,62)"):
+        require(token in cru, f"DPE1 PMU refusal mapping drifted: {token}")
     vop = libraries["vop.pbi"].lower()
     require("procedure.i rockvopframebuffer()" in vop and
             "& $fffffffffffffff0" in vop,

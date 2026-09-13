@@ -39,6 +39,64 @@ Procedure RockDisplayHexWord(value.i)
   RockDisplayHexByte(value & 255)
 EndProcedure
 
+Procedure RockDisplayHexLong(value.i)
+  RockDisplayHexWord((value >> 16) & $FFFF)
+  RockDisplayHexWord(value & $FFFF)
+EndProcedure
+
+Procedure RockDisplayCruTelemetry()
+  If rock_uart_ready <> 0
+    RockUartText("DPE1 DETAIL ERR ")
+    RockDisplayHexByte(rock_cru_error)
+    RockUartText(" SOURCE ")
+    If rock_cru_error >= 47 And rock_cru_error <= 49
+      RockUartText("CPLL")
+    ElseIf rock_cru_error >= 50 And rock_cru_error <= 52
+      RockUartText("GPLL")
+    ElseIf rock_cru_error >= 53 And rock_cru_error <= 55
+      RockUartText("VIO")
+    ElseIf rock_cru_error >= 56 And rock_cru_error <= 58
+      RockUartText("HDCP")
+    ElseIf rock_cru_error = 59
+      RockUartText("VO")
+    ElseIf rock_cru_error >= 60 And rock_cru_error <= 61
+      RockUartText("VOPL")
+    ElseIf rock_cru_error = 62
+      RockUartText("TCPD0")
+    ElseIf rock_cru_error = 64
+      RockUartText("RESET")
+    Else
+      RockUartText("UNKNOWN")
+    EndIf
+    RockUartText(" CPLL ")
+    RockDisplayHexLong(RockCruRead($60))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($64))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($68))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($6C))
+    RockUartText(" GPLL ")
+    RockDisplayHexLong(RockCruRead($80))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($84))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($88))
+    RockUartByte(32)
+    RockDisplayHexLong(RockCruRead($8C))
+    RockUartText(" PMU ")
+    RockDisplayHexLong(PeekL(#ROCK_PMU+#ROCK_PMU_PWRDN_ST) & $FFFFFFFF)
+    RockUartByte(32)
+    RockDisplayHexLong(PeekL(#ROCK_PMU+#ROCK_PMU_BUS_IDLE_REQ) & $FFFFFFFF)
+    RockUartByte(32)
+    RockDisplayHexLong(PeekL(#ROCK_PMU+#ROCK_PMU_BUS_IDLE_ST) & $FFFFFFFF)
+    RockUartByte(32)
+    RockDisplayHexLong(PeekL(#ROCK_PMU+#ROCK_PMU_BUS_IDLE_ACK) & $FFFFFFFF)
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
 Procedure RockDisplayMailboxTelemetry()
   Protected index.i
   RockUartText(" MBOX GOT ")
@@ -103,7 +161,10 @@ Procedure.i RockDisplayUp()
   rock_display_ready=0
   rock_display_error=0
   RockDisplayStage("DP00 BEGIN COLD MINIDP")
-  If RockCruDisplayPrepare()=0 : ProcedureReturn RockDisplayFail(1,"DPE1 CRU OR POWER DOMAIN") : EndIf
+  If RockCruDisplayPrepare()=0
+    RockDisplayCruTelemetry()
+    ProcedureReturn RockDisplayFail(1,"DPE1 CRU OR POWER DOMAIN")
+  EndIf
   If RockCruCadenceRelease()=0 : ProcedureReturn RockDisplayFail(3,"DPE3 CADENCE RESET RELEASE") : EndIf
   RockCdnWrite(#CDN_SW_CLK_H,99)
   RockCdnInternalClocks()
