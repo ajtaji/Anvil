@@ -47,6 +47,7 @@ Global Dim rock_edid_extension_parsed.i[#ROCK_EDID_MAX_BLOCKS-1]
 Global Dim rock_edid_cap_source.i[#ROCK_EDID_CAP_MAX-1]
 Global Dim rock_edid_cap_code.i[#ROCK_EDID_CAP_MAX-1]
 Global Dim rock_edid_cap_native.i[#ROCK_EDID_CAP_MAX-1]
+Global Dim rock_edid_cap_preferred.i[#ROCK_EDID_CAP_MAX-1]
 Global Dim rock_edid_cap_mapped.i[#ROCK_EDID_CAP_MAX-1]
 Global Dim rock_edid_cap_width.i[#ROCK_EDID_CAP_MAX-1]
 Global Dim rock_edid_cap_height.i[#ROCK_EDID_CAP_MAX-1]
@@ -94,6 +95,7 @@ Procedure.i RockEdidCapAdd(source.i,code.i,native.i,mapped.i,width.i,height.i,re
   rock_edid_cap_source[slot]=source
   rock_edid_cap_code[slot]=code
   rock_edid_cap_native[slot]=native
+  rock_edid_cap_preferred[slot]=Bool(source=#ROCK_EDID_CAP_BASE_DTD And code=0)
   rock_edid_cap_mapped[slot]=mapped
   rock_edid_cap_width[slot]=width
   rock_edid_cap_height[slot]=height
@@ -232,7 +234,9 @@ Procedure.i RockEdidCapsBaseDescriptors(base.i)
     descriptor=base+54+slot*18
     pixel=(PeekA(descriptor) & 255) | ((PeekA(descriptor+1) & 255) << 8)
     If pixel<>0
-      If RockEdidCapDtd(descriptor,#ROCK_EDID_CAP_BASE_DTD,slot,Bool(slot=0))=0 : ProcedureReturn 0 : EndIf
+      ; EDID base DTD slot zero is preferred, not CTA-native. Keep those two
+      ; identities separate in the public inventory.
+      If RockEdidCapDtd(descriptor,#ROCK_EDID_CAP_BASE_DTD,slot,0)=0 : ProcedureReturn 0 : EndIf
     ElseIf (PeekA(descriptor+2) & 255)=0 And (PeekA(descriptor+3) & 255)=$FD
       If RockEdidCapsRange(descriptor)=0 : ProcedureReturn 0 : EndIf
     EndIf

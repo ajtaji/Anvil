@@ -1172,7 +1172,7 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
                     "reason", "valid")] + [f"global_rock_edid_{name}" for name in (
                     "block_count", "cap_count", "error", "range_count",
                     "extension_tag", "extension_parsed", "cap_source",
-                    "cap_code", "cap_native", "cap_mapped", "cap_width",
+                    "cap_code", "cap_native", "cap_preferred", "cap_mapped", "cap_width",
                     "cap_height", "cap_refresh_millihz")]
     missing_symbols = [name for name in required if name not in symbols]
     require(not missing_symbols,
@@ -1239,7 +1239,7 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
         state = {name: signed(cpu.load(symbols[f"global_rock_edid_{name}"], 8))
                  for name in scalar_names}
         records = []
-        array_names = ("cap_source", "cap_code", "cap_native", "cap_mapped",
+        array_names = ("cap_source", "cap_code", "cap_native", "cap_preferred", "cap_mapped",
                        "cap_width", "cap_height", "cap_refresh_millihz")
         for slot in range(max(0, state["cap_count"])):
             records.append(tuple(signed(cpu.load(
@@ -1302,10 +1302,11 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
         "block_count": 2, "cap_count": 7, "error": 0, "range_count": 1,
         "extension_tag_1": 2, "extension_parsed_1": 1,
     }, f"emitted EDID inventory state drifted: {result}, {state}")
-    require((4, 127, 0, 0, 0, 0, 0) in records,
+    require((4, 127, 0, 0, 0, 0, 0, 0) in records,
             f"unsupported CTA VIC was hidden or synthesized: {records}")
-    require((4, 16, 1, 1, 1920, 1080, 60000) in records and
-            (5, 0, 1, 1, 1920, 1080, 120000) in records,
+    require((3, 0, 0, 1, 1, 1920, 1080, 60000) in records and
+            (4, 16, 1, 0, 1, 1920, 1080, 60000) in records and
+            (5, 0, 1, 0, 1, 1920, 1080, 120000) in records,
             f"CTA native/SVD/DTD capability identity drifted: {records}")
 
     bad_checksum = bytearray(complete)

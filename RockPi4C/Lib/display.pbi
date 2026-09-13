@@ -155,6 +155,7 @@ Procedure RockDisplayEdidCapabilities()
     EndIf
     RockUartText(" CODE ") : RockDisplayDecimal(rock_edid_cap_code[slot])
     RockUartText(" NATIVE ") : RockDisplayDecimal(rock_edid_cap_native[slot])
+    RockUartText(" PREFERRED ") : RockDisplayDecimal(rock_edid_cap_preferred[slot])
     RockUartText(" MAPPED ") : RockDisplayDecimal(rock_edid_cap_mapped[slot])
     If rock_edid_cap_mapped[slot]<>0
       RockUartByte(32) : RockDisplayDecimal(rock_edid_cap_width[slot])
