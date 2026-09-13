@@ -76,6 +76,10 @@ ProcedureNaked RockExceptionFatal()
     lsl x9, x9, #4
     mov sp, x9
     bl rockexceptionreport
+    ; The vector is installed only after the entry, timer and UART contracts
+    ; validate. Keep the exact FTDI reboot parser alive on the emergency stack
+    ; so a diagnostic fault does not force a physical power cycle.
+    bl rockrecoveryfatalloop
 rock_exception_park:
     wfe
     b rock_exception_park

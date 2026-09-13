@@ -34,6 +34,7 @@ def procedure(source: str, name: str) -> str:
 def source_contract() -> None:
     uart = (ROCK / "Lib/uart2.pbi").read_text(encoding="utf-8")
     recovery = (ROCK / "Lib/recovery.pbi").read_text(encoding="utf-8")
+    exceptions = (ROCK / "Lib/exceptions_el2.pbi").read_text(encoding="utf-8")
     board = (ROCK / "Board/board.rockpi4c").read_text(encoding="utf-8")
     uart_l = uart.lower()
     recovery_l = recovery.lower()
@@ -125,6 +126,15 @@ def source_contract() -> None:
     require("procedure rockrecoveryloop()" in board_l and
             "rockrecoverypoll()" in board_l,
             "trusted late FTDI polling loop is not wired")
+    fatal_loop = procedure(recovery, "RockRecoveryFatalLoop").lower()
+    for token in ("rockrecoveryinit()", "rockrecoverypoll()",
+                  "rocktimerwaitus(1000)"):
+        require(token in fatal_loop,
+                f"fatal FTDI recovery loop drifted: {token}")
+    fatal = procedure(exceptions, "RockExceptionFatal").lower()
+    require(fatal.index("mov sp, x9") < fatal.index("bl rockexceptionreport") <
+            fatal.index("bl rockrecoveryfatalloop") < fatal.index("rock_exception_park:"),
+            "fatal vector does not enter recovery from the emergency stack")
     require("there is no prefix execution, abbreviation or network transport" in
             recovery_l and not re.search(r"\b(?:rocknet|netrecv|dhcp)[a-z0-9_]*\s*\(",
                                          recovery_l),

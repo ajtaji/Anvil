@@ -1,7 +1,8 @@
-; Late FTDI recovery console for the original Rock Pi 4C handoff.
+; FTDI recovery console for the original Rock Pi 4C handoff.
 ; Include after arch_timer.pbi and uart2.pbi. The board may enter this poll
-; loop only after its DTB, timer, UART and EL2 exception contracts validate;
-; an early untrusted handoff must still park without accepting commands.
+; loop only after its DTB, timer and UART contracts validate. Once EL2 vectors
+; are installed, a fatal exception uses its emergency stack to enter the same
+; exact command parser. An untrusted handoff still parks without commands.
 ;
 ; Exact grammar is lowercase `help` or `reboot`, terminated by CR, LF or
 ; CRLF. There is no prefix execution, abbreviation or network transport.
@@ -148,4 +149,16 @@ Procedure.i RockRecoveryPoll()
     EndIf
   Next
   ProcedureReturn consumed
+EndProcedure
+
+Procedure RockRecoveryFatalLoop()
+  ; RockExceptionFatal calls this only after switching to the dedicated
+  ; emergency stack. If UART or timer state is not trustworthy, return to the
+  ; vector's masked WFE park. A second exception also parks in the vector.
+  If RockRecoveryInit()=0 : ProcedureReturn 0 : EndIf
+  RockUartLine("FATAL RECOVERY ACTIVE; TYPE reboot")
+  Repeat
+    RockRecoveryPoll()
+    RockTimerWaitUs(1000)
+  ForEver
 EndProcedure
