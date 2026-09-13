@@ -1967,6 +1967,8 @@ EndProcedure
 ;  from HwFileCanList() and is never asked.
 ; ----------------------------------------------------------------------
 #HW_DIR_NAME_LEN  = 11       ; the raw bytes HwDirName() writes
+#HW_DIR_UTF8_MAX  = 1024     ; full exFAT name plus terminator; legacy ABI
+                             ; remains the 11-byte 8.3 form above
 #HW_DIR_BASE_MAX  = 8        ; ... of which this many are the base
 #HW_DIR_EXT_MAX   = 3        ; ... and this many the extension
 

@@ -279,14 +279,14 @@ Procedure.i StorageUp()
   EndIf
 
   If UsbDiskUp() <> 0
-    FatSetBlockReader(@MscReadBlock)
-    If FatMount(1) = 0
+    FsSetBlockReader(@MscReadBlock)
+    If FsMount(1) = 0
       PrintN("!! the USB stick is readable but its first partition could not be")
       PrintN("   mounted as a FAT filesystem, so no file on it can be opened. This")
       PrintN("   monitor reads FAT16 and FAT32 and nothing else, on partition 1 of")
       PrintN("   an MBR partition table.")
       Print("   The filesystem said: ")
-      UartWriteStr(FatErrorText())
+      UartWriteStr(FsErrorText())
       PrintNl()
       ProcedureReturn 0
     EndIf
@@ -300,6 +300,7 @@ Procedure.i StorageUp()
     gHwFileWritable = 1
     gHwFileMounted  = 1
     gHwFileWriter   = @MscWriteBlock   ; the medium that mounted names its
+    FsSetBlockFlusher(0)               ; BOT writes complete synchronously
                                        ; own writer - see hw_file.pi4
     Print("Mounted the USB stick, which calls itself ")
     UartWriteStr(MscVendor())
@@ -332,14 +333,14 @@ Procedure.i StorageUp()
     EndIf
     gSdUp = 1
   EndIf
-  FatSetBlockReader(@SdReadBlock)
-  If FatMount(1) = 0
+  FsSetBlockReader(@SdReadBlock)
+  If FsMount(1) = 0
     PrintN("!! the SD card is readable but its first partition could not be")
     PrintN("   mounted as a FAT filesystem, so no file on it can be opened. This")
     PrintN("   monitor reads FAT16 and FAT32 and nothing else, on partition 1 of")
     PrintN("   an MBR partition table.")
     Print("   The filesystem said: ")
-    UartWriteStr(FatErrorText())   ; a POINTER - see the note on SdErrorText
+    UartWriteStr(FsErrorText())   ; a POINTER - see the note on SdErrorText
     PrintNl()
     ProcedureReturn 0
   EndIf
@@ -410,15 +411,23 @@ Procedure HwStorageReport()
     PrintDec(SdBlockCount())
   EndIf
   PrintN(" blocks of 512 bytes each.")
-  Print("Its first partition is formatted FAT")
-  PrintDec(FatType())
-  Print(", and space on it is handed out in")
+  If FsType() = #FS_EXFAT
+    PrintN("Its first partition is formatted exFAT, with Unicode long names and directories,")
+  Else
+    PrintN("Its first partition is formatted FAT, with short 8.3 root-directory names,")
+  EndIf
+  Print("and space on it is handed out in")
   PrintNl()
   Print("chunks of ")
-  PrintDec(FatBytesPerCluster())
+  PrintDec(FsBytesPerCluster())
   PrintN(" bytes.")
-  PrintN("  Names are short 8.3 names in the root directory. Case does not")
-  PrintN("  matter; a long name is refused rather than half-matched.")
+  If FsType() = #FS_EXFAT
+    PrintN("  UTF-8 paths are matched case-insensitively through this volume's own")
+    PrintN("  Unicode up-case table; nested directories and long names are available.")
+  Else
+    PrintN("  Names are short 8.3 names in the root directory. Case does not")
+    PrintN("  matter; a long name is refused rather than half-matched.")
+  EndIf
   If gMedium <> 1
     PrintN("  Writing is implemented for the USB medium only, so save and saveenv")
     PrintN("  will refuse while this card is what came up.")

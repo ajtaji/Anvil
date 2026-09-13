@@ -67,10 +67,10 @@
 ;  gLine below is #LINE_MAX + 8, not #LINE_MAX + 1: the eight is the
 ;  slack the original 72/80 pair had and it costs nothing.
 ; ----------------------------------------------------------------------
-#LINE_MAX  = 144               ; input line, minus room for the NUL.
-                               ; 140 is the longest legal `settings set`
-                               ; - see the arithmetic above - and this
-                               ; is that with four to spare
+#LINE_MAX  = 1100              ; input line, minus room for the NUL.
+                               ; exFAT permits a 1023-byte UTF-8 path;
+                               ; the remainder holds a command, quotes,
+                               ; address and length without truncation
 #REC_MAX   = 260               ; an S-record body cannot exceed 254
 #HEX_MAX   = 16                ; hex digits accepted in one number - a
                                ; full 64-bit address, and refused beyond
@@ -102,8 +102,8 @@
 #BOOT_MS   = 2000              ; autoboot countdown
 #BOOT_DOT  = 250               ; ... and how often it prints a dot
 
-Global Dim gLine.b[152]        ; the command line being edited. #LINE_MAX
-                               ; + 8, so 144 + 8; see the note above
+Global Dim gLine.b[#LINE_MAX + 8] ; the command line being edited, plus
+                               ; the same eight-byte safety slack
                                ; #LINE_MAX for why both numbers grew on
                                ; 2026-08-26 and again when the numbered
                                ; Wi-Fi slots gave `settings set` a
@@ -198,7 +198,7 @@ Global gMemWidth.i             ; 0 none, 1 .b, 2 .w, 4 .l  (see above)
 ; Used by sha1sum / sha256sum (Anvil/Core/hash_cmd.pbi).
 Global Dim gHashOut.b[64]
 
-; An 8.3 name copied out of gLine, for the one core command that takes a
+; A UTF-8 path copied out of gLine, for core storage commands that take a
 ; filename as an argument rather than reading it from the settings store:
 ; CmdSave in Anvil/Core/fs_cmd.pbi. It is copied rather than pointed at
 ; because gLine is the line editor's buffer and the parse continues past
@@ -208,9 +208,9 @@ Global Dim gHashOut.b[64]
 ; PASS, which is where it was put when `save` was a Pi 4 command in a Pi 4
 ; file. fs_cmd.pi4 is core now and builds for the Arduino UNO Q, which
 ; does not include that file at all - so a core command was reaching for a
-; global declared in one board's hardware header. Sixteen bytes: an 8.3
-; name is at most twelve characters and a NUL.
-Global Dim gName.a[16]
+; global declared in one board's hardware header. The native exFAT layer
+; accepts up to 1023 UTF-8 bytes, plus the terminating NUL.
+Global Dim gName.a[1024]
 
 ; A scratch buffer for one formatted number - setexpr's result, on its
 ; way into the settings store. Sixteen hex digits plus a NUL is the most

@@ -1,3 +1,51 @@
+; Copy one storage path from the command line. Spaces are legal when the path
+; is enclosed in double quotes. Return 0 for no argument, -1 for malformed or
+; overlong input, and the byte length otherwise. gPos remains at the following
+; argument so the normal numeric parsers can continue.
+Procedure.i ParseStoragePath()
+  Define quote.i
+  Define n.i
+  Define c.i
+  SkipSpace()
+  If gLine[gPos] = 0
+    ProcedureReturn 0
+  EndIf
+  quote = Bool(gLine[gPos] = 34)
+  If quote <> 0
+    gPos = gPos + 1
+  EndIf
+  n = 0
+  While gLine[gPos] <> 0
+    c = gLine[gPos] & $FF
+    If quote <> 0
+      If c = 34
+        Break
+      EndIf
+    ElseIf c = 32 Or c = 9
+      Break
+    EndIf
+    If n >= 1023
+      gName[0] = 0
+      ProcedureReturn -1
+    EndIf
+    gName[n] = c
+    n = n + 1
+    gPos = gPos + 1
+  Wend
+  If quote <> 0
+    If gLine[gPos] <> 34
+      gName[0] = 0
+      ProcedureReturn -1
+    EndIf
+    gPos = gPos + 1
+  EndIf
+  gName[n] = 0
+  If n = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn n
+EndProcedure
+
 Procedure CmdFat()
   Define nm.i
   Define a.i
@@ -6,14 +54,9 @@ Procedure CmdFat()
   Define i.i
   Define ch.i
 
-  ; --- the name, copied out of the command line ----------------------
-  ; gLine is the line editor's buffer and ReadLine will overwrite it the
-  ; moment this returns, so the name is copied rather than pointed at.
-  SkipSpace()
-  nm = gPos
-  SkipWord()
-
-  If gPos = nm
+  ; --- the path, copied out of the command line ----------------------
+  n = ParseStoragePath()
+  If n = 0
     ; Bare f - a status report, and the one command worth having when
     ; there is no medium, because it names WHICH step failed.
     ;
@@ -42,15 +85,13 @@ Procedure CmdFat()
     PrintN("  address and needs none typed.")
     ProcedureReturn
   EndIf
-
-  ; NUL-terminate in place. Safe: everything after the name is either
-  ; the address, which is parsed BELOW from gPos, or nothing - and the
-  ; byte overwritten is the separating space.
-  gLine[gPos] = 0
-  Define after.i = gPos + 1
+  If n < 0
+    PrintN("!! load needs a valid path. Put a path containing spaces in double")
+    PrintN("   quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
+    ProcedureReturn
+  EndIf
 
   ; --- the destination ------------------------------------------------
-  gPos = after
   a = ParseHex()
   If gParseOk = 0
     a = HwStageAddr()
@@ -60,12 +101,12 @@ Procedure CmdFat()
     ProcedureReturn
   EndIf
 
-  If HwFileOpen(@gLine[nm]) = 0
+  If HwFileOpen(@gName[0]) = 0
     Print("!! the file ")
-    UartWriteStr(@gLine[nm])
+    UartWriteStr(@gName[0])
     PrintN(" could not be opened, so nothing was loaded")
-    PrintN("   and memory is untouched. The name has to be a short 8.3 name in the")
-    PrintN("   root directory of the boot medium - case does not matter.")
+    PrintN("   and memory is untouched. Paths are case-insensitive; quote one that")
+    PrintN("   contains spaces. FAT media still accepts its traditional short name.")
     Print("   The medium said: ")
     UartWriteStr(HwFileErrorText())   ; a POINTER - see the note on SdErrorText
     PrintNl()
@@ -194,15 +235,7 @@ Procedure CmdSave()
   Define ch.i
 
   ; --- the name, copied out of the line editor's buffer ---------------
-  SkipSpace()
-  nm = gPos
-  i = 0
-  While gLine[gPos] <> 0 And gLine[gPos] <> 32 And i < 12
-    gName[i] = gLine[gPos]
-    gPos = gPos + 1
-    i = i + 1
-  Wend
-  gName[i] = 0
+  i = ParseStoragePath()
   If i = 0
     PrintN("!! save needs the name of a file to write, and none was given, so")
     PrintN("   nothing was written.")
@@ -220,6 +253,11 @@ Procedure CmdSave()
     Print("   save KERNEL8.IMG ")
     PutAddr(HwStageAddr())
     PrintN(" 36A0C is how Anvil replaces itself.")
+    ProcedureReturn
+  EndIf
+  If i < 0
+    PrintN("!! save needs a valid path. Put a path containing spaces in double")
+    PrintN("   quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
     ProcedureReturn
   EndIf
 
@@ -434,7 +472,7 @@ EndProcedure
                               ; the rest were not shown rather than scroll
                               ; a directory without end
 
-Global Dim gLsName.a[#HW_DIR_NAME_LEN]   ; the 11 raw 8.3 bytes of one row
+Global Dim gLsName.a[#HW_DIR_UTF8_MAX]
 
 ; PutName83 - the 11 raw name bytes at *e printed as NAME.EXT: the base
 ; and extension each have their space padding trimmed, and the dot appears
@@ -473,6 +511,16 @@ Procedure.i PutName83(*e)
     Wend
   EndIf
   ProcedureReturn printed
+EndProcedure
+
+Procedure.i PutNameUtf8(*name)
+  Define n.i
+  n = 0
+  While PeekA(*name + n) <> 0 And n < #HW_DIR_UTF8_MAX - 1
+    UartWrite(PeekA(*name + n))
+    n = n + 1
+  Wend
+  ProcedureReturn n
 EndProcedure
 
 ; PutDecRight - a non-negative decimal right-justified in a field w wide,
@@ -515,24 +563,15 @@ Procedure CmdFatls()
     ProcedureReturn
   EndIf
 
-  ; ROOT ONLY, AND SAY SO. fat.pi4 reads no subdirectory, so a path or a
-  ; subdirectory name is refused in a whole sentence rather than ignored.
-  ; A lone "/" or "." is the root itself and is allowed through.
-  SkipSpace()
-  argAt = gPos
-  SkipWord()
-  If gPos > argAt
-    c = gLine[argAt] & $FF
-    If (gPos - argAt) = 1 And (c = 47 Or c = 46)   ; 47 = '/', 46 = '.'
-      ; the root, spelled out - fall through
-    Else
-      PrintN("!! this monitor lists the ROOT directory of the boot medium only, so")
-      PrintN("   a subdirectory or a path cannot be listed and nothing was shown.")
-      PrintN("   The FAT reader underneath reads no subdirectory - the same reason")
-      PrintN("   load takes a bare 8.3 name and not a path. Type fatls on its own,")
-      PrintN("   or ls, for the root, which is where the files it can reach live.")
-      ProcedureReturn
-    EndIf
+  n = ParseStoragePath()
+  If n < 0
+    PrintN("!! ls needs a valid directory path. Put one containing spaces in")
+    PrintN("   double quotes; an exFAT path may be at most 1023 UTF-8 bytes.")
+    ProcedureReturn
+  EndIf
+  If n = 0
+    gName[0] = 47
+    gName[1] = 0
   EndIf
 
   ; THE SECOND GATE, and it is a different question from #CAP_STORAGE.
@@ -560,7 +599,7 @@ Procedure CmdFatls()
     ProcedureReturn
   EndIf
 
-  If HwDirRewind() = 0
+  If HwDirOpen(@gName[0]) = 0
     ; HwStorageUp() reported a mounted volume, so this should not arise;
     ; if it does, be honest rather than return in silence.
     PrintN("!! the boot medium is mounted but its root directory could not be")
@@ -571,7 +610,9 @@ Procedure CmdFatls()
     ProcedureReturn
   EndIf
 
-  PrintN("The root directory of the boot medium:")
+  Print("Directory ")
+  UartWriteStr(@gName[0])
+  PrintN(" on the boot medium:")
 
   files = 0
   dirs  = 0
@@ -594,9 +635,12 @@ Procedure CmdFatls()
       Break
     EndIf
 
-    HwDirName(@gLsName[0])
+    If HwDirNameUtf8(@gLsName[0], #HW_DIR_UTF8_MAX) < 0
+      PrintN("!! a directory name could not be decoded safely, so listing stopped.")
+      ProcedureReturn
+    EndIf
     Print("  ")
-    namelen = PutName83(@gLsName[0])
+    namelen = PutNameUtf8(@gLsName[0])
     ; Pad the 8.3 name to a 12-column field (8 + '.' + 3) so the size and
     ; the <DIR> marker line up down the page.
     While namelen < 12

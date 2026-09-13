@@ -1,0 +1,356 @@
+; Native exFAT acceptance against a writable memory block device. This is a
+; diagnostic fixture, not shipped product code and it touches no hardware.
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+
+#GATE_BLOCKS = 2100
+#GATE_BYTES = #GATE_BLOCKS * 512
+Global Dim gateDisk.a[#GATE_BYTES - 1]
+Global Dim gateWrite.a[1399]
+Global Dim gateRead.a[1399]
+Global Dim gateName.a[1023]
+Global gateFlushes.i
+Global gateWrites.i
+
+Procedure.i GateReader(lba.i, *dst)
+  If lba < 0 Or lba >= #GATE_BLOCKS
+    ProcedureReturn 0
+  EndIf
+  exfat_Copy(*dst, @gateDisk[0] + lba * 512, 512)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateWriter(lba.i, *src)
+  If lba < 0 Or lba >= #GATE_BLOCKS
+    ProcedureReturn 0
+  EndIf
+  gateWrites = gateWrites + 1
+  exfat_Copy(@gateDisk[0] + lba * 512, *src, 512)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateFlusher()
+  gateFlushes = gateFlushes + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateBootChecksum(base.i)
+  Define sum.i
+  Define s.i
+  Define i.i
+  Define b.i
+  sum = 0
+  s = 0
+  While s < 11
+    i = 0
+    While i < 512
+      If s <> 0 Or (i <> 106 And i <> 107 And i <> 112)
+        b = gateDisk[(base + s) * 512 + i]
+        sum = (exfat_Ror32(sum) + b) & $FFFFFFFF
+      EndIf
+      i = i + 1
+    Wend
+    s = s + 1
+  Wend
+  ProcedureReturn sum
+EndProcedure
+
+Procedure.i GateCrc32(offset.i, length.i)
+  Define crc.i
+  Define i.i
+  crc = $FFFFFFFF
+  i = 0
+  While i < length
+    crc = exfat_Crc32Update(crc, gateDisk[offset + i])
+    i = i + 1
+  Wend
+  ProcedureReturn (~crc) & $FFFFFFFF
+EndProcedure
+
+Procedure GateMoveToGpt()
+  Define s.i
+  Define i.i
+  Define sum.i
+  Define crc.i
+  ; Move the complete 153-sector volume before replacing its MBR with GPT.
+  s = 152
+  While s >= 0
+    exfat_Copy(@gateDisk[0] + (40 + s) * 512, @gateDisk[0] + (1 + s) * 512, 512)
+    s = s - 1
+  Wend
+  exfat_Zero(@gateDisk[0], 40 * 512)
+  ; Protective MBR.
+  gateDisk[$1BE + 4] = $EE
+  exfat_Put32(@gateDisk[0], $1BE + 8, 1)
+  exfat_Put32(@gateDisk[0], $1BE + 12, 2099)
+  gateDisk[510] = $55 : gateDisk[511] = $AA
+  ; One Microsoft Basic Data entry in the standard 16 KiB entry array.
+  exfat_Copy(@gateDisk[0] + 2 * 512, ?gateGptBasic, 16)
+  i = 0
+  While i < 16
+    gateDisk[2 * 512 + 16 + i] = i + 1
+    i = i + 1
+  Wend
+  exfat_Put64(@gateDisk[0] + 2 * 512, 32, 40)
+  exfat_Put64(@gateDisk[0] + 2 * 512, 40, 2087)
+  crc = GateCrc32(2 * 512, 128 * 128)
+  ; Primary GPT header.
+  exfat_Copy(@gateDisk[0] + 512, ?gateGptSignature, 8)
+  exfat_Put32(@gateDisk[0] + 512, 8, $00010000)
+  exfat_Put32(@gateDisk[0] + 512, 12, 92)
+  exfat_Put64(@gateDisk[0] + 512, 24, 1)
+  exfat_Put64(@gateDisk[0] + 512, 32, 2099)
+  exfat_Put64(@gateDisk[0] + 512, 40, 34)
+  exfat_Put64(@gateDisk[0] + 512, 48, 2098)
+  exfat_Put64(@gateDisk[0] + 512, 72, 2)
+  exfat_Put32(@gateDisk[0] + 512, 80, 128)
+  exfat_Put32(@gateDisk[0] + 512, 84, 128)
+  exfat_Put32(@gateDisk[0] + 512, 88, crc)
+  crc = GateCrc32(512, 92)
+  exfat_Put32(@gateDisk[0] + 512, 16, crc)
+  ; PartitionOffset changes with the move and is protected by both boot sums.
+  exfat_Put64(@gateDisk[0] + 40 * 512, 64, 40)
+  exfat_Put64(@gateDisk[0] + 52 * 512, 64, 40)
+  sum = GateBootChecksum(40)
+  i = 0
+  While i < 512
+    exfat_Put32(@gateDisk[0] + 51 * 512, i, sum)
+    i = i + 4
+  Wend
+  sum = GateBootChecksum(52)
+  i = 0
+  While i < 512
+    exfat_Put32(@gateDisk[0] + 63 * 512, i, sum)
+    i = i + 4
+  Wend
+EndProcedure
+
+Procedure GateFormat()
+  Define i.i
+  Define s.i
+  Define sum.i
+  Define tableSum.i
+  Define off.i
+  Define cp.i
+  Define base.i
+  Define root.i
+  exfat_Zero(@gateDisk[0], #GATE_BYTES)
+  ; MBR, one type-07 partition at physical block 1, 200 blocks long.
+  gateDisk[$1BE + 4] = 7
+  exfat_Put32(@gateDisk[0], $1BE + 8, 1)
+  exfat_Put32(@gateDisk[0], $1BE + 12, 2048)
+  gateDisk[510] = $55 : gateDisk[511] = $AA
+
+  ; Main and backup boot regions. Logical sectors are 512-byte blocks.
+  base = 1
+  For s = 0 To 23
+    gateDisk[(base + s) * 512 + 510] = $55
+    gateDisk[(base + s) * 512 + 511] = $AA
+  Next
+  For s = 0 To 12 Step 12
+    off = (base + s) * 512
+    gateDisk[off] = $EB : gateDisk[off + 1] = $76 : gateDisk[off + 2] = $90
+    exfat_Copy(@gateDisk[0] + off + 3, ?gateSignature, 8)
+    exfat_Put64(@gateDisk[0] + off, 64, 1)
+    exfat_Put64(@gateDisk[0] + off, 72, 2048)
+    exfat_Put32(@gateDisk[0] + off, 80, 24)
+    exfat_Put32(@gateDisk[0] + off, 84, 1)
+    exfat_Put32(@gateDisk[0] + off, 88, 25)
+    exfat_Put32(@gateDisk[0] + off, 92, 128)
+    exfat_Put32(@gateDisk[0] + off, 96, 4)
+    exfat_Put32(@gateDisk[0] + off, 100, $12345678)
+    exfat_Put16(@gateDisk[0] + off, 104, $0100)
+    exfat_Put16(@gateDisk[0] + off, 106, 0)
+    gateDisk[off + 108] = 9
+    gateDisk[off + 109] = 0
+    gateDisk[off + 110] = 1
+    gateDisk[off + 112] = 3
+  Next
+
+  ; FAT: bitmap, up-case table and root are one-cluster chains.
+  off = (base + 24) * 512
+  exfat_Put32(@gateDisk[0] + off, 2 * 4, $FFFFFFFF)
+  exfat_Put32(@gateDisk[0] + off, 3 * 4, $FFFFFFFF)
+  exfat_Put32(@gateDisk[0] + off, 4 * 4, $FFFFFFFF)
+
+  ; Allocation bitmap in cluster 2: clusters 2, 3 and 4 are allocated.
+  off = (base + 25) * 512
+  gateDisk[off] = 7
+
+  ; Compact up-case table in cluster 3. ASCII lower-case maps to upper-case;
+  ; all other UTF-16 code units are identity-mapped with the compressed run.
+  off = (base + 26) * 512
+  cp = 0
+  While cp < 97
+    exfat_Put16(@gateDisk[0] + off, cp * 2, cp)
+    cp = cp + 1
+  Wend
+  i = 0
+  While i < 26
+    exfat_Put16(@gateDisk[0] + off, 194 + i * 2, 65 + i)
+    i = i + 1
+  Wend
+  exfat_Put16(@gateDisk[0] + off, 246, $FFFF)
+  exfat_Put16(@gateDisk[0] + off, 248, 65413)
+  tableSum = 0
+  i = 0
+  While i < 250
+    tableSum = (exfat_Ror32(tableSum) + gateDisk[off + i]) & $FFFFFFFF
+    i = i + 1
+  Wend
+
+  ; Root directory in cluster 4: allocation bitmap, up-case table, end.
+  root = (base + 27) * 512
+  gateDisk[root] = $81
+  gateDisk[root + 1] = 0
+  exfat_Put32(@gateDisk[0] + root, 20, 2)
+  exfat_Put64(@gateDisk[0] + root, 24, 16)
+  gateDisk[root + 32] = $82
+  exfat_Put32(@gateDisk[0] + root + 32, 4, tableSum)
+  exfat_Put32(@gateDisk[0] + root + 32, 20, 3)
+  exfat_Put64(@gateDisk[0] + root + 32, 24, 250)
+  gateDisk[root + 64] = 0
+
+  ; Boot checksum sectors, one in each region.
+  sum = GateBootChecksum(base)
+  i = 0
+  While i < 512
+    exfat_Put32(@gateDisk[0] + (base + 11) * 512, i, sum)
+    i = i + 4
+  Wend
+  ; Backup is byte-identical to main after its own checksum sector.
+  exfat_Copy(@gateDisk[0] + (base + 12) * 512, @gateDisk[0] + base * 512, 12 * 512)
+EndProcedure
+
+Procedure.i GateBytes(count.i, seed.i)
+  Define i.i
+  i = 0
+  While i < count
+    If gateRead[i] <> ((i * 37 + seed) & $FF)
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define n.i
+  Define free0.i
+  Define seen.i
+  GateFormat()
+  ExFatSetBlockReader(@GateReader)
+  ; A read-only mount and unmount never mark the volume or call a writer.
+  ExFatSetBlockWriter(0)
+  ExFatSetBlockFlusher(0)
+  If ExFatMount(1) = 0 Or ExFatUnmount() = 0 Or gateWrites <> 0 : ProcedureReturn 29 : EndIf
+  ; A volume inherited dirty remains readable, but mutation is refused and
+  ; Anvil never clears somebody else's dirty state.
+  exfat_Put16(@gateDisk[0] + 1 * 512, 106, 2)
+  exfat_Put16(@gateDisk[0] + 13 * 512, 106, 2)
+  ExFatSetBlockWriter(@GateWriter)
+  If ExFatMount(1) = 0 : ProcedureReturn 30 : EndIf
+  gateWrites = 0
+  If ExFatMkdir(?nameDirty) <> 0 Or ExFatLastError() <> #EXFAT_E_DIRTY Or gateWrites <> 0 : ProcedureReturn 31 : EndIf
+  If ExFatUnmount() = 0 Or gateWrites <> 0 : ProcedureReturn 32 : EndIf
+  exfat_Put16(@gateDisk[0] + 1 * 512, 106, 0)
+  exfat_Put16(@gateDisk[0] + 13 * 512, 106, 0)
+  ExFatSetBlockWriter(@GateWriter)
+  ExFatSetBlockFlusher(@GateFlusher)
+  If ExFatMount(1) = 0 : ProcedureReturn 1 : EndIf
+  free0 = ExFatFreeClusters()
+  If free0 <> 125 : ProcedureReturn 2 : EndIf
+  If ExFatMkdir(?nameDocs) = 0 : ProcedureReturn 3 : EndIf
+  If ExFatMkdir(?nameSub) = 0 : ProcedureReturn 4 : EndIf
+  If ExFatCreate(?nameLong) = 0 : ProcedureReturn 5 : EndIf
+  i = 0
+  While i < 700
+    gateWrite[i] = (i * 37 + 11) & $FF
+    i = i + 1
+  Wend
+  If ExFatWrite(@gateWrite[0], 700) <> 700 : ProcedureReturn 6 : EndIf
+  ExFatClose()
+  If ExFatFlush() = 0 Or gateFlushes < 2 : ProcedureReturn 7 : EndIf
+  If ExFatUnmount() = 0 : ProcedureReturn 8 : EndIf
+  If ExFatMount(1) = 0 : ProcedureReturn 9 : EndIf
+  ; ASCII case folding comes from the on-volume up-case table.
+  If ExFatOpen(?nameLongFolded) = 0 : ProcedureReturn 10 : EndIf
+  n = ExFatRead(@gateRead[0], 700)
+  If n <> 700 Or GateBytes(700, 11) = 0 : ProcedureReturn 11 : EndIf
+  If ExFatSeek(700) = 0 : ProcedureReturn 12 : EndIf
+  i = 0
+  While i < 600
+    gateWrite[i] = (i * 37 + 29) & $FF
+    i = i + 1
+  Wend
+  If ExFatWrite(@gateWrite[0], 600) <> 600 : ProcedureReturn 13 : EndIf
+  If ExFatTruncate(300) = 0 Or ExFatSize() <> 300 : ProcedureReturn 14 : EndIf
+  ExFatClose()
+  If ExFatRename(?nameLong, ?nameUnicode) = 0 : ProcedureReturn 15 : EndIf
+  If ExFatMkdir(?nameChild) = 0 : ProcedureReturn 35 : EndIf
+  ; A directory can never be moved beneath itself, including through a
+  ; deeper descendant rather than only its immediate child.
+  If ExFatRename(?nameDocs, ?nameCycle) <> 0 Or ExFatLastError() <> #EXFAT_E_PATH : ProcedureReturn 36 : EndIf
+  If ExFatRemove(?nameChild) = 0 : ProcedureReturn 37 : EndIf
+  ; Force the subdirectory past its original one-cluster entry capacity.
+  If ExFatCreate(?nameGrow1) = 0 : ProcedureReturn 38 : EndIf : ExFatClose()
+  If ExFatCreate(?nameGrow2) = 0 : ProcedureReturn 39 : EndIf : ExFatClose()
+  If ExFatCreate(?nameGrow3) = 0 : ProcedureReturn 40 : EndIf : ExFatClose()
+  If ExFatCreate(?nameGrow4) = 0 : ProcedureReturn 41 : EndIf : ExFatClose()
+  If ExFatOpen(?nameUnicodeFolded) = 0 : ProcedureReturn 16 : EndIf
+  If ExFatRead(@gateRead[0], 400) <> 300 Or GateBytes(300, 11) = 0 : ProcedureReturn 17 : EndIf
+  ExFatClose()
+  If ExFatDirOpen(?nameSub) = 0 : ProcedureReturn 18 : EndIf
+  seen = 0
+  While ExFatDirNext() > 0
+    n = ExFatDirNameUtf8(@gateName[0], 1024)
+    If n > 0
+      seen = seen + 1
+    EndIf
+  Wend
+  If seen <> 5 : ProcedureReturn 19 : EndIf
+  If ExFatRemove(?nameGrow1) = 0 : ProcedureReturn 42 : EndIf
+  If ExFatRemove(?nameGrow2) = 0 : ProcedureReturn 43 : EndIf
+  If ExFatRemove(?nameGrow3) = 0 : ProcedureReturn 44 : EndIf
+  If ExFatRemove(?nameGrow4) = 0 : ProcedureReturn 45 : EndIf
+  If ExFatRemove(?nameUnicode) = 0 : ProcedureReturn 20 : EndIf
+  If ExFatRemove(?nameSub) = 0 : ProcedureReturn 21 : EndIf
+  If ExFatRemove(?nameDocs) = 0 : ProcedureReturn 22 : EndIf
+  If ExFatFreeClusters() <> free0 : ProcedureReturn 23 : EndIf
+  If ExFatFlush() = 0 Or ExFatUnmount() = 0 : ProcedureReturn 24 : EndIf
+  If ExFatMount(1) = 0 : ProcedureReturn 25 : EndIf
+  If ExFatOpen(?nameUnicode) <> 0 Or ExFatLastError() <> #EXFAT_E_NOT_FOUND : ProcedureReturn 26 : EndIf
+  If ExFatUnmount() = 0 : ProcedureReturn 27 : EndIf
+
+  ; The same volume is discovered through a CRC-protected GPT, not only MBR.
+  GateMoveToGpt()
+  If ExFatMount(1) = 0 Or ExFatUnmount() = 0 : ProcedureReturn 33 : EndIf
+  gateDisk[2 * 512 + 128] = 1
+  If ExFatMount(1) <> 0 Or ExFatLastError() <> #EXFAT_E_PARTITION : ProcedureReturn 34 : EndIf
+  gateDisk[2 * 512 + 128] = 0
+
+  ; A damaged copy is refused before any file metadata is trusted.
+  gateDisk[(40 + 2) * 512 + 17] = gateDisk[(40 + 2) * 512 + 17] ! 1
+  If ExFatMount(1) <> 0 Or ExFatLastError() <> #EXFAT_E_BOOT_CHECKSUM : ProcedureReturn 28 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  gateSignature: Data.a 69,88,70,65,84,32,32,32
+  gateGptSignature: Data.a 69,70,73,32,80,65,82,84
+  gateGptBasic: Data.a $A2,$A0,$D0,$EB,$E5,$B9,$33,$44,$87,$C0,$68,$B6,$B7,$26,$99,$C7
+  nameDocs: Data.a 68,111,99,115,0
+  nameSub: Data.a 68,111,99,115,47,83,117,98,0
+  nameLong: Data.a 68,111,99,115,47,83,117,98,47,65,32,108,111,110,103,32,114,101,115,105,100,101,110,116,32,109,111,100,101,108,32,110,111,116,101,115,46,116,120,116,0
+  nameLongFolded: Data.a 100,79,67,83,47,115,85,66,47,97,32,76,79,78,71,32,82,69,83,73,68,69,78,84,32,77,79,68,69,76,32,78,79,84,69,83,46,84,88,84,0
+  ; Docs/Sub/Meteo, with U+00E9 encoded as C3 A9.
+  nameUnicode: Data.a 68,111,99,115,47,83,117,98,47,77,195,169,116,195,169,111,32,82,101,112,111,114,116,46,116,120,116,0
+  nameUnicodeFolded: Data.a 100,79,67,83,47,115,85,66,47,109,195,169,84,195,169,79,32,114,69,80,79,82,84,46,84,88,84,0
+  nameDirty: Data.a 83,72,79,85,76,68,78,79,84,46,84,88,84,0
+  nameChild: Data.a 68,111,99,115,47,83,117,98,47,67,104,105,108,100,0
+  nameCycle: Data.a 68,111,99,115,47,83,117,98,47,67,104,105,108,100,47,77,111,118,101,100,0
+  nameGrow1: Data.a 68,111,99,115,47,83,117,98,47,97,46,116,120,116,0
+  nameGrow2: Data.a 68,111,99,115,47,83,117,98,47,98,46,116,120,116,0
+  nameGrow3: Data.a 68,111,99,115,47,83,117,98,47,99,46,116,120,116,0
+  nameGrow4: Data.a 68,111,99,115,47,83,117,98,47,100,46,116,120,116,0
+EndDataSection

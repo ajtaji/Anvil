@@ -136,14 +136,14 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i hwfile_MapFat()
   Define e.i
-  e = FatLastError()
+  e = FsLastError()
   If e = #FAT_ERR_NONE
     ProcedureReturn #HW_FILE_OK
   EndIf
-  If e = #FAT_ERR_NOTFOUND
+  If e = #FAT_ERR_NOTFOUND Or e = #EXFAT_E_NOT_FOUND
     ProcedureReturn #HW_FILE_NOTFOUND
   EndIf
-  If e = #FAT_ERR_NO_WRITER
+  If e = #FAT_ERR_NO_WRITER Or e = #EXFAT_E_NO_WRITER
     ProcedureReturn #HW_FILE_READONLY
   EndIf
   ProcedureReturn #HW_FILE_IO
@@ -170,7 +170,7 @@ Procedure.i HwFileOpen(*name)
     gHwFileErr = #HW_FILE_NOMEDIUM
     ProcedureReturn 0
   EndIf
-  If FatOpen(*name) = 0
+  If FsOpen(*name) = 0
     gHwFileErr = hwfile_MapFat()
     ProcedureReturn 0
   EndIf
@@ -185,7 +185,7 @@ Procedure.i HwFileSize()
     ProcedureReturn 0
   EndIf
   gHwFileErr = #HW_FILE_OK
-  ProcedureReturn FatSize()
+  ProcedureReturn FsSize()
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -218,19 +218,19 @@ Procedure.i HwFileReadAt(off.i, dst.i, n.i)
 
   canContinue = 0
   If gHwFileReadCont <> 0
-    If FatTell() = off
+    If FsTell() = off
       canContinue = 1
     EndIf
   EndIf
   gHwFileReadCont = 0
 
   If canContinue = 0
-    If FatSeek(off) = 0
+    If FsSeek(off) = 0
       gHwFileErr = hwfile_MapFat()
       ProcedureReturn -1
     EndIf
   EndIf
-  got = FatRead(dst, n)
+  got = FsRead(dst, n)
   If got < 0
     gHwFileErr = hwfile_MapFat()
     ProcedureReturn -1
@@ -242,7 +242,7 @@ EndProcedure
 Procedure HwFileClose()
   gHwFileReadCont = 0
   If gHwFileOpen <> 0
-    FatClose()
+    FsClose()
     gHwFileOpen = 0
   EndIf
 EndProcedure
@@ -314,32 +314,37 @@ Procedure.i HwFileWriteAll(*name, src.i, n.i)
     ProcedureReturn 0
   EndIf
 
-  FatSetBlockWriter(gHwFileWriter)
+  FsSetBlockWriter(gHwFileWriter)
 
-  opened = FatOpen(*name)
+  opened = FsOpen(*name)
   If opened = 0
-    If FatLastError() <> #FAT_ERR_NOTFOUND
+    If FsLastError() <> #FAT_ERR_NOTFOUND And FsLastError() <> #EXFAT_E_NOT_FOUND
       gHwFileErr = hwfile_MapFat()
-      FatSetBlockWriter(0)                    ; DISARM - open failed
+      FsSetBlockWriter(0)                     ; DISARM - open failed
       ProcedureReturn 0
     EndIf
-    If FatCreate(*name) = 0
+    If FsCreate(*name) = 0
       gHwFileErr = hwfile_MapFat()
-      FatSetBlockWriter(0)                    ; DISARM - create failed
+      FsSetBlockWriter(0)                     ; DISARM - create failed
       ProcedureReturn 0
     EndIf
     ; FatCreate leaves it open. No second FatOpen.
   EndIf
 
-  If FatOverwrite(src, n) = 0
+  If FsOverwrite(src, n) = 0
     gHwFileErr = hwfile_MapFat()
-    FatClose()
-    FatSetBlockWriter(0)                      ; DISARM - write failed
+    FsClose()
+    FsSetBlockWriter(0)                       ; DISARM - write failed
     ProcedureReturn 0
   EndIf
 
-  FatClose()
-  FatSetBlockWriter(0)                        ; DISARM - success
+  FsClose()
+  If FsFlush() = 0
+    gHwFileErr = hwfile_MapFat()
+    FsSetBlockWriter(0)
+    ProcedureReturn 0
+  EndIf
+  FsSetBlockWriter(0)                         ; DISARM - success
   ProcedureReturn 1
 EndProcedure
 
@@ -377,7 +382,7 @@ Procedure.i HwFileErrorText()
   EndIf
   ; Everything else came out of fat.pi4, which has better words for it
   ; than a generalisation would.
-  ProcedureReturn FatErrorText()
+  ProcedureReturn FsErrorText()
 EndProcedure
 
 ; ======================================================================
@@ -409,12 +414,12 @@ Procedure.i HwFileCanList()
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i HwDirRewind()
+Procedure.i HwDirOpen(*path)
   If gHwFileMounted = 0
     gHwFileErr = #HW_FILE_NOMEDIUM
     ProcedureReturn 0
   EndIf
-  If FatDirRewind() = 0
+  If FsDirOpen(*path) = 0
     gHwFileErr = hwfile_MapFat()
     ProcedureReturn 0
   EndIf
@@ -422,11 +427,15 @@ Procedure.i HwDirRewind()
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i HwDirRewind()
+  ProcedureReturn HwDirOpen(0)
+EndProcedure
+
 ; 1 an entry was read, 0 the end of the directory, -1 the walk broke.
 ; The three-way answer is fat.pi4's and the core renders all three.
 Procedure.i HwDirNext()
   Define r.i
-  r = FatDirNext()
+  r = FsDirNext()
   If r = -1
     gHwFileErr = hwfile_MapFat()
   EndIf
@@ -436,13 +445,23 @@ EndProcedure
 ; The 11 raw 8.3 name bytes of the current entry into *d. The core formats
 ; them; the shape of a name on the medium is the medium's business.
 Procedure HwDirName(*d)
-  FatDirName(*d)
+  ; Compatibility ABI: an exFAT long name cannot fit in this legacy 11-byte
+  ; slot, so callers which need names use HwDirNameUtf8 below.
+  If FsType() = #FS_FAT
+    FatDirName(*d)
+  Else
+    exfat_Zero(*d, 11)
+  EndIf
+EndProcedure
+
+Procedure.i HwDirNameUtf8(*d, capacity.i)
+  ProcedureReturn FsDirNameUtf8(*d, capacity)
 EndProcedure
 
 Procedure.i HwDirIsDir()
-  ProcedureReturn FatDirIsDir()
+  ProcedureReturn FsDirIsDir()
 EndProcedure
 
 Procedure.i HwDirSize()
-  ProcedureReturn FatDirSize()
+  ProcedureReturn FsDirSize()
 EndProcedure
