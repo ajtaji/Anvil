@@ -83,20 +83,93 @@ Procedure RockDisplayHexLong(value.i)
 EndProcedure
 
 Procedure RockDisplayEdidTelemetry()
+  Protected block.i
   Protected offset.i
   If rock_uart_ready = 0 : ProcedureReturn 0 : EndIf
-  For offset=0 To 127
-    If (offset & 15)=0
-      RockUartText("EDID ")
-      RockDisplayHexByte(offset)
-      RockUartText(": ")
-    EndIf
-    RockDisplayHexByte(PeekA(@rock_cdn_edid[0]+offset) & 255)
-    If (offset & 15)=15
+  For block=0 To rock_edid_block_count-1
+    For offset=0 To 127
+      If (offset & 15)=0
+        RockUartText("EDID BLOCK ")
+        RockDisplayDecimal(block)
+        RockUartByte(32)
+        RockDisplayHexByte(offset)
+        RockUartText(": ")
+      EndIf
+      RockDisplayHexByte(PeekA(@rock_cdn_edid[0]+block*128+offset) & 255)
+      If (offset & 15)=15
+        RockUartByte(13) : RockUartByte(10)
+      Else
+        RockUartByte(32)
+      EndIf
+    Next
+  Next
+EndProcedure
+
+Procedure RockDisplayEdidCapabilities()
+  Protected block.i
+  Protected range.i
+  Protected slot.i
+  Protected source.i
+  If rock_uart_ready = 0 : ProcedureReturn 0 : EndIf
+  RockUartText("EDID CAPS BLOCKS ")
+  RockDisplayDecimal(rock_edid_block_count)
+  RockUartText(" MODES ")
+  RockDisplayDecimal(rock_edid_cap_count)
+  RockUartByte(13) : RockUartByte(10)
+  If rock_edid_block_count>1
+    For block=1 To rock_edid_block_count-1
+      RockUartText("EDID EXT ") : RockDisplayDecimal(block)
+      RockUartText(" TAG ") : RockDisplayHexByte(rock_edid_extension_tag[block])
+      RockUartText(" PARSED ") : RockDisplayDecimal(rock_edid_extension_parsed[block])
       RockUartByte(13) : RockUartByte(10)
+    Next
+  EndIf
+  If rock_edid_range_count>0
+    For range=0 To rock_edid_range_count-1
+    RockUartText("EDID RANGE V ")
+    RockDisplayDecimal(rock_edid_range_min_v[range])
+    RockUartByte(45) : RockDisplayDecimal(rock_edid_range_max_v[range])
+    RockUartText(" HZ H ")
+    RockDisplayDecimal(rock_edid_range_min_h[range])
+    RockUartByte(45) : RockDisplayDecimal(rock_edid_range_max_h[range])
+    RockUartText(" KHZ PIXEL MAX ")
+    RockDisplayDecimal(rock_edid_range_max_pixel[range])
+    RockUartByte(13) : RockUartByte(10)
+    Next
+  EndIf
+  For slot=0 To rock_edid_cap_count-1
+    source=rock_edid_cap_source[slot]
+    RockUartText("EDID CAP ") : RockDisplayDecimal(slot) : RockUartByte(32)
+    If source=#ROCK_EDID_CAP_ESTABLISHED
+      RockUartText("ESTABLISHED")
+    ElseIf source=#ROCK_EDID_CAP_STANDARD
+      RockUartText("STANDARD")
+    ElseIf source=#ROCK_EDID_CAP_BASE_DTD
+      RockUartText("BASE DTD")
+    ElseIf source=#ROCK_EDID_CAP_CTA_SVD
+      RockUartText("CTA SVD")
+    ElseIf source=#ROCK_EDID_CAP_CTA_DTD
+      RockUartText("CTA DTD")
     Else
-      RockUartByte(32)
+      RockUartText("UNKNOWN")
     EndIf
+    RockUartText(" CODE ") : RockDisplayDecimal(rock_edid_cap_code[slot])
+    RockUartText(" NATIVE ") : RockDisplayDecimal(rock_edid_cap_native[slot])
+    RockUartText(" MAPPED ") : RockDisplayDecimal(rock_edid_cap_mapped[slot])
+    If rock_edid_cap_mapped[slot]<>0
+      RockUartByte(32) : RockDisplayDecimal(rock_edid_cap_width[slot])
+      RockUartByte(88) : RockDisplayDecimal(rock_edid_cap_height[slot])
+      RockUartText(" MHZ ") : RockDisplayDecimal(rock_edid_cap_refresh_millihz[slot])
+      RockUartText(" PIXEL ") : RockDisplayDecimal(rock_edid_cap_pixel_hz[slot])
+      RockUartText(" TOTAL ") : RockDisplayDecimal(rock_edid_cap_htotal[slot])
+      RockUartByte(88) : RockDisplayDecimal(rock_edid_cap_vtotal[slot])
+      RockUartText(" INTERLACE ") : RockDisplayDecimal(rock_edid_cap_interlaced[slot])
+      If rock_edid_cap_hsync_positive[slot]>=0
+        RockUartText(" HPOS ") : RockDisplayDecimal(rock_edid_cap_hsync_positive[slot])
+        RockUartText(" VPOS ") : RockDisplayDecimal(rock_edid_cap_vsync_positive[slot])
+      EndIf
+    EndIf
+    RockUartByte(13) : RockUartByte(10)
   Next
 EndProcedure
 
@@ -110,8 +183,8 @@ Procedure RockDisplayScanoutTelemetry()
   RockUartText(" DCLK ")
   RockDisplayHexLong(RockCruRead(#ROCK_CRU_CLKSEL+$C8))
   RockUartText(" CDN TU/SP ")
-  RockDisplayHexLong(PeekL(#ROCK_CDN_DP+#CDN_FRAMER_TU) & $FFFFFFFF) : RockUartByte(32)
-  RockDisplayHexLong(PeekL(#ROCK_CDN_DP+#CDN_FRAMER_SP) & $FFFFFFFF)
+  RockDisplayHexLong(rock_cdn_programmed_framer_tu) : RockUartByte(32)
+  RockDisplayHexLong(rock_cdn_programmed_framer_sp)
   RockUartText(" WIN0 ")
   RockDisplayHexLong(RockVopRead(#VOP_WIN0_CTRL0))
   RockUartText(" HTOTAL ")
@@ -415,13 +488,18 @@ Procedure.i RockDisplayUp()
   EndIf
   If RockCdnReadEdid()=0
     RockDisplaySubsystemTelemetry("DPE9 CDN ERR ",rock_cdn_error)
-    If rock_cdn_error = 30
+    If rock_cdn_error = 30 Or rock_cdn_error = 43
       RockDisplayEdidTelemetry()
+    EndIf
+    If rock_cdn_error = 43
+      RockDisplaySubsystemTelemetry("DPE9 EDID CAP REASON ",rock_edid_error)
+    ElseIf rock_cdn_error = 30
       RockDisplaySubsystemTelemetry("DPE9 MODE REJECTION REASON ",rock_mode_reason)
     EndIf
     ProcedureReturn RockDisplayFail(9,"DPE9 INVALID EDID OR NO SUPPORTED MODE")
   EndIf
   RockDisplayEdidTelemetry()
+  RockDisplayEdidCapabilities()
   RockDisplayModeTelemetry("DP05 EDID MODE ")
   If RockCdnTrain()=0
     RockDisplaySubsystemTelemetry("DPEB CDN ERR ",rock_cdn_error)

@@ -79,12 +79,17 @@
 #CDN_LINK_HBR2 = 20
 #CDN_SYNC_NEGATIVE = $8000
 #CDN_FW_BYTES = 98320
-#CDN_EDID_BYTES = 128
+#CDN_EDID_BYTES = 32768
 
 Global rock_cdn_error.i
 Global rock_cdn_firmware_version.i
 Global rock_cdn_link_rate.i
 Global rock_cdn_link_lanes.i
+; Firmware-owned source registers are written through the mailbox and are not
+; CPU-readable on this handoff. Retain the successfully acknowledged values
+; needed for diagnostics instead of probing that protected MMIO window.
+Global rock_cdn_programmed_framer_tu.i
+Global rock_cdn_programmed_framer_sp.i
 Global rock_cdn_aux_status.i
 Global rock_cdn_dpcd_phase.i
 Global rock_cdn_mailbox_actual_opcode.i
@@ -100,7 +105,7 @@ Global rock_cdn_mailbox_drain_count.i
 Global rock_cdn_mailbox_drain_complete.i
 Global rock_cdn_mailbox_payload5_valid.i
 Global Dim rock_cdn_mailbox_payload5.a[4]
-Global Dim rock_cdn_edid.a[255]
+Global Dim rock_cdn_edid.a[#CDN_EDID_BYTES-1]
 Global Dim rock_cdn_message.a[255]
 
 Procedure RockCdnMailboxWitnessReset(module.i, opcode.i, bytes.i)
@@ -220,13 +225,19 @@ Procedure.i RockCdnReceive(module.i, opcode.i, bytes.i, destination.i)
 EndProcedure
 
 Procedure.i RockCdnRegWrite(address.i, value.i)
+  Protected result.i
   PokeA(@rock_cdn_message[0],(address >> 8) & 255)
   PokeA(@rock_cdn_message[0]+1,address & 255)
   PokeA(@rock_cdn_message[0]+2,(value >> 24) & 255)
   PokeA(@rock_cdn_message[0]+3,(value >> 16) & 255)
   PokeA(@rock_cdn_message[0]+4,(value >> 8) & 255)
   PokeA(@rock_cdn_message[0]+5,value & 255)
-  ProcedureReturn RockCdnSend(#CDN_MB_DP_TX,#CDN_WRITE_REGISTER,6,@rock_cdn_message[0])
+  result=RockCdnSend(#CDN_MB_DP_TX,#CDN_WRITE_REGISTER,6,@rock_cdn_message[0])
+  If result <> 0
+    If address=#CDN_FRAMER_TU : rock_cdn_programmed_framer_tu=value & $FFFFFFFF : EndIf
+    If address=#CDN_FRAMER_SP : rock_cdn_programmed_framer_sp=value & $FFFFFFFF : EndIf
+  EndIf
+  ProcedureReturn result
 EndProcedure
 
 Procedure.i RockCdnRegField(address.i, firstBit.i, bits.i, value.i)
@@ -416,7 +427,18 @@ Procedure.i RockCdnReadEdidBlock(block.i, destination.i)
 EndProcedure
 
 Procedure.i RockCdnReadEdid()
+  Protected extensionCount.i
+  Protected block.i
   If RockCdnReadEdidBlock(0,@rock_cdn_edid[0]) = 0 : ProcedureReturn 0 : EndIf
+  extensionCount=PeekA(@rock_cdn_edid[0]+126) & 255
+  If extensionCount>0
+    For block=1 To extensionCount
+      If RockCdnReadEdidBlock(block,@rock_cdn_edid[0]+block*128) = 0 : ProcedureReturn 0 : EndIf
+    Next
+  EndIf
+  If RockEdidCapsCollect(@rock_cdn_edid[0],extensionCount+1)=0
+    rock_cdn_error=43 : ProcedureReturn 0
+  EndIf
   If RockModeSelect(@rock_cdn_edid[0]) = 0
     rock_cdn_error = 30 : ProcedureReturn 0
   EndIf

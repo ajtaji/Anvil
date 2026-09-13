@@ -80,6 +80,8 @@ Procedure.i RockModeEdidBaseReason(edid.i)
   ProcedureReturn #ROCK_MODE_REASON_PREFERRED
 EndProcedure
 
+XIncludeFile "RockPi4C/Lib/edid_caps.pbi"
+
 Procedure.i RockModeGcd(first.i,second.i)
   Protected temporary.i
   While first>0

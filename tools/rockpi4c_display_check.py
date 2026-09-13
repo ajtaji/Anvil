@@ -131,6 +131,37 @@ def base_edid(dtd: bytes, *, valid_checksum: bool = True,
     return bytes(edid)
 
 
+def checksum_edid_block(block: bytes | bytearray) -> bytes:
+    """Return one exact 128-byte EDID block with a valid checksum."""
+    require(len(block) == 128, "EDID block must be exactly 128 bytes")
+    result = bytearray(block)
+    result[127] = (-sum(result[:127])) & 255
+    return bytes(result)
+
+
+def capability_test_edid() -> bytes:
+    """Two-block EDID exercising every supported inventory source."""
+    base = bytearray(base_edid(detailed_timing(
+        1920, 1080, 148500, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=False,
+    ), advertise_fallback=True))
+    base[38:54] = b"\x01\x01" * 8
+    base[38:40] = bytes((0x81, 0x80))  # 1280x1024@60 standard timing.
+    base[72:90] = bytes((0, 0, 0, 0xFD, 0, 48, 144, 30, 180, 36,
+                         0, 0, 0, 0, 0, 0, 0, 0))
+    base[126] = 1
+    base = bytearray(checksum_edid_block(base))
+
+    cta = bytearray(128)
+    cta[0:4] = bytes((2, 3, 8, 1))  # CTA-861, DBC end=8, one native DTD.
+    cta[4:8] = bytes((0x43, 0x80 | 16, 4, 127))
+    cta[8:26] = detailed_timing(
+        1920, 1080, 297000, 280, 88, 44, 45, 4, 5,
+        hsync_positive=True, vsync_positive=True,
+    )
+    return bytes(base) + checksum_edid_block(cta)
+
+
 def select_reference_mode(edid: bytes) -> tuple[tuple[int, ...] | None, str, str]:
     """Independent model of the deliberately bounded preferred-DTD policy."""
     def fallback(reason: str) -> tuple[tuple[int, ...] | None, str, str]:
@@ -224,6 +255,32 @@ def source_contract() -> None:
         require(include in board, f"composition root omits {include}")
     require('xincludefile "raspberrypi4/' not in board,
             "Pi 4 hardware leaked into Rock Pi composition root")
+    edid_caps = libraries["edid_caps.pbi"].lower()
+    for token in (
+        "#rock_edid_max_blocks = 256", "#rock_edid_cap_max = 30400",
+        "procedure.i rockedidblockchecksum", "procedure.i rockedidcapsestablished",
+        "procedure.i rockedidcapsstandard", "procedure.i rockedidcapdtd",
+        "procedure rockedidcapsrange", "procedure.i rockedidcapctasvd",
+        "procedure.i rockedidcapscta", "procedure.i rockedidcapscollect",
+        "for block=1 to extensioncount", "rock_edid_extension_tag[block]=tag",
+        "rock_edid_extension_parsed[block]=1", "default : mapped=0",
+        "rock_edid_error=#rock_edid_error_capacity",
+    ):
+        require(token in edid_caps, f"EDID capability inventory drifted: {token}")
+    require(30400 >= 29 + 255 * 119,
+            "EDID capability storage cannot hold the bounded wire maximum")
+    cdn = libraries["cdn_dp.pbi"].lower()
+    for token in (
+        "#cdn_edid_bytes = 32768",
+        "global dim rock_cdn_edid.a[#cdn_edid_bytes-1]",
+        "extensioncount=peeka(@rock_cdn_edid[0]+126) & 255",
+        "for block=1 to extensioncount",
+        "rockcdnreadedidblock(block,@rock_cdn_edid[0]+block*128)",
+        "rockedidcapscollect(@rock_cdn_edid[0],extensioncount+1)",
+    ):
+        require(token in cdn, f"complete EDID acquisition drifted: {token}")
+    require("extensioncount>1" not in cdn,
+            "EDID acquisition silently truncates advertised extension blocks")
     display = libraries["display.pbi"].lower()
     display_up = display.split("procedure.i rockdisplayup()", 1)[1].split(
         "endprocedure", 1
@@ -326,6 +383,14 @@ def source_contract() -> None:
     require('rockdisplaysubsystemtelemetry("dped cdn err ",rock_cdn_error)' in
             configured_failure and "rockdisplayfail(13" in configured_failure,
             "unsupported selected mode can be mistaken for configured video")
+    for token in (
+        "procedure rockdisplayedidtelemetry()",
+        "for block=0 to rock_edid_block_count-1",
+        "procedure rockdisplayedidcapabilities()",
+        'rockuarttext("edid ext ")', 'rockuarttext(" parsed ")',
+        'rockuarttext("edid range v ")', 'rockuarttext("edid cap ")',
+    ):
+        require(token in display, f"EDID report surface drifted: {token}")
     cru = libraries["cru.pbi"].lower()
     power_order = ["rockpmupoweron(14", "rockpmupoweron(24",
                    "rockpmupoweron(20", "rockpmuidlerelease(8",
@@ -1075,6 +1140,7 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
         '; Desk-only selected-mode fixture. It must never be booted.\n'
         'XIncludeFile "RockPi4C/Lib/display_mode.pbi"\n\n'
         'Procedure.i Main()\n'
+        f'  RockEdidCapsCollect(${edid_address:08X},1)\n'
         f'  ProcedureReturn RockModeSelect(${edid_address:08X})\n'
         'EndProcedure\n',
         encoding="utf-8", newline="\n",
@@ -1097,14 +1163,20 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
         line.split("=", 1) for line in symbol_file.read_text().splitlines()
         if "=" in line
     )}
-    required = ["main", "rockmodeselect", "rockmodecommit", "__bss_start__",
-                "__bss_end__"] + [f"global_rock_mode_{name}" for name in (
+    required = ["main", "rockmodeselect", "rockmodecommit",
+                "rockedidcapscollect", "__bss_start__", "__bss_end__"] + [
+                    f"global_rock_mode_{name}" for name in (
                     "width", "height", "pixel_hz", "htotal", "hsync_start",
                     "hsync_end", "vtotal", "vsync_start", "vsync_end",
                     "hsync_positive", "vsync_positive", "pitch", "source",
-                    "reason", "valid")]
-    require(not [name for name in required if name not in symbols],
-            "selected-mode fixture symbols are incomplete")
+                    "reason", "valid")] + [f"global_rock_edid_{name}" for name in (
+                    "block_count", "cap_count", "error", "range_count",
+                    "extension_tag", "extension_parsed", "cap_source",
+                    "cap_code", "cap_native", "cap_mapped", "cap_width",
+                    "cap_height", "cap_refresh_millihz")]
+    missing_symbols = [name for name in required if name not in symbols]
+    require(not missing_symbols,
+            "selected-mode fixture symbols are incomplete: " + ", ".join(missing_symbols))
 
     interpreter_path = ROOT / "tools/a64/a64_interp.py"
     spec = importlib.util.spec_from_file_location("rockpi4c_mode_a64", interpreter_path)
@@ -1143,6 +1215,41 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
             address = symbols[f"global_rock_mode_{name}"]
             values.append(signed(cpu.load(address, 8)))
         return signed(cpu.x[0]), tuple(values)
+
+    def run_caps(edid: bytes, blocks: int) -> tuple[int, dict[str, int],
+                                                    list[tuple[int, ...]]]:
+        cpu = a64.A64()
+        for offset, byte in enumerate(blob):
+            cpu.memory[load + offset] = byte
+        for offset, byte in enumerate(edid):
+            cpu.memory[edid_address + offset] = byte
+        a64.attach_symbols(cpu, image, load)
+        cpu.pc = load + symbols["rockedidcapscollect"]
+        cpu.sp = stack
+        cpu.x[0] = edid_address
+        cpu.x[1] = blocks
+        cpu.x[30] = returned
+        for _ in range(2_000_000):
+            if cpu.pc == returned:
+                break
+            cpu.step()
+        else:
+            raise AssertionError("emitted RockEdidCapsCollect did not return")
+        scalar_names = ("block_count", "cap_count", "error", "range_count")
+        state = {name: signed(cpu.load(symbols[f"global_rock_edid_{name}"], 8))
+                 for name in scalar_names}
+        records = []
+        array_names = ("cap_source", "cap_code", "cap_native", "cap_mapped",
+                       "cap_width", "cap_height", "cap_refresh_millihz")
+        for slot in range(max(0, state["cap_count"])):
+            records.append(tuple(signed(cpu.load(
+                symbols[f"global_rock_edid_{name}"] + slot * 8, 8))
+                for name in array_names))
+        state["extension_tag_1"] = signed(cpu.load(
+            symbols["global_rock_edid_extension_tag"] + 8, 8))
+        state["extension_parsed_1"] = signed(cpu.load(
+            symbols["global_rock_edid_extension_parsed"] + 8, 8))
+        return signed(cpu.x[0]), state, records
 
     preferred = base_edid(detailed_timing(
         1920, 1080, 148500, 280, 88, 44, 45, 4, 5,
@@ -1188,6 +1295,43 @@ def emitted_mode_contract(compiler: Path, work: Path) -> None:
     require(result == 0 and values[-3:] == (-1, 14, 0),
             f"emitted parser silently admitted an unsupported native mode: "
             f"{result}, {values}")
+
+    complete = capability_test_edid()
+    result, state, records = run_caps(complete, 2)
+    require(result == 1 and state == {
+        "block_count": 2, "cap_count": 7, "error": 0, "range_count": 1,
+        "extension_tag_1": 2, "extension_parsed_1": 1,
+    }, f"emitted EDID inventory state drifted: {result}, {state}")
+    require((4, 127, 0, 0, 0, 0, 0) in records,
+            f"unsupported CTA VIC was hidden or synthesized: {records}")
+    require((4, 16, 1, 1, 1920, 1080, 60000) in records and
+            (5, 0, 1, 1, 1920, 1080, 120000) in records,
+            f"CTA native/SVD/DTD capability identity drifted: {records}")
+
+    bad_checksum = bytearray(complete)
+    bad_checksum[-1] ^= 1
+    result, state, _ = run_caps(bytes(bad_checksum), 2)
+    require(result == 0 and state["error"] == 3,
+            f"bad extension checksum was admitted: {result}, {state}")
+
+    truncated = bytearray(complete)
+    truncated[128 + 2] = 6
+    truncated[128:256] = checksum_edid_block(truncated[128:256])
+    result, state, _ = run_caps(bytes(truncated), 2)
+    require(result == 0 and state["error"] == 7,
+            f"truncated CTA data block was admitted: {result}, {state}")
+
+    unknown = bytearray(complete)
+    unknown[128] = 0x70
+    unknown[128:256] = checksum_edid_block(unknown[128:256])
+    result, state, records = run_caps(bytes(unknown), 2)
+    require(result == 1 and state["extension_tag_1"] == 0x70 and
+            state["extension_parsed_1"] == 0 and len(records) == 3,
+            f"valid unknown extension was not honestly reported: {result}, {state}")
+
+    result, state, _ = run_caps(complete, 1)
+    require(result == 0 and state["error"] == 1,
+            f"truncated advertised extension set was admitted: {result}, {state}")
 
 
 def emitted_line_buffer_contract(image: Path, symbols: dict[str, int]) -> None:
@@ -1373,8 +1517,16 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         positions = [display_up_asm.index(call) for call in emitted_witnesses]
         require(positions == sorted(positions),
                 "emitted stage-local silicon witness order drifted")
-        require(display_up_asm.count("bl rockdisplaysubsystemtelemetry") == 15,
-                "emitted subsystem error witnesses are incomplete")
+        display_source = (ROCK / "Lib/display.pbi").read_text(
+            encoding="utf-8").lower()
+        display_source_up = display_source.split(
+            "procedure.i rockdisplayup()", 1)[1].split("endprocedure", 1)[0]
+        expected_subsystem_witnesses = display_source_up.count(
+            "rockdisplaysubsystemtelemetry(")
+        require(expected_subsystem_witnesses > 0 and
+                display_up_asm.count("bl rockdisplaysubsystemtelemetry") ==
+                expected_subsystem_witnesses,
+                "emitted subsystem error witnesses differ from guarded source branches")
         require("global_rock_cru_dp_core_rate" in display_up_asm,
                 "emitted Cadence setup lost the live core-clock handoff")
         dpcd_telemetry_asm = asm.split("rockdisplaydpcdtelemetry:", 1)[1].split(
