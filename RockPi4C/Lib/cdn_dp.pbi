@@ -60,7 +60,19 @@
 #CDN_READ_EVENT = 10
 #CDN_READ_LINK_STAT = 11
 #CDN_SET_VIDEO = 12
+#CDN_GET_LAST_AUX_STATUS = 14
 #CDN_HPD_STATE = 17
+
+#CDN_AUX_ACK = 0
+#CDN_AUX_NACK = 1
+#CDN_AUX_DEFER = 2
+#CDN_AUX_SINK_ERROR = 3
+#CDN_AUX_BUS_ERROR = 4
+
+#CDN_DPCD_PHASE_SEND = 1
+#CDN_DPCD_PHASE_RESPONSE = 2
+#CDN_DPCD_PHASE_AUX_MAILBOX = 3
+#CDN_DPCD_PHASE_AUX_RESULT = 4
 
 #CDN_LINK_RBR = 6
 #CDN_LINK_HBR = 10
@@ -73,6 +85,8 @@ Global rock_cdn_error.i
 Global rock_cdn_firmware_version.i
 Global rock_cdn_link_rate.i
 Global rock_cdn_link_lanes.i
+Global rock_cdn_aux_status.i
+Global rock_cdn_dpcd_phase.i
 Global Dim rock_cdn_edid.a[255]
 Global Dim rock_cdn_message.a[255]
 
@@ -265,26 +279,58 @@ Procedure.i RockCdnHotPlug()
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i RockCdnLastAuxStatus()
+  If RockCdnSend(#CDN_MB_DP_TX,#CDN_GET_LAST_AUX_STATUS,0,@rock_cdn_message[0]) = 0 : ProcedureReturn -1 : EndIf
+  If RockCdnReceive(#CDN_MB_DP_TX,#CDN_GET_LAST_AUX_STATUS,1,@rock_cdn_message[64]) = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn PeekA(@rock_cdn_message[64]) & 255
+EndProcedure
+
 Procedure.i RockCdnDpcd()
   Protected attempt.i
+  Protected aux.i
   Protected index.i
   PokeA(@rock_cdn_message[0],0)
   PokeA(@rock_cdn_message[0]+1,16)
   PokeA(@rock_cdn_message[0]+2,0)
   PokeA(@rock_cdn_message[0]+3,0)
   PokeA(@rock_cdn_message[0]+4,0)
-  For attempt = 0 To 59
-    If RockCdnSend(#CDN_MB_DP_TX,#CDN_READ_DPCD,5,@rock_cdn_message[0]) <> 0
-      If RockCdnReceive(#CDN_MB_DP_TX,#CDN_READ_DPCD,21,@rock_cdn_message[32]) <> 0
+  rock_cdn_aux_status = -1
+  For attempt = 0 To 31
+    ; A send or receive error can leave a partial command or late response in
+    ; the firmware mailbox. It is never safe to put another command behind it.
+    rock_cdn_dpcd_phase = #CDN_DPCD_PHASE_SEND
+    If RockCdnSend(#CDN_MB_DP_TX,#CDN_READ_DPCD,5,@rock_cdn_message[0]) = 0 : ProcedureReturn 0 : EndIf
+    rock_cdn_dpcd_phase = #CDN_DPCD_PHASE_RESPONSE
+    If RockCdnReceive(#CDN_MB_DP_TX,#CDN_READ_DPCD,21,@rock_cdn_message[32]) = 0 : ProcedureReturn 0 : EndIf
+    ; The complete DPCD response has been consumed, so the mailbox is now
+    ; quiescent and can accept the owner's GET_LAST_AUX_STATUS command.
+    rock_cdn_dpcd_phase = #CDN_DPCD_PHASE_AUX_MAILBOX
+    aux = RockCdnLastAuxStatus()
+    If aux < 0 : ProcedureReturn 0 : EndIf
+    rock_cdn_aux_status = aux
+    rock_cdn_dpcd_phase = #CDN_DPCD_PHASE_AUX_RESULT
+    Select aux
+      Case #CDN_AUX_ACK
         For index = 0 To 15
           PokeA(@rock_cdn_message[0]+index,PeekA(@rock_cdn_message[32]+5+index) & 255)
         Next
         If (PeekA(@rock_cdn_message[0]) & 255) >= $10 : ProcedureReturn 1 : EndIf
-      EndIf
-    EndIf
-    RockTimerWaitUs(50000)
+        rock_cdn_error = 28
+        ProcedureReturn 0
+      Case #CDN_AUX_DEFER
+        ; Both mailbox responses were consumed. Only AUX DEFER is retryable.
+        RockTimerWaitUs(500)
+      Case #CDN_AUX_NACK
+        rock_cdn_error = 37 : ProcedureReturn 0
+      Case #CDN_AUX_SINK_ERROR
+        rock_cdn_error = 38 : ProcedureReturn 0
+      Case #CDN_AUX_BUS_ERROR
+        rock_cdn_error = 39 : ProcedureReturn 0
+      Default
+        rock_cdn_error = 40 : ProcedureReturn 0
+    EndSelect
   Next
-  rock_cdn_error = 28
+  rock_cdn_error = 41
   ProcedureReturn 0
 EndProcedure
 

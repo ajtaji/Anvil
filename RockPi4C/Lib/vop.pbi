@@ -7,6 +7,8 @@
 #ROCK_FB_WIDTH = 1024
 #ROCK_FB_HEIGHT = 768
 #ROCK_FB_WORDS = 786432
+#ROCK_FB_BYTES = #ROCK_FB_WORDS*4
+#ROCK_FB_ALIGNMENT = 16
 
 #VOP_CFG_DONE = $000
 #VOP_SYS_CTRL = $008
@@ -28,7 +30,13 @@
 
 Global rock_vop_ready.i
 Global rock_vop_error.i
-Global Dim rock_vop_framebuffer.l[#ROCK_FB_WORDS]
+; Global ordering is not an alignment contract. Reserve one alignment unit
+; of slack and derive the scanout base within this compiler-owned object.
+Global Dim rock_vop_framebuffer.l[#ROCK_FB_WORDS+4]
+
+Procedure.i RockVopFramebuffer()
+  ProcedureReturn (@rock_vop_framebuffer[0]+#ROCK_FB_ALIGNMENT-1) & $FFFFFFFFFFFFFFF0
+EndProcedure
 
 Procedure.i RockVopRead(offset.i)
   ProcedureReturn PeekL(#ROCK_VOPL+offset) & $FFFFFFFF
@@ -84,7 +92,7 @@ Procedure RockVopGlyph(character.i, x0.i, y0.i, scale.i, colour.i)
     For column=0 To 4
       If (bits & (16 >> column)) <> 0
         For dy=0 To scale-1
-          address=@rock_vop_framebuffer[0]+((y0+row*scale+dy)*#ROCK_FB_WIDTH+x0+column*scale)*4
+          address=RockVopFramebuffer()+((y0+row*scale+dy)*#ROCK_FB_WIDTH+x0+column*scale)*4
           For dx=0 To scale-1
             PokeL(address+dx*4,colour)
           Next
@@ -122,7 +130,7 @@ Procedure RockVopFirstFrame()
         Default : colour=$FF101010
       EndSelect
       If y >= 640 : colour=$FF101010 : EndIf
-      address=@rock_vop_framebuffer[0]+(y*#ROCK_FB_WIDTH+x)*4
+      address=RockVopFramebuffer()+(y*#ROCK_FB_WIDTH+x)*4
       PokeL(address,colour)
     Next
   Next
@@ -162,7 +170,7 @@ Procedure.i RockVopUp1024x768()
   RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
   RockVopWrite(#VOP_WIN0_VIR,1024)
   RockVopWrite(#VOP_WIN0_CTRL0,$A1)
-  RockVopWrite(#VOP_WIN0_YRGB_MST,@rock_vop_framebuffer[0])
+  RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)
   ; Latch the new pixel clock into the VOP only after every timing register and
   ; scan address is valid.

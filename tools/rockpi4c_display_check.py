@@ -50,9 +50,10 @@ def source_contract() -> None:
             "Pi 4 hardware leaked into Rock Pi composition root")
     display = libraries["display.pbi"].lower()
     order = [
-        "rockcrudisplayprepare", "rocktcphyup", "rockcrucadencerelease",
-        "rockcdnfirmwareload", "rockcdnfirmwareactive", "rockcdnhostcapabilities",
-        "rockcdnhotplug", "rockcdndpcd", "rockcdnreadedid",
+        "rockcrudisplayprepare", "rockcrucadencerelease", "rockcdninternalclocks",
+        "rockcdnfirmwareload", "rockcdnfirmwareactive", "rockcdnenableevents",
+        "rocktcphyup", "$30003000", "rockcdnhotplug",
+        "rockcdnhostcapabilities", "rockcdndpcd", "rockcdnreadedid",
         "rockvopup1024x768", "rockcdntrain", "rockcdnvideostatus(0)",
         "rockcdnvideo1024x768", "rockcdnvideostatus(1)",
     ]
@@ -68,6 +69,9 @@ def source_contract() -> None:
     require("$00030000" in cru and "$00030001" in cru,
             "GPIO1_D0 input/pull-up pinctrl contract missing")
     vop = libraries["vop.pbi"].lower()
+    require("procedure.i rockvopframebuffer()" in vop and
+            "& $fffffffffffffff0" in vop,
+            "framebuffer base is not derived at its required 16-byte alignment")
     for timing in (
         "rockvopwrite(#vop_hact,1320 | (296 << 16))",
         "rockvopwrite(#vop_vact,803 | (35 << 16))",
@@ -89,6 +93,60 @@ def source_contract() -> None:
     require("requiredmbps.i = (65000 * 24 + 999) / 1000" in cdn and
             "availablembps = linkmhz * rock_cdn_link_lanes * 8" in cdn,
             "1024x768 link-bandwidth arithmetic drifted")
+    for token in (
+        "#cdn_get_last_aux_status = 14", "#cdn_aux_ack = 0",
+        "#cdn_aux_nack = 1", "#cdn_aux_defer = 2",
+        "#cdn_aux_sink_error = 3", "#cdn_aux_bus_error = 4",
+        "#cdn_dpcd_phase_send = 1", "#cdn_dpcd_phase_response = 2",
+        "#cdn_dpcd_phase_aux_mailbox = 3", "#cdn_dpcd_phase_aux_result = 4",
+        "procedure.i rockcdnlastauxstatus()",
+    ):
+        require(token in cdn, f"DPCD AUX status contract drifted: {token}")
+    dpcd = cdn.split("procedure.i rockcdndpcd()", 1)[1].split(
+        "procedure.i rockcdnreadedidblock", 1)[0]
+    transaction_order = [
+        "rockcdnsend(#cdn_mb_dp_tx,#cdn_read_dpcd",
+        "rockcdnreceive(#cdn_mb_dp_tx,#cdn_read_dpcd",
+        "aux = rockcdnlastauxstatus()",
+    ]
+    positions = [dpcd.index(token) for token in transaction_order]
+    require(positions == sorted(positions),
+            "DPCD response must be consumed before AUX status is requested")
+    require("rockcdnsend(#cdn_mb_dp_tx,#cdn_read_dpcd,5,@rock_cdn_message[0]) = 0 : procedurereturn 0" in dpcd,
+            "DPCD send errors must stop without retrying a partial request")
+    require("rockcdnreceive(#cdn_mb_dp_tx,#cdn_read_dpcd,21,@rock_cdn_message[32]) = 0 : procedurereturn 0" in dpcd,
+            "DPCD transport errors must stop without retrying a dirty mailbox")
+    require("if aux < 0 : procedurereturn 0" in dpcd,
+            "AUX-status mailbox errors must stop without retry")
+    defer = dpcd.split("case #cdn_aux_defer", 1)[1].split(
+        "case #cdn_aux_nack", 1)[0]
+    require("rocktimerwaitus(500)" in defer,
+            "AUX DEFER no longer owns the sole DPCD retry delay")
+    require(dpcd.count("rocktimerwaitus(") == 1,
+            "a non-DEFER DPCD path gained a retry delay")
+    ack = dpcd.split("case #cdn_aux_ack", 1)[1].split(
+        "case #cdn_aux_defer", 1)[0]
+    require("procedurereturn 1" in ack and "procedurereturn 0" in ack,
+            "AUX ACK must accept valid DPCD and refuse an invalid revision")
+    for fatal in ("#cdn_aux_nack", "#cdn_aux_sink_error", "#cdn_aux_bus_error"):
+        branch = dpcd.split(f"case {fatal}", 1)[1].split("case ", 1)[0]
+        require("procedurereturn 0" in branch,
+                f"fatal AUX result became retryable: {fatal}")
+    require("default" in dpcd and "rock_cdn_error = 40 : procedurereturn 0" in dpcd,
+            "unknown AUX status must fail closed")
+    require("rock_cdn_error = 41" in dpcd,
+            "AUX DEFER exhaustion must fail closed")
+    require("for attempt = 0 to 31" in dpcd,
+            "DPCD retry count drifted from the 32-attempt owner contract")
+    for phase in ("send", "response", "aux_mailbox", "aux_result"):
+        require(f"rock_cdn_dpcd_phase = #cdn_dpcd_phase_{phase}" in dpcd,
+                f"DPCD telemetry omits {phase} phase")
+    require("rock_cdn_aux_status = aux" in dpcd,
+            "DPCD telemetry omits the last AUX result")
+    require("rockdisplaydpcdtelemetry()" in display and
+            'rockuarttext("dpe8 dpcd phase ")' in display and
+            'rockuarttext(" aux ")' in display,
+            "serial DPCD phase/AUX telemetry is missing")
 
 
 def firmware_contract() -> None:
@@ -182,13 +240,19 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                  re.findall(r"^([^|]+)\|([0-9]+)\|", metadata, re.M)}
         bss_start = int(values["__bss_start__"])
         bss_end = int(values["__bss_end__"])
-        framebuffer = int(values["global_rock_vop_framebuffer"])
+        framebuffer_storage = int(values["global_rock_vop_framebuffer"])
+        framebuffer = (framebuffer_storage + 15) & ~15
         require(bss_start == 0x02800000 and bss_end <= 0x02C00000,
                 f"display BSS escaped its owned window: {bss_start:#x}..{bss_end:#x}")
         require(framebuffer % 16 == 0 and framebuffer + 1024 * 768 * 4 <= bss_end,
-                "framebuffer is misaligned or not fully allocated")
-        require(sizes.get("global_rock_vop_framebuffer") == 1024 * 768 * 4,
-                "framebuffer symbol is not exactly 1024x768x32")
+                f"framebuffer is misaligned or not fully allocated: "
+                f"buffer={framebuffer:#x}, end={framebuffer + 1024 * 768 * 4:#x}, "
+                f"bss_end={bss_end:#x}")
+        storage_size = sizes.get("global_rock_vop_framebuffer")
+        require(storage_size == 1024 * 768 * 4 + 16,
+                "framebuffer storage lacks exactly one alignment unit of slack")
+        require(framebuffer + 1024 * 768 * 4 <= framebuffer_storage + storage_size,
+                "aligned framebuffer escaped its backing object")
         counted = build_count.record_build(
             ROCK / "Board/board.rockpi4c", "rockpi4c", output,
             by="tools/rockpi4c_display_check.py", compiler=compiler,
