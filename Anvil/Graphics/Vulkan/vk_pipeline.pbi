@@ -1635,6 +1635,16 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called outside a render pass (Anvil code -20004, no render pass); a draw belongs between vkCmdBeginRenderPass and vkCmdEndRenderPass, because the render pass is what says where the pixels go.")
     ProcedureReturn
   EndIf
+  If vertexCount < 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was given a negative vertexCount (Anvil code -20001, invalid argument); vertexCount is an unsigned count in the Vulkan ABI.")
+    ProcedureReturn
+  EndIf
+  ; A zero-vertex draw generates no work. In particular, it must not use
+  ; the backend seam's one real-draw slot and make a following non-empty
+  ; draw look like an unsupported second draw.
+  If vertexCount = 0
+    ProcedureReturn
+  EndIf
   If avkCbDrawCount[c] > 0
     avkCbFail(c, #VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdDraw was called a second time in one render pass (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); the backend seam carries one draw per submission, so record the second draw in its own command buffer until the backend carries a command list.")
     ProcedureReturn
@@ -1662,10 +1672,6 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
   EndIf
   If instanceCount <> 1 Or firstInstance <> 0
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDraw was asked for other than exactly one instance starting at instance zero (Anvil code -20005, instancing not implemented); the control list this backend writes draws one instance, so a second one would be declared and never drawn.")
-    ProcedureReturn
-  EndIf
-  If vertexCount < 3 Or (vertexCount % 3) <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was given a vertex count that is not a positive multiple of three (Anvil code -20001, incomplete triangle); the topology is VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, so the leftover vertices would form no primitive and would be silently dropped.")
     ProcedureReturn
   EndIf
   If firstVertex < 0

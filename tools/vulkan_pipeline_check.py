@@ -390,7 +390,8 @@ def grade(cpu, rc) -> Grader:
 
     # --- the public path reached the backend with the right numbers ---
     vertex_base = slot(6)
-    g.need("one draw reached the backend", slot(21), 1)
+    g.need("a zero draw was a no-op and the following real draw reached the backend",
+           slot(21), 1)
     g.need("four pipeline slots are live after the fifth reused one", slot(22), 4)
     g.need("the draw named the bound vertex buffer", slot(23), vertex_base)
     g.need("the draw carried the binding's stride", slot(24), STRIDE1)
@@ -416,8 +417,12 @@ def grade(cpu, rc) -> Grader:
     g.need("a fragment shader that reads push constants through a layout "
            "without a range is refused", slot(49), ERR_ARGS)
     g.need("a draw of two instances is refused", slot(43), ERR_UNSUPPORTED)
-    g.need("a vertex count that is not a multiple of three is refused",
-           slot(44), ERR_ARGS)
+    g.need("a draw with one incomplete final triangle records", slot(44), 0)
+    g.need("the incomplete-triangle draw submits", slot(161), 0)
+    g.need("the incomplete-triangle draw's fence signals", slot(162), 0)
+    g.need("the backend receives the original four-vertex count", slot(163), 4)
+    g.need("the incomplete-triangle draw is the second real backend draw",
+           slot(164), 2)
     g.need("a draw naming vertices past the end of the buffer is refused",
            slot(45), ERR_ARGS)
     g.need("ending a command buffer inside a render pass is refused",
@@ -660,7 +665,7 @@ def grade(cpu, rc) -> Grader:
     g.need("a binding this pipeline does not have carries no address",
            slot(110), 0)
     g.need("and no stride", slot(111), 0)
-    g.need("two draws have now reached the backend", slot(112), 2)
+    g.need("three draws have now reached the backend", slot(112), 3)
     g.need("NOT ONE PIXEL was written by the two-binding draw either",
            slot(113), 0)
 
@@ -733,7 +738,7 @@ def grade(cpu, rc) -> Grader:
     g.need("the draw carried the descriptor's address to the backend",
            slot(121), uniform_base)
     g.need("and its range", slot(122), 16)
-    g.need("three draws have now reached the backend", slot(68), 3)
+    g.need("four draws have now reached the backend", slot(68), 4)
 
     # pSampleMask is not optional semantics. With one sample, bit zero
     # clear suppresses every fragment while the render-pass clear still
@@ -744,8 +749,8 @@ def grade(cpu, rc) -> Grader:
     g.need("the zero-sample-mask draw submitted", slot(157), 0)
     g.need("the zero-sample-mask draw's fence signalled", slot(158), 0)
     g.need("the draw record carries sample bit zero clear", slot(159), 0)
-    g.need("the suppressed draw still reached the backend as the fourth draw",
-           slot(160), 4)
+    g.need("the suppressed draw still reached the backend as the fifth draw",
+           slot(160), 5)
 
     # --- the refusals the descriptor path makes possible ---
     g.need("a combined image sampler descriptor is refused",
@@ -961,9 +966,12 @@ PIPELINE_MUTANTS = (
     ("a draw of more than one instance is accepted",
      "  If instanceCount <> 1 Or firstInstance <> 0\n",
      "  If instanceCount < 0 Or firstInstance <> 0\n"),
-    ("a vertex count that is not a whole number of triangles is accepted",
-     "  If vertexCount < 3 Or (vertexCount % 3) <> 0\n",
-     "  If vertexCount < 3\n"),
+    ("a zero-vertex draw consumes the backend's real-draw slot",
+     "  If vertexCount = 0\n    ProcedureReturn\n  EndIf\n",
+     "  If vertexCount = 0\n    avkCbDrawCount[c] = 1\n    ProcedureReturn\n  EndIf\n"),
+    ("an incomplete final triangle is refused",
+     "  If vertexCount < 0\n",
+     "  If vertexCount < 0 Or (vertexCount > 0 And (vertexCount % 3) <> 0)\n"),
     ("blending is accepted and then not carried out",
      "  If (*a\\blendEnable & $FFFFFFFF) <> #VK_FALSE\n",
      "  If (*a\\blendEnable & $FFFFFFFF) = -1\n"),
@@ -1041,6 +1049,11 @@ SAMPLE_MASK_TRUTH_MUTANTS = frozenset({
     "the draw record always enables sample zero",
 })
 
+DRAW_COUNT_TRUTH_MUTANTS = frozenset({
+    "a zero-vertex draw consumes the backend's real-draw slot",
+    "an incomplete final triangle is refused",
+})
+
 
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
@@ -1053,7 +1066,7 @@ def main() -> int:
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage",
-                                                   "sample-mask"))
+                                                   "sample-mask", "draw-count"))
     args = parser.parse_args()
     if args.mutate_only:
         args.mutate = True
@@ -1078,8 +1091,8 @@ def main() -> int:
           f"{steps:,} executed A64 instructions")
     print("  the whole public path runs: six shader modules, four pipeline layouts, a")
     print("  render pass, a framebuffer, four buffers, two descriptor set layouts, a pool")
-    print("  and a set, five graphics pipelines over four live slots, four render passes each holding one draw,")
-    print("  four submissions and a fence")
+    print("  and a set, five graphics pipelines over four live slots, five render passes each holding one draw,")
+    print("  five submissions and a fence")
     print("  all four shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
     print("  attribute values matches a record this checker packed from the documented layout")
@@ -1113,6 +1126,8 @@ def main() -> int:
                 continue
             if args.mutate_only == "sample-mask" and name not in SAMPLE_MASK_TRUTH_MUTANTS:
                 continue
+            if args.mutate_only == "draw-count" and name not in DRAW_COUNT_TRUTH_MUTANTS:
+                continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
                 missed += 1
@@ -1138,6 +1153,8 @@ def main() -> int:
         total = len(IMAGE_USAGE_TRUTH_MUTANTS)
     elif args.mutate_only == "sample-mask":
         total = len(SAMPLE_MASK_TRUTH_MUTANTS)
+    elif args.mutate_only == "draw-count":
+        total = len(DRAW_COUNT_TRUTH_MUTANTS)
     else:
         total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
                  + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS))

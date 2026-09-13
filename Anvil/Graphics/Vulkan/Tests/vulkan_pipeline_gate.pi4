@@ -1045,6 +1045,10 @@ Procedure.i Main()
   bufHandle = buf
   bufOffset = 0
   vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  ; A zero-vertex draw is a no-op and does not consume the backend's one
+  ; real-draw slot. The following draw in the same render pass must remain
+  ; the one and only draw that reaches the backend.
+  vkCmdDraw(cmd, 0, 1, 0, 0)
   vkCmdDraw(cmd, 3, 1, 0, 0)
   vkCmdEndRenderPass(cmd)
   rc = vkEndCommandBuffer(cmd)
@@ -1108,7 +1112,22 @@ Procedure.i Main()
   vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
   vkCmdDraw(cmd, 4, 1, 0, 0)
   vkCmdEndRenderPass(cmd)
-  pgPut(44, vkEndCommandBuffer(cmd))
+  rc = vkEndCommandBuffer(cmd)
+  pgPut(44, rc)
+  ; TRIANGLE_LIST assembles one triangle and discards the incomplete
+  ; trailing vertex. The backend still receives Vulkan's original count;
+  ; its primitive assembler owns the discard rather than the recorder
+  ; falsifying what the application asked it to draw.
+  If rc = #VK_SUCCESS
+    vkResetFences(dev, 1, @fenceArray)
+    rc = vkQueueSubmit(queue, 1, @si, fence)
+    pgPut(161, rc)
+    If rc = #VK_SUCCESS
+      pgPut(162, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+      pgPut(163, AnvilVkTestBackendLastVertexCount())
+      pgPut(164, AnvilVkTestBackendDraws())
+    EndIf
+  EndIf
 
   vkResetCommandBuffer(cmd, 0)
   vkBeginCommandBuffer(cmd, @bi)
