@@ -117,9 +117,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; alignment of a four-component binary32 vector.
 #ANVIL_VK_UNIFORM_ALIGN = 16
 
-; The one queue family this slice exposes. It is transfer-capable and
-; nothing else; a graphics or compute bit here would be a claim about
-; draws and dispatches that no part of this tree implements.
+; The one queue family this slice exposes. It is always transfer-capable.
+; vkGetPhysicalDeviceQueueFamilyProperties adds VK_QUEUE_GRAPHICS_BIT
+; only when the linked backend owns #ANVIL_VK_CAP_DRAW. Compute remains
+; absent until a backend can actually execute dispatches.
 #ANVIL_VK_QUEUE_FAMILY = 0
 
 #ANVIL_VK_TOKEN_MAGIC = $564B000000000000

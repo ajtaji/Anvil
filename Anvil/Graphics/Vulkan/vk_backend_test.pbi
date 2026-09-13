@@ -44,12 +44,20 @@ Global avkTbLastH.i = 0
 Global avkTbLastPitch.i = 0
 Global avkTbLastColor.i = 0
 Global avkTbNative.i = 0
+Global avkTbCaps.i = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW
 
 ; Declare the window this backend suballocates. It is ordinary DRAM the
 ; caller owns; the backend never touches it.
 Procedure AnvilVkTestBackendHeap(base.i, bytes.i)
   avkTbHeapBase = base
   avkTbHeapBytes = bytes
+EndProcedure
+
+; Let the foundation gate model distinct honest backends without making
+; a second copy of the backend seam. Production never links this file.
+; DEVICE still depends on a real declared heap in avkBackendCaps below.
+Procedure AnvilVkTestBackendCapabilities(caps.i)
+  avkTbCaps = caps
 EndProcedure
 
 Procedure AnvilVkTestBackendLimits(maxDim.i, rowAlign.i)
@@ -109,7 +117,7 @@ EndProcedure
 
 Procedure.i avkBackendCaps()
   If avkTbHeapBase <= 0 Or avkTbHeapBytes <= 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW
+  ProcedureReturn avkTbCaps
 EndProcedure
 
 Procedure.i avkBackendName()

@@ -110,10 +110,11 @@ Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperti
   Wend
 EndProcedure
 
-; One queue family, transfer only. Saying GRAPHICS here would be a claim
-; about draws, and saying COMPUTE a claim about dispatches; neither
-; exists, and a caller that filters families on those bits must find
-; none rather than be handed a queue that cannot do the work.
+; One queue family. Transfer is implemented by every live backend.
+; Graphics is advertised only when this particular backend can execute
+; the draw record; compute remains absent because dispatch does not yet
+; exist. Keeping this derived from the backend capability means a
+; transfer-only target is not handed a queue it cannot use for drawing.
 Procedure vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice.i, *pQueueFamilyPropertyCount, *pQueueFamilyProperties.VkQueueFamilyProperties)
   If *pQueueFamilyPropertyCount = 0
     ProcedureReturn
@@ -131,6 +132,9 @@ Procedure vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice.i, *pQueueFami
     ProcedureReturn
   EndIf
   *pQueueFamilyProperties\queueFlags = #VK_QUEUE_TRANSFER_BIT
+  If (avkBackendCaps() & #ANVIL_VK_CAP_DRAW) <> 0
+    *pQueueFamilyProperties\queueFlags = *pQueueFamilyProperties\queueFlags | #VK_QUEUE_GRAPHICS_BIT
+  EndIf
   *pQueueFamilyProperties\queueCount = 1
   *pQueueFamilyProperties\timestampValidBits = 0
   *pQueueFamilyProperties\minImageTransferGranularity\width = 1

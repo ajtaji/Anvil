@@ -41,6 +41,7 @@ Procedure.i Main()
   Define mp.VkPhysicalDeviceMemoryProperties
   Define qf.VkQueueFamilyProperties
   Define qfCount.l
+  Define selectedFamily.i
 
   ; ------------------------------------------------------------------
   ;  Exact AArch64 C layout of every public record.
@@ -167,19 +168,35 @@ Procedure.i Main()
   Vkt(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS)
   Vkt(count = 1 And phys <> 0)
 
-  ; The device advertises exactly what it has: one transfer queue family
-  ; with one queue, and a memory heap that is the declared window.
+  ; The draw-capable test backend advertises a normal Vulkan graphics
+  ; queue as well as transfer. An application scanning queue families
+  ; for VK_QUEUE_GRAPHICS_BIT therefore selects family zero.
   qfCount = 0
   vkGetPhysicalDeviceQueueFamilyProperties(phys, @qfCount, 0)
   Vkt(qfCount = 1)
   qfCount = 1
   vkGetPhysicalDeviceQueueFamilyProperties(phys, @qfCount, @qf)
   Vkt(qfCount = 1)
-  Vkt(qf\queueFlags = #VK_QUEUE_TRANSFER_BIT)
-  Vkt((qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) = 0)
+  Vkt((qf\queueFlags & #VK_QUEUE_TRANSFER_BIT) <> 0)
+  Vkt((qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0)
   Vkt((qf\queueFlags & #VK_QUEUE_COMPUTE_BIT) = 0)
   Vkt(qf\queueCount = 1)
   Vkt(qf\minImageTransferGranularity\depth = 1)
+  selectedFamily = -1
+  If (qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0 : selectedFamily = 0 : EndIf
+  Vkt(selectedFamily = #ANVIL_VK_QUEUE_FAMILY)
+
+  ; The same API over a live backend without CAP_DRAW tells the smaller
+  ; truth: transfer only, so the identical scan finds no graphics queue.
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR)
+  qfCount = 1
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, @qfCount, @qf)
+  Vkt(qfCount = 1)
+  Vkt(qf\queueFlags = #VK_QUEUE_TRANSFER_BIT)
+  selectedFamily = -1
+  If (qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0 : selectedFamily = 0 : EndIf
+  Vkt(selectedFamily = -1)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW)
 
   vkGetPhysicalDeviceMemoryProperties(phys, @mp)
   Vkt(mp\memoryTypeCount = 2)

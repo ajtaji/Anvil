@@ -20,6 +20,7 @@ and the backend link gate is tools/vulkan_v3d_backend_check.py.
 from __future__ import annotations
 
 import hashlib
+import argparse
 import importlib.util
 import os
 import pathlib
@@ -36,6 +37,7 @@ VOCAB = HERE.parent / "vk_core_1_0.pbi"
 PROBE = HERE / "vulkan_foundation.pi4"
 PRODUCTION_PROBE = HERE / "vulkan_production_probe.pi4"
 V3D_BACKEND = HERE.parent / "vk_v3d_backend.pi4"
+API = HERE.parent / "vk_api.pbi"
 LOAD, STACK, RETURN = 0x400000, 0x3000000, 0xDEAD0000
 OUT = 0x06000000
 MMIO = 0xFC000000
@@ -751,7 +753,40 @@ def u64(cpu, addr: int) -> int:
     return sum(cpu.memory.get(addr + i, 0) << (8 * i) for i in range(8))
 
 
+def queue_capability_mutation() -> tuple[bool, str]:
+    """Remove GRAPHICS advertisement and require the public probe to notice.
+
+    This mutates the capability owner, not the test backend. The source is
+    restored in a finally block even when compilation or interpretation fails.
+    Run it only on request because it temporarily rewrites a shared source file.
+    """
+    fixed = """  If (avkBackendCaps() & #ANVIL_VK_CAP_DRAW) <> 0
+    *pQueueFamilyProperties\\queueFlags = *pQueueFamilyProperties\\queueFlags | #VK_QUEUE_GRAPHICS_BIT
+  EndIf
+"""
+    broken = """  ; MUTANT: a draw-capable backend falsely advertises no graphics queue.
+"""
+    original = API.read_text(encoding="utf-8")
+    if original.count(fixed) != 1:
+        return False, "queue-capability mutation anchor is stale"
+    try:
+        API.write_text(original.replace(fixed, broken), encoding="utf-8")
+        cpu, rc, _ = run_image(build(PROBE, "anvil_vk_foundation_queue_mutant.img"))
+        count = u64(cpu, OUT + 8)
+        failures = u64(cpu, OUT + 16)
+        failed_rows = [i + 1 for i in range(count)
+                       if u64(cpu, OUT + 0x100 + i * 8) == 0]
+        if rc == 0 or failures == 0:
+            return False, "removing GRAPHICS stayed green"
+        return True, "removing GRAPHICS was rejected at emitted rows " + ",".join(map(str, failed_rows))
+    finally:
+        API.write_text(original, encoding="utf-8")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mutate-queue", action="store_true")
+    args = parser.parse_args()
     failures = []
     checks = check_registry(failures)
 
@@ -804,6 +839,12 @@ def main() -> int:
     print("  production boundary executed in %d A64 instructions; device count stays zero"
           % prod_steps)
     print("  the Pi 4 V3D backend lowers through Neon/V3D and holds no CPU or DMA fallback")
+    if args.mutate_queue:
+        caught, detail = queue_capability_mutation()
+        if not caught:
+            print("vulkan_foundation_check: GREEN queue capability mutant - " + detail)
+            return 1
+        print("  RED queue capability mutant - " + detail)
     return 0
 
 
