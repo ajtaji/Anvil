@@ -41,6 +41,22 @@
 ; ordering and a gate that could not mutate it would only be asserting that
 ; today's code does what today's code does.
 Global gShotArm.i
+#DSP_DMA_LINKED = 1
+Global gate_quarantined.i
+Global gate_mirrorOff.i
+Global gate_rendererOff.i
+Procedure UartMirror(on.i)
+  If on=0 : gate_mirrorOff=gate_mirrorOff+1 : EndIf
+EndProcedure
+Procedure ConNoRenderer()
+  gate_rendererOff=gate_rendererOff+1
+EndProcedure
+Procedure.i DmaQuarantined()
+  ProcedureReturn gate_quarantined
+EndProcedure
+Procedure.i CoreAcceptOwnsSecondaries()
+  ProcedureReturn 0
+EndProcedure
 Global gShotSeq.i
 
 ; ---- the vocabulary the product files use ----------------------------
@@ -271,6 +287,7 @@ Procedure.i gate_copyIsDraw(n.i)
 EndProcedure
 
 Procedure gate_fresh()
+  gate_quarantined = 0
   gate_paints = 0
   gate_afterCall = 0
   gate_paintsAfter = 0
@@ -542,6 +559,18 @@ Procedure.i Main()
   ; picture and nobody can say why.
   If ShotArmed() <> 1 : ProcedureReturn 163 : EndIf
   ShotArm(0)
+
+  ; A quarantined DMA writer blocks screenshot memory access even when
+  ; acceleration preference is off. Execute the real DisplayMemorySafe.
+  gate_fresh()
+  gScrSrc = #SCR_SRC_DSI
+  gScrRot = 90
+  gScrDsiUp = 1
+  gDma = 0
+  gate_quarantined = 1
+  If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) <> 0 : ProcedureReturn 170 : EndIf
+  If ScrShotValid() <> 0 : ProcedureReturn 171 : EndIf
+  gate_quarantined = 0
 
   PokeI(#GATE_OUT, gate_paints)
   PokeI(#GATE_OUT + 8, ShotSeq())

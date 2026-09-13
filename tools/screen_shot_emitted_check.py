@@ -49,6 +49,7 @@ SOURCE = ROOT / "RaspberryPi4" / "Board" / "screen_source.pi4"
 GEOM = ROOT / "RaspberryPi4" / "Board" / "screen_geom.pi4"
 SCREEN = ROOT / "RaspberryPi4" / "Board" / "screen_cmd.pi4"
 CACHE = ROOT / "RaspberryPi4" / "Board" / "cache.pi4"
+DISPLAY = ROOT / "RaspberryPi4" / "Lib" / "display.pi4"
 ABI = ROOT / "Anvil" / "Hal" / "abi.pbi"
 HWCON = ROOT / "RaspberryPi4" / "Board" / "hw_con.pi4"
 SHOTARM = ROOT / "Anvil" / "Core" / "shotarm.pbi"
@@ -64,6 +65,7 @@ STEP_LIMIT = 40_000_000
 # live, then the payload path. A procedure has to be defined before it is
 # called in this language, and this list is that rule written down.
 BODIES = (
+    (DISPLAY, "DisplayMemorySafe"),
     (SHOTARM, "ShotArm"),
     (SHOTARM, "ShotArmed"),
     (SHOTARM, "ShotTakeArm"),
@@ -203,6 +205,9 @@ def mutate(text: str, edits, label: str) -> str:
 
 
 MUTATIONS = (
+    ("DMA quarantine is ignored during screenshot capture",
+     "    If DmaQuarantined() <> 0 : ProcedureReturn 0 : EndIf",
+     "    If DmaQuarantined() < 0 : ProcedureReturn 0 : EndIf"),
     # THE ONE THIS GATE EXISTS FOR, HALF ONE. Capture the buffer the console
     # DRAWS into rather than the one the panel scans. Same size, different
     # bytes, and on a quiet bench a plausible picture of a frame nobody saw.
