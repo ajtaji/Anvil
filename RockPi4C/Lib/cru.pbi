@@ -179,8 +179,16 @@ Procedure.i RockCruDisplayPower()
   ; Parent-to-child order: VIO -> HDCP and VIO -> VO -> VOPL; TCPD0 is
   ; independent. Direct power bits exist for VIO/HDCP/VO/TCPD0. VOPL is an
   ; idle-only child.
-  If RockPmuPowerOn(14,53)=0 Or RockPmuIdleRelease(17,54)=0 : ProcedureReturn 0 : EndIf
-  If RockPmuPowerOn(24,56)=0 Or RockPmuIdleRelease(11,57)=0 : ProcedureReturn 0 : EndIf
+  If RockPmuPowerOn(14,53)=0 : ProcedureReturn 0 : EndIf
+  If RockPmuIdleRelease(17,54)=0 : ProcedureReturn 0 : EndIf
+  ; The pinned DTS supplies HCLK_HDCP and PCLK_HDCP, and the live-proven
+  ; loader owner also ungates its ACLK_HDCP leaf. All three transition clocks
+  ; must run before requesting HDCP power or releasing its bus idle.
+  RockCruGate(11,3,1)
+  RockCruGate(11,10,1)
+  RockCruGate(11,12,1)
+  If RockPmuPowerOn(24,56)=0 : ProcedureReturn 0 : EndIf
+  If RockPmuIdleRelease(11,57)=0 : ProcedureReturn 0 : EndIf
   If RockPmuPowerOn(20,59)=0 : ProcedureReturn 0 : EndIf
   If RockPmuIdleRelease(8,60)=0 : ProcedureReturn 0 : EndIf
   If RockPmuPowerOn(8,62)=0 : ProcedureReturn 0 : EndIf

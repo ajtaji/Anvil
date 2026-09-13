@@ -72,6 +72,18 @@ def source_contract() -> None:
                    "rockpmupoweron(8"]
     positions = [cru.index(token) for token in power_order]
     require(positions == sorted(positions), "RK3399 power hierarchy order drifted")
+    power = cru.split("procedure.i rockcrudisplaypower()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    hdcp_transition = ["rockpmuidlerelease(17,54)", "rockcrugate(11,3,1)",
+                       "rockcrugate(11,10,1)", "rockcrugate(11,12,1)",
+                       "rockpmupoweron(24,56)", "rockpmuidlerelease(11,57)"]
+    positions = [power.index(token) for token in hdcp_transition]
+    require(positions == sorted(positions),
+            "HDCP clocks are not enabled immediately before its power/idle transition")
+    require("rockpmupoweron(14,53)=0 or" not in power and
+            "rockpmupoweron(24,56)=0 or" not in power,
+            "eager Or can release bus idle after a failed domain power-on")
     require("gpio1_d0, not gpio1_c0" in cru, "exact MiniDP power pin correction missing")
     require("$00030000" in cru and "$00030001" in cru,
             "GPIO1_D0 input/pull-up pinctrl contract missing")
@@ -179,6 +191,33 @@ def source_contract() -> None:
                 f"DPCD telemetry omits {phase} phase")
     require("rock_cdn_aux_status = aux" in dpcd,
             "DPCD telemetry omits the last AUX result")
+    require(not re.search(r"rockcdnregwrite[^\n]*\bor\b[^\n]*rockcdnregwrite", cdn),
+            "eager Or can enqueue a second command after a failed Cadence write")
+    send = cdn.split("procedure.i rockcdnsend", 1)[1].split(
+        "procedure.i rockcdnreceive", 1
+    )[0]
+    require(not re.search(r"rockcdnmailboxput[^\n]*\bor\b[^\n]*rockcdnmailboxput", send),
+            "eager Or can continue a failed Cadence mailbox header")
+    for header in ("rockcdnmailboxput(opcode)", "rockcdnmailboxput(module)",
+                   "rockcdnmailboxput((bytes >> 8) & 255)",
+                   "rockcdnmailboxput(bytes & 255)"):
+        require(f"if {header} = 0 : procedurereturn 0" in send,
+                f"mailbox header byte is not fail-fast: {header}")
+    edid = cdn.split("procedure.i rockcdnreadedidblock", 1)[1].split(
+        "procedure.i rockcdnedidsupports1024x768", 1
+    )[0]
+    request_zero = edid.index("pokea(@rock_cdn_message[0],block >> 1)")
+    request_one = edid.index("pokea(@rock_cdn_message[0]+1,block & 1)")
+    edid_send = edid.index("rockcdnsend(#cdn_mb_dp_tx,#cdn_get_edid,2,@rock_cdn_message[0])")
+    require(edid.index("for attempt = 0 to 3") < request_zero < request_one < edid_send,
+            "EDID request metadata is not rebuilt for every safe retry")
+    require("rockcdnsend(#cdn_mb_dp_tx,#cdn_get_edid,2,@rock_cdn_message[0]) = 0 : procedurereturn 0" in edid and
+            "rockcdnreceive(#cdn_mb_dp_tx,#cdn_get_edid,130,@rock_cdn_message[64]) = 0 : procedurereturn 0" in edid,
+            "EDID transport failure can retry a dirty mailbox")
+    require("peeka(@rock_cdn_message[64])" in edid and
+            "peeka(@rock_cdn_message[64]+1)" in edid and
+            "peeka(@rock_cdn_message[64]+2+index)" in edid,
+            "EDID response does not remain disjoint from its request")
     require("rockdisplaydpcdtelemetry()" in display and
             'rockuarttext("dpe8 dpcd phase ")' in display and
             'rockuarttext(" aux ")' in display,
@@ -279,9 +318,57 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                 "compiler wrote no complete firmware-bearing image")
         for suffix in (".pmf", ".asm", ".sym", ".sym.meta"):
             require(Path(str(output) + suffix).is_file(), f"compiler omitted {suffix}")
+        # Count the successful compiler invocation before any emitted-code
+        # assertion can fail. A red gate is still a real board build.
+        counted = build_count.record_build(
+            ROCK / "Board/board.rockpi4c", "rockpi4c", output,
+            by="tools/rockpi4c_display_check.py", compiler=compiler,
+        )
+        print(f"  build count: {counted.message}")
         asm = Path(str(output) + ".asm").read_text(encoding="utf-8", errors="replace").lower()
         for token in ("str w", "ldr w", "rockdisplayup"):
             require(token in asm, f"emitted display image lacks {token}")
+        power_asm = asm.split("rockcrudisplaypower:", 1)[1].split(
+            "rockcrudisplayprepare:", 1
+        )[0]
+        power_calls = [(match.start(), match.group(1)) for match in re.finditer(
+            r"\bbl\s+(rockpmupoweron|rockpmuidlerelease)\b", power_asm
+        )]
+        require([name for _, name in power_calls[:4]] ==
+                ["rockpmupoweron", "rockpmuidlerelease",
+                 "rockpmupoweron", "rockpmuidlerelease"],
+                "emitted VIO/HDCP power calls drifted")
+        for first, second in ((power_calls[0][0], power_calls[1][0]),
+                              (power_calls[2][0], power_calls[3][0])):
+            require(re.search(r"\bret\b", power_asm[first:second]) is not None,
+                    "emitted domain failure cannot return before idle release")
+        video_asm = asm.split("rockcdnvideo1024x768:", 1)[1].split(
+            "rockcdnvideostatus:", 1
+        )[0]
+        reg_writes = [match.start() for match in re.finditer(
+            r"\bbl\s+rockcdnregwrite\b", video_asm
+        )]
+        require(len(reg_writes) == 17,
+                f"emitted video register-write count drifted: {len(reg_writes)}")
+        for first, second in zip(reg_writes, reg_writes[1:]):
+            require(re.search(r"\bret\b", video_asm[first:second]) is not None,
+                    "emitted Cadence failure can reach a later mailbox write")
+        send_asm = asm.split("rockcdnsend:", 1)[1].split("rockcdnreceive:", 1)[0]
+        header_puts = [match.start() for match in re.finditer(
+            r"\bbl\s+rockcdnmailboxput\b", send_asm
+        )]
+        require(len(header_puts) == 5,
+                f"emitted mailbox put count drifted: {len(header_puts)}")
+        for first, second in zip(header_puts, header_puts[1:]):
+            require(re.search(r"\bret\b", send_asm[first:second]) is not None,
+                    "emitted mailbox header failure can reach its next byte")
+        edid_asm = asm.split("rockcdnreadedidblock:", 1)[1].split(
+            "rockcdnedidsupports1024x768:", 1
+        )[0]
+        edid_send_call = edid_asm.index("bl rockcdnsend")
+        edid_receive_call = edid_asm.index("bl rockcdnreceive")
+        require(re.search(r"\bret\b", edid_asm[edid_send_call:edid_receive_call]) is not None,
+                "emitted EDID send failure can reach receive/retry")
         # Immediate spelling is an assembler-format detail (the compiler normally
         # synthesizes 32-bit colours with MOVZ/MOVK). Assert the pattern in source
         # and require its renderer plus 32-bit stores in the emitted program.
@@ -316,11 +403,6 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                 "framebuffer storage lacks exactly one alignment unit of slack")
         require(framebuffer + 1024 * 768 * 4 <= framebuffer_storage + storage_size,
                 "aligned framebuffer escaped its backing object")
-        counted = build_count.record_build(
-            ROCK / "Board/board.rockpi4c", "rockpi4c", output,
-            by="tools/rockpi4c_display_check.py", compiler=compiler,
-        )
-        print(f"  build count: {counted.message}")
         return output.stat().st_size, hashlib.sha256(output.read_bytes()).hexdigest().upper()
 
 

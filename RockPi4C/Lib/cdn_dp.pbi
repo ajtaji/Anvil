@@ -140,9 +140,12 @@ EndProcedure
 Procedure.i RockCdnSend(module.i, opcode.i, bytes.i, message.i)
   Protected index.i
   If bytes < 0 Or bytes > 255 : rock_cdn_error = 23 : ProcedureReturn 0 : EndIf
-  If RockCdnMailboxPut(opcode) = 0 Or RockCdnMailboxPut(module) = 0 Or RockCdnMailboxPut((bytes >> 8) & 255) = 0 Or RockCdnMailboxPut(bytes & 255) = 0
-    ProcedureReturn 0
-  EndIf
+  ; A failed byte can leave a partial command in the firmware mailbox. Never
+  ; emit a later header byte after that failure.
+  If RockCdnMailboxPut(opcode) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnMailboxPut(module) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnMailboxPut((bytes >> 8) & 255) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnMailboxPut(bytes & 255) = 0 : ProcedureReturn 0 : EndIf
   For index = 0 To bytes-1
     If RockCdnMailboxPut(PeekA(message+index) & 255) = 0 : ProcedureReturn 0 : EndIf
   Next
@@ -375,18 +378,19 @@ EndProcedure
 Procedure.i RockCdnReadEdidBlock(block.i, destination.i)
   Protected attempt.i
   Protected index.i
-  PokeA(@rock_cdn_message[0],block >> 1)
-  PokeA(@rock_cdn_message[0]+1,block & 1)
   For attempt = 0 To 3
-    If RockCdnSend(#CDN_MB_DP_TX,#CDN_GET_EDID,2,@rock_cdn_message[0]) <> 0
-      If RockCdnReceive(#CDN_MB_DP_TX,#CDN_GET_EDID,130,@rock_cdn_message[0]) <> 0
-        If (PeekA(@rock_cdn_message[0]) & 255) = 128 And (PeekA(@rock_cdn_message[0]+1) & 255) = (block >> 1)
-          For index=0 To 127
-            PokeA(destination+index,PeekA(@rock_cdn_message[0]+2+index) & 255)
-          Next
-          ProcedureReturn 1
-        EndIf
-      EndIf
+    ; Rebuild the request for the only safe retry case: a complete response
+    ; whose echoed block metadata is invalid. Keep the response disjoint so it
+    ; can never overwrite the next request.
+    PokeA(@rock_cdn_message[0],block >> 1)
+    PokeA(@rock_cdn_message[0]+1,block & 1)
+    If RockCdnSend(#CDN_MB_DP_TX,#CDN_GET_EDID,2,@rock_cdn_message[0]) = 0 : ProcedureReturn 0 : EndIf
+    If RockCdnReceive(#CDN_MB_DP_TX,#CDN_GET_EDID,130,@rock_cdn_message[64]) = 0 : ProcedureReturn 0 : EndIf
+    If (PeekA(@rock_cdn_message[64]) & 255) = 128 And (PeekA(@rock_cdn_message[64]+1) & 255) = (block >> 1)
+      For index=0 To 127
+        PokeA(destination+index,PeekA(@rock_cdn_message[64]+2+index) & 255)
+      Next
+      ProcedureReturn 1
     EndIf
   Next
   rock_cdn_error = 29
@@ -464,7 +468,8 @@ Procedure.i RockCdnVideo1024x768()
     Default : rock_cdn_error = 34 : ProcedureReturn 0
   EndSelect
   If RockCdnLinkCarries1024x768(linkMHz) = 0 : rock_cdn_error = 35 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_BND_HSYNC2VSYNC,$2000) = 0 Or RockCdnRegWrite(#CDN_HSYNC2VSYNC_POL_CTRL,0) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_BND_HSYNC2VSYNC,$2000) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_HSYNC2VSYNC_POL_CTRL,0) = 0 : ProcedureReturn 0 : EndIf
   Repeat
     tu = tu + 2
     scaled = (tu * 65000 * 24) / (rock_cdn_link_lanes * linkMHz * 8)
@@ -477,16 +482,19 @@ Procedure.i RockCdnVideo1024x768()
   value = 8*(symbol+1)/24 - value + 2
   If RockCdnRegWrite($2254,value) = 0 : ProcedureReturn 0 : EndIf
   ; Cadence encodes negative sync as one in FRAMER_SP and in MSA bit 15.
-  If RockCdnRegWrite(#CDN_FRAMER_PXL_REPR,$102) = 0 Or RockCdnRegWrite(#CDN_FRAMER_SP,3) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_FRAMER_PXL_REPR,$102) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_FRAMER_SP,3) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_FRONT_BACK_PORCH,(24 << 16) | 160) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_BYTE_COUNT,3072) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_0,1344 | (296 << 16)) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_1,136 | #CDN_SYNC_NEGATIVE | (1024 << 16)) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_MSA_VERTICAL_0,806 | (35 << 16)) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_MSA_VERTICAL_1,6 | #CDN_SYNC_NEGATIVE | (768 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_MSA_MISC,32) = 0 Or RockCdnRegWrite(#CDN_STREAM_CONFIG,1) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_MSA_MISC,32) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_STREAM_CONFIG,1) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_HORIZONTAL,136 | (1024 << 16)) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_VERTICAL_0,768 | (35 << 16)) = 0 Or RockCdnRegWrite(#CDN_VERTICAL_1,806) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_VERTICAL_0,768 | (35 << 16)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_VERTICAL_1,806) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn RockCdnRegField(#CDN_VB_ID,2,1,0)
 EndProcedure
 
