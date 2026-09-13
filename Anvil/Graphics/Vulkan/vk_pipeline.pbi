@@ -155,6 +155,7 @@ Global Dim avkPipeViewX.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewY.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewW.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewH.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeSampleMask.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeCodeBase.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeCodeBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeCodeMem.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -780,7 +781,7 @@ Procedure.i avkPipeCheckRasterization(*rs.VkPipelineRasterizationStateCreateInfo
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-Procedure.i avkPipeCheckMultisample(*ms.VkPipelineMultisampleStateCreateInfo)
+Procedure.i avkPipeCheckMultisample(*ms.VkPipelineMultisampleStateCreateInfo, *outMask)
   If *ms = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given no pMultisampleState (Anvil code -20001, missing state); a graphics pipeline must declare it.")
   EndIf
@@ -792,6 +793,10 @@ Procedure.i avkPipeCheckMultisample(*ms.VkPipelineMultisampleStateCreateInfo)
   EndIf
   If (*ms\sampleShadingEnable & $FFFFFFFF) <> #VK_FALSE Or (*ms\alphaToCoverageEnable & $FFFFFFFF) <> #VK_FALSE Or (*ms\alphaToOneEnable & $FFFFFFFF) <> #VK_FALSE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for sample shading, alpha to coverage or alpha to one (Anvil code -20005, unsupported state); none of the three is emitted, so enabling one would change nothing at all.")
+  EndIf
+  PokeI(*outMask, 1)
+  If *ms\pSampleMask <> 0
+    PokeI(*outMask, PeekL(*ms\pSampleMask) & 1)
   EndIf
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -1019,6 +1024,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   Define base.i
   Define need.i
   Define mem.i
+  Define sampleMask.i
   Define *st.VkPipelineShaderStageCreateInfo
 
   If *out = 0 Or *ci = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
@@ -1101,7 +1107,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   rc = avkPipeCheckRasterization(*ci\pRasterizationState)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
-  rc = avkPipeCheckMultisample(*ci\pMultisampleState)
+  rc = avkPipeCheckMultisample(*ci\pMultisampleState, @sampleMask)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   rc = avkPipeCheckColorBlend(*ci\pColorBlendState)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
@@ -1162,6 +1168,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   avkPipeColourSrc[s] = avkShColourSrc[fs]
   avkPipeColourIdx[s] = avkShColourIdx[fs]
   avkPipeUniformBinding[s] = avkShUniformBinding[fs]
+  avkPipeSampleMask[s] = sampleMask
   base = s * #ANVIL_SPV_MAX_VARYINGS
   k = 0
   While k < #ANVIL_SPV_MAX_VARYINGS
@@ -1877,6 +1884,7 @@ Procedure.i avkDrawSubmit(c.i)
   Wend
   avkDrawRecord\vertexCount = avkCbDrawVerts[c]
   avkDrawRecord\firstVertex = avkCbDrawFirst[c]
+  avkDrawRecord\sampleMask = avkPipeSampleMask[p]
   If avkCbPushBytes[c] = #ANVIL_VK_PUSH_BYTES
     avkDrawRecord\pushBase = @avkPushStage[0]
     avkDrawRecord\pushBytes = #ANVIL_VK_PUSH_BYTES

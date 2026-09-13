@@ -123,6 +123,7 @@ Procedure.i Main()
   Define pipeB.i
   Define pipeC.i
   Define pipeD.i
+  Define pipeE.i
   Define fsU.i
   Define fsW.i
   Define dsl.i
@@ -149,6 +150,7 @@ Procedure.i Main()
   Define dci.VkDeviceCreateInfo
   Define qci.VkDeviceQueueCreateInfo
   Define prio.l
+  Define sampleMask.l
   Define pci.VkCommandPoolCreateInfo
   Define cbai.VkCommandBufferAllocateInfo
   Define bi.VkCommandBufferBeginInfo
@@ -1004,6 +1006,20 @@ Procedure.i Main()
   attrs[1]\offset = 8
   bind\stride = #PG_STRIDE1
 
+  ; A fifth otherwise-identical pipeline supplies a one-word sample mask
+  ; with bit zero clear. It is valid Vulkan state: the draw executes but
+  ; produces no covered fragments. The backend record and V3D lowering
+  ; must retain that distinction from a null (all-enabled) mask. Pipeline
+  ; B has already supplied every compiled-record fixture above and is not
+  ; drawn, so release its slot before creating E: the deliberately small
+  ; object engine supports four simultaneously live pipelines, not five.
+  vkDestroyPipeline(dev, pipeB, 0)
+  pipeB = 0
+  sampleMask = 0
+  ms\pSampleMask = @sampleMask
+  pgPut(155, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeE))
+  ms\pSampleMask = 0
+
   ; ------------------------------------------------------------------
   ;  Record one render pass with one draw, and submit it.
   ; ------------------------------------------------------------------
@@ -1253,6 +1269,22 @@ Procedure.i Main()
   pgPut(145, AnvilVkTestBackendLastStride(1))
   pgPut(68, AnvilVkTestBackendDraws())
 
+  ; The zero sample-mask pipeline submits a real render-pass clear and
+  ; draw record, but tells the rendering backend to emit no primitive.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeE)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(156, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(157, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(158, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(159, AnvilVkTestBackendLastSampleMask())
+  pgPut(160, AnvilVkTestBackendDraws())
+
   ; ------------------------------------------------------------------
   ;  ONE JOB PER SUBMISSION. A command buffer that holds both a transfer
   ;  clear and a render pass is refused at vkQueueSubmit, because the
@@ -1312,9 +1344,9 @@ Procedure.i Main()
   vkDeviceWaitIdle(dev)
   vkDestroyFence(dev, fence, 0)
   vkDestroyPipeline(dev, pipeA, 0)
-  vkDestroyPipeline(dev, pipeB, 0)
   vkDestroyPipeline(dev, pipeC, 0)
   vkDestroyPipeline(dev, pipeD, 0)
+  vkDestroyPipeline(dev, pipeE, 0)
   vkDestroyDescriptorPool(dev, dpool, 0)
   vkDestroyDescriptorSetLayout(dev, dsl, 0)
   vkDestroyDescriptorSetLayout(dev, dsl2, 0)

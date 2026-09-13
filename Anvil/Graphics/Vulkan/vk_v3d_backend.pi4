@@ -473,8 +473,13 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       V3dCacheRange(*bind\base, lastVertex * *bind\stride)
       b = b + 1
     Wend
-    V3dClGlShaderState(pbase + #AVKQ_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
-    V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+    ; A null pSampleMask means all samples; with one sample, bit zero is
+    ; the complete fragment coverage. When it is clear the render pass
+    ; clear still executes, but no primitive may enter rasterisation.
+    If *d\sampleMask <> 0
+      V3dClGlShaderState(pbase + #AVKQ_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
+      V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+    EndIf
     If V3dClError() <> #V3D_OK
       rc = #NEON_ERR_LIST
     EndIf

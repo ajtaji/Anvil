@@ -253,6 +253,7 @@ Global Dim avkTbLastVertexBase.i[#ANVIL_VK_MAX_BINDINGS]
 Global Dim avkTbLastStride.i[#ANVIL_VK_MAX_BINDINGS]
 Global avkTbLastVertexCount.i = 0
 Global avkTbLastFirstVertex.i = 0
+Global avkTbLastSampleMask.i = 0
 Global avkTbLastPushBase.i = 0
 Global avkTbLastUniformBase.i = 0
 Global avkTbLastUniformBytes.i = 0
@@ -294,6 +295,10 @@ EndProcedure
 
 Procedure.i AnvilVkTestBackendLastFirstVertex()
   ProcedureReturn avkTbLastFirstVertex
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastSampleMask()
+  ProcedureReturn avkTbLastSampleMask
 EndProcedure
 
 Procedure.i AnvilVkTestBackendLastPushBase()
@@ -368,6 +373,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Wend
   avkTbLastVertexCount = *d\vertexCount
   avkTbLastFirstVertex = *d\firstVertex
+  avkTbLastSampleMask = *d\sampleMask
   avkTbLastPushBase = *d\pushBase
   avkTbLastUniformBase = *d\uniformBase
   avkTbLastUniformBytes = *d\uniformBytes

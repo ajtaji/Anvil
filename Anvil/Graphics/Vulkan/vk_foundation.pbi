@@ -176,6 +176,7 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   bindings.i          ; the address of the first of them
   vertexCount.i
   firstVertex.i
+  sampleMask.i        ; bit zero is the one rasterisation sample's coverage
   pushBase.i          ; the push-constant block, or 0
   pushBytes.i
   ; THE UNIFORM BUFFER THE BOUND DESCRIPTOR SET RESOLVED TO, already

@@ -62,6 +62,10 @@ REQUIRED_DESCRIPTOR_CONTRACT = (
     "If (colourBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)",
     "V3dCacheRange(colourBase, 16)",
 )
+REQUIRED_SAMPLE_MASK_CONTRACT = (
+    "If *d\\sampleMask <> 0",
+    "V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, *d\\firstVertex)",
+)
 FORBIDDEN_TOKENS = ("PokeN(", "PokeI(", "PokeL(", "PokeA(", "DspCopy", "DmaCopy",
                     "DisplayClear", "DspDmaFill", "DisplayFillRect", "CopyMemory")
 
@@ -96,6 +100,11 @@ MUTANTS = (
         "a descriptor-backed TMU load is submitted without a cache clean",
         "      V3dCacheRange(colourBase, 16)\n",
         "      V3dCacheRange(colourBase, 0)\n",
+    ),
+    (
+        "sample mask zero still emits a primitive",
+        "    If *d\\sampleMask <> 0\n      V3dClGlShaderState",
+        "    If *d\\sampleMask >= 0\n      V3dClGlShaderState",
     ),
 )
 
@@ -280,6 +289,9 @@ def source_contract(text: str) -> list[str]:
     for snippet in REQUIRED_DESCRIPTOR_CONTRACT:
         if snippet not in text:
             failures.append("the descriptor TMU contract lost: " + snippet)
+    for snippet in REQUIRED_SAMPLE_MASK_CONTRACT:
+        if snippet not in text:
+            failures.append("the sample-mask suppression contract lost: " + snippet)
     for token in FORBIDDEN_TOKENS:
         if token in text:
             failures.append("the backend holds a processor-side fallback token " + token)

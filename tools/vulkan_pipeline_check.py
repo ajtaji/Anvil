@@ -391,7 +391,7 @@ def grade(cpu, rc) -> Grader:
     # --- the public path reached the backend with the right numbers ---
     vertex_base = slot(6)
     g.need("one draw reached the backend", slot(21), 1)
-    g.need("four pipelines were compiled by the backend", slot(22), 4)
+    g.need("four pipeline slots are live after the fifth reused one", slot(22), 4)
     g.need("the draw named the bound vertex buffer", slot(23), vertex_base)
     g.need("the draw carried the binding's stride", slot(24), STRIDE1)
     g.need("the draw carried its vertex count", slot(25), 3)
@@ -735,6 +735,18 @@ def grade(cpu, rc) -> Grader:
     g.need("and its range", slot(122), 16)
     g.need("three draws have now reached the backend", slot(68), 3)
 
+    # pSampleMask is not optional semantics. With one sample, bit zero
+    # clear suppresses every fragment while the render-pass clear still
+    # runs. The state-only backend records the closed draw contract; the
+    # real V3D gate separately requires the primitive-emission branch.
+    g.need("the zero-sample-mask pipeline was created", slot(155), 0)
+    g.need("the zero-sample-mask draw recorded cleanly", slot(156), 0)
+    g.need("the zero-sample-mask draw submitted", slot(157), 0)
+    g.need("the zero-sample-mask draw's fence signalled", slot(158), 0)
+    g.need("the draw record carries sample bit zero clear", slot(159), 0)
+    g.need("the suppressed draw still reached the backend as the fourth draw",
+           slot(160), 4)
+
     # --- the refusals the descriptor path makes possible ---
     g.need("a combined image sampler descriptor is refused",
            slot(123), ERR_UNSUPPORTED)
@@ -877,6 +889,12 @@ COMMAND_MUTANTS = (
 )
 
 PIPELINE_MUTANTS = (
+    ("a supplied zero sample mask is read as all enabled",
+     "    PokeI(*outMask, PeekL(*ms\\pSampleMask) & 1)\n",
+     "    PokeI(*outMask, 1)\n"),
+    ("the draw record always enables sample zero",
+     "  avkDrawRecord\\sampleMask = avkPipeSampleMask[p]\n",
+     "  avkDrawRecord\\sampleMask = 1\n"),
     ("a transfer-only image is accepted as a framebuffer colour attachment",
      "  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = 0\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkCreateFramebuffer was given",
      "  If (avkImgUsage[img] & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) = -1\n    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkCreateFramebuffer was given"),
@@ -1018,6 +1036,11 @@ IMAGE_USAGE_TRUTH_MUTANTS = frozenset({
     "a render pass requires TRANSFER_DST instead of COLOR_ATTACHMENT",
 })
 
+SAMPLE_MASK_TRUTH_MUTANTS = frozenset({
+    "a supplied zero sample mask is read as all enabled",
+    "the draw record always enables sample zero",
+})
+
 
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
@@ -1029,7 +1052,8 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage"))
+    parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage",
+                                                   "sample-mask"))
     args = parser.parse_args()
     if args.mutate_only:
         args.mutate = True
@@ -1054,9 +1078,9 @@ def main() -> int:
           f"{steps:,} executed A64 instructions")
     print("  the whole public path runs: six shader modules, four pipeline layouts, a")
     print("  render pass, a framebuffer, four buffers, two descriptor set layouts, a pool")
-    print("  and a set, four graphics pipelines, three render passes each holding one draw,")
-    print("  three submissions and a fence")
-    print("  all four pipelines were compiled by the REAL V3D QPU emitter, and every byte")
+    print("  and a set, five graphics pipelines over four live slots, four render passes each holding one draw,")
+    print("  four submissions and a fence")
+    print("  all four shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
     print("  attribute values matches a record this checker packed from the documented layout")
     print("  the third pipeline reads POSITION FROM ONE BUFFER AND COLOUR FROM ANOTHER, at")
@@ -1087,6 +1111,8 @@ def main() -> int:
                 continue
             if args.mutate_only == "image-usage" and name not in IMAGE_USAGE_TRUTH_MUTANTS:
                 continue
+            if args.mutate_only == "sample-mask" and name not in SAMPLE_MASK_TRUTH_MUTANTS:
+                continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
                 missed += 1
@@ -1110,6 +1136,8 @@ def main() -> int:
         total = len(VALIDATION_TRUTH_MUTANTS)
     elif args.mutate_only == "image-usage":
         total = len(IMAGE_USAGE_TRUTH_MUTANTS)
+    elif args.mutate_only == "sample-mask":
+        total = len(SAMPLE_MASK_TRUTH_MUTANTS)
     else:
         total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
                  + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS))
