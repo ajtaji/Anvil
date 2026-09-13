@@ -557,7 +557,7 @@ def source_contract() -> None:
     )[0]
     for timing in ("negativeh.i = bool(rock_mode_hsync_positive = 0)",
                    "negativev.i = bool(rock_mode_vsync_positive = 0)",
-                   "rockcdnregwrite(#cdn_framer_sp,negativeh | (negativev << 1))",
+                   "rockcdnregwrite(#cdn_framer_sp,(negativeh << 1) | negativev)",
                    "(rock_mode_hsync_end-rock_mode_hsync_start) | (negativeh << 15)",
                    "(rock_mode_vsync_end-rock_mode_vsync_start) | (negativev << 15)"):
         require(timing in video_mode,
@@ -931,11 +931,16 @@ def mode_arithmetic_contract() -> None:
             # Cadence encodes negative polarity, while VOP owns positive bits.
             cdn_h = 0 if hpositive else 0x8000
             cdn_v = 0 if vpositive else 0x8000
-            vop = (int(hpositive) << 3) | (int(vpositive) << 1)
+            framer_sp = ((not hpositive) << 1) | (not vpositive)
+            vop = int(hpositive) | (int(vpositive) << 1)
             require((bool(cdn_h), bool(cdn_v), vop) ==
                     (not hpositive, not vpositive,
-                     (int(hpositive) << 3) | (int(vpositive) << 1)),
+                     int(hpositive) | (int(vpositive) << 1)),
                     "VOP/Cadence polarity model drifted")
+            require(framer_sp == ({(False, False): 3, (False, True): 2,
+                                   (True, False): 1, (True, True): 0}
+                                  [(hpositive, vpositive)]),
+                    "Cadence FRAMER_SP HSP/VSP bit assignment drifted")
 
     malformed = bytearray(preferred_edid)
     malformed[0] = 1
@@ -1228,6 +1233,93 @@ def emitted_line_buffer_contract(image: Path, symbols: dict[str, int]) -> None:
                     f"emitted WIN0 control is wrong at {width}: {control:#x}")
 
 
+def emitted_cdn_video_contract(image: Path, symbols: dict[str, int]) -> None:
+    """Execute production CDN timing math with mailbox writes modeled."""
+    load = 0x02000040
+    returned = 0x06000000
+    required = ("rockcdnvideomode", "rockcdnregwrite", "rockcdnregfield")
+    require(all(name in symbols for name in required),
+            "full image omitted the Cadence video arithmetic call chain")
+    spec = importlib.util.spec_from_file_location(
+        "rockpi4c_cdn_video_a64", ROOT / "tools/a64/a64_interp.py")
+    require(spec is not None and spec.loader is not None,
+            "cannot load the repository A64 interpreter")
+    a64 = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = a64
+    spec.loader.exec_module(a64)
+    blob = image.read_bytes()
+
+    mode = {
+        "rock_mode_width": 1920, "rock_mode_height": 1080,
+        "rock_mode_pixel_hz": 148500000, "rock_mode_htotal": 2200,
+        "rock_mode_hsync_start": 2008, "rock_mode_hsync_end": 2052,
+        "rock_mode_vtotal": 1125, "rock_mode_vsync_start": 1084,
+        "rock_mode_vsync_end": 1089, "rock_mode_pitch": 7680,
+        "rock_mode_valid": 1, "rock_cdn_link_rate": 20,
+        "rock_cdn_link_lanes": 2,
+    }
+
+    def absolute(name: str) -> int:
+        return load + symbols[name]
+
+    def run_case(hpositive: bool, vpositive: bool) -> None:
+        cpu = a64.A64()
+        for offset, byte in enumerate(blob):
+            cpu.memory[load + offset] = byte
+        for name, value in mode.items():
+            cpu.raw_store(symbols["global_" + name], value, 8)
+        cpu.raw_store(symbols["global_rock_mode_hsync_positive"], int(hpositive), 8)
+        cpu.raw_store(symbols["global_rock_mode_vsync_positive"], int(vpositive), 8)
+        a64.attach_symbols(cpu, image, load)
+        writes: list[tuple[int, int]] = []
+        fields: list[tuple[int, int, int, int]] = []
+        cpu.pc = absolute("rockcdnvideomode")
+        cpu.sp = 0x05000000
+        cpu.x[30] = returned
+        for _ in range(100_000):
+            if cpu.pc == returned:
+                break
+            if cpu.pc == absolute("rockcdnregwrite"):
+                writes.append((cpu.x[0], cpu.x[1]))
+                cpu.x[0] = 1
+                cpu.pc = cpu.x[30]
+                continue
+            if cpu.pc == absolute("rockcdnregfield"):
+                fields.append(tuple(cpu.x[:4]))
+                cpu.x[0] = 1
+                cpu.pc = cpu.x[30]
+                continue
+            cpu.step()
+        else:
+            raise AssertionError("emitted RockCdnVideoMode did not return")
+        require(cpu.x[0] == 1, "emitted 1080p Cadence video setup refused")
+        negative_h, negative_v = int(not hpositive), int(not vpositive)
+        expected = [
+            (0x0B00, 0x2000), (0x0B10, 0),
+            # HBR2 x2: TU=32, VS=13. TU_CNT_RST_EN is pinned bit 15.
+            (0x2208, 0x8000 | (32 << 8) | 13), (0x2254, 4),
+            (0x220C, 0x102),
+            (0x2210, (negative_h << 1) | negative_v),
+            (0x2278, (88 << 16) | 148), (0x227C, 1920 * 3),
+            (0x2280, 2200 | (192 << 16)),
+            (0x2284, 44 | (negative_h << 15) | (1920 << 16)),
+            (0x2288, 1125 | (41 << 16)),
+            (0x228C, 5 | (negative_v << 15) | (1080 << 16)),
+            (0x2290, 32), (0x2294, 1),
+            (0x22B0, 44 | (1920 << 16)),
+            (0x22B4, 1080 | (41 << 16)), (0x22B8, 1125),
+        ]
+        require(writes == expected,
+                f"emitted CDN timing differs for H{int(hpositive)}V{int(vpositive)}: "
+                f"{writes!r}")
+        require(fields == [(0x2258, 2, 1, 0)],
+                f"emitted CDN video-valid field drifted: {fields!r}")
+
+    for hpositive in (False, True):
+        for vpositive in (False, True):
+            run_case(hpositive, vpositive)
+
+
 def compiler_contract(compiler: Path) -> tuple[int, str]:
     with tempfile.TemporaryDirectory(prefix="anvil-rockpi4c-display-") as temp_name:
         emitted_mode_contract(compiler, Path(temp_name))
@@ -1375,6 +1467,8 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         symbols = Path(str(output) + ".sym").read_text(encoding="utf-8")
         values = dict(re.findall(r"^([A-Za-z0-9_]+)=([0-9]+)$", symbols, re.M))
         emitted_line_buffer_contract(
+            output, {name.lower(): int(value) for name, value in values.items()})
+        emitted_cdn_video_contract(
             output, {name.lower(): int(value) for name, value in values.items()})
         metadata = Path(str(output) + ".sym.meta").read_text(encoding="utf-8")
         sizes = {name: int(size) for name, size in

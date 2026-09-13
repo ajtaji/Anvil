@@ -489,9 +489,10 @@ Procedure.i RockCdnVideoMode()
   value = ((pixelKHz * (symbol+1) / 1000) + linkMHz) / (rock_cdn_link_lanes*linkMHz)
   value = 8*(symbol+1)/24 - value + 2
   If RockCdnRegWrite($2254,value) = 0 : ProcedureReturn 0 : EndIf
-  ; Cadence encodes negative sync as one in FRAMER_SP and in MSA bit 15.
+  ; Pinned Radxa cdn-dp-reg.h assigns FRAMER_SP HSP to bit 1 and VSP to
+  ; bit 0. Both bits encode negative sync; the MSA polarity remains bit 15.
   If RockCdnRegWrite(#CDN_FRAMER_PXL_REPR,$102) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_FRAMER_SP,negativeH | (negativeV << 1)) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_FRAMER_SP,(negativeH << 1) | negativeV) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_FRONT_BACK_PORCH,((rock_mode_hsync_start-rock_mode_width) << 16) | (rock_mode_htotal-rock_mode_hsync_end)) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_BYTE_COUNT,rock_mode_width*3) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_MSA_HORIZONTAL_0,rock_mode_htotal | ((rock_mode_htotal-rock_mode_hsync_start) << 16)) = 0 : ProcedureReturn 0 : EndIf
