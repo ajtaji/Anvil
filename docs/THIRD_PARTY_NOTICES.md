@@ -141,14 +141,14 @@ retains the same text. Both stay as they are.
 
 ## Khronos Vulkan Registry
 
-`Anvil/Graphics/Vulkan/vk_core_1_0.pbi` and the PureBasic registry generator take
+`Anvil/Graphics/Vulkan/vk_core_1_0.pbi` and the registry generator take
 API names, values, type/member relationships and ordering from the Khronos Vulkan
 API Registry, pinned to Vulkan-Headers tag `v1.4.350`, commit
 `a33416ed2ce6bf8ef48b4eda821825f66d1850d3`. An API's names and numbers are the
 interface; they are what makes a binding a binding. The registry is offered under
 Apache-2.0 OR MIT and this repository retains the complete
 [Khronos MIT text](../licenses/Khronos-Vulkan-Registry-MIT.txt). The XML itself is
-not vendored. Generator-specific acknowledgment is retained in
+not vendored. The pinned inputs are recorded in
 [`Anvil/Graphics/Vulkan/THIRD_PARTY_NOTICES.md`](../Anvil/Graphics/Vulkan/THIRD_PARTY_NOTICES.md).
 
 ## DejaVu fonts

@@ -44,12 +44,9 @@ ordering from the Khronos Vulkan API Registry. That registry is licensed
 Apache-2.0 OR MIT. This distribution uses the MIT option and includes the full
 Khronos text in
 [`licenses/Khronos-Vulkan-Registry-MIT.txt`](../licenses/Khronos-Vulkan-Registry-MIT.txt).
-The exact tag, commit, input digest, and generator attribution are recorded in
+The exact tag, commit and input digest are recorded in
 [`Anvil/Graphics/Vulkan/THIRD_PARTY_NOTICES.md`](../Anvil/Graphics/Vulkan/THIRD_PARTY_NOTICES.md).
 The registry XML itself is not vendored.
-
-The generator's separate PureBasic XML reference attribution and license are
-also retained in that notice file.
 
 ## DejaVu-derived glyph tables
 
