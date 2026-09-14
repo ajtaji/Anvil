@@ -341,9 +341,10 @@ Procedure.i RockVopUpMode()
   ; VOP_LIT WIN0_CTRL0 resets to $3A000040: bits29:25 carry the documented
   ; per-window AXI outstanding limit ($1D). Linux programs format, line-buffer
   ; mode and enable through field updates, preserving those throughput bits.
-  ; A full $81 write erased them and the live 1080p path then starved only the
-  ; post FIFO. Own the low functional byte while retaining the reset-owned AXI
-  ; contract established by RockCruVopRelease().
+  ; A full $81 write erased them. Preserving them corrects that divergence,
+  ; but build75 still reports POST_BUF_EMPTY: this is not its proven cause.
+  ; Own the low functional byte while retaining the reset-owned AXI contract
+  ; established by RockCruVopRelease().
   RockVopField(#VOP_WIN0_CTRL0,#VOP_WIN0_FORMAT_LB_ENABLE_MASK,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)

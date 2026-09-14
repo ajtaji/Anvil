@@ -212,6 +212,16 @@ Procedure RockDisplayScanoutTelemetry()
   RockDisplayHexLong(RockVopRead(#VOP_WIN2_CTRL0)) : RockUartByte(32)
   RockDisplayHexLong(RockVopRead(#VOP_AFBCD0_CTRL))
   RockUartByte(13) : RockUartByte(10)
+  RockUartText("VOP ACTIVE H/V POST H/V ")
+  RockDisplayHexLong(RockVopRead(#VOP_HACT)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_VACT)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_POST_HACT)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_POST_VACT))
+  RockUartText(" WIN ACT/DSP/START ")
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_ACT_INFO)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_DSP_INFO)) : RockUartByte(32)
+  RockDisplayHexLong(RockVopRead(#VOP_WIN0_DSP_ST))
+  RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
 Procedure RockDisplayFrameTelemetry()
@@ -227,6 +237,8 @@ Procedure RockDisplayFrameTelemetry()
   Protected busFaultFrames.i
   Protected win0FaultFrames.i
   Protected postFaultFrames.i
+  Protected firstFrameTick.i
+  Protected lastFrameTick.i
   ; Pinned RK3399 VOPL RAW_STATUS0 latches frame-start and underrun causes.
   ; Clear uses the VOP write-mask convention: mask in the high half and the
   ; same asserted bits in the low half. CPU interrupts remain disabled.
@@ -244,19 +256,26 @@ Procedure RockDisplayFrameTelemetry()
     raw=RockVopRead(#VOP_INTR_RAW_STATUS0)
     faults=faults | (raw & (#VOP_INTR_BUS_ERROR | #VOP_INTR_WIN0_EMPTY | #VOP_INTR_POST_EMPTY))
     If (raw & #VOP_INTR_FS) <> 0
+      now=RockTimerTicks()
+      If frames=0 : firstFrameTick=now : EndIf
+      lastFrameTick=now
       frames=frames+1
       If (raw & #VOP_INTR_BUS_ERROR) <> 0 : busFaultFrames=busFaultFrames+1 : EndIf
       If (raw & #VOP_INTR_WIN0_EMPTY) <> 0 : win0FaultFrames=win0FaultFrames+1 : EndIf
       If (raw & #VOP_INTR_POST_EMPTY) <> 0 : postFaultFrames=postFaultFrames+1 : EndIf
       RockVopWrite(#VOP_INTR_CLEAR0,$08610861)
-      If frames=8 : Break : EndIf
+      If frames=9 : Break : EndIf
     EndIf
     now=RockTimerTicks()
     If now < start Or now >= deadline : Break : EndIf
   Next
   now=RockTimerTicks()
-  If frames > 0 And now > start
-    hz=(frames*rock_timer_frequency)/(now-start)
+  ; Nine observed frame edges delimit eight complete periods. The time from
+  ; the initial clear to the first edge is only a partial frame and must not
+  ; enter the frequency calculation (that previously printed about 64 Hz for
+  ; a nominal 60-Hz stream).
+  If frames > 1 And lastFrameTick > firstFrameTick
+    hz=((frames-1)*rock_timer_frequency)/(lastFrameTick-firstFrameTick)
   EndIf
   RockUartText("VOP SETTLE ") : RockDisplayHexLong(settleRaw)
   RockUartText(" STABLE FRAMES ") : RockDisplayDecimal(frames)
@@ -293,24 +312,39 @@ Procedure RockDisplayLiveLinkTelemetry()
   RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
-Procedure RockDisplayCadenceTelemetry()
+Procedure.i RockDisplayCadenceRegister(address.i)
   Protected value.i
+  If RockCdnRegRead(address,@value)=0
+    ; A timed-out/partial mailbox response is not a fresh message boundary.
+    ; Stop this diagnostic batch instead of submitting another command into
+    ; the incomplete response. Retain the original mailbox witness/error.
+    RockUartText("Read failed with code ")
+    RockDisplayDecimal(rock_cdn_error)
+    RockUartText("; check the Cadence mailbox witness before retrying.")
+    RockUartByte(13) : RockUartByte(10)
+    ProcedureReturn 0
+  EndIf
+  RockDisplayHexLong(value)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure RockDisplayCadenceTelemetry()
   If rock_uart_ready=0 : ProcedureReturn 0 : EndIf
   RockUartText("CDN VIF ")
-  If RockCdnRegRead(#CDN_VIF_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_VIF_STATUS)=0 : ProcedureReturn 0 : EndIf
   RockUartText(" STUFF ")
-  If RockCdnRegRead(#CDN_PCK_STUFF_STATUS_0,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_PCK_STUFF_STATUS_0)=0 : ProcedureReturn 0 : EndIf
   RockUartByte(32)
-  If RockCdnRegRead(#CDN_PCK_STUFF_STATUS_1,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_PCK_STUFF_STATUS_1)=0 : ProcedureReturn 0 : EndIf
   RockUartText(" RATE ")
-  If RockCdnRegRead(#CDN_RATE_GOVERNOR_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_RATE_GOVERNOR_STATUS)=0 : ProcedureReturn 0 : EndIf
   RockUartByte(13) : RockUartByte(10)
   RockUartText("CDN SYNC/MTPH/IRQ ")
-  If RockCdnRegRead(#CDN_HSYNC2VSYNC_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_HSYNC2VSYNC_STATUS)=0 : ProcedureReturn 0 : EndIf
   RockUartByte(32)
-  If RockCdnRegRead(#CDN_MTPH_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_MTPH_STATUS)=0 : ProcedureReturn 0 : EndIf
   RockUartByte(32)
-  If RockCdnRegRead(#CDN_INTERRUPT_SOURCE,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  If RockDisplayCadenceRegister(#CDN_INTERRUPT_SOURCE)=0 : ProcedureReturn 0 : EndIf
   ; SOURCE_PIF is one of the Cadence host-visible APB blocks, not a
   ; firmware-owned bank, and is therefore read directly like the mailbox.
   RockUartText(" PIF ") : RockDisplayHexLong(RockCdnRead(#CDN_SOURCE_PIF_STATUS))
@@ -613,9 +647,12 @@ Procedure.i RockDisplayUp()
     ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
   EndIf
   RockTimerWaitUs(50000)
-  RockCdnReadLiveLinkStatus()
-  RockDisplayLiveLinkTelemetry()
-  RockDisplayCadenceTelemetry()
+  If RockCdnReadLiveLinkStatus()<>0
+    RockDisplayLiveLinkTelemetry()
+    RockDisplayCadenceTelemetry()
+  Else
+    RockDisplayLiveLinkTelemetry()
+  EndIf
   RockDisplayFrameTelemetry()
   rock_display_width=rock_mode_width
   rock_display_height=rock_mode_height

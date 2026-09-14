@@ -296,6 +296,18 @@ def source_contract() -> None:
     ]
     positions = [display_up.index(token) for token in order]
     require(positions == sorted(positions), "cold-to-visible stage order drifted")
+    cadence = display.split("procedure rockdisplaycadencetelemetry()", 1)[1].split(
+        "endprocedure", 1)[0]
+    reads = re.findall(
+        r"if rockdisplaycadenceregister\(#[a-z0-9_]+\)=0 : procedurereturn 0 : endif",
+        cadence)
+    require(len(reads) == 7 and "rockcdnregread" not in cadence,
+            "Cadence diagnostic must stop after every failed mailbox read")
+    frame_probe = display.split("procedure rockdisplayframetelemetry()", 1)[1].split(
+        "endprocedure", 1)[0]
+    require("if frames=9 : break : endif" in frame_probe and
+            "hz=((frames-1)*rock_timer_frequency)/(lastframetick-firstframetick)" in frame_probe,
+            "frame rate must measure complete edge-to-edge periods")
     prepare_failure = display_up.split("if prepared=0", 1)[1].split(
         "endif", 1
     )[0]
@@ -1602,6 +1614,14 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         )[0]
         require("bl rockdisplaymailboxtelemetry" in dpcd_telemetry_asm,
                 "emitted DPCD failure lost its partial-header witness")
+        cadence_asm = asm.split("rockdisplaycadencetelemetry:", 1)[1].split(
+            "rockdisplaysubsystemtelemetry:", 1)[0]
+        cadence_calls = [match.start() for match in re.finditer(
+            r"\bbl\s+rockdisplaycadenceregister\b", cadence_asm)]
+        require(len(cadence_calls) == 7, "Cadence diagnostic register count drifted")
+        for first, second in zip(cadence_calls, cadence_calls[1:]):
+            require(re.search(r"\bret\b", cadence_asm[first:second]) is not None,
+                    "failed Cadence diagnostic can reach another mailbox command")
         for unsafe in ("bl rockcdnmailboxget", "bl rockcdnreceive",
                        "bl rockcdnlastauxstatus", "bl rockcdnsend"):
             require(unsafe not in dpcd_telemetry_asm,
