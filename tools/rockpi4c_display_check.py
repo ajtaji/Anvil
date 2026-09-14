@@ -591,11 +591,14 @@ def source_contract() -> None:
             vop_up.index("rockcrureset(279,0)") < vop_up.index(outstanding) <
             vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
             "VOP 30-read AXI throughput contract is absent or armed too late")
-    gather = "rockvopfield(#vop_win0_ctrl1,#vop_win0_gather_mask,#vop_win0_argb8888_gather)"
+    gather = "rockvopfield(#vop_win0_ctrl1,#vop_win0_gather_mask | #vop_win0_yrgb_vsu_mode_mask,#vop_win0_argb8888_gather | #vop_win0_yrgb_vsu_bic)"
     require(gather in vop_up and
             vop_up.index("rockvopwrite(#vop_win0_vir") < vop_up.index(gather) <
             vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
-            "ARGB8888 AXI gather contract is absent or armed after WIN0")
+            "ARGB8888 gather/vertical scaler contract is absent or armed after WIN0")
+    require("#vop_win0_yrgb_vsu_mode_mask = $00400000" in vop and
+            "#vop_win0_yrgb_vsu_bic = $00400000" in vop,
+            "RK3399 YRGB vertical scaler mode is not pinned to source-owned BIC")
     win_scale = "rockvopwrite(#vop_win0_scl_factor,#vop_scale_unity_xy)"
     post_scale = "rockvopwrite(#vop_post_scl_factor,#vop_scale_unity_xy)"
     require("#vop_scale_unity_xy = $10001000" in vop and
@@ -621,12 +624,20 @@ def source_contract() -> None:
         require(token in vop_up, f"dynamic VOP polarity drifted: {token}")
     require("#vop_dsp_p888_pre_dither = $00000002" in vop,
             "RK3399 VOPL P888 pre-dither contract is absent")
+    first_cfg_tail = vop_up.split("rockvopwrite(#vop_cfg_done,1)", 1)[1]
+    require("dsb sy" in first_cfg_tail and
+            first_cfg_tail.index("dsb sy") < first_cfg_tail.index("rockcrureset(281,1)"),
+            "VOP CFG_DONE is not ordered before the DCLK reset pulse")
+    final_cfg_tail = first_cfg_tail.split("rockcrureset(281,0)", 1)[1]
+    require("rockvopwrite(#vop_cfg_done,1)" in final_cfg_tail and
+            final_cfg_tail.index("rockvopwrite(#vop_cfg_done,1)") < final_cfg_tail.index("dsb sy"),
+            "final VOP CFG_DONE is not completed before scanout readiness")
     for token in (
         "#vop_win2_ctrl0 = $0b0",
         "#vop_afbcd0_ctrl = $200",
         "rockvopfield(#vop_afbcd0_ctrl,$00000001,0)",
         "rockvopfield(#vop_win0_ctrl0,$00000001,0)",
-        "rockvopfield(#vop_win2_ctrl0,$00000010,0)",
+        "rockvopfield(#vop_win2_ctrl0,$00000011,0)",
     ):
         require(token in vop_up or token in vop,
                 f"little-VOP clean-start contract drifted: {token}")
@@ -663,6 +674,15 @@ def source_contract() -> None:
                 f"Cadence selected-mode polarity/timing drifted: {timing}")
     require("rockcdnlinkcarriesmode(linkmhz)" in video_mode,
             "selected-mode link-bandwidth admission check missing")
+    reg_read = cdn.split("procedure.i rockcdnregread(address.i, destination.i)", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("#cdn_read_register = 7",
+                  "rockcdnsend(#cdn_mb_dp_tx,#cdn_read_register,2",
+                  "rockcdnreceive(#cdn_mb_dp_tx,#cdn_read_register,6",
+                  "pokel(destination"):
+        require(token in cdn or token in reg_read,
+                f"Cadence source-register read contract drifted: {token}")
     live_link = cdn.split("procedure.i rockcdnreadlivelinkstatus()", 1)[1].split(
         "endprocedure", 1
     )[0]

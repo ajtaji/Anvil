@@ -293,6 +293,30 @@ Procedure RockDisplayLiveLinkTelemetry()
   RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
+Procedure RockDisplayCadenceTelemetry()
+  Protected value.i
+  If rock_uart_ready=0 : ProcedureReturn 0 : EndIf
+  RockUartText("CDN VIF ")
+  If RockCdnRegRead(#CDN_VIF_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  RockUartText(" STUFF ")
+  If RockCdnRegRead(#CDN_PCK_STUFF_STATUS_0,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  RockUartByte(32)
+  If RockCdnRegRead(#CDN_PCK_STUFF_STATUS_1,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  RockUartText(" RATE ")
+  If RockCdnRegRead(#CDN_RATE_GOVERNOR_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  RockUartByte(13) : RockUartByte(10)
+  RockUartText("CDN SYNC/MTPH/IRQ ")
+  If RockCdnRegRead(#CDN_HSYNC2VSYNC_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  RockUartByte(32)
+  If RockCdnRegRead(#CDN_MTPH_STATUS,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  RockUartByte(32)
+  If RockCdnRegRead(#CDN_INTERRUPT_SOURCE,@value)<>0 : RockDisplayHexLong(value) : Else : RockUartText("ERR") : EndIf
+  ; SOURCE_PIF is one of the Cadence host-visible APB blocks, not a
+  ; firmware-owned bank, and is therefore read directly like the mailbox.
+  RockUartText(" PIF ") : RockDisplayHexLong(RockCdnRead(#CDN_SOURCE_PIF_STATUS))
+  RockUartByte(13) : RockUartByte(10)
+EndProcedure
+
 Procedure RockDisplaySubsystemTelemetry(text.i, error.i)
   If rock_uart_ready <> 0
     RockUartText(text)
@@ -591,6 +615,7 @@ Procedure.i RockDisplayUp()
   RockTimerWaitUs(50000)
   RockCdnReadLiveLinkStatus()
   RockDisplayLiveLinkTelemetry()
+  RockDisplayCadenceTelemetry()
   RockDisplayFrameTelemetry()
   rock_display_width=rock_mode_width
   rock_display_height=rock_mode_height

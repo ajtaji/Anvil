@@ -27,10 +27,13 @@
 #CDN_SOURCE_CIPHER_CAR = $0920
 #CDN_SOURCE_CRYPTO_CAR = $0924
 #CDN_BND_HSYNC2VSYNC = $0B00
+#CDN_HSYNC2VSYNC_STATUS = $0B0C
 #CDN_HSYNC2VSYNC_POL_CTRL = $0B10
 #CDN_FRAMER_TU = $2208
 #CDN_FRAMER_PXL_REPR = $220C
 #CDN_FRAMER_SP = $2210
+#CDN_MTPH_STATUS = $226C
+#CDN_INTERRUPT_SOURCE = $2270
 #CDN_VB_ID = $2258
 #CDN_FRONT_BACK_PORCH = $2278
 #CDN_BYTE_COUNT = $227C
@@ -40,10 +43,15 @@
 #CDN_MSA_VERTICAL_1 = $228C
 #CDN_MSA_MISC = $2290
 #CDN_STREAM_CONFIG = $2294
+#CDN_VIF_STATUS = $229C
+#CDN_PCK_STUFF_STATUS_0 = $22A0
+#CDN_PCK_STUFF_STATUS_1 = $22A4
+#CDN_RATE_GOVERNOR_STATUS = $22AC
 #CDN_HORIZONTAL = $22B0
 #CDN_VERTICAL_0 = $22B4
 #CDN_VERTICAL_1 = $22B8
 #CDN_AUX_SWAP_INVERSION = $280C
+#CDN_SOURCE_PIF_STATUS = $30820
 #CDN_IMEM = $10000
 #CDN_DMEM = $20000
 
@@ -55,6 +63,7 @@
 #CDN_READ_DPCD = 3
 #CDN_ENABLE_EVENT = 5
 #CDN_WRITE_REGISTER = 6
+#CDN_READ_REGISTER = 7
 #CDN_WRITE_FIELD = 8
 #CDN_TRAINING_CONTROL = 9
 #CDN_READ_EVENT = 10
@@ -240,6 +249,27 @@ Procedure.i RockCdnRegWrite(address.i, value.i)
     If address=#CDN_FRAMER_SP : rock_cdn_programmed_framer_sp=value & $FFFFFFFF : EndIf
   EndIf
   ProcedureReturn result
+EndProcedure
+
+Procedure.i RockCdnRegRead(address.i, destination.i)
+  ; RK3399 TRM Part 3, DPTX_READ_REGISTER: request is the 16-bit bank/register
+  ; address.  The firmware response is the echoed address followed by one
+  ; big-endian 32-bit value.  Validate the echo before exposing the value so
+  ; a stale or unrelated mailbox response can never be reported as hardware.
+  PokeA(@rock_cdn_message[0],(address >> 8) & 255)
+  PokeA(@rock_cdn_message[0]+1,address & 255)
+  If RockCdnSend(#CDN_MB_DP_TX,#CDN_READ_REGISTER,2,@rock_cdn_message[0]) = 0
+    ProcedureReturn 0
+  EndIf
+  If RockCdnReceive(#CDN_MB_DP_TX,#CDN_READ_REGISTER,6,@rock_cdn_message[0]) = 0
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(@rock_cdn_message[0]) & 255) <> ((address >> 8) & 255) Or (PeekA(@rock_cdn_message[0]+1) & 255) <> (address & 255)
+    rock_cdn_error = 37
+    ProcedureReturn 0
+  EndIf
+  PokeL(destination,((PeekA(@rock_cdn_message[0]+2) & 255) << 24) | ((PeekA(@rock_cdn_message[0]+3) & 255) << 16) | ((PeekA(@rock_cdn_message[0]+4) & 255) << 8) | (PeekA(@rock_cdn_message[0]+5) & 255))
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i RockCdnRegField(address.i, firstBit.i, bits.i, value.i)

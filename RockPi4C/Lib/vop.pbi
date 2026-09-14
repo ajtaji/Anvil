@@ -21,6 +21,8 @@
 ; and uses three YRGB gathers plus one CBCR gather for ARGB8888 scanout.
 #VOP_WIN0_GATHER_MASK = $00007F03
 #VOP_WIN0_ARGB8888_GATHER = $00001303
+#VOP_WIN0_YRGB_VSU_MODE_MASK = $00400000
+#VOP_WIN0_YRGB_VSU_BIC = $00400000
 #VOP_DSP_P888_PRE_DITHER = $00000002
 
 #VOP_CFG_DONE = $000
@@ -297,7 +299,10 @@ Procedure.i RockVopUpMode()
   ; the now-released DCLK reset instead of depending on a bootloader shadow.
   RockVopField(#VOP_AFBCD0_CTRL,$00000001,0)
   RockVopField(#VOP_WIN0_CTRL0,$00000001,0)
-  RockVopField(#VOP_WIN2_CTRL0,$00000010,0)
+  ; WIN2's declared cursor plane has a separate gate bit (b0) and enable bit
+  ; (b4). vop_disable_allwin() clears both; inheriting either from a previous
+  ; firmware owner violates the Linux clean-start sequence.
+  RockVopField(#VOP_WIN2_CTRL0,$00000011,0)
   ; Route the Cadence transmitter from the little VOP (GRF SOC_CON9 bit12).
   PokeL(#ROCK_GRF+$6224,$10001000)
   RockVopFirstFrame()
@@ -328,16 +333,28 @@ Procedure.i RockVopUpMode()
   RockVopWrite(#VOP_WIN0_SCL_FACTOR,#VOP_SCALE_UNITY_XY)
   RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
   RockVopWrite(#VOP_WIN0_VIR,rock_mode_pitch >> 2)
-  RockVopField(#VOP_WIN0_CTRL1,#VOP_WIN0_GATHER_MASK,#VOP_WIN0_ARGB8888_GATHER)
+  ; scl_vop_cal_scl_fac() selects the 5-line RGB buffer at 1920 pixels and
+  ; programs YRGB vertical-up mode BIC even when the scale modes themselves
+  ; are NONE. Own that active-path field instead of inheriting its reset value.
+  RockVopField(#VOP_WIN0_CTRL1,#VOP_WIN0_GATHER_MASK | #VOP_WIN0_YRGB_VSU_MODE_MASK,#VOP_WIN0_ARGB8888_GATHER | #VOP_WIN0_YRGB_VSU_BIC)
   RockVopWrite(#VOP_WIN0_CTRL0,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)
+  ; Linux writel()/U-Boot writel() order device MMIO before the following CRU
+  ; reset write.  Preserve that contract explicitly: CFG_DONE must reach VOPL
+  ; before the real DCLK assert/deassert pulse is started.
+  ASM
+    dsb sy
+  ENDASM
   ; Latch the new pixel clock into the VOP only after every timing register and
   ; scan address is valid.
   RockCruReset(281,1)
   RockTimerWaitUs(20)
   RockCruReset(281,0)
   RockVopWrite(#VOP_CFG_DONE,1)
+  ASM
+    dsb sy
+  ENDASM
   rock_vop_ready=1
   ProcedureReturn 1
 EndProcedure
