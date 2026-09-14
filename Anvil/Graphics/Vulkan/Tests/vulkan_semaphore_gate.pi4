@@ -1,0 +1,261 @@
+; ======================================================================
+;  Emitted gate: target-neutral Vulkan 1.0 binary semaphore state engine
+; ======================================================================
+; Builds with the real compiler and runs under the AArch64 interpreter.
+; The test backend owns no GPU.  No public semaphore entry point is exposed.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
+
+#VKS_OUT = $06000000
+#VKS_ROWS = $06000100
+#VKS_MAGIC = $564B534D
+
+Global vksChecks.i = 0
+Global vksFails.i = 0
+
+Procedure Vks(ok.i)
+  PokeN(#VKS_ROWS + vksChecks * 8, ok)
+  vksChecks = vksChecks + 1
+  If ok = 0 : vksFails = vksFails + 1 : EndIf
+EndProcedure
+
+Procedure VksOp(*op.AnvilVkSemaphoreOp, semaphore.i, operation.i)
+  *op\semaphore = semaphore
+  *op\operation = operation
+EndProcedure
+
+Procedure.i VksSignal(device.i, semaphore.i)
+  Define op.AnvilVkSemaphoreOp
+  Define ticket.i
+  VksOp(@op, semaphore, #ANVIL_VK_SEM_OP_SIGNAL)
+  If avkSemaphoreReserve(device, 1, @op, @ticket) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If avkSemaphoreCommit(ticket) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If avkSemaphoreComplete(ticket) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define instance1.i
+  Define instance2.i
+  Define physical1.i
+  Define physical2.i
+  Define device1.i
+  Define device2.i
+  Define count.l
+  Define semA.i
+  Define semB.i
+  Define semC.i
+  Define semD.i
+  Define semE.i
+  Define semF.i
+  Define leakedSem.i
+  Define leakedSem2.i
+  Define reusedDevice.i
+  Define committedTicket.i
+  Define staleSem.i
+  Define ticket.i
+  Define staleTicket.i
+  Define ticket1.i
+  Define ticket2.i
+  Define ticket3.i
+  Define ticket4.i
+  Define ticket5.i
+  Define badOut.i
+  Dim ops.AnvilVkSemaphoreOp[4]
+
+  AnvilVkTestBackendHeap($07000000, $00100000)
+  Vks(AnvilVkInstanceCreate(@instance1) = #VK_SUCCESS)
+  count = 1
+  Vks(AnvilVkPhysicalEnumerate(instance1, @count, @physical1) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceCreate(physical1, @device1) = #VK_SUCCESS)
+  Vks(AnvilVkInstanceCreate(@instance2) = #VK_SUCCESS)
+  count = 1
+  Vks(AnvilVkPhysicalEnumerate(instance2, @count, @physical2) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceCreate(physical2, @device2) = #VK_SUCCESS)
+
+  Vks(avkSemaphoreCreate(device1, 0, @semA) = #VK_SUCCESS)
+  Vks(avkSemaphoreCreate(device1, 0, @semB) = #VK_SUCCESS)
+  Vks(avkSemaphoreCreate(device1, 0, @semC) = #VK_SUCCESS)
+  Vks(avkSemaphoreCreate(device2, 0, @semD) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreState(device2, semA) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreState($12345678, semA) = #ANVIL_VK_ERR_HANDLE)
+
+  badOut = $11223344
+  Vks(avkSemaphoreCreate(device1, 1, @badOut) = #ANVIL_VK_ERR_ARGS)
+  Vks(badOut = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreCreate($12345678, 0, @badOut) = #ANVIL_VK_ERR_HANDLE)
+  Vks(badOut = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreCreate(device1, 0, 0) = #ANVIL_VK_ERR_ARGS)
+
+  ; An unsignaled wait is refused and reservation failure is atomic.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  ticket = $55667788
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #ANVIL_VK_ERR_STATE)
+  Vks(ticket = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+
+  ; Earlier signal can satisfy a later wait in the same ordered batch.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  VksOp(@ops[1], semA, #ANVIL_VK_SEM_OP_WAIT)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #VK_SUCCESS)
+  staleTicket = ticket
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket5) = #ANVIL_VK_ERR_STATE)
+  Vks(ticket5 = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreDestroy(device1, semA) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreCommit(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreDestroy(device1, semA) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreComplete(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreComplete(staleTicket) = #ANVIL_VK_ERR_HANDLE)
+
+  ; A completed unconsumed signal publishes exactly one consumable state.
+  Vks(VksSignal(device1, semA) = 1)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_SIGNALED)
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreCommit(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreComplete(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #ANVIL_VK_ERR_STATE)
+
+  ; Duplicate roles and wrong ordering are rejected without partial signal.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  VksOp(@ops[1], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  VksOp(@ops[1], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+
+  ; A later bad operation rolls the whole reservation back before commit.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  VksOp(@ops[1], semD, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreState(device2, semD) = #ANVIL_VK_SEM_UNSIGNALED)
+  VksOp(@ops[1], semB, 99)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #ANVIL_VK_ERR_ARGS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+
+  ; Commit owns every touched payload. A second reservation and destruction
+  ; fail while pending. Rollback restores the exact pre-commit bit.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreCommit(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket5) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreDestroy(device1, semA) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreCommit(ticket) = #ANVIL_VK_ERR_HANDLE)
+
+  Vks(VksSignal(device1, semA) = 1)
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreCommit(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_SIGNALED)
+
+  ; A consumed signal may be followed by a new signal, ending signaled.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  VksOp(@ops[1], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreCommit(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreComplete(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_SIGNALED)
+
+  ; A second signal cannot overwrite an unconsumed binary signal.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_SIGNALED)
+
+  ; Two waits cannot consume one signal.
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  VksOp(@ops[1], semA, #ANVIL_VK_SEM_OP_WAIT)
+  Vks(avkSemaphoreReserve(device1, 2, @ops[0], @ticket) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_SEM_SIGNALED)
+
+  ; Generation tags reject stale semaphore and transaction handles.
+  Vks(avkSemaphoreCreate(device1, 0, @semE) = #VK_SUCCESS)
+  staleSem = semE
+  Vks(avkSemaphoreDestroy(device1, semE) = #VK_SUCCESS)
+  Vks(avkSemaphoreCreate(device1, 0, @semE) = #VK_SUCCESS)
+  Vks(semE <> staleSem)
+  Vks(avkSemaphoreState(device1, staleSem) = #ANVIL_VK_ERR_HANDLE)
+  VksOp(@ops[0], semE, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  staleTicket = ticket
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(ticket <> staleTicket)
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreRollback(staleTicket) = #ANVIL_VK_ERR_HANDLE)
+
+  ; Reservation capacity is bounded and failure does not steal a slot.
+  Vks(avkSemaphoreCreate(device1, 0, @semF) = #VK_SUCCESS)
+  VksOp(@ops[0], semB, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket1) = #VK_SUCCESS)
+  VksOp(@ops[0], semC, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket2) = #VK_SUCCESS)
+  VksOp(@ops[0], semE, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket3) = #VK_SUCCESS)
+  VksOp(@ops[0], semF, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket4) = #VK_SUCCESS)
+  VksOp(@ops[0], semA, #ANVIL_VK_SEM_OP_WAIT)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket5) = #VK_ERROR_TOO_MANY_OBJECTS)
+  Vks(ticket5 = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreRollback(ticket1) = #VK_SUCCESS)
+  Vks(avkSemaphoreRollback(ticket2) = #VK_SUCCESS)
+  Vks(avkSemaphoreRollback(ticket3) = #VK_SUCCESS)
+  Vks(avkSemaphoreRollback(ticket4) = #VK_SUCCESS)
+
+  ; Device reset is all-or-nothing and retires every owned semaphore only
+  ; after reservations and pending references are gone.
+  VksOp(@ops[0], semB, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreResetDevice(device1) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device1, semC) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  Vks(avkSemaphoreResetDevice(device1) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_ERR_HANDLE)
+  Vks(avkSemaphoreState(device1, semB) = #ANVIL_VK_ERR_HANDLE)
+  Vks(avkSemaphoreState(device1, semC) = #ANVIL_VK_ERR_HANDLE)
+  Vks(avkSemaphoreState(device2, semD) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreDestroy(device2, #VK_NULL_HANDLE) = #VK_SUCCESS)
+
+  ; Deliberately violate the future integration seam by destroying a device
+  ; without calling avkSemaphoreResetDevice. Reusing the same foundation
+  ; slot with a new generation must not inherit the leaked object's or
+  ; reservation's authority.
+  Vks(avkSemaphoreCreate(device1, 0, @leakedSem) = #VK_SUCCESS)
+  Vks(avkSemaphoreCreate(device1, 0, @leakedSem2) = #VK_SUCCESS)
+  VksOp(@ops[0], leakedSem, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  VksOp(@ops[0], leakedSem2, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @committedTicket) = #VK_SUCCESS)
+  Vks(avkSemaphoreCommit(committedTicket) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceDestroy(device1) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceCreate(physical1, @reusedDevice) = #VK_SUCCESS)
+  Vks(avkTokenSlot(reusedDevice) = avkTokenSlot(device1))
+  Vks(avkTokenGen(reusedDevice) <> avkTokenGen(device1))
+  Vks(avkSemaphoreState(reusedDevice, leakedSem) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreDestroy(reusedDevice, leakedSem) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreReserve(reusedDevice, 1, @ops[0], @ticket5) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreCommit(ticket) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreRollback(ticket) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreComplete(committedTicket) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreRollback(committedTicket) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreResetDevice(reusedDevice) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(reusedDevice, leakedSem) = #ANVIL_VK_ERR_OWNER)
+
+  PokeN(#VKS_OUT + 0, #VKS_MAGIC)
+  PokeN(#VKS_OUT + 8, vksChecks)
+  PokeN(#VKS_OUT + 16, vksFails)
+  ProcedureReturn vksFails
+EndProcedure
+
+Main()
