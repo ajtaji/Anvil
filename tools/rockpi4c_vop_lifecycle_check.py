@@ -194,17 +194,39 @@ def check_source(vop_path: Path) -> None:
 
 def check_assembly(assembly_path: Path) -> None:
     assembly = assembly_path.read_text(encoding="utf-8", errors="replace").lower()
-    for label in (
-        "rockvoppreparemode:",
-        "rockvopconfigureprimary:",
-        "rockvopstartprimary:",
-        "rockvoplatchframe:",
-    ):
-        require(label in assembly, f"emitted assembly omits {label}")
-    require(re.search(r"\bbl\s+rockvoplatchframe\b", assembly) is not None,
-            "emitted phases do not call the bounded frame latch")
-    require(re.search(r"\bbl\s+rockcrureset\b", assembly) is None,
-            "emitted VOP unit directly calls the reset primitive")
+
+    def emitted(name: str) -> str:
+        # PureMetal's listing emits public Procedure labels at column zero and
+        # may place private __a64 labels inside them. Bound a procedure by the
+        # next public Rock* symbol, not by a global search of the whole image.
+        match = re.search(
+            rf"(?m)^{re.escape(name)}:\s*$([\s\S]*?)(?=^rock[a-z0-9_]+:\s*$|\Z)",
+            assembly,
+        )
+        require(match is not None, f"emitted assembly omits {name}:")
+        return match.group(1)
+
+    latch = emitted("rockvoplatchframe")
+    prepare = emitted("rockvoppreparemode")
+    configure = emitted("rockvopconfigureprimary")
+    start = emitted("rockvopstartprimary")
+
+    require(re.search(r"\bbl\s+rockvopwrite\b", latch) is not None and
+            re.search(r"\bbl\s+rocktimerticks\b", latch) is not None,
+            "emitted latch omits CFG_DONE/frame timeout owners")
+    require(re.search(r"\bbl\s+rockcruvoprelease\b", prepare) is not None and
+            re.search(r"\bbl\s+rockvoplatchframe\b", prepare) is not None,
+            "emitted prepare omits reset release or background latch")
+    require(re.search(r"\bbl\s+rockvopfirstframe\b", configure) is not None and
+            re.search(r"\bbl\s+rockvoplatchframe\b", configure) is None,
+            "emitted configure does not remain a disabled, unlatch plane phase")
+    require(re.search(r"\bbl\s+rockvopfield\b", start) is not None and
+            re.search(r"\bbl\s+rockvoplatchframe\b", start) is not None,
+            "emitted start omits WIN0 enable or frame latch")
+    for phase, body in (("prepare", prepare), ("configure", configure),
+                        ("start", start)):
+        require(re.search(r"\bbl\s+rockcrureset\b", body) is None,
+                f"emitted VOP {phase} directly calls the reset primitive")
 
 
 def main() -> None:
