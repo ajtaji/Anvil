@@ -156,6 +156,52 @@ def vertex_passthrough(zbits: int = F0, wbits: int = F1) -> bytes:
     return module(27, b)
 
 
+def vertex_texture() -> bytes:
+    """in vec2 position, in vec2 UV -> gl_Position and one vec2 varying."""
+    b = [
+        ins(OP["Capability"], CAP_SHADER),
+        ins(OP["MemoryModel"], ADDR_LOGICAL, MEM_GLSL450),
+        ins(OP["EntryPoint"], EM_VERTEX, 19, *lit("main"), 15, 16, 17, 18),
+        ins(OP["MemberDecorate"], 9, 0, DEC_BUILTIN, BUILTIN_POSITION),
+        ins(OP["Decorate"], 9, DEC_BLOCK),
+        ins(OP["Decorate"], 15, DEC_LOCATION, 0),
+        ins(OP["Decorate"], 16, DEC_LOCATION, 1),
+        ins(OP["Decorate"], 17, DEC_LOCATION, 0),
+        ins(OP["TypeVoid"], 1),
+        ins(OP["TypeFunction"], 2, 1),
+        ins(OP["TypeFloat"], 3, 32),
+        ins(OP["TypeVector"], 4, 3, 2),
+        ins(OP["TypeVector"], 5, 3, 4),
+        ins(OP["TypePointer"], 6, SC_INPUT, 4),
+        ins(OP["TypePointer"], 7, SC_INPUT, 4),
+        ins(OP["TypePointer"], 8, SC_OUTPUT, 4),
+        ins(OP["TypeStruct"], 9, 5),
+        ins(OP["TypePointer"], 10, SC_OUTPUT, 9),
+        ins(OP["TypePointer"], 27, SC_OUTPUT, 5),
+        ins(OP["TypeInt"], 11, 32, 1),
+        ins(OP["Constant"], 11, 12, 0),
+        ins(OP["Constant"], 3, 13, F0),
+        ins(OP["Constant"], 3, 14, F1),
+        ins(OP["Variable"], 6, 15, SC_INPUT),
+        ins(OP["Variable"], 7, 16, SC_INPUT),
+        ins(OP["Variable"], 8, 17, SC_OUTPUT),
+        ins(OP["Variable"], 10, 18, SC_OUTPUT),
+        ins(OP["Function"], 1, 19, 0, 2),
+        ins(OP["Label"], 20),
+        ins(OP["Load"], 4, 21, 15),
+        ins(OP["CompositeExtract"], 3, 22, 21, 0),
+        ins(OP["CompositeExtract"], 3, 23, 21, 1),
+        ins(OP["CompositeConstruct"], 5, 24, 22, 23, 13, 14),
+        ins(OP["AccessChain"], 27, 25, 18, 12),
+        ins(OP["Store"], 25, 24),
+        ins(OP["Load"], 4, 26, 16),
+        ins(OP["Store"], 17, 26),
+        ins(OP["Return"]),
+        ins(OP["FunctionEnd"]),
+    ]
+    return module(28, b)
+
+
 def vertex_position_only() -> bytes:
     """in vec2 position -> gl_Position, and no varying at all."""
     b = [

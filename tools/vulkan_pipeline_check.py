@@ -48,7 +48,11 @@ DIAGNOSTIC2 = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanVaryin
 LOAD = 0x00400000
 STACK = 0x03000000
 LOADER_LR = 0xDEAD0000
-STEP_LIMIT = 400_000_000
+# A green run currently retires about eleven million instructions. Five times
+# that budget is enough for a valid path and turns a mutation-created loop into
+# a prompt red result instead of monopolising the compiler lane for most of an
+# hour.
+STEP_LIMIT = 50_000_000
 MMIO = 0xFC000000
 
 IN = 0x06000000
@@ -65,6 +69,8 @@ OFF_UNIF_VS = 3328
 OFF_UNIF_FS = 3584
 OFF_DEFAULTS = 3840
 OFF_SHREC = 4096
+OFF_TEX_STATE = 4608
+OFF_SAMP_STATE = 4864
 PIPE_BYTES = 8192
 
 SHREC_BYTES = 36
@@ -481,7 +487,7 @@ def grade(cpu, rc) -> Grader:
     g.need("[B] the colour comes from the push-constant block", slot(34), 1)
     g.need_bytes("[B] the GL shader state record and its attribute records",
                  blob(cpu, baseB + OFF_SHREC, SHREC_BYTES + 2 * ATTR_BYTES),
-                 expected_shader_record(baseB, interleaved(vertex_base, STRIDE2, 2), 2, 0))
+                 expected_shader_record(slot(233), interleaved(vertex_base, STRIDE2, 2), 2, 0))
     g.need_bytes("[B] the coordinate shader's uniform stream",
                  blob(cpu, baseB + OFF_UNIF_CS, (6 + 4) * 4),
                  expected_vertex_uniforms(6, (W // 2) * 256, (H // 2) * 256))
@@ -858,10 +864,77 @@ def grade(cpu, rc) -> Grader:
     g.need_bytes("the uniform-buffer fragment module, word for word",
                  blob(cpu, slot(64), min(slot(65), len(spv.fragment_uniform()))),
                  spv.fragment_uniform())
+
+    # The two texture fixtures are assembled independently here and in the
+    # target-language gate. A bad opcode, result type or decoration cannot be
+    # blessed merely because the same bytes happen to reach both sides.
+    for name, (addr_slot, len_slot), want in (
+            ("the texture-coordinate vertex module", (208, 209), spv.vertex_texture()),
+            ("the combined-sampler fragment module", (210, 211), spv.fragment_sampled())):
+        g.need(f"{name} is the length this checker assembles", slot(len_slot), len(want))
+        g.need_bytes(f"{name}, word for word",
+                     blob(cpu, slot(addr_slot), min(slot(len_slot), len(want))), want)
+
+    # The executable sampled pipeline owns a separate one-texel source image;
+    # it is not a colour attachment sampled while rendering to itself.
+    texel_base = slot(234)
+    g.need("the sampled pipeline layout was created", slot(212), 0)
+    g.need("the one-texel descriptor update succeeds", slot(213), 0)
+    g.need("the one-texel shader-read transition records", slot(214), 0)
+    g.need("the one-texel shader-read transition submits", slot(215), 0)
+    g.need("the one-texel transition fence signals", slot(216), 0)
+    g.need("the texture-coordinate vertex module creates", slot(217), 0)
+    g.need("the combined-sampler fragment module creates", slot(218), 0)
+    g.need("the sampled graphics pipeline creates", slot(219), 0)
+    g.need("the pipeline records sampled-image colour", slot(220), 4)
+    g.need("the pipeline records set-zero binding zero", slot(221), 0)
+    g.need("the pipeline records the whole location-zero vec2 coordinate", slot(222), 0)
+    g.need("the real V3D emitter compiles the sampled pipeline", slot(223), 0)
+    g.need("the sampled fragment receives two varying components", slot(226), 2)
+    g.need("the sampled draw records", slot(227), 0)
+    g.need("the sampled draw submits", slot(228), 0)
+    g.need("the sampled draw fence signals", slot(229), 0)
+    g.need("the backend receives the sampled image base", slot(230), texel_base)
+    g.need("the backend receives one sampled texel across", slot(231), 1)
+    g.need("the backend receives one sampled texel down", slot(232), 1)
+
+    tex_base = slot(224)
+    g.want_true("the sampled pipeline has a real emitted-code allocation", tex_base != 0,
+                hex(tex_base))
+    g.want_true("the sampled fragment program is a whole nonempty QPU program",
+                slot(225) > 0 and slot(225) % 8 == 0, str(slot(225)))
+    sampled_words = [u64(cpu, tex_base + OFF_FS_CODE + i)
+                     for i in range(0, slot(225), 8)]
+    g.want_true("the sampled fragment program reaches its T-then-S request",
+                len(sampled_words) > 9, str(len(sampled_words)))
+    if len(sampled_words) > 9:
+        g.need("the texture request writes T before S fires it",
+               [(sampled_words[8] >> 32) & 0x3F,
+                (sampled_words[9] >> 32) & 0x3F], [34, 33])
+    g.need_bytes("the texture state carries the exact one-texel BGRA8 request",
+                 blob(cpu, tex_base + OFF_TEX_STATE, 16),
+                 struct.pack("<4I", texel_base, 1 << 26, (1 << 8) | (1 << 22),
+                             (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21)))
+    g.need_bytes("the sampler state carries linear-mag, nearest-min and clamp-to-edge",
+                 blob(cpu, tex_base + OFF_SAMP_STATE, 8),
+                 struct.pack("<2I", 0x82, (1 << 16) | (1 << 19)))
+    g.need_bytes("the sampled fragment stream points at texture state, sampler state, then TLB",
+                 blob(cpu, tex_base + OFF_UNIF_FS, 12),
+                 struct.pack("<3I", (tex_base + OFF_TEX_STATE) | 0xF,
+                             (tex_base + OFF_SAMP_STATE) | 1, TLB_CONF))
     return g
 
 
 MUTANTS = (
+    ("the sampled texture-state width is packed in the wrong field",
+     "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\\width << 26) & $FFFFFFFF)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\\width << 25) & $FFFFFFFF)\n"),
+    ("the sampled fragment stream points one word into texture state",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, (base + #AVKQ_OFF_TEX_STATE) | $F)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, (base + #AVKQ_OFF_TEX_STATE + 16) | $F)\n"),
+    ("the texture request fires S before receiving T",
+     "    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)\n    If r <> #V3DQ_OK : ProcedureReturn r : EndIf\n    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)\n",
+     "    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)\n    If r <> #V3DQ_OK : ProcedureReturn r : EndIf\n    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)\n"),
     ("the varying count is left out of the shader record's flags",
      "  V3dShaderRecordFlags(1, 0, 0, 0, 1, varyComps)\n",
      "  V3dShaderRecordFlags(1, 0, 0, 0, 1, 0)\n"),
@@ -933,6 +1006,12 @@ COMMAND_MUTANTS = (
 )
 
 PIPELINE_MUTANTS = (
+    ("the sampled pipeline records the next descriptor binding",
+     "  avkPipeSampleBinding[s] = avkShSampleBinding[fs]\n",
+     "  avkPipeSampleBinding[s] = avkShSampleBinding[fs] + 1\n"),
+    ("submit drops the closed sampled-image record",
+     "    avkDrawRecord\\sampledImage = @avkSampleStage\n",
+     "    avkDrawRecord\\sampledImage = 0\n"),
     ("a created sampler is left non-live",
      "  avkSampLive[s] = 1\n  avkSampDev[s] = d\n",
      "  avkSampLive[s] = 0\n  avkSampDev[s] = d\n"),
@@ -1147,6 +1226,14 @@ SAMPLED_STATE_MUTANTS = frozenset({
     "an image view with an empty layer range is accepted",
 })
 
+SAMPLED_EXEC_MUTANTS = frozenset({
+    "the sampled texture-state width is packed in the wrong field",
+    "the sampled fragment stream points one word into texture state",
+    "the texture request fires S before receiving T",
+    "the sampled pipeline records the next descriptor binding",
+    "submit drops the closed sampled-image record",
+})
+
 
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
@@ -1162,7 +1249,7 @@ def main() -> int:
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage",
                                                    "sample-mask", "draw-count",
-                                                   "sampled-state"))
+                                                   "sampled-state", "sampled-exec"))
     parser.add_argument("--mutate-name", choices=tuple(m[0] for m in all_mutants),
                         help="run exactly one named mutation after the green gate")
     args = parser.parse_args()
@@ -1187,11 +1274,11 @@ def main() -> int:
 
     print(f"vulkan_pipeline_check: PASS - {g.checks} property checks over "
           f"{steps:,} executed A64 instructions")
-    print("  the whole public path runs: six shader modules, four pipeline layouts, a")
+    print("  the whole public path runs: eight shader modules, five pipeline layouts, a")
     print("  render pass, a framebuffer, four buffers, a sampler, three descriptor set layouts, two pools")
-    print("  and three sets, five graphics pipelines over four live slots, five render passes each holding one draw,")
-    print("  five submissions and a fence")
-    print("  all four shader variants were compiled by the REAL V3D QPU emitter, and every byte")
+    print("  and three sets, six graphics pipelines over four live slots, six render passes each holding one draw,")
+    print("  seven submissions and a fence")
+    print("  all five shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
     print("  attribute values matches a record this checker packed from the documented layout")
     print("  the third pipeline reads POSITION FROM ONE BUFFER AND COLOUR FROM ANOTHER, at")
@@ -1201,9 +1288,9 @@ def main() -> int:
     print("  the fourth takes its colour from a UNIFORM BUFFER through a descriptor set;")
     print("  its stream keeps the descriptor address and the raw QPU words decode to a V3D")
     print("  4.2 TMU general vec4 lookup - no CPU copy of the buffer values remains")
-    print("  a combined image sampler also resolves into one closed backend record only while")
-    print("  its sampler, full view, sampled-usage image and shader-read layout are all live")
-    print("  (state only: this gate makes no sampled-pixel or texture-opcode claim)")
+    print("  the sampled shader consumes a separate one-texel image through a closed descriptor;")
+    print("  the gate independently checks both SPIR-V modules, pipeline state, exact V3D 4.2")
+    print("  texture/sampler words, uniform pointers and the executable backend record")
     print("  NOT ONE PIXEL of the render target was written and NOT ONE MMIO access was made")
     print("  RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4 and")
     print("  RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4 both build at $500000")
@@ -1232,6 +1319,8 @@ def main() -> int:
             if args.mutate_only == "draw-count" and name not in DRAW_COUNT_TRUTH_MUTANTS:
                 continue
             if args.mutate_only == "sampled-state" and name not in SAMPLED_STATE_MUTANTS:
+                continue
+            if args.mutate_only == "sampled-exec" and name not in SAMPLED_EXEC_MUTANTS:
                 continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
@@ -1264,6 +1353,8 @@ def main() -> int:
         total = len(DRAW_COUNT_TRUTH_MUTANTS)
     elif args.mutate_only == "sampled-state":
         total = len(SAMPLED_STATE_MUTANTS)
+    elif args.mutate_only == "sampled-exec":
+        total = len(SAMPLED_EXEC_MUTANTS)
     else:
         total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
                  + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS) + len(API_MUTANTS))
