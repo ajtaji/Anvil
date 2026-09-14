@@ -152,6 +152,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #SpvOpVectorShuffle = 79
 #SpvOpCompositeConstruct = 80
 #SpvOpCompositeExtract = 81
+#SpvOpSampledImage = 86
 #SpvOpImageSampleImplicitLod = 87
 #SpvOpConvertFToU = 109
 #SpvOpConvertFToS = 110
@@ -238,6 +239,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #SpvBuiltInVertexIndex = 42
 #SpvBuiltInInstanceIndex = 43
 
+; Image operands used by the one bounded combined-sampler shape.
+#SpvDim2D = 1
+#SpvImageFormatUnknown = 0
+
 ; Capabilities (3.31).
 #SpvCapabilityMatrix = 0
 #SpvCapabilityShader = 1
@@ -260,6 +265,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_T_STRUCT = 5
 #ANVIL_SPV_T_POINTER = 6
 #ANVIL_SPV_T_FUNCTION = 7
+#ANVIL_SPV_T_IMAGE = 8
+#ANVIL_SPV_T_SAMPLED_IMAGE = 9
 
 ; What an id is.
 #ANVIL_SPV_K_NONE = 0
@@ -282,12 +289,15 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_V_EXTRACT = 5      ; OpCompositeExtract of one component
 #ANVIL_SPV_V_CHAIN = 6        ; OpAccessChain into a block variable
 #ANVIL_SPV_V_UNIFORM = 7      ; a load of one member of the uniform block
+#ANVIL_SPV_V_SAMPLED = 8      ; a load of one combined sampled-image variable
+#ANVIL_SPV_V_IMAGE_SAMPLE = 9 ; OpImageSampleImplicitLod(sampled, input vec2)
 
 ; The colour sources a fragment plan can name.
 #ANVIL_SPV_COLOUR_VARYING = 0
 #ANVIL_SPV_COLOUR_PUSH = 1
 #ANVIL_SPV_COLOUR_CONST = 2
 #ANVIL_SPV_COLOUR_UNIFORM = 3
+#ANVIL_SPV_COLOUR_SAMPLED = 4
 
 ; ----------------------------------------------------------------------
 ;  WALK STATE. One module is parsed at a time and the result is copied
@@ -324,6 +334,9 @@ Global spvPushVar.i = 0
 Global spvUniformVar.i = 0      ; the Uniform-storage block variable, or 0
 Global spvUniformSet.i = -1
 Global spvUniformBinding.i = -1
+Global spvSampleVar.i = 0       ; the UniformConstant combined sampler
+Global spvSampleSet.i = -1
+Global spvSampleBinding.i = -1
 Global spvPosVar.i = 0          ; the Output variable that carries Position
 Global spvPosMember.i = -1      ; -1 when Position is the variable itself
 Global spvPosValue.i = 0        ; the value stored into it
@@ -335,6 +348,7 @@ Global spvPlanVaryCount.i = 0
 Global spvPlanPosAttr.i = -1
 Global spvPlanColourSrc.i = -1
 Global spvPlanColourIdx.i = -1
+Global spvPlanSampleCoord.i = -1
 Global Dim spvPlanAttrLoc.i[#ANVIL_SPV_MAX_ATTRS]
 Global Dim spvPlanAttrComp.i[#ANVIL_SPV_MAX_ATTRS]
 Global Dim spvPlanAttrVar.i[#ANVIL_SPV_MAX_ATTRS]
@@ -403,6 +417,9 @@ Procedure avkSpvResetTables()
   spvUniformVar = 0
   spvUniformSet = -1
   spvUniformBinding = -1
+  spvSampleVar = 0
+  spvSampleSet = -1
+  spvSampleBinding = -1
   spvPosVar = 0
   spvPosMember = -1
   spvPosValue = 0
@@ -412,6 +429,7 @@ Procedure avkSpvResetTables()
   spvPlanPosAttr = -1
   spvPlanColourSrc = -1
   spvPlanColourIdx = -1
+  spvPlanSampleCoord = -1
   k = 0
   While k < #ANVIL_SPV_MAX_ATTRS
     spvPlanAttrLoc[k] = -1
@@ -484,8 +502,8 @@ Procedure.i avkSpvRefuseOpcode(op.i)
   If op = #SpvOpTypeMatrix Or op = #SpvOpMatrixTimesVector Or op = #SpvOpMatrixTimesMatrix
     ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a matrix opcode - OpTypeMatrix, OpMatrixTimesVector or OpMatrixTimesMatrix (Anvil code -20005, unsupported instruction); there is no matrix type and no transform in this slice, so a model-view-projection multiply cannot be lowered. Pass positions already in clip space until a vertex arithmetic lowering exists.")
   EndIf
-  If op = #SpvOpTypeImage Or op = #SpvOpTypeSampler Or op = #SpvOpTypeSampledImage Or op = #SpvOpImageSampleImplicitLod
-    ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an image or sampler opcode - OpTypeImage, OpTypeSampler, OpTypeSampledImage or OpImageSampleImplicitLod (Anvil code -20005, unsupported instruction); VkSampler objects exist, but there is no sampled-image descriptor and nothing lowers a texture fetch yet. Use a per-vertex colour, the push-constant colour or a uniform buffer instead.")
+  If op = #SpvOpTypeSampler Or op = #SpvOpSampledImage
+    ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a separate sampler opcode - OpTypeSampler or OpSampledImage (Anvil code -20005, unsupported instruction); this tranche accepts one combined sampled-image variable and OpImageSampleImplicitLod. Separate image and sampler descriptors need two bindings and are not implemented.")
   EndIf
   If op = #SpvOpFAdd Or op = #SpvOpFSub Or op = #SpvOpFMul Or op = #SpvOpFDiv Or op = #SpvOpFNegate Or op = #SpvOpVectorTimesScalar Or op = #SpvOpDot
     ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a floating-point arithmetic opcode - OpFAdd, OpFSub, OpFMul, OpFDiv, OpFNegate, OpVectorTimesScalar or OpDot (Anvil code -20005, unsupported instruction); this slice lowers a shader that only moves values, so a shader that computes one cannot be emitted. The QPU arithmetic lowering is the next piece of work and it is not written yet.")
@@ -700,6 +718,43 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       spvTypeCount[id] = n
       ProcedureReturn #ANVIL_VK_OK
 
+    Case #SpvOpTypeImage
+      id = avkSpvWord(*words, at + 1)
+      a = avkSpvWord(*words, at + 2)
+      If avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpTypeImage named a result id or sampled scalar type outside the module's own bound (Anvil code -20001, malformed module); every id an instruction names must be declared earlier in the module.")
+      EndIf
+      If count <> 9
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpTypeImage with an access qualifier or a missing image operand (Anvil code -20005, unsupported image type); this sampled 2D image has the core eight operands and no optional Access Qualifier.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) <> 1
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpTypeImage whose sampled type is not a 32-bit float (Anvil code -20005, unsupported sampled type); VK_FORMAT_B8G8R8A8_UNORM is returned to the shader as four normalized binary32 components.")
+      EndIf
+      If avkSpvWord(*words, at + 3) <> #SpvDim2D Or avkSpvWord(*words, at + 4) <> 0 Or avkSpvWord(*words, at + 5) <> 0 Or avkSpvWord(*words, at + 6) <> 0
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpTypeImage that is not a non-depth, non-arrayed, non-multisampled two-dimensional image (Anvil code -20005, unsupported image type); this tranche lowers exactly sampler2D over one colour image.")
+      EndIf
+      If avkSpvWord(*words, at + 7) <> 1 Or avkSpvWord(*words, at + 8) <> #SpvImageFormatUnknown
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpTypeImage not declared for sampling with Unknown image format (Anvil code -20005, unsupported image type); a combined sampled image must carry Sampled=1 and Image Format=Unknown in this Vulkan path.")
+      EndIf
+      spvKind[id] = #ANVIL_SPV_K_TYPE
+      spvTypeClass[id] = #ANVIL_SPV_T_IMAGE
+      spvTypeComp[id] = a
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpTypeSampledImage
+      id = avkSpvWord(*words, at + 1)
+      a = avkSpvWord(*words, at + 2)
+      If count <> 3 Or avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpTypeSampledImage has the wrong length or names an id outside the module's own bound (Anvil code -20001, malformed module); it must name one previously declared OpTypeImage.")
+      EndIf
+      If spvTypeClass[a] <> #ANVIL_SPV_T_IMAGE
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpTypeSampledImage names a type that is not OpTypeImage (Anvil code -20001, malformed module); the sampled image type must wrap an image type.")
+      EndIf
+      spvKind[id] = #ANVIL_SPV_K_TYPE
+      spvTypeClass[id] = #ANVIL_SPV_T_SAMPLED_IMAGE
+      spvTypeComp[id] = a
+      ProcedureReturn #ANVIL_VK_OK
+
     Case #SpvOpTypeStruct
       id = avkSpvWord(*words, at + 1)
       If avkSpvIdOk(id) = 0
@@ -873,11 +928,8 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       If b = #SpvStorageClassStorageBuffer
         ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in the StorageBuffer storage class (Anvil code -20005, unsupported storage class); a storage buffer is written as well as read and this implementation has no descriptor type, no memory barrier and no coherence rule for one. A uniform buffer, declared Uniform with the Block decoration, is the descriptor path that exists.")
       EndIf
-      If b = #SpvStorageClassUniformConstant
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in the UniformConstant storage class (Anvil code -20005, unsupported storage class); that class holds samplers, images and combined image samplers, and the existing VkSampler object is not yet connected to an image-view descriptor or texture-unit lowering.")
-      EndIf
-      If b <> #SpvStorageClassInput And b <> #SpvStorageClassOutput And b <> #SpvStorageClassPushConstant And b <> #SpvStorageClassUniform
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in a storage class it does not implement (Anvil code -20005, unsupported storage class); the four accepted classes are Input, Output, PushConstant and Uniform.")
+      If b <> #SpvStorageClassInput And b <> #SpvStorageClassOutput And b <> #SpvStorageClassPushConstant And b <> #SpvStorageClassUniform And b <> #SpvStorageClassUniformConstant
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpVariable in a storage class it does not implement (Anvil code -20005, unsupported storage class); the accepted classes are Input, Output, PushConstant, Uniform and the one bounded UniformConstant combined sampler.")
       EndIf
       spvKind[id] = #ANVIL_SPV_K_VARIABLE
       spvValueType[id] = spvTypeComp[a]
@@ -895,6 +947,9 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       ; on an Input is what a source language emits when a `uniform` was
       ; meant to be an `in`.
       If b = #SpvStorageClassUniform
+        If spvSampleVar <> 0
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a fragment module that declares both a uniform buffer and a sampled image (Anvil code -20005, mixed descriptor shape); the current descriptor set layouts carry one resource family, so split this shader until mixed layouts are implemented.")
+        EndIf
         If spvUniformVar <> 0
           ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a second Uniform-storage block variable (Anvil code -20005, unsupported module shape); one uniform buffer reaches one fragment shader here, so a second block would need a second descriptor binding this slice does not lower.")
         EndIf
@@ -902,8 +957,22 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
           ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a Uniform-storage variable that does not carry both DescriptorSet and Binding (Anvil code -20005, unsupported uniform block); a descriptor is found by the pair, so a block missing either one names no binding at all.")
         EndIf
         spvUniformVar = id
+      ElseIf b = #SpvStorageClassUniformConstant
+        If spvUniformVar <> 0
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a fragment module that declares both a uniform buffer and a sampled image (Anvil code -20005, mixed descriptor shape); the current descriptor set layouts carry one resource family, so split this shader until mixed layouts are implemented.")
+        EndIf
+        If spvSampleVar <> 0
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a second UniformConstant sampled-image variable (Anvil code -20005, unsupported module shape); one combined sampler reaches one fragment shader in this tranche.")
+        EndIf
+        If spvTypeClass[spvValueType[id]] <> #ANVIL_SPV_T_SAMPLED_IMAGE
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a UniformConstant variable that is not a combined OpTypeSampledImage (Anvil code -20005, unsupported descriptor kind); separate images and samplers are not lowered in this tranche.")
+        EndIf
+        If spvDecSet[id] < 0 Or spvDecBinding[id] < 0
+          ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a combined sampled-image variable that does not carry both DescriptorSet and Binding (Anvil code -20005, unsupported sampled descriptor); a texture descriptor is found by that pair.")
+        EndIf
+        spvSampleVar = id
       ElseIf spvDecSet[id] >= 0 Or spvDecBinding[id] >= 0
-        ProcedureReturn avkSpvRefuse(#SpvOpDecorate, "the SPIR-V front end refused a DescriptorSet or Binding decoration on a variable that is not in the Uniform storage class (Anvil code -20005, misplaced decoration); those two decorations say which descriptor supplies a uniform buffer, and on an Input, an Output or a push-constant block they name a binding nothing can ever be bound to.")
+        ProcedureReturn avkSpvRefuse(#SpvOpDecorate, "the SPIR-V front end refused a DescriptorSet or Binding decoration on a variable that is neither a Uniform block nor a UniformConstant combined sampler (Anvil code -20005, misplaced decoration); interface and push-constant variables cannot be descriptor bindings.")
       EndIf
       ProcedureReturn #ANVIL_VK_OK
 
@@ -945,7 +1014,15 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
           spvValueA[id] = b
           ProcedureReturn #ANVIL_VK_OK
         EndIf
-        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpLoad of a variable that is not an Input (Anvil code -20005, unsupported load); a shader may read its inputs and the push-constant block, and it may not read back an output it has written.")
+        If spvTypeStorage[b] = #SpvStorageClassUniformConstant And b = spvSampleVar
+          If a <> spvValueType[b] Or spvTypeClass[a] <> #ANVIL_SPV_T_SAMPLED_IMAGE
+            ProcedureReturn avkSpvMalformed("a SPIR-V OpLoad of the combined sampled image names a result type different from its variable's pointee type (Anvil code -20001, malformed module); the loaded object must retain the OpTypeSampledImage type.")
+          EndIf
+          spvValueSrc[id] = #ANVIL_SPV_V_SAMPLED
+          spvValueA[id] = b
+          ProcedureReturn #ANVIL_VK_OK
+        EndIf
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused an OpLoad of a variable that is neither an Input nor the bounded UniformConstant combined sampler (Anvil code -20005, unsupported load); outputs cannot be read back and block members are loaded through an access chain.")
       EndIf
       If spvValueSrc[b] = #ANVIL_SPV_V_CHAIN
         If spvValueA[b] = spvPushVar And spvPushVar <> 0
@@ -1027,6 +1104,33 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
         k = k + 1
       Wend
       spvValueB[id] = n
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpImageSampleImplicitLod
+      a = avkSpvWord(*words, at + 1)
+      id = avkSpvWord(*words, at + 2)
+      b = avkSpvWord(*words, at + 3)
+      k = avkSpvWord(*words, at + 4)
+      If count <> 5
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpImageSampleImplicitLod with image operands (Anvil code -20005, unsupported sampling operands); this tranche samples implicit level zero with the descriptor's fixed sampler state and no bias, offset, projection or sparse result.")
+      EndIf
+      If avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0 Or avkSpvIdOk(b) = 0 Or avkSpvIdOk(k) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpImageSampleImplicitLod named an id outside the module's own bound (Anvil code -20001, malformed module); its result type, result, sampled image and coordinate must all be declared ids.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) <> 4
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpImageSampleImplicitLod whose result is not a four-component binary32 vector (Anvil code -20005, unsupported sample result); the BGRA8 image produces normalized RGBA.")
+      EndIf
+      If spvValueSrc[b] <> #ANVIL_SPV_V_SAMPLED Or spvValueA[b] <> spvSampleVar
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpImageSampleImplicitLod whose sampled-image operand is not a load of the declared combined sampler (Anvil code -20005, unsupported sampled value); separate image/sampler composition is not implemented.")
+      EndIf
+      If spvValueSrc[k] <> #ANVIL_SPV_V_INPUT Or avkSpvIsFloatish(spvValueType[k]) = 0 Or avkSpvComponents(spvValueType[k]) <> 2
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused OpImageSampleImplicitLod whose coordinate is not a whole load of one vec2 input (Anvil code -20005, unsupported texture coordinate); computed, projected and non-two-dimensional coordinates need arithmetic this tranche does not lower.")
+      EndIf
+      spvKind[id] = #ANVIL_SPV_K_VALUE
+      spvValueType[id] = a
+      spvValueSrc[id] = #ANVIL_SPV_V_IMAGE_SAMPLE
+      spvValueA[id] = b
+      spvValueB[id] = k
       ProcedureReturn #ANVIL_VK_OK
 
     Case #SpvOpStore
@@ -1348,7 +1452,25 @@ Procedure.i avkSpvBuildFragmentPlan()
     Wend
     ProcedureReturn #ANVIL_VK_OK
   EndIf
-  ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a fragment shader whose colour is not an interpolated input, a push-constant member, a uniform-block member or a constant (Anvil code -20005, unsupported fragment shader); this slice moves a colour into the tile buffer, it does not compute one.")
+  If src = #ANVIL_SPV_V_IMAGE_SAMPLE
+    k = avkSpvAttrOfValue(spvValueB[v])
+    If k < 0 Or spvPlanAttrComp[k] <> 2
+      ProcedureReturn avkSpvRefuse(#SpvOpImageSampleImplicitLod, "the SPIR-V front end refused a texture sample whose coordinate is not one declared vec2 fragment input (Anvil code -20005, unsupported texture coordinate); location input and sample operand must name the same whole loaded value.")
+    EndIf
+    If spvDecSet[spvSampleVar] <> 0
+      ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a sampled image at a DescriptorSet other than zero (Anvil code -20005, unsupported descriptor set); one set is bound in this tranche and its index is zero.")
+    EndIf
+    If spvDecBinding[spvSampleVar] < 0 Or spvDecBinding[spvSampleVar] >= #ANVIL_VK_MAX_SET_BINDINGS
+      ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a sampled image at a Binding this descriptor set cannot hold (Anvil code -20005, unsupported binding number); the binding must fit the bounded set layout.")
+    EndIf
+    spvPlanColourSrc = #ANVIL_SPV_COLOUR_SAMPLED
+    spvPlanColourIdx = k
+    spvPlanSampleCoord = k
+    spvSampleSet = spvDecSet[spvSampleVar]
+    spvSampleBinding = spvDecBinding[spvSampleVar]
+    ProcedureReturn #ANVIL_VK_OK
+  EndIf
+  ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a fragment shader whose colour is not an interpolated input, a push-constant member, a uniform-block member, a combined-image sample or a constant (Anvil code -20005, unsupported fragment shader); every other computation remains outside this bounded lowering.")
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1412,8 +1534,8 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
   id = 1
   While id < spvBound
     If spvDecSet[id] >= 0 Or spvDecBinding[id] >= 0
-      If id <> spvUniformVar Or spvUniformVar = 0
-        ProcedureReturn avkSpvRefuse(#SpvOpDecorate, "the SPIR-V front end refused a DescriptorSet or Binding decoration on something that is not a Uniform-storage block variable (Anvil code -20005, misplaced decoration); those two decorations say which descriptor supplies a uniform buffer, and on an Input, an Output, a push-constant block or a type they name a binding nothing can ever be bound to.")
+      If (id <> spvUniformVar Or spvUniformVar = 0) And (id <> spvSampleVar Or spvSampleVar = 0)
+        ProcedureReturn avkSpvRefuse(#SpvOpDecorate, "the SPIR-V front end refused a DescriptorSet or Binding decoration on something that is neither a Uniform block nor a UniformConstant combined sampler (Anvil code -20005, misplaced decoration); interface variables, push constants and types cannot name descriptor bindings.")
       EndIf
     EndIf
     id = id + 1
@@ -1463,6 +1585,9 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
     If spvUniformVar <> 0
       ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a Uniform-storage block in a vertex shader (Anvil code -20005, unsupported descriptor stage); the descriptor path in this slice supplies the FRAGMENT colour, and the emitted vertex programs' uniform stream carries the viewport transform and nothing else.")
     EndIf
+    If spvSampleVar <> 0
+      ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a UniformConstant sampled image in a vertex shader (Anvil code -20005, unsupported descriptor stage); this first texture lowering belongs to the fragment stage and has no vertex texture path.")
+    EndIf
     ProcedureReturn avkSpvBuildVertexPlan()
   EndIf
   If spvOriginUpperLeft = 0
@@ -1476,6 +1601,9 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
   ; descriptor set to be created, bound and written for nothing.
   If spvUniformVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_UNIFORM
     ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a fragment shader that declares a Uniform-storage block and never reads it (Anvil code -20005, unused descriptor); a declared binding has to be supplied by a descriptor set at draw time, so one nothing reads is work the caller is made to do for no picture.")
+  EndIf
+  If spvSampleVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_SAMPLED
+    ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a fragment shader that declares a combined sampled image and never samples it (Anvil code -20005, unused descriptor); a declared binding has to be supplied for every draw, so one nothing reads is work with no picture.")
   EndIf
   ProcedureReturn #ANVIL_VK_OK
 EndProcedure
@@ -1557,6 +1685,23 @@ EndProcedure
 Procedure.i AnvilVkSpirvUsesUniformBlock()
   If spvUniformVar <> 0 : ProcedureReturn 1 : EndIf
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i AnvilVkSpirvUsesSampledImage()
+  If spvSampleVar <> 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i AnvilVkSpirvSampleSet()
+  ProcedureReturn spvSampleSet
+EndProcedure
+
+Procedure.i AnvilVkSpirvSampleBinding()
+  ProcedureReturn spvSampleBinding
+EndProcedure
+
+Procedure.i AnvilVkSpirvSampleCoordInput()
+  ProcedureReturn spvPlanSampleCoord
 EndProcedure
 
 ; The descriptor set and binding the accepted uniform block named, or -1

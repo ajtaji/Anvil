@@ -127,7 +127,9 @@ Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pForm
   *pFormatProperties\optimalTilingFeatures = 0
   *pFormatProperties\bufferFeatures = 0
   If format = #VK_FORMAT_B8G8R8A8_UNORM
-    *pFormatProperties\linearTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+    If avkBackendSampledMaxDimension2D() > 0
+      *pFormatProperties\linearTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+    EndIf
     If AnvilVkBackendCanDraw() <> 0
       *pFormatProperties\linearTilingFeatures = *pFormatProperties\linearTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
     EndIf
@@ -158,7 +160,10 @@ Procedure.i vkGetPhysicalDeviceImageFormatProperties(physicalDevice.i, format.i,
   rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)
   If rc <> #VK_SUCCESS : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   limit = avkBackendMaxImageDimension2D()
-  bytes = AnvilVkImageMaxResourceSize()
+  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0 And avkBackendSampledMaxDimension2D() < limit
+    limit = avkBackendSampledMaxDimension2D()
+  EndIf
+  bytes = avkBackendRowPitchFor(limit) * limit
   If limit < 1 Or bytes < 1 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   *pImageFormatProperties\maxExtent\width = limit
   *pImageFormatProperties\maxExtent\height = limit

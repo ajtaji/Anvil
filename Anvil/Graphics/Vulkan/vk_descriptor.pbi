@@ -690,6 +690,28 @@ Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBacke
   ProcedureReturn 1
 EndProcedure
 
+; The live VkImage behind a sampled descriptor, for submission retention.
+; The closed record above owns all backend-visible properties; this handle is
+; used only by the portable lifetime counters and is never handed to a backend.
+Procedure.i AnvilVkDescriptorSetSampledImageHandle(set.i, binding.i)
+  Define s.i
+  Define lay.i
+  Define idx.i
+  Define view.i
+  Define image.i
+  s = avkDsSlot(set)
+  If s = 0 Or binding < 0 Or binding >= #ANVIL_VK_MAX_SET_BINDINGS : ProcedureReturn 0 : EndIf
+  lay = avkDsLayout[s]
+  If binding >= avkDslCount[lay] : ProcedureReturn 0 : EndIf
+  If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : ProcedureReturn 0 : EndIf
+  idx = (s * #ANVIL_VK_MAX_SET_BINDINGS) + binding
+  view = avkDsView[idx]
+  If avkDescImageViewDevice(view) <> avkDsDev[s] : ProcedureReturn 0 : EndIf
+  image = avkDescImageViewImage(view)
+  If avkImgSlot(image) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn image
+EndProcedure
+
 ; The set layout a live set was allocated from, as a SLOT, so the
 ; pipeline layer can compare it against the one its pipeline layout
 ; declares without either of them holding a handle the other could
@@ -709,6 +731,14 @@ Procedure.i AnvilVkSetLayoutHasUniform(lay.i, binding.i)
   If lay < 1 Or lay > #ANVIL_VK_MAX_SET_LAYOUTS Or avkDslLive[lay] = 0 : ProcedureReturn 0 : EndIf
   If binding < 0 Or binding >= avkDslCount[lay] : ProcedureReturn 0 : EndIf
   If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : ProcedureReturn 0 : EndIf
+  If (avkDslStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] & #VK_SHADER_STAGE_FRAGMENT_BIT) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i AnvilVkSetLayoutHasSampledImage(lay.i, binding.i)
+  If lay < 1 Or lay > #ANVIL_VK_MAX_SET_LAYOUTS Or avkDslLive[lay] = 0 : ProcedureReturn 0 : EndIf
+  If binding < 0 Or binding >= avkDslCount[lay] : ProcedureReturn 0 : EndIf
+  If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : ProcedureReturn 0 : EndIf
   If (avkDslStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] & #VK_SHADER_STAGE_FRAGMENT_BIT) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure

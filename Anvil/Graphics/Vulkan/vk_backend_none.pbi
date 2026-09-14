@@ -72,6 +72,10 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn 0
 EndProcedure
 
+Procedure.i avkBackendSampledMaxDimension2D()
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
 EndProcedure

@@ -99,6 +99,10 @@ Global Dim avkShPush.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShUniform.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShUniformSet.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShUniformBinding.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShSample.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShSampleSet.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShSampleBinding.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShSampleCoord.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShInComp.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_ATTRS]
 Global Dim avkShOutComp.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_VARYINGS]
 Global Dim avkShOutSrc.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_VARYINGS]
@@ -160,6 +164,8 @@ Global Dim avkPipeVaryCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeColourSrc.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeColourIdx.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeUniformBinding.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeSampleBinding.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeSampleCoord.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewX.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewY.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeViewW.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -188,6 +194,7 @@ Global Dim avkPushStage.l[4]
 ; address and must be able to read it after the caller's own storage is
 ; gone. Two integers per binding, which is one AnvilVkBackendBinding.
 Global Dim avkBindStage.i[#ANVIL_VK_MAX_BINDINGS * 2]
+Global avkSampleStage.AnvilVkBackendSampledImage
 
 Global avkDrawRecord.AnvilVkBackendDraw
 
@@ -536,6 +543,10 @@ Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
   avkShUniform[s] = AnvilVkSpirvUsesUniformBlock()
   avkShUniformSet[s] = AnvilVkSpirvUniformSet()
   avkShUniformBinding[s] = AnvilVkSpirvUniformBinding()
+  avkShSample[s] = AnvilVkSpirvUsesSampledImage()
+  avkShSampleSet[s] = AnvilVkSpirvSampleSet()
+  avkShSampleBinding[s] = AnvilVkSpirvSampleBinding()
+  avkShSampleCoord[s] = AnvilVkSpirvSampleCoordInput()
   base = s * #ANVIL_SPV_MAX_ATTRS
   k = 0
   While k < #ANVIL_SPV_MAX_ATTRS
@@ -1265,8 +1276,19 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose uniform block names a binding its pipeline layout's descriptor set layout does not declare as a fragment-stage uniform buffer (Anvil code -20001, layout mismatch); the Binding decoration in the SPIR-V and the binding number in VkDescriptorSetLayoutBinding are the same number and they must agree.")
     EndIf
   EndIf
-  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkLaySetCount[lay] <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a pipeline layout that declares a descriptor set layout for a fragment shader that reads no uniform block (Anvil code -20001, layout mismatch); a declared set has to be allocated, written and bound before every draw, so one nothing reads is work with no picture at the end of it.")
+  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_SAMPLED
+    If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that samples an image through a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); create a VkDescriptorSetLayout with a VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER binding at the fragment stage and name it in VkPipelineLayoutCreateInfo.")
+    EndIf
+    If avkShSampleSet[fs] <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose sampled image is at a descriptor set other than zero (Anvil code -20001, layout mismatch); one set is bound here and its index is zero.")
+    EndIf
+    If AnvilVkSetLayoutHasSampledImage(avkLaySetLayout[lay], avkShSampleBinding[fs]) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose sampled image names a binding its pipeline layout does not declare as a fragment-stage combined image sampler (Anvil code -20001, layout mismatch); the Binding decoration in SPIR-V and the descriptor-set-layout binding must agree.")
+    EndIf
+  EndIf
+  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_SAMPLED And avkLaySetCount[lay] <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a pipeline layout that declares a descriptor set layout for a fragment shader that reads no descriptor (Anvil code -20001, layout mismatch); a declared set has to be allocated, written and bound before every draw, so one nothing reads is work with no picture at the end of it.")
   EndIf
 
   s = 1
@@ -1284,6 +1306,8 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   avkPipeColourSrc[s] = avkShColourSrc[fs]
   avkPipeColourIdx[s] = avkShColourIdx[fs]
   avkPipeUniformBinding[s] = avkShUniformBinding[fs]
+  avkPipeSampleBinding[s] = avkShSampleBinding[fs]
+  avkPipeSampleCoord[s] = avkShSampleCoord[fs]
   avkPipeSampleMask[s] = sampleMask
   base = s * #ANVIL_SPV_MAX_VARYINGS
   k = 0
@@ -1444,6 +1468,16 @@ EndProcedure
 Procedure.i AnvilVkPipelineColourSource(pipe.i)
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
   ProcedureReturn avkPipeColourSrc[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineSampleBinding(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkPipeSampleBinding[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineSampleCoord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkPipeSampleCoord[pipe]
 EndProcedure
 
 Procedure.i AnvilVkPipelineColourConstant(pipe.i, k.i)
@@ -1836,6 +1870,20 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
       ProcedureReturn
     EndIf
   EndIf
+  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_SAMPLED
+    If avkCbDescSet[c] = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader samples an image, and no descriptor set was bound (Anvil code -20004, no descriptor set bound); bind the set that owns the combined image sampler before the draw.")
+      ProcedureReturn
+    EndIf
+    If avkLaySlot(avkCbDescLayout[c]) <> avkPipeLayout[p]
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a sampled-image descriptor set through a different pipeline layout from the one its pipeline was created with (Anvil code -20001, incompatible layout); bind set zero through the pipeline's own layout.")
+      ProcedureReturn
+    EndIf
+    If AnvilVkDescriptorSetSampledImage(avkCbDescSet[c], avkPipeSampleBinding[p], @avkSampleStage) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a combined image sampler that is unwritten, stale, unbound or no longer in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL (Anvil code -20004, sampled descriptor not ready); update the binding and transition the live sampled image before drawing.")
+      ProcedureReturn
+    EndIf
+  EndIf
   avkCbDrawVerts[c] = vertexCount
   avkCbDrawFirst[c] = firstVertex
   avkCbDrawCount[c] = 1
@@ -1875,6 +1923,14 @@ Procedure.i avkDrawUniformBuffer(c.i, p.i)
   ProcedureReturn AnvilVkDescriptorSetBuffer(avkCbDescSet[c], avkPipeUniformBinding[p])
 EndProcedure
 
+; The VkImage this draw's combined sampler names, or 0. As with the uniform
+; helper, retain and release share this one owner lookup so they cannot drift.
+Procedure.i avkDrawSampleImage(c.i, p.i)
+  If avkPipeColourSrc[p] <> #ANVIL_SPV_COLOUR_SAMPLED : ProcedureReturn 0 : EndIf
+  If avkCbDescSet[c] = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn AnvilVkDescriptorSetSampledImageHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
+EndProcedure
+
 ; EVERY buffer the draw reads is retained, not just the first. A colour
 ; buffer destroyed while the submission is in flight is exactly as fatal
 ; as a position buffer destroyed then, and the count that stops that is
@@ -1883,6 +1939,8 @@ Procedure avkDrawRetain(c.i)
   Define b.i
   Define p.i
   Define k.i
+  Define image.i
+  Define img.i
   If avkCbDrawCount[c] = 0
     ProcedureReturn
   EndIf
@@ -1908,12 +1966,20 @@ Procedure avkDrawRetain(c.i)
     avkBufInFlight[b] = avkBufInFlight[b] + 1
     avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
   EndIf
+  image = avkDrawSampleImage(c, p)
+  img = avkImgSlot(image)
+  If img <> 0
+    avkImgInFlight[img] = avkImgInFlight[img] + 1
+    avkMemInFlight[avkImgMemSlot[img]] = avkMemInFlight[avkImgMemSlot[img]] + 1
+  EndIf
 EndProcedure
 
 Procedure avkDrawRelease(c.i)
   Define b.i
   Define p.i
   Define k.i
+  Define image.i
+  Define img.i
   If avkCbDrawCount[c] = 0
     ProcedureReturn
   EndIf
@@ -1937,6 +2003,14 @@ Procedure avkDrawRelease(c.i)
     If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
     If avkMemInFlight[avkBufMemSlot[b]] > 0
       avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1
+    EndIf
+  EndIf
+  image = avkDrawSampleImage(c, p)
+  img = avkImgSlot(image)
+  If img <> 0
+    If avkImgInFlight[img] > 0 : avkImgInFlight[img] = avkImgInFlight[img] - 1 : EndIf
+    If avkMemInFlight[avkImgMemSlot[img]] > 0
+      avkMemInFlight[avkImgMemSlot[img]] = avkMemInFlight[avkImgMemSlot[img]] - 1
     EndIf
   EndIf
 EndProcedure
@@ -2028,6 +2102,14 @@ Procedure.i avkDrawSubmit(c.i)
   If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM And avkDrawRecord\uniformBase = 0
     avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose descriptor set, or the buffer written into it, has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
     ProcedureReturn -1
+  EndIf
+  avkDrawRecord\sampledImage = 0
+  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_SAMPLED
+    If avkCbDescSet[c] = 0 Or AnvilVkDescriptorSetSampledImage(avkCbDescSet[c], avkPipeSampleBinding[p], @avkSampleStage) = 0
+      avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose combined image sampler, image view, sampler or sampled image is no longer live and ready (Anvil code -20004, stale sampled descriptor); re-record the command buffer against live objects in shader-read layout.")
+      ProcedureReturn -1
+    EndIf
+    avkDrawRecord\sampledImage = @avkSampleStage
   EndIf
 
   rc = avkBackendDrawSupported(avkDrawRecord\targetBase, avkDrawRecord\targetBytes, avkDrawRecord\width, avkDrawRecord\height, avkDrawRecord\pitch)

@@ -65,12 +65,14 @@ OP = {
     "MemoryModel": 14, "EntryPoint": 15, "ExecutionMode": 16, "Capability": 17,
     "TypeVoid": 19, "TypeBool": 20, "TypeInt": 21, "TypeFloat": 22,
     "TypeVector": 23, "TypeMatrix": 24, "TypeImage": 25, "TypeSampler": 26,
+    "TypeSampledImage": 27,
     "TypeArray": 28, "TypeStruct": 30, "TypePointer": 32, "TypeFunction": 33,
     "Constant": 43, "ConstantComposite": 44,
     "Function": 54, "FunctionEnd": 56, "Variable": 59,
     "Load": 61, "Store": 62, "AccessChain": 65,
     "Decorate": 71, "MemberDecorate": 72,
     "VectorShuffle": 79, "CompositeConstruct": 80, "CompositeExtract": 81,
+    "SampledImage": 86, "ImageSampleImplicitLod": 87,
     "FMul": 133, "MatrixTimesVector": 145,
     "SelectionMerge": 247, "Label": 248, "Branch": 249,
     "BranchConditional": 250, "Return": 253, "FunctionEnd_": 56,
@@ -344,6 +346,60 @@ def fragment_uniform(set_: int = 0, binding: int = 0, block: bool = True,
     return module(bound, body)
 
 
+def fragment_sampled(set_: int = 0, binding: int = 0, dim: int = 1,
+                     coord_components: int = 2, decorate: bool = True,
+                     sample: bool = True, image_operands: bool = False) -> bytes:
+    """One combined sampler2D sampled with a whole Location-zero vec2."""
+    head = [
+        ins(OP["Capability"], CAP_SHADER),
+        ins(OP["MemoryModel"], ADDR_LOGICAL, MEM_GLSL450),
+        ins(OP["EntryPoint"], EM_FRAGMENT, 14, *lit("main"), 12, 13),
+        ins(OP["ExecutionMode"], 14, MODE_ORIGIN_UPPER_LEFT),
+    ]
+    if decorate:
+        head += [
+            ins(OP["Decorate"], 11, DEC_DESCRIPTOR_SET, set_),
+            ins(OP["Decorate"], 11, DEC_BINDING, binding),
+        ]
+    head += [
+        ins(OP["Decorate"], 12, DEC_LOCATION, 0),
+        ins(OP["Decorate"], 13, DEC_LOCATION, 0),
+        ins(OP["TypeVoid"], 1),
+        ins(OP["TypeFunction"], 2, 1),
+        ins(OP["TypeFloat"], 3, 32),
+        ins(OP["TypeVector"], 4, 3, coord_components),
+        ins(OP["TypeVector"], 5, 3, 4),
+        ins(OP["TypeImage"], 6, 3, dim, 0, 0, 0, 1, 0),
+        ins(OP["TypeSampledImage"], 7, 6),
+        ins(OP["TypePointer"], 8, SC_UNIFORM_CONSTANT, 7),
+        ins(OP["TypePointer"], 9, SC_INPUT, 4),
+        ins(OP["TypePointer"], 10, SC_OUTPUT, 5),
+        ins(OP["Variable"], 8, 11, SC_UNIFORM_CONSTANT),
+        ins(OP["Variable"], 9, 12, SC_INPUT),
+        ins(OP["Variable"], 10, 13, SC_OUTPUT),
+        ins(OP["Function"], 1, 14, 0, 2),
+        ins(OP["Label"], 15),
+        ins(OP["Load"], 7, 16, 11),
+        ins(OP["Load"], 4, 17, 12),
+    ]
+    if sample:
+        operands = [5, 18, 16, 17]
+        if image_operands:
+            operands.append(0)
+        head += [
+            ins(OP["ImageSampleImplicitLod"], *operands),
+            ins(OP["Store"], 13, 18),
+        ]
+    else:
+        head += [
+            ins(OP["Constant"], 3, 19, FHALF),
+            ins(OP["ConstantComposite"], 5, 20, 19, 19, 19, 19),
+            ins(OP["Store"], 13, 20),
+        ]
+    head += [ins(OP["Return"]), ins(OP["FunctionEnd"])]
+    return module(21 if not sample else 19, head)
+
+
 def vertex_uniform() -> bytes:
     """A uniform block in a VERTEX shader, which has no uniform path."""
     b = [
@@ -569,12 +625,6 @@ def build_fixtures() -> list[dict]:
         ins(OP["Load"], 4, 11, 7),
         ins(OP["Branch"], 10))
 
-    # A sampled texture.
-    image = _replace_instruction(
-        fragment_varying(),
-        ins(OP["TypeFloat"], 3, 32),
-        ins(OP["TypeImage"], 3, 3, 1, 0, 0, 0, 1, 0))
-
     # A descriptor-bound uniform.
     descriptor = _replace_instruction(
         fragment_push(),
@@ -612,6 +662,11 @@ def build_fixtures() -> list[dict]:
              rc=OK, stage=4, inputs=0, outputs=1, pos=-1, colour=3,
              comps=(0, 0), outcomp=4, outsrc=-1, push=0,
              uniform=1, uset=0, ubinding=1),
+        dict(name="a fragment shader that samples one combined image sampler",
+             blob=fragment_sampled(),
+             rc=OK, stage=4, inputs=1, outputs=1, pos=-1, colour=4,
+             comps=(2, 0), outcomp=4, outsrc=-1, push=0,
+             sampled=1, sset=0, sbinding=0, scoord=0),
 
         dict(name="a module whose magic number is not SPIR-V",
              blob=_mutate_words(good_vertex, 0, 0xDEADBEEF),
@@ -644,9 +699,24 @@ def build_fixtures() -> list[dict]:
         dict(name="a fragment shader with a branch",
              blob=branch, rc=ERR_UNSUPPORTED, opcode=OP["Branch"],
              text="OpBranch"),
-        dict(name="a fragment shader that declares an image type",
-             blob=image, rc=ERR_UNSUPPORTED, opcode=OP["TypeImage"],
-             text="OpTypeImage"),
+        dict(name="a fragment shader that declares a non-2D sampled image",
+             blob=fragment_sampled(dim=3), rc=ERR_UNSUPPORTED,
+             opcode=OP["TypeImage"], text="non-depth, non-arrayed"),
+        dict(name="a sampled image without DescriptorSet and Binding",
+             blob=fragment_sampled(decorate=False), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="both DescriptorSet and Binding"),
+        dict(name="a sampled image at descriptor set one",
+             blob=fragment_sampled(set_=1), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="DescriptorSet other than zero"),
+        dict(name="a sample whose coordinate is not vec2",
+             blob=fragment_sampled(coord_components=4), rc=ERR_UNSUPPORTED,
+             opcode=OP["ImageSampleImplicitLod"], text="coordinate"),
+        dict(name="an implicit sample carrying image operands",
+             blob=fragment_sampled(image_operands=True), rc=ERR_UNSUPPORTED,
+             opcode=OP["ImageSampleImplicitLod"], text="image operands"),
+        dict(name="a combined sampler declared but never sampled",
+             blob=fragment_sampled(sample=False), rc=ERR_UNSUPPORTED,
+             opcode=OP["Variable"], text="never samples it"),
         dict(name="a descriptor-set decoration on an output variable",
              blob=descriptor, rc=ERR_UNSUPPORTED, opcode=OP["Decorate"],
              text="DescriptorSet"),
@@ -874,9 +944,25 @@ MUTANTS = (
     ("the StorageBuffer storage class is accepted",
      "      If b = #SpvStorageClassStorageBuffer\n",
      "      If b = -1\n"),
-    ("the UniformConstant storage class is accepted",
-     "      If b = #SpvStorageClassUniformConstant\n",
-     "      If b = -2\n"),
+    # --- the bounded combined sampler ---
+    ("a non-2D image type is accepted",
+     "      If avkSpvWord(*words, at + 3) <> #SpvDim2D Or avkSpvWord(*words, at + 4) <> 0 Or avkSpvWord(*words, at + 5) <> 0 Or avkSpvWord(*words, at + 6) <> 0\n",
+     "      If avkSpvWord(*words, at + 3) < 0 Or avkSpvWord(*words, at + 4) <> 0 Or avkSpvWord(*words, at + 5) <> 0 Or avkSpvWord(*words, at + 6) <> 0\n"),
+    ("a UniformConstant variable need not be a combined sampled image",
+     "        If spvTypeClass[spvValueType[id]] <> #ANVIL_SPV_T_SAMPLED_IMAGE\n",
+     "        If spvTypeClass[spvValueType[id]] < 0\n"),
+    ("an image sample may name an unrelated sampled value",
+     "      If spvValueSrc[b] <> #ANVIL_SPV_V_SAMPLED Or spvValueA[b] <> spvSampleVar\n",
+     "      If spvValueSrc[b] < 0 Or spvValueA[b] <> spvSampleVar\n"),
+    ("a sample coordinate need not be a whole vec2 input",
+     "      If spvValueSrc[k] <> #ANVIL_SPV_V_INPUT Or avkSpvIsFloatish(spvValueType[k]) = 0 Or avkSpvComponents(spvValueType[k]) <> 2\n",
+     "      If spvValueSrc[k] <> #ANVIL_SPV_V_INPUT Or avkSpvIsFloatish(spvValueType[k]) = 0 Or avkSpvComponents(spvValueType[k]) < 0\n"),
+    ("a sampled image may sit at any descriptor set",
+     "    If spvDecSet[spvSampleVar] <> 0\n",
+     "    If spvDecSet[spvSampleVar] < 0\n"),
+    ("a declared combined sampler may go unused",
+     "  If spvSampleVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_SAMPLED\n",
+     "  If spvSampleVar < 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_SAMPLED\n"),
 )
 
 
@@ -1059,6 +1145,14 @@ def grade(cpu, rc, fixtures) -> Grader:
                    spec.get("uset", -1))
             g.need(f"[{i}] {name} - uniform binding", s64(cpu, base + 144),
                    spec.get("ubinding", -1))
+            g.need(f"[{i}] {name} - sampled image used", s64(cpu, base + 152),
+                   spec.get("sampled", 0))
+            g.need(f"[{i}] {name} - sampled descriptor set", s64(cpu, base + 160),
+                   spec.get("sset", -1))
+            g.need(f"[{i}] {name} - sampled binding", s64(cpu, base + 168),
+                   spec.get("sbinding", -1))
+            g.need(f"[{i}] {name} - sample coordinate input", s64(cpu, base + 176),
+                   spec.get("scoord", -1))
             if "const" in spec:
                 g.need(f"[{i}] {name} - constant colour", u64(cpu, base + 112) & 0xFFFFFFFF,
                        spec["const"])

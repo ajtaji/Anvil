@@ -203,6 +203,10 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   ; colour does not come from a descriptor.
   uniformBase.i
   uniformBytes.i
+  ; One sampled image, resolved from the bound descriptor at submit time.
+  ; The pointer names staging owned by the portable pipeline layer and remains
+  ; valid until the submission completes. Zero when the shader has no texture.
+  sampledImage.i
 EndStructure
 
 ; ----------------------------------------------------------------------
@@ -222,6 +226,9 @@ Declare.i avkBackendHeapFlagsOf(index.i)
 Declare.i avkBackendImageAlignment()
 Declare.i avkBackendRowPitchFor(width.i)
 Declare.i avkBackendMaxImageDimension2D()
+; Largest dimension this backend can truthfully consume through an actual
+; sampled-image instruction. Zero means no sampling path is implemented.
+Declare.i avkBackendSampledMaxDimension2D()
 Declare.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
 Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
 Declare.i avkBackendPoll()

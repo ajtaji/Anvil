@@ -320,6 +320,9 @@ Procedure.i AnvilVkImageFormatSupport(format.i, imageType.i, tiling.i, usage.i, 
   If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
+  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0 And avkBackendSampledMaxDimension2D() < 1
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
@@ -464,6 +467,12 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
   If width < 1 Or height < 1 Or width > avkBackendMaxImageDimension2D() Or height > avkBackendMaxImageDimension2D()
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an extent outside this device's limits (Anvil code -20001, invalid argument); width and height must be at least one and no more than maxImageDimension2D, which vkGetPhysicalDeviceProperties reports.")
     ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0
+    If width > avkBackendSampledMaxDimension2D() Or height > avkBackendSampledMaxDimension2D()
+      avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given a sampled-image extent outside this backend's sampled-image limit (Anvil code -20001, sampled extent too large); query this exact usage with vkGetPhysicalDeviceImageFormatProperties. The Pi 4 V3D path currently samples one texel directly; larger linear images need an optimal-tiled representation and an explicit transfer that are not implemented yet.")
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
   EndIf
   If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0
     avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImage was asked for an image usage Anvil does not implement (Anvil code -20005, unsupported usage); use VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_USAGE_SAMPLED_BIT or VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT. Storage-image and input-attachment usages are not implemented.")

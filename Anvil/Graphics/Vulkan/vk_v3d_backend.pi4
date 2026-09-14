@@ -184,6 +184,15 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn n
 EndProcedure
 
+; This first real texture tranche accepts one texel only. For a one-texel
+; image the sole BGRA word at the linear image's base is also the sole useful
+; texel of V3D's LINEARTILE level; every coordinate clamps to it. Wider images
+; require an optimal-tiled representation and a transfer operation and remain
+; outside the advertised/queryable limit rather than being misread as tiled.
+Procedure.i avkBackendSampledMaxDimension2D()
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   If Neon_Ready() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
   If base <= 0 Or bytes <= 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
@@ -367,6 +376,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Define b.i
   Define colourBase.i
   Define *bind.AnvilVkBackendBinding
+  Define *sampled.AnvilVkBackendSampledImage
 
   avkV3dNative = 0
   If *d = 0
@@ -444,7 +454,33 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       ProcedureReturn -1
     EndIf
   EndIf
-  AnvilVkV3dFragmentUniforms(pipe, pbase, colourBase, AnvilVkPipelineColourSource(pipe))
+  *sampled = 0
+  If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_SAMPLED
+    *sampled = *d\sampledImage
+    If *sampled = 0
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a sampled pipeline without its closed sampled-image record (Anvil code -20001, missing sampled image); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If *sampled\width <> 1 Or *sampled\height <> 1 Or *sampled\pitch <> 4 Or *sampled\bytes < 4
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled image outside its one-texel linear-image contract (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Larger linear images are not V3D texture layout and need an optimal-tiled image plus an explicit transfer.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+    If *sampled\format <> #VK_FORMAT_B8G8R8A8_UNORM Or *sampled\layout <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a sampled image with the wrong format or layout (Anvil code -20001, invalid sampled state); nothing was submitted. This path accepts one B8G8R8A8_UNORM texel in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.")
+      ProcedureReturn -1
+    EndIf
+    If (*sampled\magFilter <> #VK_FILTER_NEAREST And *sampled\magFilter <> #VK_FILTER_LINEAR) Or (*sampled\minFilter <> #VK_FILTER_NEAREST And *sampled\minFilter <> #VK_FILTER_LINEAR)
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed sampled filter state outside nearest or linear (Anvil code -20001, invalid sampler state); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If avkV3dWindowBytes < 4 Or *sampled\base < avkV3dWindowBase Or (*sampled\base - avkV3dWindowBase) > (avkV3dWindowBytes - 4)
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled texel outside the offscreen window mapped by the V3D page table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. An unmapped texture request is an MMU fault, not a wrong pixel.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  AnvilVkV3dFragmentUniforms(pipe, pbase, colourBase, AnvilVkPipelineColourSource(pipe), *sampled)
   rc = AnvilVkV3dBuildRecord(pipe, pbase, *d, lastVertex - 1, varyComps)
   If rc <> #V3D_OK
     avkV3dNative = rc
@@ -481,6 +517,11 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     ; the sixteen bytes visible before the TMU is allowed to fetch them.
     If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_UNIFORM
       V3dCacheRange(colourBase, 16)
+    EndIf
+    ; The QPU's texture request reads the application's mapped texel directly.
+    ; Clean that exact range before the control list can launch the request.
+    If *sampled <> 0
+      V3dCacheRange(*sampled\base, 4)
     EndIf
     ; One cache maintenance per binding: the processor wrote each of
     ; these buffers and the vertex fetcher reads all of them.

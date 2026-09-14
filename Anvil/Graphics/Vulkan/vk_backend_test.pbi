@@ -183,6 +183,13 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn avkTbMaxDim
 EndProcedure
 
+; The state backend models the portable contract over its full declared
+; extent. It never claims a pixel; the V3D emitter gate is the execution-side
+; oracle for a real texture request.
+Procedure.i avkBackendSampledMaxDimension2D()
+  ProcedureReturn avkTbMaxDim
+EndProcedure
+
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   If base <= 0 Or bytes <= 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   If pitch < (w * 4) Or (pitch * h) > bytes : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
@@ -257,6 +264,9 @@ Global avkTbLastSampleMask.i = 0
 Global avkTbLastPushBase.i = 0
 Global avkTbLastUniformBase.i = 0
 Global avkTbLastUniformBytes.i = 0
+Global avkTbLastSampledBase.i = 0
+Global avkTbLastSampledWidth.i = 0
+Global avkTbLastSampledHeight.i = 0
 Global avkTbLastDrawColour.i = 0
 Global Dim avkTbPipeBase.i[8]
 
@@ -313,6 +323,18 @@ Procedure.i AnvilVkTestBackendLastUniformBytes()
   ProcedureReturn avkTbLastUniformBytes
 EndProcedure
 
+Procedure.i AnvilVkTestBackendLastSampledBase()
+  ProcedureReturn avkTbLastSampledBase
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastSampledWidth()
+  ProcedureReturn avkTbLastSampledWidth
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastSampledHeight()
+  ProcedureReturn avkTbLastSampledHeight
+EndProcedure
+
 Procedure.i AnvilVkTestBackendLastDrawColor()
   ProcedureReturn avkTbLastDrawColour
 EndProcedure
@@ -350,6 +372,7 @@ EndProcedure
 Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Define tbk.i
   Define *tbb.AnvilVkBackendBinding
+  Define *tbs.AnvilVkBackendSampledImage
   If *d = 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbDraws = avkTbDraws + 1
@@ -377,6 +400,15 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   avkTbLastPushBase = *d\pushBase
   avkTbLastUniformBase = *d\uniformBase
   avkTbLastUniformBytes = *d\uniformBytes
+  avkTbLastSampledBase = 0
+  avkTbLastSampledWidth = 0
+  avkTbLastSampledHeight = 0
+  If *d\sampledImage <> 0
+    *tbs = *d\sampledImage
+    avkTbLastSampledBase = *tbs\base
+    avkTbLastSampledWidth = *tbs\width
+    avkTbLastSampledHeight = *tbs\height
+  EndIf
   avkTbTicks = avkTbTicks + 1
   If avkTbDrawFail <> 0
     avkTbNative = -777

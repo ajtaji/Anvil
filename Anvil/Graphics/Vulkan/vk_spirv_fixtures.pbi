@@ -3,12 +3,12 @@
 ; ======================================================================
 ; SPDX-License-Identifier: MIT
 ;
-; The five shader modules the board diagnostics feed Anvil's SPIR-V front
+; The seven shader modules the board diagnostics feed Anvil's SPIR-V front
 ; end, written out word by word so a reader can check them against the
 ; specification without a tool.
 ;
 ; THEY LIVE HERE RATHER THAN IN A DIAGNOSTIC because the desk gate walks
-; the SAME five modules and compares them, byte for byte, against modules
+; the SAME modules and compares them, byte for byte, against modules
 ; a Python assembler builds independently. If they lived in a diagnostic,
 ; the board would be the first place anybody discovered that one of these
 ; words was wrong.
@@ -16,6 +16,7 @@
 ;   VsA  position-only vertex        VsB  position and colour vertex
 ;   FsA  push-constant fragment      FsB  interpolated fragment
 ;   FsC  uniform-buffer fragment
+;   VsD  position and vec2 UV vertex FsD  combined-sampler fragment
 ;
 ; PROVENANCE. The binary layout, the opcode numbers and the enumerants
 ; are the Khronos SPIR-V specification's own (registry.khronos.org/SPIR-V,
@@ -31,6 +32,8 @@ Global Dim vtpFsA.l[256]
 Global Dim vtpVsB.l[256]
 Global Dim vtpFsB.l[256]
 Global Dim vtpFsC.l[256]
+Global Dim vtpVsD.l[256]
+Global Dim vtpFsD.l[256]
 Global vtpBuf.i = 0
 Global vtpN.i = 0
 
@@ -60,6 +63,8 @@ Global vtpN.i = 0
 #VTP_OpTypeInt = 21
 #VTP_OpTypeFloat = 22
 #VTP_OpTypeVector = 23
+#VTP_OpTypeImage = 25
+#VTP_OpTypeSampledImage = 27
 #VTP_OpTypeStruct = 30
 #VTP_OpTypePointer = 32
 #VTP_OpTypeFunction = 33
@@ -74,6 +79,7 @@ Global vtpN.i = 0
 #VTP_OpMemberDecorate = 72
 #VTP_OpCompositeConstruct = 80
 #VTP_OpCompositeExtract = 81
+#VTP_OpImageSampleImplicitLod = 87
 #VTP_OpLabel = 248
 #VTP_OpReturn = 253
 
@@ -84,6 +90,7 @@ Global vtpN.i = 0
 #VTP_EmFragment = 4
 #VTP_ModeOriginUpperLeft = 7
 #VTP_ScUniform = 2
+#VTP_ScUniformConstant = 0
 #VTP_ScInput = 1
 #VTP_ScOutput = 3
 #VTP_ScPushConstant = 9
@@ -102,6 +109,104 @@ Global vtpN.i = 0
 Procedure vtpW(v.i)
   PokeL(vtpBuf + (vtpN * 4), v)
   vtpN = vtpN + 1
+EndProcedure
+
+; The texture fixtures are kept beside the opcode declarations. These two
+; builders are defined below them, before the shared assembler helpers' bodies.
+Declare vtpIns(op.i, n.i)
+Declare vtpHeader(bound.i)
+
+; ----------------------------------------------------------------------
+;  The TEXTURE-COORDINATE vertex shader:
+;      layout(location = 0) in vec2 inPosition;
+;      layout(location = 1) in vec2 inUv;
+;      layout(location = 0) out vec2 vUv;
+; ----------------------------------------------------------------------
+Procedure.i vtpBuildVsD()
+  vtpBuf = @vtpVsD[0]
+  vtpHeader(28)
+  vtpIns(#VTP_OpCapability, 1) : vtpW(#VTP_CapShader)
+  vtpIns(#VTP_OpMemoryModel, 2) : vtpW(#VTP_AddrLogical) : vtpW(#VTP_MemGLSL450)
+  vtpIns(#VTP_OpEntryPoint, 8) : vtpW(#VTP_EmVertex) : vtpW(19) : vtpW(#VTP_NAME0) : vtpW(#VTP_NAME1) : vtpW(15) : vtpW(16) : vtpW(17) : vtpW(18)
+  vtpIns(#VTP_OpMemberDecorate, 4) : vtpW(9) : vtpW(0) : vtpW(#VTP_DecBuiltIn) : vtpW(#VTP_BuiltInPosition)
+  vtpIns(#VTP_OpDecorate, 2) : vtpW(9) : vtpW(#VTP_DecBlock)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(15) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(16) : vtpW(#VTP_DecLocation) : vtpW(1)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(17) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpTypeVoid, 1) : vtpW(1)
+  vtpIns(#VTP_OpTypeFunction, 2) : vtpW(2) : vtpW(1)
+  vtpIns(#VTP_OpTypeFloat, 2) : vtpW(3) : vtpW(32)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(4) : vtpW(3) : vtpW(2)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(5) : vtpW(3) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(6) : vtpW(#VTP_ScInput) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(7) : vtpW(#VTP_ScInput) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(8) : vtpW(#VTP_ScOutput) : vtpW(4)
+  vtpIns(#VTP_OpTypeStruct, 2) : vtpW(9) : vtpW(5)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(10) : vtpW(#VTP_ScOutput) : vtpW(9)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(27) : vtpW(#VTP_ScOutput) : vtpW(5)
+  vtpIns(#VTP_OpTypeInt, 3) : vtpW(11) : vtpW(32) : vtpW(1)
+  vtpIns(#VTP_OpConstant, 3) : vtpW(11) : vtpW(12) : vtpW(0)
+  vtpIns(#VTP_OpConstant, 3) : vtpW(3) : vtpW(13) : vtpW(#VTP_SPV_F_ZERO)
+  vtpIns(#VTP_OpConstant, 3) : vtpW(3) : vtpW(14) : vtpW(#VTP_SPV_F_ONE)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(6) : vtpW(15) : vtpW(#VTP_ScInput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(7) : vtpW(16) : vtpW(#VTP_ScInput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(8) : vtpW(17) : vtpW(#VTP_ScOutput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(10) : vtpW(18) : vtpW(#VTP_ScOutput)
+  vtpIns(#VTP_OpFunction, 4) : vtpW(1) : vtpW(19) : vtpW(0) : vtpW(2)
+  vtpIns(#VTP_OpLabel, 1) : vtpW(20)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(21) : vtpW(15)
+  vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(22) : vtpW(21) : vtpW(0)
+  vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(23) : vtpW(21) : vtpW(1)
+  vtpIns(#VTP_OpCompositeConstruct, 6) : vtpW(5) : vtpW(24) : vtpW(22) : vtpW(23) : vtpW(13) : vtpW(14)
+  vtpIns(#VTP_OpAccessChain, 4) : vtpW(27) : vtpW(25) : vtpW(18) : vtpW(12)
+  vtpIns(#VTP_OpStore, 2) : vtpW(25) : vtpW(24)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(26) : vtpW(16)
+  vtpIns(#VTP_OpStore, 2) : vtpW(17) : vtpW(26)
+  vtpIns(#VTP_OpReturn, 0)
+  vtpIns(#VTP_OpFunctionEnd, 0)
+  ProcedureReturn vtpN * 4
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The COMBINED-SAMPLER fragment shader:
+;      layout(set = 0, binding = 0) uniform sampler2D tex;
+;      layout(location = 0) in vec2 vUv;
+;      layout(location = 0) out vec4 outColour;
+;      void main() { outColour = texture(tex, vUv); }
+; ----------------------------------------------------------------------
+Procedure.i vtpBuildFsD()
+  vtpBuf = @vtpFsD[0]
+  vtpHeader(19)
+  vtpIns(#VTP_OpCapability, 1) : vtpW(#VTP_CapShader)
+  vtpIns(#VTP_OpMemoryModel, 2) : vtpW(#VTP_AddrLogical) : vtpW(#VTP_MemGLSL450)
+  vtpIns(#VTP_OpEntryPoint, 6) : vtpW(#VTP_EmFragment) : vtpW(14) : vtpW(#VTP_NAME0) : vtpW(#VTP_NAME1) : vtpW(12) : vtpW(13)
+  vtpIns(#VTP_OpExecutionMode, 2) : vtpW(14) : vtpW(#VTP_ModeOriginUpperLeft)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(11) : vtpW(#VTP_DecDescriptorSet) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(11) : vtpW(#VTP_DecBinding) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(12) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(13) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpTypeVoid, 1) : vtpW(1)
+  vtpIns(#VTP_OpTypeFunction, 2) : vtpW(2) : vtpW(1)
+  vtpIns(#VTP_OpTypeFloat, 2) : vtpW(3) : vtpW(32)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(4) : vtpW(3) : vtpW(2)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(5) : vtpW(3) : vtpW(4)
+  vtpIns(#VTP_OpTypeImage, 8) : vtpW(6) : vtpW(3) : vtpW(1) : vtpW(0) : vtpW(0) : vtpW(0) : vtpW(1) : vtpW(0)
+  vtpIns(#VTP_OpTypeSampledImage, 2) : vtpW(7) : vtpW(6)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(8) : vtpW(#VTP_ScUniformConstant) : vtpW(7)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(9) : vtpW(#VTP_ScInput) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(10) : vtpW(#VTP_ScOutput) : vtpW(5)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(8) : vtpW(11) : vtpW(#VTP_ScUniformConstant)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(9) : vtpW(12) : vtpW(#VTP_ScInput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(10) : vtpW(13) : vtpW(#VTP_ScOutput)
+  vtpIns(#VTP_OpFunction, 4) : vtpW(1) : vtpW(14) : vtpW(0) : vtpW(2)
+  vtpIns(#VTP_OpLabel, 1) : vtpW(15)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(7) : vtpW(16) : vtpW(11)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(17) : vtpW(12)
+  vtpIns(#VTP_OpImageSampleImplicitLod, 4) : vtpW(5) : vtpW(18) : vtpW(16) : vtpW(17)
+  vtpIns(#VTP_OpStore, 2) : vtpW(13) : vtpW(18)
+  vtpIns(#VTP_OpReturn, 0)
+  vtpIns(#VTP_OpFunctionEnd, 0)
+  ProcedureReturn vtpN * 4
 EndProcedure
 
 ; One instruction header: `n` is the number of operand words after it.

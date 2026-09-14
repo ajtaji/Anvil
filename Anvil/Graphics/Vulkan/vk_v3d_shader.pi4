@@ -87,6 +87,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 ; 32-byte aligned, which V3dClGlShaderState requires: its address field
 ; is 27 bits at bit 5 and the low five bits are not stored.
 #AVKQ_OFF_SHREC = 4096
+; Per-draw texture and sampler state. The largest shader record is 292 bytes,
+; so these 256-byte-aligned blocks cannot overlap it.
+#AVKQ_OFF_TEX_STATE = 4608
+#AVKQ_OFF_SAMP_STATE = 4864
 #AVKQ_BYTES = 8192
 
 ; The most attribute records one pipeline can have: four attributes of
@@ -552,6 +556,60 @@ Procedure.i avkqEmitFragment(pipe.i, base.i, colourSrc.i)
     ProcedureReturn V3dQpuProgramEnd()
   EndIf
 
+  If colourSrc = #ANVIL_SPV_COLOUR_SAMPLED
+    ; P0 and P1 point at the texture and sampler state. WRTMUC consumes one
+    ; uniform for each, exactly as the already silicon-proven Neon texture
+    ; program does.
+    r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; Location zero is a vec2. V3D supplies the interpolation correction in
+    ; r5; each coordinate must add it before the texture request is launched.
+    r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuAdd2(#V3DQ_A_FADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 11, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuAdd2(#V3DQ_A_FADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 11, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; T is written first; writing S fires the request.
+    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = 0
+    While k < 4
+      r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, k, 0)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      k = k + 1
+    Wend
+    r = V3dQpuLastThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ; The TMU returns shader RGBA. The target stores B8G8R8A8.
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 1)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 3)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuProgramEndThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ProcedureReturn V3dQpuProgramEnd()
+  EndIf
+
   ; The flat shape. The uniform stream is already in the target's byte
   ; order, so rf0..rf3 are blue, green, red and alpha and the packs are
   ; in register order.
@@ -637,13 +695,17 @@ Procedure.i AnvilVkV3dCompile(pipe.i, base.i, bytes.i)
     avkqStage = 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given a vertex layout of fewer than two or more than sixteen attribute components (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. One attribute record is emitted per component and the shader state record holds sixteen.")
   EndIf
-  If varyComps <> 0 And varyComps <> 4
+  If varyComps <> 0 And varyComps <> 2 And varyComps <> 4
     avkqStage = 2
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given other than zero or four varying components (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. The fragment shapes this emitter writes are a flat colour with no varyings and an interpolated four-component colour, and nothing between them.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given other than zero, two or four varying components (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. Flat colour uses none, a sampled image uses one vec2 and interpolated colour uses one vec4.")
   EndIf
   If varyComps = 4 And AnvilVkPipelineColourSource(pipe) <> #ANVIL_SPV_COLOUR_VARYING
     avkqStage = 3
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given a pipeline whose vertex shader writes a varying its fragment shader does not read (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. An interpolated varying that nothing consumes would be written into the VPM and thrown away.")
+  EndIf
+  If varyComps = 2 And AnvilVkPipelineColourSource(pipe) <> #ANVIL_SPV_COLOUR_SAMPLED
+    avkqStage = 3
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given a two-component varying that is not the sampled image's texture coordinate (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. This bounded shader lowering consumes one whole vec2 coordinate and implements no other vec2 fragment operation.")
   EndIf
 
   ; The viewport's half extent, in eighths of a pixel, which is the unit
@@ -764,11 +826,12 @@ EndProcedure
 ;  the TMU general vec4-load configuration and the TLB configuration.
 ;  The processor never reads or copies the descriptor's four values.
 ; ----------------------------------------------------------------------
-Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i)
+Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i, *sampled.AnvilVkBackendSampledImage)
   Define r.i
   Define g.i
   Define b.i
   Define a.i
+  Define k.i
   If colourSrc = #ANVIL_SPV_COLOUR_VARYING
     avkqPoke32(base + #AVKQ_OFF_UNIF_FS, #AVKQ_TLB_CONF)
     ProcedureReturn
@@ -778,6 +841,30 @@ Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i)
     ; in the stream: the QPU dereferences it through the TMU.
     avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, *push & $FFFFFFFF)
     avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, #AVKQ_TMU_LOAD_VEC4)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 8, #AVKQ_TLB_CONF)
+    ProcedureReturn
+  ElseIf colourSrc = #ANVIL_SPV_COLOUR_SAMPLED And *sampled <> 0
+    ; Clear the whole state records before writing the bounded fields. This is
+    ; per-draw state: no byte from a previous sampler can survive a rebinding.
+    k = 0
+    While k < 8
+      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + (k * 4), 0)
+      avkqPoke32(base + #AVKQ_OFF_SAMP_STATE + (k * 4), 0)
+      k = k + 1
+    Wend
+    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 0, *sampled\base & $FFFFFFFF)
+    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\width << 26) & $FFFFFFFF)
+    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 8, ((*sampled\height << 8) | (1 << 22)) & $FFFFFFFF)
+    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))
+    ; V3D filter bits are one for nearest and zero for linear. Mip filtering
+    ; is fixed at level zero by the accepted VkSampler contract.
+    k = $80
+    If *sampled\magFilter = #VK_FILTER_NEAREST : k = k | 1 : EndIf
+    If *sampled\minFilter = #VK_FILTER_NEAREST : k = k | 2 : EndIf
+    avkqPoke32(base + #AVKQ_OFF_SAMP_STATE + 0, k)
+    avkqPoke32(base + #AVKQ_OFF_SAMP_STATE + 4, (1 << 16) | (1 << 19))
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, (base + #AVKQ_OFF_TEX_STATE) | $F)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, (base + #AVKQ_OFF_SAMP_STATE) | 1)
     avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 8, #AVKQ_TLB_CONF)
     ProcedureReturn
   ElseIf colourSrc = #ANVIL_SPV_COLOUR_PUSH And *push <> 0
