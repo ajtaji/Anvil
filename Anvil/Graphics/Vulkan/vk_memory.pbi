@@ -18,8 +18,8 @@
 ;   VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TILING_LINEAR,
 ;   one mip level, one array layer, VK_SAMPLE_COUNT_1_BIT,
 ;   VK_SHARING_MODE_EXCLUSIVE, usage within TRANSFER_SRC | TRANSFER_DST |
-;   COLOR_ATTACHMENT, with width and height limited by the backend and row
-;   pitch derived by that same backend. The public image-format query enters
+;   SAMPLED | COLOR_ATTACHMENT, with width and height limited by the backend
+;   and row pitch derived by that same backend. The public image-format query enters
 ;   the same combination and limit owners used by creation.
 ; Everything else is refused with a real error code and a whole sentence.
 
@@ -314,7 +314,7 @@ Procedure.i AnvilVkImageFormatSupport(format.i, imageType.i, tiling.i, usage.i, 
   If format <> #VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   If tiling <> #VK_IMAGE_TILING_LINEAR : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   If usage = 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
-  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0
+  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
   If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
@@ -465,8 +465,8 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an extent outside this device's limits (Anvil code -20001, invalid argument); width and height must be at least one and no more than maxImageDimension2D, which vkGetPhysicalDeviceProperties reports.")
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0
-    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImage was asked for an image usage Anvil does not implement (Anvil code -20005, unsupported usage); use VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT or VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT. Sampler, storage-image and input-attachment usages are not implemented.")
+  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0
+    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImage was asked for an image usage Anvil does not implement (Anvil code -20005, unsupported usage); use VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_USAGE_SAMPLED_BIT or VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT. Storage-image and input-attachment usages are not implemented.")
     ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
   EndIf
   If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0

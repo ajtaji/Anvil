@@ -240,6 +240,47 @@ Procedure.i avkSamplerSlot(h.i)
   ProcedureReturn s
 EndProcedure
 
+; Descriptor-side views of the two object tables owned here. Returning the
+; device SLOT makes zero the complete stale-handle answer and lets the
+; descriptor owner compare all objects without retaining private table slots.
+Procedure.i avkDescImageViewDevice(view.i)
+  Define s.i
+  s = avkIvSlot(view)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkIvDev[s]
+EndProcedure
+
+Procedure.i avkDescImageViewImage(view.i)
+  Define s.i
+  Define image.i
+  s = avkIvSlot(view)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  image = avkIvImage[s]
+  If avkImgSlot(image) <> avkIvImgSlot[s] : ProcedureReturn 0 : EndIf
+  ProcedureReturn image
+EndProcedure
+
+Procedure.i avkDescSamplerDevice(sampler.i)
+  Define s.i
+  s = avkSamplerSlot(sampler)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkSampDev[s]
+EndProcedure
+
+Procedure.i avkDescSamplerMagFilter(sampler.i)
+  Define s.i
+  s = avkSamplerSlot(sampler)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkSampMag[s]
+EndProcedure
+
+Procedure.i avkDescSamplerMinFilter(sampler.i)
+  Define s.i
+  s = avkSamplerSlot(sampler)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkSampMin[s]
+EndProcedure
+
 ; ======================================================================
 ;  SAMPLERS -- the object/lifecycle half of the sampled-image path
 ; ======================================================================

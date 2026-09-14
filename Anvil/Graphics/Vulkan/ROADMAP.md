@@ -105,8 +105,11 @@ Everything below remains missing.
   pitches, aspects, compatible views, layout tracking per subresource, format
   feature tables, and linear/UIF conversions. The development image binding is
   external metadata only and is not a Vulkan resource implementation.
-- Samplers, normalized/unnormalized coordinates, filtering, addressing,
-  compare, border color, anisotropy capability, and combined image samplers.
+- Sampler state beyond the bounded nearest/linear, clamp-to-edge, LOD-zero
+  subset; normalized/unnormalized coordinate variants, other addressing,
+  compare, border color and anisotropy capability. One combined-image-sampler
+  descriptor record now exists, but sampled SPIR-V instructions and V3D
+  texture-fetch lowering do not, so no sampled pixel is claimed.
 
 ## Synchronization and command gaps
 

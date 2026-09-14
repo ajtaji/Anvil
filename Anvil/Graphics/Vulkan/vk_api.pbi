@@ -110,10 +110,11 @@ Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperti
   Wend
 EndProcedure
 
-; Report only format behavior the linked backend can execute. The current
-; image path is linear BGRA8; it becomes a colour attachment only when the
-; backend owns a draw path. Optimal tiling, texel-buffer, sampled, storage,
-; depth/stencil, blend and blit behavior are all absent and therefore zero.
+; Report only format behavior the implementation owns. The current image path
+; is linear BGRA8 and has a checked sampled-image descriptor representation;
+; it becomes a colour attachment only when the backend owns a draw path.
+; Optimal tiling, texel-buffer, storage, depth/stencil, blend and blit
+; behavior are all absent and therefore zero.
 Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pFormatProperties.VkFormatProperties)
   If *pFormatProperties = 0
     ProcedureReturn
@@ -125,8 +126,11 @@ Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pForm
   *pFormatProperties\linearTilingFeatures = 0
   *pFormatProperties\optimalTilingFeatures = 0
   *pFormatProperties\bufferFeatures = 0
-  If format = #VK_FORMAT_B8G8R8A8_UNORM And AnvilVkBackendCanDraw() <> 0
-    *pFormatProperties\linearTilingFeatures = #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+  If format = #VK_FORMAT_B8G8R8A8_UNORM
+    *pFormatProperties\linearTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+    If AnvilVkBackendCanDraw() <> 0
+      *pFormatProperties\linearTilingFeatures = *pFormatProperties\linearTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
+    EndIf
   EndIf
 EndProcedure
 
@@ -823,6 +827,9 @@ Procedure.i vkCreateImageView(device.i, *pCreateInfo.VkImageViewCreateInfo, *pAl
   EndIf
   If (*pCreateInfo\subresourceRange\baseMipLevel & $FFFFFFFF) <> 0 Or (*pCreateInfo\subresourceRange\baseArrayLayer & $FFFFFFFF) <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateImageView was given a subresource range that does not start at mip level zero, array layer zero (Anvil code -20005, unsupported subresource range); every image here has one mip level and one array layer.")
+  EndIf
+  If (*pCreateInfo\subresourceRange\levelCount & $FFFFFFFF) <> 1 Or (*pCreateInfo\subresourceRange\layerCount & $FFFFFFFF) <> 1
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImageView was given a subresource range that does not contain exactly one mip level and one array layer (Anvil code -20001, invalid subresource range); every image here has one mip level and one array layer, and the view must include both.")
   EndIf
   ProcedureReturn AnvilVkImageViewCreate(device, *pCreateInfo\image, *pCreateInfo\viewType & $FFFFFFFF, *pCreateInfo\format & $FFFFFFFF, *pView)
 EndProcedure

@@ -5,8 +5,9 @@
 ;
 ; Target neutral. Nothing here knows a QPU register, a VPM slot, a
 ; control-list packet or a display. It owns the three objects that stand
-; between a VkBuffer and a shader that reads it, and it resolves a bound
-; set into one address and one length that the draw record carries.
+; between resources and shaders that read them. It resolves a bound uniform
+; buffer into one address and one length, and a bounded combined image sampler
+; into a closed state record for the future texture backend.
 ;
 ; Read from the Khronos Vulkan specification and its registry:
 ;   .../chapters/descriptorsets.html   descriptor set layouts, pools,
@@ -23,18 +24,19 @@
 ; ======================================================================
 ;  WHAT THIS SLICE IMPLEMENTS
 ; ======================================================================
-;   * a descriptor set layout of one or two bindings, numbered 0 and 1,
-;     each VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, descriptorCount 1, at
-;     VK_SHADER_STAGE_FRAGMENT_BIT
-;   * a descriptor pool of one pool size, that type, with no
+;   * a descriptor set layout of one or two uniform-buffer bindings, or
+;     one VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER at binding zero;
+;     every binding has descriptorCount 1 at VK_SHADER_STAGE_FRAGMENT_BIT
+;   * a descriptor pool of one pool size, matching its set layout, with no
 ;     VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
 ;   * vkAllocateDescriptorSets of one set at a time
 ;   * vkUpdateDescriptorSets of one write at a time, no copies
 ;   * a uniform buffer of at least sixteen bytes at an offset that is a
-;     multiple of sixteen
+;     multiple of sixteen, or one bound linear BGRA8 sampled image view and
+;     one sampler in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
 ;
-; EVERY OTHER DESCRIPTOR TYPE IS REFUSED BY NAME. A sampler, a combined
-; image sampler, a sampled or storage image, a texel buffer, a storage
+; EVERY OTHER DESCRIPTOR TYPE IS REFUSED BY NAME. A sampler, a separate
+; sampled or storage image, a texel buffer, a storage
 ; buffer, either dynamic variant and an input attachment each get their
 ; own sentence, because a caller who wrote one of them needs to be told
 ; which of the eleven this implementation has - not that "6" is the only
@@ -57,6 +59,11 @@ Declare.i avkDescBufferUniform(buffer.i)  ; 1 when it named the uniform usage
 Declare.i avkDescBufferSize(buffer.i)
 Declare.i avkDescBufferAddress(buffer.i)
 Declare.i avkDescBufferDevice(buffer.i)
+Declare.i avkDescImageViewDevice(view.i)
+Declare.i avkDescImageViewImage(view.i)
+Declare.i avkDescSamplerDevice(sampler.i)
+Declare.i avkDescSamplerMagFilter(sampler.i)
+Declare.i avkDescSamplerMinFilter(sampler.i)
 
 ; ----------------------------------------------------------------------
 ;  DESCRIPTOR SET LAYOUTS
@@ -76,6 +83,7 @@ Global Dim avkDpGen.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpDev.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpMaxSets.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpCapacity.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim avkDpType.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpSetsOut.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpDescOut.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 
@@ -93,6 +101,9 @@ Global Dim avkDsLayout.i[#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1]
 Global Dim avkDsBuf.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 Global Dim avkDsOffset.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 Global Dim avkDsRange.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim avkDsSampler.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim avkDsView.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim avkDsImageLayout.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 
 Procedure.i avkDslSlot(h.i)
   Define s.i
@@ -115,13 +126,14 @@ Procedure.i avkDsSlot(h.i)
   ProcedureReturn s
 EndProcedure
 
-; Every descriptor type that is not a uniform buffer, each named.
+; Every descriptor type that is neither a uniform buffer nor the bounded
+; combined image sampler, each named.
 Procedure.i avkDescRefuseType(t.i)
-  If t = #VK_DESCRIPTOR_TYPE_SAMPLER Or t = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER Or t = #VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE Or t = #VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for an image or sampler descriptor - VK_DESCRIPTOR_TYPE_SAMPLER, COMBINED_IMAGE_SAMPLER, SAMPLED_IMAGE or STORAGE_IMAGE (Anvil code -20005, unsupported descriptor type); VkSampler objects exist, but no image-view descriptor or texture-unit lowering reaches them yet, so a bound image could not be sampled. The one descriptor type currently connected to shaders is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER.")
+  If t = #VK_DESCRIPTOR_TYPE_SAMPLER Or t = #VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE Or t = #VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for a separate sampler, sampled image or storage image descriptor (Anvil code -20005, unsupported descriptor type); this bounded slice accepts VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER so the image and sampler are validated as one state record. No SPIR-V texture instruction is accepted yet.")
   EndIf
   If t = #VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER Or t = #VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for a texel buffer descriptor - VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER or STORAGE_TEXEL_BUFFER (Anvil code -20005, unsupported descriptor type); a texel buffer is reached through a VkBufferView and there is no VkBufferView object here. The one descriptor type this implementation has is VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for a texel buffer descriptor - VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER or STORAGE_TEXEL_BUFFER (Anvil code -20005, unsupported descriptor type); a texel buffer is reached through a VkBufferView and there is no VkBufferView object here. Use a supported uniform-buffer or bounded combined-image-sampler layout.")
   EndIf
   If t = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "Anvil was asked for VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (Anvil code -20005, unsupported descriptor type); a storage buffer is written by the shader as well as read, and this implementation has no shader store, no memory barrier between a shader and the host, and no coherence rule to make one correct.")
@@ -162,7 +174,7 @@ Procedure.i AnvilVkDescriptorSetLayoutCreate(device.i, *ci.VkDescriptorSetLayout
   EndIf
   n = *ci\bindingCount & $FFFFFFFF
   If n < 1 Or n > #ANVIL_VK_MAX_SET_BINDINGS Or *ci\pBindings = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given no bindings or more than two (Anvil code -20005, unsupported set layout); one set holds one or two uniform-buffer bindings here.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given no bindings or more than two (Anvil code -20005, unsupported set layout); one set holds one or two uniform-buffer bindings, or one combined image sampler at binding zero.")
   EndIf
   seen = 0
   k = 0
@@ -176,8 +188,11 @@ Procedure.i AnvilVkDescriptorSetLayoutCreate(device.i, *ci.VkDescriptorSetLayout
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateDescriptorSetLayout was given two bindings with the same binding number (Anvil code -20001, duplicate binding); each binding of a set is described exactly once.")
     EndIf
     seen = seen | (1 << b)
-    If (*bind\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+    If (*bind\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And (*bind\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
       ProcedureReturn avkDescRefuseType(*bind\descriptorType & $FFFFFFFF)
+    EndIf
+    If (*bind\descriptorType & $FFFFFFFF) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And (n <> 1 Or b <> 0)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout placed a combined image sampler anywhere other than the only binding in set zero (Anvil code -20005, unsupported sampled-image layout); this first sampled state record is exactly one VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER at binding zero.")
     EndIf
     If (*bind\descriptorCount & $FFFFFFFF) <> 1
       ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given a descriptorCount other than one (Anvil code -20005, unsupported descriptor array); an array of descriptors is indexed in the shader, and the SPIR-V front end refuses arrays and non-constant indices. A count of zero would declare a binding nothing can be written to.")
@@ -186,7 +201,7 @@ Procedure.i AnvilVkDescriptorSetLayoutCreate(device.i, *ci.VkDescriptorSetLayout
       ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given stage flags other than VK_SHADER_STAGE_FRAGMENT_BIT alone (Anvil code -20005, unsupported stage); the descriptor path in this implementation supplies the fragment colour, and the emitted vertex programs' uniform stream carries the viewport transform and nothing else.")
     EndIf
     If *bind\pImmutableSamplers <> 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given immutable samplers (Anvil code -20005, immutable samplers not implemented); use no immutable samplers until the sampled-image descriptor path is connected.")
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorSetLayout was given immutable samplers (Anvil code -20005, immutable samplers not implemented); provide the live sampler in VkDescriptorImageInfo when updating the combined image sampler.")
     EndIf
     k = k + 1
   Wend
@@ -214,7 +229,7 @@ Procedure.i AnvilVkDescriptorSetLayoutCreate(device.i, *ci.VkDescriptorSetLayout
   While k < n
     *bind = *ci\pBindings + (k * SizeOf(VkDescriptorSetLayoutBinding))
     b = *bind\binding & $FFFFFFFF
-    avkDslType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+    avkDslType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b] = *bind\descriptorType & $FFFFFFFF
     avkDslStages[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b] = *bind\stageFlags & $FFFFFFFF
     k = k + 1
   Wend
@@ -292,7 +307,7 @@ Procedure.i AnvilVkDescriptorPoolCreate(device.i, *ci.VkDescriptorPoolCreateInfo
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was given other than exactly one pool size (Anvil code -20005, unsupported pool); there is one descriptor type here, so one VkDescriptorPoolSize describes the whole pool.")
   EndIf
   *size = *ci\pPoolSizes
-  If (*size\type & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  If (*size\type & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And (*size\type & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
     ProcedureReturn avkDescRefuseType(*size\type & $FFFFFFFF)
   EndIf
   If (*size\descriptorCount & $FFFFFFFF) < 1
@@ -307,6 +322,7 @@ Procedure.i AnvilVkDescriptorPoolCreate(device.i, *ci.VkDescriptorPoolCreateInfo
   avkDpDev[s] = d
   avkDpMaxSets[s] = *ci\maxSets & $FFFFFFFF
   avkDpCapacity[s] = *size\descriptorCount & $FFFFFFFF
+  avkDpType[s] = *size\type & $FFFFFFFF
   avkDpSetsOut[s] = 0
   avkDpDescOut[s] = 0
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_DESCRIPTOR_POOL, s, avkDpGen[s]))
@@ -325,6 +341,9 @@ Procedure avkDescFreePoolSets(p.i)
         avkDsBuf[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
         avkDsOffset[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
         avkDsRange[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+        avkDsSampler[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+        avkDsView[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+        avkDsImageLayout[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
         j = j + 1
       Wend
     EndIf
@@ -409,8 +428,15 @@ Procedure.i AnvilVkDescriptorSetsAllocate(device.i, *ai.VkDescriptorSetAllocateI
     ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets has already handed out every set this pool declared (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); no set was allocated. Raise VkDescriptorPoolCreateInfo.maxSets, or reset the pool.")
   EndIf
   If (avkDpDescOut[p] + avkDslCount[lay]) > avkDpCapacity[p]
-    ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets needs more uniform-buffer descriptors than this pool declared (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); no set was allocated. The pool's VkDescriptorPoolSize.descriptorCount counts DESCRIPTORS and not sets, so a set of two bindings costs two.")
+    ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets needs more descriptors than this pool declared (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); no set was allocated. The pool's VkDescriptorPoolSize.descriptorCount counts DESCRIPTORS and not sets, so a set of two bindings costs two.")
   EndIf
+  k = 0
+  While k < avkDslCount[lay]
+    If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> avkDpType[p]
+      ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets was given a set layout whose descriptor type is absent from this pool (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); create the pool with a VkDescriptorPoolSize.type matching every binding in the layout.")
+    EndIf
+    k = k + 1
+  Wend
 
   s = 1
   While s <= #ANVIL_VK_MAX_DESCRIPTOR_SETS And avkDsLive[s] <> 0 : s = s + 1 : Wend
@@ -425,6 +451,9 @@ Procedure.i AnvilVkDescriptorSetsAllocate(device.i, *ai.VkDescriptorSetAllocateI
     avkDsBuf[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
     avkDsOffset[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
     avkDsRange[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
+    avkDsSampler[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
+    avkDsView[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
+    avkDsImageLayout[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
     k = k + 1
   Wend
   avkDpSetsOut[p] = avkDpSetsOut[p] + 1
@@ -445,11 +474,18 @@ Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWrite
   Define s.i
   Define lay.i
   Define b.i
+  Define t.i
+  Define idx.i
   Define buf.i
   Define off.i
   Define range.i
   Define size.i
+  Define sampler.i
+  Define view.i
+  Define image.i
+  Define img.i
   Define *info.VkDescriptorBufferInfo
+  Define *imageInfo.VkDescriptorImageInfo
 
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
@@ -475,7 +511,7 @@ Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWrite
   EndIf
   lay = avkDsLayout[s]
   b = *pWrites\dstBinding & $FFFFFFFF
-  If b < 0 Or b >= avkDslCount[lay] Or avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + b] <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  If b < 0 Or b >= avkDslCount[lay]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a dstBinding this set's layout does not declare (Anvil code -20001, no such binding); the bindings a set has are the ones its VkDescriptorSetLayout described.")
   EndIf
   If (*pWrites\dstArrayElement & $FFFFFFFF) <> 0
@@ -484,42 +520,90 @@ Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWrite
   If (*pWrites\descriptorCount & $FFFFFFFF) <> 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a descriptorCount other than one (Anvil code -20001, no descriptor array); one write fills one binding here.")
   EndIf
-  If (*pWrites\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-    ProcedureReturn avkDescRefuseType(*pWrites\descriptorType & $FFFFFFFF)
+  t = *pWrites\descriptorType & $FFFFFFFF
+  If t <> avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + b]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a descriptorType different from the type declared for dstBinding (Anvil code -20001, descriptor type mismatch); use the VkDescriptorType from the VkDescriptorSetLayoutBinding that created this set's layout.")
   EndIf
-  If *pWrites\pImageInfo <> 0 Or *pWrites\pTexelBufferView <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a pImageInfo or a pTexelBufferView on a uniform-buffer write (Anvil code -20001, wrong descriptor arm); a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER write is described by pBufferInfo and by nothing else.")
+  idx = (s * #ANVIL_VK_MAX_SET_BINDINGS) + b
+  If t = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+    If *pWrites\pImageInfo <> 0 Or *pWrites\pTexelBufferView <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a pImageInfo or a pTexelBufferView on a uniform-buffer write (Anvil code -20001, wrong descriptor arm); a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER write is described by pBufferInfo and by nothing else.")
+    EndIf
+    If *pWrites\pBufferInfo = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a uniform-buffer write with no pBufferInfo (Anvil code -20001, missing buffer info); nothing was written.")
+    EndIf
+    *info = *pWrites\pBufferInfo
+    buf = *info\buffer
+    If avkDescBufferLive(buf) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkUpdateDescriptorSets was given a VkBuffer handle that is not live, or has no memory bound to it (Anvil code -20002, stale handle or unbound buffer); call vkBindBufferMemory before writing a buffer into a descriptor, because the descriptor is what the shader reads through.")
+    EndIf
+    If avkDescBufferDevice(buf) <> d
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkUpdateDescriptorSets was given a buffer from a different VkDevice from the descriptor set (Anvil code -20003, wrong parent); nothing was written.")
+    EndIf
+    If avkDescBufferUniform(buf) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a buffer that was not created with VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT (Anvil code -20001, missing usage); a buffer a shader reads through a uniform-buffer descriptor must name that usage in VkBufferCreateInfo.")
+    EndIf
+    size = avkDescBufferSize(buf)
+    off = *info\offset
+    range = *info\range
+    If off < 0 Or off >= size Or (off % #ANVIL_VK_UNIFORM_ALIGN) <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a uniform-buffer offset that is negative, past the end of the buffer, or not a multiple of sixteen (Anvil code -20001, misaligned descriptor); sixteen is this device's minUniformBufferOffsetAlignment and it is the size of the block as well.")
+    EndIf
+    If range = #VK_WHOLE_SIZE
+      range = size - off
+    EndIf
+    If range < #ANVIL_VK_UNIFORM_BYTES Or (off + range) > size
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a uniform-buffer range shorter than the sixteen-byte block, or one that runs past the end of the buffer (Anvil code -20001, range outside the buffer); the block a fragment shader reads here is one four-component colour.")
+    EndIf
+    avkDsBuf[idx] = buf
+    avkDsOffset[idx] = off
+    avkDsRange[idx] = range
+    avkDsSampler[idx] = 0
+    avkDsView[idx] = 0
+    avkDsImageLayout[idx] = 0
+    ProcedureReturn #VK_SUCCESS
   EndIf
-  If *pWrites\pBufferInfo = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a uniform-buffer write with no pBufferInfo (Anvil code -20001, missing buffer info); nothing was written.")
+
+  If t = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    If *pWrites\pBufferInfo <> 0 Or *pWrites\pTexelBufferView <> 0 Or *pWrites\pImageInfo = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given the wrong information arm for a combined image sampler (Anvil code -20001, wrong descriptor arm); provide exactly one VkDescriptorImageInfo through pImageInfo and leave pBufferInfo and pTexelBufferView null.")
+    EndIf
+    *imageInfo = *pWrites\pImageInfo
+    If (*imageInfo\imageLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a combined image sampler whose imageLayout is not VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL (Anvil code -20001, wrong sampled layout); transition the image with vkCmdPipelineBarrier and name that layout in VkDescriptorImageInfo.")
+    EndIf
+    sampler = *imageInfo\sampler
+    view = *imageInfo\imageView
+    If avkDescSamplerDevice(sampler) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkUpdateDescriptorSets was given a VkSampler handle that is not live (Anvil code -20002, stale sampler); create the bounded sampler before writing the combined image sampler descriptor.")
+    EndIf
+    If avkDescImageViewDevice(view) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkUpdateDescriptorSets was given a VkImageView handle that is not live (Anvil code -20002, stale image view); create a full single-level colour view before writing the combined image sampler descriptor.")
+    EndIf
+    If avkDescSamplerDevice(sampler) <> d Or avkDescImageViewDevice(view) <> d
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkUpdateDescriptorSets was given a sampler or image view from a different VkDevice from the descriptor set (Anvil code -20003, wrong parent); all three objects must be created by one device.")
+    EndIf
+    image = avkDescImageViewImage(view)
+    img = avkImgSlot(image)
+    If img = 0 Or avkImgBound[img] = 0 Or AnvilVkImageAddress(image) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkUpdateDescriptorSets was given an image view whose image is stale or has no memory bound (Anvil code -20002, stale or unbound sampled image); bind the image's memory before writing its view into a descriptor.")
+    EndIf
+    If avkImgDev[img] <> d
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkUpdateDescriptorSets reached an image from a different VkDevice (Anvil code -20003, wrong parent); create the image, view, sampler and descriptor set through one device.")
+    EndIf
+    If (avkImgUsage[img] & #VK_IMAGE_USAGE_SAMPLED_BIT) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given an image not created with VK_IMAGE_USAGE_SAMPLED_BIT (Anvil code -20001, missing sampled usage); image views do not add usage rights, so recreate the image with sampled usage.")
+    EndIf
+    avkDsBuf[idx] = 0
+    avkDsOffset[idx] = 0
+    avkDsRange[idx] = 0
+    avkDsSampler[idx] = sampler
+    avkDsView[idx] = view
+    avkDsImageLayout[idx] = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    ProcedureReturn #VK_SUCCESS
   EndIf
-  *info = *pWrites\pBufferInfo
-  buf = *info\buffer
-  If avkDescBufferLive(buf) = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkUpdateDescriptorSets was given a VkBuffer handle that is not live, or has no memory bound to it (Anvil code -20002, stale handle or unbound buffer); call vkBindBufferMemory before writing a buffer into a descriptor, because the descriptor is what the shader reads through.")
-  EndIf
-  If avkDescBufferDevice(buf) <> d
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkUpdateDescriptorSets was given a buffer from a different VkDevice from the descriptor set (Anvil code -20003, wrong parent); nothing was written.")
-  EndIf
-  If avkDescBufferUniform(buf) = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a buffer that was not created with VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT (Anvil code -20001, missing usage); a buffer a shader reads through a uniform-buffer descriptor must name that usage in VkBufferCreateInfo.")
-  EndIf
-  size = avkDescBufferSize(buf)
-  off = *info\offset
-  range = *info\range
-  If off < 0 Or off >= size Or (off % #ANVIL_VK_UNIFORM_ALIGN) <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a uniform-buffer offset that is negative, past the end of the buffer, or not a multiple of sixteen (Anvil code -20001, misaligned descriptor); sixteen is this device's minUniformBufferOffsetAlignment and it is the size of the block as well.")
-  EndIf
-  If range = #VK_WHOLE_SIZE
-    range = size - off
-  EndIf
-  If range < #ANVIL_VK_UNIFORM_BYTES Or (off + range) > size
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a uniform-buffer range shorter than the sixteen-byte block, or one that runs past the end of the buffer (Anvil code -20001, range outside the buffer); the block a fragment shader reads here is one four-component colour.")
-  EndIf
-  avkDsBuf[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b] = buf
-  avkDsOffset[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b] = off
-  avkDsRange[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b] = range
-  ProcedureReturn #VK_SUCCESS
+
+  ProcedureReturn avkDescRefuseType(t)
 EndProcedure
 
 ; ======================================================================
@@ -554,6 +638,56 @@ Procedure.i AnvilVkDescriptorSetBuffer(set.i, binding.i)
   If s = 0 : ProcedureReturn 0 : EndIf
   If binding < 0 Or binding >= #ANVIL_VK_MAX_SET_BINDINGS : ProcedureReturn 0 : EndIf
   ProcedureReturn avkDsBuf[(s * #ANVIL_VK_MAX_SET_BINDINGS) + binding]
+EndProcedure
+
+; Resolve the state-only combined image sampler into the one closed record the
+; texture backend will consume. Resolution happens here, not at update time:
+; destroying an image view or sampler, destroying/reusing its image slot, or
+; transitioning the image away from the descriptor's promised layout can
+; never leave a stale address or stale state in a later draw.
+Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBackendSampledImage)
+  Define s.i
+  Define lay.i
+  Define idx.i
+  Define sampler.i
+  Define view.i
+  Define image.i
+  Define img.i
+  If *out = 0 : ProcedureReturn 0 : EndIf
+  *out\base = 0
+  *out\bytes = 0
+  *out\width = 0
+  *out\height = 0
+  *out\pitch = 0
+  *out\format = 0
+  *out\layout = 0
+  *out\magFilter = 0
+  *out\minFilter = 0
+  s = avkDsSlot(set)
+  If s = 0 Or binding < 0 Or binding >= #ANVIL_VK_MAX_SET_BINDINGS : ProcedureReturn 0 : EndIf
+  lay = avkDsLayout[s]
+  If binding >= avkDslCount[lay] : ProcedureReturn 0 : EndIf
+  If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : ProcedureReturn 0 : EndIf
+  idx = (s * #ANVIL_VK_MAX_SET_BINDINGS) + binding
+  sampler = avkDsSampler[idx]
+  view = avkDsView[idx]
+  If avkDescSamplerDevice(sampler) <> avkDsDev[s] Or avkDescImageViewDevice(view) <> avkDsDev[s] : ProcedureReturn 0 : EndIf
+  image = avkDescImageViewImage(view)
+  img = avkImgSlot(image)
+  If img = 0 Or avkImgDev[img] <> avkDsDev[s] Or avkImgBound[img] = 0 : ProcedureReturn 0 : EndIf
+  If (avkImgUsage[img] & #VK_IMAGE_USAGE_SAMPLED_BIT) = 0 : ProcedureReturn 0 : EndIf
+  If avkImgLayout[img] <> avkDsImageLayout[idx] Or avkImgLayout[img] <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : ProcedureReturn 0 : EndIf
+  *out\base = AnvilVkImageAddress(image)
+  If *out\base = 0 : ProcedureReturn 0 : EndIf
+  *out\bytes = avkImgSize[img]
+  *out\width = avkImgW[img]
+  *out\height = avkImgH[img]
+  *out\pitch = avkImgPitch[img]
+  *out\format = #VK_FORMAT_B8G8R8A8_UNORM
+  *out\layout = avkImgLayout[img]
+  *out\magFilter = avkDescSamplerMagFilter(sampler)
+  *out\minFilter = avkDescSamplerMinFilter(sampler)
+  ProcedureReturn 1
 EndProcedure
 
 ; The set layout a live set was allocated from, as a SLOT, so the

@@ -95,6 +95,7 @@ ERR_ARGS = -20001
 ERR_HANDLE = -20002
 ERR_STATE = -20004
 VK_ERROR_FEATURE_NOT_PRESENT = -8
+VK_ERROR_OUT_OF_POOL_MEMORY = -1000069000
 
 
 def f32_from_int(n: int) -> int:
@@ -757,12 +758,44 @@ def grade(cpu, rc) -> Grader:
     g.need("the suppressed draw still reached the backend as the fifth draw",
            slot(160), 5)
 
-    # --- the refusals the descriptor path makes possible ---
-    g.need("a combined image sampler descriptor is refused",
+    # --- descriptor state: one uniform path and one bounded sampled path ---
+    g.need("a storage-image descriptor is refused",
            slot(123), ERR_UNSUPPORTED)
     sampler_text = cstr(cpu, u64(cpu, base + 71 * 8))
-    g.want_true("that refusal names the descriptor types it refused",
-                "COMBINED_IMAGE_SAMPLER" in sampler_text, repr(sampler_text[:140]))
+    g.want_true("that refusal names the unsupported storage-image type",
+                "storage image descriptor" in sampler_text, repr(sampler_text[:140]))
+    g.need("the bounded combined-image-sampler set layout was created", slot(171), 0)
+    g.need("a combined image sampler in a multi-binding layout is refused",
+           slot(196), ERR_UNSUPPORTED)
+    g.need("a UBO pool cannot allocate a combined-image-sampler set",
+           slot(172), VK_ERROR_OUT_OF_POOL_MEMORY)
+    g.need("the combined-image-sampler pool was created", slot(173), 0)
+    g.need("the combined-image-sampler set was allocated", slot(174), 0)
+    g.need("a sampled write cannot claim the uniform-buffer descriptor type",
+           slot(197), ERR_ARGS)
+    g.need("a bound image without SAMPLED usage is refused by the descriptor write",
+           slot(194), ERR_ARGS)
+    g.need("a combined image sampler naming the wrong layout is refused",
+           slot(195), ERR_ARGS)
+    g.need("the exact sampled descriptor write succeeds", slot(175), 0)
+    g.need("the sampled record stays closed before the promised layout holds", slot(176), 0)
+    g.need("the shader-read transition records", slot(177), 0)
+    g.need("the barrier-only submission succeeds", slot(178), 0)
+    g.need("the barrier-only submission's fence signals", slot(179), 0)
+    g.need("the sampled descriptor resolves after the layout transition", slot(180), 1)
+    g.need("the sampled record owns the current image base", slot(181), slot(3))
+    g.need("the sampled record owns the whole bound image", slot(182), slot(4))
+    g.need("the sampled record owns image width", slot(183), W)
+    g.need("the sampled record owns image height", slot(184), H)
+    g.need("the sampled record owns image pitch", slot(185), slot(5))
+    g.need("the sampled record owns the BGRA8 format", slot(186), 44)
+    g.need("the sampled record owns shader-read layout", slot(187), 5)
+    g.need("the sampled record owns linear magnification", slot(188), 1)
+    g.need("the sampled record owns nearest minification", slot(189), 0)
+    g.need("a second full image view was created for descriptor lifetime proof", slot(191), 0)
+    g.need("destroying that view closes the descriptor record", slot(190), 0)
+    g.need("an image view with zero mip levels is refused", slot(192), ERR_ARGS)
+    g.need("an image view with zero array layers is refused", slot(193), ERR_ARGS)
     g.need("a uniform-reading shader on a layout with no set layout is "
            "refused", slot(124), ERR_ARGS)
     g.need("a draw with no descriptor set bound is refused",
@@ -888,6 +921,7 @@ MUTANTS = (
 COMMAND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_command.pbi"
 DESCRIPTOR = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_descriptor.pbi"
 MEMORY = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_memory.pbi"
+API = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_api.pbi"
 
 COMMAND_MUTANTS = (
     ("a command buffer may end inside a render pass",
@@ -1005,9 +1039,12 @@ PIPELINE_MUTANTS = (
 
 
 DESCRIPTOR_MUTANTS = (
-    ("a descriptor type other than a uniform buffer is accepted in a layout",
-     "    If (*bind\\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER\n",
+    ("an unsupported descriptor type is accepted in a layout",
+     "    If (*bind\\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And (*bind\\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER\n",
      "    If (*bind\\descriptorType & $FFFFFFFF) < 0\n"),
+    ("a combined image sampler is accepted in a multi-binding layout",
+     "    If (*bind\\descriptorType & $FFFFFFFF) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And (n <> 1 Or b <> 0)\n",
+     "    If (*bind\\descriptorType & $FFFFFFFF) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And n < 0\n"),
     ("a set layout may declare a binding for a stage that cannot read it",
      "    If (*bind\\stageFlags & $FFFFFFFF) <> #VK_SHADER_STAGE_FRAGMENT_BIT\n",
      "    If (*bind\\stageFlags & $FFFFFFFF) < 0\n"),
@@ -1023,16 +1060,46 @@ DESCRIPTOR_MUTANTS = (
     ("a descriptor copy is accepted",
      "  If copyCount <> 0 Or *pCopies <> 0\n",
      "  If copyCount < 0 Or *pCopies = -1\n"),
-    ("a write may name a binding the set layout does not declare",
-     "  If b < 0 Or b >= avkDslCount[lay] Or avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + b] <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER\n",
-     "  If b < 0 Or b >= 99\n"),
+    ("a write may claim a descriptor type different from its layout",
+     "  If t <> avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + b]\n",
+     "  If t < 0\n"),
+    ("a pool type is ignored when a descriptor set is allocated",
+     "    If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> avkDpType[p]\n",
+     "    If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] < 0\n"),
+    ("a sampled descriptor accepts an image without SAMPLED usage",
+     "    If (avkImgUsage[img] & #VK_IMAGE_USAGE_SAMPLED_BIT) = 0\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkUpdateDescriptorSets was given an image not created",
+     "    If (avkImgUsage[img] & #VK_IMAGE_USAGE_SAMPLED_BIT) = -1\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkUpdateDescriptorSets was given an image not created"),
+    ("a sampled descriptor accepts a layout it cannot consume",
+     "    If (*imageInfo\\imageLayout & $FFFFFFFF) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL\n",
+     "    If (*imageInfo\\imageLayout & $FFFFFFFF) < 0\n"),
+    ("a sampled descriptor resolves before its promised image layout holds",
+     "  If avkImgLayout[img] <> avkDsImageLayout[idx] Or avkImgLayout[img] <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : ProcedureReturn 0 : EndIf\n",
+     "  If avkImgLayout[img] < 0 : ProcedureReturn 0 : EndIf\n"),
+    ("the sampled record drops the image pitch",
+     "  *out\\pitch = avkImgPitch[img]\n",
+     "  *out\\pitch = 0\n"),
+    ("the sampled record drops the sampler's magnification filter",
+     "  *out\\magFilter = avkDescSamplerMagFilter(sampler)\n",
+     "  *out\\magFilter = 0\n"),
 )
 
 
 MEMORY_MUTANTS = (
     ("COLOR_ATTACHMENT image creation is refused",
-     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0\n",
-     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT))) <> 0 Or usage = 0\n"),
+     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0\n",
+     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0 Or usage = 0\n"),
+    ("SAMPLED image creation is refused",
+     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0\n",
+     "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0\n"),
+)
+
+API_MUTANTS = (
+    ("an image view with an empty mip range is accepted",
+     "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) <> 1 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n",
+     "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) < 0 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n"),
+    ("an image view with an empty layer range is accepted",
+     "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) <> 1 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n",
+     "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) <> 1 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) < 0\n"),
 )
 
 
@@ -1065,6 +1132,21 @@ DRAW_COUNT_TRUTH_MUTANTS = frozenset({
     "an incomplete final triangle is refused",
 })
 
+SAMPLED_STATE_MUTANTS = frozenset({
+    "an unsupported descriptor type is accepted in a layout",
+    "a combined image sampler is accepted in a multi-binding layout",
+    "a write may claim a descriptor type different from its layout",
+    "a pool type is ignored when a descriptor set is allocated",
+    "a sampled descriptor accepts an image without SAMPLED usage",
+    "a sampled descriptor accepts a layout it cannot consume",
+    "a sampled descriptor resolves before its promised image layout holds",
+    "the sampled record drops the image pitch",
+    "the sampled record drops the sampler's magnification filter",
+    "SAMPLED image creation is refused",
+    "an image view with an empty mip range is accepted",
+    "an image view with an empty layer range is accepted",
+})
+
 
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
@@ -1073,13 +1155,14 @@ def run(a64, compiler):
 
 def main() -> int:
     all_mutants = (MUTANTS + PIPELINE_MUTANTS + COMMAND_MUTANTS +
-                   DESCRIPTOR_MUTANTS + MEMORY_MUTANTS)
+                   DESCRIPTOR_MUTANTS + MEMORY_MUTANTS + API_MUTANTS)
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage",
-                                                   "sample-mask", "draw-count"))
+                                                   "sample-mask", "draw-count",
+                                                   "sampled-state"))
     parser.add_argument("--mutate-name", choices=tuple(m[0] for m in all_mutants),
                         help="run exactly one named mutation after the green gate")
     args = parser.parse_args()
@@ -1105,8 +1188,8 @@ def main() -> int:
     print(f"vulkan_pipeline_check: PASS - {g.checks} property checks over "
           f"{steps:,} executed A64 instructions")
     print("  the whole public path runs: six shader modules, four pipeline layouts, a")
-    print("  render pass, a framebuffer, four buffers, a sampler, two descriptor set layouts, a pool")
-    print("  and a set, five graphics pipelines over four live slots, five render passes each holding one draw,")
+    print("  render pass, a framebuffer, four buffers, a sampler, three descriptor set layouts, two pools")
+    print("  and three sets, five graphics pipelines over four live slots, five render passes each holding one draw,")
     print("  five submissions and a fence")
     print("  all four shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
@@ -1118,6 +1201,9 @@ def main() -> int:
     print("  the fourth takes its colour from a UNIFORM BUFFER through a descriptor set;")
     print("  its stream keeps the descriptor address and the raw QPU words decode to a V3D")
     print("  4.2 TMU general vec4 lookup - no CPU copy of the buffer values remains")
+    print("  a combined image sampler also resolves into one closed backend record only while")
+    print("  its sampler, full view, sampled-usage image and shader-read layout are all live")
+    print("  (state only: this gate makes no sampled-pixel or texture-opcode claim)")
     print("  NOT ONE PIXEL of the render target was written and NOT ONE MMIO access was made")
     print("  RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4 and")
     print("  RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4 both build at $500000")
@@ -1132,7 +1218,7 @@ def main() -> int:
     for path, mutants in ((EMITTER, MUTANTS), (PIPELINE, PIPELINE_MUTANTS),
                           (COMMAND, COMMAND_MUTANTS),
                           (DESCRIPTOR, DESCRIPTOR_MUTANTS),
-                          (MEMORY, MEMORY_MUTANTS)):
+                          (MEMORY, MEMORY_MUTANTS), (API, API_MUTANTS)):
         original = path.read_text(encoding="utf-8")
         for name, fixed, broken in mutants:
             if args.mutate_name and name != args.mutate_name:
@@ -1144,6 +1230,8 @@ def main() -> int:
             if args.mutate_only == "sample-mask" and name not in SAMPLE_MASK_TRUTH_MUTANTS:
                 continue
             if args.mutate_only == "draw-count" and name not in DRAW_COUNT_TRUTH_MUTANTS:
+                continue
+            if args.mutate_only == "sampled-state" and name not in SAMPLED_STATE_MUTANTS:
                 continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
@@ -1174,9 +1262,11 @@ def main() -> int:
         total = len(SAMPLE_MASK_TRUTH_MUTANTS)
     elif args.mutate_only == "draw-count":
         total = len(DRAW_COUNT_TRUTH_MUTANTS)
+    elif args.mutate_only == "sampled-state":
+        total = len(SAMPLED_STATE_MUTANTS)
     else:
         total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
-                 + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS))
+                 + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS) + len(API_MUTANTS))
     print()
     if missed:
         print(f"vulkan_pipeline_check: {missed} of {total} mutations were not caught")

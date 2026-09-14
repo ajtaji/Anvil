@@ -78,12 +78,12 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[192]
+Global Dim pgReport.i[208]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 191
+  If slot < 0 Or slot > 207
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -107,6 +107,7 @@ Procedure.i Main()
   Define img.i
   Define mem.i
   Define view.i
+  Define viewTex.i
   Define rp.i
   Define fb.i
   Define buf.i
@@ -132,6 +133,9 @@ Procedure.i Main()
   Define dset.i
   Define dset2.i
   Define sampler.i
+  Define dslTex.i
+  Define dpoolTex.i
+  Define dsetTex.i
   Define layU.i
   Define layV.i
   Define bufP.i
@@ -186,15 +190,22 @@ Procedure.i Main()
   Define dslci.VkDescriptorSetLayoutCreateInfo
   Define dslci2.VkDescriptorSetLayoutCreateInfo
   Define dps.VkDescriptorPoolSize
+  Define dpsTex.VkDescriptorPoolSize
   Define dpci.VkDescriptorPoolCreateInfo
+  Define dpciTex.VkDescriptorPoolCreateInfo
   Define dsai.VkDescriptorSetAllocateInfo
+  Define dsaiTex.VkDescriptorSetAllocateInfo
   Define dbi.VkDescriptorBufferInfo
+  Define dii.VkDescriptorImageInfo
   Define wds.VkWriteDescriptorSet
+  Define wdsTex.VkWriteDescriptorSet
+  Define sampled.AnvilVkBackendSampledImage
   Define sampci.VkSamplerCreateInfo
   Define dslArray.i
   Define dsl2Array.i
   Define dsetArray.i
   Define dset2Array.i
+  Define dslTexArray.i
   Define vi.VkPipelineVertexInputStateCreateInfo
   Define ia.VkPipelineInputAssemblyStateCreateInfo
   Define vpstate.VkPipelineViewportStateCreateInfo
@@ -297,7 +308,7 @@ Procedure.i Main()
   ; Rendering permission comes from COLOR_ATTACHMENT. TRANSFER_SRC is
   ; present because the completed diagnostic image is copied to the
   ; display after the render pass; TRANSFER_DST is deliberately absent.
-  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
   imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
   imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
   If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS
@@ -331,9 +342,16 @@ Procedure.i Main()
   ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   ivci\subresourceRange\levelCount = 1
   ivci\subresourceRange\layerCount = 1
+  ivci\subresourceRange\levelCount = 0
+  pgPut(192, vkCreateImageView(dev, @ivci, 0, @bad))
+  ivci\subresourceRange\levelCount = 1
+  ivci\subresourceRange\layerCount = 0
+  pgPut(193, vkCreateImageView(dev, @ivci, 0, @bad))
+  ivci\subresourceRange\layerCount = 1
   If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS
     ProcedureReturn pgStop(9)
   EndIf
+  pgPut(191, vkCreateImageView(dev, @ivci, 0, @viewTex))
 
   att\format = #VK_FORMAT_B8G8R8A8_UNORM
   att\samples = #VK_SAMPLE_COUNT_1_BIT
@@ -375,6 +393,12 @@ Procedure.i Main()
   ; by the COLOR_ATTACHMENT usage rule and not by an unrelated image rule.
   imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
   pgPut(151, vkCreateImage(dev, @imgci, 0, @img2))
+  vkGetImageMemoryRequirements(dev, img2, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  vkAllocateMemory(dev, @mai, 0, @mem2)
+  vkBindImageMemory(dev, img2, mem2, 0)
   ivci\image = img2
   pgPut(152, vkCreateImageView(dev, @ivci, 0, @view2))
   fbci\pAttachments = @view2
@@ -382,13 +406,9 @@ Procedure.i Main()
   pgPut(153, vkCreateFramebuffer(dev, @fbci, 0, @bad))
   pgPut(154, AnvilVkFaultText())
   vkDestroyFramebuffer(dev, bad, 0)
-  vkDestroyImageView(dev, view2, 0)
-  vkDestroyImage(dev, img2, 0)
-  img2 = #VK_NULL_HANDLE
-  view2 = #VK_NULL_HANDLE
   ivci\image = img
   fbci\pAttachments = @view
-  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
 
   If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS
     ProcedureReturn pgStop(11)
@@ -840,9 +860,24 @@ Procedure.i Main()
   dslci\bindingCount = 1
   dslci\pBindings = @dslb
   pgPut(115, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dsl))
-  ; Every other descriptor type is refused by name, and a combined image
-  ; sampler is the one a caller reaches for first.
+  ; The one bounded sampled-image shape is a separate layout: one combined
+  ; image sampler at set zero, binding zero, fragment stage.
   dslb\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  pgPut(171, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dslTex))
+  dslb2[0]\binding = 0
+  dslb2[0]\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  dslb2[0]\descriptorCount = 1
+  dslb2[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslb2[1]\binding = 1
+  dslb2[1]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  dslb2[1]\descriptorCount = 1
+  dslb2[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci2\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dslci2\bindingCount = 2
+  dslci2\pBindings = @dslb2[0]
+  pgPut(196, vkCreateDescriptorSetLayout(dev, @dslci2, 0, @bad))
+  ; Storage images remain outside this tranche and must be refused by name.
+  dslb\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
   AnvilVkFaultClear()
   pgPut(123, vkCreateDescriptorSetLayout(dev, @dslci, 0, @bad))
   pgPut(71, AnvilVkFaultText())
@@ -944,6 +979,67 @@ Procedure.i Main()
   pgPut(119, AnvilVkDescriptorSetAddress(dset, 0))
   pgPut(120, AnvilVkDescriptorSetRange(dset, 0))
   pgPut(69, uaddr)
+
+  ; The sampled descriptor has its own pool type. A UBO pool must not be
+  ; treated as a bag of interchangeable descriptors.
+  dslTexArray = dslTex
+  dsaiTex\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  dsaiTex\descriptorSetCount = 1
+  dpsTex\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  dpsTex\descriptorCount = 1
+  dpciTex\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  dpciTex\maxSets = 1
+  dpciTex\poolSizeCount = 1
+  dpciTex\pPoolSizes = @dpsTex
+  pgPut(173, vkCreateDescriptorPool(dev, @dpciTex, 0, @dpoolTex))
+  dsaiTex\descriptorPool = dpoolTex
+  dsaiTex\pSetLayouts = @dslArray
+  pgPut(172, vkAllocateDescriptorSets(dev, @dsaiTex, @bad))
+  dsaiTex\pSetLayouts = @dslTexArray
+  pgPut(174, vkAllocateDescriptorSets(dev, @dsaiTex, @dsetTex))
+  dii\sampler = sampler
+  dii\imageView = viewTex
+  dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  wdsTex\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  wdsTex\dstSet = dsetTex
+  wdsTex\dstBinding = 0
+  wdsTex\dstArrayElement = 0
+  wdsTex\descriptorCount = 1
+  wdsTex\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  wdsTex\pImageInfo = @dii
+  wdsTex\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  wdsTex\pImageInfo = 0
+  wdsTex\pBufferInfo = @dbi
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wdsTex, 0, 0)
+  pgPut(197, AnvilVkFaultCode())
+  wdsTex\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  wdsTex\pImageInfo = @dii
+  wdsTex\pBufferInfo = 0
+  ; A live and bound image still needs the usage right its descriptor asks
+  ; for, and the write must name the one layout this state record owns.
+  dii\imageView = view2
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wdsTex, 0, 0)
+  pgPut(194, AnvilVkFaultCode())
+  dii\imageView = viewTex
+  dii\imageLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wdsTex, 0, 0)
+  pgPut(195, AnvilVkFaultCode())
+  dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @wdsTex, 0, 0)
+  pgPut(175, AnvilVkFaultCode())
+  ; Update names the layout that must hold when consumed. The actual image
+  ; has not reached it yet, so resolving now must fail closed.
+  pgPut(176, AnvilVkDescriptorSetSampledImage(dsetTex, 0, @sampled))
+  vkDestroyImageView(dev, view2, 0)
+  vkDestroyImage(dev, img2, 0)
+  vkFreeMemory(dev, mem2, 0)
+  img2 = #VK_NULL_HANDLE
+  view2 = #VK_NULL_HANDLE
+  mem2 = #VK_NULL_HANDLE
 
   plci\setLayoutCount = 1
   plci\pSetLayouts = @dslArray
@@ -1111,6 +1207,44 @@ Procedure.i Main()
     i = i + 4
   Wend
   pgPut(39, bad)
+
+  ; Move the rendered image from TRANSFER_SRC to the descriptor's promised
+  ; shader-read layout. A barrier-only submission is legal and completes
+  ; synchronously in the state backend.
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = #VK_ACCESS_MEMORY_READ_BIT
+  bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = img
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\baseMipLevel = 0
+  bar\subresourceRange\levelCount = 1
+  bar\subresourceRange\baseArrayLayer = 0
+  bar\subresourceRange\layerCount = 1
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  pgPut(177, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(178, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(179, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(180, AnvilVkDescriptorSetSampledImage(dsetTex, 0, @sampled))
+  pgPut(181, sampled\base)
+  pgPut(182, sampled\bytes)
+  pgPut(183, sampled\width)
+  pgPut(184, sampled\height)
+  pgPut(185, sampled\pitch)
+  pgPut(186, sampled\format)
+  pgPut(187, sampled\layout)
+  pgPut(188, sampled\magFilter)
+  pgPut(189, sampled\minFilter)
+  ; The descriptor retains typed handles, not a borrowed address. Once its
+  ; view dies it must stop resolving even though the backing image remains.
+  vkDestroyImageView(dev, viewTex, 0)
+  pgPut(190, AnvilVkDescriptorSetSampledImage(dsetTex, 0, @sampled))
 
   ; ------------------------------------------------------------------
   ;  The recording refusals, each on its own fresh command buffer.
@@ -1382,8 +1516,10 @@ Procedure.i Main()
   vkDestroyPipeline(dev, pipeD, 0)
   vkDestroyPipeline(dev, pipeE, 0)
   vkDestroyDescriptorPool(dev, dpool, 0)
+  vkDestroyDescriptorPool(dev, dpoolTex, 0)
   vkDestroyDescriptorSetLayout(dev, dsl, 0)
   vkDestroyDescriptorSetLayout(dev, dsl2, 0)
+  vkDestroyDescriptorSetLayout(dev, dslTex, 0)
   vkDestroyPipelineLayout(dev, layU, 0)
   vkDestroyPipelineLayout(dev, layV, 0)
   vkDestroyPipelineLayout(dev, layA, 0)

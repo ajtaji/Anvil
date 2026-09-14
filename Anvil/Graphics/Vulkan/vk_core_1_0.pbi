@@ -32,15 +32,17 @@
 #VK_FORMAT_R8G8B8A8_UNORM = 37
 #VK_FORMAT_B8G8R8A8_UNORM = 44
 
-; VkFormatFeatureFlagBits -- the one core-1.0 format capability this
+; VkFormatFeatureFlagBits -- the core-1.0 format capabilities this
 ; implementation reports. Transfer-source/destination feature bits were
 ; promoted after 1.0 and are deliberately not smuggled into this surface.
+#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT = $00000001
 #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT = $00000080
 
 ; VkImageLayout -- the core-1.0 entries the layout tracker understands.
 #VK_IMAGE_LAYOUT_UNDEFINED = 0
 #VK_IMAGE_LAYOUT_GENERAL = 1
 #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2
+#VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL = 5
 #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = 6
 #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL = 7
 #VK_IMAGE_LAYOUT_PREINITIALIZED = 8
@@ -126,6 +128,9 @@
 #VK_BORDER_COLOR_INT_OPAQUE_BLACK = 3
 #VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE = 4
 #VK_BORDER_COLOR_INT_OPAQUE_WHITE = 5
+
+; VkAccessFlagBits used by the tracked sampled-image transition.
+#VK_ACCESS_SHADER_READ_BIT = $00000020
 
 ; Device memory vocabulary.
 #VK_MAX_MEMORY_TYPES = 32

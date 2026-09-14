@@ -445,7 +445,7 @@ Procedure.i avkStagesKnown(mask.i)
 EndProcedure
 
 Procedure.i avkAccessKnown(mask.i)
-  If (mask & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT | #VK_ACCESS_HOST_READ_BIT | #VK_ACCESS_HOST_WRITE_BIT | #VK_ACCESS_MEMORY_READ_BIT | #VK_ACCESS_MEMORY_WRITE_BIT | #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT))) <> 0
+  If (mask & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT | #VK_ACCESS_SHADER_READ_BIT | #VK_ACCESS_HOST_READ_BIT | #VK_ACCESS_HOST_WRITE_BIT | #VK_ACCESS_MEMORY_READ_BIT | #VK_ACCESS_MEMORY_WRITE_BIT | #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT))) <> 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
@@ -458,6 +458,7 @@ Procedure.i avkLayoutKnown(v.i)
   If v = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : ProcedureReturn 1 : EndIf
   If v = #VK_IMAGE_LAYOUT_PREINITIALIZED : ProcedureReturn 1 : EndIf
   If v = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : ProcedureReturn 1 : EndIf
+  If v = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : ProcedureReturn 1 : EndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -518,15 +519,15 @@ Procedure AnvilVkCmdImageBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i
     ProcedureReturn
   EndIf
   If avkStagesKnown(srcStageMask) = 0 Or avkStagesKnown(dstStageMask) = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a pipeline stage this implementation does not have (Anvil code -20005, unsupported stage); the stages Anvil implements are TOP_OF_PIPE, TRANSFER, BOTTOM_OF_PIPE, HOST and ALL_COMMANDS, because there is no graphics or compute pipeline here yet.")
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a pipeline stage this implementation does not have (Anvil code -20005, unsupported stage); the stages Anvil tracks are TOP_OF_PIPE, VERTEX_INPUT, VERTEX_SHADER, FRAGMENT_SHADER, COLOR_ATTACHMENT_OUTPUT, TRANSFER, BOTTOM_OF_PIPE, HOST and ALL_COMMANDS.")
     ProcedureReturn
   EndIf
   If avkAccessKnown(srcAccessMask) = 0 Or avkAccessKnown(dstAccessMask) = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given an access flag this implementation does not have (Anvil code -20005, unsupported access); the access types Anvil implements are the transfer, host and generic memory reads and writes.")
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given an access flag this implementation does not have (Anvil code -20005, unsupported access); the access types Anvil tracks are shader reads, transfer reads/writes, colour-attachment writes, host reads/writes and generic memory reads/writes.")
     ProcedureReturn
   EndIf
   If avkLayoutKnown(oldLayout) = 0 Or avkLayoutKnown(newLayout) = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given an image layout this implementation does not track (Anvil code -20005, unsupported layout); the layouts Anvil tracks are UNDEFINED, PREINITIALIZED, GENERAL, TRANSFER_SRC_OPTIMAL and TRANSFER_DST_OPTIMAL.")
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given an image layout this implementation does not track (Anvil code -20005, unsupported layout); the layouts Anvil tracks are UNDEFINED, PREINITIALIZED, GENERAL, COLOR_ATTACHMENT_OPTIMAL, SHADER_READ_ONLY_OPTIMAL, TRANSFER_SRC_OPTIMAL and TRANSFER_DST_OPTIMAL.")
     ProcedureReturn
   EndIf
   ; Queue-family ownership. There is one family, so the only two legal

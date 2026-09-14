@@ -166,6 +166,22 @@ Structure AnvilVkBackendBinding Align #PB_Structure_AlignC
   stride.i            ; that binding's own stride, in bytes
 EndStructure
 
+; ONE CLOSED SAMPLED IMAGE. The descriptor layer resolves Vulkan handles
+; into this target-neutral record at the point a backend is about to consume
+; them. No backend is allowed to retain an application handle or infer a
+; missing image property from a global table later.
+Structure AnvilVkBackendSampledImage Align #PB_Structure_AlignC
+  base.i
+  bytes.i
+  width.i
+  height.i
+  pitch.i
+  format.i
+  layout.i
+  magFilter.i
+  minFilter.i
+EndStructure
+
 Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   pipeline.i          ; the backend's own pipeline slot
   targetBase.i        ; the colour attachment's first byte
