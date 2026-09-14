@@ -21,6 +21,7 @@
 ; and uses three YRGB gathers plus one CBCR gather for ARGB8888 scanout.
 #VOP_WIN0_GATHER_MASK = $00007F03
 #VOP_WIN0_ARGB8888_GATHER = $00001303
+#VOP_DSP_P888_PRE_DITHER = $00000002
 
 #VOP_CFG_DONE = $000
 #VOP_SYS_CTRL = $008
@@ -295,7 +296,10 @@ Procedure.i RockVopUpMode()
   pinPolarity=0
   If rock_mode_hsync_positive <> 0 : pinPolarity=pinPolarity | 1 : EndIf
   If rock_mode_vsync_positive <> 0 : pinPolarity=pinPolarity | 2 : EndIf
-  RockVopField(#VOP_DSP_CTRL1,$000F0000,pinPolarity << 16)
+  ; cdn_dp requests AAAA, but RK3399 VOPL has no 10-bit-output feature.
+  ; The pinned DRM driver therefore selects P888 and unconditionally enables
+  ; pre-dither for that mode before the post/output formatter is started.
+  RockVopField(#VOP_DSP_CTRL1,$000F0012,(pinPolarity << 16) | #VOP_DSP_P888_PRE_DITHER)
   value=RockVopRead(#VOP_SYS_CTRL)
   value=(value & $FFBF07FF) | $00000800
   RockVopWrite(#VOP_SYS_CTRL,value)

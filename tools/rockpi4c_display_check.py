@@ -617,8 +617,10 @@ def source_contract() -> None:
         require(timing in vop_up, f"dynamic VOP timing/stride drifted: {timing}")
     for token in ("if rock_mode_hsync_positive <> 0 : pinpolarity=pinpolarity | 1",
                   "if rock_mode_vsync_positive <> 0 : pinpolarity=pinpolarity | 2",
-                  "rockvopfield(#vop_dsp_ctrl1,$000f0000,pinpolarity << 16)"):
+                  "rockvopfield(#vop_dsp_ctrl1,$000f0012,(pinpolarity << 16) | #vop_dsp_p888_pre_dither)"):
         require(token in vop_up, f"dynamic VOP polarity drifted: {token}")
+    require("#vop_dsp_p888_pre_dither = $00000002" in vop,
+            "RK3399 VOPL P888 pre-dither contract is absent")
 
     # RockCruVpllMode is the final DCLK owner. Trace its complete downstream
     # source path rather than merely validating isolated PLL arithmetic.
