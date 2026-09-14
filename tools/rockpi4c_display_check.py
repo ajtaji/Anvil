@@ -490,10 +490,13 @@ def source_contract() -> None:
                   "rockcruceilingdivider(rock_cru_gpll_rate,100000000)",
                   "rockcruceilingdivider(rock_cru_gpll_rate,200000000)",
                   "rockcruceilingdivider(rock_cru_gpll_rate,400000000)",
+                  "rockcruceilingdivider(aclkrate,200000000)",
                   "rock_cru_error=errorcode",
                   "rock_cru_error=errorcode+1",
                   "rock_cru_error=errorcode+2"):
         require(token in cru, f"DPE1 PLL refusal mapping drifted: {token}")
+    require("rockcruceilingdivider(aclkrate,100000000)" not in cru,
+            "VOP1 HCLK regressed below the pinned RK3399 200 MHz assignment")
     vpll = cru.split("procedure.i rockcruvpllset(pixelhz.i)", 1)[1].split(
         "endprocedure", 1
     )[0]

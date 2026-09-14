@@ -243,7 +243,10 @@ Procedure.i RockCruDisplayClocks()
   rock_cru_dp_core_rate = rock_cru_gpll_rate/dpDivider
   spdifRate = rock_cru_gpll_rate/spdifDivider
   aclkRate = rock_cru_gpll_rate/aclkDivider
-  hclkDivider = RockCruCeilingDivider(aclkRate,100000000)
+  ; rk3399.dtsi assigns HCLK_VOP1=200 MHz alongside ACLK_VOP1=400 MHz.
+  ; Keep the register/AHB side of the VOP at that source-owned rate; cutting
+  ; it to 100 MHz diverges from the RK3399 display power/performance contract.
+  hclkDivider = RockCruCeilingDivider(aclkRate,200000000)
   If hclkDivider=0 : rock_cru_error=51 : ProcedureReturn 0 : EndIf
   hclkRate = aclkRate/hclkDivider
   If (rock_cru_dp_core_rate % 1000000) <> 0
