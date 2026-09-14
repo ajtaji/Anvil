@@ -588,74 +588,19 @@ def source_contract() -> None:
                   "#rock_vop_timing_max", "#rock_vop_stride_word_max",
                   "rock_mode_pitch*rock_mode_height > #rock_fb_max_bytes"):
         require(token in vop_valid, f"dynamic VOP admission bound missing: {token}")
-    vop_up = vop.split("procedure.i rockvopupmode()", 1)[1].split(
-        "endprocedure", 1
-    )[0]
-    line_buffer_order = ["rockvopmodevalid()",
-                         "linebuffermode=rockvoplinebuffermode(rock_mode_width)",
-                         "if linebuffermode < 0", "rockcruvoprelease()",
-                         "rockvopfield(#vop_win0_ctrl0,#vop_win0_format_lb_enable_mask,#vop_win_enable | (linebuffermode << #vop_win_lb_mode_shift))"]
-    positions = [vop_up.index(token) for token in line_buffer_order]
-    require(positions == sorted(positions),
-            "WIN0 line-buffer admission/programming moved after hardware release")
-    outstanding = "rockvopfield(#vop_sys_ctrl1,$0003f000,$0003d000)"
-    require(outstanding in vop_up and
-            vop_up.index("rockcrureset(279,0)") < vop_up.index(outstanding) <
-            vop_up.index("rockvopfield(#vop_win0_ctrl0,#vop_win0_format_lb_enable_mask"),
-            "VOP 30-read AXI throughput contract is absent or armed too late")
-    gather = "rockvopfield(#vop_win0_ctrl1,#vop_win0_gather_mask | #vop_win0_yrgb_vsu_mode_mask,#vop_win0_argb8888_gather | #vop_win0_yrgb_vsu_bic)"
-    require(gather in vop_up and
-            vop_up.index("rockvopwrite(#vop_win0_vir") < vop_up.index(gather) <
-            vop_up.index("rockvopfield(#vop_win0_ctrl0,#vop_win0_format_lb_enable_mask"),
-            "ARGB8888 gather/vertical scaler contract is absent or armed after WIN0")
-    require("#vop_win0_yrgb_vsu_mode_mask = $00400000" in vop and
-            "#vop_win0_yrgb_vsu_bic = $00400000" in vop,
-            "RK3399 YRGB vertical scaler mode is not pinned to source-owned BIC")
-    require("#vop_win0_format_lb_enable_mask = $000000ff" in vop and
-            "rockvopwrite(#vop_win0_ctrl0" not in vop_up,
-            "WIN0 programming can erase reset-owned AXI outstanding state")
-    win_scale = "rockvopwrite(#vop_win0_scl_factor,#vop_scale_unity_xy)"
-    post_scale = "rockvopwrite(#vop_post_scl_factor,#vop_scale_unity_xy)"
-    require("#vop_scale_unity_xy = $10001000" in vop and
-            win_scale in vop_up and post_scale in vop_up and
-            "rockvopfield(#vop_post_scl_ctrl,$3,0)" in vop_up,
-            "native VOP window/post scale factors are not explicitly unity")
-    require(vop_up.index(win_scale) < vop_up.index(gather) and
-            vop_up.index(post_scale) < vop_up.index("rockvopwrite(#vop_win0_act_info"),
-            "native VOP scale factors are armed after their consumers")
-    for timing in (
-        "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
-        "rockvopwrite(#vop_hact,hactiveend | (hactivestart << 16))",
-        "rockvopwrite(#vop_vtotal,vsynclength | (rock_mode_vtotal << 16))",
-        "rockvopwrite(#vop_vact,vactiveend | (vactivestart << 16))",
-        "rockvopwrite(#vop_post_hact,hactiveend | (hactivestart << 16))",
-        "rockvopwrite(#vop_post_vact,vactiveend | (vactivestart << 16))",
-        "rockvopwrite(#vop_win0_vir,rock_mode_pitch >> 2)",
-    ):
-        require(timing in vop_up, f"dynamic VOP timing/stride drifted: {timing}")
-    for token in ("if rock_mode_hsync_positive <> 0 : pinpolarity=pinpolarity | 1",
-                  "if rock_mode_vsync_positive <> 0 : pinpolarity=pinpolarity | 2",
-                  "rockvopfield(#vop_dsp_ctrl1,$000f0012,(pinpolarity << 16) | #vop_dsp_p888_pre_dither)"):
-        require(token in vop_up, f"dynamic VOP polarity drifted: {token}")
-    require("#vop_dsp_p888_pre_dither = $00000002" in vop,
-            "RK3399 VOPL P888 pre-dither contract is absent")
-    first_cfg_tail = vop_up.split("rockvopwrite(#vop_cfg_done,1)", 1)[1]
-    require("dsb sy" in first_cfg_tail and
-            first_cfg_tail.index("dsb sy") < first_cfg_tail.index("rockcrureset(281,1)"),
-            "VOP CFG_DONE is not ordered before the DCLK reset pulse")
-    final_cfg_tail = first_cfg_tail.split("rockcrureset(281,0)", 1)[1]
-    require("rockvopwrite(#vop_cfg_done,1)" in final_cfg_tail and
-            final_cfg_tail.index("rockvopwrite(#vop_cfg_done,1)") < final_cfg_tail.index("dsb sy"),
-            "final VOP CFG_DONE is not completed before scanout readiness")
-    for token in (
-        "#vop_win2_ctrl0 = $0b0",
-        "#vop_afbcd0_ctrl = $200",
-        "rockvopfield(#vop_afbcd0_ctrl,$00000001,0)",
-        "rockvopfield(#vop_win0_ctrl0,$00000001,0)",
-        "rockvopfield(#vop_win2_ctrl0,$00000011,0)",
-    ):
-        require(token in vop_up or token in vop,
-                f"little-VOP clean-start contract drifted: {token}")
+    # The VOP owner now exposes Linux-compatible CRTC/encoder/primary phases.
+    # Keep the detailed lifecycle contract in its focused checker so this broad
+    # gate cannot pin the obsolete monolithic reset/gather sequence again.
+    vop_gate = ROOT / "tools" / "rockpi4c_vop_lifecycle_check.py"
+    vop_result = subprocess.run(
+        [sys.executable, str(vop_gate), "--root", str(ROOT)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    require(vop_result.returncode == 0,
+            "focused VOP lifecycle gate failed: " +
+            (vop_result.stderr or vop_result.stdout).strip())
 
     # RockCruVpllMode is the final DCLK owner. Trace its complete downstream
     # source path rather than merely validating isolated PLL arithmetic.

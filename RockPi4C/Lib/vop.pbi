@@ -12,34 +12,33 @@
 #ROCK_FB_MAX_BYTES = #ROCK_FB_MAX_WORDS*4
 #ROCK_FB_ALIGNMENT = 16
 
-; WIN0_CTRL0 line-buffer modes used by the pinned Rockchip RGB helper.
+; WIN0_CTRL0 line-buffer modes used by the shipped Rockchip RGB helper.
 #VOP_WIN_ENABLE = 1
 #VOP_WIN_LB_MODE_SHIFT = 5
-#VOP_WIN0_FORMAT_LB_ENABLE_MASK = $000000FF
 #VOP_LB_RGB_2560X4 = 3
 #VOP_LB_RGB_1920X5 = 4
-; Rockchip's RK3368/RK3399-generation VOP driver programs both gather enables
-; and uses three YRGB gathers plus one CBCR gather for ARGB8888 scanout.
-#VOP_WIN0_GATHER_MASK = $00007F03
-#VOP_WIN0_ARGB8888_GATHER = $00001303
-#VOP_WIN0_YRGB_VSU_MODE_MASK = $00400000
-#VOP_WIN0_YRGB_VSU_BIC = $00400000
+#VOP_WIN0_CTRL0_RGB_BASE = $3A000000
+#VOP_WIN0_CTRL1_RGB_UNITY = $00400000
+#VOP_WIN0_SRC_ALPHA_OPAQUE = $00FF0000
 #VOP_DSP_P888_PRE_DITHER = $00000002
+#VOP_DSP_LAYER_LITTLE = $0000E400
+#VOP_FRAME_WAIT_US = 50000
 
 #VOP_CFG_DONE = $000
 #VOP_SYS_CTRL = $008
 #VOP_SYS_CTRL1 = $00C
 #VOP_DSP_CTRL0 = $010
 #VOP_DSP_CTRL1 = $014
+#VOP_DSP_BG = $018
 #VOP_WIN0_CTRL0 = $030
 #VOP_WIN0_CTRL1 = $034
-#VOP_WIN0_COLOR_KEY = $038
 #VOP_WIN0_VIR = $03C
 #VOP_WIN0_YRGB_MST = $040
 #VOP_WIN0_ACT_INFO = $048
 #VOP_WIN0_DSP_INFO = $04C
 #VOP_WIN0_DSP_ST = $050
 #VOP_WIN0_SCL_FACTOR = $054
+#VOP_WIN0_SRC_ALPHA_CTRL = $060
 #VOP_WIN2_CTRL0 = $0B0
 #VOP_POST_HACT = $170
 #VOP_POST_VACT = $174
@@ -49,9 +48,17 @@
 #VOP_HACT = $18C
 #VOP_VTOTAL = $190
 #VOP_VACT = $194
+#VOP_BCSH_COLOR_BAR = $1B0
+#VOP_BCSH_CTRL = $1BC
+#VOP_CABC_CTRL0 = $1C0
+#VOP_CABC_CTRL1 = $1C4
+#VOP_CABC_CTRL2 = $1C8
+#VOP_CABC_CTRL3 = $1CC
 #VOP_AFBCD0_CTRL = $200
 #VOP_INTR_CLEAR0 = $284
 #VOP_INTR_RAW_STATUS0 = $28C
+#VOP_STATUS = $2A4
+#VOP_YUV2YUV_WIN = $2C0
 
 #VOP_INTR_FS = $0001
 #VOP_INTR_BUS_ERROR = $0020
@@ -65,6 +72,8 @@
 
 Global rock_vop_ready.i
 Global rock_vop_error.i
+Global rock_vop_prepared.i
+Global rock_vop_configured.i
 ; Global ordering is not an alignment contract. Reserve one alignment unit
 ; of slack and derive the scanout base within this compiler-owned object.
 Global Dim rock_vop_framebuffer.l[#ROCK_FB_MAX_WORDS+4]
@@ -262,64 +271,82 @@ Procedure.i RockVopModeValid()
   ProcedureReturn 1
 EndProcedure
 
-Procedure.i RockVopUpMode()
-  Protected value.i
+Procedure.i RockVopLatchFrame()
+  Protected start.i
+  Protected now.i
+  Protected timeoutTicks.i
+  Protected attempt.i
+  If rock_timer_frequency < 1000000 : ProcedureReturn 0 : EndIf
+  ; RAW frame-start is used only as a bounded frame boundary witness. Interrupt
+  ; delivery remains disabled. RK3399 interrupt clear uses high-half write mask.
+  RockVopWrite(#VOP_INTR_CLEAR0,$00010001)
+  ASM
+    dsb sy
+  ENDASM
+  RockVopWrite(#VOP_CFG_DONE,1)
+  ASM
+    dsb sy
+  ENDASM
+  timeoutTicks=(rock_timer_frequency/1000000)*#VOP_FRAME_WAIT_US
+  start=RockTimerTicks()
+  For attempt=0 To 9999999
+    If (RockVopRead(#VOP_INTR_RAW_STATUS0) & #VOP_INTR_FS) <> 0
+      RockVopWrite(#VOP_INTR_CLEAR0,$00010001)
+      ProcedureReturn 1
+    EndIf
+    now=RockTimerTicks()
+    If now < start Or now-start >= timeoutTicks : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RockVopPrepareMode()
   Protected pinPolarity.i
-  Protected lineBufferMode.i
   Protected hsyncLength.i
   Protected vsyncLength.i
   Protected hactiveStart.i
   Protected hactiveEnd.i
   Protected vactiveStart.i
   Protected vactiveEnd.i
+  Protected pixelTotal.i
   rock_vop_ready=0
+  rock_vop_prepared=0
+  rock_vop_configured=0
   rock_vop_error=0
   If RockVopModeValid()=0 : ProcedureReturn 0 : EndIf
-  lineBufferMode=RockVopLineBufferMode(rock_mode_width)
-  If lineBufferMode < 0 : rock_vop_error=80 : ProcedureReturn 0 : EndIf
+  If RockCruVopRelease()=0 : rock_vop_error=71 : ProcedureReturn 0 : EndIf
   hsyncLength=rock_mode_hsync_end-rock_mode_hsync_start
   vsyncLength=rock_mode_vsync_end-rock_mode_vsync_start
   hactiveStart=rock_mode_htotal-rock_mode_hsync_start
   hactiveEnd=hactiveStart+rock_mode_width
   vactiveStart=rock_mode_vtotal-rock_mode_vsync_start
   vactiveEnd=vactiveStart+rock_mode_height
-  If RockCruVopRelease()=0 : rock_vop_error=71 : ProcedureReturn 0 : EndIf
-  ; The reference driver pulses the HCLK reset after clocks and power exist.
-  RockCruReset(279,1)
-  RockTimerWaitUs(20)
-  RockCruReset(279,0)
-  ; vop_initial() in the pinned RK3399 driver enables the maximum 30 AXI
-  ; reads outstanding. Reset defaults can feed the proven 1024x768 mode but
-  ; build 57 latched POST_BUF_EMPTY at 1080p. Program the documented VOP
-  ; throughput contract explicitly before scanout is armed.
-  RockVopField(#VOP_SYS_CTRL1,$0003F000,$0003D000)
-  ; vop_initial()/vop_disable_allwin() in the pinned RK3399 Linux driver
-  ; explicitly disables AFBCD and every declared little-VOP plane before the
-  ; new primary plane is configured.  VOPL has WIN0 and WIN2; WIN1/WIN3/HWC
-  ; are not members of its topology.  Establish that same clean state after
-  ; the now-released DCLK reset instead of depending on a bootloader shadow.
-  RockVopField(#VOP_AFBCD0_CTRL,$00000001,0)
-  RockVopField(#VOP_WIN0_CTRL0,$00000001,0)
-  ; WIN2's declared cursor plane has a separate gate bit (b0) and enable bit
-  ; (b4). vop_disable_allwin() clears both; inheriting either from a previous
-  ; firmware owner violates the Linux clean-start sequence.
-  RockVopField(#VOP_WIN2_CTRL0,$00000011,0)
-  ; Route the Cadence transmitter from the little VOP (GRF SOC_CON9 bit12).
-  PokeL(#ROCK_GRF+$6224,$10001000)
-  RockVopFirstFrame()
-  ; RK3399 VOP pin polarity uses positive-pulse bits; Cadence's independent
-  ; MSA/framer polarity fields use negative-pulse semantics.
+  pixelTotal=rock_mode_width*rock_mode_height
   pinPolarity=0
   If rock_mode_hsync_positive <> 0 : pinPolarity=pinPolarity | 1 : EndIf
   If rock_mode_vsync_positive <> 0 : pinPolarity=pinPolarity | 2 : EndIf
-  ; cdn_dp requests AAAA, but RK3399 VOPL has no 10-bit-output feature.
-  ; The pinned DRM driver therefore selects P888 and unconditionally enables
-  ; pre-dither for that mode before the post/output formatter is started.
-  RockVopField(#VOP_DSP_CTRL1,$000F0012,(pinPolarity << 16) | #VOP_DSP_P888_PRE_DITHER)
-  value=RockVopRead(#VOP_SYS_CTRL)
-  value=(value & $FFBF07FF) | $00000800
-  RockVopWrite(#VOP_SYS_CTRL,value)
-  RockVopField(#VOP_DSP_CTRL0,$F,0)
+
+  ; Shipped Linux enables HCLK/DCLK/ACLK before every VOP access and never
+  ; toggles the DCLK reset after CFG_DONE. RockCruVopRelease deasserts the
+  ; bare-metal AXI/AHB/DCLK resets; all following state is owned while live.
+  ; VOPL declares only WIN0 primary and WIN2 cursor. Disable them and AFBCD
+  ; before starting the CRTC background stage.
+  RockVopField(#VOP_AFBCD0_CTRL,$00000001,0)
+  RockVopWrite(#VOP_WIN0_CTRL0,#VOP_WIN0_CTRL0_RGB_BASE)
+  RockVopWrite(#VOP_WIN0_CTRL1,#VOP_WIN0_CTRL1_RGB_UNITY)
+  RockVopField(#VOP_WIN2_CTRL0,$00000011,0)
+
+  ; vop_initial(): unblank, leave DMA running, use DP only, and allow thirty
+  ; global AXI reads outstanding. RGB overlay/output, progressive scan and
+  ; P888 require every DSP_CTRL0 functional field to be zero.
+  RockVopField(#VOP_SYS_CTRL,$0063F800,$00000800)
+  RockVopField(#VOP_SYS_CTRL1,$0003F000,$0003D000)
+  RockVopWrite(#VOP_DSP_CTRL0,0)
+  RockVopWrite(#VOP_DSP_CTRL1,(pinPolarity << 16) | #VOP_DSP_P888_PRE_DITHER)
+  RockVopWrite(#VOP_DSP_BG,0)
+
+  ; Exact progressive CRTC and full-size post path. The shipped driver sets
+  ; the pixel clock before CFG_DONE; RockCruVpllMode owns that earlier phase.
   RockVopWrite(#VOP_HTOTAL,hsyncLength | (rock_mode_htotal << 16))
   RockVopWrite(#VOP_HACT,hactiveEnd | (hactiveStart << 16))
   RockVopWrite(#VOP_VTOTAL,vsyncLength | (rock_mode_vtotal << 16))
@@ -327,42 +354,75 @@ Procedure.i RockVopUpMode()
   RockVopWrite(#VOP_POST_HACT,hactiveEnd | (hactiveStart << 16))
   RockVopWrite(#VOP_POST_VACT,vactiveEnd | (vactiveStart << 16))
   RockVopWrite(#VOP_POST_SCL_FACTOR,#VOP_SCALE_UNITY_XY)
-  RockVopField(#VOP_POST_SCL_CTRL,$3,0)
-  RockVopWrite(#VOP_WIN0_ACT_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
-  RockVopWrite(#VOP_WIN0_DSP_ST,hactiveStart | (vactiveStart << 16))
-  RockVopWrite(#VOP_WIN0_DSP_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
-  RockVopWrite(#VOP_WIN0_SCL_FACTOR,#VOP_SCALE_UNITY_XY)
-  RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
+  RockVopField(#VOP_POST_SCL_CTRL,$00000007,0)
+
+  ; The shipped RK3399 VOPL node exposes its CABC resource. Its disabled-mode
+  ; path still programs the selected frame pixel count, stage-by-stage mode,
+  ; and the global down-limit field on every mode set.
+  RockVopWrite(#VOP_CABC_CTRL0,(pixelTotal << 4) | $00000008)
+  RockVopWrite(#VOP_CABC_CTRL1,pixelTotal << 4)
+  RockVopField(#VOP_CABC_CTRL2,$00080000,0)
+  RockVopField(#VOP_CABC_CTRL3,$00000100,$00000100)
+
+  ; RGB output bypasses BCSH and per-window YUV conversion. Own the bypasses
+  ; explicitly instead of inheriting a previous boot display pipeline.
+  RockVopField(#VOP_BCSH_COLOR_BAR,$00000001,0)
+  RockVopField(#VOP_BCSH_CTRL,$00000011,0)
+  RockVopField(#VOP_YUV2YUV_WIN,$00000007,0)
+
+  ; Latch a background-only CRTC frame before the encoder is enabled. The
+  ; display facade owns the GRF route as part of its encoder-enable phase.
+  If RockVopLatchFrame()=0 : rock_vop_error=81 : ProcedureReturn 0 : EndIf
+  rock_vop_prepared=1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RockVopConfigurePrimary()
+  Protected lineBufferMode.i
+  Protected hactiveStart.i
+  Protected vactiveStart.i
+  If rock_vop_prepared=0 : rock_vop_error=82 : ProcedureReturn 0 : EndIf
+  If RockVopModeValid()=0 : ProcedureReturn 0 : EndIf
+  lineBufferMode=RockVopLineBufferMode(rock_mode_width)
+  If lineBufferMode < 0 : rock_vop_error=80 : ProcedureReturn 0 : EndIf
+  hactiveStart=rock_mode_htotal-rock_mode_hsync_start
+  vactiveStart=rock_mode_vtotal-rock_mode_vsync_start
+  RockVopFirstFrame()
+
+  ; Complete shipped WIN0 RGB-primary state while enable remains clear. The
+  ; no-scale helper selects BIC vertical-up coefficients, unity factors, and
+  ; LB4 through 1920 pixels (LB3 above it). It does not enable AXI gather.
+  RockVopWrite(#VOP_WIN0_CTRL0,#VOP_WIN0_CTRL0_RGB_BASE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
+  RockVopWrite(#VOP_WIN0_CTRL1,#VOP_WIN0_CTRL1_RGB_UNITY)
   RockVopWrite(#VOP_WIN0_VIR,rock_mode_pitch >> 2)
-  ; scl_vop_cal_scl_fac() selects the 5-line RGB buffer at 1920 pixels and
-  ; programs YRGB vertical-up mode BIC even when the scale modes themselves
-  ; are NONE. Own that active-path field instead of inheriting its reset value.
-  RockVopField(#VOP_WIN0_CTRL1,#VOP_WIN0_GATHER_MASK | #VOP_WIN0_YRGB_VSU_MODE_MASK,#VOP_WIN0_ARGB8888_GATHER | #VOP_WIN0_YRGB_VSU_BIC)
-  ; VOP_LIT WIN0_CTRL0 resets to $3A000040: bits29:25 carry the documented
-  ; per-window AXI outstanding limit ($1D). Linux programs format, line-buffer
-  ; mode and enable through field updates, preserving those throughput bits.
-  ; A full $81 write erased them. Preserving them corrects that divergence,
-  ; but build75 still reports POST_BUF_EMPTY: this is not its proven cause.
-  ; Own the low functional byte while retaining the reset-owned AXI contract
-  ; established by RockCruVopRelease().
-  RockVopField(#VOP_WIN0_CTRL0,#VOP_WIN0_FORMAT_LB_ENABLE_MASK,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
-  RockVopWrite(#VOP_CFG_DONE,1)
-  ; Linux writel()/U-Boot writel() order device MMIO before the following CRU
-  ; reset write.  Preserve that contract explicitly: CFG_DONE must reach VOPL
-  ; before the real DCLK assert/deassert pulse is started.
-  ASM
-    dsb sy
-  ENDASM
-  ; Latch the new pixel clock into the VOP only after every timing register and
-  ; scan address is valid.
-  RockCruReset(281,1)
-  RockTimerWaitUs(20)
-  RockCruReset(281,0)
-  RockVopWrite(#VOP_CFG_DONE,1)
-  ASM
-    dsb sy
-  ENDASM
+  RockVopWrite(#VOP_WIN0_ACT_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
+  RockVopWrite(#VOP_WIN0_DSP_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
+  RockVopWrite(#VOP_WIN0_DSP_ST,hactiveStart | (vactiveStart << 16))
+  RockVopWrite(#VOP_WIN0_SCL_FACTOR,#VOP_SCALE_UNITY_XY)
+  RockVopWrite(#VOP_WIN0_SRC_ALPHA_CTRL,#VOP_WIN0_SRC_ALPHA_OPAQUE)
+  RockVopField(#VOP_DSP_CTRL1,$0000FF00,#VOP_DSP_LAYER_LITTLE)
+  RockVopField(#VOP_YUV2YUV_WIN,$00000007,0)
+  rock_vop_configured=1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RockVopStartPrimary()
+  If rock_vop_prepared=0 Or rock_vop_configured=0
+    rock_vop_error=83
+    ProcedureReturn 0
+  EndIf
+  RockVopField(#VOP_WIN0_CTRL0,#VOP_WIN_ENABLE,#VOP_WIN_ENABLE)
+  If RockVopLatchFrame()=0 : rock_vop_error=84 : ProcedureReturn 0 : EndIf
   rock_vop_ready=1
   ProcedureReturn 1
+EndProcedure
+
+; Compatibility wrapper for isolated VOP tests. The display facade uses the
+; three lifecycle phases so the encoder is enabled between background CRTC and
+; primary-plane commit, matching rockchip_atomic_commit_complete().
+Procedure.i RockVopUpMode()
+  If RockVopPrepareMode()=0 : ProcedureReturn 0 : EndIf
+  If RockVopConfigurePrimary()=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn RockVopStartPrimary()
 EndProcedure
