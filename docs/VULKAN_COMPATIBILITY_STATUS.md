@@ -467,6 +467,34 @@ candidate times out, reset the monitor/board before judging a later candidate:
 shutdown cannot prove it repaired an engine that did not complete, and a later
 red result from inherited state is not independent evidence.
 
+**2026-09-13, run 9 — PASSED. Sampled-state integration preserves the visible
+V3D path.** The final returning container was built from public main through
+`4e24052`, was 575,804 bytes, and had SHA-256
+`177c3c3f4d17437f7cdf568b3df0707786c0c54a12eb11cf6f34fa04443c3c7f`.
+Monitor build 101 received and independently hashed those exact bytes at
+`$00500000`; the run used the DMA console, a 15-second hardware deadman and a
+fresh screenshot. The report at `$00596000` had both magics and step 12.
+
+All three diagnostic verdicts were zero. The format feature word was `$81`
+(`SAMPLED_IMAGE | COLOR_ATTACHMENT`), five allocations were populated through
+`vkMapMemory`, all three submits and waits were zero, bin/render jobs advanced
+from 0 to 3, native error/OOM/MMU counts were zero, the guard remained
+`$C0E6C000`, and all pixel distances and over-tolerance counts were zero. The
+captured 1280x800 frame visibly contains the complete interpolated triangle;
+its pixel SHA-256 is
+`715531a2bbd059308f3e6b5dd9fef4226891632c1ef2d88065222e965cc3add2`.
+
+Two earlier attempts in this same slot were honest RED diagnostic controls,
+not GPU failures: first the diagnostic still expected the old format-feature
+word and stopped before submission, then its deliberately unsupported
+descriptor case still named combined image sampler after that type became the
+accepted bounded state. Those consumers were updated to the new contract; the
+final diagnostic instead refuses `STORAGE_IMAGE`, and its five intended
+validation refusals all remained present. This run proves integration and no
+regression of the existing visible V3D/TMU path. The new combined-image-sampler
+record itself remains desk-only state until SPIR-V texture instructions and a
+V3D texture fetch consume it; no sampled pixel is claimed.
+
 
 ## Required architecture
 
