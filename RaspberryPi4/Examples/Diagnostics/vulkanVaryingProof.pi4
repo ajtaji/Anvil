@@ -331,6 +331,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_CLEAR_A = $3F800000               ; 1.0 -> 255
 #VVP_CLEAR_WORD = $FF3380B2
 #VVP_MAGENTA_WORD = $FFFF00FF
+#VVP_TEXTURE_WORD = $FFFFC020           ; opaque R=255, G=192, B=32
 #VVP_TMU_GENERAL_VEC4 = $FFFFFF7C
 
 ; The triangle, in clip space. +Y is DOWN, which is Vulkan's framebuffer
@@ -497,7 +498,34 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_S_DESC_LOWERING = 124
 #VVP_S_STEP = 125
 #VVP_S_BYTES = 126
-#VVP_S_TAIL = 127
+#VVP_S_STATUS_D = 128
+#VVP_S_TEX_ADDR = 129
+#VVP_S_TEX_PIPE = 130
+#VVP_S_TEX_SUBMIT = 131
+#VVP_S_TEX_WAIT = 132
+#VVP_S_TEX_IN0 = 133                   ; .. 135
+#VVP_S_TEX_OUT0 = 136                  ; .. 138
+#VVP_S_TEX_FS_BYTES = 139
+#VVP_S_TEX_STREAM_TEX = 140
+#VVP_S_TEX_STREAM_SAMP = 141
+#VVP_S_TEX_STREAM_TLB = 142
+#VVP_S_TEX_STATE_BASE = 143
+#VVP_S_TEX_STATE_WIDTH = 144
+#VVP_S_TEX_STATE_HEIGHT = 145
+#VVP_S_TEX_STATE_FORMAT = 146
+#VVP_S_TEX_SAMP0 = 147
+#VVP_S_TEX_SAMP1 = 148
+#VVP_S_TEX_BIN_BEFORE = 149
+#VVP_S_TEX_BIN_AFTER = 150
+#VVP_S_TEX_RENDER_BEFORE = 151
+#VVP_S_TEX_RENDER_AFTER = 152
+#VVP_S_TEX_MMU = 153
+#VVP_S_TEX_OOM = 154
+#VVP_S_TEX_NATIVE = 155
+#VVP_S_TEX_DETAIL = 156
+#VVP_S_TEX_SHADER_RECORD = 157
+#VVP_S_TEX_DRAWS = 158
+#VVP_S_TAIL = 159
 
 ; ======================================================================
 ;  THE REPORT IS 32 BITS WIDE AND THAT IS NOT A DETAIL
@@ -513,7 +541,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 ;  below 4 GiB, the pixels are 32-bit words by definition, and the area
 ;  and the guard sum are masked to 32 bits below.
 ; ======================================================================
-Global Dim vvpReport.l[128]
+Global Dim vvpReport.l[160]
 Global Dim vvpClear.l[4]
 Global Dim vvpProbeX.i[7]
 Global Dim vvpProbeY.i[7]
@@ -521,7 +549,7 @@ Global Dim vvpOutX.i[3]
 Global Dim vvpOutY.i[3]
 
 Procedure vvpPut(slot.i, value.i)
-  If slot < 0 Or slot > 127
+  If slot < 0 Or slot > 159
     ProcedureReturn
   EndIf
   vvpReport[slot] = value & $FFFFFFFF
@@ -531,7 +559,7 @@ EndProcedure
 ; 64-bit comparison. A pixel of $FFFF0000 read from a .l is -65536, and
 ; comparing that against the constant would fail on every correct run.
 Procedure.i vvpGet(slot.i)
-  If slot < 0 Or slot > 127
+  If slot < 0 Or slot > 159
     ProcedureReturn 0
   EndIf
   ProcedureReturn vvpReport[slot] & $FFFFFFFF
@@ -547,6 +575,7 @@ Procedure.i vvpStop(status.i)
   If vvpGet(#VVP_S_STATUS_A) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_A, status) : EndIf
   If vvpGet(#VVP_S_STATUS_B) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_B, status) : EndIf
   If vvpGet(#VVP_S_STATUS_C) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_C, status) : EndIf
+  If vvpGet(#VVP_S_STATUS_D) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_D, status) : EndIf
   vvpPut(#VVP_S_FAULT_TEXT, AnvilVkFaultText())
   vvpPut(#VVP_S_FAULT_COUNT, AnvilVkFaultCount())
   ProcedureReturn @vvpReport[0]
@@ -590,6 +619,358 @@ Procedure vvpProbes()
   vvpOutX[0] = 100 : vvpOutY[0] = 100
   vvpOutX[1] = 700 : vvpOutY[1] = 1200
   vvpOutX[2] = 400 : vvpOutY[2] = 200
+EndProcedure
+
+; One complete sampled-image pass over the already-created device and render
+; target. The source is a separate 1x1 image: using the colour attachment as
+; its own sampler would be invalid Vulkan and would prove nothing.
+Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.VkCommandBufferBeginInfo, *rpbi.VkRenderPassBeginInfo, bufAll.i, imgBase.i)
+  Define status.i
+  Define rc.i
+  Define tex.i
+  Define texMem.i
+  Define texView.i
+  Define sampler.i
+  Define dsl.i
+  Define dpool.i
+  Define dset.i
+  Define layout.i
+  Define vs.i
+  Define fs.i
+  Define pipe.i
+  Define mapped.i
+  Define bytesVs.i
+  Define bytesFs.i
+  Define texAddr.i
+  Define shrec.i
+  Define stream.i
+  Define texState.i
+  Define sampState.i
+  Define bad.i
+  Define k.i
+  Define fenceArray.i
+  Define dslArray.i
+  Define dsetArray.i
+  Define bufHandle.i
+  Define bufOffset.q
+  Define ici.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define sci.VkSamplerCreateInfo
+  Define dslb.VkDescriptorSetLayoutBinding
+  Define dslci.VkDescriptorSetLayoutCreateInfo
+  Define dps.VkDescriptorPoolSize
+  Define dpci.VkDescriptorPoolCreateInfo
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dii.VkDescriptorImageInfo
+  Define wds.VkWriteDescriptorSet
+  Define plci.VkPipelineLayoutCreateInfo
+  Define smci.VkShaderModuleCreateInfo
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define bind.VkVertexInputBindingDescription
+  Define Dim attrs.VkVertexInputAttributeDescription[2]
+  Define vi.VkPipelineVertexInputStateCreateInfo
+  Define ia.VkPipelineInputAssemblyStateCreateInfo
+  Define vpstate.VkPipelineViewportStateCreateInfo
+  Define vp.VkViewport
+  Define sc.VkRect2D
+  Define rs.VkPipelineRasterizationStateCreateInfo
+  Define ms.VkPipelineMultisampleStateCreateInfo
+  Define cba.VkPipelineColorBlendAttachmentState
+  Define cb.VkPipelineColorBlendStateCreateInfo
+  Define gp.VkGraphicsPipelineCreateInfo
+  Define bar.VkImageMemoryBarrier
+
+  status = #VVP_OK
+  vvpPut(#VVP_S_TEX_BIN_BEFORE, V3dBinJobs())
+  vvpPut(#VVP_S_TEX_RENDER_BEFORE, V3dRenderJobs())
+
+  ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  ici\imageType = #VK_IMAGE_TYPE_2D
+  ici\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ici\extent\width = 1
+  ici\extent\height = 1
+  ici\extent\depth = 1
+  ici\mipLevels = 1
+  ici\arrayLayers = 1
+  ici\samples = #VK_SAMPLE_COUNT_1_BIT
+  ici\tiling = #VK_IMAGE_TILING_LINEAR
+  ici\usage = #VK_IMAGE_USAGE_SAMPLED_BIT
+  ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(dev, @ici, 0, @tex)
+  If rc <> #VK_SUCCESS : status = #VVP_ERR_IMAGE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+
+  If status = #VVP_OK
+    vkGetImageMemoryRequirements(dev, tex, @req)
+    mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    mai\allocationSize = req\size
+    mai\memoryTypeIndex = 0
+    rc = vkAllocateMemory(dev, @mai, 0, @texMem)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_MEMORY : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    rc = vkBindImageMemory(dev, tex, texMem, 0)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_BIND : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    texAddr = AnvilVkImageAddress(tex)
+    vvpPut(#VVP_S_TEX_ADDR, texAddr)
+    rc = vkMapMemory(dev, texMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+    If rc <> #VK_SUCCESS Or mapped <> texAddr
+      status = #VVP_ERR_MAP
+      vvpPut(#VVP_S_TEX_DETAIL, rc)
+    Else
+      PokeL(mapped, #VVP_TEXTURE_WORD)
+      vkUnmapMemory(dev, texMem)
+    EndIf
+  EndIf
+
+  If status = #VVP_OK
+    ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    ivci\image = tex
+    ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+    ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+    ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    ivci\subresourceRange\levelCount = 1
+    ivci\subresourceRange\layerCount = 1
+    rc = vkCreateImageView(dev, @ivci, 0, @texView)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_VIEW : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    sci\sType = #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+    sci\magFilter = #VK_FILTER_LINEAR
+    sci\minFilter = #VK_FILTER_NEAREST
+    sci\mipmapMode = #VK_SAMPLER_MIPMAP_MODE_NEAREST
+    sci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    sci\addressModeV = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    sci\addressModeW = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    rc = vkCreateSampler(dev, @sci, 0, @sampler)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DESCRIPTOR : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+
+  If status = #VVP_OK
+    dslb\binding = 0
+    dslb\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    dslb\descriptorCount = 1
+    dslb\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+    dslci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    dslci\bindingCount = 1
+    dslci\pBindings = @dslb
+    rc = vkCreateDescriptorSetLayout(dev, @dslci, 0, @dsl)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DESCRIPTOR : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    dps\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    dps\descriptorCount = 1
+    dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+    dpci\maxSets = 1
+    dpci\poolSizeCount = 1
+    dpci\pPoolSizes = @dps
+    rc = vkCreateDescriptorPool(dev, @dpci, 0, @dpool)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DESCRIPTOR : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    dslArray = dsl
+    dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    dsai\descriptorPool = dpool
+    dsai\descriptorSetCount = 1
+    dsai\pSetLayouts = @dslArray
+    rc = vkAllocateDescriptorSets(dev, @dsai, @dset)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DESCRIPTOR : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    dii\sampler = sampler
+    dii\imageView = texView
+    dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    wds\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    wds\dstSet = dset
+    wds\dstBinding = 0
+    wds\descriptorCount = 1
+    wds\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    wds\pImageInfo = @dii
+    AnvilVkFaultClear()
+    vkUpdateDescriptorSets(dev, 1, @wds, 0, 0)
+    If AnvilVkFaultCode() <> #ANVIL_VK_OK
+      status = #VVP_ERR_DESCRIPTOR
+      vvpPut(#VVP_S_TEX_DETAIL, AnvilVkFaultCode())
+    EndIf
+  EndIf
+
+  If status = #VVP_OK
+    plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+    plci\setLayoutCount = 1
+    plci\pSetLayouts = @dslArray
+    rc = vkCreatePipelineLayout(dev, @plci, 0, @layout)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_LAYOUT : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    bytesVs = vtpBuildVsD()
+    bytesFs = vtpBuildFsD()
+    smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+    smci\pCode = @vtpVsD[0] : smci\codeSize = bytesVs
+    rc = vkCreateShaderModule(dev, @smci, 0, @vs)
+    If rc = #VK_SUCCESS
+      smci\pCode = @vtpFsD[0] : smci\codeSize = bytesFs
+      rc = vkCreateShaderModule(dev, @smci, 0, @fs)
+    EndIf
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_SHADER : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+
+  If status = #VVP_OK
+    stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT
+    stages[0]\module = vs
+    stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+    stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT
+    stages[1]\module = fs
+    bind\binding = 0 : bind\stride = #VVP_STRIDE_ALL : bind\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+    attrs[0]\location = 0 : attrs[0]\binding = 0 : attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT : attrs[0]\offset = 0
+    attrs[1]\location = 1 : attrs[1]\binding = 0 : attrs[1]\format = #VK_FORMAT_R32G32_SFLOAT : attrs[1]\offset = 8
+    vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+    vi\vertexBindingDescriptionCount = 1 : vi\pVertexBindingDescriptions = @bind
+    vi\vertexAttributeDescriptionCount = 2 : vi\pVertexAttributeDescriptions = @attrs[0]
+    ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+    ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    PokeL(@vp\width, $44480000) : PokeL(@vp\height, $44A00000)
+    PokeL(@vp\maxDepth, #VVP_F_ONE)
+    sc\extent\width = #VVP_PANEL_W : sc\extent\height = #VVP_PANEL_H
+    vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+    vpstate\viewportCount = 1 : vpstate\pViewports = @vp
+    vpstate\scissorCount = 1 : vpstate\pScissors = @sc
+    rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+    rs\polygonMode = #VK_POLYGON_MODE_FILL : rs\cullMode = #VK_CULL_MODE_NONE
+    rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE : PokeL(@rs\lineWidth, #VVP_F_ONE)
+    ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+    ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+    cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+    cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+    cb\attachmentCount = 1 : cb\pAttachments = @cba
+    gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+    gp\stageCount = 2 : gp\pStages = @stages[0]
+    gp\pVertexInputState = @vi : gp\pInputAssemblyState = @ia
+    gp\pViewportState = @vpstate : gp\pRasterizationState = @rs
+    gp\pMultisampleState = @ms : gp\pColorBlendState = @cb
+    gp\layout = layout : gp\renderPass = *rpbi\renderPass : gp\subpass = 0 : gp\basePipelineIndex = -1
+    rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipe)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_PIPELINE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+    vvpPut(#VVP_S_TEX_PIPE, AnvilVkPipelineCodeBase(pipe))
+  EndIf
+
+  ; Transition the sampled image before recording the draw that consumes it.
+  If status = #VVP_OK
+    bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\image = tex
+    bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    bar\subresourceRange\levelCount = 1
+    bar\subresourceRange\layerCount = 1
+    vkResetCommandBuffer(cmd, 0)
+    rc = vkBeginCommandBuffer(cmd, *bi)
+    If rc = #VK_SUCCESS
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      rc = vkEndCommandBuffer(cmd)
+    EndIf
+    fenceArray = fence
+    If rc = #VK_SUCCESS : rc = vkResetFences(dev, 1, @fenceArray) : EndIf
+    If rc = #VK_SUCCESS : rc = vkQueueSubmit(queue, 1, *si, fence) : EndIf
+    If rc = #VK_SUCCESS : rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) : EndIf
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_FENCE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+
+  If status = #VVP_OK
+    vkResetCommandBuffer(cmd, 0)
+    rc = vkBeginCommandBuffer(cmd, *bi)
+    dsetArray = dset
+    bufHandle = bufAll
+    bufOffset = 0
+    If rc = #VK_SUCCESS
+      vkCmdBeginRenderPass(cmd, *rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+      vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe)
+      vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+      vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @dsetArray, 0, 0)
+      vkCmdDraw(cmd, 3, 1, 0, 0)
+      vkCmdEndRenderPass(cmd)
+      rc = vkEndCommandBuffer(cmd)
+    EndIf
+    If rc <> #VK_SUCCESS
+      status = #VVP_ERR_RECORD
+      vvpPut(#VVP_S_TEX_DETAIL, rc)
+    Else
+      vkResetFences(dev, 1, @fenceArray)
+      rc = vkQueueSubmit(queue, 1, *si, fence)
+      vvpPut(#VVP_S_TEX_SUBMIT, rc)
+      If rc = #VK_SUCCESS
+        rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+        vvpPut(#VVP_S_TEX_WAIT, rc)
+      EndIf
+      If rc <> #VK_SUCCESS : status = #VVP_ERR_SUBMIT : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+    EndIf
+  EndIf
+
+  If status = #VVP_OK
+    shrec = AnvilVkV3dLastShaderRecord()
+    vvpPut(#VVP_S_TEX_SHADER_RECORD, shrec)
+    vvpPut(#VVP_S_TEX_FS_BYTES, AnvilVkV3dProgramBytes(avkPipeSlot(pipe), 2))
+    If shrec <> 0
+      stream = PeekL(shrec + 16) & $FFFFFFFF
+      vvpPut(#VVP_S_TEX_STREAM_TEX, PeekL(stream + 0) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_STREAM_SAMP, PeekL(stream + 4) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_STREAM_TLB, PeekL(stream + 8) & $FFFFFFFF)
+      texState = (PeekL(stream + 0) & $FFFFFFFF) & $FFFFFFF0
+      sampState = (PeekL(stream + 4) & $FFFFFFFF) & $FFFFFFFE
+      vvpPut(#VVP_S_TEX_STATE_BASE, PeekL(texState + 0) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_STATE_WIDTH, PeekL(texState + 4) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_STATE_HEIGHT, PeekL(texState + 8) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_STATE_FORMAT, PeekL(texState + 12) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_SAMP0, PeekL(sampState + 0) & $FFFFFFFF)
+      vvpPut(#VVP_S_TEX_SAMP1, PeekL(sampState + 4) & $FFFFFFFF)
+    EndIf
+    bad = 0
+    k = 0
+    While k < 3
+      vvpPut(#VVP_S_TEX_IN0 + k, vvpPixel(imgBase, #VVP_PANEL_PITCH, 400, 500 + (k * 200)))
+      If vvpGet(#VVP_S_TEX_IN0 + k) <> #VVP_TEXTURE_WORD : bad = bad + 1 : EndIf
+      vvpPut(#VVP_S_TEX_OUT0 + k, vvpPixel(imgBase, #VVP_PANEL_PITCH, vvpOutX[k], vvpOutY[k]))
+      If vvpGet(#VVP_S_TEX_OUT0 + k) <> #VVP_CLEAR_WORD : bad = bad + 1 : EndIf
+      k = k + 1
+    Wend
+    If bad <> 0 : status = #VVP_ERR_PIXELS_IN : vvpPut(#VVP_S_TEX_DETAIL, bad) : EndIf
+  EndIf
+
+  vvpPut(#VVP_S_TEX_BIN_AFTER, V3dBinJobs())
+  vvpPut(#VVP_S_TEX_RENDER_AFTER, V3dRenderJobs())
+  vvpPut(#VVP_S_TEX_MMU, V3dMmuFaultsNow())
+  vvpPut(#VVP_S_TEX_OOM, V3dBinOomCount())
+  vvpPut(#VVP_S_TEX_NATIVE, AnvilVkBackendNativeError())
+  vvpPut(#VVP_S_TEX_DRAWS, avkBackendDraws())
+  If status = #VVP_OK
+    If vvpGet(#VVP_S_TEX_BIN_AFTER) <= vvpGet(#VVP_S_TEX_BIN_BEFORE) Or vvpGet(#VVP_S_TEX_RENDER_AFTER) <= vvpGet(#VVP_S_TEX_RENDER_BEFORE)
+      status = #VVP_ERR_NO_JOBS
+    ElseIf vvpGet(#VVP_S_TEX_MMU) <> 0 Or vvpGet(#VVP_S_TEX_OOM) <> 0 Or vvpGet(#VVP_S_TEX_NATIVE) <> 0
+      status = #VVP_ERR_V3D_FAULT
+    ElseIf vvpGet(#VVP_S_TEX_STATE_BASE) <> (texAddr & $FFFFFFFF) Or vvpGet(#VVP_S_TEX_STATE_WIDTH) <> (1 << 26) Or vvpGet(#VVP_S_TEX_STATE_HEIGHT) <> ((1 << 8) | (1 << 22)) Or vvpGet(#VVP_S_TEX_STREAM_TLB) <> $FFFFFFFF
+      status = #VVP_ERR_DESCRIPTOR_LOWERING
+    EndIf
+  EndIf
+
+  vkDeviceWaitIdle(dev)
+  vkDestroyPipeline(dev, pipe, 0)
+  vkDestroyShaderModule(dev, vs, 0)
+  vkDestroyShaderModule(dev, fs, 0)
+  vkDestroyPipelineLayout(dev, layout, 0)
+  vkDestroyDescriptorPool(dev, dpool, 0)
+  vkDestroyDescriptorSetLayout(dev, dsl, 0)
+  vkDestroySampler(dev, sampler, 0)
+  vkDestroyImageView(dev, texView, 0)
+  vkDestroyImage(dev, tex, 0)
+  vkFreeMemory(dev, texMem, 0)
+  ProcedureReturn status
 EndProcedure
 
 Procedure.i Main()
@@ -708,11 +1089,12 @@ Procedure.i Main()
 
   vvpPut(#VVP_S_MAGIC, #VVP_MAGIC)
   vvpPut(#VVP_S_TAIL, #VVP_TAIL_MAGIC)
-  vvpPut(#VVP_S_BYTES, 512)
+  vvpPut(#VVP_S_BYTES, 640)
   vvpStep(0)
   vvpPut(#VVP_S_STATUS_A, #VVP_NOT_TRIED)
   vvpPut(#VVP_S_STATUS_B, #VVP_NOT_TRIED)
   vvpPut(#VVP_S_STATUS_C, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_STATUS_D, #VVP_NOT_TRIED)
   vvpPut(#VVP_S_PRESENT, #VVP_P_NOT_TRIED)
   vvpPut(#VVP_S_SURFACE, #VVP_SURFACE)
   vvpPut(#VVP_S_WIN_BASE, #VVP_WIN_BASE)
@@ -1630,6 +2012,11 @@ Procedure.i Main()
     vvpPut(#VVP_S_STATUS_C, #VVP_ERR_RECORD)
   EndIf
 
+  ; PASS D: the fragment shader performs a real V3D texture request through
+  ; a combined image sampler. This final pass is what remains on the panel.
+  vvpStep(10)
+  vvpPut(#VVP_S_STATUS_D, vvpSamplePass(dev, queue, cmd, fence, @si, @bi, @rpbi, bufAll, imgBase))
+
   vvpPut(#VVP_S_BIN_AFTER, V3dBinJobs())
   vvpPut(#VVP_S_RENDER_AFTER, V3dRenderJobs())
   vvpPut(#VVP_S_BIN_OOM, V3dBinOomCount())
@@ -1641,9 +2028,9 @@ Procedure.i Main()
   vvpPut(#VVP_S_DRAWS, avkBackendDraws())
 
   ; ------------------------------------------------------------------
-  ;  10. Present what is on the image now - pass C's gradient.
+  ;  11. Present what is on the image now - pass D's sampled solid triangle.
   ; ------------------------------------------------------------------
-  vvpStep(10)
+  vvpStep(11)
   rc = DisplayAdopt(#VVP_DSI_SCAN, #VVP_PANEL_PITCH, #VVP_PANEL_W, #VVP_PANEL_H, 32)
   vvpPut(#VVP_S_DISPLAY_ERR, DisplayLastError())
   If rc = #DSP_OK
@@ -1656,9 +2043,9 @@ Procedure.i Main()
   EndIf
 
   ; ------------------------------------------------------------------
-  ;  11. Ordered teardown, then hand the V3D MMU back.
+  ;  12. Ordered teardown, then hand the V3D MMU back.
   ; ------------------------------------------------------------------
-  vvpStep(11)
+  vvpStep(12)
   vkDeviceWaitIdle(dev)
   vkDestroyFence(dev, fence, 0)
   vkDestroyPipeline(dev, pipeA, 0)
@@ -1693,12 +2080,12 @@ Procedure.i Main()
   vvpPut(#VVP_S_SHUTDOWN, 1)
 
   ; ------------------------------------------------------------------
-  ;  12. The verdicts that belong to the run as a whole. They are
+  ;  13. The verdicts that belong to the run as a whole. They are
   ;      checked in the order that makes the earliest real cause the one
   ;      reported, and they overwrite a pass verdict only when the whole
   ;      run is suspect.
   ; ------------------------------------------------------------------
-  vvpStep(12)
+  vvpStep(13)
   If vvpGet(#VVP_S_BIN_AFTER) <= vvpGet(#VVP_S_BIN_BEFORE) Or vvpGet(#VVP_S_RENDER_AFTER) <= vvpGet(#VVP_S_RENDER_BEFORE)
     ProcedureReturn vvpStop(#VVP_ERR_NO_JOBS)
   EndIf
