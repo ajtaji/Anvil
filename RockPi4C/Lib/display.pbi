@@ -224,7 +224,7 @@ Procedure RockDisplayScanoutTelemetry()
   RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
-Procedure RockDisplayFrameTelemetry()
+Procedure.i RockDisplayFrameTelemetry()
   Protected start.i
   Protected now.i
   Protected deadline.i
@@ -285,6 +285,9 @@ Procedure RockDisplayFrameTelemetry()
   RockUartText(" COUNT B/W/P ") : RockDisplayDecimal(busFaultFrames) : RockUartByte(47)
   RockDisplayDecimal(win0FaultFrames) : RockUartByte(47) : RockDisplayDecimal(postFaultFrames)
   RockUartByte(13) : RockUartByte(10)
+  ; Transport activation is not display readiness. A recurring underrun or
+  ; missing frame boundary must not publish a usable scanout capability.
+  ProcedureReturn Bool(frames=9 And faults=0)
 EndProcedure
 
 Procedure RockDisplayLiveLinkTelemetry()
@@ -425,6 +428,18 @@ Procedure RockDisplayCruTelemetry()
       RockUartText("TCPD0")
     ElseIf rock_cru_error >= 63 And rock_cru_error <= 65
       RockUartText("VPLL")
+    ElseIf rock_cru_error = 66
+      RockUartText("PIXEL CLOCK PLAN")
+    ElseIf rock_cru_error = 67 Or rock_cru_error = 68
+      RockUartText("VIO/HDCP CLOCK TREE")
+    ElseIf rock_cru_error = 69
+      RockUartText("TCPHY CLOCK TREE")
+    ElseIf rock_cru_error = 70 Or rock_cru_error = 71
+      RockUartText("CDN/SPDIF CLOCK TREE")
+    ElseIf rock_cru_error = 72 Or rock_cru_error = 73
+      RockUartText("VOP CLOCK TREE")
+    ElseIf rock_cru_error >= 74 And rock_cru_error <= 79
+      RockUartText("DISPLAY CLOCK GATES")
     Else
       RockUartText("UNKNOWN")
     EndIf
@@ -618,48 +633,77 @@ Procedure.i RockDisplayUp()
     RockDisplaySubsystemTelemetry("DPEC CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(12,"DPEC VIDEO IDLE")
   EndIf
-  ; Resolve the trained link's real bandwidth and TU constraints before
-  ; arming scanout. Never silently send a guessed mode to the monitor.
-  configured = RockCdnVideoMode()
+  ; Admit the selected mode before any timing registers are programmed.
+  ; The encoder's pure plan performs no mailbox writes on refusal.
+  configured = RockCdnPlanVideo()
   If configured = 0 And (rock_cdn_error = 35 Or rock_cdn_error = 36)
     modeFailure = rock_cdn_error
     If RockModeFallback(@rock_cdn_edid[0],modeFailure) <> 0
       RockDisplayModeTelemetry("DP MODE FALLBACK ")
-      configured = RockCdnVideoMode()
+      configured = RockCdnPlanVideo()
     EndIf
   EndIf
   If configured=0
     RockDisplaySubsystemTelemetry("DPED CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(13,"DPED VIDEO TIMING")
   EndIf
+  If RockVopModeValid()=0
+    RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
+    ProcedureReturn RockDisplayFail(10,"Display admission failed with code 10; check the selected mode's timing and framebuffer bounds.")
+  EndIf
   If RockCruVpllMode()=0
     RockDisplaySubsystemTelemetry("DPE1 CRU ERR ",rock_cru_error)
     ProcedureReturn RockDisplayFail(1,"DPE1 SELECTED PIXEL CLOCK")
   EndIf
-  If RockVopUpMode()=0
+  ; Mirror the full Rockchip DRM lifecycle, not isolated register snippets:
+  ; rockchip_drm_fb.c rockchip_atomic_commit_complete enables the CRTC,
+  ; then its encoder, then commits the primary plane. drm_atomic_helper.c
+  ; commit_modeset_enables establishes that CRTC-before-encoder ordering.
+  If RockVopPrepareMode()=0
     RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
-    ProcedureReturn RockDisplayFail(10,"DPEA VOPL FRAMEBUFFER")
+    ProcedureReturn RockDisplayFail(10,"Display setup failed with code 10; check the VOP timing-generator initialization.")
   EndIf
-  RockDisplayStage("DP06 COLOR BARS AND TEXT ARMED")
-  RockDisplayScanoutTelemetry()
+  ; cdn_dp_encoder_enable owns GRF_SOC_CON9 DP_SEL_VOP_LIT. The
+  ; transmitter route belongs to this encoder commit, not plane setup.
+  PokeL(#ROCK_GRF+$6224,$10001000)
+  If RockCdnVideoMode()=0
+    RockDisplaySubsystemTelemetry("DPED CDN ERR ",rock_cdn_error)
+    ProcedureReturn RockDisplayFail(13,"Display setup failed with code 13; check the DisplayPort timing programming.")
+  EndIf
   If RockCdnVideoStatus(1)=0
     RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
   EndIf
+  If RockVopConfigurePrimary()=0
+    RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
+    ProcedureReturn RockDisplayFail(10,"Display setup failed with code 10; check the primary-plane configuration.")
+  EndIf
+  If RockVopStartPrimary()=0
+    RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
+    ProcedureReturn RockDisplayFail(10,"Display setup failed with code 10; check the primary-plane frame boundary.")
+  EndIf
+  RockDisplayStage("DP06 COLOR BARS AND TEXT ARMED")
+  RockDisplayScanoutTelemetry()
   RockTimerWaitUs(50000)
   If RockCdnReadLiveLinkStatus()<>0
     RockDisplayLiveLinkTelemetry()
     RockDisplayCadenceTelemetry()
   Else
     RockDisplayLiveLinkTelemetry()
+    ProcedureReturn RockDisplayFail(17,"Display validation failed with code 17; check the DisplayPort link-status response.")
   EndIf
-  RockDisplayFrameTelemetry()
+  If (rock_cdn_live_link_status[0] & $77)<>$77 Or (rock_cdn_live_link_status[2] & 1)=0
+    ProcedureReturn RockDisplayFail(17,"Display validation failed with code 17; check DisplayPort lane alignment and channel equalization.")
+  EndIf
+  If RockDisplayFrameTelemetry()=0
+    ProcedureReturn RockDisplayFail(16,"Display validation failed with code 16; scanout underruns or frame boundaries are missing. Check the timing and pixel-supply pipeline.")
+  EndIf
   rock_display_width=rock_mode_width
   rock_display_height=rock_mode_height
   rock_display_pitch=rock_mode_pitch
   rock_display_buffer=RockVopFramebuffer()
   rock_display_ready=1
-  RockDisplayModeTelemetry("DP08 VISIBLE ")
+  RockDisplayModeTelemetry("DP08 SCANOUT READY ")
   ProcedureReturn 1
 EndProcedure
 

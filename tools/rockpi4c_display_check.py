@@ -243,11 +243,11 @@ def source_contract() -> None:
         "rockpmuidlerelease(17", "rockpmuidlerelease(11",
         "rockpmuidlerelease(8", "$30003000", "$10001000",
         "rock_cru_gpll_rate = rockcrupllrate($80,1,47)",
-        "rockcruvpllmode()", "$1fdf,$0080 | (aclkdivider-1)",
+        "rockcruvpllmode()", "$1fdf,clock48",
         "rockcdnfirmwareload", "rockcdnhotplug", "rockcdndpcd",
         "rockcdnreadedid", "rockmodeselect(edid.i)", "rockcdntrain",
-        "rockcdnvideomode", "rockcdnlinkcarriesmode", "rockvopupmode",
-        "dp08 visible ",
+        "rockcdnvideomode", "rockcdnlinkcarriesmode", "rockvoppreparemode",
+        "dp08 scanout ready ",
     ):
         require(token in joined, f"missing display contract token: {token}")
     board = (ROCK / "Board/board.rockpi4c").read_text(encoding="utf-8").lower()
@@ -290,9 +290,11 @@ def source_contract() -> None:
         "rockcdnfirmwareload", "rockcdnfirmwareactive", "rockcdnenableevents",
         "rocktcphyup", "$30003000", "rockcdnhotplug",
         "rockcdnhostcapabilities", "rockcdndpcd", "rockcdnreadedid",
-        "rockcdntrain", "rockcdnvideostatus(0)", "rockcdnvideomode",
-        "rockcruvpllmode", "rockvopupmode", "dp06 color bars and text armed",
-        "rockcdnvideostatus(1)", "dp08 visible ",
+        "rockcdntrain", "rockcdnvideostatus(0)", "rockcdnplanvideo",
+        "rockvopmodevalid", "rockcruvpllmode", "rockvoppreparemode",
+        "rockcdnvideomode", "rockcdnvideostatus(1)",
+        "rockvopconfigureprimary", "rockvopstartprimary",
+        "dp06 color bars and text armed", "dp08 scanout ready ",
     ]
     positions = [display_up.index(token) for token in order]
     require(positions == sorted(positions), "cold-to-visible stage order drifted")
@@ -303,7 +305,7 @@ def source_contract() -> None:
         cadence)
     require(len(reads) == 7 and "rockcdnregread" not in cadence,
             "Cadence diagnostic must stop after every failed mailbox read")
-    frame_probe = display.split("procedure rockdisplayframetelemetry()", 1)[1].split(
+    frame_probe = display.split("procedure.i rockdisplayframetelemetry()", 1)[1].split(
         "endprocedure", 1)[0]
     require("if frames=9 : break : endif" in frame_probe and
             "hz=((frames-1)*rock_timer_frequency)/(lastframetick-firstframetick)" in frame_probe,
@@ -369,7 +371,9 @@ def source_contract() -> None:
         "rockcdntrain()": ("dpeb cdn err ", "rock_cdn_error"),
         "rockcdnvideostatus(0)": ("dpec cdn err ", "rock_cdn_error"),
         "rockcruvpllmode()": ("dpe1 cru err ", "rock_cru_error"),
-        "rockvopupmode()": ("dpea vop err ", "rock_vop_error"),
+        "rockvoppreparemode()": ("dpea vop err ", "rock_vop_error"),
+        "rockvopconfigureprimary()": ("dpea vop err ", "rock_vop_error"),
+        "rockvopstartprimary()": ("dpea vop err ", "rock_vop_error"),
         "rockcdnvideostatus(1)": ("dpee cdn err ", "rock_cdn_error"),
     }
     for owner_call, (label, error) in failure_witnesses.items():
@@ -381,7 +385,7 @@ def source_contract() -> None:
                 failure.index("rockdisplayfail"),
                 f"{owner_call} no longer reports its exact subsystem error")
     mode_retry = display_up.split(
-        "configured = rockcdnvideomode()", 1
+        "configured = rockcdnplanvideo()", 1
     )[1].split("if configured=0", 1)[0]
     for token in ("rock_cdn_error = 35 or rock_cdn_error = 36",
                   "modefailure = rock_cdn_error",
@@ -412,12 +416,13 @@ def source_contract() -> None:
     power = cru.split("procedure.i rockcrudisplaypower()", 1)[1].split(
         "endprocedure", 1
     )[0]
-    hdcp_transition = ["rockpmuidlerelease(17,54)", "rockcrugate(11,3,1)",
-                       "rockcrugate(11,10,1)", "rockcrugate(11,12,1)",
-                       "rockpmupoweron(24,56)", "rockpmuidlerelease(11,57)"]
-    positions = [power.index(token) for token in hdcp_transition]
-    require(positions == sorted(positions),
-            "HDCP clocks are not enabled immediately before its power/idle transition")
+    # Clock roots, leaf gates, reset ownership and clocks-before-power are
+    # now checked as one dependency contract, not as a few nearby gate writes.
+    clock_result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/rockpi4c_cru_contract_check.py")],
+        cwd=ROOT, capture_output=True, text=True)
+    require(clock_result.returncode == 0,
+            "clock dependency contract failed: " + clock_result.stdout + clock_result.stderr)
     require("rockpmupoweron(14,53)=0 or" not in power and
             "rockpmupoweron(24,56)=0 or" not in power,
             "eager Or can release bus idle after a failed domain power-on")
@@ -502,12 +507,12 @@ def source_contract() -> None:
                   "rockcruceilingdivider(rock_cru_gpll_rate,100000000)",
                   "rockcruceilingdivider(rock_cru_gpll_rate,200000000)",
                   "rockcruceilingdivider(rock_cru_gpll_rate,400000000)",
-                  "rockcruceilingdivider(aclkrate,200000000)",
+                  "rockcruceilingdivider(rock_cru_vop_aclk_rate,200000000)",
                   "rock_cru_error=errorcode",
                   "rock_cru_error=errorcode+1",
                   "rock_cru_error=errorcode+2"):
         require(token in cru, f"DPE1 PLL refusal mapping drifted: {token}")
-    require("rockcruceilingdivider(aclkrate,100000000)" not in cru,
+    require("rockcruceilingdivider(rock_cru_vop_aclk_rate,100000000)" not in cru,
             "VOP1 HCLK regressed below the pinned RK3399 200 MHz assignment")
     vpll = cru.split("procedure.i rockcruvpllset(pixelhz.i)", 1)[1].split(
         "endprocedure", 1
@@ -632,7 +637,9 @@ def source_contract() -> None:
                    "(rock_mode_vsync_end-rock_mode_vsync_start) | (negativev << 15)"):
         require(timing in video_mode,
                 f"Cadence selected-mode polarity/timing drifted: {timing}")
-    require("rockcdnlinkcarriesmode(linkmhz)" in video_mode,
+    video_plan = cdn.split("procedure.i rockcdnplanvideo()", 1)[1].split("endprocedure", 1)[0]
+    require("rockcdnlinkcarriesmode(linkmhz)" in video_plan and
+            "if rockcdnplanvideo()=0" in video_mode,
             "selected-mode link-bandwidth admission check missing")
     reg_read = cdn.split("procedure.i rockcdnregread(address.i, destination.i)", 1)[1].split(
         "endprocedure", 1
@@ -1431,11 +1438,12 @@ def emitted_cdn_video_contract(image: Path, symbols: dict[str, int]) -> None:
     def absolute(name: str) -> int:
         return load + symbols[name]
 
-    def run_case(hpositive: bool, vpositive: bool) -> None:
+    def run_case(hpositive: bool, vpositive: bool,
+                 overrides: dict[str, int] | None = None, error: int = 0) -> None:
         cpu = a64.A64()
         for offset, byte in enumerate(blob):
             cpu.memory[load + offset] = byte
-        for name, value in mode.items():
+        for name, value in (mode | (overrides or {})).items():
             cpu.raw_store(symbols["global_" + name], value, 8)
         cpu.raw_store(symbols["global_rock_mode_hsync_positive"], int(hpositive), 8)
         cpu.raw_store(symbols["global_rock_mode_vsync_positive"], int(vpositive), 8)
@@ -1461,6 +1469,12 @@ def emitted_cdn_video_contract(image: Path, symbols: dict[str, int]) -> None:
             cpu.step()
         else:
             raise AssertionError("emitted RockCdnVideoMode did not return")
+        if error:
+            require(cpu.x[0] == 0 and not writes and not fields,
+                    f"rejected mode {overrides} partially programmed hardware: {writes}")
+            require(cpu.raw_load(symbols["global_rock_cdn_error"], 8) == error,
+                    f"rejected mode {overrides} lost its exact refusal code {error}")
+            return
         require(cpu.x[0] == 1, "emitted 1080p Cadence video setup refused")
         negative_h, negative_v = int(not hpositive), int(not vpositive)
         expected = [
@@ -1487,6 +1501,14 @@ def emitted_cdn_video_contract(image: Path, symbols: dict[str, int]) -> None:
     for hpositive in (False, True):
         for vpositive in (False, True):
             run_case(hpositive, vpositive)
+    for overrides, error in (
+        ({"rock_mode_valid": 0}, 30),
+        ({"rock_cdn_link_rate": 1}, 34),
+        ({"rock_cdn_link_rate": 6}, 35),
+        ({"rock_cdn_link_lanes": 0}, 35),
+        ({"rock_mode_pixel_hz": 180000000}, 36),
+    ):
+        run_case(True, False, overrides, error)
 
 
 def compiler_contract(compiler: Path) -> tuple[int, str]:

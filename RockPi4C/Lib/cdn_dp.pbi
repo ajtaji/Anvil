@@ -554,7 +554,13 @@ Procedure.i RockCdnLinkCarriesMode(linkMHz.i)
   ProcedureReturn Bool(requiredMbps <= availableMbps)
 EndProcedure
 
-Procedure.i RockCdnVideoMode()
+; Mode admission is separate from programming. DRM validates the mode before
+; committing the CRTC/encoder/plane transaction. In particular, a rejected TU
+; must not leave two timing registers from a rejected mode in the transmitter.
+Global rock_cdn_video_tu.i
+Global rock_cdn_video_fifo.i
+
+Procedure.i RockCdnPlanVideo()
   Protected linkMHz.i
   Protected tu.i = 30
   Protected scaled.i
@@ -562,8 +568,10 @@ Procedure.i RockCdnVideoMode()
   Protected remainder.i
   Protected value.i
   Protected pixelKHz.i = rock_mode_pixel_hz / 1000
-  Protected negativeH.i = Bool(rock_mode_hsync_positive = 0)
-  Protected negativeV.i = Bool(rock_mode_vsync_positive = 0)
+  rock_cdn_error=0
+  rock_cdn_video_tu=0
+  rock_cdn_video_fifo=0
+  If rock_mode_valid=0 : rock_cdn_error=30 : ProcedureReturn 0 : EndIf
   Select rock_cdn_link_rate
     Case #CDN_LINK_RBR : linkMHz = 162
     Case #CDN_LINK_HBR : linkMHz = 270
@@ -571,8 +579,6 @@ Procedure.i RockCdnVideoMode()
     Default : rock_cdn_error = 34 : ProcedureReturn 0
   EndSelect
   If RockCdnLinkCarriesMode(linkMHz) = 0 : rock_cdn_error = 35 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_BND_HSYNC2VSYNC,$2000) = 0 : ProcedureReturn 0 : EndIf
-  If RockCdnRegWrite(#CDN_HSYNC2VSYNC_POL_CTRL,0) = 0 : ProcedureReturn 0 : EndIf
   Repeat
     tu = tu + 2
     scaled = (tu * pixelKHz * 24) / (rock_cdn_link_lanes * linkMHz * 8)
@@ -580,10 +586,23 @@ Procedure.i RockCdnVideoMode()
     remainder = scaled - symbol * 1000
     If tu > 64 : rock_cdn_error = 36 : ProcedureReturn 0 : EndIf
   Until symbol > 1 And tu-symbol >= 4 And remainder <= 850 And remainder >= 100
-  If RockCdnRegWrite(#CDN_FRAMER_TU,symbol | (tu << 8) | $8000) = 0 : ProcedureReturn 0 : EndIf
   value = ((pixelKHz * (symbol+1) / 1000) + linkMHz) / (rock_cdn_link_lanes*linkMHz)
   value = 8*(symbol+1)/24 - value + 2
-  If RockCdnRegWrite($2254,value) = 0 : ProcedureReturn 0 : EndIf
+  rock_cdn_video_tu=symbol | (tu << 8) | $8000
+  rock_cdn_video_fifo=value
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RockCdnVideoMode()
+  Protected negativeH.i = Bool(rock_mode_hsync_positive = 0)
+  Protected negativeV.i = Bool(rock_mode_vsync_positive = 0)
+  ; Revalidate here too; the caller may not reuse admission from another
+  ; selected mode or trained link. Planning itself performs no hardware I/O.
+  If RockCdnPlanVideo()=0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_BND_HSYNC2VSYNC,$2000) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_HSYNC2VSYNC_POL_CTRL,0) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_FRAMER_TU,rock_cdn_video_tu) = 0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite($2254,rock_cdn_video_fifo) = 0 : ProcedureReturn 0 : EndIf
   ; Pinned Radxa cdn-dp-reg.h assigns FRAMER_SP HSP to bit 1 and VSP to
   ; bit 0. Both bits encode negative sync; the MSA polarity remains bit 15.
   If RockCdnRegWrite(#CDN_FRAMER_PXL_REPR,$102) = 0 : ProcedureReturn 0 : EndIf
