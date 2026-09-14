@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,15 @@ REQUIRED = (
     "If *n\\kind <> #ANVIL_IR_OP_RETURN",
     "If *n\\sourceId <> 0 Or *n\\resultType <> 0",
     "If *n\\sourceId = 0 Or *n\\operandCount <> 2",
+    "#ANVIL_IR_OP_FADD              = 8",
+    "#ANVIL_IR_OP_FMUL              = 9",
+    "#ANVIL_IR_SPV_FADD = 129",
+    "#ANVIL_IR_SPV_FMUL = 133",
+    "Procedure.i avkIrFloatLanes(*m.AvkIrModule, typeId.i)",
+    "If avkIrValueType(*m, *n\\operand0) <> *n\\resultType",
+    "If avkIrValueType(*m, *n\\operand1) <> *n\\resultType",
+    "#ANVIL_IR_DEC_NO_CONTRACTION   = 11",
+    "#ANVIL_IR_DEC_FP_FAST_MATH_MODE = 12",
 )
 
 FORBIDDEN = (
@@ -104,6 +114,26 @@ MUTANTS = (
         "If avkIrExpectedNodeOpcode(*n\\kind) = 0 Or *n\\sourceOpcode <> avkIrExpectedNodeOpcode(*n\\kind)",
         "If avkIrExpectedNodeOpcode(*n\\kind) = 0 Or *n\\sourceOpcode = 0",
     ),
+    (
+        "OpFAdd is mislabeled as OpFMul",
+        "If kind = #ANVIL_IR_OP_FADD : ProcedureReturn #ANVIL_IR_SPV_FADD : EndIf",
+        "If kind = #ANVIL_IR_OP_FADD : ProcedureReturn #ANVIL_IR_SPV_FMUL : EndIf",
+    ),
+    (
+        "integer arithmetic passes as float32",
+        "If lanes < 1\n        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\\sourceId, *n\\sourceOpcode, i)",
+        "If lanes < 0\n        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\\sourceId, *n\\sourceOpcode, i)",
+    ),
+    (
+        "mixed right operand type is accepted",
+        "If avkIrValueType(*m, *n\\operand1) <> *n\\resultType",
+        "If avkIrValueType(*m, *n\\operand1) < 0",
+    ),
+    (
+        "floating-point control decorations are silently accepted",
+        "ElseIf *d\\kind = #ANVIL_IR_DEC_NO_CONTRACTION Or *d\\kind = #ANVIL_IR_DEC_FP_FAST_MATH_MODE",
+        "ElseIf *d\\kind = -1 Or *d\\kind = -2",
+    ),
 )
 
 
@@ -139,19 +169,35 @@ def source_contract(text: str) -> list[str]:
     return failures
 
 
-def build(compiler: pathlib.Path, suffix: str) -> pathlib.Path:
-    # A second reviewer may run this gate concurrently.  A process-unique
-    # directory prevents one compiler from replacing another run's image/dbg.
+def build(compiler: pathlib.Path, suffix: str, module_text: str | None = None) -> pathlib.Path:
+    # A second reviewer may run this gate concurrently. A process-unique,
+    # minimal PMF root prevents image collisions AND makes mutations unable to
+    # rewrite the shared repository while another worker is reviewing it.
     work = pathlib.Path(tempfile.mkdtemp(prefix="anvil_vulkan_ir_"))
+    vulkan = work / "Anvil" / "Graphics" / "Vulkan"
+    tests = vulkan / "Tests"
+    tests.mkdir(parents=True, exist_ok=True)
+    (vulkan / MODULE.name).write_text(
+        MODULE.read_text(encoding="utf-8") if module_text is None else module_text,
+        encoding="utf-8")
+    shutil.copy2(GATE, tests / GATE.name)
+    source = tests / GATE.name
+    intrinsics = ROOT / "RaspberryPi4" / "Intrinsics"
+    if intrinsics.is_dir():
+        shutil.copytree(intrinsics, work / "RaspberryPi4" / "Intrinsics", dirs_exist_ok=True)
+    if (ROOT / "Boards").is_dir():
+        shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
+    if (ROOT / "keywords.def").is_file():
+        shutil.copy2(ROOT / "keywords.def", work / "keywords.def")
     image = work / f"{suffix}.img"
     command = [
-        str(compiler), "--compile", GATE.relative_to(ROOT).as_posix(),
+        str(compiler), "--compile", source.relative_to(work).as_posix(),
         "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
         "--entry-returns", "-o", str(image), "-s",
     ]
     env = os.environ.copy()
-    env["PMF_ROOT"] = str(ROOT)
-    run = subprocess.run(command, cwd=ROOT, env=env, text=True,
+    env["PMF_ROOT"] = str(work)
+    run = subprocess.run(command, cwd=work, env=env, text=True,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     if run.returncode or "pmfc: OK" not in run.stdout or not image.is_file():
         raise SystemExit("vulkan IR gate: compile failed\n" + run.stdout)
@@ -243,7 +289,8 @@ def main() -> int:
 
     print(f"vulkan_ir_check: PASS - {checks} emitted checks, {steps:,} instructions")
     print("  passive target-neutral records preserve source id/opcode, type, storage and decorations")
-    print("  three valid current-subset shapes plus deterministic hostile verifier cases")
+    print("  FAdd/FMul cover float32 scalar and vec2/vec3/vec4 with exact type identity")
+    print("  current-subset shapes plus deterministic hostile verifier cases")
     print("  one-block SSA dominance and final Return are explicit; Phi/multi-block remain refused")
 
     if not args.mutate:
@@ -257,16 +304,14 @@ def main() -> int:
             print(f"  STALE  {name}: anchor appears {count} times")
             missed += 1
             continue
-        MODULE.write_text(original.replace(fixed, broken, 1), encoding="utf-8")
         try:
-            mcpu, mreport, _ = execute(a64, build(compiler, "mutant"))
+            mutant = original.replace(fixed, broken, 1)
+            mcpu, mreport, _ = execute(a64, build(compiler, "mutant", mutant))
             _, dynamic_failures = grade(mcpu, mreport)
             caught = bool(dynamic_failures)
             detail = dynamic_failures[0] if dynamic_failures else ""
         except SystemExit as exc:
             caught, detail = True, str(exc).splitlines()[0]
-        finally:
-            MODULE.write_text(original, encoding="utf-8")
         if caught:
             print(f"  RED    {name} - {detail[:100]}")
         else:

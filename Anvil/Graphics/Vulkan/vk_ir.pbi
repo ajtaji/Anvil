@@ -8,17 +8,20 @@
 ; A future parser may populate these records only after it proves that every
 ; accepted SPIR-V instruction has one represented semantic operation.
 ;
-; The represented subset is exactly the one vk_spirv.pbi currently accepts:
-; one Vertex or Fragment entry function, void/no parameters, one basic block,
-; and Load, one-index AccessChain, CompositeExtract, CompositeConstruct,
-; ImageSampleImplicitLod, Store and Return. Phi and multi-block control flow
-; are deliberately unrepresentable in this tranche.
+; The original represented subset mirrors what vk_spirv.pbi accepts: one
+; Vertex or Fragment entry function, void/no parameters, one basic block, and
+; Load, one-index AccessChain, CompositeExtract, CompositeConstruct,
+; ImageSampleImplicitLod, Store and Return. This passive tranche additionally
+; defines exact float32 FAdd/FMul nodes for later parser/lowerer integration;
+; the current parser still refuses those opcodes, so verification here alone
+; makes no public shader-support claim. Phi and multi-block control flow remain
+; deliberately unrepresentable.
 ;
 ; Khronos SPIR-V specification/registry semantics consulted: physical IDs and
 ; SSA (2.3), types (3.32), storage classes (3.7), decorations (3.20), and the
-; instruction definitions for the seven operations above. Numeric source
-; opcodes are retained only for deterministic diagnostics; IR kinds are their
-; own target-neutral enum.
+; instruction definitions for the represented operations above. Numeric source
+; opcodes are retained only for deterministic diagnostics; the represented
+; operations use their own target-neutral IR enum.
 
 #ANVIL_IR_OK              = 0
 #ANVIL_IR_ERR_ARGS        = -23201
@@ -72,6 +75,8 @@
 #ANVIL_IR_DEC_DESCRIPTOR_SET   = 8
 #ANVIL_IR_DEC_BINDING          = 9
 #ANVIL_IR_DEC_OFFSET           = 10
+#ANVIL_IR_DEC_NO_CONTRACTION   = 11
+#ANVIL_IR_DEC_FP_FAST_MATH_MODE = 12
 
 #ANVIL_IR_BUILTIN_POSITION = 0
 
@@ -82,6 +87,8 @@
 #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD = 5
 #ANVIL_IR_OP_STORE            = 6
 #ANVIL_IR_OP_RETURN           = 7
+#ANVIL_IR_OP_FADD              = 8
+#ANVIL_IR_OP_FMUL              = 9
 
 ; Source opcode values from the Khronos grammar, retained in every record.
 #ANVIL_IR_SPV_TYPE_VOID = 19
@@ -105,6 +112,8 @@
 #ANVIL_IR_SPV_COMPOSITE_CONSTRUCT = 80
 #ANVIL_IR_SPV_COMPOSITE_EXTRACT = 81
 #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD = 87
+#ANVIL_IR_SPV_FADD = 129
+#ANVIL_IR_SPV_FMUL = 133
 #ANVIL_IR_SPV_LABEL = 248
 #ANVIL_IR_SPV_RETURN = 253
 
@@ -389,7 +398,35 @@ Procedure.i avkIrExpectedNodeOpcode(kind.i)
   If kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD : ProcedureReturn #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD : EndIf
   If kind = #ANVIL_IR_OP_STORE : ProcedureReturn #ANVIL_IR_SPV_STORE : EndIf
   If kind = #ANVIL_IR_OP_RETURN : ProcedureReturn #ANVIL_IR_SPV_RETURN : EndIf
+  If kind = #ANVIL_IR_OP_FADD : ProcedureReturn #ANVIL_IR_SPV_FADD : EndIf
+  If kind = #ANVIL_IR_OP_FMUL : ProcedureReturn #ANVIL_IR_SPV_FMUL : EndIf
   ProcedureReturn 0
+EndProcedure
+
+; Return the number of float32 lanes represented by typeId, or zero for
+; anything outside scalar/vec2/vec3/vec4 binary32. SPIR-V arithmetic requires
+; both operands and the result to have the same type; the caller checks the
+; exact type ID as well as this shape.
+Procedure.i avkIrFloatLanes(*m.AvkIrModule, typeId.i)
+  Protected *t.AvkIrType
+  Protected *component.AvkIrType
+  *t = avkIrFindType(*m, typeId)
+  If *t = 0 : ProcedureReturn 0 : EndIf
+  If *t\kind = #ANVIL_IR_TYPE_FLOAT
+    If *t\width = 32 : ProcedureReturn 1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If *t\kind <> #ANVIL_IR_TYPE_VECTOR Or *t\componentCount < 2 Or *t\componentCount > 4
+    ProcedureReturn 0
+  EndIf
+  *component = avkIrFindType(*m, *t\componentType)
+  If *component = 0
+    ProcedureReturn 0
+  EndIf
+  If *component\kind <> #ANVIL_IR_TYPE_FLOAT Or *component\width <> 32
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn *t\componentCount
 EndProcedure
 
 ; Is id defined by an instruction that dominates nodeIndex? Global constants
@@ -659,7 +696,7 @@ Procedure.i avkIrCheckDecorations(*m.AvkIrModule)
     ElseIf *d\sourceOpcode <> #ANVIL_IR_SPV_DECORATE
       ProcedureReturn avkIrFail(#ANVIL_IR_ERR_DECORATION, *d\sourceId, *d\sourceOpcode, i)
     EndIf
-    If *d\kind < #ANVIL_IR_DEC_RELAXED_PRECISION Or *d\kind > #ANVIL_IR_DEC_OFFSET
+    If *d\kind < #ANVIL_IR_DEC_RELAXED_PRECISION Or *d\kind > #ANVIL_IR_DEC_FP_FAST_MATH_MODE
       ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNSUPPORTED, *d\sourceId, *d\sourceOpcode, i)
     EndIf
     If *d\kind = #ANVIL_IR_DEC_BLOCK
@@ -682,6 +719,11 @@ Procedure.i avkIrCheckDecorations(*m.AvkIrModule)
       ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNSUPPORTED, *d\sourceId, *d\sourceOpcode, i)
     ElseIf *d\kind = #ANVIL_IR_DEC_COL_MAJOR Or *d\kind = #ANVIL_IR_DEC_MATRIX_STRIDE
       ; Matrix types are outside this tranche, so these cannot be valid here.
+      ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNSUPPORTED, *d\sourceId, *d\sourceOpcode, i)
+    ElseIf *d\kind = #ANVIL_IR_DEC_NO_CONTRACTION Or *d\kind = #ANVIL_IR_DEC_FP_FAST_MATH_MODE
+      ; These control the permitted floating-point transformation contract.
+      ; Until the parser and every lowerer preserve that contract, recognizing
+      ; and refusing them is safer than silently emitting different arithmetic.
       ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNSUPPORTED, *d\sourceId, *d\sourceOpcode, i)
     EndIf
     j = 0
@@ -710,6 +752,7 @@ Procedure.i avkIrCheckNodes(*m.AvkIrModule)
   Protected k.i
   Protected rc.i
   Protected index.i
+  Protected lanes.i
   Protected valueType.i
   Protected *n.AvkIrNode
   Protected *t.AvkIrType
@@ -779,6 +822,20 @@ Procedure.i avkIrCheckNodes(*m.AvkIrModule)
         If avkIrValueType(*m, avkIrOperand(*n, k)) <> *t\componentType : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, avkIrOperand(*n, k), *n\sourceOpcode, i) : EndIf
         k = k + 1
       Wend
+    ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
+      If *n\sourceId = 0 Or *n\operandCount <> 2 Or *n\literalCount <> 0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+      lanes = avkIrFloatLanes(*m, *n\resultType)
+      If lanes < 1
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i)
+      EndIf
+      If avkIrValueType(*m, *n\operand0) <> *n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\operand0, *n\sourceOpcode, i)
+      EndIf
+      If avkIrValueType(*m, *n\operand1) <> *n\resultType
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\operand1, *n\sourceOpcode, i)
+      EndIf
     ElseIf *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
       If *n\sourceId = 0 Or *n\operandCount <> 2 Or *n\literalCount <> 0 : ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, *n\sourceId, *n\sourceOpcode, i) : EndIf
       *t = avkIrFindType(*m, avkIrValueType(*m, *n\operand0))

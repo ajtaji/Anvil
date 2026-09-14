@@ -7,7 +7,7 @@
 XIncludeFile "../vk_ir.pbi"
 
 #IG_MAGIC = $564B4952                ; "VKIR"
-Global Dim igReport.i[256]
+Global Dim igReport.i[512]
 Global Dim igTypes.AvkIrType[20]
 Global Dim igConstants.AvkIrConstant[12]
 Global Dim igVariables.AvkIrVariable[12]
@@ -66,6 +66,46 @@ Procedure igNode(index.i, id.i, opcode.i, kind.i, resultType.i, operands.i)
   igNodes[index]\resultType = resultType
   igNodes[index]\blockId = 21
   igNodes[index]\operandCount = operands
+EndProcedure
+
+; One exact float32 scalar or vector arithmetic node followed by Return.
+; Constants dominate the entry block, so the verifier sees no parser or
+; backend behavior in this fixture.
+Procedure igArithmetic(*m.AvkIrModule, lanes.i, kind.i)
+  Protected resultType.i
+  Protected opcode.i
+  igZero() : igModule(*m)
+  *m\functionTypeId = 6 : *m\typeCount = 4 : *m\variableCount = 0
+  *m\decorationCount = 0 : *m\blockCount = 1 : *m\nodeCount = 2
+  igType(0, 1, #ANVIL_IR_SPV_TYPE_VOID, #ANVIL_IR_TYPE_VOID)
+  igType(1, 2, #ANVIL_IR_SPV_TYPE_FLOAT, #ANVIL_IR_TYPE_FLOAT) : igTypes[1]\width = 32
+  igType(2, 3, #ANVIL_IR_SPV_TYPE_VECTOR, #ANVIL_IR_TYPE_VECTOR) : igTypes[2]\componentType = 2
+  If lanes = 1 : igTypes[2]\componentCount = 2 : Else : igTypes[2]\componentCount = lanes : EndIf
+  igType(3, 6, #ANVIL_IR_SPV_TYPE_FUNCTION, #ANVIL_IR_TYPE_FUNCTION) : igTypes[3]\returnType = 1
+  igConstants[0]\sourceId = 10 : igConstants[0]\sourceOpcode = #ANVIL_IR_SPV_CONSTANT : igConstants[0]\typeId = 2 : igConstants[0]\wordCount = 1 : igConstants[0]\word0 = $3F800000
+  igConstants[1]\sourceId = 11 : igConstants[1]\sourceOpcode = #ANVIL_IR_SPV_CONSTANT : igConstants[1]\typeId = 2 : igConstants[1]\wordCount = 1 : igConstants[1]\word0 = $40000000
+  If lanes = 1
+    *m\constantCount = 2
+    resultType = 2
+    igNodes[0]\operand0 = 10 : igNodes[0]\operand1 = 11
+  Else
+    *m\constantCount = 4
+    resultType = 3
+    igConstants[2]\sourceId = 12 : igConstants[2]\sourceOpcode = #ANVIL_IR_SPV_CONSTANT_COMPOSITE : igConstants[2]\typeId = 3 : igConstants[2]\componentCount = lanes
+    igConstants[2]\component0 = 10 : igConstants[2]\component1 = 10 : igConstants[2]\component2 = 10 : igConstants[2]\component3 = 10
+    igConstants[3]\sourceId = 13 : igConstants[3]\sourceOpcode = #ANVIL_IR_SPV_CONSTANT_COMPOSITE : igConstants[3]\typeId = 3 : igConstants[3]\componentCount = lanes
+    igConstants[3]\component0 = 11 : igConstants[3]\component1 = 11 : igConstants[3]\component2 = 11 : igConstants[3]\component3 = 11
+    igNodes[0]\operand0 = 12 : igNodes[0]\operand1 = 13
+  EndIf
+  If kind = #ANVIL_IR_OP_FADD : opcode = #ANVIL_IR_SPV_FADD : Else : opcode = #ANVIL_IR_SPV_FMUL : EndIf
+  igBlocks[0]\sourceId = 21 : igBlocks[0]\sourceOpcode = #ANVIL_IR_SPV_LABEL : igBlocks[0]\nodeCount = 2
+  igNode(0, 30, opcode, kind, resultType, 2)
+  If lanes = 1
+    igNodes[0]\operand0 = 10 : igNodes[0]\operand1 = 11
+  Else
+    igNodes[0]\operand0 = 12 : igNodes[0]\operand1 = 13
+  EndIf
+  igNode(1, 0, #ANVIL_IR_SPV_RETURN, #ANVIL_IR_OP_RETURN, 0, 0)
 EndProcedure
 
 ; A current-subset vertex: vec4 input -> Position output, then Return.
@@ -163,6 +203,52 @@ Procedure.i Main()
 
   igSample(@m) : igCheck(AnvilVkIrVerify(@m) = 0)
   igUniform(@m) : igCheck(AnvilVkIrVerify(@m) = 0)
+
+  ; Both exact SPIR-V operations are represented for every supported f32
+  ; shape: scalar, vec2, vec3 and vec4.
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 2, #ANVIL_IR_OP_FADD) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 3, #ANVIL_IR_OP_FADD) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 4, #ANVIL_IR_OP_FADD) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FMUL) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 2, #ANVIL_IR_OP_FMUL) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 3, #ANVIL_IR_OP_FMUL) : igCheck(AnvilVkIrVerify(@m) = 0)
+  igArithmetic(@m, 4, #ANVIL_IR_OP_FMUL) : igCheck(AnvilVkIrVerify(@m) = 0)
+
+  ; Exact type identity is required, even for two structurally equal f32
+  ; types; integer, mixed-lane, wide, undefined and non-dominating operands
+  ; are all refused at their source operation.
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : igType(4, 4, #ANVIL_IR_SPV_TYPE_FLOAT, #ANVIL_IR_TYPE_FLOAT) : igTypes[4]\width = 32 : m\typeCount = 5 : igConstants[1]\typeId = 4
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_TYPE And AnvilVkIrLastId() = 11 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_FADD)
+  igArithmetic(@m, 2, #ANVIL_IR_OP_FMUL) : igType(4, 4, #ANVIL_IR_SPV_TYPE_VECTOR, #ANVIL_IR_TYPE_VECTOR) : igTypes[4]\componentType = 2 : igTypes[4]\componentCount = 3 : m\typeCount = 5 : igConstants[3]\typeId = 4 : igConstants[3]\componentCount = 3
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_TYPE And AnvilVkIrLastId() = 13 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_FMUL)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : igTypes[1]\sourceOpcode = #ANVIL_IR_SPV_TYPE_INT : igTypes[1]\kind = #ANVIL_IR_TYPE_INT : igTypes[1]\signedness = 0
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_TYPE And AnvilVkIrLastId() = 30)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FMUL) : igTypes[1]\width = 64
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_TYPE And AnvilVkIrLastId() = 2)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : igNodes[0]\operand1 = 63
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_UNDEFINED And AnvilVkIrLastId() = 63 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_FADD)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FMUL) : igNodes[0]\operand1 = 30
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_DOMINANCE And AnvilVkIrLastId() = 30 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_FMUL)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : m\nodeCount = 3 : igBlocks[0]\nodeCount = 3 : igNodes[0]\operand1 = 31 : igNode(1, 31, #ANVIL_IR_SPV_FMUL, #ANVIL_IR_OP_FMUL, 2, 2) : igNodes[1]\operand0 = 10 : igNodes[1]\operand1 = 11 : igNode(2, 0, #ANVIL_IR_SPV_RETURN, #ANVIL_IR_OP_RETURN, 0, 0)
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_DOMINANCE And AnvilVkIrLastId() = 31 And AnvilVkIrLastIndex() = 0)
+
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : igNodes[0]\operandCount = 1
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_TYPE And AnvilVkIrLastId() = 30)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FMUL) : igNodes[0]\literalCount = 1
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_TYPE And AnvilVkIrLastId() = 30)
+  igArithmetic(@m, 1, #ANVIL_IR_OP_FADD) : igNodes[0]\sourceOpcode = #ANVIL_IR_SPV_FMUL
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_UNSUPPORTED And AnvilVkIrLastId() = 30 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_FMUL)
+
+  ; RelaxedPrecision permits a strict f32 answer and remains valid. Flags
+  ; that alter contraction or fast-math behavior are recognized but refused
+  ; until parser and lowerer preserve their exact contract.
+  igArithmetic(@m, 4, #ANVIL_IR_OP_FADD) : m\decorationCount = 1 : igDecorations[0]\sourceId = 30 : igDecorations[0]\sourceOpcode = #ANVIL_IR_SPV_DECORATE : igDecorations[0]\member = -1 : igDecorations[0]\kind = #ANVIL_IR_DEC_RELAXED_PRECISION
+  igCheck(AnvilVkIrVerify(@m) = 0)
+  igDecorations[0]\kind = #ANVIL_IR_DEC_NO_CONTRACTION
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_UNSUPPORTED And AnvilVkIrLastId() = 30 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_DECORATE)
+  igDecorations[0]\kind = #ANVIL_IR_DEC_FP_FAST_MATH_MODE : igDecorations[0]\value = 1
+  igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_UNSUPPORTED And AnvilVkIrLastId() = 30 And AnvilVkIrLastOpcode() = #ANVIL_IR_SPV_DECORATE)
 
   igVertex(@m) : igVariables[1]\sourceId = 10
   igCheck(AnvilVkIrVerify(@m) = #ANVIL_IR_ERR_DUPLICATE And AnvilVkIrLastId() = 10 And AnvilVkIrLastOpcode() = 59 And AnvilVkIrLastIndex() = 1)
