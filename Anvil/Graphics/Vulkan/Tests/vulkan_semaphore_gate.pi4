@@ -1,12 +1,12 @@
 ; ======================================================================
-;  Emitted gate: target-neutral Vulkan 1.0 binary semaphore state engine
+;  Emitted gate: public Vulkan 1.0 binary semaphores and queue integration
 ; ======================================================================
 ; Builds with the real compiler and runs under the AArch64 interpreter.
-; The test backend owns no GPU.  No public semaphore entry point is exposed.
+; The test backend owns no GPU. It can hold and fault a flight so the gate
+; proves immediate and polled semaphore completion through public vk* calls.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
-XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 
 #VKS_OUT = $06000000
 #VKS_ROWS = $06000100
@@ -36,6 +36,40 @@ Procedure.i VksSignal(device.i, semaphore.i)
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i VksRecordClear(commandBuffer.i, image.i)
+  Define bar.VkImageMemoryBarrier
+  Define range.VkImageSubresourceRange
+  Dim colour.l[4]
+  If AnvilVkCommandBufferReset(commandBuffer, 0) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If AnvilVkCommandBufferBegin(commandBuffer, 0) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = image
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\baseMipLevel = 0
+  bar\subresourceRange\levelCount = 1
+  bar\subresourceRange\baseArrayLayer = 0
+  bar\subresourceRange\layerCount = 1
+  AnvilVkCmdImageBarrier(commandBuffer, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, @bar)
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\baseMipLevel = 0
+  range\levelCount = 1
+  range\baseArrayLayer = 0
+  range\layerCount = 1
+  colour[0] = $3F800000
+  colour[1] = 0
+  colour[2] = 0
+  colour[3] = $3F800000
+  AnvilVkCmdClearColorImage(commandBuffer, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @colour[0], @range)
+  If AnvilVkCommandBufferEnd(commandBuffer) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i Main()
   Define instance1.i
   Define instance2.i
@@ -53,6 +87,32 @@ Procedure.i Main()
   Define leakedSem.i
   Define leakedSem2.i
   Define reusedDevice.i
+  Define corruptReusedDevice.i
+  Define ownerSlot.i
+  Define queue2.i
+  Define pubA.i
+  Define pubB.i
+  Define pubC.i
+  Define pubD.i
+  Define stalePublic.i
+  Define pool.i
+  Define cmd.i
+  Define image.i
+  Define memory.i
+  Define commandHandle.i
+  Define fence.i
+  Define preSignaledFence.i
+  Define fenceHandle.i
+  Define rc.i
+  Define stage.l
+  Define badStage.l
+  Define sci.VkSemaphoreCreateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define bar.VkImageMemoryBarrier
+  Define range.VkImageSubresourceRange
+  Dim publicHandles.i[2]
+  Dim clearColor.l[4]
   Define committedTicket.i
   Define staleSem.i
   Define ticket.i
@@ -74,6 +134,7 @@ Procedure.i Main()
   count = 1
   Vks(AnvilVkPhysicalEnumerate(instance2, @count, @physical2) = #VK_SUCCESS)
   Vks(AnvilVkDeviceCreate(physical2, @device2) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceQueue(device2, @queue2) = #VK_SUCCESS)
 
   Vks(avkSemaphoreCreate(device1, 0, @semA) = #VK_SUCCESS)
   Vks(avkSemaphoreCreate(device1, 0, @semB) = #VK_SUCCESS)
@@ -213,6 +274,242 @@ Procedure.i Main()
   Vks(avkSemaphoreRollback(ticket3) = #VK_SUCCESS)
   Vks(avkSemaphoreRollback(ticket4) = #VK_SUCCESS)
 
+  ; ------------------------------------------------------------------
+  ; Public core-1.0 create/destroy and one-VkSubmitInfo queue semantics.
+  ; ------------------------------------------------------------------
+  sci\sType = #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+  sci\pNext = 0
+  sci\flags = 0
+  Vks(SizeOf(VkSemaphoreCreateInfo) = 24)
+  Vks(vkCreateSemaphore(device2, @sci, 0, @pubA) = #VK_SUCCESS)
+  Vks(vkCreateSemaphore(device2, @sci, 0, @pubB) = #VK_SUCCESS)
+  Vks(vkCreateSemaphore(device2, @sci, 0, @pubC) = #VK_SUCCESS)
+  Vks(vkCreateSemaphore(device2, @sci, 0, @pubD) = #VK_SUCCESS)
+  stalePublic = pubD
+  vkDestroySemaphore(device2, pubD, 0)
+  Vks(avkSemaphoreState(device2, stalePublic) = #ANVIL_VK_ERR_HANDLE)
+  Vks(vkCreateSemaphore(device2, @sci, 0, @pubD) = #VK_SUCCESS)
+  Vks(pubD <> stalePublic)
+  sci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  Vks(vkCreateSemaphore(device2, @sci, 0, @badOut) = #ANVIL_VK_ERR_ARGS)
+  Vks(badOut = #VK_NULL_HANDLE)
+  sci\sType = #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+  sci\pNext = 1
+  Vks(vkCreateSemaphore(device2, @sci, 0, @badOut) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Vks(badOut = #VK_NULL_HANDLE)
+  sci\pNext = 0
+  sci\flags = 1
+  Vks(vkCreateSemaphore(device2, @sci, 0, @badOut) = #ANVIL_VK_ERR_ARGS)
+  Vks(badOut = #VK_NULL_HANDLE)
+  sci\flags = 0
+
+  ; Empty submissions still execute binary signal/wait operations in queue
+  ; order. All waits precede all signals within this VkSubmitInfo.
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\pNext = 0
+  si\waitSemaphoreCount = 0
+  si\pWaitSemaphores = 0
+  si\pWaitDstStageMask = 0
+  si\commandBufferCount = 0
+  si\pCommandBuffers = 0
+  si\signalSemaphoreCount = 0
+  si\pSignalSemaphores = 0
+
+  ; Core requires a fence handed to vkQueueSubmit to be unsignaled. Prove
+  ; that even an empty public submission refuses a pre-signaled fence and
+  ; leaves that fence unchanged.
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  fci\pNext = 0
+  fci\flags = #VK_FENCE_CREATE_SIGNALED_BIT
+  Vks(vkCreateFence(device2, @fci, 0, @preSignaledFence) = #VK_SUCCESS)
+  Vks(vkGetFenceStatus(device2, preSignaledFence) = #VK_SUCCESS)
+  Vks(vkQueueSubmit(queue2, 1, @si, preSignaledFence) = #ANVIL_VK_ERR_STATE)
+  Vks(vkGetFenceStatus(device2, preSignaledFence) = #VK_SUCCESS)
+  vkDestroyFence(device2, preSignaledFence, 0)
+  Vks(vkGetFenceStatus(device2, preSignaledFence) = #ANVIL_VK_ERR_HANDLE)
+
+  si\signalSemaphoreCount = 1
+  publicHandles[0] = pubA
+  si\pSignalSemaphores = @publicHandles[0]
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device2, pubA) = #ANVIL_VK_SEM_SIGNALED)
+  stage = #VK_PIPELINE_STAGE_TRANSFER_BIT
+  si\waitSemaphoreCount = 1
+  si\pWaitSemaphores = @publicHandles[0]
+  si\pWaitDstStageMask = @stage
+  publicHandles[1] = pubB
+  si\signalSemaphoreCount = 1
+  si\pSignalSemaphores = @publicHandles[1]
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device2, pubA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreState(device2, pubB) = #ANVIL_VK_SEM_SIGNALED)
+
+  ; Unsignaled waits, duplicate signals, cross-device handles, unsupported
+  ; stage bits and broken pointer/count pairs all refuse atomically.
+  si\signalSemaphoreCount = 0
+  si\pSignalSemaphores = 0
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device2, pubA) = #ANVIL_VK_SEM_UNSIGNALED)
+  si\waitSemaphoreCount = 0
+  si\pWaitSemaphores = 0
+  si\pWaitDstStageMask = 0
+  publicHandles[0] = pubD
+  publicHandles[1] = pubD
+  si\signalSemaphoreCount = 2
+  si\pSignalSemaphores = @publicHandles[0]
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
+  Vks(avkSemaphoreState(device2, pubD) = #ANVIL_VK_SEM_UNSIGNALED)
+  publicHandles[0] = semA
+  si\signalSemaphoreCount = 1
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreState(device2, semD) = #ANVIL_VK_SEM_UNSIGNALED)
+  publicHandles[0] = pubB
+  si\signalSemaphoreCount = 0
+  si\pSignalSemaphores = 0
+  si\waitSemaphoreCount = 1
+  si\pWaitSemaphores = @publicHandles[0]
+  badStage = #VK_PIPELINE_STAGE_HOST_BIT
+  si\pWaitDstStageMask = @badStage
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Vks(avkSemaphoreState(device2, pubB) = #ANVIL_VK_SEM_SIGNALED)
+  si\pWaitSemaphores = 0
+  si\pWaitDstStageMask = @stage
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_ARGS)
+  si\waitSemaphoreCount = 0
+  si\pWaitSemaphores = 0
+  si\pWaitDstStageMask = 0
+  si\signalSemaphoreCount = 1
+  si\pSignalSemaphores = 0
+  Vks(vkQueueSubmit(queue2, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_ARGS)
+
+  ; Build one real clear so the test backend can hold the flight. The
+  ; semaphore must remain pending after vkQueueSubmit returns and settle only
+  ; when avkFlightPoll observes actual completion.
+  Vks(AnvilVkCommandPoolCreate(device2, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @pool) = #VK_SUCCESS)
+  Vks(AnvilVkCommandBufferAllocate(device2, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmd) = #VK_SUCCESS)
+  Vks(AnvilVkImageCreate(device2, 4, 4, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, #VK_IMAGE_LAYOUT_UNDEFINED, @image) = #VK_SUCCESS)
+  Vks(AnvilVkMemoryAllocate(device2, 4096, 0, @memory) = #VK_SUCCESS)
+  Vks(AnvilVkImageBindMemory(device2, image, memory, 0) = #VK_SUCCESS)
+  Vks(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = image
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\baseMipLevel = 0
+  bar\subresourceRange\levelCount = 1
+  bar\subresourceRange\baseArrayLayer = 0
+  bar\subresourceRange\layerCount = 1
+  AnvilVkCmdImageBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, @bar)
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\baseMipLevel = 0
+  range\levelCount = 1
+  range\baseArrayLayer = 0
+  range\layerCount = 1
+  clearColor[0] = $3F800000
+  clearColor[1] = 0
+  clearColor[2] = 0
+  clearColor[3] = $3F800000
+  AnvilVkCmdClearColorImage(cmd, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @clearColor[0], @range)
+  Vks(AnvilVkCommandBufferEnd(cmd) = #VK_SUCCESS)
+  commandHandle = cmd
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @commandHandle
+  publicHandles[0] = pubC
+  si\signalSemaphoreCount = 1
+  si\pSignalSemaphores = @publicHandles[0]
+  Vks(AnvilVkFenceCreate(device2, 0, @fence) = #VK_SUCCESS)
+  AnvilVkTestBackendHold(1)
+  Vks(vkQueueSubmit(queue2, 1, @si, fence) = #VK_SUCCESS)
+  Vks(AnvilVkSubmissionOutstanding() = 1)
+  Vks(avkSemaphoreState(device2, pubC) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemPendingSignal[avkSemaphoreSlot(pubC)] = 1)
+  AnvilVkFaultClear()
+  vkDestroySemaphore(device2, pubC, 0)
+  Vks(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  Vks(AnvilVkFenceStatus(device2, fence) = #VK_NOT_READY)
+  AnvilVkTestBackendHold(0)
+  Vks(vkDeviceWaitIdle(device2) = #VK_SUCCESS)
+  Vks(AnvilVkSubmissionOutstanding() = 0)
+  Vks(avkSemaphoreState(device2, pubC) = #ANVIL_VK_SEM_SIGNALED)
+  Vks(AnvilVkFenceStatus(device2, fence) = #VK_SUCCESS)
+
+  ; A fault reported by a later poll restores the consumed wait and pending
+  ; signal atomically, invalidates the command buffer and releases the flight.
+  Vks(AnvilVkFencesReset(device2, 1, @fence) = #VK_SUCCESS)
+  publicHandles[0] = pubC
+  publicHandles[1] = pubD
+  si\waitSemaphoreCount = 1
+  si\pWaitSemaphores = @publicHandles[0]
+  si\pWaitDstStageMask = @stage
+  si\signalSemaphoreCount = 1
+  si\pSignalSemaphores = @publicHandles[1]
+  AnvilVkTestBackendHold(1)
+  Vks(vkQueueSubmit(queue2, 1, @si, fence) = #VK_SUCCESS)
+  Vks(avkSemPendingWait[avkSemaphoreSlot(pubC)] = 1)
+  Vks(avkSemPendingSignal[avkSemaphoreSlot(pubD)] = 1)
+  AnvilVkTestBackendFailPollNext($53454D46)
+  Vks(vkDeviceWaitIdle(device2) = #VK_ERROR_DEVICE_LOST)
+  Vks(AnvilVkSubmissionOutstanding() = 0)
+  Vks(avkFlightSemaphoreReservation = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreState(device2, pubC) = #ANVIL_VK_SEM_SIGNALED)
+  Vks(avkSemaphoreState(device2, pubD) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemPendingWait[avkSemaphoreSlot(pubC)] = 0)
+  Vks(avkSemPendingSignal[avkSemaphoreSlot(pubD)] = 0)
+  Vks(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+
+  ; vkGetFenceStatus owns the same deferred-fault propagation contract.
+  Vks(VksRecordClear(cmd, image) = 1)
+  Vks(AnvilVkFencesReset(device2, 1, @fence) = #VK_SUCCESS)
+  commandHandle = cmd
+  AnvilVkTestBackendHold(1)
+  Vks(vkQueueSubmit(queue2, 1, @si, fence) = #VK_SUCCESS)
+  AnvilVkTestBackendFailPollNext($53454D47)
+  Vks(vkGetFenceStatus(device2, fence) = #VK_ERROR_DEVICE_LOST)
+  Vks(AnvilVkSubmissionOutstanding() = 0)
+  Vks(avkFlightSemaphoreReservation = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreState(device2, pubC) = #ANVIL_VK_SEM_SIGNALED)
+  Vks(avkSemaphoreState(device2, pubD) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemPendingWait[avkSemaphoreSlot(pubC)] = 0)
+  Vks(avkSemPendingSignal[avkSemaphoreSlot(pubD)] = 0)
+  Vks(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+  Vks(AnvilVkFenceStatus(device2, fence) = #VK_SUCCESS)
+
+  ; vkWaitForFences also reports the polled device loss instead of mistaking
+  ; the failure-signalled fence for successful execution.
+  Vks(VksRecordClear(cmd, image) = 1)
+  Vks(AnvilVkFencesReset(device2, 1, @fence) = #VK_SUCCESS)
+  commandHandle = cmd
+  fenceHandle = fence
+  AnvilVkTestBackendHold(1)
+  Vks(vkQueueSubmit(queue2, 1, @si, fence) = #VK_SUCCESS)
+  AnvilVkTestBackendFailPollNext($53454D48)
+  Vks(vkWaitForFences(device2, 1, @fenceHandle, 1, 1000000) = #VK_ERROR_DEVICE_LOST)
+  Vks(AnvilVkSubmissionOutstanding() = 0)
+  Vks(avkFlightSemaphoreReservation = #VK_NULL_HANDLE)
+  Vks(avkSemaphoreState(device2, pubC) = #ANVIL_VK_SEM_SIGNALED)
+  Vks(avkSemaphoreState(device2, pubD) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemPendingWait[avkSemaphoreSlot(pubC)] = 0)
+  Vks(avkSemPendingSignal[avkSemaphoreSlot(pubD)] = 0)
+  Vks(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+  Vks(AnvilVkFenceStatus(device2, fence) = #VK_SUCCESS)
+
+  ; Device teardown retires quiescent semaphores before invalidating the
+  ; device generation. A deliberately reserved ticket blocks the whole tear-
+  ; down until it is rolled back.
+  VksOp(@ops[0], pubA, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(device2, 1, @ops[0], @ticket) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceDestroy(device2) = #ANVIL_VK_ERR_STATE)
+  Vks(avkDevSlot(device2) <> 0)
+  Vks(avkSemaphoreState(device2, pubA) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceDestroy(device2) = #VK_SUCCESS)
+  Vks(avkSemaphoreState(device2, pubA) = #ANVIL_VK_ERR_HANDLE)
+
   ; Device reset is all-or-nothing and retires every owned semaphore only
   ; after reservations and pending references are gone.
   VksOp(@ops[0], semB, #ANVIL_VK_SEM_OP_SIGNAL)
@@ -224,33 +521,40 @@ Procedure.i Main()
   Vks(avkSemaphoreState(device1, semA) = #ANVIL_VK_ERR_HANDLE)
   Vks(avkSemaphoreState(device1, semB) = #ANVIL_VK_ERR_HANDLE)
   Vks(avkSemaphoreState(device1, semC) = #ANVIL_VK_ERR_HANDLE)
-  Vks(avkSemaphoreState(device2, semD) = #ANVIL_VK_SEM_UNSIGNALED)
+  Vks(avkSemaphoreState(device2, semD) = #ANVIL_VK_ERR_HANDLE)
   Vks(avkSemaphoreDestroy(device2, #VK_NULL_HANDLE) = #VK_SUCCESS)
 
-  ; Deliberately violate the future integration seam by destroying a device
-  ; without calling avkSemaphoreResetDevice. Reusing the same foundation
-  ; slot with a new generation must not inherit the leaked object's or
-  ; reservation's authority.
+  ; The integrated device path cannot skip semaphore teardown. A live
+  ; reservation blocks it; once quiescent, teardown retires the semaphore
+  ; before the device generation is reused.
   Vks(avkSemaphoreCreate(device1, 0, @leakedSem) = #VK_SUCCESS)
-  Vks(avkSemaphoreCreate(device1, 0, @leakedSem2) = #VK_SUCCESS)
   VksOp(@ops[0], leakedSem, #ANVIL_VK_SEM_OP_SIGNAL)
   Vks(avkSemaphoreReserve(device1, 1, @ops[0], @ticket) = #VK_SUCCESS)
-  VksOp(@ops[0], leakedSem2, #ANVIL_VK_SEM_OP_SIGNAL)
-  Vks(avkSemaphoreReserve(device1, 1, @ops[0], @committedTicket) = #VK_SUCCESS)
-  Vks(avkSemaphoreCommit(committedTicket) = #VK_SUCCESS)
+  Vks(AnvilVkDeviceDestroy(device1) = #ANVIL_VK_ERR_STATE)
+  Vks(avkDevSlot(device1) <> 0)
+  Vks(avkSemaphoreRollback(ticket) = #VK_SUCCESS)
+  staleSem = leakedSem
   Vks(AnvilVkDeviceDestroy(device1) = #VK_SUCCESS)
   Vks(AnvilVkDeviceCreate(physical1, @reusedDevice) = #VK_SUCCESS)
   Vks(avkTokenSlot(reusedDevice) = avkTokenSlot(device1))
   Vks(avkTokenGen(reusedDevice) <> avkTokenGen(device1))
-  Vks(avkSemaphoreState(reusedDevice, leakedSem) = #ANVIL_VK_ERR_OWNER)
-  Vks(avkSemaphoreDestroy(reusedDevice, leakedSem) = #ANVIL_VK_ERR_OWNER)
-  Vks(avkSemaphoreReserve(reusedDevice, 1, @ops[0], @ticket5) = #ANVIL_VK_ERR_OWNER)
-  Vks(avkSemaphoreCommit(ticket) = #ANVIL_VK_ERR_OWNER)
-  Vks(avkSemaphoreRollback(ticket) = #ANVIL_VK_ERR_OWNER)
-  Vks(avkSemaphoreComplete(committedTicket) = #ANVIL_VK_ERR_OWNER)
-  Vks(avkSemaphoreRollback(committedTicket) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreState(reusedDevice, staleSem) = #ANVIL_VK_ERR_HANDLE)
+  Vks(avkSemaphoreDestroy(reusedDevice, staleSem) = #ANVIL_VK_ERR_HANDLE)
   Vks(avkSemaphoreResetDevice(reusedDevice) = #VK_SUCCESS)
-  Vks(avkSemaphoreState(reusedDevice, leakedSem) = #ANVIL_VK_ERR_OWNER)
+  Vks(avkSemaphoreState(reusedDevice, staleSem) = #ANVIL_VK_ERR_HANDLE)
+
+  ; Corrupt the foundation deliberately to model an integration that skipped
+  ; the required reset. The semaphore engine's stored owner generation is a
+  ; second line of defence: same slot, new device generation has no authority.
+  Vks(avkSemaphoreCreate(reusedDevice, 0, @leakedSem) = #VK_SUCCESS)
+  ownerSlot = avkDevSlot(reusedDevice)
+  avkDevLive[ownerSlot] = 0
+  Vks(AnvilVkDeviceCreate(physical1, @corruptReusedDevice) = #VK_SUCCESS)
+  Vks(avkTokenSlot(corruptReusedDevice) = ownerSlot)
+  Vks(avkTokenGen(corruptReusedDevice) <> avkTokenGen(reusedDevice))
+  VksOp(@ops[0], leakedSem, #ANVIL_VK_SEM_OP_SIGNAL)
+  Vks(avkSemaphoreReserve(corruptReusedDevice, 1, @ops[0], @ticket5) = #ANVIL_VK_ERR_OWNER)
+  Vks(ticket5 = #VK_NULL_HANDLE)
 
   PokeN(#VKS_OUT + 0, #VKS_MAGIC)
   PokeN(#VKS_OUT + 8, vksChecks)

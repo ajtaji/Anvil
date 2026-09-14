@@ -563,8 +563,33 @@ Procedure vkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, dstIm
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  FENCES AND SUBMISSION
+;  BINARY SEMAPHORES, FENCES AND SUBMISSION
 ; ----------------------------------------------------------------------
+Procedure.i vkCreateSemaphore(device.i, *pCreateInfo.VkSemaphoreCreateInfo, *pAllocator, *pSemaphore)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pSemaphore = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*pSemaphore, #VK_NULL_HANDLE)
+  rc = avkNoAllocator(*pAllocator, 11)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateSemaphore was given a VkSemaphoreCreateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO.")
+  EndIf
+  rc = avkNoPNext(*pCreateInfo\pNext)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  ProcedureReturn avkSemaphoreCreate(device, *pCreateInfo\flags & $FFFFFFFF, *pSemaphore)
+EndProcedure
+
+Procedure vkDestroySemaphore(device.i, semaphore.i, *pAllocator)
+  Define rc.i
+  If avkNoAllocator(*pAllocator, 12) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  rc = avkSemaphoreDestroy(device, semaphore)
+  If rc <> #VK_SUCCESS And rc <> #ANVIL_VK_ERR_STATE
+    avkFault(rc, "vkDestroySemaphore was given a stale semaphore or a VkDevice that does not own it; nothing was destroyed. Check the parent device and for a double destroy.")
+  EndIf
+EndProcedure
+
 Procedure.i vkCreateFence(device.i, *pCreateInfo.VkFenceCreateInfo, *pAllocator, *pFence)
   Define rc.i
   If *pCreateInfo = 0 Or *pFence = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
@@ -590,9 +615,11 @@ Procedure.i vkResetFences(device.i, fenceCount.i, *pFences)
 EndProcedure
 
 Procedure.i vkGetFenceStatus(device.i, fence.i)
+  Define pollResult.i
   ; Give the device a chance to report completion first: a caller that
   ; only ever polls must still be able to see a finished submission.
-  avkFlightPoll()
+  pollResult = avkFlightPoll()
+  If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
   ProcedureReturn AnvilVkFenceStatus(device, fence)
 EndProcedure
 
@@ -601,9 +628,24 @@ Procedure.i vkWaitForFences(device.i, fenceCount.i, *pFences, waitAll.i, timeout
 EndProcedure
 
 Procedure.i vkQueueSubmit(queue.i, submitCount.i, *pSubmits.VkSubmitInfo, fence.i)
+  Define q.i
+  Define d.i
+  Define device.i
+  Define waitCount.i
+  Define signalCount.i
+  Define commandCount.i
+  Define allowedStages.i
+  Define stage.i
+  Define i.i
+  Define opCount.i
+  Define reservation.i
+  Define commandBuffer.i
+  Define rc.i
+  Dim semaphoreOps.AnvilVkSemaphoreOp[#ANVIL_VK_MAX_SEMAPHORE_OPS]
   If submitCount = 0
-    ProcedureReturn AnvilVkQueueSubmitOne(queue, #VK_NULL_HANDLE, fence)
+    ProcedureReturn AnvilVkQueueSubmitOne(queue, #VK_NULL_HANDLE, fence, #VK_NULL_HANDLE)
   EndIf
+  If submitCount < 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If *pSubmits = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If submitCount <> 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit was given more than one VkSubmitInfo in a single call (Anvil code -20005, batched submission not implemented); submit them one at a time, because executing only the first batch would be a silent partial submission.")
@@ -614,16 +656,64 @@ Procedure.i vkQueueSubmit(queue.i, submitCount.i, *pSubmits.VkSubmitInfo, fence.
   If *pSubmits\pNext <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit was given a VkSubmitInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); nothing was submitted.")
   EndIf
-  If *pSubmits\waitSemaphoreCount <> 0 Or *pSubmits\signalSemaphoreCount <> 0
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given semaphores to wait on or signal (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Semaphores are not implemented - there is one queue and one outstanding submission, so use the submission's fence to order work against the host.")
+  waitCount = *pSubmits\waitSemaphoreCount
+  signalCount = *pSubmits\signalSemaphoreCount
+  commandCount = *pSubmits\commandBufferCount
+  If waitCount < 0 Or signalCount < 0 Or commandCount < 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit was given a negative array count (Anvil code -20001, invalid count); nothing was reserved or submitted.")
   EndIf
-  If *pSubmits\commandBufferCount = 0
-    ProcedureReturn AnvilVkQueueSubmitOne(queue, #VK_NULL_HANDLE, fence)
+  If waitCount > #ANVIL_VK_MAX_SEMAPHORE_OPS Or signalCount > #ANVIL_VK_MAX_SEMAPHORE_OPS Or waitCount > (#ANVIL_VK_MAX_SEMAPHORE_OPS - signalCount)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit named more binary semaphore operations than the bounded transaction can own (Anvil code -20005, semaphore limit); nothing was reserved or submitted. Use at most sixteen waits and signals in total.")
   EndIf
-  If *pSubmits\commandBufferCount <> 1 Or *pSubmits\pCommandBuffers = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit was given more than one command buffer in a VkSubmitInfo (Anvil code -20005, multi-buffer submission not implemented); submit them one at a time, because executing only the first would be a silent partial submission.")
+  If waitCount > 0 And (*pSubmits\pWaitSemaphores = 0 Or *pSubmits\pWaitDstStageMask = 0)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit has waitSemaphoreCount greater than zero but a null pWaitSemaphores or pWaitDstStageMask (Anvil code -20001, invalid pointer/count pair); nothing was reserved or submitted.")
   EndIf
-  ProcedureReturn AnvilVkQueueSubmitOne(queue, PeekI(*pSubmits\pCommandBuffers), fence)
+  If signalCount > 0 And *pSubmits\pSignalSemaphores = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit has signalSemaphoreCount greater than zero but a null pSignalSemaphores (Anvil code -20001, invalid pointer/count pair); nothing was reserved or submitted.")
+  EndIf
+  allowedStages = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | #VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+  If AnvilVkBackendCanDraw() <> 0
+    allowedStages = allowedStages | #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | #VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | #VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+  EndIf
+  i = 0
+  While i < waitCount
+    stage = PeekL(*pSubmits\pWaitDstStageMask + (i * 4)) & $FFFFFFFF
+    If stage = 0 Or (stage & (~allowedStages & $FFFFFFFF)) <> 0
+      ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a wait destination stage mask this backend does not execute (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was reserved or submitted. Use only the reported transfer/graphics pipeline stages for this queue.")
+    EndIf
+    semaphoreOps[i]\semaphore = PeekI(*pSubmits\pWaitSemaphores + (i * 8))
+    semaphoreOps[i]\operation = #ANVIL_VK_SEM_OP_WAIT
+    i = i + 1
+  Wend
+  i = 0
+  While i < signalCount
+    semaphoreOps[waitCount + i]\semaphore = PeekI(*pSubmits\pSignalSemaphores + (i * 8))
+    semaphoreOps[waitCount + i]\operation = #ANVIL_VK_SEM_OP_SIGNAL
+    i = i + 1
+  Wend
+  If commandCount > 1 Or (commandCount = 1 And *pSubmits\pCommandBuffers = 0)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit was given more than one command buffer, or one command buffer with a null array (Anvil code -20005, bounded command-buffer batch); nothing was submitted. Submit at most one valid command buffer per VkSubmitInfo.")
+  EndIf
+  q = avkQueueSlot(queue)
+  If q = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  d = avkQueueDev[q]
+  If d < 1 Or d > #ANVIL_VK_MAX_DEVICES Or avkDevLive[d] = 0
+    ProcedureReturn #ANVIL_VK_ERR_HANDLE
+  EndIf
+  device = avkToken(#ANVIL_VK_TYPE_DEVICE, d, avkDevGen[d])
+  reservation = #VK_NULL_HANDLE
+  opCount = waitCount + signalCount
+  If opCount > 0
+    rc = avkSemaphoreReserve(device, opCount, @semaphoreOps[0], @reservation)
+    If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  EndIf
+  commandBuffer = #VK_NULL_HANDLE
+  If commandCount = 1 : commandBuffer = PeekI(*pSubmits\pCommandBuffers) : EndIf
+  rc = AnvilVkQueueSubmitOne(queue, commandBuffer, fence, reservation)
+  If rc <> #VK_SUCCESS And reservation <> #VK_NULL_HANDLE And avkSemaphoreReservationSlot(reservation) <> 0
+    avkSemaphoreRollback(reservation)
+  EndIf
+  ProcedureReturn rc
 EndProcedure
 
 ; ----------------------------------------------------------------------

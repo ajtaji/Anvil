@@ -32,6 +32,7 @@ Global avkTbClearH.i = 0
 Global avkTbHold.i = 0
 Global avkTbBusy.i = 0
 Global avkTbFail.i = 0
+Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
 ; The test backend reports a draw capability as well as a clear one, so
@@ -52,6 +53,7 @@ Global avkTbCaps.i = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_V
 Procedure AnvilVkTestBackendHeap(base.i, bytes.i)
   avkTbHeapBase = base
   avkTbHeapBytes = bytes
+  avkTbPollFail = 0
 EndProcedure
 
 ; Let the foundation gate model distinct honest backends without making
@@ -89,6 +91,12 @@ EndProcedure
 ; Make the next submission fail with this native code, as a device fault.
 Procedure AnvilVkTestBackendFailNext(code.i)
   avkTbFail = code
+EndProcedure
+
+; Make the next poll of a held submission fail once. This is test-only fault
+; injection for proving that every owner rolls back on deferred device loss.
+Procedure AnvilVkTestBackendFailPollNext(code.i)
+  avkTbPollFail = code
 EndProcedure
 
 Procedure.i AnvilVkTestBackendCalls()
@@ -306,6 +314,12 @@ EndProcedure
 Procedure.i avkBackendPoll()
   avkTbPolls = avkTbPolls + 1
   avkTbTicks = avkTbTicks + 1
+  If avkTbPollFail <> 0
+    avkTbNative = avkTbPollFail
+    avkTbPollFail = 0
+    avkTbBusy = 0
+    ProcedureReturn -1
+  EndIf
   If avkTbBusy <> 0 And avkTbHold <> 0 : ProcedureReturn 0 : EndIf
   avkTbBusy = 0
   ProcedureReturn 1

@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Source, registry, emitted-code and mutation gate for vk_semaphore.pbi.
+"""Registry, source, public emitted-code and mutation gate for semaphores.
 
-This checks the unintegrated target-neutral binary semaphore transaction
-engine.  It does not infer public Vulkan support and deliberately rejects any
-source that adds public vkCreateSemaphore/vkDestroySemaphore entry points.
+This checks the binary transaction engine, exact core-1.0 entry points,
+VkSubmitInfo wait/signal adaptation, immediate and polled queue completion,
+failure rollback, dispatch exposure, and generation-safe device teardown.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import os
 import pathlib
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_semaphore.pbi"
+API = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_api.pbi"
+COMMAND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_command.pbi"
+CORE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_core_1_0.pbi"
+BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_backend_test.pbi"
+DISPATCH = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_dispatch.pbi"
 GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_semaphore_gate.pi4"
 RESOURCE_CHECK = ROOT / "tools" / "vulkan_resource_check.py"
 MAGIC = 0x564B534D
@@ -25,53 +33,123 @@ ROWS = 0x06000100
 MUTATIONS = (
     (
         "unsignaled wait accepted",
+        SOURCE,
         "If avkSemTxSawWait[x] <> 0 Or avkSemTxFinal[x] <> #ANVIL_VK_SEM_SIGNALED",
         "If avkSemTxSawWait[x] <> 0 Or avkSemTxFinal[x] < 0",
     ),
     (
         "signal of signaled payload accepted",
+        SOURCE,
         "If avkSemTxSawSignal[x] <> 0 Or avkSemTxFinal[x] <> #ANVIL_VK_SEM_UNSIGNALED",
         "If avkSemTxSawSignal[x] <> 0 Or avkSemTxFinal[x] < 0",
     ),
     (
         "cross-device semaphore accepted",
+        SOURCE,
         "If avkSemDev[s] <> d Or avkSemDevGen[s] <> avkTokenGen(device)\n      avkSemaphoreClearReservation(t)",
         "If avkSemDev[s] < 0 Or avkSemDevGen[s] <> avkTokenGen(device)\n      avkSemaphoreClearReservation(t)",
     ),
     (
         "completion ignores consumed final state",
+        SOURCE,
         "avkSemSignaled[s] = avkSemTxFinal[x]\n      avkSemPendingSignal[s] = 0",
         "avkSemSignaled[s] = #ANVIL_VK_SEM_SIGNALED\n      avkSemPendingSignal[s] = 0",
     ),
     (
         "rollback restores final instead of prior state",
+        SOURCE,
         "avkSemSignaled[s] = avkSemTxPrior[x]\n        avkSemPendingSignal[s] = 0",
         "avkSemSignaled[s] = avkSemTxFinal[x]\n        avkSemPendingSignal[s] = 0",
     ),
     (
         "destroy ignores pending signal",
+        SOURCE,
         "If avkSemPendingSignal[s] <> 0 Or avkSemPendingWait[s] <> 0 Or avkSemaphoreReservedByAny(s) <> 0\n    ProcedureReturn avkFault",
         "If avkSemPendingSignal[s] < 0 Or avkSemPendingWait[s] <> 0 Or avkSemaphoreReservedByAny(s) <> 0\n    ProcedureReturn avkFault",
     ),
     (
         "destroy ignores uncommitted reservation",
+        SOURCE,
         "If avkSemPendingSignal[s] <> 0 Or avkSemPendingWait[s] <> 0 Or avkSemaphoreReservedByAny(s) <> 0\n    ProcedureReturn avkFault",
         "If avkSemPendingSignal[s] <> 0 Or avkSemPendingWait[s] <> 0 Or avkSemaphoreReservedByAny(s) < 0\n    ProcedureReturn avkFault",
     ),
     (
         "second reservation steals a payload",
+        SOURCE,
         "If avkSemPendingSignal[s] <> 0 Or avkSemPendingWait[s] <> 0 Or avkSemaphoreReservedByAny(s) <> 0\n      avkSemaphoreClearReservation(t)",
         "If avkSemPendingSignal[s] <> 0 Or avkSemPendingWait[s] <> 0 Or avkSemaphoreReservedByAny(s) < 0\n      avkSemaphoreClearReservation(t)",
     ),
     (
         "reused device generation inherits reservation authority",
+        SOURCE,
         "If avkSemDev[s] <> d Or avkSemDevGen[s] <> avkTokenGen(device)\n      avkSemaphoreClearReservation(t)",
         "If avkSemDev[s] <> d Or avkSemDevGen[s] < 0\n      avkSemaphoreClearReservation(t)",
     ),
     (
         "failed reservation leaves staged transaction active",
+        SOURCE,
         "avkSemTxStage[t] = #ANVIL_VK_SEM_TX_FREE\nEndProcedure",
         "avkSemTxStage[t] = #ANVIL_VK_SEM_TX_RESERVED\nEndProcedure",
+    ),
+    (
+        "flight drops semaphore ownership",
+        COMMAND,
+        "avkFlightSemaphoreReservation = semaphoreReservation",
+        "avkFlightSemaphoreReservation = #VK_NULL_HANDLE",
+    ),
+    (
+        "successful flight rolls semaphore state back",
+        COMMAND,
+        "semRc = avkSemaphoreComplete(avkFlightSemaphoreReservation)",
+        "semRc = avkSemaphoreRollback(avkFlightSemaphoreReservation)",
+    ),
+    (
+        "failed flight publishes semaphore signal",
+        COMMAND,
+        "Else\n      avkSemaphoreRollback(avkFlightSemaphoreReservation)\n    EndIf",
+        "Else\n      avkSemaphoreComplete(avkFlightSemaphoreReservation)\n    EndIf",
+    ),
+    (
+        "public waits encoded as signals",
+        API,
+        "semaphoreOps[i]\\operation = #ANVIL_VK_SEM_OP_WAIT",
+        "semaphoreOps[i]\\operation = #ANVIL_VK_SEM_OP_SIGNAL",
+    ),
+    (
+        "unsupported wait stage accepted",
+        API,
+        "If stage = 0 Or (stage & (~allowedStages & $FFFFFFFF)) <> 0",
+        "If stage < 0 Or (stage & (~allowedStages & $FFFFFFFF)) < 0",
+    ),
+    (
+        "device teardown skips semaphore reset",
+        COMMAND,
+        "rc = avkSemaphoreResetDevice(device)",
+        "rc = #VK_SUCCESS",
+    ),
+    (
+        "deferred backend fault is reported as completion",
+        BACKEND,
+        "ProcedureReturn -1\n  EndIf\n  If avkTbBusy <> 0",
+        "ProcedureReturn 1\n  EndIf\n  If avkTbBusy <> 0",
+    ),
+    (
+        "vkGetFenceStatus hides deferred device loss",
+        API,
+        "pollResult = avkFlightPoll()\n  If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n  ProcedureReturn AnvilVkFenceStatus",
+        "pollResult = avkFlightPoll()\n  If pollResult < -1 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n  ProcedureReturn AnvilVkFenceStatus",
+    ),
+    (
+        "vkWaitForFences hides deferred device loss",
+        COMMAND,
+        "pollResult = avkFlightPoll()\n    If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n    signalled = 0",
+        "pollResult = avkFlightPoll()\n    If pollResult < -1 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf\n    signalled = 0",
+    ),
+    (
+        "vkDeviceWaitIdle hides deferred device loss",
+        COMMAND,
+        "While avkFlightActive <> 0\n    pollResult = avkFlightPoll()\n    If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf",
+        "While avkFlightActive <> 0\n    pollResult = avkFlightPoll()\n    If pollResult < -1 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf",
     ),
 )
 
@@ -92,15 +170,15 @@ def u64(cpu, address: int) -> int:
 
 
 def emitted(harness, compiler: pathlib.Path, interpreter: pathlib.Path,
-            mutation: tuple[str, str] | None = None):
+            mutation: tuple[pathlib.Path, str, str] | None = None):
     a64 = harness.load_interpreter(interpreter)
     sources: dict[str, str] = {}
     if mutation:
-        before, after = mutation
-        original = SOURCE.read_text(encoding="utf-8")
+        path, before, after = mutation
+        original = path.read_text(encoding="utf-8")
         if original.count(before) != 1:
             raise AssertionError("mutant anchor count is not one: " + before)
-        sources[SOURCE.name] = original.replace(before, after, 1)
+        sources[path.name] = original.replace(before, after, 1)
     cpu, rc, steps = harness.run_once(a64, compiler, sources)
     magic = u64(cpu, OUT)
     count = u64(cpu, OUT + 8)
@@ -147,7 +225,8 @@ def registry_contract(registry: pathlib.Path) -> int:
     return 5
 
 
-def source_contract(text: str) -> int:
+def source_contract(text: str, api: str, command: str, core: str,
+                    backend: str, dispatch: str) -> int:
     required = (
         "#ANVIL_VK_SEM_UNSIGNALED = 0",
         "#ANVIL_VK_SEM_SIGNALED = 1",
@@ -172,8 +251,6 @@ def source_contract(text: str) -> int:
         if token not in text:
             raise AssertionError("source contract token missing: " + token)
     forbidden = (
-        "Procedure.i vkCreateSemaphore(",
-        "Procedure vkDestroySemaphore(",
         "VK_SEMAPHORE_TYPE_TIMELINE",
         "vkSignalSemaphore",
         "vkWaitSemaphores",
@@ -187,7 +264,74 @@ def source_contract(text: str) -> int:
         "Procedure.i avkSemaphoreCommit(", 1)[0]
     if "avkSemSignaled[s] =" in reserve or "avkSemPendingSignal[s] =" in reserve:
         raise AssertionError("reserve mutates externally visible semaphore state")
-    return len(required) + len(forbidden) + 1
+    integrated = {
+        "api": (api, (
+            "Procedure.i vkCreateSemaphore(device.i, *pCreateInfo.VkSemaphoreCreateInfo, *pAllocator, *pSemaphore)",
+            "Procedure vkDestroySemaphore(device.i, semaphore.i, *pAllocator)",
+            "semaphoreOps[i]\\operation = #ANVIL_VK_SEM_OP_WAIT",
+            "semaphoreOps[waitCount + i]\\operation = #ANVIL_VK_SEM_OP_SIGNAL",
+            "stage = 0 Or (stage & (~allowedStages & $FFFFFFFF)) <> 0",
+            "rc = AnvilVkQueueSubmitOne(queue, commandBuffer, fence, reservation)",
+            "avkSemaphoreRollback(reservation)",
+        )),
+        "command": (command, (
+            'XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"',
+            "Global avkFlightSemaphoreReservation.i = 0",
+            "job = avkSemaphoreCommit(semaphoreReservation)",
+            "semRc = avkSemaphoreComplete(avkFlightSemaphoreReservation)",
+            "avkSemaphoreRollback(avkFlightSemaphoreReservation)",
+            "avkFlightSemaphoreReservation = semaphoreReservation",
+            "rc = avkSemaphoreResetDevice(device)",
+            "If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf",
+        )),
+        "core": (core, (
+            "#VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO = 9",
+            "Structure VkSemaphoreCreateInfo Align #PB_Structure_AlignC",
+        )),
+        "backend": (backend, (
+            "Procedure AnvilVkTestBackendFailPollNext(code.i)",
+            "avkTbPollFail = 0",
+            "ProcedureReturn -1",
+        )),
+        "dispatch": (dispatch, (
+            'avkDispatchName(*pName, "vkCreateSemaphore")',
+            'avkDispatchName(*pName, "vkDestroySemaphore")',
+        )),
+    }
+    added = 0
+    for label, (body, tokens) in integrated.items():
+        for token in tokens:
+            if token not in body:
+                raise AssertionError(f"{label} integration token missing: {token}")
+            added += 1
+    return len(required) + len(forbidden) + 1 + added
+
+
+@contextlib.contextmanager
+def checker_lock():
+    """Serialize Vulkan gates that share the compiler and staged sources."""
+    lock_path = pathlib.Path(tempfile.gettempdir()) / "anvil_vk_pipeline_check.lock"
+    with lock_path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -198,28 +342,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mutate", action="store_true")
     args = parser.parse_args(argv)
     try:
-        checks = registry_contract(args.registry)
-        source = SOURCE.read_text(encoding="utf-8")
-        checks += source_contract(source)
-        harness = load_harness()
-        compiler = locate(args.compiler, [ROOT / "PureMetalForge.exe",
-            pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")], "PureMetalForge")
-        interpreter = locate(args.interp, [ROOT / "tools" / "a64" / "a64_interp.py"], "A64 interpreter")
-        rc, steps, magic, count, failures, failed_rows = emitted(harness, compiler, interpreter)
-        if (rc, magic, failures) != (0, MAGIC, 0) or count < 70:
-            raise AssertionError(
-                f"emitted gate rc={rc} magic={magic:#x} rows={count} "
-                f"failures={failures} bad={failed_rows}")
-        checks += count + 3
-        print(f"PASS: {checks} semaphore registry/source/emitted checks; "
-              f"{count} emitted rows, {steps:,} A64 instructions")
-        if args.mutate:
-            for label, before, after in MUTATIONS:
-                mrc, _, mmagic, _, mfails, _ = emitted(
-                    harness, compiler, interpreter, (before, after))
-                if mrc == 0 and mmagic == MAGIC and mfails == 0:
-                    raise AssertionError(label + " mutant survived")
-                print("RED:", label)
+        with checker_lock():
+            checks = registry_contract(args.registry)
+            source = SOURCE.read_text(encoding="utf-8")
+            checks += source_contract(
+                source, API.read_text(encoding="utf-8"),
+                COMMAND.read_text(encoding="utf-8"), CORE.read_text(encoding="utf-8"),
+                BACKEND.read_text(encoding="utf-8"), DISPATCH.read_text(encoding="utf-8"))
+            harness = load_harness()
+            compiler = locate(args.compiler, [ROOT / "PureMetalForge.exe",
+                pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")], "PureMetalForge")
+            interpreter = locate(args.interp, [ROOT / "tools" / "a64" / "a64_interp.py"], "A64 interpreter")
+            rc, steps, magic, count, failures, failed_rows = emitted(harness, compiler, interpreter)
+            if (rc, magic, failures) != (0, MAGIC, 0) or count < 170:
+                raise AssertionError(
+                    f"emitted gate rc={rc} magic={magic:#x} rows={count} "
+                    f"failures={failures} bad={failed_rows}")
+            checks += count + 3
+            print(f"PASS: {checks} semaphore registry/source/emitted checks; "
+                  f"{count} emitted rows, {steps:,} A64 instructions")
+            if args.mutate:
+                for label, path, before, after in MUTATIONS:
+                    mrc, _, mmagic, _, mfails, _ = emitted(
+                        harness, compiler, interpreter, (path, before, after))
+                    if mrc == 0 and mmagic == MAGIC and mfails == 0:
+                        raise AssertionError(label + " mutant survived")
+                    print("RED:", label)
         return 0
     except (AssertionError, OSError, RuntimeError, ET.ParseError) as exc:
         print("FAIL:", exc, file=sys.stderr)

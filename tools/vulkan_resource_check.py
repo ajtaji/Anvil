@@ -302,12 +302,6 @@ MUTANTS = (
         "      If signalled >= count And timeoutNs <> -1 : ProcedureReturn #VK_SUCCESS : EndIf\n",
     ),
     (
-        "semaphores in a VkSubmitInfo are ignored instead of refused",
-        "vk_api.pbi",
-        "  If *pSubmits\\waitSemaphoreCount <> 0 Or *pSubmits\\signalSemaphoreCount <> 0\n",
-        "  If *pSubmits\\waitSemaphoreCount < 0\n",
-    ),
-    (
         "the bounded optimal transfer image is refused",
         "vk_memory.pbi",
         "  ElseIf tiling = #VK_IMAGE_TILING_OPTIMAL\n",

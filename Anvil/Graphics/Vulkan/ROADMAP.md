@@ -86,8 +86,8 @@ mips, layers, format conversion and arbitrary texture sizes remain roadmap.
 - Complete registry generation for every core 1.0 enum, bitmask, alias,
   handle, union, structure, function-pointer type, command prototype, array
   extent, optionality rule, and platform guard.
-- Public `vk*` entry points, dispatch tables, `vkGetInstanceProcAddr`, allocator
-  callback semantics, extension/layer enumeration, general properties and
+- Remaining public `vk*` entry points, platform loader integration, generated
+  dispatch metadata, allocator callback semantics, extension/layer enumeration, general properties and
   limits, image-format queries beyond the exact implemented linear-BGRA8
   combination query,
   queue-family discovery beyond the one implemented family, and deterministic
@@ -145,9 +145,12 @@ its two states and its single owner, `vkResetFences`, `vkGetFenceStatus`, a
 doubly bounded `vkWaitForFences`, `vkDeviceWaitIdle`, image memory barriers
 with layout transitions checked against the recording and against the image,
 and the access/stage scope rules that make the clear after a transition
-correct. Everything below remains missing.
+correct. Core-1.0 binary semaphores now have public create/destroy, ordered
+wait/signal arrays in one `VkSubmitInfo`, pending generation ownership, and
+completion/fault rollback tied to the real queue flight. Everything below
+remains missing.
 
-- Binary semaphores, events, pipeline barriers, memory/buffer/image
+- Events, timeline semaphores, general pipeline barriers, memory/buffer/image
   barriers, access masks, stage masks, queue-family transfers, availability and
   visibility, host/device domains, and simultaneous queue submissions.
 - General command allocation arrays, secondary execution and inheritance,

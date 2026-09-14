@@ -604,9 +604,10 @@ Procedure.i Main()
   ; A fence that is already signalled may not be handed to a submission.
   Vkr(vkQueueSubmit(queue, 1, @si, fence2) = #ANVIL_VK_ERR_STATE)
   Sentence()
-  ; Semaphores are refused before anything is claimed.
+  ; A non-zero semaphore count without its required handle array is an
+  ; invalid pointer/count pair and is refused before anything is claimed.
   si\waitSemaphoreCount = 1
-  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Vkr(vkQueueSubmit(queue, 1, @si, fence) = #ANVIL_VK_ERR_ARGS)
   Sentence()
   si\waitSemaphoreCount = 0
   Vkr(vkQueueSubmit(queue, 2, @si, fence) = #ANVIL_VK_ERR_UNSUPPORTED)

@@ -98,6 +98,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCreatePipelineLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreatePipelineLayout, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateRenderPass") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateRenderPass, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateSampler") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateSampler, domain) : EndIf
+  If avkDispatchName(*pName, "vkCreateSemaphore") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateSemaphore, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateShaderModule") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateShaderModule, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyCommandPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyCommandPool, domain) : EndIf
@@ -113,6 +114,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkDestroyPipelineLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyPipelineLayout, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyRenderPass") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyRenderPass, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroySampler") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroySampler, domain) : EndIf
+  If avkDispatchName(*pName, "vkDestroySemaphore") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroySemaphore, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyShaderModule") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyShaderModule, domain) : EndIf
   If avkDispatchName(*pName, "vkDeviceWaitIdle") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDeviceWaitIdle, domain) : EndIf
   If avkDispatchName(*pName, "vkEndCommandBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkEndCommandBuffer, domain) : EndIf

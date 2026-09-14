@@ -3,9 +3,8 @@
 ; ======================================================================
 ; SPDX-License-Identifier: MIT
 ;
-; This file is deliberately NOT wired into vk_api.pbi or vkQueueSubmit.
-; It is the reviewed lifetime/transaction layer those entry points can use
-; later.  Including it alone does not advertise semaphore support.
+; This is the lifetime/transaction owner behind vkCreateSemaphore,
+; vkDestroySemaphore and vkQueueSubmit's wait/signal arrays.
 ;
 ; The state contract follows Vulkan-Docs v1.4.350, commit 81b1d516,
 ; chapters/synchronization.adoc: a binary semaphore is unsignaled or
@@ -14,15 +13,14 @@
 ; remain alive until that work completes.  There is no host reset operation
 ; for a semaphore and no timeline behavior in this module.
 ;
-; The current Anvil queue is synchronous.  This module therefore models the
-; exact transitions and pending ownership needed by a future queue adapter,
-; but it does not claim an asynchronous executor exists.  Reserve validates
-; a whole ordered batch without changing semaphore state.  Commit publishes
-; all pending references atomically.  Complete publishes the final binary
-; states.  Rollback restores the states that existed before commit.
+; Reserve validates a whole ordered batch without changing semaphore state.
+; Commit publishes all pending references atomically. A backend may complete
+; immediately or remain pending until avkFlightPoll observes completion.
+; Complete then publishes the final binary states; rollback restores the
+; states that existed before commit.
 ;
-; Include seam (future integration): vk_foundation/backend first, then this
-; file, then whichever API/queue adapter consumes the internal procedures.
+; Include seam: vk_foundation/backend first, then this file, then the command
+; and public API layers that consume these internal procedures.
 
 #ANVIL_VK_TYPE_SEMAPHORE = 21
 #ANVIL_VK_TYPE_SEMAPHORE_RESERVATION = 22
@@ -314,7 +312,7 @@ Procedure.i avkSemaphoreCommit(reservation.i)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-; Called only when the associated synchronous submission has really
+; Called only when the associated immediate or polled submission has really
 ; completed.  A signal followed by a wait finishes unsignaled; a final
 ; unconsumed signal finishes signaled.
 Procedure.i avkSemaphoreComplete(reservation.i)

@@ -25,11 +25,12 @@
 ;
 ; WHAT IS NOT HERE, and is refused with a real code and a sentence:
 ; secondary execution, buffer-to-buffer copies, blits, dispatches,
-; render passes, queries, events, semaphores, memory and buffer
+; render passes, queries, events, timeline semaphores, memory and buffer
 ; barriers, multi-range clears, partial-rectangle clears, depth and
 ; stencil clears, and more than one outstanding submission.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_sync.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 
 ; Ops are drawn from ONE pool rather than reserved per command buffer, so
 ; running out of them is a real VK_ERROR_OUT_OF_HOST_MEMORY that a test
@@ -125,6 +126,7 @@ Declare.i avkOpAppend(c.i, kind.i)
 Global avkFlightActive.i = 0
 Global avkFlightCb.i = 0
 Global avkFlightFence.i = 0
+Global avkFlightSemaphoreReservation.i = 0
 Global avkSubmitCount.i = 0
 Global avkCompleteCount.i = 0
 
@@ -849,6 +851,7 @@ Procedure avkFlightComplete(ok.i)
   Define c.i
   Define k.i
   Define s.i
+  Define semRc.i
   If avkFlightActive = 0
     ProcedureReturn
   EndIf
@@ -863,6 +866,21 @@ Procedure avkFlightComplete(ok.i)
       k = k + 1
     Wend
   EndIf
+  ; Semaphore state follows the same real completion boundary as images,
+  ; buffers, command buffers and fences. A pending backend keeps the ticket
+  ; committed until a later avkFlightPoll settles this flight.
+  If avkFlightSemaphoreReservation <> #VK_NULL_HANDLE
+    If ok <> 0
+      semRc = avkSemaphoreComplete(avkFlightSemaphoreReservation)
+      If semRc <> #VK_SUCCESS
+        avkSemaphoreRollback(avkFlightSemaphoreReservation)
+        ok = 0
+        avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device completed but its binary semaphore transaction could not be published (VkResult -4, VK_ERROR_DEVICE_LOST); the semaphore states were rolled back and the command buffer was invalidated.")
+      EndIf
+    Else
+      avkSemaphoreRollback(avkFlightSemaphoreReservation)
+    EndIf
+  EndIf
   avkFlightReleaseRefs(c)
   If ok = 0
     avkCmdState[c] = #ANVIL_VK_CB_INVALID
@@ -875,12 +893,15 @@ Procedure avkFlightComplete(ok.i)
   avkFlightActive = 0
   avkFlightCb = 0
   avkFlightFence = 0
+  avkFlightSemaphoreReservation = 0
   avkCompleteCount = avkCompleteCount + 1
 EndProcedure
 
-; Submit one primary command buffer, optionally signalling one fence.
-; `fence` may be #VK_NULL_HANDLE.
-Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
+; Submit one primary command buffer, optionally signalling one fence and
+; carrying one already-reserved binary-semaphore transaction. The reservation
+; is committed only after all resource/fence preflight succeeds, and is owned
+; by the flight until immediate or polled completion.
+Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreReservation.i)
   Define q.i
   Define c.i
   Define d.i
@@ -904,11 +925,28 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was called while an earlier submission on this queue has not completed (Anvil code -20004, queue busy); this slice runs one submission at a time. Wait on the earlier submission's fence, or call vkDeviceWaitIdle, before submitting again.")
   EndIf
   If commandBuffer = #VK_NULL_HANDLE
-    ; A submission with no command buffers is legal and signals the fence.
-    If fence = #VK_NULL_HANDLE : ProcedureReturn #VK_SUCCESS : EndIf
-    f = avkFenceAcquire(d, fence)
-    If f <= 0 : ProcedureReturn f : EndIf
-    avkFenceSignal(f)
+    ; A submission with no command buffers is legal. Its wait/signal
+    ; semaphore operations and fence complete synchronously because there is
+    ; no backend work to wait for.
+    f = 0
+    If fence <> #VK_NULL_HANDLE
+      f = avkFenceAcquire(d, fence)
+      If f <= 0 : ProcedureReturn f : EndIf
+    EndIf
+    If semaphoreReservation <> #VK_NULL_HANDLE
+      job = avkSemaphoreCommit(semaphoreReservation)
+      If job <> #VK_SUCCESS
+        If f > 0 : avkFenceRelease(f) : EndIf
+        ProcedureReturn job
+      EndIf
+      job = avkSemaphoreComplete(semaphoreReservation)
+      If job <> #VK_SUCCESS
+        avkSemaphoreRollback(semaphoreReservation)
+        If f > 0 : avkFenceRelease(f) : EndIf
+        ProcedureReturn job
+      EndIf
+    EndIf
+    If f > 0 : avkFenceSignal(f) : EndIf
     avkSubmitCount = avkSubmitCount + 1
     avkCompleteCount = avkCompleteCount + 1
     ProcedureReturn #VK_SUCCESS
@@ -1008,9 +1046,17 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
     f = avkFenceAcquire(d, fence)
     If f <= 0 : ProcedureReturn f : EndIf
   EndIf
+  If semaphoreReservation <> #VK_NULL_HANDLE
+    job = avkSemaphoreCommit(semaphoreReservation)
+    If job <> #VK_SUCCESS
+      If f > 0 : avkFenceRelease(f) : EndIf
+      ProcedureReturn job
+    EndIf
+  EndIf
   avkFlightActive = 1
   avkFlightCb = c
   avkFlightFence = f
+  avkFlightSemaphoreReservation = semaphoreReservation
   avkCmdState[c] = #ANVIL_VK_CB_PENDING
   avkFlightRetain(c)
   avkDrawRetain(c)
@@ -1095,7 +1141,7 @@ Procedure.i avkFlightPoll()
   If r < 0
     avkFlightComplete(0)
     avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device reported a fault while a submitted clear was running (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own code.")
-    ProcedureReturn 1
+    ProcedureReturn -1
   EndIf
   If r = 0 : ProcedureReturn 0 : EndIf
   avkFlightComplete(1)
@@ -1116,6 +1162,7 @@ Procedure.i AnvilVkWaitForFences(device.i, count.i, *handles, waitAll.i, timeout
   Define t0.i
   Define polls.i
   Define signalled.i
+  Define pollResult.i
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   If count < 1 Or *handles = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
@@ -1136,7 +1183,8 @@ Procedure.i AnvilVkWaitForFences(device.i, count.i, *handles, waitAll.i, timeout
     ; Count the fences that are signalled now, AFTER giving the device a
     ; chance to finish, so a zero timeout still observes work the backend
     ; has already completed.
-    avkFlightPoll()
+    pollResult = avkFlightPoll()
+    If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
     signalled = 0
     i = 0
     While i < count
@@ -1163,11 +1211,13 @@ EndProcedure
 Procedure.i AnvilVkDeviceWaitIdle(device.i)
   Define d.i
   Define polls.i
+  Define pollResult.i
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   polls = 0
   While avkFlightActive <> 0
-    avkFlightPoll()
+    pollResult = avkFlightPoll()
+    If pollResult < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
     polls = polls + 1
     If polls >= #ANVIL_VK_WAIT_MAX_POLLS
       ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "vkDeviceWaitIdle gave up after its bounded poll count with a submission still outstanding (VkResult -4, VK_ERROR_DEVICE_LOST); the device is not reporting completion. Check the backend's fault state before using the device again.")
@@ -1181,10 +1231,17 @@ Procedure.i AnvilVkDeviceDestroy(device.i)
   Define p.i
   Define q.i
   Define i.i
+  Define rc.i
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   If avkFlightActive <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyDevice was called with a submission still outstanding (Anvil code -20004, device busy); nothing was destroyed. Call vkDeviceWaitIdle before destroying a device.")
+  EndIf
+  ; Retire every generation-matched semaphore while the VkDevice handle is
+  ; still live. A pending/reserved transaction aborts teardown atomically.
+  rc = avkSemaphoreResetDevice(device)
+  If rc <> #VK_SUCCESS
+    ProcedureReturn avkFault(rc, "vkDestroyDevice found a binary semaphore reservation or submitted operation that is not quiescent (Anvil code -20004, semaphore in use); the device and all of its children were left alive. Wait for the queue to become idle before destroying the device.")
   EndIf
   p = 1
   While p <= #ANVIL_VK_MAX_COMMAND_POOLS

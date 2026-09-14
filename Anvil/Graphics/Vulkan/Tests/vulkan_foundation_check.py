@@ -69,6 +69,7 @@ CONSTANTS = {
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO",
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO",
     "VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO", "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO",
+    "VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO",
     "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO", "VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO", "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
     "VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER", "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER",
     "VK_FORMAT_UNDEFINED", "VK_FORMAT_R8G8B8A8_UNORM", "VK_FORMAT_B8G8R8A8_UNORM",
@@ -246,6 +247,8 @@ STRUCTS = {
                      ("VkCommandBuffer", "pCommandBuffers"),
                      ("uint32_t", "signalSemaphoreCount"),
                      ("VkSemaphore", "pSignalSemaphores")),
+    "VkSemaphoreCreateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
+                              ("VkSemaphoreCreateFlags", "flags")),
     "VkMemoryAllocateInfo": (("VkStructureType", "sType"), ("void", "pNext"),
                              ("VkDeviceSize", "allocationSize"),
                              ("uint32_t", "memoryTypeIndex")),
@@ -457,7 +460,7 @@ PB_SUFFIX = {
     "VkFormatFeatureFlags": ".l",
     "VkSampleCountFlags": ".l",
     "VkMemoryPropertyFlags": ".l", "VkMemoryHeapFlags": ".l",
-    "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l",
+    "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l", "VkSemaphoreCreateFlags": ".l",
     "VkDeviceSize": ".q", "uint64_t": ".q",
     "VkCommandPool": ".i", "VkRenderPass": ".i", "VkFramebuffer": ".i",
     "VkSemaphore": ".i", "VkCommandBuffer": ".i", "VkImage": ".i",
@@ -680,11 +683,15 @@ def expected_pbi_member(member: ET.Element) -> str:
 
 def check_registry(failures: list[str]) -> int:
     path = registry_path()
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    # A Windows Git checkout may transport the pinned XML with CRLF. Pin the
+    # registry content after normalizing that one reversible checkout detail,
+    # exactly as the dispatch inventory gate does; no XML node is rewritten.
+    registry_bytes = path.read_bytes().replace(b"\r\n", b"\n")
+    digest = hashlib.sha256(registry_bytes).hexdigest()
     if digest != REGISTRY_SHA256:
         failures.append("registry SHA-256 %s, wanted %s" % (digest, REGISTRY_SHA256))
         return 1
-    root = ET.parse(path).getroot()
+    root = ET.fromstring(registry_bytes)
     enums = {}
     for enum in root.findall(".//enum"):
         name = enum.get("name")
@@ -945,8 +952,8 @@ def image_format_mutations() -> list[tuple[str, bool, str]]:
         ("the maximum extent is hard coded instead of backend owned", API,
          "  limit = avkBackendMaxImageDimension2D()\n",
          "  limit = 4096\n"),
-        ("maxResourceSize ignores the backend row-pitch rule", API,
-         "  bytes = AnvilVkImageMaxResourceSize()\n",
+        ("maxResourceSize ignores the backend-owned image plan", API,
+         "  bytes = plan\\bytes\n",
          "  bytes = limit * limit * 4\n"),
         ("the query advertises mip levels the creator refuses", API,
          "  *pImageFormatProperties\\maxMipLevels = 1\n",

@@ -60,6 +60,7 @@ Procedure SeedWanted()
           "VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT,VK_STRUCTURE_TYPE_APPLICATION_INFO," +
           "VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO," +
           "VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,VK_STRUCTURE_TYPE_SUBMIT_INFO," +
+          "VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO," +
           "VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO," +
           "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO,VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO," +
           "VK_FORMAT_B8G8R8A8_UNORM,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT," +
@@ -92,11 +93,12 @@ Procedure SeedWanted()
   WantedStruct("VkCommandBufferInheritanceInfo") = "VkStructureType:sType,void:pNext,VkRenderPass:renderPass,uint32_t:subpass,VkFramebuffer:framebuffer,VkBool32:occlusionQueryEnable,VkQueryControlFlags:queryFlags,VkQueryPipelineStatisticFlags:pipelineStatistics"
   WantedStruct("VkCommandBufferBeginInfo") = "VkStructureType:sType,void:pNext,VkCommandBufferUsageFlags:flags,VkCommandBufferInheritanceInfo:pInheritanceInfo"
   WantedStruct("VkSubmitInfo") = "VkStructureType:sType,void:pNext,uint32_t:waitSemaphoreCount,VkSemaphore:pWaitSemaphores,VkPipelineStageFlags:pWaitDstStageMask,uint32_t:commandBufferCount,VkCommandBuffer:pCommandBuffers,uint32_t:signalSemaphoreCount,VkSemaphore:pSignalSemaphores"
+  WantedStruct("VkSemaphoreCreateInfo") = "VkStructureType:sType,void:pNext,VkSemaphoreCreateFlags:flags"
   WantedStructOrder = "VkExtent2D,VkExtent3D,VkOffset2D,VkOffset3D,VkViewport,VkRect2D,VkFormatProperties,VkImageFormatProperties," +
                       "VkComponentMapping,VkExtensionProperties,VkLayerProperties,VkApplicationInfo," +
                       "VkAllocationCallbacks,VkDeviceQueueCreateInfo,VkPhysicalDeviceFeatures,VkDeviceCreateInfo," +
                       "VkInstanceCreateInfo,VkCommandPoolCreateInfo,VkCommandBufferAllocateInfo," +
-                      "VkCommandBufferInheritanceInfo,VkCommandBufferBeginInfo,VkSubmitInfo"
+                      "VkCommandBufferInheritanceInfo,VkCommandBufferBeginInfo,VkSubmitInfo,VkSemaphoreCreateInfo"
 EndProcedure
 
 Procedure IndexRegistry(*root)
@@ -162,7 +164,7 @@ EndProcedure
 
 Procedure.s PbSuffix(cType.s)
   Select cType
-    Case "uint32_t", "int32_t", "VkBool32", "VkComponentSwizzle", "VkStructureType", "VkDeviceQueueCreateFlags", "VkDeviceCreateFlags", "VkInstanceCreateFlags", "VkCommandPoolCreateFlags", "VkCommandBufferLevel", "VkQueryControlFlags", "VkQueryPipelineStatisticFlags", "VkCommandBufferUsageFlags", "VkPipelineStageFlags", "VkFormatFeatureFlags", "VkSampleCountFlags" : ProcedureReturn ".l"
+    Case "uint32_t", "int32_t", "VkBool32", "VkComponentSwizzle", "VkStructureType", "VkDeviceQueueCreateFlags", "VkDeviceCreateFlags", "VkInstanceCreateFlags", "VkCommandPoolCreateFlags", "VkSemaphoreCreateFlags", "VkCommandBufferLevel", "VkQueryControlFlags", "VkQueryPipelineStatisticFlags", "VkCommandBufferUsageFlags", "VkPipelineStageFlags", "VkFormatFeatureFlags", "VkSampleCountFlags" : ProcedureReturn ".l"
     Case "float" : ProcedureReturn ".f"
     Case "VkCommandPool", "VkRenderPass", "VkFramebuffer", "VkSemaphore", "VkCommandBuffer" : ProcedureReturn ".i"
     Case "VkOffset2D", "VkExtent2D", "VkExtent3D" : ProcedureReturn "." + cType

@@ -35,11 +35,11 @@ vkCmdPipelineBarrier vkCmdPushConstants vkCreateBuffer vkCreateCommandPool
 vkCreateDescriptorPool vkCreateDescriptorSetLayout vkCreateDevice vkCreateFence
 vkCreateFramebuffer vkCreateGraphicsPipelines vkCreateImage vkCreateImageView
 vkCreateInstance vkCreatePipelineLayout vkCreateRenderPass vkCreateSampler
-vkCreateShaderModule vkDestroyBuffer vkDestroyCommandPool
+vkCreateSemaphore vkCreateShaderModule vkDestroyBuffer vkDestroyCommandPool
 vkDestroyDescriptorPool vkDestroyDescriptorSetLayout vkDestroyDevice
 vkDestroyFence vkDestroyFramebuffer vkDestroyImage vkDestroyImageView
 vkDestroyInstance vkDestroyPipeline vkDestroyPipelineLayout
-vkDestroyRenderPass vkDestroySampler vkDestroyShaderModule vkDeviceWaitIdle
+vkDestroyRenderPass vkDestroySampler vkDestroySemaphore vkDestroyShaderModule vkDeviceWaitIdle
 vkEndCommandBuffer vkEnumeratePhysicalDevices vkFreeCommandBuffers vkFreeMemory
 vkGetBufferMemoryRequirements vkGetDeviceQueue vkGetFenceStatus
 vkGetImageMemoryRequirements vkGetPhysicalDeviceFeatures
@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         # domain, case drift, a removed audited command, and both withheld rows.
         mutants = []
         missing = dict(rows); missing.pop("vkQueueSubmit"); mutants.append(("removed audited row", missing))
-        extra = dict(rows); extra["vkCreateSemaphore"] = ("#AVK_DISPATCH_DEVICE", "vkCreateSemaphore"); mutants.append(("missing command exposed", extra))
+        extra = dict(rows); extra["vkCreateEvent"] = ("#AVK_DISPATCH_DEVICE", "vkCreateEvent"); mutants.append(("missing command exposed", extra))
         target = dict(rows); target["vkDeviceWaitIdle"] = ("#AVK_DISPATCH_DEVICE", "vkQueueSubmit"); mutants.append(("wrong pointer", target))
         domain = dict(rows); domain["vkCreateDevice"] = ("#AVK_DISPATCH_DEVICE", "vkCreateDevice"); mutants.append(("wrong domain", domain))
         case = dict(rows); case["vkdevicewaitidle"] = case.pop("vkDeviceWaitIdle"); mutants.append(("case-folded key", case))
