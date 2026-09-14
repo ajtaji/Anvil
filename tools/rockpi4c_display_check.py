@@ -653,6 +653,16 @@ def source_contract() -> None:
                 f"Cadence selected-mode polarity/timing drifted: {timing}")
     require("rockcdnlinkcarriesmode(linkmhz)" in video_mode,
             "selected-mode link-bandwidth admission check missing")
+    live_link = cdn.split("procedure.i rockcdnreadlivelinkstatus()", 1)[1].split(
+        "endprocedure", 1
+    )[0]
+    for token in ("pokea(@rock_cdn_message[0]+1,6)",
+                  "pokea(@rock_cdn_message[0]+3,2)",
+                  "pokea(@rock_cdn_message[0]+4,2)",
+                  "rockcdnreceive(#cdn_mb_dp_tx,#cdn_read_dpcd,11",
+                  "rockcdnlastauxstatus()"):
+        require(token in live_link,
+                f"post-video DPCD 0202h link witness drifted: {token}")
     require("requiredmbps.i = (rock_mode_pixel_hz * 24 + 999999) / 1000000" in cdn and
             "availablembps = linkmhz * rock_cdn_link_lanes * 8" in cdn,
             "selected-mode link-bandwidth arithmetic drifted")
@@ -666,7 +676,7 @@ def source_contract() -> None:
     ):
         require(token in cdn, f"DPCD AUX status contract drifted: {token}")
     dpcd = cdn.split("procedure.i rockcdndpcd()", 1)[1].split(
-        "procedure.i rockcdnreadedidblock", 1)[0]
+        "procedure.i rockcdnreadlivelinkstatus", 1)[0]
     transaction_order = [
         "rockcdnsend(#cdn_mb_dp_tx,#cdn_read_dpcd",
         "rockcdnreceive(#cdn_mb_dp_tx,#cdn_read_dpcd",

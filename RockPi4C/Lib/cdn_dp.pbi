@@ -105,6 +105,8 @@ Global rock_cdn_mailbox_drain_count.i
 Global rock_cdn_mailbox_drain_complete.i
 Global rock_cdn_mailbox_payload5_valid.i
 Global Dim rock_cdn_mailbox_payload5.a[4]
+Global rock_cdn_live_link_valid.i
+Global Dim rock_cdn_live_link_status.a[5]
 Global Dim rock_cdn_edid.a[#CDN_EDID_BYTES-1]
 Global Dim rock_cdn_message.a[255]
 
@@ -401,6 +403,47 @@ Procedure.i RockCdnDpcd()
     EndSelect
   Next
   rock_cdn_error = 41
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RockCdnReadLiveLinkStatus()
+  Protected attempt.i
+  Protected aux.i
+  Protected index.i
+  rock_cdn_live_link_valid=0
+  For attempt=0 To 31
+    ; DPCD 0202h..0207h is the DP link-status block used by the pinned DRM
+    ; driver's drm_dp_dpcd_read_link_status() after video becomes active.
+    PokeA(@rock_cdn_message[0],0)
+    PokeA(@rock_cdn_message[0]+1,6)
+    PokeA(@rock_cdn_message[0]+2,0)
+    PokeA(@rock_cdn_message[0]+3,2)
+    PokeA(@rock_cdn_message[0]+4,2)
+    If RockCdnSend(#CDN_MB_DP_TX,#CDN_READ_DPCD,5,@rock_cdn_message[0])=0 : ProcedureReturn 0 : EndIf
+    If RockCdnReceive(#CDN_MB_DP_TX,#CDN_READ_DPCD,11,@rock_cdn_message[32])=0 : ProcedureReturn 0 : EndIf
+    aux=RockCdnLastAuxStatus()
+    If aux < 0 : ProcedureReturn 0 : EndIf
+    rock_cdn_aux_status=aux
+    Select aux
+      Case #CDN_AUX_ACK
+        For index=0 To 5
+          rock_cdn_live_link_status[index]=PeekA(@rock_cdn_message[32]+5+index) & 255
+        Next
+        rock_cdn_live_link_valid=1
+        ProcedureReturn 1
+      Case #CDN_AUX_DEFER
+        RockTimerWaitUs(500)
+      Case #CDN_AUX_NACK
+        rock_cdn_error=37 : ProcedureReturn 0
+      Case #CDN_AUX_SINK_ERROR
+        rock_cdn_error=38 : ProcedureReturn 0
+      Case #CDN_AUX_BUS_ERROR
+        rock_cdn_error=39 : ProcedureReturn 0
+      Default
+        rock_cdn_error=40 : ProcedureReturn 0
+    EndSelect
+  Next
+  rock_cdn_error=41
   ProcedureReturn 0
 EndProcedure
 

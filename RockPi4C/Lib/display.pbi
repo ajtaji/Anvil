@@ -263,6 +263,31 @@ Procedure RockDisplayFrameTelemetry()
   RockUartByte(13) : RockUartByte(10)
 EndProcedure
 
+Procedure RockDisplayLiveLinkTelemetry()
+  Protected index.i
+  Protected lane01.i
+  Protected aligned.i
+  If rock_uart_ready=0 : ProcedureReturn 0 : EndIf
+  RockUartText("DP LINK 0202-0207 ")
+  If rock_cdn_live_link_valid=0
+    RockUartText("UNAVAILABLE CDNERR ")
+    RockDisplayHexByte(rock_cdn_error)
+  Else
+    For index=0 To 5
+      RockDisplayHexByte(rock_cdn_live_link_status[index])
+      If index<5 : RockUartByte(32) : EndIf
+    Next
+    lane01=rock_cdn_live_link_status[0]
+    aligned=rock_cdn_live_link_status[2] & 1
+    If (lane01 & $77)=$77 And aligned<>0
+      RockUartText(" CHANNEL EQ OK")
+    Else
+      RockUartText(" CHANNEL EQ LOST")
+    EndIf
+  EndIf
+  RockUartByte(13) : RockUartByte(10)
+EndProcedure
+
 Procedure RockDisplaySubsystemTelemetry(text.i, error.i)
   If rock_uart_ready <> 0
     RockUartText(text)
@@ -558,6 +583,9 @@ Procedure.i RockDisplayUp()
     RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
   EndIf
+  RockTimerWaitUs(50000)
+  RockCdnReadLiveLinkStatus()
+  RockDisplayLiveLinkTelemetry()
   RockDisplayFrameTelemetry()
   rock_display_width=rock_mode_width
   rock_display_height=rock_mode_height
