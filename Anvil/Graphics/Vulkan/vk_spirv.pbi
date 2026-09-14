@@ -98,6 +98,21 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_MAX_ATTRS = 4
 #ANVIL_SPV_MAX_VARYINGS = 4
 #ANVIL_SPV_MAX_MEMBERS = 4
+#ANVIL_SPV_MAX_RECORDS = #ANVIL_SPV_MAX_WORDS
+
+; Public, copy-out semantic record categories. The raw accepted module is
+; retained separately, so a longer entry-point string or debug instruction
+; never narrows the legacy parser's accepted input.
+#ANVIL_SPV_REC_ENVIRONMENT = 1
+#ANVIL_SPV_REC_ENTRY       = 2
+#ANVIL_SPV_REC_TYPE        = 3
+#ANVIL_SPV_REC_CONSTANT    = 4
+#ANVIL_SPV_REC_VARIABLE    = 5
+#ANVIL_SPV_REC_DECORATION  = 6
+#ANVIL_SPV_REC_FUNCTION    = 7
+#ANVIL_SPV_REC_BLOCK       = 8
+#ANVIL_SPV_REC_NODE        = 9
+#ANVIL_SPV_REC_END         = 10
 
 ; ----------------------------------------------------------------------
 ;  Opcodes. Only the ones this file names are listed; the rest are
@@ -291,6 +306,44 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #ANVIL_SPV_V_UNIFORM = 7      ; a load of one member of the uniform block
 #ANVIL_SPV_V_SAMPLED = 8      ; a load of one combined sampled-image variable
 #ANVIL_SPV_V_IMAGE_SAMPLE = 9 ; OpImageSampleImplicitLod(sampled, input vec2)
+#ANVIL_SPV_V_FADD = 10
+#ANVIL_SPV_V_FMUL = 11
+
+; A normalized record is produced by the validating declaration engine, not
+; by a downstream re-parser. IDs and literals are kept in their semantic
+; order. Nine inline IDs cover every interface the typed IR can represent;
+; idCount retains the total and the exact source words retain any legacy extra
+; interface IDs without narrowing the old walk. Eight inline literals cover
+; every represented type/declaration. The original instruction offset/count
+; and every source word remain available too.
+Structure AvkSpvRecord Align #PB_Structure_AlignC
+  streamIndex.i
+  wordOffset.i
+  sourceOpcode.i
+  sourceWordCount.i
+  section.i
+  sourceId.i
+  resultType.i
+  idCount.i
+  id0.i
+  id1.i
+  id2.i
+  id3.i
+  id4.i
+  id5.i
+  id6.i
+  id7.i
+  id8.i
+  literalCount.i
+  literal0.i
+  literal1.i
+  literal2.i
+  literal3.i
+  literal4.i
+  literal5.i
+  literal6.i
+  literal7.i
+EndStructure
 
 ; The colour sources a fragment plan can name.
 #ANVIL_SPV_COLOUR_VARYING = 0
@@ -356,6 +409,15 @@ Global Dim spvPlanVaryLoc.i[#ANVIL_SPV_MAX_VARYINGS]
 Global Dim spvPlanVaryComp.i[#ANVIL_SPV_MAX_VARYINGS]
 Global Dim spvPlanVarySrc.i[#ANVIL_SPV_MAX_VARYINGS]
 Global Dim spvPlanConst.i[4]
+
+; Last successfully accepted module. These arrays are private and are exposed
+; only through bounded copy-out readers, so caller code may be freed or
+; overwritten immediately after a successful walk.
+Global Dim spvRecords.AvkSpvRecord[#ANVIL_SPV_MAX_RECORDS]
+Global Dim spvRecordWords.i[#ANVIL_SPV_MAX_WORDS]
+Global spvRecordCount.i = 0
+Global spvRecordWordCount.i = 0
+Global spvRecordsValid.i = 0
 
 Procedure.i AnvilVkSpirvLastOpcode()
   ProcedureReturn spvLastOpcode
@@ -574,7 +636,7 @@ EndProcedure
 ;  `at` is the word index of the instruction's first word and `count` its
 ;  word count, both already validated by the caller.
 ; ----------------------------------------------------------------------
-Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
+Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
   Define id.i
   Define a.i
   Define b.i
@@ -1133,6 +1195,50 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i)
       spvValueB[id] = k
       ProcedureReturn #ANVIL_VK_OK
 
+    Case #SpvOpFAdd
+      If irMode = 0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+      a = avkSpvWord(*words, at + 1)
+      id = avkSpvWord(*words, at + 2)
+      b = avkSpvWord(*words, at + 3)
+      k = avkSpvWord(*words, at + 4)
+      If count <> 5 Or avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0 Or avkSpvIdOk(b) = 0 Or avkSpvIdOk(k) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpFAdd named an invalid result type, result id or operand id (Anvil code -20001, malformed arithmetic); all five words and every id are required.")
+      EndIf
+      If spvKind[id] <> #ANVIL_SPV_K_NONE Or (spvKind[b] <> #ANVIL_SPV_K_VALUE And spvKind[b] <> #ANVIL_SPV_K_CONST) Or (spvKind[k] <> #ANVIL_SPV_K_VALUE And spvKind[k] <> #ANVIL_SPV_K_CONST)
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpFAdd redefined an id or used an operand not defined earlier in its block (Anvil code -20001, malformed arithmetic); SSA definitions must dominate every use.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) < 1 Or avkSpvComponents(a) > 4 Or spvValueType[b] <> a Or spvValueType[k] <> a
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused OpFAdd whose result and operands are not the same binary32 scalar or vec2, vec3 or vec4 type (Anvil code -20005, unsupported arithmetic type); mixed widths and conversions are not implicit.")
+      EndIf
+      spvKind[id]=#ANVIL_SPV_K_VALUE
+      spvValueType[id]=a
+      spvValueSrc[id]=#ANVIL_SPV_V_FADD
+      spvValueA[id]=b
+      spvValueB[id]=k
+      ProcedureReturn #ANVIL_VK_OK
+
+    Case #SpvOpFMul
+      If irMode = 0 : ProcedureReturn avkSpvRefuseOpcode(op) : EndIf
+      a = avkSpvWord(*words, at + 1)
+      id = avkSpvWord(*words, at + 2)
+      b = avkSpvWord(*words, at + 3)
+      k = avkSpvWord(*words, at + 4)
+      If count <> 5 Or avkSpvIdOk(id) = 0 Or avkSpvIdOk(a) = 0 Or avkSpvIdOk(b) = 0 Or avkSpvIdOk(k) = 0
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpFMul named an invalid result type, result id or operand id (Anvil code -20001, malformed arithmetic); all five words and every id are required.")
+      EndIf
+      If spvKind[id] <> #ANVIL_SPV_K_NONE Or (spvKind[b] <> #ANVIL_SPV_K_VALUE And spvKind[b] <> #ANVIL_SPV_K_CONST) Or (spvKind[k] <> #ANVIL_SPV_K_VALUE And spvKind[k] <> #ANVIL_SPV_K_CONST)
+        ProcedureReturn avkSpvMalformed("a SPIR-V OpFMul redefined an id or used an operand not defined earlier in its block (Anvil code -20001, malformed arithmetic); SSA definitions must dominate every use.")
+      EndIf
+      If avkSpvIsFloatish(a) = 0 Or avkSpvComponents(a) < 1 Or avkSpvComponents(a) > 4 Or spvValueType[b] <> a Or spvValueType[k] <> a
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused OpFMul whose result and operands are not the same binary32 scalar or vec2, vec3 or vec4 type (Anvil code -20005, unsupported arithmetic type); mixed widths and conversions are not implicit.")
+      EndIf
+      spvKind[id]=#ANVIL_SPV_K_VALUE
+      spvValueType[id]=a
+      spvValueSrc[id]=#ANVIL_SPV_V_FMUL
+      spvValueA[id]=b
+      spvValueB[id]=k
+      ProcedureReturn #ANVIL_VK_OK
+
     Case #SpvOpStore
       a = avkSpvWord(*words, at + 1)
       b = avkSpvWord(*words, at + 2)
@@ -1479,7 +1585,9 @@ EndProcedure
 ;  The caller has already checked that `bytes` is a multiple of four and
 ;  not zero; everything else about the module is checked here.
 ; ----------------------------------------------------------------------
-Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
+Declare.i avkSpvRetain(*words, at.i, count.i, op.i)
+
+Procedure.i avkSpvWalk(*code, bytes.i, irMode.i)
   Define words.i
   Define at.i
   Define first.i
@@ -1488,7 +1596,18 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
   Define rc.i
   Define id.i
   Define seenFunction.i
+  Define functionCount.i
+  Define blockCount.i
+  Define returnCount.i
+  Define functionEndCount.i
+  Define inFunction.i
+  Define inBlock.i
+  Define blockReturned.i
+  Define functionEnded.i
 
+  spvRecordsValid = 0
+  spvRecordCount = 0
+  spvRecordWordCount = 0
   avkSpvResetTables()
   spvLastOpcode = 0
   If *code = 0
@@ -1504,8 +1623,23 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
   rc = avkSpvHeader(*code, words)
   If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
 
+  at = 0
+  While at < words
+    spvRecordWords[at] = avkSpvWord(*code, at)
+    at = at + 1
+  Wend
+  spvRecordWordCount = words
+
   at = #ANVIL_SPV_HEADER_WORDS
   seenFunction = 0
+  functionCount = 0
+  blockCount = 0
+  returnCount = 0
+  functionEndCount = 0
+  inFunction = 0
+  inBlock = 0
+  blockReturned = 0
+  functionEnded = 0
   While at < words
     first = avkSpvWord(*code, at)
     op = first & $FFFF
@@ -1516,9 +1650,31 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
     If (at + count) > words
       ProcedureReturn avkSpvMalformed("a SPIR-V instruction declared a word count that runs past the end of the module (Anvil code -20001, truncated module); the last instruction claims more words than codeSize supplies, so either the module was cut short or codeSize is wrong.")
     EndIf
-    If op = #SpvOpFunction : seenFunction = 1 : EndIf
-    rc = avkSpvDecl(*code, at, count, op)
+    If irMode <> 0
+      If functionEnded <> 0 And op <> #SpvOpNop And op <> #SpvOpLine And op <> #SpvOpNoLine
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused an instruction after the entry function ended (Anvil code -20005, unsupported instruction order); the retained module is one function and cannot append another semantic section.")
+      EndIf
+      If op = #SpvOpFunction And (inFunction <> 0 Or functionEnded <> 0)
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused a second or nested function (Anvil code -20005, unsupported function order); exactly one entry function is representable.")
+      EndIf
+      If op = #SpvOpLabel And (inFunction = 0 Or inBlock <> 0)
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused a label outside the entry function or after its sole block began (Anvil code -20005, unsupported block order); exactly one entry block is representable.")
+      EndIf
+      If (op = #SpvOpLoad Or op = #SpvOpStore Or op = #SpvOpAccessChain Or op = #SpvOpCompositeExtract Or op = #SpvOpCompositeConstruct Or op = #SpvOpImageSampleImplicitLod Or op = #SpvOpFAdd Or op = #SpvOpFMul Or op = #SpvOpReturn) And (inBlock = 0 Or blockReturned <> 0)
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused an SSA operation outside the sole entry block or after its terminator (Anvil code -20005, unsupported instruction order); ordered operands must be defined in the block before use and OpReturn must end it.")
+      EndIf
+      If op = #SpvOpFunctionEnd And (inFunction = 0 Or inBlock = 0 Or blockReturned = 0)
+        ProcedureReturn avkSpvRefuse(op, "the SPIR-V IR walk refused OpFunctionEnd before the sole block's OpReturn terminator (Anvil code -20005, unsupported function order); an exactly representable function ends only after its block.")
+      EndIf
+    EndIf
+    rc = avkSpvDecl(*code, at, count, op, irMode)
     If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
+    rc = avkSpvRetain(*code, at, count, op)
+    If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
+    If op = #SpvOpFunction : seenFunction = 1 : functionCount = functionCount + 1 : inFunction = 1 : EndIf
+    If op = #SpvOpLabel : blockCount = blockCount + 1 : inBlock = 1 : EndIf
+    If op = #SpvOpReturn : returnCount = returnCount + 1 : blockReturned = 1 : EndIf
+    If op = #SpvOpFunctionEnd : functionEndCount = functionEndCount + 1 : inFunction = 0 : inBlock = 0 : functionEnded = 1 : EndIf
     spvInstructions = spvInstructions + 1
     at = at + count
   Wend
@@ -1588,23 +1744,56 @@ Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
     If spvSampleVar <> 0
       ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a UniformConstant sampled image in a vertex shader (Anvil code -20005, unsupported descriptor stage); this first texture lowering belongs to the fragment stage and has no vertex texture path.")
     EndIf
-    ProcedureReturn avkSpvBuildVertexPlan()
+    If irMode <> 0 And (functionCount <> 1 Or blockCount <> 1 Or returnCount <> 1 Or functionEndCount <> 1)
+      ProcedureReturn avkSpvRefuse(#SpvOpFunction, "the SPIR-V IR walk requires exactly one entry function, one block, one OpReturn and one OpFunctionEnd (Anvil code -20005, unsupported control-flow shape); no partial record stream was published.")
+    EndIf
+    rc = avkSpvBuildVertexPlan()
+    If rc = #ANVIL_VK_OK : spvRecordsValid = 1 : EndIf
+    ProcedureReturn rc
   EndIf
   If spvOriginUpperLeft = 0
     ProcedureReturn avkSpvMalformed("a SPIR-V fragment module does not declare the execution mode OriginUpperLeft (Anvil code -20001, incomplete fragment shader); the Vulkan environment requires a fragment entry point to declare its origin, and OriginUpperLeft is the only one this implementation renders.")
   EndIf
-  rc = avkSpvBuildFragmentPlan()
-  If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
+  If irMode = 0
+    rc = avkSpvBuildFragmentPlan()
+    If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
+  Else
+    If spvPosVar <> 0 Or spvPlanVaryCount <> 1 Or spvPlanVaryLoc[0] <> 0 Or spvPlanVaryComp[0] <> 4
+      ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V IR walk requires one four-component fragment output at Location 0 and no built-in output (Anvil code -20005, unsupported fragment interface); the retained IR must name the one render target exactly.")
+    EndIf
+    If spvUniformVar <> 0
+      rc = avkSpvCheckUniformBlock()
+      If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
+    EndIf
+    If spvSampleVar <> 0
+      If spvDecSet[spvSampleVar] <> 0 Or spvDecBinding[spvSampleVar] < 0 Or spvDecBinding[spvSampleVar] >= #ANVIL_VK_MAX_SET_BINDINGS
+        ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V IR walk refused a sampled image outside descriptor set zero or the bounded binding range (Anvil code -20005, unsupported sampled descriptor); the adapter does not rewrite descriptor identity.")
+      EndIf
+    EndIf
+  EndIf
   ; A BLOCK DECLARED AND NEVER READ is refused too. The pipeline layer
   ; makes the layout's binding match what the shader asked for, and a
   ; module that declares a binding it does not use would force a
   ; descriptor set to be created, bound and written for nothing.
-  If spvUniformVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_UNIFORM
+  at = 0
+  If irMode <> 0
+    id = 1
+    While id < spvBound
+      If spvValueSrc[id] = #ANVIL_SPV_V_UNIFORM : at = at | 1 : EndIf
+      If spvValueSrc[id] = #ANVIL_SPV_V_IMAGE_SAMPLE : at = at | 2 : EndIf
+      id = id + 1
+    Wend
+  EndIf
+  If spvUniformVar <> 0 And ((irMode = 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_UNIFORM) Or (irMode <> 0 And (at & 1) = 0))
     ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a fragment shader that declares a Uniform-storage block and never reads it (Anvil code -20005, unused descriptor); a declared binding has to be supplied by a descriptor set at draw time, so one nothing reads is work the caller is made to do for no picture.")
   EndIf
-  If spvSampleVar <> 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_SAMPLED
+  If irMode <> 0 And (functionCount <> 1 Or blockCount <> 1 Or returnCount <> 1 Or functionEndCount <> 1)
+    ProcedureReturn avkSpvRefuse(#SpvOpFunction, "the SPIR-V IR walk requires exactly one entry function, one block, one OpReturn and one OpFunctionEnd (Anvil code -20005, unsupported control-flow shape); no partial record stream was published.")
+  EndIf
+  If spvSampleVar <> 0 And ((irMode = 0 And spvPlanColourSrc <> #ANVIL_SPV_COLOUR_SAMPLED) Or (irMode <> 0 And (at & 2) = 0))
     ProcedureReturn avkSpvRefuse(#SpvOpVariable, "the SPIR-V front end refused a fragment shader that declares a combined sampled image and never samples it (Anvil code -20005, unused descriptor); a declared binding has to be supplied for every draw, so one nothing reads is work with no picture.")
   EndIf
+  spvRecordsValid = 1
   ProcedureReturn #ANVIL_VK_OK
 EndProcedure
 
@@ -1685,6 +1874,249 @@ EndProcedure
 Procedure.i AnvilVkSpirvUsesUniformBlock()
   If spvUniformVar <> 0 : ProcedureReturn 1 : EndIf
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkSpvRecordStart(at.i, count.i, op.i, section.i)
+  Define *r.AvkSpvRecord
+  Define n.i
+  Define i.i
+  If spvRecordCount >= #ANVIL_SPV_MAX_RECORDS
+    ProcedureReturn 0
+  EndIf
+  *r = @spvRecords[spvRecordCount]
+  i = 0
+  While i < SizeOf(AvkSpvRecord)
+    PokeA(*r + i, 0)
+    i = i + 1
+  Wend
+  *r\streamIndex = spvRecordCount
+  *r\wordOffset = at
+  *r\sourceOpcode = op
+  *r\sourceWordCount = count
+  *r\section = section
+  spvRecordCount = spvRecordCount + 1
+  ProcedureReturn *r
+EndProcedure
+
+Procedure.i avkSpvRecordIdSet(*r.AvkSpvRecord, index.i, idWord.i)
+  If index = 0
+    *r\id0 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 1
+    *r\id1 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 2
+    *r\id2 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 3
+    *r\id3 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 4
+    *r\id4 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 5
+    *r\id5 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 6
+    *r\id6 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 7
+    *r\id7 = idWord
+    ProcedureReturn 1
+  EndIf
+  If index = 8
+    *r\id8 = idWord
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Project one already-validated instruction into the target-neutral semantic
+; stream. Debug/name/Nop records carry their exact offset/opcode/count and any
+; semantic id/literals; strings remain byte-exact in spvRecordWords.
+Procedure.i avkSpvRetain(*words, at.i, count.i, op.i)
+  Define *r.AvkSpvRecord
+  Define k.i
+  Define n.i
+  Define section.i
+  section = #ANVIL_SPV_REC_ENVIRONMENT
+  If op = #SpvOpEntryPoint : section = #ANVIL_SPV_REC_ENTRY : EndIf
+  If op = #SpvOpTypeVoid Or op = #SpvOpTypeInt Or op = #SpvOpTypeFloat Or op = #SpvOpTypeVector Or op = #SpvOpTypeImage Or op = #SpvOpTypeSampledImage Or op = #SpvOpTypeStruct Or op = #SpvOpTypePointer Or op = #SpvOpTypeFunction : section = #ANVIL_SPV_REC_TYPE : EndIf
+  If op = #SpvOpConstant Or op = #SpvOpConstantComposite : section = #ANVIL_SPV_REC_CONSTANT : EndIf
+  If op = #SpvOpVariable : section = #ANVIL_SPV_REC_VARIABLE : EndIf
+  If op = #SpvOpDecorate Or op = #SpvOpMemberDecorate : section = #ANVIL_SPV_REC_DECORATION : EndIf
+  If op = #SpvOpFunction : section = #ANVIL_SPV_REC_FUNCTION : EndIf
+  If op = #SpvOpLabel : section = #ANVIL_SPV_REC_BLOCK : EndIf
+  If op = #SpvOpLoad Or op = #SpvOpStore Or op = #SpvOpAccessChain Or op = #SpvOpCompositeExtract Or op = #SpvOpCompositeConstruct Or op = #SpvOpImageSampleImplicitLod Or op = #SpvOpFAdd Or op = #SpvOpFMul Or op = #SpvOpReturn : section = #ANVIL_SPV_REC_NODE : EndIf
+  If op = #SpvOpFunctionEnd : section = #ANVIL_SPV_REC_END : EndIf
+  *r = avkSpvRecordStart(at, count, op, section)
+  If *r = 0
+    ProcedureReturn avkSpvMalformed("the accepted SPIR-V semantic record stream exceeded the module's own bounded word count (Anvil code -20001, internal bounds); no record was truncated or published.")
+  EndIf
+
+  Select op
+    Case #SpvOpCapability
+      *r\literalCount=1:*r\literal0=avkSpvWord(*words,at+1)
+    Case #SpvOpExtInstImport
+      *r\sourceId=avkSpvWord(*words,at+1)
+    Case #SpvOpSource
+      If count>1:*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+1):EndIf
+      If count>2:*r\literalCount=2:*r\literal1=avkSpvWord(*words,at+2):EndIf
+      If count>3:*r\idCount=1:*r\id0=avkSpvWord(*words,at+3):EndIf
+    Case #SpvOpName
+      If count>1:*r\sourceId=avkSpvWord(*words,at+1):EndIf
+    Case #SpvOpMemberName
+      If count>1:*r\sourceId=avkSpvWord(*words,at+1):EndIf
+      If count>2:*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+2):EndIf
+    Case #SpvOpString
+      If count>1:*r\sourceId=avkSpvWord(*words,at+1):EndIf
+    Case #SpvOpLine
+      If count>1:*r\sourceId=avkSpvWord(*words,at+1):EndIf
+      If count>2:*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+2):EndIf
+      If count>3:*r\literalCount=2:*r\literal1=avkSpvWord(*words,at+3):EndIf
+    Case #SpvOpDecorationGroup
+      If count>1:*r\sourceId=avkSpvWord(*words,at+1):EndIf
+    Case #SpvOpMemoryModel
+      *r\literalCount=2:*r\literal0=avkSpvWord(*words,at+1):*r\literal1=avkSpvWord(*words,at+2)
+    Case #SpvOpEntryPoint
+      *r\sourceId=avkSpvWord(*words,at+2):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+1)
+      ; Literal string starts at word three. Find its terminating zero byte;
+      ; the remaining words are ordered interface ids, never string payload.
+      k=3
+      While k<count
+        n=avkSpvWord(*words,at+k)
+        If (n & $FF)=0 Or (n & $FF00)=0 Or (n & $FF0000)=0 Or (n & $FF000000)=0
+          k=k+1
+          Break
+        EndIf
+        k=k+1
+      Wend
+      *r\idCount=count-k
+      n=0
+      While n<*r\idCount
+        avkSpvRecordIdSet(*r,n,avkSpvWord(*words,at+k+n))
+        n=n+1
+      Wend
+    Case #SpvOpExecutionMode
+      *r\sourceId=avkSpvWord(*words,at+1):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+2)
+    Case #SpvOpTypeVoid
+      *r\sourceId=avkSpvWord(*words,at+1)
+    Case #SpvOpTypeInt
+      *r\sourceId=avkSpvWord(*words,at+1):*r\literalCount=2:*r\literal0=avkSpvWord(*words,at+2):*r\literal1=avkSpvWord(*words,at+3)
+    Case #SpvOpTypeFloat
+      *r\sourceId=avkSpvWord(*words,at+1):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+2)
+    Case #SpvOpTypeVector
+      *r\sourceId=avkSpvWord(*words,at+1):*r\idCount=1:*r\id0=avkSpvWord(*words,at+2):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+3)
+    Case #SpvOpTypeImage
+      *r\sourceId=avkSpvWord(*words,at+1):*r\idCount=1:*r\id0=avkSpvWord(*words,at+2):*r\literalCount=6
+      *r\literal0=avkSpvWord(*words,at+3):*r\literal1=avkSpvWord(*words,at+4):*r\literal2=avkSpvWord(*words,at+5)
+      *r\literal3=avkSpvWord(*words,at+6):*r\literal4=avkSpvWord(*words,at+7):*r\literal5=avkSpvWord(*words,at+8)
+    Case #SpvOpTypeSampledImage
+      *r\sourceId=avkSpvWord(*words,at+1):*r\idCount=1:*r\id0=avkSpvWord(*words,at+2)
+    Case #SpvOpTypeStruct
+      *r\sourceId=avkSpvWord(*words,at+1):*r\idCount=count-2
+      k=0:While k<*r\idCount
+        If k=0:*r\id0=avkSpvWord(*words,at+2+k):EndIf:If k=1:*r\id1=avkSpvWord(*words,at+2+k):EndIf
+        If k=2:*r\id2=avkSpvWord(*words,at+2+k):EndIf:If k=3:*r\id3=avkSpvWord(*words,at+2+k):EndIf:k=k+1
+      Wend
+    Case #SpvOpTypePointer
+      *r\sourceId=avkSpvWord(*words,at+1):*r\idCount=1:*r\id0=avkSpvWord(*words,at+3):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+2)
+    Case #SpvOpTypeFunction
+      *r\sourceId=avkSpvWord(*words,at+1):*r\idCount=1:*r\id0=avkSpvWord(*words,at+2)
+    Case #SpvOpConstant
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+3)
+    Case #SpvOpConstantComposite
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=count-3
+      k=0:While k<*r\idCount
+        If k=0:*r\id0=avkSpvWord(*words,at+3+k):EndIf:If k=1:*r\id1=avkSpvWord(*words,at+3+k):EndIf
+        If k=2:*r\id2=avkSpvWord(*words,at+3+k):EndIf:If k=3:*r\id3=avkSpvWord(*words,at+3+k):EndIf:k=k+1
+      Wend
+    Case #SpvOpDecorate
+      *r\sourceId=avkSpvWord(*words,at+1):*r\literalCount=count-2
+      *r\literal0=avkSpvWord(*words,at+2):If *r\literalCount>1:*r\literal1=avkSpvWord(*words,at+3):EndIf
+    Case #SpvOpMemberDecorate
+      *r\sourceId=avkSpvWord(*words,at+1):*r\literalCount=count-2
+      *r\literal0=avkSpvWord(*words,at+2):*r\literal1=avkSpvWord(*words,at+3):If *r\literalCount>2:*r\literal2=avkSpvWord(*words,at+4):EndIf
+    Case #SpvOpVariable
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+3)
+    Case #SpvOpFunction
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=1:*r\id0=avkSpvWord(*words,at+4):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+3)
+    Case #SpvOpLabel
+      *r\sourceId=avkSpvWord(*words,at+1)
+    Case #SpvOpLoad
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=1:*r\id0=avkSpvWord(*words,at+3)
+    Case #SpvOpStore
+      *r\idCount=2:*r\id0=avkSpvWord(*words,at+1):*r\id1=avkSpvWord(*words,at+2)
+    Case #SpvOpAccessChain
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+    Case #SpvOpCompositeExtract
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=1:*r\id0=avkSpvWord(*words,at+3):*r\literalCount=1:*r\literal0=avkSpvWord(*words,at+4)
+    Case #SpvOpCompositeConstruct
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=count-3
+      k=0:While k<*r\idCount
+        If k=0:*r\id0=avkSpvWord(*words,at+3+k):EndIf:If k=1:*r\id1=avkSpvWord(*words,at+3+k):EndIf
+        If k=2:*r\id2=avkSpvWord(*words,at+3+k):EndIf:If k=3:*r\id3=avkSpvWord(*words,at+3+k):EndIf:k=k+1
+      Wend
+    Case #SpvOpImageSampleImplicitLod
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+    Case #SpvOpFAdd
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+    Case #SpvOpFMul
+      *r\resultType=avkSpvWord(*words,at+1):*r\sourceId=avkSpvWord(*words,at+2):*r\idCount=2:*r\id0=avkSpvWord(*words,at+3):*r\id1=avkSpvWord(*words,at+4)
+  EndSelect
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
+Procedure.i AnvilVkSpirvRecordsValid()
+  ProcedureReturn spvRecordsValid
+EndProcedure
+
+Procedure.i AnvilVkSpirvRecordCount()
+  If spvRecordsValid = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn spvRecordCount
+EndProcedure
+
+Procedure.i AnvilVkSpirvRecordWordCount()
+  If spvRecordsValid = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn spvRecordWordCount
+EndProcedure
+
+Procedure.i AnvilVkSpirvRecordWordRead(index.i, *out)
+  If spvRecordsValid = 0 Or *out = 0 Or index < 0 Or index >= spvRecordWordCount
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  PokeI(*out, spvRecordWords[index])
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
+Procedure.i AnvilVkSpirvRecordRead(index.i, *out.AvkSpvRecord)
+  Define i.i
+  Define *source.AvkSpvRecord
+  If spvRecordsValid = 0 Or *out = 0 Or index < 0 Or index >= spvRecordCount
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  *source = @spvRecords[index]
+  i = 0
+  While i < SizeOf(AvkSpvRecord)
+    PokeA(*out + i, PeekA(*source + i))
+    i = i + 1
+  Wend
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
+Procedure.i AnvilVkSpirvWalk(*code, bytes.i)
+  ProcedureReturn avkSpvWalk(*code, bytes, 0)
+EndProcedure
+
+Procedure.i AnvilVkSpirvWalkIr(*code, bytes.i)
+  ProcedureReturn avkSpvWalk(*code, bytes, 1)
 EndProcedure
 
 Procedure.i AnvilVkSpirvUsesSampledImage()
