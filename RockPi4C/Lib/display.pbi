@@ -229,7 +229,6 @@ Procedure RockDisplayFrameTelemetry()
   ; that initial state separately, then let both FIFOs run for several frames
   ; before clearing and measuring the steady path. Otherwise a legitimate
   ; first-fill POST_BUF_EMPTY latch is indistinguishable from a continuing
-  ; initial POST_BUF_EMPTY latch is indistinguishable from a continuing
   ; memory/scanout underrun.
   settleRaw=RockVopRead(#VOP_INTR_RAW_STATUS0)
   RockTimerWaitUs(200000)

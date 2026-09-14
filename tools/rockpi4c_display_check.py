@@ -593,6 +593,15 @@ def source_contract() -> None:
             vop_up.index("rockvopwrite(#vop_win0_vir") < vop_up.index(gather) <
             vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
             "ARGB8888 AXI gather contract is absent or armed after WIN0")
+    win_scale = "rockvopwrite(#vop_win0_scl_factor,#vop_scale_unity_xy)"
+    post_scale = "rockvopwrite(#vop_post_scl_factor,#vop_scale_unity_xy)"
+    require("#vop_scale_unity_xy = $10001000" in vop and
+            win_scale in vop_up and post_scale in vop_up and
+            "rockvopfield(#vop_post_scl_ctrl,$3,0)" in vop_up,
+            "native VOP window/post scale factors are not explicitly unity")
+    require(vop_up.index(win_scale) < vop_up.index(gather) and
+            vop_up.index(post_scale) < vop_up.index("rockvopwrite(#vop_win0_act_info"),
+            "native VOP scale factors are armed after their consumers")
     for timing in (
         "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
         "rockvopwrite(#vop_hact,hactiveend | (hactivestart << 16))",

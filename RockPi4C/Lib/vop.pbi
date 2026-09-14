@@ -52,6 +52,11 @@
 #VOP_INTR_WIN0_EMPTY = $0040
 #VOP_INTR_POST_EMPTY = $0800
 
+; scl_vop_cal_scl_fac() in the pinned RK3399 DRM driver writes a 12-bit
+; unity factor on both axes even when both scale modes are SCALE_NONE.
+; NONE selects the scaler algorithm; it does not make these factors optional.
+#VOP_SCALE_UNITY_XY = $10001000
+
 Global rock_vop_ready.i
 Global rock_vop_error.i
 ; Global ordering is not an alignment contract. Reserve one alignment unit
@@ -301,9 +306,12 @@ Procedure.i RockVopUpMode()
   RockVopWrite(#VOP_VACT,vactiveEnd | (vactiveStart << 16))
   RockVopWrite(#VOP_POST_HACT,hactiveEnd | (hactiveStart << 16))
   RockVopWrite(#VOP_POST_VACT,vactiveEnd | (vactiveStart << 16))
+  RockVopWrite(#VOP_POST_SCL_FACTOR,#VOP_SCALE_UNITY_XY)
+  RockVopField(#VOP_POST_SCL_CTRL,$3,0)
   RockVopWrite(#VOP_WIN0_ACT_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
   RockVopWrite(#VOP_WIN0_DSP_ST,hactiveStart | (vactiveStart << 16))
   RockVopWrite(#VOP_WIN0_DSP_INFO,(rock_mode_width-1) | ((rock_mode_height-1) << 16))
+  RockVopWrite(#VOP_WIN0_SCL_FACTOR,#VOP_SCALE_UNITY_XY)
   RockVopWrite(#VOP_WIN0_COLOR_KEY,0)
   RockVopWrite(#VOP_WIN0_VIR,rock_mode_pitch >> 2)
   RockVopField(#VOP_WIN0_CTRL1,#VOP_WIN0_GATHER_MASK,#VOP_WIN0_ARGB8888_GATHER)
