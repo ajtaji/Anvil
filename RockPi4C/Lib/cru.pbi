@@ -340,5 +340,13 @@ EndProcedure
 Procedure.i RockCruVopRelease()
   If RockCruReset(275,0)=0 : ProcedureReturn 0 : EndIf
   If RockCruReset(279,0)=0 : ProcedureReturn 0 : EndIf
+  ; DCLK must be running while the VOP timing/window shadow registers and the
+  ; first CFG_DONE are written.  The previous sequence left SRST_D_VOP1
+  ; asserted here, so the later post-configuration "pulse" had no assert
+  ; edge and the post FIFO could start in a boot-dependent state.  This order
+  ; matches both pinned owners: Linux enables DCLK before VOP programming;
+  ; Rockchip U-Boot programs and latches with DCLK released, then performs a
+  ; real assert/deassert pulse after the configuration is valid.
+  If RockCruReset(281,0)=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure

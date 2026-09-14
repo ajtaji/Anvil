@@ -632,10 +632,11 @@ def source_contract() -> None:
     vop_release = cru.split("procedure.i rockcruvoprelease()", 1)[1].split(
         "endprocedure", 1
     )[0]
-    require(vop_release.count("rockcrureset(") == 2 and
+    require(vop_release.count("rockcrureset(") == 3 and
             "rockcrureset(275,0)" in vop_release and
-            "rockcrureset(279,0)" in vop_release,
-            "VOP release gained a non-reset clock-side effect")
+            "rockcrureset(279,0)" in vop_release and
+            "rockcrureset(281,0)" in vop_release,
+            "VOP A/H/D reset release contract drifted")
     for forbidden in ("rockcrufield", "rockcrugate", "rockcruvpll",
                       "#rock_cru_clksel", "rockcruwrite"):
         require(forbidden not in vop_release,
