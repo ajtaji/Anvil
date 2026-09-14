@@ -130,7 +130,7 @@ observable.
 | `tools/vulkan_resource_check.py` | PASS — 479 independent property checks over 829,445 executed A64 instructions. The earlier complete mutation run rejects all 30 prior mistakes; the two focused `UINT64_MAX` mutants, all ten focused map-memory mutants and the focused transfer-only attachment mutant are RED. The suite now has 43 mutants; a fresh complete run of all 43 has not been claimed. | The resource, layout, fence, retention, mapping, format-capability, submission and error-reporting contracts, executed through the public entry points, with an MMIO hard stop armed; and that every byte of the bound image still held its poison, so no processor-side clear exists anywhere in the path. Its mapping properties use the public entry points to distinguish host-visible/non-visible types, owner, live/stale handle, duplicate/unbalanced state, flags, exact/whole ranges and returned pointer, then use the mapping to poison the image. Its format property refuses colour-attachment image creation when the backend advertises no graphics draw path while the shared combination owner still accepts transfer-only and sampled-only usage. Its wait properties distinguish an unsignalled unlimited wait (explicitly unsupported) from an already-satisfied unlimited wait (success). |
 | `tools/vulkan_v3d_backend_check.py` | PASS — 84 property checks over 108,668 executed A64 instructions; `--mutate` rejects all 16 desk-reachable mistakes and names 2 board-only rules it cannot reach. | That the whole closure links against the real display, V3D, QPU and Neon implementation; that a build with the engine down enumerates no device without MMIO; that geometry is planned before mutation, every arena/range/in-frame boundary is checked, and a failed rebind preserves the prior surface. It also requires full geometry restoration and the descriptor TMU mapped-range/cache-clean contracts. The source contract requires the pipeline/vertex/descriptor cleans before submission and the GPU clean plus target clean/invalidate before completion, giving the `HOST_COHERENT` advertisement teeth. |
 | `tools/vulkan_spirv_check.py` | PASS — 404 property checks over 4,755,621 executed A64 instructions; `--mutate` rejects all 28 plausible mistakes | That 52 SPIR-V modules, assembled word by word IN THE CHECKER from the specification's own opcode numbers, are walked correctly: 7 inside the subset are lowered to a plan whose every field is checked, and 45 outside it are refused with a whole sentence naming the opcode, capability, decoration, built-in, storage class or descriptor placement. The front end makes no MMIO access and does not write one byte of the module it was handed |
-| `tools/vulkan_pipeline_check.py` | Baseline PASS — 246 property checks over 10,607,411 executed A64 instructions. The focused `sampled-exec` evidence rejects all five texture field, uniform pointer, T/S launch order, pipeline binding and closed-submit-record mutants. The focused `sampled-state` batch rejects all twelve sampled descriptor, pool, usage, layout, closed-record and image-view-range mutants. Earlier focused batches retain their recorded green baselines and red mutations; a fresh complete run of the enlarged suite has not been claimed. | That the whole public path from `vkCreateShaderModule` to `vkQueueSubmit` reaches the backend with the right numbers, that recording and creation rules refuse what they say they refuse, and that every byte of five shader variants' compiled records, attribute records, uniform streams and default attribute values matches an independently built record. The sampled variant has independently assembled vertex and fragment SPIR-V modules, a separate one-texel source image transitioned to shader-read layout, an executable sampled draw, exact V3D texture/sampler state words and uniform pointers, and the required T-then-S TMU launch order. This is desk proof of the command, descriptor and emission path, not proof that V3D returned the texel; that is a Pi 4 silicon gate. The other variants retain their zero-vertex, incomplete-triangle, colour-attachment usage, zero sample-mask, split-binding, push-constant and uniform-buffer checks. No pixel of the render target is written and no MMIO access is made. |
+| `tools/vulkan_pipeline_check.py` | Baseline PASS — 246 property checks over 10,607,411 executed A64 instructions. The focused `sampled-exec` evidence rejects the texture field, uniform pointer, T/S launch order, pipeline binding and closed-submit-record mutants; the identity-swizzle mutant is also RED. The focused `sampled-state` batch rejects all twelve sampled descriptor, pool, usage, layout, closed-record and image-view-range mutants. Earlier focused batches retain their recorded green baselines and red mutations; a fresh complete run of the enlarged suite has not been claimed. | That the whole public path from `vkCreateShaderModule` to `vkQueueSubmit` reaches the backend with the right numbers, that recording and creation rules refuse what they say they refuse, and that every byte of five shader variants' compiled records, attribute records, uniform streams and default attribute values matches an independently built record. The sampled variant has independently assembled vertex and fragment SPIR-V modules, a separate one-texel source image transitioned to shader-read layout, an executable sampled draw, exact V3D texture/sampler state words including BGRA8's Z,Y,X,W logical swizzle, uniform pointers and the required T-then-S TMU launch order. The desk result is paired with the Pi 4 sampled-pixel run recorded below. The other variants retain their zero-vertex, incomplete-triangle, colour-attachment usage, zero sample-mask, split-binding, push-constant and uniform-buffer checks. No pixel of the render target is written and no MMIO access is made. |
 | `tools/vulkan_interp_check.py` | PASS — 395 property checks over 372,292 executed A64 instructions; `--mutate` rejects all 14 plausible mistakes | That `vk_interp_expect.pbi` — the module the board diagnostic asks what colour a pixel should be — gives the same answers as a second implementation of the same stated rule written in Python: the clip-to-screen transform, twice the signed area, the three barycentric numerators, the strict inside test, the four channels and the packed B8G8R8A8 word, over eight triangles and thirty-three probe pixels. The weights at every covered probe sum to twice the area, and each corner probe is dominated by its own vertex by more than three tolerances — which is what makes a board run able to tell a gradient from a flat fill. It owns no hardware and makes no MMIO access |
 
 None of these desk gates prove GPU execution, displayed output, concurrency,
@@ -493,7 +493,34 @@ final diagnostic instead refuses `STORAGE_IMAGE`, and its five intended
 validation refusals all remained present. This run proves integration and no
 regression of the existing visible V3D/TMU path. The new combined-image-sampler
 record itself remains desk-only state until SPIR-V texture instructions and a
-V3D texture fetch consume it; no sampled pixel is claimed.
+V3D texture fetch consume it; no sampled pixel is claimed by that run.
+
+**2026-09-13, run 10 — PASSED. One sampled pixel, through the real V3D TMU.**
+Public commit `85c2db8` produced a 636,380-byte flat payload with SHA-256
+`46A07A9F7B943F60BD5E3FCAC19E25F510DD2837F8283D6225929DF4C27D051F` and a
+636,508-byte PMF container with SHA-256
+`F7E32E54EF59952868859B629EACA64F3D3BDE85C78790353E8EE18DD0146352`.
+Monitor build 101 received and independently verified that container, verified
+the inner image at `$00500000`, armed a 15-second deadman and returned normally
+in 8.63 seconds. The nonzero x0 is intentionally the report pointer
+`$005A6000`, not a payload error.
+
+The 160-word report had A/B/C/D verdicts all zero, step 13 and both magics.
+The sampled submit and wait were zero; all three inside probes were exactly
+`$FFFFC020` and all three outside probes exactly `$FF3380B2`. The submitted
+texture state held source `$067DA000`, width `$04000000`, height `$00400100`
+and format/swizzle `$00A9C040`. Bin and render jobs each moved from 3 to 4;
+MMU faults, bin OOM, native backend error and detail were all zero. The returned
+1280x800 screenshot has SHA-256
+`B8D535126FFD61C82E194D196C83F24A5B4AFBCDF01936C70D1DD0C20F7902A62`.
+
+The first control run measured the old identity-swizzle defect exactly: source
+`$FFFFC020` became `$FF20C0FF` at all three inside probes while the clear,
+submission, counters and fault state remained correct. The source owner now
+uses Mesa's BGRA8 Z,Y,X,W format-table swizzle; the gate mutates it back to
+identity and turns red. This proves only the declared one-texel linear subset.
+Larger sampled images still wait for the isolated TFU/UIF prerequisite to be
+integrated through real optimal-image and transfer-command semantics.
 
 
 ## Required architecture

@@ -27,8 +27,9 @@ currently amounts to and where the files are.
 | `vk_backend_test.pbi` | The explicit test backend: state and a call log, **no GPU and no pixels ever written**. |
 | `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for uniform buffers and the bounded combined-image-sampler state shape, including typed pool accounting and live resolution into closed backend records. |
 | `vk_interp_expect.pbi` | What an interpolated varying must be at a named pixel, in exact integers. Target neutral, no floating point, and no hardware. |
-| `vk_v3d_shader.pi4` | The Pi 4 QPU emitter for the accepted shader plans, including the V3D 4.2 TMU general vec4 load used by a uniform-buffer descriptor. |
+| `vk_v3d_shader.pi4` | The Pi 4 QPU emitter for the accepted shader plans, including the V3D 4.2 TMU general vec4 load used by a uniform-buffer descriptor and the bounded combined-sampler texture request. BGRA8 sampling uses the format table's Z,Y,X,W logical swizzle; identity swizzle is a measured red/blue reversal, not an alternative. |
 | `vk_v3d_backend.pi4` | The real Pi 4 backend: validated clears and draws lowered to V3D bin and render control lists through Neon, with mapped-range and cache-visibility rules for GPU-read buffers. |
+| `vk_v3d_texture.pi4` | An isolated Pi 4 prerequisite for an exact raw-four-byte TFU copy from raster staging to level-zero `UIF_NO_XOR`. It is not yet included by the Vulkan object engine and therefore does not advertise optimal tiling. |
 
 Exactly one backend file is linked per program. There is no run-time
 registration, so a build with none fails to link and a build with two fails to
@@ -41,7 +42,7 @@ compile — neither can silently enumerate the wrong thing.
 | Generated vocabulary | A pinned core-1.0 generator exists. The checked-in slice contains the exact result, structure-type, command-lifecycle, image, format-feature, memory, queue-family, access, stage, aspect and fence values this implementation uses, plus 66 scalar, nested, fixed-array, structure-array and pointer-bearing structures. It is not the complete 1.0 vocabulary. `VkPhysicalDeviceFeatures` carries all 55 core feature members; every member is currently false. `VkClearColorValue` is a union and is deliberately **not** declared, because PureMetal has no union and one arm of it posing as the whole type is the silent wrong answer this project refuses. |
 | Semantic implementation | Opaque typed and generation-tagged handles for ten object types; instance, physical device, device and one queue that always advertises transfer and advertises graphics exactly when its backend owns the draw capability; exact `vkGetPhysicalDeviceFormatProperties` and `vkGetPhysicalDeviceImageFormatProperties` answers for the implemented linear BGRA8 combinations, with geometry, pitch-derived resource size, one mip/layer/sample and every unsupported field refused; device memory and linear `B8G8R8A8_UNORM` images with exact requirements, binding rules, usage and per-image layout; one active `vkMapMemory` range for host-visible allocations with exact/whole-range and owner checks; framebuffer colour attachments must carry `COLOR_ATTACHMENT`; image memory barriers track layouts; whole-image clears retain resources through submission; fences have a bounded finite wait and explicitly refuse an unsatisfied `UINT64_MAX`; one-sample masks suppress primitive emission without suppressing a render-pass clear; a bounded, device-owned `VkSampler`; and one combined-image-sampler descriptor that resolves only a live, bound, sampled-usage linear BGRA8 image in `SHADER_READ_ONLY_OPTIMAL` into a closed backend record. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
 | Explicit test backend | `vk_backend_test.pbi` models one device over a caller-supplied window. It records the exact clear it was asked for — address, extent, pitch, colour word — and **writes nothing**, so a gate can then read the image back and require that every poisoned byte survived. It can hold a submission outstanding, which is what makes the pending state, the fence state machine and the retention rules reachable from a desk. |
-| V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and the accepted graphics draws through transactional `NeonRebindSurface` + `NeonFrameBegin` + `NeonFrameEnd`, the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. Board runs 2 and 3 proved the original clear and its live refusal boundary; the 2026-09-13 dynamic-geometry run proved 800x1280, 640x360, partial-tile 257x193, the 1280 scalar capacity boundary, exact display-state restoration and a subsequent ordinary frame. Board run 5 proved one graphics pipeline and its varying path. The 2026-09-13 clean-state descriptor run proved the uniform-buffer TMU lookup, interpolated varying, second vertex binding, cache visibility and three consecutive jobs on Pi 4 silicon. |
+| V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and the accepted graphics draws through transactional `NeonRebindSurface` + `NeonFrameBegin` + `NeonFrameEnd`, the real bin/render submit-and-wait path with V3D and processor-side cache maintenance. There is no processor-side and no DMA image fallback under it. Board runs 2 and 3 proved the original clear and its live refusal boundary; the 2026-09-13 dynamic-geometry run proved 800x1280, 640x360, partial-tile 257x193, the 1280 scalar capacity boundary, exact display-state restoration and a subsequent ordinary frame. Board run 5 proved one graphics pipeline and its varying path. The clean-state descriptor run proved the uniform-buffer TMU lookup, interpolated varying, second vertex binding and cache visibility. The sampled-pixel run from commit `85c2db8` proved a real combined-sampler TMU request: all three inside probes were exactly `$FFFFC020`, all three outside probes exactly `$FF3380B2`, bin and render counters each advanced once, and MMU/OOM/native faults were zero. This remains exactly one linear texel. |
 
 ## Compiler ABI boundary
 
@@ -126,12 +127,28 @@ vertex bindings. Its report captured the submitted descriptor stream in slots
 bytes and the GPU-side descriptor fetch. The exact payload, report and recovery
 rules are recorded in `docs/VULKAN_DESCRIPTOR_TMU_PROOF_2026-09-13.md`.
 
+**The first sampled pixel is also proved, within its declared one-texel
+boundary.** Public commit `85c2db8` built a 636,380-byte flat payload with
+SHA-256 `46A07A9F7B943F60BD5E3FCAC19E25F510DD2837F8283D6225929DF4C27D051F`;
+its 636,508-byte PMF container has SHA-256
+`F7E32E54EF59952868859B629EACA64F3D3BDE85C78790353E8EE18DD0146352`.
+Monitor build 101 verified the container and inner image, and the returning
+report at `$005A6000` had zero A/B/C/D verdicts, zero submit/wait/fault results,
+the Z,Y,X,W state word `$00A9C040`, exact inside/outside pixels, step 13 and
+both magics. Bin and render jobs moved from 3 to 4. The screenshot was
+1280x800 with SHA-256
+`B8D535126FFD61C82E194D196C83F24A5B4AFBCDF01936C70D1DD0C20F7902A62`.
+This does not make a larger linear image valid and does not advertise optimal
+tiling; those require the isolated TFU/UIF prerequisite to be integrated as a
+real Vulkan transfer transaction and then proved on silicon.
+
 ## Next real backend layers
 
 The next stages are per-object GPU virtual addressing and residency above
 today's single window, arithmetic in the shader front end and the typed IR that
-needs, SPIR-V sampled-image types/instructions and texture-fetch lowering that consume the
-new descriptor record, broader immutable pipeline state, command lowering into V3D
+needs, integration of the proved raster-to-UIF transfer prerequisite through a
+real optimal-image resource and transfer command so sampling can exceed one
+texel, broader immutable pipeline state, command lowering into V3D
 bin/render jobs with dependencies, interrupt-driven completion so submission is
 genuinely asynchronous, and then WSI against Anvil's existing HDMI/DSI present
 seam.

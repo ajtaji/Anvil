@@ -18,12 +18,13 @@ dependency.
 
 ## The implemented slice
 
-`vk_v3d_backend.pi4` executes exactly one recorded operation on the GPU: a
-whole-image colour clear of one `VK_FORMAT_B8G8R8A8_UNORM`, linear, single-mip,
-single-layer 2D image bound to real `VkDeviceMemory` in an offscreen window.
-It is reached through the public `vkCmdClearColorImage` and `vkQueueSubmit`,
-after a public `vkCmdPipelineBarrier`-shaped transition, and its completion is
-observed through a public `VkFence`.
+`vk_v3d_backend.pi4` executes validated whole-image clears and the bounded
+graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes one
+combined `sampler2D` implicit-LOD request from a separate one-texel linear
+`VK_FORMAT_B8G8R8A8_UNORM` image. The image is real `VkDeviceMemory`, populated
+through `vkMapMemory`, transitioned through `vkCmdPipelineBarrier`, resolved
+through a closed combined-image-sampler descriptor, submitted by
+`vkQueueSubmit`, and observed through a public `VkFence`.
 
 The execution path is `NeonRebindSurface`, `NeonFrameBegin` and `NeonFrameEnd`
 with no draws. `NeonRebindSurface` plans and validates each accepted geometry,
@@ -42,8 +43,10 @@ desk gate checks the source for one.
   images through the V3D planner up to the configured equal width/height
   maximum and derives row pitch from the same rule used by creation and the
   public image-format query. Zero, overflowing, over-capacity or unmapped
-  geometry is refused before a job counter can move. Mips, array layers,
-  multisampling, optimal tiling and other formats remain unsupported.
+  geometry is refused before a job counter can move. Sampled resources are
+  narrower: only 1x1 linear BGRA8 is accepted, because that sole texel is also
+  the sole V3D linear-tile texel. Mips, array layers, multisampling, public
+  optimal tiling and other formats remain unsupported.
 - **The buffer the display is scanning out.** This backend is offscreen by
   contract. Presentation stays with the display layer.
 - **Asynchrony.** `NeonFrameEnd` waits for both jobs before it returns, so
@@ -53,6 +56,26 @@ desk gate checks the source for one.
   interrupt-driven completion rather than the current bounded polls.
 - **More than one clear per submission, and more than one submission at a
   time.** Both are refused, not truncated.
+
+### Sampled-pixel silicon boundary
+
+The 2026-09-13 Pi 4 run from public commit `85c2db8` is green. Its PMF container
+was 636,508 bytes with SHA-256
+`F7E32E54EF59952868859B629EACA64F3D3BDE85C78790353E8EE18DD0146352`.
+Monitor build 101 verified both container and 636,380-byte inner image before
+entry. The returned 160-word report records all four pass verdicts zero,
+sampled submit/wait zero, three exact `$FFFFC020` inside pixels, three exact
+`$FF3380B2` outside pixels, bin and render counters 3 to 4, and zero MMU, OOM,
+native-backend and detail faults. The texture-state word was `$00A9C040`, the
+source-backed Z,Y,X,W logical swizzle required by BGRA8; the prior identity
+swizzle was measured red as `$FF20C0FF` and is now a focused desk mutant.
+
+That is one sampled texel, not general texture support. Commit `bf67333` adds an
+isolated, desk-proved raw-four-byte raster-to-`UIF_NO_XOR` TFU prerequisite, but
+no public Vulkan file includes it yet. The next transaction must add an optimal
+image resource contract, an explicit buffer-to-image copy command, resource
+retention/layout/cache/failure semantics, TFU execution and a greater-than-1x1
+silicon proof before any optimal-tiling capability is advertised.
 
 ## API and object gaps
 
