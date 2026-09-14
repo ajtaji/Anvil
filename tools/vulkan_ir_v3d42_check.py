@@ -24,6 +24,8 @@ MUTANTS=(
  ('TLBU/TLB reversed','#V3DQ_WADDR_TLBU, 1','#V3DQ_WADDR_TLB, 1'),
  ('VPM wait omitted','If rc = 0 : rc = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1) : EndIf','If rc = 0 : rc = V3dQpuNop() : EndIf'),
  ('relaxed precision accepted','If *d\\kind = #ANVIL_IR_DEC_RELAXED_PRECISION','If *d\\kind = 99'),
+ ('FAdd replaced by integer OR','V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B','V3dQpuAdd2(#V3DQ_A_OR, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B'),
+ ('FMul replaced by SMul24','V3dQpuMul(#V3DQ_M_FMUL, first + k','V3dQpuMul(#V3DQ_M_SMUL24, first + k'),
 )
 
 def locate(explicit,env,fallback):
@@ -58,19 +60,28 @@ def q(c,a): return sum(c.memory.get(a+i,0)<<(8*i) for i in range(8))
 def blob(c,a,n): return bytes(c.memory.get(a+i,0) for i in range(n))
 def grade(c,r):
  bad=[]
- if q(c,r+200*8)!=MAGIC:return 0,['bad report magic']
- checks=q(c,r+201*8); fails=q(c,r+202*8)
- if fails: bad.append(f'{fails} of {checks} emitted checks failed: '+','.join(str(i+1) for i in range(checks) if q(c,r+(64+i)*8)==0))
- roles=('vertex','fragment:varying','fragment:flat','fragment:uniform','fragment:sampled','vertex')
+ if q(c,r+500*8)!=MAGIC:return 0,['bad report magic']
+ checks=q(c,r+501*8); fails=q(c,r+502*8)
+ if fails: bad.append(f'{fails} of {checks} emitted checks failed: '+','.join(str(i+1) for i in range(checks) if q(c,r+(256+i)*8)==0))
+ roles=('vertex','fragment:varying','fragment:flat','fragment:uniform','fragment:sampled','vertex')+('vertex',)*8
  words=0
  for i,role in enumerate(roles):
   b=i*8;rc=q(c,r+b*8);addr=q(c,r+(b+1)*8);size=q(c,r+(b+2)*8);un=q(c,r+(b+4)*8)
   if rc or not size: bad.append(f'case {i} did not lower: rc={rc} bytes={size}');continue
-  try: ins=verify_program(blob(c,addr,size),ProgramContract(f'ir42/{i}',role,un));words+=len(ins)
+  try:
+    ins=verify_program(blob(c,addr,size),ProgramContract(f'ir42/{i}',role,un));words+=len(ins)
+    if i>=6:
+     lanes=(i-6)//2+1; is_add=((i-6)&1)==0
+     ar=[x for x in ins if x.add_op=='fadd/faddnf'] if is_add else [x for x in ins if x.mul_op=='fmul']
+     if len(ar)!=lanes:raise ValueError(f'ir42/{i}: expected {lanes} arithmetic words, got {len(ar)}')
+     dest=[x.add_waddr if is_add else x.mul_waddr for x in ar]
+     if dest!=list(range(2*lanes,3*lanes)):raise ValueError(f'ir42/{i}: arithmetic destinations {dest}')
+     if any({x.raddr_a,x.raddr_b}!={lane,lanes+lane} for lane,x in enumerate(ar)):raise ValueError(f'ir42/{i}: arithmetic operands are not the paired VPM inputs')
+     if is_add and any(((x.word>>24)&255)!=5 or x.add_mux_a!=6 or x.add_mux_b!=7 for x in ar):raise ValueError(f'ir42/{i}: FAdd ordering/opcode is not exact')
   except Exception as e: bad.append(f'case {i} decoder: {e}')
  return checks,bad+[f'__WORDS__={words}']
 def sourcecheck(text):
- need=('AnvilVkIrVerify(*m)','@avk42CodeScratch[0]','avk42RangesOverlap(','#ANVIL_IR_V3D42_TMU_VEC4','V3dQpuLastThrsw()','V3dQpuProgramEnd()','#ANVIL_IR_DEC_RELAXED_PRECISION','If *other\\variableId = *io\\variableId')
+ need=('AnvilVkIrVerify(*m)','@avk42CodeScratch[0]','avk42RangesOverlap(','#ANVIL_IR_V3D42_TMU_VEC4','V3dQpuLastThrsw()','V3dQpuProgramEnd()','#ANVIL_IR_DEC_RELAXED_PRECISION','If *other\\variableId = *io\\variableId','#ANVIL_IR_OP_FADD','#ANVIL_IR_OP_FMUL')
  return [f'missing {x}' for x in need if x not in text]
 def runone(compiler,a64,suffix):
  c,r,steps=execute(a64,build(compiler,suffix));checks,items=grade(c,r);words=int(items[-1].split('=')[1]);return checks,words,steps,items[:-1]

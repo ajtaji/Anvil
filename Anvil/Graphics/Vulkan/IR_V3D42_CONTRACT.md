@@ -8,9 +8,12 @@ The lowerer consumes an `AvkIrModule` only after `AnvilVkIrVerify` succeeds.
 It supports the existing one-block binary32 operations: input or descriptor
 `Load`, one-member `AccessChain`, `CompositeExtract`, `CompositeConstruct`,
 combined `ImageSampleImplicitLod`, output `Store`, and final `Return`.
-Arithmetic is outside this commit and is refused. It will be added only as a
-separate reviewed extension after the passive IR owns exact arithmetic nodes;
-this lowerer never invents sidecar opcodes or a parallel request language.
+The reviewed arithmetic extension lowers exact float32 scalar and equal-width
+vec2/vec3/vec4 `FAdd` and `FMul` nodes now owned by the passive IR. It emits one
+QPU operation per lane, retains the IR result/type identity, and still refuses
+RelaxedPrecision, NoContraction, FPFastMathMode, non-binary32 values, and all
+unrepresented arithmetic. It never invents sidecar opcodes or a parallel
+request language.
 
 Binding policy is explicit target input. IO records map a unique source
 variable/member to bounded, non-overlapping VPM or varying slots with exact
@@ -38,7 +41,8 @@ Scalar constants used by a represented composite can be materialized from the
 uniform stream. The focused proof does not claim a separate constant-colour
 fragment family; its independently decoded families are vertex VPM, fragment
 varying, push constant, uniform buffer, sampled image, and the vertex
-construct/extract fixture.
+construct/extract fixture, plus both arithmetic operations at scalar, vec2,
+vec3, and vec4 widths.
 
 V3D encodings and scheduling follow the locally pinned Mesa sources cited in
 `RaspberryPi4/Lib/v3dqpu.pi4`: `qpu_pack.c`, `qpu_instr.c`,

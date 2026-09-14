@@ -5,7 +5,7 @@
 XIncludeFile "../vk_ir_v3d42.pi4"
 
 #LG_MAGIC = $49523432
-#LG_CASES = 6
+#LG_CASES = 14
 Global Dim lgTypes.AvkIrType[20]
 Global Dim lgConstants.AvkIrConstant[12]
 Global Dim lgVariables.AvkIrVariable[12]
@@ -14,14 +14,14 @@ Global Dim lgBlocks.AvkIrBlock[2]
 Global Dim lgNodes.AvkIrNode[20]
 Global Dim lgInputs.AvkIrV3d42Io[4]
 Global Dim lgOutputs.AvkIrV3d42Io[4]
-Global Dim lgCode.i[1024]
-Global Dim lgUniform.l[384]
-Global Dim lgReport.i[256]
+Global Dim lgCode.i[2048]
+Global Dim lgUniform.l[1024]
+Global Dim lgReport.i[512]
 Global lgChecks.i = 0
 Global lgFails.i = 0
 
 Procedure lgCheck(ok.i)
-  lgReport[64 + lgChecks] = ok
+  lgReport[256 + lgChecks] = ok
   lgChecks = lgChecks + 1
   If ok = 0 : lgFails = lgFails + 1 : EndIf
 EndProcedure
@@ -181,24 +181,46 @@ Procedure lgComposite(*m.AvkIrModule)
   lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
 EndProcedure
 
-; A valid passive-IR FAdd used to prove this existing-operation commit refuses
-; arithmetic loudly until the separately reviewed lowering extension lands.
-Procedure lgArithmetic(*m.AvkIrModule)
+; Two exact-width VPM inputs, one float32 arithmetic node, and one VPM output.
+Procedure lgArithmetic(*m.AvkIrModule, lanes.i, operation.i)
+  Protected resultType.i
+  Protected opcode.i
   lgZero():lgBase(*m)
-  *m\typeCount=4:*m\constantCount=2:*m\functionTypeId=6
-  *m\variableCount=1:*m\decorationCount=1:*m\blockCount=1:*m\nodeCount=3
+  *m\stage=#ANVIL_IR_STAGE_VERTEX
+  *m\typeCount=6:*m\constantCount=0:*m\functionTypeId=6
+  *m\variableCount=3:*m\decorationCount=3:*m\blockCount=1:*m\nodeCount=5
   lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
   lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
-  lgType(2,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[2]\storageClass=3:lgTypes[2]\pointeeType=2
-  lgType(3,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[3]\returnType=1
-  lgConstants[0]\sourceId=10:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2:lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3F800000
-  lgConstants[1]\sourceId=12:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$40000000
-  lgVariables[0]\sourceId=15:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=5:lgVariables[0]\storageClass=3
-  lgDecorations[0]\sourceId=15:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=7
-  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=3
-  lgNode(0,30,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2):lgNodes[0]\operand0=10:lgNodes[0]\operand1=12
-  lgNode(1,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[1]\operand0=15:lgNodes[1]\operand1=30
-  lgNode(2,0,253,#ANVIL_IR_OP_RETURN,0,0)
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2
+  If lanes=1
+    lgTypes[2]\componentCount=2
+    resultType=2
+  Else
+    lgTypes[2]\componentCount=lanes
+    resultType=3
+  EndIf
+  lgType(3,4,32,#ANVIL_IR_TYPE_POINTER):lgTypes[3]\storageClass=1
+  lgTypes[3]\pointeeType=resultType
+  lgType(4,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[4]\storageClass=3
+  lgTypes[4]\pointeeType=resultType
+  lgType(5,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[5]\returnType=1
+  lgVariables[0]\sourceId=10:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=4:lgVariables[0]\storageClass=1
+  lgVariables[1]\sourceId=12:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=4:lgVariables[1]\storageClass=1
+  lgVariables[2]\sourceId=15:lgVariables[2]\sourceOpcode=59:lgVariables[2]\pointerType=5:lgVariables[2]\storageClass=3
+  lgDecorations[0]\sourceId=10:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=7
+  lgDecorations[1]\sourceId=12:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=7:lgDecorations[1]\value=1
+  lgDecorations[2]\sourceId=15:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=7
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=5
+  If operation=#ANVIL_IR_OP_FADD
+    opcode=#ANVIL_IR_SPV_FADD
+  Else
+    opcode=#ANVIL_IR_SPV_FMUL
+  EndIf
+  lgNode(0,30,61,#ANVIL_IR_OP_LOAD,resultType,1):lgNodes[0]\operand0=10
+  lgNode(1,31,61,#ANVIL_IR_OP_LOAD,resultType,1):lgNodes[1]\operand0=12
+  lgNode(2,32,opcode,operation,resultType,2):lgNodes[2]\operand0=30:lgNodes[2]\operand1=31
+  lgNode(3,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[3]\operand0=15:lgNodes[3]\operand1=32
+  lgNode(4,0,253,#ANVIL_IR_OP_RETURN,0,0)
 EndProcedure
 
 Procedure lgTarget(*t.AvkIrV3d42Target, targetIndex.i, targetRole.i, inputId.i, inputComps.i, outputId.i, outputComps.i)
@@ -253,6 +275,9 @@ Procedure.i Main()
   Protected r.AvkIrV3d42Result
   Protected rc.i
   Protected sentinel.i
+  Protected lanes.i
+  Protected operation.i
+  Protected caseIndex.i
 
   lgPass(@m,#ANVIL_IR_STAGE_VERTEX)
   lgTarget(@t,0,1,10,4,11,4)
@@ -292,10 +317,36 @@ Procedure.i Main()
   lgRecord(5,rc,@r,@t)
   lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
 
-  ; Arithmetic nodes are represented by the passive IR but deliberately not
-  ; lowered in this first commit.
-  lgArithmetic(@m):lgTarget(@t,5,2,0,0,15,1)
-  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_UNSUPPORTED And AnvilVkIrV3d42SourceId()=30 And AnvilVkIrV3d42SourceOpcode()=129)
+  ; Both exact arithmetic operations at every admitted scalar/vector width.
+  caseIndex=6
+  lanes=1
+  While lanes<=4
+    operation=#ANVIL_IR_OP_FADD
+    lgArithmetic(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,10,lanes,15,lanes)
+    t\inputCount=2
+    lgInputs[1]\variableId=12:lgInputs[1]\member=-1
+    lgInputs[1]\firstSlot=lanes
+    lgInputs[1]\components=lanes
+    t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
+    caseIndex=caseIndex+1
+    operation=#ANVIL_IR_OP_FMUL
+    lgArithmetic(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,10,lanes,15,lanes)
+    t\inputCount=2
+    lgInputs[1]\variableId=12:lgInputs[1]\member=-1
+    lgInputs[1]\firstSlot=lanes
+    lgInputs[1]\components=lanes
+    t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
+    caseIndex=caseIndex+1
+    lanes=lanes+1
+  Wend
   lgPass(@m,2):lgTarget(@t,5,1,10,4,11,4)
   t\tlbConfig=0
   lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT)
@@ -344,8 +395,8 @@ Procedure.i Main()
   PokeI(t\codeBase,sentinel)
   lgCheck(AnvilVkIrV3d42Lower(0,@t,@r)=#ANVIL_IR_V3D42_ERR_ARGS)
 
-  lgReport[200]=#LG_MAGIC
-  lgReport[201]=lgChecks
-  lgReport[202]=lgFails
+  lgReport[500]=#LG_MAGIC
+  lgReport[501]=lgChecks
+  lgReport[502]=lgFails
   ProcedureReturn @lgReport[0]
 EndProcedure

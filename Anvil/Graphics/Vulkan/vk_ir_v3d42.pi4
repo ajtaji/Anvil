@@ -416,6 +416,40 @@ Procedure.i avk42EmitSample(*m.AvkIrModule, *t.AvkIrV3d42Target, *n.AvkIrNode, *
   ProcedureReturn 0
 EndProcedure
 
+Procedure.i avk42EmitArithmetic(*m.AvkIrModule, *n.AvkIrNode)
+  Protected lanes.i = avkIrFloatLanes(*m, *n\resultType)
+  Protected leftId.i = *n\operand0
+  Protected rightId.i = *n\operand1
+  Protected first.i
+  Protected k.i
+  Protected rc.i
+  If lanes < 1 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  If avk42Count[leftId] = 0 : rc = avk42EmitConstant(*m, leftId) : If rc <> 0 : ProcedureReturn rc : EndIf : EndIf
+  If avk42Count[rightId] = 0 : rc = avk42EmitConstant(*m, rightId) : If rc <> 0 : ProcedureReturn rc : EndIf : EndIf
+  If avk42Count[leftId] <> lanes Or avk42Count[rightId] <> lanes
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5)
+  EndIf
+  first = avk42Alloc(lanes, *n\sourceId, *n\sourceOpcode)
+  If first < 0 : ProcedureReturn first : EndIf
+  k = 0 : rc = 0
+  While k < lanes And rc = 0
+    If *n\kind = #ANVIL_IR_OP_FADD
+      rc = V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, avk42Reg[(leftId * 4) + k], avk42Reg[(rightId * 4) + k])
+    ElseIf *n\kind = #ANVIL_IR_OP_FMUL
+      V3dQpuReset()
+      V3dQpuMul(#V3DQ_M_FMUL, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+      V3dQpuRaddr(avk42Reg[(leftId * 4) + k], avk42Reg[(rightId * 4) + k])
+      rc = V3dQpuEmit()
+    Else
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5)
+    EndIf
+    k = k + 1
+  Wend
+  If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  avk42SetRegs(*n\sourceId, lanes, first, first + 1, first + 2, first + 3)
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i avk42PrepareAndEmit(*m.AvkIrModule, *t.AvkIrV3d42Target, *r.AvkIrV3d42Result)
   Protected i.i
   Protected k.i
@@ -469,6 +503,8 @@ Procedure.i avk42PrepareAndEmit(*m.AvkIrModule, *t.AvkIrV3d42Target, *r.AvkIrV3d
         k = k + 1
       Wend
       avk42Count[*n\sourceId] = *n\operandCount
+    ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
+      rc = avk42EmitArithmetic(*m, *n)
     ElseIf *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
       rc = avk42EmitSample(*m, *t, *n, *r)
     ElseIf *n\kind = #ANVIL_IR_OP_STORE
