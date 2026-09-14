@@ -64,6 +64,10 @@ Procedure.i avkBackendImageAlignment()
   ProcedureReturn 4096
 EndProcedure
 
+Procedure.i avkBackendImageCopySourceAlignment()
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avkBackendRowPitchFor(width.i)
   ProcedureReturn width * 4
 EndProcedure
@@ -72,8 +76,20 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i avkBackendSampledMaxDimension2D()
+Procedure.i avkBackendSampledMaxDimension2D(tiling.i)
   ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *plan.AnvilVkBackendImagePlan)
+  If *plan <> 0
+    *plan\bytes = 0 : *plan\alignment = 0 : *plan\rowPitch = 0
+    *plan\backendLayout = 0 : *plan\paddedWidth = 0 : *plan\paddedHeight = 0
+  EndIf
+  ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+EndProcedure
+
+Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+  ProcedureReturn -1
 EndProcedure
 
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)

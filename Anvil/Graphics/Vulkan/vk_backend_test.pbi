@@ -26,6 +26,7 @@ Global avkTbHeapBase.i = 0
 Global avkTbHeapBytes.i = 0
 Global avkTbMaxDim.i = 4096
 Global avkTbRowAlign.i = 64
+Global avkTbCopyAlign.i = 64
 Global avkTbClearW.i = 0
 Global avkTbClearH.i = 0
 Global avkTbHold.i = 0
@@ -63,6 +64,13 @@ EndProcedure
 Procedure AnvilVkTestBackendLimits(maxDim.i, rowAlign.i)
   If maxDim > 0 : avkTbMaxDim = maxDim : EndIf
   If rowAlign > 0 : avkTbRowAlign = rowAlign : EndIf
+EndProcedure
+
+; Publish the source-address contract of this backend's image-copy engine.
+; Tests deliberately change it to prove the target-neutral recorder follows
+; backend truth rather than carrying a V3D-specific cache-line constant.
+Procedure AnvilVkTestBackendCopyAlignment(alignment.i)
+  If alignment > 0 : avkTbCopyAlign = alignment : EndIf
 EndProcedure
 
 ; Restrict the extent this backend will clear, the way the Pi 4 backend
@@ -175,6 +183,10 @@ Procedure.i avkBackendImageAlignment()
   ProcedureReturn 4096
 EndProcedure
 
+Procedure.i avkBackendImageCopySourceAlignment()
+  ProcedureReturn avkTbCopyAlign
+EndProcedure
+
 Procedure.i avkBackendRowPitchFor(width.i)
   ProcedureReturn (((width * 4) + avkTbRowAlign - 1) / avkTbRowAlign) * avkTbRowAlign
 EndProcedure
@@ -186,8 +198,77 @@ EndProcedure
 ; The state backend models the portable contract over its full declared
 ; extent. It never claims a pixel; the V3D emitter gate is the execution-side
 ; oracle for a real texture request.
-Procedure.i avkBackendSampledMaxDimension2D()
+Procedure.i avkBackendSampledMaxDimension2D(tiling.i)
+  If tiling <> #VK_IMAGE_TILING_LINEAR And tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn 0 : EndIf
   ProcedureReturn avkTbMaxDim
+EndProcedure
+
+Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *plan.AnvilVkBackendImagePlan)
+  Define pw.i
+  Define ph.i
+  If *plan = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  *plan\bytes = 0 : *plan\alignment = 0 : *plan\rowPitch = 0
+  *plan\backendLayout = 0 : *plan\paddedWidth = 0 : *plan\paddedHeight = 0
+  If width < 1 Or height < 1 Or width > avkTbMaxDim Or height > avkTbMaxDim : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If format <> #VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  *plan\alignment = 4096
+  If tiling = #VK_IMAGE_TILING_LINEAR
+    *plan\rowPitch = avkBackendRowPitchFor(width)
+    *plan\bytes = *plan\rowPitch * height
+    *plan\paddedWidth = width : *plan\paddedHeight = height
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  pw = ((width + 31) / 32) * 32
+  ph = ((height + 7) / 8) * 8
+  *plan\bytes = pw * ph * 4
+  *plan\backendLayout = 4
+  *plan\paddedWidth = pw : *plan\paddedHeight = ph
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Global avkTbCopies.i = 0
+Global avkTbLastCopySource.i = 0
+Global avkTbLastCopyDestination.i = 0
+Global avkTbLastCopyBytes.i = 0
+
+Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  avkTbTicks = avkTbTicks + 1
+  If avkTbFail <> 0
+    avkTbNative = avkTbFail
+    avkTbFail = 0
+    ProcedureReturn -1
+  EndIf
+  avkTbCopies = avkTbCopies + 1
+  avkTbLastCopySource = *copy\sourceBase
+  avkTbLastCopyDestination = *copy\destinationBase
+  avkTbLastCopyBytes = *copy\destinationBytes
+  avkTbNative = 0
+  If avkTbHold <> 0
+    avkTbBusy = 1
+    ProcedureReturn #ANVIL_VK_JOB_PENDING
+  EndIf
+  avkTbBusy = 0
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i AnvilVkTestBackendCopies()
+  ProcedureReturn avkTbCopies
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastCopySource()
+  ProcedureReturn avkTbLastCopySource
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastCopyDestination()
+  ProcedureReturn avkTbLastCopyDestination
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastCopyBytes()
+  ProcedureReturn avkTbLastCopyBytes
 EndProcedure
 
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)

@@ -44,6 +44,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_HEAP = $06200000
 #PG_HEAP_BYTES = $00100000
 #PG_OUT = $06100000
+#PG_OPTIMAL_STATE = $06180000
 #PG_MAGIC = $564B5047                ; "VKPG"
 
 ; The render target the gate draws into, and the vertex layout.
@@ -78,13 +79,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[256]
+Global Dim pgReport.i[320]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 255
+  If slot < 0 Or slot > 319
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -229,6 +230,17 @@ Procedure.i Main()
   Define bufOffset.q
   Define Dim twoBufs.i[2]
   Define Dim twoOffsets.q[2]
+  Define copyBuf.i
+  Define copyMem.i
+  Define copyImg.i
+  Define copyImgMem.i
+  Define failImg.i
+  Define failImgMem.i
+  Define copyPtr.i
+  Define copyAddress.i
+  Define copyImageAddress.i
+  Define copyFailures.i
+  Define copyRegion.VkBufferImageCopy
 
   pgPut(0, #PG_MAGIC)
   ; THE BOARD DIAGNOSTIC'S OWN MODULES, assembled by the same file the
@@ -1584,6 +1596,233 @@ Procedure.i Main()
   pgPut(231, AnvilVkTestBackendLastSampledWidth())
   pgPut(232, AnvilVkTestBackendLastSampledHeight())
 
+  ; ------------------------------------------------------------------
+  ;  AN OPTIMAL-TILED IMAGE THROUGH THE CORE TRANSFER COMMAND.
+  ;
+  ;  The test backend owns no pixels, but it holds this request so the
+  ;  public lifetime, fence and failure-atomic layout rules are observed.
+  ;  The Pi diagnostic is the separate proof that the exact request really
+  ;  runs through TFU and is then sampled by V3D.
+  ; ------------------------------------------------------------------
+  bufci\size = 1024
+  bufci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+  pgPut(235, vkCreateBuffer(dev, @bufci, 0, @copyBuf))
+  vkGetBufferMemoryRequirements(dev, copyBuf, @req)
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 1
+  pgPut(236, vkAllocateMemory(dev, @mai, 0, @copyMem))
+  pgPut(237, vkBindBufferMemory(dev, copyBuf, copyMem, 0))
+  pgPut(238, vkMapMemory(dev, copyMem, 0, req\size, 0, @copyPtr))
+  i = 0
+  While i < (17 * 13)
+    PokeL(copyPtr + 64 + (i * 4), $FF000000 | (i & $FFFFFF))
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyMem)
+  copyAddress = AnvilVkBufferAddress(copyBuf) + 64
+
+  imgci\extent\width = 17
+  imgci\extent\height = 13
+  imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  pgPut(239, vkCreateImage(dev, @imgci, 0, @copyImg))
+  vkGetImageMemoryRequirements(dev, copyImg, @req)
+  pgPut(240, req\size)
+  pgPut(241, AnvilVkImageRowPitch(copyImg))
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  pgPut(242, vkAllocateMemory(dev, @mai, 0, @copyImgMem))
+  pgPut(243, vkBindImageMemory(dev, copyImg, copyImgMem, 0))
+  copyImageAddress = AnvilVkImageAddress(copyImg)
+
+  copyRegion\bufferOffset = 64
+  copyRegion\bufferRowLength = 0
+  copyRegion\bufferImageHeight = 0
+  copyRegion\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  copyRegion\imageSubresource\mipLevel = 0
+  copyRegion\imageSubresource\baseArrayLayer = 0
+  copyRegion\imageSubresource\layerCount = 1
+  copyRegion\imageOffset\x = 0
+  copyRegion\imageOffset\y = 0
+  copyRegion\imageOffset\z = 0
+  copyRegion\imageExtent\width = 17
+  copyRegion\imageExtent\height = 13
+  copyRegion\imageExtent\depth = 1
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\image = copyImg
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  pgPut(244, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendHold(1)
+  pgPut(245, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(246, AnvilVkSubmissionOutstanding())
+  pgPut(247, AnvilVkImageLayout(copyImg))
+  AnvilVkFaultClear()
+  vkDestroyBuffer(dev, copyBuf, 0)
+  pgPut(248, AnvilVkFaultCode())
+  AnvilVkFaultClear()
+  vkFreeMemory(dev, copyMem, 0)
+  pgPut(249, AnvilVkFaultCode())
+  AnvilVkFaultClear()
+  vkDestroyImage(dev, copyImg, 0)
+  pgPut(250, AnvilVkFaultCode())
+  AnvilVkFaultClear()
+  vkFreeMemory(dev, copyImgMem, 0)
+  pgPut(251, AnvilVkFaultCode())
+  pgPut(252, vkGetFenceStatus(dev, fence))
+  AnvilVkTestBackendHold(0)
+  pgPut(253, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(254, AnvilVkImageLayout(copyImg))
+  pgPut(255, AnvilVkTestBackendCopies())
+  pgPut(256, AnvilVkTestBackendLastCopySource())
+  pgPut(257, AnvilVkTestBackendLastCopyDestination())
+  pgPut(258, AnvilVkTestBackendLastCopyBytes())
+  pgPut(259, AnvilVkSubmissionOutstanding())
+  sampled\base = copyImageAddress
+  sampled\bytes = 2048
+  sampled\width = 17
+  sampled\height = 13
+  sampled\pitch = 0
+  sampled\format = #VK_FORMAT_B8G8R8A8_UNORM
+  sampled\layout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  sampled\magFilter = #VK_FILTER_LINEAR
+  sampled\minFilter = #VK_FILTER_NEAREST
+  sampled\tiling = #VK_IMAGE_TILING_OPTIMAL
+  sampled\backendLayout = 4
+  sampled\paddedWidth = 32
+  sampled\paddedHeight = 16
+  AnvilVkV3dFragmentUniforms(texSlot, #PG_OPTIMAL_STATE, 0, #ANVIL_SPV_COLOUR_SAMPLED, @sampled)
+  pgPut(270, #PG_OPTIMAL_STATE)
+
+  ; A backend failure is transactional. Even though the recording contains
+  ; a final shader-read barrier, an image whose TFU copy failed must retain
+  ; its entry layout and the fence must still settle.
+  imgci\extent\width = 17
+  imgci\extent\height = 13
+  pgPut(260, vkCreateImage(dev, @imgci, 0, @failImg))
+  vkGetImageMemoryRequirements(dev, failImg, @req)
+  mai\allocationSize = req\size
+  pgPut(261, vkAllocateMemory(dev, @mai, 0, @failImgMem))
+  pgPut(262, vkBindImageMemory(dev, failImg, failImgMem, 0))
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\image = failImg
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyBufferToImage(cmd, copyBuf, failImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  pgPut(263, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendFailNext(77)
+  pgPut(264, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(265, AnvilVkImageLayout(failImg))
+  pgPut(266, vkGetFenceStatus(dev, fence))
+  pgPut(267, AnvilVkSubmissionOutstanding())
+  pgPut(268, AnvilVkBackendNativeError())
+
+  ; Hostile region shapes are refused while recording. Count them rather
+  ; than blessing one later generic error: each starts with a fresh command
+  ; buffer and must independently make vkEndCommandBuffer fail.
+  copyFailures = 0
+  copyRegion\imageExtent\width = 16
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  copyRegion\imageExtent\width = 17
+  copyRegion\bufferRowLength = 17
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  copyRegion\bufferRowLength = 0
+  copyRegion\bufferOffset = 4
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  copyRegion\bufferOffset = 64
+  AnvilVkTestBackendCopyAlignment(128)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  AnvilVkTestBackendCopyAlignment(64)
+  copyRegion\imageSubresource\mipLevel = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  copyRegion\imageSubresource\mipLevel = 0
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, @copyRegion)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
+  pgPut(269, copyFailures)
+
+  ; Image slots are reusable, but an old command must never acquire the new
+  ; image merely because it occupies the same slot. Record against failImg,
+  ; destroy it, create and bind its replacement, then prove submit resolves
+  ; the retained generation-tagged handle instead of trusting the slot hint.
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\image = failImg
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyBufferToImage(cmd, copyBuf, failImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  pgPut(273, vkEndCommandBuffer(cmd))
+  vkDestroyImage(dev, failImg, 0)
+  vkFreeMemory(dev, failImgMem, 0)
+  pgPut(274, vkCreateImage(dev, @imgci, 0, @failImg))
+  vkGetImageMemoryRequirements(dev, failImg, @req)
+  mai\allocationSize = req\size
+  pgPut(275, vkAllocateMemory(dev, @mai, 0, @failImgMem))
+  pgPut(276, vkBindImageMemory(dev, failImg, failImgMem, 0))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(277, vkQueueSubmit(queue, 1, @si, fence))
+
+  ; Recording retains the handle, not a borrowed address. Destroying the
+  ; source after vkEndCommandBuffer is therefore detected before submission
+  ; and no backend work begins.
+  bar\srcAccessMask = 0
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\image = failImg
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyBufferToImage(cmd, copyBuf, failImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  pgPut(271, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  vkDestroyBuffer(dev, copyBuf, 0)
+  pgPut(272, vkQueueSubmit(queue, 1, @si, fence))
+
+  ; Now that the held submission completed, all retained objects really can
+  ; be released. This also proves the earlier destroy calls did not half-work.
+  vkFreeMemory(dev, copyMem, 0)
+  vkDestroyImage(dev, copyImg, 0)
+  vkFreeMemory(dev, copyImgMem, 0)
+  vkDestroyImage(dev, failImg, 0)
+  vkFreeMemory(dev, failImgMem, 0)
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+
   ; The descriptor owns typed handles, not a borrowed address. Once its
   ; current view dies it must stop resolving even while the image remains.
   vkDestroyImageView(dev, view2, 0)
@@ -1645,6 +1884,53 @@ Procedure.i Main()
   EndIf
   vkDestroyImage(dev, img2, 0)
   vkFreeMemory(dev, mem2, 0)
+
+  ; Generation-tagged dependency chain. Slots are deliberately reused in
+  ; each case; an executable command buffer must retain the exact framebuffer,
+  ; and that framebuffer must retain the exact render pass and image view.
+  rpbi\framebuffer = fb
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(278, vkEndCommandBuffer(cmd))
+  vkDestroyFramebuffer(dev, fb, 0)
+  fbci\renderPass = rp : fbci\pAttachments = @view
+  pgPut(279, vkCreateFramebuffer(dev, @fbci, 0, @fb))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(280, vkQueueSubmit(queue, 1, @si, fence))
+
+  rpbi\framebuffer = fb
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(281, vkEndCommandBuffer(cmd))
+  vkDestroyImageView(dev, view, 0)
+  ivci\image = img
+  pgPut(282, vkCreateImageView(dev, @ivci, 0, @view))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(283, vkQueueSubmit(queue, 1, @si, fence))
+
+  vkDestroyFramebuffer(dev, fb, 0)
+  fbci\pAttachments = @view
+  pgPut(284, vkCreateFramebuffer(dev, @fbci, 0, @fb))
+  rpbi\framebuffer = fb
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(285, vkEndCommandBuffer(cmd))
+  vkDestroyRenderPass(dev, rp, 0)
+  pgPut(286, vkCreateRenderPass(dev, @rpci, 0, @rp))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(287, vkQueueSubmit(queue, 1, @si, fence))
 
   ; ------------------------------------------------------------------
   ;  Ordered teardown.

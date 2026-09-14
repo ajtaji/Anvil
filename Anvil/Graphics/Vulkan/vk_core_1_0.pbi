@@ -481,6 +481,25 @@ Structure VkImageSubresourceRange Align #PB_Structure_AlignC
   layerCount.l
 EndStructure
 
+Structure VkImageSubresourceLayers Align #PB_Structure_AlignC
+  aspectMask.l
+  mipLevel.l
+  baseArrayLayer.l
+  layerCount.l
+EndStructure
+
+; Exact core-1.0 ABI. VkDeviceSize gives the structure eight-byte alignment;
+; the embedded records place imageExtent at byte 44 and the C ABI rounds the
+; complete record to 56 bytes.
+Structure VkBufferImageCopy Align #PB_Structure_AlignC
+  bufferOffset.q
+  bufferRowLength.l
+  bufferImageHeight.l
+  imageSubresource.VkImageSubresourceLayers
+  imageOffset.VkOffset3D
+  imageExtent.VkExtent3D
+EndStructure
+
 Structure VkImageMemoryBarrier Align #PB_Structure_AlignC
   sType.l
   *pNext

@@ -203,8 +203,11 @@ Procedure.i Main()
   Sentence()
   imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
   imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
-  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
-  Sentence()
+  ; The backend now owns a bounded optimal UIF_NO_XOR plan for transfer
+  ; destinations. Optimal bytes deliberately expose no linear row pitch.
+  Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_SUCCESS And AnvilVkImageRowPitch(img) = 0)
+  vkDestroyImage(dev, img, 0)
+  img = #VK_NULL_HANDLE
   imgci\tiling = #VK_IMAGE_TILING_LINEAR
   imgci\mipLevels = 2
   Vkr(vkCreateImage(dev, @imgci, 0, @img) = #ANVIL_VK_ERR_UNSUPPORTED)

@@ -24,7 +24,7 @@
 ; No implementation source was consulted or translated.
 ;
 ; WHAT IS NOT HERE, and is refused with a real code and a sentence:
-; secondary execution, buffers, copies, blits, draws, dispatches,
+; secondary execution, buffer-to-buffer copies, blits, dispatches,
 ; render passes, queries, events, semaphores, memory and buffer
 ; barriers, multi-range clears, partial-rectangle clears, depth and
 ; stencil clears, and more than one outstanding submission.
@@ -40,6 +40,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_sync.pbi"
 #ANVIL_VK_OP_NONE = 0
 #ANVIL_VK_OP_BARRIER = 1
 #ANVIL_VK_OP_CLEAR_COLOR = 2
+#ANVIL_VK_OP_COPY_BUFFER_IMAGE = 3
 
 ; "the tracker does not know yet" for a layout inside a recording.
 #ANVIL_VK_LAYOUT_UNKNOWN = -2
@@ -53,6 +54,10 @@ Global Dim avkOpRef.i[#ANVIL_VK_MAX_OPS + 1]
 Global Dim avkOpOldLayout.i[#ANVIL_VK_MAX_OPS + 1]
 Global Dim avkOpNewLayout.i[#ANVIL_VK_MAX_OPS + 1]
 Global Dim avkOpColor.i[#ANVIL_VK_MAX_OPS + 1]
+Global Dim avkOpBuffer.i[#ANVIL_VK_MAX_OPS + 1]
+Global Dim avkOpBufferOffset.i[#ANVIL_VK_MAX_OPS + 1]
+Global Dim avkOpSourceBytes.i[#ANVIL_VK_MAX_OPS + 1]
+Global Dim avkOpSourcePitch.i[#ANVIL_VK_MAX_OPS + 1]
 
 Global Dim avkCbOpHead.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbOpTail.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
@@ -90,6 +95,7 @@ Global Dim avkCbVtxOffset.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * #ANVIL_VK_MAX_
 Global Dim avkCbRpActive.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbRpDone.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbFb.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbFbHandle.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbClearWord.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawFirst.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
@@ -107,6 +113,13 @@ Global Dim avkCbPushWord.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * 4]
 Declare.i avkDrawSubmit(c.i)
 Declare avkDrawRetain(c.i)
 Declare avkDrawRelease(c.i)
+Declare.i avkCopyBufferResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *baseOut)
+Declare avkCopyBufferRetain(c.i)
+Declare avkCopyBufferRelease(c.i)
+Declare avkCbFail(c.i, code.i, text.i)
+Declare.i avkCbRef(c.i, image.i, s.i)
+Declare.i avkRefClaim(c.i, k.i, claim.i)
+Declare.i avkOpAppend(c.i, kind.i)
 
 ; The single outstanding submission.
 Global avkFlightActive.i = 0
@@ -128,10 +141,121 @@ Procedure avkOpsRelease(c.i)
     avkOpLive[o] = 0
     avkOpNext[o] = 0
     avkOpKind[o] = #ANVIL_VK_OP_NONE
+    avkOpBuffer[o] = 0
+    avkOpBufferOffset[o] = 0
+    avkOpSourceBytes[o] = 0
+    avkOpSourcePitch[o] = 0
     o = n
   Wend
   avkCbOpHead[c] = 0
   avkCbOpTail[c] = 0
+EndProcedure
+
+; Exact bounded vkCmdCopyBufferToImage semantics: one tightly packed whole
+; BGRA8 level/layer from a TRANSFER_SRC buffer into an optimal TRANSFER_DST
+; image. The command captures the handles and immutable region values here;
+; the queue resolves and validates the live resources again before retaining
+; them, as Vulkan lifetime belongs to submission rather than recording.
+Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, dstImageLayout.i, *r.VkBufferImageCopy)
+  Define c.i
+  Define d.i
+  Define s.i
+  Define k.i
+  Define o.i
+  Define sourceBytes.i
+  Define sourcePitch.i
+  Define copyAlign.i
+  If *r = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage was given a null VkBufferImageCopy pointer (Anvil code -20001, invalid argument); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyBufferToImage was given a VkCommandBuffer handle that is not live (Anvil code -20002, stale or foreign handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage was called on a command buffer that is not recording (Anvil code -20004, wrong command buffer state); call vkBeginCommandBuffer first.")
+    ProcedureReturn
+  EndIf
+  If avkCbRpActive[c] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage was called inside a render pass (Anvil code -20004, transfer inside render pass); end the render pass before recording this transfer.")
+    ProcedureReturn
+  EndIf
+  s = avkImgSlot(dstImage)
+  If s = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdCopyBufferToImage was given a destination VkImage handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is invalid.")
+    ProcedureReturn
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkImgDev[s] <> d
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "vkCmdCopyBufferToImage was given a destination image owned by a different device (Anvil code -20003, wrong parent); source, destination and command buffer must share one VkDevice.")
+    ProcedureReturn
+  EndIf
+  If avkImgBound[s] = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage was given a destination image with no memory bound (Anvil code -20004, image not bound); call vkBindImageMemory first.")
+    ProcedureReturn
+  EndIf
+  If avkImgTiling[s] <> #VK_IMAGE_TILING_OPTIMAL Or (avkImgUsage[s] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires an optimal-tiled destination created with VK_IMAGE_USAGE_TRANSFER_DST_BIT (Anvil code -20001, wrong destination contract); this bounded transfer does not reinterpret a linear image as tiled.")
+    ProcedureReturn
+  EndIf
+  If dstImageLayout <> #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage was given a destination layout other than VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL (Anvil code -20001, wrong copy layout); transition the image before the copy and name that exact layout.")
+    ProcedureReturn
+  EndIf
+  copyAlign = avkBackendImageCopySourceAlignment()
+  If copyAlign < 1 Or (copyAlign & (copyAlign - 1)) <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage could not obtain a power-of-two source-alignment contract from the active backend (Anvil code -20005, incomplete copy backend); no transfer was recorded.")
+    ProcedureReturn
+  EndIf
+  If (*r\bufferOffset % copyAlign) <> 0 Or *r\bufferOffset < 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires a non-negative bufferOffset aligned to the active backend's image-copy source requirement (Anvil code -20001, misaligned buffer offset); query and obey the target's published transfer contract.")
+    ProcedureReturn
+  EndIf
+  If *r\bufferRowLength <> 0 Or *r\bufferImageHeight <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given an explicit buffer row length or image height (Anvil code -20005, strided copy not implemented); zero means tightly packed and is the supported core subset.")
+    ProcedureReturn
+  EndIf
+  If *r\imageSubresource\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *r\imageSubresource\mipLevel <> 0 Or *r\imageSubresource\baseArrayLayer <> 0 Or *r\imageSubresource\layerCount <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given a subresource other than colour mip zero, layer zero, count one (Anvil code -20005, unsupported subresource); every image in this subset has exactly that one subresource.")
+    ProcedureReturn
+  EndIf
+  If *r\imageOffset\x <> 0 Or *r\imageOffset\y <> 0 Or *r\imageOffset\z <> 0 Or *r\imageExtent\width <> avkImgW[s] Or *r\imageExtent\height <> avkImgH[s] Or *r\imageExtent\depth <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given a partial destination region (Anvil code -20005, partial copy not implemented); offset must be zero and extent must cover the complete one-level image.")
+    ProcedureReturn
+  EndIf
+  sourcePitch = avkImgW[s] * #ANVIL_VK_BGRA8_TEXEL_BYTES
+  sourceBytes = sourcePitch * avkImgH[s]
+  If sourcePitch < 1 Or sourceBytes < sourcePitch
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage computed a wrapped source span (Anvil code -20001, invalid extent); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkCopyBufferResolve(srcBuffer, d, *r\bufferOffset, sourceBytes, 0) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage could not resolve a live, bound VK_BUFFER_USAGE_TRANSFER_SRC_BIT buffer covering the complete source region (Anvil code -20004, invalid source buffer); bind sufficient memory and keep the buffer live.")
+    ProcedureReturn
+  EndIf
+  k = avkCbRef(c, dstImage, s)
+  If k < 0
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyBufferToImage exceeded this command buffer's retained-image capacity (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); split the work across command buffers.")
+    ProcedureReturn
+  EndIf
+  If avkRefClaim(c, k, dstImageLayout) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage claims a destination layout that earlier commands in this recording did not leave (Anvil code -20004, layout mismatch); record the transfer-destination barrier first.")
+    ProcedureReturn
+  EndIf
+  o = avkOpAppend(c, #ANVIL_VK_OP_COPY_BUFFER_IMAGE)
+  If o = 0
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool ran out of recorded-command storage while recording vkCmdCopyBufferToImage (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); reset unused command buffers or record fewer commands.")
+    ProcedureReturn
+  EndIf
+  avkOpRef[o] = k
+  avkOpOldLayout[o] = dstImageLayout
+  avkOpNewLayout[o] = dstImageLayout
+  avkOpBuffer[o] = srcBuffer
+  avkOpBufferOffset[o] = *r\bufferOffset
+  avkOpSourceBytes[o] = sourceBytes
+  avkOpSourcePitch[o] = sourcePitch
 EndProcedure
 
 ; Return a command buffer to the initial state: no ops, no references, no
@@ -164,6 +288,7 @@ Procedure avkCbClear(c.i)
   avkCbRpActive[c] = 0
   avkCbRpDone[c] = 0
   avkCbFb[c] = 0
+  avkCbFbHandle[c] = 0
   avkCbClearWord[c] = 0
   avkCbDrawCount[c] = 0
   avkCbDrawFirst[c] = 0
@@ -704,6 +829,7 @@ Procedure avkFlightReleaseRefs(c.i)
   Define k.i
   Define s.i
   avkDrawRelease(c)
+  avkCopyBufferRelease(c)
   k = 0
   While k < avkCbRefCount[c]
     s = avkRefSlot[avkRefIndex(c, k)]
@@ -764,8 +890,13 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
   Define o.i
   Define job.i
   Define clears.i
+  Define copies.i
+  Define copyOp.i
   Define colour.i
   Define target.i
+  Define sourceBase.i
+  Define copyAlign.i
+  Define copy.AnvilVkBackendImageCopy
   q = avkQueueSlot(queue)
   If q = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   d = avkQueueDev[q]
@@ -798,9 +929,13 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
   ; what the device holds, and it is checked before anything is claimed.
   k = 0
   While k < avkCbRefCount[c]
-    s = avkRefSlot[avkRefIndex(c, k)]
-    If avkImgLive[s] = 0 Or avkImgBound[s] = 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer that references an image which has since been destroyed or unbound (Anvil code -20004, stale resource reference); re-record the command buffer against live resources.")
+    ; The slot is only a recorded acceleration hint. Resolve the original
+    ; generation-tagged handle again before looking at any slot-owned state.
+    ; Otherwise destroying an image after recording and creating another in
+    ; the same slot would silently redirect the old command to the replacement.
+    s = avkImgSlot(avkRefImage[avkRefIndex(c, k)])
+    If s = 0 Or s <> avkRefSlot[avkRefIndex(c, k)] Or avkImgBound[s] = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer that references an image which has since been destroyed, replaced or unbound (Anvil code -20004, stale resource reference); re-record the command buffer against the current live image generation.")
     EndIf
     If avkRefEntry[avkRefIndex(c, k)] <> #ANVIL_VK_LAYOUT_ANY
       If avkImgLayout[s] <> avkRefEntry[avkRefIndex(c, k)]
@@ -813,6 +948,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
   ; with none is legal and does nothing; one with two is refused, because
   ; running only the first would be a silent wrong answer.
   clears = 0
+  copies = 0
+  copyOp = 0
   colour = 0
   target = 0
   o = avkCbOpHead[c]
@@ -821,21 +958,50 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
       clears = clears + 1
       colour = avkOpColor[o]
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+    ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+      copies = copies + 1
+      copyOp = o
+      target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
     EndIf
     o = avkOpNext[o]
   Wend
   If clears > 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one clear (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This slice lowers one clear per submission, so record one clear per command buffer until the backend carries a command list.")
   EndIf
+  If copies > 1
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one buffer-to-image copy (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This bounded backend transaction executes exactly one complete TFU transfer.")
+  EndIf
   ; A command buffer is either a transfer or a render pass, never both.
   ; The backend seam carries ONE job, and running the clear and throwing
   ; the draw away - or the other way round - would be a silent partial
   ; submission, which is the one answer this engine never gives.
-  If avkCbDrawCount[c] > 0 And clears > 0
+  If avkCbDrawCount[c] > 0 And (clears > 0 Or copies > 0)
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding both a vkCmdClearColorImage and a render pass (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The backend seam carries one job per submission, so record the clear and the render pass in separate command buffers.")
+  EndIf
+  If clears > 0 And copies > 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given both a clear and a buffer-to-image copy (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Record each backend job in its own command buffer until ordered multi-job submission exists.")
   EndIf
   If avkCbRpDone[c] <> 0 And avkCbDrawCount[c] = 0
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer whose render pass contains no draw (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A render pass with no draw would be a clear wearing a render pass's clothes, and vkCmdClearColorImage is the honest way to ask for that.")
+  EndIf
+  ; Resolve every generation-tagged draw dependency before the submission
+  ; changes command/fence/resource state. A stale object is an application
+  ; state error, not a device loss discovered after the flight has begun.
+  If avkCbDrawCount[c] > 0
+    job = avkDrawPreflight(c)
+    If job <> #ANVIL_VK_OK : ProcedureReturn job : EndIf
+  EndIf
+  If copies = 1
+    copyAlign = avkBackendImageCopySourceAlignment()
+    If copyAlign < 1 Or (copyAlign & (copyAlign - 1)) <> 0 Or (avkOpBufferOffset[copyOp] % copyAlign) <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that the recorded copy no longer satisfies the active backend's image-copy source alignment (Anvil code -20004, backend contract changed); re-record against the current target contract.")
+    EndIf
+    If avkCopyBufferResolve(avkOpBuffer[copyOp], d, avkOpBufferOffset[copyOp], avkOpSourceBytes[copyOp], @sourceBase) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a vkCmdCopyBufferToImage source buffer is no longer live, bound, owned, aligned or large enough (Anvil code -20004, stale source resource); re-record against a valid transfer-source buffer.")
+    EndIf
+    If target < 1 Or avkImgTiling[target] <> #VK_IMAGE_TILING_OPTIMAL Or avkImgBackendLayout[target] = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer-to-image copy no longer resolves to a complete optimal-image backend plan (Anvil code -20004, invalid destination resource); nothing was submitted.")
+    EndIf
   EndIf
   f = 0
   If fence <> #VK_NULL_HANDLE
@@ -848,6 +1014,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
   avkCmdState[c] = #ANVIL_VK_CB_PENDING
   avkFlightRetain(c)
   avkDrawRetain(c)
+  avkCopyBufferRetain(c)
   avkSubmitCount = avkSubmitCount + 1
   If avkCbDrawCount[c] > 0
     job = avkDrawSubmit(c)
@@ -859,6 +1026,29 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i)
     If job = #ANVIL_VK_JOB_DONE
       avkFlightComplete(1)
     EndIf
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If copies = 1
+    copy\windowBase = avkHeapBase
+    copy\windowBytes = avkHeapBytes
+    copy\sourceBase = sourceBase
+    copy\sourceBytes = avkOpSourceBytes[copyOp]
+    copy\sourcePitch = avkOpSourcePitch[copyOp]
+    copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target]
+    copy\destinationBytes = avkImgSize[target]
+    copy\width = avkImgW[target]
+    copy\height = avkImgH[target]
+    copy\destinationLayout = avkImgBackendLayout[target]
+    copy\paddedWidth = avkImgPaddedW[target]
+    copy\paddedHeight = avkImgPaddedH[target]
+    copy\timeoutUs = 250000
+    job = avkBackendSubmitImageCopy(@copy)
+    If job < 0
+      avkFlightComplete(0)
+      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing vkCmdCopyBufferToImage (VkResult -4, VK_ERROR_DEVICE_LOST); the destination layout was not advanced, the command buffer is invalid and its fence is signalled. Inspect the backend's TFU and MMU fault evidence before retrying.")
+      ProcedureReturn #VK_ERROR_DEVICE_LOST
+    EndIf
+    If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
     ProcedureReturn #VK_SUCCESS
   EndIf
   If clears = 0

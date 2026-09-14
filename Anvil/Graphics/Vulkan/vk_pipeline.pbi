@@ -143,7 +143,9 @@ Global Dim avkFbLive.a[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbGen.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbDev.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbRp.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
+Global Dim avkFbRpHandle.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbView.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
+Global Dim avkFbViewHandle.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbW.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbH.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 
@@ -470,6 +472,59 @@ Procedure AnvilVkBufferDestroy(device.i, buffer.i)
   EndIf
   avkBufLive[s] = 0
   avkBufBound[s] = 0
+EndProcedure
+
+; Resolve a transfer source both while recording and immediately before
+; submission. The handle, generation, binding, usage, owner and exact range
+; are checked every time; recording never turns a resource into a borrowed
+; raw address that can survive destruction or slot reuse.
+Procedure.i avkCopyBufferResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *baseOut)
+  Define b.i
+  Define base.i
+  Define alignment.i
+  If *baseOut <> 0 : PokeI(*baseOut, 0) : EndIf
+  b = avkBufSlot(buffer)
+  If b = 0 Or avkBufDev[b] <> deviceSlot Or avkBufBound[b] = 0 : ProcedureReturn 0 : EndIf
+  If (avkBufUsage[b] & #VK_BUFFER_USAGE_TRANSFER_SRC_BIT) = 0 : ProcedureReturn 0 : EndIf
+  If offset < 0 Or bytes < 1 Or offset > avkBufSize[b] Or bytes > (avkBufSize[b] - offset) : ProcedureReturn 0 : EndIf
+  base = AnvilVkBufferAddress(buffer)
+  alignment = avkBackendImageCopySourceAlignment()
+  If alignment < 1 Or (alignment & (alignment - 1)) <> 0 : ProcedureReturn 0 : EndIf
+  If base = 0 Or ((base + offset) % alignment) <> 0 : ProcedureReturn 0 : EndIf
+  If *baseOut <> 0 : PokeI(*baseOut, base + offset) : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure avkCopyBufferRetain(c.i)
+  Define o.i
+  Define b.i
+  o = avkCbOpHead[c]
+  While o <> 0
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+      b = avkBufSlot(avkOpBuffer[o])
+      If b <> 0
+        avkBufInFlight[b] = avkBufInFlight[b] + 1
+        avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
+      EndIf
+    EndIf
+    o = avkOpNext[o]
+  Wend
+EndProcedure
+
+Procedure avkCopyBufferRelease(c.i)
+  Define o.i
+  Define b.i
+  o = avkCbOpHead[c]
+  While o <> 0
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+      b = avkBufSlot(avkOpBuffer[o])
+      If b <> 0
+        If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
+        If avkMemInFlight[avkBufMemSlot[b]] > 0 : avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1 : EndIf
+      EndIf
+    EndIf
+    o = avkOpNext[o]
+  Wend
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -816,7 +871,10 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   If layers <> 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateFramebuffer was asked for more than one layer (Anvil code -20005, layered rendering not implemented); every image here has one array layer.")
   EndIf
-  img = avkIvImgSlot[iv]
+  img = avkImgSlot(avkIvImage[iv])
+  If img = 0 Or img <> avkIvImgSlot[iv]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkCreateFramebuffer was given an image view whose image has since been destroyed or replaced (Anvil code -20004, stale image-view dependency); create a new view from the current live image first.")
+  EndIf
   If width <> avkImgW[img] Or height <> avkImgH[img]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateFramebuffer was given a width or height that is not the attachment image's own extent (Anvil code -20001, framebuffer does not match its attachment); a smaller framebuffer over a larger image would render into part of it, and this backend renders the whole render target at one geometry.")
   EndIf
@@ -830,7 +888,9 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   avkFbLive[s] = 1
   avkFbDev[s] = d
   avkFbRp[s] = rp
+  avkFbRpHandle[s] = renderPass
   avkFbView[s] = iv
+  avkFbViewHandle[s] = view
   avkFbW[s] = width
   avkFbH[s] = height
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_FRAMEBUFFER, s, avkFbGen[s]))
@@ -1566,6 +1626,13 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBeginRenderPass was given a framebuffer that was not created for this render pass (Anvil code -20001, incompatible framebuffer); a framebuffer is compatible only with the render pass whose attachment description it was created against.")
     ProcedureReturn
   EndIf
+  ; A framebuffer retains Vulkan handles, not authority over whichever
+  ; objects later reuse the same slots. Resolve both recorded generations
+  ; before reading the cached slots or attachment state.
+  If avkRpSlot(avkFbRpHandle[fb]) <> avkFbRp[fb] Or avkIvSlot(avkFbViewHandle[fb]) <> avkFbView[fb]
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBeginRenderPass was given a framebuffer whose render pass or attachment view has since been destroyed or replaced (Anvil code -20004, stale framebuffer dependency); rebuild the framebuffer from current live handles.")
+    ProcedureReturn
+  EndIf
   If avkRpDev[rp] <> avkPoolDev[avkCmdPool[c]]
     avkCbFail(c, #ANVIL_VK_ERR_OWNER, "vkCmdBeginRenderPass was given a render pass that belongs to a different VkDevice from the command buffer's pool (Anvil code -20003, wrong parent); every object in one command buffer must share one device.")
     ProcedureReturn
@@ -1583,8 +1650,8 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
     ProcedureReturn
   EndIf
   iv = avkFbView[fb]
-  img = avkIvImgSlot[iv]
-  If avkImgLive[img] = 0 Or avkImgBound[img] = 0
+  img = avkImgSlot(avkIvImage[iv])
+  If img = 0 Or img <> avkIvImgSlot[iv] Or avkImgBound[img] = 0
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdBeginRenderPass was given a framebuffer whose attachment image has no memory bound to it (Anvil code -20004, image not bound); call vkBindImageMemory before recording a render pass against it.")
     ProcedureReturn
   EndIf
@@ -1607,6 +1674,7 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
   alpha = avkUnorm8FromF32Bits(avkU32(*pClearValues + 12))
   avkCbClearWord[c] = (alpha << 24) | (red << 16) | (green << 8) | blue
   avkCbFb[c] = fb
+  avkCbFbHandle[c] = framebuffer
   avkCbRpActive[c] = 1
   avkRefCur[avkRefIndex(c, k)] = avkRpFinalLayout[rp]
 EndProcedure
@@ -1768,6 +1836,7 @@ EndProcedure
 Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstVertex.i, firstInstance.i)
   Define c.i
   Define p.i
+  Define fb.i
   Define b.i
   Define k.i
   Define stride.i
@@ -1816,7 +1885,12 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     EndIf
     k = k + 1
   Wend
-  If avkPipeRp[p] <> avkFbRp[avkCbFb[c]]
+  fb = avkFbSlot(avkCbFbHandle[c])
+  If fb = 0 Or fb <> avkCbFb[c]
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called after its framebuffer was destroyed or replaced (Anvil code -20004, stale framebuffer reference); begin a new render pass against a current live framebuffer.")
+    ProcedureReturn
+  EndIf
+  If avkPipeRp[p] <> avkFbRp[fb]
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a pipeline created for a different render pass from the one that is begun (Anvil code -20001, incompatible render pass); a pipeline may only be used inside a render pass compatible with the one it was created against.")
     ProcedureReturn
   EndIf
@@ -2015,6 +2089,41 @@ Procedure avkDrawRelease(c.i)
   EndIf
 EndProcedure
 
+; Resolve the exact generations of every retained render-target dependency
+; before vkQueueSubmit changes any observable state. Slots remain caches only.
+Procedure.i avkDrawPreflight(c.i)
+  Define p.i
+  Define b.i
+  Define fb.i
+  Define img.i
+  Define iv.i
+  Define rp.i
+  Define k.i
+
+  p = avkPipeSlot(avkCbPipe[c])
+  fb = avkFbSlot(avkCbFbHandle[c])
+  If p = 0 Or fb = 0 Or fb <> avkCbFb[c]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose pipeline or framebuffer has since been destroyed or replaced (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
+  EndIf
+  rp = avkRpSlot(avkFbRpHandle[fb])
+  iv = avkIvSlot(avkFbViewHandle[fb])
+  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0 Or iv <> avkFbView[fb]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose framebuffer dependencies have since been destroyed or replaced (Anvil code -20004, stale render pass or image view); re-record against a framebuffer built from current live handles.")
+  EndIf
+  k = 0
+  While k < avkPipeBindCount[p]
+    If avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k]) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer one of whose bound vertex buffers has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
+    EndIf
+    k = k + 1
+  Wend
+  img = avkImgSlot(avkIvImage[iv])
+  If img = 0 Or img <> avkIvImgSlot[iv] Or avkImgBound[img] = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose colour attachment has since been destroyed, replaced or unbound (Anvil code -20004, stale resource reference); re-record the command buffer against live resources.")
+  EndIf
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
 ; Build the one closed draw and hand it over. Returns the backend's
 ; answer, or -1 when the backend refused or faulted.
 Procedure.i avkDrawSubmit(c.i)
@@ -2022,28 +2131,17 @@ Procedure.i avkDrawSubmit(c.i)
   Define b.i
   Define fb.i
   Define img.i
+  Define iv.i
   Define k.i
   Define rc.i
 
+  If avkDrawPreflight(c) <> #ANVIL_VK_OK : ProcedureReturn -1 : EndIf
   p = avkPipeSlot(avkCbPipe[c])
+  ; Preflight above resolved every generation-tagged handle. From this point
+  ; the cached slots are safe for this externally synchronized submission.
   fb = avkCbFb[c]
-  If p = 0 Or fb = 0
-    avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose pipeline or framebuffer has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
-    ProcedureReturn -1
-  EndIf
-  k = 0
-  While k < avkPipeBindCount[p]
-    If avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k]) = 0
-      avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer one of whose bound vertex buffers has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
-      ProcedureReturn -1
-    EndIf
-    k = k + 1
-  Wend
-  img = avkIvImgSlot[avkFbView[fb]]
-  If avkImgLive[img] = 0 Or avkImgBound[img] = 0
-    avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose colour attachment has since been destroyed or unbound (Anvil code -20004, stale resource reference); re-record the command buffer against live resources.")
-    ProcedureReturn -1
-  EndIf
+  iv = avkFbView[fb]
+  img = avkIvImgSlot[iv]
   ; The push-constant block is copied out of the recording into storage
   ; this file owns, so the address handed to the backend outlives the
   ; caller's own buffer.

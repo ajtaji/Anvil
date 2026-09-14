@@ -663,6 +663,10 @@ Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBacke
   *out\layout = 0
   *out\magFilter = 0
   *out\minFilter = 0
+  *out\tiling = 0
+  *out\backendLayout = 0
+  *out\paddedWidth = 0
+  *out\paddedHeight = 0
   s = avkDsSlot(set)
   If s = 0 Or binding < 0 Or binding >= #ANVIL_VK_MAX_SET_BINDINGS : ProcedureReturn 0 : EndIf
   lay = avkDsLayout[s]
@@ -687,6 +691,10 @@ Procedure.i AnvilVkDescriptorSetSampledImage(set.i, binding.i, *out.AnvilVkBacke
   *out\layout = avkImgLayout[img]
   *out\magFilter = avkDescSamplerMagFilter(sampler)
   *out\minFilter = avkDescSamplerMinFilter(sampler)
+  *out\tiling = avkImgTiling[img]
+  *out\backendLayout = avkImgBackendLayout[img]
+  *out\paddedWidth = avkImgPaddedW[img]
+  *out\paddedHeight = avkImgPaddedH[img]
   ProcedureReturn 1
 EndProcedure
 

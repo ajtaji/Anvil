@@ -22,16 +22,23 @@ Add --mutate to require every plausible mistake to be caught.
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
 import importlib.util
 import os
 import pathlib
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
+RUN_DIR = pathlib.Path(tempfile.mkdtemp(
+    prefix=f"anvil_vk_pipeline_{os.getpid()}_"))
+atexit.register(shutil.rmtree, RUN_DIR, True)
 sys.path.insert(0, str(HERE))
 import vulkan_spirv_check as spv  # noqa: E402  - the SPIR-V assembler lives there
 
@@ -242,7 +249,10 @@ def load_interpreter(path: pathlib.Path):
 
 def compile_one(compiler: pathlib.Path, source: pathlib.Path, name: str,
                 load: int = LOAD, stack: int = STACK) -> pathlib.Path:
-    image = pathlib.Path(tempfile.gettempdir()) / name
+    # Every checker process owns its artifacts. A fixed %TEMP% name let a
+    # concurrent gate replace another process's image/debug sidecar between
+    # compile and interpretation, producing shifting false results.
+    image = RUN_DIR / name
     command = [
         str(compiler), "--compile", source.relative_to(ROOT).as_posix(),
         "-t", "pi4", "--load-addr", hex(load), "--stack-addr", hex(stack),
@@ -922,10 +932,86 @@ def grade(cpu, rc) -> Grader:
                  blob(cpu, tex_base + OFF_UNIF_FS, 12),
                  struct.pack("<3I", (tex_base + OFF_TEX_STATE) | 0xF,
                              (tex_base + OFF_SAMP_STATE) | 1, TLB_CONF))
+
+    # The first core buffer-to-optimal-image transaction. The held test
+    # backend proves observable lifetime/fence/layout semantics without
+    # pretending to produce pixels; the board diagnostic is the pixel proof.
+    for name, n in (("transfer source buffer creates", 235),
+                    ("transfer source memory allocates", 236),
+                    ("transfer source memory binds", 237),
+                    ("transfer source memory maps", 238),
+                    ("optimal sampled image creates", 239),
+                    ("optimal image memory allocates", 242),
+                    ("optimal image memory binds", 243),
+                    ("copy command buffer records", 244),
+                    ("held copy submission starts", 245),
+                    ("held copy eventually signals", 253),
+                    ("failure-case optimal image creates", 260),
+                    ("failure-case image memory allocates", 261),
+                    ("failure-case image memory binds", 262),
+                    ("failure-case command buffer records", 263),
+                    ("stale-image command records against the old generation", 273),
+                    ("replacement image reuses the released slot", 274),
+                    ("replacement image memory allocates", 275),
+                    ("replacement image memory binds", 276)):
+        g.need(name, slot(n), 0)
+    g.need("17x13 UIF_NO_XOR allocation is 32x16x4 bytes", slot(240), 2048)
+    g.need("optimal tiling never publishes a linear row pitch", slot(241), 0)
+    g.need("held copy remains outstanding", slot(246), 1)
+    g.need("layout is not published before copy completion", slot(247), 0)
+    g.need("source buffer is retained while copy is in flight", slot(248), ERR_STATE)
+    g.need("source memory is retained while copy is in flight", slot(249), ERR_STATE)
+    g.need("destination image is retained while copy is in flight", slot(250), ERR_STATE)
+    g.need("destination memory is retained while copy is in flight", slot(251), ERR_STATE)
+    g.need("held copy fence is not ready", slot(252), 1)
+    g.need("successful copy publishes shader-read layout", slot(254), 5)
+    g.need("exactly one image copy reached the backend", slot(255), 1)
+    g.need("backend received source address plus VkBufferImageCopy offset",
+           slot(256), slot(256) & ~63)
+    g.want_true("backend received a different optimal destination",
+                slot(257) != 0 and slot(257) != slot(256),
+                f"{slot(256):#x} / {slot(257):#x}")
+    g.need("backend received the complete padded optimal allocation", slot(258), 2048)
+    g.need("successful wait settles the outstanding transaction", slot(259), 0)
+    g.need("backend failure is reported as device lost", slot(264), -4)
+    g.need("failed copy does not publish its final shader-read layout", slot(265), 0)
+    g.need("failed-copy fence is settled", slot(266), 0)
+    g.need("failed copy leaves no outstanding transaction", slot(267), 0)
+    g.need("backend-native failure evidence survives", slot(268), 77)
+    g.need("all seven hostile region/layout/count/alignment requests are refused", slot(269), 7)
+    g.need("stale-source command records while the source is live", slot(271), 0)
+    g.need("destroyed source is revalidated before submission", slot(272), ERR_STATE)
+    g.need("destroyed and slot-replaced image is revalidated before submission",
+           slot(277), ERR_STATE)
+    for name, n in (("framebuffer-alias command records", 278),
+                    ("replacement framebuffer reuses the released slot", 279),
+                    ("image-view-alias command records", 281),
+                    ("replacement image view reuses the released slot", 282),
+                    ("framebuffer rebuilds on the current view", 284),
+                    ("render-pass-alias command records", 285),
+                    ("replacement render pass reuses the released slot", 286)):
+        g.need(name, slot(n), 0)
+    g.need("recorded framebuffer generation cannot alias its replacement",
+           slot(280), ERR_STATE)
+    g.need("framebuffer view generation cannot alias its replacement",
+           slot(283), ERR_STATE)
+    g.need("framebuffer render-pass generation cannot alias its replacement",
+           slot(287), ERR_STATE)
+    optimal_state = slot(270)
+    g.need_bytes("optimal texture state names the TFU destination and exact 17x13 UIF level",
+                 blob(cpu, optimal_state + OFF_TEX_STATE, 20),
+                 struct.pack("<5I", slot(257), 17 << 26,
+                             (13 << 8) | (1 << 22),
+                             (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18)
+                             | (5 << 21) | (1 << 11),
+                             1 << 6))
     return g
 
 
 MUTANTS = (
+    ("optimal sampled state loses the strict-UIF level-zero bit",
+     "      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 16, (1 << 6))\n",
+     "      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 16, 0)\n"),
     ("the BGRA8 texture state uses identity swizzle and returns BGR as shader RGB",
      "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21))\n",
      "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))\n"),
@@ -1000,6 +1086,24 @@ MEMORY = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_memory.pbi"
 API = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_api.pbi"
 
 COMMAND_MUTANTS = (
+    ("buffer-to-image copy accepts a shader-read destination layout",
+     "  If dstImageLayout <> #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL\n",
+     "  If dstImageLayout < 0\n"),
+    ("buffer-to-image copy accepts a partial width",
+     "*r\\imageExtent\\width <> avkImgW[s] Or *r\\imageExtent\\height <> avkImgH[s]",
+     "*r\\imageExtent\\width < 0 Or *r\\imageExtent\\height <> avkImgH[s]"),
+    ("buffer-to-image submit does not revalidate the source buffer",
+     "    If avkCopyBufferResolve(avkOpBuffer[copyOp], d, avkOpBufferOffset[copyOp], avkOpSourceBytes[copyOp], @sourceBase) = 0\n",
+     "    If avkCopyBufferResolve(avkOpBuffer[copyOp], d, avkOpBufferOffset[copyOp], avkOpSourceBytes[copyOp], @sourceBase) = 99\n"),
+    ("buffer-to-image submit trusts a reused destination slot",
+     "    s = avkImgSlot(avkRefImage[avkRefIndex(c, k)])\n    If s = 0 Or s <> avkRefSlot[avkRefIndex(c, k)] Or avkImgBound[s] = 0\n",
+     "    s = avkRefSlot[avkRefIndex(c, k)]\n    If avkImgLive[s] = 0 Or avkImgBound[s] = 0\n"),
+    ("a failed TFU copy publishes its final image layout",
+     "    If job < 0\n      avkFlightComplete(0)\n      avkFault(#VK_ERROR_DEVICE_LOST, \"the graphics device failed while executing vkCmdCopyBufferToImage",
+     "    If job < 0\n      avkFlightComplete(1)\n      avkFault(#VK_ERROR_DEVICE_LOST, \"the graphics device failed while executing vkCmdCopyBufferToImage"),
+    ("buffer-to-image submit does not retain the source buffer",
+     "  avkCopyBufferRetain(c)\n  avkSubmitCount = avkSubmitCount + 1\n",
+     "  avkSubmitCount = avkSubmitCount + 1\n"),
     ("a command buffer may end inside a render pass",
      "  If avkCbRpActive[c] <> 0\n    avkCmdState[c] = #ANVIL_VK_CB_INVALID\n",
      "  If avkCbRpActive[c] = -1\n    avkCmdState[c] = #ANVIL_VK_CB_INVALID\n"),
@@ -1009,6 +1113,15 @@ COMMAND_MUTANTS = (
 )
 
 PIPELINE_MUTANTS = (
+    ("draw submission trusts a reused framebuffer slot",
+     "  fb = avkFbSlot(avkCbFbHandle[c])\n  If p = 0 Or fb = 0 Or fb <> avkCbFb[c]\n",
+     "  fb = avkCbFb[c]\n  If p = 0 Or fb = 0\n"),
+    ("draw submission trusts a reused framebuffer image-view slot",
+     "  iv = avkIvSlot(avkFbViewHandle[fb])\n  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0 Or iv <> avkFbView[fb]\n",
+     "  iv = avkFbView[fb]\n  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0\n"),
+    ("draw submission trusts a reused framebuffer render-pass slot",
+     "  rp = avkRpSlot(avkFbRpHandle[fb])\n  iv = avkIvSlot(avkFbViewHandle[fb])\n",
+     "  rp = avkFbRp[fb]\n  iv = avkIvSlot(avkFbViewHandle[fb])\n"),
     ("the sampled pipeline records the next descriptor binding",
      "  avkPipeSampleBinding[s] = avkShSampleBinding[fs]\n",
      "  avkPipeSampleBinding[s] = avkShSampleBinding[fs] + 1\n"),
@@ -1167,6 +1280,9 @@ DESCRIPTOR_MUTANTS = (
 
 
 MEMORY_MUTANTS = (
+    ("an optimal image publishes a fake linear row pitch",
+     "  avkImgPitch[s] = plan\\rowPitch\n  avkImgSize[s] = plan\\bytes\n",
+     "  avkImgPitch[s] = 64\n  avkImgSize[s] = plan\\bytes\n"),
     ("COLOR_ATTACHMENT image creation is refused",
      "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0 Or usage = 0\n",
      "  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0 Or usage = 0\n"),
@@ -1176,6 +1292,9 @@ MEMORY_MUTANTS = (
 )
 
 API_MUTANTS = (
+    ("vkCmdCopyBufferToImage accepts more than one region",
+     "  If regionCount <> 1 Or *pRegions = 0\n    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, \"vkCmdCopyBufferToImage was given other than one copy region",
+     "  If regionCount < 0 Or *pRegions = 0\n    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, \"vkCmdCopyBufferToImage was given other than one copy region"),
     ("an image view with an empty mip range is accepted",
      "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) <> 1 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n",
      "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) < 0 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n"),
@@ -1214,6 +1333,13 @@ DRAW_COUNT_TRUTH_MUTANTS = frozenset({
     "an incomplete final triangle is refused",
 })
 
+LIFETIME_ALIAS_MUTANTS = frozenset({
+    "buffer-to-image submit trusts a reused destination slot",
+    "draw submission trusts a reused framebuffer slot",
+    "draw submission trusts a reused framebuffer image-view slot",
+    "draw submission trusts a reused framebuffer render-pass slot",
+})
+
 SAMPLED_STATE_MUTANTS = frozenset({
     "an unsupported descriptor type is accepted in a layout",
     "a combined image sampler is accepted in a multi-binding layout",
@@ -1237,25 +1363,95 @@ SAMPLED_EXEC_MUTANTS = frozenset({
     "submit drops the closed sampled-image record",
 })
 
+TEST_BACKEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_backend_test.pbi"
+TEST_BACKEND_MUTANTS = (
+    ("the portable copy recorder ignores backend source alignment",
+     "Procedure.i avkBackendImageCopySourceAlignment()\n  ProcedureReturn avkTbCopyAlign\nEndProcedure\n",
+     "Procedure.i avkBackendImageCopySourceAlignment()\n  ProcedureReturn 64\nEndProcedure\n"),
+    ("the copy backend cannot hold an in-flight transfer",
+     "  avkTbLastCopyBytes = *copy\\destinationBytes\n  avkTbNative = 0\n  If avkTbHold <> 0\n",
+     "  avkTbLastCopyBytes = *copy\\destinationBytes\n  avkTbNative = 0\n  If avkTbHold = 99\n"),
+    ("the copy backend reports source bytes as destination capacity",
+     "  avkTbLastCopyBytes = *copy\\destinationBytes\n",
+     "  avkTbLastCopyBytes = *copy\\sourceBytes\n"),
+)
+
+OPTIMAL_COPY_MUTANTS = frozenset({
+    "optimal sampled state loses the strict-UIF level-zero bit",
+    "buffer-to-image copy accepts a shader-read destination layout",
+    "buffer-to-image copy accepts a partial width",
+    "buffer-to-image submit does not revalidate the source buffer",
+    "buffer-to-image submit trusts a reused destination slot",
+    "the portable copy recorder ignores backend source alignment",
+    "a failed TFU copy publishes its final image layout",
+    "buffer-to-image submit does not retain the source buffer",
+    "an optimal image publishes a fake linear row pitch",
+    "vkCmdCopyBufferToImage accepts more than one region",
+    "the copy backend cannot hold an in-flight transfer",
+    "the copy backend reports source bytes as destination capacity",
+})
+
 
 def run(a64, compiler):
     cpu, rc, steps = execute(a64, build(compiler))
     return grade(cpu, rc), steps
 
 
+@contextlib.contextmanager
+def checker_lock():
+    """Serialize the checker because mutation mode temporarily edits source.
+
+    Unique output directories stop artifact aliasing; this OS lock closes the
+    other half of the race by ensuring a baseline cannot compile while another
+    process has installed a hostile source mutation.
+    """
+    lock_path = pathlib.Path(tempfile.gettempdir()) / "anvil_vk_pipeline_check.lock"
+    with lock_path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def main() -> int:
     all_mutants = (MUTANTS + PIPELINE_MUTANTS + COMMAND_MUTANTS +
-                   DESCRIPTOR_MUTANTS + MEMORY_MUTANTS + API_MUTANTS)
+                   DESCRIPTOR_MUTANTS + MEMORY_MUTANTS + API_MUTANTS +
+                   TEST_BACKEND_MUTANTS)
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
+    parser.add_argument("--coordination-probe", action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--mutate-only", choices=("validation-truth", "image-usage",
                                                    "sample-mask", "draw-count",
-                                                   "sampled-state", "sampled-exec"))
+                                                   "lifetime-alias",
+                                                   "sampled-state", "sampled-exec",
+                                                   "optimal-copy"))
     parser.add_argument("--mutate-name", choices=tuple(m[0] for m in all_mutants),
                         help="run exactly one named mutation after the green gate")
     args = parser.parse_args()
+    if args.coordination_probe:
+        start = time.monotonic_ns()
+        time.sleep(0.25)
+        print(f"{RUN_DIR}|{start}|{time.monotonic_ns()}")
+        return 0
     if args.mutate_only or args.mutate_name:
         args.mutate = True
 
@@ -1308,7 +1504,8 @@ def main() -> int:
     for path, mutants in ((EMITTER, MUTANTS), (PIPELINE, PIPELINE_MUTANTS),
                           (COMMAND, COMMAND_MUTANTS),
                           (DESCRIPTOR, DESCRIPTOR_MUTANTS),
-                          (MEMORY, MEMORY_MUTANTS), (API, API_MUTANTS)):
+                          (MEMORY, MEMORY_MUTANTS), (API, API_MUTANTS),
+                          (TEST_BACKEND, TEST_BACKEND_MUTANTS)):
         original = path.read_text(encoding="utf-8")
         for name, fixed, broken in mutants:
             if args.mutate_name and name != args.mutate_name:
@@ -1321,9 +1518,13 @@ def main() -> int:
                 continue
             if args.mutate_only == "draw-count" and name not in DRAW_COUNT_TRUTH_MUTANTS:
                 continue
+            if args.mutate_only == "lifetime-alias" and name not in LIFETIME_ALIAS_MUTANTS:
+                continue
             if args.mutate_only == "sampled-state" and name not in SAMPLED_STATE_MUTANTS:
                 continue
             if args.mutate_only == "sampled-exec" and name not in SAMPLED_EXEC_MUTANTS:
+                continue
+            if args.mutate_only == "optimal-copy" and name not in OPTIMAL_COPY_MUTANTS:
                 continue
             if original.count(fixed) != 1:
                 print(f"  STALE  {name} - its anchor appears {original.count(fixed)} times")
@@ -1354,13 +1555,18 @@ def main() -> int:
         total = len(SAMPLE_MASK_TRUTH_MUTANTS)
     elif args.mutate_only == "draw-count":
         total = len(DRAW_COUNT_TRUTH_MUTANTS)
+    elif args.mutate_only == "lifetime-alias":
+        total = len(LIFETIME_ALIAS_MUTANTS)
     elif args.mutate_only == "sampled-state":
         total = len(SAMPLED_STATE_MUTANTS)
     elif args.mutate_only == "sampled-exec":
         total = len(SAMPLED_EXEC_MUTANTS)
+    elif args.mutate_only == "optimal-copy":
+        total = len(OPTIMAL_COPY_MUTANTS)
     else:
         total = (len(MUTANTS) + len(PIPELINE_MUTANTS) + len(COMMAND_MUTANTS)
                  + len(DESCRIPTOR_MUTANTS) + len(MEMORY_MUTANTS) + len(API_MUTANTS))
+        total += len(TEST_BACKEND_MUTANTS)
     print()
     if missed:
         print(f"vulkan_pipeline_check: {missed} of {total} mutations were not caught")
@@ -1370,4 +1576,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with checker_lock():
+        raise SystemExit(main())

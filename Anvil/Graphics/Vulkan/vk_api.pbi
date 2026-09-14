@@ -110,11 +110,9 @@ Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperti
   Wend
 EndProcedure
 
-; Report only format behavior the implementation owns. The current image path
-; is linear BGRA8 and has a checked sampled-image descriptor representation;
-; it becomes a colour attachment only when the backend owns a draw path.
-; Optimal tiling, texel-buffer, storage, depth/stencil, blend and blit
-; behavior are all absent and therefore zero.
+; Report only format behavior the implementation owns. Linear BGRA8 becomes a
+; colour attachment only when the backend owns drawing. Optimal BGRA8 is a
+; sampled image only when the backend owns both its layout plan and transfer.
 Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pFormatProperties.VkFormatProperties)
   If *pFormatProperties = 0
     ProcedureReturn
@@ -127,8 +125,11 @@ Procedure vkGetPhysicalDeviceFormatProperties(physicalDevice.i, format.i, *pForm
   *pFormatProperties\optimalTilingFeatures = 0
   *pFormatProperties\bufferFeatures = 0
   If format = #VK_FORMAT_B8G8R8A8_UNORM
-    If avkBackendSampledMaxDimension2D() > 0
+    If avkBackendSampledMaxDimension2D(#VK_IMAGE_TILING_LINEAR) > 0
       *pFormatProperties\linearTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+    EndIf
+    If avkBackendSampledMaxDimension2D(#VK_IMAGE_TILING_OPTIMAL) > 0
+      *pFormatProperties\optimalTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
     EndIf
     If AnvilVkBackendCanDraw() <> 0
       *pFormatProperties\linearTilingFeatures = *pFormatProperties\linearTilingFeatures | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT
@@ -144,6 +145,7 @@ Procedure.i vkGetPhysicalDeviceImageFormatProperties(physicalDevice.i, format.i,
   Define rc.i
   Define limit.i
   Define bytes.i
+  Define plan.AnvilVkBackendImagePlan
   If *pImageFormatProperties = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If avkPhysSlot(physicalDevice) = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetPhysicalDeviceImageFormatProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the properties structure was left untouched, so do not read it.")
@@ -160,10 +162,13 @@ Procedure.i vkGetPhysicalDeviceImageFormatProperties(physicalDevice.i, format.i,
   rc = AnvilVkImageFormatSupport(format, imageType, tiling, usage, flags)
   If rc <> #VK_SUCCESS : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   limit = avkBackendMaxImageDimension2D()
-  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0 And avkBackendSampledMaxDimension2D() < limit
-    limit = avkBackendSampledMaxDimension2D()
+  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0 And avkBackendSampledMaxDimension2D(tiling) < limit
+    limit = avkBackendSampledMaxDimension2D(tiling)
   EndIf
-  bytes = avkBackendRowPitchFor(limit) * limit
+  If avkBackendImagePlan(limit, limit, format, tiling, usage, @plan) <> #VK_SUCCESS
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  bytes = plan\bytes
   If limit < 1 Or bytes < 1 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   *pImageFormatProperties\maxExtent\width = limit
   *pImageFormatProperties\maxExtent\height = limit
@@ -538,6 +543,23 @@ Procedure vkCmdClearColorImage(commandBuffer.i, image.i, imageLayout.i, *pColor,
     ProcedureReturn
   EndIf
   AnvilVkCmdClearColorImage(commandBuffer, image, imageLayout, *pColor, *pRanges)
+EndProcedure
+
+; Exact core Vulkan 1.0 signature. The first executable tranche accepts one
+; whole, tightly packed region; refusing an array is safer than executing its
+; first member and silently leaving the rest uncopied.
+Procedure vkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, dstImageLayout.i, regionCount.i, *pRegions.VkBufferImageCopy)
+  Define c.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyBufferToImage was given a VkCommandBuffer handle that is not live (Anvil code -20002, stale or foreign handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If regionCount <> 1 Or *pRegions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given other than one copy region (Anvil code -20005, region arrays not implemented); nothing was recorded because a partial array copy would be a false success.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, *pRegions)
 EndProcedure
 
 ; ----------------------------------------------------------------------

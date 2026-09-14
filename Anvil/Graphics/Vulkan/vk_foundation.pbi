@@ -180,6 +180,42 @@ Structure AnvilVkBackendSampledImage Align #PB_Structure_AlignC
   layout.i
   magFilter.i
   minFilter.i
+  tiling.i
+  backendLayout.i
+  paddedWidth.i
+  paddedHeight.i
+EndStructure
+
+; Closed resource plan returned by the backend that owns the physical image
+; layout. Portable Vulkan code retains the values but never interprets the
+; opaque layout tag. A linear image has a real rowPitch; an optimal image has
+; rowPitch zero because Vulkan exposes no linear row layout for it.
+Structure AnvilVkBackendImagePlan Align #PB_Structure_AlignC
+  bytes.i
+  alignment.i
+  rowPitch.i
+  backendLayout.i
+  paddedWidth.i
+  paddedHeight.i
+EndStructure
+
+; One already-validated whole-image transfer. No Vulkan handles cross the
+; backend boundary: the portable layer resolves them again at submission and
+; retains both resources until this operation has completed or failed.
+Structure AnvilVkBackendImageCopy Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  sourcePitch.i
+  destinationBase.i
+  destinationBytes.i
+  width.i
+  height.i
+  destinationLayout.i
+  paddedWidth.i
+  paddedHeight.i
+  timeoutUs.i
 EndStructure
 
 Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
@@ -224,11 +260,14 @@ Declare.i avkBackendHeapCount()
 Declare.i avkBackendHeapSizeOf(index.i)
 Declare.i avkBackendHeapFlagsOf(index.i)
 Declare.i avkBackendImageAlignment()
+Declare.i avkBackendImageCopySourceAlignment()
 Declare.i avkBackendRowPitchFor(width.i)
 Declare.i avkBackendMaxImageDimension2D()
 ; Largest dimension this backend can truthfully consume through an actual
 ; sampled-image instruction. Zero means no sampling path is implemented.
-Declare.i avkBackendSampledMaxDimension2D()
+Declare.i avkBackendSampledMaxDimension2D(tiling.i)
+Declare.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *plan.AnvilVkBackendImagePlan)
+Declare.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
 Declare.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
 Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
 Declare.i avkBackendPoll()

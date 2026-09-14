@@ -43,11 +43,12 @@
 ;             fetcher reads and nothing whatever about the picture.
 ;
 ;    PASS D - A COMBINED IMAGE SAMPLER feeds the fragment colour. A
-;             separate one-texel BGRA8 image is written through mapped
-;             Vulkan memory, transitioned to shader-read layout, resolved
-;             through a closed descriptor and sampled by a real V3D TMU
-;             request. Three inside and three outside pixels, V3D job
-;             counters and fault state make the result exact.
+;             separate 4x4 optimal-tiled BGRA8 image is populated from a
+;             host-visible transfer buffer by vkCmdCopyBufferToImage and a
+;             real V3D TFU job, transitioned to shader-read layout, resolved
+;             through a closed descriptor and sampled by real TMU requests.
+;             Three exact inside colours, three exact outside pixels, TFU/
+;             bin/render counters and fault state make the result exact.
 ;
 ;  SEVEN SPIR-V MODULES ARE ASSEMBLED WORD BY WORD, from the Khronos
 ;  specification's own opcode numbers, in
@@ -93,10 +94,11 @@
 ; ======================================================================
 ;  WHAT THE OPERATOR SHOULD SEE
 ; ======================================================================
-;  A solid orange-yellow triangle, apex up, on a blue-grey ground, held
-;  for one second. Its exact stored colour is $FFFFC020: R=255, G=192,
-;  B=32, A=255. In panel pixels the apex is at (400, 320) and the base
-;  runs from (200, 960) to (600, 960).
+;  A sharply divided green/red/blue triangle, apex up, on a blue-grey
+;  ground, held for one second. These are nearest-filter samples from the
+;  4x4 optimal-tiled image: green at the apex, blue at the lower left and
+;  red at the lower right. In panel pixels the apex is at (400, 320) and
+;  the base runs from (200, 960) to (600, 960).
 ;
 ;  That is PASS D - the colour sampled through the combined image
 ;  descriptor. Passes A, B and C are drawn into the same image first and
@@ -104,8 +106,8 @@
 ;
 ;  AN OPERATOR WHO SEES A GRADIENT OR SOLID MAGENTA TRIANGLE has watched
 ;  a run where pass D did not replace the previous pass, and slot 125 says
-;  which step stopped it. A sampled triangle with red and blue exchanged
-;  is $FF20C0FF and is a texture-state swizzle defect, not a pass.
+;  which step stopped it. A solid sampled triangle is the old one-texel
+;  proof, not this optimal-image transfer proof.
 ;
 ; ======================================================================
 ;  BEFORE RUNNING IT
@@ -133,18 +135,18 @@
 ; ======================================================================
 ;  THE REPORT, AND HOW TO READ IT
 ; ======================================================================
-;  x0 comes back as the address of ONE HUNDRED AND SIXTY 32-BIT WORDS -
-;  640 bytes. ONE SLOT IS ONE WORD, so the slot number below is
+;  x0 comes back as the address of ONE HUNDRED AND SEVENTY-SIX 32-BIT
+;  WORDS - 704 bytes. ONE SLOT IS ONE WORD, so the slot number below is
 ;  the word number in the dump. Read it with
 ;
-;      md.l <x0> 280
+;      md.l <x0> 2C0
 ;
 ;  and NOT with a bare `md`: the dump's count is in BYTES whichever
-;  width is chosen, so 280 hex is 640 bytes is 160 words, and a bare
-;  `md` groups by one byte. $200 is written in hex because every
+;  width is chosen, so 2C0 hex is 704 bytes is 176 words, and a bare
+;  `md` groups by one byte. 2C0 is written in hex because every
 ;  argument of that command is.
 ;
-;  Slot 0 is $59524156 ("VARY") and slot 159 is $56415259, the same four
+;  Slot 0 is $59524156 ("VARY") and slot 175 is $56415259, the same four
 ;  letters backwards. A dump that does not show BOTH did not show the
 ;  whole report, and the verdicts near the end of it were not read.
 ;
@@ -249,7 +251,7 @@
 ;   123  descriptor fragment stream word 2: TLB config
 ;   124  descriptor GPU-lowering evidence verdict, 1
 ;   125  HIGHEST STEP REACHED, 1 to 13
-;   126  report length in bytes, 640
+;   126  report length in bytes, 704
 ;   127  reserved
 ;   128  PASS D VERDICT - combined image sampler
 ;   129  sampled image address
@@ -268,7 +270,21 @@
 ;   156  sampled failure detail
 ;   157  sampled shader-record address
 ;   158  total backend draws after sampled pass
-;   159  tail magic $56415259
+; 159..160  TFU jobs before and after the optimal-image copy
+;   161  transfer-source address (64-byte aligned offset in its buffer)
+;   162  optimal image allocation bytes, including UIF padding
+;   163  optimal image row pitch, zero because no linear pitch exists
+; 164..165  copy submit and fence-wait results
+;   166  layout after the successful copy, SHADER_READ_ONLY_OPTIMAL
+;   167  reserved
+;   168  transfer buffer memoryTypeBits
+;   169  selected host-visible memory type
+;   170  selected memory property flags
+;   171  physical memory type count
+;   172  transfer buffer allocation bytes
+;   173  VkMemoryAllocateInfo sType at the call boundary
+;   174  transfer buffer vkAllocateMemory result
+;   175  tail magic $56415259
 ;
 ;  THE PROBE PIXELS, in panel coordinates:
 ;    0 (400, 346)  inset from the apex          - red dominant
@@ -300,19 +316,18 @@
 ; ======================================================================
 ;  THE NEW PIECE THIS RUN MUST PROVE
 ; ======================================================================
-;  THE GPU NOW DEREFERENCES THE DESCRIPTOR. The fragment uniform stream
-;  carries the uniform-buffer address, $FFFFFF7C (V3D 4.2 TMU general
-;  vec4, regular per-quad fragment load), and the TLB configuration. The QPU
-;  writes that address to TMUAU, which consumes the configuration word,
-;  carries that thread switch on the launch and reads four LDTMU
-;  results. No processor-side copy of the four colour values remains.
+;  THE TEXTURE IS NO LONGER A MAPPED LINEAR ONE-TEXEL SHORTCUT. The core
+;  command records one tightly packed whole-image buffer-to-image copy.
+;  Submission revalidates both live resources and bindings, retains them
+;  through completion, runs the V3D TFU into UIF_NO_XOR optimal layout and
+;  publishes SHADER_READ_ONLY_OPTIMAL only after success. The fragment
+;  shader then samples that >1x1 result through the ordinary descriptor.
 ;
-;  The desk gate independently decodes all eighteen raw QPU words. This
-;  board run adds the part a desk cannot: the stream words are captured
-;  from the submitted shader record in slots 121..123, slot 124 requires
-;  all three to match, and pass A still requires the fetched magenta at
-;  the probe pixels. A failure is #VVP_ERR_DESCRIPTOR_LOWERING, not a
-;  generic wrong-pixel report.
+;  The report makes each ownership layer independently visible: slots
+;  159..166 cover TFU execution, source address, padded image extent and
+;  layout publication; slots 168..174 cover the public memory selection
+;  and allocation call; slots 133..148 cover exact pixels and the V3D 4.2
+;  texture/sampler state. No processor-side image write or fallback exists.
 
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
@@ -330,7 +345,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 
 #VVP_MAGIC = $59524156                 ; "VARY", slot 0
-#VVP_TAIL_MAGIC = $56415259            ; "YRAV", slot 127
+#VVP_TAIL_MAGIC = $56415259            ; "YRAV", final report slot
+#VVP_REPORT_BYTES = 176 * 4
 
 #VVP_ARENA = $0A000000
 #VVP_ARENA_BYTES = $01000000
@@ -356,6 +372,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_CLEAR_WORD = $FF3380B2
 #VVP_MAGENTA_WORD = $FFFF00FF
 #VVP_TEXTURE_WORD = $FFFFC020           ; opaque R=255, G=192, B=32
+#VVP_TEX_RED = $FFFF0000
+#VVP_TEX_GREEN = $FF00FF00
+#VVP_TEX_BLUE = $FF0000FF
+#VVP_TEX_YELLOW = $FFFFFF00
 #VVP_TMU_GENERAL_VEC4 = $FFFFFF7C
 
 ; The triangle, in clip space. +Y is DOWN, which is Vulkan's framebuffer
@@ -549,7 +569,22 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_S_TEX_DETAIL = 156
 #VVP_S_TEX_SHADER_RECORD = 157
 #VVP_S_TEX_DRAWS = 158
-#VVP_S_TAIL = 159
+#VVP_S_TFU_BEFORE = 159
+#VVP_S_TFU_AFTER = 160
+#VVP_S_TEX_STAGE_ADDR = 161
+#VVP_S_TEX_IMAGE_BYTES = 162
+#VVP_S_TEX_IMAGE_PITCH = 163
+#VVP_S_TEX_COPY_SUBMIT = 164
+#VVP_S_TEX_COPY_WAIT = 165
+#VVP_S_TEX_COPY_LAYOUT = 166
+#VVP_S_STAGE_MEMORY_BITS = 168
+#VVP_S_STAGE_MEMORY_TYPE = 169
+#VVP_S_STAGE_MEMORY_FLAGS = 170
+#VVP_S_STAGE_MEMORY_TYPE_COUNT = 171
+#VVP_S_STAGE_MEMORY_BYTES = 172
+#VVP_S_STAGE_MEMORY_STYPE = 173
+#VVP_S_STAGE_MEMORY_RC = 174
+#VVP_S_TAIL = 175
 
 ; ======================================================================
 ;  THE REPORT IS 32 BITS WIDE AND THAT IS NOT A DETAIL
@@ -565,7 +600,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 ;  below 4 GiB, the pixels are 32-bit words by definition, and the area
 ;  and the guard sum are masked to 32 bits below.
 ; ======================================================================
-Global Dim vvpReport.l[160]
+Global Dim vvpReport.l[176]
 Global Dim vvpClear.l[4]
 Global Dim vvpProbeX.i[7]
 Global Dim vvpProbeY.i[7]
@@ -573,7 +608,7 @@ Global Dim vvpOutX.i[3]
 Global Dim vvpOutY.i[3]
 
 Procedure vvpPut(slot.i, value.i)
-  If slot < 0 Or slot > 159
+  If slot < 0 Or slot > 175
     ProcedureReturn
   EndIf
   vvpReport[slot] = value & $FFFFFFFF
@@ -583,7 +618,7 @@ EndProcedure
 ; 64-bit comparison. A pixel of $FFFF0000 read from a .l is -65536, and
 ; comparing that against the constant would fail on every correct run.
 Procedure.i vvpGet(slot.i)
-  If slot < 0 Or slot > 159
+  If slot < 0 Or slot > 175
     ProcedureReturn 0
   EndIf
   ProcedureReturn vvpReport[slot] & $FFFFFFFF
@@ -648,11 +683,13 @@ EndProcedure
 ; One complete sampled-image pass over the already-created device and render
 ; target. The source is a separate 1x1 image: using the colour attachment as
 ; its own sampler would be invalid Vulkan and would prove nothing.
-Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.VkCommandBufferBeginInfo, *rpbi.VkRenderPassBeginInfo, bufAll.i, imgBase.i)
+Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.VkCommandBufferBeginInfo, *rpbi.VkRenderPassBeginInfo, bufAll.i, imgBase.i)
   Define status.i
   Define rc.i
   Define tex.i
   Define texMem.i
+  Define stage.i
+  Define stageMem.i
   Define texView.i
   Define sampler.i
   Define dsl.i
@@ -666,6 +703,7 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   Define bytesVs.i
   Define bytesFs.i
   Define texAddr.i
+  Define hostType.i
   Define shrec.i
   Define stream.i
   Define texState.i
@@ -679,6 +717,7 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   Define bufOffset.q
   Define ici.VkImageCreateInfo
   Define req.VkMemoryRequirements
+  Define mp.VkPhysicalDeviceMemoryProperties
   Define mai.VkMemoryAllocateInfo
   Define ivci.VkImageViewCreateInfo
   Define sci.VkSamplerCreateInfo
@@ -705,22 +744,25 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   Define cb.VkPipelineColorBlendStateCreateInfo
   Define gp.VkGraphicsPipelineCreateInfo
   Define bar.VkImageMemoryBarrier
+  Define bci.VkBufferCreateInfo
+  Define copy.VkBufferImageCopy
 
   status = #VVP_OK
   vvpPut(#VVP_S_TEX_BIN_BEFORE, V3dBinJobs())
   vvpPut(#VVP_S_TEX_RENDER_BEFORE, V3dRenderJobs())
+  vvpPut(#VVP_S_TFU_BEFORE, V3dTfuJobs())
 
   ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
   ici\imageType = #VK_IMAGE_TYPE_2D
   ici\format = #VK_FORMAT_B8G8R8A8_UNORM
-  ici\extent\width = 1
-  ici\extent\height = 1
+  ici\extent\width = 4
+  ici\extent\height = 4
   ici\extent\depth = 1
   ici\mipLevels = 1
   ici\arrayLayers = 1
   ici\samples = #VK_SAMPLE_COUNT_1_BIT
-  ici\tiling = #VK_IMAGE_TILING_LINEAR
-  ici\usage = #VK_IMAGE_USAGE_SAMPLED_BIT
+  ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+  ici\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
   ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
   ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
   rc = vkCreateImage(dev, @ici, 0, @tex)
@@ -728,6 +770,8 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
 
   If status = #VVP_OK
     vkGetImageMemoryRequirements(dev, tex, @req)
+    vvpPut(#VVP_S_TEX_IMAGE_BYTES, req\size)
+    vvpPut(#VVP_S_TEX_IMAGE_PITCH, AnvilVkImageRowPitch(tex))
     mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
     mai\allocationSize = req\size
     mai\memoryTypeIndex = 0
@@ -741,13 +785,66 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   If status = #VVP_OK
     texAddr = AnvilVkImageAddress(tex)
     vvpPut(#VVP_S_TEX_ADDR, texAddr)
-    rc = vkMapMemory(dev, texMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
-    If rc <> #VK_SUCCESS Or mapped <> texAddr
+    bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    bci\size = 128
+    bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+    bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    rc = vkCreateBuffer(dev, @bci, 0, @stage)
+    If rc <> #VK_SUCCESS
+      status = #VVP_ERR_BUFFER
+      vvpPut(#VVP_S_TEX_DETAIL, rc)
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    vkGetBufferMemoryRequirements(dev, stage, @req)
+    vkGetPhysicalDeviceMemoryProperties(phys, @mp)
+    vvpPut(#VVP_S_STAGE_MEMORY_BITS, req\memoryTypeBits)
+    vvpPut(#VVP_S_STAGE_MEMORY_TYPE_COUNT, mp\memoryTypeCount)
+    vvpPut(#VVP_S_STAGE_MEMORY_BYTES, req\size)
+    mai\allocationSize = req\size
+    mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    vvpPut(#VVP_S_STAGE_MEMORY_STYPE, mai\sType)
+    hostType = -1
+    k = 0
+    While k < mp\memoryTypeCount
+      If (req\memoryTypeBits & (1 << k)) <> 0 And (mp\memoryTypes[k]\propertyFlags & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) <> 0
+        hostType = k
+        Break
+      EndIf
+      k = k + 1
+    Wend
+    vvpPut(#VVP_S_STAGE_MEMORY_TYPE, hostType)
+    If hostType >= 0
+      vvpPut(#VVP_S_STAGE_MEMORY_FLAGS, mp\memoryTypes[hostType]\propertyFlags)
+    EndIf
+    mai\memoryTypeIndex = hostType
+    rc = vkAllocateMemory(dev, @mai, 0, @stageMem)
+    vvpPut(#VVP_S_STAGE_MEMORY_RC, rc)
+    If rc = #VK_SUCCESS : rc = vkBindBufferMemory(dev, stage, stageMem, 0) : EndIf
+    If rc <> #VK_SUCCESS
+      status = #VVP_ERR_MEMORY
+      vvpPut(#VVP_S_TEX_DETAIL, rc)
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    vvpPut(#VVP_S_TEX_STAGE_ADDR, AnvilVkBufferAddress(stage) + 64)
+    rc = vkMapMemory(dev, stageMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+    If rc <> #VK_SUCCESS Or mapped <> AnvilVkBufferAddress(stage)
       status = #VVP_ERR_MAP
       vvpPut(#VVP_S_TEX_DETAIL, rc)
     Else
-      PokeL(mapped, #VVP_TEXTURE_WORD)
-      vkUnmapMemory(dev, texMem)
+      ; Four exact nearest-filter regions: red/green above, blue/yellow below.
+      ; The three probe vertices sample green, blue and red respectively.
+      k = 0
+      While k < 16
+        If (k / 4) < 2
+          If (k % 4) < 2 : PokeL(mapped + 64 + (k * 4), #VVP_TEX_RED) : Else : PokeL(mapped + 64 + (k * 4), #VVP_TEX_GREEN) : EndIf
+        Else
+          If (k % 4) < 2 : PokeL(mapped + 64 + (k * 4), #VVP_TEX_BLUE) : Else : PokeL(mapped + 64 + (k * 4), #VVP_TEX_YELLOW) : EndIf
+        EndIf
+        k = k + 1
+      Wend
+      vkUnmapMemory(dev, stageMem)
     EndIf
   EndIf
 
@@ -764,7 +861,7 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   EndIf
   If status = #VVP_OK
     sci\sType = #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
-    sci\magFilter = #VK_FILTER_LINEAR
+    sci\magFilter = #VK_FILTER_NEAREST
     sci\minFilter = #VK_FILTER_NEAREST
     sci\mipmapMode = #VK_SAMPLER_MIPMAP_MODE_NEAREST
     sci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
@@ -882,28 +979,50 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
     vvpPut(#VVP_S_TEX_PIPE, AnvilVkPipelineCodeBase(pipe))
   EndIf
 
-  ; Transition the sampled image before recording the draw that consumes it.
+  ; Populate the optimal image through the core transfer command, then make
+  ; the successful TFU result visible to fragment sampling in the same
+  ; command buffer. A failed copy cannot publish the final layout.
   If status = #VVP_OK
     bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
-    bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+    bar\srcAccessMask = 0
+    bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
     bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
-    bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
     bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
     bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
     bar\image = tex
     bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
     bar\subresourceRange\levelCount = 1
     bar\subresourceRange\layerCount = 1
+    copy\bufferOffset = 64
+    copy\bufferRowLength = 0
+    copy\bufferImageHeight = 0
+    copy\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    copy\imageSubresource\mipLevel = 0
+    copy\imageSubresource\baseArrayLayer = 0
+    copy\imageSubresource\layerCount = 1
+    copy\imageExtent\width = 4
+    copy\imageExtent\height = 4
+    copy\imageExtent\depth = 1
     vkResetCommandBuffer(cmd, 0)
     rc = vkBeginCommandBuffer(cmd, *bi)
     If rc = #VK_SUCCESS
-      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+      bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+      bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
       rc = vkEndCommandBuffer(cmd)
     EndIf
     fenceArray = fence
     If rc = #VK_SUCCESS : rc = vkResetFences(dev, 1, @fenceArray) : EndIf
     If rc = #VK_SUCCESS : rc = vkQueueSubmit(queue, 1, *si, fence) : EndIf
+    vvpPut(#VVP_S_TEX_COPY_SUBMIT, rc)
     If rc = #VK_SUCCESS : rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) : EndIf
+    vvpPut(#VVP_S_TEX_COPY_WAIT, rc)
+    vvpPut(#VVP_S_TEX_COPY_LAYOUT, AnvilVkImageLayout(tex))
     If rc <> #VK_SUCCESS : status = #VVP_ERR_FENCE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
   EndIf
 
@@ -958,8 +1077,14 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
     bad = 0
     k = 0
     While k < 3
-      vvpPut(#VVP_S_TEX_IN0 + k, vvpPixel(imgBase, #VVP_PANEL_PITCH, 400, 500 + (k * 200)))
-      If vvpGet(#VVP_S_TEX_IN0 + k) <> #VVP_TEXTURE_WORD : bad = bad + 1 : EndIf
+      vvpPut(#VVP_S_TEX_IN0 + k, vvpPixel(imgBase, #VVP_PANEL_PITCH, vvpProbeX[k], vvpProbeY[k]))
+      If k = 0
+        If vvpGet(#VVP_S_TEX_IN0 + k) <> #VVP_TEX_GREEN : bad = bad + 1 : EndIf
+      ElseIf k = 1
+        If vvpGet(#VVP_S_TEX_IN0 + k) <> #VVP_TEX_BLUE : bad = bad + 1 : EndIf
+      Else
+        If vvpGet(#VVP_S_TEX_IN0 + k) <> #VVP_TEX_RED : bad = bad + 1 : EndIf
+      EndIf
       vvpPut(#VVP_S_TEX_OUT0 + k, vvpPixel(imgBase, #VVP_PANEL_PITCH, vvpOutX[k], vvpOutY[k]))
       If vvpGet(#VVP_S_TEX_OUT0 + k) <> #VVP_CLEAR_WORD : bad = bad + 1 : EndIf
       k = k + 1
@@ -973,12 +1098,15 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   vvpPut(#VVP_S_TEX_OOM, V3dBinOomCount())
   vvpPut(#VVP_S_TEX_NATIVE, AnvilVkBackendNativeError())
   vvpPut(#VVP_S_TEX_DRAWS, avkBackendDraws())
+  vvpPut(#VVP_S_TFU_AFTER, V3dTfuJobs())
   If status = #VVP_OK
     If vvpGet(#VVP_S_TEX_BIN_AFTER) <= vvpGet(#VVP_S_TEX_BIN_BEFORE) Or vvpGet(#VVP_S_TEX_RENDER_AFTER) <= vvpGet(#VVP_S_TEX_RENDER_BEFORE)
       status = #VVP_ERR_NO_JOBS
     ElseIf vvpGet(#VVP_S_TEX_MMU) <> 0 Or vvpGet(#VVP_S_TEX_OOM) <> 0 Or vvpGet(#VVP_S_TEX_NATIVE) <> 0
       status = #VVP_ERR_V3D_FAULT
-    ElseIf vvpGet(#VVP_S_TEX_STATE_BASE) <> (texAddr & $FFFFFFFF) Or vvpGet(#VVP_S_TEX_STATE_WIDTH) <> (1 << 26) Or vvpGet(#VVP_S_TEX_STATE_HEIGHT) <> ((1 << 8) | (1 << 22)) Or vvpGet(#VVP_S_TEX_STREAM_TLB) <> $FFFFFFFF
+    ElseIf vvpGet(#VVP_S_TFU_AFTER) <= vvpGet(#VVP_S_TFU_BEFORE) Or vvpGet(#VVP_S_TEX_COPY_SUBMIT) <> #VK_SUCCESS Or vvpGet(#VVP_S_TEX_COPY_WAIT) <> #VK_SUCCESS Or vvpGet(#VVP_S_TEX_COPY_LAYOUT) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      status = #VVP_ERR_DESCRIPTOR_LOWERING
+    ElseIf vvpGet(#VVP_S_TEX_STATE_BASE) <> (texAddr & $FFFFFFFF) Or vvpGet(#VVP_S_TEX_STATE_WIDTH) <> (4 << 26) Or vvpGet(#VVP_S_TEX_STATE_HEIGHT) <> ((4 << 8) | (1 << 22)) Or (vvpGet(#VVP_S_TEX_STATE_FORMAT) & (1 << 11)) = 0 Or vvpGet(#VVP_S_TEX_STREAM_TLB) <> $FFFFFFFF
       status = #VVP_ERR_DESCRIPTOR_LOWERING
     EndIf
   EndIf
@@ -992,6 +1120,8 @@ Procedure.i vvpSamplePass(dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.
   vkDestroyDescriptorSetLayout(dev, dsl, 0)
   vkDestroySampler(dev, sampler, 0)
   vkDestroyImageView(dev, texView, 0)
+  vkDestroyBuffer(dev, stage, 0)
+  vkFreeMemory(dev, stageMem, 0)
   vkDestroyImage(dev, tex, 0)
   vkFreeMemory(dev, texMem, 0)
   ProcedureReturn status
@@ -1113,7 +1243,7 @@ Procedure.i Main()
 
   vvpPut(#VVP_S_MAGIC, #VVP_MAGIC)
   vvpPut(#VVP_S_TAIL, #VVP_TAIL_MAGIC)
-  vvpPut(#VVP_S_BYTES, 640)
+  vvpPut(#VVP_S_BYTES, #VVP_REPORT_BYTES)
   vvpStep(0)
   vvpPut(#VVP_S_STATUS_A, #VVP_NOT_TRIED)
   vvpPut(#VVP_S_STATUS_B, #VVP_NOT_TRIED)
@@ -1230,7 +1360,7 @@ Procedure.i Main()
   EndIf
   vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @fp)
   vvpPut(#VVP_S_FORMAT_LINEAR, fp\linearTilingFeatures)
-  If fp\linearTilingFeatures <> (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) Or fp\optimalTilingFeatures <> 0 Or fp\bufferFeatures <> 0
+  If fp\linearTilingFeatures <> (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) Or fp\optimalTilingFeatures <> #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT Or fp\bufferFeatures <> 0
     NeonShutdown()
     ProcedureReturn vvpStop(#VVP_ERR_FORMAT)
   EndIf
@@ -2039,7 +2169,7 @@ Procedure.i Main()
   ; PASS D: the fragment shader performs a real V3D texture request through
   ; a combined image sampler. This final pass is what remains on the panel.
   vvpStep(10)
-  vvpPut(#VVP_S_STATUS_D, vvpSamplePass(dev, queue, cmd, fence, @si, @bi, @rpbi, bufAll, imgBase))
+  vvpPut(#VVP_S_STATUS_D, vvpSamplePass(phys, dev, queue, cmd, fence, @si, @bi, @rpbi, bufAll, imgBase))
 
   vvpPut(#VVP_S_BIN_AFTER, V3dBinJobs())
   vvpPut(#VVP_S_RENDER_AFTER, V3dRenderJobs())

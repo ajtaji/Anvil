@@ -63,6 +63,8 @@ Global Dim avkImgGen.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgDev.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgW.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgH.i[#ANVIL_VK_MAX_IMAGES + 1]
+Global Dim avkImgFormat.i[#ANVIL_VK_MAX_IMAGES + 1]
+Global Dim avkImgTiling.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgUsage.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgPitch.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgSize.i[#ANVIL_VK_MAX_IMAGES + 1]
@@ -74,6 +76,9 @@ Global Dim avkImgBound.a[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgLayout.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgOwnerQf.i[#ANVIL_VK_MAX_IMAGES + 1]
 Global Dim avkImgInFlight.i[#ANVIL_VK_MAX_IMAGES + 1]
+Global Dim avkImgBackendLayout.i[#ANVIL_VK_MAX_IMAGES + 1]
+Global Dim avkImgPaddedW.i[#ANVIL_VK_MAX_IMAGES + 1]
+Global Dim avkImgPaddedH.i[#ANVIL_VK_MAX_IMAGES + 1]
 
 Global avkHeapReady.i = 0
 Global avkHeapBase.i = 0
@@ -312,15 +317,22 @@ Procedure.i AnvilVkImageFormatSupport(format.i, imageType.i, tiling.i, usage.i, 
   If flags <> 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   If imageType <> #VK_IMAGE_TYPE_2D : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   If format <> #VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
-  If tiling <> #VK_IMAGE_TILING_LINEAR : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   If usage = 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))) <> 0
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
-  If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
+  If tiling = #VK_IMAGE_TILING_LINEAR
+    If (usage & #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) <> 0 And AnvilVkBackendCanDraw() = 0
+      ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+    EndIf
+  ElseIf tiling = #VK_IMAGE_TILING_OPTIMAL
+    If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0
+      ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+    EndIf
+  Else
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
-  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0 And avkBackendSampledMaxDimension2D() < 1
+  If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0 And avkBackendSampledMaxDimension2D(tiling) < 1
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
   ProcedureReturn #VK_SUCCESS
@@ -450,7 +462,7 @@ EndProcedure
 Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, usage.i, initialLayout.i, *out)
   Define d.i
   Define s.i
-  Define pitch.i
+  Define plan.AnvilVkBackendImagePlan
   Define rc.i
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
@@ -460,8 +472,8 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage was asked for a format this implementation does not support (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); the only image format Anvil implements today is VK_FORMAT_B8G8R8A8_UNORM, so ask vkGetPhysicalDeviceFormatProperties before choosing one.")
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
-  If tiling <> #VK_IMAGE_TILING_LINEAR
-    avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage was asked for VK_IMAGE_TILING_OPTIMAL (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); Anvil implements only VK_IMAGE_TILING_LINEAR, because the tiled layouts this GPU uses are not written yet and a linear image is the one whose bytes a reader can check.")
+  If tiling <> #VK_IMAGE_TILING_LINEAR And tiling <> #VK_IMAGE_TILING_OPTIMAL
+    avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage was asked for an image tiling this implementation does not support (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); use VK_IMAGE_TILING_LINEAR or the backend's queryable VK_IMAGE_TILING_OPTIMAL subset.")
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
   If width < 1 Or height < 1 Or width > avkBackendMaxImageDimension2D() Or height > avkBackendMaxImageDimension2D()
@@ -469,7 +481,7 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
   If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0
-    If width > avkBackendSampledMaxDimension2D() Or height > avkBackendSampledMaxDimension2D()
+    If width > avkBackendSampledMaxDimension2D(tiling) Or height > avkBackendSampledMaxDimension2D(tiling)
       avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given a sampled-image extent outside this backend's sampled-image limit (Anvil code -20001, sampled extent too large); query this exact usage with vkGetPhysicalDeviceImageFormatProperties. The Pi 4 V3D path currently samples one texel directly; larger linear images need an optimal-tiled representation and an explicit transfer that are not implemented yet.")
       ProcedureReturn #ANVIL_VK_ERR_ARGS
     EndIf
@@ -490,23 +502,33 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an initialLayout that the specification does not permit (Anvil code -20001, invalid argument); VkImageCreateInfo.initialLayout must be VK_IMAGE_LAYOUT_UNDEFINED or VK_IMAGE_LAYOUT_PREINITIALIZED.")
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
+  rc = avkBackendImagePlan(width, height, format, tiling, usage, @plan)
+  If rc <> #VK_SUCCESS Or plan\bytes < 1 Or plan\alignment < 1
+    ProcedureReturn avkFault(#VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateImage could not obtain a complete physical layout plan for this format, tiling, usage and extent (VkResult -11, VK_ERROR_FORMAT_NOT_SUPPORTED); no image was created. The backend must own the byte size and alignment before the allocation can be queried.")
+  EndIf
+  If tiling = #VK_IMAGE_TILING_LINEAR And plan\rowPitch < (width * #ANVIL_VK_BGRA8_TEXEL_BYTES)
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the graphics backend answered vkCreateImage with a row pitch narrower than one row of the image (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no image was created. This is a backend layout defect.")
+  EndIf
+  If tiling = #VK_IMAGE_TILING_OPTIMAL And plan\rowPitch <> 0
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the graphics backend exposed a linear row pitch for an optimal-tiled image (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no image was created. Optimal image bytes have no public linear row layout.")
+  EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_IMAGES And avkImgLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_IMAGES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
-  pitch = avkBackendRowPitchFor(width)
-  If pitch < (width * #ANVIL_VK_BGRA8_TEXEL_BYTES)
-    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the graphics backend answered vkCreateImage with a row pitch narrower than one row of the image (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no image was created. This is a backend defect, not a caller error - check avkBackendRowPitchFor for the linked backend.")
-    ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
-  EndIf
   avkImgGen[s] = avkNextGen(avkImgGen[s])
   avkImgLive[s] = 1
   avkImgDev[s] = d
   avkImgW[s] = width
   avkImgH[s] = height
+  avkImgFormat[s] = format
+  avkImgTiling[s] = tiling
   avkImgUsage[s] = usage
-  avkImgPitch[s] = pitch
-  avkImgSize[s] = pitch * height
-  avkImgAlign[s] = avkBackendImageAlignment()
+  avkImgPitch[s] = plan\rowPitch
+  avkImgSize[s] = plan\bytes
+  avkImgAlign[s] = plan\alignment
+  avkImgBackendLayout[s] = plan\backendLayout
+  avkImgPaddedW[s] = plan\paddedWidth
+  avkImgPaddedH[s] = plan\paddedHeight
   avkImgMemory[s] = #VK_NULL_HANDLE
   avkImgMemSlot[s] = 0
   avkImgMemOffset[s] = 0

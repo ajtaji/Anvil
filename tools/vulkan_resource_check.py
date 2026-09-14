@@ -308,10 +308,10 @@ MUTANTS = (
         "  If *pSubmits\\waitSemaphoreCount < 0\n",
     ),
     (
-        "an optimal-tiling image is created anyway",
+        "the bounded optimal transfer image is refused",
         "vk_memory.pbi",
-        "  If tiling <> #VK_IMAGE_TILING_LINEAR\n",
-        "  If tiling < 0\n",
+        "  ElseIf tiling = #VK_IMAGE_TILING_OPTIMAL\n",
+        "  ElseIf tiling = -99\n",
     ),
     (
         "host allocation callbacks are accepted and then ignored",
@@ -365,6 +365,7 @@ MAP_MEMORY_MUTANTS = frozenset({
 
 FORMAT_TRUTH_MUTANTS = frozenset({
     "vkCreateImage accepts a color attachment on a transfer-only backend",
+    "the bounded optimal transfer image is refused",
 })
 
 PIPELINE_BARRIER_ABI_MUTANTS = frozenset({

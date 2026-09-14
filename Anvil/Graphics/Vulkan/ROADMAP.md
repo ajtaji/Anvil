@@ -19,12 +19,13 @@ dependency.
 ## The implemented slice
 
 `vk_v3d_backend.pi4` executes validated whole-image clears and the bounded
-graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes one
-combined `sampler2D` implicit-LOD request from a separate one-texel linear
-`VK_FORMAT_B8G8R8A8_UNORM` image. The image is real `VkDeviceMemory`, populated
-through `vkMapMemory`, transitioned through `vkCmdPipelineBarrier`, resolved
-through a closed combined-image-sampler descriptor, submitted by
-`vkQueueSubmit`, and observed through a public `VkFence`.
+graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes a
+combined `sampler2D` implicit-LOD request from either the measured one-texel
+linear image or the bounded optimal BGRA8 image path. The optimal path records
+one tightly packed whole-image `vkCmdCopyBufferToImage`, revalidates and retains
+both live resources at submission, executes a TFU raster-to-`UIF_NO_XOR` copy,
+and publishes shader-read layout only after successful completion. Submission
+and the following sampled draw are both observed through public fences.
 
 The execution path is `NeonRebindSurface`, `NeonFrameBegin` and `NeonFrameEnd`
 with no draws. `NeonRebindSurface` plans and validates each accepted geometry,
@@ -43,10 +44,11 @@ desk gate checks the source for one.
   images through the V3D planner up to the configured equal width/height
   maximum and derives row pitch from the same rule used by creation and the
   public image-format query. Zero, overflowing, over-capacity or unmapped
-  geometry is refused before a job counter can move. Sampled resources are
-  narrower: only 1x1 linear BGRA8 is accepted, because that sole texel is also
-  the sole V3D linear-tile texel. Mips, array layers, multisampling, public
-  optimal tiling and other formats remain unsupported.
+  geometry is refused before a job counter can move. Sampled resources remain
+  bounded: linear sampling is 1x1 only; optimal BGRA8 supports one mip, one
+  layer, one sample and the backend-planned size, with a single tightly packed
+  whole-image transfer region. Mips, partial regions, row-length overrides,
+  array layers, multisampling and other formats remain unsupported.
 - **The buffer the display is scanning out.** This backend is offscreen by
   contract. Presentation stays with the display layer.
 - **Asynchrony.** `NeonFrameEnd` waits for both jobs before it returns, so
@@ -70,12 +72,14 @@ native-backend and detail faults. The texture-state word was `$00A9C040`, the
 source-backed Z,Y,X,W logical swizzle required by BGRA8; the prior identity
 swizzle was measured red as `$FF20C0FF` and is now a focused desk mutant.
 
-That is one sampled texel, not general texture support. Commit `bf67333` adds an
-isolated, desk-proved raw-four-byte raster-to-`UIF_NO_XOR` TFU prerequisite, but
-no public Vulkan file includes it yet. The next transaction must add an optimal
-image resource contract, an explicit buffer-to-image copy command, resource
-retention/layout/cache/failure semantics, TFU execution and a greater-than-1x1
-silicon proof before any optimal-tiling capability is advertised.
+That older run is one sampled linear texel, not general texture support. The
+next 2026-09-13 run integrated `bf67333` through a real optimal-image resource
+and `vkCmdCopyBufferToImage` transaction. A 4x4 BGRA8 source produced exact
+green/blue/red sampled probes, exact clear exterior probes, TFU/bin/render
+counter advances, shader-read layout, zero MMU/OOM/native faults and texture
+state `$00A9C840`. Exact artifacts and hashes are in `COVERAGE.md`. This proves
+only the declared one-region level-zero `UIF_NO_XOR` subset; general copies,
+mips, layers, format conversion and arbitrary texture sizes remain roadmap.
 
 ## API and object gaps
 
@@ -124,10 +128,10 @@ Everything below remains missing.
   memory is unsupported until explicitly implemented.
 - Buffers and buffer views with bounds, usage, sharing mode, queue-family
   ownership, and texel formats.
-- Images with all core dimensionalities, mip/layer planes, tilings, row/slice
-  pitches, aspects, compatible views, layout tracking per subresource, format
-  feature tables, and linear/UIF conversions. The development image binding is
-  external metadata only and is not a Vulkan resource implementation.
+- Images beyond the implemented linear BGRA8 and bounded level-zero
+  `UIF_NO_XOR` BGRA8 subset: other dimensionalities, mip/layer planes,
+  row/slice overrides, aspects, compatible views, per-subresource layout and
+  broader format feature tables remain missing.
 - Sampler state beyond the bounded nearest/linear, clamp-to-edge, LOD-zero
   subset; normalized/unnormalized coordinate variants, other addressing,
   compare, border color and anisotropy capability. One combined-image-sampler
@@ -149,9 +153,10 @@ correct. Everything below remains missing.
 - General command allocation arrays, secondary execution and inheritance,
   simultaneous-use and pending resubmission rules, reset/release behavior, and
   command-pool external synchronization beyond the current state engine.
-- All buffer/image copies, blits, resolves, fills, updates, mip transitions,
-  depth/stencil clears, partial color clears, and multi-range clears. TFU is a
-  candidate for supported raster-to-tiled conversions, not a general memcpy.
+- Buffer/image copies beyond the one implemented tightly packed whole-image
+  buffer-to-optimal-image transfer; blits, resolves, fills, updates, mip
+  transitions, depth/stencil clears, partial colour clears and multi-range
+  clears remain missing. TFU is not represented as a general memcpy.
 - Queries, timestamps, conditional behavior, push constants, dynamic state,
   indexed/indirect draws, dispatch, and render-pass commands.
 

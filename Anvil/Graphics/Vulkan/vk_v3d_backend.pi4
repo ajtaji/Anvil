@@ -66,6 +66,7 @@
 ; resolve AnvilVkV3dCompile by name rather than linking something odd.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
 
 ; The clear colour word this backend hands V3dRenderClear lands in the
 ; target VERBATIM: TILE_RENDERING_MODE_CFG carries a packed word, not
@@ -170,6 +171,13 @@ Procedure.i avkBackendImageAlignment()
   ProcedureReturn 4096
 EndProcedure
 
+; TFU raster input is cleaned and issued by cache-line. This requirement is
+; backend-owned so another Vulkan target can publish its own transfer engine's
+; alignment without inheriting a Pi 4 constant in the command layer.
+Procedure.i avkBackendImageCopySourceAlignment()
+  ProcedureReturn 64
+EndProcedure
+
 ; Linear BGRA8 images use a tight four-byte row.  The transactional Neon
 ; rebind installs this pitch in the V3D store packet; it is no longer copied
 ; from the display surface.
@@ -189,8 +197,71 @@ EndProcedure
 ; texel of V3D's LINEARTILE level; every coordinate clamps to it. Wider images
 ; require an optimal-tiled representation and a transfer operation and remain
 ; outside the advertised/queryable limit rather than being misread as tiled.
-Procedure.i avkBackendSampledMaxDimension2D()
-  ProcedureReturn 1
+Procedure.i avkBackendSampledMaxDimension2D(tiling.i)
+  Define n.i
+  If tiling = #VK_IMAGE_TILING_LINEAR : ProcedureReturn 1 : EndIf
+  If tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn 0 : EndIf
+  n = avkBackendMaxImageDimension2D()
+  If n > #ANVIL_V3D_TEXTURE_MAX_DIM : n = #ANVIL_V3D_TEXTURE_MAX_DIM : EndIf
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *plan.AnvilVkBackendImagePlan)
+  Define vp.AvkV3dTexturePlan
+  Define rc.i
+  If *plan = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  *plan\bytes = 0 : *plan\alignment = 0 : *plan\rowPitch = 0
+  *plan\backendLayout = 0 : *plan\paddedWidth = 0 : *plan\paddedHeight = 0
+  If format <> #VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If width < 1 Or height < 1 Or width > avkBackendMaxImageDimension2D() Or height > avkBackendMaxImageDimension2D()
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  *plan\alignment = avkBackendImageAlignment()
+  If tiling = #VK_IMAGE_TILING_LINEAR
+    *plan\rowPitch = avkBackendRowPitchFor(width)
+    *plan\bytes = *plan\rowPitch * height
+    *plan\paddedWidth = width : *plan\paddedHeight = height
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If usage = 0 Or (usage & (~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  rc = AnvilVkV3dTexturePlanBuild(width, height, width * 4, @vp)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  *plan\bytes = vp\destinationBytes
+  *plan\backendLayout = vp\textureMemoryFormat
+  *plan\paddedWidth = vp\paddedWidth
+  *plan\paddedHeight = vp\paddedHeight
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+  Define t.AvkV3dTextureTransfer
+  Define p.AvkV3dTexturePlan
+  Define rc.i
+  avkV3dNative = 0
+  If *copy = 0 : avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn -1 : EndIf
+  If *copy\destinationLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR
+    avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS
+    ProcedureReturn -1
+  EndIf
+  t\windowBase = *copy\windowBase : t\windowBytes = *copy\windowBytes
+  t\sourceBase = *copy\sourceBase : t\sourceBytes = *copy\sourceBytes
+  t\destinationBase = *copy\destinationBase : t\destinationBytes = *copy\destinationBytes
+  t\width = *copy\width : t\height = *copy\height
+  t\sourcePitch = *copy\sourcePitch : t\timeoutUs = *copy\timeoutUs
+  rc = AnvilVkV3dTextureConvert(@t, @p)
+  If rc <> #ANVIL_V3D_TEXTURE_OK
+    avkV3dNative = rc
+    ProcedureReturn -1
+  EndIf
+  If p\textureMemoryFormat <> *copy\destinationLayout Or p\paddedWidth <> *copy\paddedWidth Or p\paddedHeight <> *copy\paddedHeight
+    avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS
+    ProcedureReturn -1
+  EndIf
+  avkV3dJobs = avkV3dJobs + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
@@ -377,6 +448,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Define colourBase.i
   Define *bind.AnvilVkBackendBinding
   Define *sampled.AnvilVkBackendSampledImage
+  Define texturePlan.AvkV3dTexturePlan
 
   avkV3dNative = 0
   If *d = 0
@@ -461,8 +533,24 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a sampled pipeline without its closed sampled-image record (Anvil code -20001, missing sampled image); nothing was submitted.")
       ProcedureReturn -1
     EndIf
-    If *sampled\width <> 1 Or *sampled\height <> 1 Or *sampled\pitch <> 4 Or *sampled\bytes < 4
-      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled image outside its one-texel linear-image contract (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Larger linear images are not V3D texture layout and need an optimal-tiled image plus an explicit transfer.")
+    If *sampled\tiling = #VK_IMAGE_TILING_LINEAR
+      If *sampled\width <> 1 Or *sampled\height <> 1 Or *sampled\pitch <> 4 Or *sampled\bytes < 4
+        avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a linear sampled image outside its one-texel contract (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Larger sampled images must use the optimal UIF layout produced by vkCmdCopyBufferToImage.")
+        avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+        ProcedureReturn -1
+      EndIf
+    ElseIf *sampled\tiling = #VK_IMAGE_TILING_OPTIMAL
+      If AnvilVkV3dTexturePlanBuild(*sampled\width, *sampled\height, *sampled\width * 4, @texturePlan) <> #ANVIL_V3D_TEXTURE_OK
+        avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+        ProcedureReturn -1
+      EndIf
+      If *sampled\backendLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR Or *sampled\pitch <> 0 Or *sampled\bytes < texturePlan\destinationBytes Or *sampled\paddedWidth <> texturePlan\paddedWidth Or *sampled\paddedHeight <> texturePlan\paddedHeight
+        avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed an optimal sampled image whose retained UIF plan is incomplete or inconsistent (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Recreate and fill it through the supported optimal-image copy path.")
+        avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+        ProcedureReturn -1
+      EndIf
+    Else
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled image with an unknown physical tiling (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted.")
       avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
       ProcedureReturn -1
     EndIf
@@ -474,7 +562,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed sampled filter state outside nearest or linear (Anvil code -20001, invalid sampler state); nothing was submitted.")
       ProcedureReturn -1
     EndIf
-    If avkV3dWindowBytes < 4 Or *sampled\base < avkV3dWindowBase Or (*sampled\base - avkV3dWindowBase) > (avkV3dWindowBytes - 4)
+    If *sampled\bytes < 4 Or *sampled\bytes > avkV3dWindowBytes Or *sampled\base < avkV3dWindowBase Or (*sampled\base - avkV3dWindowBase) > (avkV3dWindowBytes - *sampled\bytes)
       avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled texel outside the offscreen window mapped by the V3D page table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. An unmapped texture request is an MMU fault, not a wrong pixel.")
       avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
       ProcedureReturn -1
@@ -521,7 +609,7 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     ; The QPU's texture request reads the application's mapped texel directly.
     ; Clean that exact range before the control list can launch the request.
     If *sampled <> 0
-      V3dCacheRange(*sampled\base, 4)
+      V3dCacheRange(*sampled\base, *sampled\bytes)
     EndIf
     ; One cache maintenance per binding: the processor wrote each of
     ; these buffers and the vertex fetcher reads all of them.

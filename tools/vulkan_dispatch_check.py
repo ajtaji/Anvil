@@ -26,11 +26,11 @@ MAGIC = 0x564B4450
 OUT = 0x06000000
 ROWS = 0x06000100
 
-WITHHELD = frozenset(("vkFreeDescriptorSets", "vkCmdCopyBufferToImage"))
+WITHHELD = frozenset(("vkFreeDescriptorSets",))
 ALLOWLIST = frozenset("""vkAllocateCommandBuffers vkAllocateDescriptorSets
 vkAllocateMemory vkBeginCommandBuffer vkBindBufferMemory vkBindImageMemory
 vkCmdBeginRenderPass vkCmdBindDescriptorSets vkCmdBindPipeline
-vkCmdBindVertexBuffers vkCmdClearColorImage vkCmdDraw vkCmdEndRenderPass
+vkCmdBindVertexBuffers vkCmdClearColorImage vkCmdCopyBufferToImage vkCmdDraw vkCmdEndRenderPass
 vkCmdPipelineBarrier vkCmdPushConstants vkCreateBuffer vkCreateCommandPool
 vkCreateDescriptorPool vkCreateDescriptorSetLayout vkCreateDevice vkCreateFence
 vkCreateFramebuffer vkCreateGraphicsPipelines vkCreateImage vkCreateImageView
