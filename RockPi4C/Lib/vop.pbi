@@ -15,6 +15,7 @@
 ; WIN0_CTRL0 line-buffer modes used by the pinned Rockchip RGB helper.
 #VOP_WIN_ENABLE = 1
 #VOP_WIN_LB_MODE_SHIFT = 5
+#VOP_WIN0_FORMAT_LB_ENABLE_MASK = $000000FF
 #VOP_LB_RGB_2560X4 = 3
 #VOP_LB_RGB_1920X5 = 4
 ; Rockchip's RK3368/RK3399-generation VOP driver programs both gather enables
@@ -337,7 +338,13 @@ Procedure.i RockVopUpMode()
   ; programs YRGB vertical-up mode BIC even when the scale modes themselves
   ; are NONE. Own that active-path field instead of inheriting its reset value.
   RockVopField(#VOP_WIN0_CTRL1,#VOP_WIN0_GATHER_MASK | #VOP_WIN0_YRGB_VSU_MODE_MASK,#VOP_WIN0_ARGB8888_GATHER | #VOP_WIN0_YRGB_VSU_BIC)
-  RockVopWrite(#VOP_WIN0_CTRL0,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
+  ; VOP_LIT WIN0_CTRL0 resets to $3A000040: bits29:25 carry the documented
+  ; per-window AXI outstanding limit ($1D). Linux programs format, line-buffer
+  ; mode and enable through field updates, preserving those throughput bits.
+  ; A full $81 write erased them and the live 1080p path then starved only the
+  ; post FIFO. Own the low functional byte while retaining the reset-owned AXI
+  ; contract established by RockCruVopRelease().
+  RockVopField(#VOP_WIN0_CTRL0,#VOP_WIN0_FORMAT_LB_ENABLE_MASK,#VOP_WIN_ENABLE | (lineBufferMode << #VOP_WIN_LB_MODE_SHIFT))
   RockVopWrite(#VOP_WIN0_YRGB_MST,RockVopFramebuffer())
   RockVopWrite(#VOP_CFG_DONE,1)
   ; Linux writel()/U-Boot writel() order device MMIO before the following CRU

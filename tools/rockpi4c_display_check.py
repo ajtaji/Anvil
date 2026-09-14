@@ -582,23 +582,26 @@ def source_contract() -> None:
     line_buffer_order = ["rockvopmodevalid()",
                          "linebuffermode=rockvoplinebuffermode(rock_mode_width)",
                          "if linebuffermode < 0", "rockcruvoprelease()",
-                         "rockvopwrite(#vop_win0_ctrl0,#vop_win_enable | (linebuffermode << #vop_win_lb_mode_shift))"]
+                         "rockvopfield(#vop_win0_ctrl0,#vop_win0_format_lb_enable_mask,#vop_win_enable | (linebuffermode << #vop_win_lb_mode_shift))"]
     positions = [vop_up.index(token) for token in line_buffer_order]
     require(positions == sorted(positions),
             "WIN0 line-buffer admission/programming moved after hardware release")
     outstanding = "rockvopfield(#vop_sys_ctrl1,$0003f000,$0003d000)"
     require(outstanding in vop_up and
             vop_up.index("rockcrureset(279,0)") < vop_up.index(outstanding) <
-            vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
+            vop_up.index("rockvopfield(#vop_win0_ctrl0,#vop_win0_format_lb_enable_mask"),
             "VOP 30-read AXI throughput contract is absent or armed too late")
     gather = "rockvopfield(#vop_win0_ctrl1,#vop_win0_gather_mask | #vop_win0_yrgb_vsu_mode_mask,#vop_win0_argb8888_gather | #vop_win0_yrgb_vsu_bic)"
     require(gather in vop_up and
             vop_up.index("rockvopwrite(#vop_win0_vir") < vop_up.index(gather) <
-            vop_up.index("rockvopwrite(#vop_win0_ctrl0"),
+            vop_up.index("rockvopfield(#vop_win0_ctrl0,#vop_win0_format_lb_enable_mask"),
             "ARGB8888 gather/vertical scaler contract is absent or armed after WIN0")
     require("#vop_win0_yrgb_vsu_mode_mask = $00400000" in vop and
             "#vop_win0_yrgb_vsu_bic = $00400000" in vop,
             "RK3399 YRGB vertical scaler mode is not pinned to source-owned BIC")
+    require("#vop_win0_format_lb_enable_mask = $000000ff" in vop and
+            "rockvopwrite(#vop_win0_ctrl0" not in vop_up,
+            "WIN0 programming can erase reset-owned AXI outstanding state")
     win_scale = "rockvopwrite(#vop_win0_scl_factor,#vop_scale_unity_xy)"
     post_scale = "rockvopwrite(#vop_post_scl_factor,#vop_scale_unity_xy)"
     require("#vop_scale_unity_xy = $10001000" in vop and
