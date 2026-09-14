@@ -229,6 +229,8 @@ Procedure.i RockCruVpllMode()
   If RockCruVpllSet(rock_mode_pixel_hz)=0 : ProcedureReturn 0 : EndIf
   RockCruField(#ROCK_CRU_CLKSEL+$C8,$0BFF,$0000)
   RockCruGate(10,13,1)
+  If RockCruExpect(#ROCK_CRU_CLKSEL+$C8,$0BFF,$0000,73)=0 : ProcedureReturn 0 : EndIf
+  If RockCruExpect(#ROCK_CRU_CLKGATE+10*4,$2000,0,74)=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure
 

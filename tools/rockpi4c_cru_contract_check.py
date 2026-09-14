@@ -77,6 +77,10 @@ def main() -> int:
             "CLKSEL48 VOPL ACLK/HCLK")
     require(source, r"RockCruField\(#ROCK_CRU_CLKSEL\+\$C8,\$0BFF,\$0000\)",
             "CLKSEL50 VPLL DIV/1 DCLK")
+    require(source, r"RockCruExpect\(#ROCK_CRU_CLKSEL\+\$C8,\$0BFF,\$0000,73\)",
+            "selected-mode CLKSEL50 readback")
+    require(source, r"RockCruExpect\(#ROCK_CRU_CLKGATE\+10\*4,\$2000,0,74\)",
+            "selected-mode DCLK gate readback")
 
     # Parent/NoC/leaf gates required by the pinned DT and genpd hierarchy.
     required_gates = {
