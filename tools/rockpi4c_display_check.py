@@ -621,6 +621,15 @@ def source_contract() -> None:
         require(token in vop_up, f"dynamic VOP polarity drifted: {token}")
     require("#vop_dsp_p888_pre_dither = $00000002" in vop,
             "RK3399 VOPL P888 pre-dither contract is absent")
+    for token in (
+        "#vop_win2_ctrl0 = $0b0",
+        "#vop_afbcd0_ctrl = $200",
+        "rockvopfield(#vop_afbcd0_ctrl,$00000001,0)",
+        "rockvopfield(#vop_win0_ctrl0,$00000001,0)",
+        "rockvopfield(#vop_win2_ctrl0,$00000010,0)",
+    ):
+        require(token in vop_up or token in vop,
+                f"little-VOP clean-start contract drifted: {token}")
 
     # RockCruVpllMode is the final DCLK owner. Trace its complete downstream
     # source path rather than merely validating isolated PLL arithmetic.

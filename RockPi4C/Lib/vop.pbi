@@ -37,6 +37,7 @@
 #VOP_WIN0_DSP_INFO = $04C
 #VOP_WIN0_DSP_ST = $050
 #VOP_WIN0_SCL_FACTOR = $054
+#VOP_WIN2_CTRL0 = $0B0
 #VOP_POST_HACT = $170
 #VOP_POST_VACT = $174
 #VOP_POST_SCL_FACTOR = $178
@@ -45,6 +46,7 @@
 #VOP_HACT = $18C
 #VOP_VTOTAL = $190
 #VOP_VACT = $194
+#VOP_AFBCD0_CTRL = $200
 #VOP_INTR_CLEAR0 = $284
 #VOP_INTR_RAW_STATUS0 = $28C
 
@@ -288,6 +290,14 @@ Procedure.i RockVopUpMode()
   ; build 57 latched POST_BUF_EMPTY at 1080p. Program the documented VOP
   ; throughput contract explicitly before scanout is armed.
   RockVopField(#VOP_SYS_CTRL1,$0003F000,$0003D000)
+  ; vop_initial()/vop_disable_allwin() in the pinned RK3399 Linux driver
+  ; explicitly disables AFBCD and every declared little-VOP plane before the
+  ; new primary plane is configured.  VOPL has WIN0 and WIN2; WIN1/WIN3/HWC
+  ; are not members of its topology.  Establish that same clean state after
+  ; the now-released DCLK reset instead of depending on a bootloader shadow.
+  RockVopField(#VOP_AFBCD0_CTRL,$00000001,0)
+  RockVopField(#VOP_WIN0_CTRL0,$00000001,0)
+  RockVopField(#VOP_WIN2_CTRL0,$00000010,0)
   ; Route the Cadence transmitter from the little VOP (GRF SOC_CON9 bit12).
   PokeL(#ROCK_GRF+$6224,$10001000)
   RockVopFirstFrame()
