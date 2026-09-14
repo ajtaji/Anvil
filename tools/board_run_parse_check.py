@@ -197,6 +197,22 @@ def main() -> int:
         fail("the trace's stage word did not decode")
     checks += 3
 
+    # The monitor command language reads counts as hexadecimal, while the
+    # command-line trace length is an ordinary decimal integer.  These two
+    # examples are deliberately made of decimal digits that mean a different
+    # value when sent unchanged: 672 must be 2A0 on the wire, never 0x672.
+    if tool.monitor_hex_count(672) != "2A0":
+        fail("a 672-byte trace was not encoded as hexadecimal 2A0")
+    if tool.monitor_hex_count(640) != "280":
+        fail("a 640-byte trace was not encoded as hexadecimal 280")
+    try:
+        tool.monitor_hex_count(-1)
+    except ValueError:
+        pass
+    else:
+        fail("a negative trace count was encoded instead of refused")
+    checks += 3
+
     # ---- 7. the PNG it writes -------------------------------------------
     # WRITTEN BY HAND, so it is worth proving it is a PNG rather than
     # assuming it. Signature, an IHDR that says what the decoder said, and

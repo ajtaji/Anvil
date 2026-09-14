@@ -99,6 +99,18 @@ DEFAULT_TIMEOUT = 600.0
 DEFAULT_TRACE_BYTES = 256
 
 
+def monitor_hex_count(byte_count: int) -> str:
+    """Encode a monitor command count, whose command language is hexadecimal.
+
+    The command parser has always treated an unprefixed count as hex.  Keeping
+    this conversion named at the wire boundary prevents a decimal host length
+    such as 672 from silently becoming 0x672 (1,650) on the board.
+    """
+    if byte_count < 0:
+        raise ValueError("a monitor byte count cannot be negative")
+    return f"{byte_count:X}"
+
+
 # =====================================================================
 #  THE WIRE FORMATS, PARSED BY PURE FUNCTIONS
 # ---------------------------------------------------------------------
@@ -667,8 +679,14 @@ def run(args: argparse.Namespace) -> int:
             spec = args.trace.split(":")
             trace_addr = int(spec[0], 16)
             trace_len = int(spec[1]) if len(spec) > 1 else DEFAULT_TRACE_BYTES
-            dump = console.command(f"memory {trace_addr:X} {trace_len}", 30)
+            dump = console.command(
+                f"memory {trace_addr:X} {monitor_hex_count(trace_len)}", 30)
             blob = parse_dump(dump)
+            if len(blob) != trace_len:
+                raise StreamError(
+                    f"the monitor returned {len(blob)} trace bytes after "
+                    f"exactly {trace_len} were requested; the trace is not "
+                    "a bounded evidence record.")
             record["trace"] = {
                 "addr": f"{trace_addr:08X}",
                 "bytes": len(blob),
