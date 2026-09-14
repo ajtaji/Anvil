@@ -4,12 +4,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
+import importlib.util
 import re
 import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CRU = ROOT / "RockPi4C" / "Lib" / "cru.pbi"
+LOAD = 0x02000040
+RETURN = 0x07000000
+STACK = 0x07100000
+CRU_BASE = 0xFF760000
+CLKSEL = 0x100
+CLKGATE = 0x300
 
 
 def require(source: str, pattern: str, description: str) -> None:
@@ -60,7 +68,202 @@ def check_rate_plan(parent: int) -> None:
             )
 
 
+def load_interpreter():
+    path = ROOT / "tools" / "a64" / "a64_interp.py"
+    spec = importlib.util.spec_from_file_location("rockpi4c_cru_a64", path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load A64 interpreter from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def emitted_contract(image: Path) -> None:
+    sidecar = Path(str(image) + ".sym")
+    if not image.is_file() or not sidecar.is_file():
+        raise AssertionError(f"missing image or symbol sidecar: {image}")
+    symbols = {}
+    for line in sidecar.read_text(encoding="utf-8-sig").splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            symbols[name.lower()] = int(value, 0)
+    required = {
+        "rockcrudisplayclocks", "rockcruvpllmode", "rockcrupllrate",
+        "rockcruvpll65", "rockcruvpllset", "global_rock_cru_error",
+        "global_rock_mode_valid", "global_rock_cru_dp_core_rate",
+        "global_rock_cru_vio_aclk_rate", "global_rock_cru_vio_pclk_rate",
+        "global_rock_cru_hdcp_aclk_rate", "global_rock_cru_hdcp_hclk_rate",
+        "global_rock_cru_hdcp_pclk_rate", "global_rock_cru_vop_aclk_rate",
+        "global_rock_cru_vop_hclk_rate",
+    }
+    missing = required - symbols.keys()
+    if missing:
+        raise AssertionError(f"emitted image lacks symbols: {sorted(missing)}")
+
+    a64 = load_interpreter()
+    blob = image.read_bytes()
+    hooks = {
+        LOAD + symbols[name]: name
+        for name in ("rockcrupllrate", "rockcruvpll65", "rockcruvpllset")
+    }
+
+    class Machine:
+        def __init__(self, parent: int, stuck_ones: dict[int, int] | None = None):
+            self.parent = parent
+            self.stuck_ones = stuck_ones or {}
+            self.cru: dict[int, int] = {}
+            self.writes: list[tuple[int, int, int]] = []
+            self.cpu = a64.A64()
+            self.cpu.memory.update({LOAD + index: byte for index, byte in enumerate(blob)})
+            original_load, original_store = self.cpu.load, self.cpu.store
+
+            def load(addr: int, size: int) -> int:
+                if CRU_BASE <= addr < CRU_BASE + 0x1000:
+                    if size != 4 or addr & 3:
+                        raise AssertionError(f"bad CRU read {addr:#x}/{size}")
+                    return self.cru.get(addr - CRU_BASE, 0xFFFF)
+                return original_load(addr, size)
+
+            def store(addr: int, value: int, size: int) -> None:
+                if CRU_BASE <= addr < CRU_BASE + 0x1000:
+                    if size != 4 or addr & 3:
+                        raise AssertionError(f"bad CRU write {addr:#x}/{size}")
+                    offset = addr - CRU_BASE
+                    word = value & 0xFFFFFFFF
+                    mask = (word >> 16) & 0xFFFF
+                    data = word & 0xFFFF
+                    old = self.cru.get(offset, 0xFFFF)
+                    new = (old & ~mask) | (data & mask)
+                    new |= self.stuck_ones.get(offset, 0) & mask
+                    self.cru[offset] = new & 0xFFFF
+                    self.writes.append((offset, mask, data))
+                    return
+                original_store(addr, value, size)
+
+            self.cpu.load, self.cpu.store = load, store
+
+        def call(self, name: str) -> int:
+            cpu = self.cpu
+            cpu.pc = LOAD + symbols[name]
+            cpu.sp = STACK
+            cpu.x[30] = RETURN
+            for _ in range(500_000):
+                if cpu.pc == RETURN:
+                    return cpu.x[0]
+                hook = hooks.get(cpu.pc)
+                if hook == "rockcrupllrate":
+                    cpu.x[0] = self.parent
+                    cpu.pc = cpu.x[30]
+                elif hook in ("rockcruvpll65", "rockcruvpllset"):
+                    # PLL sequencing/rate arithmetic have their own emitted
+                    # gates.  This test owns the downstream clock contract.
+                    cpu.x[0] = 1
+                    cpu.pc = cpu.x[30]
+                else:
+                    cpu.step()
+            raise AssertionError(f"emitted {name} did not return")
+
+        def reg(self, offset: int, mask: int = 0xFFFF) -> int:
+            return self.cru.get(offset, 0xFFFF) & mask
+
+        def glob(self, name: str) -> int:
+            return self.cpu.raw_load(symbols["global_" + name], 8)
+
+    def expected(parent: int) -> tuple[dict[int, tuple[int, int]], dict[str, int]]:
+        aclk_div = divider(parent, 400_000_000)
+        aclk = parent // aclk_div
+        pclk_div = divider(aclk, 100_000_000)
+        hclk_div = divider(aclk, 200_000_000)
+        registers = {
+            CLKSEL + 42 * 4: (0xDFDF, 0x0040 | (aclk_div - 1) |
+                              0x4000 | ((aclk_div - 1) << 8)),
+            CLKSEL + 43 * 4: (0x7FFF, (pclk_div - 1) |
+                              ((hclk_div - 1) << 5) | ((pclk_div - 1) << 10)),
+            CLKSEL + 64 * 4: (0x9FDF, 0x00C0 | (divider(parent, 50_000_000) - 1)),
+            CLKSEL + 46 * 4: (0x00DF, 0x0080 | (divider(parent, 100_000_000) - 1)),
+            CLKSEL + 32 * 4: (0x9F00, 0x8000 | ((divider(parent, 200_000_000) - 1) << 8)),
+            CLKSEL + 48 * 4: (0x1FDF, 0x0080 | (aclk_div - 1) |
+                              ((hclk_div - 1) << 8)),
+            CLKSEL + 50 * 4: (0x0BFF, 0),
+        }
+        rates = {
+            "rock_cru_dp_core_rate": parent // divider(parent, 100_000_000),
+            "rock_cru_vio_aclk_rate": aclk,
+            "rock_cru_vio_pclk_rate": aclk // pclk_div,
+            "rock_cru_hdcp_aclk_rate": aclk,
+            "rock_cru_hdcp_hclk_rate": aclk // hclk_div,
+            "rock_cru_hdcp_pclk_rate": aclk // pclk_div,
+            "rock_cru_vop_aclk_rate": aclk,
+            "rock_cru_vop_hclk_rate": aclk // hclk_div,
+        }
+        return registers, rates
+
+    gate_masks = {
+        10: 0x2C40,
+        11: 0x050B,
+        13: 0x0030,
+        21: 0x0060,
+        28: 0x00F0,
+        29: 0x10B9,
+    }
+    for parent in (800_000_000, 594_000_000):
+        machine = Machine(parent)
+        if machine.call("rockcrudisplayclocks") != 1:
+            raise AssertionError(
+                f"emitted display clocks refused {parent}: error {machine.glob('rock_cru_error')}"
+            )
+        registers, rates = expected(parent)
+        for offset, (mask, value) in registers.items():
+            actual = machine.reg(offset, mask)
+            if actual != value:
+                raise AssertionError(
+                    f"{parent} CLK/SEL {offset:#x}: {actual:#x} != {value:#x} mask {mask:#x}"
+                )
+        for bank, mask in gate_masks.items():
+            actual = machine.reg(CLKGATE + bank * 4, mask)
+            if actual:
+                raise AssertionError(f"{parent} gate{bank}: enabled mask remains {actual:#x}")
+        if machine.reg(CLKGATE + 11 * 4, 1 << 12) != 1 << 12:
+            raise AssertionError("emitted code touched reserved gate11.bit12")
+        for name, value in rates.items():
+            if machine.glob(name) != value:
+                raise AssertionError(f"{parent} {name}: {machine.glob(name)} != {value}")
+
+    # A stuck CLKSEL42 parent bit must refuse before power with error 67.
+    clock42 = CLKSEL + 42 * 4
+    machine = Machine(800_000_000, {clock42: 1 << 7})
+    if machine.call("rockcrudisplayclocks") != 0 or machine.glob("rock_cru_error") != 67:
+        raise AssertionError("emitted CLKSEL42 readback did not fail closed with error 67")
+
+    # The selected-mode wrapper must independently own and verify CLKSEL50
+    # and its DCLK gate, even after initial display preparation.
+    clock50 = CLKSEL + 50 * 4
+    machine = Machine(800_000_000)
+    machine.cpu.raw_store(symbols["global_rock_mode_valid"], 1, 8)
+    if machine.call("rockcruvpllmode") != 1:
+        raise AssertionError("emitted selected-mode clock wrapper refused valid setup")
+    if machine.reg(clock50, 0x0BFF) != 0 or machine.reg(CLKGATE + 10 * 4, 0x2000):
+        raise AssertionError("emitted selected-mode wrapper did not select/enable VPLL DCLK")
+
+    machine = Machine(800_000_000, {clock50: 1 << 8})
+    machine.cpu.raw_store(symbols["global_rock_mode_valid"], 1, 8)
+    if machine.call("rockcruvpllmode") != 0 or machine.glob("rock_cru_error") != 73:
+        raise AssertionError("emitted selected-mode CLKSEL50 failure did not return error 73")
+
+    gate10 = CLKGATE + 10 * 4
+    machine = Machine(800_000_000, {gate10: 1 << 13})
+    machine.cpu.raw_store(symbols["global_rock_mode_valid"], 1, 8)
+    if machine.call("rockcruvpllmode") != 0 or machine.glob("rock_cru_error") != 74:
+        raise AssertionError("emitted selected-mode DCLK gate failure did not return error 74")
+
+    print("ROCK Pi 4C emitted CRU contract: PASS (GPLL 800/594 and refusal paths)")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image", type=Path, help="execute the exact emitted image contract")
+    args = parser.parse_args()
     source = CRU.read_text(encoding="utf-8")
 
     # The two real handoff rates accepted by the product must both produce a
@@ -126,6 +329,8 @@ def main() -> int:
     if spdif_release < release[-1]:
         raise AssertionError("SPDIF reset changed before the CDN video reset trio")
 
+    if args.image:
+        emitted_contract(args.image.resolve())
     print("ROCK Pi 4C CRU contract gate: PASS")
     return 0
 
