@@ -855,7 +855,13 @@ Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i, *sample
     avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 0, *sampled\base & $FFFFFFFF)
     avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\width << 26) & $FFFFFFFF)
     avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 8, ((*sampled\height << 8) | (1 << 22)) & $FFFFFFFF)
-    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))
+    ; The hardware texture type is RGBA8, but Vulkan B8G8R8A8's logical
+    ; channels are Z,Y,X,W relative to those stored bytes. Mesa 24.3.4's
+    ; v3dx_format_table.c:62 owns that format contract, and
+    ; v3d_translate_pipe_swizzle() maps Z,Y,X,W to hardware selectors
+    ; 4,3,2,5. XYZW here is not an equivalent byte-order choice: silicon
+    ; returns B,G,R,A to the shader and reverses red and blue.
+    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21))
     ; V3D filter bits are one for nearest and zero for linear. Mip filtering
     ; is fixed at level zero by the accepted VkSampler contract.
     k = $80

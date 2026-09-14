@@ -911,10 +911,10 @@ def grade(cpu, rc) -> Grader:
         g.need("the texture request writes T before S fires it",
                [(sampled_words[8] >> 32) & 0x3F,
                 (sampled_words[9] >> 32) & 0x3F], [34, 33])
-    g.need_bytes("the texture state carries the exact one-texel BGRA8 request",
+    g.need_bytes("the texture state carries the exact one-texel BGRA8 request and ZYXW logical swizzle",
                  blob(cpu, tex_base + OFF_TEX_STATE, 16),
                  struct.pack("<4I", texel_base, 1 << 26, (1 << 8) | (1 << 22),
-                             (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21)))
+                             (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21)))
     g.need_bytes("the sampler state carries linear-mag, nearest-min and clamp-to-edge",
                  blob(cpu, tex_base + OFF_SAMP_STATE, 8),
                  struct.pack("<2I", 0x82, (1 << 16) | (1 << 19)))
@@ -926,6 +926,9 @@ def grade(cpu, rc) -> Grader:
 
 
 MUTANTS = (
+    ("the BGRA8 texture state uses identity swizzle and returns BGR as shader RGB",
+     "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21))\n",
+     "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))\n"),
     ("the sampled texture-state width is packed in the wrong field",
      "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\\width << 26) & $FFFFFFFF)\n",
      "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\\width << 25) & $FFFFFFFF)\n"),

@@ -1,5 +1,5 @@
-; vulkanVaryingProof.pi4 - a gradient, two vertex buffers, and a
-;                          uniform-buffer descriptor, drawn by V3D.
+; vulkanVaryingProof.pi4 - varying, buffer-descriptor and sampled-image
+;                          Vulkan paths, drawn by V3D.
 ;
 ; DIAGNOSTIC. IT DOES NOT SHIP. It is an instrument, not a how-to.
 ;
@@ -15,7 +15,7 @@
 ;  shaders and that one triangle goes through the pipeline. Its second
 ;  pass gave all three vertices the SAME colour on purpose, so it proved
 ;  the varying PATH and nothing about interpolation. This proves the
-;  three things that came next, and each is a different question:
+;  four things that came next, and each is a different question:
 ;
 ;    PASS A - A UNIFORM BUFFER FEEDS THE FRAGMENT COLOUR, through the
 ;             whole descriptor path: vkCreateDescriptorSetLayout,
@@ -42,7 +42,14 @@
 ;             data across two buffers must change where the vertex
 ;             fetcher reads and nothing whatever about the picture.
 ;
-;  FIVE SPIR-V MODULES ARE ASSEMBLED WORD BY WORD, from the Khronos
+;    PASS D - A COMBINED IMAGE SAMPLER feeds the fragment colour. A
+;             separate one-texel BGRA8 image is written through mapped
+;             Vulkan memory, transitioned to shader-read layout, resolved
+;             through a closed descriptor and sampled by a real V3D TMU
+;             request. Three inside and three outside pixels, V3D job
+;             counters and fault state make the result exact.
+;
+;  SEVEN SPIR-V MODULES ARE ASSEMBLED WORD BY WORD, from the Khronos
 ;  specification's own opcode numbers, in
 ;  Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi - the same file the
 ;  triangle proof uses, and the same file tools/vulkan_pipeline_check.py
@@ -86,20 +93,19 @@
 ; ======================================================================
 ;  WHAT THE OPERATOR SHOULD SEE
 ; ======================================================================
-;  A triangle, apex up, on a blue-grey ground, held for one second:
-;  RED at the apex, GREEN at the lower left, BLUE at the lower right,
-;  blending smoothly through grey in the middle. In panel pixels the
-;  apex is at (400, 320) and the base runs from (200, 960) to (600, 960).
+;  A solid orange-yellow triangle, apex up, on a blue-grey ground, held
+;  for one second. Its exact stored colour is $FFFFC020: R=255, G=192,
+;  B=32, A=255. In panel pixels the apex is at (400, 320) and the base
+;  runs from (200, 960) to (600, 960).
 ;
-;  That is PASS C - the gradient drawn out of TWO buffers. Passes A and
-;  B are drawn into the same image first and overwritten by pass C's
-;  clear, so they are never on the glass and live only in the report.
+;  That is PASS D - the colour sampled through the combined image
+;  descriptor. Passes A, B and C are drawn into the same image first and
+;  overwritten by the following pass's clear, so they live in the report.
 ;
-;  AN OPERATOR WHO SEES A SOLID MAGENTA TRIANGLE has watched a run where
-;  pass B and pass C did not happen, and slot 125 says which step
-;  stopped it. An operator who sees a solid triangle of any one colour
-;  where a gradient was expected is looking at the defect this run
-;  exists to find.
+;  AN OPERATOR WHO SEES A GRADIENT OR SOLID MAGENTA TRIANGLE has watched
+;  a run where pass D did not replace the previous pass, and slot 125 says
+;  which step stopped it. A sampled triangle with red and blue exchanged
+;  is $FF20C0FF and is a texture-state swizzle defect, not a pass.
 ;
 ; ======================================================================
 ;  BEFORE RUNNING IT
@@ -127,18 +133,18 @@
 ; ======================================================================
 ;  THE REPORT, AND HOW TO READ IT
 ; ======================================================================
-;  x0 comes back as the address of ONE HUNDRED AND TWENTY-EIGHT 32-BIT
-;  WORDS - 512 bytes. ONE SLOT IS ONE WORD, so the slot number below is
+;  x0 comes back as the address of ONE HUNDRED AND SIXTY 32-BIT WORDS -
+;  640 bytes. ONE SLOT IS ONE WORD, so the slot number below is
 ;  the word number in the dump. Read it with
 ;
-;      md.l <x0> 200
+;      md.l <x0> 280
 ;
 ;  and NOT with a bare `md`: the dump's count is in BYTES whichever
-;  width is chosen, so 200 hex is 512 bytes is 128 words, and a bare
+;  width is chosen, so 280 hex is 640 bytes is 160 words, and a bare
 ;  `md` groups by one byte. $200 is written in hex because every
 ;  argument of that command is.
 ;
-;  Slot 0 is $59524156 ("VARY") and slot 127 is $56415259, the same four
+;  Slot 0 is $59524156 ("VARY") and slot 159 is $56415259, the same four
 ;  letters backwards. A dump that does not show BOTH did not show the
 ;  whole report, and the verdicts near the end of it were not read.
 ;
@@ -242,9 +248,27 @@
 ;   122  descriptor fragment stream word 1: TMU general vec4 config
 ;   123  descriptor fragment stream word 2: TLB config
 ;   124  descriptor GPU-lowering evidence verdict, 1
-;   125  HIGHEST STEP REACHED, 1 to 12
-;   126  report length in bytes, 512
-;   127  tail magic $56415259
+;   125  HIGHEST STEP REACHED, 1 to 13
+;   126  report length in bytes, 640
+;   127  reserved
+;   128  PASS D VERDICT - combined image sampler
+;   129  sampled image address
+;   130  sampled pipeline code base
+;   131  sampled draw submit result
+;   132  sampled draw fence-wait result
+; 133..135  sampled pass inside pixels
+; 136..138  sampled pass outside pixels
+;   139  sampled fragment-program bytes
+; 140..142  texture-state, sampler-state and TLB uniform words
+; 143..146  texture base, width, height and format/swizzle state words
+; 147..148  sampler-state words
+; 149..150  bin jobs before and after sampled draw
+; 151..152  render jobs before and after sampled draw
+; 153..155  sampled draw MMU faults, bin OOM and native backend error
+;   156  sampled failure detail
+;   157  sampled shader-record address
+;   158  total backend draws after sampled pass
+;   159  tail magic $56415259
 ;
 ;  THE PROBE PIXELS, in panel coordinates:
 ;    0 (400, 346)  inset from the apex          - red dominant
@@ -258,8 +282,8 @@
 ;    (100, 100), (700, 1200), (400, 200)
 ;
 ;  SLOT 125 IS THE ONE TO READ FIRST when anything is wrong. It is the
-;  number of the step that was running, 1 to 12, and 12 means the whole
-;  payload ran including the present.
+;  number of the step that was running, 1 to 13, and 13 means the whole
+;  payload ran including present, teardown and final whole-run checks.
 ;
 ;  THE EXPECTED BYTES. VK_FORMAT_B8G8R8A8_UNORM stores B, G, R, A in
 ;  ascending byte order, so a 32-bit word read on this little-endian
