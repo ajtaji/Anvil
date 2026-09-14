@@ -5,7 +5,7 @@
 XIncludeFile "../vk_ir_v3d42.pi4"
 
 #LG_MAGIC = $49523432
-#LG_CASES = 14
+#LG_CASES = 18
 Global Dim lgTypes.AvkIrType[20]
 Global Dim lgConstants.AvkIrConstant[12]
 Global Dim lgVariables.AvkIrVariable[12]
@@ -14,8 +14,8 @@ Global Dim lgBlocks.AvkIrBlock[2]
 Global Dim lgNodes.AvkIrNode[20]
 Global Dim lgInputs.AvkIrV3d42Io[4]
 Global Dim lgOutputs.AvkIrV3d42Io[4]
-Global Dim lgCode.i[2048]
-Global Dim lgUniform.l[1024]
+Global Dim lgCode.i[4096]
+Global Dim lgUniform.l[2048]
 Global Dim lgReport.i[512]
 Global lgChecks.i = 0
 Global lgFails.i = 0
@@ -223,6 +223,74 @@ Procedure lgArithmetic(*m.AvkIrModule, lanes.i, operation.i)
   lgNode(4,0,253,#ANVIL_IR_OP_RETURN,0,0)
 EndProcedure
 
+; Two exact constants are lowered before a deliberately consumed VPM load.
+; This makes the constant uniform destinations RF0 upward as the independent
+; vertex decoder requires, while the eight cases above separately prove the
+; complete LDVPM -> arithmetic -> STVPM path. Distinct scalar words prove both
+; uniform-stream order and the register each arithmetic lane consumes.
+Procedure lgArithmeticConstant(*m.AvkIrModule, lanes.i, operation.i)
+  Protected resultType.i
+  Protected opcode.i
+  Protected k.i
+  lgZero():lgBase(*m)
+  *m\stage=#ANVIL_IR_STAGE_VERTEX
+  *m\typeCount=6:*m\functionTypeId=6
+  *m\variableCount=2:*m\decorationCount=2:*m\blockCount=1:*m\nodeCount=4
+  lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
+  lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=4
+  If lanes=1
+    resultType=2
+  Else
+    resultType=3
+  EndIf
+  lgType(3,4,32,#ANVIL_IR_TYPE_POINTER):lgTypes[3]\storageClass=1:lgTypes[3]\pointeeType=resultType
+  lgType(4,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[4]\storageClass=3:lgTypes[4]\pointeeType=resultType
+  lgType(5,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[5]\returnType=1
+  lgVariables[0]\sourceId=10:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=4:lgVariables[0]\storageClass=1
+  lgVariables[1]\sourceId=15:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=5:lgVariables[1]\storageClass=3
+  lgDecorations[0]\sourceId=10:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=7
+  lgDecorations[1]\sourceId=15:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=7
+  If lanes=1
+    *m\constantCount=2
+    lgConstants[0]\sourceId=40:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2
+    lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3FC00000
+    lgConstants[1]\sourceId=41:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2
+    lgConstants[1]\wordCount=1:lgConstants[1]\word0=$3F000000
+  Else
+    *m\constantCount=10
+    lgConstants[0]\sourceId=40:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2:lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3F800000
+    lgConstants[1]\sourceId=41:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$40000000
+    lgConstants[2]\sourceId=42:lgConstants[2]\sourceOpcode=43:lgConstants[2]\typeId=2:lgConstants[2]\wordCount=1:lgConstants[2]\word0=$40800000
+    lgConstants[3]\sourceId=43:lgConstants[3]\sourceOpcode=43:lgConstants[3]\typeId=2:lgConstants[3]\wordCount=1:lgConstants[3]\word0=$41000000
+    lgConstants[4]\sourceId=44:lgConstants[4]\sourceOpcode=44:lgConstants[4]\typeId=3
+    lgConstants[4]\componentCount=4:lgConstants[4]\component0=40:lgConstants[4]\component1=41
+    lgConstants[4]\component2=42:lgConstants[4]\component3=43
+    lgConstants[5]\sourceId=45:lgConstants[5]\sourceOpcode=43:lgConstants[5]\typeId=2:lgConstants[5]\wordCount=1:lgConstants[5]\word0=$3F000000
+    lgConstants[6]\sourceId=46:lgConstants[6]\sourceOpcode=43:lgConstants[6]\typeId=2:lgConstants[6]\wordCount=1:lgConstants[6]\word0=$3E800000
+    lgConstants[7]\sourceId=47:lgConstants[7]\sourceOpcode=43:lgConstants[7]\typeId=2:lgConstants[7]\wordCount=1:lgConstants[7]\word0=$3E000000
+    lgConstants[8]\sourceId=48:lgConstants[8]\sourceOpcode=43:lgConstants[8]\typeId=2:lgConstants[8]\wordCount=1:lgConstants[8]\word0=$3D800000
+    lgConstants[9]\sourceId=49:lgConstants[9]\sourceOpcode=44:lgConstants[9]\typeId=3
+    lgConstants[9]\componentCount=4:lgConstants[9]\component0=45:lgConstants[9]\component1=46
+    lgConstants[9]\component2=47:lgConstants[9]\component3=48
+  EndIf
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=4
+  If operation=#ANVIL_IR_OP_FADD
+    opcode=#ANVIL_IR_SPV_FADD
+  Else
+    opcode=#ANVIL_IR_SPV_FMUL
+  EndIf
+  lgNode(0,32,opcode,operation,resultType,2):lgNodes[0]\operand0=40
+  If lanes=1
+    lgNodes[0]\operand1=41
+  Else
+    lgNodes[0]\operand0=44:lgNodes[0]\operand1=49
+  EndIf
+  lgNode(1,30,61,#ANVIL_IR_OP_LOAD,resultType,1):lgNodes[1]\operand0=10
+  lgNode(2,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[2]\operand0=15:lgNodes[2]\operand1=32
+  lgNode(3,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
 Procedure lgTarget(*t.AvkIrV3d42Target, targetIndex.i, targetRole.i, inputId.i, inputComps.i, outputId.i, outputComps.i)
   Protected clearOffset.i
   clearOffset=0
@@ -346,6 +414,26 @@ Procedure.i Main()
     lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
     caseIndex=caseIndex+1
     lanes=lanes+1
+  Wend
+
+  ; Constant operands: scalar and vec4, for both exact operations.
+  lanes=1
+  While lanes<=4
+    operation=#ANVIL_IR_OP_FADD
+    lgArithmeticConstant(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,10,lanes,15,lanes):t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=(lanes*2))
+    caseIndex=caseIndex+1
+    operation=#ANVIL_IR_OP_FMUL
+    lgArithmeticConstant(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,10,lanes,15,lanes):t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=(lanes*2))
+    caseIndex=caseIndex+1
+    lanes=lanes+3
   Wend
   lgPass(@m,2):lgTarget(@t,5,1,10,4,11,4)
   t\tlbConfig=0

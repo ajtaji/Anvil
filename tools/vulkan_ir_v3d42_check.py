@@ -26,6 +26,14 @@ MUTANTS=(
  ('relaxed precision accepted','If *d\\kind = #ANVIL_IR_DEC_RELAXED_PRECISION','If *d\\kind = 99'),
  ('FAdd replaced by integer OR','V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B','V3dQpuAdd2(#V3DQ_A_OR, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B'),
  ('FMul replaced by SMul24','V3dQpuMul(#V3DQ_M_FMUL, first + k','V3dQpuMul(#V3DQ_M_SMUL24, first + k'),
+ ('FAdd destination made magic','V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B','V3dQpuAdd2(#V3DQ_A_FADD, first + k, 1, #V3DQ_MUX_A, #V3DQ_MUX_B'),
+ ('FAdd mux A replaced by mux B','V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B','V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_B, #V3DQ_MUX_B'),
+ ('FMul destination made magic','V3dQpuMul(#V3DQ_M_FMUL, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)','V3dQpuMul(#V3DQ_M_FMUL, first + k, 1, #V3DQ_MUX_A, #V3DQ_MUX_B)'),
+ ('FMul mux A replaced by mux B','V3dQpuMul(#V3DQ_M_FMUL, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)','V3dQpuMul(#V3DQ_M_FMUL, first + k, 0, #V3DQ_MUX_B, #V3DQ_MUX_B)'),
+ ('LDVPM input slot shifted','V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, reg, #V3DQ_MUX_A, slot)','V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, reg, #V3DQ_MUX_A, slot + 1)'),
+ ('STVPM output slot shifted','V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot, reg)','V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot + 1, reg)'),
+ ('constant uniform word changed','avk42AppendUniform(*c\\word0)','avk42AppendUniform(*c\\word0 + 1)'),
+ ('constant load register shifted','V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first, 0)','V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first + 1, 0)'),
 )
 
 def locate(explicit,env,fallback):
@@ -57,13 +65,14 @@ def execute(a64,img):
   c.step()
  raise SystemExit('IR V3D42 fixture timeout')
 def q(c,a): return sum(c.memory.get(a+i,0)<<(8*i) for i in range(8))
+def u32(c,a): return sum(c.memory.get(a+i,0)<<(8*i) for i in range(4))
 def blob(c,a,n): return bytes(c.memory.get(a+i,0) for i in range(n))
 def grade(c,r):
  bad=[]
  if q(c,r+500*8)!=MAGIC:return 0,['bad report magic']
  checks=q(c,r+501*8); fails=q(c,r+502*8)
  if fails: bad.append(f'{fails} of {checks} emitted checks failed: '+','.join(str(i+1) for i in range(checks) if q(c,r+(256+i)*8)==0))
- roles=('vertex','fragment:varying','fragment:flat','fragment:uniform','fragment:sampled','vertex')+('vertex',)*8
+ roles=('vertex','fragment:varying','fragment:flat','fragment:uniform','fragment:sampled','vertex')+('vertex',)*12
  words=0
  for i,role in enumerate(roles):
   b=i*8;rc=q(c,r+b*8);addr=q(c,r+(b+1)*8);size=q(c,r+(b+2)*8);un=q(c,r+(b+4)*8)
@@ -71,13 +80,38 @@ def grade(c,r):
   try:
     ins=verify_program(blob(c,addr,size),ProgramContract(f'ir42/{i}',role,un));words+=len(ins)
     if i>=6:
-     lanes=(i-6)//2+1; is_add=((i-6)&1)==0
+     is_const=i>=14
+     lanes=(1 if i<16 else 4) if is_const else (i-6)//2+1
+     is_add=((i-6)&1)==0
      ar=[x for x in ins if x.add_op=='fadd/faddnf'] if is_add else [x for x in ins if x.mul_op=='fmul']
      if len(ar)!=lanes:raise ValueError(f'ir42/{i}: expected {lanes} arithmetic words, got {len(ar)}')
      dest=[x.add_waddr if is_add else x.mul_waddr for x in ar]
      if dest!=list(range(2*lanes,3*lanes)):raise ValueError(f'ir42/{i}: arithmetic destinations {dest}')
-     if any({x.raddr_a,x.raddr_b}!={lane,lanes+lane} for lane,x in enumerate(ar)):raise ValueError(f'ir42/{i}: arithmetic operands are not the paired VPM inputs')
-     if is_add and any(((x.word>>24)&255)!=5 or x.add_mux_a!=6 or x.add_mux_b!=7 for x in ar):raise ValueError(f'ir42/{i}: FAdd ordering/opcode is not exact')
+     if any(x.raddr_a!=lane or x.raddr_b!=lanes+lane for lane,x in enumerate(ar)):raise ValueError(f'ir42/{i}: arithmetic operand order is not exact')
+     if is_add and any(((x.word>>24)&255)!=5 or x.add_magic or x.add_mux_a!=6 or x.add_mux_b!=7 for x in ar):raise ValueError(f'ir42/{i}: FAdd encoding is not exact')
+     if not is_add and any(((x.word>>58)&63)!=21 or x.mul_magic or x.mul_mux_a!=6 or x.mul_mux_b!=7 for x in ar):raise ValueError(f'ir42/{i}: FMul encoding is not exact')
+     constant_loads=[x for x in ins if 'ldunifrf' in x.signals]
+     if is_const:
+      if [x.index for x in constant_loads]!=list(range(2*lanes)):raise ValueError(f'ir42/{i}: constant loads are not the first contiguous phase')
+      if [x.signal_addr for x in constant_loads]!=list(range(2*lanes)):raise ValueError(f'ir42/{i}: constant load registers are not exact')
+      expected=[0x3fc00000,0x3f000000] if lanes==1 else [0x3f800000,0x40000000,0x40800000,0x41000000,0x3f000000,0x3e800000,0x3e000000,0x3d800000]
+      actual=[u32(c,q(c,r+(b+3)*8)+(4*k)) for k in range(un)]
+      if actual!=expected:raise ValueError(f'ir42/{i}: uniform words {actual!r}')
+     elif constant_loads:raise ValueError(f'ir42/{i}: unexpected constant uniform loads')
+     ar_start=2*lanes
+     if [x.index for x in ar]!=list(range(ar_start,ar_start+lanes)):raise ValueError(f'ir42/{i}: arithmetic is not the third contiguous phase')
+     ld=[x for x in ins if x.add_op=='ldvpmv_in']
+     if len(ld)!=(lanes if is_const else 2*lanes):raise ValueError(f'ir42/{i}: wrong LDVPM lane count')
+     ld_start=3*lanes if is_const else 0
+     if [x.index for x in ld]!=list(range(ld_start,ld_start+len(ld))):raise ValueError(f'ir42/{i}: LDVPM phase is not contiguous/in order')
+     if any(x.add_waddr!=(3*lanes+lane if is_const else lane) or x.add_magic or x.add_mux_a!=6 or x.add_mux_b!=0 or x.raddr_a!=lane for lane,x in enumerate(ld)):raise ValueError(f'ir42/{i}: LDVPM destination/slot order is not exact')
+     st=[x for x in ins if x.add_op=='stvpmv']
+     st_start=4*lanes if is_const else 3*lanes
+     if [x.index for x in st]!=list(range(st_start,st_start+lanes)):raise ValueError(f'ir42/{i}: STVPM phase is not contiguous/in order')
+     if any(x.add_waddr!=0 or x.add_magic or x.add_mux_a!=6 or x.add_mux_b!=7 or x.raddr_a!=lane or x.raddr_b!=2*lanes+lane for lane,x in enumerate(st)):raise ValueError(f'ir42/{i}: STVPM source/slot order is not exact')
+     waits=[x for x in ins if x.add_op=='vpmwt']
+     wait_index=5*lanes if is_const else 4*lanes
+     if len(waits)!=1 or waits[0].index!=wait_index:raise ValueError(f'ir42/{i}: VPM wait does not follow the final store')
   except Exception as e: bad.append(f'case {i} decoder: {e}')
  return checks,bad+[f'__WORDS__={words}']
 def sourcecheck(text):

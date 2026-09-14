@@ -41,8 +41,15 @@ Scalar constants used by a represented composite can be materialized from the
 uniform stream. The focused proof does not claim a separate constant-colour
 fragment family; its independently decoded families are vertex VPM, fragment
 varying, push constant, uniform buffer, sampled image, and the vertex
-construct/extract fixture, plus both arithmetic operations at scalar, vec2,
-vec3, and vec4 widths.
+construct/extract fixture. Arithmetic coverage pins both operations at scalar,
+vec2, vec3, and vec4 widths with two VPM operands, plus scalar and vec4 cases
+whose two operands are exact constants. The independent decoder checks the
+raw FADD and FMUL opcodes, muxes, non-magic destinations, ordered LDVPM input
+slots, ALU lanes, ordered STVPM output slots, and the final VPM wait. Constant
+cases additionally check each LDUNIFRF destination and every uniform word in
+stream order. V3D 4.2 embeds pack/unpack choice in these selected arithmetic
+opcode forms rather than exposing a separate pack/unpack field; checking the
+complete raw opcode/mux/magic tuple pins the admitted no-conversion form.
 
 V3D encodings and scheduling follow the locally pinned Mesa sources cited in
 `RaspberryPi4/Lib/v3dqpu.pi4`: `qpu_pack.c`, `qpu_instr.c`,
