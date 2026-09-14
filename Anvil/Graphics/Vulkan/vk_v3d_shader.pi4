@@ -70,6 +70,7 @@
 ;      (triangle rasterisation and the fragment output)
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_ir_v3d42.pi4"
 
 ; ----------------------------------------------------------------------
 ;  THE PIPELINE'S DEVICE MEMORY. One page of code and one of everything
@@ -133,6 +134,18 @@ Global Dim avkqColourSrc.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqCsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqVsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqFsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsUniformWords.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushFirst.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushR.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushG.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushB.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushA.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsUniformAddress.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsUniformConfig.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsTextureState.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsSamplerState.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsTlbConfig.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqIrLive.a[193]
 Global avkqError.i = 0
 Global avkqStage.i = 0
 
@@ -144,6 +157,71 @@ EndProcedure
 ; and not just a number.
 Procedure.i AnvilVkV3dShaderStage()
   ProcedureReturn avkqStage
+EndProcedure
+
+Procedure.i avkqIrDecoration(*m.AvkIrModule, id.i, kind.i)
+  Define i.i
+  Define *d.AvkIrDecoration
+  i = 0
+  While i < *m\decorationCount
+    *d = avkIrDecorationAt(*m, i)
+    If *d\sourceId = id And *d\member = -1 And *d\kind = kind
+      ProcedureReturn *d\value
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i avkqIrVariableComponents(*m.AvkIrModule, *v.AvkIrVariable)
+  Define *p.AvkIrType
+  If *v = 0 : ProcedureReturn 0 : EndIf
+  *p = avkIrFindType(*m, *v\pointerType)
+  If *p = 0 Or *p\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkIrFloatLanes(*m, *p\pointeeType)
+EndProcedure
+
+; Reconstruct Store-root SSA liveness from the pipeline's immutable typed IR.
+; This is deliberately private to the backend: it must not depend on mutable
+; scratch from shader-module summary, and dead declarations are not executable
+; fragment inputs.
+Procedure avkqIrBuildLive(*m.AvkIrModule, rootId.i)
+  Define i.i
+  Define k.i
+  Define changed.i
+  Define id.i
+  Define *n.AvkIrNode
+  i=0
+  While i<193:avkqIrLive[i]=0:i=i+1:Wend
+  If rootId>0 And rootId<193:avkqIrLive[rootId]=1:EndIf
+  changed=1
+  While changed<>0
+    changed=0:i=0
+    While i<*m\nodeCount
+      *n=avkIrNodeAt(*m,i)
+      If *n\sourceId>0 And *n\sourceId<193 And avkqIrLive[*n\sourceId]<>0
+        k=0
+        While k<*n\operandCount
+          id=avkIrOperand(*n,k)
+          If id>0 And id<193 And avkqIrLive[id]=0
+            avkqIrLive[id]=1:changed=1
+          EndIf
+          k=k+1
+        Wend
+      EndIf
+      i=i+1
+    Wend
+  Wend
+EndProcedure
+
+Procedure avkqClearFragmentMetadata(pipe.i)
+  avkqFsUniformWords[pipe] = 0
+  avkqFsPushFirst[pipe] = -1
+  avkqFsPushR[pipe] = -1 : avkqFsPushG[pipe] = -1
+  avkqFsPushB[pipe] = -1 : avkqFsPushA[pipe] = -1
+  avkqFsUniformAddress[pipe] = -1 : avkqFsUniformConfig[pipe] = -1
+  avkqFsTextureState[pipe] = -1 : avkqFsSamplerState[pipe] = -1
+  avkqFsTlbConfig[pipe] = -1
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -673,22 +751,52 @@ EndProcedure
 ; writes memory; the engine is not consulted and no register is read.
 ; Whether a device exists at all was settled by avkBackendPrepare long
 ; before any pipeline could be created.
-Procedure.i AnvilVkV3dCompile(pipe.i, base.i, bytes.i)
+Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
   Define r.i
+  Define pipe.i
+  Define base.i
+  Define bytes.i
   Define inSlots.i
   Define varyComps.i
   Define halfW.i
   Define halfH.i
   Define kcount.i
+  Define i.i
+  Define location.i
+  Define components.i
+  Define firstSlot.i
+  Define inputCount.i
+  Define outputCount.i
+  Define valueId.i
+  Define outputVariableId.i
+  Define outputMember.i
+  Define *ir.AvkIrModule
+  Define *variable.AvkIrVariable
+  Define *node.AvkIrNode
+  Define target.AvkIrV3d42Target
+  Define result.AvkIrV3d42Result
+  Dim inputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
+  Dim outputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
 
   avkqError = 0
   avkqStage = 0
+  If *build = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  pipe = *build\pipeline
+  base = *build\base
+  bytes = *build\bytes
+  *ir = *build\fragmentIr
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
   If base <= 0 Or (base % 4096) <> 0 Or bytes < #AVKQ_BYTES
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
+  If *ir = 0 Or *ir\stage <> #ANVIL_IR_STAGE_FRAGMENT
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 QPU compiler was not given the verified fragment typed IR module from the current synchronous pipeline-build transaction (Anvil code -20001, invalid shader transaction); no pipeline was created.")
+  EndIf
+  avkqClearFragmentMetadata(pipe)
   inSlots = avkqTotalComponents(pipe)
   varyComps = avkqVaryingComponents(pipe)
   If inSlots < 2 Or inSlots > #AVKQ_MAX_RECORDS
@@ -699,13 +807,13 @@ Procedure.i AnvilVkV3dCompile(pipe.i, base.i, bytes.i)
     avkqStage = 2
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given other than zero, two or four varying components (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. Flat colour uses none, a sampled image uses one vec2 and interpolated colour uses one vec4.")
   EndIf
-  If varyComps = 4 And AnvilVkPipelineColourSource(pipe) <> #ANVIL_SPV_COLOUR_VARYING
+  If varyComps > 0 And AnvilVkPipelineUsesVarying(pipe) = 0
     avkqStage = 3
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given a pipeline whose vertex shader writes a varying its fragment shader does not read (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. An interpolated varying that nothing consumes would be written into the VPM and thrown away.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a pipeline whose vertex shader writes a varying its fragment shader does not read (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. An interpolated varying that nothing consumes would be written into the VPM and thrown away.")
   EndIf
-  If varyComps = 2 And AnvilVkPipelineColourSource(pipe) <> #ANVIL_SPV_COLOUR_SAMPLED
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0 And varyComps <> 2
     avkqStage = 3
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given a two-component varying that is not the sampled image's texture coordinate (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. This bounded shader lowering consumes one whole vec2 coordinate and implements no other vec2 fragment operation.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a sampled-image fragment graph without exactly one vec2 varying coordinate (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. This bounded texture path consumes one whole two-component input.")
   EndIf
 
   ; The viewport's half extent, in eighths of a pixel, which is the unit
@@ -734,11 +842,81 @@ Procedure.i AnvilVkV3dCompile(pipe.i, base.i, bytes.i)
     ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU emitter could not encode the vertex shader (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. AnvilVkV3dShaderError() carries the encoder's own code.")
   EndIf
   avkqStage = 7
-  r = avkqEmitFragment(pipe, base, AnvilVkPipelineColourSource(pipe))
-  avkqFsBytes[pipe] = V3dQpuProgramBytes()
-  If r <> #V3DQ_OK
+  i=0:valueId=0:outputVariableId=0
+  While i<*ir\nodeCount
+    *node=avkIrNodeAt(*ir,i)
+    If *node\kind=#ANVIL_IR_OP_STORE
+      valueId=*node\operand1
+      outputMember=-1
+      avk42PointerSelection(*ir,*node\operand0,@outputVariableId,@outputMember)
+    EndIf
+    i=i+1
+  Wend
+  avkqIrBuildLive(*ir,valueId)
+  i = 0
+  While i < *ir\variableCount
+    *variable = avkIrVariableAt(*ir, i)
+    location = avkqIrDecoration(*ir, *variable\sourceId, #ANVIL_IR_DEC_LOCATION)
+    If location >= 0
+      components = avkqIrVariableComponents(*ir, *variable)
+      If components < 1 Or location >= #ANVIL_IR_V3D42_MAX_IO
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not map a fragment interface variable into its bounded typed-IR input/output table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created.")
+      EndIf
+      If *variable\storageClass = #ANVIL_IR_STORAGE_INPUT And avkqIrLive[*variable\sourceId] <> 0
+        inputs[location]\variableId = *variable\sourceId
+        inputs[location]\member = -1
+        inputs[location]\components = components
+        If inputCount < location + 1 : inputCount = location + 1 : EndIf
+      ElseIf *variable\storageClass = #ANVIL_IR_STORAGE_OUTPUT And *variable\sourceId = outputVariableId
+        outputs[location]\variableId = *variable\sourceId
+        outputs[location]\member = -1
+        outputs[location]\components = components
+        If outputCount < location + 1 : outputCount = location + 1 : EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  firstSlot = 0 : i = 0
+  While i < inputCount
+    inputs[i]\firstSlot = firstSlot
+    firstSlot = firstSlot + inputs[i]\components
+    i = i + 1
+  Wend
+  outputs[0]\firstSlot = 0
+  target\role = #ANVIL_IR_V3D42_ROLE_FRAGMENT
+  target\codeBase = base + #AVKQ_OFF_FS_CODE
+  target\codeCapacity = #AVKQ_CODE_SLOT
+  target\uniformBase = base + #AVKQ_OFF_UNIF_FS
+  target\uniformCapacity = #AVKQ_OFF_DEFAULTS - #AVKQ_OFF_UNIF_FS
+  target\inputCount = inputCount
+  If inputCount > 0 : target\inputs = @inputs[0] : EndIf
+  target\outputCount = outputCount
+  If outputCount > 0 : target\outputs = @outputs[0] : EndIf
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0 : target\pushWordCount = 4 : EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0 : target\uniformBlockAddress = 4 : EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    target\textureStateAddress = base + #AVKQ_OFF_TEX_STATE
+    target\samplerStateAddress = base + #AVKQ_OFF_SAMP_STATE
+  EndIf
+  target\tlbConfig = #AVKQ_TLB_CONF
+  r = AnvilVkIrV3d42Lower(*ir, @target, @result)
+  avkqFsBytes[pipe] = result\codeBytes
+  If r <> #ANVIL_IR_V3D42_OK
     avkqError = r
-    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU emitter could not encode the fragment shader (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. AnvilVkV3dShaderError() carries the encoder's own code.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not lower the verified fragment typed IR into an exact V3D 4.2 program (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. AnvilVkIrV3d42Error(), SourceId(), SourceOpcode() and Stage() identify the unsupported semantic operation or layout.")
+  EndIf
+  avkqFsUniformWords[pipe] = result\uniformWords
+  avkqFsPushFirst[pipe] = result\pushFirstWord
+  avkqFsPushR[pipe] = result\pushRWord : avkqFsPushG[pipe] = result\pushGWord
+  avkqFsPushB[pipe] = result\pushBWord : avkqFsPushA[pipe] = result\pushAWord
+  avkqFsUniformAddress[pipe] = result\uniformAddressWord
+  avkqFsUniformConfig[pipe] = result\uniformConfigWord
+  avkqFsTextureState[pipe] = result\textureStateWord
+  avkqFsSamplerState[pipe] = result\samplerStateWord
+  avkqFsTlbConfig[pipe] = result\tlbConfigWord
+  If avkqFragmentMetadataValid(pipe) = 0
+    avkqError = #ANVIL_IR_V3D42_ERR_LAYOUT
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU compiler returned an inconsistent fragment uniform layout (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. Every required patch index must be distinct and inside the retained stream, and absent resources must own no patch index.")
   EndIf
 
   avkqStage = 8
@@ -773,6 +951,7 @@ Procedure AnvilVkV3dRelease(pipe.i)
   EndIf
   avkqBase[pipe] = 0
   avkqRecords[pipe] = 0
+  avkqClearFragmentMetadata(pipe)
 EndProcedure
 
 ; Where a compiled pipeline's memory is, how many attribute records it
@@ -817,33 +996,169 @@ Procedure.i AnvilVkV3dProgramBytes(pipe.i, which.i)
   ProcedureReturn 0
 EndProcedure
 
+Procedure.i AnvilVkV3dFragmentUniformWords(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqFsUniformWords[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushFirstWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushFirst[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushRWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushR[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushGWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushG[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushBWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushB[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushAWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushA[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentUniformAddressWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsUniformAddress[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentUniformConfigWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsUniformConfig[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentTextureStateWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsTextureState[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentSamplerStateWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsSamplerState[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentTlbConfigWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsTlbConfig[pipe]
+EndProcedure
+
+; Validate the entire lowerer-returned stream ABI before changing one draw
+; word. Required features own exact, distinct in-range indices; absent
+; features own none. Stale or corrupted metadata is therefore a refusal.
+Procedure.i avkqFragmentMetadataValid(pipe.i)
+  Define words.i
+  Define count.i
+  Define i.i
+  Define k.i
+  Dim index.i[8]
+  words = avkqFsUniformWords[pipe]
+  If words < 1 Or words > ((#AVKQ_OFF_DEFAULTS - #AVKQ_OFF_UNIF_FS) / 4)
+    ProcedureReturn 0
+  EndIf
+  If avkqFsTlbConfig[pipe] < 0 : ProcedureReturn 0 : EndIf
+  index[count] = avkqFsTlbConfig[pipe] : count = count + 1
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0
+    If avkqFsPushFirst[pipe] < 0 Or avkqFsPushR[pipe] < 0 Or avkqFsPushG[pipe] < 0 Or avkqFsPushB[pipe] < 0 Or avkqFsPushA[pipe] < 0 : ProcedureReturn 0 : EndIf
+    If avkqFsPushFirst[pipe] >= words : ProcedureReturn 0 : EndIf
+    If avkqFsPushFirst[pipe] > avkqFsPushR[pipe] Or avkqFsPushFirst[pipe] > avkqFsPushG[pipe] Or avkqFsPushFirst[pipe] > avkqFsPushB[pipe] Or avkqFsPushFirst[pipe] > avkqFsPushA[pipe] : ProcedureReturn 0 : EndIf
+    If avkqFsPushFirst[pipe] <> avkqFsPushR[pipe] And avkqFsPushFirst[pipe] <> avkqFsPushG[pipe] And avkqFsPushFirst[pipe] <> avkqFsPushB[pipe] And avkqFsPushFirst[pipe] <> avkqFsPushA[pipe] : ProcedureReturn 0 : EndIf
+    index[count] = avkqFsPushR[pipe] : count = count + 1
+    index[count] = avkqFsPushG[pipe] : count = count + 1
+    index[count] = avkqFsPushB[pipe] : count = count + 1
+    index[count] = avkqFsPushA[pipe] : count = count + 1
+  ElseIf avkqFsPushFirst[pipe] <> -1 Or avkqFsPushR[pipe] <> -1 Or avkqFsPushG[pipe] <> -1 Or avkqFsPushB[pipe] <> -1 Or avkqFsPushA[pipe] <> -1
+    ProcedureReturn 0
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+    If avkqFsUniformAddress[pipe] < 0 Or avkqFsUniformConfig[pipe] < 0 : ProcedureReturn 0 : EndIf
+    index[count] = avkqFsUniformAddress[pipe] : count = count + 1
+    index[count] = avkqFsUniformConfig[pipe] : count = count + 1
+  ElseIf avkqFsUniformAddress[pipe] <> -1 Or avkqFsUniformConfig[pipe] <> -1
+    ProcedureReturn 0
+  EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    If avkqFsTextureState[pipe] < 0 Or avkqFsSamplerState[pipe] < 0 : ProcedureReturn 0 : EndIf
+    index[count] = avkqFsTextureState[pipe] : count = count + 1
+    index[count] = avkqFsSamplerState[pipe] : count = count + 1
+  ElseIf avkqFsTextureState[pipe] <> -1 Or avkqFsSamplerState[pipe] <> -1
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < count
+    If index[i] < 0 Or index[i] >= words : ProcedureReturn 0 : EndIf
+    k = i + 1
+    While k < count
+      If index[i] = index[k] : ProcedureReturn 0 : EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
 ; ----------------------------------------------------------------------
-;  The fragment uniform stream for one draw.
-;
-;  Flat: blue, green, red, alpha and then the tile-buffer configuration
-;  word, which the TLBU write pulls by itself. Interpolated: the
-;  configuration word alone. Descriptor: the resolved buffer address,
-;  the TMU general vec4-load configuration and the TLB configuration.
-;  The processor never reads or copies the descriptor's four values.
+;  Patch the fragment uniform stream for one draw. Pipeline creation already
+;  emitted every immutable word. Dynamic push, UBO and sampled-image values
+;  are written only through indices returned by the typed IR lowerer; this
+;  procedure never reconstructs a positional stream layout or channel order.
 ; ----------------------------------------------------------------------
-Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i, *sampled.AnvilVkBackendSampledImage)
+Procedure.i AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, uniformBase.i, *sampled.AnvilVkBackendSampledImage)
   Define r.i
   Define g.i
   Define b.i
   Define a.i
   Define k.i
-  If colourSrc = #ANVIL_SPV_COLOUR_VARYING
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS, #AVKQ_TLB_CONF)
-    ProcedureReturn
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or base <= 0 Or (base & 7) <> 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If colourSrc = #ANVIL_SPV_COLOUR_UNIFORM And *push <> 0
-    ; `*push` is the descriptor's resolved GPU-visible address. Keep it
-    ; in the stream: the QPU dereferences it through the TMU.
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, *push & $FFFFFFFF)
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, #AVKQ_TMU_LOAD_VEC4)
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 8, #AVKQ_TLB_CONF)
-    ProcedureReturn
-  ElseIf colourSrc = #ANVIL_SPV_COLOUR_SAMPLED And *sampled <> 0
+  If avkqFragmentMetadataValid(pipe) = 0
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  ; Validate every required dynamic input before the first write. Combined
+  ; shaders must never partially patch push words and then discover that a
+  ; later UBO or sampled-image argument is absent.
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0 And *push = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0 And uniformBase <= 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0 And *sampled = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0 And (base & 31) <> 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0
+    If *push = 0 Or avkqFsPushR[pipe] < 0 Or avkqFsPushG[pipe] < 0 Or avkqFsPushB[pipe] < 0 Or avkqFsPushA[pipe] < 0
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    r = PeekL(*push) & $FFFFFFFF
+    g = PeekL(*push + 4) & $FFFFFFFF
+    b = PeekL(*push + 8) & $FFFFFFFF
+    a = PeekL(*push + 12) & $FFFFFFFF
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsPushR[pipe] * 4), r)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsPushG[pipe] * 4), g)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsPushB[pipe] * 4), b)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsPushA[pipe] * 4), a)
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+    If uniformBase <= 0 Or avkqFsUniformAddress[pipe] < 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsUniformAddress[pipe] * 4), uniformBase & $FFFFFFFF)
+  EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    If *sampled = 0 Or avkqFsTextureState[pipe] < 0 Or avkqFsSamplerState[pipe] < 0
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
     ; Clear the whole state records before writing the bounded fields. This is
     ; per-draw state: no byte from a previous sampler can survive a rebinding.
     k = 0
@@ -878,26 +1193,10 @@ Procedure AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, colourSrc.i, *sample
     If *sampled\minFilter = #VK_FILTER_NEAREST : k = k | 2 : EndIf
     avkqPoke32(base + #AVKQ_OFF_SAMP_STATE + 0, k)
     avkqPoke32(base + #AVKQ_OFF_SAMP_STATE + 4, (1 << 16) | (1 << 19))
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, (base + #AVKQ_OFF_TEX_STATE) | $F)
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, (base + #AVKQ_OFF_SAMP_STATE) | 1)
-    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 8, #AVKQ_TLB_CONF)
-    ProcedureReturn
-  ElseIf colourSrc = #ANVIL_SPV_COLOUR_PUSH And *push <> 0
-    r = PeekL(*push) & $FFFFFFFF
-    g = PeekL(*push + 4) & $FFFFFFFF
-    b = PeekL(*push + 8) & $FFFFFFFF
-    a = PeekL(*push + 12) & $FFFFFFFF
-  Else
-    r = AnvilVkPipelineColourConstant(pipe, 0)
-    g = AnvilVkPipelineColourConstant(pipe, 1)
-    b = AnvilVkPipelineColourConstant(pipe, 2)
-    a = AnvilVkPipelineColourConstant(pipe, 3)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsTextureState[pipe] * 4), (base + #AVKQ_OFF_TEX_STATE) | $F)
+    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsSamplerState[pipe] * 4), (base + #AVKQ_OFF_SAMP_STATE) | 1)
   EndIf
-  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, b)
-  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, g)
-  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 8, r)
-  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 12, a)
-  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 16, #AVKQ_TLB_CONF)
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 ; ----------------------------------------------------------------------

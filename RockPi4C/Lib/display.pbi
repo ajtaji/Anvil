@@ -290,10 +290,22 @@ Procedure.i RockDisplayFrameTelemetry()
   ProcedureReturn Bool(frames=9 And faults=0)
 EndProcedure
 
+Procedure.i RockDisplayLinkLaneMask()
+  ; DPCD 0202h packs lane 0 in the low nibble and lane 1 in the high nibble.
+  ; Validate exactly the lane count returned by the completed training event;
+  ; never accept an unknown count or require an untrained physical lane.
+  Select rock_cdn_link_lanes
+    Case 1 : ProcedureReturn $07
+    Case 2 : ProcedureReturn $77
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
 Procedure RockDisplayLiveLinkTelemetry()
   Protected index.i
   Protected lane01.i
   Protected aligned.i
+  Protected required.i
   If rock_uart_ready=0 : ProcedureReturn 0 : EndIf
   RockUartText("DP LINK 0202-0207 ")
   If rock_cdn_live_link_valid=0
@@ -306,7 +318,8 @@ Procedure RockDisplayLiveLinkTelemetry()
     Next
     lane01=rock_cdn_live_link_status[0]
     aligned=rock_cdn_live_link_status[2] & 1
-    If (lane01 & $77)=$77 And aligned<>0
+    required=RockDisplayLinkLaneMask()
+    If required<>0 And (lane01 & required)=required And aligned<>0
       RockUartText(" CHANNEL EQ OK")
     Else
       RockUartText(" CHANNEL EQ LOST")
@@ -556,7 +569,12 @@ Procedure.i RockDisplayUp()
   Protected prepared.i
   Protected configured.i
   Protected modeFailure.i
+  Protected linkLaneMask.i
   rock_display_ready=0
+  rock_display_width=0
+  rock_display_height=0
+  rock_display_pitch=0
+  rock_display_buffer=0
   rock_display_error=0
   RockDisplayStage("DP00 BEGIN COLD MINIDP")
   prepared = RockCruDisplayPrepare()
@@ -692,7 +710,8 @@ Procedure.i RockDisplayUp()
     RockDisplayLiveLinkTelemetry()
     ProcedureReturn RockDisplayFail(17,"Display validation failed with code 17; check the DisplayPort link-status response.")
   EndIf
-  If (rock_cdn_live_link_status[0] & $77)<>$77 Or (rock_cdn_live_link_status[2] & 1)=0
+  linkLaneMask=RockDisplayLinkLaneMask()
+  If linkLaneMask=0 Or (rock_cdn_live_link_status[0] & linkLaneMask)<>linkLaneMask Or (rock_cdn_live_link_status[2] & 1)=0
     ProcedureReturn RockDisplayFail(17,"Display validation failed with code 17; check DisplayPort lane alignment and channel equalization.")
   EndIf
   If RockDisplayFrameTelemetry()=0

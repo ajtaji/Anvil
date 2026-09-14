@@ -414,8 +414,10 @@ Procedure.i avkBackendPipelineBytes()
   ProcedureReturn AnvilVkV3dPipelineBytes()
 EndProcedure
 
-Procedure.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
-  ProcedureReturn AnvilVkV3dCompile(pipe, base, bytes)
+Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
+  If *build = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *build\fragmentIr = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  ProcedureReturn AnvilVkV3dCompile(*build)
 EndProcedure
 
 Procedure avkBackendPipelineRelease(pipe.i)
@@ -445,7 +447,6 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Define lastVertex.i
   Define vertexBytes.i
   Define b.i
-  Define colourBase.i
   Define *bind.AnvilVkBackendBinding
   Define *sampled.AnvilVkBackendSampledImage
   Define texturePlan.AvkV3dTexturePlan
@@ -503,31 +504,33 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
   Wend
 
   varyComps = avkqVaryComps[pipe]
-  ; A push colour is read by the processor into the fragment uniform
-  ; stream. A descriptor colour is not: its GPU-visible address goes in
-  ; the stream and the fragment QPU dereferences it through a TMU general
-  ; load. That makes mapped residency and cache visibility backend rules,
-  ; not assumptions the portable descriptor layer can prove.
-  colourBase = *d\pushBase
-  If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_UNIFORM
-    colourBase = *d\uniformBase
-    If colourBase = 0 Or *d\uniformBytes < 16
+  ; Push constants, a UBO and a sampled image are independent resources in
+  ; typed IR. Validate each live resource on its own instead of selecting one
+  ; overloaded colour source; arithmetic shaders may consume combinations.
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0
+    If *d\pushBase = 0 Or *d\pushBytes < 16
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw whose fragment shader reads push constants but no complete sixteen-byte block was supplied (Anvil code -20001, invalid push constants); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+    If *d\uniformBase = 0 Or *d\uniformBytes < 16
       avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw whose fragment colour comes from a uniform buffer with no address or a range shorter than sixteen bytes (Anvil code -20001, invalid descriptor); nothing was submitted.")
       ProcedureReturn -1
     EndIf
-    If avkV3dWindowBytes < 16 Or colourBase < avkV3dWindowBase
+    If avkV3dWindowBytes < 16 Or *d\uniformBase < avkV3dWindowBase
       avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a uniform-buffer descriptor outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A TMU general load reaches the descriptor through that mapping, and an unmapped page is an MMU fault rather than a wrong colour.")
       avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
       ProcedureReturn -1
     EndIf
-    If (colourBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)
+    If (*d\uniformBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)
       avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a uniform-buffer descriptor outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A TMU general load reaches the descriptor through that mapping, and an unmapped page is an MMU fault rather than a wrong colour.")
       avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
       ProcedureReturn -1
     EndIf
   EndIf
   *sampled = 0
-  If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_SAMPLED
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
     *sampled = *d\sampledImage
     If *sampled = 0
       avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a sampled pipeline without its closed sampled-image record (Anvil code -20001, missing sampled image); nothing was submitted.")
@@ -568,7 +571,12 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
       ProcedureReturn -1
     EndIf
   EndIf
-  AnvilVkV3dFragmentUniforms(pipe, pbase, colourBase, AnvilVkPipelineColourSource(pipe), *sampled)
+  rc = AnvilVkV3dFragmentUniforms(pipe, pbase, *d\pushBase, *d\uniformBase, *sampled)
+  If rc <> #VK_SUCCESS
+    avkV3dNative = rc
+    avkFault(rc, "the Pi 4 Vulkan backend refused inconsistent fragment uniform metadata or missing per-draw resources; no uniform word and no control list was submitted.")
+    ProcedureReturn -1
+  EndIf
   rc = AnvilVkV3dBuildRecord(pipe, pbase, *d, lastVertex - 1, varyComps)
   If rc <> #V3D_OK
     avkV3dNative = rc
@@ -603,8 +611,8 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     V3dCacheRange(pbase, #AVKQ_BYTES)
     ; The QPU, not the processor, reads a descriptor-backed colour. Make
     ; the sixteen bytes visible before the TMU is allowed to fetch them.
-    If AnvilVkPipelineColourSource(pipe) = #ANVIL_SPV_COLOUR_UNIFORM
-      V3dCacheRange(colourBase, 16)
+    If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+      V3dCacheRange(*d\uniformBase, 16)
     EndIf
     ; The QPU's texture request reads the application's mapped texel directly.
     ; Clean that exact range before the control list can launch the request.

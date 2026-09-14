@@ -89,6 +89,50 @@ F1 = 0x3F800000
 TLB_CONF = 0xFFFFFFFF
 TMU_GENERAL_VEC4 = 0xFFFFFF7C
 
+# Independent 9897ddc legacy executable oracle, captured before the typed-IR
+# production switch. These are complete V3D 4.2 instruction words, not a
+# length or a pattern sampled from the new lowerer's answer.
+FS_FLAT_QWORDS = [
+    0x3D803186BB800000, 0x3D807186BB800000, 0x3D80B186BB800000,
+    0x3D80F186BB800000, 0x3C203186BB800000, 0x3C203186BB800000,
+    0x3C003186BB800000, 0x3C003186BB800000, 0x3C0031883583E001,
+    0x3C0031873583E083, 0x3C203186BB800000, 0x3C003186BB800000,
+    0x3C003186BB800000, 0x3C003186BB800000,
+]
+FS_VARYING_QWORDS = [
+    0x3D003186BB800000, 0x3C003186BB800000, 0x3C00218405835000,
+    0x3D007186BB800000, 0x3C003186BB800000, 0x3C00218505835040,
+    0x3D00B186BB800000, 0x3C003186BB800000, 0x3C00218605835080,
+    0x3D00F186BB800000, 0x3C003186BB800000, 0x3C002187058350C0,
+    0x3C203186BB800000, 0x3C203186BB800000, 0x3C003186BB800000,
+    0x3C003186BB800000, 0x3C0031883583E185, 0x3C0031873583E107,
+    0x3C203186BB800000, 0x3C003186BB800000, 0x3C003186BB800000,
+    0x3C003186BB800000,
+]
+FS_UBO_QWORDS = [
+    0x3D823186BB800000, 0x3C20318DB6836200, 0x3C003186BB800000,
+    0x3C003186BB800000, 0x3C803186BB800000, 0x3C807186BB800000,
+    0x3C80B186BB800000, 0x3C80F186BB800000, 0x3C203186BB800000,
+    0x3C203186BB800000, 0x3C003186BB800000, 0x3C003186BB800000,
+    0x3C0031883583E081, 0x3C0031873583E003, 0x3C203186BB800000,
+    0x3C003186BB800000, 0x3C003186BB800000, 0x3C003186BB800000,
+]
+FS_SAMPLED_QWORDS = [
+    0x3E403186BB800000, 0x3E403186BB800000, 0x3D02B186BB800000,
+    0x3C003186BB800000, 0x3C00218C05835280, 0x3D02F186BB800000,
+    0x3C003186BB800000, 0x3C00218D058352C0, 0x3C0031A2B6836340,
+    0x3C0031A1B6836300, 0x3C203186BB800000, 0x3C003186BB800000,
+    0x3C003186BB800000, 0x3C803186BB800000, 0x3C807186BB800000,
+    0x3C80B186BB800000, 0x3C80F186BB800000, 0x3C203186BB800000,
+    0x3C203186BB800000, 0x3C003186BB800000, 0x3C003186BB800000,
+    0x3C0031883583E081, 0x3C0031873583E003, 0x3C203186BB800000,
+    0x3C003186BB800000, 0x3C003186BB800000, 0x3C003186BB800000,
+]
+
+
+def qwords_blob(values: list[int]) -> bytes:
+    return struct.pack("<%dQ" % len(values), *values)
+
 W = H = 64
 STRIDE1, STRIDE2 = 24, 8
 # The split layout: position in one buffer, colour in another, at two
@@ -272,6 +316,33 @@ def build(compiler: pathlib.Path) -> pathlib.Path:
     return compile_one(compiler, GATE, "anvil_vk_pipeline_gate.img")
 
 
+def fragment_varying_with_dead_io() -> bytes:
+    """Direct varying colour plus dead decorated input/output declarations."""
+    I, O = spv.ins, spv.OP
+    body = [
+        I(O["Capability"], spv.CAP_SHADER),
+        I(O["MemoryModel"], spv.ADDR_LOGICAL, spv.MEM_GLSL450),
+        I(O["EntryPoint"], spv.EM_FRAGMENT, 9, *spv.lit("main"), 7, 8, 12, 13),
+        I(O["ExecutionMode"], 9, spv.MODE_ORIGIN_UPPER_LEFT),
+        I(O["Decorate"], 7, spv.DEC_LOCATION, 0),
+        I(O["Decorate"], 8, spv.DEC_LOCATION, 0),
+        I(O["Decorate"], 12, spv.DEC_LOCATION, 1),
+        I(O["Decorate"], 13, spv.DEC_LOCATION, 1),
+        I(O["TypeVoid"], 1), I(O["TypeFunction"], 2, 1),
+        I(O["TypeFloat"], 3, 32), I(O["TypeVector"], 4, 3, 4),
+        I(O["TypePointer"], 5, spv.SC_INPUT, 4),
+        I(O["TypePointer"], 6, spv.SC_OUTPUT, 4),
+        I(O["Variable"], 5, 7, spv.SC_INPUT),
+        I(O["Variable"], 6, 8, spv.SC_OUTPUT),
+        I(O["Variable"], 5, 12, spv.SC_INPUT),
+        I(O["Variable"], 6, 13, spv.SC_OUTPUT),
+        I(O["Function"], 1, 9, 0, 2), I(O["Label"], 10),
+        I(O["Load"], 4, 11, 7), I(O["Load"], 4, 14, 12),
+        I(O["Store"], 8, 11), I(O["Return"]), I(O["FunctionEnd"]),
+    ]
+    return spv.module(15, body)
+
+
 def modules() -> list[bytes]:
     return [spv.vertex_passthrough(), spv.fragment_varying(),
             spv.vertex_position_only(), spv.fragment_push(),
@@ -280,7 +351,14 @@ def modules() -> list[bytes]:
             # offers it against a set layout that has binding zero only,
             # which is the one way a shader and a layout can disagree
             # that no other rule in the path can see.
-            spv.fragment_uniform(binding=1)]
+            spv.fragment_uniform(binding=1),
+            # Direct immutable RGBA. The module is created only after the
+            # direct-push source module is destroyed, so it proves same-slot
+            # incompatible IR reuse without increasing the live-module cap.
+            spv.fragment_constant(),
+            # Retains valid dead interface declarations and a dead Load. The
+            # public compiler must derive its ABI from the sole Store root.
+            fragment_varying_with_dead_io()]
 
 
 def execute(a64, image: pathlib.Path):
@@ -415,7 +493,7 @@ def grade(cpu, rc) -> Grader:
     # --- the public path reached the backend with the right numbers ---
     vertex_base = slot(6)
     g.need("a zero draw was a no-op and the following real draw reached the backend",
-           slot(21), 1)
+           slot(21), 2)
     g.need("four pipeline slots are live after the fifth reused one", slot(22), 4)
     g.need("the draw named the bound vertex buffer", slot(23), vertex_base)
     g.need("the draw carried the binding's stride", slot(24), STRIDE1)
@@ -446,7 +524,7 @@ def grade(cpu, rc) -> Grader:
     g.need("the incomplete-triangle draw's fence signals", slot(162), 0)
     g.need("the backend receives the original four-vertex count", slot(163), 4)
     g.need("the incomplete-triangle draw is the second real backend draw",
-           slot(164), 2)
+           slot(164), 3)
     g.need("a draw naming vertices past the end of the buffer is refused",
            slot(45), ERR_ARGS)
     g.need("ending a command buffer inside a render pass is refused",
@@ -455,6 +533,29 @@ def grade(cpu, rc) -> Grader:
            slot(53), ERR_ARGS)
     g.need("a fragment shader that reads a varying nothing writes is refused",
            slot(54), ERR_ARGS)
+    g.need("[dead-io] shader module with valid dead declarations creates",
+           slot(341), 0)
+    g.need("[dead-io] public pipeline ignores the dead input and output",
+           slot(342), 0)
+    g.need("[dead-io] real typed-IR V3D compilation succeeds", slot(343), 0)
+    g.need("[dead-io] only the live varying remains in the pipeline",
+           slot(347), 1)
+    dead_base = slot(348)
+    g.want_true("[dead-io] emitted cache base existed before the frozen copy",
+                slot(344) != 0, hex(slot(344)))
+    g.want_true("[dead-io] frozen executable storage exists", dead_base != 0,
+                hex(dead_base))
+    g.need("[dead-io] fragment byte length remains the frozen legacy length",
+           slot(345), len(FS_VARYING_QWORDS) * 8)
+    g.need("[dead-io] fragment uniform stream remains one TLB word",
+           slot(346), 1)
+    if dead_base:
+        g.need_bytes("[dead-io] dead input/load/output change no fragment QPU byte",
+                     blob(cpu, dead_base + OFF_FS_CODE, slot(345)),
+                     qwords_blob(FS_VARYING_QWORDS))
+        g.need_bytes("[dead-io] dead declarations change no uniform word",
+                     blob(cpu, dead_base + OFF_UNIF_FS, 4),
+                     struct.pack("<I", TLB_CONF))
     vary_text = cstr(cpu, u64(cpu, base + 50 * 8))
     g.want_true("the varying refusal says the two stages disagree on how MANY "
                 "varyings there are", "number of varyings" in vary_text,
@@ -512,6 +613,78 @@ def grade(cpu, rc) -> Grader:
                  blob(cpu, baseB + OFF_UNIF_FS, 20),
                  struct.pack("<5I", PUSH[2], PUSH[1], PUSH[0], PUSH[3], TLB_CONF))
 
+    # The source module may die immediately after pipeline creation. Its old
+    # token must never alias same-slot replacement IR, while the pipeline owns
+    # a complete immutable executable image and exact patch ABI of its own.
+    g.want_true("[lifetime] the original push module owned a real slot and generation",
+                slot(288) > 0 and slot(289) > 0, f"{slot(288)} / {slot(289)}")
+    g.want_true("[lifetime] the original module exposed verified typed IR",
+                slot(290) != 0 and slot(291) == slot(289),
+                f"{slot(290):#x} / {slot(291)}")
+    g.need("[lifetime] B's retained executable base was frozen", slot(292), slot(233))
+    g.need("[lifetime] B's retained fragment length was frozen", slot(293), slot(18))
+    g.need("[lifetime] direct push retained five uniform words", slot(294), 5)
+    g.need("[lifetime] pushFirst is the first returned lane index", slot(295), 0)
+    g.need("[lifetime] red's exact stream word", slot(296), 2)
+    g.need("[lifetime] green's exact stream word", slot(297), 1)
+    g.need("[lifetime] blue's exact stream word", slot(298), 0)
+    g.need("[lifetime] alpha's exact stream word", slot(299), 3)
+    g.need("[lifetime] push owns no UBO address index", slot(300), -1)
+    g.need("[lifetime] push owns no UBO configuration index", slot(301), -1)
+    g.need("[lifetime] push owns no texture index", slot(302), -1)
+    g.need("[lifetime] push owns no sampler index", slot(303), -1)
+    g.need("[lifetime] push's TLB index is exact", slot(304), 4)
+    g.need("[lifetime] destroy invalidates the stale IR pointer", slot(305), 0)
+    g.need("[lifetime] destroy invalidates the stale IR generation", slot(306), 0)
+    g.need("[lifetime] a stale module token cannot create a pipeline", slot(307), ERR_HANDLE)
+    g.need("[lifetime] stale pipeline creation writes null", slot(308), 0)
+    g.need("[lifetime] incompatible replacement module creates", slot(309), 0)
+    g.need("[lifetime] replacement reuses the exact module slot", slot(310), slot(288))
+    g.want_true("[lifetime] replacement advances the module generation",
+                slot(311) != 0 and slot(311) != slot(289), str(slot(311)))
+    g.want_true("[lifetime] replacement exposes its own verified IR",
+                slot(312) != 0 and slot(313) == slot(311),
+                f"{slot(312):#x} / {slot(313)}")
+    g.need("[lifetime] old token remains stale after same-slot reuse", slot(314), ERR_HANDLE)
+    g.need("[lifetime] reused-slot stale creation still writes null", slot(315), 0)
+    g.need("[lifetime] replacement immutable pipeline creates", slot(316), 0)
+    g.need("[lifetime] replacement typed IR compiles", slot(317), 0)
+    constant_base = slot(331)
+    g.want_true("[constant] same-slot replacement owns emitted storage",
+                constant_base != 0, hex(constant_base))
+    g.need("[constant] direct immutable fragment length is legacy-flat",
+           slot(332), len(FS_FLAT_QWORDS) * 8)
+    g.need("[constant] direct immutable fragment has five uniform words",
+           slot(333), 5)
+    if constant_base:
+        g.need_bytes("[constant] repeated blue/alpha IDs still emit four exact loads",
+                     blob(cpu, constant_base + OFF_FS_CODE, slot(332)),
+                     qwords_blob(FS_FLAT_QWORDS))
+        g.need_bytes("[constant] immutable stream remains exact BGRA plus TLB",
+                     blob(cpu, constant_base + OFF_UNIF_FS, 20),
+                     struct.pack("<5I", 0x3F800000, 0x00000000,
+                                 0x3F000000, 0x3F800000, TLB_CONF))
+    g.need("[lifetime] replacement compile changes no byte of old B", slot(318), 0)
+    g.need("[lifetime] every retained old-B metadata field remains exact", slot(319), 1)
+    g.need("[lifetime] replacement destroy invalidates its IR pointer", slot(320), 0)
+    g.need("[lifetime] replacement destroy invalidates its IR generation", slot(321), 0)
+    g.need("[lifetime] retained copy accepts metadata-only patch", slot(322), 0)
+    g.need("[lifetime] retained-copy patch changes no unnamed byte", slot(323), 0)
+    g.need("[lifetime] all four named semantic push words receive exact values", slot(324), 1)
+    g.need("[metadata] an out-of-range lowerer index is refused", slot(334), ERR_STATE)
+    g.need("[metadata] refusal occurs before any retained byte changes", slot(335), 0)
+    g.need("[lifetime] private proof fence creates", slot(336), 0)
+    for name, n in (("record", 325), ("end", 326), ("submit", 327), ("wait", 328)):
+        g.need(f"[lifetime] old pipeline public draw {name} succeeds", slot(n), 0)
+    old_push = slot(329)
+    g.want_true("[lifetime] old pipeline draw retained a complete push block", old_push != 0,
+                hex(old_push))
+    g.need("[lifetime] old draw retained push red", slot(337) & 0xFFFFFFFF, PUSH[0])
+    g.need("[lifetime] old draw retained push green", slot(338) & 0xFFFFFFFF, PUSH[1])
+    g.need("[lifetime] old draw retained push blue", slot(339) & 0xFFFFFFFF, PUSH[2])
+    g.need("[lifetime] old draw retained push alpha", slot(340) & 0xFFFFFFFF, PUSH[3])
+    g.need("[lifetime] exactly one old-pipeline draw preceded the ordinary suite", slot(330), 1)
+
     # --- the programs are the length the emission rules predict ---
     csA, vsA, fsA = slot(10), slot(11), slot(12)
     csB, vsB, fsB = slot(16), slot(17), slot(18)
@@ -521,6 +694,10 @@ def grade(cpu, rc) -> Grader:
         g.want_true(f"{name} program is a whole number of instructions",
                     value > 0 and value % 8 == 0, str(value))
         g.want_true(f"{name} program fits its slot", value <= 1024, str(value))
+    g.need_bytes("[A] typed lowering preserves every legacy varying QPU word",
+                 blob(cpu, baseA + OFF_FS_CODE, fsA), qwords_blob(FS_VARYING_QWORDS))
+    g.need_bytes("[B] typed lowering preserves every legacy push QPU word",
+                 blob(cpu, baseB + OFF_FS_CODE, fsB), qwords_blob(FS_FLAT_QWORDS))
 
     # The DIFFERENCES between the two pipelines are what the emission
     # rules predict exactly, and they are checked rather than the
@@ -689,7 +866,7 @@ def grade(cpu, rc) -> Grader:
     g.need("a binding this pipeline does not have carries no address",
            slot(110), 0)
     g.need("and no stride", slot(111), 0)
-    g.need("three draws have now reached the backend", slot(112), 3)
+    g.need("four draws have now reached the backend", slot(112), 4)
     g.need("NOT ONE PIXEL was written by the two-binding draw either",
            slot(113), 0)
 
@@ -733,6 +910,8 @@ def grade(cpu, rc) -> Grader:
            "instructions", fsD, 18 * 8)
     raw_d = [u64(cpu, baseD + OFF_FS_CODE + i)
              for i in range(0, fsD, 8)]
+    g.need_bytes("[D] typed lowering preserves every legacy UBO QPU word",
+                 blob(cpu, baseD + OFF_FS_CODE, fsD), qwords_blob(FS_UBO_QWORDS))
 
     def sig(word: int) -> int:
         return (word >> 53) & 0x1F
@@ -760,7 +939,7 @@ def grade(cpu, rc) -> Grader:
     g.need("the draw carried the descriptor's address to the backend",
            slot(121), uniform_base)
     g.need("and its range", slot(122), 16)
-    g.need("four draws have now reached the backend", slot(68), 4)
+    g.need("five draws have now reached the backend", slot(68), 5)
 
     # pSampleMask is not optional semantics. With one sample, bit zero
     # clear suppresses every fragment while the render-pass clear still
@@ -771,8 +950,8 @@ def grade(cpu, rc) -> Grader:
     g.need("the zero-sample-mask draw submitted", slot(157), 0)
     g.need("the zero-sample-mask draw's fence signalled", slot(158), 0)
     g.need("the draw record carries sample bit zero clear", slot(159), 0)
-    g.need("the suppressed draw still reached the backend as the fifth draw",
-           slot(160), 5)
+    g.need("the suppressed draw still reached the backend as the sixth draw",
+           slot(160), 6)
 
     # --- descriptor state: one uniform path and one bounded sampled path ---
     g.need("a storage-image descriptor is refused",
@@ -915,6 +1094,9 @@ def grade(cpu, rc) -> Grader:
                 slot(225) > 0 and slot(225) % 8 == 0, str(slot(225)))
     sampled_words = [u64(cpu, tex_base + OFF_FS_CODE + i)
                      for i in range(0, slot(225), 8)]
+    g.need_bytes("the sampled typed lowering preserves every legacy QPU word",
+                 blob(cpu, tex_base + OFF_FS_CODE, slot(225)),
+                 qwords_blob(FS_SAMPLED_QWORDS))
     g.want_true("the sampled fragment program reaches its T-then-S request",
                 len(sampled_words) > 9, str(len(sampled_words)))
     if len(sampled_words) > 9:
@@ -1009,6 +1191,12 @@ def grade(cpu, rc) -> Grader:
 
 
 MUTANTS = (
+    ("the V3D target includes a dead decorated fragment input",
+     "If *variable\\storageClass = #ANVIL_IR_STORAGE_INPUT And avkqIrLive[*variable\\sourceId] <> 0",
+     "If *variable\\storageClass = #ANVIL_IR_STORAGE_INPUT"),
+    ("the V3D target includes a dead decorated fragment output",
+     "ElseIf *variable\\storageClass = #ANVIL_IR_STORAGE_OUTPUT And *variable\\sourceId = outputVariableId",
+     "ElseIf *variable\\storageClass = #ANVIL_IR_STORAGE_OUTPUT"),
     ("optimal sampled state loses the strict-UIF level-zero bit",
      "      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 16, (1 << 6))\n",
      "      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 16, 0)\n"),
@@ -1113,6 +1301,12 @@ COMMAND_MUTANTS = (
 )
 
 PIPELINE_MUTANTS = (
+    ("the fragment summary includes a dead decorated input",
+     "If *v\\storageClass = #ANVIL_IR_STORAGE_INPUT And avkShIrLive[*v\\sourceId] <> 0",
+     "If *v\\storageClass = #ANVIL_IR_STORAGE_INPUT"),
+    ("the fragment summary includes a dead decorated output",
+     "ElseIf *v\\storageClass = #ANVIL_IR_STORAGE_OUTPUT And *v\\sourceId = outputVariableId",
+     "ElseIf *v\\storageClass = #ANVIL_IR_STORAGE_OUTPUT"),
     ("draw submission trusts a reused framebuffer slot",
      "  fb = avkFbSlot(avkCbFbHandle[c])\n  If p = 0 Or fb = 0 Or fb <> avkCbFb[c]\n",
      "  fb = avkCbFb[c]\n  If p = 0 Or fb = 0\n"),

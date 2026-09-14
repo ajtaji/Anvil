@@ -225,6 +225,7 @@ class ProgramContract:
     name: str
     role: str
     uniform_words: int
+    requires_vpm_load: bool = True
 
 
 def _fail(ins: Instruction, text: str) -> None:
@@ -315,7 +316,7 @@ def verify_program(data: bytes | Sequence[int], contract: ProgramContract) -> li
     if role in ("coordinate", "vertex"):
         if tlb_writes:
             raise VerifyError(f"{contract.name}: vertex-side program writes the tile buffer")
-        if not any(i.add_op.startswith("ldvpm") for i in insns):
+        if contract.requires_vpm_load and not any(i.add_op.startswith("ldvpm") for i in insns):
             raise VerifyError(f"{contract.name}: no VPM attribute load")
         if not any(i.add_op.startswith("stvpm") for i in insns):
             raise VerifyError(f"{contract.name}: no VPM result store")

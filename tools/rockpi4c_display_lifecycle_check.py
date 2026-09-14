@@ -25,7 +25,14 @@ PHASES = [
 def source_contract():
     display = (ROOT / "RockPi4C/Lib/display.pbi").read_text().lower()
     cdn = (ROOT / "RockPi4C/Lib/cdn_dp.pbi").read_text().lower()
+    vop = (ROOT / "RockPi4C/Lib/vop.pbi").read_text().lower()
     body = display.split("procedure.i rockdisplayup()", 1)[1].split("endprocedure", 1)[0]
+    publication_clear = ["rock_display_ready=0", "rock_display_width=0",
+                         "rock_display_height=0", "rock_display_pitch=0",
+                         "rock_display_buffer=0"]
+    clear_offsets = [body.index(token) for token in publication_clear]
+    assert clear_offsets == sorted(clear_offsets)
+    assert max(clear_offsets) < body.index("rockdisplaystage(")
     ordered = ["configured = rockcdnplanvideo()", "if rockvopmodevalid()=0", "if rockcruvpllmode()=0",
                "if rockvoppreparemode()=0", "if rockcdnvideomode()=0",
                "if rockcdnvideostatus(1)=0", "if rockvopconfigureprimary()=0",
@@ -41,6 +48,16 @@ def source_contract():
     assert video.index("if rockcdnplanvideo()=0") < video.index("rockcdnregwrite")
     sample = display.split("procedure.i rockdisplayframetelemetry()", 1)[1].split("endprocedure", 1)[0]
     assert "procedurereturn bool(frames=9 and faults=0)" in sample
+    lane_mask = display.split("procedure.i rockdisplaylinklanemask()", 1)[1].split("endprocedure", 1)[0]
+    assert "case 1 : procedurereturn $07" in lane_mask
+    assert "case 2 : procedurereturn $77" in lane_mask
+    assert "procedurereturn 0" in lane_mask
+    assert "linklanemask=rockdisplaylinklanemask()" in body
+    assert "if linklanemask=0 or (rock_cdn_live_link_status[0] & linklanemask)<>linklanemask" in body
+    configure = vop.split("procedure.i rockvopconfigureprimary()", 1)[1].split("endprocedure", 1)[0]
+    start = vop.split("procedure.i rockvopstartprimary()", 1)[1].split("endprocedure", 1)[0]
+    assert configure.index("rock_vop_configured=0") < configure.index("rock_vop_prepared=0")
+    assert start.index("rock_vop_ready=0") < start.index("rock_vop_prepared=0 or rock_vop_configured=0")
 
 
 def emitted_contract(image):
@@ -60,14 +77,25 @@ def emitted_contract(image):
     passive = {"rockcdnwrite", "rockcdninternalclocks", "rocktimerwaitus"}
     phase_names = set(PHASES) - {"video-idle", "video-valid"}
 
-    def run(failure=None, bad_alignment=False):
+    def run(failure=None, bad_alignment=False, lanes=2, lane_status=None,
+            stale_publication=False):
         cpu = module.A64()
         cpu.memory.update(memory)
         for name, value in {"rock_mode_width": 1920, "rock_mode_height": 1080,
-                            "rock_mode_pitch": 7680, "rock_cdn_error": 34}.items():
+                            "rock_mode_pitch": 7680, "rock_cdn_error": 34,
+                            "rock_cdn_link_lanes": lanes}.items():
             cpu.raw_store(symbols["global_" + name], value, 8)
+        if stale_publication:
+            for name, value in {"rock_display_ready": 1,
+                                "rock_display_width": 1024,
+                                "rock_display_height": 768,
+                                "rock_display_pitch": 4096,
+                                "rock_display_buffer": 0x02965000}.items():
+                cpu.raw_store(symbols["global_" + name], value, 8)
         status = symbols["global_rock_cdn_live_link_status"]
-        cpu.raw_store(status, 0x77, 1)
+        if lane_status is None:
+            lane_status = 0x07 if lanes == 1 else 0x77
+        cpu.raw_store(status, lane_status, 1)
         cpu.raw_store(status + 2, 0 if bad_alignment else 1, 1)
         cpu.sp, cpu.x[30] = 0x05000000, returned
         cpu.pc = load + symbols["rockdisplayup"]
@@ -93,18 +121,28 @@ def emitted_contract(image):
         else:
             raise AssertionError("display facade did not return")
         ready = cpu.raw_load(symbols["global_rock_display_ready"], 8)
-        if failure is None and not bad_alignment:
+        valid_link = lanes in (1, 2) and (lane_status & (0x07 if lanes == 1 else 0x77)) == (0x07 if lanes == 1 else 0x77)
+        if failure is None and not bad_alignment and valid_link:
             assert cpu.x[0] == 1 and ready == 1 and trace == PHASES, trace
         else:
             assert cpu.x[0] == 0 and ready == 0, (failure, trace, ready)
             expected = PHASES[:PHASES.index(failure) + 1] if failure else PHASES[:-1]
             assert trace == expected, (failure, trace, expected)
+        if stale_publication:
+            for name in ("rock_display_width", "rock_display_height",
+                         "rock_display_pitch", "rock_display_buffer"):
+                assert cpu.raw_load(symbols["global_" + name], 8) == 0, name
 
     run()
+    run(lanes=1)
+    run(lanes=1, lane_status=0)
+    run(lanes=0)
+    run(lanes=3)
     for failure in PHASES:
         run(failure)
+    run(failure=PHASES[0], stale_publication=True)
     run(bad_alignment=True)
-    print(f"Emitted lifecycle: success, {len(PHASES)} owner failures and bad link alignment passed")
+    print(f"Emitted lifecycle: 2/1-lane success, invalid lanes, {len(PHASES)} owner failures, failed re-entry and bad alignment passed")
 
 
 def main():

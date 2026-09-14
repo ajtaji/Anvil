@@ -2,7 +2,7 @@
 """Compile, execute, decode and mutate the isolated typed-IR V3D lowerer."""
 
 from __future__ import annotations
-import argparse, importlib.util, os, pathlib, subprocess, sys, tempfile
+import argparse, contextlib, importlib.util, os, pathlib, subprocess, sys, tempfile
 
 HERE=pathlib.Path(__file__).resolve().parent; ROOT=HERE.parent
 MODULE=ROOT/'Anvil/Graphics/Vulkan/vk_ir_v3d42.pi4'
@@ -11,7 +11,7 @@ LOAD=0x400000; STACK=0x3000000; LR=0xDEAD0000; MMIO=0xFC000000
 MAGIC=0x49523432; STEP_LIMIT=40_000_000
 
 sys.path.insert(0,str(HERE))
-from v3d42_qpu_decode import ProgramContract, decode_program, verify_program
+from v3d42_qpu_decode import ProgramContract, decode_program, verify_program, uniform_consumption
 
 MUTANTS=(
  ('refusal writes caller code','i = 0 : While i < codeBytes : PokeA(*t\\codeBase + i, PeekA(@avk42CodeScratch[0] + i))','i = 0 : While i < codeBytes : PokeA(*t\\codeBase + i, 0)'),
@@ -34,6 +34,29 @@ MUTANTS=(
  ('STVPM output slot shifted','V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot, reg)','V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot + 1, reg)'),
  ('constant uniform word changed','avk42AppendUniform(*c\\word0)','avk42AppendUniform(*c\\word0 + 1)'),
  ('constant load register shifted','V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first, 0)','V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first + 1, 0)'),
+ ('dead SSA resource emitted','If *n\\sourceId > 0 And avk42Live[*n\\sourceId] = 0','If *n\\sourceId > 0 And avk42Live[*n\\sourceId] < 0'),
+ ('duplicate varying load consumes FIFO twice','If priorId > 0','If priorId < 0'),
+ ('nonzero block member accepted','If *v = 0 Or member <> 0','If *v = 0 Or member = 12345'),
+ ('missing Block decoration accepted','If avk42Decoration(*m, *block\\sourceId, -1, #ANVIL_IR_DEC_BLOCK) < 0','If avk42Decoration(*m, *block\\sourceId, -1, #ANVIL_IR_DEC_BLOCK) < -1'),
+ ('missing or nonzero member Offset accepted','If avk42Decoration(*m, *block\\sourceId, 0, #ANVIL_IR_DEC_OFFSET) <> 0','If avk42Decoration(*m, *block\\sourceId, 0, #ANVIL_IR_DEC_OFFSET) = 12345'),
+ ('integer block scalar accepted','*scalar\\kind <> #ANVIL_IR_TYPE_FLOAT','*scalar\\kind = 12345'),
+ ('two live push loads accepted','If pushLoads > 1','If pushLoads > 2'),
+ ('two live UBO loads accepted','If uniformLoads > 1','If uniformLoads > 2'),
+ ('two live samples accepted','If liveSamples > 1','If liveSamples > 2'),
+ ('fixed TMU register reservation removed',
+  '  If liveSamples > 0\n    avk42NextReg = 14       ; sample rf0..3 and UV rf12..13\n  ElseIf uniformLoads > 0\n    avk42NextReg = 9        ; UBO result rf0..3 and address rf8',
+  '  If liveSamples > 0\n    avk42NextReg = 4        ; sample rf0..3 and UV rf12..13\n  ElseIf uniformLoads > 0\n    avk42NextReg = 4        ; UBO result rf0..3 and address rf8'),
+ ('sample plus UBO result aliases rf0',
+  '    first = 0\n    If avk42HasSample <> 0\n      ; A sample result owns rf0..3.',
+  '    first = 0\n    If avk42HasSample = 0\n      ; A sample result owns rf0..3.'),
+ ('sample result moved off rf0',
+  '  first = 0\n  If avk42NextReg < 14 : avk42NextReg = 14 : EndIf',
+  '  first = 4\n  If avk42NextReg < 14 : avk42NextReg = 14 : EndIf'),
+ ('push R metadata aliases G','If k = 0 : *r\\pushRWord = pos : EndIf','If k = 0 : *r\\pushGWord = pos : EndIf'),
+ ('UBO address metadata aliases config','*r\\uniformAddressWord = avk42AppendUniform(*t\\uniformBlockAddress)','*r\\uniformConfigWord = avk42AppendUniform(*t\\uniformBlockAddress)'),
+ ('texture metadata aliases sampler','*r\\textureStateWord = avk42AppendUniform(*t\\textureStateAddress)','*r\\samplerStateWord = avk42AppendUniform(*t\\textureStateAddress)'),
+ ('prepare publishes metadata before transaction commits','avk42PrepareAndEmit(*m, *t, @avk42PendingResult)','avk42PrepareAndEmit(*m, *t, *r)'),
+ ('resource validation reads caller result','avk42ValidateResourceUse(*m, *t, @avk42PendingResult)','avk42ValidateResourceUse(*m, *t, *r)'),
 )
 
 def locate(explicit,env,fallback):
@@ -42,6 +65,23 @@ def locate(explicit,env,fallback):
  return p.resolve()
 def loadmod(name,path):
  s=importlib.util.spec_from_file_location(name,path); m=importlib.util.module_from_spec(s);sys.modules[name]=m;s.loader.exec_module(m);return m
+@contextlib.contextmanager
+def checker_lock():
+ p=pathlib.Path(tempfile.gettempdir())/'anvil_vk_pipeline_check.lock'
+ with p.open('a+b') as f:
+  f.seek(0,os.SEEK_END)
+  if f.tell()==0:f.write(b'0');f.flush()
+  f.seek(0)
+  if os.name=='nt':
+   import msvcrt
+   msvcrt.locking(f.fileno(),msvcrt.LK_LOCK,1)
+   try:yield
+   finally:f.seek(0);msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)
+  else:
+   import fcntl
+   fcntl.flock(f.fileno(),fcntl.LOCK_EX)
+   try:yield
+   finally:fcntl.flock(f.fileno(),fcntl.LOCK_UN)
 def build(compiler,suffix):
  d=pathlib.Path(tempfile.mkdtemp(prefix='anvil_ir42_')); out=d/f'{suffix}.img'
  cmd=[str(compiler),'--compile',GATE.relative_to(ROOT).as_posix(),'-t','pi4','--load-addr',hex(LOAD),'-s','--stack-addr',hex(STACK),'--entry-returns','-o',str(out)]
@@ -69,17 +109,26 @@ def u32(c,a): return sum(c.memory.get(a+i,0)<<(8*i) for i in range(4))
 def blob(c,a,n): return bytes(c.memory.get(a+i,0) for i in range(n))
 def grade(c,r):
  bad=[]
- if q(c,r+500*8)!=MAGIC:return 0,['bad report magic']
- checks=q(c,r+501*8); fails=q(c,r+502*8)
+ if q(c,r+1000*8)!=MAGIC:return 0,['bad report magic']
+ checks=q(c,r+1001*8); fails=q(c,r+1002*8)
  if fails: bad.append(f'{fails} of {checks} emitted checks failed: '+','.join(str(i+1) for i in range(checks) if q(c,r+(256+i)*8)==0))
- roles=('vertex','fragment:varying','fragment:flat','fragment:uniform','fragment:sampled','vertex')+('vertex',)*12
+ roles=(('vertex','fragment:varying','fragment:flat','fragment:uniform','fragment:sampled','vertex')
+        +('vertex',)*12+('fragment:flat','fragment:uniform','fragment:sampled','fragment:varying'))
  words=0
  for i,role in enumerate(roles):
   b=i*8;rc=q(c,r+b*8);addr=q(c,r+(b+1)*8);size=q(c,r+(b+2)*8);un=q(c,r+(b+4)*8)
-  if rc or not size: bad.append(f'case {i} did not lower: rc={rc} bytes={size}');continue
+  if rc or not size:
+   eb=900+i*3
+   bad.append(f'case {i} did not lower: rc={rc} bytes={size} source={q(c,r+eb*8)} opcode={q(c,r+(eb+1)*8)} stage={q(c,r+(eb+2)*8)}');continue
   try:
-    ins=verify_program(blob(c,addr,size),ProgramContract(f'ir42/{i}',role,un));words+=len(ins)
-    if i>=6:
+    if 14<=i<18:
+     # These constants intentionally retain a dead input Load in IR, but the
+     # Store-root executable has no attribute read. Decode the exact program
+     # below without imposing the generic vertex "must LDVPM" contract.
+     ins=verify_program(blob(c,addr,size),ProgramContract(f'ir42/{i}','vertex',un,requires_vpm_load=False))
+    else:ins=verify_program(blob(c,addr,size),ProgramContract(f'ir42/{i}',role,un))
+    words+=len(ins)
+    if 6<=i<18:
      is_const=i>=14
      lanes=(1 if i<16 else 4) if is_const else (i-6)//2+1
      is_add=((i-6)&1)==0
@@ -101,18 +150,88 @@ def grade(c,r):
      ar_start=2*lanes
      if [x.index for x in ar]!=list(range(ar_start,ar_start+lanes)):raise ValueError(f'ir42/{i}: arithmetic is not the third contiguous phase')
      ld=[x for x in ins if x.add_op=='ldvpmv_in']
-     if len(ld)!=(lanes if is_const else 2*lanes):raise ValueError(f'ir42/{i}: wrong LDVPM lane count')
+     if len(ld)!=(0 if is_const else 2*lanes):raise ValueError(f'ir42/{i}: wrong LDVPM lane count')
      ld_start=3*lanes if is_const else 0
      if [x.index for x in ld]!=list(range(ld_start,ld_start+len(ld))):raise ValueError(f'ir42/{i}: LDVPM phase is not contiguous/in order')
      if any(x.add_waddr!=(3*lanes+lane if is_const else lane) or x.add_magic or x.add_mux_a!=6 or x.add_mux_b!=0 or x.raddr_a!=lane for lane,x in enumerate(ld)):raise ValueError(f'ir42/{i}: LDVPM destination/slot order is not exact')
      st=[x for x in ins if x.add_op=='stvpmv']
-     st_start=4*lanes if is_const else 3*lanes
+     st_start=3*lanes if is_const else 3*lanes
      if [x.index for x in st]!=list(range(st_start,st_start+lanes)):raise ValueError(f'ir42/{i}: STVPM phase is not contiguous/in order')
      if any(x.add_waddr!=0 or x.add_magic or x.add_mux_a!=6 or x.add_mux_b!=7 or x.raddr_a!=lane or x.raddr_b!=2*lanes+lane for lane,x in enumerate(st)):raise ValueError(f'ir42/{i}: STVPM source/slot order is not exact')
      waits=[x for x in ins if x.add_op=='vpmwt']
-     wait_index=5*lanes if is_const else 4*lanes
+     wait_index=4*lanes if is_const else 4*lanes
      if len(waits)!=1 or waits[0].index!=wait_index:raise ValueError(f'ir42/{i}: VPM wait does not follow the final store')
   except Exception as e: bad.append(f'case {i} decoder: {e}')
+ # Resource-combination programs use valid fragment mechanics but deliberately
+ # exceed the old single-family decoder roles. Decode their exact physical
+ # register and uniform metadata contracts directly.
+ for i in range(22,30):
+  b=i*8;rc=q(c,r+b*8);addr=q(c,r+(b+1)*8);size=q(c,r+(b+2)*8);un=q(c,r+(b+4)*8)
+  if rc or not size:
+   eb=900+i*3
+   bad.append(f'case {i} mixed resources did not lower: rc={rc} bytes={size} source={q(c,r+eb*8)} opcode={q(c,r+(eb+1)*8)} stage={q(c,r+(eb+2)*8)}');continue
+  try:
+   ins=decode_program(blob(c,addr,size));words+=len(ins)
+   if sum(uniform_consumption(x) for x in ins)!=un:raise ValueError('uniform consumption does not match returned word count')
+   mb=600+i*10
+   meta=[q(c,r+(mb+k)*8) for k in range(10)]
+   meta=[x-(1<<64) if x&(1<<63) else x for x in meta]
+   push=i in (22,23,24,25,28,29);ubo=i in (22,23,26,27,28,29);sample=i in (24,25,26,27,28,29)
+   present=[meta[9]]
+   if push:
+    if meta[0]!=min(meta[1:5]):raise ValueError(f'pushFirst does not identify first semantic push word: {meta[:5]}')
+    if meta[0]<0 or meta[0]>=un:raise ValueError(f'pushFirst out of range: {meta[0]}, words={un}')
+    present+=meta[1:5]
+   elif any(x!=-1 for x in meta[:5]):raise ValueError(f'unused push metadata {meta[:5]}')
+   if ubo: present+=meta[5:7]
+   elif any(x!=-1 for x in meta[5:7]):raise ValueError(f'unused UBO metadata {meta[5:7]}')
+   if sample: present+=meta[7:9]
+   elif any(x!=-1 for x in meta[7:9]):raise ValueError(f'unused sample metadata {meta[7:9]}')
+   if any(x<0 or x>=un for x in present) or len(set(present))!=len(present):raise ValueError(f'indices not unique/in range: {meta}, words={un}')
+   if sorted(present)!=list(range(un)):raise ValueError(f'metadata does not cover exact stream: {present}, words={un}')
+   stream=q(c,r+(b+3)*8)
+   if push:
+    expected=(0x3f800000,0x40000000,0x40400000,0x3f800000)
+    for pos,value in zip(meta[1:5],expected):
+     if u32(c,stream+4*pos)!=value:raise ValueError(f'push semantic word {pos} is {u32(c,stream+4*pos):#x}, expected {value:#x}')
+   if ubo:
+    if u32(c,stream+4*meta[5])!=0x00102000:raise ValueError('UBO address metadata does not name the supplied address')
+    if u32(c,stream+4*meta[6])!=0xffffff7c:raise ValueError('UBO config metadata does not name vec4 configuration')
+   if sample:
+    if u32(c,stream+4*meta[7])!=0x00200000:raise ValueError('texture metadata does not name supplied state')
+    if u32(c,stream+4*meta[8])!=0x00200100:raise ValueError('sampler metadata does not name supplied state')
+   if u32(c,stream+4*meta[9])!=0xffffffff:raise ValueError('TLB metadata does not name exact configuration')
+   rb=400+i*5
+   preg,ureg,sreg,areg0,areg1=[q(c,r+(rb+k)*8) for k in range(5)]
+   regs=[]
+   if push:regs.append(('push',preg))
+   if ubo:regs.append(('ubo',ureg))
+   if sample:regs.append(('sample',sreg))
+   for ai,(name0,r0),(name1,r1) in [(areg0,regs[0],regs[1])]:
+    ar=[x for x in ins if x.add_op=='fadd/faddnf' and x.add_waddr in range(ai,ai+4)]
+    if len(ar)!=4 or any(x.raddr_a!=r0+k or x.raddr_b!=r1+k for k,x in enumerate(ar)):
+     raise ValueError(f'first arithmetic aliases/reorders {name0}/{name1}: regs={regs}, dest={ai}')
+   if len(regs)==3:
+    ar=[x for x in ins if x.add_op=='fadd/faddnf' and x.add_waddr in range(areg1,areg1+4)]
+    if len(ar)!=4 or any(x.raddr_a!=areg0+k or x.raddr_b!=regs[2][1]+k for k,x in enumerate(ar)):
+     raise ValueError(f'second arithmetic aliases/reorders prior/{regs[2][0]}')
+   ranges=[set(range(v,v+4)) for _,v in regs]
+   if any(ranges[a]&ranges[b] for a in range(len(ranges)) for b in range(a+1,len(ranges))):raise ValueError(f'resource register alias {regs}')
+   if sample and sreg!=0:raise ValueError(f'sample result is not rf0..3: {sreg}')
+   if sample and push and preg<14:raise ValueError(f'sample+push result overlaps reserved sample/UV registers: {preg}')
+   if sample and ubo and ureg<14:raise ValueError(f'sample+UBO result not disjoint/reserved: {ureg}')
+   if i==28 and meta!=[2,2,3,4,5,6,7,0,1,8]:raise ValueError(f'triple canonical metadata {meta}')
+  except Exception as e:bad.append(f'case {i} mixed decoder: {e}')
+ # Duplicate live input loads must consume one four-lane varying FIFO value
+ # and both SSA IDs must map to the same semantic registers.
+ try:
+  b=21*8;ins=decode_program(blob(c,q(c,r+(b+1)*8),q(c,r+(b+2)*8)))
+  varying=[x.signal_addr for x in ins if 'ldvary' in x.signals]
+  if varying!=[0,1,2,3]:raise ValueError(f'varying FIFO consumed {varying}')
+  first=[q(c,r+(550+k)*8) for k in range(4)]
+  second=[q(c,r+(554+k)*8) for k in range(4)]
+  if first!=[0,1,2,3] or second!=first:raise ValueError(f'duplicate SSA lane mappings differ: {first} vs {second}')
+ except Exception as e:bad.append(f'case 21 duplicate-input decoder: {e}')
  return checks,bad+[f'__WORDS__={words}']
 def sourcecheck(text):
  need=('AnvilVkIrVerify(*m)','@avk42CodeScratch[0]','avk42RangesOverlap(','#ANVIL_IR_V3D42_TMU_VEC4','V3dQpuLastThrsw()','V3dQpuProgramEnd()','#ANVIL_IR_DEC_RELAXED_PRECISION','If *other\\variableId = *io\\variableId','#ANVIL_IR_OP_FADD','#ANVIL_IR_OP_FMUL')
@@ -145,4 +264,5 @@ def main():
   if not caught:missed+=1
  if missed:print(f'vulkan_ir_v3d42_check: FAIL - {missed} mutants escaped');return 1
  print(f'vulkan_ir_v3d42_check: all {len(MUTANTS)} mutations rejected');return 0
-if __name__=='__main__':raise SystemExit(main())
+if __name__=='__main__':
+ with checker_lock():raise SystemExit(main())

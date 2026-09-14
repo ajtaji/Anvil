@@ -381,6 +381,7 @@ Procedure.i RockVopConfigurePrimary()
   Protected lineBufferMode.i
   Protected hactiveStart.i
   Protected vactiveStart.i
+  rock_vop_configured=0
   If rock_vop_prepared=0 : rock_vop_error=82 : ProcedureReturn 0 : EndIf
   If RockVopModeValid()=0 : ProcedureReturn 0 : EndIf
   lineBufferMode=RockVopLineBufferMode(rock_mode_width)
@@ -408,6 +409,7 @@ Procedure.i RockVopConfigurePrimary()
 EndProcedure
 
 Procedure.i RockVopStartPrimary()
+  rock_vop_ready=0
   If rock_vop_prepared=0 Or rock_vop_configured=0
     rock_vop_error=83
     ProcedureReturn 0

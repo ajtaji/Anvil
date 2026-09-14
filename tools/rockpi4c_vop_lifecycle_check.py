@@ -139,6 +139,7 @@ def check_source(vop_path: Path) -> None:
     ordered(
         configure,
         (
+            "rock_vop_configured=0",
             "rock_vop_prepared=0",
             "rockvopmodevalid()",
             "linebuffermode=rockvoplinebuffermode(rock_mode_width)",
@@ -172,6 +173,7 @@ def check_source(vop_path: Path) -> None:
     ordered(
         start,
         (
+            "rock_vop_ready=0",
             "rock_vop_prepared=0 or rock_vop_configured=0",
             "rockvopfield(#vop_win0_ctrl0,#vop_win_enable,#vop_win_enable)",
             "rockvoplatchframe()",

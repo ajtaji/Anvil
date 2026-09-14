@@ -245,6 +245,19 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   sampledImage.i
 EndStructure
 
+; One closed, synchronous pipeline-build transaction. The fragment IR points
+; into a live VkShaderModule only for the duration of avkBackendPipelineBuild;
+; a successful backend must retain executable bytes and exact patch metadata,
+; never this pointer. The portable layer validates the module slot and its IR
+; generation immediately before this synchronous call; the backend therefore
+; receives no unverifiable lifetime token of its own.
+Structure AnvilVkBackendPipelineBuildInfo Align #PB_Structure_AlignC
+  pipeline.i
+  base.i
+  bytes.i
+  fragmentIr.i
+EndStructure
+
 ; ----------------------------------------------------------------------
 ;  THE BACKEND SEAM.
 ; ----------------------------------------------------------------------
@@ -279,7 +292,7 @@ Declare.i avkBackendTicksUs()
 ; being absent, so a build that reaches one links and refuses instead of
 ; failing to resolve a symbol at the worst possible moment.
 Declare.i avkBackendPipelineBytes()
-Declare.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
+Declare.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
 Declare avkBackendPipelineRelease(pipe.i)
 Declare.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
 Declare.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)

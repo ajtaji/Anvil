@@ -46,6 +46,13 @@
 XIncludeFile "Anvil/Graphics/Vulkan/vk_command.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_descriptor.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_ir.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_ir_adapter.pbi"
+
+; A fragment whose stored value is a typed arithmetic graph is no longer one
+; of the five legacy single-source shapes. This is an observation for gates
+; and diagnostics only; resource validation uses the independent flags below.
+#ANVIL_SPV_COLOUR_IR = 5
 
 ; EIGHT BUFFERS AND EIGHT SHADER MODULES, raised from four when the
 ; split vertex layout and the descriptor path arrived: one diagnostic
@@ -82,11 +89,20 @@ Global Dim avkBufBound.a[#ANVIL_VK_MAX_BUFFERS + 1]
 Global Dim avkBufInFlight.i[#ANVIL_VK_MAX_BUFFERS + 1]
 
 ; ----------------------------------------------------------------------
-;  SHADER MODULES. One module holds one walked plan.
+;  SHADER MODULES. One module owns one verified, immutable typed IR image.
+;
+;  The legacy coordinate/vertex plan remains beside it until typed IR can
+;  represent gl_Position and multiple stores. Fragment compilation never
+;  reads parser globals: it consumes the slot-owned IR below. `valid` and the
+;  matching generation are published before the handle and invalidated on
+;  destroy, so a recycled module slot cannot expose yesterday's semantics.
 ; ----------------------------------------------------------------------
 Global Dim avkShLive.a[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShGen.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShDev.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShIr.AvkSpirvIrStorage[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShIrGen.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShIrLive.a[193]
 Global Dim avkShStage.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShWords.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShInstr.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
@@ -103,6 +119,7 @@ Global Dim avkShSample.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShSampleSet.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShSampleBinding.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShSampleCoord.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShUsesVarying.a[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShInComp.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_ATTRS]
 Global Dim avkShOutComp.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_VARYINGS]
 Global Dim avkShOutSrc.i[(#ANVIL_VK_MAX_SHADER_MODULES + 1) * #ANVIL_SPV_MAX_VARYINGS]
@@ -165,6 +182,10 @@ Global Dim avkPipePosAttr.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeVaryCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeColourSrc.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeColourIdx.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeUsesPush.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeUsesUniform.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeUsesSample.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeUsesVarying.a[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeUniformBinding.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeSampleBinding.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeSampleCoord.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -568,6 +589,293 @@ EndProcedure
 ; ======================================================================
 ;  SHADER MODULES
 ; ======================================================================
+Procedure.i avkShIrDecoration(*m.AvkIrModule, id.i, kind.i)
+  Define i.i
+  Define *d.AvkIrDecoration
+  i = 0
+  While i < *m\decorationCount
+    *d = avkIrDecorationAt(*m, i)
+    If *d\sourceId = id And *d\member = -1 And *d\kind = kind
+      ProcedureReturn *d\value
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i avkShIrMemberDecoration(*m.AvkIrModule, id.i, member.i, kind.i)
+  Define i.i
+  Define *d.AvkIrDecoration
+  i = 0
+  While i < *m\decorationCount
+    *d = avkIrDecorationAt(*m, i)
+    If *d\sourceId = id And *d\member = member And *d\kind = kind
+      ProcedureReturn *d\value
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i avkShIrBlockSelectionValid(*m.AvkIrModule, variableId.i, member.i)
+  Define *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Define *pointer.AvkIrType
+  Define *block.AvkIrType
+  Define *memberType.AvkIrType
+  Define *scalar.AvkIrType
+  Define typeId.i
+  If *v = 0 Or member <> 0 : ProcedureReturn 0 : EndIf
+  *pointer = avkIrFindType(*m, *v\pointerType)
+  If *pointer = 0 Or *pointer\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  *block = avkIrFindType(*m, *pointer\pointeeType)
+  If *block = 0 Or *block\kind <> #ANVIL_IR_TYPE_STRUCT Or *block\memberCount < 1 : ProcedureReturn 0 : EndIf
+  If avkShIrDecoration(*m, *block\sourceId, #ANVIL_IR_DEC_BLOCK) < 0 : ProcedureReturn 0 : EndIf
+  If avkShIrMemberDecoration(*m, *block\sourceId, 0, #ANVIL_IR_DEC_OFFSET) <> 0 : ProcedureReturn 0 : EndIf
+  typeId = avkIrMemberType(*block, 0)
+  *memberType = avkIrFindType(*m, typeId)
+  If *memberType = 0 Or *memberType\kind <> #ANVIL_IR_TYPE_VECTOR Or *memberType\componentCount <> 4 : ProcedureReturn 0 : EndIf
+  *scalar = avkIrFindType(*m, *memberType\componentType)
+  If *scalar = 0 Or *scalar\kind <> #ANVIL_IR_TYPE_FLOAT Or *scalar\width <> 32 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkShIrComponents(*m.AvkIrModule, variableId.i)
+  Define *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Define *p.AvkIrType
+  If *v = 0 : ProcedureReturn 0 : EndIf
+  *p = avkIrFindType(*m, *v\pointerType)
+  If *p = 0 Or *p\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkIrFloatLanes(*m, *p\pointeeType)
+EndProcedure
+
+Procedure.i avkShIrPointerSelection(*m.AvkIrModule, pointerId.i, *variableOut, *memberOut)
+  Define *v.AvkIrVariable = avkIrFindVariable(*m, pointerId)
+  Define *n.AvkIrNode
+  Define *c.AvkIrConstant
+  If *v <> 0
+    PokeI(*variableOut, *v\sourceId)
+    PokeI(*memberOut, -1)
+    ProcedureReturn *v\pointerType
+  EndIf
+  *n = avkIrFindNode(*m, pointerId)
+  If *n = 0 Or *n\kind <> #ANVIL_IR_OP_ACCESS_CHAIN : ProcedureReturn 0 : EndIf
+  *v = avkIrFindVariable(*m, *n\operand0)
+  *c = avkIrFindConstant(*m, *n\operand1)
+  If *v = 0 Or *c = 0 : ProcedureReturn 0 : EndIf
+  PokeI(*variableOut, *v\sourceId)
+  PokeI(*memberOut, *c\word0)
+  ProcedureReturn *n\resultType
+EndProcedure
+
+Procedure.i avkShIrInputIndex(*m.AvkIrModule, variableId.i)
+  ProcedureReturn avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_LOCATION)
+EndProcedure
+
+Procedure avkShIrBuildLive(*m.AvkIrModule, rootId.i)
+  Define i.i
+  Define k.i
+  Define changed.i
+  Define id.i
+  Define *n.AvkIrNode
+  i = 0
+  While i < 193 : avkShIrLive[i] = 0 : i = i + 1 : Wend
+  If rootId > 0 And rootId < 193 : avkShIrLive[rootId] = 1 : EndIf
+  changed = 1
+  While changed <> 0
+    changed = 0
+    i = 0
+    While i < *m\nodeCount
+      *n = avkIrNodeAt(*m, i)
+      If *n\sourceId > 0 And *n\sourceId < 193 And avkShIrLive[*n\sourceId] <> 0
+        k = 0
+        While k < *n\operandCount
+          id = avkIrOperand(*n, k)
+          If id > 0 And id < 193 And avkShIrLive[id] = 0
+            avkShIrLive[id] = 1
+            changed = 1
+          EndIf
+          k = k + 1
+        Wend
+      EndIf
+      i = i + 1
+    Wend
+  Wend
+EndProcedure
+
+; Derive the fragment interface and every runtime resource independently from
+; immutable typed IR. Arithmetic can combine a varying with one resource, so
+; an exclusive "colour source" is insufficient for correctness.
+Procedure.i avkShIrSummarizeFragment(slot.i)
+  Define *m.AvkIrModule = @avkShIr[slot]\module
+  Define *v.AvkIrVariable
+  Define *n.AvkIrNode
+  Define *load.AvkIrNode
+  Define *c.AvkIrConstant
+  Define *lane.AvkIrConstant
+  Define i.i
+  Define k.i
+  Define location.i
+  Define comps.i
+  Define variableId.i
+  Define member.i
+  Define valueId.i
+  Define outputVariableId.i
+  Define base.i
+
+  avkShInCount[slot] = 0
+  avkShOutCount[slot] = 0
+  avkShPosAttr[slot] = -1
+  avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_IR
+  avkShColourIdx[slot] = -1
+  avkShPush[slot] = 0
+  avkShUniform[slot] = 0
+  avkShUniformSet[slot] = -1
+  avkShUniformBinding[slot] = -1
+  avkShSample[slot] = 0
+  avkShSampleSet[slot] = -1
+  avkShSampleBinding[slot] = -1
+  avkShSampleCoord[slot] = -1
+  avkShUsesVarying[slot] = 0
+  base = slot * #ANVIL_SPV_MAX_ATTRS
+  k = 0
+  While k < #ANVIL_SPV_MAX_ATTRS
+    avkShInComp[base + k] = 0
+    k = k + 1
+  Wend
+  base = slot * #ANVIL_SPV_MAX_VARYINGS
+  k = 0
+  While k < #ANVIL_SPV_MAX_VARYINGS
+    avkShOutComp[base + k] = 0
+    avkShOutSrc[base + k] = -1
+    k = k + 1
+  Wend
+  base = slot * 4
+  k = 0
+  While k < 4
+    avkShConst[base + k] = 0
+    k = k + 1
+  Wend
+
+  ; The executable interface is rooted at the sole final Store value. SPIR-V
+  ; may legally retain declared inputs and dead loads which do not contribute
+  ; to that value; advertising those dead inputs to the backend would make its
+  ; strict target validation reject an otherwise unchanged legacy shader.
+  i = 0 : valueId = 0 : outputVariableId = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    If *n\kind = #ANVIL_IR_OP_STORE
+      valueId = *n\operand1
+      member = -1
+      avkShIrPointerSelection(*m, *n\operand0, @outputVariableId, @member)
+    EndIf
+    i = i + 1
+  Wend
+  avkShIrBuildLive(*m, valueId)
+
+  i = 0
+  While i < *m\variableCount
+    *v = avkIrVariableAt(*m, i)
+    location = avkShIrDecoration(*m, *v\sourceId, #ANVIL_IR_DEC_LOCATION)
+    If location >= 0
+      comps = avkShIrComponents(*m, *v\sourceId)
+      If comps < 1 Or location >= #ANVIL_SPV_MAX_ATTRS
+        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+      EndIf
+      If *v\storageClass = #ANVIL_IR_STORAGE_INPUT And avkShIrLive[*v\sourceId] <> 0
+        avkShInComp[(slot * #ANVIL_SPV_MAX_ATTRS) + location] = comps
+        If avkShInCount[slot] < location + 1 : avkShInCount[slot] = location + 1 : EndIf
+      ElseIf *v\storageClass = #ANVIL_IR_STORAGE_OUTPUT And *v\sourceId = outputVariableId
+        avkShOutComp[(slot * #ANVIL_SPV_MAX_VARYINGS) + location] = comps
+        If avkShOutCount[slot] < location + 1 : avkShOutCount[slot] = location + 1 : EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+
+  ; Live loads name push/uniform use. A sampled image is counted only by the sample
+  ; operation, not merely because its semantic handle was loaded.
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    If *n\sourceId > 0 And avkShIrLive[*n\sourceId] <> 0 And *n\kind = #ANVIL_IR_OP_LOAD
+      variableId = 0 : member = -1
+      If avkShIrPointerSelection(*m, *n\operand0, @variableId, @member) <> 0
+        *v = avkIrFindVariable(*m, variableId)
+        If *v <> 0 And *v\storageClass = #ANVIL_IR_STORAGE_PUSH_CONSTANT
+          If avkShIrBlockSelectionValid(*m, variableId, member) = 0 : ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED : EndIf
+          avkShPush[slot] = 1
+        ElseIf *v <> 0 And *v\storageClass = #ANVIL_IR_STORAGE_UNIFORM
+          If avkShIrBlockSelectionValid(*m, variableId, member) = 0 : ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED : EndIf
+          avkShUniform[slot] = 1
+          avkShUniformSet[slot] = avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_DESCRIPTOR_SET)
+          avkShUniformBinding[slot] = avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_BINDING)
+        ElseIf *v <> 0 And *v\storageClass = #ANVIL_IR_STORAGE_INPUT
+          avkShUsesVarying[slot] = 1
+        EndIf
+      EndIf
+    ElseIf *n\sourceId > 0 And avkShIrLive[*n\sourceId] <> 0 And *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
+      avkShSample[slot] = 1
+      *load = avkIrFindNode(*m, *n\operand0)
+      If *load = 0 Or *load\kind <> #ANVIL_IR_OP_LOAD
+        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+      EndIf
+      variableId = 0 : member = -1
+      If avkShIrPointerSelection(*m, *load\operand0, @variableId, @member) = 0
+        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+      EndIf
+      avkShSampleSet[slot] = avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_DESCRIPTOR_SET)
+      avkShSampleBinding[slot] = avkShIrDecoration(*m, variableId, #ANVIL_IR_DEC_BINDING)
+      *load = avkIrFindNode(*m, *n\operand1)
+      If *load = 0 Or *load\kind <> #ANVIL_IR_OP_LOAD
+        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+      EndIf
+      variableId = 0 : member = -1
+      If avkShIrPointerSelection(*m, *load\operand0, @variableId, @member) = 0
+        ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+      EndIf
+      avkShSampleCoord[slot] = avkShIrInputIndex(*m, variableId)
+    EndIf
+    i = i + 1
+  Wend
+
+  ; Preserve the five observable legacy source names only when the final store
+  ; is exactly that shape. A computed graph is #ANVIL_SPV_COLOUR_IR even when
+  ; it happens to read one of the same resources.
+  *n = avkIrFindNode(*m, valueId)
+  If *n <> 0 And *n\kind = #ANVIL_IR_OP_LOAD
+    variableId = 0 : member = -1
+    If avkShIrPointerSelection(*m, *n\operand0, @variableId, @member) <> 0
+      *v = avkIrFindVariable(*m, variableId)
+      If *v <> 0 And *v\storageClass = #ANVIL_IR_STORAGE_INPUT
+        avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_VARYING
+        avkShColourIdx[slot] = avkShIrInputIndex(*m, variableId)
+      ElseIf *v <> 0 And *v\storageClass = #ANVIL_IR_STORAGE_PUSH_CONSTANT
+        avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_PUSH
+        avkShColourIdx[slot] = 0
+      ElseIf *v <> 0 And *v\storageClass = #ANVIL_IR_STORAGE_UNIFORM
+        avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_UNIFORM
+        avkShColourIdx[slot] = 0
+      EndIf
+    EndIf
+  ElseIf *n <> 0 And *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
+    avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_SAMPLED
+    avkShColourIdx[slot] = avkShSampleCoord[slot]
+  Else
+    *c = avkIrFindConstant(*m, valueId)
+    If *c <> 0 And *c\componentCount = 4
+      avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_CONST
+      k = 0
+      While k < 4
+        *lane = avkIrFindConstant(*m, avkIrConstantComponent(*c, k))
+        If *lane = 0 Or *lane\wordCount <> 1 : ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED : EndIf
+        avkShConst[(slot * 4) + k] = *lane\word0
+        k = k + 1
+      Wend
+    EndIf
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
   Define d.i
   Define s.i
@@ -578,15 +886,22 @@ Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
   PokeI(*out, #VK_NULL_HANDLE)
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  rc = AnvilVkSpirvWalk(*code, bytes)
+  rc = AnvilVkSpirvWalkIr(*code, bytes)
   If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_SHADER_MODULES And avkShLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_SHADER_MODULES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+  rc = AnvilVkSpirvIrAdapt(@avkShIr[s])
+  If rc <> #ANVIL_IR_OK
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule could not retain the accepted SPIR-V as verified typed IR (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no shader module was published and the adapter's last-error fields identify the semantic record that failed.")
+  EndIf
   avkShGen[s] = avkNextGen(avkShGen[s])
-  avkShLive[s] = 1
   avkShDev[s] = d
-  avkShStage[s] = AnvilVkSpirvStage()
+  If avkShIr[s]\module\stage = #ANVIL_IR_STAGE_VERTEX
+    avkShStage[s] = 0
+  Else
+    avkShStage[s] = 4
+  EndIf
   avkShWords[s] = bytes / 4
   avkShInstr[s] = AnvilVkSpirvInstructions()
   avkShInCount[s] = AnvilVkSpirvInputCount()
@@ -621,6 +936,15 @@ Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
     avkShConst[base + k] = AnvilVkSpirvColourConstant(k)
     k = k + 1
   Wend
+  If avkShIr[s]\module\stage = #ANVIL_IR_STAGE_FRAGMENT
+    rc = avkShIrSummarizeFragment(s)
+    If rc <> #VK_SUCCESS
+      avkShIr[s]\valid = 0
+      ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule could not derive a complete fragment interface and resource summary from verified typed IR (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no shader module was published.")
+    EndIf
+  EndIf
+  avkShIrGen[s] = avkShGen[s]
+  avkShLive[s] = 1
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_SHADER_MODULE, s, avkShGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -640,7 +964,22 @@ Procedure AnvilVkShaderModuleDestroy(device.i, module.i)
     avkFault(#ANVIL_VK_ERR_OWNER, "vkDestroyShaderModule was called with a device that does not own this module (Anvil code -20003, wrong parent); nothing was destroyed.")
     ProcedureReturn
   EndIf
+  avkShIr[s]\valid = 0
+  avkShIrGen[s] = 0
   avkShLive[s] = 0
+EndProcedure
+
+Procedure.i AnvilVkShaderModuleIr(module.i)
+  Define s.i = avkShSlot(module)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  If avkShIrGen[s] <> avkShGen[s] Or avkShIr[s]\valid = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn @avkShIr[s]\module
+EndProcedure
+
+Procedure.i AnvilVkShaderModuleIrGeneration(module.i)
+  Define s.i = avkShSlot(module)
+  If s = 0 Or avkShIr[s]\valid = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkShIrGen[s]
 EndProcedure
 
 Procedure.i AnvilVkShaderModuleStage(module.i)
@@ -1213,6 +1552,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   Define mem.i
   Define sampleMask.i
   Define *st.VkPipelineShaderStageCreateInfo
+  Define build.AnvilVkBackendPipelineBuildInfo
 
   If *out = 0 Or *ci = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
@@ -1313,10 +1653,10 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
     EndIf
     k = k + 1
   Wend
-  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_PUSH And avkLayPushBytes[lay] <> #ANVIL_VK_PUSH_BYTES
+  If avkShPush[fs] <> 0 And avkLayPushBytes[lay] <> #ANVIL_VK_PUSH_BYTES
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that reads the push-constant block through a pipeline layout that declares no push constant range (Anvil code -20001, layout mismatch); declare a sixteen-byte fragment-stage range at offset zero.")
   EndIf
-  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_VARYING And avkShOutCount[vs] < 1
+  If avkShUsesVarying[fs] <> 0 And avkShOutCount[vs] < 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that interpolates a varying its vertex shader never writes (Anvil code -20001, interface mismatch); the vertex stage must write the Location the fragment stage reads.")
   EndIf
   ; THE DESCRIPTOR INTERFACE. A fragment shader that reads a uniform
@@ -1325,7 +1665,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   ; uniform buffer there, in the fragment stage. This is the one place
   ; the module and the layout are both in view, and a mismatch caught
   ; anywhere later is a draw reading an address nothing wrote.
-  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_UNIFORM
+  If avkShUniform[fs] <> 0
     If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that reads a uniform block through a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); create a VkDescriptorSetLayout with a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER binding at the fragment stage and name it in VkPipelineLayoutCreateInfo.")
     EndIf
@@ -1336,7 +1676,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose uniform block names a binding its pipeline layout's descriptor set layout does not declare as a fragment-stage uniform buffer (Anvil code -20001, layout mismatch); the Binding decoration in the SPIR-V and the binding number in VkDescriptorSetLayoutBinding are the same number and they must agree.")
     EndIf
   EndIf
-  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_SAMPLED
+  If avkShSample[fs] <> 0
     If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that samples an image through a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); create a VkDescriptorSetLayout with a VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER binding at the fragment stage and name it in VkPipelineLayoutCreateInfo.")
     EndIf
@@ -1347,7 +1687,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose sampled image names a binding its pipeline layout does not declare as a fragment-stage combined image sampler (Anvil code -20001, layout mismatch); the Binding decoration in SPIR-V and the descriptor-set-layout binding must agree.")
     EndIf
   EndIf
-  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_SAMPLED And avkLaySetCount[lay] <> 0
+  If avkShUniform[fs] = 0 And avkShSample[fs] = 0 And avkLaySetCount[lay] <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a pipeline layout that declares a descriptor set layout for a fragment shader that reads no descriptor (Anvil code -20001, layout mismatch); a declared set has to be allocated, written and bound before every draw, so one nothing reads is work with no picture at the end of it.")
   EndIf
 
@@ -1365,6 +1705,10 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   avkPipeVaryCount[s] = avkShOutCount[vs]
   avkPipeColourSrc[s] = avkShColourSrc[fs]
   avkPipeColourIdx[s] = avkShColourIdx[fs]
+  avkPipeUsesPush[s] = avkShPush[fs]
+  avkPipeUsesUniform[s] = avkShUniform[fs]
+  avkPipeUsesSample[s] = avkShSample[fs]
+  avkPipeUsesVarying[s] = avkShUsesVarying[fs]
   avkPipeUniformBinding[s] = avkShUniformBinding[fs]
   avkPipeSampleBinding[s] = avkShSampleBinding[fs]
   avkPipeSampleCoord[s] = avkShSampleCoord[fs]
@@ -1421,7 +1765,16 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   avkPipeCodeMem[s] = mem
   avkPipeCodeBase[s] = avkHeapBase + avkMemOffset[mem]
   avkPipeCodeBytes[s] = need
-  rc = avkBackendPipelineBuild(s, avkPipeCodeBase[s], need)
+  If avkShIr[fs]\valid = 0 Or avkShIrGen[fs] <> avkShGen[fs]
+    avkInternalFree(mem)
+    avkPipeCodeMem[s] = 0
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateGraphicsPipelines found that its fragment module's verified typed IR lifetime ended before backend lowering (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was published.")
+  EndIf
+  build\pipeline = s
+  build\base = avkPipeCodeBase[s]
+  build\bytes = need
+  build\fragmentIr = @avkShIr[fs]\module
+  rc = avkBackendPipelineBuild(@build)
   If rc <> #VK_SUCCESS
     avkInternalFree(mem)
     avkPipeCodeMem[s] = 0
@@ -1528,6 +1881,26 @@ EndProcedure
 Procedure.i AnvilVkPipelineColourSource(pipe.i)
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
   ProcedureReturn avkPipeColourSrc[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineUsesPushConstants(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeUsesPush[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineUsesUniformBuffer(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeUsesUniform[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineUsesSampledImage(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeUsesSample[pipe]
+EndProcedure
+
+Procedure.i AnvilVkPipelineUsesVarying(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkPipeUsesVarying[pipe]
 EndProcedure
 
 Procedure.i AnvilVkPipelineSampleBinding(pipe.i)
@@ -1918,7 +2291,7 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     EndIf
     k = k + 1
   Wend
-  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_PUSH And avkCbPushBytes[c] <> #ANVIL_VK_PUSH_BYTES
+  If avkPipeUsesPush[p] <> 0 And avkCbPushBytes[c] <> #ANVIL_VK_PUSH_BYTES
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader reads the push-constant block, and no push constants were recorded (Anvil code -20004, push constants not set); call vkCmdPushConstants before the draw, because an unset block would be whatever the memory happened to hold.")
     ProcedureReturn
   EndIf
@@ -1926,7 +2299,7 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
   ; Three separate ways to arrive with nothing to read, and each is
   ; named: no set bound at all, a set bound through the wrong layout,
   ; and a set whose binding vkUpdateDescriptorSets never filled.
-  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM
+  If avkPipeUsesUniform[p] <> 0
     If avkCbDescSet[c] = 0
       avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader reads a uniform buffer, and no descriptor set was bound (Anvil code -20004, no descriptor set bound); call vkCmdBindDescriptorSets before the draw, because the set is what says which buffer the shader reads.")
       ProcedureReturn
@@ -1944,7 +2317,7 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
       ProcedureReturn
     EndIf
   EndIf
-  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_SAMPLED
+  If avkPipeUsesSample[p] <> 0
     If avkCbDescSet[c] = 0
       avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader samples an image, and no descriptor set was bound (Anvil code -20004, no descriptor set bound); bind the set that owns the combined image sampler before the draw.")
       ProcedureReturn
@@ -1992,7 +2365,7 @@ EndProcedure
 ; The VkBuffer this draw's descriptor names, or 0. One procedure, so the
 ; retain and the release cannot ever disagree about which buffer it was.
 Procedure.i avkDrawUniformBuffer(c.i, p.i)
-  If avkPipeColourSrc[p] <> #ANVIL_SPV_COLOUR_UNIFORM : ProcedureReturn 0 : EndIf
+  If avkPipeUsesUniform[p] = 0 : ProcedureReturn 0 : EndIf
   If avkCbDescSet[c] = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn AnvilVkDescriptorSetBuffer(avkCbDescSet[c], avkPipeUniformBinding[p])
 EndProcedure
@@ -2000,7 +2373,7 @@ EndProcedure
 ; The VkImage this draw's combined sampler names, or 0. As with the uniform
 ; helper, retain and release share this one owner lookup so they cannot drift.
 Procedure.i avkDrawSampleImage(c.i, p.i)
-  If avkPipeColourSrc[p] <> #ANVIL_SPV_COLOUR_SAMPLED : ProcedureReturn 0 : EndIf
+  If avkPipeUsesSample[p] = 0 : ProcedureReturn 0 : EndIf
   If avkCbDescSet[c] = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn AnvilVkDescriptorSetSampledImageHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
 EndProcedure
@@ -2193,16 +2566,16 @@ Procedure.i avkDrawSubmit(c.i)
   ; a uniform buffer, so a backend cannot read a stale one by accident.
   avkDrawRecord\uniformBase = 0
   avkDrawRecord\uniformBytes = 0
-  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM And avkCbDescSet[c] <> 0
+  If avkPipeUsesUniform[p] <> 0 And avkCbDescSet[c] <> 0
     avkDrawRecord\uniformBase = AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p])
     avkDrawRecord\uniformBytes = AnvilVkDescriptorSetRange(avkCbDescSet[c], avkPipeUniformBinding[p])
   EndIf
-  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_UNIFORM And avkDrawRecord\uniformBase = 0
+  If avkPipeUsesUniform[p] <> 0 And avkDrawRecord\uniformBase = 0
     avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose descriptor set, or the buffer written into it, has since been destroyed (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
     ProcedureReturn -1
   EndIf
   avkDrawRecord\sampledImage = 0
-  If avkPipeColourSrc[p] = #ANVIL_SPV_COLOUR_SAMPLED
+  If avkPipeUsesSample[p] <> 0
     If avkCbDescSet[c] = 0 Or AnvilVkDescriptorSetSampledImage(avkCbDescSet[c], avkPipeSampleBinding[p], @avkSampleStage) = 0
       avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose combined image sampler, image view, sampler or sampled image is no longer live and ready (Anvil code -20004, stale sampled descriptor); re-record the command buffer against live objects in shader-read layout.")
       ProcedureReturn -1

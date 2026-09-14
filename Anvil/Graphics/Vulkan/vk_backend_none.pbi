@@ -118,7 +118,7 @@ Procedure.i avkBackendPipelineBytes()
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i avkBackendPipelineBuild(pipe.i, base.i, bytes.i)
+Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
   ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
 EndProcedure
 
