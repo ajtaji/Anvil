@@ -1,0 +1,513 @@
+; Dedicated desk gate for canonical typed vertex planning and transactional
+; V3D 4.2 coordinate/vertex pair emission. No Vulkan objects or MMIO.
+
+XIncludeFile "../vk_ir_v3d42.pi4"
+
+#VG_MAGIC = $56523432
+#VG_CASES = 64
+#VG_STRIDE = 48
+Global Dim vgTypes.AvkIrType[16]
+Global Dim vgConstants.AvkIrConstant[8]
+Global Dim vgVariables.AvkIrVariable[12]
+Global Dim vgInterfaces.i[12]
+Global Dim vgDecorations.AvkIrDecoration[24]
+Global Dim vgBlocks.AvkIrBlock[2]
+Global Dim vgNodes.AvkIrNode[24]
+Global Dim vgInputs.AvkIrV3d42Io[4]
+Global Dim vgCsCode.i[#VG_CASES * 128]
+Global Dim vgVsCode.i[#VG_CASES * 128]
+Global Dim vgCsUniform.l[#VG_CASES * 64]
+Global Dim vgVsUniform.l[#VG_CASES * 64]
+Global Dim vgReport.i[4096]
+
+Procedure vgZero()
+  Protected i.i
+  i=0 : While i<SizeOf(AvkIrType)*16 : PokeA(@vgTypes[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrConstant)*8 : PokeA(@vgConstants[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrVariable)*12 : PokeA(@vgVariables[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(.i)*12 : PokeA(@vgInterfaces[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrDecoration)*24 : PokeA(@vgDecorations[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrBlock)*2 : PokeA(@vgBlocks[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrNode)*24 : PokeA(@vgNodes[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrV3d42Io)*4 : PokeA(@vgInputs[0]+i,0) : i=i+1 : Wend
+EndProcedure
+
+Procedure vgType(index.i, sourceId.i, sourceOp.i, irKind.i)
+  vgTypes[index]\sourceId = sourceId
+  vgTypes[index]\sourceOpcode = sourceOp
+  vgTypes[index]\kind = irKind
+EndProcedure
+
+Procedure vgNode(index.i, sourceId.i, sourceOp.i, irKind.i, resultType.i, operands.i)
+  vgNodes[index]\sourceId = sourceId
+  vgNodes[index]\sourceOpcode = sourceOp
+  vgNodes[index]\kind = irKind
+  vgNodes[index]\resultType = resultType
+  vgNodes[index]\blockId = 50
+  vgNodes[index]\operandCount = operands
+EndProcedure
+
+Procedure vgDecor(index.i, sourceId.i, member.i, irKind.i, value.i)
+  vgDecorations[index]\sourceId = sourceId
+  vgDecorations[index]\sourceOpcode = #ANVIL_IR_SPV_DECORATE
+  If member >= 0 : vgDecorations[index]\sourceOpcode = #ANVIL_IR_SPV_MEMBER_DECORATE : EndIf
+  vgDecorations[index]\member = member
+  vgDecorations[index]\kind = irKind
+  vgDecorations[index]\value = value
+EndProcedure
+
+; mode: 0=no varying, 2=one vec2, 4=one vec4, 22=two vec2.
+Procedure vgModule(*m.AvkIrModule,mode.i,reverseStores.i,directPosition.i)
+  Protected i.i=0
+  Protected n.i=0
+  Protected d.i=0
+  Protected v.i=0
+  Protected varyingLoads.i=0
+  Protected clear.i=0
+  vgZero()
+  While clear<SizeOf(AvkIrModule) : PokeA(*m+clear,0) : clear=clear+1 : Wend
+  *m\sourceVersion=$00010000 : *m\idBound=64 : *m\stage=#ANVIL_IR_STAGE_VERTEX : *m\entryFunctionId=49 : *m\entryFunctionOpcode=#ANVIL_IR_SPV_FUNCTION
+  *m\functionTypeId=9 : *m\returnTypeId=1 : *m\entryBlockId=50
+  *m\types=@vgTypes[0] : *m\constants=@vgConstants[0] : *m\variables=@vgVariables[0]
+  *m\interfaces=@vgInterfaces[0]
+  *m\decorations=@vgDecorations[0] : *m\blocks=@vgBlocks[0] : *m\nodes=@vgNodes[0]
+  *m\typeCount=9 : *m\constantCount=2 : *m\blockCount=1
+  vgType(0,1,#ANVIL_IR_SPV_TYPE_VOID,#ANVIL_IR_TYPE_VOID)
+  vgType(1,2,#ANVIL_IR_SPV_TYPE_FLOAT,#ANVIL_IR_TYPE_FLOAT) : vgTypes[1]\width=32
+  vgType(2,3,#ANVIL_IR_SPV_TYPE_VECTOR,#ANVIL_IR_TYPE_VECTOR) : vgTypes[2]\componentType=2 : vgTypes[2]\componentCount=2
+  vgType(3,4,#ANVIL_IR_SPV_TYPE_VECTOR,#ANVIL_IR_TYPE_VECTOR) : vgTypes[3]\componentType=2 : vgTypes[3]\componentCount=4
+  vgType(4,5,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[4]\storageClass=#ANVIL_IR_STORAGE_INPUT : vgTypes[4]\pointeeType=3
+  vgType(5,6,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[5]\storageClass=#ANVIL_IR_STORAGE_INPUT : vgTypes[5]\pointeeType=4
+  vgType(6,7,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[6]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[6]\pointeeType=3
+  vgType(7,8,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[7]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[7]\pointeeType=4
+  vgType(8,9,#ANVIL_IR_SPV_TYPE_FUNCTION,#ANVIL_IR_TYPE_FUNCTION) : vgTypes[8]\returnType=1
+  vgConstants[0]\sourceId=30 : vgConstants[0]\sourceOpcode=#ANVIL_IR_SPV_CONSTANT : vgConstants[0]\typeId=2 : vgConstants[0]\wordCount=1 : vgConstants[0]\word0=$00000000
+  vgConstants[1]\sourceId=31 : vgConstants[1]\sourceOpcode=#ANVIL_IR_SPV_CONSTANT : vgConstants[1]\typeId=2 : vgConstants[1]\wordCount=1 : vgConstants[1]\word0=$3F800000
+  vgVariables[v]\sourceId=10 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=5 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_INPUT
+  If directPosition<>0 : vgVariables[v]\pointerType=6 : EndIf
+  v=v+1 : vgDecor(d,10,-1,#ANVIL_IR_DEC_LOCATION,0) : d=d+1
+  If mode=2 Or mode=22
+    vgVariables[v]\sourceId=11 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=5 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_INPUT
+    v=v+1 : vgDecor(d,11,-1,#ANVIL_IR_DEC_LOCATION,1) : d=d+1 : varyingLoads=varyingLoads+1
+  ElseIf mode=4
+    vgVariables[v]\sourceId=11 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=6 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_INPUT
+    v=v+1 : vgDecor(d,11,-1,#ANVIL_IR_DEC_LOCATION,1) : d=d+1 : varyingLoads=varyingLoads+1
+  EndIf
+  If mode=22
+    vgVariables[v]\sourceId=12 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=5 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_INPUT
+    v=v+1 : vgDecor(d,12,-1,#ANVIL_IR_DEC_LOCATION,2) : d=d+1 : varyingLoads=varyingLoads+1
+  EndIf
+  vgVariables[v]\sourceId=20 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=8 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_OUTPUT
+  v=v+1 : vgDecor(d,20,-1,#ANVIL_IR_DEC_BUILTIN,#ANVIL_IR_BUILTIN_POSITION) : d=d+1
+  If mode<>0
+    vgVariables[v]\sourceId=21 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE
+    If mode=4 : vgVariables[v]\pointerType=8 : Else : vgVariables[v]\pointerType=7 : EndIf
+    vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : v=v+1 : vgDecor(d,21,-1,#ANVIL_IR_DEC_LOCATION,0) : d=d+1
+  EndIf
+  If mode=22
+    vgVariables[v]\sourceId=22 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=7 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_OUTPUT
+    v=v+1 : vgDecor(d,22,-1,#ANVIL_IR_DEC_LOCATION,1) : d=d+1
+  EndIf
+  *m\variableCount=v : *m\interfaceCount=v : *m\decorationCount=d
+  i=0 : While i<v : vgInterfaces[i]=vgVariables[i]\sourceId : i=i+1 : Wend
+  If directPosition<>0
+    vgNode(n,40,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,4,1) : vgNodes[n]\operand0=10 : n=n+1
+  Else
+    vgNode(n,40,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[n]\operand0=10 : n=n+1
+    vgNode(n,41,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=40 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=0 : n=n+1
+    vgNode(n,42,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=40 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=1 : n=n+1
+    vgNode(n,43,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,4,4)
+    vgNodes[n]\operand0=41 : vgNodes[n]\operand1=42 : vgNodes[n]\operand2=30 : vgNodes[n]\operand3=31 : n=n+1
+  EndIf
+  If mode<>0
+    vgNode(n,44,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,Bool(mode=4)*1+3,1)
+    If mode=4 : vgNodes[n]\resultType=4 : Else : vgNodes[n]\resultType=3 : EndIf
+    vgNodes[n]\operand0=11 : n=n+1
+  EndIf
+  If mode=22
+    vgNode(n,45,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[n]\operand0=12 : n=n+1
+  EndIf
+  If reverseStores<>0 And mode<>0
+    vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=21 : vgNodes[n]\operand1=44 : n=n+1
+    If mode=22 : vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=22 : vgNodes[n]\operand1=45 : n=n+1 : EndIf
+  EndIf
+  vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=20
+  If directPosition<>0 : vgNodes[n]\operand1=40 : Else : vgNodes[n]\operand1=43 : EndIf
+  n=n+1
+  If reverseStores=0 And mode<>0
+    vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=21 : vgNodes[n]\operand1=44 : n=n+1
+    If mode=22 : vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=22 : vgNodes[n]\operand1=45 : n=n+1 : EndIf
+  EndIf
+  vgNode(n,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : n=n+1
+  *m\nodeCount=n : vgBlocks[0]\sourceId=50 : vgBlocks[0]\sourceOpcode=#ANVIL_IR_SPV_LABEL : vgBlocks[0]\nodeCount=n
+EndProcedure
+
+; The alternate accepted gl_PerVertex form: an Output Block member decorated
+; BuiltIn Position, selected through AccessChain.  No Offset decoration is
+; present because this is an interface semantic, not a resource-memory block.
+Procedure vgBlockPosition(*m.AvkIrModule)
+  vgModule(*m,0,0,0)
+  vgType(9,54,#ANVIL_IR_SPV_TYPE_STRUCT,#ANVIL_IR_TYPE_STRUCT) : vgTypes[9]\memberCount=1 : vgTypes[9]\member0=4
+  vgType(10,55,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[10]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[10]\pointeeType=54
+  vgType(11,56,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[11]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[11]\pointeeType=4
+  vgType(12,57,#ANVIL_IR_SPV_TYPE_INT,#ANVIL_IR_TYPE_INT) : vgTypes[12]\width=32 : vgTypes[12]\signedness=1
+  *m\typeCount=13
+  vgConstants[2]\sourceId=32 : vgConstants[2]\sourceOpcode=#ANVIL_IR_SPV_CONSTANT : vgConstants[2]\typeId=57 : vgConstants[2]\wordCount=1 : vgConstants[2]\word0=0 : *m\constantCount=3
+  vgVariables[1]\pointerType=55
+  vgDecor(1,54,-1,#ANVIL_IR_DEC_BLOCK,0)
+  vgDecor(2,54,0,#ANVIL_IR_DEC_BUILTIN,#ANVIL_IR_BUILTIN_POSITION) : *m\decorationCount=3
+  vgNode(4,46,#ANVIL_IR_SPV_ACCESS_CHAIN,#ANVIL_IR_OP_ACCESS_CHAIN,56,2) : vgNodes[4]\operand0=20 : vgNodes[4]\operand1=32
+  vgNode(5,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[5]\operand0=46 : vgNodes[5]\operand1=43
+  vgNode(6,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0)
+  *m\nodeCount=7 : vgBlocks[0]\nodeCount=7
+EndProcedure
+
+; kind 1=no Block, 2=wrong BuiltIn, 3=no BuiltIn, 4=dual
+; BuiltIn+Location, 5=irrelevant nonzero Offset (still accepted).
+Procedure vgBlockPositionVariant(*m.AvkIrModule, kind.i)
+  Protected i.i
+  vgBlockPosition(*m)
+  Select kind
+    Case 1
+      i=0 : While i<SizeOf(AvkIrDecoration) : PokeA(@vgDecorations[1]+i,PeekA(@vgDecorations[2]+i)) : i=i+1 : Wend : *m\decorationCount=2
+    Case 2 : vgDecorations[2]\value=#ANVIL_IR_BUILTIN_POSITION+1
+    Case 3 : *m\decorationCount=2
+    Case 4 : vgDecor(3,54,0,#ANVIL_IR_DEC_LOCATION,0) : *m\decorationCount=4
+    Case 5 : vgDecor(3,54,0,#ANVIL_IR_DEC_OFFSET,64) : *m\decorationCount=4
+  EndSelect
+EndProcedure
+
+Procedure vgDirectOutputVariant(*m.AvkIrModule, kind.i)
+  Protected d.i
+  vgModule(*m,22,0,0)
+  Select kind
+    Case 1 ; Position also has Location.
+      d=*m\decorationCount : vgDecor(d,20,-1,#ANVIL_IR_DEC_LOCATION,0) : *m\decorationCount=d+1
+    Case 2 ; Arbitrary BuiltIn.
+      vgDecorations[3]\value=#ANVIL_IR_BUILTIN_POSITION+1
+    Case 3 ; Gap: first varying destination is Location 1.
+      vgDecorations[4]\value=1 : vgDecorations[5]\value=2
+    Case 4 ; Two distinct outputs target Location 0.
+      vgDecorations[5]\value=0
+  EndSelect
+EndProcedure
+
+Procedure vgPositionValueVariant(*m.AvkIrModule, kind.i)
+  vgModule(*m,0,0,0)
+  Select kind
+    Case 1 : vgNodes[1]\literal0=1 : vgNodes[2]\literal0=0 ; y,x
+    Case 2 : vgNodes[3]\operand2=31 ; +1 where exact +0 is required
+    Case 3 ; x/y are extracts of two separate whole vec2 Loads.
+      vgNode(2,47,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[2]\operand0=10
+      vgNode(3,42,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[3]\operand0=47 : vgNodes[3]\literalCount=1 : vgNodes[3]\literal0=1
+      vgNode(4,43,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,4,4) : vgNodes[4]\operand0=41 : vgNodes[4]\operand1=42 : vgNodes[4]\operand2=30 : vgNodes[4]\operand3=31
+      vgNode(5,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[5]\operand0=20 : vgNodes[5]\operand1=43
+      vgNode(6,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : *m\nodeCount=7 : vgBlocks[0]\nodeCount=7
+  EndSelect
+EndProcedure
+
+; Position destination multiplicity hostiles: the semantic target, rather
+; than the raw pointer ID, is unique.
+Procedure vgDuplicatePosition(*m.AvkIrModule, kind.i)
+  Protected v.i
+  Protected d.i
+  vgModule(*m,0,0,0)
+  If kind=1 ; Store the same direct Position pointer twice.
+    vgNode(5,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[5]\operand0=20 : vgNodes[5]\operand1=43
+    vgNode(6,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : *m\nodeCount=7 : vgBlocks[0]\nodeCount=7
+  ElseIf kind=2 ; Two distinct direct output variables are Position.
+    v=*m\variableCount : vgVariables[v]\sourceId=23 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=8 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_OUTPUT
+    vgInterfaces[v]=23 : *m\variableCount=v+1 : *m\interfaceCount=v+1
+    d=*m\decorationCount : vgDecor(d,23,-1,#ANVIL_IR_DEC_BUILTIN,#ANVIL_IR_BUILTIN_POSITION) : *m\decorationCount=d+1
+    vgNode(5,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[5]\operand0=23 : vgNodes[5]\operand1=43
+    vgNode(6,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : *m\nodeCount=7 : vgBlocks[0]\nodeCount=7
+  Else ; One interface-block member and one direct Position target.
+    vgBlockPosition(*m)
+    v=*m\variableCount : vgVariables[v]\sourceId=23 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=8 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_OUTPUT
+    vgInterfaces[v]=23 : *m\variableCount=v+1 : *m\interfaceCount=v+1
+    d=*m\decorationCount : vgDecor(d,23,-1,#ANVIL_IR_DEC_BUILTIN,#ANVIL_IR_BUILTIN_POSITION) : *m\decorationCount=d+1
+    vgNode(6,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[6]\operand0=23 : vgNodes[6]\operand1=43
+    vgNode(7,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : *m\nodeCount=8 : vgBlocks[0]\nodeCount=8
+  EndIf
+EndProcedure
+
+; Varying result-shape hostiles remain verifier-valid so refusal belongs to
+; the typed vertex semantic classifier, not generic IR validation.
+Procedure vgVaryingShape(*m.AvkIrModule, kind.i)
+  vgModule(*m,2,0,0)
+  Select kind
+    Case 1 ; scalar float => total one
+      vgType(9,55,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[9]\storageClass=#ANVIL_IR_STORAGE_INPUT : vgTypes[9]\pointeeType=2
+      vgType(10,56,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[10]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[10]\pointeeType=2 : *m\typeCount=11
+      vgVariables[1]\pointerType=55 : vgVariables[3]\pointerType=56 : vgNodes[4]\resultType=2
+    Case 2 ; vec3 float => total three
+      vgType(9,54,#ANVIL_IR_SPV_TYPE_VECTOR,#ANVIL_IR_TYPE_VECTOR) : vgTypes[9]\componentType=2 : vgTypes[9]\componentCount=3
+      vgType(10,55,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[10]\storageClass=#ANVIL_IR_STORAGE_INPUT : vgTypes[10]\pointeeType=54
+      vgType(11,56,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[11]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[11]\pointeeType=54 : *m\typeCount=12
+      vgVariables[1]\pointerType=55 : vgVariables[3]\pointerType=56 : vgNodes[4]\resultType=54
+    Case 3 ; vec2 signed integer is not float32
+      vgType(9,54,#ANVIL_IR_SPV_TYPE_INT,#ANVIL_IR_TYPE_INT) : vgTypes[9]\width=32 : vgTypes[9]\signedness=1
+      vgType(10,55,#ANVIL_IR_SPV_TYPE_VECTOR,#ANVIL_IR_TYPE_VECTOR) : vgTypes[10]\componentType=54 : vgTypes[10]\componentCount=2
+      vgType(11,56,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[11]\storageClass=#ANVIL_IR_STORAGE_INPUT : vgTypes[11]\pointeeType=55
+      vgType(12,57,#ANVIL_IR_SPV_TYPE_POINTER,#ANVIL_IR_TYPE_POINTER) : vgTypes[12]\storageClass=#ANVIL_IR_STORAGE_OUTPUT : vgTypes[12]\pointeeType=55 : *m\typeCount=13
+      vgVariables[1]\pointerType=56 : vgVariables[3]\pointerType=57 : vgNodes[4]\resultType=55
+    Case 4 ; verifier-valid vec2 CompositeConstruct, not a whole Load
+      vgNode(4,44,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,3,2) : vgNodes[4]\operand0=41 : vgNodes[4]\operand1=42
+    Case 5 ; two vec4 destinations => total eight
+      vgModule(*m,22,0,0)
+      vgVariables[1]\pointerType=6 : vgVariables[2]\pointerType=6 : vgVariables[4]\pointerType=8 : vgVariables[5]\pointerType=8
+      vgNodes[4]\resultType=4 : vgNodes[5]\resultType=4
+  EndSelect
+EndProcedure
+
+Procedure vgSharedInput(*m.AvkIrModule, kind.i)
+  If kind=1
+    vgModule(*m,22,0,0) : vgNodes[5]\operand0=11 ; two distinct Loads of one Input
+  Else
+    vgModule(*m,2,0,0) : vgNodes[4]\operand0=10 ; Position and varying share Input
+  EndIf
+EndProcedure
+
+Procedure vgAddDeadInput(*m.AvkIrModule, withLoad.i)
+  Protected v.i=*m\variableCount
+  Protected d.i=*m\decorationCount
+  Protected n.i=*m\nodeCount-1
+  vgVariables[v]\sourceId=13 : vgVariables[v]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[v]\pointerType=5 : vgVariables[v]\storageClass=#ANVIL_IR_STORAGE_INPUT
+  vgInterfaces[v]=13 : *m\variableCount=v+1 : *m\interfaceCount=v+1
+  vgDecor(d,13,-1,#ANVIL_IR_DEC_LOCATION,3) : *m\decorationCount=d+1
+  If withLoad<>0
+    vgNode(n,47,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[n]\operand0=13 : n=n+1
+    vgNode(n,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : n=n+1
+    *m\nodeCount=n : vgBlocks[0]\nodeCount=n
+  EndIf
+EndProcedure
+
+Procedure vgPermuteEquivalent(*m.AvkIrModule)
+  Protected i.i
+  Protected temp.a
+  Protected tempId.i
+  i=0 : While i<SizeOf(AvkIrVariable) : temp=PeekA(@vgVariables[1]+i) : PokeA(@vgVariables[1]+i,PeekA(@vgVariables[2]+i)) : PokeA(@vgVariables[2]+i,temp) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrVariable) : temp=PeekA(@vgVariables[4]+i) : PokeA(@vgVariables[4]+i,PeekA(@vgVariables[5]+i)) : PokeA(@vgVariables[5]+i,temp) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrDecoration) : temp=PeekA(@vgDecorations[1]+i) : PokeA(@vgDecorations[1]+i,PeekA(@vgDecorations[2]+i)) : PokeA(@vgDecorations[2]+i,temp) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrDecoration) : temp=PeekA(@vgDecorations[4]+i) : PokeA(@vgDecorations[4]+i,PeekA(@vgDecorations[5]+i)) : PokeA(@vgDecorations[5]+i,temp) : i=i+1 : Wend
+  tempId=vgInterfaces[0] : vgInterfaces[0]=vgInterfaces[5] : vgInterfaces[5]=tempId
+  tempId=vgNodes[4]\sourceId : vgNodes[4]\sourceId=vgNodes[5]\sourceId : vgNodes[5]\sourceId=tempId
+  vgNodes[7]\operand1=vgNodes[4]\sourceId
+  vgNodes[8]\operand1=vgNodes[5]\sourceId
+EndProcedure
+
+Procedure vgPlanSentinel(*p.AvkIrV3d42VertexPlan)
+  Protected i.i=0
+  While i<SizeOf(AvkIrV3d42VertexPlan) : PokeA(*p+i,(i*31+$6D)&$FF) : i=i+1 : Wend
+EndProcedure
+
+Procedure.i vgPlanIsSentinel(*p.AvkIrV3d42VertexPlan)
+  Protected i.i=0
+  While i<SizeOf(AvkIrV3d42VertexPlan) : If PeekA(*p+i)<>((i*31+$6D)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure vgFill(*t.AvkIrV3d42VertexPairTarget)
+  Protected i.i=0
+  While i<*t\coordinateCodeCapacity : PokeA(*t\coordinateCodeBase+i,(i*13+$31)&$FF) : i=i+1 : Wend
+  i=0 : While i<*t\vertexCodeCapacity : PokeA(*t\vertexCodeBase+i,(i*17+$41)&$FF) : i=i+1 : Wend
+  i=0 : While i<*t\coordinateUniformCapacity : PokeA(*t\coordinateUniformBase+i,(i*19+$51)&$FF) : i=i+1 : Wend
+  i=0 : While i<*t\vertexUniformCapacity : PokeA(*t\vertexUniformBase+i,(i*23+$61)&$FF) : i=i+1 : Wend
+EndProcedure
+
+Procedure.i vgUntouched(*t.AvkIrV3d42VertexPairTarget)
+  Protected i.i=0
+  While i<*t\coordinateCodeCapacity : If PeekA(*t\coordinateCodeBase+i)<>((i*13+$31)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  i=0 : While i<*t\vertexCodeCapacity : If PeekA(*t\vertexCodeBase+i)<>((i*17+$41)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  i=0 : While i<*t\coordinateUniformCapacity : If PeekA(*t\coordinateUniformBase+i)<>((i*19+$51)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  i=0 : While i<*t\vertexUniformCapacity : If PeekA(*t\vertexUniformBase+i)<>((i*23+$61)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i vgStorageUntouched(index.i)
+  Protected i.i=0
+  While i<1024 : If PeekA(@vgCsCode[index*128]+i)<>((i*13+$31)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  i=0 : While i<1024 : If PeekA(@vgVsCode[index*128]+i)<>((i*17+$41)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  i=0 : While i<256 : If PeekA(@vgCsUniform[index*64]+i)<>((i*19+$51)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  i=0 : While i<256 : If PeekA(@vgVsUniform[index*64]+i)<>((i*23+$61)&$FF) : ProcedureReturn 0 : EndIf : i=i+1 : Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i vgTxnFailure(*m.AvkIrModule,*t.AvkIrV3d42VertexPairTarget,*r.AvkIrV3d42VertexPairResult,index.i,stage.i)
+  Protected rc.i
+  vgResultSentinel(*r) : rc=AnvilVkIrV3d42LowerVertexPair(*m,*t,*r)
+  ProcedureReturn Bool(rc<>0 And AnvilVkIrV3d42Stage()=stage And vgStorageUntouched(index)<>0 And vgResultIsSentinel(*r)<>0)
+EndProcedure
+
+Procedure vgResultSentinel(*r.AvkIrV3d42VertexPairResult)
+  *r\coordinateCodeBytes=$11111111 : *r\vertexCodeBytes=$22222222
+  *r\coordinateUniformWords=$33333333 : *r\vertexUniformWords=$44444444
+  *r\inputSlots=$55555555 : *r\varyingComponents=$66666666
+  *r\halfWidthEighths=$77777777 : *r\halfHeightEighths=$12345678
+EndProcedure
+
+Procedure.i vgResultIsSentinel(*r.AvkIrV3d42VertexPairResult)
+  ProcedureReturn Bool(*r\coordinateCodeBytes=$11111111 And *r\vertexCodeBytes=$22222222 And *r\coordinateUniformWords=$33333333 And *r\vertexUniformWords=$44444444 And *r\inputSlots=$55555555 And *r\varyingComponents=$66666666 And *r\halfWidthEighths=$77777777 And *r\halfHeightEighths=$12345678)
+EndProcedure
+
+Procedure vgTarget(*t.AvkIrV3d42VertexPairTarget,index.i,mode.i,directPosition.i,width.i,height.i)
+  Protected clear.i=0
+  While clear<SizeOf(AvkIrV3d42VertexPairTarget) : PokeA(*t+clear,0) : clear=clear+1 : Wend
+  *t\coordinateCodeBase=@vgCsCode[index*128] : *t\coordinateCodeCapacity=1024
+  *t\vertexCodeBase=@vgVsCode[index*128] : *t\vertexCodeCapacity=1024
+  *t\coordinateUniformBase=@vgCsUniform[index*64] : *t\coordinateUniformCapacity=256
+  *t\vertexUniformBase=@vgVsUniform[index*64] : *t\vertexUniformCapacity=256
+  *t\viewportWidth=width : *t\viewportHeight=height : *t\inputs=@vgInputs[0]
+  vgInputs[0]\variableId=10 : vgInputs[0]\member=-1 : vgInputs[0]\firstSlot=0
+  If directPosition<>0 : vgInputs[0]\components=4 : Else : vgInputs[0]\components=2 : EndIf
+  *t\inputCount=1
+  If mode<>0
+    vgInputs[1]\variableId=11 : vgInputs[1]\member=-1 : vgInputs[1]\firstSlot=vgInputs[0]\components
+    If mode=4 : vgInputs[1]\components=4 : Else : vgInputs[1]\components=2 : EndIf
+    *t\inputCount=2
+  EndIf
+  If mode=22
+    vgInputs[2]\variableId=12 : vgInputs[2]\member=-1 : vgInputs[2]\firstSlot=4 : vgInputs[2]\components=2 : *t\inputCount=3
+  EndIf
+EndProcedure
+
+Procedure vgRecord(index.i,rc.i,*r.AvkIrV3d42VertexPairResult,*t.AvkIrV3d42VertexPairTarget)
+  Protected b.i=index*#VG_STRIDE
+  vgReport[b+0]=rc : vgReport[b+1]=AnvilVkIrV3d42Error() : vgReport[b+2]=AnvilVkIrV3d42SourceId() : vgReport[b+3]=AnvilVkIrV3d42SourceOpcode() : vgReport[b+4]=AnvilVkIrV3d42Stage()
+  vgReport[b+5]=*r\coordinateCodeBytes : vgReport[b+6]=*r\vertexCodeBytes
+  vgReport[b+7]=*r\coordinateUniformWords : vgReport[b+8]=*r\vertexUniformWords
+  vgReport[b+9]=*r\inputSlots : vgReport[b+10]=*r\varyingComponents : vgReport[b+11]=*r\halfWidthEighths : vgReport[b+12]=*r\halfHeightEighths
+  vgReport[b+13]=*t\coordinateCodeBase : vgReport[b+14]=*t\vertexCodeBase : vgReport[b+15]=*t\coordinateUniformBase : vgReport[b+16]=*t\vertexUniformBase
+EndProcedure
+
+Procedure vgRecordPlan(index.i,rc.i,*p.AvkIrV3d42VertexPlan)
+  Protected b.i=index*#VG_STRIDE
+  Protected i.i
+  Protected at.i
+  vgReport[b+0]=rc : vgReport[b+1]=AnvilVkIrV3d42Error() : vgReport[b+2]=AnvilVkIrV3d42SourceId() : vgReport[b+3]=AnvilVkIrV3d42SourceOpcode() : vgReport[b+4]=AnvilVkIrV3d42Stage()
+  vgReport[b+18]=*p\positionOutputVariableId : vgReport[b+19]=*p\positionOutputMember
+  vgReport[b+20]=*p\positionInputVariableId : vgReport[b+21]=*p\positionInputMember : vgReport[b+22]=*p\positionLoadId
+  vgReport[b+23]=*p\varyingCount : vgReport[b+24]=*p\varyingComponents
+  i=0 : While i<2 : at=b+25+(i*7) : vgReport[at+0]=*p\varyings[i]\location : vgReport[at+1]=*p\varyings[i]\outputVariableId : vgReport[at+2]=*p\varyings[i]\outputMember : vgReport[at+3]=*p\varyings[i]\sourceVariableId : vgReport[at+4]=*p\varyings[i]\sourceMember : vgReport[at+5]=*p\varyings[i]\sourceLoadId : vgReport[at+6]=*p\varyings[i]\components : i=i+1 : Wend
+EndProcedure
+
+Procedure.i Main()
+  Protected m.AvkIrModule
+  Protected t.AvkIrV3d42VertexPairTarget
+  Protected r.AvkIrV3d42VertexPairResult
+  Protected p.AvkIrV3d42VertexPlan
+  Protected rc.i
+  Protected i.i
+  Protected mask.i
+  i=0 : While i<=4096 : vgReport[i]=0 : i=i+1 : Wend
+
+  vgModule(@m,0,0,0) : vgTarget(@t,0,0,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(0,rc,@r,@t) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgRecordPlan(0,rc,@p)
+  vgModule(@m,2,0,0) : vgTarget(@t,1,2,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(1,rc,@r,@t)
+  vgModule(@m,4,0,0) : vgTarget(@t,2,4,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(2,rc,@r,@t)
+  vgModule(@m,22,1,0) : vgTarget(@t,3,22,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(3,rc,@r,@t)
+  vgModule(@m,0,0,1) : vgTarget(@t,4,0,1,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[4*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(4,rc,@r,@t)
+  vgModule(@m,2,0,0) : vgTarget(@t,5,2,0,3,5) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(5,rc,@r,@t)
+  vgModule(@m,4,0,0) : vgTarget(@t,6,4,0,257,257) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(6,rc,@r,@t)
+  vgModule(@m,2,0,0) : vgTarget(@t,7,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : t\vertexCodeCapacity=8 : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : t\vertexCodeCapacity=1024 : vgReport[7*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(7,rc,@r,@t)
+  vgModule(@m,0,0,0) : vgTarget(@t,8,0,0,1,1) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(8,rc,@r,@t)
+  vgModule(@m,0,0,0) : vgTarget(@t,9,0,0,65535,65535) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(9,rc,@r,@t)
+  vgModule(@m,0,0,0) : vgTarget(@t,10,0,0,65536,1) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[10*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(10,rc,@r,@t)
+  vgBlockPosition(@m) : vgTarget(@t,11,0,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(11,rc,@r,@t) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgRecordPlan(11,rc,@p)
+  vgModule(@m,22,0,0) : vgTarget(@t,12,22,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(12,rc,@r,@t) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgRecordPlan(12,rc,@p)
+  vgModule(@m,22,0,0) : vgAddDeadInput(@m,0) : vgTarget(@t,13,22,0,4,4) : vgInputs[3]\variableId=13 : vgInputs[3]\member=-1 : vgInputs[3]\firstSlot=6 : vgInputs[3]\components=2 : t\inputCount=4 : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(13,rc,@r,@t)
+  vgModule(@m,22,0,0) : vgAddDeadInput(@m,1) : vgTarget(@t,14,22,0,4,4) : vgInputs[3]\variableId=13 : vgInputs[3]\member=-1 : vgInputs[3]\firstSlot=6 : vgInputs[3]\components=2 : t\inputCount=4 : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(14,rc,@r,@t)
+  vgModule(@m,22,0,0) : vgPermuteEquivalent(@m) : vgTarget(@t,15,22,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(15,rc,@r,@t) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgRecordPlan(15,rc,@p)
+  vgBlockPositionVariant(@m,1) : vgTarget(@t,16,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[16*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(16,rc,@r,@t)
+  vgBlockPositionVariant(@m,2) : vgTarget(@t,17,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[17*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(17,rc,@r,@t)
+  vgBlockPositionVariant(@m,3) : vgTarget(@t,18,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[18*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(18,rc,@r,@t)
+  vgBlockPositionVariant(@m,4) : vgTarget(@t,19,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[19*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(19,rc,@r,@t)
+  vgBlockPositionVariant(@m,5) : vgTarget(@t,20,0,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(20,rc,@r,@t)
+  vgDirectOutputVariant(@m,1) : vgTarget(@t,21,22,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[21*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(21,rc,@r,@t)
+  vgDirectOutputVariant(@m,2) : vgTarget(@t,22,22,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[22*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(22,rc,@r,@t)
+  vgDirectOutputVariant(@m,3) : vgTarget(@t,23,22,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[23*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(23,rc,@r,@t)
+  vgDirectOutputVariant(@m,4) : vgTarget(@t,24,22,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[24*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(24,rc,@r,@t)
+  vgPositionValueVariant(@m,1) : vgTarget(@t,25,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[25*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(25,rc,@r,@t)
+  vgPositionValueVariant(@m,2) : vgTarget(@t,26,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[26*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(26,rc,@r,@t)
+  vgPositionValueVariant(@m,3) : vgTarget(@t,27,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[27*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(27,rc,@r,@t)
+
+  ; Plan publication is independent and transactional for null, verifier, and semantic failures.
+  mask=0 : vgPlanSentinel(@p) : rc=AnvilVkIrV3d42PlanVertex(0,@p) : If rc<>0 And AnvilVkIrV3d42Stage()=1 And vgPlanIsSentinel(@p)<>0 : mask=mask|1 : EndIf
+  vgModule(@m,0,0,0) : m\idBound=0 : vgPlanSentinel(@p) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : If rc<>0 And AnvilVkIrV3d42Stage()=1 And vgPlanIsSentinel(@p)<>0 : mask=mask|2 : EndIf
+  vgModule(@m,0,0,1) : vgPlanSentinel(@p) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : If rc<>0 And AnvilVkIrV3d42Stage()=2 And vgPlanIsSentinel(@p)<>0 : mask=mask|4 : EndIf
+  vgReport[28*#VG_STRIDE+17]=mask
+
+  ; Pair stages 1/2 and all five caller-owned regions remain untouched.
+  mask=0 : vgModule(@m,0,0,0) : vgTarget(@t,29,0,0,4,4) : vgFill(@t) : If vgTxnFailure(0,@t,@r,29,1) : mask=mask|1 : EndIf
+  vgModule(@m,0,0,0) : vgTarget(@t,29,0,0,4,4) : vgFill(@t) : If vgTxnFailure(@m,0,@r,29,1) : mask=mask|2 : EndIf
+  vgModule(@m,0,0,0) : m\idBound=0 : vgTarget(@t,29,0,0,4,4) : vgFill(@t) : If vgTxnFailure(@m,@t,@r,29,1) : mask=mask|4 : EndIf
+  vgModule(@m,0,0,1) : vgTarget(@t,29,0,1,4,4) : vgFill(@t) : If vgTxnFailure(@m,@t,@r,29,2) : mask=mask|8 : EndIf
+  vgReport[29*#VG_STRIDE+17]=mask
+
+  ; Input and viewport stage-3 refusals.
+  mask=0 : vgModule(@m,0,0,0) : vgTarget(@t,30,0,0,4,4) : vgFill(@t) : vgInputs[0]\components=4 : If vgTxnFailure(@m,@t,@r,30,3) : mask=mask|1 : EndIf
+  vgModule(@m,0,0,0) : vgTarget(@t,30,0,0,4,4) : vgFill(@t) : t\inputs=0 : If vgTxnFailure(@m,@t,@r,30,3) : mask=mask|2 : EndIf
+  vgModule(@m,0,0,0) : vgTarget(@t,30,0,0,0,4) : vgFill(@t) : If vgTxnFailure(@m,@t,@r,30,3) : mask=mask|4 : EndIf
+  vgModule(@m,0,0,0) : vgTarget(@t,30,0,0,4,65536) : vgFill(@t) : If vgTxnFailure(@m,@t,@r,30,3) : mask=mask|8 : EndIf
+  vgReport[30*#VG_STRIDE+17]=mask
+
+  ; Every pair among the four publication spans overlaps independently.
+  mask=0 : i=0
+  While i<6
+    vgModule(@m,0,0,0) : vgTarget(@t,31,0,0,4,4) : vgFill(@t)
+    Select i
+      Case 0 : t\vertexCodeBase=t\coordinateCodeBase
+      Case 1 : t\coordinateUniformBase=t\coordinateCodeBase
+      Case 2 : t\vertexUniformBase=t\coordinateCodeBase
+      Case 3 : t\coordinateUniformBase=t\vertexCodeBase
+      Case 4 : t\vertexUniformBase=t\vertexCodeBase
+      Case 5 : t\vertexUniformBase=t\coordinateUniformBase
+    EndSelect
+    If vgTxnFailure(@m,@t,@r,31,6) : mask=mask|(1<<i) : EndIf : i=i+1
+  Wend
+  vgReport[31*#VG_STRIDE+17]=mask
+
+  ; Null/alignment/capacity/range span failures are likewise publish-nothing.
+  mask=0 : i=0
+  While i<10
+    vgModule(@m,0,0,0) : vgTarget(@t,32,0,0,4,4) : vgFill(@t)
+    Select i
+      Case 0 : t\coordinateCodeBase=0
+      Case 1 : t\coordinateCodeBase=t\coordinateCodeBase+1
+      Case 2 : t\vertexCodeBase=t\vertexCodeBase+1
+      Case 3 : t\coordinateUniformBase=t\coordinateUniformBase+1
+      Case 4 : t\vertexUniformBase=t\vertexUniformBase+1
+      Case 5 : t\coordinateCodeCapacity=8
+      Case 6 : t\vertexCodeCapacity=8
+      Case 7 : t\coordinateUniformCapacity=4
+      Case 8 : t\vertexUniformCapacity=4
+      Case 9 : t\coordinateCodeBase=-8
+    EndSelect
+    If vgTxnFailure(@m,@t,@r,32,6) : mask=mask|(1<<i) : EndIf : i=i+1
+  Wend
+  vgReport[32*#VG_STRIDE+17]=mask
+
+  ; Direct arbitrary vec4 Position is a planning refusal, independently of
+  ; later target-input validation (topic 832).
+  vgModule(@m,0,0,1) : vgPlanSentinel(@p) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgReport[33*#VG_STRIDE+17]=vgPlanIsSentinel(@p) : vgRecordPlan(33,rc,@p)
+  vgDuplicatePosition(@m,1) : vgTarget(@t,34,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[34*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(34,rc,@r,@t)
+  vgDuplicatePosition(@m,2) : vgTarget(@t,35,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[35*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(35,rc,@r,@t)
+  vgDuplicatePosition(@m,3) : vgTarget(@t,36,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[36*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(36,rc,@r,@t)
+  vgDirectOutputVariant(@m,3) : vgDecorations[4]\value=$FFFFFFFF : vgTarget(@t,37,22,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[37*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(37,rc,@r,@t)
+  vgModule(@m,2,0,0) : vgDecorations[3]\value=99 : vgTarget(@t,38,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[38*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(38,rc,@r,@t)
+  vgVaryingShape(@m,1) : vgTarget(@t,39,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[39*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(39,rc,@r,@t)
+  vgVaryingShape(@m,2) : vgTarget(@t,40,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[40*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(40,rc,@r,@t)
+  vgVaryingShape(@m,3) : vgTarget(@t,41,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[41*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(41,rc,@r,@t)
+  vgVaryingShape(@m,4) : vgTarget(@t,42,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[42*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(42,rc,@r,@t)
+  vgVaryingShape(@m,5) : vgTarget(@t,43,22,0,4,4) : vgInputs[1]\components=4 : vgInputs[2]\firstSlot=6 : vgInputs[2]\components=4 : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[43*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(43,rc,@r,@t)
+  vgSharedInput(@m,1) : vgTarget(@t,44,22,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(44,rc,@r,@t) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgRecordPlan(44,rc,@p)
+  vgSharedInput(@m,2) : vgTarget(@t,45,2,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(45,rc,@r,@t) : rc=AnvilVkIrV3d42PlanVertex(@m,@p) : vgRecordPlan(45,rc,@p)
+  vgModule(@m,2,0,0) : m\interfaceCount=m\interfaceCount-1 : vgTarget(@t,46,2,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgReport[46*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : vgRecord(46,rc,@r,@t)
+  ; A normal-success control becomes the exact stage-4/stage-5 transaction
+  ; witness under the two final-encoder source mutants.
+  vgModule(@m,0,0,0) : vgTarget(@t,47,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : If rc<>0 : vgReport[47*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : EndIf : vgRecord(47,rc,@r,@t)
+  vgModule(@m,0,0,0) : rc=AnvilVkIrV3d42PlanVertex(@m,0) : vgReport[48*#VG_STRIDE+0]=rc : vgReport[48*#VG_STRIDE+1]=AnvilVkIrV3d42Error() : vgReport[48*#VG_STRIDE+2]=AnvilVkIrV3d42SourceId() : vgReport[48*#VG_STRIDE+3]=AnvilVkIrV3d42SourceOpcode() : vgReport[48*#VG_STRIDE+4]=AnvilVkIrV3d42Stage()
+  vgModule(@m,0,0,0) : vgTarget(@t,49,0,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,0) : vgReport[49*#VG_STRIDE+0]=rc : vgReport[49*#VG_STRIDE+1]=AnvilVkIrV3d42Error() : vgReport[49*#VG_STRIDE+2]=AnvilVkIrV3d42SourceId() : vgReport[49*#VG_STRIDE+3]=AnvilVkIrV3d42SourceOpcode() : vgReport[49*#VG_STRIDE+4]=AnvilVkIrV3d42Stage() : vgReport[49*#VG_STRIDE+17]=vgStorageUntouched(49)
+
+  vgReport[4000]=#VG_MAGIC
+  ProcedureReturn @vgReport[0]
+EndProcedure
