@@ -28,6 +28,8 @@ payloads instead of making each payload bring a second hardware stack.
 |---|---|---|
 | Raspberry Pi 4 / BCM2711 / Cortex-A72 | Bare-metal AArch64 image | Most mature target. A recent hardware build booted with caches enabled, HDMI and native 1280×800 landscape DSI output, DMA-backed console rendering, and wired/Wi-Fi console access. A 2.2 MB RAM transfer was verified over Ethernet at approximately 10.97 MiB/s. The current tree contains newer display, network, and touch integration that still requires a complete on-board release pass. |
 | Arduino UNO Q / QCM2290 / Cortex-A53 | AArch64 UEFI application | Early target. UEFI console and file access are in use, and GPIO has been exercised on hardware. Most native QCM2290 drivers, networking, display acceleration, and the Adreno path remain development work. |
+| Raspberry Pi 3 Model B v1.2 / BCM2837 / Cortex-A53 | Bare-metal AArch64 image (`-t pi3`) | Early target. The cold-entry foundation and an immutable serial A/B updater are implemented and desk-tested; final SD-card update and recovery acceptance on the physical board remains. USB host and USB Ethernet are not brought up yet. See [RaspberryPi3/README.md](RaspberryPi3/README.md). |
+| ROCK Pi 4C v1.2 / RK3399 / Cortex-A72 + A53 | arm64 U-Boot `Image` (`-t rockpi4c`) | Early target. MiniDP output is proven on hardware at 1024×768; the preferred 1920×1080 mode is not working yet. A UART recovery console (`help`, `reboot`) is proven on the board. No network command service yet. See [RockPi4C/README.md](RockPi4C/README.md). |
 
 Host builds and emitted-code tests are valuable gates, but they are not a
 substitute for hardware proof. Exact status and known boundaries are recorded
@@ -48,6 +50,10 @@ RaspberryPi4/
 ArduinoQ/
   Board/                QCM2290 UEFI composition
   Lib/                  current native UNO Q drivers
+RaspberryPi3/
+  Board/, Boot/, Lib/   BCM2837 cold entry, serial updater, pinned boot files
+RockPi4C/
+  Board/, Lib/          RK3399 composition, MiniDP display and UART recovery
 Boards/                  external-compiler target profile
 Firmware/CYW43455/       Pi radio firmware (separately licensed)
 licenses/                retained third-party license texts
@@ -55,8 +61,9 @@ docs/                    architecture, provenance, notices and formats
 tools/                   build, verification and development gates
 ```
 
-Shared code uses `.pbi`, Raspberry Pi hardware code uses `.pi4`, and UNO Q
-hardware code uses `.unoq`. Target-specific names do not leak into the portable
+Shared code uses `.pbi`, Raspberry Pi 4 hardware code uses `.pi4`, UNO Q
+hardware code uses `.unoq`, and the Pi 3 and ROCK Pi 4C board files use `.pi3`
+and `.rockpi4c`. Target-specific names do not leak into the portable
 HAL contract.
 
 ## Build
