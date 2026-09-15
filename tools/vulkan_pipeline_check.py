@@ -162,6 +162,10 @@ def f32_from_int(n: int) -> int:
     return struct.unpack("<I", struct.pack("<f", float(n)))[0]
 
 
+def f32_bits(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
 def out_seg(slots: int, vary: int) -> int:
     """align(n,8)/8 sectors, plus one whenever there are varyings."""
     n = max(1, (slots + 7) // 8)
@@ -548,6 +552,14 @@ def grade(cpu, rc) -> Grader:
     g.need("[dead-io] public pipeline ignores the dead input and output",
            slot(342), 0)
     g.need("[dead-io] real typed-IR V3D compilation succeeds", slot(343), 0)
+    g.need("[odd viewport] public pipeline retains the odd width", slot(633), 9)
+    g.need("[odd viewport] public pipeline retains the odd height", slot(634), 11)
+    g.need("[odd viewport] V3D fine X preserves the half pixel", slot(635), 9 * 128)
+    g.need("[odd viewport] V3D fine Y preserves the half pixel", slot(636), 11 * 128)
+    g.need("[odd viewport] V3D X scaling is exactly 4.5f", slot(637) & 0xFFFFFFFF,
+           f32_bits(4.5))
+    g.need("[odd viewport] V3D Y scaling is exactly 5.5f", slot(638) & 0xFFFFFFFF,
+           f32_bits(5.5))
     g.need("the gate ran to the end", slot(1), 0)
     if slot(1) != 0:
         g.failures.append("  fault: " + cstr(cpu, u64(cpu, base + 32 * 8))[:200])
@@ -666,6 +678,18 @@ def grade(cpu, rc) -> Grader:
     g.need_bytes("[A] the default attribute values",
                  blob(cpu, baseA + OFF_DEFAULTS, 16),
                  struct.pack("<4I", F0, F0, F0, F1))
+    g.need_bytes("[odd viewport] typed coordinate program remains pipeline A's",
+                 blob(cpu, dead_base + OFF_CS_CODE, slot(10)),
+                 blob(cpu, baseA + OFF_CS_CODE, slot(10)))
+    g.need_bytes("[odd viewport] typed vertex program remains pipeline A's",
+                 blob(cpu, dead_base + OFF_VS_CODE, slot(11)),
+                 blob(cpu, baseA + OFF_VS_CODE, slot(11)))
+    g.need_bytes("[odd viewport] coordinate uniforms carry exact 4.5/5.5 centres",
+                 blob(cpu, dead_base + OFF_UNIF_CS, (10 + 4) * 4),
+                 expected_vertex_uniforms(10, 9 * 128, 11 * 128))
+    g.need_bytes("[odd viewport] vertex uniforms carry exact 4.5/5.5 centres",
+                 blob(cpu, dead_base + OFF_UNIF_VS, (8 + 4) * 4),
+                 expected_vertex_uniforms(8, 9 * 128, 11 * 128))
 
     # --- pipeline B: one attribute, no varyings, a push-constant colour ---
     baseB = slot(13)
@@ -693,6 +717,26 @@ def grade(cpu, rc) -> Grader:
     # The source module may die immediately after pipeline creation. Its old
     # token must never alias same-slot replacement IR, while the pipeline owns
     # a complete immutable executable image and exact patch ABI of its own.
+    g.want_true("[vertex lifetime] original vertex module owned a real slot and generation",
+                slot(639) > 0 and slot(640) > 0, f"{slot(639)} / {slot(640)}")
+    g.want_true("[vertex lifetime] original vertex module exposed verified typed IR",
+                slot(641) != 0 and slot(642) == slot(640),
+                f"{slot(641):#x} / {slot(642)}")
+    g.need("[vertex lifetime] destroy invalidates the stale IR pointer", slot(643), 0)
+    g.need("[vertex lifetime] destroy invalidates the stale IR generation", slot(644), 0)
+    g.need("[vertex lifetime] stale vertex token cannot create a pipeline", slot(645), ERR_HANDLE)
+    g.need("[vertex lifetime] stale vertex creation writes null", slot(646), 0)
+    g.need("[vertex lifetime] replacement vertex module creates", slot(647), 0)
+    g.need("[vertex lifetime] replacement reuses the exact module slot", slot(648), slot(639))
+    g.want_true("[vertex lifetime] replacement advances the module generation",
+                slot(649) != 0 and slot(649) != slot(640), str(slot(649)))
+    g.want_true("[vertex lifetime] replacement exposes its own verified IR",
+                slot(650) != 0 and slot(651) == slot(649),
+                f"{slot(650):#x} / {slot(651)}")
+    g.need("[vertex lifetime] old token remains stale after same-slot reuse", slot(652), ERR_HANDLE)
+    g.need("[vertex lifetime] reused-slot stale creation still writes null", slot(653), 0)
+    g.need("[vertex lifetime] replacement destroy invalidates its IR pointer", slot(654), 0)
+    g.need("[vertex lifetime] replacement destroy invalidates its IR generation", slot(655), 0)
     g.want_true("[lifetime] the original push module owned a real slot and generation",
                 slot(288) > 0 and slot(289) > 0, f"{slot(288)} / {slot(289)}")
     g.want_true("[lifetime] the original module exposed verified typed IR",
@@ -741,8 +785,10 @@ def grade(cpu, rc) -> Grader:
                      blob(cpu, constant_base + OFF_UNIF_FS, 20),
                      struct.pack("<5I", 0x3F800000, 0x00000000,
                                  0x3F000000, 0x3F800000, TLB_CONF))
-    g.need("[lifetime] replacement compile changes no byte of old B", slot(318), 0)
-    g.need("[lifetime] every retained old-B metadata field remains exact", slot(319), 1)
+    g.need("[lifetime] vertex and fragment replacement compile changes no byte of old B",
+           slot(318), 0)
+    g.need("[lifetime] every retained old-B vertex and fragment metadata field remains exact",
+           slot(319), 1)
     g.need("[lifetime] replacement destroy invalidates its IR pointer", slot(320), 0)
     g.need("[lifetime] replacement destroy invalidates its IR generation", slot(321), 0)
     g.need("[lifetime] retained copy accepts metadata-only patch", slot(322), 0)

@@ -106,11 +106,12 @@ Procedure.i pgStop(status.i)
   ProcedureReturn @pgReport[0]
 EndProcedure
 
-Procedure.i pgCompileV3d(slot.i, pipeline.i, fragmentModule.i)
+Procedure.i pgCompileV3d(slot.i, pipeline.i, vertexModule.i, fragmentModule.i)
   Define build.AnvilVkBackendPipelineBuildInfo
   build\pipeline = slot
   build\base = AnvilVkPipelineCodeBase(pipeline)
   build\bytes = AnvilVkPipelineCodeBytes(pipeline)
+  build\vertexIr = AnvilVkShaderModuleIr(vertexModule)
   build\fragmentIr = AnvilVkShaderModuleIr(fragmentModule)
   ProcedureReturn AnvilVkV3dCompile(@build)
 EndProcedure
@@ -156,6 +157,8 @@ Procedure.i Main()
   Define fsD.i
   Define staleFsB.i
   Define fsReuse.i
+  Define staleVsB.i
+  Define vsReuse.i
   Define pipeLife.i
   Define dsl.i
   Define dsl2.i
@@ -211,6 +214,12 @@ Procedure.i Main()
   Define lifeTextureState.i
   Define lifeSamplerState.i
   Define lifeTlb.i
+  Define lifeCsBytes.i
+  Define lifeVsBytes.i
+  Define lifeRecords.i
+  Define lifeVaryings.i
+  Define lifeHalfWidth.i
+  Define lifeHalfHeight.i
   Define lifeDiff.i
   Define lifeOk.i
   Define oldDslSlot.i
@@ -761,10 +770,17 @@ Procedure.i Main()
     ProcedureReturn pgStop(21)
   EndIf
 
+  ; The public odd-viewport proof uses a real drawable 9 x 11 extent. The
+  ; pipeline stores whole pixels, while the V3D lowerer must retain the .5
+  ; centre in both binary32 scaling and u14.8 viewport-offset forms.
+  PokeL(@vp\width, $41100000)          ; 9.0
+  PokeL(@vp\height, $41300000)         ; 11.0
+  sc\extent\width = 9
+  sc\extent\height = 11
   stages[1]\module = fsDeadIo
   pgPut(342, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeDeadIo))
   If pipeDeadIo = 0 : ProcedureReturn pgStop(93) : EndIf
-  rc=pgCompileV3d(2, pipeDeadIo, fsDeadIo):pgPut(343,rc)
+  rc=pgCompileV3d(2, pipeDeadIo, vsA, fsDeadIo):pgPut(343,rc)
   If rc<>#VK_SUCCESS : ProcedureReturn pgStop(94) : EndIf
   pgPut(344, AnvilVkV3dCodeBase(2))
   pgPut(345, AnvilVkV3dProgramBytes(2, 2))
@@ -772,6 +788,12 @@ Procedure.i Main()
   ; Pipeline query helpers consume the closed object slot carried to the
   ; backend build record, not the generation-tagged public handle.
   pgPut(347, AnvilVkPipelineUsesVarying(2))
+  pgPut(633, AnvilVkPipelineViewportWidth(2))
+  pgPut(634, AnvilVkPipelineViewportHeight(2))
+  pgPut(635, AnvilVkV3dViewportHalfWidthFine(2))
+  pgPut(636, AnvilVkV3dViewportHalfHeightFine(2))
+  pgPut(637, AnvilVkV3dViewportHalfWidthBits(2))
+  pgPut(638, AnvilVkV3dViewportHalfHeightBits(2))
   i=0
   While i<8192
     pgSavedDeadIo[i]=PeekA(AnvilVkV3dCodeBase(2)+i)
@@ -782,6 +804,10 @@ Procedure.i Main()
   vkDestroyPipeline(dev,pipeDeadIo,0):pipeDeadIo=0
   vkDestroyShaderModule(dev,fsDeadIo,0):fsDeadIo=0
   stages[1]\module = fsA
+  PokeL(@vp\width, $42800000)          ; 64.0
+  PokeL(@vp\height, $42800000)         ; 64.0
+  sc\extent\width = #PG_W
+  sc\extent\height = #PG_H
 
   ; A pipeline that asks for blending must be refused.
   cba\blendEnable = #VK_TRUE
@@ -825,7 +851,7 @@ Procedure.i Main()
   ;  device memory, and build their real shader records.
   ; ------------------------------------------------------------------
   pgPut(19, AnvilVkV3dShaderRecordOffset())
-  If pgCompileV3d(1, pipeA, fsA) <> #VK_SUCCESS
+  If pgCompileV3d(1, pipeA, vsA, fsA) <> #VK_SUCCESS
     pgPut(2, AnvilVkV3dShaderStage())
     ProcedureReturn pgStop(23)
   EndIf
@@ -855,7 +881,7 @@ Procedure.i Main()
   PokeL(@pgPush[0] + 4, #PG_PUSH_G)
   PokeL(@pgPush[0] + 8, #PG_PUSH_B)
   PokeL(@pgPush[0] + 12, #PG_PUSH_A)
-  If pgCompileV3d(2, pipeB, fsB) <> #VK_SUCCESS
+  If pgCompileV3d(2, pipeB, vsB, fsB) <> #VK_SUCCESS
     pgPut(2, AnvilVkV3dShaderStage())
     ProcedureReturn pgStop(25)
   EndIf
@@ -887,11 +913,40 @@ Procedure.i Main()
 
   ; ------------------------------------------------------------------
   ;  VkShaderModule lifetime is independent of the executable pipeline.
-  ;  Freeze every piece of B's retained fragment ABI, destroy its source
-  ;  module, reuse that exact module slot for incompatible immutable IR, and
-  ;  compile the replacement. The old token must stay stale while B's full
-  ;  executable image and metadata remain unchanged and drawable.
+  ;  Start with the vertex half: destroy B's source module, reuse that exact
+  ;  slot for a new verified vertex module, and prove the old token remains
+  ;  stale. The replacement is used below to compile a second pipeline.
   ; ------------------------------------------------------------------
+  staleVsB = vsB
+  pgPut(639, avkTokenSlot(staleVsB))
+  pgPut(640, avkTokenGen(staleVsB))
+  pgPut(641, AnvilVkShaderModuleIr(staleVsB))
+  pgPut(642, AnvilVkShaderModuleIrGeneration(staleVsB))
+  vkDestroyShaderModule(dev, staleVsB, 0)
+  vsB = 0
+  pgPut(643, AnvilVkShaderModuleIr(staleVsB))
+  pgPut(644, AnvilVkShaderModuleIrGeneration(staleVsB))
+  bad = 0
+  pgPut(645, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(646, bad)
+  smci\pCode = PeekI(#PG_IN + 32)
+  smci\codeSize = PeekI(#PG_IN + 40)
+  pgPut(647, vkCreateShaderModule(dev, @smci, 0, @vsReuse))
+  pgPut(648, avkTokenSlot(vsReuse))
+  pgPut(649, avkTokenGen(vsReuse))
+  pgPut(650, AnvilVkShaderModuleIr(vsReuse))
+  pgPut(651, AnvilVkShaderModuleIrGeneration(vsReuse))
+  bad = 0
+  pgPut(652, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @bad))
+  pgPut(653, bad)
+  vsB = vsReuse
+  vsReuse = 0
+  stages[0]\module = vsB
+
+  ; Now freeze every piece of B's retained fragment ABI, destroy its source
+  ; module, reuse that exact module slot for incompatible immutable IR, and
+  ; compile the replacement. Both old tokens must stay stale while B's full
+  ; executable image and metadata remain unchanged and drawable.
   staleFsB = fsB
   lifeBase = AnvilVkV3dCodeBase(2)
   lifeIr = AnvilVkShaderModuleIr(staleFsB)
@@ -908,6 +963,12 @@ Procedure.i Main()
   lifeTextureState = AnvilVkV3dFragmentTextureStateWord(2)
   lifeSamplerState = AnvilVkV3dFragmentSamplerStateWord(2)
   lifeTlb = AnvilVkV3dFragmentTlbConfigWord(2)
+  lifeCsBytes = AnvilVkV3dProgramBytes(2, 0)
+  lifeVsBytes = AnvilVkV3dProgramBytes(2, 1)
+  lifeRecords = AnvilVkV3dRecordCount(2)
+  lifeVaryings = AnvilVkV3dVaryingComponents(2)
+  lifeHalfWidth = AnvilVkV3dViewportHalfWidthFine(2)
+  lifeHalfHeight = AnvilVkV3dViewportHalfHeightFine(2)
   pgPut(288, avkTokenSlot(staleFsB))
   pgPut(289, avkTokenGen(staleFsB))
   pgPut(290, lifeIr)
@@ -948,7 +1009,7 @@ Procedure.i Main()
   gp\layout = layA
   pgPut(316, vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeLife))
   If pipeLife <> 0
-    pgPut(317, pgCompileV3d(3, pipeLife, fsReuse))
+    pgPut(317, pgCompileV3d(3, pipeLife, vsB, fsReuse))
     i = 0
     While i < 8192
       pgSavedConstant[i] = PeekA(AnvilVkV3dCodeBase(3) + i)
@@ -971,7 +1032,9 @@ Procedure.i Main()
     i = i + 1
   Wend
   pgPut(318, lifeDiff)
-  lifeOk = Bool(AnvilVkV3dCodeBase(2) = lifeBase And AnvilVkV3dProgramBytes(2, 2) = lifeFsBytes And AnvilVkV3dFragmentUniformWords(2) = lifeWords)
+  lifeOk = Bool(AnvilVkV3dCodeBase(2) = lifeBase And AnvilVkV3dProgramBytes(2, 0) = lifeCsBytes And AnvilVkV3dProgramBytes(2, 1) = lifeVsBytes)
+  lifeOk = lifeOk * Bool(AnvilVkV3dProgramBytes(2, 2) = lifeFsBytes And AnvilVkV3dRecordCount(2) = lifeRecords And AnvilVkV3dVaryingComponents(2) = lifeVaryings)
+  lifeOk = lifeOk * Bool(AnvilVkV3dViewportHalfWidthFine(2) = lifeHalfWidth And AnvilVkV3dViewportHalfHeightFine(2) = lifeHalfHeight And AnvilVkV3dFragmentUniformWords(2) = lifeWords)
   lifeOk = lifeOk * Bool(AnvilVkV3dFragmentPushFirstWord(2) = lifePushFirst And AnvilVkV3dFragmentPushRWord(2) = lifePushR And AnvilVkV3dFragmentPushGWord(2) = lifePushG)
   lifeOk = lifeOk * Bool(AnvilVkV3dFragmentPushBWord(2) = lifePushB And AnvilVkV3dFragmentPushAWord(2) = lifePushA And AnvilVkV3dFragmentUniformAddressWord(2) = lifeUniformAddress)
   lifeOk = lifeOk * Bool(AnvilVkV3dFragmentUniformConfigWord(2) = lifeUniformConfig And AnvilVkV3dFragmentTextureStateWord(2) = lifeTextureState And AnvilVkV3dFragmentSamplerStateWord(2) = lifeSamplerState And AnvilVkV3dFragmentTlbConfigWord(2) = lifeTlb)
@@ -1161,7 +1224,7 @@ Procedure.i Main()
   pgPut(91, AnvilVkPipelineAttrCount(3))
   pgPut(92, AnvilVkPipelineColourSource(3))
 
-  If pgCompileV3d(3, pipeC, fsA) <> #VK_SUCCESS
+  If pgCompileV3d(3, pipeC, vsA, fsA) <> #VK_SUCCESS
     pgPut(2, AnvilVkV3dShaderStage())
     ProcedureReturn pgStop(71)
   EndIf
@@ -1441,7 +1504,7 @@ Procedure.i Main()
   stages[1]\module = fsU
   pgPut(66, AnvilVkPipelineColourSource(4))
   pgPut(73, AnvilVkPipelineAttrCount(4))
-  If pgCompileV3d(4, pipeD, fsU) <> #VK_SUCCESS
+  If pgCompileV3d(4, pipeD, vsB, fsU) <> #VK_SUCCESS
     pgPut(2, AnvilVkV3dShaderStage())
     ProcedureReturn pgStop(76)
   EndIf
@@ -1874,7 +1937,7 @@ Procedure.i Main()
   pgPut(220, AnvilVkPipelineColourSource(texSlot))
   pgPut(221, AnvilVkPipelineSampleBinding(texSlot))
   pgPut(222, AnvilVkPipelineSampleCoord(texSlot))
-  pgPut(223, pgCompileV3d(texSlot, pipeTex, fsD))
+  pgPut(223, pgCompileV3d(texSlot, pipeTex, vsD, fsD))
   sampled\base = AnvilVkImageAddress(img2)
   sampled\bytes = 4
   sampled\width = 1
@@ -2504,7 +2567,7 @@ Procedure.i Main()
   pgPut(434, AnvilVkPipelineUsesUniformBuffer(mixedPipeSlot))
   pgPut(435, AnvilVkPipelineUsesSampledImage(mixedPipeSlot))
   pgPut(436, AnvilVkPipelineUsesPushConstants(mixedPipeSlot))
-  pgPut(437, pgCompileV3d(mixedPipeSlot, pipeMixed, fsMixed))
+  pgPut(437, pgCompileV3d(mixedPipeSlot, pipeMixed, vsD, fsMixed))
   pgPut(438, AnvilVkV3dProgramBytes(mixedPipeSlot, 2))
   pgPut(439, AnvilVkV3dFragmentUniformWords(mixedPipeSlot))
   pgPut(543, AnvilVkPipelineUsesVarying(mixedPipeSlot))
@@ -2935,6 +2998,8 @@ Procedure.i Main()
   vkDestroyShaderModule(dev, vsA, 0)
   vkDestroyShaderModule(dev, fsA, 0)
   vkDestroyShaderModule(dev, vsB, 0)
+  pgPut(654, AnvilVkShaderModuleIr(vsB))
+  pgPut(655, AnvilVkShaderModuleIrGeneration(vsB))
   vkDestroyShaderModule(dev, fsB, 0)
   vkDestroyShaderModule(dev, fsU, 0)
   vkDestroyShaderModule(dev, fsW, 0)

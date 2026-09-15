@@ -389,12 +389,11 @@ EndProcedure
 ;  not. Both packets that carry it are re-emitted: CFG_BITS without its
 ;  blend-enable bit, and BLEND_ENABLES with no render target selected.
 ;
-;  THE VIEWPORT MUST BE THE RENDER GEOMETRY. The clipper's half width
-;  and the viewport offset are written by the prologue from the engine's
-;  own surface, and the emitted coordinate shader scales by the
-;  pipeline's viewport. If those two disagree the clipper and the
-;  rasteriser work on different geometry, which is a wrong picture and
-;  not a slow one, so the draw is refused rather than reconciled.
+;  THE VIEWPORT MUST BE THE RENDER GEOMETRY. NeonFrameBegin establishes the
+;  surface-wide clip window. This backend then re-emits the clipper scale and
+;  viewport offset from the compiled pipeline's exact u14.8 half extents, so
+;  odd dimensions retain their half pixel and the coordinate shader, clipper
+;  and rasteriser all consume the same value.
 
 ; Neon's frame prologue writes CFG_BITS with both facings enabled, no
 ; clockwise winding and depth function ALWAYS, and then ORs in the blend
@@ -416,7 +415,7 @@ EndProcedure
 
 Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
   If *build = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
-  If *build\fragmentIr = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *build\vertexIr = 0 Or *build\fragmentIr = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   ProcedureReturn AnvilVkV3dCompile(*build)
 EndProcedure
 
@@ -598,6 +597,11 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     rc = NeonFrameBegin(*d\clearBgra)
   EndIf
   If rc = #NEON_OK
+    ; Replace Neon's integer-centred UI viewport with the pipeline's exact
+    ; centre. For an odd extent the low eight bits are $80; reusing Neon's
+    ; floor-centred value would shift every primitive by half a pixel.
+    V3dClClipperXyScaling(AnvilVkV3dViewportHalfWidthBits(pipe), AnvilVkV3dViewportHalfHeightBits(pipe))
+    V3dClViewportOffset(AnvilVkV3dViewportHalfWidthFine(pipe), 0, AnvilVkV3dViewportHalfHeightFine(pipe), 0)
     ; Undo the prologue's alpha blend, both packets that carry it.
     V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
     V3dClBlendEnables(0)

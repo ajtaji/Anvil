@@ -245,16 +245,17 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   sampledImage.i
 EndStructure
 
-; One closed, synchronous pipeline-build transaction. The fragment IR points
-; into a live VkShaderModule only for the duration of avkBackendPipelineBuild;
-; a successful backend must retain executable bytes and exact patch metadata,
-; never this pointer. The portable layer validates the module slot and its IR
-; generation immediately before this synchronous call; the backend therefore
+; One closed, synchronous pipeline-build transaction. Both IR pointers name
+; live VkShaderModules only for the duration of avkBackendPipelineBuild; a
+; successful backend must retain executable bytes and exact patch metadata,
+; never either pointer. The portable layer validates both module slots and IR
+; generations immediately before this synchronous call; the backend therefore
 ; receives no unverifiable lifetime token of its own.
 Structure AnvilVkBackendPipelineBuildInfo Align #PB_Structure_AlignC
   pipeline.i
   base.i
   bytes.i
+  vertexIr.i
   fragmentIr.i
 EndStructure
 

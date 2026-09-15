@@ -1846,14 +1846,15 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   avkPipeCodeMem[s] = mem
   avkPipeCodeBase[s] = avkHeapBase + avkMemOffset[mem]
   avkPipeCodeBytes[s] = need
-  If avkShIr[fs]\valid = 0 Or avkShIrGen[fs] <> avkShGen[fs]
+  If avkShIr[vs]\valid = 0 Or avkShIrGen[vs] <> avkShGen[vs] Or avkShIr[fs]\valid = 0 Or avkShIrGen[fs] <> avkShGen[fs]
     avkInternalFree(mem)
     avkPipeCodeMem[s] = 0
-    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateGraphicsPipelines found that its fragment module's verified typed IR lifetime ended before backend lowering (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was published.")
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateGraphicsPipelines found that a vertex or fragment module's verified typed IR lifetime ended before backend lowering (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was published.")
   EndIf
   build\pipeline = s
   build\base = avkPipeCodeBase[s]
   build\bytes = need
+  build\vertexIr = @avkShIr[vs]\module
   build\fragmentIr = @avkShIr[fs]\module
   rc = avkBackendPipelineBuild(@build)
   If rc <> #VK_SUCCESS

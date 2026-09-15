@@ -130,6 +130,8 @@ Global Dim avkqRecords.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqInSlots.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqVaryComps.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqPosSlot.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqHalfWidthFine.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqHalfHeightFine.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqColourSrc.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqCsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkqVsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -758,9 +760,6 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
   Define bytes.i
   Define inSlots.i
   Define varyComps.i
-  Define halfW.i
-  Define halfH.i
-  Define kcount.i
   Define i.i
   Define location.i
   Define components.i
@@ -770,11 +769,19 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
   Define valueId.i
   Define outputVariableId.i
   Define outputMember.i
+  Define positionLocation.i
+  Define positionSlot.i
+  Define *vertexIr.AvkIrModule
   Define *ir.AvkIrModule
   Define *variable.AvkIrVariable
   Define *node.AvkIrNode
+  Define *vertexVarying.AvkIrV3d42VertexVarying
   Define target.AvkIrV3d42Target
   Define result.AvkIrV3d42Result
+  Define vertexPlan.AvkIrV3d42VertexPlan
+  Define vertexTarget.AvkIrV3d42VertexPairTarget
+  Define vertexResult.AvkIrV3d42VertexPairResult
+  Dim vertexInputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
   Dim inputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
   Dim outputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
 
@@ -786,6 +793,7 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
   pipe = *build\pipeline
   base = *build\base
   bytes = *build\bytes
+  *vertexIr = *build\vertexIr
   *ir = *build\fragmentIr
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
     ProcedureReturn #ANVIL_VK_ERR_ARGS
@@ -793,10 +801,53 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
   If base <= 0 Or (base % 4096) <> 0 Or bytes < #AVKQ_BYTES
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If *ir = 0 Or *ir\stage <> #ANVIL_IR_STAGE_FRAGMENT
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 QPU compiler was not given the verified fragment typed IR module from the current synchronous pipeline-build transaction (Anvil code -20001, invalid shader transaction); no pipeline was created.")
+  If *vertexIr = 0 Or *vertexIr\stage <> #ANVIL_IR_STAGE_VERTEX Or *ir = 0 Or *ir\stage <> #ANVIL_IR_STAGE_FRAGMENT
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 QPU compiler was not given both verified vertex and fragment typed IR modules from the current synchronous pipeline-build transaction (Anvil code -20001, invalid shader transaction); no pipeline was created.")
   EndIf
   avkqClearFragmentMetadata(pipe)
+
+  ; The canonical typed plan is the authority.  The portable summaries still
+  ; feed Vulkan interface checks and attribute records, so prove every one of
+  ; their vertex facts against the plan before emitting a byte.
+  avkqStage = 1
+  r = AnvilVkIrV3d42PlanVertex(*vertexIr, @vertexPlan)
+  If r <> #ANVIL_IR_V3D42_OK
+    avkqError = r
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not form a canonical plan from the verified vertex typed IR (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. AnvilVkIrV3d42Error(), SourceId(), SourceOpcode() and Stage() identify the unsupported semantic operation or layout.")
+  EndIf
+  inputCount = 0
+  i = 0
+  While i < *vertexIr\variableCount
+    *variable = avkIrVariableAt(*vertexIr, i)
+    location = avkqIrDecoration(*vertexIr, *variable\sourceId, #ANVIL_IR_DEC_LOCATION)
+    If *variable\storageClass = #ANVIL_IR_STORAGE_INPUT And location >= 0
+      components = avkqIrVariableComponents(*vertexIr, *variable)
+      If location >= #ANVIL_IR_V3D42_MAX_IO Or components < 1 Or vertexInputs[location]\components <> 0
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not map the vertex typed-IR inputs into the bounded attribute table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created.")
+      EndIf
+      vertexInputs[location]\variableId = *variable\sourceId
+      vertexInputs[location]\member = -1
+      vertexInputs[location]\firstSlot = avkqInSlotOf(pipe, location)
+      vertexInputs[location]\components = components
+      If inputCount < location + 1 : inputCount = location + 1 : EndIf
+    EndIf
+    i = i + 1
+  Wend
+  positionLocation = avkqIrDecoration(*vertexIr, vertexPlan\positionInputVariableId, #ANVIL_IR_DEC_LOCATION)
+  If inputCount <> AnvilVkPipelineAttrCount(pipe) Or positionLocation <> AnvilVkPipelinePositionAttr(pipe) Or vertexPlan\varyingCount <> AnvilVkPipelineVaryingCount(pipe)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 QPU compiler found that the portable vertex summary disagrees with the canonical typed-IR plan (Anvil code -20004, inconsistent pipeline state); no pipeline was created.")
+  EndIf
+  positionSlot = avkqInSlotOf(pipe, positionLocation)
+  i = 0
+  While i < vertexPlan\varyingCount
+    *vertexVarying = @vertexPlan + OffsetOf(AvkIrV3d42VertexPlan\varyings) + i * SizeOf(AvkIrV3d42VertexVarying)
+    location = avkqIrDecoration(*vertexIr, *vertexVarying\sourceVariableId, #ANVIL_IR_DEC_LOCATION)
+    If *vertexVarying\location <> i Or *vertexVarying\components <> AnvilVkPipelineVaryingComponents(pipe, i) Or location <> AnvilVkPipelineVaryingSource(pipe, i)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 QPU compiler found that a portable varying summary disagrees with the canonical typed-IR plan (Anvil code -20004, inconsistent pipeline state); no pipeline was created.")
+    EndIf
+    i = i + 1
+  Wend
+
   inSlots = avkqTotalComponents(pipe)
   varyComps = avkqVaryingComponents(pipe)
   If inSlots < 2 Or inSlots > #AVKQ_MAX_RECORDS
@@ -816,32 +867,39 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a sampled-image fragment graph without exactly one vec2 varying coordinate (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. This bounded texture path consumes one whole two-component input.")
   EndIf
 
-  ; The viewport's half extent, in eighths of a pixel, which is the unit
-  ; CLIPPER_XY_SCALING and VIEWPORT_OFFSET both carry. The clipper's own
-  ; copy is written by the engine's frame prologue from the same surface
-  ; geometry, and the draw is refused unless the two agree.
-  halfW = (AnvilVkPipelineViewportWidth(pipe) / 2) * 256
-  halfH = (AnvilVkPipelineViewportHeight(pipe) / 2) * 256
-  If halfW <= 0 Or halfH <= 0
+  ; VIEWPORT_OFFSET's fine field is unsigned u14.8.  Origin-zero extents up
+  ; to 32767 fit exactly, including odd dimensions; 32768 would overflow the
+  ; field rather than merely make a larger picture.
+  If AnvilVkPipelineViewportWidth(pipe) > 32767 Or AnvilVkPipelineViewportHeight(pipe) > 32767
     avkqStage = 4
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 QPU emitter was given a viewport with no area (Anvil code -20001, invalid viewport); no pipeline was created.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a viewport wider or taller than 32767 pixels (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created because V3D 4.2's origin-zero fine viewport offset is an unsigned u14.8 field.")
   EndIf
 
+  vertexTarget\coordinateCodeBase = base + #AVKQ_OFF_CS_CODE
+  vertexTarget\coordinateCodeCapacity = #AVKQ_CODE_SLOT
+  vertexTarget\vertexCodeBase = base + #AVKQ_OFF_VS_CODE
+  vertexTarget\vertexCodeCapacity = #AVKQ_CODE_SLOT
+  vertexTarget\coordinateUniformBase = base + #AVKQ_OFF_UNIF_CS
+  vertexTarget\coordinateUniformCapacity = #AVKQ_OFF_UNIF_VS - #AVKQ_OFF_UNIF_CS
+  vertexTarget\vertexUniformBase = base + #AVKQ_OFF_UNIF_VS
+  vertexTarget\vertexUniformCapacity = #AVKQ_OFF_UNIF_FS - #AVKQ_OFF_UNIF_VS
+  vertexTarget\viewportWidth = AnvilVkPipelineViewportWidth(pipe)
+  vertexTarget\viewportHeight = AnvilVkPipelineViewportHeight(pipe)
+  vertexTarget\inputCount = inputCount
+  vertexTarget\inputs = @vertexInputs[0]
   avkqStage = 5
-  r = avkqEmitCoord(pipe, base, inSlots, varyComps, halfW, halfH)
-  avkqCsBytes[pipe] = V3dQpuProgramBytes()
-  If r <> #V3DQ_OK
+  r = AnvilVkIrV3d42LowerVertexPair(*vertexIr, @vertexTarget, @vertexResult)
+  If r <> #ANVIL_IR_V3D42_OK
     avkqError = r
-    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU emitter could not encode the coordinate shader (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. AnvilVkV3dShaderError() carries the encoder's own code and V3dQpuHazardName() names the rule it broke.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not lower the verified vertex typed IR into an exact transactional coordinate/vertex pair (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. AnvilVkIrV3d42Error(), SourceId(), SourceOpcode() and Stage() identify the unsupported semantic operation, layout or encoder step.")
   EndIf
-  avkqStage = 6
-  r = avkqEmitVertex(pipe, base, inSlots, varyComps)
-  avkqVsBytes[pipe] = V3dQpuProgramBytes()
-  If r <> #V3DQ_OK
-    avkqError = r
-    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU emitter could not encode the vertex shader (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. AnvilVkV3dShaderError() carries the encoder's own code.")
+  If vertexResult\inputSlots <> inSlots Or vertexResult\varyingComponents <> varyComps
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 QPU compiler found that the emitted typed vertex pair disagrees with the validated pipeline layout (Anvil code -20004, inconsistent pipeline state); no pipeline was created.")
   EndIf
+  avkqCsBytes[pipe] = vertexResult\coordinateCodeBytes
+  avkqVsBytes[pipe] = vertexResult\vertexCodeBytes
   avkqStage = 7
+  inputCount = 0
   i=0:valueId=0:outputVariableId=0
   While i<*ir\nodeCount
     *node=avkIrNodeAt(*ir,i)
@@ -919,14 +977,6 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
     ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU compiler returned an inconsistent fragment uniform layout (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. Every required patch index must be distinct and inside the retained stream, and absent resources must own no patch index.")
   EndIf
 
-  avkqStage = 8
-  kcount = 6 + varyComps
-  If inSlots > kcount : kcount = inSlots : EndIf
-  avkqWriteVertexUniforms(base + #AVKQ_OFF_UNIF_CS, kcount, halfW, halfH)
-  kcount = 4 + varyComps
-  If inSlots > kcount : kcount = inSlots : EndIf
-  avkqWriteVertexUniforms(base + #AVKQ_OFF_UNIF_VS, kcount, halfW, halfH)
-
   ; The default attribute values, read for any component a shader asks
   ; for that an attribute record does not supply. Nothing in an emitted
   ; program does, but the record's field is not optional.
@@ -939,7 +989,9 @@ Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
   avkqRecords[pipe] = inSlots
   avkqInSlots[pipe] = inSlots
   avkqVaryComps[pipe] = varyComps
-  avkqPosSlot[pipe] = avkqInSlotOf(pipe, AnvilVkPipelinePositionAttr(pipe))
+  avkqPosSlot[pipe] = positionSlot
+  avkqHalfWidthFine[pipe] = vertexResult\halfWidthEighths
+  avkqHalfHeightFine[pipe] = vertexResult\halfHeightEighths
   avkqColourSrc[pipe] = AnvilVkPipelineColourSource(pipe)
   avkqStage = 0
   ProcedureReturn #VK_SUCCESS
@@ -951,6 +1003,8 @@ Procedure AnvilVkV3dRelease(pipe.i)
   EndIf
   avkqBase[pipe] = 0
   avkqRecords[pipe] = 0
+  avkqHalfWidthFine[pipe] = 0
+  avkqHalfHeightFine[pipe] = 0
   avkqClearFragmentMetadata(pipe)
 EndProcedure
 
@@ -976,6 +1030,38 @@ Procedure.i AnvilVkV3dVaryingComponents(pipe.i)
     ProcedureReturn 0
   EndIf
   ProcedureReturn avkqVaryComps[pipe]
+EndProcedure
+
+; Exact origin-zero viewport centre in the V3D VIEWPORT_OFFSET fine field's
+; u14.8 units. Odd dimensions retain their half pixel as 128, not zero.
+Procedure.i AnvilVkV3dViewportHalfWidthFine(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqHalfWidthFine[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dViewportHalfHeightFine(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqHalfHeightFine[pipe]
+EndProcedure
+
+; Convert the positive u14.8 centre retained for VIEWPORT_OFFSET into the
+; binary32 pixel value CLIPPER_XY_SCALING consumes. The integer-to-float
+; helper is exact for this range; subtracting eight from its exponent is an
+; exact division by 256 and preserves an odd extent's .5 pixel.
+Procedure.i avkqViewportFineToFloatBits(fine.i)
+  Define bits.i
+  If fine <= 0 : ProcedureReturn 0 : EndIf
+  bits = avkqF32FromInt(fine)
+  If bits = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn bits - (8 << 23)
+EndProcedure
+
+Procedure.i AnvilVkV3dViewportHalfWidthBits(pipe.i)
+  ProcedureReturn avkqViewportFineToFloatBits(AnvilVkV3dViewportHalfWidthFine(pipe))
+EndProcedure
+
+Procedure.i AnvilVkV3dViewportHalfHeightBits(pipe.i)
+  ProcedureReturn avkqViewportFineToFloatBits(AnvilVkV3dViewportHalfHeightFine(pipe))
 EndProcedure
 
 Procedure.i AnvilVkV3dShaderRecordOffset()

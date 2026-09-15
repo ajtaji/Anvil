@@ -473,7 +473,7 @@ Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
   If *build = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If *build\pipeline < 1 Or *build\pipeline > 7 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If *build\base <= 0 Or *build\bytes < avkTbPipeBytes : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
-  If *build\fragmentIr = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *build\vertexIr = 0 Or *build\fragmentIr = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   avkTbPipeBase[*build\pipeline] = *build\base
   avkTbLastPipe = *build\pipeline
   avkTbLastPipeBase = *build\base
