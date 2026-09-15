@@ -756,7 +756,8 @@ Global tcp_drop_hold.i        ; 1 while a retransmission is being emitted
 #TCP_SV_OOO_LEN  = 56          ; #TCP_OOO_SLOTS slots
 #TCP_SV_OOO_USED = 60          ; #TCP_OOO_SLOTS slots
 #TCP_SV_LIP      = 64
-#TCP_SV_N        = 65          ; must exceed every index above
+#TCP_SV_KIND     = 65          ; the interface, parked with the peer (forum 829)
+#TCP_SV_N        = 66          ; must exceed every index above
 
 Global Dim tcp_parked.i[#TCP_SOCKETS * #TCP_SV_N]
 
@@ -770,6 +771,7 @@ Procedure tcp_Load(s.i)
   tcp_rport         = tcp_parked[b + #TCP_SV_RPORT]
   tcp_rip           = tcp_parked[b + #TCP_SV_RIP]
   tcp_lip           = tcp_parked[b + #TCP_SV_LIP]
+  tcp_kind          = tcp_parked[b + #TCP_SV_KIND]
   i = 0
   While i < 6
     tcp_rmac[i]     = tcp_parked[b + #TCP_SV_MAC0 + i] & $FF
@@ -835,6 +837,7 @@ Procedure tcp_Save(s.i)
   tcp_parked[b + #TCP_SV_RPORT]    = tcp_rport
   tcp_parked[b + #TCP_SV_RIP]      = tcp_rip
   tcp_parked[b + #TCP_SV_LIP]      = tcp_lip
+  tcp_parked[b + #TCP_SV_KIND]     = tcp_kind
   i = 0
   While i < 6
     tcp_parked[b + #TCP_SV_MAC0 + i] = tcp_rmac[i] & $FF
