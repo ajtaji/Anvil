@@ -116,6 +116,17 @@ def monitor_hex_count(byte_count: int) -> str:
     return f"{byte_count:X}"
 
 
+def binary_preview(data: bytes) -> str:
+    """Render binary evidence without asking a console to encode binary data.
+
+    Printable ASCII stays readable. Every other byte is an ASCII-only hex
+    escape, so the preview is safe on Windows consoles regardless of their
+    active code page and the trace file itself remains untouched.
+    """
+    return "".join(chr(byte) if 0x20 <= byte <= 0x7E else f"\\x{byte:02x}"
+                   for byte in data)
+
+
 def parse_trace_spec(value: str | None) -> tuple[int, int] | None:
     """Validate the host trace request before a console or upload exists.
 
@@ -890,7 +901,7 @@ def run(args: argparse.Namespace) -> int:
                 "addr": f"{trace_addr:08X}",
                 "bytes": len(blob),
                 "hex": blob.hex(),
-                "ascii_magic": blob[:4].decode("ascii", "replace"),
+                "ascii_magic": binary_preview(blob[:4]),
             }
             (out_dir / f"{name}.trace.bin").write_bytes(blob)
             print(f"  trace   {len(blob)} bytes from {trace_addr:08X} "

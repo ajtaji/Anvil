@@ -195,7 +195,17 @@ def main() -> int:
         fail(f"the trace's magic decoded as {blob[:4]!r}")
     if int.from_bytes(blob[8:16], "little") != 9:
         fail("the trace's stage word did not decode")
-    checks += 3
+    if tool.binary_preview(b"KTRC") != "KTRC":
+        fail("a printable trace prefix did not stay readable")
+    hostile_preview = tool.binary_preview(bytes((0x96, 0xA4, 0xFF, 0x00)))
+    if hostile_preview != r"\x96\xa4\xff\x00":
+        fail(f"a binary trace prefix rendered as {hostile_preview!r}")
+    try:
+        hostile_preview.encode("ascii")
+        hostile_preview.encode("cp1252")
+    except UnicodeEncodeError:
+        fail("a binary trace preview is not console-safe ASCII")
+    checks += 5
 
     # The monitor command language reads counts as hexadecimal, while the
     # command-line trace length is an ordinary decimal integer.  These two
