@@ -67,19 +67,19 @@ one gets a compile-time refusal naming it.
 
 | Entry point | Status |
 |---|---|
-| `vkCreateShaderModule` / `vkDestroyShaderModule` | Implemented. The module is WALKED at creation, not stored: `vkCreateShaderModule` returns an Anvil refusal, with a sentence, for any module outside the accepted SPIR-V subset. |
+| `vkCreateShaderModule` / `vkDestroyShaderModule` | Implemented. Creation walks and verifies the accepted SPIR-V subset, then retains an immutable exact-word image and typed IR owned by the shader-module generation. Pipeline creation consumes that verified IR synchronously and copies its executable metadata, so a compiled pipeline survives later module destruction and slot reuse. Modules outside the accepted subset are refused with a whole sentence before publication. |
 | `vkCreateBuffer` / `vkDestroyBuffer` / `vkGetBufferMemoryRequirements` / `vkBindBufferMemory` | Implemented for `VK_BUFFER_USAGE_VERTEX_BUFFER_BIT`, `VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT` and the two transfer bits, exclusive sharing, page-granular alignment. |
 | `vkCreateImageView` / `vkDestroyImageView` | Implemented for `VK_IMAGE_VIEW_TYPE_2D`, `VK_FORMAT_B8G8R8A8_UNORM`, identity swizzle, the whole colour subresource. |
 | `vkCreateSampler` / `vkDestroySampler` | Implemented as a typed, device-owned object for normalized 2D sampling with nearest or linear min/mag filters, nearest mip mode at LOD zero, clamp-to-edge on all coordinates, and no anisotropy or comparison. It is retained by the bounded combined-image-sampler descriptor and consumed by both the measured linear one-texel path and the bounded optimal-image path. |
 | `vkCreateRenderPass` / `vkDestroyRenderPass` | Implemented for one colour attachment, one subpass, no dependencies, `loadOp` CLEAR and `storeOp` STORE. |
 | `vkCreateFramebuffer` / `vkDestroyFramebuffer` | Implemented for one attachment at the image's own extent, one layer. |
-| `vkCreatePipelineLayout` / `vkDestroyPipelineLayout` | Implemented for zero or one descriptor set layout and at most one push constant range: fragment stage, offset 0, 16 bytes. |
-| `vkCreateDescriptorSetLayout` / `vkDestroyDescriptorSetLayout` | Implemented for one or two uniform-buffer bindings numbered 0..n-1, or exactly one `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` at binding zero; every binding has `descriptorCount` 1 at `VK_SHADER_STAGE_FRAGMENT_BIT`. Mixed layouts and every other descriptor type are refused. Destroying a layout under a live set is refused. |
-| `vkCreateDescriptorPool` / `vkDestroyDescriptorPool` / `vkResetDescriptorPool` | Implemented for one pool size of uniform buffers. `VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT` is refused, and so are reset and destroy while a submission is in flight. |
-| `vkAllocateDescriptorSets` | Implemented for one set per call, against the pool's own `maxSets`, descriptor count and descriptor type, with `VK_ERROR_OUT_OF_POOL_MEMORY` when any is absent or exhausted. |
+| `vkCreatePipelineLayout` / `vkDestroyPipelineLayout` | Implemented for zero or one descriptor set layout and at most one push constant range: fragment stage, offset 0, 16 bytes. Creation consumes and copies the set layout's immutable dense binding schema; later source-layout destruction or slot reuse cannot substitute another schema. Nonzero create flags and cross-device set layouts are refused before publication. |
+| `vkCreateDescriptorSetLayout` / `vkDestroyDescriptorSetLayout` | Implemented for one or two dense bindings numbered 0..n-1, each either `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` or `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`; every binding has `descriptorCount` 1 at `VK_SHADER_STAGE_FRAGMENT_BIT`. A mixed UBO-plus-sampler layout is supported in either binding order. Every other descriptor type, sparse numbering and duplicate binding are refused before publication. Sets consume and copy the schema at allocation, so the source layout may subsequently be destroyed or reused without changing them. |
+| `vkCreateDescriptorPool` / `vkDestroyDescriptorPool` / `vkResetDescriptorPool` | Implemented for arbitrary input rows containing the two supported descriptor types. Duplicate rows of the same type are summed with checked overflow into independent per-type capacities. `VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT` is refused, and so are reset and destroy while a submission is in flight. |
+| `vkAllocateDescriptorSets` | Implemented for one set per call, against the pool's `maxSets` and independent per-type capacities. Mixed allocation is transactional: either every binding's type has capacity and the complete immutable schema is published, or no counter or output changes. `VK_ERROR_OUT_OF_POOL_MEMORY` reports an absent or exhausted type. |
 | `vkFreeDescriptorSets` | Present and refuses, naming the pool bit it would need. It is not missing from the link; it says why it cannot work. |
-| `vkUpdateDescriptorSets` | Implemented for one write per call and no copies. Uniform-buffer writes require `dstArrayElement` 0, `descriptorCount` 1 and a live, bound uniform buffer at a sixteen-byte-aligned offset and range of at least sixteen (`VK_WHOLE_SIZE` accepted). The bounded combined-image-sampler write requires a live device-owned sampler and full image view, a bound linear BGRA8 image created with `SAMPLED`, and `SHADER_READ_ONLY_OPTIMAL`; resolution rechecks live handles and the image's current layout. Refused while a submission is in flight. |
-| `vkCmdBindDescriptorSets` | Implemented for one set at index 0, no dynamic offsets, `VK_PIPELINE_BIND_POINT_GRAPHICS`, through the pipeline layout the set's own layout belongs to. |
+| `vkUpdateDescriptorSets` | Implemented for one write per call and no copies. The two bindings of a mixed set update independently. Uniform-buffer writes require `dstArrayElement` 0, `descriptorCount` 1 and a live, same-device bound uniform buffer at a sixteen-byte-aligned offset and range of at least sixteen (`VK_WHOLE_SIZE` accepted); subtraction-based bounds validation prevents `offset + range` wrap. The bounded combined-image-sampler write requires a live same-device sampler and full image view, a bound BGRA8 image created with `SAMPLED`, and `SHADER_READ_ONLY_OPTIMAL`; resolution rechecks live handles and the image's current layout. Refused while a submission is in flight. |
+| `vkCmdBindDescriptorSets` | Implemented for one set at index 0, no dynamic offsets and `VK_PIPELINE_BIND_POINT_GRAPHICS`. Device ownership and the copied binding-count/type/stage schema must match the command buffer's pipeline layout; compatible schemas from distinct source layout handles are accepted. |
 | `vkCreateGraphicsPipelines` / `vkDestroyPipeline` | Implemented for exactly one `VkGraphicsPipelineCreateInfo` per call and no pipeline cache. See the state table below for what it accepts. |
 | `vkCmdBeginRenderPass` / `vkCmdEndRenderPass` | Implemented for `VK_SUBPASS_CONTENTS_INLINE`, one clear value, a render area that is the whole framebuffer. |
 | `vkCmdBindPipeline` | Implemented for `VK_PIPELINE_BIND_POINT_GRAPHICS`. |
@@ -121,7 +121,7 @@ observable.
 | Pi 4 renderer | The existing Pi driver initializes V3D 4.2, GPU page tables, QPU encoding, bin/render control lists, TFU and CSD submission, bounded waits, cache maintenance, OOM handling, and fault evidence. Neon builds fixed UI shaders and geometry for boxes, lines, glyphs, textures, clipping, rotation, and console chrome. The console has exercised the underlying V3D bin/render path on hardware. | Neon is an engine API, not Vulkan fixed-function state. Its built-in shaders are not SPIR-V, shader modules, descriptor-backed programs, or general graphics/compute pipelines. Direct polling and single-owner global arenas are not a Vulkan queue scheduler. A working console does not prove arbitrary Vulkan commands or shaders. |
 | Memory and resources | One heap, taken whole from the backend and suballocated first-fit with page-granular alignment. `VkDeviceMemory`, `VkImage`, `VkBuffer` and the bounded `VkSampler` subset are real typed objects with generations and owners; memory-backed resources also carry bind and in-flight counts. A compiled pipeline's shaders take an INTERNAL allocation from the same heap that no handle names and `vkFreeMemory` cannot reach. Row pitch and image size come from the backend's rule; optimal images expose no fake row pitch. A host-visible allocation supports one checked `vkMapMemory` range, including `VK_WHOLE_SIZE`, and must be unmapped before free. Pi 4's identity-mapped window is advertised `HOST_COHERENT` because submission/completion own mandatory cache maintenance. A combined-image-sampler descriptor resolves to one closed live record only while its image is bound, carries `SAMPLED`, and remains in `SHADER_READ_ONLY_OPTIMAL`. The bounded optimal BGRA8 path records and retains one whole-image buffer copy and reaches `UIF_NO_XOR` through TFU. | There are no buffer views, mip levels, array layers, general tilings, aliasing, dedicated allocations, sparse memory, flush/invalidate mapped-range entry points, index buffers, storage buffers, or formats other than `B8G8R8A8_UNORM`. Linear sampled images remain limited to 1x1. Optimal images remain limited to the planner's level-zero one-layer/one-sample BGRA8 shape and one tightly packed whole-image copy; partial regions, row-length overrides and conversion are refused. There is one queue family, so queue-family ownership transfer is refused rather than implemented. |
 | Synchronization | `VkFence` with its two states and its one owner, plus core-1.0 binary semaphores with generation ownership, ordered single-consumption, pending references and failure-atomic reserve/commit/complete/rollback. `vkWaitForFences` honours finite timeouts and is bounded twice. An already-satisfied `UINT64_MAX` wait succeeds; an unsatisfied one is explicitly refused. Image memory barriers carry layout tracking checked at record and submit. The test backend proves both immediate and later-polled semaphore completion and later-polled device-loss rollback; the current V3D backend completes inside `NeonFrameEnd`. | There are no events, timeline semaphores, host semaphore signal/wait/reset, general global or buffer memory barriers, multi-`VkSubmitInfo` batches, or concurrent queues. An unsignaled wait cannot park the single-owner queue and is refused loudly. A genuinely unlimited host wait that another thread could satisfy still needs reentrant call frames. |
-| Shaders and pipelines | A SPIR-V front end parses a module, validates it against the Vulkan environment and refuses by name everything outside one declared subset: a pass-through vertex shader, and a fragment shader whose colour is an interpolated varying, a push-constant member, a uniform-block member, a constant, or one exact combined `sampler2D` implicit-LOD lookup from a location-zero `vec2`. A V3D emitter turns that subset's plan into QPU programs, uniform streams and a GL shader state record. Uniform-buffer and sampled-image descriptors keep GPU-visible addresses in those streams; V3D 4.2 TMU requests dereference them in the QPU, and the backend proves each range mapped and cleans it before submission. A pipeline object owns fixed-function state, the stage interface match, the vertex input layout across one to four bindings, and the match between shader `DescriptorSet`/`Binding` decorations and the descriptor set layout its pipeline layout declares. A render pass and framebuffer own the colour attachment. | There is no target-neutral shader IR, no register allocator, no scheduler and no general instruction selection - the emitter assigns registers by counting, which is enough for the accepted subset and nothing else. Sampled SPIR-V is restricted to one combined 2D image at set zero, one binding, direct whole-`vec2` coordinates, implicit LOD, no image operands and direct whole-`vec4` output. On Pi 4 the resource must be exactly one linear BGRA8 texel; larger textures still require correct V3D tiling and transfer support. There is no general arithmetic or control flow, storage buffer, dynamic descriptor, descriptor array, descriptor copy, push descriptor, specialization constant, pipeline cache, derivative pipeline, compute pipeline, second subpass, depth attachment or blending. Internal clear lowering is still not a shader compiler and this is still not one either. |
+| Shaders and pipelines | A SPIR-V front end parses a module, validates it against the Vulkan environment and retains exact records as immutable typed SSA IR. The accepted vertex path remains pass-through. The fragment path supports scalar and two-, three- or four-component binary32 values, straight-line `FAdd`/`FMul`, live input loads, one push-constant block, one uniform-block member, and one combined `sampler2D` implicit-LOD lookup; dead declared inputs, outputs and loads do not change the live interface. The V3D 4.2 lowerer reserves resource registers from live dependencies, emits QPU programs and a uniform stream transactionally, and publishes exact patch metadata only after complete validation. Uniform-buffer and sampled-image descriptors keep GPU-visible addresses in those streams; the backend proves each range mapped and cleans it before submission. Pipelines copy executable shader metadata and the immutable descriptor/push compatibility signature. | There is no general control flow, phi, loop, function-call, integer arithmetic, conversion, comparison, storage buffer, dynamic descriptor, descriptor array, descriptor copy, push descriptor, specialization constant, pipeline cache, derivative pipeline, compute pipeline, second subpass, depth attachment or blending. Sampled SPIR-V remains restricted to one combined 2D image at set zero, direct whole-`vec2` coordinates, implicit LOD, no image operands and direct whole-`vec4` output. The supported fragment graph may combine at most one live push load, one live UBO load and one live sample. The lowerer is serialized and uses bounded scratch storage; it is not a general optimizer or scheduler. Linear sampling remains bounded to one texel; the optimal path is the separately proved level-zero BGRA8 whole-image transfer shape. |
 | Presentation | Pi display code owns HDMI/DSI surfaces, physical/logical rotation, cache/DMA presentation, capture, and V3D console retargeting. | There is no `VkSurfaceKHR`, platform extension, surface capability query, swapchain image set, acquire/present synchronization, present mode, resize/loss handling, or ownership transfer. The board diagnostic presents by copying the finished image onto the shown half of the framebuffer, which is the display layer's own path and not WSI. |
 | Driver modules | PMFMOD v1 validates, relocates, zeroes, cache-synchronizes, and records an AArch64 module image in a board-provided arena. | Neither board wires a module arena or file discovery. The engine does not call module probe/init/quiesce entries, bind services, install stable dispatch trampolines, account for in-flight calls, or reload. The Vulkan backend is statically composed, which the layering permits. |
 
@@ -134,9 +134,11 @@ observable.
 | `tools/vulkan_dispatch_check.py` / `tools/vulkan_dispatch_inventory_check.py` | PASS — 370 registry/source/emitted checks, 58 emitted rows and 775,632 interpreted A64 instructions; all 3 focused mutants are RED. The complete inventory validates all 137 core-1.0 commands: 74 declared-callable and 63 missing, with 73 names exposed through the resolvers. | Exact registry prototypes, aliases and command domains; case-sensitive bounded lookup; null-instance/global, instance and device query rules; and the deliberate `vkFreeDescriptorSets` withholding boundary. |
 | `tools/vulkan_resource_check.py` | PASS — 474 independent property checks over 1,134,241 executed A64 instructions. The earlier complete mutation run rejects all 30 prior mistakes; the two focused `UINT64_MAX` mutants, all ten focused map-memory mutants and the focused transfer-only attachment mutant are RED. The suite now has 44 mutants after the obsolete semaphore-refusal mutant was removed; a fresh complete run of all 44 has not been claimed. | The resource, layout, fence, retention, mapping, format-capability, submission and error-reporting contracts, executed through the public entry points, with an MMIO hard stop armed; and that every byte of the bound image still held its poison, so no processor-side clear exists anywhere in the path. Its mapping properties use the public entry points to distinguish host-visible/non-visible types, owner, live/stale handle, duplicate/unbalanced state, flags, exact/whole ranges and returned pointer, then use the mapping to poison the image. Its format property refuses colour-attachment image creation when the backend advertises no graphics draw path while the shared combination owner still accepts transfer-only and sampled-only usage. Its wait properties distinguish an unsignalled unlimited wait (explicitly unsupported) from an already-satisfied unlimited wait (success). |
 | `tools/vulkan_v3d_backend_check.py` | PASS — 84 property checks over 388,147 executed A64 instructions; all three production board diagnostics build real images. The recorded mutation run rejects all 16 desk-reachable mistakes and names 2 board-only rules it cannot reach. | That the whole closure links against the real display, V3D, QPU and Neon implementation; that a build with the engine down enumerates no device without MMIO; that geometry is planned before mutation, every arena/range/in-frame boundary is checked, and a failed rebind preserves the prior surface. It also requires full geometry restoration and the descriptor TMU mapped-range/cache-clean contracts. The source contract requires the pipeline/vertex/descriptor cleans before submission and the GPU clean plus target clean/invalidate before completion, giving the `HOST_COHERENT` advertisement teeth. |
-| `tools/vulkan_spirv_check.py` | PASS — 404 property checks over 4,755,621 executed A64 instructions; `--mutate` rejects all 28 plausible mistakes | That 52 SPIR-V modules, assembled word by word IN THE CHECKER from the specification's own opcode numbers, are walked correctly: 7 inside the subset are lowered to a plan whose every field is checked, and 45 outside it are refused with a whole sentence naming the opcode, capability, decoration, built-in, storage class or descriptor placement. The front end makes no MMIO access and does not write one byte of the module it was handed |
-| `tools/vulkan_qpu_emitted_check.py` | Baseline PASS — 15 emitted programs containing 423 V3D 4.2 instructions over 12,383,933 A64 setup instructions. | Independent decoding of coordinate, vertex and fragment programs for varying, push-constant, split-binding, uniform-buffer and sampled-image paths. |
-| `tools/vulkan_pipeline_check.py` | Baseline PASS — 299 property checks over 12,383,933 executed A64 instructions. The focused `optimal-copy` batch covers resource, region, backend-owned alignment, generation, layout-publication, retention, async-hold, padded-capacity and backend packet mutations. The four-mutant `lifetime-alias` batch rejects stale destination-image, framebuffer, image-view and render-pass slot reuse. The sampled-exec identity-swizzle mutant and the twelve sampled-state mutants remain red. | That the public path from image/buffer creation through `vkCmdCopyBufferToImage`, submit, TFU backend record and later sampled draw reaches each layer with the right immutable state. The test backend writes no pixels or MMIO; real pixel/TFU execution is paired with the Pi 4 run below. Existing shader-record, vertex, descriptor, zero-draw, incomplete-triangle, colour-attachment and sample-mask checks remain. Each checker process owns unique artifacts and a whole-run OS lock prevents a baseline from compiling through another process's temporary hostile mutation. |
+| `tools/vulkan_spirv_check.py` | PASS — 486 checks over 11,639,888 executed A64 instructions across 58 assembled modules. | The legacy accepted and refused SPIR-V vocabulary is unchanged after exact-record retention: modules are assembled word by word from specification opcode numbers, walked without mutation, and either published only after complete validation or refused with a whole sentence naming the unsupported semantic. |
+| `tools/vulkan_spirv_ir_adapter_check.py` | PASS — 8,704 properties over 57,196,054 interpreted A64 instructions; all 7 focused mutations are RED. | Exact immutable raw words, every retained semantic record field/order/offset, typed IR types and nodes, publish-last invalidation, self-use dominance refusal, poisoned-output clearing, and all six embedded pointer rebindings. |
+| `tools/vulkan_ir_v3d42_check.py` | PASS — 65 emitted checks, 734 independently decoded QPU instructions and 23,444,775 interpreted A64 instructions; all 39 causal mutations are RED with infrastructure failures separated from semantic rejection. | Transactional straight-line typed-IR lowering, binary32 `FAdd`/`FMul`, dependency-driven register reservations, split resource lifetimes, exact uniform metadata, dead-SSA behavior, range/overlap checks and publish-last failure atomicity. |
+| `tools/vulkan_qpu_emitted_check.py` | Baseline PASS — 15 emitted programs containing 423 independently decoded V3D 4.2 instructions over 44,342,506 A64 setup instructions. | Independent decoding of coordinate, vertex and fragment programs for varying, push-constant, split-binding, uniform-buffer, sampled-image and typed arithmetic paths. |
+| `tools/vulkan_pipeline_check.py` | Baseline PASS — 596 property checks over 44,342,506 executed A64 instructions. The compact mixed-descriptor gate separately passes in 2,983,365 A64 instructions and rejects all 42 causal mutations; the focused dead-I/O wrapper rejects all four public-summary/backend mutations. The optimal-copy, lifetime-alias and sampled-state families remain red. | The public path through resource creation, transfer, immutable descriptor schemas, mixed UBO-plus-sampler binding, typed fragment lowering, transactional submission and exact backend observation. It proves all nine mixed uniform words, six descriptor dependencies plus the attachment view, dual-role view retention, compatible schema handles, slot reuse safety, per-type pool atomicity, cross-device refusals, dead-interface liveness and failure-atomic release. The test backend writes no pixels or MMIO; real GPU execution is paired only with the explicit Pi 4 runs below. Each checker owns unique artifacts and a whole-run OS lock prevents compilation through another process's hostile mutation. |
 | `tools/vulkan_interp_check.py` | PASS — 395 property checks over 372,292 executed A64 instructions; `--mutate` rejects all 14 plausible mistakes | That `vk_interp_expect.pbi` — the module the board diagnostic asks what colour a pixel should be — gives the same answers as a second implementation of the same stated rule written in Python: the clip-to-screen transform, twice the signed area, the three barycentric numerators, the strict inside test, the four channels and the packed B8G8R8A8 word, over eight triangles and thirty-three probe pixels. The weights at every covered probe sum to twice the area, and each corner probe is dominated by its own vertex by more than three tolerances — which is what makes a board run able to tell a gradient from a flat fill. It owns no hardware and makes no MMIO access |
 
 None of these desk gates prove GPU execution, displayed output, concurrency,
@@ -432,13 +434,15 @@ highest step 10 and both magics present. This accepts those APIs and their
 vertex/render cache path at the one proven 800x1280 geometry. It does not make
 the failed descriptor/TMU run green.
 
-The generic `tools/board_run.py` wrapper currently treats any nonzero `x0` as
-a payload failure. These Vulkan diagnostics intentionally return a report
-address in `x0`, so its loud wrapper verdict is not their verdict; the complete
-magic/tail report is. Its capture-sequence comparison also mistakes the first
-capture after a monitor reset for stale when the persisted old sequence was
-higher. Both tool issues are recorded here so neither can be read as a Vulkan
-failure.
+The generic `tools/board_run.py` wrapper now accepts an explicit unsigned
+`--expect-x0` value, validates it before any board side effect, and records the
+expectation in its JSON evidence. A mismatch remains a failure after trace and
+screenshot preservation. Its fatal-exception path validates the requested
+trace range before boot, retains every accepted exception datagram through a
+quiet prompt/reset boundary, and never sends trace or screenshot commands as
+though a faulting payload had returned. Focused fake-console gates cover normal
+return, expected nonzero return, mismatch, complete and incomplete exception
+records, timeouts, malformed ranges and the no-transmit-on-fatal rule.
 
 **2026-09-13, run 8 — PASSED. Uniform-buffer descriptor, interpolation and
 split vertex bindings on silicon.** This was the first candidate after a safe
@@ -562,6 +566,38 @@ current normalized nearest-filter sample path. Other formats, partial copies,
 row-length/image-height overrides, mips, layers, scaling and conversion remain
 refused.
 
+**2026-09-15, run 12 — PASSED. One fragment executes sampled-image, push and
+UBO arithmetic on silicon.** Monitor build 101 verified the exact 874,740-byte
+container, SHA-256
+`6405122BD5F7BE41BB79B56CDCB770D0499AA1A7E6E602AAE17C42F7419B9D85`,
+at `$00500000`, armed the 15-second deadman and returned normally in 9.81
+seconds with `x0=$005E7E78`. The flat 874,612-byte image has SHA-256
+`C942FDF52697C80DBC3ACC56850431366C04ADDBAA050FC840ECAC3FB965922A`.
+The checker recovered all 240 report words and required both magics, length
+960, final step 13, four zero pass verdicts, zero submit/wait results and zero
+MMU, OOM and native-backend faults.
+
+The fragment computes `sample * push + UBO`. The retained typed IR and V3D
+lowerer published nine distinct runtime indices: push RGBA 4..7, UBO
+address/config 2/3, texture/sampler 0/1 and TLB 8. The returned shader record
+proved that all nine values were patched through those indices, including UBO
+address `$067D3000`, vec4 TMU configuration `$FFFFFF7C`, texture/sampler
+pointers `$067DD20F`/`$067DD301`, and TLB word `$FFFFFFFF`. The three inside
+pixels were exactly `$FF808000`, `$FF800080`, `$FFFF0000`; all outside probes
+kept `$FF3380B2`. TFU, bin and render counters each advanced exactly once.
+Module and pipeline-layout source slots were destroyed and reused without
+altering the compiled pipeline, and all nine retained resource counters were
+zero after completion. The five deliberate hostile validation probes remained
+a cumulative count of 5 before, during and after the mixed draw while the
+current fault code was zero on both sides, proving the draw added no fault.
+
+The fresh DMA capture was sequence 2, 1280x800, with pixel SHA-256
+`D1F98B232832C919E8FC96F4EC1EF8144240063B0BF76B05A3B4DC7C44D51A18`;
+the triangle was inspected and clean. The board returned healthy to the build
+101 prompt. This accepts only the current one-sample, one-push-load,
+one-UBO-load straight-line binary32 graph. It is not general shader, descriptor,
+texture, scheduling or Vulkan-conformance proof.
+
 
 ## Required architecture
 
@@ -644,27 +680,24 @@ The order below is dependency order, not a schedule:
    typed IR. Start with one tightly declared vertex/fragment capability set;
    reject every capability, execution model, decoration, type, instruction, or
    precision behavior that is not implemented.
-   **Parsing, validation and the refusals are done (2026-09-11); the typed IR is
-   NOT.** What exists is a walker that produces a small plan for one declared
-   subset and refuses everything else by name. That is enough for a
-   pass-through shader and nothing like enough for a general one, and the
-   distinction is kept in the source: the file says it is an emitter and not a
-   compiler.
+   **Parsing, validation, exact-record retention and the first typed IR are
+   done.** The immutable IR represents the declared single-function,
+   single-block vertex/fragment subset, including straight-line binary32
+   `FAdd`/`FMul`; unsupported capabilities and operations remain explicit
+   refusals. It is a bounded shader compiler path, not a general SPIR-V
+   implementation.
 5. Add pipeline layouts, descriptors, render passes, fixed-function state and
    V3D QPU lowering. Differential shader tests and independent packet/QPU
    decoders precede broader instruction coverage.
-   **Pipeline layouts, one render pass, the fixed-function state listed above
-   and the QPU lowering are done (2026-09-11), and so is ONE descriptor type -
-   a uniform buffer, through a set layout, a pool, an allocation, an update and
-   a bind, with every other type refused by its own name. The independent
-   decoder is still partial** - the checker packs the shader record and the
-   attribute records independently and compares bytes, and as of 2026-09-12 it
-   decodes the signal/destination sequence and lookup fields of the eighteen
-   raw instructions in the descriptor fragment program. Other emitted programs
-   are still checked by length, no-op structure
-   and whole-byte equality rather than a complete disassembler. The descriptor
-   now uses a GPU-side V3D 4.2 TMU general vec4 load; its desk proof and
-   clean-state silicon execution are complete in run 8.
+   **Pipeline layouts, one render pass, the fixed-function state listed above,
+   typed QPU lowering, uniform-buffer descriptors and bounded combined image
+   samplers are implemented.** A dense two-binding set may carry both resource
+   types; copied schemas, per-type pool accounting, device ownership and
+   submission lifetimes are independently gated. The QPU checker decodes 423
+   V3D 4.2 instructions across all 15 emitted programs. Historical UBO and
+   sampled-image silicon runs remain valid, and the 2026-09-15 recovered and
+   graded board report now proves the first bounded three-source arithmetic
+   fragment (`sample * push + UBO`) on V3D 4.2.
 6. Add the bare-metal surface/swapchain extension over the existing display
    provider, preserving separate HDMI and DSI ownership and rotations.
 7. Expand features only with a machine-readable coverage matrix, negative

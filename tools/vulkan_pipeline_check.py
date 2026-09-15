@@ -55,11 +55,11 @@ DIAGNOSTIC2 = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanVaryin
 LOAD = 0x00400000
 STACK = 0x03000000
 LOADER_LR = 0xDEAD0000
-# A green run currently retires about eleven million instructions. Five times
-# that budget is enough for a valid path and turns a mutation-created loop into
-# a prompt red result instead of monopolising the compiler lane for most of an
-# hour.
-STEP_LIMIT = 50_000_000
+# The mixed descriptor/lifetime matrix is deliberately much larger than the
+# original pipeline gate. This remains a finite execution ceiling: a valid
+# gate must return, while a mutation-created loop still terminates as an
+# infrastructure failure rather than being misreported as a semantic kill.
+STEP_LIMIT = int(os.environ.get("ANVIL_VK_PIPELINE_STEP_LIMIT", "150000000"))
 MMIO = 0xFC000000
 
 IN = 0x06000000
@@ -343,6 +343,69 @@ def fragment_varying_with_dead_io() -> bytes:
     return spv.module(15, body)
 
 
+def fragment_mixed_sample_push_uniform() -> bytes:
+    """sample(binding 1) * push vec4 + UBO(binding 0) -> out vec4.
+
+    This is the smallest public shader that forces both descriptor families,
+    push constants and arithmetic through one retained typed-IR pipeline.
+    """
+    I, O = spv.ins, spv.OP
+    body = [
+        I(O["Capability"], spv.CAP_SHADER),
+        I(O["MemoryModel"], spv.ADDR_LOGICAL, spv.MEM_GLSL450),
+        I(O["EntryPoint"], spv.EM_FRAGMENT, 24, *spv.lit("main"), 12, 13),
+        I(O["ExecutionMode"], 24, spv.MODE_ORIGIN_UPPER_LEFT),
+        I(O["Decorate"], 11, spv.DEC_DESCRIPTOR_SET, 0),
+        I(O["Decorate"], 11, spv.DEC_BINDING, 1),
+        I(O["Decorate"], 12, spv.DEC_LOCATION, 0),
+        I(O["Decorate"], 13, spv.DEC_LOCATION, 0),
+        I(O["Decorate"], 14, spv.DEC_BLOCK),
+        I(O["MemberDecorate"], 14, 0, spv.DEC_OFFSET, 0),
+        I(O["Decorate"], 16, spv.DEC_DESCRIPTOR_SET, 0),
+        I(O["Decorate"], 16, spv.DEC_BINDING, 0),
+        I(O["Decorate"], 20, spv.DEC_BLOCK),
+        I(O["MemberDecorate"], 20, 0, spv.DEC_OFFSET, 0),
+        I(O["TypeVoid"], 1),
+        I(O["TypeFunction"], 2, 1),
+        I(O["TypeFloat"], 3, 32),
+        I(O["TypeVector"], 4, 3, 2),
+        I(O["TypeVector"], 5, 3, 4),
+        I(O["TypeImage"], 6, 3, 1, 0, 0, 0, 1, 0),
+        I(O["TypeSampledImage"], 7, 6),
+        I(O["TypePointer"], 8, spv.SC_UNIFORM_CONSTANT, 7),
+        I(O["TypePointer"], 9, spv.SC_INPUT, 4),
+        I(O["TypePointer"], 10, spv.SC_OUTPUT, 5),
+        I(O["TypeStruct"], 14, 5),
+        I(O["TypePointer"], 15, spv.SC_UNIFORM, 14),
+        I(O["TypePointer"], 17, spv.SC_UNIFORM, 5),
+        I(O["TypeInt"], 18, 32, 1),
+        I(O["Constant"], 18, 19, 0),
+        I(O["TypeStruct"], 20, 5),
+        I(O["TypePointer"], 21, spv.SC_PUSH, 20),
+        I(O["TypePointer"], 23, spv.SC_PUSH, 5),
+        I(O["Variable"], 8, 11, spv.SC_UNIFORM_CONSTANT),
+        I(O["Variable"], 9, 12, spv.SC_INPUT),
+        I(O["Variable"], 10, 13, spv.SC_OUTPUT),
+        I(O["Variable"], 15, 16, spv.SC_UNIFORM),
+        I(O["Variable"], 21, 22, spv.SC_PUSH),
+        I(O["Function"], 1, 24, 0, 2),
+        I(O["Label"], 25),
+        I(O["Load"], 7, 26, 11),
+        I(O["Load"], 4, 27, 12),
+        I(O["ImageSampleImplicitLod"], 5, 28, 26, 27),
+        I(O["AccessChain"], 17, 29, 16, 19),
+        I(O["Load"], 5, 30, 29),
+        I(O["AccessChain"], 23, 31, 22, 19),
+        I(O["Load"], 5, 32, 31),
+        I(133, 5, 33, 28, 32),       # OpFMul
+        I(129, 5, 34, 33, 30),       # OpFAdd
+        I(O["Store"], 13, 34),
+        I(O["Return"]),
+        I(O["FunctionEnd"]),
+    ]
+    return spv.module(35, body)
+
+
 def modules() -> list[bytes]:
     return [spv.vertex_passthrough(), spv.fragment_varying(),
             spv.vertex_position_only(), spv.fragment_push(),
@@ -358,7 +421,8 @@ def modules() -> list[bytes]:
             spv.fragment_constant(),
             # Retains valid dead interface declarations and a dead Load. The
             # public compiler must derive its ABI from the sole Store root.
-            fragment_varying_with_dead_io()]
+            fragment_varying_with_dead_io(),
+            fragment_mixed_sample_push_uniform()]
 
 
 def execute(a64, image: pathlib.Path):
@@ -404,7 +468,14 @@ def execute(a64, image: pathlib.Path):
         if cpu.pc == LOADER_LR:
             return cpu, cpu.x[0] & 0xFFFFFFFFFFFFFFFF, steps
         cpu.step()
-    raise SystemExit(f"vulkan_pipeline_check: the gate did not return in {STEP_LIMIT} steps")
+    where = cpu.locate(cpu.pc) if cpu.locate else f"${cpu.pc:016X}"
+    progress_slot = load(OUT + 680 * 8, 8)
+    progress_value = load(OUT + progress_slot * 8, 8) if progress_slot <= 679 else 0
+    raise SystemExit(
+        f"vulkan_pipeline_check: the gate did not return in {STEP_LIMIT} steps; "
+        f"pc=${cpu.pc:016X} ({where}), x0=${cpu.x[0]:016X}, "
+        f"x1=${cpu.x[1]:016X}, sp=${cpu.sp:016X}, "
+        f"last-report-slot={progress_slot}, value=${progress_value:016X}")
 
 
 def u64(cpu, addr: int) -> int:
@@ -466,6 +537,17 @@ def grade(cpu, rc) -> Grader:
     g = Grader()
     g.want_true("the gate returned a report address", base != 0, hex(base))
     g.need("gate magic", hex(u64(cpu, base)), hex(MAGIC))
+    # Grade the four public dead-interface semantic boundaries before the
+    # global end-row. A deliberate liveness mutant can stop at pipeline or V3D
+    # creation (93/94); its exact causal property must still be published and
+    # must not be misclassified as an infrastructure-only early stop.
+    g.need("[dead-io] shader module with valid dead declarations creates",
+           slot(341), 0)
+    g.need("[dead-io] retained fragment summary has only the Store output",
+           (slot(629), slot(630), slot(631)), (1, 4, 0))
+    g.need("[dead-io] public pipeline ignores the dead input and output",
+           slot(342), 0)
+    g.need("[dead-io] real typed-IR V3D compilation succeeds", slot(343), 0)
     g.need("the gate ran to the end", slot(1), 0)
     if slot(1) != 0:
         g.failures.append("  fault: " + cstr(cpu, u64(cpu, base + 32 * 8))[:200])
@@ -533,11 +615,6 @@ def grade(cpu, rc) -> Grader:
            slot(53), ERR_ARGS)
     g.need("a fragment shader that reads a varying nothing writes is refused",
            slot(54), ERR_ARGS)
-    g.need("[dead-io] shader module with valid dead declarations creates",
-           slot(341), 0)
-    g.need("[dead-io] public pipeline ignores the dead input and output",
-           slot(342), 0)
-    g.need("[dead-io] real typed-IR V3D compilation succeeds", slot(343), 0)
     g.need("[dead-io] only the live varying remains in the pipeline",
            slot(347), 1)
     dead_base = slot(348)
@@ -960,8 +1037,8 @@ def grade(cpu, rc) -> Grader:
     g.want_true("that refusal names the unsupported storage-image type",
                 "storage image descriptor" in sampler_text, repr(sampler_text[:140]))
     g.need("the bounded combined-image-sampler set layout was created", slot(171), 0)
-    g.need("a combined image sampler in a multi-binding layout is refused",
-           slot(196), ERR_UNSUPPORTED)
+    g.need("the earlier mixed sampler and UBO layout smoke test creates",
+           slot(196), 0)
     g.need("a UBO pool cannot allocate a combined-image-sampler set",
            slot(172), VK_ERROR_OUT_OF_POOL_MEMORY)
     g.need("the combined-image-sampler pool was created", slot(173), 0)
@@ -1034,13 +1111,14 @@ def grade(cpu, rc) -> Grader:
     shape_text = cstr(cpu, u64(cpu, base + 146 * 8))
     g.want_true("the wrong-shape refusal is owned by descriptor-set layout "
                 "compatibility",
-                "allocated from a different VkDescriptorSetLayout" in shape_text,
+                "immutable binding schema is incompatible" in shape_text,
                 repr(shape_text[:170]))
     g.need("a correctly shaped set bound through the wrong pipeline layout is "
            "refused at draw", slot(147), ERR_ARGS)
     pipeline_layout_text = cstr(cpu, u64(cpu, base + 148 * 8))
     g.want_true("the wrong-pipeline-layout refusal is the draw-time layout rule",
-                "bound through a different pipeline layout" in pipeline_layout_text,
+                "immutable set and push-range compatibility signature differs"
+                in pipeline_layout_text,
                 repr(pipeline_layout_text[:170]))
     g.need("a one-binding descriptor draw clears binding one's old address",
            slot(144), 0)
@@ -1088,8 +1166,9 @@ def grade(cpu, rc) -> Grader:
     g.need("the backend receives one sampled texel down", slot(232), 1)
 
     tex_base = slot(224)
-    g.want_true("the sampled pipeline has a real emitted-code allocation", tex_base != 0,
-                hex(tex_base))
+    tex_address_base = slot(632)
+    g.want_true("the sampled pipeline has a real emitted-code allocation",
+                tex_address_base != 0, hex(tex_address_base))
     g.want_true("the sampled fragment program is a whole nonempty QPU program",
                 slot(225) > 0 and slot(225) % 8 == 0, str(slot(225)))
     sampled_words = [u64(cpu, tex_base + OFF_FS_CODE + i)
@@ -1112,8 +1191,8 @@ def grade(cpu, rc) -> Grader:
                  struct.pack("<2I", 0x82, (1 << 16) | (1 << 19)))
     g.need_bytes("the sampled fragment stream points at texture state, sampler state, then TLB",
                  blob(cpu, tex_base + OFF_UNIF_FS, 12),
-                 struct.pack("<3I", (tex_base + OFF_TEX_STATE) | 0xF,
-                             (tex_base + OFF_SAMP_STATE) | 1, TLB_CONF))
+                 struct.pack("<3I", (tex_address_base + OFF_TEX_STATE) | 0xF,
+                             (tex_address_base + OFF_SAMP_STATE) | 1, TLB_CONF))
 
     # The first core buffer-to-optimal-image transaction. The held test
     # backend proves observable lifetime/fence/layout semantics without
@@ -1185,8 +1264,247 @@ def grade(cpu, rc) -> Grader:
                  struct.pack("<5I", slot(257), 17 << 26,
                              (13 << 8) | (1 << 22),
                              (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18)
-                             | (5 << 21) | (1 << 11),
-                             1 << 6))
+                              | (5 << 21) | (1 << 11),
+                              1 << 6))
+
+    # Mixed descriptor schemas are consumed by value at every Vulkan lifetime
+    # boundary. These public rows deliberately destroy/reuse source layouts and
+    # reorder pool rows; handles are allowed to differ, schema and behaviour are
+    # not.
+    for name, n in (("mixed UBO+sampler set layout creates", 360),
+                    ("interleaved duplicate-row descriptor pool creates", 361),
+                    ("mixed descriptor set allocates atomically", 364),
+                    ("mixed UBO binding updates", 365),
+                    ("mixed sampled binding updates independently", 366),
+                    ("mixed pipeline layout copies source schema", 372),
+                    ("reversed input binding rows canonicalise", 373),
+                    ("compatible distinct pipeline layout creates", 374),
+                    ("compatible distinct layout binds old set", 379),
+                    ("second duplicate-row ordering creates", 392)):
+        g.need(name, slot(n), 0)
+    g.need("duplicate UBO pool rows sum to two", slot(362), 2)
+    g.need("sample pool capacity remains one", slot(363), 1)
+    g.want_true("mixed set retained its UBO handle", slot(367) != 0, hex(slot(367)))
+    g.want_true("mixed set retained its sampler handle", slot(368) != 0, hex(slot(368)))
+    g.want_true("mixed set retained its image-view handle", slot(369) != 0, hex(slot(369)))
+    g.need("near-maximum UBO range is refused", slot(370), ERR_ARGS)
+    g.need("failed UBO replacement preserves both descriptor families", slot(371), 1)
+    g.need("copied mixed schema has two bindings", slot(375), 2)
+    g.need("copied binding zero remains uniform-buffer type", slot(376), 6)
+    g.need("copied binding one remains combined-sampler type", slot(377), 1)
+    g.need("copied push signature remains sixteen bytes", slot(378), 16)
+    g.need("schema compatibility compares descriptor stages", slot(596), 0)
+    g.need("stale destroyed source layout cannot create a new layout", slot(380), ERR_HANDLE)
+    g.need("stale-source refusal nulls output", slot(381), 0)
+    g.need("pipeline-layout creation flags are refused", slot(382), ERR_UNSUPPORTED)
+    g.need("flags refusal nulls output before inner creation", slot(383), 0)
+    g.need("second live device creates", slot(384), 0)
+    g.need("second-device mixed source layout creates", slot(385), 0)
+    g.need("foreign source layout is refused at pipeline-layout create", slot(386), -20003)
+    g.need("foreign-source refusal nulls output", slot(387), 0)
+    g.need("second-device pipeline layout creates", slot(388), 0)
+    g.need("foreign layout cannot bind into first-device command buffer", slot(389), -20003)
+    g.need("foreign layout cannot update first-device push constants", slot(390), -20003)
+    g.need("foreign push refusal leaves existing word untouched", slot(391), 0xA5C30FF0)
+    g.need("reordered duplicate pool still sums two UBO descriptors", slot(393), 2)
+    g.need("reordered duplicate pool still has one sampler", slot(394), 1)
+    g.need("late duplicate-row overflow refuses pool creation", slot(395), -1)
+    g.need("overflow refusal nulls pool output", slot(396), 0)
+    g.need("UBO-overflow refusal mutates no pool slot state", slot(610), 1)
+    g.need("single-UBO source layout creates", slot(397), 0)
+    g.need("remaining per-type UBO capacity allocates independently", slot(398), 0)
+    g.need("exhausted UBO capacity refuses another set", slot(399), VK_ERROR_OUT_OF_POOL_MEMORY)
+    g.need("UBO exhaustion nulls output", slot(400), 0)
+    g.need("single-sampler source layout creates", slot(401), 0)
+    g.need("exhausted sampler capacity refuses independently", slot(402), VK_ERROR_OUT_OF_POOL_MEMORY)
+    g.need("sampler exhaustion nulls output", slot(403), 0)
+    g.need("failed allocations leave exact UBO outstanding count", slot(404), 2)
+    g.need("failed allocations leave exact sampler outstanding count", slot(405), 1)
+    g.need("single-type pool creates for atomic mixed shortage", slot(406), 0)
+    g.need("missing second descriptor family refuses mixed allocation", slot(407), VK_ERROR_OUT_OF_POOL_MEMORY)
+    g.need("mixed-shortage refusal nulls output", slot(408), 0)
+    g.need("mixed-shortage refusal spends no UBO capacity", slot(409), 0)
+    g.need("mixed-shortage refusal spends no sampler capacity", slot(410), 0)
+    g.need("following UBO-only allocation still succeeds", slot(411), 0)
+    g.need("successful UBO-only allocation spends exactly one", slot(412), 1)
+    g.need("late unsupported pool row refuses whole creation", slot(413), ERR_UNSUPPORTED)
+    g.need("late unsupported row leaves output null", slot(414), 0)
+    g.need("late zero-count pool row refuses whole creation", slot(415), ERR_ARGS)
+    g.need("late zero-count row leaves output null", slot(416), 0)
+    g.need("reordered-pool mixed set allocates", slot(417), 0)
+    g.need("sample-first mixed update succeeds", slot(418), 0)
+    g.need("UBO-second mixed update succeeds", slot(419), 0)
+    g.need("both descriptor arms survive reverse update order", slot(420), 1)
+
+    # The real retained-IR mixed shader and its runtime lifetime transaction.
+    for name, n in (("mixed arithmetic shader module creates", 421),
+                    ("incompatible source layout reuses the destroyed slot", 422),
+                    ("sample image creates", 424),
+                    ("sample memory allocates", 425),
+                    ("sample memory binds", 426),
+                    ("sample view creates", 427),
+                    ("sample descriptor updates", 428),
+                    ("sample layout transition records", 429),
+                    ("sample layout transition submits", 430),
+                    ("sample layout transition completes", 431),
+                    ("mixed arithmetic pipeline creates", 432),
+                    ("typed mixed fragment lowers to V3D", 437),
+                    ("incompatible pipeline-layout slot replacement creates", 440),
+                    ("framebuffer rebuilds against current render-pass generation", 442),
+                    ("valid mixed command records", 443),
+                    ("valid mixed draw submits", 444),
+                    ("valid mixed draw completes", 445),
+                    ("incompatible CB-layout slot replacement creates", 591),
+                    ("compatible CB bind layout is recreated", 593),
+                    ("stale-sample command records while resources are live", 451),
+                    ("replacement sample view creates", 457),
+                    ("replacement sample descriptor updates", 458),
+                    ("held mixed draw submits", 459),
+                    ("held mixed draw completes", 467),
+                    ("alias layout transition records", 491),
+                    ("alias layout transition submits", 492),
+                    ("alias layout transition completes", 493),
+                    ("alias sample descriptor updates", 494),
+                    ("alias-accounting draw records", 495),
+                    ("alias-accounting draw submits", 496),
+                    ("alias-accounting draw completes", 509)):
+        g.need(name, slot(n), 0)
+    g.need("source layout really reused the incompatible slot", slot(423), 1)
+    g.want_true("mixed pipeline published a live slot", 0 < slot(433) <= 7,
+                str(slot(433)))
+    g.need("mixed pipeline retained its UBO requirement", slot(434), 1)
+    g.need("mixed pipeline retained its sample requirement", slot(435), 1)
+    g.need("mixed pipeline retained its push requirement", slot(436), 1)
+    g.want_true("mixed fragment emitted executable bytes", slot(438) > 0,
+                str(slot(438)))
+    g.need("mixed fragment emitted its exact nine-word uniform stream",
+           slot(439), 9)
+    g.need("mixed fragment retained its live varying", slot(543), 1)
+    g.need("runtime patching consumes lowerer metadata", slot(544), 0)
+    mixed_indices = ([slot(i) for i in range(545, 550)] + [slot(605)] +
+                     [slot(i) for i in range(550, 553)])
+    g.want_true("all nine mixed dynamic/TLB indices are in range",
+                all(0 <= i < slot(439) for i in mixed_indices),
+                str(mixed_indices))
+    g.want_true("all nine mixed dynamic/TLB indices are distinct",
+                len(set(mixed_indices)) == 9, str(mixed_indices))
+    g.need("mixed UBO address is patched through its returned index",
+           slot(553) & 0xFFFFFFFF, slot(447) & 0xFFFFFFFF)
+    mixed_base = slot(564)
+    mixed_words = [slot(i) & 0xFFFFFFFF for i in range(620, 629)]
+    for channel, index, word, expected in zip(
+            "RGBA", mixed_indices[:4], mixed_words[:4], PUSH):
+        g.need(f"mixed push {channel} is patched through its semantic index",
+               word, expected)
+    g.need("mixed UBO address word is exact", mixed_words[4],
+           slot(447) & 0xFFFFFFFF)
+    g.need("mixed UBO vec4 config word is exact", mixed_words[5],
+           TMU_GENERAL_VEC4)
+    g.need("mixed texture pointer uses its lowerer-returned index",
+           mixed_words[6], (mixed_base + OFF_TEX_STATE) | 0xF)
+    g.need("mixed sampler pointer uses its lowerer-returned index",
+           mixed_words[7], (mixed_base + OFF_SAMP_STATE) | 1)
+    g.need("mixed TLB word uses its lowerer-returned index",
+           mixed_words[8], TLB_CONF)
+    g.need("pipeline layout slot really reused with incompatible schema", slot(441), 1)
+    g.need("incompatible descriptor type/shape is refused at bind", slot(540), ERR_ARGS)
+    g.need("failed incompatible bind preserves prior copied CB state", slot(595), 1)
+    g.need("same schema without the required push signature creates", slot(541), 0)
+    g.need("push-signature mismatch is refused before a draw publishes", slot(542), ERR_ARGS)
+    g.need("exactly one valid mixed draw reaches the backend", slot(446), 1)
+    g.need("mixed backend receives exact UBO base", slot(447), slot(553))
+    g.need("mixed backend receives exactly one vec4 UBO", slot(448), 16)
+    g.want_true("mixed backend receives the dedicated sampled image",
+                slot(449) != 0 and slot(449) != slot(447), hex(slot(449)))
+    g.need("mixed backend receives a push block", slot(450), 1)
+    g.need("CB source layout reuses the exact incompatible slot", slot(592), 1)
+    g.need("CB source layout returns to the exact compatible slot", slot(594), 1)
+    g.need("stale sampler-family view refuses before flight", slot(452), ERR_STATE)
+    g.need("stale sampler refusal changes no submit counter", slot(453), 0)
+    g.need("stale sampler refusal calls no draw backend", slot(454), 0)
+    g.need("stale sampler refusal leaves no outstanding flight", slot(455), 0)
+    g.need("stale sampler refusal leaves fence unsignalled", slot(456), 1)
+    g.need("stale sampler refusal creates its fresh signal semaphore", slot(597), 0)
+    g.need("stale sampler refusal leaves signal semaphore unsignalled", slot(598), 0)
+    g.need("stale sampler refusal leaves no semaphore reservation stage", slot(599), 0)
+    g.need("stale sampler refusal never reaches the retain observer",
+           slot(600), 0x13579BDF)
+    g.need("stale sampler refusal changes no completion counter", slot(606), 0)
+    g.need("stale sampler refusal changes no backend-call counter", slot(608), 0)
+
+    for index, label in enumerate(("UBO buffer", "UBO memory", "sampler",
+                                   "sample view", "sample image", "sample memory",
+                                   "attachment view", "attachment image",
+                                   "attachment memory")):
+        g.need(f"backend callback sees {label} retained before dispatch",
+               slot(473 + index), 1)
+        g.need(f"forced-failure callback still sees {label} retained",
+               slot(482 + index), 1)
+    for n, label in ((460, "UBO buffer"), (461, "UBO memory"),
+                     (462, "sample image"), (463, "sample memory"),
+                     (464, "sampler"), (465, "sample view"),
+                     (466, "attachment view")):
+        g.need(f"held flight exposes exact {label} retain count", slot(n), 1)
+    for n, label in ((554, "UBO buffer"), (555, "UBO memory"),
+                     (556, "sampler"), (557, "sample view"),
+                     (558, "sample image"), (559, "sample memory"),
+                     (560, "framebuffer")):
+        g.need(f"held flight refuses destruction of {label}", slot(n), ERR_STATE)
+    g.need("successful held completion releases every observed owner", slot(468), 0)
+    g.need("forced draw failure reports device lost", slot(469), -4)
+    g.need("forced draw failure releases every observed owner", slot(470), 0)
+    g.need("forced draw failure leaves no outstanding flight", slot(471), 0)
+    g.need("forced draw failure settles its fence", slot(472), 0)
+
+    alias_expected = [1, 1, 1, 2, 2, 2, 2, 2, 2]
+    for index, expected in enumerate(alias_expected):
+        g.need(f"alias accounting callback counter {index}", slot(497 + index), expected)
+    g.need("active-flight framebuffer destruction is refused", slot(506), ERR_STATE)
+    g.need("a second framebuffer may create without aliasing the active slot", slot(507), 0)
+    g.want_true("second framebuffer publishes a handle", slot(508) != 0,
+                hex(slot(508)))
+    g.need("second framebuffer occupies a distinct slot", slot(511), 1)
+    g.need("alias-accounting completion releases view/image/memory", slot(510), 0)
+    g.need("five interleaved pool rows create without an arbitrary bound", slot(565), 0)
+    g.need("five-row pool sums three UBO descriptors", slot(566), 3)
+    g.need("five-row pool sums two sampled descriptors", slot(567), 2)
+    g.need("reverse five-row ordering creates", slot(568), 0)
+    g.need("reverse ordering preserves UBO total", slot(569), 3)
+    g.need("reverse ordering preserves sampled total", slot(570), 2)
+    g.need("sample duplicate-row overflow refuses pool creation", slot(571), -1)
+    g.need("sample-overflow refusal nulls output", slot(572), 0)
+    g.need("sample-overflow refusal mutates no pool slot state", slot(573), 1)
+    g.need("sampler-only pool creates for mirrored atomic shortage", slot(574), 0)
+    g.need("sampler-only pool refuses a mixed allocation", slot(575), VK_ERROR_OUT_OF_POOL_MEMORY)
+    g.need("mirrored mixed-shortage refusal nulls output", slot(576), 0)
+    g.need("mirrored shortage spends no UBO descriptors", slot(577), 0)
+    g.need("mirrored shortage spends no sampled descriptors", slot(578), 0)
+    g.need("following sampler-only allocation succeeds", slot(579), 0)
+    g.need("successful sampler-only allocation spends exactly one", slot(580), 1)
+    g.need("incompatible descriptor stage is refused at source creation", slot(581), ERR_UNSUPPORTED)
+    g.need("stage refusal publishes no source layout", slot(582), 0)
+    for kind, rc_slot, out_slot, live_slot in (
+            ("descriptor-set-layout", 611, 612, 613),
+            ("descriptor-pool", 614, 615, 616),
+            ("sampler", 617, 618, 619)):
+        g.need(f"public {kind} allocator is refused", slot(rc_slot), ERR_UNSUPPORTED)
+        g.need(f"public {kind} allocator refusal nulls output", slot(out_slot), 0)
+        g.need(f"public {kind} allocator refusal publishes no live slot", slot(live_slot), 1)
+    g.need("UBO-mirror restores a valid dedicated sampled view", slot(583), 0)
+    g.need("UBO-mirror command records while both families are live", slot(584), 0)
+    g.need("stale UBO family refuses before flight", slot(585), ERR_STATE)
+    g.need("stale UBO refusal changes no submit counter", slot(586), 0)
+    g.need("stale UBO refusal calls no draw backend", slot(587), 0)
+    g.need("stale UBO refusal leaves no outstanding flight", slot(588), 0)
+    g.need("stale UBO refusal leaves fence unsignalled", slot(589), 1)
+    g.need("stale UBO refusal retains no surviving sampled owner", slot(590), 0)
+    g.need("stale UBO refusal creates its fresh signal semaphore", slot(601), 0)
+    g.need("stale UBO refusal leaves signal semaphore unsignalled", slot(602), 0)
+    g.need("stale UBO refusal leaves no semaphore reservation stage", slot(603), 0)
+    g.need("stale UBO refusal never reaches the retain observer",
+           slot(604), 0x2468ACE0)
+    g.need("stale UBO refusal changes no completion counter", slot(607), 0)
+    g.need("stale UBO refusal changes no backend-call counter", slot(609), 0)
     return g
 
 
@@ -1201,14 +1519,14 @@ MUTANTS = (
      "      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 16, (1 << 6))\n",
      "      avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 16, 0)\n"),
     ("the BGRA8 texture state uses identity swizzle and returns BGR as shader RGB",
-     "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21))\n",
-     "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))\n"),
+     "    k = (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21)\n",
+     "    k = (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21)\n"),
     ("the sampled texture-state width is packed in the wrong field",
      "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\\width << 26) & $FFFFFFFF)\n",
      "    avkqPoke32(base + #AVKQ_OFF_TEX_STATE + 4, (*sampled\\width << 25) & $FFFFFFFF)\n"),
     ("the sampled fragment stream points one word into texture state",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, (base + #AVKQ_OFF_TEX_STATE) | $F)\n",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, (base + #AVKQ_OFF_TEX_STATE + 16) | $F)\n"),
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsTextureState[pipe] * 4), (base + #AVKQ_OFF_TEX_STATE) | $F)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsTextureState[pipe] * 4), (base + #AVKQ_OFF_TEX_STATE + 16) | $F)\n"),
     ("the texture request fires S before receiving T",
      "    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)\n    If r <> #V3DQ_OK : ProcedureReturn r : EndIf\n    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)\n",
      "    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)\n    If r <> #V3DQ_OK : ProcedureReturn r : EndIf\n    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)\n"),
@@ -1237,17 +1555,17 @@ MUTANTS = (
      "  halfW = (AnvilVkPipelineViewportWidth(pipe) / 2) * 256\n",
      "  halfW = (AnvilVkPipelineViewportWidth(pipe) / 4) * 256\n"),
     ("the fragment uniform stream is left in the shader's component order",
-     "  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, b)\n",
-     "  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, r)\n"),
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsPushR[pipe] * 4), r)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsPushR[pipe] * 4), b)\n"),
     ("the tile-buffer configuration word is left out of the stream",
-     "  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 16, #AVKQ_TLB_CONF)\n",
-     "  avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 16, 0)\n"),
+     "  target\\tlbConfig = #AVKQ_TLB_CONF\n",
+     "  target\\tlbConfig = 0\n"),
     ("the descriptor stream copies the first buffer word instead of keeping its address",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, *push & $FFFFFFFF)\n",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 0, PeekL(*push) & $FFFFFFFF)\n"),
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsUniformAddress[pipe] * 4), uniformBase & $FFFFFFFF)\n",
+     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + (avkqFsUniformAddress[pipe] * 4), PeekL(uniformBase) & $FFFFFFFF)\n"),
     ("the descriptor stream omits the regular-operation field from the TMU config",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, #AVKQ_TMU_LOAD_VEC4)\n",
-     "    avkqPoke32(base + #AVKQ_OFF_UNIF_FS + 4, $FFFFFF84)\n"),
+     "  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0 : target\\uniformBlockAddress = 4 : EndIf\n",
+     "  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0 : target\\uniformBlockAddress = 8 : EndIf\n"),
     ("the descriptor lookup uses TMUA instead of uniform-configured TMUAU",
      "    V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)\n",
      "    V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)\n"),
@@ -1296,8 +1614,8 @@ COMMAND_MUTANTS = (
      "  If avkCbRpActive[c] <> 0\n    avkCmdState[c] = #ANVIL_VK_CB_INVALID\n",
      "  If avkCbRpActive[c] = -1\n    avkCmdState[c] = #ANVIL_VK_CB_INVALID\n"),
     ("a command buffer holding both a clear and a render pass is submitted",
-     "  If avkCbDrawCount[c] > 0 And clears > 0\n",
-     "  If avkCbDrawCount[c] > 0 And clears > 99\n"),
+     "  If avkCbDrawCount[c] > 0 And (clears > 0 Or copies > 0)\n",
+     "  If avkCbDrawCount[c] > 0 And (clears > 99 Or copies > 99)\n"),
 )
 
 PIPELINE_MUTANTS = (
@@ -1323,8 +1641,8 @@ PIPELINE_MUTANTS = (
      "    avkDrawRecord\\sampledImage = @avkSampleStage\n",
      "    avkDrawRecord\\sampledImage = 0\n"),
     ("a created sampler is left non-live",
-     "  avkSampLive[s] = 1\n  avkSampDev[s] = d\n",
-     "  avkSampLive[s] = 0\n  avkSampDev[s] = d\n"),
+     "  avkSampInFlight[s] = 0\n  avkSampLive[s] = 1\n",
+     "  avkSampInFlight[s] = 0\n  avkSampLive[s] = 0\n"),
     ("a sampler silently accepts repeat addressing",
      "  If (*ci\\addressModeU & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE Or (*ci\\addressModeV & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE Or (*ci\\addressModeW & $FFFFFFFF) <> #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE\n",
      "  If (*ci\\addressModeU & $FFFFFFFF) < 0 Or (*ci\\addressModeV & $FFFFFFFF) < 0 Or (*ci\\addressModeW & $FFFFFFFF) < 0\n"),
@@ -1377,26 +1695,26 @@ PIPELINE_MUTANTS = (
      "      avkBindStage[(k * 2) + 0] = avkBindStage[(k * 2) + 0]\n      avkBindStage[(k * 2) + 1] = avkBindStage[(k * 2) + 1]\n"),
     # --- the descriptor ---
     ("a uniform-reading shader is accepted on a layout with no set layout",
-     "    If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0\n",
-     "    If avkLaySetCount[lay] < 0 Or avkLaySetLayout[lay] < 0\n"),
+     "  If avkShUniform[fs] <> 0\n    If avkLaySetCount[lay] <> 1 Or avkLayBindingCount[lay] = 0\n",
+     "  If avkShUniform[fs] <> 0\n    If avkLaySetCount[lay] < 0 Or avkLayBindingCount[lay] < 0\n"),
     ("the shader's binding need not be one the set layout declares",
-     "    If AnvilVkSetLayoutHasUniform(avkLaySetLayout[lay], avkShUniformBinding[fs]) = 0\n",
-     "    If AnvilVkSetLayoutHasUniform(avkLaySetLayout[lay], avkShUniformBinding[fs]) = 99\n"),
+     "    If avkLayHasBinding(lay, avkShUniformBinding[fs], #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) = 0\n",
+     "    If avkLayHasBinding(lay, avkShUniformBinding[fs], #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) = 99\n"),
     ("a draw may read a uniform buffer with no descriptor set bound",
-     "    If avkCbDescSet[c] = 0\n      avkCbFail(c, #ANVIL_VK_ERR_STATE,",
-     "    If avkCbDescSet[c] = -1\n      avkCbFail(c, #ANVIL_VK_ERR_STATE,"),
+     "  If avkPipeUsesUniform[p] <> 0\n    If avkCbDescSet[c] = 0\n      avkCbFail(c, #ANVIL_VK_ERR_STATE,",
+     "  If avkPipeUsesUniform[p] <> 0\n    If avkCbDescSet[c] = -1\n      avkCbFail(c, #ANVIL_VK_ERR_STATE,"),
     ("a bound set need not have been allocated from the layout's own shape",
-     "  If AnvilVkDescriptorSetLayoutSlot(set) <> avkLaySetLayout[lay]\n",
-     "  If AnvilVkDescriptorSetLayoutSlot(set) < 0\n"),
+     "  If avkSetMatchesLayout(set, lay) = 0\n",
+     "  If avkSetMatchesLayout(set, lay) = 99\n"),
     ("a set may be bound through a layout the pipeline was not built with",
-     "    If avkLaySlot(avkCbDescLayout[c]) <> avkPipeLayout[p]\n",
-     "    If avkLaySlot(avkCbDescLayout[c]) < 0\n"),
+     "    If avkCbMatchesPipe(c, p) = 0\n      avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdDraw was called with descriptor state",
+     "    If avkCbMatchesPipe(c, p) = 99\n      avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdDraw was called with descriptor state"),
     ("the draw record takes no descriptor address at all",
      "    avkDrawRecord\\uniformBase = AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p])\n",
      "    avkDrawRecord\\uniformBase = AnvilVkDescriptorSetAddress(avkCbDescSet[c], 0) + 4\n"),
     ("a pipeline layout may declare a set layout no shader reads",
-     "  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkLaySetCount[lay] <> 0\n",
-     "  If avkShColourSrc[fs] <> #ANVIL_SPV_COLOUR_UNIFORM And avkLaySetCount[lay] < 0\n"),
+     "  If avkShUniform[fs] = 0 And avkShSample[fs] = 0 And avkLaySetCount[lay] <> 0\n",
+     "  If avkShUniform[fs] = 0 And avkShSample[fs] = 0 And avkLaySetCount[lay] < 0\n"),
     ("a draw of more than one instance is accepted",
      "  If instanceCount <> 1 Or firstInstance <> 0\n",
      "  If instanceCount < 0 Or firstInstance <> 0\n"),
@@ -1416,8 +1734,8 @@ PIPELINE_MUTANTS = (
      "  If avkShOutCount[vs] <> avkShInCount[fs]\n",
      "  If avkShOutCount[vs] < 0\n"),
     ("a fragment shader may read push constants a layout never declared",
-     "  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_PUSH And avkLayPushBytes[lay] <> #ANVIL_VK_PUSH_BYTES\n",
-     "  If avkShColourSrc[fs] = #ANVIL_SPV_COLOUR_PUSH And avkLayPushBytes[lay] < 0\n"),
+     "  If avkShPush[fs] <> 0 And avkLayPushBytes[lay] <> #ANVIL_VK_PUSH_BYTES\n",
+     "  If avkShPush[fs] <> 0 And avkLayPushBytes[lay] < 0\n"),
     ("a render pass whose loadOp is not CLEAR is accepted",
      "  If (*att\\loadOp & $FFFFFFFF) <> #VK_ATTACHMENT_LOAD_OP_CLEAR\n",
      "  If (*att\\loadOp & $FFFFFFFF) < 0\n"),
@@ -1431,9 +1749,9 @@ DESCRIPTOR_MUTANTS = (
     ("an unsupported descriptor type is accepted in a layout",
      "    If (*bind\\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And (*bind\\descriptorType & $FFFFFFFF) <> #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER\n",
      "    If (*bind\\descriptorType & $FFFFFFFF) < 0\n"),
-    ("a combined image sampler is accepted in a multi-binding layout",
-     "    If (*bind\\descriptorType & $FFFFFFFF) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And (n <> 1 Or b <> 0)\n",
-     "    If (*bind\\descriptorType & $FFFFFFFF) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And n < 0\n"),
+    ("duplicate uniform-buffer pool rows are not summed",
+     "      uboCapacity = uboCapacity + count\n",
+     "      uboCapacity = count\n"),
     ("a set layout may declare a binding for a stage that cannot read it",
      "    If (*bind\\stageFlags & $FFFFFFFF) <> #VK_SHADER_STAGE_FRAGMENT_BIT\n",
      "    If (*bind\\stageFlags & $FFFFFFFF) < 0\n"),
@@ -1443,18 +1761,18 @@ DESCRIPTOR_MUTANTS = (
     ("a uniform buffer may sit at any offset",
      "  If off < 0 Or off >= size Or (off % #ANVIL_VK_UNIFORM_ALIGN) <> 0\n",
      "  If off < 0 Or off >= size Or (off % #ANVIL_VK_UNIFORM_ALIGN) < 0\n"),
-    ("a descriptor range shorter than the block is accepted",
-     "  If range < #ANVIL_VK_UNIFORM_BYTES Or (off + range) > size\n",
-     "  If range < 0 Or (off + range) > size\n"),
+    ("a descriptor range may wrap past the end of its buffer",
+     "    If range < #ANVIL_VK_UNIFORM_BYTES Or range > (size - off)\n",
+     "    If range < #ANVIL_VK_UNIFORM_BYTES Or range > size\n"),
     ("a descriptor copy is accepted",
      "  If copyCount <> 0 Or *pCopies <> 0\n",
      "  If copyCount < 0 Or *pCopies = -1\n"),
-    ("a write may claim a descriptor type different from its layout",
-     "  If t <> avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + b]\n",
+    ("a write may claim a descriptor type different from its copied set schema",
+     "  If t <> avkDsType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b]\n",
      "  If t < 0\n"),
-    ("a pool type is ignored when a descriptor set is allocated",
-     "    If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> avkDpType[p]\n",
-     "    If avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] < 0\n"),
+    ("a mixed allocation ignores sampled-image-sampler capacity",
+     "  If needUbo > (avkDpUboCapacity[p] - avkDpUboOut[p]) Or needSample > (avkDpSampleCapacity[p] - avkDpSampleOut[p])\n",
+     "  If needUbo > (avkDpUboCapacity[p] - avkDpUboOut[p])\n"),
     ("a sampled descriptor accepts an image without SAMPLED usage",
      "    If (avkImgUsage[img] & #VK_IMAGE_USAGE_SAMPLED_BIT) = 0\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkUpdateDescriptorSets was given an image not created",
      "    If (avkImgUsage[img] & #VK_IMAGE_USAGE_SAMPLED_BIT) = -1\n      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, \"vkUpdateDescriptorSets was given an image not created"),
@@ -1648,6 +1966,27 @@ def main() -> int:
         return 0
     if args.mutate_only or args.mutate_name:
         args.mutate = True
+
+    # Mutation proof is meaningful only when every requested edit is a unique,
+    # byte-exact change to the intended production rule. Missing or ambiguous
+    # anchors are checker infrastructure failures, never semantic rejections.
+    if args.mutate:
+        anchor_errors = []
+        for path, mutants in ((EMITTER, MUTANTS), (PIPELINE, PIPELINE_MUTANTS),
+                              (COMMAND, COMMAND_MUTANTS),
+                              (DESCRIPTOR, DESCRIPTOR_MUTANTS),
+                              (MEMORY, MEMORY_MUTANTS), (API, API_MUTANTS),
+                              (TEST_BACKEND, TEST_BACKEND_MUTANTS)):
+            source = path.read_text(encoding="utf-8")
+            for name, fixed, _broken in mutants:
+                hits = source.count(fixed)
+                if hits != 1:
+                    anchor_errors.append(f"{path.name}: {name}: {hits} hits")
+        if anchor_errors:
+            print("vulkan_pipeline_check: INFRA - mutation anchors are not unique")
+            for error in anchor_errors:
+                print("  " + error)
+            return 2
 
     compiler = locate_compiler(args.compiler)
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,

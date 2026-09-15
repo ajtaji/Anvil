@@ -81,6 +81,16 @@ state `$00A9C840`. Exact artifacts and hashes are in `COVERAGE.md`. This proves
 only the declared one-region level-zero `UIF_NO_XOR` subset; general copies,
 mips, layers, format conversion and arbitrary texture sizes remain roadmap.
 
+The 2026-09-15 Pi 4 run also closes the first three-source fragment graph:
+one optimal sampled image multiplied by a push-constant `vec4`, then added to
+one UBO `vec4`. Its exact 960-byte report proves the nine lowerer-provided
+uniform indices and patched words, exact expected pixels, one TFU/bin/render
+advance apiece, immutable module/layout slot reuse, zero released retains, and
+no new validation, MMU, OOM or native fault. The payload, report and screenshot
+hashes are recorded in `COVERAGE.md`. This remains a bounded straight-line
+binary32 graph with one live load from each resource family; broader SSA,
+control flow, descriptor multiplicity and texture shapes remain roadmap.
+
 ## API and object gaps
 
 - Complete registry generation for every core 1.0 enum, bitmask, alias,
@@ -134,9 +144,10 @@ Everything below remains missing.
   broader format feature tables remain missing.
 - Sampler state beyond the bounded nearest/linear, clamp-to-edge, LOD-zero
   subset; normalized/unnormalized coordinate variants, other addressing,
-  compare, border color and anisotropy capability. One combined-image-sampler
-  descriptor record now exists, but sampled SPIR-V instructions and V3D
-  texture-fetch lowering do not, so no sampled pixel is claimed.
+  compare, border color and anisotropy capability. Combined-image-sampler
+  SPIR-V, V3D texture fetch and the bounded level-zero BGRA8 sampled pixel are
+  implemented; descriptor arrays, multiple live samples, general image
+  operands, mip selection and broader formats remain missing.
 
 ## Synchronization and command gaps
 

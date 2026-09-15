@@ -101,19 +101,24 @@ Global Dim avkCbClearWord.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawFirst.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbDrawVerts.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
-; The one descriptor set vkCmdBindDescriptorSets bound, as a handle, and
-; the pipeline layout it was bound with. Both are kept: the specification
-; says a set is bound THROUGH a layout, and a draw whose pipeline was
-; built against a different layout is reading its uniform through an
-; agreement that was never made.
+; The one descriptor set vkCmdBindDescriptorSets bound, plus the immutable
+; compatibility signature copied from the pipeline layout at record time.
+; Vulkan does not require that source layout handle to remain live, so a
+; command buffer never retains or later resolves that destructible slot.
 Global Dim avkCbDescSet.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
-Global Dim avkCbDescLayout.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDescSetCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDescBindingCount.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDescPushBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbDescType.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim avkCbDescStages.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 Global Dim avkCbPushBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbPushWord.i[(#ANVIL_VK_MAX_COMMAND_BUFFERS + 1) * 4]
 
 Declare.i avkDrawSubmit(c.i)
 Declare avkDrawRetain(c.i)
 Declare avkDrawRelease(c.i)
+Declare avkAttachmentViewRetain(c.i)
+Declare avkAttachmentViewRelease(c.i)
 Declare.i avkCopyBufferResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *baseOut)
 Declare avkCopyBufferRetain(c.i)
 Declare avkCopyBufferRelease(c.i)
@@ -296,8 +301,16 @@ Procedure avkCbClear(c.i)
   avkCbDrawFirst[c] = 0
   avkCbDrawVerts[c] = 0
   avkCbDescSet[c] = 0
-  avkCbDescLayout[c] = 0
+  avkCbDescSetCount[c] = 0
+  avkCbDescBindingCount[c] = 0
+  avkCbDescPushBytes[c] = 0
   avkCbPushBytes[c] = 0
+  k = 0
+  While k < #ANVIL_VK_MAX_SET_BINDINGS
+    avkCbDescType[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] = -1
+    avkCbDescStages[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
+    k = k + 1
+  Wend
   k = 0
   While k < 4
     avkCbPushWord[(c * 4) + k] = 0
@@ -825,6 +838,7 @@ Procedure avkFlightRetain(c.i)
     avkMemInFlight[avkImgMemSlot[s]] = avkMemInFlight[avkImgMemSlot[s]] + 1
     k = k + 1
   Wend
+  avkAttachmentViewRetain(c)
 EndProcedure
 
 Procedure avkFlightReleaseRefs(c.i)
@@ -832,6 +846,7 @@ Procedure avkFlightReleaseRefs(c.i)
   Define s.i
   avkDrawRelease(c)
   avkCopyBufferRelease(c)
+  avkAttachmentViewRelease(c)
   k = 0
   While k < avkCbRefCount[c]
     s = avkRefSlot[avkRefIndex(c, k)]

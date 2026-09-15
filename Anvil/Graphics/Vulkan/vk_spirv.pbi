@@ -1009,7 +1009,7 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
       ; on an Input is what a source language emits when a `uniform` was
       ; meant to be an `in`.
       If b = #SpvStorageClassUniform
-        If spvSampleVar <> 0
+        If irMode = 0 And spvSampleVar <> 0
           ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a fragment module that declares both a uniform buffer and a sampled image (Anvil code -20005, mixed descriptor shape); the current descriptor set layouts carry one resource family, so split this shader until mixed layouts are implemented.")
         EndIf
         If spvUniformVar <> 0
@@ -1020,7 +1020,7 @@ Procedure.i avkSpvDecl(*words, at.i, count.i, op.i, irMode.i)
         EndIf
         spvUniformVar = id
       ElseIf b = #SpvStorageClassUniformConstant
-        If spvUniformVar <> 0
+        If irMode = 0 And spvUniformVar <> 0
           ProcedureReturn avkSpvRefuse(op, "the SPIR-V front end refused a fragment module that declares both a uniform buffer and a sampled image (Anvil code -20005, mixed descriptor shape); the current descriptor set layouts carry one resource family, so split this shader until mixed layouts are implemented.")
         EndIf
         If spvSampleVar <> 0

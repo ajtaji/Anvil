@@ -788,7 +788,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i vkCreateDescriptorSetLayout(device.i, *pCreateInfo.VkDescriptorSetLayoutCreateInfo, *pAllocator, *pSetLayout)
   Define rc.i
-  If *pCreateInfo = 0 Or *pSetLayout = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *pSetLayout = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*pSetLayout, #VK_NULL_HANDLE)
+  If *pCreateInfo = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   rc = avkNoAllocator(*pAllocator, 0)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   ProcedureReturn AnvilVkDescriptorSetLayoutCreate(device, *pCreateInfo, *pSetLayout)
@@ -803,7 +805,9 @@ EndProcedure
 
 Procedure.i vkCreateDescriptorPool(device.i, *pCreateInfo.VkDescriptorPoolCreateInfo, *pAllocator, *pDescriptorPool)
   Define rc.i
-  If *pCreateInfo = 0 Or *pDescriptorPool = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *pDescriptorPool = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*pDescriptorPool, #VK_NULL_HANDLE)
+  If *pCreateInfo = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   rc = avkNoAllocator(*pAllocator, 0)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   ProcedureReturn AnvilVkDescriptorPoolCreate(device, *pCreateInfo, *pDescriptorPool)
@@ -818,7 +822,9 @@ EndProcedure
 
 Procedure.i vkCreateSampler(device.i, *pCreateInfo.VkSamplerCreateInfo, *pAllocator, *pSampler)
   Define rc.i
-  If *pCreateInfo = 0 Or *pSampler = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *pSampler = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*pSampler, #VK_NULL_HANDLE)
+  If *pCreateInfo = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   rc = avkNoAllocator(*pAllocator, 0)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   ProcedureReturn AnvilVkSamplerCreate(device, *pCreateInfo, *pSampler)
@@ -876,7 +882,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i vkCreatePipelineLayout(device.i, *pCreateInfo.VkPipelineLayoutCreateInfo, *pAllocator, *pPipelineLayout)
   Define rc.i
-  If *pCreateInfo = 0 Or *pPipelineLayout = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *pPipelineLayout = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*pPipelineLayout, #VK_NULL_HANDLE)
+  If *pCreateInfo = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   rc = avkNoAllocator(*pAllocator, 0)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
@@ -884,6 +892,9 @@ Procedure.i vkCreatePipelineLayout(device.i, *pCreateInfo.VkPipelineLayoutCreate
   EndIf
   If avkNoPNext(*pCreateInfo\pNext) <> #VK_SUCCESS
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreatePipelineLayout was given a VkPipelineLayoutCreateInfo with a pNext chain (Anvil code -20005, no pNext extension is implemented); no layout was created.")
+  EndIf
+  If (*pCreateInfo\flags & $FFFFFFFF) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreatePipelineLayout was given nonzero creation flags (Anvil code -20005, unsupported flags); no pipeline layout was created.")
   EndIf
   ProcedureReturn AnvilVkPipelineLayoutCreate(device, *pCreateInfo\setLayoutCount & $FFFFFFFF, *pCreateInfo\pSetLayouts, *pCreateInfo\pushConstantRangeCount & $FFFFFFFF, *pCreateInfo\pPushConstantRanges, *pPipelineLayout)
 EndProcedure

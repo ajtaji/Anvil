@@ -35,6 +35,12 @@ Global avkTbFail.i = 0
 Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
+; Optional test-only retain observer. The pipeline gate registers addresses of
+; exact in-flight counters; other gates leave every pointer zero. Sampling
+; inside the backend callback proves acquisition happened before dispatch,
+; which a post-submit snapshot alone cannot establish.
+Global Dim avkTbRetainPtr.i[9]
+Global Dim avkTbRetainSeen.i[9]
 ; The test backend reports a draw capability as well as a clear one, so
 ; a desk gate can drive the whole pipeline path. It is still not a GPU
 ; and it still writes no pixels.
@@ -91,6 +97,27 @@ EndProcedure
 ; Make the next submission fail with this native code, as a device fault.
 Procedure AnvilVkTestBackendFailNext(code.i)
   avkTbFail = code
+EndProcedure
+
+Procedure AnvilVkTestBackendObserveRetains(uboBuffer.i, uboMemory.i, sampleSampler.i, sampleView.i, sampleImage.i, sampleMemory.i, attachmentView.i, attachmentImage.i, attachmentMemory.i)
+  avkTbRetainPtr[0] = uboBuffer : avkTbRetainPtr[1] = uboMemory
+  avkTbRetainPtr[2] = sampleSampler : avkTbRetainPtr[3] = sampleView
+  avkTbRetainPtr[4] = sampleImage : avkTbRetainPtr[5] = sampleMemory
+  avkTbRetainPtr[6] = attachmentView : avkTbRetainPtr[7] = attachmentImage
+  avkTbRetainPtr[8] = attachmentMemory
+EndProcedure
+
+Procedure.i AnvilVkTestBackendObservedRetain(index.i)
+  If index < 0 Or index > 8 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkTbRetainSeen[index]
+EndProcedure
+
+Procedure AnvilVkTestBackendPoisonObservedRetains(value.i)
+  Define i.i = 0
+  While i < 9
+    avkTbRetainSeen[i] = value
+    i = i + 1
+  Wend
 EndProcedure
 
 ; Make the next poll of a held submission fail once. This is test-only fault
@@ -507,6 +534,14 @@ Procedure.i avkBackendSubmitDraw(*d.AnvilVkBackendDraw)
     avkTbLastSampledHeight = *tbs\height
   EndIf
   avkTbTicks = avkTbTicks + 1
+  tbk = 0
+  While tbk < 9
+    avkTbRetainSeen[tbk] = 0
+    If avkTbRetainPtr[tbk] <> 0
+      avkTbRetainSeen[tbk] = PeekI(avkTbRetainPtr[tbk])
+    EndIf
+    tbk = tbk + 1
+  Wend
   If avkTbDrawFail <> 0
     avkTbNative = -777
     avkTbDrawFail = 0

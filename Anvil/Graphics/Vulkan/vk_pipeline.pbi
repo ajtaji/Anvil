@@ -133,7 +133,9 @@ Global Dim avkLayGen.i[#ANVIL_VK_MAX_LAYOUTS + 1]
 Global Dim avkLayDev.i[#ANVIL_VK_MAX_LAYOUTS + 1]
 Global Dim avkLayPushBytes.i[#ANVIL_VK_MAX_LAYOUTS + 1]
 Global Dim avkLaySetCount.i[#ANVIL_VK_MAX_LAYOUTS + 1]
-Global Dim avkLaySetLayout.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim avkLayBindingCount.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim avkLayBindingType.i[(#ANVIL_VK_MAX_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim avkLayBindingStages.i[(#ANVIL_VK_MAX_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 
 Global Dim avkRpLive.a[#ANVIL_VK_MAX_RENDER_PASSES + 1]
 Global Dim avkRpGen.i[#ANVIL_VK_MAX_RENDER_PASSES + 1]
@@ -146,6 +148,7 @@ Global Dim avkIvGen.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 Global Dim avkIvDev.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 Global Dim avkIvImage.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 Global Dim avkIvImgSlot.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
+Global Dim avkIvInFlight.i[#ANVIL_VK_MAX_IMAGE_VIEWS + 1]
 
 ; Samplers are target-neutral Vulkan state. The V3D backend will translate
 ; these values into its sampler-state record when the combined-image
@@ -155,6 +158,7 @@ Global Dim avkSampGen.i[#ANVIL_VK_MAX_SAMPLERS + 1]
 Global Dim avkSampDev.i[#ANVIL_VK_MAX_SAMPLERS + 1]
 Global Dim avkSampMag.i[#ANVIL_VK_MAX_SAMPLERS + 1]
 Global Dim avkSampMin.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim avkSampInFlight.i[#ANVIL_VK_MAX_SAMPLERS + 1]
 
 Global Dim avkFbLive.a[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkFbGen.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
@@ -172,7 +176,14 @@ Global Dim avkFbH.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkPipeLive.a[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeGen.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeDev.i[#ANVIL_VK_MAX_PIPELINES + 1]
-Global Dim avkPipeLayout.i[#ANVIL_VK_MAX_PIPELINES + 1]
+; A pipeline owns the complete layout compatibility signature it was created
+; against. It does not chase a pipeline-layout slot that may be destroyed and
+; reused before an already-created pipeline is submitted.
+Global Dim avkPipePushBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeSetCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeBindingCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeBindingType.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim avkPipeBindingStages.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 Global Dim avkPipeRp.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindStride.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_BINDINGS]
@@ -343,10 +354,11 @@ Procedure.i AnvilVkSamplerCreate(device.i, *ci.VkSamplerCreateInfo, *out)
   While s <= #ANVIL_VK_MAX_SAMPLERS And avkSampLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_SAMPLERS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
   avkSampGen[s] = avkNextGen(avkSampGen[s])
-  avkSampLive[s] = 1
   avkSampDev[s] = d
   avkSampMag[s] = *ci\magFilter & $FFFFFFFF
   avkSampMin[s] = *ci\minFilter & $FFFFFFFF
+  avkSampInFlight[s] = 0
+  avkSampLive[s] = 1
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_SAMPLER, s, avkSampGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -365,6 +377,10 @@ Procedure AnvilVkSamplerDestroy(device.i, sampler.i)
   EndIf
   If d = 0 Or avkSampDev[s] <> d
     avkFault(#ANVIL_VK_ERR_OWNER, "vkDestroySampler was called through a device that does not own it (Anvil code -20003, wrong parent); destroy the sampler through the VkDevice that created it.")
+    ProcedureReturn
+  EndIf
+  If avkSampInFlight[s] <> 0
+    avkFault(#ANVIL_VK_ERR_STATE, "vkDestroySampler was called while a submission is reading it (Anvil code -20004, resource in use); wait for the submission fence or call vkDeviceWaitIdle before destroying it.")
     ProcedureReturn
   EndIf
   avkSampLive[s] = 0
@@ -1004,6 +1020,8 @@ Procedure.i AnvilVkPipelineLayoutCreate(device.i, setCount.i, *setLayouts, pushC
   Define s.i
   Define bytes.i
   Define dsl.i
+  Define bindingCount.i
+  Define k.i
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
   d = avkDevSlot(device)
@@ -1014,8 +1032,12 @@ Procedure.i AnvilVkPipelineLayoutCreate(device.i, setCount.i, *setLayouts, pushC
   EndIf
   If setCount = 1
     If *setLayouts = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
-    dsl = AnvilVkDescriptorSetLayoutSlotOf(PeekI(*setLayouts))
-    If dsl = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+    dsl = PeekI(*setLayouts)
+    bindingCount = AnvilVkSetLayoutBindingCountOf(dsl)
+    If bindingCount < 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+    If AnvilVkSetLayoutDeviceSlotOf(dsl) <> d
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkCreatePipelineLayout was given a descriptor set layout from a different VkDevice (Anvil code -20003, wrong parent); no pipeline layout was created.")
+    EndIf
   EndIf
   bytes = 0
   If pushCount > 1
@@ -1035,11 +1057,21 @@ Procedure.i AnvilVkPipelineLayoutCreate(device.i, setCount.i, *setLayouts, pushC
   While s <= #ANVIL_VK_MAX_LAYOUTS And avkLayLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_LAYOUTS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
   avkLayGen[s] = avkNextGen(avkLayGen[s])
-  avkLayLive[s] = 1
   avkLayDev[s] = d
   avkLayPushBytes[s] = bytes
   avkLaySetCount[s] = setCount
-  avkLaySetLayout[s] = dsl
+  avkLayBindingCount[s] = bindingCount
+  k = 0
+  While k < #ANVIL_VK_MAX_SET_BINDINGS
+    avkLayBindingType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = -1
+    avkLayBindingStages[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = 0
+    If k < bindingCount
+      avkLayBindingType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = AnvilVkSetLayoutBindingTypeOf(dsl, k)
+      avkLayBindingStages[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = AnvilVkSetLayoutBindingStagesOf(dsl, k)
+    EndIf
+    k = k + 1
+  Wend
+  avkLayLive[s] = 1
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_PIPELINE_LAYOUT, s, avkLayGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -1060,6 +1092,38 @@ Procedure AnvilVkPipelineLayoutDestroy(device.i, layout.i)
     ProcedureReturn
   EndIf
   avkLayLive[s] = 0
+EndProcedure
+
+Procedure.i avkLayHasBinding(lay.i, binding.i, descriptorType.i)
+  If lay < 1 Or lay > #ANVIL_VK_MAX_LAYOUTS Or avkLayLive[lay] = 0 : ProcedureReturn 0 : EndIf
+  If binding < 0 Or binding >= avkLayBindingCount[lay] : ProcedureReturn 0 : EndIf
+  If avkLayBindingType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] <> descriptorType : ProcedureReturn 0 : EndIf
+  If avkLayBindingStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + binding] <> #VK_SHADER_STAGE_FRAGMENT_BIT : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkSetMatchesLayout(set.i, lay.i)
+  Define k.i
+  If AnvilVkDescriptorSetSchemaCount(set) <> avkLayBindingCount[lay] : ProcedureReturn 0 : EndIf
+  k = 0
+  While k < avkLayBindingCount[lay]
+    If AnvilVkDescriptorSetSchemaType(set, k) <> avkLayBindingType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] : ProcedureReturn 0 : EndIf
+    If AnvilVkDescriptorSetSchemaStages(set, k) <> avkLayBindingStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] : ProcedureReturn 0 : EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkCbMatchesPipe(c.i, p.i)
+  Define k.i
+  If avkCbDescSetCount[c] <> avkPipeSetCount[p] Or avkCbDescBindingCount[c] <> avkPipeBindingCount[p] Or avkCbDescPushBytes[c] <> avkPipePushBytes[p] : ProcedureReturn 0 : EndIf
+  k = 0
+  While k < avkPipeBindingCount[p]
+    If avkCbDescType[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> avkPipeBindingType[(p * #ANVIL_VK_MAX_SET_BINDINGS) + k] : ProcedureReturn 0 : EndIf
+    If avkCbDescStages[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> avkPipeBindingStages[(p * #ANVIL_VK_MAX_SET_BINDINGS) + k] : ProcedureReturn 0 : EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn 1
 EndProcedure
 
 ; ======================================================================
@@ -1170,6 +1234,7 @@ Procedure.i AnvilVkImageViewCreate(device.i, image.i, viewType.i, format.i, *out
   avkIvDev[s] = d
   avkIvImage[s] = image
   avkIvImgSlot[s] = img
+  avkIvInFlight[s] = 0
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_IMAGE_VIEW, s, avkIvGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -1187,6 +1252,10 @@ Procedure AnvilVkImageViewDestroy(device.i, view.i)
   EndIf
   If d = 0 Or avkIvDev[s] <> d
     avkFault(#ANVIL_VK_ERR_OWNER, "vkDestroyImageView was called with a device that does not own this view (Anvil code -20003, wrong parent); nothing was destroyed.")
+    ProcedureReturn
+  EndIf
+  If avkIvInFlight[s] <> 0
+    avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyImageView was called while a submission is using it as an attachment or sampled view (Anvil code -20004, resource in use); wait for the submission fence or call vkDeviceWaitIdle before destroying it.")
     ProcedureReturn
   EndIf
   avkIvLive[s] = 0
@@ -1224,7 +1293,6 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   While s <= #ANVIL_VK_MAX_FRAMEBUFFERS And avkFbLive[s] <> 0 : s = s + 1 : Wend
   If s > #ANVIL_VK_MAX_FRAMEBUFFERS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
   avkFbGen[s] = avkNextGen(avkFbGen[s])
-  avkFbLive[s] = 1
   avkFbDev[s] = d
   avkFbRp[s] = rp
   avkFbRpHandle[s] = renderPass
@@ -1232,6 +1300,7 @@ Procedure.i AnvilVkFramebufferCreate(device.i, renderPass.i, view.i, width.i, he
   avkFbViewHandle[s] = view
   avkFbW[s] = width
   avkFbH[s] = height
+  avkFbLive[s] = 1
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_FRAMEBUFFER, s, avkFbGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -1249,6 +1318,10 @@ Procedure AnvilVkFramebufferDestroy(device.i, framebuffer.i)
   EndIf
   If d = 0 Or avkFbDev[s] <> d
     avkFault(#ANVIL_VK_ERR_OWNER, "vkDestroyFramebuffer was called with a device that does not own this framebuffer (Anvil code -20003, wrong parent); nothing was destroyed.")
+    ProcedureReturn
+  EndIf
+  If avkFlightActive <> 0 And avkCbFbHandle[avkFlightCb] = framebuffer
+    avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyFramebuffer was called while a submitted command buffer still uses this framebuffer (Anvil code -20004, resource in use); nothing was destroyed. Wait on the submission's fence, or call vkDeviceWaitIdle, first.")
     ProcedureReturn
   EndIf
   avkFbLive[s] = 0
@@ -1666,24 +1739,24 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   ; the module and the layout are both in view, and a mismatch caught
   ; anywhere later is a draw reading an address nothing wrote.
   If avkShUniform[fs] <> 0
-    If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
+    If avkLaySetCount[lay] <> 1 Or avkLayBindingCount[lay] = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that reads a uniform block through a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); create a VkDescriptorSetLayout with a VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER binding at the fragment stage and name it in VkPipelineLayoutCreateInfo.")
     EndIf
     If avkShUniformSet[fs] <> 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose uniform block is at a descriptor set other than zero (Anvil code -20001, layout mismatch); one set is bound here and its index is zero.")
     EndIf
-    If AnvilVkSetLayoutHasUniform(avkLaySetLayout[lay], avkShUniformBinding[fs]) = 0
+    If avkLayHasBinding(lay, avkShUniformBinding[fs], #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose uniform block names a binding its pipeline layout's descriptor set layout does not declare as a fragment-stage uniform buffer (Anvil code -20001, layout mismatch); the Binding decoration in the SPIR-V and the binding number in VkDescriptorSetLayoutBinding are the same number and they must agree.")
     EndIf
   EndIf
   If avkShSample[fs] <> 0
-    If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
+    If avkLaySetCount[lay] <> 1 Or avkLayBindingCount[lay] = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader that samples an image through a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); create a VkDescriptorSetLayout with a VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER binding at the fragment stage and name it in VkPipelineLayoutCreateInfo.")
     EndIf
     If avkShSampleSet[fs] <> 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose sampled image is at a descriptor set other than zero (Anvil code -20001, layout mismatch); one set is bound here and its index is zero.")
     EndIf
-    If AnvilVkSetLayoutHasSampledImage(avkLaySetLayout[lay], avkShSampleBinding[fs]) = 0
+    If avkLayHasBinding(lay, avkShSampleBinding[fs], #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a fragment shader whose sampled image names a binding its pipeline layout does not declare as a fragment-stage combined image sampler (Anvil code -20001, layout mismatch); the Binding decoration in SPIR-V and the descriptor-set-layout binding must agree.")
     EndIf
   EndIf
@@ -1699,7 +1772,15 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   ; slot live only once the backend has said yes. A half-built pipeline
   ; that a later call could find is worse than no pipeline at all.
   avkPipeDev[s] = d
-  avkPipeLayout[s] = lay
+  avkPipePushBytes[s] = avkLayPushBytes[lay]
+  avkPipeSetCount[s] = avkLaySetCount[lay]
+  avkPipeBindingCount[s] = avkLayBindingCount[lay]
+  k = 0
+  While k < #ANVIL_VK_MAX_SET_BINDINGS
+    avkPipeBindingType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = avkLayBindingType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+    avkPipeBindingStages[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = avkLayBindingStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+    k = k + 1
+  Wend
   avkPipeRp[s] = rp
   avkPipePosAttr[s] = avkShPosAttr[vs]
   avkPipeVaryCount[s] = avkShOutCount[vs]
@@ -2126,6 +2207,8 @@ EndProcedure
 Procedure AnvilVkCmdBindDescriptorSet(commandBuffer.i, bindPoint.i, layout.i, firstSet.i, set.i, dynamicCount.i)
   Define c.i
   Define lay.i
+  Define d.i
+  Define k.i
   c = avkCmdSlot(commandBuffer)
   If c = 0
     avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdBindDescriptorSets was given a VkCommandBuffer handle that is not live (Anvil code -20002, stale or foreign handle); nothing was recorded.")
@@ -2152,20 +2235,37 @@ Procedure AnvilVkCmdBindDescriptorSet(commandBuffer.i, bindPoint.i, layout.i, fi
     avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdBindDescriptorSets was given a VkPipelineLayout handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
     ProcedureReturn
   EndIf
-  If avkLaySetCount[lay] <> 1 Or avkLaySetLayout[lay] = 0
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkLayDev[lay] <> d
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "vkCmdBindDescriptorSets was given a pipeline layout from a different VkDevice from the command buffer (Anvil code -20003, wrong parent); no descriptor binding state was changed.")
+    ProcedureReturn
+  EndIf
+  If avkLaySetCount[lay] <> 1 Or avkLayBindingCount[lay] = 0
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindDescriptorSets was given a pipeline layout that declares no descriptor set layout (Anvil code -20001, layout mismatch); a set can only be bound through a layout that says what set zero is.")
     ProcedureReturn
   EndIf
-  If AnvilVkDescriptorSetLayoutSlot(set) = 0
+  If AnvilVkDescriptorSetDeviceSlot(set) = 0
     avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdBindDescriptorSets was given a VkDescriptorSet handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
     ProcedureReturn
   EndIf
-  If AnvilVkDescriptorSetLayoutSlot(set) <> avkLaySetLayout[lay]
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindDescriptorSets was given a descriptor set that was allocated from a different VkDescriptorSetLayout from the one its pipeline layout declares (Anvil code -20001, incompatible descriptor set); the shader's bindings are checked against the pipeline layout, so a set built to a different shape would be read at offsets nobody agreed to.")
+  If AnvilVkDescriptorSetDeviceSlot(set) <> d
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "vkCmdBindDescriptorSets was given a descriptor set from a different VkDevice from the command buffer and pipeline layout (Anvil code -20003, wrong parent); no descriptor binding state was changed.")
+    ProcedureReturn
+  EndIf
+  If avkSetMatchesLayout(set, lay) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindDescriptorSets was given a descriptor set whose immutable binding schema is incompatible with the pipeline layout (Anvil code -20001, incompatible descriptor set); binding types, stages and binding count must match, but the source layout handles need not be identical.")
     ProcedureReturn
   EndIf
   avkCbDescSet[c] = set
-  avkCbDescLayout[c] = layout
+  avkCbDescSetCount[c] = avkLaySetCount[lay]
+  avkCbDescBindingCount[c] = avkLayBindingCount[lay]
+  avkCbDescPushBytes[c] = avkLayPushBytes[lay]
+  k = 0
+  While k < #ANVIL_VK_MAX_SET_BINDINGS
+    avkCbDescType[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] = avkLayBindingType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+    avkCbDescStages[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] = avkLayBindingStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+    k = k + 1
+  Wend
 EndProcedure
 
 Procedure AnvilVkCmdPushConstants(commandBuffer.i, layout.i, stageFlags.i, offset.i, size.i, *values)
@@ -2184,6 +2284,10 @@ Procedure AnvilVkCmdPushConstants(commandBuffer.i, layout.i, stageFlags.i, offse
   lay = avkLaySlot(layout)
   If lay = 0
     avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdPushConstants was given a VkPipelineLayout handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
+    ProcedureReturn
+  EndIf
+  If avkLayDev[lay] <> avkPoolDev[avkCmdPool[c]]
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "vkCmdPushConstants was given a pipeline layout from a different VkDevice from the command buffer (Anvil code -20003, wrong parent); no push-constant words were copied.")
     ProcedureReturn
   EndIf
   If avkLayPushBytes[lay] <> #ANVIL_VK_PUSH_BYTES
@@ -2304,8 +2408,8 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
       avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader reads a uniform buffer, and no descriptor set was bound (Anvil code -20004, no descriptor set bound); call vkCmdBindDescriptorSets before the draw, because the set is what says which buffer the shader reads.")
       ProcedureReturn
     EndIf
-    If avkLaySlot(avkCbDescLayout[c]) <> avkPipeLayout[p]
-      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a descriptor set bound through a different pipeline layout from the one its pipeline was created with (Anvil code -20001, incompatible layout); the layout is the agreement about what set zero holds, and two different ones are two different agreements.")
+    If avkCbMatchesPipe(c, p) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with descriptor state whose immutable set and push-range compatibility signature differs from the pipeline's (Anvil code -20001, incompatible layout); rebind through a compatible pipeline layout.")
       ProcedureReturn
     EndIf
     If AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p]) = 0
@@ -2322,8 +2426,8 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
       avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called with a pipeline whose fragment shader samples an image, and no descriptor set was bound (Anvil code -20004, no descriptor set bound); bind the set that owns the combined image sampler before the draw.")
       ProcedureReturn
     EndIf
-    If avkLaySlot(avkCbDescLayout[c]) <> avkPipeLayout[p]
-      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a sampled-image descriptor set through a different pipeline layout from the one its pipeline was created with (Anvil code -20001, incompatible layout); bind set zero through the pipeline's own layout.")
+    If avkCbMatchesPipe(c, p) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with sampled descriptor state whose immutable set and push-range compatibility signature differs from the pipeline's (Anvil code -20001, incompatible layout); rebind through a compatible pipeline layout.")
       ProcedureReturn
     EndIf
     If AnvilVkDescriptorSetSampledImage(avkCbDescSet[c], avkPipeSampleBinding[p], @avkSampleStage) = 0
@@ -2378,6 +2482,27 @@ Procedure.i avkDrawSampleImage(c.i, p.i)
   ProcedureReturn AnvilVkDescriptorSetSampledImageHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
 EndProcedure
 
+; The render-target view belongs to the submission flight, not specifically
+; to shader resource retention. Keeping this pair at the flight boundary also
+; covers a render-pass submission whose backend work does not read descriptors.
+Procedure avkAttachmentViewRetain(c.i)
+  Define fb.i = avkCbFb[c]
+  Define iv.i
+  If fb > 0
+    iv = avkFbView[fb]
+    If iv > 0 : avkIvInFlight[iv] = avkIvInFlight[iv] + 1 : EndIf
+  EndIf
+EndProcedure
+
+Procedure avkAttachmentViewRelease(c.i)
+  Define fb.i = avkCbFb[c]
+  Define iv.i
+  If fb > 0
+    iv = avkFbView[fb]
+    If iv > 0 And avkIvInFlight[iv] > 0 : avkIvInFlight[iv] = avkIvInFlight[iv] - 1 : EndIf
+  EndIf
+EndProcedure
+
 ; EVERY buffer the draw reads is retained, not just the first. A colour
 ; buffer destroyed while the submission is in flight is exactly as fatal
 ; as a position buffer destroyed then, and the count that stops that is
@@ -2388,6 +2513,10 @@ Procedure avkDrawRetain(c.i)
   Define k.i
   Define image.i
   Define img.i
+  Define sampler.i
+  Define samp.i
+  Define view.i
+  Define iv.i
   If avkCbDrawCount[c] = 0
     ProcedureReturn
   EndIf
@@ -2419,6 +2548,14 @@ Procedure avkDrawRetain(c.i)
     avkImgInFlight[img] = avkImgInFlight[img] + 1
     avkMemInFlight[avkImgMemSlot[img]] = avkMemInFlight[avkImgMemSlot[img]] + 1
   EndIf
+  If avkPipeUsesSample[p] <> 0
+    sampler = AnvilVkDescriptorSetSamplerHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
+    samp = avkSamplerSlot(sampler)
+    If samp <> 0 : avkSampInFlight[samp] = avkSampInFlight[samp] + 1 : EndIf
+    view = AnvilVkDescriptorSetImageViewHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
+    iv = avkIvSlot(view)
+    If iv <> 0 : avkIvInFlight[iv] = avkIvInFlight[iv] + 1 : EndIf
+  EndIf
 EndProcedure
 
 Procedure avkDrawRelease(c.i)
@@ -2427,6 +2564,10 @@ Procedure avkDrawRelease(c.i)
   Define k.i
   Define image.i
   Define img.i
+  Define sampler.i
+  Define samp.i
+  Define view.i
+  Define iv.i
   If avkCbDrawCount[c] = 0
     ProcedureReturn
   EndIf
@@ -2460,6 +2601,14 @@ Procedure avkDrawRelease(c.i)
       avkMemInFlight[avkImgMemSlot[img]] = avkMemInFlight[avkImgMemSlot[img]] - 1
     EndIf
   EndIf
+  If avkPipeUsesSample[p] <> 0
+    sampler = AnvilVkDescriptorSetSamplerHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
+    samp = avkSamplerSlot(sampler)
+    If samp <> 0 And avkSampInFlight[samp] > 0 : avkSampInFlight[samp] = avkSampInFlight[samp] - 1 : EndIf
+    view = AnvilVkDescriptorSetImageViewHandle(avkCbDescSet[c], avkPipeSampleBinding[p])
+    iv = avkIvSlot(view)
+    If iv <> 0 And avkIvInFlight[iv] > 0 : avkIvInFlight[iv] = avkIvInFlight[iv] - 1 : EndIf
+  EndIf
 EndProcedure
 
 ; Resolve the exact generations of every retained render-target dependency
@@ -2477,6 +2626,28 @@ Procedure.i avkDrawPreflight(c.i)
   fb = avkFbSlot(avkCbFbHandle[c])
   If p = 0 Or fb = 0 Or fb <> avkCbFb[c]
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer whose pipeline or framebuffer has since been destroyed or replaced (Anvil code -20004, stale resource reference); re-record the command buffer against live objects.")
+  EndIf
+  ; Resolve BOTH descriptor families before vkQueueSubmit acquires a fence,
+  ; commits semaphores, raises in-flight counts or calls the backend. A mixed
+  ; draw is one transaction: a valid UBO cannot make a stale sampler a late
+  ; partial submission, and the reverse is equally true.
+  If avkPipeUsesUniform[p] <> 0 Or avkPipeUsesSample[p] <> 0
+    If avkCbDescSet[c] = 0 Or AnvilVkDescriptorSetDeviceSlot(avkCbDescSet[c]) <> avkPipeDev[p]
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a draw whose descriptor set is stale or belongs to a different device (Anvil code -20004, stale descriptor state); nothing was submitted.")
+    EndIf
+    If avkCbMatchesPipe(c, p) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given descriptor state incompatible with the recorded pipeline's immutable layout signature (Anvil code -20004, incompatible descriptor state); nothing was submitted.")
+    EndIf
+  EndIf
+  If avkPipeUsesUniform[p] <> 0
+    If AnvilVkDescriptorSetAddress(avkCbDescSet[c], avkPipeUniformBinding[p]) = 0 Or AnvilVkDescriptorSetRange(avkCbDescSet[c], avkPipeUniformBinding[p]) < #ANVIL_VK_UNIFORM_BYTES
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found the recorded uniform-buffer descriptor unwritten or stale (Anvil code -20004, descriptor not ready); nothing was submitted.")
+    EndIf
+  EndIf
+  If avkPipeUsesSample[p] <> 0
+    If AnvilVkDescriptorSetSampledImage(avkCbDescSet[c], avkPipeSampleBinding[p], @avkSampleStage) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found the recorded combined-image-sampler descriptor unwritten or stale (Anvil code -20004, sampled descriptor not ready); nothing was submitted.")
+    EndIf
   EndIf
   rp = avkRpSlot(avkFbRpHandle[fb])
   iv = avkIvSlot(avkFbViewHandle[fb])

@@ -26,7 +26,7 @@ currently amounts to and where the files are.
 | `vk_api.pbi` | The public `vk*` entry points and their validation. |
 | `vk_backend_none.pbi` | The absent backend: no device is enumerated. UNO Q and any Pi build without V3D link this. |
 | `vk_backend_test.pbi` | The explicit test backend: state and a call log, **no GPU and no pixels ever written**. |
-| `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for uniform buffers and the bounded combined-image-sampler state shape, including typed pool accounting and live resolution into closed backend records. |
+| `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for dense one- or two-binding schemas containing uniform buffers, bounded combined image samplers, or one of each. Pools sum duplicate input rows into checked per-type capacities; allocation, copied immutable schemas, independent writes and live resolution into closed backend records are transactional. |
 | `vk_interp_expect.pbi` | What an interpolated varying must be at a named pixel, in exact integers. Target neutral, no floating point, and no hardware. |
 | `vk_v3d_shader.pi4` | The Pi 4 QPU emitter for the accepted shader plans, including the V3D 4.2 TMU general vec4 load used by a uniform-buffer descriptor and the bounded combined-sampler texture request. BGRA8 sampling uses the format table's Z,Y,X,W logical swizzle; identity swizzle is a measured red/blue reversal, not an alternative. |
 | `vk_v3d_backend.pi4` | The real Pi 4 backend: validated clears and draws lowered to V3D bin/render control lists through Neon, plus the bounded raster-to-`UIF_NO_XOR` optimal-image copy lowered to the TFU, with mapped-range and cache-visibility rules. |
@@ -41,7 +41,7 @@ compile — neither can silently enumerate the wrong thing.
 | Class | Current coverage |
 |---|---|
 | Generated vocabulary | A pinned core-1.0 generator exists. The checked-in slice contains the exact result, structure-type, command-lifecycle, image, format-feature, memory, queue-family, access, stage, aspect, fence and binary-semaphore values this implementation uses, plus 70 scalar, nested, fixed-array, structure-array and pointer-bearing structures. It is not the complete 1.0 vocabulary. `VkPhysicalDeviceFeatures` carries all 55 core feature members; every member is currently false. `VkClearColorValue` is a union and is deliberately **not** declared, because PureMetal has no union and one arm of it posing as the whole type is the silent wrong answer this project refuses. |
-| Semantic implementation | Opaque typed and generation-tagged handles including binary semaphores; instance, physical device, device and one queue that always advertises transfer and advertises graphics exactly when its backend owns the draw capability; exact format/image-format answers for implemented linear BGRA8 and the bounded optimal sampled/transfer-destination combination; device memory plus linear and optimal `B8G8R8A8_UNORM` images with exact requirements, binding, usage and layout; one active checked host mapping; whole-image clears and one tightly packed whole-image buffer-to-image copy with live-resource revalidation and retention; destination layout publication only after copy success; binary semaphore waits/signals and fences with bounded waits; one-sample-mask suppression; a bounded sampler; and one combined-image-sampler descriptor resolving a live bound sampled image in `SHADER_READ_ONLY_OPTIMAL`. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
+| Semantic implementation | Opaque typed and generation-tagged handles including binary semaphores; instance, physical device, device and one queue that always advertises transfer and advertises graphics exactly when its backend owns the draw capability; exact format/image-format answers for implemented linear BGRA8 and the bounded optimal sampled/transfer-destination combination; device memory plus linear and optimal `B8G8R8A8_UNORM` images with exact requirements, binding, usage and layout; one active checked host mapping; whole-image clears and one tightly packed whole-image buffer-to-image copy with live-resource revalidation and retention; destination layout publication only after copy success; binary semaphore waits/signals and fences with bounded waits; one-sample-mask suppression; a bounded sampler; immutable copied descriptor schemas with independent per-type pool accounting; and a mixed uniform-buffer plus combined-image-sampler set resolving both live resources in one fragment draw. Every refusal is a real code and a whole sentence naming it and the next thing to check. |
 | Explicit test backend | `vk_backend_test.pbi` models one device over a caller-supplied window. It records the exact clear it was asked for — address, extent, pitch, colour word — and **writes nothing**, so a gate can then read the image back and require that every poisoned byte survived. It can hold a submission outstanding or fail a later poll once, making pending semaphore/fence/resource ownership and both completion and rollback reachable from a desk. |
 | V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and accepted graphics draws through transactional Neon/V3D bin-render jobs, and lowers the bounded optimal buffer-to-image copy through a real TFU job. There is no processor or DMA image fallback. The 2026-09-13 4x4 proof copied raster BGRA8 into `UIF_NO_XOR`, then sampled it: exact inside probes were green, blue and red; outside probes stayed `$FF3380B2`; TFU, bin and render counters each advanced once; the optimal state was `$00A9C840`; and MMU/OOM/native faults were zero. This proves one level/layer/sample, one tightly packed whole-image region and the current 4-byte BGRA8/nearest-sampling subset, not general texture support. |
 
@@ -76,7 +76,7 @@ divergent API.
 `vk_spirv.pbi` walks a SPIR-V module, validates it against the Vulkan
 environment, refuses by name everything outside one declared subset - a
 pass-through vertex shader and a flat or interpolated fragment shader - and
-lowers what is left to a small plan. `vk_v3d_shader.pi4` turns that plan into
+originally lowered what remained to a small plan. That first path produced
 three QPU programs, their uniform streams and a GL shader state record.
 `vk_pipeline.pbi` adds buffers, shader modules, pipeline layouts, render passes,
 image views, framebuffers, graphics pipelines and the render-pass recording
@@ -88,9 +88,11 @@ exact, and the picture was presented. That is one uniform-colour triangle and
 one triangle whose three vertices carried the SAME colour through the varying
 path - a proof of the path and not of interpolation.
 
-It is an EMITTER and not a compiler: no target-neutral IR, no register
-allocator, no scheduler, no instruction selection, and no arithmetic in an
-accepted shader. The refusals are what keeps that honest.
+That statement describes the first 2026-09-11 slice. The current path retains
+the verified module as immutable typed SSA IR and lowers straight-line
+binary32 `FAdd`/`FMul` graphs to V3D 4.2. It is still bounded: no general
+control flow, phi, calls, conversions, optimizer or scheduler are claimed,
+and everything outside the declared IR/lowerer contract is refused.
 
 ## 2026-09-11, the same evening: varyings, a second binding, descriptors
 
@@ -100,7 +102,7 @@ question on the board:
 | File | What it owns |
 |---|---|
 | `vk_interp_expect.pbi` | What an interpolated varying MUST be at a named pixel: the clip-to-screen transform, the pixel-centre sample point, the three edge functions, the weighted average and the 8-bit UNORM rounding, all in exact integers with no floating point. `tools/vulkan_interp_check.py` runs it against a second implementation of the same rule written in Python. |
-| `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` plus one exact `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` at set zero/binding zero. Pool type is enforced; sampled writes require a live sampler, full live image view, bound `SAMPLED` image and shader-read-only layout; consumption revalidates every handle and the current layout before returning base, size, geometry, format and filters. |
+| `vk_descriptor.pbi` | `VkDescriptorSetLayout`, `VkDescriptorPool` and `VkDescriptorSet` for `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` and `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`, independently or together in a dense two-binding set. Pool capacity is tracked per type and duplicate size rows are summed with overflow checks. Sets and pipeline layouts copy immutable schemas, so destroying or reusing a source layout cannot substitute a new shape. Sampled writes require a live sampler, full live image view, bound `SAMPLED` image and shader-read-only layout; consumption revalidates every handle and current layout before returning closed resource records. |
 
 `vk_pipeline.pbi` gained one to four vertex input bindings, each with its own
 stride, and refuses a binding no attribute reads. `vk_v3d_shader.pi4` builds
@@ -168,11 +170,34 @@ offset, level-zero `UIF_NO_XOR`, and the current normalized nearest-filter
 sampler. Mips, partial regions, row-length overrides, layers, scaling,
 conversion, blits and other formats are still refused.
 
+**One fragment now combines a sampled image, push constants and a uniform
+buffer on Pi 4 silicon.** On 2026-09-15 monitor build 101 verified and ran the
+874,740-byte PMF container with SHA-256
+`6405122BD5F7BE41BB79B56CDCB770D0499AA1A7E6E602AAE17C42F7419B9D85`;
+the 874,612-byte flat image has SHA-256
+`C942FDF52697C80DBC3ACC56850431366C04ADDBAA050FC840ECAC3FB965922A`.
+It returned the complete 960-byte report at `$005E7E78` in 9.81 seconds.
+All four pass verdicts, submit/wait results, MMU/OOM/native errors, and the
+current pre/post-draw validation codes were zero. The deliberately cumulative
+validation count stayed 5 before, during and after the mixed draw, proving it
+added no fault. The typed lowerer published the exact nine-word stream with
+semantic indices push RGBA 4..7, UBO address/config 2/3, texture/sampler 0/1
+and TLB 8. Runtime patching placed all nine exact values through those indices;
+the UBO address was `$067D3000`, the TMU configuration was `$FFFFFF7C`, and
+the texture/sampler/TLB words were `$067DD20F`, `$067DD301`, `$FFFFFFFF`.
+TFU, bin and render counters each advanced exactly once. The three inside
+pixels were `$FF808000`, `$FF800080`, `$FFFF0000`, the three outside pixels
+remained `$FF3380B2`, and all nine retained resource counters returned to zero.
+The DMA screenshot was 1280x800 with pixel SHA-256
+`D1F98B232832C919E8FC96F4EC1EF8144240063B0BF76B05A3B4DC7C44D51A18`.
+This closes only the declared straight-line `sample * push + UBO` subset, not
+general SPIR-V, arbitrary descriptors, textures, or expression scheduling.
+
 ## Next real backend layers
 
 The next stages are per-object GPU virtual addressing and residency above
-today's single window, arithmetic in the shader front end and the typed IR that
-needs, broader optimal-image shapes and transfer commands beyond the proved
+today's single window, arithmetic beyond the current straight-line binary32
+`FAdd`/`FMul` typed-IR subset, broader optimal-image shapes and transfer commands beyond the proved
 whole-image copy, broader immutable pipeline state, command lowering into V3D
 bin/render jobs with dependencies, interrupt-driven completion so submission is
 genuinely asynchronous, and then WSI against Anvil's existing HDMI/DSI present
