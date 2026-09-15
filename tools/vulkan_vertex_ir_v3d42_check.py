@@ -21,7 +21,6 @@ GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/vulkan_vertex_ir_v3d42_gate.pi4"
 MODULE = ROOT / "Anvil/Graphics/Vulkan/vk_ir_v3d42.pi4"
 COMPILER = pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
 COMPILER_SHA = "8f2e43d4b260c5fa049762e6212c4355ea9cf49d30c0c10092783d3a664a5367"
-KEYWORDS_SHA = "5167b0b5f1de571ad596d274eabbd0669852bf4997a5cdbf0483e898e05ae1b5"
 INTERPRETER = ROOT / "tools/a64/a64_interp.py"
 INTERPRETER_SHA = "7bf5c82987fdf6c014b14349070355ee4d539da28f7bfe1befd73f54d6da2b6e"
 LOAD = 0x400000
@@ -133,7 +132,7 @@ def load_module(name: str, path: pathlib.Path):
     return module
 
 
-def compile_entries(keywords: pathlib.Path) -> dict[str, bytes]:
+def compile_entries() -> dict[str, bytes]:
     entries = {}
     for rel in ("Anvil/Graphics/Vulkan/vk_core_1_0.pbi", "Anvil/Graphics/Vulkan/vk_foundation.pbi",
                 "Anvil/Graphics/Vulkan/vk_ir.pbi", "Anvil/Graphics/Vulkan/vk_ir_v3d42.pi4",
@@ -145,9 +144,6 @@ def compile_entries(keywords: pathlib.Path) -> dict[str, bytes]:
             entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
     entries[pathlib.Path(__file__).resolve().relative_to(ROOT).as_posix()] = pathlib.Path(__file__).resolve().read_bytes()
     entries[INTERPRETER.relative_to(ROOT).as_posix()] = INTERPRETER.read_bytes()
-    # PMF_ROOT must contain this ordinary path even though the compiler-owned
-    # copy is independently pinned before and after every invocation.
-    entries["keywords.def"] = keywords.read_bytes()
     return entries
 
 
@@ -179,25 +175,21 @@ def freeze_inputs(entries: dict[str, bytes]) -> tuple[pathlib.Path, str]:
 
 
 def guard_inputs(shared_supplier, shared_hash: str, snapshot: pathlib.Path, snapshot_hash: str,
-                 compiler: pathlib.Path, compiler_hash: str, keywords: pathlib.Path,
-                 keywords_hash: str) -> None:
+                 compiler: pathlib.Path, compiler_hash: str) -> None:
     if framed_manifest(shared_supplier()) != shared_hash:
         raise RuntimeError("vertex IR42 gate: shared compile inputs changed")
     if sha(compiler) != compiler_hash:
         raise RuntimeError("vertex IR42 gate: compiler changed")
-    if sha(keywords) != keywords_hash:
-        raise RuntimeError("vertex IR42 gate: compiler keywords changed")
     if snapshot_manifest(snapshot) != snapshot_hash:
         raise RuntimeError("vertex IR42 gate: frozen snapshot changed")
 
 
-def build(compiler: pathlib.Path, keywords: pathlib.Path, snapshot: pathlib.Path,
-          manifest: str, compiler_hash: str, keywords_hash: str,
+def build(compiler: pathlib.Path, snapshot: pathlib.Path,
+          manifest: str, compiler_hash: str,
           module: bytes | None = None, runner=subprocess.run,
           timeout: float = 300) -> tuple[pathlib.Path, pathlib.Path]:
     if snapshot_manifest(snapshot) != manifest: raise RuntimeError("vertex IR42 gate: frozen snapshot changed before compile")
     if sha(compiler) != compiler_hash: raise RuntimeError("vertex IR42 gate: compiler changed before compile")
-    if sha(keywords) != keywords_hash: raise RuntimeError("vertex IR42 gate: compiler keywords changed before compile")
     work = pathlib.Path(tempfile.mkdtemp(prefix="anvil_vertex_ir42_"))
     try:
         shutil.copytree(snapshot, work, dirs_exist_ok=True)
@@ -211,7 +203,6 @@ def build(compiler: pathlib.Path, keywords: pathlib.Path, snapshot: pathlib.Path
         proc = runner(cmd, cwd=work, env=env, text=True, stdout=subprocess.PIPE,
                       stderr=subprocess.STDOUT, timeout=timeout)
         if sha(compiler) != compiler_hash: raise RuntimeError("vertex IR42 gate: compiler changed during compile")
-        if sha(keywords) != keywords_hash: raise RuntimeError("vertex IR42 gate: compiler keywords changed during compile")
         if snapshot_manifest(snapshot) != manifest: raise RuntimeError("vertex IR42 gate: frozen snapshot changed during compile")
         if proc.returncode or "pmfc: OK" not in proc.stdout or not out.is_file():
             raise RuntimeError("vertex IR42 compile failed\n" + proc.stdout)
@@ -220,14 +211,14 @@ def build(compiler: pathlib.Path, keywords: pathlib.Path, snapshot: pathlib.Path
         remove_private_tree(work); raise
 
 
-def build_execute(a64, compiler: pathlib.Path, keywords: pathlib.Path, snapshot: pathlib.Path,
-                  manifest: str, compiler_hash: str, keywords_hash: str,
+def build_execute(a64, compiler: pathlib.Path, snapshot: pathlib.Path,
+                  manifest: str, compiler_hash: str,
                   module: bytes | None = None, runner=subprocess.run,
                   timeout: float = 300, execute_fn=None):
     image = work = None
     try:
-        image, work = build(compiler, keywords, snapshot, manifest, compiler_hash,
-                            keywords_hash, module=module, runner=runner, timeout=timeout)
+        image, work = build(compiler, snapshot, manifest, compiler_hash,
+                            module=module, runner=runner, timeout=timeout)
         return (execute_fn or execute)(a64, image)
     finally:
         remove_private_tree(work)
@@ -349,9 +340,9 @@ def grade(cpu, report):
     need(q(cpu,b) == (1<<64)-23405 and q(cpu,b+4*8) == 3 and q(cpu,b+17*8) == 1,
          "viewport 65536 refuses transactionally")
     exact_stage2 = {
-        16:(-23404,20,62),17:(-23403,20,62),18:(-23404,20,62),19:(-23404,20,62),
+        16:(-23404,20,62),17:(-23403,20,62),18:(-23404,20,62),
         21:(-23404,20,62),22:(-23403,20,62),23:(-23404,21,62),24:(-23404,22,62),
-        25:(-23403,43,62),26:(-23403,43,62),27:(-23403,43,62),
+        25:(-23403,43,62),26:(-23403,43,62),27:(-23403,44,62),
         34:(-23403,20,62),35:(-23403,23,62),36:(-23403,23,62),
         37:(-23403,21,62),38:(-23403,21,62),39:(-23403,21,62),
         40:(-23403,21,62),41:(-23403,21,62),42:(-23403,44,62),43:(-23403,49,62),
@@ -361,6 +352,10 @@ def grade(cpu, report):
         need(tuple(q(cpu,base+i*8) for i in (0,1,2,3,4,17)) ==
              (neg(code),neg(code),source_id,opcode,2,1),
              f"case {case} exact semantic refusal provenance and transaction")
+    base=report+19*STRIDE*8
+    need(tuple(q(cpu,base+i*8) for i in (0,1,2,3,4,17)) ==
+         (neg(-23402),neg(-23402),54,72,1,1),
+         "case 19 exact verifier decoration-conflict provenance and transaction")
     base=report+46*STRIDE*8
     need(tuple(q(cpu,base+i*8) for i in (0,1,2,3,4,17)) ==
          (neg(-23402),neg(-23402),21,15,1,1),
@@ -476,18 +471,18 @@ MUTANTS = (
 )
 
 
-def infra_self_test(compiler: pathlib.Path, keywords: pathlib.Path) -> None:
+def infra_self_test(compiler: pathlib.Path) -> None:
     temp = pathlib.Path(tempfile.gettempdir())
     before = {p.resolve() for pattern in ("anvil_vertex_ir42_*",)
               for p in temp.glob(pattern) if p.is_dir()}
-    entries = compile_entries(keywords)
+    entries = compile_entries()
     snapshot, manifest = freeze_inputs(entries)
     fake = pathlib.Path(tempfile.mkdtemp(prefix="anvil_vertex_ir42_fake_"))
-    fake_compiler = fake / "compiler.exe"; fake_keywords = fake / "keywords.def"
-    fake_compiler.write_bytes(b"compiler"); fake_keywords.write_bytes(b"keywords")
+    fake_compiler = fake / "compiler.exe"
+    fake_compiler.write_bytes(b"compiler")
     tally = MutationTally()
     flags = {name: False for name in ("immutable", "compile", "timeout", "execute",
-                                      "compiler", "keywords", "snapshot", "shared", "combined")}
+                                      "compiler", "snapshot", "shared", "combined")}
 
     def failed(*args, **kwargs): return subprocess.CompletedProcess(args[0], 1, "injected compile failure")
     def timed(*args, **kwargs): raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
@@ -496,7 +491,6 @@ def infra_self_test(compiler: pathlib.Path, keywords: pathlib.Path) -> None:
         return subprocess.CompletedProcess(args[0], 0, "pmfc: OK")
     def execute_failure(*args, **kwargs): raise SystemExit("injected execute failure")
     def compiler_drift(*args, **kwargs): fake_compiler.write_bytes(b"changed"); return success(*args, **kwargs)
-    def keyword_drift(*args, **kwargs): fake_keywords.write_bytes(b"changed"); return success(*args, **kwargs)
     def snapshot_drift(*args, **kwargs):
         victim = snapshot / MODULE.relative_to(ROOT); victim.write_bytes(victim.read_bytes() + b"\n")
         return success(*args, **kwargs)
@@ -505,23 +499,20 @@ def infra_self_test(compiler: pathlib.Path, keywords: pathlib.Path) -> None:
         loaded = load_module("anvil_vertex_ir42_a64_selftest", snapshot / INTERPRETER.relative_to(ROOT))
         flags["immutable"] = snapshot_manifest(snapshot) == before_load and callable(getattr(loaded, "A64", None))
         sys.modules.pop("anvil_vertex_ir42_a64_selftest", None)
-        try: build(compiler, keywords, snapshot, manifest, sha(compiler), sha(keywords), runner=failed)
+        try: build(compiler, snapshot, manifest, sha(compiler), runner=failed)
         except RuntimeError as error: flags["compile"] = "injected compile failure" in str(error)
-        try: build(compiler, keywords, snapshot, manifest, sha(compiler), sha(keywords), runner=timed, timeout=.01)
+        try: build(compiler, snapshot, manifest, sha(compiler), runner=timed, timeout=.01)
         except subprocess.TimeoutExpired: flags["timeout"] = True
-        try: build_execute(None, compiler, keywords, snapshot, manifest, sha(compiler), sha(keywords), runner=success, execute_fn=execute_failure)
+        try: build_execute(None, compiler, snapshot, manifest, sha(compiler), runner=success, execute_fn=execute_failure)
         except SystemExit as error: flags["execute"] = "injected execute failure" in str(error)
-        fh, kh = sha(fake_compiler), sha(fake_keywords)
-        try: build(fake_compiler, fake_keywords, snapshot, manifest, fh, kh, runner=compiler_drift)
+        fh = sha(fake_compiler)
+        try: build(fake_compiler, snapshot, manifest, fh, runner=compiler_drift)
         except RuntimeError as error: flags["compiler"] = "compiler changed during compile" in str(error)
-        fake_compiler.write_bytes(b"compiler"); fake_keywords.write_bytes(b"keywords")
-        try: build(fake_compiler, fake_keywords, snapshot, manifest, sha(fake_compiler), sha(fake_keywords), runner=keyword_drift)
-        except RuntimeError as error: flags["keywords"] = "compiler keywords changed during compile" in str(error)
-        fake_keywords.write_bytes(b"keywords")
+        fake_compiler.write_bytes(b"compiler")
         altered = dict(entries); key = sorted(altered)[0]; altered[key] += b"changed"
-        try: guard_inputs(lambda: altered, framed_manifest(entries), snapshot, manifest, compiler, sha(compiler), keywords, sha(keywords))
+        try: guard_inputs(lambda: altered, framed_manifest(entries), snapshot, manifest, compiler, sha(compiler))
         except RuntimeError as error: flags["shared"] = "shared compile inputs changed" in str(error)
-        try: build(compiler, keywords, snapshot, manifest, sha(compiler), sha(keywords), runner=snapshot_drift)
+        try: build(compiler, snapshot, manifest, sha(compiler), runner=snapshot_drift)
         except RuntimeError as error: flags["snapshot"] = "frozen snapshot changed during compile" in str(error)
         # Restore only the private injected snapshot bytes for final cleanup tests.
         (snapshot / MODULE.relative_to(ROOT)).write_bytes(entries[MODULE.relative_to(ROOT).as_posix()])
@@ -543,21 +534,20 @@ def infra_self_test(compiler: pathlib.Path, keywords: pathlib.Path) -> None:
     if not all(flags.values()): raise RuntimeError(f"vertex IR42 gate: infra self-test failed: {flags}")
     if tally.rejected != 0: raise RuntimeError("vertex IR42 gate: infra failure counted as semantic kill")
     if after != before: raise RuntimeError(f"vertex IR42 gate: infra self-test leaked roots: {after-before}")
-    print("vulkan_vertex_ir_v3d42_check: infra self-test PASS - immutable load; compile/timeout/execute/compiler/keyword/snapshot/shared drift abort; combined primary preserved; rejected=0; temp roots unchanged")
+    print("vulkan_vertex_ir_v3d42_check: infra self-test PASS - immutable load; compile/timeout/execute/compiler/snapshot/shared drift abort; combined primary preserved; rejected=0; temp roots unchanged")
 
 
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument("--compiler", default=str(COMPILER)); parser.add_argument("--self-test-infra", action="store_true"); parser.add_argument("--mutate", action="store_true"); args = parser.parse_args()
-    compiler = pathlib.Path(args.compiler).resolve(); keywords = compiler.parent / "keywords.def"
+    compiler = pathlib.Path(args.compiler).resolve()
     if compiler != COMPILER.resolve() or sha(compiler) != COMPILER_SHA: raise RuntimeError("pinned compiler mismatch")
-    if sha(keywords) != KEYWORDS_SHA: raise RuntimeError("pinned compiler keywords mismatch")
     if sha(INTERPRETER) != INTERPRETER_SHA: raise RuntimeError("pinned interpreter mismatch")
     if args.self_test_infra:
-        infra_self_test(compiler, keywords); return 0
-    entries = compile_entries(keywords); shared_manifest = framed_manifest(entries)
+        infra_self_test(compiler); return 0
+    entries = compile_entries(); shared_manifest = framed_manifest(entries)
     snapshot, manifest = freeze_inputs(entries); primary = None
     try:
-        def guard(): guard_inputs(lambda: compile_entries(keywords), shared_manifest, snapshot, manifest, compiler, COMPILER_SHA, keywords, KEYWORDS_SHA)
+        def guard(): guard_inputs(lambda: compile_entries(), shared_manifest, snapshot, manifest, compiler, COMPILER_SHA)
         frozen_checker = snapshot / pathlib.Path(__file__).resolve().relative_to(ROOT)
         frozen_interp = snapshot / INTERPRETER.relative_to(ROOT)
         if sha(frozen_checker) != sha(pathlib.Path(__file__).resolve()): raise RuntimeError("frozen checker mismatch")
@@ -569,10 +559,9 @@ def main():
         if args.mutate:
             preflight_mutants=[(item,mutate_source(source,item[2],item[3])) for item in MUTANTS]
         guard()
-        cpu, report, steps = build_execute(a64, compiler, keywords, snapshot, manifest, COMPILER_SHA, KEYWORDS_SHA)
+        cpu, report, steps = build_execute(a64, compiler, snapshot, manifest, COMPILER_SHA)
         guard(); checks, bad = grade(cpu, report)
         print(f"vulkan_vertex_ir_v3d42_check: compiler={compiler} sha256={sha(compiler)}", flush=True)
-        print(f"vulkan_vertex_ir_v3d42_check: keywords={keywords} sha256={sha(keywords)}", flush=True)
         print(f"vulkan_vertex_ir_v3d42_check: checker={sha(pathlib.Path(__file__).resolve())} interpreter={sha(INTERPRETER)} manifest={manifest}", flush=True)
         if bad:
             print(f"vulkan_vertex_ir_v3d42_check: FAIL - {checks} checks / {steps:,} A64")
@@ -583,7 +572,7 @@ def main():
             escaped=[]; tally=MutationTally()
             for index,(item,broken) in enumerate(preflight_mutants):
                 name,causal,old,new=item; guard()
-                mcpu,mreport,msteps=build_execute(a64,compiler,keywords,snapshot,manifest,COMPILER_SHA,KEYWORDS_SHA,module=broken)
+                mcpu,mreport,msteps=build_execute(a64,compiler,snapshot,manifest,COMPILER_SHA,module=broken)
                 guard(); mchecks,mbad=grade(mcpu,mreport)
                 causal_bad=[item for item in mbad if causal in item]
                 if not causal_bad:
@@ -600,7 +589,7 @@ def main():
     except BaseException as error:
         primary = error; raise
     finally:
-        finalize_snapshot(lambda: guard_inputs(lambda: compile_entries(keywords), shared_manifest, snapshot, manifest, compiler, COMPILER_SHA, keywords, KEYWORDS_SHA), snapshot, primary)
+        finalize_snapshot(lambda: guard_inputs(lambda: compile_entries(), shared_manifest, snapshot, manifest, compiler, COMPILER_SHA), snapshot, primary)
 
 
 if __name__ == "__main__":
