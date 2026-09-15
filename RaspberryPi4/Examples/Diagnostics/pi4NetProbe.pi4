@@ -1,0 +1,943 @@
+; pi4NetProbe.pi4 - RaspberryPi4/Lib/net.pi4 walked from "does the
+; protocol layer work with no wire at all" through to a board that
+; answers `ping` from a PC, with every stage printing its reading before
+; the next stage depends on it.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NetProbe.pi4 -t pi4 \
+;            --load-addr 0x400000 --stack-addr 0x3000000 \
+;            --entry-returns -o net.img
+;
+; --entry-returns IS NOT OPTIONAL. Without it the payload runs off its
+; own end and the board hangs. Twenty-one of the diagnostics in this
+; directory need it and every one of them says so in its own header,
+; because the build line is the thing people copy from the wrong file.
+;
+; ARM THE DEADMAN BEFORE RUNNING THIS: `deadman 45`. Stage 6 listens for
+; thirty seconds by design and a board that looks hung for thirty
+; seconds is a board somebody power-cycles at second twenty-five.
+;
+; ----------------------------------------------------------------------
+;  WHAT THIS IS PROVING, AND IN WHAT ORDER
+; ----------------------------------------------------------------------
+;  net.pi4 sits on top of genet.pi4 and does no input or output of its
+;  own - see the long note in its header. So this probe is the pump:
+;  GenetRecvWait() gets a frame, NetInput() decides what it is, and if
+;  NetOutLen() is non-zero GenetSend() puts the answer back on the wire.
+;  Nothing else is happening here.
+;
+;  1. GENET, briefly. Identity, PHY, link, bring-up. This probe does
+;     NOT re-do pi4GenetProbe's work - that file is the place to go when
+;     the wire is the problem - but nothing above layer 2 means anything
+;     until layer 2 is up, so the readings are printed and the run stops
+;     if they are bad.
+;
+;  2. THE PROTOCOL LAYER, OFF THE WIRE. This is the stage that keeps its
+;     value forever and it is deliberately placed BEFORE anything
+;     depends on the network. Two frames are held in this file as
+;     literal bytes - a real ARP request and a real ICMP echo request -
+;     and they are fed straight into NetInput(). If the replies come out
+;     right, the whole of ARP, IPv4, the checksums and ICMP are proven
+;     WITHOUT A CABLE, A SWITCH OR A PC. If they come out wrong, nothing
+;     that follows is worth reading and the cause is in this tree rather
+;     than out on the bench.
+;
+;     THE TWO CANNED FRAMES ARE ADDRESSED TO 192.168.1.50 and this stage
+;     therefore configures that address temporarily, prints that it is
+;     doing so, and puts the real configuration back afterwards. The
+;     alternative - patching the addresses in - would need the header
+;     checksum recomputing, and recomputing it with the library's own
+;     checksum is the library marking its own homework.
+;
+;  3. THE REAL CONFIGURATION, printed as dotted quads so a human can
+;     compare it against what they typed on the PC.
+;
+;  4. ARP FOR THE GATEWAY. The first thing that requires the network to
+;     answer. A request goes out and the receive loop runs until either
+;     the reply arrives or the deadline passes; either way the result is
+;     printed with the gateway's hardware address if we got one.
+;
+;  5. AN OUTBOUND PING. Four echo requests to #NP_PEER, matched by
+;     identifier and sequence. This is the direction that needs ARP to
+;     have worked, which is why it comes after stage 4.
+;
+;  6. THE SERVICE LOOP - THIRTY SECONDS OF ANSWERING. This is the stage
+;     a `ping 192.168.1.50` is typed into. Every frame that arrives is
+;     handed to NetInput() and every reply it stages is sent. A tally is
+;     printed at the end: frames in, replies out, ARP answered, pings
+;     answered, UDP received.
+;
+;     IT IS A DURATION AND NOT A POLL COUNT. Sixty passes of a 500 ms
+;     GenetRecvWait() is thirty seconds of real listening. A bare loop
+;     of GenetRecv() calls is microseconds, and on 2026-08-26 exactly
+;     that mistake produced a "receive is broken" report from a receive
+;     path that was working perfectly - the whole story is in
+;     GenetRecvWait's header in genet.pi4.
+;
+;  7. UDP. Whatever arrived on #NP_UDP_PORT during stage 6 is reported,
+;     and one datagram is sent to the peer.
+;
+;  8. THE REFUSALS, every one of them provoked deliberately and printed
+;     with the code it should have returned. THIS IS THE HALF OF THE
+;     PROBE THAT KEEPS ITS VALUE FOREVER: a refusal that stops firing is
+;     a refusal somebody deleted, and this is where that shows up.
+;     IT RUNS LAST AND IT LEAVES THE STACK UNCONFIGURED, because
+;     provoking #NET_E_NO_MAC means calling NetReset(). Nothing after it
+;     would work and nothing is put after it.
+;
+; ----------------------------------------------------------------------
+;  WHAT TO TYPE ON THE PC, AND WHAT EACH OUTCOME MEANS
+; ----------------------------------------------------------------------
+;  Put the PC on the same subnet as #NP_IP below, then during stage 6:
+;
+;      ping 192.168.1.50
+;
+;  Reply from 192.168.1.50: bytes=32 time<1ms TTL=64
+;      Everything works. TTL=64 is ours (#NET_IP_TTL_DEFAULT); a TTL
+;      that is not 64 or 63 means something else answered.
+;
+;  Request timed out.
+;      Something between the ARP and the echo failed. Read the tally at
+;      the end of stage 6: "arp answered 0" means the PC's ARP never
+;      reached us or our reply never reached it, which is layer 2;
+;      "arp answered 1, ping answered 0" means ARP works and ICMP does
+;      not, which is this file's problem.
+;
+;  Destination host unreachable.
+;      The PC could not even ARP for us - wrong subnet on one side, or
+;      the board never sent an ARP reply. Check `arp -a` on the PC.
+;
+; ----------------------------------------------------------------------
+;  UNITS
+; ----------------------------------------------------------------------
+;  Lengths in bytes, times in milliseconds, addresses printed as dotted
+;  quads. Speeds in Mbit/s, which is what stage 1 borrows from
+;  pi4GenetProbe.
+; ----------------------------------------------------------------------
+
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+
+; ----------------------------------------------------------------------
+;  THE THINGS TO CHANGE BEFORE A RUN
+; ----------------------------------------------------------------------
+; The board's own address, its netmask, its gateway, and one peer to
+; ping outbound. All four as four octets, so nothing here depends on
+; knowing which end of a 32-bit number the first octet lives at.
+#NP_IP_A = 169
+#NP_IP_B = 254
+#NP_IP_C = 183
+#NP_IP_D = 50
+
+#NP_MASK_A = 255
+#NP_MASK_B = 255
+#NP_MASK_C = 0
+#NP_MASK_D = 0
+
+#NP_GW_A = 169
+#NP_GW_B = 254
+#NP_GW_C = 183
+#NP_GW_D = 67
+
+; Who to ping outbound in stage 5, and who to send a datagram to in
+; stage 7. The gateway is the safest default because it is the one
+; machine on the segment that is certain to exist and certain to answer
+; ARP.
+#NP_PEER_A = 169
+#NP_PEER_B = 254
+#NP_PEER_C = 183
+#NP_PEER_D = 67
+
+#NP_UDP_PORT = 9000        ; what we bind, and where stage 7 sends
+
+; The RX region genet.pi4 requires. 512 KiB - 256 descriptors of 2048
+; bytes - at $04000000, in the low DRAM bank, well clear of the image at
+; $00400000 and the stack top at $03000000.
+#NP_RX_REGION = $04000000
+#NP_RX_BYTES  = 524288
+
+#NP_LINK_MS = 2000         ; how long to wait for auto-negotiation
+#NP_TX_MS   = 100          ; how long to wait for one frame to leave
+
+; Stage 4 and 5: how long to wait for the network to answer one
+; question, and in how many slices. 8 x 250 ms = two seconds.
+#NP_ANSWER_SLICE_MS = 250
+#NP_ANSWER_SLICES   = 8
+
+; Stage 6: 60 x 500 ms = thirty seconds. A DURATION, NOT A POLL COUNT -
+; see the header.
+#NP_SERVE_SLICE_MS = 500
+#NP_SERVE_SLICES   = 60
+
+Global Dim npMac.a[6]
+Global Dim npRx.a[1600]
+Global Dim npPeerMac.a[6]
+Global Dim npArp.a[60]         ; a real ARP request, byte for byte
+Global Dim npEcho.a[74]        ; a real ICMP echo request, byte for byte
+Global Dim npUdpOut.a[64]
+
+Global npIp.i
+Global npMask.i
+Global npGw.i
+Global npPeer.i
+
+; Stage 6's tally.
+Global npFramesIn.i
+Global npRepliesOut.i
+Global npArpAnswered.i
+Global npPingAnswered.i
+Global npUdpIn.i
+Global npSendFail.i
+
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; An IPv4 address the way a person writes one. net.pi4 holds an address
+; with its FIRST OCTET IN THE MOST SIGNIFICANT BYTE, so this reads it
+; from the top down and there is nothing to reverse.
+Procedure DotLine(*name, ip.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec((ip >> 24) & $FF)
+  UartWrite(46)                    ; ASCII full stop
+  PrintDec((ip >> 16) & $FF)
+  UartWrite(46)
+  PrintDec((ip >> 8) & $FF)
+  UartWrite(46)
+  PrintDec(ip & $FF)
+  PrintNl()
+EndProcedure
+
+Procedure MacLine(*name, *mac)
+  Define i.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  For i = 0 To 5
+    If i > 0
+      UartWrite(58)                ; ASCII colon
+    EndIf
+    PutHexN(PeekA(*mac + i), 2)
+  Next
+  PrintNl()
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  PrintNl()
+EndProcedure
+
+; The last net.pi4 refusal, in words.
+Procedure WhyNet()
+  UartWriteStr("  -> ")
+  UartWriteStr(NetErrorText())
+  PrintNl()
+EndProcedure
+
+; The last genet.pi4 refusal, in words. Kept separate because the two
+; libraries have separate error variables and printing the wrong one
+; while chasing a fault costs more time than the two procedures cost.
+Procedure WhyGenet()
+  UartWriteStr("  -> ")
+  UartWriteStr(GenetErrorText())
+  PrintNl()
+EndProcedure
+
+; A refusal, provoked and graded on the spot. `got` is what came back
+; and `want` is what the library documents. Printing both means a
+; changed code shows up as a changed transcript rather than as silence.
+Procedure Refusal(*name, got.i, want.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(got)
+  UartWriteStr("  (want ")
+  PrintDec(want)
+  UartWriteStr(")")
+  If got <> want
+    UartWriteStr("   *** WRONG ***")
+  EndIf
+  PrintNl()
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  THE TWO CANNED FRAMES
+; ----------------------------------------------------------------------
+;  Byte for byte what a Windows host puts on the wire. They are written
+;  out longhand rather than generated, because a frame generated by the
+;  library under test proves only that the library agrees with itself.
+;
+;  npArp - 60 octets. An ARP request, broadcast, from
+;  dc:a6:32:11:22:33 at 192.168.1.20, asking who has 192.168.1.50.
+;  42 octets of protocol and 18 of zero pad.
+;
+;  npEcho - 74 octets. An ICMP echo request to 192.168.1.50 from
+;  192.168.1.20, identifier 1, sequence 37, carrying the 32-byte
+;  lower-case a..w payload Microsoft's ping sends. Its IPv4 header
+;  checksum ($A4F6) and its ICMP checksum ($4D36) are both correct, so
+;  a library that fails to verify them and a library that verifies them
+;  wrongly are BOTH caught here.
+;
+;  These are the same two frames tools/a64/a64_net_check.py feeds in, so
+;  a disagreement between the board and the gate is a disagreement about
+;  the same bytes.
+; ----------------------------------------------------------------------
+Procedure NpLoadFrames()
+  npArp[0] = $FF : npArp[1] = $FF : npArp[2] = $FF : npArp[3] = $FF
+  npArp[4] = $FF : npArp[5] = $FF                                  ; broadcast
+  npArp[6] = $DC : npArp[7] = $A6 : npArp[8] = $32
+  npArp[9] = $11 : npArp[10] = $22 : npArp[11] = $33               ; the asker
+  npArp[12] = $08 : npArp[13] = $06                                ; ARP
+  npArp[14] = $00 : npArp[15] = $01                                ; Ethernet
+  npArp[16] = $08 : npArp[17] = $00                                ; IPv4
+  npArp[18] = $06 : npArp[19] = $04                                ; 6 and 4
+  npArp[20] = $00 : npArp[21] = $01                                ; request
+  npArp[22] = $DC : npArp[23] = $A6 : npArp[24] = $32
+  npArp[25] = $11 : npArp[26] = $22 : npArp[27] = $33              ; sender hw
+  npArp[28] = $C0 : npArp[29] = $A8
+  npArp[30] = $01 : npArp[31] = $14                                ; 192.168.1.20
+  npArp[32] = $00 : npArp[33] = $00 : npArp[34] = $00
+  npArp[35] = $00 : npArp[36] = $00 : npArp[37] = $00              ; target hw
+  npArp[38] = $C0 : npArp[39] = $A8
+  npArp[40] = $01 : npArp[41] = $32                                ; 192.168.1.50
+  npArp[42] = $00 : npArp[43] = $00 : npArp[44] = $00 : npArp[45] = $00
+  npArp[46] = $00 : npArp[47] = $00 : npArp[48] = $00 : npArp[49] = $00
+  npArp[50] = $00 : npArp[51] = $00 : npArp[52] = $00 : npArp[53] = $00
+  npArp[54] = $00 : npArp[55] = $00 : npArp[56] = $00 : npArp[57] = $00
+  npArp[58] = $00 : npArp[59] = $00                                ; the pad
+
+  npEcho[0] = $02 : npEcho[1] = $00 : npEcho[2] = $4D
+  npEcho[3] = $46 : npEcho[4] = $00 : npEcho[5] = $01              ; to us
+  npEcho[6] = $DC : npEcho[7] = $A6 : npEcho[8] = $32
+  npEcho[9] = $11 : npEcho[10] = $22 : npEcho[11] = $33            ; from the PC
+  npEcho[12] = $08 : npEcho[13] = $00                              ; IPv4
+  npEcho[14] = $45 : npEcho[15] = $00                              ; version 4, IHL 5
+  npEcho[16] = $00 : npEcho[17] = $3C                              ; total 60
+  npEcho[18] = $12 : npEcho[19] = $34                              ; identification
+  npEcho[20] = $40 : npEcho[21] = $00                              ; Don't Fragment
+  npEcho[22] = $40                                                 ; TTL 64
+  npEcho[23] = $01                                                 ; protocol ICMP
+  npEcho[24] = $A4 : npEcho[25] = $F6                              ; header checksum
+  npEcho[26] = $C0 : npEcho[27] = $A8
+  npEcho[28] = $01 : npEcho[29] = $14                              ; from 192.168.1.20
+  npEcho[30] = $C0 : npEcho[31] = $A8
+  npEcho[32] = $01 : npEcho[33] = $32                              ; to 192.168.1.50
+  npEcho[34] = $08 : npEcho[35] = $00                              ; echo request
+  npEcho[36] = $4D : npEcho[37] = $36                              ; ICMP checksum
+  npEcho[38] = $00 : npEcho[39] = $01                              ; identifier 1
+  npEcho[40] = $00 : npEcho[41] = $25                              ; sequence 37
+  npEcho[42] = $61 : npEcho[43] = $62 : npEcho[44] = $63 : npEcho[45] = $64
+  npEcho[46] = $65 : npEcho[47] = $66 : npEcho[48] = $67 : npEcho[49] = $68
+  npEcho[50] = $69 : npEcho[51] = $6A : npEcho[52] = $6B : npEcho[53] = $6C
+  npEcho[54] = $6D : npEcho[55] = $6E : npEcho[56] = $6F : npEcho[57] = $70
+  npEcho[58] = $71 : npEcho[59] = $72 : npEcho[60] = $73 : npEcho[61] = $74
+  npEcho[62] = $75 : npEcho[63] = $76 : npEcho[64] = $77 : npEcho[65] = $61
+  npEcho[66] = $62 : npEcho[67] = $63 : npEcho[68] = $64 : npEcho[69] = $65
+  npEcho[70] = $66 : npEcho[71] = $67 : npEcho[72] = $68 : npEcho[73] = $69
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  ONE TURN OF THE PUMP.
+;
+;  Listen for `ms` milliseconds, hand anything that arrives to
+;  NetInput(), send anything it stages, and return what NetInput()
+;  returned. 0 means the deadline passed with nothing to do.
+;
+;  THE TALLY IS KEPT HERE so that every caller counts the same way.
+; ----------------------------------------------------------------------
+Procedure.i NpPump(ms.i)
+  Define n.i
+  Define r.i
+  n = GenetRecvWait(@npRx[0], 1600, ms)
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  npFramesIn = npFramesIn + 1
+  r = NetInput(#HW_LINK_WIRED, @npRx[0], n)
+  If NetOutLen() > 0
+    If GenetSend(NetOutBuf(), NetOutLen(), #NP_TX_MS) = 1
+      npRepliesOut = npRepliesOut + 1
+      If NetLastProto() = $0806
+        npArpAnswered = npArpAnswered + 1
+      Else
+        npPingAnswered = npPingAnswered + 1
+      EndIf
+    Else
+      npSendFail = npSendFail + 1
+    EndIf
+  EndIf
+  If r = 2
+    npUdpIn = npUdpIn + 1
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  THE CANNED SUBNET
+; ----------------------------------------------------------------------
+;  npArp and npEcho are addressed to 192.168.1.50 byte by byte, so they
+;  only mean anything against a stack configured as 192.168.1.50/24.
+;  Stage 2 and stage 8 both replay them and both must configure it.
+;
+;  IT IS A PROCEDURE AND NOT A COMMENT because on 2026-08-26 stage 8
+;  replayed them against the REAL bench address instead and the frames
+;  were dropped, unremarked, by net.pi4's destination filter. A rule
+;  written in a comment is a rule one of its two callers will forget.
+; ----------------------------------------------------------------------
+Procedure.i NpCannedConfig()
+  ProcedureReturn NetSetIPv4(#HW_LINK_WIRED, NetMakeIPv4(192, 168, 1, 50), NetMakeIPv4(255, 255, 255, 0), 0)
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  RESOLVE THE PEER, AND ANSWER THE QUESTION THE BUILDER WILL ASK
+; ----------------------------------------------------------------------
+;  1 if the peer's hardware address is known RIGHT NOW, having sent an
+;  ARP request and pumped for it if it was not.
+;
+;  WHY THIS EXISTS. Stage 7 used to print "peer resolved" from one
+;  NetArpLookup() near the top and then let NetPingBuild() ask the cache
+;  again, seconds and several received frames later. On 2026-08-26 the
+;  two answers differed and the stage printed both:
+;
+;      peer resolved  1
+;      ping build     0   -> the hardware address is not known
+;
+;  A reader should not be asked to notice that two adjacent lines cannot
+;  both be true. Every claim about resolution now comes from THIS
+;  procedure, called immediately before the build that depends on it,
+;  so there is only ever one answer in flight. The underlying cause -
+;  an entry expiring mid-conversation - is fixed in net.pi4; see
+;  net_ConfirmNeighbour there. This is the second half of that repair
+;  and it is worth keeping even so, because an instrument that can
+;  print a contradiction will eventually print one for a new reason.
+; ----------------------------------------------------------------------
+Procedure.i NpEnsurePeer()
+  Define i.i
+  Define r.i
+  If NetArpLookup(#HW_LINK_WIRED, npPeer, @npPeerMac[0]) = 1
+    ProcedureReturn 1
+  EndIf
+  r = NetArpRequest(#HW_LINK_WIRED, npPeer)
+  If r = 1
+    GenetSend(NetOutBuf(), NetOutLen(), #NP_TX_MS)
+  EndIf
+  i = 0
+  While i < #NP_ANSWER_SLICES
+    NpPump(#NP_ANSWER_SLICE_MS)
+    If NetArpLookup(#HW_LINK_WIRED, npPeer, @npPeerMac[0]) = 1
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+
+Procedure.i Main()
+  Define i.i
+  Define n.i
+  Define r.i
+  Define ok.i
+  Define phy.i
+  Define sent.i
+  Define got.i
+
+  PrintNl()
+  Say("=== net.pi4 - ARP, IPv4, ICMP and UDP over GENET ===")
+  PrintNl()
+
+  npMac[0] = $02
+  npMac[1] = $00
+  npMac[2] = $4D
+  npMac[3] = $46
+  npMac[4] = $00
+  npMac[5] = $01
+  NpLoadFrames()
+  NetInit()
+
+  npIp   = NetMakeIPv4(#NP_IP_A, #NP_IP_B, #NP_IP_C, #NP_IP_D)
+  npMask = NetMakeIPv4(#NP_MASK_A, #NP_MASK_B, #NP_MASK_C, #NP_MASK_D)
+  npGw   = NetMakeIPv4(#NP_GW_A, #NP_GW_B, #NP_GW_C, #NP_GW_D)
+  npPeer = NetMakeIPv4(#NP_PEER_A, #NP_PEER_B, #NP_PEER_C, #NP_PEER_D)
+
+  ; ==================================================================
+  ;  1. GENET, BRIEFLY
+  ; ==================================================================
+  ; pi4GenetProbe.pi4 is the file for diagnosing layer 2. These are the
+  ; four readings without which nothing above them means anything.
+  Say("1. the wire")
+  ok = GenetProbe()
+  HexLine("SYS_REV_CTRL   ", GenetRevision(), 8)
+  Line("probe ok       ", ok)
+  If ok = 0
+    WhyGenet()
+    Say("=== stopping: the GENET block did not answer. Run pi4GenetProbe ===")
+    ProcedureReturn 0
+  EndIf
+
+  phy = GenetPhyScan()
+  Line("PHY address    ", phy)
+  If phy < 0
+    WhyGenet()
+    Say("=== stopping: no PHY. Run pi4GenetProbe ===")
+    ProcedureReturn 0
+  EndIf
+  HexLine("PHY id         ", GenetPhyId(), 8)
+
+  ok = GenetPhyWaitLink(#NP_LINK_MS)
+  Line("link           ", ok)
+  If ok = 0
+    WhyGenet()
+    Say("  (no cable, or nothing on the other end)")
+  EndIf
+  If GenetPhyResolve() = 1
+    Line("speed Mbit/s   ", GenetSpeed())
+    Line("full duplex    ", GenetFullDuplex())
+  EndIf
+  PrintNl()
+
+  ; ==================================================================
+  ;  2. THE PROTOCOL LAYER, WITH NO WIRE INVOLVED
+  ; ==================================================================
+  ; The stage that keeps its value forever, and the one that says
+  ; whether a later failure is out on the bench or in this tree. Two
+  ; real frames go in and two real replies must come out, and neither
+  ; the MAC nor the cable nor the switch is in the path.
+  Say("2. protocol self-test, off the wire")
+  Say("  (the canned frames are addressed to 192.168.1.50, so the")
+  Say("   stack is configured to that address for this stage only)")
+
+  Line("set mac        ", NetSetMac(#HW_LINK_WIRED, @npMac[0]))
+  Line("set 192.168.1.50", NpCannedConfig())
+
+  ; --- a real ARP request for us ---
+  r = NetInput(#HW_LINK_WIRED, @npArp[0], 60)
+  Line("ARP in  -> code", r)
+  Line("  reply octets ", NetOutLen())
+  If r <> 1
+    WhyNet()
+  EndIf
+  If NetOutLen() = 60
+    HexLine("  opcode (want 0002)", (PeekA(NetOutBuf() + 20) << 8) | PeekA(NetOutBuf() + 21), 4)
+    MacLine("  reply goes to", NetOutBuf())
+    MacLine("  and comes from", NetOutBuf() + 6)
+    HexLine("  our IP in it ", (PeekA(NetOutBuf() + 28) << 24) | (PeekA(NetOutBuf() + 29) << 16) | (PeekA(NetOutBuf() + 30) << 8) | PeekA(NetOutBuf() + 31), 8)
+    ; The pad. Eighteen zeros, and they must be zeros - see PADDING in
+    ; net.pi4's header. A non-zero here is the board's own memory
+    ; leaking onto the network.
+    n = 0
+    For i = 42 To 59
+      If PeekA(NetOutBuf() + i) <> 0
+        n = n + 1
+      EndIf
+    Next
+    Line("  non-zero pad ", n)
+  EndIf
+
+  ; --- a real ICMP echo request ---
+  ; Its two checksums are both correct in the canned bytes, so this
+  ; grades verification in both directions at once: a library that skips
+  ; the check and a library that computes it wrongly both fail here.
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Line("echo in -> code", r)
+  Line("  reply octets ", NetOutLen())
+  If r <> 1
+    WhyNet()
+  EndIf
+  If NetOutLen() = 74
+    Line("  ICMP type (want 0)", PeekA(NetOutBuf() + 34))
+    Line("  ICMP code (want 0)", PeekA(NetOutBuf() + 35))
+    HexLine("  identifier (want 0001)", (PeekA(NetOutBuf() + 38) << 8) | PeekA(NetOutBuf() + 39), 4)
+    HexLine("  sequence (want 0025) ", (PeekA(NetOutBuf() + 40) << 8) | PeekA(NetOutBuf() + 41), 4)
+    Line("  TTL (want 64)", PeekA(NetOutBuf() + 22))
+    HexLine("  ver/IHL (want 45)", PeekA(NetOutBuf() + 14), 2)
+    ; The payload must come back unchanged. That is the whole contract
+    ; of an echo, and it is what the pinging host matches on.
+    n = 0
+    For i = 0 To 31
+      If PeekA(NetOutBuf() + 42 + i) <> npEcho[42 + i]
+        n = n + 1
+      EndIf
+    Next
+    Line("  payload octets changed (want 0)", n)
+  EndIf
+
+  ; --- the same echo with one payload octet flipped and the checksum
+  ;     left alone. It must be REFUSED. ---
+  npEcho[45] = npEcho[45] ! $01
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("corrupt echo   ", r, #NET_E_ICMP_CKSUM)
+  npEcho[45] = npEcho[45] ! $01
+  PrintNl()
+
+  ; ==================================================================
+  ;  3. THE REAL CONFIGURATION
+  ; ==================================================================
+  Say("3. configuration")
+  NetArpFlush(#HW_LINK_WIRED)
+  ok = NetSetIPv4(#HW_LINK_WIRED, npIp, npMask, npGw)
+  Line("set ipv4       ", ok)
+  If ok = 0
+    WhyNet()
+    Say("=== stopping: the address, mask or gateway was refused ===")
+    ProcedureReturn 0
+  EndIf
+  MacLine("mac            ", @npMac[0])
+  DotLine("address        ", NetIPv4(#HW_LINK_WIRED))
+  DotLine("netmask        ", NetMask(#HW_LINK_WIRED))
+  DotLine("gateway        ", NetGateway(#HW_LINK_WIRED))
+  DotLine("subnet bcast   ", NetSubnetBroadcast(#HW_LINK_WIRED))
+  DotLine("peer           ", npPeer)
+  Line("configured     ", NetConfigured(#HW_LINK_WIRED))
+  Line("udp bind       ", NetUdpBind(#HW_LINK_WIRED, #NP_UDP_PORT))
+  Line("udp port       ", NetUdpBoundPort(#HW_LINK_WIRED))
+  PrintNl()
+
+  ; ==================================================================
+  ;  4. BRING THE MAC UP
+  ; ==================================================================
+  ; After the protocol self-test, so that a failure here is unambiguous:
+  ; everything above this line has already been proved.
+  Say("4. bring-up")
+  Line("set mac        ", GenetSetMac(@npMac[0]))
+  Line("set rx region  ", GenetSetRxRegion(#NP_RX_REGION, #NP_RX_BYTES))
+  ok = GenetStart(#NP_LINK_MS)
+  Line("start ok       ", ok)
+  If ok = 0
+    WhyGenet()
+    Say("=== stopping: the MAC is not up. The refusal suite still runs ===")
+  EndIf
+  If ok = 1
+    Line("MAC-side link  ", GenetMacLinkStatus())
+    HexLine("UMAC_CMD raw   ", GenetUmacCmd(), 8)
+    HexLine("OOB raw        ", GenetOobCtrl(), 8)
+  EndIf
+  PrintNl()
+
+  If ok = 1
+    ; ================================================================
+    ;  5. ARP FOR THE GATEWAY
+    ; ================================================================
+    ; The first thing that needs the network to answer. Two seconds, in
+    ; eight clock-bounded slices.
+    Say("5. ARP for the gateway")
+    DotLine("asking for     ", npGw)
+    r = NetArpRequest(#HW_LINK_WIRED, npGw)
+    Line("built          ", r)
+    Line("octets         ", NetOutLen())
+    If r = 0
+      WhyNet()
+    Else
+      sent = GenetSend(NetOutBuf(), NetOutLen(), #NP_TX_MS)
+      Line("sent           ", sent)
+      If sent = 0
+        WhyGenet()
+      EndIf
+    EndIf
+    got = 0
+    i = 0
+    While i < #NP_ANSWER_SLICES
+      NpPump(#NP_ANSWER_SLICE_MS)
+      If NetArpLookup(#HW_LINK_WIRED, npGw, @npPeerMac[0]) = 1
+        got = 1
+        Break
+      EndIf
+      i = i + 1
+    Wend
+    Line("slices used    ", i + 1)
+    Line("resolved       ", got)
+    If got = 1
+      MacLine("gateway mac    ", @npPeerMac[0])
+    Else
+      Say("  the gateway did not answer. Stage 6 still works - it")
+      Say("  answers what comes to it and needs nothing resolved.")
+    EndIf
+    Line("arp entries    ", NetArpCount(#HW_LINK_WIRED))
+    PrintNl()
+
+    ; ================================================================
+    ;  6. THIRTY SECONDS OF ANSWERING - THE STAGE TO PING INTO
+    ; ================================================================
+    Say("6. serving. PING THE BOARD NOW:")
+    UartWriteStr("     ping ")
+    PrintDec((npIp >> 24) & $FF)
+    UartWrite(46)
+    PrintDec((npIp >> 16) & $FF)
+    UartWrite(46)
+    PrintDec((npIp >> 8) & $FF)
+    UartWrite(46)
+    PrintDec(npIp & $FF)
+    PrintNl()
+    Say("  thirty seconds, in sixty half-second slices. A DURATION,")
+    Say("  not a poll count - see GenetRecvWait in genet.pi4.")
+    npFramesIn = 0
+    npRepliesOut = 0
+    npArpAnswered = 0
+    npPingAnswered = 0
+    npUdpIn = 0
+    npSendFail = 0
+    i = 0
+    While i < #NP_SERVE_SLICES
+      NpPump(#NP_SERVE_SLICE_MS)
+      i = i + 1
+    Wend
+    Line("frames in      ", npFramesIn)
+    Line("replies out    ", npRepliesOut)
+    Line("arp answered   ", npArpAnswered)
+    Line("ping answered  ", npPingAnswered)
+    Line("udp received   ", npUdpIn)
+    Line("send failures  ", npSendFail)
+    Line("net ignored    ", NetDropCount())
+    Line("genet rx count ", GenetRxCount())
+    Line("genet tx count ", GenetTxCount())
+    Line("arp entries    ", NetArpCount(#HW_LINK_WIRED))
+    If npPingAnswered > 0
+      Say("  >>> THE BOARD ANSWERED A PING. <<<")
+    EndIf
+    PrintNl()
+
+    ; ================================================================
+    ;  7. OUTBOUND - A PING AND A DATAGRAM
+    ; ================================================================
+    Say("7. outbound")
+    Line("peer resolved  ", NpEnsurePeer())
+
+    got = 0
+    i = 1
+    While i <= 4
+      ; RE-RESOLVE BEFORE EVERY BUILD, not once before the loop. The
+      ; loop runs for seconds and an ARP entry has a lifetime; asking
+      ; once at the top and trusting the answer four pings later is
+      ; what produced the contradiction of 2026-08-26. NpEnsurePeer is
+      ; free when the address is already known.
+      If NpEnsurePeer() = 0
+        Line("peer lost      ", i)
+        Say("  the peer stopped answering ARP part way through the loop.")
+        Break
+      EndIf
+      r = NetPingBuild(#HW_LINK_WIRED, npPeer, $4321, i, 32)
+      If r = 0
+        Line("ping build     ", r)
+        WhyNet()
+        If NetError() = #NET_E_NO_ARP
+          Say("  THE LINE ABOVE CONTRADICTS THE LINE BEFORE IT. The address")
+          Say("  was resolved microseconds ago and is unknown now. That is")
+          Say("  an internal inconsistency in net.pi4, not a network fault:")
+          Say("  report this whole stage rather than re-cabling anything.")
+        EndIf
+        Break
+      EndIf
+      If GenetSend(NetOutBuf(), NetOutLen(), #NP_TX_MS) = 0
+        WhyGenet()
+        Break
+      EndIf
+      n = 0
+      While n < 4
+        If NpPump(250) = 3
+          got = got + 1
+          Break
+        EndIf
+        n = n + 1
+      Wend
+      i = i + 1
+    Wend
+    Line("pings sent     ", i - 1)
+    Line("replies        ", got)
+    If got > 0
+      DotLine("last reply from", NetPongFrom())
+      Line("last identifier", NetPongIdent())
+      Line("last sequence  ", NetPongSeq())
+      Line("payload octets ", NetPongBytes())
+    EndIf
+
+    i = 0
+    While i < 32
+      npUdpOut[i] = 97 + (i % 23)
+      i = i + 1
+    Wend
+    If NpEnsurePeer() = 0
+      Line("udp built      ", 0)
+      Say("  not attempted: the peer's hardware address is not known.")
+      r = 0
+    Else
+      r = NetUdpBuild(#HW_LINK_WIRED, npPeer, #NP_UDP_PORT, 5555, @npUdpOut[0], 32)
+      Line("udp built      ", r)
+    EndIf
+    If r = 0
+      WhyNet()
+    Else
+      Line("udp octets     ", NetOutLen())
+      Line("udp sent       ", GenetSend(NetOutBuf(), NetOutLen(), #NP_TX_MS))
+    EndIf
+    PrintNl()
+  EndIf
+
+  ; ==================================================================
+  ;  8. THE REFUSALS
+  ; ==================================================================
+  ; Every documented refusal in net.pi4, provoked deliberately. A
+  ; refusal that stops firing is a refusal somebody deleted, and this is
+  ; the only place that would notice.
+  ;
+  ; IT RUNS LAST AND IT LEAVES THE STACK UNCONFIGURED. NetReset() is the
+  ; only way to get back to "no MAC address has been set", so nothing
+  ; that needs the network can come after this.
+  Say("8. the refusals")
+
+  ; STAGE 8 ESTABLISHES ITS OWN PRECONDITIONS, and until 2026-08-26 it
+  ; did not. It replays stage 2's canned frames and it builds to
+  ; addresses chosen for stage 2's canned subnet - but by the time it
+  ; runs, stage 3 has reconfigured the stack to the real bench address
+  ; and stages 6 and 7 have filled the ARP cache. Two of its cases
+  ; therefore reported the wrong answer, and BOTH were this file's
+  ; fault rather than net.pi4's:
+  ;
+  ;   "bad ICMP cksum" wanted -112 and got 0. npEcho is addressed to
+  ;   192.168.1.50 and the board was 169.254.183.50, so net_RecvIp's
+  ;   destination filter returned #NET_IN_IGNORED before the ICMP
+  ;   checksum was ever computed. Every OTHER npEcho case in this stage
+  ;   kept working only because each provokes a HEADER check - version,
+  ;   IHL, header checksum, fragment, total length - and every one of
+  ;   those runs BEFORE the destination filter. This is the only case in
+  ;   the stage that has to get past it, so it is the only one that
+  ;   broke, which is exactly why the failure looked inexplicable.
+  ;
+  ;   "unresolved host" wanted -118 and got 0. It builds to
+  ;   192.168.1.201, which is OFF-LINK under 169.254.0.0/16, so
+  ;   NetRouteMac resolved THE GATEWAY - cached by then - and the build
+  ;   succeeded. The case was never testing an unresolved host at all.
+  ;   Under the canned /24 that address is on-link, and the flush below
+  ;   guarantees it is unknown.
+  ;
+  ; The general rule, and the reason this is written out at length: a
+  ; stage that consumes fixtures must configure the machine those
+  ; fixtures were made for. Inheriting whatever the previous stage left
+  ; behind is how a suite starts grading a different question from the
+  ; one its labels claim.
+  NetArpFlush(#HW_LINK_WIRED)
+  Line("canned config  ", NpCannedConfig())
+
+  ; --- things that need no configuration at all ---
+  NetInput(#HW_LINK_WIRED, 0, 60)
+  Refusal("null frame     ", NetError(), #NET_E_ARG)
+
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 13)
+  Refusal("13-byte frame  ", r, #NET_E_SHORT)
+
+  ; --- malformed IPv4, each field broken one at a time ---
+  npEcho[14] = $65                                   ; version 6, IHL 5
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("version 6      ", r, #NET_E_IP_VERSION)
+  npEcho[14] = $44                                   ; version 4, IHL 4
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("IHL 4          ", r, #NET_E_IP_HEADER)
+  npEcho[14] = $45
+
+  npEcho[24] = npEcho[24] ! $01                      ; header checksum
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("bad IP cksum   ", r, #NET_E_IP_CKSUM)
+  npEcho[24] = npEcho[24] ! $01
+
+  npEcho[20] = $60                                   ; DF and More Fragments
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("fragment (MF)  ", r, #NET_E_FRAGMENT)
+  npEcho[20] = $40
+  npEcho[21] = $01                                   ; a fragment offset
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("fragment (off) ", r, #NET_E_FRAGMENT)
+  npEcho[21] = $00
+
+  npEcho[17] = $FF                                   ; total length 255
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("total too long ", r, #NET_E_IP_LENGTH)
+  npEcho[17] = $3C
+
+  npEcho[36] = npEcho[36] ! $01                      ; ICMP checksum
+  r = NetInput(#HW_LINK_WIRED, @npEcho[0], 74)
+  Refusal("bad ICMP cksum ", r, #NET_E_ICMP_CKSUM)
+  npEcho[36] = npEcho[36] ! $01
+
+  ; --- ARP ---
+  r = NetInput(#HW_LINK_WIRED, @npArp[0], 20)
+  Refusal("short ARP      ", r, #NET_E_ARP_SHORT)
+  npArp[15] = $02                                    ; hardware type 2
+  r = NetInput(#HW_LINK_WIRED, @npArp[0], 60)
+  Refusal("ARP not ethernet", r, #NET_E_ARP_PROTO)
+  npArp[15] = $01
+
+  ; --- receiving into our own staging buffer ---
+  r = NetInput(#HW_LINK_WIRED, NetOutBuf(), 60)
+  Refusal("rx into out buf", r, #NET_E_ARG)
+
+  ; --- builders ---
+  r = NetUdpBuild(#HW_LINK_WIRED, NetMakeIPv4(192, 168, 1, 201), 7777, 5555, @npUdpOut[0], 32)
+  Refusal("unresolved host", NetError(), #NET_E_NO_ARP)
+  NetUdpBuild(#HW_LINK_WIRED, npPeer, 7777, 5555, @npUdpOut[0], 1473)
+  Refusal("payload 1473   ", NetError(), #NET_E_TOO_BIG)
+  NetUdpBuild(#HW_LINK_WIRED, npPeer, 0, 5555, @npUdpOut[0], 4)
+  Refusal("port 0         ", NetError(), #NET_E_PORT)
+  NetPingBuild(#HW_LINK_WIRED, npPeer, 1, 1, 1473)
+  Refusal("ping 1473      ", NetError(), #NET_E_TOO_BIG)
+
+  ; --- configuration ---
+  NetSetIPv4(#HW_LINK_WIRED, npIp, NetMakeIPv4(255, 0, 255, 0), 0)
+  Refusal("mask 255.0.255.0", NetError(), #NET_E_MASK)
+  NetSetIPv4(#HW_LINK_WIRED, npIp, npMask, NetMakeIPv4(10, 0, 0, 1))
+  Refusal("gateway off-net", NetError(), #NET_E_GATEWAY)
+  NetSetMac(#HW_LINK_WIRED, @npArp[0])                               ; six $FF - a group address
+  Refusal("broadcast mac  ", NetError(), #NET_E_ARG)
+
+  ; --- off-link with no gateway. Reconfigure without one first. ---
+  NetSetIPv4(#HW_LINK_WIRED, npIp, npMask, 0)
+  NetUdpBuild(#HW_LINK_WIRED, NetMakeIPv4(8, 8, 8, 8), 53, 5555, @npUdpOut[0], 4)
+  Refusal("no gateway     ", NetError(), #NET_E_NO_ROUTE)
+
+  ; --- and finally, nothing configured at all ---
+  NetReset()
+  r = NetInput(#HW_LINK_WIRED, @npArp[0], 60)
+  Refusal("no mac, input  ", r, #NET_E_NO_MAC)
+  NetArpRequest(#HW_LINK_WIRED, npGw)
+  Refusal("no mac, arp    ", NetError(), #NET_E_NO_MAC)
+  NetSetMac(#HW_LINK_WIRED, @npMac[0])
+  NetArpRequest(#HW_LINK_WIRED, npGw)
+  Refusal("no ip, arp     ", NetError(), #NET_E_NO_IP)
+  PrintNl()
+
+  Say("=== done. The stack is left UNCONFIGURED by stage 8. ===")
+  ProcedureReturn 0
+EndProcedure

@@ -208,10 +208,6 @@ def stage(work: pathlib.Path, view_text: str, console_text: str) -> pathlib.Path
             shutil.copytree(src, work / "RaspberryPi4" / name, dirs_exist_ok=True)
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
-    # PMF_ROOT is the ONLY place the compiler looks for its keyword table.
-    for loose in ("keywords.def",):
-        if (ROOT / loose).is_file():
-            shutil.copy2(ROOT / loose, work / loose)
     return work / "RaspberryPi4" / "Tests" / GATE.name
 
 

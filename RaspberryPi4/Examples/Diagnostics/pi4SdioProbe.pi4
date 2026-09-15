@@ -1,0 +1,1225 @@
+; pi4SdioProbe.pi4 - the second SD controller, the SDIO bus on it, and
+; the CYW43455 radio at the end of it. Everything that can be learned
+; about the Pi 4's WiFi part WITHOUT firmware, printed in one pass.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is the artefact tools/a64/a64_sdio_check.py runs. Its output
+; format is therefore load-bearing: the gate reads values back out of
+; the serial log by label, so a label changed here changes the gate.
+;
+; ======================================================================
+; WHAT IT DOES, AND THE ORDER MATTERS
+; ======================================================================
+;   1. THE FIRMWARE HALF. The power-device table, the EMMC clock's
+;      state, and WL_ON. All three go through the property mailbox and
+;      all three are now sdio.pi4's own code rather than this file's -
+;      this file calls SdioAssertWlOn() and prints the ladder it left
+;      behind. See THE POWER RAIL in RaspberryPi4/Lib/sdio.pi4 for why
+;      that moved and what it cost to leave it here.
+;
+;   2. THE BASE CLOCK, from the mailbox, for clock id 1 (EMMC). NOT 12
+;      (EMMC2) - those are different clocks on this chip and only one of
+;      them feeds the controller at $FE300000. sdio.pi4 refuses rather
+;      than guessing, which is why this step exists.
+;
+;   3. THE RAW REGISTERS, PRINTED BEFORE ANY OPINION IS FORMED. Host
+;      Controller Version and both Capabilities words for this
+;      controller, and the same three for EMMC2 next door as a control.
+;      This is new, and it is the whole lesson of the first bench run:
+;      the diagnostic printed a confident wrong conclusion and none of
+;      the evidence, so the evidence had to be read out of a monitor
+;      prompt by hand before the conclusion could be seen to be
+;      wrong. Three extra lines would have saved that.
+;
+;   4. SdioInit() - reset, power, 400 kHz, CMD0, CMD5, CMD3, CMD7, 25
+;      MHz, four-bit bus.
+;
+;   5. Enable SDIO functions 1 and 2.
+;
+;   6. Cyw43Attach() - block sizes, the ALP clock sequence, the chip ID,
+;      the core walk.
+;
+;   7. BLOCK-MODE CMD53, COMPARED AGAINST BYTE MODE. Added 2026-08-26,
+;      and it is the only section here that is an EXPERIMENT rather than
+;      a report. One region of the chip is read twice in byte mode - the
+;      control, which proves the region reads the same twice - and once
+;      in block mode, and the three results are diffed. Section 5c says
+;      what each outcome means.
+;
+;   8. THE CORES GO DOWN AND THE CHIP IS ASKED HOW MUCH RAM IT HAS.
+;      The first WRITES this program has ever made to the radio. The ARM
+;      CR4 is brought out of reset but HALTED, the 802.11 core is
+;      disabled, and the CR4's memory banks are walked for a RAM size.
+;      Then a 256-byte pattern is written into that RAM and read back.
+;
+;   9. Ask for the things that STILL cannot work, and print the
+;      refusals. That is not padding: it is the honest state of the
+;      work. The list is shorter than it was - firmware upload and start
+;      are implemented as of 2026-08-26 - and what remains is refused
+;      because the SDPCM transport is not written, NOT because of a
+;      licence. See THE FIRMWARE in RaspberryPi4/Lib/cyw43.pi4.
+;
+; ======================================================================
+; WHAT THIS PROGRAM STILL CANNOT DO, AND IT IS ARITHMETIC, NOT PERMISSION
+; ======================================================================
+; It does not upload firmware, because it has nowhere to upload FROM.
+; The image is 609,309 bytes and this diagnostic is a few tens of
+; kilobytes; the blob cannot be compiled into it. The image and the CLM
+; blob are in the repository at Firmware/CYW43455/ (the NVRAM is board
+; data and is not) and the library's
+; Cyw43UploadFirmware takes a pointer and a length, so what is missing
+; is a way to get 609 KB into the Pi's own RAM at run time. There are
+; two, and choosing between them is a separate job with its own risks:
+;
+;   * fat.pi4 reads real FAT32 off the boot medium and is proven on
+;     silicon. The host copies the three files onto the stick once.
+;     WRITING to that stick can damage the boot image; READING cannot,
+;     and reading is all this needs.
+;
+;   * Anvil's serial `receive` puts them in RAM over the wire. Slower,
+;     needs no change to the stick, and needs no new code in the radio
+;     path at all.
+;
+; Either way cyw43.pi4 does not care which, and this program is
+; deliberately not the one that chooses.
+;
+; ======================================================================
+; WHERE IT STOPPED LAST TIME, AND WHAT EACH STOPPING POINT MEANS
+; ======================================================================
+; THE FIRST RUN ON SILICON WAS 2026-08-26 AND IT STOPPED AT THE BUS:
+;
+;     mailbox init (want 1)    1
+;     WL_ON asserted (want 1)  0
+;     EMMC clock Hz (id 1)     250000000
+;     SdioInit (want 1)        0
+;     sdio: Capabilities register all-zero or all-ones - wrong device?
+;     last cmd $FF  last intr $00000000  last state $000F0001
+;
+; BOTH DIAGNOSES IN THAT LOG WERE WRONG. Both are fixed.
+;
+;   THE CAPABILITIES MESSAGE sent the bench looking at the base address,
+;   and the base address was right. Read by hand afterwards: $FE3000FC
+;   returned $99020000, which is Host Controller Version $9902 - spec
+;   version 2, SDHCI 3.00, vendor $99 - from a block that is plainly
+;   decoding, while EMMC2 at $FE3400FC returned $10020000 as a control.
+;   An all-zero Capabilities register on THIS controller is normal:
+;   Raspberry Pi Linux rpi-6.12.y drivers/mmc/host/bcm2835-mmc.c, the driver
+;   Raspberry Pi binds to this node, reads SDHCI_CAPABILITIES exactly
+;   once (lines 255-257) and only to print it in a debug dump. sdio.pi4
+;   no longer refuses over it.
+;
+;   THE 250000000 IS NOT EVIDENCE THAT THE CLOCK IS RUNNING either, and
+;   this file used to imply that it was. GET_CLOCK_RATE returns the rate
+;   a clock WOULD run at - "Next enable rate should be returned even if
+;   the clock is not running",
+;   the Raspberry Pi firmware's Mailbox property interface document,
+;   line 310 of the copy read.
+;   The on/off fact is GET_CLOCK_STATE bit 0, and it is printed now.
+;
+;   THE WL_ON FAILURE had two candidate causes in this file's own nine
+;   lines and both were real bugs. GET_GPIO_CONFIG was asked for with a
+;   twenty-four byte payload, but struct gpio_get_config is five words -
+;   twenty - and only struct gpio_set_config is six (expander driver
+;   lines 32-47). And the direction word was written as 0, which is
+;   RPI_EXP_GPIO_DIR_IN (line 22), so the pin was being configured as an
+;   INPUT while a state field it would then ignore said 1. Both are
+;   fixed, in sdio.pi4, which now owns the whole sequence and power-
+;   cycles the pin the way the bench-proven Pico driver does.
+;
+; THE REMAINING STOPPING POINTS, in the order they would be met:
+;
+;   "the word at $FE3000FC is all-zero or all-ones"
+;       NOW this really is the base address or the low-peripheral
+;       translation, because that word answered on 2026-08-26 and this
+;       message no longer fires for anything else. Compare against
+;       uart.pi4 reaching the PL011 at $FE201000, which has printed on
+;       this bench, and against the EMMC2 control rows this file prints
+;       directly above it.
+;
+;   "nothing answered CMD5"
+;       Read the WL_ON ladder at the top. Step 9 with level 1 means the
+;       firmware says the radio is powered and the fault is further
+;       along - the pin mux, or the bus. Anything less than 9 names the
+;       transaction that failed; SdioWlOnStep in sdio.pi4 lists what
+;       each rung means.
+;
+;   "CHIPCLKCSR did not read back what was written"
+;       The SDIO layer works and function 1 does not. Almost always the
+;       function enable, occasionally the block size.
+;
+;   "chip ID reads all-zero"
+;       ALP never really came up, or the backplane window registers went
+;       somewhere else. The window is the likeliest: check that the
+;       address written to SBADDRLOW is the address SHIFTED RIGHT EIGHT.
+;
+;   pmfc pi4SdioProbe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o sdio.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+
+; ======================================================================
+;  WHAT THIS FILE NO LONGER OWNS
+;
+;  It used to carry its own nine-line probe_WlOn() and its own copies of
+;  the expander constants. Both are gone and sdio.pi4 has them, because
+;  a bus driver whose device is unpowered is not a driver and because
+;  the diagnostic and the library had two chances to get the payload
+;  sizes right and got the same one wrong twice.
+;
+;  The constants that MOVED, with their citations, are in
+;  RaspberryPi4/Lib/sdio.pi4 near #SDIO_TAG_GET_POWER_STATE. The
+;  procedure that replaced probe_WlOn() is SdioAssertWlOn().
+;
+;  WHAT STAYS HERE is the sweep - see probe_PowerTable below - because
+;  it is a question a diagnostic asks once and a library should never
+;  ask at all.
+; ======================================================================
+
+; Mailbox clock id 1 = EMMC.
+; U-Boot v2025.01 arch/arm/mach-bcm283x/include/mach/mbox.h line 229.
+#PROBE_CLOCK_ID_EMMC = 1
+
+; Mailbox clock id 12 = EMMC2, the micro-SD controller's clock. Printed
+; alongside id 1 ONLY as a control, exactly as the EMMC2 registers are:
+; two clocks, one of which is known to be feeding a working controller.
+; U-Boot v2025.01 arch/arm/mach-bcm283x/include/mach/mbox.h line 239.
+#PROBE_CLOCK_ID_EMMC2 = 12
+
+; ----------------------------------------------------------------------
+;  AND EMMC2's THREE REGISTERS ARE **NOT** DEFINED HERE, DELIBERATELY.
+;
+;  They would be the perfect control - $FE3400FC read $10020000 and
+;  $FE340040 read $45EE6432 on 2026-08-26, which is what proved our MMIO
+;  reads were fine and turned the Capabilities verdict over - and this
+;  program still does not read them. Two reasons, and the second is the
+;  real one:
+;
+;    * sdio.pi4's header states the invariant plainly: "Nothing in this
+;      file touches $FE340000 and nothing in emmc.pi4 touches
+;      $FE300000." A diagnostic that quietly reaches into the other
+;      controller's window is the first crack in that, and the window it
+;      would reach into belongs to the boot medium.
+;
+;    * tools/a64/a64_sdio_check.py enforces it. Any access outside the
+;      mmcnr node's declared window aborts the gate with "if that is
+;      inside another SD controller's window, the library has the wrong
+;      base address". That check is worth more than three log lines.
+;
+;  So the control rows are read from the monitor prompt instead, by
+;  hand, and the addresses are printed by this program so that they
+;  never have to be looked up again. See probe_RawRegisters.
+; ----------------------------------------------------------------------
+
+; The three registers this program IS entitled to read. ARM
+; $FE300000, from mmcnr@7e300000 - Raspberry Pi Linux rpi-6.12.y
+; arch/arm/boot/dts/broadcom/bcm270x.dtsi lines 50-60. The offsets are
+; SDHCI's:
+; SDHCI_CAPABILITIES $40 and SDHCI_CAPABILITIES_1 $44
+; (rpi-6.12.y drivers/mmc/host/sdhci.h lines 210 and 231), and
+; SDHCI_HOST_VERSION is the
+; 16-bit register at $FE, so the whole word at $FC carries it in its top
+; half. READ ONLY, here. Everything that writes to this window is
+; sdio.pi4's.
+#PROBE_SDIO_VER  = $FE3000FC
+#PROBE_SDIO_CAP0 = $FE300040
+#PROBE_SDIO_CAP1 = $FE300044
+
+
+; ======================================================================
+;  THE TWO COMPARISON BUFFERS, and why there are two of them.
+;
+;  Every experiment below reads the same region of the chip twice and
+;  diffs the results, so it needs two buffers that exist at the same
+;  time. They are Dim arrays of .l because a Dim array lands 8-byte
+;  aligned on this backend - more than the 4 that CMD53's contract asks
+;  for - which is the same note fat.pi4 makes about its sector buffers.
+;
+;  256 BYTES IS FOUR OF FUNCTION 1'S 64-BYTE BLOCKS, which is the
+;  smallest size that exercises what actually had to be written today:
+;  one block proves nothing about the per-block re-arm, two proves the
+;  loop runs twice, and four is enough that an off-by-one in the block
+;  arithmetic lands somewhere visible. It is also small enough to sit
+;  comfortably inside the EROM table, which the read comparison depends
+;  on - see section 5c.
+; ======================================================================
+#PROBE_XFER_BYTES = 256
+Global Dim probe_bufA.l[#PROBE_XFER_BYTES / 4]
+Global Dim probe_bufB.l[#PROBE_XFER_BYTES / 4]
+
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_Count - print a comparison result that is allowed to say it
+;  never happened.
+;
+;  A NEGATIVE COUNT MEANS NOT COMPARED, and it prints as those words
+;  rather than as a number. This exists because of one line in the
+;  2026-08-26 bench log:
+;
+;      control mismatches (want 0)  0
+;
+;  printed while both of the reads it was comparing had failed and
+;  nothing at all had been walked. Zero mismatches out of zero bytes is
+;  arithmetically true, reads as a pass, and was the single most
+;  misleading line in the run. Every count in this program that can be
+;  skipped now goes through here.
+; ----------------------------------------------------------------------
+Procedure probe_Count(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  If v < 0
+    UartWriteStr("NOT COMPARED - the reads it needed did not both succeed")
+  Else
+    PrintDec(v)
+  EndIf
+  PrintNl()
+EndProcedure
+
+Procedure TextLine(*name, *value)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  UartWriteStr(*value)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_PowerTable - GET_POWER_STATE for every device id any source on
+;  this disk names, printed as a table.
+;
+;  THIS IS HERE BECAUSE NO FILE ON THIS DISK ANSWERS THE QUESTION, and a
+;  single bench run does. The two sources disagree about what device id
+;  0 even is:
+;
+;      U-Boot v2025.01 arch/arm/mach-bcm283x/include/mach/mbox.h line 177
+;          #define BCM2835_MBOX_POWER_DEVID_SDHCI   0
+;      the firmware's Mailbox property interface document, line 168
+;          * 0x00000000: SD Card
+;
+;  and the same document lists ids 9 and 10 as "Unknown (RPi4)" at lines
+;  177-178, which is a written admission that the table was never
+;  updated for this part. The reply's bit 1 is the firmware saying "no
+;  such device" (lines 190-193), so a sweep separates the ids that exist
+;  on a BCM2711 from the ids that were only ever BCM2835's.
+;
+;  Nothing is set. This reads.
+; ----------------------------------------------------------------------
+Procedure probe_PowerTable()
+  Define id.i
+  Define s.i
+
+  For id = 0 To 10
+    s = SdioQueryPowerState(id)
+    UartWriteStr("  power devid ")
+    PrintDec(id)
+    UartWriteStr("  state ")
+    PrintDec(s)
+    If s < 0
+      UartWriteStr("  (not asked - mailbox refused)")
+    Else
+      If (s & #SDIO_MBX_STATE_NODEV) <> 0
+        ; Bit 1 of a RESPONSE means the device does not exist. In a
+        ; SET_POWER_STATE REQUEST the same bit means "wait for the
+        ; rail"; it is only a no-such-device flag on the way back. Both
+        ; constants are sdio.pi4's, with the citations attached there.
+        UartWriteStr("  no such device")
+      Else
+        If (s & #SDIO_MBX_STATE_ON) <> 0
+          UartWriteStr("  exists, ON")
+        Else
+          UartWriteStr("  exists, off")
+        EndIf
+      EndIf
+    EndIf
+    PrintNl()
+  Next
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  probe_RawRegisters - the three words that decide whether the block is
+;  there, for BOTH SDHCI-class controllers, before anything judges them.
+;
+;  THIS IS THE FIX FOR THE FIRST BENCH RUN. The log said "wrong device?"
+;  and printed four status words, none of which was the register the
+;  message was about. The two numbers that settled it - $FE3000FC and
+;  $FE300040 - had to be read out of a monitor prompt afterwards. A
+;  diagnostic that names a register in its verdict must print that
+;  register.
+;
+;  IT READS THE ADDRESSES ITSELF rather than calling sdio.pi4's
+;  accessors, and that is deliberate: those accessors hold nothing until
+;  SdioInit() has run, and the whole point of these three rows is to
+;  exist BEFORE the library has formed an opinion. It is also a second,
+;  independent reading of the same window by a second file, which is
+;  worth something on a bring-up where the address itself was the
+;  suspect for a day.
+;
+;  THE CONTROL IS NAMED, NOT READ. See the comment beside
+;  #PROBE_SDIO_VER for why this program will not touch $FE34xxxx. The
+;  three addresses are printed so the next person can paste them into
+;  the monitor instead of deriving them, and the values recorded on
+;  2026-08-26 are printed beside them so a disagreement is visible
+;  without going back through the handoffs.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  probe_FirmwareHalfReport - everything SdioInit's firmware half did,
+;  printed on the success path and the failure path alike.
+;
+;  THE ATTEMPT, NOT JUST THE AFTERMATH. The first bench run reported
+;  "clock state before 0 / clock state after 0" and that single pair is
+;  compatible with three completely different stories: the set was never
+;  sent, the set was sent and the firmware refused it, or the set was
+;  accepted and the clock did not move. Each needs a different next
+;  step, and the log could not choose between them. So the reply word
+;  and the mailbox error from the set itself are printed here.
+;
+;  A REPLY OF -1 MEANS THE TRANSACTION NEVER COMPLETED. It is not a
+;  state word. The mailbox error on the next line is then the reason,
+;  and #MBX_ERR_TAG (8) in particular means the firmware came back and
+;  declined to service the tag at all.
+; ----------------------------------------------------------------------
+Procedure probe_FirmwareHalfReport()
+  HexLine("host version raw ", SdioHostVersionRaw(), 8)
+  HexLine("capabilities 0   ", SdioCaps0(), 8)
+  HexLine("capabilities 1   ", SdioCaps1(), 8)
+  Line("caps read as zero", SdioCapsAreZero())
+  Line("mailbox was used ", SdioMailboxUsed())
+  Line("clock state before", SdioClockStateBefore())
+  Line("clock set reply  ", SdioClockSetReply())
+  Line("clock set mbx err", SdioClockSetError())
+  TextLine("clock set meaning", SdioMailboxErrorText(SdioClockSetError()))
+  ; The control for the same question: a SET-type tag that has been seen
+  ; to PASS the per-tag check on this firmware. If this reads 8 bytes
+  ; with MBX_OK while the two GPIO sets read 0 bytes with MBX_ERR_TAG,
+  ; the two cases are genuinely different and mailbox.pi4's strictness
+  ; is not on its own the explanation.
+  Line("clock set resp bytes", SdioClockSetRespBytes())
+  Line("clock state after", SdioClockStateAfter())
+  Line("clock Hz measured", SdioClockMeasured())
+  ; Read-only as of the second bench run. See sdio_EnableClockAndPower:
+  ; the firmware reported UART0 powered off while UART0 was printing,
+  ; so this file no longer acts on the power table. Before and after are
+  ; the same query and will agree; both are printed because a future
+  ; firmware that starts maintaining the table would show up here as a
+  ; disagreement, and that would be worth noticing.
+  Line("power state before", SdioPowerStateBefore())
+  Line("power state after", SdioPowerStateAfter())
+  Line("WL_ON step       ", SdioWlOnStep())
+  Line("WL_ON level      ", SdioWlOnLevel())
+  PrintNl()
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  probe_DecodeIntr - the Interrupt Status word, one named bit per line.
+;
+;  THE BENCH SHOULD NEVER HAVE TO DECODE $00048000 BY HAND AGAIN. It did,
+;  on 2026-08-26, and the decode was correct but it needed the header
+;  open beside the log. The names come from sdio.pi4's SdioIntBitName,
+;  which carries a line number from rpi-6.12.y_sdhci.h against every one
+;  of them.
+;
+;  Only the bits that are SET and that the header actually names are
+;  printed. A run with a clean status word prints one line saying so,
+;  which is more useful than thirty-two rows of nothing.
+; ----------------------------------------------------------------------
+Procedure probe_DecodeIntr(v.i)
+  Define i.i
+  Define shown.i
+
+  shown = 0
+  For i = 0 To 31
+    If ((v >> i) & 1) = 1
+      If SdioIntBitIsNamed(i) = 1
+        UartWriteStr("    bit ")
+        PrintDec(i)
+        UartWriteStr("  ")
+        UartWriteStr(SdioIntBitName(i))
+        PrintNl()
+        shown = shown + 1
+      Else
+        UartWriteStr("    bit ")
+        PrintDec(i)
+        UartWriteStr("  set, and the header names no such bit - suspect a bad read")
+        PrintNl()
+        shown = shown + 1
+      EndIf
+    EndIf
+  Next
+  If shown = 0
+    UartWriteStr("    no interrupt status bits are set")
+    PrintNl()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_DecodeR5 - the CMD52/CMD53 response, one named bit per line,
+;  and the reason it exists is the same as probe_DecodeIntr's.
+;
+;  ON 2026-08-26 THIS PROGRAM PRINTED "the card REFUSED the command -
+;  see SdioLastR5" AND STOPPED THERE. That sentence tells the reader that
+;  something is wrong and then asks for a search to find out what, from a
+;  variable, with the header open. The five R5 status bits are five
+;  unrelated faults - a length the function will not take, a function
+;  that is not enabled, an illegal command, a CRC failure - and knowing
+;  which one it was is the whole diagnosis. Printing the number and not
+;  the meaning is the instrument failing, not the bus.
+;
+;  Always prints the raw word too. A decoder can only name the bits its
+;  table knows; the raw value is what survives a table that is wrong.
+; ----------------------------------------------------------------------
+Procedure probe_DecodeR5(v.i)
+  Define i.i
+  Define shown.i
+
+  UartWriteStr("    R5 raw $")
+  PutHexN(v, 4)
+  UartWriteStr("   data byte $")
+  PutHexN(v & $FF, 2)
+  PrintNl()
+
+  shown = 0
+  For i = 8 To 15
+    If ((v >> i) & 1) = 1
+      If SdioR5BitIsNamed(i) = 1
+        UartWriteStr("    bit ")
+        PrintDec(i)
+        UartWriteStr("  ")
+        UartWriteStr(SdioR5BitName(i))
+        PrintNl()
+        shown = shown + 1
+      EndIf
+    EndIf
+  Next
+  If shown = 0
+    UartWriteStr("    no R5 status bit is set - the card did NOT refuse, so")
+    PrintNl()
+    UartWriteStr("    whatever failed, it was not the card objecting")
+    PrintNl()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_XferFailed - everything worth knowing about a failed bulk
+;  transfer, in one call, from both layers.
+;
+;  THE TWO LAYERS DISAGREE ABOUT WHAT WENT WRONG AND BOTH ARE RIGHT.
+;  cyw43.pi4 says "a bulk transfer failed" because that is all it knows;
+;  sdio.pi4 says which command, which block and which status bits. A log
+;  that carries only the first sends the reader to the wrong file.
+; ----------------------------------------------------------------------
+Procedure probe_XferFailed()
+  UartWriteStr("    ")
+  UartWriteStr(Cyw43ErrorText())
+  PrintNl()
+  UartWriteStr("    ")
+  UartWriteStr(SdioErrorText())
+  PrintNl()
+  Line("    failed on block ", SdioLastXferBlock())
+  probe_DecodeR5(SdioLastR5())
+  HexLine("    last intr       ", SdioLastIntr(), 8)
+  probe_DecodeIntr(SdioLastIntr())
+  HexLine("    present state   ", SdioLastStatus(), 8)
+EndProcedure
+
+
+
+; ----------------------------------------------------------------------
+;  probe_BusRegisters - what the controller's own registers hold, read
+;  back rather than assumed.
+;
+;  The bench asked for the divider that was ACTUALLY PROGRAMMED, which
+;  is a different claim from the divider this code computed. Both are
+;  printed, on the same screen, so a disagreement between them is
+;  visible instead of inferred.
+;
+;  THE PULL REGISTER IS HERE FOR A REASON. It held b10 - PULL DOWN - on
+;  CMD and DAT0..3 for the whole of this bring-up, because the device
+;  tree numbers pull-up as 2 and the BCM2711 register numbers 2 as
+;  pull-down. Bits 15:4 of the value below should now read $555 in
+;  their upper five fields: b01 five times for GPIO35..39, and b00 for
+;  GPIO34. See THE PULL ENCODING IS INVERTED in sdio.pi4.
+; ----------------------------------------------------------------------
+Procedure probe_BusRegisters()
+  HexLine("control0 ($28)   ", SdioControl0Raw(), 8)
+  HexLine("control1 ($2C)   ", SdioControl1Raw(), 8)
+  Line("divisor computed ", SdioDivisor())
+  Line("divisor in reg   ", SdioDivisorProgrammed())
+  Line("base clock kHz   ", SdioBaseClockKhz())
+  Line("bus clock kHz    ", SdioClockKhz())
+  HexLine("gpfsel3          ", SdioGpfsel3(), 8)
+  HexLine("gppup2 (want $550)", SdioGppup2() & $0000FFF0, 8)
+EndProcedure
+
+
+Procedure probe_RawRegisters()
+  HexLine("sdio  $FE3000FC ver ", PeekN(#PROBE_SDIO_VER), 8)
+  HexLine("sdio  $FE300040 cap0", PeekN(#PROBE_SDIO_CAP0), 8)
+  HexLine("sdio  $FE300044 cap1", PeekN(#PROBE_SDIO_CAP1), 8)
+  UartWriteStr("  control, read these from the monitor, not from here:")
+  PrintNl()
+  UartWriteStr("    $FE3400FC was $10020000 and $FE340040 was $45EE6432")
+  PrintNl()
+  UartWriteStr("    on 2026-08-26 - EMMC2, the micro-SD controller")
+  PrintNl()
+EndProcedure
+
+
+Procedure.i Main()
+  Define ok.i
+  Define hz.i
+  Define khz.i
+  Define i.i
+  Define n.i
+  Define bad.i
+  Define ctl.i
+  Define okA.i
+  Define okB.i
+  Define okC.i
+
+  PrintNl()
+  UartWriteStr("=== pi4 SDIO / CYW43455 probe ===")
+  PrintNl()
+  PrintNl()
+
+  ; ====================================================================
+  ; 1 - the mailbox, then WL_ON
+  ; ====================================================================
+  UartWriteStr("-- power and clock --")
+  PrintNl()
+
+  ok = MailboxInit()
+  Line("mailbox init (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  mailbox refused - nothing below can be trusted")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; --- the power-device table ------------------------------------------
+  ; Before anything is switched on, ask the firmware what it thinks
+  ; exists. See probe_PowerTable: this is the question the documents on
+  ; this disk contradict each other about.
+  probe_PowerTable()
+  PrintNl()
+
+  ; --- WL_ON, now sdio.pi4's job ---------------------------------------
+  ; SdioInit() calls this too and calling it twice is harmless. It is
+  ; called here as well so that the ladder is printed BEFORE the bus
+  ; work, which is where a reader will look first, and so that the
+  ; 170 ms this spends power-cycling the radio is spent before the
+  ; controller is touched rather than in the middle of it.
+  ok = SdioAssertWlOn()
+  Line("WL_ON asserted (want 1)", ok)
+  Line("WL_ON step (want 13)", SdioWlOnStep())
+  ; THE RUNG IN WORDS, EVERY RUN, PASS OR FAIL. The first two bench runs
+  ; printed a bare number and the number had to be looked up in a report
+  ; the person at the board did not have. A diagnostic that emits an
+  ; integer nobody can decode has not diagnosed anything.
+  TextLine("WL_ON meaning    ", SdioWlOnStepText())
+  ; And the transport's own verdict at that rung. This line separates
+  ; "the firmware refused the tag" from "the firmware never answered",
+  ; which are the two halves of every mailbox failure and lead to
+  ; completely different places.
+  Line("WL_ON mailbox err", SdioWlOnMailboxError())
+  TextLine("WL_ON mbx meaning", SdioMailboxErrorText(SdioWlOnMailboxError()))
+  ; State as found, before this program wrote anything to the pin.
+  ; Direction 0 is RPI_EXP_GPIO_DIR_IN and 1 is RPI_EXP_GPIO_DIR_OUT -
+  ; expander driver lines 22-23. A level as found of 1 means the radio
+  ; was already powered and a full cycle was performed; 0 means the pin
+  ; was only ever driven high, so nothing could have left the radio
+  ; worse off than it started.
+  Line("WL_ON dir as found", SdioWlOnDirectionFound())
+  Line("WL_ON level as found", SdioWlOnLevelFound())
+  Line("WL_ON polarity as found", SdioWlOnPolarity())
+  ; SET_GPIO_CONFIG is advisory now - the board refused it while
+  ; accepting every other expander tag on the same pin. Its outcome is
+  ; recorded and nothing waits for it.
+  Line("WL_ON set-config ok", SdioWlOnConfigOk())
+  TextLine("WL_ON set-config why", SdioMailboxErrorText(SdioWlOnConfigError()))
+  ; THE DISCRIMINATOR FOR THE OPEN QUESTION. See AN OPEN QUESTION in
+  ; sdio.pi4. A response length of 0 beside an MBX_ERR_TAG means the
+  ; firmware returned nothing, and a cleared response bit on an empty
+  ; reply may be a success we are misreading, because mailbox.pi4
+  ; checks every individual tag's bit and is stricter than U-Boot.
+  ; A length of 8 beside MBX_ERR_TAG is not that case.
+  Line("WL_ON set-cfg resp bytes", SdioWlOnConfigRespBytes())
+  Line("WL_ON set-state resp bytes", SdioWlOnSetRespBytes())
+  ; -1 HERE MEANS THE READBACK NEVER RAN. It is not a pin level. The
+  ; ladder stopped before rung 13 and the value was never fetched; the
+  ; meaning line above says where it stopped.
+  Line("WL_ON level readback (want 1)", SdioWlOnLevel())
+  If SdioWlOnLevel() < 0
+    UartWriteStr("    a readback of -1 is not a pin level: the")
+    PrintNl()
+    UartWriteStr("    GET_GPIO_STATE at the end of the ladder never ran")
+    PrintNl()
+  EndIf
+  If ok = 0
+    UartWriteStr("  the radio may be unpowered; CMD5 will find nothing")
+    PrintNl()
+  EndIf
+
+  ; ====================================================================
+  ; 2 - the clocks: the rate, and then whether it is actually running
+  ; ====================================================================
+  hz = MailboxClockRate(#PROBE_CLOCK_ID_EMMC)
+  Line("EMMC clock Hz (id 1)", hz)
+  If hz <= 0
+    UartWriteStr("  the firmware would not name the EMMC clock - sdio.pi4 will refuse")
+    PrintNl()
+  Else
+    khz = hz / 1000
+    SdioSetBaseClockKhz(khz)
+    Line("base clock kHz", khz)
+  EndIf
+
+  ; A RATE IS NOT A RUNNING CLOCK. The property document is explicit at
+  ; line 310: "Next enable rate should be returned even if the clock is
+  ; not running". The first bench run printed 250000000 for id 1 and
+  ; that number carried no information about whether the controller was
+  ; being clocked at all. These three lines carry it.
+  Line("EMMC clock state bit0=on", SdioQueryClockState(#PROBE_CLOCK_ID_EMMC))
+  Line("EMMC clock Hz measured", MailboxClockRateMeasured(#PROBE_CLOCK_ID_EMMC))
+  ; The control: EMMC2's clock, feeding a controller known to work. This
+  ; is a STATE query and never a rate query. sdio.pi4's base clock comes
+  ; from id 1 and only from id 1 - that is the rule
+  ; tools/a64/a64_sdio_check.py enforces, and asking id 12 what its rate
+  ; is would break it. Asking whether it is running does not.
+  Line("EMMC2 clock state (control)", SdioQueryClockState(#PROBE_CLOCK_ID_EMMC2))
+
+  ; THE TWO ROWS ABOVE CONTRADICTED EACH OTHER ON 2026-08-26: state 0,
+  ; measured 250000496 Hz. A measurement is the firmware counting real
+  ; edges, and 496 Hz of jitter off a nominal 250 MHz is what a real
+  ; measurement of a real clock looks like. A gated clock cannot be
+  ; measured at 250.000496 MHz. So on this part the state bit appears to
+  ; mean "some client has claimed this clock", not "the generator is
+  ; running" - and the power sweep above says the same thing far more
+  ; bluntly, by reporting UART0 as powered off in a message UART0 is
+  ; transmitting. Both readings are in sdio.pi4, above
+  ; sdio_EnableClockAndPower, with the argument spelled out.
+  UartWriteStr("  if state says off and measured says a real rate, believe")
+  PrintNl()
+  UartWriteStr("  the measurement - see sdio_EnableClockAndPower in sdio.pi4")
+  PrintNl()
+  PrintNl()
+
+  ; ====================================================================
+  ; 2b - the raw registers, BEFORE anything judges them
+  ; ====================================================================
+  UartWriteStr("-- raw registers, before anything judges them --")
+  PrintNl()
+  probe_RawRegisters()
+  UartWriteStr("  a zero cap0 with a good ver is NORMAL here - see sdio.pi4")
+  PrintNl()
+  PrintNl()
+
+  ; ====================================================================
+  ; 3 - the SDIO bus
+  ; ====================================================================
+  UartWriteStr("-- sdio bring-up --")
+  PrintNl()
+
+  ok = SdioInit()
+  Line("SdioInit (want 1)", ok)
+
+  ; ALWAYS, BEFORE THE PASS/FAIL BRANCH. SdioInit runs the firmware half
+  ; internally, and the first bench run could not tell whether the
+  ; SET_CLOCK_STATE inside it had been skipped, refused or ignored -
+  ; only that the state had not moved. Printing this on both paths is
+  ; what makes those three distinguishable.
+  probe_FirmwareHalfReport()
+
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    HexLine("last cmd       ", SdioLastCmd(), 2)
+    HexLine("last intr      ", SdioLastIntr(), 8)
+    ; DECODED, EVERY TIME. See probe_DecodeIntr.
+    probe_DecodeIntr(SdioLastIntr())
+    HexLine("last state     ", SdioLastStatus(), 8)
+    HexLine("last r5        ", SdioLastR5(), 4)
+    PrintNl()
+    UartWriteStr("  -- the bus, as actually programmed --")
+    PrintNl()
+    probe_BusRegisters()
+    PrintNl()
+    UartWriteStr("=== stopped at the bus ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  UartWriteStr("  -- the bus, as actually programmed --")
+  PrintNl()
+  probe_BusRegisters()
+  Line("host spec version", SdioHostVersion())
+  Line("host vendor      ", SdioHostVendor())
+  HexLine("capabilities 0   ", SdioCaps0(), 8)
+  HexLine("capabilities 1   ", SdioCaps1(), 8)
+  Line("bus clock kHz    ", SdioClockKhz())
+  Line("clock divisor    ", SdioDivisor())
+  Line("bus width        ", SdioBusWidth())
+  HexLine("io ocr           ", SdioOcr(), 6)
+  Line("io functions     ", SdioFunctionCount())
+  Line("memory present   ", SdioMemoryPresent())
+  Line("1.8V capable     ", Sdio18vCapable())
+  HexLine("rca              ", SdioRca(), 4)
+  ; REPORTED, NOT ACTED ON. The device on this controller is soldered
+  ; down and the node is marked non-removable; these two bits are here
+  ; because a surprising value in them is evidence about which
+  ; controller is answering. See sdio_ControllerPlausible.
+  Line("card detect bit  ", SdioCardDetectBit())
+  Line("card pin level   ", SdioCardPinLevel())
+  PrintNl()
+
+  ; ====================================================================
+  ; 4 - the two I/O functions
+  ; ====================================================================
+  UartWriteStr("-- sdio functions --")
+  PrintNl()
+
+  ok = SdioEnableFunction(1)
+  Line("enable F1 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at function 1 ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = SdioEnableFunction(2)
+  Line("enable F2 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+  EndIf
+
+  ; A CCCR read that proves byte access works before the CYW43 layer
+  ; depends on it. If this is wrong, everything above it lied.
+  HexLine("CCCR revision    ", SdioCmd52Read(0, $00), 2)
+  HexLine("CCCR caps        ", SdioCmd52Read(0, $08), 2)
+  HexLine("CCCR bus if      ", SdioCmd52Read(0, $07), 2)
+  PrintNl()
+
+  ; ====================================================================
+  ; 5 - the radio
+  ; ====================================================================
+  UartWriteStr("-- cyw43 --")
+  PrintNl()
+
+  ok = Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Line("Cyw43SetIo (want 1)", ok)
+
+  ok = Cyw43Attach()
+  Line("Cyw43Attach (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    HexLine("chipclkcsr       ", Cyw43ClockCsr(), 2)
+    HexLine("chipid raw       ", Cyw43ChipIdRaw(), 8)
+    PrintNl()
+    UartWriteStr("=== stopped at the chip ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  HexLine("chipclkcsr       ", Cyw43ClockCsr(), 2)
+  HexLine("chipid raw       ", Cyw43ChipIdRaw(), 8)
+  HexLine("chip id          ", Cyw43ChipId(), 4)
+  Line("chip rev         ", Cyw43ChipRev())
+  Line("chip package     ", Cyw43ChipPackage())
+  Line("backplane type   ", Cyw43SocType())
+  Line("chipid corecount ", Cyw43ChipCoreCountField())
+  Line("is CYW43455      ", Cyw43IsCyw43455())
+  TextLine("chip name        ", Cyw43ChipName())
+  PrintNl()
+
+  ; ====================================================================
+  ; 5b - the cores
+  ; ====================================================================
+  UartWriteStr("-- cores --")
+  PrintNl()
+  n = Cyw43CoreCount()
+  Line("cores found      ", n)
+  For i = 0 To n - 1
+    UartWriteStr("  core ")
+    PrintDec(i)
+    UartWriteStr(" id $")
+    PutHexN(Cyw43CoreId(i), 3)
+    UartWriteStr(" rev ")
+    PrintDec(Cyw43CoreRev(i))
+    UartWriteStr(" base $")
+    PutHexN(Cyw43CoreBase(i), 8)
+    UartWriteStr(" wrap $")
+    PutHexN(Cyw43CoreWrap(i), 8)
+    PrintNl()
+  Next
+  PrintNl()
+
+  ; ====================================================================
+  ; 5c - BLOCK-MODE CMD53, PROVED AGAINST BYTE MODE
+  ;
+  ; This is the point of today's work and it is the one section of this
+  ; program that is an EXPERIMENT rather than a report.
+  ;
+  ; THE TARGET IS THE EROM TABLE and the choice matters. Two transfer
+  ; modes can only be compared over a region that reads the same twice,
+  ; and most of this chip does not: ChipCommon's low 256 bytes contain
+  ; live counters, the SDIO core's block contains interrupt status, and
+  ; the chip's RAM is not writable until the CR4 is out of reset. The
+  ; EROM is a descriptor table the silicon does not change, it is
+  ; hundreds of bytes long, and cyw43.pi4 has already walked it word by
+  ; word and got a coherent answer out of it - so a mismatch here is
+  ; block mode's fault and nothing else's.
+  ;
+  ; WHAT EACH OUTCOME MEANS, because a bare "mismatches 0" is not a
+  ; finding:
+  ;
+  ;   byte  ok 1, block ok 1, mismatches 0
+  ;       Block-mode CMD53 works. This is the result the firmware
+  ;       upload is waiting on.
+  ;
+  ;   block ok 0
+  ;       The command itself failed. SdioLastError says which - a
+  ;       DATA_TMO on block 1 means the controller never raised Buffer
+  ;       Read Ready for a multi-block command, which would mean
+  ;       SDHCI_TRNS_MULTI or the block count register is wrong. A
+  ;       DATA_TMO on a LATER block means the per-block re-arm is wrong,
+  ;       which is a different bug in the same procedure.
+  ;
+  ;   block ok 1, mismatches non-zero
+  ;       The worst and most interesting outcome: the transfer completed
+  ;       and moved the wrong bytes. Almost certainly the card and the
+  ;       controller disagree about the block size. Compare the F1 block
+  ;       size row above with 64.
+  ;
+  ;   byte ok 0
+  ;       Nothing to do with today's work - the bulk path is broken in
+  ;       byte mode too, and every result below is meaningless.
+  ; ====================================================================
+  UartWriteStr("-- cmd53 block mode --")
+  PrintNl()
+
+  Line("F1 block size    ", Cyw43F1BlockSize())
+  ; THE NUMBER THAT WAS WRONG ON THE FIRST BENCH RUN. This code chunked
+  ; byte-mode transfers at 512 and the card refused 256; the real
+  ; ceiling is the FUNCTION's block size. It is printed on its own row
+  ; so that it can never be wrong silently again.
+  Line("byte-mode max    ", Cyw43ByteMax())
+  Line("card can multi-block (want 1)", Cyw43MultiBlockCapable())
+  HexLine("erom pointer     ", Cyw43EromPtr(), 8)
+
+  ok = Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+  Line("Cyw43SetBlockIo (want 1)", ok)
+
+  ; ctl and bad both start at -1, meaning NOT COMPARED, and only a
+  ; comparison that actually ran may set them to a count. See the note
+  ; on the control below.
+  ctl = -1
+  bad = -1
+
+  If Cyw43EromPtr() = 0
+    UartWriteStr("  no EROM pointer - skipping the comparison")
+    PrintNl()
+  Else
+    ; Arm A: byte mode. Forced on even though it is the default, so that
+    ; this line is a statement of what ran rather than a reliance on a
+    ; default that might change.
+    Cyw43SetBlockMode(0)
+    Line("block mode off (want 0)", Cyw43BlockMode())
+    okA = Cyw43ReadMem(Cyw43EromPtr(), @probe_bufA[0], #PROBE_XFER_BYTES)
+    Line("byte-mode read (want 1) ", okA)
+    If okA = 0
+      probe_XferFailed()
+    Else
+      HexLine("  first word      ", PeekN(@probe_bufA[0]), 8)
+    EndIf
+
+    ; ==================================================================
+    ;  THE CONTROL, and it must be able to say "I did not run".
+    ;
+    ;  On 2026-08-26 this printed "control mismatches (want 0)  0" while
+    ;  BOTH reads had failed and nothing whatsoever had been compared.
+    ;  Zero mismatches out of zero bytes is arithmetically true and
+    ;  completely misleading, and an instrument that reports success
+    ;  when it never ran is worse than one that reports nothing.
+    ;
+    ;  So the counter starts at -1 and the row prints "not compared"
+    ;  for it. A count is only ever written by a loop that had two
+    ;  buffers of real data to walk.
+    ; ==================================================================
+    okB = 0
+    If okA = 1
+      okB = Cyw43ReadMem(Cyw43EromPtr(), @probe_bufB[0], #PROBE_XFER_BYTES)
+      Line("byte-mode read again    ", okB)
+      If okB = 0
+        probe_XferFailed()
+      EndIf
+    Else
+      UartWriteStr("  second byte-mode read SKIPPED - the first one failed")
+      PrintNl()
+    EndIf
+
+    If okA = 1 And okB = 1
+      ctl = 0
+      For i = 0 To #PROBE_XFER_BYTES - 1
+        If PeekA(@probe_bufA[0] + i) <> PeekA(@probe_bufB[0] + i)
+          ctl = ctl + 1
+        EndIf
+      Next
+    EndIf
+    probe_Count("control mismatches (want 0)", ctl)
+    If ctl > 0
+      UartWriteStr("  THE REGION IS NOT STATIC. The comparison below cannot")
+      PrintNl()
+      UartWriteStr("  distinguish a block-mode fault from a changing register.")
+      PrintNl()
+    EndIf
+
+    ; Arm B: block mode over the identical region. Only attempted when
+    ; the control actually passed - a block-mode result measured against
+    ; a byte-mode arm that never ran is the vacuous answer again, one
+    ; layer up.
+    If ctl <> 0
+      UartWriteStr("  block-mode comparison SKIPPED - no usable control")
+      PrintNl()
+    Else
+      okC = Cyw43SetBlockMode(1)
+      Line("block mode on (want 1)  ", okC)
+      If okC = 0
+        UartWriteStr("    ")
+        UartWriteStr(Cyw43ErrorText())
+        PrintNl()
+      Else
+        okC = Cyw43ReadMem(Cyw43EromPtr(), @probe_bufB[0], #PROBE_XFER_BYTES)
+        Line("block-mode read (want 1)", okC)
+        If okC = 0
+          probe_XferFailed()
+        Else
+          HexLine("  first word      ", PeekN(@probe_bufB[0]), 8)
+          bad = 0
+          For i = 0 To #PROBE_XFER_BYTES - 1
+            If PeekA(@probe_bufA[0] + i) <> PeekA(@probe_bufB[0] + i)
+              If bad = 0
+                Line("  first mismatch at byte", i)
+                HexLine("    byte mode said  ", PeekA(@probe_bufA[0] + i), 2)
+                HexLine("    block mode said ", PeekA(@probe_bufB[0] + i), 2)
+              EndIf
+              bad = bad + 1
+            EndIf
+          Next
+          Line("bytes compared   ", #PROBE_XFER_BYTES)
+        EndIf
+      EndIf
+    EndIf
+    probe_Count("mismatches (want 0)", bad)
+    ; Leave block mode ON for the steps below if it worked, because that
+    ; is the configuration the upload will use and a diagnostic that
+    ; tests one thing and then reports on another is worse than no
+    ; diagnostic.
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 5d - THE CORES GO DOWN AND THE CHIP SAYS HOW MUCH RAM IT HAS
+  ;
+  ; brcmf_chip_cr4_set_passive() then brcmf_chip_get_raminfo(), in that
+  ; order and not the other one - the CR4's bank registers only answer
+  ; once the CR4 itself is out of reset and halted.
+  ;
+  ; THIS WRITES TO THE CHIP. Everything above it was read-only. What it
+  ; does is put the radio's own ARM into a halted state, which is where
+  ; it already is after a power-on, so the worst case is a chip that
+  ; needs the WL_ON cycle this program already performs at step 1.
+  ;
+  ; WHAT THE NUMBERS SHOULD BE. RAM base $00198000, from
+  ; brcmf_chip_tcm_rambase()'s table for a $4345. RAM size is WALKED out
+  ; of the CR4's memory banks and is not predicted here on purpose - a
+  ; predicted number is a number this program would find a way to agree
+  ; with. It must be non-zero, a multiple of 8192 or 1024, and comfortably
+  ; larger than the 609,309-byte image; a 43455 is generally reported as
+  ; having 786,432 bytes.
+  ; ====================================================================
+  UartWriteStr("-- cores down, ram info --")
+  PrintNl()
+
+  Line("ARM CR4 core index", Cyw43FindCore(#CYW43_CORE_ARM_CR4))
+  Line("802.11 core index ", Cyw43FindCore(#CYW43_CORE_80211))
+  Line("SDIO dev core index", Cyw43FindCore(#CYW43_CORE_SDIO_DEV))
+
+  ok = Cyw43PrepareDownload()
+  Line("Cyw43PrepareDownload (want 1)", ok)
+  If ok = 0
+    ; BOTH LAYERS, and the SDIO one first in your reading order. On
+    ; 2026-08-26 this printed only "a 32-bit backplane read failed",
+    ; which sent the reader to the backplane window when the actual
+    ; fault was a data line left inhibited by a refused command three
+    ; sections earlier. The bus layer knew; nobody asked it.
+    probe_XferFailed()
+    UartWriteStr("=== stopped before the download ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  Line("CR4 is up (want 1)", Cyw43CoreIsUp(Cyw43FindCore(#CYW43_CORE_ARM_CR4)))
+  HexLine("ram base (want $198000)", Cyw43RamBase(), 8)
+  Line("ram size bytes   ", Cyw43RamSize())
+  HexLine("ram size hex     ", Cyw43RamSize(), 8)
+  ; The image is 609,309 bytes. Printed as a comparison rather than as a
+  ; verdict, because the number that matters is the one the chip
+  ; reported and a "yes it fits" line would hide it.
+  Line("image bytes needed", 609309)
+  Line("ram size minus image", Cyw43RamSize() - 609309)
+  PrintNl()
+
+  ; ====================================================================
+  ; 5e - THE CHIP'S RAM, WRITTEN AND READ BACK
+  ;
+  ; The first WRITE of bulk data this project has ever made to this
+  ; chip, and the last thing that can be proved without the 609 KB image
+  ; on the board. A pattern goes into the top of the image area, comes
+  ; back, and is compared.
+  ;
+  ; WHY IT IS SAFE: the ARM is halted and there is no firmware in that
+  ; RAM to corrupt. The region used is the bottom of the image area,
+  ; which the upload will overwrite in its entirety anyway.
+  ;
+  ; IF THIS FAILS AND 5c PASSED, the fault is in the WRITE direction
+  ; specifically - reads were already proven. Re-run with block mode off
+  ; to find out whether it is block mode's write path or the bulk path
+  ; as a whole.
+  ; ====================================================================
+  UartWriteStr("-- ram write and read back --")
+  PrintNl()
+
+  For i = 0 To #PROBE_XFER_BYTES - 1
+    ; A pattern that is different in every byte AND different from any
+    ; plausible stuck value: not all-zero, not all-ones, and not a
+    ; repeating byte, so that an off-by-one in the block arithmetic
+    ; shows up as a mismatch rather than as more of the same.
+    PokeB(@probe_bufA[0] + i, (i * 7 + 19) & $FF)
+  Next
+
+  ok = Cyw43WriteMem(Cyw43RamBase(), @probe_bufA[0], #PROBE_XFER_BYTES)
+  Line("Cyw43WriteMem (want 1)", ok)
+  ; bad stays at -1 - NOT COMPARED - unless a verify pass actually ran.
+  ; Cyw43VerifyMem returns -1 for "the read-back itself failed" for the
+  ; same reason, so the two meanings coincide and probe_Count prints
+  ; words rather than a number in both.
+  bad = -1
+  If ok = 0
+    probe_XferFailed()
+  Else
+    Cyw43ClearVerifyRecord()
+    bad = Cyw43VerifyMem(Cyw43RamBase(), @probe_bufA[0], #PROBE_XFER_BYTES, @probe_bufB[0], #PROBE_XFER_BYTES)
+    If bad < 0
+      UartWriteStr("  the read-back itself failed:")
+      PrintNl()
+      probe_XferFailed()
+    EndIf
+    If bad > 0
+      HexLine("  first bad address", Cyw43BadAddr(), 8)
+      HexLine("  chip said        ", Cyw43BadGot(), 2)
+      HexLine("  should have been ", Cyw43BadWant(), 2)
+    EndIf
+  EndIf
+  probe_Count("ram mismatches (want 0)", bad)
+  PrintNl()
+
+  ; ====================================================================
+  ; 6 - the firmware, which this program does not carry
+  ;
+  ; NOT PADDING. This is the finding. Everything above it is bring-up
+  ; that leads here, and a log that stopped at "ram size" would let a
+  ; reader assume the rest is a matter of time.
+  ;
+  ; THE REFUSAL THAT USED TO BE HERE IS GONE, and it is worth saying why
+  ; in the log itself rather than only in a source comment: the three
+  ; image and CLM blob are in the repository at Firmware/CYW43455/ and
+  ; the licence permits it. What stops THIS program is arithmetic, not
+  ; permission - 609,309 bytes will not fit in a diagnostic image, so
+  ; they have to arrive at run time, and choosing how is a separate job
+  ; with its own risks. See the header.
+  ;
+  ; Cyw43Start is called anyway, and it must return 0 with
+  ; #CYW43_ERR_NOT_LOADED - "releasing the ARM needs BOTH a verified
+  ; image and a verified NVRAM". A 1 here would mean the guard is
+  ; broken and the radio's ARM had just been released into empty RAM.
+  ; ====================================================================
+  UartWriteStr("-- firmware --")
+  PrintNl()
+  Line("firmware required (want 1)", Cyw43FirmwareRequired())
+  TextLine("image needed     ", Cyw43FirmwareName())
+  TextLine("nvram needed     ", Cyw43NvramName())
+  TextLine("clm (optional)   ", Cyw43ClmName())
+  Line("Cyw43Start with nothing loaded (want 0)", Cyw43Start())
+  UartWriteStr("  ")
+  UartWriteStr(Cyw43ErrorText())
+  PrintNl()
+  ; SCANNING IS NO LONGER ON THIS LIST. Cyw43ScanStart became real on
+  ; 2026-08-27 with the SDPCM transport, so calling it here would start
+  ; a scan on a radio with no firmware in it rather than print a
+  ; refusal. What it needs is the image, which this program has no way
+  ; to obtain - see the header. The scan diagnostic is
+  ; pi4WifiScan.pi4.
+  ;
+  ; JOINING LEFT THIS LIST TOO, ON THE EVENING OF 2026-08-27.
+  ; Cyw43Join was the last stub standing in for the whole refused set
+  ; and it is gone: the security block, the event ring and the join
+  ; state machine are section 8 of cyw43.pi4, and the board associated
+  ; with a real access point on the strength of them. Calling it here
+  ; would now ATTEMPT a join on a radio with no firmware in it rather
+  ; than print a refusal - exactly the trap Cyw43ScanStart left this
+  ; list for that morning. The join diagnostic is pi4WifiJoin.pi4.
+  ;
+  ; SO THE REFUSAL LIST IS EMPTY AND THIS PROGRAM NO LONGER TESTS ONE.
+  ; Cyw43Start above is what remains and it is the right survivor: it
+  ; is the one call that still MUST refuse without an image, and its
+  ; guard is the one whose failure would release the radio's ARM into
+  ; empty RAM.
+  PrintNl()
+
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

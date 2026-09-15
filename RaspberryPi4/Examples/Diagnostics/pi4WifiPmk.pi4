@@ -1,0 +1,518 @@
+; ======================================================================
+; pi4WifiPmk.pi4 - DERIVE THE PMK FOR EVERY STORED NETWORK AND LEAVE IT
+; IN DRAM FOR THE JOIN PAYLOAD TO PICK UP. RESUMABLE.
+;
+; DIAGNOSTIC. Does not ship.
+; ----------------------------------------------------------------------
+; WHY THIS IS A SEPARATE PAYLOAD, AND WHY IT RESUMES.
+;
+; MEASURED ON SILICON. pi4WifiJoin.pi4 used to run
+; nine published crypto vectors before touching the radio, on the
+; estimate that two 4096-iteration derivations would cost "tens of
+; milliseconds apiece". The board printed:
+;
+;     -- the supplicant crypto, published vectors --
+;       ... all nine ok ...
+;       elapsed ms         15497
+;
+; and then the deadman fired. FIFTEEN AND A HALF SECONDS, with the
+; radio still cold. Roughly ten of those seconds are ONE
+; passphrase-to-PSK mapping: PBKDF2-SHA1 at 4096 iterations over two
+; output blocks is 16,384 HMAC-SHA1 calls, and with the MMU off every
+; instruction fetch and every load is uncached Device memory.
+;
+; The watchdog on this part cannot be armed past ~15.999 s
+; (PM_WDOG_MAX_TICKS $000FFFFF, safety.pi4) and a payload must not arm
+; its own - pi4NeonLiar.pi4:2514 records what that costs: Anvil stops
+; the watchdog IT armed when the payload returns and never learns about
+; ours, so the board resets after every run. So the ceiling is fifteen
+; seconds, full stop, and four networks at ten seconds each do not fit
+; in one run any more than they fit inside the join.
+;
+; THEREFORE: this payload does as many derivations as fit, writes them
+; to a fixed DRAM window, and RUNS AGAIN to do the rest. Each run
+; reports how many are staged and how many are still owed. When it says
+; "all staged", run the join.
+;
+; ======================================================================
+; WHAT TO TYPE
+; ======================================================================
+;     pmf> fill 1400000 0 800
+;     pmf> load SETTINGS.TXT 1400000
+;     pmf> deadman 15
+;     pmf> run 400000              <- repeat until it says all staged
+;
+; The three radio blobs are NOT needed here; this payload never touches
+; the bus. Only SETTINGS.TXT, and only because that is where the
+; passphrase lives.
+;
+; ======================================================================
+; NOTHING DERIVED FROM THE PASSPHRASE OR THE PMK IS EVER PRINTED
+; ======================================================================
+; Not the passphrase, not the PMK, not a hash of the PMK, not one byte
+; of it. What is printed is the SSID, the passphrase's LENGTH and the
+; milliseconds each derivation took - enough to tell "it worked" from
+; "that slot has no credential", and nothing anyone could use.
+;
+; THE PMK IS AS GOOD AS THE PASSPHRASE. Anyone holding those 32 bytes
+; joins this network for as long as the passphrase stands; it is not a
+; "derived, therefore safe" value. That is why the window is DRAM the
+; next payload reads and why this file has no dump command.
+; ======================================================================
+
+; THE SETTINGS STORE NAMES NO OTHER FILE - a library never
+; includes a library - so ITS dependencies are listed here, in this order,
+; by the main program. Anvil/Core/settings.pbi is chip-free core and
+; reaches a medium only through the HwFile* seam: Anvil/Hal/hal.pbi
+; declares that seam's #HW_FILE_* codes, and RaspberryPi4/Board/hw_file.pi4
+; is THIS board's backend for it, written over fat.pi4. Both come before
+; the store, exactly as the store's own USE block and
+; pi4SettingsSelfTest.pi4 have it. hal.pbi's RequireCap prints a refusal
+; and so names Print/PrintN/UartWriteStr, which is why uart.pi4 stays
+; first.
+;
+; This program only ever calls SettingsParse() against the window Anvil's
+; `load` filled, so none of that machinery ever executes here - but a file
+; is compiled whole and every name in it has to resolve.
+;
+; LOSING THESE TWO LINES IS WHAT STOPPED THIS PROGRAM BUILDING. The store
+; moved out of RaspberryPi4/Lib and onto the seam; the XIncludeFile
+; below was given its new path and nothing
+; else was added, so #HW_FILE_OK resolved nowhere in this translation
+; unit. The monitor (RaspberryPi4/Board/board.pi4) and the settings gate
+; (pi4SettingsSelfTest.pi4) both already listed the two files, which is
+; why the identical library built there and only these two diagnostics
+; broke. tools/a64/a64_diag_build_check.py builds every diagnostic in
+; this directory so the next such omission is caught the same day.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Board/hw_file.pi4"
+XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "RaspberryPi4/Lib/sha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/hmacsha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/pbkdf2.pi4"
+
+; Where Anvil's `load` put SETTINGS.TXT, and the size of the zeroed
+; window in front of it. pi4WifiJoin.pi4's numbers, unchanged: a second
+; opinion about where the file lives is a second thing to get wrong.
+#SET_ADDR = $01400000
+#SET_WIN  = 8192
+
+; ----------------------------------------------------------------------
+;  THE STAGING WINDOW at $01500000, clear of everything else this bench
+;  uses - firmware $01000000, NVRAM $01200000 with its work area at
+;  $01210000, scratch $01220000, CLM $01300000, settings $01400000.
+;
+;      +0   4   magic        $504D4B31, 'P' 'M' 'K' '1'
+;      +4   4   count        entries that follow
+;      +8   4   fingerprint  FNV-1a over the whole settings text
+;      +12  4   reserved
+;      +16  ..  entries, #PMKS_ENTRY bytes each
+;
+;  and each entry is
+;
+;      +0   4   slot         the settings slot it came from
+;      +4   4   ssidLen      1..32
+;      +8  32   ssid         raw bytes, NOT terminated
+;      +40 32   pmk          the 32 bytes
+;      +72  8   pad
+;
+;  THE FINGERPRINT IS WHAT MAKES RESUMING SAFE. Without it a window
+;  staged from yesterday's SETTINGS.TXT would be reused after somebody
+;  changed a passphrase at the console, and the join would fail its
+;  message 3 MIC with no visible cause. Any change to the file at all -
+;  including a comment - invalidates the whole window and starts again,
+;  which is the cheap and obviously-correct rule rather than the clever
+;  one.
+;
+;  MATCHED BY SSID AT THE FAR END, not by slot. The slot is carried for
+;  a person reading a log; the join picks by the SSID it chose, because
+;  the ladder can pick a network in a different order from the one
+;  settings stores it in and a slot index would pair the wrong key with
+;  the right name.
+; ----------------------------------------------------------------------
+#PMKS_ADDR      = $01500000
+#PMKS_MAGIC     = $504D4B31
+#PMKS_HDR       = 16
+#PMKS_OFF_COUNT = 4
+#PMKS_OFF_FP    = 8
+#PMKS_ENTRY     = 80
+#PMKS_OFF_SLOT  = 0
+#PMKS_OFF_SLEN  = 4
+#PMKS_OFF_SSID  = 8
+#PMKS_OFF_PMK   = 40
+#PMKS_MAX       = 8
+
+; ----------------------------------------------------------------------
+;  HOW LATE A DERIVATION MAY BE STARTED.
+;
+;  One measured derivation is about ten seconds and the deadman is
+;  fifteen. Starting one at t = 4000 ms therefore finishes at about
+;  14 000 ms, which leaves a second for the report; starting one at
+;  t = 6000 ms does not. The number is a START gate rather than a
+;  deadline because there is no way to stop a derivation once it is
+;  running - PBKDF2 has no yield - so the only honest control is
+;  refusing to begin.
+;
+;  IF THE MEASURED COST CHANGES, THIS IS THE NUMBER THAT MOVES. It is
+;  printed on every run beside the actual elapsed time so the two can
+;  be compared without reading the source.
+; ----------------------------------------------------------------------
+#PMKS_START_BY_MS = 4000
+
+Global g_hz.i = 0
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; An SSID is 32 arbitrary bytes chosen by whoever runs the access point.
+; Everything outside printable ASCII is replaced, so a name carrying
+; escape sequences cannot rewrite the lines above it in a log destined
+; for a report. pi4WifiJoin.pi4's PrintSsid; the duplication is
+; deliberate, these payloads share no code by design.
+Procedure PrintSsid(p.i, n.i)
+  Define j.i
+  If n <= 0
+    UartWriteStr("<hidden>")
+    ProcedureReturn 0
+  EndIf
+  If n > 32
+    n = 32
+  EndIf
+  For j = 0 To n - 1
+    If PeekA(p + j) >= 32 And PeekA(p + j) <= 126
+      UartWrite(PeekA(p + j))
+    Else
+      UartWrite(46)
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i MsSince(t0.i)
+  If g_hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn ((Ticks() - t0) * 1000) / g_hz
+EndProcedure
+
+; FNV-1a, 32 bits, over the settings text. NOT a security function and
+; it is not asked to be one: it answers "is this the same file as last
+; run", where the alternative to a wrong answer is a re-derivation, not
+; a break-in. Masked to 32 bits at every step because .i here is 64.
+Procedure.i Fnv1a(p.i, n.i)
+  Define h.i
+  Define i.i
+  h = $811C9DC5
+  For i = 0 To n - 1
+    h = (h ! PeekA(p + i)) & $FFFFFFFF
+    h = (h * 16777619) & $FFFFFFFF
+  Next
+  ProcedureReturn h
+EndProcedure
+
+Procedure.i Rd32(p.i)
+  ProcedureReturn PeekA(p) | (PeekA(p + 1) << 8) | (PeekA(p + 2) << 16) | (PeekA(p + 3) << 24)
+EndProcedure
+
+Procedure Wr32(p.i, v.i)
+  PokeB(p + 0, v & $FF)
+  PokeB(p + 1, (v >> 8) & $FF)
+  PokeB(p + 2, (v >> 16) & $FF)
+  PokeB(p + 3, (v >> 24) & $FF)
+EndProcedure
+
+; Is this SSID already in the staged table? Returns 1 or 0.
+Procedure.i AlreadyStaged(count.i, ssid.i, ssidLen.i)
+  Define e.i
+  Define ent.i
+  Define k.i
+  Define same.i
+  For e = 0 To count - 1
+    ent = #PMKS_ADDR + #PMKS_HDR + e * #PMKS_ENTRY
+    If Rd32(ent + #PMKS_OFF_SLEN) = ssidLen
+      same = 1
+      For k = 0 To ssidLen - 1
+        If PeekA(ent + #PMKS_OFF_SSID + k) <> PeekA(ssid + k)
+          same = 0
+        EndIf
+      Next
+      If same = 1
+        ProcedureReturn 1
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define ok.i
+  Define setLen.i
+  Define slot.i
+  Define ssid.i
+  Define ssidLen.i
+  Define pass.i
+  Define passLen.i
+  Define count.i
+  Define fp.i
+  Define oldFp.i
+  Define t.i
+  Define took.i
+  Define ent.i
+  Define tRun.i
+  Define usable.i
+  Define derived.i
+  Define owed.i
+
+  If TimerInit() <> 0
+    g_hz = TickHz()
+  EndIf
+  tRun = Ticks()
+
+  PrintNl()
+  UartWriteStr("=== pi4WifiPmk - stage the PMKs ===")
+  PrintNl()
+  UartDrain()
+  Line("tick hz          ", g_hz)
+
+  ; ------------------------------------------------------------------
+  ;  The settings text. Find the end by scanning for the NUL the `fill`
+  ;  left behind, and REFUSE rather than guess if there is not one in
+  ;  the window: parsing 8 KB of unknown DRAM as a settings file
+  ;  reports a syntax error on a line that is not in the file, which
+  ;  sends somebody to edit a file that is perfectly correct.
+  ; ------------------------------------------------------------------
+  setLen = -1
+  For i = 0 To #SET_WIN - 1
+    If PeekA(#SET_ADDR + i) = 0
+      setLen = i
+      Break
+    EndIf
+  Next
+  If setLen < 0
+    UartWriteStr("  NO TERMINATOR in 8 KB at $01400000. Type:")
+    PrintNl()
+    UartWriteStr("    fill 1400000 0 800")
+    PrintNl()
+    UartWriteStr("    load SETTINGS.TXT 1400000")
+    PrintNl()
+    UartWriteStr("=== stopped at the settings ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Line("settings bytes   ", setLen)
+
+  ok = SettingsParse(#SET_ADDR, setLen)
+  Line("SettingsParse (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SettingsErrorText())
+    PrintNl()
+    Line("  at file line   ", SettingsErrorLine())
+    UartWriteStr("=== stopped at the settings ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  fp = Fnv1a(#SET_ADDR, setLen)
+  UartWriteStr("  settings fingerprint  $")
+  PutHexN(fp, 8)
+  PrintNl()
+
+  ; ------------------------------------------------------------------
+  ;  What is already staged, if anything, and is it still valid?
+  ; ------------------------------------------------------------------
+  count = 0
+  If Rd32(#PMKS_ADDR) = #PMKS_MAGIC
+    oldFp = Rd32(#PMKS_ADDR + #PMKS_OFF_FP)
+    If oldFp = fp
+      count = Rd32(#PMKS_ADDR + #PMKS_OFF_COUNT)
+      If count < 0 Or count > #PMKS_MAX
+        count = 0
+      EndIf
+      Line("already staged   ", count)
+    Else
+      UartWriteStr("  the staged window was built from a DIFFERENT SETTINGS.TXT")
+      PrintNl()
+      UartWriteStr("  ($")
+      PutHexN(oldFp, 8)
+      UartWriteStr(") - discarding it and starting again.")
+      PrintNl()
+    EndIf
+  Else
+    UartWriteStr("  nothing staged yet")
+    PrintNl()
+  EndIf
+
+  ; The magic goes DOWN only at the end of a run. While derivations are
+  ; in progress the window must not look valid, because a deadman reset
+  ; partway through would otherwise leave a count that overstates what
+  ; is in it.
+  Wr32(#PMKS_ADDR, 0)
+  Wr32(#PMKS_ADDR + #PMKS_OFF_COUNT, count)
+  Wr32(#PMKS_ADDR + #PMKS_OFF_FP, fp)
+  Wr32(#PMKS_ADDR + 12, 0)
+
+  PrintNl()
+  UartWriteStr("-- derivations --")
+  PrintNl()
+  UartDrain()
+
+  usable = 0
+  derived = 0
+  owed = 0
+  slot = SettingsWifiNextSlot(0)
+  While slot <> 0
+    ssid    = SettingsWifiSlotSsid(slot)
+    ssidLen = SettingsLength(SettingsWifiSlotSsidKey(slot))
+    pass    = SettingsWifiSlotPassword(slot)
+    passLen = SettingsLength(SettingsWifiSlotPasswordKey(slot))
+
+    If ssid = 0 Or ssidLen < 1 Or ssidLen > 32 Or pass = 0 Or passLen < 8 Or passLen > 63
+      UartWriteStr("  slot ")
+      PrintDec(slot)
+      UartWriteStr("  ")
+      PrintSsid(ssid, ssidLen)
+      UartWriteStr("   SKIPPED - not a usable credential (pass bytes ")
+      PrintDec(passLen)
+      UartWriteStr(")")
+      PrintNl()
+      UartDrain()
+    Else
+      usable = usable + 1
+      If AlreadyStaged(count, ssid, ssidLen) = 1
+        UartWriteStr("  slot ")
+        PrintDec(slot)
+        UartWriteStr("  ")
+        PrintSsid(ssid, ssidLen)
+        UartWriteStr("   already staged")
+        PrintNl()
+        UartDrain()
+      ElseIf count >= #PMKS_MAX
+        owed = owed + 1
+        UartWriteStr("  slot ")
+        PrintDec(slot)
+        UartWriteStr("   NO ROOM - raise PMKS_MAX")
+        PrintNl()
+        UartDrain()
+      ElseIf MsSince(tRun) > #PMKS_START_BY_MS
+        owed = owed + 1
+        UartWriteStr("  slot ")
+        PrintDec(slot)
+        UartWriteStr("  ")
+        PrintSsid(ssid, ssidLen)
+        UartWriteStr("   DEFERRED - too late in the budget to start one")
+        PrintNl()
+        UartDrain()
+      Else
+        UartWriteStr("  slot ")
+        PrintDec(slot)
+        UartWriteStr("  ")
+        PrintSsid(ssid, ssidLen)
+        UartWriteStr("   pass bytes ")
+        PrintDec(passLen)
+        UartWriteStr("   deriving ...")
+        PrintNl()
+        UartDrain()
+
+        ent = #PMKS_ADDR + #PMKS_HDR + count * #PMKS_ENTRY
+        For i = 0 To #PMKS_ENTRY - 1
+          PokeB(ent + i, 0)
+        Next
+
+        t = Ticks()
+        ok = Wpa2Psk(pass, passLen, ssid, ssidLen, ent + #PMKS_OFF_PMK)
+        took = MsSince(t)
+
+        If ok <> 32
+          UartWriteStr("     Wpa2Psk REFUSED, returned ")
+          PrintDec(ok)
+          PrintNl()
+          UartDrain()
+          For i = 0 To #PMKS_ENTRY - 1
+            PokeB(ent + i, 0)
+          Next
+          owed = owed + 1
+        Else
+          Wr32(ent + #PMKS_OFF_SLOT, slot)
+          Wr32(ent + #PMKS_OFF_SLEN, ssidLen)
+          For i = 0 To ssidLen - 1
+            PokeB(ent + #PMKS_OFF_SSID + i, PeekA(ssid + i))
+          Next
+          count = count + 1
+          derived = derived + 1
+          UartWriteStr("     PMK derived in ")
+          PrintDec(took)
+          UartWriteStr(" ms")
+          PrintNl()
+          UartDrain()
+          Wr32(#PMKS_ADDR + #PMKS_OFF_COUNT, count)
+        EndIf
+      EndIf
+    EndIf
+
+    slot = SettingsWifiNextSlot(slot)
+  Wend
+
+  ; The header last, so a run that reset partway leaves no magic.
+  Wr32(#PMKS_ADDR + #PMKS_OFF_COUNT, count)
+  If count > 0
+    Wr32(#PMKS_ADDR, #PMKS_MAGIC)
+  EndIf
+
+  ; The library's own key material, gone. The staged copy is deliberate
+  ; and is the point; these are the working buffers.
+  Pbkdf2Wipe()
+
+  PrintNl()
+  Line("usable networks  ", usable)
+  Line("staged now       ", count)
+  Line("derived this run ", derived)
+  Line("still owed       ", owed)
+  Line("start-by ms      ", #PMKS_START_BY_MS)
+  Line("elapsed ms       ", MsSince(tRun))
+  UartWriteStr("  window at $")
+  PutHexN(#PMKS_ADDR, 8)
+  PrintNl()
+  If owed > 0
+    UartWriteStr("=== RUN THIS AGAIN - ")
+    PrintDec(owed)
+    UartWriteStr(" still to derive ===")
+    PrintNl()
+    UartDrain()
+    ProcedureReturn 2
+  EndIf
+  If count = 0
+    UartWriteStr("=== nothing staged ===")
+    PrintNl()
+    UartDrain()
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("=== all staged - now run the join ===")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

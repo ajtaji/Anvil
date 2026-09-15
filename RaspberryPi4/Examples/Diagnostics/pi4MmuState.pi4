@@ -1,0 +1,208 @@
+; pi4MmuState.pi4 - STAGE 0 of the MMU work. Read the machine's actual
+;                   MMU and cache state and print it. Change nothing.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   pmfc pi4MmuState.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o mmustate.img
+;
+; ----------------------------------------------------------------------
+; WHY THIS EXISTS
+; ----------------------------------------------------------------------
+; Five files in this tree state what the MMU is doing and they do not
+; agree with each other:
+;
+;   RaspberryPi4/Lib/genet.pi4:318     "THE MMU AND THE CACHES ARE OFF"
+;   RaspberryPi4/Lib/memory.pi4:239    "THE MMU IS OFF"
+;   RaspberryPi4/Lib/display.pi4:427   "WITH THE MMU AND CACHES ON"
+;   RaspberryPi4/Lib/xhci.pi4:275      "The MMU and caches are ON"
+;   RaspberryPi4/Lib/mailbox.pi4:376   MMU and caches OFF as kernel8.img
+;
+; The last three were written when images were entered through U-Boot's
+; "go" with U-Boot's page tables live. U-Boot is gone from the stick.
+; So two of those five describe a configuration that no longer exists -
+; but NOBODY HAS MEASURED WHICH, and a whole staged programme of work
+; is about to be built on the answer.
+;
+; This probe is the measurement. It is free: it reads four system
+; registers and prints them, writes nothing, and cannot hang.
+;
+; ----------------------------------------------------------------------
+; THIS IS SAFE, AND HERE IS THE ARGUMENT RATHER THAN THE ASSERTION
+; ----------------------------------------------------------------------
+; Every instruction this probe adds over an empty program is an `mrs`.
+; MRS reads. It cannot fault at EL2 for any of the four registers used
+; here, it cannot change execution, and it cannot leave the machine in
+; a state the monitor will not survive returning to. There is no
+; sequence here that a power cycle could be needed for.
+;
+; ARM THE DEADMAN ANYWAY. Bench practice makes it the rule for EVERY
+; payload without exception, and a rule with an exception for "the safe ones" is a rule that gets
+; skipped on the day it mattered. It costs one line.
+;
+; ----------------------------------------------------------------------
+; WHAT THE OUTPUT MEANS - read this BEFORE running it, not after
+; ----------------------------------------------------------------------
+; SCTLR_EL2 is the line that matters. There is an exact expected value.
+;
+;   $0000000030C50830  EXPECTED. This is what the firmware's own stub
+;                      writes and then erets into us with, quoted at
+;                      raspberrypi/tools armstubs/armstub8.S:136-141
+;                      (revision 439b6198a9b3), whose comment
+;                      reads "All set bits below are res1. LE, no
+;                      WXN/I/SA/C/A/M". So this value means the MMU is
+;                      OFF, the data cache is OFF, the instruction
+;                      cache is OFF, alignment checking is off and
+;                      nothing has touched the register since the stub.
+;                      genet.pi4 and memory.pi4 are right,
+;                      display.pi4:427 and xhci.pi4:275 are stale and
+;                      should be corrected in place.
+;
+;   ANYTHING ELSE      Do NOT read this as "the MMU is on". It means
+;                      only that the register is not what the stub on
+;                      this disk writes, and there are at least three
+;                      quite different reasons for that: the board may
+;                      be running a NEWER stub with a different RES1
+;                      set; the board may be running the GIC or
+;                      high-peripheral variant; or something in our own
+;                      startup may be writing SCTLR_EL2. Report the raw
+;                      value. Do not start stage 1 until it is
+;                      explained - stage 1 rewrites this register, and
+;                      rewriting a register whose current value is
+;                      unexplained is how a board ends up needing
+;                      hands.
+;
+; CurrentEL should read $8. EL2 is CurrentEL bits 3:2, so EL2 is the
+; value 2 in that field, which is $8 in the whole register. The probe
+; prints the raw register AND the decoded level side by side on
+; purpose: if they disagree, the decode is what is wrong, and printing
+; only the decode would hide that.
+;
+; SCTLR_EL1 is printed because it costs one instruction and it turns a
+; puzzle into an answer in the case nobody expects. If this program is
+; somehow NOT at EL2, then SCTLR_EL2 is the meaningless read and
+; SCTLR_EL1 is the one that governs. Reading both means one bench run
+; is conclusive either way instead of needing a second.
+;
+; HCR_EL2 is printed because it governs whether a stage 2 translation
+; regime is in play. If something below us has already established
+; stage 2, every plan in RaspberryPi4/Lib/mmu.pi4 changes, and this is
+; the cheapest possible place to discover that.
+;
+; ----------------------------------------------------------------------
+; THE BENCH PROCEDURE
+; ----------------------------------------------------------------------
+;   pmf> deadman 15
+;   pmf> receive 400000 <len> <crc>
+;   pmf> run 400000
+;
+; Expected: four labelled hex lines, then the prompt back. The payload
+; is built --entry-returns so it returns to the resident monitor rather
+; than running off its own end; a payload built without it runs past
+; its last instruction, which is why the deadman is armed as well.
+;
+; WHAT WOULD TELL YOU IT WENT WRONG: no output at all. That would not
+; be an MMU finding, it would mean the UART is not where uart.pi4
+; thinks it is or the payload never got control, and it is the same
+; failure any other diagnostic in this directory would show. Nothing
+; this probe does can produce a hang, so a hang is a transfer problem,
+; not a result.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+; ----------------------------------------------------------------------
+;  PutHex16 - a full 64-bit value, all sixteen digits, always.
+;
+;  Sixteen digits with no suppression of leading zeroes, deliberately.
+;  A system register printed as "30C50830" and a system register
+;  printed as "0000000030C50830" carry different information: the
+;  second one says the top half was read and was zero, and the first
+;  one leaves open the possibility that only 32 bits were fetched. That
+;  distinction is exactly the 64-bit trap
+;  RaspberryPi4/Monitor/anvil.pi4:1309-1314 records, where an `ldr w9`
+;  instead of an `ldr x9` silently loses the top half of an address.
+;
+;  No character literals - house rule. 48 is the code for the digit
+;  zero and 55 is the code for the letter A minus ten, which is the
+;  same arithmetic every other probe in this directory uses.
+; ----------------------------------------------------------------------
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Row - "<label> $<16 hex digits>" and a newline.
+; ----------------------------------------------------------------------
+Procedure Row(*label, v.i)
+  UartWriteStr(*label)
+  UartWrite(36)                 ; the dollar sign that marks hex here
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure.i Main()
+  Define sctlr2.i
+  Define entered.i
+
+  UartInit(115200)
+
+  ; Belt and braces over the monitor's deadman. This probe cannot hang,
+  ; so this line will never fire; it is here because the habit is the
+  ; thing being maintained, not the coverage.
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4MmuState - stage 0, read only")
+  UartWriteNl()
+  UartWriteNl()
+
+  Row("CurrentEL raw   ", MmuCurrentEl())
+  Row("exception level ", MmuEl())
+
+  sctlr2 = MmuSctlrEl2()
+  Row("SCTLR_EL2       ", sctlr2)
+  Row("SCTLR_EL2 stub  ", #MMU_SCTLR_EL2_STUB)
+
+  Row("SCTLR_EL1       ", MmuSctlrEl1())
+  Row("HCR_EL2         ", MmuHcrEl2())
+
+  UartWriteNl()
+
+  ; The verdict, spelled out, so that the person at the bench does not
+  ; have to compare two sixteen-digit numbers by eye at the end of a
+  ; long session. The numbers are printed above regardless, because the
+  ; verdict is a convenience and the numbers are the finding.
+  entered = MmuSctlrEl2Entered()
+  If entered = 1
+    UartWriteStr("VERDICT: SCTLR_EL2 is exactly what armstub8.S wrote.")
+    UartWriteNl()
+    UartWriteStr("         MMU off, D-cache off, I-cache off. Proven,")
+    UartWriteNl()
+    UartWriteStr("         not decoded - see armstub8.S:136-141.")
+  Else
+    UartWriteStr("VERDICT: SCTLR_EL2 is NOT the stub value. This does")
+    UartWriteNl()
+    UartWriteStr("         NOT mean the MMU is on. Report the raw")
+    UartWriteNl()
+    UartWriteStr("         number and do not begin stage 1.")
+  EndIf
+  UartWriteNl()
+
+  UartDrain()
+
+  ; Back to the monitor. Zero is the boring answer and the one the
+  ; monitor prints as the payload's return value; the finding is in the
+  ; text above, not in this number.
+  ProcedureReturn 0
+EndProcedure

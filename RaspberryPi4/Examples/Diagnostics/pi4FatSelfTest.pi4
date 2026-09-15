@@ -1,0 +1,802 @@
+; ======================================================================
+; pi4FatSelfTest - the fabricated-image gate for RaspberryPi4/Lib/fat.pi4
+; ----------------------------------------------------------------------
+; THERE IS NO SD CARD IN THIS MACHINE. This program is the answer to
+; that: it stands a FAT32 volume up inside a Dim array, points fat.pi4
+; at it through the same FatSetBlockReader and FatSetBlockWriter seams
+; the monitor uses for @SdReadBlock and @MscWriteBlock, reads it back -
+; and then CHANGES IT.
+;
+; The image itself is written into tdisk[] by the harness
+; (a64_fat_check.py) after the BSS is up and before Main runs - the same
+; way a real medium is "written" by somebody else long before this code
+; sees it. Nothing about the parser knows the difference.
+;
+; Every check appends to res[]. The harness compares the whole array
+; against a list of expected values it holds independently, so a check
+; that silently stops running is a length mismatch, not a pass.
+;
+; BUT res[] IS NOT THE EVIDENCE FOR THE WRITE HALF, and that distinction
+; is the whole design of the second half of this file. Everything in
+; res[] is fat.pi4 reporting on fat.pi4. What proves the write half is
+; the harness reading tdisk[] back out of memory afterwards and parsing
+; the FAT, the root directory and FSInfo for itself, plus two things
+; this file records raw and makes no judgement about:
+;
+;     tdLog[]   every LBA the block writer was handed, in order, with
+;               negative TdMark tags cutting it into phases
+;     tdSnap[]  the 512 bytes of every one of those writes
+;
+; The harness does all the judging on both. A program that graded its
+; own write ordering would be grading the same assumption twice.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+
+#TD_SECTORS  = 2048
+#TD_BYTES    = 1048576      ; 2048 * 512
+#RES_MAX     = 512
+#DST_BYTES   = 3072
+#WSRC_BYTES  = 2048         ; the bytes the write half puts on the medium
+#LOG_MAX     = 2048         ; the write trace - see TdWrite
+#SNAP_MAX    = 256          ; how many written sectors are kept whole
+
+Global Dim tdisk.a[#TD_BYTES]
+Global Dim res.i[#RES_MAX]
+Global nres.i     = 0
+
+Global Dim dstA.a[#DST_BYTES]   ; whole file, aligned destination
+Global Dim dstB.a[#DST_BYTES]   ; same file, 100 bytes at a time
+Global Dim dstU.a[#DST_BYTES]   ; same file, destination offset by 1
+Global Dim dstX.a[#DST_BYTES]   ; scratch for the reads that must fail
+Global Dim dstW.a[#DST_BYTES]   ; PMF.IMG read back after being GROWN
+Global Dim dstN.a[#DST_BYTES]   ; a CREATED file read back
+Global Dim dstO.a[#DST_BYTES]   ; a file read back after FatOverwrite grew it
+Global Dim wsrc.a[#WSRC_BYTES]  ; the source bytes, a pattern the harness
+                                ; computes the same way and independently
+
+Global tdReads.i      = 0
+Global tdFailLba.i    = -1
+Global tdMisaligned.i = 0
+Global tdIntoA.i      = 0   ; reads written STRAIGHT into dstA  (direct path)
+Global tdIntoU.i      = 0   ; reads written straight into dstU  (must be 0)
+
+; ----------------------------------------------------------------------
+; THE WRITE TRACE. Every call to the block writer appends its LBA here,
+; and TdMark drops a NEGATIVE tag between phases so the harness can cut
+; the trace into windows.
+;
+; It exists because two of the properties that matter most cannot be
+; seen in the finished image at all - "the data reached the medium
+; before the directory said it had" and "the cluster was claimed in the
+; FAT before anything was written into it" are statements about ORDER,
+; and a correct final image is produced by the wrong order just as
+; happily as by the right one.
+;
+; The trace is raw: this file records what happened and makes no
+; judgement about it. All of the judging is on the harness side, which
+; is the point - a program that graded its own ordering would be
+; grading the same assumption twice.
+;
+; tdLogLost counts entries that did not fit. A gate whose evidence
+; silently ran out is worse than no gate, so the harness asserts it is
+; zero rather than trusting the array to be big enough.
+; ----------------------------------------------------------------------
+; AND THE CONTENTS, NOT ONLY THE ADDRESSES. A trace of LBAs turned out
+; not to be enough, and finding that out is the reason this array
+; exists: fat_SetEntry writes the SAME sector twice in a row when it
+; claims a cluster and then links it on, so "claim before link" and
+; "link before claim" produce an identical sequence of LBAs. The gate
+; was watched staying GREEN for a mutation that reversed those two -
+; which is a real defect, because the reversed order leaves a window
+; where a live chain runs into a cluster the FAT still calls free.
+;
+; So every write's 512 bytes are kept as well. The harness can then
+; reconstruct the FAT after each individual write and check the rule
+; directly, instead of inferring it from addresses.
+;
+; The k-th snapshot is the k-th WRITE in tdLog, counting only the
+; non-negative entries. Refused writes are snapshotted too, so the two
+; can never drift apart.
+Global Dim tdLog.i[#LOG_MAX]
+Global tdLogN.i       = 0
+Global tdLogLost.i    = 0
+Global Dim tdSnap.a[#SNAP_MAX * 512]
+Global tdSnapN.i      = 0
+Global tdSnapLost.i   = 0
+Global tdWrites.i     = 0
+Global tdWOutside.i   = 0   ; writes outside the partition, counted here
+                            ; as well - the harness proves it from the
+                            ; trace, this is only the cheap cross-check
+Global tdWFailLba.i   = -1
+Global tdMisalignedW.i = 0
+
+; The partition the harness fabricated. Written here as literals so that
+; this file can tell "outside the partition" from "inside it" without
+; asking fat.pi4, which is the thing being tested.
+#TD_PART_LBA  = 63
+#TD_PART_SECS = 66600
+
+Procedure Chk(v.i)
+  If nres < #RES_MAX
+    res[nres] = v
+  EndIf
+  nres = nres + 1
+EndProcedure
+
+Procedure TdMark(tag.i)
+  If tdLogN < #LOG_MAX
+    tdLog[tdLogN] = 0 - tag
+    tdLogN = tdLogN + 1
+  Else
+    tdLogLost = tdLogLost + 1
+  EndIf
+EndProcedure
+
+; The block reader. Same signature as SdReadBlock, and it enforces the
+; same 4-byte alignment rule, so any buffer fat.pi4 hands it that
+; SdReadBlock would have rejected is counted and fails the read.
+Procedure.i TdRead(lba.i, *buf)
+  Define i.i
+  Define *src
+  tdReads = tdReads + 1
+  If (*buf & 3) <> 0
+    tdMisaligned = tdMisaligned + 1
+    ProcedureReturn 0
+  EndIf
+  If lba < 0 Or lba >= #TD_SECTORS
+    ProcedureReturn 0
+  EndIf
+  If lba = tdFailLba
+    ProcedureReturn 0
+  EndIf
+  ; Which of fat.pi4's two paths handed us this buffer? A buffer inside
+  ; the caller's own destination is the DIRECT path; anything else is
+  ; the bounce through fat_secBuf. This is the only way to prove from
+  ; outside that both paths ran.
+  If *buf >= @dstA[0] And *buf < (@dstA[0] + #DST_BYTES)
+    tdIntoA = tdIntoA + 1
+  EndIf
+  If *buf >= @dstU[0] And *buf < (@dstU[0] + #DST_BYTES)
+    tdIntoU = tdIntoU + 1
+  EndIf
+  *src = @tdisk[0] + (lba * 512)
+  i = 0
+  While i < 128
+    PokeL(*buf + (i * 4), PeekN(*src + (i * 4)))
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The block writer. Same signature as MscWriteBlock, same 4-byte
+; alignment rule, and it records EVERYTHING before it decides whether to
+; do anything - a refused write is still an attempt and the harness must
+; be able to see it.
+Procedure.i TdWrite(lba.i, *buf)
+  Define i.i
+  Define *dst
+  tdWrites = tdWrites + 1
+
+  If tdLogN < #LOG_MAX
+    tdLog[tdLogN] = lba
+    tdLogN = tdLogN + 1
+  Else
+    tdLogLost = tdLogLost + 1
+  EndIf
+
+  If lba < #TD_PART_LBA Or lba >= (#TD_PART_LBA + #TD_PART_SECS)
+    tdWOutside = tdWOutside + 1
+  EndIf
+
+  ; The whole sector, byte at a time. PokeL/PeekN would be four times
+  ; quicker and cannot be used here: this runs BEFORE the alignment
+  ; check below, on purpose, so that a misaligned buffer is still
+  ; recorded and the snapshot index cannot drift away from the trace
+  ; index. A 32-bit load of a misaligned buffer is exactly the thing
+  ; being tested for.
+  If tdSnapN < #SNAP_MAX
+    *dst = @tdSnap[0] + (tdSnapN * 512)
+    i = 0
+    While i < 512
+      PokeA(*dst + i, PeekA(*buf + i))
+      i = i + 1
+    Wend
+    tdSnapN = tdSnapN + 1
+  Else
+    tdSnapLost = tdSnapLost + 1
+  EndIf
+
+  If (*buf & 3) <> 0
+    tdMisalignedW = tdMisalignedW + 1
+    ProcedureReturn 0
+  EndIf
+  If lba < 0 Or lba >= #TD_SECTORS
+    ProcedureReturn 0
+  EndIf
+  If lba = tdWFailLba
+    ProcedureReturn 0
+  EndIf
+
+  *dst = @tdisk[0] + (lba * 512)
+  i = 0
+  While i < 128
+    PokeL(*dst + (i * 4), PeekN(*buf + (i * 4)))
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; Change one byte of the medium. Every corruption case below is written
+; as a poke and a restore so the volume is good again afterwards.
+Procedure TdPoke(lba.i, off.i, v.i)
+  PokeA(@tdisk[0] + (lba * 512) + off, v)
+EndProcedure
+
+Procedure Main()
+  Define n.i
+  Define i.i
+  Define total.i
+
+  ; ---- 1. no reader is a refusal, not a guess ------------------------
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  Chk(FatBlockReader())
+
+  FatSetBlockReader(@TdRead)
+  Chk(FatBlockReader() <> 0)
+
+  ; ---- 2. the partition number is 1..4 -------------------------------
+  Chk(FatMount(0))
+  Chk(FatLastError())
+  Chk(FatMount(5))
+  Chk(FatLastError())
+
+  ; ---- 3. the good mount, and every number it derived ----------------
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  Chk(FatMounted())
+  Chk(FatType())
+  Chk(FatPartitionType())
+  Chk(FatPartitionLba())
+  Chk(FatPartitionSectors())
+  Chk(FatTotalSectors())
+  Chk(FatBytesPerCluster())
+  Chk(FatClusterCount())
+  Chk(FatFatLba())
+  Chk(FatDataLba())
+  Chk(FatRootCluster())
+
+  ; ---- 4. the file - not the first entry, chain not contiguous -------
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatLastError())
+  Chk(FatSize())
+  Chk(FatFirstCluster())
+  Chk(FatIsOpen())
+  n = FatRead(@dstA[0], #DST_BYTES)
+  Chk(n)
+  Chk(FatTell())
+  Chk(FatRead(@dstA[0] + 2600, 100))      ; past the end - clean EOF
+  Chk(FatLastError())
+
+  ; ---- 5. the same bytes, read a hundred at a time -------------------
+  Chk(FatRewind())
+  Chk(FatTell())
+  total = 0
+  i = 0
+  While i < 40
+    n = FatRead(@dstB[0] + total, 100)
+    If n <= 0
+      Break
+    EndIf
+    total = total + n
+    i = i + 1
+  Wend
+  Chk(total)
+  Chk(FatTell())
+
+  ; ---- 6. an UNALIGNED destination - the bounce path all the way -----
+  Chk(FatOpen("PMF.IMG"))
+  n = FatRead(@dstU[0] + 1, #DST_BYTES - 1)
+  Chk(n)
+
+  ; ---- 7. lowercase, and a name sitting behind a long-name run -------
+  Chk(FatOpen("pmf.img"))
+  Chk(FatSize())
+  Chk(FatOpen("LONGNA~1.IMG"))
+  Chk(FatSize())
+
+  ; ---- 8. names that are REFUSED rather than searched for ------------
+  Chk(FatOpen("verylongname.img"))
+  Chk(FatLastError())
+  Chk(FatOpen("BOOT/PMF.IMG"))
+  Chk(FatLastError())
+  Chk(FatOpen("A.B.C"))
+  Chk(FatLastError())
+  Chk(FatOpen("PMF.IMGS"))
+  Chk(FatLastError())
+
+  ; ---- 9. what the scan must skip, and where it must stop ------------
+  ; PMF.IMG is entry 6. Entry 1 is a deleted ($E5) entry, entries 2-3
+  ; are a long-name ($0F) run and entry 0 is the volume label - finding
+  ; PMF.IMG at all is the proof that none of the three stopped the scan.
+  Chk(FatOpen("PMFBOOT"))
+  Chk(FatLastError())
+  Chk(FatOpen("SUBDIR"))
+  Chk(FatLastError())
+  Chk(FatOpen("NOPE.TXT"))
+  Chk(FatLastError())
+
+  ; ---- 10. corrupt directory entries ---------------------------------
+  Chk(FatOpen("OFFVOL.BIN"))
+  Chk(FatLastError())
+  Chk(FatOpen("NOCLUS.BIN"))
+  Chk(FatLastError())
+  Chk(FatOpen("HUGE.BIN"))
+  Chk(FatLastError())
+
+  ; ---- 11. an empty file is a file, not an error ---------------------
+  Chk(FatOpen("EMPTY.TXT"))
+  Chk(FatSize())
+  Chk(FatFirstCluster())
+  Chk(FatRead(@dstX[0], 100))
+  Chk(FatLastError())
+
+  ; ---- 12. chains that must be refused rather than walked ------------
+  Chk(FatOpen("LOOP.IMG"))
+  Chk(FatRead(@dstX[0], #DST_BYTES))
+  Chk(FatLastError())
+  Chk(FatOpen("SELF.IMG"))
+  Chk(FatRead(@dstX[0], #DST_BYTES))
+  Chk(FatLastError())
+  Chk(FatOpen("SHORT.BIN"))
+  Chk(FatRead(@dstX[0], #DST_BYTES))
+  Chk(FatLastError())
+  Chk(FatOpen("BADMARK.BIN"))
+  Chk(FatRead(@dstX[0], #DST_BYTES))
+  Chk(FatLastError())
+
+  ; ---- 13. the medium failing mid-file -------------------------------
+  Chk(FatOpen("PMF.IMG"))
+  tdFailLba = 1126                    ; the file's SECOND cluster
+  Chk(FatRead(@dstX[0], #DST_BYTES))
+  Chk(FatLastError())
+  Chk(FatLastLba())
+  tdFailLba = -1
+
+  ; ---- 14. FatRead's own argument refusals ---------------------------
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatRead(0, 100))
+  Chk(FatLastError())
+  Chk(FatRead(@dstX[0], -1))
+  Chk(FatLastError())
+  FatClose()
+  Chk(FatIsOpen())
+  Chk(FatRead(@dstX[0], 100))
+  Chk(FatLastError())
+  Chk(FatSize())
+  Chk(FatLastError())
+
+  ; ---- 15. MBR refusals ----------------------------------------------
+  TdPoke(0, $1FE, 0)
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(0, $1FE, $55)
+
+  TdPoke(0, $1CE, 1)                  ; slot 2 status byte
+  Chk(FatMount(2))
+  Chk(FatLastError())
+  TdPoke(0, $1CE, 0)
+
+  Chk(FatMount(3))                    ; slot 3 type byte is $00
+  Chk(FatLastError())
+
+  TdPoke(0, $1D2, $EE)                ; slot 2 type -> protective MBR
+  Chk(FatMount(2))
+  Chk(FatLastError())
+  TdPoke(0, $1D2, $06)
+  Chk(FatMount(2))                    ; slot 2 type is FAT16
+  Chk(FatLastError())
+
+  TdPoke(0, $1E2, $0C)                ; slot 3 says FAT32 with lba 0
+  Chk(FatMount(3))
+  Chk(FatLastError())
+  TdPoke(0, $1E2, 0)
+
+  ; ---- 16. boot sector refusals ---------------------------------------
+  TdPoke(63, $1FE, 0)
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $1FE, $55)
+
+  TdPoke(63, $0C, 4)                  ; BytsPerSec = 1024
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $0C, 2)
+
+  TdPoke(63, $0D, 3)                  ; SecPerClus = 3, not a power of two
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $0D, 1)
+
+  TdPoke(63, $0E, 0)                  ; RsvdSecCnt = 0
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $0E, 32)
+
+  TdPoke(63, $10, 0)                  ; NumFATs = 0
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $10, 2)
+
+  TdPoke(63, $24, $40)                ; FATSz32 = 40000 - metadata > volume
+  TdPoke(63, $25, $9C)
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $24, $00)
+  TdPoke(63, $25, $02)
+
+  TdPoke(63, $20, $29)                ; TotSec32 = 66601 > the partition
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $20, $15)
+
+  TdPoke(63, $16, 1)                  ; FATSz16 nonzero on a FAT32 volume
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $16, 0)
+
+  TdPoke(63, $11, $10)                ; RootEntCnt = 16, TotSec32 = 66582
+  TdPoke(63, $20, $16)
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $11, 0)
+  TdPoke(63, $20, $15)
+
+  TdPoke(63, $2A, 1)                  ; FSVer = 1
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $2A, 0)
+
+  TdPoke(63, $28, $82)                ; ExtFlags: active FAT 2 of 2
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $28, $81)                ; active FAT 1 - the mirror
+  Chk(FatMount(1))
+  Chk(FatFatLba())
+  TdPoke(63, $28, 0)
+
+  TdPoke(63, $2C, 0)                  ; RootClus = 0
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  TdPoke(63, $2C, 2)
+
+  ; ---- 17. FAT16 and FAT12, refused BY CLUSTER COUNT ------------------
+  ; Both partitions carry the FAT32 type byte $0C, so a reader that
+  ; trusted the MBR - or the "FAT32   " string in the boot sector -
+  ; would sail straight past. 65524 clusters is FAT16 and 65525 is
+  ; FAT32: the good volume above is exactly on the boundary.
+  Chk(FatMount(4))
+  Chk(FatLastError())
+  Chk(FatType())
+  TdPoke(0, $1F6, $D1)                ; slot 4 start 2000 -> 2001
+  Chk(FatMount(4))
+  Chk(FatLastError())
+  Chk(FatType())
+  TdPoke(0, $1F6, $D0)
+
+  ; ---- 18. a ROOT DIRECTORY THAT LOOPS - the one that really hangs ----
+  TdPoke(63, $2C, 3)                  ; root cluster 3, whose FAT entry is 3
+  Chk(FatMount(1))
+  Chk(FatRootCluster())
+  Chk(FatOpen("NOPE.TXT"))
+  Chk(FatLastError())
+  TdPoke(63, $2C, 2)
+
+  ; ---- 19. an operation before a successful mount ---------------------
+  TdPoke(0, $1FE, 0)
+  Chk(FatMount(1))
+  TdPoke(0, $1FE, $55)
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatLastError())
+
+  ; ---- 20. the volume still mounts and still reads ---------------------
+  Chk(FatMount(1))
+  Chk(FatType())
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatSize())
+  FatClose()
+
+  ; ---- 21. the reader was never handed a buffer it would refuse -------
+  Chk(tdMisaligned)
+  Chk(tdReads > 0)
+  ; The aligned whole-file read took the DIRECT path for its four full
+  ; sectors and bounced only the 452-byte tail; the unaligned one
+  ; bounced every sector. Both paths ran, and neither was guessed at.
+  Chk(tdIntoA)
+  Chk(tdIntoU)
+
+  ; ====================================================================
+  ;  THE WRITE HALF
+  ; ====================================================================
+  ; From here the medium is CHANGED. Everything below is verified twice:
+  ; once by this program asking fat.pi4 what it thinks happened, and
+  ; once by the harness reading tdisk[] back out of memory afterwards
+  ; and parsing the FAT, the directory and FSInfo for itself. Only the
+  ; second of those two is evidence; the first is a convenience for
+  ; finding out WHERE it went wrong.
+  ; ====================================================================
+
+  ; The source pattern. Deliberately not the same shape as the read
+  ; half's, so that a byte of one appearing where the other belongs is
+  ; obvious rather than plausible.
+  i = 0
+  While i < #WSRC_BYTES
+    wsrc[i] = ((((i / 512) * 91) + ((i % 512) * 29)) + 200) % 256
+    i = i + 1
+  Wend
+
+  ; ---- 22. no writer is a refusal, exactly like no reader -------------
+  Chk(FatBlockWriter())
+  Chk(FatMount(1))
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatWrite(@wsrc[0], 10))
+  Chk(FatLastError())
+  Chk(FatOverwrite(@wsrc[0], 2500))
+  Chk(FatLastError())
+  Chk(FatCreate("X.BIN"))
+  Chk(FatLastError())
+  Chk(FatDelete("PMF.IMG"))
+  Chk(FatLastError())
+
+  FatSetBlockWriter(@TdWrite)
+  Chk(FatBlockWriter() <> 0)
+  Chk(tdWrites)                       ; still nothing written
+
+  ; ---- 23. what the mount found out about free space ------------------
+  Chk(FatFsInfoValid())
+  Chk(FatFsInfoLba())
+  Chk(FatFreeClusters())              ; -1: FSInfo said "unknown"
+  Chk(FatNextFreeHint())              ; 0, likewise
+  Chk(FatFreeScanned())               ; 0 - nothing has needed it yet
+  Chk(FatMirrorsFats())
+  Chk(FatNumFats())
+  Chk(FatFatBase())
+  Chk(FatFatEnd())
+  Chk(FatDataEnd())
+
+  ; ---- 24. GROW ACROSS A CLUSTER BOUNDARY -----------------------------
+  ; PMF.IMG is 2500 bytes over the chain 5 -> 9 -> 6 -> 12 -> 8, which
+  ; is four full 512-byte clusters and a 452-byte tail. Appending 300
+  ; bytes fills that tail and needs exactly ONE new cluster, so this is
+  ; the smallest write that exercises allocation, chaining, a partial
+  ; sector at both ends, and the directory size update.
+  TdMark(1)
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatSize())
+  n = FatSize()
+  Chk(FatSeek(n))
+  Chk(FatTell())
+  Chk(FatWrite(@wsrc[0], 300))
+  Chk(FatLastError())
+  Chk(FatSize())
+  Chk(FatTell())
+  Chk(FatFreeScanned())               ; 1 - the first allocation had to
+                                      ; rebuild the count FSInfo did not
+                                      ; have
+  Chk(FatFreeClusters())
+  Chk(FatDirEntryLba())
+  Chk(FatDirEntryOffset())
+  TdMark(2)
+
+  ; ---- 25. read it back through a COMPLETELY FRESH open ---------------
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatSize())
+  Chk(FatRead(@dstW[0], #DST_BYTES))
+
+  ; ---- 26. TRUNCATE ----------------------------------------------------
+  TdMark(3)
+  Chk(FatOpen("PMF.IMG"))
+  Chk(FatTruncate(3000))              ; bigger: refused, not invented
+  Chk(FatLastError())
+  Chk(FatTruncate(-1))
+  Chk(FatLastError())
+  Chk(FatSize())                      ; unchanged by either refusal
+  Chk(FatTruncate(1000))
+  Chk(FatLastError())
+  Chk(FatSize())
+  Chk(FatTell())                      ; 0 - the read position was there
+  Chk(FatRead(@dstX[0], #DST_BYTES))  ; 1000, not 2800
+  Chk(FatRead(@dstX[0], #DST_BYTES))  ; 0 - the new end really is an end
+  Chk(FatRewind())
+  TdMark(4)
+
+  ; ---- 27. CREATE, write, close, and find it again --------------------
+  TdMark(5)
+  Chk(FatCreate("NEW.BIN"))
+  Chk(FatIsOpen())
+  Chk(FatSize())
+  Chk(FatFirstCluster())              ; 0 - an empty file has no chain
+  Chk(FatAttributes())                ; $20 ARCHIVE
+  Chk(FatCreate("NEW.BIN"))           ; again: refused, not reopened
+  Chk(FatLastError())
+  Chk(FatOpen("NEW.BIN"))
+  Chk(FatSize())
+  Chk(FatWrite(@wsrc[0], 1300))
+  Chk(FatSize())
+  Chk(FatFirstCluster())
+  FatClose()
+  Chk(FatOpen("NEW.BIN"))
+  Chk(FatSize())
+  Chk(FatFirstCluster())
+  Chk(FatRead(@dstN[0], #DST_BYTES))
+  TdMark(6)
+
+  ; ---- 28. a create that has to EXTEND the root directory -------------
+  ; The root directory is one cluster of sixteen entries and the last of
+  ; them is the $00 end marker. Taking it leaves nowhere to put the new
+  ; marker, so the directory has to grow by a cluster - and the cluster
+  ; has to be zeroed before it is linked, or the scan runs into a
+  ; deleted file's bytes and reads them as entries.
+  TdMark(7)
+  Chk(FatCreate("TWO.BIN"))
+  Chk(FatDirEntryLba())               ; still the first root cluster
+  Chk(FatDirEntryOffset())            ; 480 - the sixteenth slot
+  Chk(FatWrite(@wsrc[0], 100))
+  Chk(FatSize())
+  FatClose()
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatSize())
+  ; and now the SECOND root cluster is where a new entry goes
+  Chk(FatCreate("THREE.BIN"))
+  Chk(FatDirEntryLba())
+  Chk(FatDirEntryOffset())
+  Chk(FatOpen("THREE.BIN"))           ; a fresh scan walks into it
+  Chk(FatSize())
+  TdMark(8)
+
+  ; ---- 29. DELETE -----------------------------------------------------
+  TdMark(9)
+  Chk(FatDelete("NEW.BIN"))
+  Chk(FatLastError())
+  Chk(FatOpen("NEW.BIN"))
+  Chk(FatLastError())
+  Chk(FatDelete("NOPE.TXT"))
+  Chk(FatLastError())
+  Chk(FatDelete("SUBDIR"))            ; a directory is refused
+  Chk(FatLastError())
+  Chk(FatDelete("verylongname.img"))  ; not an 8.3 name
+  Chk(FatLastError())
+  TdMark(10)
+
+  ; ---- 30. FatOverwrite, which can now resize -------------------------
+  TdMark(11)
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatSize())
+  Chk(FatOverwrite(@wsrc[0], 1700))   ; GROWS from 100 bytes
+  Chk(FatLastError())
+  Chk(FatSize())
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatSize())
+  Chk(FatRead(@dstO[0], #DST_BYTES))
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatOverwrite(@wsrc[0], 40))     ; SHRINKS to 40
+  Chk(FatSize())
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatSize())
+  TdMark(12)
+
+  ; ---- 31. the write side's own argument refusals ---------------------
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatWrite(0, 10))
+  Chk(FatLastError())
+  Chk(FatWrite(@wsrc[0], -1))
+  Chk(FatLastError())
+  Chk(FatWrite(@wsrc[0], 0))          ; zero bytes is 0, not an error
+  Chk(FatLastError())
+  Chk(FatSeek(41))                    ; past the end
+  Chk(FatLastError())
+  Chk(FatSeek(-1))
+  Chk(FatLastError())
+  Chk(FatSeek(40))                    ; the append position IS allowed
+  Chk(FatLastError())
+  FatClose()
+  Chk(FatWrite(@wsrc[0], 10))
+  Chk(FatLastError())
+  Chk(FatTruncate(0))
+  Chk(FatLastError())
+  Chk(FatSeek(0))
+  Chk(FatLastError())
+
+  ; ---- 32. a read-only entry is refused by all three --------------------
+  TdPoke(1119, 139, $21)              ; LONGNA~1.IMG: ARCHIVE|READ_ONLY
+  Chk(FatMount(1))                    ; remount, so nothing is cached
+  Chk(FatOpen("LONGNA~1.IMG"))
+  Chk(FatAttributes())
+  Chk(FatWrite(@wsrc[0], 4))
+  Chk(FatLastError())
+  Chk(FatTruncate(0))
+  Chk(FatLastError())
+  Chk(FatDelete("LONGNA~1.IMG"))
+  Chk(FatLastError())
+  TdPoke(1119, 139, $20)
+  Chk(FatMount(1))
+
+  ; ---- 33. an FSInfo hint that IS valid is honoured ---------------------
+  ; Cluster 700 is free and a long way from anywhere the allocator has
+  ; been, so a file that lands on it can only have got there by reading
+  ; the hint.
+  TdPoke(64, $1EC, $BC)               ; FSI_Nxt_Free = 700
+  TdPoke(64, $1ED, $02)
+  TdPoke(64, $1EE, $00)
+  TdPoke(64, $1EF, $00)
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  Chk(FatNextFreeHint())
+  Chk(FatFreeScanned())               ; 0
+  Chk(FatCreate("HINT.BIN"))
+  Chk(FatWrite(@wsrc[0], 10))
+  Chk(FatFirstCluster())              ; 700, because the hint was used
+  Chk(FatFreeScanned())               ; still 0 - no scan was needed
+  TdMark(13)
+
+  ; ---- 34. an FSInfo whose signature is wrong is LEFT ALONE -------------
+  ; The BPB can point at any sector in the reserved region. If what is
+  ; there is not an FSInfo structure, writing a free-cluster count into
+  ; it would be writing over something else - the backup boot sector
+  ; lives in that region too. So the mount reports it and the sector is
+  ; never touched again; the harness proves the sector was not written.
+  TdMark(14)
+  TdPoke(64, 0, $00)                  ; break FSI_LeadSig
+  Chk(FatMount(1))                    ; still mounts
+  Chk(FatLastError())
+  Chk(FatMounted())
+  Chk(FatFsInfoValid())
+  Chk(FatFsInfoLba())
+  Chk(FatCreate("NOFSI.BIN"))         ; allocation still works
+  Chk(FatWrite(@wsrc[0], 10))
+  Chk(FatFreeScanned())               ; 1 - it had to count for itself
+  TdMark(15)
+  TdPoke(64, 0, $52)                  ; put "RRaA" back
+  Chk(FatMount(1))
+  Chk(FatLastError())
+  Chk(FatFsInfoValid())
+  ; The count on the medium is stale now, because the last few
+  ; allocations had nowhere to record themselves. This is the call that
+  ; fixes that, and it is the only thing that can.
+  Chk(FatRescanFree())
+  Chk(FatLastError())
+
+  ; ---- 35. the medium refusing a write ----------------------------------
+  Chk(FatOpen("TWO.BIN"))
+  n = FatDataLba() + (FatFirstCluster() - 2)
+  tdWFailLba = n
+  Chk(FatWrite(@wsrc[0], 20))
+  Chk(FatLastError())
+  Chk(FatLastLba() = n)
+  tdWFailLba = -1
+  Chk(FatOpen("TWO.BIN"))
+  Chk(FatSize())                      ; unchanged - the refusal was total
+
+  ; ---- 36. one deletion left standing, for the harness to inspect -------
+  ; Everything deleted so far has had its slot recycled by a later
+  ; create, which is the right behaviour and leaves nothing to look at.
+  ; This one is last, so the finished image carries a $E5 entry and a
+  ; chain that really was returned to the free pool.
+  TdMark(16)
+  Chk(FatDelete("HINT.BIN"))
+  Chk(FatLastError())
+  Chk(FatOpen("HINT.BIN"))
+  Chk(FatLastError())
+  TdMark(17)
+
+  ; ---- 37. the writer's contract, counted from outside ------------------
+  Chk(tdMisalignedW)                  ; 0 - never handed a bad buffer
+  Chk(tdWOutside)                     ; 0 - never aimed outside
+  Chk(tdWrites > 0)
+  Chk(tdLogLost)                      ; 0 - the trace is complete
+  Chk(tdSnapLost)                     ; 0 - and so are the snapshots
+  Chk(nres)
+EndProcedure
+
+Main()

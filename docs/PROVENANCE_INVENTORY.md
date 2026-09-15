@@ -863,6 +863,7 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/interrupts.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | llvm-19.1.0 | Apache-2.0 WITH LLVM-exception | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4Atomics.pi4` | hardware-facts | llvm-19.1.0 | Apache-2.0 WITH LLVM-exception | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | consulted | uboot-v2025.01 | GPL-2.0-or-later | cite the source; no notice obligation |
 | `RaspberryPi4/Lib/mmu.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
@@ -919,14 +920,67 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/v3d.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/v3d.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/v3d.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqconprobe.unoq` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqcoreproof.unoq` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqefiprobe.unoq` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqsliprxprobe.unoq` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/anvilqprobe.unoq` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicTimer.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4NeonLiar.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DisplayProbe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DmaProbe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Dwc2Device.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Dwc2Probe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Entropy.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4FbAsk.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4FbSettle.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4GenetProbe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidOneShot.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidTiming.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Install.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4MmuCycleDF.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4MmuState.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4NeonSurface.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4PcieProbe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4PcieState.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4SdioProbe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4SlowSpin.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Vl805Bar.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/v3d.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/v3dqpu.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqgpuprobe.unoq` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4NeonBox.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4NeonChrome.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4NeonGate.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dAtlas.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dClear.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dCsd.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dFbClear.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dQpuAsm.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dTex.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dTfu.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dTri.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/v3dqpu.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dCsd.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dQpuAsm.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dTri.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wifi.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wifi.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wpa2sup.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wpa2sup.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wpa2sup.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wpa2sup.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wpa2sup.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wpa2sup.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
@@ -934,13 +988,32 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/x25519.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/x509.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/x509_blob.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
+| `tools/fixtures/t0vm/pemdec_blob.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/xhci.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/xhci.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/xhci.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicProbe.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicTimer.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4NeonLiar.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4SmpWake.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4MmuState.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/xhci.pi4` | consulted | uboot-v2025.01 | GPL-2.0-or-later | cite the source; no notice obligation |
 | `RaspberryPi4/Lib/xhci.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Monitor/anvil_fonts.pi4` | consulted | dejavu-fonts | DejaVu/Bitstream Vera | cite the source; no notice obligation; `licenses/DejaVu-Fonts-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Tests/Fixtures/dsi_panel_v1.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqefiprobe.unoq` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqgpuprobe.unoq` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqnetproof.unoq` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicProbe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicTimer.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HciProbe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HdmiAudioProbe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4BootContainerSelfTest.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DisplayProbe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DmaProbe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Dwc2Probe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4FanSelfTest.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4SdioProbe.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/Fixtures/dsi_panel_v1.pi4` | consulted | linux-v6.12 | GPL-2.0 (per file) | cite the source; no notice obligation |
 | `RaspberryPi4/Tests/Fixtures/dsi_panel_v1.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/dhcp_emitted_gate.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
@@ -951,5 +1024,68 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Tests/i2c_mcu_write_timeline_probe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/i2c_touch_recovery_probe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/pbkdf2_step_emitted_gate.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqefiprobe.unoq` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4AesSelfTest.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/touch_goodix_compile.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqconprobe.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqcoreproof.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqgpuprobe.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/anvilqprobe.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4Atomics.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicTimer.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HciProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HdmiAudioProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HdmiAudioTone.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4TouchProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DisplayProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DmaProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Dwc2Device.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Dwc2Probe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Entropy.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4FbAsk.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidOneShot.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidTiming.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4NeonChrome.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4SdioProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dClear.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dCsd.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dIdent.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Tests/touch_goodix_compile.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqdrbg.unoq` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqnetproof.unoq` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/anvilqprobe.unoq` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4Atomics.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicProbe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4NeonLiar.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4TouchProbe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4AesSelfTest.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DmaGate.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4DmaProbe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Dwc2Probe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Entropy.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidBudget.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidKeys.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidOneShot.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidSelfTest.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HidTiming.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4HubWatch.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Install.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4MmuState.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4OrderCost.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4PcieProbe.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4PcieState.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4UsbConfig.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4UsbDisk.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4UsbEnum.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4V3dTfu.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4Vl805Bar.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4XhciHw.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/pi4XhciSelfTest.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |

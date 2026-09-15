@@ -134,7 +134,6 @@ def build_mask_mutant(compiler: Path, work: Path) -> Path:
     tests = root / "RaspberryPi4" / "Tests"
     lib.mkdir(parents=True)
     tests.mkdir(parents=True)
-    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
     shutil.copytree(
         ROOT / "RaspberryPi4" / "Intrinsics",
         root / "RaspberryPi4" / "Intrinsics",

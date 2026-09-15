@@ -332,16 +332,6 @@ def main():
             with tempfile.TemporaryDirectory(prefix="anvil-i2c-trace-mutant-") as td:
                 staged = pathlib.Path(td)
                 shutil.copytree(ROOT / "RaspberryPi4", staged / "RaspberryPi4")
-                # THIS REPOSITORY'S keyword table, the way every other gate
-                # stages one. It used to be taken from the compiler's own
-                # directory, which assumed the executable is being run out of
-                # its install tree - false the moment anybody snapshots the
-                # compiler to hold one binary still across a long sweep, which
-                # is exactly what a bench that rebuilds it four times a day
-                # has to do. The two tables cannot disagree anyway: the
-                # compiler refuses a project table that restates one of its
-                # own keywords differently.
-                shutil.copy2(ROOT / "keywords.def", staged / "keywords.def")
                 compiler_intrinsics = compiler.parent / "RaspberryPi4/Intrinsics"
                 if compiler_intrinsics.is_dir():
                     shutil.copytree(compiler_intrinsics,

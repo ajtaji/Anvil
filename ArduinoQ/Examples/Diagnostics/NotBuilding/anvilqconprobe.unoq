@@ -1,0 +1,793 @@
+; ======================================================================
+;  anvilqconprobe.unoq - Arduino UNO Q (QCM2290) CONSOLE PROBE.
+;
+;  WHY THIS EXISTS. ArduinoQ/Board/README.md records the blocker on the Q
+;  in one sentence: "Anvil's core is a command loop over a line editor: it
+;  needs to *read* bytes as well as write them", and the only byte path
+;  the board was known to offer - the GENI SE4 UART at 0x04A90000 - is
+;  1.8 V with no level shifter on the bench. That made input a HARDWARE
+;  blocker.
+;
+;  But anvilqcoreproof.unoq proved something the blocker note did not use:
+;  the Q runs Anvil as a **UEFI application with boot services still up**.
+;  It is launched by systemd-boot under U-Boot's EFI implementation, it
+;  never calls ExitBootServices, and it hands the board back with
+;  RuntimeServices->ResetSystem. While boot services are up the firmware
+;  is *obliged* to publish a console: EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL on
+;  SystemTable->ConOut and EFI_SIMPLE_TEXT_INPUT_PROTOCOL on
+;  SystemTable->ConIn (UEFI 2.10, sections 12.3 and 12.4). Those are a
+;  keyboard and a screen for free, routed to whatever the firmware already
+;  drives - and they need no level shifter.
+;
+;  RULE 21 SAYS MEASURE, DO NOT GUESS. So this probe does not assume any
+;  of that is wired up on THIS board. It asks the firmware, four
+;  questions, and writes down the answers:
+;
+;    1. CONOUT. Is SystemTable->ConOut non-NULL? What does its Mode say
+;       (MaxMode / Mode / Attribute / cursor)? What does QueryMode(0)
+;       report for columns and rows? Does OutputString() actually return
+;       EFI_SUCCESS - i.e. is anything downstream of it alive?
+;
+;    2. CONIN. Is SystemTable->ConIn non-NULL, and does it carry a
+;       WaitForKey event? Does ReadKeyStroke() answer EFI_NOT_READY
+;       (0x8000000000000006 - "the protocol is there, no key is waiting",
+;       which is what we WANT to see) or EFI_DEVICE_ERROR / EFI_UNSUPPORTED
+;       (no input device behind it at all)? It then polls for ~6 seconds
+;       so that a key pressed on any attached keyboard or console is
+;       caught and reported - that would prove a live interactive path.
+;
+;    3. GOP. Does BootServices->LocateProtocol find
+;       EFI_GRAPHICS_OUTPUT_PROTOCOL? If it does, the board is driving a
+;       display and we get FrameBufferBase / size / resolution / pixel
+;       format - which is both proof ConOut has somewhere visible to land
+;       AND the route to a real screenshot.
+;
+;    4. ESP FILE WRITE. Can the app write a FILE to the EFI System
+;       Partition, via LoadedImage->DeviceHandle ->
+;       SimpleFileSystem->OpenVolume->Open->Write? This matters enormously:
+;       the phase-1 output channel is a UEFI variable, and U-Boot's whole
+;       variable store on this board is about 1.5 KB. A file on the ESP is
+;       unbounded and Linux reads it straight off /boot/efi over SSH. If
+;       this works, Anvil on the Q gets a real transcript and a real
+;       screenshot instead of a 2 KB budget.
+;
+;  It reports through BOTH channels: the proven UEFI-variable sink
+;  (qsink.pi4 -> AnvilQTxt, read by tools/read_anvil_proof.py) and, if
+;  question 4 says yes, the same text as \EFI\anvil\qconprobe.log on the
+;  ESP. Then it resets back to Debian exactly like the core proof does, so
+;  the board always comes back.
+;
+;  BUILD:  tools/build_unoq_conprobe.sh   (-t unoq, then EFI-wrap)
+; ======================================================================
+
+EnableExplicit
+
+; ---- Q-local backends first (they define the seams the core needs) ---
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "ArduinoQ/Board/hwinfo_q.unoq"
+; ---- portable core, reused unchanged --------------------------------
+XIncludeFile "Anvil/Core/format.pbi"
+
+; ======================================================================
+;  UEFI structure offsets. Every one of these is from the UEFI 2.10
+;  specification; they are named rather than inlined so a reader can check
+;  them against the document without decoding a magic number.
+; ======================================================================
+
+; EFI_SYSTEM_TABLE (UEFI 2.10 s4.3). Hdr is 24 bytes, then pointers.
+#ST_CONIN         = $30      ; EFI_SIMPLE_TEXT_INPUT_PROTOCOL  *ConIn
+#ST_CONOUT        = $40      ; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut
+#ST_RUNTIME       = $58      ; EFI_RUNTIME_SERVICES            *RuntimeServices
+#ST_BOOT          = $60      ; EFI_BOOT_SERVICES               *BootServices
+
+; EFI_RUNTIME_SERVICES (s4.5) - the two the proof already uses.
+#RT_SETVARIABLE   = $58
+#RT_RESETSYSTEM   = $68
+
+; EFI_BOOT_SERVICES (s4.4). Hdr 24 bytes, then the function table in the
+; spec's order; these are the four this probe calls.
+#BS_HANDLEPROTOCOL  = $98
+#BS_STALL           = $F8
+#BS_LOCATEPROTOCOL  = $140
+
+; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL (s12.4).
+#TXO_RESET        = $00
+#TXO_OUTPUTSTRING = $08
+#TXO_QUERYMODE    = $18
+#TXO_SETMODE      = $20
+#TXO_SETATTR      = $28
+#TXO_CLEARSCREEN  = $30
+#TXO_SETCURSOR    = $38
+#TXO_ENABLECURSOR = $40
+#TXO_MODE         = $48      ; -> SIMPLE_TEXT_OUTPUT_MODE
+
+; SIMPLE_TEXT_OUTPUT_MODE (s12.4) - five INT32 then a BOOLEAN.
+#TXOM_MAXMODE     = $00
+#TXOM_MODE        = $04
+#TXOM_ATTRIBUTE   = $08
+#TXOM_CURSORCOL   = $0C
+#TXOM_CURSORROW   = $10
+#TXOM_CURSORVIS   = $14
+
+; EFI_SIMPLE_TEXT_INPUT_PROTOCOL (s12.3).
+#TXI_RESET        = $00
+#TXI_READKEY      = $08
+#TXI_WAITFORKEY   = $10      ; EFI_EVENT, not a function pointer
+
+; EFI_GRAPHICS_OUTPUT_PROTOCOL (s12.9).
+#GOP_QUERYMODE    = $00
+#GOP_SETMODE      = $08
+#GOP_BLT          = $10
+#GOP_MODE         = $18      ; -> EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
+; EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
+#GOPM_MAXMODE     = $00      ; UINT32
+#GOPM_MODE        = $04      ; UINT32
+#GOPM_INFO        = $08      ; EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *
+#GOPM_SIZEOFINFO  = $10      ; UINTN
+#GOPM_FBBASE      = $18      ; EFI_PHYSICAL_ADDRESS
+#GOPM_FBSIZE      = $20      ; UINTN
+; EFI_GRAPHICS_OUTPUT_MODE_INFORMATION
+#GOPI_VERSION     = $00
+#GOPI_HRES        = $04
+#GOPI_VRES        = $08
+#GOPI_PIXFMT      = $0C
+#GOPI_PIXINFO     = $10      ; 4 x UINT32 masks
+#GOPI_PIXPERLINE  = $20
+
+; EFI_LOADED_IMAGE_PROTOCOL (s9.1).
+#LI_REVISION      = $00
+#LI_PARENTHANDLE  = $08
+#LI_SYSTEMTABLE   = $10
+#LI_DEVICEHANDLE  = $18
+
+; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL (s13.4) / EFI_FILE_PROTOCOL (s13.5).
+#SFS_OPENVOLUME   = $08
+#FILE_OPEN        = $08
+#FILE_CLOSE       = $10
+#FILE_READ        = $20
+#FILE_WRITE       = $28
+#FILE_FLUSH       = $50
+
+; EFI_FILE_PROTOCOL open modes (s13.5). CREATE is bit 63, which is the one
+; value in this file that is NOT written as a literal: no hex constant with
+; the top bit set appears anywhere in this tree, so it is built with a shift
+; at run time rather than trusting the tokeniser with $8000000000000000.
+#EFI_FILE_MODE_READ   = 1
+#EFI_FILE_MODE_WRITE  = 2
+
+; Status codes we test for by name.
+#EFI_SUCCESS      = 0
+#EFI_NOT_READY    = $8000000000000006
+
+; "IBI SYST" as a little-endian 64-bit word - EFI_SYSTEM_TABLE signature.
+#EFI_SYST_SIG = $5453595320494249
+; NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+#EFI_ATTR = $7
+
+; ---- captured UEFI entry registers -----------------------------------
+Global gIh.i             ; x0 = EFI ImageHandle at entry
+Global gSt.i             ; x1 = EFI SystemTable at entry
+Global gStSig.i
+
+; ---- resolved protocol pointers --------------------------------------
+Global gConIn.i
+Global gConOut.i
+Global gBs.i
+Global gRt.i
+
+; ---- ConOut findings --------------------------------------------------
+Global gTxoMode.i        ; the SIMPLE_TEXT_OUTPUT_MODE pointer
+Global gTxoMaxMode.i
+Global gTxoCurMode.i
+Global gTxoAttr.i
+Global gTxoCol.i
+Global gTxoRow.i
+Global gQmStatus.i       ; QueryMode(0) status
+Global gQmCols.i
+Global gQmRows.i
+Global gOutStatus.i      ; OutputString() status for the banner
+
+; ---- ConIn findings ---------------------------------------------------
+Global gWaitEvt.i
+Global gKeyStatus1.i     ; first ReadKeyStroke, before any polling
+Global gPollCount.i      ; how many polls the 6 s window ran
+Global gKeyGot.i         ; 1 if a key ever arrived
+Global gKeyScan.i
+Global gKeyChar.i
+Global gKeyStatusLast.i
+
+; ---- GOP findings -----------------------------------------------------
+Global gGopStatus.i
+Global gGop.i
+Global gGopMaxMode.i
+Global gGopCurMode.i
+Global gFbBase.i
+Global gFbSize.i
+Global gHres.i
+Global gVres.i
+Global gPixFmt.i
+Global gPixPerLine.i
+
+; ---- ESP file findings ------------------------------------------------
+Global gLiStatus.i
+Global gLi.i
+Global gDevHandle.i
+Global gSfsStatus.i
+Global gSfs.i
+Global gVolStatus.i
+Global gRoot.i
+Global gFileStatus.i
+Global gFile.i
+Global gWriteStatus.i
+Global gWroteLen.i
+
+; ---- indirect-call scratch for UefiCall5() ----------------------------
+Global gCallFn.i
+Global gCallA0.i
+Global gCallA1.i
+Global gCallA2.i
+Global gCallA3.i
+Global gCallA4.i
+Global gCallRet.i
+
+; ---- buffers ----------------------------------------------------------
+Global Dim gName.b[24]      ; UTF-16LE "AnvilQTxt",0
+Global Dim gGuid.b[16]      ; our vendor GUID for the report variable
+Global Dim gGopGuid.b[16]
+Global Dim gLiGuid.b[16]
+Global Dim gSfsGuid.b[16]
+Global Dim gW.b[512]        ; UTF-16LE scratch for OutputString / Open
+Global Dim gOut.b[16]       ; a UINTN out-parameter cell (and Key)
+Global Dim gOut2.b[16]
+Global Dim gSizeCell.b[16]
+
+; ----------------------------------------------------------------------
+;  UefiCall5 - call gCallFn(gCallA0..gCallA4) by the AAPCS64/UEFI
+;  convention, return status in gCallRet. Verbatim from anvilqcoreproof.unoq:
+;  args cross in globals, target in x9, blr x9, save x0 out. Calls that
+;  take fewer than five arguments simply ignore the extra registers, which
+;  is exactly what AAPCS64 guarantees.
+; ----------------------------------------------------------------------
+Procedure UefiCall5()
+  ASM
+    adrp x0, global_gcalla0
+    add  x0, x0, #:lo12:global_gcalla0
+    ldr  x0, [x0]
+    adrp x1, global_gcalla1
+    add  x1, x1, #:lo12:global_gcalla1
+    ldr  x1, [x1]
+    adrp x2, global_gcalla2
+    add  x2, x2, #:lo12:global_gcalla2
+    ldr  x2, [x2]
+    adrp x3, global_gcalla3
+    add  x3, x3, #:lo12:global_gcalla3
+    ldr  x3, [x3]
+    adrp x4, global_gcalla4
+    add  x4, x4, #:lo12:global_gcalla4
+    ldr  x4, [x4]
+    adrp x9, global_gcallfn
+    add  x9, x9, #:lo12:global_gcallfn
+    ldr  x9, [x9]
+    blr  x9
+    adrp x10, global_gcallret
+    add  x10, x10, #:lo12:global_gcallret
+    str  x0, [x10]
+  EndASM
+EndProcedure
+
+Procedure.i Call5(fn.i, a0.i, a1.i, a2.i, a3.i, a4.i)
+  gCallFn = fn
+  gCallA0 = a0
+  gCallA1 = a1
+  gCallA2 = a2
+  gCallA3 = a3
+  gCallA4 = a4
+  UefiCall5()
+  ProcedureReturn gCallRet
+EndProcedure
+
+Procedure Pb(base.i, off.i, v.i)
+  PokeB(base + off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Ascii16(*s) - widen a NUL-terminated ASCII string into gW as UTF-16LE
+;  and return gW's address. UEFI text calls all take CHAR16*, and the
+;  compiler's string literals are byte strings, so every literal this file
+;  hands to the firmware goes through here.
+; ----------------------------------------------------------------------
+Procedure.i Ascii16(*s)
+  Define i.i
+  Define c.i
+  Define b.i
+  b = @gW[0]
+  i = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If i >= 250
+      Break
+    EndIf
+    PokeB(b + i * 2, c)
+    PokeB(b + i * 2 + 1, 0)
+    If c = 0
+      Break
+    EndIf
+    i = i + 1
+  ForEver
+  ; guarantee a terminator even if we broke on the length guard
+  PokeB(b + i * 2, 0)
+  PokeB(b + i * 2 + 1, 0)
+  ProcedureReturn b
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Ascii16Nl(*s) - the same widening, but with a CR LF appended. UEFI
+;  consoles want both characters (UEFI 2.10 s12.4: the output protocol
+;  treats CR and LF separately), and this tree has no Chr() and no string
+;  concatenation - not one occurrence in RaspberryPi4/, Anvil/ or
+;  ArduinoQ/ - so a newline cannot be built into a literal at a call site.
+; ----------------------------------------------------------------------
+Procedure.i Ascii16Nl(*s)
+  Define i.i
+  Define c.i
+  Define b.i
+  b = @gW[0]
+  i = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0 Or i >= 248
+      Break
+    EndIf
+    PokeB(b + i * 2, c)
+    PokeB(b + i * 2 + 1, 0)
+    i = i + 1
+  ForEver
+  PokeB(b + i * 2, 13)     : PokeB(b + i * 2 + 1, 0)
+  PokeB(b + i * 2 + 2, 10) : PokeB(b + i * 2 + 3, 0)
+  PokeB(b + i * 2 + 4, 0)  : PokeB(b + i * 2 + 5, 0)
+  ProcedureReturn b
+EndProcedure
+
+; ConSay(*s) - one line, CR LF terminated, to the firmware console if there
+; is one. The status of the LAST call is kept so the report can say whether
+; the firmware accepted our text.
+Procedure ConSay(*s)
+  If gConOut = 0
+    ProcedureReturn
+  EndIf
+  gOutStatus = Call5(PeekI(gConOut + #TXO_OUTPUTSTRING), gConOut, Ascii16Nl(*s), 0, 0, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The four GUIDs, hand-poked little-endian the way the proof pokes its
+;  vendor GUID (no dependence on a host string or GUID library).
+; ----------------------------------------------------------------------
+Procedure BuildGuids()
+  Define b.i
+  ; our report vendor GUID: a1b2c3d4-5566-7788-99aa-bbccddeeff00
+  b = @gGuid[0]
+  Pb(b,0,$D4):Pb(b,1,$C3):Pb(b,2,$B2):Pb(b,3,$A1)
+  Pb(b,4,$66):Pb(b,5,$55)
+  Pb(b,6,$88):Pb(b,7,$77)
+  Pb(b,8,$99):Pb(b,9,$AA):Pb(b,10,$BB):Pb(b,11,$CC)
+  Pb(b,12,$DD):Pb(b,13,$EE):Pb(b,14,$FF):Pb(b,15,$00)
+
+  ; EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID 9042a9de-23dc-4a38-96fb-7aded080516a
+  b = @gGopGuid[0]
+  Pb(b,0,$DE):Pb(b,1,$A9):Pb(b,2,$42):Pb(b,3,$90)
+  Pb(b,4,$DC):Pb(b,5,$23)
+  Pb(b,6,$38):Pb(b,7,$4A)
+  Pb(b,8,$96):Pb(b,9,$FB):Pb(b,10,$7A):Pb(b,11,$DE)
+  Pb(b,12,$D0):Pb(b,13,$80):Pb(b,14,$51):Pb(b,15,$6A)
+
+  ; EFI_LOADED_IMAGE_PROTOCOL_GUID 5b1b31a1-9562-11d2-8e3f-00a0c969723b
+  b = @gLiGuid[0]
+  Pb(b,0,$A1):Pb(b,1,$31):Pb(b,2,$1B):Pb(b,3,$5B)
+  Pb(b,4,$62):Pb(b,5,$95)
+  Pb(b,6,$D2):Pb(b,7,$11)
+  Pb(b,8,$8E):Pb(b,9,$3F):Pb(b,10,$00):Pb(b,11,$A0)
+  Pb(b,12,$C9):Pb(b,13,$69):Pb(b,14,$72):Pb(b,15,$3B)
+
+  ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID 964e5b22-6459-11d2-8e39-00a0c969723b
+  b = @gSfsGuid[0]
+  Pb(b,0,$22):Pb(b,1,$5B):Pb(b,2,$4E):Pb(b,3,$96)
+  Pb(b,4,$59):Pb(b,5,$64)
+  Pb(b,6,$D2):Pb(b,7,$11)
+  Pb(b,8,$8E):Pb(b,9,$39):Pb(b,10,$00):Pb(b,11,$A0)
+  Pb(b,12,$C9):Pb(b,13,$69):Pb(b,14,$72):Pb(b,15,$3B)
+EndProcedure
+
+Procedure BuildName()
+  Define b.i
+  ; "AnvilQTxt" UTF-16LE, NUL terminated
+  b = @gName[0]
+  Pb(b,0,65):Pb(b,1,0)   : Pb(b,2,110):Pb(b,3,0)
+  Pb(b,4,118):Pb(b,5,0)  : Pb(b,6,105):Pb(b,7,0)
+  Pb(b,8,108):Pb(b,9,0)  : Pb(b,10,81):Pb(b,11,0)
+  Pb(b,12,84):Pb(b,13,0) : Pb(b,14,120):Pb(b,15,0)
+  Pb(b,16,116):Pb(b,17,0): Pb(b,18,0):Pb(b,19,0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Question 1 - CONOUT.
+; ----------------------------------------------------------------------
+Procedure ProbeConOut()
+  If gConOut = 0
+    ProcedureReturn
+  EndIf
+  gTxoMode = PeekI(gConOut + #TXO_MODE)
+  If gTxoMode <> 0
+    gTxoMaxMode = PeekL(gTxoMode + #TXOM_MAXMODE)
+    gTxoCurMode = PeekL(gTxoMode + #TXOM_MODE)
+    gTxoAttr    = PeekL(gTxoMode + #TXOM_ATTRIBUTE)
+    gTxoCol     = PeekL(gTxoMode + #TXOM_CURSORCOL)
+    gTxoRow     = PeekL(gTxoMode + #TXOM_CURSORROW)
+  EndIf
+  ; QueryMode(this, 0, *cols, *rows)
+  PokeI(@gOut[0], 0)
+  PokeI(@gOut2[0], 0)
+  gQmStatus = Call5(PeekI(gConOut + #TXO_QUERYMODE), gConOut, 0, @gOut[0], @gOut2[0], 0)
+  gQmCols = PeekI(@gOut[0])
+  gQmRows = PeekI(@gOut2[0])
+
+  ; Put something HUMAN-READABLE on whatever the firmware is driving. If a
+  ; display or a serial console is attached, this is visible proof our code
+  ; owns the console; if not, the status code still tells us the truth.
+  ConSay("=============================================")
+  ConSay("  Anvil UNO Q - console probe")
+  ConSay("  ConOut is alive and this text came from")
+  ConSay("  a PureMetal-built AArch64 UEFI application.")
+  ConSay("=============================================")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Question 2 - CONIN. Ask once, then poll for about six seconds so that a
+;  key pressed on any attached keyboard or console is caught. Stall() is
+;  used rather than a spin so the firmware keeps servicing its input
+;  devices - a USB keyboard behind ConIn is polled by the firmware's timer
+;  event, and a tight loop that never yields can starve it.
+; ----------------------------------------------------------------------
+Procedure ProbeConIn()
+  Define i.i
+  Define st.i
+  If gConIn = 0
+    ProcedureReturn
+  EndIf
+  gWaitEvt = PeekI(gConIn + #TXI_WAITFORKEY)
+
+  PokeI(@gOut[0], 0)
+  gKeyStatus1 = Call5(PeekI(gConIn + #TXI_READKEY), gConIn, @gOut[0], 0, 0, 0)
+  If gKeyStatus1 = #EFI_SUCCESS
+    gKeyGot  = 1
+    gKeyScan = PeekW(@gOut[0]) & $FFFF
+    gKeyChar = PeekW(@gOut[0] + 2) & $FFFF
+  EndIf
+
+  ConSay("Press any key in the next 6 seconds to prove input works...")
+
+  i = 0
+  While i < 600 And gKeyGot = 0
+    PokeI(@gOut[0], 0)
+    st = Call5(PeekI(gConIn + #TXI_READKEY), gConIn, @gOut[0], 0, 0, 0)
+    gKeyStatusLast = st
+    If st = #EFI_SUCCESS
+      gKeyGot  = 1
+      gKeyScan = PeekW(@gOut[0]) & $FFFF
+      gKeyChar = PeekW(@gOut[0] + 2) & $FFFF
+      Break
+    EndIf
+    ; BootServices->Stall(10000) = 10 ms
+    If gBs <> 0
+      Call5(PeekI(gBs + #BS_STALL), 10000, 0, 0, 0, 0)
+    EndIf
+    i = i + 1
+  Wend
+  gPollCount = i
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Question 3 - GOP.
+; ----------------------------------------------------------------------
+Procedure ProbeGop()
+  Define m.i
+  Define inf.i
+  If gBs = 0
+    ProcedureReturn
+  EndIf
+  PokeI(@gOut[0], 0)
+  ; LocateProtocol(*Protocol, *Registration, **Interface)
+  gGopStatus = Call5(PeekI(gBs + #BS_LOCATEPROTOCOL), @gGopGuid[0], 0, @gOut[0], 0, 0)
+  If gGopStatus <> #EFI_SUCCESS
+    ProcedureReturn
+  EndIf
+  gGop = PeekI(@gOut[0])
+  If gGop = 0
+    ProcedureReturn
+  EndIf
+  m = PeekI(gGop + #GOP_MODE)
+  If m = 0
+    ProcedureReturn
+  EndIf
+  gGopMaxMode = PeekL(m + #GOPM_MAXMODE) & $FFFFFFFF
+  gGopCurMode = PeekL(m + #GOPM_MODE) & $FFFFFFFF
+  gFbBase     = PeekI(m + #GOPM_FBBASE)
+  gFbSize     = PeekI(m + #GOPM_FBSIZE)
+  inf = PeekI(m + #GOPM_INFO)
+  If inf <> 0
+    gHres       = PeekL(inf + #GOPI_HRES) & $FFFFFFFF
+    gVres       = PeekL(inf + #GOPI_VRES) & $FFFFFFFF
+    gPixFmt     = PeekL(inf + #GOPI_PIXFMT) & $FFFFFFFF
+    gPixPerLine = PeekL(inf + #GOPI_PIXPERLINE) & $FFFFFFFF
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Question 4 - CAN WE WRITE A FILE TO THE ESP?
+;
+;  ImageHandle -> LoadedImage -> DeviceHandle -> SimpleFileSystem ->
+;  OpenVolume -> root -> Open(CREATE|WRITE|READ) -> Write -> Close.
+;  Every status is kept, so a failure names the exact step that failed
+;  rather than reporting a bare "no".
+; ----------------------------------------------------------------------
+Procedure.i EspWrite(*path, data.i, len.i)
+  Define mode.i
+  If gBs = 0
+    ProcedureReturn 0
+  EndIf
+  ; HandleProtocol(ImageHandle, &LoadedImageGuid, **Interface)
+  PokeI(@gOut[0], 0)
+  gLiStatus = Call5(PeekI(gBs + #BS_HANDLEPROTOCOL), gIh, @gLiGuid[0], @gOut[0], 0, 0)
+  If gLiStatus <> #EFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  gLi = PeekI(@gOut[0])
+  If gLi = 0
+    ProcedureReturn 0
+  EndIf
+  gDevHandle = PeekI(gLi + #LI_DEVICEHANDLE)
+
+  ; HandleProtocol(DeviceHandle, &SimpleFileSystemGuid, **Interface)
+  PokeI(@gOut[0], 0)
+  gSfsStatus = Call5(PeekI(gBs + #BS_HANDLEPROTOCOL), gDevHandle, @gSfsGuid[0], @gOut[0], 0, 0)
+  If gSfsStatus <> #EFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  gSfs = PeekI(@gOut[0])
+  If gSfs = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; sfs->OpenVolume(sfs, **Root)
+  PokeI(@gOut[0], 0)
+  gVolStatus = Call5(PeekI(gSfs + #SFS_OPENVOLUME), gSfs, @gOut[0], 0, 0, 0)
+  If gVolStatus <> #EFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  gRoot = PeekI(@gOut[0])
+  If gRoot = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; root->Open(root, **New, name, CREATE|WRITE|READ, 0). EFI_FILE_MODE_CREATE
+  ; is bit 63; see the note by the mode constants for why it is shifted here
+  ; rather than written as a literal.
+  mode = 1
+  mode = mode << 63
+  mode = mode | #EFI_FILE_MODE_WRITE | #EFI_FILE_MODE_READ
+  PokeI(@gOut2[0], 0)
+  gFileStatus = Call5(PeekI(gRoot + #FILE_OPEN), gRoot, @gOut2[0], Ascii16(*path), mode, 0)
+  If gFileStatus <> #EFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  gFile = PeekI(@gOut2[0])
+  If gFile = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; file->Write(file, *BufferSize, *Buffer)
+  PokeI(@gSizeCell[0], len)
+  gWriteStatus = Call5(PeekI(gFile + #FILE_WRITE), gFile, @gSizeCell[0], data, 0, 0)
+  gWroteLen = PeekI(@gSizeCell[0])
+
+  Call5(PeekI(gFile + #FILE_FLUSH), gFile, 0, 0, 0, 0)
+  Call5(PeekI(gFile + #FILE_CLOSE), gFile, 0, 0, 0, 0)
+  Call5(PeekI(gRoot + #FILE_CLOSE), gRoot, 0, 0, 0, 0)
+
+  If gWriteStatus = #EFI_SUCCESS
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The report, formatted through the portable core formatters into the Q
+;  sink, exactly as anvilqcoreproof.unoq does it.
+; ----------------------------------------------------------------------
+Procedure EmitReport()
+  QOutReset()
+  PrintN("== Anvil UNO Q  CONSOLE PROBE ==")
+
+  Print("SystemTable= ")
+  PutHex16(gSt)
+  Print("  sig=")
+  PutHex16(gStSig)
+  PrintNl()
+  Print("BootSvcs   = ")
+  PutHex16(gBs)
+  Print("  RuntimeSvcs=")
+  PutHex16(gRt)
+  PrintNl()
+  Print("CurrentEL  = ")
+  PrintDec((RdCurrentEl() >> 2) & 3)
+  PrintNl()
+
+  PrintN("-- 1. ConOut (EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL) --")
+  Print("ConOut ptr = ")
+  PutHex16(gConOut)
+  PrintNl()
+  Print("Mode ptr   = ")
+  PutHex16(gTxoMode)
+  PrintNl()
+  Print("MaxMode    = ")
+  PrintDec(gTxoMaxMode)
+  Print("  Mode=")
+  PrintDec(gTxoCurMode)
+  Print("  Attr=")
+  PutHex8(gTxoAttr)
+  PrintNl()
+  Print("Cursor     = col ")
+  PrintDec(gTxoCol)
+  Print(" row ")
+  PrintDec(gTxoRow)
+  PrintNl()
+  Print("QueryMode0 = st ")
+  PutHex16(gQmStatus)
+  Print("  cols=")
+  PrintDec(gQmCols)
+  Print("  rows=")
+  PrintDec(gQmRows)
+  PrintNl()
+  Print("OutputStr  = st ")
+  PutHex16(gOutStatus)
+  PrintN("   (0 = the firmware accepted our text)")
+
+  PrintN("-- 2. ConIn (EFI_SIMPLE_TEXT_INPUT_PROTOCOL) --")
+  Print("ConIn ptr  = ")
+  PutHex16(gConIn)
+  PrintNl()
+  Print("WaitForKey = ")
+  PutHex16(gWaitEvt)
+  PrintN("   (an EFI_EVENT; non-zero = a real input path)")
+  Print("ReadKey #1 = st ")
+  PutHex16(gKeyStatus1)
+  PrintN("   (8000000000000006 = NOT_READY, protocol alive, no key)")
+  Print("polled     = ")
+  PrintDec(gPollCount)
+  PrintN(" times over ~6 s")
+  Print("last st    = ")
+  PutHex16(gKeyStatusLast)
+  PrintNl()
+  Print("key seen   = ")
+  PrintDec(gKeyGot)
+  Print("  scan=")
+  PutHex8(gKeyScan)
+  Print("  char=")
+  PutHex8(gKeyChar)
+  PrintNl()
+
+  PrintN("-- 3. GOP (EFI_GRAPHICS_OUTPUT_PROTOCOL) --")
+  Print("LocateProt = st ")
+  PutHex16(gGopStatus)
+  PrintN("   (0 = a framebuffer exists)")
+  Print("GOP ptr    = ")
+  PutHex16(gGop)
+  PrintNl()
+  Print("modes      = ")
+  PrintDec(gGopCurMode)
+  Print(" of ")
+  PrintDec(gGopMaxMode)
+  PrintNl()
+  Print("resolution = ")
+  PrintDec(gHres)
+  Print(" x ")
+  PrintDec(gVres)
+  Print("  pxPerLine=")
+  PrintDec(gPixPerLine)
+  Print("  fmt=")
+  PrintDec(gPixFmt)
+  PrintNl()
+  Print("framebuffer= ")
+  PutHex16(gFbBase)
+  Print("  size=")
+  PrintDec(gFbSize)
+  PrintNl()
+
+  PrintN("-- 4. ESP file write --")
+  Print("LoadedImage= st ")
+  PutHex16(gLiStatus)
+  Print("  devhandle=")
+  PutHex16(gDevHandle)
+  PrintNl()
+  Print("SimpleFS   = st ")
+  PutHex16(gSfsStatus)
+  PrintNl()
+  Print("OpenVolume = st ")
+  PutHex16(gVolStatus)
+  PrintNl()
+  Print("Open file  = st ")
+  PutHex16(gFileStatus)
+  PrintNl()
+  Print("Write      = st ")
+  PutHex16(gWriteStatus)
+  Print("  bytes=")
+  PrintDec(gWroteLen)
+  PrintNl()
+  PrintN("== end of probe ==")
+EndProcedure
+
+Procedure.i Main()
+  Define fn.i
+  Define stOk.i
+
+  ; ---- CAPTURE x0/x1 FIRST (UEFI ImageHandle / SystemTable) ----------
+  ASM
+    adrp x9, global_gih
+    add  x9, x9, #:lo12:global_gih
+    str  x0, [x9]
+    adrp x9, global_gst
+    add  x9, x9, #:lo12:global_gst
+    str  x1, [x9]
+  EndASM
+
+  BuildGuids()
+  BuildName()
+
+  ; ---- validate the captured SystemTable before trusting it ----------
+  stOk = 0
+  If gSt <> 0
+    If (gSt & 7) = 0
+      If gSt >= $40000000
+        gStSig = PeekI(gSt)
+        If gStSig = #EFI_SYST_SIG
+          stOk = 1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  If stOk = 0
+    ProcedureReturn 0                 ; nothing safe to do; fall back to the boot manager
+  EndIf
+
+  gConIn  = PeekI(gSt + #ST_CONIN)
+  gConOut = PeekI(gSt + #ST_CONOUT)
+  gRt     = PeekI(gSt + #ST_RUNTIME)
+  gBs     = PeekI(gSt + #ST_BOOT)
+
+  ProbeConOut()
+  ProbeGop()
+  ProbeConIn()
+
+  ; ---- question 4 runs FIRST, against a tiny marker file, so that its
+  ;      statuses are already known when the report is formatted. Writing
+  ;      the log first and re-writing it afterwards would leave a stale
+  ;      tail: EFI_FILE_PROTOCOL Open with CREATE does not truncate, so a
+  ;      shorter second write leaves the end of the first one behind.
+  EspWrite("\EFI\anvil\qespcheck.txt", @gGuid[0], 16)
+
+  ; ---- now format the full report and land it on BOTH channels --------
+  EmitReport()
+  EspWrite("\EFI\anvil\qconprobe.log", @gQOut[0], gQOutLen)
+
+  fn = PeekI(gRt + #RT_SETVARIABLE)
+  Call5(fn, @gName[0], @gGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  ConSay("probe complete - resetting back to Debian")
+
+  ; ---- hand the board back to Linux via a cold reset -----------------
+  fn = PeekI(gRt + #RT_RESETSYSTEM)
+  Call5(fn, 0, 0, 0, 0, 0)
+
+  ProcedureReturn 0
+EndProcedure

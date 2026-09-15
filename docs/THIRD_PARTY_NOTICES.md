@@ -128,6 +128,15 @@ complete [BearSSL MIT text](../licenses/BearSSL-LICENSE.txt) is retained in
 Those source headers are left exactly as their authors wrote them. This lane
 removed no acknowledgment from any file and does not rewrite what a header says.
 
+The test certificates in `RaspberryPi4/Reference/` are BearSSL's own sample
+and test data, redistributed unmodified under the same MIT licence:
+`cert-{ee,ica,root}-{ec,rsa}.pem.txt` are BearSSL `samples/cert-*.pem` (stored
+with a `.txt` suffix because this repository refuses `.pem` files), and
+`bearssl_test_x509_root.crt` is BearSSL `test/x509/root.crt`, both from
+https://www.bearssl.org/git/BearSSL at commit
+`7bea48e5e850ab4cafbe68d3765cdaba13a86d6f`. The gates and generators under
+`tools/` read them as inputs; none of them ships in a monitor image.
+
 ## Raspberry Pi firmware stub
 
 `RaspberryPi4/Board/armstub8.asm` was written for the same job as

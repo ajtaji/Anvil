@@ -1,0 +1,129 @@
+; pi4MmuCycle.pi4 - LOCALISE the enable/disable alternation. pi4MmuFlush
+;   run repeatedly alternates PASS/FAIL by run parity. Does the same
+;   alternation appear when the enable->write->flush->disable->readback
+;   cycle is repeated INSIDE ONE payload (no Anvil scroll/DMA/reload
+;   between iterations), or only across separate payload runs?
+;
+;   If the cycles below alternate, the cause is purely the cache
+;   enable/disable cycle and is reproducible in isolation. If every
+;   cycle PASSES, the cause is something in the inter-run path (Anvil's
+;   DMA console scroll, the payload reload) and not the cache cycle.
+;
+;   Tables are built ONCE (they do not change); each cycle re-poisons,
+;   enables cached, writes the pattern, flushes, disables and reads back
+;   with the MMU off.
+;
+;   PureMetalForge.exe --compile pi4MmuCycle.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o pi4MmuCycle.img
+;   pmf> deadman 20
+;   pmf> run 400000
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+#TABLES       = $00600000
+#TESTBUF      = $00800000
+#TESTWORDS    = 16
+#POISON_BASE  = $DEAD0000
+#PATTERN_BASE = $C0FFEE00
+#CYCLES       = 8
+
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define k.i
+  Define i.i
+  Define fails.i
+  Define poison.i
+  Define during.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(20)
+  UartWriteNl()
+  UartWriteStr("pi4MmuCycleDF - disable-then-flush (U-Boot order) the cache enable/disable cycle in one run")
+  UartWriteNl()
+  UartWriteNl()
+
+  rc = MmuBuildTables(#TABLES)
+  UartWriteStr("tables built rc ")
+  PutHex16(rc)
+  UartWriteNl()
+  If rc <> 0
+    UartWriteStr("REFUSED - nothing enabled")
+    UartWriteNl()
+    UartDrain()
+    ProcedureReturn rc
+  EndIf
+  If MmuBuildable() = 0
+    UartWriteStr("THIS BUILD CANNOT ENABLE - #MMU_HAVE_EL2_REGS is 0")
+    UartWriteNl()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+  UartWriteNl()
+
+  For k = 1 To #CYCLES
+    ; poison the buffer with the MMU/caches OFF - straight to DRAM
+    For i = 0 To #TESTWORDS - 1
+      PokeI(#TESTBUF + (i * 8), #POISON_BASE + i)
+    Next
+
+    MmuEnableCached()
+    during = MmuSctlrEl2()
+
+    ; pattern into cacheable DRAM (dirty lines, not yet in DRAM)
+    For i = 0 To #TESTWORDS - 1
+      PokeI(#TESTBUF + (i * 8), #PATTERN_BASE + i)
+    Next
+
+    MmuDisableCached()
+    MmuFlushDCacheAll()
+
+    ; read back with the MMU OFF - hits physical DRAM
+    fails  = 0
+    poison = 0
+    For i = 0 To #TESTWORDS - 1
+      If PeekI(#TESTBUF + (i * 8)) <> #PATTERN_BASE + i
+        fails = fails + 1
+        If PeekI(#TESTBUF + (i * 8)) = #POISON_BASE + i
+          poison = poison + 1
+        EndIf
+      EndIf
+    Next
+
+    UartWriteStr("cycle ")
+    PutHex16(k)
+    UartWriteStr("  SCTLR during ")
+    PutHex16(during)
+    UartWriteStr("  mismatched ")
+    PutHex16(fails)
+    If fails = 0
+      UartWriteStr("  PASS")
+    ElseIf poison = fails
+      UartWriteStr("  FAIL(poison)")
+    Else
+      UartWriteStr("  FAIL(other)")
+    EndIf
+    UartWriteNl()
+    UartDrain()
+  Next
+
+  UartWriteNl()
+  UartWriteStr("done")
+  UartWriteNl()
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

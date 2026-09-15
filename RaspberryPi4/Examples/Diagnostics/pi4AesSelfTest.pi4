@@ -1,0 +1,487 @@
+; pi4AesSelfTest.pi4 - do AES and RFC 3394 key wrap run on real silicon?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; RaspberryPi4/Lib/aes.pi4 and RaspberryPi4/Lib/keywrap.pi4 are gated
+; hard on the desktop by tools/a64/a64_aes_check.py and
+; tools/a64/a64_keywrap_check.py - against FIPS-197's worked examples
+; with every intermediate round value, against the NIST CAVP AESAVS
+; known-answer files, and against RFC 3394 section 4 - and every one of
+; those runs happened inside tools/a64/a64_interp.py, WHICH IS A MODEL.
+; When a board is attached, the same checks should also run on the board.
+; This is that program.
+;
+; ======================================================================
+;  WHAT A BOARD RUN ADDS THAT THE MODEL CANNOT
+; ======================================================================
+;
+; The desktop gate is far more thorough than this file and always will
+; be: it has 1,553 CAVP vectors and every printed intermediate, read off
+; the disk. Repeating that here would be pointless. What the model
+; CANNOT have is the part:
+;
+;   * a real memory system with the MMU off, where every access is
+;     Device-nGnRnE and an unaligned wide one is a silent runaway;
+;   * real instruction timing, real caches, and a real branch predictor;
+;   * a compiler bug that the emulator and the code generator share.
+;     An emulator agrees with itself, and some failures have appeared
+;     only on silicon.
+;
+; So this file runs a SMALL set of the same published vectors and one
+; property test that needs no table at all.
+;
+; ======================================================================
+;  THE VECTORS HERE ARE TYPED, AND THAT IS THE ONE THING THIS FILE DOES
+;  THAT THE DESKTOP GATE REFUSES TO DO
+; ======================================================================
+;
+; There is no disk to parse from on a bare-metal board, so the hex
+; strings below are transcribed by hand - which is exactly the failure
+; mode the desktop gates avoid by construction. They are therefore NOT
+; the evidence of correctness; the desktop gates are. If a line here
+; disagrees with the library, suspect this file first and go and read
+; RaspberryPi4/Reference/fips197-2001.txt and rfc3394.txt.
+;
+; Two things reduce the risk. Every string here also appears in a gate
+; that parsed it from a document, so a typo shows up as a desktop/board
+; disagreement rather than as silence. And the LAST test needs no typed
+; answer at all: it wraps a block of pseudo-random key data, unwraps it,
+; and requires the bytes back - a property of the pair that is true
+; whatever the right ciphertext happens to be.
+;
+; ======================================================================
+;  BUILT WITH --entry-returns
+; ======================================================================
+;   pmfc pi4AesSelfTest.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+;
+; It returns the number of failures, so the monitor's own line is the
+; verdict; the detail goes over the UART. Nothing here touches a
+; peripheral except the console, so it cannot hang and cannot leave the
+; machine in a state.
+;
+; EXPECT IT TO BE FAST. One AES-128 block is a few thousand
+; instructions; the whole file is well under a million, which at 1.5 GHz
+; is not measurable by eye.
+;
+; NO REAL CREDENTIAL IS ANYWHERE NEAR THIS FILE. Every key here is from
+; a published document. The one the board actually uses lives in
+; SETTINGS.TXT on the boot medium.
+
+XIncludeFile "RaspberryPi4/Lib/aes.pi4"
+XIncludeFile "RaspberryPi4/Lib/keywrap.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Global Dim aKey.a[32]
+Global Dim aBlk.a[16]
+Global Dim aWant.a[16]
+Global Dim aOut.a[16]
+
+; THE KEY WRAP BUFFERS ARE SIZED FOR THE BIGGEST ROUND TRIP, NOT FOR
+; THE BIGGEST PUBLISHED VECTOR.  RFC 3394 stops at 32 bytes of key data
+; and the last round trip below uses 344, which is 43 registers - the
+; smallest size that drives the step counter past 255.  The first draft
+; of this file sized these at 72 bytes and would have written 352 into
+; them; there is no MMU here to catch that, so the sizes and the largest
+; RoundTrip call have to be kept in step by hand.
+#KWBUF = 344
+Global Dim wKek.a[32]
+Global Dim wKd.a[#KWBUF]
+Global Dim wCt.a[#KWBUF + 8]
+Global Dim wOut.a[#KWBUF + 8]
+Global Dim wTmp.a[#KWBUF + 8]
+
+Global fails.i
+Global rngState.i
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHexByte(v.i)
+  Define n.i
+  n = (v >> 4) & $F
+  If n < 10 : PutC(48 + n) : Else : PutC(87 + n) : EndIf
+  n = v & $F
+  If n < 10 : PutC(48 + n) : Else : PutC(87 + n) : EndIf
+EndProcedure
+
+Procedure PutBytes(p.i, n.i)
+  Define i.i
+  i = 0
+  While i < n
+    PutHexByte(PeekA(p + i) & 255)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HexTo(dst, s) - parse a NUL-terminated hex string into bytes at dst.
+;  Returns the byte count, or -1 if the string is not an even run of hex
+;  digits. THE REFUSAL MATTERS: a mistyped vector with an odd number of
+;  digits would otherwise silently become a shorter key, and a shorter
+;  key is a different test that still passes something.
+; ----------------------------------------------------------------------
+Procedure.i HexNibble(c.i)
+  If c >= 48 And c <= 57
+    ProcedureReturn c - 48
+  EndIf
+  If c >= 97 And c <= 102
+    ProcedureReturn c - 87
+  EndIf
+  If c >= 65 And c <= 70
+    ProcedureReturn c - 55
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HexTo(dst.i, *s)
+  Define i.i
+  Define n.i
+  Define hi.i
+  Define lo.i
+  i = 0
+  n = 0
+  Repeat
+    hi = PeekA(s + i)
+    If hi = 0 : Break : EndIf
+    lo = PeekA(s + i + 1)
+    If lo = 0 : ProcedureReturn -1 : EndIf
+    hi = HexNibble(hi)
+    lo = HexNibble(lo)
+    If hi < 0 Or lo < 0 : ProcedureReturn -1 : EndIf
+    PokeB(dst + n, (hi << 4) | lo)
+    n = n + 1
+    i = i + 2
+  ForEver
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Expect(name, got, want, n) - compare n bytes and complain loudly.
+; ----------------------------------------------------------------------
+Procedure.i Expect(*name, got.i, want.i, n.i)
+  Define i.i
+  i = 0
+  While i < n
+    If (PeekA(got + i) & 255) <> (PeekA(want + i) & 255)
+      PutS("  FAIL ") : PutS(name)
+      PutS("  at byte ") : PutDec(i) : PutNl()
+      PutS("       got  ") : PutBytes(got, n) : PutNl()
+      PutS("       want ") : PutBytes(want, n) : PutNl()
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i ExpectRet(*name, got.i, want.i)
+  If got = want
+    ProcedureReturn 0
+  EndIf
+  PutS("  FAIL ") : PutS(name)
+  PutS("  returned ") : PutDec(got)
+  PutS(", wanted ") : PutDec(want) : PutNl()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  AesKat(keyhex, ptHex, ctHex) - one FIPS-197 known-answer test, both
+;  directions.
+; ----------------------------------------------------------------------
+Procedure.i AesKat(*keyhex, *pthex, *cthex)
+  Define klen.i
+  Define bad.i
+  Define r.i
+
+  bad = 0
+  klen = HexTo(@aKey[0], keyhex)
+  If klen <> 16 And klen <> 24 And klen <> 32
+    PutS("  FAIL a key vector in this file is ") : PutDec(klen)
+    PutS(" bytes long") : PutNl()
+    ProcedureReturn 1
+  EndIf
+
+  r = AesSetKey(@aKey[0], klen)
+  If r = 0
+    PutS("  FAIL AesSetKey refused a ") : PutDec(klen)
+    PutS("-byte key") : PutNl()
+    ProcedureReturn 1
+  EndIf
+
+  PutS("  AES-") : PutDec(klen * 8) : PutS("  ")
+
+  HexTo(@aBlk[0], pthex)
+  HexTo(@aWant[0], cthex)
+  r = AesEncryptBlock(@aBlk[0], @aOut[0])
+  bad = bad + ExpectRet("AesEncryptBlock", r, 16)
+  bad = bad + Expect("encrypt", @aOut[0], @aWant[0], 16)
+
+  HexTo(@aBlk[0], cthex)
+  HexTo(@aWant[0], pthex)
+  r = AesDecryptBlock(@aBlk[0], @aOut[0])
+  bad = bad + ExpectRet("AesDecryptBlock", r, 16)
+  bad = bad + Expect("decrypt", @aOut[0], @aWant[0], 16)
+
+  ; IN PLACE, which the header of aes.pi4 promises and which is the
+  ; shape RFC 3394 actually uses.
+  HexTo(@aOut[0], cthex)
+  HexTo(@aWant[0], pthex)
+  AesDecryptBlock(@aOut[0], @aOut[0])
+  bad = bad + Expect("decrypt in place", @aOut[0], @aWant[0], 16)
+
+  If bad = 0
+    PutS("ok") : PutNl()
+  EndIf
+  ProcedureReturn bad
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  KwKat(kekhex, kdhex, ctHex) - one RFC 3394 section 4 vector, wrap and
+;  unwrap, plus the integrity refusal on a corrupted copy.
+; ----------------------------------------------------------------------
+Procedure.i KwKat(*kekhex, *kdhex, *cthex)
+  Define keklen.i
+  Define kdlen.i
+  Define ctlen.i
+  Define bad.i
+  Define i.i
+  Define r.i
+
+  bad = 0
+  keklen = HexTo(@wKek[0], kekhex)
+  kdlen = HexTo(@wKd[0], kdhex)
+  ctlen = HexTo(@wCt[0], cthex)
+  If ctlen <> kdlen + 8
+    PutS("  FAIL a key wrap vector in this file has a ") : PutDec(ctlen)
+    PutS("-byte ciphertext for ") : PutDec(kdlen)
+    PutS(" bytes of key data") : PutNl()
+    ProcedureReturn 1
+  EndIf
+
+  PutS("  KW ") : PutDec(kdlen * 8) : PutS("-bit data / ")
+  PutDec(keklen * 8) : PutS("-bit KEK  ")
+
+  r = KwWrap(@wKek[0], keklen, @wKd[0], kdlen, @wOut[0])
+  bad = bad + ExpectRet("KwWrap", r, ctlen)
+  bad = bad + Expect("wrap", @wOut[0], @wCt[0], ctlen)
+
+  r = KwUnwrap(@wKek[0], keklen, @wCt[0], ctlen, @wOut[0])
+  bad = bad + ExpectRet("KwUnwrap", r, kdlen)
+  bad = bad + Expect("unwrap", @wOut[0], @wKd[0], kdlen)
+
+  ; ---- the integrity check, RFC 3394 section 5 ----------------------
+  ; One bit flipped in the integrity register must be refused AND must
+  ; leave nothing at all in the output buffer. A wrong return value with
+  ; the plaintext still sitting there is a decryption oracle.
+  i = 0
+  While i < ctlen
+    wTmp[i] = wCt[i] & 255
+    i = i + 1
+  Wend
+  wTmp[0] = (wTmp[0] & 255) ! 1
+  i = 0
+  While i < kdlen
+    wOut[i] = $5A
+    i = i + 1
+  Wend
+  r = KwUnwrap(@wKek[0], keklen, @wTmp[0], ctlen, @wOut[0])
+  bad = bad + ExpectRet("KwUnwrap of a corrupted blob", r, 0)
+  i = 0
+  While i < kdlen
+    If (wOut[i] & 255) <> 0
+      PutS("  FAIL a refused unwrap left key data behind at byte ")
+      PutDec(i) : PutNl()
+      bad = bad + 1
+      Break
+    EndIf
+    i = i + 1
+  Wend
+
+  If bad = 0
+    PutS("ok") : PutNl()
+  EndIf
+  ProcedureReturn bad
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  A DETERMINISTIC pseudo-random source, so a failure can be reproduced
+;  exactly. xorshift64*, the same shape pi4StringF32.pi4 and
+;  pi4DamageSelfTest.pi4 use, and for the same reason: this is a SWEEP,
+;  not entropy, and it must give the same sweep on every run and on
+;  every board.
+; ----------------------------------------------------------------------
+Procedure.i RngNext()
+  Define v.i
+  v = rngState
+  v = v ! (v << 13)
+  v = v ! ((v >> 7) & $01FFFFFFFFFFFFFF)
+  v = v ! (v << 17)
+  rngState = v
+  ProcedureReturn (v >> 32) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RoundTrip(keklen, kdlen) - THE TEST WITH NO TYPED ANSWER IN IT.
+;
+;  Wrap pseudo-random key data under a pseudo-random KEK, unwrap it, and
+;  require the same bytes back. That is a property of the pair and it is
+;  checkable without knowing the right ciphertext, so it cannot be
+;  invalidated by a typo in this file.
+;
+;  WHAT A ROUND TRIP CANNOT CATCH, said plainly: two matching bugs. A
+;  wrap and an unwrap that were both wrong in mirror-image ways would
+;  round-trip perfectly. The desktop gates are what rule that out, by
+;  comparing against a published document. This one answers a different
+;  question - does the code that has only ever run under a model also
+;  run on the part - and the failures it looks for are the ones a model
+;  cannot have.
+;
+;  IT ALSO REACHES A PLACE NO PUBLISHED VECTOR DOES. With 43 registers
+;  the step counter t passes 255, so the second byte of the integrity
+;  register is exercised; every RFC 3394 vector stops at t = 24.
+; ----------------------------------------------------------------------
+Procedure.i RoundTrip(keklen.i, kdlen.i)
+  Define i.i
+  Define bad.i
+  Define r.i
+
+  bad = 0
+  i = 0
+  While i < keklen
+    wKek[i] = RngNext() & 255
+    i = i + 1
+  Wend
+  i = 0
+  While i < kdlen
+    wKd[i] = RngNext() & 255
+    i = i + 1
+  Wend
+
+  PutS("  round trip  ") : PutDec(kdlen)
+  PutS(" bytes under a ") : PutDec(keklen * 8) : PutS("-bit KEK  ")
+
+  r = KwWrap(@wKek[0], keklen, @wKd[0], kdlen, @wCt[0])
+  bad = bad + ExpectRet("KwWrap", r, kdlen + 8)
+  r = KwUnwrap(@wKek[0], keklen, @wCt[0], kdlen + 8, @wOut[0])
+  bad = bad + ExpectRet("KwUnwrap", r, kdlen)
+  bad = bad + Expect("round trip", @wOut[0], @wKd[0], kdlen)
+
+  If bad = 0
+    PutS("ok") : PutNl()
+  EndIf
+  ProcedureReturn bad
+EndProcedure
+
+Procedure.i Main()
+  PutNl()
+  PutS("=== pi4AesSelfTest - AES and RFC 3394 key wrap, on silicon ===")
+  PutNl()
+
+  fails = 0
+  rngState = $0123456789ABCDEF
+
+  ; ---- FIPS-197 Appendix C, the three worked examples ---------------
+  ; RaspberryPi4/Reference/fips197-2001.txt, sections C.1, C.2 and C.3.
+  PutS("FIPS-197 Appendix C known-answer tests:") : PutNl()
+  fails = fails + AesKat("000102030405060708090a0b0c0d0e0f", "00112233445566778899aabbccddeeff", "69c4e0d86a7b0430d8cdb78070b4c55a")
+  fails = fails + AesKat("000102030405060708090a0b0c0d0e0f1011121314151617", "00112233445566778899aabbccddeeff", "dda97ca4864cdfe06eaf70a0ec0d7191")
+  fails = fails + AesKat("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "00112233445566778899aabbccddeeff", "8ea2b7ca516745bfeafc49904b496089")
+
+  ; ---- a key length that must be refused ----------------------------
+  PutS("refusals:") : PutNl()
+  If AesSetKey(@aKey[0], 20) <> 0
+    PutS("  FAIL AesSetKey accepted a 20-byte key") : PutNl()
+    fails = fails + 1
+  EndIf
+  If AesEncryptBlock(@aBlk[0], @aOut[0]) <> 0
+    PutS("  FAIL AesEncryptBlock ran with no key installed") : PutNl()
+    fails = fails + 1
+  EndIf
+  If KwWrap(@wKek[0], 16, @wKd[0], 8, @wOut[0]) <> 0
+    PutS("  FAIL KwWrap accepted n = 1") : PutNl()
+    fails = fails + 1
+  EndIf
+  If KwWrap(@wKek[0], 16, @wKd[0], 20, @wOut[0]) <> 0
+    PutS("  FAIL KwWrap accepted a length that is not a multiple of 8")
+    PutNl()
+    fails = fails + 1
+  EndIf
+  PutS("  ok") : PutNl()
+
+  ; ---- RFC 3394 section 4, all six ----------------------------------
+  ; RaspberryPi4/Reference/rfc3394.txt, sections 4.1 to 4.6.
+  PutS("RFC 3394 section 4 vectors:") : PutNl()
+  fails = fails + KwKat("000102030405060708090A0B0C0D0E0F", "00112233445566778899AABBCCDDEEFF", "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5")
+  fails = fails + KwKat("000102030405060708090A0B0C0D0E0F1011121314151617", "00112233445566778899AABBCCDDEEFF", "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D")
+  fails = fails + KwKat("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", "00112233445566778899AABBCCDDEEFF", "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7")
+  fails = fails + KwKat("000102030405060708090A0B0C0D0E0F1011121314151617", "00112233445566778899AABBCCDDEEFF0001020304050607", "031D33264E15D33268F24EC260743EDCE1C6C7DDEE725A936BA814915C6762D2")
+  fails = fails + KwKat("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", "00112233445566778899AABBCCDDEEFF0001020304050607", "A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1")
+  fails = fails + KwKat("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F", "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21")
+
+  ; ---- the property test, with no typed answer in it ----------------
+  PutS("round trips (no expected value is typed for these):") : PutNl()
+  fails = fails + RoundTrip(16, 16)
+  fails = fails + RoundTrip(24, 24)
+  fails = fails + RoundTrip(32, 32)
+  fails = fails + RoundTrip(16, 56)
+  ; 344 bytes is 43 registers, so the step counter passes 255 and the
+  ; second byte of A is exercised. No published vector goes that far.
+  fails = fails + RoundTrip(16, 344)
+
+  AesWipe()
+  KwWipe()
+
+  PutNl()
+  If fails = 0
+    PutS("=== pi4AesSelfTest: ALL PASS ===")
+  Else
+    PutS("=== pi4AesSelfTest: ") : PutDec(fails)
+    PutS(" FAILURES ===")
+  EndIf
+  PutNl()
+  ProcedureReturn fails
+EndProcedure

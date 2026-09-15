@@ -1,0 +1,563 @@
+; ======================================================================
+; pi4BootContainerSelfTest.pi4 - the executable gate for the BOOTLOADER:
+; Anvil/Core/pmfboot.pbi's verify-place-enter path.
+; ----------------------------------------------------------------------
+; This is the one part of Anvil that must never be wrong, because being
+; wrong means entering memory that is not the program somebody asked for.
+; Loud errors beat silent wrong answers, and that rule has no sharper case
+; anywhere in this program.
+;
+; So this file proves the three outcomes that matter, over the REAL code
+; path rather than a re-implementation of it:
+;
+;   (a) A GOOD CONTAINER IS ENTERED, and the payload demonstrably ran.
+;       Not "the command returned 1" - the payload writes a known word to
+;       a known address and returns a known value in x0, and both are read
+;       back out of memory afterwards. A pass that only checks a return
+;       code cannot tell "entered it" from "decided it would have".
+;
+;   (b) A CONTAINER WITH ONE CORRUPTED BYTE IS REFUSED by the hash check,
+;       and the payload is NOT entered. The corruption is one bit in the
+;       middle of the image - the kind a bad sector or a truncated copy
+;       actually produces, not a mangled header that a dozen earlier
+;       checks would catch first. The point is that the LAST guard holds
+;       when every earlier one has passed.
+;
+;   (c) A CONTAINER WHOSE LOAD ADDRESS OVERLAPS THE MONITOR IS REFUSED,
+;       before a single byte is written anywhere.
+;
+; ----------------------------------------------------------------------
+; HOW IT RUNS, AND WHY IT IS AN INSTRUMENT AND NOT AN EXAMPLE
+; ----------------------------------------------------------------------
+; With no Pi 4 attached, the vehicle is the project's own A64 oracle. A
+; gate runs on the board when a board is attached; a no-board run is what
+; the emulator stays right for, and this is one. The harness is
+; tools/a64/a64_bootcontainer_check.py, which builds this file, stages
+; three containers into memory, runs each one, and reads the verdict out.
+;
+; It also prints its verdict over the UART, so the identical binary is the
+; stronger proof the day a Pi 4 is attached: receive it, run it, read the
+; tally. Nothing here needs a display, a mailbox, a card or a network.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4BootContainerSelfTest.pi4
+;        -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns
+;        -o _work/bootc.img
+;
+; ----------------------------------------------------------------------
+; WHY THE HARNESS BUILDS THE CONTAINERS AND THIS FILE DOES NOT
+; ----------------------------------------------------------------------
+; It would have been easier to have this program construct its own header
+; and its own payload in memory and then boot it. That is a WEAKER test
+; and the weakness is the interesting kind: a header written by the same
+; source file that reads it agrees with itself no matter what the layout
+; actually is. Get the offset of `load` wrong in both places and the test
+; passes while every real container fails.
+;
+; So the containers come from OUTSIDE, byte by byte, from a Python harness
+; that lays the header out from the table in Anvil/Core/pmfboot.pbi's own
+; documentation and computes the digest with hashlib. Three independent
+; statements of the format - the compiler's writer, this monitor's reader,
+; and the harness - and the test only passes when all three agree.
+;
+; ----------------------------------------------------------------------
+; THE PAYLOAD, AND WHY IT LOOKS LIKE THAT
+; ----------------------------------------------------------------------
+; Four A64 instructions, assembled by the harness and placed as the
+; container's image:
+;
+;     movz x1, #0xBEEF               a value nothing else would produce
+;     movz x2, #0x0130, lsl #16      the observation address, $01300000
+;     str  x1, [x2]                  the known write
+;     movz x0, #0x5A5A               the known return value
+;     ret                            back to the monitor
+;
+; It touches nothing else, needs no stack beyond the one it is handed, and
+; is position-independent by construction - no ADRP, no literal pool, no
+; branch. That last property matters: the whole point of the container is
+; that the monitor PLACES the image at an address, so a payload that only
+; worked at one address would not be testing placement.
+;
+; $01300000 for the observation and $01200000 for the load are both inside
+; the low payload window ($00400000..$07EFFFFF), well clear of this
+; program's own image at $00400000, and inside the oracle's flat memory.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+; timer.pi4 is INCLUDED but TimerInit() is never CALLED - see Main. It is
+; here because Anvil/Core/rxbreak.pbi names Ticks() inside RxByte, the
+; transfer protocol's timeout read, which this program never executes.
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+
+; ----------------------------------------------------------------------
+;  The capability declarations this instrument needs. It builds none of
+;  the gated command families; #CAP_STORAGE is here because
+;  Anvil/Core/pmfboot.pbi names it in CmdBoot's gate, and CmdBoot is
+;  compiled even though this program never calls it.
+; ----------------------------------------------------------------------
+#CAP_STORAGE  = 1
+#CAP_NET      = 0
+#CAP_GPIO     = 0
+#CAP_I2C      = 0
+#CAP_MMC      = 0
+#CAP_USB      = 0
+#CAP_BOOT_EL1 = 0
+
+XIncludeFile "Anvil/Hal/hal.pbi"
+
+; ======================================================================
+;  THE STORAGE SEAM, STUBBED - and stubbed HONESTLY, not plausibly.
+;
+;  This instrument proves the boot-from-MEMORY path, which touches no
+;  medium at all. But Anvil/Core/pmfboot.pbi is compiled whole, and its
+;  file path names HwFileOpen and the rest, so the names must exist.
+;
+;  EVERY ONE OF THEM REFUSES. Not "returns something harmless" - refuses,
+;  with #HW_FILE_NOMEDIUM, which is the truth: this program has no medium.
+;  A stub that answered a read with zeroes would let a future edit route
+;  the tested path through the file reader by mistake and still go green.
+; ======================================================================
+Global gHwFileErr.i
+
+Procedure.i HwFileLastError()
+  ProcedureReturn gHwFileErr
+EndProcedure
+Procedure.i HwStorageUp()
+  gHwFileErr = #HW_FILE_NOMEDIUM
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwFileOpen(*name)
+  gHwFileErr = #HW_FILE_NOMEDIUM
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwFileSize()
+  gHwFileErr = #HW_FILE_NOMEDIUM
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwFileReadAt(off.i, dst.i, n.i)
+  gHwFileErr = #HW_FILE_NOMEDIUM
+  ProcedureReturn -1
+EndProcedure
+Procedure HwFileClose()
+EndProcedure
+Procedure.i HwFileWritable()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwFileWriteAll(*name, src.i, n.i)
+  gHwFileErr = #HW_FILE_NOMEDIUM
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwFileErrorText()
+  ProcedureReturn "this diagnostic has no storage medium at all - it proves the boot-from-memory path"
+EndProcedure
+Procedure.i HwFileCanList()
+  ProcedureReturn 0
+EndProcedure
+Procedure HwStorageReport()
+  PrintN("no medium: this is a diagnostic, not the monitor.")
+EndProcedure
+
+; ======================================================================
+;  NO SETTINGS STORE AND NO LINE EDITOR, and their absence is the reason
+;  Anvil/Core/pmfboot.pbi is a separate file from
+;  Anvil/Core/bootfile_cmd.pbi.
+;
+;  The `boot` command word reads a command line, and Anvil/Core/parse.pbi
+;  reaches for a USB keyboard, a mouse tick and a Wi-Fi console to do it.
+;  The four boot.* settings need a 2,600-line KEY=VALUE store on a medium
+;  this program does not have. Neither has anything whatever to do with
+;  whether a hash is checked before a jump - and faking both, just to ask
+;  that question, is how a gate ends up testing its own scaffolding.
+;
+;  So the container ENGINE builds on its own, and this file builds only
+;  that. What it includes below is the engine's entire dependency list.
+; ======================================================================
+
+; ======================================================================
+;  THE REST OF THE SEAM THE BOOT ENGINE NAMES ON ANVIL MAIN, STUBBED.
+;
+;  Anvil/Core/rxbreak.pbi reads its cancellation byte from EITHER console -
+;  the UART or the network console - so it names three NetConsole*
+;  procedures. This instrument has no network: the pump does nothing and
+;  the network source never has a byte (-1), which is the truth, and the
+;  UART path the harness models is untouched.
+;
+;  Anvil/Core/pmfboot.pbi calls ScreenServiceTick() between long phases so a
+;  board with a display can repaint during a large boot. There is no
+;  display here, so it does nothing.
+;
+;  HwPmfTargetId() is what a version-2 container's target field is judged
+;  against. The containers the harness stages for cases 1 to 5 are version
+;  1, which carry no target and never ask; the answer is the Pi 4's
+;  compiler target id (RaspberryPi4/Board/hw_id.pi4) so that a version-2
+;  container staged here is judged the way the board would judge it.
+; ======================================================================
+Procedure NetConsoleClaimLocal()
+EndProcedure
+Procedure NetConsolePump()
+EndProcedure
+Procedure.i NetConsoleGetc()
+  ProcedureReturn -1
+EndProcedure
+Procedure ScreenServiceTick()
+EndProcedure
+Procedure.i HwPmfTargetId()
+  ProcedureReturn 2711
+EndProcedure
+
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+
+; ======================================================================
+;  RunAt(a) - THE JUMP, and this is the board seam this instrument has to
+;  supply for itself.
+;
+;  On the Pi 4 RunAt lives in RaspberryPi4/Board/cache.pi4 and does three
+;  board things around the call: it stops the ethernet DMA, it flushes and
+;  disables the caches, and it arms the deadman. None of those exist here
+;  and none of them is what is under test. What IS under test is that
+;  pmfboot.pi4 reaches this call, with the right address, only when every
+;  guard has passed - so this is the call and nothing else.
+;
+;  THE INDIRECT CALL IS ASSEMBLY AND HAS TO BE. The project prefers
+;  libraries to intrinsics unless the language genuinely cannot express
+;  something, and a computed jump is the first thing on that list. This language has no way to spell a call through a
+;  variable, which is why cache.pi4's CallAddr is written exactly this way
+;  and why the same shape is repeated here rather than invented.
+;
+;  "ldr x9", not "ldr w9": an ldr w9 would branch to the low half of the
+;  address, which for anything above 4 GB is a wild branch into
+;  plausible-looking low memory. cache.pi4 records the same warning.
+; ======================================================================
+Procedure BootCall()
+  ASM
+    adrp x9, global_ggoaddr
+    add  x9, x9, #:lo12:global_ggoaddr
+    ldr  x9, [x9]
+    blr  x9
+    adrp x10, global_ggorc
+    add  x10, x10, #:lo12:global_ggorc
+    str  x0, [x10]
+  EndASM
+EndProcedure
+
+Procedure.i RunAt(a.i)
+  ; The one address it will not jump to is the monitor's own - the same
+  ; refusal cache.pi4's RunAt makes, kept because pmfboot.pi4 is entitled
+  ; to assume the seam has it.
+  If HitsMonitor(a, a) <> 0
+    Print("!! ")
+    PutAddr(a)
+    PrintN(" is inside the monitor itself, so nothing was run.")
+    ProcedureReturn 0
+  EndIf
+  gGoAddr = a
+  gGoRc = 0
+  BootCall()
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE PAYLOAD ABI, STUBBED - and stubbed so that reaching it is LOUD.
+;
+;  Anvil/Core/pmfboot.pbi's PmfEnter() gained three references when the
+;  payload ABI landed on 2026-09-04: it sets gSvcMayReturn from the
+;  container's flags word, and - only for a container that declared
+;  #PMF_FLAG_WANTS_SERVICES - calls BuildServiceTable() and
+;  SvcTableAddr(). This instrument builds pmfboot.pi4 WHOLE, so the three
+;  names must exist here even though no case reaches them:
+;
+;    * cases 2, 3, 4 and 5 are refused before PmfEnter is called at all;
+;    * case 1's container declares bit 0 only, so the flag branch is not
+;      taken.
+;
+;  IT DOES NOT INCLUDE Anvil/Hal/abi.pbi, and that is the same judgement
+;  the HwFile* stubs above are built on. abi.pi4 rides the whole Hw* seam -
+;  storage, settings, GPIO, I2C, USB, the console - and pulling it in would
+;  mean stubbing all of that to prove something about a hash. One include
+;  boundary in the right place is the difference between a testable
+;  bootloader and one that is only ever exercised by hand on a board, and
+;  this file's footer already says so.
+;
+;  SvcTableAddr RETURNS 0 AND BuildServiceTable SHOUTS. Not "returns
+;  something harmless" - a stub that handed back a plausible address would
+;  let a future edit route a tested path through a table that does not
+;  exist and still go green. If either is ever reached here, the transcript
+;  says which and the run is a fault in the harness, not a pass.
+; ======================================================================
+Global gSvcMayReturn.i
+
+Procedure BuildServiceTable()
+  PrintN("!! this instrument has no service table, and PmfEnter just asked for one.")
+  PrintN("   No case here declares the wants-services flag, so reaching this line")
+  PrintN("   means a container was staged with bit 2 set and was NOT refused by the")
+  PrintN("   ninth guard - which is case 5's whole subject. Treat this run as a")
+  PrintN("   fault in the harness and not as a result.")
+EndProcedure
+
+Procedure.i SvcTableAddr()
+  ProcedureReturn 0
+EndProcedure
+
+; The boot code compares a container header against the payload ABI
+; version. That number lives in its own file so this probe, which builds a
+; monitor with NO service table on purpose, reads the same one the monitor
+; does instead of carrying a copy that drifts.
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+XIncludeFile "Anvil/Core/pmfboot.pbi"
+
+; ======================================================================
+;  WHERE THE HARNESS PUTS THINGS. These four addresses are the contract
+;  between this file and tools/a64/a64_bootcontainer_check.py, and they
+;  are stated in both. All four are inside the low payload window
+;  ($00400000..$07EFFFFF) and clear of this program's own image, which the
+;  build places at $00400000 and which is well under a megabyte.
+; ======================================================================
+#BC_CASECELL  = $01100000      ; where the harness stages the CASE NUMBER
+#BC_CONTAINER = $01000000      ; where the harness stages the container
+#BC_LOAD      = $01200000      ; where its header says the image goes
+#BC_OBSERVE   = $01300000      ; where the payload writes its known word
+#BC_MAGICVAL  = $BEEF          ; ... and what it writes
+#BC_RETVAL    = $5A5A          ; what the payload returns in x0
+
+; ======================================================================
+;  THE VERDICT, in globals the harness reads out of the .sym map.
+;
+;  IT IS ALSO PRINTED. A verdict that lives only in memory is the reason: a tally readable only from a dump is what forced
+;  gates into the emulator in the first place. On a board, receive this
+;  and run it and the UART says the same thing.
+; ======================================================================
+Global gBcCase.i               ; which case the harness asked for
+Global gBcBooted.i             ; 1 if PmfBootAt reported it entered
+Global gBcObserved.i           ; what is at #BC_OBSERVE afterwards
+Global gBcRc.i                 ; x0 the payload returned
+Global gBcPass.i               ; 1 = this case behaved as it must
+Global gBcRan.i                ; 1 = Main reached the end. Guards a dump
+                               ; read from a program that faulted early.
+Global gBcPlaced.i             ; the first word at #BC_LOAD afterwards.
+                               ; CASE 5's WHOLE POINT: the ninth guard runs
+                               ; before a byte is copied, so "refused" is
+                               ; not enough - it must be refused HAVING
+                               ; DONE NOTHING, and the only way to say that
+                               ; out loud is to prove the load address was
+                               ; never written.
+
+; ----------------------------------------------------------------------
+;  THE CASE NUMBER ARRIVES IN MEMORY, NOT IN A GLOBAL, and the first
+;  attempt at this got it wrong in a way worth recording.
+;
+;  It was a `Global gBcWant.i = -1` that the harness poked before starting
+;  the program. Every case then ran as -1. The reason is _start: a compiled
+;  image initialises its data and clears its BSS in its first
+;  instructions, so ANY global the harness writes before execution is
+;  overwritten before Main() ever looks at it. That is correct behaviour
+;  from the image and a wrong assumption in the harness.
+;
+;  So the case number lives at a fixed address in the payload window,
+;  which _start has no reason to touch and does not. #BC_CASECELL is that
+;  address, and it is stated in this file and in the harness both.
+;
+;  It reads as 0 - "no case staged" - if the poke never happened, which
+;  Main below reports as a fault in the harness rather than treating as a
+;  pass.
+; ----------------------------------------------------------------------
+
+Procedure PutCaseName(c.i)
+  If c = 1
+    Print("a good container")
+  ElseIf c = 2
+    Print("a container with one corrupted image byte")
+  ElseIf c = 3
+    Print("a container whose load address overlaps the monitor")
+  ElseIf c = 4
+    Print("a container whose entry is outside its own image")
+  ElseIf c = 5
+    Print("a container asking for BOTH a device tree and the service table")
+  Else
+    Print("an unknown case")
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define booted.i
+
+  UartInit(115200)
+  ; NO TimerInit(). It reads CNTFRQ_EL0 with an MRS, and the A64 oracle
+  ; models neither system register - correctly, since it is an
+  ; INTERPRETER of the integer subset the backend emits and not a model of
+  ; the BCM2711's timer block. Nothing on the path under test needs a
+  ; clock: OutBreak() polls UartReadReady() and does not time anything,
+  ; and the countdown that does live in Anvil/Core/bootfile_cmd.pbi, which
+  ; this instrument deliberately does not build. On a board the call would
+  ; be free and harmless; leaving it out is what makes the identical
+  ; source run in both places.
+  gBad = 0
+  gFail = 0
+  gHaveEntry = 0
+
+  gBcCase = PeekI(#BC_CASECELL)
+  gBcPass = 0
+  gBcRan  = 0
+
+  PrintN("pi4BootContainerSelfTest - the bootloader's verify-place-enter path.")
+  Print("Case ")
+  PrintDec(gBcCase)
+  Print(": ")
+  PutCaseName(gBcCase)
+  PrintN(".")
+  PrintNl()
+
+  ; 1..5. Case 4 (entry outside the image) and case 5 (both x0 flags) are
+  ; staged by the harness; 4 only under --mutate, 5 in every run - the
+  ; ninth guard landed with the payload ABI on 2026-09-04 and is a
+  ; standing case, not a mutant control.
+  If gBcCase < 1 Or gBcCase > 5
+    PrintN("!! no case was staged. The harness pokes a case number into gBcWant")
+    PrintN("   before the run, and it did not, so nothing was tested. This is a")
+    PrintN("   fault in the harness and NOT a pass.")
+    gBcRan = 1
+    ProcedureReturn 1
+  EndIf
+
+  ; The observation cell is cleared FIRST, so that "the payload wrote it"
+  ; cannot be confused with "it happened to be there". On the oracle
+  ; memory reads as 0 anyway; on a board it reads as whatever was there.
+  PokeI(#BC_OBSERVE, 0)
+  ; AND THE LOAD ADDRESS, for the same reason and one step further. Case 5
+  ; must be refused before a byte is placed, so this cell has to start at
+  ; a known value for "it was never written" to mean anything.
+  PokeI(#BC_LOAD, 0)
+
+  booted = PmfBootAt(#BC_CONTAINER)
+
+  gBcBooted   = booted
+  gBcObserved = PeekI(#BC_OBSERVE)
+  gBcPlaced   = PeekI(#BC_LOAD)
+  gBcRc       = gGoRc
+
+  PrintNl()
+  PrintN("---- what happened ----")
+  Print("  PmfBootAt returned   ")
+  PrintDec(booted)
+  PrintNl()
+  Print("  word at ")
+  PutAddr(#BC_OBSERVE)
+  Print("     ")
+  PutHex16(gBcObserved)
+  PrintNl()
+  Print("  payload x0           ")
+  PutHex16(gBcRc)
+  PrintNl()
+  Print("  word at ")
+  PutAddr(#BC_LOAD)
+  Print("     ")
+  PutHex16(gBcPlaced)
+  PrintNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE VERDICT PER CASE. Each states what MUST be true, and each
+  ;  requires the negative as well as the positive: case 1 is not a pass
+  ;  merely because it returned 1, and cases 2 and 3 are not passes
+  ;  merely because they returned 0 - the payload must be proved NOT to
+  ;  have run, or a refusal that happened after the jump would look
+  ;  exactly like a refusal that happened before it.
+  ; ------------------------------------------------------------------
+  If gBcCase = 1
+    If booted <> 0 And gBcObserved = #BC_MAGICVAL And gBcRc = #BC_RETVAL
+      gBcPass = 1
+      PrintN("PASS: the container was verified, placed and ENTERED, and the payload")
+      PrintN("      demonstrably ran - it wrote its word and returned its value.")
+    Else
+      PrintN("FAIL: a good container was not entered, or the payload did not run.")
+      If booted = 0
+        PrintN("      PmfBootAt refused it. The lines above say why.")
+      EndIf
+      If gBcObserved <> #BC_MAGICVAL
+        PrintN("      The known write is not at the observation address, so the")
+        PrintN("      payload never executed even if the command claimed it did.")
+      EndIf
+      If gBcRc <> #BC_RETVAL
+        PrintN("      x0 is not the payload's return value.")
+      EndIf
+    EndIf
+
+  ElseIf gBcCase = 2
+    If booted = 0 And gBcObserved = 0 And gBcRc = 0
+      gBcPass = 1
+      PrintN("PASS: the corrupted container was REFUSED by the hash check, and the")
+      PrintN("      payload was not entered - the observation cell is untouched.")
+    Else
+      PrintN("FAIL: a container with a corrupted image byte was not refused, or was")
+      PrintN("      refused only after the payload had already been entered.")
+      If booted <> 0
+        PrintN("      PmfBootAt reported success. THE HASH CHECK DID NOT HOLD. This is")
+        PrintN("      the worst possible outcome for this program: the last guard")
+        PrintN("      before the jump let a corrupted image through.")
+      EndIf
+      If gBcObserved <> 0
+        PrintN("      The payload RAN. Whatever printed above, the jump happened.")
+      EndIf
+    EndIf
+
+  ElseIf gBcCase = 5
+    ; ------------------------------------------------------------------
+    ;  THE NINTH GUARD. Bit 1 says "put a device tree in x0" and bit 2
+    ;  says "put the service table in x0", and there is one x0.
+    ;
+    ;  THIS CASE IS STRICTER THAN 2 AND 3, and deliberately: those two are
+    ;  refused AFTER the image has been placed (the hash cannot run before
+    ;  placement, and the range check is about where placement would go).
+    ;  The ninth guard runs before the image length is even checked, so
+    ;  the container must be refused HAVING DONE NOTHING - and gBcPlaced
+    ;  is what says so. A guard that refused correctly but only after
+    ;  copying a megabyte over the operator's memory would pass every
+    ;  other check here.
+    ; ------------------------------------------------------------------
+    If booted = 0 And gBcObserved = 0 And gBcRc = 0 And gBcPlaced = 0
+      gBcPass = 1
+      PrintN("PASS: the container asking for both a device tree and the service")
+      PrintN("      table in x0 was REFUSED, and nothing was placed, entered or")
+      PrintN("      written - the load address still holds what it held before.")
+    Else
+      PrintN("FAIL: a container with bits 1 and 2 both set was not refused before")
+      PrintN("      anything happened.")
+      If booted <> 0
+        PrintN("      PmfBootAt reported success. It was ENTERED with one of two")
+        PrintN("      pointers it asked for, and which one is a coin toss.")
+      EndIf
+      If gBcPlaced <> 0
+        PrintN("      The image was PLACED. The refusal came too late: this guard")
+        PrintN("      runs before the image length is checked precisely so that a")
+        PrintN("      container this confused never touches memory at all.")
+      EndIf
+    EndIf
+
+  Else
+    If booted = 0 And gBcObserved = 0 And gBcRc = 0
+      gBcPass = 1
+      PrintN("PASS: the container whose load address overlaps the monitor was")
+      PrintN("      REFUSED, and nothing was placed or entered.")
+    Else
+      PrintN("FAIL: a container asking to be loaded over the monitor was not")
+      PrintN("      refused. On a board that would have overwritten the code that")
+      PrintN("      was reading it, with no prompt left to say so.")
+    EndIf
+  EndIf
+
+  PrintNl()
+  If gBcPass <> 0
+    PrintN("RESULT: GREEN")
+  Else
+    PrintN("RESULT: RED")
+  EndIf
+
+  gBcRan = 1
+  ProcedureReturn 0
+EndProcedure
+
+Main()

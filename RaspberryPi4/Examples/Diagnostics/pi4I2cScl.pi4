@@ -1,0 +1,709 @@
+; pi4I2cScl.pi4 - WHAT CLOCK ACTUALLY FEEDS THE I2C DIVIDER? Measure it.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THE QUESTION. The BCM2711 datasheet (Table 30, p.28) says SCL =
+; core_clock / CDIV "where core_clk is nominally 150 MHz", and the driver
+; computed its reported rate from that constant. Meanwhile the monitor's
+; own `info` prints a MEASURED VideoCore clock of half a gigahertz on the
+; same board in the same session. If the divider is fed from the second
+; number rather than the first, every rate this board has ever reported is
+; wrong by that ratio - a requested 100 kHz would really be about 333 kHz.
+;
+; That was an inference drawn from two printed numbers. Nothing had ever
+; watched a clock edge. This watches clock edges.
+;
+; HOW. The divider is programmed to a KNOWN CDIV, a transaction is started
+; (a one-byte read from an address with nothing on it - the address is not
+; acknowledged, but the controller still clocks SCL out to ask), and the
+; SCL pad is sampled in a tight loop while it happens. Every falling edge
+; is timestamped from the architectural counter, so
+;
+;     SCL    = gaps * tick_hz / (t_last - t_first)
+;     source = SCL * CDIV
+;
+; over a run of gaps that are all one clock period. The source clock then
+; falls out of two things both measured on this board: an edge count and
+; a tick count.
+;
+; WHICH GAPS COUNT IS THE WHOLE ACCURACY OF THIS THING, and getting it
+; wrong cost a wrong answer that looked right - see THE FIRST GAP IS NOT
+; A CLOCK PERIOD, further down, which is where the intervals are printed
+; and the reason is set out with the numbers that showed it.
+;
+; REPEATED AT FIVE DIVIDERS PLUS WHATEVER WAS SET WHEN IT STARTED, so the
+; answer is a fit and not a point. If the rows agree, the divider is fed
+; by one clock and its rate is that number. If they walk with CDIV, the
+; model SCL = source/CDIV is wrong and this prints disagreeing numbers
+; instead of one confident one.
+;
+; THE SAMPLING RATE IS PRINTED AND SO IS THE MARGIN. A polling loop cannot
+; see an edge it did not sample near, so every row reports how many samples
+; fell in one SCL half-period AND how far the worst fitted gap was from
+; their mean. Below four samples a half the row says it is not evidence
+; rather than being quietly averaged in with the good ones.
+;
+; A SECOND ESTIMATE runs alongside: the same fitted span at two different
+; dividers, subtracted. That removes the one error a single row cannot -
+; the time the sampling loop takes to NOTICE an edge - because it is a
+; property of the loop and not of the divider. See THE SLOPE.
+;
+; AND THE ANSWER IS COMPARED WITH WHAT THE FIRMWARE SAYS - the configured
+; and measured rates of all four mailbox clocks - so the source can be
+; NAMED rather than merely quantified. A measured 500 MHz means nothing
+; until it is matched against the clock the firmware calls by that number.
+;
+; IT ALSO CHECKS SOMEBODY ELSE'S WORK. The FIRST row is the divider as
+; found, measured before anything is touched and put back afterwards. So
+; `i2c speed 400000`, then this, and the first row is the rate that
+; command actually put on the wire - which is how the fix for this topic
+; was proved rather than argued.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN. It is sent
+; to a resident Anvil and RETURNS to it, so a wrong answer costs a line of
+; output rather than a power cycle:
+;
+;   pmfc RaspberryPi4/Examples/Diagnostics/pi4I2cScl.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o i2cscl.img
+;
+; ARM THE DEADMAN FIRST. `deadman 15` immediately before `run 400000`.
+;
+; WHAT IT LEAVES BEHIND. GPIO 2 and 3 on alt0, and the divider exactly as
+; it was found. It writes no device: every transaction is addressed to
+; 0x08, which the bus scan of 2026-09-03 found empty, and a read probe
+; writes nothing even if something is there.
+
+; THE ORDER IS LOAD-BEARING (a library never includes a
+; library, so this file lists every one it needs, in a sequence that
+; works). i2c.pi4 calls PinAlt out of gpio.pi4 and the two clock getters
+; out of mailbox.pi4, so both must be parsed BEFORE it; timer.pi4 depends
+; on nothing and can go anywhere.
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; The address every transaction here is aimed at. 0x08 is the first
+; address a scan tries and the 2026-09-03 pass found nothing at it. A
+; read probe writes no byte, so even a device that appeared later would
+; not be disturbed - only asked.
+#SCL_PROBE_ADDR = $08
+
+; How long one sampling window lasts, in microseconds. It only has to
+; outlast one transaction at the slowest divider used here: nine SCL
+; clocks at 65534 against a source as low as 150 MHz is about 3.9 ms, and
+; against 500 MHz about 1.2 ms. 20 ms covers both with room to spare, and
+; six windows still finish inside a fiftieth of the deadman.
+#SCL_WINDOW_US = 20000
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; A decimal number padded on the left to `w` columns, so the table lines
+; up and a wrong order of magnitude is visible as a shape rather than
+; having to be read digit by digit.
+Procedure PutPad(v.i, w.i)
+  Define n.i
+  Define t.i
+  n = 1
+  t = v
+  If t < 0
+    t = 0 - t
+    n = n + 1
+  EndIf
+  While t >= 10
+    t = t / 10
+    n = n + 1
+  Wend
+  While n < w
+    PutC(32)
+    n = n + 1
+  Wend
+  PutDec(v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE MEASUREMENT ITSELF.
+;
+;  Results come back in globals rather than a struct because this
+;  language has no multiple return and a diagnostic is a bad place to
+;  invent one.
+; ----------------------------------------------------------------------
+Global g_edges.i          ; falling edges seen on SCL during the window
+Global g_samples.i        ; how many times the pad was actually read
+Global g_windowticks.i    ; how long the window really was, in ticks
+Global g_status.i         ; the BSC status word when the window closed
+Global g_divback.i        ; DIV read back, so a rejected write is visible
+
+; EVERY EDGE, NOT JUST THE FIRST AND LAST, AND HERE IS WHY.
+;
+; The first version of this instrument timed from the first falling edge
+; to the last and divided by the number of gaps. It got a self-consistent
+; answer that was five per cent low at every divider - which is exactly
+; the shape of a real effect being averaged into a wrong model, and not
+; the shape of noise. A transaction is not nine identical clock periods:
+; it is eight address bits, an acknowledge slot, and then a STOP, and the
+; controller does not have to spend one whole period on the last of those.
+; Averaging over the tail folds that into the answer and biases it low, at
+; every divider equally, so the six rows still AGREE with each other while
+; all being wrong together. Agreement is not accuracy.
+;
+; So every edge is timestamped and the intervals are printed. The source
+; is then computed only from the run of identical periods inside the
+; address byte, and the odd interval at the end is visible in the table
+; instead of hiding inside the number.
+#SCL_MAX_EDGES = 24
+Global Dim g_tick.i(#SCL_MAX_EDGES)
+
+; The tick span the last row fitted over and how many clock periods that
+; span was, so the two-divider slope below can subtract two of them. The
+; count has to travel with the span: subtracting two spans measured over
+; DIFFERENT numbers of periods is meaningless, and the caller checks.
+Global g_fitspan.i
+Global g_fitgaps.i
+
+; ======================================================================
+;  THE SAMPLING LOOP IS ASSEMBLY, AND THIS IS THE ONE PLACE IN THIS TREE
+;  WHERE THAT IS NOT A SHORTCUT.
+;
+;  The tree's rule is LIBRARIES, NEVER INTRINSICS, unless the language
+;  genuinely cannot express the thing. Written in the language, this loop
+;  samples at about 880 kHz - measured, printed by the instrument itself
+;  as samples per SCL half-period. That is enough to resolve SCL down to
+;  about 100 kHz and NOT enough for 400 kHz, which is exactly the rate
+;  the topic asks to be proved.
+;
+;  WHY IT IS SO SLOW, AND WHY NO REWRITE IN THE LANGUAGE HELPS. The MMU
+;  is off on this board, so there is NO DATA CACHE - and this compiler
+;  gives every local variable a static home in memory. So each iteration
+;  of a loop written normally costs one uncached DRAM access per variable
+;  touched, plus the peripheral read it actually wanted. Eight or nine
+;  DRAM round trips to look at one pin. It is not the compiler being
+;  poor; it is the absence of a cache making "a variable" cost what a
+;  memory access costs.
+;
+;  In registers the same loop is a peripheral load, a mask, two branches
+;  and an add - and the peripheral load is then the only thing off-chip.
+;  It measures about twenty times faster, which puts 400 kHz comfortably
+;  inside reach.
+;
+;  THE INVARIANT, if this is ever edited: NOTHING IN THIS BLOCK MAY TOUCH
+;  MEMORY except the peripheral read at [x0], the timestamp store at
+;  [x14] on an edge, and the one sample-count store at the very end. A
+;  single spilled variable in the middle of the loop and the sampling
+;  rate goes back to where it was, silently, and the instrument starts
+;  reporting a slower clock than the board has - which is precisely the
+;  failure this whole topic is about.
+; ======================================================================
+Procedure.i I2cSclSample(levaddr.i, mask.i, maxedges.i, *buf, deadline.i, *samples)
+  ASM
+    ; x0 = the GPLEV address          x3 = the timestamp buffer
+    ; x1 = the SCL bit mask           x4 = the tick deadline
+    ; x2 = how many the buffer holds  x5 = where the sample count goes
+    ; x9  = this sample, masked       x13 = samples taken
+    ; x10 = the previous sample       x14 = the buffer write pointer
+    ; x11 = edges seen                x15 = the constant 255
+    ; x12 = a timestamp, then scratch
+    mov  x10, x1                 ; an idle bus rests HIGH - start there,
+                                 ; so a line already low is not counted
+                                 ; as a falling edge that never happened
+    movz x11, #0
+    movz x13, #0
+    mov  x14, x3
+    movz x15, #255
+sclSampleLoop:
+    ldr  w9, [x0]
+    and  x9, x9, x1
+    cbnz x9, sclSampleNext       ; high - cannot be a falling edge
+    cbz  x10, sclSampleNext      ; was already low - not an edge either
+    mrs  x12, cntpct_el0         ; a falling edge, and this is when
+    cmp  x11, x2
+    b.ge sclSampleCount          ; buffer full - still count it
+    str  x12, [x14]
+    add  x14, x14, #8
+sclSampleCount:
+    add  x11, x11, #1
+sclSampleNext:
+    mov  x10, x9
+    add  x13, x13, #1
+    ; The deadline is read once every 256 samples. Reading it every
+    ; sample would add a system-register read to the hot path to police
+    ; a window three orders of magnitude longer than the granularity
+    ; that costs.
+    and  x12, x13, x15
+    cbnz x12, sclSampleLoop
+    mrs  x12, cntpct_el0
+    cmp  x12, x4
+    b.lt sclSampleLoop
+    str  x13, [x5]
+    mov  x0, x11
+  EndASM
+EndProcedure
+
+Procedure.i I2cSclWindow(cdiv.i, windowticks.i)
+  Define tstart.i
+  Define mask.i
+  Define n.i
+
+  mask = 1 << #I2C_PIN_SCL
+
+  ; Program the divider and stage a one-byte read. Same register order
+  ; the library's own I2cXfer uses (clear the sticky bits, address,
+  ; length, then one write to C), because a different order here would
+  ; be measuring a transaction shape the driver never produces.
+  a64_barrier()
+  PokeL(#BSC1_BASE + #BSC_DIV_OFF, cdiv & $FFFF)
+  g_divback = PeekN(#BSC1_BASE + #BSC_DIV_OFF) & $FFFF
+  PokeL(#BSC1_BASE + #BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
+  PokeL(#BSC1_BASE + #BSC_A_OFF, #SCL_PROBE_ADDR)
+  PokeL(#BSC1_BASE + #BSC_DLEN_OFF, 1)
+  a64_barrier()
+
+  g_edges = 0
+  g_samples = 0
+
+  tstart = Ticks()
+
+  ; GO, and then straight into the sampler. Nothing may happen between
+  ; the start bit and the loop: at the fast dividers one printed
+  ; character would cost more than an SCL period.
+  PokeL(#BSC1_BASE + #BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR | #BSC_C_ST | #BSC_C_READ)
+  n = I2cSclSample(#GPIO_BASE + #GPLEV0_OFF, mask, #SCL_MAX_EDGES, @g_tick(0), tstart + windowticks, @g_samples)
+
+  g_windowticks = Ticks() - tstart
+  a64_barrier()
+  g_status = PeekN(#BSC1_BASE + #BSC_S_OFF) & $FFFFFFFF
+  PokeL(#BSC1_BASE + #BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
+  a64_barrier()
+
+  g_edges = n
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE FIRST GAP IS NOT A CLOCK PERIOD, AND IT WAS MEASURED THAT WAY.
+;
+;  The very first interval - from the first falling edge of SCL to the
+;  second - comes out at almost exactly ONE AND A HALF times every
+;  interval after it, at every divider:
+;
+;     cdiv 65534   10646  7067 7058 7097 7056 7086 7084 7074 7035
+;     cdiv 32768    5277  3538 3539 3588 3537 3526 3523 3521 3580
+;     cdiv 16384    2656  1779 1777 1790 1773 1772 1774 1730 1782
+;
+;  Every gap but the first is the period. The first is the START
+;  condition's hold time plus the period, and the controller spends half
+;  a period extra there.
+;
+;  THIS IS WHY THE FIRST VERSION OF THIS INSTRUMENT WAS WRONG BY EXACTLY
+;  SEVEN PER CENT. It averaged over seven gaps including that one, so it
+;  divided 7.5 periods' worth of ticks by 7 and reported 7/7.5 of the
+;  real clock - 466 MHz where the answer is 500 MHz - at EVERY divider,
+;  identically. Six rows agreeing with each other and all wrong together
+;  is what a systematic error looks like, and it is why the intervals are
+;  printed rather than summarised. The agreement was real. The number was
+;  not.
+;
+;  So the fit starts at the SECOND edge and runs to the last one, over
+;  gaps that are all the same thing.
+; ----------------------------------------------------------------------
+#SCL_FIT_FROM = 1             ; skip gap 0 - the START hold, see above
+#SCL_FIT_MIN_GAPS = 4         ; fewer than this is not a fit
+
+; ----------------------------------------------------------------------
+;  One row of the table, and the source clock it implies.
+;  Returns the implied source in Hz, or 0 if the row is not evidence.
+; ----------------------------------------------------------------------
+Procedure.i Row(cdiv.i, tickhz.i, windowticks.i)
+  Define span.i
+  Define gaps.i
+  Define last.i
+  Define scl.i
+  Define src.i
+  Define samplehz.i
+  Define perhalf.i
+  Define i.i
+  Define g.i
+  Define mean.i
+  Define worst.i
+  Define d.i
+
+  I2cSclWindow(cdiv, windowticks)
+
+  PutS("  cdiv ")
+  PutPad(g_divback, 5)
+  PutS("  edges ")
+  PutPad(g_edges, 3)
+
+  ; The fit runs from the second edge to the last one recorded. Every gap
+  ; in that run is one clock period; the one before it is not.
+  last = g_edges - 1
+  If last > #SCL_MAX_EDGES - 1
+    last = #SCL_MAX_EDGES - 1
+  EndIf
+  gaps = last - #SCL_FIT_FROM
+  If gaps < #SCL_FIT_MIN_GAPS
+    PutS("   TOO FEW EDGES to fit - ")
+    PutDec(gaps)
+    PutS(" usable gaps, wanted ")
+    PutDec(#SCL_FIT_MIN_GAPS)
+    PutS(", status $")
+    PutDec(g_status)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  span = g_tick(last) - g_tick(#SCL_FIT_FROM)
+  g_fitspan = span
+  g_fitgaps = gaps
+  If span <= 0
+    PutS("   the first and last of the fitted edges carry the same")
+    PutS(" timestamp - nothing can be divided by that.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; SCL and then the source, each in ONE expression rather than from the
+  ; rounded value above it, so a printed rounding does not propagate.
+  ; gaps * tickhz * cdiv is at most about 3e13 here, a long way inside a
+  ; 64-bit product.
+  scl = (gaps * tickhz) / span
+  src = (gaps * tickhz * cdiv) / span
+
+  samplehz = (g_samples * tickhz) / g_windowticks
+  perhalf = samplehz / (scl * 2)
+
+  ; HOW UNIFORM THE FITTED GAPS ACTUALLY WERE, as the worst single
+  ; deviation from their mean, in per cent. This is the number that says
+  ; whether the row is one clock measured a few times or a sampling loop
+  ; losing edges, and it costs one pass over an array that is already in
+  ; registers. A row with a large scatter is still usable - the mean is
+  ; what is quoted - but the reader gets to see the spread rather than a
+  ; confident single figure resting on it.
+  mean = span / gaps
+  worst = 0
+  For i = #SCL_FIT_FROM + 1 To last
+    g = g_tick(i) - g_tick(i - 1)
+    d = g - mean
+    If d < 0
+      d = 0 - d
+    EndIf
+    If d > worst
+      worst = d
+    EndIf
+  Next
+
+  PutS("  SCL ")
+  PutPad(scl, 8)
+  PutS(" Hz   source ")
+  PutPad(src, 10)
+  PutS(" Hz   samp/half ")
+  PutPad(perhalf, 4)
+  PutS("  spread ")
+  PutPad((worst * 100) / mean, 3)
+  PutC(37)                            ; 37 = '%'
+
+  ; EVERY INTERVAL, IN TICKS, so the reader can see for themselves that
+  ; the fitted ones are uniform and that the first one is not. A number
+  ; that has to be trusted is worth less than a number with its working
+  ; printed beside it - and this is the working that caught the seven per
+  ; cent the header describes.
+  PutS("   gaps")
+  For i = 1 To last
+    If i = #SCL_FIT_FROM + 1
+      PutS("  |")                     ; everything right of the bar is fitted
+    EndIf
+    PutC(32)
+    PutDec(g_tick(i) - g_tick(i - 1))
+  Next
+  If perhalf < 4
+    PutS("   <- TOO COARSE, not evidence")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+  ProcedureReturn src
+EndProcedure
+
+Procedure SayClock(*name, id.i)
+  PutS("  ")
+  PutS(*name)
+  PutS("  configured ")
+  PutPad(MailboxClockRate(id), 11)
+  PutS("   measured ")
+  PutPad(MailboxClockRateMeasured(id), 11)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SLOPE, AND WHY IT IS A BETTER NUMBER THAN ANY SINGLE ROW.
+;
+;  Every row above divides a measured tick span by a known number of
+;  periods, and it carries one systematic error nobody can remove from a
+;  single reading: a polling loop notices an edge some time AFTER it
+;  happens, and that latency sits inside the span. It is roughly the same
+;  at both ends of a span, so it mostly cancels - but "mostly" is not a
+;  measurement.
+;
+;  Two dividers remove it properly. The fitted span is the same known
+;  number of periods at both, so
+;
+;     span(cdiv) = gaps * cdiv / source + latency
+;
+;  and the latency, being a property of the sampling loop and not of the
+;  divider, subtracts out exactly:
+;
+;     source = gaps * (cdivA - cdivB) * tick_hz / (spanA - spanB)
+;
+;  Nothing here is assumed about the transaction, the controller or the
+;  loop. Two spans, two dividers, one known period count.
+; ----------------------------------------------------------------------
+Procedure.i SlopeEstimate(spanA.i, cdivA.i, spanB.i, cdivB.i, gaps.i, tickhz.i)
+  If spanA <= spanB Or cdivA <= cdivB Or gaps <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (gaps * (cdivA - cdivB) * tickhz) / (spanA - spanB)
+EndProcedure
+
+Procedure Main()
+  Define tickhz.i
+  Define windowticks.i
+  Define s1.i
+  Define s2.i
+  Define s3.i
+  Define s4.i
+  Define s5.i
+  Define good.i
+  Define total.i
+  Define avg.i
+  Define slope.i
+  Define spanslow.i
+  Define spanfast.i
+  Define gapsslow.i
+  Define gapsfast.i
+  Define core.i
+  Define asfound.i
+
+  PutNl()
+  PutS("=== Pi 4 I2C source clock - measured on the wire, not read off a page ===")
+  PutNl()
+
+  tickhz = TickHz()
+  If tickhz <= 0
+    PutS("CNTFRQ_EL0 reads ")
+    PutDec(tickhz)
+    PutS(" - nothing here can be timed. Stopping.")
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+  PutS("tick counter ")
+  PutDec(tickhz)
+  PutS(" Hz")
+  PutNl()
+
+  If MailboxInit() = 0
+    PutS("MailboxInit failed, error ")
+    PutDec(MailboxError())
+    PutS(" - the firmware clocks cannot be named, but the")
+    PutNl()
+    PutS("measurement below does not need them.")
+    PutNl()
+  Else
+    PutS("what the firmware says about its clocks:")
+    PutNl()
+    SayClock("ARM ", #MBX_CLK_ARM)
+    SayClock("CORE", #MBX_CLK_CORE)
+    SayClock("EMMC", #MBX_CLK_EMMC)
+    SayClock("UART", #MBX_CLK_UART)
+  EndIf
+
+  ; THE DIVIDER AS FOUND, READ BEFORE ANYTHING IS TOUCHED. This is what
+  ; makes the instrument able to check somebody ELSE's work: type
+  ; `i2c speed 400000`, run this, and the first row below is the rate
+  ; that command actually put on the wire, measured. It is put back at
+  ; the end, so running this does not disturb the setting it came to
+  ; check.
+  asfound = I2cGetDiv()
+
+  ; Bring the bus up only if it is not already up. I2cInit REPROGRAMS
+  ; THE DIVIDER, so calling it unconditionally would destroy the very
+  ; setting the row above exists to measure. If the pins are already on
+  ; the controller's function there is nothing to bring up.
+  ;
+  ; Until the bus has been up once, the SCL pad is a plain input
+  ; connected to nothing the controller drives - the unmuxed-pins defect, and
+  ; it would make every row below read zero edges.
+  If I2cPinsMuxed() <> 1
+    PutS("the bus was not up, so it is being brought up here - which resets the")
+    PutNl()
+    PutS("divider, so the as-found row is the 100 kHz default and not a setting.")
+    PutNl()
+    I2cInit()
+    asfound = I2cGetDiv()
+  EndIf
+  If I2cPinsMuxed() <> 1
+    PutS("the bus pins are NOT on the controller's function after I2cInit,")
+    PutNl()
+    PutS("so nothing below would be measuring SCL. Stopping.")
+    PutNl()
+    ProcedureReturn 2
+  EndIf
+
+  windowticks = (tickhz / 1000) * (#SCL_WINDOW_US / 1000)
+
+  PutNl()
+  PutS("AS FOUND - the divider whoever ran last left behind, measured:")
+  PutNl()
+  Row(asfound, tickhz, windowticks)
+
+  PutNl()
+  PutS("measuring SCL directly, one window per divider:")
+  PutNl()
+  s1 = Row(65534, tickhz, windowticks)
+  spanslow = g_fitspan                    ; kept for the two-divider slope
+  gapsslow = g_fitgaps
+  s2 = Row(32768, tickhz, windowticks)
+  s3 = Row(16384, tickhz, windowticks)
+  s4 = Row(8192, tickhz, windowticks)
+  spanfast = g_fitspan                    ; the other end of the slope
+  gapsfast = g_fitgaps
+  s5 = Row(4096, tickhz, windowticks)
+  Row(1500, tickhz, windowticks)          ; the reset default, for the record
+
+  good = 0
+  total = 0
+  If s1 > 0 : good = good + 1 : total = total + s1 : EndIf
+  If s2 > 0 : good = good + 1 : total = total + s2 : EndIf
+  If s3 > 0 : good = good + 1 : total = total + s3 : EndIf
+  If s4 > 0 : good = good + 1 : total = total + s4 : EndIf
+  If s5 > 0 : good = good + 1 : total = total + s5 : EndIf
+
+  PutNl()
+  If good = 0
+    PutS("NO ROW IS EVIDENCE. Nothing was measured; do not quote a number.")
+    PutNl()
+    I2cSetDiv(asfound)
+    ProcedureReturn 3
+  EndIf
+
+  avg = total / good
+  PutS("mean of the ")
+  PutDec(good)
+  PutS(" usable rows: source = ")
+  PutDec(avg)
+  PutS(" Hz")
+  PutNl()
+
+  ; THE TWO-DIVIDER SLOPE, which removes the sampling latency the mean
+  ; above still carries. cdiv 65534 against cdiv 8192, the slowest row
+  ; and the fastest one still sampled comfortably.
+  slope = 0
+  If gapsslow = gapsfast
+    slope = SlopeEstimate(spanslow, 65534, spanfast, 8192, gapsslow, tickhz)
+  Else
+    PutS("no slope: the two rows fitted ")
+    PutDec(gapsslow)
+    PutS(" and ")
+    PutDec(gapsfast)
+    PutS(" periods, and spans over")
+    PutNl()
+    PutS("different period counts cannot be subtracted.")
+    PutNl()
+  EndIf
+  If slope > 0
+    PutS("two-divider slope, sampling latency subtracted out: source = ")
+    PutDec(slope)
+    PutS(" Hz")
+    PutNl()
+  EndIf
+
+  ; AND NOW NAME IT. A measured half-gigahertz means nothing until it is
+  ; matched against a clock the firmware will talk about by name; that is
+  ; what turns "the divider is fed by something near 500 MHz" into "the
+  ; divider is fed by the clock the mailbox calls CORE, and here is the
+  ; ratio". Printed as a per-mille error so a one-to-one match is not
+  ; something the reader has to work out.
+  core = MailboxClockRateMeasured(#MBX_CLK_CORE)
+  If core > 0 And slope > 0
+    PutS("the firmware's MEASURED core clock is ")
+    PutDec(core)
+    PutS(" Hz; the slope is ")
+    PutDec((slope * 1000) / core)
+    PutS("/1000 of it")
+    PutNl()
+  EndIf
+  core = MailboxClockRate(#MBX_CLK_CORE)
+  If core > 0 And slope > 0
+    PutS("its CONFIGURED core clock is ")
+    PutDec(core)
+    PutS(" Hz; the slope is ")
+    PutDec((slope * 1000) / core)
+    PutS("/1000 of that")
+    PutNl()
+  EndIf
+  If slope > 0
+    PutS("the datasheet's nominal 150000000 Hz; the slope is ")
+    PutDec((slope * 1000) / 150000000)
+    PutS("/1000 of that")
+    PutNl()
+  EndIf
+
+  ; PUT THE DIVIDER BACK EXACTLY AS IT WAS FOUND. An instrument that
+  ; changes the thing it came to measure is worth nothing on the second
+  ; run, and `i2c speed` typed after this must report what it reported
+  ; before it.
+  I2cSetDiv(asfound)
+
+  PutS("=== done ===")
+  PutNl()
+  ProcedureReturn avg / 1000000
+EndProcedure

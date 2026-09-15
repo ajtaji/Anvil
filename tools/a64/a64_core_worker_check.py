@@ -820,7 +820,6 @@ def build_ownership_mutant(compiler: str, work: Path, label: str,
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, target)
-    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
     shutil.copytree(ROOT / "Boards", root / "Boards")
     shutil.copytree(
         ROOT / "RaspberryPi4" / "Intrinsics",

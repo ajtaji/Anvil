@@ -1,0 +1,266 @@
+; pi4NeonMbxTag.pi4 - WHICH MAILBOX TAG IN V3D BRING-UP KILLS THE
+; FIRMWARE?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT pi4NeonMbx.pi4 ALREADY SETTLED
+; ======================================================================
+;  Measured on the board, 2026-08-28, on a freshly reset Pi 4:
+;
+;    rung 0  after nothing at all
+;        MAIL0_STA $40000000  MAIL1_STA $40000000
+;        DisplayInit rc 1   base $3E2CB000  1920x1080   SURFACE OK
+;
+;    rung 1  after V3dInit
+;        MAIL0_STA $40000000  MAIL1_STA $00000005
+;        DisplayInit rc -19  MailboxError 5   NO SURFACE
+;
+;  #MBX_ERR_RXTIMEOUT = 5 is "mailbox 0 stayed EMPTY": the request went
+;  out and NOTHING CAME BACK. MAIL1 already had five requests queued by
+;  the time the rung was read, so the firmware stopped answering PART
+;  WAY THROUGH V3dAskFirmware's own twelve transactions and never
+;  started again. It stays dead across payloads. Only a board reset
+;  clears it.
+;
+;  SO IT IS NOT THE V3D MMU - that is not touched until much later -
+;  and it is not the ASB or PM register sequence, which is registers
+;  and not mail. It is one of the four SET tags V3dAskFirmware sends
+;  (v3d.pi4:1578-1586):
+;
+;      SET_DOMAIN_STATE   the new numbering, V3D on
+;      SET_POWER_STATE    the OLD numbering, V3D on
+;      SET_CLOCK_STATE    V3D clock on
+;      SET_CLOCK_RATE     V3D clock to the ceiling the firmware reported
+;
+; ======================================================================
+;  WHAT THIS ASKS
+; ======================================================================
+;  Each of the four, ONE AT A TIME, with a full DisplayInit after it.
+;  The first one that is followed by NO SURFACE is the tag, by name.
+;
+;  IT DOES NOT CALL V3dInit AT ALL. The tags are sent directly through
+;  mailbox.pi4, so nothing else in the bring-up can be blamed and
+;  nothing else runs.
+;
+;  THE QUERIES GO FIRST AND ARE EXPECTED TO BE HARMLESS. Five reads -
+;  the domain, the power, the clock state, the rate and the maximum -
+;  are sent before any write, and a DisplayInit after them proves the
+;  read half is innocent before the write half is accused.
+;
+;  ANNOUNCE THEN DRAIN. Each dead transaction costs 1000 ms
+;  (#MBX_TIMEOUT_MS) and DisplayInit is nine tags in one message, so a
+;  run that goes bad early still has to survive to print. Every line is
+;  flushed before the thing that might not come back, and the deadman
+;  is the monitor's usual 15 s.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonMbxTag.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o _work/neonmbxtag.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+; v3d.pi4's own constants, restated here so this probe depends on
+; nothing but the mailbox. The values are v3d.pi4:1494-1530's.
+#MT_TAG_SET_DOMAIN_STATE = $00038030
+#MT_TAG_SET_POWER_STATE  = $00028001
+#MT_TAG_SET_CLOCK_STATE  = $00038001
+#MT_DOMAIN_ID_NEW = 11
+#MT_POWER_ID_OLD  = 10
+#MT_CLOCK_ID      = 5
+#MT_STATE_ON      = 1
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Global mtDead.i = 0
+
+; The same two questions after every step.
+Procedure.i After(*what)
+  Define rc.i
+  UartWriteStr("  after ")
+  UartWriteStr(*what)
+  PutNl()
+  UartWriteStr("      MAIL0_STA ")
+  PutHex(PeekN(#MBX_STATUS0) & $FFFFFFFF, 8)
+  UartWriteStr("  MAIL1_STA ")
+  PutHex(PeekN(#MBX_STATUS1) & $FFFFFFFF, 8)
+  PutNl()
+  UartDrain()
+  If mtDead <> 0
+    UartWriteStr("      (not asking again - the firmware is already gone)")
+    PutNl()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+  DisplayStandardTags()
+  rc = DisplayInit(1920, 1080, 32)
+  UartWriteStr("      DisplayInit rc ")
+  PrintDec(rc)
+  UartWriteStr("  MailboxError ")
+  PrintDec(MailboxError())
+  If rc = 1
+    UartWriteStr("   SURFACE OK")
+  Else
+    UartWriteStr("   *** NO SURFACE - THIS IS THE STEP ***")
+    mtDead = 1
+  EndIf
+  PutNl()
+  PutNl()
+  UartDrain()
+  ProcedureReturn rc
+EndProcedure
+
+; One id/state tag, sent on its own.
+Procedure.i SetIdState(tag.i, id.i, state.i)
+  Define ok.i
+  If MailboxBegin(tag, 8, 8) = 0
+    ProcedureReturn -1
+  EndIf
+  MailboxSetWord(0, id)
+  MailboxSetWord(1, state)
+  ok = MailboxSend()
+  If ok = 0
+    ProcedureReturn -2
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define v.i
+  Define maxHz.i
+
+  PutNl()
+  PutS("=== pi4NeonMbxTag - which bring-up tag kills the firmware? ===")
+  PutNl()
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running")
+    PutNl()
+  EndIf
+  If MailboxInit() = 0
+    PutS("verdict: NO MAILBOX")
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+
+  rc = After("nothing at all")
+  If rc <> 1
+    PutS("verdict: THE BOARD WAS ALREADY WEDGED. Reset and run again.")
+    PutNl()
+    ProcedureReturn 2
+  EndIf
+
+  ; ---- the five reads --------------------------------------------------
+  PutS("  ... five READS: domain, power, clock state, rate, maximum")
+  PutNl()
+  UartDrain()
+  v = SetIdState($00030030, #MT_DOMAIN_ID_NEW, 0)      ; GET_DOMAIN_STATE
+  UartWriteStr("      GET_DOMAIN_STATE  ")
+  PrintDec(v)
+  PutNl()
+  v = SetIdState($00020001, #MT_POWER_ID_OLD, 0)       ; GET_POWER_STATE
+  UartWriteStr("      GET_POWER_STATE   ")
+  PrintDec(v)
+  PutNl()
+  v = SetIdState($00030001, #MT_CLOCK_ID, 0)           ; GET_CLOCK_STATE
+  UartWriteStr("      GET_CLOCK_STATE   ")
+  PrintDec(v)
+  PutNl()
+  v = MailboxClockRate(#MT_CLOCK_ID)
+  UartWriteStr("      GET_CLOCK_RATE    ")
+  PrintDec(v)
+  PutNl()
+  maxHz = MailboxClockRateMax(#MT_CLOCK_ID)
+  UartWriteStr("      GET_MAX_CLOCK     ")
+  PrintDec(maxHz)
+  PutNl()
+  UartDrain()
+  rc = After("the five reads")
+
+  ; ---- SET_DOMAIN_STATE ------------------------------------------------
+  PutS("  ... SET_DOMAIN_STATE, id 11, on")
+  PutNl()
+  UartDrain()
+  v = SetIdState(#MT_TAG_SET_DOMAIN_STATE, #MT_DOMAIN_ID_NEW, #MT_STATE_ON)
+  UartWriteStr("      reply ")
+  PrintDec(v)
+  PutNl()
+  UartDrain()
+  rc = After("SET_DOMAIN_STATE")
+
+  ; ---- SET_POWER_STATE, the OLD numbering ------------------------------
+  PutS("  ... SET_POWER_STATE, id 10, on  (the OLD numbering)")
+  PutNl()
+  UartDrain()
+  v = SetIdState(#MT_TAG_SET_POWER_STATE, #MT_POWER_ID_OLD, #MT_STATE_ON)
+  UartWriteStr("      reply ")
+  PrintDec(v)
+  PutNl()
+  UartDrain()
+  rc = After("SET_POWER_STATE")
+
+  ; ---- SET_CLOCK_STATE -------------------------------------------------
+  PutS("  ... SET_CLOCK_STATE, clock 5, on")
+  PutNl()
+  UartDrain()
+  v = SetIdState(#MT_TAG_SET_CLOCK_STATE, #MT_CLOCK_ID, #MT_STATE_ON)
+  UartWriteStr("      reply ")
+  PrintDec(v)
+  PutNl()
+  UartDrain()
+  rc = After("SET_CLOCK_STATE")
+
+  ; ---- SET_CLOCK_RATE, to the ceiling the firmware reported ------------
+  PutS("  ... SET_CLOCK_RATE, clock 5, to the reported maximum")
+  PutNl()
+  UartWriteStr("      asking for ")
+  PrintDec(maxHz)
+  UartWriteStr(" Hz")
+  PutNl()
+  UartDrain()
+  If maxHz > 0
+    v = MailboxClockRateSet(#MT_CLOCK_ID, maxHz, 0)
+    UartWriteStr("      applied ")
+    PrintDec(v)
+    PutNl()
+  Else
+    UartWriteStr("      skipped - the firmware reported no maximum")
+    PutNl()
+  EndIf
+  UartDrain()
+  rc = After("SET_CLOCK_RATE")
+
+  PutNl()
+  PutS("=== done. The first *** line names the tag. ===")
+  PutNl()
+  UartDrain()
+  ProcedureReturn mtDead
+EndProcedure

@@ -1,0 +1,3442 @@
+; pi4NeonLiar.pi4 - STAGES 0, 0.5 and 0.6 of the NeonArcade port.
+;
+;   STAGE 0    one real Neon chrome screen, drawn with NO new library:
+;              today's unmodified display.pi4, DisplayFillRect for
+;              Neon_Box with the alpha thrown away, DisplayCharClear
+;              with the built-in 8x16 font for Neon_Text, and the
+;              palette converted by hand into DisplayRGB calls.
+;
+;   STAGE 0.5  four timed passes over the whole 32bpp surface, so that
+;              the compositor in stage 1 is designed against a measured
+;              fill rate and a measured blend rate rather than a guess.
+;
+;   STAGE 0.6  the same screen again, three times, each with ONE widget
+;              different and only the damage repainted - and a pixel-by-
+;              pixel proof that the fast frame is the same picture as
+;              the slow one. Added 2026-08-26 with
+;              RaspberryPi4/Lib/damage.pi4.
+;
+; DIAGNOSTIC. Does not ship. It changes nothing that does: display.pi4
+; is not touched, and the one file it adds under Lib/ - damage.pi4 -
+; includes nothing and drives no hardware.
+;
+;   PureMetalForge.exe --compile RaspberryPi4\Examples\Diagnostics\NotBuilding\pi4NeonLiar.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o _work\liar.img
+;
+; ======================================================================
+; THE TWO NAMED LIES. READ THESE BEFORE LOOKING AT THE SCREEN.
+; ======================================================================
+; The plan calls this diagnostic "the liar" and the name is the point.
+; Two things on the panel will be visibly wrong. BOTH ARE INTENDED, both
+; are consequences of using display.pi4 unmodified, and NEITHER IS A
+; DEFECT. Do not report them.
+;
+;   LIE 1 - EVERY GLOW AND EVERY HOVER IS FULLY OPAQUE.
+;
+;     Neon_Glow (GlUIChrome.pbi:323-328) is four nested boxes at alpha
+;     0.10/1.5, /3, /4.5, /6 - so between 2% and 7% opacity each. It is
+;     meant to read as a faint lift. display.pi4 has no blend anywhere
+;     in it - DisplayFillRect is an opaque run fill (display.pi4:2414-2455)
+;     and DisplayBlit is a straight copy (display.pi4:2668-2682) - so
+;     every one of those four boxes lands at FULL strength.
+;
+;     WHAT YOU WILL SEE: a hard four-pixel cyan halo around the hovered
+;     button instead of a soft glow, and a hard four-pixel BLACK border
+;     around the open drop-down where its 45% shadow should be
+;     (GlUIChrome.pbi:772). The hovered list row and the hovered menu
+;     row are solid instead of faded. That is the missing alpha channel
+;     made visible, which is exactly what stage 1 exists to add.
+;
+;   LIE 2 - EVERY GLYPH IS THE WRONG WIDTH.
+;
+;     The engine's text is proportional, antialiased, from a rasterised
+;     atlas (GlUtilities.pbi:1191-1193). display.pi4's font is 8 wide by
+;     16 tall, ASCII 32..126, one bit per pixel, FIXED WIDTH
+;     (display.pi4:530-538).
+;
+;     WHAT YOU WILL SEE: every string is exactly 8 pixels per character.
+;     Menu tabs are narrower than they should be, "I" is as wide as "W",
+;     the right-aligned shortcut column does not line up with anything,
+;     and there is no antialiasing at all. Stage 2 is what fixes this,
+;     and section 4.4 of the plan says how.
+;
+; THERE IS A THIRD WRONGNESS AND IT IS NOT THIS PROGRAM'S.
+;
+;     Anvil prints two or three lines of its own after a payload returns
+;     - "## deadman stopped", "## returned, x0 = ..." and then the
+;     prompt (RaspberryPi4/Monitor/anvil.pi4:1497, :1512). When the
+;     screen is up those lines go through the UART mirror onto the
+;     console rectangle, which is most of the panel. So a short band of
+;     Anvil's own text WILL be stamped across the picture as soon as
+;     this program returns.
+;
+;     That is Anvil, not the diagnostic, and there is nothing this
+;     payload can do about it: Anvil's console cursor lives in Anvil's
+;     copy of display.pi4's globals and is not reachable from here.
+;     Bring the screen up FRESH (reset, then "s") before running this,
+;     so Anvil's cursor is near the TOP of its console and only a few
+;     rows are lost. On a console that has already scrolled to the
+;     bottom, those closing lines will SCROLL THE WHOLE PICTURE UP by
+;     one text row each, which is ugly but still recognisable.
+;
+; ======================================================================
+; WHAT STAGE 0 IS ACTUALLY PROVING
+; ======================================================================
+; Section 1.1 of the plan makes one claim and the whole port rests on
+; it: that the entire 1367-line application chrome draws through exactly
+; TWO primitives plus a scissor.
+;
+;   Neon_Box   GlUIChrome.pbi:302-304   -> DisplayFillRect here
+;   Neon_Text  GlUIChrome.pbi:306-308   -> DisplayCharClear here
+;   Neon_Scissor* GlUIChrome.pbi:404-422 -> NlClipSet/NlClipClear here
+;
+; Everything else in that file is composed from those three. Neon_Frame
+; is four boxes (:330-335). Neon_Glow is four boxes (:323-328).
+; Neon_Panel is five boxes and a text (:339-348). The menu check mark is
+; seven boxes (:879-885). This program transcribes those compositions
+; literally, and it COUNTS the primitive calls it made and prints the
+; totals. If the count comes back as fills and glyphs and nothing else,
+; and a recognisable menu bar, panel and list appear, the claim holds.
+;
+; THE SCISSOR IS THE ONE PLACE THIS PROGRAM ADDS CODE display.pi4 DOES
+; NOT HAVE, and it is worth being exact about what it does and does not
+; do. display.pi4 clips every primitive to the SURFACE (its own header
+; says so, at :2354-2357) and has no notion of a caller's clip
+; rectangle. So NlBox intersects the rectangle with the clip before
+; calling DisplayFillRect - a few lines of arithmetic, no new library -
+; and NlText drops any GLYPH CELL that is not wholly inside the clip.
+;
+;   THAT MAKES THE TEXT CLIP GLYPH-GRANULAR, NOT PIXEL-EXACT. A row of
+;   list text half way over the bottom edge of its box disappears
+;   entirely instead of being cut in half. That is a stage 0 limitation
+;   and it is named here so nobody mistakes it for a third lie:
+;   GfxClipSet in stage 1 is pixel-exact by construction, because it
+;   clips runs and not cells.
+;
+; The list in the picture is deliberately scrolled, and deliberately has
+; more rows than fit, so the clip has something to do. The counters at
+; the end print how many boxes were narrowed and how many glyphs were
+; dropped. If those are zero, the clip proved nothing and the screen is
+; lying about a third thing.
+;
+; NO FLOATING POINT ANYWHERE. Section 3.1 of the plan: .f arithmetic is
+; refused outright by this backend (EmitCore_A64.pbi:543-544) and
+; software binary32 costs 1751 instructions per multiply
+; (math.pi4:114-125). Every coordinate here is a .i, every palette
+; entry is an integer 0..255 converted by hand from GlUIChrome.pbi's
+; floats, and Neon_UIScale is 1.0 so Neon_S() is the identity and does
+; not appear. This is also the first small test of the .f -> .i
+; conversion the plan schedules as stage 3 across 460 sites.
+;
+; ======================================================================
+; STAGE 0.5 - WHAT IS MEASURED, AND THE DECISION IT DRIVES
+; ======================================================================
+; The plan's stage 0.5 asks for three numbers. THE FIRST IS ALREADY
+; ANSWERED and is not re-measured here:
+;
+;   SCTLR_EL2 = $30C50830, at EL2, measured on this board on 2026-08-26
+;   by RaspberryPi4/Examples/Diagnostics/pi4MmuState.pi4. That is
+;   exactly what Datasheets/pi4/armstub8.S:136-141 writes, and every set
+;   bit in it is RES1. THE MMU IS OFF, THE D-CACHE IS OFF, THE I-CACHE
+;   IS OFF. Measured, not assumed.
+;
+;   Note in passing that display.pi4:426-429 and xhci.pi4:275 still say
+;   the opposite. They are STALE - inherited from the U-Boot era, when
+;   an image entered through "go" ran on U-Boot's page tables. Anvil
+;   boots directly now. Those two comments should be corrected in place
+;   by whoever owns those files; this diagnostic does not touch them.
+;
+; So every access below is Device memory: no caching, no gathering, no
+; write combining. That is the configuration the numbers describe, and
+; it is why they are worth taking. MMU stage 1 has since been proven on
+; this board (see THE DECISION below), but nothing has turned it on for
+; this payload: the register above is still what a run of this program
+; will find, and these are therefore MMU-OFF numbers. Say so beside them
+; whenever they are quoted.
+;
+; FOUR PASSES, not two, because two numbers cannot separate the two
+; possible walls:
+;
+;   1. CLEAR   DisplayClear() through the existing unrolled wide-store
+;              loop (display.pi4:2414-2455). Pure opaque stores. This is
+;              the fill-rate ceiling, and its header claims about 1.4
+;              instructions per byte at :2386-2389, which this pass is
+;              in a position to check.
+;
+;   2. READ    every pixel read and accumulated, nothing written. This
+;              number is not in the plan and it earns its place: it is
+;              the only way to tell a read-bound wall from a write-bound
+;              one, and the compositor's blend does both.
+;
+;   3. BLEND, PLAIN   read, unpack three channels into locals, blend,
+;              repack, store. This is what stage 1's GfxFill blended
+;              path looks like when it is written to be read.
+;
+;   4. BLEND, FUSED   the same arithmetic with the per-channel locals
+;              eliminated, which is what DspRowFill32's own header
+;              (display.pi4:2372-2384) says you have to do on this
+;              backend: procedure locals are STATICALLY ALLOCATED, so
+;              every mention of one costs an adrp/add/ldr or
+;              adrp/add/str, and a one-pixel body that stores one pixel
+;              was measured at THIRTY instructions.
+;
+; PASSES 3 AND 4 ARE THE FINDING, TOGETHER. If they are close, the wall
+; is memory and the MMU is the answer. If 4 is far better than 3, a
+; large part of the cost is the calling convention rather than the
+; DRAM, and the first fix is codegen discipline in the compositor's
+; inner loop, not page tables. One number could not have told them
+; apart.
+;
+; THE DECISION, AND IT GOT CHEAPER TO ACT ON WHILE THIS WAS BEING
+; WRITTEN. Per the plan's stage 0.5: if the full-surface blend pass is
+; worse than about 25 ms, a 1920x1080 alpha-composited UI is not
+; reachable in this memory configuration and the MMU work moves ahead
+; of everything else.
+;
+;   WHEN THE PLAN WAS WRITTEN that was an expensive verdict, because
+;   RaspberryPi4/Lib/mmu.pi4 was unproven code waiting on three
+;   assembler encodings and turning it on was a research project.
+;
+;   IT IS NOT ANY MORE. MMU stage 1 PASSED ON THIS BOARD on 2026-08-26,
+;   after this file was started: SCTLR_EL2 went $30C50830 -> $30C50831
+;   -> $30C50830, with the console alive the whole way through, and
+;   both the PCIe window above 4 GiB and the ARM-local window mapped
+;   correctly. So "the MMU moves ahead of everything else" now means
+;   enabling something that has been switched on and off once already
+;   on real silicon, not opening a new front.
+;
+;   WHICH CHANGES HOW TO READ AN OVER-BUDGET NUMBER. It is no longer a
+;   reason to redesign the compositor around dirty rectangles before
+;   trying anything else. Mapping DRAM as Normal Cacheable and
+;   re-running these same four passes is now the cheapest experiment
+;   available, and it should be the next thing done - the numbers below
+;   are the before half of a before-and-after that can be had in an
+;   afternoon.
+;
+; This program computes the verdict on the board and prints it, so
+; nobody has to divide two numbers at the end of a long session.
+;
+; EACH PASS IS PROBED BEFORE IT IS RUN. Eight rows are timed first, the
+; full-surface cost extrapolated from them, and the estimate PRINTED.
+; The full pass then runs only if the estimate is under five seconds.
+; Nothing on this disk measures uncached store bandwidth on this board,
+; so "how long will four full-surface passes take" is genuinely unknown
+; before the first one, and a diagnostic that hangs into the deadman
+; having printed nothing is worth nothing. Every pass drains the UART
+; the moment it has a number, so a run that dies part way through is
+; still informative - the house style pi4DisplayProbe.pi4 sets with its
+; numbered sections.
+;
+; THE ARM CLOCK IS ASKED FOR, NOT ASSUMED. The part boots at 600 MHz and
+; reaches 1500 MHz only when something raises it. Every cycles-per-byte
+; figure below is computed against the rate the firmware reports through
+; MailboxClockRateMeasured(3), and that rate is printed beside them, so
+; an instructions-per-byte claim cannot silently inherit the wrong
+; clock.
+;
+; AUTO-FLUSH IS OFF FOR THE TIMED PASSES AND FOR THE PICTURE, and it is
+; measured separately as a fifth number. display.pi4 documents that
+; escape itself (:463-464): draw a lot with it off, DisplayFlush() once
+; at the end. With the MMU off the dc cvac is architecturally a no-op,
+; but it still executes 129,600 times over a 1824x984 surface, and
+; knowing what that costs is what decides whether stage 1's GfxFlushRect
+; can stay on by default.
+;
+; ======================================================================
+; STAGE 0.6 - DIRTY RECTANGLES, AND WHY THEY ARE THE ANSWER HERE
+; ======================================================================
+; Stage 0.5 came back over budget by two orders of magnitude and the
+; conclusion drawn from it at the time was "turn the MMU on". That was
+; done, and it bought 1.3x, not the 100x that was needed:
+;
+;                         MMU off      MMU on, DRAM cacheable
+;   clear, stores only    356.9 ms          266.4 ms
+;   read, loads only     1787.0 ms         1155.0 ms
+;   blend, best of two   2718.8 ms         2172.0 ms   vs a 25 ms budget
+;   this Neon screen     1184.7 ms          922.5 ms
+;
+; THE CACHES COULD NOT HAVE HELPED MORE THAN THAT and it is worth being
+; clear about why, because "add cache" is the reflex. A compositor
+; STREAMS: every cache line is touched once per frame and then never
+; again, so there is no reuse for a cache to find. All it can
+; contribute is burst fills, and 1.3x is about what burst fills are
+; worth.
+;
+; So there are two independent problems and stage 0.6 solves exactly
+; one of them.
+;
+;   PROBLEM ONE - A PIXEL COSTS FAR TOO MUCH. 266.4 ms of pure opaque
+;   stores over 1,794,816 pixels is 148 ns each, which at 1500 MHz is
+;   222 CYCLES TO WRITE FOUR BYTES, through a loop whose own header
+;   claims about 1.4 instructions per byte (display.pi4:2386-2389). One
+;   of those two numbers is wrong and this program cannot tell which -
+;   it would take a cycle-accurate look at the emitted loop, which
+;   belongs to whoever owns the code generator. IT IS NOT A MEMORY
+;   BANDWIDTH STORY: 8.29 MB in 266 ms is 31 MB/s, and this part's DRAM
+;   does not run at 31 MB/s.
+;
+;   PROBLEM TWO - THE PROGRAM TOUCHES 8 MB EVERY FRAME TO CHANGE A
+;   BUTTON. That one needs no compiler work at all, and it is this one.
+;
+; A UI THAT HOVERS A BUTTON SHOULD REPAINT A BUTTON. Sections 9a to 9d
+; below draw this same screen with one widget different and repaint
+; only what changed, and print both numbers so the ratio is on the
+; serial line rather than in a claim.
+;
+; ----------------------------------------------------------------------
+; RECTANGLES, NOT TILES, AND THE REASON IS THE 148 ns
+; ----------------------------------------------------------------------
+; The full argument with its arithmetic is in RaspberryPi4/Lib/
+; damage.pi4's header. The short form:
+;
+;   A TILE GRID is easier - one bit per tile, OR them together, repaint
+;   the marked ones, no coalescing to get wrong. Its cost is the edge
+;   pixels of a widget that does not fill its tiles, and on this
+;   hardware an edge pixel costs the same 148 ns as a useful one. A
+;   caret is 2 x 16; at 64-pixel tiles it repaints up to 8192 pixels to
+;   change 32, which is a 256x tax on the commonest event in any UI.
+;
+;   MAKE THE TILES SMALL ENOUGH TO FIX THAT and the bitmap becomes
+;   28,000 tiles, and walking it every frame is O(SURFACE) - which is
+;   the exact thing damage tracking was bought to stop paying. The two
+;   costs move in opposite directions and they cross ABOVE the cost of
+;   doing it exactly.
+;
+;   SO: EXACT RECTANGLES, with a merge rule derived from what a
+;   rectangle actually costs. Merging two of them wastes the pixels in
+;   their union that were in neither; keeping them apart costs the
+;   repaint driver one more intersection test per primitive, about
+;   27 us across a thousand-primitive screen. 27 us at 148 ns a pixel
+;   is 182 pixels, so the threshold is 256 and it is settable.
+;
+; ----------------------------------------------------------------------
+; WHAT SECTION 9 PRINTS, AND HOW TO READ IT
+; ----------------------------------------------------------------------
+;   9a  A CARET BLINK. One rectangle, 32 pixels. This is the floor, and
+;       what it measures is NOT the pixels - it is the cost of walking
+;       the widget tree and asking the damage list about every
+;       primitive in it while painting almost nothing. If 9a is a large
+;       fraction of the frame budget, the next thing to build is a
+;       retained widget tree, not a better damage rule. That is the
+;       most useful single number in this section.
+;
+;   9b  A HOVER MOVING BETWEEN TWO BUTTONS. TWO rectangles, and it must
+;       stay two - the two buttons are 500 pixels apart and their union
+;       wastes about 13,000 pixels, which is 1.9 ms to save 27 us. If
+;       this prints one rectangle, the slack is set too high.
+;       BOTH BUTTONS ARE DAMAGED, the one losing the glow as well as
+;       the one gaining it, and each is damaged FOUR PIXELS OVERSIZE
+;       because Neon_Glow's ring is four nested boxes outside the
+;       button (GlUIChrome.pbi:323-328). Damage the button only and the
+;       old halo stays on screen as a hollow cyan frame around nothing.
+;
+;   9c  A LIST SCROLLED ONE ROW. The whole well, because every row in
+;       it moved. THIS IS THE WORST CASE AND IT IS REPORTED AS SUCH -
+;       dirty rectangles are not uniformly a hundredfold win, and
+;       anyone quoting the caret number without this one is quoting
+;       half the picture. (A hardware blitter turns this into a copy
+;       plus one row; that is the DMA 2D engine in section 9.3 of the
+;       port plan and it is deliberately not done here.)
+;
+;   9d  ALL THREE AT ONCE. The busiest frame a real UI has. It also
+;       prints what the BOUNDING BOX of that damage would have been, so
+;       the value of having a cost model rather than just taking the
+;       union is visible as a number.
+;
+;   9e  THE IDENTITY CHECK, AND IT IS THE ONE THAT MATTERS MOST.
+;       A fast frame that is subtly wrong is worse than a slow one. So
+;       the program draws state B in full and keeps the surface, draws
+;       state A in full over it, applies the event that turns A into B
+;       with only its damage repainted, and then COMPARES EVERY PIXEL.
+;       Zero differences means the fast path and the slow path produce
+;       the same picture. Anything else means an event under-reported
+;       its damage, and the timings above are the cost of drawing the
+;       wrong thing quickly.
+;
+; ----------------------------------------------------------------------
+; SECTION 10 - THE SHADOW-BUFFER QUESTION, SETTLED BY ONE PAIR
+; ----------------------------------------------------------------------
+; With the MMU on and DRAM cacheable a shadow buffer is viable where it
+; was not before, so the question is live. It reduces to one thing:
+; DOES A STORE INTO THE FRAMEBUFFER COST WHAT THE IDENTICAL STORE INTO
+; ORDINARY DRAM COSTS? Section 10 runs the same unrolled loop against
+; both and prints the ratio and a verdict.
+;
+; If they are the same, a shadow can only add work - write the pixel
+; twice, read it once more - and damage-repaint straight into the live
+; framebuffer is right. If the framebuffer is much slower, then the
+; framebuffer is the wall, and composing in DRAM while copying out only
+; the DAMAGED rectangles is the answer - in which case the shadow
+; buffer and the damage layer are one decision, because it is the
+; damage that makes the copy small.
+;
+; TEARING IS NOT WHAT DECIDES IT, at these rates. A caret repaint
+; measured in microseconds cannot be caught half-drawn by a 60 Hz
+; scan-out in any way a person could see. A full repaint at hundreds of
+; milliseconds tears with or without a shadow buffer. Tearing becomes a
+; real question only when a frame is both large and fast, and this
+; hardware is not there.
+;
+; ----------------------------------------------------------------------
+; WHAT STAGE 0.6 DID NOT TOUCH
+; ----------------------------------------------------------------------
+; display.pi4. Not one line. The damage layer needs nothing from it
+; that it does not already export - DisplayWidth/Height for the bind,
+; DisplayFillRect to paint, DisplayFlushRect to make a rectangle
+; visible - and adding a damage hook to the file that drives Anvil's
+; own console would have been risk taken for no gain.
+;
+; It also does not touch a DMA engine, and that is the point of putting
+; the tracking in its own file: damage.pi4 says WHICH pixels, and has
+; no opinion about who moves them. When the accelerated blit arrives it
+; goes underneath this unchanged.
+;
+; ======================================================================
+; THE BENCH PROCEDURE
+; ======================================================================
+;   pmf> r                      reset, so Anvil's console starts empty
+;   pmf> s                      screen on - REQUIRED, see below
+;   pmf> deadman 30
+;   pmf> receive 400000 <len> <crc>
+;   pmf> run 400000
+;
+; THE SCREEN MUST BE UP BEFORE THE RUN, and not because this payload
+; needs it - it brings up its own framebuffer. It is because Anvil's
+; screenshot command refuses when gScreen is 0 (anvil.pi4:3318-3321),
+; so without "s" first there is no way to get the picture off the board.
+;
+; DEADMAN 30 RATHER THAN THE HOUSE 15, and here is the reason rather
+; than the exception. Four full-surface passes over 8.29 MB of memory
+; whose speed nothing on this disk has ever measured is the one payload
+; in this directory whose runtime genuinely cannot be predicted before
+; it is run once. The five-second-per-pass estimate gate above bounds it
+; at roughly twenty seconds in the worst case it will attempt.
+;
+; STAGE 0.6 PUSHED THAT UP AGAIN AND 30 IS NOW TIGHT. Sections 8 to 10
+; add, on the cached numbers: four full repaints at about 0.9 s each
+; (one for the picture, two for the identity check's two reference
+; states, one to leave the panel correct), a whole-surface copy, and a
+; whole-surface compare - the compare is a read pass, which stage 0.5
+; measured at 1.16 s. Call it six seconds on top of the eleven the
+; stage 0.5 passes take.
+;
+;   USE `deadman 45` UNTIL THE FIRST FULL RUN HAS PRINTED ITS OWN
+;   TOTALS, then tighten it to whatever that run actually took plus a
+;   third. The BCM2711 counter is 20 bits at 65536/s, so ~15.999 s is
+;   the ceiling a SINGLE arming can express (safety.pi4:491-498 clamps
+;   and returns the real value); Anvil's `deadman` command re-arms, so
+;   the number typed at the prompt is not bounded the same way. If a
+;   run does reset the board part way through, the sections above the
+;   reset have already printed - every one of them drains the UART the
+;   moment it has a number, for exactly this case.
+;
+; Afterwards, for the picture:
+;   python tools/pmfshot.py COM7 liar.png
+;
+; WITHOUT A BOARD, and this is new: the whole program can be run on the
+; project's A64 oracle against a fabricated VideoCore, at 800 x 600,
+; with the MMU switch forced off -
+;
+;   python tools/a64/a64_damage_check.py --only-neon
+;
+; Its TIMINGS ARE FICTION there (time is a step counter) but section
+; 9e's pixel-by-pixel identity check is real arithmetic and is checked
+; by the harness. Use it to know the frames are CORRECT before spending
+; bench time finding out how FAST they are.
+;
+; ======================================================================
+; WHAT YOU SHOULD SEE ON THE HDMI PANEL
+; ======================================================================
+; A dark grey-blue application window - NOT black. The ground is
+; (33,34,37), which is GlUIChrome.pbi:57's 0.129/0.133/0.145 converted,
+; and its header says why it is grey rather than black at :47-49.
+;
+; From the top:
+;
+;   a MENU BAR across the full width, one shade lighter than the ground,
+;   with a hairline under it and five root labels - File, Edit, Board,
+;   Tools, Help. BOARD IS DRAWN OPEN: its tab is cyan-tinted with a
+;   two-pixel cyan underline;
+;
+;   its DROP-DOWN hanging below it, with the hard black four-pixel
+;   border that is LIE 1, a cyan-ish hairline frame, six rows, one
+;   separator hairline, one row hovered in solid cyan-grey, one row
+;   showing the seven-box green CHECK MARK, one row greyed out as
+;   disabled, and right-aligned shortcut text that does not line up
+;   because of LIE 2;
+;
+;   a TAB STRIP under the menu bar with three tabs, the middle one
+;   active - lighter, with a two-pixel cyan indicator under it;
+;
+;   a LEFT PANEL titled PROJECT with a cyan tab down its left edge,
+;   containing a scrolling LIST - a sixteen-row well holding a
+;   twenty-eight-row tree, scrolled six rows down. So its first visible
+;   row is not its first row and it overflows at BOTH edges, which is
+;   what gives the clip something to do.
+;
+;     Look at the top and bottom edges of that well specifically. There
+;     is a partly-visible hovered row at each - and what you will see of
+;     it is a SLIVER OF A BACKGROUND BAR WITH NO TEXT IN IT. That is the
+;     two clips behaving differently on purpose: the box is cut to the
+;     pixel, and the glyph cell is dropped whole because a 1bpp
+;     fixed-cell renderer cannot draw half a character. It is named in
+;     the scissor note above and it is a stage 0 limitation, not a
+;     third lie - stage 1's GfxClipSet is pixel-exact on both.
+;
+;     Inside the well: one row selected (mmu.pi4 - a cyan bar down its
+;     left edge and cyan text), several amber group headings at
+;     different indent depths, right-aligned faint file sizes, and a
+;     scrollbar thumb about sixteen twenty-eighths of the track high
+;     sitting a fifth of the way down it;
+;
+;   BELOW THE LIST, in the same panel, a hairline-framed DETAIL STRIP
+;   with three lines in it. It is there because the list well is
+;   deliberately too small and something honest had to occupy the space
+;   the list gave up;
+;
+;   a RIGHT PANEL titled SERIAL MONITOR with a few lines of text, a
+;   TEXT FIELD reading COM7 115200 with a cyan frame and a two-pixel
+;   cyan CARET after the text, and below it a row of four BUTTONS - one
+;   normal, one lit cyan, one disabled and faint, and one HOVERED,
+;   which is the one wearing the hard cyan halo of LIE 1;
+;
+;     THE CARET AND THE HOVER ARE THE STAGE 0.6 SUBJECTS. The caret is
+;     the smallest thing on the panel - two pixels by sixteen - and the
+;     hovered button with its four-pixel ring is the largest thing a
+;     pointer changes. Section 9 repaints each of them alone and times
+;     it. By the time the run ends the caret has blinked twice and the
+;     hover has been moved and put back, so what is on the panel at the
+;     end is the picture described here;
+;
+;   a STATUS BAR across the bottom, with the two lies restated on it in
+;   text so that anyone photographing the screen has the caveat in the
+;   photograph.
+;
+; AND ONE THING YOU SHOULD NOT SEE: any curve, any gradient, any soft
+; edge, any anti-aliased glyph. Every pixel on that panel came out of
+; exactly two calls, DisplayFillRect and DisplayCharClear, and the run
+; prints how many of each it made. If the picture looks like an
+; application anyway, section 1.1 of the plan is right and the port is
+; tractable. That is the whole of what stage 0 is for.
+;
+; WHAT WOULD TELL YOU IT WENT WRONG, as opposed to lied:
+;
+;   * nothing on the panel at all, and no UART output - the payload
+;     never got control, or the UART is not where uart.pi4 thinks it is.
+;     Not a graphics finding.
+;   * UART output but a black screen - DisplayInit failed. The code and
+;     DisplayLastError() are printed; -1 is #DSP_ENOTAGS, -5 is the
+;     set-physical tag, and display.pi4:916-957 has the rest.
+;   * A PICTURE THAT LEANS DIAGONALLY - the pitch is being used as if it
+;     were width*bpp somewhere. It is not used at all in this file:
+;     every pixel here goes through display.pi4's primitives except the
+;     three timed passes, which take DisplayPitch() explicitly. If this
+;     appears, it is in display.pi4 and it is a real bug in a file that
+;     has been proven on silicon, so say so loudly.
+;   * red and blue swapped - the firmware's pixel order disagrees with
+;     display.pi4's packing. This program asks the firmware, exactly as
+;     anvil.pi4:3211-3215 does, and prints the answer.
+;   * the screenshot showing Anvil's console rather than this picture -
+;     the second DisplayInit moved the framebuffer. This program prints
+;     the base address it was given; compare it with what Anvil reports.
+;     That would be a real finding about re-initialising a framebuffer
+;     that is already allocated, and it is worth writing down.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+; #DSP_DMA_LINKED - MANDATORY, and it must be defined BEFORE display.pi4.
+; 0 = the CPU drawing path and nothing else; every procedure that would
+; touch the blitter is skipped at the token level and never parsed, and
+; what display.pi4 still carries is ten accessors totalling 660 bytes so
+; that a program can ask whether the engine was linked and be told no.
+; 1 would additionally require RaspberryPi4/Lib/dma.pi4 to be included
+; ahead of display.pi4.
+; display.pi4's THE DMA SEAM section has the reasoning; there is no
+; default because a default in the library and a different value here
+; would be a hard "Constant already defined" error.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+; mmu.pi4, so this program can measure the SAME passes with the caches on
+; as it measured with them off. Stage 0.5's whole verdict was that a
+; composited UI is unreachable in an uncached memory configuration; the
+; only honest way to test that claim is to change the configuration and
+; re-run the identical code.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+; damage.pi4, so this program can draw the SAME screen twice - once in
+; full, once repainting only what a single widget changed - and time
+; both with the same clock, through the same primitives, in the same
+; run. Two numbers from two programs would not be comparable.
+;
+; It includes nothing, touches no hardware, and is proven separately by
+; RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4DamageSelfTest.pi4 and
+; tools/a64/a64_damage_check.py. See STAGE 0.6 in the header.
+XIncludeFile "RaspberryPi4/Lib/damage.pi4"
+
+
+; ======================================================================
+;  OUTPUT HELPERS
+;
+;  No character literals anywhere - house rule. The ASCII codes used
+;  below are 32 space, 36 dollar, 46 full stop, 48 the digit zero, 55
+;  the letter A minus ten, and 58 colon. Each is named where it is used.
+; ======================================================================
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)                      ; 48 is the digit zero
+    Else
+      UartWrite(55 + n)                      ; 55 is the letter A minus ten
+    EndIf
+  Next
+EndProcedure
+
+; PutFix2 - a value that has already been multiplied by 100, printed as
+; a decimal with two places. Integer arithmetic throughout: .f is
+; refused by this backend and a software float costs 1751 instructions
+; per multiply (math.pi4:114-125), which is not a price a diagnostic
+; should pay to print "1.40".
+Procedure PutFix2(v100.i)
+  Define w.i
+  Define f.i
+  w = v100 / 100
+  f = v100 - (w * 100)
+  If f < 0
+    f = 0 - f
+  EndIf
+  PrintDec(w)
+  UartWrite(46)                              ; 46 is the full stop
+  UartWrite(48 + (f / 10))
+  UartWrite(48 + (f - ((f / 10) * 10)))
+EndProcedure
+
+; PutMs - microseconds printed as milliseconds with three places, which
+; is the unit the 25 ms decision is stated in.
+Procedure PutMs(us.i)
+  Define w.i
+  Define f.i
+  w = us / 1000
+  f = us - (w * 1000)
+  PrintDec(w)
+  UartWrite(46)                              ; 46 is the full stop
+  UartWrite(48 + (f / 100))
+  UartWrite(48 + ((f / 10) - ((f / 100) * 10)))
+  UartWrite(48 + (f - ((f / 10) * 10)))
+EndProcedure
+
+Procedure PutLabel(*s)
+  UartWriteStr("    ")
+  UartWriteStr(*s)
+EndProcedure
+
+
+; ======================================================================
+;  THE PALETTE, CONVERTED BY HAND
+; ======================================================================
+;  GlUIChrome.pbi:57-68 holds twelve colours as .f triples in 0..1. Each
+;  one below is that triple times 255, rounded to nearest, and the
+;  rounding is checked against the one place the engine states the
+;  answer itself: its palette header says the ground is "(33,34,37)"
+;  (GlUIChrome.pbi:48), and 0.129/0.133/0.145 times 255 is
+;  32.9/33.9/37.0. They agree, so the conversion below is the same
+;  conversion the engine's author did.
+;
+;  These are DERIVED colours as well as the twelve, because the widgets
+;  multiply the palette rather than naming new entries - an open menu
+;  tab is accent times 0.30/0.30/0.34 (GlUIChrome.pbi:725), a drop-down
+;  frame is accent times 0.55 (:774), a scrollbar thumb under the
+;  pointer is accent times 0.8 (:485). Those products are done here, at
+;  author time, in the same by-hand way, so that the drawing code below
+;  is a transcription and not an arithmetic exercise.
+;
+;  THEY ARE COMPUTED AT RUN TIME, NOT AS CONSTANTS, because DisplayRGB
+;  packs against the surface's depth and against DisplayColourSwap
+;  (display.pi4:2172-2192). A packed constant would be a 32bpp
+;  no-swap assumption baked into twelve places.
+; ======================================================================
+
+; One declaration per line - this dialect takes one name per Global.
+Global cBg.i
+Global cPanel.i
+Global cHead.i
+Global cLine.i
+Global cText.i
+Global cDim.i
+Global cFaint.i
+Global cAcc.i
+Global cAmb.i
+Global cGrn.i
+Global cRed.i
+Global cVio.i
+
+Global cAccTab.i          ; accent * 0.30 0.30 0.34 - open menu tab, selected row
+Global cAccRow.i          ; accent * 0.28 0.28 0.32 - hovered menu row
+Global cAccFrame.i        ; accent * 0.55         - drop-down frame
+Global cAccThumb.i        ; accent * 0.8          - scrollbar thumb, hot
+Global cThumb.i           ; 0.31 0.33 0.36        - scrollbar thumb, idle
+Global cBtnLit.i          ; 0.157 0.365 0.408     - a lit button's face
+Global cBtnLitText.i      ; 0.588 0.816 0.867     - a lit button's label
+Global cBtnTop.i          ; 0.216 0.259 0.325     - a button's top highlight
+Global cListBg.i          ; 0.118 0.122 0.133     - a list's well
+Global cBlack.i           ; the drop-down's shadow, which has no alpha here
+
+Procedure NlPalette()
+  ; The twelve, GlUIChrome.pbi:57-68, in file order.
+  cBg    = DisplayRGB( 33,  34,  37)
+  cPanel = DisplayRGB( 37,  38,  41)
+  cHead  = DisplayRGB( 43,  44,  47)
+  cLine  = DisplayRGB( 50,  51,  54)
+  cText  = DisplayRGB(220, 220, 220)
+  cDim   = DisplayRGB(147, 152, 162)
+  cFaint = DisplayRGB(111, 117, 127)
+  cAcc   = DisplayRGB( 90, 189, 208)
+  cAmb   = DisplayRGB(225, 165,  66)
+  cGrn   = DisplayRGB( 92, 191, 152)
+  cRed   = DisplayRGB(221, 126, 126)
+  cVio   = DisplayRGB(169, 152, 224)
+
+  ; The derived ones. Each is the accent triple above scaled by the
+  ; factor the widget uses, rounded to nearest.
+  cAccTab   = DisplayRGB( 27,  57,  71)      ; :725  0.30 0.30 0.34
+  cAccRow   = DisplayRGB( 25,  53,  67)      ; :856  0.28 0.28 0.32
+  cAccFrame = DisplayRGB( 50, 104, 114)      ; :774  0.55
+  cAccThumb = DisplayRGB( 72, 151, 166)      ; :485  0.80
+  cThumb    = DisplayRGB( 79,  84,  92)      ; :484  0.31 0.33 0.36
+  cBtnLit     = DisplayRGB( 40,  93, 104)    ; :358
+  cBtnLitText = DisplayRGB(150, 208, 221)    ; :359
+  cBtnTop     = DisplayRGB( 55,  66,  83)    ; :369
+  cListBg     = DisplayRGB( 30,  31,  34)    ; :1307
+  cBlack      = DisplayRGB(  0,   0,   0)    ; :772, the shadow
+EndProcedure
+
+
+; ======================================================================
+;  THE THREE PRIMITIVES
+;
+;  Neon_Box, Neon_Text and the scissor, and nothing else. Every widget
+;  below is built out of these, in the same compositions GlUIChrome.pbi
+;  uses, because that is the claim being tested.
+; ======================================================================
+
+Global nlClipOn.i = 0
+Global nlClipX.i
+Global nlClipY.i
+Global nlClipW.i
+Global nlClipH.i
+
+Global nlFills.i = 0        ; DisplayFillRect calls made
+Global nlGlyphs.i = 0       ; DisplayCharClear calls made
+Global nlTexts.i = 0        ; DisplayTextClear calls made
+Global nlNarrowed.i = 0     ; boxes the clip cut down
+Global nlDropped.i = 0      ; boxes the clip removed entirely
+Global nlGlyphsCut.i = 0    ; glyph cells the clip removed entirely
+Global nlPixels.i = 0       ; pixels actually handed to DisplayFillRect
+
+; ----------------------------------------------------------------------
+; THE DAMAGE SWITCH - STAGE 0.6.
+;
+; nlDmgOn = 0 is the stage 0 behaviour and nothing above changes: every
+; primitive draws, and drawing the screen costs the whole screen.
+;
+; nlDmgOn = 1 makes the two primitives consult damage.pi4 before they
+; draw anything. The widget tree is walked EXACTLY ONCE either way -
+; the alternative, re-running the tree once per damage rectangle, pays
+; for the layout arithmetic N times and damage.pi4's header sets out
+; why that is the wrong way round.
+;
+; THE CLIP AND THE DAMAGE ARE TWO DIFFERENT THINGS AND BOTH APPLY.
+; NlClipSet is the widget's own scissor - the list well saying "nothing
+; of mine may paint outside this box". The damage list is the frame
+; saying "nothing at all may paint outside these boxes". A primitive
+; has to survive both, in that order, and the order matters only for
+; the counters: a box the scissor already removed is not a box the
+; damage layer saved.
+Global nlDmgOn.i = 0
+Global nlDmgSkipped.i = 0   ; primitives the damage list rejected outright
+Global nlDmgSplit.i = 0     ; primitives drawn once per damage rect, > once
+
+; Neon_ScissorSet, GlUIChrome.pbi:404-418, with both of its coordinate
+; flips gone: there is no GL scissor box counting up from the bottom of
+; a DPI-scaled drawable here, there is a rectangle in surface pixels and
+; the surface is the canvas. That simplification is the whole of section
+; 6.3 of the plan in one procedure.
+Procedure NlClipSet(x.i, y.i, w.i, h.i)
+  nlClipOn = 1
+  nlClipX = x
+  nlClipY = y
+  nlClipW = w
+  nlClipH = h
+EndProcedure
+
+Procedure NlClipClear()
+  nlClipOn = 0
+EndProcedure
+
+; Neon_Box, GlUIChrome.pbi:302-304. The alpha argument of the original
+; is simply not here: there is nothing that could be done with it, and a
+; parameter that is accepted and ignored is worse than one that is
+; absent, because it reads as though it works. LIE 1 lives in this
+; absence.
+Procedure NlBox(x.i, y.i, w.i, h.i, colour.i)
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+  Define dx0.i
+  Define dy0.i
+  Define dx1.i
+  Define dy1.i
+  Define k.i
+  Define n.i
+  Define drawn.i
+
+  If w < 1 Or h < 1
+    ProcedureReturn
+  EndIf
+
+  x0 = x
+  y0 = y
+  x1 = x + w
+  y1 = y + h
+
+  If nlClipOn = 1
+    If x0 < nlClipX
+      x0 = nlClipX
+    EndIf
+    If y0 < nlClipY
+      y0 = nlClipY
+    EndIf
+    If x1 > (nlClipX + nlClipW)
+      x1 = nlClipX + nlClipW
+    EndIf
+    If y1 > (nlClipY + nlClipH)
+      y1 = nlClipY + nlClipH
+    EndIf
+    If x1 <= x0 Or y1 <= y0
+      nlDropped = nlDropped + 1
+      ProcedureReturn
+    EndIf
+    If x0 <> x Or y0 <> y
+      nlNarrowed = nlNarrowed + 1
+    ElseIf x1 <> (x + w) Or y1 <> (y + h)
+      nlNarrowed = nlNarrowed + 1
+    EndIf
+  EndIf
+
+  If nlDmgOn = 0
+    nlFills = nlFills + 1
+    nlPixels = nlPixels + ((x1 - x0) * (y1 - y0))
+    DisplayFillRect(x0, y0, x1 - x0, y1 - y0, colour)
+    ProcedureReturn
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; THE DAMAGE-LIMITED PATH.
+  ;
+  ; The early-out first, because it is what the overwhelming majority
+  ; of a screen's primitives take: on a frame where one button changed,
+  ; every one of the other four hundred boxes ends here having cost one
+  ; DamageHits call. That call is the entire price of a primitive that
+  ; does not need to be drawn, and it is the number damage.pi4's
+  ; 27-microsecond-per-rectangle derivation is built out of.
+  If DamageHits(x0, y0, x1 - x0, y1 - y0) = 0
+    nlDmgSkipped = nlDmgSkipped + 1
+    ProcedureReturn
+  EndIf
+
+  ; Drawn once per damage rectangle it touches, clipped to each. This
+  ; is only correct because damage.pi4 keeps its rectangles DISJOINT -
+  ; overlapping ones would paint the shared pixels twice, which is
+  ; merely wasteful for today's opaque fill and wrong for the alpha
+  ; blend stage 1 adds. That invariant is asserted by
+  ; pi4DamageSelfTest.pi4 rather than assumed here.
+  ; EACH ACCESSOR IS CALLED ONCE PER RECTANGLE AND THE RESULT IS KEPT.
+  ; A first version wrote "If DamageRectX(k) > dx0 : dx0 = DamageRectX(k)"
+  ; four times over, which is sixteen procedure calls per primitive per
+  ; rectangle. On a backend where a call plus its statically-allocated
+  ; locals is thirty-odd instructions, a four-rectangle frame over a
+  ; thousand primitives was paying about sixty-four thousand calls -
+  ; roughly a millisecond and a half of pure accounting, on the very
+  ; measurement (9a, the floor) that exists to find out what the
+  ; accounting costs. Four calls, four locals.
+  n = DamageCount()
+  k = 0
+  drawn = 0
+  While k < n
+    dx0 = DamageRectX(k)
+    dy0 = DamageRectY(k)
+    dx1 = dx0 + DamageRectW(k)
+    dy1 = dy0 + DamageRectH(k)
+    If x0 > dx0
+      dx0 = x0
+    EndIf
+    If y0 > dy0
+      dy0 = y0
+    EndIf
+    If x1 < dx1
+      dx1 = x1
+    EndIf
+    If y1 < dy1
+      dy1 = y1
+    EndIf
+    If dx1 > dx0
+      If dy1 > dy0
+        nlFills = nlFills + 1
+        nlPixels = nlPixels + ((dx1 - dx0) * (dy1 - dy0))
+        DisplayFillRect(dx0, dy0, dx1 - dx0, dy1 - dy0, colour)
+        drawn = drawn + 1
+      EndIf
+    EndIf
+    k = k + 1
+  Wend
+  If drawn > 1
+    nlDmgSplit = nlDmgSplit + 1
+  EndIf
+EndProcedure
+
+; Neon_Text, GlUIChrome.pbi:306-308.
+;
+; TWO PATHS, AND THE SPLIT IS DELIBERATE. Unclipped text is one
+; DisplayTextClear call, because that is the primitive the plan names
+; for this stage and it should appear in the program literally. Clipped
+; text walks the string itself and calls DisplayCharClear per glyph,
+; which is exactly DisplayTextClear's own loop (display.pi4:3069-3088)
+; with one rectangle test added - because a whole-string call cannot
+; drop the glyphs that fall outside a caller's clip rectangle, and
+; display.pi4 has no caller clip rectangle to give it.
+Procedure NlText(x.i, y.i, *s, colour.i)
+  Define i.i
+  Define c.i
+  Define cx.i
+  Define cw.i
+  Define ch.i
+  Define adv.i
+
+  ; The one-call path survives only when NEITHER the widget scissor nor
+  ; the damage list has anything to say. Both of them work a cell at a
+  ; time, and DisplayTextClear cannot be asked to skip cells.
+  If nlClipOn = 0
+    If nlDmgOn = 0
+      nlTexts = nlTexts + 1
+      nlPixels = nlPixels + (DisplayTextWidth(*s) * DisplayCharHeight())
+      DisplayTextClear(x, y, *s, colour)
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  cw = DisplayCharWidth()
+  ch = DisplayCharHeight()
+
+  ; ONE TEST FOR THE WHOLE RUN BEFORE WALKING IT. A status bar caption
+  ; is ninety glyphs; asking the damage list ninety separate times when
+  ; the answer for the run as a whole is "no" turns a rejected string
+  ; into ninety rejections. DisplayTextWidth walks the string to
+  ; measure it, which is cheap next to that and is the same measurement
+  ; NlTextRight and NlTextCentre have already made by the time they get
+  ; here anyway.
+  If nlDmgOn = 1
+    If DamageHits(x, y, DisplayTextWidth(*s), ch) = 0
+      nlDmgSkipped = nlDmgSkipped + 1
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  i = 0
+  cx = x
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    ; The WHOLE cell has to be inside. See the header: this is
+    ; glyph-granular and stage 1's clip is not. Written as four separate
+    ; tests rather than one compound condition because the house rule
+    ; wants full comparisons on both sides of every Or, and four short
+    ; branches read better than the parenthesised chain that would be.
+    adv = 0
+    If nlClipOn = 1
+      If cx < nlClipX
+        adv = cw
+      ElseIf (cx + cw) > (nlClipX + nlClipW)
+        adv = cw
+      ElseIf y < nlClipY
+        adv = cw
+      ElseIf (y + ch) > (nlClipY + nlClipH)
+        adv = cw
+      EndIf
+      If adv <> 0
+        nlGlyphsCut = nlGlyphsCut + 1
+      EndIf
+    EndIf
+
+    ; THE DAMAGE TEST IS PER CELL AND THE CELL IS DRAWN WHOLE.
+    ;
+    ; A glyph that straddles the edge of a damage rectangle is drawn in
+    ; full, so a few of its pixels land outside the damage. That is
+    ; harmless and it is worth saying why rather than leaving it to be
+    ; rediscovered: DisplayCharClear is transparent - it paints the lit
+    ; pixels and leaves the rest - and the background outside the
+    ; damage was, by definition, already correct. Painting the same
+    ; glyph over the same unchanged background produces the same
+    ; pixels.
+    ;
+    ; WHAT IT DOES MEAN IS THAT THE CALLER MUST REPORT THE WHOLE TEXT
+    ; RUN AS DAMAGE, before and after. A string that got shorter leaves
+    ; its tail on the screen if only the new extent was reported,
+    ; because nothing erases outside a damage rectangle. That is the
+    ; classic dirty-rectangle ghost and it reads as a font bug.
+    If adv = 0
+      If nlDmgOn = 1
+        If DamageHits(cx, y, cw, ch) = 0
+          adv = cw
+        EndIf
+      EndIf
+    EndIf
+
+    If adv = 0
+      nlGlyphs = nlGlyphs + 1
+      nlPixels = nlPixels + (cw * ch)
+      adv = DisplayCharClear(cx, y, c, colour)
+      If adv < 1
+        adv = cw
+      EndIf
+    EndIf
+    cx = cx + adv
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure.i NlTextWidth(*s)
+  ProcedureReturn DisplayTextWidth(*s)
+EndProcedure
+
+; Neon_TextRight, GlUIChrome.pbi:310-312.
+Procedure NlTextRight(xRight.i, y.i, *s, colour.i)
+  NlText(xRight - NlTextWidth(*s), y, *s, colour)
+EndProcedure
+
+; Neon_TextCentre, GlUIChrome.pbi:314-316.
+Procedure NlTextCentre(x.i, w.i, y.i, *s, colour.i)
+  NlText(x + ((w - NlTextWidth(*s)) / 2), y, *s, colour)
+EndProcedure
+
+; Neon_Frame, GlUIChrome.pbi:330-335. Four boxes, corners written twice,
+; exactly as the original.
+Procedure NlFrame(x.i, y.i, w.i, h.i, colour.i)
+  NlBox(x, y, w, 1, colour)
+  NlBox(x, y + h - 1, w, 1, colour)
+  NlBox(x, y, 1, h, colour)
+  NlBox(x + w - 1, y, 1, h, colour)
+EndProcedure
+
+; Neon_Glow, GlUIChrome.pbi:323-328. Four nested boxes.
+;
+; THIS PROCEDURE IS LIE 1, AND IT IS WORTH LOOKING AT WHAT SURVIVED.
+; The original's four boxes carry alpha strength/1.5, /3, /4.5 and /6 -
+; between 2% and 7% at the default strength of 0.10. Here the four
+; rectangles are drawn at full opacity in the order the original draws
+; them, largest first, so the inner ones overwrite the outer ones and
+; what is left on the screen is a hard four-pixel band of the glow
+; colour. The GEOMETRY is faithful and only the alpha is gone, which is
+; why the halo is exactly four pixels wide and not some other number.
+Procedure NlGlow(x.i, y.i, w.i, h.i, colour.i)
+  Define i.i
+  For i = 4 To 1 Step -1
+    NlBox(x - i, y - i, w + (i * 2), h + (i * 2), colour)
+  Next
+EndProcedure
+
+
+; ======================================================================
+;  THE WIDGETS
+;
+;  Each of these is a transcription of the procedure named above it.
+;  Interaction is gone - there is no mouse on this board yet (section 7
+;  of the plan) - so the states a real frame would compute from the
+;  pointer are passed in instead, which is what lets one static screen
+;  show a hovered row, a selected row and a disabled row at once.
+; ======================================================================
+
+; Neon_Panel, GlUIChrome.pbi:339-348. Five boxes and a text.
+Procedure NlPanel(x.i, y.i, w.i, h.i, *title, accent.i, headerH.i)
+  NlBox(x, y, w, h, cPanel)
+  NlBox(x, y, w, headerH, cHead)
+  NlBox(x, y, 3, headerH, accent)
+  NlBox(x, y + headerH, w, 1, cLine)
+  ; The original upper-cases the title (UCase, :345). The titles below
+  ; are written upper-case in the source instead, because there is no
+  ; string library in this build and a case conversion is not what is
+  ; being proved.
+  NlText(x + 12, y + 5, *title, accent)
+  NlFrame(x, y, w, h, cLine)
+EndProcedure
+
+; Neon_Button, GlUIChrome.pbi:350-374.
+;
+; hover is 0 or 1 rather than the 0..1 fade Neon_Animate produces
+; (:354), because the fade is an alpha and there is no alpha. A half-way
+; hover and a full hover are the same picture here. That is LIE 1 again,
+; in its second costume.
+Procedure NlButton(x.i, y.i, w.i, h.i, *label, lit.i, enabled.i, hover.i)
+  Define face.i
+  Define ink.i
+  Define th.i
+
+  face = cLine
+  ink  = cText
+  If lit = 1
+    face = cBtnLit
+    ink  = cBtnLitText
+  EndIf
+  If enabled = 0
+    ink = cFaint
+  EndIf
+
+  ; :366 - the hovered button is glowed in the accent colour BEFORE the
+  ; face is drawn, so the face covers the inner part of the glow and
+  ; what is left is a ring. With alpha that ring is a lift. Without it,
+  ; it is a halo.
+  If hover = 1
+    NlGlow(x, y, w, h, cAcc)
+  EndIf
+
+  NlBox(x, y, w, h, face)
+  NlBox(x, y, w, 1, cBtnTop)                 ; :369
+  NlBox(x, y + h - 1, w, 1, cBg)             ; :370
+  th = DisplayCharHeight()
+  NlTextCentre(x, w, y + ((h - th) / 2), *label, ink)
+EndProcedure
+
+; The menu bar's root tab, GlUIChrome.pbi:687-733, with the hit testing
+; and the open/close state machine removed and the state passed in.
+; Returns the tab's width so the caller can advance its cursor, which is
+; what Neon_MenuCursorX does at :701.
+Procedure.i NlMenuTab(x.i, y.i, h.i, *title, isOpen.i)
+  Define tabW.i
+  Define th.i
+
+  ; :696-697 - tabW is the measured text width plus 24. Measured, not
+  ; declared, exactly as the original: the whole point of LIE 2 is that
+  ; the measurement is honest about a font that is the wrong one.
+  tabW = NlTextWidth(*title) + 24
+  th = DisplayCharHeight()
+
+  If isOpen = 1
+    NlBox(x, y, tabW, h, cAccTab)                        ; :725
+    NlBox(x, y + h - 2, tabW, 2, cAcc)                   ; :726
+    NlTextCentre(x, tabW, y + ((h - th) / 2), *title, cAcc)
+  Else
+    NlTextCentre(x, tabW, y + ((h - th) / 2), *title, cText)
+  EndIf
+  ProcedureReturn tabW
+EndProcedure
+
+; A drop-down row, GlUIChrome.pbi:817-897. rowH is 24 in the original
+; (#NEON_MENU_ROWH, :610) and stays 24 here because Neon_UIScale is 1.
+Procedure NlMenuItem(x.i, y.i, w.i, *label, *shortcut, enabled.i, checked.i, hovered.i)
+  Define ink.i
+  Define th.i
+  Define ty.i
+  Define mu.i
+  Define mx.i
+  Define my.i
+
+  If hovered = 1
+    NlBox(x + 1, y, w - 2, 24, cAccRow)                  ; :856
+  EndIf
+
+  ink = cText
+  If enabled = 0
+    ink = cFaint
+  EndIf
+  th = DisplayCharHeight()
+  ty = y + ((24 - th) / 2)
+
+  If checked = 1
+    ; :869-885 - SEVEN COLUMNS, NOT THREE RECTANGLES, and the original's
+    ; comment explains at length why: three rectangles read as a return
+    ; arrow. markU is Neon_S(1.5) with a floor of 1.5; at scale 1 that
+    ; is 1.5, and there are no fractional pixels here, so it is 2. The
+    ; check is therefore 14 pixels wide rather than 10.5 - a rounding
+    ; consequence of the .f -> .i conversion, visible, and the kind of
+    ; thing stage 3 has to decide deliberately rather than inherit.
+    mu = 2
+    mx = x + 4
+    my = y + ((24 - (mu * 7)) / 2)
+    NlBox(mx,            my + (mu * 2), mu, mu * 3, cGrn)
+    NlBox(mx + mu,       my + (mu * 3), mu, mu * 3, cGrn)
+    NlBox(mx + (mu * 2), my + (mu * 4), mu, mu * 3, cGrn)
+    NlBox(mx + (mu * 3), my + (mu * 3), mu, mu * 3, cGrn)
+    NlBox(mx + (mu * 4), my + (mu * 2), mu, mu * 3, cGrn)
+    NlBox(mx + (mu * 5), my + mu,       mu, mu * 3, cGrn)
+    NlBox(mx + (mu * 6), my,            mu, mu * 3, cGrn)
+  EndIf
+
+  NlText(x + 14 + 4, ty, *label, ink)                    ; :887
+  If PeekB(*shortcut) & $FF <> 0
+    NlTextRight(x + w - 14, ty + 1, *shortcut, cFaint)   ; :889
+  EndIf
+EndProcedure
+
+; Neon_MenuSeparator, GlUIChrome.pbi:899-913. One box, inset ten pixels
+; each side, on the centre line of a nine-pixel row.
+Procedure NlMenuSeparator(x.i, y.i, w.i)
+  NlBox(x + 10, y + (9 / 2), w - 20, 1, cLine)
+EndProcedure
+
+; One tab of Neon_TabStrip, GlUIChrome.pbi:1111-1154. Returns its width.
+Procedure.i NlStripTab(x.i, y.i, h.i, *label, isActive.i, hovered.i)
+  Define tabW.i
+  Define th.i
+
+  tabW = NlTextWidth(*label) + 26                        ; :1115
+  th = DisplayCharHeight()
+
+  If isActive = 1
+    NlBox(x, y, tabW, h - 1, cPanel)                     ; :1127
+    NlBox(x, y, 1, h - 1, cLine)                         ; :1128
+    NlBox(x + tabW - 1, y, 1, h - 1, cLine)              ; :1129
+    NlText(x + 12, y + ((h - th) / 2), *label, cText)
+    NlBox(x, y, tabW, 2, cAcc)                           ; :1158, the indicator
+  Else
+    If hovered = 1
+      NlBox(x, y + 2, tabW, h - 3, cHead)                ; :1133
+    EndIf
+    NlText(x + 12, y + ((h - th) / 2), *label, cDim)
+  EndIf
+  ProcedureReturn tabW
+EndProcedure
+
+; ----------------------------------------------------------------------
+; THE LIST, GlUIChrome.pbi:1280-1363.
+;
+; THE GEOMETRY LIVES IN GLOBALS AND THAT IS NOT A SHORTCUT - it is what
+; the original does. Neon_ListBegin stores x, y, w, h and RowH into
+; Neon_ListX..Neon_ListRowH (:1287-1292) and Neon_ListItem reads them
+; back; the item call takes only the things that change per row. This
+; transcription had to arrive at the same shape for a second reason as
+; well, and it is worth recording because it will constrain the real
+; port too: THIS BACKEND PASSES AT MOST EIGHT ARGUMENTS. Nine and up
+; would have to travel on the stack and that path is not implemented -
+; the compiler refuses with a named error rather than emitting a wrong
+; call, which is the project's philosophy showing up in the toolchain.
+; A first draft of this procedure took ten and had to be split.
+;
+; state folds three booleans into one argument for the same reason:
+;   0 a plain row      1 selected      2 a group heading      3 hovered
+; ----------------------------------------------------------------------
+Global nlListX.i
+Global nlListY.i
+Global nlListW.i
+Global nlListH.i
+Global nlListRowH.i
+
+Procedure NlListBegin(x.i, y.i, w.i, h.i, rowH.i)
+  nlListX = x
+  nlListY = y
+  nlListW = w
+  nlListH = h
+  nlListRowH = rowH
+  NlBox(x, y, w, h, cListBg)                 ; :1307, the well
+  ; :1308 - the list clips to its own well, MINUS the scrollbar gutter,
+  ; so the bar itself is drawn outside the clip by NlListEnd.
+  NlClipSet(x, y, w - 10, h)
+EndProcedure
+
+; Neon_ListItem, GlUIChrome.pbi:1312-1353. Called inside the list's clip
+; rectangle; rows above and below the well are cut by NlBox and dropped
+; by NlText rather than by a visibility test, which is the point of
+; drawing it this way.
+Procedure NlListItem(y.i, *label, *detail, depth.i, state.i)
+  Define ink.i
+  Define th.i
+  Define barW.i
+
+  barW = nlListW - 10                        ; :1332, the scrollbar's gutter
+
+  If state = 1
+    NlBox(nlListX, y, barW, nlListRowH, cAccTab)   ; :1332
+    NlBox(nlListX, y, 2, nlListRowH, cAcc)         ; :1333
+  ElseIf state = 3
+    ; :1335-1336 draws this at alpha = hover. Opaque here. LIE 1.
+    NlBox(nlListX, y, barW, nlListRowH, cHead)
+  EndIf
+
+  ink = cText
+  If state = 2
+    ink = cAmb                               ; :1342
+  ElseIf state = 1
+    ink = cAcc                               ; :1344
+  EndIf
+
+  th = DisplayCharHeight()
+  NlText(nlListX + 8 + (depth * 14), y + ((nlListRowH - th) / 2), *label, ink)  ; :1347
+  If PeekB(*detail) & $FF <> 0
+    NlTextRight(nlListX + nlListW - 16, y + ((nlListRowH - th) / 2), *detail, cFaint)  ; :1349
+  EndIf
+EndProcedure
+
+; Neon_ScrollBarV, GlUIChrome.pbi:435-488, with the dragging removed.
+; The thumb's height and position are the original's arithmetic in
+; integers: thumbH = h * visible / total, floored at 18; thumbY = y +
+; travel * top / maxTop. Written as one multiply then one divide, so the
+; integer division happens once and at the end - the same discipline
+; Q16.16 exists to make unnecessary in stage 3.
+Procedure NlScrollBarV(x.i, y.i, w.i, h.i, total.i, visible.i, top.i, hot.i)
+  Define thumbH.i
+  Define travel.i
+  Define thumbY.i
+  Define maxTop.i
+  Define colour.i
+
+  NlBox(x, y, w, h, cBg)                     ; :437, the track
+
+  If total <= visible Or total < 1
+    ProcedureReturn                          ; :438-446, an inert track
+  EndIf
+
+  maxTop = total - visible
+  thumbH = (h * visible) / total
+  If thumbH < 18
+    thumbH = 18                              ; :453
+  EndIf
+  travel = h - thumbH
+  thumbY = y + ((travel * top) / maxTop)
+
+  colour = cThumb
+  If hot = 1
+    colour = cAccThumb                       ; :485
+  EndIf
+  NlBox(x + 2, thumbY, w - 4, thumbH, colour)
+EndProcedure
+
+; Neon_ListEnd, GlUIChrome.pbi:1355-1363. Drops the clip, then draws the
+; scrollbar in the ten-pixel gutter the clip deliberately left for it.
+; total and top are passed in because there is no per-frame row count to
+; remember here - the screen is drawn once.
+Procedure NlListEnd(total.i, top.i)
+  NlClipClear()                              ; :1357
+  NlScrollBarV(nlListX + nlListW - 10, nlListY, 10, nlListH, total, nlListH / nlListRowH, top, 1)
+EndProcedure
+
+
+; ======================================================================
+;  THE MUTABLE STATE - what makes this a UI rather than a picture
+;
+;  STAGE 0 DREW ONE FRAME AND THE STATES WERE WRITTEN INTO THE DRAWING
+;  CODE: button three was the hovered one because the call said so.
+;  Stage 0.6 needs to draw the SAME screen with one thing different, so
+;  the three things that change now live here and NlDrawScreen reads
+;  them. That is the only change to the stage 0 picture's meaning: with
+;  these at their initial values the screen is pixel-identical to what
+;  stage 0 drew, plus the text field, and the counters below prove it.
+; ======================================================================
+
+Global nlHoverBtn.i = 3     ; which button wears the glow. -1 for none.
+Global nlListTop.i = 6      ; the list's first visible row
+Global nlCaretOn.i = 1      ; the text field's caret
+
+; ----------------------------------------------------------------------
+; WHERE THE DAMAGEABLE WIDGETS ENDED UP.
+;
+; Filled in by NlDrawScreen as it lays the screen out, and read by the
+; frame driver to build damage rectangles. NOT computed twice.
+;
+; The layout is resolution-dependent - this board reports 1824 x 984
+; after overscan, not the 1920 x 1080 that was asked for - so every one
+; of these is a number the drawing code worked out at run time. A frame
+; driver carrying its own copy of the arithmetic would agree on this
+; board and disagree on the next one, and the symptom would be a widget
+; that repaints correctly at one resolution and ghosts at another.
+; ----------------------------------------------------------------------
+Global nlBtnX.i             ; the first button's left edge
+Global nlBtnY.i
+Global nlBtnW.i
+Global nlBtnH.i
+Global nlBtnStep.i          ; x advance from one button to the next
+Global nlCaretX.i           ; the text field's caret, set by NlTextField
+Global nlCaretY.i
+Global nlCaretW.i
+Global nlCaretH.i
+Global nlWellX.i            ; the list's well, the scroll case
+Global nlWellY.i
+Global nlWellW.i
+Global nlWellH.i
+
+; NlIsHover exists because "hover = nlHoverBtn = 0" would be an
+; assignment inside an argument list in this dialect and there is no
+; boolean expression to hand instead. A named predicate is clearer than
+; four locals computed above the call, and it keeps NlButton's argument
+; count at eight - which is this backend's hard ceiling, as the note on
+; NlListItem records.
+Procedure.i NlIsHover(n.i)
+  If nlHoverBtn = n
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; A TEXT FIELD WITH A CARET - the smallest thing a UI changes.
+;
+; THIS ONE WIDGET IS NOT A LINE-BY-LINE TRANSCRIPTION AND IT WOULD BE
+; DISHONEST TO CITE IT AS ONE. Every other widget above carries a
+; GlUIChrome.pbi line number because the port plan quotes those lines.
+; GlUIChrome.pbi ITSELF IS NOT IN THIS REPOSITORY - it is the host-side
+; NeonArcade engine - so what is known about Neon_TextInput here is
+; what the plan records: that it is at GlUIChrome.pbi:1250, that it
+; scissors (plan section 0.2), that it is one of only two places in the
+; whole chrome kit that reads the keyboard (plan section 7.1), and that
+; its caret blinks on Sin(Neon_CaretPhase) at :1256.
+;
+; So the shape below is composed from the chrome kit's own vocabulary -
+; a well, a frame, a text run and a two-pixel bar - and it is not
+; claimed to be pixel-identical to the original. It is here because
+; STAGE 0.6 needs the SMALLEST possible change to a real screen, and a
+; blinking caret is that: two pixels wide by one character cell tall,
+; against 1.79 million pixels of surface.
+;
+; caretOn is a bool and not a phase, for the same reason NlButton's
+; hover is: the original fades it with a sine and there is no alpha to
+; fade with. LIE 1, in its third costume.
+;
+; IT RECORDS ITS OWN CARET GEOMETRY INTO GLOBALS, and that is the whole
+; discipline of the damage layer in one place. The frame driver below
+; must damage exactly the rectangle this procedure is going to paint,
+; and the only way to be sure of that is for the same code to decide
+; both. A frame driver that recomputed "the caret is at x + 8 + the
+; text width" would be a second copy of a layout rule, and the first
+; time somebody changed the 8 the caret would leave a ghost.
+Procedure NlTextField(x.i, y.i, w.i, h.i, *text, focused.i, caretOn.i)
+  Define th.i
+  Define ty.i
+  Define frame.i
+
+  th = DisplayCharHeight()
+  ty = y + ((h - th) / 2)
+
+  NlBox(x, y, w, h, cListBg)
+  frame = cLine
+  If focused = 1
+    frame = cAcc
+  EndIf
+  NlFrame(x, y, w, h, frame)
+  NlText(x + 8, ty, *text, cText)
+
+  nlCaretX = x + 8 + NlTextWidth(*text)
+  nlCaretY = ty
+  nlCaretW = 2
+  nlCaretH = th
+
+  If caretOn = 1
+    NlBox(nlCaretX, nlCaretY, nlCaretW, nlCaretH, cAcc)
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  THE SCREEN
+;
+;  One frame of a plausible application, laid out against whatever
+;  geometry the firmware actually gave us - NOT against 1920x1080. This
+;  board reports 1824x984 after overscan, and a diagnostic that assumed
+;  the number it asked for would draw half a picture and blame the
+;  library.
+; ======================================================================
+
+Procedure NlDrawScreen()
+  Define w.i
+  Define h.i
+  Define menuY.i
+  Define menuH.i
+  Define stripY.i
+  Define stripH.i
+  Define statusH.i
+  Define statusY.i
+  Define contentY.i
+  Define contentH.i
+  Define gut.i
+  Define lx.i
+  Define lw.i
+  Define rx.i
+  Define rw.i
+  Define cx.i
+  Define dx.i
+  Define dy.i
+  Define dw.i
+  Define dh.i
+  Define ry.i
+  Define listX.i
+  Define listY.i
+  Define listW.i
+  Define listH.i
+  Define rowH.i
+  Define rowTop.i
+  Define dsY.i
+  Define dsH.i
+  Define bx.i
+  Define by.i
+  Define bw.i
+  Define bh.i
+  Define th.i
+
+  w = DisplayWidth()
+  h = DisplayHeight()
+  th = DisplayCharHeight()
+
+  menuY   = 0
+  menuH   = 30
+  stripY  = menuH
+  stripH  = 28
+  statusH = 24
+  statusY = h - statusH
+  gut     = 10
+  contentY = stripY + stripH + gut
+  contentH = statusY - gut - contentY
+
+  ; ---- the ground ---------------------------------------------------
+  NlBox(0, 0, w, h, cBg)
+
+  ; ---- the menu bar, GlUIChrome.pbi:650-683 --------------------------
+  NlBox(0, menuY, w, menuH, cHead)                       ; :676
+  NlBox(0, menuY + menuH - 1, w, 1, cLine)               ; :677
+
+  cx = 8                                                 ; :653, x + Neon_S(8)
+  cx = cx + NlMenuTab(cx, menuY, menuH, "File",  0)
+  cx = cx + NlMenuTab(cx, menuY, menuH, "Edit",  0)
+  dx = cx
+  cx = cx + NlMenuTab(cx, menuY, menuH, "Board", 1)      ; this one is open
+  cx = cx + NlMenuTab(cx, menuY, menuH, "Tools", 0)
+  cx = cx + NlMenuTab(cx, menuY, menuH, "Help",  0)
+
+  ; ---- the tab strip, GlUIChrome.pbi:1095-1162 -----------------------
+  NlBox(0, stripY, w, stripH, cBg)                       ; :1097
+  NlBox(0, stripY + stripH - 1, w, 1, cLine)             ; :1098
+  cx = 4                                                 ; :1105
+  cx = cx + NlStripTab(cx, stripY, stripH, "main.pmf",   0, 0)
+  cx = cx + NlStripTab(cx, stripY, stripH, "display.pi4", 1, 0)
+  cx = cx + NlStripTab(cx, stripY, stripH, "anvil.pi4",  0, 1)
+
+  ; ---- the left panel and its list -----------------------------------
+  lx = gut
+  lw = 380
+  NlPanel(lx, contentY, lw, contentH, "PROJECT", cAcc, 26)
+
+  listX = lx + 8
+  listY = contentY + 26 + 8
+  listW = lw - 16
+  rowH  = 22
+  rowTop = nlListTop                        ; the list's scroll position, now state
+
+  ; THE WELL IS DELIBERATELY TOO SMALL, and this was a real defect caught
+  ; by replaying the layout arithmetic before the board ever saw it. The
+  ; first version gave the list the whole panel: at 1824x984 that is 840
+  ; pixels, thirty-eight rows of space for twenty-eight rows of content.
+  ; Nothing overflowed, so the clip was only ever handed rectangles that
+  ; were already inside it, the scrollbar took its inert-track path
+  ; (GlUIChrome.pbi:438-446) and drew no thumb, and the screen would have
+  ; quietly proved nothing while looking correct. A test that cannot fail
+  ; is not a test.
+  ;
+  ; Sixteen rows, and twenty-eight to put in them. The panel's remaining
+  ; height goes to a detail strip underneath, which is what a real file
+  ; browser does with it anyway.
+  listH = (16 * rowH) + 8
+  If listH > (contentH - 26 - 16)
+    listH = contentH - 26 - 16               ; a short panel still fits
+  EndIf
+
+  ; The well's geometry, recorded for the scroll frame's damage. A
+  ; scroll moves every row in the well, so the damage IS the well - see
+  ; the note on the scroll case in section 9.
+  nlWellX = listX
+  nlWellY = listY
+  nlWellW = listW
+  nlWellH = listH
+
+  ; Neon_ListBegin, GlUIChrome.pbi:1286-1309 - the well, then the clip.
+  NlListBegin(listX, listY, listW, listH, rowH)
+
+  ; TWENTY-EIGHT ROWS INTO A WELL THAT HOLDS FEWER, starting six rows
+  ; above the top of the well. So the first visible row and the last
+  ; one are both PARTLY outside it, which is the whole reason the clip
+  ; is here. The rows above and below are drawn and thrown away rather
+  ; than skipped by a visibility test, deliberately: a clip that is only
+  ; ever handed rectangles that were already inside it has proved
+  ; nothing. The counters at the end of the run say how many boxes it
+  ; narrowed and how many glyph cells it dropped.
+  ; ROW 5 AND ROW 22 ARE THE TWO PARTIAL ROWS, at the top and bottom
+  ; edges of the well, and they are the ones given a hover on purpose: a
+  ; hovered row is the only list state that paints a background box, so
+  ; those two are what make the BOX clip visible rather than merely
+  ; correct. You should see a sliver of a bar with no text in it at each
+  ; edge - the box cut to the pixel, the glyph cell dropped whole.
+  ; Row 12 (mmu.pi4) is the selection, and it sits well inside the view
+  ; because a selection scrolled out of sight proves nothing. An earlier
+  ; draft had it on row 4, six rows above the top of the well.
+  ry = listY - (rowTop * rowH)
+  NlListItem(ry + (rowH *  0), "RaspberryPi4",      "", 0, 2)
+  NlListItem(ry + (rowH *  1), "Lib",               "31", 1, 2)
+  NlListItem(ry + (rowH *  2), "bits.pi4",          "23 KB", 2, 0)
+  NlListItem(ry + (rowH *  3), "clocks.pi4",        "9 KB", 2, 0)
+  NlListItem(ry + (rowH *  4), "display.pi4",       "166 KB", 2, 0)
+  NlListItem(ry + (rowH *  5), "emmc.pi4",          "92 KB", 2, 3)
+  NlListItem(ry + (rowH *  6), "fat.pi4",           "181 KB", 2, 0)
+  NlListItem(ry + (rowH *  7), "genet.pi4",         "133 KB", 2, 0)
+  NlListItem(ry + (rowH *  8), "gpio.pi4",          "29 KB", 2, 0)
+  NlListItem(ry + (rowH *  9), "mailbox.pi4",       "83 KB", 2, 0)
+  NlListItem(ry + (rowH * 10), "math.pi4",          "70 KB", 2, 0)
+  NlListItem(ry + (rowH * 11), "memory.pi4",        "67 KB", 2, 0)
+  NlListItem(ry + (rowH * 12), "mmu.pi4",           "69 KB", 2, 1)
+  NlListItem(ry + (rowH * 13), "timer.pi4",         "18 KB", 2, 0)
+  NlListItem(ry + (rowH * 14), "uart.pi4",          "54 KB", 2, 0)
+  NlListItem(ry + (rowH * 15), "Examples",          "", 1, 2)
+  NlListItem(ry + (rowH * 16), "Diagnostics",       "30", 2, 2)
+  NlListItem(ry + (rowH * 17), "pi4DisplayProbe",   "", 3, 0)
+  NlListItem(ry + (rowH * 18), "pi4MmuState",       "", 3, 0)
+  NlListItem(ry + (rowH * 19), "pi4NeonLiar",       "here", 3, 0)
+  NlListItem(ry + (rowH * 20), "pi4TimerProbe",     "", 3, 0)
+  NlListItem(ry + (rowH * 21), "Monitor",           "", 1, 2)
+  NlListItem(ry + (rowH * 22), "anvil.pi4",         "", 2, 3)
+  NlListItem(ry + (rowH * 23), "Intrinsics",        "", 1, 2)
+  NlListItem(ry + (rowH * 24), "bcm2711.def",       "", 2, 0)
+  NlListItem(ry + (rowH * 25), "Reference",         "", 1, 2)
+  NlListItem(ry + (rowH * 26), "README.md",         "", 2, 0)
+  NlListItem(ry + (rowH * 27), "Boards",            "", 0, 2)
+
+  ; Neon_ListEnd, GlUIChrome.pbi:1355-1363 - clip off, then the bar in
+  ; the gutter the clip left for it. total 28 against visible 16, so this
+  ; one takes the real path and draws a thumb sixteen twenty-eighths of
+  ; the track high, six rows down.
+  NlListEnd(28, rowTop)
+
+  ; ---- the detail strip, in the panel space the list did not take -----
+  ; Neon_Frame plus text: no new primitive, and it gives the panel
+  ; something to do below the list rather than a rectangle of nothing.
+  dsY = listY + listH + 10
+  dsH = (contentY + contentH) - dsY - 8
+  If dsH > 40
+    NlFrame(listX, dsY, listW, dsH, cLine)
+    NlText(listX + 10, dsY + 8,      "display.pi4", cAcc)
+    NlText(listX + 10, dsY + 8 + th, "166 KB   proven on silicon", cDim)
+    If dsH > (8 + (th * 3))
+      NlText(listX + 10, dsY + 8 + (th * 2), "do not modify", cAmb)
+    EndIf
+  EndIf
+  ; ---- the right panel -----------------------------------------------
+  rx = lx + lw + gut
+  rw = w - rx - gut
+  NlPanel(rx, contentY, rw, contentH, "SERIAL MONITOR", cAmb, 26)
+
+  ry = contentY + 26 + 12
+  NlText(rx + 14, ry + (th * 0), "PureMetal Forge - Anvil", cDim)
+  NlText(rx + 14, ry + (th * 1), "screen up - real geometry is on the serial line", cDim)
+  NlText(rx + 14, ry + (th * 2), "mailbox ok - ARM clock queried, not assumed", cDim)
+  NlText(rx + 14, ry + (th * 3), "SCTLR_EL2 $0000000030C50830 - MMU off, caches off", cGrn)
+  NlText(rx + 14, ry + (th * 4), "stage 0: two primitives and a scissor", cText)
+  NlText(rx + 14, ry + (th * 5), "stage 0.5: four passes, see the serial line", cText)
+  NlText(rx + 14, ry + (th * 6), "no floating point was executed to draw this", cAmb)
+  NlText(rx + 14, ry + (th * 7), "warning: every glow below is opaque", cRed)
+  NlText(rx + 14, ry + (th * 8), "note: the accent colour is 90,189,208", cAcc)
+  NlText(rx + 14, ry + (th * 9), "note: the violet entry is 169,152,224", cVio)
+
+  ; ---- the buttons, one of each state --------------------------------
+  ; MEASURED FROM THE PANEL, not hardcoded at 150. The first version was
+  ; hardcoded and the four buttons ran 420 pixels past the right edge of
+  ; the panel on a 640-wide surface - which this board is not, but a
+  ; layout that is only correct at one resolution is a layout that has
+  ; not been thought about. Four buttons and three twelve-pixel gaps.
+  bw = ((rw - 28) - (12 * 3)) / 4
+  If bw > 150
+    bw = 150
+  EndIf
+  bh = 30
+  by = contentY + contentH - bh - 16
+  bx = rx + 14
+
+  ; Recorded for the hover frame's damage, BEFORE the buttons are
+  ; drawn, so that the frame driver and the drawing code cannot
+  ; disagree about where they are.
+  nlBtnX = bx
+  nlBtnY = by
+  nlBtnW = bw
+  nlBtnH = bh
+  nlBtnStep = bw + 12
+
+  ; ---- the text field, above the buttons -------------------------------
+  ; It is here because stage 0.6 needs the smallest change a real UI
+  ; makes, and a blinking caret is it. See NlTextField's header for why
+  ; this one widget carries no GlUIChrome.pbi line number.
+  NlTextField(bx, by - 44, (bw * 3) + 24, 28, "COM7 115200", 1, nlCaretOn)
+
+  NlButton(bx,                 by, bw, bh, "BUILD",   0, 1, NlIsHover(0))
+  NlButton(bx + (bw + 12),     by, bw, bh, "UPLOAD",  1, 1, NlIsHover(1))
+  NlButton(bx + (bw + 12) * 2, by, bw, bh, "MONITOR", 0, 0, NlIsHover(2))
+  NlButton(bx + (bw + 12) * 3, by, bw, bh, "HOVERED", 0, 1, NlIsHover(3))
+
+  ; ---- the status bar -------------------------------------------------
+  NlBox(0, statusY, w, statusH, cHead)
+  NlBox(0, statusY, w, 1, cLine)
+  NlText(12, statusY + ((statusH - th) / 2), "pi4NeonLiar - stage 0", cDim)
+  NlTextCentre(0, w, statusY + ((statusH - th) / 2), "LIE 1: every glow and hover is OPAQUE.   LIE 2: every glyph is 8px FIXED WIDTH.   Both intended.", cAmb)
+  NlTextRight(w - 12, statusY + ((statusH - th) / 2), "display.pi4 unmodified", cDim)
+
+  ; ---- the open drop-down, LAST, because it draws on top --------------
+  ; GlUIChrome.pbi:772-774. dx is the x of the Board tab, remembered
+  ; above; the drop-down hangs from the bottom of the bar (:750).
+  dy = menuY + menuH
+  dw = 300
+  dh = (24 * 6) + 9 + 8
+  NlGlow(dx, dy, dw, dh, cBlack)                         ; :772 - the shadow
+  NlBox(dx, dy, dw, dh, cHead)                           ; :773
+  NlFrame(dx, dy, dw, dh, cAccFrame)                     ; :774
+
+  ry = dy + 4
+  NlMenuItem(dx, ry,          dw, "Raspberry Pi 4",  "",       1, 1, 0)
+  NlMenuItem(dx, ry + 24,     dw, "Raspberry Pi 5",  "",       0, 0, 0)
+  NlMenuItem(dx, ry + 48,     dw, "RP2350",          "",       1, 0, 1)
+  NlMenuSeparator(dx, ry + 72, dw)
+  NlMenuItem(dx, ry + 81,     dw, "Rescan ports",    "Ctrl+R", 1, 0, 0)
+  NlMenuItem(dx, ry + 105,    dw, "Board manager",   "Ctrl+B", 1, 0, 0)
+  NlMenuItem(dx, ry + 129,    dw, "Properties",      "Alt+P",  1, 0, 0)
+EndProcedure
+
+
+; ======================================================================
+;  STAGE 0.6 - THE FRAME DRIVER
+;
+;  Everything above draws a screen. This draws the SAME screen with one
+;  widget different, repaints only what that changed, and times it
+;  against the full redraw. The ratio between those two numbers is what
+;  stage 0.6 is for.
+; ======================================================================
+
+Procedure NlCountersReset()
+  nlFills = 0
+  nlGlyphs = 0
+  nlTexts = 0
+  nlNarrowed = 0
+  nlDropped = 0
+  nlGlyphsCut = 0
+  nlPixels = 0
+  nlDmgSkipped = 0
+  nlDmgSplit = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NlPaintFull - the baseline. Every primitive draws; the whole surface
+; is flushed. Returns microseconds INCLUDING the flush, because a frame
+; that has not been made visible is not a frame and comparing a draw
+; against a draw-plus-flush would flatter the wrong one.
+; ----------------------------------------------------------------------
+Procedure.i NlPaintFull()
+  Define t0.i
+  NlCountersReset()
+  nlDmgOn = 0
+  t0 = Micros()
+  NlDrawScreen()
+  DisplayFlush()
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NlPaintDamaged - the same traversal, damage-limited, and then a flush
+; of ONLY the damaged rectangles.
+;
+; THE FLUSH IS PART OF THE SAVING AND IT IS EASY TO LEAVE OUT. With the
+; MMU off, DisplayFlush() is 129,600 dc cvac instructions over a
+; 1824 x 984 surface that are architecturally no-ops and still execute.
+; With the MMU on and DRAM cacheable they are real work. Either way a
+; damage-limited repaint that ended in a whole-surface flush would have
+; given back a large part of what it saved, so the flush is per
+; rectangle here and it is inside the timing.
+;
+; The widget tree is walked ONCE, whatever the rectangle count. See the
+; note on nlDmgOn.
+; ----------------------------------------------------------------------
+Procedure.i NlPaintDamaged()
+  Define t0.i
+  Define k.i
+  Define n.i
+
+  NlCountersReset()
+  nlDmgOn = 1
+  t0 = Micros()
+  NlDrawScreen()
+  n = DamageCount()
+  k = 0
+  While k < n
+    DisplayFlushRect(DamageRectX(k), DamageRectY(k), DamageRectW(k), DamageRectH(k))
+    k = k + 1
+  Wend
+  nlDmgOn = 0
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; THE THREE EVENTS, EACH DECLARING ITS OWN DAMAGE.
+;
+; Each of these is what a real event handler would do: change the state
+; and say what that will repaint. They are separate from the drawing
+; code and they read the geometry the drawing code recorded, which is
+; the discipline the note on nlBtnX sets out.
+;
+; THE BUTTON DAMAGE IS THE BUTTON PLUS FOUR PIXELS ON EVERY SIDE, and
+; the four is not a safety margin - it is Neon_Glow's ring
+; (GlUIChrome.pbi:323-328), which is four nested boxes each one pixel
+; further out. A damage rectangle of exactly the button would leave the
+; halo of the button that LOST the hover still painted, as a hollow
+; cyan frame around nothing. That is the ghost this whole layer has to
+; be careful about, and it is four pixels wide.
+; ----------------------------------------------------------------------
+Procedure NlDamageButton(n.i)
+  If n < 0
+    ProcedureReturn
+  EndIf
+  DamageAdd(nlBtnX + (nlBtnStep * n) - 4, nlBtnY - 4, nlBtnW + 8, nlBtnH + 8)
+EndProcedure
+
+Procedure NlEventHover(n.i)
+  ; BOTH buttons are damaged, the one losing the hover and the one
+  ; gaining it. A frame that damaged only the new one is the commonest
+  ; dirty-rectangle bug there is.
+  NlDamageButton(nlHoverBtn)
+  nlHoverBtn = n
+  NlDamageButton(n)
+EndProcedure
+
+Procedure NlEventCaret()
+  ; The caret's own cell only. NlTextField recorded it on the last
+  ; full paint; it does not move while the text does not change.
+  nlCaretOn = 1 - nlCaretOn
+  DamageAdd(nlCaretX, nlCaretY, nlCaretW, nlCaretH)
+EndProcedure
+
+Procedure NlEventScroll(rows.i)
+  ; THE WHOLE WELL, AND THAT IS CORRECT RATHER THAN LAZY. A scroll of
+  ; one row moves every pixel in the well; there is no smaller honest
+  ; answer with a software fill. (There is a smaller answer with a
+  ; hardware blitter - DisplayCopyRect the well up by one row and
+  ; repaint the one row that is newly exposed - and that is exactly the
+  ; kind of thing the DMA 2D engine in section 9.3 of the port plan is
+  ; for. It is deliberately NOT done here, because this measurement is
+  ; about the damage layer and not about a scrolling trick, and because
+  ; mixing the two would make the scroll number unquotable.)
+  ;
+  ; The scrollbar thumb lives in the ten-pixel gutter OUTSIDE the clip
+  ; (NlListBegin sets the clip to w - 10) and it moves too, so the
+  ; damage is the well plus its gutter - which is nlWellW, the full
+  ; width, because the well's own box already spans both.
+  nlListTop = nlListTop + rows
+  If nlListTop < 0
+    nlListTop = 0
+  EndIf
+  If nlListTop > 12
+    nlListTop = 12
+  EndIf
+  DamageAdd(nlWellX, nlWellY, nlWellW, nlWellH)
+EndProcedure
+
+
+; ======================================================================
+;  THE SHADOW-BUFFER QUESTION - MEASURED, NOT ARGUED
+;
+;  Section 6.3 of the port plan drops the engine's FBO and says: if the
+;  measurement demands a shadow buffer, add it as a shadow buffer. This
+;  is that measurement, and it is one question with one experiment.
+;
+;  THE QUESTION IS NOT "IS DOUBLE BUFFERING NICE". It is: DOES A STORE
+;  INTO THE FRAMEBUFFER COST THE SAME AS A STORE INTO ORDINARY DRAM?
+;
+;  Everything else follows from the answer. If they are the same, a
+;  shadow buffer can only add work - you write the pixel twice and copy
+;  it once - and damage-repaint straight into the live framebuffer is
+;  right. If the framebuffer is much slower, then the framebuffer is
+;  the wall, composing into DRAM and copying out only the damaged
+;  rectangles is the answer, and it is the DAMAGE LAYER that makes that
+;  copy small enough to be worth doing.
+;
+;  IT IS WORTH SAYING WHY THIS IS NOT ALREADY KNOWN. Stage 0.5 measured
+;  266 ms of opaque stores over 8.29 MB with DRAM mapped cacheable -
+;  about 148 ns and 222 CPU cycles for one four-byte pixel, through a
+;  loop whose own header claims 1.4 instructions per byte
+;  (display.pi4:2386-2389). Those two cannot both be true. Either the
+;  instruction count is wrong or those stores are not going to cacheable
+;  memory at all, and nothing on this disk distinguishes them. THE SAME
+;  LOOP AGAINST TWO DESTINATIONS DOES, in one pair of numbers.
+;
+;  THE SHADOW LIVES AT $01000000 and the address is chosen, not found.
+;  Anvil's map (anvil.pi4:618-626) puts the monitor at $00200000..
+;  $003FFFFF and the low payload window at $00400000..$07EFFFFF. This
+;  image loads at $00400000 and its stack grows DOWN from $03000000,
+;  and mmu.pi4's tables are at $00600000. 16 MiB is inside the payload
+;  window, above the image and its page tables, and 32 MiB below the
+;  stack. A full 1824 x 984 x 4 surface is 7.18 MB, so the shadow ends
+;  at about $016D8000 with room to spare in every direction.
+;
+;  IT IS NOT A Global Dim, AND THAT WAS THE FIRST ATTEMPT. Seven
+;  megabytes of BSS on this backend is seven megabytes in the image
+;  file, and the image reaches the board over a 115200-baud serial
+;  line. That is about ten minutes of `receive` for a buffer whose
+;  contents nobody cares about.
+;
+;  A PREDICTION, WRITTEN DOWN BEFORE THE RUN SO THAT IT CAN BE WRONG.
+;  Stage 0.5's own numbers already point one way, and saying so in
+;  advance is worth more than explaining the result afterwards:
+;
+;    read, loads only   1155.0 ms
+;    clear, stores only  266.4 ms
+;
+;  Reads are 4.3x dearer than writes over the same 8.29 MB. That is
+;  not what a slow INSTRUCTION LOOP looks like - a load loop and a
+;  store loop cost about the same number of instructions, so a
+;  codegen-bound pass would show the two roughly level. It is exactly
+;  what DEVICE MEMORY looks like: stores post and retire, loads stall
+;  to the far end and nothing gathers or combines.
+;
+;  SO THE PREDICTION IS THAT THE FRAMEBUFFER IS STILL UNCACHED EVEN
+;  WITH THE MMU ON - that mmu.pi4's identity map does not give the
+;  firmware's framebuffer region the Normal Cacheable attribute that
+;  the rest of DRAM gets - and that section 10 will therefore report a
+;  large ratio and a SHADOW-BUFFER verdict.
+;
+;  IF THE RATIO COMES BACK NEAR 1.0 THE PREDICTION IS WRONG and the
+;  finding is bigger, not smaller: it would mean 222 cycles per pixel
+;  is what this backend's store loop genuinely costs in cacheable
+;  memory, and the whole problem moves to the code generator. Either
+;  answer is worth the run. Neither is worth guessing.
+; ======================================================================
+
+#NL_SHADOW = $01000000
+
+; ----------------------------------------------------------------------
+; NlPassStore - w pixels by rows rows of one colour at base/pitch.
+;
+; THE INNER LOOP IS DspRowFill32's, DELIBERATELY. Same eight-pixel
+; unroll, same 64-bit PokeI, same masked doubling, same head pixel for
+; alignment (display.pi4:2414-2455). The point of this measurement is
+; to compare two DESTINATIONS, so everything else has to be identical -
+; a naive one-pixel loop here would be measuring the loop.
+;
+; It is copied rather than called because DspRowFill32 takes a byte
+; address computed from display.pi4's own globals and there is no way
+; to point it at anything else. Copying a proven loop to move it to a
+; different address is the smaller sin than adding a base parameter to
+; a file that drives Anvil's console.
+; ----------------------------------------------------------------------
+Procedure.i NlPassStore(base.i, pitch.i, w.i, rows.i, colour.i)
+  Define t0.i
+  Define y.i
+  Define p.i
+  Define n.i
+  Define left.i
+  Define wide.i
+  Define c.i
+
+  c = colour & $FFFFFFFF
+  wide = c | (c << 32)
+
+  t0 = Micros()
+  y = 0
+  While y < rows
+    p = base + (y * pitch)
+    left = w
+    If (p & 7) <> 0
+      PokeL(p, c)
+      p = p + 4
+      left = left - 1
+    EndIf
+    n = left >> 3
+    While n > 0
+      PokeI(p, wide)
+      PokeI(p + 8, wide)
+      PokeI(p + 16, wide)
+      PokeI(p + 24, wide)
+      p = p + 32
+      n = n - 1
+    Wend
+    left = left & 7
+    While left > 0
+      PokeL(p, c)
+      p = p + 4
+      left = left - 1
+    Wend
+    y = y + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NlPassCopy - the presentation step a shadow buffer needs: one
+; rectangle out of the shadow and into the framebuffer, at the same
+; coordinates.
+;
+; EIGHT ARGUMENTS IS THE CEILING ON THIS BACKEND, so the two pitches
+; travel and the geometry is a rectangle rather than x, y, w, h plus
+; both bases. That is why the source and destination rectangles are the
+; same one: a shadow buffer that composed at a different offset from
+; the panel would need a ninth argument, and there is no reason to
+; want one.
+;
+; Wide 64-bit moves, two pixels at a time, for the same reason the fill
+; is unrolled. No alignment head here: both bases are $100-aligned and
+; both pitches are multiples of eight on this surface, so a rectangle
+; starting at an even x is eight-aligned in both buffers. The odd-x
+; case falls into the tail loop and is correct, just slower - and the
+; damage rectangles this is asked to copy come from widget geometry,
+; which is even far more often than not.
+; ----------------------------------------------------------------------
+Procedure.i NlPassCopy(dst.i, dpitch.i, src.i, spitch.i, x.i, y.i, w.i, h.i)
+  Define t0.i
+  Define r.i
+  Define d.i
+  Define s.i
+  Define n.i
+  Define left.i
+
+  t0 = Micros()
+  r = 0
+  While r < h
+    d = dst + ((y + r) * dpitch) + (x * 4)
+    s = src + ((y + r) * spitch) + (x * 4)
+    left = w
+    If (d & 7) <> 0
+      PokeL(d, PeekN(s))
+      d = d + 4
+      s = s + 4
+      left = left - 1
+    EndIf
+    n = left >> 2
+    While n > 0
+      PokeI(d, PeekI(s))
+      PokeI(d + 8, PeekI(s + 8))
+      d = d + 16
+      s = s + 16
+      n = n - 1
+    Wend
+    left = left & 3
+    While left > 0
+      PokeL(d, PeekN(s))
+      d = d + 4
+      s = s + 4
+      left = left - 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+
+; ======================================================================
+;  THE PROOF THAT THE FAST FRAME IS THE RIGHT FRAME
+;
+;  A damage-limited repaint that is fast and wrong is worse than a slow
+;  one, and it is wrong in a way nobody photographs: a stale pixel
+;  outside the damage rectangle looks like a rendering artefact, three
+;  layers away from the accounting mistake that caused it.
+;
+;  So the timing is not the deliverable on its own. This is the check
+;  that goes with it, and it is the only one that can settle the
+;  question completely:
+;
+;    1. draw state B in full, and keep a copy of the surface;
+;    2. draw state A in full, over the top;
+;    3. apply the event that turns A into B, declaring its damage, and
+;       repaint ONLY that damage;
+;    4. compare every pixel of the surface with the copy from step 1.
+;
+;  A single differing pixel means the event under-reported its damage.
+;  Zero means the fast path and the slow path produce the same picture,
+;  which is the whole claim.
+;
+;  IT COSTS A FULL-SURFACE COMPARE, which stage 0.5 measured as a read
+;  pass at over a second on this board. That is why it runs once, on
+;  one representative event, rather than after every frame in section 9
+;  - and why the event it runs on is the HOVER rather than the caret.
+;  The hover is the one with two damage rectangles, the one where a
+;  four-pixel glow ring has to be accounted for on a widget that is
+;  losing it, and therefore the one where an under-report is plausible.
+;  A caret that failed this check would be a much stranger bug.
+; ======================================================================
+
+Global nlDiffX.i = -1
+Global nlDiffY.i = -1
+
+; A whole-surface copy, used to keep the reference picture. Wide moves,
+; row by row against the pitch - never width * bpp, for the reason
+; display.pi4:313-331 spends a section on.
+Procedure.i NlSnapshot(dst.i, dpitch.i, src.i, spitch.i, w.i, h.i)
+  Define t0.i
+  Define r.i
+  Define d.i
+  Define s.i
+  Define n.i
+
+  t0 = Micros()
+  r = 0
+  While r < h
+    d = dst + (r * dpitch)
+    s = src + (r * spitch)
+    n = w >> 1
+    While n > 0
+      PokeI(d, PeekI(s))
+      d = d + 8
+      s = s + 8
+      n = n - 1
+    Wend
+    If (w & 1) = 1
+      PokeL(d, PeekN(s))
+    EndIf
+    r = r + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; Count the pixels that differ, and remember where the first one was.
+;
+; IT COUNTS RATHER THAN STOPPING AT THE FIRST. "One pixel differs" and
+; "forty thousand differ" are different bugs - the first is an edge or
+; an off-by-one in a damage rectangle, the second is a whole widget
+; that was never repainted - and the count tells them apart without a
+; second run. The coordinate is what says which widget.
+Procedure.i NlDiff(a.i, apitch.i, b.i, bpitch.i, w.i, h.i)
+  Define bad.i
+  Define x.i
+  Define y.i
+  Define pa.i
+  Define pb.i
+
+  bad = 0
+  nlDiffX = -1
+  nlDiffY = -1
+  y = 0
+  While y < h
+    pa = a + (y * apitch)
+    pb = b + (y * bpitch)
+    x = 0
+    While x < w
+      If (PeekN(pa) & $FFFFFFFF) <> (PeekN(pb) & $FFFFFFFF)
+        If bad = 0
+          nlDiffX = x
+          nlDiffY = y
+        EndIf
+        bad = bad + 1
+      EndIf
+      pa = pa + 4
+      pb = pb + 4
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+  ProcedureReturn bad
+EndProcedure
+
+
+; ======================================================================
+;  STAGE 0.5 - THE FOUR PASSES
+;
+;  Each takes a row count so the same code can be probed over eight rows
+;  and then run over the whole surface, and each returns the elapsed
+;  microseconds from Micros() (timer.pi4:354).
+;
+;  THE ROW ADDRESS IS base + y * pitch, never base + y * width * bpp.
+;  display.pi4's header spends a whole section on why (:313-331): the
+;  wrong one does not blank the screen, it SHEARS the picture
+;  diagonally, and it looks like a bad cable.
+; ======================================================================
+
+Procedure.i NlPassClear(rows.i, colour.i)
+  Define t0.i
+  Define w.i
+  t0 = Micros()
+  w = DisplayWidth()
+  DisplayFillRect(0, 0, w, rows, colour)
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+Global nlReadAcc.i = 0
+
+; Read every pixel and accumulate it. The accumulator is a global and is
+; printed afterwards, so nothing about this loop can be argued away as
+; dead - this backend does not dead-strip anyway (math.pi4:127-132
+; records that including a library costs its whole size), but a
+; measurement whose work might have been removed is not a measurement.
+Procedure.i NlPassRead(rows.i)
+  Define t0.i
+  Define base.i
+  Define pitch.i
+  Define w.i
+  Define y.i
+  Define p.i
+  Define n.i
+  Define acc.i
+
+  base  = DisplayBase()
+  pitch = DisplayPitch()
+  w     = DisplayWidth()
+  acc   = 0
+
+  t0 = Micros()
+  y = 0
+  While y < rows
+    p = base + (y * pitch)
+    n = w
+    While n > 0
+      acc = acc + (PeekN(p) & $FFFFFFFF)
+      p = p + 4
+      n = n - 1
+    Wend
+    y = y + 1
+  Wend
+  nlReadAcc = acc
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; THE BLEND, WRITTEN TO BE READ.
+;
+; dst = (src * a + dst * (255 - a)) >> 8, per channel, non-premultiplied
+; - the one blend equation the whole engine needs, because
+; glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) is set once at
+; GlUtilities.pbi:718-719 and never changed again.
+;
+; >> 8 RATHER THAN / 255, AND THE OFF-BY-ONE IS REAL. With a = 255 this
+; produces 254 where it should produce 255, so an "opaque" blend fades a
+; white by one level. Stage 1 does not have this problem because
+; GfxFill's opaque case takes the fast path and never reaches the blend
+; at all (section 2.2 of the plan). It is written this way here because
+; a divide by 255 per channel per pixel would be measuring a divider
+; that no compositor would ship.
+;
+; The source colour is taken already PACKED, from DisplayRGB, and split
+; the same way it was packed. That makes the pass correct whichever way
+; DisplayColourSwap has the channels: red and blue could be the other
+; way round throughout and this blend would still be blending each
+; channel with itself.
+; ----------------------------------------------------------------------
+Procedure.i NlPassBlendPlain(rows.i, src.i, sa.i)
+  Define t0.i
+  Define base.i
+  Define pitch.i
+  Define w.i
+  Define y.i
+  Define p.i
+  Define n.i
+  Define d.i
+  Define ia.i
+  Define ra.i
+  Define ga.i
+  Define ba.i
+  Define dr.i
+  Define dg.i
+  Define db.i
+
+  base  = DisplayBase()
+  pitch = DisplayPitch()
+  w     = DisplayWidth()
+  ia = 255 - sa
+  ra = ((src >> 16) & 255) * sa
+  ga = ((src >> 8) & 255) * sa
+  ba = (src & 255) * sa
+
+  t0 = Micros()
+  y = 0
+  While y < rows
+    p = base + (y * pitch)
+    n = w
+    While n > 0
+      d  = PeekN(p) & $FFFFFFFF
+      dr = (ra + (((d >> 16) & 255) * ia)) >> 8
+      dg = (ga + (((d >> 8) & 255) * ia)) >> 8
+      db = (ba + ((d & 255) * ia)) >> 8
+      PokeL(p, (((($FF << 24) | (dr << 16)) | (dg << 8)) | db))
+      p = p + 4
+      n = n - 1
+    Wend
+    y = y + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; THE SAME BLEND, FUSED.
+;
+; Identical arithmetic, identical result, with the three per-channel
+; locals gone. On a machine with a register allocator these two are the
+; same program. On THIS backend they are not, and DspRowFill32's header
+; says why in detail (display.pi4:2372-2384): procedure locals are
+; statically allocated, so "dr = ..." is an adrp/add/str and every later
+; mention of dr is an adrp/add/ldr. Three locals written once and read
+; once is twelve address materialisations per pixel that the fused form
+; does not pay.
+;
+; EVERY SHIFT IS PARENTHESISED. On this compiler & and | bind TIGHTER
+; than << and >>, so "d >> 16 & 255" parses as "d >> (16 & 255)" and
+; would silently be a different program. display.pi4's header calls this
+; out as one of its three 64-bit traps (:416-421) and every shift in
+; that file is parenthesised for the same reason, including the ones
+; where it would not have mattered.
+; ----------------------------------------------------------------------
+Procedure.i NlPassBlendFused(rows.i, src.i, sa.i)
+  Define t0.i
+  Define base.i
+  Define pitch.i
+  Define w.i
+  Define y.i
+  Define p.i
+  Define n.i
+  Define d.i
+  Define ia.i
+  Define ra.i
+  Define ga.i
+  Define ba.i
+
+  base  = DisplayBase()
+  pitch = DisplayPitch()
+  w     = DisplayWidth()
+  ia = 255 - sa
+  ra = ((src >> 16) & 255) * sa
+  ga = ((src >> 8) & 255) * sa
+  ba = (src & 255) * sa
+
+  t0 = Micros()
+  y = 0
+  While y < rows
+    p = base + (y * pitch)
+    n = w
+    While n > 0
+      d = PeekN(p) & $FFFFFFFF
+      PokeL(p, (((($FF << 24) | ((((ra + (((d >> 16) & 255) * ia)) >> 8)) << 16)) | ((((ga + (((d >> 8) & 255) * ia)) >> 8)) << 8)) | ((ba + ((d & 255) * ia)) >> 8)))
+      p = p + 4
+      n = n - 1
+    Wend
+    y = y + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+
+; ======================================================================
+;  REPORTING ONE PASS
+;
+;  Every derived figure is stated with the number it was derived from
+;  beside it, so a wrong assumption is visible rather than folded in.
+; ======================================================================
+
+; bytes is the TRAFFIC, not the pixel count times four: a blend touches
+; each pixel twice, once in and once out, and the whole point of the
+; measurement is the memory traffic.
+Procedure NlReport(us.i, pixels.i, bytes.i, hz.i)
+  Define cycles.i
+
+  PutLabel("elapsed            ")
+  PutMs(us)
+  UartWriteStr(" ms  (")
+  PrintDec(us)
+  UartWriteStr(" us)")
+  PrintNl()
+
+  If us < 1
+    PutLabel("too fast to divide - the counter did not move")
+    PrintNl()
+    ProcedureReturn
+  EndIf
+
+  PutLabel("traffic            ")
+  PrintDec(bytes)
+  UartWriteStr(" bytes")
+  PrintNl()
+
+  ; bytes per microsecond IS megabytes per second, with a megabyte
+  ; meaning 1000000 bytes. Said, rather than left for the reader.
+  PutLabel("rate               ")
+  PutFix2((bytes * 100) / us)
+  UartWriteStr(" MB/s   (decimal MB, i.e. bytes per microsecond)")
+  PrintNl()
+
+  PutLabel("ns per pixel       ")
+  PutFix2((us * 100000) / pixels)
+  PrintNl()
+
+  If hz > 0
+    cycles = (us * hz) / 1000000
+    PutLabel("cycles per pixel   ")
+    PutFix2((cycles * 100) / pixels)
+    PrintNl()
+    PutLabel("cycles per byte    ")
+    PutFix2((cycles * 100) / bytes)
+    UartWriteStr("   (compare 1.4 instructions/byte, display.pi4:2386-2389)")
+    PrintNl()
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+; 1 = turn the MMU on with DRAM cacheable before measuring. 0 = the
+; original uncached run. See the long note inside Main().
+#NL_MMU = 1
+
+; ----------------------------------------------------------------------
+; NlMmuOff - hand Anvil back an untranslated machine, from anywhere.
+;
+; A DEFECT FOUND BY READING, 2026-08-26, WHILE ADDING STAGE 0.6.
+;
+; Main() turns the MMU on as its FIRST act and turned it off again at
+; its LAST line - and it has four exits, not one. MailboxInit failing,
+; DisplayInit failing and a surface too small for the layout all
+; returned straight to Anvil with translation still enabled.
+;
+; Anvil knows nothing about page tables. Every address it then touches
+; goes through a table this payload built and this payload owns, at
+; $600000, inside the low payload window that the next `receive` will
+; overwrite. The symptom would not be a clean fault - it would be a
+; monitor that works until something happens to be mapped differently,
+; which is the worst kind.
+;
+; It had never been seen because all three of those exits are failure
+; paths, and on a bench where the screen comes up they never run. That
+; is exactly the argument for fixing it rather than noting it: the
+; paths that only execute when something else has already gone wrong
+; are the ones nobody has watched.
+; ----------------------------------------------------------------------
+Procedure NlMmuOff()
+  If #NL_MMU = 1
+    If MmuEnabled() = 1
+      MmuDisable()
+      UartWriteStr("MMU: off again - Anvil gets an untranslated machine back.")
+      PrintNl()
+      UartDrain()
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define bpp.i
+  Define order.i
+  Define hz.i
+  Define pixels.i
+  Define probeRows.i
+  Define probeUs.i
+  Define estUs.i
+  Define fullUs.i
+  Define clearUs.i
+  Define readUs.i
+  Define plainUs.i
+  Define fusedUs.i
+  Define flushUs.i
+  Define bestUs.i
+  Define src.i
+  Define t0.i
+  ; --- stage 0.6, the damage-limited frames -------------------------
+  Define fullPixels.i
+  Define fullFills.i
+  Define caretUs.i
+  Define caretPx.i
+  Define hoverUs.i
+  Define hoverPx.i
+  Define scrollUs.i
+  Define scrollPx.i
+  Define mixedUs.i
+  Define mixedPx.i
+  ; --- the shadow-buffer experiment ---------------------------------
+  Define fbUs.i
+  Define dramUs.i
+  Define copyUs.i
+  Define shadowRows.i
+  ; --- 9e, the identity check ---------------------------------------
+  Define snapUs.i
+  Define idHoverUs.i
+  Define diffCount.i
+
+  UartInit(115200)
+
+  ; ------------------------------------------------------------------
+  ;  THE CACHES, AND THE BEFORE-AND-AFTER THIS PROGRAM EXISTS FOR
+  ; ------------------------------------------------------------------
+  ;  #NL_MMU = 0 reproduces the 2026-08-26 measurement exactly: MMU off,
+  ;  nothing cached, blend 2713 ms against a 25 ms budget.
+  ;  #NL_MMU = 1 builds the identity map and turns translation on with
+  ;  DRAM mapped Normal Write-Back Cacheable, then runs the identical
+  ;  passes. Which attribute DRAM gets is #MMU_DRAM_ATTR in mmu.pi4.
+  ;
+  ;  THE MMU IS TURNED OFF AGAIN BEFORE THIS RETURNS. Anvil is still
+  ;  running underneath and knows nothing about page tables; handing it
+  ;  back a translated address space would be a fault it has no vector
+  ;  for. Stage 1 proved the off-again path on this board - SCTLR_EL2
+  ;  went $30C50830 -> $30C50831 -> $30C50830 with the console alive.
+  ;
+  ;  THE TABLES GO AT $600000, inside the low payload window and clear of
+  ;  this image at $400000 and its stack at $3000000. 8 KiB, two tables.
+  If #NL_MMU = 1
+    UartWriteStr("MMU: building the identity map at $600000 ...")
+    PrintNl()
+    ; MmuBuildTables RETURNS 0 ON SUCCESS and a negative #MMU_ERR_* on
+    ; refusal (mmu.pi4:1044-1046, :1144). Testing it as though non-zero
+    ; meant success silently ran the whole measurement UNCACHED and
+    ; reported the uncached numbers as though they were the cached ones -
+    ; which is worse than a crash, because the output looked complete.
+    ; pi4MmuIdentity.pi4:216 gets this right with `If rc <> 0`.
+    If MmuBuildTables($600000) <> 0
+      UartWriteStr("MMU: the tables would not build - running UNCACHED.")
+      PrintNl()
+    Else
+      MmuEnable()
+      If MmuEnabled() = 1
+        UartWriteStr("MMU: ON. DRAM is Normal Write-Back Cacheable. Every")
+        PrintNl()
+        UartWriteStr("     number below is the CACHED half of the comparison.")
+        PrintNl()
+      Else
+        UartWriteStr("MMU: the enable did not take - running UNCACHED.")
+        PrintNl()
+      EndIf
+    EndIf
+  Else
+    UartWriteStr("MMU: off. These are the UNCACHED numbers.")
+    PrintNl()
+  EndIf
+
+  ; THIS PAYLOAD DELIBERATELY DOES NOT ARM A WATCHDOG, and the removed
+  ; line that used to sit here reset the board after every single run.
+  ;
+  ; It said SafetyWatchdogStart(30), citing the vault's "Bench practice -
+  ; arm the deadman". That rule was misread. Arming is the OPERATOR's
+  ; job - `deadman <secs>` at the prompt, then `run` - and the reason is
+  ; the half nobody thinks about: ANVIL STOPS IT AGAIN when the payload
+  ; returns. A payload that arms its own watchdog leaves one running that
+  ; Anvil does not know exists and therefore never stops.
+  ;
+  ; MEASURED, on 2026-08-26, three runs identically: the payload returned
+  ; at 11.0 s, Anvil printed its "returned" line, and the board reset
+  ; 14.1 s later. It happened with the screen on and with the screen off,
+  ; which is how the HDMI console was cleared of suspicion. Every
+  ; screenshot of this program's own picture was truncated by it, because
+  ; a 1920x1080 capture over 115200 baud takes minutes and the board was
+  ; gone within seconds.
+  ;
+  ; AND IT ASKED FOR 30 SECONDS AND WAS GIVEN 16. The BCM2711 counter is
+  ; 20 bits at 65536/s, so ~15.999 s is the ceiling; safety.pi4:491-498
+  ; clamps and RETURNS THE REAL VALUE, and this call site threw that
+  ; return away. The library was honest and the caller did not listen -
+  ; which is why the passes below print their own elapsed times rather
+  ; than trusting any timeout to bound them.
+  ;
+  ; This program bounds itself instead: every pass is probed over eight
+  ; rows first and the full pass runs only if the estimate is survivable.
+  ; If you want a net underneath that, type `deadman 15` before `run` -
+  ; the whole program measures about 11 s, so 15 fits, and Anvil will
+  ; stop it for you afterwards.
+
+  PrintNl()
+  UartWriteStr("=== pi4NeonLiar - stage 0 (the picture) and stage 0.5 (the wall) ===")
+  PrintNl()
+  UartWriteStr("Two things on the screen are deliberately wrong. See the file header:")
+  PrintNl()
+  UartWriteStr("  LIE 1  every glow and every hover is FULLY OPAQUE - display.pi4 has")
+  PrintNl()
+  UartWriteStr("         no blend, so Neon_Glow's four 2-7% boxes land at full strength.")
+  PrintNl()
+  UartWriteStr("  LIE 2  every glyph is 8 pixels wide - the built-in font is fixed width,")
+  PrintNl()
+  UartWriteStr("         the engine's is proportional and antialiased.")
+  PrintNl()
+  UartWriteStr("Neither is a defect. Do not report them.")
+  PrintNl()
+  PrintNl()
+
+  ; ---- 1. bring the surface up ---------------------------------------
+  UartWriteStr("-- 1. the surface")
+  PrintNl()
+
+  If MailboxInit() = 0
+    UartWriteStr("!! MailboxInit failed, MailboxError ")
+    PrintDec(MailboxError())
+    PrintNl()
+    UartWriteStr("   Nothing below this line can run. This is a transport failure,")
+    PrintNl()
+    UartWriteStr("   not a graphics one.")
+    PrintNl()
+    UartDrain()
+    NlMmuOff()
+    ProcedureReturn 1
+  EndIf
+
+  DisplayStandardTags()
+  rc = DisplayInit(1920, 1080, 32)
+  If DisplayReady() = 0
+    UartWriteStr("!! DisplayInit returned ")
+    PrintDec(rc)
+    UartWriteStr(", DisplayLastError ")
+    PrintDec(DisplayLastError())
+    UartWriteStr(", MailboxError ")
+    PrintDec(MailboxError())
+    PrintNl()
+    UartWriteStr("   display.pi4:916-957 names every one of those codes. The usual")
+    PrintNl()
+    UartWriteStr("   cause is no HDMI display connected when the board powered on -")
+    PrintNl()
+    UartWriteStr("   the firmware only looks for one at boot.")
+    PrintNl()
+    UartDrain()
+    NlMmuOff()
+    ProcedureReturn 2
+  EndIf
+
+  ; RED AND BLUE, ASKED RATHER THAN ASSUMED - anvil.pi4:3211-3215 does
+  ; exactly this and its comment explains why the answer depends on how
+  ; the board booted. Tag $00040006 is GET_PIXEL_ORDER; 0 is BGR and 1
+  ; is RGB, from Datasheets/pi4/uboot/v2025.01_mbox.h:373-374.
+  order = -1
+  If MailboxBegin($00040006, 4, 4) <> 0
+    MailboxSetWord(0, 0)
+    If MailboxSend() <> 0
+      order = MailboxWord(0)
+    EndIf
+  EndIf
+  If order = 1
+    DisplayColourSwap(1)
+  Else
+    DisplayColourSwap(0)
+  EndIf
+
+  w     = DisplayWidth()
+  h     = DisplayHeight()
+  pitch = DisplayPitch()
+  bpp   = DisplayBytesPerPixel()
+  pixels = w * h
+
+  PutLabel("geometry           ")
+  PrintDec(w)
+  UartWriteStr(" x ")
+  PrintDec(h)
+  UartWriteStr(" x ")
+  PrintDec(DisplayDepth())
+  UartWriteStr(" bpp, pitch ")
+  PrintDec(pitch)
+  PrintNl()
+
+  PutLabel("framebuffer base   $")
+  PutHexN(DisplayBase(), 16)
+  UartWriteStr("   (compare Anvil's own - if they differ, the")
+  PrintNl()
+  PutLabel("                    second DisplayInit moved it and a screenshot will")
+  PrintNl()
+  PutLabel("                    show Anvil's console instead of this picture)")
+  PrintNl()
+
+  PutLabel("pixel order        ")
+  PrintDec(order)
+  UartWriteStr("   (0 = BGR, no swap wanted; 1 = RGB, swap applied; -1 = the")
+  PrintNl()
+  PutLabel("                    firmware would not say)")
+  PrintNl()
+
+  ; THE CLOCK IS ASKED FOR. The part boots at 600 MHz and reaches 1500
+  ; only when something raises it, so every cycles-per-byte figure below
+  ; would be wrong by a factor of 2.5 if the number were assumed. The
+  ; MEASURED rate is the honest one - it differs from the configured
+  ; rate whenever the governor has dropped the core.
+  hz = MailboxClockRateMeasured(3)
+  If hz < 1
+    hz = MailboxClockRate(3)
+  EndIf
+  PutLabel("ARM clock          ")
+  PrintDec(hz)
+  UartWriteStr(" Hz, measured through the mailbox, not assumed")
+  PrintNl()
+
+  If bpp <> 4
+    UartWriteStr("!! this surface is not 32bpp. The blend passes below read and write")
+    PrintNl()
+    UartWriteStr("   32-bit pixels directly and would corrupt a 16bpp surface, so they")
+    PrintNl()
+    UartWriteStr("   are being skipped. The picture will still be drawn.")
+    PrintNl()
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  ; AUTO-FLUSH OFF for everything that follows. display.pi4:463-464
+  ; documents this exact escape. The flush is then measured on its own
+  ; and the surface is flushed once at the very end.
+  DisplayAutoFlush(0)
+
+  ; THE PALETTE IS BUILT HERE, not just before the picture, and the
+  ; reason is a bug that was in this file for an hour: pass 1 clears the
+  ; surface to cBg, and cBg was still zero at that point, so the
+  ; fill-rate pass painted the screen BLACK while a comment two lines
+  ; away said it was clearing to the Neon ground. The timing would have
+  ; been right and the sentence describing it wrong, which is the worst
+  ; combination. DisplayRGB is trustworthy from the moment the colour
+  ; order is settled, which is the line above, so this belongs here.
+  NlPalette()
+
+  src = DisplayRGB(90, 189, 208)             ; the accent, as a wash
+
+  ; ==================================================================
+  ;  2. THE FOUR PASSES
+  ;
+  ;  Each is probed over eight rows first and the full-surface cost
+  ;  extrapolated, because nothing on this disk has ever measured
+  ;  uncached memory on this board and a diagnostic that disappears
+  ;  into the deadman having printed nothing is worth nothing.
+  ; ==================================================================
+  probeRows = 8
+
+  UartWriteStr("-- 2. STAGE 0.5, pass 1 of 4: DisplayClear, opaque stores only")
+  PrintNl()
+  PutLabel("through DspRowFill32's unrolled wide-store loop, display.pi4:2414-2455")
+  PrintNl()
+  probeUs = NlPassClear(probeRows, cBg)
+  estUs = (probeUs * h) / probeRows
+  PutLabel("probe, 8 rows      ")
+  PrintDec(probeUs)
+  UartWriteStr(" us  -> full surface estimated at ")
+  PutMs(estUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  UartDrain()
+  clearUs = 0
+  If estUs < 5000000
+    clearUs = NlPassClear(h, cBg)
+    NlReport(clearUs, pixels, pixels * 4, hz)
+  Else
+    PutLabel("FULL PASS SKIPPED - the estimate above is over five seconds. The")
+    PrintNl()
+    PutLabel("probe is the answer; treat the estimate as the number.")
+    PrintNl()
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  UartWriteStr("-- 3. STAGE 0.5, pass 2 of 4: read every pixel, write nothing")
+  PrintNl()
+  PutLabel("not in the plan. It is here because it is the only way to tell a")
+  PrintNl()
+  PutLabel("read-bound wall from a write-bound one, and the blend does both.")
+  PrintNl()
+  probeUs = NlPassRead(probeRows)
+  estUs = (probeUs * h) / probeRows
+  PutLabel("probe, 8 rows      ")
+  PrintDec(probeUs)
+  UartWriteStr(" us  -> full surface estimated at ")
+  PutMs(estUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  UartDrain()
+  readUs = 0
+  If estUs < 5000000
+    readUs = NlPassRead(h)
+    NlReport(readUs, pixels, pixels * 4, hz)
+    PutLabel("checksum           $")
+    PutHexN(nlReadAcc, 16)
+    UartWriteStr("   (printed so the loop cannot be argued away)")
+    PrintNl()
+  Else
+    PutLabel("FULL PASS SKIPPED - over five seconds estimated.")
+    PrintNl()
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  plainUs = 0
+  fusedUs = 0
+  If bpp = 4
+    UartWriteStr("-- 4. STAGE 0.5, pass 3 of 4: read-modify-write blend, written to be read")
+    PrintNl()
+    PutLabel("dst = (src*a + dst*(255-a)) >> 8 per channel, three locals per pixel")
+    PrintNl()
+    probeUs = NlPassBlendPlain(probeRows, src, 128)
+    estUs = (probeUs * h) / probeRows
+    PutLabel("probe, 8 rows      ")
+    PrintDec(probeUs)
+    UartWriteStr(" us  -> full surface estimated at ")
+    PutMs(estUs)
+    UartWriteStr(" ms")
+    PrintNl()
+    UartDrain()
+    If estUs < 5000000
+      plainUs = NlPassBlendPlain(h, src, 128)
+      ; TRAFFIC IS EIGHT BYTES A PIXEL HERE, not four: every pixel is
+      ; read and then written.
+      NlReport(plainUs, pixels, pixels * 8, hz)
+    Else
+      PutLabel("FULL PASS SKIPPED - over five seconds estimated.")
+      PrintNl()
+    EndIf
+    PrintNl()
+    UartDrain()
+
+    UartWriteStr("-- 5. STAGE 0.5, pass 4 of 4: the same blend, per-channel locals fused out")
+    PrintNl()
+    PutLabel("identical arithmetic. The gap between this and pass 3 is the cost of")
+    PrintNl()
+    PutLabel("this backend's statically-allocated locals - display.pi4:2372-2384.")
+    PrintNl()
+    probeUs = NlPassBlendFused(probeRows, src, 128)
+    estUs = (probeUs * h) / probeRows
+    PutLabel("probe, 8 rows      ")
+    PrintDec(probeUs)
+    UartWriteStr(" us  -> full surface estimated at ")
+    PutMs(estUs)
+    UartWriteStr(" ms")
+    PrintNl()
+    UartDrain()
+    If estUs < 5000000
+      fusedUs = NlPassBlendFused(h, src, 128)
+      NlReport(fusedUs, pixels, pixels * 8, hz)
+    Else
+      PutLabel("FULL PASS SKIPPED - over five seconds estimated.")
+      PrintNl()
+    EndIf
+    PrintNl()
+    UartDrain()
+  EndIf
+
+  ; ---- the fifth number: what the cache maintenance costs -------------
+  UartWriteStr("-- 6. the flush, on its own")
+  PrintNl()
+  PutLabel("DisplayFlush() is one dc cvac per 64 bytes plus one dsb sy. With the")
+  PrintNl()
+  PutLabel("MMU off it is architecturally a no-op, but it still executes. This is")
+  PrintNl()
+  PutLabel("the number that decides whether stage 1's GfxFlushRect can default on.")
+  PrintNl()
+  t0 = Micros()
+  DisplayFlush()
+  flushUs = Micros() - t0
+  PutLabel("elapsed            ")
+  PutMs(flushUs)
+  UartWriteStr(" ms  for ")
+  PrintDec((pitch * h) / 64)
+  UartWriteStr(" cache lines")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  ; ==================================================================
+  ;  7. THE VERDICT ON THE 25 ms QUESTION
+  ;
+  ;  Stated by the program rather than left to be divided out at the
+  ;  end of a long session. The BEST of the two blend passes is the one
+  ;  that counts: a compositor is allowed to be written well, and the
+  ;  question is whether the memory system can carry it, not whether
+  ;  the first draft could.
+  ; ==================================================================
+  UartWriteStr("-- 7. the verdict")
+  PrintNl()
+
+  ; THE SUMMARY, so the decomposition is on one screen. Four passes over
+  ; the same surface: stores only, loads only, then both plus arithmetic
+  ; twice. Whichever of these dominates is the thing to attack, and the
+  ; whole reason there are four rather than the plan's two.
+  PutLabel("pass 1  clear, stores only      ")
+  PutMs(clearUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  PutLabel("pass 2  read, loads only        ")
+  PutMs(readUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  PutLabel("pass 3  blend, three locals     ")
+  PutMs(plainUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  PutLabel("pass 4  blend, locals fused out ")
+  PutMs(fusedUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  PutLabel("        whole-surface flush     ")
+  PutMs(flushUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  PutLabel("A zero above means that pass was skipped as too slow to run in full;")
+  PrintNl()
+  PutLabel("its eight-row probe and extrapolation are printed in its own section.")
+  PrintNl()
+  PrintNl()
+
+  ; The BEST of the two blend passes is the one the verdict uses: a
+  ; compositor is allowed to be written well, and the question is
+  ; whether the memory system can carry it, not whether a first draft
+  ; could. Start from whichever actually ran - an earlier version
+  ; started from plainUs unconditionally and would have reported "no
+  ; blend number" in the case where pass 3 was skipped and pass 4 ran.
+  bestUs = plainUs
+  If bestUs < 1
+    bestUs = fusedUs
+  EndIf
+  If fusedUs > 0 And fusedUs < bestUs
+    bestUs = fusedUs
+  EndIf
+
+  If bestUs < 1
+    PutLabel("NO BLEND NUMBER. Either the surface is not 32bpp or the full pass was")
+    PrintNl()
+    PutLabel("skipped as too slow. In the skipped case the estimate above IS the")
+    PrintNl()
+    PutLabel("answer and it is far worse than 25 ms, so read it as MMU FIRST.")
+    PrintNl()
+  ElseIf bestUs > 25000
+    PutLabel("OVER BUDGET. The best full-surface blend is ")
+    PutMs(bestUs)
+    UartWriteStr(" ms against a 25 ms")
+    PrintNl()
+    PutLabel("budget. A 1920x1080 alpha-composited UI is NOT reachable in this")
+    PrintNl()
+    PutLabel("memory configuration WITH THE MMU OFF. Per the plan's stage 0.5,")
+    PrintNl()
+    PutLabel("the MMU work moves ahead of everything else - and that is now a")
+    PrintNl()
+    PutLabel("SMALL step, not a research project: MMU stage 1 passed on this")
+    PrintNl()
+    PutLabel("board on 2026-08-26, SCTLR_EL2 $30C50830 -> $30C50831 -> $30C50830")
+    PrintNl()
+    PutLabel("with the console alive throughout. So the next move is to map DRAM")
+    PrintNl()
+    PutLabel("Normal Cacheable and RE-RUN THIS EXACT PROGRAM. These numbers are")
+    PrintNl()
+    PutLabel("the before half of a before-and-after worth one afternoon.")
+    PrintNl()
+    PutLabel("Before concluding it is memory at all, compare passes 3 and 4. If 4")
+    PrintNl()
+    PutLabel("is far better than 3, a large part of this is the calling convention")
+    PrintNl()
+    PutLabel("and not the DRAM, and the inner loop is the cheaper fix of the two.")
+    PrintNl()
+  Else
+    PutLabel("WITHIN BUDGET. The best full-surface blend is ")
+    PutMs(bestUs)
+    UartWriteStr(" ms against a")
+    PrintNl()
+    PutLabel("25 ms budget. A full-screen alpha composite is reachable WITH THE")
+    PrintNl()
+    PutLabel("MMU OFF, so the plan's stage 1 proceeds as written and the MMU does")
+    PrintNl()
+    PutLabel("not have to jump the queue on graphics grounds.")
+    PrintNl()
+    PutLabel("Two cautions before celebrating. This is ONE full-surface wash and a")
+    PrintNl()
+    PutLabel("real frame has overdraw - GlUIChrome.pbi:323-328 puts four nested")
+    PrintNl()
+    PutLabel("boxes behind every hovered surface - so divide the headroom by the")
+    PrintNl()
+    PutLabel("overdraw factor. And the 25 ms line is a 1920x1080 line; this")
+    PrintNl()
+    PutLabel("surface is smaller after overscan, so scale it before quoting it.")
+    PrintNl()
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  ; ==================================================================
+  ;  8. THE PICTURE
+  ;
+  ;  Last, so that it survives on the panel. The passes above have just
+  ;  washed the whole surface and would otherwise erase it.
+  ; ==================================================================
+  UartWriteStr("-- 8. STAGE 0, the picture")
+  PrintNl()
+
+  ; A SURFACE TOO SMALL FOR THE LAYOUT IS NO SURFACE, and refusing is
+  ; better than drawing a menu bar over a panel over a status bar and
+  ; letting somebody wonder which part is the bug. This is the same
+  ; refusal, for the same reason, that anvil.pi4:3155-3162 makes before
+  ; it will build a console. The stage 0.5 numbers above are unaffected
+  ; and stand on their own.
+  If w < 800 Or h < 600
+    UartWriteStr("!! the surface is ")
+    PrintDec(w)
+    UartWriteStr(" x ")
+    PrintDec(h)
+    UartWriteStr(", and this layout needs at least 800 x 600.")
+    PrintNl()
+    PutLabel("The picture is being skipped rather than drawn on top of itself.")
+    PrintNl()
+    PutLabel("The four passes above are still valid - they do not care about")
+    PrintNl()
+    PutLabel("the shape of the surface, only its size in pixels.")
+    PrintNl()
+    PutLabel("Sections 9 and 10 go with the picture and are skipped too - both")
+    PrintNl()
+    PutLabel("of them repaint this layout and neither means anything without it.")
+    PrintNl()
+    UartDrain()
+    NlMmuOff()
+    ProcedureReturn 0
+  EndIf
+
+  ; THE DAMAGE LAYER IS BOUND TO THE SURFACE, not to the display: it
+  ; takes two numbers and knows nothing about a framebuffer. This is
+  ; the seam the port plan's section 8.3 asks for, and it is the reason
+  ; the same tracker will sit unchanged on top of a DMA blitter.
+  If DamageBind(w, h) <> #DMG_OK
+    UartWriteStr("!! DamageBind refused with ")
+    PrintDec(DamageLastError())
+    UartWriteStr(" - the damage sections below are skipped.")
+    PrintNl()
+  EndIf
+
+  ; The full paint, INCLUDING its whole-surface flush, so that it is
+  ; the same kind of number as the damaged frames below. The flush is
+  ; the escape display.pi4 documents at :463-464 and the reason
+  ; auto-flush was turned off at the top rather than left on.
+  fullUs = NlPaintFull()
+  fullPixels = nlPixels
+  fullFills = nlFills
+
+  PutLabel("drawn in           ")
+  PutMs(fullUs)
+  UartWriteStr(" ms, including one whole-surface flush")
+  PrintNl()
+  PutLabel("pixels touched     ")
+  PrintDec(fullPixels)
+  UartWriteStr("   (overdraw: the surface is ")
+  PrintDec(pixels)
+  UartWriteStr(" px)")
+  PrintNl()
+
+  ; THE COUNTERS ARE THE PROOF OF SECTION 1.1. Two primitives and a
+  ; scissor, and the numbers say whether that was true of this screen.
+  PutLabel("DisplayFillRect    ")
+  PrintDec(nlFills)
+  UartWriteStr("   <- every box, frame, glow, panel, check mark")
+  PrintNl()
+  PutLabel("DisplayTextClear   ")
+  PrintDec(nlTexts)
+  UartWriteStr("   <- unclipped strings, one call each")
+  PrintNl()
+  PutLabel("DisplayCharClear   ")
+  PrintDec(nlGlyphs)
+  UartWriteStr("   <- clipped strings, one call per glyph")
+  PrintNl()
+  PutLabel("any other draw     0   <- there is no third primitive in this file")
+  PrintNl()
+  PrintNl()
+
+  PutLabel("boxes narrowed by the clip   ")
+  PrintDec(nlNarrowed)
+  PrintNl()
+  PutLabel("boxes removed by the clip    ")
+  PrintDec(nlDropped)
+  PrintNl()
+  PutLabel("glyph cells removed by clip  ")
+  PrintDec(nlGlyphsCut)
+  PrintNl()
+  PutLabel("If those three are all zero the scissor proved nothing and the list")
+  PrintNl()
+  PutLabel("is not actually overflowing its well. That would be a defect.")
+  PrintNl()
+  PrintNl()
+
+  ; ==================================================================
+  ;  9. STAGE 0.6 - THE SAME SCREEN, ONE WIDGET AT A TIME
+  ;
+  ;  The picture above cost a full redraw. A real UI does not redraw a
+  ;  screen when a caret blinks, and this section is the measurement of
+  ;  how much that is worth on this hardware.
+  ;
+  ;  EVERY FRAME BELOW WALKS THE WHOLE WIDGET TREE. Nothing is skipped
+  ;  at the application level - the menu bar, the list, the panels and
+  ;  the status bar are all visited, exactly as they were for the full
+  ;  paint. The only difference is that each primitive asks the damage
+  ;  list whether it is inside anything that changed. So the numbers
+  ;  below include the cost of deciding not to draw, which is the
+  ;  honest way to measure this: a driver that knew in advance which
+  ;  widgets to visit would be measuring a different design.
+  ; ==================================================================
+  PrintNl()
+  UartWriteStr("-- 9. STAGE 0.6, damage-limited repaints of the same screen")
+  PrintNl()
+  PutLabel("the tree is walked in full every time. Only the primitives change.")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  ; ---- 9a. a caret blink --------------------------------------------
+  DamageReset()
+  NlEventCaret()
+  caretUs = NlPaintDamaged()
+  caretPx = nlPixels
+  PutLabel("9a CARET BLINK     ")
+  PutMs(caretUs)
+  UartWriteStr(" ms   ")
+  PrintDec(DamageCount())
+  UartWriteStr(" rect, ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px damaged, ")
+  PrintDec(caretPx)
+  UartWriteStr(" px painted")
+  PrintNl()
+  PutLabel("                   ")
+  PrintDec(nlFills)
+  UartWriteStr(" fills and ")
+  PrintDec(nlGlyphs)
+  UartWriteStr(" glyphs drawn; ")
+  PrintDec(nlDmgSkipped)
+  UartWriteStr(" primitives rejected by the damage list")
+  PrintNl()
+  UartDrain()
+
+  ; ---- 9b. a hover moving between two buttons -----------------------
+  DamageReset()
+  NlEventHover(0)
+  hoverUs = NlPaintDamaged()
+  hoverPx = nlPixels
+  PutLabel("9b HOVER MOVES     ")
+  PutMs(hoverUs)
+  UartWriteStr(" ms   ")
+  PrintDec(DamageCount())
+  UartWriteStr(" rects, ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px damaged, ")
+  PrintDec(hoverPx)
+  UartWriteStr(" px painted")
+  PrintNl()
+  PutLabel("                   two rectangles: the button losing the glow and the")
+  PrintNl()
+  PutLabel("                   one gaining it. If this says one, they were merged")
+  PrintNl()
+  PutLabel("                   and the slack is set too high for this layout.")
+  PrintNl()
+  UartDrain()
+
+  ; ---- 9c. a list scrolled by one row -------------------------------
+  DamageReset()
+  NlEventScroll(1)
+  scrollUs = NlPaintDamaged()
+  scrollPx = nlPixels
+  PutLabel("9c LIST SCROLL     ")
+  PutMs(scrollUs)
+  UartWriteStr(" ms   ")
+  PrintDec(DamageCount())
+  UartWriteStr(" rect, ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px damaged, ")
+  PrintDec(scrollPx)
+  UartWriteStr(" px painted")
+  PrintNl()
+  PutLabel("                   the whole well, because every row moved. This is")
+  PrintNl()
+  PutLabel("                   the WORST case for a damage layer and it is still")
+  PrintNl()
+  PutLabel("                   the honest one - see NlEventScroll on why the")
+  PrintNl()
+  PutLabel("                   scroll-by-copy trick is deliberately not used.")
+  PrintNl()
+  UartDrain()
+
+  ; ---- 9d. all three at once ----------------------------------------
+  ; THE BUSIEST FRAME A REAL UI HAS: the pointer moves off one button
+  ; and onto another while a caret blinks and a list scrolls under the
+  ; wheel. Three unrelated regions. The count is the coalescer's answer
+  ; and the area is what it costs.
+  DamageReset()
+  NlEventCaret()
+  NlEventHover(3)
+  NlEventScroll(-1)
+  mixedUs = NlPaintDamaged()
+  mixedPx = nlPixels
+  PutLabel("9d ALL THREE       ")
+  PutMs(mixedUs)
+  UartWriteStr(" ms   ")
+  PrintDec(DamageCount())
+  UartWriteStr(" rects, ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px damaged, ")
+  PrintDec(mixedPx)
+  UartWriteStr(" px painted")
+  PrintNl()
+  PutLabel("                   bounding box would be ")
+  PrintDec(DamageBoundsW() * DamageBoundsH())
+  UartWriteStr(" px - which is what a")
+  PrintNl()
+  PutLabel("                   tracker without a cost model would have repainted.")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  ; ---- 9e. the fast frame must be the RIGHT frame -------------------
+  ; See the long note above NlSnapshot. This is the check that makes
+  ; the numbers above worth quoting.
+  If bpp = 4
+    PrintNl()
+    PutLabel("9e IDENTITY CHECK - is the damaged frame the same picture as a")
+    PrintNl()
+    PutLabel("   full redraw of the same state? Every pixel is compared.")
+    PrintNl()
+
+    ; state B, in full, kept in the shadow as the reference
+    nlHoverBtn = 1
+    NlPaintFull()
+    snapUs = NlSnapshot(#NL_SHADOW, pitch, DisplayBase(), pitch, w, h)
+
+    ; state A, in full, over the top
+    nlHoverBtn = 3
+    NlPaintFull()
+
+    ; A -> B by the event, damage-limited. Its own variable, because
+    ; the ratio section below still needs 9b's number and an earlier
+    ; draft quietly overwrote it here - which would have reported the
+    ; identity check's timing as though it were the hover frame's.
+    DamageReset()
+    NlEventHover(1)
+    idHoverUs = NlPaintDamaged()
+
+    diffCount = NlDiff(DisplayBase(), pitch, #NL_SHADOW, pitch, w, h)
+    PutLabel("   the reference snapshot took ")
+    PutMs(snapUs)
+    UartWriteStr(" ms; the compare is a full read pass")
+    PrintNl()
+    PutLabel("   pixels differing from the full redraw   ")
+    PrintDec(diffCount)
+    PrintNl()
+    If diffCount = 0
+      PutLabel("   IDENTICAL. The damage-limited repaint produced exactly the")
+      PrintNl()
+      PutLabel("   picture the full repaint produces, in ")
+      PutMs(idHoverUs)
+      UartWriteStr(" ms instead of ")
+      PutMs(fullUs)
+      UartWriteStr(" ms.")
+      PrintNl()
+      PutLabel("   That is the deliverable, and it is now proven rather than")
+      PrintNl()
+      PutLabel("   photographed.")
+      PrintNl()
+    Else
+      PutLabel("   ** THE DAMAGED FRAME IS NOT THE FULL FRAME. ** First difference")
+      PrintNl()
+      PutLabel("   at x ")
+      PrintDec(nlDiffX)
+      UartWriteStr(", y ")
+      PrintDec(nlDiffY)
+      PrintNl()
+      PutLabel("   Some event under-reported what it would repaint. A small count")
+      PrintNl()
+      PutLabel("   means an edge - most likely Neon_Glow's four-pixel ring, which")
+      PrintNl()
+      PutLabel("   NlDamageButton exists to include. A large count means a whole")
+      PrintNl()
+      PutLabel("   widget was missed. DO NOT QUOTE THE TIMINGS ABOVE until this")
+      PrintNl()
+      PutLabel("   reads zero: they are the cost of drawing the wrong picture.")
+      PrintNl()
+    EndIf
+    PrintNl()
+    UartDrain()
+  EndIf
+
+  ; ---- the ratio, stated -------------------------------------------
+  PutLabel("full repaint       ")
+  PutMs(fullUs)
+  UartWriteStr(" ms, ")
+  PrintDec(fullPixels)
+  UartWriteStr(" px painted, ")
+  PrintDec(fullFills)
+  UartWriteStr(" fills")
+  PrintNl()
+  If caretUs > 0
+    PutLabel("caret is faster by ")
+    PrintDec(fullUs / caretUs)
+    UartWriteStr("x")
+    PrintNl()
+  Else
+    PutLabel("the caret frame was too fast for the microsecond counter to see,")
+    PrintNl()
+    PutLabel("which is itself the answer: it is under one microsecond.")
+    PrintNl()
+  EndIf
+  If hoverUs > 0
+    PutLabel("hover is faster by ")
+    PrintDec(fullUs / hoverUs)
+    UartWriteStr("x")
+    PrintNl()
+  EndIf
+  If scrollUs > 0
+    PutLabel("scroll is faster by ")
+    PrintDec(fullUs / scrollUs)
+    UartWriteStr("x")
+    PrintNl()
+  EndIf
+  PutLabel("THE FLOOR IS THE TRAVERSAL, NOT THE PIXELS. A frame that paints")
+  PrintNl()
+  PutLabel("almost nothing still walks the tree and still asks the damage list")
+  PrintNl()
+  PutLabel("about every primitive. Whatever the caret frame costs above is")
+  PrintNl()
+  PutLabel("very nearly that floor, and no smaller change can beat it. If it")
+  PrintNl()
+  PutLabel("is a large fraction of the frame budget, the next move is a")
+  PrintNl()
+  PutLabel("retained widget tree, NOT a better damage rule.")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  ; ==================================================================
+  ;  10. THE SHADOW-BUFFER QUESTION
+  ;
+  ;  One pair of numbers decides it. See the long note above
+  ;  NlPassStore for why this is the experiment and not another.
+  ; ==================================================================
+  UartWriteStr("-- 10. shadow buffer, or straight into the live framebuffer?")
+  PrintNl()
+
+  If bpp <> 4
+    PutLabel("skipped - this surface is not 32bpp.")
+    PrintNl()
+  Else
+    ; A quarter of the surface, so the whole section is fast even if
+    ; the framebuffer turns out to be as slow as stage 0.5 says. The
+    ; two destinations get IDENTICAL geometry, which is the only thing
+    ; that makes them comparable.
+    shadowRows = h / 4
+    If shadowRows < 1
+      shadowRows = 1
+    EndIf
+
+    fbUs   = NlPassStore(DisplayBase(), pitch, w, shadowRows, cBg)
+    dramUs = NlPassStore(#NL_SHADOW,    pitch, w, shadowRows, cBg)
+
+    PutLabel("the SAME store loop, ")
+    PrintDec(shadowRows)
+    UartWriteStr(" rows of ")
+    PrintDec(w)
+    UartWriteStr(" pixels, two destinations:")
+    PrintNl()
+    PutLabel("  into the framebuffer   ")
+    PutMs(fbUs)
+    UartWriteStr(" ms")
+    PrintNl()
+    PutLabel("  into plain DRAM        ")
+    PutMs(dramUs)
+    UartWriteStr(" ms   ($01000000, inside Anvil's low payload window)")
+    PrintNl()
+
+    If dramUs > 0
+      PutLabel("  ratio                 ")
+      PutFix2((fbUs * 100) / dramUs)
+      UartWriteStr("x")
+      PrintNl()
+    EndIf
+
+    ; The presentation step: one damaged rectangle out of the shadow
+    ; and into the framebuffer. Sized as the hover frame's damage,
+    ; because that is the rectangle a real UI would actually be
+    ; copying.
+    copyUs = NlPassCopy(DisplayBase(), pitch, #NL_SHADOW, pitch, 0, 0, nlBtnW + 8, nlBtnH + 8)
+    PutLabel("  a hover-sized damaged copy, ")
+    PrintDec(nlBtnW + 8)
+    UartWriteStr(" x ")
+    PrintDec(nlBtnH + 8)
+    UartWriteStr(": ")
+    PutMs(copyUs)
+    UartWriteStr(" ms")
+    PrintNl()
+    PrintNl()
+
+    ; THE VERDICT, COMPUTED. The threshold is 2x and the reasoning is
+    ; arithmetic rather than taste: a shadow strategy writes every
+    ; pixel once into DRAM and then copies it once into the
+    ; framebuffer, so it pays one DRAM write plus one DRAM read plus
+    ; one framebuffer write against the direct strategy's one
+    ; framebuffer write. It can only win if a framebuffer write is
+    ; expensive enough to dominate all three, and the crossover is
+    ; around twice - below that the extra traffic eats the saving.
+    If dramUs < 1
+      PutLabel("VERDICT: the DRAM pass was too fast to time at this size. Re-run")
+      PrintNl()
+      PutLabel("with more rows before drawing a conclusion from it.")
+      PrintNl()
+    ElseIf fbUs > (dramUs * 2)
+      PutLabel("VERDICT: SHADOW-BUFFER. A store into the framebuffer costs more")
+      PrintNl()
+      PutLabel("than twice what the identical store into DRAM costs, so the")
+      PrintNl()
+      PutLabel("framebuffer - not the compositor and not the arithmetic - is the")
+      PrintNl()
+      PutLabel("wall. Compose into the shadow at DRAM speed and copy out only")
+      PrintNl()
+      PutLabel("the damaged rectangles. Note what makes that affordable: the")
+      PrintNl()
+      PutLabel("copy is proportional to the DAMAGE, so the shadow buffer and the")
+      PrintNl()
+      PutLabel("damage layer are one decision, not two.")
+      PrintNl()
+    Else
+      PutLabel("VERDICT: NO SHADOW BUFFER. The framebuffer is not meaningfully")
+      PrintNl()
+      PutLabel("slower than DRAM, so a shadow would add a second write and a")
+      PrintNl()
+      PutLabel("read to save nothing. Repaint the damage straight into the live")
+      PrintNl()
+      PutLabel("framebuffer.")
+      PrintNl()
+      PutLabel("AND TEARING IS NOT A REASON TO RECONSIDER AT THESE RATES. A")
+      PrintNl()
+      PutLabel("frame that repaints a caret in microseconds cannot be caught")
+      PrintNl()
+      PutLabel("half-drawn by a 60 Hz scan-out in any way a person could see;")
+      PrintNl()
+      PutLabel("the full repaint CAN be, and takes hundreds of milliseconds, so")
+      PrintNl()
+      PutLabel("it would tear with or without a shadow. Tearing becomes a real")
+      PrintNl()
+      PutLabel("question only once a frame is both large and fast, which is")
+      PrintNl()
+      PutLabel("exactly the state this hardware is not in.")
+      PrintNl()
+    EndIf
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  ; The screen is left holding the damaged frames' state, which is a
+  ; slightly different picture from the one described in the header -
+  ; button 3 hovered again, the caret blinked twice, the list scrolled
+  ; down and back. Section 10 then washed the top quarter of it with
+  ; the ground colour. So the panel is repainted one last time, in
+  ; full, and flushed, and what the camera sees is the stage 0 picture
+  ; the header describes.
+  ;
+  ; MEASURING FIRST AND DRAWING LAST IS THE HOUSE ORDER HERE and it is
+  ; the reason this line exists rather than a note apologising for a
+  ; quarter-blanked screen.
+  fullUs = NlPaintFull()
+  PutLabel("the panel repainted in full one last time, ")
+  PutMs(fullUs)
+  UartWriteStr(" ms")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  UartWriteStr("Look at the panel now. Anvil is about to print two or three lines of")
+  PrintNl()
+  UartWriteStr("its own over the top of the picture - that is Anvil, not this program.")
+  PrintNl()
+  UartWriteStr("Then: python tools/pmfshot.py COM7 liar.png")
+  PrintNl()
+  UartDrain()
+
+  ; Hand Anvil back the address space it thinks it has. The same call
+  ; now guards the three failure exits above - see NlMmuOff.
+  NlMmuOff()
+
+  ProcedureReturn 0
+EndProcedure

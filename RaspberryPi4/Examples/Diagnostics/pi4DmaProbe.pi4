@@ -1,0 +1,1739 @@
+; pi4DmaProbe.pi4 - STAGE 1 of getting pixels moved by hardware.
+;
+; It answers one question with a number: IS THE SoC'S 2D DMA BLITTER
+; FASTER THAN THE CPU AT FILLING THIS SURFACE, AND BY HOW MUCH?
+;
+; The number to beat was measured on this board on 2026-08-26 by
+; RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4NeonLiar.pi4:
+;
+;                           MMU off      MMU on, DRAM cacheable
+;       clear, stores only  356.9 ms          266.4 ms
+;
+; against a 25 ms frame budget. This program runs THE SAME FILL through
+; display.pi4's CPU loop and through RaspberryPi4/Lib/dma.pi4's
+; hardware path, in one run, back to back, on the same surface, and
+; prints both. Nothing here is compared across sessions.
+;
+;   PureMetalForge.exe --compile RaspberryPi4\Examples\Diagnostics\pi4DmaProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o _work\dmaprobe.img
+;
+; DIAGNOSTIC. Does not ship. It adds nothing under Lib/ and changes
+; nothing that does.
+;
+; ======================================================================
+; WHAT TO RUN, AND WHAT EACH OUTCOME MEANS
+; ======================================================================
+; Reset the board, bring the screen up fresh, then run this. Anvil will
+; stamp two or three lines of its own over the picture when the payload
+; returns - that is Anvil, not this program, and pi4NeonLiar.pi4's
+; header explains why nothing here can prevent it.
+;
+; THE SECTIONS COME IN THE ORDER THAT MAKES A FAILURE READABLE, and the
+; order is the whole design of this program: nothing is aimed at the
+; framebuffer until every property it depends on has been proved in a
+; 64 KiB sandbox.
+;
+;   1. THE CONTROLLER. What the ENABLE register says, which channels
+;      the device tree offers, which channels the FIRMWARE offers, and
+;      whether the chosen channel is a full engine or a LITE one.
+;
+;      IF THE PAGE FIELD IS NOT ZERO, stop. Every address this program
+;      computes is wrong by one or more gigabytes and nothing below is
+;      meaningful. See dma.pi4's HAZARD 1.
+;
+;   2. THE YLENGTH CALIBRATION. The one thing the vendor PDF leaves
+;      ambiguous for this engine. The probe writes nothing; it counts
+;      rows out of the engine's own SOURCE_AD register.
+;
+;      IF THE ADVANCE IS 4, YLENGTH is a plain row count.
+;      IF IT IS 8, YLENGTH is rows minus one.
+;      IF IT IS 65540, TDMODE was ignored and the channel is behaving
+;        like a LITE engine, which should be impossible on 0/2/4/5/6.
+;      WRITE THE ANSWER DOWN. From then on a program can state it with
+;      DmaSetYLengthBias() and skip the probe entirely.
+;
+;   3. CORRECTNESS, IN A SANDBOX. Six tests over 64 KiB of scratch, all
+;      verified byte by byte, all with the framebuffer untouched:
+;      the fill lands where it should and NOWHERE ELSE (which is the
+;      independent cross-check on the calibration), the stride skips
+;      the right gap, a rectangle copy is exact, an overlapping
+;      downward copy - the scroll case - is exact, and the two
+;      refusals that protect the board actually refuse.
+;
+;      IF ANY OF THESE FAIL, the timings below are meaningless and the
+;      screen section is skipped. Read the failing test's own line: it
+;      says which byte, what was there and what should have been.
+;
+;   4. THE TIMINGS. The fill, the blit, and the present, each done both
+;      ways on the same bytes.
+;
+;   4d. THE DISPLAY PATH ITSELF. Added 2026-08-27, when display.pi4
+;      gained an accelerated DisplayFillRect behind #DSP_DMA_LINKED.
+;      The same rectangle is drawn twice - engine off, then engine on -
+;      and the two are compared BYTE FOR BYTE over a window eight pixels
+;      larger on every side, so damage beside the rectangle counts.
+;
+;      IT ALSO ASKS DisplayDmaOps() WHETHER THE ENGINE RAN AT ALL, and
+;      that check comes first. Every accelerated primitive in
+;      display.pi4 falls back to the CPU when anything is uncertain, and
+;      a fallback draws the RIGHT PICTURE - so a green comparison with a
+;      zero transfer count means this section compared the CPU path
+;      against itself and proved nothing.
+;
+;      IT RUNS AFTER EVERY TIMING, because 4a and 4b use DisplayFillRect
+;      and DisplayBlit as the CPU reference and would be meaningless if
+;      those had gone through the engine. DisplayUseDma() is off by
+;      default and 4d is the first thing here that turns it on.
+;
+;   5. THE PICTURE. Colour bars drawn entirely by the DMA engine, with
+;      one line of text from display.pi4 so the two can be seen
+;      cohabiting. If the bars are there and are the right colours, the
+;      hardware path is not merely fast, it is right.
+;
+; ======================================================================
+; THE THREE THINGS THAT WOULD MAKE THIS LIE
+; ======================================================================
+;
+;   * MEASURING THE CACHE FLUSH AS PART OF THE CPU'S FILL. display.pi4
+;     auto-flushes after every primitive (display.pi4:2337-2343), which
+;     is one "dc cvac" per 64 bytes plus a barrier over the whole
+;     surface - about 130,000 cache maintenance operations that have
+;     nothing to do with how fast a store loop is. THE AUTO-FLUSH IS
+;     TURNED OFF around the timed CPU pass, exactly as pi4NeonLiar.pi4
+;     does at :1978, so that 266.4 ms is being compared with 266.4 ms.
+;
+;   * NOT MEASURING THE CACHE CLEAN AS PART OF THE DMA'S PRESENT. The
+;     mirror image, and it is the dishonest direction. A blit from a
+;     CPU-composed shadow buffer must clean that buffer out of the
+;     D-cache before the engine reads it, and with the MMU on that is
+;     129,600 lines over 8.29 MB. IT IS TIMED AND PRINTED SEPARATELY
+;     AND THEN ADDED IN, because a present that quotes only the DMA
+;     time is quoting half the bill. The FILL has no such cost - its
+;     source is thirty-two bytes - which is exactly why the fill is
+;     the honest headline and the present is not.
+;
+;   * A SURFACE THAT IS NOT 1920 x 1080. This board reports 1824 x 984
+;     after overscan on at least one configuration (damage.pi4's
+;     header records it), so every derived figure here is computed from
+;     DisplayWidth(), DisplayHeight() and DisplayPitch() as the
+;     firmware reported them, and the actual geometry is printed first.
+;     Do not compare a rate against a remembered one without checking
+;     that line.
+;
+; ======================================================================
+; MEMORY THIS PROGRAM USES, AND WHY EACH ADDRESS
+; ======================================================================
+;   $400000   this image. --load-addr.
+;   $480000   its BSS, 512 KiB above the load address
+;             (#A64_BSS_GAP in RaspberryPi4/A64Assembler.pbi).
+;   $600000   the MMU tables, 8 KiB, when #DP_MMU is 1. The same place
+;             pi4NeonLiar.pi4 puts them.
+;   $700000   the DMA scratch block, 512 bytes. 256-byte aligned and in
+;             the low gigabyte, which is what DmaSetScratch() insists
+;             on. It was 256 until 2026-08-26; the fill pattern inside
+;             it grew from 32 bytes to 256 when a bench run showed the
+;             engine reading past the end of it on a long row.
+;   $780000   the 64 KiB correctness sandbox. Everything in section 3
+;             happens in here and nowhere else.
+;   $1000000  the 8.29 MB shadow surface for the blit and present
+;             timings. Sixteen megabytes up, so it is clear of the
+;             image, clear of the sandbox, and far below the stack top
+;             at $3000000.
+;
+; EVERY ONE OF THOSE IS BELOW $40000000, which is the only address rule
+; the legacy DMA engines have and the one that fails silently.
+; RaspberryPi4/Lib/memory.pi4's map (:200-215) is where the windows
+; come from; the low payload window is $00400000..$07EFFFFF, so the
+; shadow at $1000000 plus 8.29 MB ends around $18D0000 and is well
+; inside it.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+; ----------------------------------------------------------------------
+; THE DMA SEAM IS ON IN THIS PROGRAM, AND dma.pi4 THEREFORE MOVES ABOVE
+; display.pi4.
+;
+; #DSP_DMA_LINKED = 1 makes display.pi4 compile its accelerated fill,
+; copy and scroll (display.pi4's THE DMA SEAM section). Those call
+; DmaFillPattern32, DmaCopy2D, DmaCopy, DmaCacheRect and DmaSetBounds,
+; and definition order is the convention in this dialect - there is not
+; one Declare anywhere in RaspberryPi4/Lib/ - so dma.pi4 has to be
+; parsed first. It used to sit last in this list, which was harmless
+; while nothing in display.pi4 named it.
+;
+; THE CONSTANT IS MANDATORY AND HAS NO DEFAULT. display.pi4 cannot
+; supply one: a default there and a different value here would be a hard
+; "Constant already defined" error, so the main file states it and the
+; library reads it. Same seam as x509.pico2's #X509_SIG_LINKED.
+; ----------------------------------------------------------------------
+#DSP_DMA_LINKED = 1
+
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+
+; ======================================================================
+;  CONFIGURATION
+; ======================================================================
+
+; 1 = build the identity map and run with DRAM Normal Write-Back
+; Cacheable, which is the configuration the 266.4 ms was measured in
+; and therefore the one the comparison has to be made in. 0 = the
+; uncached run, which is worth doing once because the DMA engine does
+; not care either way and the CPU does: with the caches off the CPU
+; number goes to 356.9 ms and the ratio gets FLATTERING. The honest
+; headline is the cached one.
+#DP_MMU = 1
+
+#DP_TABLES  = $600000
+#DP_SCRATCH = $700000
+#DP_SCRATCH_BYTES = 512
+#DP_SAND    = $780000
+#DP_SAND_BYTES = 65536
+#DP_SHADOW  = $1000000
+
+; ----------------------------------------------------------------------
+;  SECTION 4d's TWO CAPTURE BUFFERS. Added 2026-08-27 with the display
+;  path's A/B.
+;
+;  display.pi4 now routes DisplayFillRect through the engine when
+;  #DSP_DMA_LINKED is 1 and DisplayUseDma(1) has been called. That
+;  wiring has its own arithmetic - a clip, a pitch, a byte offset - and
+;  its own cache sequence, and NONE of it is what pi4DmaGate.pi4 tests:
+;  the gate has no framebuffer, no mailbox and no display.pi4 in its
+;  build at all. So the wiring has to be proved here, against the CPU
+;  path, on the surface it will actually run on.
+;
+;  TWO BUFFERS OF 64 KiB, one per pass, so the comparison is between two
+;  captured images rather than between an image and a remembered
+;  expectation. 128 x 128 pixels at 4 bytes is exactly 65536.
+;
+;  $790000 and $7A0000 sit above the sandbox at $780000 and well below
+;  the shadow at $1000000. They are the same two addresses
+;  pi4DmaGate.pi4 uses for its OUT and SRC buffers, which is a
+;  coincidence of both programs wanting scratch above $780000 and not a
+;  shared layout - the two never run at once.
+; ----------------------------------------------------------------------
+#DP_CAP_A   = $790000
+#DP_CAP_B   = $7A0000
+
+; The A/B rectangle, and the window captured around it.
+;
+; THE WINDOW IS EIGHT PIXELS LARGER ON EVERY SIDE AND THAT MARGIN IS THE
+; POINT. A wrong stride, a YLENGTH one too large or a burst that runs
+; past the end of a row does not corrupt the rectangle - it corrupts
+; what is NEXT to it, and a comparison that only looked at the rectangle
+; would pass every one of them. It is the same argument pi4DmaGate.pi4's
+; header makes for comparing whole buffers, applied to a surface that is
+; far too big to compare whole.
+#DP_AB_WINX = 56
+#DP_AB_WINY = 56
+#DP_AB_WINW = 128
+#DP_AB_WINH = 128
+#DP_AB_X    = 64
+#DP_AB_Y    = 64
+#DP_AB_W    = 112
+#DP_AB_H    = 112
+
+; ASCII codes used below. No character literals - house rule.
+#DP_SPACE = 32
+#DP_DOT   = 46
+#DP_ZERO  = 48
+#DP_ALPHA = 55                 ; the letter A, minus ten
+#DP_COLON = 58
+
+Global dpFails.i = 0
+Global dpChecks.i = 0
+Global dpSurfaceOk.i = 0
+
+
+; ======================================================================
+;  OUTPUT HELPERS
+;
+;  The same shapes pi4NeonLiar.pi4 uses (:376-425), for the same
+;  reasons: integer arithmetic only, because .f is refused outright by
+;  this backend and a software binary32 multiply costs 1751
+;  instructions (math.pi4:114-125), which is not a price a diagnostic
+;  should pay to print "1.40".
+; ======================================================================
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+EndProcedure
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(#DP_ZERO + n)
+    Else
+      UartWrite(#DP_ALPHA + n)
+    EndIf
+  Next
+EndProcedure
+
+; A value already multiplied by 100, printed with two decimal places.
+Procedure PutFix2(v100.i)
+  Define w.i
+  Define f.i
+  w = v100 / 100
+  f = v100 - (w * 100)
+  If f < 0
+    f = 0 - f
+  EndIf
+  PrintDec(w)
+  UartWrite(#DP_DOT)
+  UartWrite(#DP_ZERO + (f / 10))
+  UartWrite(#DP_ZERO + (f - ((f / 10) * 10)))
+EndProcedure
+
+; Microseconds printed as milliseconds with three places, which is the
+; unit the 25 ms decision and the 266.4 ms measurement are stated in.
+Procedure PutMs(us.i)
+  Define w.i
+  Define f.i
+  w = us / 1000
+  f = us - (w * 1000)
+  PrintDec(w)
+  UartWrite(#DP_DOT)
+  UartWrite(#DP_ZERO + (f / 100))
+  UartWrite(#DP_ZERO + ((f / 10) - ((f / 100) * 10)))
+  UartWrite(#DP_ZERO + (f - ((f / 10) * 10)))
+EndProcedure
+
+Procedure PutLabel(*s)
+  UartWriteStr("    ")
+  UartWriteStr(*s)
+EndProcedure
+
+; One pass/fail line. Every check in this program goes through here, so
+; the tally at the end cannot disagree with the lines above it.
+Procedure Chk(*name, got.i, want.i)
+  dpChecks = dpChecks + 1
+  If got = want
+    UartWriteStr("  ok    ")
+    UartWriteStr(*name)
+    PutNl()
+  Else
+    dpFails = dpFails + 1
+    UartWriteStr("  FAIL  ")
+    UartWriteStr(*name)
+    UartWriteStr("   got ")
+    PrintDec(got)
+    UartWriteStr(", wanted ")
+    PrintDec(want)
+    PutNl()
+  EndIf
+EndProcedure
+
+; The same, when the interesting part is a hex value.
+Procedure ChkHex(*name, got.i, want.i)
+  dpChecks = dpChecks + 1
+  If got = want
+    UartWriteStr("  ok    ")
+    UartWriteStr(*name)
+    PutNl()
+  Else
+    dpFails = dpFails + 1
+    UartWriteStr("  FAIL  ")
+    UartWriteStr(*name)
+    UartWriteStr("   got $")
+    PutHexN(got, 8)
+    UartWriteStr(", wanted $")
+    PutHexN(want, 8)
+    PutNl()
+  EndIf
+EndProcedure
+
+; When a check fails, say what the library thought was wrong. Reading
+; DmaErrorText() is almost always the whole diagnosis.
+Procedure PutDmaErr()
+  UartWriteStr("        ")
+  UartWriteStr(DmaErrorText())
+  PutNl()
+EndProcedure
+
+
+; ======================================================================
+;  SECTION 1 - THE CONTROLLER
+; ======================================================================
+
+; Print one channel's availability from each of the three sources that
+; have an opinion: the device tree, the firmware, and the silicon.
+Procedure DpChannelLine(ch.i, dtMask.i, fwMask.i)
+  Define en.i
+  UartWriteStr("    channel ")
+  If ch < 10
+    UartWrite(#DP_SPACE)
+  EndIf
+  PrintDec(ch)
+  UartWriteStr("   device tree ")
+  If ((dtMask >> ch) & 1) = 1
+    UartWriteStr("free ")
+  Else
+    UartWriteStr("HELD ")
+  EndIf
+  UartWriteStr("  firmware ")
+  If fwMask < 0
+    UartWriteStr("?    ")
+  Else
+    If ((fwMask >> ch) & 1) = 1
+      UartWriteStr("free ")
+    Else
+      UartWriteStr("HELD ")
+    EndIf
+  EndIf
+  en = DmaEnableRaw()
+  UartWriteStr("  ENABLE bit ")
+  If ((en >> ch) & 1) = 1
+    UartWriteStr("1")
+  Else
+    UartWriteStr("0")
+  EndIf
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DpAskFirmware - mailbox tag $00060001, GET_DMA_CHANNELS.
+;
+; The device tree at Datasheets/pi4/bcm2711.dtsi:106 says $07F5. That is
+; what a Linux kernel would be told; it is NOT a promise from the
+; firmware that is actually running underneath us right now. The
+; firmware will answer the question directly, and when the two disagree
+; the firmware is the one to believe - it is the party that would be
+; using the channel.
+;
+; Returns the mask, or -1 if the firmware would not answer. A -1 is not
+; a failure of anything: a bare-metal program has no right to expect
+; every property tag to exist, and the device-tree mask is a perfectly
+; good second source. It is printed as a question mark rather than
+; folded into a wrong answer.
+; ----------------------------------------------------------------------
+Procedure.i DpAskFirmware()
+  Define m.i
+  m = -1
+  If MailboxBegin($00060001, 4, 4) <> 0
+    MailboxSetWord(0, 0)
+    If MailboxSend() <> 0
+      m = MailboxWord(0) & $FFFFFFFF
+    EndIf
+  EndIf
+  ProcedureReturn m
+EndProcedure
+
+Procedure DpReportController()
+  Define en.i
+  Define page.i
+  Define pagelite.i
+  Define fw.i
+
+  PutS("-- 1. the DMA controller at $FE007000")
+  PutNl()
+
+  en       = DmaEnableRaw()
+  page     = (en >> 24) & $F
+  pagelite = (en >> 28) & $F
+
+  PutLabel("ENABLE (offset $FF0, so $FE007FF0)   $")
+  PutHexN(en, 8)
+  PutNl()
+
+  PutLabel("PAGE     (bits 27:24, the 1G window for DMA0-6)   ")
+  PrintDec(page)
+  PutNl()
+  PutLabel("PAGELITE (bits 31:28, the same for DMA7-10)       ")
+  PrintDec(pagelite)
+  PutNl()
+
+  ; THE CHECK THAT INVALIDATES EVERYTHING BELOW IT IF IT FAILS.
+  ; bcm2711-peripherals.txt:4994-5002. A non-zero PAGE means the
+  ; engines' one-gigabyte window has been moved, so every bus address
+  ; computed from an ARM physical address lands a gigabyte or more away
+  ; from where it was meant to. The reset value is zero and dma.pi4
+  ; never writes the field.
+  Chk("PAGE is zero - the 1G window is where every address here assumes", page, 0)
+  If page <> 0
+    PutS("        STOP. Nothing below this line means anything. Something on")
+    PutNl()
+    PutS("        this board has moved the window the 30-bit engines address.")
+    PutNl()
+  EndIf
+
+  fw = DpAskFirmware()
+  PutLabel("firmware GET_DMA_CHANNELS ($00060001)   ")
+  If fw < 0
+    PutS("no answer - using the device tree only")
+  Else
+    UartWrite(36)                        ; 36 is the dollar sign
+    PutHexN(fw, 4)
+  EndIf
+  PutNl()
+  PutLabel("device tree brcm,dma-channel-mask       $07F5   (bcm2711.dtsi:106)")
+  PutNl()
+  PutNl()
+
+  DpChannelLine(0, $07F5, fw)
+  DpChannelLine(2, $07F5, fw)
+  DpChannelLine(4, $07F5, fw)
+  DpChannelLine(5, $07F5, fw)
+  DpChannelLine(6, $07F5, fw)
+  PutNl()
+  PutS("    Channels 1 and 3 are the firmware's, 7-10 are LITE and have no 2D")
+  PutNl()
+  PutS("    mode at all, 11-14 are DMA4 with a different control block, 15 is")
+  PutNl()
+  PutS("    the VPU's. Only the five above are candidates.")
+  PutNl()
+  PutNl()
+EndProcedure
+
+
+; ======================================================================
+;  SECTION 3 - CORRECTNESS, IN A SANDBOX
+;
+;  Every test in this section writes only inside the 64 KiB at
+;  #DP_SAND, and DmaSetBounds() is pointed at exactly that region while
+;  they run, so a bug in the rectangle arithmetic here is refused by the
+;  library rather than delivered to the framebuffer.
+;
+;  THE CACHE DISCIPLINE IS EXPLICIT AND IT IS THE CALLER'S. dma.pi4
+;  cleans its own control block and its own pattern and nothing else,
+;  so every test below cleans what the CPU wrote before the engine
+;  reads it and invalidates what the engine wrote before the CPU reads
+;  it. With #DP_MMU = 0 those calls are architecturally no-ops and cost
+;  a few cycles a line; with #DP_MMU = 1 they are the difference
+;  between a test and a coin toss.
+; ======================================================================
+
+; Fill a span with a 32-bit word, using the CPU. PokeL, thirty-two bits
+; at a time, because a bare Poke is EIGHT bytes on this target and
+; would write two words per call.
+Procedure DpCpuFill(addr.i, bytes.i, value.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeL(addr + i, value & $FFFFFFFF)
+    i = i + 4
+  Wend
+EndProcedure
+
+; Count the 32-bit words in a span that are NOT the expected value.
+Procedure.i DpCountBad(addr.i, bytes.i, want.i)
+  Define i.i
+  Define bad.i
+  bad = 0
+  i = 0
+  While i < bytes
+    If (PeekN(addr + i) & $FFFFFFFF) <> (want & $FFFFFFFF)
+      bad = bad + 1
+    EndIf
+    i = i + 4
+  Wend
+  ProcedureReturn bad
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DpTestFill - the 2D fill, and the independent cross-check on the
+; YLENGTH calibration.
+;
+; A rectangle of 64 bytes on each of 4 rows, at a pitch of 256. Three
+; separate properties are checked and they fail in different ways:
+;
+;   THE RECTANGLE IS FILLED        - the transfer happened at all.
+;   THE GAP AFTER EACH ROW IS NOT  - the destination stride is being
+;                                    applied, and applied on top of the
+;                                    address the row left off at rather
+;                                    than instead of it.
+;   ROW 4 IS NOT                   - the row count is right. This is
+;                                    the cross-check on the bias that
+;                                    DmaCalibrate() derived from
+;                                    SOURCE_AD, and it is deliberately
+;                                    derived a completely different
+;                                    way: if the calibration were one
+;                                    out, four rows would have been
+;                                    asked for and five delivered, and
+;                                    this is the check that sees it.
+; ----------------------------------------------------------------------
+Procedure DpTestFill()
+  Define bad.i
+  Define r.i
+  Define rowbad.i
+
+  DpCpuFill(#DP_SAND, 8192, 0)
+  DmaCacheRange(#DP_SAND, 8192)
+
+  If DmaFillPattern32(#DP_SAND, 256, 64, 4, $A5A5A5A5) = 0
+    Chk("2D fill of 4 rows x 64 bytes at pitch 256", 0, 1)
+    PutDmaErr()
+    ProcedureReturn
+  EndIf
+  DmaCacheRange(#DP_SAND, 8192)
+
+  bad = 0
+  r = 0
+  While r < 4
+    bad = bad + DpCountBad(#DP_SAND + (r * 256), 64, $A5A5A5A5)
+    r = r + 1
+  Wend
+  Chk("the 4 x 64 rectangle is filled                (words wrong)", bad, 0)
+
+  bad = 0
+  r = 0
+  While r < 4
+    bad = bad + DpCountBad((#DP_SAND + (r * 256)) + 64, 192, 0)
+    r = r + 1
+  Wend
+  Chk("the 192-byte gap after each row is untouched  (words wrong)", bad, 0)
+
+  rowbad = DpCountBad(#DP_SAND + (4 * 256), 64, 0)
+  Chk("row 4 is untouched - the row count is exact   (words wrong)", rowbad, 0)
+  If rowbad <> 0
+    PutS("        The YLENGTH bias is one out. DmaYLengthBias() said ")
+    PrintDec(DmaYLengthBias())
+    PutS(", and a")
+    PutNl()
+    PutS("        fill therefore wrote one row too many. Nothing below is safe.")
+    PutNl()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DpTestCopy - a rectangle copy between two non-overlapping regions
+; with the same pitch, which is the sprite blit and the present.
+;
+; The source is filled with a DIFFERENT word per row, not one word
+; everywhere. A copy that got the source stride wrong, or that read the
+; same row four times, would pass a single-value test and fails this
+; one.
+; ----------------------------------------------------------------------
+Procedure DpTestCopy()
+  Define src.i
+  Define dst.i
+  Define r.i
+  Define bad.i
+
+  src = #DP_SAND + 16384
+  dst = #DP_SAND + 24576
+
+  r = 0
+  While r < 4
+    DpCpuFill(src + (r * 256), 64, $C0DE0000 + r)
+    r = r + 1
+  Wend
+  DpCpuFill(dst, 1024, 0)
+  DmaCacheRange(src, 1024)
+  DmaCacheRange(dst, 1024)
+
+  If DmaCopy2D(dst, 256, src, 256, 64, 4) = 0
+    Chk("2D copy of 4 rows x 64 bytes", 0, 1)
+    PutDmaErr()
+    ProcedureReturn
+  EndIf
+  DmaCacheRange(dst, 1024)
+
+  bad = 0
+  r = 0
+  While r < 4
+    bad = bad + DpCountBad(dst + (r * 256), 64, $C0DE0000 + r)
+    r = r + 1
+  Wend
+  Chk("every copied row carries its own value        (words wrong)", bad, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DpTestScroll - AN OVERLAPPING DOWNWARD COPY. This is the one test
+; here that checks an ASSUMPTION rather than a documented fact.
+;
+; dma.pi4 allows a copy whose destination starts BELOW its source, on
+; the reasoning that SRC_INC and DEST_INC both increment
+; (bcm2711-peripherals.txt:3327-3374) so each byte is read before the
+; write that would clobber it. The PDF states the increments; it does
+; not state that reads and writes retire in address order under
+; bursting, and it does not have to for the hardware to be correct.
+;
+; So it is tested. Eight contiguous 64-byte rows, each holding its own
+; index, copied up by one row. If the answer comes back sheared or
+; smeared, the library's overlap rule is wrong and the fix is to refuse
+; overlap in both directions and let the caller stage through a
+; temporary - which costs a second pass over the bytes, which is
+; exactly why the assumption was worth making and worth testing.
+; ----------------------------------------------------------------------
+Procedure DpTestScroll()
+  Define base.i
+  Define r.i
+  Define bad.i
+
+  base = #DP_SAND + 32768
+
+  r = 0
+  While r < 8
+    DpCpuFill(base + (r * 64), 64, $5000 + r)
+    r = r + 1
+  Wend
+  DmaCacheRange(base, 512)
+
+  ; Seven rows, from row 1 upward, landing on row 0. Contiguous, so the
+  ; pitch equals the row and both strides are zero - and it is still a
+  ; 2D transfer, because that is the path a real scroll would take.
+  If DmaCopy2D(base, 64, base + 64, 64, 64, 7) = 0
+    Chk("overlapping downward copy - the scroll case", 0, 1)
+    PutDmaErr()
+    ProcedureReturn
+  EndIf
+  DmaCacheRange(base, 512)
+
+  bad = 0
+  r = 0
+  While r < 7
+    bad = bad + DpCountBad(base + (r * 64), 64, $5000 + r + 1)
+    r = r + 1
+  Wend
+  Chk("scroll by one row leaves rows 0..6 = old 1..7 (words wrong)", bad, 0)
+
+  bad = DpCountBad(base + (7 * 64), 64, $5007)
+  Chk("row 7, which nothing wrote, is unchanged      (words wrong)", bad, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DpTestRefusals - the checks that protect the board.
+;
+; None of these touches the hardware. They are here because a guard
+; that has never been seen to refuse anything is a guard nobody knows
+; is broken - and two of these are the difference between a bad picture
+; and a board that needs a power cycle.
+; ----------------------------------------------------------------------
+Procedure DpTestRefusals()
+  Chk("DmaAddrOk refuses $40000000, the 1 GiB cap", DmaAddrOk($40000000, 4), 0)
+  Chk("DmaAddrOk refuses a buffer that straddles it", DmaAddrOk($3FFFFFF0, 64), 0)
+  Chk("DmaAddrOk refuses a zero length", DmaAddrOk(#DP_SAND, 0), 0)
+  Chk("DmaAddrOk accepts the sandbox", DmaAddrOk(#DP_SAND, 4096), 1)
+  ChkHex("DmaBusAddr($780000) is the uncached alias", DmaBusAddr($780000), $C0780000)
+
+  ; Just below the declared window. One byte outside is outside.
+  Chk("a fill below the declared window is refused", DmaFillPattern32(#DP_SAND - 64, 256, 64, 1, 0), 0)
+  Chk("...and the reason given is #DMA_ERR_BOUNDS", DmaError(), #DMA_ERR_BOUNDS)
+
+  ; Just past the end of it.
+  Chk("a fill past the end of the window is refused", DmaFillPattern32((#DP_SAND + #DP_SAND_BYTES) - 32, 256, 64, 1, 0), 0)
+  Chk("...and the reason given is #DMA_ERR_BOUNDS", DmaError(), #DMA_ERR_BOUNDS)
+
+  ; A failed DmaSetChannel() does not change the channel and does not
+  ; clear the ready flag, so these two are safe to run in the middle of
+  ; a session. That property is worth knowing and is why they are here
+  ; rather than at the end.
+  Chk("channel 7 is refused - it is a LITE engine", DmaSetChannel(7), 0)
+  Chk("...and the reason given is #DMA_ERR_LITE", DmaError(), #DMA_ERR_LITE)
+  Chk("channel 1 is refused - it is the firmware's", DmaSetChannel(1), 0)
+  Chk("...and the reason given is #DMA_ERR_CHANNEL", DmaError(), #DMA_ERR_CHANNEL)
+  Chk("channel 12 is refused - it is DMA4", DmaSetChannel(12), 0)
+  Chk("the refusals did not steal the channel", DmaChannel(), 0)
+  Chk("the refusals did not clear the ready flag", DmaReady(), 1)
+EndProcedure
+
+
+; ======================================================================
+;  SECTION 4 - THE TIMINGS
+; ======================================================================
+
+; One measurement, reported with everything it was derived from beside
+; it, so a wrong assumption is visible rather than folded in.
+;
+; bytes is the TRAFFIC. For a fill that is the bytes written; for a copy
+; it is twice the rectangle, because every byte is read once and
+; written once and the whole point of the exercise is memory bandwidth.
+Procedure DpReport(*name, us.i, bytes.i)
+  PutLabel(*name)
+  PutS("  ")
+  PutMs(us)
+  PutS(" ms")
+  If us > 0
+    PutS("   ")
+    PutFix2((bytes * 100) / us)
+    PutS(" MB/s")
+  EndIf
+  PutNl()
+EndProcedure
+
+; The headline. Two elapsed times over the same bytes, and the ratio
+; between them printed to two places so a 1.9x cannot be read as a 2x.
+Procedure DpCompare(*what, cpuUs.i, dmaUs.i)
+  PutNl()
+  PutLabel(*what)
+  PutNl()
+  If dmaUs < 1
+    PutLabel("  the DMA pass measured zero microseconds - it did not run")
+    PutNl()
+    ProcedureReturn
+  EndIf
+  PutLabel("  hardware is ")
+  PutFix2((cpuUs * 100) / dmaUs)
+  PutS("x the CPU")
+  PutNl()
+  If cpuUs > dmaUs
+    PutLabel("  saved ")
+    PutMs(cpuUs - dmaUs)
+    PutS(" ms")
+  Else
+    PutLabel("  COST ")
+    PutMs(dmaUs - cpuUs)
+    PutS(" ms - the hardware path is SLOWER here")
+  EndIf
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DpBurstSweep - the same full-surface fill at several burst lengths.
+;
+; TI.BURST_LENGTH is the one parameter that materially changes
+; throughput, and a default nobody has swept is a guess.
+;
+; THE CEILING IS DmaBurstMaxSafe() AND IS NOT WRITTEN DOWN HERE. It
+; used to be a literal 8, justified by section 4.3's warning that "if a
+; read burst is selected that is too large, the AXI read bus will be
+; stalled... and possibly AXI lock up" (:5238-5240) plus the fact that
+; channel 0's external FIFO is eight words. That was reasoning from a
+; mechanism, and on 2026-08-26 pi4DmaGate.pi4's group F turned the
+; warning into a measurement: a burst above 8 locked the bus and the
+; deadman had to reset the board.
+;
+; So the number now comes from dma.pi4's #DMA_BURST_MAX_SAFE, which is
+; the same cap DmaSetBurst() enforces as a refusal. Two consequences,
+; and both are the point:
+;
+;   * THIS SWEEP CANNOT AIM A BUS-LOCKING TRANSFER AT THE FRAMEBUFFER.
+;     It could not even if it tried - DmaSetBurst() would refuse.
+;   * WHEN THE GATE NARROWS THE CEILING, THIS FOLLOWS AUTOMATICALLY.
+;     There is no second copy of the number to drift out of step with
+;     the first, which is exactly how "8" survived here for a day as a
+;     value nobody could justify.
+;
+; Finding the ceiling is the GATE's job and it does it on a scratch
+; buffer with the screen not involved. This program's job is to measure
+; throughput inside it.
+; ----------------------------------------------------------------------
+Procedure DpBurstSweep(base.i, pitch.i, w.i, h.i)
+  Define n.i
+  Define t0.i
+  Define us.i
+  Define bytes.i
+  Define save.i
+
+  save  = DmaBurst()
+  bytes = (w * 4) * h
+
+  PutS("-- 4c. burst length sweep, the same full-surface fill each time")
+  PutNl()
+  PutLabel("ceiling is DmaBurstMaxSafe() = ")
+  PrintDec(DmaBurstMaxSafe())
+  PutS("   (measured, not chosen - see dma.pi4)")
+  PutNl()
+
+  n = 0
+  While n <= DmaBurstMaxSafe()
+    DmaSetBurst(n)
+    t0 = Micros()
+    If DmaFill32(base, pitch, w, h, $FF000000 + (n * 16)) = 0
+      PutLabel("burst ")
+      PrintDec(n)
+      PutS("  REFUSED - ")
+      PutS(DmaErrorText())
+      PutNl()
+    Else
+      us = Micros() - t0
+      PutLabel("burst ")
+      PrintDec(n)
+      PutS("   ")
+      PutMs(us)
+      PutS(" ms   ")
+      If us > 0
+        PutFix2((bytes * 100) / us)
+        PutS(" MB/s")
+      EndIf
+      PutNl()
+    EndIf
+    If n = 0
+      n = 1
+    Else
+      n = n * 2
+    EndIf
+  Wend
+
+  DmaSetBurst(save)
+  PutNl()
+EndProcedure
+
+
+; ======================================================================
+;  SECTION 4d - THE DISPLAY PATH ITSELF, A AGAINST B
+; ======================================================================
+;  Everything above this point exercises dma.pi4 directly. This section
+;  exercises THE WIRING - display.pi4's DisplayFillRect deciding to hand
+;  a rectangle to the engine, computing its address and pitch, running
+;  the cache sequence, and declining to auto-flush afterwards.
+;
+;  THAT WIRING HAS NO OTHER TEST AND CANNOT HAVE ONE ELSEWHERE.
+;  pi4DmaGate.pi4 is the differential gate for dma.pi4 and it has no
+;  framebuffer, no mailbox and no display.pi4 in its build; a Python
+;  gate over tools/a64/a64_interp.py has a flat memory model and cannot
+;  represent a cache at all, let alone a second bus master. The only
+;  place the display path can be checked is on the surface it runs on,
+;  which is here.
+;
+;  THE METHOD IS THE SAME ONE THE GATE USES: do the same rectangle
+;  twice, once each way, and require the two results to be identical
+;  byte for byte - over a window LARGER than the rectangle, so that
+;  damage beside it counts as damage.
+;
+;  THE ORDER IS CPU FIRST, THEN DMA, and both passes start from a known
+;  different background so that "the engine did nothing" cannot pass.
+;  If the engine never wrote, its capture holds the background and the
+;  CPU's capture holds the rectangle, and they differ - which is the
+;  correct verdict for a path that silently declined.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DpCapture - copy a window of the surface into a buffer, honestly.
+;
+; THE INVALIDATE IS NOT OPTIONAL AND IT IS THE WHOLE REASON THIS IS A
+; PROCEDURE. Reading pixels the engine wrote, with the caches on, is
+; hazard B out of display.pi4's coherency section: the CPU may hold a
+; stale clean line over them and will happily serve it. A capture that
+; skipped this would read the CPU's own earlier picture back out of the
+; cache and report that the two passes agreed - the single most
+; convincing wrong answer this program could produce.
+;
+; PeekN, the unsigned 32-bit read, and PokeL to store: a bare Peek/Poke
+; is eight bytes on this target and would take two pixels at a time,
+; which is right by accident here and wrong the moment the window width
+; is odd.
+; ----------------------------------------------------------------------
+Procedure DpCapture(buf.i, base.i, pitch.i, x0.i, y0.i, w.i, h.i)
+  Define r.i
+  Define c.i
+  Define s.i
+  Define d.i
+
+  DmaCacheRect(base + (y0 * pitch) + (x0 * 4), pitch, w * 4, h)
+
+  d = buf
+  r = 0
+  While r < h
+    s = (base + ((y0 + r) * pitch)) + (x0 * 4)
+    c = 0
+    While c < w
+      PokeL(d, PeekN(s))
+      s = s + 4
+      d = d + 4
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+; First differing byte between two captures, or -1. The OFFSET is the
+; diagnosis: divide by 4 for the pixel, then by the window width for the
+; row, and whether it lands inside the rectangle or in the eight-pixel
+; margin says which of two completely different bugs it is.
+Procedure.i DpCapDiff(a.i, b.i, bytes.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    If (PeekB(a + i) & $FF) <> (PeekB(b + i) & $FF)
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure DpDisplayAB(base.i, pitch.i, w.i, h.i)
+  Define bytes.i
+  Define diff.i
+  Define px.i
+  Define col.i
+  Define row.i
+  Define opsBefore.i
+  Define bg.i
+  Define fg.i
+
+  PutS("-- 4d. the DISPLAY PATH: DisplayFillRect with the engine off, then on")
+  PutNl()
+
+  If DisplayDmaLinked() = 0
+    PutS("     SKIPPED - this build has #DSP_DMA_LINKED = 0, so display.pi4 has")
+    PutNl()
+    PutS("     no accelerated path to compare against. Nothing is wrong; this")
+    PutNl()
+    PutS("     program is simply not the build that tests the wiring.")
+    PutNl()
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  ; The window has to fit on the surface. A board reporting a smaller
+  ; mode than expected is a real possibility - this one reported
+  ; 1824 x 984 under overscan - and running the A/B off the edge would
+  ; compare two clipped rectangles and call them equal.
+  If (#DP_AB_WINX + #DP_AB_WINW) > w Or (#DP_AB_WINY + #DP_AB_WINH) > h
+    PutS("     SKIPPED - the surface is smaller than the 128 x 128 window this")
+    PutNl()
+    PutS("     comparison needs at (56,56). Not a failure; move the window.")
+    PutNl()
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  bytes = (#DP_AB_WINW * #DP_AB_WINH) * 4
+  bg    = DisplayRGB(20, 20, 60)
+  fg    = DisplayRGB(240, 120, 0)
+
+  ; ---- pass A: the CPU ----------------------------------------------
+  ; The engine is switched off at run time, not unlinked, so the two
+  ; passes differ in exactly one thing.
+  DisplayUseDma(0)
+  DisplayFillRect(#DP_AB_WINX, #DP_AB_WINY, #DP_AB_WINW, #DP_AB_WINH, bg)
+  DisplayFillRect(#DP_AB_X, #DP_AB_Y, #DP_AB_W, #DP_AB_H, fg)
+  DpCapture(#DP_CAP_A, base, pitch, #DP_AB_WINX, #DP_AB_WINY, #DP_AB_WINW, #DP_AB_WINH)
+
+  ; ---- scrub, so a pass that draws nothing cannot agree --------------
+  ; A DIFFERENT colour, not the background either pass will use. If the
+  ; DMA pass declines and writes nothing, the capture holds THIS and the
+  ; comparison fails, which is the honest outcome for a silent decline.
+  DisplayFillRect(#DP_AB_WINX, #DP_AB_WINY, #DP_AB_WINW, #DP_AB_WINH, DisplayRGB(0, 200, 0))
+
+  ; ---- pass B: the engine -------------------------------------------
+  opsBefore = DisplayDmaOps()
+  DisplayUseDma(1)
+  DisplayFillRect(#DP_AB_WINX, #DP_AB_WINY, #DP_AB_WINW, #DP_AB_WINH, bg)
+  DisplayFillRect(#DP_AB_X, #DP_AB_Y, #DP_AB_W, #DP_AB_H, fg)
+  DpCapture(#DP_CAP_B, base, pitch, #DP_AB_WINX, #DP_AB_WINY, #DP_AB_WINW, #DP_AB_WINH)
+
+  ; ---- DID THE ENGINE ACTUALLY DO IT? --------------------------------
+  ; ASKED BEFORE THE PIXELS ARE COMPARED, because it is the question
+  ; that decides what the comparison means. display.pi4's accelerated
+  ; primitives fall back to the CPU whenever anything is not certain,
+  ; and a fallback DRAWS THE RIGHT PICTURE - so a green comparison with
+  ; a zero op count is a program that tested the CPU path twice.
+  dpChecks = dpChecks + 1
+  If DisplayDmaOps() = opsBefore
+    dpFails = dpFails + 1
+    PutS("  FAIL  the engine performed NO transfers during pass B, so the")
+    PutNl()
+    PutS("        comparison below is the CPU path against itself. Refusals so")
+    PutNl()
+    PutS("        far: ")
+    PrintDec(DisplayDmaRefusals())
+    PutS(", policy fallbacks: ")
+    PrintDec(DisplayDmaFallbacks())
+    PutNl()
+    If DisplayDmaRefusals() > 0
+      PutS("        the last refusal was: ")
+      PutS(DmaErrorText())
+      PutNl()
+      PutS("        DmaSetBounds not pointed at the surface is the usual cause -")
+      PutNl()
+      PutS("        DisplayDmaBind() is the one call that does it.")
+      PutNl()
+    EndIf
+  EndIf
+
+  ; ---- the comparison -------------------------------------------------
+  diff = DpCapDiff(#DP_CAP_A, #DP_CAP_B, bytes)
+  dpChecks = dpChecks + 1
+  If diff < 0
+    PutLabel("the two passes are byte-identical over the whole 128 x 128 window,")
+    PutNl()
+    PutLabel("margin included. ")
+    PrintDec(DisplayDmaOps() - opsBefore)
+    PutS(" transfer(s) went through the engine.")
+    PutNl()
+  Else
+    dpFails = dpFails + 1
+    px  = diff / 4
+    col = px % #DP_AB_WINW
+    row = px / #DP_AB_WINW
+    PutS("  FAIL  the DMA pass differs from the CPU pass at window pixel (")
+    PrintDec(col)
+    PutS(",")
+    PrintDec(row)
+    PutS(")")
+    PutNl()
+    PutS("        cpu $")
+    PutHexN(PeekN(#DP_CAP_A + (px * 4)) & $FFFFFFFF, 8)
+    PutS("   dma $")
+    PutHexN(PeekN(#DP_CAP_B + (px * 4)) & $FFFFFFFF, 8)
+    PutNl()
+    ; WHERE it is relative to the filled rectangle is most of the
+    ; diagnosis and a person should not have to work it out on paper.
+    If col < (#DP_AB_X - #DP_AB_WINX) Or row < (#DP_AB_Y - #DP_AB_WINY)
+      PutS("        IN THE MARGIN - the engine wrote outside the rectangle it was")
+      PutNl()
+      PutS("        given. Suspect the stride, or a row count one too large.")
+      PutNl()
+    ElseIf col >= ((#DP_AB_X - #DP_AB_WINX) + #DP_AB_W) Or row >= ((#DP_AB_Y - #DP_AB_WINY) + #DP_AB_H)
+      PutS("        IN THE MARGIN - the engine wrote outside the rectangle it was")
+      PutNl()
+      PutS("        given. Suspect the stride, or a row count one too large.")
+      PutNl()
+    Else
+      PutS("        INSIDE the rectangle - the fill itself, or the cache sequence")
+      PutNl()
+      PutS("        around it. Check pi4DmaGate group G before suspecting this.")
+      PutNl()
+    EndIf
+  EndIf
+
+  ; Leave the engine on. Section 5 draws with it deliberately.
+  DisplayUseDma(1)
+  PutNl()
+EndProcedure
+
+
+; ======================================================================
+;  SECTION 5 - THE PICTURE
+;
+;  Eight colour bars, every pixel of them placed by the DMA engine, and
+;  one line of text placed by display.pi4's CPU glyph loop on top. The
+;  point is not decoration: a fill that is fast and WRONG looks like a
+;  fill that is fast, and the timings above cannot tell the difference.
+;  Bars in the right places, in the right colours, with sharp edges, is
+;  the check a person can make in one second.
+;
+;  WHAT WRONG LOOKS LIKE, so it is recognised rather than puzzled over:
+;    * bars sheared diagonally  - the pitch is wrong, or the stride is
+;      being applied instead of added. display.pi4:313-331 has the same
+;      note from the CPU side.
+;    * bars the wrong colour but in the right places - red and blue are
+;      swapped, which is a firmware pixel-order question and is asked
+;      and answered in Main() below, not a DMA question.
+;    * the last bar wider than the others - integer division; the eighth
+;      bar deliberately takes the remainder.
+;    * one bar missing entirely - it was refused. The transcript says
+;      which and why.
+; ======================================================================
+Procedure DpDrawBars(base.i, pitch.i, w.i, h.i)
+  Define i.i
+  Define bw.i
+  Define x.i
+  Define cols.i
+  Define c.i
+  Define bad.i
+
+  bw  = w / 8
+  bad = 0
+
+  i = 0
+  While i < 8
+    ; The palette, built with DisplayRGB so the firmware's pixel order
+    ; is honoured rather than assumed - the same call every other
+    ; program here uses, and the reason DisplayColourSwap() exists.
+    Select i
+      Case 0 : c = DisplayRGB(255, 255, 255)
+      Case 1 : c = DisplayRGB(255, 255,   0)
+      Case 2 : c = DisplayRGB(  0, 255, 255)
+      Case 3 : c = DisplayRGB(  0, 255,   0)
+      Case 4 : c = DisplayRGB(255,   0, 255)
+      Case 5 : c = DisplayRGB(255,   0,   0)
+      Case 6 : c = DisplayRGB(  0,   0, 255)
+      Case 7 : c = DisplayRGB( 24,  24,  32)
+    EndSelect
+
+    x    = i * bw
+    cols = bw
+    If i = 7
+      cols = w - x                       ; the remainder, so nothing is
+    EndIf                                ; left unpainted at the edge
+
+    If DmaFill32(base + (x * 4), pitch, cols, h, c) = 0
+      bad = bad + 1
+      PutLabel("bar ")
+      PrintDec(i)
+      PutS(" refused - ")
+      PutS(DmaErrorText())
+      PutNl()
+    EndIf
+    i = i + 1
+  Wend
+
+  Chk("eight colour bars, every pixel placed by the engine", bad, 0)
+EndProcedure
+
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define bpp.i
+  Define base.i
+  Define size.i
+  Define order.i
+  Define shadowPitch.i
+  Define shadowBytes.i
+  Define bytes.i
+  Define t0.i
+  Define adv.i
+  Define hz.i
+  Define cpuFillUs.i
+  Define dmaFillUs.i
+  Define engineUs.i
+  Define cleanUs.i
+  Define cpuBlitUs.i
+  Define dmaBlitUs.i
+  Define presentUs.i
+  Define y.i
+  Define p.i
+  Define n.i
+
+  UartInit(115200)
+
+  PutNl()
+  PutS("=== pi4DmaProbe - stage 1, pixels moved by the SoC instead of the CPU ===")
+  PutNl()
+  PutS("The number to beat is 266.4 ms, measured on this board 2026-08-26 with")
+  PutNl()
+  PutS("the caches on, for a full-surface opaque fill by display.pi4's CPU loop.")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE CACHES
+  ; ------------------------------------------------------------------
+  ;  MmuBuildTables RETURNS 0 ON SUCCESS and a negative #MMU_ERR_* on
+  ;  refusal (mmu.pi4:1044-1046). Testing it the other way round is a
+  ;  mistake that has already cost this project a whole run, because
+  ;  the output looks complete: the measurement quietly runs UNCACHED
+  ;  and reports uncached numbers as cached ones. pi4NeonLiar.pi4:1505
+  ;  carries the same warning.
+  ;
+  ;  THE MMU GOES OFF AGAIN BEFORE THIS RETURNS. Anvil is running
+  ;  underneath and knows nothing about page tables.
+  If #DP_MMU = 1
+    PutS("MMU: building the identity map at $600000 ...")
+    PutNl()
+    If MmuBuildTables(#DP_TABLES) <> 0
+      PutS("MMU: the tables would not build - running UNCACHED. The CPU numbers")
+      PutNl()
+      PutS("     below will be the 356.9 ms ones, and the ratio will FLATTER the")
+      PutNl()
+      PutS("     hardware. Say so if you quote them.")
+      PutNl()
+    Else
+      MmuEnable()
+      If MmuEnabled() = 1
+        PutS("MMU: ON. DRAM is Normal Write-Back Cacheable, which is the")
+        PutNl()
+        PutS("     configuration the 266.4 ms was measured in.")
+        PutNl()
+      Else
+        PutS("MMU: the enable did not take - running UNCACHED.")
+        PutNl()
+      EndIf
+    EndIf
+  Else
+    PutS("MMU: off by #DP_MMU. These are the UNCACHED numbers and the CPU side")
+    PutNl()
+    PutS("     of every comparison is the 356.9 ms one, not the 266.4 ms one.")
+    PutNl()
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE SURFACE
+  ; ------------------------------------------------------------------
+  If MailboxInit() = 0
+    PutS("!! MailboxInit failed, MailboxError ")
+    PrintDec(MailboxError())
+    PutNl()
+    PutS("   This is a transport failure, not a graphics one. Nothing below can run.")
+    PutNl()
+    UartDrain()
+    ProcedureReturn 1
+  EndIf
+
+  DisplayStandardTags()
+  rc = DisplayInit(1920, 1080, 32)
+  If DisplayReady() = 0
+    PutS("!! DisplayInit returned ")
+    PrintDec(rc)
+    PutS(", DisplayLastError ")
+    PrintDec(DisplayLastError())
+    PutNl()
+    PutS("   display.pi4:916-957 names every one of those codes. The usual cause")
+    PutNl()
+    PutS("   is no HDMI display connected when the board powered on.")
+    PutNl()
+    UartDrain()
+    ProcedureReturn 2
+  EndIf
+
+  ; Red and blue asked rather than assumed, exactly as anvil.pi4 and
+  ; pi4NeonLiar.pi4 do. Tag $00040006 is GET_PIXEL_ORDER; 0 is BGR and
+  ; 1 is RGB (Datasheets/pi4/uboot/v2025.01_mbox.h:373-374).
+  order = -1
+  If MailboxBegin($00040006, 4, 4) <> 0
+    MailboxSetWord(0, 0)
+    If MailboxSend() <> 0
+      order = MailboxWord(0)
+    EndIf
+  EndIf
+  If order = 1
+    DisplayColourSwap(1)
+  Else
+    DisplayColourSwap(0)
+  EndIf
+
+  w     = DisplayWidth()
+  h     = DisplayHeight()
+  pitch = DisplayPitch()
+  bpp   = DisplayBytesPerPixel()
+  base  = DisplayBase()
+  size  = DisplaySize()
+
+  PutS("-- 0. the surface, as the firmware reported it")
+  PutNl()
+  PutLabel("geometry        ")
+  PrintDec(w)
+  PutS(" x ")
+  PrintDec(h)
+  PutS(" x ")
+  PrintDec(bpp * 8)
+  PutS(" bpp")
+  PutNl()
+  PutLabel("pitch           ")
+  PrintDec(pitch)
+  PutS(" bytes per row")
+  If pitch <> (w * bpp)
+    PutS("   (NOT width*bpp - the linear present is not available)")
+  EndIf
+  PutNl()
+  PutLabel("ARM base        $")
+  PutHexN(base, 8)
+  PutNl()
+  PutLabel("VideoCore bus   $")
+  PutHexN(DisplayBusBase(), 8)
+  PutNl()
+  PutLabel("size            ")
+  PrintDec(size)
+  PutS(" bytes")
+  PutNl()
+  PutLabel("as the engine will be told it   $")
+  PutHexN(DmaBusAddr(base), 8)
+  PutNl()
+
+  ; The surface has to be inside the low gigabyte or the legacy engines
+  ; cannot see it. display.pi4:2053 masks the firmware's bus address
+  ; with $3FFFFFFF, so it always is - but the whole point of dma.pi4's
+  ; HAZARD 1 is that this is the check nobody makes, so it is made.
+  Chk("the framebuffer is inside the 1 GiB the engine can reach", DmaAddrOk(base, size), 1)
+
+  ; EVERY PIXEL CALCULATION BELOW ASSUMES FOUR BYTES. DmaFill32() is a
+  ; 32bpp entry point by name, the colour bars index columns with
+  ; "x * 4", and the traffic figures are width * 4 * height. display.pi4
+  ; will happily give a 16bpp surface (#DSP_EDEPTH accepts 16 or 32), so
+  ; the assumption is checked rather than left to produce a picture that
+  ; is half as wide as it should be and a rate that is twice what it
+  ; really was. A 16bpp caller is served by DmaFillPattern32() with a
+  ; doubled half-word; this program simply does not do that case.
+  If bpp <> 4
+    Chk("the surface is 32bpp - everything below assumes four bytes", bpp, 4)
+    PutS("   Nothing below this line would be meaningful. Stopping.")
+    PutNl()
+    UartDrain()
+    If #DP_MMU = 1
+      If MmuEnabled() = 1
+        MmuDisable()
+      EndIf
+    EndIf
+    ProcedureReturn 4
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  SECTION 1 - THE CONTROLLER
+  ; ------------------------------------------------------------------
+  DpReportController()
+
+  ; ------------------------------------------------------------------
+  ;  BRING dma.pi4 UP, POINTED AT THE SANDBOX
+  ; ------------------------------------------------------------------
+  PutS("-- 2. bringing up RaspberryPi4/Lib/dma.pi4")
+  PutNl()
+
+  ; Put the bias back to "unknown" so the probe re-derives it on this
+  ; run rather than inheriting the constant. See the same call in
+  ; pi4DmaGate.pi4 for the argument.
+  DmaSetYLengthBias(-1)
+
+  Chk("DmaSetScratch($700000, 512)", DmaSetScratch(#DP_SCRATCH, #DP_SCRATCH_BYTES), 1)
+  If DmaError() <> #DMA_ERR_NONE
+    PutDmaErr()
+  EndIf
+
+  ; The window starts as the SANDBOX, not the framebuffer. Section 3
+  ; runs entirely inside it, so a rectangle-arithmetic bug in a test is
+  ; refused instead of landing on the screen - or somewhere worse.
+  Chk("DmaSetBounds(the 64 KiB sandbox)", DmaSetBounds(#DP_SAND, #DP_SAND_BYTES), 1)
+
+  If DmaInit() = 0
+    Chk("DmaInit()", 0, 1)
+    PutDmaErr()
+    PutS("   Nothing below this line can run.")
+    PutNl()
+    UartDrain()
+    If #DP_MMU = 1
+      If MmuEnabled() = 1
+        MmuDisable()
+      EndIf
+    EndIf
+    ProcedureReturn 3
+  EndIf
+  Chk("DmaInit()", 1, 1)
+
+  PutLabel("channel                 ")
+  PrintDec(DmaChannel())
+  PutNl()
+  PutLabel("burst length            ")
+  PrintDec(DmaBurst())
+  PutNl()
+  PutLabel("YLENGTH source advance  ")
+  adv = DmaCalibrateAdvance()
+  PrintDec(adv)
+  PutS(" bytes")
+  PutNl()
+  PutLabel("YLENGTH bias            ")
+  PrintDec(DmaYLengthBias())
+  If DmaYLengthBias() = 0
+    PutS("    YLENGTH IS A PLAIN ROW COUNT on this part.")
+  Else
+    PutS("    YLENGTH IS ROWS MINUS ONE on this part.")
+  EndIf
+  PutNl()
+  PutS("    Write that down. It is the one thing the vendor PDF does not say")
+  PutNl()
+  PutS("    for the legacy engine, and once it is known a program can state it")
+  PutNl()
+  PutS("    with DmaSetYLengthBias() and skip the probe.")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  SECTION 3 - CORRECTNESS
+  ; ------------------------------------------------------------------
+  PutS("-- 3. correctness, entirely inside the 64 KiB sandbox at $780000")
+  PutNl()
+  DpTestFill()
+  DpTestCopy()
+  DpTestScroll()
+  DpTestRefusals()
+  PutNl()
+
+  If dpFails <> 0
+    PutS("!! Correctness failed. The timings below would be meaningless and the")
+    PutNl()
+    PutS("   framebuffer is deliberately left alone. Fix the failing line first.")
+    PutNl()
+    UartDrain()
+    If #DP_MMU = 1
+      If MmuEnabled() = 1
+        MmuDisable()
+      EndIf
+    EndIf
+    ProcedureReturn dpFails
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  SECTION 4 - THE TIMINGS
+  ; ------------------------------------------------------------------
+  ;  From here on the destination is the framebuffer, so the window
+  ;  moves. This is the only place in the program that widens it, and
+  ;  it happens after every correctness property has been proved.
+  ;
+  ;  THROUGH DisplayDmaBind() AND NOT DmaSetBounds() DIRECTLY. The two
+  ;  are the same call with the same two numbers; the difference is that
+  ;  DisplayDmaBind takes them from the firmware's own answer instead of
+  ;  from two locals this program happens to be holding, and section 4d
+  ;  below depends on the window being the surface. It is also the call
+  ;  every other program will make, so it is the one that should be
+  ;  under test - a public entry point no gate exercises is a public
+  ;  entry point nobody knows is broken.
+  rc = DisplayDmaBind()
+  Chk("DisplayDmaBind() points the engine at the surface", rc, 1)
+  If rc = 0
+    PutDmaErr()
+  EndIf
+  PutNl()
+
+  ; The auto-flush goes off for the whole timing section. display.pi4
+  ; would otherwise clean 130,000 cache lines after every primitive,
+  ; which is not what "how fast is a store loop" means.
+  DisplayAutoFlush(0)
+
+  bytes = (w * bpp) * h
+  hz    = DmaCounterHz()
+
+  PutS("-- 4a. the full-surface opaque fill - THE HEADLINE")
+  PutNl()
+
+  t0 = Micros()
+  DisplayFillRect(0, 0, w, h, DisplayRGB(0, 0, 40))
+  cpuFillUs = Micros() - t0
+  DpReport("CPU, display.pi4 DspRowFill32 ", cpuFillUs, bytes)
+
+  ; CLEAN AND INVALIDATE THE SURFACE BEFORE THE ENGINE WRITES IT, AND
+  ; DO IT OUTSIDE THE TIMED REGION.
+  ;
+  ; The CPU fill above left the whole surface in the D-cache, dirty.
+  ; If those lines were still there when the engine wrote DRAM, a later
+  ; eviction would put the CPU's pixels back OVER the engine's - a
+  ; corruption that appears seconds after the transfer, in bands, and
+  ; looks like a DMA fault. dma.pi4's DmaFillPattern32 header names it.
+  ;
+  ; It is outside the timed region because it is an artefact of this
+  ; program doing both things to one surface. A compositor that uses
+  ; the engine does not first paint the same pixels with the CPU, so
+  ; charging the hardware path for this would be inventing a cost.
+  DmaCacheRange(base, size)
+
+  t0 = Micros()
+  rc = DmaFill32(base, pitch, w, h, DisplayRGB(0, 40, 0))
+  dmaFillUs = Micros() - t0
+
+  If rc = 0
+    Chk("DmaFill32 over the whole surface", 0, 1)
+    PutDmaErr()
+  Else
+    DpReport("DMA, dma.pi4 DmaFill32        ", dmaFillUs, bytes)
+
+    ; The engine's own time, from CNTPCT_EL0 sampled either side of the
+    ; ACTIVE poll inside the library. The difference between this and
+    ; the figure above is the control-block setup and the completion
+    ; poll, and a caller doing many small rectangles pays it every time.
+    If hz > 0
+      engineUs = (DmaLastTicks() * 1000000) / hz
+      PutLabel("of which the engine itself     ")
+      PutMs(engineUs)
+      PutS(" ms   (the rest is control-block setup and the completion poll)")
+      PutNl()
+    EndIf
+    DpCompare("FILL, full surface:", cpuFillUs, dmaFillUs)
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4b. the blit, from a CPU-composed shadow surface
+  ; ------------------------------------------------------------------
+  shadowPitch = w * bpp
+  shadowBytes = shadowPitch * h
+
+  PutS("-- 4b. the full-surface blit, from a shadow buffer at $1000000")
+  PutNl()
+
+  If DmaAddrOk(#DP_SHADOW, shadowBytes) = 0
+    PutLabel("the shadow buffer is not reachable by this engine - skipped")
+    PutNl()
+  Else
+    ; Compose something into the shadow with the CPU: one word per row,
+    ; so a blit that repeated a row or dropped one would be visible on
+    ; the screen afterwards rather than only in a number.
+    y = 0
+    While y < h
+      p = #DP_SHADOW + (y * shadowPitch)
+      n = 0
+      While n < w
+        PokeL(p, ((y & 255) << 8) | (n & 255))
+        p = p + 4
+        n = n + 1
+      Wend
+      y = y + 1
+    Wend
+
+    ; THE CPU BLIT GOES FIRST, BEFORE THE CACHE CLEAN, AND THE ORDER IS
+    ; DELIBERATE. Cleaning the shadow buffer INVALIDATES it as well -
+    ; "dc civac" - so a CPU blit run afterwards would start from a cold
+    ; cache while the DMA path would not, and the comparison would be
+    ; tilted by an artefact of the measurement. Run in this order both
+    ; paths read the same 8.29 MB out of DRAM, which is what actually
+    ; happens: the A72's L2 is a megabyte and the surface is eight, so
+    ; nothing was ever going to be resident.
+    t0 = Micros()
+    DisplayBlit(#DP_SHADOW, shadowPitch, 0, 0, w, h)
+    cpuBlitUs = Micros() - t0
+    DpReport("CPU, display.pi4 DisplayBlit  ", cpuBlitUs, bytes * 2)
+
+    ; THE CLEAN IS PART OF THE DMA PATH'S BILL AND IS TIMED SEPARATELY.
+    t0 = Micros()
+    DmaCacheRange(#DP_SHADOW, shadowBytes)
+    cleanUs = Micros() - t0
+
+    DmaCacheRange(base, size)
+
+    t0 = Micros()
+    rc = DmaCopy2D(base, pitch, #DP_SHADOW, shadowPitch, shadowPitch, h)
+    dmaBlitUs = Micros() - t0
+
+    If rc = 0
+      Chk("DmaCopy2D over the whole surface", 0, 1)
+      PutDmaErr()
+    Else
+      DpReport("DMA, dma.pi4 DmaCopy2D        ", dmaBlitUs, bytes * 2)
+      PutLabel("plus the source cache clean    ")
+      PutMs(cleanUs)
+      PutS(" ms   (129,600 lines over 8.29 MB, and it is real)")
+      PutNl()
+      DpCompare("BLIT, DMA time only:", cpuBlitUs, dmaBlitUs)
+      DpCompare("BLIT, DMA time plus the clean it needs:", cpuBlitUs, dmaBlitUs + cleanUs)
+    EndIf
+
+    ; The linear present. Only correct when the surface is contiguous,
+    ; which means pitch = width * bpp; display.pi4's DspFlushSpan
+    ; (:2316-2331) carves out the same special case with the same
+    ; caveat. When it applies it is one control block for 8.29 MB with
+    ; no stride to re-evaluate 1080 times.
+    If pitch = shadowPitch
+      DmaCacheRange(base, size)
+      t0 = Micros()
+      rc = DmaCopy(base, #DP_SHADOW, shadowBytes)
+      presentUs = Micros() - t0
+      If rc = 0
+        Chk("DmaCopy, the linear present", 0, 1)
+        PutDmaErr()
+      Else
+        DpReport("DMA, one linear DmaCopy       ", presentUs, bytes * 2)
+        DpCompare("PRESENT, linear versus the 2D copy above:", dmaBlitUs, presentUs)
+      EndIf
+    Else
+      PutLabel("the linear present is skipped - the pitch is not width*bpp, so")
+      PutNl()
+      PutLabel("the surface is not one contiguous run and DmaCopy would be wrong")
+      PutNl()
+    EndIf
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4c. the burst sweep
+  ; ------------------------------------------------------------------
+  DpBurstSweep(base, pitch, w, h)
+
+  ; ------------------------------------------------------------------
+  ;  4d. the display path, A against B
+  ;
+  ;  IT COMES AFTER EVERY TIMING AND NOT BEFORE. Sections 4a and 4b use
+  ;  DisplayFillRect and DisplayBlit as the CPU REFERENCE, and the whole
+  ;  comparison would be meaningless if those had quietly gone through
+  ;  the engine. DisplayUseDma() defaults to OFF for exactly that reason
+  ;  and this is the first thing in the program that turns it on.
+  ; ------------------------------------------------------------------
+  DpDisplayAB(base, pitch, w, h)
+
+  ; ------------------------------------------------------------------
+  ;  SECTION 5 - THE PICTURE
+  ; ------------------------------------------------------------------
+  PutS("-- 5. the picture")
+  PutNl()
+  DmaCacheRange(base, size)
+  DpDrawBars(base, pitch, w, h)
+
+  ; INVALIDATE BEFORE THE CPU DRAWS OVER THE ENGINE'S WORK.
+  ;
+  ; Added 2026-08-27. The clean above happens BEFORE the bars, which
+  ; deals with dirty lines the CPU left behind; it does nothing about
+  ; the other direction. Between that clean and the text below, the
+  ; surface is Normal cacheable memory that this part read-allocates, so
+  ; the A72 is architecturally free to pull lines in speculatively while
+  ; the engine is painting DRAM underneath. A glyph write into such a
+  ; line is a read-modify-write of the STALE picture, and DisplayFlush
+  ; then cleans that stale picture back out over the bars - as a
+  ; rectangle of old pixels around every character, which reads as a
+  ; text-rendering fault rather than a coherency one.
+  ;
+  ; It costs one civac per 64 bytes of surface and it removes a whole
+  ; class of "the bars looked wrong near the text" report.
+  DmaCacheRange(base, size)
+
+  ; One line of CPU text over the top, so both paths can be seen on one
+  ; screen. It goes through display.pi4 unchanged; the surface is the
+  ; same surface and neither path knows about the other.
+  ;
+  ; THE ENGINE IS SWITCHED OFF FOR THESE TWO LINES so that "placed by
+  ; the CPU" is true. DisplayTextClear draws glyph cells, every one of
+  ; them far below DisplayDmaMin(), so they would take the CPU path
+  ; anyway - but a caption that depends on a threshold staying where it
+  ; is today is a caption that will be a lie one tuning run from now.
+  DisplayUseDma(0)
+  DisplayTextClear(16, 16, "pi4DmaProbe - these bars were placed by the DMA engine", DisplayRGB(255, 255, 255))
+  DisplayTextClear(16, 40, "this line was placed by the CPU, through display.pi4", DisplayRGB(200, 200, 200))
+  DisplayFlush()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  WHAT THE SEAM ACTUALLY DID. Printed unconditionally, because the
+  ;  one thing a caller cannot see from a correct picture is which path
+  ;  drew it.
+  ; ------------------------------------------------------------------
+  PutS("-- the display seam")
+  PutNl()
+  PutLabel("dma linked into display.pi4  ")
+  PrintDec(DisplayDmaLinked())
+  PutNl()
+  PutLabel("transfers through the engine ")
+  PrintDec(DisplayDmaOps())
+  PutNl()
+  PutLabel("policy fallbacks to the CPU  ")
+  PrintDec(DisplayDmaFallbacks())
+  PutS("   (rectangles under DisplayDmaMin = ")
+  PrintDec(DisplayDmaMinGet())
+  PutS(" pixels)")
+  PutNl()
+  PutLabel("refusals by the engine       ")
+  PrintDec(DisplayDmaRefusals())
+  If DisplayDmaRefusals() > 0
+    PutS("   <- read this: ")
+    PutS(DmaErrorText())
+  EndIf
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE TALLY
+  ; ------------------------------------------------------------------
+  PutS("=== ")
+  PrintDec(dpChecks - dpFails)
+  PutS(" of ")
+  PrintDec(dpChecks)
+  PutS(" checks passed, ")
+  PrintDec(dpFails)
+  PutS(" failed ===")
+  PutNl()
+  PutS("Look at the screen now: eight colour bars, sharp edges, two lines of")
+  PutNl()
+  PutS("text. Anvil is about to print over the top of it - that is Anvil.")
+  PutNl()
+  UartDrain()
+
+  ; Hand Anvil back the address space it thinks it has.
+  If #DP_MMU = 1
+    If MmuEnabled() = 1
+      MmuDisable()
+      PutS("MMU: off again - Anvil gets an untranslated machine back.")
+      PutNl()
+      UartDrain()
+    EndIf
+  EndIf
+
+  ProcedureReturn dpFails
+EndProcedure

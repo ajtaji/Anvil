@@ -1,0 +1,559 @@
+; pi4SimdSelfTest.pi4 - RaspberryPi4/Lib/simd.pi4 against its own scalar
+;                        twins, every rung of every ladder, on the part.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4SimdSelfTest.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o simdself.img
+;
+;   pmf> deadman 15
+;   pmf> b 400000 <len> <crc>
+;   pmf> run 400000
+;
+; ----------------------------------------------------------------------
+; WHAT THIS IS FOR, AND WHY IT IS THE SAME PROGRAM THE GATE RUNS
+; ----------------------------------------------------------------------
+; tools/a64/a64_simd_lib_check.py builds THIS FILE and runs it in the
+; reference interpreter with a PL011 shim, so the transcript the gate
+; reads is the transcript the board prints. One program, two machines,
+; and a disagreement between them is a finding rather than a difference
+; in what was tested.
+;
+; The gate cannot say anything about the silicon and this program can.
+; It cannot say anything about speed either - that is the throughput
+; table, which needs a cycle counter and a board.
+;
+; ----------------------------------------------------------------------
+; THE COUNTS ARE CHOSEN, NOT SWEPT
+; ----------------------------------------------------------------------
+; Each vector loop in simd.pi4 is a ladder - sixteen, then four, then
+; one - so the interesting counts are the rung boundaries and the
+; remainders either side of them. 0, 1, 3, 4, 5, 15, 16, 17, 19, 63,
+; 64 and 65 hit every rung, every entry to a rung, and every possible
+; remainder at both step widths. A sweep of 0..65 would run five times
+; as long and cover the same twelve behaviours.
+;
+; EVERY CASE ALSO CHECKS A GUARD WORD past the end of the run. A loop
+; that writes one element too many is the single most likely defect in
+; a ladder, it is invisible to a comparison of the region itself, and
+; on a display buffer it is a corrupted pixel somebody chases for a
+; day.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/simd.pi4"
+
+; Four buffers of 128 32-bit words each. `.i` is eight bytes on this
+; target, so 64 of them is 512 bytes is 128 words.
+Global Dim sd_src.i[64]
+Global Dim sd_ref.i[64]
+Global Dim sd_vec.i[64]
+Global Dim sd_fa.i[64]
+Global Dim sd_fb.i[64]
+; The CRC's own buffer. 512 bytes, and it is `.i`, so its first byte
+; sits on an eight-byte boundary - which is what lets the offsets 0..7
+; below walk the alignment ladder deliberately instead of by luck.
+Global Dim sd_crc.i[64]
+Global sd_pass.i
+Global sd_fail.i
+
+
+; The value written past the end of every run under test. Distinctive
+; enough that finding it in the output means something.
+#SD_GUARD = $5A5AA5A5
+
+; ----------------------------------------------------------------------
+; Read32 - one 32-bit word, as an UNSIGNED value.
+;
+; PeekL is the SIGNED 32-bit read on this target and the whole library
+; layer masks it (`PeekL(x) & $FFFFFFFF`, RaspberryPi4/Lib/smp.pi4:935).
+; Every comparison in this program goes through here instead, because
+; the first draft masked one side of a comparison and not the other and
+; reported a perfectly good fill as broken for every colour whose top
+; bit was set. A helper cannot be applied to one side only.
+; ----------------------------------------------------------------------
+Procedure.i Read32(*at)
+  ProcedureReturn PeekL(*at) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Output helpers. Local to this program, as every diagnostic's are.
+; ----------------------------------------------------------------------
+Procedure PutDec(v.i)
+  Define digits.i
+  Define i.i
+  Define n.i
+  Dim buf.i[24]
+  n = v
+  If n = 0
+    UartWrite(48)
+    ProcedureReturn
+  EndIf
+  If n < 0
+    UartWrite(45)
+    n = -n
+  EndIf
+  digits = 0
+  While n > 0
+    buf[digits] = n % 10
+    n = n / 10
+    digits = digits + 1
+  Wend
+  i = digits - 1
+  While i >= 0
+    UartWrite(48 + buf[i])
+    i = i - 1
+  Wend
+EndProcedure
+
+Procedure PutHex8(v.i)
+  Define i.i
+  Define nib.i
+  UartWriteStr("$")
+  i = 28
+  While i >= 0
+    nib = (v >> i) & 15
+    If nib < 10
+      UartWrite(48 + nib)
+    Else
+      UartWrite(55 + nib)
+    EndIf
+    i = i - 4
+  Wend
+EndProcedure
+
+; A verdict line. FULL SENTENCE, KEEPING THE CODE - house rule since
+; 2026-09-03: the number stays in the text so an old transcript still
+; matches, and the sentence says what the number means.
+Procedure Judge(*label, got.i, want.i, code.i)
+  UartWriteStr("  ")
+  UartWriteStr(*label)
+  If got = want
+    UartWriteStr(" ... PASS")
+    UartWriteNl()
+    sd_pass = sd_pass + 1
+  Else
+    UartWriteStr(" ... FAIL at code ")
+    PutDec(code)
+    UartWriteStr(" (twin mismatch): the vector routine answered ")
+    PutHex8(got)
+    UartWriteStr(" where its scalar twin answered ")
+    PutHex8(want)
+    UartWriteStr(". Check the tail ladder in simd.pi4 first, then the guard word.")
+    UartWriteNl()
+    sd_fail = sd_fail + 1
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One fill case: fill both ways, compare word for word, and check the
+;  guard past the end of the run.
+; ----------------------------------------------------------------------
+Procedure FillCase(count.i, value.i)
+  Define i.i
+  Define bad.i
+  Define wroteV.i
+  Define wroteS.i
+
+  ; Poison both destinations so a loop that writes nothing cannot look
+  ; like a loop that wrote the right thing.
+  i = 0
+  While i < 128
+    PokeL(@sd_vec[0] + i * 4, $DEADBEEF)
+    PokeL(@sd_ref[0] + i * 4, $DEADBEEF)
+    i = i + 1
+  Wend
+  PokeL(@sd_vec[0] + count * 4, #SD_GUARD)
+  PokeL(@sd_ref[0] + count * 4, #SD_GUARD)
+
+  wroteV = SimdFill32(@sd_vec[0], value, count)
+  wroteS = SimdFill32Scalar(@sd_ref[0], value, count)
+
+  UartWriteStr("fill count=")
+  PutDec(count)
+  UartWriteNl()
+  Judge("  returned count                  ", wroteV, wroteS, 101)
+
+  ; THE TWIN COMPARISON IS NOT ENOUGH ON ITS OWN, and the sweep proved
+  ; it: two routines that both write NOTHING agree perfectly. So every
+  ; word is checked against the VALUE as well as against the twin -
+  ; the positive control the SIMD gate requires of every fixture,
+  ; applied here.
+  bad = 0
+  i = 0
+  While i < count
+    If Read32(@sd_vec[0] + i * 4) <> Read32(@sd_ref[0] + i * 4)
+      bad = bad + 1
+    EndIf
+    If Read32(@sd_vec[0] + i * 4) <> (value & $FFFFFFFF)
+      bad = bad + 1
+    EndIf
+    i = i + 1
+  Wend
+  Judge("  every word matches the twin     ", bad, 0, 102)
+  ; BOTH GUARDS, and that is not belt and braces either: the scalar
+  ; twin has its own end to run off, and a scalar routine that stores
+  ; eight bytes where the vector one stores four passes every
+  ; comparison of the region and clobbers the word after it.
+  Judge("  the guard word past the end     ", Read32(@sd_vec[0] + count * 4), #SD_GUARD, 103)
+  Judge("  ...and the twin's own guard     ", Read32(@sd_ref[0] + count * 4), #SD_GUARD, 104)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One blit case.
+; ----------------------------------------------------------------------
+Procedure BlitCase(count.i)
+  Define i.i
+  Define bad.i
+  Define copiedV.i
+  Define copiedS.i
+
+  i = 0
+  While i < 128
+    PokeL(@sd_src[0] + i * 4, $01010101 * (i + 1))
+    PokeL(@sd_vec[0] + i * 4, $DEADBEEF)
+    PokeL(@sd_ref[0] + i * 4, $DEADBEEF)
+    i = i + 1
+  Wend
+  PokeL(@sd_vec[0] + count * 4, #SD_GUARD)
+  PokeL(@sd_ref[0] + count * 4, #SD_GUARD)
+
+  copiedV = SimdBlit32(@sd_vec[0], @sd_src[0], count)
+  copiedS = SimdBlit32Scalar(@sd_ref[0], @sd_src[0], count)
+
+  UartWriteStr("blit count=")
+  PutDec(count)
+  UartWriteNl()
+  Judge("  returned count                  ", copiedV, copiedS, 111)
+
+  ; THE SOURCE IS CHECKED AGAINST A PATTERN, NOT AGAINST ITSELF. A blit
+  ; whose load and store were exchanged writes its SOURCE and leaves
+  ; its destination alone - and then the source, the destination and
+  ; the twin all hold the same bytes and every comparison between them
+  ; passes. The sweep found exactly that. The pattern is recomputed
+  ; here from i, so nothing in this check reads a buffer the routine
+  ; could have written.
+  bad = 0
+  i = 0
+  While i < 128
+    If Read32(@sd_src[0] + i * 4) <> (($01010101 * (i + 1)) & $FFFFFFFF)
+      bad = bad + 1
+    EndIf
+    i = i + 1
+  Wend
+  Judge("  the source is untouched         ", bad, 0, 114)
+
+  bad = 0
+  i = 0
+  While i < count
+    If Read32(@sd_vec[0] + i * 4) <> (($01010101 * (i + 1)) & $FFFFFFFF)
+      bad = bad + 1
+    EndIf
+    If Read32(@sd_vec[0] + i * 4) <> Read32(@sd_ref[0] + i * 4)
+      bad = bad + 1
+    EndIf
+    i = i + 1
+  Wend
+  Judge("  matches the pattern and the twin", bad, 0, 112)
+  Judge("  the guard word past the end     ", Read32(@sd_vec[0] + count * 4), #SD_GUARD, 113)
+  Judge("  ...and the twin's own guard     ", Read32(@sd_ref[0] + count * 4), #SD_GUARD, 115)
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define dotV.i
+  Define dotS.i
+  Define off.i
+  Define len.i
+  Define bad.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4SimdSelfTest - Advanced SIMD against its own scalar twins")
+  UartWriteNl()
+  UartWriteNl()
+
+  sd_pass = 0
+  sd_fail = 0
+
+  ; ------------------------------------------------------------------
+  ;  THE FILL AND THE BLIT, at every rung of the ladder.
+  ; ------------------------------------------------------------------
+  FillCase(0, $FF00FF00)
+  FillCase(1, $FF00FF00)
+  FillCase(3, $FF00FF00)
+  FillCase(4, $11223344)
+  FillCase(5, $11223344)
+  FillCase(15, $11223344)
+  FillCase(16, $A5A5A5A5)
+  FillCase(17, $A5A5A5A5)
+  FillCase(19, $A5A5A5A5)
+  FillCase(63, $0000FFFF)
+  FillCase(64, $0000FFFF)
+  FillCase(65, $0000FFFF)
+  UartWriteNl()
+
+  BlitCase(0)
+  BlitCase(1)
+  BlitCase(3)
+  BlitCase(4)
+  BlitCase(5)
+  BlitCase(15)
+  BlitCase(16)
+  BlitCase(17)
+  BlitCase(19)
+  BlitCase(63)
+  BlitCase(64)
+  BlitCase(65)
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  A NEGATIVE COUNT IS NOT AN ERROR AND IT IS NOT A DISASTER EITHER.
+  ;  It writes nothing and answers zero. Worth a case of its own,
+  ;  because the ladder's comparisons are UNSIGNED and a negative count
+  ;  reaching them would read as an enormous one and run off the end of
+  ;  memory. The guard at index 0 catches exactly that.
+  ; ------------------------------------------------------------------
+  PokeL(@sd_vec[0], #SD_GUARD)
+  i = SimdFill32(@sd_vec[0], $FFFFFFFF, -7)
+  UartWriteStr("a negative count")
+  UartWriteNl()
+  Judge("  fill answers zero               ", i, 0, 121)
+  Judge("  and wrote nothing at all        ", Read32(@sd_vec[0]), #SD_GUARD, 122)
+  PokeL(@sd_vec[0], #SD_GUARD)
+  i = SimdBlit32(@sd_vec[0], @sd_src[0], -7)
+  Judge("  blit answers zero               ", i, 0, 123)
+  Judge("  and wrote nothing at all        ", Read32(@sd_vec[0]), #SD_GUARD, 124)
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE DOT PRODUCT. Three cases, and the second and third are the
+  ;  point of the exercise.
+  ; ------------------------------------------------------------------
+  UartWriteStr("dot product")
+  UartWriteNl()
+
+  ; CASE 1: sixteen ones times sixteen ones. Every partial sum is a
+  ; small integer, every addition is exact, and the order therefore
+  ; cannot matter. The two must agree EXACTLY, and this is the case
+  ; that says the vector routine computes a dot product at all.
+  i = 0
+  While i < 16
+    PokeL(@sd_fa[0] + i * 4, $3F800000)          ; 1.0
+    PokeL(@sd_fb[0] + i * 4, $3F800000)          ; 1.0
+    i = i + 1
+  Wend
+  dotV = SimdDotF32B(@sd_fa[0], @sd_fb[0], 16)
+  dotS = SimdDotF32ScalarB(@sd_fa[0], @sd_fb[0], 16)
+  Judge("  16 x (1.0 * 1.0) agree exactly  ", dotV, dotS, 131)
+  Judge("  ...and the answer is 16.0       ", dotV, $41800000, 132)
+
+  ; CASE 2: THE ORDER MATTERS AND THE TWO ANSWERS DIFFER. One large
+  ; term and three terms of 2^-24. Left to right, each small term is
+  ; exactly half an ulp of the running total and ties to even, so all
+  ; three vanish. Four lanes wide, the three small terms land in three
+  ; SEPARATE accumulators, survive, and are added together first.
+  ;
+  ; NEITHER ANSWER IS WRONG. This case exists so that nobody later
+  ; "fixes" the disagreement, and it is asserted in both directions.
+  PokeL(@sd_fa[0], $3F800000)                    ; 1.0
+  PokeL(@sd_fa[0] + 4, $33800000)                ; 2^-24
+  PokeL(@sd_fa[0] + 8, $33800000)
+  PokeL(@sd_fa[0] + 12, $33800000)
+  PokeL(@sd_fb[0], $3F800000)
+  PokeL(@sd_fb[0] + 4, $3F800000)
+  PokeL(@sd_fb[0] + 8, $3F800000)
+  PokeL(@sd_fb[0] + 12, $3F800000)
+  dotV = SimdDotF32B(@sd_fa[0], @sd_fb[0], 4)
+  dotS = SimdDotF32ScalarB(@sd_fa[0], @sd_fb[0], 4)
+  Judge("  four lanes keep the small terms ", dotV, $3F800001, 133)
+  Judge("  one accumulator loses them      ", dotS, $3F800000, 134)
+
+  ; CASE 3: THE FUSION, on its own. Lane 0 accumulates -1.0 and then a
+  ; product whose low bit is exactly half an ulp of 1.0. Fused, that
+  ; bit survives into the sum because the product is never rounded;
+  ; unfused, the multiply rounds it away before the add ever sees it.
+  ; The other twelve elements are zero and contribute nothing.
+  i = 0
+  While i < 8
+    PokeL(@sd_fa[0] + i * 4, 0)
+    PokeL(@sd_fb[0] + i * 4, 0)
+    i = i + 1
+  Wend
+  PokeL(@sd_fa[0], $BF800000)                    ; -1.0
+  PokeL(@sd_fb[0], $3F800000)                    ; 1.0
+  PokeL(@sd_fa[0] + 16, $3F800800)               ; 1 + 2^-12
+  PokeL(@sd_fb[0] + 16, $3F800800)               ; 1 + 2^-12
+  dotV = SimdDotF32B(@sd_fa[0], @sd_fb[0], 8)
+  dotS = SimdDotF32ScalarB(@sd_fa[0], @sd_fb[0], 8)
+  Judge("  the fused form keeps the bit    ", dotV, $3A000400, 135)
+  Judge("  the separate multiply loses it  ", dotS, $3A000000, 136)
+
+  ; CASE 4: an empty dot product is +0.0 and not a fault.
+  Judge("  an empty dot product is +0.0    ", SimdDotF32B(@sd_fa[0], @sd_fb[0], 0), 0, 137)
+
+  ; ------------------------------------------------------------------
+  ;  CASE 5: THE TAIL. Counts of 5, 6 and 7 - more than one vector step
+  ;  and not a multiple of four - so the tail runs one, two and three
+  ;  times with a full body behind it.
+  ;
+  ;  THE SWEEP IS WHY THESE EXIST. Every dot-product case above uses a
+  ;  count that is a multiple of four, so the tail was never executed at
+  ;  all and a mutation that made it read the BODY's leftover operands
+  ;  survived. All ones, so the answer is a small integer, exact in
+  ;  every order, and a tail that dragged the previous four elements in
+  ;  with it would answer 12, 16 or 20 instead of 5, 6 or 7.
+  ; ------------------------------------------------------------------
+  i = 0
+  While i < 8
+    PokeL(@sd_fa[0] + i * 4, $3F800000)          ; 1.0
+    PokeL(@sd_fb[0] + i * 4, $3F800000)          ; 1.0
+    i = i + 1
+  Wend
+  Judge("  a tail of one: 5 ones give 5.0  ", SimdDotF32B(@sd_fa[0], @sd_fb[0], 5), $40A00000, 138)
+  Judge("  a tail of two: 6 ones give 6.0  ", SimdDotF32B(@sd_fa[0], @sd_fb[0], 6), $40C00000, 139)
+  Judge("  a tail of three: 7 give 7.0     ", SimdDotF32B(@sd_fa[0], @sd_fb[0], 7), $40E00000, 140)
+  Judge("  ...and the twin agrees on 7     ", SimdDotF32B(@sd_fa[0], @sd_fb[0], 7), SimdDotF32ScalarB(@sd_fa[0], @sd_fb[0], 7), 141)
+
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE TWO INTRINSICS. They are the instruction-level reach the
+  ;  library's loops are built out of, and they are the ONLY part of
+  ;  this campaign that both the Pi 4 and the Arduino UNO Q can use
+  ;  today - the Q has no library layer.
+  ;
+  ;  A DECLARED INTRINSIC THAT NOTHING CALLS IS AN INTRINSIC NOTHING
+  ;  TESTS. Both are executed here, and both are checked for what they
+  ;  did NOT touch as well as for what they did: sixteen bytes, not
+  ;  eight and not twenty.
+  ; ------------------------------------------------------------------
+  UartWriteStr("the intrinsics")
+  UartWriteNl()
+  ; SIXTEEN WORDS, not eight: the copy lands at +32 and the word AFTER
+  ; it, at +48, is one of the things being checked. The first draft
+  ; poisoned only the first eight and that word still held a blit
+  ; leftover, which read as the intrinsic having written too far.
+  i = 0
+  While i < 16
+    PokeL(@sd_vec[0] + i * 4, $DEADBEEF)
+    PokeL(@sd_src[0] + i * 4, $11110000 + i)
+    i = i + 1
+  Wend
+  a64_neon_zero128(@sd_vec[0])
+  Judge("  zero128 cleared the first word  ", Read32(@sd_vec[0]), 0, 151)
+  Judge("  ...and the fourth               ", Read32(@sd_vec[0] + 12), 0, 152)
+  Judge("  ...and stopped at sixteen bytes ", Read32(@sd_vec[0] + 16), $DEADBEEF, 153)
+
+  a64_neon_copy128(@sd_vec[0] + 32, @sd_src[0])
+  Judge("  copy128 moved the first word    ", Read32(@sd_vec[0] + 32), $11110000, 154)
+  Judge("  ...and the fourth               ", Read32(@sd_vec[0] + 44), $11110003, 155)
+  Judge("  ...and stopped at sixteen bytes ", Read32(@sd_vec[0] + 48), $DEADBEEF, 156)
+  Judge("  ...and left its source alone    ", Read32(@sd_src[0]), $11110000, 157)
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  CRC32, THE ONE EXTENSION THIS SILICON REPORTS AS IMPLEMENTED.
+  ;
+  ;  Not a vector instruction and this program does not pretend it is -
+  ;  see simd.pi4's header. It is here because it is the same campaign
+  ;  and it wants the same twin arrangement.
+  ;
+  ;  THE FIRST CASE IS THE ONLY ONE WITH AN OUTSIDE ORACLE AND IT IS THE
+  ;  ONE THAT MATTERS. Both routines could be wrong the same way - the
+  ;  reflected-polynomial identity is exactly the sort of thing two
+  ;  implementations written on one afternoon get identically wrong -
+  ;  and a twin comparison cannot see that at all. $CBF43926 is the
+  ;  check value every CRC catalogue prints for CRC-32/ISO-HDLC over
+  ;  the nine bytes "123456789". It is a number from outside this tree.
+  ; ------------------------------------------------------------------
+  UartWriteStr("crc32, the scalar extension this part HAS")
+  UartWriteNl()
+
+  PokeA(@sd_crc[0] + 0, 49)                      ; '1'
+  PokeA(@sd_crc[0] + 1, 50)
+  PokeA(@sd_crc[0] + 2, 51)
+  PokeA(@sd_crc[0] + 3, 52)
+  PokeA(@sd_crc[0] + 4, 53)
+  PokeA(@sd_crc[0] + 5, 54)
+  PokeA(@sd_crc[0] + 6, 55)
+  PokeA(@sd_crc[0] + 7, 56)
+  PokeA(@sd_crc[0] + 8, 57)                      ; '9'
+  Judge("  the PUBLISHED check value       ", SimdCrc32(@sd_crc[0], 9), $CBF43926, 161)
+  Judge("  ...and the software twin agrees ", SimdCrc32Scalar(@sd_crc[0], 9), $CBF43926, 162)
+
+  ; A LENGTH OF NINE IS EXACTLY ONE DOUBLEWORD AND ONE BYTE, so the case
+  ; above already runs both rungs from an aligned start. What it cannot
+  ; reach is the head of the ladder, which only runs when the ADDRESS is
+  ; unaligned - and that is the rung whose absence is fatal rather than
+  ; wrong: an `ldr x` at an odd address with the MMU off stops the board
+  ; dead with no output at all. Every offset 0..7 and every length 0..17
+  ; is checked below, which is 144 runs through every combination of the
+  ; three rungs.
+  i = 0
+  While i < 512
+    PokeA(@sd_crc[0] + i, (i * 37 + 11) % 256)
+    i = i + 1
+  Wend
+
+  bad = 0
+  off = 0
+  While off < 8
+    len = 0
+    While len < 18
+      If SimdCrc32(@sd_crc[0] + off, len) <> SimdCrc32Scalar(@sd_crc[0] + off, len)
+        bad = bad + 1
+      EndIf
+      len = len + 1
+    Wend
+    off = off + 1
+  Wend
+  Judge("  144 runs over every rung agree  ", bad, 0, 163)
+
+  ; A long run, so the doubleword loop is where nearly all the work is,
+  ; and one that is NOT a multiple of eight so the tail runs too.
+  Judge("  501 bytes at offset 3 agree     ", SimdCrc32(@sd_crc[0] + 3, 501), SimdCrc32Scalar(@sd_crc[0] + 3, 501), 164)
+
+  ; AN EMPTY RANGE ANSWERS THE ACCUMULATOR IT WAS GIVEN, masked to 32
+  ; bits, and does not fault. The finished form of an empty range is
+  ; therefore $FFFFFFFF inverted, which is zero - and a routine that
+  ; returned its raw accumulator instead would answer $FFFFFFFF here.
+  Judge("  an empty range is not a fault   ", SimdCrc32Part($12345678, @sd_crc[0], 0), $12345678, 165)
+  Judge("  ...and a negative length either ", SimdCrc32Part($12345678, @sd_crc[0], -9), $12345678, 166)
+  Judge("  the finished empty CRC is zero  ", SimdCrc32(@sd_crc[0], 0), 0, 167)
+
+  ; THE UPPER HALF OF THE ACCUMULATOR IS NOT THE CALLER'S TO KEEP. A
+  ; run of length zero executes no crc32 instruction at all, so nothing
+  ; clears the top of x0 for it - the routine has to. Passed a value
+  ; with rubbish above bit 31, both forms must still answer 32 bits.
+  Judge("  a 64-bit input is masked to 32  ", SimdCrc32Part($AAAAAAAA12345678, @sd_crc[0], 0), $12345678, 168)
+  Judge("  ...in the software twin too     ", SimdCrc32PartScalar($AAAAAAAA12345678, @sd_crc[0], 0), $12345678, 169)
+
+  ; RUNNING IT IN TWO PIECES IS THE SAME AS RUNNING IT IN ONE. This is
+  ; what the Part form exists for, and it is the property a boot-image
+  ; check depends on.
+  Judge("  two chunks equal one whole run  ", SimdCrc32Part(SimdCrc32Part($FFFFFFFF, @sd_crc[0], 100), @sd_crc[0] + 100, 156) ! $FFFFFFFF, SimdCrc32(@sd_crc[0], 256), 170)
+  UartWriteNl()
+
+  UartWriteStr("pi4SimdSelfTest done: ")
+  PutDec(sd_pass)
+  UartWriteStr(" passed, ")
+  PutDec(sd_fail)
+  UartWriteStr(" failed.")
+  UartWriteNl()
+  If sd_fail = 0
+    UartWriteStr("VERDICT: the vector routines and their scalar twins agree everywhere they must,")
+    UartWriteNl()
+    UartWriteStr("         and differ exactly where floating-point addition says they should.")
+  Else
+    UartWriteStr("VERDICT: FAILURES ABOVE. Each names its code and what it expected; read the")
+    UartWriteNl()
+    UartWriteStr("         first one, because a ladder defect makes every later case fail too.")
+  EndIf
+  UartWriteNl()
+  ProcedureReturn 0
+EndProcedure

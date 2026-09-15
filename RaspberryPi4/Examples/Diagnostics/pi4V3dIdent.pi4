@@ -1,0 +1,409 @@
+; pi4V3dIdent.pi4 - stage 0 of the V3D bring-up. Is the GPU there?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ONE READ IS THE POINT OF THIS PROGRAM. HUB_IDENT1 at $FEC0000C. Its
+; low twelve bits must be $124 - TVER=4, REV=2, NCORES=1 - and that one
+; 32-bit value proves the whole chain at once: the legacy-to-ARM address
+; derivation, Low Peripheral mode, the power domain, the clock, the
+; reset deassert and both ASB bridges. The prediction is made in
+; v3d.pi4 as #V3D_IDENT1_EXPECT_LOW12, in advance, so the run either
+; confirms it or names the failure.
+;
+; WHAT THE PROGRAM IS REALLY FOR, beyond that one word: nothing on this
+; disk says whether the firmware leaves V3D clocked and out of reset on
+; a bare-metal boot with no display driver loaded. The feasibility study
+; names that as stage 0's biggest unknown. So HUB_IDENT1 is sampled at
+; FOUR points - before anything, after the mailbox asks, after the
+; reset deassert, after the ASB bridges - and the four together answer
+; it in one run instead of leaving it to be guessed at.
+;
+; READ THE FOUR-SNAPSHOT TABLE FIRST when the run comes back. The
+; interesting outcomes are:
+;
+;   at entry already $...124   the firmware left it running. Neither the
+;                              mailbox nor the register sequence was
+;                              needed, and that is the cheapest possible
+;                              answer to the stage-4 ownership question
+;                              as well.
+;   zero until AFTER RESET     PM_GRAFX.V3DRSTN was the thing. The
+;                              register sequence is mandatory.
+;   zero until AFTER ASB       the bridges were the thing.
+;   zero throughout            it is dark. Compare the clock rows: a
+;                              MEASURED clock of zero and a dark block
+;                              agree; a measured clock of 500 MHz and a
+;                              dark block means the clock was never the
+;                              problem.
+;   $FFFFFFFF throughout       nothing answers at $FEC00000 at all. That
+;                              is a MAPPING failure, not a GPU failure,
+;                              and the bridge rows above will already
+;                              have said so and stopped.
+;
+; WHY THE BRIDGE ROWS COME FIRST AND WHY THE PROGRAM STOPS ON THEM.
+; $FE00A020 and $FEC11020 must each read $62726467, ASCII "brdg". Those
+; two reads need no clock, no power and no reset - only that the
+; address derivation and Low Peripheral mode are right. They are the
+; kernel's own probe check (bcm2835-power.c:645-658). They also gate
+; every WRITE this program makes, because the PM block being written to
+; also contains PM_RSTC and PM_WDOG, which are how this SoC is reset:
+; if the peripheral window is not where we think it is, a
+; password-bearing write at a guessed offset is a reboot rather than a
+; failed experiment.
+;
+; NOTHING IS TURNED OFF, ANYWHERE. There is no power-down path in
+; v3d.pi4 and this program has none either.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN. It is
+; sent to a resident monitor and RETURNS to it, so a wrong answer costs
+; a line of output rather than a power cycle:
+;
+;   pmfc RaspberryPi4\Examples\Diagnostics\pi4V3dIdent.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o _work\v3dident.img
+;
+; ARM THE DEADMAN BEFORE RUNNING IT. `deadman 15`. This program writes
+; to the SoC's power-management block. It has been written so that a
+; wrong address cannot be reached - see the bridge gate above - but
+; "cannot be reached" is a claim about this source, and the deadman is
+; a claim about nothing at all, which is what makes it worth having.
+;
+; THE RETURN VALUE is a compact verdict for the monitor's own line,
+; which prints only the low eight digits of x0:
+;    $124  - IDENT answered correctly. Everything below is detail.
+;    0     - the identity read did not pass; the error code is in the
+;            "verdict" row and the whole log says where it stopped.
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. PeekB names the SIGNED .b and sign-extends, so
+    ; a byte above 127 would come back negative and this loop would
+    ; never see its terminator. PeekA is the raw-byte accessor.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; Pad a name out so the values line up. Fixed width, no cleverness -
+; a column that drifts makes a table of hex unreadable, and this runs
+; before anything that could format for us.
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+; "  name .......... $XXXXXXXX"
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 22)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+; "  name .......... 12345"
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 22)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+; "  name .......... 12  (want 34)  MISMATCH"
+Procedure RowWant(*name, got.i, want.i)
+  PutS("  ")
+  PutPad(*name, 22)
+  PutDec(got)
+  PutS("   (predicted ")
+  PutDec(want)
+  PutS(")")
+  If got <> want
+    PutS("   MISMATCH")
+  EndIf
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The error code, spelled out. A number alone sends the reader back to
+;  the library to look it up, and the whole point of this program is
+;  that one run should be enough.
+; ----------------------------------------------------------------------
+Procedure PutErrName(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_BRIDGE_LEGACY
+      PutS("BRIDGE_LEGACY - $FE00A020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_BRIDGE_RPIVID
+      PutS("BRIDGE_RPIVID - $FEC11020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_PM_DEAD
+      PutS("PM_DEAD - PM_GRAFX read all-ones. PM base is wrong.")
+    Case #V3D_ERR_RESET
+      PutS("RESET - V3DRSTN did not stick. Password or offset.")
+    Case #V3D_ERR_ASB_MASTER
+      PutS("ASB_MASTER - master bridge ACK never cleared.")
+    Case #V3D_ERR_ASB_SLAVE
+      PutS("ASB_SLAVE - slave bridge ACK never cleared.")
+    Case #V3D_ERR_IDENT_ZERO
+      PutS("IDENT_ZERO - present but dark. Clock or reset.")
+    Case #V3D_ERR_IDENT_ONES
+      PutS("IDENT_ONES - nothing answers there. Mapping.")
+    Case #V3D_ERR_IDENT_VERSION
+      PutS("IDENT_VERSION - answering, and not V3D 4.2.")
+    Case #V3D_ERR_IDENT_CORES
+      PutS("IDENT_CORES - V3D 4.2, but NCORES is not 1.")
+    Default
+      PutS("unknown code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One snapshot row: the raw word, plus the decoded low twelve bits so
+;  the reader does not have to do the arithmetic four times.
+; ----------------------------------------------------------------------
+Procedure Snapshot(*when, v.i)
+  PutS("  ")
+  PutPad(*when, 22)
+  PutS("$")
+  PutHex(v, 8)
+  PutS("   low12 $")
+  PutHex(v & #V3D_IDENT1_LOW12_MASK, 3)
+  If (v & #V3D_IDENT1_LOW12_MASK) = #V3D_IDENT1_EXPECT_LOW12
+    PutS("   <-- ANSWERING")
+  EndIf
+  PutNl()
+EndProcedure
+
+
+Procedure Main()
+  Define r.i
+  Define i1.i
+  Define ci1.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 0 - bridge, power, clock, IDENTITY ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0a. The bridge witness, printed BEFORE anything is written, and
+  ;  the program stops here if it fails. Two reads.
+  ; ------------------------------------------------------------------
+  PutS("0a  AXI bridge IDs - both must read $62726467, ASCII 'brdg'")
+  PutNl()
+  RowHex("legacy  $FE00A020", V3dBridgeIdLegacy())
+  RowHex("rpivid  $FEC11020", V3dBridgeIdRpivid())
+  PutNl()
+
+  r = V3dBridgeCheck()
+  If r <> #V3D_OK
+    PutS("STOPPED: ")
+    PutErrName(r)
+    PutNl()
+    PutS("Nothing was written. The peripheral window is not where this")
+    PutNl()
+    PutS("build thinks it is; that is a mapping problem, not a GPU one.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutS("    both bridges answered. Writes are now permitted.")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0b. The whole sequence. V3dInit() takes the four snapshots.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+
+  PutS("0b  HUB_IDENT1 at each step - THIS IS THE INSTRUMENT")
+  PutNl()
+  Snapshot("at entry", V3dIdent1AtEntry())
+  Snapshot("after mailbox", V3dIdent1AfterClock())
+  Snapshot("after reset deassert", V3dIdent1AfterReset())
+  Snapshot("after ASB enable", V3dIdent1AfterAsb())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  What the firmware said. Recorded, not believed - on this part the
+  ;  state bits mean "some client has claimed this" and not "the
+  ;  hardware is running" (sdio.pi4:1690-1790). The MEASURED clock is
+  ;  the only row here that is an observation.
+  ; ------------------------------------------------------------------
+  PutS("    what the firmware said (recorded, NOT believed):")
+  PutNl()
+  RowDec("mailbox reachable", V3dMailboxUsed())
+  RowDec("domain 11 before", V3dDomainBefore())
+  RowDec("domain 11 set reply", V3dDomainReply())
+  RowDec("domain 11 after", V3dDomainAfter())
+  RowDec("power devid 10 before", V3dPowerBefore())
+  RowDec("power devid 10 reply", V3dPowerReply())
+  RowDec("clock 5 state before", V3dClockStateBefore())
+  RowDec("clock 5 state after", V3dClockStateAfter())
+  RowDec("clock 5 configured Hz", V3dClockRate())
+  RowDec("clock 5 max Hz", V3dClockMax())
+  RowDec("clock 5 applied Hz", V3dClockApplied())
+  RowDec("clock 5 MEASURED Hz", V3dClockMeasured())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  The registers that were written, before and after.
+  ; ------------------------------------------------------------------
+  PutS("    PM and ASB, before and after:")
+  PutNl()
+  RowHex("PM_GRAFX before", V3dGrafxBefore())
+  RowHex("PM_GRAFX after", V3dGrafxAfter())
+  RowHex("ASB master before", V3dAsbMasterBefore())
+  RowHex("ASB master after", V3dAsbMasterAfter())
+  RowHex("ASB slave before", V3dAsbSlaveBefore())
+  RowHex("ASB slave after", V3dAsbSlaveAfter())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  The identity dump.
+  ; ------------------------------------------------------------------
+  PutS("    the identity registers:")
+  PutNl()
+  RowHex("HUB_IDENT0 $FEC00000", V3dIdent0())
+  RowHex("HUB_IDENT1 $FEC0000C", V3dIdent1())
+  RowHex("HUB_IDENT2 $FEC00010", V3dIdent2())
+  RowHex("HUB_IDENT3 $FEC00014", V3dIdent3())
+  RowHex("MMU_DEBUG  $FEC01238", V3dMmuDebug())
+  RowHex("CORE_IDENT0 $FEC04000", V3dCoreIdent0())
+  RowHex("CORE_IDENT1 $FEC04004", V3dCoreIdent1())
+  RowHex("CORE_IDENT2 $FEC04008", V3dCoreIdent2())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  Decoded, against the predictions made in v3d.pi4.
+  ; ------------------------------------------------------------------
+  i1  = V3dIdent1()
+  ci1 = V3dCoreIdent1()
+  PutS("    decoded, against predictions made before the read:")
+  PutNl()
+  RowWant("TVER", V3dTverOf(i1), #V3D_EXPECT_TVER)
+  RowWant("REV", V3dRevOf(i1), #V3D_EXPECT_REV)
+  RowDec("version TVER*10+REV", V3dVersionOf(i1))
+  RowWant("NCORES", V3dCoresOf(i1), #V3D_EXPECT_NCORES)
+  RowDec("NHOSTS", V3dHostsOf(i1))
+  RowWant("slices  NSLC", V3dSlicesOf(ci1), #V3D_EXPECT_NSLC)
+  RowWant("QPUs/slice QUPS", V3dQpusPerSliceOf(ci1), #V3D_EXPECT_QUPS)
+  RowDec("TMUs", V3dTmusOf(ci1))
+  RowDec("semaphores", V3dSemaphoresOf(ci1))
+  RowDec("VPM size, KB", V3dVpmSizeKbOf(ci1))
+  PutNl()
+
+  ; The capability bits are NOT predicted. They are what the read is
+  ; for, and printing them as raw ones and zeros keeps them that way.
+  PutS("    capability bits (not predicted - this is what we came for):")
+  PutNl()
+  RowDec("WITH_L3C", (i1 >> 16) & 1)
+  RowDec("WITH_TFU", (i1 >> 17) & 1)
+  RowDec("WITH_TSY", (i1 >> 18) & 1)
+  RowDec("WITH_MSO", (i1 >> 19) & 1)
+  RowDec("WITH_MMU", (V3dIdent2() >> 8) & 1)
+  RowDec("L3C size, KB", V3dIdent2() & $FF)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  Faults. Zero everywhere is the healthy answer, and a non-zero here
+  ;  names its own problem rather than leaving a hang to be guessed at.
+  ; ------------------------------------------------------------------
+  PutS("    fault registers - all zero is healthy:")
+  PutNl()
+  RowHex("HUB_INT_STS", V3dHubIntStsNow())
+  RowHex("CTL_INT_STS", V3dCoreIntStsNow())
+  RowHex("ERR_STAT", V3dErrStatNow())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  Verdict.
+  ; ------------------------------------------------------------------
+  PutS("verdict: ")
+  PutErrName(r)
+  PutNl()
+
+  If r <> #V3D_OK
+    PutS("=== V3D DID NOT IDENTIFY ===")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  PutS("=== V3D 4.2 IS ALIVE - HUB_IDENT1 low 12 bits are $124 ===")
+  PutNl()
+  PutS("Next: nothing in v3d.pi4 submits a job, on purpose. Read the")
+  PutNl()
+  PutS("WHY THERE IS NO JOB SUBMISSION section before writing one.")
+  PutNl()
+  ProcedureReturn #V3D_IDENT1_EXPECT_LOW12
+EndProcedure

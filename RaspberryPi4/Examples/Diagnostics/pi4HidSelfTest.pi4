@@ -1,0 +1,383 @@
+; ======================================================================
+; pi4HidSelfTest - the modelled-bus gate for RaspberryPi4/Lib/hid.pi4
+; and for the hub and route-string additions to RaspberryPi4/Lib/xhci.pi4
+; ----------------------------------------------------------------------
+; THERE IS NO KEYBOARD ON THIS BENCH AND NO ACCESS TO THE BOARD from the
+; session that wrote this. So the whole bus is fabricated: a model of an
+; xHCI controller with a HUB on root port 1 - which is what this board
+; really has - a low-speed keyboard and a full-speed composite device
+; behind that hub, and a device that is HID but NOT boot-protocol, so
+; that the refusal path is executed and not merely written.
+;
+; The model lives in tools/a64/a64_hid_check.py and drives this program
+; on the project's A64 oracle.
+;
+; NOTHING HERE IS A CLAIM ABOUT SILICON. It is a test of the driver's
+; state machine: the ORDER of the enumeration, the contents of the slot
+; context for a device behind a hub, and the decoding of boot reports
+; into key events.
+;
+; THE PCIe SEAM. pcie.pi4 is not included; the four entry points
+; xhci.pi4 needs are stubbed here over a fake configuration window the
+; harness intercepts. This is copied deliberately from
+; pi4XhciSelfTest.pi4 so that the two gates present the same machine to
+; the same driver.
+;
+; Every check appends to res[]. The harness compares the whole array
+; against values it derives INDEPENDENTLY - the key-event expectations
+; are computed by a second decoder written from the HID specification in
+; Python, not transcribed from this driver - so a check that silently
+; stops running is a length mismatch, not a pass.
+; ======================================================================
+
+#XT_CFG = $700000000
+
+#XT_OUT_CPU  = $600000000
+#XT_OUT_BUS  = $F8000000
+#XT_OUT_SIZE = $04000000
+#XT_DMA_LIMIT = $C0000000
+
+Procedure.i PcieCfgRead32(bus.i, dev.i, fn.i, off.i)
+  ProcedureReturn PeekN(#XT_CFG + (bus << 20) + (dev << 15) + (fn << 12) + off)
+EndProcedure
+
+Procedure PcieCfgWrite32(bus.i, dev.i, fn.i, off.i, v.i)
+  PokeN(#XT_CFG + (bus << 20) + (dev << 15) + (fn << 12) + off, v)
+EndProcedure
+
+Procedure.i PcieCpuFromBus(busAddr.i)
+  If busAddr < #XT_OUT_BUS
+    ProcedureReturn -1
+  EndIf
+  If busAddr >= (#XT_OUT_BUS + #XT_OUT_SIZE)
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn #XT_OUT_CPU + (busAddr - #XT_OUT_BUS)
+EndProcedure
+
+Procedure.i PcieDmaOk(addr.i, len.i)
+  If len <= 0
+    ProcedureReturn 0
+  EndIf
+  If addr <= 0
+    ProcedureReturn 0
+  EndIf
+  If (addr + len) > #XT_DMA_LIMIT
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The ownership seam, copied from pi4XhciSelfTest.pi4 for the same reason
+; as the four above: a cold controller nothing adopted, and PcieEnableDma
+; as pcie.pi4 writes it minus the "has PcieEnumerate run" guard.
+Procedure.i PcieNeedsTakeover()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieAdoptCpu()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieAdoptHalted()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieEnableDma()
+  Define cmd.i
+  cmd = PcieCfgRead32(1, 0, 0, $04) & $FFFF
+  PcieCfgWrite32(1, 0, 0, $04, cmd | $0004)
+  ProcedureReturn Bool((PcieCfgRead32(1, 0, 0, $04) & $0004) <> 0)
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+
+; The result array is large because every key event is reported in full
+; - usage, up or down, and character - rather than folded into a
+; checksum. A checksum that matches proves the total is right and says
+; nothing about which event was wrong, and "which one" is the entire
+; question when a decoder gets the array-order rule wrong.
+#RES_MAX = 640
+
+Global Dim res.i[#RES_MAX]
+Global nres.i = 0
+
+; How many times the keyboard is polled. THE HARNESS SCRIPTS EXACTLY
+; THIS MANY REPORTS and the two numbers must agree; a mismatch shows up
+; as a length mismatch in the comparison rather than as a quiet pass on
+; a shorter run.
+#KBD_POLLS   = 18
+#MOUSE_POLLS = 6
+
+Procedure Chk(v.i)
+  If nres < #RES_MAX
+    res[nres] = v
+  EndIf
+  nres = nres + 1
+EndProcedure
+
+; One keyboard poll, reported in full: the event count, then SIX slots
+; of (usage, down, character), zero-filled past the count. Fixed width
+; so that a poll producing fewer events than expected shifts nothing -
+; it shows up as a zero where a usage should be, at the right index.
+Procedure PollKbd(h.i)
+  Define n.i
+  Define i.i
+  n = HidKeyboardPoll(h)
+  Chk(n)
+  i = 0
+  While i < 6
+    If i < n
+      Chk(HidKeyUsage(i))
+      Chk(HidKeyDown(i))
+      Chk(HidKeyCharAt(i))
+    Else
+      Chk(0)
+      Chk(0)
+      Chk(0)
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure Main()
+  Define i.i
+  Define n.i
+  Define kbd.i
+  Define mouse.i
+  Define kbd2.i
+
+  ; ---- 1. the controller ---------------------------------------------
+  Chk(XhciInit())
+  Chk(XhciLastError())
+  Chk(XhciMaxPorts())
+
+  ; ---- 2. enumerate everything ---------------------------------------
+  ; One call, because the whole point of HidFindAndAttachAll is that the
+  ; order of the twenty-odd steps inside it is not something a caller
+  ; should have to know. What it found is checked from both sides: the
+  ; count here, and the controller's own view of every slot context from
+  ; outside the program, in the harness.
+  n = HidFindAndAttachAll()
+  Chk(n)
+  Chk(HidCount())
+  Chk(HidLastError())
+
+  ; ---- 3. the hub ------------------------------------------------------
+  Chk(XhciHubSlot())
+  Chk(XhciHubRootPort())
+  Chk(XhciHubPorts())
+  Chk(XhciHubTtt())
+  Chk(XhciHubPgood())
+  Chk(XhciHubChar())
+
+  ; Port 1 of the hub is empty; ports 2, 3 and 4 are not. Asked AFTER
+  ; enumeration, so these also prove the hub still answers once devices
+  ; behind it are addressed - a hub whose own control endpoint stopped
+  ; working the moment a low-speed device appeared behind it would be a
+  ; transaction-translator fault, and it would look like a dead keyboard.
+  Chk(XhciHubPortConnected(1))
+  Chk(XhciHubPortConnected(2))
+  Chk(XhciHubPortConnected(3))
+  Chk(XhciHubPortConnected(4))
+  Chk(XhciHubPortSpeed(2))
+  Chk(XhciHubPortSpeed(3))
+
+  ; Refusals from the hub layer. A port number past bNbrPorts is a
+  ; caller mistake and must be named, not clamped onto the last port.
+  Chk(XhciHubPortConnected(9))
+  Chk(XhciLastError())
+
+  ; ---- 4. what was attached ------------------------------------------
+  kbd   = HidFind(#HID_PROTO_KEYBOARD)
+  mouse = HidFind(#HID_PROTO_MOUSE)
+  Chk(kbd)
+  Chk(mouse)
+  Chk(HidProtocol(kbd))
+  Chk(HidProtocol(mouse))
+  Chk(HidInterface(kbd))
+  Chk(HidInterface(mouse))
+  Chk(HidSlot(kbd))
+  Chk(HidSlot(mouse))
+  ; The interrupt endpoint that is recorded and deliberately not used.
+  ; Its bInterval is the number the polling decision has to be measured
+  ; against, so a driver that fails to record it has removed the only
+  ; yardstick there is.
+  Chk(HidEndpoint(kbd))
+  Chk(HidEndpointMps(kbd))
+  Chk(HidInterval(kbd))
+  Chk(HidEndpoint(mouse))
+  Chk(HidInterval(mouse))
+  Chk(HidIdleAccepted(kbd))
+  Chk(HidIdleAccepted(mouse))
+
+  ; The composite device's SECOND interface. It is a keyboard on the
+  ; same slot as the mouse, and the whole reason HidAttach takes a
+  ; skipIface argument. Finding it by protocol would return the FIRST
+  ; keyboard, so it is found by walking handles.
+  kbd2 = 0
+  i = 1
+  While i <= 4
+    If HidSlot(i) = HidSlot(mouse)
+      If HidProtocol(i) = #HID_PROTO_KEYBOARD
+        kbd2 = i
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  Chk(kbd2)
+  Chk(HidInterface(kbd2))
+  Chk(HidSlot(kbd2))
+
+  ; ---- 5. the pure layout function, before any device is polled ------
+  ; These need no keyboard at all and are the cheapest possible check on
+  ; the tables. Every one is a case somebody gets wrong.
+  Chk(HidKeyChar($04, 0, 0, 0))                    ; a
+  Chk(HidKeyChar($04, #HID_MOD_LSHIFT, 0, 0))      ; A
+  Chk(HidKeyChar($04, 0, 1, 0))                    ; caps -> A
+  Chk(HidKeyChar($04, #HID_MOD_LSHIFT, 1, 0))      ; caps+shift -> a
+  Chk(HidKeyChar($04, #HID_MOD_RSHIFT, 0, 0))      ; RIGHT shift too
+  Chk(HidKeyChar($1E, 0, 0, 0))                    ; 1
+  Chk(HidKeyChar($1E, #HID_MOD_LSHIFT, 0, 0))      ; !
+  Chk(HidKeyChar($1E, 0, 1, 0))                    ; caps does NOT
+                                                   ; affect a digit
+  Chk(HidKeyChar($27, 0, 0, 0))                    ; 0
+  Chk(HidKeyChar($27, #HID_MOD_LSHIFT, 0, 0))      ; )
+  Chk(HidKeyChar($28, 0, 0, 0))                    ; Return -> 13
+  Chk(HidKeyChar($29, 0, 0, 0))                    ; Escape -> 27
+  Chk(HidKeyChar($2A, 0, 0, 0))                    ; Backspace -> 8
+  Chk(HidKeyChar($2B, 0, 0, 0))                    ; Tab -> 9
+  Chk(HidKeyChar($2C, 0, 0, 0))                    ; Space -> 32
+  Chk(HidKeyChar($2D, #HID_MOD_LSHIFT, 0, 0))      ; _
+  Chk(HidKeyChar($34, 0, 0, 0))                    ; '
+  Chk(HidKeyChar($34, #HID_MOD_LSHIFT, 0, 0))      ; "
+  Chk(HidKeyChar($35, 0, 0, 0))                    ; `
+  Chk(HidKeyChar($35, #HID_MOD_LSHIFT, 0, 0))      ; ~
+  Chk(HidKeyChar($38, #HID_MOD_LSHIFT, 0, 0))      ; ?
+  Chk(HidKeyChar($39, 0, 0, 0))                    ; Caps Lock itself -
+                                                   ; no character
+  Chk(HidKeyChar($3A, 0, 0, 0))                    ; F1 - no character
+  Chk(HidKeyChar($4F, 0, 0, 0))                    ; Right arrow - none
+  Chk(HidKeyChar($4C, 0, 0, 0))                    ; Delete -> 127
+  Chk(HidKeyChar($59, 0, 0, 0))                    ; keypad 1, Num Lock
+                                                   ; OFF -> no character
+  Chk(HidKeyChar($59, 0, 0, 1))                    ; keypad 1, Num Lock
+                                                   ; ON -> 49
+  Chk(HidKeyChar($62, 0, 0, 1))                    ; keypad 0 -> 48
+  Chk(HidKeyChar($58, 0, 0, 0))                    ; keypad Enter -> 13
+                                                   ; regardless of lock
+  Chk(HidKeyChar($64, 0, 0, 0))                    ; Non-US backslash
+  Chk(HidKeyChar($64, #HID_MOD_LSHIFT, 0, 0))      ; -> |
+  Chk(HidKeyChar($32, 0, 0, 0))                    ; Non-US # -> 35
+  Chk(HidKeyChar($67, 0, 0, 1))                    ; keypad = -> 61
+  Chk(HidKeyChar($68, 0, 0, 0))                    ; F13 - past the
+                                                   ; table, must be 0
+  Chk(HidKeyChar($FF, 0, 0, 0))                    ; out of range
+  Chk(HidKeyChar(-1, 0, 0, 0))                     ; negative
+
+  ; ---- 6. the keyboard, through a scripted sequence ------------------
+  ; The harness supplies #KBD_POLLS reports in a fixed order and knows
+  ; what each one should decode to. The interesting ones, and what each
+  ; is there to catch, are named in the harness beside the script.
+  HidPollResetStats()
+  i = 0
+  While i < #KBD_POLLS
+    PollKbd(kbd)
+    i = i + 1
+  Wend
+
+  ; The lock state the sequence should have left behind, and the lamp
+  ; byte that was pushed out to match it.
+  Chk(HidCapsLock())
+  Chk(HidNumLock())
+  Chk(HidScrollLock())
+  Chk(HidKeyOverflows())
+
+  ; The measurement instrument. The model advances its tick counter by a
+  ; fixed amount per instruction, so these are not milliseconds of
+  ; anything real - what is checked is that the count matches the number
+  ; of polls and that the totals are non-zero and ordered, which is what
+  ; a caller relies on. A worst case smaller than the mean would mean
+  ; the bookkeeping is wrong.
+  Chk(HidPollCount())
+  If HidPollTicks() > 0
+    Chk(1)
+  Else
+    Chk(0)
+  EndIf
+  If HidPollWorstUs() >= HidPollMeanUs()
+    Chk(1)
+  Else
+    Chk(0)
+  EndIf
+
+  ; ---- 7. the lamps ----------------------------------------------------
+  ; Caps Lock was pressed an odd number of times above, so the lamp byte
+  ; must have Caps Lock set. HidSyncLeds only issues a transfer when the
+  ; state changed, so calling it twice must leave one byte and succeed
+  ; both times.
+  Chk(HidSyncLeds(kbd))
+  Chk(HidLeds())
+  Chk(HidSyncLeds(kbd))
+  Chk(HidLeds())
+  Chk(HidSetLeds(kbd, $FF))     ; trimmed to five bits
+  Chk(HidLeds())
+  Chk(HidSetLeds(mouse, 0))     ; a mouse has no lamps - refused
+  Chk(HidLastError())
+
+  ; ---- 8. the mouse ----------------------------------------------------
+  HidMouseTake()
+  i = 0
+  While i < #MOUSE_POLLS
+    Chk(HidMousePoll(mouse))
+    Chk(HidMouseButtons())
+    i = i + 1
+  Wend
+  ; Motion ACCUMULATES across polls, so these are the sums over the
+  ; whole scripted sequence and not the last report's values. A decoder
+  ; that overwrites instead of adding gives the last report's numbers,
+  ; which are plausible and wrong.
+  Chk(HidMouseDx())
+  Chk(HidMouseDy())
+  Chk(HidMouseWheel())
+  Chk(HidMouseHasWheel())
+  HidMouseTake()
+  Chk(HidMouseDx())
+  Chk(HidMouseDy())
+  Chk(HidMouseWheel())
+  Chk(HidMouseButtons())        ; buttons are state - NOT cleared
+
+  ; ---- 9. refusals -----------------------------------------------------
+  Chk(HidKeyboardPoll(mouse))   ; wrong device kind
+  Chk(HidMousePoll(kbd))
+  Chk(HidPoll(0))               ; not a handle
+  Chk(HidPoll(99))
+  Chk(HidSlot(0))
+  Chk(HidProtocol(0))
+  Chk(HidFind(99))              ; no such protocol
+
+  ; The raw bytes of the last keyboard report, exactly as they arrived.
+  ; This is the answer to "what did the keyboard actually send" and it is
+  ; checked because every decode above is an interpretation.
+  i = 0
+  While i < 8
+    Chk(HidReportByte(kbd, i))
+    i = i + 1
+  Wend
+  Chk(HidReportLength(kbd))
+
+  ; ---- 10. detach and re-find ------------------------------------------
+  HidDetach(kbd2)
+  Chk(HidCount())
+  Chk(HidSlot(kbd2))
+  Chk(HidPoll(kbd2))            ; a detached handle is refused
+
+  ; ---- 11. the arena did not overflow ----------------------------------
+  Chk(XhciArenaUsed())
+  Chk(XhciLastError())
+
+  Chk(nres)
+EndProcedure
+
+Main()

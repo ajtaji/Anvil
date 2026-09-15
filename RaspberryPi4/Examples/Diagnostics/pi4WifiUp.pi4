@@ -1,0 +1,358 @@
+; ======================================================================
+;  pi4WifiUp.pi4 - upload the CYW43455 firmware and release its ARM.
+;
+;  This is the step after pi4SdioProbe. The probe proves the bus works
+;  and stops at the point where a radio needs 609309 bytes of firmware
+;  it does not have. This program supplies them.
+;
+;  WHY THE FIRMWARE IS NOT IN THIS FILE. The CYW43455 has no flash of
+;  its own. Its ARM comes out of reset with empty RAM, so every cold
+;  boot has to push the whole image across SDIO before the chip can do
+;  anything at all. Compiling 609 KB into the payload would make the
+;  payload larger than Anvil, and Anvil already knows how to read files
+;  off the boot medium. So the division of labour is:
+;
+;      Anvil          reads the files off the stick into DRAM
+;      this payload   pushes what is in DRAM across the bus
+;
+;  and the two meet at a pair of addresses agreed here in constants.
+;  Nothing in this file touches the filesystem.
+;
+;  HOW TO RUN IT - all five lines matter and the order matters:
+;
+;      deadman 25
+;      load BRCMFW.BIN 1000000
+;      load BRCMNV.TXT 2000000
+;      receive 400000 <len> <crc>
+;      run 400000
+;
+;  THE LENGTHS ARE NOT PASSED IN, THEY ARE CHECKED. A payload takes no
+;  arguments, so the sizes below are constants. That would normally be a
+;  latent trap - load a different build of the firmware and this program
+;  would push the wrong number of bytes and blame the radio. So it does
+;  not trust them: it takes a CRC32 over each buffer and compares it
+;  with the value recorded here, and refuses if either disagrees. A
+;  wrong file is then a named refusal on the first screen instead of a
+;  chip that almost works.
+;
+;  THE CRCs ARE OF THE UPSTREAM FILES, taken on the host and confirmed
+;  by reading them back off the stick on this board:
+;
+;      brcmfmac43455-sdio.bin  609309 bytes  crc32 B8B12CED
+;      brcmfmac43455-sdio.txt    2074 bytes  crc32 2BDBDDF6
+;
+;  WHERE THE BUFFERS GO. $1000000 and $2000000 are both inside the low
+;  window Anvil documents at boot (00400000 to 07EFFFFF), a long way
+;  above this payload at $400000 and a long way apart from each other.
+;  The firmware buffer is 609309 bytes, so it ends at $1094BDD and comes
+;  nowhere near the NVRAM at $2000000.
+;
+;  IT DOES NOT SCAN, JOIN OR SEND A FRAME. Those need the SDPCM
+;  transport, which is not written. What this program can honestly
+;  prove is that the image goes in, verifies byte for byte, and the
+;  chip has its processor out of reset - which is the whole of the
+;  bring-up and is the thing nothing on this board has ever done.
+;
+;   PureMetalForge.exe --compile pi4WifiUp.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o wifiup.img
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+
+#WU_FW_ADDR   = $1000000
+#WU_FW_LEN    = 609309
+#WU_FW_CRC    = $B8B12CED
+
+#WU_NV_ADDR   = $2000000
+#WU_NV_LEN    = 2074
+#WU_NV_CRC    = $2BDBDDF6
+
+; The NVRAM is rewritten on the way in - Cyw43UploadNvram strips
+; comments and blank lines and appends a length token - so it needs
+; somewhere to build the cooked copy. It can only ever get SHORTER than
+; the source, so the source length is a safe bound; this rounds up to a
+; comfortable 8 KB rather than sizing it to the byte, because a work
+; buffer that is exactly big enough is one edit away from not being.
+#WU_WORK_ADDR = $2100000
+#WU_WORK_MAX  = 8192
+
+; The verify scratch. Cyw43VerifyMem reads back through this in chunks,
+; so it bounds how much of the bus is in flight at once and nothing
+; else. 4 KB is 64 block-mode reads of 64 bytes.
+#WU_SCRATCH_ADDR = $2200000
+#WU_SCRATCH_LEN  = 4096
+
+; PutHexN lives in pi4SdioProbe too, and is duplicated here rather than
+; hoisted into uart.pi4 because uart.pi4 is a library and a library here
+; never includes a library - so anything it gains, every user of it
+; gains, whether they print hex or not. Twelve lines is the cheaper
+; price. If a third diagnostic wants it, that is the moment to move it.
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  wu_Crc32 - IEEE 802.3, reflected, polynomial EDB88320.
+;
+;  The same one Anvil crc32 uses and the same one tools/anvil.py
+;  computes, which is the point: a value computed here that matches the
+;  one the host computed means two independent implementations agree
+;  about the bytes, rather than one implementation agreeing with itself.
+;
+;  No table. A 1 KB table would have to be built at run time anyway
+;  because this payload has no initialised data section worth the name,
+;  and 609 KB of bitwise CRC costs a fraction of a second next to the
+;  SDIO transfer it is guarding.
+; ----------------------------------------------------------------------
+Procedure.i wu_Crc32(*buf, n.i)
+  Define c.i
+  Define i.i
+  Define k.i
+  Define b.i
+
+  ; THE ACCUMULATOR IS .i AND MASKED, AND THE FIRST VERSION WAS NEITHER.
+  ; It used .l and wrote c = c >> 1. A .l is a SIGNED 32-bit long, so
+  ; that is an ARITHMETIC shift: the moment the CRC value has its top
+  ; bit set - which it does within the first few bytes - the shift drags
+  ; a one in from the left instead of a zero, and every value after that
+  ; is wrong. On the board it produced FCDCA722 for an image Anvil's own
+  ; crc32 command reads as B8B12CED.
+  ;
+  ; It is a good failure to have had here rather than later: the guard
+  ; refused, said exactly which value it saw, and sent nothing to the
+  ; radio. Had this been a silent difference it would have looked like a
+  ; corrupt firmware file.
+  ;
+  ; The fix keeps c in a 64-bit .i and masks back to 32 bits after every
+  ; step, so the value is never negative and >> is never arithmetic on
+  ; anything that matters.
+  c = $FFFFFFFF
+  i = 0
+  While i < n
+    b = PeekA(*buf + i) & $FF
+    c = (c ! b) & $FFFFFFFF
+    k = 0
+    While k < 8
+      If (c & 1) <> 0
+        c = ((c >> 1) ! $EDB88320) & $FFFFFFFF
+      Else
+        c = (c >> 1) & $FFFFFFFF
+      EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn (c ! $FFFFFFFF) & $FFFFFFFF
+EndProcedure
+
+Procedure wu_Why(*what)
+  UartWriteStr("  !! ")
+  UartWriteStr(*what)
+  UartWriteStr(" - ")
+  UartWriteStr(Cyw43ErrorText())
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define ok.i
+  Define got.i
+
+  ; NO UartInit HERE. Anvil has the PL011 up and running before it
+  ; jumps into a payload - that is how this program's own output
+  ; reaches anyone - and re-initialising it would reset the divisor
+  ; underneath a monitor that may well have moved the line to 1.5
+  ; Mbaud. pi4SdioProbe does not call it either, for the same reason.
+  PrintNl()
+  PrintN("=== CYW43455 firmware upload and start ===")
+  PrintNl()
+
+  ; ---- the buffers, before a single bus cycle -----------------------
+  ; This runs FIRST, deliberately. Bringing the bus up takes a couple of
+  ; seconds and touches the power rails; discovering afterwards that the
+  ; operator loaded the wrong file wastes all of it and, worse, invites
+  ; the reading that the radio was at fault.
+  PrintN("-- what is in memory --")
+  got = wu_Crc32(#WU_FW_ADDR, #WU_FW_LEN)
+  HexLine("firmware crc32 at 1000000", got, 8)
+  If got <> #WU_FW_CRC
+    PrintN("  !! that is not the firmware this program was built against.")
+    PrintN("     Expected B8B12CED over 609309 bytes. Load BRCMFW.BIN to")
+    PrintN("     1000000 and run this again. Nothing has been sent to the")
+    PrintN("     radio and the bus has not been touched.")
+    ProcedureReturn 1
+  EndIf
+  PrintN("  the firmware image is the one this program expects")
+
+  got = wu_Crc32(#WU_NV_ADDR, #WU_NV_LEN)
+  HexLine("nvram crc32 at 2000000", got, 8)
+  If got <> #WU_NV_CRC
+    PrintN("  !! that is not the NVRAM this program was built against.")
+    PrintN("     Expected 2BDBDDF6 over 2074 bytes. Load BRCMNV.TXT to")
+    PrintN("     2000000 and run this again. Nothing has been sent.")
+    ProcedureReturn 1
+  EndIf
+  PrintN("  the NVRAM file is the one this program expects")
+  PrintNl()
+
+  ; ---- the mailbox and the controller clock -------------------------
+  ; SdioInit REFUSES WITHOUT THIS, and says so by name: "base clock
+  ; unknown - Capabilities says 0, call SdioSetBaseClockKhz with mailbox
+  ; clock id 1". On a BCM2711 the SDHCI Capabilities register reads back
+  ; zero for the base clock field, so the controller cannot be asked how
+  ; fast it is being fed; only the VideoCore firmware knows, and it has
+  ; to be asked over the mailbox before any command can be timed.
+  ;
+  ; CLOCK ID 1 IS EMMC AND NOT EMMC2. They are different clocks feeding
+  ; different controllers, and this program drives mmcnr at $FE300000,
+  ; which is the one on the EMMC clock. Getting this wrong does not
+  ; refuse - it produces a plausible number and a bus running at the
+  ; wrong speed, which is the kind of fault that looks like bad silicon.
+  #WU_CLOCK_ID_EMMC = 1
+
+  PrintN("-- power and clock --")
+  ok = MailboxInit()
+  Line("mailbox init (want 1)", ok)
+  If ok = 0
+    PrintN("  !! the mailbox refused, so the EMMC clock rate cannot be asked")
+    PrintN("     for and the bus cannot be brought up. Nothing was sent.")
+    ProcedureReturn 1
+  EndIf
+
+  Define hz.i
+  hz = MailboxClockRate(#WU_CLOCK_ID_EMMC)
+  Line("EMMC clock Hz (id 1)", hz)
+  If hz <= 0
+    PrintN("  !! the firmware would not name the EMMC clock, so sdio.pi4 has")
+    PrintN("     no base rate to divide and will refuse. Nothing was sent.")
+    ProcedureReturn 1
+  EndIf
+  SdioSetBaseClockKhz(hz / 1000)
+  Line("base clock kHz", hz / 1000)
+  PrintNl()
+
+  ; ---- the bus ------------------------------------------------------
+  PrintN("-- the bus --")
+  ok = SdioInit()
+  Line("SdioInit (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  !! ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = SdioEnableFunction(1)
+  Line("enable F1 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  !! ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Line("Cyw43SetIo (want 1)", ok)
+  ok = Cyw43Attach()
+  Line("Cyw43Attach (want 1)", ok)
+  If ok = 0
+    wu_Why("Cyw43Attach")
+    ProcedureReturn 1
+  EndIf
+
+  ; BLOCK MODE IS NOT OPTIONAL HERE. 609309 bytes in 64-byte byte-mode
+  ; chunks is 9521 separate commands; in 64-byte blocks the same bytes
+  ; go as multi-block transfers and the command count collapses. This is
+  ; the path that was broken until the byte-mode ceiling and the R5
+  ; inhibit bug were fixed, so a failure on these two lines means that
+  ; regressed rather than that the firmware is wrong.
+  ok = Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+  Line("Cyw43SetBlockIo (want 1)", ok)
+  ok = Cyw43SetBlockMode(1)
+  Line("block mode on (want 1)", ok)
+  If ok = 0
+    wu_Why("Cyw43SetBlockMode")
+    ProcedureReturn 1
+  EndIf
+  PrintNl()
+
+  ; ---- the cores ----------------------------------------------------
+  PrintN("-- the radio own memory --")
+  ok = Cyw43PrepareDownload()
+  Line("Cyw43PrepareDownload (want 1)", ok)
+  If ok = 0
+    wu_Why("Cyw43PrepareDownload")
+    ProcedureReturn 1
+  EndIf
+  Line("image bytes needed", #WU_FW_LEN)
+  PrintNl()
+
+  ; ---- the upload ---------------------------------------------------
+  PrintN("-- the upload --")
+  PrintN("  609309 bytes are going across the bus now. This takes a few")
+  PrintN("  seconds and prints nothing while it runs.")
+  ok = Cyw43UploadFirmware(#WU_FW_ADDR, #WU_FW_LEN, #WU_SCRATCH_ADDR, #WU_SCRATCH_LEN)
+  Line("Cyw43UploadFirmware (want 1)", ok)
+  If ok = 0
+    wu_Why("Cyw43UploadFirmware")
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43UploadNvram(#WU_NV_ADDR, #WU_NV_LEN, #WU_WORK_ADDR, #WU_WORK_MAX, #WU_SCRATCH_ADDR, #WU_SCRATCH_LEN)
+  Line("Cyw43UploadNvram (want 1)", ok)
+  If ok = 0
+    wu_Why("Cyw43UploadNvram")
+    ProcedureReturn 1
+  EndIf
+  Line("nvram bytes after cooking", Cyw43NvramBytes())
+  PrintNl()
+
+  ; ---- release the ARM ----------------------------------------------
+  PrintN("-- releasing the radio processor --")
+  ok = Cyw43Start()
+  Line("Cyw43Start (want 1)", ok)
+  If ok = 0
+    wu_Why("Cyw43Start")
+    ProcedureReturn 1
+  EndIf
+  PrintN("  the CYW43455 is running its own firmware.")
+  PrintNl()
+  PrintN("  WHAT THIS DOES NOT YET MEAN: nothing has been asked of the")
+  PrintN("  radio and nothing has answered. Scanning needs the SDPCM")
+  PrintN("  transport, which is not written. What is proven is that the")
+  PrintN("  image went in, verified, and the processor came out of reset.")
+
+  PrintNl()
+  PrintN("=== done ===")
+  ProcedureReturn 0
+EndProcedure
+
+Main()

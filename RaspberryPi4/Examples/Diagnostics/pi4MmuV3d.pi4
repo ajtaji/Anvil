@@ -1,0 +1,661 @@
+; pi4MmuV3d.pi4 - THE 60 fps TEST, now proving REPEATED cached frames.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4MmuV3d.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o RaspberryPi4/Examples/Diagnostics/pi4MmuV3d.img
+;
+; ======================================================================
+;  WHAT THIS PROVES, AND WHAT THE SILICON ALREADY SAID
+; ======================================================================
+;  FIRST SILICON RUN (2026-08-29): caches ON works. SCTLR_EL2 came back
+;  $30C51835 (M | C | I set), the textured picture was PIXEL-EXACT under
+;  cached DRAM (ink 2041/2041, ground 10119/10119, all glyph probes OK),
+;  and the textured full-screen VERTEX BUILD fell from ~124 ms to
+;  1729 us - a 72x cut, full frame ~14 ms, i.e. 60 fps REACHED. That
+;  number is proven and is not re-litigated here.
+;
+;  THE OPEN QUESTION THIS VERSION ANSWERS: are CONSECUTIVE cached frames
+;  solid? A live console repaints frame after frame; if the SECOND cached
+;  frame is wrong or never completes, the console dies after one repaint.
+;  So this file renders #TT_FRAMES FULL TEXTURED frames BACK TO BACK,
+;  and after EACH one:
+;    * verifies EVERY pixel of the drawn text band against an independent
+;      read of the font (ink -> text colour, blank -> ground), and
+;    * DUMPS the full V3D completion state - bin BFC and render RFC
+;      before/after, bin/render spin counts, CT0CS/CT1CS, INT_STS,
+;      ERR_STAT, MMU_CTL, OOM count - so a frame that FAILS shows WHY:
+;      a render timeout (RFC did not move, CT1CS still busy) reads
+;      differently from a driver error (ERR_STAT set) or an MMU fault
+;      (MMU_CTL faults, a VIO address), which a bare "RENDER FAILED"
+;      with both error codes zero could not distinguish.
+;
+;  Each frame POISONS the whole surface with the CPU first (dirty cached
+;  stores), CLEANS it to DRAM, then renders and reads back - so every
+;  frame independently exercises the CPU-writes / GPU-writes coherency
+;  edge, not just the first. If frame K comes back wrong while frame 0
+;  was exact, that is a per-frame coherency or CLE-state bug and the dump
+;  for frame K names it.
+;
+; ======================================================================
+;  THE COHERENCY WORK (unchanged in principle, now PER FRAME)
+; ======================================================================
+;  With DRAM cacheable the CPU's writes sit in the D-cache and V3D reads
+;  DRAM directly. Every GPU-read buffer is cleaned by the engine's own
+;  V3dCacheRange() sites before the doorbell, and the framebuffer is
+;  invalidated for read-back by V3dRenderWait() - and ALL of that fires
+;  on EVERY NeonFrameEnd, so it already covers repeated frames:
+;
+;    vertex arrays / shader recs / uniforms / QPU code  NeonFrameEnd
+;    bin CL / tile-alloc pool / tile-state              V3dBinSubmit
+;    render CL / tile-list / render target              V3dRenderSubmit
+;    framebuffer read-back (invalidate)                 V3dRenderWait
+;    texture atlas + sampler state                      built ONCE, MMU off
+;
+;  THE ONE THING THIS FILE OWNS, done every frame: the CPU poison of the
+;  framebuffer is a dirty-line write to a buffer the GPU then overwrites.
+;  V3dCacheRange over the whole surface after the poison and before any
+;  GPU work stops V3dRenderWait's later civac from writing that poison
+;  back over the GPU's pixels. One clean per frame, right after the
+;  poison.
+;
+; ======================================================================
+;  ORDER / SAFETY (as pi4MmuIdentity)
+; ======================================================================
+;  Bring up mailbox/display/V3D/neon and build the atlas MMU OFF; print
+;  the pre-state; build + DUMP the tables; re-arm the deadman; enable
+;  M|C|I; render the frames (deadman re-armed each frame); restore with
+;  the MMU OFF. A bad map hangs at the enable and the deadman resets in
+;  ~16 s (nothing to revert). A coherency/state bug shows as a wrong or
+;  failed frame with its register dump, printed while the caches are
+;  still on so every value read is fresh.
+;
+;  ONE clean run per boot - a hung render wedges V3D and the board
+;  is rebooted between runs.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#TABLES = $00600000
+
+#TT_ARENA       = $04000000
+#TT_ARENA_BYTES = $01000000
+#TT_POISON      = $A5A5A5A5
+
+#TT_GR = $11
+#TT_GG = $33
+#TT_GB = $55
+#TT_IR = $EE
+#TT_IG = $C4
+#TT_IB = $7A
+
+; The full-screen textured block: ttStr (ASCII 32..126) at #TT_FULL_X,
+; rows top to bottom, STEP == glyph height so rows are contiguous.
+#TT_FULL_X       = 8
+#TT_FULL_Y0      = 8
+#TT_FULL_STEP    = 16
+#TT_FULL_COLS    = 95
+#TT_FULL_MAXGLY  = 3000
+
+; HOW MANY consecutive full textured frames to render and verify. The
+; point is > 1; four proves the 2nd, 3rd and 4th all hold.
+#TT_FRAMES = 4
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define n.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  n = 0
+  i = 0
+  While PeekA(*name + i) <> 0
+    n = n + 1
+    i = i + 1
+  Wend
+  While n < width
+    UartWrite(32)
+    n = n + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutPad(*name, 30)
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowHex16(*name, v.i)
+  PutPad(*name, 30)
+  PutHex(v, 16)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutPad(*name, 30)
+  PrintDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  If e = 0
+    PutS("OK")
+  Else
+    PutS("error ")
+    PrintDec(e)
+  EndIf
+EndProcedure
+
+Procedure DumpTables()
+  Define i.i
+  PutS("level 1, the slots that are mapped:") : PutNl()
+  For i = 0 To #MMU_L1_ENTRIES - 1
+    If MmuDescriptor(#TABLES, i) <> 0
+      UartWriteStr("  L1 slot ")
+      PrintDec(i)
+      UartWriteStr("  ")
+      PutHex(MmuDescriptor(#TABLES, i), 16)
+      PutNl()
+    EndIf
+  Next
+  PutS("level 2, the three boundaries that decide it:") : PutNl()
+  RowHex16("  L2 479 top of DRAM", MmuDescriptorL2(#TABLES, 479))
+  RowHex16("  L2 480 peripherals", MmuDescriptorL2(#TABLES, 480))
+  RowHex16("  L2 508 ARM-local", MmuDescriptorL2(#TABLES, 508))
+EndProcedure
+
+; ======================================================================
+;  THE STRING - ASCII 32..126.
+; ======================================================================
+Global Dim ttStr.a[128]
+Global ttLen.i = 0
+
+Procedure BuildString()
+  Define c.i
+  ttLen = 0
+  c = 32
+  While c <= 126
+    ttStr[ttLen] = c
+    ttLen = ttLen + 1
+    c = c + 1
+  Wend
+  ttStr[ttLen] = 0
+EndProcedure
+
+; ======================================================================
+;  STATE
+; ======================================================================
+Global groundCol.i
+Global inkCol.i
+Global fullRows.i = 0
+
+; Per-verify counters (reset before each frame's FullVerify).
+Global nInk.i = 0
+Global nInkOk.i = 0
+Global nBg.i = 0
+Global nBgOk.i = 0
+Global firstBadX.i = -1
+Global firstBadY.i = -1
+Global firstBadGot.i = 0
+Global firstBadWant.i = 0
+
+Global bmHz.i = 1
+Global mmuBefore.i = 0
+Global ffFrame.i = -1
+Global maxBuild.i = 0
+
+Procedure BmHzInit()
+  bmHz = V3dCounterHz() / 1000000
+  If bmHz < 1
+    bmHz = 1
+  EndIf
+EndProcedure
+
+Procedure.i BmUs(t0.i)
+  ProcedureReturn (V3dTicks() - t0) / bmHz
+EndProcedure
+
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(Neon_SurfaceBase() + (y * Neon_SurfacePitch()) + (x * 4))
+EndProcedure
+
+; ======================================================================
+;  INDEPENDENT FONT READ for the FULL-SCREEN textured layout. Glyph
+;  column c (0..94) is char c+32 at x = #TT_FULL_X + c*8; row r is at
+;  y = #TT_FULL_Y0 + r*#TT_FULL_STEP. STEP == 16 == glyph height, so
+;  every drawn pixel is either ink or within-cell ground.
+; ======================================================================
+Procedure.i FullInkAt(px.i, py.i)
+  Define r.i
+  Define c.i
+  Define tx.i
+  Define ty.i
+  Define ch.i
+  Define b.i
+
+  If py < #TT_FULL_Y0
+    ProcedureReturn 0
+  EndIf
+  r = (py - #TT_FULL_Y0) / #TT_FULL_STEP
+  If r >= fullRows
+    ProcedureReturn 0
+  EndIf
+  ty = (py - #TT_FULL_Y0) - (r * #TT_FULL_STEP)
+  If ty >= 16
+    ProcedureReturn 0
+  EndIf
+  If px < #TT_FULL_X
+    ProcedureReturn 0
+  EndIf
+  c = (px - #TT_FULL_X) / 8
+  If c >= #TT_FULL_COLS
+    ProcedureReturn 0
+  EndIf
+  tx = (px - #TT_FULL_X) - (c * 8)
+  ch = ttStr[c]
+  If ch < 32 Or ch > 126
+    ProcedureReturn 0
+  EndIf
+  b = PeekA(?dsp_font8x16 + (((ch - 32) * 16) + ty))
+  If (b & (128 >> tx)) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Verify every pixel of the drawn text band for the current frame.
+Procedure FullVerify()
+  Define px.i
+  Define py.i
+  Define v.i
+  Define x1.i
+  Define y1.i
+
+  nInk = 0
+  nInkOk = 0
+  nBg = 0
+  nBgOk = 0
+  firstBadX = -1
+  firstBadY = -1
+  firstBadGot = 0
+  firstBadWant = 0
+
+  x1 = #TT_FULL_X + (#TT_FULL_COLS * 8)
+  y1 = #TT_FULL_Y0 + (fullRows * #TT_FULL_STEP)
+  py = #TT_FULL_Y0
+  While py < y1
+    px = #TT_FULL_X
+    While px < x1
+      v = PixelAt(px, py)
+      If FullInkAt(px, py) <> 0
+        nInk = nInk + 1
+        If v = inkCol
+          nInkOk = nInkOk + 1
+        ElseIf firstBadX < 0
+          firstBadX = px
+          firstBadY = py
+          firstBadGot = v
+          firstBadWant = inkCol
+        EndIf
+      Else
+        nBg = nBg + 1
+        If v = groundCol
+          nBgOk = nBgOk + 1
+        ElseIf firstBadX < 0
+          firstBadX = px
+          firstBadY = py
+          firstBadGot = v
+          firstBadWant = groundCol
+        EndIf
+      EndIf
+      px = px + 1
+    Wend
+    py = py + 1
+  Wend
+EndProcedure
+
+Procedure.i DrawFullScreen(colour.i)
+  Define y.i
+  Define rows.i
+  Define gly.i
+  Define r.i
+
+  y    = #TT_FULL_Y0
+  rows = 0
+  gly  = 0
+  While (y + 16) <= Neon_SurfaceH() And gly < #TT_FULL_MAXGLY
+    r = Neon_TextTex(#NEON_FONT_UI, #TT_FULL_X, y, @ttStr[0], colour)
+    If r <> #NEON_OK
+      ProcedureReturn rows
+    EndIf
+    gly  = gly + #TT_FULL_COLS
+    rows = rows + 1
+    y    = y + #TT_FULL_STEP
+  Wend
+  ProcedureReturn rows
+EndProcedure
+
+; Poison the whole surface (cached CPU stores) then clean+invalidate it,
+; so no dirty framebuffer line survives into the GPU render.
+Procedure PoisonFlush()
+  Define i.i
+  Define n.i
+  n = Neon_SurfaceH()
+  i = 0
+  While i < n
+    DspRowFill32(Neon_SurfaceBase() + (i * Neon_SurfacePitch()), Neon_SurfaceW(), #TT_POISON)
+    i = i + 1
+  Wend
+  V3dCacheRange(Neon_SurfaceBase(), Neon_SurfaceH() * Neon_SurfacePitch())
+  V3dBarrier()
+EndProcedure
+
+; The full V3D completion state for the frame just ended - this is the
+; per-frame CLE_BFC/RFC/ERR_STAT log. A render that did not complete
+; shows RFC unchanged and CT1CS non-idle; an OOM shows in the bin line;
+; an MMU fault shows a non-zero MMU_CTL and a VIO address.
+Procedure DumpFrameRegs()
+  PutS("     bin  bfc ") : PrintDec(V3dBinBfcBefore()) : PutS("->") : PrintDec(V3dBinBfcAfter())
+  PutS(" spins ")   : PrintDec(V3dBinSpins())
+  PutS(" oom ")     : PrintDec(V3dBinOomCount())
+  PutS(" int ")     : PutHex(V3dBinIntSts(), 8)
+  PutS(" ct0cs ")   : PutHex(V3dBinCt0cs(), 8)
+  PutS(" err ")     : PutHex(V3dBinErrStat(), 8)
+  PutS(" mmu ")     : PutHex(V3dBinMmuCtl(), 8)
+  PutNl()
+  PutS("     ren  rfc ") : PrintDec(V3dRenderRfcBefore()) : PutS("->") : PrintDec(V3dRenderRfcAfter())
+  PutS(" spins ")   : PrintDec(V3dRenderSpins())
+  PutS(" int ")     : PutHex(V3dRenderIntSts(), 8)
+  PutS(" ct1cs ")   : PutHex(V3dRenderCt1cs(), 8)
+  PutS(" err ")     : PutHex(V3dRenderErrStat(), 8)
+  PutS(" mmu ")     : PutHex(V3dRenderMmuCtl(), 8)
+  PutS(" clean ")   : PrintDec(V3dRenderCleanResult())
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  THE CACHED FRAME LOOP. Returns 1 if every frame was pixel-exact.
+; ======================================================================
+Procedure.i CachedFrames()
+  Define k.i
+  Define r.i
+  Define t0.i
+  Define bu.i
+  Define allOk.i
+
+  allOk    = 1
+  ffFrame  = -1
+  maxBuild = 0
+
+  k = 0
+  While k < #TT_FRAMES
+    ; Fresh deadman ahead of each frame - a wedged render is bounded by
+    ; V3dRenderWait's own timeout, but this covers the whole iteration.
+    SafetyWatchdogStart(15)
+
+    PoisonFlush()
+
+    r = NeonFrameBegin(groundCol)
+    If r <> #NEON_OK
+      PutS("frame ") : PrintDec(k) : PutS(": NeonFrameBegin err ") : PrintDec(r)
+      PutS(" (neon_err ") : PrintDec(Neon_Error()) : PutS(")") : PutNl()
+      allOk = 0
+      If ffFrame < 0 : ffFrame = k : EndIf
+      ; A frame left half-open cannot be followed by another; stop.
+      Break
+    EndIf
+
+    t0 = V3dTicks()
+    fullRows = DrawFullScreen(inkCol)
+    bu = BmUs(t0)
+    If bu > maxBuild
+      maxBuild = bu
+    EndIf
+
+    r = NeonFrameEnd()
+
+    PutS("frame ") : PrintDec(k) : PutS(": rc ") : PrintDec(r)
+    PutS("  build ")  : PrintDec(bu)
+    PutS("us begin ") : PrintDec(Neon_UsBegin())
+    PutS(" clean ")   : PrintDec(Neon_UsClean())
+    PutS(" bin ")     : PrintDec(Neon_UsBin())
+    PutS(" render ")  : PrintDec(Neon_UsRender())
+    PutS("us rows ")  : PrintDec(fullRows)
+    PutNl()
+    DumpFrameRegs()
+
+    If r <> #NEON_OK
+      PutS("  -> FRAME FAILED: neon_err ") : PrintDec(Neon_Error())
+      PutS(", v3d_err ") : PrintDec(V3dError())
+      PutS(" (rfc moved: ")
+      If V3dRenderRfcAfter() <> V3dRenderRfcBefore() : PutS("yes") : Else : PutS("NO -> render never completed") : EndIf
+      PutS(")") : PutNl()
+      allOk = 0
+      If ffFrame < 0 : ffFrame = k : EndIf
+    ElseIf fullRows <= 0
+      PutS("  -> FRAME FAILED: DrawFullScreen produced no rows") : PutNl()
+      allOk = 0
+      If ffFrame < 0 : ffFrame = k : EndIf
+    Else
+      FullVerify()
+      PutS("  verify ink ") : PrintDec(nInkOk) : PutS("/") : PrintDec(nInk)
+      PutS(" ground ")      : PrintDec(nBgOk) : PutS("/") : PrintDec(nBg)
+      If nInkOk = nInk And nBgOk = nBg
+        PutS("  -> PIXEL-EXACT") : PutNl()
+      Else
+        PutS("  -> WRONG: first bad (") : PrintDec(firstBadX) : PutS(",") : PrintDec(firstBadY)
+        PutS(") got ")  : PutHex(firstBadGot, 8)
+        PutS(" want ")  : PutHex(firstBadWant, 8)
+        PutNl()
+        allOk = 0
+        If ffFrame < 0 : ffFrame = k : EndIf
+      EndIf
+    EndIf
+    PutNl()
+    k = k + 1
+  Wend
+
+  ProcedureReturn allOk
+EndProcedure
+
+; ======================================================================
+;  BODY
+; ======================================================================
+Procedure.i Body()
+  Define r.i
+  Define during.i
+  Define after.i
+  Define allOk.i
+
+  PutNl()
+  PutS("=== pi4MmuV3d - REPEATED textured frames under cached DRAM ===")
+  PutNl()
+  PutNl()
+
+  ; ---- 0. bring-up, MMU OFF ----------------------------------------
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running") : PutNl()
+  EndIf
+  BmHzInit()
+  If MailboxInit() = 0
+    PutS("verdict: NO MAILBOX") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("verdict: NO TAGS") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = DisplayInit(1920, 1080, 32)
+  If r <> 1
+    PutS("    DisplayInit rc ") : PrintDec(r) : PutNl()
+    PutS("verdict: NO SURFACE") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = NeonArena(#TT_ARENA, #TT_ARENA_BYTES)
+  If r <> #NEON_OK
+    PutS("verdict: ARENA") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  If r <> #NEON_OK
+    PutS("verdict: SURFACE") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonInit()
+  PutPad("NeonInit", 30) : PutErr(r) : PutNl()
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: NEONINIT") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  NeonPalette()
+  NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  BuildString()
+
+  groundCol = Neon_RGBA(#TT_GR, #TT_GG, #TT_GB, 255)
+  inkCol    = Neon_RGBA(#TT_IR, #TT_IG, #TT_IB, 255)
+
+  r = Neon_TexAtlasBuild()
+  PutPad("Neon_TexAtlasBuild", 30) : PutErr(r) : PutNl()
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: ATLAS") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("ground", groundCol)
+  RowHex("ink", inkCol)
+  RowDec("string chars", ttLen)
+  RowDec("frames to render", #TT_FRAMES)
+  PutNl()
+
+  ; ---- 1. MMU pre-state --------------------------------------------
+  mmuBefore = MmuSctlrEl2()
+  RowHex16("SCTLR_EL2 before", mmuBefore)
+  RowHex16("exception level", MmuEl())
+  RowHex16("MMU on before", MmuEnabled())
+  PutNl()
+
+  ; ---- 2. build + dump the tables, MMU still OFF -------------------
+  RowHex("tables at", #TABLES)
+  r = MmuBuildTables(#TABLES)
+  RowHex16("build returned", r)
+  If r <> 0
+    PutS("REFUSED. See #MMU_ERR_* in mmu.pi4. Nothing enabled.") : PutNl()
+    ProcedureReturn r
+  EndIf
+  PutNl()
+  DumpTables()
+  PutNl()
+
+  If MmuBuildable() = 0
+    PutS("THIS BUILD CANNOT ENABLE - #MMU_HAVE_EL2_REGS is 0. Outcome D.") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 3. the switch, caches on ------------------------------------
+  SafetyWatchdogStart(15)
+  PutS("ENABLING NOW (cached) - if this is the last line, outcome B:") : PutNl()
+  PutS("the deadman resets the board in ~16 s and Anvil returns MMU off.") : PutNl()
+  UartDrain()
+
+  MmuEnableCached()
+
+  PutS("ALIVE - the console works with the MMU ON and caches ON.") : PutNl()
+  during = MmuSctlrEl2()
+  RowHex16("SCTLR_EL2 during", during)
+  If MmuEnabled() = 0
+    PutS("WRONG: enable ran and SCTLR_EL2.M is still clear.") : PutNl()
+  EndIf
+  If (during & #MMU_SCTLR_C) = 0
+    PutS("WRONG: SCTLR_EL2.C (D-cache) did not come on - DRAM is NOT cached.") : PutNl()
+  EndIf
+  If (during & #MMU_SCTLR_I) = 0
+    PutS("WARN: SCTLR_EL2.I (I-cache) did not come on.") : PutNl()
+  EndIf
+  PutNl()
+  UartDrain()
+
+  ; ---- 4. THE REPEATED CACHED FRAMES -------------------------------
+  PutS("rendering ") : PrintDec(#TT_FRAMES) : PutS(" consecutive full textured frames, each verified:") : PutNl()
+  PutNl()
+  allOk = CachedFrames()
+  PutNl()
+
+  ; ---- 5. belt-and-braces flush, then restore ----------------------
+  MmuCleanRange($00400000, $00400000)
+  MmuCleanRange(#TT_ARENA, #TT_ARENA_BYTES)
+  MmuDisableCached()
+
+  ; ---- 6. MMU post-state -------------------------------------------
+  after = MmuSctlrEl2()
+  RowHex16("SCTLR_EL2 after", after)
+  If after = mmuBefore
+    PutS("MMU OFF AGAIN - SCTLR_EL2 byte for byte what it was. Restore OK.") : PutNl()
+  Else
+    PutS("MMU off, but SCTLR_EL2 did not return to entry - report both.") : PutNl()
+  EndIf
+  PutNl()
+
+  ; ---- 7. the verdict ----------------------------------------------
+  If allOk <> 0 And ffFrame < 0
+    PutS("verdict: ALL ") : PrintDec(#TT_FRAMES)
+    PutS(" CONSECUTIVE full textured frames PIXEL-EXACT under cached DRAM.") : PutNl()
+    If maxBuild < 16000
+      PutS("verdict: worst vertex build ") : PrintDec(maxBuild)
+      PutS(" us < 16 ms - repeated 60 fps frames are SOLID.") : PutNl()
+    Else
+      PutS("verdict: correct, but worst vertex build ") : PrintDec(maxBuild)
+      PutS(" us >= 16 ms - see the per-frame build numbers.") : PutNl()
+    EndIf
+  Else
+    PutS("verdict: FAILED at frame ") : PrintDec(ffFrame)
+    PutS(" - read its bin/ren register dump above (rfc moved? ct1cs idle?") : PutNl()
+    PutS("  err_stat set? mmu faulted?) to tell timeout from driver error.") : PutNl()
+  EndIf
+
+  UartDrain()
+  ProcedureReturn allOk
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+  rc = Body()
+  NeonShutdown()
+  ProcedureReturn rc
+EndProcedure

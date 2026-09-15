@@ -1,0 +1,1467 @@
+; pi4V3dTri.pi4 - stage 4 of the V3D bring-up. IS THERE A TRIANGLE?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM CLAIMS, AND WHAT IT REFUSES TO CLAIM
+; ======================================================================
+;
+;  pi4V3dClear.pi4 got 4096 pixels of one colour out of the binner and
+;  the renderer. A CLEAR NEEDS NO SHADER. This program is the first
+;  thing here that runs a VERTEX SHADER and a FRAGMENT SHADER through
+;  the graphics pipeline and rasterises a primitive.
+;
+;  THE PASS CRITERION IS COUNTED PIXELS AND A SHAPE, NOT A PICTURE.
+;  A screenshot is not evidence and neither is "some pixels changed".
+;  This program clears a 64 x 64 buffer to one colour, draws ONE
+;  TRIANGLE in a second colour, reads back all 4096 words on the CPU
+;  and reports:
+;
+;    * how many hold the triangle colour, the clear colour, the
+;      poison it was filled with beforehand, and anything else;
+;    * the BOUNDING BOX of the triangle-coloured pixels;
+;    * how many pixels STRICTLY INSIDE the triangle are the wrong
+;      colour, and how many STRICTLY OUTSIDE it are the wrong colour,
+;      with a two-pixel margin either side of every edge so that no
+;      fill-rule detail can decide the verdict;
+;    * whether the unmapped guard page after the target was touched.
+;
+;  THE DIAGONAL EDGE IS THE POINT. A rectangle can be produced by a
+;  blit, a clear with a scissor, or a store to the wrong address. A
+;  triangle with a hypotenuse can only be produced by a rasteriser
+;  fed by a shaded vertex, and the interior/exterior counts below
+;  test exactly that: the pixels on the far side of the diagonal must
+;  still be the clear colour.
+;
+; ======================================================================
+;  THE TWO COLOURS, AND WHY THE FRAGMENT VALUES ARE NOT n/255
+; ======================================================================
+;
+;  clear    $44332211   R $11 G $22 B $33 A $44 - pi4V3dClear.pi4's
+;  triangle $C0884422   R $22 G $44 B $88 A $C0
+;
+;  Eight distinct bytes across the two, so the channel order is proven
+;  twice over and in the same read, and neither is the poison.
+;
+;  THE FRAGMENT SHADER WRITES f16 AND THE TILE BUFFER IS 8-BIT UNORM,
+;  so each component makes a round trip f32 -> f16 -> unorm8 and the
+;  rounding mode of the last step is not written down anywhere on this
+;  disk. So the values are (n + 0.25) / 255 rather than n / 255:
+;
+;      $22 -> 34.25/255 = $3E09898A
+;      $44 -> 68.25/255 = $3E890909
+;      $88 -> 136.25/255 = $3F08C8C9
+;      $C0 -> 192.25/255 = $3F410101
+;
+;  Through f16 those come back as 34.24, 68.23, 136.22 and 192.25 in
+;  the 0..255 scale. Round-to-nearest gives 34, 68, 136 and 192, and
+;  so does truncation. The test therefore cannot fail on a rounding
+;  rule this project has not measured - which is a deliberate choice
+;  to test the pipeline and not the converter, and it is stated here
+;  so that nobody later reads the pass as evidence about rounding.
+;
+; ======================================================================
+;  THE SHADERS, AND WHY THEY DO NO ARITHMETIC
+; ======================================================================
+;
+;  THE VERTICES ARE PRE-TRANSFORMED ON THE A72. That is the route
+;  v3d-feasibility.md:264-267 proposes and it is the right one for a
+;  first triangle: a shader that multiplies is a shader whose failure
+;  has two explanations. These three shaders COPY.
+;
+;  THE SHADED VERTEX LAYOUT IS NOT NEGOTIABLE AND IT IS CITED.
+;  Mesa mesa-24.3.4, src/broadcom/compiler/v3d_nir_lower_io.c:399-433:
+;
+;    coordinate shader   VPM 0-3 = Xc Yc Zc Wc, 4-5 = Xs Ys.  Six.
+;    vertex shader       VPM 0-1 = Xs Ys, 2 = Zs, 3 = 1/Wc.   Four.
+;
+;  and :492-560 gives the arithmetic the shaders would have done:
+;    Xs = f2i32(ffloor(Xc * viewport_x_scale * (1/Wc)))
+;    Zs = Zc * z_scale * (1/Wc) + z_offset
+;  with ffloor and not fround_even ON 4.2 SPECIFICALLY (:539-542).
+;
+;  Wc IS 1.0 FOR ALL THREE VERTICES, so 1/Wc is 1.0 and every one of
+;  those multiplies is by one. The CPU does the rest.
+;
+;  Xs AND Ys ARE INTEGERS IN 1/256ths OF A PIXEL, RELATIVE TO THE
+;  VIEWPORT CENTRE. The shader does not add the viewport offset - no
+;  offset term appears in v3d_nir_lower_io.c's expression - so
+;  VIEWPORT_OFFSET carries it, and its Fine X field is u14.8, i.e.
+;  pixels times 256 (v3d_packet.xml:812). With a 64-wide surface the
+;  centre is 32 pixels, so fine X and fine Y are 8192 and
+;  CLIPPER_XY_SCALING's half-width, which is "in 1/256th of pixel"
+;  (:822), is 8192.0f. The two have to agree and they are computed
+;  from the same two numbers below.
+;
+;  THE THREE VERTICES, IN PIXELS: (8,8), (56,8), (8,56).
+;  So Xs = (px - 32) * 256 and Ys = (py - 32) * 256, which is -6144,
+;  +6144 and -6144 across X. A NEGATIVE INTEGER IS WHY THE ATTRIBUTE
+;  RECORDS FOR SLOTS 4 AND 5 DECLARE `int` AND `read as int`: -6144 is
+;  $FFFFE800 and +6144 is $00001800, and $00001800 read as a float is
+;  a DENORMAL. If the vertex fetcher flushed denormals the triangle
+;  would collapse to the viewport centre, which looks like a wrong
+;  transform and is a wrong declaration. See V3dAttrRecordType().
+;
+; ======================================================================
+;  WHAT IS UNPROVEN HERE EVEN IF EVERY PIXEL IS RIGHT
+; ======================================================================
+;
+;   * THE Y DIRECTION IS NOT KNOWN IN ADVANCE and this program does
+;     not pretend it is. The triangle is deliberately NOT symmetric,
+;     the bounding box is printed, and the interior/exterior counts
+;     are computed for BOTH conventions with the run saying which one
+;     matched. Guessing and then "confirming" it would be worthless.
+;   * ONE TILE. 64 x 64 is exactly one tile and one supertile, the
+;     same reason pi4V3dClear.pi4 used it. Nothing here exercises the
+;     supertile sweep or a partial tile.
+;   * NO DEPTH, NO BLEND, NO TEXTURE, NO VARYINGS, NO CLIPPING WORK.
+;     All three vertices are inside the clip volume, so the clipper's
+;     output path is configured and never taken.
+;   * THE SEVEN LDVPM OPERATIONS HAVE NO OFFLINE ORACLE. py-videocore6
+;     cannot encode any of them; a64_v3d_qpu_check.py checks them
+;     against its own reading of Mesa's tables and says so. THIS
+;     PROGRAM IS THEIR ONLY REAL WITNESS - if the triangle appears in
+;     the right place, LDVPMV_IN and STVPMV decoded the way both
+;     readings thought.
+;
+; ======================================================================
+;  RUNNING IT
+; ======================================================================
+;
+;  PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4V3dTri.pi4 \
+;      -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;      -o v3dtri.img
+;  then send v3dtri.img to the resident monitor with a 35 second capture.
+;
+;  It prints a lot. Drive anvil with a fixed capture, not the default
+;  four seconds - pi4V3dCsd.pi4's bench note applies here too.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP. Identity-mapped through the V3D MMU, VA = PA, the
+;  same as every V3D probe before it. The guard page at $65C000 is
+;  DELIBERATELY NOT MAPPED and sits immediately after the target.
+; ----------------------------------------------------------------------
+#TRI_PT        = $640000
+#TRI_PT_BYTES  = 16384
+#TRI_ILLEGAL   = $648000
+#TRI_BCL       = $650000
+#TRI_TILELIST  = $651000
+#TRI_RCL       = $652000
+#TRI_TSTATE    = $653000
+; The shader state record plus its eight attribute records. Page
+; aligned, so 32-byte aligned, which GL_SHADER_STATE requires.
+#TRI_SHREC     = $654000
+; The vertex data, and the default attribute values 256 bytes into the
+; same page.
+#TRI_VERTS     = $655000
+#TRI_DEFAULTS  = $655100
+; The three uniform streams, 64 bytes apart.
+#TRI_UNIF_CS   = $656000
+#TRI_UNIF_VS   = $656040
+#TRI_UNIF_FS   = $656080
+; The three QPU programs, 512 bytes apart. Eight-byte aligned by
+; construction; V3dQpuProgramBegin() refuses otherwise.
+#TRI_CODE_CS   = $657000
+#TRI_CODE_VS   = $657200
+#TRI_CODE_FS   = $657400
+#TRI_CODE_SLOT = 512
+#TRI_TARGET    = $658000
+#TRI_GUARD     = $65C000
+; THE ENCODER CORPUS. A second shader state record with two attribute
+; records, built with a NON-ZERO VALUE IN EVERY FIELD, never submitted
+; and DELIBERATELY NOT MAPPED into the V3D page table.
+;
+; IT EXISTS BECAUSE A MUTATION RUN DEMANDED IT. Three faults injected
+; into v3d.pi4's record encoders survived a64_v3d_tri_check.py's first
+; pass and all three had the same shape: the field they corrupted is
+; ZERO in this draw. The fragment shader has no varyings, so the
+; varying count's shift does not matter; the three code addresses are
+; page-plus-512 aligned, so the low-bit mask does not matter. That is
+; stage 3's lesson arriving in a third file. A FIELD IS ONLY PINNED
+; DOWN BY A VALUE WHOSE BITS ARE NOT ALL ZERO.
+#TRI_CORPUS    = $65D000
+#TRI_CORPUS_BYTES = 4096
+#TRI_TALLOC    = $660000
+#TRI_OVERFLOW  = $700000
+
+#TRI_PAGE          = 4096
+#TRI_BCL_BYTES     = 4096
+#TRI_TL_BYTES      = 4096
+#TRI_RCL_BYTES     = 4096
+#TRI_TSTATE_BYTES  = 4096
+#TRI_SHREC_BYTES   = 4096
+#TRI_VERTS_BYTES   = 4096
+#TRI_UNIF_BYTES    = 4096
+#TRI_CODE_BYTES    = 4096
+#TRI_TARGET_BYTES  = 16384
+#TRI_GUARD_BYTES   = 4096
+#TRI_TALLOC_BYTES  = $84000
+#TRI_OVERFLOW_BYTES = 262144
+
+#TRI_W      = 64
+#TRI_H      = 64
+#TRI_STRIDE = 256
+#TRI_PIXELS = 4096
+
+#TRI_CLEAR  = $44332211
+#TRI_COLOR  = $C0884422
+#TRI_POISON = $A5A5A5A5
+
+; 1.0f, written into ZS_CLEAR_VALUES and never read - there is no
+; depth buffer. Same value pi4V3dClear.pi4 uses and for the same
+; reason.
+#TRI_ZCLEAR = $3F800000
+
+#TRI_F_ZERO   = $00000000
+#TRI_F_ONE    = $3F800000
+#TRI_F_P75    = $3F400000
+#TRI_F_M75    = $BF400000
+#TRI_F_8192   = $46000000
+
+; The four fragment colour components. See the header.
+#TRI_F_R = $3E09898A
+#TRI_F_G = $3E890909
+#TRI_F_B = $3F08C8C9
+#TRI_F_A = $3F410101
+
+; The TLB configuration word the fragment shader's TLBU write pulls
+; out of the uniform stream. nir_to_vir.c:1856-1891 builds it:
+;
+;   0xffffff00                     the specifier register's fill
+;   | TLB_SAMPLE_MODE_PER_PIXEL    1 << 2   = $04
+;   | (7 - rt) << 3                7 << 3   = $38   (REVERSED: 7 = RT0)
+;   | TLB_TYPE_F16_COLOR           3 << 6   = $C0
+;   | TLB_F16_SWAP_HI_LO           1 << 1   = $02
+;   | TLB_VEC_SIZE_4_F16           1 << 0   = $01
+;
+; which is $FFFFFFFF, and that is not a coincidence: the comment at
+; nir_to_vir.c:1817-1820 says the register is "preloaded with
+; 0xffffffff (0xff gets you normal vec4 f16 RT0 writes)". It is
+; written explicitly anyway, exactly as Mesa writes it, because
+; relying on a preloaded default is relying on nothing else having
+; consumed a specifier first.
+#TRI_TLB_CONF = $FFFFFFFF
+
+; The three vertices, in PIXELS, and the viewport centre they are
+; measured from. Everything below is derived from these five numbers.
+#TRI_V0X = 8
+#TRI_V0Y = 8
+#TRI_V1X = 56
+#TRI_V1Y = 8
+#TRI_V2X = 8
+#TRI_V2Y = 56
+#TRI_CX  = 32
+#TRI_CY  = 32
+
+; The margin, in pixels, around every edge of the triangle inside
+; which this program declines to have an opinion. TWO PIXELS, which
+; is more than any fill rule can move an edge, so the interior and
+; exterior counts below cannot be decided by one.
+#TRI_MARGIN = 2
+
+; 100 ms each. The kernel's own order of magnitude for a V3D wait.
+#TRI_WAIT_US = 100000
+
+; ======================================================================
+;  PRINTING
+; ======================================================================
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_NOINIT
+      PutS("NOINIT - V3dInit() has not passed")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - no V3D page table")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page walk failed. See VIO_ADDR.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - outside the page table, or page 0")
+    Case #V3D_ERR_MMU_FLUSH
+      PutS("MMU_FLUSH - the TLB clear never finished")
+    Case #V3D_ERR_CACHE_TIMEOUT
+      PutS("CACHE_TIMEOUT - the L2T clean never finished")
+    Case #V3D_ERR_CL_ARGS
+      PutS("CL_ARGS - a field or a buffer will not do")
+    Case #V3D_ERR_CL_FULL
+      PutS("CL_FULL - the list ran out of room")
+    Case #V3D_ERR_CL_NOBUF
+      PutS("CL_NOBUF - a packet with no list open")
+    Case #V3D_ERR_BIN_TIMEOUT
+      PutS("BIN_TIMEOUT - CLE_BFC never moved")
+    Case #V3D_ERR_BIN_OOM
+      PutS("BIN_OOM - the tile allocation pool ran out")
+    Case #V3D_ERR_RENDER_TIMEOUT
+      PutS("RENDER_TIMEOUT - CLE_RFC never moved")
+    Case #V3D_ERR_JOB_BUSY
+      PutS("JOB_BUSY - the render was offered before the bin finished")
+    Default
+      PutS("code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure PutQpuErr(e.i)
+  Select e
+    Case #V3DQ_OK
+      PutS("OK")
+    Case #V3DQ_ERR_ADD_OP
+      PutS("ADD_OP - that ADD operation is not encoded")
+    Case #V3DQ_ERR_SIG
+      PutS("SIG - no 4.2 code for that signal combination")
+    Case #V3DQ_ERR_RANGE
+      PutS("RANGE - a waddr, mux or raddr is out of its field")
+    Case #V3DQ_ERR_FULL
+      PutS("FULL - the program buffer has no room")
+    Case #V3DQ_ERR_NOBUF
+      PutS("NOBUF - V3dQpuProgramBegin() was never called")
+    Case #V3DQ_ERR_HAZARD
+      PutS("HAZARD - a p37 restriction, rule ")
+      PutDec(V3dQpuHazardName())
+    Case #V3DQ_ERR_VPM_DEST
+      PutS("VPM_DEST - a magic destination on a VPM load")
+    Case #V3DQ_ERR_PACK
+      PutS("PACK - an output pack this operation cannot take")
+    Case #V3DQ_ERR_UNPACK
+      PutS("UNPACK - an input unpack this operation cannot take")
+    Default
+      PutS("code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+; A control list or a record, as bytes, sixteen to a line. Printed in
+; full every run: it is the only evidence that survives a hang, and it
+; is what makes a claim about "what the lists contain" checkable by
+; somebody who was not at the bench.
+Procedure DumpBytes(base.i, len.i)
+  Define i.i
+  i = 0
+  While i < len
+    If (i % 16) = 0
+      PutS("  ")
+      PutHex(base + i, 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekA(base + i), 2)
+    i = i + 1
+    If (i % 16) = 0
+      PutNl()
+    EndIf
+  Wend
+  If (len % 16) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+; A QPU program, one 64-bit instruction per line, high half first the
+; way every V3D disassembler prints it.
+Procedure DumpProgram(base.i, count.i)
+  Define i.i
+  i = 0
+  While i < count
+    PutS("  Q ")
+    PutDec(i)
+    PutS(" ")
+    PutHex(PeekN(base + (i * 8) + 4), 8)
+    PutS(" ")
+    PutHex(PeekN(base + (i * 8)), 8)
+    PutNl()
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  THE THREE SHADERS
+;
+;  Every one of them is uniform loads, VPM traffic and a thread end.
+;  No arithmetic. See the header for why.
+;
+;  THE UNIFORM STREAM IS READ IN PROGRAM ORDER. Each LDUNIFRF consumes
+;  the next word, and the fragment shader's write to TLBU consumes one
+;  more without an LDUNIFRF at all - v3d_qpu_magic_waddr_loads_unif()
+;  (qpu_instr.c:646-658) names VPMU, TLBU, TMUAU and SYNCU as the four
+;  magic addresses that pull from the uniform FIFO. So the streams
+;  built by BuildUniforms() are laid out in the order the shaders
+;  touch them and nowhere else.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE COORDINATE SHADER. Six values in, six values out.
+;
+;  Reads VPM input slots 0..5 - Xc Yc Zc Wc Xs Ys - and writes them to
+;  VPM output slots 0..5, which is the coordinate shader's shaded
+;  vertex layout unchanged (v3d_nir_lower_io.c:412-419).
+;
+;  IT IS A SINGLE-SEGMENT PROGRAM. It never switches threads, so it is
+;  spawned already in the final thread section and its whole thread
+;  end is one THRSW and three NOPs - nir_to_vir.c:4886-4890 and
+;  qpu_validate.c:430. The shader state record's "coordinate shader
+;  start in final thread section" bit says the same thing and the two
+;  MUST agree; V3dQpuProgramBeginSeg() cannot check the record and the
+;  record cannot check the program.
+;
+;  VPMWT AFTER THE LAST STORE AND BEFORE THE THREAD END is GFXH-1684:
+;  "VPM writes need to be complete by the end of the shader",
+;  nir_to_vir.c:2070-2077, and emit_vert_end() is called after the
+;  last THRSW is placed and before the scheduler appends the program
+;  end (nir_to_vir.c:4959-4979, qpu_schedule.c:3052-3055).
+; ----------------------------------------------------------------------
+Procedure.i BuildCoordShader()
+  Define r.i
+  Define k.i
+
+  r = V3dQpuProgramBeginSeg(#TRI_CODE_CS, #TRI_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; rf0..rf5 = the constants 0..5, from the uniform stream. Mesa does
+  ; exactly this - vir_LDVPMV_IN(c, vir_uniform_ui(c, index)),
+  ; nir_to_vir.c:2826-2828 - rather than using a small immediate,
+  ; and following it removes a guess about whether LDVPMV's offset
+  ; operand may come from the small-immediate slot.
+  k = 0
+  While k < 6
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; rf8..rf13 = VPM input 0..5. Mux A reads RADDR_A, which holds the
+  ; register with the offset in it.
+  k = 0
+  While k < 6
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 8 + k, #V3DQ_MUX_A, k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; VPM output 0..5 = rf8..rf13. STVPMV takes the SLOT INDEX first and
+  ; the VALUE second - vir_STVPMV(c, vpm_index, val),
+  ; nir_to_vir.c:2058 - and it has no destination at all: the waddr
+  ; field carries the operation.
+  k = 0
+  While k < 6
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, k, 8 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE VERTEX SHADER. Four values out of eight in.
+;
+;  Reads VPM input slots 4..7 - Xs Ys Zs 1/Wc - and writes them to VPM
+;  output slots 0..3, which is the NON-coord layout
+;  (v3d_nir_lower_io.c:418-424). The vertex shader's VPM INPUT holds
+;  all eight values because its attribute records say so; the
+;  coordinate shader's holds six. They are separate blocks.
+; ----------------------------------------------------------------------
+Procedure.i BuildVertexShader()
+  Define r.i
+  Define k.i
+
+  r = V3dQpuProgramBeginSeg(#TRI_CODE_VS, #TRI_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  k = 0
+  While k < 8
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; rf8..rf11 = VPM input 4..7.
+  k = 0
+  While k < 4
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 8 + k, #V3DQ_MUX_A, 4 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; VPM output 0..3 = rf8..rf11.
+  k = 0
+  While k < 4
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, k, 8 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE FRAGMENT SHADER. Four uniforms in, one pixel out.
+;
+;  TWO VFPACKs, EXACTLY AS MESA EMITS THEM for an 8-bit render target
+;  (nir_to_vir.c:1930-1942): the first writes TLBU and carries the
+;  configuration word, the second writes TLB. Each VFPACK packs two
+;  f32 lanes into one 2 x f16 result, so (r,g) then (b,a) is four
+;  components in two instructions.
+;
+;  THE TLB WRITES COME AFTER THE LAST THREAD SWITCH AND THAT IS THE
+;  ONE STRUCTURAL THING IN THIS SHADER. nir_to_vir.c:4959 is a comment
+;  that says so in as many words - "Emit the last THRSW before STVPM
+;  and TLB writes" - because the tile buffer is a shared resource and
+;  the final thread section is where the scoreboard lock is held.
+;  Unlike the other two shaders this one is therefore NOT single
+;  segment, and the shader record's "fragment shader start in final
+;  thread section" bit is clear to match.
+; ----------------------------------------------------------------------
+Procedure.i BuildFragmentShader()
+  Define r.i
+  Define k.i
+
+  r = V3dQpuProgramBeginSeg(#TRI_CODE_FS, #TRI_CODE_SLOT, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; rf0..rf3 = R, G, B, A.
+  k = 0
+  While k < 4
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; The last-THRSW pair and its two delay slots.
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; TLBU first: the write pulls the configuration word out of the
+  ; uniform stream by itself.
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 3)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ======================================================================
+;  THE DATA
+; ======================================================================
+
+; One vertex, eight 32-bit values, in the order the attribute records
+; declare them: Xc Yc Zc Wc Xs Ys Zs 1/Wc.
+Procedure PutVertex(n.i, xc.i, yc.i, xs.i, ys.i)
+  Define b.i
+  b = #TRI_VERTS + (n * 32)
+  PokeN(b +  0, xc)
+  PokeN(b +  4, yc)
+  PokeN(b +  8, #TRI_F_ZERO)   ; Zc, and therefore Zw = 0 with Wc = 1
+  PokeN(b + 12, #TRI_F_ONE)    ; Wc
+  PokeN(b + 16, xs)            ; Xs, an INTEGER in 1/256 pixel
+  PokeN(b + 20, ys)            ; Ys
+  PokeN(b + 24, #TRI_F_ZERO)   ; Zs = Zc * 1 + 0
+  PokeN(b + 28, #TRI_F_ONE)    ; 1/Wc
+EndProcedure
+
+Procedure BuildVerts()
+  Define i.i
+  ; Xs = (px - 32) * 256, and the subtraction is what VIEWPORT_OFFSET
+  ; puts back.
+  PutVertex(0, #TRI_F_M75, #TRI_F_M75, (#TRI_V0X - #TRI_CX) * 256, (#TRI_V0Y - #TRI_CY) * 256)
+  PutVertex(1, #TRI_F_P75, #TRI_F_M75, (#TRI_V1X - #TRI_CX) * 256, (#TRI_V1Y - #TRI_CY) * 256)
+  PutVertex(2, #TRI_F_M75, #TRI_F_P75, (#TRI_V2X - #TRI_CX) * 256, (#TRI_V2Y - #TRI_CY) * 256)
+
+  ; The default attribute values. Mesa always supplies an address
+  ; (v3dx_draw.c:701-703) and the hardware reads from it for any
+  ; component a shader asks for that the record does not supply.
+  ; Nothing here asks for one; it is (0,0,0,1) because that is what a
+  ; missing vec4 should be.
+  PokeN(#TRI_DEFAULTS +  0, #TRI_F_ZERO)
+  PokeN(#TRI_DEFAULTS +  4, #TRI_F_ZERO)
+  PokeN(#TRI_DEFAULTS +  8, #TRI_F_ZERO)
+  PokeN(#TRI_DEFAULTS + 12, #TRI_F_ONE)
+EndProcedure
+
+Procedure BuildUniforms()
+  Define k.i
+  ; The coordinate shader loads six constants, 0..5.
+  k = 0
+  While k < 6
+    PokeN(#TRI_UNIF_CS + (k * 4), k)
+    k = k + 1
+  Wend
+  ; The vertex shader loads eight, 0..7.
+  k = 0
+  While k < 8
+    PokeN(#TRI_UNIF_VS + (k * 4), k)
+    k = k + 1
+  Wend
+  ; The fragment shader loads four colour components and then the TLB
+  ; configuration word, WHICH IS FIFTH BECAUSE THE TLBU WRITE IS THE
+  ; FIFTH THING TO TOUCH THE STREAM.
+  PokeN(#TRI_UNIF_FS +  0, #TRI_F_R)
+  PokeN(#TRI_UNIF_FS +  4, #TRI_F_G)
+  PokeN(#TRI_UNIF_FS +  8, #TRI_F_B)
+  PokeN(#TRI_UNIF_FS + 12, #TRI_F_A)
+  PokeN(#TRI_UNIF_FS + 16, #TRI_TLB_CONF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SHADER STATE RECORD AND EIGHT ATTRIBUTE RECORDS.
+;
+;  ONE ATTRIBUTE RECORD PER VALUE, and that is a deliberate choice
+;  rather than a natural one. A single record with a vec size of four
+;  would be fewer records - and "vec size" is a two-bit field whose
+;  encoding for four components is not stated in v3d_packet.xml and
+;  is not written anywhere else on this disk. Mesa's own dummy record
+;  (v3dx_draw.c:877-887) uses vec_size 1 with one value read, which
+;  pins ONE point of that encoding and no other. So every attribute
+;  here is one 32-bit value with vec size 1, which is the only shape
+;  this project can cite.
+;
+;  THE COORDINATE SHADER READS SIX AND THE VERTEX SHADER READS EIGHT.
+;  The VPM offset for value k is the SUM of the previous attributes'
+;  counts (nir_to_vir.c:2810-2824), and with one value each that sum
+;  is k - which is why the shaders can use the constants 0..7 as
+;  their offsets directly. Records 6 and 7 have a coordinate-shader
+;  count of ZERO, so the coordinate shader's VPM input block is six
+;  values and its offsets 0..5 mean the same six values.
+;
+;  GFXH-930 is satisfied: records 0..5 are read by both phases.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  THE ENCODER CORPUS RECORD. See the memory map for why it exists.
+;
+;  EVERY VALUE HERE IS CHOSEN SO THAT A WRONG SHIFT MOVES IT. The
+;  varying count is $AD rather than zero; the eight VPM nibbles are
+;  eight DIFFERENT numbers so a transposed pair is visible; the
+;  minus_one on the two input-segment counts is exercised at 9 and 16
+;  rather than at 1, where minus one and no minus one look alike; and
+;  THE THREE CODE ADDRESSES ARE EIGHT-BYTE ALIGNED AND NOT SIXTEEN,
+;  which is the one case that tells a $FFFFFFF8 mask from a $FFFFFFF0
+;  one. The three flag triples are all different so that the fourWay /
+;  finalSeg / propagateNans bits cannot be transposed unnoticed.
+;
+;  IT IS BUILT FIRST, BEFORE THE REAL RECORD, because
+;  V3dShaderRecordBegin() takes over the library's one record cursor
+;  and the real record must be the one V3dShaderRecordAddr() names
+;  when the bin list is written.
+; ----------------------------------------------------------------------
+Procedure.i BuildCorpusRecord()
+  Define r.i
+  r = V3dShaderRecordBegin(#TRI_CORPUS, 2)
+  If r <> #V3D_OK : ProcedureReturn r : EndIf
+  V3dShaderRecordFlags(1, 1, 1, 1, 1, $AD)
+  V3dShaderRecordVpm(3, 5, 7, 9, 11, 13, 15, 16)
+  V3dShaderRecordDefaults($12345678)
+  V3dShaderRecordFragment($0ABCDEF8, $13579BDC, 1, 0, 1)
+  V3dShaderRecordVertex($01234568, $2468ACE0, 0, 1, 0)
+  V3dShaderRecordCoord($0FEDCBA8, $3141592C, 1, 1, 0)
+  V3dAttrRecord(0, $ABCDEF00, $00010203, $04050607, 13, 7)
+  V3dAttrRecordType(0, 2, #V3D_ATTR_SHORT, 1, 1, 0, $BEEF)
+  V3dAttrRecord(1, $76543210, $0A0B0C0D, $0E0F1011, 5, 12)
+  V3dAttrRecordType(1, 3, #V3D_ATTR_BYTE, 0, 1, 1, $1234)
+  If V3dShaderRecordOk() = 0
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+Procedure.i BuildRecords(csCount.i, vsCount.i)
+  Define r.i
+  Define k.i
+  Define cs.i
+
+  r = V3dShaderRecordBegin(#TRI_SHREC, 8)
+  If r <> #V3D_OK : ProcedureReturn r : EndIf
+
+  V3dShaderRecordFlags(1, 0, 0, 0, 1, 0)
+  ; Shared VPM segments, one sector each way, As = 1 and Ve = 0.
+  ; Mesa mesa-24.3.4 src/broadcom/compiler/vir.c:2508-2515 for As and Ve, :843-859 for
+  ; the segment sizes and for separate_segments being forced false.
+  V3dShaderRecordVpm(1, 0, 1, 1, 1, 0, 1, 1)
+  V3dShaderRecordDefaults(#TRI_DEFAULTS)
+  V3dShaderRecordFragment(#TRI_CODE_FS, #TRI_UNIF_FS, 1, 0, 1)
+  V3dShaderRecordVertex(#TRI_CODE_VS, #TRI_UNIF_VS, 1, 1, 1)
+  V3dShaderRecordCoord(#TRI_CODE_CS, #TRI_UNIF_CS, 1, 1, 1)
+
+  k = 0
+  While k < 8
+    cs = 1
+    If k >= csCount
+      cs = 0
+    EndIf
+    V3dAttrRecord(k, #TRI_VERTS + (k * 4), 32, $FFFFFF, cs, 1)
+    k = k + 1
+  Wend
+  ; Slots 4 and 5 are Xs and Ys and they are SIGNED INTEGERS. See the
+  ; header - $00001800 read as a float is a denormal.
+  V3dAttrRecordType(4, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
+  V3dAttrRecordType(5, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
+
+  If V3dShaderRecordOk() = 0
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+; ======================================================================
+;  VERIFICATION
+; ======================================================================
+
+Global nTri.i     = 0
+Global nClear.i   = 0
+Global nPoison.i  = 0
+Global nOther.i   = 0
+Global firstOther.i = -1
+Global firstOtherVal.i = 0
+Global minX.i = 9999
+Global maxX.i = -1
+Global minY.i = 9999
+Global maxY.i = -1
+Global guardTouched.i = 0
+
+; The two conventions, counted separately. `dir` 0 means the shaded Ys
+; increases with the row index the store writes; `dir` 1 means it
+; decreases. NOTHING ON THIS DISK SAYS WHICH, so both are computed and
+; the run says which one matched.
+Global insideBad0.i  = 0
+Global outsideBad0.i = 0
+Global insideN0.i    = 0
+Global outsideN0.i   = 0
+Global insideBad1.i  = 0
+Global outsideBad1.i = 0
+Global insideN1.i    = 0
+Global outsideN1.i   = 0
+
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(#TRI_TARGET + (y * #TRI_STRIDE) + (x * 4))
+EndProcedure
+
+; Is (x,y) strictly inside the triangle (8,8)-(56,8)-(8,56) by at
+; least `m` pixels on every edge? The three edges are x = 8, y = 8 and
+; x + y = 64, so the test is three inequalities and no arithmetic that
+; can overflow.
+Procedure.i InsideBy(x.i, y.i, m.i)
+  If x < (#TRI_V0X + m)
+    ProcedureReturn 0
+  EndIf
+  If y < (#TRI_V0Y + m)
+    ProcedureReturn 0
+  EndIf
+  If (x + y) > ((#TRI_V1X + #TRI_V1Y) - m)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Is (x,y) strictly OUTSIDE the same triangle by at least `m` pixels?
+; It is outside if it is on the wrong side of ANY edge by the margin.
+Procedure.i OutsideBy(x.i, y.i, m.i)
+  If x < (#TRI_V0X - m)
+    ProcedureReturn 1
+  EndIf
+  If y < (#TRI_V0Y - m)
+    ProcedureReturn 1
+  EndIf
+  If (x + y) > ((#TRI_V1X + #TRI_V1Y) + m)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Verify()
+  Define x.i
+  Define y.i
+  Define v.i
+  Define sy.i
+
+  y = 0
+  While y < #TRI_H
+    x = 0
+    While x < #TRI_W
+      v = PixelAt(x, y)
+      If v = #TRI_COLOR
+        nTri = nTri + 1
+        If x < minX : minX = x : EndIf
+        If x > maxX : maxX = x : EndIf
+        If y < minY : minY = y : EndIf
+        If y > maxY : maxY = y : EndIf
+      ElseIf v = #TRI_CLEAR
+        nClear = nClear + 1
+      ElseIf v = #TRI_POISON
+        nPoison = nPoison + 1
+      Else
+        nOther = nOther + 1
+        If firstOther < 0
+          firstOther = (y * #TRI_W) + x
+          firstOtherVal = v
+        EndIf
+      EndIf
+
+      ; Convention 0: the store's row y IS the shaded Ys row.
+      If InsideBy(x, y, #TRI_MARGIN) = 1
+        insideN0 = insideN0 + 1
+        If v <> #TRI_COLOR
+          insideBad0 = insideBad0 + 1
+        EndIf
+      EndIf
+      If OutsideBy(x, y, #TRI_MARGIN) = 1
+        outsideN0 = outsideN0 + 1
+        If v <> #TRI_CLEAR
+          outsideBad0 = outsideBad0 + 1
+        EndIf
+      EndIf
+
+      ; Convention 1: the store's row y is (height - 1 - Ys row).
+      sy = (#TRI_H - 1) - y
+      If InsideBy(x, sy, #TRI_MARGIN) = 1
+        insideN1 = insideN1 + 1
+        If v <> #TRI_COLOR
+          insideBad1 = insideBad1 + 1
+        EndIf
+      EndIf
+      If OutsideBy(x, sy, #TRI_MARGIN) = 1
+        outsideN1 = outsideN1 + 1
+        If v <> #TRI_CLEAR
+          outsideBad1 = outsideBad1 + 1
+        EndIf
+      EndIf
+
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+Procedure VerifyGuard()
+  Define i.i
+  Define n.i
+  i = 0
+  n = #TRI_GUARD_BYTES / 4
+  While i < n
+    If PeekN(#TRI_GUARD + (i * 4)) <> #TRI_POISON
+      guardTouched = guardTouched + 1
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define csBytes.i
+  Define vsBytes.i
+  Define fsBytes.i
+  Define ok.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 4 - one triangle, 64x64, counted ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0. Stage 0. A precondition and not a formality: V3D 7.1 puts
+  ;     different registers at these offsets and the CLE is a bus
+  ;     master.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0: ")
+  PutErr(r)
+  PutNl()
+  RowHex("HUB_IDENT1", V3dIdent1())
+  If r <> #V3D_OK
+    PutS("verdict: STAGE0")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. THE THREE QPU PROGRAMS, BUILT AND PRINTED FIRST.
+  ;
+  ;     Before any hardware state exists, because a program that
+  ;     refuses to assemble is a finding that should not need a
+  ;     working MMU to reach, and because a listing already on the
+  ;     wire survives a hang later.
+  ; ------------------------------------------------------------------
+  PutS("1   the shaders")
+  PutNl()
+
+  r = BuildCoordShader()
+  csBytes = V3dQpuProgramBytes()
+  PutS("    coordinate shader: ")
+  PutQpuErr(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", csBytes / 8)
+  DumpProgram(#TRI_CODE_CS, csBytes / 8)
+
+  r = BuildVertexShader()
+  vsBytes = V3dQpuProgramBytes()
+  PutS("    vertex shader: ")
+  PutQpuErr(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", vsBytes / 8)
+  DumpProgram(#TRI_CODE_VS, vsBytes / 8)
+
+  r = BuildFragmentShader()
+  fsBytes = V3dQpuProgramBytes()
+  PutS("    fragment shader: ")
+  PutQpuErr(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", fsBytes / 8)
+  DumpProgram(#TRI_CODE_FS, fsBytes / 8)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  2. The frame geometry, printed before anything is built from it.
+  ; ------------------------------------------------------------------
+  r = V3dRenderBegin(#TRI_W, #TRI_H, #V3D_OFMT_RGBA8)
+  PutS("2   the frame: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: GEOMETRY")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("tile width", V3dTileW())
+  RowDec("tile height", V3dTileH())
+  RowDec("tiles across", V3dTilesX())
+  RowDec("tiles down", V3dTilesY())
+  RowDec("RT internal type", V3dRtInternalType())
+  RowDec("RT internal bpp", V3dRtInternalBpp())
+  RowDec("tile alloc needed", V3dTileAllocNeeded())
+  RowDec("tile alloc given", #TRI_TALLOC_BYTES)
+  PutNl()
+
+  r = V3dRenderTarget(#TRI_TARGET, #TRI_TARGET_BYTES, #V3D_MEMFMT_RASTER, #TRI_STRIDE, 0)
+  If r <> #V3D_OK
+    PutS("    the render target: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  V3dRenderClear(#TRI_CLEAR, #TRI_ZCLEAR, 0)
+  r = V3dRenderPool(#TRI_TALLOC, #TRI_TALLOC_BYTES, #TRI_TSTATE, #TRI_TSTATE_BYTES)
+  If r <> #V3D_OK
+    PutS("    the pools: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinOverflow(#TRI_OVERFLOW, #TRI_OVERFLOW_BYTES)
+  If r <> #V3D_OK
+    PutS("    the overflow pool: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  3. THE DATA AND THE RECORDS.
+  ; ------------------------------------------------------------------
+  BuildVerts()
+  BuildUniforms()
+
+  ; POISON BOTH RECORD PAGES BEFORE EITHER IS BUILT. Twenty fields of
+  ; the record are booleans nothing here sets, and the hardware reads
+  ; all of them; V3dShaderRecordBegin() zeroes the record for exactly
+  ; that reason. Over zeroed DRAM a missing zeroing pass is invisible,
+  ; which is what let a mutant that deleted it survive.
+  i = 0
+  n = #TRI_CORPUS_BYTES / 4
+  While i < n
+    PokeN(#TRI_CORPUS + (i * 4), #TRI_POISON)
+    PokeN(#TRI_SHREC + (i * 4), #TRI_POISON)
+    i = i + 1
+  Wend
+
+  r = BuildCorpusRecord()
+  PutS("3   the encoder corpus record: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: CORPUS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("corpus bytes", V3dShaderRecordBytes())
+  DumpBytes(#TRI_CORPUS, V3dShaderRecordBytes())
+  PutNl()
+
+  r = BuildRecords(6, 8)
+  PutS("3b  the shader state record: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RECORD")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("record", V3dShaderRecordAddr())
+  RowDec("record + attrs, bytes", V3dShaderRecordBytes())
+  DumpBytes(V3dShaderRecordAddr(), V3dShaderRecordBytes())
+  PutS("    the three vertices, eight words each:")
+  PutNl()
+  DumpBytes(#TRI_VERTS, 96)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4. POISON THE TARGET AND THE GUARD PAGE.
+  ;
+  ;     Poisoning rather than only checking for the two colours is
+  ;     what makes "wrote nothing", "wrote zeros" and "wrote part of
+  ;     it" three distinguishable answers.
+  ; ------------------------------------------------------------------
+  i = 0
+  n = #TRI_TARGET_BYTES / 4
+  While i < n
+    PokeN(#TRI_TARGET + (i * 4), #TRI_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = #TRI_GUARD_BYTES / 4
+  While i < n
+    PokeN(#TRI_GUARD + (i * 4), #TRI_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = 4096 / 4
+  While i < n
+    PokeN(#TRI_TALLOC + (i * 4), #TRI_POISON)
+    PokeN(#TRI_TSTATE + (i * 4), #TRI_POISON)
+    i = i + 1
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  5. THE V3D MMU. Every address the CLE, the PTB, the VCD, the QPU
+  ;     and the TLB touch is VIRTUAL.
+  ;
+  ;     THE FIVE NEW MAPPINGS ARE THE STAGE-4 ONES: the shader state
+  ;     record, the vertex data, the uniform streams and the QPU
+  ;     programs. A clear needed none of them.
+  ; ------------------------------------------------------------------
+  PutS("5   the V3D MMU: ")
+  r = V3dMmuInit(#TRI_PT, #TRI_PT_BYTES, #TRI_ILLEGAL)
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dMmuMap(#TRI_BCL, #TRI_BCL, #TRI_BCL_BYTES)
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_TILELIST, #TRI_TILELIST, #TRI_TL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_RCL, #TRI_RCL, #TRI_RCL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_TSTATE, #TRI_TSTATE, #TRI_TSTATE_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_SHREC, #TRI_SHREC, #TRI_SHREC_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_VERTS, #TRI_VERTS, #TRI_VERTS_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_UNIF_CS, #TRI_UNIF_CS, #TRI_UNIF_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_CODE_CS, #TRI_CODE_CS, #TRI_CODE_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_TARGET, #TRI_TARGET, #TRI_TARGET_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_TALLOC, #TRI_TALLOC, #TRI_TALLOC_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TRI_OVERFLOW, #TRI_OVERFLOW, #TRI_OVERFLOW_BYTES)
+  EndIf
+  If r <> #V3D_OK
+    PutS("    mapping: ") : PutErr(r) : PutNl()
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("pages mapped", V3dMmuPagesMapped())
+  RowHex("PTE for the guard page", V3dMmuEntry(#TRI_GUARD))
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  6. THE BIN LIST - the prologue, the draw state, and the primitive.
+  ;
+  ;     THE ORDER IS MESA'S, from v3dX(emit_state) (v3dx_emit.c:256 to
+  ;     :684 in source order), then v3d_emit_gl_shader_state
+  ;     (v3dx_draw.c:891-908), then the primitive (:1330-1334).
+  ;     Nothing here chose it.
+  ; ------------------------------------------------------------------
+  r = V3dBclBegin(#TRI_BCL, #TRI_BCL_BYTES)
+  If r = #V3D_OK
+    ; The clip window is the whole surface. v3dx_emit.c:243-263.
+    V3dClClipWindow(0, 0, #TRI_W, #TRI_H)
+
+    ; BOTH FACING BITS ARE SET, so a winding this program has not
+    ; reasoned about cannot cull the triangle. Depth-test function
+    ; ALWAYS, which is what Mesa writes when depth testing is off
+    ; (v3dx_emit.c:346-348, PIPE_FUNC_ALWAYS, and the XML's Compare
+    ; Function enum gives ALWAYS = 7).
+    V3dClCfgBits(V3dCfgBitsWord(1, 1, 0, 7))
+
+    V3dClPointSize(#TRI_F_ONE)
+    V3dClLineWidth(#TRI_F_ONE)
+
+    ; Half-width and half-height IN 1/256ths OF A PIXEL, as floats.
+    ; 32 pixels * 256 = 8192.
+    V3dClClipperXyScaling(#TRI_F_8192, #TRI_F_8192)
+    ; Zs = Zc * 1 + 0, so the vertex shader's Zs is Zc unchanged.
+    V3dClClipperZScaleOffset(#TRI_F_ONE, #TRI_F_ZERO)
+    ; And the clip planes Mesa derives from the same two numbers:
+    ; translate - scale and translate + scale, so -1 and +1.
+    V3dClClipperZMinMax($BF800000, #TRI_F_ONE)
+    ; The viewport centre, u14.8: 32 pixels is 8192.
+    V3dClViewportOffset((#TRI_CX * 256), 0, (#TRI_CY * 256), 0)
+
+    ; Zero because the fragment shader has no varyings at all.
+    V3dClColorWriteMasks(0)
+    V3dClZeroAllFlatShadeFlags()
+    V3dClZeroAllNonperspFlags()
+    V3dClZeroAllCentroidFlags()
+
+    V3dClOcclusionQueryCounter(0)
+    ; Coverage 1.0 as an f187 - the top sixteen bits of the f32 - and
+    ; the four-sample mask Mesa writes for a non-MSAA surface.
+    V3dClSampleState($3F80, $F)
+
+    ; Vc = vcm_cache_size for both phases, and with no geometry shader
+    ; that is the same number twice (Mesa mesa-24.3.4 src/broadcom/compiler/vir.c
+    ; :2508-2515). Four is what :861-876's arithmetic gives for any
+    ; VPM this part reports.
+    V3dClVcmCacheSize(4, 4)
+    V3dClGlShaderState(V3dShaderRecordAddr(), 8)
+
+    V3dClVertexArrayPrims(#V3D_PRIM_TRIANGLES, 3, 0)
+
+    r = V3dBclFinish()
+  EndIf
+  PutS("6   the bin list: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("bin list bytes", V3dBclBytes())
+  DumpBytes(V3dBclStartAddr(), V3dBclBytes())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  7. THE RENDER LIST AND ITS GENERIC TILE LIST. Unchanged from the
+  ;     clear: the render side of a draw and of a clear are the same
+  ;     list, which is worth knowing and is why this stage did not
+  ;     have to touch V3dRclBuild().
+  ; ------------------------------------------------------------------
+  r = V3dRclBuild(#TRI_TILELIST, #TRI_TL_BYTES, #TRI_RCL, #TRI_RCL_BYTES)
+  PutS("7   the render list: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("generic tile list bytes", V3dTileListBytes())
+  DumpBytes(V3dTileListStartAddr(), V3dTileListBytes())
+  RowDec("render list bytes", V3dRclBytes())
+  DumpBytes(V3dRclStartAddr(), V3dRclBytes())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  8. CACHE MAINTENANCE FOR THE FOUR BUFFERS V3dBinSubmit() DOES NOT
+  ;     KNOW ABOUT.
+  ;
+  ;     V3dBinSubmit() cleans the bin list, the tile allocation pool
+  ;     and the tile state, because those are the three it is handed.
+  ;     The shader record, the vertex data, the uniform streams and
+  ;     the QPU programs are reached through the record and the
+  ;     library never sees their extents. WITH THE ARM MMU OFF THIS
+  ;     COSTS NOTHING AND DOES NOTHING - every access is
+  ;     Device-nGnRnE - and it is here anyway because the first
+  ;     cacheable-DRAM run should not have to discover it.
+  ; ------------------------------------------------------------------
+  V3dCacheRange(#TRI_SHREC, V3dShaderRecordBytes())
+  V3dCacheRange(#TRI_VERTS, 512)
+  V3dCacheRange(#TRI_UNIF_CS, 256)
+  V3dCacheRange(#TRI_CODE_CS, #TRI_CODE_SLOT * 3)
+  V3dBarrier()
+
+  ; ------------------------------------------------------------------
+  ;  9. THE BIN JOB. This one bins a real primitive.
+  ; ------------------------------------------------------------------
+  r = V3dBinSubmit()
+  PutS("8   bin submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BINSUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinWait(#TRI_WAIT_US)
+  PutS("    bin wait: ")
+  PutErr(r)
+  PutNl()
+  RowHex("CLE_BFC before", V3dBinBfcBefore())
+  RowHex("CLE_BFC after", V3dBinBfcAfter())
+  RowHex("CLE_CT0CA", V3dBinCt0ca())
+  RowHex("CLE_CT0EA", V3dBinCt0ea())
+  RowHex("PTB_BPCA", V3dBinBpca())
+  RowHex("PTB_BPCS", V3dBinBpcs())
+  RowHex("CTL_INT_STS", V3dBinIntSts())
+  RowHex("ERR_STAT", V3dBinErrStat())
+  RowHex("MMU_CTL", V3dBinMmuCtl())
+  RowHex("MMU_VIO_ADDR", V3dBinVioAddr())
+  RowDec("bin spins", V3dBinSpins())
+  RowDec("OOM events", V3dBinOomCount())
+  PutS("    the tile allocation pool, first 16 words:")
+  PutNl()
+  DumpBytes(#TRI_TALLOC, 64)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BIN")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  10. THE RENDER JOB.
+  ; ------------------------------------------------------------------
+  r = V3dRenderSubmit()
+  PutS("9   render submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RENDERSUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dRenderWait(#TRI_WAIT_US)
+  PutS("    render wait: ")
+  PutErr(r)
+  PutNl()
+  RowHex("CLE_RFC before", V3dRenderRfcBefore())
+  RowHex("CLE_RFC after", V3dRenderRfcAfter())
+  RowHex("CLE_CT1CA", V3dRenderCt1ca())
+  RowHex("CLE_CT1EA", V3dRenderCt1ea())
+  RowHex("CTL_INT_STS", V3dRenderIntSts())
+  RowHex("ERR_STAT", V3dRenderErrStat())
+  RowHex("MMU_CTL", V3dRenderMmuCtl())
+  RowHex("MMU_VIO_ADDR", V3dRenderVioAddr())
+  RowDec("render spins", V3dRenderSpins())
+  RowDec("cache clean result", V3dRenderCleanResult())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  11. THE PIXELS. This is the whole test.
+  ; ------------------------------------------------------------------
+  Verify()
+  VerifyGuard()
+
+  PutS("10  the pixels")
+  PutNl()
+  RowDec("pixels total", #TRI_PIXELS)
+  RowHex("triangle colour", #TRI_COLOR)
+  RowDec("pixels triangle colour", nTri)
+  RowHex("clear colour", #TRI_CLEAR)
+  RowDec("pixels clear colour", nClear)
+  RowDec("pixels still poison", nPoison)
+  RowDec("pixels some other value", nOther)
+  RowDec("first other, pixel index", firstOther)
+  RowHex("first other, value", firstOtherVal)
+  RowDec("bounding box min x", minX)
+  RowDec("bounding box max x", maxX)
+  RowDec("bounding box min y", minY)
+  RowDec("bounding box max y", maxY)
+  RowDec("guard words touched", guardTouched)
+  PutNl()
+
+  PutS("    the shape, both Y conventions, margin 2 px:")
+  PutNl()
+  RowDec("dir0 interior pixels", insideN0)
+  RowDec("dir0 interior WRONG", insideBad0)
+  RowDec("dir0 exterior pixels", outsideN0)
+  RowDec("dir0 exterior WRONG", outsideBad0)
+  RowDec("dir1 interior pixels", insideN1)
+  RowDec("dir1 interior WRONG", insideBad1)
+  RowDec("dir1 exterior pixels", outsideN1)
+  RowDec("dir1 exterior WRONG", outsideBad1)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE VERDICT.
+  ;
+  ;  A pass needs ALL of: no poison left anywhere, nothing outside the
+  ;  two colours, the guard page untouched, and ONE of the two Y
+  ;  conventions clean on both its interior and its exterior. The
+  ;  interior count also has to be non-zero, or "nothing was drawn and
+  ;  every exterior pixel is the clear colour" would pass.
+  ; ------------------------------------------------------------------
+  ok = 0
+  If insideN0 > 0
+    If insideBad0 = 0
+      If outsideBad0 = 0
+        ok = 1
+      EndIf
+    EndIf
+  EndIf
+  If insideN1 > 0
+    If insideBad1 = 0
+      If outsideBad1 = 0
+        ok = 2
+      EndIf
+    EndIf
+  EndIf
+  If nPoison <> 0 Or nOther <> 0 Or guardTouched <> 0
+    ok = 0
+  EndIf
+
+  Select ok
+    Case 1
+      PutS("verdict: OK - triangle, Y increases with the stored row")
+    Case 2
+      PutS("verdict: OK - triangle, Y is flipped against the stored row")
+    Default
+      PutS("verdict: NO TRIANGLE")
+  EndSelect
+  PutNl()
+
+  ProcedureReturn nTri
+EndProcedure

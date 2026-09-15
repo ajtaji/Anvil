@@ -1,0 +1,412 @@
+; ======================================================================
+;  anvilqsliprxprobe.unoq - Arduino UNO Q: WHY THE RECEIVE PATH DELIVERS
+;  FOUR BYTES FOR EVERY ONE.
+;
+;  ---- WHAT THIS EXISTS TO SETTLE ---------------------------------------
+;
+;  On 2026-09-07 the SLIP bench ran on this silicon and the transmit half
+;  was perfect: four ICMP echo requests left the board, the host peer
+;  decoded all four with good checksums and answered all four. The board
+;  then reported `driver: bytes out 248  in 992` for a host that had put
+;  exactly 248 bytes on the wire - EXACTLY FOUR RECEIVED BYTES FOR EVERY
+;  ONE SENT - so nothing matched and every echo read NO REPLY.
+;
+;  Four is the FIFO word size, so the fault is in how many bytes are
+;  taken out of a receive word. THE TWO VENDOR DRIVERS DO NOT SETTLE IT.
+;  qcom_geni_serial.c's polled qcom_geni_serial_get_char() applies the
+;  partial-word count only when the word count is exactly 1; its
+;  interrupt path qcom_geni_serial_handle_rx_fifo() applies it to the
+;  last word whatever the count is; and U-Boot's msm_serial_getc() reads
+;  one word and throws three bytes away on purpose. Every one of them
+;  takes four bytes from a word that is not marked partial, so none of
+;  them explains a fourfold count on its own.
+;
+;  ***SO THIS IMAGE MEASURES INSTEAD OF ARGUING.*** It sends one echo
+;  request, then reads RX_FIFO_STATUS and the FIFO word itself in a tight
+;  bounded loop and records the RAW PAIRS. The word count, the RX_LAST
+;  flag and RX_LAST_BYTE_VALID for every single read, next to the four
+;  bytes that word actually carried, answer the question outright:
+;
+;    * a word count above 1 on a stream of single bytes says the stale
+;      timer is flushing one byte per word and the "not the last word, so
+;      it holds four" rule is wrong here;
+;    * RX_LAST clear on a partial word says the flag cannot be used to
+;      find the partial word at all;
+;    * a word carrying one real byte and three zeroes names the three
+;      bytes that are being invented.
+;
+;  ---- IT READS TWO REGISTERS DIRECTLY, AND THAT IS THE POINT -----------
+;
+;  RX_FIFO_STATUS and RX_FIFOn are read here with PeekN rather than
+;  through the driver, because the driver's own reading of them is the
+;  thing under test and an instrument that shares the suspect's code
+;  cannot convict it. THIS IS SAFE ONLY BECAUSE THE PORT IS ALREADY
+;  TAKEN: QSerialUp() has answered 1, which means the engine answered its
+;  identity read, so the window is clocked. Nothing here is reached if
+;  the take fails.
+;
+;  ---- IT TAKES THE CONSOLE, LIKE THE BENCH ----------------------------
+;
+;  Same wire, same rules, same transcript route: \EFI\anvil\qsliprx.log
+;  on the EFI System Partition and the AnvilQTxt variable. Start the host
+;  first and leave it running:
+;
+;      python tools/q_slip_host.py --port COM<n> --baud 115200 \
+;             --dump _work/rxprobe.cap
+;
+;  BUILD:  bash tools/build_unoq_sliprxprobe.sh
+; ======================================================================
+
+EnableExplicit
+
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "ArduinoQ/Lib/qgeniuart.pi4"
+XIncludeFile "ArduinoQ/Board/hw_serial_q.pi4"
+XIncludeFile "ArduinoQ/Lib/qslip.pi4"
+XIncludeFile "ArduinoQ/Lib/qnetfile.pi4"
+XIncludeFile "ArduinoQ/Board/hw_link_q.pi4"
+XIncludeFile "ArduinoQ/Board/hw_net_q.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+
+#EFI_ATTR = $7
+
+#RP_IP   = $0A000002
+#RP_MASK = $FFFFFFFC
+#RP_PEER = $0A000001
+
+; The two registers under test. Absolute, because this instrument must
+; not share the driver's accessors - see the header.
+#RP_RX_FIFO_STATUS = $04A90804
+#RP_RX_FIFO        = $04A90780
+#RP_RX_LAST        = $80000000
+#RP_RX_LAST_MASK   = $70000000
+#RP_RX_LAST_SHIFT  = 28
+#RP_RX_WC_MASK     = $1FFFFFF
+
+; How many raw pairs to keep. A 60-octet datagram is 62 bytes on the
+; wire, so 96 covers a whole reply however the engine chooses to hand it
+; over - one byte per word at the worst, four at the best.
+#RP_MAX = 96
+; The bound on the whole capture. The host answers in about ten
+; milliseconds; 400 is generous by forty times and it is a BOUND, which
+; is what stops a silent wire becoming a board nobody can reach.
+#RP_WAIT_MS = 400
+
+Global Dim gRpSt.i[#RP_MAX]
+Global Dim gRpWd.i[#RP_MAX]
+Global gRpN.i
+Global gRpBytes.i
+Global Dim gRpPeerMac.b[8]
+Global Dim gVarName.b[24]
+Global Dim gVarGuid.b[16]
+
+Procedure PutDotted(v.i)
+  PrintDec((v >> 24) & $FF)
+  Print(".")
+  PrintDec((v >> 16) & $FF)
+  Print(".")
+  PrintDec((v >> 8) & $FF)
+  Print(".")
+  PrintDec(v & $FF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Resolve - the same bounded address-cache step the bench needs, and for
+;  the same reason: NetPingBuild() refuses with -118 until the next hop
+;  is known, and on a SLIP wire the reply is synthesised by the framing
+;  layer rather than transmitted, so this cannot fail because of a silent
+;  host.
+; ----------------------------------------------------------------------
+Procedure.i Resolve()
+  Define k.i
+  Define hop.i
+  hop = NetNextHop(#RP_PEER)
+  k = 0
+  While k < 4
+    If NetArpLookup(hop, @gRpPeerMac[0]) = 1
+      ProcedureReturn 1
+    EndIf
+    If NetArpRequest(hop) <> 0
+      LinkTxStaged()
+    EndIf
+    LinkPumpNet(10)
+    k = k + 1
+  Wend
+  ProcedureReturn NetArpLookup(hop, @gRpPeerMac[0])
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Capture - the measurement.
+;
+;  ***THE FIFO WORD IS READ EXACTLY ONCE PER RECORDED STATUS AND THE
+;  STATUS IS READ IMMEDIATELY BEFORE IT.*** Reading the status twice, or
+;  reading the word without the status that described it, would produce a
+;  table in which the two columns are about different moments - which is
+;  the one way a raw dump can lie.
+;
+;  Nothing is decoded and nothing is delivered anywhere: this loop
+;  deliberately does not use the driver's read routine, so the bytes it
+;  pulls are lost. That is the cost of measuring the suspect with an
+;  independent instrument and it is why this image pings once rather than
+;  four times.
+; ----------------------------------------------------------------------
+Procedure Capture()
+  Define t0.i
+  Define st.i
+  t0 = millis()
+  Repeat
+    st = PeekN(#RP_RX_FIFO_STATUS) & $FFFFFFFF
+    If (st & #RP_RX_WC_MASK) <> 0
+      gRpSt[gRpN] = st
+      gRpWd[gRpN] = PeekN(#RP_RX_FIFO) & $FFFFFFFF
+      gRpN = gRpN + 1
+      If gRpN >= #RP_MAX
+        Break
+      EndIf
+    EndIf
+    If (millis() - t0) > #RP_WAIT_MS
+      Break
+    EndIf
+  ForEver
+EndProcedure
+
+Procedure Report()
+  Define i.i
+  Define st.i
+  Define wd.i
+  Define wc.i
+  Define lastf.i
+  Define lastn.i
+  Define words1.i
+  Define wordsN.i
+  Define lastset.i
+
+  PrintN("-- every receive word, exactly as the engine handed it over --")
+  PrintN("     #  RX_FIFO_STATUS  words  LAST  valid   the word")
+  i = 0
+  words1 = 0
+  wordsN = 0
+  lastset = 0
+  While i < gRpN
+    st = gRpSt[i]
+    wd = gRpWd[i]
+    wc = st & #RP_RX_WC_MASK
+    If (st & #RP_RX_LAST) <> 0
+      lastf = 1
+      lastset = lastset + 1
+    Else
+      lastf = 0
+    EndIf
+    lastn = (st & #RP_RX_LAST_MASK) >> #RP_RX_LAST_SHIFT
+    If wc = 1
+      words1 = words1 + 1
+    Else
+      wordsN = wordsN + 1
+    EndIf
+    Print("  ")
+    PrintDec(i)
+    Print("    ")
+    PutHex8(st)
+    Print("      ")
+    PrintDec(wc)
+    Print("     ")
+    PrintDec(lastf)
+    Print("     ")
+    PrintDec(lastn)
+    Print("     ")
+    PutHex8(wd)
+    PrintNl()
+    i = i + 1
+  Wend
+  PrintNl()
+
+  PrintN("-- what that table says --")
+  Print("  words recorded ")
+  PrintDec(gRpN)
+  Print("   of them with a word count of 1: ")
+  PrintDec(words1)
+  Print("   more than 1: ")
+  PrintDec(wordsN)
+  PrintNl()
+  Print("  RX_LAST set on ")
+  PrintDec(lastset)
+  Print(" of ")
+  PrintDec(gRpN)
+  PrintNl()
+  PrintNl()
+  PrintN("  READ IT THIS WAY, and the reading is fixed before the run so it")
+  PrintN("  cannot be chosen to suit the answer:")
+  PrintN("   * The host answers one echo request with 62 bytes on the wire.")
+  PrintN("     Sixteen words of four bytes is the engine packing properly and")
+  PrintN("     the driver's rule is right; sixty-two words is one byte a word")
+  PrintN("     and the rule that a non-last word holds four is what invents")
+  PrintN("     the other three.")
+  PrintN("   * RX_LAST set on every row means the partial-word count is")
+  PrintN("     available on every word and the driver is simply not asking")
+  PrintN("     for it except when the word count happens to be 1.")
+  PrintN("   * RX_LAST clear on a row whose word plainly carries one real")
+  PrintN("     byte means the flag cannot be used to find a partial word at")
+  PrintN("     all on this engine, and the count has to come from somewhere")
+  PrintN("     else.")
+  PrintN("   * NOTHING recorded at all means the receive command is not")
+  PrintN("     delivering into the FIFO, which is a different fault from")
+  PrintN("     over-delivery and is not what the bench measured.")
+EndProcedure
+
+Procedure EmitReport()
+  PrintN("== Anvil on the Arduino UNO Q - the SLIP receive word probe ==")
+  PrintNl()
+
+  If QSerialUp() = 0
+    PrintN("THE PORT WAS NOT TAKEN, and the driver's reason follows.")
+    PrintNl()
+    Print("  ")
+    UartWriteStr(QGeniUartWhy())
+    PrintNl()
+    PrintN("Nothing was written to any register and nothing was read from the")
+    PrintN("FIFO. This probe reads the engine directly and is only safe once")
+    PrintN("the take has answered, so it stops here.")
+    ProcedureReturn
+  EndIf
+
+  Print("  serial engine 4 answered ")
+  PutHex8(QGeniUartFwRev())
+  Print(", protocol ")
+  PrintDec(QGeniUartProto())
+  Print(", clock divider ")
+  PrintDec(QSerialClkDiv())
+  PrintNl()
+
+  If LinkUseKind(#HW_LINK_SERIAL) <> #HW_LINK_SERIAL
+    PrintN("the link policy refused the serial kind:")
+    Print("  ")
+    UartWriteStr(LinkWhyText())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  If NetSetMac(HwLinkMacPtr(#HW_LINK_SERIAL)) <> 1
+    PrintN("the address the link offered was refused by the IP layer")
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  If NetSetIPv4(#RP_IP, #RP_MASK, #RP_PEER) <> 1
+    Print("the IP configuration was refused, net error ")
+    PrintDec(NetError())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  Print("  this board is ")
+  PutDotted(#RP_IP)
+  Print(" and the host is ")
+  PutDotted(#RP_PEER)
+  PrintNl()
+
+  If Resolve() <> 1
+    PrintN("  the peer is not in the address cache, so no request can be")
+    PrintN("  built. That is a fault inside this image, not a silent host.")
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+
+  If NetPingBuild(#RP_PEER, $6100, 1, 32) <> 1
+    Print("  the echo request could not be built, net error ")
+    PrintDec(NetError())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  If LinkTxStaged() <> 1
+    PrintN("  the echo request would not go on the wire, so there is nothing")
+    PrintN("  for the host to answer and nothing to measure.")
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  Print("  one echo request sent, ")
+  PrintDec(QSerTxBytes())
+  PrintN(" bytes across the transmit FIFO")
+  PrintNl()
+
+  Capture()
+  Report()
+
+  QSerialGive()
+  PrintNl()
+  Print("-- the port was handed back: present now reads ")
+  PrintDec(QSerialPresent())
+  PrintN(" --")
+
+  PrintNl()
+  Print("transcript used ")
+  PrintDec(gQOutLen)
+  Print(" of ")
+  PrintDec(#Q_OUT_MAX)
+  Print(" bytes, dropped ")
+  PrintDec(gQTrunc)
+  PrintNl()
+  PrintN("== end of run ==")
+EndProcedure
+
+Procedure BuildSinkNames()
+  Define b.i
+  b = @gVarName[0]
+  QPb(b,0,65) :QPb(b,1,0) : QPb(b,2,110):QPb(b,3,0)
+  QPb(b,4,118):QPb(b,5,0) : QPb(b,6,105):QPb(b,7,0)
+  QPb(b,8,108):QPb(b,9,0) : QPb(b,10,81):QPb(b,11,0)
+  QPb(b,12,84):QPb(b,13,0): QPb(b,14,120):QPb(b,15,0)
+  QPb(b,16,116):QPb(b,17,0):QPb(b,18,0):QPb(b,19,0)
+  b = @gVarGuid[0]
+  QPb(b, 0,$D4):QPb(b, 1,$C3):QPb(b, 2,$B2):QPb(b, 3,$A1)
+  QPb(b, 4,$66):QPb(b, 5,$55)
+  QPb(b, 6,$88):QPb(b, 7,$77)
+  QPb(b, 8,$99):QPb(b, 9,$AA):QPb(b,10,$BB):QPb(b,11,$CC)
+  QPb(b,12,$DD):QPb(b,13,$EE):QPb(b,14,$FF):QPb(b,15,$00)
+EndProcedure
+
+Procedure.i Main()
+  Define ih.i
+  Define st.i
+
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+
+  ih = gQIh
+  st = gQSt
+  If QEfiInit(ih, st) = 0
+    ProcedureReturn 0
+  EndIf
+
+  If TimerInit() = 0
+    QEfiOutStr("the architectural counter reads as stopped - refusing to take the console UART")
+    QEfiReset()
+    ProcedureReturn 0
+  EndIf
+
+  QSlipInit()
+  BuildSinkNames()
+
+  QEfiOutStr("Anvil UNO Q - taking serial engine 4 to probe the receive words; output goes to the ESP log")
+
+  EmitReport()
+
+  QEspWrite("\EFI\anvil\qsliprx.log", @gQOut[0], gQOutLen)
+  QCall(PeekI(gQRt + #QRT_SETVARIABLE), @gVarName[0], @gVarGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  QEfiOutStr("probe complete - resetting back to Debian")
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure

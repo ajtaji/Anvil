@@ -1,0 +1,1708 @@
+; pi4DmaGate.pi4 - THE DIFFERENTIAL GATE for RaspberryPi4/Lib/dma.pi4.
+;
+; Do the same rectangle twice - once with a plain CPU byte loop and once
+; with the DMA engine - and require the two results to be IDENTICAL BYTE
+; FOR BYTE, over the WHOLE buffer and not merely over the rectangle.
+;
+; DIAGNOSTIC. Does not ship. It touches no framebuffer, opens no
+; mailbox, and needs no HDMI display connected.
+;
+;   PureMetalForge.exe --compile RaspberryPi4\Examples\Diagnostics\pi4DmaGate.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o _work\dmagate.img
+;
+; ======================================================================
+; WHY A CPU BYTE LOOP IS THE RIGHT ORACLE
+; ======================================================================
+; pi4FpGate.pi4 makes the argument for this shape of test and it applies
+; here unchanged: a table of expected answers can be wrong in the same
+; direction as the code it checks, and two INDEPENDENT IMPLEMENTATIONS
+; of the same specification, running on the same board, in the same
+; program, on the same inputs, cannot.
+;
+; The oracle here is fifteen lines of PokeB. It shares nothing with
+; dma.pi4 - not a register, not a control block, not a cache operation,
+; not even a word width. If the two agree on a hundred geometries the
+; agreement means something.
+;
+; AND THE COMPARISON IS OVER THE WHOLE 64 KiB, NOT THE RECTANGLE. That
+; is the half that catches the interesting bugs. A stride applied
+; instead of added, a YLENGTH one too large, a burst that over-writes
+; past the end of a row - none of those corrupt the rectangle. They
+; corrupt what is NEXT to it, and a test that only looked at the
+; rectangle would pass every one of them.
+;
+; ======================================================================
+; WHAT IS SWEPT, AND WHAT EACH GROUP IS LOOKING FOR
+; ======================================================================
+;
+;   GROUP A - FILL, ALIGNED. Row lengths that are multiples of four
+;     bytes, at pitches with and without a gap, from one row to
+;     seventeen. This is the ordinary case and every one of these must
+;     pass.
+;
+;   GROUP B - FILL, AWKWARD. Row lengths that are NOT multiples of four
+;     - 5, 17, 63 bytes - and destinations that are not four-byte
+;     aligned. The PDF says the engine "can deal with byte aligned
+;     transfers and will minimise bus traffic by buffering and packing
+;     misaligned accesses" (bcm2711-peripherals.txt:2286), so these
+;     should pass; they are in their own group because if they DO fail,
+;     the finding is "align your rectangles", not "the library is
+;     broken", and the two must not be confused.
+;
+;   GROUP C - COPY. The same geometries with a real source, and the
+;     source deliberately has a DIFFERENT pitch from the destination on
+;     half of them, because one stride field serving both sides is
+;     exactly where a packing bug would hide.
+;
+;   GROUP D - THE OVERLAPPING DOWNWARD COPY. dma.pi4 permits it on the
+;     reasoning that both addresses increment, which the PDF states,
+;     and therefore that each byte is read before the write that would
+;     clobber it, which the PDF does NOT state. This group is the whole
+;     evidence for that assumption. If it fails, the fix is in
+;     dma.pi4's DmaCopy2D - refuse overlap in both directions - and not
+;     here.
+;
+;   GROUP E - THE REFUSALS. Rectangles that must be turned away before
+;     a register is written. These matter more than they look: this
+;     engine writes physical addresses with nothing in the path to stop
+;     it, and a guard nobody has watched refuse anything is a guard
+;     nobody knows is broken.
+;
+;   GROUP A2 - THE BRACKET. Added after the first bench run, which
+;     failed exactly one case and left the boundary unlocated. Two
+;     ladders that walk the row length and the destination stride
+;     SEPARATELY, so a failure names which of the two it was.
+;
+;   GROUP G - CACHE COHERENCY, AND THE ONLY GROUP WITH NEGATIVE
+;     CONTROLS. Added 2026-08-27 when display.pi4 gained a DMA path.
+;     Groups A to F prove GEOMETRY and prove nothing whatever about
+;     coherency, because DgCaseFill and DgCaseCopy call DmaCacheRange
+;     over the whole 64 KiB on both sides of every transfer - which
+;     satisfies the discipline for them and would keep them green with
+;     every cache operation in dma.pi4 deleted. Group G removes that
+;     hygiene deliberately, one operation at a time, and requires the
+;     result to come out WRONG. Its own header is the long version.
+;     It runs BEFORE group F, because a group behind a deliberate hang
+;     may never run.
+;
+;   GROUP F - THE BURST CEILING, AND IT IS EXPECTED TO HANG THE BOARD.
+;     It runs last, it is the only caller of DmaSetBurstProbe(), and
+;     ARMING THE DEADMAN IS NOT OPTIONAL BEFORE IT. Its own header has
+;     the bisection procedure that turns the search into three runs.
+;
+; ======================================================================
+; ARM THE DEADMAN. `deadman 15` at the Anvil prompt, then `run`.
+; ======================================================================
+; Group F provoked an AXI bus lock on 2026-08-26 and the deadman is
+; what brought the board back. The counter is 20 bits at 65536 Hz, so
+; ~15.999 s is the ceiling on this part (safety.pi4:491-498 clamps and
+; RETURNS the real value); the whole suite runs in a couple of seconds,
+; so 15 covers it with room to spare and every group F rung is
+; deliberately one case rather than three so it stays that way.
+;
+; ======================================================================
+; THE BUFFERS, AND THE PROPERTY THE LAYOUT ITSELF PROVES
+; ======================================================================
+;   $780000  REF, 64 KiB - what the CPU produced
+;   $790000  OUT, 64 KiB - what the engine produced
+;   $7A0000  SRC, 64 KiB - the source for the copy tests
+;   $800000  THRASH, 2 MiB - group G's eviction region. Never read for
+;            its contents, only walked so that the last-level cache
+;            cannot still be holding the three buffers above.
+;
+; DmaSetBounds() IS POINTED AT OUT AND NOTHING ELSE, for the whole run.
+; So REF and SRC are outside the window the library will write into,
+; and any transfer that aimed at them - through a sign error, an
+; overflowed stride, a rectangle computed backwards - is refused rather
+; than delivered. The layout is part of the test.
+;
+; All three are inside the low gigabyte, which is the one address rule
+; the legacy engines have and the one that fails silently. See dma.pi4's
+; HAZARD 1.
+;
+; ======================================================================
+; THE CACHES
+; ======================================================================
+; #DG_MMU = 1 runs the whole gate with DRAM Normal Write-Back Cacheable,
+; which is the configuration that actually matters now and the one where
+; a missing clean or a missing invalidate turns a correct transfer into
+; a wrong answer. Every case here cleans what the CPU wrote before the
+; engine reads it and invalidates what the engine wrote before the CPU
+; reads it, through DmaCacheRange().
+;
+; RUNNING IT WITH #DG_MMU = 0 AS WELL IS WORTH ONE RUN. With the caches
+; off the maintenance calls are architecturally no-ops, so a pass there
+; and a failure here would localise the fault to the cache discipline
+; rather than to the transfer - which is the one diagnosis that is hard
+; to reach any other way.
+;
+; BUT SEE GROUP G FIRST. The sentence above ("every case here cleans
+; what the CPU wrote... through DmaCacheRange") is exactly why groups A
+; to F cannot certify the cache discipline: the GATE does the
+; maintenance, generously, on both sides of every transfer, so the
+; library could do none of its own and every case would still pass.
+; Group G is the part that removes the gate's own hygiene on purpose and
+; requires the result to be wrong. With #DG_MMU = 0 group G announces
+; that it is inert and runs no cases, because with the caches off there
+; is no hazard to provoke and a green group G would mean nothing.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+
+
+#DG_MMU = 1
+
+#DG_TABLES = $600000
+#DG_SCRATCH = $700000
+#DG_SCRATCH_BYTES = 512
+
+#DG_REF = $780000
+#DG_OUT = $790000
+#DG_SRC = $7A0000
+#DG_BYTES = 65536
+
+; ----------------------------------------------------------------------
+;  THE THRASH REGION - two megabytes whose only job is to be bigger than
+;  the cache. Added 2026-08-27 with group G.
+;
+;  Group G has to FORCE an eviction, because the hazard it looks for is a
+;  dirty line written back AFTER the engine has already written the same
+;  address. Waiting for that to happen by itself is not a test; the whole
+;  difficulty of the bug is that it happens when it feels like it.
+;  Reading straight through a region larger than the last level of cache
+;  makes it happen on demand.
+;
+;  TWO MEGABYTES because the Cortex-A72 cluster in the BCM2711 has a 1 MB
+;  shared L2 above a 32 KiB L1 data cache. Two megabytes read end to end
+;  cannot leave any of the 192 KiB of gate buffers resident, whatever the
+;  replacement policy does.
+;
+;  $800000 is above the three buffers, below the stack top at $3000000,
+;  and inside the low payload window $00400000..$07EFFFFF that
+;  memory.pi4's map (:200-215) sets aside. Nothing reads what it
+;  contains - only that it was touched.
+; ----------------------------------------------------------------------
+#DG_THRASH = $800000
+#DG_THRASH_BYTES = 2097152
+
+; ASCII codes. No character literals - house rule.
+; ======================================================================
+;  TRACING - because silence means pass, and a hang is not a pass
+; ======================================================================
+;  Every group except F prints only failures, which keeps a clean run
+;  to a handful of lines. That convention is correct for a test that
+;  RETURNS and useless for one that might not: on 2026-08-26 group F
+;  hung the board and the transcript could not say which rung it was
+;  on, because a rung that hangs never reaches its own failure line.
+;
+;  A HANG IS ONLY EVER DIAGNOSED BY WHAT WAS PRINTED BEFORE IT.
+;
+;  So there are two levels, and the split is on cost:
+;
+;    #DG_TRACE = 0  the default. Groups A to E stay silent on success.
+;                   They run inside DmaSetBurst()'s cap and none of
+;                   them has ever hung.
+;    #DG_TRACE = 1  every case in every group announces its geometry
+;                   BEFORE it attempts it, and drains the UART so the
+;                   bytes are physically on the wire before the engine
+;                   starts. Sixty-odd extra lines, and the last one is
+;                   the answer if the board stops.
+;
+;  IF THE BOARD EVER HANGS IN A GROUP OTHER THAN F, re-run once with
+;  #DG_TRACE = 1. That is the whole recovery procedure.
+;
+;  GROUP F IS ALWAYS TRACED REGARDLESS, because provoking a hang is its
+;  entire purpose and a traceless run of it is a wasted reset.
+#DG_TRACE = 0
+
+#DG_ZERO  = 48
+#DG_ALPHA = 55                 ; the letter A, minus ten
+#DG_SPACE = 32
+
+Global dgChecks.i = 0
+Global dgFails.i = 0
+
+; ----------------------------------------------------------------------
+;  A THIRD TALLY, AND IT IS NOT A THIRD KIND OF FAILURE.
+;
+;  Group G carries NEGATIVE CONTROLS: cases that deliberately omit a
+;  cache operation and must therefore come out WRONG. A negative control
+;  that comes out RIGHT has not found a bug in dma.pi4 - it has found
+;  that the gate could not provoke the hazard on this run, which means
+;  the matching POSITIVE case proved nothing either.
+;
+;  Calling that a pass would be the worst possible answer, because it is
+;  the answer a machine with the caches accidentally off gives to every
+;  question in the group. Calling it a failure would be a lie about
+;  dma.pi4. So it is its own word: INCONCLUSIVE, counted, and printed in
+;  the summary next to the other two.
+; ----------------------------------------------------------------------
+Global dgIncon.i = 0
+
+
+; ======================================================================
+;  OUTPUT
+; ======================================================================
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+EndProcedure
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(#DG_ZERO + n)
+    Else
+      UartWrite(#DG_ALPHA + n)
+    EndIf
+  Next
+EndProcedure
+
+; Print a geometry the same way every time, so a failing line can be
+; read at a glance and typed straight back in.
+Procedure PutGeom(rowBytes.i, rows.i, dpitch.i, spitch.i, off.i)
+  PutS("w=")
+  PrintDec(rowBytes)
+  PutS(" h=")
+  PrintDec(rows)
+  PutS(" dp=")
+  PrintDec(dpitch)
+  PutS(" sp=")
+  PrintDec(spitch)
+  PutS(" off=")
+  PrintDec(off)
+EndProcedure
+
+
+; ======================================================================
+;  THE ORACLE - a plain CPU byte loop, sharing nothing with dma.pi4
+; ======================================================================
+
+; Every byte of a buffer set to one value. PokeB, one byte at a time,
+; because the oracle must not depend on any width assumption that the
+; thing under test also makes.
+Procedure DgSet(addr.i, bytes.i, v.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeB(addr + i, v & $FF)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgFillRef - the fill, as the CPU would do it.
+;
+; Byte j of a row gets byte (j mod 4) of the pattern word, and that is
+; the specification the engine is being held to. It is worth saying why
+; it is right even though the engine reads the pattern 128 bits at a
+; time from a source address that never moves: every one of those reads
+; starts at the pattern base, 16 is a multiple of 4, and the pattern is
+; one 32-bit word repeated - so whatever chunk size the engine chooses,
+; the byte it delivers at row offset j is pattern byte (j mod 4). The
+; oracle is therefore independent of the engine's chunking, which is
+; exactly what an oracle has to be.
+; ----------------------------------------------------------------------
+Procedure DgFillRef(dst.i, pitch.i, rowBytes.i, rows.i, pattern.i)
+  Define r.i
+  Define j.i
+  Define b.i
+  r = 0
+  While r < rows
+    j = 0
+    While j < rowBytes
+      b = (pattern >> ((j & 3) * 8)) & $FF
+      PokeB((dst + (r * pitch)) + j, b)
+      j = j + 1
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+; The copy, as the CPU would do it. Forward, byte at a time, which is
+; also the order dma.pi4 claims the engine uses - so for the
+; overlapping case in group D this oracle is asserting the SAME
+; ordering, and the two agreeing is the evidence.
+Procedure DgCopyRef(dst.i, dpitch.i, src.i, spitch.i, rowBytes.i, rows.i)
+  Define r.i
+  Define j.i
+  r = 0
+  While r < rows
+    j = 0
+    While j < rowBytes
+      PokeB((dst + (r * dpitch)) + j, PeekB((src + (r * spitch)) + j) & $FF)
+      j = j + 1
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+; First differing byte offset, or -1 if the two buffers are identical.
+; The OFFSET is the diagnosis - it says whether the damage was inside
+; the rectangle, in the gap after a row, or past the end of the last
+; row, and those are three different bugs.
+Procedure.i DgDiff(a.i, b.i, bytes.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    If (PeekB(a + i) & $FF) <> (PeekB(b + i) & $FF)
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgReport - one case, reported the same way whatever failed.
+;
+; A failing line carries the geometry, the byte offset, and both bytes,
+; because those four facts together are usually the whole diagnosis and
+; a bench operator should not have to instrument anything to get them.
+; ----------------------------------------------------------------------
+Procedure DgReport(*group, rowBytes.i, rows.i, dpitch.i, spitch.i, off.i, diff.i)
+  dgChecks = dgChecks + 1
+  If diff < 0
+    ProcedureReturn
+  EndIf
+  dgFails = dgFails + 1
+  PutS("  FAIL  ")
+  PutS(*group)
+  PutS("  ")
+  PutGeom(rowBytes, rows, dpitch, spitch, off)
+  PutS("   first bad byte at +")
+  PrintDec(diff)
+  PutS(" ($")
+  PutHexN(diff, 4)
+  PutS("):  cpu $")
+  PutHexN(PeekB(#DG_REF + diff) & $FF, 2)
+  PutS("  dma $")
+  PutHexN(PeekB(#DG_OUT + diff) & $FF, 2)
+
+  ; Say WHERE it is relative to the rectangle, because that is the part
+  ; a human would otherwise work out on paper every single time.
+  If diff >= (((rows - 1) * dpitch) + rowBytes + off)
+    PutS("   PAST THE END of the last row")
+  Else
+    If (((diff - off) % dpitch) >= rowBytes)
+      PutS("   in the GAP after a row - the stride is wrong")
+    Else
+      PutS("   INSIDE the rectangle")
+    EndIf
+  EndIf
+  PutNl()
+EndProcedure
+
+; A refusal that must happen. Same tally, different shape.
+Procedure DgMustRefuse(*name, got.i, wantErr.i)
+  dgChecks = dgChecks + 1
+  If got <> 0
+    dgFails = dgFails + 1
+    PutS("  FAIL  ")
+    PutS(*name)
+    PutS("   the transfer was ACCEPTED and it must not be")
+    PutNl()
+    ProcedureReturn
+  EndIf
+  If DmaError() <> wantErr
+    dgFails = dgFails + 1
+    PutS("  FAIL  ")
+    PutS(*name)
+    PutS("   refused, but for the wrong reason: ")
+    PutS(DmaErrorText())
+    PutNl()
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  ONE CASE
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DgCaseFill - one fill geometry, both ways, whole-buffer comparison.
+;
+; THE TWO BUFFERS ARE PRE-SET TO THE SAME NON-ZERO BYTE, not to zero.
+; Zero is the value a failed transfer leaves behind and the value fresh
+; memory tends to hold, so a test that filled zeros into zeros could
+; pass while doing nothing at all. $3C is arbitrary and is neither the
+; pattern nor a byte of it.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+; DgAnnounce - name a case BEFORE attempting it, and get the bytes out.
+;
+; THE UartDrain() IS THE ENTIRE POINT and it is not tidiness. Without
+; it the line sits in the PL011's transmit FIFO while the DMA engine
+; starts, and if the engine locks the bus the CPU never runs the code
+; that would have pushed it out - so the marker that was supposed to
+; name the rung dies in the FIFO with everything else. Drain first,
+; then touch the hardware.
+; ----------------------------------------------------------------------
+Procedure DgAnnounce(*what, rowBytes.i, rows.i, dpitch.i, spitch.i, off.i)
+  UartWriteStr("  .. ")
+  UartWriteStr(*what)
+  UartWriteStr("  ")
+  PutGeom(rowBytes, rows, dpitch, spitch, off)
+  PutNl()
+  UartDrain()
+EndProcedure
+
+Procedure DgCaseFill(rowBytes.i, rows.i, pitch.i, off.i, pattern.i)
+  Define rc.i
+
+  If #DG_TRACE = 1
+    DgAnnounce("fill", rowBytes, rows, pitch, 0, off)
+  EndIf
+
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+
+  DgFillRef(#DG_REF + off, pitch, rowBytes, rows, pattern)
+
+  rc = DmaFillPattern32(#DG_OUT + off, pitch, rowBytes, rows, pattern)
+  If rc = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  A/B fill  ")
+    PutGeom(rowBytes, rows, pitch, 0, off)
+    PutS("   REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  DgReport("fill", rowBytes, rows, pitch, 0, off, DgDiff(#DG_REF, #DG_OUT, #DG_BYTES))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgCaseCopy - one copy geometry, both ways, whole-buffer comparison.
+;
+; The source is filled with a counter rather than a constant, so a copy
+; that read the same row repeatedly, or that walked the source with the
+; destination's stride, produces a different answer instead of the same
+; one. A constant source would pass both of those bugs.
+; ----------------------------------------------------------------------
+Procedure DgCaseCopy(rowBytes.i, rows.i, dpitch.i, spitch.i, off.i)
+  Define rc.i
+  Define i.i
+
+  If #DG_TRACE = 1
+    DgAnnounce("copy", rowBytes, rows, dpitch, spitch, off)
+  EndIf
+
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  i = 0
+  While i < #DG_BYTES
+    PokeB(#DG_SRC + i, (i + (i / 251)) & $FF)
+    i = i + 1
+  Wend
+  DmaCacheRange(#DG_SRC, #DG_BYTES)
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+
+  DgCopyRef(#DG_REF + off, dpitch, #DG_SRC, spitch, rowBytes, rows)
+
+  rc = DmaCopy2D(#DG_OUT + off, dpitch, #DG_SRC, spitch, rowBytes, rows)
+  If rc = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  A/B copy  ")
+    PutGeom(rowBytes, rows, dpitch, spitch, off)
+    PutS("   REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  DgReport("copy", rowBytes, rows, dpitch, spitch, off, DgDiff(#DG_REF, #DG_OUT, #DG_BYTES))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgCaseScroll - an OVERLAPPING downward copy, both ways.
+;
+; This is the one case in the gate that tests an assumption rather than
+; a documented fact, and it is the reason dma.pi4 allows overlap at all
+; instead of forcing every scroll through a temporary buffer and a
+; second pass over the bytes.
+;
+; Both buffers are seeded identically first, so the CPU reference and
+; the engine are shifting the SAME starting contents. The reference
+; copies forward, byte at a time, which is the order the engine is
+; claimed to use; the two agreeing is the evidence for the claim.
+; ----------------------------------------------------------------------
+Procedure DgCaseScroll(rowBytes.i, rows.i, pitch.i, shift.i)
+  Define rc.i
+  Define i.i
+  Define n.i
+
+  If #DG_TRACE = 1
+    DgAnnounce("scroll", rowBytes, rows, pitch, pitch, shift)
+  EndIf
+
+  n = ((rows + shift) * pitch)
+
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  i = 0
+  While i < n
+    PokeB(#DG_REF + i, (i * 7) & $FF)
+    PokeB(#DG_OUT + i, (i * 7) & $FF)
+    i = i + 1
+  Wend
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+
+  DgCopyRef(#DG_REF, pitch, #DG_REF + (shift * pitch), pitch, rowBytes, rows)
+
+  rc = DmaCopy2D(#DG_OUT, pitch, #DG_OUT + (shift * pitch), pitch, rowBytes, rows)
+  If rc = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  A/B scroll  ")
+    PutGeom(rowBytes, rows, pitch, pitch, shift)
+    PutS("   REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  DgReport("scroll", rowBytes, rows, pitch, pitch, shift, DgDiff(#DG_REF, #DG_OUT, #DG_BYTES))
+EndProcedure
+
+
+; ======================================================================
+;  THE SWEEPS
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; GROUP A - fill, aligned. The ordinary case, and every one must pass.
+;
+; The geometries are chosen to cross the boundaries the hardware cares
+; about rather than to be numerous: 4 bytes is one 32-bit write and
+; smaller than the engine's 128-bit width, 16 is exactly that width, 20
+; crosses it awkwardly, 64 is a cache line, 68 crosses one, 252 and 256
+; straddle the point where a burst can and cannot complete. One row
+; tests the degenerate case where the stride is never applied at all,
+; and seventeen rows tests it sixteen times.
+; ----------------------------------------------------------------------
+Procedure DgGroupA()
+  PutS("-- group A: fill, four-byte-aligned rows and destinations")
+  PutNl()
+
+  DgCaseFill(4,    1,   4,   0, $11223344)
+  DgCaseFill(4,    1,  64,   0, $11223344)
+  DgCaseFill(4,    8,  64,   0, $11223344)
+  DgCaseFill(16,   1,  16,   0, $A5A5A5A5)
+  DgCaseFill(16,   4,  16,   0, $A5A5A5A5)
+  DgCaseFill(16,   4,  64,   0, $A5A5A5A5)
+  DgCaseFill(20,   3,  64,   0, $DEADBEEF)
+  DgCaseFill(64,   1,  64,   0, $00FF00FF)
+  DgCaseFill(64,  17,  64,   0, $00FF00FF)
+  DgCaseFill(64,  17, 256,   0, $00FF00FF)
+  DgCaseFill(68,   5, 256,   0, $12345678)
+  DgCaseFill(252,  9, 256,   0, $FFFFFFFF)
+  DgCaseFill(256,  9, 256,   0, $01020304)
+  DgCaseFill(256, 17, 512,   0, $01020304)
+  DgCaseFill(1024, 8, 2048,  0, $CAFEF00D)
+
+  ; The destination moved off the start of the buffer, so an engine that
+  ; ignored the address entirely - or masked it - shows up.
+  DgCaseFill(64,   4,  64, 128, $77777777)
+  DgCaseFill(64,   4, 256, 128, $77777777)
+  DgCaseFill(16,   4,  64,  32, $77777777)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; GROUP B - fill, awkward. Rows and destinations that are not
+; four-byte aligned.
+;
+; The PDF says the engine "can deal with byte aligned transfers and
+; will minimise bus traffic by buffering and packing misaligned
+; accesses" (bcm2711-peripherals.txt:2286). These cases hold it to
+; that. THEY ARE IN THEIR OWN GROUP because a failure here is a
+; different finding from a failure in group A: it would mean "align
+; your rectangles", which is a constraint dma.pi4 would then have to
+; document and enforce, not evidence that anything is broken.
+; ----------------------------------------------------------------------
+Procedure DgGroupB()
+  PutS("-- group B: fill, rows and destinations that are NOT four-byte aligned")
+  PutNl()
+
+  DgCaseFill(1,   1,  64,   0, $11223344)
+  DgCaseFill(3,   1,  64,   0, $11223344)
+  DgCaseFill(5,   4,  64,   0, $11223344)
+  DgCaseFill(17,  4,  64,   0, $A5A5A5A5)
+  DgCaseFill(63,  4,  64,   0, $A5A5A5A5)
+  DgCaseFill(63,  4, 128,   0, $A5A5A5A5)
+  DgCaseFill(64,  4,  67,   0, $DEADBEEF)   ; an odd PITCH, not an odd row
+  DgCaseFill(16,  4,  64,   1, $12345678)
+  DgCaseFill(16,  4,  64,   2, $12345678)
+  DgCaseFill(16,  4,  64,   3, $12345678)
+  DgCaseFill(17,  4,  67,   3, $12345678)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; GROUP C - copy. The same shapes with a real source.
+;
+; Half of these give the source a DIFFERENT pitch from the destination,
+; which is the case that matters most: one 32-bit STRIDE register
+; carries both, D_STRIDE in 31:16 and S_STRIDE in 15:0
+; (bcm2711-peripherals.txt:3491-3515), and a packing error there
+; produces a picture that looks almost right.
+; ----------------------------------------------------------------------
+Procedure DgGroupC()
+  PutS("-- group C: copy, including source and destination pitches that differ")
+  PutNl()
+
+  DgCaseCopy(4,    1,   4,    4,   0)
+  DgCaseCopy(16,   4,  16,   16,   0)
+  DgCaseCopy(16,   4,  64,   16,   0)
+  DgCaseCopy(16,   4,  16,   64,   0)
+  DgCaseCopy(64,   8,  64,   64,   0)
+  DgCaseCopy(64,   8, 256,   64,   0)
+  DgCaseCopy(64,   8,  64,  256,   0)
+  DgCaseCopy(68,   5, 256,  128,   0)
+  DgCaseCopy(252,  9, 256,  512,   0)
+  DgCaseCopy(256, 17, 512,  256,   0)
+  DgCaseCopy(1024, 8, 2048, 1024,  0)
+  DgCaseCopy(64,   4,  64,   64, 128)
+  DgCaseCopy(17,   4,  67,   64,   3)
+  DgCaseCopy(5,    4,  64,   64,   1)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; GROUP D - the overlapping downward copy. The one assumption.
+; ----------------------------------------------------------------------
+Procedure DgGroupD()
+  PutS("-- group D: OVERLAPPING downward copy - the scroll, and the one assumption")
+  PutNl()
+
+  DgCaseScroll(64,  16,  64, 1)     ; contiguous, shift one row
+  DgCaseScroll(64,  16,  64, 4)     ; shift four rows
+  DgCaseScroll(64,  16, 128, 1)     ; with a gap between rows
+  DgCaseScroll(1024, 8, 1024, 1)    ; rows longer than any burst
+  DgCaseScroll(17,   9,  67, 2)     ; awkward everything
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; GROUP E - the refusals.
+;
+; Nothing here touches the hardware. Every one of these is a rectangle
+; that MUST be turned away before a register is written, and the reason
+; given must be the right reason - a check that refuses for the wrong
+; cause is a check that will wave through the case it was written for.
+; ----------------------------------------------------------------------
+Procedure DgGroupE()
+  PutS("-- group E: the refusals that keep a bus master inside its window")
+  PutNl()
+
+  ; Outside the declared window, both ends.
+  DgMustRefuse("a fill one byte below OUT", DmaFillPattern32(#DG_OUT - 1, 64, 64, 1, 0), #DMA_ERR_BOUNDS)
+  DgMustRefuse("a fill whose last row runs past OUT", DmaFillPattern32((#DG_OUT + #DG_BYTES) - 64, 64, 64, 2, 0), #DMA_ERR_BOUNDS)
+  DgMustRefuse("a fill aimed at REF, which is not the window", DmaFillPattern32(#DG_REF, 64, 64, 1, 0), #DMA_ERR_BOUNDS)
+  DgMustRefuse("a copy aimed at SRC, which is not the window", DmaCopy2D(#DG_SRC, 64, #DG_REF, 64, 64, 1), #DMA_ERR_BOUNDS)
+
+  ; Beyond what the register fields can express. Each of these would be
+  ; TRUNCATED rather than refused if the check were missing, and a
+  ; truncated XLENGTH is a fill of the wrong width that reads as a
+  ; diagonal shear.
+  DgMustRefuse("a row longer than XLENGTH can hold", DmaFillPattern32(#DG_OUT, 70000, 70000, 1, 0), #DMA_ERR_ARGS)
+  DgMustRefuse("more rows than YLENGTH can hold", DmaFillPattern32(#DG_OUT, 4, 4, 20000, 0), #DMA_ERR_ARGS)
+  DgMustRefuse("a gap wider than the signed stride field", DmaFillPattern32(#DG_OUT, 40000, 4, 2, 0), #DMA_ERR_STRIDE)
+  DgMustRefuse("a pitch narrower than the row", DmaFillPattern32(#DG_OUT, 32, 64, 2, 0), #DMA_ERR_ARGS)
+  DgMustRefuse("a zero-height rectangle", DmaFillPattern32(#DG_OUT, 64, 64, 0, 0), #DMA_ERR_ARGS)
+  DgMustRefuse("a zero-width rectangle", DmaFillPattern32(#DG_OUT, 64, 0, 4, 0), #DMA_ERR_ARGS)
+
+  ; Beyond the 1 GiB the engines can reach. This is the silent one.
+  DgMustRefuse("a source above the 1 GiB cap", DmaCopy2D(#DG_OUT, 64, $80000000, 64, 64, 1), #DMA_ERR_REACH)
+
+  ; The overlap the library will not do.
+  DgMustRefuse("an overlapping UPWARD copy", DmaCopy2D(#DG_OUT + 64, 64, #DG_OUT, 64, 64, 8), #DMA_ERR_OVERLAP)
+
+  ; THE BURST CAP, and this is the guard whose failure mode is a board
+  ; that stops answering rather than a bad rectangle. Added 2026-08-26
+  ; after group F locked the AXI bus. No transfer is attempted here -
+  ; these are setter calls and nothing else - so this costs nothing and
+  ; risks nothing.
+  DgMustRefuse("DmaSetBurst refuses 15", DmaSetBurst(15), #DMA_ERR_BURST)
+  DgMustRefuse("DmaSetBurst refuses one above the cap", DmaSetBurst(#DMA_BURST_MAX_SAFE + 1), #DMA_ERR_BURST)
+  dgChecks = dgChecks + 1
+  If DmaSetBurst(#DMA_BURST_MAX_SAFE) <> 1
+    dgFails = dgFails + 1
+    PutS("  FAIL  DmaSetBurst accepts the cap itself   it refused: ")
+    PutS(DmaErrorText())
+    PutNl()
+  EndIf
+  dgChecks = dgChecks + 1
+  If DmaBurst() <> #DMA_BURST_MAX_SAFE
+    dgFails = dgFails + 1
+    PutS("  FAIL  a refused DmaSetBurst changed the burst anyway")
+    PutNl()
+  EndIf
+  ; DmaSetBurstProbe()'s ACCEPTANCE above the cap is not tested here.
+  ; Group F is the proof of it, and proving it here would leave the
+  ; burst set above the cap in a group that is supposed to be inert.
+
+  PutNl()
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+; GROUP A2 - THE BRACKET. Added 2026-08-26, after the bench.
+;
+; The first run failed exactly one case, `w=1024 h=8 dp=2048`, and every
+; other group A fill passed. The widest of those was w=256. So the
+; boundary was somewhere in 256 < w <= 1024 and nothing in the suite
+; said where. This group says where.
+;
+; ---- WHAT IT SEPARATES, AND THIS IS THE POINT OF THE LAYOUT ----------
+; The failing case had TWO quantities that were unusually large and no
+; other case had either: a 1024-byte ROW and a 1024-byte STRIDE. One
+; test cannot tell them apart, so this group runs each ladder with the
+; other quantity pinned:
+;
+;   THE ROW LADDER runs at PITCH = ROWBYTES, so the destination stride
+;   is ZERO on every rung. If the row ladder fails at some width, the
+;   stride is not involved, because there isn't one.
+;
+;   THE STRIDE LADDER holds the row at a width the first run already
+;   proved good - 64 bytes - and walks the stride up past 1024 to 4096.
+;   If the stride ladder is clean, D_STRIDE is exonerated outright.
+;
+;   THE CORNER re-runs the original failing geometry, so the fix is
+;   asserted against the exact case that found the bug rather than
+;   against a case that resembles it.
+;
+; ---- WHAT THE DIAGNOSIS PREDICTS -------------------------------------
+; The cause was found to be the fill's SOURCE, not its length and not
+; its stride: the pattern was 32 bytes, a read burst is up to 256, and
+; the engine read past the end of the pattern into memory nothing had
+; written. The decisive evidence was that the bad byte was $00 and this
+; gate seeds with $3C, so the engine WROTE there - a truncated length
+; would have left $3C behind and a bad stride would have put good data
+; somewhere else.
+;
+; SO THE PREDICTION IS: with the pattern at 256 bytes, EVERY RUNG OF
+; BOTH LADDERS PASSES, including w=2048 and w=4096 which are wider than
+; anything the original suite tried.
+;
+; IF A ROW RUNG STILL FAILS, the diagnosis was wrong or incomplete and
+; the boundary is real. Report the largest width that passed: that
+; number goes into #DMA_FILL_MAX_ROW_BYTES in dma.pi4, which already
+; refuses anything above it with #DMA_ERR_ROWLIMIT. A silently short
+; fill on a framebuffer is a partially drawn frame that reads as a
+; rendering bug three layers up, so it must be a named refusal and not
+; a comment.
+;
+; IF A STRIDE RUNG FAILS INSTEAD, the fault is in the STRIDE word this
+; file packs - D_STRIDE in 31:16, S_STRIDE in 15:0
+; (bcm2711-peripherals.txt:3491-3515) - and dma.pi4's DmaGeomOk() needs
+; a tighter cap than the field's own 32767.
+; ----------------------------------------------------------------------
+Procedure DgGroupA2()
+  PutS("-- group A2: the bracket. Row length and stride walked separately.")
+  PutNl()
+
+  ; The row ladder. Pitch equals the row, so the stride is zero
+  ; throughout and only the row length is changing.
+  DgCaseFill(256,   4,  256,  0, $CAFEF00D)
+  DgCaseFill(320,   4,  320,  0, $CAFEF00D)
+  DgCaseFill(384,   4,  384,  0, $CAFEF00D)
+  DgCaseFill(512,   4,  512,  0, $CAFEF00D)
+  DgCaseFill(640,   4,  640,  0, $CAFEF00D)
+  DgCaseFill(768,   4,  768,  0, $CAFEF00D)
+  DgCaseFill(896,   4,  896,  0, $CAFEF00D)
+  DgCaseFill(1024,  4, 1024,  0, $CAFEF00D)
+  DgCaseFill(2048,  4, 2048,  0, $CAFEF00D)
+  DgCaseFill(4096,  4, 4096,  0, $CAFEF00D)
+
+  ; The stride ladder. The row stays at 64, which the first run proved
+  ; good, and the gap between rows walks past the value the failing
+  ; case had.
+  DgCaseFill(64,    8,   64,  0, $CAFEF00D)
+  DgCaseFill(64,    8,  128,  0, $CAFEF00D)
+  DgCaseFill(64,    8,  320,  0, $CAFEF00D)
+  DgCaseFill(64,    8, 1088,  0, $CAFEF00D)   ; stride 1024, the suspect
+  DgCaseFill(64,    8, 2048,  0, $CAFEF00D)   ; stride 1984
+  DgCaseFill(64,    8, 4096,  0, $CAFEF00D)   ; stride 4032
+
+  ; Both large at once, which is the original failing geometry, and
+  ; then the same shape at an offset so the fix is not accidentally
+  ; depending on the destination starting at the buffer base.
+  DgCaseFill(1024,  8, 2048,  0, $CAFEF00D)   ; THE CASE THAT FAILED
+  DgCaseFill(1024,  8, 2048, 256, $CAFEF00D)
+  DgCaseFill(1024,  6, 2048, 128, $A5A5A5A5)
+  PutNl()
+EndProcedure
+
+
+; ======================================================================
+; GROUP G - CACHE COHERENCY, AND THE ONLY GROUP WITH NEGATIVE CONTROLS
+; ======================================================================
+; Added 2026-08-27, when display.pi4 gained a DMA path and the question
+; stopped being academic.
+;
+; ----------------------------------------------------------------------
+; WHY THE OTHER SIX GROUPS CANNOT ANSWER THIS QUESTION
+; ----------------------------------------------------------------------
+; Look at DgCaseFill above. It calls DmaCacheRange over the WHOLE 64 KiB
+; before the transfer and again after it. That is correct, generous, and
+; it makes the cache discipline UNFALSIFIABLE: those two calls alone
+; satisfy every requirement the transfer has, so the case would pass
+; with every cache operation inside dma.pi4 deleted, and it would pass
+; with every cache operation inside display.pi4 deleted too.
+;
+; A test whose own hygiene supplies the property under test is not
+; testing that property. Groups A to E prove GEOMETRY - strides,
+; YLENGTH, packing, bounds, refusals - and they prove it well. They
+; prove nothing at all about coherency and this group exists to say so
+; out loud rather than let a green run imply otherwise.
+;
+; ----------------------------------------------------------------------
+; AND NEITHER CAN ANY EMULATOR, EVER
+; ----------------------------------------------------------------------
+; tools/a64/a64_interp.py runs the real compiled image against one flat
+; byte array. No data cache, no dirty line, no eviction, no speculative
+; refill, no second bus master. In that model the CPU's stores and the
+; engine's stores land in the same array in program order, so none of
+; the hazards below can be represented, let alone caught. Every case in
+; this group would pass there with the maintenance removed.
+;
+; That is the same defect that let tools/a64/a64_sdio_check.py certify a
+; payload which faults on silicon, because its memory was a dictionary
+; that did not care about alignment. A model more forgiving than the
+; part certifies bugs. COHERENCY IS PROVED ON SILICON OR IT IS NOT
+; PROVED, and this group only means anything with #DG_MMU = 1.
+;
+; ----------------------------------------------------------------------
+; THE THREE HAZARDS, AND WHAT EACH CASE DOES ABOUT IT
+; ----------------------------------------------------------------------
+;   HAZARD A - the engine READS what the CPU left in a dirty line, so it
+;              copies whatever DRAM last saw. G4 omits the source clean
+;              and must come out WRONG; G5 supplies it and must come out
+;              right.
+;
+;   HAZARD B - the CPU READS a stale but clean line over pixels the
+;              engine wrote. G3 omits the post-transfer invalidate, with
+;              the lines deliberately primed resident first, and must
+;              come out WRONG.
+;
+;   HAZARD C - a DIRTY line the CPU left over the DESTINATION is evicted
+;              AFTER the engine's write and puts the old pixels back.
+;              This is the worst of the three: it succeeds, then
+;              corrupts, and it does it at a time of the cache's
+;              choosing. G2 omits the pre-transfer clean and then FORCES
+;              the eviction with DgEvict(), and must come out WRONG.
+;              G1 supplies the clean and must come out right.
+;
+; ----------------------------------------------------------------------
+; WHY THE NEGATIVE CONTROLS ARE THE IMPORTANT HALF
+; ----------------------------------------------------------------------
+; A coherency test that only ever asserts "with the maintenance, it
+; worked" cannot distinguish a correct discipline from a machine where
+; the caches happened not to matter that afternoon - a run with the MMU
+; off, a run where the working set stayed resident, a run where the
+; compiler hoisted the read. Every one of those makes the positive cases
+; green and the library unproven.
+;
+; So each hazard is asserted in BOTH directions and the negative comes
+; first in the reading order. If a negative control passes, its positive
+; twin is downgraded to INCONCLUSIVE in the summary, because it is.
+;
+; ----------------------------------------------------------------------
+; THE GEOMETRY IS SMALL ON PURPOSE
+; ----------------------------------------------------------------------
+; 64 bytes by 16 rows at a pitch of 64 - one contiguous kilobyte. G3
+; needs its primed lines to still be resident when it reads them back,
+; and a kilobyte fits in the 32 KiB L1 with room to spare. A large
+; rectangle would evict itself during the priming loop and G3 would pass
+; for the wrong reason, which is exactly the failure this group is built
+; to refuse to make.
+; ======================================================================
+
+#DG_G_ROWBYTES = 64
+#DG_G_ROWS     = 16
+#DG_G_PITCH    = 64
+#DG_G_BYTES    = 1024          ; = ROWBYTES * ROWS, the contiguous span
+
+; The two patterns. They must differ in EVERY byte, so that a stale
+; readback of any byte at all is a mismatch rather than a coincidence.
+;   $CAFEF00D is what the engine is asked to write.
+;   $13572468 is what the CPU leaves behind in the dirty lines.
+#DG_G_ENGINE = $CAFEF00D
+#DG_G_STALE  = $13572468
+
+; ----------------------------------------------------------------------
+; DgEvict - push everything out of the caches, on demand.
+;
+; Read one word out of every 64-byte line across two megabytes. A load
+; allocates the whole containing line, so by the end the L1 and the L2
+; hold nothing but this region and every dirty line that was over the
+; gate's buffers has been WRITTEN BACK TO DRAM on its way out.
+;
+; THE WRITE-BACK IS THE POINT, not the eviction. Hazard C is not "the
+; line went away", it is "the line went away and took its old contents
+; with it, over the top of the engine's work". This procedure is the
+; only thing in the gate that can make that happen at a known moment.
+;
+; THE RESULT IS ACCUMULATED AND RETURNED, and that is not decoration.
+; A loop whose loads feed nothing is a loop a compiler may remove. This
+; backend does not do that today - it has no such pass - but a read loop
+; that cannot be elided is cheap insurance against the day it does, and
+; the day it does would silently turn every case below green.
+;
+; PeekN, the unsigned 32-bit read: the value is never interpreted, only
+; summed, but a widening read would touch two lines per step and halve
+; the region actually walked.
+; ----------------------------------------------------------------------
+Procedure.i DgEvict()
+  Define i.i
+  Define acc.i
+  acc = 0
+  i = 0
+  While i < #DG_THRASH_BYTES
+    acc = acc + (PeekN(#DG_THRASH + i) & $FF)
+    i = i + 64
+  Wend
+  ProcedureReturn acc
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgPrime - read a region so its lines are resident and CLEAN.
+;
+; For hazard B. A clean line is not a line the CPU is entitled to
+; ignore: the engine will write DRAM underneath it and the CPU will keep
+; serving the old value out of the cache until somebody invalidates.
+; This is how the gate guarantees the line is there to be stale, instead
+; of hoping a prefetcher put one there.
+; ----------------------------------------------------------------------
+Procedure.i DgPrime(addr.i, bytes.i)
+  Define i.i
+  Define acc.i
+  acc = 0
+  i = 0
+  While i < bytes
+    acc = acc + (PeekN(addr + i) & $FF)
+    i = i + 64
+  Wend
+  ProcedureReturn acc
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgExpectSame / DgExpectDiff - the two verdicts this group can reach.
+;
+; DgExpectSame is an ordinary check: a mismatch is a FAIL.
+;
+; DgExpectDiff is the negative control and it is NOT an ordinary check
+; inverted. A match there is not a defect in dma.pi4 - it means the
+; hazard did not reproduce, so this run has learned nothing about the
+; discipline in either direction. It is counted as INCONCLUSIVE and it
+; says, in the line it prints, exactly which positive case it has just
+; invalidated. Reporting it as a pass would be the single most
+; misleading thing this file could do.
+; ----------------------------------------------------------------------
+Procedure DgExpectSame(*name, diff.i)
+  dgChecks = dgChecks + 1
+  If diff < 0
+    ProcedureReturn
+  EndIf
+  dgFails = dgFails + 1
+  PutS("  FAIL  ")
+  PutS(*name)
+  PutS("   first bad byte at +")
+  PrintDec(diff)
+  PutS(":  want $")
+  PutHexN(PeekB(#DG_REF + diff) & $FF, 2)
+  PutS("  got $")
+  PutHexN(PeekB(#DG_OUT + diff) & $FF, 2)
+  PutNl()
+EndProcedure
+
+Procedure DgExpectDiff(*name, diff.i)
+  dgChecks = dgChecks + 1
+  If diff >= 0
+    ProcedureReturn
+  EndIf
+  dgIncon = dgIncon + 1
+  PutS("  INCONCLUSIVE  ")
+  PutS(*name)
+  PutNl()
+  PutS("      the omitted cache operation made NO difference on this run, so the")
+  PutNl()
+  PutS("      hazard did not reproduce and the matching positive case proves")
+  PutNl()
+  PutS("      nothing. Check #DG_MMU is 1 and that MmuEnabled() said so above.")
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DgGroupG - the six cases.
+;
+; EVERY CASE BUILDS ITS OWN REFERENCE WITH THE CPU BYTE LOOP, exactly as
+; the rest of the gate does, so the oracle is still fifteen lines of
+; PokeB that share nothing with dma.pi4.
+;
+; THE COMPARISON IS OVER THE WHOLE 64 KiB, as everywhere else here. A
+; cache line is 64 bytes and a rectangle edge is not on one, so a
+; maintenance bug that over-reaches damages the bytes NEXT to the
+; rectangle - which is precisely what a rectangle-only comparison cannot
+; see. That is the same argument the file's header makes for the
+; geometry groups and it is stronger here, not weaker.
+; ----------------------------------------------------------------------
+Procedure DgGroupG()
+  Define acc.i
+  Define d.i
+
+  PutS("-- group G: CACHE COHERENCY. Three hazards, each asserted BOTH ways.")
+  PutNl()
+
+  If #DG_MMU = 0
+    PutS("   SKIPPED - #DG_MMU is 0, so DRAM is uncached, every cache operation")
+    PutNl()
+    PutS("   in this program is architecturally a no-op, and there is no hazard")
+    PutNl()
+    PutS("   to provoke. This group is only meaningful with the caches ON.")
+    PutNl()
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  acc = 0
+
+  ; ==================================================================
+  ; G1 - HAZARD C, THE DISCIPLINE APPLIED. Must come out RIGHT.
+  ;
+  ; The CPU dirties the destination, the discipline cleans and
+  ; invalidates it, the engine fills it, the post-pass invalidates it,
+  ; and only THEN is an eviction forced. There is nothing dirty left to
+  ; evict, so the engine's pixels survive.
+  ;
+  ; THE MAINTENANCE HERE IS DmaCacheRect OVER THE RECTANGLE ONLY, not
+  ; DmaCacheRange over the whole buffer. That is deliberate and it puts
+  ; the new procedure on the critical path of a case that fails if it
+  ; under-maintains by so much as one line - which is the only way a
+  ; cache-maintenance routine can be tested at all.
+  ; ==================================================================
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DgFillRef(#DG_REF, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE)
+  ; The CPU leaves dirty lines holding a DIFFERENT pattern over the
+  ; destination. This is the thing that must not come back.
+  DgFillRef(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_STALE)
+
+  DmaCacheRect(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS)
+  If DmaFillPattern32(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE) = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  G1  the fill was REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+  Else
+    DmaCacheRect(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS)
+    acc = acc + DgEvict()
+    DmaCacheRange(#DG_OUT, #DG_BYTES)
+    d = DgDiff(#DG_REF, #DG_OUT, #DG_BYTES)
+    DgExpectSame("G1  hazard C, clean before + invalidate after, then evicted", d)
+  EndIf
+
+  ; ==================================================================
+  ; G2 - HAZARD C, THE NEGATIVE CONTROL. Must come out WRONG.
+  ;
+  ; Identical to G1 with the PRE-transfer clean removed. The CPU's dirty
+  ; lines are still sitting over the destination when the engine writes
+  ; DRAM; DgEvict() then writes them back on top and the picture reverts
+  ; to what the CPU had put there.
+  ;
+  ; IF THIS PASSES - that is, if the two buffers still agree - the run
+  ; could not provoke the hazard and G1 proved nothing.
+  ; ==================================================================
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DgFillRef(#DG_REF, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE)
+  DgFillRef(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_STALE)
+
+  ; NO DmaCacheRect HERE. That omission is the whole case.
+  If DmaFillPattern32(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE) = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  G2  the fill was REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+  Else
+    acc = acc + DgEvict()
+    ; Invalidate before comparing, so the comparison reads DRAM - which
+    ; is where the damage is - rather than a cache that may still be
+    ; telling the CPU its own story.
+    DmaCacheRange(#DG_OUT, #DG_BYTES)
+    d = DgDiff(#DG_REF, #DG_OUT, #DG_BYTES)
+    DgExpectDiff("G2  hazard C, NO clean before the transfer, then evicted", d)
+  EndIf
+
+  ; ==================================================================
+  ; G3 - HAZARD B, THE NEGATIVE CONTROL. Must come out WRONG.
+  ;
+  ; The destination is made clean and consistent with DRAM, then READ so
+  ; that clean lines are resident. The engine writes DRAM underneath
+  ; them. With no invalidate the CPU keeps serving the old value out of
+  ; the cache, so the comparison sees the pre-fill contents.
+  ;
+  ; NO DgEvict() IN THIS ONE, and that is the difference from G2: the
+  ; whole point is that the lines are STILL THERE. Evicting would fix
+  ; the very thing being demonstrated.
+  ; ==================================================================
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DgFillRef(#DG_REF, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE)
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  acc = acc + DgPrime(#DG_OUT, #DG_G_BYTES)
+
+  If DmaFillPattern32(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE) = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  G3  the fill was REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+  Else
+    ; NO invalidate. The compare below is the CPU reading its own stale
+    ; lines, which is the hazard.
+    d = DgDiff(#DG_REF, #DG_OUT, #DG_BYTES)
+    DgExpectDiff("G3  hazard B, primed clean lines and NO invalidate after", d)
+  EndIf
+
+  ; ==================================================================
+  ; G4 - HAZARD B, THE DISCIPLINE APPLIED. Must come out RIGHT.
+  ;
+  ; The same as G3 with the post-transfer invalidate put back. One line
+  ; of difference, and the whole hazard.
+  ; ==================================================================
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DgFillRef(#DG_REF, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE)
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  acc = acc + DgPrime(#DG_OUT, #DG_G_BYTES)
+
+  If DmaFillPattern32(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_ENGINE) = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  G4  the fill was REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+  Else
+    DmaCacheRect(#DG_OUT, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS)
+    d = DgDiff(#DG_REF, #DG_OUT, #DG_BYTES)
+    DgExpectSame("G4  hazard B, primed clean lines and the invalidate applied", d)
+  EndIf
+
+  ; ==================================================================
+  ; G5 - HAZARD A, THE NEGATIVE CONTROL. Must come out WRONG.
+  ;
+  ; The CPU writes a source rectangle and does NOT clean it. The engine
+  ; reads DRAM, which still holds what was there before, and copies
+  ; that. The destination therefore ends up holding the OLD source, not
+  ; the new one.
+  ;
+  ; THE DESTINATION SIDE IS FULLY MAINTAINED so that the only variable
+  ; is the source. If both sides were left alone a failure could not be
+  ; attributed to either.
+  ; ==================================================================
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DgSet(#DG_SRC, #DG_BYTES, $3C)
+  DmaCacheRange(#DG_SRC, #DG_BYTES)          ; SRC and DRAM now agree on $3C
+
+  ; The reference is what the CPU intends the copy to deliver.
+  DgFillRef(#DG_REF, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_STALE)
+  ; The same bytes into the real source - left DIRTY on purpose.
+  DgFillRef(#DG_SRC, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_STALE)
+
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  If DmaCopy2D(#DG_OUT, #DG_G_PITCH, #DG_SRC, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS) = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  G5  the copy was REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+  Else
+    DmaCacheRange(#DG_OUT, #DG_BYTES)
+    d = DgDiff(#DG_REF, #DG_OUT, #DG_BYTES)
+    DgExpectDiff("G5  hazard A, source left dirty and NOT cleaned before the copy", d)
+  EndIf
+
+  ; ==================================================================
+  ; G6 - HAZARD A, THE DISCIPLINE APPLIED. Must come out RIGHT.
+  ; ==================================================================
+  DgSet(#DG_REF, #DG_BYTES, $3C)
+  DgSet(#DG_OUT, #DG_BYTES, $3C)
+  DgSet(#DG_SRC, #DG_BYTES, $3C)
+  DmaCacheRange(#DG_SRC, #DG_BYTES)
+
+  DgFillRef(#DG_REF, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_STALE)
+  DgFillRef(#DG_SRC, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS, #DG_G_STALE)
+
+  DmaCacheRect(#DG_SRC, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS)   ; the clean
+  DmaCacheRange(#DG_OUT, #DG_BYTES)
+  If DmaCopy2D(#DG_OUT, #DG_G_PITCH, #DG_SRC, #DG_G_PITCH, #DG_G_ROWBYTES, #DG_G_ROWS) = 0
+    dgChecks = dgChecks + 1
+    dgFails  = dgFails + 1
+    PutS("  FAIL  G6  the copy was REFUSED: ")
+    PutS(DmaErrorText())
+    PutNl()
+  Else
+    DmaCacheRange(#DG_OUT, #DG_BYTES)
+    d = DgDiff(#DG_REF, #DG_OUT, #DG_BYTES)
+    DgExpectSame("G6  hazard A, source cleaned with DmaCacheRect before the copy", d)
+  EndIf
+
+  ; The accumulator exists so the read loops cannot be optimised away.
+  ; Printing it is what makes that true rather than merely intended, and
+  ; the value itself carries no information at all - do not read it as a
+  ; result.
+  PutS("   (eviction and priming walked ")
+  PrintDec(acc)
+  PutS(" bytes' worth of low bytes - the number is")
+  PutNl()
+  PutS("    printed only so the read loops cannot be dead code)")
+  PutNl()
+  PutNl()
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+; GROUP F - THE BURST CEILING. THIS GROUP IS EXPECTED TO HANG THE BOARD.
+;
+; ======================================================================
+; READ THIS BEFORE RUNNING IT
+; ======================================================================
+; ARM THE DEADMAN. `deadman 15` at the Anvil prompt, then `run`. On
+; 2026-08-26 this group locked the AXI bus and the deadman is what got
+; the board back; without it the recovery is hands on the hardware. The
+; counter is 20 bits at 65536 Hz so ~15.999 s is the ceiling on this
+; part (safety.pi4:491-498 clamps and returns the real value), which is
+; why every rung below is ONE case and not three.
+;
+; NOTHING ELSE IN THIS FILE CAN DO THIS. Groups A to E run inside
+; DmaSetBurst()'s cap, which is #DMA_BURST_MAX_SAFE = 8 and is a
+; refusal, not a clamp. This group is the single caller of
+; DmaSetBurstProbe(), the door in dma.pi4 that exists so a ladder can
+; climb past the cap and find out where the cap belongs.
+;
+; ======================================================================
+; WHAT HAPPENED, AND WHY THE LADDER NOW RUNS DOWNWARDS
+; ======================================================================
+; The first version of this group walked UP from burst 0 and printed
+; only failures. It hung, and the transcript could not say which rung
+; it hung on, because a rung that hangs never reaches its own failure
+; line. That is one wasted reset and no information.
+;
+; Two things changed.
+;
+;   IT ANNOUNCES EACH RUNG BEFORE ATTEMPTING IT, AND DRAINS THE UART.
+;   The drain is the part that matters: without it the line sits in the
+;   PL011's transmit FIFO while the engine starts, and if the bus locks
+;   the CPU never runs the code that would have pushed it out. So the
+;   marker naming the rung would die in the FIFO along with everything
+;   else. Announce, drain, then touch the hardware. The last line on
+;   the wire is then the answer.
+;
+;   IT WALKS DOWN FROM 15, NOT UP FROM 0. A hang ends the run, so a
+;   ladder yields exactly ONE data point per reset whichever way it
+;   runs - and the interesting end is the top. Walking up meant paying
+;   for every safe rung before reaching the one in question. Walking
+;   down puts the answer in the first rung or two.
+;
+; ======================================================================
+; HOW TO FIND THE EXACT RUNG IN ONE RUN
+; ======================================================================
+; The ladder WALKS UP, and a hanging rung ends the run, so the run
+; stops at the LOWEST burst length that hangs - which is the ceiling.
+; The last "burst N survived" line names the highest safe value and the
+; "attempting" line under it names the one that locked the bus.
+;
+; That is one run and one reset, not a bisection. An earlier version of
+; this header described a three-run bisection over 9..15; it walked the
+; ladder downwards, where the run stops at the HIGHEST hanging rung and
+; learns nothing about the six below it. See the comment on the loop.
+;
+; #DG_F_TOP and #DG_F_BOTTOM still bound the ladder and SETTING THEM
+; EQUAL STILL RUNS A SINGLE RUNG, which is the right tool for
+; re-testing one value - just not for finding the ceiling.
+;
+; WHEN THE NUMBER IS KNOWN: set #DMA_BURST_MAX_SAFE in dma.pi4 to one
+; BELOW the lowest hanging rung, note the bench date beside it, and
+; DmaSetBurst() refuses the rest with #DMA_ERR_BURST from then on. If
+; the answer comes back as 9, the constant stays at 8 and this ladder
+; will have confirmed the cap rather than moved it - which is still
+; worth knowing, because "8 because the FIFO is 8 words" and "8 because
+; 9 hangs" are different degrees of confidence.
+;
+; ======================================================================
+; WHAT IS ACTUALLY BEING TESTED AT EACH RUNG
+; ======================================================================
+; Two questions at once, and they fail differently:
+;
+;   DOES IT HANG?  The bus-lock question. Answered by whether the next
+;                  line appears.
+;   DOES IT READ PAST THE 256-BYTE PATTERN?  The regression question -
+;                  the pattern is 256 bytes because sixteen beats of
+;                  128 bits is the documented burst ceiling
+;                  (bcm2711-peripherals.txt:5231), so no legal burst
+;                  length should be able to walk off the end of it.
+;                  Answered by the byte-for-byte compare, which prints
+;                  a FAIL line like any other case.
+;
+; A rung that prints its announcement and then a FAIL is the second
+; problem. A rung that prints its announcement and then nothing is the
+; first.
+;
+; One fill case per rung, at w=1024 h=8 dp=2048 - the geometry that
+; found the original bug - so a rung is a few tens of milliseconds and
+; the whole ladder fits inside the deadman with room to spare.
+; ----------------------------------------------------------------------
+#DG_F_TOP    = 15
+#DG_F_BOTTOM = 8
+
+Procedure DgGroupF()
+  Define n.i
+  Define save.i
+
+  save = DmaBurst()
+
+  PutS("-- group F: the burst ceiling. THIS GROUP IS EXPECTED TO HANG THE BOARD.")
+  PutNl()
+  PutS("   Every rung is named BEFORE it is attempted and the UART is drained, so")
+  PutNl()
+  PutS("   the LAST LINE ON THE WIRE IS THE RUNG THAT HUNG. Walking DOWN from ")
+  PrintDec(#DG_F_TOP)
+  PutS(" to ")
+  PrintDec(#DG_F_BOTTOM)
+  PutS(".")
+  PutNl()
+  PutS("   Set #DG_F_TOP and #DG_F_BOTTOM equal to run one rung and bisect.")
+  PutNl()
+  UartDrain()
+
+  ; THE LADDER WALKS UP, AND THE FIRST VERSION WALKED DOWN ON MY OWN
+  ; BAD ADVICE. The reasoning for walking down was that if the ceiling
+  ; is near the top, walking up pays for the whole ladder before
+  ; reaching the interesting rung. That is true of a ladder whose rungs
+  ; all run - and false of this one, because A HANGING RUNG ENDS THE
+  ; RUN. The board resets and nothing after it executes.
+  ;
+  ; So the two directions are not symmetric:
+  ;
+  ;   walking DOWN from 15   stops at the HIGHEST hanging rung, which
+  ;                          is 15 itself if 15 hangs. One data point,
+  ;                          and the six rungs below it never ran.
+  ;   walking UP from 8      stops at the LOWEST hanging rung, which is
+  ;                          exactly the ceiling being looked for.
+  ;
+  ; Walking up answers the question in ONE run. The bisection below is
+  ; kept because setting TOP and BOTTOM equal is still the right tool
+  ; for re-testing a single rung, but it is no longer the way to find
+  ; the ceiling from scratch.
+  ;
+  ; The rungs cost tens of milliseconds each, so paying for the whole
+  ; ladder was never the expensive part. A reset is.
+  n = #DG_F_BOTTOM
+  While n <= #DG_F_TOP
+    ; The rung's own marker. Printed and DRAINED before anything is
+    ; asked of the engine, which is the whole instrument.
+    UartWriteStr("  .. burst ")
+    PrintDec(n)
+    UartWriteStr("  attempting w=1024 h=8 dp=2048 ...")
+    PutNl()
+    UartDrain()
+
+    ; DmaSetBurstProbe, not DmaSetBurst: above #DMA_BURST_MAX_SAFE the
+    ; ordinary setter refuses with #DMA_ERR_BURST, which is correct for
+    ; every caller except this one.
+    If DmaSetBurstProbe(n) = 0
+      PutS("  FAIL  burst ")
+      PrintDec(n)
+      PutS("  DmaSetBurstProbe refused: ")
+      PutS(DmaErrorText())
+      PutNl()
+      UartDrain()
+    Else
+      DgCaseFill(1024, 8, 2048, 0, $CAFEF00D)
+      ; Reaching here at all is the pass. Say so, because in THIS group
+      ; silence is the thing being watched for and an unbroken run of
+      ; announcements with nothing between them is ambiguous.
+      UartWriteStr("     burst ")
+      PrintDec(n)
+      UartWriteStr("  survived")
+      PutNl()
+      UartDrain()
+    EndIf
+
+    n = n + 1
+  Wend
+
+  DmaSetBurst(save)
+  PutS("   group F completed without hanging. Every rung from ")
+  PrintDec(#DG_F_BOTTOM)
+  PutS(" up to ")
+  PrintDec(#DG_F_TOP)
+  PutNl()
+  PutS("   survived, so #DMA_BURST_MAX_SAFE could be raised to ")
+  PrintDec(#DG_F_TOP)
+  PutS(" - but only")
+  PutNl()
+  PutS("   on the strength of more than one run, and only on channel 0.")
+  PutNl()
+  UartDrain()
+  PutNl()
+EndProcedure
+
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+Procedure.i Main()
+  UartInit(115200)
+
+  PutNl()
+  PutS("=== pi4DmaGate - the DMA engine against a CPU byte loop, byte for byte ===")
+  PutNl()
+  PutS("No framebuffer, no mailbox, no HDMI display needed. Three 64 KiB buffers")
+  PutNl()
+  PutS("at $780000, $790000 and $7A0000, and only the middle one is inside the")
+  PutNl()
+  PutS("window the library is allowed to write into.")
+  PutNl()
+  PutNl()
+
+  ; MmuBuildTables RETURNS 0 ON SUCCESS and a negative #MMU_ERR_* on
+  ; refusal (mmu.pi4:1044-1046). Testing it the other way round has
+  ; already cost this project a run, because the output looks complete:
+  ; the whole gate quietly runs with the caches OFF, where the cache
+  ; maintenance it is supposed to be exercising is a no-op, and passes.
+  If #DG_MMU = 1
+    PutS("MMU: building the identity map at $600000 ...")
+    PutNl()
+    If MmuBuildTables(#DG_TABLES) <> 0
+      PutS("MMU: the tables would not build. THE GATE IS NOW RUNNING UNCACHED,")
+      PutNl()
+      PutS("     which means every DmaCacheRange() below is a no-op and the cache")
+      PutNl()
+      PutS("     discipline is NOT being tested. A pass proves less than it looks.")
+      PutNl()
+    Else
+      MmuEnable()
+      If MmuEnabled() = 1
+        PutS("MMU: ON, DRAM Normal Write-Back Cacheable. The cache discipline is")
+        PutNl()
+        PutS("     under test as well as the transfers.")
+        PutNl()
+      Else
+        PutS("MMU: the enable did not take - running UNCACHED, see above.")
+        PutNl()
+      EndIf
+    EndIf
+  Else
+    PutS("MMU: off by #DG_MMU. The transfers are under test; the cache discipline")
+    PutNl()
+    PutS("     is not, because every maintenance operation is a no-op here.")
+    PutNl()
+  EndIf
+  PutNl()
+
+  ; FORGET THE KNOWN ANSWER AND MEASURE IT AGAIN. dma.pi4 now starts
+  ; with #DMA_YLENGTH_BIAS_BCM2711 = 1, measured on this board on
+  ; 2026-08-26, and DmaInit() takes it as given so an ordinary program
+  ; does not pay for a probe whose result is written down. A GATE IS
+  ; NOT AN ORDINARY PROGRAM: the whole reason it exists is to re-derive
+  ; what everything else assumes, so it puts the bias back to "unknown"
+  ; and makes DmaInit() run the probe on every single bench run.
+  DmaSetYLengthBias(-1)
+
+  If DmaSetScratch(#DG_SCRATCH, #DG_SCRATCH_BYTES) = 0
+    PutS("!! DmaSetScratch: ")
+    PutS(DmaErrorText())
+    PutNl()
+    UartDrain()
+    ProcedureReturn 1
+  EndIf
+
+  ; OUT and nothing else. REF and SRC stay outside the window for the
+  ; whole run, which is how group E's last four cases mean anything.
+  If DmaSetBounds(#DG_OUT, #DG_BYTES) = 0
+    PutS("!! DmaSetBounds: ")
+    PutS(DmaErrorText())
+    PutNl()
+    UartDrain()
+    ProcedureReturn 2
+  EndIf
+
+  If DmaInit() = 0
+    PutS("!! DmaInit: ")
+    PutS(DmaErrorText())
+    PutNl()
+    PutS("   Nothing below this line can run.")
+    PutNl()
+    UartDrain()
+    If #DG_MMU = 1
+      If MmuEnabled() = 1
+        MmuDisable()
+      EndIf
+    EndIf
+    ProcedureReturn 3
+  EndIf
+
+  PutS("dma: channel ")
+  PrintDec(DmaChannel())
+  PutS(", burst ")
+  PrintDec(DmaBurst())
+  PutS(", YLENGTH bias ")
+  PrintDec(DmaYLengthBias())
+  PutS(" (source advanced ")
+  PrintDec(DmaCalibrateAdvance())
+  PutS(" bytes in the probe)")
+  PutNl()
+  If DmaYLengthBias() = 0
+    PutS("     YLENGTH is a PLAIN ROW COUNT on this part.")
+  Else
+    PutS("     YLENGTH is ROWS MINUS ONE on this part.")
+  EndIf
+  PutNl()
+  PutNl()
+
+  If #DG_TRACE = 1
+    PutS("TRACING IS ON. Every case names itself before it runs and the UART is")
+    PutNl()
+    PutS("drained, so if the board stops the last line is the case that stopped it.")
+    PutNl()
+  Else
+    PutS("Only failures print below. Silence inside groups A to E is those groups")
+    PutNl()
+    PutS("passing - they run inside DmaSetBurst's cap and none of them has hung.")
+    PutNl()
+    PutS("IF THE BOARD HANGS IN ONE OF THEM, re-run once with #DG_TRACE = 1; that")
+    PutNl()
+    PutS("is the whole recovery procedure. Group F always traces itself.")
+    PutNl()
+  EndIf
+  PutNl()
+  PutS("Group F runs LAST and is expected to hang the board. Arm the deadman.")
+  PutNl()
+  PutNl()
+  UartDrain()
+
+  DgGroupA()
+  DgGroupA2()
+  DgGroupB()
+  DgGroupC()
+  DgGroupD()
+  DgGroupE()
+  ; G BEFORE F, ALWAYS. Group F is expected to hang the board and a group
+  ; queued after it may never run at all. Coherency is the question the
+  ; display path now depends on, so it does not sit behind the one
+  ; deliberate crash in this program.
+  DgGroupG()
+  DgGroupF()
+
+  PutS("=== ")
+  PrintDec((dgChecks - dgFails) - dgIncon)
+  PutS(" of ")
+  PrintDec(dgChecks)
+  PutS(" cases agree with the CPU, ")
+  PrintDec(dgFails)
+  PutS(" failed, ")
+  PrintDec(dgIncon)
+  PutS(" inconclusive ===")
+  PutNl()
+
+  ; INCONCLUSIVE IS REPORTED AHEAD OF THE VERDICT AND IT IS NOT A PASS.
+  ; A group G negative control that failed to reproduce its hazard has
+  ; taken its positive twin down with it, and a summary that folded that
+  ; into "everything agreed" would be asserting the one thing this run
+  ; did not establish.
+  If dgIncon > 0
+    PutS("!! ")
+    PrintDec(dgIncon)
+    PutS(" coherency negative control(s) did not reproduce their hazard, so the")
+    PutNl()
+    PutS("   matching positive cases prove nothing. THE CACHE DISCIPLINE IS")
+    PutNl()
+    PutS("   UNPROVEN ON THIS RUN whatever the failure count says. First thing to")
+    PutNl()
+    PutS("   check is the MMU line at the top: with the caches off there is no")
+    PutNl()
+    PutS("   hazard to provoke and every group G control comes out like this.")
+    PutNl()
+  EndIf
+
+  If dgFails = 0
+    PutS("Every rectangle the engine drew is byte-identical to the one the CPU")
+    PutNl()
+    PutS("drew, across the whole 64 KiB and not merely inside the rectangle.")
+    PutNl()
+  Else
+    PutS("Read the group a failure came from before reading the failure.")
+    PutNl()
+    PutS("  A or C  a real defect in the control block this file builds.")
+    PutNl()
+    PutS("  A2 row ladder   the fill row limit is REAL. Put the largest width that")
+    PutNl()
+    PutS("                  passed into #DMA_FILL_MAX_ROW_BYTES in dma.pi4; the")
+    PutNl()
+    PutS("                  refusal is already wired in behind it.")
+    PutNl()
+    PutS("  A2 stride ladder  the STRIDE word is mispacked, or D_STRIDE needs a")
+    PutNl()
+    PutS("                  tighter cap than the field's own 32767.")
+    PutNl()
+    PutS("  B       an alignment constraint to document, not a defect.")
+    PutNl()
+    PutS("  G1/G4/G6  a POSITIVE coherency case failed: the discipline as written")
+    PutNl()
+    PutS("            is not sufficient on this part. That is a defect in the")
+    PutNl()
+    PutS("            cache sequence, not in the transfer - the geometry groups")
+    PutNl()
+    PutS("            above will still be green while it is broken.")
+    PutNl()
+    PutS("  G2/G3/G5  cannot FAIL, only pass or come out inconclusive. See the")
+    PutNl()
+    PutS("            line above the verdict.")
+    PutNl()
+    PutS("  D       dma.pi4 must refuse overlap in BOTH directions.")
+    PutNl()
+    PutS("  F FAIL  a burst can still read past the 256-byte fill pattern - the")
+    PutNl()
+    PutS("          rung printed, ran and disagreed with the CPU.")
+    PutNl()
+    PutS("  F SILENT after a rung's announcement, the board hung on THAT rung. Set")
+    PutNl()
+    PutS("          #DMA_BURST_MAX_SAFE in dma.pi4 to one below it.")
+    PutNl()
+  EndIf
+  UartDrain()
+
+  If #DG_MMU = 1
+    If MmuEnabled() = 1
+      MmuDisable()
+      PutS("MMU: off again - Anvil gets an untranslated machine back.")
+      PutNl()
+      UartDrain()
+    EndIf
+  EndIf
+
+  ProcedureReturn dgFails
+EndProcedure

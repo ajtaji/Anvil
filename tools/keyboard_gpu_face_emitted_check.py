@@ -270,8 +270,6 @@ def stage(work: pathlib.Path, compose: str, keep: str) -> pathlib.Path:
         shutil.copytree(src, work / "RaspberryPi4" / "Intrinsics", dirs_exist_ok=True)
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
-    if (ROOT / "keywords.def").is_file():
-        shutil.copy2(ROOT / "keywords.def", work / "keywords.def")
     return work / "RaspberryPi4" / "Tests" / GATE.name
 
 

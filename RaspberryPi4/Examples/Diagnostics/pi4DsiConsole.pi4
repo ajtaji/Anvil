@@ -1,0 +1,468 @@
+; ======================================================================
+; pi4DsiConsole.pi4 - PUT TEXT ON THE WAVESHARE DSI PANEL, FROM A
+; PAYLOAD, WITHOUT REPLACING THE MONITOR.
+; ----------------------------------------------------------------------
+; WHY THIS EXISTS, AND IT IS A BENCH-SAFETY REASON RATHER THAN A FEATURE.
+;
+; The thing being built is Anvil's console on the DSI panel AT BOOT, and
+; the only way to run that is to flash KERNEL8.IMG. A monitor image
+; cannot be RAM-run: it is linked for $200000, the running monitor is
+; there, and pmfboot correctly refuses to place an image over the code
+; doing the placing. So the honest choice is between flashing an
+; unproven boot path and finding some other way to run the new code
+; first.
+;
+; This is the other way. It carries the SAME library sequence the boot
+; path carries - the firmware power domain, the panel's rails, the
+; D-PHY, the DCS init table, the HVS channel over Anvil's own
+; framebuffer, the pixel valve - and then draws through the same
+; display.pi4 the console draws through, at the same font size the seam
+; derives. If this puts readable text on the glass, the boot path's
+; hardware sequence is proven, and the flash that follows is a flash of
+; something already seen working.
+;
+; AND IT DRAWS IT THE WAY THE BOARD WILL: LANDSCAPE, at the rotation
+; ScrRotDefault(#SCR_SRC_DSI) names, into #FB_DRAW and transposed onto
+; the panel with the shipped ScrTranspose. A proof that drew the panel's
+; own portrait scan would be a proof of a path nothing boots into - and
+; the transpose is the half of the seam that has never been on glass.
+;
+; SO IT ALSO ANSWERS THE ONE QUESTION NO AMOUNT OF READING ANSWERS:
+; WHICH WAY UP. 90 and 270 are both landscape and only one of them has
+; the heading at the top; which depends on how the flat cable leaves the
+; board. If this comes up upside down, the answer is not a change to
+; this file and not a rebuild - it is `screen rotate 270` on the flashed
+; monitor, typed once and saved.
+;
+; IT IS BUILT WITH --entry-returns AND IT RETURNS. A wrong answer costs
+; a few lines of output and a `dsi off`, not a power cycle and not a
+; stick pulled out of the board.
+;
+; WHAT IT DELIBERATELY DOES NOT PROVE: that the console comes up on the
+; panel with nothing typed. That is the boot path and only a flash can
+; show it. This proves everything the boot path would do AFTER deciding
+; to do it.
+;
+; THE BUILD LINE:
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4DsiConsole.pi4 -t pi4 \
+;        --load-addr 0x800000 --stack-addr 0x4F00000 --entry-returns \
+;        -o dsicon.img
+;
+; ARM THE DEADMAN FIRST: `deadman 30` immediately before the run.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/clocks.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2.pi4"
+XIncludeFile "RaspberryPi4/Lib/dsi_host.pi4"
+XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2_dcs.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/hvs.pi4"
+; display.pi4 needs to be told at compile time whether the DMA engine is
+; linked in. It is not here: this payload draws with the processor,
+; because what is being proved is the DSI path and not the blitter, and
+; the blitter is proved by its own gate.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
+; PutHex2 / PutHex8, so the register readings below print the way every
+; other diagnostic on this board prints them. Anvil/Core/format.pbi is
+; core and depends on nothing but the UART.
+XIncludeFile "Anvil/Core/format.pbi"
+
+; The panel's geometry and the framebuffer's home. Copied from
+; RaspberryPi4/Board/memmap.pi4 rather than including it, because that
+; file also defines HwMonLo/HwMonHi over the MONITOR's window and this
+; payload is not the monitor. The four numbers are the ones the seam
+; uses and they are the ones this proves.
+#FB_SCAN    = $08A00000
+#FB_DRAW    = $08E00000
+#PANEL_W    = 800
+#PANEL_H    = 1280
+#FB_BYTES   = 4096000
+
+; ----------------------------------------------------------------------
+;  THE VERDICT BLOCK - WHY THIS PAYLOAD WRITES ITS ANSWER INTO DRAM.
+;
+;  A payload has its own copy of uart.pi4 and its own globals, so its
+;  output goes to the physical serial line and NOWHERE ELSE. The
+;  monitor's network console is fed by the monitor's own aux output tap,
+;  which this program is not part of and cannot be - it is a separate
+;  image with a separate BSS. On a bench with no serial adapter attached
+;  that makes every line it prints unreadable.
+;
+;  So it also writes sixteen words to a fixed address, and the monitor's
+;  `md` reads them back afterwards. That is the technique the earliest
+;  bring-up work used when the console itself was the thing being
+;  debugged, and it is the way out of the circle.
+;
+;  THE SLOTS, in order, so a dump reads without this file open:
+;    0  the magic, D51C0DE1, so a dump of stale DRAM cannot be mistaken
+;       for a result
+;    1  how far it got: the number of the last step that succeeded
+;    2  the panel's identity byte, or FFFFFFFF if it was never read
+;    3  DSI STAT across the AFE release - 05010000 is all three lanes
+;       reaching STOP
+;    4  DCS commands sent, of 200
+;    5  the panel's Power Mode byte - 1C is display on and sleep out
+;    6  DisplayAdopt's return code, 1 for OK
+;    7  the scaler's mode field the instant the channel was enabled
+;    8  the scan line counter, first read
+;    9  and again 20 ms later. DIFFERENT MEANS IT IS SCANNING, and this
+;       pair is the only reading in the block that proves pixels move
+;   10  the scaler's mode field after the valve is running
+;   11  the console's width in characters
+;   12  and its height in lines
+;   13  the rotation it drew at - 90 is the shipped default, LANDSCAPE
+;   14  the console's logical width in pixels (1280 when landscape)
+;   15  and its logical height (800 when landscape)
+;
+;  $00D00000 is inside the low payload window, clear of this image
+;  ($800000), clear of its BSS ($880000) and clear of the container it
+;  was placed from ($C00000).
+; ----------------------------------------------------------------------
+#VERDICT    = $00D00000
+#VER_MAGIC  = $D51C0DE1
+
+Procedure VerdictWord(slot.i, v.i)
+  PokeN(#VERDICT + slot * 4, v & $FFFFFFFF)
+EndProcedure
+
+Global gStep.i = 0
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The bring-up, in the driver's order, exactly as the seam's
+;  ScrDsiBringUp does it. If these two ever drift the payload stops
+;  being a proof of the boot path, so they are written to be read side
+;  by side.
+; ----------------------------------------------------------------------
+Procedure.i BringUp()
+  Define ok.i
+
+  Say("1. the firmware power domain (DSI1 is domain 19, and it is OFF at boot)")
+  If DsiDomainProbe() <> 1
+    Say("   !! the firmware does not implement the power-domain tags. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  If DsiDomainOn() = 0
+    Say("   !! the domain would not read back ON. Stopping - every register")
+    Say("      below would read back perfectly and drive nothing.")
+    ProcedureReturn 0
+  EndIf
+  VerdictWord(1, 1)
+  Say("   domain 19 reads back ON.")
+
+  Say("2. the panel's rails, over the display connector's I2C")
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  If I2cUp() = 0
+    I2cSelectBus(#I2C_BUS_HEADER)
+    Say("   !! that bus would not come up. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  If DsiV2Identify() = 0 Or DsiV2Plausible() <> 1
+    I2cSelectBus(#I2C_BUS_HEADER)
+    Say("   !! no panel answered its identity registers. Is it plugged in?")
+    ProcedureReturn 0
+  EndIf
+  Print("   panel id ")
+  PutHex2(DsiV2Id())
+  Print(", size ")
+  PutHex2(DsiV2Size())
+  Print(", firmware ")
+  PutHex2(DsiV2Version())
+  PrintNl()
+  VerdictWord(2, DsiV2Id())
+  If DsiV2Begin() = 0
+    I2cSelectBus(#I2C_BUS_HEADER)
+    Say("   !! the panel micro would not take the power-on write. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  ok = DsiPanelRails()
+  If DsiV2Backlight(255) = 0
+    ok = 0
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  If ok = 0
+    Say("   !! not every expander write acknowledged. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  VerdictWord(1, 2)
+  Say("   rails up, reset released, backlight on.")
+
+  Say("3. the link clock and the D-PHY")
+  If DsiModePlan(70000000) = 0
+    Say("   !! the display PLL could not be read. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  If DsiClocksSet() = 0
+    Say("   !! a clock generator would not go idle. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  DsiHostBringUp()
+  If DsiIsUp() = 0
+    Say("   !! the host did not come up. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  VerdictWord(1, 3)
+  VerdictWord(3, DsiStatRelease())
+  Print("   lanes reached STOP, STAT ")
+  PutHex8(DsiStatRelease())
+  PrintNl()
+
+  Say("4. the panel's own 200-command init table")
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  ok = 1
+  If DsiV2Begin() = 0
+    ok = 0
+  EndIf
+  If ok <> 0
+    If DsiPanelPrepare() = 0
+      ok = 0
+    EndIf
+  EndIf
+  If DsiV2Backlight(255) = 0
+    ok = 0
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  Print("   sent ")
+  PrintDec(DsiPanelSent())
+  Print(" of 200, failed ")
+  PrintDec(DsiPanelFailed())
+  PrintNl()
+  VerdictWord(4, DsiPanelSent())
+  If ok = 0 Or DsiPanelSent() = 0
+    Say("   !! the table did not go out. Stopping.")
+    ProcedureReturn 0
+  EndIf
+  VerdictWord(1, 4)
+
+  Say("5. did the panel answer? (a read only a live panel can answer)")
+  ok = DsiDcsRead($0A)
+  If ok < 0
+    Say("   !! no byte came back. Stopping - nothing below would be visible.")
+    ProcedureReturn 0
+  EndIf
+  VerdictWord(5, ok)
+  VerdictWord(1, 5)
+  Print("   Power Mode = ")
+  PutHex2(ok)
+  PrintN("   (bit 4 sleep out, bit 2 display on)")
+
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define scale.i
+  Define diag.i
+  Define y.i
+  Define rot.i
+  Define lw.i
+  Define lh.i
+
+  UartInit(115200)
+
+  ; THE VERDICT BLOCK IS STAMPED AND CLEARED FIRST. A dump of stale DRAM
+  ; from a previous run would otherwise read as this run's answer, which
+  ; is the same trap a stale binary is and just as quiet.
+  y = 0
+  While y < 16
+    VerdictWord(y, 0)
+    y = y + 1
+  Wend
+  VerdictWord(0, #VER_MAGIC)
+
+  PrintNl()
+  Say("=== pi4DsiConsole - Anvil's own text on the Waveshare 10.1 DSI panel ===")
+  Say("Nothing here replaces the monitor. It returns when it is done.")
+  PrintNl()
+
+  If BringUp() = 0
+    Say("The panel was not brought up. Nothing was drawn.")
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- the framebuffer, cleared before the scaler ever reads it ------
+  ; The HVS starts scanning the instant the channel is enabled, so
+  ; whatever DRAM held here would otherwise be the first thing on the
+  ; glass.
+  VerdictWord(1, 6)
+  Say("6. clearing the framebuffer the panel scans, at 08A00000")
+  HvsFill(#FB_SCAN, #PANEL_W, #PANEL_H, $FF000028)
+  MmuCleanRange(#FB_SCAN, #FB_BYTES)
+
+  Say("7. the scaler channel and the pixel valve")
+  HvsMirror(0, 0)
+  ; HvsUp's return value is NOT a verdict - the channel's mode field
+  ; still reads DISABLED the instant it is enabled, because nothing is
+  ; pulling pixels out of it until the valve below starts asking. See
+  ; THE READBACK in hvs.pi4. The honest test is four lines down.
+  HvsUp(#FB_SCAN, #PANEL_W, #PANEL_H)
+  VerdictWord(7, HvsModeAtEnable())
+  PvUp(#PANEL_W, DsiHsyncS(), DsiHsyncE(), DsiHtotal(), #PANEL_H, 1300, 1320, 1324)
+  PvEnable()
+  DsiVideoOn()
+  PvVideoOn()
+  VerdictWord(8, HvsChannelLine())
+  delay(20)
+  VerdictWord(9, HvsChannelLine())
+  VerdictWord(10, HvsChannelMode())
+  Print("   HVS mode ")
+  PrintDec(HvsChannelMode())
+  Print(", line counter ")
+  PrintDec(HvsChannelLine())
+  Print(" then ")
+  PrintDec(HvsChannelLine())
+  PrintNl()
+
+  ; ---- THE SAME display.pi4 THE CONSOLE DRAWS THROUGH ---------------
+  ;
+  ;  AND THE SAME SURFACE THE SEAM WOULD INSTALL. ScrDsiSurface() adopts
+  ;  #MON_FB_DRAW at the LOGICAL size whenever the rotation is sideways,
+  ;  which the default is, and #MON_FB_SCAN only when it is not. Adopting
+  ;  the scanned buffer here would draw a portrait console nothing boots
+  ;  into and would never exercise the transpose at all.
+  rot = ScrRotDefault(#SCR_SRC_DSI)
+  lw = ScrLogicalW(rot, #PANEL_W, #PANEL_H)
+  lh = ScrLogicalH(rot, #PANEL_W, #PANEL_H)
+  VerdictWord(13, rot)
+  VerdictWord(14, lw)
+  VerdictWord(15, lh)
+  Print("8. adopting a ")
+  PrintDec(lw)
+  Print(" x ")
+  PrintDec(lh)
+  Print(" drawing surface at 08E00000, rotation ")
+  PrintDec(rot)
+  PrintNl()
+  HvsFill(#FB_DRAW, lw, lh, $FF000028)
+  rc = DisplayAdopt(#FB_DRAW, lw * 4, lw, lh, 32)
+  If rc <> #DSP_OK
+    Print("   !! DisplayAdopt refused it, code ")
+    PrintDec(rc)
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  VerdictWord(1, 8)
+  VerdictWord(6, rc)
+  DisplayColourSwap(0)
+  DisplayAutoFlush(1)
+  ; THE PANEL'S OWN GEOMETRY AND ITS OWN SIZE BYTE, NOT THE SURFACE'S
+  ; WIDTH. This payload draws the shipped path, and the shipped path
+  ; computes the font from how big the glass is - so it must be handed
+  ; the panel's 800 x 1280 and the diagonal the micro reported, with the
+  ; ROTATED surface's width supplied only for the eighty-column cap.
+  ; Handing it DisplayWidth() alone is precisely the bug this file
+  ; exists to prove is gone.
+  diag = DsiV2Size()
+  If ScrDiagUsable(diag) = 0
+    diag = #SCR_DSI_DIAG_TENTHS
+  EndIf
+  scale = ScrScaleFor(#PANEL_W, #PANEL_H, diag, DisplayWidth())
+  DisplayScale(scale)
+  Print("   surface ")
+  PrintDec(DisplayWidth())
+  Print(" x ")
+  PrintDec(DisplayHeight())
+  Print(", ")
+  PrintDec(ScrPixelsPerInch(#PANEL_W, #PANEL_H, diag))
+  Print(" px/in, font scale ")
+  PrintDec(scale)
+  Print(", console ")
+  PrintDec(DisplayWidth() / DisplayCharWidth())
+  Print(" columns by ")
+  PrintDec((DisplayHeight() - 120) / DisplayCharHeight())
+  PrintN(" lines")
+
+  VerdictWord(11, DisplayWidth() / DisplayCharWidth())
+  VerdictWord(12, (DisplayHeight() - 120) / DisplayCharHeight())
+  VerdictWord(1, 9)
+  Say("9. drawing")
+  DisplayClear(DisplayRGB(0, 0, 40))
+  ; A band across the top where the monitor's banner goes, so the shape
+  ; on the glass is the shape the console will have. It is drawn in the
+  ; CONSOLE's coordinates, not the panel's - the transpose below is what
+  ; turns it.
+  DisplayFillRect(0, 0, DisplayWidth(), 120, DisplayRGB(0, 0, 40))
+  DisplayHLine(24, 114, DisplayWidth() - 48, DisplayRGB(255, 140, 0))
+  DisplayHLine(24, 115, DisplayWidth() - 48, DisplayRGB(60, 40, 20))
+  DisplayColour(DisplayRGB(226, 232, 240), DisplayRGB(0, 0, 40))
+
+  DisplayText(24, 40, "PureMetal Forge - Anvil", DisplayRGB(255, 140, 0), DisplayRGB(0, 0, 40))
+  DisplayText(24, 70, "on the Waveshare 10.1 DSI panel", DisplayRGB(226, 232, 240), DisplayRGB(0, 0, 40))
+
+  DisplayConsole(0, 120, DisplayWidth(), DisplayHeight() - 120)
+  DisplayPrintLn("This text is being drawn by RaspberryPi4/Lib/display.pi4, through")
+  DisplayPrintLn("a framebuffer this monitor allocated itself at 08A00000 and put")
+  DisplayPrintLn("an HVS display list over. The VideoCore firmware allocated none")
+  DisplayPrintLn("of it and owns no DSI display at all.")
+  DisplayPrintLn("")
+  DisplayPrintLn("If you can read this, the whole DSI path works: the firmware")
+  DisplayPrintLn("power domain, the panel's rails, the D-PHY, the 200-command DCS")
+  DisplayPrintLn("init table, the scaler channel and pixel valve 1.")
+  DisplayPrintLn("")
+  DisplayPrint("The console is ")
+  DisplayPrintDec(DisplayCols())
+  DisplayPrint(" columns by ")
+  DisplayPrintDec(DisplayRows())
+  DisplayPrintLn(" lines at this font size.")
+  DisplayPrintLn("")
+  ; A ruler, so the column count can be checked by eye rather than
+  ; believed. Ten characters per group. It is written to a hundred and
+  ; the landscape console is eighty, so THE LAST TWENTY CHARACTERS MUST
+  ; NOT BE ON THE GLASS - a ruler that fitted would mean the surface is
+  ; wider than the seam thinks it is, which is what this line is for.
+  DisplayPrintLn("0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789")
+  DisplayPrintLn("         1         2         3         4         5         6         7         8         9        10")
+  DisplayPrintLn("")
+  y = 0
+  While y < 8
+    DisplayPrint("line ")
+    DisplayPrintDec(y)
+    DisplayPrintLn(" - the scroll and the fill both work if these are all here")
+    y = y + 1
+  Wend
+
+  VerdictWord(1, 10)
+  VerdictWord(11, DisplayCols())
+  VerdictWord(12, DisplayRows())
+
+  ; ---- THE TRANSPOSE, WHICH IS THE HALF THAT HAS NEVER BEEN SEEN -----
+  ;  Nothing above this line is on the glass: the panel is scanning
+  ;  #FB_SCAN and every pixel so far went into #FB_DRAW. This is
+  ;  ScrPresentAll() with the seam's own procedures, whole surface, and
+  ;  the clean after it is the whole scanned buffer rather than the
+  ;  per-run form - one payload doing one pass is not the place to prove
+  ;  the damage arithmetic, and the gate proves that on the oracle.
+  Say("10. transposing the console onto the panel")
+  ScrTranspose(rot, #FB_DRAW, #FB_SCAN, #PANEL_W, #PANEL_H, 0, lh - 1)
+  MmuCleanRange(#FB_SCAN, #FB_BYTES)
+
+  VerdictWord(1, 11)
+  Say("    drawn. LOOK AT THE PANEL.")
+  PrintNl()
+  Say("WHAT SHOULD BE ON THE GLASS: a dark blue LANDSCAPE screen - the text")
+  Say("running along the panel's LONG edge, which is how it is mounted - with")
+  Say("an orange PureMetal Forge - Anvil heading and a rule under it, then")
+  Say("paragraphs of white text and a two-line column ruler.")
+  Say("The console is 1280 across at font scale 2, so the ruler reads to 80")
+  Say("and ends exactly at the right-hand edge.")
+  PrintNl()
+  Say("IF IT IS UPSIDE DOWN, that is not a defect and not a rebuild: 90 and")
+  Say("270 are both landscape and which is the top depends on the cable. The")
+  Say("fix on the flashed monitor is screen rotate 270, typed once. It saves.")
+  PrintNl()
+  Say("Nothing was replaced. The monitor is still the one you were talking to.")
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

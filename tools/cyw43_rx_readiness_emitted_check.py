@@ -97,7 +97,6 @@ def build_guard_mutant(compiler: Path, work: Path, name: str) -> Path:
     tests = root / "RaspberryPi4" / "Tests"
     lib.mkdir(parents=True)
     tests.mkdir(parents=True)
-    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
     shutil.copytree(
         ROOT / "RaspberryPi4" / "Intrinsics",
         root / "RaspberryPi4" / "Intrinsics",
@@ -132,7 +131,6 @@ def build_busy_mutant(compiler: Path, work: Path) -> Path:
     root = work / "busy-mutant"
     lib = root / "RaspberryPi4" / "Lib"; tests = root / "RaspberryPi4" / "Tests"
     lib.mkdir(parents=True); tests.mkdir(parents=True)
-    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
     shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", root / "RaspberryPi4" / "Intrinsics")
     source = (ROOT / "RaspberryPi4/Lib/cyw43.pi4").read_text(encoding="utf-8")
     old = "  If cyw43_rxIrqBusy <> 0"
@@ -169,7 +167,6 @@ def build_scratch_mutant(compiler: Path, work: Path) -> Path:
     root = work / "scratch-mutant"
     lib = root / "RaspberryPi4" / "Lib"; tests = root / "RaspberryPi4" / "Tests"
     lib.mkdir(parents=True); tests.mkdir(parents=True)
-    shutil.copy2(ROOT / "keywords.def", root / "keywords.def")
     shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", root / "RaspberryPi4" / "Intrinsics")
     source = (ROOT / "RaspberryPi4/Lib/cyw43.pi4").read_text(encoding="utf-8")
     for old, new in SCRATCH_MUTATION:

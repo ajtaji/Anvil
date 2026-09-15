@@ -1,0 +1,645 @@
+; pi4NeonText.pi4 - Neon_Text, the convex fan and the line list, on the
+; HDMI screen through V3D, verified pixel by pixel against the font.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT MAKES THIS A REAL TEST OF THE GLYPHS
+; ======================================================================
+;  The expected image is not typed in and it is not a bounding box. For
+;  every pixel of the text's rectangle this program reads THE FONT BLOB
+;  ITSELF - the same 1-bit-per-pixel cell data neon.pi4's decomposition
+;  reads - works out whether that pixel is ink, and demands the ink
+;  colour where it is ink and the ground colour where it is not.
+;
+;  So a decomposition that merged two rows it should not have, dropped
+;  the last run of a row, got the MSB-first bit order backwards, or put
+;  a glyph one pixel out, fails on the exact pixels it got wrong and
+;  the run names the first one.
+;
+;  THE TWO SIDES ARE GENUINELY DIFFERENT CODE. neon.pi4 walks rows,
+;  merges identical ones into bands, finds horizontal runs of set bits
+;  and emits a rectangle per run, which the GPU then rasterises and
+;  blends. This file asks one question per pixel: is bit
+;  (7 - (x mod 8)) of row (y mod 16) of glyph c set? A shared helper
+;  would make the test agree with the code by construction; two
+;  independent walks of the same blob do not.
+;
+;  THE TEXT IS DRAWN AT ALPHA 255 over an opaque ground, so the blend
+;  cannot hide a wrong pixel behind a partial one. The blend itself is
+;  already proven exactly, on 2,073,600 pixels, by pi4NeonBox.pi4.
+;
+; ======================================================================
+;  THE FAN AND THE LINE LIST
+; ======================================================================
+;  The desktop OpenGL utility layer this engine mirrors has both a
+;  triangle fan and a line list. The engine carries both, so both are
+;  checked here.
+;
+;  A fan cannot be checked pixel-exactly without reimplementing the
+;  rasteriser's fill rule, so it is checked the way pi4V3dTri.pi4
+;  checked its triangle: a MARGIN INSIDE every edge must all be the fan
+;  colour, a margin OUTSIDE must all be the ground, and the bounding
+;  box must be where the geometry says. The fan here is a square built
+;  from four points, so "inside" and "outside" are three comparisons
+;  and no arithmetic that can overflow.
+;
+;  The line list is checked at its endpoints and at its midpoints, plus
+;  a count of how many pixels carry the line colour at all - a line
+;  list that drew nothing and one that drew a filled triangle are both
+;  caught by that count being outside a generous band.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonText.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o neontext.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#NT_ARENA       = $04000000
+#NT_ARENA_BYTES = $01000000
+#NT_POISON      = $A5A5A5A5
+
+; Ground and ink, four distinct bytes in each.
+#NT_GR = $11
+#NT_GG = $33
+#NT_GB = $55
+#NT_IR = $EE
+#NT_IG = $C4
+#NT_IB = $7A
+
+; The string's origin and the string. 95 printable characters, which
+; is every glyph the font has, so the test covers the whole table
+; rather than whichever letters happened to be in a word.
+#NT_TX = 64
+#NT_TY = 200
+
+; The fan - a square, so inside and outside are exact.
+#NT_FX0 = 300
+#NT_FY0 = 400
+#NT_FX1 = 500
+#NT_FY1 = 600
+#NT_FR = $20
+#NT_FG = $D0
+#NT_FB = $90
+#NT_MARGIN = 3
+
+; The line list.
+#NT_LX0 = 800
+#NT_LY0 = 400
+#NT_LX1 = 1200
+#NT_LY1 = 400
+#NT_LR = $C8
+#NT_LG = $44
+#NT_LB = $22
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define n.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  n = 0
+  i = 0
+  While PeekA(*name + i) <> 0
+    n = n + 1
+    i = i + 1
+  Wend
+  While n < width
+    UartWrite(32)
+    n = n + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutPad(*name, 30)
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutPad(*name, 30)
+  PrintDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  If e = 0
+    PutS("OK")
+  Else
+    PutS("error ")
+    PrintDec(e)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE STRING. 95 characters, ASCII 32 through 126 in order, built at
+;  run time so no literal has to carry a quotation mark or a backslash.
+; ======================================================================
+Global Dim ntStr.a[128]
+Global ntLen.i = 0
+
+Procedure BuildString()
+  Define c.i
+  ntLen = 0
+  c = 32
+  While c <= 126
+    ntStr[ntLen] = c
+    ntLen = ntLen + 1
+    c = c + 1
+  Wend
+  ntStr[ntLen] = 0
+EndProcedure
+
+; ======================================================================
+;  THE INDEPENDENT READ OF THE FONT BLOB
+;
+;  Is the pixel at (px, py) ink, for the string drawn at (#NT_TX,#NT_TY)
+;  at scale 1? Nothing here is shared with neon.pi4's decomposition.
+; ======================================================================
+Procedure.i InkAt(px.i, py.i)
+  Define col.i
+  Define row.i
+  Define idx.i
+  Define ch.i
+  Define b.i
+
+  If py < #NT_TY
+    ProcedureReturn 0
+  EndIf
+  row = py - #NT_TY
+  If row >= 16
+    ProcedureReturn 0
+  EndIf
+  If px < #NT_TX
+    ProcedureReturn 0
+  EndIf
+  col = px - #NT_TX
+  idx = col / 8
+  If idx >= ntLen
+    ProcedureReturn 0
+  EndIf
+  ch = ntStr[idx]
+  If ch < 32 Or ch > 126
+    ProcedureReturn 0
+  EndIf
+  ; The blob's layout, display.pi4:3640-3648: glyph n at
+  ; n * cellH * rowBytes, MSB of the byte is the leftmost pixel.
+  b = PeekA(?dsp_font8x16 + (((ch - 32) * 16) + row))
+  If (b & (128 >> (col - (idx * 8)))) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  COUNTERS
+; ======================================================================
+Global nInk.i = 0
+Global nInkOk.i = 0
+Global nBg.i = 0
+Global nBgOk.i = 0
+Global firstBadX.i = -1
+Global firstBadY.i = -1
+Global firstBadGot.i = 0
+Global firstBadWant.i = 0
+
+Global fanIn.i = 0
+Global fanInBad.i = 0
+Global fanOut.i = 0
+Global fanOutBad.i = 0
+Global fanMinX.i = 99999
+Global fanMaxX.i = -1
+Global fanMinY.i = 99999
+Global fanMaxY.i = -1
+Global fanPixels.i = 0
+
+Global linePixels.i = 0
+Global lineEndsOk.i = 0
+
+Global groundCol.i
+Global inkCol.i
+Global fanCol.i
+Global lineCol.i
+
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(Neon_SurfaceBase() + (y * Neon_SurfacePitch()) + (x * 4))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The text rectangle, every pixel.
+; ----------------------------------------------------------------------
+Procedure VerifyText()
+  Define px.i
+  Define py.i
+  Define v.i
+  Define want.i
+  Define x1.i
+
+  x1 = #NT_TX + (ntLen * 8)
+  py = #NT_TY
+  While py < (#NT_TY + 16)
+    px = #NT_TX
+    While px < x1
+      v = PixelAt(px, py)
+      If InkAt(px, py) <> 0
+        want = inkCol
+        nInk = nInk + 1
+        If v = want
+          nInkOk = nInkOk + 1
+        ElseIf firstBadX < 0
+          firstBadX = px
+          firstBadY = py
+          firstBadGot = v
+          firstBadWant = want
+        EndIf
+      Else
+        want = groundCol
+        nBg = nBg + 1
+        If v = want
+          nBgOk = nBgOk + 1
+        ElseIf firstBadX < 0
+          firstBadX = px
+          firstBadY = py
+          firstBadGot = v
+          firstBadWant = want
+        EndIf
+      EndIf
+      px = px + 1
+    Wend
+    py = py + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The fan. A margin inside every edge must be the fan colour and a
+;  margin outside must be the ground.
+; ----------------------------------------------------------------------
+Procedure VerifyFan()
+  Define px.i
+  Define py.i
+  Define v.i
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+
+  x0 = #NT_FX0 - 40
+  y0 = #NT_FY0 - 40
+  x1 = #NT_FX1 + 40
+  y1 = #NT_FY1 + 40
+
+  py = y0
+  While py < y1
+    px = x0
+    While px < x1
+      v = PixelAt(px, py)
+      If v = fanCol
+        fanPixels = fanPixels + 1
+        If px < fanMinX : fanMinX = px : EndIf
+        If px > fanMaxX : fanMaxX = px : EndIf
+        If py < fanMinY : fanMinY = py : EndIf
+        If py > fanMaxY : fanMaxY = py : EndIf
+      EndIf
+      ; strictly inside by the margin
+      If px >= (#NT_FX0 + #NT_MARGIN) And px < (#NT_FX1 - #NT_MARGIN)
+        If py >= (#NT_FY0 + #NT_MARGIN) And py < (#NT_FY1 - #NT_MARGIN)
+          fanIn = fanIn + 1
+          If v <> fanCol
+            fanInBad = fanInBad + 1
+          EndIf
+        EndIf
+      EndIf
+      ; strictly outside by the margin
+      If px < (#NT_FX0 - #NT_MARGIN) Or px >= (#NT_FX1 + #NT_MARGIN) Or py < (#NT_FY0 - #NT_MARGIN) Or py >= (#NT_FY1 + #NT_MARGIN)
+        fanOut = fanOut + 1
+        If v <> groundCol
+          fanOutBad = fanOutBad + 1
+        EndIf
+      EndIf
+      px = px + 1
+    Wend
+    py = py + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The line list. Count its pixels in a band around where it should be,
+;  and check three points on it.
+; ----------------------------------------------------------------------
+Procedure VerifyLines()
+  Define px.i
+  Define py.i
+  Define v.i
+
+  py = #NT_LY0 - 20
+  While py < (#NT_LY0 + 20)
+    px = #NT_LX0 - 20
+    While px < (#NT_LX1 + 20)
+      If PixelAt(px, py) = lineCol
+        linePixels = linePixels + 1
+      EndIf
+      px = px + 1
+    Wend
+    py = py + 1
+  Wend
+
+  ; Three points that must be on the line, allowing one pixel of
+  ; vertical slack for the rasteriser's own rule about where a
+  ; horizontal line at an integer y lands.
+  px = #NT_LX0 + 4
+  If PixelAt(px, #NT_LY0) = lineCol Or PixelAt(px, #NT_LY0 - 1) = lineCol
+    lineEndsOk = lineEndsOk + 1
+  EndIf
+  px = (#NT_LX0 + #NT_LX1) / 2
+  If PixelAt(px, #NT_LY0) = lineCol Or PixelAt(px, #NT_LY0 - 1) = lineCol
+    lineEndsOk = lineEndsOk + 1
+  EndIf
+  px = #NT_LX1 - 4
+  If PixelAt(px, #NT_LY0) = lineCol Or PixelAt(px, #NT_LY0 - 1) = lineCol
+    lineEndsOk = lineEndsOk + 1
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+Procedure.i Body()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define guard.i
+
+  PutNl()
+  PutS("=== pi4NeonText - glyphs, a fan and a line list, through V3D ===")
+  PutNl()
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running")
+    PutNl()
+  EndIf
+  If MailboxInit() = 0
+    PutS("verdict: NO MAILBOX")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("verdict: NO TAGS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = DisplayInit(1920, 1080, 32)
+  If r <> 1
+    PutS("    DisplayInit rc ")
+    PrintDec(r)
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = NeonArena(#NT_ARENA, #NT_ARENA_BYTES)
+  If r <> #NEON_OK
+    PutS("verdict: ARENA")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  If r <> #NEON_OK
+    PutS("verdict: SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonInit()
+  PutPad("NeonInit", 30)
+  PutErr(r)
+  PutNl()
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: NEONINIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  NeonPalette()
+  NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  BuildString()
+
+  groundCol = Neon_RGBA(#NT_GR, #NT_GG, #NT_GB, 255)
+  inkCol    = Neon_RGBA(#NT_IR, #NT_IG, #NT_IB, 255)
+  fanCol    = Neon_RGBA(#NT_FR, #NT_FG, #NT_FB, 255)
+  lineCol   = Neon_RGBA(#NT_LR, #NT_LG, #NT_LB, 255)
+  RowHex("ground", groundCol)
+  RowHex("ink", inkCol)
+  RowDec("characters in the string", ntLen)
+  RowDec("string width, pixels", Neon_TextWidth(#NEON_FONT_UI, @ntStr[0]))
+  RowDec("line height, pixels", Neon_LineHeight(#NEON_FONT_UI))
+  PutNl()
+
+  ; The guard.
+  i = 0
+  While i < 1024
+    PokeN(Neon_GuardAddr() + (i * 4), #NT_POISON)
+    i = i + 1
+  Wend
+  ; Poison the surface.
+  n = Neon_SurfaceH()
+  i = 0
+  While i < n
+    DspRowFill32(Neon_SurfaceBase() + (i * Neon_SurfacePitch()), Neon_SurfaceW(), #NT_POISON)
+    i = i + 1
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  THE FRAME
+  ; ------------------------------------------------------------------
+  r = NeonFrameBegin(groundCol)
+  If r <> #NEON_OK
+    PutS("verdict: FRAMEBEGIN")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  Neon_Text(#NEON_FONT_UI, #NT_TX, #NT_TY, @ntStr[0], inkCol)
+
+  ; A second line, RIGHT ALIGNED and CENTRED, so the two positioning
+  ; wrappers are exercised even though only the first line is counted
+  ; pixel by pixel.
+  Neon_TextRight(#NEON_FONT_UI, 1900, #NT_TY + 40, "Neon_TextRight ends here ->", Neon_C_Amb)
+  Neon_TextCentre(#NEON_FONT_UI, 0, Neon_SurfaceW(), #NT_TY + 64, "Neon_TextCentre is centred on the surface", Neon_C_Acc)
+
+  ; The fan, as a square: four points, wound in fan order - the first
+  ; point is the hub and each later point extends the fan.
+  NeonFanBegin()
+  NeonFanPoint(#NT_FX0, #NT_FY0)
+  NeonFanPoint(#NT_FX1, #NT_FY0)
+  NeonFanPoint(#NT_FX1, #NT_FY1)
+  NeonFanPoint(#NT_FX0, #NT_FY1)
+  NeonFanEnd(fanCol)
+
+  ; The line list - one horizontal segment, plus a fan of others that
+  ; are not counted but prove more than one segment goes in a list.
+  NeonLinesBegin()
+  NeonLine(#NT_LX0, #NT_LY0, #NT_LX1, #NT_LY1)
+  i = 1
+  While i < 8
+    NeonLine(#NT_LX0, #NT_LY0 + (i * 30), #NT_LX1, #NT_LY0 + (i * 30) + 20)
+    i = i + 1
+  Wend
+  NeonLinesEnd(lineCol)
+
+  RowDec("draw calls", Neon_Draws())
+  RowDec("glyphs", Neon_Glyphs())
+  RowDec("glyph rectangles", Neon_Runs())
+  RowDec("vertices", Neon_Verts())
+  UartDrain()
+
+  r = NeonFrameEnd()
+  PutPad("NeonFrameEnd", 30)
+  PutErr(r)
+  PutNl()
+  RowDec("us in FrameBegin", Neon_UsBegin())
+  RowDec("us in the cache clean", Neon_UsClean())
+  RowDec("us in the binner", Neon_UsBin())
+  RowDec("us in the renderer", Neon_UsRender())
+  RowHex("bin ERR_STAT", V3dBinErrStat())
+  RowHex("render ERR_STAT", V3dRenderErrStat())
+  RowHex("render MMU_VIO_ADDR", V3dRenderVioAddr())
+  RowDec("V3D clock, applied", V3dClockApplied())
+  RowDec("V3D clock, measured", V3dClockMeasured())
+  RowDec("V3D clock, max", V3dClockMax())
+  If r <> #NEON_OK
+    RowDec("Neon_Error", Neon_Error())
+    PutS("verdict: FRAMEEND")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE COUNTS
+  ; ------------------------------------------------------------------
+  VerifyText()
+  VerifyFan()
+  VerifyLines()
+
+  guard = 0
+  i = 0
+  While i < 1024
+    If PeekN(Neon_GuardAddr() + (i * 4)) <> #NT_POISON
+      guard = guard + 1
+    EndIf
+    i = i + 1
+  Wend
+
+  PutS("text, every pixel of the string's rectangle")
+  PutNl()
+  RowDec("ink pixels wanted", nInk)
+  RowDec("ink pixels right", nInkOk)
+  RowDec("ground pixels wanted", nBg)
+  RowDec("ground pixels right", nBgOk)
+  RowDec("first bad x", firstBadX)
+  RowDec("first bad y", firstBadY)
+  RowHex("first bad, found", firstBadGot)
+  RowHex("first bad, wanted", firstBadWant)
+  PutNl()
+
+  PutS("the convex fan")
+  PutNl()
+  RowDec("fan pixels", fanPixels)
+  RowDec("interior tested", fanIn)
+  RowDec("interior WRONG", fanInBad)
+  RowDec("exterior tested", fanOut)
+  RowDec("exterior WRONG", fanOutBad)
+  RowDec("bounding box x min", fanMinX)
+  RowDec("bounding box x max", fanMaxX)
+  RowDec("bounding box y min", fanMinY)
+  RowDec("bounding box y max", fanMaxY)
+  PutNl()
+
+  PutS("the line list")
+  PutNl()
+  RowDec("line pixels in the band", linePixels)
+  RowDec("points on the line, of 3", lineEndsOk)
+  PutNl()
+
+  RowDec("guard words touched", guard)
+  PutNl()
+
+  If guard <> 0
+    PutS("verdict: GUARD TOUCHED")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If nInkOk <> nInk Or nBgOk <> nBg
+    PutS("verdict: TEXT WRONG")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If fanInBad <> 0 Or fanOutBad <> 0
+    PutS("verdict: FAN WRONG")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If lineEndsOk <> 3
+    PutS("verdict: LINES WRONG")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutS("verdict: OK - every glyph pixel exact, fan filled, lines drawn")
+  PutNl()
+  ProcedureReturn nInkOk
+EndProcedure
+
+; ======================================================================
+;  THE WRAPPER THAT HANDS THE GPU BACK.
+;
+;  Main() is a wrapper and Body() is the program, for one reason:
+;  Body() has a dozen early returns and EVERY ONE of them has to put
+;  the V3D MMU back before the monitor gets control again. Measured on
+;  the board, 2026-08-28: a payload that left the MMU enabled with its
+;  own page table killed the VideoCore firmware's mailbox service, and
+;  the NEXT payload could not get a surface - MAIL1_STA $80000008,
+;  full of requests nobody was consuming, cleared only by a reset.
+;  See NeonShutdown() in neon.pi4 for the full note.
+;
+;  A cleanup that has to be repeated at a dozen returns is a cleanup
+;  that will be missed at one of them.
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  rc = Body()
+  NeonShutdown()
+  ProcedureReturn rc
+EndProcedure

@@ -1,0 +1,841 @@
+; ======================================================================
+; pi4DamageSelfTest.pi4 - the executable gate for RaspberryPi4/Lib/damage.pi4
+; ----------------------------------------------------------------------
+; damage.pi4 is integer rectangle arithmetic and nothing else. It opens
+; no port, touches no register, reads no framebuffer and calls nothing
+; it does not define. So unlike every other diagnostic in this folder,
+; ALL OF IT CAN BE PROVEN WITHOUT THE BOARD - and this file is written
+; so that the same binary is the proof either way.
+;
+;   on the bench     receive / run, and read the tally on the UART
+;   with no board    tools/a64/a64_damage_check.py, which builds THIS
+;                    file and executes it on the project's A64 oracle
+;
+; Vault rule 17 says the gate runs on the board when the board is
+; attached, and it is right, and it is not in tension with this: what
+; forced the emulator historically was a verdict living in SRAM that
+; had to be read out of a memory dump. This program prints its verdict
+; over the UART, so the board run is strictly stronger and the oracle
+; run is available when nobody is at the bench. Rule 17's own list of
+; what the emulator stays right for begins with "no-board runs".
+;
+; DIAGNOSTIC. Does not ship (rule 19).
+;
+;   PureMetalForge.exe --compile RaspberryPi4\Examples\Diagnostics\NotBuilding\pi4DamageSelfTest.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o _work\damage.img
+;
+; NOTHING HERE NEEDS A DISPLAY, A MAILBOX OR A DEADMAN. It runs in a
+; few milliseconds and returns. `deadman 15` costs nothing and is still
+; the house habit.
+;
+; ======================================================================
+; WHAT IS BEING PROVEN, AND WHY THESE PROPERTIES AND NOT OTHERS
+; ======================================================================
+; A coalescer is easy to test badly. The temptation is to assert the
+; rectangles that come out of a particular sequence, which pins the
+; IMPLEMENTATION rather than the CONTRACT: change the merge order and
+; sixty assertions go red having found no defect at all.
+;
+; So the checks below are built on four properties that must hold for
+; any correct coalescer, plus the small number of exact outcomes the
+; rule genuinely promises:
+;
+;   SOUNDNESS      every rectangle ever added is still wholly covered
+;                  by ONE kept rectangle. This is the property that
+;                  matters: a coalescer that loses area does not draw a
+;                  slow picture, it draws a WRONG picture, and it does
+;                  it intermittently, at the edges, in a way that reads
+;                  as a rendering bug three layers down.
+;
+;   DISJOINTNESS   no two kept rectangles overlap. damage.pi4's header
+;                  explains at length that this is a correctness
+;                  requirement of the blended repaint stage 1 adds, not
+;                  a tidiness preference, and that the defect it
+;                  prevents does not exist yet - which is exactly why
+;                  it needs a test now, while somebody is looking.
+;
+;   BOUNDEDNESS    the kept count never exceeds the configured limit.
+;
+;   ORDER          the same damage reported in a different order
+;                  produces the same set. Without this, a timing
+;                  comparison between two frames is not comparing
+;                  anything, because the repaint cost would depend on
+;                  the order the widget tree happened to walk.
+;
+; The exact-outcome checks are confined to the places where the rule
+; makes a precise promise: the clip, the containment early-out, the
+; half-open edge comparison, and the slack threshold's boundary. The
+; boundary is checked from BOTH sides - a threshold tested only from
+; the inside is a threshold that could be off by any amount at all.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/damage.pi4"
+
+
+; ======================================================================
+;  THE TALLY
+;
+;  Every check prints its own line whether it passed or failed, rather
+;  than only reporting failures. A silent pass is indistinguishable
+;  from a check that never ran, and a gate that can skip itself without
+;  saying so is the shape of defect this project's whole philosophy is
+;  aimed at.
+; ======================================================================
+
+Global tPass.i = 0
+Global tFail.i = 0
+Global tNum.i = 0
+
+; No character literals - house rule. 32 is space, 46 the full stop,
+; 48 the digit zero, 58 the colon.
+Procedure THead(*name)
+  tNum = tNum + 1
+  If tNum < 10
+    UartWrite(32)
+  EndIf
+  PrintDec(tNum)
+  UartWrite(46)                              ; 46 is the full stop
+  UartWrite(32)
+  UartWriteStr(*name)
+EndProcedure
+
+Procedure TPad(n.i)
+  Define i.i
+  i = n
+  While i > 0
+    UartWrite(32)
+    i = i - 1
+  Wend
+EndProcedure
+
+; TOk - the check passed. TBad - it did not, and the two numbers that
+; disagreed are printed, because "check 14 failed" without them costs
+; the next person a rebuild to find out by how much.
+Procedure TOk()
+  UartWriteStr("  PASS")
+  PrintNl()
+  tPass = tPass + 1
+EndProcedure
+
+Procedure TBad(got.i, want.i)
+  UartWriteStr("  ** FAIL **  got ")
+  PrintDec(got)
+  UartWriteStr(", wanted ")
+  PrintDec(want)
+  PrintNl()
+  tFail = tFail + 1
+EndProcedure
+
+Procedure TEq(*name, got.i, want.i)
+  THead(*name)
+  If got = want
+    TOk()
+  Else
+    TBad(got, want)
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  A DETERMINISTIC PSEUDO-RANDOM SOURCE FOR THE STRESS CHECK
+;
+;  A 64-bit xorshift, seeded with a constant. DETERMINISTIC IS THE
+;  POINT: a stress test that draws different rectangles on every run
+;  finds a defect once and then cannot reproduce it, which is worse
+;  than not finding it - the next run is green and the report reads as
+;  a flake. This sequence is the same on the board, in the oracle, and
+;  in six months.
+;
+;  Every shift is parenthesised. On this compiler & and | bind TIGHTER
+;  than << and >>, so "v >> 12 & 255" parses as "v >> (12 & 255)" -
+;  display.pi4:416-421 lists this as one of its three 64-bit traps.
+; ======================================================================
+
+Global rngState.i = $2545F4914F6CDD1D
+
+Procedure.i RngNext()
+  Define v.i
+  v = rngState
+  v = v ! (v << 13)
+  v = v ! ((v >> 7) & $01FFFFFFFFFFFFFF)
+  v = v ! (v << 17)
+  rngState = v
+  If v < 0
+    v = 0 - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure.i RngBelow(n.i)
+  If n < 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn RngNext() % n
+EndProcedure
+
+
+; ======================================================================
+;  THE STRESS CHECK'S RECORD OF WHAT IT ASKED FOR
+;
+;  Kept so that soundness can be asserted against every rectangle ever
+;  added, not just against the last one. The originals are stored
+;  CLIPPED, because that is what damage.pi4 promised to cover - an
+;  unclipped rectangle's off-surface part is not damage and nothing is
+;  going to repaint it.
+; ======================================================================
+
+#ST_MAX = 200
+
+Global Dim stX.i[#ST_MAX]
+Global Dim stY.i[#ST_MAX]
+Global Dim stW.i[#ST_MAX]
+Global Dim stH.i[#ST_MAX]
+Global stN.i = 0
+
+Procedure StRecord(x.i, y.i, w.i, h.i, sw.i, sh.i)
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+  If stN >= #ST_MAX
+    ProcedureReturn
+  EndIf
+  x0 = x
+  y0 = y
+  x1 = x + w
+  y1 = y + h
+  If x0 < 0
+    x0 = 0
+  EndIf
+  If y0 < 0
+    y0 = 0
+  EndIf
+  If x1 > sw
+    x1 = sw
+  EndIf
+  If y1 > sh
+    y1 = sh
+  EndIf
+  If x1 <= x0
+    ProcedureReturn
+  EndIf
+  If y1 <= y0
+    ProcedureReturn
+  EndIf
+  stX[stN] = x0
+  stY[stN] = y0
+  stW[stN] = x1 - x0
+  stH[stN] = y1 - y0
+  stN = stN + 1
+EndProcedure
+
+; How many of the recorded rectangles are NOT wholly inside some single
+; kept rectangle. Zero is the only acceptable answer; the count rather
+; than a flag so that a failure says how badly.
+Procedure.i StUncovered()
+  Define i.i
+  Define bad.i
+  bad = 0
+  i = 0
+  While i < stN
+    If DamageCovers(stX[i], stY[i], stW[i], stH[i]) = 0
+      bad = bad + 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn bad
+EndProcedure
+
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+Procedure.i Main()
+  Define rc.i
+  Define i.i
+  Define n1.i
+  Define a1.i
+  Define bx1.i
+  Define by1.i
+  Define bw1.i
+  Define bh1.i
+
+  UartInit(115200)
+  PrintNl()
+  UartWriteStr("=== pi4DamageSelfTest - the gate for RaspberryPi4/Lib/damage.pi4 ===")
+  PrintNl()
+  UartWriteStr("No display, no mailbox, no hardware. Integer rectangle arithmetic only.")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  A. REFUSALS BEFORE ANYTHING IS SET UP
+  ;
+  ;  These run FIRST, before DamageBind, because they are the only
+  ;  checks that can see the unbound state and once it is gone it does
+  ;  not come back.
+  ; ------------------------------------------------------------------
+  UartWriteStr("-- A. refusals")
+  PrintNl()
+
+  TEq("DamageAdd before DamageBind refuses          ", DamageAdd(0, 0, 10, 10), #DMG_EBOUNDS)
+  TEq("...and DamageLastError says the same         ", DamageLastError(), #DMG_EBOUNDS)
+  TEq("DamageAddAll before DamageBind refuses       ", DamageAddAll(), #DMG_EBOUNDS)
+  TEq("DamageBound is 0 before the bind             ", DamageBound(), 0)
+  TEq("DamageBind refuses a zero width              ", DamageBind(0, 1080), #DMG_EARGS)
+  TEq("DamageBind refuses a negative height         ", DamageBind(1920, -1), #DMG_EARGS)
+  TEq("a refused bind leaves it unbound             ", DamageBound(), 0)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  B. THE BIND, AND THE CLIP
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- B. bind and clip, on a 1920 x 1080 surface")
+  PrintNl()
+
+  TEq("DamageBind(1920, 1080) accepts               ", DamageBind(1920, 1080), #DMG_OK)
+  TEq("DamageBound is 1 now                         ", DamageBound(), 1)
+  TEq("the surface width came back                  ", DamageSurfaceWidth(), 1920)
+  TEq("the surface height came back                 ", DamageSurfaceHeight(), 1080)
+  TEq("a fresh bind holds nothing                   ", DamageCount(), 0)
+  TEq("...and reports itself empty                  ", DamageEmpty(), 1)
+
+  DamageReset()
+  DamageAdd(-10, -20, 30, 40)
+  TEq("a rect straddling the origin is kept         ", DamageCount(), 1)
+  TEq("...clipped to x = 0                          ", DamageRectX(0), 0)
+  TEq("...clipped to y = 0                          ", DamageRectY(0), 0)
+  TEq("...width 30-10 = 20                          ", DamageRectW(0), 20)
+  TEq("...height 40-20 = 20                         ", DamageRectH(0), 20)
+
+  DamageReset()
+  DamageAdd(1900, 1070, 100, 100)
+  TEq("a rect over the far corner is kept           ", DamageCount(), 1)
+  TEq("...clipped to width 20                       ", DamageRectW(0), 20)
+  TEq("...clipped to height 10                      ", DamageRectH(0), 10)
+
+  DamageReset()
+  TEq("a rect wholly off the surface is accepted    ", DamageAdd(5000, 5000, 10, 10), #DMG_OK)
+  TEq("...and produces no damage at all             ", DamageCount(), 0)
+  TEq("a zero-width rect produces no damage         ", DamageCount(), 0)
+
+  DamageReset()
+  DamageAdd(10, 10, 0, 50)
+  TEq("a zero-width rect is not kept                ", DamageCount(), 0)
+  DamageAdd(10, 10, 50, 0)
+  TEq("a zero-height rect is not kept               ", DamageCount(), 0)
+  DamageAdd(10, 10, -5, 50)
+  TEq("a negative-width rect is not kept            ", DamageCount(), 0)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  C. CONTAINMENT - the commonest case in a real frame
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- C. containment")
+  PrintNl()
+
+  DamageStatsReset()
+  DamageSetSlack(0)
+  DamageReset()
+  DamageAdd(100, 100, 200, 200)
+  DamageAdd(120, 120, 20, 20)
+  TEq("a rect inside a kept one adds nothing        ", DamageCount(), 1)
+  TEq("...and the outer rect is unchanged in x      ", DamageRectX(0), 100)
+  TEq("...unchanged in width                        ", DamageRectW(0), 200)
+  TEq("...and it was counted as contained           ", DamageStatContained(), 1)
+  TEq("an identical rect is also contained          ", DamageAdd(100, 100, 200, 200), #DMG_OK)
+  TEq("...still one rectangle                       ", DamageCount(), 1)
+  TEq("...and two containments now                  ", DamageStatContained(), 2)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  D. THE HALF-OPEN EDGE, AND THE FORCED MERGE
+  ;
+  ;  The two rules that are NOT tuning: touching rectangles do not
+  ;  overlap, and overlapping rectangles are merged whatever the slack
+  ;  says. Slack is 0 throughout this section so that nothing else can
+  ;  be responsible for a merge.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- D. the half-open edge, and the mandatory merge")
+  PrintNl()
+
+  DamageSetSlack(0)
+  DamageStatsReset()
+  DamageReset()
+  DamageAdd(0, 0, 100, 10)
+  DamageAdd(0, 10, 100, 10)
+  TEq("edge-sharing rects merge (waste is 0)        ", DamageCount(), 1)
+  TEq("...into a 100 x 20                           ", DamageRectH(0), 20)
+  TEq("...by the SLACK rule, not the overlap rule   ", DamageStatOverlaps(), 0)
+  TEq("...one slack merge                           ", DamageStatMerges(), 1)
+
+  DamageSetSlack(0)
+  DamageStatsReset()
+  DamageReset()
+  DamageAdd(0, 0, 100, 10)
+  DamageAdd(0, 11, 100, 10)
+  TEq("a one-row gap at slack 0 stays two rects     ", DamageCount(), 2)
+  TEq("...no merges at all                          ", DamageStatMerges(), 0)
+
+  DamageSetSlack(0)
+  DamageStatsReset()
+  DamageReset()
+  DamageAdd(0, 0, 100, 100)
+  DamageAdd(50, 50, 100, 100)
+  TEq("overlapping rects merge even at slack 0      ", DamageCount(), 1)
+  TEq("...by the OVERLAP rule                       ", DamageStatOverlaps(), 1)
+  TEq("...union x0 = 0                              ", DamageRectX(0), 0)
+  TEq("...union y0 = 0                              ", DamageRectY(0), 0)
+  TEq("...union width 150                           ", DamageRectW(0), 150)
+  TEq("...union height 150                          ", DamageRectH(0), 150)
+
+  ; THE CASCADE. This is the case a single-pass absorber gets wrong:
+  ; the new rectangle touches A and B, and after absorbing A it is
+  ; bigger and only then reaches B. Written as a check because a
+  ; single-pass version passes every other test in this file.
+  DamageSetSlack(0)
+  DamageStatsReset()
+  DamageReset()
+  DamageAdd(0, 0, 100, 100)
+  DamageAdd(200, 0, 100, 100)
+  TEq("two far-apart rects stay apart at slack 0    ", DamageCount(), 2)
+  DamageAdd(90, 0, 120, 100)
+  TEq("a bridge across both collapses to one        ", DamageCount(), 1)
+  TEq("...spanning x 0                              ", DamageRectX(0), 0)
+  TEq("...to x 300, so width 300                    ", DamageRectW(0), 300)
+  TEq("...two overlaps were absorbed                ", DamageStatOverlaps(), 2)
+  TEq("...and the set is disjoint                   ", DamageDisjoint(), 1)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  E. THE SLACK THRESHOLD, FROM BOTH SIDES
+  ;
+  ;  Two 100 x 10 rectangles with a two-row gap. Union is 100 x 22 =
+  ;  2200; the parts are 1000 each; so the merge wastes exactly 200
+  ;  pixels. A threshold tested only from the inside could be off by
+  ;  any amount, so both 200 and 199 are checked.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- E. the slack threshold, from both sides (the merge wastes 200 px)")
+  PrintNl()
+
+  DamageSetSlack(199)
+  DamageReset()
+  DamageAdd(0, 0, 100, 10)
+  DamageAdd(0, 12, 100, 10)
+  TEq("slack 199: 200 px of waste is refused        ", DamageCount(), 2)
+
+  DamageSetSlack(200)
+  DamageReset()
+  DamageAdd(0, 0, 100, 10)
+  DamageAdd(0, 12, 100, 10)
+  TEq("slack 200: 200 px of waste is taken          ", DamageCount(), 1)
+  TEq("...and the union is 100 x 22                 ", DamageRectH(0), 22)
+
+  TEq("DamageSetSlack refuses a negative            ", DamageSetSlack(-1), #DMG_ESLACK)
+  TEq("...and the old slack survived the refusal    ", DamageSlack(), 200)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  F. ORDER INDEPENDENCE
+  ;
+  ;  Three 100 x 100 rectangles stacked with 50-pixel gaps, and a slack
+  ;  of exactly 5000 - the waste of merging two ADJACENT members of the
+  ;  stack. Merging the two OUTER ones first would waste 20000 and is
+  ;  refused.
+  ;
+  ;  Added in the order A, B, C the middle one bridges as it arrives.
+  ;  Added A, C, B the middle one arrives last and has to bridge a set
+  ;  that is already split - which only works because the slack pass
+  ;  runs to FIXPOINT rather than taking one merge and stopping. That
+  ;  is the property this check exists for; an earlier draft took the
+  ;  single cheapest merge and left the third rectangle behind, and it
+  ;  produced two different repaint costs for the same frame depending
+  ;  on which way the widget tree happened to be walked.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- F. order independence (slack 5000, three 100x100 with 50 px gaps)")
+  PrintNl()
+
+  DamageSetSlack(5000)
+  DamageReset()
+  DamageAdd(0,   0, 100, 100)
+  DamageAdd(0, 150, 100, 100)
+  DamageAdd(0, 300, 100, 100)
+  n1 = DamageCount()
+  a1 = DamageArea()
+  bx1 = DamageBoundsX()
+  by1 = DamageBoundsY()
+  bw1 = DamageBoundsW()
+  bh1 = DamageBoundsH()
+  TEq("order A,B,C collapses to one rectangle       ", n1, 1)
+  TEq("...covering y 0 to 400, so height 400        ", bh1, 400)
+
+  DamageReset()
+  DamageAdd(0,   0, 100, 100)
+  DamageAdd(0, 300, 100, 100)
+  DamageAdd(0, 150, 100, 100)
+  TEq("order A,C,B gives the same count             ", DamageCount(), n1)
+  TEq("...the same area                             ", DamageArea(), a1)
+  TEq("...the same bounds x                         ", DamageBoundsX(), bx1)
+  TEq("...the same bounds y                         ", DamageBoundsY(), by1)
+  TEq("...the same bounds w                         ", DamageBoundsW(), bw1)
+  TEq("...the same bounds h                         ", DamageBoundsH(), bh1)
+
+  DamageReset()
+  DamageAdd(0, 300, 100, 100)
+  DamageAdd(0, 150, 100, 100)
+  DamageAdd(0,   0, 100, 100)
+  TEq("order C,B,A gives the same count             ", DamageCount(), n1)
+  TEq("...and the same area                         ", DamageArea(), a1)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  G. THE LIMIT
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- G. the rectangle limit")
+  PrintNl()
+
+  TEq("DamageSetLimit refuses zero                  ", DamageSetLimit(0), #DMG_ELIMIT)
+  TEq("DamageSetLimit refuses above #DMG_MAX        ", DamageSetLimit(#DMG_MAX + 1), #DMG_ELIMIT)
+  TEq("DamageSetLimit(2) accepts                    ", DamageSetLimit(2), #DMG_OK)
+
+  DamageSetSlack(0)
+  DamageStatsReset()
+  DamageReset()
+  DamageAdd(   0,   0, 40, 40)
+  DamageAdd( 500,   0, 40, 40)
+  DamageAdd(1000,   0, 40, 40)
+  DamageAdd(   0, 500, 40, 40)
+  DamageAdd(1000, 500, 40, 40)
+  TEq("five scattered rects, limit 2 -> two kept    ", DamageCount(), 2)
+  TEq("...forced merges happened                    ", DamageStatForced(), 3)
+  TEq("...and the result is still disjoint          ", DamageDisjoint(), 1)
+  TEq("...the peak never exceeded the limit         ", DamageStatPeak(), 2)
+
+  ; LOWERING THE LIMIT UNDER A LIVE SET collapses immediately - the
+  ; alternative leaves DamageCount() above a limit that was just
+  ; accepted, and a caller sizing an array off DamageLimit() would then
+  ; be handed more rectangles than it can hold.
+  TEq("lowering the limit to 1 collapses at once    ", DamageSetLimit(1), #DMG_OK)
+  TEq("...to a single rectangle                     ", DamageCount(), 1)
+  TEq("...still covering the far corner in x        ", DamageRectW(0), 1040)
+  TEq("...and in y                                  ", DamageRectH(0), 540)
+
+  DamageSetLimit(#DMG_LIMIT_DEFAULT)
+  TEq("the limit came back                          ", DamageLimit(), #DMG_LIMIT_DEFAULT)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  H. THE ACCESSORS AND THEIR REFUSALS
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- H. accessors")
+  PrintNl()
+
+  DamageSetSlack(0)
+  DamageReset()
+  DamageAdd(100, 200, 30, 40)
+  DamageAdd(900, 200, 30, 40)
+  TEq("two rects, exact area 30*40 twice            ", DamageArea(), 2400)
+  TEq("bounds x is the leftmost edge                ", DamageBoundsX(), 100)
+  TEq("bounds y                                     ", DamageBoundsY(), 200)
+  TEq("bounds w spans both                          ", DamageBoundsW(), 830)
+  TEq("bounds h                                     ", DamageBoundsH(), 40)
+  TEq("DamageRectX out of range returns 0           ", DamageRectX(9), 0)
+  TEq("...and sets #DMG_EINDEX                      ", DamageLastError(), #DMG_EINDEX)
+  TEq("DamageRectW out of range returns 0           ", DamageRectW(-1), 0)
+  TEq("DamageHitsRect out of range returns 0        ", DamageHitsRect(9, 0, 0, 10, 10), 0)
+
+  TEq("DamageHits over the first rect               ", DamageHits(105, 205, 4, 4), 1)
+  TEq("DamageHits over the second rect              ", DamageHits(905, 205, 4, 4), 1)
+  TEq("DamageHits in the gap between them           ", DamageHits(500, 205, 4, 4), 0)
+  TEq("DamageHits just left of the first            ", DamageHits(96, 205, 4, 4), 0)
+  TEq("DamageHits touching the left edge            ", DamageHits(96, 205, 5, 4), 1)
+  TEq("DamageHits on a zero-width probe             ", DamageHits(105, 205, 0, 4), 0)
+  TEq("DamageCovers a rect inside one               ", DamageCovers(105, 205, 4, 4), 1)
+  TEq("DamageCovers a rect spanning both            ", DamageCovers(105, 205, 800, 4), 0)
+
+  DamageReset()
+  TEq("an empty set has count 0                     ", DamageCount(), 0)
+  TEq("...area 0                                    ", DamageArea(), 0)
+  TEq("...bounds x 0                                ", DamageBoundsX(), 0)
+  TEq("...bounds w 0                                ", DamageBoundsW(), 0)
+  TEq("...and hits nothing                          ", DamageHits(0, 0, 1920, 1080), 0)
+
+  DamageAddAll()
+  TEq("DamageAddAll gives one rectangle             ", DamageCount(), 1)
+  TEq("...of the whole surface area                 ", DamageArea(), 1920 * 1080)
+  TEq("...and it hits everywhere                    ", DamageHits(1919, 1079, 1, 1), 1)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  I. THE STRESS CHECK - soundness under 200 arbitrary rectangles
+  ;
+  ;  This is the one that would catch a coalescer that loses area, and
+  ;  it is the reason StRecord keeps every rectangle it asked for. The
+  ;  sequence is deterministic (see RngNext) so a failure here can be
+  ;  reproduced exactly rather than reported as a flake.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- I. stress: 200 arbitrary rects, limit 8, slack 256")
+  PrintNl()
+
+  DamageSetLimit(8)
+  DamageSetSlack(256)
+  DamageStatsReset()
+  DamageReset()
+  stN = 0
+  rngState = $2545F4914F6CDD1D
+
+  ; WIDGET-SIZED, NOT SCREEN-SIZED. A first version drew rectangles up
+  ; to 300 x 300 and every run collapsed to the whole surface, because
+  ; two hundred of those cover 1920 x 1080 several times over. It
+  ; passed, and it proved only that a coalescer which returns "all of
+  ; it" is sound - which is true and useless. 4 to 64 pixels is the
+  ; size range a UI actually damages: a caret, a checkbox, a label, a
+  ; scrollbar thumb.
+  i = 0
+  While i < 200
+    n1 = RngBelow(2000) - 40
+    a1 = RngBelow(1120) - 40
+    bx1 = 4 + RngBelow(61)
+    by1 = 4 + RngBelow(61)
+    StRecord(n1, a1, bx1, by1, 1920, 1080)
+    DamageAdd(n1, a1, bx1, by1)
+    i = i + 1
+  Wend
+
+  UartWriteStr("   ")
+  PrintDec(stN)
+  UartWriteStr(" of 200 rectangles carried area after clipping")
+  PrintNl()
+  UartWriteStr("   kept ")
+  PrintDec(DamageCount())
+  UartWriteStr(", area ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px of ")
+  PrintDec(1920 * 1080)
+  PrintNl()
+  UartDrain()
+
+  TEq("SOUNDNESS: nothing added was lost            ", StUncovered(), 0)
+  TEq("DISJOINTNESS: no two kept rects overlap      ", DamageDisjoint(), 1)
+  TEq("BOUNDEDNESS: the count is within the limit   ", DamageCount() <= 8, 1)
+  TEq("...and the peak never exceeded it either     ", DamageStatPeak() <= 8, 1)
+  TEq("the exact area cannot exceed the surface     ", DamageArea() <= (1920 * 1080), 1)
+
+  ; A SECOND PASS OVER THE SAME SET MUST ADD NOTHING. Every rectangle
+  ; is already covered, so the coalescer should take the containment
+  ; early-out 200 times and change no geometry at all. It is a cheap
+  ; check and it catches an off-by-one in DmgInside that the soundness
+  ; check cannot see - DmgInside being too STRICT loses no area, it
+  ; just quietly stops the fast path from ever firing.
+  n1 = DamageCount()
+  a1 = DamageArea()
+  DamageStatsReset()
+  i = 0
+  While i < stN
+    DamageAdd(stX[i], stY[i], stW[i], stH[i])
+    i = i + 1
+  Wend
+  TEq("replaying the same damage changes no count   ", DamageCount(), n1)
+  TEq("...and no area                               ", DamageArea(), a1)
+  TEq("...every one taking the containment path     ", DamageStatContained(), stN)
+  TEq("...with no merges at all                     ", DamageStatMerges(), 0)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  J. THE STRESS CHECK AT SLACK 0 - the degenerate case, on purpose
+  ;
+  ;  Slack 0 with a limit of 16 is the setting that keeps the most
+  ;  rectangles, and it is the arrangement the header warns about: a
+  ;  naive list of many tiny rectangles. It must still be sound and
+  ;  still be disjoint. If the invariants only hold at the default
+  ;  tuning they are not invariants.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- J. the same 200, at slack 0 and limit 16")
+  PrintNl()
+
+  DamageSetLimit(#DMG_MAX)
+  DamageSetSlack(0)
+  DamageStatsReset()
+  DamageReset()
+  i = 0
+  While i < stN
+    DamageAdd(stX[i], stY[i], stW[i], stH[i])
+    i = i + 1
+  Wend
+
+  UartWriteStr("   kept ")
+  PrintDec(DamageCount())
+  UartWriteStr(" rectangles, area ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px")
+  PrintNl()
+
+  TEq("SOUNDNESS holds at slack 0 too               ", StUncovered(), 0)
+  TEq("DISJOINTNESS holds at slack 0 too            ", DamageDisjoint(), 1)
+  TEq("BOUNDEDNESS: within #DMG_MAX                 ", DamageCount() <= #DMG_MAX, 1)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  K. REBINDING
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- K. rebinding")
+  PrintNl()
+
+  TEq("a rebind to a smaller surface accepts        ", DamageBind(640, 480), #DMG_OK)
+  TEq("...and throws the old rectangles away        ", DamageCount(), 0)
+  DamageAdd(600, 400, 200, 200)
+  TEq("...clipping to the NEW extent, width 40      ", DamageRectW(0), 40)
+  TEq("...and height 80                             ", DamageRectH(0), 80)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  L. THE FRAMES A REAL UI ACTUALLY PRODUCES
+  ;
+  ;  Everything above proves the coalescer is CORRECT. This section
+  ;  proves the default tuning is USEFUL, which is a different claim
+  ;  and the one the 256-pixel slack was derived for. The rectangles
+  ;  are the ones the Neon chrome screen really damages, at the sizes
+  ;  it really damages them:
+  ;
+  ;    a caret          2 x 16    the smallest thing in the UI
+  ;    a button + glow  158 x 38  the hover case, with Neon_Glow's
+  ;                               four-pixel ring included
+  ;    a list well      364 x 360 the scroll case
+  ;
+  ;  Every count below is what SHOULD happen if the derivation in
+  ;  damage.pi4's header is right - one extra rectangle costs about
+  ;  27 us of repaint driver, one wasted pixel about 148 ns, so the
+  ;  break-even is 182 pixels and the default slack is 256.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- L. the frames a real UI produces, at the default tuning")
+  PrintNl()
+
+  DamageBind(1920, 1080)
+  DamageSetLimit(#DMG_LIMIT_DEFAULT)
+  DamageSetSlack(#DMG_SLACK_DEFAULT)
+
+  DamageReset()
+  DamageAdd(1400, 300, 2, 16)
+  TEq("a caret blink is one rectangle               ", DamageCount(), 1)
+  TEq("...of exactly 32 pixels                      ", DamageArea(), 32)
+
+  ; A HOVER MOVING BETWEEN TWO DISTANT BUTTONS. Both must be repainted
+  ; - the one losing the glow as much as the one gaining it - and they
+  ; must NOT be merged: the union of two 158 x 38 buttons 500 pixels
+  ; apart is 658 x 38, which wastes 12,996 pixels. At 148 ns that is
+  ; 1.9 ms to save 27 us, and the rule says no.
+  DamageReset()
+  DamageAdd(1000, 800, 158, 38)
+  DamageAdd(1500, 800, 158, 38)
+  TEq("a hover moving 500 px apart stays two rects  ", DamageCount(), 2)
+  TEq("...touching 2 x 6004 = 12008 px              ", DamageArea(), 12008)
+
+  ; THE SAME TWO BUTTONS SIDE BY SIDE, with the twelve-pixel gutter the
+  ; screen actually uses between its buttons. Union 328 x 38 = 12,464
+  ; against 12,008, so the merge wastes 456 - still refused at 256, and
+  ; correctly: 456 wasted pixels is 67 us against a 27 us saving.
+  DamageReset()
+  DamageAdd(1000, 800, 158, 38)
+  DamageAdd(1170, 800, 158, 38)
+  TEq("adjacent buttons, 12 px gutter, stay apart   ", DamageCount(), 2)
+
+  ; CLOSE THE GAP TO FOUR PIXELS and the arithmetic flips: union
+  ; 320 x 38 = 12,160, waste 152, under the threshold, so one rectangle.
+  ; THE THRESHOLD IS DOING REAL WORK IN THE MIDDLE OF THE RANGE A UI
+  ; LIVES IN - it is not a formality that always fires or never does.
+  DamageReset()
+  DamageAdd(1000, 800, 158, 38)
+  DamageAdd(1162, 800, 158, 38)
+  TEq("...but at a 4 px gap they merge              ", DamageCount(), 1)
+  TEq("...into 320 x 38                             ", DamageArea(), 12160)
+
+  ; THE BUSIEST REALISTIC FRAME: a hover leaves one button and arrives
+  ; at another, a caret blinks in a field on the far side of the
+  ; screen, and a clock ticks in the status bar. Four separate events,
+  ; and the answer must be four rectangles - not one bounding box over
+  ; the whole window, which is what a scheme without a cost model
+  ; produces and which would be 1.9 million pixels instead of 19,000.
+  DamageReset()
+  DamageAdd(1000, 800, 158, 38)
+  DamageAdd(1500, 800, 158, 38)
+  DamageAdd( 400, 300,   2, 16)
+  DamageAdd(1700, 960,  64, 16)
+  TEq("hover + hover + caret + clock = four rects   ", DamageCount(), 4)
+  TEq("...and the exact area is 13064 px            ", DamageArea(), 13064)
+  TEq("...against a full surface of 2073600         ", 1920 * 1080, 2073600)
+  TEq("...still disjoint                            ", DamageDisjoint(), 1)
+
+  ; The bounding box of that same frame, for the comparison the
+  ; tile-versus-rectangle argument turns on. 1300 x 676 = 878,800 px -
+  ; SIXTY-SEVEN TIMES the exact damage, for a frame in which four
+  ; small things moved. This is the number that says why the merge rule
+  ; has a threshold instead of just taking the union.
+  UartWriteStr("   exact damage ")
+  PrintDec(DamageArea())
+  UartWriteStr(" px; the bounding box would be ")
+  PrintDec(DamageBoundsW() * DamageBoundsH())
+  UartWriteStr(" px")
+  PrintNl()
+
+  ; A LIST SCROLLED BY ONE ROW damages its whole well, and that is
+  ; correct and unavoidable with a software fill - every row moved.
+  ; It is here to keep the scale honest: dirty rectangles are not
+  ; uniformly a hundredfold win, and a scroll is the case where they
+  ; are only a sevenfold one.
+  DamageReset()
+  DamageAdd(18, 122, 364, 360)
+  TEq("a one-row list scroll damages the whole well ", DamageCount(), 1)
+  TEq("...131040 px, which is 6.3% of the surface   ", DamageArea(), 131040)
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  THE TALLY
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("======================================================================")
+  PrintNl()
+  UartWriteStr("  checks run   ")
+  PrintDec(tNum)
+  PrintNl()
+  UartWriteStr("  passed       ")
+  PrintDec(tPass)
+  PrintNl()
+  UartWriteStr("  FAILED       ")
+  PrintDec(tFail)
+  PrintNl()
+  If tFail = 0
+    UartWriteStr("  VERDICT      GREEN - damage.pi4's coalescer holds all four properties.")
+    PrintNl()
+  Else
+    UartWriteStr("  VERDICT      RED. Do not use the damage layer until this is zero.")
+    PrintNl()
+    UartWriteStr("               Each failing line above prints what it got and what it")
+    PrintNl()
+    UartWriteStr("               wanted; the stress sequence is deterministic, so it")
+    PrintNl()
+    UartWriteStr("               reproduces exactly on the next run.")
+    PrintNl()
+  EndIf
+  UartWriteStr("======================================================================")
+  PrintNl()
+  UartDrain()
+
+  ; The return value IS the verdict, so a harness that cannot read the
+  ; serial line can still tell. Anvil prints x0 when a payload returns.
+  ProcedureReturn tFail
+EndProcedure

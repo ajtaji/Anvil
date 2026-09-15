@@ -1,0 +1,311 @@
+; pi4Install.pi4 - write a new Anvil onto the stick, from the board.
+;
+; DIAGNOSTIC / TOOL. Does not ship, but it is how Anvil got installed.
+;
+; THE BOOTSTRAP PROBLEM THIS SOLVES. Anvil is now the boot image. The
+; copy currently on the stick predates the bridge bus-number fix, so its
+; USB does not work, so it cannot use its own save command to replace
+; itself. And U-Boot is no longer what the firmware boots, and cannot be
+; chainloaded - it is linked for $80000 and is not position-independent,
+; which was established the expensive way.
+;
+; So the new code has to arrive some other way, run from somewhere else,
+; and write the stick itself. That is this: a payload loaded over the
+; serial line to $400000, carrying the fixed PCIe path inside it, which
+; brings USB up properly and writes two files.
+;
+; WHAT IT WRITES, AND WHY THOSE TWO
+;
+;   HISTORICAL NOTE, 2026-08-26: the two size constraints below are
+;   GONE. fat.pi4 now allocates, extends and truncates, so neither the
+;   image nor config.txt has to be padded to a fixed size. This file
+;   is kept as the record of how Anvil was first installed, when the
+;   only writer available could overwrite in place and nothing more.
+;
+;   KERNEL8.IMG   gets the new Anvil. Not ANVIL.IMG, because that slot
+;                 is 216604 bytes and the new build is 223948, and
+;                 fat.pi4 will not grow a file - see the long note above
+;                 FatOverwrite for why it refuses to allocate clusters.
+;                 KERNEL8.IMG is 692400 bytes: U-Boot's old slot, and
+;                 room for a long time.
+;
+;   CONFIG.TXT    repointed at kernel8.img. It has to stay EXACTLY 1489
+;                 bytes, because the same restriction applies to it.
+;
+; WHAT IS LOST: U-Boot. It was the recovery path, and it is being
+; overwritten deliberately and with permission. What replaces it:
+;
+;   * ANVIL.IMG, the older build, is still on the stick and still boots.
+;     Recovery is editing one line of config.txt back to it.
+;   * Anvil's own save command, which is what made U-Boot's fatwrite
+;     unnecessary in the first place.
+;
+; THE IMAGES ARE ALREADY IN RAM when this runs. The host puts them
+; there with the monitor's receive command before running this:
+;
+;     receive 1000000 <len> <crc>     the padded Anvil
+;     receive 1800000 5D1 <crc>       the new config.txt
+;     run 400000
+;
+; PADDING IS THE HOST'S JOB. FatOverwrite takes the file's exact length
+; and nothing else, so the host pads the image up to 692400 with zeros.
+; The slack is loaded into RAM after Anvil at $200000, reaching $2A9000,
+; still inside the window the monitor reserves for itself.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/usbmsc.pi4"
+XIncludeFile "RaspberryPi4/Lib/emmc.pi4"
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+
+#IMG_ADDR   = $1000000
+#IMG_BYTES  = 692400          ; KERNEL8.IMG's size on the stick
+#CFG_ADDR   = $1800000
+#CFG_BYTES  = 1489            ; CONFIG.TXT's size on the stick
+
+Global Dim gCfgBuf.a[512]
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; Bring the USB medium up. This is the same sequence the monitor's
+; UsbDiskUp does, and it is repeated here rather than shared because a
+; library never includes a library and this file is the main one.
+Procedure.i UsbUp()
+  Define p.i
+  Define n.i
+  Define got.i
+  Define speed.i
+  Define slot.i
+  Define total.i
+  Define off.i
+  Define len.i
+  Define typ.i
+  Define cls.i
+  Define sub.i
+  Define prot.i
+  Define epOut.i
+  Define epIn.i
+  Define mpsOut.i
+  Define mpsIn.i
+  Define cfgVal.i
+  Define found.i
+
+  If PcieInit() = 0
+    UartWriteStr("pcie: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If PcieEnumerate() = 0
+    UartWriteStr("pcie enumerate: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If XhciInit() = 0
+    UartWriteStr("xhci: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  found = 0
+  n = XhciMaxPorts()
+  For p = 1 To n
+    If XhciPortConnected(p) = 0
+      Continue
+    EndIf
+    If XhciPortReset(p) = 0
+      Continue
+    EndIf
+    speed = XhciPortSpeed(p)
+    slot = XhciEnableSlot()
+    If slot = 0
+      Continue
+    EndIf
+    If XhciAddressDevice(slot, p, speed) = 0
+      Continue
+    EndIf
+    got = XhciGetDescriptor(2, 0, 0, 64)
+    If got < 9
+      Continue
+    EndIf
+    If XhciCopyIn(@gCfgBuf[0], got) <= 0
+      Continue
+    EndIf
+    total = PeekA(@gCfgBuf[0] + 2) | (PeekA(@gCfgBuf[0] + 3) << 8)
+    If total > got
+      Continue
+    EndIf
+    cfgVal = PeekA(@gCfgBuf[0] + 5)
+    cls = 0
+    epOut = 0
+    epIn = 0
+    off = 0
+    While off < total
+      len = PeekA(@gCfgBuf[0] + off)
+      typ = PeekA(@gCfgBuf[0] + off + 1)
+      If len = 0
+        Break
+      EndIf
+      If typ = 4
+        cls  = PeekA(@gCfgBuf[0] + off + 5)
+        sub  = PeekA(@gCfgBuf[0] + off + 6)
+        prot = PeekA(@gCfgBuf[0] + off + 7)
+      ElseIf typ = 5 And cls = 8
+        If (PeekA(@gCfgBuf[0] + off + 3) & 3) = 2
+          If (PeekA(@gCfgBuf[0] + off + 2) & $80) <> 0
+            epIn  = PeekA(@gCfgBuf[0] + off + 2)
+            mpsIn = PeekA(@gCfgBuf[0] + off + 4) | (PeekA(@gCfgBuf[0] + off + 5) << 8)
+          Else
+            epOut  = PeekA(@gCfgBuf[0] + off + 2)
+            mpsOut = PeekA(@gCfgBuf[0] + off + 4) | (PeekA(@gCfgBuf[0] + off + 5) << 8)
+          EndIf
+        EndIf
+      EndIf
+      off = off + len
+    Wend
+    If cls <> 8 Or sub <> 6 Or prot <> $50
+      Continue
+    EndIf
+    If epOut = 0 Or epIn = 0
+      Continue
+    EndIf
+    found = p
+    Break
+  Next
+  If found = 0
+    Say("no mass storage device found")
+    ProcedureReturn 0
+  EndIf
+
+  If XhciSetConfiguration(cfgVal) = 0
+    UartWriteStr("SET_CONFIGURATION: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If XhciConfigureBulk(epOut, mpsOut, epIn, mpsIn) = 0
+    UartWriteStr("Configure Endpoint: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If MscInit() = 0
+    UartWriteStr("scsi: ")
+    UartWriteStr(MscErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Overwrite one file with exactly its own length from *src.
+Procedure.i PutFile(*name, *src, want.i)
+  Define n.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr(" ... ")
+  UartDrain()
+
+  If FatOpen(*name) = 0
+    UartWriteStr("open failed: ")
+    UartWriteStr(FatErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  n = FatSize()
+  If n <> want
+    UartWriteStr("is ")
+    PrintDec(n)
+    UartWriteStr(" bytes, expected ")
+    PrintDec(want)
+    UartWriteStr(" - REFUSING, the host padded to the wrong size")
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If FatOverwrite(*src, n) = 0
+    UartWriteStr("write failed: ")
+    UartWriteStr(FatErrorText())
+    PrintNl()
+    UartWriteStr("     last block $")
+    PutHexN(FatLastLba(), 8)
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  PrintDec(n)
+  UartWriteStr(" bytes written")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  PrintNl()
+  Say("=== installing Anvil onto the boot stick ===")
+
+  UartWriteStr("bringing USB up ... ")
+  UartDrain()
+  If UsbUp() = 0
+    Say("=== stopped: nothing was written ===")
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("ok, ")
+  UartWriteStr(MscProduct())
+  PrintNl()
+
+  FatSetBlockReader(@MscReadBlock)
+  If FatMount(1) = 0
+    UartWriteStr("mount: ")
+    UartWriteStr(FatErrorText())
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+  Say("partition 1 mounted")
+
+  ; The writer goes in only now, and comes out again at the end. A
+  ; block writer left installed is a way for a later bug to reach the
+  ; medium.
+  FatSetBlockWriter(@MscWriteBlock)
+
+  PrintNl()
+  Say("writing:")
+  If PutFile("KERNEL8.IMG", #IMG_ADDR, #IMG_BYTES) = 0
+    FatSetBlockWriter(0)
+    Say("=== FAILED. If it got part way, write it again before resetting. ===")
+    ProcedureReturn 3
+  EndIf
+  If PutFile("CONFIG.TXT", #CFG_ADDR, #CFG_BYTES) = 0
+    FatSetBlockWriter(0)
+    Say("=== the image is in but config.txt is not - the board will")
+    Say("    still boot the OLD anvil.img. Safe, but not done. ===")
+    ProcedureReturn 4
+  EndIf
+  FatSetBlockWriter(0)
+
+  PrintNl()
+  Say("=== installed. reset to boot the new Anvil. ===")
+  Say("    config.txt now points at kernel8.img")
+  Say("    anvil.img is still there as the fallback")
+  ProcedureReturn 0
+EndProcedure

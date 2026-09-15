@@ -1,0 +1,593 @@
+; pi4Atomics.pi4 - the atomics, on the silicon. Read the feature
+;                   register that decides whether the ARMv8.1 LSE
+;                   instructions exist, then exercise the ARMv8.0
+;                   exclusives and RaspberryPi4/Lib/atomic.pi4 and
+;                   report what the part actually did.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4Atomics.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o atomics.img
+;
+;   pmf> deadman 15
+;   pmf> b 400000 <len> <crc>
+;   pmf> run 400000
+;
+; ----------------------------------------------------------------------
+; WHY THIS EXISTS - TWO QUESTIONS NO GATE ON THIS MACHINE CAN ANSWER
+; ----------------------------------------------------------------------
+;
+; QUESTION ONE: DOES THIS PART HAVE THE LSE ATOMICS?
+;
+; A64Assembler.pbi REFUSES cas, swp, ldadd and the rest of the ARMv8.1
+; Large System Extension family, and its refusal message names
+; ID_AA64ISAR0_EL1.ATOMIC as the thing to check. The reasoning behind
+; that refusal is that the Cortex-A72 is an ARMv8.0-A core and the
+; extension arrived in ARMv8.1, so the instructions would be UNDEFINED
+; on the part - the manual's decode pseudocode for every one of them
+; reads `if !IsFeatureImplemented(FEAT_LSE) then EndOfDecode(Decode_UNDEF)`
+; at Datasheets/arm-a64-instruction-set.txt:6169 and its siblings.
+;
+; That reasoning is sound and it is still REASONING. This program reads
+; the register.
+;
+; THE FIELD: ATOMIC, bits 23:20, with 0b0000 meaning not implemented,
+; 0b0010 meaning FEAT_LSE and 0b0011 meaning FEAT_LSE128 -
+; RaspberryPi4/Reference/v6.12_arm64_tools_sysreg:1349-1353. Note there
+; is no 0b0001. A test of this field against 1 is a silent always-false;
+; the test is against 0.
+;
+; NO LSE INSTRUCTION IS EXECUTED HERE, and that is the point. If the
+; field reads 0 then executing one would be an undefined-instruction
+; exception into a vector table nothing in this tree installs - a hang
+; with no output. The register is read instead.
+;
+; QUESTION TWO, AND IT IS THE ONE NOBODY HAS ASKED: DO THE EXCLUSIVES
+; WORK AT ALL ON THIS BOARD, WITH THE MMU OFF?
+;
+; This is not paranoia and it is not covered by any encoding check.
+; Every payload in this tree runs with the MMU off unless it says
+; otherwise, and with the MMU off ARMv8-A treats every data access as
+; Device memory. The architecture does not promise that Load/Store
+; Exclusive works on Device memory - the global monitor is an
+; implementation-defined structure and a part is permitted not to
+; support exclusives outside Normal memory.
+;
+; THAT RULE IS NOT CITED HERE, deliberately, and the honesty matters:
+; it lives in the memory-model chapter of Arm DDI 0487, which is NOT on
+; this machine. Datasheets/arm-a64-instruction-set.txt is the
+; instruction-set volume and carries encodings and per-instruction
+; pseudocode only - a grep of it for the Device-memory rule finds
+; nothing. So the paragraph above is reasoning from what the exclusive
+; monitor IS, not a quotation, and this program exists to replace it
+; with a measurement.
+;
+; THE STAKES: if a store-exclusive can never succeed on this board's
+; memory as currently mapped, then every primitive in
+; RaspberryPi4/Lib/atomic.pi4 returns #ATOMIC_GAVE_UP, always, and the
+; bounded retry is the only reason that is a refusal rather than a hang.
+; That would be a real finding and it would say that locks on this part
+; need the MMU on with DRAM mapped Normal - which is
+; RaspberryPi4/Lib/mmu.pi4's job, not this file's.
+;
+; Check 3 below is the one that answers it, and it is the check to read
+; first if anything else looks strange.
+;
+; ----------------------------------------------------------------------
+; WHY THIS IS SAFE, argued rather than asserted
+; ----------------------------------------------------------------------
+; Every instruction here is an mrs, an ordinary load or store, or an
+; exclusive access to a word in this program's own BSS. Nothing is
+; written to any system register. No peripheral is touched except the
+; UART. There is no LSE instruction and no floating-point instruction,
+; so there is nothing here that can be UNDEFINED on this part.
+;
+; The one construct that could hang is a retry loop, and every loop
+; reached from this file is bounded by atomic.pi4's #ATOMIC_SPINS - the
+; whole reason that bound exists. The raw checks below use no loop at
+; all.
+;
+; ARM THE DEADMAN ANYWAY. `deadman 15` before `run`, every time, for the
+; reason in the vault's "Bench practice - arm the deadman": the habit is
+; the thing being maintained, and the one session that skipped it turned
+; a recoverable hang into a request for the mains.
+;
+; ----------------------------------------------------------------------
+; WHAT EACH CHECK PROVES, AND WHAT NONE OF THEM CAN
+; ----------------------------------------------------------------------
+; These run on ONE core. Nothing here contends anything, so nothing here
+; proves a lock excludes anybody. What they prove is that the monitor
+; behaves as the architecture describes on this silicon, and that the
+; library's arithmetic and its refusals are right - which is everything
+; except the thing that needs a second core.
+;
+; Two properties are deliberately NOT asserted, because on real silicon
+; they are IMPLEMENTATION DEFINED and asserting them would be inventing
+; a requirement:
+;
+;   * that a store-exclusive to a DIFFERENT address than the load fails.
+;     AArch64_IsExclusiveVA is an optional check and the manual says
+;     plainly "It is always safe to return TRUE"
+;     (arm-a64-instruction-set.txt:481596-481604). This part is allowed
+;     to succeed there. The value is PRINTED, not judged.
+;
+;   * that a plain store between the pair clears the reservation. It
+;     does on every implementation anyone has met, and the architecture
+;     leaves room. Printed, not judged.
+;
+; The interpreter's model IS strict about both, which is what makes it
+; useful for catching a program that leans on the sloppy case. A model
+; being stricter than the part is the safe direction; the reverse is how
+; four gates in this project certified real bugs this week.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/atomic.pi4"
+
+; The words under test. Each gets its own #ATOMIC_PAD_WORDS block so no
+; two of them can share a reservation granule - which is the padding
+; rule atomic.pi4's header states, applied to the program that is
+; supposed to demonstrate it.
+Global Dim at_lock.i[#ATOMIC_PAD_WORDS]
+Global Dim at_counter.i[#ATOMIC_PAD_WORDS]
+Global Dim at_scratch.i[#ATOMIC_PAD_WORDS]
+Global Dim at_other.i[#ATOMIC_PAD_WORDS]
+Global at_result.i
+Global at_pass.i
+Global at_fail.i
+
+; ----------------------------------------------------------------------
+;  The system-register read. One mrs, result left in x0, which is where
+;  a .i return value goes - the idiom from
+;  RaspberryPi4/Lib/timer.pi4:221-223 and pi4FpState.pi4.
+;
+;  The encoding for id_aa64isar0_el1 was added to A64SystemRegBase() in
+;  A64Assembler.pbi on 2026-08-28, cited to
+;  RaspberryPi4/Reference/llvm19.1.0_AArch64SystemOperands.td:752 with
+;  the quintuple independently confirmed by
+;  RaspberryPi4/Reference/v6.12_arm64_tools_sysreg:1306.
+; ----------------------------------------------------------------------
+Procedure.i AtIdIsar0()
+  ASM
+    mrs x0, id_aa64isar0_el1
+  EndASM
+EndProcedure
+
+Procedure.i AtMidr()
+  ASM
+    mrs x0, midr_el1
+  EndASM
+EndProcedure
+
+Procedure.i AtCurrentEl()
+  ASM
+    mrs x0, currentel
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE RAW MONITOR PROBES.
+;
+;  These bypass atomic.pi4 on purpose. The library's loops would retry
+;  a failure away, and a failure is exactly what three of these are
+;  measuring. Each is a straight line of at most five instructions and
+;  contains no branch backwards, so none of them can hang.
+;
+;  All of them take the address in x0 and leave a status in x0, using
+;  x9..x11 as working registers - the same discipline atomic.pi4's
+;  header sets out, for the same reason: a global read inside one of
+;  these would make it a different test on a second core.
+; ----------------------------------------------------------------------
+
+; A store-exclusive with NO reservation. clrex guarantees the monitor is
+; open first, so this is a deterministic architectural requirement and
+; not a probabilistic one: it MUST return 1.
+Procedure.i AtStxrWithNoReservation(*addr)
+  ASM
+    clrex
+    movz  x9, #$5A5A
+    stxr  w10, x9, [x0]
+    mov   x0, x10
+  EndASM
+EndProcedure
+
+; A matched pair. Returns the status: 0 means the store landed.
+; It may spuriously return 1 - that is legal - so the caller retries a
+; bounded number of times before calling it a failure.
+Procedure.i AtStxrMatched(*addr, value.i)
+  ASM
+    ldxr  x9, [x0]
+    stxr  w10, x1, [x0]
+    mov   x0, x10
+  EndASM
+EndProcedure
+
+; Two store-exclusives from one load. The architecture clears the local
+; monitor inside AArch64_ExclusiveMonitorsPass, before it has even
+; looked at the result (arm-a64-instruction-set.txt:481582), so the
+; SECOND one must fail. Returns first_status * 2 + second_status, so one
+; number carries both: 1 means "first passed, second failed", which is
+; the required answer.
+Procedure.i AtStxrTwice(*addr)
+  ASM
+    movz  x9, #$1234
+    ldxr  x11, [x0]
+    stxr  w10, x9, [x0]
+    mov   x11, x10
+    stxr  w10, x9, [x0]
+    lsl   x11, x11, #1
+    add   x0, x11, x10
+  EndASM
+EndProcedure
+
+; A plain store between the load and the store-exclusive. Returns the
+; status. Expected 1 on every implementation anyone has met; PRINTED,
+; not judged, because the architecture leaves room.
+Procedure.i AtStxrAfterPlainStore(*addr)
+  ASM
+    ldxr  x9, [x0]
+    movz  x11, #$7777
+    str   x11, [x0]
+    stxr  w10, x9, [x0]
+    mov   x0, x10
+  EndASM
+EndProcedure
+
+; Load exclusive from one address, store exclusive to another. IMPDEF -
+; printed, not judged. See the header.
+Procedure.i AtStxrCrossAddress(*from, *to)
+  ASM
+    ldxr  x9, [x0]
+    movz  x11, #$3333
+    stxr  w10, x11, [x1]
+    mov   x0, x10
+  EndASM
+EndProcedure
+
+; ldar / stlr, which take no reservation at all. A round trip through
+; memory: if this returns what it stored, the ordered accesses move the
+; right bytes.
+Procedure.i AtOrderedRoundTrip(*addr, value.i)
+  ASM
+    stlr  x1, [x0]
+    ldar  x0, [x0]
+  EndASM
+EndProcedure
+
+; A store-exclusive after an ldar. ldar is NOT an exclusive - o2 = 1 in
+; the encoding - so it takes no reservation and this must fail. An
+; implementation that got o2 backwards would pass every other check on
+; this page.
+Procedure.i AtStxrAfterLdar(*addr)
+  ASM
+    clrex
+    ldar  x9, [x0]
+    movz  x11, #$2222
+    stxr  w10, x11, [x0]
+    mov   x0, x10
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Printing. Copied from pi4FpState.pi4 rather than shared, for the
+;  reason that file gives: a diagnostic that depends on another
+;  diagnostic stops building when somebody tidies the other one.
+;
+;  No character literals - house rule. 48 is the code for the digit
+;  zero, 55 is the letter A minus ten, 32 is a space.
+; ----------------------------------------------------------------------
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define digits.i
+  Define i.i
+  Define n.i
+  Dim buf.i(24)
+  n = v
+  If n < 0
+    UartWrite(45)                      ; minus
+    n = -n
+  EndIf
+  If n = 0
+    UartWrite(48)
+    ProcedureReturn
+  EndIf
+  digits = 0
+  While n > 0
+    buf(digits) = n % 10
+    n = n / 10
+    digits = digits + 1
+  Wend
+  For i = digits - 1 To 0 Step -1
+    UartWrite(48 + buf(i))
+  Next
+EndProcedure
+
+Procedure Row(*label, v.i)
+  UartWriteStr(*label)
+  UartWrite(36)                        ; the dollar sign that marks hex
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure Note(*label, *text)
+  UartWriteStr(*label)
+  UartWriteStr(*text)
+  UartWriteNl()
+EndProcedure
+
+; A judged check. Prints PASS or FAIL, the label, and what was seen.
+Procedure Judge(*label, got.i, want.i)
+  If got = want
+    at_pass = at_pass + 1
+    UartWriteStr("  PASS  ")
+  Else
+    at_fail = at_fail + 1
+    UartWriteStr("  FAIL  ")
+  EndIf
+  UartWriteStr(*label)
+  UartWriteStr("  got ")
+  PutDec(got)
+  UartWriteStr(" want ")
+  PutDec(want)
+  UartWriteNl()
+EndProcedure
+
+; An unjudged observation: something the architecture leaves to the
+; implementation. Reported so the next person knows what this silicon
+; does, never asserted.
+Procedure Observe(*label, got.i)
+  UartWriteStr("  ----  ")
+  UartWriteStr(*label)
+  UartWriteStr("  = ")
+  PutDec(got)
+  UartWriteStr("   (implementation defined - reported, not required)")
+  UartWriteNl()
+EndProcedure
+
+Procedure.i Main()
+  Define isar.i
+  Define atomicfield.i
+  Define midr.i
+  Define i.i
+  Define r.i
+  Define status.i
+  Define tries.i
+  Define retries.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4Atomics - ARMv8.0 exclusives on the silicon, and the LSE question")
+  UartWriteNl()
+  UartWriteNl()
+
+  midr = AtMidr()
+  isar = AtIdIsar0()
+  Row("MIDR_EL1        ", midr)
+  Row("CurrentEL raw   ", AtCurrentEl())
+  Row("ID_AA64ISAR0_EL1", isar)
+
+  ; ------------------------------------------------------------------
+  ;  QUESTION ONE. ATOMIC is bits 23:20.
+  ; ------------------------------------------------------------------
+  atomicfield = (isar >> 20) & $F
+  UartWriteStr("ID_AA64ISAR0_EL1.ATOMIC (bits 23:20) = ")
+  PutDec(atomicfield)
+  UartWriteNl()
+  If atomicfield = 0
+    Note("  verdict  ", "0b0000 = NI. FEAT_LSE is NOT implemented on this part.")
+    Note("           ", "cas / swp / ldadd would be UNDEFINED here. The assembler")
+    Note("           ", "is right to refuse them. Build atomics out of ldxr/stxr.")
+  Else
+    Note("  verdict  ", "NON-ZERO. This part DOES implement the LSE atomics, and")
+    Note("           ", "A64Assembler.pbi's blanket refusal is now WRONG for it.")
+    Note("           ", "Do not just delete the refusal - encode the family, cite")
+    Note("           ", "it, and gate it. See A64IsLseAtomic in A64Assembler.pbi.")
+  EndIf
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  QUESTION TWO, and the monitor's behaviour on this silicon.
+  ; ------------------------------------------------------------------
+  UartWriteStr("The exclusive monitor, on this board, with memory as it is now:")
+  UartWriteNl()
+
+  ; Check 1. A store-exclusive with the monitor provably open must fail.
+  ; This is the deterministic one and it needs no retry.
+  at_scratch[0] = $1111
+  status = AtStxrWithNoReservation(@at_scratch[0])
+  Judge("stxr after clrex fails            ", status, 1)
+  Judge("...and did not write memory       ", at_scratch[0], $1111)
+
+  ; Check 2. A matched pair. A spurious failure is legal, so this is
+  ; retried a bounded number of times and the retries are reported.
+  ; If this needs more than a handful of tries on an idle single core,
+  ; something is interesting.
+  at_scratch[0] = 0
+  retries = 0
+  status = 1
+  tries = 0
+  While status <> 0 And tries < 64
+    status = AtStxrMatched(@at_scratch[0], $ABCD)
+    tries = tries + 1
+    If status <> 0
+      retries = retries + 1
+    EndIf
+  Wend
+  Judge("ldxr/stxr pair succeeds           ", status, 0)
+  Judge("...and wrote the value            ", at_scratch[0], $ABCD)
+  UartWriteStr("        spurious failures before it landed: ")
+  PutDec(retries)
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  THIS IS THE CHECK THAT ANSWERS QUESTION TWO. If the pair above
+  ;  never landed in 64 tries, exclusives do not work on this memory as
+  ;  it is currently mapped, and every lock on this board needs the MMU
+  ;  on with DRAM Normal. Say so in as many words rather than leaving it
+  ;  to be inferred from a FAIL line.
+  ; ------------------------------------------------------------------
+  If status <> 0
+    UartWriteNl()
+    Note("STOP     ", "EVERY STORE-EXCLUSIVE REPORTED FAILURE, 64 times, on an idle")
+    Note("         ", "single core with nothing contending. That is not spurious")
+    Note("         ", "failure - the exclusive monitor does not report correctly")
+    Note("         ", "on this memory as currently mapped.")
+    Note("         ", "NOW LOOK AT THE LINE ABOVE THAT SAYS WHETHER THE VALUE WAS")
+    Note("         ", "WRITTEN. If it passed, the failing stores ARE LANDING, and")
+    Note("         ", "that is far worse than not working: every retry loop in")
+    Note("         ", "Lib/atomic.pi4 performs its operation 1024 times and THEN")
+    Note("         ", "returns #ATOMIC_GAVE_UP. An AtomicAdd of 1 moves the")
+    Note("         ", "counter by 1024. Look for a counter 1024x too large.")
+    Note("         ", "WHY: with the MMU off every access is Device, and the")
+    Note("         ", "architecture does not guarantee exclusives outside Normal")
+    Note("         ", "memory. The fix is Lib/mmu.pi4 with DRAM mapped Normal")
+    Note("         ", "Inner-Shareable, and then re-running this program.")
+    Note("         ", "UNTIL THEN: AtomicSelfTest() refuses, and nothing else in")
+    Note("         ", "Lib/atomic.pi4 may be used. The encodings are not in")
+    Note("         ", "question - a64_atomic_check.py checks 1078 of them against")
+    Note("         ", "Arm's tables and an independent assembler. This is a")
+    Note("         ", "memory-regime problem, not an assembler problem.")
+    UartWriteNl()
+  EndIf
+
+  ; Check 3. Two store-exclusives from one load: the second must fail.
+  at_scratch[0] = 0
+  r = AtStxrTwice(@at_scratch[0])
+  ; first*2 + second. 1 = first passed, second failed.
+  Judge("second stxr of a pair fails       ", r, 1)
+
+  ; Check 4. ldar takes no reservation.
+  at_scratch[0] = 0
+  Judge("stxr after ldar fails             ", AtStxrAfterLdar(@at_scratch[0]), 1)
+
+  ; Check 5. The ordered accesses move the right bytes, both widths of
+  ; the same word.
+  Judge("stlr/ldar round trip              ", AtOrderedRoundTrip(@at_scratch[0], $FEEDFACE), $FEEDFACE)
+
+  ; The two implementation-defined observations. Printed, never judged.
+  at_scratch[0] = 0
+  ; One line each - this language has no line continuation inside a
+  ; call, which is why these are long.
+  Observe("stxr after a plain store to the same word (1 = failed)", AtStxrAfterPlainStore(@at_scratch[0]))
+  at_scratch[0] = 0
+  at_other[0] = 0
+  Observe("stxr to a different word than the ldxr (1 = failed)  ", AtStxrCrossAddress(@at_scratch[0], @at_other[0]))
+
+  UartWriteNl()
+  UartWriteStr("RaspberryPi4/Lib/atomic.pi4, on this board:")
+  UartWriteNl()
+
+  ; THE GUARD, FIRST. This is the one call a real program makes before
+  ; it uses any lock, and it is checked here before anything that
+  ; depends on it - so its answer can be compared against the raw
+  ; monitor results above rather than taken on trust.
+  ;
+  ; It is deliberately given at_scratch and not at_lock: it writes and
+  ; restores whatever word it is given, and pointing it at a lock word
+  ; that a real program might be holding would be a bad habit to
+  ; demonstrate even where it is harmless.
+  at_scratch[0] = $C0DE
+  r = AtomicSelfTest(@at_scratch[0])
+  UartWriteStr("  ----  AtomicSelfTest = ")
+  PutDec(r)
+  If r = #ATOMIC_OK
+    UartWriteStr("  (OK - the monitor works on this memory)")
+  Else
+    UartWriteStr("  (REFUSES - and every check below is therefore expected to fail)")
+  EndIf
+  UartWriteNl()
+  Judge("...and left the word untouched    ", at_scratch[0], $C0DE)
+
+  ; The library. #ATOMIC_OK is 0, #ATOMIC_BUSY is 1, #ATOMIC_GAVE_UP 2.
+  at_lock[0] = 0
+  Judge("AtomicTryLock on a free lock      ", AtomicTryLock(@at_lock[0]), #ATOMIC_OK)
+  Judge("...the lock is now held           ", at_lock[0], 1)
+  Judge("AtomicTryLock on a held lock      ", AtomicTryLock(@at_lock[0]), #ATOMIC_BUSY)
+  Judge("...and did not disturb it         ", at_lock[0], 1)
+
+  ; A bounded wait on a lock nobody will ever release. This is the
+  ; refusal, on hardware, and it is the whole argument for bounding the
+  ; loop: without the bound this line is where the board stops
+  ; answering.
+  Judge("AtomicLock on a held lock refuses ", AtomicLock(@at_lock[0], 200), #ATOMIC_GAVE_UP)
+  Judge("...and still did not take it      ", at_lock[0], 1)
+  Judge("AtomicLock with a zero budget     ", AtomicLock(@at_lock[0], 0), #ATOMIC_GAVE_UP)
+
+  AtomicUnlock(@at_lock[0])
+  Judge("AtomicUnlock releases             ", at_lock[0], 0)
+  Judge("AtomicLock on a free lock         ", AtomicLock(@at_lock[0], 200), #ATOMIC_OK)
+  AtomicUnlock(@at_lock[0])
+
+  at_counter[0] = 40
+  Judge("AtomicCas with a matching value   ", AtomicCas(@at_counter[0], 40, 41), #ATOMIC_OK)
+  Judge("...wrote the replacement          ", at_counter[0], 41)
+  Judge("AtomicCas with a differing value  ", AtomicCas(@at_counter[0], 40, 99), #ATOMIC_BUSY)
+  Judge("...and left the word alone        ", at_counter[0], 41)
+
+  at_counter[0] = 0
+  at_result = 0
+  Judge("AtomicAdd                         ", AtomicAdd(@at_counter[0], 7, @at_result), #ATOMIC_OK)
+  Judge("...added                          ", at_counter[0], 7)
+  Judge("...reported the new value         ", at_result, 7)
+  Judge("AtomicAdd with a negative delta   ", AtomicAdd(@at_counter[0], -3, @at_result), #ATOMIC_OK)
+  Judge("...subtracted                     ", at_counter[0], 4)
+
+  ; A THOUSAND INCREMENTS. Single-core, so this proves arithmetic and
+  ; not exclusion - but a monitor that spuriously failed often enough to
+  ; exhaust the bound would show up here and nowhere else, and a
+  ; primitive that lost an update under repetition would land short.
+  at_counter[0] = 0
+  r = #ATOMIC_OK
+  For i = 1 To 1000
+    If AtomicAdd(@at_counter[0], 1, @at_result) <> #ATOMIC_OK
+      r = #ATOMIC_GAVE_UP
+    EndIf
+  Next
+  Judge("1000 x AtomicAdd all succeeded    ", r, #ATOMIC_OK)
+  Judge("...counter reached 1000           ", at_counter[0], 1000)
+
+  UartWriteNl()
+  UartWriteStr("passed ")
+  PutDec(at_pass)
+  UartWriteStr("   failed ")
+  PutDec(at_fail)
+  UartWriteNl()
+  If at_fail = 0
+    Note("VERDICT  ", "every judged check passed on this silicon.")
+  ElseIf r <> #ATOMIC_OK
+    ; `r` still holds the AtomicSelfTest result. Saying this out loud
+    ; matters: a reader who sees twelve FAIL lines and does not connect
+    ; them to the one line at the top will go hunting the library for a
+    ; bug that is not in it.
+    Note("VERDICT  ", "AtomicSelfTest REFUSED, so the exclusive monitor does not")
+    Note("         ", "work on this memory - and EVERY library failure above is")
+    Note("         ", "explained by that one fact. Do not go looking for a bug in")
+    Note("         ", "Lib/atomic.pi4. Map DRAM as Normal Inner-Shareable with")
+    Note("         ", "Lib/mmu.pi4 and run this again; that is the experiment.")
+  Else
+    Note("VERDICT  ", "SOMETHING FAILED while AtomicSelfTest said the monitor")
+    Note("         ", "works. That combination is NOT explained by the memory")
+    Note("         ", "regime and is a real defect. Read the FAIL lines.")
+  EndIf
+  Note("NOTE     ", "one core ran all of this. Nothing here contended anything,")
+  Note("         ", "so nothing here proves a lock excludes another core.")
+  UartWriteNl()
+
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,288 @@
+; pi4Dwc2Probe.pi4 - is there a USB DEVICE controller behind the USB-C
+; socket, and will it talk to us?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHY THIS MATTERS. Everything reaches this board at 115200 baud, about
+; 11.5 KB a second. A 200 KB monitor takes twenty seconds to send and a
+; framebuffer takes minutes. The Pi 4's USB-C socket is not only power:
+; its data pins go to the SoC's OWN USB controller, a Synopsys DesignWare
+; DWC2 OTG core at
+;
+;     usb@7e980000  ->  ARM physical $FE980000
+;     Datasheets/pi4/bcm283x.dtsi, node "usb: usb@7e980000",
+;     compatible "brcm,bcm2835-usb", reg = <0x7e980000 0x10000>
+;
+; and that core can be a DEVICE, not just a host. A high-speed bulk
+; endpoint moves megabytes a second. That is the difference between
+; twenty seconds and a fifth of one.
+;
+; THIS IS NOT THE CONTROLLER THE REST OF THE USB WORK USES. The four
+; type-A sockets hang off a VL805 across PCIe and are driven by
+; xhci.pi4 in HOST mode. This is a different controller, a different
+; register block, and the opposite role. Confusing them would be easy
+; and expensive, so: VL805 = host = xhci.pi4 = the boot stick. DWC2 =
+; device = this = the cable to the laptop.
+;
+; WHAT IS BEING ASKED, in order, because each answer decides whether the
+; next question is worth asking:
+;
+;   1. is the USB power domain even on? U-Boot powers the PCIe path, not
+;      this one, so the block may be cold. A register read on an
+;      unpowered block does not return zero, it aborts.
+;   2. does GSNPSID read back as a DWC2 core? The top half is $4F54 -
+;      ASCII "OT", for OTG - and anything else means the address is
+;      wrong or the block is asleep.
+;   3. does GHWCFG2 say this core can be a device at all? Its low three
+;      bits are the OTG mode, and two of the six values are host-only.
+;   4. how many device endpoints and what PHY? A high-speed UTMI PHY is
+;      what makes this worth doing; a full-speed-only core would cap at
+;      1.5 MB/s and change the argument.
+;
+; THE POWER TAGS ARE USED AT THE CALL SITE ON PURPOSE. mailbox.pi4
+; deliberately does not wrap $00020001 / $00028001 - its header says
+; they are cited but that "turning rails off with no consumer of them is
+; a way to make a board stop working, not a feature" - and points at
+; MailboxBegin/MailboxSend for exactly this case. Citation:
+;
+;     RPI_FIRMWARE_GET_DOMAIN_STATE  $00020001
+;     RPI_FIRMWARE_SET_DOMAIN_STATE  $00028001
+;     Datasheets/pi4/raspberrypi-firmware.h
+;     device 3 is USB HCD; state bit 0 is on, bit 1 is "wait for it"
+;
+;   PureMetalForge.exe --compile pi4Dwc2Probe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o dwc2.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+#DWC2_BASE = $FE980000
+
+; Register offsets, from Datasheets/pi4/dwc2/v6.12_hw.h. The line number
+; is beside each one because that file is 30 KB of macros and finding a
+; given define again otherwise means grepping twice.
+#DWC2_GOTGCTL  = $000     ; hw.h:30
+#DWC2_GAHBCFG  = $008     ; hw.h:46
+#DWC2_GUSBCFG  = $00C     ; hw.h:66
+#DWC2_GRSTCTL  = $010     ; hw.h:98
+#DWC2_GINTSTS  = $014     ; hw.h:124
+#DWC2_GSNPSID  = $040     ; hw.h:224
+#DWC2_GHWCFG1  = $044
+#DWC2_GHWCFG2  = $048     ; hw.h:228
+#DWC2_GHWCFG3  = $04C
+#DWC2_GHWCFG4  = $050
+
+#PWR_DOMAIN_USB = 3
+#TAG_GET_DOMAIN = $00020001
+#TAG_SET_DOMAIN = $00028001
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Num(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+; One power-domain transaction. Returns the state the firmware reports,
+; or -1. state is only meaningful for the SET.
+Procedure.i PowerDomain(tag.i, dev.i, state.i)
+  If MailboxBegin(tag, 8, 8) = 0
+    ProcedureReturn -1
+  EndIf
+  MailboxSetWord(0, dev)
+  MailboxSetWord(1, state)
+  If MailboxSend() = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+Procedure.i Main()
+  Define st.i
+  Define id.i
+  Define hw2.i
+  Define hw3.i
+  Define hw4.i
+  Define mode.i
+  Define neps.i
+  Define phy.i
+
+  PrintNl()
+  UartWriteStr("=== the USB-C side: a DWC2 device controller? ===")
+  PrintNl()
+
+  If MailboxInit() = 0
+    UartWriteStr("!! mailbox: ")
+    PrintDec(MailboxError())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- 1. the power domain -------------------------------------------
+  st = PowerDomain(#TAG_GET_DOMAIN, #PWR_DOMAIN_USB, 0)
+  UartWriteStr("  USB power domain, as found  ")
+  If st < 0
+    UartWriteStr("the firmware would not say")
+  ElseIf (st & 1) <> 0
+    UartWriteStr("ON")
+  Else
+    UartWriteStr("OFF")
+  EndIf
+  PrintNl()
+
+  ; Turn it on and WAIT for it - bit 1. Without the wait the next
+  ; instruction can reach a block whose clocks have not started, and
+  ; that is an abort rather than a zero.
+  st = PowerDomain(#TAG_SET_DOMAIN, #PWR_DOMAIN_USB, 3)
+  UartWriteStr("  after asking for it ON      ")
+  If st < 0
+    UartWriteStr("the firmware would not say")
+  ElseIf (st & 1) <> 0
+    UartWriteStr("ON")
+  Else
+    UartWriteStr("still OFF - nothing below can work")
+  EndIf
+  PrintNl()
+  If st < 0 Or (st & 1) = 0
+    UartWriteStr("=== stopping: reading an unpowered block aborts ===")
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+  delay(10)
+  UartDrain()
+
+  ; ---- 2. is it a DWC2 at all ----------------------------------------
+  ; DRAIN FIRST. If the address is wrong this read takes a data abort
+  ; and resets the CPU, and the last line out would otherwise be lost.
+  UartWriteStr("  about to read $FE980040 (GSNPSID)")
+  PrintNl()
+  UartWriteStr("  if the next line is missing, that address is not mapped")
+  PrintNl()
+  UartDrain()
+
+  id = PeekN(#DWC2_BASE + #DWC2_GSNPSID) & $FFFFFFFF
+  Row("GSNPSID      ", id, 8)
+  UartWriteStr("  top half $")
+  PutHexN((id >> 16) & $FFFF, 4)
+  If ((id >> 16) & $FFFF) = $4F54
+    UartWriteStr("  = ASCII OT, this is a DesignWare OTG core")
+  Else
+    UartWriteStr("  NOT $4F54 - this is not a DWC2 core")
+    PrintNl()
+    UartWriteStr("=== stopping ===")
+    PrintNl()
+    ProcedureReturn 3
+  EndIf
+  PrintNl()
+  UartWriteStr("  core release  ")
+  PutHexN(id & $FFFF, 4)
+  PrintNl()
+  PrintNl()
+
+  ; ---- 3. can it be a device -----------------------------------------
+  hw2 = PeekN(#DWC2_BASE + #DWC2_GHWCFG2) & $FFFFFFFF
+  hw3 = PeekN(#DWC2_BASE + #DWC2_GHWCFG3) & $FFFFFFFF
+  hw4 = PeekN(#DWC2_BASE + #DWC2_GHWCFG4) & $FFFFFFFF
+  Row("GHWCFG1      ", PeekN(#DWC2_BASE + #DWC2_GHWCFG1) & $FFFFFFFF, 8)
+  Row("GHWCFG2      ", hw2, 8)
+  Row("GHWCFG3      ", hw3, 8)
+  Row("GHWCFG4      ", hw4, 8)
+  PrintNl()
+
+  ; hw.h:261-267. Six values, and two of them mean host only.
+  mode = hw2 & 7
+  UartWriteStr("  OTG mode ")
+  PrintDec(mode)
+  UartWriteStr("  = ")
+  Select mode
+    Case 0
+      UartWriteStr("HNP and SRP capable OTG - can be a device")
+    Case 1
+      UartWriteStr("SRP-only capable OTG - can be a device")
+    Case 2
+      UartWriteStr("no HNP/SRP capable OTG - can be a device")
+    Case 3
+      UartWriteStr("SRP capable DEVICE - device only")
+    Case 4
+      UartWriteStr("no SRP capable DEVICE - device only")
+    Case 5
+      UartWriteStr("SRP capable HOST - HOST ONLY, no device mode")
+    Case 6
+      UartWriteStr("no SRP capable HOST - HOST ONLY, no device mode")
+    Default
+      UartWriteStr("undocumented")
+  EndSelect
+  PrintNl()
+
+  ; hw.h:241-242. The count excludes endpoint zero on some cores; what
+  ; matters here is only whether there are enough for a bulk pair.
+  neps = ((hw2 >> 10) & $F) + 1
+  Num("device endpoints (incl EP0)", neps)
+
+  ; hw.h:249-253.
+  phy = (hw2 >> 6) & 3
+  UartWriteStr("  high-speed PHY  ")
+  Select phy
+    Case 0
+      UartWriteStr("NONE - full speed only, so about 1.5 MB/s at best")
+    Case 1
+      UartWriteStr("UTMI+  - high speed, the one worth having")
+    Case 2
+      UartWriteStr("ULPI   - high speed")
+    Case 3
+      UartWriteStr("UTMI+/ULPI - high speed")
+  EndSelect
+  PrintNl()
+  ; hw.h:238
+  UartWriteStr("  dynamic FIFO    ")
+  If (hw2 & (1 << 19)) <> 0
+    UartWriteStr("yes")
+  Else
+    UartWriteStr("no - the FIFO layout is fixed in silicon")
+  EndIf
+  PrintNl()
+  PrintNl()
+
+  ; ---- 4. what state is it in right now ------------------------------
+  Row("GOTGCTL      ", PeekN(#DWC2_BASE + #DWC2_GOTGCTL) & $FFFFFFFF, 8)
+  Row("GUSBCFG      ", PeekN(#DWC2_BASE + #DWC2_GUSBCFG) & $FFFFFFFF, 8)
+  Row("GAHBCFG      ", PeekN(#DWC2_BASE + #DWC2_GAHBCFG) & $FFFFFFFF, 8)
+  Row("GINTSTS      ", PeekN(#DWC2_BASE + #DWC2_GINTSTS) & $FFFFFFFF, 8)
+  ; GINTSTS bit 0 is Current Mode: 1 host, 0 device. It reflects what
+  ; the core is doing NOW, which is not the same as what it can do.
+  UartWriteStr("  current mode    ")
+  If (PeekN(#DWC2_BASE + #DWC2_GINTSTS) & 1) <> 0
+    UartWriteStr("HOST")
+  Else
+    UartWriteStr("DEVICE")
+  EndIf
+  PrintNl()
+
+  PrintNl()
+  UartWriteStr("=== read without incident ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

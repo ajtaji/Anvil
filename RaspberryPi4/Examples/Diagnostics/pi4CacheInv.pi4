@@ -1,0 +1,39 @@
+; pi4CacheInv.pi4 - ISOLATION probe. Does MmuInvalidateDCacheAll() (the
+;   set/way `dc isw` walk added 2026-08-29) COMPLETE, or does it hang?
+;
+;   Nothing here enables the MMU. The walk is state-independent - it
+;   discards cache lines by set/way - so this needs no cold board. If
+;   "INV: walk returned" prints, the walk terminates; if output stops at
+;   "INV: entering walk", the walk hangs and that is the bug behind the
+;   pi4MmuFlush hang, not the enable transition.
+;
+;   PureMetalForge.exe --compile pi4CacheInv.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o pi4CacheInv.img
+;   pmf> deadman 15
+;   pmf> run 400000
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  UartWriteNl()
+EndProcedure
+
+Procedure.i Main()
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+  UartWriteNl()
+  Say("pi4CacheInv - does the dc isw set/way walk terminate?")
+  UartWriteNl()
+
+  Say("INV: entering walk")
+  UartDrain()
+
+  MmuInvalidateDCacheAll()
+
+  Say("INV: walk returned - it terminates and does not fault.")
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

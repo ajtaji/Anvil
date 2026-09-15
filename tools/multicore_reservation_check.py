@@ -133,7 +133,6 @@ def mutant_root(work: Path, label: str, source_root: Path,
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / relative, target)
-    shutil.copy2(source_root / "keywords.def", root / "keywords.def")
     shutil.copytree(source_root / "Boards", root / "Boards")
     shutil.copytree(source_root / "RaspberryPi4" / "Intrinsics",
                     root / "RaspberryPi4" / "Intrinsics")

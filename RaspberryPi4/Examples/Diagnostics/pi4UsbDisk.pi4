@@ -1,0 +1,429 @@
+; pi4UsbDisk.pi4 - read the boot stick, end to end.
+;
+; DIAGNOSTIC. Does not ship, but everything under it does.
+;
+; The whole chain in one program:
+;
+;   PCIe link, outbound window, inbound offset
+;   endpoint BAR, bridge forwarding window
+;   XHCI reset, rings, scratchpad, run
+;   port reset, Enable Slot, Address Device
+;   descriptors, and the interface that says mass storage
+;   SET_CONFIGURATION, Configure Endpoint
+;   SCSI: TEST UNIT READY, INQUIRY, READ CAPACITY
+;   READ(10) of block 0, and what is in it
+;
+; It stops at the first thing that does not work and says which, because
+; a chain this long with one "failed" at the end is not a diagnosis.
+;
+; THE MBR IS THE PROOF. A stick that boots a Pi has a partition table in
+; block 0 ending in $55 $AA, and a first partition whose type byte says
+; FAT. Those bytes cannot be produced by accident: if they are right,
+; the block came off the medium.
+;
+;   pmfc pi4UsbDisk.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o usbdisk.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/usbmsc.pi4"
+
+; The block buffer the controller DMAs into. A GLOBAL, not a local: it
+; has to outlive the frame that asked for it and be reachable by a bus
+; master.
+Global Dim blk.a[512]
+Global Dim cfg.a[512]
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure Step_(*s)
+  UartWriteStr("  ")
+  UartWriteStr(*s)
+  UartWriteStr(" ... ")
+  UartDrain()
+EndProcedure
+
+Procedure Ok()
+  UartWriteStr("ok")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure Bad(*why)
+  UartWriteStr("FAILED")
+  PrintNl()
+  UartWriteStr("     ")
+  UartWriteStr(*why)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure DumpBlock(*b, rows.i)
+  Define r.i
+  Define c.i
+  Define v.i
+  For r = 0 To rows - 1
+    UartWriteStr("    ")
+    PutHexN(r * 16, 4)
+    UartWriteStr("  ")
+    For c = 0 To 15
+      PutHexN(PeekA(*b + (r * 16) + c), 2)
+      UartWrite(32)
+    Next
+    UartWrite(124)
+    For c = 0 To 15
+      v = PeekA(*b + (r * 16) + c)
+      If v < 32 Or v > 126
+        v = 46
+      EndIf
+      UartWrite(v)
+    Next
+    UartWrite(124)
+    PrintNl()
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Define p.i
+  Define n.i
+  Define speed.i
+  Define slot.i
+  Define total.i
+  Define off.i
+  Define len.i
+  Define typ.i
+  Define epOut.i
+  Define epIn.i
+  Define mpsOut.i
+  Define mpsIn.i
+  Define cls.i
+  Define sub.i
+  Define prot.i
+  Define cfgVal.i
+  Define found.i
+  Define sig.i
+  Define ptype.i
+  Define plba.i
+
+  PrintNl()
+  Say("=== reading the boot stick ===")
+
+  Step_("PCIe")
+  If PcieInit() = 0
+    Bad(PcieErrorText())
+    ProcedureReturn 1
+  EndIf
+  If PcieEnumerate() = 0
+    Bad(PcieErrorText())
+    ProcedureReturn 1
+  EndIf
+  Ok()
+
+  Step_("XHCI")
+  If XhciInit() = 0
+    Bad(XhciErrorText())
+    ProcedureReturn 2
+  EndIf
+  Ok()
+
+  ; ---- find a mass storage device on a root port ---------------------
+  found = 0
+  n = XhciMaxPorts()
+  For p = 1 To n
+    If XhciPortConnected(p) = 0
+      Continue
+    EndIf
+    UartWriteStr("  port ")
+    PrintDec(p)
+    UartWriteStr(": ")
+    UartDrain()
+
+    If XhciPortReset(p) = 0
+      UartWriteStr("reset failed")
+      PrintNl()
+      Continue
+    EndIf
+    speed = XhciPortSpeed(p)
+    slot = XhciEnableSlot()
+    If slot = 0
+      UartWriteStr("no slot")
+      PrintNl()
+      Continue
+    EndIf
+    If XhciAddressDevice(slot, p, speed) = 0
+      UartWriteStr("address failed: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+
+    n = XhciGetDescriptor(2, 0, 0, 64)
+    If n < 9
+      UartWriteStr("no configuration descriptor")
+      PrintNl()
+      Continue
+    EndIf
+    If XhciCopyIn(@cfg[0], n) <= 0
+      UartWriteStr("could not copy the configuration")
+      PrintNl()
+      Continue
+    EndIf
+    total = PeekA(@cfg[0] + 2) | (PeekA(@cfg[0] + 3) << 8)
+    If total > n
+      UartWriteStr("the configuration is longer than one read")
+      PrintNl()
+      Continue
+    EndIf
+    cfgVal = PeekA(@cfg[0] + 5)
+
+    ; Walk for a mass storage interface and its two bulk endpoints.
+    cls = 0
+    epOut = 0
+    epIn = 0
+    off = 0
+    While off < total
+      len = PeekA(@cfg[0] + off)
+      typ = PeekA(@cfg[0] + off + 1)
+      If len = 0
+        Break
+      EndIf
+      If typ = 4
+        cls  = PeekA(@cfg[0] + off + 5)
+        sub  = PeekA(@cfg[0] + off + 6)
+        prot = PeekA(@cfg[0] + off + 7)
+      ElseIf typ = 5 And cls = 8
+        ; bmAttributes low two bits = 2 is bulk.
+        If (PeekA(@cfg[0] + off + 3) & 3) = 2
+          If (PeekA(@cfg[0] + off + 2) & $80) <> 0
+            epIn  = PeekA(@cfg[0] + off + 2)
+            mpsIn = PeekA(@cfg[0] + off + 4) | (PeekA(@cfg[0] + off + 5) << 8)
+          Else
+            epOut  = PeekA(@cfg[0] + off + 2)
+            mpsOut = PeekA(@cfg[0] + off + 4) | (PeekA(@cfg[0] + off + 5) << 8)
+          EndIf
+        EndIf
+      EndIf
+      off = off + len
+    Wend
+
+    If cls <> 8
+      UartWriteStr("not mass storage (class $")
+      PutHexN(cls, 2)
+      UartWriteStr(")")
+      PrintNl()
+      Continue
+    EndIf
+    If sub <> 6 Or prot <> $50
+      UartWriteStr("mass storage but not SCSI/BOT")
+      PrintNl()
+      Continue
+    EndIf
+    If epOut = 0 Or epIn = 0
+      UartWriteStr("mass storage with no bulk pair")
+      PrintNl()
+      Continue
+    EndIf
+    UartWriteStr("mass storage, bulk OUT $")
+    PutHexN(epOut, 2)
+    UartWriteStr(" IN $")
+    PutHexN(epIn, 2)
+    PrintNl()
+    found = p
+    Break
+  Next
+
+  If found = 0
+    Say("=== no mass storage device found ===")
+    ProcedureReturn 3
+  EndIf
+
+  ; ---- configure, in the order that matters --------------------------
+  Step_("SET_CONFIGURATION")
+  If XhciSetConfiguration(cfgVal) = 0
+    Bad(XhciErrorText())
+    ProcedureReturn 4
+  EndIf
+  Ok()
+
+  Step_("Configure Endpoint")
+  If XhciConfigureBulk(epOut, mpsOut, epIn, mpsIn) = 0
+    Bad(XhciErrorText())
+    ProcedureReturn 5
+  EndIf
+  Ok()
+
+  ; WHAT THE CONTROLLER THINKS IT WAS TOLD. Configure Endpoint returning
+  ; success means the command was accepted, not that the endpoints are
+  ; usable. These three numbers are read back out of the OUTPUT context
+  ; and are the difference between the two.
+  UartWriteStr("  context entries  ")
+  PrintDec(XhciCtxEntries())
+  UartWriteStr("   (want ")
+  PrintDec(XhciDciIn())
+  UartWriteStr(")")
+  PrintNl()
+  UartWriteStr("  EP OUT dci ")
+  PrintDec(XhciDciOut())
+  UartWriteStr(" state ")
+  PrintDec(XhciEpState(XhciDciOut()))
+  UartWriteStr("   EP IN dci ")
+  PrintDec(XhciDciIn())
+  UartWriteStr(" state ")
+  PrintDec(XhciEpState(XhciDciIn()))
+  PrintNl()
+  UartWriteStr("  (0 disabled, 1 running, 2 halted, 3 stopped, 4 error)")
+  PrintNl()
+  UartDrain()
+
+  ; ---- SCSI ----------------------------------------------------------
+  ; ONE TEST UNIT READY, REPORTED IN FULL, before the retry loop.
+  ; MscInit retries forty times and then says "never became ready",
+  ; which is true and useless: it hides whether the very first command
+  ; failed in the wrapper, the data phase or the status phase. This asks
+  ; once and prints exactly where it stopped.
+  Step_("one TEST UNIT READY")
+  If MscTestUnitReady() = 1
+    Ok()
+  Else
+    UartWriteStr("failed")
+    PrintNl()
+    UartWriteStr("     ")
+    UartWriteStr(MscErrorText())
+    PrintNl()
+    UartWriteStr("     xhci says: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    UartWriteStr("     last completion code ")
+    PrintDec(XhciLastComp())
+    PrintNl()
+    UartWriteStr("     CBW sent:")
+    Define k.i
+    For k = 0 To 30
+      UartWriteStr(" ")
+      PutHexN(PeekA(MscCbwAddr() + k), 2)
+    Next
+    PrintNl()
+    UartWriteStr("     CSW read reported ")
+    PrintDec(MscLastIn())
+    UartWriteStr(" bytes  (13 = the device answered; 64 = it did not)")
+    PrintNl()
+    ; WHERE the buffers are, not just what is in them. Control transfers
+    ; DMA into the xhci arena and work; this one DMAs into a plain global
+    ; and does not. Alignment is the obvious difference between the two,
+    ; and it is one line to rule in or out.
+    UartWriteStr("     CSW buffer at $")
+    PutHexN(MscCswAddr(), 16)
+    UartWriteStr("   64-byte aligned: ")
+    If (MscCswAddr() & 63) = 0
+      UartWriteStr("yes")
+    Else
+      UartWriteStr("NO, offset ")
+      PrintDec(MscCswAddr() & 63)
+    EndIf
+    PrintNl()
+    UartWriteStr("     bounce buffer at $")
+    PutHexN(XhciBounceAddr(), 16)
+    UartWriteStr("   (control transfers into this one work)")
+    PrintNl()
+    UartWriteStr("     CSW back:")
+    For k = 0 To 12
+      UartWriteStr(" ")
+      PutHexN(PeekA(MscCswAddr() + k), 2)
+    Next
+    PrintNl()
+    UartDrain()
+  EndIf
+
+  Step_("SCSI bring-up")
+  If MscInit() = 0
+    Bad(MscErrorText())
+    UartWriteStr("     sense key ")
+    PrintDec(MscSenseKey())
+    UartWriteStr(", additional code $")
+    PutHexN(MscSenseAsc(), 2)
+    PrintNl()
+    ProcedureReturn 6
+  EndIf
+  Ok()
+
+  UartWriteStr("  vendor   ")
+  UartWriteStr(MscVendor())
+  PrintNl()
+  UartWriteStr("  product  ")
+  UartWriteStr(MscProduct())
+  PrintNl()
+  UartWriteStr("  blocks   ")
+  PrintDec(MscBlockCount())
+  UartWriteStr(" of ")
+  PrintDec(MscBlockSize())
+  UartWriteStr(" bytes")
+  PrintNl()
+  ; Capacity in whole gigabytes, the way a label reports it.
+  UartWriteStr("  capacity ")
+  PrintDec((MscBlockCount() / 2048) / 1024)
+  UartWriteStr(" GB")
+  PrintNl()
+  UartDrain()
+
+  ; ---- the actual read -----------------------------------------------
+  Step_("READ(10) block 0")
+  If MscReadBlock(0, @blk[0]) = 0
+    Bad(MscErrorText())
+    ProcedureReturn 7
+  EndIf
+  Ok()
+
+  PrintNl()
+  Say("first 4 rows of block 0:")
+  DumpBlock(@blk[0], 4)
+
+  ; ---- and the proof --------------------------------------------------
+  sig = PeekA(@blk[0] + 510) | (PeekA(@blk[0] + 511) << 8)
+  UartWriteStr("  boot signature $")
+  PutHexN(sig, 4)
+  If sig = $AA55
+    UartWriteStr("   correct - this is a partition table")
+  Else
+    UartWriteStr("   NOT $AA55 - not an MBR")
+  EndIf
+  PrintNl()
+
+  ; Partition one's entry begins at 446. Type byte at +4, first LBA at
+  ; +8 little-endian.
+  ptype = PeekA(@blk[0] + 446 + 4)
+  plba  = PeekA(@blk[0] + 446 + 8) | (PeekA(@blk[0] + 446 + 9) << 8) | (PeekA(@blk[0] + 446 + 10) << 16) | (PeekA(@blk[0] + 446 + 11) << 24)
+  UartWriteStr("  partition 1 type $")
+  PutHexN(ptype, 2)
+  If ptype = $0B Or ptype = $0C
+    UartWriteStr("   FAT32")
+  ElseIf ptype = $0E Or ptype = $06
+    UartWriteStr("   FAT16")
+  EndIf
+  UartWriteStr("  first LBA ")
+  PrintDec(plba)
+  PrintNl()
+
+  PrintNl()
+  Say("=== the stick was read ===")
+  ProcedureReturn 0
+EndProcedure

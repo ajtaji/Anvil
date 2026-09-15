@@ -244,7 +244,6 @@ def build(compiler: pathlib.Path, suffix: str, frontend: str | None = None,
     shutil.copy2(GATE, tests / GATE.name)
     shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", work / "RaspberryPi4" / "Intrinsics")
     shutil.copytree(ROOT / "Boards", work / "Boards")
-    shutil.copy2(ROOT / "keywords.def", work / "keywords.def")
     image = work / f"{suffix}.img"
     command = [str(compiler), "--compile", (tests / GATE.name).relative_to(work).as_posix(),
                "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),

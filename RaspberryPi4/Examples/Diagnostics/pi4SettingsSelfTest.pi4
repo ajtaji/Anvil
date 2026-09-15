@@ -1,0 +1,977 @@
+; ======================================================================
+; pi4SettingsSelfTest - the gate program for Anvil/Core/settings.pi4
+; ----------------------------------------------------------------------
+; settings.pi4 splits cleanly in two and this file tests the two halves
+; two different ways, because they are not equally hard to prove.
+;
+;   THE PURE HALF - the table, the parser and the serialiser - touches no
+;   medium at all. It is exercised here directly, against text fixtures
+;   the harness pokes into tsrc[] before Main runs, exactly the way a
+;   real file's bytes arrive from somewhere else.
+;
+;   THE I/O HALF calls fat.pi4, so it needs a filesystem. There is no SD
+;   card in this machine, so the harness fabricates a FAT32 volume in
+;   tdisk[] the same way a64_fat_check.py does, and this file hands
+;   fat.pi4 the two seams - TdRead and TdWrite - that the monitor fills
+;   with @MscReadBlock and @MscWriteBlock.
+;
+; Every check appends to res[]. The harness holds the expected values
+; independently, so a check that silently stops running is a length
+; mismatch and not a pass.
+;
+; AND res[] IS NOT THE EVIDENCE FOR THE SAVE. Everything in res[] is
+; settings.pi4 reporting on settings.pi4. What proves the save is the
+; harness reading tdisk[] back out of memory afterwards, walking the root
+; directory, following SETTINGS.TXT's cluster chain and parsing the text
+; for itself - asking this program nothing.
+;
+; ======================================================================
+; EVERY CREDENTIAL IN THIS FILE IS FAKE, AND THAT IS A RULE
+; ======================================================================
+; "testpass1" is not a passphrase for anything. Neither is any of the
+; digit runs used to test the length limits, and neither is any of the
+; network names - "HouseNet", "BenchNet", "NetOne" and the rest are
+; invented here to exercise the two comparisons that matter and are not
+; the names of any network this board has ever seen.
+;
+; NO REAL PASSPHRASE MAY BE WRITTEN ANYWHERE UNDER THIS TREE - not in a
+; .pi4, not in a .py, not in a comment, and not temporarily. The real
+; credentials live in SETTINGS.TXT on the board's own boot medium, which
+; is not in the repository and is the only place they belong. A test
+; that needed a real one would be a test that had gone wrong, because
+; nothing in this library treats one byte differently from another.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+; THE REAL STORAGE BACKEND, not a double.
+;
+; Anvil/Core/settings.pi4 stopped calling fat.pi4 directly when the
+; Arduino UNO Q arrived: it reaches a medium only through the HwFile*
+; seam (Anvil/Hal/hal.pi4), and RaspberryPi4/Board/hw_file.pi4 is this
+; board's implementation of it over fat.pi4.
+;
+; This gate includes THAT FILE rather than a stub, so the thing under
+; test is the whole path a `saveenv` takes. It is possible
+; because the backend takes its block writer as a pointer nominated by
+; whatever brought the medium up - Board/storage.pi4 on a real board,
+; PhaseMedium below on a fabricated volume - instead of naming a USB
+; driver inline.
+; uart.pi4 is INCLUDED AND NEVER EXECUTED, and it is here only because
+; Anvil/Hal/hal.pi4's RequireCap prints a refusal and therefore names
+; Print, PrintN and UartWriteStr. This program has no console at all - it
+; reports through the res[] array the harness reads out of memory - and
+; it never calls a gated command, so RequireCap never runs and not one
+; MMIO access happens. Linking the names is the whole of the cost.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Board/hw_file.pi4"
+XIncludeFile "Anvil/Core/settings.pbi"
+
+#TD_SECTORS   = 2048
+#TD_BYTES     = 1048576      ; 2048 * 512
+#RES_MAX      = 512          ; was 320 until the Wi-Fi slot phase was
+                             ; added. Chk() drops anything past this
+                             ; SILENTLY while still counting it, so an
+                             ; overflow shows up as a length mismatch
+                             ; against the harness and not as a pass -
+                             ; but it would still be an unreadable
+                             ; failure, so the array is grown with the
+                             ; phase rather than after it
+#TS_SLOTS     = 8            ; text fixtures the harness fills in
+#TS_SLOT      = 512
+#TS_BYTES     = 4096         ; 8 * 512
+#OUT_BYTES    = 6144         ; where SettingsSerialise is asked to write
+#GUARD_BYTES  = 512          ; a small destination with slack after it, so
+                             ; an OVERRUN can be seen and not only a
+                             ; refusal - see PhaseRoundTrip
+
+; The partition the harness fabricated. Literals here so this file can
+; tell "inside the partition" from "outside" without asking fat.pi4,
+; which is part of what is being tested.
+#TD_PART_LBA  = 63
+#TD_PART_SECS = 66600
+
+Global Dim tdisk.a[#TD_BYTES]
+Global Dim res.i[#RES_MAX]
+Global nres.i = 0
+
+Global Dim tsrc.a[#TS_BYTES]      ; the parser's fixtures, poked in
+Global Dim tsrcLen.i[#TS_SLOTS]   ; and their lengths
+Global Dim tout.a[#OUT_BYTES]     ; the serialiser's destination
+Global Dim tguard.a[#GUARD_BYTES] ; and a deliberately too-small one
+
+Global tdWrites.i   = 0
+Global tdWOutside.i = 0
+Global tdMisaligned.i = 0
+
+Procedure Chk(v.i)
+  If nres < #RES_MAX
+    res[nres] = v
+  EndIf
+  nres = nres + 1
+EndProcedure
+
+; The block reader. Same signature and the same 4-byte alignment rule as
+; SdReadBlock, so any buffer fat.pi4 hands it that the real reader would
+; have refused is counted and fails the read.
+Procedure.i TdRead(lba.i, *buf)
+  Define i.i
+  Define *src
+  If (*buf & 3) <> 0
+    tdMisaligned = tdMisaligned + 1
+    ProcedureReturn 0
+  EndIf
+  If lba < 0 Or lba >= #TD_SECTORS
+    ProcedureReturn 0
+  EndIf
+  *src = @tdisk[0] + (lba * 512)
+  i = 0
+  While i < 128
+    PokeL(*buf + (i * 4), PeekN(*src + (i * 4)))
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The block writer. Counted before anything else happens, because "the
+; save was refused and NOT ONE SECTOR WAS WRITTEN" is one of the
+; assertions and a refused attempt still has to be visible.
+Procedure.i TdWrite(lba.i, *buf)
+  Define i.i
+  Define *dst
+  tdWrites = tdWrites + 1
+  If lba < #TD_PART_LBA Or lba >= (#TD_PART_LBA + #TD_PART_SECS)
+    tdWOutside = tdWOutside + 1
+  EndIf
+  If (*buf & 3) <> 0
+    tdMisaligned = tdMisaligned + 1
+    ProcedureReturn 0
+  EndIf
+  If lba < 0 Or lba >= #TD_SECTORS
+    ProcedureReturn 0
+  EndIf
+  *dst = @tdisk[0] + (lba * 512)
+  i = 0
+  While i < 128
+    PokeL(*dst + (i * 4), PeekN(*buf + (i * 4)))
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; Compare two NUL-terminated strings. 1 if equal. Written here rather
+; than taken from string.pi4 so this program has no dependency the
+; library under test does not have.
+Procedure.i TStrEq(*a, *b)
+  Define i.i
+  Define x.i
+  Define y.i
+  If *a = 0 Or *b = 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < 4096
+    x = PeekA(*a + i)
+    y = PeekA(*b + i)
+    If x <> y
+      ProcedureReturn 0
+    EndIf
+    If x = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; 1 if the key holds exactly this value.
+Procedure.i TValIs(*key, *want)
+  ProcedureReturn TStrEq(SettingsGet(*key), *want)
+EndProcedure
+
+; The length of a NUL-terminated string at an address. settings.pi4 has
+; set_Len and it is private, correctly - a library's internals are not
+; a gate's to reach into either. Used to MEASURE the key names the slot
+; scheme builds at run time against #SET_KEY_MAX, rather than counting
+; the characters by eye in a comment and being wrong.
+Procedure.i TLenZ(*s)
+  Define n.i
+  If *s = 0
+    ProcedureReturn -1
+  EndIf
+  n = 0
+  While PeekA(*s + n) <> 0
+    n = n + 1
+    If n > 4096
+      ProcedureReturn n
+    EndIf
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i TsAddr(slot.i)
+  ProcedureReturn @tsrc[0] + (slot * #TS_SLOT)
+EndProcedure
+
+; ======================================================================
+;  PHASE 1 - THE TABLE, with no medium and no text
+; ======================================================================
+Procedure PhaseTable()
+  Define i.i
+  Define ok.i
+  Define full.i
+
+  SettingsReset()
+  Chk(SettingsCount())                                   ; 0
+
+  Chk(SettingsSet("wifi.network", "Workshop"))           ; 1
+  Chk(SettingsCount())                                   ; 1
+  Chk(TValIs("wifi.network", "Workshop"))                ; 1
+  Chk(SettingsDirty())                                   ; 1
+
+  ; The case fold. A key set in one spelling is found in another, and
+  ; the canonical form kept in the table is the lower-case one.
+  Chk(TValIs("WiFi.Network", "Workshop"))                ; 1
+  Chk(TStrEq(SettingsKeyAt(0), "wifi.network"))          ; 1
+
+  ; Replacing a value does not add a key.
+  Chk(SettingsSet("WIFI.NETWORK", "Bench"))              ; 1
+  Chk(SettingsCount())                                   ; 1
+  Chk(TValIs("wifi.network", "Bench"))                   ; 1
+
+  ; An empty value is legal and is NOT the same as an absent key.
+  Chk(SettingsSet("boot.file", ""))                      ; 1
+  Chk(SettingsHas("boot.file"))                          ; 1
+  Chk(SettingsLength("boot.file"))                       ; 0
+  Chk(SettingsHas("boot.missing"))                       ; 0
+  Chk(SettingsLength("boot.missing"))                    ; -1
+
+  ; Every refusal, by its own code.
+  Chk(SettingsSet("", "x"))                              ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NO_KEY 2
+  Chk(SettingsSet("has space", "x"))                     ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_KEY_CHAR 4
+  Chk(SettingsSet("has=equals", "x"))                    ; 0
+  Chk(SettingsLastError())                               ; 4
+  Chk(SettingsSet("thisnameisfarfarlongerthanthirtyonebytes", "x"))  ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_KEY_LONG 3
+  Chk(SettingsSet("edge", " leading"))                   ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_VALUE_EDGE 7
+  Chk(SettingsSet("edge", "trailing "))                  ; 0
+  Chk(SettingsLastError())                               ; 7
+  Chk(SettingsHas("edge"))                               ; 0 - nothing was
+                                                         ; part-applied
+
+  ; A value that is exactly at the limit, and one byte over it. 95 and 96
+  ; characters, counted by hand and by the harness.
+  Chk(SettingsSet("v95", "12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345"))
+  Chk(SettingsLength("v95"))                             ; 95
+  Chk(SettingsSet("v96", "123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"))
+  Chk(SettingsLastError())                               ; #SET_ERR_VALUE_LONG 5
+
+  ; Remove, and the order of what is left.
+  Chk(SettingsSet("aaa", "1"))                           ; 1
+  Chk(SettingsSet("bbb", "2"))                           ; 1
+  Chk(SettingsCount())                                   ; 5
+  Chk(SettingsRemove("boot.file"))                       ; 1
+  Chk(SettingsCount())                                   ; 4
+  Chk(TStrEq(SettingsKeyAt(0), "wifi.network"))          ; 1
+  Chk(TStrEq(SettingsKeyAt(1), "v95"))                   ; 1
+  Chk(TStrEq(SettingsKeyAt(2), "aaa"))                   ; 1
+  Chk(TStrEq(SettingsKeyAt(3), "bbb"))                   ; 1
+  Chk(SettingsRemove("boot.file"))                       ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NOTFOUND 9
+
+  ; Which keys are secret. The rule is the NAME, not a list.
+  Chk(SettingsIsSecret("wifi.network"))                  ; 0
+  Chk(SettingsIsSecret("wifi.password.plaintext"))       ; 1
+  Chk(SettingsIsSecret("WIFI.PASSWORD.PLAINTEXT"))       ; 1
+  Chk(SettingsIsSecret("http.auth.secret"))              ; 1
+  Chk(SettingsIsSecret("passphrase"))                    ; 0
+  Chk(TStrEq(SettingsMaskText(), "********"))            ; 1
+
+  ; And asking about a key must never leave an error behind for the next
+  ; message the monitor prints.
+  SettingsSet("k", "v")
+  SettingsHas("nosuchkey")
+  Chk(SettingsLastError())                               ; #SET_ERR_NONE 0
+
+  ; THE FAN'S OWN KEYS, added 2026-09-06 with the fan policy.
+  ;
+  ; NOTHING ABOUT THEM IS SPECIAL, and that is precisely the claim worth
+  ; checking rather than assuming. A key whose NAME the store's own rules
+  ; refuse does not fail loudly at the setter - Anvil/Core/fan_cmd.pi4
+  ; would print its confirmation and the value would simply never be in
+  ; the table - so the symptom would be a fan that forgets which pin it
+  ; is on at every reset, with nothing in any transcript saying why. Six
+  ; keys, six lines, and the question is settled for good.
+  SettingsReset()
+  Chk(SettingsSet("fan.pin", "18"))                      ; 1
+  Chk(SettingsSet("fan.mode", "auto"))                   ; 1
+  ; THE THREE CURVE KEYS CARRY A CAPITAL F, and checking them here is
+  ; not a formality. The unit moved INTO the key name on 2026-09-07, so
+  ; that an older card's celsius curve cannot be misread as Fahrenheit -
+  ; and that only works if the store will hold a name with an uppercase
+  ; letter in it. If it will not, the fan silently forgets its curve at
+  ; every reset and nothing in any transcript says why.
+  Chk(SettingsSet("fan.lowF", "113"))                    ; 1
+  Chk(SettingsSet("fan.highF", "158"))                   ; 1
+  Chk(SettingsSet("fan.hystF", "5"))                     ; 1
+  Chk(SettingsSet("fan.hz", "25000"))                    ; 1
+  Chk(SettingsCount())                                   ; 6
+  Chk(TValIs("fan.pin", "18"))                           ; 1
+  Chk(TValIs("fan.hz", "25000"))                         ; 1
+  ; NONE OF THEM IS SECRET. The masking rule is the NAME, and a fan pin
+  ; in a screenshot is harmless; masking it would only hide it from the
+  ; person trying to work out why the fan is not turning.
+  Chk(SettingsIsSecret("fan.pin"))                       ; 0
+  Chk(SettingsIsSecret("fan.mode"))                      ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NONE 0
+
+  ; The Wi-Fi limits, cited to cyw43.pico2 in the library.
+  SettingsReset()
+  Chk(SettingsSetWifiNetwork(""))                        ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_WIFI_NETWORK 17
+  Chk(SettingsSetWifiNetwork("Workshop"))                ; 1
+  Chk(TStrEq(SettingsWifiNetwork(), "Workshop"))         ; 1
+  Chk(SettingsSetWifiPassword("shortie"))                ; 0 - seven
+  Chk(SettingsLastError())                               ; #SET_ERR_WIFI_PASS 18
+  Chk(SettingsSetWifiPassword("eightchr"))               ; 1 - eight
+  Chk(TStrEq(SettingsWifiPassword(), "eightchr"))        ; 1
+  Chk(TStrEq(SettingsWifiPasswordKey(), "wifi.password.plaintext"))  ; 1
+
+  ; The table filling up. Thirty-two is the whole idea; the thirty-third
+  ; must refuse rather than overwrite something.
+  SettingsReset()
+  ok = 0
+  i = 0
+  While i < 32
+    ; Keys k00 .. k31, built from two digits so no two collide.
+    tout[0] = 107                       ; k
+    tout[1] = 48 + (i / 10)             ; the tens digit
+    tout[2] = 48 + (i % 10)             ; and the units
+    tout[3] = 0
+    ok = ok + SettingsSet(@tout[0], "x")
+    i = i + 1
+  Wend
+  Chk(ok)                                                ; 32
+  Chk(SettingsCount())                                   ; 32
+  tout[0] = 122 : tout[1] = 122 : tout[2] = 0            ; zz
+  full = SettingsSet(@tout[0], "x")
+  Chk(full)                                              ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_FULL 8
+  Chk(SettingsCount())                                   ; 32 - unchanged
+EndProcedure
+
+; ======================================================================
+;  PHASE 2 - THE PARSER, over fixtures the harness poked into tsrc[]
+; ======================================================================
+Procedure PhaseParse()
+  ; --- slot 0: the everything file ------------------------------------
+  ; Comments in both spellings, blank lines, CRLF and lone-CR endings, a
+  ; UTF-8 byte order mark, blanks around the equals sign, a value with
+  ; its own equals signs in it, and a duplicate key.
+  Chk(SettingsParse(TsAddr(0), tsrcLen[0]))              ; 1
+  Chk(SettingsLastError())                               ; 0
+  Chk(SettingsLoadState())                               ; 1
+  Chk(SettingsCount())                                   ; 5
+  Chk(TValIs("wifi.network", "Workshop"))                ; 1
+  Chk(TValIs("wifi.password.plaintext", "correct-horse-9")) ; 1
+  Chk(TValIs("console.baud", "1500000"))                 ; 1
+  Chk(TValIs("some.base64", "YWJjZA=="))                 ; 1
+  Chk(TValIs("dup.key", "second"))                       ; 1 - LAST wins
+  Chk(SettingsDuplicates())                              ; 1
+  Chk(SettingsDirty())                                   ; 0 - a parse is
+                                                         ; not a change
+
+  ; --- slot 1: a line with no equals sign, on line 3 ------------------
+  Chk(SettingsParse(TsAddr(1), tsrcLen[1]))              ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_SYNTAX 10
+  Chk(SettingsErrorLine())                               ; 3
+  Chk(SettingsLoadState())                               ; 2 - PARTIAL
+  Chk(SettingsCount())                                   ; 2 - what came
+                                                         ; before it IS there
+
+  ; --- slot 2: nothing to the left of the equals, on line 2 -----------
+  Chk(SettingsParse(TsAddr(2), tsrcLen[2]))              ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NO_KEY 2
+  Chk(SettingsErrorLine())                               ; 2
+
+  ; --- slot 3: an over-length value, on line 1 ------------------------
+  Chk(SettingsParse(TsAddr(3), tsrcLen[3]))              ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_VALUE_LONG 5
+  Chk(SettingsErrorLine())                               ; 1
+
+  ; --- slot 4: an over-length key, on line 1 --------------------------
+  Chk(SettingsParse(TsAddr(4), tsrcLen[4]))              ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_KEY_LONG 3
+  Chk(SettingsErrorLine())                               ; 1
+
+  ; --- slot 5: comments and blanks only -------------------------------
+  Chk(SettingsParse(TsAddr(5), tsrcLen[5]))              ; 1
+  Chk(SettingsCount())                                   ; 0
+
+  ; --- an empty buffer is a valid, empty file -------------------------
+  Chk(SettingsParse(TsAddr(6), 0))                       ; 1
+  Chk(SettingsCount())                                   ; 0
+  Chk(SettingsParse(0, 4))                               ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NULL 1
+EndProcedure
+
+; ======================================================================
+;  PHASE 3 - THE ROUND TRIP. Serialise the table, parse the bytes back,
+;  and compare. This is the property that actually matters, because it
+;  is exactly what a save followed by a reboot does.
+; ======================================================================
+Procedure PhaseRoundTrip()
+  Define n.i
+  Define i.i
+  Define same.i
+
+  SettingsReset()
+  SettingsSet("wifi.network", "Workshop 2.4GHz")
+  SettingsSet("wifi.password.plaintext", "correct-horse-9")
+  SettingsSet("console.baud", "1500000")
+  SettingsSet("boot.file", "ANVIL.IMG")
+  SettingsSet("odd.value", "a=b=c")
+
+  n = SettingsSerialise(@tout[0], #OUT_BYTES)
+  Chk(Bool(n > 0))                                             ; 1
+  Chk(SettingsLastError())                               ; 0
+
+  ; The first byte must be '#': every saved file starts with the banner,
+  ; which is what makes the warning impossible to lose.
+  Chk(PeekA(@tout[0]))                                   ; 35
+  ; And the last byte must be a newline, so an editor does not add one.
+  Chk(PeekA(@tout[0] + n - 1))                           ; 10
+
+  Chk(SettingsParse(@tout[0], n))                        ; 1
+  Chk(SettingsCount())                                   ; 5
+  Chk(TValIs("wifi.network", "Workshop 2.4GHz"))         ; 1
+  Chk(TValIs("wifi.password.plaintext", "correct-horse-9")) ; 1
+  Chk(TValIs("console.baud", "1500000"))                 ; 1
+  Chk(TValIs("boot.file", "ANVIL.IMG"))                  ; 1
+  Chk(TValIs("odd.value", "a=b=c"))                      ; 1 - the FIRST
+                                                         ; equals splits
+
+  ; The order survives too, which is what keeps two saved files diffable.
+  same = 1
+  i = 0
+  While i < 5
+    If SettingsKeyAt(i) = 0
+      same = 0
+    EndIf
+    i = i + 1
+  Wend
+  Chk(same)                                              ; 1
+  Chk(TStrEq(SettingsKeyAt(0), "wifi.network"))          ; 1
+  Chk(TStrEq(SettingsKeyAt(4), "odd.value"))             ; 1
+
+  ; A destination too small must REFUSE, not truncate - AND MUST NOT
+  ; WRITE PAST THE END OF IT. The second half is the one a finished
+  ; result cannot show, and --mutate found it: with the string writer's
+  ; bounds check removed the call still returned -1, because the BYTE
+  ; writer's own check fired one line later. It had already run sixty
+  ; bytes past the end of the caller's buffer by then. So the buffer is
+  ; zeroed first and the slack after the limit is checked afterwards.
+  i = 0
+  While i < #GUARD_BYTES
+    tguard[i] = 0
+    i = i + 1
+  Wend
+  Chk(SettingsSerialise(@tguard[0], 64))                 ; -1
+  Chk(SettingsLastError())                               ; #SET_ERR_TEXT_LONG 11
+  same = 1
+  i = 64
+  While i < #GUARD_BYTES
+    If tguard[i] <> 0
+      same = 0
+    EndIf
+    i = i + 1
+  Wend
+  Chk(same)                                              ; 1
+EndProcedure
+
+; ======================================================================
+;  PHASE 4 - THE NUMBERED WI-FI SLOTS
+; ======================================================================
+;  Four networks with a preference order, plus the old flat pair sitting
+;  behind them as a pseudo-slot so that a stick written by the previous
+;  build keeps working. See the WI-FI, MORE THAN ONE NETWORK section in
+;  settings.pi4 for the whole of the reasoning; this phase asserts the
+;  parts of it that are properties rather than prose.
+;
+;  THE THREE THINGS THAT WOULD ACTUALLY HURT, and which are therefore
+;  tested first and hardest:
+;
+;    1. THE COMPARISON IN SettingsWifiFindSsid GOING SOFT. Two of the
+;       real networks around this board differ from each other by ONE
+;       LETTER, and one differs from another only by a "2.4ghz" suffix.
+;       A fold or a normalisation makes the board join the wrong access
+;       point with the right passphrase for a different one, and report
+;       an authentication failure against a name on the screen that
+;       looks perfectly correct. Four assertions below exist only to
+;       make that mutation red.
+;    2. THE LEGACY PAIR MOVING TO THE FRONT OF THE ORDER. It is last on
+;       purpose - a floor, not a preference - and if it were first then
+;       every board that has ever run the old build would silently
+;       ignore slot 1 forever.
+;    3. A NUMBERED PASSPHRASE LOSING ITS MASK. SettingsIsSecret works on
+;       the substring "password", and it keeps working here only because
+;       the key tail is "password.plaintext" and was not shortened to
+;       match "ssid". Asserted rather than assumed.
+; ======================================================================
+Procedure PhaseWifiSlots()
+  Define s.i
+  Define n.i
+  Define ok.i
+  Define ka.i
+  Define kb.i
+
+  ; --- the geometry, from the named constants and nowhere else --------
+  SettingsReset()
+  Chk(SettingsWifiSlots())                               ; 4
+  Chk(SettingsWifiLegacySlot())                          ; 5
+
+  ; --- the key names, assembled at run time ---------------------------
+  Chk(TStrEq(SettingsWifiSlotSsidKey(1), "wifi.1.ssid"))              ; 1
+  Chk(TStrEq(SettingsWifiSlotSsidKey(4), "wifi.4.ssid"))              ; 1
+  Chk(TStrEq(SettingsWifiSlotPasswordKey(1), "wifi.1.password.plaintext"))  ; 1
+  Chk(TStrEq(SettingsWifiSlotPasswordKey(4), "wifi.4.password.plaintext"))  ; 1
+
+  ; THE LONGEST KEY THE SCHEME CAN GENERATE, MEASURED. #SET_KEY_MAX is
+  ; 31 bytes not counting the NUL (settings.pi4:500) and the passphrase
+  ; key for a one-digit slot is 25 - "wifi." 5 + digit 1 + dot 1 +
+  ; "password.plaintext" 18. A two-digit slot would be 26. Six bytes of
+  ; headroom, and the number comes from the library rather than from
+  ; somebody counting characters in a comment.
+  Chk(TLenZ(SettingsWifiSlotPasswordKey(4)))             ; 25
+  Chk(TLenZ(SettingsWifiSlotSsidKey(4)))                 ; 11
+
+  ; The pseudo-slot hands back the OLD FLAT NAMES, which is the whole
+  ; trick that lets one walk cover both spellings.
+  Chk(TStrEq(SettingsWifiSlotSsidKey(5), "wifi.network"))                 ; 1
+  Chk(TStrEq(SettingsWifiSlotPasswordKey(5), "wifi.password.plaintext"))  ; 1
+
+  ; And a slot number this store does not keep gets no name at all.
+  Chk(SettingsWifiSlotSsidKey(0))                        ; 0
+  Chk(SettingsWifiSlotSsidKey(6))                        ; 0
+  Chk(SettingsWifiSlotPasswordKey(0))                    ; 0
+  Chk(SettingsWifiSlotPasswordKey(6))                    ; 0
+
+  ; TWO BUFFERS AND NOT ONE. Both addresses are held at once and both
+  ; names must still be right. With a single shared buffer the second
+  ; call overwrites the first name while its address is still live, and
+  ; this is the only assertion that would see it.
+  ka = SettingsWifiSlotSsidKey(2)
+  kb = SettingsWifiSlotPasswordKey(3)
+  Chk(TStrEq(ka, "wifi.2.ssid"))                         ; 1
+  Chk(TStrEq(kb, "wifi.3.password.plaintext"))           ; 1
+
+  ; --- THE MASK. A numbered passphrase is secret for exactly the same
+  ;     reason the flat one is: the substring "password" is in its name.
+  Chk(SettingsIsSecret("wifi.1.ssid"))                   ; 0
+  Chk(SettingsIsSecret("wifi.1.password.plaintext"))     ; 1
+  Chk(SettingsIsSecret("wifi.4.password.plaintext"))     ; 1
+  Chk(SettingsIsSecret(SettingsWifiSlotPasswordKey(4)))  ; 1
+  Chk(SettingsIsSecret(SettingsWifiSlotSsidKey(4)))      ; 0
+
+  ; --- an empty store: every reader says "nothing", and QUIETLY -------
+  ; Walking four slots to find the none that are populated is the normal
+  ; use of this API, and it must not leave #SET_ERR_NOTFOUND behind for
+  ; the next message the monitor prints.
+  SettingsReset()
+  Chk(SettingsWifiSlotSsid(1))                           ; 0
+  Chk(SettingsWifiSlotPassword(1))                       ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NONE 0
+  Chk(SettingsWifiSlotUsed(1))                           ; 0
+  Chk(SettingsWifiNextSlot(0))                           ; 0
+  Chk(SettingsWifiSlotCount())                           ; 0
+  Chk(SettingsWifiFindSsid("HouseNet"))                  ; 0
+  Chk(SettingsLastError())                               ; 0
+
+  ; A slot number that does not exist IS a caller mistake and does get
+  ; its own code, which is what separates it from an empty slot.
+  Chk(SettingsWifiSlotSsid(9))                           ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_WIFI_SLOT 19
+
+  ; --- setting a slot. FAKE CREDENTIALS, see the header ---------------
+  SettingsReset()
+  Chk(SettingsSetWifiSlotSsid(1, "WorkshopAP"))          ; 1
+  Chk(SettingsSetWifiSlotPassword(1, "testpass1"))       ; 1 - FAKE
+  Chk(TValIs("wifi.1.ssid", "WorkshopAP"))               ; 1
+  Chk(TValIs("wifi.1.password.plaintext", "testpass1"))  ; 1
+  Chk(TStrEq(SettingsWifiSlotSsid(1), "WorkshopAP"))     ; 1
+  Chk(TStrEq(SettingsWifiSlotPassword(1), "testpass1"))  ; 1
+  Chk(SettingsWifiSlotUsed(1))                           ; 1
+  Chk(SettingsCount())                                   ; 2
+
+  ; --- the limits, and they are the SAME FOUR CONSTANTS the flat pair
+  ;     uses. #SET_WIFI_NET_MIN/MAX and #SET_WIFI_PASS_MIN/MAX, cited in
+  ;     settings.pi4 to cyw43.pico2:459-466.
+  Chk(SettingsSetWifiSlotSsid(1, ""))                    ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_WIFI_NETWORK 17
+  Chk(SettingsSetWifiSlotPassword(1, "shortie"))         ; 0 - seven
+  Chk(SettingsLastError())                               ; #SET_ERR_WIFI_PASS 18
+  ; and neither refusal changed what was there
+  Chk(TStrEq(SettingsWifiSlotSsid(1), "WorkshopAP"))     ; 1
+  Chk(TStrEq(SettingsWifiSlotPassword(1), "testpass1"))  ; 1
+
+  ; A SLOT NUMBER OUT OF RANGE, and the legacy pseudo-slot, which READS
+  ; but must never be WRITTEN through this API - a command that could
+  ; create the old flat key on a stick that never had one would put a
+  ; credential last in the order and leave it there to be puzzled over.
+  Chk(SettingsSetWifiSlotSsid(0, "Nope"))                ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_WIFI_SLOT 19
+  Chk(SettingsSetWifiSlotSsid(5, "Nope"))                ; 0
+  Chk(SettingsLastError())                               ; 19
+  Chk(SettingsSetWifiSlotPassword(5, "testpass1"))       ; 0
+  Chk(SettingsLastError())                               ; 19
+  Chk(SettingsHas("wifi.network"))                       ; 0 - and none of
+                                                         ; that created it
+
+  ; --- THE TWO LENGTHS THE BENCH ACTUALLY CARES ABOUT -----------------
+  ; A 32-byte SSID is WPA2's ceiling (#SET_WIFI_NET_MAX) and a 63-byte
+  ; passphrase is the other one (#SET_WIFI_PASS_MAX). Both have to fit
+  ; #SET_VAL_MAX = 95 (settings.pi4:502) with room to spare, and the
+  ; byte over each has to be refused rather than truncated.
+  SettingsReset()
+  Chk(SettingsSetWifiSlotSsid(2, "abcdefghijklmnopqrstuvwxyz012345"))     ; 32 -> 1
+  Chk(SettingsLength("wifi.2.ssid"))                     ; 32
+  Chk(SettingsSetWifiSlotSsid(2, "abcdefghijklmnopqrstuvwxyz0123456"))    ; 33 -> 0
+  Chk(SettingsLastError())                               ; 17
+  Chk(SettingsLength("wifi.2.ssid"))                     ; 32 - unchanged
+  ; 63 characters of obvious filler. NOT a passphrase for anything.
+  Chk(SettingsSetWifiSlotPassword(2, "012345678901234567890123456789012345678901234567890123456789abc"))  ; 1
+  Chk(SettingsLength("wifi.2.password.plaintext"))       ; 63
+  Chk(SettingsSetWifiSlotPassword(2, "012345678901234567890123456789012345678901234567890123456789abcd")) ; 64 -> 0
+  Chk(SettingsLastError())                               ; 18
+  Chk(SettingsLength("wifi.2.password.plaintext"))       ; 63 - unchanged
+  ; And the length the real names run to - twenty-eight characters with
+  ; a band suffix on the end. Well inside both limits; asserted so that
+  ; "will the long one fit" is answered by the gate and not by memory.
+  Chk(SettingsSetWifiSlotSsid(3, "aaaabbbbccccddddeeeeffff2.4g"))         ; 1
+  Chk(SettingsLength("wifi.3.ssid"))                     ; 28
+
+  ; --- BYTE-EXACT SSID MATCHING. The most important assertions here. --
+  ; Slots 1 and 2 differ ONLY by a band suffix. Slots 3 and 4 differ by
+  ; ONE LETTER. Both shapes are real on this bench and both are what a
+  ; case fold or a "helpful" normalisation would destroy.
+  SettingsReset()
+  Chk(SettingsSetWifiSlotSsid(1, "HouseNet2.4ghz"))      ; 1
+  Chk(SettingsSetWifiSlotSsid(2, "HouseNet"))            ; 1
+  Chk(SettingsSetWifiSlotSsid(3, "BenchNet"))            ; 1
+  Chk(SettingsSetWifiSlotSsid(4, "BenchNat"))            ; 1
+  Chk(SettingsWifiFindSsid("HouseNet2.4ghz"))            ; 1
+  Chk(SettingsWifiFindSsid("HouseNet"))                  ; 2 - the suffix is
+                                                         ; NOT stripped
+  Chk(SettingsWifiFindSsid("BenchNet"))                  ; 3
+  Chk(SettingsWifiFindSsid("BenchNat"))                  ; 4 - one letter, and
+                                                         ; a different network
+  Chk(SettingsWifiFindSsid("benchnet"))                  ; 0 - NOT case folded
+  Chk(SettingsWifiFindSsid("BENCHNET"))                  ; 0
+  Chk(SettingsWifiFindSsid("BenchNe"))                   ; 0 - a prefix is not
+                                                         ; a match
+  Chk(SettingsWifiFindSsid("BenchNetX"))                 ; 0 - nor is a longer
+                                                         ; string that starts
+                                                         ; with one
+  Chk(SettingsWifiFindSsid(" BenchNet"))                 ; 0 - and nothing is
+                                                         ; trimmed
+  Chk(SettingsWifiFindSsid("Nothing"))                   ; 0
+  Chk(SettingsWifiFindSsid(""))                          ; 0
+  Chk(SettingsWifiFindSsid(0))                           ; 0
+  Chk(SettingsLastError())                               ; 0 - and not one of
+                                                         ; those left an error
+
+  ; --- THE PREFERENCE ORDER, AND THE LEGACY PAIR AT THE BACK OF IT ----
+  SettingsReset()
+  Chk(SettingsSetWifiSlotSsid(2, "Two"))                 ; 1
+  Chk(SettingsSetWifiSlotSsid(4, "Four"))                ; 1
+  ; the OLD flat key, set through the OLD procedure, which still exists
+  Chk(SettingsSetWifiNetwork("Legacy"))                  ; 1
+  Chk(SettingsSetWifiPassword("testpass1"))              ; 1 - FAKE
+  Chk(SettingsWifiSlotCount())                           ; 3
+  Chk(SettingsWifiNextSlot(0))                           ; 2 - empty slot 1 is
+                                                         ; skipped
+  Chk(SettingsWifiNextSlot(2))                           ; 4
+  Chk(SettingsWifiNextSlot(4))                           ; 5 - THE LEGACY PAIR
+                                                         ; IS LAST, NOT FIRST
+  Chk(SettingsWifiNextSlot(5))                           ; 0
+  Chk(TStrEq(SettingsWifiSlotSsid(5), "Legacy"))         ; 1 - and it IS read
+  Chk(TStrEq(SettingsWifiSlotPassword(5), "testpass1"))  ; 1
+  Chk(SettingsWifiFindSsid("Two"))                       ; 2
+  Chk(SettingsWifiFindSsid("Legacy"))                    ; 5
+
+  ; --- A STICK WRITTEN BY THE PREVIOUS BUILD --------------------------
+  ; Nothing in it but the flat pair, exactly as an old SETTINGS.TXT
+  ; holds them. It must still be readable, the old accessors must still
+  ; answer, and nobody's saved passphrase may go missing on upgrade.
+  SettingsReset()
+  Chk(SettingsSet("wifi.network", "OldStick"))           ; 1
+  Chk(SettingsSet("wifi.password.plaintext", "testpass1"))  ; 1 - FAKE
+  Chk(SettingsWifiSlotCount())                           ; 1
+  Chk(SettingsWifiNextSlot(0))                           ; 5
+  Chk(TStrEq(SettingsWifiSlotSsid(5), "OldStick"))       ; 1
+  Chk(TStrEq(SettingsWifiSlotPassword(5), "testpass1"))  ; 1
+  Chk(SettingsWifiFindSsid("OldStick"))                  ; 5
+  Chk(TStrEq(SettingsWifiNetwork(), "OldStick"))         ; 1 - the old
+  Chk(TStrEq(SettingsWifiPassword(), "testpass1"))       ; 1 - accessors, which
+                                                         ; existing callers use
+
+  ; --- REMOVING A SLOT ------------------------------------------------
+  SettingsReset()
+  Chk(SettingsSetWifiSlotSsid(3, "Three"))               ; 1
+  Chk(SettingsSetWifiSlotPassword(3, "testpass1"))       ; 1 - FAKE
+  Chk(SettingsCount())                                   ; 2
+  Chk(SettingsRemoveWifiSlot(3))                         ; 1
+  Chk(SettingsCount())                                   ; 0 - BOTH keys went
+  Chk(SettingsRemoveWifiSlot(3))                         ; 0 - already empty
+  Chk(SettingsLastError())                               ; 0 - and that is not
+                                                         ; an error
+  ; HALF A SLOT GOES ENTIRELY. A passphrase with no name against it
+  ; names no network, so it does not count as populated - and it must
+  ; not be left behind either.
+  Chk(SettingsSetWifiSlotPassword(2, "testpass1"))       ; 1 - FAKE
+  Chk(SettingsCount())                                   ; 1
+  Chk(SettingsWifiSlotUsed(2))                           ; 0
+  Chk(SettingsWifiSlotCount())                           ; 0
+  Chk(SettingsRemoveWifiSlot(2))                         ; 1
+  Chk(SettingsCount())                                   ; 0
+  ; and a slot number that does not exist is refused by name
+  Chk(SettingsRemoveWifiSlot(9))                         ; 0
+  Chk(SettingsLastError())                               ; 19
+  ; the legacy pseudo-slot CAN be removed - that is the migration path,
+  ; and refusing it would leave `settings remove` and two hand-typed key
+  ; names as the only way out.
+  Chk(SettingsSetWifiNetwork("Legacy"))                  ; 1
+  Chk(SettingsSetWifiPassword("testpass1"))              ; 1 - FAKE
+  Chk(SettingsRemoveWifiSlot(5))                         ; 1
+  Chk(SettingsCount())                                   ; 0
+
+  ; --- ALL FOUR SLOTS AT ONCE, PLUS THE LEGACY PAIR -------------------
+  ; Ten keys of #SET_MAX_KEYS = 32, which is the arithmetic written into
+  ; settings.pi4's #SET_WIFI_SLOTS comment, measured here rather than
+  ; asserted in prose.
+  SettingsReset()
+  ok = 0
+  s = 1
+  While s <= 4
+    ok = ok + SettingsSetWifiSlotSsid(s, "NetOne")
+    ok = ok + SettingsSetWifiSlotPassword(s, "testpass1")   ; FAKE
+    s = s + 1
+  Wend
+  Chk(ok)                                                ; 8
+  Chk(SettingsCount())                                   ; 8
+  Chk(SettingsSetWifiNetwork("Legacy"))                  ; 1
+  Chk(SettingsSetWifiPassword("testpass1"))              ; 1 - FAKE
+  Chk(SettingsCount())                                   ; 10
+  Chk(SettingsWifiSlotCount())                           ; 5
+  ; FOUR SLOTS HOLDING THE SAME NAME IS LEGAL and the FIRST one wins,
+  ; because first means most preferred. A network whose key was changed,
+  ; kept in two slots until the new one is known good, is the case.
+  Chk(SettingsWifiFindSsid("NetOne"))                    ; 1
+
+  ; --- AND THE WHOLE LOT SURVIVES A ROUND TRIP ------------------------
+  ; Serialise, parse the bytes back, and ask the slot API again. This is
+  ; what a save followed by a reboot does, and it is the only assertion
+  ; here that covers the new key names going through the PARSER as well
+  ; as through the table.
+  n = SettingsSerialise(@tout[0], #OUT_BYTES)
+  Chk(Bool(n > 0))                                       ; 1
+  Chk(SettingsParse(@tout[0], n))                        ; 1
+  Chk(SettingsCount())                                   ; 10
+  Chk(SettingsWifiSlotCount())                           ; 5
+  Chk(TStrEq(SettingsWifiSlotSsid(4), "NetOne"))         ; 1
+  Chk(TStrEq(SettingsWifiSlotPassword(4), "testpass1"))  ; 1
+  Chk(TStrEq(SettingsWifiSlotSsid(5), "Legacy"))         ; 1
+  Chk(SettingsWifiNextSlot(4))                           ; 5
+  Chk(SettingsWifiFindSsid("Legacy"))                    ; 5
+  ; and every numbered passphrase is still a secret after the round trip
+  Chk(SettingsIsSecret(SettingsKeyAt(1)))                ; 1 - wifi.1.password
+  Chk(SettingsIsSecret(SettingsKeyAt(0)))                ; 0 - wifi.1.ssid
+EndProcedure
+
+; ======================================================================
+;  PHASE 5 - THE MEDIUM
+; ======================================================================
+Procedure PhaseMedium()
+  Define n.i
+
+  ; MOUNTED THROUGH THE FILESYSTEM DISPATCH, the way Board/storage.pi4
+  ; does. The HwFile* seam calls Fs* (Anvil/Storage/filesystem.pbi), which
+  ; answers nothing until FsMount has classified the volume; a bare
+  ; FatMount would leave the dispatch at #FS_NONE and every HwFileOpen
+  ; would be refused as a storage fault instead of "not found".
+  FsSetBlockReader(@TdRead)
+  Chk(FsMount(1))                                        ; 1
+  Chk(FatType())                                         ; 32
+
+  ; STAND IN FOR Board/storage.pi4. On a real board that file mounts the
+  ; medium and then declares three things to the seam: that something is
+  ; mounted, whether it can be written, and which procedure writes a
+  ; block. Here the volume is fabricated, so this does the same three.
+  ; Writable is left 0 for now - the next block is the safety property.
+  gHwFileMounted  = 1
+  gHwFileWritable = 0
+  gHwFileWriter   = 0
+
+  ; --- there is no settings file yet, and that has its own code -------
+  SettingsReset()
+  Chk(SettingsLoad())                                    ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_NO_FILE 12
+  Chk(SettingsCount())                                   ; 0
+  Chk(tdWrites)                                          ; 0
+
+  ; --- a save WHEN THE MEDIUM IS NOT WRITABLE must not touch a sector -
+  ;
+  ; THIS IS THE SAME SAFETY CLAIM AS BEFORE, RE-EXPRESSED, and the change
+  ; is worth stating rather than quietly making. It used to read: with no
+  ; block writer installed, SettingsSave must be refused by fat.pi4 with
+  ; #FAT_ERR_NO_WRITER and must not write a sector - because the library
+  ; never called FatSetBlockWriter itself.
+  ;
+  ; The library still never calls it. What moved is WHO does: the board's
+  ; HwFileWriteAll now arms the writer around its own single write and
+  ; disarms it on every path out, which is one place instead of three.
+  ; So "no writer installed" is no longer a state SettingsSave can reach -
+  ; and the property that matters, that a medium which cannot be written
+  ; is refused without a sector being touched, is reached through
+  ; HwFileWritable() instead. The code is #HW_FILE_READONLY rather than
+  ; #FAT_ERR_NO_WRITER, and the observable - tdWrites stays 0 - is
+  ; identical, because it is the observable that was ever the point.
+  SettingsSetWifiNetwork("Workshop")
+  SettingsSetWifiPassword("correct-horse-9")
+  SettingsSet("console.baud", "1500000")
+  Chk(SettingsSave())                                    ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_FAT 13
+  Chk(SettingsFatError())                                ; #HW_FILE_READONLY 5
+  Chk(tdWrites)                                          ; 0 - NOT ONE
+  ; AND NO WRITER WAS INSTALLED ON THE WAY TO THAT REFUSAL. This is the
+  ; other half of the same claim and it is not implied by the line above:
+  ; "no sector was written" and "nothing is now able to write one" are
+  ; different facts, and a refusal is the path most likely to leave the
+  ; second one wrong, because it is the path that returns early. The
+  ; seam's own words for it are "refused BEFORE anything is armed", and
+  ; this is what makes that a measurement.
+  ;
+  ; It is also the check that catches the library reaching past the seam.
+  ; The store is chip-free core and must not know a block writer exists;
+  ; if it ever installs one, the refusal path is where the arming
+  ; survives, because HwFileWriteAll turns back before it touches the
+  ; writer at all and therefore never disarms it either.
+  Chk(FatBlockWriter())                                  ; 0 - and nothing
+                                                         ; can write
+
+  ; --- now declare the medium writable and name its writer ------------
+  gHwFileWritable = 1
+  gHwFileWriter   = @TdWrite
+  Chk(SettingsSave())                                    ; 1
+  Chk(SettingsLastError())                               ; 0
+  Chk(SettingsDirty())                                   ; 0
+  Chk(Bool(tdWrites > 0))                                      ; 1
+  Chk(tdWOutside)                                        ; 0
+  Chk(tdMisaligned)                                      ; 0
+
+  ; --- and read it back through a completely fresh table --------------
+  SettingsReset()
+  Chk(SettingsCount())                                   ; 0
+  Chk(SettingsLoad())                                    ; 1
+  Chk(SettingsLoadState())                               ; 1
+  Chk(SettingsCount())                                   ; 3
+  Chk(TStrEq(SettingsWifiNetwork(), "Workshop"))         ; 1
+  Chk(TStrEq(SettingsWifiPassword(), "correct-horse-9")) ; 1
+  Chk(TValIs("console.baud", "1500000"))                 ; 1
+
+  ; --- change something and save over it. The file gets SHORTER here,
+  ;     because a key is removed, so this exercises the resize.
+  Chk(SettingsRemove("console.baud"))                    ; 1
+  Chk(SettingsSetWifiPassword("a-much-longer-passphrase-than-before")) ; 1
+  Chk(SettingsSave())                                    ; 1
+  SettingsReset()
+  Chk(SettingsLoad())                                    ; 1
+  Chk(SettingsCount())                                   ; 2
+  Chk(TStrEq(SettingsWifiPassword(), "a-much-longer-passphrase-than-before")) ; 1
+  Chk(SettingsHas("console.baud"))                       ; 0
+
+  ; --- the partial-load guard, and the only way past it ---------------
+  ; A save after a partial load would delete every line the parse never
+  ; reached. It is refused until somebody says otherwise.
+  Chk(SettingsParse(TsAddr(1), tsrcLen[1]))              ; 0
+  Chk(SettingsLoadState())                               ; 2
+  n = tdWrites
+  Chk(SettingsSave())                                    ; 0
+  Chk(SettingsLastError())                               ; #SET_ERR_UNSAFE_SAVE 15
+  Chk(tdWrites - n)                                      ; 0 - and nothing
+                                                         ; was written
+  ; The EARLIEST refusal there is - it happens before the table is even
+  ; serialised - and therefore the one with the most code after it that
+  ; never runs. Nothing may have been armed on the way in.
+  Chk(FatBlockWriter())                                  ; 0
+  SettingsDiscardLoad()
+  Chk(SettingsLoadState())                               ; 1
+  Chk(SettingsSave())                                    ; 1
+
+  ; Put the file back to something the harness can check independently,
+  ; and leave the writer OFF the way the monitor leaves it.
+  SettingsReset()
+  SettingsSetWifiNetwork("Workshop")
+  SettingsSetWifiPassword("correct-horse-9")
+  SettingsSet("console.baud", "1500000")
+  SettingsSet("boot.file", "ANVIL.IMG")
+  Chk(SettingsSave())                                    ; 1
+
+  ; --- AND THE WRITER IS OFF AGAIN AFTERWARDS -------------------------
+  ; The disarm used to be this program's job and is now HwFileWriteAll's,
+  ; so this checks that it actually happened rather than assuming it: ask
+  ; fat.pi4 what writer it is holding, and it must be none. That is the
+  ; whole safety guarantee in one line - between saves, nothing in this
+  ; monitor can reach the medium.
+  ;
+  ; THIS LINE ALONE WAS NOT ENOUGH, and it took a deliberate-damage run to
+  ; show it. A store that installs a writer of its own is caught by
+  ; nothing here, because the very next thing that happens on the SUCCESS
+  ; path is HwFileWriteAll arming its own writer over the top and
+  ; disarming it on the way out - so this reads 0 either way. The
+  ; assertion was written when the store spoke to the medium directly, and
+  ; on the far side of the file seam "disarmed after a save that worked"
+  ; stopped being the whole property. It is now one of four: the writer is
+  ; off after EVERY exit from a save, and the three refusals are the
+  ; interesting ones, because a refusal returns before HwFileWriteAll can
+  ; tidy up after anybody.
+  Chk(FatBlockWriter())                                  ; 0 - disarmed
+
+  ; And with the medium declared unwritable it must refuse again, without
+  ; a sector.
+  gHwFileWritable = 0
+  n = tdWrites
+  SettingsSet("boot.file", "OTHER.IMG")
+  Chk(SettingsSave())                                    ; 0
+  Chk(SettingsFatError())                                ; #HW_FILE_READONLY 5
+  Chk(tdWrites - n)                                      ; 0
+  ; THE LAST THING THIS PROGRAM DOES TO THE MEDIUM IS BE REFUSED, so this
+  ; is the state the monitor is left in. If a save can leave a writer
+  ; armed behind it, this is where it stays armed for good.
+  Chk(FatBlockWriter())                                  ; 0
+
+  Chk(tdWOutside)                                        ; 0 over the whole
+                                                         ; run
+  Chk(tdMisaligned)                                      ; 0
+EndProcedure
+
+Procedure Main()
+  PhaseTable()
+  PhaseParse()
+  PhaseRoundTrip()
+  ; The slots go BEFORE the medium and after the round trip. Before,
+  ; because PhaseMedium asserts that tdWrites is still 0 when it starts
+  ; and a phase between it and that assertion would have to be trusted
+  ; not to write; after, because it borrows tout[] from the round trip
+  ; and there is no reason for two phases to own the same buffer at the
+  ; same time.
+  PhaseWifiSlots()
+  PhaseMedium()
+  Chk(nres)          ; the count itself, so a check that stopped running
+                     ; is a mismatch and not a pass
+EndProcedure
+
+Main()

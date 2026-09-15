@@ -1,0 +1,298 @@
+; pi4NeonSurface.pi4 - WHY DOES EVERY MAILBOX TRANSACTION FROM A PAYLOAD
+; TIME OUT ON THE WRITE SIDE?
+;
+; DIAGNOSTIC. Does not ship. Bench time spent to kill guesses.
+;
+; ======================================================================
+;  WHAT IS KNOWN, AND HOW
+; ======================================================================
+; pi4V3dFbClear.pi4 could not get a surface: DisplayInit(1920,1080,32)
+; returned #DSP_ESEND (-19), which display.pi4:2242-2251 defines as
+; "MailboxListSend() failed and MailboxError() was not #MBX_ERR_TAG".
+;
+; GUESS 1, DEAD: that Anvil's live screen was in the way. Run without
+; "screen on" - same -19.
+;
+; MEASURED, 2026-08-28, this file's first version:
+;
+;     1 before V3dInit: rc -19  MailboxError 4  failedTag -1
+;     2 V3dInit rc 0
+;     3 after V3dInit:  rc -19  MailboxError 4
+;
+; #MBX_ERR_TXTIMEOUT = 4 is raised in exactly one place -
+; mailbox.pi4:1298-1301, when MbxWaitClear(#MBX_STATUS1, #MBX_FULL)
+; gives up. So MAILBOX 1 IS FULL AND STAYS FULL, the request word is
+; never written, and this has nothing to do with tags, sizes, display
+; geometry or V3D. It also fires BEFORE V3D is touched, so V3D is
+; innocent.
+;
+; ======================================================================
+;  WHAT THIS ASKS, AND WHY THE DRAIN IS THE INTERESTING PART
+; ======================================================================
+; The two mailboxes are one FIFO pair. MAIL0 carries replies to the ARM
+; and MAIL1 carries requests to the VideoCore. If MAIL0 has been left
+; holding a reply nobody read, the VideoCore has nowhere to put the next
+; one and stops taking requests - and the symptom of that, on the ARM
+; side, is MAIL1 reading FULL forever. That is one hypothesis and it is
+; the one thing here that can be TESTED rather than argued: read MAIL0
+; until it says EMPTY, print every word that comes out, and try again.
+;
+; So the run is:
+;
+;   1. the raw status words, before anything at all
+;   2. DRAIN MAIL0 and print what was in it
+;   3. the raw status words again
+;   4. a SINGLE-TAG message - get physical size - which is the same
+;      transport the nine-tag one uses but the smallest possible
+;      payload
+;   5. the nine-tag DisplayInit
+;   6. and if that works, the surface parameters the engine needs
+;
+; ANNOUNCE THEN DRAIN, EVERY STEP. The deadman is ~15.999 s and a
+; mailbox that never answers costs 1000 ms per transaction
+; (#MBX_TIMEOUT_MS), so five of them is five seconds and a hang is
+; still possible. Every line is flushed before the thing that might
+; not come back.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonSurface.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o _work/neonsurface.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+Procedure PutHex8(v.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)                              ; 36 is the dollar sign
+  For i = 7 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)                      ; 48 is the digit zero
+    Else
+      UartWrite(55 + n)                      ; 55 is the letter A minus ten
+    EndIf
+  Next
+EndProcedure
+
+Procedure Status(*label)
+  UartWriteStr(*label)
+  UartWriteStr("  MAIL0_STA ")
+  PutHex8(PeekN(#MBX_STATUS0) & $FFFFFFFF)
+  UartWriteStr("  MAIL1_STA ")
+  PutHex8(PeekN(#MBX_STATUS1) & $FFFFFFFF)
+  UartWriteStr("   (bit31 FULL, bit30 EMPTY)")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; Read MAIL0 until it says EMPTY, printing every word. Bounded: a
+; mailbox that never empties must not turn a diagnostic into a hang.
+Procedure.i Drain()
+  Define n.i
+  Define v.i
+  n = 0
+  While n < 32
+    If (PeekN(#MBX_STATUS0) & #MBX_EMPTY) <> 0
+      Break
+    EndIf
+    v = PeekN(#MBX_READ) & $FFFFFFFF
+    UartWriteStr("    drained ")
+    PutHex8(v)
+    UartWriteStr("  channel ")
+    PrintDec(v & $F)
+    PrintNl()
+    n = n + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  Define n.i
+
+  PrintNl()
+  UartWriteStr("=== pi4NeonSurface - the mailbox write side ===")
+  PrintNl()
+  PrintNl()
+
+  If TimerInit() = 0
+    UartWriteStr("!! the architectural counter is NOT running - every mailbox")
+    PrintNl()
+    UartWriteStr("   deadline falls back to the iteration backstop")
+    PrintNl()
+  Else
+    UartWriteStr("counter scale ")
+    PrintDec(TimerScale())
+    PrintNl()
+  EndIf
+  PrintNl()
+
+  ; ---- 1. raw status, before this payload has touched anything -------
+  Status("1 at entry            ")
+
+  ; ---- 2. drain -------------------------------------------------------
+  UartWriteStr("2 draining MAIL0")
+  PrintNl()
+  UartDrain()
+  n = Drain()
+  UartWriteStr("    words drained ")
+  PrintDec(n)
+  PrintNl()
+  UartDrain()
+
+  ; ---- 3. raw status again --------------------------------------------
+  Status("3 after the drain     ")
+  PrintNl()
+
+  ; ---- 4. the transport itself, one tag -------------------------------
+  UartWriteStr("4 single tag, get physical size")
+  PrintNl()
+  UartDrain()
+  If MailboxInit() = 0
+    UartWriteStr("    MailboxInit REFUSED, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+    UartDrain()
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("    buffer ")
+  PutHex8(MailboxBufferAddr())
+  UartWriteStr("  bus ")
+  PutHex8(MailboxBusAddr())
+  PrintNl()
+  UartDrain()
+
+  If MailboxBegin(#MBX_TAG_FB_GETPHYS, 0, 8) = 0
+    UartWriteStr("    MailboxBegin refused, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+  Else
+    r = MailboxSend()
+    UartWriteStr("    send ")
+    PrintDec(r)
+    UartWriteStr("  error ")
+    PrintDec(MailboxError())
+    If r <> 0
+      UartWriteStr("   physical ")
+      PrintDec(MailboxWord(0))
+      UartWrite(120)                         ; 120 is the letter x
+      PrintDec(MailboxWord(1))
+    EndIf
+    PrintNl()
+  EndIf
+  UartDrain()
+  Status("    status after       ")
+  PrintNl()
+
+  ; ---- 5. single tag, allocate ----------------------------------------
+  ; If the surface is already up - and the monitor's own banner says it
+  ; is - the firmware answers this with the EXISTING buffer rather than
+  ; making a new one. That is the whole reason this is worth asking
+  ; separately from DisplayInit: it needs no mode set at all.
+  UartWriteStr("5 single tag, allocate (asking for the EXISTING surface)")
+  PrintNl()
+  UartDrain()
+  If MailboxBegin(#MBX_TAG_FB_ALLOCATE, 4, 8) = 0
+    UartWriteStr("    begin refused, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+  Else
+    MailboxSetWord(0, 256)                   ; the alignment U-Boot asks for
+    r = MailboxSend()
+    UartWriteStr("    send ")
+    PrintDec(r)
+    UartWriteStr("  error ")
+    PrintDec(MailboxError())
+    If r <> 0
+      UartWriteStr("   bus ")
+      PutHex8(MailboxWord(0))
+      UartWriteStr("  bytes ")
+      PrintDec(MailboxWord(1))
+    EndIf
+    PrintNl()
+  EndIf
+  UartDrain()
+
+  UartWriteStr("6 single tag, get pitch")
+  PrintNl()
+  UartDrain()
+  If MailboxBegin(#MBX_TAG_FB_GETPITCH, 0, 4) = 0
+    UartWriteStr("    begin refused, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+  Else
+    r = MailboxSend()
+    UartWriteStr("    send ")
+    PrintDec(r)
+    UartWriteStr("  error ")
+    PrintDec(MailboxError())
+    If r <> 0
+      UartWriteStr("   pitch ")
+      PrintDec(MailboxWord(0))
+    EndIf
+    PrintNl()
+  EndIf
+  UartDrain()
+
+  UartWriteStr("7 single tag, get depth")
+  PrintNl()
+  UartDrain()
+  If MailboxBegin(#MBX_TAG_FB_SETDEPTH - $8000, 0, 4) = 0
+    UartWriteStr("    begin refused, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+  Else
+    r = MailboxSend()
+    UartWriteStr("    send ")
+    PrintDec(r)
+    UartWriteStr("  error ")
+    PrintDec(MailboxError())
+    If r <> 0
+      UartWriteStr("   depth ")
+      PrintDec(MailboxWord(0))
+    EndIf
+    PrintNl()
+  EndIf
+  UartDrain()
+  PrintNl()
+
+  ; ---- 8. the nine-tag message ----------------------------------------
+  UartWriteStr("8 nine tags, DisplayInit(1920,1080,32)")
+  PrintNl()
+  UartDrain()
+  If DisplayStandardTags() = 0
+    UartWriteStr("    DisplayStandardTags REFUSED")
+    PrintNl()
+    UartDrain()
+    ProcedureReturn 2
+  EndIf
+  r = DisplayInit(1920, 1080, 32)
+  UartWriteStr("    rc ")
+  PrintDec(r)
+  UartWriteStr("  MailboxError ")
+  PrintDec(MailboxError())
+  UartWriteStr("  failedTag ")
+  PrintDec(MailboxListFailedTag())
+  PrintNl()
+  UartWriteStr("    size ")
+  PrintDec(DisplayWidth())
+  UartWrite(120)
+  PrintDec(DisplayHeight())
+  UartWriteStr("  pitch ")
+  PrintDec(DisplayPitch())
+  UartWriteStr("  base ")
+  PutHex8(DisplayBase())
+  PrintNl()
+  UartDrain()
+
+  PrintNl()
+  UartWriteStr("=== done ===")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

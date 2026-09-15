@@ -1,0 +1,56 @@
+; pi4SlowSpin.pi4 - looks like a hang, but gives up on its own.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHY THIS EXISTS INSTEAD OF pi4Hang.pi4. Proving the deadman works
+; means running something the deadman has to rescue. pi4Hang.pi4 does
+; that honestly and has one bad property: if the deadman DOESN'T work,
+; the board is wedged until a human pulls the power. That is a fine
+; trade with someone sitting at the bench and a poor one at 3 a.m.
+;
+; So this spins for a fixed wall-clock time and then returns normally.
+; Armed with a SHORTER deadman, the two outcomes are distinguishable and
+; only one of them can go wrong:
+;
+;   deadman fires   -> the board resets partway through. PROVEN.
+;   deadman broken  -> this returns to the prompt. Board still healthy,
+;                      and the failure is reported rather than wedging.
+;
+; A test whose failure mode is "everything is fine, and you know" is
+; worth more than a purer one that has to be supervised.
+;
+; The wait is on CNTPCT_EL0 via timer.pi4, not a spin count, so it is
+; the same ten seconds at 600 MHz and at 1.5 GHz.
+;
+;   PureMetalForge.exe --compile pi4SlowSpin.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o slow.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+
+Procedure.i Main()
+  Define i.i
+
+  PrintNl()
+  UartWriteStr("=== spinning for 10 s. a shorter deadman should cut this short. ===")
+  PrintNl()
+  UartDrain()
+
+  ; One line a second, so the transcript shows exactly WHEN it stopped
+  ; rather than only that it did. If the last number printed is 2 and a
+  ; U-Boot banner follows, the deadman fired at three seconds and the
+  ; evidence is on the page.
+  For i = 1 To 10
+    Delay(1000)
+    UartWriteStr("  t+")
+    PrintDec(i)
+    UartWriteStr(" s")
+    PrintNl()
+    UartDrain()
+  Next
+
+  UartWriteStr("=== reached the end. THE DEADMAN DID NOT FIRE. ===")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 10
+EndProcedure

@@ -25,8 +25,7 @@ def main():
         oldroot = Path(tmp)/'oldroot'
         for rel in ('RaspberryPi4/Board/memmap.pi4', 'RaspberryPi4/Lib/mmu.pi4',
                     'RaspberryPi4/Lib/mmu_secondary.pi4',
-                    'RaspberryPi4/Tests/core_worker_emitted_gate.pi4',
-                    'keywords.def'):
+                    'RaspberryPi4/Tests/core_worker_emitted_gate.pi4'):
             dst = oldroot/rel
             dst.parent.mkdir(parents=True,exist_ok=True)
             shutil.copy2(ROOT/rel,dst)

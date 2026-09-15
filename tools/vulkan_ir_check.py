@@ -187,8 +187,6 @@ def build(compiler: pathlib.Path, suffix: str, module_text: str | None = None) -
         shutil.copytree(intrinsics, work / "RaspberryPi4" / "Intrinsics", dirs_exist_ok=True)
     if (ROOT / "Boards").is_dir():
         shutil.copytree(ROOT / "Boards", work / "Boards", dirs_exist_ok=True)
-    if (ROOT / "keywords.def").is_file():
-        shutil.copy2(ROOT / "keywords.def", work / "keywords.def")
     image = work / f"{suffix}.img"
     command = [
         str(compiler), "--compile", source.relative_to(work).as_posix(),

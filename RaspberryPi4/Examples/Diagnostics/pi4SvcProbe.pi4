@@ -1,0 +1,923 @@
+; ======================================================================
+; pi4SvcProbe.pi4 - THE REFERENCE PAYLOAD for Anvil's payload ABI.
+;
+; It is the first program ever written on the far side of the service
+; table (Anvil/Hal/abi.pbi), and its job is to prove that the far side is
+; habitable: that a separately compiled image, entered by Anvil from a
+; container, can reach the monitor's console, filesystem, GPIO and
+; capability model WITHOUT NAMING A SINGLE CHIP.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4SvcProbe.pi4
+;        -t pi4 --load-addr 0x400000 --stack-addr 0x3000000
+;        --entry-returns --wants-services -o _work/svcprobe.img
+;
+; ----------------------------------------------------------------------
+; THE PROPERTY THAT MATTERS MOST, AND IT IS AN ABSENCE
+; ----------------------------------------------------------------------
+; THIS FILE INCLUDES NOTHING. Not uart.pi4, not timer.pi4, not
+; memmap.pi4, not hal.pi4. It names no register, no peripheral address,
+; no chip constant and no library procedure. Every single thing it does
+; goes through a pointer it was handed in x0.
+;
+; That is not tidiness - IT IS THE TEST. The whole point of the ABI is
+; that the same bytes run on the Pi 4 today and on another board later,
+; and a probe that reached for one Pi 4 library "just for its output"
+; would have proved the opposite while appearing to pass.
+; tools/a64/a64_abi_check.py greps this source for exactly that and fails
+; on a hit.
+;
+; ----------------------------------------------------------------------
+; SO HOW DOES IT REPORT, WITH NO CONSOLE OF ITS OWN?
+; ----------------------------------------------------------------------
+; Two ways, and both are readable by a person.
+;
+;   1. IT DRAWS ITS REPORT ON THE SCREEN, through SvcRect and SvcText.
+;      That is the honest demonstration: the payload owns the pixels.
+;
+;   2. IT FILLS A RESULT BLOCK of 64-bit words at #SVCP_RESULT, one
+;      answer per slot, and returns a FAILURE COUNT in x0.
+;
+; The second exists because A VERDICT THAT LIVES ONLY ON A SCREEN CANNOT
+; BE CHECKED BY A GATE, and one that lives only in memory cannot be read
+; by a person without a dump - so it lives in both. On the bench the
+; block is read back with Anvil's own `md` after the payload returns, so
+; the transcript is Anvil's console output and not a photograph of a
+; monitor; off the bench, tools/a64/a64_abi_check.py reads the identical
+; words out of the interpreter's memory. Same artefact, same numbers, two
+; vehicles.
+;
+; x0 CARRIES THE FAILURE COUNT AND NOT A BOOLEAN, so that
+; "returned, x0 = 0000000000000000" on the monitor's own last line is a
+; complete pass/fail verdict before anybody dumps anything.
+;
+; ----------------------------------------------------------------------
+; HOW A PAYLOAD READS x0, AND WHY IT IS THE FIRST STATEMENT OF Main
+; ----------------------------------------------------------------------
+; The container's flags word has bit 2 set (--wants-services), so Anvil's
+; PmfEnter puts the service table's address in x0 and enters. By the time
+; Main() runs, the only things that have touched registers are
+; EmitCore_A64's preamble - which uses x9, x10, x16, x17, x18 for the
+; stack, the BSS zero and the FP gate - and Main()'s own prologue, which
+; uses x29 and x30. So x0 IS STILL THE TABLE at Main()'s first statement,
+; and it is captured there.
+;
+; This is exactly what RaspberryPi4/Board/board.pi4's Main() already does
+; to capture the firmware's device-tree pointer, and the reasoning is
+; copied from there rather than re-derived - including the choice of x1
+; as the scratch register.
+;
+; ----------------------------------------------------------------------
+; CALLING THROUGH THE TABLE
+; ----------------------------------------------------------------------
+; A slot is an address read out of the table and called indirectly. THE
+; '*' IN EACH DECLARATION IS LOAD-BEARING AND IT COST A BUILD ELSEWHERE
+; (RaspberryPi4/Lib/fat.pi4's header records it at length): the compiler
+; refuses a call through a plain ".i" variable unless it can SEE an
+; "x = @Something" assignment, and there is none here - these addresses
+; come from memory. A name declared with '*' already holds an address by
+; declaration and is exempt.
+;
+; The other half of that spelling, also learned the hard way: the call is
+; written "svc_rect(...)" with NO star. "*svc_rect(...)" compiles clean
+; and DEREFERENCES THE RETURN VALUE.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE ABI's OWN CONSTANTS, RESTATED HERE.
+;
+;  A PAYLOAD CANNOT INCLUDE abi.pi4 AND MUST NOT. That file is Anvil's
+;  half - it declares the table, the procedures and BuildServiceTable, all
+;  of which would be compiled into this image as a second, dead copy. What
+;  crosses the seam is the NUMBERS, and a payload restates the ones it
+;  uses, exactly as a program written against any other ABI does.
+;
+;  THAT RESTATEMENT IS ITSELF UNDER TEST. tools/a64/a64_abi_check.py reads
+;  both files and fails if any constant here disagrees with abi.pi4 -
+;  because a payload that quietly held a stale slot number would call the
+;  wrong procedure with the right arguments, which is the worst failure
+;  this table can have and the one nothing else would catch.
+; ----------------------------------------------------------------------
+#SVC_MAGIC       = $53564E41   ; 'ANVS'
+#SVC_ABI_MAJOR   = 1
+; 2 ON ANVIL MAIN (Anvil/Hal/abi_version.pbi): 1.1 filled core slots 14
+; and 15 for driver modules and 1.2 filled console slot 13 for the
+; screenshot. Both were appends into reserved slots, so every slot this
+; probe calls means what it meant at 1.0 - which is why #SVCP_NEED_MINOR
+; below stays 0 while this restatement follows the table.
+#SVC_ABI_MINOR   = 2
+#SVC_SLOT_COUNT  = 184
+#SVC_HDR_BYTES   = 16          ; magic, major, minor, entry_count
+
+#SVC_OK        =    0
+#SVC_ENOSYS    = -100
+#SVC_ENOCAP    = -101
+#SVC_EARG      = -102
+#SVC_EPERM     = -106
+#SVC_EABI      = -109
+
+; ----------------------------------------------------------------------
+;  WHAT THIS PAYLOAD WAS BUILT AGAINST, and it is NOT the same fact as
+;  the two constants above it.
+;
+;  #SVC_ABI_MAJOR / #SVC_ABI_MINOR are a RESTATEMENT of what abi.pi4 says
+;  today, and the gate fails if they drift from it. These two are this
+;  PAYLOAD'S REQUIREMENT: the version of the table its slot numbers and
+;  its signatures came from. Today they are the same numbers, which is
+;  exactly why they need separate names - a payload built last year
+;  against 1.0 and run on a 1.3 monitor has to be able to say both, and
+;  one constant cannot hold two facts.
+;
+;  THE VERSION GATE THESE FEED IS A MERGE GATE (ruling, 2026-09-04): the
+;  table carries major.minor, the payload checks it on entry, and refuses
+;  in a full sentence with the code when Anvil's table is OLDER than it
+;  needs. Bumping either of these is how the negative controls are built;
+;  see the gate's --mutate and the two refusal paths in Main.
+; ----------------------------------------------------------------------
+#SVCP_NEED_MAJOR = 1
+#SVCP_NEED_MINOR = 0
+
+#SVCCAP_STORAGE  = 0
+#SVCCAP_NET      = 1
+#SVCCAP_GPIO     = 2
+#SVCCAP_I2C      = 3
+#SVCCAP_MMC      = 4
+#SVCCAP_USB      = 5
+#SVCCAP_BOOT_EL1 = 6
+#SVCCAP_TOUCH    = 7
+#SVCCAP_GNSS     = 8
+#SVCCAP_VEHLINK  = 9
+#SVCCAP_SPI      = 10
+#SVCCAP_UART     = 11
+#SVCCAP_RTC      = 12
+#SVCCAP_CONSOLE  = 13
+; 14 and 15 were appended at ABI 1.1 (Anvil/Hal/seams.pbi). They are
+; restated so the gate can hold them to the published numbers; the
+; result block keeps one word each for the FIRST fourteen ids only,
+; because widening it would move every word after #R_CAPBASE and break
+; every reader of a dump taken from an older run.
+#SVCCAP_PWM      = 14
+#SVCCAP_THERMAL  = 15
+#SVCCAP_COUNT    = 14
+
+; The slots this probe calls, by absolute index. Group bases are spelled
+; out so a reader can check each against abi.pbi's group table.
+#SLOT_ABIMAJOR   = 0
+#SLOT_ABIMINOR   = 1
+#SLOT_BOARDID    = 2
+#SLOT_BOARDNAME  = 3
+#SLOT_CAPGET     = 4
+#SLOT_PET        = 6
+#SLOT_MMUSTATE   = 10
+#SLOT_ERRTEXT    = 12
+#SLOT_ERRDETAIL  = 13
+#SLOT_TICKS      = 16
+#SLOT_CLOCKPROV  = 18
+#SLOT_SCRW       = 24
+#SLOT_SCRH       = 25
+#SLOT_TIER       = 26
+#SLOT_FRAMEBEGIN = 27
+#SLOT_FRAMEEND   = 28
+#SLOT_RECT       = 29
+#SLOT_TEXT       = 30
+#SLOT_TEXTWIDTH  = 31
+#SLOT_LINE       = 33
+#SLOT_FRAMECOST  = 34
+#SLOT_TEXTHEIGHT = 36
+#SLOT_STORAGEUP  = 48
+#SLOT_FILEOPEN   = 49
+#SLOT_FILESIZE   = 50
+#SLOT_FILEREADAT = 51
+#SLOT_FILECLOSE  = 52
+#SLOT_FILEWRITABLE = 53
+#SLOT_FILEWRITEALL = 54
+#SLOT_FILEAPPEND   = 55
+#SLOT_SETTINGSET = 65
+#SLOT_NETUP      = 72
+#SLOT_GPIOCOUNT  = 108
+#SLOT_GPIOMODE   = 109
+#SLOT_GPIOLEVEL  = 110
+#SLOT_GPIOPULL   = 111
+#SLOT_VEHUP      = 144
+#SLOT_VEHLOSS    = 151
+
+; ----------------------------------------------------------------------
+;  WHERE THE RESULT BLOCK GOES.
+;
+;  $01400000 is inside the low payload window ($00400000..$07EFFFFF), a
+;  clean megabyte boundary, and well clear of this program's own image at
+;  $00400000 - which is a few tens of kilobytes. IT IS STATED IN BOTH
+;  THIS FILE AND tools/a64/a64_abi_check.py, and the two must agree; the
+;  gate reads the words back from here and the bench operator types
+;  `md 1400000` for the same numbers.
+;
+;  IT IS NOT A Global. A compiled image zeroes its BSS in _start, which is
+;  fine, but a Global's ADDRESS is a link-time fact the harness would
+;  have to look up in the .sym map - and the bench operator would have to
+;  as well, on a board, from a hex dump. A stated address costs one
+;  constant and both readers use the same one. pi4BootContainerSelfTest
+;  makes the same choice for the same reason.
+; ----------------------------------------------------------------------
+#SVCP_RESULT = $01400000
+
+; WHERE THE REFUSAL SENTENCE IS BUILT. One page past the result block,
+; which is 56 words - so there is a whole 4 KB of daylight between them
+; and a sentence that ran long could not scribble on a verdict. Stated
+; rather than declared as a Global for the same reason #SVCP_RESULT is:
+; the bench operator types `md 1401000` and reads it as text, and the
+; gate reads the identical bytes out of the interpreter.
+#SVCP_SENTENCE = $01401000
+#SVCP_MAGIC  = $50435653       ; 'SVCP', the first word, so a dump of the
+                               ; wrong address is obvious rather than
+                               ; being read as a result of all zeroes
+#SVCP_DONE   = $454E4F44       ; 'DONE', the last word, so a truncated or
+                               ; half-written block cannot be read as a
+                               ; complete pass
+
+; ----------------------------------------------------------------------
+;  #SVCP_UNSET - WHAT A WORD SAYS WHEN THIS RUN NEVER WROTE IT.
+;
+;  The block is at a stated address in ordinary DRAM that nothing clears.
+;  A word this run does not reach therefore reads back whatever the last
+;  thing to use that memory left there - and on real silicon that is
+;  high-entropy rubbish which is INDISTINGUISHABLE FROM AN ANSWER. On
+;  2026-09-07 the board proof read one such word as -298433844653064393
+;  and reported it as a wrong refusal code, when the truth was that the
+;  probe had never written the word at all. Two hours went into the
+;  difference between "the monitor answered wrongly" and "nobody asked".
+;
+;  Under an interpreter the same defect is INVISIBLE, because emulated
+;  memory starts at zero and an unwritten word reads 0 - which is a
+;  perfectly plausible answer. That asymmetry is the whole reason this
+;  only ever showed on the board.
+;
+;  So every word is stamped with this before the run starts. It is eight
+;  ASCII bytes rather than a number so that the bench operator reading
+;  `md 1400000` sees the word say NOTWRIT! in the text column, and the
+;  gate and the proof tool both report "never written" instead of
+;  comparing rubbish against an expectation. It is not a plausible
+;  answer to any slot: no code, count, pointer or handle in this ABI
+;  can take this value.
+; ----------------------------------------------------------------------
+#SVCP_UNSET  = $2154495257544F4E   ; 'NOTWRIT!', least-significant byte first
+
+; Word indices inside the block. One answer per word, in the order they
+; are taken, so a hex dump reads top to bottom like the run did.
+#R_MAGIC      = 0
+#R_TABLEADDR  = 1
+#R_HDRMAGIC   = 2
+#R_HDRMAJOR   = 3
+#R_HDRMINOR   = 4
+#R_HDRCOUNT   = 5
+; The version gate's four words, taken here because this is where the run
+; takes them - the block reads top to bottom like the run did.
+#R_NEEDMAJOR  = 6              ; what this payload was built against
+#R_NEEDMINOR  = 7
+#R_ABIRC      = 8              ; 0, or #SVC_EABI when the gate refused
+#R_ABITEXT    = 9              ; where the refusal sentence was written
+#R_SLOTMAJOR  = 10
+#R_SLOTMINOR  = 11
+#R_BOARDID    = 12
+#R_NAMEPTR    = 13
+#R_MMUSTATE   = 14
+#R_TICKS0     = 15
+#R_CAPBASE    = 16             ; ... 14 words, one per #SVCCAP_*
+#R_SCRW       = 30
+#R_SCRH       = 31
+#R_TIER       = 32
+#R_TEXTH      = 33
+#R_FRAMERC    = 34
+#R_FRAMECOST  = 35
+#R_TEXTWIDTH  = 36
+#R_GPIOCOUNT  = 37
+#R_GPIOMODE   = 38
+#R_GPIOLEVEL  = 39
+#R_GPIOPULL   = 40
+#R_VEHUP      = 41
+#R_VEHLOSS    = 42
+#R_ERRTEXTPTR = 43
+#R_DETAILPTR  = 44
+#R_PERMRC     = 45
+#R_APPENDRC   = 46
+#R_STORAGEUP  = 47
+#R_FILERC     = 48
+#R_NULLSLOTS  = 49
+#R_UNIMPLRC   = 50
+#R_CLOCKPROV  = 51
+#R_NETUPRC    = 52
+#R_TICKS1     = 53
+#R_FAILS      = 54
+#R_DONE       = 55
+#R_WORDS      = 56
+
+; THE PIN THIS PROBE READS. GPIO 4 is a plain header pin on every board
+; that has a header, and READING one is always allowed - hal.pi4's
+; HwGpioReservedReason gates WRITES only, "because reading a pin is always
+; allowed for diagnostics". This probe never writes a pin: a payload that
+; drove an output on a board whose wiring it has not been told about is
+; the one experiment that can damage hardware, and a diagnostic has no
+; business running it.
+#PROBE_PIN = 4
+
+; ======================================================================
+;  THE TABLE, AND THE POINTERS INTO IT
+; ======================================================================
+Global gSvcTable.i             ; x0, captured at Main's first statement
+Global gFails.i
+Global gTabMajor.i             ; the table's own version, read from the
+Global gTabMinor.i             ; header before any slot is touched
+Global *gSentence              ; the refusal, once built
+Global gTextY.i                ; the baseline the next report line goes on
+
+; One pointer per slot called. Named for the slot, declared with '*'.
+Global *svc_abimajor
+Global *svc_abiminor
+Global *svc_boardid
+Global *svc_boardname
+Global *svc_capget
+Global *svc_pet
+Global *svc_mmustate
+Global *svc_errtext
+Global *svc_errdetail
+Global *svc_ticks
+Global *svc_clockprov
+Global *svc_scrw
+Global *svc_scrh
+Global *svc_tier
+Global *svc_framebegin
+Global *svc_frameend
+Global *svc_rect
+Global *svc_text
+Global *svc_textwidth
+Global *svc_line
+Global *svc_framecost
+Global *svc_textheight
+Global *svc_storageup
+Global *svc_fileopen
+Global *svc_filesize
+Global *svc_filereadat
+Global *svc_fileclose
+Global *svc_filewritable
+Global *svc_filewriteall
+Global *svc_fileappend
+Global *svc_settingset
+Global *svc_netup
+Global *svc_gpiocount
+Global *svc_gpiomode
+Global *svc_gpiolevel
+Global *svc_gpiopull
+Global *svc_vehup
+Global *svc_vehloss
+
+; ======================================================================
+;  CaptureX0() - the whole handover, in four instructions.
+;
+;  Called as Main()'s FIRST statement. See the header for why x0 is still
+;  the table at that point, and why x1 is a safe scratch.
+;
+;  IT IS A PROCEDURE AND NOT AN INLINE BLOCK IN Main, only so that the
+;  reasoning above has somewhere to live next to the instructions it is
+;  about. Calling it does not disturb x0: this backend's prologue saves
+;  x29/x30 and nothing else before the body runs.
+; ======================================================================
+Procedure CaptureX0()
+  ASM
+    adrp x1, global_gsvctable
+    add  x1, x1, #:lo12:global_gsvctable
+    str  x0, [x1]
+  EndASM
+EndProcedure
+
+; ======================================================================
+;  Slot(i) - the address in slot i, read out of the table.
+;
+;  THE HEADER IS SIXTEEN BYTES AND THE SLOTS ARE EIGHT EACH, so slot i is
+;  at table + 16 + i*8. Read with PeekI, which is the 64-bit read on this
+;  target; a 32-bit read would take the low half of a procedure address
+;  and branch into plausible-looking low memory - the exact trap
+;  cache.pi4 and fat.pi4 both record for "ldr w9".
+;
+;  THE TABLE ADDRESS IS 8-BYTE ALIGNED by construction: it is the address
+;  of a 64-bit array in Anvil's BSS. So every slot read is aligned, and an
+;  unaligned wide read on this part with the MMU off is an alignment abort
+;  with no console message at all.
+; ======================================================================
+Procedure.i Slot(i.i)
+  ProcedureReturn PeekI(gSvcTable + #SVC_HDR_BYTES + i * 8)
+EndProcedure
+
+Procedure.i Hdr32(off.i)
+  ; A header field, 32 bits, read a byte at a time. NOT a wide read: the
+  ; four fields are at +0, +4, +8 and +12, and +4 and +12 are not 8-byte
+  ; aligned. PeekA and not PeekB - PeekB sign-extends on this target, so a
+  ; byte of $EF would come back as -17 and poison the shift it is in.
+  ; pmfboot.pi4, fat.pi4 and settings.pi4 all record the same trap.
+  ProcedureReturn PeekA(gSvcTable + off) | (PeekA(gSvcTable + off + 1) << 8) | (PeekA(gSvcTable + off + 2) << 16) | (PeekA(gSvcTable + off + 3) << 24)
+EndProcedure
+
+Procedure Put(i.i, v.i)
+  PokeI(#SVCP_RESULT + i * 8, v)
+EndProcedure
+
+; ======================================================================
+;  BUILDING A SENTENCE WITH NO LIBRARY, because a payload has none.
+;
+;  There is no formatter on this side of the table and there must not be
+;  a call into one: the refusal these three build is the refusal for the
+;  case where calling a slot is exactly what the payload may not do. So
+;  the payload spells its own bytes, which is four lines of arithmetic
+;  and no dependency at all.
+; ======================================================================
+Procedure.i PutStr(at.i, *s)
+  While PeekA(*s) <> 0
+    PokeA(at, PeekA(*s))
+    at = at + 1
+    *s = *s + 1
+  Wend
+  ProcedureReturn at
+EndProcedure
+
+; 0..999 in decimal. A fourth digit would mean the versioning rule broke
+; a very long time before this formatter did.
+Procedure.i PutDec(at.i, v.i)
+  Define d.i
+  If v < 0
+    v = 0
+  EndIf
+  If v >= 100
+    d = v / 100
+    PokeA(at, $30 + d)
+    at = at + 1
+    v = v - d * 100
+    PokeA(at, $30 + (v / 10))
+    at = at + 1
+    PokeA(at, $30 + (v % 10))
+    at = at + 1
+    ProcedureReturn at
+  EndIf
+  If v >= 10
+    PokeA(at, $30 + (v / 10))
+    at = at + 1
+    PokeA(at, $30 + (v % 10))
+    at = at + 1
+    ProcedureReturn at
+  EndIf
+  PokeA(at, $30 + v)
+  at = at + 1
+  ProcedureReturn at
+EndProcedure
+
+; THE REFUSAL, in the house shape: what failed, at what code, by name,
+; what that means, and the first thing to check - with both version
+; numbers in it, because the whole question the reader has is "which two
+; versions". *tail is the clause that differs between the two refusal
+; paths; everything before it is identical, so the two cannot drift into
+; saying different things about the same fact.
+Procedure.i AbiRefusal(*tail)
+  Define at.i
+  at = #SVCP_SENTENCE
+  at = PutStr(at, "this payload refused to run at code -109 (SVC_EABI): the service table it was entered with is version ")
+  at = PutDec(at, gTabMajor)
+  PokeA(at, $2E)
+  at = at + 1
+  at = PutDec(at, gTabMinor)
+  at = PutStr(at, " and this payload was built against ")
+  at = PutDec(at, #SVCP_NEED_MAJOR)
+  PokeA(at, $2E)
+  at = at + 1
+  at = PutDec(at, #SVCP_NEED_MINOR)
+  at = PutStr(at, ". ")
+  at = PutStr(at, *tail)
+  PokeA(at, 0)
+  Put(#R_ABITEXT, #SVCP_SENTENCE)
+  ProcedureReturn #SVCP_SENTENCE
+EndProcedure
+
+Procedure Expect(i.i, got.i, want.i)
+  ; RECORD THE ANSWER AND JUDGE IT IN ONE PLACE, so that the block always
+  ; holds what was actually read and the failure count always agrees with
+  ; it. A probe that recorded a value and judged a different one is the
+  ; shape of gate that goes green while the thing under it is wrong.
+  Put(i, got)
+  If got <> want
+    gFails = gFails + 1
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  The screen report. Each line is drawn through SvcText at the next
+;  baseline, on a panel drawn with SvcRect - which is precisely proof
+;  the whole UI primitive set, exercised as a side effect of reporting rather
+;  than as a contrived demonstration.
+; ======================================================================
+Procedure Say(*s, argb.i)
+  If *svc_text = 0
+    ProcedureReturn
+  EndIf
+  svc_text(24, gTextY, *s, argb, 0, $00101418)
+  gTextY = gTextY + PeekI(#SVCP_RESULT + #R_TEXTH * 8) + 6
+EndProcedure
+
+; ======================================================================
+;  Main
+; ======================================================================
+Procedure.i Main()
+  Define i.i
+  Define n.i
+  Define rc.i
+  Define vrc.i                 ; the vehicle-link refusal, kept apart from
+                               ; rc so the frame's verdict cannot overwrite
+                               ; the one the block records and judges
+  Define nulls.i
+  Define w.i
+  Define h.i
+
+  ; ---- 1. THE HANDOVER, FIRST ----------------------------------------
+  CaptureX0()
+
+  ; ---- 1b. EVERY WORD SAYS "NEVER WRITTEN" UNTIL IT IS WRITTEN -------
+  ; This runs before anything else touches the block, and it is not
+  ; tidiness. The block sits in DRAM nothing clears, so a word this run
+  ; does not reach reads back whatever was there - rubbish on silicon,
+  ; zero under an interpreter, and both of them read as ANSWERS. See
+  ; #SVCP_UNSET for the run that cost a bench session to that difference.
+  ; Afterwards a word that was never written says so, in the dump, in the
+  ; gate and in the proof tool alike, and no reader has to know which
+  ; words this particular path happens to reach.
+  i = 0
+  While i < #R_WORDS
+    Put(i, #SVCP_UNSET)
+    i = i + 1
+  Wend
+
+  ; The block is stamped LAST-WORD-LAST, so nothing may be written to
+  ; #R_DONE until the very end. The magic goes in first so that a dump of
+  ; the wrong address is obvious.
+  Put(#R_MAGIC, #SVCP_MAGIC)
+  Put(#R_TABLEADDR, gSvcTable)
+  gFails = 0
+
+  ; A ZERO TABLE IS THE ONE FAILURE THAT ENDS THE RUN. Everything below
+  ; reads through it, and reading through 0 with the MMU off does not
+  ; fault predictably - it returns whatever is at low DRAM, which is the
+  ; firmware's spin table and looks like plausible small integers. So
+  ; this is checked before a single slot is touched.
+  If gSvcTable = 0
+    Put(#R_FAILS, 1)
+    Put(#R_DONE, #SVCP_DONE)
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- 2. THE HEADER -------------------------------------------------
+  ; READ BEFORE ANY SLOT IS CALLED, and then checked AGAIN through slots 0
+  ; and 1 below. The redundancy is deliberate: a
+  ; payload that got the table pointer wrong reads plausible garbage out
+  ; of a header and finds out at the first CALL, because a call through a
+  ; wrong pointer faults and a read through one does not.
+  Expect(#R_HDRMAGIC, Hdr32(0), #SVC_MAGIC)
+  Expect(#R_HDRMAJOR, Hdr32(4), #SVC_ABI_MAJOR)
+  Expect(#R_HDRMINOR, Hdr32(8), #SVC_ABI_MINOR)
+  Expect(#R_HDRCOUNT, Hdr32(12), #SVC_SLOT_COUNT)
+
+  ; ---- 2b. THE VERSION GATE, AND IT IS A REFUSAL AND NOT A COUNTER ---
+  ; The ruling of 2026-09-04: the table carries major.minor, the payload
+  ; checks it ON ENTRY, and refuses in a full sentence with the code when
+  ; the table is OLDER than the payload was built against. The four
+  ; Expects above judge whether abi.pi4 and this file still agree, which
+  ; is a different question and answers it for the gate; THIS is the
+  ; check a payload in a truck makes about the monitor it landed on.
+  gTabMajor = Hdr32(4)
+  gTabMinor = Hdr32(8)
+  Put(#R_NEEDMAJOR, #SVCP_NEED_MAJOR)
+  Put(#R_NEEDMINOR, #SVCP_NEED_MINOR)
+  Put(#R_ABIRC, #SVC_OK)
+
+  ; MAJOR MISMATCH - NOT ONE SLOT MAY BE TOUCHED, and this is the part
+  ; that is easy to get wrong. A major bump is defined as an existing
+  ; slot CHANGING MEANING, so this payload holds slot numbers for a
+  ; layout this table does not have; calling slot 30 here would reach
+  ; whatever this major put at 30, with the arguments the other major
+  ; specified, and RETURN. A wrong call that returns is worse than a
+  ; fault, because nothing downstream can see it.
+  ;
+  ; So the refusal is built with the payload's own bytes and left where
+  ; the operator can read it - `md 1401000` on the monitor, or the gate's
+  ; own read of the same address - and the payload returns. The ONLY
+  ; thing guaranteed across a major is the sixteen header bytes, which is
+  ; why they are all this path uses. Anvil owns the console again the
+  ; instant the payload returns, and that is the right place for a
+  ; sentence the payload cannot safely draw.
+  If gTabMajor <> #SVCP_NEED_MAJOR
+    *gSentence = AbiRefusal("A major version is a different table, not a smaller one, so nothing in it was called - no slot number in this payload means what it means here. Check that the monitor and the payload came from the same release.")
+    Put(#R_ABIRC, #SVC_EABI)
+    gFails = gFails + 1
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #SVCP_DONE)
+    ProcedureReturn gFails
+  EndIf
+
+  ; ---- 3. NO SLOT IS NULL --------------------------------------------
+  ; Every reserved slot must point at SvcUnimplemented rather than at 0.
+  ; A null slot is a branch to address 0 the first time an over-new
+  ; payload reaches for it, and a board that stops with nothing on the
+  ; wire is exactly what the whole error convention exists to avoid.
+  nulls = 0
+  i = 0
+  While i < #SVC_SLOT_COUNT
+    If Slot(i) = 0
+      nulls = nulls + 1
+    EndIf
+    i = i + 1
+  Wend
+  Expect(#R_NULLSLOTS, nulls, 0)
+
+  ; ---- 4. BIND THE SLOTS ---------------------------------------------
+  *svc_abimajor   = Slot(#SLOT_ABIMAJOR)
+  *svc_abiminor   = Slot(#SLOT_ABIMINOR)
+  *svc_boardid    = Slot(#SLOT_BOARDID)
+  *svc_boardname  = Slot(#SLOT_BOARDNAME)
+  *svc_capget     = Slot(#SLOT_CAPGET)
+  *svc_pet        = Slot(#SLOT_PET)
+  *svc_mmustate   = Slot(#SLOT_MMUSTATE)
+  *svc_errtext    = Slot(#SLOT_ERRTEXT)
+  *svc_errdetail  = Slot(#SLOT_ERRDETAIL)
+  *svc_ticks      = Slot(#SLOT_TICKS)
+  *svc_clockprov  = Slot(#SLOT_CLOCKPROV)
+  *svc_scrw       = Slot(#SLOT_SCRW)
+  *svc_scrh       = Slot(#SLOT_SCRH)
+  *svc_tier       = Slot(#SLOT_TIER)
+  *svc_framebegin = Slot(#SLOT_FRAMEBEGIN)
+  *svc_frameend   = Slot(#SLOT_FRAMEEND)
+  *svc_rect       = Slot(#SLOT_RECT)
+  *svc_text       = Slot(#SLOT_TEXT)
+  *svc_textwidth  = Slot(#SLOT_TEXTWIDTH)
+  *svc_line       = Slot(#SLOT_LINE)
+  *svc_framecost  = Slot(#SLOT_FRAMECOST)
+  *svc_textheight = Slot(#SLOT_TEXTHEIGHT)
+  *svc_storageup  = Slot(#SLOT_STORAGEUP)
+  *svc_fileopen   = Slot(#SLOT_FILEOPEN)
+  *svc_filesize   = Slot(#SLOT_FILESIZE)
+  *svc_filereadat = Slot(#SLOT_FILEREADAT)
+  *svc_fileclose  = Slot(#SLOT_FILECLOSE)
+  *svc_filewritable = Slot(#SLOT_FILEWRITABLE)
+  *svc_filewriteall = Slot(#SLOT_FILEWRITEALL)
+  *svc_fileappend = Slot(#SLOT_FILEAPPEND)
+  *svc_settingset = Slot(#SLOT_SETTINGSET)
+  *svc_netup      = Slot(#SLOT_NETUP)
+  *svc_gpiocount  = Slot(#SLOT_GPIOCOUNT)
+  *svc_gpiomode   = Slot(#SLOT_GPIOMODE)
+  *svc_gpiolevel  = Slot(#SLOT_GPIOLEVEL)
+  *svc_gpiopull   = Slot(#SLOT_GPIOPULL)
+  *svc_vehup      = Slot(#SLOT_VEHUP)
+  *svc_vehloss    = Slot(#SLOT_VEHLOSS)
+
+  ; ---- 4b. MINOR OLDER THAN THIS PAYLOAD NEEDS ----------------------
+  ; The second half of the version gate, and it is a different refusal
+  ; from the one above because it is a different situation. The major
+  ; matches, so every slot this table DOES have still means what this
+  ; payload was told it means - a minor bump only ever APPENDS inside a
+  ; group's reserved block. Calling a slot is therefore safe, and a
+  ; payload with a screen refuses the way a payload with a screen should:
+  ; it draws the sentence itself, through the console group, naming both
+  ; versions. It does not proceed - the services it was written against
+  ; are genuinely not in this monitor.
+  ;
+  ; The console is asked for rather than assumed, because a board with no
+  ; pixel surface still has to be able to refuse; there the sentence
+  ; stays at #SVCP_SENTENCE and the failure count comes back in x0, which
+  ; is the same two artefacts the major path leaves.
+  If gTabMinor < #SVCP_NEED_MINOR
+    *gSentence = AbiRefusal("Every service this table does have still means what it means, because a minor version only ever adds - but the ones this payload was built to call are not in it. Update Anvil, or rebuild the payload against the version this monitor offers.")
+    Put(#R_ABIRC, #SVC_EABI)
+    gFails = gFails + 1
+    If svc_capget(#SVCCAP_CONSOLE) <> 0
+      Put(#R_TEXTH, svc_textheight())
+      If svc_framebegin() = #SVC_OK
+        svc_rect(0, 0, svc_scrw(), svc_scrh(), $FF101418)
+        gTextY = 72
+        Say(*gSentence, $FFF6A05A)
+        Say(svc_errtext(#SVC_EABI), $FF9FB4C8)
+        svc_frameend()
+      EndIf
+    EndIf
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #SVCP_DONE)
+    ProcedureReturn gFails
+  EndIf
+
+  ; ---- 5. THE FIRST CALLS --------------------------------------------
+  ; Slots 0 and 1 against the header words already read. If the pointer
+  ; were wrong these would not return at all.
+  Expect(#R_SLOTMAJOR, svc_abimajor(), #SVC_ABI_MAJOR)
+  Expect(#R_SLOTMINOR, svc_abiminor(), #SVC_ABI_MINOR)
+
+  Put(#R_BOARDID, svc_boardid())
+  Put(#R_NAMEPTR, svc_boardname())
+  Put(#R_MMUSTATE, svc_mmustate())
+  Put(#R_CLOCKPROV, svc_clockprov())
+  Put(#R_TICKS0, svc_ticks())
+
+  ; ---- 6. ALL FOURTEEN CAPABILITY IDS --------------------------------
+  ; Recorded, not judged: what each answers is the BOARD's business, and a
+  ; probe that asserted a particular board's answers would be a probe that
+  ; only runs on that board - which is the opposite of the point.
+  i = 0
+  While i < #SVCCAP_COUNT
+    Put(#R_CAPBASE + i, svc_capget(i))
+    i = i + 1
+  Wend
+
+  ; PET THE DEADMAN. Anvil never pets it on the payload's behalf, and this
+  ; probe is short - but calling it here proves the slot is reachable and
+  ; is the habit every real payload has to have.
+  svc_pet()
+
+  ; ---- 7. THE REFUSAL, TAKEN BEFORE ANYTHING CAN SKIP IT -------------
+  ; The vehicle-link group is the one to use: #CAP_VEHLINK is 0 on this
+  ; board, so this is a LIVE refusal over
+  ; real code rather than a contrived one.
+  ;
+  ; IT IS TAKEN HERE, ON EVERY PATH, AND NOT INSIDE THE DRAWING BELOW.
+  ; It used to be taken inside the frame, which made the ABI's central
+  ; contract - an absent capability answers #SVC_ENOCAP - conditional on
+  ; a framebuffer existing. On 2026-09-07 the board proof found what that
+  ; costs: #CAP_CONSOLE is 1 on this board because it has a console, but
+  ; SvcFrameBegin answered #SVC_EIO because there is nothing to draw
+  ; into, the drawing block was skipped, and the word was never written -
+  ; while the judgement below went on reading it and grading DRAM. An
+  ; interpreter never saw it because every stubbed capability there reads
+  ; 0, so the gate only ever ran the no-console path.
+  ;
+  ; The rule this is an instance of: WHAT IS JUDGED IS TAKEN
+  ; UNCONDITIONALLY; only the reporting of it may be conditional.
+  vrc = svc_vehup()
+  Put(#R_VEHUP, vrc)
+
+  ; ---- 8. THE SCREEN, AND THE REFUSAL DRAWN ON IT --------------------
+  ; Anvil supplies the wording; the payload draws it. That split is the
+  ; point, and it is the drawing primitives exercised as a side
+  ; effect of reporting rather than as a contrived demonstration. A board
+  ; with no framebuffer draws none of it and refuses exactly the same.
+  If svc_capget(#SVCCAP_CONSOLE) <> 0
+    Put(#R_SCRW, svc_scrw())
+    Put(#R_SCRH, svc_scrh())
+    Put(#R_TIER, svc_tier())
+    Put(#R_TEXTH, svc_textheight())
+    Put(#R_TEXTWIDTH, svc_textwidth("Anvil payload ABI", 0))
+
+    rc = svc_framebegin()
+    Put(#R_FRAMERC, rc)
+    If rc = #SVC_OK
+      w = svc_scrw()
+      h = svc_scrh()
+      ; A dark panel over the whole screen, then a lighter one inside it,
+      ; then a rule. Three calls to the one primitive the whole UI is
+      ; built from, plus the line primitive the duty-status grid needs.
+      svc_rect(0, 0, w, h, $FF101418)
+      svc_rect(16, 16, w - 32, h - 32, $FF18202A)
+      svc_line(24, 96, w - 24, 96, $FF3A82F6, 2)
+
+      gTextY = 72
+      Say("Anvil payload ABI - reference probe", $FFE8EEF4)
+      gTextY = 140
+      Say(svc_boardname(), $FF9FB4C8)
+      Say("entered with the service table in x0", $FF9FB4C8)
+
+      ; The refusal taken above, rendered. The CALL is not repeated here:
+      ; drawing a second one would report a different call from the one
+      ; the block records and the judgement grades.
+      Say("calling a service for a capability this board does not have:", $FFF6C85A)
+      Say(svc_errtext(vrc), $FFF6A05A)
+      If svc_errdetail() <> 0
+        Say(svc_errdetail(), $FFF6A05A)
+      EndIf
+
+      svc_frameend()
+      Put(#R_FRAMECOST, svc_framecost())
+    EndIf
+  EndIf
+  ; NO SCREEN IS NOT A FAILURE, and it no longer needs a second copy of
+  ; the refusal either: section 7 took it before this block was reached,
+  ; on every board. The Else that used to hold that copy is gone, because
+  ; two call sites for one recorded answer is how the two paths drifted
+  ; apart in the first place.
+
+  ; The refusal codes, judged. These are the contract and they do not
+  ; depend on which board this is: a capability that is absent answers
+  ; #SVC_ENOCAP, always.
+  If svc_capget(#SVCCAP_VEHLINK) = 0
+    Expect(#R_VEHLOSS, svc_vehloss(), #SVC_ENOCAP)
+    If PeekI(#SVCP_RESULT + #R_VEHUP * 8) <> #SVC_ENOCAP
+      gFails = gFails + 1
+    EndIf
+  Else
+    Put(#R_VEHLOSS, svc_vehloss())
+  EndIf
+
+  Put(#R_ERRTEXTPTR, svc_errtext(#SVC_ENOCAP))
+  Put(#R_DETAILPTR, svc_errdetail())
+
+  ; A code that is not in the set must still produce a sentence, never 0 -
+  ; a payload that got 0 back would have nothing to draw at exactly the
+  ; moment it most needs something.
+  If svc_errtext(-31337) = 0
+    gFails = gFails + 1
+  EndIf
+
+  ; ---- 9. THE GUARDED SETTING ----------------------------------------
+  ; boot.fails is the reboot-loop guard. A payload that could clear it
+  ; could defeat the one thing standing between a bad update and a truck
+  ; that needs a laptop, so the slot refuses ON PURPOSE and says so.
+  Expect(#R_PERMRC, svc_settingset("boot.fails", "0"), #SVC_EPERM)
+
+  ; ---- 10. GPIO ------------------------------------------------------
+  If svc_capget(#SVCCAP_GPIO) <> 0
+    Put(#R_GPIOCOUNT, svc_gpiocount())
+    Put(#R_GPIOMODE, svc_gpiomode(#PROBE_PIN))
+    Put(#R_GPIOLEVEL, svc_gpiolevel(#PROBE_PIN))
+    Put(#R_GPIOPULL, svc_gpiopull(#PROBE_PIN))
+  Else
+    Expect(#R_GPIOCOUNT, svc_gpiocount(), #SVC_ENOCAP)
+  EndIf
+
+  ; ---- 11. STORAGE ---------------------------------------------------
+  ; WRITTEN THEN READ BACK AND COMPARED, byte for byte. A write that
+  ; returned success proves the call returned; only the read-back proves
+  ; the bytes.
+  ;
+  ; NO MEDIUM IS NOT A FAILURE and is not counted as one: whether a stick
+  ; is plugged in is not a property of the ABI. The outcome is RECORDED so
+  ; the transcript says which run this was.
+  Put(#R_STORAGEUP, svc_storageup())
+  Put(#R_FILERC, -1)
+  If PeekI(#SVCP_RESULT + #R_STORAGEUP * 8) = 1
+    If svc_filewritable() = 1
+      i = 0
+      While i < 256
+        PokeB($01500000 + i, (i * 7 + 13) & $FF)
+        i = i + 1
+      Wend
+      If svc_filewriteall("SVCPROBE.BIN", $01500000, 256) = 1
+        If svc_fileopen("SVCPROBE.BIN") = 1
+          n = svc_filereadat(0, $01510000, 256)
+          svc_fileclose()
+          rc = 1
+          If n <> 256
+            rc = 0
+          Else
+            i = 0
+            While i < 256
+              If PeekA($01510000 + i) <> ((i * 7 + 13) & $FF)
+                rc = 0
+              EndIf
+              i = i + 1
+            Wend
+          EndIf
+          Put(#R_FILERC, rc)
+          If rc = 0
+            gFails = gFails + 1
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; APPEND IS NOT IMPLEMENTED ON ANY BOARD YET and must say so rather than
+  ; fall back to a read-modify-write, which would BE the O(n-squared) path
+  ; the slot exists to avoid while reporting success. This asserts the
+  ; honest refusal; when append lands, this expectation changes to a
+  ; many-record append test and this line is what points at it.
+  Expect(#R_APPENDRC, svc_fileappend("SVCPROBE.LOG", $01500000, 16), #SVC_ENOSYS)
+
+  ; The net group is reserved and empty in this build - the one-IP-layer
+  ; merge has not landed (see the net group in abi.pbi). #SVC_ENOSYS is the
+  ; truth.
+  Expect(#R_NETUPRC, svc_netup(), #SVC_ENOSYS)
+
+  ; A reserved slot inside a group that IS implemented must also answer
+  ; #SVC_ENOSYS rather than fault. Slot 46 is inside the touch block's
+  ; reserved tail.
+  *svc_netup = Slot(46)
+  Expect(#R_UNIMPLRC, svc_netup(), #SVC_ENOSYS)
+
+  ; ---- 12. UPTIME IS MONOTONIC ---------------------------------------
+  Put(#R_TICKS1, svc_ticks())
+  If PeekI(#SVCP_RESULT + #R_TICKS1 * 8) < PeekI(#SVCP_RESULT + #R_TICKS0 * 8)
+    gFails = gFails + 1
+  EndIf
+
+  Put(#R_FAILS, gFails)
+  Put(#R_DONE, #SVCP_DONE)
+
+  ; x0 IS THE FAILURE COUNT. Anvil prints it on its own last line, so
+  ; "returned, x0 = 0000000000000000" is a complete verdict.
+  ;
+  ; RETURNING IS HOW THIS PAYLOAD GETS OUT, and not SvcReturn. The ABI's
+  ; SvcReturn is #SVC_ENOSYS in 1.0 - this monitor cannot unwind out of a
+  ; payload from inside a service call, and abi.pi4 says so at length.
+  ; --entry-returns turns _start's forever-trap into a real epilogue and
+  ; the monitor's BLR catches it, which is the path proven on silicon
+  ; 2026-08-25.
+  ProcedureReturn gFails
+EndProcedure
