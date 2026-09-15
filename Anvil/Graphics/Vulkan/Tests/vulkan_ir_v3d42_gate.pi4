@@ -5,7 +5,9 @@
 XIncludeFile "../vk_ir_v3d42.pi4"
 
 #LG_MAGIC = $49523432
-#LG_CASES = 30
+#LG_CASES = 32
+#LG_SAVED_CODE_BYTES = 1024
+#LG_SAVED_UNIFORM_WORDS = 64
 Global Dim lgTypes.AvkIrType[24]
 Global Dim lgConstants.AvkIrConstant[12]
 Global Dim lgVariables.AvkIrVariable[12]
@@ -14,8 +16,12 @@ Global Dim lgBlocks.AvkIrBlock[2]
 Global Dim lgNodes.AvkIrNode[32]
 Global Dim lgInputs.AvkIrV3d42Io[4]
 Global Dim lgOutputs.AvkIrV3d42Io[4]
-Global Dim lgCode.i[4096]
-Global Dim lgUniform.l[2048]
+Global Dim lgCode.i[4224]
+Global Dim lgUniform.l[2112]
+Global Dim lgSavedCode30.i[128]
+Global Dim lgSavedUniform30.l[64]
+Global Dim lgSavedCode31.i[128]
+Global Dim lgSavedUniform31.l[64]
 Global Dim lgReport.i[1024]
 Global lgChecks.i = 0
 Global lgFails.i = 0
@@ -33,6 +39,10 @@ Procedure.i lgSameBytes(a.i,b.i,bytes.i)
     i=i+1
   Wend
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i lgDisjoint(a.i,aBytes.i,b.i,bBytes.i)
+  ProcedureReturn Bool((a+aBytes)<=b Or (b+bBytes)<=a)
 EndProcedure
 
 Procedure lgFillTarget(*t.AvkIrV3d42Target)
@@ -337,6 +347,54 @@ Procedure lgResourceMix(*m.AvkIrModule, usePush.i, useUniform.i, useSample.i, or
   lgBlocks[0]\nodeCount=n
 EndProcedure
 
+; Two live constant vectors and their FAdd are emitted before the sampled
+; image request.  With the sample reservation intact the early result starts
+; above rf13; weakening the reservation lets the later UV setup overwrite its
+; first two lanes before the final FAdd consumes them.
+Procedure lgLateSampleSpan(*m.AvkIrModule)
+  lgSample(*m)
+  *m\idBound=96:*m\constantCount=10:*m\nodeCount=7:lgBlocks[0]\nodeCount=7
+  lgConstants[0]\sourceId=40:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2:lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3F000000
+  lgConstants[1]\sourceId=41:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$3F100000
+  lgConstants[2]\sourceId=42:lgConstants[2]\sourceOpcode=43:lgConstants[2]\typeId=2:lgConstants[2]\wordCount=1:lgConstants[2]\word0=$3F200000
+  lgConstants[3]\sourceId=43:lgConstants[3]\sourceOpcode=43:lgConstants[3]\typeId=2:lgConstants[3]\wordCount=1:lgConstants[3]\word0=$3F300000
+  lgConstants[4]\sourceId=44:lgConstants[4]\sourceOpcode=43:lgConstants[4]\typeId=2:lgConstants[4]\wordCount=1:lgConstants[4]\word0=$3F400000
+  lgConstants[5]\sourceId=45:lgConstants[5]\sourceOpcode=43:lgConstants[5]\typeId=2:lgConstants[5]\wordCount=1:lgConstants[5]\word0=$3F500000
+  lgConstants[6]\sourceId=46:lgConstants[6]\sourceOpcode=43:lgConstants[6]\typeId=2:lgConstants[6]\wordCount=1:lgConstants[6]\word0=$3F600000
+  lgConstants[7]\sourceId=47:lgConstants[7]\sourceOpcode=43:lgConstants[7]\typeId=2:lgConstants[7]\wordCount=1:lgConstants[7]\word0=$3F700000
+  lgConstants[8]\sourceId=48:lgConstants[8]\sourceOpcode=44:lgConstants[8]\typeId=4:lgConstants[8]\componentCount=4
+  lgConstants[8]\component0=40:lgConstants[8]\component1=41:lgConstants[8]\component2=42:lgConstants[8]\component3=43
+  lgConstants[9]\sourceId=49:lgConstants[9]\sourceOpcode=44:lgConstants[9]\typeId=4:lgConstants[9]\componentCount=4
+  lgConstants[9]\component0=44:lgConstants[9]\component1=45:lgConstants[9]\component2=46:lgConstants[9]\component3=47
+  lgNode(0,50,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2):lgNodes[0]\operand0=48:lgNodes[0]\operand1=49
+  lgNode(1,30,61,#ANVIL_IR_OP_LOAD,6,1):lgNodes[1]\operand0=15
+  lgNode(2,31,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[2]\operand0=16
+  lgNode(3,32,87,#ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD,4,2):lgNodes[3]\operand0=30:lgNodes[3]\operand1=31
+  lgNode(4,51,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2):lgNodes[4]\operand0=50:lgNodes[4]\operand1=32
+  lgNode(5,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[5]\operand0=17:lgNodes[5]\operand1=51
+  lgNode(6,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+; A live arithmetic result is allocated before the UBO load and consumed
+; afterwards. Weakening the UBO reservation places that result in rf8..rf11;
+; the later address LDUNIFRF/TMUAU use of rf8 would then destroy its first lane.
+Procedure lgLateUboSpan(*m.AvkIrModule)
+  lgBlock(*m,2)
+  *m\idBound=96:*m\constantCount=6:*m\nodeCount=6:lgBlocks[0]\nodeCount=6
+  lgConstants[1]\sourceId=40:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$3F000000
+  lgConstants[2]\sourceId=41:lgConstants[2]\sourceOpcode=43:lgConstants[2]\typeId=2:lgConstants[2]\wordCount=1:lgConstants[2]\word0=$3F100000
+  lgConstants[3]\sourceId=42:lgConstants[3]\sourceOpcode=43:lgConstants[3]\typeId=2:lgConstants[3]\wordCount=1:lgConstants[3]\word0=$3F200000
+  lgConstants[4]\sourceId=43:lgConstants[4]\sourceOpcode=43:lgConstants[4]\typeId=2:lgConstants[4]\wordCount=1:lgConstants[4]\word0=$3F300000
+  lgConstants[5]\sourceId=48:lgConstants[5]\sourceOpcode=44:lgConstants[5]\typeId=3:lgConstants[5]\componentCount=4
+  lgConstants[5]\component0=40:lgConstants[5]\component1=41:lgConstants[5]\component2=42:lgConstants[5]\component3=43
+  lgNode(0,50,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,3,2):lgNodes[0]\operand0=48:lgNodes[0]\operand1=48
+  lgNode(1,30,65,#ANVIL_IR_OP_ACCESS_CHAIN,6,2):lgNodes[1]\operand0=15:lgNodes[1]\operand1=12
+  lgNode(2,31,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[2]\operand0=30
+  lgNode(3,51,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,3,2):lgNodes[3]\operand0=50:lgNodes[3]\operand1=31
+  lgNode(4,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[4]\operand0=16:lgNodes[4]\operand1=51
+  lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
 ; Two scalar VPM inputs -> vec2 construct -> extract lane one -> scalar VPM
 ; output. This covers both composite operations and distinct IO mappings.
 Procedure lgComposite(*m.AvkIrModule)
@@ -560,6 +618,7 @@ Procedure.i Main()
   Protected lanes.i
   Protected operation.i
   Protected caseIndex.i
+  Protected copyIndex.i
 
   lgPass(@m,#ANVIL_IR_STAGE_VERTEX)
   lgTarget(@t,0,1,10,4,11,4)
@@ -708,6 +767,52 @@ Procedure.i Main()
     caseIndex=caseIndex+1
   Wend
 
+  ; Causal reservation witnesses.  These are ordered so ordinary live SSA
+  ; values exist before a later fixed-register resource operation and remain
+  ; operands afterwards; the host checker decodes the later arithmetic and
+  ; verifies that the resource setup could not have overwritten them.
+  lgLateSampleSpan(@m):lgTarget(@t,30,2,16,2,17,4)
+  t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(30,rc,@r,@t)
+  lgCheck(lgDisjoint(@lgSavedCode30[0],#LG_SAVED_CODE_BYTES,@lgSavedUniform30[0],#LG_SAVED_UNIFORM_WORDS*4)<>0)
+  If rc=0 And r\codeBytes<=#LG_SAVED_CODE_BYTES And r\uniformWords<=#LG_SAVED_UNIFORM_WORDS
+    copyIndex=0
+    While copyIndex<r\codeBytes
+      PokeA(@lgSavedCode30[0]+copyIndex,PeekA(t\codeBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    copyIndex=0
+    While copyIndex<(r\uniformWords*4)
+      PokeA(@lgSavedUniform30[0]+copyIndex,PeekA(t\uniformBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    lgReport[241]=@lgSavedCode30[0]:lgReport[243]=@lgSavedUniform30[0]
+  EndIf
+  lgReport[760]=avk42Reg[48*4]:lgReport[761]=avk42Reg[49*4]
+  lgReport[762]=avk42Reg[50*4]:lgReport[763]=avk42Reg[32*4]:lgReport[764]=avk42Reg[51*4]
+  lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=11)
+
+  lgLateUboSpan(@m):lgTarget(@t,31,2,0,0,16,4)
+  t\uniformBlockAddress=$00102000
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(31,rc,@r,@t)
+  lgCheck(lgDisjoint(@lgSavedCode31[0],#LG_SAVED_CODE_BYTES,@lgSavedUniform31[0],#LG_SAVED_UNIFORM_WORDS*4)<>0)
+  If rc=0 And r\codeBytes<=#LG_SAVED_CODE_BYTES And r\uniformWords<=#LG_SAVED_UNIFORM_WORDS
+    copyIndex=0
+    While copyIndex<r\codeBytes
+      PokeA(@lgSavedCode31[0]+copyIndex,PeekA(t\codeBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    copyIndex=0
+    While copyIndex<(r\uniformWords*4)
+      PokeA(@lgSavedUniform31[0]+copyIndex,PeekA(t\uniformBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    lgReport[249]=@lgSavedCode31[0]:lgReport[251]=@lgSavedUniform31[0]
+  EndIf
+  lgReport[770]=avk42Reg[48*4]:lgReport[771]=avk42Reg[50*4]
+  lgReport[772]=avk42Reg[31*4]:lgReport[773]=avk42Reg[51*4]
+  lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=7)
+
   ; Exact live resource block contract: Block, member zero, Offset zero and
   ; float32 vec4. Each refusal is transactional and points at the Load stage.
   lgBlock(@m,9):lgTypes[3]\memberCount=2:lgTypes[3]\member1=3:lgConstants[0]\word0=1
@@ -802,9 +907,10 @@ Procedure.i Main()
   lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
   t\uniformBase=t\codeBase+8
   lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_RANGE)
-  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  lgPass(@m,#ANVIL_IR_STAGE_FRAGMENT):lgTarget(@t,32,#ANVIL_IR_V3D42_ROLE_FRAGMENT,10,4,11,4)
   t\inputCount=2:lgInputs[1]\variableId=10:lgInputs[1]\member=-1:lgInputs[1]\firstSlot=4:lgInputs[1]\components=4
-  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=10)
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=10 And AnvilVkIrV3d42SourceOpcode()=#ANVIL_IR_SPV_VARIABLE And AnvilVkIrV3d42Stage()=2 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
   lgComposite(@m):lgTarget(@t,5,1,10,1,11,1)
   t\inputCount=2
   lgInputs[1]\variableId=12:lgInputs[1]\member=-1:lgInputs[1]\firstSlot=0:lgInputs[1]\components=1
