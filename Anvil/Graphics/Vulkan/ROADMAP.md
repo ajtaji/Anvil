@@ -2,7 +2,9 @@
 
 This is a coverage inventory, not a version or conformance claim. The schema
 target is `VK_API_VERSION_1_0`, generated from the pinned registry identified
-in `COVERAGE.md`. Production currently exposes no physical device.
+in `COVERAGE.md`. A production Pi 4 build linked to the V3D backend exposes its
+one implemented physical device; targets without a graphics backend enumerate
+none.
 
 See the [cross-layer compatibility inventory](../../../docs/VULKAN_COMPATIBILITY_STATUS.md)
 for the current implementation matrix, prerequisites, target-neutral boundaries,
