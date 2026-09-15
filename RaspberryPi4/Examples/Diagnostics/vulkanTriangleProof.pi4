@@ -27,8 +27,8 @@
 ;    vkCmdPushConstants, vkCmdDraw, vkCmdEndRenderPass,
 ;    vkEndCommandBuffer, vkCreateFence, vkQueueSubmit, vkWaitForFences,
 ;    vkDeviceWaitIdle and the ordered teardown.
-;  The live physical device's exact linear-format feature word is checked
-;  before image creation, and both allocations are populated through
+;  The live physical device's exact linear and optimal format-feature words
+;  are checked before image creation, and both allocations are populated through
 ;  vkMapMemory/vkUnmapMemory. Correct GPU pixels after those unflushed host
 ;  writes are the silicon proof behind this backend's HOST_COHERENT claim.
 ;
@@ -84,8 +84,11 @@
 ;  WHAT THE OPERATOR SHOULD SEE
 ; ======================================================================
 ;  A solid GREEN triangle, apex up, on a blue-grey ground, held for six
-;  seconds. In panel pixels the apex is at (400, 320) and the base runs
-;  from (200, 960) to (600, 960).
+;  seconds. The Vulkan target and its deliberately odd 799 x 1279 viewport
+;  put the apex at
+;  (399.5, 319.75) and the base from (199.75, 959.25) to
+;  (599.25, 959.25). Its half-pixel centres are also verified directly in
+;  the submitted BCL; a correct-looking picture alone is not that proof.
 ;
 ;  The green is PASS TWO. Pass one's red triangle is drawn into the same
 ;  image and then overwritten by pass two's clear, so it is never on the
@@ -135,8 +138,10 @@
 ;
 ;    0  magic $564B5452          32 layout after pass one
 ;    1  UNIFORM-COLOUR VERDICT   33 bin OOM count
-;    2  detail                   34 bin error status
-;    3  detail 2                 35 render error status
+;    2  failure detail, or BCL start on success
+;    3  failure detail 2, or BCL bytes on success
+;                                34 bin error status
+;                                35 render error status
 ;    4  PER-VERTEX VERDICT       36 MMU fault count
 ;    5  surface (guard) base     37 MMU violation address
 ;    6  Vulkan window base       38 guard sum before
@@ -195,6 +200,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VTP_SURFACE = $06000000
 #VTP_PANEL_W = 800
 #VTP_PANEL_H = 1280
+#VTP_VIEW_W = 799
+#VTP_VIEW_H = 1279
 #VTP_PANEL_PITCH = 3200
 #VTP_SCREEN_BYTES = 4096000
 #VTP_WIN_BASE = $063E8000              ; $06000000 + 4,096,000
@@ -226,10 +233,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VTP_Y2 = $3F000000                    ;  0.5
 #VTP_STRIDE = 24                       ; vec2 position + vec4 colour
 
-; The six sample points. The triangle's apex is (400, 320) and its base
-; runs from (200, 960) to (600, 960), so the half width at row y is
-; (y - 320) / 640 * 200 and every point below is comfortably clear of an
-; edge - the nearest is 56 pixels from one.
+; The six sample points. The odd viewport makes the triangle's apex
+; (399.5, 319.75) and its base run from (199.75, 959.25) to
+; (599.25, 959.25); every point below remains comfortably clear of an edge.
 #VTP_IN0X = 400
 #VTP_IN0Y = 500
 #VTP_IN1X = 400
@@ -275,6 +281,18 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VTP_ERR_V3D_FAULT = 27
 #VTP_ERR_FORMAT = 28
 #VTP_ERR_MAP = 29
+#VTP_ERR_VIEWPORT_PACKET = 30
+
+; Independent V3D 4.2 packet oracle for the consecutive draw-local override.
+; Packet 110 is CLIPPER_XY_SCALING and packet 108 is VIEWPORT_OFFSET.
+; 799/2 and 1279/2 are exact binary32 399.5 and 639.5. Fine X/Y are
+; unsigned u14.8, so they are width/height multiplied by 128.
+#VTP_PKT_CLIPPER_XY_SCALING = 110
+#VTP_PKT_VIEWPORT_OFFSET = 108
+#VTP_SCALE_X_BITS = $43C7C000
+#VTP_SCALE_Y_BITS = $441FE000
+#VTP_FINE_X = $00018F80
+#VTP_FINE_Y = $00027F80
 
 #VTP_P_NOT_TRIED = 0
 #VTP_P_OK = 1
@@ -439,6 +457,34 @@ Procedure.i vtpPixel(imgBase.i, pitch.i, x.i, y.i)
   ProcedureReturn PeekL(imgBase + (y * pitch) + (x * 4)) & $FFFFFFFF
 EndProcedure
 
+; Control-list words are byte-aligned, not naturally aligned. Read them the
+; same byte-wise way the V3D packet encoder writes them.
+Procedure.i vtpLe32(addr.i)
+  ProcedureReturn (PeekA(addr) & $FF) | ((PeekA(addr + 1) & $FF) << 8) | ((PeekA(addr + 2) & $FF) << 16) | ((PeekA(addr + 3) & $FF) << 24)
+EndProcedure
+
+; Return the byte offset of the exact consecutive scaling/offset pair. A
+; single opcode byte is not evidence because arbitrary packet payload can
+; contain the same value.
+Procedure.i vtpFindOddViewportPackets(base.i, bytes.i)
+  Define i.i
+  If base = 0 Or bytes < 18 : ProcedureReturn -1 : EndIf
+  i = 0
+  While i <= bytes - 18
+    If (PeekA(base + i) & $FF) = #VTP_PKT_CLIPPER_XY_SCALING
+      If vtpLe32(base + i + 1) = #VTP_SCALE_X_BITS And vtpLe32(base + i + 5) = #VTP_SCALE_Y_BITS
+        If (PeekA(base + i + 9) & $FF) = #VTP_PKT_VIEWPORT_OFFSET
+          If vtpLe32(base + i + 10) = #VTP_FINE_X And vtpLe32(base + i + 14) = #VTP_FINE_Y
+            ProcedureReturn i
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
 Procedure.i Main()
   Define rc.i
   Define inst.i
@@ -476,6 +522,7 @@ Procedure.i Main()
   Define hz.i
   Define badIn.i
   Define badOut.i
+  Define viewportPacket.i
 
   Define ici.VkInstanceCreateInfo
   Define fp.VkFormatProperties
@@ -586,7 +633,7 @@ Procedure.i Main()
     ProcedureReturn vtpStop(#VTP_ERR_INSTANCE)
   EndIf
   vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @fp)
-  If fp\linearTilingFeatures <> (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) Or fp\optimalTilingFeatures <> 0 Or fp\bufferFeatures <> 0
+  If fp\linearTilingFeatures <> (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) Or fp\optimalTilingFeatures <> #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT Or fp\bufferFeatures <> 0
     vtpPut(#VTP_S_DETAIL, fp\linearTilingFeatures)
     vtpPut(#VTP_S_DETAIL2, fp\optimalTilingFeatures | fp\bufferFeatures)
     NeonShutdown()
@@ -628,8 +675,8 @@ Procedure.i Main()
   imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
   imgci\imageType = #VK_IMAGE_TYPE_2D
   imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
-  imgci\extent\width = #VTP_PANEL_W
-  imgci\extent\height = #VTP_PANEL_H
+  imgci\extent\width = #VTP_VIEW_W
+  imgci\extent\height = #VTP_VIEW_H
   imgci\extent\depth = 1
   imgci\mipLevels = 1
   imgci\arrayLayers = 1
@@ -716,8 +763,8 @@ Procedure.i Main()
   fbci\renderPass = rp
   fbci\attachmentCount = 1
   fbci\pAttachments = @view
-  fbci\width = #VTP_PANEL_W
-  fbci\height = #VTP_PANEL_H
+  fbci\width = #VTP_VIEW_W
+  fbci\height = #VTP_VIEW_H
   fbci\layers = 1
   If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS
     NeonShutdown()
@@ -845,14 +892,14 @@ Procedure.i Main()
   ia\primitiveRestartEnable = #VK_FALSE
   PokeL(@vp\x, #VTP_F_ZERO)
   PokeL(@vp\y, #VTP_F_ZERO)
-  PokeL(@vp\width, $44480000)            ; 800.0
-  PokeL(@vp\height, $44A00000)           ; 1280.0
+  PokeL(@vp\width, $4447C000)            ; 799.0, deliberately odd
+  PokeL(@vp\height, $449FE000)           ; 1279.0, deliberately odd
   PokeL(@vp\minDepth, #VTP_F_ZERO)
   PokeL(@vp\maxDepth, #VTP_F_ONE)
   sc\offset\x = 0
   sc\offset\y = 0
-  sc\extent\width = #VTP_PANEL_W
-  sc\extent\height = #VTP_PANEL_H
+  sc\extent\width = #VTP_VIEW_W
+  sc\extent\height = #VTP_VIEW_H
   vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
   vpstate\viewportCount = 1
   vpstate\pViewports = @vp
@@ -948,8 +995,8 @@ Procedure.i Main()
   rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
   rpbi\renderPass = rp
   rpbi\framebuffer = fb
-  rpbi\renderArea\extent\width = #VTP_PANEL_W
-  rpbi\renderArea\extent\height = #VTP_PANEL_H
+  rpbi\renderArea\extent\width = #VTP_VIEW_W
+  rpbi\renderArea\extent\height = #VTP_VIEW_H
   rpbi\clearValueCount = 1
   rpbi\pClearValues = @vtpClear[0]
 
@@ -1045,6 +1092,9 @@ Procedure.i Main()
         If rc <> #VK_SUCCESS
           vtpPut(#VTP_S_STATUS2, #VTP_ERR_FENCE)
         Else
+          vtpPut(#VTP_S_DETAIL, V3dBclStartAddr())
+          vtpPut(#VTP_S_DETAIL2, V3dBclBytes())
+          viewportPacket = vtpFindOddViewportPackets(V3dBclStartAddr(), V3dBclBytes())
           vtpPut(#VTP_S_P2_IN0, vtpPixel(imgBase, pitch, #VTP_IN0X, #VTP_IN0Y))
           vtpPut(#VTP_S_P2_IN1, vtpPixel(imgBase, pitch, #VTP_IN1X, #VTP_IN1Y))
           vtpPut(#VTP_S_P2_IN2, vtpPixel(imgBase, pitch, #VTP_IN2X, #VTP_IN2Y))
@@ -1059,7 +1109,9 @@ Procedure.i Main()
           If vtpGet(#VTP_S_P2_OUT0) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
           If vtpGet(#VTP_S_P2_OUT1) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
           If vtpGet(#VTP_S_P2_OUT2) <> #VTP_CLEAR_WORD : badOut = badOut + 1 : EndIf
-          If badIn <> 0
+          If viewportPacket < 0
+            vtpPut(#VTP_S_STATUS2, #VTP_ERR_VIEWPORT_PACKET)
+          ElseIf badIn <> 0
             vtpPut(#VTP_S_STATUS2, #VTP_ERR_PIXELS_IN)
           ElseIf badOut <> 0
             vtpPut(#VTP_S_STATUS2, #VTP_ERR_PIXELS_OUT)
@@ -1090,7 +1142,7 @@ Procedure.i Main()
   rc = DisplayAdopt(#VTP_DSI_SCAN, #VTP_PANEL_PITCH, #VTP_PANEL_W, #VTP_PANEL_H, 32)
   vtpPut(#VTP_S_DISPLAY_ERR, DisplayLastError())
   If rc = #DSP_OK
-    DisplayBlit(imgBase, pitch, 0, 0, #VTP_PANEL_W, #VTP_PANEL_H)
+    DisplayBlit(imgBase, pitch, 0, 0, #VTP_VIEW_W, #VTP_VIEW_H)
     DisplayFlush()
     vtpPut(#VTP_S_PRESENT, #VTP_P_OK)
     delay(#VTP_SHOW_MS)

@@ -7351,9 +7351,18 @@ Procedure.i V3dRenderSubmit()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  V3dRenderWait - spin on CLE_RFC, then clean.
+;  V3dRenderWait - spin on CTL_INT_STS.FRDONE, then clean.
 ;
-;  ON THE CLEAN, WHICH IS BELT AND BRACES AND IS LABELLED AS SUCH:
+;  FRDONE IS THE COMPLETION CONTRACT, NOT CLE_RFC. Linux v3d_irq.c
+;  signals the render job's fence from V3D_INT_FRDONE, and
+;  v3d_sched.c starts the render job after the cache invalidation that
+;  belongs to that submission. A Pi 4 proof showed why the distinction
+;  matters: CLE_RFC advanced while one immediate CPU sample still saw
+;  the pre-render clear value; after a later cache transition the same
+;  location contained the rendered pixel. RFC remains useful telemetry,
+;  but it is not allowed to publish completion.
+;
+;  ON THE CLEAN:
 ;  v3d_drm.h:143-149 states that TLB writes are already flushed by the
 ;  time the render-done event happens, and that only TMU writes can
 ;  leave dirty cachelines. Nothing in this stage does a TMU write. So
@@ -7361,13 +7370,10 @@ EndProcedure
 ;
 ;  It runs anyway because FLM_CLEAN cannot lose data - v3d_regs.h:259
 ;  to :261, "Writes out dirty cachelines and marks them clean, without
-;  invalidating" - and because the documented guarantee is tied to the
-;  render-done IRQ while this file polls RFC, and nothing on this disk
-;  says those are the same instant. Two register writes and two
-;  bounded spins against the risk of a repeat of the stage-2 failure,
-;  where every register said success and the output page was still
-;  poison. V3dRenderCleanResult() reports it separately so a reader
-;  can see it ran.
+;  invalidating". It also preserves the explicit stage-2 defence where
+;  every job register said success while the output page was still
+;  poison. V3dRenderCleanResult() reports it separately so a reader can
+;  see it ran.
 ;
 ;  NOTE WHICH OPERATION THIS IS AND DO NOT "SIMPLIFY" IT TO
 ;  V3dInvalidateCaches(). That one uses FLM_FLUSH, which INVALIDATES.
@@ -7375,7 +7381,7 @@ EndProcedure
 ;  destroy it - which is exactly the mistake stage 2 nearly made.
 ; ----------------------------------------------------------------------
 Procedure.i V3dRenderWait(us.i)
-  Protected rfc.i
+  Protected sts.i
   Protected hz.i
   Protected deadline.i
   Protected spins.i
@@ -7395,8 +7401,8 @@ Procedure.i V3dRenderWait(us.i)
   rc    = #V3D_ERR_RENDER_TIMEOUT
 
   Repeat
-    rfc = V3dCoreRead(#V3D_CLE_RFC)
-    If rfc <> v3d_renRfcBefore
+    sts = V3dCoreRead(#V3D_CTL_INT_STS)
+    If (sts & #V3D_CTL_INT_FRDONE) <> 0
       rc = #V3D_OK
       Break
     EndIf

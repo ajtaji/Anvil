@@ -78,6 +78,7 @@ REQUIRED_HOST_COHERENT_BACKEND = (
     "V3dCacheRange(*bind\\base, lastVertex * *bind\\stride)",
 )
 REQUIRED_HOST_COHERENT_COMPLETION = (
+    "If (sts & #V3D_CTL_INT_FRDONE) <> 0",
     "v3d_renCleanRc = V3dCleanCaches()",
     "V3dCacheRange(v3d_rtAddr, v3d_rtBytes)",
 )
@@ -129,6 +130,14 @@ MUTANTS = (
 )
 
 DYNAMIC_MUTANTS = (
+    (
+        "the public render fence is published from RFC before FRDONE",
+        V3D_CORE,
+        "    sts = V3dCoreRead(#V3D_CTL_INT_STS)\n"
+        "    If (sts & #V3D_CTL_INT_FRDONE) <> 0\n",
+        "    sts = V3dCoreRead(#V3D_CLE_RFC)\n"
+        "    If sts <> v3d_renRfcBefore\n",
+    ),
     (
         "partial right and bottom tiles are truncated instead of rounded outward",
         V3D_CORE,

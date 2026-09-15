@@ -767,7 +767,7 @@ def compile_probe(compiler: str, probe: pathlib.Path,
 #  of Main() so the lists it built can be read out of its memory.
 # =====================================================================
 class Model:
-    def __init__(self, bfc_moves=True, rfc_moves=True):
+    def __init__(self, bfc_moves=True, rfc_moves=True, render_done=True):
         self.ident1 = 0x000E1124
         self.ident2 = 0x00000100          # WITH_MMU
         self.grafx = 0x1020 | 0x06
@@ -786,6 +786,7 @@ class Model:
         self.int_sts = 0
         self.bfc_moves = bfc_moves
         self.rfc_moves = rfc_moves
+        self.render_done = render_done
         self.ptb = {}
         self.core_regs_written: list[int] = []
 
@@ -1056,6 +1057,7 @@ def core_write(m, off, value, syms, cpu):
         m.cle[0x0010C] = value
         if m.rfc_moves:
             m.rfc = (m.rfc + 1) & 0xFF
+        if m.render_done:
             m.int_sts |= 1              # FRDONE
         return
     raise SystemExit("a64_v3d_rcl_check: write to core register $%05X, which "
@@ -1477,7 +1479,7 @@ def negatives(fails: list[str], ctx: Context) -> None:
     for label, kw, want in (
             ("the binner never completes", {"bfc_moves": False},
              "BIN_TIMEOUT"),
-            ("the renderer never completes", {"rfc_moves": False},
+            ("RFC advances before render done", {"render_done": False},
              "RENDER_TIMEOUT")):
         ROWS[0] += 1
         cpu, out = run(ctx.image, Model(**kw))
@@ -1485,6 +1487,13 @@ def negatives(fails: list[str], ctx: Context) -> None:
         print("     %-34s %s" % (label, "ok" if ok else "DID NOT REPORT " + want))
         if not ok:
             fails.append("%s: the probe did not report %s" % (label, want))
+    ROWS[0] += 1
+    cpu, out = run(ctx.image, Model(rfc_moves=False))
+    ok = "render wait: OK" in out
+    print("     %-34s %s" % ("FRDONE completes without RFC movement",
+                             "ok" if ok else "DID NOT COMPLETE"))
+    if not ok:
+        fails.append("FRDONE did not complete the render wait when RFC stayed still")
     ROWS[0] += 1
     cpu, out = run(ctx.image, Model(bfc_moves=False))
     ok = "render submit" not in out
