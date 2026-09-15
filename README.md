@@ -4,7 +4,10 @@
 in PureMetal.**
 
 [MIT licensed](LICENSE) · [Architecture](docs/ARCHITECTURE.md) ·
-[Portability](docs/PORTABILITY.md) · [Project forum](https://forum.ajtaji.com/) ·
+[Portability](docs/PORTABILITY.md) ·
+[PureMetal Forge](https://puremetalforge.ajtaji.com/) ·
+[Forums](https://forum.ajtaji.com/category/18/puremetal-forge) ·
+[Anvil forum](https://forum.ajtaji.com/category/116/anvil) ·
 [Issue tracker](https://github.com/ajtaji/Anvil/issues)
 
 Anvil keeps one hardware-independent monitor core and composes it with the
@@ -59,7 +62,8 @@ HAL contract.
 ## Build
 
 The PureMetal application (`PureMetalForge.exe`, or `PureMetalForge.linux` on
-Linux) is an external dependency and is not included. The editor and the
+Linux) is an external dependency and is not included; it is free to download
+from the [PureMetal Forge website](https://puremetalforge.ajtaji.com/). The editor and the
 compiler are one program: `--compile` builds from the command line with no
 window, and there is no separate console compiler. Python 3 is used by the
 repository wrapper and host checks; those scripts use only the standard
