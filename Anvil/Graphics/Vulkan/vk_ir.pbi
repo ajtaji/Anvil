@@ -102,6 +102,7 @@
 #ANVIL_IR_SPV_TYPE_FUNCTION = 33
 #ANVIL_IR_SPV_CONSTANT = 43
 #ANVIL_IR_SPV_CONSTANT_COMPOSITE = 44
+#ANVIL_IR_SPV_ENTRY_POINT = 15
 #ANVIL_IR_SPV_FUNCTION = 54
 #ANVIL_IR_SPV_VARIABLE = 59
 #ANVIL_IR_SPV_LOAD = 61
@@ -194,6 +195,7 @@ Structure AvkIrNode Align #PB_Structure_AlignC
 EndStructure
 
 Structure AvkIrModule Align #PB_Structure_AlignC
+  sourceVersion.i
   idBound.i
   stage.i
   entryFunctionId.i
@@ -207,6 +209,8 @@ Structure AvkIrModule Align #PB_Structure_AlignC
   constants.i
   variableCount.i
   variables.i
+  interfaceCount.i
+  interfaces.i
   decorationCount.i
   decorations.i
   blockCount.i
@@ -458,6 +462,9 @@ Procedure.i avkIrCheckCounts(*m.AvkIrModule)
   If *m\variableCount < 0 Or *m\variableCount > #ANVIL_IR_MAX_VARIABLES Or (*m\variableCount > 0 And *m\variables = 0)
     ProcedureReturn avkIrFail(#ANVIL_IR_ERR_BOUNDS, 0, 0, -1)
   EndIf
+  If *m\interfaceCount < 0 Or *m\interfaceCount > #ANVIL_IR_MAX_VARIABLES Or (*m\interfaceCount > 0 And *m\interfaces = 0)
+    ProcedureReturn avkIrFail(#ANVIL_IR_ERR_BOUNDS, 0, #ANVIL_IR_SPV_ENTRY_POINT, -1)
+  EndIf
   If *m\decorationCount < 0 Or *m\decorationCount > #ANVIL_IR_MAX_DECORATIONS Or (*m\decorationCount > 0 And *m\decorations = 0)
     ProcedureReturn avkIrFail(#ANVIL_IR_ERR_BOUNDS, 0, 0, -1)
   EndIf
@@ -467,6 +474,93 @@ Procedure.i avkIrCheckCounts(*m.AvkIrModule)
   If *m\nodeCount < 1 Or *m\nodeCount > #ANVIL_IR_MAX_NODES Or *m\nodes = 0
     ProcedureReturn avkIrFail(#ANVIL_IR_ERR_BOUNDS, 0, 0, -1)
   EndIf
+  ProcedureReturn #ANVIL_IR_OK
+EndProcedure
+
+; Entry-point interface ownership is optional for target-authored IR
+; (sourceVersion zero). SPIR-V-backed IR retains the exact ordered operands.
+; Before SPIR-V 1.4 only Input and Output variables are interface operands and
+; duplicate operands are permitted by the grammar. SPIR-V 1.4 and later list
+; every statically referenced global variable and forbid duplicates.
+Procedure.i avkIrInterfaceContains(*m.AvkIrModule, id.i)
+  Protected i.i
+  i = 0
+  While i < *m\interfaceCount
+    If PeekI(*m\interfaces + (i * SizeOf(.i))) = id : ProcedureReturn 1 : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkIrVariableReferenced(*m.AvkIrModule, id.i)
+  Protected i.i
+  Protected k.i
+  Protected operand.i
+  Protected *n.AvkIrNode
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    k = 0
+    While k < *n\operandCount
+      operand = avkIrOperand(*n, k)
+      If operand = id : ProcedureReturn 1 : EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkIrCheckInterface(*m.AvkIrModule)
+  Protected i.i
+  Protected j.i
+  Protected id.i
+  Protected *v.AvkIrVariable
+  ; Zero marks IR authored directly against this schema rather than adapted
+  ; from SPIR-V. Existing target-neutral fixtures deliberately use that form.
+  If *m\sourceVersion = 0 : ProcedureReturn #ANVIL_IR_OK : EndIf
+  If *m\sourceVersion < $00010000 Or *m\sourceVersion > $00010600
+    ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNSUPPORTED, *m\sourceVersion, #ANVIL_IR_SPV_ENTRY_POINT, -1)
+  EndIf
+  i = 0
+  While i < *m\interfaceCount
+    id = PeekI(*m\interfaces + (i * SizeOf(.i)))
+    If avkIrIdOk(*m, id) = 0
+      ProcedureReturn avkIrFail(#ANVIL_IR_ERR_BOUNDS, id, #ANVIL_IR_SPV_ENTRY_POINT, i)
+    EndIf
+    *v = avkIrFindVariable(*m, id)
+    If *v = 0
+      If avkIrDefined(*m, id) <> 0
+        ProcedureReturn avkIrFail(#ANVIL_IR_ERR_TYPE, id, #ANVIL_IR_SPV_ENTRY_POINT, i)
+      EndIf
+      ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNDEFINED, id, #ANVIL_IR_SPV_ENTRY_POINT, i)
+    EndIf
+    If *m\sourceVersion < $00010400 And *v\storageClass <> #ANVIL_IR_STORAGE_INPUT And *v\storageClass <> #ANVIL_IR_STORAGE_OUTPUT
+      ProcedureReturn avkIrFail(#ANVIL_IR_ERR_STORAGE, id, #ANVIL_IR_SPV_ENTRY_POINT, i)
+    EndIf
+    If *m\sourceVersion >= $00010400
+      j = 0
+      While j < i
+        If PeekI(*m\interfaces + (j * SizeOf(.i))) = id
+          ProcedureReturn avkIrFail(#ANVIL_IR_ERR_DUPLICATE, id, #ANVIL_IR_SPV_ENTRY_POINT, i)
+        EndIf
+        j = j + 1
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < *m\variableCount
+    *v = avkIrVariableAt(*m, i)
+    If avkIrVariableReferenced(*m, *v\sourceId) <> 0
+      If *m\sourceVersion >= $00010400 Or *v\storageClass = #ANVIL_IR_STORAGE_INPUT Or *v\storageClass = #ANVIL_IR_STORAGE_OUTPUT
+        If avkIrInterfaceContains(*m, *v\sourceId) = 0
+          ProcedureReturn avkIrFail(#ANVIL_IR_ERR_UNDEFINED, *v\sourceId, #ANVIL_IR_SPV_ENTRY_POINT, i)
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
   ProcedureReturn #ANVIL_IR_OK
 EndProcedure
 
@@ -917,5 +1011,6 @@ Procedure.i AnvilVkIrVerify(*m.AvkIrModule)
   rc = avkIrCheckVariables(*m) : If rc <> 0 : ProcedureReturn rc : EndIf
   rc = avkIrCheckDecorations(*m) : If rc <> 0 : ProcedureReturn rc : EndIf
   rc = avkIrCheckCfg(*m) : If rc <> 0 : ProcedureReturn rc : EndIf
-  ProcedureReturn avkIrCheckNodes(*m)
+  rc = avkIrCheckNodes(*m) : If rc <> 0 : ProcedureReturn rc : EndIf
+  ProcedureReturn avkIrCheckInterface(*m)
 EndProcedure

@@ -10,6 +10,7 @@ Structure AvkSpirvIrStorage Align #PB_Structure_AlignC
   types.AvkIrType[#ANVIL_IR_MAX_TYPES + 1]
   constants.AvkIrConstant[#ANVIL_IR_MAX_CONSTANTS + 1]
   variables.AvkIrVariable[#ANVIL_IR_MAX_VARIABLES + 1]
+  interfaces.i[#ANVIL_IR_MAX_VARIABLES + 1]
   decorations.AvkIrDecoration[#ANVIL_IR_MAX_DECORATIONS + 1]
   blocks.AvkIrBlock[#ANVIL_IR_MAX_BLOCKS + 1]
   nodes.AvkIrNode[#ANVIL_IR_MAX_NODES + 1]
@@ -49,9 +50,59 @@ Procedure avkSpvIrClear(*s.AvkSpirvIrStorage)
   *s\module\types=*s+OffsetOf(AvkSpirvIrStorage\types)
   *s\module\constants=*s+OffsetOf(AvkSpirvIrStorage\constants)
   *s\module\variables=*s+OffsetOf(AvkSpirvIrStorage\variables)
+  *s\module\interfaces=*s+OffsetOf(AvkSpirvIrStorage\interfaces)
   *s\module\decorations=*s+OffsetOf(AvkSpirvIrStorage\decorations)
   *s\module\blocks=*s+OffsetOf(AvkSpirvIrStorage\blocks)
   *s\module\nodes=*s+OffsetOf(AvkSpirvIrStorage\nodes)
+EndProcedure
+
+; Copy the exact EntryPoint interface operands from retained source words.
+; AvkSpvRecord's nine inline IDs are deliberately only a convenience
+; projection and must never narrow this authoritative list.
+Procedure.i avkSpvIrEntryInterface(*r.AvkSpvRecord, *m.AvkIrModule, index.i)
+  Protected k.i = 3
+  Protected word.i
+  Protected count.i
+  Protected id.i
+  Protected rc.i
+  Protected terminated.i = 0
+  If *r\sourceOpcode <> #SpvOpEntryPoint Or *r\sourceWordCount < 4
+    ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD, *r\sourceId, *r\sourceOpcode, index)
+  EndIf
+  rc = AnvilVkSpirvRecordWordRead(*r\wordOffset, @word)
+  If rc <> #ANVIL_VK_OK Or (word & $FFFF) <> #SpvOpEntryPoint Or (word >> 16) <> *r\sourceWordCount
+    ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD, *r\sourceId, *r\sourceOpcode, index)
+  EndIf
+  While k < *r\sourceWordCount
+    rc = AnvilVkSpirvRecordWordRead(*r\wordOffset + k, @word)
+    If rc <> #ANVIL_VK_OK
+      ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD, *r\sourceId, *r\sourceOpcode, index)
+    EndIf
+    k = k + 1
+    If (word & $FF) = 0 Or (word & $FF00) = 0 Or (word & $FF0000) = 0 Or (word & $FF000000) = 0
+      terminated = 1
+      Break
+    EndIf
+  Wend
+  If terminated = 0
+    ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD, *r\sourceId, *r\sourceOpcode, index)
+  EndIf
+  count = *r\sourceWordCount - k
+  If count < 0 Or count > #ANVIL_IR_MAX_VARIABLES
+    ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RANGE, *r\sourceId, *r\sourceOpcode, index)
+  EndIf
+  *m\interfaceCount = count
+  count = 0
+  While k < *r\sourceWordCount
+    rc = AnvilVkSpirvRecordWordRead(*r\wordOffset + k, @id)
+    If rc <> #ANVIL_VK_OK
+      ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD, *r\sourceId, *r\sourceOpcode, index)
+    EndIf
+    PokeI(*m\interfaces + (count * SizeOf(.i)), id)
+    count = count + 1
+    k = k + 1
+  Wend
+  ProcedureReturn #ANVIL_IR_OK
 EndProcedure
 
 Procedure.i avkSpvIrDecorationKind(spvKind.i)
@@ -269,6 +320,7 @@ Procedure.i AnvilVkSpirvIrAdapt(*out.AvkSpirvIrStorage)
     ProcedureReturn avkSpvIrFail(#ANVIL_IR_ERR_ARGS, 0, 0, -1)
   EndIf
   avkSpvIrClear(@avkSpvIrScratch)
+  *m\sourceVersion=AnvilVkSpirvVersion()
   *m\idBound=AnvilVkSpirvBound()
   i=0
   While i<AnvilVkSpirvRecordCount()
@@ -285,6 +337,7 @@ Procedure.i AnvilVkSpirvIrAdapt(*out.AvkSpirvIrStorage)
         ProcedureReturn avkSpvIrFail(#ANVIL_SPV_IR_ERR_RECORD, r\sourceId, r\sourceOpcode, i)
       EndIf
       *m\entryFunctionId=r\sourceId
+      rc=avkSpvIrEntryInterface(@r,*m,i)
     ElseIf r\section = #ANVIL_SPV_REC_TYPE
       rc = avkSpvIrType(@r, i)
     ElseIf r\section = #ANVIL_SPV_REC_CONSTANT
@@ -342,6 +395,7 @@ Procedure.i AnvilVkSpirvIrAdapt(*out.AvkSpirvIrStorage)
   *out\module\types = *out+OffsetOf(AvkSpirvIrStorage\types)
   *out\module\constants = *out+OffsetOf(AvkSpirvIrStorage\constants)
   *out\module\variables = *out+OffsetOf(AvkSpirvIrStorage\variables)
+  *out\module\interfaces = *out+OffsetOf(AvkSpirvIrStorage\interfaces)
   *out\module\decorations = *out+OffsetOf(AvkSpirvIrStorage\decorations)
   *out\module\blocks = *out+OffsetOf(AvkSpirvIrStorage\blocks)
   *out\module\nodes = *out+OffsetOf(AvkSpirvIrStorage\nodes)

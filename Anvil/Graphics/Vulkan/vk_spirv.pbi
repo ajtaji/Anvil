@@ -311,11 +311,12 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 
 ; A normalized record is produced by the validating declaration engine, not
 ; by a downstream re-parser. IDs and literals are kept in their semantic
-; order. Nine inline IDs cover every interface the typed IR can represent;
-; idCount retains the total and the exact source words retain any legacy extra
-; interface IDs without narrowing the old walk. Eight inline literals cover
-; every represented type/declaration. The original instruction offset/count
-; and every source word remain available too.
+; order. The nine inline IDs are a convenience projection for the bounded
+; instructions represented below; they are not an authoritative copy of an
+; OpEntryPoint interface. idCount retains that instruction's total and the
+; retained source words remain the exact interface source for the typed-IR
+; adapter. Eight inline literals cover every represented type/declaration.
+; The original instruction offset/count and every source word remain available.
 Structure AvkSpvRecord Align #PB_Structure_AlignC
   streamIndex.i
   wordOffset.i

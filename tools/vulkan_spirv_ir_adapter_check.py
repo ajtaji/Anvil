@@ -9,7 +9,8 @@ and adapts those records without reparsing the caller's module.
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import contextlib
+import hashlib
 import os
 import pathlib
 import shutil
@@ -17,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import types
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -24,6 +26,10 @@ VULKAN = ROOT / "Anvil" / "Graphics" / "Vulkan"
 GATE = VULKAN / "Tests" / "vulkan_spirv_ir_adapter_gate.pi4"
 FRONTEND = VULKAN / "vk_spirv.pbi"
 ADAPTER = VULKAN / "vk_spirv_ir_adapter.pbi"
+IR = VULKAN / "vk_ir.pbi"
+EXPECTED_COMPILER = pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
+EXPECTED_COMPILER_SHA = "8f2e43d4b260c5fa049762e6212c4355ea9cf49d30c0c10092783d3a664a5367"
+EXPECTED_KEYWORDS_SHA = "5167b0b5f1de571ad596d274eabbd0669852bf4997a5cdbf0483e898e05ae1b5"
 
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -36,23 +42,190 @@ MAGIC = 0x53504952
 OK = 0
 ERR_ARGS = -20001
 IR_ERR_ARGS = -23201
+IR_ERR_BOUNDS = -23202
+IR_ERR_DUPLICATE = -23203
+IR_ERR_UNDEFINED = -23204
+IR_ERR_TYPE = -23205
+IR_ERR_STORAGE = -23206
 IR_ERR_DOMINANCE = -23211
+SPV_IR_ERR_RECORD = -23301
+SPV_IR_ERR_RANGE = -23302
 MAX_RECORDS = 128
 MAX_WORDS = 1024
-SLOTS = 22
+SLOTS = 24
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@contextlib.contextmanager
+def checker_lock():
+    path = pathlib.Path(tempfile.gettempdir()) / "anvil_vk_pipeline_check.lock"
+    with path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def remove_private_tree(path: pathlib.Path | None) -> None:
+    if path is None:
+        return
+    if path.exists():
+        shutil.rmtree(path)
+    if path.exists():
+        raise RuntimeError(f"adapter gate: private tree did not clean up: {path}")
+
+
+def finalize_snapshot(guard, snapshot: pathlib.Path,
+                      primary: BaseException | None) -> None:
+    """Guard and clean a snapshot without masking an active primary failure."""
+    if primary is not None:
+        try:
+            guard()
+        except BaseException as secondary:
+            primary.add_note(f"secondary final input guard failure: {secondary}")
+        try:
+            remove_private_tree(snapshot)
+        except BaseException as secondary:
+            primary.add_note(f"secondary snapshot cleanup failure: {secondary}")
+        return
+    try:
+        guard()
+    except BaseException as guard_error:
+        try:
+            remove_private_tree(snapshot)
+        except BaseException as cleanup_error:
+            guard_error.add_note(f"secondary snapshot cleanup failure: {cleanup_error}")
+        raise
+    remove_private_tree(snapshot)
+
+
+def compile_input_entries(runtime_keywords: pathlib.Path,
+                          interpreter: pathlib.Path) -> dict[str, bytes]:
+    entries: dict[str, bytes] = {}
+    roots = [VULKAN / "vk_core_1_0.pbi", VULKAN / "vk_foundation.pbi", IR,
+             FRONTEND, ADAPTER, GATE]
+    for path in roots:
+        entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    for directory in (ROOT / "RaspberryPi4" / "Intrinsics", ROOT / "Boards"):
+        for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+            entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    entries["_compiler/keywords.def"] = runtime_keywords.read_bytes()
+    entries[(HERE / "vulkan_spirv_check.py").relative_to(ROOT).as_posix()] = (HERE / "vulkan_spirv_check.py").read_bytes()
+    entries[interpreter.relative_to(ROOT).as_posix()] = interpreter.read_bytes()
+    checker = pathlib.Path(__file__).resolve()
+    entries[checker.relative_to(ROOT).as_posix()] = checker.read_bytes()
+    return entries
+
+
+def framed_manifest(entries: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(entries):
+        encoded = name.encode("utf-8")
+        data = entries[name]
+        digest.update(len(encoded).to_bytes(4, "little"))
+        digest.update(encoded)
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
+
+
+def snapshot_manifest(snapshot: pathlib.Path) -> str:
+    entries = {path.relative_to(snapshot).as_posix(): path.read_bytes()
+               for path in snapshot.rglob("*") if path.is_file()}
+    return framed_manifest(entries)
+
+
+def freeze_inputs(entries: dict[str, bytes]) -> tuple[pathlib.Path, str]:
+    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="anvil_vk_spirv_ir_snapshot_"))
+    try:
+        for name, data in entries.items():
+            path = snapshot / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        manifest = framed_manifest(entries)
+        if snapshot_manifest(snapshot) != manifest:
+            raise RuntimeError("adapter gate: frozen snapshot differs from framed inputs")
+        return snapshot, manifest
+    except BaseException:
+        remove_private_tree(snapshot)
+        raise
+
+
+def guard_campaign_inputs(shared_supplier, shared_hash: str, snapshot: pathlib.Path,
+                          snapshot_hash: str, compiler: pathlib.Path,
+                          compiler_hash: str, runtime_keywords: pathlib.Path,
+                          keywords_hash: str) -> None:
+    if framed_manifest(shared_supplier()) != shared_hash:
+        raise RuntimeError("adapter gate: shared compile inputs changed during frozen campaign")
+    if sha256_file(compiler) != compiler_hash:
+        raise RuntimeError("adapter gate: installed compiler changed during frozen campaign")
+    if sha256_file(runtime_keywords) != keywords_hash:
+        raise RuntimeError("adapter gate: compiler keywords changed during frozen campaign")
+    if snapshot_manifest(snapshot) != snapshot_hash:
+        raise RuntimeError("adapter gate: frozen snapshot changed during campaign")
+
+
+def create_infra_roots(entries: dict[str, bytes]) -> tuple[pathlib.Path, str, pathlib.Path,
+                                                            pathlib.Path, pathlib.Path]:
+    snapshot, snapshot_hash = freeze_inputs(entries)
+    try:
+        fake = pathlib.Path(tempfile.mkdtemp(prefix="anvil_vk_spirv_ir_fake_"))
+        fake_compiler = fake / "compiler.exe"
+        fake_keywords = fake / "keywords.def"
+        fake_compiler.write_bytes(b"frozen compiler")
+        fake_keywords.write_bytes(b"frozen keywords")
+        return snapshot, snapshot_hash, fake, fake_compiler, fake_keywords
+    except BaseException:
+        remove_private_tree(snapshot)
+        if "fake" in locals():
+            remove_private_tree(fake)
+        raise
 
 
 def load_module(name: str, path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"adapter gate: cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
+    """Execute the exact bytes at path without creating adjacent bytecode."""
+    source = path.read_bytes()
+    code = compile(source, str(path), "exec")
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = name.rpartition(".")[0]
+    prior = sys.modules.get(name)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        exec(code, module.__dict__)
+    except BaseException:
+        if prior is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = prior
+        raise
     return module
 
 
-oracle = load_module("anvil_spirv_fixture_oracle", HERE / "vulkan_spirv_check.py")
+ORACLE_PATH = HERE / "vulkan_spirv_check.py"
+ORACLE_LOADED_HASH = sha256_file(ORACLE_PATH)
+oracle = load_module("anvil_spirv_fixture_oracle", ORACLE_PATH)
+if sha256_file(ORACLE_PATH) != ORACLE_LOADED_HASH:
+    raise RuntimeError("adapter gate: SPIR-V oracle changed while it was loaded")
 OP = dict(oracle.OP)
 OP["FAdd"] = 129
 
@@ -171,6 +344,173 @@ def move_after_return(blob: bytes, opcode: int) -> bytes:
     return struct.pack(f"<{len(flat)}I", *flat)
 
 
+def entry_interface(blob: bytes) -> tuple[int, int, list[int]]:
+    words = list(struct.unpack(f"<{len(blob)//4}I", blob))
+    at = 5
+    while at < len(words):
+        count, op = words[at] >> 16, words[at] & 0xFFFF
+        if op == OP["EntryPoint"]:
+            k = at + 3
+            while k < at + count:
+                word = words[k]
+                k += 1
+                if any(((word >> shift) & 0xFF) == 0 for shift in (0, 8, 16, 24)):
+                    return at, k, words[k:at + count]
+            raise AssertionError("unterminated EntryPoint name")
+        at += count
+    raise AssertionError("EntryPoint missing")
+
+
+def rewrite_interface(blob: bytes, ids: list[int], version: int | None = None,
+                      bound: int | None = None) -> bytes:
+    words = list(struct.unpack(f"<{len(blob)//4}I", blob))
+    at, first_id, _ = entry_interface(blob)
+    old_count = words[at] >> 16
+    prefix = words[at + 1:first_id]
+    replacement = [((1 + len(prefix) + len(ids)) << 16) | OP["EntryPoint"], *prefix, *ids]
+    words[at:at + old_count] = replacement
+    if version is not None:
+        words[1] = version
+    if bound is not None:
+        words[3] = bound
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def unterminated_entry_name(blob: bytes) -> bytes:
+    words = list(struct.unpack(f"<{len(blob)//4}I", blob))
+    at, _, _ = entry_interface(blob)
+    old_count = words[at] >> 16
+    execution_model, entry = words[at + 1:at + 3]
+    words[at:at + old_count] = [
+        (4 << 16) | OP["EntryPoint"], execution_model, entry, 0x6E69616D]
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def variable_rows(blob: bytes) -> list[tuple[int, int]]:
+    rows = []
+    for _, record in instruction_records(blob):
+        if record["sourceOpcode"] == OP["Variable"]:
+            rows.append((record["sourceId"], record["literal0"]))
+    return rows
+
+
+def function_id(blob: bytes) -> int:
+    return next(record["sourceId"] for _, record in instruction_records(blob)
+                if record["sourceOpcode"] == OP["Function"])
+
+
+def fragment_ten_interfaces() -> bytes:
+    o = oracle
+    ins = o.ins
+    ids = iter(range(1, 64))
+    void = next(ids); fn_type = next(ids); f32 = next(ids); vec4 = next(ids)
+    out_ptr = next(ids); one = next(ids); colour = next(ids)
+    variables = [next(ids) for _ in range(10)]
+    function = next(ids); block = next(ids)
+    body = [ins(OP["Capability"], o.CAP_SHADER),
+            ins(OP["MemoryModel"], o.ADDR_LOGICAL, o.MEM_GLSL450),
+            ins(OP["EntryPoint"], o.EM_FRAGMENT, function, *o.lit("main"), *variables),
+            ins(OP["ExecutionMode"], function, o.MODE_ORIGIN_UPPER_LEFT)]
+    body += [ins(OP["Decorate"], variable, o.DEC_LOCATION, 0) for variable in variables]
+    body += [ins(OP["TypeVoid"], void), ins(OP["TypeFunction"], fn_type, void),
+             ins(OP["TypeFloat"], f32, 32), ins(OP["TypeVector"], vec4, f32, 4),
+             ins(OP["TypePointer"], out_ptr, o.SC_OUTPUT, vec4),
+             ins(OP["Constant"], f32, one, o.F1),
+             ins(OP["ConstantComposite"], vec4, colour, one, one, one, one)]
+    body += [ins(OP["Variable"], out_ptr, variable, o.SC_OUTPUT) for variable in variables]
+    body += [ins(OP["Function"], void, function, 0, fn_type), ins(OP["Label"], block),
+             ins(OP["Store"], variables[0], colour), ins(OP["Return"]),
+             ins(OP["FunctionEnd"])]
+    blob = o.module(next(ids), body)
+    assert len(blob) == 588
+    assert hashlib.sha256(blob).hexdigest() == "efb170d9743b16ea9461102ded73fa121134c95c8f0330070d6950513c7829f6"
+    return blob
+
+
+def interface_cases() -> list[dict]:
+    ten = fragment_ten_interfaces()
+    _, _, ten_ids = entry_interface(ten)
+    constant = oracle.fragment_constant()
+    _, _, constant_ids = entry_interface(constant)
+    varying = oracle.fragment_varying()
+    _, _, varying_ids = entry_interface(varying)
+    duplicated = rewrite_interface(varying, varying_ids + [varying_ids[-1]], 0x00010300)
+    duplicated_14 = rewrite_interface(duplicated, varying_ids + [varying_ids[-1]], 0x00010400)
+    constant_bound = struct.unpack_from("<I", constant, 12)[0]
+    undefined = rewrite_interface(constant, constant_ids + [constant_bound],
+                                  bound=constant_bound + 1)
+    outbound = rewrite_interface(constant, constant_ids + [constant_bound])
+    nonvariable = rewrite_interface(constant, constant_ids + [function_id(constant)])
+    push = oracle.fragment_push()
+    push_vars = variable_rows(push)
+    push_resource = next(identifier for identifier, storage in push_vars
+                         if storage == oracle.SC_PUSH)
+    wrong_pre14 = rewrite_interface(push, entry_interface(push)[2] + [push_resource],
+                                    0x00010300)
+    result = [
+        dict(name="ten exact EntryPoint interface IDs", blob=ten, ok=True),
+        dict(name="thirty-two EntryPoint operands", blob=rewrite_interface(
+            constant, [constant_ids[0]] * 32, 0x00010300), ok=True),
+        dict(name="thirty-three EntryPoint operands refuse before publication",
+             blob=rewrite_interface(constant, [constant_ids[0]] * 33, 0x00010300), ok=True,
+             adapt=False, adapt_code=SPV_IR_ERR_RANGE, fault_id=function_id(constant),
+             fault_opcode=OP["EntryPoint"], fault_index=2),
+        dict(name="SPIR-V 1.3 duplicate interface operands are accepted",
+             blob=duplicated, ok=True),
+        dict(name="SPIR-V 1.4 duplicate interface operands are rejected",
+             blob=duplicated_14, ok=True, adapt=False, adapt_code=IR_ERR_DUPLICATE,
+             fault_id=varying_ids[-1], fault_opcode=OP["EntryPoint"], fault_index=2),
+        dict(name="undefined EntryPoint interface ID", blob=undefined, ok=True,
+             adapt=False, adapt_code=IR_ERR_UNDEFINED, fault_id=constant_bound,
+             fault_opcode=OP["EntryPoint"], fault_index=len(constant_ids)),
+        dict(name="out-of-bound EntryPoint interface ID", blob=outbound, ok=True,
+             adapt=False, adapt_code=IR_ERR_BOUNDS, fault_id=constant_bound,
+             fault_opcode=OP["EntryPoint"], fault_index=len(constant_ids)),
+        dict(name="non-variable EntryPoint interface ID", blob=nonvariable, ok=True,
+             adapt=False, adapt_code=IR_ERR_TYPE, fault_id=function_id(constant),
+             fault_opcode=OP["EntryPoint"], fault_index=len(constant_ids)),
+        dict(name="pre-1.4 resource interface operand has wrong storage",
+             blob=wrong_pre14, ok=True, adapt=False, adapt_code=IR_ERR_STORAGE,
+             fault_id=push_resource, fault_opcode=OP["EntryPoint"],
+             fault_index=len(entry_interface(push)[2])),
+        dict(name="SPIR-V 1.4 listed dead global is accepted",
+             blob=rewrite_interface(ten, ten_ids, 0x00010400), ok=True),
+        dict(name="unterminated retained EntryPoint name refuses exact interface extraction",
+             blob=unterminated_entry_name(constant), ok=True, adapt=False,
+             adapt_code=SPV_IR_ERR_RECORD, fault_id=function_id(constant),
+             fault_opcode=OP["EntryPoint"], fault_index=2),
+    ]
+    for label, factory, storage in (
+            ("push", oracle.fragment_push, oracle.SC_PUSH),
+            ("uniform", oracle.fragment_uniform, oracle.SC_UNIFORM),
+            ("sample", oracle.fragment_sampled, oracle.SC_UNIFORM_CONSTANT)):
+        blob = factory()
+        variables = variable_rows(blob)
+        all_ids = [identifier for identifier, _ in variables]
+        resource = next(identifier for identifier, value in variables if value == storage)
+        valid = rewrite_interface(blob, all_ids, 0x00010400)
+        missing = rewrite_interface(blob, [identifier for identifier in all_ids
+                                           if identifier != resource], 0x00010400)
+        variable_index = [identifier for identifier, _ in variables].index(resource)
+        result += [
+            dict(name=f"SPIR-V 1.4 valid {label} global interface", blob=valid, ok=True),
+            dict(name=f"SPIR-V 1.4 missing live {label} global interface", blob=missing,
+                 ok=True, adapt=False, adapt_code=IR_ERR_UNDEFINED,
+                 fault_id=resource, fault_opcode=OP["EntryPoint"],
+                 fault_index=variable_index),
+        ]
+    for label, missing_id in (("input", varying_ids[-1]), ("output", varying_ids[0])):
+        variables = variable_rows(varying)
+        variable_index = [identifier for identifier, _ in variables].index(missing_id)
+        result.append(dict(
+            name=f"missing live {label} EntryPoint interface",
+            blob=rewrite_interface(varying, [identifier for identifier in varying_ids
+                                             if identifier != missing_id]),
+            ok=True, adapt=False, adapt_code=IR_ERR_UNDEFINED, fault_id=missing_id,
+            fault_opcode=OP["EntryPoint"], fault_index=variable_index))
+    return result
+
+
 def fixtures() -> list[dict]:
     accepted = [
         ("legacy varying", oracle.fragment_varying()),
@@ -211,7 +551,7 @@ def fixtures() -> list[dict]:
              dict(name="arithmetic appears after the block terminator", blob=bad_order, ok=False),
              dict(name="descriptor decoration is misplaced on output", blob=bad_decoration, ok=False),
              dict(name="IR verifier refusal never publishes adapter output", blob=verifier_refusal,
-                  ok=True, adapt=False)])
+                  ok=True, adapt=False)] + interface_cases())
 
 
 def locate(explicit: str | None, env: str, candidates: list[pathlib.Path]) -> pathlib.Path:
@@ -226,35 +566,66 @@ def locate(explicit: str | None, env: str, candidates: list[pathlib.Path]) -> pa
     raise SystemExit(f"adapter gate: {env} was not found; pass its option")
 
 
-def build(compiler: pathlib.Path, suffix: str, frontend: str | None = None,
-          adapter: str | None = None) -> pathlib.Path:
+def build(compiler: pathlib.Path, runtime_keywords: pathlib.Path, suffix: str,
+          snapshot: pathlib.Path, snapshot_hash: str, compiler_hash: str,
+          keywords_hash: str, frontend: bytes | None = None,
+          adapter: bytes | None = None, ir: bytes | None = None,
+          runner=subprocess.run, compile_timeout: float = 120) -> tuple[pathlib.Path, pathlib.Path]:
+    if snapshot_manifest(snapshot) != snapshot_hash:
+        raise RuntimeError("adapter gate: frozen snapshot changed before compile")
+    if sha256_file(compiler) != compiler_hash:
+        raise RuntimeError("adapter gate: compiler changed before compile")
+    if sha256_file(runtime_keywords) != keywords_hash:
+        raise RuntimeError("adapter gate: compiler keywords changed before compile")
     work = pathlib.Path(tempfile.mkdtemp(prefix="anvil_vk_spirv_ir_"))
-    dst = work / "Anvil" / "Graphics" / "Vulkan"
-    tests = dst / "Tests"
-    tests.mkdir(parents=True)
-    for source in (VULKAN / "vk_core_1_0.pbi", VULKAN / "vk_foundation.pbi",
-                   VULKAN / "vk_ir.pbi"):
-        shutil.copy2(source, dst / source.name)
-    (dst / FRONTEND.name).write_text(
-        FRONTEND.read_text(encoding="utf-8") if frontend is None else frontend,
-        encoding="utf-8")
-    (dst / ADAPTER.name).write_text(
-        ADAPTER.read_text(encoding="utf-8") if adapter is None else adapter,
-        encoding="utf-8")
-    shutil.copy2(GATE, tests / GATE.name)
-    shutil.copytree(ROOT / "RaspberryPi4" / "Intrinsics", work / "RaspberryPi4" / "Intrinsics")
-    shutil.copytree(ROOT / "Boards", work / "Boards")
-    image = work / f"{suffix}.img"
-    command = [str(compiler), "--compile", (tests / GATE.name).relative_to(work).as_posix(),
-               "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
-               "--entry-returns", "-o", str(image), "-s"]
-    env = os.environ.copy()
-    env["PMF_ROOT"] = str(work)
-    run = subprocess.run(command, cwd=work, env=env, text=True,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-    if run.returncode or "pmfc: OK" not in run.stdout or not image.is_file():
-        raise SystemExit("adapter gate: compile failed\n" + run.stdout)
-    return image
+    try:
+        shutil.copytree(snapshot, work, dirs_exist_ok=True)
+        for source, replacement in ((IR, ir), (FRONTEND, frontend), (ADAPTER, adapter)):
+            if replacement is not None:
+                target = work / source.relative_to(ROOT)
+                target.write_bytes(replacement)
+        tests = work / GATE.parent.relative_to(ROOT)
+        image = work / f"{suffix}.img"
+        command = [str(compiler), "--compile", (tests / GATE.name).relative_to(work).as_posix(),
+                   "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK),
+                   "--entry-returns", "-o", str(image), "-s"]
+        env = os.environ.copy()
+        env["PMF_ROOT"] = str(work)
+        run = runner(command, cwd=work, env=env, text=True,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     check=False, timeout=compile_timeout)
+        if sha256_file(compiler) != compiler_hash:
+            raise RuntimeError("adapter gate: compiler changed during compile")
+        if sha256_file(runtime_keywords) != keywords_hash:
+            raise RuntimeError("adapter gate: compiler keywords changed during compile")
+        if snapshot_manifest(snapshot) != snapshot_hash:
+            raise RuntimeError("adapter gate: frozen snapshot changed during compile")
+        if run.returncode or "pmfc: OK" not in run.stdout or not image.is_file():
+            raise RuntimeError("adapter gate: compile failed\n" + run.stdout)
+        return image, work
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def build_execute(a64, compiler: pathlib.Path, runtime_keywords: pathlib.Path,
+                  suffix: str, cases: list[dict], snapshot: pathlib.Path,
+                  snapshot_hash: str, compiler_hash: str, keywords_hash: str,
+                  frontend: bytes | None = None, adapter: bytes | None = None,
+                  ir: bytes | None = None, runner=subprocess.run,
+                  compile_timeout: float = 120, execute_fn=None):
+    image = None
+    work = None
+    try:
+        image, work = build(compiler, runtime_keywords, suffix, snapshot,
+                            snapshot_hash, compiler_hash, keywords_hash,
+                            frontend=frontend, adapter=adapter, ir=ir,
+                            runner=runner, compile_timeout=compile_timeout)
+        if execute_fn is None:
+            execute_fn = execute
+        return execute_fn(a64, image, cases)
+    finally:
+        remove_private_tree(work)
 
 
 def execute(a64, image: pathlib.Path, cases: list[dict]):
@@ -392,7 +763,7 @@ def instruction_records(blob: bytes) -> list[tuple[list[int], dict]]:
         elif op in (OP["ImageSampleImplicitLod"], OP["FAdd"], OP["FMul"]):
             record["resultType"], record["sourceId"] = inst[1:3]; ids = inst[3:5]
         record["idCount"], record["literalCount"] = len(ids), len(literals)
-        for index, value in enumerate(ids): record[f"id{index}"] = value
+        for index, value in enumerate(ids[:9]): record[f"id{index}"] = value
         for index, value in enumerate(literals): record[f"literal{index}"] = value
         records.append((inst, record))
         at += count
@@ -421,10 +792,10 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
         base = result + ci * SLOTS * 8
         report = [s64(cpu, base + i * 8) for i in range(SLOTS)]
         name = case["name"]
-        module = read_qwords(cpu, report[5], 19)
+        module = read_qwords(cpu, report[5], 22)
         g.need(f"{name}: embedded IR pointers rebound",
-               [module[8], module[10], module[12], module[14], module[16], module[18]],
-               report[16:22])
+               [module[9], module[11], module[13], module[15], module[17], module[19], module[21]],
+               [report[16], report[17], report[18], report[22], report[19], report[20], report[21]])
         if not case["ok"]:
             g.need(f"{name}: walk rejects", report[0] != OK, True)
             g.need(f"{name}: retained stream invalid", report[1], 0)
@@ -447,7 +818,15 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
             g.need(f"{name}: adapter verified", report[4], OK)
             g.need(f"{name}: adapter published last", report[14], 1)
         else:
-            g.need(f"{name}: verifier rejects", report[4] != OK, True)
+            expected_code = case.get("adapt_code")
+            if expected_code is None:
+                g.need(f"{name}: verifier rejects", report[4] != OK, True)
+            else:
+                g.need(f"{name}: exact adapter refusal", report[4], expected_code)
+                g.need(f"{name}: exact retained refusal code", report[7], expected_code)
+                g.need(f"{name}: exact refusal source ID", report[8], case["fault_id"])
+                g.need(f"{name}: exact refusal opcode", report[9], case["fault_opcode"])
+                g.need(f"{name}: exact refusal index", report[10], case["fault_index"])
             g.need(f"{name}: rejected adapter output stays invalid", report[14], 0)
         raw = read_qwords(cpu, report[12], len(original_words))
         g.need(f"{name}: immutable exact module words", raw, original_words)
@@ -467,12 +846,27 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
         function = next(r for r in rec_values if r["section"] == 7)
         block = next(r for r in rec_values if r["section"] == 8)
         bound = original_words[3]
-        g.need(f"{name}: IR module header", module[:8],
-               [bound, 2, function["sourceId"], OP["Function"], function["id0"],
+        entry = next(r for r in rec_values if r["section"] == 2)
+        interface_words = original_words[entry["wordOffset"]:entry["wordOffset"] + entry["sourceWordCount"]]
+        name_at = 3
+        while name_at < len(interface_words):
+            word = interface_words[name_at]
+            name_at += 1
+            if any(((word >> shift) & 0xFF) == 0 for shift in (0, 8, 16, 24)):
+                break
+        interfaces = interface_words[name_at:]
+        g.need(f"{name}: IR module header", module[:9],
+               [original_words[1], bound, 2, function["sourceId"], OP["Function"], function["id0"],
                 function["resultType"], block["sourceId"], len(types)])
-        g.need(f"{name}: IR section counts", [module[9], module[11], module[13], module[15], module[17]],
+        g.need(f"{name}: IR section counts", [module[10], module[12], module[16], module[18], module[20]],
                [len(constants), len(variables), len(decorations), 1, len(nodes)])
-        type_rows = [read_qwords(cpu, module[8] + i * 21 * 8, 21) for i in range(len(types))]
+        g.need(f"{name}: exact EntryPoint interface count", module[14], len(interfaces))
+        g.need(f"{name}: exact EntryPoint interface IDs",
+               read_qwords(cpu, module[15], len(interfaces)), interfaces)
+        g.need(f"{name}: interface pointer rebound", module[15], report[22])
+        g.need(f"{name}: source version copied", report[15], original_words[1])
+        g.need(f"{name}: interface count copied", report[23], len(interfaces))
+        type_rows = [read_qwords(cpu, module[9] + i * 21 * 8, 21) for i in range(len(types))]
         for i, (row, r) in enumerate(zip(type_rows, types)):
             expected = [r["sourceId"], r["sourceOpcode"], IR_TYPE_KIND[r["sourceOpcode"]]] + [0] * 18
             op = r["sourceOpcode"]
@@ -486,7 +880,7 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
             elif op == OP["TypeSampledImage"]: expected[5] = r["id0"]
             g.need(f"{name}: typed IR type {i}", row, expected)
         for i, r in enumerate(constants):
-            row = read_qwords(cpu, module[10] + i * 10 * 8, 10)
+            row = read_qwords(cpu, module[11] + i * 10 * 8, 10)
             expected = [r["sourceId"], r["sourceOpcode"], r["resultType"], 0, 0,
                         0, 0, 0, 0, 0]
             if r["sourceOpcode"] == OP["Constant"]:
@@ -495,11 +889,11 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
                 expected[5:] = [r["idCount"], r["id0"], r["id1"], r["id2"], r["id3"]]
             g.need(f"{name}: typed IR constant {i}", row, expected)
         for i, r in enumerate(variables):
-            row = read_qwords(cpu, module[12] + i * 4 * 8, 4)
+            row = read_qwords(cpu, module[13] + i * 4 * 8, 4)
             g.need(f"{name}: typed IR variable {i}", row,
                    [r["sourceId"], r["sourceOpcode"], r["resultType"], r["literal0"]])
         for i, r in enumerate(decorations):
-            row = [s64(cpu, module[14] + i * 5 * 8 + j * 8) for j in range(5)]
+            row = [s64(cpu, module[17] + i * 5 * 8 + j * 8) for j in range(5)]
             if r["sourceOpcode"] == OP["MemberDecorate"]:
                 member, spv_kind, value = r["literal0"], r["literal1"], r["literal2"]
             else:
@@ -507,10 +901,10 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
             g.need(f"{name}: typed IR decoration {i}", row,
                    [r["sourceId"], r["sourceOpcode"], member, IR_DEC_KIND[spv_kind], value])
         g.need(f"{name}: typed IR block",
-               read_qwords(cpu, module[16], 6),
+               read_qwords(cpu, module[19], 6),
                [block["sourceId"], block["sourceOpcode"], 0, len(nodes), 0, 0])
         for i, r in enumerate(nodes):
-            row = read_qwords(cpu, module[18] + i * 12 * 8, 12)
+            row = read_qwords(cpu, module[21] + i * 12 * 8, 12)
             expected = [r["sourceId"], r["sourceOpcode"], IR_NODE_KIND[r["sourceOpcode"]],
                         r["resultType"], block["sourceId"], r["idCount"], r["id0"], r["id1"],
                         r["id2"], r["id3"], r["literalCount"], r["literal0"]]
@@ -538,49 +932,317 @@ MUTANTS = (
      "ProcedureReturn #ANVIL_IR_DEC_LOCATION", "ProcedureReturn #ANVIL_IR_DEC_BINDING"),
 )
 
+INTERFACE_MUTANTS = (
+    ("authoritative interface is not truncated to nine IDs", "adapter",
+     "ten exact EntryPoint interface IDs", "exact EntryPoint interface IDs",
+     "  count = 0\n  While k < *r\\sourceWordCount\n",
+     "  count = 0\n  While k < *r\\sourceWordCount And count < 9\n"),
+    ("interface operands are copied into owned storage", "adapter",
+     "ten exact EntryPoint interface IDs", "adapter verified",
+     "    PokeI(*m\\interfaces + (count * SizeOf(.i)), id)\n",
+     "    PokeI(*m\\interfaces + (count * SizeOf(.i)), 0)\n"),
+    ("published interface pointer is rebound", "adapter",
+     "ten exact EntryPoint interface IDs", "interface pointer rebound",
+     "  *out\\module\\interfaces = *out+OffsetOf(AvkSpirvIrStorage\\interfaces)\n",
+     "  *out\\module\\interfaces = 0\n"),
+    ("source SPIR-V version is retained", "adapter",
+     "ten exact EntryPoint interface IDs", "source version copied",
+     "  *m\\sourceVersion=AnvilVkSpirvVersion()\n",
+     "  *m\\sourceVersion=0\n"),
+    ("EntryPoint name terminator is mandatory", "adapter",
+     "unterminated retained EntryPoint name", "exact adapter refusal",
+     "  If terminated = 0\n",
+     "  If terminated < 0\n"),
+    ("interface storage cap is exactly thirty-two", "adapter",
+     "thirty-three EntryPoint operands", "exact adapter refusal",
+     "  If count < 0 Or count > #ANVIL_IR_MAX_VARIABLES\n",
+     "  If count < 0 Or count > (#ANVIL_IR_MAX_VARIABLES + 1)\n"),
+    ("SPIR-V 1.4 duplicate interface operands are rejected", "ir",
+     "SPIR-V 1.4 duplicate interface operands", "exact adapter refusal",
+     "    If *m\\sourceVersion >= $00010400\n      j = 0\n",
+     "    If *m\\sourceVersion > $00010400\n      j = 0\n"),
+    ("pre-1.4 interface operands are only Input or Output", "ir",
+     "pre-1.4 resource interface operand", "exact adapter refusal",
+     "    If *m\\sourceVersion < $00010400 And *v\\storageClass <> #ANVIL_IR_STORAGE_INPUT And *v\\storageClass <> #ANVIL_IR_STORAGE_OUTPUT\n",
+     "    If *m\\sourceVersion < $00010400 And *v\\storageClass = -1\n"),
+    ("every statically referenced global is in the interface", "ir",
+     "SPIR-V 1.4 missing live sample global", "exact adapter refusal",
+     "    If avkIrVariableReferenced(*m, *v\\sourceId) <> 0\n",
+     "    If avkIrVariableReferenced(*m, *v\\sourceId) < 0\n"),
+)
+
+
+def encoded_anchor(source: bytes, text: str) -> bytes:
+    candidates = [text.encode("utf-8")]
+    if "\n" in text:
+        candidates.append(text.replace("\n", "\r\n").encode("utf-8"))
+    hits = [(candidate, source.count(candidate)) for candidate in candidates]
+    exact = [candidate for candidate, count in hits if count == 1]
+    if len(exact) != 1 or sum(count for _, count in hits) != 1:
+        raise RuntimeError(f"adapter gate: mutation anchor is not unique: {text!r}; counts={hits!r}")
+    return exact[0]
+
+
+def mutate_source(source: bytes, old_text: str, new_text: str) -> bytes:
+    old = encoded_anchor(source, old_text)
+    newline = "\r\n" if b"\r\n" in old else "\n"
+    new = new_text.replace("\n", newline).encode("utf-8")
+    old_eols = [match.group(0) for match in __import__("re").finditer(br"\r\n|\n|\r", old)]
+    new_eols = [match.group(0) for match in __import__("re").finditer(br"\r\n|\n|\r", new)]
+    if old_eols != new_eols:
+        raise RuntimeError("adapter gate: mutation changes its anchor's newline sequence")
+    at = source.index(old)
+    broken = source[:at] + new + source[at + len(old):]
+    if broken[:at] != source[:at] or broken[at + len(new):] != source[at + len(old):]:
+        raise RuntimeError("adapter gate: mutation changed bytes outside its one anchor")
+    return broken
+
+
+class MutationTally:
+    def __init__(self):
+        self.rejected = 0
+
+    def semantic_rejection(self) -> None:
+        self.rejected += 1
+
+
+def infra_self_test(compiler: pathlib.Path, runtime_keywords: pathlib.Path,
+                    interpreter: pathlib.Path) -> None:
+    temp = pathlib.Path(tempfile.gettempdir())
+    before = {path.resolve() for pattern in ("anvil_vk_spirv_ir_*",)
+              for path in temp.glob(pattern) if path.is_dir()}
+    entries = compile_input_entries(runtime_keywords, interpreter)
+    snapshot, snapshot_hash, fake_dir, fake_compiler, fake_keywords = create_infra_roots(entries)
+    tally = MutationTally()
+    compile_abort = timeout_abort = execute_abort = drift_abort = False
+    keyword_abort = snapshot_abort = shared_abort = False
+    immutable_load = False
+    combined_primary = False
+
+    def failed_runner(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 1, "injected compile failure")
+
+    def timeout_runner(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    def success_runner(*args, **kwargs):
+        output = pathlib.Path(args[0][args[0].index("-o") + 1])
+        output.write_bytes(b"injected image")
+        return subprocess.CompletedProcess(args[0], 0, "pmfc: OK")
+
+    def execute_failure(*args, **kwargs):
+        raise SystemExit("injected execute failure")
+
+    def drift_runner(*args, **kwargs):
+        fake_compiler.write_bytes(b"changed compiler")
+        return success_runner(*args, **kwargs)
+
+    def keyword_drift_runner(*args, **kwargs):
+        fake_keywords.write_bytes(b"changed keywords")
+        return success_runner(*args, **kwargs)
+
+    def snapshot_drift_runner(*args, **kwargs):
+        victim = snapshot / IR.relative_to(ROOT)
+        victim.write_bytes(victim.read_bytes() + b"\n")
+        return success_runner(*args, **kwargs)
+
+    try:
+        load_name = "anvil_spirv_ir_a64_immutable_selftest"
+        load_manifest = snapshot_manifest(snapshot)
+        try:
+            loaded = load_module(load_name, snapshot / interpreter.relative_to(ROOT))
+            immutable_load = (snapshot_manifest(snapshot) == load_manifest and
+                              callable(getattr(loaded, "A64", None)) and
+                              callable(getattr(loaded, "attach_symbols", None)))
+        finally:
+            sys.modules.pop(load_name, None)
+        try:
+            build(compiler, runtime_keywords, "infra_compile", snapshot, snapshot_hash,
+                  sha256_file(compiler), sha256_file(runtime_keywords), runner=failed_runner)
+        except RuntimeError as error:
+            compile_abort = "injected compile failure" in str(error)
+        try:
+            build(compiler, runtime_keywords, "infra_timeout", snapshot, snapshot_hash,
+                  sha256_file(compiler), sha256_file(runtime_keywords), runner=timeout_runner,
+                  compile_timeout=0.01)
+        except subprocess.TimeoutExpired:
+            timeout_abort = True
+        try:
+            build_execute(None, compiler, runtime_keywords, "infra_execute", [], snapshot,
+                          snapshot_hash, sha256_file(compiler), sha256_file(runtime_keywords),
+                          runner=success_runner, execute_fn=execute_failure)
+        except SystemExit as error:
+            execute_abort = "injected execute failure" in str(error)
+        original_fake_hash = sha256_file(fake_compiler)
+        try:
+            build(fake_compiler, fake_keywords, "infra_drift", snapshot, snapshot_hash,
+                  original_fake_hash, sha256_file(fake_keywords), runner=drift_runner)
+        except RuntimeError as error:
+            drift_abort = "compiler changed during compile" in str(error)
+        fake_compiler.write_bytes(b"frozen compiler")
+        fake_keywords.write_bytes(b"frozen keywords")
+        try:
+            build(fake_compiler, fake_keywords, "infra_keyword_drift", snapshot, snapshot_hash,
+                  sha256_file(fake_compiler), sha256_file(fake_keywords),
+                  runner=keyword_drift_runner)
+        except RuntimeError as error:
+            keyword_abort = "compiler keywords changed during compile" in str(error)
+        fake_keywords.write_bytes(b"frozen keywords")
+        altered_entries = dict(entries)
+        first_name = sorted(altered_entries)[0]
+        altered_entries[first_name] += b"changed"
+        try:
+            guard_campaign_inputs(lambda: altered_entries, framed_manifest(entries),
+                                  snapshot, snapshot_hash, compiler, sha256_file(compiler),
+                                  runtime_keywords, sha256_file(runtime_keywords))
+        except RuntimeError as error:
+            shared_abort = "shared compile inputs changed" in str(error)
+        for mutant in INTERFACE_MUTANTS:
+            _, owner, _, _, old, new = mutant
+            source = {"adapter": ADAPTER.read_bytes(), "ir": IR.read_bytes()}[owner]
+            mutate_source(source, old, new)
+        try:
+            build(compiler, runtime_keywords, "infra_snapshot_drift", snapshot, snapshot_hash,
+                  sha256_file(compiler), sha256_file(runtime_keywords),
+                  runner=snapshot_drift_runner)
+        except RuntimeError as error:
+            snapshot_abort = "frozen snapshot changed during compile" in str(error)
+        combined_snapshot, _ = freeze_inputs({"sentinel": b"frozen"})
+        injected_primary = SystemExit("injected combined execute failure")
+
+        def persistent_drift_guard():
+            raise RuntimeError("injected persistent final guard drift")
+
+        try:
+            try:
+                raise injected_primary
+            finally:
+                finalize_snapshot(persistent_drift_guard, combined_snapshot,
+                                  sys.exc_info()[1])
+        except SystemExit as error:
+            combined_primary = (error is injected_primary and
+                                any("injected persistent final guard drift" in note
+                                    for note in getattr(error, "__notes__", ())) and
+                                not combined_snapshot.exists())
+    finally:
+        try:
+            if "combined_snapshot" in locals():
+                remove_private_tree(combined_snapshot)
+        finally:
+            try:
+                remove_private_tree(snapshot)
+            finally:
+                remove_private_tree(fake_dir)
+    after = {path.resolve() for pattern in ("anvil_vk_spirv_ir_*",)
+             for path in temp.glob(pattern) if path.is_dir()}
+    if not all((immutable_load, combined_primary, compile_abort, timeout_abort,
+                execute_abort, drift_abort,
+                keyword_abort, snapshot_abort, shared_abort)):
+        raise RuntimeError(f"adapter gate: infrastructure self-test failed: immutable-load={immutable_load} combined-primary={combined_primary} compile={compile_abort} timeout={timeout_abort} execute={execute_abort} compiler-drift={drift_abort} keyword-drift={keyword_abort} snapshot-drift={snapshot_abort} shared-drift={shared_abort}")
+    if tally.rejected != 0:
+        raise RuntimeError(f"adapter gate: infrastructure failures counted as {tally.rejected} semantic kills")
+    if after != before:
+        raise RuntimeError(f"adapter gate: infrastructure self-test leaked temp roots: {sorted(str(path) for path in after - before)}")
+    print("vulkan_spirv_ir_adapter_check: infra self-test PASS - immutable frozen-byte module load leaves snapshot exact; combined execute primary + guard drift preserves primary/note/cleanup; compile failure, timeout, execute/SystemExit, compiler/keyword/snapshot/shared drift abort; rejected=0; temp roots unchanged; EOL/prefix/suffix splices exact")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
+    parser.add_argument("--mutate-interface", action="store_true")
+    parser.add_argument("--self-test-infra", action="store_true")
     args = parser.parse_args()
     compiler = locate(args.compiler, "PMF_COMPILER",
-                      [pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")])
+                      [EXPECTED_COMPILER])
+    if compiler != EXPECTED_COMPILER.resolve():
+        raise RuntimeError(f"adapter gate: compiler must be the installed pinned executable {EXPECTED_COMPILER}")
+    compiler_hash = sha256_file(compiler)
+    if compiler_hash != EXPECTED_COMPILER_SHA:
+        raise RuntimeError(f"adapter gate: compiler SHA-256 {compiler_hash} != {EXPECTED_COMPILER_SHA}")
+    runtime_keywords = compiler.parent / "keywords.def"
+    if not runtime_keywords.is_file():
+        raise RuntimeError(f"adapter gate: compiler-owned keywords missing: {runtime_keywords}")
+    keywords_hash = sha256_file(runtime_keywords)
+    if keywords_hash != EXPECTED_KEYWORDS_SHA:
+        raise RuntimeError(f"adapter gate: keywords SHA-256 {keywords_hash} != {EXPECTED_KEYWORDS_SHA}")
     interp = locate(args.interp, "PMF_A64_INTERP", [ROOT / "tools" / "a64" / "a64_interp.py"])
-    a64 = load_module("anvil_spirv_ir_a64", interp)
-    cases = fixtures()
-    cpu, result, steps = execute(a64, build(compiler, "base"), cases)
-    g = grade(cpu, result, cases)
-    if g.failures:
-        print(f"vulkan_spirv_ir_adapter_check: FAIL ({g.checks} checks, {steps:,} instructions)")
-        for failure in g.failures[:80]: print("  " + failure)
-        if len(g.failures) > 80: print(f"  ... {len(g.failures)-80} more")
-        return 1
-    print(f"vulkan_spirv_ir_adapter_check: PASS - {g.checks} properties over {steps:,} A64 instructions")
-    print("  5 legacy fragment families and FAdd/FMul scalar/vec2/vec3/vec4")
-    print("  exact immutable words, record fields/order/offsets, typed IR and hostile stale/dominance failures")
-    if not args.mutate:
-        print("  (run with --mutate for focused source mutants)")
+    if args.self_test_infra:
+        infra_self_test(compiler, runtime_keywords, interp)
         return 0
-    front = FRONTEND.read_text(encoding="utf-8")
-    adapter = ADAPTER.read_text(encoding="utf-8")
-    escaped = []
-    for index, (name, owner, case_text, old, new) in enumerate(MUTANTS):
-        source = front if owner == "front" else adapter
-        if source.count(old) != 1:
-            escaped.append(f"{name}: mutation locator count {source.count(old)}")
-            continue
-        broken = source.replace(old, new, 1)
-        try:
-            image = build(compiler, f"mutant_{index}", frontend=broken if owner == "front" else None,
-                          adapter=broken if owner == "adapter" else None)
+    entries = compile_input_entries(runtime_keywords, interp)
+    shared_hash = framed_manifest(entries)
+    snapshot, snapshot_hash = freeze_inputs(entries)
+    try:
+        def guard_inputs() -> None:
+            guard_campaign_inputs(lambda: compile_input_entries(runtime_keywords, interp),
+                                  shared_hash, snapshot, snapshot_hash, compiler,
+                                  compiler_hash, runtime_keywords, keywords_hash)
+
+        frozen_oracle = snapshot / ORACLE_PATH.relative_to(ROOT)
+        if sha256_file(frozen_oracle) != ORACLE_LOADED_HASH:
+            raise RuntimeError("adapter gate: loaded oracle differs from frozen oracle bytes")
+        print(f"vulkan_spirv_ir_adapter_check: compiler={compiler} sha256={compiler_hash}", flush=True)
+        print(f"vulkan_spirv_ir_adapter_check: keywords={runtime_keywords} sha256={keywords_hash}", flush=True)
+        print(f"vulkan_spirv_ir_adapter_check: frozen-input-manifest={snapshot_hash}", flush=True)
+        print(f"vulkan_spirv_ir_adapter_check: oracle={ORACLE_PATH} sha256={ORACLE_LOADED_HASH}", flush=True)
+        print(f"vulkan_spirv_ir_adapter_check: interpreter={interp} sha256={sha256_file(interp)}", flush=True)
+        a64 = load_module("anvil_spirv_ir_a64", snapshot / interp.relative_to(ROOT))
+        if snapshot_manifest(snapshot) != snapshot_hash:
+            raise RuntimeError("adapter gate: frozen snapshot changed while loading interpreter")
+        cases = fixtures()
+        if args.mutate_interface:
+            causal_names = {mutant[2] for mutant in INTERFACE_MUTANTS}
+            cases = [case for case in cases if any(name in case["name"] for name in causal_names)]
+        guard_inputs()
+        cpu, result, steps = build_execute(
+            a64, compiler, runtime_keywords, "base", cases, snapshot, snapshot_hash,
+            compiler_hash, keywords_hash)
+        guard_inputs()
+        g = grade(cpu, result, cases)
+        if g.failures:
+            print(f"vulkan_spirv_ir_adapter_check: FAIL ({g.checks} checks, {steps:,} instructions)")
+            for failure in g.failures[:80]: print("  " + failure)
+            if len(g.failures) > 80: print(f"  ... {len(g.failures)-80} more")
+            return 1
+        print(f"vulkan_spirv_ir_adapter_check: PASS - {g.checks} properties over {steps:,} A64 instructions")
+        if args.mutate_interface:
+            print("  compact exact EntryPoint retention, version, ownership and hostile interface baseline")
+        else:
+            print("  5 legacy fragment families and FAdd/FMul scalar/vec2/vec3/vec4")
+            print("  exact immutable words, record fields/order/offsets, typed IR and hostile stale/dominance failures")
+        if not args.mutate and not args.mutate_interface:
+            print("  (run with --mutate for focused source mutants)")
+            return 0
+        sources = {
+            "front": (snapshot / FRONTEND.relative_to(ROOT)).read_bytes(),
+            "adapter": (snapshot / ADAPTER.relative_to(ROOT)).read_bytes(),
+            "ir": (snapshot / IR.relative_to(ROOT)).read_bytes(),
+        }
+        selected = INTERFACE_MUTANTS if args.mutate_interface else MUTANTS
+        escaped = []
+        tally = MutationTally()
+        for index, mutant in enumerate(selected):
+            if args.mutate_interface:
+                name, owner, case_text, causal, old, new = mutant
+            else:
+                name, owner, case_text, old, new = mutant
+                causal = None
+            broken = mutate_source(sources[owner], old, new)
             mutant_cases = [case for case in fixtures() if case_text in case["name"]]
-            if not mutant_cases:
-                escaped.append(f"{name}: no fixture matching {case_text!r}")
-                continue
-            mcpu, mresult, _ = execute(a64, image, mutant_cases)
+            if len(mutant_cases) != 1:
+                raise RuntimeError(f"adapter gate: {name}: expected one causal fixture for {case_text!r}, got {len(mutant_cases)}")
+            overrides = {owner: broken}
+            guard_inputs()
+            mcpu, mresult, _ = build_execute(
+                a64, compiler, runtime_keywords, f"mutant_{index}", mutant_cases,
+                snapshot, snapshot_hash, compiler_hash, keywords_hash,
+                frontend=overrides.get("front"), adapter=overrides.get("adapter"),
+                ir=overrides.get("ir"))
+            guard_inputs()
             mg = grade(mcpu, mresult, mutant_cases)
+            caught = bool(mg.failures)
             if name == "arithmetic use need not dominate":
                 case = mutant_cases[0]
                 report = [s64(mcpu, mresult + i * 8) for i in range(SLOTS)]
@@ -589,19 +1251,33 @@ def main() -> int:
                 expected = [OK, IR_ERR_DOMINANCE, IR_ERR_DOMINANCE,
                             case["dominance_id"], case["dominance_opcode"],
                             case["dominance_index"], 0]
-                if proof != expected:
+                caught = proof != expected
+                if not caught:
                     escaped.append(f"{name}: exact proof {proof!r}, wanted {expected!r}")
-            elif not mg.failures:
+            elif not caught:
                 escaped.append(name)
-        except SystemExit:
-            pass
-    if escaped:
-        print(f"vulkan_spirv_ir_adapter_check: FAIL - {len(escaped)} mutants escaped")
-        for name in escaped: print("  " + name)
-        return 1
-    print(f"vulkan_spirv_ir_adapter_check: all {len(MUTANTS)} focused mutations rejected")
-    return 0
+            elif causal is not None:
+                prefix = f"{mutant_cases[0]['name']}: {causal}:"
+                caught = any(failure.startswith(prefix) for failure in mg.failures)
+                if not caught:
+                    escaped.append(f"{name}: causal property {prefix!r} did not fail; got {mg.failures[:3]!r}")
+            if caught:
+                tally.semantic_rejection()
+            detail = mg.failures[0] if mg.failures else ""
+            print(f"  {'RED' if caught else 'GREEN'} {index + 1}/{len(selected)} {name}" +
+                  (f": {detail}" if detail else ""), flush=True)
+        if escaped:
+            print(f"vulkan_spirv_ir_adapter_check: FAIL - {len(escaped)} mutants escaped")
+            for name in escaped: print("  " + name)
+            return 1
+        if tally.rejected != len(selected):
+            raise RuntimeError(f"adapter gate: semantic rejection tally {tally.rejected} != {len(selected)}")
+        print(f"vulkan_spirv_ir_adapter_check: all {len(selected)} focused mutations rejected")
+        return 0
+    finally:
+        finalize_snapshot(guard_inputs, snapshot, sys.exc_info()[1])
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with checker_lock():
+        raise SystemExit(main())
