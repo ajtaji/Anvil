@@ -41,10 +41,7 @@ TARGETS = {
     "pi3-stub": {
         "source": Path("RaspberryPi3/Board/armstub8.asm"),
         "output": Path("build/pi3/armstub8.bin"),
-        # PureMetalForge's raw armstub frontend currently requires `-t pi4`.
-        # This is only assembler selection: the source is Pi3-specific raw
-        # instructions and contains no injected Pi4 runtime or constants.
-        "target": "pi4",
+        "target": "pi3",
         "args": ["--armstub"],
     },
     "pi3-monitor": {
