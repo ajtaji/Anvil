@@ -73,12 +73,43 @@ _start:
   msr hcr_el2, x0
   movz x0, #3
   msr cnthctl_el2, x0
+  ; The firmware reset state traps EL2 FP/SIMD accesses. Clear TFP before
+  ; ERET so the compiler's EL2 startup and monitor code can use the A64 bank.
+  movz x0, #0x33FF
+  msr cptr_el2, x0
   movz x0, #0x03C9
   msr spsr_el3, x0
   adr x0, el2_entry
   msr elr_el3, x0
   eret
 
+; Firmware-owned spin-table/header layout. Firmware clears the shared
+; magic/version word after reading it, leaving slot 3 available for a core.
+.org 0xD8
+spin_cpu0:
+  .quad 0
+.org 0xE0
+spin_cpu1:
+  .quad 0
+.org 0xE8
+spin_cpu2:
+  .quad 0
+.org 0xF0
+spin_cpu3:
+  .word 0x5AFE570B
+.org 0xF4
+stub_version:
+  .word 0
+.org 0xF8
+dtb_ptr32:
+  .word 0
+.org 0xFC
+kernel_entry32:
+  .word 0
+.org 0x100
+; Keep all executable EL2 dispatch code after the firmware-owned header and
+; spin table above. The slot ABI occupies 0xD8..0xFF even when the entry
+; stub itself grows beyond one firmware block.
 el2_entry:
   msr daifset, #15
   mrs x6, mpidr_el1
@@ -106,28 +137,4 @@ boot_kernel:
   movz x3, #0
   br x4
 
-; Firmware-owned spin-table/header layout. Firmware clears the shared
-; magic/version word after reading it, leaving slot 3 available for a core.
-.org 0xD8
-spin_cpu0:
-  .quad 0
-.org 0xE0
-spin_cpu1:
-  .quad 0
-.org 0xE8
-spin_cpu2:
-  .quad 0
-.org 0xF0
-spin_cpu3:
-  .word 0x5AFE570B
-.org 0xF4
-stub_version:
-  .word 0
-.org 0xF8
-dtb_ptr32:
-  .word 0
-.org 0xFC
-kernel_entry32:
-  .word 0
-.org 0x100
 .align 256
