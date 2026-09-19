@@ -1,7 +1,9 @@
 XIncludeFile "RaspberryPi3/Lib/timer.pbi"
 ; Clock service dependency is supplied deterministically; controller/timer
 ; operations remain real emitted MMIO and are modeled by the host gate.
+Global sd_gate_clock_queries.i
 Procedure.i Pi3ClockRate(id.i)
+  sd_gate_clock_queries + 1
   ProcedureReturn 250000000
 EndProcedure
 XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
@@ -9,6 +11,7 @@ XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
 Global Dim sd_gate_buffer.l[384]
 Procedure.i Main()
   If Pi3SdError() = 99
+    Pi3SdSetBootClock(250000000)
     Pi3SdInit(400000000, 0, $8000000)
     Pi3SdReadBlock(42, @sd_gate_buffer[0])
     Pi3SdSetWriteWindow(40, 10)
