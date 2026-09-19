@@ -1,0 +1,100 @@
+;
+; Opt-in bridge from the resident adapter's completed attachment to vk_wsi.
+; It owns no display, DMA, HDMI or DSI operation.
+;
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_wsi.pbi"
+
+#NVD_WSI_FREE = 0
+#NVD_WSI_ACQUIRED = 1
+#NVD_WSI_READY = 2
+#NVD_WSI_RESERVED = 3
+#NVD_WSI_COMMITTED = 4
+
+Global nvdWsiState.i
+Global nvdWsiDevice.i
+Global nvdWsiSwapchain.i
+Global nvdWsiImageIndex.i
+Global nvdWsiImageKey.i
+Global nvdWsiTargetGeneration.i
+Global nvdWsiTicket.i
+
+Procedure.i nvdWsiEnabled()
+  ProcedureReturn Bool(nvdWsiState <> #NVD_WSI_FREE)
+EndProcedure
+
+Procedure nvdWsiClear()
+  nvdWsiState = #NVD_WSI_FREE : nvdWsiDevice = 0 : nvdWsiSwapchain = 0
+  nvdWsiImageIndex = -1 : nvdWsiImageKey = 0 : nvdWsiTargetGeneration = 0 : nvdWsiTicket = 0
+EndProcedure
+
+Procedure.i nvdWsiAttach(device.i, swapchain.i, imageIndex.i, targetGeneration.i)
+  If nvdWsiState <> #NVD_WSI_FREE Or device = 0 Or swapchain = 0 Or imageIndex < 0 Or targetGeneration < 1
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  nvdWsiImageKey = avkWsiImageKey(device, swapchain, imageIndex)
+  If nvdWsiImageKey = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkWsiImageState(device, swapchain, imageIndex) <> #ANVIL_VK_WSI_IMAGE_ACQUIRED
+    nvdWsiImageKey = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  nvdWsiDevice = device : nvdWsiSwapchain = swapchain : nvdWsiImageIndex = imageIndex
+  nvdWsiTargetGeneration = targetGeneration : nvdWsiState = #NVD_WSI_ACQUIRED
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i nvdWsiMarkReady()
+  If nvdWsiState <> #NVD_WSI_ACQUIRED : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkWsiMarkRenderReady(nvdWsiDevice, nvdWsiSwapchain, nvdWsiImageIndex) <> #VK_SUCCESS
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  nvdWsiState = #NVD_WSI_READY
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i nvdWsiReserve()
+  Define item.AnvilVkWsiPresentItem
+  If nvdWsiState <> #NVD_WSI_READY : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  item\swapchain = nvdWsiSwapchain : item\imageIndex = nvdWsiImageIndex
+  If avkWsiPresentReserve(nvdWsiDevice, 1, @item, @nvdWsiTicket) <> #VK_SUCCESS
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  nvdWsiState = #NVD_WSI_RESERVED
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i nvdWsiCommit()
+  If nvdWsiState <> #NVD_WSI_RESERVED Or nvdWsiTicket = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkWsiPresentCommit(nvdWsiTicket) <> #VK_SUCCESS : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  nvdWsiState = #NVD_WSI_COMMITTED
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i nvdWsiComplete(success.i)
+  If nvdWsiState <> #NVD_WSI_COMMITTED Or nvdWsiTicket = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkWsiPresentComplete(nvdWsiTicket, success) <> #VK_SUCCESS : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  nvdWsiClear()
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i nvdWsiRollback()
+  Define result.i
+  If nvdWsiState = #NVD_WSI_FREE : ProcedureReturn #VK_SUCCESS : EndIf
+  If nvdWsiState = #NVD_WSI_READY
+    result = avkWsiReleaseImage(nvdWsiDevice, nvdWsiSwapchain, nvdWsiImageIndex)
+    If result <> #VK_SUCCESS : ProcedureReturn result : EndIf
+    nvdWsiClear() : ProcedureReturn #VK_SUCCESS
+  EndIf
+  If nvdWsiState = #NVD_WSI_ACQUIRED
+    result = avkWsiReleaseImage(nvdWsiDevice, nvdWsiSwapchain, nvdWsiImageIndex)
+    If result <> #VK_SUCCESS : ProcedureReturn result : EndIf
+    nvdWsiClear() : ProcedureReturn #VK_SUCCESS
+  EndIf
+  result = avkWsiPresentRollback(nvdWsiTicket)
+  If result <> #VK_SUCCESS : ProcedureReturn result : EndIf
+  nvdWsiTicket = 0
+  nvdWsiState = #NVD_WSI_READY
+  result = avkWsiReleaseImage(nvdWsiDevice, nvdWsiSwapchain, nvdWsiImageIndex)
+  If result <> #VK_SUCCESS : ProcedureReturn result : EndIf
+  nvdWsiClear()
+  ProcedureReturn #VK_SUCCESS
+EndProcedure

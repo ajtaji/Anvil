@@ -1,0 +1,185 @@
+; ======================================================================
+;  hw_board.pi3 - the Raspberry Pi 3's HwBoard* backend.
+;
+;  The handful of facts the payload ABI (Anvil/Hal/abi.pbi) needs and no
+;  command family does: what this board is called, how to reset it, what
+;  state its MMU and caches are in, what time it is, and how to pet the
+;  deadman. None of them has a #CAP_ flag for the same reason HwAddr* has
+;  none - every board has an identity, a reset and a cache state, so
+;  there is nothing that could be absent.
+;
+;  INCLUDE ORDER: after RaspberryPi3/Lib/timer.pbi (Pi3Micros,
+;  Pi3DelayUs), RaspberryPi3/Lib/mmu.pi3 (MmuState) and
+;  RaspberryPi3/Lib/pl011_console.pi3 (UartDrain), and before
+;  Anvil/Hal/abi.pbi, which calls all of them. House rule 10: this file
+;  includes nothing itself.
+; ======================================================================
+
+Procedure.i HwBoardName()
+  ProcedureReturn "Raspberry Pi 3 Model B (Broadcom BCM2837)"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwReboot() - reset the board. Does not return.
+;
+;  THE BCM2835 POWER-MANAGEMENT WATCHDOG, which is how everything resets
+;  a Pi: write a short timeout into WDOG and then set the full-reset bit
+;  in RSTC. The magic $5A in the top byte is the PM block's password, and
+;  a write without it is discarded silently.
+;
+;  THE SAME TWO REGISTERS RaspberryPi3/Lib/update_watchdog.pbi WRITES,
+;  and the values are taken from there rather than re-derived. This is a
+;  second copy of two register addresses and it is deliberate: that
+;  file's Pi3UpdateResetNow() refuses unless the updater's transport is
+;  quiescent, which is exactly right for a reset requested in the middle
+;  of a firmware update and exactly wrong for `reboot` typed at a prompt.
+;  A monitor whose reset command could refuse because something unrelated
+;  was mid-transaction is a monitor somebody power-cycles instead.
+;
+;  THE CONSOLE IS DRAINED FIRST. BUSY, not FIFO-empty - UartDrain() waits
+;  for the last stop bit to leave the wire. The difference is one
+;  character time, and it is the difference between a clean last line and
+;  a truncated one.
+;
+;  THE DELAY AFTERWARDS IS NOT A WAIT, IT IS THE PROOF. The reset takes a
+;  handful of ticks; reaching the line after the delay means the reset
+;  did NOT happen, and saying so is better than returning quietly to a
+;  prompt the operator will think belongs to the new boot.
+; ----------------------------------------------------------------------
+Procedure HwReboot()
+  Define control.i
+  UartDrain()
+  ASM
+    dsb sy
+    isb
+  EndASM
+  ; WDOG = password | 10 ticks of the 65536 Hz counter.
+  PokeL($3F100024, $5A00000A)
+  control = PeekL($3F10001C) & $FFFFFFFF
+  ; RSTC: keep the bits the firmware set, clear the two-bit reset-config
+  ; field and write "full reset" into it.
+  PokeL($3F10001C, $5A000000 | (control & $00FFFFCF) | $20)
+  ASM
+    dsb sy
+    isb
+  EndASM
+  Pi3DelayUs(500000)
+  PrintN("!! the reset did not happen. The power-management watchdog accepted the")
+  PrintN("   write and the board is still here, which usually means the firmware")
+  PrintN("   holds the reset configuration. Remove the power.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pi3EnterPayload(a) - call the address, and come back.
+;
+;  A BLR AND NOT A BR. The payload is CALLED, so a plain `ret` at its end
+;  brings the processor back here with this monitor still resident and
+;  still owning the card, the console and the page tables. A branch would
+;  be a handover, and this board already has one of those - the loader's,
+;  which is how this image was started.
+;
+;  x0 IS THE ENTRY POINT AND x0 IS ALSO THE FIRST ARGUMENT, which is
+;  convenient and worth stating rather than discovering: a payload built
+;  from this tree takes no arguments, so what it actually receives in x0
+;  is its own address, and nothing reads it.
+;
+;  THE BARRIERS ARE THE POINT. The payload's bytes were written as DATA,
+;  with the caches on; without the instruction-cache invalidate the fetch
+;  at its entry can see whatever was there before, which is the failure
+;  that produces no message at all. Anvil/Core/memcmd.pbi has already
+;  cleaned the range by address through CacheFlushRange(); this is the
+;  fence that makes the clean visible to the fetch.
+; ----------------------------------------------------------------------
+Procedure Pi3EnterPayload(a.i)
+  ASM
+    dsb sy
+    ic iallu
+    dsb sy
+    isb
+    blr x0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pi3MonWatchdogStop() - release the loader's deadman.
+;
+;  THE MOST IMPORTANT WRITE THIS MONITOR MAKES. The immutable loader arms
+;  a fifteen-second never-fed watchdog before it branches here and does
+;  not stop it; this is what turns it off, once the running slot has
+;  confirmed itself. Miss it and the board resets and falls back to the
+;  last confirmed image, which from the other end of a serial cable looks
+;  exactly like this image having crashed.
+;
+;  $5A000102 IS THE SAME WORD RaspberryPi3/Lib/update_watchdog.pbi WRITES
+;  and it is taken from there rather than re-derived: the PM password in
+;  the top byte, the reset-config field cleared, and the watchdog-enable
+;  bit off. This is a second copy of two register addresses and it is
+;  deliberate, for the same reason HwReboot() above is: that file's
+;  Pi3UpdateWatchdogStop() refuses unless the A/B module has a confirmed
+;  active slot IN ITS OWN GLOBALS, and this monitor confirms through
+;  Anvil/Storage/ab_record.pbi instead - by name through the shared
+;  filesystem rather than by walking a cluster chain, which is what rule
+;  30 requires of it. Coupling the release of the deadman to the state of
+;  a module this monitor deliberately does not use would be a monitor
+;  that cannot switch its own watchdog off.
+;
+;  IT VERIFIES. Reading the control register back and checking the enable
+;  bits are clear costs one load, and the alternative is a monitor that
+;  believes it is safe and is fifteen seconds from a reset.
+; ----------------------------------------------------------------------
+Procedure.i Pi3MonWatchdogStop()
+  ASM
+    dsb sy
+    isb
+  EndASM
+  PokeL($3F10001C, $5A000102)
+  ASM
+    dsb sy
+    isb
+  EndASM
+  ProcedureReturn Bool((PeekL($3F10001C) & $30) = 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmuState() - bit 0 MMU on, bit 1 D-cache on, bit 2 I-cache on.
+;
+;  READ FROM SCTLR, not answered from a constant, because on this board
+;  Anvil is the thing that turns them on: it is entered with all three
+;  off and brings them up itself, so the register is the only honest
+;  source. A payload that asked this and got a constant would be told the
+;  cache state of an intention rather than of the machine.
+;
+;  MmuState() reads the register of the CURRENT exception level, which
+;  matters here because this monitor can arrive at EL2 or at EL3
+;  depending on what the firmware was asked to do.
+; ----------------------------------------------------------------------
+Procedure.i HwMmuState()
+  ProcedureReturn MmuState()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMicros() IS NOT HERE. It is part of THE TIME seam
+;  (Anvil/Hal/hal.pbi) and this board implements that whole seam in one
+;  file, RaspberryPi3/Board/hwtimer.pi3, so that a payload and the
+;  monitor cannot end up reading the counter two different ways.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  HwPet() - pet the deadman.
+;
+;  A NO-OP, AND AN HONEST ONE RATHER THAN A MISSING FEATURE. There is a
+;  watchdog on this part and this monitor deliberately does not hold it:
+;  the immutable loader arms a fifteen-second never-fed timer before it
+;  branches here, and this monitor's job is to RELEASE it by confirming
+;  the slot, not to start feeding it. A monitor that petted would defeat
+;  the A/B trial outright - a slot that hung after confirming would be
+;  petted for ever instead of falling back to the last good one.
+;
+;  A payload that pets in its own loop therefore costs one call and
+;  nothing happens, which is the correct behaviour: the alternative is a
+;  payload that has to know which board it is on in order to know whether
+;  to pet, and that is the fork the whole capability model exists to
+;  prevent. When this board grows a `deadman` command of its own, this
+;  becomes the feed and nothing else in the tree changes.
+; ----------------------------------------------------------------------
+Procedure HwPet()
+EndProcedure

@@ -1,0 +1,825 @@
+; ======================================================================
+;  input_editor_emitted_gate.pi4
+;
+;  Emitted-code gate for the normalized input dispatcher and the shared
+;  line editor. Anvil/Core/input_events.pbi and Anvil/Core/text_edit.pbi
+;  are compiled UNCHANGED and executed; only the three leaves they stand
+;  on are scripted here - the tick counter, the echo port, and the
+;  board global the CRLF de-duplicator lives in.
+;
+;  Main() returns the number of the first failing assertion, or 0.
+;
+; ======================================================================
+;  THE FIRST HALF IS AN EQUIVALENCE PROOF AND IT NEEDS A REFERENCE
+; ======================================================================
+;  The claim that has to be earned is that the serial console and the
+;  Ethernet console behave exactly as they did before the editor was
+;  extracted. "Exactly" cannot be checked against the new code, so
+;  GateRefStep() below is a TRANSCRIPTION OF THE OLD EDITOR - the inline
+;  body of Anvil/Core/parse.pbi's ReadLine() as it stood before this
+;  work, one byte at a time, including its echo. Every scenario is run
+;  through it and through the real code, and the two are compared on
+;  the buffer, the length, the NUL, the truncation flag, the Ctrl-C flag
+;  AND THE WHOLE ECHO BYTE SEQUENCE.
+;
+;  The echo comparison is the part that matters. A refactor that got the
+;  buffer right and the echo wrong would look correct in every test that
+;  reads the line and would put a visibly broken prompt in front of an
+;  operator - and on this board the "terminal" is also a framebuffer
+;  console with no escape-sequence interpreter at all, so a stray CSI
+;  would be printed as text rather than acted on.
+;
+;  A transcription can drift from the thing it transcribes, so
+;  tools/input_editor_emitted_check.py builds eight MUTANTS of the real
+;  files and requires each one to be caught. A reference that agrees
+;  with a broken implementation is not a reference.
+; ======================================================================
+
+XIncludeFile "Anvil/Core/state.pbi"
+
+; The board global the line editor's CRLF de-duplication lives in. On a
+; real board it is declared by the board's display globals; it is here
+; for the same reason the tick counter is, and it is deliberately NOT
+; reset between lines - see the CRLF scenario.
+Global gLastCR.i = 0
+
+Global gate_ticks.i = 0
+Procedure.i Ticks()
+  gate_ticks = gate_ticks + 1
+  ProcedureReturn gate_ticks
+EndProcedure
+
+; The echo port. Everything text_edit.pbi emits lands here, in order.
+#GATE_ECHO_MAX = 1024
+Global Dim gate_echo.a[#GATE_ECHO_MAX + 8]
+Global gate_echoN.i = 0
+Global gate_echoOver.i = 0
+
+Procedure UartWrite(c.i)
+  If gate_echoN < #GATE_ECHO_MAX
+    gate_echo[gate_echoN] = c & $FF
+  Else
+    gate_echoOver = 1
+  EndIf
+  gate_echoN = gate_echoN + 1
+EndProcedure
+
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+
+; ======================================================================
+;  THE OLD EDITOR, TRANSCRIBED
+; ======================================================================
+
+Global Dim gate_refLine.b[#LINE_MAX + 16]
+Global gate_refLen.i = 0
+Global gate_refTrunc.i = 0
+Global gate_refCtrlC.i = 0
+Global gate_refLastCR.i = 0
+Global Dim gate_refEcho.a[#GATE_ECHO_MAX + 8]
+Global gate_refEchoN.i = 0
+
+Procedure GateRefEcho(c.i)
+  If gate_refEchoN < #GATE_ECHO_MAX
+    gate_refEcho[gate_refEchoN] = c & $FF
+  EndIf
+  gate_refEchoN = gate_refEchoN + 1
+EndProcedure
+
+Procedure GateRefBegin()
+  gate_refLen = 0
+  gate_refTrunc = 0
+  gate_refCtrlC = 0
+  gate_refEchoN = 0
+EndProcedure
+
+; One byte through the editor Anvil/Core/parse.pbi used to contain.
+; 1 means the line ended here.
+Procedure.i GateRefStep(c.i)
+  If c = 10 And gate_refLastCR <> 0
+    gate_refLastCR = 0
+    ProcedureReturn 0
+  EndIf
+  gate_refLastCR = 0
+  If c = 13 Or c = 10
+    If c = 13
+      gate_refLastCR = 1
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  If c = 8 Or c = 127
+    If gate_refLen > 0
+      gate_refLen = gate_refLen - 1
+      GateRefEcho(8)
+      GateRefEcho(32)
+      GateRefEcho(8)
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If c = 3
+    gate_refLen = 0
+    gate_refTrunc = 0
+    gate_refCtrlC = 1
+    ProcedureReturn 1
+  EndIf
+  If c >= 32 And c < 127
+    If gate_refLen < #LINE_MAX
+      gate_refLine[gate_refLen] = c
+      gate_refLen = gate_refLen + 1
+      GateRefEcho(c)
+    Else
+      gate_refTrunc = 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE SCRIPTED BYTE STREAM
+; ======================================================================
+
+#GATE_STREAM_MAX = 512
+Global Dim gate_stream.a[#GATE_STREAM_MAX + 8]
+Global gate_streamN.i = 0
+
+Procedure GateStreamBegin()
+  gate_streamN = 0
+EndProcedure
+
+Procedure GateStreamPut(c.i)
+  If gate_streamN < #GATE_STREAM_MAX
+    gate_stream[gate_streamN] = c & $FF
+    gate_streamN = gate_streamN + 1
+  EndIf
+EndProcedure
+
+Procedure GateStreamStr(*s)
+  Define i.i
+  Define b.i
+  i = 0
+  Repeat
+    b = PeekA(*s + i) & $FF
+    If b = 0
+      Break
+    EndIf
+    GateStreamPut(b)
+    i = i + 1
+  ForEver
+EndProcedure
+
+; ======================================================================
+;  THE TWO RUNS
+; ======================================================================
+
+Procedure GateDrain()
+  Dim ev.a[#AIE_EVSZ]
+  While InputEventsPop(@ev) = 1
+  Wend
+EndProcedure
+
+; GateNewStep - one byte through the real dispatcher and the real
+; editor, applied exactly the way Anvil/Core/parse.pbi's ReadLine()
+; applies an event. 1 means the line ended here.
+Global gate_lastRc.i = 0
+Procedure.i GateNewStep(source.i, c.i)
+  Define kind.i
+  Dim ev.a[#AIE_EVSZ]
+  InputFeedByte(source, c)
+  While InputEventsPop(@ev) = 1
+    kind = PeekL(@ev + #AIE_EV_KIND)
+    If kind = #AIE_TEXT
+      gate_lastRc = TextEditInsert(PeekL(@ev + #AIE_EV_CODE))
+    ElseIf kind = #AIE_KEY_DOWN
+      gate_lastRc = TextEditKey(PeekL(@ev + #AIE_EV_CODE))
+    ElseIf kind = #AIE_KEY_UP
+      gate_lastRc = TextEditKeyRelease(PeekL(@ev + #AIE_EV_CODE))
+    ElseIf kind = #AIE_CANCEL
+      TextEditCancelNotice(PeekL(@ev + #AIE_EV_CODE))
+    EndIf
+  Wend
+  ProcedureReturn TextEditDone()
+EndProcedure
+
+Procedure GateRunRef()
+  Define i.i
+  GateRefBegin()
+  i = 0
+  While i < gate_streamN
+    If GateRefStep(gate_stream[i] & $FF) <> 0
+      i = gate_streamN
+    Else
+      i = i + 1
+    EndIf
+  Wend
+EndProcedure
+
+Procedure GateRunNew(source.i)
+  Define i.i
+  gate_echoN = 0
+  gate_echoOver = 0
+  TextEditBegin()
+  i = 0
+  While i < gate_streamN
+    If GateNewStep(source, gate_stream[i] & $FF) <> 0
+      i = gate_streamN
+    Else
+      i = i + 1
+    EndIf
+  Wend
+EndProcedure
+
+; GateCompare - the real result against the transcribed one.
+; 0 identical, 1..7 says which way they differ.
+Procedure.i GateCompare()
+  Define i.i
+  If gate_echoOver <> 0
+    ProcedureReturn 7
+  EndIf
+  If gLineLen <> gate_refLen
+    ProcedureReturn 1
+  EndIf
+  i = 0
+  While i < gate_refLen
+    If (gLine[i] & $FF) <> (gate_refLine[i] & $FF)
+      ProcedureReturn 2
+    EndIf
+    i = i + 1
+  Wend
+  If (gLine[gLineLen] & $FF) <> 0
+    ProcedureReturn 3
+  EndIf
+  If gLineTrunc <> gate_refTrunc
+    ProcedureReturn 4
+  EndIf
+  If gLineCtrlC <> gate_refCtrlC
+    ProcedureReturn 5
+  EndIf
+  If gate_echoN <> gate_refEchoN
+    ProcedureReturn 6
+  EndIf
+  i = 0
+  While i < gate_refEchoN
+    If gate_echo[i] <> gate_refEcho[i]
+      ProcedureReturn 7
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; GateScenario - run the stream that is loaded through the reference and
+; then through both real byte sources. Returns base+code on the first
+; difference, 0 if all three agree.
+;
+; RESETTING gLastCR ON BOTH SIDES BEFORE EACH RUN is what makes the three
+; runs comparable; the CRLF scenario is the one place it is deliberately
+; left alone, and it calls the steps itself.
+Procedure.i GateScenario(base.i)
+  Define rc.i
+  gate_refLastCR = 0
+  GateRunRef()
+  gLastCR = 0
+  GateRunNew(#AIS_PHYSICAL)
+  rc = GateCompare()
+  If rc <> 0
+    ProcedureReturn base + rc
+  EndIf
+  gLastCR = 0
+  GateRunNew(#AIS_NETWORK)
+  rc = GateCompare()
+  If rc <> 0
+    ProcedureReturn base + 100 + rc
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  HELPERS FOR THE CARET HALF
+; ======================================================================
+
+Procedure.i GateKey(code.i)
+  ProcedureReturn TextEditKey(code)
+EndProcedure
+
+Procedure GateType(*s)
+  Define i.i
+  Define b.i
+  i = 0
+  Repeat
+    b = PeekA(*s + i) & $FF
+    If b = 0
+      Break
+    EndIf
+    TextEditInsert(b)
+    i = i + 1
+  ForEver
+EndProcedure
+
+; 1 if the edited line is exactly *s.
+Procedure.i GateLineIs(*s)
+  Define i.i
+  Define b.i
+  i = 0
+  Repeat
+    b = PeekA(*s + i) & $FF
+    If b = 0
+      Break
+    EndIf
+    If i >= gLineLen
+      ProcedureReturn 0
+    EndIf
+    If (gLine[i] & $FF) <> b
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  ForEver
+  ProcedureReturn Bool(i = gLineLen)
+EndProcedure
+
+Procedure.i GatePushEvent(kind.i, source.i, code.i)
+  Dim ev.a[#AIE_EVSZ]
+  InputEventInit(@ev, kind, source, code, 0)
+  ProcedureReturn InputEventsPush(@ev)
+EndProcedure
+
+; ======================================================================
+
+Procedure.i Main()
+  Define rc.i
+  Define i.i
+  Define gen.i
+  Define pushed.i
+  Define ups.i
+  Define owner.i
+  Dim ev.a[#AIE_EVSZ]
+  Dim tev.a[#AIT_EVSZ]
+
+  ; ====================================================================
+  ;  PART A - THE BYTE STREAMS. Physical and network, against the old
+  ;  editor transcribed.
+  ; ====================================================================
+
+  ; A1 an ordinary command.
+  GateStreamBegin()
+  GateStreamStr("help")
+  GateStreamPut(13)
+  rc = GateScenario(10)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A2 backspaces in the middle of typing, then more text.
+  GateStreamBegin()
+  GateStreamStr("abcd")
+  GateStreamPut(8)
+  GateStreamPut(8)
+  GateStreamStr("XY")
+  GateStreamPut(13)
+  rc = GateScenario(20)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A3 DEL (127) is a backspace, and a backspace on an empty line does
+  ; nothing and echoes nothing.
+  GateStreamBegin()
+  GateStreamPut(8)
+  GateStreamStr("a")
+  GateStreamPut(127)
+  GateStreamPut(8)
+  GateStreamStr("zz")
+  GateStreamPut(10)
+  rc = GateScenario(30)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A4 Ctrl-C discards the line, keeps the echo, sets the flag, and
+  ; clears the truncation flag with it.
+  GateStreamBegin()
+  GateStreamStr("ab")
+  GateStreamPut(3)
+  rc = GateScenario(40)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A5 EVERY BYTE THE OLD EDITOR IGNORED IS STILL IGNORED. 0, 9 (Tab),
+  ; 27 (Esc), 31, 128 and 200 produce nothing and echo nothing. Tab and
+  ; Esc are the two that matter: both now have key codes, and mapping
+  ; the BYTE onto the KEY would change the serial console - Esc would
+  ; discard a line every time a terminal sent an arrow key, whose escape
+  ; sequence starts with exactly that byte.
+  GateStreamBegin()
+  GateStreamPut(0)
+  GateStreamStr("m")
+  GateStreamPut(9)
+  GateStreamPut(27)
+  GateStreamStr("e")
+  GateStreamPut(31)
+  GateStreamPut(128)
+  GateStreamPut(200)
+  GateStreamStr("m")
+  GateStreamPut(13)
+  rc = GateScenario(50)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A6 a line longer than #LINE_MAX is truncated, flagged, and the
+  ; dropped characters are not echoed.
+  GateStreamBegin()
+  i = 0
+  While i < #LINE_MAX + 6
+    GateStreamPut(97 + (i % 26))
+    i = i + 1
+  Wend
+  GateStreamPut(13)
+  rc = GateScenario(60)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A7 a bare LF ends a line just as a CR does.
+  GateStreamBegin()
+  GateStreamStr("ok")
+  GateStreamPut(10)
+  rc = GateScenario(70)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ; A8 THE CRLF PAIR ACROSS TWO LINES. The CR ends the first line and
+  ; the LF arrives at the start of the second, so the de-duplication
+  ; state has to survive the line it ended. gLastCR is NOT reset between
+  ; the two halves here, on either side, which is the whole point.
+  gate_refLastCR = 0
+  gLastCR = 0
+  GateStreamBegin()
+  GateStreamStr("one")
+  GateStreamPut(13)
+  GateRunRef()
+  GateRunNew(#AIS_PHYSICAL)
+  rc = GateCompare()
+  If rc <> 0 : ProcedureReturn 80 + rc : EndIf
+  GateStreamBegin()
+  GateStreamPut(10)
+  GateStreamStr("two")
+  GateStreamPut(13)
+  GateRunRef()
+  GateRunNew(#AIS_PHYSICAL)
+  rc = GateCompare()
+  If rc <> 0 : ProcedureReturn 90 + rc : EndIf
+  If GateLineIs("two") = 0 : ProcedureReturn 99 : EndIf
+
+  ; ====================================================================
+  ;  PART B - THE CARET. None of this is reachable from a byte, which is
+  ;  exactly why the editor had to be extracted.
+  ; ====================================================================
+  gLastCR = 0
+  gate_echoN = 0
+  TextEditBegin()
+  GateType("abcd")
+  If GateLineIs("abcd") = 0 : ProcedureReturn 200 : EndIf
+  If TextEditCaret() <> 4 : ProcedureReturn 201 : EndIf
+
+  ; Home, then an insertion at the front.
+  If GateKey(#AIK_HOME) <> #AIE_OK : ProcedureReturn 202 : EndIf
+  If TextEditCaret() <> 0 : ProcedureReturn 203 : EndIf
+  TextEditInsert(88)                                   ; 'X'
+  If GateLineIs("Xabcd") = 0 : ProcedureReturn 204 : EndIf
+  If TextEditCaret() <> 1 : ProcedureReturn 205 : EndIf
+  If TextEditLength() <> 5 : ProcedureReturn 206 : EndIf
+
+  ; End, then an insertion at the back.
+  If GateKey(#AIK_END) <> #AIE_OK : ProcedureReturn 207 : EndIf
+  If TextEditCaret() <> 5 : ProcedureReturn 208 : EndIf
+  TextEditInsert(90)                                   ; 'Z'
+  If GateLineIs("XabcdZ") = 0 : ProcedureReturn 209 : EndIf
+
+  ; Left twice, then Delete removes the character AFTER the caret.
+  GateKey(#AIK_LEFT)
+  GateKey(#AIK_LEFT)
+  If TextEditCaret() <> 4 : ProcedureReturn 210 : EndIf
+  If GateKey(#AIK_DELETE) <> #AIE_OK : ProcedureReturn 211 : EndIf
+  If GateLineIs("XabcZ") = 0 : ProcedureReturn 212 : EndIf
+  If TextEditCaret() <> 4 : ProcedureReturn 213 : EndIf
+
+  ; Backspace removes the character BEFORE the caret.
+  If GateKey(#AIK_BACKSPACE) <> #AIE_OK : ProcedureReturn 214 : EndIf
+  If GateLineIs("XabZ") = 0 : ProcedureReturn 215 : EndIf
+  If TextEditCaret() <> 3 : ProcedureReturn 216 : EndIf
+
+  ; Right steps forward over one character and stops at the end.
+  GateKey(#AIK_RIGHT)
+  If TextEditCaret() <> 4 : ProcedureReturn 217 : EndIf
+  GateKey(#AIK_RIGHT)
+  If TextEditCaret() <> 4 : ProcedureReturn 218 : EndIf
+
+  ; Home, then Left at column zero does nothing and echoes nothing.
+  GateKey(#AIK_HOME)
+  gate_echoN = 0
+  If GateKey(#AIK_LEFT) <> #AIE_OK : ProcedureReturn 219 : EndIf
+  If TextEditCaret() <> 0 : ProcedureReturn 220 : EndIf
+  If gate_echoN <> 0 : ProcedureReturn 221 : EndIf
+
+  ; Backspace at column zero does nothing and echoes nothing either.
+  If GateKey(#AIK_BACKSPACE) <> #AIE_OK : ProcedureReturn 222 : EndIf
+  If GateLineIs("XabZ") = 0 : ProcedureReturn 223 : EndIf
+  If gate_echoN <> 0 : ProcedureReturn 224 : EndIf
+
+  ; Delete at the end of the line does nothing.
+  GateKey(#AIK_END)
+  gate_echoN = 0
+  If GateKey(#AIK_DELETE) <> #AIE_OK : ProcedureReturn 225 : EndIf
+  If GateLineIs("XabZ") = 0 : ProcedureReturn 226 : EndIf
+  If gate_echoN <> 0 : ProcedureReturn 227 : EndIf
+
+  ; TAB IS REFUSED AND NOTHING IS INVENTED.
+  If GateKey(#AIK_TAB) <> #AIE_ERR_NO_TAB : ProcedureReturn 228 : EndIf
+  If GateLineIs("XabZ") = 0 : ProcedureReturn 229 : EndIf
+  If gate_echoN <> 0 : ProcedureReturn 230 : EndIf
+  If TextEditDone() <> 0 : ProcedureReturn 231 : EndIf
+
+  ; Esc cancels the edit the way Ctrl-C does.
+  If GateKey(#AIK_ESC) <> #AIE_OK : ProcedureReturn 232 : EndIf
+  If TextEditLength() <> 0 : ProcedureReturn 233 : EndIf
+  If TextEditCancelled() = 0 : ProcedureReturn 234 : EndIf
+  If TextEditDone() = 0 : ProcedureReturn 235 : EndIf
+
+  ; An unknown key code is refused rather than guessed at.
+  TextEditBegin()
+  If TextEditKey(99) <> #AIE_ERR_CODE : ProcedureReturn 236 : EndIf
+  If TextEditKey(0) <> #AIE_ERR_CODE : ProcedureReturn 237 : EndIf
+
+  ; ====================================================================
+  ;  PART C - BOUNDS
+  ; ====================================================================
+  TextEditBegin()
+  i = 0
+  While i < #LINE_MAX
+    If TextEditInsert(97) <> #AIE_OK : ProcedureReturn 300 : EndIf
+    i = i + 1
+  Wend
+  If TextEditLength() <> #LINE_MAX : ProcedureReturn 301 : EndIf
+  If TextEditTruncated() <> 0 : ProcedureReturn 302 : EndIf
+  gate_echoN = 0
+  If TextEditInsert(98) <> #AIE_ERR_LINE_FULL : ProcedureReturn 303 : EndIf
+  If TextEditLength() <> #LINE_MAX : ProcedureReturn 304 : EndIf
+  If TextEditTruncated() = 0 : ProcedureReturn 305 : EndIf
+  If gate_echoN <> 0 : ProcedureReturn 306 : EndIf
+  ; A full line still edits: the caret still moves and a delete still
+  ; frees a column.
+  If GateKey(#AIK_BACKSPACE) <> #AIE_OK : ProcedureReturn 307 : EndIf
+  If TextEditLength() <> #LINE_MAX - 1 : ProcedureReturn 308 : EndIf
+  ; Non-printable insertions are refused, not stored.
+  TextEditBegin()
+  If TextEditInsert(9) <> #AIE_ERR_CODE : ProcedureReturn 309 : EndIf
+  If TextEditInsert(31) <> #AIE_ERR_CODE : ProcedureReturn 310 : EndIf
+  If TextEditInsert(127) <> #AIE_ERR_CODE : ProcedureReturn 311 : EndIf
+  If TextEditLength() <> 0 : ProcedureReturn 312 : EndIf
+  ; And the two ends of the printable range are accepted.
+  If TextEditInsert(32) <> #AIE_OK : ProcedureReturn 313 : EndIf
+  If TextEditInsert(126) <> #AIE_OK : ProcedureReturn 314 : EndIf
+
+  ; ====================================================================
+  ;  PART D - THE QUEUE, AND WHAT SATURATION MUST NOT DO
+  ; ====================================================================
+  GateDrain()
+  ; A malformed event is refused by shape rather than stored.
+  If GatePushEvent(#AIE_TEXT, #AIS_PHYSICAL, 31) <> #AIE_ERR_CODE : ProcedureReturn 400 : EndIf
+  If GatePushEvent(#AIE_TEXT, #AIS_PHYSICAL, 127) <> #AIE_ERR_CODE : ProcedureReturn 401 : EndIf
+  If GatePushEvent(#AIE_KEY_DOWN, #AIS_PHYSICAL, 0) <> #AIE_ERR_CODE : ProcedureReturn 402 : EndIf
+  If GatePushEvent(#AIE_KEY_DOWN, #AIS_PHYSICAL, #AIK_MAX + 1) <> #AIE_ERR_CODE : ProcedureReturn 403 : EndIf
+  If GatePushEvent(#AIE_TEXT, 0, 65) <> #AIE_ERR_SOURCE : ProcedureReturn 404 : EndIf
+  If GatePushEvent(#AIE_TEXT, #AIS_MAX + 1, 65) <> #AIE_ERR_SOURCE : ProcedureReturn 405 : EndIf
+  If GatePushEvent(77, #AIS_PHYSICAL, 65) <> #AIE_ERR_KIND : ProcedureReturn 406 : EndIf
+  If InputEventsPush(0) <> #AIE_ERR_ARG : ProcedureReturn 407 : EndIf
+  If InputEventsQueued() <> 0 : ProcedureReturn 408 : EndIf
+
+  ; Fill the queue exactly. Every one of these is a key RELEASE, which
+  ; is the event the design says must never be silently lost.
+  gen = InputFocusGeneration()
+  i = 0
+  While i < #AIE_QMAX
+    If GatePushEvent(#AIE_KEY_UP, #AIS_TOUCH_KEYBOARD, #AIK_BACKSPACE) <> #AIE_OK
+      ProcedureReturn 409
+    EndIf
+    i = i + 1
+  Wend
+  If InputEventsQueued() <> #AIE_QMAX : ProcedureReturn 410 : EndIf
+  pushed = InputCancelCount()
+
+  ; THE ONE THAT DOES NOT FIT. It is refused with a code, everything is
+  ; cancelled, the generation moves on, and what is left in the queue is
+  ; exactly one CANCEL carrying the reason - NOT sixty-four releases
+  ; with the oldest quietly overwritten.
+  If GatePushEvent(#AIE_TEXT, #AIS_TOUCH_KEYBOARD, 65) <> #AIE_ERR_FULL : ProcedureReturn 411 : EndIf
+  If InputCancelCount() <> pushed + 1 : ProcedureReturn 412 : EndIf
+  If InputCancelReason() <> #AIC_QUEUE_FULL : ProcedureReturn 413 : EndIf
+  If InputFocusGeneration() <> gen + 1 : ProcedureReturn 414 : EndIf
+  If InputEventsQueued() <> 1 : ProcedureReturn 415 : EndIf
+  If InputStaleDropped() <> #AIE_QMAX : ProcedureReturn 416 : EndIf
+  If InputEventsPop(@ev) <> 1 : ProcedureReturn 417 : EndIf
+  If PeekL(@ev + #AIE_EV_KIND) <> #AIE_CANCEL : ProcedureReturn 418 : EndIf
+  If PeekL(@ev + #AIE_EV_CODE) <> #AIC_QUEUE_FULL : ProcedureReturn 419 : EndIf
+  If PeekL(@ev + #AIE_EV_GEN) <> InputFocusGeneration() : ProcedureReturn 420 : EndIf
+  If PeekI(@ev + #AIE_EV_TIME) = 0 : ProcedureReturn 421 : EndIf
+  If InputEventsPop(@ev) <> 0 : ProcedureReturn 422 : EndIf
+
+  ; The cancellation is delivered to the editor and DOES NOT TOUCH THE
+  ; TYPED TEXT.
+  TextEditBegin()
+  GateType("half typed")
+  GatePushEvent(#AIE_KEY_UP, #AIS_TOUCH_KEYBOARD, #AIK_ENTER)
+  InputCancelAll(#AIC_SCREEN_CHANGE)
+  If InputEventsPop(@ev) <> 1 : ProcedureReturn 423 : EndIf
+  If PeekL(@ev + #AIE_EV_KIND) <> #AIE_CANCEL : ProcedureReturn 424 : EndIf
+  TextEditCancelNotice(PeekL(@ev + #AIE_EV_CODE))
+  If GateLineIs("half typed") = 0 : ProcedureReturn 425 : EndIf
+  If TextEditDone() <> 0 : ProcedureReturn 426 : EndIf
+  If TextEditLastCancel() <> #AIC_SCREEN_CHANGE : ProcedureReturn 427 : EndIf
+
+  ; ====================================================================
+  ;  PART E - THE FOCUS GENERATION
+  ; ====================================================================
+  GateDrain()
+  gen = InputFocusGeneration()
+  ; Setting the focus to the client it already is changes nothing, which
+  ; is what lets ReadLine call it on every line.
+  If InputFocusSet(InputFocus()) <> gen : ProcedureReturn 500 : EndIf
+  If InputFocusGeneration() <> gen : ProcedureReturn 501 : EndIf
+  ; Changing it cancels, once.
+  pushed = InputCancelCount()
+  If InputFocusSet(#AIF_COMMAND_LINE) <> gen + 1 : ProcedureReturn 502 : EndIf
+  If InputCancelCount() <> pushed + 1 : ProcedureReturn 503 : EndIf
+  If InputCancelReason() <> #AIC_FOCUS_CHANGE : ProcedureReturn 504 : EndIf
+  GateDrain()
+
+  ; AN EVENT STAMPED WITH A GENERATION THAT HAS BEEN LEFT BEHIND IS NOT
+  ; DELIVERED. It is accepted by Push - losing that race is normal, not
+  ; a producer defect - and dies once, at delivery, where it is counted.
+  i = InputStaleDropped()
+  InputEventInit(@ev, #AIE_TEXT, #AIS_TOUCH_KEYBOARD, 65, 0)
+  PokeL(@ev + #AIE_EV_GEN, InputFocusGeneration() - 1)
+  If InputEventsPush(@ev) <> #AIE_OK : ProcedureReturn 505 : EndIf
+  If InputEventsQueued() <> 1 : ProcedureReturn 506 : EndIf
+  If InputEventsPop(@ev) <> 0 : ProcedureReturn 507 : EndIf
+  If InputStaleDropped() <> i + 1 : ProcedureReturn 508 : EndIf
+  ; A current one, pushed straight after, still arrives.
+  If GatePushEvent(#AIE_TEXT, #AIS_TOUCH_KEYBOARD, 66) <> #AIE_OK : ProcedureReturn 509 : EndIf
+  If InputEventsPop(@ev) <> 1 : ProcedureReturn 510 : EndIf
+  If PeekL(@ev + #AIE_EV_CODE) <> 66 : ProcedureReturn 511 : EndIf
+
+  ; ====================================================================
+  ;  PART F - NO KEY RELEASE IS DROPPED ON THE WAY TO THE EDITOR
+  ; ====================================================================
+  GateDrain()
+  TextEditBegin()
+  ups = TextEditKeyUps()
+  i = 0
+  While i < 12
+    If GatePushEvent(#AIE_KEY_DOWN, #AIS_TOUCH_KEYBOARD, #AIK_LEFT) <> #AIE_OK : ProcedureReturn 600 : EndIf
+    If GatePushEvent(#AIE_KEY_UP, #AIS_TOUCH_KEYBOARD, #AIK_LEFT) <> #AIE_OK : ProcedureReturn 601 : EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While InputEventsPop(@ev) = 1
+    If PeekL(@ev + #AIE_EV_KIND) = #AIE_KEY_UP
+      TextEditKeyRelease(PeekL(@ev + #AIE_EV_CODE))
+      i = i + 1
+    EndIf
+  Wend
+  If i <> 12 : ProcedureReturn 602 : EndIf
+  If TextEditKeyUps() <> ups + 12 : ProcedureReturn 603 : EndIf
+  ; A release naming a key that does not exist is refused, not counted.
+  If TextEditKeyRelease(#AIK_MAX + 1) <> #AIE_ERR_CODE : ProcedureReturn 604 : EndIf
+  If TextEditKeyUps() <> ups + 12 : ProcedureReturn 605 : EndIf
+
+  ; ====================================================================
+  ;  PART G - ONE DISPATCHER, FOCUS AND CAPTURE
+  ; ====================================================================
+  InputCancelAll(#AIC_LAYOUT_CHANGE)
+  GateDrain()
+  InputRegionClear(#AIO_KEYBOARD)
+  InputRegionClear(#AIO_UI)
+
+  ; With nothing installed, every contact is the pointer's.
+  If InputTouchDispatch(10, 10, 1, #AIT_DOWN, Ticks(), 40) <> #AIO_POINTER : ProcedureReturn 700 : EndIf
+  If InputCaptureOwner(1) <> #AIO_POINTER : ProcedureReturn 701 : EndIf
+  If InputTouchQueued(#AIO_POINTER) <> 1 : ProcedureReturn 702 : EndIf
+  If InputTouchDispatch(10, 12, 1, #AIT_UP, Ticks(), -1) <> #AIO_POINTER : ProcedureReturn 703 : EndIf
+  ; THE OWNER GETS ITS OWN RELEASE, and only then loses the contact.
+  If InputTouchQueued(#AIO_POINTER) <> 2 : ProcedureReturn 704 : EndIf
+  If InputCaptureOwner(1) <> #AIO_NONE : ProcedureReturn 705 : EndIf
+  While InputTouchPop(#AIO_POINTER, @tev) = 1
+  Wend
+
+  ; Install a keyboard rectangle across the bottom of a 800x480 surface.
+  If InputRegionSet(#AIO_KEYBOARD, 0, 288, 800, 192) <> #AIE_OK : ProcedureReturn 706 : EndIf
+  If InputRegionSet(#AIO_KEYBOARD, 0, 288, 0, 192) <> #AIE_ERR_ARG : ProcedureReturn 707 : EndIf
+  If InputRegionSet(99, 0, 0, 10, 10) <> #AIE_ERR_OWNER : ProcedureReturn 708 : EndIf
+  If InputRegionOwnerAt(400, 300) <> #AIO_KEYBOARD : ProcedureReturn 709 : EndIf
+  If InputRegionOwnerAt(400, 287) <> #AIO_POINTER : ProcedureReturn 710 : EndIf
+  If InputRegionOwnerAt(800, 300) <> #AIO_POINTER : ProcedureReturn 711 : EndIf
+  If InputRegionOwnerAt(0, 288) <> #AIO_KEYBOARD : ProcedureReturn 712 : EndIf
+  If InputRegionOwnerAt(799, 479) <> #AIO_KEYBOARD : ProcedureReturn 713 : EndIf
+
+  ; A DOWN INSIDE THE KEYBOARD BELONGS TO IT UNTIL THE FINGER LIFTS -
+  ; EVEN DRAGGED OUTSIDE - and it must not click through.
+  If InputTouchDispatch(100, 400, 5, #AIT_DOWN, Ticks(), 50) <> #AIO_KEYBOARD : ProcedureReturn 714 : EndIf
+  If InputTouchDispatch(100, 100, 5, #AIT_MOVE, Ticks(), 50) <> #AIO_KEYBOARD : ProcedureReturn 715 : EndIf
+  If InputTouchQueued(#AIO_POINTER) <> 0 : ProcedureReturn 716 : EndIf
+  If InputTouchDispatch(100, 90, 5, #AIT_UP, Ticks(), -1) <> #AIO_KEYBOARD : ProcedureReturn 717 : EndIf
+  If InputTouchQueued(#AIO_KEYBOARD) <> 3 : ProcedureReturn 718 : EndIf
+  If InputCaptureOwner(5) <> #AIO_NONE : ProcedureReturn 719 : EndIf
+  ; and the records carry what the board handed over, untransformed.
+  If InputTouchPop(#AIO_KEYBOARD, @tev) <> 1 : ProcedureReturn 720 : EndIf
+  If PeekL(@tev + #AIT_EV_X) <> 100 : ProcedureReturn 721 : EndIf
+  If PeekL(@tev + #AIT_EV_Y) <> 400 : ProcedureReturn 722 : EndIf
+  If PeekL(@tev + #AIT_EV_ID) <> 5 : ProcedureReturn 723 : EndIf
+  If PeekL(@tev + #AIT_EV_ST) <> #AIT_DOWN : ProcedureReturn 724 : EndIf
+  If PeekL(@tev + #AIT_EV_PRES) <> 50 : ProcedureReturn 725 : EndIf
+  If PeekL(@tev + #AIT_EV_OWNER) <> #AIO_KEYBOARD : ProcedureReturn 726 : EndIf
+  If PeekI(@tev + #AIT_EV_TICK) = 0 : ProcedureReturn 727 : EndIf
+  While InputTouchPop(#AIO_KEYBOARD, @tev) = 1
+  Wend
+
+  ; STARTING OUTSIDE AND SLIDING IN DOES NOT MANUFACTURE A KEYPRESS.
+  If InputTouchDispatch(400, 100, 6, #AIT_DOWN, Ticks(), 50) <> #AIO_POINTER : ProcedureReturn 728 : EndIf
+  If InputTouchDispatch(400, 400, 6, #AIT_MOVE, Ticks(), 50) <> #AIO_POINTER : ProcedureReturn 729 : EndIf
+  If InputTouchQueued(#AIO_KEYBOARD) <> 0 : ProcedureReturn 730 : EndIf
+  If InputTouchDispatch(400, 400, 6, #AIT_UP, Ticks(), -1) <> #AIO_POINTER : ProcedureReturn 731 : EndIf
+  While InputTouchPop(#AIO_POINTER, @tev) = 1
+  Wend
+
+  ; A MOVE for a contact nothing ever owned is routed nowhere.
+  If InputTouchDispatch(400, 400, 77, #AIT_MOVE, Ticks(), 50) <> #AIO_NONE : ProcedureReturn 732 : EndIf
+  If InputTouchQueued(#AIO_KEYBOARD) <> 0 : ProcedureReturn 733 : EndIf
+  If InputTouchQueued(#AIO_POINTER) <> 0 : ProcedureReturn 734 : EndIf
+  ; A state hal.pbi does not define is routed nowhere either.
+  If InputTouchDispatch(400, 400, 78, 99, Ticks(), 50) <> #AIO_NONE : ProcedureReturn 735 : EndIf
+
+  ; NOBODY STEALS A CONTACT MID-GESTURE.
+  If InputTouchDispatch(100, 400, 8, #AIT_DOWN, Ticks(), 50) <> #AIO_KEYBOARD : ProcedureReturn 736 : EndIf
+  If InputCaptureBegin(8, #AIO_POINTER) <> #AIE_ERR_CAPTURED : ProcedureReturn 737 : EndIf
+  If InputCaptureOwner(8) <> #AIO_KEYBOARD : ProcedureReturn 738 : EndIf
+  ; The SAME owner re-claiming is idempotent - a controller that
+  ; re-reports a frame must not be an error.
+  If InputCaptureBegin(8, #AIO_KEYBOARD) <> #AIE_OK : ProcedureReturn 739 : EndIf
+  If InputCaptureCount() <> 1 : ProcedureReturn 740 : EndIf
+  If InputCaptureBegin(9, 0) <> #AIE_ERR_OWNER : ProcedureReturn 741 : EndIf
+
+  ; RECONCILE AGAINST THE CONTACTS THAT ARE DOWN NOW. Contact 8's UP is
+  ; never delivered; the sweep releases it and queues a CANCEL - not an
+  ; UP, because hal.pbi is explicit that a lost contact is not a release.
+  While InputTouchPop(#AIO_KEYBOARD, @tev) = 1
+  Wend
+  InputCaptureReconcileBegin()
+  InputCaptureReconcileEnd(#AIC_CONTACT_LOST)
+  If InputCaptureOwner(8) <> #AIO_NONE : ProcedureReturn 742 : EndIf
+  If InputCaptureCount() <> 0 : ProcedureReturn 743 : EndIf
+  If InputTouchPop(#AIO_KEYBOARD, @tev) <> 1 : ProcedureReturn 744 : EndIf
+  If PeekL(@tev + #AIT_EV_ST) <> #AIT_CANCEL : ProcedureReturn 745 : EndIf
+  If PeekL(@tev + #AIT_EV_ID) <> 8 : ProcedureReturn 746 : EndIf
+  If InputCancelReason() <> #AIC_CONTACT_LOST : ProcedureReturn 747 : EndIf
+
+  ; A contact the controller still reports is KEPT by the same sweep.
+  If InputTouchDispatch(100, 400, 11, #AIT_DOWN, Ticks(), 50) <> #AIO_KEYBOARD : ProcedureReturn 748 : EndIf
+  InputCaptureReconcileBegin()
+  InputCaptureSeen(11)
+  InputCaptureReconcileEnd(#AIC_CONTACT_LOST)
+  If InputCaptureOwner(11) <> #AIO_KEYBOARD : ProcedureReturn 749 : EndIf
+  InputCaptureEnd(11)
+
+  ; TEN CONTACTS FIT AND AN ELEVENTH IS REFUSED RATHER THAN SILENTLY
+  ; GIVEN TO SOMEBODY.
+  i = 0
+  While i < #AIT_MAXCONTACTS
+    If InputTouchDispatch(100, 400, 20 + i, #AIT_DOWN, Ticks(), 50) <> #AIO_KEYBOARD
+      ProcedureReturn 750
+    EndIf
+    i = i + 1
+  Wend
+  If InputCaptureCount() <> #AIT_MAXCONTACTS : ProcedureReturn 751 : EndIf
+  If InputTouchDispatch(100, 400, 99, #AIT_DOWN, Ticks(), 50) <> #AIO_NONE : ProcedureReturn 752 : EndIf
+  If InputCaptureOwner(99) <> #AIO_NONE : ProcedureReturn 753 : EndIf
+
+  ; A cancellation releases every one of them, and the keyboard's lane
+  ; is emptied with the rest.
+  InputCancelAll(#AIC_TOUCH_LOST)
+  If InputCaptureCount() <> 0 : ProcedureReturn 754 : EndIf
+  If InputTouchQueued(#AIO_KEYBOARD) <> 0 : ProcedureReturn 755 : EndIf
+  If InputCancelReason() <> #AIC_TOUCH_LOST : ProcedureReturn 756 : EndIf
+
+  ; Hiding the keyboard hands the same pixel back to the pointer.
+  InputRegionClear(#AIO_KEYBOARD)
+  If InputRegionOwnerAt(400, 400) <> #AIO_POINTER : ProcedureReturn 757 : EndIf
+  ; A surface above the keyboard wins the same pixel while it is there.
+  InputRegionSet(#AIO_KEYBOARD, 0, 288, 800, 192)
+  InputRegionSet(#AIO_UI, 0, 0, 800, 480)
+  If InputRegionOwnerAt(400, 400) <> #AIO_UI : ProcedureReturn 758 : EndIf
+  InputRegionClear(#AIO_UI)
+  If InputRegionOwnerAt(400, 400) <> #AIO_KEYBOARD : ProcedureReturn 759 : EndIf
+  InputRegionClear(#AIO_KEYBOARD)
+
+  ; ====================================================================
+  ;  PART H - AND THE BYTE PATH STILL WORKS AFTER ALL OF THAT
+  ; ====================================================================
+  GateDrain()
+  gLastCR = 0
+  gate_refLastCR = 0
+  GateStreamBegin()
+  GateStreamStr("memory 0x200000 16")
+  GateStreamPut(13)
+  rc = GateScenario(800)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ProcedureReturn 0
+EndProcedure

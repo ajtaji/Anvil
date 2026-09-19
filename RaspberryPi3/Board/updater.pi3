@@ -1,0 +1,44 @@
+; Autonomous serial + Ethernet update monitor slot; no full Anvil claim.
+; load0x200000 BSS0x1100000 stack0x1F00000; staged container>=0x2000000.
+LoadAddress $200000
+BssAddress $1100000
+StackAddress $1F00000
+#ANVIL_BUILD = 26 ; pmf:build
+#ANVIL_BUILD_DATE = 20260918 ; pmf:builddate
+#ANVIL_BUILD_TIME = 205342 ; pmf:buildtime
+XIncludeFile "RaspberryPi3/Board/update_boot_support.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_native.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_host_core.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_host_init.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_transfer.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_control.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_enumeration.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_transport.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_runtime.pbi"
+; The network files are buffer codecs/state machines with no board I/O. The
+; one constant they require is the canonical Anvil HAL value; the integration
+; gate compares it to hal.pbi without pulling the monitor's printing seam in.
+#HW_LINK_NONE = 0
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "Anvil/Network/dhcp.pbi"
+XIncludeFile "RaspberryPi3/Board/usb_diagnostic.pbi"
+XIncludeFile "RaspberryPi3/Board/ethernet_update.pbi"
+Procedure Main()
+  ; Identity comes from the loader's CRC-protected fixed handoff, not newest
+  ; disk generation or argument registers consumed by the cold startup.
+  pi3_dtb = $1000000
+  ; The loader left PL011 configured. This is the first source-level action,
+  ; before SD context, mailbox, mount or confirmation can refuse or wait.
+  pi3ut_WriteLine("C0: candidate Main entered")
+  If Pi3UpdateBootStart(0) = 0 : Pi3Park() : EndIf
+  If pi3ut_WriteLine("Pi3 update prompt ready; confirming running generation") = 0 : Pi3Park() : EndIf
+  If Pi3UpdateConfirmHandoff() = 0 : Pi3Say("STOP: running generation not confirmed") : Pi3Park() : EndIf
+  If Pi3UpdateWatchdogStop() = 0 : Pi3Say("STOP: trial watchdog remains armed") : Pi3Park() : EndIf
+  If Pi3UpdateRegisterCommand(@Pi3UsbDiagCommand)=0 : Pi3Park() : EndIf
+  If Pi3UpdateRegisterIdle(@Pi3EthernetIdle)=0 : Pi3Park() : EndIf
+  pi3ut_WriteLine("usbdiag: explicit one-shot USB diagnostic; updater recovery stays available")
+  Pi3EthernetStart()
+  Pi3UpdateServe()
+EndProcedure

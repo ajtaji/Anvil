@@ -1,0 +1,36 @@
+; Desk-only emitted transport fixture; no MMIO.
+Global lanFixtureCalls.i
+Global p3usb_transfer_actual.i
+Global p3usb_transfer_next_pid.i
+Procedure.i Pi3UsbChannelTransfer(channel.i,deviceAddress.i,endpointAddress.i,endpointType.i,maxPacket.i,lowSpeed.i,dmaBusAddress.i,byteCount.i,pid.i,timeoutUs.i)
+  lanFixtureCalls+1 : p3usb_transfer_actual=byteCount : p3usb_transfer_next_pid=pid
+  If byteCount=4 And endpointAddress=$80
+    PokeA($02001000,$34) : PokeA($02001001,$12) : PokeA($02001002,$00) : PokeA($02001003,$EC)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+XIncludeFile "RaspberryPi3/Lib/usb_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_control.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_enumeration.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_transport.pbi"
+Procedure.i Main()
+  Protected operation.i=PeekI($06000000)
+  If operation=1 : ProcedureReturn Pi3LanMiiCommand(1,3,0) : EndIf
+  If operation=2
+    PokeA($02002000,2):PokeA($02002001,$11):PokeA($02002002,$22)
+    PokeA($02002003,$33):PokeA($02002004,$44):PokeA($02002005,$55)
+    ProcedureReturn Pi3LanMacValid($02002000)
+  EndIf
+  If operation=3
+    p3usb_enum_lan_address=2 : p3usb_lan_bulk_in=$81 : p3usb_lan_bulk_out=2
+    If Pi3LanTransportAttach(3,2,$02000000,$C0200000,$02001000,$C0201000,2,50000)<>1 : ProcedureReturn -1 : EndIf
+    If Pi3LanRegisterBegin(0,1,0)<>1 : ProcedureReturn -2 : EndIf
+    If Pi3LanRegisterStep()<>#P3_LAN_IO_PROGRESS : ProcedureReturn -3 : EndIf
+    If Pi3LanRegisterStep()<>#P3_LAN_IO_PROGRESS : ProcedureReturn -4 : EndIf
+    If Pi3LanRegisterStep()<>#P3_LAN_IO_DONE : ProcedureReturn -5 : EndIf
+    If lanFixtureCalls<>3 : ProcedureReturn -6 : EndIf
+    ProcedureReturn p3lan_reg_value
+  EndIf
+  ProcedureReturn -99
+EndProcedure

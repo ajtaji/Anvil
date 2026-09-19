@@ -1,0 +1,2589 @@
+; pi4WifiJoin.pi4 - associate with a WPA2 network and prove the link.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is pi4WifiScan's sibling and it deliberately repeats that file's
+; whole bring-up rather than sharing it. The two differ ONLY from the
+; event mask onwards, and a shared bring-up would mean one file's
+; failure could be caused by the other's edit - which is precisely the
+; property a bring-up instrument must not have. Where a passage below is
+; word-for-word pi4WifiScan's, that is on purpose and it is marked.
+;
+; ======================================================================
+; ARM THE DEADMAN. `deadman 15` BEFORE `run`. EVERY TIME.
+; ======================================================================
+; The arithmetic is tighter here than in the scan, so it is worth the
+; paragraph:
+;
+;   NOTE 2026-08-28: the nine-vector crypto block that used to run
+;   before all of this is GONE from the run path - it measured 15,497 ms
+;   on the board against an estimate of "about a tenth of a second", and
+;   the deadman fired with the radio still cold. See section 0.
+;
+;   bring-up      609,312 bytes uploaded and read back      ~1 to 2 s
+;   the scan      #SCAN_BUDGET_MS below                     up to 5 s
+;   security      nine ioctls plus a 103 ms settle          ~0.2 s
+;   the join      the library's own guards, worst case      up to 12 s
+;                                                           ------------
+;                                                     worst case ~19 s
+;
+; NINETEEN AGAINST FIFTEEN. THE WORST CASE DOES NOT FIT AND THAT IS
+; STATED RATHER THAN HIDDEN, because a payload whose budget only works
+; when nothing goes wrong is a payload that resets the board on the one
+; run you needed to watch.
+;
+; WHAT THE WORST CASE ACTUALLY IS: a five-second keying stall
+; (#CYW43_JOINFAIL_KEYTIMEOUT) plus the association walk. On the twin's
+; bench the MEDIAN join with a clean teardown was 2677 ms and the worst
+; was 4571 ms; the five-second stalls all came from an access point
+; still holding a stale association for a board that had vanished while
+; joined. The FIRST join after a cold radio has no such stale state to
+; clear, so the expected total here is around nine seconds.
+;
+; AND IF IT OVERRUNS, THE DEADMAN IS THE RIGHT ANSWER rather than a
+; failure of planning. The board resets itself back into the firmware
+; and comes back on its own; the cost is a re-run. Unarmed, the same
+; overrun wedges the board and needs somebody to reach for the mains,
+; because U-Boot is gone from the stick (pi4Install.pi4:1-52). The
+; elapsed-ms rows this file prints at every phase exist so that the
+; nineteen above stops being arithmetic and becomes a measurement.
+;
+; ======================================================================
+; WHAT TO TYPE, IN THIS ORDER
+; ======================================================================
+;     pmf> screen off
+;     pmf> load BRCMFW.BIN  1000000
+;     pmf> load BRCMNV.TXT  1200000
+;     pmf> load BRCMCLM.BLB 1300000
+;     pmf> fill 1400000 0 800
+;     pmf> load SETTINGS.TXT 1400000
+;     pmf> deadman 15
+;     pmf> map              <- it prints `stage a file at <stage>`. An
+;                              image is the same bytes at any --load-addr.
+;     pmf> run <stage>
+;
+; `screen off` IS IN THE LIST FOR A MEASURED REASON. On 2026-08-28,
+; after a deadman reset, Anvil came back with the HDMI framebuffer
+; enabled and the very next run of this payload could not get an answer
+; out of the mailbox: `MailboxClockRate(1)` returned zero and the run
+; stopped at "the firmware would not report the EMMC clock" with the
+; radio never touched. pi4WifiKey.pi4 retries that query and prints
+; each attempt; this file still asks once, so turn the screen off.
+;
+; THE `fill` LINE IS NOT OPTIONAL AND IT IS NOT TIDINESS. A payload
+; takes no arguments, so it cannot be told how long SETTINGS.TXT is -
+; Anvil's `load` knows and prints it, and nothing carries that number
+; across the jump. Zeroing 800 hex words (8 KB) first means the file's
+; last byte is followed by a NUL, so the payload can find the end by
+; scanning, and a scan that finds no NUL inside the window is a REFUSAL
+; rather than a guess. Skip the fill and the payload will parse the file
+; plus whatever DRAM junk follows it, and settings.pi4 will refuse the
+; first junk line - reporting a syntax error on a line that is not in
+; the file.
+;
+; ======================================================================
+; THE PASSPHRASE IS NOT IN THIS FILE AND MUST NEVER BE PUT IN IT
+; ======================================================================
+; It lives in SETTINGS.TXT on the boot medium, which is not in the
+; repository, and it reaches this payload only by being read off the
+; stick into DRAM by Anvil. Nothing on the host ever sees it. Type it
+; once at the console with `wifi password` and `settings save`, and it
+; stays on the stick.
+;
+; THIS FILE PRINTS THE SSID IT CHOSE, THE SLOT IT CAME FROM AND THE
+; PASSPHRASE'S LENGTH - and never a byte of the passphrase itself. The
+; length is the useful half: "8 characters" against a passphrase you
+; know is thirteen names the fault without putting a credential in a
+; serial log that ends up pasted into a report.
+;
+; ======================================================================
+; WHAT SUCCESS LOOKS LIKE, IN ORDER
+; ======================================================================
+;   1. the scan finds a stored network, and this file names it BY BSSID
+;   2. the security block is accepted - and item 2 of it is the
+;      experiment that settles who runs the supplicant
+;   3. association completes: SET_SSID 0, AUTH 0, LINK flags bit 0,
+;      PSK_SUP 6, and the accumulator reaches $0E01
+;   4. the firmware reads back a BSSID that MATCHES THE ONE WE CHOSE,
+;      an SSID, a channel and an RSSI
+;
+; Every event is printed as it arrives, with its raw type, status,
+; reason and flags, because nothing on this part has ever been measured
+; and the ORDER is a bench fact this run is here to establish.
+;
+; ======================================================================
+; THIS FILE ASSOCIATES. IT DOES NOT KEY. pi4WifiKey.pi4 DOES.
+; ======================================================================
+; Written 2026-08-28, once the reason for finding 3 below was settled.
+; The 43455 firmware image on this bench is built WITHOUT `idsup`, the
+; in-dongle supplicant - its own component list says so, beside the
+; Pico's which does have it - so there is no supplicant in the radio to
+; hand a passphrase to, and there never was. The four refusals recorded
+; in finding 3 are one fact arriving four times.
+;
+; The four-way handshake therefore runs in the HOST, in
+; RaspberryPi4/Lib/wpa2sup.pi4, driven by
+; Examples/Diagnostics/pi4WifiKey.pi4. THIS file keeps its job: the
+; scan, the selection ladder, the association and the event trace, plus
+; the three questions a host supplicant needs answered (section 10b).
+; It is the instrument for "did we associate and why not"; the other
+; one is the instrument for "is the link keyed".
+;
+; ======================================================================
+; WHAT THIS FILE MEASURED ON 2026-08-27, ON SILICON. READ IT BEFORE
+; RE-DERIVING ANY OF IT.
+; ======================================================================
+;
+; 1. THE 2.4 GHz NETWORK ASSOCIATES. Two events, seven milliseconds
+;    apart, and then four independent read-backs agreed:
+;
+;      [t+8054 ms] event  3 AUTH status 0 reason 0 flags $0000 state $0A01
+;      [t+8061 ms] event 16 LINK status 0 reason 0 flags $0001 state $0E01
+;      WLC_GET_BSSID   04:42:1A:A5:BC:90   - the BSSID we CHOSE
+;      WLC_GET_SSID    ajtaji              - matches
+;      WLC_GET_CHANNEL 2                   - matches the scan
+;      WLC_GET_RSSI    -35 dBm             - against the scan's -33
+;
+;    The same ioctl answered -17 BCME_NOTASSOCIATED before the join, so
+;    the second reading means something.
+;
+;    NOTE WHAT DID **NOT** ARRIVE: no SET_SSID status 0, and no PSK_SUP.
+;    The accumulator reached $0E01 on AUTH plus LINK plus a PRESET KEYED
+;    bit, and the preset is the whole reason it could. See
+;    #CYW43_JOINEXP_NOKEY in cyw43.pi4. THIS LINK HAS NO PAIRWISE KEY.
+;
+; 2. THE 5 GHz NETWORK IS REFUSED BY THE ACCESS POINT, and the code says
+;    exactly why:
+;
+;      [t+8094 ms] event 3 AUTH  status 0 reason 0
+;      [t+8101 ms] event 7 ASSOC status 1 reason 43
+;
+;    43 is AKMP_NOT_VALID. Not the channel, not the signal, and NOT DFS
+;    - a session was nearly spent on the DFS theory before event 7 was
+;    added to the mask, and event 7 answered it in one line. The 5 GHz
+;    radio does not accept the one key-management suite this driver
+;    offers. It wants SAE, or PSK-SHA256 with management frame
+;    protection. `bsscfg:wpa_auth` is the knob and this file has exactly
+;    one value to put in it.
+;
+; 2b. WHAT SAE WOULD COST, WRITTEN DOWN SO NOBODY HAS TO GUESS TWICE.
+;    NOT STARTED, DELIBERATELY. This is a scope note, not a plan.
+;
+;    THE FIRST QUESTION IS FREE AND HAS NOT BEEN ASKED. brcmfmac probes
+;    the firmware for SAE with a single iovar named "sae" -
+;    Reference/v6.12_brcmfmac_feature.c:45, in the same table that
+;    drives every other capability - and it carries an SAE password
+;    ioctl whose struct is Reference/v6.12_brcmfmac_fwil_types.h:596,
+;    a length plus 128 key bytes. ONE GET_VAR ANSWERS WHETHER THIS
+;    FIRMWARE HAS SAE AT ALL, and it costs one ioctl on the next bench
+;    run. Everything below assumes the answer is no, because this image
+;    also has no WPA2 supplicant and an image with SAE but no PSK
+;    supplicant would be a very strange build. IF THE ANSWER IS YES the
+;    cost collapses to sending a password and the rest of this note is
+;    void, which is exactly why the question is worth one ioctl.
+;
+;    IF THE HOST HAS TO RUN SAE, the bill is, in order of nastiness:
+;
+;    a) MANAGEMENT FRAMES, AND THIS IS THE ONE THAT DECIDES IT. SAE's
+;       Commit and Confirm are carried in 802.11 AUTHENTICATION frames
+;       with authentication algorithm 3 - not data frames. cyw43.pi4's
+;       data path (section 9) carries 802.3 frames on SDPCM channel 2
+;       and cannot express an authentication frame at all. Linux does
+;       external SAE by having the firmware hand AUTH frames up as
+;       events and taking them back down through a vendor path; that
+;       needs firmware support this image has not been shown to have.
+;       If the firmware will not pass AUTH frames to the host, THERE IS
+;       NO AMOUNT OF ARITHMETIC THAT MAKES SAE POSSIBLE HERE, and every
+;       item below is wasted. Establish (a) before writing any of it.
+;
+;    b) P-256. Group 19 is the default and the only one worth doing.
+;       The RP2350 tree already has the arithmetic - bignum.pico2,
+;       ec256.pico2, x25519.pico2 - and none of it is ported to this
+;       target. That is a real port, not a copy: RaspberryPi4/Lib's
+;       sha256.pi4 header records what a 64-bit .i did to a 32-bit
+;       word algorithm, and a bignum library is nothing but 32-bit
+;       word assumptions.
+;
+;    c) HASH TO ELEMENT. WPA3 now requires H2E, which is the simplified
+;       SWU map of RFC 9380 plus expand_message_xmd over SHA-256. We
+;       HAVE SHA-256, HMAC-SHA256 and HKDF on this target already
+;       (sha256.pi4, hmac.pi4, hkdf.pi4), so this is the cheapest item
+;       on the list. The older hunting-and-pecking loop is what
+;       Dragonblood broke and must not be written.
+;
+;    d) THE FOUR-WAY HANDSHAKE STILL HAPPENS AFTERWARDS. SAE produces a
+;       PMK; everything after that is the same RSN key management
+;       WPA2-PSK needs, including the AES key wrap of the GTK in
+;       message 3. So SAE is strictly ADDITIONAL to the WPA2 work, not
+;       an alternative route to it.
+;
+;    e) WPA3 MANDATES PROTECTED MANAGEMENT FRAMES, which means
+;       BIP-CMAC-128 and therefore AES-CMAC, and `mfp` is one of the
+;       iovars this firmware already refuses (item 7 in the security
+;       block below).
+;
+;    THE HONEST SUMMARY: (a) is a yes/no question that costs one ioctl
+;    and gates the other four items completely. Ask it before costing
+;    anything else.
+;
+; 3. THERE IS NO SUPPLICANT IN THIS FIRMWARE. `bsscfg:sup_wpa`,
+;    `bsscfg:sup_wpa2_eapver` and `bsscfg:sup_wpa_tmo` all answer -23
+;    BCME_UNSUPPORTED, the bare `sup_wpa` existence probe answers -23,
+;    and WLC_SET_WSEC_PMK answers -2 BCME_BADARG at BOTH documented
+;    struct sizes, 68 and 132. Four independent refusals.
+;
+; 4. THE SELECTION RULE WAS CONSISTENT AND UNHELPFUL. With all four
+;    networks stored it picked ajtaji_5G, which cannot associate; with
+;    the 5 GHz slot removed it picked ajtaji, which does. The rule had
+;    no retry - one choice, and it lived with it.
+;
+;    FIXED 2026-08-28 BY A LADDER, and the fix is not a second rule.
+;    probe_BuildLadder applies the SAME three-tier rule repeatedly to
+;    the candidates not yet tried, so rung 0 is exactly the choice the
+;    single-choice code made and rung k is exactly what it would have
+;    chosen with the first k removed. The join walks the ladder and
+;    falls through ONLY on a failure a different network could fix -
+;    ASSOC, PRUNE and NONET, and nothing else. See probe_FallThrough
+;    for why WRONGPASS, KEYTIMEOUT and TIMEOUT are excluded, and
+;    #JOIN_LADDER_BUDGET_MS for the clock that stops it.
+;
+;    *** NOT YET RUN ON SILICON. *** Everything above in this list was
+;    measured on the board; this is not. The bench run that proves it
+;    is the one where rung 0 is ajtaji_5G, the log shows status 43, and
+;    rung 1 is ajtaji and associates. Until that log exists this is a
+;    change that compiles.
+
+; THE SETTINGS STORE NAMES NO OTHER FILE - house rule 10, a library never
+; includes a library - so ITS dependencies are listed here, in this order,
+; by the main program. Anvil/Core/settings.pi4 is chip-free core and
+; reaches a medium only through the HwFile* seam: Anvil/Hal/hal.pi4
+; declares that seam's #HW_FILE_* codes, and Anvil/Storage/hwfile.pbi
+; is THIS board's backend for it, written over fat.pi4. Both come before
+; the store, exactly as the store's own USE block and
+; pi4SettingsSelfTest.pi4 have it. hal.pi4's RequireCap prints a refusal
+; and so names Print/PrintN/UartWriteStr, which is why uart.pi4 stays
+; first.
+;
+; This program only ever calls SettingsParse() against the window Anvil's
+; `load` filled, so none of that machinery ever executes here - but a file
+; is compiled whole and every name in it has to resolve.
+;
+; LOSING THESE TWO LINES IS WHAT STOPPED THIS PROGRAM BUILDING. The store
+; moved out of RaspberryPi4/Lib and onto the seam on 2026-09-02 (commit
+; 8e17a6f1); the XIncludeFile below was given its new path and nothing
+; else was added, so #HW_FILE_OK resolved nowhere in this translation
+; unit. The monitor (RaspberryPi4/Board/board.pi4) and the settings gate
+; (pi4SettingsSelfTest.pi4) both already listed the two files, which is
+; why the identical library built there and only these two diagnostics
+; broke. tools/a64/a64_diag_build_check.py builds every diagnostic in
+; this directory so the next such omission is caught the same day.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"          ; Ticks/TickHz for the wall clock
+XIncludeFile "Anvil/Core/wallclock.pbi"            ; hwfile.pbi stamps changes with it
+XIncludeFile "Anvil/Storage/hwfile.pbi"
+XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "RaspberryPi4/Lib/sha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/hmacsha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/pbkdf2.pi4"
+
+; ----------------------------------------------------------------------
+;  Where Anvil's `load` put each file. The three blob addresses, lengths
+;  and CRCs are pi4WifiScan's, unchanged, and they were measured on the
+;  board by reading each file back off the stick.
+; ----------------------------------------------------------------------
+#FW_ADDR = $01000000
+#FW_LEN  = 609309
+#FW_CRC  = $B8B12CED
+
+#NV_ADDR = $01200000
+#NV_LEN  = 2074
+#NV_CRC  = $2BDBDDF6
+
+#CLM_ADDR = $01300000
+#CLM_LEN  = 2676
+#CLM_CRC  = $346D4B26
+
+; SETTINGS.TXT. NO CRC, and the absence is deliberate rather than an
+; oversight: the other three files are fixed vendor blobs whose bytes
+; are known, and this one is edited by a person at the console. A
+; constant here would fail on the first legitimate edit and would train
+; whoever met it to delete the check.
+;
+; 8 KB of window against settings.pi4's #SET_TEXT_MAX of 6144 - the
+; largest file that library will ever write - with room for the banner
+; and a hand-added comment or two.
+#SET_ADDR = $01400000
+#SET_WIN  = 8192
+
+; Working buffers, placed after the blobs. pi4WifiScan's, unchanged.
+#NV_WORK      = $01210000
+#NV_WORK_MAX  = 4096
+#SCRATCH      = $01220000
+#SCRATCH_LEN  = 2048
+
+; Mailbox clock id 1 = EMMC. NOT 12, which is EMMC2's - they are
+; different clocks with different rates and the wrong one produces a bus
+; that almost works.
+#CLOCK_ID_EMMC = 1
+
+; ----------------------------------------------------------------------
+;  The scan's budget. FIVE SECONDS HERE AND NOT THE SCAN INSTRUMENT'S
+;  EIGHT, and the difference is bought rather than assumed: the measured
+;  scan on this board took 56 slices of 50 ms, which is 2.8 s, so five
+;  is a margin of nearly two on the observed time. The three seconds
+;  saved go into the join's budget, which is the part with no headroom.
+; ----------------------------------------------------------------------
+#SCAN_BUDGET_MS = 5000
+#SCAN_SLICE_MS  = 50
+
+; The join's polling slice. SHORTER THAN THE SCAN'S, because a join
+; produces four to six events over several seconds rather than a burst,
+; and a long slice spends most of itself waiting after the event that
+; ended it has already been recorded.
+#JOIN_SLICE_MS = 20
+
+; The caller's own ceiling on the join loop, in slices. THE LIBRARY OWNS
+; THE REAL GUARDS - #CYW43_JOIN_TOTAL_MS and the two phase budgets - and
+; this is only the belt to their braces: a Cyw43JoinPoll that somehow
+; never returned a verdict would otherwise spin until the deadman fired,
+; and a deadman reset tells you nothing while a printed "the poll loop
+; hit its own ceiling" tells you exactly which layer failed.
+#JOIN_MAX_SLICES = 900
+
+; ======================================================================
+;  THE SELECTION RULE, AND IT IS A RULE RATHER THAN A LOOP ORDER.
+;
+;  PREFER 5 GHz, UNLESS IT IS TOO WEAK - THEN FALL BACK TO 2.4 GHz.
+;
+;  THE RULE IS NOT "PICK THE STRONGER" AND THAT DISTINCTION IS THE WHOLE
+;  POINT. At this bench the 2.4 GHz network reads -27 dBm and the 5 GHz
+;  one -44 dBm, so a rule that compared the two numbers would choose
+;  2.4 GHz on every single run and the stated preference would never
+;  once be honoured while appearing to work perfectly. The two bands are
+;  NEVER compared against each other below. The 5 GHz candidate is
+;  compared against a FIXED FLOOR and against nothing else.
+;
+;  WHY PREFER 5 GHz AT ALL: it is far less congested, its channels are
+;  wider, and where it reaches at all it usually carries more. Its
+;  weakness is range, which is exactly what the floor is for.
+;
+;  THE FLOOR IS -70 dBm AND HERE IS WHERE THAT COMES FROM. The useful
+;  part of the range runs from about -30 dBm (excellent) to about
+;  -80 dBm (unusable), and a WPA2 link is normally healthy down to about
+;  -67 dBm, below which rate adaptation starts costing real throughput.
+;  -70 sits just under that knee. It accepts the entire normal operating
+;  range - this bench's -44 dBm passes with twenty-six decibels to spare
+;  - and rejects only a link already into the marginal band, which is
+;  the one place 2.4 GHz's better propagation is likely to win. A
+;  threshold that rejected -44 would reject the normal case, which is
+;  the failure to avoid.
+;
+;  IT IS A NAMED CONSTANT AND NOT A NUMBER IN AN `If`, because it is a
+;  judgement about radio and not a fact about this code, and the next
+;  person to disagree with it should be able to find it in one search.
+;
+;  THE BAND COMES FROM THE CONTROL CHANNEL, NOT THE CHANSPEC CENTRE.
+;  Cyw43ScanChannel() is the control channel - the one the AP is
+;  described as being on - and Cyw43ScanChanspecChannel() is the centre
+;  of a 40 or 80 MHz block, which on this bench reads 58 for a network
+;  whose control channel is 52. Channel numbers above 14 are 5 GHz.
+;  Using the centre would still give the right band here, and would be
+;  the wrong field for the same reason it was the wrong field in the
+;  scan's channel column.
+;
+;  ------------------------------------------------------------------
+;  RSSI IS SIGNED AND THIS FILE DOES NOT ASSUME IT SURVIVED THE TABLE.
+;  ------------------------------------------------------------------
+;  -44 read as an unsigned byte is 212, which is comfortably above any
+;  sane threshold - so an unsigned read makes EVERY network pass the
+;  floor and the fallback branch never fires, silently, for ever. The
+;  sign is handled at the source (cyw43_RxI16 sign-extends a 16-bit
+;  field, and cyw43_bssRssi is a 64-bit signed element), and this file
+;  CHECKS THAT RATHER THAN TRUSTING IT: probe_RssiSane below refuses any
+;  value outside -110..0 and the selection prints its verdict. A single
+;  positive RSSI in the table would fail the run with a message naming
+;  the cause, instead of quietly disabling the rule.
+;
+;  ------------------------------------------------------------------
+;  TIES ARE BROKEN BY THE STORED SLOT, WHICH IS A PERSON'S DECISION.
+;  ------------------------------------------------------------------
+;  Within a band, the winner is the candidate held in the LOWEST
+;  NUMBERED settings slot. That order was typed by somebody on purpose
+;  and it does not change with the weather; RSSI does, and two networks
+;  a decibel apart would otherwise swap places between runs and make the
+;  rule unrepeatable - which is the one thing it must not be. If the
+;  SAME slot matches two scan rows (one SSID, two access points) the
+;  stronger RSSI wins, and if those tie too the lower BSSID wins, so
+;  there is no path through this that depends on scan order.
+; ======================================================================
+#JOIN_5G_FLOOR_DBM = -70
+
+; ----------------------------------------------------------------------
+;  THE LADDER. How many candidates the run may try, and the wall clock
+;  that stops it trying more.
+;
+;  WHY A LADDER EXISTS AT ALL. Until 2026-08-28 the selection made ONE
+;  choice and lived with it, and on this bench that choice is the 5 GHz
+;  network - which refuses us with 802.11 status 43 AKMP_NOT_VALID
+;  because it wants WPA3/SAE and this driver offers WPA2-PSK. The rule
+;  was consistent and it picked the one network that cannot work. That
+;  was recorded as finding 4 at the head of this file and deliberately
+;  left standing at the time, with the note that a retry loop invented
+;  at the end of a session is how a rule stops being repeatable. This
+;  one is not invented at the end of a session: it reuses the SAME
+;  three-tier rule, applied repeatedly to what is left, so rung 0 is
+;  bit-for-bit the choice the old code made and every rung after it is
+;  the choice the old code WOULD have made with the failures removed.
+;
+;  FOUR RUNGS, NOT "ALL OF THEM". Each rung costs an association
+;  attempt, and the deadman arithmetic at the head of this file is
+;  already over budget with one. Four is the number of credentials this
+;  bench stores, so it is the point past which more rungs cannot help.
+;
+;  #JOIN_LADDER_BUDGET_MS IS THE REAL GUARD, and it is checked against
+;  the run's own clock rather than against a count. A ladder bounded
+;  only by a rung count can still overrun, because one slow rung costs
+;  as much as three fast ones; a refusal arrives in milliseconds and a
+;  timeout takes seconds, and only a clock can tell the difference
+;  after the fact. 20 000 ms is chosen to sit just beyond the ~19 s
+;  worst case the header computes, so the ladder can never be the
+;  reason the deadman fires - if the run is going to overrun, it will
+;  overrun on rung 0 for reasons that have nothing to do with this.
+; ----------------------------------------------------------------------
+#JOIN_LADDER_MAX       = 4
+#JOIN_LADDER_BUDGET_MS = 20000
+#JOIN_5G_FIRST_CHANNEL = 15    ; channel 14 is the last 2.4 GHz one
+#JOIN_RSSI_FLOOR  = -110       ; nothing real reads below this
+#JOIN_RSSI_CEIL   = 0          ; nor above this
+
+; ----------------------------------------------------------------------
+;  HOW LONG TO LISTEN FOR EAPOL MESSAGE 1 AFTER THE LINK COMES UP.
+;
+;  An authenticator sends message 1 within a few tens of milliseconds
+;  of the association response and retries it - hostapd's default is
+;  four attempts a second apart (dot11RSNAConfigPairwiseUpdateCount).
+;  2500 ms therefore covers the first frame and two retries, so a
+;  single lost frame does not read as "the AP never spoke to us".
+;
+;  IT IS NOT LONGER BECAUSE OF THE DEADMAN. Everything above this point
+;  has already spent most of fifteen seconds; a listen window that
+;  causes the reset is a window whose result nobody sees.
+; ----------------------------------------------------------------------
+#EAPOL_LISTEN_MS = 2500
+
+; Our own six bytes, from the firmware rather than from the NVRAM text.
+; A Global rather than a local because its address is taken.
+Global Dim ourMac.a[6]
+
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; PrintNl and PrintDec are uart.pi4's, at lines 1155 and 1119. Defining
+; them again is a duplicate-procedure error rather than a shadow.
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UNTRUSTED TEXT FROM THE AIR, PRINTED SAFELY.
+;
+;  An SSID is 32 arbitrary bytes chosen by whoever runs the access
+;  point. A hidden network's is all NULs; a hostile one can contain
+;  escape sequences that move the cursor, clear the screen or rewrite
+;  the lines above - which on a log that is going to be pasted into a
+;  report is a way to make this program appear to say something it did
+;  not. Byte by byte, everything outside printable ASCII replaced.
+;
+;  THE BOUND IS THE CALLER'S LENGTH AND ALSO 32. Both, because the two
+;  can disagree: the length comes from the same untrusted frame.
+; ----------------------------------------------------------------------
+Procedure PrintSsid(p.i, n.i)
+  Define j.i
+  If n <= 0
+    UartWriteStr("<hidden>")
+    ProcedureReturn 0
+  EndIf
+  If n > 32
+    n = 32
+  EndIf
+  For j = 0 To n - 1
+    If PeekA(p + j) >= 32 And PeekA(p + j) <= 126
+      UartWrite(PeekA(p + j))
+    Else
+      UartWrite(46)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PrintBssid(p.i)
+  Define j.i
+  For j = 0 To 5
+    PutHexN(PeekA(p + j) & $FF, 2)
+    If j < 5
+      UartWrite(58)
+    EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE TRANSPORT INSTRUMENT. pi4WifiScan's, word for word, including the
+;  UartDrain - which is the whole point of it. The announcement is made
+;  BEFORE the dangerous call, so if that call never returns this line is
+;  the last thing the board will ever say and it has to be out of the
+;  PL011 before the call is attempted.
+; ----------------------------------------------------------------------
+Procedure.i probe_StepName(step.i)
+  Select step
+    Case 1
+      ProcedureReturn "Cyw43WifiUp entered"
+    Case 2
+      ProcedureReturn "transport bookkeeping reset"
+    Case 3
+      ProcedureReturn "SENDING bsscfg:event_msgs"
+    Case 4
+      ProcedureReturn "event mask returned"
+    Case 5
+      ProcedureReturn "SENDING WLC_UP"
+    Case 6
+      ProcedureReturn "WLC_UP returned"
+    Case 7
+      ProcedureReturn "SENDING the escan request"
+    Case 8
+      ProcedureReturn "escan request returned"
+    Case 9
+      ProcedureReturn "no credit - draining to earn one"
+    Case 10
+      ProcedureReturn "pushing the request frame at F2"
+    Case 11
+      ProcedureReturn "WAITING for the reply"
+    Case 12
+      ProcedureReturn "the wait returned"
+    Case 13
+      ProcedureReturn "SENDING one clmload chunk"
+    Case 14
+      ProcedureReturn "every clmload chunk was accepted"
+    Case 15
+      ProcedureReturn "ASKING clmload_status"
+    Case 16
+      ProcedureReturn "clmload_status answered"
+  EndSelect
+  ProcedureReturn "unknown step - see THE TRACE SEAM in cyw43.pi4"
+EndProcedure
+
+Procedure probe_Trace(step.i)
+  UartWriteStr("  .. ")
+  PrintDec(step)
+  UartWriteStr("  ")
+  UartWriteStr(probe_StepName(step))
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  crc32 over a DRAM buffer. pi4WifiScan's, unchanged, including the
+;  run-time table build - the argument for which is in that file and is
+;  about the offline gate rather than about the board.
+; ----------------------------------------------------------------------
+#CRC32_POLY = $EDB88320
+Global Dim crcTab.l[256]
+Global crcTabReady.i = 0
+
+Procedure Crc32Init()
+  Define i.i
+  Define k.i
+  Define c.i
+  If crcTabReady = 1
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To 255
+    c = i
+    For k = 0 To 7
+      If (c & 1) = 1
+        c = (c >> 1) ! #CRC32_POLY
+      Else
+        c = c >> 1
+      EndIf
+    Next
+    crcTab[i] = c
+  Next
+  crcTabReady = 1
+EndProcedure
+
+Procedure.i Crc32(*p, n.i)
+  Define c.i
+  Define i.i
+  Define idx.i
+  Define tab.i
+  Define q.i
+  Crc32Init()
+  tab = @crcTab[0]
+  q = *p
+  c = $FFFFFFFF
+  For i = 1 To n
+    idx = (c ! PeekA(q)) & $FF
+    c = PeekN(tab + (idx << 2)) ! ((c >> 8) & $00FFFFFF)
+    q = q + 1
+  Next
+  ProcedureReturn (~c) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ELAPSED MILLISECONDS, so the deadman arithmetic in the header stops
+;  being arithmetic. CNTPCT_EL0 and CNTFRQ_EL0 directly rather than
+;  timer.pi4, because this payload already has four libraries in it and
+;  a fifth for two readings is not worth the image.
+; ----------------------------------------------------------------------
+Procedure.i probe_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i probe_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i NowMs()
+  Define hz.i
+  hz = probe_TickHz()
+  If hz < 1000
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn probe_Ticks() / (hz / 1000)
+EndProcedure
+
+Global startMs.i = 0
+
+Procedure Stamp(*what)
+  UartWriteStr("  [t+")
+  PrintDec(NowMs() - startMs)
+  UartWriteStr(" ms] ")
+  UartWriteStr(*what)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_RssiSane - is this reading a signed dBm figure at all?
+;
+;  THE CHECK EXISTS BECAUSE ITS FAILURE WOULD BE INVISIBLE. If a signed
+;  field ever reached the table unsigned, -44 would arrive as 212 or as
+;  65492, every 5 GHz candidate would clear a -70 floor, and the
+;  fallback branch of the selection rule would never execute again -
+;  with no error, no wrong number on the screen, and a rule that looks
+;  like it works. So the rule refuses to run on a value it cannot
+;  believe, and says so.
+;
+;  -110..0. Nothing real reads above 0 dBm, and -110 is below the noise
+;  floor of any receiver in this class.
+; ----------------------------------------------------------------------
+Procedure.i probe_RssiSane(v.i)
+  If v < #JOIN_RSSI_FLOOR Or v > #JOIN_RSSI_CEIL
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i probe_Is5GHz(chan.i)
+  If chan >= #JOIN_5G_FIRST_CHANNEL
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_Better - is candidate `a` a better pick than the incumbent `b`,
+;  both already known to be in the same band and both stored?
+;
+;  Lowest stored slot, then strongest RSSI, then lowest BSSID. THE THIRD
+;  TEST IS NOT PARANOIA: two access points broadcasting one SSID at the
+;  same measured strength is an ordinary mesh, and without it the winner
+;  would be whichever the scan happened to report first - which is the
+;  one thing the rule is required not to be.
+;
+;  b = -1 means there is no incumbent yet.
+; ----------------------------------------------------------------------
+Procedure.i probe_Better(a.i, slotA.i, b.i, slotB.i)
+  Define j.i
+  Define x.i
+  Define y.i
+
+  If b < 0
+    ProcedureReturn 1
+  EndIf
+  If slotA < slotB
+    ProcedureReturn 1
+  EndIf
+  If slotA > slotB
+    ProcedureReturn 0
+  EndIf
+  If Cyw43ScanRssi(a) > Cyw43ScanRssi(b)
+    ProcedureReturn 1
+  EndIf
+  If Cyw43ScanRssi(a) < Cyw43ScanRssi(b)
+    ProcedureReturn 0
+  EndIf
+  For j = 0 To 5
+    x = Cyw43ScanBssidByte(a, j)
+    y = Cyw43ScanBssidByte(b, j)
+    If x < y
+      ProcedureReturn 1
+    EndIf
+    If x > y
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+
+
+; ----------------------------------------------------------------------
+;  THE LADDER, BUILT BY APPLYING THE ONE RULE REPEATEDLY.
+;
+;  ladderRow[k] is the scan row of the k-th candidate to try and
+;  ladderSlot[k] is the settings slot it came from. probe_BuildLadder
+;  returns how many rungs it filled.
+;
+;  IT IS THE SAME RULE, NOT A SECOND ONE, AND THAT IS THE WHOLE DESIGN.
+;  The three-tier preference - a 5 GHz candidate at or above the floor,
+;  else any 2.4 GHz candidate, else a below-floor 5 GHz one, ties broken
+;  by slot then RSSI then BSSID by probe_Better - is run once per rung
+;  over the candidates not yet taken. So rung 0 is exactly what the
+;  single-choice code chose, and rung k is exactly what it would have
+;  chosen if the first k networks had not existed. A separate "retry
+;  rule" would have been a second thing to keep in step with the first,
+;  and the first is the one this file documents at length.
+;
+;  ladderTaken IS THE ONLY MUTABLE STATE and it marks rows already
+;  placed on the ladder. It is sized to #CYW43_MAX_BSS because that is
+;  the size of the scan table it indexes; a smaller array with a bound
+;  check would be the same thing with a way to get the bound wrong.
+;
+;  A ROW THAT IS NOT STORED NEVER ENTERS. SettingsWifiFindSsid returning
+;  0 means no credential, and a candidate with no credential is not a
+;  candidate - it is a network somebody else owns.
+; ----------------------------------------------------------------------
+Global Dim ladderRow.i[#JOIN_LADDER_MAX]
+Global Dim ladderSlot.i[#JOIN_LADDER_MAX]
+Global Dim ladderTaken.a[#CYW43_MAX_BSS]
+
+Procedure.i probe_BuildLadder(found.i)
+  Define i.i
+  Define k.i
+  Define slot.i
+  Define rssi.i
+  Define chan.i
+  Define best5.i
+  Define best5Slot.i
+  Define best24.i
+  Define best24Slot.i
+  Define weak5.i
+  Define weak5Slot.i
+  Define pick.i
+  Define pickSlot.i
+
+  For i = 0 To #CYW43_MAX_BSS - 1
+    ladderTaken[i] = 0
+  Next
+
+  k = 0
+  While k < #JOIN_LADDER_MAX
+    best5 = -1
+    best5Slot = 0
+    best24 = -1
+    best24Slot = 0
+    weak5 = -1
+    weak5Slot = 0
+
+    For i = 0 To found - 1
+      If ladderTaken[i] = 0
+        slot = SettingsWifiFindSsid(Cyw43ScanSsid(i))
+        If slot <> 0
+          rssi = Cyw43ScanRssi(i)
+          chan = Cyw43ScanChannel(i)
+          If probe_Is5GHz(chan) = 1
+            If rssi >= #JOIN_5G_FLOOR_DBM
+              If probe_Better(i, slot, best5, best5Slot) = 1
+                best5 = i
+                best5Slot = slot
+              EndIf
+            Else
+              If probe_Better(i, slot, weak5, weak5Slot) = 1
+                weak5 = i
+                weak5Slot = slot
+              EndIf
+            EndIf
+          Else
+            If probe_Better(i, slot, best24, best24Slot) = 1
+              best24 = i
+              best24Slot = slot
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+    Next
+
+    ; The rule, applied. Three lines, in this order, and the order IS
+    ; the rule - the same three lines the single-choice code ran, kept
+    ; here in the same order for the same reasons stated there.
+    pick = -1
+    pickSlot = 0
+    If best5 >= 0
+      pick = best5
+      pickSlot = best5Slot
+    ElseIf best24 >= 0
+      pick = best24
+      pickSlot = best24Slot
+    ElseIf weak5 >= 0
+      pick = weak5
+      pickSlot = weak5Slot
+    EndIf
+
+    If pick < 0
+      ProcedureReturn k
+    EndIf
+
+    ladderRow[k] = pick
+    ladderSlot[k] = pickSlot
+    ladderTaken[pick] = 1
+    k = k + 1
+  Wend
+
+  ProcedureReturn k
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_FallThrough - may the ladder move to the next rung after this
+;  failure?
+;
+;  ONLY FOR A REFUSAL THAT A DIFFERENT NETWORK COULD FIX, and the list
+;  is short on purpose:
+;
+;    JOINFAIL_ASSOC  the association was refused. On this bench that is
+;                    802.11 status 43 AKMP_NOT_VALID from the 5 GHz
+;                    radio, and it is THE case this ladder was written
+;                    for. It arrives in milliseconds, so falling
+;                    through costs almost nothing.
+;    JOINFAIL_PRUNE  RSN mismatch. cyw43.pi4's own text says RETRYING
+;                    UNCHANGED WILL LOOP FOR EVER - which is an argument
+;                    for trying a DIFFERENT network and against trying
+;                    the same one, so it belongs here and nowhere else.
+;    JOINFAIL_NONET  the SSID was not on the air. Same reasoning: this
+;                    network cannot be joined now, another might.
+;
+;  AND FOR NOTHING ELSE. The three that are deliberately excluded:
+;
+;    JOINFAIL_WRONGPASS   the access point's own verdict on the key. A
+;                         stored credential is wrong and that is a
+;                         configuration fault worth stopping on; walking
+;                         quietly to the next network would hide it.
+;    JOINFAIL_KEYTIMEOUT  the fix for this one is a disassociate and a
+;                         retry of the SAME network - measured on the
+;                         twin at 21 of 22 first attempts - and it is a
+;                         different mechanism from this ladder. Falling
+;                         through would take the one network that was
+;                         about to work and abandon it.
+;    JOINFAIL_TIMEOUT     slow by definition, and it leaves the radio in
+;                         a state nothing here has characterised. Two of
+;                         those would eat the whole deadman budget.
+;
+;  BADAUTH and LINKLOST are excluded by omission, for the timeout
+;  reason: neither is a fast, unambiguous "this network said no".
+; ----------------------------------------------------------------------
+Procedure.i probe_FallThrough(failCode.i)
+  If failCode = #CYW43_JOINFAIL_ASSOC
+    ProcedureReturn 1
+  EndIf
+  If failCode = #CYW43_JOINFAIL_PRUNE
+    ProcedureReturn 1
+  EndIf
+  If failCode = #CYW43_JOINFAIL_NONET
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE CRYPTO, ON SILICON, AGAINST PUBLISHED VECTORS
+; ======================================================================
+;
+;  WHY THIS RUNS FIRST, BEFORE A SINGLE RADIO REGISTER IS TOUCHED. The
+;  host now has to be the WPA2 supplicant, because this firmware has
+;  none - finding 3 above, four independent refusals. A supplicant that
+;  computes the wrong PMK produces a join that fails with no diagnosis
+;  available anywhere: the access point simply stops answering, and
+;  every symptom points at the radio. So the arithmetic is proven
+;  BEFORE the radio is powered, and if it is wrong this file says so
+;  and stops rather than spending twenty seconds blaming the air.
+;
+;  IT COSTS ABOUT A TENTH OF A SECOND. Nine vectors, of which two are
+;  4096-iteration derivations - roughly 16,000 SHA-1 compressions each.
+;  On a 600 MHz core that is tens of milliseconds apiece. It fits inside
+;  the deadman budget at the top of this file with room to spare, and
+;  the elapsed-ms row after it turns this estimate into a measurement.
+;
+;  EVERY VALUE HERE IS PUBLISHED. Two SHA-1 digests from FIPS PUB 180-1
+;  by way of RFC 3174 section 7.3; three HMAC-SHA1 cases from RFC 2202
+;  section 3, one of them the 96-bit truncation; three PBKDF2 vectors
+;  from RFC 6070; and the passphrase-to-PSK example from IEEE 802.11i
+;  Annex H.4.2, which is the passphrase "password" against the SSID
+;  "IEEE".
+;
+;  *** THERE IS NO REAL CREDENTIAL IN THIS SECTION AND THERE MUST NEVER
+;  BE ONE. *** The published vectors exist precisely so that nobody has
+;  to test with a live passphrase. The real one is read from
+;  SETTINGS.TXT further down, is never printed, and appears in no source
+;  file. If a future edit is tempted to "just check it against the real
+;  network's PMK", the answer is no: a PMK in a console log is the
+;  passphrase for every practical purpose, and this log gets pasted into
+;  reports.
+;
+;  THE SAME VECTORS ARE THE OFFLINE GATE'S. tools/a64/a64_sha1_check.py,
+;  a64_hmacsha1_check.py and a64_pbkdf2_check.py run these and several
+;  hundred more against a model of the instruction set. This section is
+;  the part that runs on the PART - the model has no caches and no real
+;  memory system, so agreement between the two is worth having and
+;  disagreement would be worth a great deal more.
+; ======================================================================
+
+Global Dim cryptoOut.a[40]         ; digest / MAC / derived key workspace
+Global Dim cryptoKey.a[24]         ; a constructed HMAC key
+
+; ----------------------------------------------------------------------
+;  crypto_Expect - compare `words` big-endian 32-bit words at `got`
+;  against the Data.l table at `want`.
+;
+;  THE TABLE IS WORDS AND THE BUFFER IS BYTES, so the comparison
+;  reassembles four bytes into a word rather than casting either side.
+;  A digest is defined as a byte string; storing the expectation as
+;  words is only a way to write it compactly, and the reassembly is
+;  where the two representations are reconciled explicitly instead of
+;  by an endianness assumption nobody checked.
+;
+;  PeekN, NOT PeekL, on the table: half the words in a digest have bit
+;  31 set and PeekL sign-extends on this target. PeekA, not PeekB, on
+;  the buffer, for the same reason one octet down.
+; ----------------------------------------------------------------------
+Procedure.i crypto_Expect(got.i, want.i, words.i)
+  Define w.i
+  Define v.i
+  Define g.i
+  For w = 0 To words - 1
+    v = PeekN(want + w * 4) & $FFFFFFFF
+    g = ((PeekA(got + w * 4) & 255) << 24) | ((PeekA(got + w * 4 + 1) & 255) << 16) | ((PeekA(got + w * 4 + 2) & 255) << 8) | (PeekA(got + w * 4 + 3) & 255)
+    If g <> v
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure crypto_Row(*name, ok.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  If ok = 1
+    UartWriteStr("  ok")
+  Else
+    UartWriteStr("  *** WRONG ***")
+  EndIf
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The vector inputs, returned from Procedure.i so they arrive as
+;  addresses. That spelling is this file's own - probe_StepName above
+;  does the same thing - and it is used here because the alternative, a
+;  byte table, would hide plain ASCII behind hex for no gain.
+;
+;  THEIR LENGTHS ARE WRITTEN OUT AT EACH CALL SITE rather than measured,
+;  because the document states a length and that length is part of the
+;  vector. RFC 2202 case 2's data is 28 octets; if a future edit changed
+;  the text and left the 28, the vector would fail, which is correct.
+; ----------------------------------------------------------------------
+Procedure.i crypto_Abc()
+  ProcedureReturn "abc"
+EndProcedure
+
+Procedure.i crypto_Abcd56()
+  ProcedureReturn "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+EndProcedure
+
+Procedure.i crypto_HiThere()
+  ProcedureReturn "Hi There"
+EndProcedure
+
+Procedure.i crypto_Jefe()
+  ProcedureReturn "Jefe"
+EndProcedure
+
+Procedure.i crypto_WhatDoYa()
+  ProcedureReturn "what do ya want for nothing?"
+EndProcedure
+
+Procedure.i crypto_TestWithTruncation()
+  ProcedureReturn "Test With Truncation"
+EndProcedure
+
+Procedure.i crypto_Password()
+  ProcedureReturn "password"
+EndProcedure
+
+Procedure.i crypto_Salt()
+  ProcedureReturn "salt"
+EndProcedure
+
+Procedure.i crypto_Ieee()
+  ProcedureReturn "IEEE"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CryptoSelfTest - returns the number of vectors that came out wrong.
+;  Zero is the only acceptable answer.
+; ----------------------------------------------------------------------
+Procedure.i CryptoSelfTest()
+  Define bad.i
+  Define ok.i
+  Define i.i
+  Define n.i
+
+  bad = 0
+
+  ; ---- SHA-1, RFC 3174 section 7.3 / FIPS PUB 180-1 ------------------
+  Sha1Of(crypto_Abc(), 3, @cryptoOut[0])
+  ok = crypto_Expect(@cryptoOut[0], ?vecSha1Abc, 5)
+  crypto_Row("sha1   RFC 3174 TEST1 ", ok)
+  bad = bad + (1 - ok)
+
+  Sha1Of(crypto_Abcd56(), 56, @cryptoOut[0])
+  ok = crypto_Expect(@cryptoOut[0], ?vecSha1Abcd, 5)
+  crypto_Row("sha1   RFC 3174 TEST2 ", ok)
+  bad = bad + (1 - ok)
+
+  ; ---- HMAC-SHA1, RFC 2202 section 3 ---------------------------------
+  ; Case 1: a 20-byte key of $0B. Built in a loop rather than written
+  ; out, because twenty identical bytes typed by hand is nineteen
+  ; chances to be wrong and no chance to be interesting.
+  For i = 0 To 19
+    cryptoKey[i] = $0B
+  Next
+  HmacSha1Of(@cryptoKey[0], 20, crypto_HiThere(), 8, @cryptoOut[0])
+  ok = crypto_Expect(@cryptoOut[0], ?vecHmacCase1, 5)
+  crypto_Row("hmac   RFC 2202 case 1", ok)
+  bad = bad + (1 - ok)
+
+  ; Case 2: the key is ASCII and shorter than the block.
+  HmacSha1Of(crypto_Jefe(), 4, crypto_WhatDoYa(), 28, @cryptoOut[0])
+  ok = crypto_Expect(@cryptoOut[0], ?vecHmacCase2, 5)
+  crypto_Row("hmac   RFC 2202 case 2", ok)
+  bad = bad + (1 - ok)
+
+  ; Case 5, TRUNCATED TO 96 BITS. The RFC publishes the short answer as
+  ; well as the long one, and this is the truncation path the EAPOL-Key
+  ; MIC will use at 128 bits - so it is checked here rather than taken
+  ; on trust from the full-length cases. The RETURNED LENGTH is checked
+  ; too: a truncation that writes the right twelve bytes and reports
+  ; twenty would break the caller and not this comparison.
+  For i = 0 To 19
+    cryptoKey[i] = $0C
+  Next
+  HmacSha1Key(@cryptoKey[0], 20)
+  HmacSha1Update(crypto_TestWithTruncation(), 20)
+  n = HmacSha1End(@cryptoOut[0], 12)
+  ok = crypto_Expect(@cryptoOut[0], ?vecHmacCase5t, 3)
+  If n <> 12
+    ok = 0
+  EndIf
+  crypto_Row("hmac   RFC 2202 case 5, cut to 96 bits", ok)
+  bad = bad + (1 - ok)
+
+  ; ---- PBKDF2-HMAC-SHA1, RFC 6070 ------------------------------------
+  ; c = 1 and c = 2 are the two that can tell an off-by-one in the
+  ; iteration loop from a correct one. c = 4096 is the one that costs
+  ; what a real derivation costs, and is here to prove the cost as much
+  ; as the answer.
+  n = Pbkdf2Sha1(crypto_Password(), 8, crypto_Salt(), 4, 1, @cryptoOut[0], 20)
+  ok = crypto_Expect(@cryptoOut[0], ?vecPbkdf2C1, 5)
+  If n <> 20
+    ok = 0
+  EndIf
+  crypto_Row("pbkdf2 RFC 6070 c=1   ", ok)
+  bad = bad + (1 - ok)
+
+  n = Pbkdf2Sha1(crypto_Password(), 8, crypto_Salt(), 4, 2, @cryptoOut[0], 20)
+  ok = crypto_Expect(@cryptoOut[0], ?vecPbkdf2C2, 5)
+  If n <> 20
+    ok = 0
+  EndIf
+  crypto_Row("pbkdf2 RFC 6070 c=2   ", ok)
+  bad = bad + (1 - ok)
+
+  n = Pbkdf2Sha1(crypto_Password(), 8, crypto_Salt(), 4, 4096, @cryptoOut[0], 20)
+  ok = crypto_Expect(@cryptoOut[0], ?vecPbkdf2C4096, 5)
+  If n <> 20
+    ok = 0
+  EndIf
+  crypto_Row("pbkdf2 RFC 6070 c=4096", ok)
+  bad = bad + (1 - ok)
+
+  ; ---- the WPA2 mapping, IEEE 802.11i Annex H.4.2 --------------------
+  ; PSK = PBKDF2(passphrase, SSID, 4096, 32). This is the exact call
+  ; a join will make with the real credential, run here on the
+  ; standard's own worked example.
+  n = Wpa2Psk(crypto_Password(), 8, crypto_Ieee(), 4, @cryptoOut[0])
+  ok = crypto_Expect(@cryptoOut[0], ?vecPskIeee, 8)
+  If n <> 32
+    ok = 0
+  EndIf
+  crypto_Row("psk    IEEE Annex H.4 ", ok)
+  bad = bad + (1 - ok)
+
+  ; The workspace held a PUBLISHED PMK, not a real one, but wiping it
+  ; anyway means the habit lives in the file rather than in somebody's
+  ; memory.
+  For i = 0 To 39
+    cryptoOut[i] = 0
+  Next
+  Pbkdf2Wipe()
+
+  ProcedureReturn bad
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PUBLISHED EXPECTATIONS, as big-endian 32-bit words.
+;
+;  Data.l because each entry must occupy four bytes and be reachable at
+;  base + w * 4; read with PeekN, never PeekL, because half of these
+;  words have bit 31 set. Data has no unsigned spelling and does not
+;  need one - what is being asked of it is a four-byte slot, not a sign.
+;
+;  EVERY ONE OF THESE IS FROM A PUBLISHED DOCUMENT and NOT ONE was
+;  produced by running this tree. The same values are parsed straight
+;  out of those documents by tools/a64/a64_sha1_check.py,
+;  a64_hmacsha1_check.py and a64_pbkdf2_check.py, so a typo below
+;  disagrees with the offline gate rather than quietly redefining the
+;  answer.
+; ----------------------------------------------------------------------
+DataSection
+  ; SHA-1("abc") - RFC 3174 section 7.3, resultarray[0]
+  vecSha1Abc:
+  Data.l $A9993E36, $4706816A, $BA3E2571, $7850C26C, $9CD0D89D
+
+  ; SHA-1 of the 56-byte two-block message - resultarray[1]
+  vecSha1Abcd:
+  Data.l $84983E44, $1C3BD26E, $BAAE4AA1, $F95129E5, $E54670F1
+
+  ; HMAC-SHA1, RFC 2202 section 3, case 1
+  vecHmacCase1:
+  Data.l $B6173186, $55057264, $E28BC0B6, $FB378C8E, $F146BE00
+
+  ; case 2
+  vecHmacCase2:
+  Data.l $EFFCDF6A, $E5EB2FA2, $D27416D5, $F184DF9C, $259A7C79
+
+  ; case 5, the published digest-96
+  vecHmacCase5t:
+  Data.l $4C1A0342, $4B55E07F, $E7F27BE1
+
+  ; PBKDF2-HMAC-SHA1 - RFC 6070
+  vecPbkdf2C1:
+  Data.l $0C60C80F, $961F0E71, $F3A9B524, $AF601206, $2FE037A6
+
+  vecPbkdf2C2:
+  Data.l $EA6C014D, $C72D6F8C, $CD1ED92A, $CE1D41F0, $D8DE8957
+
+  vecPbkdf2C4096:
+  Data.l $4B007901, $B765489A, $BEAD49D9, $26F721D0, $65A429C1
+
+  ; The PSK for passphrase "password" and SSID "IEEE" - IEEE 802.11i
+  ; Annex H.4.2. The CONSTRUCTION is cited on disk at
+  ; RaspberryPi4/Reference/hostap_sha1-pbkdf2.c:71-72; the standard
+  ; itself is not freely redistributable and is not on this disk, so
+  ; tools/a64/a64_pbkdf2_check.py confirms this value against an
+  ; implementation outside this tree before it uses it.
+  vecPskIeee:
+  Data.l $F42C6FC5, $2DF0EBEF, $9EBB4B90, $B38A5F90
+  Data.l $2E83FE1B, $135A70E2, $3AED762E, $9710A12E
+EndDataSection
+
+
+Procedure.i Main()
+  Define ok.i
+  Define hz.i
+  Define i.i
+  Define j.i
+  Define r.i
+  Define crc.i
+  Define n.i
+  Define slices.i
+  Define stop.i
+  Define done.i
+  Define found.i
+  Define setLen.i
+  Define slot.i
+  Define chosen.i
+  Define chosenSlot.i
+  Define best5.i
+  Define best5Slot.i
+  Define best24.i
+  Define best24Slot.i
+  Define weak5.i
+  Define weak5Slot.i
+  Define rssi.i
+  Define chan.i
+  Define pass.i
+  Define passLen.i
+  Define ssid.i
+  Define ssidLen.i
+  Define verdict.i
+  Define matched.i
+  Define bssidOk.i
+  Define supGone.i
+  Define pmkOk.i
+  Define rungs.i
+  Define rung.i
+  Define attempts.i
+  Define fellThrough.i
+  Define k.i
+  Define p.i
+  Define eapolLen.i
+  Define eapolMs.i
+
+  startMs = NowMs()
+
+  PrintNl()
+  UartWriteStr("=== pi4 CYW43455 join ===")
+  PrintNl()
+  PrintNl()
+
+  ; ====================================================================
+  ; 0 - THE CRYPTO NO LONGER RUNS HERE, AND THE REASON IS A MEASUREMENT.
+  ;
+  ; The block above CryptoSelfTest estimated "about a tenth of a
+  ; second ... tens of milliseconds apiece" for the two 4096-iteration
+  ; derivations. MEASURED ON SILICON, 2026-08-28, COM7, deadman 15:
+  ;
+  ;     -- the supplicant crypto, published vectors --
+  ;       ... all nine vectors ok ...
+  ;       elapsed ms         15497
+  ;
+  ; FIFTEEN AND A HALF SECONDS, and the deadman fired on the next line
+  ; with the radio still cold. The estimate was out by a factor of
+  ; about 150, in the one direction that costs the entire run.
+  ;
+  ; WHY, said plainly so nobody re-derives it: the MMU is off, so every
+  ; instruction fetch and every load is Device memory with no cache
+  ; anywhere. 4096 iterations over two output blocks is 16,384 HMAC-
+  ; SHA1 calls, and at roughly 1.2 ms each that is ten seconds for ONE
+  ; passphrase-to-PSK mapping. It is NOT a defect in sha1.pi4 or
+  ; pbkdf2.pi4 - every published vector passed, on the board, which is
+  ; what that run proved before it ran out of clock.
+  ;
+  ; SO THE ARITHMETIC IS PROVEN IN ITS OWN PAYLOAD AND THE PMK IS
+  ; DERIVED IN ANOTHER (pi4WifiPmk.pi4, which stages it in DRAM). This
+  ; file's fifteen seconds are for the radio. CryptoSelfTest and its
+  ; vectors are left below, uncalled: deleting them would delete the
+  ; citation for every value in them.
+  ; ====================================================================
+
+  ; ====================================================================
+  ; 1 - what is in DRAM
+  ; ====================================================================
+  UartWriteStr("-- the blobs, as loaded --")
+  PrintNl()
+
+  crc = Crc32(#FW_ADDR, #FW_LEN)
+  HexLine("firmware crc32   ", crc, 8)
+  If crc <> #FW_CRC
+    HexLine("  EXPECTED       ", #FW_CRC, 8)
+    UartWriteStr("  WRONG - type:  load BRCMFW.BIN 1000000")
+    PrintNl()
+    UartWriteStr("=== stopped at crc ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  crc = Crc32(#NV_ADDR, #NV_LEN)
+  HexLine("nvram crc32      ", crc, 8)
+  If crc <> #NV_CRC
+    HexLine("  EXPECTED       ", #NV_CRC, 8)
+    UartWriteStr("  WRONG - type:  load BRCMNV.TXT 1200000")
+    PrintNl()
+    UartWriteStr("=== stopped at crc ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  crc = Crc32(#CLM_ADDR, #CLM_LEN)
+  HexLine("clm crc32        ", crc, 8)
+  If crc <> #CLM_CRC
+    HexLine("  EXPECTED       ", #CLM_CRC, 8)
+    UartWriteStr("  WRONG - type:  load BRCMCLM.BLB 1300000")
+    PrintNl()
+    UartWriteStr("=== stopped at crc ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; 2 - THE CREDENTIALS, off the stick and into the settings table.
+  ;
+  ; SettingsParse TOUCHES NO MEDIUM. It is a pass over a byte buffer -
+  ; settings.pi4 says so in its header and it is what makes the whole
+  ; library testable offline - so this payload never brings USB up and
+  ; never competes with Anvil for it. Anvil did the reading; this only
+  ; parses what Anvil left in DRAM.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- the stored networks --")
+  PrintNl()
+
+  ; Find the end by scanning for the NUL the `fill` left behind. A
+  ; REFUSAL RATHER THAN A GUESS if there is not one inside the window:
+  ; parsing eight kilobytes of unknown DRAM as a settings file would
+  ; report a syntax error on a line that is not in the file, which sends
+  ; somebody to edit a file that is perfectly correct.
+  setLen = -1
+  For i = 0 To #SET_WIN - 1
+    If PeekA(#SET_ADDR + i) = 0
+      setLen = i
+      Break
+    EndIf
+  Next
+  If setLen < 0
+    UartWriteStr("  NO TERMINATOR in 8 KB at $01400000. Either the fill was")
+    PrintNl()
+    UartWriteStr("  skipped or SETTINGS.TXT is larger than this window. Type:")
+    PrintNl()
+    UartWriteStr("    fill 1400000 0 800")
+    PrintNl()
+    UartWriteStr("    load SETTINGS.TXT 1400000")
+    PrintNl()
+    UartWriteStr("=== stopped at the settings ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Line("settings bytes   ", setLen)
+  If setLen = 0
+    UartWriteStr("  SETTINGS.TXT IS EMPTY, or the load did not happen. There")
+    PrintNl()
+    UartWriteStr("  are no credentials to join with.")
+    PrintNl()
+    UartWriteStr("=== stopped at the settings ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = SettingsParse(#SET_ADDR, setLen)
+  Line("SettingsParse (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SettingsErrorText())
+    PrintNl()
+    Line("  at file line   ", SettingsErrorLine())
+    UartWriteStr("=== stopped at the settings ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Line("keys in the table", SettingsCount())
+  Line("duplicate keys   ", SettingsDuplicates())
+
+  ; THE STORED LIST, IN PREFERENCE ORDER, WITH NO PASSPHRASES ON IT.
+  ; The slot number and the SSID are what the selection is decided on
+  ; and are therefore what has to be printed; the passphrase's LENGTH is
+  ; printed beside it because "the slot is there but its passphrase is
+  ; 0 bytes" is a real and otherwise silent failure.
+  ;
+  ; WALKED WITH THE CURSOR, NOT WITH `For slot = 1 To
+  ; SettingsWifiSlots()`. The obvious loop misses the LEGACY pseudo-slot
+  ; - settings.pi4 keeps the old flat wifi.network / wifi.password pair
+  ; readable as slot #SET_WIFI_LEGACY, one past the numbered ones, so a
+  ; stick written by yesterday's build still joins. A bound of
+  ; SettingsWifiSlots() would silently exclude exactly the credential
+  ; the backward-compatibility promise was made about.
+  n = 0
+  slot = SettingsWifiNextSlot(0)
+  While slot <> 0
+    n = n + 1
+    UartWriteStr("  slot ")
+    PrintDec(slot)
+    If slot = SettingsWifiLegacySlot()
+      UartWriteStr(" (old flat keys)")
+    Else
+      UartWriteStr("                ")
+    EndIf
+    UartWriteStr("  ")
+    ssid = SettingsWifiSlotSsid(slot)
+    PrintSsid(ssid, SettingsLength(SettingsWifiSlotSsidKey(slot)))
+    UartWriteStr("   passphrase bytes ")
+    PrintDec(SettingsLength(SettingsWifiSlotPasswordKey(slot)))
+    PrintNl()
+    slot = SettingsWifiNextSlot(slot)
+  Wend
+  Line("stored networks  ", n)
+  If n = 0
+    UartWriteStr("  NOTHING IS STORED. Type, at the prompt:")
+    PrintNl()
+    UartWriteStr("    wifi ssid 1 <name>")
+    PrintNl()
+    UartWriteStr("    wifi password 1 <passphrase>")
+    PrintNl()
+    UartWriteStr("    settings save")
+    PrintNl()
+    UartWriteStr("=== stopped at the settings ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; 3 - the bus. The mailbox preamble is not optional.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- bus --")
+  PrintNl()
+
+  ok = MailboxInit()
+  Line("mailbox init (want 1)", ok)
+  If ok = 0
+    UartWriteStr("=== stopped at the mailbox ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  hz = MailboxClockRate(#CLOCK_ID_EMMC)
+  If hz <= 0
+    UartWriteStr("  the firmware would not report the EMMC clock.")
+    PrintNl()
+    UartWriteStr("=== stopped at the clock ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  SdioSetBaseClockKhz(hz / 1000)
+
+  ok = SdioAssertWlOn()
+  Line("WL_ON asserted (want 1)", ok)
+
+  ok = SdioInit()
+  Line("SdioInit (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the bus ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = SdioEnableFunction(1)
+  Line("enable F1 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at function 1 ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; 4 - the chip and the firmware
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- chip and firmware --")
+  PrintNl()
+
+  ok = Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Line("Cyw43SetIo (want 1)", ok)
+  ok = Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+  Line("Cyw43SetBlockIo (want 1)", ok)
+
+  ok = Cyw43Attach()
+  Line("Cyw43Attach (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the chip ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  HexLine("chip id          ", Cyw43ChipId(), 4)
+
+  ok = Cyw43SetBlockMode(1)
+  Line("block mode on (want 1)", ok)
+
+  ok = Cyw43PrepareDownload()
+  Line("Cyw43PrepareDownload (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped before the download ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43UploadFirmware(#FW_ADDR, #FW_LEN, #SCRATCH, #SCRATCH_LEN)
+  Line("Cyw43UploadFirmware (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    HexLine("  first bad addr ", Cyw43BadAddr(), 8)
+    UartWriteStr("=== stopped at the image ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43UploadNvram(#NV_ADDR, #NV_LEN, #NV_WORK, #NV_WORK_MAX, #SCRATCH, #SCRATCH_LEN)
+  Line("Cyw43UploadNvram (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the nvram ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43Start()
+  Line("Cyw43Start (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped releasing the ARM ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43HtClock()
+  Line("Cyw43HtClock (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the HT clock ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43AnnounceHost()
+  Line("Cyw43AnnounceHost (want 1)", ok)
+
+  ok = SdioEnableFunction(2)
+  Line("enable F2 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  F2 NEVER CAME READY - the firmware did not boot.")
+    PrintNl()
+    UartWriteStr("=== stopped at F2 ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Stamp("firmware up")
+
+  ; ====================================================================
+  ; 5 - the transport, with THE JOIN EVENT MASK
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- transport --")
+  PrintNl()
+
+  Cyw43SetTrace(@probe_Trace, 0)
+
+  ; #CYW43_EVMASK_JOIN, which is the one difference from pi4WifiScan's
+  ; call. It adds the ten event types an association is decided by; see
+  ; the argument at Cyw43SetEventMask for why it is an argument and not
+  ; simply always on.
+  r = Cyw43WifiUp(#CLM_ADDR, #CLM_LEN, #CYW43_EVMASK_JOIN, 2000)
+  Line("Cyw43WifiUp (want 0)", r)
+  Line("  clm chunks sent", Cyw43ClmChunks())
+  Line("  clm status     ", Cyw43ClmStatus())
+  If r <> 0
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    UartWriteStr("=== stopped at wifi up ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Stamp("radio up")
+
+  ; ====================================================================
+  ; 5b - THE BASELINE. Ask whether we are associated BEFORE joining.
+  ;
+  ; WITHOUT THIS THE READ-BACK AFTER THE JOIN PROVES NOTHING. A firmware
+  ; that answered "associated" to everything would look identical to one
+  ; that had just associated, and there would be no way to tell from the
+  ; log. -17 BCME_NOTASSOCIATED here is what makes the second reading
+  ; evidence. It is also the first time this driver has ever sent
+  ; WLC_GET_BSSID, so whether -17 really comes back is itself unverified
+  ; and this row is the verification.
+  ; ====================================================================
+  r = Cyw43ReadBssid(2000)
+  Line("baseline associated (want 0)", r)
+  Line("  raw ioctl status (want -17)", Cyw43IoctlStatus())
+  If r = 1
+    UartWriteStr("  ALREADY ASSOCIATED before we joined. The radio was left")
+    PrintNl()
+    UartWriteStr("  joined by a previous run; the proof below cannot")
+    PrintNl()
+    UartWriteStr("  distinguish that link from one this run made.")
+    PrintNl()
+  EndIf
+
+  ; ====================================================================
+  ; 6 - the scan
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- scan --")
+  PrintNl()
+
+  r = Cyw43ScanStart(0, 2000)
+  Line("Cyw43ScanStart (want 0)", r)
+  If r <> 0
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    UartWriteStr("=== stopped starting the scan ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  done = -1
+  slices = 0
+  stop = 0
+  While stop = 0 And slices < (#SCAN_BUDGET_MS / #SCAN_SLICE_MS)
+    r = Cyw43ScanPoll(#SCAN_SLICE_MS)
+    slices = slices + 1
+    If r = #CYW43_SCAN_DONE
+      done = 0
+      stop = 1
+    EndIf
+    If r = #CYW43_SCAN_FAILED
+      done = 1
+      stop = 1
+    EndIf
+  Wend
+  Line("slices used      ", slices)
+  If done = -1
+    UartWriteStr("  NO COMPLETION EVENT within the budget - which is NOT the")
+    PrintNl()
+    UartWriteStr("  same as a scan that found nothing.")
+    PrintNl()
+  ElseIf done = 1
+    UartWriteStr("  scan completed, status ")
+    PrintDec(Cyw43EventStatus())
+    PrintNl()
+  EndIf
+  Stamp("scan done")
+
+  found = Cyw43ScanCount()
+  Line("networks found   ", found)
+
+  ; ====================================================================
+  ; 7 - THE SELECTION. See the rule at the head of this file.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- selecting --")
+  PrintNl()
+
+  For i = 0 To found - 1
+    ssid = Cyw43ScanSsid(i)
+    ssidLen = Cyw43ScanSsidLen(i)
+    rssi = Cyw43ScanRssi(i)
+    chan = Cyw43ScanChannel(i)
+
+    UartWriteStr("  ")
+    PrintBssid(@cyw43_bssBssid[0] + i * 6)
+    UartWriteStr("  ch ")
+    PrintDec(chan)
+    UartWriteStr("  ")
+    PrintDec(rssi)
+    UartWriteStr(" dBm  ")
+    PrintSsid(ssid, ssidLen)
+
+    ; THE SIGN CHECK, PER ROW AND NOT ONCE. A table where one entry
+    ; survived sign extension and another did not is a stranger fault
+    ; than one where none did, and it is the one a single check would
+    ; miss.
+    If probe_RssiSane(rssi) = 0
+      UartWriteStr("   <- RSSI IS NOT A SIGNED dBm READING. Refusing.")
+      PrintNl()
+      UartWriteStr("=== stopped at the selection ===")
+      PrintNl()
+      ProcedureReturn 1
+    EndIf
+
+    ; IS IT STORED? The comparison is settings.pi4's, byte for byte,
+    ; because two of the real networks differ from other saved profiles
+    ; by a single letter and one differs only by a suffix.
+    slot = SettingsWifiFindSsid(ssid)
+    If slot = 0
+      UartWriteStr("   - not stored, skipped")
+      PrintNl()
+    Else
+      UartWriteStr("   <- stored in slot ")
+      PrintDec(slot)
+      ; NARRATION ONLY. Which tier each row lands in is printed here
+      ; and DECIDED in probe_BuildLadder, which runs the same three
+      ; tests over the same values. Two places, one rule: the tier
+      ; names below must keep agreeing with the tests there, and they
+      ; are side by side in this file so that a change to one that
+      ; misses the other is visible in a diff.
+      If probe_Is5GHz(chan) = 1
+        If rssi >= #JOIN_5G_FLOOR_DBM
+          UartWriteStr(", 5 GHz, above the floor")
+        Else
+          UartWriteStr(", 5 GHz, BELOW the floor")
+        EndIf
+      Else
+        UartWriteStr(", 2.4 GHz")
+      EndIf
+      PrintNl()
+    EndIf
+  Next
+
+  Line("5 GHz floor dBm  ", #JOIN_5G_FLOOR_DBM)
+
+  ; THE RULE, APPLIED - REPEATEDLY, TO BUILD A LADDER.
+  ;
+  ; The rule itself is unchanged and lives in probe_BuildLadder: a
+  ; healthy 5 GHz link beats everything; failing that, any 2.4 GHz
+  ; link; failing that, a weak 5 GHz link, because a marginal link is
+  ; better than no link and refusing here would turn "prefer 5 GHz
+  ; unless it is weak" into "refuse to associate when 5 GHz is weak and
+  ; there is no 2.4 GHz", which nobody asked for.
+  ;
+  ; WHAT CHANGED ON 2026-08-28 IS THAT IT IS APPLIED MORE THAN ONCE.
+  ; Rung 0 is the choice the single-choice code made, unchanged; each
+  ; later rung is what that code would have chosen with the earlier
+  ; rungs deleted from the scan. The join below walks the ladder and
+  ; falls through ONLY on a failure a different network could fix -
+  ; see probe_FallThrough, which is deliberately short.
+  rungs = probe_BuildLadder(found)
+  Line("candidates on the ladder", rungs)
+
+  If rungs < 1
+    UartWriteStr("  NONE OF THE VISIBLE NETWORKS IS STORED, and none of the")
+    PrintNl()
+    UartWriteStr("  stored ones is visible. THAT IS NOT A FAULT IN THIS CODE -")
+    PrintNl()
+    UartWriteStr("  a network that is not on the air cannot be joined. The scan")
+    PrintNl()
+    UartWriteStr("  list above and the stored list further up are the report.")
+    PrintNl()
+    UartWriteStr("=== stopped: nothing to join ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; THE WHOLE LADDER IS PRINTED BEFORE ANY OF IT IS TRIED, so the log
+  ; records the plan and not only what happened to it. A run that
+  ; succeeds on rung 0 still shows what it would have fallen through
+  ; to, which is the difference between "the rule worked" and "the rule
+  ; had one option and got lucky".
+  For i = 0 To rungs - 1
+    UartWriteStr("  rung ")
+    PrintDec(i)
+    UartWriteStr("  ")
+    PrintBssid(@cyw43_bssBssid[0] + ladderRow[i] * 6)
+    UartWriteStr("  ch ")
+    PrintDec(Cyw43ScanChannel(ladderRow[i]))
+    UartWriteStr("  ")
+    PrintDec(Cyw43ScanRssi(ladderRow[i]))
+    UartWriteStr(" dBm  slot ")
+    PrintDec(ladderSlot[i])
+    UartWriteStr("  ")
+    PrintSsid(Cyw43ScanSsid(ladderRow[i]), Cyw43ScanSsidLen(ladderRow[i]))
+    PrintNl()
+  Next
+
+  chosen = ladderRow[0]
+  chosenSlot = ladderSlot[0]
+
+  ; SELECTED BY BSSID. The row is identified by its six bytes from here
+  ; on, and those same six bytes are what the firmware is asked to
+  ; confirm after the join. The name is printed too, for a reader.
+  UartWriteStr("  CHOSEN  ")
+  PrintBssid(@cyw43_bssBssid[0] + chosen * 6)
+  UartWriteStr("  ch ")
+  PrintDec(Cyw43ScanChannel(chosen))
+  UartWriteStr("  ")
+  PrintDec(Cyw43ScanRssi(chosen))
+  UartWriteStr(" dBm  ")
+  PrintSsid(Cyw43ScanSsid(chosen), Cyw43ScanSsidLen(chosen))
+  PrintNl()
+
+  ; THE SELECTION TEST IS ON THE ENTRY, NOT ON THE PASSPHRASE. Every
+  ; stored network on this bench shares one passphrase, so comparing the
+  ; passphrase that came back could not fail whichever slot was read -
+  ; every wrong answer is byte-identical to the right one. What is
+  ; printed and checked is WHICH SLOT matched and what SSID that slot
+  ; holds, which is the only thing that can distinguish them.
+  Line("  from stored slot", chosenSlot)
+  UartWriteStr("  that slot holds  ")
+  PrintSsid(SettingsWifiSlotSsid(chosenSlot), SettingsLength(SettingsWifiSlotSsidKey(chosenSlot)))
+  PrintNl()
+  UartWriteStr("  under key        ")
+  UartWriteStr(SettingsWifiSlotPasswordKey(chosenSlot))
+  PrintNl()
+
+  pass = SettingsWifiSlotPassword(chosenSlot)
+  passLen = SettingsLength(SettingsWifiSlotPasswordKey(chosenSlot))
+  Line("  passphrase bytes", passLen)
+  If pass = 0 Or passLen < 8
+    UartWriteStr("  THAT SLOT HAS NO USABLE PASSPHRASE. 8 to 63 bytes is the")
+    PrintNl()
+    UartWriteStr("  802.11i range and settings.pi4 enforces it on the way in,")
+    PrintNl()
+    UartWriteStr("  so a short one here means the key was never set.")
+    PrintNl()
+    UartWriteStr("=== stopped: no credential ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; 8 - THE SECURITY BLOCK, ONE PRINTED VERDICT PER ITEM.
+  ;
+  ; ITEM 2 IS THE EXPERIMENT. The bare "sup_wpa" existence probe
+  ; answered -23 BRCMF_FW_UNSUPPORTED on this board, which by
+  ; brcmfmac's rule means no firmware supplicant. But the probe asks
+  ; about a DIFFERENT IOVAR from the one a driver writes to turn the
+  ; supplicant on, and this line is the direct question: if
+  ; bsscfg:sup_wpa = 1 is accepted then the supplicant is there whatever
+  ; the probe said, and if it is refused then the host must do PBKDF2
+  ; and EAPOL itself and this payload stops here honestly.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- security --")
+  PrintNl()
+
+  verdict = 0
+  supGone = 0
+  pmkOk = 0
+  For i = 0 To #CYW43_SEC_ITEMS - 1
+    If i = #CYW43_SEC_PRE
+      ; The 100 ms settle and the PMK, between items 4 and 5. Both
+      ; reference drivers put a gap here and the longer of the two
+      ; margins is the one taken; see Cyw43SecurityWpa2.
+      ; ================================================================
+      ; THE PMK, AND THE STRUCT SIZE IS THE EXPERIMENT.
+      ;
+      ; brcmfmac declares 132 bytes and the twin sends 68. On
+      ; 2026-08-27 this firmware answered -2 BCME_BADARG to 68 - which
+      ; is BADARG and NOT -23 BCME_UNSUPPORTED, so the ioctl EXISTS on
+      ; this part and only the argument was wrong. 132 is tried first
+      ; because brcmfmac is the driver that works with this image; 68
+      ; is tried after, because a second data point costs one ioctl and
+      ; "both sizes were refused" is a different finding from "the
+      ; other size was right all along".
+      ; ================================================================
+      cyw43_DelayUs(100000)
+      r = Cyw43SetPmk(pass, passLen, #CYW43_PMK_STRUCT_132, 2000)
+      UartWriteStr("  PMK 132 bytes (brcmfmac's)         rc ")
+      PrintDec(r)
+      UartWriteStr("  status ")
+      PrintDec(Cyw43IoctlStatus())
+      PrintNl()
+      If r <> 0
+        r = Cyw43SetPmk(pass, passLen, #CYW43_PMK_STRUCT_68, 2000)
+        UartWriteStr("  PMK  68 bytes (the twin's)         rc ")
+        PrintDec(r)
+        UartWriteStr("  status ")
+        PrintDec(Cyw43IoctlStatus())
+        PrintNl()
+      EndIf
+      If r = 0
+        pmkOk = 1
+        UartWriteStr("     ^^ THE FIRMWARE TOOK THE PASSPHRASE. flags = 1 says")
+        PrintNl()
+        UartWriteStr("     it must run PBKDF2 over these bytes itself, so there")
+        PrintNl()
+        UartWriteStr("     IS key derivation in here even though bsscfg:sup_wpa")
+        PrintNl()
+        UartWriteStr("     is not a name it knows.")
+        PrintNl()
+      EndIf
+      If r <> 0
+        ; THE PMK IS PART OF THE SUPPLICANT AND FAILS WITH IT. Its
+        ; refusal is not a separate fault to stop on when items 2 to 4
+        ; have already said there is no supplicant to give a key to -
+        ; it is the same fact arriving a fourth time. Counted into
+        ; supGone rather than into verdict for exactly that reason.
+        supGone = supGone + 1
+        UartWriteStr("     ^^ and the PMK with it. -2 is BCME_BADARG, -23 is")
+        PrintNl()
+        UartWriteStr("     BCME_UNSUPPORTED; either way there is nothing here to")
+        PrintNl()
+        UartWriteStr("     hand a passphrase to.")
+        PrintNl()
+      EndIf
+      cyw43_DelayUs(3000)
+    EndIf
+
+    r = Cyw43SecItem(i, 2000)
+    UartWriteStr("  ")
+    PrintDec(i)
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43SecItemName(i))
+    UartWriteStr("   rc ")
+    PrintDec(r)
+    UartWriteStr("  status ")
+    PrintDec(Cyw43IoctlStatus())
+    PrintNl()
+
+    If i = #CYW43_SEC_SUPWPA And r <> 0
+      UartWriteStr("     ^^ bsscfg:sup_wpa REFUSED. The bare sup_wpa existence")
+      PrintNl()
+      UartWriteStr("     probe was right: THIS FIRMWARE HAS NO SUPPLICANT.")
+      PrintNl()
+    EndIf
+    If i = #CYW43_SEC_SUPWPA And r = 0
+      UartWriteStr("     ^^ ACCEPTED. The firmware CAN run the supplicant,")
+      PrintNl()
+      UartWriteStr("     whatever the bare sup_wpa probe answered.")
+      PrintNl()
+    EndIf
+
+    ; ==================================================================
+    ; ITEMS 4, 5 AND 6 ARE THE SUPPLICANT AND THEY FAIL TOGETHER OR NOT
+    ; AT ALL. They are counted into supGone rather than treated as
+    ; gates, and the run CONTINUES.
+    ;
+    ; WHY CONTINUE, WHEN THE FIRST VERSION OF THIS FILE STOPPED HERE.
+    ; Because stopping conflates two things that are not the same:
+    ; 802.11 AUTHENTICATION AND ASSOCIATION, which is what the word
+    ; "associate" means and which needs no supplicant at all, and the
+    ; RSN FOUR-WAY HANDSHAKE, which is key management and does. The
+    ; firmware will happily do the first with WSEC and WPA_AUTH set -
+    ; those are what put a matching RSN IE in the association request -
+    ; and everything after LINK-up is what has nobody to run it.
+    ;
+    ; So the join goes ahead, and what it measures is exactly how far
+    ; association gets on this part. That is a real answer to a real
+    ; question. What it must NEVER do is call the result a working
+    ; link, which is what Cyw43SetJoinExpectation(NOKEY) is for.
+    ; ==================================================================
+    If i = #CYW43_SEC_SUPWPA Or i = #CYW43_SEC_EAPVER Or i = #CYW43_SEC_SUPTMO
+      If r <> 0
+        supGone = supGone + 1
+      EndIf
+    ElseIf i = #CYW43_SEC_MFP
+      ; `mfp` is TOLERATED. A firmware without 802.11w refuses the iovar
+      ; and associates perfectly well without it, and stopping a join
+      ; over a capability advertisement would turn a missing optional
+      ; feature into a milestone failure.
+      If r <> 0
+        UartWriteStr("     (tolerated - mfp is an advertisement, not a requirement)")
+        PrintNl()
+      EndIf
+    ElseIf r <> 0
+      verdict = 1
+    EndIf
+  Next
+
+  ; The key material is out of both buffers by now - Cyw43SetPmk wipes
+  ; cyw43_arg and cyw43_tx unconditionally, on success and failure
+  ; alike. Said here because a reader of THIS file should not have to
+  ; open the library to find out whether a passphrase is still sitting
+  ; in DRAM where `memory 400000 200` would print it.
+
+  If verdict <> 0
+    UartWriteStr("  A GATED ITEM WAS REFUSED - one that is NOT part of the")
+    PrintNl()
+    UartWriteStr("  supplicant. Not attempting the join; it would fail for a")
+    PrintNl()
+    UartWriteStr("  reason already printed above.")
+    PrintNl()
+    UartWriteStr("=== stopped at security ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; THE VERDICT ON WHO RUNS THE SUPPLICANT, DECLARED TO THE LIBRARY.
+  ;
+  ; This is the one place in the run where a fact discovered at run time
+  ; changes what the state machine is allowed to conclude, and it is
+  ; done explicitly rather than inferred inside cyw43.pi4 - the library
+  ; refuses to guess, and this payload is the thing that watched item 2
+  ; be refused and therefore knows.
+  ; ====================================================================
+  ; ====================================================================
+  ; TWO FACTS, AND THE PMK IS THE ONE THAT DECIDES.
+  ;
+  ; The three bsscfg:sup_* iovars are ONE WAY of turning a firmware
+  ; supplicant on, and their absence proves only that this firmware does
+  ; not know those names. WLC_SET_WSEC_PMK with flags = 1 is a
+  ; DIFFERENT and older way, and it is the one that actually hands over
+  ; key material: flags = 1 means "these are ASCII, you run PBKDF2".
+  ; A firmware that ACCEPTS that has a supplicant whatever it thinks of
+  ; the iovar names, so the PMK's verdict outranks theirs.
+  ;
+  ; The first version of this file got that ordering wrong and declared
+  ; NOKEY on the strength of the -23s alone, while the PMK's own answer
+  ; was -2 BADARG - a wrong SIZE, not a missing feature.
+  ; ====================================================================
+  Line("supplicant iovars refused (0 = the firmware knows them)", supGone)
+  Line("the firmware took a passphrase (1 = yes)", pmkOk)
+  If pmkOk = 1
+    Cyw43SetJoinExpectation(#CYW43_JOINEXP_SECURED)
+    UartWriteStr("  THE FIRMWARE HAS THE KEY MATERIAL. A full WPA2 join is")
+    PrintNl()
+    UartWriteStr("  expected: PSK_SUP status 6 must arrive for this to pass.")
+    PrintNl()
+  Else
+    Cyw43SetJoinExpectation(#CYW43_JOINEXP_NOKEY)
+    UartWriteStr("  ================================================")
+    PrintNl()
+    UartWriteStr("  NO SUPPLICANT ON EITHER SIDE. WHAT FOLLOWS IS AN")
+    PrintNl()
+    UartWriteStr("  802.11 ASSOCIATION PROBE AND NOT A WORKING LINK.")
+    PrintNl()
+    UartWriteStr("  ================================================")
+    PrintNl()
+    UartWriteStr("  Association and authentication are 802.11; the four-way")
+    PrintNl()
+    UartWriteStr("  handshake that follows is RSN key management and there is")
+    PrintNl()
+    UartWriteStr("  nothing here to run it. Expect SET_SSID, AUTH and LINK to")
+    PrintNl()
+    UartWriteStr("  arrive and NO PSK_SUP, and expect the access point to")
+    PrintNl()
+    UartWriteStr("  deauthenticate once its own handshake timer expires.")
+    PrintNl()
+    UartWriteStr("  NO DATA FRAME CAN PASS: there is no pairwise key.")
+    PrintNl()
+  EndIf
+  Stamp("security done")
+
+  ; ====================================================================
+  ; 9 - THE JOIN
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- join --")
+  PrintNl()
+
+  ; ====================================================================
+  ; THE LADDER LOOP.
+  ;
+  ; ONE ITERATION IS EXACTLY THE JOIN THIS FILE ALWAYS DID. Nothing
+  ; inside the body was rewritten; it was indented and the two places
+  ; that named the single choice now name the rung. A run whose rung 0
+  ; succeeds - or whose rung 0 fails in any way probe_FallThrough does
+  ; not list - produces the same log it produced before this loop
+  ; existed, line for line apart from the two "rung" headers.
+  ;
+  ; THE PER-RUNG CREDENTIAL IS THE ONE THING A LATER RUNG HAS TO REDO.
+  ; The nine security items in section 8 configure the INTERFACE - which
+  ; cipher suite and which key-management suite this station offers -
+  ; and that is identical for every candidate, so they are sent once and
+  ; not re-sent here. The PASSPHRASE is per network, so a rung above 0
+  ; looks its slot's credential up and re-sends the PMK before joining.
+  ; Section 8 already did that for rung 0, including its two-struct-size
+  ; experiment and all of its narration, and repeating that experiment
+  ; three more times would bury the finding it exists to report.
+  ;
+  ; chosen AND chosenSlot ARE UPDATED AS THE LADDER MOVES, so section 10
+  ; below - the read-back that proves which access point actually
+  ; answered - checks the rung that was last attempted, without knowing
+  ; the ladder exists.
+  ; ====================================================================
+  rung = 0
+  attempts = 0
+  fellThrough = 0
+  verdict = #CYW43_JOIN_FAILED
+
+  While rung < rungs
+    chosen = ladderRow[rung]
+    chosenSlot = ladderSlot[rung]
+
+    UartWriteStr("  --- rung ")
+    PrintDec(rung)
+    UartWriteStr(" of ")
+    PrintDec(rungs)
+    UartWriteStr("  slot ")
+    PrintDec(chosenSlot)
+    UartWriteStr("  ")
+    PrintSsid(Cyw43ScanSsid(chosen), Cyw43ScanSsidLen(chosen))
+    UartWriteStr("  ")
+    PrintBssid(@cyw43_bssBssid[0] + chosen * 6)
+    PrintNl()
+    UartDrain()
+
+    If rung > 0
+      ; A LATER RUNG'S CREDENTIAL. Looked up the same way section 8
+      ; looked up rung 0's, and refused on the same terms: 8 to 63
+      ; bytes is the 802.11i range and settings.pi4 enforces it on the
+      ; way in, so a short one here means the key was never set.
+      pass = SettingsWifiSlotPassword(chosenSlot)
+      passLen = SettingsLength(SettingsWifiSlotPasswordKey(chosenSlot))
+      If pass = 0 Or passLen < 8
+        UartWriteStr("      that slot has no usable passphrase - skipping this rung")
+        PrintNl()
+        rung = rung + 1
+        Continue
+      EndIf
+
+      ; The same 100 ms settle and the same struct-size order as
+      ; section 8. Quietly this time: the experiment was reported once
+      ; and the answer will not have changed between two rungs.
+      cyw43_DelayUs(100000)
+      r = Cyw43SetPmk(pass, passLen, #CYW43_PMK_STRUCT_132, 2000)
+      If r <> 0
+        r = Cyw43SetPmk(pass, passLen, #CYW43_PMK_STRUCT_68, 2000)
+      EndIf
+      Line("      PMK for this rung (0 = taken)", r)
+      cyw43_DelayUs(3000)
+    EndIf
+
+    attempts = attempts + 1
+    r = Cyw43JoinStart(Cyw43ScanSsid(chosen), Cyw43ScanSsidLen(chosen), 2000)
+    Line("Cyw43JoinStart (want 0)", r)
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    If r <> 0
+      UartWriteStr("  THE REQUEST ITSELF WAS REFUSED, so no events will follow.")
+      PrintNl()
+      UartWriteStr("=== stopped starting the join ===")
+      PrintNl()
+      ProcedureReturn 1
+    EndIf
+
+  ; EVERY EVENT IS PRINTED AS IT ARRIVES, with its raw numbers. Nothing
+  ; on this part has ever been measured, so the ORDER of these lines is
+  ; itself the finding - which is why this loop prints before it acts on
+  ; the verdict rather than summarising afterwards.
+    slices = 0
+    verdict = #CYW43_JOIN_RUNNING
+    While slices < #JOIN_MAX_SLICES
+      verdict = Cyw43JoinPoll(#JOIN_SLICE_MS)
+      slices = slices + 1
+      If Cyw43EventNew() <> 0
+        UartWriteStr("  [t+")
+        PrintDec(NowMs() - startMs)
+        UartWriteStr(" ms] event ")
+        PrintDec(Cyw43JoinEventType())
+        UartWriteStr(" ")
+        UartWriteStr(Cyw43EventName(Cyw43JoinEventType()))
+        UartWriteStr("  status ")
+        PrintDec(Cyw43JoinEventStatus())
+        UartWriteStr("  reason ")
+        PrintDec(Cyw43JoinEventReason())
+        UartWriteStr("  flags $")
+        PutHexN(Cyw43JoinEventFlags(), 4)
+        UartWriteStr("  state $")
+        PutHexN(Cyw43JoinState(), 4)
+        PrintNl()
+        ; AN ASSOC EVENT THAT FAILED CARRIES THE ACCESS POINT'S OWN 802.11
+        ; STATUS CODE IN ITS REASON FIELD, and it is the only place in the
+        ; whole run where the other end explains itself. Printed here, in
+        ; words, immediately under the raw numbers.
+        If Cyw43JoinEventType() = #CYW43_EV_ASSOC
+          If Cyw43JoinEventStatus() <> 0
+            UartWriteStr("        the AP said: ")
+            UartWriteStr(Cyw43AssocStatusText(Cyw43JoinEventReason()))
+            PrintNl()
+          EndIf
+        EndIf
+        UartDrain()
+      EndIf
+      If verdict <> #CYW43_JOIN_RUNNING
+        Break
+      EndIf
+    Wend
+
+    Line("poll slices used ", slices)
+    Line("join verdict (1 = JOINED)", verdict)
+    HexLine("accumulator      ", Cyw43JoinState(), 4)
+    Line("SET_SSID status 0 seen", Cyw43JoinSsidOk())
+    Line("events seen      ", Cyw43EventsSeen())
+    Line("events DROPPED   ", Cyw43EventsDropped())
+    Line("ICV errors       ", Cyw43IcvErrors())
+    If slices >= #JOIN_MAX_SLICES
+      UartWriteStr("  THE CALLER'S OWN CEILING FIRED, which means the library's")
+      PrintNl()
+      UartWriteStr("  guards did not. That is a bug in Cyw43JoinPoll, not in the")
+      PrintNl()
+      UartWriteStr("  radio.")
+      PrintNl()
+    EndIf
+    ; WHAT "JOINED" MEANS HERE, IN WORDS, EVERY TIME. The library owns
+    ; the sentence (Cyw43JoinedMeansText) so that this log and the state
+    ; machine cannot disagree about what was proved.
+    UartWriteStr("  JOINED would mean: ")
+    UartWriteStr(Cyw43JoinedMeansText())
+    PrintNl()
+
+    If verdict <> #CYW43_JOIN_JOINED
+      Line("join failure class", Cyw43JoinFail())
+      UartWriteStr("  ")
+      UartWriteStr(Cyw43JoinFailText())
+      PrintNl()
+      Line("  phase reached  ", Cyw43JoinPhase())
+    Else
+      Stamp("ASSOCIATED")
+    EndIf
+
+    ; ==================================================================
+    ; THE FALL-THROUGH DECISION, AND THE FOUR REASONS IT CAN SAY NO.
+    ;
+    ; Printed in full every time, because a ladder that stops without
+    ; saying why is worse than no ladder: the log would look identical
+    ; to the old single-choice behaviour and nobody would know which
+    ; they were reading.
+    ; ==================================================================
+    If verdict = #CYW43_JOIN_JOINED
+      Break
+    EndIf
+
+    If probe_FallThrough(Cyw43JoinFail()) = 0
+      UartWriteStr("  LADDER STOPS: this failure is not one another network")
+      PrintNl()
+      UartWriteStr("  would fix. See probe_FallThrough for the three that are.")
+      PrintNl()
+      Break
+    EndIf
+
+    If rung + 1 >= rungs
+      UartWriteStr("  LADDER STOPS: that was the last rung.")
+      PrintNl()
+      Break
+    EndIf
+
+    If (NowMs() - startMs) > #JOIN_LADDER_BUDGET_MS
+      Line("  LADDER STOPS on the clock, elapsed ms", NowMs() - startMs)
+      UartWriteStr("  The deadman gets the rest of the budget.")
+      PrintNl()
+      Break
+    EndIf
+
+    ; DISASSOCIATE BEFORE THE NEXT RUNG. Not tidiness: the twin's bench
+    ; measured attempt-1 success going from 4.3% to 75.3% across 144
+    ; reset-to-reset cycles when a clean teardown preceded the retry,
+    ; and the keying-stall failure MODE disappeared rather than becoming
+    ; rarer. cyw43.pi4's Cyw43Disassoc carries the citation. Here it
+    ; also clears whatever half-state the refusing access point left.
+    r = Cyw43Disassoc(2000)
+    Line("  disassociate before the next rung (0 = ok)", r)
+    r = Cyw43DrainEvents(200)
+    Line("  events drained ", r)
+    fellThrough = fellThrough + 1
+    rung = rung + 1
+  Wend
+
+  ; attempts, NOT rung + 1: a rung whose slot turned out to have no
+  ; usable passphrase is skipped without an association attempt, and
+  ; counting it would overstate what the radio was asked to do.
+  Line("rungs attempted  ", attempts)
+  Line("fall-throughs    ", fellThrough)
+
+  If verdict <> #CYW43_JOIN_JOINED
+    ; THE READ-BACKS RUN ANYWAY. A join that failed may still have been
+    ; associated for part of a second - AUTH and LINK arriving and then
+    ; a DEAUTH is exactly the supplicant-less signature - and
+    ; WLC_GET_BSSID answering with an address at any point is the
+    ; evidence that association itself worked. Refusing to look because
+    ; the verdict was FAILED would throw away the finding.
+    UartWriteStr("  === NOT A COMPLETED JOIN - reading the link back anyway ===")
+    PrintNl()
+  EndIf
+
+  ; ====================================================================
+  ; 10 - THE PROOF. Not what the state machine thinks - what the
+  ; firmware says when asked.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- proof --")
+  PrintNl()
+
+  r = Cyw43ReadBssid(2000)
+  Line("WLC_GET_BSSID says associated (want 1)", r)
+  If r = 1
+    UartWriteStr("  negotiated BSSID  ")
+    PrintBssid(@cyw43_linkBssid[0])
+    PrintNl()
+    UartWriteStr("  we chose          ")
+    PrintBssid(@cyw43_bssBssid[0] + chosen * 6)
+    PrintNl()
+
+    ; THE COMPARISON IS THE POINT OF THE WHOLE SELECTION. Joining
+    ; something called by the right name is not the same as joining the
+    ; access point that was chosen, and on a network with more than one
+    ; AP broadcasting one SSID the two routinely differ.
+    bssidOk = 1
+    For j = 0 To 5
+      If Cyw43LinkBssidByte(j) <> Cyw43ScanBssidByte(chosen, j)
+        bssidOk = 0
+      EndIf
+    Next
+    Line("  BSSID MATCHES THE ONE WE CHOSE (want 1)", bssidOk)
+    If bssidOk = 0
+      UartWriteStr("  A DIFFERENT ACCESS POINT ANSWERED. That is not a failure")
+      PrintNl()
+      UartWriteStr("  of the link - it is a failure of the selection to bind.")
+      PrintNl()
+      UartWriteStr("  WLC_SET_SSID joins by NAME; pinning a BSSID needs the")
+      PrintNl()
+      UartWriteStr("  `join` iovar, which cyw43.pi4 does not build. See the")
+      PrintNl()
+      UartWriteStr("  head of section 8 there.")
+      PrintNl()
+    EndIf
+  EndIf
+
+  r = Cyw43ReadSsid(2000)
+  Line("WLC_GET_SSID rc  ", r)
+  If r = 0
+    UartWriteStr("  negotiated SSID   ")
+    PrintSsid(Cyw43LinkSsid(), Cyw43LinkSsidLen())
+    PrintNl()
+    matched = 1
+    If Cyw43LinkSsidLen() <> Cyw43ScanSsidLen(chosen)
+      matched = 0
+    Else
+      For j = 0 To Cyw43LinkSsidLen() - 1
+        If PeekA(Cyw43LinkSsid() + j) <> PeekA(Cyw43ScanSsid(chosen) + j)
+          matched = 0
+        EndIf
+      Next
+    EndIf
+    Line("  SSID matches (want 1)", matched)
+  EndIf
+
+  r = Cyw43ReadChannel(2000)
+  Line("WLC_GET_CHANNEL rc", r)
+  If r = 0
+    Line("  negotiated channel", Cyw43LinkChannel())
+    Line("  the scan said     ", Cyw43ScanChannel(chosen))
+  EndIf
+
+  r = Cyw43ReadRssi(2000)
+  Line("WLC_GET_RSSI rc  ", r)
+  If r = 0
+    Line("  link RSSI dBm   ", Cyw43LinkRssi())
+    If probe_RssiSane(Cyw43LinkRssi()) = 0
+      UartWriteStr("  THAT IS NOT A PLAUSIBLE dBm READING - see probe_RssiSane.")
+      PrintNl()
+    EndIf
+  EndIf
+
+  ; ====================================================================
+  ; 10b - THE THREE QUESTIONS A HOST SUPPLICANT NEEDS ANSWERED, AND THEY
+  ;       ALL COST LESS THAN A SECOND EACH.
+  ;
+  ; The firmware build string already says there is no in-dongle
+  ; supplicant - see the head of section 10 in cyw43.pi4 for the two
+  ; blobs side by side. What it does NOT say is whether the three
+  ; things a HOST supplicant depends on are there:
+  ;
+  ;   1. does the AP actually start a four-way handshake with us, and
+  ;      does the firmware pass EAPOL up to the host as a data frame?
+  ;      THIS IS THE ONE THAT DECIDES EVERYTHING. If message 1 never
+  ;      arrives there is nothing to answer and no amount of correct
+  ;      arithmetic helps.
+  ;   2. what RSN information element did the association request
+  ;      actually carry? Message 2 has to repeat it byte for byte.
+  ;   3. does the BARE `sup_wpa` spelling - brcmfmac's, cfg80211.c:2477
+  ;      - answer differently from the `bsscfg:` one the last bench
+  ;      sent? Expected no. Asked anyway, because it is one ioctl and
+  ;      it closes the question.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- what a host supplicant would need --")
+  PrintNl()
+
+  r = Cyw43MacAddress(@ourMac[0], 2000)
+  Line("cur_etheraddr rc ", r)
+  If r = 0
+    UartWriteStr("  our MAC          ")
+    PrintBssid(@ourMac[0])
+    PrintNl()
+  EndIf
+
+  ; --- 3, first, because it is the cheapest -------------------------
+  r = Cyw43SupWpaEnable(2000)
+  UartWriteStr("  sup_wpa = 1 (BARE name, brcmfmac's)   rc ")
+  PrintDec(r)
+  UartWriteStr("  status ")
+  PrintDec(Cyw43IoctlStatus())
+  PrintNl()
+  If r = 0
+    UartWriteStr("     ^^ ACCEPTED. Everything below is unnecessary - the")
+    PrintNl()
+    UartWriteStr("     firmware will run the handshake. Give it the PMK.")
+    PrintNl()
+  Else
+    UartWriteStr("     ^^ refused, as the build string predicted. -23 is")
+    PrintNl()
+    UartWriteStr("     BCME_UNSUPPORTED: the name is not in this image.")
+    PrintNl()
+  EndIf
+
+  ; --- 2 - what went out in the association request -----------------
+  r = Cyw43GetAssocReqIes(160, 2000)
+  Line("assoc_req_ies rc ", r)
+  If r = 0
+    n = Cyw43ReplyLen()
+    Line("  bytes of IEs    ", n)
+    p = Cyw43ReplyPtr()
+    ; Walk the elements. id, len, body - and print the RSN one ($30)
+    ; in full, because those exact bytes are what message 2 must carry.
+    i = 0
+    While i + 2 <= n
+      k = PeekA(p + i + 1)
+      If i + 2 + k > n
+        UartWriteStr("  IE RUNS PAST THE REPLY at offset ")
+        PrintDec(i)
+        PrintNl()
+        Break
+      EndIf
+      UartWriteStr("  IE id ")
+      PrintDec(PeekA(p + i))
+      UartWriteStr(" len ")
+      PrintDec(k)
+      If PeekA(p + i) = 48
+        UartWriteStr("   <- RSN:  ")
+        For j = 0 To k + 1
+          PutHexN(PeekA(p + i + j), 2)
+          UartWrite(32)
+        Next
+      EndIf
+      PrintNl()
+      i = i + 2 + k
+    Wend
+    UartDrain()
+  EndIf
+
+  ; --- 1 - THE DECIDING QUESTION ------------------------------------
+  ; EtherType $888E is 802.1X. The firmware passes it up in the clear
+  ; before any key is installed - that is the whole point of the
+  ; controlled/uncontrolled port split - so if the AP is talking to us
+  ; at all, message 1 lands here as an ordinary 802.3 frame on SDPCM
+  ; channel 2.
+  PrintNl()
+  UartWriteStr("  listening for EAPOL, ")
+  PrintDec(#EAPOL_LISTEN_MS)
+  UartWriteStr(" ms ...")
+  PrintNl()
+  UartDrain()
+
+  eapolLen = 0
+  eapolMs = NowMs()
+  While (NowMs() - eapolMs) < #EAPOL_LISTEN_MS
+    n = Cyw43Receive(100)
+    If n >= 14
+      p = Cyw43ReceivePtr()
+      If PeekA(p + 12) = $88 And PeekA(p + 13) = $8E
+        eapolLen = n
+        Break
+      EndIf
+      UartWriteStr("  a data frame, ")
+      PrintDec(n)
+      UartWriteStr(" bytes, ethertype $")
+      PutHexN(PeekA(p + 12), 2)
+      PutHexN(PeekA(p + 13), 2)
+      UartWriteStr(" - not 802.1X")
+      PrintNl()
+      UartDrain()
+    EndIf
+  Wend
+
+  If eapolLen = 0
+    UartWriteStr("  NO EAPOL IN ")
+    PrintDec(#EAPOL_LISTEN_MS)
+    UartWriteStr(" ms. Either the association never completed, or")
+    PrintNl()
+    UartWriteStr("  the AP gave up before we listened, or the firmware is not")
+    PrintNl()
+    UartWriteStr("  passing 802.1X frames to the host. The rx data frame")
+    PrintNl()
+    UartWriteStr("  counter below separates the last of those from the others.")
+    PrintNl()
+  Else
+    p = Cyw43ReceivePtr()
+    UartWriteStr("  *** EAPOL MESSAGE, ")
+    PrintDec(eapolLen)
+    UartWriteStr(" bytes ***")
+    PrintNl()
+    UartWriteStr("    from        ")
+    PrintBssid(p + 6)
+    PrintNl()
+    UartWriteStr("    to          ")
+    PrintBssid(p)
+    PrintNl()
+    Line("    1X version ", PeekA(p + 14))
+    Line("    1X type    ", PeekA(p + 15))
+    Line("    1X body len", (PeekA(p + 16) << 8) | PeekA(p + 17))
+    If PeekA(p + 15) = 3 And eapolLen >= 113
+      Line("    descriptor ", PeekA(p + 18))
+      UartWriteStr("    key info   $")
+      PutHexN((PeekA(p + 19) << 8) | PeekA(p + 20), 4)
+      PrintNl()
+      Line("    key length ", (PeekA(p + 21) << 8) | PeekA(p + 22))
+      Line("    key data ln", (PeekA(p + 111) << 8) | PeekA(p + 112))
+      UartWriteStr("    THAT IS MESSAGE 1 OF THE FOUR-WAY HANDSHAKE. Key")
+      PrintNl()
+      UartWriteStr("    descriptor version is the low three bits of key info;")
+      PrintNl()
+      UartWriteStr("    2 means HMAC-SHA1-128 MIC and AES key wrap.")
+      PrintNl()
+    EndIf
+  EndIf
+  UartDrain()
+
+  ; ====================================================================
+  ; 11 - the counters, whether or not any of it worked
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- transport counters --")
+  PrintNl()
+  Line("rx frames        ", Cyw43RxFrames())
+  Line("rx data frames   ", Cyw43RxDataFrames())
+  Line("tx data frames   ", Cyw43TxFrames())
+  Line("bad headers      ", Cyw43RxBadHdr())
+  Line("too short        ", Cyw43RxShort())
+  Line("other channels   ", Cyw43RxOther())
+  Line("other events     ", Cyw43EvOther())
+  Line("bad event prefix ", Cyw43EvBadIsland())
+  Line("empty events     ", Cyw43EvEmpty())
+  Line("credit stalls    ", Cyw43Stalls())
+  Line("duplicates folded", Cyw43ScanDuplicates())
+  PrintNl()
+
+  Stamp("done")
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

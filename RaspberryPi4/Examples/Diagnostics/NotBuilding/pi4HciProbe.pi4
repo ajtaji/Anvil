@@ -1,0 +1,614 @@
+; pi4HciProbe.pi4 - the Bluetooth UART HCI transport, exercised so a
+; harness can watch every byte it puts on the wire.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is the artefact tools/a64/a64_hci_check.py runs.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HciProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 \
+;        --entry-returns -o hciprobe.img
+;
+; ======================================================================
+;  ON THIS BENCH IT WILL REFUSE, AND THAT IS THE CORRECT RESULT
+; ======================================================================
+; The board runs with dtoverlay=disable-bt, which moves the PL011 to
+; header pins 8 and 10 so the serial console can have it. The Bluetooth
+; module is on the other end of that same PL011, through GPIO 30-33,
+; and it is not powered. So on this board today this program prints its
+; routing report, says "REFUSED - the PL011 is the console", and stops
+; without writing a single UART register.
+;
+; That is not the program failing. It is RaspberryPi4/Lib/bluetooth.pi4
+; doing the one thing that file exists to do. Read its header - the
+; section headed THE OPTIONS, WHAT EACH COSTS, AND WHICH ONE WAS PICKED
+; - for what has to change on the boot medium before this probe can
+; reach a Bluetooth controller.
+;
+; ======================================================================
+;  WHY IT GOES QUIET IN THE MIDDLE, AND WHY THAT IS NOT A BUG
+; ======================================================================
+; THERE IS ONE PL011 AND THIS PROGRAM NEEDS IT FOR TWO THINGS. The
+; console it reports through and the HCI transport it is testing are
+; the same peripheral, pointed at different pins. So the program is in
+; three phases and the middle one is silent:
+;
+;   PHASE 1  console on GPIO 14/15. Banner, routing report.
+;   PHASE 2  BtInit() muxes the PL011 to GPIO 30-33. THE CONSOLE IS
+;            GONE. Every result is stashed in a global; nothing prints,
+;            because anything printed here would go down the HCI wire
+;            and desynchronise the controller's packet parser - which
+;            is exactly the failure the transport spec calls a loss of
+;            synchronisation.
+;   PHASE 3  the mux is put back, the console returns, everything
+;            measured in phase 2 is printed at once.
+;
+; A reader watching a terminal sees a pause. A reader who does not know
+; why sees a hang. Hence this comment, and hence the "--- phase 2, the
+; console is about to go quiet ---" line the program prints before it
+; happens.
+;
+; THE MUX RESTORE IS THIS PROGRAM'S JOB, NOT THE LIBRARY'S.
+; bluetooth.pi4's BtOff() deliberately leaves the pins alone, for the
+; same reason uart.pi4's UartOff() does: dropping TXD is a break
+; condition at whatever is listening. A diagnostic that has to get its
+; own console back is a different situation from a library shutting a
+; port down, so the restore lives here where its consequences are
+; local and visible.
+;
+; ======================================================================
+;  WHAT IS WORTH CHECKING HERE, and it is not "does it compile"
+; ======================================================================
+;
+;   1. THE ROUTING REFUSAL FIRES AND COSTS NOTHING. On a board whose
+;      PL011 is the console, BtInit() must return 0 having written NO
+;      register at all. Not "written and reverted" - never written. The
+;      gate asserts zero bytes on the wire for that case, which is the
+;      only assertion that can distinguish a refusal from a very quiet
+;      failure.
+;
+;   2. H4 FRAMING, IN BOTH DIRECTIONS. A command is 1 + 3 + plen bytes
+;      and an event is 1 + 2 + plen, and nothing in the protocol keeps
+;      them aligned except counting. The gate reads the command stream
+;      byte by byte and answers with events it builds itself.
+;
+;   3. THE MALFORMED CASES, WHICH IS WHERE THE BUGS ACTUALLY ARE. The
+;      last exchange this program runs is a second HCI_Reset that
+;      exists ONLY so the harness has somewhere to send a broken
+;      answer: a short event, a bad packet indicator, a Command
+;      Complete naming the wrong command, or a credit-only Command
+;      Complete that must be skipped rather than mistaken for the
+;      reply. Each one has to produce a DIFFERENT error code, and the
+;      probe prints the code rather than a pass/fail so the gate can
+;      tell them apart.
+;
+;   4. THE PLACEHOLDER ADDRESS. Read_BD_ADDR on an unpatched CYW43455
+;      succeeds and returns a factory constant. A probe that printed it
+;      as "the address" would be reporting a lie with a status byte of
+;      zero behind it.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/bluetooth.pi4"
+
+; ----------------------------------------------------------------------
+;  BT_ON, through the firmware GPIO expander.
+;
+;  Not a BCM2711 GPIO. bcm271x-rpi-bt.dtsi line 7 has
+;  shutdown-gpios = <&expgpio 0 GPIO_ACTIVE_HIGH>, bcm2711-rpi-4-b.dts
+;  line 62 names expgpio line 0 "BT_ON", and raspberrypi-exp-gpio.c
+;  line 20 adds RPI_EXP_GPIO_BASE 128 to the line number before it goes
+;  in the mailbox. Tags from raspberrypi-firmware.h lines 84-88.
+;
+;  THESE TWO TAG NUMBERS BELONG IN mailbox.pi4 and are here only
+;  because that file is shared and this work may not edit it. See the
+;  bottom of bluetooth.pi4.
+; ----------------------------------------------------------------------
+#HP_TAG_SET_GPIO_CONFIG = $00038043
+#HP_TAG_SET_GPIO_STATE  = $00038041
+#HP_BT_ON = 128
+
+; SET_GPIO_CONFIG's six words, raspberrypi-exp-gpio.c lines 32-39:
+;   gpio, direction, polarity, term_en, term_pull_up, state
+#HP_GPIO_DIR_OUT = 1
+
+; ----------------------------------------------------------------------
+;  The console's own pin mux, for phase 3. Read-modify-write against
+;  these masks and nothing wider: GPFSEL1 also holds GPIO 10-13, which
+;  may be an SPI somebody else set up, and GPFSEL3 also holds GPIO
+;  34-39, which are the SD card.
+; ----------------------------------------------------------------------
+#HP_GPFSEL1 = $FE200004
+#HP_GPFSEL3 = $FE20000C
+#HP_F1415_MASK = $0003F000     ; FSEL14 bits 14:12, FSEL15 bits 17:15
+#HP_F1415_ALT0 = $00024000     ; both ALT0 (b100) - TXD0 and RXD0
+#HP_F3033_MASK = $00000FFF     ; FSEL30..FSEL33
+
+; ----------------------------------------------------------------------
+;  The receive bound for exchange 4 ONLY, and it is deliberately short.
+;
+;  Exchanges 1 to 3 pass 0 and get bluetooth.pi4's full #BT_RX_SPIN_MAX,
+;  which is right for a controller that may genuinely be thinking.
+;  Exchange 4 exists to be answered BADLY - by a harness that has
+;  already decided to send a truncated packet - so the interesting
+;  outcome is reached in microseconds and the rest of the wait is pure
+;  cost. On silicon it is the difference between a probe that finishes
+;  and one that looks hung; under the gate's interpreter, where every
+;  spin is an emulated instruction, it is the difference between
+;  seconds and tens of minutes.
+;
+;  IT IS NOT A TUNING PARAMETER FOR THE OTHER THREE. Do not "make them
+;  consistent" by passing this to exchanges 1 to 3: a real HCI_Reset
+;  after a firmware patch takes a quarter of a second, and 20000 bus
+;  reads is nowhere near that.
+; ----------------------------------------------------------------------
+#HP_FRAME_SPINS = 20000
+
+; ----------------------------------------------------------------------
+;  Everything phase 2 measures. It cannot print, so it remembers.
+;
+;  EVERY ERROR SLOT STARTS AT -1, WHICH MEANS "NOT ATTEMPTED", AND THAT
+;  IS NOT TIDINESS. Zero is #BT_ERR_NONE - "no error" - so a slot left
+;  at its default reads as SUCCESS on a run where the step never
+;  happened at all. The routing refusal is exactly that run: BtInit()
+;  stops phase 2 dead, and a report saying "reset err 0 none" under a
+;  reset that was never sent is a silent wrong answer in the one
+;  instrument built to find them.
+; ----------------------------------------------------------------------
+#HP_NOT_ATTEMPTED = -1
+
+Global r_route.i
+Global r_header.i
+Global r_module.i
+Global r_power.i
+Global r_powerErr.i
+Global r_init.i
+Global r_initErr.i
+Global r_flushed.i
+Global r_reset.i
+Global r_resetErr.i
+Global r_resetStatus.i
+Global r_ver.i
+Global r_verErr.i
+Global r_bd.i
+Global r_bdErr.i
+Global r_bdPlaceholder.i
+Global r_extra.i
+Global r_extraErr.i
+Global r_extraEvt.i
+Global r_extraLen.i
+Global r_extraGot.i
+Global r_badByte.i
+Global r_routeAfter.i
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RouteName(r) - the routing code, in words.
+;
+;  A number here would be a second thing to look up at the exact moment
+;  somebody is already confused about which UART is where.
+; ----------------------------------------------------------------------
+Procedure RouteName(r.i)
+  UartWriteStr("  routing        ")
+  If r = #BT_ROUTE_MODULE
+    UartWriteStr("PL011 -> GPIO 30-33, the Bluetooth module")
+  ElseIf r = #BT_ROUTE_HEADER
+    UartWriteStr("PL011 -> GPIO 14/15, the header. THIS IS THE CONSOLE.")
+  ElseIf r = #BT_ROUTE_BOTH
+    UartWriteStr("BOTH pin sets muxed - one transmitter, two destinations")
+  Else
+    UartWriteStr("neither pin set is muxed to the PL011")
+  EndIf
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ErrName(e) - the failure code, in words. Same argument as above.
+; ----------------------------------------------------------------------
+Procedure ErrName(e.i)
+  If e = #HP_NOT_ATTEMPTED
+    UartWriteStr("NOT ATTEMPTED - this step never ran")
+  ElseIf e = #BT_ERR_NONE
+    UartWriteStr("none")
+  ElseIf e = #BT_ERR_ROUTING
+    UartWriteStr("ROUTING - the PL011 is the console, refused")
+  ElseIf e = #BT_ERR_NOT_READY
+    UartWriteStr("NOT_READY - no port")
+  ElseIf e = #BT_ERR_NOT_POWERED
+    UartWriteStr("NOT_POWERED - BT_ON was never declared raised")
+  ElseIf e = #BT_ERR_TX
+    UartWriteStr("TX - the FIFO never drained (CTS? see BtDropped)")
+  ElseIf e = #BT_ERR_TIMEOUT
+    UartWriteStr("TIMEOUT - nothing came back")
+  ElseIf e = #BT_ERR_INDICATOR
+    UartWriteStr("INDICATOR - not one of the five H4 packet types")
+  ElseIf e = #BT_ERR_NOT_EVENT
+    UartWriteStr("NOT_EVENT - a valid indicator, but not $04")
+  ElseIf e = #BT_ERR_SHORT
+    UartWriteStr("SHORT - the stream stopped inside the packet")
+  ElseIf e = #BT_ERR_OVERFLOW
+    UartWriteStr("OVERFLOW - plen past the buffer")
+  ElseIf e = #BT_ERR_OPCODE
+    UartWriteStr("OPCODE - a Command Complete for another command")
+  ElseIf e = #BT_ERR_STATUS
+    UartWriteStr("STATUS - the command completed and reported failure")
+  ElseIf e = #BT_ERR_HWERR
+    UartWriteStr("HWERR - HCI_Hardware_Error, the controller lost sync")
+  ElseIf e = #BT_ERR_PLEN
+    UartWriteStr("PLEN - parameter length out of range")
+  ElseIf e = #BT_ERR_BADDIV
+    UartWriteStr("BADDIV - the baud divisor is unreachable")
+  ElseIf e = #BT_ERR_NEEDS_PATCH
+    UartWriteStr("NEEDS_PATCH - past the firmware wall")
+  ElseIf e = #BT_ERR_NO_FIRMWARE
+    UartWriteStr("NO_FIRMWARE - there is no .hcd and there cannot be")
+  Else
+    UartWriteStr("unknown")
+  EndIf
+EndProcedure
+
+Procedure ErrLine(*name, e.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(e)
+  UartWriteStr("  ")
+  ErrName(e)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BtOnRaise() - drive the firmware expander line that powers the
+;  Bluetooth core. Returns 1 on success.
+;
+;  TWO TRANSACTIONS, NOT ONE, and the order is the driver's. Linux's
+;  raspberrypi-exp-gpio.c makes the line an output with the state it
+;  wants (SET_GPIO_CONFIG, six words, lines 103-119) and then sets the
+;  state (SET_GPIO_STATE, two words, lines 175-192). Doing only the
+;  second on a line the firmware still has configured as an input is a
+;  transaction that reports success and changes nothing - which on this
+;  board is indistinguishable from every other way of getting silence.
+;
+;  THE POLARITY WORD IS READ-MODIFY-WRITE IN LINUX and is passed as 0
+;  here. The driver calls rpi_exp_gpio_get_polarity() first specifically
+;  to "Retain existing setting" (line 118) - so this is a place where
+;  this probe is deliberately simpler than the driver, and it is
+;  recorded rather than hidden. BT_ON is documented ACTIVE_HIGH in the
+;  device tree (bcm271x-rpi-bt.dtsi line 7,
+;  shutdown-gpios = <&expgpio 0 GPIO_ACTIVE_HIGH>), so 0 is the
+;  expected value; if a future board ships it inverted, this is the
+;  line that would need the read.
+; ----------------------------------------------------------------------
+Procedure.i BtOnRaise()
+  ; --- SET_GPIO_CONFIG: make line 128 an output, driven high ---------
+  If MailboxBegin(#HP_TAG_SET_GPIO_CONFIG, 24, 24) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #HP_BT_ON)
+  MailboxSetWord(1, #HP_GPIO_DIR_OUT)
+  MailboxSetWord(2, 0)                 ; polarity - see the note above
+  MailboxSetWord(3, 0)                 ; term_en, n/a on an output
+  MailboxSetWord(4, 0)                 ; term_pull_up, n/a
+  MailboxSetWord(5, 1)                 ; state
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ; The firmware answers by writing 0 into the gpio word on success -
+  ; raspberrypi-exp-gpio.c line 121 tests `set_out.gpio != 0` and calls
+  ; anything else a failure. Checked, because a tag the firmware does
+  ; not implement comes back marked answered with the request echoed.
+  If MailboxWord(0) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  ; --- SET_GPIO_STATE: drive it high ---------------------------------
+  If MailboxBegin(#HP_TAG_SET_GPIO_STATE, 8, 8) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #HP_BT_ON)
+  MailboxSetWord(1, 1)
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  If MailboxWord(0) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ConsoleMuxRestore() - put GPIO 14/15 back to ALT0 and GPIO 30-33
+;  back to plain inputs, so phase 3 has somewhere to print.
+;
+;  THE ORDER MATTERS AND IT IS THE OPPOSITE OF WHAT LOOKS NATURAL.
+;  Un-mux the Bluetooth pins FIRST, then mux the header pins. Do it the
+;  other way and there is a window - however short - in which both pin
+;  sets are driven by the one transmitter, which is #BT_ROUTE_BOTH:
+;  every byte goes to a terminal and to a Bluetooth core at the same
+;  time. It is a handful of instructions wide and it would still be a
+;  real state that a fault at the wrong moment could leave behind.
+;
+;  GPIO 30-33 go to INPUT (b000), not back to whatever they were.
+;  Nothing recorded what they were, and inventing a previous value is
+;  worse than the honest default. On this board they were inputs.
+; ----------------------------------------------------------------------
+Procedure ConsoleMuxRestore()
+  Define v.i
+  v = PeekN(#HP_GPFSEL3)
+  v = v & (~#HP_F3033_MASK)
+  PokeL(#HP_GPFSEL3, v)
+
+  v = PeekN(#HP_GPFSEL1)
+  v = v & (~#HP_F1415_MASK)
+  v = v | #HP_F1415_ALT0
+  PokeL(#HP_GPFSEL1, v)
+EndProcedure
+
+; ======================================================================
+;  PHASE 2 - everything between the mux and the restore. NO PRINTING.
+; ======================================================================
+;  Split into its own procedure so that the rule "nothing in here may
+;  print" has a boundary a reader can see, rather than being a comment
+;  in the middle of Main() that the next edit walks straight past.
+; ======================================================================
+Procedure Phase2()
+  r_initErr = #HP_NOT_ATTEMPTED
+  r_resetErr = #HP_NOT_ATTEMPTED
+  r_verErr = #HP_NOT_ATTEMPTED
+  r_bdErr = #HP_NOT_ATTEMPTED
+  r_extraErr = #HP_NOT_ATTEMPTED
+  r_resetStatus = #HP_NOT_ATTEMPTED
+
+  r_init = BtInit()
+  r_initErr = BtError()
+  If r_init = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Anything the controller was part-way through saying when this
+  ; program started is a packet that begins in the middle. Discard it
+  ; before counting anything. This is NOT the fix for a desynchronised
+  ; stream - HCI_Reset is, and it is the next line - but it stops the
+  ; count from being wrong before the reset is even sent.
+  r_flushed = BtFlushRx(2000)
+
+  ; --- exchange 1: HCI_Reset -----------------------------------------
+  ; Also the routing test. It is the only check in this program that
+  ; needs the wire to work in both directions.
+  r_reset = BtHciReset(0)
+  r_resetErr = BtError()
+  r_resetStatus = BtCommandStatus()
+  If r_reset = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; --- exchange 2: Read_Local_Version_Information --------------------
+  r_ver = BtReadLocalVersion(0)
+  r_verErr = BtError()
+
+  ; --- exchange 3: Read_BD_ADDR --------------------------------------
+  r_bd = BtReadBdAddr(0)
+  r_bdErr = BtError()
+  r_bdPlaceholder = BtBdAddrIsPlaceholder()
+
+  ; --- exchange 4: a second HCI_Reset, for the harness ---------------
+  ; It exists so a modelled controller has somewhere to send a BROKEN
+  ; answer without corrupting the three exchanges above. On a real
+  ; board it is a redundant reset and costs a few milliseconds; in the
+  ; gate it is the only exchange that is ever deliberately malformed.
+  BtClearError()
+  r_extra = BtHciReset(#HP_FRAME_SPINS)
+  r_extraErr = BtError()
+  r_extraEvt = BtEventCode()
+  r_extraLen = BtEventLen()
+  r_extraGot = BtEventGot()
+  r_badByte = BtBadByte()
+
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define b.i
+
+  TimerInit()
+
+  ; ==================================================================
+  ;  PHASE 1 - the console still works.
+  ; ==================================================================
+  PrintNl()
+  UartWriteStr("=== Bluetooth HCI over UART (H4) ===")
+  PrintNl()
+  PrintNl()
+
+  r_route = BtRouting()
+  r_header = BtHeaderHasPl011()
+  r_module = BtModuleHasPl011()
+  RouteName(r_route)
+  Line("header ALT0    ", r_header)
+  Line("module ALT3    ", r_module)
+  PrintNl()
+
+  If r_route = #BT_ROUTE_HEADER
+    UartWriteStr("  The PL011 is on header pins 8 and 10, which on this")
+    PrintNl()
+    UartWriteStr("  bench is the serial console you are reading this on.")
+    PrintNl()
+    UartWriteStr("  bluetooth.pi4 will refuse to take it. Expect")
+    PrintNl()
+    UartWriteStr("  #BT_ERR_ROUTING below and NO register writes at all.")
+    PrintNl()
+    PrintNl()
+  EndIf
+
+  ; --- power. The mailbox is not the UART, so this is still safe to
+  ;     narrate. Doing it BEFORE the mux keeps the noisy part in the
+  ;     phase that can still talk.
+  If MailboxInit() = 0
+    UartWriteStr("  mailbox init FAILED - cannot reach the firmware")
+    PrintNl()
+    r_power = 0
+    r_powerErr = MailboxError()
+  Else
+    r_power = BtOnRaise()
+    r_powerErr = MailboxError()
+    Line("BT_ON raised   ", r_power)
+    If r_power <> 0
+      ; v6.12_hci_bcm.c line 300, bcm_gpio_set_power():
+      ;   /* wait for device to power on and come out of reset */
+      ;   usleep_range(100000, 120000);
+      ; 120 ms, the top of the driver's range, because being late costs
+      ; nothing and being early costs a controller that is not listening.
+      delay(120)
+      BtDeclarePowered(1)
+    Else
+      UartWriteStr("  BT_ON could not be raised - the core is in reset.")
+      PrintNl()
+      UartWriteStr("  BtDeclarePowered() is NOT being called, so every")
+      PrintNl()
+      UartWriteStr("  command below will refuse with NOT_POWERED rather")
+      PrintNl()
+      UartWriteStr("  than time out and blame the wire.")
+      PrintNl()
+    EndIf
+  EndIf
+  PrintNl()
+
+  UartWriteStr("--- phase 2, the console is about to go quiet ---")
+  PrintNl()
+  UartDrain()
+
+  ; ==================================================================
+  ;  PHASE 2 - silent.
+  ; ==================================================================
+  Phase2()
+
+  ; ==================================================================
+  ;  PHASE 3 - the console comes back.
+  ; ==================================================================
+  ConsoleMuxRestore()
+  r_routeAfter = BtRouting()
+
+  PrintNl()
+  UartWriteStr("--- phase 3, console restored ---")
+  PrintNl()
+  PrintNl()
+
+  UartWriteStr("transport")
+  PrintNl()
+  Line("init           ", r_init)
+  ErrLine("init err       ", r_initErr)
+  Line("stole console  ", BtStoleConsole())
+  Line("powered        ", BtPowered())
+  Line("flushed bytes  ", r_flushed)
+  PrintNl()
+
+  UartWriteStr("HCI_Reset")
+  PrintNl()
+  Line("reset          ", r_reset)
+  ErrLine("reset err      ", r_resetErr)
+  Line("reset status   ", r_resetStatus)
+  PrintNl()
+
+  UartWriteStr("Read_Local_Version_Information")
+  PrintNl()
+  Line("version        ", r_ver)
+  ErrLine("version err    ", r_verErr)
+  Line("hci_ver        ", BtHciVer())
+  Line("hci_rev        ", BtHciRev())
+  Line("lmp_ver        ", BtLmpVer())
+  Line("manufacturer   ", BtManufacturer())
+  Line("lmp_subver     ", BtLmpSubver())
+  Line("is BCM4345C5   ", BtIsBcm4345C5())
+  PrintNl()
+
+  UartWriteStr("Read_BD_ADDR")
+  PrintNl()
+  Line("bdaddr         ", r_bd)
+  ErrLine("bdaddr err     ", r_bdErr)
+  ; Printed the way a human writes it, which is the WIRE ORDER
+  ; REVERSED - bdaddr_t stores the least significant octet first. The
+  ; reversal happens here, once, at the point of printing, and nowhere
+  ; inside the library.
+  UartWriteStr("  bd_addr        ")
+  If BtHaveBdAddr() <> 0
+    For i = 5 To 0 Step -1
+      b = BtBdAddrByte(i)
+      PutHexN(b, 2)
+      If i > 0
+        UartWrite(58)              ; ':'
+      EndIf
+    Next
+  Else
+    UartWriteStr("(not read)")
+  EndIf
+  PrintNl()
+  Line("placeholder    ", r_bdPlaceholder)
+  If r_bdPlaceholder <> 0
+    UartWriteStr("  ^ that is the factory no-address value for an")
+    PrintNl()
+    UartWriteStr("  UNPATCHED BCM4345C5. The command succeeded, the")
+    PrintNl()
+    UartWriteStr("  status byte was zero, and the answer means nothing.")
+    PrintNl()
+    UartWriteStr("  This is the firmware wall, measured.")
+    PrintNl()
+  EndIf
+  PrintNl()
+
+  UartWriteStr("framing probe (a second HCI_Reset)")
+  PrintNl()
+  Line("extra          ", r_extra)
+  ErrLine("extra err      ", r_extraErr)
+  Line("evt code       ", r_extraEvt)
+  Line("evt len        ", r_extraLen)
+  Line("evt got        ", r_extraGot)
+  Line("bad byte       ", r_badByte)
+  PrintNl()
+
+  UartWriteStr("counters")
+  PrintNl()
+  Line("tx bytes       ", BtTxCount())
+  Line("rx bytes       ", BtRxCount())
+  Line("dropped        ", BtDropped())
+  Line("route after    ", r_routeAfter)
+  PrintNl()
+
+  ; --- the two refusals, exercised on purpose ------------------------
+  ; Both of these are supposed to fail. A gate that never called them
+  ; could not tell a deliberate refusal from a procedure somebody
+  ; quietly implemented from a blog post.
+  UartWriteStr("past the wall (both MUST refuse)")
+  PrintNl()
+  Line("BtLoadPatch    ", BtLoadPatch(0, 0))
+  ErrLine("  err          ", BtError())
+  Line("BtSetBaudrate  ", BtSetBaudrate(3000000))
+  ErrLine("  err          ", BtError())
+  PrintNl()
+
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

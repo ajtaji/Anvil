@@ -1,0 +1,729 @@
+; ======================================================================
+;  anvilqsliptcp.unoq - Arduino UNO Q: THE REAL THING OVER THE DEBUG UART.
+;
+;  ICMP and a complete TCP session between Anvil on this board and a peer
+;  on the PC, over two wires on the JCTL header, MEASURED - bytes, round
+;  trips and the rate the link actually sustains.
+;
+;  ---- WHY THIS IS A SEPARATE IMAGE AND NOT `net` AT THE PROMPT --------
+;
+;  ***BECAUSE THE CONSOLE IS THE WIRE.*** Anvil's monitor reads its
+;  commands from the firmware's ConIn and prints to ConOut, and on this
+;  board both of those are serial engine 4 - the same engine this link
+;  runs on. Typing `ping` at the prompt would require the port to be
+;  carrying console text and SLIP frames at the same moment, which is not
+;  a thing two wires can do. So the command sequence is compiled in: the
+;  code below calls the SAME procedures the `net`, `ping` and `tcp`
+;  commands call - NetSetIPv4, NetArpRequest, NetPingBuild, LinkTxStaged,
+;  LinkPumpNet, TcpConnect, TcpSend, TcpRead, TcpClose - and the
+;  transcript goes to the EFI System Partition.
+;
+;  ---- WHAT IT MEASURES, AND WHAT EACH NUMBER IS WORTH -----------------
+;
+;   1. ICMP: eight echo requests, each timed with millis(). At 115200 a
+;      60-octet exchange is about ten milliseconds of wire time in each
+;      direction; a round trip far from twenty is worth as much as the
+;      pass itself.
+;   2. TCP: one connection to the host's echo service on port 7 - SYN,
+;      SYN|ACK, ACK - then #TQ_BLOCK bytes sent and the same number read
+;      back and COMPARED BYTE FOR BYTE, then an orderly close.
+;   3. The rate: the echoed block is #TQ_BLOCK bytes each way, so the
+;      link carried twice that plus headers in the elapsed time. The
+;      figure printed is bytes a second over the whole exchange, and the
+;      ceiling it is measured against is stated beside it: 115200 8N1 is
+;      11,520 bytes a second of raw wire, and SLIP, IP and TCP headers
+;      plus the escaping all come out of that.
+;
+;  ***THE COMPARISON IS THE POINT, NOT THE COUNT.*** A byte count that
+;  matches proves the link moved the right NUMBER of bytes; only the
+;  comparison proves it moved the right ones. The first silicon run of
+;  the bench counted 992 bytes in for 248 sent and every one of the four
+;  echoes was refused - a count alone would have called that a working
+;  link with a timing problem.
+;
+;  ---- IT TAKES THE CONSOLE ---------------------------------------------
+;
+;  Same wire and same rules as anvilqslipbench.unoq: the transcript goes to
+;  \EFI\anvil\qsliptcp.log and the AnvilQTxt variable, and the port is
+;  handed back before the reset. Start the host first and leave it
+;  running - this image connects and then gives up:
+;
+;      python tools/q_slip_host.py --port COM<n> --baud 115200 \
+;             --dump _work/tcp.cap
+;
+;  BUILD:  bash tools/build_unoq_sliptcp.sh
+; ======================================================================
+
+EnableExplicit
+
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "ArduinoQ/Lib/qgeniuart.pi4"
+XIncludeFile "ArduinoQ/Board/hw_serial_q.pi4"
+XIncludeFile "ArduinoQ/Lib/qslip.pi4"
+XIncludeFile "ArduinoQ/Lib/qnetfile.pi4"
+XIncludeFile "ArduinoQ/Board/hw_link_q.pi4"
+XIncludeFile "ArduinoQ/Board/hw_net_q.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+XIncludeFile "RaspberryPi4/Lib/tcp.pi4"
+
+#EFI_ATTR = $7
+
+#TQ_IP   = $0A000002
+#TQ_MASK = $FFFFFFFC
+#TQ_PEER = $0A000001
+#TQ_PORT = 7                  ; the host peer's echo service
+
+#TQ_PINGS   = 8
+#TQ_PING_MS = 500
+; 1024 bytes each way. Big enough that the rate is a measurement rather
+; than a round-off - at 115200 it is about a fifth of a second of wire -
+; and small enough to fit the 4096-byte rings tcp.pi4 declares with room
+; to spare, so a full ring is never what this run is measuring.
+#TQ_BLOCK   = 1024
+; The bound on the whole TCP exchange. Two kilobytes plus headers is
+; about 250 ms of wire; eight seconds is thirty times that, and it is a
+; BOUND, which is what stops a silent peer becoming a board nobody can
+; reach.
+#TQ_TCP_MS  = 8000
+#TQ_STEP_MS = 3000            ; the bound on connect, and on close
+; ONE PUMP SLICE, LONGER THAN THE LONGEST FRAME ON THIS WIRE. 1024
+; payload bytes plus headers is about 1080 octets = 94 ms at 115200,
+; and SLIP escaping can only add to that. 200 covers it with room and
+; is still a BOUND.
+#TQ_SLICE_MS = 200
+
+Global gTqSent.i
+Global gTqHeard.i
+Global gTqMin.i
+Global gTqMax.i
+Global gTqSum.i
+Global Dim gTqPeerMac.b[8]
+; What LinkPumpNet() answered, tallied by answer. THE ONE READING THAT
+; SEPARATES "no frame ever arrived" FROM "a frame arrived and the IP
+; layer wanted nothing to do with it", and those two have different
+; first things to check: the first is the wire or the framing, the
+; second is the address configuration. Indexed by answer + 1, so
+; #LINK_RX_NONE (-1) lands at 0 and #NET_IN_TCP (5) at 6.
+#TQ_PUMP_SLOTS = 8
+Global Dim gTqPump.i[#TQ_PUMP_SLOTS]
+Global Dim gTqOut.a[#TQ_BLOCK]
+Global Dim gTqIn.a[#TQ_BLOCK]
+Global Dim gVarName.b[24]
+Global Dim gVarGuid.b[16]
+
+Procedure PutDotted(v.i)
+  PrintDec((v >> 24) & $FF)
+  Print(".")
+  PrintDec((v >> 16) & $FF)
+  Print(".")
+  PrintDec((v >> 8) & $FF)
+  Print(".")
+  PrintDec(v & $FF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Resolve - the address cache, before anything can be addressed.
+;
+;  NetPingBuild() and TcpConnect() both refuse until the next hop has an
+;  entry. On a SLIP wire there are no hardware addresses at all and
+;  qslip.pi4 answers the request itself rather than transmitting it, so
+;  this step cannot fail because the host is quiet - if it fails, the
+;  fault is inside this image.
+; ----------------------------------------------------------------------
+Procedure.i Resolve()
+  Define k.i
+  Define hop.i
+  hop = NetNextHop(#TQ_PEER)
+  k = 0
+  While k < 4
+    If NetArpLookup(hop, @gTqPeerMac[0]) = 1
+      ProcedureReturn 1
+    EndIf
+    If NetArpRequest(hop) <> 0
+      LinkTxStaged()
+    EndIf
+    LinkPumpNet(10)
+    k = k + 1
+  Wend
+  ProcedureReturn NetArpLookup(hop, @gTqPeerMac[0])
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pings - what `ping` does, without a console to type it on.
+; ----------------------------------------------------------------------
+Procedure Pings()
+  Define i.i
+  Define t0.i
+  Define dt.i
+  Define ident.i
+  Define seq.i
+  Define got.i
+  Define r.i
+
+  PrintN("-- ICMP: eight echo requests to the host at 10.0.0.1 --")
+  i = 0
+  While i < #TQ_PINGS
+    ident = $7100 + i
+    seq = i + 1
+    got = 0
+    If NetPingBuild(#TQ_PEER, ident, seq, 32) <> 1
+      Print("  request ")
+      PrintDec(seq)
+      Print(" could not be built, net error ")
+      PrintDec(NetError())
+      PrintNl()
+      i = i + 1
+      Continue
+    EndIf
+    If LinkTxStaged() <> 1
+      Print("  request ")
+      PrintDec(seq)
+      PrintN(" would not go on the wire")
+      gTqSent = gTqSent + 1
+      i = i + 1
+      Continue
+    EndIf
+    gTqSent = gTqSent + 1
+
+    t0 = millis()
+    Repeat
+      ; ---- THE SLICE IS SIZED FROM THE WIRE, NOT PICKED ----------------
+      ; At 115200 a byte is 87 microseconds, so a 60-octet echo reply is
+      ; 5.4 milliseconds of wire and a full-size datagram is over 130.
+      ; A pump slice SHORTER THAN A FRAME can return empty-handed in the
+      ; middle of one however healthy the link is, and on a link where
+      ; nothing else is a candidate that reads as loss. #TQ_SLICE_MS is
+      ; longer than the largest frame either end will send.
+      r = LinkPumpNet(#TQ_SLICE_MS)
+      If r >= -1
+        If r < #TQ_PUMP_SLOTS - 1
+          gTqPump[r + 1] = gTqPump[r + 1] + 1
+        EndIf
+      EndIf
+      If NetPongBytes() > 0
+        If NetPongIdent() = ident
+          If NetPongSeq() = seq
+            got = 1
+            Break
+          EndIf
+        EndIf
+      EndIf
+      If (millis() - t0) > #TQ_PING_MS
+        Break
+      EndIf
+    ForEver
+    dt = millis() - t0
+
+    Print("  request ")
+    PrintDec(seq)
+    If got = 1
+      gTqHeard = gTqHeard + 1
+      gTqSum = gTqSum + dt
+      If gTqHeard = 1
+        gTqMin = dt
+        gTqMax = dt
+      Else
+        If dt < gTqMin
+          gTqMin = dt
+        EndIf
+        If dt > gTqMax
+          gTqMax = dt
+        EndIf
+      EndIf
+      Print("  reply from ")
+      PutDotted(NetPongFrom())
+      Print("  ")
+      PrintDec(NetPongBytes())
+      Print(" bytes  ")
+      PrintDec(dt)
+      PrintN(" ms")
+    Else
+      Print("  NO REPLY within ")
+      PrintDec(#TQ_PING_MS)
+      PrintN(" ms")
+    EndIf
+    i = i + 1
+  Wend
+
+  Print("  sent ")
+  PrintDec(gTqSent)
+  Print("   answered ")
+  PrintDec(gTqHeard)
+  If gTqHeard > 0
+    Print("   round trip min ")
+    PrintDec(gTqMin)
+    Print(" avg ")
+    PrintDec(gTqSum / gTqHeard)
+    Print(" max ")
+    PrintDec(gTqMax)
+    Print(" ms")
+  EndIf
+  PrintNl()
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Session - what `tcp connect` / `tcp send` / `tcp close` do.
+;
+;  THE PAYLOAD IS NOT ZEROES AND IT IS NOT ALL PRINTABLE. It is a
+;  counter, so every byte's position is in its value and a block that
+;  comes back shifted, duplicated or truncated says so at the first
+;  mismatch rather than comparing equal to itself. It also puts $C0 and
+;  $DB - SLIP's END and ESCAPE - into the stream four times each per 256
+;  bytes, which is the only way an escaping bug reaches this layer at
+;  all.
+; ----------------------------------------------------------------------
+Procedure.i Session(escapes.i)
+  Define i.i
+  Define r.i
+  Define st.i
+  Define t0.i
+  Define dt.i
+  Define sent.i
+  Define got.i
+  Define n.i
+  Define bad.i
+
+  PrintN("-- TCP: one session to the host's echo service on port 7 --")
+
+  ; ---- THE DISCRIMINATING EXPERIMENT, AND IT IS THE WHOLE REASON THIS
+  ; ---- PROCEDURE TAKES AN ARGUMENT.
+  ;
+  ; The first silicon runs failed in a way two different faults explain
+  ; equally well, and the capture cannot tell them apart: the ONLY two
+  ; frames the board never acted on were also the only two carrying an
+  ; escape sequence AND the only two carrying a large TCP payload. Ten
+  ; frames with neither went through - eight echo replies, a SYN|ACK and
+  ; a FIN.
+  ;
+  ; So this runs the same session twice. Once with a payload that CANNOT
+  ; contain SLIP's END or ESCAPE - letters only - and once with a counter
+  ; that carries four of each per kilobyte. If the letters come back and
+  ; the counter does not, the fault is in the escape path; if neither
+  ; comes back, the escaping is innocent and the fault is in carrying a
+  ; large TCP segment. Either way the answer is a measurement.
+  If escapes = 0
+    PrintN("  payload: letters only, so not one END and not one ESCAPE byte")
+  Else
+    PrintN("  payload: a counter, four END and four ESCAPE bytes per kilobyte")
+  EndIf
+
+  i = 0
+  While i < #TQ_BLOCK
+    If escapes = 0
+      gTqOut[i] = 65 + (i % 26)
+    Else
+      gTqOut[i] = i & $FF
+    EndIf
+    gTqIn[i] = 0
+    i = i + 1
+  Wend
+
+  r = TcpConnect(#TQ_PEER, #TQ_PORT)
+  If r < 0
+    Print("  connect refused, error ")
+    PrintDec(r)
+    Print("  ")
+    UartWriteStr(TcpErrorText(r))
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  t0 = millis()
+  Repeat
+    st = TcpPoll(10)
+    If TcpConnected() <> 0
+      Break
+    EndIf
+    If st = #TCP_CLOSED
+      Break
+    EndIf
+    If (millis() - t0) > #TQ_STEP_MS
+      Break
+    EndIf
+  ForEver
+  dt = millis() - t0
+
+  If TcpConnected() = 0
+    Print("  the connection never came up; state is ")
+    UartWriteStr(TcpStateName(TcpState()))
+    Print(" after ")
+    PrintDec(dt)
+    PrintN(" ms")
+    PrintN("  A SYN that is never answered is the host program not running,")
+    PrintN("  or running on another port. A SYN answered by a reset is the")
+    PrintN("  host running with no echo service on port 7.")
+    TcpAbort()
+    ProcedureReturn 0
+  EndIf
+  Print("  connected in ")
+  PrintDec(dt)
+  Print(" ms - the three-way handshake crossed the wire; local port ")
+  PrintDec(TcpLocalPort())
+  PrintNl()
+
+  ; ---- the exchange, and it is timed from the first byte offered -----
+  sent = 0
+  got = 0
+  t0 = millis()
+  Repeat
+    If sent < #TQ_BLOCK
+      n = TcpSend(@gTqOut[sent], #TQ_BLOCK - sent)
+      If n > 0
+        sent = sent + n
+      EndIf
+    EndIf
+    TcpPoll(#TQ_SLICE_MS)
+    If TcpAvailable() > 0
+      n = TcpRead(@gTqIn[got], #TQ_BLOCK - got)
+      If n > 0
+        got = got + n
+      EndIf
+    EndIf
+    If got >= #TQ_BLOCK
+      Break
+    EndIf
+    If TcpWasReset() <> 0
+      Break
+    EndIf
+    If (millis() - t0) > #TQ_TCP_MS
+      Break
+    EndIf
+  ForEver
+  dt = millis() - t0
+  If dt <= 0
+    dt = 1
+  EndIf
+
+  Print("  offered ")
+  PrintDec(sent)
+  Print(" bytes, read back ")
+  PrintDec(got)
+  Print(" bytes in ")
+  PrintDec(dt)
+  PrintN(" ms")
+
+  bad = -1
+  i = 0
+  While i < got
+    If gTqIn[i] <> gTqOut[i]
+      bad = i
+      Break
+    EndIf
+    i = i + 1
+  Wend
+
+  If got <> #TQ_BLOCK
+    PrintN("  ** THE BLOCK DID NOT COME BACK WHOLE. What did arrive is")
+    PrintN("     compared anyway, because where it stops matters: a clean")
+    PrintN("     prefix that just ends is a link that stalled, and a")
+    PrintN("     mismatch inside it is a link that corrupts.")
+  EndIf
+  If bad >= 0
+    Print("  ** MISMATCH at offset ")
+    PrintDec(bad)
+    Print(": sent ")
+    PutHex2(gTqOut[bad])
+    Print(", got ")
+    PutHex2(gTqIn[bad])
+    PrintNl()
+  Else
+    Print("  every one of the ")
+    PrintDec(got)
+    PrintN(" bytes came back byte for byte identical")
+  EndIf
+
+  ; ---- the rate. Both directions, over the measured elapsed time -----
+  Print("  the link carried ")
+  PrintDec(sent + got)
+  Print(" payload bytes in ")
+  PrintDec(dt)
+  Print(" ms = ")
+  PrintDec(((sent + got) * 1000) / dt)
+  PrintN(" bytes a second of payload")
+  PrintN("  (115200 8N1 is 11,520 bytes a second of RAW WIRE in ONE")
+  PrintN("   direction. This figure counts payload in both directions and")
+  PrintN("   pays for a 20-octet IP header, a 20-octet TCP header and SLIP")
+  PrintN("   escaping out of that ceiling, so it is the useful rate and not")
+  PrintN("   the line rate, and the two must not be compared as if equal.)")
+
+  ; ---- the orderly close ---------------------------------------------
+  TcpClose()
+  t0 = millis()
+  Repeat
+    st = TcpPoll(10)
+    If st = #TCP_CLOSED
+      Break
+    EndIf
+    If st = #TCP_TIME_WAIT
+      Break
+    EndIf
+    If (millis() - t0) > #TQ_STEP_MS
+      Break
+    EndIf
+  ForEver
+  Print("  closed: state is ")
+  UartWriteStr(TcpStateName(TcpState()))
+  Print(" after ")
+  PrintDec(millis() - t0)
+  PrintN(" ms")
+  PrintNl()
+
+  If bad >= 0
+    ProcedureReturn 0
+  EndIf
+  If got <> #TQ_BLOCK
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Tally()
+  Define i.i
+  PrintN("-- the pump, answer by answer, over the echo phase --")
+  PrintN("  (-1 nothing waiting · 0 ignored · 1 a reply was staged ·")
+  PrintN("   2 UDP · 3 an echo REPLY · 4 an address cache entry · 5 TCP)")
+  i = 0
+  While i < #TQ_PUMP_SLOTS
+    If gTqPump[i] <> 0
+      Print("    answer ")
+      PrintDec(i - 1)
+      Print(" x ")
+      PrintDec(gTqPump[i])
+      PrintNl()
+    EndIf
+    i = i + 1
+  Wend
+  Print("  frames handed to the IP layer ")
+  PrintDec(LinkRxFrames())
+  Print("   frames put on the wire ")
+  PrintDec(LinkTxCount())
+  Print("   refused by the link ")
+  PrintDec(LinkTxFails())
+  PrintNl()
+  PrintN("  READ THESE TWO TOGETHER. A frame count of zero beside a framing")
+  PrintN("  layer that decoded datagrams means the pump never saw them and")
+  PrintN("  the fault is between qslip.pi4 and link.pi4. A frame count that")
+  PrintN("  matches the datagrams, with every answer 0, means the IP layer")
+  PrintN("  saw every one and wanted none - which is an ADDRESS question,")
+  PrintN("  not a wire question.")
+  PrintNl()
+
+  PrintN("-- what TCP itself saw, straight out of the state machine --")
+  Print("  segments accepted ")
+  PrintDec(tcp_seg_rx)
+  Print("   payload bytes accepted ")
+  PrintDec(tcp_bytes_rx)
+  Print("   retransmissions sent ")
+  PrintDec(tcp_retrans)
+  PrintNl()
+  Print("  refused as unacceptable ")
+  PrintDec(tcp_unacceptable)
+  Print("   duplicate acknowledgements ")
+  PrintDec(tcp_dupacks)
+  Print("   resets in ")
+  PrintDec(tcp_rst_rx)
+  Print("   out of order dropped ")
+  PrintDec(tcp_ooo_drop)
+  PrintNl()
+  PrintN("  THIS IS THE ROW THAT NAMES THE LAYER. Segments accepted at zero")
+  PrintN("  means TcpInput() was never called with one, so the IP layer")
+  PrintN("  below it did not hand any up - a checksum or an address, not")
+  PrintN("  TCP. A count above zero with no payload bytes means the")
+  PrintN("  segments arrived and the state machine turned them down, and")
+  PrintN("  the unacceptable and duplicate columns say which way.")
+  PrintNl()
+
+  PrintN("-- the counters, from three independent places --")
+  Print("  framing: datagrams out ")
+  PrintDec(QSlipTxDatagrams())
+  Print("  in ")
+  PrintDec(QSlipRxDatagrams())
+  Print("  address requests answered here ")
+  PrintDec(QSlipArpsAnswered())
+  PrintNl()
+  Print("  framing refusals: over the maximum ")
+  PrintDec(QSlipRefusedLong())
+  Print("  wrong ethertype ")
+  PrintDec(QSlipRefusedType())
+  Print("  receive overruns ")
+  PrintDec(QSlipOverruns())
+  Print("  bad escapes ")
+  PrintDec(QSlipBadEscapes())
+  PrintNl()
+  Print("  driver: bytes out ")
+  PrintDec(QSerTxBytes())
+  Print("  in ")
+  PrintDec(QSerRxBytes())
+  Print("  command timeouts ")
+  PrintDec(QGeniUartTxTimeouts())
+  Print("  aborts ")
+  PrintDec(QGeniUartTxAborts())
+  Print("  watermark timeouts ")
+  PrintDec(QGeniUartTxWmTimeouts())
+  Print("  receive command re-posted ")
+  PrintDec(QGeniUartRxRestarts())
+  PrintNl()
+  PrintN("  (A GENI CAPTURES NOTHING WHILE ITS SECONDARY SEQUENCER IS IDLE,")
+  PrintN("   and the command posted at take does not run for ever. Nothing")
+  PrintN("   latches when it ends - the port just goes deaf and reads like a")
+  PrintN("   quiet peer. A large number here is normal and is the driver")
+  PrintN("   keeping the port open; a zero beside lost frames would mean the")
+  PrintN("   deafness is somewhere else.)")
+  PrintN("  (THE THREE ARE THE INSTRUMENT. If the framing layer says it")
+  PrintN("   sent datagrams and the driver says it wrote no bytes, the")
+  PrintN("   fault is between them. A driver byte count that is a clean")
+  PrintN("   MULTIPLE of what the host put on the wire is the receive word")
+  PrintN("   geometry, which is exactly how the 2026-09-07 defect showed")
+  PrintN("   itself: 992 in for 248 sent.)")
+  PrintNl()
+EndProcedure
+
+Procedure EmitReport()
+  PrintN("== Anvil on the Arduino UNO Q - ICMP and TCP over the debug UART ==")
+  PrintNl()
+
+  If QSerialUp() = 0
+    PrintN("THE PORT WAS NOT TAKEN, and the driver's reason follows.")
+    PrintNl()
+    Print("  ")
+    UartWriteStr(QGeniUartWhy())
+    PrintNl()
+    ProcedureReturn
+  EndIf
+
+  Print("  serial engine 4 answered ")
+  PutHex8(QGeniUartFwRev())
+  Print(", protocol ")
+  PrintDec(QGeniUartProto())
+  Print(", clock divider ")
+  PrintDec(QSerialClkDiv())
+  PrintN(" (the divider is the fact; the rate needs a root clock the")
+  PrintN("   engine does not publish, and the wire is 115,200 - measured)")
+
+  If LinkUseKind(#HW_LINK_SERIAL) <> #HW_LINK_SERIAL
+    PrintN("the link policy refused the serial kind:")
+    Print("  ")
+    UartWriteStr(LinkWhyText())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  If NetSetMac(HwLinkMacPtr(#HW_LINK_SERIAL)) <> 1
+    PrintN("the address the link offered was refused by the IP layer")
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  If NetSetIPv4(#TQ_IP, #TQ_MASK, #TQ_PEER) <> 1
+    Print("the IP configuration was refused, net error ")
+    PrintDec(NetError())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  Print("  this board is ")
+  PutDotted(#TQ_IP)
+  Print(" and the host is ")
+  PutDotted(#TQ_PEER)
+  Print(", link ")
+  UartWriteStr(LinkName())
+  PrintNl()
+  PrintNl()
+
+  If Resolve() <> 1
+    PrintN("  the peer is not in the address cache, so nothing can be")
+    PrintN("  addressed. That is a fault inside this image, not a silent")
+    PrintN("  host: on this link the reply is synthesised locally.")
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+
+  TcpInit()
+
+  Pings()
+  Session(0)
+  PrintN("-- the same session again, with the escaping payload --")
+  Session(1)
+  Tally()
+
+  QSerialGive()
+  Print("-- the port was handed back: present now reads ")
+  PrintDec(QSerialPresent())
+  PrintN(" --")
+  PrintN("  The firmware console owns serial engine 4 again. If the shell on")
+  PrintN("  the other end of this wire is now garbled, that is a defect in")
+  PrintN("  the give-back and it belongs on the forum before anything else.")
+  PrintNl()
+
+  Print("transcript used ")
+  PrintDec(gQOutLen)
+  Print(" of ")
+  PrintDec(#Q_OUT_MAX)
+  Print(" bytes, dropped ")
+  PrintDec(gQTrunc)
+  PrintNl()
+  PrintN("== end of run ==")
+EndProcedure
+
+Procedure BuildSinkNames()
+  Define b.i
+  b = @gVarName[0]
+  QPb(b,0,65) :QPb(b,1,0) : QPb(b,2,110):QPb(b,3,0)
+  QPb(b,4,118):QPb(b,5,0) : QPb(b,6,105):QPb(b,7,0)
+  QPb(b,8,108):QPb(b,9,0) : QPb(b,10,81):QPb(b,11,0)
+  QPb(b,12,84):QPb(b,13,0): QPb(b,14,120):QPb(b,15,0)
+  QPb(b,16,116):QPb(b,17,0):QPb(b,18,0):QPb(b,19,0)
+  b = @gVarGuid[0]
+  QPb(b, 0,$D4):QPb(b, 1,$C3):QPb(b, 2,$B2):QPb(b, 3,$A1)
+  QPb(b, 4,$66):QPb(b, 5,$55)
+  QPb(b, 6,$88):QPb(b, 7,$77)
+  QPb(b, 8,$99):QPb(b, 9,$AA):QPb(b,10,$BB):QPb(b,11,$CC)
+  QPb(b,12,$DD):QPb(b,13,$EE):QPb(b,14,$FF):QPb(b,15,$00)
+EndProcedure
+
+Procedure.i Main()
+  Define ih.i
+  Define st.i
+
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+
+  ih = gQIh
+  st = gQSt
+  If QEfiInit(ih, st) = 0
+    ProcedureReturn 0
+  EndIf
+
+  If TimerInit() = 0
+    QEfiOutStr("the architectural counter reads as stopped - refusing to take the console UART")
+    QEfiReset()
+    ProcedureReturn 0
+  EndIf
+
+  QSlipInit()
+  BuildSinkNames()
+
+  QEfiOutStr("Anvil UNO Q - taking serial engine 4 for ICMP and TCP; output goes to the ESP log")
+
+  EmitReport()
+
+  QEspWrite("\EFI\anvil\qsliptcp.log", @gQOut[0], gQOutLen)
+  QCall(PeekI(gQRt + #QRT_SETVARIABLE), @gVarName[0], @gVarGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  QEfiOutStr("run complete - resetting back to Debian")
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure

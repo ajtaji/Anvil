@@ -1,0 +1,1230 @@
+; ======================================================================
+; http.pi4 - an HTTP/1.1 client, plain text, over tcp.pi4.
+;
+; RFC 9110 (semantics) and RFC 9112 (HTTP/1.1 syntax and framing). This
+; is the SMOKE TEST for the TCP work and it is written to be exactly
+; that: enough of HTTP to fetch one page from a real server and print
+; what came back, and not one feature more.
+;
+; ======================================================================
+; WHY A SMOKE TEST IS THE RIGHT SHAPE FOR THIS FILE
+; ======================================================================
+; A TCP stack can pass every desk gate ever written and still fail
+; against the first real server it meets, because a real server does
+; things a harness does not: it sends a SYN-ACK with options we did not
+; ask for, it answers in several segments of its own choosing, it closes
+; with a FIN the moment it has finished, and it does all of that from
+; the other side of a router. `http get http://example.com/` exercises
+; the handshake, the window, segmentation, reassembly, a clean close and
+; DNS in one command that a person can type, and the answer - `HTTP/1.1
+; 200 OK` and a page - is one nobody can misread.
+;
+; That is what it is for. It is NOT a general-purpose HTTP client and
+; the gaps below say so plainly rather than leaving them to be found.
+;
+; ======================================================================
+; WHAT THIS IS NOT
+; ======================================================================
+;  1. NO TLS, NO https. Port 80 and clear text. An https URL is REFUSED
+;     BY NAME rather than quietly fetched over port 80, because the two
+;     are not the same request and answering the wrong one is worse than
+;     answering neither.
+;  2. NO REDIRECTS ARE FOLLOWED. A 301 or 302 is reported with its
+;     Location header printed and nothing is fetched. Following one
+;     means a loop guard, a hop count and a same-host policy, and none
+;     of that belongs in a smoke test.
+;  3. NO REQUEST BODY, so no POST and no PUT. GET and HEAD only.
+;  4. NO PERSISTENT CONNECTIONS. Every request sends `Connection: close`
+;     and the connection is torn down afterwards. That is deliberate:
+;     the close is half the thing being tested.
+;  5. NO CONTENT DECODING. gzip, deflate and brotli are not requested
+;     and would not be understood; the request sends no Accept-Encoding
+;     at all, which RFC 9110 12.5.3 makes equivalent to "anything", so a
+;     server MAY still compress. If one does, the body printed is the
+;     compressed bytes and HttpFraming() still reports honestly. Sending
+;     `Accept-Encoding: identity` would be the fix and is not done
+;     because it is one more thing to get wrong in a smoke test.
+;  6. THE BODY BUFFER IS FINITE AND A LONGER BODY IS TRUNCATED, not
+;     silently dropped: HttpTruncated() goes to 1, HttpBodySeen() counts
+;     what really arrived and HttpBodyLen() counts what was kept. A
+;     caller that prints only HttpBodyLen() and never looks at the other
+;     two will believe a short page.
+;  7. THE BODY IS NOT NUL-TERMINATED. It is bytes and a length. A caller
+;     that treats it as a string prints the tail of the previous
+;     response - which is a real failure from this project's own
+;     history, on the Pico, and is why this line is here.
+;
+; ======================================================================
+; FRAMING - RFC 9112 6.3, IN ITS OWN ORDER, AND THE ONE REFUSAL
+; ======================================================================
+; How the body ends is decided ONCE, when the headers finish, by walking
+; RFC 9112 6.3's list in the order it is written:
+;
+;   1. a 1xx, 204 or 304 response has no body at all
+;   2. a response to HEAD has no body
+;   3. Transfer-Encoding: chunked - the chunks say where it ends
+;   4. Content-Length - that many bytes
+;   5. otherwise the body runs until the connection closes
+;
+; A MESSAGE CARRYING BOTH chunked AND Content-Length IS REFUSED, and
+; that is the one place this file is strict rather than tolerant. RFC
+; 9112 6.3 permits a recipient to ignore the Content-Length in that
+; case; this file will not, because choosing between two disagreeing
+; framings is precisely the ambiguity request smuggling is built on, and
+; a monitor has no business resolving it quietly.
+;
+; ======================================================================
+; REQUIRES - the main program includes these BEFORE this file
+; ======================================================================
+;     RaspberryPi4/Lib/timer.pi4     Micros(), millis()
+;     RaspberryPi4/Lib/net.pi4
+;     RaspberryPi4/Lib/link.pi4
+;     RaspberryPi4/Lib/tcp.pi4
+;
+; The names this file calls and does not define: TcpUse, TcpConnect,
+; TcpPoll, TcpSend, TcpRead, TcpAvailable, TcpState, TcpClose, TcpAbort,
+; TcpError, TcpWasReset, TcpAlloc, TcpCurrent, millis - and one the MAIN
+; PROGRAM must supply, NetBreakCheck(), which returns non-zero when the
+; operator has asked for the command to stop.
+;
+; THE NAME IS NOT RESOLVED HERE. HttpGet takes an address, not a
+; hostname, because resolving one means the settings store (which DNS
+; server) and that belongs to the monitor and not to a protocol library.
+; The Host: header still carries the NAME, which is what a virtual host
+; needs, so both are arguments.
+; ======================================================================
+
+#HTTP_PORT_DEFAULT = 80
+
+; Sizes. The request line and headers are built in one buffer; the
+; response's status line and each header line are assembled in another,
+; one byte at a time, because a header can be split across any number of
+; TCP segments and reassembling it at the byte is the only way that
+; cannot be wrong.
+#HTTP_REQ_MAX   = 512
+#HTTP_LINE_MAX  = 256
+#HTTP_HOST_MAX  = 128
+#HTTP_PATH_MAX  = 192
+#HTTP_LOC_MAX   = 256
+#HTTP_RXCHUNK   = 512
+
+; Deadlines. Every one of them is a WHOLE-PHASE budget measured from the
+; start of that phase, not a per-byte one: a server that dribbles a byte
+; a second is a server this monitor should give up on, and a per-byte
+; timer never would.
+#HTTP_CONNECT_MS = 10000
+#HTTP_SEND_MS    = 10000
+#HTTP_RESP_MS    = 20000
+#HTTP_SLICE_MS   = 5
+
+; The framing decision (RFC 9112 6.3).
+#HTTP_FRAME_NONE    = 0    ; no body by status or by method
+#HTTP_FRAME_LENGTH  = 1    ; Content-Length
+#HTTP_FRAME_CHUNKED = 2    ; Transfer-Encoding: chunked
+#HTTP_FRAME_CLOSE   = 3    ; until the connection closes
+
+; The parser's state.
+#HTTP_ST_IDLE     = 0
+#HTTP_ST_STATUS   = 1
+#HTTP_ST_HEADERS  = 2
+#HTTP_ST_BODY_LEN = 3
+#HTTP_ST_BODY_CHK = 4
+#HTTP_ST_CHUNKSZ  = 5
+#HTTP_ST_CHUNKEND = 6
+#HTTP_ST_BODY_EOF = 7
+#HTTP_ST_DONE     = 8
+
+; Refusals. Negative, numbered from -400 so they cannot be confused with
+; tcp.pi4's -300s or net.pi4's -100s, and every one has a full sentence
+; in HttpErrorText() that carries the number.
+#HTTP_OK            =    0
+#HTTP_E_ARG         = -400
+#HTTP_E_URL         = -401  ; not a URL this can parse
+#HTTP_E_SCHEME      = -402  ; https, or something that is not http
+#HTTP_E_LONG        = -403  ; the host or path is longer than the buffer
+#HTTP_E_NOSOCK      = -404  ; no free TCP socket
+#HTTP_E_CONNECT     = -405  ; the connection was never established
+#HTTP_E_RESET       = -406  ; the peer reset it
+#HTTP_E_SEND        = -407  ; the request could not be pushed out in time
+#HTTP_E_TIMEOUT     = -408  ; no response in time
+#HTTP_E_CLOSED      = -409  ; the peer closed before the message finished
+#HTTP_E_STATUS      = -410  ; the status line is not HTTP/x.y NNN
+#HTTP_E_FRAMING     = -411  ; chunked AND Content-Length. Refused.
+#HTTP_E_CHUNK       = -412  ; a chunk size that is not hexadecimal
+#HTTP_E_TRUNC       = -413  ; SOFT: everything parsed, body was cut short
+
+Global Dim http_req.a[#HTTP_REQ_MAX]
+Global http_reqlen.i
+Global http_reqover.i
+
+Global Dim http_line.a[#HTTP_LINE_MAX]
+Global http_linelen.i
+Global http_lineover.i
+
+Global Dim http_host.a[#HTTP_HOST_MAX]
+Global http_hostlen.i
+Global Dim http_path.a[#HTTP_PATH_MAX]
+Global http_pathlen.i
+Global Dim http_loc.a[#HTTP_LOC_MAX]
+Global http_loclen.i
+Global http_locover.i
+
+Global http_state.i
+Global http_status.i
+Global http_framing.i
+Global http_clen.i            ; the Content-Length that was announced
+Global http_haveclen.i
+Global http_chunked.i
+Global http_headonly.i
+Global http_hdrcount.i
+Global http_hdrdropped.i      ; header lines too long to parse. NOT
+                              ; truncated and NOT guessed at - counted.
+Global http_err.i
+Global http_tcperr.i
+Global http_truncated.i
+Global http_sock.i = -1
+Global http_port.i = #HTTP_PORT_DEFAULT
+Global http_ip.i
+
+Global http_dst.i             ; the caller's body buffer
+Global http_dstmax.i
+Global http_bodylen.i         ; bytes KEPT
+Global http_bodyseen.i        ; bytes that ARRIVED
+Global http_chunkleft.i
+Global http_chunkhex.i
+Global http_chunkdigits.i
+Global http_requests.i
+Global http_oks.i
+Global http_rxbytes.i         ; every byte TcpRead handed over
+
+Global Dim http_rx.a[#HTTP_RXCHUNK]
+
+; ----------------------------------------------------------------------
+;  Small helpers. Character literals are not used anywhere in this file:
+;  the house rule is that a number in the source is a number a reader can
+;  check, and 58 with ": colon" beside it is checkable where a quoted
+;  colon in a language whose string handling is not the subject here is
+;  one more thing to reason about.
+; ----------------------------------------------------------------------
+Procedure.i http_Lower(c.i)
+  If c >= 65 And c <= 90                ; 'A'..'Z'
+    ProcedureReturn c + 32
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+Procedure.i http_IsDigit(c.i)
+  If c >= 48 And c <= 57
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Does the assembled line begin with this header name, case-insensitively,
+; and is it followed by a colon? Returns the offset of the first byte of
+; the value with leading spaces and tabs skipped, or -1.
+Procedure.i http_Field(name.i)
+  Define i.i
+  Define c.i
+  Define d.i
+  i = 0
+  While 1 = 1
+    c = PeekA(name + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    If i >= http_linelen
+      ProcedureReturn -1
+    EndIf
+    d = http_line[i] & $FF
+    If http_Lower(d) <> http_Lower(c)
+      ProcedureReturn -1
+    EndIf
+    i = i + 1
+  Wend
+  If i >= http_linelen
+    ProcedureReturn -1
+  EndIf
+  If (http_line[i] & $FF) <> 58         ; 58 is a colon
+    ProcedureReturn -1
+  EndIf
+  i = i + 1
+  While i < http_linelen
+    d = http_line[i] & $FF
+    If d <> 32 And d <> 9               ; space, tab
+      Break
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+; A non-negative decimal from the assembled line at `off`, or -1. It
+; REFUSES anything that is not entirely digits, because a Content-Length
+; of "123abc" is a malformed message and reading 123 out of it is the
+; guess this project does not make.
+Procedure.i http_Dec(off.i)
+  Define v.i
+  Define n.i
+  Define c.i
+  v = 0
+  n = 0
+  While off < http_linelen
+    c = http_line[off] & $FF
+    If c = 13 Or c = 32 Or c = 9
+      Break
+    EndIf
+    If http_IsDigit(c) = 0
+      ProcedureReturn -1
+    EndIf
+    If v > 200000000                    ; a length nothing here could hold
+      ProcedureReturn -1
+    EndIf
+    v = v * 10 + (c - 48)
+    n = n + 1
+    off = off + 1
+  Wend
+  If n = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Building the request.
+; ----------------------------------------------------------------------
+Procedure http_ReqReset()
+  http_reqlen = 0
+  http_reqover = 0
+EndProcedure
+
+Procedure http_ReqPutC(c.i)
+  If http_reqlen >= #HTTP_REQ_MAX
+    http_reqover = 1
+    ProcedureReturn
+  EndIf
+  http_req[http_reqlen] = c & $FF
+  http_reqlen = http_reqlen + 1
+EndProcedure
+
+Procedure http_ReqPut(s.i)
+  Define i.i
+  Define c.i
+  i = 0
+  While 1 = 1
+    c = PeekA(s + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    http_ReqPutC(c)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure http_ReqPutBytes(p.i, n.i)
+  Define i.i
+  i = 0
+  While i < n
+    http_ReqPutC(PeekA(p + i) & $FF)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure http_ReqCrLf()
+  http_ReqPutC(13)
+  http_ReqPutC(10)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HttpParseUrl - "http://host[:port]/path" into the three parts.
+;
+;  IT IS DELIBERATELY NARROW. No userinfo, no query-string handling
+;  beyond passing it through as part of the path, no percent-decoding, no
+;  IPv6 literal in brackets. Each of those is refused or passed through
+;  whole rather than half-understood.
+;
+;  AN https URL IS ITS OWN REFUSAL (#HTTP_E_SCHEME). Fetching it over
+;  port 80 because the port is what we know how to do would answer a
+;  different question from the one asked, and on a URL somebody chose
+;  https for.
+; ----------------------------------------------------------------------
+Procedure.i HttpParseUrl(url.i)
+  Define i.i
+  Define c.i
+  Define n.i
+  Define port.i
+  Define sawcolon.i
+  http_hostlen = 0
+  http_pathlen = 0
+  http_port = #HTTP_PORT_DEFAULT
+  If url = 0
+    ProcedureReturn #HTTP_E_ARG
+  EndIf
+
+  i = 0
+  ; The scheme, if one is written. "http://" is accepted; "https://" is
+  ; named and refused; anything else with a "://" in it is refused as a
+  ; scheme too, so that ftp:// does not silently become a path.
+  If (http_Lower(PeekA(url + 0) & $FF) = 104) And (http_Lower(PeekA(url + 1) & $FF) = 116)
+    If (http_Lower(PeekA(url + 2) & $FF) = 116) And (http_Lower(PeekA(url + 3) & $FF) = 112)
+      If (PeekA(url + 4) & $FF) = 58                    ; "http:"
+        If (PeekA(url + 5) & $FF) = 47 And (PeekA(url + 6) & $FF) = 47
+          i = 7
+        Else
+          ProcedureReturn #HTTP_E_URL
+        EndIf
+      ElseIf (http_Lower(PeekA(url + 4) & $FF) = 115)   ; "https"
+        ProcedureReturn #HTTP_E_SCHEME
+      Else
+        ProcedureReturn #HTTP_E_URL
+      EndIf
+    EndIf
+  EndIf
+  If i = 0
+    ; No scheme written. Accept a bare host, but refuse anything with a
+    ; scheme separator in it that we did not recognise above.
+    n = 0
+    While n < 16
+      If (PeekA(url + n) & $FF) = 0
+        Break
+      EndIf
+      If (PeekA(url + n) & $FF) = 58
+        If (PeekA(url + n + 1) & $FF) = 47
+          ProcedureReturn #HTTP_E_SCHEME
+        EndIf
+      EndIf
+      n = n + 1
+    Wend
+  EndIf
+
+  ; The authority, up to the first slash.
+  port = 0
+  sawcolon = 0
+  While 1 = 1
+    c = PeekA(url + i) & $FF
+    If c = 0 Or c = 47                  ; end, or the start of the path
+      Break
+    EndIf
+    If c = 58                           ; a colon: a port follows
+      sawcolon = 1
+    ElseIf sawcolon <> 0
+      If http_IsDigit(c) = 0
+        ProcedureReturn #HTTP_E_URL
+      EndIf
+      port = port * 10 + (c - 48)
+      If port > 65535
+        ProcedureReturn #HTTP_E_URL
+      EndIf
+    Else
+      If http_hostlen >= #HTTP_HOST_MAX - 1
+        ProcedureReturn #HTTP_E_LONG
+      EndIf
+      http_host[http_hostlen] = c
+      http_hostlen = http_hostlen + 1
+    EndIf
+    i = i + 1
+  Wend
+  If http_hostlen = 0
+    ProcedureReturn #HTTP_E_URL
+  EndIf
+  If sawcolon <> 0
+    If port < 1
+      ProcedureReturn #HTTP_E_URL
+    EndIf
+    http_port = port
+  EndIf
+  http_host[http_hostlen] = 0
+
+  ; The path. An absent one is "/" - RFC 9112 3.2.1, "the origin-form
+  ; ... if the target URI's path component is empty, the client MUST
+  ; send /".
+  If (PeekA(url + i) & $FF) = 0
+    http_path[0] = 47
+    http_pathlen = 1
+  Else
+    While 1 = 1
+      c = PeekA(url + i) & $FF
+      If c = 0
+        Break
+      EndIf
+      If http_pathlen >= #HTTP_PATH_MAX - 1
+        ProcedureReturn #HTTP_E_LONG
+      EndIf
+      http_path[http_pathlen] = c
+      http_pathlen = http_pathlen + 1
+      i = i + 1
+    Wend
+  EndIf
+  http_path[http_pathlen] = 0
+  ProcedureReturn #HTTP_OK
+EndProcedure
+
+Procedure.i HttpHost()
+  ProcedureReturn @http_host[0]
+EndProcedure
+
+Procedure.i HttpHostLen()
+  ProcedureReturn http_hostlen
+EndProcedure
+
+Procedure.i HttpPath()
+  ProcedureReturn @http_path[0]
+EndProcedure
+
+Procedure.i HttpPathLen()
+  ProcedureReturn http_pathlen
+EndProcedure
+
+Procedure.i HttpUrlPort()
+  ProcedureReturn http_port
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The response parser, fed ONE BYTE AT A TIME.
+;
+;  A byte at a time looks wasteful and is the only thing that cannot be
+;  wrong: a status line, a header, a chunk size and the CRLF after a
+;  chunk can all be split across any TCP segment boundary the server
+;  feels like choosing, and a parser that assumes otherwise passes every
+;  test against a fast local server and fails against one across a
+;  router. The cost is a compare and a store per byte on a 1.5 GHz core.
+; ----------------------------------------------------------------------
+Procedure http_LineReset()
+  http_linelen = 0
+  http_lineover = 0
+EndProcedure
+
+Procedure http_LineByte(c.i)
+  If c = 13                             ; a bare CR is dropped; the LF ends
+    ProcedureReturn                     ; the line. RFC 9112 2.2 allows a
+  EndIf                                 ; recipient to accept a bare LF.
+  If http_linelen >= #HTTP_LINE_MAX
+    http_lineover = 1                   ; NOT truncated into the buffer:
+    ProcedureReturn                     ; a half header is worse than none
+  EndIf
+  http_line[http_linelen] = c & $FF
+  http_linelen = http_linelen + 1
+EndProcedure
+
+Procedure http_BodyByte(c.i)
+  http_bodyseen = http_bodyseen + 1
+  If http_bodylen < http_dstmax
+    PokeB(http_dst + http_bodylen, c & $FF)
+    http_bodylen = http_bodylen + 1
+  Else
+    http_truncated = 1
+  EndIf
+EndProcedure
+
+; RFC 9112 6.3, walked in its own order, once, when the headers end.
+Procedure.i http_HeadersDone()
+  If http_status >= 100 And http_status <= 199
+    http_framing = #HTTP_FRAME_NONE
+    ProcedureReturn #HTTP_OK
+  EndIf
+  If http_status = 204 Or http_status = 304
+    http_framing = #HTTP_FRAME_NONE
+    ProcedureReturn #HTTP_OK
+  EndIf
+  If http_headonly <> 0
+    http_framing = #HTTP_FRAME_NONE
+    ProcedureReturn #HTTP_OK
+  EndIf
+  If http_chunked <> 0
+    If http_haveclen <> 0
+      ; Both framings announced. REFUSED - see FRAMING at the top.
+      ProcedureReturn #HTTP_E_FRAMING
+    EndIf
+    http_framing = #HTTP_FRAME_CHUNKED
+    ProcedureReturn #HTTP_OK
+  EndIf
+  If http_haveclen <> 0
+    http_framing = #HTTP_FRAME_LENGTH
+    ProcedureReturn #HTTP_OK
+  EndIf
+  http_framing = #HTTP_FRAME_CLOSE
+  ProcedureReturn #HTTP_OK
+EndProcedure
+
+; The status line: "HTTP/" then a version token, a space, three digits.
+; THE VERSION IS OTHERWISE IGNORED - an HTTP/1.0 server works, and its
+; lack of chunked encoding is handled by the read-until-close framing
+; that its missing Content-Length selects anyway.
+Procedure.i http_StatusLine()
+  Define i.i
+  Define v.i
+  If http_linelen < 12
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  If (http_line[0] & $FF) <> 72 Or (http_line[1] & $FF) <> 84
+    ProcedureReturn #HTTP_E_STATUS      ; 72 84 84 80 47 is "HTTP/"
+  EndIf
+  If (http_line[2] & $FF) <> 84 Or (http_line[3] & $FF) <> 80
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  If (http_line[4] & $FF) <> 47
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  i = 5
+  While i < http_linelen
+    If (http_line[i] & $FF) = 32
+      Break
+    EndIf
+    i = i + 1
+  Wend
+  i = i + 1
+  If (i + 2) >= http_linelen
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  If http_IsDigit(http_line[i] & $FF) = 0
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  If http_IsDigit(http_line[i + 1] & $FF) = 0
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  If http_IsDigit(http_line[i + 2] & $FF) = 0
+    ProcedureReturn #HTTP_E_STATUS
+  EndIf
+  v = ((http_line[i] & $FF) - 48) * 100
+  v = v + ((http_line[i + 1] & $FF) - 48) * 10
+  v = v + ((http_line[i + 2] & $FF) - 48)
+  http_status = v
+  ProcedureReturn #HTTP_OK
+EndProcedure
+
+Procedure http_HeaderLine()
+  Define off.i
+  Define n.i
+  Define i.i
+  Define c.i
+  If http_lineover <> 0
+    http_hdrdropped = http_hdrdropped + 1
+    ProcedureReturn
+  EndIf
+  http_hdrcount = http_hdrcount + 1
+
+  off = http_Field(?http_nm_clen)
+  If off >= 0
+    n = http_Dec(off)
+    If n >= 0
+      http_clen = n
+      http_haveclen = 1
+    EndIf
+    ProcedureReturn
+  EndIf
+  off = http_Field(?http_nm_te)
+  If off >= 0
+    ; "chunked" is the only transfer coding this understands, and RFC
+    ; 9112 6.1 requires it to be the LAST one; anything else present at
+    ; all means the body cannot be framed here. Looking for the word
+    ; anywhere in the value is enough for that decision because the only
+    ; two outcomes are "chunked" and "refuse".
+    i = off
+    While i + 6 < http_linelen
+      If http_Lower(http_line[i] & $FF) = 99          ; c
+        If http_Lower(http_line[i + 1] & $FF) = 104   ; h
+          If http_Lower(http_line[i + 2] & $FF) = 117 ; u
+            If http_Lower(http_line[i + 3] & $FF) = 110 ; n
+              If http_Lower(http_line[i + 4] & $FF) = 107 ; k
+                If http_Lower(http_line[i + 5] & $FF) = 101 ; e
+                  If http_Lower(http_line[i + 6] & $FF) = 100 ; d
+                    http_chunked = 1
+                  EndIf
+                EndIf
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+      i = i + 1
+    Wend
+    ProcedureReturn
+  EndIf
+  off = http_Field(?http_nm_loc)
+  If off >= 0
+    http_loclen = 0
+    http_locover = 0
+    i = off
+    While i < http_linelen
+      c = http_line[i] & $FF
+      If http_loclen >= #HTTP_LOC_MAX - 1
+        http_locover = 1
+        Break
+      EndIf
+      http_loc[http_loclen] = c
+      http_loclen = http_loclen + 1
+      i = i + 1
+    Wend
+    http_loc[http_loclen] = 0
+    ProcedureReturn
+  EndIf
+EndProcedure
+
+Procedure.i http_HexDigit(c.i)
+  If c >= 48 And c <= 57
+    ProcedureReturn c - 48
+  EndIf
+  If c >= 97 And c <= 102
+    ProcedureReturn c - 87
+  EndIf
+  If c >= 65 And c <= 70
+    ProcedureReturn c - 55
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; One byte of the response. Returns #HTTP_OK while it wants more, a
+; refusal, or #HTTP_ST_DONE's effect by leaving http_state at
+; #HTTP_ST_DONE.
+Procedure.i http_Feed(c.i)
+  Define r.i
+  Define d.i
+
+  If http_state = #HTTP_ST_STATUS
+    If c = 10
+      r = http_StatusLine()
+      If r <> #HTTP_OK
+        ProcedureReturn r
+      EndIf
+      http_LineReset()
+      http_state = #HTTP_ST_HEADERS
+    Else
+      http_LineByte(c)
+    EndIf
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  If http_state = #HTTP_ST_HEADERS
+    If c = 10
+      If http_linelen = 0
+        r = http_HeadersDone()
+        If r <> #HTTP_OK
+          ProcedureReturn r
+        EndIf
+        If http_framing = #HTTP_FRAME_NONE
+          http_state = #HTTP_ST_DONE
+        ElseIf http_framing = #HTTP_FRAME_LENGTH
+          If http_clen = 0
+            http_state = #HTTP_ST_DONE
+          Else
+            http_state = #HTTP_ST_BODY_LEN
+          EndIf
+        ElseIf http_framing = #HTTP_FRAME_CHUNKED
+          http_chunkhex = 0
+          http_chunkdigits = 0
+          http_state = #HTTP_ST_CHUNKSZ
+        Else
+          http_state = #HTTP_ST_BODY_EOF
+        EndIf
+        http_LineReset()
+        ProcedureReturn #HTTP_OK
+      EndIf
+      http_HeaderLine()
+      http_LineReset()
+    Else
+      http_LineByte(c)
+    EndIf
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  If http_state = #HTTP_ST_BODY_LEN
+    http_BodyByte(c)
+    If http_bodyseen >= http_clen
+      http_state = #HTTP_ST_DONE
+    EndIf
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  If http_state = #HTTP_ST_BODY_EOF
+    http_BodyByte(c)
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  If http_state = #HTTP_ST_CHUNKSZ
+    If c = 10
+      If http_chunkdigits = 0
+        ProcedureReturn #HTTP_E_CHUNK
+      EndIf
+      http_chunkleft = http_chunkhex
+      If http_chunkleft = 0
+        ; The last chunk. Any trailer fields that follow are read and
+        ; discarded by falling into the header state, which ends on the
+        ; empty line - that is RFC 9112 7.1.2's trailer section and
+        ; ignoring it is what 7.1.3 allows a client to do.
+        http_state = #HTTP_ST_DONE
+      Else
+        http_state = #HTTP_ST_BODY_CHK
+      EndIf
+      ProcedureReturn #HTTP_OK
+    EndIf
+    If c = 13
+      ProcedureReturn #HTTP_OK
+    EndIf
+    If c = 59                           ; a semicolon: chunk extensions,
+      http_chunkdigits = http_chunkdigits + 1   ; which are ignored, but
+      ProcedureReturn #HTTP_OK          ; the size before it still counts
+    EndIf
+    d = http_HexDigit(c)
+    If d < 0
+      ; Inside an extension after the semicolon anything is legal; before
+      ; one, a non-hex digit is a malformed chunk size and is refused
+      ; rather than read as zero.
+      If http_chunkdigits = 0
+        ProcedureReturn #HTTP_E_CHUNK
+      EndIf
+      ProcedureReturn #HTTP_OK
+    EndIf
+    If http_chunkhex > 8000000
+      ProcedureReturn #HTTP_E_CHUNK
+    EndIf
+    http_chunkhex = http_chunkhex * 16 + d
+    http_chunkdigits = http_chunkdigits + 1
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  If http_state = #HTTP_ST_BODY_CHK
+    http_BodyByte(c)
+    http_chunkleft = http_chunkleft - 1
+    If http_chunkleft <= 0
+      http_state = #HTTP_ST_CHUNKEND
+    EndIf
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  If http_state = #HTTP_ST_CHUNKEND
+    If c = 10
+      http_chunkhex = 0
+      http_chunkdigits = 0
+      http_state = #HTTP_ST_CHUNKSZ
+    EndIf
+    ProcedureReturn #HTTP_OK
+  EndIf
+
+  ProcedureReturn #HTTP_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HttpGet / HttpHead - the whole exchange, blocking, pumping TcpPoll.
+;
+;  IT BLOCKS AND THAT IS A CHOICE. Everything else in this stack is
+;  non-blocking, and this is not, because a monitor command IS a
+;  blocking thing: the operator typed `http get` and is waiting. The
+;  budget is bounded in every phase, TcpPoll is called throughout so the
+;  rest of the stack keeps running, and the caller can pass a break
+;  check in - see HttpSetBreak.
+; ----------------------------------------------------------------------
+; THE BREAK CHECK IS A NAME THIS FILE CALLS AND DOES NOT DEFINE, exactly
+; as the link seam is. The main program supplies
+;
+;     Procedure.i NetBreakCheck()
+;
+; returning non-zero when the operator has asked for the command to
+; stop. In Anvil it is one line onto OutBreak().
+;
+; A PROCEDURE POINTER WAS CONSIDERED AND REJECTED, for the reason
+; net.pi4's header gives about the same choice: it buys nothing over the
+; caller writing one line, and it turns a missing implementation from a
+; compile-time "undefined procedure" into a run-time call through null.
+Procedure.i http_Broke()
+  ProcedureReturn NetBreakCheck()
+EndProcedure
+
+Procedure http_Reset(dst.i, maxlen.i)
+  http_state = #HTTP_ST_IDLE
+  http_status = 0
+  http_framing = #HTTP_FRAME_NONE
+  http_clen = 0
+  http_haveclen = 0
+  http_chunked = 0
+  http_hdrcount = 0
+  http_hdrdropped = 0
+  http_err = #HTTP_OK
+  http_tcperr = 0
+  http_truncated = 0
+  http_bodylen = 0
+  http_bodyseen = 0
+  http_rxbytes = 0
+  http_chunkleft = 0
+  http_chunkhex = 0
+  http_chunkdigits = 0
+  http_loclen = 0
+  http_locover = 0
+  http_loc[0] = 0
+  http_dst = dst
+  http_dstmax = maxlen
+  http_LineReset()
+  http_ReqReset()
+EndProcedure
+
+; THE ROUTE IS RESOLVED HERE AND THE INTERFACE IS PASSED DOWN. TCP
+; latches the interface with the rest of the peer, so it has to be told
+; which one - and the destination is what decides it, on a board holding
+; an address on a cable and another on a radio at once. NONE means no
+; interface can reach this host at all, which is a connect failure and
+; not an ARP wait.
+Procedure.i http_Connect(ip.i, port.i)
+  Define t0.i
+  Define rc.i
+  Define k.i
+  k = NetIfForDest(ip)
+  If k = #HW_LINK_NONE
+    http_tcperr = #NET_TCP_E_ROUTE
+    ProcedureReturn #HTTP_E_CONNECT
+  EndIf
+  t0 = millis()
+  While 1 = 1
+    If TcpState() = #TCP_CLOSED
+      rc = TcpConnect(k, ip, port)
+      If rc <> #NET_TCP_OK
+        If rc <> #NET_TCP_E_ARP
+          http_tcperr = rc
+          ProcedureReturn #HTTP_E_CONNECT
+        EndIf
+      EndIf
+    EndIf
+    TcpPoll(#HTTP_SLICE_MS)
+    If TcpState() = #TCP_ESTABLISHED
+      ProcedureReturn #HTTP_OK
+    EndIf
+    If TcpWasReset() <> 0
+      http_tcperr = TcpError()
+      ProcedureReturn #HTTP_E_RESET
+    EndIf
+    If TcpError() <> 0
+      If TcpState() = #TCP_CLOSED
+        http_tcperr = TcpError()
+        ProcedureReturn #HTTP_E_CONNECT
+      EndIf
+    EndIf
+    If http_Broke() <> 0
+      ProcedureReturn #HTTP_E_CONNECT
+    EndIf
+    If (millis() - t0) > #HTTP_CONNECT_MS
+      ProcedureReturn #HTTP_E_CONNECT
+    EndIf
+  Wend
+  ProcedureReturn #HTTP_E_CONNECT
+EndProcedure
+
+; TcpSend's short return is documented and is NOT an error, so this
+; loops on it and restarts the clock whenever anything moves.
+Procedure.i http_SendAll(src.i, len.i)
+  Define off.i
+  Define k.i
+  Define t0.i
+  off = 0
+  t0 = millis()
+  While off < len
+    k = TcpSend(src + off, len - off)
+    If k > 0
+      off = off + k
+      t0 = millis()
+    EndIf
+    TcpPoll(#HTTP_SLICE_MS)
+    If TcpWasReset() <> 0
+      http_tcperr = TcpError()
+      ProcedureReturn #HTTP_E_RESET
+    EndIf
+    If TcpState() = #TCP_CLOSED
+      http_tcperr = TcpError()
+      ProcedureReturn #HTTP_E_SEND
+    EndIf
+    If http_Broke() <> 0
+      ProcedureReturn #HTTP_E_SEND
+    EndIf
+    If (millis() - t0) > #HTTP_SEND_MS
+      ProcedureReturn #HTTP_E_SEND
+    EndIf
+  Wend
+  ProcedureReturn #HTTP_OK
+EndProcedure
+
+Procedure.i http_ReadResponse()
+  Define t0.i
+  Define n.i
+  Define i.i
+  Define r.i
+  Define st.i
+  t0 = millis()
+  http_state = #HTTP_ST_STATUS
+  While 1 = 1
+    n = TcpRead(@http_rx[0], #HTTP_RXCHUNK)
+    If n > 0
+      http_rxbytes = http_rxbytes + n
+      t0 = millis()
+      i = 0
+      While i < n
+        r = http_Feed(http_rx[i] & $FF)
+        If r <> #HTTP_OK
+          ProcedureReturn r
+        EndIf
+        If http_state = #HTTP_ST_DONE
+          ProcedureReturn #HTTP_OK
+        EndIf
+        i = i + 1
+      Wend
+    Else
+      TcpPoll(#HTTP_SLICE_MS)
+      If TcpAvailable() = 0
+        st = TcpState()
+        If st <> #TCP_ESTABLISHED And st <> #TCP_SYN_SENT And st <> #TCP_SYN_RECEIVED
+          ; The connection has ended with the ring empty. Whether that
+          ; is the ANSWER or a FAILURE depends entirely on the framing
+          ; decided when the headers finished - RFC 9112 6.3 step 5
+          ; makes the close itself the framing when nothing else said.
+          If http_state = #HTTP_ST_BODY_EOF
+            http_state = #HTTP_ST_DONE
+            ProcedureReturn #HTTP_OK
+          EndIf
+          If http_state = #HTTP_ST_DONE
+            ProcedureReturn #HTTP_OK
+          EndIf
+          If TcpWasReset() <> 0
+            http_tcperr = TcpError()
+            ProcedureReturn #HTTP_E_RESET
+          EndIf
+          http_tcperr = TcpError()
+          ProcedureReturn #HTTP_E_CLOSED
+        EndIf
+      EndIf
+      If http_Broke() <> 0
+        ProcedureReturn #HTTP_E_TIMEOUT
+      EndIf
+      If (millis() - t0) > #HTTP_RESP_MS
+        ProcedureReturn #HTTP_E_TIMEOUT
+      EndIf
+    EndIf
+  Wend
+  ProcedureReturn #HTTP_E_TIMEOUT
+EndProcedure
+
+; The one entry point both HttpGet and HttpHead go through. `method` is
+; a pointer to the method token; the URL has already been parsed into
+; http_host / http_path / http_port by HttpParseUrl, and `ip` is what
+; the caller resolved that host to.
+Procedure.i http_Run(method.i, ip.i, dst.i, maxlen.i)
+  Define r.i
+  Define s.i
+  Define keep.i
+
+  http_Reset(dst, maxlen)
+  If ip = 0
+    http_err = #HTTP_E_ARG
+    ProcedureReturn #HTTP_E_ARG
+  EndIf
+  If http_hostlen = 0 Or http_pathlen = 0
+    http_err = #HTTP_E_URL
+    ProcedureReturn #HTTP_E_URL
+  EndIf
+  http_ip = ip
+
+  ; The request, RFC 9112 3: request-line, then the header fields, then
+  ; an empty line. Host is MANDATORY in HTTP/1.1 (RFC 9112 3.2) and is
+  ; the whole reason a name is carried alongside an address.
+  http_ReqPut(method)
+  http_ReqPutC(32)
+  http_ReqPutBytes(@http_path[0], http_pathlen)
+  http_ReqPut(" HTTP/1.1")
+  http_ReqCrLf()
+  http_ReqPut("Host: ")
+  http_ReqPutBytes(@http_host[0], http_hostlen)
+  http_ReqCrLf()
+  http_ReqPut("Connection: close")
+  http_ReqCrLf()
+  http_ReqPut("User-Agent: PureMetalAnvil/1.0")
+  http_ReqCrLf()
+  http_ReqCrLf()
+  If http_reqover <> 0
+    http_err = #HTTP_E_LONG
+    ProcedureReturn #HTTP_E_LONG
+  EndIf
+
+  keep = TcpCurrent()
+  s = TcpAlloc()
+  If s < 0
+    TcpUse(keep)
+    http_err = #HTTP_E_NOSOCK
+    ProcedureReturn #HTTP_E_NOSOCK
+  EndIf
+  http_sock = s
+  TcpUse(s)
+  http_requests = http_requests + 1
+
+  r = http_Connect(ip, http_port)
+  If r = #HTTP_OK
+    r = http_SendAll(@http_req[0], http_reqlen)
+  EndIf
+  If r = #HTTP_OK
+    r = http_ReadResponse()
+  EndIf
+
+  ; The teardown runs whatever happened, and it runs in this order: a
+  ; polite FIN, two slices to let the peer's answer arrive, then an
+  ; abort so the socket is never left holding a half-closed connection
+  ; the next command cannot use.
+  TcpClose()
+  TcpPoll(#HTTP_SLICE_MS)
+  TcpPoll(#HTTP_SLICE_MS)
+  TcpAbort()
+  TcpUse(keep)
+
+  If r = #HTTP_OK
+    If http_truncated <> 0
+      ; SOFT. The status, the headers and the framing are all valid and
+      ; usable; only the body was longer than the buffer. Reporting this
+      ; as a hard failure would throw away a correct answer.
+      http_err = #HTTP_E_TRUNC
+      ProcedureReturn #HTTP_E_TRUNC
+    EndIf
+    http_oks = http_oks + 1
+  EndIf
+  http_err = r
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i HttpGet(ip.i, dst.i, maxlen.i)
+  http_headonly = 0
+  ProcedureReturn http_Run("GET", ip, dst, maxlen)
+EndProcedure
+
+Procedure.i HttpHead(ip.i)
+  http_headonly = 1
+  ProcedureReturn http_Run("HEAD", ip, 0, 0)
+EndProcedure
+
+Procedure HttpInit()
+  http_Reset(0, 0)
+  http_sock = -1
+  http_port = #HTTP_PORT_DEFAULT
+  http_ip = 0
+  http_requests = 0
+  http_oks = 0
+  http_hostlen = 0
+  http_pathlen = 0
+EndProcedure
+
+Procedure.i HttpStatus()
+  ProcedureReturn http_status
+EndProcedure
+
+Procedure.i HttpBodyLen()
+  ProcedureReturn http_bodylen
+EndProcedure
+
+Procedure.i HttpBodySeen()
+  ProcedureReturn http_bodyseen
+EndProcedure
+
+Procedure.i HttpContentLength()
+  If http_haveclen = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn http_clen
+EndProcedure
+
+Procedure.i HttpFraming()
+  ProcedureReturn http_framing
+EndProcedure
+
+Procedure.i HttpTruncated()
+  ProcedureReturn http_truncated
+EndProcedure
+
+Procedure.i HttpHeaderCount()
+  ProcedureReturn http_hdrcount
+EndProcedure
+
+Procedure.i HttpHeadersDropped()
+  ProcedureReturn http_hdrdropped
+EndProcedure
+
+Procedure.i HttpRxBytes()
+  ProcedureReturn http_rxbytes
+EndProcedure
+
+Procedure.i HttpLocation()
+  ProcedureReturn @http_loc[0]
+EndProcedure
+
+Procedure.i HttpLocationLen()
+  ProcedureReturn http_loclen
+EndProcedure
+
+Procedure.i HttpIsRedirect()
+  If http_status >= 300 And http_status <= 399
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HttpError()
+  ProcedureReturn http_err
+EndProcedure
+
+Procedure.i HttpTcpError()
+  ProcedureReturn http_tcperr
+EndProcedure
+
+Procedure.i HttpFramingName(f.i)
+  If f = #HTTP_FRAME_NONE
+    ProcedureReturn "no body"
+  EndIf
+  If f = #HTTP_FRAME_LENGTH
+    ProcedureReturn "Content-Length"
+  EndIf
+  If f = #HTTP_FRAME_CHUNKED
+    ProcedureReturn "chunked"
+  EndIf
+  ProcedureReturn "until the connection closed"
+EndProcedure
+
+; House rule of 2026-09-03: a full sentence that keeps the number and says
+; what to check first.
+Procedure.i HttpErrorText(e.i)
+  Select e
+    Case #HTTP_OK
+      ProcedureReturn "http: no refusal recorded"
+    Case #HTTP_E_ARG
+      ProcedureReturn "http -400: a null pointer or an empty address reached the client, which is a fault in the monitor and not in what you typed"
+    Case #HTTP_E_URL
+      ProcedureReturn "http -401: that is not a URL this can parse. It wants http://host[:port]/path - a bare host works too, and the path defaults to /"
+    Case #HTTP_E_SCHEME
+      ProcedureReturn "http -402: this fetches PLAIN http only and that URL is https or another scheme, so nothing was fetched. It was refused rather than fetched over port 80, because that would answer a different question from the one asked"
+    Case #HTTP_E_LONG
+      ProcedureReturn "http -403: the host name or the path is longer than this client's buffer, so nothing was sent. Shorten it, or fetch by address"
+    Case #HTTP_E_NOSOCK
+      ProcedureReturn "http -404: every TCP socket is in use, so nothing was fetched. tcp status shows what is holding them; tcp close frees one"
+    Case #HTTP_E_CONNECT
+      ProcedureReturn "http -405: the connection was never established. Either nothing is listening on that port, or the address is not reachable - ping it to find out which"
+    Case #HTTP_E_RESET
+      ProcedureReturn "http -406: the server reset the connection. That is its answer and not a fault on this board; a server that resets instead of replying usually did not like the request line"
+    Case #HTTP_E_SEND
+      ProcedureReturn "http -407: the request could not be pushed out in ten seconds, so nothing was fetched. The connection came up and then stopped accepting data, which is the far end or the path to it"
+    Case #HTTP_E_TIMEOUT
+      ProcedureReturn "http -408: no response in twenty seconds, so nothing was fetched. The request went out and the server has not answered; check it is serving that path"
+    Case #HTTP_E_CLOSED
+      ProcedureReturn "http -409: the server closed the connection before the message it had announced was complete, so what arrived is not a whole response and is not being reported as one"
+    Case #HTTP_E_STATUS
+      ProcedureReturn "http -410: the first line back was not an HTTP status line, so nothing could be read. Something is listening on that port but it is not an HTTP server"
+    Case #HTTP_E_FRAMING
+      ProcedureReturn "http -411: the response announced BOTH a chunked transfer encoding and a Content-Length. Those can disagree, and choosing between them is how request smuggling works, so this refuses instead of guessing"
+    Case #HTTP_E_CHUNK
+      ProcedureReturn "http -412: a chunk size that is not hexadecimal, so the body could not be framed. The response is malformed"
+    Case #HTTP_E_TRUNC
+      ProcedureReturn "http -413: the status, the headers and the framing are all good and the BODY was longer than the buffer, so it was cut short. This is not a failure of the fetch - ask for fewer bytes, or read the length that arrived"
+    Default
+      ProcedureReturn "http: an unnumbered refusal, which is itself a defect"
+  EndSelect
+EndProcedure
+
+DataSection
+  ; The three header names this client looks for, as plain bytes so that
+  ; no character literal appears in the source and each is checkable
+  ; against the RFC by eye.
+  http_nm_clen:
+    Data.b 67,111,110,116,101,110,116,45,76,101,110,103,116,104,0   ; Content-Length
+  http_nm_te:
+    Data.b 84,114,97,110,115,102,101,114,45,69,110,99,111,100,105,110,103,0 ; Transfer-Encoding
+  http_nm_loc:
+    Data.b 76,111,99,97,116,105,111,110,0                            ; Location
+EndDataSection

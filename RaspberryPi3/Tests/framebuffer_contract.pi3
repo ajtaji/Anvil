@@ -1,0 +1,16 @@
+; Desk-only framebuffer contract fixture.  The host gate supplies a modeled
+; BCM2837 property mailbox and framebuffer; this file must never be booted.
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+XIncludeFile "RaspberryPi3/Lib/framebuffer.pbi"
+
+Procedure.i Main()
+  ; Volatile-looking runtime selection keeps each callable under test in the
+  ; emitted image without ever making this a bootable hardware program.
+  Select PeekI($06000000)
+    Case 1 : ProcedureReturn Pi3FbInit(PeekI($06000008),PeekI($06000010))
+    Case 2 : ProcedureReturn Pi3FbPack(PeekI($06000018),PeekI($06000020),PeekI($06000028))
+  EndSelect
+  ProcedureReturn Pi3FbError()
+EndProcedure

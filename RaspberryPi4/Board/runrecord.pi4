@@ -1,0 +1,337 @@
+; ======================================================================
+;  runrecord.pi4 - WHAT HAPPENED TO THE LAST PAYLOAD, KEPT WHERE A RESET
+;                  CANNOT ERASE IT, AND THE `last run` COMMAND THAT SAYS SO.
+; ======================================================================
+;
+;  WHY THIS EXISTS. On 2026-09-16 three long payloads - two to five minutes
+;  of silent compute each - finished and returned, and the host runner
+;  reported that they had never returned. The return line had been printed
+;  and sent; it was lost on the way in (the host's firewall had forgotten
+;  the console's datagram flow during the silence). Each result was dug out
+;  of memory by hand, and "never returned" was one sentence standing for
+;  four different outcomes:
+;
+;    the payload returned, and only the line was lost;
+;    the payload is still running;
+;    the deadman reset the board;
+;    the payload stopped at a processor exception;
+;
+;  and a fifth the host already sees by itself: the monitor never entered it.
+;
+;  A line on a network can always be lost. The fix for THAT is on the host.
+;  What the host cannot do without help is find out afterwards WHICH of
+;  those happened, and only the monitor knows. So the monitor writes it down
+;  at the three moments that decide it - entry, return, exception - and a
+;  host that did not see a return line asks with `last run`.
+;
+;  WHERE IT LIVES. In the boot phase record's page, #MON_PHASE_LO, from the
+;  second cache line on. That page was chosen for exactly this property and
+;  its argument is in memmap.pi4: no image size reaches it, the stack
+;  cannot, _start does not erase it, its address never moves, and it is a
+;  refused region so `write`, `fill` and `copy` cannot overwrite it by
+;  accident. DRAM survives the deadman's reset, so a record written before
+;  the reset is read after it - which is the only way "the deadman reset
+;  the board" can ever be said by the board rather than guessed by a host.
+;
+;  THE LAYOUT, 64-bit words from #MON_PHASE_LO:
+;
+;    +64   magic "ANVRUNR1"          +72   run number, rises on every entry
+;    +80   state                     +88   entry address
+;    +96   x0 at return              +104  boot count at entry
+;    +112  counter at entry          +120  counter at return or exception
+;    +128  deadman seconds armed     +136  ESR at an exception
+;    +144  PC at an exception        +152  FAR at an exception
+;
+;  STATES: 0 nothing recorded, 1 entered and not yet back, 2 returned,
+;  3 stopped at a processor exception.
+;
+;  THE BOOT COUNT IS THE RESET DETECTOR. MonPhaseBegin raises the phase
+;  record's boot count once per boot. A record that says "entered" with a
+;  boot count below the current one was entered by a previous boot and
+;  never came back to it: the board restarted underneath the payload. With
+;  a deadman armed that is the deadman; without one it was a person or a
+;  power cut, and the sentence says which it can and cannot know.
+;
+;  EVERY WRITE IS FLUSHED TO DRAM AT ONCE. A payload may have turned its own
+;  caches on (the four-core service requires it), so a word written from
+;  the exception path could otherwise sit in a dirty cache line when the
+;  deadman resets the board. dc civac on the two cache lines the record
+;  occupies puts it in DRAM before anything else can happen.
+; ======================================================================
+
+#RUNREC_BASE  = #MON_PHASE_LO + 64
+#RUNREC_MAGIC = $414E5652554E5231      ; "ANVRUNR1", spelled as ANVPHASE is, positive
+
+#RUNREC_OFF_MAGIC   = 0
+#RUNREC_OFF_RUN     = 8
+#RUNREC_OFF_STATE   = 16
+#RUNREC_OFF_ADDR    = 24
+#RUNREC_OFF_X0      = 32
+#RUNREC_OFF_BOOTS   = 40
+#RUNREC_OFF_T0      = 48
+#RUNREC_OFF_T1      = 56
+#RUNREC_OFF_DEADMAN = 64
+#RUNREC_OFF_ESR     = 72
+#RUNREC_OFF_PC      = 80
+#RUNREC_OFF_FAR     = 88
+
+#RUNREC_NONE      = 0
+#RUNREC_ENTERED   = 1
+#RUNREC_RETURNED  = 2
+#RUNREC_EXCEPTION = 3
+
+Global runrec_flush.i = 0
+
+Procedure RunRecordFlushLine()
+  ASM
+    adrp x16, global_runrec_flush
+    add  x16, x16, #:lo12:global_runrec_flush
+    ldr  x16, [x16]
+    dc civac, x16
+  EndASM
+EndProcedure
+
+Procedure RunRecordFlush()
+  runrec_flush = #RUNREC_BASE
+  RunRecordFlushLine()
+  runrec_flush = #RUNREC_BASE + 64
+  RunRecordFlushLine()
+  ASM
+    dsb sy
+  EndASM
+EndProcedure
+
+Procedure.i RunRecordValid()
+  ProcedureReturn Bool(PeekI(#RUNREC_BASE + #RUNREC_OFF_MAGIC) = #RUNREC_MAGIC)
+EndProcedure
+
+Procedure.i RunRecordState()
+  If RunRecordValid() = 0
+    ProcedureReturn #RUNREC_NONE
+  EndIf
+  ProcedureReturn PeekI(#RUNREC_BASE + #RUNREC_OFF_STATE)
+EndProcedure
+
+Procedure.i RunRecordRun()
+  If RunRecordValid() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekI(#RUNREC_BASE + #RUNREC_OFF_RUN)
+EndProcedure
+
+; The last thing before the jump. Written AFTER every refusal RunAt can make,
+; so a payload the monitor declined leaves the run number where it was - and
+; "the number did not move" is how a host knows nothing was entered.
+Procedure RunRecordEnter(addr.i, deadman.i)
+  Define run.i
+  run = RunRecordRun() + 1
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_STATE,   #RUNREC_ENTERED)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_RUN,     run)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_ADDR,    addr)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_X0,      0)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_BOOTS,   MonPhaseBoots())
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_T0,      Ticks())
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_T1,      0)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_DEADMAN, deadman)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_ESR,     0)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_PC,      0)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_FAR,     0)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_MAGIC,   #RUNREC_MAGIC)
+  RunRecordFlush()
+EndProcedure
+
+; The FIRST thing after the payload comes back, before the picture and
+; before any device is touched: if the return path then wedges, the record
+; already says the payload returned and what it returned.
+Procedure RunRecordReturn(x0.i)
+  If RunRecordState() <> #RUNREC_ENTERED
+    ProcedureReturn
+  EndIf
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_X0,    x0)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_T1,    Ticks())
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_STATE, #RUNREC_RETURNED)
+  RunRecordFlush()
+EndProcedure
+
+; From the processor-exception reporter, before it prints anything. Only a
+; payload that is still inside counts: an exception in the monitor's own
+; code after a payload returned is not that payload's, and must not
+; rewrite what it did.
+Procedure RunRecordException(esr.i, pc.i, far.i)
+  If RunRecordState() <> #RUNREC_ENTERED
+    ProcedureReturn
+  EndIf
+  If PeekI(#RUNREC_BASE + #RUNREC_OFF_BOOTS) <> MonPhaseBoots()
+    ProcedureReturn
+  EndIf
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_ESR,   esr)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_PC,    pc)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_FAR,   far)
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_T1,    Ticks())
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_STATE, #RUNREC_EXCEPTION)
+  RunRecordFlush()
+EndProcedure
+
+; Milliseconds between entry and the recorded end, or -1 when the end was
+; not seen by this boot's counter (a reset in between restarts it).
+Procedure.i RunRecordMs()
+  Define hz.i
+  Define t0.i
+  Define t1.i
+  t0 = PeekI(#RUNREC_BASE + #RUNREC_OFF_T0)
+  t1 = PeekI(#RUNREC_BASE + #RUNREC_OFF_T1)
+  hz = TickHz()
+  If hz <= 0 Or t1 = 0 Or t1 < t0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn (t1 - t0) / (hz / 1000)
+EndProcedure
+
+Procedure RunRecordSaySeconds(ms.i)
+  If ms < 0
+    Print("a time this boot's counter did not see")
+    ProcedureReturn
+  EndIf
+  PrintDec(ms / 1000)
+  Print(".")
+  PrintDec((ms / 100) % 10)
+  Print(" s")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  last run - one machine line, then the same facts as sentences.
+;
+;    LASTRUN <run:8> <state:2> <restarted:2> <deadman:2> <x0:16>
+;            <addr:16> <ms:16> <esr:16> <pc:16> <far:16>
+;
+;  on ONE line. ms is FFFFFFFFFFFFFFFF when it is not known. The line is
+;  anchored whole and every field is fixed-width hex, the same shape as
+;  `shot`'s SHOT line, so a host reads it without reading the prose.
+; ----------------------------------------------------------------------
+Procedure CmdLastRun()
+  Define state.i
+  Define restarted.i
+  Define dead.i
+  Define ms.i
+  Define run.i
+
+  state = RunRecordState()
+  run = RunRecordRun()
+  restarted = 0
+  dead = 0
+  ms = -1
+  If state <> #RUNREC_NONE
+    If PeekI(#RUNREC_BASE + #RUNREC_OFF_BOOTS) <> MonPhaseBoots()
+      restarted = 1
+    EndIf
+    dead = PeekI(#RUNREC_BASE + #RUNREC_OFF_DEADMAN)
+    If restarted = 0
+      ms = RunRecordMs()
+    EndIf
+  EndIf
+
+  Print("LASTRUN ")
+  PutHexN(run, 8)
+  Print(" ")
+  PutHexN(state, 2)
+  Print(" ")
+  PutHexN(restarted, 2)
+  Print(" ")
+  PutHexN(dead, 2)
+  Print(" ")
+  If state = #RUNREC_NONE
+    PutHex16(0)
+    Print(" ")
+    PutHex16(0)
+  Else
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_X0))
+    Print(" ")
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_ADDR))
+  EndIf
+  Print(" ")
+  PutHex16(ms)
+  Print(" ")
+  If state = #RUNREC_NONE
+    PutHex16(0)
+    Print(" ")
+    PutHex16(0)
+    Print(" ")
+    PutHex16(0)
+  Else
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_ESR))
+    Print(" ")
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_PC))
+    Print(" ")
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_FAR))
+  EndIf
+  PrintNl()
+
+  If state = #RUNREC_NONE
+    PrintN("No payload has been entered since this board's memory last lost power,")
+    PrintN("so there is nothing to report. The record survives a reset and the")
+    PrintN("deadman, but not a power cut.")
+    ProcedureReturn
+  EndIf
+
+  Print("Run ")
+  PrintDec(run)
+  Print(" entered the payload at ")
+  PutAddr(PeekI(#RUNREC_BASE + #RUNREC_OFF_ADDR))
+  If dead > 0
+    Print(" with a ")
+    PrintDec(dead)
+    PrintN(" s deadman armed.")
+  Else
+    PrintN(" with no deadman armed.")
+  EndIf
+
+  If state = #RUNREC_RETURNED
+    If restarted = 0
+      Print("It RETURNED after ")
+      RunRecordSaySeconds(ms)
+      Print(", and its x0 register held ")
+    Else
+      Print("It RETURNED, before the board was restarted since, and its x0 register held ")
+    EndIf
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_X0))
+    PrintN(".")
+    PrintN("  A host that did not see the return line lost it on the way; the")
+    PrintN("  payload itself came back.")
+  ElseIf state = #RUNREC_EXCEPTION
+    Print("It STOPPED AT A PROCESSOR EXCEPTION: ESR=")
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_ESR))
+    Print(" PC=")
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_PC))
+    Print(" FAR=")
+    PutHex16(PeekI(#RUNREC_BASE + #RUNREC_OFF_FAR))
+    PrintN(".")
+    If restarted <> 0
+      If dead > 0
+        PrintN("  The board then reset: the deadman fired, because nothing pets it")
+        PrintN("  once the monitor has stopped.")
+      Else
+        PrintN("  The board has been restarted since, by a reset or a power cycle.")
+      EndIf
+    Else
+      Print("  That was ")
+      RunRecordSaySeconds(ms)
+      PrintN(" after entry.")
+    EndIf
+  Else
+    If restarted <> 0
+      If dead > 0
+        PrintN("It NEVER CAME BACK and the board restarted underneath it with the")
+        PrintN("  deadman armed, so THE DEADMAN RESET THE BOARD: the payload stopped")
+        PrintN("  petting it, hung, or ran with its interrupts and its pets both gone.")
+      Else
+        PrintN("It NEVER CAME BACK and the board was restarted underneath it. No")
+        PrintN("  deadman was armed, so that was a reset or a power cycle from outside.")
+      EndIf
+    Else
+      ; Only reachable if something other than the payload is asking - a
+      ; secondary path at the prompt while the record says entered. Say it.
+      PrintN("It is recorded as entered and not yet back, and this board has not")
+      PrintN("  restarted since - which the payload itself could not be asking.")
+    EndIf
+  EndIf
+EndProcedure

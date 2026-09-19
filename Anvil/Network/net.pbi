@@ -1,0 +1,4237 @@
+; ======================================================================
+;  net.pbi - target-neutral Ethernet II, ARP, IPv4, ICMP echo and UDP.
+; ======================================================================
+;
+;  THE BOARD ANSWERS A PING. Proven on silicon 2026-08-26, over a bare
+;  cable between this Pi 4 and a laptop, within minutes of the file
+;  being written:
+;
+;      Reply from the board's link-local address: bytes=32 time=2ms TTL=64
+;      four of four, 0% loss
+;      laptop ARP table: the board's link-local address -> its test MAC
+;
+;  TTL 64 is ours. So this board runs a bootloader, an Ethernet driver
+;  and an IP stack entirely out of this project, and answers an ordinary
+;  ping from an ordinary PC needing no host tooling at that end at all -
+;  which is exactly why a ping was chosen as the first proof. Five of
+;  five UDP datagrams were carried the same session.
+;
+;  AND IT SETTLED A STANDING SUSPICION ABOUT THE LAYER BELOW. genet.pi4's
+;  transmit path had never been PROVEN: frames left and their counter
+;  incremented, but nothing had ever answered, so a transmit-side
+;  divergence between U-Boot and Linux over ID_MODE_DIS was about to be
+;  chased. ARP resolving the laptop in one slice, and Windows accepting
+;  our echo replies, proves transmit is correct as it stands. A working
+;  driver did not get "fixed".
+;
+;  ---- A HEADER THAT LIED, AND WHY IT IS WORTH THE PARAGRAPH ----------
+;
+;  This block used to open: "NOTHING IN THIS FILE HAS RUN ON SILICON.
+;  Written 2026-08-26, the same day genet.pi4 was proven end to end on a
+;  real board. The layer underneath is real; this layer is not yet."
+;  True when typed, false a few hours later, and COMMITTED ALONGSIDE ITS
+;  OWN REFUTATION - the commit that introduces this file is titled
+;  "net.pi4: the board answers a ping" and quotes the transcript above
+;  in its own message.
+;
+;  It then produced a live disagreement inside the tree, which is how it
+;  was found. RaspberryPi4/Lib/tftp.pi4's header says, correctly, that
+;  it was written "the day net.pi4 answered a ping and received five of
+;  five UDP datagrams from a laptop over a direct cable" - so two files
+;  in one directory said opposite things about this one, and NEITHER
+;  CLAIM WAS IN THE VAULT. It was settled from the git history rather
+;  than by picking a side, because a commit message written at the bench
+;  carries a transcript and a header carries nothing. tftp.pi4 was right.
+;
+;  THE VAULT STILL HAS NO ROW FOR THIS RESULT. "Silicon results
+;  2026-08-26" predates it by a few hours and stops at GENET. Until
+;  somebody writes it there, the only evidence for the paragraph above
+;  is a commit message - and a commit message is not in anything a
+;  future session reads at startup.
+;
+;  ---- WHAT IS PROVEN ON THE WIRE, AND WHAT IS ONLY GATED ------------
+;
+;    PROVEN, 2026-08-26: ARP request and reply, IPv4 header parsing and
+;    emission, ICMP echo, UDP, and the ARP cache under a real
+;    conversation - the last one the hard way.
+;
+;    THE BUG THE WIRE FOUND AND THE GATE COULD NOT. ARP entries died
+;    mid-conversation. The cache was refreshed by ARP frames and by
+;    nothing else, so an entry expired on a fixed 20 s timer however
+;    busy the conversation with that neighbour was (see :501). It bit
+;    only ON-LINK, because off-link the entry that matters is the
+;    GATEWAY's, and a router ARPs its segment constantly - so that entry
+;    stays alive as a side effect of other machines' traffic, and every
+;    earlier test had been off-link. Fixed by net_ConfirmNeighbour()
+;    (:1391), called from net_RecvIp after the header checks and after
+;    the destination filter.
+;
+;    WHY THE GATE COULD NOT HAVE CAUGHT IT, which is the part worth
+;    keeping: NO CASE IN THE HARNESS COULD MAKE TIME PASS. Expiry is the
+;    only thing in this file that reads a clock, so the defect lived in
+;    the one region unreachable by construction. Two harness operations
+;    - an ARP TTL control and a CNTPCT tick-burner - had to be written
+;    before it could be tested at all. 63 cases became 88, with two
+;    guards so a careless repair cannot buy the green: a SILENT
+;    neighbour must still expire, and an IMPOSTOR MAC must confirm
+;    nothing.
+;
+;    GATED BUT NOT WITNESSED ON THE WIRE: every refusal path, IP options
+;    on receive, fragmentation refusal in both directions, and the
+;    off-link/gateway routing decision. tools/a64/a64_net_check.py
+;    compares every frame BYTE FOR BYTE, the ARP reply's 18 zero pad
+;    octets included, and 15 mutations go red.
+;
+;    AN HONEST LIMIT ON THAT GATE, stated in its own docstring and
+;    repeated here because it is easy to over-read: it is NOT the same
+;    kind of gate as a64_genet_check.py. That one PARSES the vendor
+;    driver, so it is a second independent READING. The EtherTypes, ARP
+;    layout, IPv4 header, ICMP types and UDP header here began as a
+;    SECOND TRANSCRIPTION - two files can believe the same wrong
+;    constant, and no amount of byte-exact comparison finds that. The
+;    checksum and pseudo-header ARE cited (rfc9293-tcp.txt:407 and :433,
+;    located by content so the citation cannot go stale), and so are the
+;    14 and the 1500 (v2025.01_bcmgenet.c:102). RFCs 826, 791, 792, 768
+;    and 1123 were fetched into RaspberryPi4/Reference/ later the same
+;    day precisely to close the gap, so the gate CAN now parse the spec
+;    - check whether it does before quoting this either way.
+;
+;    NOT DONE, written down as an omission rather than left to be
+;    discovered: no ICMP port-unreachable is sent, and broadcast pings
+;    are not answered.
+;
+;  WHAT THIS IS FOR. genet.pi4 moves raw Ethernet frames and knows
+;  nothing whatever about protocol: on 2026-08-26 it put a 60-byte
+;  broadcast on the wire and received a genuine spanning-tree BPDU off a
+;  live switch, and that is the whole of its vocabulary. This file is
+;  the vocabulary. With it the board can answer a ping - which is the
+;  single best first proof there is, because it needs no host tooling at
+;  all, only a person typing `ping` at a command prompt - and can carry
+;  UDP payloads, which is what a file transfer will eventually ride on.
+;
+;  HOW A CALLER USES IT - AND WHY IT LOOKS LIKE THIS
+;  ----------------------------------------------------------------------
+;  THIS LIBRARY PERFORMS NO INPUT AND NO OUTPUT. It never calls
+;  GenetSend, it never calls GenetRecv, and it does not know that
+;  genet.pi4 exists. It is a codec and a small state machine over
+;  buffers, and the main program does all the pumping:
+;
+;      XIncludeFile "Anvil/Hal/hal.pbi"          the #HW_LINK_* kinds
+;      XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+;      XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+;      XIncludeFile "Anvil/Network/net.pbi"
+;      ...
+;      NetSetMac(#HW_LINK_WIRED, @mymac[0])
+;      NetSetIPv4(#HW_LINK_WIRED, NetMakeIPv4(192,168,1,50), NetMakeIPv4(255,255,255,0), NetMakeIPv4(192,168,1,1))
+;      ...
+;      Repeat
+;        n = GenetRecvWait(@rx[0], 1600, 250)
+;        If n > 0
+;          r = NetInput(#HW_LINK_WIRED, @rx[0], n)
+;          If r = #NET_IN_REPLY
+;            GenetSend(NetOutBuf(), NetOutLen(), 100)
+;          EndIf
+;        EndIf
+;      ForEver
+;
+;  THE INTERFACE IS THE FIRST ARGUMENT OF EVERYTHING WITH AN IDENTITY IN
+;  IT, and the caller above passes a constant because it drives one card.
+;  A board with a cable and a radio passes the kind the frame ARRIVED on
+;  when it parses, and the kind a route CHOSE when it builds. There is
+;  one address row per kind and nothing is ever copied between them - see
+;  THE IDENTITY OF EVERY INTERFACE below for the account of the single
+;  identity this replaced and of the swap that briefly stood in for it.
+;
+;  THREE REASONS FOR THAT SHAPE, and the first is a project rule:
+;
+;   1. A LIBRARY NEVER INCLUDES A LIBRARY here. If this file called
+;      GenetSend it would have to include genet.pi4, and the main
+;      program lists both instead. The alternative - a procedure pointer
+;      handed in at run time - was considered and rejected: it buys
+;      nothing over the caller writing two lines, and it makes the
+;      failure mode "a call through a null pointer" rather than "a
+;      refusal code".
+;
+;   2. IT MAKES THE GATE POSSIBLE. tools/a64/a64_net_check.py feeds
+;      byte-exact frames into NetInput() and reads byte-exact frames out
+;      of NetOutBuf(), with no device model at all, because there is no
+;      device in the path. A protocol layer that did its own I/O would
+;      need the whole GENET model bolted underneath it before a single
+;      checksum could be tested.
+;
+;   3. THE CALLER OWNS THE DEADLINE. Waiting is the caller's business,
+;      as it is in genet.pi4 - see the header of GenetRecvWait(), which
+;      exists because a poll count was mistaken for a duration and cost
+;      a hardware run. Nothing in this file loops waiting for the
+;      network.
+;
+;  THE ONE BUFFER THIS FILE OWNS
+;  ----------------------------------------------------------------------
+;  Every procedure that BUILDS a frame builds it in one staging buffer of
+;  #NET_FRAME_MAX bytes, reached through NetOutBuf() and NetOutLen().
+;  1536 bytes of BSS is the whole cost. genet.pi4 explicitly refuses to
+;  own its 512 KiB receive region for exactly this reason and makes the
+;  caller supply it (genet.pi4:1921-1934, "WHY NOT A `Global Dim` HERE"); 1536 bytes is three orders of
+;  magnitude smaller and the trade goes the other way.
+;
+;  EACH BUILD OVERWRITES THE LAST. Build, send, build, send. Building
+;  twice and sending once sends the second one. NetInput() clears the
+;  buffer on entry, so a reply staged by one call is gone by the next -
+;  send it before you pump again.
+;
+;  PADDING IS DONE HERE, AND THIS IS THE RIGHT PLACE FOR IT
+;  ----------------------------------------------------------------------
+;  The shortest legal Ethernet frame is 64 bytes on the wire including
+;  the four-byte FCS, so 60 bytes of frame; the GENET MAC appends the FCS
+;  itself. genet.pi4 REFUSES anything shorter than 60 rather than padding
+;  it (genet.pi4:956-971, #GENET_MIN_FRAME), and the reasoning is sound:
+;  padding a caller's buffer means writing past the length the caller
+;  gave, into memory whose size the library does not know.
+;
+;  Here that objection does not apply, because the buffer is ours and we
+;  know it is 1536 bytes long. So NetOutLen() is NEVER less than 60: an
+;  ARP reply is 42 bytes of protocol and 18 bytes of zero, and every
+;  builder ends by calling net_Finish(). A caller can hand NetOutBuf()
+;  and NetOutLen() straight to GenetSend() and it will never be refused
+;  for being short. THE PAD IS ZEROS, not stack rubbish - a short frame
+;  padded with whatever happened to be in memory is a slow leak of the
+;  board's RAM onto the network, and it costs one loop to not do that.
+;
+;  ENDIANNESS, SAID OUT LOUD BECAUSE IT IS THE COMMONEST WAY TO GET THIS
+;  WRONG
+;  ----------------------------------------------------------------------
+;  The wire is BIG-ENDIAN - "network byte order" - and this machine is
+;  LITTLE-ENDIAN. Every multi-byte field in every header in this file is
+;  therefore read and written ONE BYTE AT A TIME through net_GetBE16 /
+;  net_GetBE32 / net_PutBE16 / net_PutBE32.
+;
+;  THERE IS NOT A SINGLE PeekU, PeekW, PeekL, PeekN, PokeU, PokeW, PokeL
+;  OR PokeN AIMED AT A PROTOCOL FIELD ANYWHERE IN THIS FILE, and that is
+;  deliberate rather than accidental. Those would work - and they would
+;  produce a byte-swapped field, silently, on a value that then travels
+;  to another machine which reads it as a perfectly plausible different
+;  number. A 16-bit port of 7 read the wrong way round is port 1792, and
+;  nothing anywhere raises a complaint. The byte loops are three lines
+;  each, they compile to almost nothing, and they cannot be wrong in a
+;  direction that looks right.
+;
+;  THE ONE PeekN IN THIS FILE IS NOT AIMED AT A FIELD, and the sentence
+;  above is worded the way it is so that it stays exactly true. It is in
+;  net_Sum16; it reads four octets of a buffer as A NUMBER TO ADD UP and
+;  never as a value; and RFC 1071 section 1.2B is the licence, because
+;  the ones' complement sum is byte-order independent - a sum taken the
+;  wrong way round is the right answer byte-swapped, and swapping it once
+;  at the end makes it right. Nothing it touches is a field and nothing
+;  it produces leaves this machine in the order it was read. The argument
+;  is written out again beside the code, so that anyone adding a SECOND
+;  one has to make it from scratch rather than cite this one.
+;
+;  IPv4 ADDRESSES ARE HELD AS NUMBERS, NOT AS BYTES. Inside this file an
+;  address is one .i in the range 0..$FFFFFFFF whose MOST SIGNIFICANT
+;  BYTE IS THE FIRST OCTET, so 192.168.1.50 is $C0A80132 - the number you
+;  would write down if you were reading the dotted quad left to right.
+;  Use NetMakeIPv4(192,168,1,50) to build one and never type the hex.
+;  That representation makes masking arithmetic ordinary
+;  ((ip & mask) = (ours & mask) is the on-link test) and it converts to
+;  the wire with net_PutBE32, which emits the most significant byte
+;  first - which is the first octet. The two orders agree by
+;  construction, and that is the reason for choosing it.
+;
+;  WHAT IS REFUSED, AND WHY REFUSING IS THE POINT
+;  ----------------------------------------------------------------------
+;  1. IP FRAGMENTATION, IN BOTH DIRECTIONS.
+;
+;     RECEIVE: a datagram with MF set, or with a non-zero fragment
+;     offset, is refused with #NET_E_FRAGMENT and is NOT reassembled and
+;     NOT partly processed. Reassembly is a buffer pool, a timer, an
+;     overlapping-fragment policy and a decade of security history, and
+;     none of that belongs in a first network stack. The tempting wrong
+;     thing is to treat the first fragment as if it were the whole
+;     datagram, because it parses perfectly and usually contains the
+;     whole header; that is silent corruption and it is exactly what a
+;     numbered refusal exists to prevent.
+;
+;     TRANSMIT: we never fragment. A payload that will not fit one frame
+;     is refused with #NET_E_TOO_BIG before anything is built, and every
+;     datagram we emit carries DF (Don't Fragment). Setting DF is not
+;     decoration: it means a router that WOULD have had to fragment
+;     sends back an ICMP "fragmentation needed" instead of quietly doing
+;     it, so the failure arrives as a message rather than as a datagram
+;     we can never reassemble.
+;
+;  2. A PING TO THE BROADCAST ADDRESS IS NOT ANSWERED. An echo request
+;     whose IP destination was a broadcast is ignored, not replied to.
+;     One packet from an attacker with a forged source produces a reply
+;     from every host on the segment; the board should not be one of
+;     them. Directed-broadcast UDP is still delivered, because that is a
+;     thing a caller may legitimately want.
+;
+;  3. ICMP PORT UNREACHABLE IS NOT SENT for a UDP datagram to a port
+;     nobody is bound to. Such a datagram is simply ignored. This is a
+;     KNOWN OMISSION rather than an oversight: the correct behaviour is
+;     to send type 3 code 3 quoting the first 8 bytes of the datagram,
+;     and it is not here because nothing needs it yet and because a
+;     stack that answers unsolicited packets is a stack that can be made
+;     to shout at a third party. Recorded so that the next person does
+;     not have to work out whether it was forgotten.
+;
+;  4. NO IP OPTIONS ARE EVER EMITTED. IHL is always 5 on transmit.
+;     On RECEIVE options are accepted and skipped - IHL 5..15 is parsed,
+;     the header checksum covers all IHL*4 bytes as it must, and the
+;     payload starts at IHL*4. Skipping an option we do not understand is
+;     CORRECT behaviour, not mishandling, which is why this one is
+;     accepted where fragmentation is refused. IHL below 5 is a
+;     malformed header and is refused with #NET_E_IP_HEADER.
+;
+;  5. NO ROUTING, NO FORWARDING, NO MULTICAST, NO IGMP, NO DHCP.
+;     DHCP in particular is deliberately absent: it is a separate job
+;     with its own state machine and its own timers, and putting it here
+;     would double the file. See CONFIGURATION below.
+;
+;     THIS LINE USED TO END "NO TCP" AND IT NO LONGER DOES, 2026-09-04.
+;     What is here is TCP's FRAMING and nothing else: net_RecvTcp checks
+;     the twenty-byte header, the data offset and the checksum and hands
+;     the segment's coordinates up as #NET_IN_TCP; NetTcpBuild puts an
+;     Ethernet and an IPv4 header in front of a segment somebody else
+;     wrote and computes its checksum. NO SEQUENCE NUMBER IS COMPARED IN
+;     THIS FILE AND NO CONNECTION STATE LIVES IN IT. The protocol - the
+;     state machine, the timers, the windows, the rings - is
+;     RaspberryPi4/Lib/tcp.pi4, which touches no register and no frame
+;     it does not own. It is the same seam cyw43.pico2 drew for
+;     RP2350/Lib/tcp.pico2, drawn in the same place for the same reason:
+;     a protocol layer that did its own framing could not be gated
+;     without a device model underneath it.
+;
+;  THE CHECKSUM, AND WHAT WAS DONE ABOUT THE PSEUDO-HEADER
+;  ----------------------------------------------------------------------
+;  All three checksums here - IPv4 header, ICMP, UDP - are the same
+;  16-bit ones' complement of the ones' complement sum, and there is a
+;  citable definition of it ON THIS DISK:
+;
+;    Datasheets/rfc9293-tcp.txt:407-415
+;      "the 16-bit ones' complement of the ones' complement sum of all
+;       16-bit words in the header and text ... If a segment contains an
+;       odd number of header and text octets, alignment can be achieved
+;       by padding the last octet with zeros on its right ... While
+;       computing the checksum, the checksum field itself is replaced
+;       with zeros."
+;
+;  net_Sum16() implements exactly that, including the right-hand zero
+;  pad for an odd length. It returns the RUNNING 32-BIT SUM rather than
+;  the finished value, so that a pseudo-header, a header and a payload
+;  can be summed into one accumulator without ever materialising a
+;  concatenated buffer. net_Cksum() folds and complements.
+;
+;  VERIFYING is done by summing the received bytes WITH the checksum
+;  field left in place and requiring net_Cksum() of the result to be
+;  zero. That is the standard trick and it is worth stating why it works:
+;  the sender chose the field so that the total sum is $FFFF, and the
+;  complement of $FFFF is 0.
+;
+;  THE UDP PSEUDO-HEADER. IPv4 UDP checksums are OPTIONAL - a sender may
+;  transmit zero to mean "not computed" and a receiver must then accept
+;  the datagram unchecked. THIS FILE COMPUTES THEM ANYWAY, in both
+;  directions, because a UDP checksum is the only end-to-end integrity
+;  check the payload gets and switching it off saves a few microseconds
+;  to buy silent corruption. NetUdpChecksumTx(0) exists to turn the
+;  TRANSMIT side off, for a bench experiment; the default is on and the
+;  receive side always checks a non-zero field.
+;
+;  What was done about the pseudo-header, concretely:
+;
+;    * The layout used is the twelve octets of Figure 2 in
+;      Datasheets/rfc9293-tcp.txt:426-449 - source address, destination
+;      address, a zero octet, the protocol number, and the upper-layer
+;      length. THAT FIGURE IS TCP'S. UDP's pseudo-header is the same
+;      twelve octets with PTCL 17 instead of 6 and the UDP length in
+;      place of the TCP length, and the authority for that is RFC 768,
+;      WHICH IS NOT ON THIS DISK. So the SHAPE is cited and the
+;      SUBSTITUTION is not; see THE CITATION PROBLEM below.
+;    * It is never materialised in memory. net_PseudoSum() adds the
+;      twelve octets' worth of 16-bit words arithmetically - the two
+;      halves of each address, then (0 << 8) | protocol, then the
+;      length - into the accumulator, and the payload sum is added on
+;      top. Building a scratch buffer and summing it would give the same
+;      answer and would need a scratch buffer.
+;    * The length that goes into it is the UDP LENGTH - header plus
+;      payload - and NOT the IP total length. Those differ by 20 and
+;      confusing them produces a checksum that is wrong by a constant,
+;      which is the most annoying possible bug because it is wrong for
+;      every packet in exactly the same way and therefore looks
+;      systematic rather than arithmetic.
+;    * IF THE COMPUTED CHECKSUM COMES OUT ZERO WE TRANSMIT $FFFF. Zero
+;      on the wire means "no checksum here"; $FFFF is the other
+;      representation of the same ones'-complement value, so the
+;      receiver's arithmetic is unaffected and the "not computed"
+;      meaning is not accidentally claimed. This rule is RFC 768's, and
+;      RFC 768 is not on this disk either.
+;
+;  THE CITATION PROBLEM - READ THIS BEFORE TRUSTING A NUMBER HERE
+;  ----------------------------------------------------------------------
+;  mailbox.pi4:239-240 sets the house rule: a number that could only have
+;  been recalled rather than read does not belong in the tree. This file
+;  cannot fully honour it, and pretending otherwise would be worse than
+;  saying so.
+;
+;  The source-vault reference index was read first, and its networking
+;  reference collection was searched
+;  for if_ether.h, ip.h, icmp.h, udp.h, an lwIP tree, ARPOP, ETHERTYPE_,
+;  ETH_P_ and the literal 0x0806. THE ONLY MATCHES IN THE WHOLE TREE ARE
+;  AN AVR UART REGISTER AND SOME DES TABLES. There is no IP stack and no
+;  protocol header on this machine.
+;
+;  WHAT IS CITED, AND FROM WHERE:
+;    * the ones' complement checksum  Datasheets/rfc9293-tcp.txt:407-415
+;    * the IPv4 pseudo-header layout  Datasheets/rfc9293-tcp.txt:426-449
+;    * MTU 1500 and an Ethernet header of 14 octets
+;        Datasheets/pi4/uboot/v2025.01_bcmgenet.c:102
+;        ("Body(1500) + EH_SIZE(14) + VLANTAG(4) + ...")
+;    * the 60-byte minimum frame, and that the MAC appends the FCS
+;        RaspberryPi4/Lib/genet.pi4:956-971
+;    * the largest frame the MAC will accept, 1536
+;        RaspberryPi4/Lib/genet.pi4:972 (#GENET_MAX_FRAME)
+;
+;  WHAT IS **NOT** CITED, because the document is not on this disk. Every
+;  constant in the #NET_UNCITED block below carries this mark. They are
+;  written from the protocol definitions and are exactly the class of
+;  number the house rule distrusts:
+;
+;      RFC  826  Address Resolution Protocol - the ARP packet layout,
+;                the hardware/protocol type numbers, the opcodes, and
+;                the packet-reception algorithm this file implements.
+;      RFC  791  Internet Protocol - the IPv4 header layout, the
+;                version/IHL/flags/fragment fields and TTL.
+;      RFC  792  Internet Control Message Protocol - echo request and
+;                echo reply, types 8 and 0.
+;      RFC  768  User Datagram Protocol - the UDP header, the pseudo-
+;                header substitution and the transmit-$FFFF rule.
+;      RFC  894  IP over Ethernet - EtherType $0800.
+;      IANA "Protocol Numbers" - ICMP 1, UDP 17.
+;      IEEE 802.3 - the 1536 boundary between a length field and an
+;                EtherType, and the 60-byte minimum (this one has a
+;                second witness in genet.pi4, above).
+;      RFC 3927  Dynamic Configuration of IPv4 Link-Local Addresses.
+;                ADDED 2026-09-07. The 169.254.0.0/16 prefix and the
+;                reserved first and last 256 addresses (section 2.1);
+;                the ARP Probe and ARP Announcement packet forms and
+;                what counts as a conflict (2.2, 2.2.1, 2.4); the timing
+;                constants (2.2.1); and the defend-once-then-give-up
+;                rule (2.5). See THE LINK-LOCAL BLOCK below, where every
+;                one of those numbers is written out with the section it
+;                comes from beside it.
+;
+;  ASK FOR THOSE FIVE RFCs TO BE PUT ON THE DISK. They are small, they
+;  are stable, and once they are here the block below can be turned into
+;  cited constants and the gate can PARSE them instead of restating
+;  them - which is the difference between two independent readings and
+;  one reading written down twice.
+;
+;  CONFIGURATION - AND HOW settings.pbi WILL FEED IT LATER
+;  ----------------------------------------------------------------------
+;  A static address, set by the caller. There is no DHCP here and there
+;  is not going to be in this file.
+;
+;      NetSetMac(@mac[0])
+;      NetSetIPv4(ip, mask, gateway)
+;
+;  Anvil/Core/settings.pbi - a persistent key/value store on the
+;  boot stick - is being written by somebody else as this is written. It
+;  is NOT included here and this file does not depend on it. The API
+;  above is shaped so that it can be fed from there without changing a
+;  line of this file: everything arrives as plain integers, so a main
+;  program will eventually do something on the order of
+;
+;      ip = NetMakeIPv4(a, b, c, d)          ; a..d parsed from a setting
+;      NetSetIPv4(ip, mask, gw)
+;
+;  and the parsing of "192.168.1.50" into four numbers belongs in the
+;  main program or in settings.pbi, not here. NetMakeIPv4() takes four
+;  octets rather than one packed number precisely so that the caller
+;  never has to know which end of the number the first octet lives at.
+;
+;  THE MAC ADDRESS IS NOT INVENTED HERE either, for the same reasons
+;  genet.pi4 gives at length (genet.pi4:239-262, "WHY THIS FILE WILL NOT MAKE ONE UP"): a made-up
+;  locally-administered address means two boards running the same image
+;  collide on the same switch, and the symptom is intermittent and
+;  blamed on everything except the cause. NetSetMac() is mandatory and
+;  everything refuses with #NET_E_NO_MAC until it is called. THE ADDRESS
+;  MUST BE THE SAME ONE HANDED TO GenetSetMac(); nothing here can check
+;  that, because this file cannot see genet.pi4, and if they differ the
+;  symptom is that the MAC filters out every reply to everything we send.
+;  That is worth a line of comment in the main program.
+;
+;  ERROR CODES - NEGATIVE, AND NUMBERED FROM -100 ON PURPOSE
+;  ----------------------------------------------------------------------
+;  Every refusal here is a negative #NET_E_* and they start at -100.
+;  genet.pi4's run from -1 to -18 and a program using both prints both
+;  into the same log; -110 can only ever have come from this file and -8
+;  can only ever have come from that one. The gap is not decoration, it
+;  is so that a number in a transcript identifies its own author.
+;
+;  NetInput() returns a NON-NEGATIVE #NET_IN_* when it succeeded and a
+;  negative #NET_E_* when it refused, and the two ranges cannot overlap.
+;  #NET_IN_IGNORED is ZERO AND IS NOT AN ERROR - a frame for somebody
+;  else, a spanning-tree BPDU, an ARP for a neighbour: on a live switch
+;  port most frames are ignored and a caller treating that as a fault
+;  will report one several times a second.
+;
+;  UNITS
+;  ----------------------------------------------------------------------
+;  Lengths in bytes, times in milliseconds, ports and identifiers as
+;  plain numbers. Addresses as described above.
+; ======================================================================
+
+
+; ======================================================================
+;  SIZES
+; ======================================================================
+; 14 = destination(6) + source(6) + EtherType(2).
+; [v2025.01_bcmgenet.c:102 "EH_SIZE(14)"]
+#NET_ETH_HDR = 14
+
+; The payload of one frame. [v2025.01_bcmgenet.c:102 "Body(1500)"]
+#NET_MTU = 1500
+
+; The staging buffer. 14 + 1500 = 1514 is all we can ever build; 1536 is
+; the ceiling genet.pi4 imposes (#GENET_MAX_FRAME, genet.pi4:972) and
+; the buffer is sized to it so that the two limits can never disagree in
+; the direction that overflows.
+#NET_FRAME_MAX = 1536
+
+; The floor. genet.pi4:956-971 refuses anything shorter and explains
+; why it will not pad; net_Finish() pads to this instead.
+#NET_FRAME_MIN = 60
+
+; Header sizes, all fixed because we emit no options.
+#NET_IP_HDR   = 20
+#NET_UDP_HDR  = 8
+#NET_ICMP_HDR = 8
+#NET_ARP_LEN  = 28
+
+; The largest payload that fits without fragmenting, which we will not
+; do. 1500 - 20 - 8.
+#NET_UDP_PAYLOAD_MAX  = 1472
+#NET_ICMP_PAYLOAD_MAX = 1472
+
+; TCP's fixed header, and the largest SEGMENT - header, options and data
+; together - that can be built here without fragmenting: 1500 - 20.
+;
+; THE DATA CEILING IS SMALLER AND IS NOT THIS FILE'S BUSINESS. How many
+; option bytes a segment carries is the protocol's decision, and it
+; differs between a SYN and everything after it. This file checks the
+; WHOLE segment against #NET_TCP_SEG_MAX, so it never has to know where
+; the options stop - and a caller that gets the split wrong is refused
+; with a number rather than handed a datagram that needs fragmenting.
+#NET_TCP_HDR      = 20
+#NET_TCP_SEG_MAX  = 1480
+
+
+; ======================================================================
+;  #NET_UNCITED - EVERY CONSTANT BELOW IS UNCITED. See THE CITATION
+;  PROBLEM in the header. The RFC that defines each one is named beside
+;  it so that the check is a lookup and not an investigation.
+; ======================================================================
+
+; ---- EtherType ----
+; Values at or above 1536 are types; 1500 and below are 802.3 length
+; fields. 1501..1535 is undefined and treated here as a length.
+; [IEEE 802.3, uncited]
+#NET_ETHERTYPE_MIN = 1536
+#NET_ET_IPV4 = $0800                  ; [RFC 894, uncited]
+#NET_ET_ARP  = $0806                  ; [RFC 826, uncited]
+
+; ---- ARP ---- [RFC 826, uncited]
+#NET_ARP_HTYPE_ETHER = 1
+#NET_ARP_HLEN_ETHER  = 6
+#NET_ARP_PLEN_IPV4   = 4
+#NET_ARP_OP_REQUEST  = 1
+#NET_ARP_OP_REPLY    = 2
+
+; ---- IPv4 ---- [RFC 791, uncited]
+#NET_IP_VERSION      = 4
+#NET_IP_IHL_MIN      = 5              ; five 32-bit words = 20 octets
+#NET_IP_IHL_MAX      = 15             ; the field is four bits
+#NET_IP_FLAG_DF      = $4000          ; Don't Fragment
+#NET_IP_FLAG_MF      = $2000          ; More Fragments
+#NET_IP_FRAG_MASK    = $1FFF          ; the offset, in 8-octet units
+#NET_IP_TTL_DEFAULT  = 64             ; a conventional value, not a
+                                      ; required one. 64 is what nearly
+                                      ; everything sends; it is large
+                                      ; enough to cross any real path
+                                      ; and small enough that a routing
+                                      ; loop dies in well under a second.
+
+; ---- protocol numbers ---- [IANA "Protocol Numbers", uncited]
+#NET_PROTO_ICMP = 1
+#NET_PROTO_TCP  = 6
+#NET_PROTO_UDP  = 17
+
+; ---- ICMP ---- [RFC 792, uncited]
+#NET_ICMP_ECHO_REPLY   = 0
+#NET_ICMP_ECHO_REQUEST = 8
+#NET_ICMP_CODE_ZERO    = 0
+
+; ---- the two special IPv4 addresses we recognise ----
+; 255.255.255.255. [RFC 919/922, uncited]
+#NET_IP_BROADCAST = $FFFFFFFF
+
+; THE ONE PORT NUMBER THIS FILE KNOWS, and it is here under protest.
+; net.pi4 does not otherwise know what any port is for - that is the
+; whole point of NetUdpBind. This one is the exception because the
+; destination filter in net_RecvIp has to let a UNICAST DHCP reply
+; through at an address this board does not have yet, and that decision
+; happens three checks before net_RecvUdp reads the UDP header at all.
+; Anvil/Network/dhcp.pbi spells the same number #DHCP_PORT_CLIENT and
+; is included AFTER this file, so it cannot be the one definition; the
+; two are checked against each other by tools/a64/a64_net_check.py.
+; [RFC 2131 4.1, "DHCP messages ... to the client's port 68"]
+#NET_PORT_DHCP_CLIENT = 68
+
+
+; ======================================================================
+;  RETURN CODES
+; ======================================================================
+; NetInput()'s successes. Non-negative, and 0 is not an error.
+#NET_IN_IGNORED = 0    ; not for us, or nothing we speak. NORMAL.
+#NET_IN_REPLY   = 1    ; a frame is staged in NetOutBuf() - SEND IT
+#NET_IN_UDP     = 2    ; a UDP datagram landed; see NetUdpRx*()
+#NET_IN_PONG    = 3    ; an ICMP echo REPLY arrived; see NetPong*()
+#NET_IN_LEARNED = 4    ; an ARP reply filled a cache entry. Nothing to
+                       ; send, but a NetArpLookup() that failed a
+                       ; moment ago will now succeed.
+#NET_IN_TCP     = 5    ; a TCP segment landed and its checksum verified.
+                       ; NOTHING HAS BEEN INTERPRETED. This file owns no
+                       ; sequence number and no connection state; the
+                       ; segment's coordinates are handed up through
+                       ; NetTcpRx*() and the protocol lives in
+                       ; RaspberryPi4/Lib/tcp.pi4, exactly as the Pico's
+                       ; driver hands one up to RP2350/Lib/tcp.pico2.
+
+; The refusals. All negative, all distinct, none reused.
+#NET_E_NONE        =    0
+#NET_E_ARG         = -100  ; a null pointer or a negative length
+#NET_E_NO_MAC      = -101  ; NetSetMac() was never called for this
+                           ; interface
+#NET_E_NO_IP       = -102  ; NetSetIPv4() was never called for this
+                           ; interface
+#NET_E_MASK        = -103  ; the netmask is not a run of ones followed
+                           ; by a run of zeros. A mask like 255.0.255.0
+                           ; parses, masks, and gives wrong answers
+                           ; about who is on-link forever after.
+#NET_E_GATEWAY     = -104  ; the gateway is not inside our own subnet,
+                           ; so it could never be reached to be asked
+#NET_E_SHORT       = -105  ; the frame is shorter than the header it
+                           ; must contain
+#NET_E_IP_VERSION  = -106  ; the version nibble is not 4
+#NET_E_IP_HEADER   = -107  ; IHL below 5, or IHL*4 past the end
+#NET_E_IP_LENGTH   = -108  ; total length below the header, or past the
+                           ; end of the frame we were handed
+#NET_E_IP_CKSUM    = -109  ; the header checksum does not verify
+#NET_E_FRAGMENT    = -110  ; REFUSED, NOT REASSEMBLED. See the header.
+#NET_E_ICMP_SHORT  = -111
+#NET_E_ICMP_CKSUM  = -112
+#NET_E_UDP_SHORT   = -113
+#NET_E_UDP_LENGTH  = -114  ; the UDP length field disagrees with the
+                           ; datagram it is inside
+#NET_E_UDP_CKSUM   = -115
+#NET_E_ARP_SHORT   = -116
+#NET_E_ARP_PROTO   = -117  ; ARP for something that is not IPv4 over
+                           ; Ethernet - we have nothing to say about it
+#NET_E_NO_ARP      = -118  ; no cache entry for the destination. The
+                           ; caller must NetArpRequest() and pump until
+                           ; NetInput() returns #NET_IN_LEARNED.
+#NET_E_NO_ROUTE    = -119  ; off-link and no gateway configured
+#NET_E_TOO_BIG     = -120  ; would need fragmenting, which is refused
+#NET_E_CACHE_FULL  = -121  ; every ARP slot is a live entry.
+                           ; CURRENTLY UNREACHABLE AND KEPT ON PURPOSE.
+                           ; net_ArpSlot(1) evicts the soonest-expiring
+                           ; valid entry rather than failing, so
+                           ; NetArpSet() never runs out. The code stays
+                           ; numbered because the eviction policy is the
+                           ; kind of thing that gets tightened later,
+                           ; and a refusal that has to be invented at
+                           ; that point gets invented with a number
+                           ; somebody else is already using. It is not
+                           ; provoked in the probe's refusal suite,
+                           ; because it cannot be.
+#NET_E_PORT        = -122  ; a port outside 1..65535
+#NET_E_TCP_SHORT   = -123  ; a TCP segment shorter than its own twenty-
+                           ; byte header
+#NET_E_TCP_OFFSET  = -124  ; the data-offset nibble is below 5, or the
+                           ; header it describes runs past the segment
+#NET_E_TCP_CKSUM   = -125  ; the TCP checksum does not verify. It is
+                           ; NEVER OPTIONAL - RFC 9293 3.1 - so unlike
+                           ; UDP there is no zero here that means "not
+                            ; computed" and a zero field is a wrong one.
+#NET_E_UDP_FULL    = -126  ; every persistent UDP listener slot on this
+                           ; interface is in use
+
+
+; ======================================================================
+;  STATE
+; ======================================================================
+#NET_ARP_ENTRIES = 8
+
+; How long a learned ARP entry is believed. Not a citable number - the
+; usual figure quoted for a host cache is a few minutes and it varies by
+; operating system. Twenty seconds is chosen SHORT on purpose: this is a
+; bench stack, the boards and PCs on the bench get re-addressed and
+; re-cabled constantly, and a wrong entry that expires in twenty seconds
+; is an annoyance while one that expires in five minutes is a debugging
+; session. NetArpTtlMs() changes it.
+#NET_ARP_TTL_MS_DEFAULT = 20000
+
+; ======================================================================
+;  THE LINK-LOCAL BLOCK - RFC 3927, uncited (the document is not on this
+;  disk; every number below carries the section it comes from)
+; ======================================================================
+;  WHY THIS IS HERE AT ALL, 2026-09-07. A cable running straight from
+;  this board into a laptop has NO DHCP SERVER ON IT. The board asked,
+;  four times over twelve seconds, and nothing answered - because there
+;  was nothing there to answer. Meanwhile the laptop at the other end,
+;  which had asked exactly the same question and got exactly the same
+;  silence, gave ITSELF a link-local address and carried on. That is not a
+;  workaround, it is what every operating system on that cable already
+;  does, and it is written down: RFC 3927.
+;
+;  So the board does the same thing, and then the two ends of the cable
+;  are on one segment with no server, no static configuration and
+;  nothing typed at either end. THE POINT IS THAT NOTHING ON THE LAPTOP
+;  CHANGES - no address, no sharing, no firewall rule, no service.
+;
+;  WHAT THIS FILE PROVIDES AND WHAT IT DOES NOT. Here: the two packet
+;  forms (Probe and Announcement), the conflict test, and the numbers.
+;  NOT here: the state machine that picks an address, waits out the
+;  intervals and calls NetSetIPv4 - that needs a link to send on and a
+;  clock to sleep against, which are the caller's, exactly as DHCP's
+;  exchange is in Anvil/Core/net_cmd.pbi and not in dhcp.pi4.
+;  Anvil/Core/netll.pbi is the state machine.
+; ----------------------------------------------------------------------
+; The prefix, and the usable range inside it. [RFC 3927 s2.1: the block
+; is 169.254/16 and "the first 256 and last 256 addresses ... are
+; reserved for future use and MUST NOT be selected"] - so 169.254.1.0
+; through 169.254.254.255, which is 254 * 256 = 65,024 addresses.
+#NET_LL_PREFIX   = $A9FE0000          ; 169.254.0.0
+#NET_LL_MASK     = $FFFF0000          ; /16
+#NET_LL_FIRST    = $A9FE0100          ; 169.254.1.0
+#NET_LL_LAST     = $A9FEFEFF          ; 169.254.254.255
+#NET_LL_COUNT    = 65024              ; #NET_LL_LAST - #NET_LL_FIRST + 1
+
+; The ten constants of [RFC 3927 s2.2.1]. Named as the RFC names them so
+; that anyone holding the document can check them one for one. The three
+; that are ranges are the bounds of a random delay, in milliseconds.
+#NET_LL_PROBE_WAIT_MS       = 1000    ; initial random delay, 0..this
+#NET_LL_PROBE_NUM           = 3       ; how many probes go out
+#NET_LL_PROBE_MIN_MS        = 1000    ; the gap between two probes is
+#NET_LL_PROBE_MAX_MS        = 2000    ;   random in [MIN, MAX]
+#NET_LL_ANNOUNCE_WAIT_MS    = 2000    ; after the last probe, before the
+                                      ;   first announcement
+#NET_LL_ANNOUNCE_NUM        = 2       ; how many announcements go out
+#NET_LL_ANNOUNCE_INTERVAL_MS = 2000   ; the gap between them
+#NET_LL_MAX_CONFLICTS       = 10      ; after this many, back off
+#NET_LL_RATE_LIMIT_MS       = 60000   ; ... to one attempt this often
+#NET_LL_DEFEND_INTERVAL_MS  = 10000   ; a second conflict inside this
+                                      ;   window means give the address
+                                      ;   up rather than defend again
+
+; What the watcher is doing. NetLlWatch() sets it.
+#NET_LL_OFF     = 0    ; not watching. The ordinary state.
+#NET_LL_PROBING = 1    ; an address is being tested and is NOT ours yet
+#NET_LL_CLAIMED = 2    ; the address is ours and will be defended
+
+; ---- the watcher's state ----
+; WHICH INTERFACE IS ACQUIRING OR DEFENDING. RFC 3927 is an
+; INTERFACE' protocol - s2.5 defends "an interface where that host is
+; currently using the same address" - and until 2026-09-08 this watcher
+; had no interface at all, because the IP layer had only one identity
+; and the question could not be asked. It saw every ARP frame the board
+; received, from either link, and would have treated a conflict for
+; 169.254.x.y seen on the RADIO as a conflict on the CABLE. On this
+; bench nothing ever put a 169.254 conflict on the radio' segment, so
+; it was right by accident; it is now right by construction.
+Global net_llKind.i             ; 0 = not watching any interface
+Global net_llMode.i             ; one of the three above
+Global net_llAddr.i             ; the address being probed or defended
+Global net_llConflict.i         ; 1 once a conflict has been seen
+Global Dim net_llConflictMac.a[6]   ; who claimed it
+Global net_llDefendAt.i         ; net_Ticks() at the last defence, 0 =
+                                ; none yet. TICKS AND NOT MILLISECONDS:
+                                ; this file has no millis() and does not
+                                ; want one - net_Ticks/net_MsToTicks is
+                                ; the clock the ARP cache already uses,
+                                ; and one clock per file is the rule
+                                ; that keeps a gate able to run this
+                                ; code without a timer module.
+Global net_llGiveUp.i           ; 1 = a second conflict inside
+                                ;     DEFEND_INTERVAL; the address must
+                                ;     be surrendered, not defended again
+Global net_llDefends.i          ; how many defences have gone out
+Global net_llSeed.i             ; the PRNG state, seeded from the MAC
+
+#NET_HZ_FALLBACK = 54000000     ; as genet.pi4:982, and carrying the
+#NET_HZ_MAX      = 1000000000   ; same caveat: an assumption, not a
+                                ; measurement. A zero frequency would
+                                ; make every deadline fire instantly,
+                                ; which is what this guards.
+
+Global net_err.i                ; the last refusal
+
+; ======================================================================
+;  THE IDENTITY OF EVERY INTERFACE, ONE ROW EACH. THERE IS NO "CURRENT".
+; ======================================================================
+;  WHAT WAS HERE UNTIL 2026-09-08, and why it was the wrong shape.
+;
+;  One MAC, one address, one netmask, one gateway, one broadcast, one
+;  alias - the whole board' identity in ten globals - and, from
+;  2026-09-07, a SECOND store of the same facts per interface in
+;  Anvil/Core/netif.pbi, with NetIfActivate() COPYING a row into these
+;  globals before every frame was parsed, and a counter, netif_swaps,
+;  whose only job was to prove to a reader that the copying really
+;  happened.
+;
+;  THAT WORKED, and it was measured working on silicon on 2026-09-08 -
+;  the console answering on a cable and a radio at once, an image
+;  landing over the cable at 293 KB/s with the digest equal. It was
+;  still A SWAP ON TOP OF THE OLD SINGLE-IDENTITY SHAPE: two stores of
+;  one fact, kept in step by a procedure every caller had to remember,
+;  in an order nothing could check. `dhcp` and the link-local prober
+;  wrote these globals directly, so NetIfActivate could not even
+;  short-circuit on "this kind is already active" - it had no way to
+;  know what the globals held. The counter in `net link` was the tell:
+;  a number whose only purpose is to reassure the reader that a
+;  synchronisation is happening is a number that should not need to
+;  exist.
+;
+;  WHAT IS HERE NOW IS THE SHAPE THE FIELD BUILDS. lwIP keeps the
+;  addresses in `struct netif` and PASSES THE INTERFACE - ip4_input(p,
+;  inp), etharp_input(p, netif), ip4_output_if(..., netif). Nothing is
+;  copied anywhere, so nothing can be out of step, and "which interface
+;  is this frame about" is answered by the caller that actually knows:
+;  the pump that just received it, or the routing decision that chose
+;  where it leaves by.
+;
+;  SO: ONE ROW PER #HW_LINK_* KIND, and `kind` is the FIRST parameter of
+;  everything in this file that has an identity in it. There is still
+;  exactly ONE copy of every protocol rule - one ARP implementation, one
+;  IPv4 header parser, one checksum, one fragment refusal - which is
+;  what a second stack would have thrown away. Only the identity is per
+;  interface, because only the identity ever was.
+;
+;  THE MAC AND THE ADDRESS CANNOT COME APART. That was NetIfActivate'
+;  one real virtue and it is now structural rather than a thing to
+;  remember: they are two fields of one row, and a frame built for
+;  `kind` reads both out of that row. A stack carrying the wired card'
+;  six bytes and the radio' IPv4 address builds frames that every
+;  switch and every access point on the path filters out, with nothing
+;  on the board or on the network reporting a fault.
+;
+;  KIND 0 (#HW_LINK_NONE) IS NEVER A ROW. net_IfValid refuses it, so a
+;  caller that lost track of its interface gets a refusal rather than a
+;  frame sourced from address zero.
+; ======================================================================
+
+; The kinds run 0..5 (#HW_LINK_NONE..#HW_LINK_FILE in Anvil/Hal/hal.pbi)
+; so six rows covers every one of them and row 0 is never used. Spelled
+; as one constant so a new kind added to the seam is one edit here.
+#NET_IF_KINDS = 6
+
+Global Dim net_ifMacSet.i[#NET_IF_KINDS]
+Global Dim net_ifMac.a[#NET_IF_KINDS * 6]   ; ours, in wire order; the
+                                            ; six bytes of `kind` start
+                                            ; at kind * 6
+
+Global Dim net_ifIpSet.i[#NET_IF_KINDS]
+Global Dim net_ifIp.i[#NET_IF_KINDS]        ; all three as described in
+Global Dim net_ifMask.i[#NET_IF_KINDS]      ; the header: one .i, most
+Global Dim net_ifGw.i[#NET_IF_KINDS]        ; significant byte first
+Global Dim net_ifBcast.i[#NET_IF_KINDS]     ; the subnet broadcast,
+                                            ; precomputed
+
+; ----------------------------------------------------------------------
+;  THE SECOND ADDRESS ON THE SAME INTERFACE. Zero on every interface
+;  that has never needed one, and then every test below is one compare.
+;
+;  ONE CASE PUT IT HERE and it is not a general aliasing feature: a cable
+;  with no DHCP server on it, where this board has given itself a
+;  link-local address (RFC 3927) AND is handing out leases of its own on
+;  192.168.137.0/24 as the server. The two peers it can meet cannot both
+;  be answered at one address -
+;
+;    a DHCP client takes 192.168.137.2 and then cannot reach 169.254.x.y
+;    at all, because a host drops its self-assigned address the moment
+;    it gets a lease;
+;    a host that is not a DHCP client sits on its own link-local address
+;    and can reach nothing else.
+;
+;  - so the interface holds both and this layer answers at whichever one
+;  was asked. See NetSetIPv4Alt for the rules, which are the primary
+;  address' own.
+; ----------------------------------------------------------------------
+Global Dim net_ifAlt.i[#NET_IF_KINDS]
+Global Dim net_ifAltMask.i[#NET_IF_KINDS]
+Global Dim net_ifAltBcast.i[#NET_IF_KINDS]
+
+; ----------------------------------------------------------------------
+;  net_IfValid - is `kind` a row in this table at all.
+;
+;  NOT a question about whether the interface holds an address or has a
+;  cable in it: purely "is this index one of the six". Every entry point
+;  asks it first, so an out-of-range kind is a refusal and never a read
+;  past the end of an array.
+; ----------------------------------------------------------------------
+Procedure.i net_IfValid(kind.i)
+  If kind <= 0
+    ProcedureReturn 0
+  EndIf
+  If kind >= #NET_IF_KINDS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Where the six MAC bytes of `kind` start. Meaningful only when
+; net_ifMacSet[kind] is 1.
+Procedure.i net_IfMacPtr(kind.i)
+  ProcedureReturn @net_ifMac[0] + kind * 6
+EndProcedure
+
+Global net_ipId.i               ; the IPv4 Identification counter
+
+; The staging buffer and how much of it is a frame.
+Global Dim net_out.a[#NET_FRAME_MAX]
+Global net_outLen.i
+
+; The ARP cache. Parallel arrays rather than a Structure, matching the
+; way the rest of the Pi 4 libraries hold their tables.
+;   state 0 = free, 1 = pending (we asked, nobody has answered),
+;   state 2 = valid
+Global Dim net_arpKind.a[#NET_ARP_ENTRIES]       ; owning interface
+Global Dim net_arpIp.i[#NET_ARP_ENTRIES]
+Global Dim net_arpMac.a[48]                 ; 8 entries x 6 bytes
+Global Dim net_arpState.a[#NET_ARP_ENTRIES]
+Global Dim net_arpDeadline.i[#NET_ARP_ENTRIES]   ; in CNTPCT_EL0 ticks
+Global net_arpTtlMs.i
+
+; The last received UDP datagram.
+Global Dim net_udpBound.i[#NET_IF_KINDS] ; 0 = accept any port on this interface
+; Persistent listeners coexist with the command's movable reply filter.
+; DHCP client, DHCP server and future services therefore do not overwrite
+; one another merely because a console command is waiting for a reply.
+#NET_UDP_LISTENERS = 8
+Global Dim net_udpListen.i[#NET_IF_KINDS * #NET_UDP_LISTENERS]
+Global net_udpTxCksum.i         ; 1 = compute on transmit. See header.
+; DHCP bring-up. 0 normally. 1 only while a DHCP exchange is in flight,
+; when this stack must send from 0.0.0.0 and receive a broadcast reply
+; before it has an address of its own. See NetDhcpMode() and
+; NetUdpBuildBcast(), and Anvil/Network/dhcp.pbi for the whole story.
+Global Dim net_dhcpMode.a[#NET_IF_KINDS]
+; ----------------------------------------------------------------------
+;  WHICH OF OUR ADDRESSES THE DATAGRAM JUST RECEIVED WAS ADDRESSED TO.
+;
+;  A FACT ABOUT A FRAME, not a mode. It is set by net_RecvIp for the
+;  frame it is parsing and read by whoever wants to answer that peer at
+;  the address the peer used - because a reply sourced from our OTHER
+;  address is discarded by the asker as unsolicited, by every stack,
+;  silently, which is the failure the pair of addresses exists to
+;  prevent.
+;
+;  A BROADCAST NAMES NEITHER ADDRESS, so for one this holds
+;  NetSrcFor(kind, srcIp) - the one of that interface' addresses that is
+;  on the ASKER' own subnet. That line is what made `--find` work over
+;  the cable on 2026-09-07; the account is at the assignment itself.
+;
+;  UNTIL 2026-09-08 THIS WAS `net_rxTo` AND THE TRANSMIT PATH READ IT.
+;  It is receive state and it is now only ever receive state: nothing
+;  this file builds consults it, and NetSrcFor(kind, dstIp) - which is a
+;  function of its two arguments and nothing else - is what every
+;  outbound frame asks instead.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  WHICH INTERFACE THE FRAME JUST PARSED ARRIVED ON.
+;
+;  A FACT ABOUT A FRAME, like net_rxTo below it and like net_udpRxFrom -
+;  not a mode, and nothing this file BUILDS ever reads it. It is here so
+;  that a protocol above this layer which latches a peer out of a
+;  received segment can latch the interface out of the same segment: a
+;  TCP listener accepting a SYN records the peer' address, its port and
+;  its hardware address from the frame, and the interface belongs in
+;  that same list, because a connection that later replies out of the
+;  other link is a connection nobody can reach.
+; ----------------------------------------------------------------------
+Global net_rxKind.i
+
+Global net_rxTo.i
+
+Global net_udpRxFrom.i
+Global net_udpRxPort.i
+Global net_udpRxDstPort.i
+Global net_udpRxLen.i
+Global Dim net_udpRx.a[#NET_UDP_PAYLOAD_MAX]
+
+; ---- the last TCP segment, AS COORDINATES AND NOT AS A COPY --------
+;
+; UDP above copies its payload into net_udpRx, and that is right for
+; UDP: a datagram is a message, the caller wants the whole of it, and
+; 1472 bytes of BSS buys a payload whose lifetime the caller controls.
+;
+; TCP IS COPIED ONCE, AND ONCE IS ENOUGH. tcp.pi4 copies the data
+; straight into its receive ring - it has to, because a ring is where
+; ordering lives - so a copy here would be a second one, per segment,
+; on a board whose caches are off for most of Anvil's life. What is
+; handed up instead is where the bytes ARE.
+;
+; THE LIFETIME RULE, AND IT IS THE SAME ONE THE DRIVERS BELOW ALREADY
+; HAVE: these pointers point INTO THE FRAME THE CALLER HANDED
+; NetInput(), so they are valid exactly as long as that frame is - which
+; on the Wi-Fi side is "until the next call into cyw43.pi4" and on the
+; wired side is "until the next GenetRecvWait into the same buffer".
+; Consume the segment before pumping again. A reply being BUILT is
+; always safe, because replies are built in net_out and NetInput()
+; refuses a frame that lives there (see NetInput).
+Global net_tcpRxFrom.i          ; the peer's IPv4 address
+Global net_tcpRxTo.i            ; the destination, always ours
+Global net_tcpRxSrcPort.i
+Global net_tcpRxDstPort.i
+Global net_tcpRxSeg.i           ; -> the first byte of the TCP header
+Global net_tcpRxSegLen.i        ; header + options + data
+Global net_tcpRxHdrLen.i        ; the data offset, IN OCTETS
+Global net_tcpRxData.i          ; -> the first data byte
+Global net_tcpRxDataLen.i
+Global net_tcpRxMac.i           ; -> the six source-MAC bytes in the
+                                ; frame. A RST to a stranger has to be
+                                ; addressed, and the stranger is by
+                                ; definition not in the ARP cache.
+Global net_tcpRxCount.i         ; segments handed up
+
+; The last ICMP echo REPLY we received.
+Global net_pongFrom.i
+Global net_pongIdent.i
+Global net_pongSeq.i
+Global net_pongBytes.i
+
+; Six bytes of scratch for "which MAC does this go to". A file-level
+; global rather than a local array because a local array inside a
+; procedure is not something this compiler is known to accept and a
+; six-byte global costs nothing. NOTHING HERE IS RE-ENTRANT anyway -
+; there is one output buffer, so two builders cannot be in flight at
+; once, and this shares that constraint rather than adding one.
+Global Dim net_scratchMac.a[6]
+
+; The last frame's protocol, for a diagnostic to print. 0, $0806, or
+; the IP protocol number.
+Global net_lastProto.i
+
+; Instrumentation only. Never control.
+Global net_inCount.i
+Global net_replyCount.i
+Global net_dropCount.i
+
+
+; ======================================================================
+;  THE CLOCK
+; ======================================================================
+; The same two instructions genet.pi4, pcie.pi4, safety.pi4 and
+; mailbox.pi4 all use, and the same justification: `mrs` reads a system
+; register, the language has no equivalent, and this is the case the
+; no-inline-asm-in-libraries rule allows for.
+;
+; It is here at all only because the ARP cache has to expire. A cache
+; that never forgets is a cache that keeps sending to a machine that has
+; changed its network card, forever, with no symptom except that the
+; other end never answers.
+; ----------------------------------------------------------------------
+Procedure.i net_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i net_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i net_MsToTicks(ms.i)
+  Protected hz.i
+  If ms <= 0
+    ProcedureReturn 0
+  EndIf
+  hz = net_TickHz()
+  If hz <= 0 Or hz > #NET_HZ_MAX
+    hz = #NET_HZ_FALLBACK
+  EndIf
+  ProcedureReturn (hz / 1000) * ms
+EndProcedure
+
+
+; ======================================================================
+;  BYTE ORDER - the only place multi-byte protocol fields are touched
+; ======================================================================
+; See ENDIANNESS in the header. One byte at a time, most significant
+; first, every time, with no cleverness available to be got wrong.
+;
+; PeekA and not PeekB: PeekB SIGN-EXTENDS as of 2026-08-25, so a byte of
+; $FF becomes $FFFFFFFFFFFFFFFF and every OR below fills the result with
+; ones. genet.pi4:1859-1863 records the same trap and it is not
+; hypothetical for this data either - a broadcast MAC is six $FF bytes
+; and an all-ones netmask octet is another.
+; ----------------------------------------------------------------------
+Procedure.i net_GetBE16(*p)
+  ProcedureReturn ((PeekA(*p) << 8) | PeekA(*p + 1)) & $FFFF
+EndProcedure
+
+Procedure.i net_GetBE32(*p)
+  Protected v.i
+  v = PeekA(*p)
+  v = (v << 8) | PeekA(*p + 1)
+  v = (v << 8) | PeekA(*p + 2)
+  v = (v << 8) | PeekA(*p + 3)
+  ProcedureReturn v & $FFFFFFFF
+EndProcedure
+
+Procedure net_PutBE16(*p, v.i)
+  PokeB(*p + 0, (v >> 8) & $FF)
+  PokeB(*p + 1, v & $FF)
+EndProcedure
+
+Procedure net_PutBE32(*p, v.i)
+  PokeB(*p + 0, (v >> 24) & $FF)
+  PokeB(*p + 1, (v >> 16) & $FF)
+  PokeB(*p + 2, (v >> 8) & $FF)
+  PokeB(*p + 3, v & $FF)
+EndProcedure
+
+
+; ======================================================================
+;  SMALL MEMORY HELPERS
+; ======================================================================
+; Deliberately local rather than pulled from memory.pi4 or string.pi4: a
+; library includes no library, and these are three loops.
+; ----------------------------------------------------------------------
+Procedure net_Copy(*dst, *src, n.i)
+  Protected i.i
+  i = 0
+  While i < n
+    PokeB(*dst + i, PeekA(*src + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure net_Zero(*dst, n.i)
+  Protected i.i
+  i = 0
+  While i < n
+    PokeB(*dst + i, 0)
+    i = i + 1
+  Wend
+EndProcedure
+
+; 1 if the n bytes match. Not constant time and does not need to be -
+; nothing here compares a secret.
+Procedure.i net_Same(*a, *b, n.i)
+  Protected i.i
+  i = 0
+  While i < n
+    If PeekA(*a + i) <> PeekA(*b + i)
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; 1 if all six bytes are $FF - the Ethernet broadcast address.
+Procedure.i net_IsBroadcastMac(*m)
+  Protected i.i
+  i = 0
+  While i < 6
+    If PeekA(*m + i) <> $FF
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; 1 if the individual/group bit is set - a multicast or broadcast
+; address, which can never be a valid SOURCE and can never be a station
+; whose address we cache.
+Procedure.i net_IsGroupMac(*m)
+  If (PeekA(*m) & 1) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+
+; ======================================================================
+;  THE CHECKSUM
+; ======================================================================
+;  Datasheets/rfc9293-tcp.txt:407-415. See THE CHECKSUM in the header
+;  for the whole discussion; this is the mechanics.
+;
+;  net_Sum16 returns a RUNNING 32-BIT SUM, not a checksum. Chaining is
+;  the point: a UDP checksum is the pseudo-header plus the UDP header
+;  plus the payload, and summing them into one accumulator avoids ever
+;  building the concatenation in memory.
+;
+;  THE CARRIES ARE NOT FOLDED IN THE LOOP. They accumulate in the top
+;  half of a 64-bit .i and net_Fold deals with them at the end. That is
+;  safe because the largest thing we ever sum is 1536 bytes = 768 words
+;  of at most $FFFF, which is under $0300_0000 - twenty-six bits, with
+;  thirty-eight to spare. Folding inside the loop would be correct too
+;  and slower.
+;
+;  THE ODD BYTE IS PADDED ON ITS RIGHT WITH ZERO, i.e. it becomes the
+;  HIGH half of the last word. rfc9293-tcp.txt:411-413 says exactly
+;  that. Getting it the other way round gives a checksum that is right
+;  for every even-length packet and wrong for every odd-length one,
+;  which is a bug that hides for a long time because most packets are
+;  even.
+; ----------------------------------------------------------------------
+;  ----------------------------------------------------------------------
+;  THE WIDE PATH - RFC 1071 section 1.2B AND 1.2C, AND WHY IT IS ALLOWED
+;  TO READ A WHOLE WORD IN A FILE THAT REFUSES TO READ A FIELD THAT WAY
+;  ----------------------------------------------------------------------
+;  WHY IT WAS WORTH DOING. `a64_tcp_check.py --cost` counts what the
+;  receive path spends per octet received. On 2026-09-07, with the ring
+;  copies already fixed, this procedure was 21.75 of 62.74 instructions
+;  per octet - a THIRD of everything left - because verifying an inbound
+;  TCP checksum means summing the whole segment, and the loop below did
+;  it two octets at a time with two byte loads, a shift and an or.
+;
+;  1.2C, "Parallel Summation": the sum may be accumulated in units wider
+;  than sixteen bits and folded at the end. A 64-bit accumulator cannot
+;  overflow here - the largest buffer this file ever sums is under two
+;  kilobytes, so under 512 words of at most $FFFFFFFF, which is under
+;  2^41 - and the fold is the same end-around carry net_Fold already
+;  does. Folding a sum of 32-bit words is identical to folding a sum of
+;  their 16-bit halves, because the fold maps a value at 2^16 onto 1.
+;
+;  1.2B, "Byte Order Independence": *this* is the part that has to be
+;  argued rather than asserted. The four octets are read with PeekN,
+;  which on this little-endian machine puts the FIRST octet in the LOW
+;  byte - the opposite of the wire's order. 1.2B says the ones'
+;  complement sum computed on byte-swapped data is the byte-swap of the
+;  sum computed on the data. So the accumulator below is a correct sum in
+;  a SWAPPED DOMAIN, and it is folded to sixteen bits and swapped ONCE,
+;  here, before it joins the caller's running total. Nothing swapped ever
+;  escapes this procedure.
+;
+;  WHAT MAKES THIS DIFFERENT FROM THE THING THE HEADER FORBIDS: a field
+;  read with the wrong endianness is a WRONG VALUE that looks plausible
+;  and travels. This is a sum, it is never compared with anything but
+;  itself, and the one place its order could matter is the one place it
+;  is corrected. If the swap below were deleted, EVERY checksum this
+;  board sends and every one it verifies would be wrong at once and the
+;  first frame would fail - which is the opposite of a defect that hides.
+;
+;  IT IS GUARDED ON ALIGNMENT AND IT HAS TO BE. With the MMU off every
+;  data access on this part is Device-nGnRnE and an unaligned 32-bit load
+;  is an Alignment fault with no vector installed - a dead board, no
+;  message.
+;
+;  AND THE GUARD HAD TO BE MORE THAN `IS IT WORD-ALIGNED`, WHICH THE
+;  FIRST VERSION OF IT WAS. Every buffer this procedure is asked to sum
+;  in anger is TWO past a word boundary, never on one: a TCP segment
+;  starts 14 + 20 = 34 octets into a frame whose own base is aligned, and
+;  an IP header starts 14 in. So the first version measured EXACTLY THE
+;  SAME 62.80 instructions per octet as the loop it was supposed to
+;  replace - it compiled, it was correct, and it never once executed. The
+;  measurement is what said so; reading the code would not have.
+;
+;  So the head is stepped forward IN WHOLE PAIRS until the pointer is
+;  word-aligned, which costs at most one iteration of the old loop and is
+;  what makes the wide path reachable. It has to be whole PAIRS because
+;  the 16-bit pairing is what the checksum is; stepping one octet would
+;  pair every subsequent octet with the wrong neighbour and produce a
+;  number that is wrong for every packet of odd... every packet at all.
+;
+;  The old loop is kept underneath, unchanged, for every buffer the guard
+;  still turns away - an odd address, or fewer than four octets - and for
+;  the remainder of every buffer it takes.
+Procedure.i net_Sum16(*p, n.i, seed.i)
+  Protected sum.i
+  Protected i.i
+  Protected q.i
+  Protected e.i
+  Protected w.i
+  Protected whole.i
+  sum = seed
+  i = 0
+
+  If (*p & 1) = 0
+    ; One pair, only if that is what it takes to reach a word boundary.
+    If (*p & 2) <> 0
+      If (i + 1) < n
+        sum = sum + ((PeekA(*p + i) << 8) | PeekA(*p + i + 1))
+        i = i + 2
+      EndIf
+    EndIf
+    whole = (n - i) & (~3)
+    If whole >= 4
+      q = *p + i
+      e = q + whole
+      w = 0
+      While q < e
+        w = w + PeekN(q)
+        q = q + 4
+      Wend
+      ; Fold to sixteen bits in the swapped domain, then swap once. Two
+      ; separate steps on purpose: the fold is 1.2C and the swap is 1.2B,
+      ; and a reader checking one should not have to untangle the other.
+      While w > $FFFF
+        w = (w & $FFFF) + (w >> 16)
+      Wend
+      sum = sum + (((w & $FF) << 8) | ((w >> 8) & $FF))
+      i = i + whole
+    EndIf
+  EndIf
+
+  ; i is EVEN here on every path, so the pairing below starts on the same
+  ; parity it would have started on if this loop had run from zero. That
+  ; is what makes the pieces add up to the same answer, and it is why the
+  ; head above steps by two and the body by four.
+  While (i + 1) < n
+    sum = sum + ((PeekA(*p + i) << 8) | PeekA(*p + i + 1))
+    i = i + 2
+  Wend
+  If i < n
+    sum = sum + (PeekA(*p + i) << 8)
+  EndIf
+  ProcedureReturn sum
+EndProcedure
+
+; Fold the carries down into sixteen bits. Twice, because the first fold
+; can itself carry: $1FFFE folds to $FFFF + 1 = $10000, and one more
+; fold gives 1.
+Procedure.i net_Fold(sum.i)
+  Protected s.i
+  s = sum
+  While s > $FFFF
+    s = (s & $FFFF) + (s >> 16)
+  Wend
+  ProcedureReturn s & $FFFF
+EndProcedure
+
+; The finished field: the ones' complement of the folded sum.
+; $FFFF - s rather than (~s) & $FFFF. They are identical for
+; 0 <= s <= $FFFF and the subtraction cannot be misread as a logical
+; Not by somebody skimming.
+Procedure.i net_Cksum(sum.i)
+  ProcedureReturn ($FFFF - net_Fold(sum)) & $FFFF
+EndProcedure
+
+; The twelve octets of Figure 2 (rfc9293-tcp.txt:426-449), added
+; arithmetically rather than built. `len` is the UPPER-LAYER length -
+; for UDP that is the UDP header plus payload, NOT the IP total length.
+Procedure.i net_PseudoSum(srcIp.i, dstIp.i, proto.i, len.i, seed.i)
+  Protected sum.i
+  sum = seed
+  sum = sum + ((srcIp >> 16) & $FFFF)
+  sum = sum + (srcIp & $FFFF)
+  sum = sum + ((dstIp >> 16) & $FFFF)
+  sum = sum + (dstIp & $FFFF)
+  sum = sum + (proto & $FF)          ; the zero octet is the high half
+  sum = sum + (len & $FFFF)
+  ProcedureReturn sum
+EndProcedure
+
+
+; ======================================================================
+;  CONFIGURATION
+; ======================================================================
+; Build an address from its four octets. USE THIS rather than typing the
+; hex: it is the only place in a caller's source where the order of the
+; octets has to be right, and it reads like the dotted quad.
+Procedure.i NetMakeIPv4(a.i, b.i, c.i, d.i)
+  ProcedureReturn (((a & $FF) << 24) | ((b & $FF) << 16) | ((c & $FF) << 8) | (d & $FF)) & $FFFFFFFF
+EndProcedure
+
+Procedure.i NetError()
+  ProcedureReturn net_err
+EndProcedure
+
+; Six bytes in wire order. THE SAME SIX BYTES GenetSetMac() WAS GIVEN -
+; see the header; nothing here can check that and the failure if they
+; differ is that the MAC hardware filters out every reply to everything
+; we send, which reads as "the network does not answer".
+;
+; A group address is refused for the same reason genet.pi4:1864-1870
+; refuses one: a station address with the individual/group bit set is
+; not a legal source, conformant switches drop frames from it, and the
+; failure is silent and remote.
+Procedure.i NetSetMac(kind.i, *mac)
+  Protected i.i
+  Protected any.i
+  net_err = #NET_E_NONE
+  If *mac = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If net_IsGroupMac(*mac) = 1
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  any = 0
+  i = 0
+  While i < 6
+    If PeekA(*mac + i) <> 0
+      any = 1
+    EndIf
+    i = i + 1
+  Wend
+  If any = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < 6
+    net_ifMac[kind * 6 + i] = PeekA(*mac + i)
+    i = i + 1
+  Wend
+  net_ifMacSet[kind] = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i NetGetMac(kind.i, *out)
+  If *out = 0 Or net_ifMacSet[kind] = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  net_Copy(*out, net_IfMacPtr(kind), 6)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i NetMacSet(kind.i)
+  ProcedureReturn net_ifMacSet[kind]
+EndProcedure
+
+; A netmask must be a run of ones followed by a run of zeros. Checked,
+; because 255.0.255.0 masks perfectly well and gives a wrong answer to
+; "is this address on my segment" for every address, forever, with no
+; other symptom.
+;
+; THE TEST IS ON THE COMPLEMENT, NOT ON THE MASK. Write inv for the
+; complement of the mask inside 32 bits. A contiguous mask is
+; 1...10...0, so inv is 0...01...1 - one less than a power of two - and
+; `inv & (inv + 1)` is zero exactly when that holds. For $FFFFFF00,
+; inv is $000000FF, inv + 1 is $00000100, and the AND is zero. For the
+; broken $FF00FF00, inv is $00FF00FF, inv + 1 is $00FF0100, and the AND
+; is $00FF0000, so it is refused.
+;
+; THE FIRST VERSION OF THIS TESTED `mask & (mask + 1)` AND WAS WRONG,
+; and it is recorded rather than quietly corrected because it is the
+; more natural thing to write and it fails in the worst direction: it
+; refuses every ordinary mask. $FFFFFF00 + 1 is $FFFFFF01 and the AND
+; is $FFFFFF00, not zero, so 255.255.255.0 was rejected as
+; non-contiguous and nothing could be configured at all. Caught by
+; tools/a64/a64_net_check.py on its first run, before any of this went
+; near a board.
+Procedure.i net_MaskIsContiguous(mask.i)
+  Protected m.i
+  Protected inv.i
+  m = mask & $FFFFFFFF
+  If m = 0
+    ProcedureReturn 0
+  EndIf
+  inv = (m ! $FFFFFFFF) & $FFFFFFFF
+  If (inv & (inv + 1)) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ip, mask and gateway as described in ENDIANNESS. gateway 0 means "no
+; gateway" - everything off-link is then refused with #NET_E_NO_ROUTE
+; rather than sent into the void.
+;
+; THE GATEWAY MUST BE ON OUR OWN SUBNET. A gateway we could only reach
+; through a gateway is not a gateway, and the mistake - typing the
+; router's WAN address, or a mask of 255.255.255.255 - produces a board
+; that can talk to its own segment and nothing else, with no message.
+Procedure.i NetSetIPv4(kind.i, ip.i, mask.i, gw.i)
+  Protected a.i
+  Protected m.i
+  Protected g.i
+  net_err = #NET_E_NONE
+  a = ip & $FFFFFFFF
+  m = mask & $FFFFFFFF
+  g = gw & $FFFFFFFF
+  If a = 0 Or a = #NET_IP_BROADCAST
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If net_MaskIsContiguous(m) = 0
+    net_err = #NET_E_MASK
+    ProcedureReturn 0
+  EndIf
+  ; Our own address may not be the subnet's network number or its
+  ; broadcast. Both are legal to WRITE and neither is a host.
+  If (a & m) = a And m <> $FFFFFFFF
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If (a | (m ! $FFFFFFFF)) = a And m <> $FFFFFFFF
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If g <> 0
+    If (g & m) <> (a & m)
+      net_err = #NET_E_GATEWAY
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  net_ifIp[kind] = a
+  net_ifMask[kind] = m
+  net_ifGw[kind] = g
+  ; The subnet broadcast: our address with every host bit set. `!` is
+  ; the BITWISE exclusive-or on this compiler (operator.def:42), so
+  ; m ! $FFFFFFFF is the complement of the mask inside 32 bits.
+  net_ifBcast[kind] = (a | (m ! $FFFFFFFF)) & $FFFFFFFF
+  net_ifIpSet[kind] = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  NetSetIPv4Alt - A SECOND ADDRESS ON THE SAME INTERFACE. `ip` of 0
+;  removes it. 1 if the table now reads as asked.
+;
+;  WHAT IT IS FOR, and it is one case rather than a general aliasing
+;  feature. A cable with no DHCP server on it: this board gives itself a
+;  link-local address (RFC 3927) AND hands out leases of its own on
+;  192.168.137.0/24 (Anvil/Core/dhcpd.pbi). The two peers it can meet
+;  cannot both be answered at one address -
+;
+;    a DHCP client takes 192.168.137.2 and then cannot reach 169.254.x.y
+;    at all, because a host drops its self-assigned address the moment
+;    it gets a lease;
+;    a host that is not a DHCP client sits on its own link-local address
+;    and can reach nothing else.
+;
+;  - so the board answers at both, and net_RecvIp accepts either as a
+;  destination while net_rxTo makes the REPLY leave from whichever one
+;  the request was addressed to. A reply sourced from the other address
+;  is dropped by the asker as unsolicited, which is a silence with no
+;  error anywhere and is exactly the failure this pairing prevents.
+;
+;  THE RULES ARE THE SAME RULES. A non-contiguous netmask is refused
+;  here for the reason it is refused above; the network number and the
+;  broadcast are refused for the reason they are refused above. There is
+;  no gateway on an alias: a second address on a directly connected
+;  segment is reached without one, and a board with two default routes
+;  is a board that cannot say which one it used.
+; ----------------------------------------------------------------------
+Procedure.i NetSetIPv4Alt(kind.i, ip.i, mask.i)
+  Protected a.i
+  Protected m.i
+  net_err = #NET_E_NONE
+  a = ip & $FFFFFFFF
+  m = mask & $FFFFFFFF
+  If a = 0
+    net_ifAlt[kind] = 0
+    net_ifAltMask[kind] = 0
+    net_ifAltBcast[kind] = 0
+    ProcedureReturn 1
+  EndIf
+  If a = #NET_IP_BROADCAST
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If net_MaskIsContiguous(m) = 0
+    net_err = #NET_E_MASK
+    ProcedureReturn 0
+  EndIf
+  If (a & m) = a And m <> $FFFFFFFF
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If (a | (m ! $FFFFFFFF)) = a And m <> $FFFFFFFF
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  net_ifAlt[kind] = a
+  net_ifAltMask[kind] = m
+  net_ifAltBcast[kind] = (a | (m ! $FFFFFFFF)) & $FFFFFFFF
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  NetClearIPv4 - this interface holds no address any more.
+;
+;  IT CLEARS THE ALIAS TOO. An interface with no address of its own that
+;  went on answering at a second one would be a board reachable at an
+;  address `net` does not print, which is worse than unreachable.
+;
+;  THE MAC IS LEFT ALONE. The six bytes belong to the hardware and are
+;  still true of it; losing a lease does not change a card' address, and
+;  a row that forgot its MAC would have to go back to the driver for it
+;  before it could send anything again.
+; ----------------------------------------------------------------------
+Procedure NetClearIPv4(kind.i)
+  If net_IfValid(kind) = 0
+    ProcedureReturn
+  EndIf
+  net_ifIpSet[kind] = 0
+  net_ifIp[kind] = 0
+  net_ifMask[kind] = 0
+  net_ifGw[kind] = 0
+  net_ifBcast[kind] = 0
+  net_ifAlt[kind] = 0
+  net_ifAltMask[kind] = 0
+  net_ifAltBcast[kind] = 0
+EndProcedure
+
+Procedure.i NetIPv4Alt(kind.i)
+  ProcedureReturn net_ifAlt[kind]
+EndProcedure
+
+Procedure.i NetMaskAlt(kind.i)
+  ProcedureReturn net_ifAltMask[kind]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  NetSrcFor - WHICH OF `kind`' ADDRESSES A FRAME TO `dstIp` LEAVES WITH.
+;
+;  THE DESTINATION' SUBNET DECIDES FIRST, and that is the rule rather
+;  than a refinement: a board holding 169.254.170.250/16 and, on the same
+;  cable, 192.168.137.1/24 must answer a host at 192.168.137.2 AS
+;  192.168.137.2' neighbour. A frame sourced from the other address is
+;  off that host' subnet, so the host answers it through a gateway it
+;  does not have, and the conversation dies with nothing logged anywhere.
+;
+;  THE ALIAS IS TESTED FIRST because it is the narrower subnet in the one
+;  configuration that has one (a /24 inside a /16), so a destination that
+;  matches both belongs to the alias.
+;
+;  OFF BOTH SUBNETS - a router, or a destination reached through a
+;  gateway - it is this interface' PRIMARY address, which is the only
+;  address it has any claim to use there.
+;
+;  THIS PROCEDURE HAS NO STATE, and until 2026-09-08 it had some. It fell
+;  back to `net_rxTo`, a global that the RECEIVE path wrote and the
+;  TRANSMIT path read - so what a frame was sourced from depended on
+;  which datagram had most recently arrived. That was how the one
+;  caller who genuinely needs to choose a source, the DHCP server
+;  answering a broadcast that is on no subnet at all, said what it
+;  wanted: it set the mode and then built the frame. It now passes the
+;  address to NetUdpBuildBcast and says so in one call, and the mode,
+;  the setter NetUseIPv4 and the reader NetIPv4InUse are all gone.
+;  A transmit decision that reads receive state is a decision nobody can
+;  predict from the call site.
+; ----------------------------------------------------------------------
+Procedure.i NetSrcFor(kind.i, dstIp.i)
+  Protected d.i
+  If net_IfValid(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  d = dstIp & $FFFFFFFF
+  If net_ifAlt[kind] <> 0
+    If (d & net_ifAltMask[kind]) = (net_ifAlt[kind] & net_ifAltMask[kind])
+      ProcedureReturn net_ifAlt[kind]
+    EndIf
+  EndIf
+  If net_ifIpSet[kind] <> 0
+    ProcedureReturn net_ifIp[kind]
+  EndIf
+  ProcedureReturn net_ifAlt[kind]
+EndProcedure
+
+; 1 if `ip` is one of the two addresses `kind` holds. The test every
+; caller that may name a source address is held to, so that this layer
+; cannot be asked to forge one.
+Procedure.i NetIfHoldsIp(kind.i, ip.i)
+  Protected a.i
+  If net_IfValid(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  a = ip & $FFFFFFFF
+  If a = 0
+    ProcedureReturn 0
+  EndIf
+  If net_ifIpSet[kind] <> 0 And a = net_ifIp[kind]
+    ProcedureReturn 1
+  EndIf
+  If net_ifAlt[kind] <> 0 And a = net_ifAlt[kind]
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NetIPv4(kind.i)
+  ProcedureReturn net_ifIp[kind]
+EndProcedure
+
+Procedure.i NetMask(kind.i)
+  ProcedureReturn net_ifMask[kind]
+EndProcedure
+
+Procedure.i NetGateway(kind.i)
+  ProcedureReturn net_ifGw[kind]
+EndProcedure
+
+Procedure.i NetSubnetBroadcast(kind.i)
+  ProcedureReturn net_ifBcast[kind]
+EndProcedure
+
+Procedure.i NetConfigured(kind.i)
+  If net_ifMacSet[kind] = 1 And net_ifIpSet[kind] = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; 1 if `ip` is on our own segment. Meaningless before NetSetIPv4().
+;
+; THE ALIAS'S SUBNET IS OUR OWN SEGMENT TOO. Everything that asks this
+; question is deciding whether to send a frame straight to a neighbour or
+; hand it to a gateway, and a host on the alias's subnet is a neighbour -
+; a board serving 192.168.137.0/24 that answered "no" here would look for
+; a router to reach the machine on the other end of its own cable.
+Procedure.i NetOnLink(kind.i, ip.i)
+  Protected d.i
+  d = ip & $FFFFFFFF
+  If net_ifAlt[kind] <> 0
+    If (d & net_ifAltMask[kind]) = (net_ifAlt[kind] & net_ifAltMask[kind])
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If net_ifIpSet[kind] = 0
+    ProcedureReturn 0
+  EndIf
+  If (d & net_ifMask[kind]) = (net_ifIp[kind] & net_ifMask[kind])
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+
+; ======================================================================
+;  THE OUTPUT BUFFER
+; ======================================================================
+Procedure.i NetOutBuf()
+  ProcedureReturn @net_out[0]
+EndProcedure
+
+Procedure.i NetOutLen()
+  ProcedureReturn net_outLen
+EndProcedure
+
+Procedure NetOutClear()
+  net_outLen = 0
+EndProcedure
+
+; Every builder ends here. Pads to #NET_FRAME_MIN with ZEROS - see
+; PADDING in the header for why it is done here and why the pad is not
+; whatever happened to be in the buffer from the previous frame.
+Procedure.i net_Finish(n.i)
+  Protected i.i
+  If n < 0 Or n > #NET_FRAME_MAX
+    net_outLen = 0
+    net_err = #NET_E_TOO_BIG
+    ProcedureReturn 0
+  EndIf
+  i = n
+  While i < #NET_FRAME_MIN
+    net_out[i] = 0
+    i = i + 1
+  Wend
+  If n < #NET_FRAME_MIN
+    net_outLen = #NET_FRAME_MIN
+  Else
+    net_outLen = n
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Write the 14-byte Ethernet II header at the start of the staging
+; buffer. Returns the offset of the payload, which is always 14.
+Procedure.i net_BeginFrame(kind.i, *dstMac, etherType.i)
+  net_Copy(@net_out[0], *dstMac, 6)
+  net_Copy(@net_out[6], net_IfMacPtr(kind), 6)
+  net_PutBE16(@net_out[12], etherType)
+  ProcedureReturn #NET_ETH_HDR
+EndProcedure
+
+
+; ======================================================================
+;  THE ARP CACHE
+; ======================================================================
+;  Eight entries. That is not a measurement; it is "a bench segment's
+;  worth". A board talking to one PC and one router needs two. When it
+;  fills, the OLDEST-EXPIRING entry is evicted rather than the refusal
+;  #NET_E_CACHE_FULL being returned to a caller who cannot do anything
+;  useful with it - except when every entry is a live valid one and the
+;  new one is merely PENDING, in which case a speculative request must
+;  not be allowed to throw out a working entry.
+;
+;  ENTRIES EXPIRE. See #NET_ARP_TTL_MS_DEFAULT for the number and why it
+;  is short.
+;
+;  ENTRIES ARE ALSO CONFIRMED BY TRAFFIC. An entry's deadline is pushed
+;  out by an ARP frame from that neighbour, and - since 2026-08-26 - by
+;  any well-formed IPv4 datagram that arrived from it and was addressed
+;  to us. Without the second rule an entry died on a fixed timer in the
+;  middle of a conversation that was proving it alive the whole time;
+;  net_ConfirmNeighbour carries the full account.
+; ----------------------------------------------------------------------
+Procedure.i net_ArpTtlTicks()
+  If net_arpTtlMs <= 0
+    net_arpTtlMs = #NET_ARP_TTL_MS_DEFAULT
+  EndIf
+  ProcedureReturn net_MsToTicks(net_arpTtlMs)
+EndProcedure
+
+; How long a learned entry lives, in milliseconds.
+Procedure.i NetArpTtlMs(ms.i)
+  If ms <= 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  net_arpTtlMs = ms
+  ProcedureReturn 1
+EndProcedure
+
+; Retire anything past its deadline. Called from every path that reads
+; the cache, so an entry can never be observed after it has expired.
+Procedure net_ArpExpire()
+  Protected i.i
+  Protected now.i
+  now = net_Ticks()
+  i = 0
+  While i < #NET_ARP_ENTRIES
+    If net_arpState[i] <> 0
+      If (now - net_arpDeadline[i]) > 0
+        net_arpState[i] = 0
+        net_arpKind[i] = #HW_LINK_NONE
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; The slot holding `ip` on `kind`, or -1. The interface is part of an
+; ARP entry: two private segments routinely contain the same IPv4
+; address and may map it to different stations.
+Procedure.i net_ArpFind(kind.i, ip.i)
+  Protected i.i
+  i = 0
+  While i < #NET_ARP_ENTRIES
+    If net_arpState[i] <> 0
+      If net_arpKind[i] = kind And net_arpIp[i] = (ip & $FFFFFFFF)
+        ProcedureReturn i
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; A slot for a new entry: a free one, else a pending one, else the
+; valid one that expires soonest. Returns -1 only if `wantValid` is 0
+; and every slot holds a live valid entry - see the note above.
+Procedure.i net_ArpSlot(wantValid.i)
+  Protected i.i
+  Protected best.i
+  Protected bestAt.i
+  i = 0
+  While i < #NET_ARP_ENTRIES
+    If net_arpState[i] = 0
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < #NET_ARP_ENTRIES
+    If net_arpState[i] = 1
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  If wantValid = 0
+    ProcedureReturn -1
+  EndIf
+  best = 0
+  bestAt = net_arpDeadline[0]
+  i = 1
+  While i < #NET_ARP_ENTRIES
+    If (net_arpDeadline[i] - bestAt) < 0
+      best = i
+      bestAt = net_arpDeadline[i]
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn best
+EndProcedure
+
+; Install or refresh a valid entry. Used internally when an ARP packet
+; teaches us something, and exposed so a caller can pin a static entry
+; on a segment with no ARP responder.
+Procedure.i NetArpSet(kind.i, ip.i, *mac)
+  Protected s.i
+  If net_IfValid(kind) = 0 Or *mac = 0 Or (ip & $FFFFFFFF) = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  ; Never cache a group address as a station. It cannot be one, and a
+  ; forged ARP claiming a multicast MAC would otherwise make us send
+  ; every subsequent packet for that host to a multicast group.
+  If net_IsGroupMac(*mac) = 1
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  net_ArpExpire()
+  s = net_ArpFind(kind, ip)
+  If s < 0
+    s = net_ArpSlot(1)
+  EndIf
+  If s < 0
+    net_err = #NET_E_CACHE_FULL
+    ProcedureReturn 0
+  EndIf
+  net_arpKind[s] = kind
+  net_arpIp[s] = ip & $FFFFFFFF
+  net_Copy(@net_arpMac[s * 6], *mac, 6)
+  net_arpState[s] = 2
+  net_arpDeadline[s] = net_Ticks() + net_ArpTtlTicks()
+  ProcedureReturn 1
+EndProcedure
+
+; 1 and six bytes at *out if we know the address, 0 otherwise.
+;
+; THE TWO BROADCASTS ANSWER WITHOUT A CACHE ENTRY. 255.255.255.255 and
+; our own subnet broadcast map to ff:ff:ff:ff:ff:ff by definition; there
+; is nothing to resolve and nobody to ask.
+Procedure.i NetArpLookup(kind.i, ip.i, *out)
+  Protected s.i
+  Protected a.i
+  If *out = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  a = ip & $FFFFFFFF
+  If a = #NET_IP_BROADCAST Or a = net_ifBcast[kind]
+    net_Zero(*out, 6)
+    PokeB(*out + 0, $FF)
+    PokeB(*out + 1, $FF)
+    PokeB(*out + 2, $FF)
+    PokeB(*out + 3, $FF)
+    PokeB(*out + 4, $FF)
+    PokeB(*out + 5, $FF)
+    ProcedureReturn 1
+  EndIf
+  net_ArpExpire()
+  s = net_ArpFind(kind, a)
+  If s < 0
+    ProcedureReturn 0
+  EndIf
+  If net_arpState[s] <> 2
+    ProcedureReturn 0
+  EndIf
+  net_Copy(*out, @net_arpMac[s * 6], 6)
+  ProcedureReturn 1
+EndProcedure
+
+; 1 if a request is outstanding and has not yet timed out.
+Procedure.i NetArpPending(kind.i, ip.i)
+  Protected s.i
+  net_ArpExpire()
+  s = net_ArpFind(kind, ip)
+  If s < 0
+    ProcedureReturn 0
+  EndIf
+  If net_arpState[s] = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NetArpForget(kind.i, ip.i)
+  Protected s.i
+  s = net_ArpFind(kind, ip)
+  If s < 0
+    ProcedureReturn 0
+  EndIf
+  net_arpState[s] = 0
+  net_arpKind[s] = #HW_LINK_NONE
+  ProcedureReturn 1
+EndProcedure
+
+Procedure NetArpFlush(kind.i)
+  Protected i.i
+  i = 0
+  While i < #NET_ARP_ENTRIES
+    If kind = #HW_LINK_NONE Or net_arpKind[i] = kind
+      net_arpState[i] = 0
+      net_arpKind[i] = #HW_LINK_NONE
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; How many entries are valid right now. For a diagnostic to print.
+Procedure.i NetArpCount(kind.i)
+  Protected i.i
+  Protected n.i
+  net_ArpExpire()
+  n = 0
+  i = 0
+  While i < #NET_ARP_ENTRIES
+    If net_arpState[i] = 2 And (kind = #HW_LINK_NONE Or net_arpKind[i] = kind)
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; Slot-by-slot access, so a probe can print the whole table rather than
+; asking it questions one address at a time.
+Procedure.i NetArpEntryState(i.i)
+  If i < 0 Or i >= #NET_ARP_ENTRIES
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn net_arpState[i]
+EndProcedure
+
+Procedure.i NetArpEntryIp(i.i)
+  If i < 0 Or i >= #NET_ARP_ENTRIES
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn net_arpIp[i]
+EndProcedure
+
+Procedure.i NetArpEntryMac(i.i, *out)
+  If i < 0 Or i >= #NET_ARP_ENTRIES
+    ProcedureReturn 0
+  EndIf
+  If *out = 0
+    ProcedureReturn 0
+  EndIf
+  net_Copy(*out, @net_arpMac[i * 6], 6)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WHICH MAC DOES A DATAGRAM FOR `ip` GO TO?
+;
+;  ON-LINK: the destination's own MAC. OFF-LINK: THE GATEWAY'S MAC, with
+;  the IP destination still the far host. This is the single most
+;  commonly mis-implemented line in a first IP stack, and the failure
+;  mode is instructive: an ARP for an off-link address is answered by
+;  nobody (it is not on this segment), so the stack sits resolving
+;  forever and the symptom is "the internet does not work but the local
+;  network does". The frame goes to the router; the datagram goes to the
+;  far host; those are different questions and this is where they are
+;  kept apart.
+; ----------------------------------------------------------------------
+Procedure.i NetRouteMac(kind.i, ip.i, *out)
+  Protected target.i
+  If NetConfigured(kind) = 0
+    net_err = #NET_E_NO_IP
+    ProcedureReturn 0
+  EndIf
+  If *out = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If NetOnLink(kind, ip) = 1
+    target = ip & $FFFFFFFF
+  Else
+    If (ip & $FFFFFFFF) = #NET_IP_BROADCAST
+      target = #NET_IP_BROADCAST
+    Else
+      If net_ifGw[kind] = 0
+        net_err = #NET_E_NO_ROUTE
+        ProcedureReturn 0
+      EndIf
+      target = net_ifGw[kind]
+    EndIf
+  EndIf
+  If NetArpLookup(kind, target, *out) = 0
+    net_err = #NET_E_NO_ARP
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The address NetRouteMac() would resolve, so a caller can ARP for the
+; right thing. Returns 0 if there is no route at all.
+Procedure.i NetNextHop(kind.i, ip.i)
+  If net_ifIpSet[kind] = 0
+    ProcedureReturn 0
+  EndIf
+  If NetOnLink(kind, ip) = 1
+    ProcedureReturn ip & $FFFFFFFF
+  EndIf
+  If (ip & $FFFFFFFF) = #NET_IP_BROADCAST
+    ProcedureReturn #NET_IP_BROADCAST
+  EndIf
+  ProcedureReturn net_ifGw[kind]
+EndProcedure
+
+Procedure.i NetArpEntryKind(i.i)
+  If i < 0 Or i >= #NET_ARP_ENTRIES
+    ProcedureReturn #HW_LINK_NONE
+  EndIf
+  ProcedureReturn net_arpKind[i]
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  REACHABILITY CONFIRMATION - "I just heard from you, so you are still
+;  there"
+; ----------------------------------------------------------------------
+;  A frame that ARRIVED from a neighbour is proof that the neighbour is
+;  still at that hardware address, and it is BETTER proof than the ARP
+;  reply that installed the entry, because it is more recent. This
+;  pushes the deadline out, and pushes out nothing else.
+;
+;  WHY THIS EXISTS AT ALL. Until 2026-08-26 the cache was refreshed by
+;  ARP frames and by nothing else, so an entry died on a fixed twenty
+;  second timer no matter how busy the conversation with that neighbour
+;  was. On silicon that produced a contradiction a reader could not
+;  explain: NetArpLookup() answered 1, and NetPingBuild() called
+;  immediately afterwards refused with #NET_E_NO_ARP, because the entry
+;  expired in the second between them while the board and the peer were
+;  exchanging pings the whole time.
+;
+;  IT IS THE ON-LINK CASE THAT SUFFERS, and that is why it went unseen
+;  for so long. Talking to an OFF-LINK host, the only entry the send
+;  path needs is the GATEWAY's, and a gateway is a router that ARPs the
+;  segment constantly, so its entry is refreshed as a side effect of
+;  somebody else's traffic. Talking to an ON-LINK peer, the entry that
+;  matters is the peer's own, the conversation is ICMP and UDP, and
+;  ICMP and UDP refreshed nothing. The one traffic class that could
+;  keep the entry alive was the one class the conversation never
+;  produced.
+;
+;  WHAT THIS DELIBERATELY DOES NOT DO, each for its own reason:
+;
+;    * IT NEVER CREATES AN ENTRY. An unsolicited datagram from a
+;      stranger must not earn a cache slot. That is how eight slots
+;      fill in seconds on a busy segment - the capacity argument in THE
+;      ARP CACHE above - and it is also how a forged source address
+;      would install itself.
+;
+;    * IT NEVER CHANGES A STORED HARDWARE ADDRESS. If the frame's
+;      source MAC is not the one already cached, this does nothing
+;      whatsoever. So the worst a forged frame can achieve is to extend
+;      the life of an entry that was ALREADY correct and whose MAC the
+;      forger already knew - which is not an attack, it is a fact.
+;      This is also what keeps the re-cabling argument intact: a host
+;      that changes its network card arrives with a different MAC, the
+;      compare fails, nothing is refreshed, and the stale entry dies on
+;      schedule exactly as before.
+;
+;    * IT CONFIRMS THE NEXT HOP, NOT THE SOURCE ADDRESS. A datagram
+;      from an off-link host reached us THROUGH the gateway, so what it
+;      proves is that the GATEWAY is alive. Refreshing an entry for the
+;      far host would be refreshing an entry that has no business
+;      existing - see NetRouteMac for why those are different
+;      questions. NetNextHop() is the single authority on which address
+;      that is, and it is the same one the send path asks, so the two
+;      cannot disagree.
+;
+;    * IT DOES NOT EXPIRE THE CACHE FIRST. An entry whose deadline has
+;      just passed but which has this instant demonstrated that it is
+;      alive should be kept, not retired. Sweeping before confirming
+;      would throw away the entry and then decline to recreate it,
+;      which is the current bug wearing a different hat.
+; ----------------------------------------------------------------------
+Procedure net_ConfirmNeighbour(kind.i, srcIp.i, *srcMac)
+  Protected hop.i
+  Protected s.i
+  If *srcMac = 0
+    ProcedureReturn
+  EndIf
+  If net_ifIpSet[kind] = 0
+    ProcedureReturn
+  EndIf
+  ; A group address is nobody's station address, so it can confirm
+  ; nothing. NetArpSet refuses to store one for the same reason.
+  If net_IsGroupMac(*srcMac) = 1
+    ProcedureReturn
+  EndIf
+  hop = NetNextHop(kind, srcIp)
+  If hop = 0
+    ProcedureReturn
+  EndIf
+  s = net_ArpFind(kind, hop)
+  If s < 0
+    ProcedureReturn
+  EndIf
+  If net_arpState[s] <> 2
+    ProcedureReturn
+  EndIf
+  If net_Same(@net_arpMac[s * 6], *srcMac, 6) = 0
+    ProcedureReturn
+  EndIf
+  net_arpDeadline[s] = net_Ticks() + net_ArpTtlTicks()
+EndProcedure
+
+
+; ======================================================================
+;  BUILD: ARP REQUEST
+; ======================================================================
+;  Broadcast, 28 octets of ARP after the 14-octet Ethernet header, then
+;  18 octets of zero pad to reach 60. [RFC 826, uncited]
+;
+;  The target hardware address field is ZERO, not broadcast. It is the
+;  field being asked about; filling it with $FF is a common and harmless
+;  variation that some stacks emit, and zero is the one the RFC's own
+;  example uses.
+;
+;  A PENDING CACHE ENTRY IS CREATED so that NetArpPending() can answer,
+;  and so that a caller retrying does not have to keep its own list of
+;  what it has asked for.
+; ----------------------------------------------------------------------
+Procedure.i NetArpRequest(kind.i, ip.i)
+  Protected p.i
+  Protected s.i
+  Protected i.i
+  Protected a.i
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  If NetConfigured(kind) = 0
+    If net_ifMacSet[kind] = 0
+      net_err = #NET_E_NO_MAC
+    Else
+      net_err = #NET_E_NO_IP
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  a = ip & $FFFFFFFF
+  If a = 0 Or a = net_ifIp[kind]
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  ; ASKING WHO HAS OUR OWN ALIAS IS THE SAME MISTAKE. Refused here rather
+  ; than left to answer itself, because a board that ARPs for an address
+  ; it holds gets its own announcement back and writes itself into its
+  ; own neighbour cache.
+  If net_ifAlt[kind] <> 0 And a = net_ifAlt[kind]
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+
+  ; An ARP request goes to the broadcast address, because the point of
+  ; it is that we do not know who to send it to.
+  i = 0
+  While i < 6
+    net_scratchMac[i] = $FF
+    i = i + 1
+  Wend
+  p = net_BeginFrame(kind, @net_scratchMac[0], #NET_ET_ARP)
+
+  net_PutBE16(@net_out[p + 0], #NET_ARP_HTYPE_ETHER)
+  net_PutBE16(@net_out[p + 2], #NET_ET_IPV4)
+  net_out[p + 4] = #NET_ARP_HLEN_ETHER
+  net_out[p + 5] = #NET_ARP_PLEN_IPV4
+  net_PutBE16(@net_out[p + 6], #NET_ARP_OP_REQUEST)
+  net_Copy(@net_out[p + 8], net_IfMacPtr(kind), 6)          ; sender hardware
+  ; THE SENDER PROTOCOL ADDRESS IS THE ONE THE TARGET CAN ANSWER. A board
+  ; holding a link-local address and, on the same cable, a /24 it serves
+  ; leases on must ask the /24's hosts as their neighbour: an ARP request
+  ; whose sender address is off the target's subnet is answered by some
+  ; stacks and dropped by others, and the ones that answer write an entry
+  ; they can never use.
+  net_PutBE32(@net_out[p + 14], NetSrcFor(kind, a))       ; sender protocol
+  net_Zero(@net_out[p + 18], 6)                      ; target hardware
+  net_PutBE32(@net_out[p + 24], a)                   ; target protocol
+
+  ; Remember that we asked.
+  net_ArpExpire()
+  s = net_ArpFind(kind, a)
+  If s < 0
+    s = net_ArpSlot(0)
+  EndIf
+  If s >= 0
+    If net_arpState[s] <> 2
+      net_arpIp[s] = a
+      net_arpState[s] = 1
+      net_arpDeadline[s] = net_Ticks() + net_ArpTtlTicks()
+    EndIf
+  EndIf
+
+  ProcedureReturn net_Finish(p + #NET_ARP_LEN)
+EndProcedure
+
+
+; ======================================================================
+;  BUILD: THE TWO LINK-LOCAL ARP PACKETS  [RFC 3927]
+; ======================================================================
+;  Both are ARP REQUESTS on the wire and both are broadcast, and the only
+;  thing that distinguishes them - from each other and from an ordinary
+;  "who has" - is what goes in the two protocol-address fields. That is
+;  not an implementation detail, it is the mechanism:
+;
+;    ORDINARY REQUEST    spa = ours   tpa = theirs   "who has theirs"
+;    PROBE               spa = 0      tpa = the one  "is anyone using
+;                                     we want         this? and I am NOT
+;                                                     claiming it by
+;                                                     asking"
+;    ANNOUNCEMENT        spa = ours   tpa = ours     "I have taken this.
+;                                                     Update your cache."
+;
+;  THE PROBE'S ZERO SENDER ADDRESS IS THE WHOLE POINT [RFC 3927 s2.2:
+;  "an ARP Request ... with ... the sender IP address field set to 0".]
+;  A probe carrying our candidate as the sender would install that
+;  binding in every cache on the segment - which is precisely what must
+;  not happen until we know the address is free. It also means a probe
+;  can be sent BEFORE NetSetIPv4 has ever been called, which is the
+;  ordinary case: this stack has no address at all yet. So these two
+;  need only NetSetMac, and they say so.
+;
+;  net_RecvArp ALREADY DECLINES TO CACHE A ZERO SENDER, in two places,
+;  with the comment "which is what a duplicate-address probe sends and
+;  which is nobody's address" - written before there was a probe to send.
+;  The receive side was ready for this.
+; ----------------------------------------------------------------------
+
+; Shared body. op is always REQUEST; the caller supplies spa and tpa.
+Procedure.i net_ArpLlFrame(kind.i, spa.i, tpa.i)
+  Protected p.i
+  Protected i.i
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  If net_ifMacSet[kind] = 0
+    net_err = #NET_E_NO_MAC
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < 6
+    net_scratchMac[i] = $FF
+    i = i + 1
+  Wend
+  p = net_BeginFrame(kind, @net_scratchMac[0], #NET_ET_ARP)
+  net_PutBE16(@net_out[p + 0], #NET_ARP_HTYPE_ETHER)
+  net_PutBE16(@net_out[p + 2], #NET_ET_IPV4)
+  net_out[p + 4] = #NET_ARP_HLEN_ETHER
+  net_out[p + 5] = #NET_ARP_PLEN_IPV4
+  net_PutBE16(@net_out[p + 6], #NET_ARP_OP_REQUEST)
+  net_Copy(@net_out[p + 8], net_IfMacPtr(kind), 6)          ; sender hardware
+  net_PutBE32(@net_out[p + 14], spa & $FFFFFFFF)     ; sender protocol
+  net_Zero(@net_out[p + 18], 6)                      ; target hardware
+  net_PutBE32(@net_out[p + 24], tpa & $FFFFFFFF)     ; target protocol
+  ProcedureReturn net_Finish(p + #NET_ARP_LEN)
+EndProcedure
+
+; An ARP PROBE for `ip`. NOTHING IS PUT IN THE CACHE - not even a
+; pending entry, unlike NetArpRequest - because a probe is not a
+; question about a neighbour we intend to talk to, and a pending entry
+; for our own candidate address would be a cache slot spent on a lie.
+Procedure.i NetArpProbe(kind.i, ip.i)
+  If (ip & $FFFFFFFF) = 0
+    net_err = #NET_E_ARG
+    net_outLen = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn net_ArpLlFrame(kind, 0, ip)
+EndProcedure
+
+; An ARP ANNOUNCEMENT for `ip`. [RFC 3927 s2.4: "an ARP Announcement ...
+; identical to the ARP Probe ... except that both the sender and target
+; IP address fields contain the host's newly selected IPv4 address".]
+; This is also the DEFENCE packet of s2.5.
+Procedure.i NetArpAnnounce(kind.i, ip.i)
+  If (ip & $FFFFFFFF) = 0
+    net_err = #NET_E_ARG
+    net_outLen = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn net_ArpLlFrame(kind, ip, ip)
+EndProcedure
+
+; 1 if `ip` is inside 169.254.0.0/16 at all. Used to say which sentence
+; `net` prints, and to keep a link-local address out of the places a
+; routable one belongs.
+Procedure.i NetIsLinkLocal(ip.i)
+  If ((ip & $FFFFFFFF) & #NET_LL_MASK) = #NET_LL_PREFIX
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; 1 if `ip` is one this board is allowed to SELECT - inside the prefix
+; and outside both reserved 256-address runs. [RFC 3927 s2.1]
+Procedure.i NetLlSelectable(ip.i)
+  Protected a.i
+  a = ip & $FFFFFFFF
+  If a < #NET_LL_FIRST Or a > #NET_LL_LAST
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  PICKING ONE, AND WHY IT IS SEEDED FROM THE HARDWARE ADDRESS
+; ======================================================================
+;  [RFC 3927 s2.1: "the host ... SHOULD use a pseudo-random number
+;  generator ... seeded using a value derived from ... the IEEE 802 MAC
+;  address ... so that ... a host will usually select the same address
+;  each time".]
+;
+;  THE STABILITY IS THE FEATURE, and on this bench it is most of the
+;  value. A board that picked a fresh random address on every reset
+;  would be a board whose address has to be looked up again after every
+;  flash - and the whole point of this work is a console that is there
+;  after a reset with nothing typed. Seeded from the MAC, this board
+;  comes back to the same 169.254.x.y all evening, and two DIFFERENT
+;  boards on one segment still start from different candidates.
+;
+;  IT IS NOT A CRYPTOGRAPHIC GENERATOR AND MUST NOT BE USED AS ONE.
+;  RaspberryPi4/Lib/drbg.pi4 is that. This is a 64-bit xorshift whose
+;  whole job is to spread 65,024 candidates evenly and repeatably; the
+;  three shift constants are Marsaglia's usual 13/7/17 triple.
+;
+;  A ZERO SEED IS THE ONE STATE A XORSHIFT CANNOT LEAVE, so a MAC that
+;  folded to zero - all six bytes zero, which is not a legal station
+;  address but is what an uninitialised array holds - is replaced by a
+;  constant. Without this the board would propose 169.254.1.0 forever.
+; ----------------------------------------------------------------------
+Procedure NetLlSeedFromMac(kind.i)
+  Protected i.i
+  Protected s.i
+  ; FNV-1a over the six bytes: a 64-bit offset basis and prime, folding
+  ; every bit of every byte into the whole word.
+  s = $CBF29CE484222325
+  i = 0
+  While i < 6
+    s = s ! net_ifMac[kind * 6 + i]
+    s = s * $00000100000001B3
+    i = i + 1
+  Wend
+  If s = 0
+    s = $9E3779B97F4A7C15
+  EndIf
+  net_llSeed = s
+EndProcedure
+
+Procedure.i net_LlNext()
+  Protected x.i
+  x = net_llSeed
+  If x = 0
+    NetLlSeedFromMac(net_llKind)
+    x = net_llSeed
+    If x = 0
+      x = $9E3779B97F4A7C15
+    EndIf
+  EndIf
+  ; THE RIGHT SHIFT IS MASKED AND THAT IS NOT DECORATION. Every integer
+  ; in this compiler is signed and `>>` is an ARITHMETIC shift, so a
+  ; word with its top bit set shifts ones in from the left - which turns
+  ; a xorshift into a generator that walks towards all-ones and stays
+  ; there. The mask supplies the logical shift the algorithm is defined
+  ; over: 64 - 7 = 57 bits kept.
+  x = x ! (x << 13)
+  x = x ! ((x >> 7) & $01FFFFFFFFFFFFFF)
+  x = x ! (x << 17)
+  net_llSeed = x
+  ; The sign bit is masked off before anything is done with the value:
+  ; every integer here is signed, and a negative modulus is the classic
+  ; way this kind of code produces an address outside its own range.
+  ProcedureReturn x & $7FFFFFFFFFFFFFFF
+EndProcedure
+
+; The next candidate address, always selectable by construction.
+Procedure.i NetLlPick()
+  ProcedureReturn #NET_LL_FIRST + (net_LlNext() % #NET_LL_COUNT)
+EndProcedure
+
+; A random delay in [loMs, hiMs]. The RFC's intervals are ranges rather
+; than fixed numbers precisely so that two hosts that powered up
+; together do not stay in step, so this must not be quietly replaced by
+; a midpoint.
+Procedure.i NetLlRandMs(loMs.i, hiMs.i)
+  If hiMs <= loMs
+    ProcedureReturn loMs
+  EndIf
+  ProcedureReturn loMs + (net_LlNext() % (hiMs - loMs + 1))
+EndProcedure
+
+
+; ======================================================================
+;  THE CONFLICT WATCHER  [RFC 3927 s2.2.1 and s2.5]
+; ======================================================================
+;  A link-local address is only ours for as long as nobody else is using
+;  it, and the only way to find that out is to READ EVERY ARP FRAME ON
+;  THE SEGMENT. net_RecvArp already sees them all - it is called for
+;  every frame with EtherType $0806 whether or not the frame is for us -
+;  so the test goes there and costs two compares on a segment with no
+;  conflict, which is every segment nearly all of the time.
+;
+;  IT HAD TO GO IN FRONT OF TWO EARLY RETURNS and that is the reason
+;  this is a hook rather than something a caller could have written
+;  outside net.pi4. net_RecvArp gives up on a frame when `net_ipSet = 0`
+;  (we have no address, so nothing can be for us) and when
+;  `tpa <> net_ip` (somebody else's conversation). BOTH are exactly the
+;  frames a probe has to see: while probing we have no address yet, and
+;  a conflicting host's ARP is addressed to somebody else entirely.
+;
+;  THE TWO DEFINITIONS OF A CONFLICT, and they are different:
+;
+;  WHILE PROBING [s2.2.1]. Two separate cases, both of which mean the
+;  candidate must be abandoned:
+;    (a) any ARP packet, request or reply, whose SENDER protocol address
+;        is our candidate - somebody is already using it;
+;    (b) an ARP PROBE (sender protocol address 0) whose TARGET protocol
+;        address is our candidate - somebody else is probing for the
+;        same address at the same moment. Without this rule two hosts
+;        that started together both conclude "free" and both take it.
+;
+;  ONCE CLAIMED [s2.5]. Only (a) - an ARP packet whose sender protocol
+;  address is ours. A probe from a neighbour for our address is answered
+;  by the ordinary ARP machinery below, which is what tells that
+;  neighbour to pick another one.
+;
+;  NEVER OURSELVES. Every test excludes a frame whose sender hardware
+;  address is our own MAC: a switch that floods our own announcement
+;  back at us, or a hub, would otherwise make the board declare a
+;  conflict with itself and give up an address nobody else wants. This
+;  is the first thing to check if a board ever refuses every address it
+;  picks.
+; ----------------------------------------------------------------------
+
+; Start, change or stop watching. mode is one of #NET_LL_OFF /
+; _PROBING / _CLAIMED. Setting a mode CLEARS the conflict flag, because
+; a conflict belongs to the address that was being watched when it was
+; seen; carrying it into the next candidate would fail that candidate
+; without ever testing it. The give-up flag and the defence clock are
+; deliberately NOT cleared here - see NetLlDefendReset.
+Procedure NetLlWatch(kind.i, ip.i, mode.i)
+  net_llKind = kind
+  net_llAddr = ip & $FFFFFFFF
+  net_llMode = mode
+  net_llConflict = 0
+  net_Zero(@net_llConflictMac[0], 6)
+  If mode = #NET_LL_OFF
+    net_llAddr = 0
+    net_llKind = 0
+  EndIf
+EndProcedure
+
+; WHICH INTERFACE THE WATCHER IS ON. 0 when it is off.
+Procedure.i NetLlKind()
+  ProcedureReturn net_llKind
+EndProcedure
+
+Procedure.i NetLlMode()
+  ProcedureReturn net_llMode
+EndProcedure
+
+Procedure.i NetLlAddr()
+  ProcedureReturn net_llAddr
+EndProcedure
+
+Procedure.i NetLlConflict()
+  ProcedureReturn net_llConflict
+EndProcedure
+
+Procedure.i NetLlConflictMacPtr()
+  ProcedureReturn @net_llConflictMac[0]
+EndProcedure
+
+; 1 when a SECOND conflict landed inside DEFEND_INTERVAL of the first,
+; which [RFC 3927 s2.5] says must end in the address being surrendered
+; rather than defended a second time. A monitor reads this and picks
+; another address.
+Procedure.i NetLlGiveUp()
+  ProcedureReturn net_llGiveUp
+EndProcedure
+
+Procedure.i NetLlDefends()
+  ProcedureReturn net_llDefends
+EndProcedure
+
+; Forget the defence history. Called when an address is newly claimed,
+; so that the ten-second window belongs to THIS address and not to one
+; the board held a minute ago.
+Procedure NetLlDefendReset()
+  net_llDefendAt = 0
+  net_llGiveUp = 0
+  net_llDefends = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  net_LlSeeArp - the hook itself. Returns 1 when it has STAGED a
+;  defensive announcement that the caller must send, 0 otherwise.
+;
+;  IT DOES NOT PRINT AND IT DOES NOT RECONFIGURE. Both belong to the
+;  monitor: this file has no console and no settings store, and a
+;  library that gave an address up on its own would do it in the middle
+;  of somebody's transfer with nothing anywhere saying why.
+; ----------------------------------------------------------------------
+Procedure.i net_LlSeeArp(kind.i, op.i, spa.i, tpa.i, *sha)
+  Protected hit.i
+  Protected now.i
+  If net_llMode = #NET_LL_OFF
+    ProcedureReturn 0
+  EndIf
+  If net_llAddr = 0
+    ProcedureReturn 0
+  EndIf
+  ; ------------------------------------------------------------------
+  ; ONLY THE INTERFACE THAT HOLDS THE ADDRESS CAN CONFLICT OVER IT.
+  ; [RFC 3927 s2.5: a host defends "an interface where that host is
+  ; currently using the same address".] A board acquiring 169.254.x.y on
+  ; a cable while a radio is joined to a house network receives ARP on
+  ; both; a frame off the radio' segment says nothing whatever about
+  ; who owns an address on the cable, and treating it as a conflict
+  ; would surrender an address nobody had claimed.
+  ; ------------------------------------------------------------------
+  If kind <> net_llKind
+    ProcedureReturn 0
+  EndIf
+  ; Our own frame coming back to us is not a conflict.
+  If net_Same(*sha, net_IfMacPtr(kind), 6) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  hit = 0
+  If spa = net_llAddr
+    hit = 1                      ; (a) somebody is using it
+  EndIf
+  If net_llMode = #NET_LL_PROBING
+    If op = #NET_ARP_OP_REQUEST And spa = 0 And tpa = net_llAddr
+      hit = 1                    ; (b) somebody else is probing for it
+    EndIf
+  EndIf
+  If hit = 0
+    ProcedureReturn 0
+  EndIf
+
+  net_llConflict = 1
+  net_Copy(@net_llConflictMac[0], *sha, 6)
+
+  If net_llMode <> #NET_LL_CLAIMED
+    ProcedureReturn 0            ; probing: nothing to defend yet
+  EndIf
+
+  ; ---- the defence, and the one-shot rule [RFC 3927 s2.5] ----------
+  ; "if a host receives an ARP packet ... on an interface where that
+  ; host is currently using the same address ... the host MAY elect to
+  ; attempt to defend its address by recording the time ... and then
+  ; broadcasting ONE single ARP Announcement ... However, if the host
+  ; receives yet another ARP packet ... within DEFEND_INTERVAL ... it
+  ; MUST immediately cease using the address."
+  now = net_Ticks()
+  If net_llDefendAt <> 0
+    If (now - net_llDefendAt) < net_MsToTicks(#NET_LL_DEFEND_INTERVAL_MS)
+      net_llGiveUp = 1
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  net_llDefendAt = now
+  net_llDefends = net_llDefends + 1
+  If NetArpAnnounce(net_llKind, net_llAddr) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  BUILD: IPv4
+; ======================================================================
+;  Writes a 20-octet header at net_out[#NET_ETH_HDR] and returns the
+;  offset of the payload. `payloadLen` is what will follow it.
+;
+;  DF IS ALWAYS SET. See WHAT IS REFUSED in the header: we cannot
+;  reassemble, so we ask the network not to fragment and to complain
+;  instead.
+;
+;  THE IDENTIFICATION FIELD counts up. For a datagram that is never
+;  fragmented the field has no protocol meaning at all, but a packet
+;  capture with a moving Identification is far easier to read than one
+;  where every packet says 0, and it costs an increment.
+;
+;  THE CHECKSUM COVERS THE HEADER ONLY - twenty octets, with the
+;  checksum field itself zero while it is computed
+;  (rfc9293-tcp.txt:414-415 states the zeroing rule for TCP and it is
+;  the same rule here). IT DOES NOT COVER THE PAYLOAD. That is why a
+;  corrupt UDP payload is caught by the UDP checksum and by nothing
+;  else, and it is the argument for computing the UDP one.
+; ----------------------------------------------------------------------
+Procedure.i net_BuildIp(kind.i, srcIp.i, proto.i, dstIp.i, payloadLen.i)
+  Protected h.i
+  Protected total.i
+  h = #NET_ETH_HDR
+  total = #NET_IP_HDR + payloadLen
+
+  net_out[h + 0] = ((#NET_IP_VERSION << 4) | #NET_IP_IHL_MIN) & $FF
+  net_out[h + 1] = 0                                 ; DSCP and ECN, both 0
+  net_PutBE16(@net_out[h + 2], total)
+  net_ipId = (net_ipId + 1) & $FFFF
+  net_PutBE16(@net_out[h + 4], net_ipId)
+  net_PutBE16(@net_out[h + 6], #NET_IP_FLAG_DF)
+  net_out[h + 8] = #NET_IP_TTL_DEFAULT
+  net_out[h + 9] = proto & $FF
+  net_PutBE16(@net_out[h + 10], 0)                   ; the checksum field,
+                                                     ; zero while summing
+  ; THE SOURCE IS net_SrcFor's, NOT net_ip, and every checksum over a
+  ; pseudo-header below asks the same procedure with the same destination
+  ; so the two can never disagree. See net_SrcFor for the rule.
+  ; THE SOURCE IS THE CALLER', PASSED IN, and it is the same value the
+  ; caller puts in the pseudo-header a few lines later - one local, used
+  ; twice, so a header and its checksum CANNOT disagree about who sent
+  ; the datagram. They used to be two separate calls to the same
+  ; procedure with the same destination, which was correct and was one
+  ; edit away from not being.
+  net_PutBE32(@net_out[h + 12], srcIp & $FFFFFFFF)
+  net_PutBE32(@net_out[h + 16], dstIp)
+  net_PutBE16(@net_out[h + 10], net_Cksum(net_Sum16(@net_out[h], #NET_IP_HDR, 0)))
+
+  ProcedureReturn h + #NET_IP_HDR
+EndProcedure
+
+
+; ======================================================================
+;  BUILD: ICMP ECHO REQUEST - "ping something"
+; ======================================================================
+;  [RFC 792, uncited] Type 8 code 0, a 16-bit identifier, a 16-bit
+;  sequence number, and a payload that comes back unchanged.
+;
+;  THE PAYLOAD IS GENERATED HERE rather than taken from the caller,
+;  because the only thing a ping payload has to be is recognisable when
+;  it comes back. It is the lower-case letters cycling a..w, which is
+;  the pattern Microsoft's ping sends and therefore the pattern a person
+;  staring at Wireshark will recognise instantly. NO CHARACTER LITERALS:
+;  97 is ASCII lower-case 'a' and 23 letters takes it to 119, ASCII 'w'.
+;
+;  THE DESTINATION MAC MUST ALREADY BE KNOWN. If it is not, this refuses
+;  with #NET_E_NO_ARP rather than silently broadcasting or silently
+;  doing nothing - the caller is expected to NetArpRequest() and pump
+;  until #NET_IN_LEARNED. Resolving inside here would mean this
+;  procedure had to send and wait, which it cannot do; see HOW A CALLER
+;  USES IT.
+; ----------------------------------------------------------------------
+Procedure.i NetPingBuild(kind.i, ip.i, ident.i, seq.i, payloadLen.i)
+  Protected mac.i
+  Protected p.i
+  Protected i.i
+  Protected n.i
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  If NetConfigured(kind) = 0
+    If net_ifMacSet[kind] = 0
+      net_err = #NET_E_NO_MAC
+    Else
+      net_err = #NET_E_NO_IP
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  n = payloadLen
+  If n < 0 Or n > #NET_ICMP_PAYLOAD_MAX
+    net_err = #NET_E_TOO_BIG
+    ProcedureReturn 0
+  EndIf
+  If NetRouteMac(kind, ip, @net_scratchMac[0]) = 0
+    ProcedureReturn 0
+  EndIf
+  mac = @net_scratchMac[0]
+
+  net_BeginFrame(kind, mac, #NET_ET_IPV4)
+  p = net_BuildIp(kind, NetSrcFor(kind, ip & $FFFFFFFF), #NET_PROTO_ICMP, ip & $FFFFFFFF, #NET_ICMP_HDR + n)
+
+  net_out[p + 0] = #NET_ICMP_ECHO_REQUEST
+  net_out[p + 1] = #NET_ICMP_CODE_ZERO
+  net_PutBE16(@net_out[p + 2], 0)                    ; checksum, zero
+                                                     ; while summing
+  net_PutBE16(@net_out[p + 4], ident & $FFFF)
+  net_PutBE16(@net_out[p + 6], seq & $FFFF)
+  i = 0
+  While i < n
+    net_out[p + #NET_ICMP_HDR + i] = 97 + (i % 23)   ; ASCII 'a'..'w'
+    i = i + 1
+  Wend
+  ; ICMP HAS NO PSEUDO-HEADER. The sum is over the ICMP message alone -
+  ; header plus payload - and nothing from the IP header enters it. UDP
+  ; is the one that is different, and confusing the two gives a
+  ; checksum that is wrong by exactly the pseudo-header's value.
+  net_PutBE16(@net_out[p + 2], net_Cksum(net_Sum16(@net_out[p], #NET_ICMP_HDR + n, 0)))
+
+  ProcedureReturn net_Finish(p + #NET_ICMP_HDR + n)
+EndProcedure
+
+
+; ======================================================================
+;  BUILD: UDP
+; ======================================================================
+;  [RFC 768, uncited] Source port, destination port, length, checksum,
+;  then the payload. The length field covers the UDP HEADER AND THE
+;  PAYLOAD - eight more than the payload - and is the field the receiver
+;  believes in preference to anything IP said.
+;
+;  See THE CHECKSUM in the header for the pseudo-header treatment and
+;  for why zero is turned into $FFFF.
+; ----------------------------------------------------------------------
+Procedure.i NetUdpBuild(kind.i, dstIp.i, dstPort.i, srcPort.i, *payload, length.i)
+  Protected p.i
+  Protected src.i
+  Protected sum.i
+  Protected ck.i
+  Protected ulen.i
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  If NetConfigured(kind) = 0
+    If net_ifMacSet[kind] = 0
+      net_err = #NET_E_NO_MAC
+    Else
+      net_err = #NET_E_NO_IP
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If length < 0 Or length > #NET_UDP_PAYLOAD_MAX
+    net_err = #NET_E_TOO_BIG
+    ProcedureReturn 0
+  EndIf
+  If length > 0 And *payload = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If dstPort < 1 Or dstPort > 65535
+    net_err = #NET_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If srcPort < 1 Or srcPort > 65535
+    net_err = #NET_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If NetRouteMac(kind, dstIp, @net_scratchMac[0]) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ulen = #NET_UDP_HDR + length
+  net_BeginFrame(kind, @net_scratchMac[0], #NET_ET_IPV4)
+  src = NetSrcFor(kind, dstIp & $FFFFFFFF)
+  p = net_BuildIp(kind, src, #NET_PROTO_UDP, dstIp & $FFFFFFFF, ulen)
+
+  net_PutBE16(@net_out[p + 0], srcPort)
+  net_PutBE16(@net_out[p + 2], dstPort)
+  net_PutBE16(@net_out[p + 4], ulen)
+  net_PutBE16(@net_out[p + 6], 0)                    ; checksum, zero
+                                                     ; while summing
+  If length > 0
+    net_Copy(@net_out[p + #NET_UDP_HDR], *payload, length)
+  EndIf
+
+  If net_udpTxCksum = 0
+    ; The caller asked for no checksum. Zero on the wire is the legal
+    ; way to say "not computed" for IPv4 UDP - and it is the only
+    ; reason zero is ever written here.
+    net_PutBE16(@net_out[p + 6], 0)
+  Else
+    ; THE SAME SOURCE net_BuildIp JUST WROTE. A pseudo-header summed
+    ; over a different source address than the header carries produces a
+    ; checksum every receiver rejects, and nothing on this board would
+    ; ever know - so the one procedure is asked twice with the one
+    ; destination rather than the answer being carried between them.
+    sum = net_PseudoSum(src, dstIp & $FFFFFFFF, #NET_PROTO_UDP, ulen, 0)
+    sum = net_Sum16(@net_out[p], ulen, sum)
+    ck = net_Cksum(sum)
+    If ck = 0
+      ; Zero means "no checksum" on the wire, so the other legal
+      ; representation of the same ones'-complement value is sent
+      ; instead. See THE CHECKSUM in the header.
+      ck = $FFFF
+    EndIf
+    net_PutBE16(@net_out[p + 6], ck)
+  EndIf
+
+  ProcedureReturn net_Finish(p + ulen)
+EndProcedure
+
+; ======================================================================
+;  BUILD: BROADCAST UDP FROM AN UNCONFIGURED STACK - "the DHCP send"
+; ======================================================================
+;  A DHCP DISCOVER or REQUEST has to leave this board before it has an
+;  address, which is the one thing NetUdpBuild() will not do - it refuses
+;  with #NET_E_NO_IP when NetConfigured() is 0, and it resolves the
+;  destination MAC through the ARP cache, which is empty and cannot be
+;  filled for a machine we have not been introduced to.
+;
+;  So this builds a datagram FROM 0.0.0.0 TO 255.255.255.255 with a
+;  broadcast destination MAC, and it needs only that our own hardware
+;  address is known (net_macSet). The source IP is net_ip, which is 0
+;  before configuration - exactly the "unassigned" ciaddr RFC 2131 wants
+;  in a DISCOVER. Everything else is NetUdpBuild's arithmetic.
+;
+;  THE UDP CHECKSUM IS COMPUTED over the pseudo-header 0.0.0.0 ->
+;  255.255.255.255, which is what a receiving DHCP server verifies, so it
+;  is left on. This is the ONE builder that does not consult the ARP
+;  cache and the ONE that runs before an IP is set; it exists solely for
+;  dhcp.pi4 and is not a general broadcast facility.
+; ----------------------------------------------------------------------
+Procedure.i NetUdpBuildBcast(kind.i, srcIp.i, dstPort.i, srcPort.i, *payload, length.i)
+  Protected p.i
+  Protected sum.i
+  Protected ck.i
+  Protected ulen.i
+  Protected i.i
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  If net_ifMacSet[kind] = 0
+    net_err = #NET_E_NO_MAC
+    ProcedureReturn 0
+  EndIf
+  If length < 0 Or length > #NET_UDP_PAYLOAD_MAX
+    net_err = #NET_E_TOO_BIG
+    ProcedureReturn 0
+  EndIf
+  If length > 0 And *payload = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If dstPort < 1 Or dstPort > 65535
+    net_err = #NET_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If srcPort < 1 Or srcPort > 65535
+    net_err = #NET_E_PORT
+    ProcedureReturn 0
+  EndIf
+  ; ------------------------------------------------------------------
+  ; THE SOURCE ADDRESS IS NAMED BY THE CALLER, AND IT HAS TO BE.
+  ;
+  ; 255.255.255.255 is on no subnet at all, so nothing about the
+  ; destination can say which of an interface' addresses this leaves
+  ; with, and the two callers want different answers on the same
+  ; interface: a DHCP CLIENT taking a lease has no address yet and must
+  ; source 0.0.0.0 [RFC 2131 s4.1], while the DHCP SERVER answering a
+  ; DISCOVER must source the address it is offering leases from - which
+  ; on this board is the interface' ALIAS, 192.168.137.1, and not its
+  ; primary link-local address. An OFFER sourced from the wrong one is
+  ; discarded by the client with nothing logged at either end.
+  ;
+  ; ZERO IS ALLOWED AND NOTHING ELSE IS, except an address this
+  ; interface actually holds. A layer that could be told to source a
+  ; broadcast from an arbitrary address is a forgery engine, and neither
+  ; caller needs that power. This is the rule NetUseIPv4 used to enforce
+  ; before setting a mode the transmit path would read later; it is the
+  ; same rule, asked at the point the frame is built.
+  ; ------------------------------------------------------------------
+  If srcIp <> 0
+    If NetIfHoldsIp(kind, srcIp) = 0
+      net_err = #NET_E_ARG
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ; The Ethernet destination is the broadcast address, six $FF bytes.
+  i = 0
+  While i < 6
+    net_scratchMac[i] = $FF
+    i = i + 1
+  Wend
+
+  ulen = #NET_UDP_HDR + length
+  net_BeginFrame(kind, @net_scratchMac[0], #NET_ET_IPV4)
+  p = net_BuildIp(kind, srcIp & $FFFFFFFF, #NET_PROTO_UDP, #NET_IP_BROADCAST, ulen)
+
+  net_PutBE16(@net_out[p + 0], srcPort)
+  net_PutBE16(@net_out[p + 2], dstPort)
+  net_PutBE16(@net_out[p + 4], ulen)
+  net_PutBE16(@net_out[p + 6], 0)                    ; checksum, zero
+                                                     ; while summing
+  If length > 0
+    net_Copy(@net_out[p + #NET_UDP_HDR], *payload, length)
+  EndIf
+
+  sum = net_PseudoSum(srcIp & $FFFFFFFF, #NET_IP_BROADCAST, #NET_PROTO_UDP, ulen, 0)
+  sum = net_Sum16(@net_out[p], ulen, sum)
+  ck = net_Cksum(sum)
+  If ck = 0
+    ck = $FFFF
+  EndIf
+  net_PutBE16(@net_out[p + 6], ck)
+
+  ProcedureReturn net_Finish(p + ulen)
+EndProcedure
+
+; Let the receive path accept a broadcast datagram while this stack has
+; no address of its own (1), or return to the normal rule that an
+; unconfigured stack ignores all IPv4 (0). ONLY dhcp.pi4 turns this on,
+; and only around a DHCP exchange. See net_RecvIp for what it changes.
+; ======================================================================
+;  BUILD: TCP - THE FRAMING ONLY. THE SEGMENT IS THE CALLER'S.
+; ======================================================================
+;  This is the transmit half of the same seam net_RecvTcp draws. The
+;  caller - RaspberryPi4/Lib/tcp.pi4 - writes the TCP header, its
+;  options and its data into the staging buffer at NetTcpSegBuf(), and
+;  then asks here for an Ethernet header, an IPv4 header and the
+;  checksum. Nothing in this file knows what a sequence number is.
+;
+;  BUILD IN PLACE, DO NOT COPY, and the reason is the one cyw43.pi4
+;  gives for Cyw43DataPtr() at length: a copy is one memcpy per segment
+;  on a board that runs with its caches off for most of Anvil's life,
+;  and it would also mean the protocol needed a 1536-byte buffer of its
+;  own for no gain. The staging buffer already exists and is already
+;  the thing the caller hands to the link.
+;
+;  THE ORDER MATTERS AND IS NOT NEGOTIABLE:
+;      p = NetTcpSegBuf()      ; write the segment there, first
+;      ... build header, options, data ...
+;      NetTcpBuild(peerIp, segLen, 0)
+;  Building the segment AFTER this call writes into a buffer whose
+;  checksum has already been computed, and the result is a segment
+;  every peer on earth silently discards. There is no way for this file
+;  to detect that, which is exactly why it is written here in capitals.
+;
+;  *dstMac MAY BE ZERO, meaning "route it through the ARP cache" - the
+;  ordinary case, and the same lookup NetUdpBuild does. A NON-ZERO
+;  *dstMac addresses the frame straight at those six bytes and skips
+;  the cache entirely. That exists for ONE purpose: a RST to a stranger.
+;  RFC 9293 3.10.7.1 requires a segment that arrives for a closed port
+;  to be answered with a reset, the stranger is by definition not in the
+;  cache, and resolving it would mean ARPing a machine in order to tell
+;  it to go away. net_RecvTcp hands the source MAC up as
+;  NetTcpRxMac() for precisely this.
+;
+;  THE CHECKSUM FIELD IS ZEROED HERE before summing, so a caller that
+;  left a stale value in it from the previous segment cannot poison the
+;  sum. That is two writes and it removes an entire class of bug in
+;  which retransmitting the same segment twice produces two different
+;  checksums.
+; ----------------------------------------------------------------------
+Procedure.i NetTcpSegBuf()
+  ProcedureReturn @net_out[#NET_ETH_HDR + #NET_IP_HDR]
+EndProcedure
+
+Procedure.i NetTcpSegMax()
+  ProcedureReturn #NET_TCP_SEG_MAX
+EndProcedure
+
+; Build a TCP frame from one exact local address. Passive opens need this
+; form: a wildcard listener may accept a SYN addressed to either the
+; primary address or an alias, and every later segment must keep using
+; the address the peer actually connected to. NetIfHoldsIp is the
+; anti-spoof boundary; callers cannot manufacture an unrelated source.
+Procedure.i NetTcpBuildFrom(kind.i, srcIp.i, dstIp.i, segLen.i, *dstMac)
+  Protected p.i
+  Protected src.i
+  Protected sum.i
+  Protected mac.i
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  If NetConfigured(kind) = 0
+    If net_ifMacSet[kind] = 0
+      net_err = #NET_E_NO_MAC
+    Else
+      net_err = #NET_E_NO_IP
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If segLen < #NET_TCP_HDR
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If segLen > #NET_TCP_SEG_MAX
+    net_err = #NET_E_TOO_BIG
+    ProcedureReturn 0
+  EndIf
+  If dstIp = 0 Or dstIp = #NET_IP_BROADCAST
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  src = srcIp & $FFFFFFFF
+  If NetIfHoldsIp(kind, src) = 0
+    net_err = #NET_E_NO_IP
+    ProcedureReturn 0
+  EndIf
+
+  If *dstMac = 0
+    If NetRouteMac(kind, dstIp, @net_scratchMac[0]) = 0
+      ProcedureReturn 0
+    EndIf
+    mac = @net_scratchMac[0]
+  Else
+    mac = *dstMac
+  EndIf
+
+  ; The segment is ALREADY at net_out[34]. net_BeginFrame writes octets
+  ; 0..13 and net_BuildIp writes 14..33, so neither of them can reach
+  ; it - which is the property that makes build-in-place safe and is
+  ; worth a line, because it is not obvious from either call site.
+  net_BeginFrame(kind, mac, #NET_ET_IPV4)
+  p = net_BuildIp(kind, src, #NET_PROTO_TCP, dstIp & $FFFFFFFF, segLen)
+
+  net_PutBE16(@net_out[p + 16], 0)                   ; the checksum
+                                                     ; field, zero while
+                                                     ; it is summed
+  sum = net_PseudoSum(src, dstIp & $FFFFFFFF, #NET_PROTO_TCP, segLen, 0)
+  sum = net_Sum16(@net_out[p], segLen, sum)
+  ; NO $0000 -> $FFFF ALIAS. See net_RecvTcp: TCP never gave zero a
+  ; second meaning, so a computed zero is a correct checksum and
+  ; "fixing" it would make the segment wrong.
+  net_PutBE16(@net_out[p + 16], net_Cksum(sum))
+
+  ProcedureReturn net_Finish(p + segLen)
+EndProcedure
+
+; Active opens and legacy callers choose their source from routing. The
+; exact-source form above is what a latched TCP endpoint uses thereafter.
+Procedure.i NetTcpBuild(kind.i, dstIp.i, segLen.i, *dstMac)
+  ProcedureReturn NetTcpBuildFrom(kind, NetSrcFor(kind, dstIp), dstIp, segLen, *dstMac)
+EndProcedure
+
+
+Procedure.i NetDhcpMode(kind.i, on.i)
+  If net_IfValid(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  If on = 0
+    net_dhcpMode[kind] = 0
+  Else
+    net_dhcpMode[kind] = 1
+  EndIf
+  ProcedureReturn net_dhcpMode[kind]
+EndProcedure
+
+; Turn the TRANSMIT-side UDP checksum off (0) or on (1). On by default.
+; The receive side always checks a non-zero field regardless.
+Procedure.i NetUdpChecksumTx(on.i)
+  If on = 0
+    net_udpTxCksum = 0
+  Else
+    net_udpTxCksum = 1
+  EndIf
+  ProcedureReturn net_udpTxCksum
+EndProcedure
+
+; Deliver only datagrams for this destination port. 0 accepts any.
+Procedure.i NetUdpBind(kind.i, port.i)
+  Define k.i
+  If port < 0 Or port > 65535
+    net_err = #NET_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If kind = #HW_LINK_NONE
+    For k = 1 To #NET_IF_KINDS - 1
+      net_udpBound[k] = port
+    Next
+    ProcedureReturn 1
+  EndIf
+  If net_IfValid(kind) = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  net_udpBound[kind] = port
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i NetUdpBoundPort(kind.i)
+  If net_IfValid(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn net_udpBound[kind]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  NetUdpListen - persistent UDP ownership, per interface.
+;
+;  NetUdpBind is the one movable reply filter used by synchronous
+;  commands. A listener remains installed while those commands run.
+;  Multiple persistent protocols are legitimate here -- a console plus
+;  a DHCP client, or a console plus the direct-cable DHCP server -- so
+;  their ports live in an explicit table rather than a privileged
+;  "second" scalar which the next service would overwrite.
+;
+;  `on` adds idempotently or removes the named port. There is no wildcard
+;  listener: port zero remains NetUdpBind's deliberate accept-any mode.
+; ----------------------------------------------------------------------
+Procedure.i NetUdpListen(kind.i, port.i, on.i)
+  Define first.i
+  Define i.i
+  Define p.i
+  If port < 1 Or port > 65535
+    net_err = #NET_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If net_IfValid(kind) = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn 0
+  EndIf
+  first = kind * #NET_UDP_LISTENERS
+  For i = 0 To #NET_UDP_LISTENERS - 1
+    p = net_udpListen[first + i]
+    If p = port
+      If on = 0
+        net_udpListen[first + i] = 0
+      EndIf
+      ProcedureReturn 1
+    EndIf
+  Next
+  If on = 0
+    ProcedureReturn 1
+  EndIf
+  For i = 0 To #NET_UDP_LISTENERS - 1
+    If net_udpListen[first + i] = 0
+      net_udpListen[first + i] = port
+      ProcedureReturn 1
+    EndIf
+  Next
+  net_err = #NET_E_UDP_FULL
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NetUdpListening(kind.i, port.i)
+  Define first.i
+  Define i.i
+  If net_IfValid(kind) = 0 Or port < 1 Or port > 65535
+    ProcedureReturn 0
+  EndIf
+  first = kind * #NET_UDP_LISTENERS
+  For i = 0 To #NET_UDP_LISTENERS - 1
+    If net_udpListen[first + i] = port
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+; WHICH OF OUR ADDRESSES THE LAST DATAGRAM WAS ADDRESSED TO. See
+; net_rxTo where it is declared. Zero before the first frame.
+; WHICH INTERFACE THE LAST FRAME ARRIVED ON. See net_rxKind where it is
+; declared. Zero before the first frame.
+Procedure.i NetRxKind()
+  ProcedureReturn net_rxKind
+EndProcedure
+
+Procedure.i NetRxTo()
+  ProcedureReturn net_rxTo
+EndProcedure
+
+Procedure.i NetUdpRxFrom()
+  ProcedureReturn net_udpRxFrom
+EndProcedure
+
+Procedure.i NetUdpRxPort()
+  ProcedureReturn net_udpRxPort
+EndProcedure
+
+Procedure.i NetUdpRxDstPort()
+  ProcedureReturn net_udpRxDstPort
+EndProcedure
+
+Procedure.i NetUdpRxLen()
+  ProcedureReturn net_udpRxLen
+EndProcedure
+
+; A pointer to the last datagram's payload. IT IS A COPY, in memory this
+; library owns, exactly so that it survives the caller reusing the
+; receive buffer it handed to NetInput(). It is valid until the next
+; NetInput() call.
+Procedure.i NetUdpRxData()
+  ProcedureReturn @net_udpRx[0]
+EndProcedure
+
+; ---- the last TCP segment. READ THE LIFETIME RULE beside the globals
+; ---- before storing any of these pointers anywhere.
+Procedure.i NetTcpRxFrom()
+  ProcedureReturn net_tcpRxFrom
+EndProcedure
+
+Procedure.i NetTcpRxTo()
+  ProcedureReturn net_tcpRxTo
+EndProcedure
+
+Procedure.i NetTcpRxSrcPort()
+  ProcedureReturn net_tcpRxSrcPort
+EndProcedure
+
+Procedure.i NetTcpRxDstPort()
+  ProcedureReturn net_tcpRxDstPort
+EndProcedure
+
+Procedure.i NetTcpRxSeg()
+  ProcedureReturn net_tcpRxSeg
+EndProcedure
+
+Procedure.i NetTcpRxSegLen()
+  ProcedureReturn net_tcpRxSegLen
+EndProcedure
+
+Procedure.i NetTcpRxHdrLen()
+  ProcedureReturn net_tcpRxHdrLen
+EndProcedure
+
+Procedure.i NetTcpRxData()
+  ProcedureReturn net_tcpRxData
+EndProcedure
+
+Procedure.i NetTcpRxDataLen()
+  ProcedureReturn net_tcpRxDataLen
+EndProcedure
+
+Procedure.i NetTcpRxMac()
+  ProcedureReturn net_tcpRxMac
+EndProcedure
+
+Procedure.i NetTcpRxCount()
+  ProcedureReturn net_tcpRxCount
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: ARP
+; ======================================================================
+;  *a points at the 28 ARP octets, `n` is how many octets of frame
+;  follow the Ethernet header.
+;
+;  THE LEARNING RULE IS RFC 826's, NOT "cache everything". [uncited]
+;  The sender's address pair is merged into the cache if we ALREADY have
+;  an entry for it; a NEW entry is created only when the packet was
+;  addressed to us. The reason is capacity: every ARP request on a
+;  segment is a broadcast, so caching every sender fills eight slots in
+;  seconds on a busy switch and evicts the two entries that matter. The
+;  rule also means that answering a request costs us nothing extra -
+;  we learn the asker for free, in the same packet, which is why a ping
+;  works without us ever sending an ARP request of our own.
+; ----------------------------------------------------------------------
+Procedure.i net_RecvArp(kind.i, *a, n.i)
+  Protected op.i
+  Protected spa.i
+  Protected tpa.i
+  Protected sha.i
+  Protected s.i
+  Protected p.i
+  ; Which of OUR addresses the request named, 0 for none of them.
+  Protected mine.i
+
+  If n < #NET_ARP_LEN
+    net_err = #NET_E_ARP_SHORT
+    ProcedureReturn #NET_E_ARP_SHORT
+  EndIf
+  If net_GetBE16(*a + 0) <> #NET_ARP_HTYPE_ETHER
+    net_err = #NET_E_ARP_PROTO
+    ProcedureReturn #NET_E_ARP_PROTO
+  EndIf
+  If net_GetBE16(*a + 2) <> #NET_ET_IPV4
+    net_err = #NET_E_ARP_PROTO
+    ProcedureReturn #NET_E_ARP_PROTO
+  EndIf
+  If PeekA(*a + 4) <> #NET_ARP_HLEN_ETHER
+    net_err = #NET_E_ARP_PROTO
+    ProcedureReturn #NET_E_ARP_PROTO
+  EndIf
+  If PeekA(*a + 5) <> #NET_ARP_PLEN_IPV4
+    net_err = #NET_E_ARP_PROTO
+    ProcedureReturn #NET_E_ARP_PROTO
+  EndIf
+
+  op  = net_GetBE16(*a + 6)
+  sha = *a + 8
+  spa = net_GetBE32(*a + 14)
+  tpa = net_GetBE32(*a + 24)
+
+  ; Merge, if we already knew this address. Never from a group MAC, and
+  ; never for address zero (which is what a duplicate-address probe
+  ; sends and which is nobody's address).
+  If spa <> 0 And net_IsGroupMac(sha) = 0
+    s = net_ArpFind(kind, spa)
+    If s >= 0
+      NetArpSet(kind, spa, sha)
+    EndIf
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; THE LINK-LOCAL WATCHER, AND IT HAS TO BE HERE. Both of the early
+  ; returns below discard exactly the frames a probe must see: while
+  ; probing we have no address at all, so `net_ipSet = 0` is the normal
+  ; state, and a host already using our candidate is talking to somebody
+  ; else, so `tpa <> net_ip` as well. Two compares on a segment with
+  ; nothing to report, which is nearly every frame on nearly every
+  ; segment. Off entirely (one compare) unless an address is being
+  ; probed or defended. See THE CONFLICT WATCHER above.
+  ;
+  ; A staged defence is a frame the caller must SEND, so it leaves by
+  ; the same door every other staged reply leaves by - #NET_IN_REPLY -
+  ; and every existing pump already sends it without knowing what it is.
+  If net_LlSeeArp(kind, op, spa, tpa, sha) <> 0
+    ProcedureReturn #NET_IN_REPLY
+  EndIf
+  ; ------------------------------------------------------------------
+
+  If net_ifIpSet[kind] = 0 And net_ifAlt[kind] = 0
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+  ; ------------------------------------------------------------------
+  ; WHICH OF OUR ADDRESSES WAS ASKED FOR. An interface can hold two (see
+  ; net_ip2 where it is declared) and BOTH must be defended by ARP: an
+  ; address nothing answers ARP for is an address no host on the segment
+  ; can send a frame to at all, so a board serving DHCP on an alias it
+  ; did not answer for would hand out leases to machines that then could
+  ; not reach it. The reply's sender protocol address is the one that
+  ; was ASKED for and never the primary - answering an ARP for A with an
+  ; announcement of B is how a neighbour ends up holding our hardware
+  ; address filed under an address we will never source a frame from.
+  ; ------------------------------------------------------------------
+  mine = 0
+  If net_ifIpSet[kind] <> 0 And tpa = net_ifIp[kind]
+    mine = net_ifIp[kind]
+  ElseIf net_ifAlt[kind] <> 0 And tpa = net_ifAlt[kind]
+    mine = net_ifAlt[kind]
+  EndIf
+  If mine = 0
+    ; Somebody else's conversation. Extremely common - this is most of
+    ; the broadcast traffic on any segment - and NOT an error.
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+
+  ; It was for us, so the sender is worth a cache slot of its own.
+  If spa <> 0 And net_IsGroupMac(sha) = 0
+    NetArpSet(kind, spa, sha)
+  EndIf
+
+  If op = #NET_ARP_OP_REPLY
+    ProcedureReturn #NET_IN_LEARNED
+  EndIf
+  If op <> #NET_ARP_OP_REQUEST
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+
+  ; ---- build the reply ----
+  ; UNICAST, back to the asker. A broadcast reply is legal and wasteful.
+  p = net_BeginFrame(kind, sha, #NET_ET_ARP)
+  net_PutBE16(@net_out[p + 0], #NET_ARP_HTYPE_ETHER)
+  net_PutBE16(@net_out[p + 2], #NET_ET_IPV4)
+  net_out[p + 4] = #NET_ARP_HLEN_ETHER
+  net_out[p + 5] = #NET_ARP_PLEN_IPV4
+  net_PutBE16(@net_out[p + 6], #NET_ARP_OP_REPLY)
+  net_Copy(@net_out[p + 8], net_IfMacPtr(kind), 6)          ; sender hardware = ours
+  net_PutBE32(@net_out[p + 14], mine)                ; sender protocol = the
+                                                     ; one that was asked for
+  net_Copy(@net_out[p + 18], sha, 6)                 ; target = the asker
+  net_PutBE32(@net_out[p + 24], spa)
+  ; net_BeginFrame already wrote the destination MAC from `sha`, but
+  ; `sha` points INTO THE CALLER'S FRAME and the copy above reads it
+  ; after we have written our own header over bytes 0..13 of OUR buffer.
+  ; Those are different buffers, so there is no aliasing - stated here
+  ; because it is the first thing to check if this ever produces a
+  ; reply addressed to itself.
+  If net_Finish(p + #NET_ARP_LEN) = 0
+    ProcedureReturn net_err
+  EndIf
+  ProcedureReturn #NET_IN_REPLY
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: ICMP
+; ======================================================================
+;  *p points at the ICMP message, `n` is its length as the IP header
+;  declared it - NOT the length of the frame. See net_RecvIp.
+;
+;  THE REPLY GOES BACK TO THE FRAME'S SOURCE MAC, not to an ARP lookup
+;  of the source IP. This is correct and it is also what makes the very
+;  first proof possible: a PC pings the board, the board answers, and
+;  the board never has to resolve anything or have anything configured
+;  beyond its own address. If we looked the source up in the cache we
+;  would refuse the first ping of every session with #NET_E_NO_ARP and
+;  the board would look dead.
+; ----------------------------------------------------------------------
+Procedure.i net_RecvIcmp(kind.i, *p, n.i, srcIp.i, *srcMac, wasBroadcast.i)
+  Protected t.i
+  Protected q.i
+
+  If n < #NET_ICMP_HDR
+    net_err = #NET_E_ICMP_SHORT
+    ProcedureReturn #NET_E_ICMP_SHORT
+  EndIf
+  ; No pseudo-header. The sum is over the message with its own checksum
+  ; field left in place, and it must complement to zero.
+  If net_Cksum(net_Sum16(*p, n, 0)) <> 0
+    net_err = #NET_E_ICMP_CKSUM
+    ProcedureReturn #NET_E_ICMP_CKSUM
+  EndIf
+
+  t = PeekA(*p + 0)
+
+  If t = #NET_ICMP_ECHO_REPLY And PeekA(*p + 1) = #NET_ICMP_CODE_ZERO
+    net_pongFrom  = srcIp
+    net_pongIdent = net_GetBE16(*p + 4)
+    net_pongSeq   = net_GetBE16(*p + 6)
+    net_pongBytes = n - #NET_ICMP_HDR
+    ProcedureReturn #NET_IN_PONG
+  EndIf
+
+  If t <> #NET_ICMP_ECHO_REQUEST
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+  If PeekA(*p + 1) <> #NET_ICMP_CODE_ZERO
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+  ; A ping to a broadcast is not answered. See WHAT IS REFUSED.
+  If wasBroadcast = 1
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+  If (#NET_ETH_HDR + #NET_IP_HDR + n) > #NET_FRAME_MAX
+    net_err = #NET_E_TOO_BIG
+    ProcedureReturn #NET_E_TOO_BIG
+  EndIf
+
+  ; ---- build the echo reply ----
+  ; The whole message is echoed back with only the type changed and the
+  ; checksum recomputed: identifier, sequence and payload come back
+  ; BYTE FOR BYTE, which is the entire contract of an echo and is what
+  ; the pinging host uses to match the reply to its request.
+  net_BeginFrame(kind, *srcMac, #NET_ET_IPV4)
+  q = net_BuildIp(kind, NetSrcFor(kind, srcIp), #NET_PROTO_ICMP, srcIp, n)
+  net_Copy(@net_out[q], *p, n)
+  net_out[q + 0] = #NET_ICMP_ECHO_REPLY
+  net_PutBE16(@net_out[q + 2], 0)
+  net_PutBE16(@net_out[q + 2], net_Cksum(net_Sum16(@net_out[q], n, 0)))
+
+  If net_Finish(q + n) = 0
+    ProcedureReturn net_err
+  EndIf
+  ProcedureReturn #NET_IN_REPLY
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: UDP
+; ======================================================================
+;  THE UDP LENGTH FIELD IS AUTHORITATIVE for how much of this is a
+;  datagram, and it is checked against how much we actually have before
+;  a single byte is summed or copied. A length field larger than the
+;  data present is the classic read-past-the-end, and it arrives from
+;  the network for free.
+;
+;  A CHECKSUM OF ZERO MEANS "NOT COMPUTED" and the datagram is accepted
+;  unchecked. That is IPv4 UDP's rule and there is nothing to be done
+;  about it at this end; it is worth knowing that a payload arriving
+;  that way has had no integrity check whatsoever above the Ethernet
+;  FCS.
+; ----------------------------------------------------------------------
+Procedure.i net_RecvUdp(kind.i, *p, n.i, srcIp.i, dstIp.i)
+  Protected sport.i
+  Protected dport.i
+  Protected ulen.i
+  Protected ck.i
+  Protected sum.i
+  Protected plen.i
+
+  If n < #NET_UDP_HDR
+    net_err = #NET_E_UDP_SHORT
+    ProcedureReturn #NET_E_UDP_SHORT
+  EndIf
+  sport = net_GetBE16(*p + 0)
+  dport = net_GetBE16(*p + 2)
+  ulen  = net_GetBE16(*p + 4)
+  ck    = net_GetBE16(*p + 6)
+
+  If ulen < #NET_UDP_HDR
+    net_err = #NET_E_UDP_LENGTH
+    ProcedureReturn #NET_E_UDP_LENGTH
+  EndIf
+  If ulen > n
+    net_err = #NET_E_UDP_LENGTH
+    ProcedureReturn #NET_E_UDP_LENGTH
+  EndIf
+
+  If ck <> 0
+    sum = net_PseudoSum(srcIp, dstIp, #NET_PROTO_UDP, ulen, 0)
+    sum = net_Sum16(*p, ulen, sum)
+    If net_Cksum(sum) <> 0
+      net_err = #NET_E_UDP_CKSUM
+      ProcedureReturn #NET_E_UDP_CKSUM
+    EndIf
+  EndIf
+
+  If net_udpBound[kind] <> 0 And dport <> net_udpBound[kind]
+    ; Not the command's reply port. Persistent protocol owners are kept
+    ; separately so one service cannot displace another.
+    If NetUdpListening(kind, dport) = 0
+      ; Nobody is listening. No ICMP port unreachable is sent - see
+      ; WHAT IS REFUSED, point 3.
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+  EndIf
+
+  plen = ulen - #NET_UDP_HDR
+  If plen > #NET_UDP_PAYLOAD_MAX
+    plen = #NET_UDP_PAYLOAD_MAX
+  EndIf
+  If plen > 0
+    net_Copy(@net_udpRx[0], *p + #NET_UDP_HDR, plen)
+  EndIf
+  net_udpRxFrom    = srcIp
+  net_udpRxPort    = sport
+  net_udpRxDstPort = dport
+  net_udpRxLen     = plen
+  ProcedureReturn #NET_IN_UDP
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: TCP - VALIDATE THE FRAMING, INTERPRET NOTHING
+; ======================================================================
+;  *p points at the TCP header and n is how many octets of datagram
+;  follow the IP header. THE WHOLE OF TCP'S MEANING IS SOMEBODY ELSE'S:
+;  no sequence number is compared here, no state is consulted, no reply
+;  is staged. That seam is deliberate and it is the same one cyw43.pico2
+;  drew for RP2350/Lib/tcp.pico2 - the driver validates the framing and
+;  hands up one segment's coordinates; the protocol file owns the rest
+;  and touches no register and no buffer it does not own.
+;
+;  WHAT IS CHECKED, IN THE ORDER A LATER READ NEEDS IT:
+;    1. the segment is at least a twenty-octet header,
+;    2. the data offset is 5..15 words and does not run past the
+;       segment - checked BEFORE the data pointer is computed from it,
+;    3. the checksum, over the twelve-octet pseudo-header and the whole
+;       segment, complements to zero.
+;
+;  THE CHECKSUM IS NEVER OPTIONAL. RFC 9293 3.1: "The TCP checksum is
+;  never optional." UDP gave zero a second meaning and therefore needs
+;  the $FFFF alias; TCP never did, so a zero field here is simply a
+;  wrong one and #NET_E_TCP_CKSUM says so. Do not copy UDP's
+;  `If ck <> 0` guard into this procedure - it would accept every
+;  corrupt segment whose corruption happened to land on the checksum.
+;
+;  A SEGMENT TO A BROADCAST ADDRESS IS REFUSED BY THE CALLER, not here:
+;  net_RecvIp knows whether the destination was a broadcast and TCP has
+;  no broadcast at all, so answering one would be answering a forgery.
+; ----------------------------------------------------------------------
+Procedure.i net_RecvTcp(kind.i, *p, n.i, srcIp.i, dstIp.i, *srcMac)
+  Protected off.i
+  Protected hl.i
+  Protected sum.i
+
+  If n < #NET_TCP_HDR
+    net_err = #NET_E_TCP_SHORT
+    ProcedureReturn #NET_E_TCP_SHORT
+  EndIf
+
+  off = (PeekA(*p + 12) >> 4) & $F
+  hl = off * 4
+  If hl < #NET_TCP_HDR
+    net_err = #NET_E_TCP_OFFSET
+    ProcedureReturn #NET_E_TCP_OFFSET
+  EndIf
+  If hl > n
+    net_err = #NET_E_TCP_OFFSET
+    ProcedureReturn #NET_E_TCP_OFFSET
+  EndIf
+
+  sum = net_PseudoSum(srcIp, dstIp, #NET_PROTO_TCP, n, 0)
+  sum = net_Sum16(*p, n, sum)
+  If net_Cksum(sum) <> 0
+    net_err = #NET_E_TCP_CKSUM
+    ProcedureReturn #NET_E_TCP_CKSUM
+  EndIf
+
+  net_tcpRxFrom    = srcIp
+  net_tcpRxTo      = dstIp
+  net_tcpRxSrcPort = net_GetBE16(*p + 0)
+  net_tcpRxDstPort = net_GetBE16(*p + 2)
+  net_tcpRxSeg     = *p
+  net_tcpRxSegLen  = n
+  net_tcpRxHdrLen  = hl
+  net_tcpRxData    = *p + hl
+  net_tcpRxDataLen = n - hl
+  net_tcpRxMac     = *srcMac
+  net_tcpRxCount   = net_tcpRxCount + 1
+  ProcedureReturn #NET_IN_TCP
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: IPv4
+; ======================================================================
+;  *a points at the IP header, `n` is how many octets of frame follow
+;  the Ethernet header.
+;
+;  THE ORDER OF THE CHECKS IS THE POINT. Everything that could make a
+;  later read go out of bounds is checked before that read happens:
+;  version, then IHL, then IHL against `n`, then total length against
+;  IHL and against `n`, and only then the checksum - which reads IHL*4
+;  bytes and therefore needs IHL to have been believed first.
+;
+;  n MAY EXCEED THE TOTAL LENGTH AND USUALLY DOES. A 60-byte minimum
+;  frame carrying a 46-byte datagram has 14 octets of Ethernet padding
+;  after it, and if the MAC ever forwards the FCS there would be four
+;  more. Everything downstream is driven off the IP total length and the
+;  UDP length, never off the frame length, so trailing bytes are ignored
+;  by construction rather than by a special case.
+; ----------------------------------------------------------------------
+Procedure.i net_RecvIp(kind.i, *a, n.i, *srcMac)
+  Protected vihl.i
+  Protected ihl.i
+  Protected total.i
+  Protected ff.i
+  Protected proto.i
+  Protected srcIp.i
+  Protected dstIp.i
+  Protected wasBroadcast.i
+  ; DHCP-MODE UNICAST: 1 for the one datagram this stack accepts at an
+  ; address it does not own. See the block that sets it, below.
+  Protected dhcpUni.i
+
+  If n < #NET_IP_HDR
+    net_err = #NET_E_SHORT
+    ProcedureReturn #NET_E_SHORT
+  EndIf
+
+  vihl = PeekA(*a + 0)
+  If ((vihl >> 4) & $F) <> #NET_IP_VERSION
+    net_err = #NET_E_IP_VERSION
+    ProcedureReturn #NET_E_IP_VERSION
+  EndIf
+  ihl = (vihl & $F) * 4
+  If ihl < #NET_IP_HDR
+    net_err = #NET_E_IP_HEADER
+    ProcedureReturn #NET_E_IP_HEADER
+  EndIf
+  If ihl > n
+    net_err = #NET_E_IP_HEADER
+    ProcedureReturn #NET_E_IP_HEADER
+  EndIf
+
+  total = net_GetBE16(*a + 2)
+  If total < ihl
+    net_err = #NET_E_IP_LENGTH
+    ProcedureReturn #NET_E_IP_LENGTH
+  EndIf
+  If total > n
+    ; The frame is shorter than the datagram claims. Truncated in
+    ; flight, or a lie. Either way there is nothing here to parse.
+    net_err = #NET_E_IP_LENGTH
+    ProcedureReturn #NET_E_IP_LENGTH
+  EndIf
+
+  ; FRAGMENTS ARE REFUSED, NOT REASSEMBLED, AND NOT PARTLY PROCESSED.
+  ; Checked BEFORE the checksum only because it is cheaper; both are
+  ; before anything is believed.
+  ff = net_GetBE16(*a + 6)
+  If (ff & #NET_IP_FLAG_MF) <> 0
+    net_err = #NET_E_FRAGMENT
+    ProcedureReturn #NET_E_FRAGMENT
+  EndIf
+  If (ff & #NET_IP_FRAG_MASK) <> 0
+    net_err = #NET_E_FRAGMENT
+    ProcedureReturn #NET_E_FRAGMENT
+  EndIf
+
+  ; The header checksum, over IHL*4 octets INCLUDING options and
+  ; INCLUDING the checksum field itself, which must complement to zero.
+  If net_Cksum(net_Sum16(*a, ihl, 0)) <> 0
+    net_err = #NET_E_IP_CKSUM
+    ProcedureReturn #NET_E_IP_CKSUM
+  EndIf
+
+  proto = PeekA(*a + 9)
+  srcIp = net_GetBE32(*a + 12)
+  dstIp = net_GetBE32(*a + 16)
+  net_lastProto = proto
+
+  ; The flag is cleared here rather than at the declaration because the
+  ; destination filter further down reads it, and net_ip is 0 while we
+  ; are unconfigured - so that filter would otherwise throw away the very
+  ; datagram this exception exists to let through.
+  dhcpUni = 0
+
+  If net_ifIpSet[kind] = 0 And net_ifAlt[kind] = 0
+    ; No address of our own. Normally that means every IPv4 datagram is
+    ; someone else's and is ignored. THE ONE EXCEPTION IS DHCP: while a
+    ; lease is being acquired (NetDhcpMode(1)) we have no address yet by
+    ; definition.
+    ;
+    ; THE ALIAS COUNTS AS AN ADDRESS OF OUR OWN. An interface can carry
+    ; the alias alone for a moment - a board that has begun serving DHCP
+    ; on a cable before its own link-local probes have finished - and a
+    ; board that ignored every datagram in that window would be deaf at
+    ; an address it was advertising.
+    If net_dhcpMode[kind] = 0
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+    If dstIp <> #NET_IP_BROADCAST
+      ; ======================================================================
+      ;  A SERVER MAY IGNORE THE BROADCAST FLAG AND UNICAST ITS REPLY, AND
+      ;  MOST DOMESTIC ROUTERS DO. Fixed 2026-09-05; before it, `dhcp` over
+      ;  Wi-Fi on this bench sent DISCOVER after DISCOVER and was answered
+      ;  every time by a router that unicast its OFFER to the address it was
+      ;  about to hand out - which this stack, having no address, threw away
+      ;  two lines above. The refusal text `dhcp` prints named this as the
+      ;  likely cause and it was right.
+      ;
+      ;  RFC 2131 4.1: a server "MAY" broadcast when the flag is set; RFC 951
+      ;  and RFC 1542 4.1 describe the other behaviour, where the reply is
+      ;  unicast to yiaddr with the client's chaddr written into the ARP
+      ;  cache by hand. Neither is wrong and a client that only accepts one
+      ;  of them works on some networks and not others, with nothing to see
+      ;  except a timeout.
+      ;
+      ;  WHAT IS ACTUALLY LET THROUGH IS ONE PORT, IN ONE MODE, AND NOTHING
+      ;  ELSE. The datagram must be UDP, its destination port must be 68, and
+      ;  net_dhcpMode must be on - which only dhcp.pi4's caller turns on, and
+      ;  only around one exchange. Every other unicast to an address we do
+      ;  not own is still ignored exactly as before. Beyond this point the
+      ;  reply still has to satisfy DhcpParseReply: BOOTREPLY, OUR
+      ;  TRANSACTION ID, and the magic cookie. A stranger who wants to reach
+      ;  this arm has to guess a 32-bit xid inside a window a few seconds
+      ;  long while a lease is being taken, and the worst it can then do is
+      ;  offer an address the operator watches the board refuse or accept.
+      ;
+      ;  THE PORT IS READ HERE RATHER THAN LEFT TO net_RecvUdp because that
+      ;  procedure is three checks further on, past the point this datagram
+      ;  is discarded. `ihl` is already validated above, and the length test
+      ;  guarantees four octets of UDP header before the read.
+      ; ======================================================================
+      If proto <> #NET_PROTO_UDP
+        ProcedureReturn #NET_IN_IGNORED
+      EndIf
+      If (total - ihl) < #NET_UDP_HDR
+        ProcedureReturn #NET_IN_IGNORED
+      EndIf
+      If net_GetBE16(*a + ihl + 2) <> #NET_PORT_DHCP_CLIENT
+        ProcedureReturn #NET_IN_IGNORED
+      EndIf
+      dhcpUni = 1
+    EndIf
+  EndIf
+
+  wasBroadcast = 0
+  If dstIp = #NET_IP_BROADCAST Or dstIp = net_ifBcast[kind]
+    wasBroadcast = 1
+  EndIf
+  ; The alias's own subnet broadcast is ours as well. A DHCP client that
+  ; has taken a lease on the served subnet renews to that broadcast.
+  If net_ifAlt[kind] <> 0 And dstIp = net_ifAltBcast[kind]
+    wasBroadcast = 1
+  EndIf
+  ; ------------------------------------------------------------------
+  ; ADDRESSED TO EITHER OF OUR ADDRESSES, AND THE REPLY LEAVES FROM THE
+  ; ONE IT WAS ADDRESSED TO. See net_rxTo where it is declared: a reply
+  ; sourced from our other address is discarded by the asker as
+  ; unsolicited - by every stack, silently - so the address a request
+  ; came in on is remembered here, at the one point in this file that
+  ; knows it, rather than being re-derived by each protocol below.
+  ;
+  ; A BROADCAST DOES NOT MOVE IT. 255.255.255.255 names neither address,
+  ; and a subnet broadcast is answered from the address on that subnet,
+  ; which is what NetSrcFor works out from the destination anyway.
+  ; ------------------------------------------------------------------
+  If net_ifIpSet[kind] <> 0 And dstIp = net_ifIp[kind]
+    net_rxTo = net_ifIp[kind]
+  ElseIf net_ifAlt[kind] <> 0 And dstIp = net_ifAlt[kind]
+    net_rxTo = net_ifAlt[kind]
+  ElseIf wasBroadcast <> 0
+    ; ================================================================
+    ; A BROADCAST NAMES NEITHER OF OUR ADDRESSES, SO THE ASKER'S
+    ; SUBNET DECIDES - AND LEAVING IT ALONE COSTS THE BOARD ITS
+    ; DISCOVERY. MEASURED OVER THE CABLE, 2026-09-07, build 13.
+    ;
+    ; The board held a link-local address on the cable and a private lease on
+    ; the radio, and the console was answering on both. From the directly
+    ; attached host, a network-console `echo AA` to the link-local address came back
+    ; perfectly - a UNICAST, which sets net_rxTo to the address it
+    ; was addressed to. `anvil_wifi.py --find`, which BROADCASTS to
+    ; 169.254.255.255, found nothing on the cable at all: with
+    ; net_rxTo left standing at whatever the last unicast had set,
+    ; the reply to a broadcast on the cable was SOURCED FROM THE
+    ; RADIO'S ADDRESS, and the laptop threw it away as unsolicited
+    ; with nothing logged at either end.
+    ;
+    ; So a board with two addresses could be talked to and could not
+    ; be FOUND, which is the same shape of defect as the runt padding
+    ; the night before: one path, one direction, invisible from the
+    ; board, and fatal to the one tool a person reaches for first.
+    ;
+    ; net_SrcFor(srcIp) is the honest answer - the one of our
+    ; addresses that is on the ASKER's own subnet - and it is the same
+    ; procedure every outbound frame already asks. A source that
+    ; matches neither of our subnets (a relayed or forged broadcast)
+    ; leaves net_rxTo exactly as it was, which is what net_SrcFor
+    ; answers by construction.
+    ; ================================================================
+    net_rxTo = NetSrcFor(kind, srcIp)
+  EndIf
+  If wasBroadcast = 0 And dhcpUni = 0
+    If dstIp <> net_ifIp[kind]
+      If net_ifAlt[kind] = 0 Or dstIp <> net_ifAlt[kind]
+        ; Somebody else's datagram, arriving because a switch flooded it
+        ; or because the MAC filter is wider than we are. Not an error.
+        ProcedureReturn #NET_IN_IGNORED
+      EndIf
+    EndIf
+  EndIf
+
+  ; A source address that is a broadcast cannot be answered and is a
+  ; standard forgery. Drop it before anything builds a reply to it.
+  If srcIp = #NET_IP_BROADCAST
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+  ; ------------------------------------------------------------------
+  ; A SOURCE OF 0.0.0.0 IS THE SAME REFUSAL WITH ONE EXCEPTION, AND THE
+  ; EXCEPTION IS WHY THIS BOARD CAN BE A DHCP SERVER AT ALL.
+  ;
+  ; RFC 2131 section 4.1: a client that has no address yet - which is
+  ; every client sending a DISCOVER, by definition - sets ciaddr and the
+  ; IP source address to 0.0.0.0. So the one datagram a DHCP server most
+  ; needs to receive is the one this guard was written to throw away,
+  ; and until this exception existed the server answered nothing at all
+  ; and there was nothing on the board to see: the DISCOVER was
+  ; discarded three layers below anything that counts.
+  ;
+  ; IT IS NARROW ON PURPOSE. UDP only, to a persistent listener -- port
+  ; 67 while the DHCP server role is actually held. Every other datagram
+  ; from 0.0.0.0 is still dropped
+  ; before anything can build a reply to it. `ihl` is validated above
+  ; and the length test below guarantees four octets of UDP header
+  ; before the read.
+  ; ------------------------------------------------------------------
+  If srcIp = 0
+    If proto <> #NET_PROTO_UDP
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+    If (total - ihl) < #NET_UDP_HDR
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+    If NetUdpListening(kind, net_GetBE16(*a + ihl + 2)) = 0
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+  EndIf
+
+  ; THE DATAGRAM IS WELL FORMED AND IT IS FOR US, so whoever sent it is
+  ; alive at the hardware address it came from. Confirm the cache entry
+  ; for the next hop before the payload is looked at, and note the
+  ; position of this line: it is AFTER every header check and AFTER the
+  ; destination filter, so a corrupt frame or somebody else's datagram
+  ; confirms nothing. See net_ConfirmNeighbour for what it refuses to
+  ; do and why.
+  net_ConfirmNeighbour(kind, srcIp, *srcMac)
+
+  If proto = #NET_PROTO_ICMP
+    ProcedureReturn net_RecvIcmp(kind, *a + ihl, total - ihl, srcIp, *srcMac, wasBroadcast)
+  EndIf
+  If proto = #NET_PROTO_UDP
+    ProcedureReturn net_RecvUdp(kind, *a + ihl, total - ihl, srcIp, dstIp)
+  EndIf
+  If proto = #NET_PROTO_TCP
+    ; TCP HAS NO BROADCAST. A segment addressed to the subnet broadcast
+    ; or to 255.255.255.255 is either a scan or a forgery, and the only
+    ; correct answer to it is nothing at all - a RST to the source
+    ; address of a broadcast SYN is a packet this board sends to a
+    ; stranger on somebody else's say-so. Ignored, not refused: it is a
+    ; normal thing to see on a live segment.
+    If wasBroadcast <> 0
+      ProcedureReturn #NET_IN_IGNORED
+    EndIf
+    ProcedureReturn net_RecvTcp(kind, *a + ihl, total - ihl, srcIp, dstIp, *srcMac)
+  EndIf
+  ProcedureReturn #NET_IN_IGNORED
+EndProcedure
+
+
+; ======================================================================
+;  NetInput - HAND IT EVERY FRAME THE MAC GIVES YOU
+; ======================================================================
+;  *frame is one Ethernet frame as GenetRecv()/GenetRecvWait() delivered
+;  it: destination, source, EtherType, payload. NO FCS - the GENET
+;  receive path returns the descriptor's length minus the two
+;  RBUF_ALIGN_2B pad bytes and the measured result on 2026-08-26 was 60
+;  bytes for a minimum-size BPDU, which is a frame with its FCS already
+;  removed. NOTHING HERE DEPENDS ON THAT: every length is taken from a
+;  protocol field, so four trailing bytes of FCS would be ignored the
+;  same way Ethernet padding is.
+;
+;  RETURNS a #NET_IN_* on success or a negative #NET_E_* on refusal.
+;  #NET_IN_IGNORED IS ZERO AND IS NOT AN ERROR - on a live switch port
+;  most frames are somebody else's and a caller that logs a fault for
+;  each will fill its console.
+;
+;  THE OUTPUT BUFFER IS CLEARED ON ENTRY. A reply staged by a previous
+;  call is gone. Send it before pumping again.
+; ----------------------------------------------------------------------
+;  NetDefaults - THE STACK'S TUNABLES, AND NOT ONE ADDRESS.
+;
+;  Split out of NetReset on 2026-09-08, because a caller appeared that
+;  wanted one half and was silently taking both. RaspberryPi4/Board/
+;  eth.pi4's eth_HwUp calls NetInit() when the Ethernet CONTROLLER
+;  starts, meaning "forget what the wired interface was". Under one
+;  identity that was the same thing as resetting the stack, because
+;  there was only the one. With a row per interface it TAKES THE RADIO'
+;  ADDRESS AWAY as a side effect of bringing the cable up - which is the
+;  2026-09-07 defect wearing the other coat, and `ifconfig eth0 up` does
+;  not touch wlan0.
+;
+;  It is idempotent, so calling it on every bring-up costs three stores.
+; ----------------------------------------------------------------------
+Procedure NetDefaults()
+  net_arpTtlMs = #NET_ARP_TTL_MS_DEFAULT
+  net_udpTxCksum = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+Procedure.i NetInput(kind.i, *frame, length.i)
+  Protected et.i
+  Protected toUs.i
+  Protected bcast.i
+  Protected r.i
+
+  net_err = #NET_E_NONE
+  net_outLen = 0
+  net_lastProto = 0
+  net_rxKind = kind
+
+  If *frame = 0 Or length < 0
+    net_err = #NET_E_ARG
+    ProcedureReturn #NET_E_ARG
+  EndIf
+  If net_IfValid(kind) = 0
+    net_err = #NET_E_ARG
+    ProcedureReturn #NET_E_ARG
+  EndIf
+  If net_ifMacSet[kind] = 0
+    net_err = #NET_E_NO_MAC
+    ProcedureReturn #NET_E_NO_MAC
+  EndIf
+  If length < #NET_ETH_HDR
+    net_err = #NET_E_SHORT
+    ProcedureReturn #NET_E_SHORT
+  EndIf
+  ; RECEIVING INTO OUR OWN STAGING BUFFER IS REFUSED. It looks like a
+  ; sensible economy - one buffer instead of two - and it is not one:
+  ; net_BeginFrame writes the reply's first fourteen bytes over the
+  ; frame we are still parsing, so an ARP reply would be built from
+  ; whatever it had just overwritten. Caught here rather than left as a
+  ; corrupted reply nobody can explain.
+  If *frame >= @net_out[0] And *frame < (@net_out[0] + #NET_FRAME_MAX)
+    net_err = #NET_E_ARG
+    ProcedureReturn #NET_E_ARG
+  EndIf
+
+  net_inCount = net_inCount + 1
+
+  ; ---- the destination filter ----
+  ; The MAC hardware already does most of this, but not all of it: it
+  ; accepts our address and broadcast and, depending on how it was
+  ; configured, may accept more. Doing it again here costs six byte
+  ; compares and means this file is correct even in promiscuous mode -
+  ; which is exactly the mode somebody will turn on while debugging.
+  toUs  = net_Same(*frame, net_IfMacPtr(kind), 6)
+  bcast = net_IsBroadcastMac(*frame)
+  If toUs = 0 And bcast = 0
+    net_dropCount = net_dropCount + 1
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+
+  et = net_GetBE16(*frame + 12)
+
+  ; Below 1536 the field is an 802.3 LENGTH, not an EtherType, and what
+  ; follows is an LLC header rather than IP. Spanning-tree BPDUs are
+  ; exactly this and they are the most common unsolicited frame on a
+  ; switch port - the one the board actually received on 2026-08-26 had
+  ; $0026 here, which is 38, a length. NOT AN ERROR.
+  If et < #NET_ETHERTYPE_MIN
+    net_dropCount = net_dropCount + 1
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+
+  If et = #NET_ET_ARP
+    net_lastProto = #NET_ET_ARP
+    r = net_RecvArp(kind, *frame + #NET_ETH_HDR, length - #NET_ETH_HDR)
+  ElseIf et = #NET_ET_IPV4
+    r = net_RecvIp(kind, *frame + #NET_ETH_HDR, length - #NET_ETH_HDR, *frame + 6)
+  Else
+    net_dropCount = net_dropCount + 1
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+
+  If r = #NET_IN_REPLY
+    net_replyCount = net_replyCount + 1
+  EndIf
+  If r < 0
+    net_dropCount = net_dropCount + 1
+    net_outLen = 0
+  EndIf
+  If r = #NET_IN_IGNORED
+    net_dropCount = net_dropCount + 1
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+
+; ======================================================================
+;  WHAT THE LAST FRAME WAS, AND THE COUNTERS
+; ======================================================================
+; $0806 for ARP, or the IP protocol number (1 ICMP, 17 UDP), or 0.
+Procedure.i NetLastProto()
+  ProcedureReturn net_lastProto
+EndProcedure
+
+Procedure.i NetInCount()
+  ProcedureReturn net_inCount
+EndProcedure
+
+Procedure.i NetReplyCount()
+  ProcedureReturn net_replyCount
+EndProcedure
+
+Procedure.i NetDropCount()
+  ProcedureReturn net_dropCount
+EndProcedure
+
+Procedure.i NetPongFrom()
+  ProcedureReturn net_pongFrom
+EndProcedure
+
+Procedure.i NetPongIdent()
+  ProcedureReturn net_pongIdent
+EndProcedure
+
+Procedure.i NetPongSeq()
+  ProcedureReturn net_pongSeq
+EndProcedure
+
+Procedure.i NetPongBytes()
+  ProcedureReturn net_pongBytes
+EndProcedure
+
+; Back to the state a freshly booted program is in. Exists for the
+; refusal suite in a diagnostic, which has to be able to get back to
+; "nothing is configured" in order to provoke #NET_E_NO_MAC.
+Procedure NetReset()
+  Protected i.i
+  Protected k.i
+  net_err = #NET_E_NONE
+  ; EVERY ROW, INCLUDING ROW 0. A controller that has been restarted
+  ; holds nothing, on any interface - and clearing five of six rows is
+  ; the kind of omission that leaves a board answering at an address
+  ; `net` no longer prints.
+  For k = 0 To #NET_IF_KINDS - 1
+    net_ifMacSet[k] = 0
+    net_ifIpSet[k] = 0
+    net_ifIp[k] = 0
+    net_ifMask[k] = 0
+    net_ifGw[k] = 0
+    net_ifBcast[k] = 0
+    net_ifAlt[k] = 0
+    net_ifAltMask[k] = 0
+    net_ifAltBcast[k] = 0
+    net_dhcpMode[k] = 0
+    net_udpBound[k] = 0
+    For i = 0 To #NET_UDP_LISTENERS - 1
+      net_udpListen[k * #NET_UDP_LISTENERS + i] = 0
+    Next
+  Next
+  net_llKind = 0
+  net_rxKind = 0
+  net_rxTo = 0
+  net_ipId = 0
+  net_outLen = 0
+  net_udpRxFrom = 0
+  net_udpRxPort = 0
+  net_udpRxDstPort = 0
+  net_udpRxLen = 0
+  net_tcpRxFrom = 0
+  net_tcpRxTo = 0
+  net_tcpRxSrcPort = 0
+  net_tcpRxDstPort = 0
+  net_tcpRxSeg = 0
+  net_tcpRxSegLen = 0
+  net_tcpRxHdrLen = 0
+  net_tcpRxData = 0
+  net_tcpRxDataLen = 0
+  net_tcpRxMac = 0
+  net_tcpRxCount = 0
+  net_pongFrom = 0
+  net_pongIdent = 0
+  net_pongSeq = 0
+  net_pongBytes = 0
+  net_lastProto = 0
+  net_inCount = 0
+  net_replyCount = 0
+  net_dropCount = 0
+  NetDefaults()
+  i = 0
+  While i < #NET_IF_KINDS * 6
+    net_ifMac[i] = 0
+    i = i + 1
+  Wend
+  NetArpFlush(#HW_LINK_NONE)
+EndProcedure
+
+; Bring the mutable defaults up before anything else runs, and forget
+; every interface with them: this is the WHOLE stack, for a program
+; starting from nothing and for a gate between cases. A driver bringing
+; ONE controller up wants NetDefaults() and NetClearIPv4(kind) instead -
+; see NetDefaults for what that cost when it was one call.
+Procedure NetInit()
+  NetReset()
+EndProcedure
+
+
+; ======================================================================
+;  THE REFUSAL, IN WORDS
+; ======================================================================
+; A number in a log is a number somebody has to look up. Every code
+; above has a sentence here, and the sentence says what to DO about it
+; wherever there is something to do.
+; ----------------------------------------------------------------------
+Procedure.i NetErrorText()
+  Select net_err
+    Case #NET_E_NONE
+      ProcedureReturn "net: no refusal recorded"
+    Case #NET_E_ARG
+      ProcedureReturn "net: REFUSED - a null pointer, a negative length, or an address that cannot be a host"
+    Case #NET_E_NO_MAC
+      ProcedureReturn "net: REFUSED - this interface has no MAC address. Call NetSetMac(interface, mac) with the SAME six bytes the driver for that interface was given"
+    Case #NET_E_NO_IP
+      ProcedureReturn "net: REFUSED - this interface has no IPv4 address. Call NetSetIPv4(interface, address, netmask, gateway)"
+    Case #NET_E_MASK
+      ProcedureReturn "net: REFUSED - the netmask is not a run of ones followed by a run of zeros"
+    Case #NET_E_GATEWAY
+      ProcedureReturn "net: REFUSED - the gateway is not on our own subnet, so it could never be reached to be asked"
+    Case #NET_E_SHORT
+      ProcedureReturn "net: REFUSED - the frame is shorter than the header it must contain"
+    Case #NET_E_IP_VERSION
+      ProcedureReturn "net: REFUSED - the IP version nibble is not 4"
+    Case #NET_E_IP_HEADER
+      ProcedureReturn "net: REFUSED - the IHL field is below 5 or runs past the end of the frame"
+    Case #NET_E_IP_LENGTH
+      ProcedureReturn "net: REFUSED - the IP total length disagrees with the frame it arrived in"
+    Case #NET_E_IP_CKSUM
+      ProcedureReturn "net: REFUSED - the IPv4 header checksum does not verify"
+    Case #NET_E_FRAGMENT
+      ProcedureReturn "net: REFUSED - a fragmented datagram. This stack does not reassemble and will not pretend the first fragment is the whole"
+    Case #NET_E_ICMP_SHORT
+      ProcedureReturn "net: REFUSED - an ICMP message shorter than its own eight-byte header"
+    Case #NET_E_ICMP_CKSUM
+      ProcedureReturn "net: REFUSED - the ICMP checksum does not verify"
+    Case #NET_E_UDP_SHORT
+      ProcedureReturn "net: REFUSED - a UDP datagram shorter than its own eight-byte header"
+    Case #NET_E_UDP_LENGTH
+      ProcedureReturn "net: REFUSED - the UDP length field disagrees with the datagram it is inside"
+    Case #NET_E_UDP_CKSUM
+      ProcedureReturn "net: REFUSED - the UDP checksum does not verify"
+    Case #NET_E_ARP_SHORT
+      ProcedureReturn "net: REFUSED - an ARP packet shorter than 28 bytes"
+    Case #NET_E_ARP_PROTO
+      ProcedureReturn "net: REFUSED - ARP for something that is not IPv4 over Ethernet"
+    Case #NET_E_NO_ARP
+      ProcedureReturn "net: REFUSED - the destination hardware address is not known. Call NetArpRequest(interface, ip) and pump until NetInput(interface, frame, length) returns 4"
+    Case #NET_E_NO_ROUTE
+      ProcedureReturn "net: REFUSED - the destination is off-link and no gateway is configured"
+    Case #NET_E_TOO_BIG
+      ProcedureReturn "net: REFUSED - it would have to be fragmented, and fragmenting is refused"
+    Case #NET_E_CACHE_FULL
+      ProcedureReturn "net: REFUSED - every ARP cache slot holds a live entry"
+    Case #NET_E_PORT
+      ProcedureReturn "net: REFUSED - a UDP port outside 1..65535"
+    Case #NET_E_TCP_SHORT
+      ProcedureReturn "net: REFUSED - a TCP segment shorter than its own twenty-byte header"
+    Case #NET_E_TCP_OFFSET
+      ProcedureReturn "net: REFUSED - the TCP data offset is below five words or runs past the segment"
+    Case #NET_E_TCP_CKSUM
+      ProcedureReturn "net: REFUSED - the TCP checksum does not verify. A TCP checksum is never optional, so a zero field is a wrong one and not an omission"
+    Case #NET_E_UDP_FULL
+      ProcedureReturn "net: REFUSED - every persistent UDP listener slot on this interface is in use"
+    Default
+      ProcedureReturn "net: an unnumbered refusal, which is itself a defect"
+  EndSelect
+EndProcedure

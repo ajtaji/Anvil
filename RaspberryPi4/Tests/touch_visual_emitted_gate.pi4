@@ -1,0 +1,98 @@
+EnableExplicit
+#ANVIL_V3D_CONSOLE=1 : #SCR_SRC_DSI=2 : #HW_TOUCH_EVSZ=16
+; @@CONSTANTS@@
+Global gScreen.i=1 : Global gScrSrc.i=#SCR_SRC_DSI : Global gCurShown.i=1 : Global *gConPaint=$1234
+Global dsp_cox.i=3 : Global dsp_coy.i=4 : Global dsp_cols.i=80 : Global dsp_rows.i=30
+Global dsp_cx.i=7 : Global dsp_cy.i=8 : Global dsp_fg.i=$112233 : Global dsp_bg.i=$445566
+Global gV3dConOn.i=1 : Global gCursorGpuOwned.i=1
+Global gate_mode.i : Global gate_tick.i : Global gate_ids.i : Global gate_moveMarks.i : Global gate_releaseLines.i
+Global gate_renderer.i : Global gate_repaint.i : Global gate_show.i : Global gate_hide.i : Global gate_busSay.i
+Global gate_v3d.i=1 : Global gate_readyCalls.i : Global gate_tickCalls.i
+Global gate_presents.i
+Global gate_seq.i : Global gate_exitPresent.i : Global gate_presentSeq.i : Global gate_rendererSeq.i : Global gate_restoring.i
+Procedure GatePrintN(p.i) : EndProcedure
+Procedure GatePrint(p.i) : EndProcedure
+Procedure GatePrintDec(v.i) : EndProcedure
+Procedure.i HwTouchReady() : gate_readyCalls=gate_readyCalls+1 : ProcedureReturn 1 : EndProcedure
+Procedure.i HwTouchMaxPoints() : ProcedureReturn 10 : EndProcedure
+Procedure.i V3dConActive() : ProcedureReturn gate_v3d : EndProcedure
+Procedure PointerHide() : gate_hide=gate_hide+1 : gCurShown=0 : EndProcedure
+Procedure PointerShow() : gate_show=gate_show+1 : gCurShown=1 : EndProcedure
+Procedure ConNoRenderer() : *gConPaint=0 : EndProcedure
+Procedure ConSetRenderer(p.i) : gate_seq=gate_seq+1 : gate_rendererSeq=gate_seq : *gConPaint=p : gate_renderer=p : EndProcedure
+Procedure ConRepaint() : gate_repaint=gate_repaint+1 : EndProcedure
+Procedure DisplayConsoleFull() : EndProcedure
+Procedure DisplayColour(f.i,b.i) : dsp_fg=f : dsp_bg=b : EndProcedure
+Procedure DisplayClear(c.i) : EndProcedure
+Procedure DisplayConsole(x.i,y.i,w.i,h.i) : dsp_cox=x : dsp_coy=y : dsp_cols=w/8 : dsp_rows=h/16 : EndProcedure
+Procedure DisplayLocate(x.i,y.i) : dsp_cx=x : dsp_cy=y : EndProcedure
+Procedure.i DisplayCharWidth() : ProcedureReturn 8 : EndProcedure
+Procedure.i DisplayCharHeight() : ProcedureReturn 16 : EndProcedure
+Procedure.i DisplayCols() : ProcedureReturn 80 : EndProcedure
+Procedure.i DisplayRows() : ProcedureReturn 30 : EndProcedure
+Procedure DisplayPrint(p.i) : EndProcedure
+Procedure DisplayPrintDec(v.i) : EndProcedure
+Procedure DisplayPrintHex(v.i,n.i) : gate_ids=gate_ids | (1 << v) : EndProcedure
+Procedure DisplayFillRect(x.i,y.i,w.i,h.i,c.i)
+  If w=7 And h=7 : gate_moveMarks=gate_moveMarks+1 : EndIf
+  If c=$FFFFFF And ((w=32 And h=2) Or (w=2 And h=32)) : gate_releaseLines=gate_releaseLines+1 : EndIf
+EndProcedure
+Procedure.i OutBreak() : ProcedureReturn Bool(gate_mode=1 And gate_tick=0) : EndProcedure
+Procedure.i KeyboardChar() : ProcedureReturn -1 : EndProcedure
+Procedure.i Ticks()
+  If gate_mode=0 And gate_tick>=3 : ProcedureReturn 40000 : EndIf
+  ProcedureReturn gate_tick*20
+EndProcedure
+Procedure.i TickHz() : ProcedureReturn 1000 : EndProcedure
+Procedure delay(ms.i) : EndProcedure
+Procedure.i HwTouchTick()
+  gate_tickCalls=gate_tickCalls+1
+  If gate_mode=2 : ProcedureReturn -1 : EndIf
+  If gate_mode=3 And gate_tick>=1 : ProcedureReturn -1 : EndIf
+  gate_tick=gate_tick+1
+  If gate_tick<=2 : ProcedureReturn 10 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchPointId(i.i) : ProcedureReturn i : EndProcedure
+Procedure.i HwTouchPointX(i.i) : ProcedureReturn 100+i*20+gate_tick : EndProcedure
+Procedure.i HwTouchPointY(i.i) : ProcedureReturn 200+i*10+gate_tick : EndProcedure
+Procedure.i HwTouchPoll(p.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i HwTouchDowns() : ProcedureReturn 10 : EndProcedure
+Procedure.i HwTouchMoves() : ProcedureReturn gate_tick*10 : EndProcedure
+Procedure.i HwTouchUps() : ProcedureReturn Bool(gate_tick>=3)*10 : EndProcedure
+Procedure.i Gt9LastBusCode() : ProcedureReturn -77 : EndProcedure
+Procedure TouchSayBusCode(c.i) : gate_busSay=c : EndProcedure
+Procedure DrawBanner() : gate_restoring=1 : EndProcedure
+Procedure ScrPresentAll()
+ gate_presents=gate_presents+1
+ If gate_restoring<>0 : gate_seq=gate_seq+1 : gate_presentSeq=gate_seq : gate_exitPresent=gate_exitPresent+1 : EndIf
+EndProcedure
+; @@BODY@@
+Procedure Reset(mode.i)
+ gate_mode=mode : gate_tick=0 : gate_ids=0 : gate_moveMarks=0 : gate_releaseLines=0 : gate_renderer=0 : gate_repaint=0 : gate_show=0 : gate_hide=0 : gate_busSay=0 : gate_v3d=1 : gate_readyCalls=0 : gate_tickCalls=0 : gate_presents=0
+ gate_seq=0 : gate_exitPresent=0 : gate_presentSeq=0 : gate_rendererSeq=0 : gate_restoring=0
+ gScreen=1 : gScrSrc=#SCR_SRC_DSI : gCurShown=1 : *gConPaint=$1234
+ dsp_cox=3 : dsp_coy=4 : dsp_cols=80 : dsp_rows=30 : dsp_cx=7 : dsp_cy=8 : dsp_fg=$112233 : dsp_bg=$445566 : gV3dConOn=1 : gCursorGpuOwned=1
+EndProcedure
+Procedure.i Restored()
+ ProcedureReturn Bool(*gConPaint=$1234 And gate_renderer=$1234 And gate_repaint=1 And gate_show=1 And gate_hide=1 And dsp_cox=3 And dsp_coy=4 And dsp_cols=80 And dsp_rows=30 And dsp_cx=7 And dsp_cy=8 And dsp_fg=$112233 And dsp_bg=$445566 And gV3dConOn=1 And gCursorGpuOwned=1)
+EndProcedure
+Procedure.i Main()
+ Define rc.i
+ Reset(0) : rc=TouchVisualTest()
+ If rc<>0 : ProcedureReturn 1 : EndIf
+ If gate_ids<>$3FF Or gate_moveMarks<>10 Or gate_releaseLines<>40 Or gate_presents<>5 Or gate_exitPresent<>1 Or gate_presentSeq>=gate_rendererSeq Or Restored()=0 : ProcedureReturn 1 : EndIf
+ ; CPU renderer and a previously hidden cursor stay that way on key exit.
+ Reset(1) : gate_v3d=0 : gV3dConOn=0 : gCursorGpuOwned=0 : gCurShown=0 : rc=TouchVisualTest()
+ If rc<>0 Or gate_presents<>2 Or gate_exitPresent<>1 Or gate_presentSeq>=gate_rendererSeq Or *gConPaint<>$1234 Or gate_repaint<>1 Or gate_show<>0 Or gCurShown<>0 Or gV3dConOn<>0 Or gCursorGpuOwned<>0 : ProcedureReturn 2 : EndIf
+ Reset(2) : rc=TouchVisualTest() : If rc<>-1 Or gate_presents<>2 Or gate_exitPresent<>1 Or gate_presentSeq>=gate_rendererSeq Or Restored()=0 : ProcedureReturn 3 : EndIf
+ ; Re-entry after an error which populated all ten active slots must start with
+ ; fresh locals: no stale failure return and no extra first-frame motion.
+ Reset(3) : rc=TouchVisualTest() : If rc<>-1 Or gate_ids<>$3FF Or gate_presents<>3 Or gate_exitPresent<>1 Or gate_presentSeq>=gate_rendererSeq Or Restored()=0 : ProcedureReturn 5 : EndIf
+ Reset(0) : rc=TouchVisualTest()
+ If rc<>0 Or gate_ids<>$3FF Or gate_moveMarks<>10 Or gate_releaseLines<>40 Or gate_presents<>5 Or gate_exitPresent<>1 Or gate_presentSeq>=gate_rendererSeq Or Restored()=0 : ProcedureReturn 6 : EndIf
+ ; Refusal occurs before any touch hardware call or renderer mutation.
+ Reset(0) : gScreen=0 : rc=TouchVisualTest()
+ If rc<>0 Or gate_readyCalls<>0 Or gate_tickCalls<>0 Or gate_hide<>0 Or gate_presents<>0 Or *gConPaint<>$1234 : ProcedureReturn 4 : EndIf
+ ProcedureReturn 0
+EndProcedure

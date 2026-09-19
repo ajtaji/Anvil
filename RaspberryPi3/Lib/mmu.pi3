@@ -1,0 +1,838 @@
+; ======================================================================
+;  mmu.pi3 - the Cortex-A53 MMU and caches on the Raspberry Pi 3,
+;            and the reason the Pi 3 monitor cannot be written without it
+; ======================================================================
+;
+;  ---- WHY THIS EXISTS AT ALL, AND WHY IT IS NOT OPTIONAL HERE --------
+;
+;  The Pi 4's mmu.pi4 was staged: the monitor ran perfectly well with
+;  translation off for months and the MMU was brought up to make the
+;  machine FASTER. On this board the MMU is not an optimisation. It is
+;  the thing that makes the shared core RUNNABLE, and that is a different
+;  argument which is worth stating before anyone decides to skip a stage.
+;
+;  With SCTLR_ELx.M clear, ARMv8-A treats EVERY data access as
+;  Device-nGnRnE regardless of anything else, and an unaligned access to
+;  Device memory is an Alignment fault - not a slow path, a fault, and
+;  not one that SCTLR.A can turn off, because SCTLR.A only governs Normal
+;  memory. Anvil's shared core and the shared filesystems read packed
+;  on-disk structures at whatever byte offset the format puts them:
+;  Anvil/Storage/fat32.pbi and exfat.pbi walk directory entries,
+;  Anvil/Core/sha256.pbi walks message blocks, Anvil/Core/settings.pbi
+;  walks text. Any one of those landing odd is a data abort.
+;
+;  The existing Pi 3 code gets away with translation off because it is
+;  careful, small and hand-written against that constraint - the loader,
+;  the updater and the early diagnostics never make an unaligned access.
+;  The shared core makes no such promise and should not have to: it is
+;  the same source that runs on two boards where the MMU is already on.
+;
+;  So: translation on, caches on, before the prompt. The alternative is
+;  a monitor that faults the first time somebody types `sha256sum`.
+;
+;  ---- ON RISK, CALIBRATED --------------------------------------------
+;
+;  Nothing here can brick a Pi 3. A bad table hangs the board or resets
+;  it, and the cost is a power cycle. There is no EEPROM on this part -
+;  a Pi 3 boots from the card, so the very worst case is rewriting the
+;  card on a PC. The care taken below is about DIAGNOSABILITY, which is
+;  a genuinely different objective: a hang with the MMU half on gives no
+;  console and no clue, so everything that CAN be checked is checked
+;  BEFORE the enabling instruction, and MmuBuildTables() is a separate
+;  procedure from MmuEnable() precisely so its output can be dumped and
+;  read while the board is still in no danger at all.
+;
+;  This board has a second safety net the Pi 4 did not have at the same
+;  stage: the immutable loader's fifteen-second never-fed watchdog is
+;  still armed while this runs. A monitor that wedges in here is reset
+;  by it and the loader falls back to the last confirmed slot. That is
+;  not an excuse to be careless; it is the reason the MMU is brought up
+;  AFTER the A/B confirm rather than before it - see THE ORDER below.
+;
+;  ---- THE ORDER, AND IT IS THE LOAD-BEARING PART OF THIS FILE --------
+;
+;  THE FIRMWARE MAILBOX MUST BE FINISHED WITH BEFORE THE MMU GOES ON.
+;
+;  RaspberryPi3/Lib/mailbox.pbi's Pi3MailboxContext() reads SCTLR (EL2
+;  or EL3), masks it with 5 - bit 0 (M) and bit 2 (C) - and REFUSES the
+;  transaction if either is set. Its header says why in as many words:
+;  the property buffer must be "resident, 16-byte aligned, uncached low
+;  ARM RAM", and it "does not pretend a cache-off diagnostic path
+;  supports cached DMA ownership". That guard is correct for what it
+;  guards. It is also absolute: once this file turns the MMU on, every
+;  mailbox call on this board returns 0.
+;
+;  That is not a small list. Pi3ClockRate() feeds the UART baud divisor
+;  AND Pi3SdInit()'s clock (RaspberryPi3/Lib/sdhost.pbi:173); the ARM
+;  memory extent and the DTB validation come from a property tag; the
+;  board revision code - which is how HwMemoryBytes() knows this is a
+;  1 GB board - is a property tag; the framebuffer is allocated by
+;  property tag; the status LED is a firmware GPIO expander line reached
+;  by property tag.
+;
+;  SO THE MONITOR'S BOOT IS: every mailbox transaction first, the A/B
+;  confirm and the watchdog release next, THEN this file, and then the
+;  prompt. Everything the monitor will ever need from the firmware is
+;  asked for once, while it can still be asked, and remembered.
+;  RaspberryPi3/Board/hw_mem.pi3 is written around exactly that and says
+;  so; it is the one place where this board's backend is structurally
+;  different from RaspberryPi4/Board/hw_mem.pi4, which can afford to ask
+;  lazily from inside the address guard.
+;
+;  THE PROPER FIX IS IN mailbox.pbi AND IT IS NOT THIS LANE'S FILE. The
+;  guard's real question is "is the property buffer coherent with the
+;  VideoCore", not "are the caches globally off"; a buffer sitting in a
+;  Normal Non-Cacheable block is coherent with caches on, which is what
+;  MmuAddNc() below exists to arrange. That change belongs to whoever
+;  owns the loader's include closure, it is written down in the vault
+;  plan, and until it lands this file's ORDER is the answer. Nothing
+;  here works around the guard and nothing here disables it.
+;
+;  ---- THE MAP --------------------------------------------------------
+;
+;  The whole of this board's address space of interest fits in two
+;  gigabytes, which is why the level-1 table has FOUR entries where the
+;  Pi 4's has sixty-four. From arch/arm/boot/dts/broadcom/bcm2837.dtsi
+;  lines 8-10 in the pinned Raspberry Pi Linux reference:
+;
+;      ranges = <0x7e000000  0x3f000000  0x1000000>,
+;               <0x40000000  0x40000000  0x00001000>;
+;      dma-ranges = <0xc0000000  0x00000000  0x3f000000>;
+;
+;  which says: the legacy $7E000000 peripheral bus window is at physical
+;  $3F000000 and is 16 MB; the ARM-local window is at $40000000 and is
+;  4 KB; and the DRAM the VideoCore can see runs from 0 for $3F000000
+;  bytes. So:
+;
+;    $00000000..$3EFFFFFF   DRAM, Normal Write-Back cacheable, minus any
+;                           range MmuAddNc() has asked to keep coherent
+;    $3F000000..$3FFFFFFF   the BCM2837 peripherals, Device-nGnRnE
+;    $40000000..$401FFFFF   the ARM-local peripherals, Device-nGnRnE.
+;                           The window is only 4 KB; this is the 2 MB
+;                           block containing it, because a level-2 block
+;                           is the finest thing these tables express.
+;                           RaspberryPi3/Board/hw_addr.pi3 refuses above
+;                           $40000FFF and says so - the guard is tighter
+;                           than the tables here, deliberately, and that
+;                           asymmetry is written down in both files.
+;    everything else        FAULT
+;
+;  THERE IS NO SECOND RUN OF DRAM. On the Pi 4 the 64 MB the peripheral
+;  aperture displaces reappears above four gigabytes, and a monitor that
+;  invited an operator to type that address cost a board its power on
+;  2026-09-18 (the vault's "Memory size and the unmapped second run").
+;  The BCM2837 has no such run: 1 GB is fitted, the top 16 MB of it is
+;  under the peripheral window, and that memory is simply not reachable
+;  by the ARM. So the honest top of DRAM here is $3EFFFFFF and the guard
+;  says ABSENT above it rather than inviting anybody anywhere.
+;
+;  ---- GEOMETRY -------------------------------------------------------
+;
+;  4 KB granule, 32-bit input address (T0SZ = 32), so the walk starts at
+;  level 1 with index bits [31:30]: FOUR level-1 descriptors, each
+;  covering 1 GiB. Two of them are split by level-2 tables of 512
+;  entries at 2 MiB each. Three 4 KiB tables in all, 12,288 bytes.
+;
+;  The Pi 4 uses a 36-bit input address because it has to reach a PCIe
+;  outbound window at $6_0000_0000. Nothing on this board is above
+;  $40001000, so a 32-bit input address is not a saving - it is the
+;  truth, and it means an address above 4 GiB is refused by the
+;  translation regime itself rather than by a slot left at FAULT.
+;
+;  ---- WHAT TURNING THE CACHES ON CHANGES, AND WHAT IT DOES NOT -------
+;
+;  ON THIS BOARD, LESS THAN ON THE PI 4, AND THAT IS WORTH KNOWING
+;  BEFORE ANYBODY GOES LOOKING FOR TROUBLE. The Pi 4's note warns that
+;  every driver that DMAs - xhci, genet, usbmsc, the mailbox - has
+;  cache-maintenance calls that are no-ops until DRAM is cacheable and
+;  have never been exercised. The equivalent audit for this board, done
+;  before this file was written:
+;
+;    * SDHOST IS PROGRAMMED I/O. RaspberryPi3/Lib/sdhost.pbi's
+;      p3sdTransfer() moves the block a word at a time through the data
+;      FIFO at register $40 - PeekL/PokeL on the caller's buffer and
+;      p3sdRead/p3sdWrite on the register. There is no bus master, so
+;      there is no coherency question, so the whole storage path is safe
+;      with caches on with no maintenance at all. This is the single
+;      biggest reason M1 can turn the caches on at the same time as the
+;      MMU rather than staging them.
+;    * THE MAILBOX IS the one bus master in the M1 image, and it is
+;      handled by the ORDER above rather than by maintenance.
+;    * THE USB HOST AND THE ETHERNET ADAPTER do DMA, and they are not in
+;      the M1 image at all. Whoever brings them in owns that audit, and
+;      MmuAddNc() below is the mechanism, the same one the Pi 4 uses for
+;      its framebuffer.
+;
+;  MmuAddNc(lo, hi) marks a range to be mapped Normal NON-CACHEABLE
+;  instead of Write-Back, at 2 MiB granularity, in either of the split
+;  gigabytes. It is how a buffer shared with a bus master stays coherent
+;  without a single maintenance call - which is strictly better than
+;  maintenance nobody has ever run. Call it BEFORE MmuBuildTables().
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NONE. House rule 10: a library never includes another library; the
+;  main file lists what it needs. This file reads and writes system
+;  registers and plain memory and calls nothing.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  MmuCurrentEl() / MmuEl() - what level is this actually running at.
+;
+;  READ, NEVER ASSUMED. The Pi 3's firmware normally hands off at EL2,
+;  and the loader's branch (Pi3UpdateEnter in
+;  RaspberryPi3/Board/update_boot_support.pbi) is a plain `br` that
+;  changes nothing - so the monitor arrives wherever the firmware put
+;  the loader. "Normally" is not a contract: config.txt can ask for EL3,
+;  and a board whose banner asserted a level it had not read is the exact
+;  defect forum 575 was about.
+;
+;  CurrentEL holds the level in bits 3:2, so the raw read is 4, 8 or 12
+;  and MmuEl() shifts it down to 1, 2 or 3.
+; ----------------------------------------------------------------------
+Procedure.i MmuCurrentEl()
+  ASM
+    mrs x0, currentel
+  EndASM
+EndProcedure
+
+Procedure.i MmuEl()
+  ProcedureReturn (MmuCurrentEl() >> 2) & 3
+EndProcedure
+
+Procedure.i MmuAtEl3()
+  If MmuCurrentEl() = 12
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The SCTLR readers. One per level, because a system register name is
+;  part of the instruction in this assembler and cannot be an operand -
+;  which is also why MmuEnable() below carries two near-identical
+;  sequences rather than one helper.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlrEl2()
+  ASM
+    mrs x0, sctlr_el2
+  EndASM
+EndProcedure
+
+Procedure.i MmuSctlrEl3()
+  ASM
+    mrs x0, sctlr_el3
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlr() - the one the processor is actually using.
+;
+;  `cache status`, HwMmuState() and MmuEnabled() are all asking "is
+;  translation on for the code running right now", so they must read the
+;  register of the CURRENT level. Reading SCTLR_EL2 at EL3 is legal and
+;  returns a register nothing is using, which would be a confident wrong
+;  answer of the worst kind.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlr()
+  If MmuAtEl3() <> 0
+    ProcedureReturn MmuSctlrEl3()
+  EndIf
+  ProcedureReturn MmuSctlrEl2()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The attribute constants. Every one cited, and every one identical to
+;  RaspberryPi4/Lib/mmu.pi4's - these are architecture, not chip, and two
+;  boards disagreeing about what a Normal Write-Back descriptor looks
+;  like would be a bug in one of them.
+; ----------------------------------------------------------------------
+
+; MAIR. One byte per index, low index first:
+;   0  Device-nGnRnE   $00
+;   1  Device-nGnRE    $04
+;   2  Device-GRE      $0C
+;   3  Normal NC       $44
+;   4  Normal WB       $FF
+; -> $FF_440C_0400. Indices 0, 3 and 4 are used below; the other two are
+; carried because the register is written whole.
+#MMU3_MAIR = $FF440C0400
+
+; TCR, for a 32-bit input address at EL2 or EL3 (the two registers have
+; the same field layout, both being the one-VA-range no-VHE format):
+;
+;   RSVD          (1<<31)|(1<<23)   $80800000
+;   PS = 0 (32-bit output address)  $00000000   the BCM2837 has no
+;                                               physical address above
+;                                               $40001000, so claiming
+;                                               36 bits would describe
+;                                               space that is not there
+;   TG0 = 4 KB    (0<<14)           $00000000
+;   SH0 = inner   (3<<12)           $00003000
+;   ORGN0 = WBWA  (1<<10)           $00000400
+;   IRGN0 = WBWA  (1<<8)            $00000100
+;   T0SZ = 64-32                    $00000020
+;                                   ----------
+;                                   $80803520
+;
+; The SH0/IRGN0/ORGN0 fields describe the TABLE WALKER's own accesses,
+; not the memory being mapped. They say cacheable here and that is
+; correct and not an inconsistency.
+#MMU3_TCR = $80803520
+
+; A 2 MiB or 1 GiB BLOCK descriptor, Device-nGnRnE:
+;   PTE_TYPE_BLOCK   (1<<0)                  $001
+;   MEMTYPE index 0                          $000
+;   NON_SHARE        (0<<8)                  $000
+;   AF, the access flag (1<<10)              $400
+;
+; THE ACCESS FLAG IS NOT OPTIONAL. With AF clear the very first access
+; through the descriptor takes an Access Flag fault. It is one bit, it
+; is easy to leave out, and leaving it out produces a board that dies on
+; the instruction after the enable with nothing on the console.
+#MMU3_ATTR_DEVICE = $401
+
+; Normal Inner/Outer Non-Cacheable - MAIR index 3, inner shareable:
+;   BLOCK $001 | (3<<2) $00C | INNER_SHARE $300 | AF $400
+#MMU3_ATTR_NC = $70D
+
+; Normal Inner/Outer Write-Back cacheable - MAIR index 4, inner
+; shareable:
+;   BLOCK $001 | (4<<2) $010 | INNER_SHARE $300 | AF $400
+#MMU3_ATTR_WB = $711
+
+; What ordinary DRAM gets. Written as a literal rather than as
+; #MMU3_ATTR_WB because this language refuses a constant declared from
+; another constant in its initialiser - the same trap
+; RaspberryPi4/Lib/mmu.pi4 records at the same line. The only two values
+; this may ever take are $711 (Write-Back) and $70D (Non-Cacheable), and
+; it is one constant so that a bad result is one edit to revert.
+#MMU3_DRAM_ATTR = $711
+
+; A TABLE descriptor is the next table's address with the low two bits
+; set. No hierarchical permission bits, so a table imposes no extra
+; restriction on what it points at.
+#MMU3_DESC_TABLE = 3
+
+; An all-zero descriptor faults. The name exists so the loop below says
+; what it means rather than storing a bare zero.
+#MMU3_DESC_FAULT = 0
+
+; SCTLR bits. M is bit 0, C (D-cache) is bit 2, I (I-cache) is bit 12.
+;
+; WITH C CLEAR, ARMv8-A TREATS EVERY NORMAL ACCESS AS NON-CACHEABLE
+; WHATEVER THE DESCRIPTOR SAYS. So #MMU3_SCTLR_M on its own gives
+; translation with no caching even though #MMU3_DRAM_ATTR is the
+; Write-Back descriptor; M|C|I is what makes the attribute take effect.
+; Both are offered because the first bring-up on silicon should be able
+; to separate "the tables are wrong" from "the caches broke something",
+; and those are different questions with different answers.
+#MMU3_SCTLR_M   = 1
+#MMU3_SCTLR_C   = $4
+#MMU3_SCTLR_I   = $1000
+#MMU3_SCTLR_MCI = $1005
+
+; Geometry.
+#MMU3_L1_ENTRIES  = 4        ; 32-bit input address, index bits [31:30]
+#MMU3_L2_ENTRIES  = 512      ; a full 4 KiB table, 9 index bits
+#MMU3_TABLE_BYTES = 12288    ; three 4 KiB tables: L1, L2 for slot 0,
+                             ; L2 for slot 1
+
+; The two boundaries inside the low gigabyte, both from bcm2837.dtsi:8.
+; $3F000000 is where DRAM stops being reachable by the ARM and the
+; peripheral aperture begins; it is 2 MiB aligned, so a level-2 table
+; splits it exactly with no remainder to argue about.
+#MMU3_PERIPH_BASE = $3F000000
+#MMU3_PERIPH_TOP  = $3FFFFFFF
+
+; The ARM-local window. The hardware window is 4 KB
+; ($40000000..$40000FFF); #MMU3_LOCAL_BLOCKS is how many 2 MiB blocks of
+; slot 1 are mapped Device to contain it, which is one. Everything above
+; that in slot 1 is FAULT.
+#MMU3_LOCAL_BASE   = $40000000
+#MMU3_LOCAL_TOP    = $40000FFF
+#MMU3_LOCAL_BLOCKS = 1
+
+; Where the tables live. $1F10000 is 64 KiB aligned, above the monitor's
+; stack top ($1F00000, from tools/pi3_slot.py's STACK_ADDRESS) and below
+; the loader's handoff page ($1FF0000, #PI3_UPDATE_HANDOFF) - a gap this
+; board's slot contract leaves unused by construction. It is a constant
+; rather than a BSS array because a BSS array is not 4 KiB aligned and
+; hunting alignment at run time inside the one procedure that must be
+; inspectable is the wrong kind of clever.
+#MMU3_TABLE_BASE = $1F10000
+
+; MmuBuildTables() refusals. Negative and distinct, because "no tables"
+; and "tables somewhere useless" are different bugs and one -1 would
+; merge them.
+#MMU3_ERR_NULL  = -1
+#MMU3_ERR_ALIGN = -2
+#MMU3_ERR_LOW   = -3
+#MMU3_ERR_HIGH  = -4
+
+; ----------------------------------------------------------------------
+;  The values MmuEnable() loads, written by MmuBuildTables() so that the
+;  enable sequence's ASM block contains nothing but the switch itself.
+; ----------------------------------------------------------------------
+Global mmu3_ttbr.i
+Global mmu3_tcr.i
+Global mmu3_mair.i
+
+; ----------------------------------------------------------------------
+;  The non-cacheable ranges. Four is enough for every buffer this board
+;  is ever likely to share with a bus master at once (the mailbox
+;  property buffer, a framebuffer, and two spare for the USB and
+;  Ethernet lanes) and a fixed array cannot fail to allocate.
+; ----------------------------------------------------------------------
+#MMU3_NC_MAX = 4
+Global Dim mmu3_nc_lo.i[#MMU3_NC_MAX]
+Global Dim mmu3_nc_hi.i[#MMU3_NC_MAX]
+Global mmu3_ncN.i
+
+Procedure MmuClearNc()
+  mmu3_ncN = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuAddNc(lo, hi) - keep this range out of the caches.
+;
+;  Rounded OUT to 2 MiB block boundaries by mmu3_BlockNc() below, never
+;  in: a buffer half of which is cached is worse than one that is wholly
+;  cached, because the failure then depends on where in the buffer the
+;  bus master happened to look.
+;
+;  Call before MmuBuildTables(). Adding a range afterwards changes
+;  nothing, and this says so by refusing silently rather than by
+;  pretending - MmuNcCount() is how a caller checks it took.
+; ----------------------------------------------------------------------
+Procedure MmuAddNc(lo.i, hi.i)
+  If mmu3_ncN >= #MMU3_NC_MAX Or hi < lo Or lo < 0
+    ProcedureReturn
+  EndIf
+  mmu3_nc_lo[mmu3_ncN] = lo
+  mmu3_nc_hi[mmu3_ncN] = hi
+  mmu3_ncN = mmu3_ncN + 1
+EndProcedure
+
+Procedure.i MmuNcCount()
+  ProcedureReturn mmu3_ncN
+EndProcedure
+
+; Does the 2 MiB block starting at pa overlap any non-cacheable range?
+Procedure.i mmu3_BlockNc(pa.i)
+  Define i.i
+  Define top.i
+  top = pa + $1FFFFF
+  For i = 0 To mmu3_ncN - 1
+    If mmu3_nc_lo[i] <= top And mmu3_nc_hi[i] >= pa
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuBuildTables(base) - write the three tables. TOUCHES NO SYSTEM
+;  REGISTER.
+;
+;  SEPARATE FROM MmuEnable() ON PURPOSE. This procedure only writes
+;  DRAM, so it can be called and its output dumped and read word by word
+;  with the MMU still off and the board in no danger at all. That is what
+;  makes this stage provable: everything that could be wrong is
+;  inspectable BEFORE the one instruction that commits to it.
+; ----------------------------------------------------------------------
+Procedure.i MmuBuildTables(base.i)
+  Define i.i
+  Define pa.i
+  Define l2lo.i
+  Define l2hi.i
+  Define d.i
+
+  If base = 0
+    ProcedureReturn #MMU3_ERR_NULL
+  EndIf
+  If (base & $FFF) <> 0
+    ProcedureReturn #MMU3_ERR_ALIGN
+  EndIf
+  ; Below $1F00000 is the monitor's stack, its BSS, its code and the
+  ; loader's staging arena. Tables written there would corrupt the thing
+  ; that is about to translate through them.
+  If base < $1F00000
+    ProcedureReturn #MMU3_ERR_LOW
+  EndIf
+  ; And they must not reach the loader's handoff page, which the A/B
+  ; machinery reads back after the confirm.
+  If base + #MMU3_TABLE_BYTES > $1FF0000
+    ProcedureReturn #MMU3_ERR_HIGH
+  EndIf
+
+  l2lo = base + 4096      ; splits level-1 slot 0, $00000000..$3FFFFFFF
+  l2hi = base + 8192      ; splits level-1 slot 1, $40000000..$7FFFFFFF
+
+  ; ---- level-2 for slot 0: DRAM, then the peripheral aperture -------
+  For i = 0 To #MMU3_L2_ENTRIES - 1
+    pa = i << 21
+    If pa >= #MMU3_PERIPH_BASE
+      d = pa | #MMU3_ATTR_DEVICE
+    ElseIf mmu3_BlockNc(pa) <> 0
+      d = pa | #MMU3_ATTR_NC
+    Else
+      d = pa | #MMU3_DRAM_ATTR
+    EndIf
+    ; PokeI, eight bytes. A descriptor is 64 bits and PokeL would write
+    ; four, leaving the top half of every entry holding whatever DRAM
+    ; happened to contain - which for a table this size is a walk into
+    ; arbitrary memory.
+    PokeI(l2lo + (i << 3), d)
+  Next
+
+  ; ---- level-2 for slot 1: the ARM-local window, then nothing -------
+  ; Only the blocks that contain the 4 KB local window are mapped. The
+  ; rest of the gigabyte FAULTS, which is the honest answer: there is no
+  ; hardware there.
+  For i = 0 To #MMU3_L2_ENTRIES - 1
+    pa = #MMU3_LOCAL_BASE + (i << 21)
+    If i < #MMU3_LOCAL_BLOCKS
+      d = pa | #MMU3_ATTR_DEVICE
+    Else
+      d = #MMU3_DESC_FAULT
+    EndIf
+    PokeI(l2hi + (i << 3), d)
+  Next
+
+  ; ---- level 1: four slots -----------------------------------------
+  For i = 0 To #MMU3_L1_ENTRIES - 1
+    If i = 0
+      d = l2lo | #MMU3_DESC_TABLE
+    ElseIf i = 1
+      d = l2hi | #MMU3_DESC_TABLE
+    Else
+      d = #MMU3_DESC_FAULT
+    EndIf
+    PokeI(base + (i << 3), d)
+  Next
+
+  ; Hand the enable sequence its three values here, not inside it, so
+  ; that everything MmuEnable() needs is already in memory before it is
+  ; called.
+  mmu3_ttbr = base
+  mmu3_tcr  = #MMU3_TCR
+  mmu3_mair = #MMU3_MAIR
+
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Read one descriptor back, so a probe or a gate can check the tables
+;  with the MMU still off. "The table builder is correct" is a claim that
+;  should be tested by something other than the table builder.
+; ----------------------------------------------------------------------
+Procedure.i MmuDescriptor(base.i, slot.i)
+  ProcedureReturn PeekI(base + (slot << 3))
+EndProcedure
+
+Procedure.i MmuDescriptorL2Low(base.i, slot.i)
+  ProcedureReturn PeekI(base + 4096 + (slot << 3))
+EndProcedure
+
+Procedure.i MmuDescriptorL2High(base.i, slot.i)
+  ProcedureReturn PeekI(base + 8192 + (slot << 3))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuAttrFor(pa) - what attribute word a physical address SHOULD get.
+;
+;  THE ONE PURE PROCEDURE IN THIS FILE, and it exists for the same
+;  reason HwMemFromRevision() exists in RaspberryPi4/Board/hw_mem.pi4:
+;  it is the only part of the map a desk gate can EXECUTE. Everything
+;  else here writes DRAM or a system register. A gate compiles this
+;  procedure, runs the emitted A64 over the boundaries of THE MAP above
+;  and over the addresses either side of each one, and rejects an
+;  off-by-one, a swapped attribute and a missing access flag.
+;
+;  MmuBuildTables() and RaspberryPi3/Board/hw_addr.pi3 are both written
+;  against it so that the tables and the guard cannot drift apart: there
+;  is one statement of what is where, and both readers ask it.
+;  It answers #MMU3_DESC_FAULT for an address with nothing behind it.
+;
+;  IT DOES NOT CONSULT THE NON-CACHEABLE LIST. Those are a run-time
+;  decision about coherency, not a statement about what kind of thing is
+;  at an address, and folding them in here would make the gate's
+;  expectations depend on what a caller happened to register.
+; ----------------------------------------------------------------------
+Procedure.i MmuAttrFor(pa.i)
+  If pa < 0
+    ProcedureReturn #MMU3_DESC_FAULT
+  EndIf
+  If pa < #MMU3_PERIPH_BASE
+    ProcedureReturn #MMU3_DRAM_ATTR
+  EndIf
+  ; THE PERIPHERAL APERTURE AND THE PROCESSOR-LOCAL WINDOW ARE
+  ; ADJACENT ON THIS PART: $3FFFFFFF + 1 IS $40000000. An earlier
+  ; version of this procedure carried an arm refusing the gap between
+  ; them, and the gate caught it as dead code on its first run - there
+  ; is no gap, the arm could never be reached, and a refusal sentence
+  ; nobody can ever see is a refusal nobody can act on.
+  If pa <= #MMU3_PERIPH_TOP
+    ProcedureReturn #MMU3_ATTR_DEVICE
+  EndIf
+  If pa <= #MMU3_LOCAL_TOP
+    ProcedureReturn #MMU3_ATTR_DEVICE
+  EndIf
+  ProcedureReturn #MMU3_DESC_FAULT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuBarrier() - dsb sy; isb. Its own procedure because several callers
+;  outside this file need exactly this pair and an ASM block in a board
+;  file is a place a register gets clobbered.
+; ----------------------------------------------------------------------
+Procedure MmuBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEnabled() / MmuCachesOn() - what is actually on, read from the
+;  register of the current level.
+; ----------------------------------------------------------------------
+Procedure.i MmuEnabled()
+  ProcedureReturn (MmuSctlr() & 1) <> 0
+EndProcedure
+
+Procedure.i MmuCachesOn()
+  ProcedureReturn (MmuSctlr() & 4) <> 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuState() - the HwMmuState() answer: bit 0 MMU, bit 1 D-cache,
+;  bit 2 I-cache. Note the bit ORDER is the seam's, not SCTLR's - the
+;  seam numbers them 0,1,2 and SCTLR puts them at 0,2,12 - which is
+;  exactly the kind of quiet mismatch that makes a status line wrong
+;  without making it look wrong.
+; ----------------------------------------------------------------------
+Procedure.i MmuState()
+  Define s.i
+  Define r.i
+  s = MmuSctlr()
+  r = 0
+  If (s & 1) <> 0
+    r = r | 1
+  EndIf
+  If (s & 4) <> 0
+    r = r | 2
+  EndIf
+  If (s & $1000) <> 0
+    r = r | 4
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEnable() - THE SWITCH. The single most dangerous sequence here.
+;
+;  THE TWO ARMS ARE DUPLICATED RATHER THAN FACTORED, and that is
+;  deliberate. The obvious tidy-up is one helper with the register name
+;  passed in, which this assembler cannot express: a system register is
+;  part of the instruction, not an operand. The next tidy-up is a helper
+;  per level called from the middle of the sequence, and that puts a
+;  stack push and pop between the register loads and the enable. Two
+;  copies of eighteen instructions is cheaper than debugging that.
+;
+;  THE VALUES ARE THE SAME AT BOTH LEVELS. TCR_EL3 and MAIR_EL3 have the
+;  same field layout as their EL2 twins, both being the one-VA-range
+;  no-VHE format, which is why there is no separate EL3 constant to
+;  disagree with them.
+;
+;  M ONLY, NOT M|C|I. This procedure turns translation on and leaves the
+;  caches alone, so the first thing tried on silicon separates "the
+;  tables are wrong" from "the caches broke something".
+;  MmuEnableCached() below is the one the monitor actually calls once
+;  the tables have been read back on a board.
+;
+;  `orr x9, x9, x10` rather than an immediate: the assembler's logical
+;  immediate encoding is a bitmask form this file does not need to rely
+;  on, and a register is unambiguous.
+; ----------------------------------------------------------------------
+Procedure MmuEnable()
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      tlbi alle3
+      dsb sy
+      isb
+
+      adrp x9, global_mmu3_ttbr
+      add  x9, x9, #:lo12:global_mmu3_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el3, x9
+
+      adrp x9, global_mmu3_tcr
+      add  x9, x9, #:lo12:global_mmu3_tcr
+      ldr  x9, [x9]
+      msr  tcr_el3, x9
+
+      adrp x9, global_mmu3_mair
+      add  x9, x9, #:lo12:global_mmu3_mair
+      ldr  x9, [x9]
+      msr  mair_el3, x9
+
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el3
+      movz x10, #1
+      orr  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+    EndASM
+  Else
+    ASM
+      dsb sy
+      tlbi alle2
+      dsb sy
+      isb
+
+      adrp x9, global_mmu3_ttbr
+      add  x9, x9, #:lo12:global_mmu3_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el2, x9
+
+      adrp x9, global_mmu3_tcr
+      add  x9, x9, #:lo12:global_mmu3_tcr
+      ldr  x9, [x9]
+      msr  tcr_el2, x9
+
+      adrp x9, global_mmu3_mair
+      add  x9, x9, #:lo12:global_mmu3_mair
+      ldr  x9, [x9]
+      msr  mair_el2, x9
+
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el2
+      movz x10, #1
+      orr  x9, x9, x10
+      msr  sctlr_el2, x9
+      isb
+    EndASM
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEnableCached() - translation AND both caches, in one step.
+;
+;  ONE STEP AND NOT TWO, and the reason is specific to this board rather
+;  than a preference. Between a bare MmuEnable() and a later "now set C
+;  and I" there is a window in which translation is on and caching is
+;  off; every byte the monitor writes in that window - its console ring,
+;  its globals, the prompt it is about to print - is written
+;  Non-Cacheable, and every byte it reads afterwards comes from a cache
+;  that never saw them. Cleaning that up correctly means the very
+;  cache-maintenance discipline this file is trying to avoid needing. So
+;  the caches come on with the MMU, at a moment when nothing has been
+;  written since the tables, or they do not come on at all.
+;
+;  The three ASM sequences differ from MmuEnable()'s only in the mask:
+;  #MMU3_SCTLR_MCI is $1005, a single movz-able word.
+; ----------------------------------------------------------------------
+Procedure MmuEnableCached()
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      tlbi alle3
+      dsb sy
+      isb
+
+      adrp x9, global_mmu3_ttbr
+      add  x9, x9, #:lo12:global_mmu3_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el3, x9
+
+      adrp x9, global_mmu3_tcr
+      add  x9, x9, #:lo12:global_mmu3_tcr
+      ldr  x9, [x9]
+      msr  tcr_el3, x9
+
+      adrp x9, global_mmu3_mair
+      add  x9, x9, #:lo12:global_mmu3_mair
+      ldr  x9, [x9]
+      msr  mair_el3, x9
+
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el3
+      movz x10, #4101
+      orr  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+    EndASM
+  Else
+    ASM
+      dsb sy
+      tlbi alle2
+      dsb sy
+      isb
+
+      adrp x9, global_mmu3_ttbr
+      add  x9, x9, #:lo12:global_mmu3_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el2, x9
+
+      adrp x9, global_mmu3_tcr
+      add  x9, x9, #:lo12:global_mmu3_tcr
+      ldr  x9, [x9]
+      msr  tcr_el2, x9
+
+      adrp x9, global_mmu3_mair
+      add  x9, x9, #:lo12:global_mmu3_mair
+      ldr  x9, [x9]
+      msr  mair_el2, x9
+
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el2
+      movz x10, #4101
+      orr  x9, x9, x10
+      msr  sctlr_el2, x9
+      isb
+    EndASM
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuUp() - build and switch, with the one check that matters between.
+;
+;  THE READ-BACK IS NOT DECORATION. MmuBuildTables() writes DRAM through
+;  the same pointer machinery everything else uses, and a table that did
+;  not land - a bad base, a range that did not take - produces a hang
+;  with no console at the following instruction. Reading slot 0 back and
+;  requiring it to be the table descriptor it was told to write costs
+;  one load and turns that hang into a refusal that can be printed.
+;
+;  It answers 0 on refusal WITHOUT having touched a system register, so
+;  the caller can say so on a console that still works.
+; ----------------------------------------------------------------------
+Procedure.i MmuUp()
+  Define rc.i
+  rc = MmuBuildTables(#MMU3_TABLE_BASE)
+  If rc <> 0
+    ProcedureReturn rc
+  EndIf
+  If MmuDescriptor(#MMU3_TABLE_BASE, 0) <> ((#MMU3_TABLE_BASE + 4096) | #MMU3_DESC_TABLE)
+    ProcedureReturn #MMU3_ERR_NULL
+  EndIf
+  If MmuDescriptor(#MMU3_TABLE_BASE, 1) <> ((#MMU3_TABLE_BASE + 8192) | #MMU3_DESC_TABLE)
+    ProcedureReturn #MMU3_ERR_NULL
+  EndIf
+  If MmuDescriptor(#MMU3_TABLE_BASE, 3) <> #MMU3_DESC_FAULT
+    ProcedureReturn #MMU3_ERR_NULL
+  EndIf
+  MmuEnableCached()
+  ProcedureReturn 0
+EndProcedure

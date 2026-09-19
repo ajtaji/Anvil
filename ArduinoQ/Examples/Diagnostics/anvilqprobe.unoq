@@ -1,0 +1,261 @@
+; ======================================================================
+;  anvilqprobe.unoq - Arduino UNO Q (QCM2290) bring-up PROBE #1
+;
+;  THIS IS A MINIMAL BRING-UP PROBE, NOT the Anvil monitor. Its whole
+;  job is to PROVE that a PureMetal-built AArch64 image executes on the Q's
+;  Cortex-A53, launched by the board's own UEFI firmware, and to leave
+;  behind evidence a running Linux can read back over SSH.
+;
+;  ---- WHICH TARGET IT IS BUILT FOR --------------------------------
+;  It was first built with -t pi4, before the unoq target had a code
+;  generator. It is built with -t unoq now. The unoq target reuses the
+;  same A64 backend as pi4, the A53 runs the same ARMv8.0-A A64 ISA as
+;  the Pi 4's A72, and this probe uses ONLY architectural system
+;  registers, plain DRAM, and the UEFI SystemTable passed in at runtime -
+;  no BCM2711 peripheral is touched - so the output is fully portable to
+;  the Q. See the tool header in tools/unoq_efi_wrap.py and the build
+;  script tools/build_unoq_probe.sh.
+;
+;  ---- HOW IT RUNS ---------------------------------------------------
+;  It is wrapped as a minimal AArch64 PE/COFF EFI application and staged
+;  onto the ESP, booted once by systemd-boot. The image is position-
+;  independent (every global is reached with adrp/#:lo12: - PC-relative -
+;  and BSS lives inside the image), so UEFI may load it at any address.
+;
+;  UEFI calls the entry with x0 = EFI ImageHandle, x1 = EFI SystemTable
+;  (AAPCS64). The compiler's --entry-returns _start preserves x0/x1 (it only
+;  touches x16/x17/x18/x9/x10 before `bl Main`), so Main() captures them
+;  in its very first instructions.
+;
+;  ---- THE PROOF -----------------------------------------------------
+;  It reads MIDR_EL1 (0x51af8014 on the QCM2290 A53), CNTFRQ_EL0 (19.2
+;  MHz on the Q), CurrentEL, and CNTPCT_EL0, packs them with a magic tag,
+;  and writes them into a NON-VOLATILE UEFI variable "AnvilProof" via
+;  RuntimeServices->SetVariable while boot services are still up. U-Boot
+;  persists NV variables to /boot/efi/ubootefi.var on the ESP, so Linux
+;  can read the proof back after the machine returns to it (efivarfs, or
+;  by parsing ubootefi.var directly - see tools/read_anvil_proof.py).
+;
+;  It then calls RuntimeServices->ResetSystem(EfiResetCold) to hand the
+;  board straight back to Linux. Because the one-shot boot selection was
+;  already consumed by systemd-boot, the reset lands on the default entry
+;  (Debian) - deterministic, no boot loop, nothing overwritten.
+; ======================================================================
+
+EnableExplicit
+
+; ---- captured UEFI entry registers -----------------------------------
+Global gIh.i            ; x0 = EFI ImageHandle at entry
+Global gSt.i            ; x1 = EFI SystemTable at entry
+
+; ---- CPU identity, read on the A53 -----------------------------------
+Global gMidr.i          ; MIDR_EL1  (implementer/part/revision)
+Global gCntfrq.i        ; CNTFRQ_EL0 in Hz
+Global gEl.i            ; CurrentEL raw (EL is bits [3:2], so EL = raw>>2)
+Global gCntpct.i        ; CNTPCT_EL0 sample #1
+Global gCntpct2.i       ; CNTPCT_EL0 sample #2 (shows the counter advanced)
+Global gStSig.i         ; PeekI(SystemTable) - the EFI table signature
+Global gSetRc.i         ; SetVariable() return status
+
+; ---- indirect-call scratch for UefiCall5() ---------------------------
+Global gCallFn.i
+Global gCallA0.i
+Global gCallA1.i
+Global gCallA2.i
+Global gCallA3.i
+Global gCallA4.i
+Global gCallRet.i
+
+; ---- buffers handed to SetVariable -----------------------------------
+Global Dim gName.b[24]  ; UTF-16LE "AnvilProof",0
+Global Dim gGuid.b[16]  ; vendor GUID
+Global Dim gProof.b[96] ; the variable's data payload
+
+; "IBI SYST" as a little-endian 64-bit word - the EFI_SYSTEM_TABLE
+; signature at offset 0. Used to sanity-check the captured SystemTable
+; before we ever call through it.
+#EFI_SYST_SIG = $5453595320494249
+; NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+#EFI_ATTR = $7
+#PROOF_LEN = 72
+
+; ----------------------------------------------------------------------
+;  System-register reads. Each is one mrs leaving the value in x0, which
+;  is where a .i return value lives - the same shape as timer.pi4.
+; ----------------------------------------------------------------------
+Procedure.i RdMidr()
+  ASM
+    mrs x0, midr_el1
+  EndASM
+EndProcedure
+
+Procedure.i RdCntfrq()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i RdCurrentEl()
+  ASM
+    mrs x0, CurrentEL
+  EndASM
+EndProcedure
+
+Procedure.i RdCntpct()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UefiCall5 - call gCallFn(gCallA0..gCallA3, gCallA4) by the AAPCS64 /
+;  UEFI convention, leaving the return status in gCallRet.
+;
+;  Everything crosses in globals, exactly like cache.pi4's CallAddr():
+;  the arguments are loaded from BSS into x0..x4, the target from gCallFn
+;  into x9, then `blr x9`. UEFI preserves x19..x28/sp/x29, so the caller's
+;  frame is intact; we only have to save the return value out of x0 before
+;  the epilogue runs.
+; ----------------------------------------------------------------------
+Procedure UefiCall5()
+  ASM
+    adrp x0, global_gcalla0
+    add  x0, x0, #:lo12:global_gcalla0
+    ldr  x0, [x0]
+    adrp x1, global_gcalla1
+    add  x1, x1, #:lo12:global_gcalla1
+    ldr  x1, [x1]
+    adrp x2, global_gcalla2
+    add  x2, x2, #:lo12:global_gcalla2
+    ldr  x2, [x2]
+    adrp x3, global_gcalla3
+    add  x3, x3, #:lo12:global_gcalla3
+    ldr  x3, [x3]
+    adrp x4, global_gcalla4
+    add  x4, x4, #:lo12:global_gcalla4
+    ldr  x4, [x4]
+    adrp x9, global_gcallfn
+    add  x9, x9, #:lo12:global_gcallfn
+    ldr  x9, [x9]
+    blr  x9
+    adrp x10, global_gcallret
+    add  x10, x10, #:lo12:global_gcallret
+    str  x0, [x10]
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  A byte-store helper so the buffer construction below reads cleanly.
+; ----------------------------------------------------------------------
+Procedure Pb(base.i, off.i, v.i)
+  PokeB(base + off, v)
+EndProcedure
+
+Procedure.i Main()
+  Define rt.i
+  Define fn.i
+  Define base.i
+  Define stOk.i
+
+  ; ---- CAPTURE x0/x1 FIRST -------------------------------------------
+  ; UEFI passed ImageHandle in x0 and SystemTable in x1. The compiler's _start
+  ; did not disturb them, and Main()'s prologue only sets up the frame,
+  ; so they are still live here. Store them before any other code can
+  ; reuse x0/x1.
+  ASM
+    adrp x9, global_gih
+    add  x9, x9, #:lo12:global_gih
+    str  x0, [x9]
+    adrp x9, global_gst
+    add  x9, x9, #:lo12:global_gst
+    str  x1, [x9]
+  EndASM
+
+  ; ---- read the A53's identity ---------------------------------------
+  gMidr   = RdMidr()
+  gCntfrq = RdCntfrq()
+  gEl     = RdCurrentEl()
+  gCntpct = RdCntpct()
+
+  ; ---- build the UTF-16LE variable name "AnvilProof",0 ---------------
+  base = @gName[0]
+  Pb(base, 0, 65)  : Pb(base, 1, 0)     ; A
+  Pb(base, 2, 110) : Pb(base, 3, 0)     ; n
+  Pb(base, 4, 118) : Pb(base, 5, 0)     ; v
+  Pb(base, 6, 105) : Pb(base, 7, 0)     ; i
+  Pb(base, 8, 108) : Pb(base, 9, 0)     ; l
+  Pb(base, 10, 80) : Pb(base, 11, 0)    ; P
+  Pb(base, 12, 114): Pb(base, 13, 0)    ; r
+  Pb(base, 14, 111): Pb(base, 15, 0)    ; o
+  Pb(base, 16, 111): Pb(base, 17, 0)    ; o
+  Pb(base, 18, 102): Pb(base, 19, 0)    ; f
+  Pb(base, 20, 0)  : Pb(base, 21, 0)    ; terminating NUL
+
+  ; ---- build the vendor GUID a1b2c3d4-5566-7788-99aa-bbccddeeff00 ----
+  ; EFI_GUID byte order: Data1/2/3 little-endian, Data4 in byte order.
+  base = @gGuid[0]
+  Pb(base, 0, $D4) : Pb(base, 1, $C3) : Pb(base, 2, $B2) : Pb(base, 3, $A1)
+  Pb(base, 4, $66) : Pb(base, 5, $55)
+  Pb(base, 6, $88) : Pb(base, 7, $77)
+  Pb(base, 8, $99) : Pb(base, 9, $AA) : Pb(base, 10, $BB) : Pb(base, 11, $CC)
+  Pb(base, 12, $DD): Pb(base, 13, $EE) : Pb(base, 14, $FF) : Pb(base, 15, $00)
+
+  ; ---- validate the captured SystemTable before trusting it ----------
+  ; Only read/call through it if it is a non-null, 8-byte-aligned DRAM
+  ; pointer whose first word is the EFI_SYSTEM_TABLE signature. DRAM is
+  ; identity-mapped by UEFI, so the PeekI is safe under those guards.
+  stOk = 0
+  If gSt <> 0
+    If (gSt & 7) = 0
+      If gSt >= $40000000
+        gStSig = PeekI(gSt)
+        If gStSig = #EFI_SYST_SIG
+          stOk = 1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; ---- pack the proof payload ----------------------------------------
+  base = @gProof[0]
+  Pb(base, 0, 65) : Pb(base, 1, 78) : Pb(base, 2, 86) : Pb(base, 3, 73)  ; ANVI
+  Pb(base, 4, 76) : Pb(base, 5, 81) : Pb(base, 6, 48) : Pb(base, 7, 49)  ; LQ01
+  PokeI(base + 8,  gMidr)
+  PokeI(base + 16, gCntfrq)
+  PokeI(base + 24, gEl)
+  PokeI(base + 32, gCntpct)
+  PokeI(base + 40, gIh)
+  PokeI(base + 48, gSt)
+  PokeI(base + 56, gStSig)
+  gCntpct2 = RdCntpct()
+  PokeI(base + 64, gCntpct2)
+
+  ; ---- write the proof to a non-volatile UEFI variable ---------------
+  If stOk = 1
+    rt = PeekI(gSt + $58)              ; EFI_SYSTEM_TABLE.RuntimeServices
+    fn = PeekI(rt + $58)              ; EFI_RUNTIME_SERVICES.SetVariable
+    gCallFn = fn
+    gCallA0 = @gName[0]               ; VariableName (CHAR16*)
+    gCallA1 = @gGuid[0]              ; VendorGuid (EFI_GUID*)
+    gCallA2 = #EFI_ATTR             ; Attributes
+    gCallA3 = #PROOF_LEN            ; DataSize
+    gCallA4 = @gProof[0]           ; Data
+    UefiCall5()
+    gSetRc = gCallRet
+
+    ; ---- hand the board back to Linux via a cold reset --------------
+    ; RuntimeServices->ResetSystem(EfiResetCold=0, EFI_SUCCESS=0, 0, NULL).
+    ; Does not return; if it somehow does, we fall through and return to
+    ; the boot manager, which boots the default (Debian) entry.
+    fn = PeekI(rt + $68)              ; EFI_RUNTIME_SERVICES.ResetSystem
+    gCallFn = fn
+    gCallA0 = 0
+    gCallA1 = 0
+    gCallA2 = 0
+    gCallA3 = 0
+    gCallA4 = 0
+    UefiCall5()
+  EndIf
+
+  ProcedureReturn 0
+EndProcedure

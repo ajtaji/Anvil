@@ -1,0 +1,1289 @@
+; ======================================================================
+;  pwm.pi4 - the BCM2711 pulse width modulators, and a coarse software
+;  PWM for a pin that is not one of theirs.
+;
+;  WHAT THIS FILE OWNS
+;
+;    * PWM0 at $FE20C000 and PWM1 at $FE20C800, two channels each
+;      (BCM2711 ARM Peripherals section 8.6: "The PWM0 register base
+;      address is 0x7e20c000 and the PWM1 register base address is
+;      0x7e20c800", translated by the device tree's own soc ranges,
+;      Datasheets/pi4/bcm2711.dtsi:40 - <0x7e000000 0x0 0xfe000000>).
+;    * clk_pwm, which is NOT in the PWM block. Section 8.5's last line
+;      says so in four words: "PWM clock source and frequency is
+;      controlled in CPRMAN." So this file also programs CM_PWMCTL and
+;      CM_PWMDIV in the clock manager at $FE101000.
+;    * one SOFTWARE channel, a level toggled from a periodic call, for a
+;      transistor on any GPIO. It is coarse and it says so everywhere.
+;
+;  WHAT IT DOES NOT OWN. The fan curve (Anvil/Core/fan.pbi), the pin the
+;  operator chose and the words printed about any of it (the `fan`
+;  command). This file takes a pin number and a frequency and produces
+;  a waveform, or a named refusal.
+;
+;  REQUIRES, and the main file lists both in this order (house rule 10 -
+;  a library never includes a library):
+;
+;      XIncludeFile "RaspberryPi4/Lib/gpio.pi4"     ; PinAlt, PinHigh...
+;      XIncludeFile "RaspberryPi4/Lib/timer.pi4"    ; Micros
+;      XIncludeFile "RaspberryPi4/Lib/pwm.pi4"
+;
+;  THIS FILE HAS DRIVEN A PIN ON SILICON (2026-09-06, pi4-fan-silicon,
+;  a four-wire fan on GPIO 18, PWM0 channel 1 through ALT5, 25 kHz).
+;  `gpio status 18` reads level 0 at a duty of 0, level 1 at 1000, and
+;  either value on successive reads at 500. The line this replaces said
+;  NOTHING IN THIS FILE HAS DRIVEN A PIN ON SILICON, and it was right:
+;  the first version of this file reported every number correctly and
+;  left the pad low. What it was missing is written out under THE
+;  SILICON FACT below - read that before changing anything about the
+;  clock or the control byte.
+;
+; ======================================================================
+;  THE TWO MODES, AND WHY THIS FILE USES M/S
+; ======================================================================
+;  Section 8.4 gives PWM mode two sub-modes. With MSEN=0 the channel
+;  runs the "evenly distributed pulses" algorithm of section 8.3 - it
+;  spreads N ones through M cycles, so the output flips at close to
+;  clk_pwm and the ratio is right only when averaged. With MSEN=1 it
+;  sends M cycles high then S-M low: one edge pair per period, at
+;  exactly clk_pwm/RNG.
+;
+;  A FOUR-PIN FAN NEEDS THE SECOND. Its control input is specified as a
+;  25 kHz square wave whose DUTY it measures; a 54 MHz stream of evenly
+;  distributed pulses with the same average is not that signal, and the
+;  fan's own tachometer and control loop are entitled to do anything at
+;  all with it. So every channel this file starts sets MSENi, which is
+;  also what the downstream kernel driver does unconditionally
+;  (Datasheets/pi4/pwm/rpi-6.12.y_pwm-bcm2835.c:19, `#define PWM_MODE
+;  0x80  /* set timer in PWM mode */`, ORed into every channel's control
+;  byte in bcm2835_pwm_apply) - 0x80 is bit 7 of the byte, which is
+;  MSEN1 in Table 153, so that comment names the sub-mode rather than
+;  the mode.
+;
+;  The FIFO is not used (USEFi stays 0) and neither is serialiser mode
+;  (MODEi stays 0). A fan wants one number until told otherwise, which
+;  is exactly what DATi is for.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE PWM BLOCKS.
+;
+;  Two instances, "named PWM0 and PWM1 (each with two output channels)"
+;  - section 8.2. The device tree names both: bcm283x.dtsi:413
+;  pwm@7e20c000 and bcm2711.dtsi:275 pwm1@7e20c800, each with a reg size
+;  of 0x28, which is the register map below plus its last word.
+; ----------------------------------------------------------------------
+#PWM0_BASE = $FE20C000
+#PWM1_BASE = $FE20C800
+
+; Table 152, the PWM register map. Offsets are from the block's base and
+; are the same for PWM0 and PWM1.
+#PWM_CTL_OFF  = $00           ; PWM Control
+#PWM_STA_OFF  = $04           ; PWM Status
+#PWM_DMAC_OFF = $08           ; PWM DMA Configuration - untouched here
+#PWM_RNG1_OFF = $10           ; Channel 1 Range
+#PWM_DAT1_OFF = $14           ; Channel 1 Data
+#PWM_FIF1_OFF = $18           ; FIFO input - untouched here
+#PWM_RNG2_OFF = $20           ; Channel 2 Range
+#PWM_DAT2_OFF = $24           ; Channel 2 Data
+
+; ----------------------------------------------------------------------
+;  CTL, Table 153. The control register holds one BYTE per channel:
+;  channel 1 in bits 7:0 and channel 2 in bits 15:8, the same field in
+;  the same position eight bits up. That is why the kernel driver writes
+;  it as `PWM_CONTROL_SHIFT(x) ((x) * 8)` with a 0xff mask
+;  (pwm-bcm2835.c:16-18) and why the constants below are the CHANNEL 1
+;  positions, shifted by 8 for channel 2.
+;
+;  ONE BIT BREAKS THAT SYMMETRY AND IT IS THE TRAP: bit 6 is CLRF, "Clear
+;  FIFO", and it is NOT per-channel - it is one shared one-shot for the
+;  single FIFO. Bit 14, where a per-channel reading would put channel
+;  2's copy, is Reserved. So CLRF has its own absolute constant below
+;  and is never shifted. Writing it would clear a FIFO this file does
+;  not use, which is harmless and still wrong, so it is never written.
+; ----------------------------------------------------------------------
+#PWM_CTL_PWEN = $01           ; bit 0  PWEN1 - channel enable
+#PWM_CTL_MODE = $02           ; bit 1  MODE1 - 0 PWM, 1 serialiser
+#PWM_CTL_RPTL = $04           ; bit 2  RPTL1 - repeat last FIFO word
+#PWM_CTL_SBIT = $08           ; bit 3  SBIT1 - the silence level
+#PWM_CTL_POLA = $10           ; bit 4  POLA1 - invert the output
+#PWM_CTL_USEF = $20           ; bit 5  USEF1 - transmit from the FIFO
+#PWM_CTL_MSEN = $80           ; bit 7  MSEN1 - M/S instead of the
+                              ;        distributed-pulse algorithm
+#PWM_CTL_CLRF = $40           ; bit 6  CLRF, SHARED, never shifted
+#PWM_CTL_CHAN_SHIFT = 8       ; channel 2's byte sits this far up
+#PWM_CTL_CHAN_MASK  = $FF     ; and is this wide
+
+; STA, Table 154. Only the two error flags this file can actually cause
+; are named; the FIFO flags belong to a FIFO nobody here fills.
+#PWM_STA_BERR  = $100         ; bit 8  bus error - a write went too fast
+#PWM_STA_STA1  = $200         ; bit 9  channel 1 is transmitting
+#PWM_STA_STA2  = $400         ; bit 10 channel 2 is transmitting
+
+; RNG reset value, Table 156: 0x00000020. Worth naming because a channel
+; enabled without setting RNG runs at clk_pwm/32, which at the 54 MHz
+; oscillator is 1.6875 MHz - a real waveform, on the wrong pin's fan, at
+; a frequency nothing asked for.
+#PWM_RNG_RESET = $20
+
+; ----------------------------------------------------------------------
+;  THE CLOCK MANAGER.
+;
+;  Base $FE101000. Section 5.4.2 states the bus address for the general
+;  purpose clocks - "The General Purpose clocks register base address is
+;  0x7e101000" - and the device tree gives the whole block: bcm283x.dtsi
+;  :86 `cprman@7e101000` with reg size 0x2000.
+;
+;  THE PWM CLOCK'S OWN TWO REGISTERS ARE NOT IN THE DATASHEET. Section
+;  5.4 documents CM_GP0CTL/DIV through CM_GP2CTL/DIV at 0x70..0x84 and
+;  stops; the per-peripheral clocks are undocumented there. Their
+;  offsets come from the downstream kernel's clock driver, which is what
+;  actually programs this block on this part:
+;  Datasheets/pi4/pwm/rpi-6.12.y_clk-bcm2835.c:86-87
+;      #define CM_PWMCTL   0x0a0
+;      #define CM_PWMDIV   0x0a4
+;  and its clock table confirms the pairing at line 2212:
+;      [BCM2835_CLOCK_PWM] = REGISTER_PER_CLK(.name = "pwm",
+;          .ctl_reg = CM_PWMCTL, .div_reg = CM_PWMDIV,
+;          .int_bits = 12, .frac_bits = 12, .is_mash_clock = true)
+;
+;  THE BIT LAYOUT IS THE DATASHEET'S. Tables 99 and 100 define
+;  CM_GP*CTL and CM_GP*DIV, and the per-peripheral pair uses the same
+;  layout - the kernel's general CM_* bit constants (clk-bcm2835.c:124-
+;  136) are applied to every ctl_reg in that table, including this one.
+;  So both sources agree field for field, and the two are cited
+;  separately below wherever they say the same thing twice.
+; ----------------------------------------------------------------------
+#CM_BASE       = $FE101000
+#CM_PWMCTL_OFF = $A0
+#CM_PWMDIV_OFF = $A4
+
+; Bits 31:24 of BOTH registers are PASSWD, "Clock Manager password 5a"
+; (Tables 99 and 100), and a write without it is discarded. The kernel
+; spells the same thing as a whole word: clk-bcm2835.c:41
+; `#define CM_PASSWORD 0x5a000000`.
+#CM_PASSWD = $5A000000
+
+; CM_*CTL fields. Table 99 for SRC/ENAB/KILL/BUSY/MASH, and
+; clk-bcm2835.c:124-131 for the same positions plus GATE and BUSYD,
+; which Table 99 leaves Reserved and blank respectively.
+#CM_CTL_SRC_MASK = $0F        ; bits 3:0
+#CM_CTL_ENAB     = $10        ; bit 4  request start/stop, glitch-free
+#CM_CTL_KILL     = $20        ; bit 5  stop and reset - test/debug only
+#CM_CTL_GATE     = $40        ; bit 6  Reserved in Table 99; BIT(6) in
+                              ;        the kernel, which sets it with
+                              ;        ENABLE in bcm2835_clock_on
+                              ;        (clk-bcm2835.c:1111-1114)
+#CM_CTL_BUSY     = $80        ; bit 7  the generator is running
+#CM_CTL_BUSYD    = $100       ; bit 8
+#CM_CTL_MASH_SHIFT = 9        ; bits 10:9, Table 99: 0 = integer division
+
+; SRC, Table 99: 0 GND, 1 oscillator, 2/3 test-debug, 4 PLLA per,
+; 5 PLLC per, 6 PLLD per, 7 HDMI auxiliary, 8-15 GND. Same numbering in
+; clk-bcm2835.c:134-145.
+#CM_SRC_GND      = 0
+#CM_SRC_OSC      = 1
+#CM_SRC_PLLD_PER = 6
+
+; CM_*DIV, Table 100: PASSWD 31:24, DIVI 23:12, and the remaining 11:0
+; are the fractional part - twelve bits, which is what the kernel calls
+; CM_DIV_FRAC_BITS (clk-bcm2835.c:45).
+#CM_DIV_INT_SHIFT = 12
+#CM_DIV_INT_MAX   = 4095      ; twelve bits of DIVI
+
+; ----------------------------------------------------------------------
+;  THE PARENT CLOCK IS THE OSCILLATOR, AND ON THIS PART IT IS 54 MHz.
+;
+;  Not 19.2 MHz. bcm283x.dtsi:486-491 declares clk_osc at 19200000 for
+;  the family and bcm2711.dtsi:618-620 OVERRIDES it:
+;      &clk_osc { clock-frequency = <54000000>; };
+;  The same 54 MHz turns up independently at the architectural counter,
+;  which this tree has measured on the board (Lib/timer.pi4, CNTFRQ_EL0
+;  read 54000000 on 2026-08-24). Two unrelated places agreeing is why
+;  this constant is trusted rather than guessed.
+;
+;  WHY NOT PLLD, WHICH IS FASTER AND WHICH SRC=6 SELECTS. Because its
+;  rate is not a number anywhere on this disk. PLLD's per output is
+;  itself a programmable divider - A2W_PLLD_PER at 0x1540
+;  (clk-bcm2835.c:274) - so using it means reading and modelling the PLL
+;  to know what was asked for, and a parent rate that is wrong by a
+;  factor produces a fan frequency that is wrong by the same factor with
+;  no symptom this side of an oscilloscope. The oscillator's rate is
+;  stated, cross-checked, and enough: 54 MHz reaches 25 kHz EXACTLY at
+;  a divisor of 1 and a range of 2160, and covers 1 Hz upwards. PLLD
+;  stays named in #CM_SRC_PLLD_PER and unused, so the day somebody needs
+;  megahertz the constant is already correct.
+; ----------------------------------------------------------------------
+#PWM_OSC_HZ = 54000000
+
+; ----------------------------------------------------------------------
+;  THE FREQUENCY ENVELOPE, and every bound has a reason rather than a
+;  round number.
+;
+;  #PWM_RANGE_TARGET is what the divisor search aims RNG at. It is the
+;  duty resolution: a range of 2000 counts resolves a permille to two
+;  counts, so every step the caller can ask for is a step the hardware
+;  can make. Aiming higher costs nothing at low frequencies and is not
+;  reachable at high ones, which is what the clamp below is for.
+;
+;  #PWM_RANGE_MIN is 2, and it is the kernel driver's PERIOD_MIN
+;  (pwm-bcm2835.c:24) rather than a guess - a range of 1 leaves no room
+;  for a duty at all and a range of 0 is a divide by zero in the part.
+;
+;  #PWM_RANGE_MAX is a twenty-bit range. RNG is a full 32-bit register
+;  (Table 156) and nothing in the part objects to a larger one, but a
+;  range beyond this means a period beyond twenty seconds at the slowest
+;  divisor, which is not a PWM signal any more, and refusing it by name
+;  is more useful than producing it.
+; ----------------------------------------------------------------------
+#PWM_RANGE_TARGET = 2000
+#PWM_RANGE_MIN    = 2
+#PWM_RANGE_MAX    = 1048575
+
+; The duty scale. Permille rather than percent because 25 kHz at a range
+; of 2160 resolves far finer than one percent, and a fan curve that can
+; only step in percent hunts at the bottom of its range.
+#PWM_DUTY_MAX = 1000
+
+; ----------------------------------------------------------------------
+;  RESULT CODES. Zero is success and every failure is negative and named;
+;  no procedure here returns a bare 1 for "worked", because the caller of
+;  PwmBegin needs to know WHICH refusal it hit to say a useful sentence.
+; ----------------------------------------------------------------------
+#PWM_OK        = 0
+#PWM_ERR_PIN   = -1   ; not a pin this part can drive from a PWM channel
+#PWM_ERR_HZ    = -2   ; a frequency clk_pwm cannot be divided down to
+#PWM_ERR_DUTY  = -3   ; a duty outside 0..1000 permille
+#PWM_ERR_BUSY  = -4   ; the clock generator would not stop
+#PWM_ERR_STATE = -5   ; the channel was never begun
+#PWM_ERR_SOFT  = -6   ; the software channel is already on another pin
+#PWM_ERR_CLOCK = -7   ; the clock generator would not START - ENAB was
+                      ; asserted and BUSY never rose. MEASURED ON THE
+                      ; BOARD 2026-09-06: this is the failure that made
+                      ; the whole driver report success and drive
+                      ; nothing, and it had no code before that date.
+#PWM_ERR_START = -8   ; the channel would not begin transmitting - the
+                      ; control byte reads back correct and STAi stays
+                      ; clear. See THE SILICON FACT below.
+
+; ----------------------------------------------------------------------
+;  KINDS. A caller that has been handed a pin needs to know which of the
+;  two mechanisms it got, because their guarantees are not the same.
+; ----------------------------------------------------------------------
+#PWM_KIND_NONE = 0
+#PWM_KIND_HARD = 1    ; a real PWM channel, clocked by the part
+#PWM_KIND_SOFT = 2    ; a level toggled by software, coarse
+
+; How long the clock generator is given to drop BUSY. The kernel gives
+; every clock LOCK_TIMEOUT_NS (clk-bcm2835.c) and gives up with a
+; message; this gives it a millisecond, which is four orders of
+; magnitude longer than one cycle of the slowest clock this file will
+; program, and then says so rather than writing into a running divider -
+; Table 99: "To avoid lock-ups and glitches ... do not change this
+; control while BUSY=1".
+#PWM_BUSY_TIMEOUT_US = 1000
+
+; ----------------------------------------------------------------------
+;  THE SILICON FACT, MEASURED ON THE BOARD 2026-09-06 (pi4-fan-silicon)
+;
+;  A CHANNEL MUST BE ENABLED WHILE ITS CLOCK GENERATOR IS STOPPED. It
+;  starts when the generator starts. Enable it more than about a
+;  hundred microseconds AFTER the generator is running and it never
+;  starts at all, and NOTHING IN ANY REGISTER SAYS SO.
+;
+;  How that was found. `fan pin 18` + `fan 100` reported GPIO 18, ALT5,
+;  25000 Hz, 54 MHz divided by 1, a range of 2160 and a duty of 100
+;  percent. CM_PWMCTL read back $91 - BUSY, ENAB, source 1 - PWM0 CTL
+;  read back $81 (MSEN1|PWEN1), RNG1 and DAT1 both read back $870. And
+;  `gpio status 18` read ALT5 LEVEL 0, with PWM0 STA reading $102: BERR
+;  set and STA1, "channel 1 is transmitting", CLEAR. Re-writing the
+;  IDENTICAL control byte $81 brought the pad HIGH and STA1 with it
+;  ($302). Re-writing RNG1 and DAT1 changed nothing.
+;
+;  Then a payload swept the gap between starting the generator and
+;  writing the control byte, on the part, and STA1 came up at gaps of
+;  0, 5, 20 and 100 microseconds and did NOT come up at 1000 - while
+;  CM_PWMCTL read $91 the whole time, and while re-asserting the same
+;  ENAB value changed nothing. Programming the channel FIRST and
+;  starting the generator afterwards works with no gap and with a
+;  millisecond of gap, which is the sequence this file now uses.
+;
+;  That is the behaviour of a block whose clock is gated away again once
+;  no channel is asking for it. The datasheet does not say so; the part
+;  does, five times out of five.
+;
+;  SO THE ORDER IS: stop the generator, set the divisor, set the source,
+;  PROGRAM AND ENABLE THE CHANNEL, start the generator, wait for BUSY to
+;  rise, then ask STAi whether it worked. The last step is what makes
+;  this file unable to lie again: a channel that did not start is now an
+;  error code and not a cheerful report.
+;
+;  A SECOND, SEPARATE WAY TO LOSE THE FAN, also measured: a generator
+;  parked on SRC=GND never drops BUSY. CM_PWMCTL written $5A000000 read
+;  back $00000080 and stayed; $5A000001 read back $00000001 at once. So
+;  PwmClockStop names a real source rather than waiting forever.
+;
+;  #PWM_START_TIMEOUT_US is two milliseconds, and it is a floor rather
+;  than a guess: two milliseconds is fifty periods at 25 kHz and it is
+;  the window the bench payload used when it watched STA1 come up. The
+;  programming burst itself needs no delays at all - the version with a
+;  settle between every store is one of the versions that failed on the
+;  bench - and the only thing this constant paces is the wait before the
+;  recovery write, which must not arrive before the part has had its
+;  chance to answer.
+; ----------------------------------------------------------------------
+#PWM_CLOCK_SETTLE_US   = 10
+#PWM_START_TIMEOUT_US  = 2000
+#PWM_START_TRIES       = 4
+
+; ======================================================================
+;  STATE
+; ======================================================================
+; The hardware side. One block/channel pair at a time is all a fan needs
+; and all this file tracks; a second caller starting a second channel is
+; supported by the register code below, but the reporting accessors
+; describe the LAST channel begun. That is stated rather than hidden
+; because a two-fan board would want an array here and would notice.
+Global pwm_pin.i          = -1        ; the pin currently driven, or -1
+Global pwm_base.i         = 0         ; #PWM0_BASE or #PWM1_BASE
+Global pwm_chan.i         = -1        ; 0 for channel 1, 1 for channel 2
+Global pwm_range.i        = 0         ; RNG as programmed
+Global pwm_divi.i         = 0         ; DIVI as programmed
+Global pwm_wantHz.i       = 0         ; what was asked for
+Global pwm_actualHz.i     = 0         ; what the divisors actually make
+Global pwm_duty.i         = 0         ; permille as last set
+Global pwm_kind.i         = #PWM_KIND_NONE
+Global pwm_startWrites.i  = 0         ; control-byte writes the LAST
+                                      ; PwmBegin needed before STAi came
+                                      ; up. One means the part behaved.
+
+; The software side. ONE channel, deliberately: there is one fan, a
+; second software channel doubles the work done inside somebody else's
+; tick, and two of them sharing a service call would beat against each
+; other. A second request is refused by name (#PWM_ERR_SOFT) rather than
+; silently moving the first one.
+Global pwmsoft_pin.i      = -1
+Global pwmsoft_periodUs.i = 0
+Global pwmsoft_highUs.i   = 0
+Global pwmsoft_markUs.i   = 0         ; when the current period started
+Global pwmsoft_level.i    = 0         ; what the pad was last driven to
+Global pwmsoft_idle.i     = 1         ; where a stall parks the pin
+Global pwmsoft_stalls.i   = 0         ; how many times it has parked
+Global pwmsoft_edges.i    = 0         ; edges driven, for the bench
+
+; The software channel's frequency ceiling. Its service call runs from
+; somebody else's periodic tick, so the shortest period it can honour is
+; a few times that tick's own interval; a millisecond period asks the
+; caller for a service call every few hundred microseconds. Above this
+; the answer would be a waveform whose duty is decided by scheduling
+; jitter, so it is refused instead.
+#PWM_SOFT_HZ_MIN = 1
+#PWM_SOFT_HZ_MAX = 1000
+
+; A service call that arrives this many periods late means the caller
+; stopped calling - a long command at the prompt, a transfer, a hang.
+; The pin is parked at its idle level and the event is counted. Two is
+; the smallest number that cannot be reached by ordinary jitter and is
+; still noticed within a few milliseconds at the default frequency.
+#PWM_SOFT_STALL_PERIODS = 2
+
+; ======================================================================
+;  THE PIN TABLE
+; ======================================================================
+;  Section 8.5's Quick Reference lists the GPIOs assigned to PWM
+;  channels, but its table in the extracted text is a column layout that
+;  can be read two ways. The device tree states the same pairing one pin
+;  at a time and cannot be misread, so it is the source here and the
+;  section is the corroboration:
+;
+;    Datasheets/pi4/bcm2711.dtsi
+;      842  pwm0_0_gpio12  gpio12  alt0        PWM0 channel 1
+;      849  pwm0_0_gpio18  gpio18  alt5        PWM0 channel 1
+;      856  pwm1_0_gpio40  gpio40  alt0        PWM1 channel 1
+;      863  pwm0_1_gpio13  gpio13  alt0        PWM0 channel 2
+;      870  pwm0_1_gpio19  gpio19  alt5        PWM0 channel 2
+;      877  pwm1_1_gpio41  gpio41  alt0        PWM1 channel 2
+;      884  pwm0_1_gpio45  gpio45  alt0        PWM0 channel 2
+;      891  pwm0_0_gpio52  gpio52  alt1        PWM0 channel 1
+;      898  pwm0_1_gpio53  gpio53  alt1        PWM0 channel 2
+;
+;  The node names carry the mapping in themselves: pwm<block>_<channel>
+;  _gpio<pin>. So gpio18 is block 0 channel 0 - which Table 152 calls
+;  channel 1 - on alternate function 5, and that is the pin most Pi
+;  fan wiring uses.
+;
+;  ONLY FOUR OF THE NINE REACH THE 40-PIN HEADER: 12, 13, 18 and 19.
+;  40, 41, 45, 52 and 53 are real die lines with on-board uses and are
+;  above the header's range; the board backend is what decides which to
+;  offer an operator, not this file, which answers for the silicon.
+; ----------------------------------------------------------------------
+
+; PwmPinBlock(pin) - #PWM0_BASE, #PWM1_BASE, or 0 for a pin with no
+; PWM function at all.
+Procedure.i PwmPinBlock(pin.i)
+  Select pin
+    Case 12
+      ProcedureReturn #PWM0_BASE
+    Case 13
+      ProcedureReturn #PWM0_BASE
+    Case 18
+      ProcedureReturn #PWM0_BASE
+    Case 19
+      ProcedureReturn #PWM0_BASE
+    Case 40
+      ProcedureReturn #PWM1_BASE
+    Case 41
+      ProcedureReturn #PWM1_BASE
+    Case 45
+      ProcedureReturn #PWM0_BASE
+    Case 52
+      ProcedureReturn #PWM0_BASE
+    Case 53
+      ProcedureReturn #PWM0_BASE
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; PwmPinChannel(pin) - 0 for the block's channel 1, 1 for its channel 2,
+; -1 for a pin with no PWM function. The names in the device tree are
+; zero-based (pwm0_0, pwm0_1) and Table 152's registers are one-based
+; (RNG1, RNG2); this returns the zero-based index and every register
+; address below is computed from it, so the two numberings meet in one
+; place instead of at every call site.
+Procedure.i PwmPinChannel(pin.i)
+  Select pin
+    Case 12
+      ProcedureReturn 0
+    Case 13
+      ProcedureReturn 1
+    Case 18
+      ProcedureReturn 0
+    Case 19
+      ProcedureReturn 1
+    Case 40
+      ProcedureReturn 0
+    Case 41
+      ProcedureReturn 1
+    Case 45
+      ProcedureReturn 1
+    Case 52
+      ProcedureReturn 0
+    Case 53
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; PwmPinAlt(pin) - the alternate function number that puts the PWM
+; channel on the pad, or -1. Three different answers across nine pins,
+; which is exactly why this is a table and not a constant.
+Procedure.i PwmPinAlt(pin.i)
+  Select pin
+    Case 12
+      ProcedureReturn 0
+    Case 13
+      ProcedureReturn 0
+    Case 18
+      ProcedureReturn 5
+    Case 19
+      ProcedureReturn 5
+    Case 40
+      ProcedureReturn 0
+    Case 41
+      ProcedureReturn 0
+    Case 45
+      ProcedureReturn 0
+    Case 52
+      ProcedureReturn 1
+    Case 53
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; PwmPinIsCapable(pin) - 1 if the part can drive a hardware PWM channel
+; out of this pin.
+Procedure.i PwmPinIsCapable(pin.i)
+  If PwmPinBlock(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  REGISTER ADDRESSES
+; ======================================================================
+
+; The channel's range register: RNG1 at 0x10 and RNG2 at 0x20, so the
+; stride between the two channels' register pairs is 0x10 - which is
+; also how the kernel driver writes it, `PERIOD(x) (((x) * 0x10) + 0x10)`
+; (pwm-bcm2835.c:21). Both derivations are written here because the two
+; agreeing is the check.
+Procedure.i PwmRngAddr(base.i, chan.i)
+  ProcedureReturn base + #PWM_RNG1_OFF + chan * $10
+EndProcedure
+
+; DAT1 at 0x14, DAT2 at 0x24; the same stride.
+; `DUTY(x) (((x) * 0x10) + 0x14)` - pwm-bcm2835.c:22.
+Procedure.i PwmDatAddr(base.i, chan.i)
+  ProcedureReturn base + #PWM_DAT1_OFF + chan * $10
+EndProcedure
+
+; ======================================================================
+;  THE DIVISOR SEARCH
+; ======================================================================
+;  Given a wanted frequency, choose DIVI and RNG so that
+;
+;      f = #PWM_OSC_HZ / (DIVI * RNG)
+;
+;  with RNG as close to #PWM_RANGE_TARGET as the bounds allow, because
+;  RNG is the duty resolution and DIVI is not.
+;
+;  It is a division, not a search: the DIVI that puts RNG at the target
+;  is osc/(f * target), and clamping it to 1..4095 and recomputing RNG
+;  handles both ends. Then RNG is checked against its own bounds, which
+;  is where a frequency that cannot be made gets refused.
+;
+;  WORKED, because these are the numbers the gate checks:
+;    25000 Hz  DIVI = 54e6/(25000*2000) = 1 (truncated from 1.08)
+;              RNG  = 54e6/(1*25000)    = 2160
+;              f    = 54e6/(1*2160)     = 25000   exactly
+;     1000 Hz  DIVI = 27, RNG = 2000, f = 1000    exactly
+;      100 Hz  DIVI = 270, RNG = 2000, f = 100    exactly
+;  and at the top:
+;    27000000  DIVI = 1, RNG = 2, f = 27000000    exactly, and one more
+;              hertz refuses with #PWM_ERR_HZ because RNG would be 1.
+;
+;  THE TRUNCATION IS DELIBERATE AND IT IS WHY 25 kHz IS EXACT. Rounding
+;  DIVI up to 2 would give RNG = 1080 and the same exact frequency with
+;  half the duty resolution. Truncating biases DIVI down, which biases
+;  RNG up, which is the direction that costs nothing.
+; ----------------------------------------------------------------------
+
+; PwmDivisorFor(hz) - the DIVI this file would use. Also the first half
+; of the refusal test, so it is a procedure rather than three lines
+; inside PwmBegin: the gate calls it directly.
+Procedure.i PwmDivisorFor(hz.i)
+  Define d.i
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ; The product cannot overflow: hz is bounded below by the caller's own
+  ; check and the widest sensible operand here is 27 million times two
+  ; thousand, which is 5.4e10 - inside a 64-bit .i by nine orders of
+  ; magnitude. On a 32-bit target this line would need splitting, which
+  ; is one more reason this file is a Pi 4 file.
+  d = #PWM_OSC_HZ / (hz * #PWM_RANGE_TARGET)
+  If d < 1
+    d = 1
+  EndIf
+  If d > #CM_DIV_INT_MAX
+    d = #CM_DIV_INT_MAX
+  EndIf
+  ProcedureReturn d
+EndProcedure
+
+; PwmRangeFor(hz) - the RNG that goes with PwmDivisorFor(hz), or 0 if
+; the frequency is out of the envelope. 0 is not a range the part can
+; use, so it doubles as the refusal without a second out-parameter.
+Procedure.i PwmRangeFor(hz.i)
+  Define d.i
+  Define r.i
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  d = PwmDivisorFor(hz)
+  If d < 1
+    ProcedureReturn 0
+  EndIf
+  r = #PWM_OSC_HZ / (d * hz)
+  If r < #PWM_RANGE_MIN
+    ProcedureReturn 0
+  EndIf
+  If r > #PWM_RANGE_MAX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; PwmActualHzFor(hz) - the frequency the part will really produce for a
+; request, or 0 if the request is out of the envelope. The caller prints
+; THIS, never the number it asked for: at 25 kHz they are the same and
+; at 7 Hz they are not, and a report that says 7 when the fan sees 7.0007
+; is the kind of confident wrong answer this project keeps finding.
+Procedure.i PwmActualHzFor(hz.i)
+  Define d.i
+  Define r.i
+  r = PwmRangeFor(hz)
+  If r = 0
+    ProcedureReturn 0
+  EndIf
+  d = PwmDivisorFor(hz)
+  ProcedureReturn #PWM_OSC_HZ / (d * r)
+EndProcedure
+
+; PwmDutyCounts(range, permille) - the DAT value for a duty, rounded to
+; nearest rather than truncated. Half a count of bias at a range of 2160
+; is 0.023 percent and would not matter; it matters at a range of 4,
+; where truncation turns a 749-permille request into one count of eight
+; and rounding turns it into three.
+;
+; The two rails are exact by construction: 0 permille gives 0 counts and
+; 1000 permille gives exactly `range` counts, which with MSEN=1 is a
+; solid level rather than a period with one missing edge.
+Procedure.i PwmDutyCounts(range.i, permille.i)
+  If permille <= 0
+    ProcedureReturn 0
+  EndIf
+  If permille >= #PWM_DUTY_MAX
+    ProcedureReturn range
+  EndIf
+  ProcedureReturn (range * permille + #PWM_DUTY_MAX / 2) / #PWM_DUTY_MAX
+EndProcedure
+
+; ======================================================================
+;  THE CLOCK GENERATOR
+; ======================================================================
+
+Procedure.i PwmCmRead(off.i)
+  ProcedureReturn PeekN(#CM_BASE + off) & $FFFFFFFF
+EndProcedure
+
+; Every write to either register carries the password in 31:24. There is
+; one procedure so that there is one place the password can be missing
+; from, and it cannot be missing from that one - the argument is the
+; VALUE, and the password is added here.
+Procedure PwmCmWrite(off.i, value.i)
+  PokeN(#CM_BASE + off, #CM_PASSWD | (value & $00FFFFFF))
+EndProcedure
+
+; PwmClockStop() - drop ENAB and wait for BUSY to fall.
+;
+; Table 99 on ENAB: "This requests the clock to start or stop without
+; glitches. The output clock will not stop immediately because the cycle
+; must be allowed to complete ... The BUSY flag will go low when the
+; final cycle is completed." So the wait is not optional politeness; the
+; divider must not be written while BUSY is set, and the same table says
+; that in as many words for MASH, SRC and DIVI.
+;
+; The kernel does exactly this pair - clear CM_ENABLE, then
+; bcm2835_clock_wait_busy (clk-bcm2835.c:1088-1101) - and gives up with
+; a message on timeout. This returns #PWM_ERR_BUSY instead of writing
+; into a running generator.
+;
+; ONE RECOVERY, AND IT WAS MEASURED RATHER THAN REASONED. A generator
+; whose SRC field is GND does not stop: on the board on 2026-09-06,
+; CM_PWMCTL written to $5A000000 (password, SRC=GND, ENAB clear) read
+; back $00000080 - BUSY set - and STAYED there. Writing $5A000001, the
+; same register with the oscillator selected and ENAB still clear, read
+; back $00000001 immediately. So a stuck BUSY whose source is GND is
+; cured by naming a real source, and this is the one place that knows
+; it. Without this the whole command is a permanent refusal - "that pin
+; could not be set up as a fan output" - after anything at all leaves
+; the generator parked on GND, which is how this failure was first
+; reproduced from the prompt.
+Procedure.i PwmClockStop()
+  Define v.i
+  Define t0.i
+  Define tries.i
+  v = PwmCmRead(#CM_PWMCTL_OFF)
+  PwmCmWrite(#CM_PWMCTL_OFF, v & ~#CM_CTL_ENAB)
+  tries = 0
+  While tries < 2
+    t0 = Micros()
+    While (PwmCmRead(#CM_PWMCTL_OFF) & #CM_CTL_BUSY) <> 0
+      If Micros() - t0 > #PWM_BUSY_TIMEOUT_US
+        Break
+      EndIf
+    Wend
+    If (PwmCmRead(#CM_PWMCTL_OFF) & #CM_CTL_BUSY) = 0
+      ProcedureReturn #PWM_OK
+    EndIf
+    If (PwmCmRead(#CM_PWMCTL_OFF) & #CM_CTL_SRC_MASK) <> #CM_SRC_GND
+      ProcedureReturn #PWM_ERR_BUSY
+    EndIf
+    PwmCmWrite(#CM_PWMCTL_OFF, #CM_SRC_OSC)
+    tries = tries + 1
+  Wend
+  ProcedureReturn #PWM_ERR_BUSY
+EndProcedure
+
+; PwmClockPrepare(divi) - steps 1 to 3 of the clock start: stop, program
+; the divisor, select the source. IT DOES NOT ENABLE. The ORDER IS THE
+; WHOLE PROCEDURE and it comes straight out of Table 99's two warnings:
+; do not change MASH or SRC while BUSY is set, and do not change them
+; "at the same time as asserting ENAB". So source and enable are two
+; separate writes, not one.
+;
+;   1  stop and wait                          (PwmClockStop)
+;   2  DIV  = PASSWD | DIVI<<12 | 0           integer division, no frac
+;   3  CTL  = PASSWD | MASH 0 | SRC           source chosen, still off
+;   4  CTL  = PASSWD | MASH 0 | SRC | ENAB | GATE   -- PwmClockRun()
+;
+; STEP 4 IS A SEPARATE PROCEDURE BECAUSE THE CHANNEL GOES BETWEEN THEM.
+; See THE SILICON FACT at the top of this file: on this part the channel
+; has to be programmed and enabled while the generator is still stopped,
+; and it starts when the generator does.
+;
+; MASH IS ZERO, WHICH ALSO SETTLES A DISAGREEMENT BETWEEN THE SOURCES
+; RATHER THAN CHOOSING BETWEEN THEM. Table 99 calls bits 10:9 MASH, with
+; 0 meaning integer division; the kernel calls bit 9 CM_FRAC and sets it
+; only when the fractional part of the divisor is non-zero
+; (clk-bcm2835.c:1161-1162). This file divides by an integer, so DIVF is
+; zero, so bit 9 is zero under both readings and nothing here has to
+; decide which is right.
+;
+; GATE, bit 6, is Reserved in Table 99 and BIT(6) in the kernel, which
+; sets it together with ENABLE for every per-peripheral clock
+; (clk-bcm2835.c:1111-1114). The kernel is the code that runs this block
+; on this part every day, so it is followed, and the discrepancy is
+; recorded here rather than quietly resolved.
+Procedure.i PwmClockPrepare(divi.i)
+  Define rc.i
+  If divi < 1
+    divi = 1
+  EndIf
+  If divi > #CM_DIV_INT_MAX
+    divi = #CM_DIV_INT_MAX
+  EndIf
+  rc = PwmClockStop()
+  If rc <> #PWM_OK
+    ProcedureReturn rc
+  EndIf
+  PwmCmWrite(#CM_PWMDIV_OFF, divi << #CM_DIV_INT_SHIFT)
+  PwmCmWrite(#CM_PWMCTL_OFF, #CM_SRC_OSC)
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; PwmClockRun() - step 4, on its own, because a whole channel has to be
+; programmed between it and step 3. Assert ENAB and then WAIT FOR BUSY
+; TO RISE.
+;
+; Table 99 calls ENAB a request - "This requests the clock to start or
+; stop without glitches" - and BUSY the answer. The wait is not
+; politeness: it is what makes the STA check that follows it mean
+; anything, because a channel read for its state before its clock is up
+; answers "not transmitting" whether or not it was going to run.
+Procedure.i PwmClockRun()
+  Define t0.i
+  PwmCmWrite(#CM_PWMCTL_OFF, #CM_SRC_OSC | #CM_CTL_ENAB | #CM_CTL_GATE)
+  t0 = Micros()
+  While (PwmCmRead(#CM_PWMCTL_OFF) & #CM_CTL_BUSY) = 0
+    If Micros() - t0 > #PWM_BUSY_TIMEOUT_US
+      ProcedureReturn #PWM_ERR_CLOCK
+    EndIf
+  Wend
+  delayMicroseconds(#PWM_CLOCK_SETTLE_US)
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; PwmClockHz() - what clk_pwm is running at, read back from the
+; registers rather than remembered. Zero when the generator is not
+; enabled, because a rate for a stopped clock is a fiction.
+Procedure.i PwmClockHz()
+  Define ctl.i
+  Define divi.i
+  ctl = PwmCmRead(#CM_PWMCTL_OFF)
+  If (ctl & #CM_CTL_ENAB) = 0
+    ProcedureReturn 0
+  EndIf
+  If (ctl & #CM_CTL_SRC_MASK) <> #CM_SRC_OSC
+    ; Somebody else's source. The rate is not knowable from here without
+    ; a PLL model, so say nothing rather than report the oscillator's.
+    ProcedureReturn 0
+  EndIf
+  divi = (PwmCmRead(#CM_PWMDIV_OFF) >> #CM_DIV_INT_SHIFT) & #CM_DIV_INT_MAX
+  If divi < 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #PWM_OSC_HZ / divi
+EndProcedure
+
+; ======================================================================
+;  THE HARDWARE CHANNEL
+; ======================================================================
+
+; PwmCtlWrite(base, chan, byte) - replace one channel's control byte and
+; leave the other channel's alone. Read-modify-write, which is safe here
+; only because a single caller owns this block; two cores starting two
+; channels at once would need the same treatment GPSET/GPCLR gets, and
+; the part offers no set/clear pair for CTL.
+;
+; CLRF (bit 6) is masked OUT of whatever is written, always. It is the
+; shared FIFO's one-shot and this file uses no FIFO; letting it through
+; a per-channel byte would make channel 2's SBIT position clear channel
+; 1's FIFO, which is the exact confusion the CTL note at the top warns
+; about.
+Procedure PwmCtlWrite(base.i, chan.i, byte.i)
+  Define v.i
+  Define sh.i
+  sh = chan * #PWM_CTL_CHAN_SHIFT
+  v = PeekN(base + #PWM_CTL_OFF) & $FFFFFFFF
+  v = v & ~(#PWM_CTL_CHAN_MASK << sh)
+  v = v & ~#PWM_CTL_CLRF
+  v = v | ((byte & #PWM_CTL_CHAN_MASK) << sh)
+  v = v & ~#PWM_CTL_CLRF
+  PokeN(base + #PWM_CTL_OFF, v)
+EndProcedure
+
+; PwmStaRead(base) - the block's status word, as a positive number.
+;
+; THE ONLY REGISTER IN THIS FILE THAT REPORTS ON THE PART RATHER THAN ON
+; THIS FILE'S OWN WRITES. CTL, RNG and DAT all read back what was
+; written to them whether or not the channel ever started - measured, on
+; the board, with the pad low (THE SILICON FACT above). STAi is the one
+; bit that comes from the channel itself.
+Procedure.i PwmStaRead(base.i)
+  ProcedureReturn PeekN(base + #PWM_STA_OFF) & $FFFFFFFF
+EndProcedure
+
+; PwmChanStaMask(chan) - STA1 for channel index 0, STA2 for index 1.
+; Table 154 puts them at bits 9 and 10, one apart, so the shift is the
+; channel index and not the index times anything.
+Procedure.i PwmChanStaMask(chan.i)
+  ProcedureReturn #PWM_STA_STA1 << chan
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PwmProgramChannel(base, chan, rng) - the four channel stores, made
+;  WHILE THE CLOCK GENERATOR IS STILL STOPPED.
+;
+;  That is the whole of the fix of 2026-09-06 and it is measured, not
+;  reasoned: with the generator running, this same burst leaves STA1
+;  clear and the pad low while every register reads back perfect, and
+;  with the generator stopped the channel is transmitting the moment the
+;  generator starts. A gap of a millisecond between this and the start
+;  does not hurt; a gap of a millisecond between a start and this one
+;  does. See THE SILICON FACT.
+;
+;  BERR (Table 154) is write-one-to-clear and is cleared first, so a
+;  BERR read after this burst belongs to this burst.
+;
+;  THE ORDER INSIDE THE BURST STILL MATTERS for the reason it always
+;  did: the channel is disabled, then RNG and DAT are written, then it
+;  is enabled. Table 153 says "All registers and FIFOs are writeable
+;  without setting this bit", so writing them while disabled is allowed;
+;  the other order would run at the reset range of 32 (Table 156).
+; ----------------------------------------------------------------------
+Procedure PwmProgramChannel(base.i, chan.i, rng.i)
+  PokeN(base + #PWM_STA_OFF, #PWM_STA_BERR)
+  PwmCtlWrite(base, chan, 0)                        ; channel off
+  PokeN(PwmRngAddr(base, chan), rng)
+  PokeN(PwmDatAddr(base, chan), 0)
+  PwmCtlWrite(base, chan, #PWM_CTL_MSEN | #PWM_CTL_PWEN)
+  pwm_startWrites = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PwmConfirmChannel(base, chan) - ask the CHANNEL whether it is running,
+;  and refuse rather than report if it is not.
+;
+;  STAi is the only bit in this block that a driver cannot make up by
+;  writing to it, which is why the check is here and not on CTL. The
+;  retry is the recovery that was measured to work on a channel that had
+;  missed its start: a second write of the IDENTICAL control byte. It is
+;  counted, because a board that needs it every time is telling you
+;  something about its clock and should not be able to say it quietly.
+;
+;  A channel that will not start leaves the pad UNMUXED and the channel
+;  disabled - the caller gets a named refusal and a pin that was never
+;  touched, which is the outcome the first version of this file could
+;  not produce.
+; ----------------------------------------------------------------------
+Procedure.i PwmConfirmChannel(base.i, chan.i)
+  Define sta.i
+  Define tries.i
+  Define t0.i
+  sta = PwmChanStaMask(chan)
+  tries = 0
+  While tries < #PWM_START_TRIES
+    ; WAIT FOR IT BEFORE TOUCHING IT AGAIN. A version of this procedure
+    ; that read STA once and then re-wrote the control byte KILLED the
+    ; channel it was checking on: the first read is a few microseconds
+    ; after the generator came up, STA1 is not up yet, and the re-write
+    ; lands on a running block, which is the very thing that does not
+    ; start a channel. Four of those in a row leave STA $102 - BERR set,
+    ; STA1 clear - which is exactly what the bench measured before this
+    ; loop learned to be patient.
+    t0 = Micros()
+    While Micros() - t0 <= #PWM_START_TIMEOUT_US
+      If (PwmStaRead(base) & sta) <> 0
+        ProcedureReturn #PWM_OK
+      EndIf
+    Wend
+    PwmCtlWrite(base, chan, #PWM_CTL_MSEN | #PWM_CTL_PWEN)
+    pwm_startWrites = pwm_startWrites + 1
+    tries = tries + 1
+  Wend
+  If (PwmStaRead(base) & sta) <> 0
+    ProcedureReturn #PWM_OK
+  EndIf
+  PwmCtlWrite(base, chan, 0)
+  ProcedureReturn #PWM_ERR_START
+EndProcedure
+
+; PwmBegin(pin, hz) - put a real PWM channel on a pin at a frequency.
+;
+; ORDER MATTERS TWICE HERE.
+;
+;   The channel is DISABLED, then RNG and DAT are written, then it is
+;   enabled. Table 153 says "All registers and FIFOs are writeable
+;   without setting this bit", so writing them while disabled is allowed;
+;   doing it in the other order would run the channel at the reset range
+;   of 32 (Table 156) for however long the two stores take, which at the
+;   oscillator is a 1.7 MHz burst on a pin somebody is about to connect
+;   a fan to.
+;
+;   The PIN IS MUXED LAST. Until PinAlt runs the pad is whatever it was;
+;   after it, the pad follows the channel. Muxing first would put the
+;   reset-range burst on the wire.
+;
+; The duty starts at 0. A caller that wanted a fan spinning asks for it
+; on the next line, and a library that guessed would be the reason a
+; board came up with a fan at full speed.
+Procedure.i PwmBegin(pin.i, hz.i)
+  Define base.i
+  Define chan.i
+  Define alt.i
+  Define rng.i
+  Define divi.i
+  Define rc.i
+
+  base = PwmPinBlock(pin)
+  If base = 0
+    ProcedureReturn #PWM_ERR_PIN
+  EndIf
+  chan = PwmPinChannel(pin)
+  alt  = PwmPinAlt(pin)
+  If chan < 0 Or alt < 0
+    ; Unreachable while the three tables agree, and checked anyway: a
+    ; pin present in one table and missing from another is a defect in
+    ; this file, and it should fail here rather than compute an address
+    ; from a negative channel index.
+    ProcedureReturn #PWM_ERR_PIN
+  EndIf
+
+  rng = PwmRangeFor(hz)
+  If rng = 0
+    ProcedureReturn #PWM_ERR_HZ
+  EndIf
+  divi = PwmDivisorFor(hz)
+
+  ; THE THREE STEPS, IN THE ORDER THE PART DEMANDS. Swapping the middle
+  ; two is the defect this file was born with: see THE SILICON FACT.
+  rc = PwmClockPrepare(divi)
+  If rc <> #PWM_OK
+    ProcedureReturn rc
+  EndIf
+
+  GpioBarrier()
+  PwmProgramChannel(base, chan, rng)
+  rc = PwmClockRun()
+  GpioBarrier()
+  If rc <> #PWM_OK
+    PwmCtlWrite(base, chan, 0)
+    ProcedureReturn rc
+  EndIf
+
+  ; AND THEN THE PART'S OWN ANSWER. Everything written above reads back
+  ; correct on a channel that never started; STAi does not.
+  rc = PwmConfirmChannel(base, chan)
+  If rc <> #PWM_OK
+    ProcedureReturn rc
+  EndIf
+
+  PinAlt(pin, alt)
+
+  pwm_pin      = pin
+  pwm_base     = base
+  pwm_chan     = chan
+  pwm_range    = rng
+  pwm_divi     = divi
+  pwm_wantHz   = hz
+  pwm_actualHz = #PWM_OSC_HZ / (divi * rng)
+  pwm_duty     = 0
+  pwm_kind     = #PWM_KIND_HARD
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; PwmDuty(permille) - the duty of the channel PwmBegin started.
+;
+; A duty outside 0..1000 is REFUSED rather than clamped. Clamping is the
+; friendlier behaviour right up to the moment a caller's arithmetic goes
+; wrong by a factor of ten and the fan runs flat out with nothing in any
+; log saying anything happened.
+Procedure.i PwmDuty(permille.i)
+  If pwm_kind <> #PWM_KIND_HARD
+    ProcedureReturn #PWM_ERR_STATE
+  EndIf
+  If permille < 0 Or permille > #PWM_DUTY_MAX
+    ProcedureReturn #PWM_ERR_DUTY
+  EndIf
+  GpioBarrier()
+  PokeN(PwmDatAddr(pwm_base, pwm_chan), PwmDutyCounts(pwm_range, permille))
+  GpioBarrier()
+  pwm_duty = permille
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; PwmEnd() - stop the channel and hand the pin back as an INPUT.
+;
+; An input, not an output driven low, and that is a safety decision
+; rather than tidiness: a 2-wire fan on a transistor is off when the
+; gate is not driven, and a 4-pin fan reads an undriven PWM input as
+; "no control signal", which every specification of that connector
+; answers with FULL SPEED. Either way the fan ends up in its safe state
+; and not in whichever one the last DAT write happened to leave.
+;
+; The clock generator is left RUNNING. It is shared by both blocks and
+; all four channels; stopping it here would stop a second channel this
+; file does not know about. Stopping the channel stops the output.
+Procedure.i PwmEnd()
+  If pwm_kind <> #PWM_KIND_HARD
+    ProcedureReturn #PWM_ERR_STATE
+  EndIf
+  GpioBarrier()
+  PwmCtlWrite(pwm_base, pwm_chan, 0)
+  PokeN(PwmDatAddr(pwm_base, pwm_chan), 0)
+  GpioBarrier()
+  PinInput(pwm_pin)
+  pwm_pin      = -1
+  pwm_base     = 0
+  pwm_chan     = -1
+  pwm_range    = 0
+  pwm_divi     = 0
+  pwm_wantHz   = 0
+  pwm_actualHz = 0
+  pwm_duty     = 0
+  pwm_kind     = #PWM_KIND_NONE
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; ======================================================================
+;  THE SOFTWARE CHANNEL
+; ======================================================================
+;  For a 2-wire fan on a transistor on a pin with no PWM function. It
+;  toggles a plain output from a service call the caller makes as often
+;  as it can, and it is COARSE - not "slightly less accurate", coarse:
+;
+;    * its edges land wherever the next service call lands, so the duty
+;      is right on average over many periods and wrong on any one;
+;    * a command that runs for a second without servicing it leaves the
+;      pin wherever the last edge put it;
+;    * it cannot go above #PWM_SOFT_HZ_MAX and refuses to try.
+;
+;  THE STALL RULE IS WHY IT IS SAFE ANYWAY. Every service call measures
+;  how long since the last one. Past #PWM_SOFT_STALL_PERIODS periods it
+;  stops modulating, drives the pin to its IDLE level and counts the
+;  event, so a long-running command parks the fan at the level the
+;  caller nominated as safe - full on, for a fan - rather than at a
+;  coin toss. The count is reported, because a fan that spends its life
+;  parked is a fan that should be on a PWM pin instead.
+; ----------------------------------------------------------------------
+
+; PwmSoftPeriodUs(hz) - the period in microseconds, or 0 for a frequency
+; outside the software channel's envelope.
+Procedure.i PwmSoftPeriodUs(hz.i)
+  If hz < #PWM_SOFT_HZ_MIN Or hz > #PWM_SOFT_HZ_MAX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1000000 / hz
+EndProcedure
+
+; PwmSoftDrive(level) - the one place the pad is written, so the shadow
+; and the pin cannot disagree and the edge count is honest.
+Procedure PwmSoftDrive(level.i)
+  If level <> pwmsoft_level
+    pwmsoft_edges = pwmsoft_edges + 1
+  EndIf
+  pwmsoft_level = level
+  If level <> 0
+    PinHigh(pwmsoft_pin)
+  Else
+    PinLow(pwmsoft_pin)
+  EndIf
+EndProcedure
+
+; PwmSoftBegin(pin, hz, idleLevel) - claim a pin for software PWM.
+;
+; The pin is staged LOW and then made an output, the same order
+; Lib/gpio.pi4's PinHigh note describes and the same order the `gpio`
+; command uses, so the pad does not glitch through whatever the last
+; owner left in GPSET/GPCLR.
+Procedure.i PwmSoftBegin(pin.i, hz.i, idleLevel.i)
+  Define per.i
+  If GpioPinValid(pin) = 0
+    ProcedureReturn #PWM_ERR_PIN
+  EndIf
+  If pwmsoft_pin >= 0 And pwmsoft_pin <> pin
+    ProcedureReturn #PWM_ERR_SOFT
+  EndIf
+  per = PwmSoftPeriodUs(hz)
+  If per = 0
+    ProcedureReturn #PWM_ERR_HZ
+  EndIf
+  pwmsoft_pin      = pin
+  pwmsoft_periodUs = per
+  pwmsoft_highUs   = 0
+  pwmsoft_markUs   = Micros()
+  pwmsoft_idle     = idleLevel
+  pwmsoft_stalls   = 0
+  pwmsoft_edges    = 0
+  ; THE PIN IS STAGED LOW AND THEN MADE AN OUTPUT, the same order
+  ; Lib/gpio.pi4's PinHigh note describes and the same order the `gpio`
+  ; command uses, so the pad does not glitch through whatever the last
+  ; owner left in GPSET/GPCLR.
+  PinLow(pin)
+  PinOutput(pin)
+  ; The shadow is set to the OPPOSITE of what is about to be driven so
+  ; that the first PwmSoftDrive counts a real edge. Without it a channel
+  ; that begins at zero and stays there would report no edges at all and
+  ; look identical to one that was never serviced.
+  pwmsoft_level    = 1
+  PwmSoftDrive(0)
+  pwm_pin      = pin
+  pwm_wantHz   = hz
+  pwm_actualHz = 1000000 / per
+  pwm_duty     = 0
+  pwm_kind     = #PWM_KIND_SOFT
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; PwmSoftDuty(permille) - the fraction of each period the pin is high.
+Procedure.i PwmSoftDuty(permille.i)
+  If pwm_kind <> #PWM_KIND_SOFT
+    ProcedureReturn #PWM_ERR_STATE
+  EndIf
+  If permille < 0 Or permille > #PWM_DUTY_MAX
+    ProcedureReturn #PWM_ERR_DUTY
+  EndIf
+  pwmsoft_highUs = PwmDutyCounts(pwmsoft_periodUs, permille)
+  pwm_duty = permille
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; PwmSoftService() - drive the pin for right now. Call it as often as
+; possible; it is a subtraction and a compare when there is nothing to
+; do. Returns 1 if it drove an edge, 0 otherwise, so a caller that wants
+; to know whether it is keeping up can find out.
+;
+; THE RAILS ARE HANDLED BEFORE THE PHASE ARITHMETIC, not by it. A duty
+; of 0 with a period boundary in the past would otherwise drive high for
+; the zero microseconds between the two compares - a runt pulse at every
+; period, on a rail that is supposed to be a solid level.
+Procedure.i PwmSoftService()
+  Define now.i
+  Define since.i
+  If pwm_kind <> #PWM_KIND_SOFT
+    ProcedureReturn 0
+  EndIf
+  now = Micros()
+  since = now - pwmsoft_markUs
+
+  ; THE STALL RULE. A gap this long is not jitter, it is a caller that
+  ; stopped calling; park the pin and re-anchor so the first period
+  ; after the stall is a whole one rather than a fragment.
+  If since > pwmsoft_periodUs * #PWM_SOFT_STALL_PERIODS
+    pwmsoft_stalls = pwmsoft_stalls + 1
+    pwmsoft_markUs = now
+    PwmSoftDrive(pwmsoft_idle)
+    ProcedureReturn 1
+  EndIf
+
+  ; Advance to the current period. A While rather than an If because a
+  ; single late call can be more than one period late and still inside
+  ; the stall bound, and stepping the mark by one period at a time keeps
+  ; the phase rather than resetting it.
+  While since >= pwmsoft_periodUs
+    pwmsoft_markUs = pwmsoft_markUs + pwmsoft_periodUs
+    since = since - pwmsoft_periodUs
+  Wend
+
+  If pwmsoft_highUs <= 0
+    PwmSoftDrive(0)
+    ProcedureReturn 0
+  EndIf
+  If pwmsoft_highUs >= pwmsoft_periodUs
+    PwmSoftDrive(1)
+    ProcedureReturn 0
+  EndIf
+  If since < pwmsoft_highUs
+    PwmSoftDrive(1)
+  Else
+    PwmSoftDrive(0)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; PwmSoftEnd() - release the pin, as an input, for the reason PwmEnd
+; gives.
+Procedure.i PwmSoftEnd()
+  If pwm_kind <> #PWM_KIND_SOFT
+    ProcedureReturn #PWM_ERR_STATE
+  EndIf
+  PinInput(pwmsoft_pin)
+  pwmsoft_pin      = -1
+  pwmsoft_periodUs = 0
+  pwmsoft_highUs   = 0
+  pwmsoft_level    = 0
+  pwm_pin      = -1
+  pwm_wantHz   = 0
+  pwm_actualHz = 0
+  pwm_duty     = 0
+  pwm_kind     = #PWM_KIND_NONE
+  ProcedureReturn #PWM_OK
+EndProcedure
+
+; ======================================================================
+;  WHAT IS RUNNING - read by the command that has to report it
+; ======================================================================
+Procedure.i PwmKind()
+  ProcedureReturn pwm_kind
+EndProcedure
+
+Procedure.i PwmPin()
+  ProcedureReturn pwm_pin
+EndProcedure
+
+Procedure.i PwmHz()
+  ProcedureReturn pwm_actualHz
+EndProcedure
+
+Procedure.i PwmRequestedHz()
+  ProcedureReturn pwm_wantHz
+EndProcedure
+
+Procedure.i PwmDutyNow()
+  ProcedureReturn pwm_duty
+EndProcedure
+
+Procedure.i PwmRange()
+  ProcedureReturn pwm_range
+EndProcedure
+
+Procedure.i PwmDivisor()
+  ProcedureReturn pwm_divi
+EndProcedure
+
+; PwmStartWrites() - how many control-byte writes the last PwmBegin
+; needed before the channel answered. One is the part behaving; more is
+; the clock-domain crossing that THE SILICON FACT describes, and it is
+; reported rather than hidden.
+Procedure.i PwmStartWrites()
+  ProcedureReturn pwm_startWrites
+EndProcedure
+
+Procedure.i PwmSoftStalls()
+  ProcedureReturn pwmsoft_stalls
+EndProcedure
+
+Procedure.i PwmSoftEdges()
+  ProcedureReturn pwmsoft_edges
+EndProcedure
+
+; PwmSoftLevel() - the shadow, not the pad. The pad is GPLEV's to answer
+; and DigitalRead is how a caller asks; this says what this file last
+; drove, which is the useful half when the two disagree.
+Procedure.i PwmSoftLevel()
+  ProcedureReturn pwmsoft_level
+EndProcedure

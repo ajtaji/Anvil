@@ -1,0 +1,357 @@
+; pi4Dwc2Device.pi4 - force the USB-C controller into DEVICE mode and
+; find out whether anything on the other end of the cable notices.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THE ONE QUESTION THIS ANSWERS, before anyone writes a gadget driver:
+; is the USB-C socket carrying DATA to the laptop, or only power?
+;
+; It is worth answering on its own because the answer is binary, it
+; takes a hundred lines, and the alternative is finding out after two
+; thousand. A hub in the middle may pass power and not D+/D-; a charge
+; cable certainly will not; and none of that is visible from this end
+; except by asking the bus.
+;
+; HOW THE ASKING WORKS. A USB host, on seeing a device attach, drives a
+; RESET down the port within a few hundred milliseconds - it has to, it
+; is the only way it can start talking. The DWC2 core latches that in
+; GINTSTS as USBRST, and then, once it has worked out the speed,
+; ENUMDONE. So:
+;
+;   force device mode, pull the data line up, wait, read GINTSTS
+;
+;   USBRST seen    -> the cable carries data and a host is talking
+;   nothing at all -> power only, or no host, and the gadget idea stops
+;                     here until the cabling changes
+;
+; WHAT pi4Dwc2Probe ALREADY ESTABLISHED, so it is not re-argued:
+;   GSNPSID $4F54280A     a DesignWare OTG core, release 2.80a
+;   OTG mode 0            HNP/SRP capable - device mode is available
+;   8 device endpoints, UTMI+ high-speed PHY, dynamic FIFO
+;   GUSBCFG $20402700     bit 29 FHMOD set - something forced HOST mode
+;
+; SO THE CORE IS CAPABLE AND HAS BEEN TOLD TO BE A HOST. Bits 29 and 30
+; of GUSBCFG are Force Host Mode and Force Device Mode; clearing one and
+; setting the other is the supported way to override the connector ID
+; pin, which on this board reads as A-device because a power hub is
+; attached. From Datasheets/pi4/dwc2/v6.12_hw.h:
+;
+;     GUSBCFG_FORCEDEVMODE   BIT(30)     hw.h:95
+;     GUSBCFG_FORCEHOSTMODE  BIT(29)     hw.h:96
+;
+; THE 25 MS IS NOT OPTIONAL. The core re-samples its mode and the PHY
+; has to follow; the databook requires at least 25 ms after writing
+; either force bit before the mode is stable. Linux waits 25 ms in
+; dwc2_force_mode(). Reading GINTSTS earlier just reports the old mode.
+;
+; SOFT DISCONNECT. DCTL bit 1 is SFTDISCON, and it is SET out of reset -
+; the core holds the pull-up off so software can get ready before the
+; host sees anything. Clearing it is the electrical equivalent of plugging the
+; cable in. Nothing here can be seen by the host until it is cleared.
+;
+;   PureMetalForge.exe --compile pi4Dwc2Device.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o dwc2dev.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+#DWC2_BASE = $FE980000
+
+#DWC2_GOTGCTL  = $000
+#DWC2_GAHBCFG  = $008
+#DWC2_GUSBCFG  = $00C
+#DWC2_GRSTCTL  = $010
+#DWC2_GINTSTS  = $014
+#DWC2_GINTMSK  = $018
+#DWC2_GSNPSID  = $040
+#DWC2_DCFG     = $800     ; hw.h, device configuration
+#DWC2_DCTL     = $804
+#DWC2_DSTS     = $808
+
+; GUSBCFG, hw.h:95-96
+#GUSBCFG_FORCEDEVMODE  = $40000000     ; BIT(30)
+#GUSBCFG_FORCEHOSTMODE = $20000000     ; BIT(29)
+
+; GRSTCTL, hw.h
+#GRSTCTL_CSFTRST = $00000001           ; core soft reset
+#GRSTCTL_AHBIDLE = $80000000           ; AHB master idle
+
+; GINTSTS bits that matter here, hw.h:124+
+#GINTSTS_CURMODE_HOST = $00000001
+#GINTSTS_USBRST       = $00001000
+#GINTSTS_ENUMDONE     = $00002000
+#GINTSTS_USBSUSP      = $00000800
+#GINTSTS_ERLYSUSP     = $00000400
+
+; DCTL
+#DCTL_SFTDISCON = $00000002
+
+Global gSavedUsbCfg.i          ; the firmware's PHY setup, across the reset
+
+#PWR_DOMAIN_USB = 3
+#TAG_SET_DOMAIN = $00028001
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure.i Rd(off.i)
+  ProcedureReturn PeekN(#DWC2_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure Wr(off.i, v.i)
+  PokeL(#DWC2_BASE + off, v)
+EndProcedure
+
+Procedure.i PowerOn()
+  If MailboxBegin(#TAG_SET_DOMAIN, 8, 8) = 0
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, #PWR_DOMAIN_USB)
+  MailboxSetWord(1, 3)          ; on, and wait for it
+  If MailboxSend() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MailboxWord(1) & 1
+EndProcedure
+
+Procedure.i Main()
+  Define v.i
+  Define i.i
+  Define seen.i
+  Define st.i
+
+  PrintNl()
+  UartWriteStr("=== USB-C: is anything listening? ===")
+  PrintNl()
+
+  If MailboxInit() = 0
+    UartWriteStr("!! mailbox failed")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PowerOn() = 0
+    UartWriteStr("!! the USB power domain would not come on")
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+  delay(10)
+
+  If ((Rd(#DWC2_GSNPSID) >> 16) & $FFFF) <> $4F54
+    UartWriteStr("!! not a DWC2 core at $FE980000")
+    PrintNl()
+    ProcedureReturn 3
+  EndIf
+  ; Keep the firmware's PHY configuration - the soft reset below throws
+  ; it away and nothing else on this board knows how to recompute it.
+  gSavedUsbCfg = Rd(#DWC2_GUSBCFG)
+  Row("GUSBCFG as found", gSavedUsbCfg, 8)
+  Row("GINTSTS as found", Rd(#DWC2_GINTSTS), 8)
+  UartWriteStr("  mode as found   ")
+  If (Rd(#DWC2_GINTSTS) & #GINTSTS_CURMODE_HOST) <> 0
+    UartWriteStr("HOST")
+  Else
+    UartWriteStr("DEVICE")
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  ; ---- force device mode ---------------------------------------------
+  UartWriteStr("forcing device mode ... ")
+  UartDrain()
+  v = Rd(#DWC2_GUSBCFG)
+  v = v & (~#GUSBCFG_FORCEHOSTMODE)
+  v = v | #GUSBCFG_FORCEDEVMODE
+  Wr(#DWC2_GUSBCFG, v)
+  delay(30)
+
+  ; A CORE SOFT RESET, because the force bit alone was not enough.
+  ; Writing GUSBCFG took - it read back $40402700, FDMOD set and FHMOD
+  ; clear - and GINTSTS did not move at all: still $5400002B, still
+  ; saying HOST. The core latches its operating mode at reset, so the
+  ; bit says what it should BECOME and the reset is what makes it.
+  ;
+  ; The sequence is the databook's and Linux's dwc2_core_reset(): wait
+  ; for the AHB master to go idle, set CSFTRST, then wait for the core
+  ; to clear it itself. Both waits are bounded - a core that never
+  ; answers must not hang the monitor.
+  UartWriteStr("core soft reset ... ")
+  UartDrain()
+  i = 0
+  While i < 10000 And (Rd(#DWC2_GRSTCTL) & #GRSTCTL_AHBIDLE) = 0
+    i = i + 1
+  Wend
+  If (Rd(#DWC2_GRSTCTL) & #GRSTCTL_AHBIDLE) = 0
+    UartWriteStr("the AHB master never went idle")
+    PrintNl()
+    ProcedureReturn 5
+  EndIf
+  Wr(#DWC2_GRSTCTL, Rd(#DWC2_GRSTCTL) | #GRSTCTL_CSFTRST)
+  i = 0
+  While i < 100000 And (Rd(#DWC2_GRSTCTL) & #GRSTCTL_CSFTRST) <> 0
+    i = i + 1
+  Wend
+  If (Rd(#DWC2_GRSTCTL) & #GRSTCTL_CSFTRST) <> 0
+    UartWriteStr("CSFTRST never self-cleared")
+    PrintNl()
+    ProcedureReturn 6
+  EndIf
+  UartWriteStr("done")
+  PrintNl()
+
+  ; The mode is re-sampled during the reset, and the databook allows
+  ; time for it to settle. Poll rather than guess at one delay.
+  i = 0
+  While i < 40 And (Rd(#DWC2_GINTSTS) & #GINTSTS_CURMODE_HOST) <> 0
+    delay(10)
+    i = i + 1
+  Wend
+  UartWriteStr("settled after ")
+  PrintDec(i * 10)
+  UartWriteStr(" ms")
+  PrintNl()
+
+  ; PUT THE PHY CONFIGURATION BACK. The soft reset wiped GUSBCFG -
+  ; $20402700 went in and $40401400 came out - and those cleared bits
+  ; are the PHY interface width, the turnaround time and the timeout
+  ; calibration that the FIRMWARE worked out for this board. Attaching
+  ; with them at their reset defaults is attaching with a misconfigured
+  ; PHY, and a host would see nothing on the wire. Restoring the
+  ; firmware's own value and only changing the mode bits keeps every
+  ; number that was measured rather than guessed.
+  v = gSavedUsbCfg
+  v = v & (~#GUSBCFG_FORCEHOSTMODE)
+  v = v | #GUSBCFG_FORCEDEVMODE
+  Wr(#DWC2_GUSBCFG, v)
+  delay(10)
+  Row("GUSBCFG restored", Rd(#DWC2_GUSBCFG), 8)
+
+  ; DCFG's low two bits are the device speed. 0 asks for high speed,
+  ; which is what a UTMI+ PHY is for; without setting it the core comes
+  ; out of reset at whatever the default is and may not drive the
+  ; pull-up the host is looking for.
+  Wr(#DWC2_DCFG, Rd(#DWC2_DCFG) & (~3))
+  delay(10)
+  Row("DCFG            ", Rd(#DWC2_DCFG), 8)
+  Row("GUSBCFG now  ", Rd(#DWC2_GUSBCFG), 8)
+  Row("GINTSTS now  ", Rd(#DWC2_GINTSTS), 8)
+  UartWriteStr("  mode now        ")
+  If (Rd(#DWC2_GINTSTS) & #GINTSTS_CURMODE_HOST) <> 0
+    UartWriteStr("HOST - the force bit did not take")
+    PrintNl()
+    UartWriteStr("=== stopping: it will not leave host mode ===")
+    PrintNl()
+    ProcedureReturn 4
+  EndIf
+  UartWriteStr("DEVICE")
+  PrintNl()
+  UartDrain()
+
+  ; ---- clear the latched status, then attach --------------------------
+  ; GINTSTS is write-one-to-clear. Clearing it first means anything seen
+  ; afterwards happened AFTER we attached, rather than being left over
+  ; from whatever the firmware was doing.
+  Wr(#DWC2_GINTSTS, $FFFFFFFF)
+
+  Row("DCTL before  ", Rd(#DWC2_DCTL), 8)
+  UartWriteStr("  soft disconnect ")
+  If (Rd(#DWC2_DCTL) & #DCTL_SFTDISCON) <> 0
+    UartWriteStr("SET - the host cannot see us yet")
+  Else
+    UartWriteStr("already clear")
+  EndIf
+  PrintNl()
+
+  UartWriteStr("attaching (clearing soft disconnect) ...")
+  PrintNl()
+  UartDrain()
+  v = Rd(#DWC2_DCTL)
+  Wr(#DWC2_DCTL, v & (~#DCTL_SFTDISCON))
+
+  ; ---- watch for the host --------------------------------------------
+  ; A host that sees an attach resets the port within a few hundred
+  ; milliseconds. Three seconds is far longer than it needs and short
+  ; enough to sit through.
+  UartWriteStr("watching GINTSTS for 3 s ")
+  UartDrain()
+  seen = 0
+  i = 0
+  While i < 30
+    st = Rd(#DWC2_GINTSTS)
+    seen = seen | st
+    delay(100)
+    UartWrite(46)
+    UartDrain()
+    i = i + 1
+  Wend
+  PrintNl()
+  Row("GINTSTS accumulated", seen, 8)
+  Row("DSTS               ", Rd(#DWC2_DSTS), 8)
+  PrintNl()
+
+  UartWriteStr("  USB reset seen    ")
+  If (seen & #GINTSTS_USBRST) <> 0
+    UartWriteStr("YES - a host is driving this port")
+  Else
+    UartWriteStr("no")
+  EndIf
+  PrintNl()
+  UartWriteStr("  enumeration done  ")
+  If (seen & #GINTSTS_ENUMDONE) <> 0
+    UartWriteStr("YES - the host has set the speed")
+  Else
+    UartWriteStr("no")
+  EndIf
+  PrintNl()
+  UartWriteStr("  suspend seen      ")
+  If (seen & (#GINTSTS_USBSUSP | #GINTSTS_ERLYSUSP)) <> 0
+    UartWriteStr("yes - a bus is there but idle")
+  Else
+    UartWriteStr("no")
+  EndIf
+  PrintNl()
+  PrintNl()
+
+  ; ---- the verdict -----------------------------------------------------
+  If (seen & #GINTSTS_USBRST) <> 0
+    UartWriteStr("=== THE CABLE CARRIES DATA. A gadget driver is worth writing. ===")
+  ElseIf (seen & (#GINTSTS_USBSUSP | #GINTSTS_ERLYSUSP)) <> 0
+    UartWriteStr("=== something is on the bus but it never reset us. ===")
+  Else
+    UartWriteStr("=== silence. Power only, or no host on this port. ===")
+  EndIf
+  PrintNl()
+
+  ; ---- PUT IT BACK -----------------------------------------------------
+  ; Leaving the core forced into device mode with its pull-up on would
+  ; be a rude thing to hand back to whatever runs next, and U-Boot's USB
+  ; is not expecting it.
+  Wr(#DWC2_DCTL, Rd(#DWC2_DCTL) | #DCTL_SFTDISCON)
+  v = Rd(#DWC2_GUSBCFG)
+  v = v & (~#GUSBCFG_FORCEDEVMODE)
+  v = v | #GUSBCFG_FORCEHOSTMODE
+  Wr(#DWC2_GUSBCFG, v)
+  delay(30)
+  UartWriteStr("(host mode restored)")
+  PrintNl()
+
+  ProcedureReturn 0
+EndProcedure

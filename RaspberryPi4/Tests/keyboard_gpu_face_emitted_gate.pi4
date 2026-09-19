@@ -1,0 +1,609 @@
+; ======================================================================
+;  keyboard_gpu_face_emitted_gate.pi4
+;
+;  THE V3D TIER'S KEY LABELS, EXECUTED. This is the tier the bench runs
+;  on - the 10.1 inch DSI panel with the console turned 90 degrees, where
+;  gCursorGpuOwned is 1 - and until now it drew its key labels with the
+;  engine's own one-bit cell face magnified, which is the staircase the
+;  smooth faces exist to remove. The band is now composed by the SAME
+;  procedure the framebuffer tier uses, and reaches the panel by the
+;  SAME route the banner's smooth title already does.
+;
+;  So there are two lifted things in this image and nothing else about
+;  either is retyped:
+;
+;    * TouchKeyboardComposeCpu, from between the compose fences in
+;      RaspberryPi4/Board/banner_clock.pi4, run with gCursorGpuOwned = 1
+;      over the real key model and the real view;
+;
+;    * ScrGpuKeepLogicalBand, from between its fences in
+;      RaspberryPi4/Board/screen_source.pi4, run over the real rotation
+;      arithmetic in RaspberryPi4/Board/screen_geom.pi4.
+;
+;  WHAT IT GRADES, and none of it can be read off the source:
+;
+;    1. THE COMPOSER RUNS AT ALL ON THIS TIER. It used to return at the
+;       second line when the GPU owned the frame. A gate that only
+;       checked faces would pass a composer that drew nothing.
+;    2. EVERY LABEL IS SET IN THE 30 px FACE where its box holds the
+;       face's line height and the label's real width, and in the cell
+;       font where it does not - at the same six surfaces the
+;       framebuffer tier's gate uses, so the two tiers are graded
+;       against one statement.
+;    3. THE BAND IS PAINTED WHOLE. What the presentation seam moves is a
+;       range of LOGICAL rows, and underneath them on a turned panel lies
+;       the GPU's PHYSICAL frame; a pass that painted only the keys would
+;       transpose the last frame's bytes onto the glass between them. The
+;       first rectangle has to cover the whole band and nothing drawn may
+;       leave it.
+;    4. THE DRAIN HAPPENS BEFORE THE COPY. Every pixel write, then
+;       a64_barrier, then the present - in that order, by execution and
+;       not by reading the file.
+;    5. THE POINTER'S SAVE-UNDER IS NOT TOUCHED on a tier that has none,
+;       and the mask is written again over the finished band instead.
+;    6. NOTHING OUTSIDE THE BAND IS THIS PASS'S while the GPU owns the
+;       frame: with the band down the composer draws nothing at all.
+;    7. THE CARRY IS THE BAND'S OWN PHYSICAL RECTANGLE at 0, 90, 180 and
+;       270, and the copy is drained before it is called finished.
+;
+;  DIAGNOSTIC. No MMIO, framebuffer, GPU submission, DMA or cache
+;  operation occurs; the harness arms a hard stop on any MMIO access.
+; ======================================================================
+
+#KG_MAGIC_AT = $06000000
+#KG_MAGIC    = $4B424750          ; "KBGP"
+#KG_META     = $06000100
+#KG_SCEN     = $06010000
+#KG_STRIDE   = $00010000
+#KG_KEEP     = $06100000
+#KG_KEEPSZ   = $00001000
+
+; Per scenario: a header, then one 96-byte record per drawn label.
+#KG_OK        = 0
+#KG_ITEMS     = 8
+#KG_LABELS    = 16
+#KG_SMOOTH    = 24
+#KG_BITMAP    = 32
+#KG_SCALEEND  = 40
+#KG_FIDMIN    = 48
+#KG_FIDMAX    = 56
+#KG_TEXTN     = 64
+#KG_RECTS     = 72                ; rectangles the pass filled
+#KG_R0X       = 80                ; and the FIRST one, which has to be
+#KG_R0Y       = 88                ; the whole band
+#KG_R0W       = 96
+#KG_R0H       = 104
+#KG_BANDY     = 112               ; the band the view laid out
+#KG_BANDH     = 120
+#KG_LW        = 128
+#KG_PRESN     = 136               ; ScrPresent calls
+#KG_PRESY0    = 144               ; and the logical rows it was given
+#KG_PRESY1    = 152
+#KG_LASTWRITE = 160               ; event number of the last pixel write
+#KG_BARRIER   = 168               ; event number of a64_barrier, 0 = never
+#KG_PRESENTAT = 176               ; event number of ScrPresent
+#KG_CURSORAT  = 184               ; event number of the pointer re-assert
+#KG_CURSOROPS = 192               ; save-under calls, which must be none
+#KG_OUTSIDE   = 200               ; draw items that left the band
+#KG_REC       = $400
+#KG_RECSZ     = 96
+#KG_MAXREC    = 200
+
+#KG_R_FACE   = 0                  ; 1 smooth, 2 bitmap
+#KG_R_BOXX   = 8
+#KG_R_BOXY   = 16
+#KG_R_BOXW   = 24
+#KG_R_BOXH   = 32
+#KG_R_DRAWX  = 40
+#KG_R_DRAWW  = 48
+#KG_R_TOP    = 56
+#KG_R_DRAWH  = 64
+#KG_R_TEXT   = 72
+
+; One carry result.
+#KG_K_RC    = 0
+#KG_K_DST   = 8
+#KG_K_SRC   = 16
+#KG_K_WIDE  = 24
+#KG_K_TALL  = 32
+#KG_K_PITCH = 40
+#KG_K_DMA   = 48                  ; 1 if the DMA engine took it
+#KG_K_ROWS  = 56                  ; CPU rows moved when it did not
+#KG_K_DRAIN = 64                  ; event number of the barrier, 0 = never
+#KG_K_LAST  = 72                  ; event number of the last byte moved
+
+; ---- the leaves console.pi4 needs and this gate does not exercise -----
+Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
+Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
+Procedure.i UartMirrorReadStyle() : ProcedureReturn 0 : EndProcedure
+
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+XIncludeFile "RaspberryPi4/Board/console.pi4"
+XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
+XIncludeFile "RaspberryPi4/Monitor/anvil_fonts.pi4"
+
+; ======================================================================
+;  THE BOARD'S LEAVES, RECORDED RATHER THAN PERFORMED.
+; ======================================================================
+#CUR_W = 8
+#CUR_H = 14
+
+; The panel this tier actually runs on, and its two Anvil-owned buffers.
+#MON_FB_SCAN    = $08A00000
+#MON_FB_DRAW    = $08E00000
+#MON_FB_PANEL_W = 800
+#MON_FB_PANEL_H = 1280
+
+Global gScreen.i = 1
+Global gCursorGpuOwned.i = 1
+Global gCurShown.i = 0
+Global gCurX.i = 0
+Global gCurY.i = 0
+Global dsp_scale.i = 1
+Global gTkbCpuDamage.i = #TKB_DAMAGE_ALL
+
+; The screen seam's own globals, which the carry reads.
+Global gScrSrc.i = #SCR_SRC_DSI
+Global gScrRot.i = 90
+Global gScrDsiUp.i = 1
+Global gDma.i = 0
+
+Global gKgEvent.i = 0             ; a monotonic event number, so ORDER is
+                                  ; a fact and not an assumption
+Global gKgSlot.i = 0
+Global gKgRecN.i = 0
+Global gKgSmooth.i = 0
+Global gKgBitmap.i = 0
+Global gKgFidMin.i = 99
+Global gKgFidMax.i = -1
+Global gKgBoxX.i
+Global gKgBoxY.i
+Global gKgBoxW.i
+Global gKgBoxH.i
+Global gKgCharX.i
+Global gKgCharY.i
+Global gKgCharN.i
+Global gKgCharText.i
+Global gKgRects.i = 0
+Global gKgR0X.i = -1
+Global gKgR0Y.i = -1
+Global gKgR0W.i = -1
+Global gKgR0H.i = -1
+Global gKgOutside.i = 0
+Global gKgLastWrite.i = 0
+Global gKgBarrier.i = 0
+Global gKgPresentAt.i = 0
+Global gKgPresN.i = 0
+Global gKgPresY0.i = -1
+Global gKgPresY1.i = -1
+Global gKgCursorAt.i = 0
+Global gKgCursorOps.i = 0
+Global gKgBandY.i = 0
+Global gKgBandH.i = 0
+Global gKgBandW.i = 0
+Global gKgKeep.i = 0              ; which carry slot is being recorded
+Global gKgKeepRows.i = 0
+Global gKgKeepDma.i = 0
+
+Procedure.i KgTick()
+  gKgEvent = gKgEvent + 1
+  ProcedureReturn gKgEvent
+EndProcedure
+
+; A rectangle that left the band is a rectangle the presentation seam
+; would not carry, or would carry with somebody else's pixels beside it.
+Procedure KgInside(x.i, y.i, w.i, h.i)
+  If gKgBandH < 1
+    ProcedureReturn
+  EndIf
+  If x < 0 Or y < gKgBandY Or (x + w) > gKgBandW Or (y + h) > (gKgBandY + gKgBandH)
+    gKgOutside = gKgOutside + 1
+  EndIf
+EndProcedure
+
+Procedure.i DisplayBase() : ProcedureReturn $01000000 : EndProcedure
+Procedure.i DisplayWidth() : ProcedureReturn 1280 : EndProcedure
+Procedure.i DisplayHeight() : ProcedureReturn 800 : EndProcedure
+Procedure.i DisplayPitch() : ProcedureReturn 1280 * 4 : EndProcedure
+Procedure.i DisplayCharWidth() : ProcedureReturn 8 * dsp_scale : EndProcedure
+Procedure.i DisplayCharHeight() : ProcedureReturn 16 * dsp_scale : EndProcedure
+Procedure DisplayScale(s.i) : dsp_scale = s : EndProcedure
+Procedure.i DisplayRGB(r.i, g.i, b.i) : ProcedureReturn ($FF000000 | (r << 16)) | (g << 8) | b : EndProcedure
+
+Procedure DisplayFillRect(x.i, y.i, w.i, h.i, c.i)
+  If gKgRects = 0
+    gKgR0X = x
+    gKgR0Y = y
+    gKgR0W = w
+    gKgR0H = h
+  EndIf
+  gKgRects = gKgRects + 1
+  KgInside(x, y, w, h)
+  gKgLastWrite = KgTick()
+EndProcedure
+
+Procedure DisplayFlushRect(x.i, y.i, w.i, h.i) : EndProcedure
+
+Procedure ScrPresent(y0.i, y1.i)
+  gKgPresN = gKgPresN + 1
+  gKgPresY0 = y0
+  gKgPresY1 = y1
+  gKgPresentAt = KgTick()
+EndProcedure
+
+Procedure a64_barrier()
+  If gKgKeep <> 0
+    PokeI(#KG_KEEP + gKgKeep * #KG_KEEPSZ + #KG_K_DRAIN, KgTick())
+    ProcedureReturn
+  EndIf
+  gKgBarrier = KgTick()
+EndProcedure
+
+; The pointer re-assert, recorded. The real one writes the mask into the
+; presented surface through ScrCaptureSnapshot; what this gate grades is
+; that it is reached AFTER the band, and that the save-under was never
+; touched to get there.
+Procedure TouchKeyboardPresentedCursor(y0.i, y1.i)
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  If gCurY > y1 Or (gCurY + #CUR_H - 1) < y0
+    ProcedureReturn
+  EndIf
+  gKgCursorAt = KgTick()
+EndProcedure
+
+; The reserved band above the console.
+Procedure.i LogoHeight() : ProcedureReturn 120 : EndProcedure
+Procedure CursorRestore(x.i, y.i) : gKgCursorOps = gKgCursorOps + 1 : EndProcedure
+Procedure CursorSave(x.i, y.i) : gKgCursorOps = gKgCursorOps + 1 : EndProcedure
+Procedure CursorDraw(x.i, y.i) : gKgCursorOps = gKgCursorOps + 1 : EndProcedure
+
+Procedure KgPut(field.i, value.i)
+  PokeI(#KG_SCEN + gKgSlot * #KG_STRIDE + #KG_REC + gKgRecN * #KG_RECSZ + field, value)
+EndProcedure
+
+; THE LABEL IS COPIED, NOT POINTED AT - the view hands labels out of one
+; reused arena.
+Procedure KgPutLabel(*s)
+  Define i.i
+  Define c.i
+  Define at.i
+  at = #KG_SCEN + gKgSlot * #KG_STRIDE + #KG_REC + gKgRecN * #KG_RECSZ + #KG_R_TEXT
+  i = 0
+  c = PeekA(*s) & $FF
+  While c <> 0 And i < 15
+    PokeA(at + i, c)
+    i = i + 1
+    c = PeekA(*s + i) & $FF
+  Wend
+  PokeA(at + i, 0)
+EndProcedure
+
+; THE GATE'S OWN READING OF THE SAME BAKED METRICS, the oracle for a
+; width and not the thing under test.
+Procedure.i SmoothTextWidth(*s, fid.i)
+  Define i.i
+  Define c.i
+  Define w.i
+  If fid < gKgFidMin : gKgFidMin = fid : EndIf
+  If fid > gKgFidMax : gKgFidMax = fid : EndIf
+  i = 0
+  w = 0
+  c = PeekA(*s) & $FF
+  While c <> 0
+    If c >= #FONT_keys_FIRST And c < (#FONT_keys_FIRST + #FONT_keys_COUNT)
+      w = w + PeekA(?fontKeysMeta + (c - #FONT_keys_FIRST) * 8)
+    EndIf
+    i = i + 1
+    c = PeekA(*s + i) & $FF
+  Wend
+  ProcedureReturn w
+EndProcedure
+
+Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i)
+  Define w.i
+  w = SmoothTextWidth(*s, fid)
+  If fid < gKgFidMin : gKgFidMin = fid : EndIf
+  If fid > gKgFidMax : gKgFidMax = fid : EndIf
+  If gKgRecN < #KG_MAXREC
+    KgPut(#KG_R_FACE, 1)
+    KgPut(#KG_R_BOXX, gKgBoxX)
+    KgPut(#KG_R_BOXY, gKgBoxY)
+    KgPut(#KG_R_BOXW, gKgBoxW)
+    KgPut(#KG_R_BOXH, gKgBoxH)
+    KgPut(#KG_R_DRAWX, x)
+    KgPut(#KG_R_DRAWW, w)
+    KgPut(#KG_R_TOP, base - #FONT_keys_ASC)
+    KgPut(#KG_R_DRAWH, #FONT_keys_LINEH)
+    KgPutLabel(*s)
+    gKgRecN = gKgRecN + 1
+  EndIf
+  gKgSmooth = gKgSmooth + 1
+  KgInside(x, base - #FONT_keys_ASC, w, #FONT_keys_LINEH)
+  gKgLastWrite = KgTick()
+  ProcedureReturn w
+EndProcedure
+
+Procedure DisplayChar(x.i, y.i, c.i, fg.i, bg.i)
+  If gKgCharN = 0
+    gKgCharX = x
+    gKgCharY = y
+  EndIf
+  gKgCharN = gKgCharN + 1
+  KgInside(x, y, DisplayCharWidth(), DisplayCharHeight())
+  gKgLastWrite = KgTick()
+EndProcedure
+
+Procedure.i KgDrawText(i.i)
+  gKgCharText = TouchKeyboardDrawText(i)
+  ProcedureReturn gKgCharText
+EndProcedure
+
+Procedure KgCloseBitmapRun()
+  If gKgCharN < 1
+    ProcedureReturn
+  EndIf
+  If gKgRecN < #KG_MAXREC
+    KgPut(#KG_R_FACE, 2)
+    KgPut(#KG_R_BOXX, gKgBoxX)
+    KgPut(#KG_R_BOXY, gKgBoxY)
+    KgPut(#KG_R_BOXW, gKgBoxW)
+    KgPut(#KG_R_BOXH, gKgBoxH)
+    KgPut(#KG_R_DRAWX, gKgCharX)
+    KgPut(#KG_R_DRAWW, gKgCharN * DisplayCharWidth())
+    KgPut(#KG_R_TOP, gKgCharY)
+    KgPut(#KG_R_DRAWH, DisplayCharHeight())
+    KgPutLabel(gKgCharText)
+    gKgRecN = gKgRecN + 1
+  EndIf
+  gKgBitmap = gKgBitmap + 1
+  gKgCharN = 0
+EndProcedure
+
+Procedure.i KgDrawX(i.i)
+  KgCloseBitmapRun()
+  gKgBoxX = TouchKeyboardDrawX(i)
+  ProcedureReturn gKgBoxX
+EndProcedure
+Procedure.i KgDrawY(i.i)
+  gKgBoxY = TouchKeyboardDrawY(i)
+  ProcedureReturn gKgBoxY
+EndProcedure
+Procedure.i KgDrawW(i.i)
+  gKgBoxW = TouchKeyboardDrawW(i)
+  ProcedureReturn gKgBoxW
+EndProcedure
+Procedure.i KgDrawH(i.i)
+  gKgBoxH = TouchKeyboardDrawH(i)
+  ProcedureReturn gKgBoxH
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CARRY'S LEAVES. Neither moves a byte; both record what was asked
+;  for, so the checker can compare the rectangle against its own
+;  arithmetic over the panel's geometry.
+; ----------------------------------------------------------------------
+Procedure.i DmaCopy2D(dst.i, dpitch.i, src.i, spitch.i, wide.i, tall.i)
+  Define b.i
+  b = #KG_KEEP + gKgKeep * #KG_KEEPSZ
+  PokeI(b + #KG_K_DST, dst)
+  PokeI(b + #KG_K_SRC, src)
+  PokeI(b + #KG_K_WIDE, wide)
+  PokeI(b + #KG_K_TALL, tall)
+  PokeI(b + #KG_K_PITCH, dpitch)
+  PokeI(b + #KG_K_DMA, 1)
+  PokeI(b + #KG_K_LAST, KgTick())
+  ProcedureReturn 1
+EndProcedure
+
+Procedure DspCopyUp(dst.i, src.i, bytes.i)
+  Define b.i
+  b = #KG_KEEP + gKgKeep * #KG_KEEPSZ
+  If gKgKeepRows = 0
+    PokeI(b + #KG_K_DST, dst)
+    PokeI(b + #KG_K_SRC, src)
+    PokeI(b + #KG_K_WIDE, bytes)
+  EndIf
+  gKgKeepRows = gKgKeepRows + 1
+  PokeI(b + #KG_K_LAST, KgTick())
+EndProcedure
+
+; ---- the two lifted productions --------------------------------------
+XIncludeFile "RaspberryPi4/Tests/_keyboard_gpu_face_lift.pbi"
+XIncludeFile "RaspberryPi4/Tests/_keyboard_gpu_keep_lift.pbi"
+
+; ----------------------------------------------------------------------
+;  One scenario: lay the real keyboard out at a surface, show it, and run
+;  the real composer over the real draw list WITH THE GPU OWNING THE
+;  FRAME - which is the whole point of this gate.
+; ----------------------------------------------------------------------
+Global gKgM.TouchKeyboardMetrics
+
+Procedure.i KgScenario(slot.i, page.i, lw.i, lh.i, ppi.i, ds.i, show.i, cursorY.i)
+  Define b.i
+  Define i.i
+  Define n.i
+  b = #KG_SCEN + slot * #KG_STRIDE
+  gKgSlot = slot
+  gKgRecN = 0
+  gKgSmooth = 0
+  gKgBitmap = 0
+  gKgCharN = 0
+  gKgFidMin = 99
+  gKgFidMax = -1
+  gKgRects = 0
+  gKgR0X = -1
+  gKgR0Y = -1
+  gKgR0W = -1
+  gKgR0H = -1
+  gKgOutside = 0
+  gKgLastWrite = 0
+  gKgBarrier = 0
+  gKgPresentAt = 0
+  gKgPresN = 0
+  gKgPresY0 = -1
+  gKgPresY1 = -1
+  gKgCursorAt = 0
+  gKgCursorOps = 0
+  dsp_scale = ds
+
+  TouchKeyboardInit()
+  TkSetPage(page)
+  gKgM\logicalW     = lw
+  gKgM\logicalH     = lh
+  gKgM\bannerH      = 120
+  gKgM\cellW        = 8 * ds
+  gKgM\cellH        = 16 * ds
+  gKgM\ppi          = ppi
+  gKgM\displayScale = ds
+  If TouchKeyboardLayout(@gKgM) = 0
+    PokeI(b + #KG_OK, 0)
+    ProcedureReturn 0
+  EndIf
+  TouchKeyboardViewSetVisible(show)
+  TouchKeyboardMarkAll()
+  gTkbCpuDamage = #TKB_DAMAGE_CHANGED
+  gKgBandY = TouchKeyboardBandY()
+  gKgBandH = TouchKeyboardBandH()
+  gKgBandW = TouchKeyboardBandW()
+  If show = 0
+    ; Nothing outside the band is this pass's on this tier, so there is
+    ; no band to be inside of either.
+    gKgBandH = 0
+  EndIf
+
+  ; A POINTER ON THE GLASS, over the band, so the re-assert is exercised
+  ; and the save-under's absence is a measured fact.
+  gCurShown = Bool(cursorY >= 0)
+  gCurX = 40
+  If cursorY >= 0
+    gCurY = cursorY
+  Else
+    gCurY = 0
+  EndIf
+
+  TouchKeyboardComposeCpu()
+  KgCloseBitmapRun()
+
+  n = 0
+  i = 0
+  While i < TouchKeyboardDrawCount()
+    If TouchKeyboardDrawKind(i) = #TKB_DRAW_TEXT
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+  PokeI(b + #KG_TEXTN, n)
+
+  PokeI(b + #KG_OK, 1)
+  PokeI(b + #KG_ITEMS, TouchKeyboardDrawCount())
+  PokeI(b + #KG_LABELS, gKgSmooth + gKgBitmap)
+  PokeI(b + #KG_SMOOTH, gKgSmooth)
+  PokeI(b + #KG_BITMAP, gKgBitmap)
+  PokeI(b + #KG_SCALEEND, dsp_scale)
+  PokeI(b + #KG_FIDMIN, gKgFidMin)
+  PokeI(b + #KG_FIDMAX, gKgFidMax)
+  PokeI(b + #KG_RECTS, gKgRects)
+  PokeI(b + #KG_R0X, gKgR0X)
+  PokeI(b + #KG_R0Y, gKgR0Y)
+  PokeI(b + #KG_R0W, gKgR0W)
+  PokeI(b + #KG_R0H, gKgR0H)
+  PokeI(b + #KG_BANDY, TouchKeyboardBandY())
+  PokeI(b + #KG_BANDH, TouchKeyboardBandH())
+  PokeI(b + #KG_LW, TouchKeyboardBandW())
+  PokeI(b + #KG_PRESN, gKgPresN)
+  PokeI(b + #KG_PRESY0, gKgPresY0)
+  PokeI(b + #KG_PRESY1, gKgPresY1)
+  PokeI(b + #KG_LASTWRITE, gKgLastWrite)
+  PokeI(b + #KG_BARRIER, gKgBarrier)
+  PokeI(b + #KG_PRESENTAT, gKgPresentAt)
+  PokeI(b + #KG_CURSORAT, gKgCursorAt)
+  PokeI(b + #KG_CURSOROPS, gKgCursorOps)
+  PokeI(b + #KG_OUTSIDE, gKgOutside)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One carry: the band's physical rectangle at a rotation, moved out of
+;  the presented front and into the GPU's target.
+; ----------------------------------------------------------------------
+Procedure KgCarry(slot.i, rot.i, dma.i, y0.i, y1.i)
+  Define b.i
+  b = #KG_KEEP + slot * #KG_KEEPSZ
+  gKgKeep = slot
+  gKgKeepRows = 0
+  gScrRot = rot
+  gDma = dma
+  PokeI(b + #KG_K_DMA, 0)
+  PokeI(b + #KG_K_DRAIN, 0)
+  PokeI(b + #KG_K_LAST, 0)
+  PokeI(b + #KG_K_RC, ScrGpuKeepLogicalBand(#MON_FB_DRAW, y0, y1))
+  PokeI(b + #KG_K_ROWS, gKgKeepRows)
+  gKgKeep = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  And the case the carry must REFUSE: a renderer drawing straight into
+;  the surface that is being scanned. There is nothing to carry there,
+;  and carrying would copy the band over itself while the panel reads it.
+; ----------------------------------------------------------------------
+Procedure KgCarrySingleBuffered(slot.i, y0.i, y1.i)
+  Define b.i
+  b = #KG_KEEP + slot * #KG_KEEPSZ
+  gKgKeep = slot
+  gKgKeepRows = 0
+  gScrSrc = #SCR_SRC_HDMI
+  gDma = 1
+  PokeI(b + #KG_K_DMA, 0)
+  PokeI(b + #KG_K_DRAIN, 0)
+  PokeI(b + #KG_K_LAST, 0)
+  PokeI(b + #KG_K_RC, ScrGpuKeepLogicalBand(DisplayBase(), y0, y1))
+  PokeI(b + #KG_K_ROWS, gKgKeepRows)
+  gScrSrc = #SCR_SRC_DSI
+  gDma = 0
+  gKgKeep = 0
+EndProcedure
+
+Procedure.i Main()
+  PokeI(#KG_MAGIC_AT, #KG_MAGIC)
+
+  ; 0 - THE BENCH PANEL, landscape, the geometry a finger touches, with a
+  ; pointer sitting on the band.
+  KgScenario(0, 0, 1280, 800, 149, 1, 1, 600)
+  ; 1 - the panel's own portrait scan, where the keys are narrower.
+  KgScenario(1, 0, 800, 1280, 149, 1, 1, -1)
+  ; 2 - the bench panel at the large-text setting.
+  KgScenario(2, 0, 1280, 800, 149, 2, 1, -1)
+  ; 3 - the symbol page, landscape.
+  KgScenario(3, 1, 1280, 800, 149, 1, 1, -1)
+  ; 4 - the smallest surface the arrangement fits: the fallback's reason
+  ; to exist, on this tier too.
+  KgScenario(4, 0, 640, 480, 149, 1, 1, -1)
+  ; 5 - a screen that never said how big it is.
+  KgScenario(5, 0, 1280, 800, 0, 1, 1, -1)
+  ; 6 - THE BAND DOWN. The button beside the prompt belongs to the GPU
+  ; frame on this tier and this pass may draw nothing at all.
+  KgScenario(6, 0, 1280, 800, 149, 1, 0, -1)
+
+  ; The carry, at every rotation the panel is offered, over the band the
+  ; bench panel lays out.
+  KgScenario(0, 0, 1280, 800, 149, 1, 1, 600)
+  KgCarry(1, 90, 0, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+  KgCarry(2, 90, 1, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+  KgCarry(3, 270, 0, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+  gScrRot = 0
+  KgScenario(7, 0, 800, 1280, 149, 1, 1, -1)
+  KgCarry(4, 0, 0, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+  KgCarry(5, 180, 0, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+  KgCarrySingleBuffered(6, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+  gScrRot = 90
+
+  PokeI(#KG_META, #FONT_keys_LINEH)
+  PokeI(#KG_META + 8, #FONT_keys_ASC)
+  PokeI(#KG_META + 16, #MON_FB_PANEL_W)
+  PokeI(#KG_META + 24, #MON_FB_PANEL_H)
+  PokeI(#KG_META + 32, #MON_FB_SCAN)
+  PokeI(#KG_META + 40, #MON_FB_DRAW)
+  ProcedureReturn 0
+EndProcedure

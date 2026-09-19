@@ -1,0 +1,68 @@
+#HW_FILE_OK = 0
+#HW_FILE_NOTFOUND = 1
+#HW_FILE_NOMEDIUM = 2
+#HW_FILE_READONLY = 3
+Global gate_fileError.i = #HW_FILE_NOTFOUND
+Global gate_fileOpen.i : Global gate_fileSize.i : Global gate_readRc.i
+Procedure.i HwFileOpen(*n) : ProcedureReturn gate_fileOpen : EndProcedure
+Procedure.i HwFileLastError() : ProcedureReturn gate_fileError : EndProcedure
+Procedure.i HwFileSize() : ProcedureReturn gate_fileSize : EndProcedure
+Procedure.i HwFileReadAt(o.i,*b,n.i) : ProcedureReturn gate_readRc : EndProcedure
+Procedure HwFileClose() : EndProcedure
+Procedure.i HwFileWritable() : ProcedureReturn 0 : EndProcedure
+Procedure.i HwFileWriteAll(*n,*b,l.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i HwFileErrorText(e.i) : ProcedureReturn "error" : EndProcedure
+Procedure PutS(*b,p.i,m.i,*s) : EndProcedure
+
+; @@PRODUCTION_SETTINGS@@
+
+Global Dim gate_text.a[128]
+Procedure.i GateLine(at.i, *s)
+  Define i.i
+  i = 0
+  While PeekA(*s + i) <> 0
+    gate_text[at + i] = PeekA(*s + i)
+    i = i + 1
+  Wend
+  gate_text[at + i] = 10
+  ProcedureReturn at + i + 1
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  Define n.i
+  SettingsReset()
+  If SettingsWifiRevision() <> 0 : ProcedureReturn 1 : EndIf
+  If SettingsSet("fan.mode", "on") = 0 Or SettingsWifiRevision() <> 0 : ProcedureReturn 2 : EndIf
+  If SettingsSet("WiFi.Network", "bench") = 0 Or SettingsWifiRevision() <> 1 : ProcedureReturn 3 : EndIf
+  If SettingsSet("wifi.network", "bench") = 0 Or SettingsWifiRevision() <> 1 : ProcedureReturn 4 : EndIf
+  If SettingsSet("wifi.1.pmk.secret", "cache") = 0 Or SettingsWifiRevision() <> 1 : ProcedureReturn 5 : EndIf
+  If SettingsSet("wifi.1.pmk.secret", "new-cache") = 0 Or SettingsWifiRevision() <> 1 : ProcedureReturn 16 : EndIf
+  If SettingsRemove("wifi.missing") <> 0 Or SettingsWifiRevision() <> 1 : ProcedureReturn 6 : EndIf
+  If SettingsRemove("wifi.network") = 0 Or SettingsWifiRevision() <> 2 : ProcedureReturn 7 : EndIf
+
+  If SettingsSet("wifi.network", "old") = 0 : ProcedureReturn 8 : EndIf
+  n = GateLine(0, "wifi.1.ssid=one")
+  n = GateLine(n, "wifi.1.password.plaintext=12345678")
+  r = SettingsParse(@gate_text[0], n)
+  If r = 0 Or SettingsWifiRevision() <> 4 : ProcedureReturn 9 : EndIf
+  n = GateLine(0, "wifi.2.ssid=two")
+  n = GateLine(n, "bad line")
+  r = SettingsParse(@gate_text[0], n)
+  If r <> 0 Or SettingsLoadState() <> 2 Or SettingsWifiRevision() <> 5 : ProcedureReturn 10 : EndIf
+  SettingsDiscardLoad()
+  If SettingsWifiRevision() <> 5 : ProcedureReturn 11 : EndIf
+
+  r = SettingsParse(0, 0)
+  If r <> 0 Or SettingsWifiRevision() <> 6 : ProcedureReturn 12 : EndIf
+  If SettingsSet("wifi.network", "before-negative") = 0 Or SettingsWifiRevision() <> 7 : ProcedureReturn 13 : EndIf
+  r = SettingsParse(@gate_text[0], -1)
+  If r <> 0 Or SettingsWifiRevision() <> 8 : ProcedureReturn 14 : EndIf
+  If SettingsSet("wifi.network", "after-negative") = 0 Or SettingsWifiRevision() <> 9 : ProcedureReturn 15 : EndIf
+  If SettingsSet("wifi.password.plaintext", "12345678") = 0 Or SettingsWifiRevision() <> 10 : ProcedureReturn 18 : EndIf
+  gate_fileOpen = 1 : gate_fileSize = 4 : gate_readRc = -1
+  If SettingsLoad() <> 0 Or SettingsWifiRevision() <> 10 Or SettingsHas("wifi.network") = 0 : ProcedureReturn 19 : EndIf
+  gate_fileOpen = 0 : gate_fileError = #HW_FILE_NOTFOUND
+  If SettingsLoad() <> 0 Or SettingsWifiRevision() <> 11 : ProcedureReturn 20 : EndIf
+  ProcedureReturn 0
+EndProcedure

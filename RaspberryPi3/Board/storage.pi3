@@ -1,0 +1,340 @@
+; Pi 3 storage composition over the shared filesystem and file facade.
+; Reader requests use the native ranged SD interface. The file facade holds
+; Pi3StorageWriteBlocks as its writer and arms it only during a file operation.
+; That wrapper additionally fences each block request to its exact range and
+; closes the SD window afterwards. Block zero is never writable here.
+;
+; Boot confirmation mounts partition 1 without scanning free space. A/B record
+; I/O is shared by all Pi 3 compositions in Lib/boot_record.pbi: existing,
+; contiguous, 512-byte control files are replaced without allocation changes,
+; under one-sector fences. Their allocation can occupy a larger cluster.
+; Shared ab_record owns record validation, state changes, CRC and readback.
+;
+; Include after SDHOST, filesystem, hwfile, ab_record and boot_record.
+
+Global gPi3StorageUp.i          ; 1 once a filesystem is mounted for us
+Global gPi3StorageWhy.i         ; the refusal code from the last attempt
+Global gPi3StoragePart.i        ; the partition FsMount() took
+
+; THE THREE VALUES Anvil/Storage/hwfile.pbi READS, and nothing else. It
+; declares them; this file is what sets them. gHwFileWriter is HELD, not
+; installed - the shared seam arms it for the length of one write and
+; disarms it on every path out, so between writes the filesystem has no
+; way to write at all. 0 means this medium is readable and not writable.
+;
+; gPi3FileWriter is this board's own name for the same pointer, used by
+; the A/B record callbacks at the foot of this file, which arm and disarm
+; it themselves for the one write that decides whether the board boots
+; this image again.
+Global gPi3FileWriter.i
+
+; ----------------------------------------------------------------------
+;  Pi3StorageCanWrite() - whether the native medium can accept writes.
+;
+;  Called by StorageUp() before anything writes, including the A/B
+;  confirm. It answers 1 or 0; a 0 leaves the medium readable and
+;  HwFileWritable() then says so, which is the honest state rather than a
+;  write that fails half way through a settings file.
+; ----------------------------------------------------------------------
+Procedure.i Pi3StorageCanWrite()
+  ProcedureReturn Bool(p3sd_ready <> 0 And p3sd_blocks > 1)
+EndProcedure
+
+; The file facade arms this callback for one operation. Each block request
+; additionally opens only its own SD range and closes it on success or failure.
+Procedure.i Pi3StorageWriteBlocks(lba.i, count.i, buffer.i)
+  Protected ok.i
+  If Pi3StorageCanWrite() = 0 Or lba < 1 Or count < 1 : ProcedureReturn 0 : EndIf
+  If lba >= p3sd_blocks Or count > p3sd_blocks - lba : ProcedureReturn 0 : EndIf
+  If Pi3SdSetWriteWindow(lba, count) = 0 : ProcedureReturn 0 : EndIf
+  ok = Pi3SdWriteBlocks(lba, count, buffer)
+  Pi3SdSetWriteWindow(0, 0)
+  ProcedureReturn ok
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  pi3StorageMountAny() - mount partition 1, and if that fails, any other.
+;
+;  PARTITION 1 FIRST AND BY NAME, not "the first one that mounts". A path
+;  with no N: prefix means partition 1, so a board that quietly mounted
+;  partition 2 because partition 1 was damaged would open a DIFFERENT
+;  file for the same name - including the settings file, which is how a
+;  board would come up with no network credentials and no complaint.
+;
+;  The fallback still exists, and it prints. A card whose boot partition
+;  will not mount is a card an operator needs to look at, and a monitor
+;  that can still read the data partition is a monitor they can look at
+;  it FROM.
+;
+;  This is RaspberryPi4/Board/storage.pi4's storage_MountAny() with the
+;  medium name folded in, because there is only one medium here.
+; ----------------------------------------------------------------------
+Procedure.i pi3StorageMountAny()
+  Define n.i
+  If FsSelectPartition(1) <> 0
+    ProcedureReturn 1
+  EndIf
+  PrintN("!! partition 1 of the card could not be mounted, so a path with no N:")
+  PrintN("   prefix will not open. The other partitions are tried next.")
+  Print("   The filesystem said: ")
+  UartWriteStr(FsErrorText())
+  PrintNl()
+  n = 2
+  While n <= #FS_MAX_PARTITION
+    If FsSelectPartition(n) <> 0
+      ProcedureReturn 1
+    EndIf
+    n = n + 1
+  Wend
+  PrintN("!! no partition on the card could be mounted at all. Nothing that reads")
+  PrintN("   or writes a file will work this boot. The card is the one the board")
+  PrintN("   booted from, so the loader could read it - which points at the")
+  PrintN("   partition table or at a filesystem this monitor does not recognise")
+  PrintN("   rather than at the medium.")
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE CONFIRM PATH IS SIZED IN CARD READS, NOT IN LINES
+; ======================================================================
+;  MEASURED ON SILICON, 2026-09-18: a single-block read on this card
+;  costs MORE THAN FOURTEEN MILLISECONDS, and the boot chain's own mount
+;  spends 1,039 of them. The boot lane is chasing the per-read cost - a
+;  status poll after every read is the lead - but until that lands, the
+;  arithmetic is brutal and it decides the shape of this file: at 14 ms
+;  a read, SEVENTY-FOUR READS IS A SECOND, and the loader's never-fed
+;  watchdog gives this monitor FIFTEEN.
+;
+;  So the confirm does the LEAST CARD WORK THAT CAN POSSIBLY CONFIRM,
+;  and everything else waits until the deadman is off:
+;
+;    IN THE WINDOW   mount partition 1; open the ONE control record the
+;                    handoff page names; read it; rewrite it; read it
+;                    back. Nothing else is opened, no directory is
+;                    listed, the second partition is not touched and no
+;                    report is printed.
+;    AFTER IT        StorageUp() does the rest, lazily, the first time a
+;                    command actually needs a file.
+;
+;  THE SECOND PARTITION IS THE ONE TO WATCH. Mounting exFAT means reading
+;  its boot region and its allocation bitmap, and doing that inside the
+;  window to be tidy would be how a board that works becomes a board that
+;  resets every fifteen seconds with no explanation.
+;
+;  WHY NOT SIMPLY WIDEN THE WINDOW. It is the immutable loader's, it is
+;  deliberately never fed, and it is the only thing that gets the board
+;  back if this image is bad. A monitor that needed it widened would be
+;  asking for the safety net to be raised because it was slow.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Pi3StorageForConfirm() - the minimum: a reader, closed write window, and
+;  partition 1.
+;
+;  IT PRINTS NOTHING ON THE WAY IN. Every line printed at 115200 is
+;  another millisecond, and this runs against a clock.
+; ----------------------------------------------------------------------
+Procedure.i Pi3StorageForConfirm()
+  If gPi3StorageUp <> 0
+    ProcedureReturn 1
+  EndIf
+  If p3sd_ready = 0
+    gPi3StorageWhy = -1
+    ProcedureReturn 0
+  EndIf
+  FsSetRangeReader(@Pi3SdReadBlocks)
+  FsSetRangeWriter(0)
+  Pi3SdSetWriteWindow(0, 0)
+  If Pi3StorageCanWrite() <> 0
+    gPi3FileWriter = @Pi3StorageWriteBlocks
+    gHwFileWriter = @Pi3StorageWriteBlocks
+    gHwFileWritable = 1
+  Else
+    gPi3FileWriter = 0
+    gHwFileWriter = 0
+    gHwFileWritable = 0
+  EndIf
+  ; PARTITION 1 ONLY, and FsMount rather than the fallback walk: the
+  ; control records are on the boot partition or they are nowhere, and
+  ; trying three more partitions inside the window would cost more than
+  ; it could ever find.
+  If FsMount(1) = 0
+    gHwFileMounted = 0
+    gPi3FileWriter = 0
+    gHwFileWriter = 0
+    gHwFileWritable = 0
+    gPi3StorageWhy = FsLastError()
+    ProcedureReturn 0
+  EndIf
+  gPi3StoragePart = FsPartition()
+  gPi3StorageUp = 1
+  gHwFileMounted = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  StorageUp() - bring the medium up and mount a filesystem on it.
+;
+;  THE MEDIUM IS ALREADY UP BY THE TIME THIS RUNS, and this procedure
+;  does not bring it up again. Pi3SdInit() was called during boot, before
+;  the MMU, because it needs the firmware mailbox for its clock
+;  (sdhost.pbi line 173 asks Pi3ClockRate(4)) and the mailbox stops
+;  answering once the MMU is on - the whole argument is in the ORDER
+;  section of RaspberryPi3/Lib/mmu.pi3. Pi3SdInit() also refuses a second
+;  attempt outright (p3sd_attempted), so calling it here would turn a
+;  working card into a refusal.
+;
+;  So what this does is the FILESYSTEM half: install this board's reader
+;  and held writer on the shared layer, close the write window, and mount.
+;
+;  IT IS IDEMPOTENT. A command calls HwStorageUp() before it reads files
+;  and has no idea whether another command did so first.
+; ----------------------------------------------------------------------
+Procedure.i StorageUp()
+  If gPi3StorageUp <> 0
+    ProcedureReturn 1
+  EndIf
+
+  If p3sd_ready = 0
+    gPi3StorageWhy = -1
+    PrintN("!! the SD host did not come up during boot, so there is no medium to")
+    PrintN("   mount. Everything that reads or writes a file is unavailable this")
+    PrintN("   boot. The reason was printed while the board was starting.")
+    ProcedureReturn 0
+  EndIf
+
+  ; THE CONFIRM PATH HAS USUALLY DONE ALL OF THIS ALREADY, and the early
+  ; return above is what makes this cheap. This body runs only when the
+  ; confirm did not happen or did not get this far - a slot started by
+  ; hand, or a card that would not mount in the window.
+  ;
+  ; The reader is this board's. FsSetRange* installs into BOTH
+  ; filesystems, so one call covers FAT32 and exFAT and they cannot end
+  ; up with different block sources.
+  FsSetRangeReader(@Pi3SdReadBlocks)
+
+  ; The facade holds this bounded ranged writer; it is not armed here.
+  ; Each physical request opens only its own nonzero block range and closes
+  ; that range when it returns. Mount failures clear all writable state.
+  FsSetRangeWriter(0)
+  Pi3SdSetWriteWindow(0, 0)
+  If Pi3StorageCanWrite() <> 0
+    gPi3FileWriter = @Pi3StorageWriteBlocks
+    gHwFileWriter = @Pi3StorageWriteBlocks
+    gHwFileWritable = 1
+  Else
+    ; Readable, not writable. The pointer stays 0, HwFileWritable()
+    ; answers 0, and a caller refuses loudly rather than finding out half
+    ; way through a settings file.
+    gPi3FileWriter = 0
+    gHwFileWriter = 0
+    gHwFileWritable = 0
+  EndIf
+
+  If pi3StorageMountAny() = 0
+    gHwFileMounted = 0
+    gPi3FileWriter = 0
+    gHwFileWriter = 0
+    gHwFileWritable = 0
+    gPi3StorageWhy = FsLastError()
+    ProcedureReturn 0
+  EndIf
+
+  gPi3StoragePart = FsPartition()
+  gPi3StorageUp = 1
+  gHwFileMounted = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwStorageUp()
+  ProcedureReturn StorageUp()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwStorageReport() - the paragraph `help` and `info` print about where
+;  files come from on this board.
+; ----------------------------------------------------------------------
+Procedure HwStorageReport()
+  If gPi3StorageUp = 0
+    PrintN("  Files come from the SD card the board booted from, through this")
+    PrintN("  monitor's own host driver. Nothing is mounted yet - the first")
+    PrintN("  command that needs a file will mount it and say so if it cannot.")
+    ProcedureReturn
+  EndIf
+  Print("  Files come from partition ")
+  PrintDec(gPi3StoragePart)
+  Print(" of the SD card the board booted from, ")
+  If FsType() = 2
+    Print("formatted exFAT")
+  Else
+    Print("formatted FAT32")
+  EndIf
+  PrintN(".")
+  PrintN("  The card is read and written one block at a time by this monitor's own")
+  PrintN("  host driver, and the filesystem code above it is the same code every")
+  PrintN("  Anvil board uses - nothing about FAT32 or exFAT is written twice.")
+  If gPi3FileWriter = 0
+    PrintN("  It is MOUNTED READ-ONLY: the write window could not be opened, so")
+    PrintN("  save, mkdir and rm will refuse rather than half-write a file.")
+    ProcedureReturn
+  EndIf
+  PrintN("  Writes are allowed everywhere except the partition table in block 0,")
+  PrintN("  which this monitor never has a reason to write and will not.")
+EndProcedure
+
+; ======================================================================
+;  THE A/B CONTROL RECORDS, REACHED BY NAME.
+;
+;  Anvil/Storage/ab_record.pbi holds the record's layout and its state
+;  machine and knows nothing about a medium. These two procedures are the
+;  medium half, and they are four filesystem calls each.
+;
+;  THE NAMES ARE ON THE BOOT PARTITION AND SAY SO. "1:" is the FAT32
+;  partition the loader, the firmware and both slots live on; the data
+;  partition is "2:" and has no business holding a boot-control record.
+;  Writing the prefix rather than relying on the default means a monitor
+;  that had to fall back to mounting partition 2 - because partition 1
+;  would not mount - cannot then confirm a slot against a record that is
+;  not there, or worse, one that is.
+; ======================================================================
+
+
+
+
+
+
+
+; ----------------------------------------------------------------------
+;  Pi3StorageConfirmSlot() - release the loader's deadman, or say why not.
+;
+;  THE MOST IMPORTANT FIFTEEN SECONDS THIS MONITOR HAS. The loader armed
+;  a never-fed watchdog before it branched here and this is what turns it
+;  off: confirm the running slot, then stop the timer. Miss it and the
+;  board resets and falls back to the last confirmed image, which from
+;  the other end of a serial cable looks exactly like this image having
+;  crashed.
+;
+;  IT PRINTS ON EVERY FAILURE PATH AND IT PRINTS THE SENTENCE, because
+;  the operator has a few seconds to read it before the reset, and the
+;  difference between "the card is read-only" and "the handoff page is
+;  not valid" is the difference between an afternoon and a minute.
+; ----------------------------------------------------------------------
+Procedure.i Pi3StorageConfirmSlot()
+  If Pi3StorageForConfirm() = 0
+    PrintN("!! the boot partition would not mount, so the running slot cannot be")
+    PrintN("   confirmed and the loader's deadman is still armed. This board is")
+    PrintN("   about to reset and fall back to its other slot.")
+    ProcedureReturn 0
+  EndIf
+  AbSetIo(@Pi3BootReadRecord, @Pi3BootWriteRecord)
+  If AbConfirmRunning() = 0
+    PrintN("!! the running slot could not be confirmed, so the loader's fifteen-")
+    PrintN("   second deadman is still armed and this board is about to reset and")
+    PrintN("   fall back to its other slot.")
+    Print("   ")
+    UartWriteStr(AbErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure

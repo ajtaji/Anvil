@@ -1,0 +1,815 @@
+; ======================================================================
+;  console.pi4 - THE ONE CONSOLE CORE.
+;
+;  Anvil's console is ONE thing with several ENDPOINTS, not several
+;  parallel consoles. This file is the core: the output hub's terminal
+;  MODEL - a character grid with a cursor, wrap and scroll - maintained
+;  ONCE, hardware-agnostic. Every endpoint attaches to it:
+;
+;    * SCREEN endpoints (DMA, V3D, CPU) are RENDERERS of this one grid.
+;      They differ only in how they paint it - the DMA renderer blits the
+;      cells and DMA-scrolls, the V3D renderer GPU-renders them - and they
+;      draw byte-identical content because they read the same grid.
+;    * SERIAL / WIFI / ETHERNET endpoints are byte-stream adapters over the
+;      same output; they are fed straight off the UART, not from here.
+;
+;  ONE CONSUMER OF THE OUTPUT STREAM. ConDrainRing() is the ONLY thing
+;  that reads the UART mirror ring into the grid. The renderers never
+;  consume the ring - they paint whatever the grid says. That is the whole
+;  fix for the bugs a second, private V3D grid caused: the boot log is in
+;  the grid whichever renderer is active, there is no double-consume, and
+;  the scroll happens once. Switch renderers and the SAME grid appears,
+;  differing only in sharpness.
+;
+;  THIS FILE KNOWS NOTHING ABOUT ANY MEDIUM. It has no framebuffer, no
+;  V3D, no pixels - just the grid, the cursor, and dirty/scroll bookkeeping
+;  the renderers read to paint efficiently. A board that has no display
+;  registers no screen renderer and this core still runs (harmlessly) or is
+;  simply never pumped; the serial and wireless endpoints are unaffected.
+;
+;  ======================================================================
+;  THE VIEWPORT IS NOT THE CONTENT. 2026-09-10.
+;  ======================================================================
+;
+;  This core used to hold ONE number of rows and use it for two different
+;  jobs: how much text is STORED, and how much of it is SHOWN. They were
+;  the same number because nothing had ever wanted them to differ, and the
+;  only way to show fewer rows was to re-run ConGridInit - which CLEARS
+;  THE GRID. Reserving the bottom of the screen for a touch keyboard that
+;  way would throw the session's output away to make room for a keyboard,
+;  and hiding it again would have nothing to put back.
+;
+;  So they are two numbers now, and the naming says which is which:
+;
+;    ConContent*   STORAGE. gConCols x gConRows cells, the scroll, the
+;                  text cursor, the history. The keyboard never touches
+;                  any of it. This is what survives a show and a hide.
+;    ConGrid* / ConView*   THE VIEWPORT. How many rows a renderer paints
+;                  and which stored rows they are. Every ConGrid accessor
+;                  that takes a ROW INDEX takes a VIEWPORT row, because
+;                  that is what a renderer has always meant by it - the
+;                  two registered renderers are correct unchanged.
+;
+;  THE VIEWPORT IS PINNED TO THE CURSOR, at the BOTTOM. ConViewTop() is
+;  derived, never stored: the last visible row is the row the next
+;  character lands on. That is the property that keeps the prompt and its
+;  caret on the glass when the keyboard takes the bottom of the screen -
+;  the opposite choice (show the top rows) would reserve space by hiding
+;  the one line the operator is typing on.
+;
+;  AND THE HARDWARE SCROLL HINT IS WITHHELD WHILE THE VIEWPORT IS
+;  RESERVED. ConGridScrollN() exists so a renderer can scroll the PICTURE
+;  instead of repainting it, and it scrolls the whole console rectangle -
+;  whose bottom is now a UI layer this core does not own. Withholding the
+;  hint costs a per-row repaint of the visible rows and is the only
+;  honest answer; the alternative is a keyboard that walks up the screen.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE TOUCH KEYBOARD'S GEOMETRY, AND WHY THE INCLUDE IS HERE.
+;
+;  touch_keyboard_view.pbi is pure integer arithmetic - no register, no
+;  framebuffer, no medium - so including it does not give this core one.
+;  It is included HERE because both of the things that need it are below
+;  this file in board.pi4's include order, and the first of them
+;  (v3d_console.pi4) is behind #ANVIL_V3D_CONSOLE, so it cannot be the
+;  one place the view arrives from. This core calls NOTHING in it.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Graphics/touch_keyboard_view.pbi"
+
+; ----------------------------------------------------------------------
+;  THE BOUNDED BOOT TRANSCRIPT, AND WHY THE INCLUDE IS HERE TOO.
+;
+;  boot_transcript.pbi is pure storage - no hardware, no output of its own,
+;  no dependency on anything in this file. It is included HERE because
+;  ConDrainRing is where it is TAKEN, and a file that feeds a buffer is the
+;  right place for that buffer to arrive from: every gate that pulls this
+;  core in gets the seam with it rather than having to know that board.pi4
+;  included it earlier. screen_cmd.pi4, which replays it, is below this
+;  file in the include order and needs nothing extra.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Core/boot_transcript.pbi"
+XIncludeFile "Anvil/Core/console_style.pbi"
+
+#CON_MAXCOLS = 256
+#CON_MAXROWS = 80
+#CON_CELLS   = 20480              ; 256 * 80
+
+Global Dim gConGrid.a[#CON_CELLS]        ; one byte per cell, ASCII (space = blank)
+Global Dim gConStyle.a[#CON_CELLS]       ; screen-only style beside each character
+Global Dim gConRowDirty.a[#CON_MAXROWS]  ; 1 if a row's content changed since paint
+Global Dim gConRowBuf.a[#CON_MAXCOLS + 2] ; a renderer's scratch for one NUL-terminated row
+Global gConCols.i   = 0
+Global gConRows.i   = 0
+Global gConCurR.i   = 0                  ; the TEXT cursor (where the next char lands)
+Global gConCurC.i   = 0
+Global gConScrollN.i = 0                 ; net rows scrolled UP since the last paint,
+                                         ; so a renderer can hardware-scroll to match
+Global gConFullClear.i = 0               ; the whole console was cleared
+Global gConDirty.i  = 0                  ; anything at all changed since the last paint
+Global gConReady.i  = 0                  ; geometry has been set
+
+; ---- THE VIEWPORT ----------------------------------------------------
+; How many of the gConRows stored rows are currently VISIBLE, and which
+; origin the last paint used. gConViewRows = 0 means "not reserved",
+; which reads as the whole grid; it is not clamped at assignment so the
+; console can be re-sized underneath a reservation without the two
+; drifting apart silently.
+Global gConViewRows.i    = 0
+Global gConViewTopLast.i = 0
+
+; ======================================================================
+;  THE UI OVERLAY SEAM.
+;
+;  A UI layer that is NOT text - today the touch keyboard, tomorrow
+;  whatever else - registers a pair of procedures here. The core knows
+;  nothing about what they draw; it only knows WHEN they must run:
+;
+;    paint  after the active screen renderer has painted the grid, and
+;           on every forced repaint. The adapter is the thing that knows
+;           whether the frame it would be drawing into is owned by a GPU
+;           that already composed the layer itself, and it is the only
+;           thing that may decide that.
+;    reset  when the geometry this core describes stops meaning anything
+;           - a new console size, or the screen going away. Whatever the
+;           layer had laid out against the old surface is stale, and a
+;           stale hit rectangle is a finger landing where nothing is
+;           drawn. This fires BEFORE any new geometry is installed.
+; ======================================================================
+Global *gConOverlay      = 0
+Global *gConOverlayReset = 0
+Global gConOverlayDirty.i = 0
+Global gConOverlayWhole.i = 0
+
+; THE FRAME WAS CLEARED UNDER THE LAYER. A renderer that filled the whole
+; console rectangle - a full clear, a viewport change, a forced repaint -
+; has erased whatever the layer had on it, so the layer's next pass must
+; draw itself whole rather than just the parts it thinks changed. It is a
+; latch and not a flag, because the renderer clears its own bookkeeping
+; before the layer ever runs.
+Procedure.i ConOverlayTakeWhole()
+  Define v.i
+  v = gConOverlayWhole
+  gConOverlayWhole = 0
+  ProcedureReturn v
+EndProcedure
+
+; For a renderer that clears the surface outside this core's own paths -
+; a tier handing the screen back, a diagnostic returning it. It says the
+; same thing the latch above says and it is a separate entry point only
+; so a caller does not have to know the flag's name.
+Procedure ConOverlayMarkWhole()
+  gConOverlayWhole = 1
+EndProcedure
+
+Procedure ConSetOverlay(*paint, *reset)
+  *gConOverlay      = *paint
+  *gConOverlayReset = *reset
+EndProcedure
+
+Procedure ConNoOverlay()
+  *gConOverlay      = 0
+  *gConOverlayReset = 0
+EndProcedure
+
+; The layer changed and nothing in the grid did. Ask for a pass anyway:
+; a pressed key has to appear on the next serviced frame whether or not a
+; character was printed.
+Procedure ConOverlayDamage()
+  gConOverlayDirty = 1
+  gConDirty = 1
+EndProcedure
+
+Procedure ConOverlayReset()
+  If *gConOverlayReset <> 0
+    gConOverlayReset()
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE VIEWPORT. Derived from the content and the reservation; never a
+;  second copy of either.
+; ======================================================================
+Procedure.i ConContentRows()
+  ProcedureReturn gConRows
+EndProcedure
+
+Procedure.i ConContentCols()
+  ProcedureReturn gConCols
+EndProcedure
+
+Procedure.i ConViewRows()
+  If gConViewRows < 1 Or gConViewRows > gConRows
+    ProcedureReturn gConRows
+  EndIf
+  ProcedureReturn gConViewRows
+EndProcedure
+
+Procedure.i ConViewReserved()
+  ProcedureReturn Bool(ConViewRows() < gConRows)
+EndProcedure
+
+; The first STORED row the viewport shows. Pinned so the text cursor's
+; row is the LAST visible one - see the header. Clamped into the content
+; at both ends, so a cursor that has not reached the bottom yet shows the
+; top of the grid exactly as this console always has.
+Procedure.i ConViewTop()
+  Define vr.i
+  Define t.i
+  vr = ConViewRows()
+  t = gConCurR - vr + 1
+  If t < 0
+    t = 0
+  EndIf
+  If t > (gConRows - vr)
+    t = gConRows - vr
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; Where the text cursor is in VIEWPORT rows - what a caret has to be
+; drawn at. -1 if it is not on screen, which cannot happen while the
+; viewport is pinned to it but is answered rather than assumed.
+Procedure.i ConViewCursorRow()
+  Define v.i
+  v = gConCurR - ConViewTop()
+  If v < 0 Or v >= ConViewRows()
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure ConGridMarkAll()
+  Define r.i
+  r = 0
+  While r < gConRows
+    gConRowDirty[r] = 1
+    r = r + 1
+  Wend
+  gConDirty = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ConSetViewRows - reserve the bottom of the console for something else.
+;
+;  IT DOES NOT TOUCH ONE STORED CELL. The grid keeps its size, its
+;  history, its scroll position and its cursor; only how much of it is
+;  painted changes. That is the whole point of the separation: showing
+;  the keyboard must not cost the session's output, and hiding it must
+;  put the revealed rows back from what was retained rather than from
+;  whatever the screen happened to be showing.
+;
+;  The full clear is the TRANSITION rectangle and it happens once per
+;  show or hide - not per tick, and not per keystroke.
+; ----------------------------------------------------------------------
+Procedure ConSetViewRows(rows.i)
+  Define want.i
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  want = rows
+  If want < 1
+    want = 1
+  EndIf
+  If want > gConRows
+    want = gConRows
+  EndIf
+  If want = ConViewRows()
+    ProcedureReturn
+  EndIf
+  gConViewRows = want
+  gConFullClear = 1
+  gConOverlayWhole = 1
+  ConGridMarkAll()
+EndProcedure
+
+Procedure ConViewRelease()
+  ConSetViewRows(gConRows)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ConMarkViewRowQuiet - this visible row has something on it that is not
+;  its text, so repaint it the next time anything is painted. QUIET means
+;  it does NOT say the screen changed: saying that would make the next
+;  service tick paint, which would mark it again, which would paint
+;  again - a console that repaints for ever because something is drawn
+;  on it.
+;
+;  WHY THE OVERLAY NEEDS THIS, AND WHY IT IS EXACTLY RIGHT. A renderer
+;  that hardware-scrolls the picture moves everything in the console
+;  rectangle up, INCLUDING whatever a UI layer drew there - the keyboard
+;  button beside the prompt - and leaves a copy behind, because a row
+;  whose text merely moved is not marked dirty. The dirty flags travel
+;  with the content in ConGridScroll, so a flag left on the button's rows
+;  arrives, after a scroll of any size, on precisely the rows the moved
+;  copy landed on. The renderer repaints those from the grid, erasing the
+;  copy, and the layer draws itself again on top. No save-under, no
+;  special case in the renderer, and the hardware scroll is kept.
+; ----------------------------------------------------------------------
+Procedure ConMarkViewRowQuiet(v.i)
+  Define r.i
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  r = ConViewTop() + v
+  If r < 0 Or r >= gConRows
+    ProcedureReturn
+  EndIf
+  gConRowDirty[r] = 1
+EndProcedure
+
+Procedure ConGridClear()
+  Define i.i
+  Define n.i
+  n = gConCols * gConRows
+  i = 0
+  While i < n
+    gConGrid[i] = 32
+    gConStyle[i] = #UART_SCREEN_STYLE_NORMAL
+    i = i + 1
+  Wend
+  gConCurR = 0
+  gConCurC = 0
+  gConFullClear = 1
+  gConOverlayWhole = 1
+  gConScrollN = 0
+  ConGridMarkAll()
+EndProcedure
+
+; ConGridInit - set the grid geometry (columns x rows) and clear it. The
+; CALLER works out cols/rows from the display; the model just holds them,
+; so it needs nothing board-specific.
+Procedure ConGridInit(cols.i, rows.i)
+  If cols > #CON_MAXCOLS
+    cols = #CON_MAXCOLS
+  EndIf
+  If rows > #CON_MAXROWS
+    rows = #CON_MAXROWS
+  EndIf
+  If cols < 1
+    cols = 1
+  EndIf
+  If rows < 1
+    rows = 1
+  EndIf
+  ; THE OLD GEOMETRY IS GONE, so anything laid out against it is stale.
+  ; This fires BEFORE the new size is installed, so an overlay cannot be
+  ; asked to reset against a surface it has never seen.
+  ConOverlayReset()
+  gConCols = cols
+  gConRows = rows
+  ; A new console is a whole console: nothing is reserved until something
+  ; asks again, which it must do against the size just installed.
+  gConViewRows = 0
+  gConViewTopLast = 0
+  ConGridClear()
+  gConReady = 1
+EndProcedure
+
+; Scroll the whole grid up one row. The dirty flags shift with the content
+; so a renderer that hardware-scrolls the picture only has to repaint the
+; rows that genuinely changed, exactly like the DMA console always did.
+Procedure ConGridScroll()
+  Define r.i
+  Define c.i
+  r = 0
+  While r < gConRows - 1
+    c = 0
+    While c < gConCols
+      gConGrid[r * gConCols + c] = gConGrid[(r + 1) * gConCols + c]
+      gConStyle[r * gConCols + c] = gConStyle[(r + 1) * gConCols + c]
+      c = c + 1
+    Wend
+    gConRowDirty[r] = gConRowDirty[r + 1]
+    r = r + 1
+  Wend
+  c = 0
+  While c < gConCols
+    gConGrid[(gConRows - 1) * gConCols + c] = 32
+    gConStyle[(gConRows - 1) * gConCols + c] = #UART_SCREEN_STYLE_NORMAL
+    c = c + 1
+  Wend
+  gConRowDirty[gConRows - 1] = 1
+  gConScrollN = gConScrollN + 1
+  gConDirty = 1
+  ; WITH THE BOTTOM RESERVED THERE IS NO HARDWARE SCROLL TO MATCH - see
+  ; the header. Every visible row's source moved, so every visible row is
+  ; repainted instead; the rows the keyboard covers are not among them.
+  If ConViewReserved() <> 0
+    ConGridMarkAll()
+  EndIf
+EndProcedure
+
+Procedure ConGridNewline()
+  gConCurC = 0
+  gConCurR = gConCurR + 1
+  If gConCurR >= gConRows
+    ConGridScroll()
+    gConCurR = gConRows - 1
+  EndIf
+  ; The viewport is pinned to the cursor, so moving the cursor can move
+  ; the window over the content with nothing in the content changing.
+  ; Say the screen is dirty, or that move never reaches the glass.
+  If ConViewReserved() <> 0
+    gConDirty = 1
+  EndIf
+EndProcedure
+
+; The terminal state machine, one byte at a time. Newline, carriage
+; return, backspace, tab, wrap and scroll - the ordinary console rules,
+; kept ONCE here for every renderer.
+Procedure ConGridPutcStyle(c.i, style.i)
+  Define t.i
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  If c = 13                          ; CR
+    gConCurC = 0
+    ProcedureReturn
+  EndIf
+  If c = 10                          ; LF
+    ConGridNewline()
+    ProcedureReturn
+  EndIf
+  If c = 8 Or c = 127                ; backspace / delete
+    If gConCurC > 0
+      gConCurC = gConCurC - 1
+      gConGrid[gConCurR * gConCols + gConCurC] = 32
+      gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
+      gConRowDirty[gConCurR] = 1
+      gConDirty = 1
+    EndIf
+    ProcedureReturn
+  EndIf
+  If c = 9                           ; tab -> next multiple of 8
+    t = (gConCurC + 8) - ((gConCurC + 8) % 8)
+    While gConCurC < t And gConCurC < gConCols
+      gConGrid[gConCurR * gConCols + gConCurC] = 32
+      gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
+      gConCurC = gConCurC + 1
+    Wend
+    gConRowDirty[gConCurR] = 1
+    gConDirty = 1
+    If gConCurC >= gConCols
+      ConGridNewline()
+    EndIf
+    ProcedureReturn
+  EndIf
+  If c < 32 Or c > 126               ; other control bytes: ignore
+    ProcedureReturn
+  EndIf
+  gConGrid[gConCurR * gConCols + gConCurC] = c
+  If style = #UART_SCREEN_STYLE_PROMPT
+    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_PROMPT
+  Else
+    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
+  EndIf
+  gConRowDirty[gConCurR] = 1
+  gConDirty = 1
+  gConCurC = gConCurC + 1
+  If gConCurC >= gConCols
+    ConGridNewline()
+  EndIf
+EndProcedure
+
+; Direct model callers (boot transcript replay and focused gates) produce
+; ordinary console text. Live output uses ConGridPutcStyle below.
+Procedure ConGridPutc(c.i)
+  ConGridPutcStyle(c, #UART_SCREEN_STYLE_NORMAL)
+EndProcedure
+
+; ConDrainRing - THE ONE CONSUMER of the UART mirror ring. Drains it into
+; the grid. ScreenPump calls it before painting, and uart.pi4 may call it as
+; a MODEL-ONLY producer-side drain at a line boundary / high-water mark. It
+; never renders and never prints, so that callback is safe inside UartWrite.
+;
+; IT IS ALSO WHERE THE BOOT TRANSCRIPT IS TAKEN, and this is the only
+; place it can be taken from. The transcript exists so that a console
+; rebuilt at a geometry the settings store named - after the screen was
+; already up and already printing - can be reconstructed from what was
+; SAID rather than from what happens to still be on the glass. So it has
+; to capture exactly the byte stream the grid was built from: one tap, on
+; the one consumer, in the one order. Capturing at the producer would
+; catch bytes the grid never received; capturing in the renderer would
+; catch them once per repaint.
+;
+; BootTranscriptPut is a bounds check and a store when capture is armed
+; and a single compare when it is not, which is what it costs for the
+; whole life of the board after ScreenEarlyLogFinish.
+Procedure ConDrainRing()
+  Define n.i
+  Define i.i
+  Define c.i
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  n = UartMirrorCount()
+  i = 0
+  While i < n
+    c = UartMirrorGet()
+    If c < 0
+      Break
+    EndIf
+    BootTranscriptPut(c)
+    ConGridPutcStyle(c, UartMirrorReadStyle())
+    i = i + 1
+  Wend
+EndProcedure
+
+; ---- read-only accessors ---------------------------------------------
+;
+;  ConContent*  STORAGE, indexed by stored row. What survives a show and
+;               a hide of the keyboard.
+;  ConGrid*     THE VIEWPORT, indexed by VISIBLE row, which is what a
+;               renderer has always meant by a row index. With nothing
+;               reserved the two are identical and every existing caller
+;               is correct unchanged.
+Procedure.i ConGridReady()
+  ProcedureReturn gConReady
+EndProcedure
+Procedure.i ConGridCols()
+  ProcedureReturn gConCols
+EndProcedure
+
+Procedure.i ConContentCell(r.i, c.i)
+  If r < 0 Or r >= gConRows Or c < 0 Or c >= gConCols
+    ProcedureReturn 32
+  EndIf
+  ProcedureReturn gConGrid[r * gConCols + c] & $FF
+EndProcedure
+Procedure.i ConContentCellStyle(r.i, c.i)
+  If r < 0 Or r >= gConRows Or c < 0 Or c >= gConCols
+    ProcedureReturn #UART_SCREEN_STYLE_NORMAL
+  EndIf
+  ProcedureReturn gConStyle[r * gConCols + c] & $FF
+EndProcedure
+Procedure.i ConContentRowDirty(r.i)
+  If r < 0 Or r >= gConRows
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn gConRowDirty[r]
+EndProcedure
+
+Procedure.i ConGridRows()
+  ProcedureReturn ConViewRows()
+EndProcedure
+Procedure.i ConGridCell(r.i, c.i)
+  ProcedureReturn ConContentCell(ConViewTop() + r, c)
+EndProcedure
+Procedure.i ConGridCellStyle(r.i, c.i)
+  ProcedureReturn ConContentCellStyle(ConViewTop() + r, c)
+EndProcedure
+Procedure.i ConGridRowDirty(r.i)
+  If r < 0 Or r >= ConViewRows()
+    ProcedureReturn 0
+  EndIf
+  ; THE WINDOW MOVED, SO EVERY VISIBLE ROW IS SHOWING SOMETHING ELSE.
+  ; The stored row's own dirty flag says nothing about that: the content
+  ; is untouched and the picture is entirely wrong.
+  If gConViewTopLast <> ConViewTop()
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn ConContentRowDirty(ConViewTop() + r)
+EndProcedure
+Procedure.i ConGridScrollN()
+  If ConViewReserved() <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn gConScrollN
+EndProcedure
+Procedure.i ConGridFullClear()
+  ProcedureReturn gConFullClear
+EndProcedure
+Procedure.i ConGridDirty()
+  ProcedureReturn gConDirty
+EndProcedure
+Procedure.i ConGridCurR()
+  ProcedureReturn gConCurR
+EndProcedure
+Procedure.i ConGridCurC()
+  ProcedureReturn gConCurC
+EndProcedure
+
+; Build a NUL-terminated string of one grid row into a caller's buffer,
+; trimmed of trailing spaces. Returns the length (0 for a blank row). The
+; renderers use this to paint a row and to know how much of it is ink.
+Procedure.i ConContentRowText(r.i, *dst)
+  Define c.i
+  Define last.i
+  Define g.i
+  If r < 0 Or r >= gConRows
+    PokeA(*dst, 0)
+    ProcedureReturn 0
+  EndIf
+  last = -1
+  c = 0
+  While c < gConCols
+    g = gConGrid[r * gConCols + c] & $FF
+    If g = 0
+      g = 32
+    EndIf
+    PokeA(*dst + c, g)
+    If g <> 32
+      last = c
+    EndIf
+    c = c + 1
+  Wend
+  PokeA(*dst + last + 1, 0)
+  ProcedureReturn last + 1
+EndProcedure
+
+; The same row, addressed the way a renderer addresses it.
+Procedure.i ConGridRowText(r.i, *dst)
+  ProcedureReturn ConContentRowText(ConViewTop() + r, *dst)
+EndProcedure
+
+; Copy the contiguous run beginning at column `first` whose cells all have
+; the same style. Renderers advance by the returned count and choose one
+; colour for the whole call. Interior spaces remain; trailing spaces are
+; omitted from the draw string but still count in the returned run length,
+; so the next style begins at its exact cell without painting blank tails.
+Procedure.i ConGridStyleRunText(r.i, first.i, *dst)
+  Define c.i
+  Define n.i
+  Define last.i
+  Define style.i
+  Define g.i
+  If r < 0 Or r >= ConViewRows() Or first < 0 Or first >= gConCols
+    PokeA(*dst, 0)
+    ProcedureReturn 0
+  EndIf
+  style = ConGridCellStyle(r, first)
+  c = first
+  n = 0
+  last = -1
+  While c < gConCols And ConGridCellStyle(r, c) = style
+    g = ConGridCell(r, c)
+    If g = 0
+      g = 32
+    EndIf
+    PokeA(*dst + n, g)
+    If g <> 32
+      last = n
+    EndIf
+    n = n + 1
+    c = c + 1
+  Wend
+  PokeA(*dst + last + 1, 0)
+  ProcedureReturn n
+EndProcedure
+
+; Called by a renderer once it has painted the grid, to clear the change
+; bookkeeping. The NEXT change re-sets it. The viewport origin is recorded
+; here and nowhere else, so "the window moved" is answered against the
+; origin the picture on the glass was actually drawn at.
+Procedure ConGridClearDirty()
+  Define r.i
+  r = 0
+  While r < gConRows
+    gConRowDirty[r] = 0
+    r = r + 1
+  Wend
+  gConScrollN = 0
+  gConFullClear = 0
+  gConDirty = 0
+  gConViewTopLast = ConViewTop()
+EndProcedure
+
+; ======================================================================
+;  THE SCREEN ENDPOINT REGISTRY + THE PUMP.
+;
+;  A SCREEN renderer is an endpoint that paints the grid. Exactly one is
+;  active at a time (the current display tier); it registers itself with
+;  ConSetRenderer(@its_paint_proc). The core calls it through the pointer,
+;  so it knows nothing about V3D, DMA or CPU - a new renderer type is added
+;  by writing a paint proc and registering it, touching nothing here. With
+;  no display, no renderer is registered and the pump paints nothing; the
+;  serial and wireless endpoints, fed straight off the UART, are unaffected.
+; ======================================================================
+Global *gConPaint = 0            ; the active screen renderer's paint proc
+
+Procedure ConSetRenderer(*fn)
+  *gConPaint = *fn
+EndProcedure
+Procedure ConNoRenderer()
+  *gConPaint = 0
+EndProcedure
+
+; Take the grid down (the screen went away). Output keeps flowing to the
+; serial and wireless endpoints; there is just nothing painting the grid.
+;
+; The overlay is RESET but stays registered: the surface went away, not
+; the feature. Its geometry is invalidated so nothing can be hit-tested
+; against rectangles that describe a screen this monitor is no longer
+; drawing on, and it lays itself out again when a screen comes back.
+Procedure ConGridStop()
+  ConOverlayReset()
+  gConReady = 0
+  gConViewRows = 0
+  gConViewTopLast = 0
+  gConOverlayDirty = 0
+  *gConPaint = 0
+EndProcedure
+
+; ScreenPump - THE HUB. Drain the one output stream into the one grid, then
+; let the active screen renderer paint what changed. This is the single
+; entry every caller (the prompt, the boot log, the payload boundary) uses;
+; the name is kept because four files already call it.
+Procedure ScreenPump()
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  ConDrainRing()
+  If gConDirty = 0 And gConOverlayDirty = 0
+    ProcedureReturn
+  EndIf
+  If *gConPaint <> 0
+    gConPaint()
+    ; THE UI LAYER LAST, AND BELOW THE POINTER. The renderer has finished
+    ; with the frame; whether this pass may touch it at all is the
+    ; adapter's decision, because only the adapter knows whether a GPU
+    ; composed the layer inside the frame it just presented.
+    ;
+    ; NO RENDERER MEANS NO UI LAYER. A diagnostic that takes the screen
+    ; unregisters the renderer (ConNoRenderer) and paints the whole
+    ; surface itself; drawing an overlay on top of it would be this core
+    ; scribbling on something it does not own. The layout is kept, not
+    ; thrown away, so the restore is a repaint and not a re-layout.
+    If *gConOverlay <> 0
+      gConOverlay()
+    EndIf
+  EndIf
+  gConOverlayDirty = 0
+EndProcedure
+
+; ======================================================================
+;  ConMirrorDrain - THE PRODUCER-SIDE CALLBACK, AND THE ONE PLACE THAT
+;  DECIDES WHETHER A LINE IS PAINTED WHEN IT IS PRINTED.
+; ----------------------------------------------------------------------
+;  uart.pi4 calls the registered drain at a LINE BOUNDARY and at the
+;  ring's high-water mark. For the whole life of the board after boot
+;  that has to be a pure drain: a long synchronous command produces far
+;  more than the 8 KiB staging ring, and painting per line would repaint
+;  the console once per line of a screenful - which is why ConDrainRing
+;  never renders and why ScreenPump paints the finished model once.
+;
+;  DURING THE BOOT LOG THE OPPOSITE IS REQUIRED, and it was asked for in
+;  those words: the earliest possible screen with live progress on it.
+;  A boot that collects sixty lines and shows them all when the prompt
+;  arrives is a board that looks hung for the time it takes to enumerate
+;  USB - which is exactly the window an operator most needs to see.
+;
+;  SO THE WINDOW IS EXPLICIT AND IT IS SHORT. ScreenEarlyLogStart opens
+;  it, ScreenEarlyLogFinish closes it, and outside it this is byte for
+;  byte the behaviour that was here before. It is not a flag read from
+;  somewhere else and it is not a heuristic about how much is queued.
+;
+;  THE RE-ENTRY GUARD IS NOT DECORATION. This runs INSIDE UartWrite, and
+;  a renderer that printed anything - a refusal, a warning - would come
+;  straight back here. The guard makes that a return instead of a stack
+;  that ends in the sea.
+; ======================================================================
+Global gConLiveBoot.i
+Global gConDrainBusy.i
+
+; Only the boot path turns this on, and only ScreenEarlyLogFinish turns
+; it off. A command that takes the screen does not have to know about it.
+Procedure ConSetLiveBoot(on.i)
+  gConLiveBoot = Bool(on <> 0)
+EndProcedure
+
+Procedure.i ConLiveBoot()
+  ProcedureReturn gConLiveBoot
+EndProcedure
+
+Procedure ConMirrorDrain()
+  If gConDrainBusy <> 0
+    ProcedureReturn
+  EndIf
+  gConDrainBusy = 1
+  If gConLiveBoot <> 0
+    ScreenPump()
+  Else
+    ConDrainRing()
+  EndIf
+  gConDrainBusy = 0
+EndProcedure
+
+; ConRepaint - force the whole grid to be repainted by the current
+; renderer (used the instant a new tier takes over, so the freshly
+; registered renderer shows the existing grid rather than a blank screen).
+Procedure ConRepaint()
+  If gConReady = 0
+    ProcedureReturn
+  EndIf
+  ConGridMarkAll()
+  gConFullClear = 1
+  gConOverlayWhole = 1
+  If *gConPaint <> 0
+    gConPaint()
+    If *gConOverlay <> 0
+      gConOverlay()
+    EndIf
+  EndIf
+  gConOverlayDirty = 0
+EndProcedure

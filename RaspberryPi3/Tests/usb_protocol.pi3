@@ -1,0 +1,42 @@
+; Desk-only emitted-code fixture.  It does not touch real USB MMIO and must
+; never be staged as a boot image.  A gate supplies all pointer arguments.
+Global p3usb_fixture_ticks.i
+
+Procedure.i Pi3UsbTime()
+  p3usb_fixture_ticks+100
+  ProcedureReturn p3usb_fixture_ticks
+EndProcedure
+
+Procedure.i Pi3UsbRead(offset.i)
+  If offset=$40 : ProcedureReturn $4F54280A : EndIf
+  If offset=$10 : ProcedureReturn $80000000 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Pi3UsbWrite(offset.i,value.i)
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/usb_host_core.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_transfer.pbi"
+
+Procedure.i Main()
+  Protected operation.i=PeekI($06000000)
+  Protected first.i=PeekI($06000008)
+  Protected second.i=PeekI($06000010)
+  Protected third.i=PeekI($06000018)
+  Select operation
+    Case 1 : ProcedureReturn Pi3UsbChannelCharWord(first,second,#P3_USB_EP_BULK,third,0)
+    Case 2 : ProcedureReturn Pi3UsbChannelSizeWord(first,second,third)
+    Case 3 : ProcedureReturn Pi3UsbLanEndpoints(first,second)
+    Case 4 : ProcedureReturn Pi3LanTxFrame(first,second,third,PeekI($06000020))
+    Case 5 : ProcedureReturn Pi3LanRxFrame(first,second)
+    Case 6 : ProcedureReturn Pi3UsbCoreReset()
+    Case 8 : ProcedureReturn Pi3UsbPortControl(first,second,third)
+    Case 7
+      p3usb_state=1
+      ProcedureReturn Pi3UsbChannelTransfer(0,first,$81,#P3_USB_EP_BULK,512,0,second,third,0,10000)
+  EndSelect
+  ProcedureReturn -1
+EndProcedure

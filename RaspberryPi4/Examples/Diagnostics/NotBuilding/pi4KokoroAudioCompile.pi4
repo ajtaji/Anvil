@@ -1,0 +1,18 @@
+; pi4KokoroAudioCompile.pi4 - compile gate for the Kokoro HDMI sink.
+;
+; This does not start HDMI audio. It exists so every release proves that the
+; target-neutral FP32 PCM conversion and the Pi 4 24-to-48 kHz stereo adapter
+; still compile together. A generated Kokoro application calls
+; PmKokoroHdmiStart(), PmKokoroHdmiPlay24k() and PmKokoroHdmiStop().
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+XIncludeFile "RaspberryPi4/Lib/hdmiaudio.pi4"
+XIncludeFile "MathLib/onnx/pcm_fp32.pmi"
+XIncludeFile "RaspberryPi4/Lib/kokoro_audio.pi4"
+
+Procedure Main()
+  If PmPcmSample16(0.0, 1.0) <> 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure

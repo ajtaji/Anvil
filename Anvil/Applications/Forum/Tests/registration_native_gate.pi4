@@ -1,0 +1,50 @@
+; Deterministic opaque handles and serialized reference transaction, not crypto/DB.
+Global rclock.i = 1000
+Global rtoken.i = 100
+Global rdigest.i
+Global rexpires.i
+Global rused.i
+Global raccounts.i
+Global rmail.i
+Procedure.i ForumRegServicesReady() : ProcedureReturn 1 : EndProcedure
+Procedure.i ForumRegNow() : ProcedureReturn rclock : EndProcedure
+Procedure.i ForumRegCanonicalEmail(e.i) : ProcedureReturn e : EndProcedure
+Procedure.i ForumRegRandomToken(n.i) : rtoken = rtoken + 1 : ProcedureReturn rtoken : EndProcedure
+Procedure.i ForumRegTokenDigest(t.i) : ProcedureReturn t + 10000 : EndProcedure
+Procedure.i ForumRegPasswordVerifier(p.i) : ProcedureReturn 55555 : EndProcedure
+Procedure.i ForumRegStoreChallenge(e.i, o.i, t.i, d.i, n.i, x.i)
+  If raccounts <> 0 : ProcedureReturn 0 : EndIf
+  rdigest = d : rexpires = x : rused = 0 : rmail = rmail + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure.i ForumRegAdmitRedeem(o.i, n.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i ForumRegConsumeAndCreate(d.i, v.i, o.i, n.i)
+  If rdigest = 0 Or d <> rdigest Or rused <> 0 Or n >= rexpires Or raccounts <> 0
+    ProcedureReturn 0
+  EndIf
+  rused = 1 : raccounts = raccounts + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure ForumRegRelease(h.i) : EndProcedure
+XIncludeFile "Anvil/Applications/Forum/registration.pbi"
+#REG_NATIVE_OUT = $06000000
+Procedure.i Main()
+  PokeI(#REG_NATIVE_OUT, ForumRegRedeem(123, 9, 1))
+  PokeI(#REG_NATIVE_OUT + 8, raccounts)
+  PokeI(#REG_NATIVE_OUT + 16, ForumRegBegin(1, 1))
+  PokeI(#REG_NATIVE_OUT + 24, raccounts)
+  PokeI(#REG_NATIVE_OUT + 32, rmail)
+  PokeI(#REG_NATIVE_OUT + 40, ForumRegRedeem(rtoken + 1, 9, 1))
+  PokeI(#REG_NATIVE_OUT + 48, raccounts)
+  PokeI(#REG_NATIVE_OUT + 56, ForumRegRedeem(rtoken, 9, 1))
+  PokeI(#REG_NATIVE_OUT + 64, raccounts)
+  PokeI(#REG_NATIVE_OUT + 72, ForumRegRedeem(rtoken, 9, 1))
+  PokeI(#REG_NATIVE_OUT + 80, raccounts)
+  ; Separate isolated reference identity for the expiry boundary.
+  raccounts = 0 : rdigest = 0 : rused = 0
+  PokeI(#REG_NATIVE_OUT + 88, ForumRegBegin(2, 1))
+  rclock = rexpires
+  PokeI(#REG_NATIVE_OUT + 96, ForumRegRedeem(rtoken, 9, 1))
+  PokeI(#REG_NATIVE_OUT + 104, raccounts)
+  ProcedureReturn 0
+EndProcedure

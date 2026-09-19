@@ -1,0 +1,1074 @@
+; ======================================================================
+;  v3d_console.pi4 - the screen console, rendered by the NeonArcade GPU
+;  engine on V3D instead of by the DMA/CPU text grid.
+;
+;  Ordered: "change anvil to use the neon arcade engine", "dont forget vsync".
+;
+;  THE SCREEN IS ONE OPTIONAL CHANNEL, NOT "THE CONSOLE". Anvil's console
+;  is several CONCURRENT, INDEPENDENT channels: the serial line, the
+;  wireless/network console, and - when a display is attached - the screen.
+;  Output is mirrored to every channel that exists and input is taken from
+;  any of them, all at the same time. This file is only the SCREEN channel's
+;  renderer, and one of three tiers for it (V3D, then the DMA and CPU
+;  framebuffer renderers). It NEVER gates, owns, or switches off serial or
+;  the network - it only draws pixels. A headless board (no display) simply
+;  has no screen channel; the others run exactly as always.
+;
+;  TIER SELECTION. The screen renderer is chosen at boot by driver
+;  availability, V3D PREFERRED (V3dConAutoStart): V3D if the 3D stack comes
+;  up, else the DMA-accelerated framebuffer, else the plain-CPU framebuffer.
+;  `screen v3d` / `screen dma` / `screen cpu` override it; #ANVIL_V3D_CONSOLE
+;  = 0 compiles the V3D tier out entirely (the framebuffer renderer is then
+;  the top tier). The DMA/CPU renderer in Lib/display.pi4 + Board/display.pi4
+;  + Board/screen_cmd.pi4 is unchanged and is the fallback.
+;
+;  HOW IT RENDERS. The text comes from the UART mirror ring (uart.pi4's
+;  UartMirror*), the same source ScreenPump drains onto the DMA console.
+;  This backend drains that ring into its own character GRID - a tiny
+;  terminal (newline, CR, backspace, tab, wrap, scroll) - and draws the
+;  whole grid with one NeonArcade frame: one Neon_Text per row, below a
+;  banner that is CPU-blitted to match the DMA console exactly (photo,
+;  smooth title, subtitle, "A N V I L"). Only ONE renderer drains the ring
+;  at a time; ScreenPump delegates here when V3D is the active tier.
+;
+;  REDRAW ON CHANGE, NOT CONTINUOUSLY. A full V3D frame is expensive, so a
+;  frame is built only when the grid or cursor actually changed. On DSI the
+;  cursor is part of that transformed GPU frame; HDMI retains its proven CPU
+;  overlay after the frame is presented.
+;
+;  DOUBLE BUFFER, AND WHY IT IS A COPY NOT A PAGE FLIP. The first design
+;  rendered into the off-screen half of a double-height surface and
+;  page-flipped with SET_VIRTUAL_OFFSET (applied at vblank). It worked, but
+;  on this firmware the scanout of a NON-ZERO virtual offset is BLURRED - the
+;  HVS filters the panned view (the rendered DRAM is provably pixel-exact).
+;  So the shown half now stays at offset 0 (crisp), the GPU renders into the
+;  off-screen half, and the DMA engine COPIES the finished frame up to the
+;  shown half - the copy is the only window the shown half changes in (~ms),
+;  versus the ~260 ms a straight-to-front render would smear. No double-
+;  height surface -> single buffer (crisp, smears on redraw). DSI always has
+;  its fixed pair and uses the CPU mover if its DMA engine is unavailable.
+;
+;  THE MAILBOX MUST SURVIVE. V3dInit used to wedge the firmware property
+;  mailbox until a reset; that was root-caused and fixed (v3d.pi4:1608,
+;  vault "NeonArcade on V3D - the engine draws"), so info/temperature/clock
+;  keep working with V3D resident.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Arena for the engine. It owns this DRAM: the V3D page table, the QPU
+;  programs, the tile pools, the bin/render control lists, the vertex and
+;  uniform buffers and the glyph atlas. ~16 MiB, page aligned.
+;
+;  $0A000000 (160 MiB) is deliberate. This arena is disjoint from the named
+;  monitor image ($200000), low payload window ($400000..$7EFFFFF), payload
+;  stack ($7F00000), GENET receive ring ($8100000), monitor BSS
+;  ($0D000000..$0DFFFFFF), framebuffer, modules, screenshot and Vulkan heap;
+;  the map checker validates the configured ranges. It is within bank 0
+;  (which reaches ~$3B2FFFFF), so it is present on every Pi 4.
+; ----------------------------------------------------------------------
+; The whole module is behind the flag, so a build with #ANVIL_V3D_CONSOLE = 0
+; compiles NONE of it - no engine references, the three V3D libraries prune
+; away, and the DMA/CPU console is the only one. (board.pi4 also gates the
+; library includes on the same flag.)
+CompilerIf #ANVIL_V3D_CONSOLE = 1
+
+#V3DCON_ARENA       = $0A000000
+#V3DCON_ARENA_BYTES = $01000000        ; 16 MiB
+
+; Auto-enable the D-cache when the V3D tier first comes up, for the fast
+; redraw path (~33 ms vs ~384 ms). Safe because the M4 coherency work is
+; done and verified. Set to 0 to leave caches off at boot (the operator can
+; still `cache on` by hand); the DMA/CPU tiers do not need it.
+#ANVIL_V3D_CACHE_AUTO = 1
+
+Global gV3dConInit.i = 0                ; 1 once NeonInit succeeded (resident)
+Global gV3dConOn.i   = 0                ; 1 while V3D is the active screen renderer
+Global gV3dConFail.i = 0               ; 1 if setup was tried and failed
+
+Declare ConPaintV3d()
+Declare.i V3dConActivate()
+
+; NO PRIVATE GRID. This renderer paints the ONE shared console grid
+; (console.pi4) - ConGridRows/Cols/RowText - exactly like the DMA renderer,
+; so the two show byte-identical content. The old gV3dGrid/V3dGridPutc/
+; V3dConGeom/V3dConPump that maintained a second grid and drained the ring
+; a second time are gone; that duplication caused the missing boot log and
+; the stacked prompts.
+
+; Double buffering. HDMI renders into the lower half of its double-height
+; allocation. DSI uses its fixed Anvil-owned back buffer and copies it into
+; the HVS scan buffer.
+Global gV3dDouble.i   = 0
+Global gV3dPhysW.i    = 0               ; physical raster width
+Global gV3dPhysH.i    = 0               ; physical (shown) height in pixels
+Global gV3dFbBase.i   = 0               ; GPU target base (HDMI front or DSI back)
+Global gV3dPitch.i    = 0               ; physical target pitch
+Global gV3dRot.i      = 0               ; logical-to-physical engine rotation
+Global gV3dBackY.i    = 0               ; y offset of the off-screen half (0 or physH)
+
+; Timing of the last frame, microseconds, for the `screen v3d` report.
+Global gV3dUsBuild.i  = 0               ; A72 grid->vertex build (Neon draw calls)
+Global gV3dUsBin.i    = 0
+Global gV3dUsRender.i = 0
+Global gV3dUsFlip.i   = 0
+Global gV3dUsWall.i   = 0               ; whole present, wall clock
+Global gV3dFrames.i   = 0
+
+; ----------------------------------------------------------------------
+;  Colours. Neon_RGBA packs $AARRGGBB and the engine's default RB-swap
+;  makes that land correctly on this BGR framebuffer (proven by pi4NeonBox
+;  against two million pixels), so the same call is used for the clear and
+;  the shaded text. Dark blue ground to match the DMA console's RGB(0,0,40).
+; ----------------------------------------------------------------------
+Procedure.i V3dCon_Ground()
+  ProcedureReturn Neon_RGBA(0, 0, 40, 255)
+EndProcedure
+Procedure.i V3dCon_Ink()
+  ProcedureReturn Neon_RGBA(226, 232, 240, 255)
+EndProcedure
+Procedure.i V3dCon_PromptInk()
+  ProcedureReturn Neon_RGBA(80, 255, 120, 255)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConSetupOnce - bring the engine up over the live framebuffer. Runs
+;  the expensive half once; a second call with gV3dConInit set returns 1.
+;  Returns 1 on success, 0 having printed why (and latched gV3dConFail).
+; ----------------------------------------------------------------------
+Procedure.i V3dConSetupOnce()
+  Define r.i
+  Define base.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define physW.i
+  Define physH.i
+  Define rot.i
+
+  CompilerIf #ANVIL_V3D_CONSOLE = 0
+  ProcedureReturn 0
+  CompilerEndIf
+
+  If gV3dConInit <> 0
+    ProcedureReturn 1
+  EndIf
+  If gV3dConFail <> 0
+    ProcedureReturn 0
+  EndIf
+
+  base  = ScrGpuBase()
+  w     = DisplayWidth()
+  h     = DisplayHeight()
+  pitch = ScrGpuPitch()
+  physW = ScrGpuPhysicalW()
+  physH = ScrGpuPhysicalH()
+  rot   = ScrGpuRotation()
+  If base = 0 Or w < 8 Or h < 8 Or DisplayBytesPerPixel() <> 4
+    PrintN("!! the V3D console needs a 32-bit framebuffer that is already up, and")
+    PrintN("   there is not one. Type screen on first.")
+    gV3dConFail = 1
+    ProcedureReturn 0
+  EndIf
+  If physW < 8 Or physH < 8 Or pitch < (physW * 4)
+    PrintN("!! the V3D console was given an invalid physical render target.")
+    gV3dConFail = 1
+    ProcedureReturn 0
+  EndIf
+
+  gV3dFbBase = base
+  gV3dPhysW  = physW
+  gV3dPhysH  = physH
+  gV3dPitch  = pitch
+  gV3dRot    = rot
+
+  If NeonArena(#V3DCON_ARENA, #V3DCON_ARENA_BYTES) <> #NEON_OK
+    PrintN("!! the V3D console could not register its work memory (NeonArena).")
+    gV3dConFail = 1
+    ProcedureReturn 0
+  EndIf
+  If NeonSurfaceOriented(base, w, h, pitch, rot) <> #NEON_OK
+    PrintN("!! the V3D console could not bind the framebuffer (NeonSurface).")
+    gV3dConFail = 1
+    ProcedureReturn 0
+  EndIf
+
+  ; DOUBLE BUFFERING. HDMI maps both halves of the firmware allocation. DSI's
+  ; already-guarded front/back pair needs no widened V3D map. Otherwise HDMI
+  ; renders straight into its single live surface (which can tear).
+  If gV3dDouble <> 0 And ScrGpuHasFixedBack() = 0
+    NeonSurfaceMapSpan(pitch * h * 2)
+  EndIf
+
+  r = NeonInit()
+  If r <> #NEON_OK
+    Print("!! the V3D console engine would not initialise (NeonInit rc ")
+    PrintDec(r)
+    PrintN("). The DMA console is unaffected.")
+    gV3dConFail = 1
+    ProcedureReturn 0
+  EndIf
+
+  NeonPalette()
+  NeonFontDefaults()
+  ; The console's own 8x16 font, the same bitmap the DMA console draws.
+  If NeonFontUse(?dsp_font8x16, 8, 16, 32, 126) <> #NEON_OK
+    PrintN("!! the V3D console could not bind its font.")
+    NeonShutdown()
+    gV3dConFail = 1
+    ProcedureReturn 0
+  EndIf
+  ; Match the framebuffer console's physical glyph size and its explicit
+  ; `screen scale` override. All four engine faces share this bitmap.
+  NeonFontSetup(#NEON_FONT_UI,    gScrScale, 0)
+  NeonFontSetup(#NEON_FONT_SMALL, gScrScale, 0)
+  NeonFontSetup(#NEON_FONT_MONO,  gScrScale, 0)
+  NeonFontSetup(#NEON_FONT_BOLD,  gScrScale, 1)
+
+  ; THE PRESENT IS A COPY, NOT A PAGE FLIP, so the shown surface never leaves
+  ; virtual offset 0 - see V3dConPresent for why (the firmware blurs a
+  ; non-zero offset). That copy is the DMA engine's job, so rebind it to the
+  ; framebuffer TryDouble just reallocated: its old binding (from boot) is to
+  ; a surface that no longer exists. If the engine will not bind, the present
+  ; falls back to the CPU mover, which is still correct and crisp.
+  If gV3dDouble <> 0
+    gDma = ScreenDmaUp()
+    ; TryDouble re-ran DisplayInit, which reset the console rectangle to the
+    ; whole screen; put it back below the banner so DisplayCols/Rows (and the
+    ; shared grid, which was sized from them) stay consistent.
+    If ScrGpuHasFixedBack() = 0
+      DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+    EndIf
+  EndIf
+
+  gV3dConInit = 1
+  ProcedureReturn 1
+EndProcedure
+
+; A surface/source change invalidates every address and every geometry-derived
+; table in the resident engine. Detach calls this before another screen can be
+; acquired, so a later activation rebuilds against the new source instead of
+; reusing an HDMI base or a differently rotated panel target.
+Procedure.i V3dConInvalidate()
+  If gV3dConInit <> 0
+    If NeonShutdown() <> #NEON_OK
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  gV3dConInit = 0
+  gV3dConOn = 0
+  gV3dConFail = 0
+  gV3dDouble = 0
+  gV3dPhysW = 0
+  gV3dPhysH = 0
+  gV3dFbBase = 0
+  gV3dPitch = 0
+  gV3dRot = 0
+  gV3dBackY = 0
+  gCursorGpuOwned = 0
+  ProcedureReturn 1
+EndProcedure
+
+; A returning payload is another image with another BSS, so its software
+; owner flag cannot release this resident engine. RunAt uses this pair at the
+; machine boundary: stop and forget every resident V3D transaction before the
+; jump, then rebuild the renderer only after the payload picture and the DMA
+; channel have been reclaimed. 0 means no resident engine, 1 means it was
+; resident but inactive, and 2 means it was the active console renderer.
+Procedure.i V3dConPayloadSuspend()
+  Define state.i
+
+  If gV3dConInit = 0
+    ProcedureReturn 0
+  EndIf
+  state = 1
+  If gV3dConOn <> 0
+    state = 2
+    ConNoRenderer()
+  EndIf
+  If V3dConInvalidate() = 0
+    ; The release may have reset one command thread before the other failed.
+    ; Do not paint through state whose hardware half is now unknown.
+    gV3dConOn = 0
+    gV3dConFail = 1
+    gCursorGpuOwned = 0
+    ConNoRenderer()
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn state
+EndProcedure
+
+Procedure.i V3dConPayloadResume(state.i)
+  If state <> 2
+    ProcedureReturn 1
+  EndIf
+  If V3dConActivate() <> 0
+    ProcedureReturn 1
+  EndIf
+
+  ; Activation already tried to restore the display DMA binding on failure.
+  ; Make that safe tier explicit before RunAt prints any recovery diagnostics.
+  If gScreen <> 0
+    gDma = ScreenDmaUp()
+    If gDma <> 0
+      ConSetRenderer(@ConPaintDma)
+      ConRepaint()
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ConNoRenderer()
+  ProcedureReturn 0
+EndProcedure
+
+; The framebuffer cursor cannot be overlaid after a rotated GPU present: its
+; save-under uses logical pitch. Draw the same 8x14 mask into the V3D frame so
+; it crosses the same central transform as every glyph and rectangle.
+Procedure V3dConRenderCursor()
+  Define r.i
+  Define c.i
+  Define m.i
+  Define first.i
+
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  r = 0
+  While r < #CUR_H
+    m = gCurMask[r]
+    c = 0
+    While c < #CUR_W
+      If (m & ($80 >> c)) <> 0
+        first = c
+        Repeat
+          c = c + 1
+        Until c >= #CUR_W Or (m & ($80 >> c)) = 0
+        Neon_Box(gCurX + first, gCurY + r, c - first, 1, Neon_RGBA(255, 255, 255, 255))
+      Else
+        c = c + 1
+      EndIf
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchKeyboardComposeNeon - WHAT OF THE KEYBOARD IS STILL DRAWN INSIDE
+;  THE GPU FRAME, which is now the keyboard BUTTON and nothing else.
+;
+;  THE BAND IS NOT DRAWN HERE ANY MORE, and the reason is the face on the
+;  keys. This engine has ONE face - a one-bit cell at four integer
+;  scales - and a cell font can only be enlarged by whole pixels, so at
+;  three or four times a letter is a staircase. That is what the panel
+;  was showing, and it is what was called blocky. The engine cannot be
+;  given a coverage-map face cheaply: the 4.2 TMU cannot sample the
+;  linear atlas the baked faces live in, which is the same reason the
+;  banner - photo, smooth title and all - is not a GPU texture either.
+;
+;  SO THE BAND TAKES THE BANNER'S ROUTE, exactly. The CPU composes it in
+;  LOGICAL coordinates through display.pi4 (DrawSmoothText and the rest),
+;  ScrPresent puts it on the panel through the one transpose this monitor
+;  owns, and every GPU frame after that CARRIES THOSE PIXELS ALONG -
+;  ScrGpuKeepLogicalBand copies them back out of the presented front in
+;  ConPaintV3d, the same way ScrGpuKeepBanner carries the banner. No
+;  second renderer, no second rotation formula, no race: the CPU never
+;  writes a byte the GPU is rendering into, because the band it draws is
+;  the console's own logical surface and the copy that carries it happens
+;  after NeonFrameEnd has waited.
+;
+;  WHAT STAYS HERE. The button beside the prompt, which lives INSIDE the
+;  console rectangle the GPU repaints wholesale every frame - there is no
+;  band-shaped hole to carry it in, and it is rectangles rather than
+;  type. Its "KB" fallback label is a 16 x 16 box, which could not hold
+;  the 30 px face on any tier; the same fallback rule the framebuffer
+;  composer states puts the cell font in it.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardComposeNeon()
+  Define n.i
+  Define len.i
+  Define i.i
+  Define k.i
+  Define col.i
+  Define face.i
+  Define at.i
+
+  If TouchKeyboardLayoutOk() = 0
+    ProcedureReturn
+  EndIf
+  ; THE BAND IS THE CPU COMPOSER'S, AND IT IS ALREADY ON THE PANEL. See
+  ; the header: drawing it here as well would put a frame of blocky
+  ; labels on the glass for the length of one present, every time the
+  ; console repainted, and then replace them.
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn
+  EndIf
+  n = TouchKeyboardPaint(#TKB_RENDER_GPU, #TKB_DAMAGE_ALL)
+  If n < 1
+    ProcedureReturn
+  EndIf
+  face = 0
+  i = 0
+  While i < n
+    k = TouchKeyboardDrawKind(i)
+    col = TouchKeyboardDrawFg(i)
+    If k = #TKB_DRAW_RECT
+      Neon_Box(TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawW(i), TouchKeyboardDrawH(i), Neon_RGBA((col >> 16) & $FF, (col >> 8) & $FF, col & $FF, 255))
+    ElseIf k = #TKB_DRAW_TEXT
+      at = TouchKeyboardDrawScale(i)
+      If at <> face
+        face = at
+        NeonFontSetup(#NEON_FONT_MONO, face, 0)
+      EndIf
+      ; The item is a label centred in a box; the mono face at `at` is
+      ; the bitmap cell magnified, so the centring is arithmetic.
+      len = 0
+      While PeekA(TouchKeyboardDrawText(i) + len) <> 0
+        len = len + 1
+      Wend
+      Neon_Text(#NEON_FONT_MONO, TouchKeyboardDrawX(i) + (TouchKeyboardDrawW(i) - len * 8 * at) / 2, TouchKeyboardDrawY(i) + (TouchKeyboardDrawH(i) - 16 * at) / 2, TouchKeyboardDrawText(i), Neon_RGBA((col >> 16) & $FF, (col >> 8) & $FF, col & $FF, 255))
+    EndIf
+    i = i + 1
+  Wend
+  ; Put the mono face back the size the console set it to, or the next
+  ; thing that asks the engine for monospaced text gets the keyboard's.
+  If face <> 0
+    NeonFontSetup(#NEON_FONT_MONO, gScrScale, 0)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConKeepKeyboardBand - the keyboard band's half of the banner's
+;  deal, in one place so ConPaintV3d says it once for both buffered
+;  paths. Nothing to carry when the band is down; the GPU frame then
+;  owns every row it used to cover.
+; ----------------------------------------------------------------------
+Procedure V3dConKeepKeyboardBand(renderBase.i)
+  If TouchKeyboardLayoutOk() = 0 Or TouchKeyboardViewVisible() = 0
+    ProcedureReturn
+  EndIf
+  ScrGpuKeepLogicalBand(renderBase, TouchKeyboardBandY(), TouchKeyboardBandY() + TouchKeyboardBandH() - 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConRenderGridFrame - the GPU half of a frame: clear to the ground and
+;  Neon_Text the SHARED console grid, one row per non-blank row, below the
+;  banner band. Reads the same grid (ConGrid*) and lays it out at the same
+;  x/y as the DMA renderer, so the two are byte-identical but for sharpness.
+; ----------------------------------------------------------------------
+Procedure.i V3dConRenderGridFrame()
+  Define r.i
+  Define y.i
+  Define ch.i
+  Define n.i
+  Define rc.i
+  Define c.i
+  Define cw.i
+  Define ink.i
+
+  rc = NeonFrameBegin(V3dCon_Ground())
+  If rc <> #NEON_OK
+    ProcedureReturn rc
+  EndIf
+  ; NO title bar - the banner (photo, smooth title, subtitle, "A N V I L")
+  ; is CPU-blitted after this frame (the TMU on 4.2 cannot sample the linear
+  ; font atlas, so the banner cannot be a GPU texture).
+  ch = Neon_LineHeight(#NEON_FONT_UI)
+  cw = Neon_CharWidth(#NEON_FONT_UI)
+  r = 0
+  While r < ConGridRows()
+    y = LogoHeight() + r * ch
+    c = 0
+    While c < ConGridCols()
+      If ConGridCellStyle(r, c) = #UART_SCREEN_STYLE_PROMPT
+        ink = V3dCon_PromptInk()
+      Else
+        ink = V3dCon_Ink()
+      EndIf
+      n = ConGridStyleRunText(r, c, @gConRowBuf[0])
+      If n > 0
+        Neon_Text(#NEON_FONT_UI, c * cw, y, @gConRowBuf[0], ink)
+        c = c + n
+      Else
+        c = c + 1
+      EndIf
+    Wend
+    r = r + 1
+  Wend
+  ; The UI layer, then the pointer on top of it. This order is the layer
+  ; order the design states and it is the only place it is decided on
+  ; this tier.
+  TouchKeyboardComposeNeon()
+  V3dConRenderCursor()
+  ProcedureReturn NeonFrameEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConDrawGrid - build one NeonArcade frame from the grid. The engine's
+; ----------------------------------------------------------------------
+;  V3dConFlip - present the freshly rendered off-screen half at the next
+;  vertical blank. Thin wrapper over display.pi4's DisplayFlip, which
+;  issues SET_VIRTUAL_OFFSET ($00048009) and records the live view offset
+;  so a screenshot reads the half on the glass.
+; ----------------------------------------------------------------------
+Procedure.i V3dConFlip(y.i)
+  ProcedureReturn DisplayFlip(y)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConBlitBanner - CPU-blit the DMA console's full banner (the anvil
+;  PHOTO, the smooth "PureMetal Forge" title, the subtitle, the rule and
+;  "A N V I L") into the top band of the half at `targetBase`.
+;
+;  WHY THE CPU, NOT THE GPU. The photo and the anti-aliased DejaVu faces
+;  cannot be V3D textures: the 4.2 TMU cannot sample the linear atlas they
+;  live in (the reason Neon_Text draws rectangles). So the banner is the
+;  exact same CPU path the DMA console uses (DrawBanner -> DrawAnvilPic /
+;  DrawSmoothText), just aimed at the back buffer instead of the front.
+;
+;  WHEN. AFTER the GPU text frame (NeonFrameEnd has waited for the render)
+;  and BEFORE the flip, so it lands on the half about to be shown. The band
+;  is 0..LogoHeight() and the grid text starts at LogoHeight(), so the two
+;  never overlap; the GPU already cleared the band to the same ground
+;  colour DrawSmoothText blends against, so the photo's and the title's
+;  anti-aliased edges fade into it seamlessly.
+;
+;  HOW IT REACHES THE BACK HALF. DrawBanner draws through display.pi4's
+;  primitives, which all write to dsp_base. Point dsp_base at the target
+;  half around the call and put it straight back, so nothing else is
+;  disturbed. (With caches ON these CPU writes would need a clean before
+;  the flip; that is part of the M4 coherency work and caches are OFF by
+;  default, where PokeL goes straight to DRAM.)
+; ----------------------------------------------------------------------
+Procedure V3dConBlitBanner(targetBase.i)
+  Define saved.i
+  saved = DisplayBase()
+  DisplaySetBase(targetBase)
+  DrawBanner()
+  DisplaySetBase(saved)
+  ; DRAIN THE CPU'S BANNER WRITES BEFORE THE DMA COPY READS THEM. With the
+  ; framebuffer mapped Normal Non-Cacheable (caches on), these PokeL writes
+  ; go through a store buffer that may GATHER and reorder them, so without a
+  ; barrier the DMA engine can read the off-screen half before the photo and
+  ; the smooth title have reached DRAM, and they drop out of the copied
+  ; frame. dsb sy makes them complete to the point of coherency first.
+  ; Harmless with caches off (the writes were already Device-ordered).
+  a64_barrier()
+EndProcedure
+
+; Re-establish the mouse cursor on top of a freshly presented frame. A text
+; redraw overwrites the whole shown half (and the pixels the cursor's
+; save-under held), so after presenting, the cursor is drawn again with a
+; fresh save-under - otherwise its next move would restore stale pixels. No
+; cursor up (headless, or no mouse) -> nothing to do.
+Procedure V3dConCursorRefresh()
+  If gScrSrc = #SCR_SRC_DSI
+    ; The cursor was part of the transformed GPU frame. A CPU overlay would
+    ; use the logical DisplayPitch against a physical portrait buffer.
+    ProcedureReturn
+  EndIf
+  If gCurShown <> 0
+    CursorSave(gCurX, gCurY)
+    CursorDraw(gCurX, gCurY)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ConPaintV3d - THE V3D SCREEN RENDERER. Registered with the console core
+;  as the active screen endpoint while V3D is the tier; the hub calls it
+;  when the shared grid changed. It GPU-renders the WHOLE shared grid (the
+;  GPU repaints everything anyway), CPU-blits the banner, presents, and
+;  redraws the cursor. It never reads the ring - the hub already drained it
+;  into the grid, the same grid the DMA renderer paints.
+;
+;  DOUBLE BUFFER BY OFF-SCREEN RENDER + COPY, shown half stays at virtual
+;  offset 0. (A SET_VIRTUAL_OFFSET page flip to a non-zero offset scans out
+;  BLURRED on this firmware - the HVS filters the panned view - although the
+;  rendered DRAM is provably pixel-exact. Offset 0 is crisp, so the GPU
+;  renders into the OFF-SCREEN bottom half and the finished frame is DMA-
+;  copied up to the shown top half - the only window the shown half changes
+;  in is the ~ms copy, versus the ~260 ms a straight-to-front render smears.)
+; ----------------------------------------------------------------------
+Procedure ConPaintV3d()
+  Define r.i
+  Define t0.i
+  Define renderBase.i
+  Define bytes.i
+  Define shown.i
+
+  If gV3dConInit = 0
+    ProcedureReturn
+  EndIf
+
+  t0 = Micros()
+  bytes = gV3dPhysH * gV3dPitch
+  shown = 0
+
+  If gV3dDouble <> 0
+    renderBase = gV3dFbBase
+    If ScrGpuHasFixedBack() = 0
+      renderBase = gV3dFbBase + bytes
+    EndIf
+    NeonRetarget(renderBase, bytes)
+    r = V3dConRenderGridFrame()
+    If r = #NEON_OK
+      If gScrSrc = #SCR_SRC_DSI
+        ; The established CPU renderer already put a correctly transformed
+        ; banner on the front. Preserve that physical strip in the new frame.
+        ScrGpuKeepBanner(renderBase)
+      Else
+        V3dConBlitBanner(renderBase)
+      EndIf
+      ; AND THE KEYBOARD BAND THE SAME WAY. It is CPU-composed in logical
+      ; coordinates and already on the panel; this carries it through a
+      ; frame the GPU cleared, so the console repaint that follows a
+      ; keystroke does not blank the keys and make them be redrawn.
+      V3dConKeepKeyboardBand(renderBase)
+      shown = ScrGpuPresent(renderBase, bytes)
+      If shown <> 0
+        V3dConCursorRefresh()
+      EndIf
+    EndIf
+  Else
+    ; SINGLE BUFFER - no double-height surface, or no DMA engine to copy with.
+    ; Render straight into the shown (offset 0) surface. Smears during the GPU
+    ; render but is crisp; the honest fallback.
+    r = V3dConRenderGridFrame()
+    If r = #NEON_OK
+      V3dConBlitBanner(DisplayBase())
+      V3dConCursorRefresh()
+      ; NOTHING TO CARRY THE KEYBOARD BAND IN. This frame was rendered
+      ; straight into the shown surface, so the clear at the top of it
+      ; took the band with it and there is no second buffer to copy the
+      ; presented band out of. Say so, and the composer that runs next
+      ; draws itself whole - the same latch a full console clear sets.
+      ConOverlayMarkWhole()
+      shown = 1
+    EndIf
+  EndIf
+
+  gV3dUsBuild  = Neon_UsBegin()
+  gV3dUsBin    = Neon_UsBin()
+  gV3dUsRender = Neon_UsRender()
+  gV3dUsWall   = Micros() - t0
+  If shown <> 0
+    gV3dFrames = gV3dFrames + 1
+    ConGridClearDirty()
+  EndIf
+EndProcedure
+
+; Read-only timing accessors for the `screen v3d` report.
+Procedure.i V3dConUsBuild()
+  ProcedureReturn gV3dUsBuild
+EndProcedure
+Procedure.i V3dConUsBin()
+  ProcedureReturn gV3dUsBin
+EndProcedure
+Procedure.i V3dConUsRender()
+  ProcedureReturn gV3dUsRender
+EndProcedure
+Procedure.i V3dConUsWall()
+  ProcedureReturn gV3dUsWall
+EndProcedure
+Procedure.i V3dConActive()
+  ProcedureReturn gV3dConOn
+EndProcedure
+Procedure.i V3dConDoubleBuffered()
+  ProcedureReturn gV3dDouble
+EndProcedure
+
+; Read-only execution evidence for `screen v3d status`. The frame/timing
+; counters above say what the console asked for; these values come from the
+; V3D submission layer and include the hardware's BFC/RFC completion counters
+; sampled on both sides of the most recent bin/render jobs plus every captured
+; error register. This routine performs no init, reset, clear or submit.
+Procedure V3dConStatus()
+  PrintN("V3D execution status (read-only; most recent submitted frame):")
+  Print("  engine ready ")
+  PrintDec(V3dReady())
+  Print(", init error ")
+  PrintDec(V3dError())
+  Print(", console frames ")
+  PrintDec(gV3dFrames)
+  PrintNl()
+
+  Print("  bin jobs ")
+  PrintDec(V3dBinJobs())
+  Print(", hardware BFC before $ ")
+  PutHexN(V3dBinBfcBefore(), 8)
+  Print(" after $ ")
+  PutHexN(V3dBinBfcAfter(), 8)
+  Print(", spins ")
+  PrintDec(V3dBinSpins())
+  PrintNl()
+  Print("    INTSTS $ ")
+  PutHexN(V3dBinIntSts(), 8)
+  Print(" ERRSTAT $ ")
+  PutHexN(V3dBinErrStat(), 8)
+  Print(" MMU_CTL $ ")
+  PutHexN(V3dBinMmuCtl(), 8)
+  Print(" VIO_ADDR $ ")
+  PutHexN(V3dBinVioAddr(), 8)
+  Print(" VIO_ID $ ")
+  PutHexN(V3dBinVioId(), 8)
+  Print(" OOM ")
+  PrintDec(V3dBinOomCount())
+  PrintNl()
+
+  Print("  render jobs ")
+  PrintDec(V3dRenderJobs())
+  Print(", hardware RFC before $ ")
+  PutHexN(V3dRenderRfcBefore(), 8)
+  Print(" after $ ")
+  PutHexN(V3dRenderRfcAfter(), 8)
+  Print(", spins ")
+  PrintDec(V3dRenderSpins())
+  PrintNl()
+  Print("    INTSTS $ ")
+  PutHexN(V3dRenderIntSts(), 8)
+  Print(" ERRSTAT $ ")
+  PutHexN(V3dRenderErrStat(), 8)
+  Print(" MMU_CTL $ ")
+  PutHexN(V3dRenderMmuCtl(), 8)
+  Print(" VIO_ADDR $ ")
+  PutHexN(V3dRenderVioAddr(), 8)
+  Print(" VIO_ID $ ")
+  PutHexN(V3dRenderVioId(), 8)
+  Print(" clean rc ")
+  PrintDec(V3dRenderCleanResult())
+  PrintNl()
+  If V3dBinJobs() = 0 Or V3dRenderJobs() = 0
+    PrintN("  No completed bin/render pair has been recorded yet; these zeros are not")
+    PrintN("  presented as GPU execution evidence.")
+  Else
+    PrintN("  A changed BFC and RFC across their jobs are the hardware completion proof;")
+    PrintN("  the software job/frame counts alone are not.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConTryDouble - obtain an off-screen render target. DSI already owns its
+;  fixed pair and returns success without touching firmware. HDMI reallocates
+;  the framebuffer with twice the virtual height. Returns 1 when either form
+;  of back buffer exists; 0 after HDMI has reverted to a single buffer.
+;
+;  This re-runs DisplayInit, which reallocates the firmware framebuffer -
+;  the picture is briefly whatever the firmware leaves in the new surface
+;  until the first V3D frame lands, which is immediate. The physical mode
+;  is unchanged, so the DMA console keeps working in the top half.
+; ----------------------------------------------------------------------
+Procedure.i V3dConTryDouble()
+  Define w.i
+  Define h.i
+
+  w = DisplayWidth()
+  h = DisplayHeight()
+
+  ; The DSI owner already reserves distinct physical front/back buffers.
+  ; Firmware owns neither of them and must not be called on this path.
+  If ScrGpuHasFixedBack() <> 0
+    ProcedureReturn 1
+  EndIf
+
+  DisplaySetVirtMul(2)
+  DisplayStandardTags()
+  DisplayInit(w, h, 32)
+
+  If DisplayReady() <> 0 And DisplayVirtualHeight() >= (h * 2) And DisplayHeight() = h
+    ProcedureReturn 1
+  EndIf
+
+  ; The firmware would not give a double-height surface. Put it back to a
+  ; single buffer so the console still comes up (single-buffered, may tear).
+  DisplaySetVirtMul(1)
+  DisplayStandardTags()
+  DisplayInit(w, h, 32)
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConActivate - THE DRIVER-AVAILABILITY GATE, no report. Returns 1 if
+;  the V3D console is now the active backend, 0 if the 3D stack is
+;  unavailable or would not initialise (caller then stays on / falls back
+;  to the DMA/CPU framebuffer console). Both the boot tier auto-select and
+;  `screen v3d` go through this, so "V3D is up" means the same thing to
+;  both. The heavy init runs ONCE; a later re-activation reuses the
+;  resident engine and the double-height buffer it already obtained.
+; ----------------------------------------------------------------------
+Procedure.i V3dConActivate()
+  If gScreen = 0
+    ProcedureReturn 0
+  EndIf
+  If gV3dConFail <> 0
+    ProcedureReturn 0
+  EndIf
+  If gV3dConOn <> 0
+    ProcedureReturn 1
+  EndIf
+  If gV3dConInit = 0
+    ; PROBE THE 3D STACK CHEAPLY FIRST - bridge, power, clock, IDENT - before
+    ; disturbing the framebuffer. If V3D is not even present (a board without
+    ; it, or a firmware that will not power it), return now and leave the DMA
+    ; console EXACTLY as it is: no double-height reallocation for a buffer
+    ; that cannot be used. V3dInit is idempotent, so NeonInit calling it
+    ; again below is fine (pi4NeonMbx relies on the same).
+    If V3dInit() <> #V3D_OK
+      ProcedureReturn 0
+    EndIf
+    ; A tear-free double buffer is tried before the engine binds the
+    ; surface, because obtaining it may move the framebuffer base.
+    gV3dDouble = V3dConTryDouble()
+    If V3dConSetupOnce() = 0
+      ; The 3D stack was present but the engine would not come up. Rebind the
+      ; DMA engine to whatever framebuffer TryDouble left, so the DMA console
+      ; still scrolls, and fall back.
+      gDma = ScreenDmaUp()
+      ProcedureReturn 0
+    EndIf
+    ; TURN THE D-CACHE ON FOR THE FAST PATH. With caches off a V3D redraw is
+    ; ~384 ms; with them on it is ~33 ms (~11x), because the A72 builds the
+    ; vertex lists in cacheable DRAM. This is safe now that the M4 coherency
+    ; work is done: the framebuffer and the GENET ring are mapped Non-
+    ; Cacheable (CacheEnable), the mailbox and DMA engine carry dc civac, and
+    ; SDIO/USB are PIO/maintained - every path the console and its drivers
+    ; touch is coherent with the D-cache on (verified on silicon: wifi
+    ; console, info/mailbox, wb OTA, USB stick, screenshot, payload run).
+    ; Done ONCE, on the first activation, so a later `cache off` is respected.
+    ; CacheEnable is a no-op if this build cannot cache (#ANVIL_CACHE = 0 or
+    ; the assembler lacks the EL2 registers).
+    CompilerIf #ANVIL_V3D_CACHE_AUTO = 1
+    CacheEnable()
+    CompilerEndIf
+  EndIf
+  ; V3D is the tier now. Register the V3D renderer as the active screen
+  ; endpoint and repaint the SHARED grid with it - the grid already holds
+  ; the boot log and everything else, so V3D shows exactly what the DMA
+  ; renderer was showing, just GPU-painted. There is no private grid to
+  ; clear and no ring to re-drain.
+  ; Remove a CPU save-under cursor before the back buffer changes meaning.
+  ; On a sideways DSI surface ScrPresent also removes it from the physical
+  ; front, including the unlikely case where it overlaps the preserved banner.
+  If gCurShown <> 0
+    CursorRestore(gCurX, gCurY)
+    ScrPresent(gCurY, gCurY + #CUR_H - 1)
+  EndIf
+  gV3dConOn = 1
+  gCursorGpuOwned = 1
+  gV3dBackY = gV3dPhysH
+  ConSetRenderer(@ConPaintV3d)
+  ConRepaint()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConStart - make the V3D GPU the console backend. `screen v3d`.
+; ----------------------------------------------------------------------
+Procedure.i V3dConStart()
+  CompilerIf #ANVIL_V3D_CONSOLE = 0
+  PrintN("This build was compiled without the V3D console (#ANVIL_V3D_CONSOLE = 0),")
+  PrintN("so the DMA/CPU console is the only one. Nothing changed.")
+  ProcedureReturn 0
+  CompilerElse
+  ; `screen v3d status` is strictly observational. Parse it before any screen
+  ; or activation checks so a failed/inactive engine can still report the
+  ; captured reason and zero-job state without changing hardware.
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  If WordIs("status") <> 0
+    V3dConStatus()
+    ProcedureReturn 1
+  EndIf
+  If gScreen = 0
+    PrintN("!! there is no screen up to render on, so the V3D console cannot start.")
+    PrintN("   Type screen on first, then screen v3d.")
+    ProcedureReturn 0
+  EndIf
+  If gV3dConOn <> 0
+    ; Already the active backend: report the last frame's timing rather than
+    ; refusing, so `screen v3d` doubles as the stats command.
+    PrintN("The V3D console is already the active backend.")
+    Print("  Last frame: build ")
+    PrintDec(V3dConUsBuild())
+    Print(" us, bin ")
+    PrintDec(V3dConUsBin())
+    Print(" us, render ")
+    PrintDec(V3dConUsRender())
+    Print(" us, wall ")
+    PrintDec(V3dConUsWall())
+    Print(" us (")
+    PrintDec(gV3dFrames)
+    PrintN(" frames drawn).")
+    If gV3dDouble <> 0
+      Print("  Double-buffered: rendered off-screen, copied to the shown surface")
+      If gDma <> 0
+        PrintN(" by DMA.")
+      Else
+        PrintN(" by the CPU fallback.")
+      EndIf
+    Else
+      PrintN("  Single-buffered - correct but smears during the GPU render.")
+    EndIf
+    PrintN("  Type screen dma to go back to the DMA/CPU console.")
+    ProcedureReturn 1
+  EndIf
+
+  ; Bring the 3D stack up and make it the console. V3dConActivate is the
+  ; driver-availability gate; if it fails, V3D is genuinely unavailable and
+  ; the DMA/CPU console stays.
+  If V3dConActivate() = 0
+    PrintN("!! the V3D 3D stack would not initialise, so the console stays on the")
+    PrintN("   DMA/CPU framebuffer backend. Nothing else is affected.")
+    ProcedureReturn 0
+  EndIf
+
+  PrintN("The console is now rendered by the V3D GPU engine (NeonArcade).")
+  If gV3dDouble <> 0
+    PrintN("  Double-buffered: the GPU renders off-screen and the finished frame is")
+    PrintN("  copied up to the shown half, which stays at offset 0 so the text is")
+    PrintN("  pixel-crisp (a non-zero virtual offset scans out blurred on this")
+    PrintN("  firmware; DSI uses its fixed Anvil-owned front/back surfaces).")
+    If gDma <> 0
+      PrintN("  The finished-frame copy is DMA accelerated.")
+    Else
+      PrintN("  The finished-frame copy is using its CPU fallback.")
+    EndIf
+  Else
+    PrintN("  Single-buffered (no off-screen copy available) - correct and crisp,")
+    PrintN("  but smears during the GPU's render. Everything else works.")
+  EndIf
+  Print("  First frame: build ")
+  PrintDec(V3dConUsBuild())
+  Print(" us, bin ")
+  PrintDec(V3dConUsBin())
+  Print(" us, render ")
+  PrintDec(V3dConUsRender())
+  Print(" us, wall ")
+  PrintDec(V3dConUsWall())
+  PrintN(" us.")
+  ; THE STORED GRID, NOT THE VIEWPORT. This line reports how much text the
+  ; console holds, which does not change when the touch keyboard reserves
+  ; the bottom of the screen; ConGridRows() would have answered how many
+  ; rows are currently VISIBLE and quietly turned this into a different
+  ; sentence the moment a keyboard came up.
+  Print("  The GPU frame is redrawn only when the screen changes. Grid is ")
+  PrintDec(ConContentCols())
+  Print(" x ")
+  PrintDec(ConContentRows())
+  Print(" characters, showing ")
+  PrintDec(ConViewRows())
+  PrintN(" rows.")
+  PrintN("  Type screen dma to return to the DMA/CPU console; info still works")
+  PrintN("  (the firmware mailbox survives V3D). Type screenshot to capture it.")
+  ProcedureReturn 1
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConStop - hand the console back to the DMA/CPU backend. `screen dma`.
+;  The engine stays initialised (init-once), so a later `screen v3d` is
+;  cheap; only rendering stops.
+; ----------------------------------------------------------------------
+Procedure V3dConStop()
+  CompilerIf #ANVIL_V3D_CONSOLE = 0
+  PrintN("This build has no V3D console; the DMA/CPU console is already the one.")
+  ProcedureReturn
+  CompilerElse
+  If gV3dConOn = 0
+    PrintN("The V3D console was not active; the DMA/CPU console is already the one.")
+    ProcedureReturn
+  EndIf
+  gV3dConOn = 0
+  gCursorGpuOwned = 0
+
+  ; If a page flip left the shown half at the lower offset, put it back to
+  ; the top so the DMA console - which always draws the top half - is what
+  ; is scanned out.
+  If gV3dDouble <> 0 And gScrSrc = #SCR_SRC_HDMI
+    V3dConFlip(0)
+    gV3dBackY = gV3dPhysH
+  EndIf
+
+  ; Repaint the DMA console: the whole surface, the banner band, and the
+  ; console rectangle. The next ScreenPump (now draining to the DMA path
+  ; again) draws the text.
+  DisplayClear(gScreenBg)
+  DrawBanner()
+  DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+  ; THE CLEAR ABOVE TOOK THE KEYBOARD WITH IT. The UI layer was inside the
+  ; GPU's frame a moment ago and is about to be composed by the CPU
+  ; renderer instead; without this latch its next pass would draw only the
+  ; keys it thinks changed, onto a band that is no longer there.
+  ConOverlayMarkWhole()
+  ConOverlayDamage()
+  PrintN("The console is back on the DMA/CPU backend. The V3D engine stays loaded,")
+  PrintN("so screen v3d switches back to it without re-initialising.")
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dConAutoStart - THE BOOT-TIME TIER SELECTION.
+;
+;  Anvil PREFERS the V3D console and picks the console tier by driver
+;  availability: bring the 3D stack up, and if it initialises the V3D
+;  console becomes the default; if V3D is unavailable or init fails, the
+;  DMA-accelerated framebuffer console (already up) stays; and if the DMA
+;  engine never bound either, that same framebuffer console is drawn by the
+;  plain CPU. Driver availability is the decider, not a fixed default.
+;
+;  WHY AFTER THE OTHER DRIVERS, NOT BEFORE. V3dInit talks to the firmware
+;  property mailbox for power and clock, and the Wi-Fi bring-up's EMMC-clock
+;  query is famously fragile when the mailbox is contended (wifi.pi4's
+;  header). So the fast DMA console carries the boot log, all the boot
+;  drivers come up on it, and only then is V3D brought up - the tier is
+;  still chosen at boot by whether the 3D stack initialises, and the prompt
+;  the operator meets is on V3D whenever it is available.
+;
+;  THE SPEED, AND THE D-CACHE. A V3D redraw is ~384 ms with the cache off
+;  and ~33 ms with it on (the A72 builds the vertex lists in cacheable
+;  DRAM). The M4 coherency work is done, so V3dConActivate turns the cache
+;  ON when V3D first comes up (#ANVIL_V3D_CACHE_AUTO): the framebuffer and
+;  the GENET receive ring are mapped Non-Cacheable and the mailbox / DMA
+;  engine carry dc civac, so every path the console and its drivers touch is
+;  coherent - verified on silicon for the wifi console, info/mailbox, wb
+;  OTA, the USB stick, the screenshot and a payload run. `cache off` slows
+;  the console back down but is always safe.
+; ----------------------------------------------------------------------
+Procedure V3dConAutoStart()
+  If gScreen = 0
+    ; NO DISPLAY. There is no screen RENDERER to select - but that changes
+    ; NOTHING about the other consoles. The serial line, the wireless console
+    ; and any network console are CONCURRENT, ALWAYS-ON channels: output is
+    ; mirrored to every one that exists and input is taken from any of them,
+    ; whether or not a display is attached. The screen is ONE OPTIONAL channel
+    ; among them, never "the" console and never their fallback. This path only
+    ; reports that the optional one is absent; it selects, brings up, and
+    ; gates nothing, and it cannot hang.
+    PrintN("display: none attached, so no screen renderer is selected. The serial")
+    PrintN("line and the wireless/network consoles run exactly as always - the")
+    PrintN("screen is one optional channel among them, not the console.")
+    ProcedureReturn
+  EndIf
+  If V3dConActivate() <> 0
+    Print("display renderer: V3D GPU (NeonArcade), ")
+    If gV3dDouble <> 0
+      Print("double-buffered (off-screen render + copy)")
+    Else
+      Print("single-buffered")
+    EndIf
+    PrintN(" - the preferred tier is up.")
+    PrintN("  This is the SCREEN channel only; the serial and wireless/network")
+    PrintN("  consoles run alongside it, always. Redraw is on-change; the D-cache")
+    PrintN("  was turned on for it (~33 ms/frame, versus ~384 ms without) - the")
+    PrintN("  framebuffer and GENET ring are mapped non-cacheable so it is coherent.")
+    PrintN("  screen dma / cpu drop to the CPU renderer; cache off slows it but is")
+    PrintN("  always safe.")
+  Else
+    ; V3D is not available; the framebuffer console (already up) is the tier.
+    If gDma <> 0
+      PrintN("console tier: DMA-accelerated framebuffer (V3D unavailable).")
+    Else
+      PrintN("console tier: plain CPU framebuffer (V3D and the DMA engine unavailable).")
+    EndIf
+  EndIf
+EndProcedure
+
+CompilerEndIf   ; #ANVIL_V3D_CONSOLE = 1 (the whole module)

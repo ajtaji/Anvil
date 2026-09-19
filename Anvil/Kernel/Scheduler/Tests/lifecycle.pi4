@@ -1,0 +1,82 @@
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+Global checks.i
+Global failures.i
+Procedure Check(actual.i, expected.i)
+  checks = checks + 1
+  If actual <> expected
+    failures = failures + 1
+  EndIf
+EndProcedure
+Procedure Main()
+  Protected a.i
+  Protected b.i
+  Protected c.i
+  Protected n.i
+  a = SchedCreate()
+  b = SchedCreate()
+  Check(a, 32)
+  Check(b, 33)
+  Check(SchedNext(), a)
+  Check(SchedNext(), 0)
+  Check(SchedCancel(a), 0)
+  Check(SchedWait(a, 7, 100), 1)
+  Check(SchedAdvance(50), 0)
+  Check(SchedNext(), b)
+  Check(SchedYield(b), 1)
+  Check(SchedWake(7, 1), 1)
+  Check(SchedWake(7, 1), 0)
+  Check(SchedNext(), b)
+  Check(SchedFinish(b), 1)
+  Check(SchedReap(b), 1)
+  Check(SchedState(b), -1)
+  c = SchedCreate()
+  Check(c, 65)
+  Check(SchedCancel(b), 0)
+  Check(SchedNext(), a)
+  Check(SchedWait(a, 0, 99), 1)
+  Check(SchedAdvance(98), 0)
+  Check(SchedAdvance(97), -1)
+  Check(SchedAdvance(99), 1)
+  Check(SchedAdvance(100), 0)
+  Check(SchedCancel(c), 1)
+  Check(SchedReap(c), 1)
+  Check(SchedNext(), a)
+  Check(SchedFinish(a), 1)
+  Check(SchedReap(a), 1)
+  Check(SchedNext(), 0)
+  For n = 0 To 31
+    a = SchedCreate()
+    Check(SchedState(a), #SCHED_READY)
+  Next
+  Check(SchedCreate(), 0)
+  For n = 0 To 31
+    a = SchedNext()
+    Check(SchedYield(a), 1)
+  Next
+  For n = 0 To 31
+    a = SchedNext()
+    Check(SchedFinish(a), 1)
+    Check(SchedReap(a), 1)
+  Next
+  Check(SchedNext(), 0)
+  Check(SchedWake(0, 32), -1)
+  Check(SchedWake(7, 33), -1)
+  a = SchedCreate()
+  b = SchedCreate()
+  Check(SchedNext(), a)
+  Check(SchedYield(a), 1)
+  Check(SchedNext(), b)
+  Check(SchedWait(b, 9, 0), 1)
+  Check(SchedNext(), a)
+  Check(SchedWait(a, 9, 0), 1)
+  Check(SchedWake(9, 1), 1)
+  Check(SchedNext(), b)
+  Check(SchedCancel(a), 1)
+  Check(SchedWake(9, 32), 0)
+  Check(SchedReap(a), 1)
+  Check(SchedFinish(b), 1)
+  Check(SchedReap(b), 1)
+  Check(SchedNext(), 0)
+  PokeI($6000000, checks)
+  PokeI($6000008, failures)
+EndProcedure

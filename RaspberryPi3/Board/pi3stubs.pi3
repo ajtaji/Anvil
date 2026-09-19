@@ -1,0 +1,900 @@
+; ======================================================================
+;  pi3stubs.pi3 - WHAT THIS BOARD DOES NOT DO, SAID OUT LOUD.
+;
+;  Every capability this board declares 0 still needs its Hw* seam to
+;  EXIST, and this is where they are. Its counterpart is
+;  ArduinoQ/Board/qstubs_q.unoq, which does the same job on that board
+;  for a longer list.
+;
+; ----------------------------------------------------------------------
+;  WHY A BOARD SUPPLIES A SEAM IT CANNOT ANSWER
+; ----------------------------------------------------------------------
+;  An ABSENT procedure is a link error naming a symbol, which tells a
+;  reader nothing about the board. A seam that is optional in places
+;  produces a board that builds and then behaves differently for a reason
+;  nobody can see. So a board supplies the WHOLE seam, the gate in front
+;  of it refuses the command, and the procedure behind the gate answers
+;  the way a board with no such hardware should - which is what the
+;  sections below are.
+;
+;  NOTHING HERE IS REACHED IN NORMAL USE. RequireCap() in
+;  Anvil/Hal/hal.pbi reads the capability flag and refuses the command
+;  with a whole sentence before any of these is called. They exist so
+;  that the image LINKS and so that a flag raised before its backend is
+;  written fails in a way somebody can read.
+;
+; ----------------------------------------------------------------------
+;  EVERY ZERO HERE SAYS WHICH KIND OF ZERO IT IS
+; ----------------------------------------------------------------------
+;  Anvil/Hal/hal.pbi is explicit that 0 covers both "the board has no
+;  such hardware" and "no backend has been written for it yet", because
+;  from the operator's seat those are the same fact and the same honest
+;  refusal. They are NOT the same fact for the next person to work here,
+;  so each section below says which it is - and on this board most of
+;  them are the second, sometimes with a working driver sitting in the
+;  tree that this image deliberately does not carry.
+;
+;  THIS IS NOT FEATURE-GATING TO SAVE SPACE. hal.pbi forbids that in as
+;  many words and nothing here is hidden that works.
+;
+;  INCLUDE ORDER: after Anvil/Hal/hal.pbi (every #HW_* code these
+;  answer with), after RaspberryPi3/Lib/pl011_console.pi3 (PrintN) and
+;  after the A/B module (pi3_dtb). House rule 10: this file includes
+;  nothing itself.
+; ======================================================================
+
+; ======================================================================
+;  #CAP_CONSOLE = 0 - THERE IS A FRAMEBUFFER AND THERE IS NO SURFACE.
+;
+;  This is the one group on this board where 0 is the most misleading
+;  answer available, so it is worth being exact about what is and is not
+;  there. RaspberryPi3/Lib/framebuffer.pbi allocates an HDMI framebuffer
+;  through the firmware mailbox and PRESENTS IT - that was proven on this
+;  silicon in build 6, and the panel showed text.
+;
+;  What does not exist is the HwCon* surface: the console grid, the
+;  damage tracking, the text renderer and the tiering that let the shared
+;  core and a payload DRAW on it. That is milestone 3, and until it is
+;  written a board that claimed #CAP_CONSOLE = 1 would offer a payload a
+;  drawing surface that answers every call with a zero.
+;
+;  #HW_TIER_CPU IS THE ONLY HONEST ANSWER TO A QUESTION THAT SHOULD NOT
+;  BE ASKED. The seam has three tiers and no 'none', because a board
+;  that answers this is a board with a surface; here the gate in front
+;  of every caller is #CAP_CONSOLE = 0, so nothing reaches it. It says
+;  CPU rather than an invented fourth value so that a reader is not sent
+;  looking for a constant that does not exist.
+; ======================================================================
+
+Procedure.i HwConBacklight(pct.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwConCapture()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConFrameBegin()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConFrameEnd()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConHeight()
+  ProcedureReturn 0
+EndProcedure
+Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
+EndProcedure
+Procedure.i HwConText(x.i, y.i, *utf8, argb.i, bg.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConTextHeight()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConTextWidth(*utf8)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConTier()
+  ProcedureReturn #HW_TIER_CPU
+EndProcedure
+Procedure.i HwConWidth()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_GPIO = 0 - NO BACKEND, AND THE HARDWARE IS RIGHT THERE.
+;
+;  The BCM2837's GPIO block is at $3F200000 and this monitor already
+;  writes it: RaspberryPi3/Lib/uart.pbi muxes GPIO 14 and 15 to the
+;  PL011 and runs the old-style GPPUD/GPPUDCLK pull sequence, and
+;  RaspberryPi3/Lib/sdhost.pbi muxes 48 to 53 for the card. So this 0 is
+;  "no backend has been written", not "Anvil cannot reach the pins".
+;
+;  HwGpioCount() ANSWERS 0 AND NOT 54. A count with no backend behind it
+;  would make `gpio` print a table of pins it cannot read, which is worse
+;  than refusing: every row would be a plausible-looking lie.
+;
+;  WHAT WRITING THIS BACKEND ACTUALLY NEEDS, so nobody starts it thinking
+;  it is an afternoon: the reserved-pin list. This board has the console
+;  on 14 and 15, the card on 48 to 53, and the radio on 34 to 39 in ALT3 -
+;  and driving any of those from `gpio` takes the machine down under
+;  itself. HwGpioReservedReason() is the seam for saying so per pin, and
+;  it is the part that has to be right before the write half is offered.
+; ======================================================================
+
+Procedure.i HwGpioAltGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioLevelGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioMode(pin.i, mode.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioModeGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioPullGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioReservedReason(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioToggle(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioUserMax()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioWrite(pin.i, level.i)
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_I2C = 0 - NO BACKEND. The BCM2837 has two Broadcom Serial
+;  Controllers and nothing in this tree drives either of them. Not a
+;  platform problem and not a hardware absence: unwritten work, in a
+;  group nothing on this bench currently needs.
+; ======================================================================
+
+Procedure.i HwI2cDefaultBus()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwI2cGetSpeed(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cPadLevel(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwI2cPin(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwI2cPinFunc(bus.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwI2cPinReady(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwI2cProbe(bus.i, addr.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cRateMax(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cRateMin(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cRead(bus.i, addr.i, *buf, n.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cSetSpeed(bus.i, hz.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cSourceHz(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cSourceWhere(bus.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwI2cUp(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cWrite(bus.i, addr.i, *buf, n.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+
+; ======================================================================
+;  #CAP_MMC = 0 - AND THE CARD WORKS. This group is the RAW BLOCK family:
+;  `mmc read`, `mmc write`, sector counts. The card is reached instead
+;  through the storage and file seams, which is a different question and
+;  a different command set.
+;
+;  It is 0 rather than 1 because the raw family's contract includes
+;  things this board's driver deliberately refuses - an unrestricted
+;  write, for one. RaspberryPi3/Lib/sdhost.pbi will only write inside a
+;  window somebody declared, because the card carries the immutable
+;  loader and both A/B slots, and `mmc write 0` on the boot card is a
+;  board that stops booting. Offering the family and then refusing half
+;  of it would be worse than not offering it.
+; ======================================================================
+
+Procedure.i HwMmcUp()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcBlockCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcBlockSize()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcCanWrite()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcErrorText()
+  ProcedureReturn "this board has no raw block family: its card is reached through the filesystem seam, not through mmc"
+EndProcedure
+Procedure.i HwMmcInfo()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcReadBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcType()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcWriteBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_PWM = 0 - NO BACKEND AND NO FAN. The part has two PWM channels;
+;  nothing here drives them, and a Pi 3 Model B has no fan header for the
+;  family's main use. Unwritten work in a group nothing needs.
+; ======================================================================
+
+Procedure.i HwPwmBegin(pin.i, hz.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmDefaultPin()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwPwmDetail(which.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmDuty(permille.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmDutyNow()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmEnd()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHz()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHzDefault()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHzMax(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHzMin(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmKind()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmPinAt(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwPwmPinCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmPinIsHard(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmReservedReason(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure HwPwmService()
+EndProcedure
+
+; ======================================================================
+;  THE TEMPERATURE - NOT A CAPABILITY, AND NOT KNOWN.
+;
+;  HwTemp* has no #CAP_ flag: the core takes a reading once a second at
+;  the prompt whether or not a fan is armed, and a board that cannot
+;  answer says so with #HW_TEMP_NONE rather than by being absent.
+;
+;  THE SENSOR EXISTS. The BCM2837 has an on-die thermal sensor and the
+;  firmware will report it through the property mailbox. This monitor
+;  does not ask, for the reason every mailbox question on this board runs
+;  into: the mailbox stops answering once the MMU is on, and a
+;  once-a-second reading is exactly the kind of thing that cannot be
+;  asked during boot and remembered. Reading the sensor's own registers
+;  is the answer, and it is work nobody has done here.
+;
+;  SO IT ANSWERS UNKNOWN AND THE ROW SAYS UNKNOWN. A plausible constant
+;  would be the worst possible value in a field whose whole purpose is to
+;  tell somebody their board is hot.
+; ======================================================================
+
+Procedure.i HwTempMaxMilliC()
+  ProcedureReturn #HW_TEMP_NONE
+EndProcedure
+Procedure.i HwTempMilliC()
+  ProcedureReturn #HW_TEMP_NONE
+EndProcedure
+Procedure.i HwTempSource()
+  ProcedureReturn #HW_TEMP_SRC_NONE
+EndProcedure
+
+; ======================================================================
+;  #CAP_TOUCH = 0 - THERE IS NO PANEL. Not unwritten work: there is no
+;  touch controller on this bench's Pi 3 and no plan for one.
+; ======================================================================
+
+Procedure HwTouchFlush()
+EndProcedure
+Procedure.i HwTouchMaxPoints()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchPoll(*ev)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchQueued()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchReady()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchTick()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchUp()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_USB = 0 - THE DRIVERS EXIST AND THE MONITOR DOES NOT CARRY THEM.
+;
+;  This board has a DWC2 host controller and a LAN9514 hub-and-Ethernet
+;  part behind it, and RaspberryPi3/Lib/usb_*.pbi and lan9514_*.pbi are
+;  real drivers that pass their desk gates. They are the BOOT LANE's, they
+;  are compiled into the serial updater, and they are NOT in this image.
+;
+;  That is a deliberate milestone-1 boundary rather than an oversight.
+;  Bringing a USB host up on this part means DMA, and this monitor has
+;  just turned its caches on for the first time; the coherency discipline
+;  those drivers would need has never run here. Adding both at once would
+;  mean the first failure has two candidate causes.
+;
+;  So the group is 0, and the `usb` family refuses in a sentence. When the
+;  drivers come in, this section goes and a hw_usb.pi3 replaces it.
+; ======================================================================
+
+; What is left of the device-listing seam after the USB protocol moved
+; into Anvil/Bus/usb_core.pbi: choosing WHICH device, and naming the
+; driver that holds an interface. This board drives no USB host this
+; monitor can reach, so a load always fails and no interface is claimed.
+; A listing handed that prints the sentence about an empty bus, which is
+; the truth here and not a failure to read.
+Procedure.i HwUsbDescLoad(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDescLoaded()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevRootPort(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevParent(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevIfaceDriver(i.i, ifnum.i)
+  ProcedureReturn "no driver"
+EndProcedure
+Procedure.i HwUsbBurstIn()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbBurstOut()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevAddress(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevClass(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevKind(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevPid(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevRoute(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevSlot(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevSpeed(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevVid(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbEnumerate()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostFirmware()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostLinkSpeed()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostLinkSsc()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostLinkWidth()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostPid()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostPresent()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostVersion()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostVid()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPortConnected(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPortSpeed(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPorts()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPresent()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubRootPort()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldCount(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldName(r.i, f.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldValue(r.i, f.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegName(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegNote(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegValue(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortConnected(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortLinkState(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortPowerTimeouts(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortSpeed(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadAvailable()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadBlocks(lba.i, count.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageBlockCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageBlockSize()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageConfigLen()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageError()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageProduct()
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwUsbStorageProtocol()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageReady()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageUas()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageVendor()
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwUsbTree()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitBytes()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitFirstUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitLastUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure HwUsbWaitLedgerReset()
+EndProcedure
+Procedure.i HwUsbWaitName(i.i)
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwUsbWaitTotalUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitVisits(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitWorstUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkComp(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkErr(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkErrText(c.i)
+  ProcedureReturn "this board declares no USB host, so no enumeration walk was ever started"
+EndProcedure
+Procedure.i HwUsbWalkIsHub(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkPort(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkPortsc(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkReached(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkSlot(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkStep(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkStepText(s.i)
+  ProcedureReturn "no step - this board declares no USB host"
+EndProcedure
+Procedure.i HwUsbWalkUsbCmd()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkUsbSts()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_BOOT_EL1 = 0 - AND ON THIS BOARD THAT IS NOT A PLATFORM LIMIT.
+;
+;  The Arduino UNO Q answers 0 here because UEFI runs it at EL1 and there
+;  is no EL2 from which to install one. This board is different: the
+;  firmware normally hands a Pi 3 over at EL2, which is exactly where a
+;  kernel handoff has to be done from, so the capability is reachable and
+;  it is simply not written.
+;
+;  IT IS NOT WRITTEN BECAUSE THE PIECES AROUND IT ARE NOT. Dropping an
+;  arm64 Image to EL1 means handing it a device tree - this board has
+;  one, pinned at $1000000 - and it means the caches and MMU this monitor
+;  just turned on being put back exactly as the kernel expects to find
+;  them, which on this part has never been done and cannot be proven
+;  without a kernel to boot. That is a milestone of its own.
+; ======================================================================
+
+Procedure HwBootToEl1(entry.i, dtb.i)
+  ; Unreachable: #CAP_BOOT_EL1 = 0 gates every caller. If it is ever
+  ; reached, a capability was declared without a backend, and saying so
+  ; is far better than branching somewhere with the wrong exception
+  ; level and the caches in an unknown state.
+  PrintN("!! HwBootToEl1 was reached on a board that declares #CAP_BOOT_EL1 = 0.")
+  PrintN("   That is a bug in this board's capability declaration, not in the")
+  PrintN("   command. Nothing was done and nothing was branched to.")
+EndProcedure
+
+; ======================================================================
+;  HwFirmwareDtb() - AND THIS ONE IS A REAL ANSWER, NOT A STUB.
+;
+;  It sits in this file because it is one procedure and has no family to
+;  live with, not because this board cannot answer it. The Pi 3 CAN: the
+;  device tree is at $1000000, pinned there by the boot arrangement -
+;  Pi3UpdateConfigure() refuses any other value, the loader passes it in
+;  x0 when it branches, and Pi3BootMemory() has already walked its header
+;  and checked its magic and its length before this monitor printed
+;  anything.
+;
+;  SO IT RETURNS pi3_dtb AND NOT A CONSTANT. If boot validation refused,
+;  pi3_dtb is left at whatever it was and the boot stopped long before
+;  here; if it succeeded, this is a pointer somebody has already checked.
+;  Returning $1000000 unconditionally would be the same number with none
+;  of that behind it.
+; ======================================================================
+
+Procedure.i HwFirmwareDtb()
+  ProcedureReturn pi3_dtb
+EndProcedure
+
+; ======================================================================
+;  THE CONSTANTS AND GLOBALS THE SHARED CORE READS FROM ITS BOARD.
+;
+;  Not a seam and not a capability: a handful of names that shared files
+;  reference directly and that only a board can fill in. The Arduino
+;  UNO Q keeps its set at the foot of qstubs_q.unoq for the same reason.
+; ======================================================================
+
+; The console's own base, which the banner prints so an operator can see
+; WHICH port the text they are reading came out of. A real address here,
+; unlike the UNO Q, whose console is a firmware protocol with no base.
+#UART_BASE = $3F201000
+
+; ----------------------------------------------------------------------
+;  THE BOOT COUNTER - THIS BOARD HAS NONE, AND SAYS SO.
+;
+;  Anvil/Core/uptime.pbi reads a cell that survives a reset and holds a
+;  magic and a count, so `uptime` can say how many times the board has
+;  restarted. On the Pi 4 a library maintains it; nothing maintains one
+;  here, and writing one would be new work in a lane that has been told
+;  not to add libraries that do not exist yet.
+;
+;  SO THE MAGIC IS ZERO AND CAN NEVER MATCH, which is what makes uptime
+;  report the count as not available instead of reporting a number that
+;  came from whatever was in memory. The address still has to be one that
+;  is safe to READ, because the read happens before the magic is tested:
+;  the loader's handoff page is mapped, owned by the boot arrangement,
+;  and never holds this magic.
+;
+;  WHAT A REAL ONE WOULD NEED, so nobody starts it by accident: a cell
+;  outside both the monitor's BSS and the loader's, in a region
+;  memmap.pi3 declares so that `fill` cannot reach it, incremented once
+;  per boot before anything can fault, and reset by a confirmed update.
+;  That is a milestone, not a constant.
+; ----------------------------------------------------------------------
+#SAFETY_COUNT_ADDR = $1FF0000      ; the loader handoff page - readable,
+                                   ; and never this magic
+#SAFETY_MAGIC      = $00000000     ; can never match; the count is absent
+
+; ----------------------------------------------------------------------
+;  Globals the shared line editor and commands read. On the Pi 4 they
+;  live in that board's display globals; this board has no display
+;  service and no USB input, so they are constants that say so.
+; ----------------------------------------------------------------------
+Global gMouseTried.i = 1     ; 1 = "already tried", so ReadLine never asks
+Global gKbdH.i = 0           ; no USB HID keyboard on this board
+Global gScreen.i = 0         ; no console surface yet - see #CAP_CONSOLE
+Global gLastCR.i = 0         ; the line editor's CR/LF de-duplication state
+Global gBootTicks.i = 0      ; the counter at entry, set by Main()
+Global gBase.i = 0           ; the `base` command's address base
+Global gMbx.i = 0            ; the mailbox library keeps its own state
+
+; ======================================================================
+;  THE SERVICE HOOKS THE PROMPT CALLS ON EVERY SPIN.
+;
+;  Anvil's core is one set of bytes for every board, so the command loop
+;  and the line editor call these unconditionally. A board that has none
+;  of the hardware behind them still has to make the NAMES resolve, and
+;  the honest answer is a no-op that says which kind of nothing it is.
+;
+;  THE TWO THAT RETURN VALUES ARE THE DANGEROUS ONES. KeyboardChar() and
+;  NetConsoleGetc() feed the line editor; the only safe answers here are
+;  "no character" and "idle", and anything else is a phantom keystroke in
+;  somebody's command.
+; ======================================================================
+
+; No pixel surface yet - see #CAP_CONSOLE in the board file.
+Procedure ScreenPump()
+EndProcedure
+
+Procedure ScreenBannerTick()
+EndProcedure
+
+Procedure ScreenServiceTick()
+EndProcedure
+
+; No USB host in this image, so no keyboard and no mouse to attach.
+Procedure MouseTryAttach()
+EndProcedure
+
+Procedure MouseTick()
+EndProcedure
+
+Procedure.i KeyboardChar()
+  ProcedureReturn 0            ; 0 = no character
+EndProcedure
+
+; No touch controller on this board at all.
+Procedure TouchTick()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE NETWORK SERVICE HOOKS. #CAP_NET is 0 here, so there is no link, no
+;  lease, no console peer and no connection - but the prompt calls all
+;  six on every spin because on a board that HAS them, a lease renewing
+;  or a handshake finishing while nobody is typing is exactly what they
+;  are for.
+; ----------------------------------------------------------------------
+Procedure NetConsolePump()
+EndProcedure
+
+; A local keystroke cannot contend with a remote console session here:
+; there is no remote owner to release.
+Procedure NetConsoleClaimLocal()
+EndProcedure
+
+Procedure NetConsoleRearm()
+EndProcedure
+
+; The link-local address defence (RFC 3927 section 2.5): a second
+; conflicting ARP inside ten seconds must end in the address being
+; dropped rather than defended again. This board can never have taken
+; one.
+Procedure NetConsoleLlTick()
+EndProcedure
+
+Procedure NetDhcpTick()
+EndProcedure
+
+Procedure TcpTick()
+EndProcedure
+
+Procedure.i NetConsoleGetc()
+  ProcedureReturn -1           ; below zero = idle
+EndProcedure
+
+Procedure WifiLinkTick()
+EndProcedure
+
+; ======================================================================
+;  CACHE MAINTENANCE - and on this board it is REAL, not a stub.
+;
+;  The memory family flushes a range before running code that was just
+;  written into it, so the instruction fetch sees the new bytes rather
+;  than whatever the instruction cache had. On a board with the caches
+;  off that can be nothing; this monitor turns them ON during boot, so it
+;  has to be the real maintenance or `run` would branch into stale lines.
+;
+;  CLEAN TO THE POINT OF UNIFICATION, THEN INVALIDATE THE INSTRUCTION
+;  LINE, which is the ARM-documented pair for exactly this: `dc cvau`
+;  pushes the data the processor wrote out to where an instruction fetch
+;  will see it, and `ic ivau` throws away any instruction line that was
+;  already holding the old bytes. One without the other is the failure
+;  that produces no message at all.
+;
+;  SIXTY-FOUR BYTES IS THE A53's CACHE LINE, the same as the A72's, so
+;  the other board's step carries over unchanged.
+;
+;  THE ADDRESS GOES THROUGH A GLOBAL because an ASM block cannot take a
+;  local as an operand here. Its own procedure, so the loop around it
+;  stays readable.
+; ======================================================================
+Global gPi3FlushAddr.i
+
+Procedure Pi3CacheLine()
+  ASM
+    adrp x9, global_gpi3flushaddr
+    add  x9, x9, #:lo12:global_gpi3flushaddr
+    ldr  x9, [x9]
+    dc cvau, x9
+    ic ivau, x9
+  EndASM
+EndProcedure
+
+Procedure CacheFlushRange(lo.i, hi.i)
+  Define a.i
+  If hi < lo
+    ProcedureReturn
+  EndIf
+  a = (lo >> 6) << 6
+  While a <= hi
+    gPi3FlushAddr = a
+    Pi3CacheLine()
+    a = a + 64
+  Wend
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; ======================================================================
+;  AUTOBOOT - THIS BOARD HAS SOMETHING BETTER AND DOES NOT NEED IT.
+;
+;  On the Pi 4 an autoboot cell in preserved memory holds an entry point
+;  to run without being asked. This board's equivalent is the A/B slot
+;  machinery itself: the loader already chooses what runs, verifies it,
+;  gives it a trial and falls back if it does not confirm. An autoboot
+;  cell beside that would be a second, weaker answer to a question this
+;  board has already answered well.
+;
+;  So there is no armed entry and nothing to store, and Banner() reports
+;  none - which is true rather than merely unimplemented.
+; ======================================================================
+Procedure.i AutoEntry()
+  ProcedureReturn 0            ; 0 = no autoboot entry armed
+EndProcedure
+
+Procedure AutoSet(a.i)
+  ; Nothing to store. The command that calls this says so rather than
+  ; falling silent.
+EndProcedure
+
+; ======================================================================
+;  RunAt(a) - BRANCH INTO A PAYLOAD AND COME BACK.
+;
+;  This is `run` and `go`, and it is the one place this monitor hands the
+;  processor to code it did not compile. It is here rather than in a stub
+;  section because it is REAL: it is short because there is very little a
+;  board has to do, not because there is nothing.
+;
+;  THE ADDRESS IS NOT CHECKED HERE and that is not an omission. The
+;  command that got it has already been through the address guard and the
+;  monitor-window refusals, which is where an address is judged; a second
+;  opinion at the branch would either agree, and be noise, or disagree,
+;  and leave two answers to one question.
+;
+;  ZERO IS THE ONE VALUE REFUSED, because it is what every "no entry
+;  point" answer in this tree is spelled as - AutoEntry() above returns it
+;  - and branching to it would turn a missing payload into a fault at
+;  address nothing.
+;
+;  THE INSTRUCTION CACHE IS THE CALLER'S PROBLEM AND IT IS HANDLED. A
+;  payload that arrived over the serial line was WRITTEN as data with the
+;  caches on, so the instruction fetch at its entry point could see
+;  whatever was there before. Anvil/Core/memcmd.pbi calls
+;  CacheFlushRange() over the received range before it calls this, which
+;  is exactly why the real maintenance above is not a no-op on this
+;  board.
+;
+;  THE PAYLOAD IS ENTERED WITH THIS MONITOR RESIDENT. It returns here,
+;  and everything this board owns - the card, the console, the page
+;  tables - is still owned when it does.
+; ======================================================================
+Procedure RunAt(a.i)
+  If a = 0
+    ProcedureReturn
+  EndIf
+  Pi3EnterPayload(a)
+EndProcedure

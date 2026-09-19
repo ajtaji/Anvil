@@ -1,0 +1,183 @@
+; pi4FbRaw.pi4 - what did the firmware actually SAY about the framebuffer?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHY THIS EXISTS. pi4DisplayProbe reports DisplayInit() = -5 with
+; MailboxError() = #MBX_ERR_STATUS. That pair says a useful thing and
+; then stops short of the useful thing:
+;
+;   not TXTIMEOUT   - the request was accepted into mailbox 1
+;   not RXTIMEOUT   - a reply came back
+;   not ECHO        - the reply named OUR buffer
+;   STATUS          - the firmware set the response code to something
+;                     other than $80000000 (REQUEST SUCCESSFUL)
+;
+; So the channel works end to end and the firmware understood enough to
+; answer. What it refused, and why, is written in the buffer itself and
+; nothing was printing it.
+;
+; The buffer layout is the property-interface one, all 32-bit words:
+;
+;   [0] total size in bytes
+;   [1] request/response code   $00000000 request
+;                               $80000000 SUCCESS
+;                               $80000001 ERROR PARSING REQUEST BUFFER
+;   [2..] tags, each: tag id, value buffer size, request/response code,
+;         then the value words. A tag the firmware ANSWERED has bit 31
+;         set in its third word, and the low bits are the length it
+;         wrote. A tag it did not recognise comes back with that word
+;         still zero - which is a different failure from the whole
+;         buffer being rejected, and telling them apart is the point.
+;   [n] $00000000 end tag
+;
+; This program makes the same call the display library makes and then
+; dumps every word, so the answer is read off the firmware's own reply
+; instead of inferred from a return code.
+;
+;   PureMetalForge.exe --compile pi4FbRaw.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o fbraw.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+; #DSP_DMA_LINKED - MANDATORY, and it must be defined BEFORE display.pi4.
+; 0 = the CPU drawing path and nothing else; every procedure that would
+; touch the blitter is skipped at the token level and never parsed, and
+; what display.pi4 still carries is ten accessors totalling 660 bytes so
+; that a program can ask whether the engine was linked and be told no.
+; 1 would additionally require RaspberryPi4/Lib/dma.pi4 to be included
+; ahead of display.pi4.
+; display.pi4's THE DMA SEAM section has the reasoning; there is no
+; default because a default in the library and a different value here
+; would be a hard "Constant already defined" error.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; Dump the property buffer as the firmware left it. 24 words is well
+; past the end tag of the display request and costs nothing.
+;
+; READ THE MEMORY, NOT MailboxWord(). MailboxWord(i) is the i-th VALUE
+; word of the current tag - it is relative to the tag body, not to the
+; buffer. Dumping it here printed twenty-four zeros and looked exactly
+; like "our writes are not landing", which is a far more alarming
+; conclusion than the truth and would have sent this somewhere silly.
+; The raw header lives at MailboxBufferAddr() and is read with PeekN.
+Procedure DumpBuffer(*what)
+  Define i.i
+  Define w.i
+  Define b.i
+  b = MailboxBufferAddr()
+  UartWriteStr(*what)
+  PrintNl()
+  For i = 0 To 23
+    w = PeekN(b + i * 4) & $FFFFFFFF
+    UartWriteStr("    [")
+    If i < 10
+      UartWrite(48)
+    EndIf
+    PrintDec(i)
+    UartWriteStr("] $")
+    PutHexN(w, 8)
+    ; Word 1 is the only one with a fixed meaning, so annotate it and
+    ; leave the rest as numbers rather than guessing at tag identities.
+    If i = 1
+      If w = $80000000
+        UartWriteStr("   SUCCESS")
+      ElseIf w = $80000001
+        UartWriteStr("   ERROR PARSING REQUEST BUFFER")
+      ElseIf w = 0
+        UartWriteStr("   still the request code - the firmware wrote nothing")
+      Else
+        UartWriteStr("   unexpected response code")
+      EndIf
+    EndIf
+    PrintNl()
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+
+  PrintNl()
+  UartWriteStr("=== what the firmware says about the framebuffer ===")
+  PrintNl()
+
+  If MailboxInit() = 0
+    UartWriteStr("!! MailboxInit failed, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Row("buffer CPU   ", MailboxBufferAddr(), 16)
+  Row("buffer BUS   ", MailboxBusAddr(), 16)
+
+  ; A KNOWN-GOOD CALL FIRST. The monitor reads clocks and temperature
+  ; over this same channel and they work, so if this one fails too the
+  ; problem is the channel and not the framebuffer - and that is worth
+  ; establishing before reading anything into the framebuffer result.
+  UartWriteStr("control: ARM clock query ... ")
+  Define hz.i
+  hz = MailboxClockRate(3)
+  If hz > 0
+    PrintDec(hz)
+    UartWriteStr(" Hz - the channel is good")
+  Else
+    UartWriteStr("FAILED, error ")
+    PrintDec(MailboxError())
+  EndIf
+  PrintNl()
+  PrintNl()
+
+  ; THE TAG TABLE IS NOT LOADED BY DEFAULT, and leaving it out gets you
+  ; DisplayInit() = -1 with MailboxError() = 0 - a refusal from the
+  ; display library that never reaches the firmware at all. Worth the
+  ; line of comment: -1 and -5 look equally like "the display failed"
+  ; and they are not remotely the same failure.
+  If DisplayStandardTags() = 0
+    UartWriteStr("!! DisplayStandardTags failed")
+    PrintNl()
+    ProcedureReturn 3
+  EndIf
+
+  UartWriteStr("DisplayInit(1920, 1080, 32) ... ")
+  UartDrain()
+  rc = DisplayInit(1920, 1080, 32)
+  If rc = 1
+    UartWriteStr("SUCCEEDED")
+    PrintNl()
+    Row("base         ", DisplayBase(), 16)
+    Row("pitch        ", DisplayPitch(), 8)
+    DumpBuffer("the reply, for the record:")
+    ProcedureReturn 0
+  EndIf
+
+  UartWriteStr("failed, rc = ")
+  PrintDec(rc)
+  UartWriteStr(", MailboxError = ")
+  PrintDec(MailboxError())
+  PrintNl()
+  DumpBuffer("the firmware's reply, word by word:")
+
+  ProcedureReturn 2
+EndProcedure

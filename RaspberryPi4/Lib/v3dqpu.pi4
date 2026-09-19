@@ -1,0 +1,3421 @@
+; v3dqpu.pi4 - the QPU instruction encoder for the Raspberry Pi 4's
+;              VideoCore VI (V3D 4.2). Sixty-four bits at a time.
+;
+; ======================================================================
+;  WHY THIS FILE EXISTS AT ALL, WHICH IS NOT "SO WE CAN WRITE SHADERS"
+; ======================================================================
+;
+;  It exists because there is no way to draw anything without it, and
+;  that was a surprise. The reasoning is in the port plan and it is
+;  worth repeating here because it is the whole justification:
+;
+;    - Mesa implements even a SCISSORED glClear "by drawing a pair of
+;      triangles" (v3dx_draw.c:1641-1642). A whole-surface clear is a
+;      tile-buffer operation and needs no shader; anything smaller is
+;      a draw.
+;    - The shader state record's fragment, vertex and coordinate code
+;      addresses have NO ENABLE BIT. There is no encoding for "this
+;      draw has no fragment shader". The address field is always read
+;      and the QPU always runs whatever is there.
+;
+;  So this is not an optional later stage that buys performance. It is
+;  the gate in front of the second triangle.
+;
+; ======================================================================
+;  WHY IT IS WORTH DOING CAREFULLY, AND THE ONE PIECE OF LUCK
+; ======================================================================
+;
+;  Everything else in this bring-up has been checked by a model this
+;  project wrote against a document this project read. When those two
+;  agree it means one person read one file the same way twice, and
+;  four times in one week that agreement has certified a real bug.
+;
+;  THE QPU INSTRUCTION SET IS THE ONE PART WITH A REAL OFFLINE ORACLE.
+;  py-videocore6 (Datasheets/pi4/v3d/py-videocore6/assembler.py, 1258
+;  lines) is a COMPLETE, INDEPENDENT implementation of this encoding,
+;  written by somebody else, from the same silicon, in another
+;  language, working on real Pi 4s. tools/a64/a64_v3d_qpu_check.py
+;  assembles an instruction with THIS file and the same instruction
+;  with THAT file and compares all sixty-four bits. That is not a
+;  model agreeing with itself. It is two independent transcriptions
+;  agreeing, and it is the strongest gate this project has had.
+;
+;  Read a64_v3d_qpu_check.py's header for what even that cannot catch.
+;
+; ======================================================================
+;  THE SOURCE OF EVERY NUMBER BELOW
+; ======================================================================
+;
+;  Datasheets/pi4/v3d/mesa/qpu_pack.c
+;      lines 47-111  every field of the 64-bit word as a MASK/SHIFT
+;                    pair. This is the bit layout and there is no
+;                    other statement of it on this disk.
+;      lines 131-161 the 4.2 SIGNAL table, thirty-two entries.
+;      lines 239-264 the forty-eight small immediates.
+;      lines 344-421 the condition/flag packing table.
+;      lines 457-559 the 4.2 ADD opcode table.
+;      lines 561-574 the 4.2 MUL opcode table.
+;      lines 1548-1766 v3d42_qpu_add_pack, the ADD half.
+;      lines 2039-2154 v3d42_qpu_mul_pack, the MUL half.
+;      lines 2413-2464 the whole-ALU assembly.
+;      lines 2466-2515 the BRANCH form.
+;  Datasheets/pi4/v3d/mesa/qpu_instr.h
+;      lines 41-58   the signal structure, field by field.
+;      lines 62-137  cond / pf / uf / waddr enumerations.
+;      lines 144-245 the ADD and MUL operation enumerations. THE
+;                    NUMBERING OF #V3DQ_A_* AND #V3DQ_M_* BELOW IS
+;                    THAT ENUMERATION'S ORDINALS, deliberately, so
+;                    that the two lists can be read side by side.
+;      lines 267-334 the pack / unpack enumerations.
+;      lines 322-330 the eight input muxes.
+;  Datasheets/pi4/v3d/mesa/qpu_instr.c
+;      lines 387-518 add_op_args / mul_op_args - which operations take
+;                    zero, one or two sources. The packer needs this
+;                    because an unused mux field CARRIES THE OPCODE.
+;      lines 1061-1073 which signals carry a write address.
+;  Datasheets/pi4/v3d/mesa/qpu_validate.c
+;      the hazard rules, "Summary of Instruction Restrictions" p37.
+;
+; ======================================================================
+;  WHAT THIS FILE COVERS AND WHAT IT DOES NOT
+; ======================================================================
+;
+;  The brief was "cover what a trivial fragment shader needs, not the
+;  whole ISA - and SAY what you left out". Here is the saying.
+;
+;  COVERED
+;    - The complete 4.2 ALU instruction form: both halves, both
+;      write addresses and their magic bits, all four input muxes,
+;      both output packs, all input unpacks, the condition/flag
+;      field in every one of its eleven shapes, and the signal field
+;      in every one of its twenty-seven legal values.
+;    - ADD operations: FADD FADDNF ADD SUB FSUB MIN MAX UMIN UMAX
+;      SHL SHR ASR ROR FMIN FMAX AND OR XOR VADD VSUB NOT NEG
+;      FLAPUSH FLBPUSH FLPOP RECIP SETMSF SETREVF NOP TIDX EIDX LR
+;      VFLA VFLNA VFLB VFLNB FXCD XCD FYCD YCD MSF REVF IID SAMPID
+;      BARRIERID TMUWT VPMWT FLAFIRST FLNAFIRST RSQRT EXP LOG SIN
+;      RSQRT2 FCMP FROUND FTOIN FTRUNC FTOIZ FFLOOR FTOUZ FCEIL FTOC
+;      FDX FDY ITOF CLZ UTOF, and since stage 4 also VFPACK,
+;      LDVPMV_IN LDVPMV_OUT LDVPMD_IN LDVPMD_OUT LDVPMP LDVPMG_IN
+;      LDVPMG_OUT and STVPMV STVPMD STVPMP.
+;      THE FOUR THAT REMAIN, and they are the whole of what is left
+;      of the 4.2 ADD table: VFMIN, VFMAX, VDWWT, VPMSETUP.
+;    - MUL operations: ADD SUB UMUL24 SMUL24 MULTOP FMOV MOV NOP FMUL.
+;      That is 9 of the 10.
+;    - The BRANCH form, all seven conditions, all four destinations,
+;      the unif-address extension, and the split 24-bit offset.
+;    - All forty-eight small immediates including the sixteen powers
+;      of two, which are float bit patterns and not integers.
+;    - The straight-line subset of the hazard rules; see below.
+;
+;  NOT COVERED, AND EACH FOR A STATED REASON
+;
+;    1. V3D 7.1. Nothing here. The 7.1 encoding moved the register
+;       file addresses INTO the operand descriptors and rewrote both
+;       opcode tables (qpu_pack.c:585-787). The Pi 4 is 4.2 - proven
+;       on this silicon, HUB_IDENT1 $000E1124 - and a file that
+;       carried both would have two paths, one of which nobody here
+;       can test. When a 7.1 part turns up, write v3dqpu71.pi4.
+;
+;    2. VFMIN, VFMAX and VFMUL, and the four
+;       V3D_QPU_UNPACK_REPLICATE_* / SWAP_16 input modes they use.
+;       They are the half-float SIMD path and their packing rule is a
+;       different one again (qpu_pack.c:1734-1746, :2114-2133).
+;
+;       VFPACK IS NOW ENCODED - it was in this list until stage 4 and
+;       it is out of it because a fragment shader writing f16 colour
+;       to the tile buffer needs it (nir_to_vir.c:1931-1941 is the
+;       only colour-write path Mesa takes for an 8-bit render target).
+;       Its rule is qpu_pack.c:1663-1688: opcode 53, the two f32
+;       INPUT UNPACKS in bits 3:2 and 1:0, and ABS REFUSED ON BOTH -
+;       which is exactly why the 4.2 table gives VFPACK the three
+;       broken ranges 53-55, 57-59 and 61-63 rather than 48-63: the
+;       five values an ABS operand would produce are the five that
+;       are missing. py-videocore6 witnesses it (assembler.py:744 and
+;       :712-727).
+;
+;    3. VPMSETUP, and the LDVPM as a SIGNAL - see notes 7 and 10.
+;
+;       THE VPM ALU FAMILY IS NOW ENCODED and it was not until stage
+;       4. LDVPMV/LDVPMD/LDVPMP/LDVPMG in and out, and
+;       STVPMV/STVPMD/STVPMP. A VERTEX SHADER CANNOT READ ITS
+;       ATTRIBUTES WITHOUT LDVPMV_IN AND CANNOT WRITE ITS SHADED
+;       VERTEX WITHOUT STVPMV, so leaving them out was leaving out
+;       the triangle. The three rules they add are all transcribed
+;       from qpu_pack.c:1577-1607 and are set out at v3dq_PackAdd():
+;         - LDVPM* is opcode 188 with the variant in MUX_B (0 = V,
+;           1 = D, 2 = P) and opcode 189 for G, qpu_pack.c:520-531;
+;         - the IN/OUT distinction IS THE MA BIT and is NOT a magic
+;           write, qpu_pack.c:1591-1603 - _OUT sets bit 44 and both
+;           forms assert the destination is the register file;
+;         - STVPM* encodes its operation in the WADDR FIELD, 0/1/2,
+;           and suppresses MA, qpu_pack.c:1578-1589.
+;
+;       WITNESSES DIFFER ACROSS THE FAMILY AND THE GATE SAYS SO BY
+;       NAME. py-videocore6 has stvpmv/stvpmd/stvpmp (assembler.py
+;       :804-806) and no ldvpm ALU operation at all - in its table
+;       opcode 188 is only reachable as rsqrt/exp/log/sin/rsqrt2. So
+;       the seven LDVPM* operations are UNWITNESSED in exactly the
+;       sense FXCD and VADD are, and a64_v3d_qpu_check.py lists them
+;       beside those eight rather than quietly counting them as
+;       checked. Their opcode rows, their MUX_B assignments and their
+;       operand counts ARE re-derived from Mesa by the parsing pass.
+;       What no offline check can see is whether the packer routes
+;       them correctly - only a triangle can, and that is why the
+;       triangle is the test and not the corpus.
+;
+;       AND py-videocore6 DOES NOT IMPLEMENT THE STVPM WADDR
+;       OVERRIDE. It packs `self.dst.waddr` like any other operation
+;       (assembler.py:738), so the gate constructs its stvpm entries
+;       with an explicit rf0/rf1/rf2 destination to make the two
+;       agree. The OVERRIDE ITSELF - "the caller's waddr is ignored
+;       and replaced by 0, 1 or 2" - is therefore Mesa-only and is
+;       checked by a separate model-against-model case that is
+;       labelled as one.
+;
+;    4. VDWWT. It is the ver-33 occupant of the slot 4.2 gives to
+;       IID (qpu_pack.c:510-511). Encoding it on this part would
+;       assemble to IID.
+;
+;    5. VFMOVABSNEGNAB, opcodes 190-191. Mesa itself does not
+;       implement it: "FIXME: MORE COMPLICATED", qpu_pack.c:533-534.
+;       There is no specification of it on this disk to transcribe.
+;
+;    6. The ROTATE signal's operand semantics. #V3DQ_SIG_ROTATE
+;       encodes (signal 23) and the small-immediate field then means
+;       a rotation count rather than a value - py-videocore6's
+;       assembler.py:610-614 does that substitution. This file will
+;       encode the signal and will let the caller place the count,
+;       but it does NOT know that r5 means "rotate by r5" and it
+;       does not check the rotate-specific restrictions. Do not use
+;       it without reading that code first.
+;
+;    7. LDVPM as a SIGNAL. It has a bit in Mesa's signal struct
+;       (qpu_instr.h:48) and IT IS NOT IN THE 4.2 SIGNAL TABLE -
+;       qpu_pack.c:131-161 never sets it. So it is unencodable on
+;       this part, and V3dQpuSig() refuses it BY NAME rather than
+;       failing the table lookup with a number, because "signal 128
+;       is not in the table" sends the reader to the wrong place.
+;
+;    8. LABELS AND FIXUPS. V3dQpuBranch() takes a byte offset and
+;       nothing computes one for you. py-videocore6 resolves labels
+;       (assembler.py:1102-1108, offset = (label - serial - 4) * 8);
+;       a caller here writes that arithmetic itself. A label table
+;       is a compiler's job and this is not a compiler.
+;
+;    9. SCHEDULING. Nothing here reorders or dual-issues anything.
+;       The caller places every instruction and every delay slot.
+;
+;  WHAT THE HAZARD CHECKER COVERS, AND THE ONE RULE IT REFUSES TO
+;  GUESS AT, is documented at V3dQpuEmit() below.
+;
+; ======================================================================
+;  THIS FILE INCLUDES NOTHING AND DEPENDS ON NOTHING
+; ======================================================================
+;
+;  A library never includes a library. This one is pure arithmetic and
+;  memory writes: no MMIO, no timers, no mailbox, no cache
+;  maintenance. That is deliberate and it is what makes it testable
+;  offline - tools/a64/a64_v3d_qpu_check.py runs the encoder in the A64
+;  emulator with NO board model at all, because there is no board in
+;  it.
+;
+;  CACHE MAINTENANCE IS THEREFORE NOT DONE HERE. A QPU program the CPU
+;  has written is not visible to the GPU until the line is out of the
+;  CPU's cache. V3dCsdSubmit() in v3d.pi4 takes the program's ADDRESS
+;  AND EXTENT and does the maintenance itself, for the reason
+;  V3dTfuSubmit() does: maintenance that is structural cannot be
+;  forgotten and maintenance that is remembered will be. If you build
+;  a program and hand its address to something other than
+;  V3dCsdSubmit(), the flush is yours.
+;
+;  A PROGRAM that wants both includes them in this order:
+;
+;     XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+;     XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+;     XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+;
+; ======================================================================
+;  THE SHAPE OF THE 64-BIT WORD, AND WHY IT IS HELD AS TWO HALVES
+; ======================================================================
+;
+;  The Pi 4's .i is 64 bits, so the whole instruction fits in one. It
+;  is NOT held that way, and the reason is not squeamishness.
+;
+;  EVERY FIELD OF THE 4.2 INSTRUCTION LIES ENTIRELY WITHIN ONE 32-BIT
+;  HALF. That is a property of the layout, not an assumption - read
+;  qpu_pack.c:47-111 and check: the highest field below bit 32 is
+;  OP_ADD at 31:24, the lowest above it is WADDR_A at 37:32. Nothing
+;  straddles. The BRANCH form's offset is split by the hardware
+;  itself into 55:35 and 31:24, and even that splits ON the boundary
+;  rather than across it.
+;
+;  So two 32-bit halves cost nothing in clarity and buy three things:
+;  every shift is a small positive shift on a value that never
+;  approaches the sign bit; the halves are exactly the two words that
+;  go to memory little-endian first-half-first; and a mismatch against
+;  the oracle names a half, which halves the search.
+;
+;  #V3DQ_LO is bits 31:0 and #V3DQ_HI is bits 63:32 throughout. A
+;  comment saying "bit 45" means the instruction's bit 45, which is
+;  hi bit 13.
+;
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  FIELD POSITIONS. qpu_pack.c:47-111, one line each, in the source's
+;  own order so the two can be read together. The MASK column there is
+;  QPU_MASK(high, low); here only the shift and the width are needed
+;  because every field is set into a zeroed word.
+;
+;  Shifts marked _HI are relative to bit 32.
+; ----------------------------------------------------------------------
+#V3DQ_OP_MUL_SHIFT_HI   = 26   ; bits 63:58  qpu_pack.c:47-48
+#V3DQ_OP_MUL_MASK       = $3F
+#V3DQ_SIG_SHIFT_HI      = 21   ; bits 57:53  qpu_pack.c:50-51
+#V3DQ_SIG_MASK          = $1F
+#V3DQ_COND_SHIFT_HI     = 14   ; bits 52:46  qpu_pack.c:53-54
+#V3DQ_COND_MASK         = $7F
+#V3DQ_COND_SIG_MAGIC    = 64   ; (1 << 6)    qpu_pack.c:55
+#V3DQ_MM_HI             = 8192 ; bit 45      qpu_pack.c:57
+#V3DQ_MA_HI             = 4096 ; bit 44      qpu_pack.c:58
+#V3DQ_WADDR_M_SHIFT_HI  = 6    ; bits 43:38  qpu_pack.c:60-61
+#V3DQ_WADDR_M_MASK      = $3F
+#V3DQ_BR_ADDR_LOW_SHIFT_HI = 3 ; bits 55:35  qpu_pack.c:63-64
+#V3DQ_BR_ADDR_LOW_MASK  = $1FFFFF
+#V3DQ_WADDR_A_SHIFT_HI  = 0    ; bits 37:32  qpu_pack.c:66-67
+#V3DQ_WADDR_A_MASK      = $3F
+#V3DQ_BR_COND_SHIFT_HI  = 0    ; bits 34:32  qpu_pack.c:69-70
+#V3DQ_BR_COND_MASK      = 7
+#V3DQ_BR_ADDR_HIGH_SHIFT = 24  ; bits 31:24  qpu_pack.c:72-73
+#V3DQ_BR_ADDR_HIGH_MASK = $FF
+#V3DQ_OP_ADD_SHIFT      = 24   ; bits 31:24  qpu_pack.c:75-76
+#V3DQ_OP_ADD_MASK       = $FF
+#V3DQ_MUL_B_SHIFT       = 21   ; bits 23:21  qpu_pack.c:78-79
+#V3DQ_MUX_MASK          = 7
+#V3DQ_BR_MSFIGN_SHIFT   = 21   ; bits 22:21  qpu_pack.c:81-82
+#V3DQ_BR_MSFIGN_MASK    = 3
+#V3DQ_MUL_A_SHIFT       = 18   ; bits 20:18  qpu_pack.c:84-85
+#V3DQ_ADD_B_SHIFT       = 15   ; bits 17:15  qpu_pack.c:90-91
+#V3DQ_BR_BDU_SHIFT      = 15   ; bits 17:15  qpu_pack.c:93-94
+#V3DQ_BR_BDU_MASK       = 7
+#V3DQ_BR_UB             = 16384 ; bit 14     qpu_pack.c:96
+#V3DQ_ADD_A_SHIFT       = 12   ; bits 14:12  qpu_pack.c:98-99
+#V3DQ_BR_BDI_SHIFT      = 12   ; bits 13:12  qpu_pack.c:101-102
+#V3DQ_BR_BDI_MASK       = 3
+#V3DQ_RADDR_A_SHIFT     = 6    ; bits 11:6   qpu_pack.c:107-108
+#V3DQ_RADDR_B_SHIFT     = 0    ; bits 5:0    qpu_pack.c:110-111
+#V3DQ_RADDR_MASK        = $3F
+
+; BIT 23 OF A BRANCH IS "SET LINK" AND MESA DOES NOT PACK IT.
+;
+; py-videocore6 does: assembler.py:1119, `(set_link << 23)`. Mesa's
+; branch structure (qpu_instr.h:392-410) has no such member and
+; v3d_qpu_instr_pack_branch (qpu_pack.c:2466-2515) never writes bit
+; 23. The two sources DISAGREE about whether the field exists, and
+; since both write zero there by default they have never noticed.
+;
+; This file carries it, as a parameter that defaults to zero, because
+; a bit that one of the two independent transcriptions believes in is
+; a bit worth being able to set - and because a gate that could not
+; set it could not demonstrate that both agree when it is clear.
+#V3DQ_BR_SET_LINK       = 8388608 ; bit 23, py-videocore6 assembler.py:1119
+
+; ----------------------------------------------------------------------
+;  THE EIGHT INPUT MUXES. qpu_instr.h:322-330.
+;
+;  Muxes 0-5 are the accumulators r0..r5. Mux 6 reads whatever
+;  register-file address is in RADDR_A and mux 7 reads RADDR_B - so
+;  ONE instruction can read at most two different register-file
+;  registers, and that is a hardware limit rather than an encoding
+;  inconvenience. py-videocore6 enforces it by raising "Too many
+;  register files read" (assembler.py:556).
+;
+;  MUX 7 IS ALSO WHERE A SMALL IMMEDIATE ARRIVES. When the SMIMM
+;  signal is set, RADDR_B holds an index into the forty-eight-entry
+;  table instead of a register number, and anything reading mux 7
+;  gets the immediate. That is why V3dQpuSmallImm() writes RADDR_B: a
+;  caller who also wanted a register-file read on B would be asking
+;  for two different things from one field, and the refusal below
+;  says so.
+; ----------------------------------------------------------------------
+#V3DQ_MUX_R0 = 0
+#V3DQ_MUX_R1 = 1
+#V3DQ_MUX_R2 = 2
+#V3DQ_MUX_R3 = 3
+#V3DQ_MUX_R4 = 4
+#V3DQ_MUX_R5 = 5
+#V3DQ_MUX_A  = 6
+#V3DQ_MUX_B  = 7
+
+; ----------------------------------------------------------------------
+;  THE MAGIC WRITE ADDRESSES. qpu_instr.h:90-137.
+;
+;  A write address is six bits plus a "magic" bit. Magic clear means
+;  the register file, entry 0..63. Magic set means one of these
+;  hardware units, and THAT is how a QPU program touches memory: there
+;  is no store instruction, there is a write to TMUD followed by a
+;  write to TMUA.
+;
+;  Only the 4.x spellings are here. The names marked "V3D 7.x" in the
+;  header are omitted - see the version note above.
+; ----------------------------------------------------------------------
+#V3DQ_WADDR_R0    = 0
+#V3DQ_WADDR_R1    = 1
+#V3DQ_WADDR_R2    = 2
+#V3DQ_WADDR_R3    = 3
+#V3DQ_WADDR_R4    = 4
+#V3DQ_WADDR_R5    = 5
+#V3DQ_WADDR_NOP   = 6   ; the bit bucket. THE DEFAULT DESTINATION.
+#V3DQ_WADDR_TLB   = 7
+#V3DQ_WADDR_TLBU  = 8
+#V3DQ_WADDR_UNIFA = 9
+#V3DQ_WADDR_TMUL  = 10
+#V3DQ_WADDR_TMUD  = 11  ; the DATA of a TMU write
+#V3DQ_WADDR_TMUA  = 12  ; the ADDRESS, and writing it FIRES the access
+#V3DQ_WADDR_TMUAU = 13
+#V3DQ_WADDR_VPM   = 14
+#V3DQ_WADDR_VPMU  = 15
+#V3DQ_WADDR_SYNC  = 16
+#V3DQ_WADDR_SYNCU = 17
+#V3DQ_WADDR_SYNCB = 18
+#V3DQ_WADDR_RECIP = 19
+#V3DQ_WADDR_RSQRT = 20
+#V3DQ_WADDR_EXP   = 21
+#V3DQ_WADDR_LOG   = 22
+#V3DQ_WADDR_SIN   = 23
+#V3DQ_WADDR_RSQRT2 = 24
+#V3DQ_WADDR_TMUC  = 32
+#V3DQ_WADDR_TMUS  = 33
+#V3DQ_WADDR_TMUT  = 34
+#V3DQ_WADDR_TMUR  = 35
+#V3DQ_WADDR_TMUI  = 36
+#V3DQ_WADDR_TMUB  = 37
+#V3DQ_WADDR_TMUDREF = 38
+#V3DQ_WADDR_TMUOFF  = 39
+#V3DQ_WADDR_TMUSCM  = 40
+#V3DQ_WADDR_TMUSF   = 41
+#V3DQ_WADDR_TMUSLOD = 42
+#V3DQ_WADDR_TMUHS   = 43
+#V3DQ_WADDR_TMUHSCM = 44
+#V3DQ_WADDR_TMUHSF  = 45
+#V3DQ_WADDR_TMUHSLOD = 46
+#V3DQ_WADDR_R5REP   = 55
+
+; ----------------------------------------------------------------------
+;  THE SIGNAL FIELD, HELD AS A BITMASK OF THE THIRTEEN BOOLEANS.
+;
+;  qpu_instr.h:41-58 is a bitfield struct of thirteen flags; the
+;  hardware field is FIVE BITS naming one of thirty-two prepared
+;  combinations (qpu_pack.c:131-161). Mesa packs by LINEAR SEARCH of
+;  that table for an exact structural match (v3d_qpu_sig_pack,
+;  qpu_pack.c:217-237) and this file does the same, because any other
+;  method would be inventing a rule the hardware does not have: the
+;  table is not a bit-per-flag encoding and there is no arithmetic
+;  from the flags to the index. Twenty-seven of the thirty-two are
+;  legal on 4.2; 26 through 30 are reserved and refused.
+;
+;  The one flag with no 4.2 encoding is LDVPM - see the coverage list.
+; ----------------------------------------------------------------------
+#V3DQ_SIG_NONE      = 0
+#V3DQ_SIG_THRSW     = 1
+#V3DQ_SIG_LDUNIF    = 2
+#V3DQ_SIG_LDUNIFA   = 4
+#V3DQ_SIG_LDUNIFRF  = 8
+#V3DQ_SIG_LDUNIFARF = 16
+#V3DQ_SIG_LDTMU     = 32
+#V3DQ_SIG_LDVARY    = 64
+#V3DQ_SIG_LDVPM     = 128   ; NOT ENCODABLE ON 4.2. Refused by name.
+#V3DQ_SIG_LDTLB     = 256
+#V3DQ_SIG_LDTLBU    = 512
+#V3DQ_SIG_UCB       = 1024
+#V3DQ_SIG_ROTATE    = 2048
+#V3DQ_SIG_WRTMUC    = 4096
+#V3DQ_SIG_SMIMM     = 8192
+
+; The six signals that carry a write address in the COND field instead
+; of a condition. qpu_instr.c:1061-1073. When any of these is set the
+; instruction may not also set flags, and bits 52:46 hold
+; (magic << 6) | waddr - qpu_pack.c:2439-2455.
+;
+; 888 AND IT WAS 856 FOR AN HOUR. This constant was typed as a sum
+; and the sum was wrong by exactly 32, which is LDTMU - so every
+; instruction carrying an LDTMU signal packed a CONDITION into bits
+; 52:46 where the hardware reads a DESTINATION, and the load landed
+; wherever the flags happened to encode. Five corpus entries came out
+; wrong and the guard that refuses flags-beside-a-loading-signal
+; stopped refusing.
+;
+; a64_v3d_qpu_check.py caught it on the first run, twice over: the
+; oracle disagreed about the five instructions, and the gate's own
+; re-derivation of the list out of qpu_instr.c:1067-1072 disagreed
+; about the constant. Nothing else would have. It is left written out
+; as a sum, with this note, because the next reader adding a signal to
+; the list will do the same arithmetic.
+#V3DQ_SIG_WRITES_ADDR = 888  ; LDUNIFRF|LDUNIFARF|LDTMU|LDVARY|LDTLB|LDTLBU
+                             ; = 8 + 16 + 32 + 64 + 256 + 512
+
+; ----------------------------------------------------------------------
+;  CONDITIONS AND FLAG UPDATES. qpu_instr.h:62-88.
+;
+;  Three different things share the seven-bit COND field and the
+;  packing table at qpu_pack.c:355-370 is the enumeration of which
+;  COMBINATIONS fit:
+;    - a CONDITION (ifa/ifb/ifna/ifnb) that predicates the write,
+;      one per half;
+;    - a PUSH (pushz/pushn/pushc) that replaces the flags from a
+;      half's result;
+;    - an UPDATE (andz .. norc) that combines with the existing flags.
+;  Eleven combinations are encodable out of the many that can be
+;  asked for, and V3dQpuPack() refuses the rest rather than dropping
+;  one silently, which is what a table lookup miss would otherwise do.
+; ----------------------------------------------------------------------
+#V3DQ_COND_NONE = 0
+#V3DQ_COND_IFA  = 1
+#V3DQ_COND_IFB  = 2
+#V3DQ_COND_IFNA = 3
+#V3DQ_COND_IFNB = 4
+
+#V3DQ_PF_NONE  = 0
+#V3DQ_PF_PUSHZ = 1
+#V3DQ_PF_PUSHN = 2
+#V3DQ_PF_PUSHC = 3
+
+#V3DQ_UF_NONE  = 0
+#V3DQ_UF_ANDZ  = 1
+#V3DQ_UF_ANDNZ = 2
+#V3DQ_UF_NORNZ = 3
+#V3DQ_UF_NORZ  = 4
+#V3DQ_UF_ANDN  = 5
+#V3DQ_UF_ANDNN = 6
+#V3DQ_UF_NORNN = 7
+#V3DQ_UF_NORN  = 8
+#V3DQ_UF_ANDC  = 9
+#V3DQ_UF_ANDNC = 10
+#V3DQ_UF_NORNC = 11
+#V3DQ_UF_NORC  = 12
+
+; ----------------------------------------------------------------------
+;  OUTPUT PACK AND INPUT UNPACK. qpu_instr.h:267-320.
+;
+;  These are the free half-float conversions on the way out of and
+;  into the ALU. Only the f32 set is used here; the four f16
+;  replicate/swap modes belong to the vector operations this file
+;  does not encode.
+;
+;  NOTE THE ASYMMETRY, WHICH IS A TRAP. In the ENCODING, unpack 0 is
+;  ABS and unpack 1 is NONE (qpu_pack.c:867-897). In Mesa's ENUM,
+;  NONE is 0 so that a zeroed structure means "no modifier". The
+;  numbers below are the ENUM's, and v3dq_F32UnpackBits() performs
+;  the swap. Getting this backwards produces an instruction that
+;  takes the absolute value of everything and is otherwise correct,
+;  which is the kind of bug that survives a long time.
+; ----------------------------------------------------------------------
+#V3DQ_PACK_NONE = 0
+#V3DQ_PACK_L    = 1
+#V3DQ_PACK_H    = 2
+
+#V3DQ_UNPACK_NONE = 0
+#V3DQ_UNPACK_ABS  = 1
+#V3DQ_UNPACK_L    = 2
+#V3DQ_UNPACK_H    = 3
+
+; ----------------------------------------------------------------------
+;  THE ADD OPERATIONS. The numbering is qpu_instr.h:144-245's
+;  ordinals, so this list and that enumeration can be diffed by eye.
+;  The ones this file does not encode still hold their ordinal, and
+;  v3dq_AddOpcode() refuses them by name.
+; ----------------------------------------------------------------------
+#V3DQ_A_FADD      = 0
+#V3DQ_A_FADDNF    = 1
+#V3DQ_A_VFPACK    = 2
+#V3DQ_A_ADD       = 3
+#V3DQ_A_SUB       = 4
+#V3DQ_A_FSUB      = 5
+#V3DQ_A_MIN       = 6
+#V3DQ_A_MAX       = 7
+#V3DQ_A_UMIN      = 8
+#V3DQ_A_UMAX      = 9
+#V3DQ_A_SHL       = 10
+#V3DQ_A_SHR       = 11
+#V3DQ_A_ASR       = 12
+#V3DQ_A_ROR       = 13
+#V3DQ_A_FMIN      = 14
+#V3DQ_A_FMAX      = 15
+#V3DQ_A_VFMIN     = 16   ; not encoded
+#V3DQ_A_AND       = 17
+#V3DQ_A_OR        = 18
+#V3DQ_A_XOR       = 19
+#V3DQ_A_VADD      = 20
+#V3DQ_A_VSUB      = 21
+#V3DQ_A_NOT       = 22
+#V3DQ_A_NEG       = 23
+#V3DQ_A_FLAPUSH   = 24
+#V3DQ_A_FLBPUSH   = 25
+#V3DQ_A_FLPOP     = 26
+#V3DQ_A_RECIP     = 27
+#V3DQ_A_SETMSF    = 28
+#V3DQ_A_SETREVF   = 29
+#V3DQ_A_NOP       = 30
+#V3DQ_A_TIDX      = 31
+#V3DQ_A_EIDX      = 32
+#V3DQ_A_LR        = 33
+#V3DQ_A_VFLA      = 34
+#V3DQ_A_VFLNA     = 35
+#V3DQ_A_VFLB      = 36
+#V3DQ_A_VFLNB     = 37
+#V3DQ_A_FXCD      = 38
+#V3DQ_A_XCD       = 39
+#V3DQ_A_FYCD      = 40
+#V3DQ_A_YCD       = 41
+#V3DQ_A_MSF       = 42
+#V3DQ_A_REVF      = 43
+#V3DQ_A_VDWWT     = 44   ; not encoded - ver 33 only, see coverage note 4
+#V3DQ_A_IID       = 45
+#V3DQ_A_SAMPID    = 46
+#V3DQ_A_BARRIERID = 47
+#V3DQ_A_TMUWT     = 48
+#V3DQ_A_VPMSETUP  = 49   ; not encoded
+#V3DQ_A_VPMWT     = 50
+#V3DQ_A_FLAFIRST  = 51
+#V3DQ_A_FLNAFIRST = 52
+#V3DQ_A_LDVPMV_IN  = 53
+#V3DQ_A_LDVPMV_OUT = 54
+#V3DQ_A_LDVPMD_IN  = 55
+#V3DQ_A_LDVPMD_OUT = 56
+#V3DQ_A_LDVPMP     = 57
+#V3DQ_A_RSQRT      = 58
+#V3DQ_A_EXP        = 59
+#V3DQ_A_LOG        = 60
+#V3DQ_A_SIN        = 61
+#V3DQ_A_RSQRT2     = 62
+#V3DQ_A_LDVPMG_IN  = 63
+#V3DQ_A_LDVPMG_OUT = 64
+#V3DQ_A_FCMP       = 65
+#V3DQ_A_VFMAX      = 66  ; not encoded
+#V3DQ_A_FROUND     = 67
+#V3DQ_A_FTOIN      = 68
+#V3DQ_A_FTRUNC     = 69
+#V3DQ_A_FTOIZ      = 70
+#V3DQ_A_FFLOOR     = 71
+#V3DQ_A_FTOUZ      = 72
+#V3DQ_A_FCEIL      = 73
+#V3DQ_A_FTOC       = 74
+#V3DQ_A_FDX        = 75
+#V3DQ_A_FDY        = 76
+#V3DQ_A_STVPMV     = 77
+#V3DQ_A_STVPMD     = 78
+#V3DQ_A_STVPMP     = 79
+#V3DQ_A_ITOF       = 80
+#V3DQ_A_CLZ        = 81
+#V3DQ_A_UTOF       = 82
+
+; ----------------------------------------------------------------------
+;  THE MUL OPERATIONS. qpu_instr.h:247-266's ordinals.
+; ----------------------------------------------------------------------
+#V3DQ_M_ADD    = 0
+#V3DQ_M_SUB    = 1
+#V3DQ_M_UMUL24 = 2
+#V3DQ_M_VFMUL  = 3   ; not encoded
+#V3DQ_M_SMUL24 = 4
+#V3DQ_M_MULTOP = 5
+#V3DQ_M_FMOV   = 6
+#V3DQ_M_MOV    = 7
+#V3DQ_M_NOP    = 8
+#V3DQ_M_FMUL   = 9
+
+; ----------------------------------------------------------------------
+;  BRANCH FIELDS. qpu_instr.h:359-389.
+;
+;  THE CONDITION ENCODING SKIPS ONE. Mesa packs a non-ALWAYS branch
+;  condition as 2 + (cond - COND_A0), qpu_pack.c:2473-2477, so ALWAYS
+;  is 0 and A0 is 2; value 1 is not produced. py-videocore6's table
+;  (assembler.py:1055-1063) is that same map written out literally
+;  and it has the same hole. Two independent readings, one hole; it
+;  is the hardware's.
+; ----------------------------------------------------------------------
+#V3DQ_BR_ALWAYS = 0
+#V3DQ_BR_A0     = 1
+#V3DQ_BR_NA0    = 2
+#V3DQ_BR_ALLA   = 3
+#V3DQ_BR_ANYNA  = 4
+#V3DQ_BR_ANYA   = 5
+#V3DQ_BR_ALLNA  = 6
+
+#V3DQ_MSFIGN_NONE = 0
+#V3DQ_MSFIGN_P    = 1
+#V3DQ_MSFIGN_Q    = 2
+
+#V3DQ_BDEST_ABS      = 0
+#V3DQ_BDEST_REL      = 1
+#V3DQ_BDEST_LINK_REG = 2
+#V3DQ_BDEST_REGFILE  = 3
+
+#V3DQ_TYPE_ALU    = 0
+#V3DQ_TYPE_BRANCH = 1
+
+; ----------------------------------------------------------------------
+;  ERRORS. Distinct codes, because "the instruction would not encode"
+;  is four or five different questions and answering all of them with
+;  one number sends the reader back to this file to guess.
+; ----------------------------------------------------------------------
+#V3DQ_OK              = 0
+#V3DQ_ERR_ADD_OP      = -1  ; ADD operation not encoded by this file
+#V3DQ_ERR_MUL_OP      = -2  ; MUL operation not encoded by this file
+#V3DQ_ERR_SIG         = -3  ; that combination of signals has no 4.2 code
+#V3DQ_ERR_SIG_LDVPM   = -4  ; LDVPM specifically: no 4.2 code exists
+#V3DQ_ERR_FLAGS       = -5  ; that combination of conditions cannot be packed
+#V3DQ_ERR_FLAGS_SIG   = -6  ; flags asked for with a signal that owns the field
+#V3DQ_ERR_PACK        = -7  ; output pack not legal for this operation
+#V3DQ_ERR_UNPACK      = -8  ; input unpack not legal for this operation
+#V3DQ_ERR_SMALLIMM    = -9  ; that value is not one of the forty-eight
+#V3DQ_ERR_RANGE       = -10 ; a waddr, mux or raddr is out of its field
+#V3DQ_ERR_FULL        = -11 ; the program buffer has no room
+#V3DQ_ERR_NOBUF       = -12 ; V3dQpuProgramBegin() was never called
+#V3DQ_ERR_BRANCH      = -13 ; a branch field is out of range
+#V3DQ_ERR_HAZARD      = -14 ; the instruction breaks a p37 restriction
+#V3DQ_ERR_SMIMM_CLASH = -15 ; small immediate and a mux-7 register read
+; A DISTINCT CODE FOR THE VPM DESTINATION RULE, because "range" would
+; send the reader to look at a number that is perfectly in range.
+; qpu_pack.c:1595 and :1601 assert !magic_write for every LDVPM* form:
+; the destination of a VPM load is a REGISTER FILE address and bit 44
+; is not the magic flag there, it is the IN/OUT selector. A caller who
+; asked for a magic destination asked for a different instruction.
+#V3DQ_ERR_VPM_DEST    = -16
+
+; ======================================================================
+;  STATE
+; ======================================================================
+;
+;  ONE PENDING INSTRUCTION, SET BY PIECES, THEN PACKED. The
+;  alternative was a single procedure taking every field, and that is
+;  twenty-eight arguments; the alternative to THAT was several
+;  overloads covering the common shapes, which is how a caller ends up
+;  unable to express the uncommon one. The accumulator is the shape
+;  py-videocore6 uses too (its ALU object collects add half, mul half,
+;  signals and conditions before packing, assembler.py:936-1000) and
+;  the reason is the same.
+;
+;  V3dQpuReset() puts it back to a NOP-NOP with everything else clear,
+;  and EVERY emitter calls it first. A field left over from the
+;  previous instruction is the failure mode this design has, and the
+;  reset is how it is closed.
+; ----------------------------------------------------------------------
+Global v3dq_type.i        = #V3DQ_TYPE_ALU
+
+Global v3dq_addOp.i       = #V3DQ_A_NOP
+Global v3dq_addWaddr.i    = #V3DQ_WADDR_NOP
+Global v3dq_addMagic.i    = 1
+Global v3dq_addMuxA.i     = 0
+Global v3dq_addMuxB.i     = 0
+Global v3dq_addPack.i     = #V3DQ_PACK_NONE
+Global v3dq_addUnpackA.i  = #V3DQ_UNPACK_NONE
+Global v3dq_addUnpackB.i  = #V3DQ_UNPACK_NONE
+
+Global v3dq_mulOp.i       = #V3DQ_M_NOP
+Global v3dq_mulWaddr.i    = #V3DQ_WADDR_NOP
+Global v3dq_mulMagic.i    = 1
+Global v3dq_mulMuxA.i     = 0
+Global v3dq_mulMuxB.i     = 0
+Global v3dq_mulPack.i     = #V3DQ_PACK_NONE
+Global v3dq_mulUnpackA.i  = #V3DQ_UNPACK_NONE
+Global v3dq_mulUnpackB.i  = #V3DQ_UNPACK_NONE
+
+Global v3dq_raddrA.i      = 0
+Global v3dq_raddrB.i      = 0
+Global v3dq_raddrBIsImm.i = 0
+
+Global v3dq_sig.i         = #V3DQ_SIG_NONE
+Global v3dq_sigAddr.i     = 0
+Global v3dq_sigMagic.i    = 0
+
+Global v3dq_ac.i          = #V3DQ_COND_NONE
+Global v3dq_mc.i          = #V3DQ_COND_NONE
+Global v3dq_apf.i         = #V3DQ_PF_NONE
+Global v3dq_mpf.i         = #V3DQ_PF_NONE
+Global v3dq_auf.i         = #V3DQ_UF_NONE
+Global v3dq_muf.i         = #V3DQ_UF_NONE
+
+Global v3dq_brCond.i      = #V3DQ_BR_ALWAYS
+Global v3dq_brMsfign.i    = #V3DQ_MSFIGN_NONE
+Global v3dq_brBdi.i       = #V3DQ_BDEST_REL
+Global v3dq_brBdu.i       = 0
+Global v3dq_brUb.i        = 0
+Global v3dq_brSetLink.i   = 0
+Global v3dq_brOffset.i    = 0
+Global v3dq_brRaddrA.i    = 0
+
+; The packed result of the last successful V3dQpuPack().
+Global v3dq_hi.i          = 0
+Global v3dq_lo.i          = 0
+
+; The program buffer.
+Global v3dq_bufAddr.i     = 0
+Global v3dq_bufBytes.i    = 0
+Global v3dq_bufUsed.i     = 0
+Global v3dq_count.i       = 0
+
+; The hazard tracker. See V3dQpuEmit().
+Global v3dq_ip.i          = 0
+Global v3dq_lastSfuWrite.i = -10
+Global v3dq_lastThrswIp.i  = -10
+Global v3dq_lastBranchIp.i = -10
+Global v3dq_lastThrswFound.i = 0
+Global v3dq_threndFound.i    = 0
+Global v3dq_thrswCount.i     = 0
+Global v3dq_prevLdvary.i     = 0
+Global v3dq_hazardName.i     = 0   ; which rule refused; see V3dQpuHazard()
+
+Global v3dq_err.i         = #V3DQ_OK
+
+; ======================================================================
+;  SMALL, PURE HELPERS
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  v3dq_Fail - record and return. Every refusal goes through here so
+;  that a caller who ignores the return value can still ask
+;  V3dQpuError() afterwards, which is what a diagnostic printing a
+;  register trail wants.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_Fail(code.i)
+  v3dq_err = code
+  ProcedureReturn code
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3dq_Ffs - the position of the lowest set bit, counting from zero,
+;  or -1 for zero.
+;
+;  Mesa writes `ffs(desc->mux.b_mask) - 1` (qpu_pack.c:1570) to turn a
+;  MASK OF PERMITTED MUX VALUES into THE mux value to encode, for an
+;  operation that does not use that operand. This file stores the
+;  chosen value directly in v3dq_AddMuxBFixed() rather than storing
+;  masks, because the masks exist in Mesa only to serve the DISASSEMBLER
+;  - the packer never uses any bit but the lowest. Keeping this
+;  procedure anyway would be keeping a thing with no caller.
+;
+;  It is therefore NOT here. This comment is, so that a reader diffing
+;  against qpu_pack.c does not go looking for it.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  v3dq_F32UnpackBits - the ENCODED value of an f32 input unpack.
+;  qpu_pack.c:867-897. See the asymmetry note above: ABS encodes as 0
+;  and NONE as 1, which is the reverse of the enumeration's order.
+;  Returns -1 for a mode with no f32 encoding.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_F32UnpackBits(u.i)
+  Select u
+    Case #V3DQ_UNPACK_ABS
+      ProcedureReturn 0
+    Case #V3DQ_UNPACK_NONE
+      ProcedureReturn 1
+    Case #V3DQ_UNPACK_L
+      ProcedureReturn 2
+    Case #V3DQ_UNPACK_H
+      ProcedureReturn 3
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3dq_F32PackBits - the ENCODED value of an f32 output pack.
+;  qpu_pack.c:999-1016. Here NONE is 0 and the order is the
+;  enumeration's, which is exactly why the unpack side is worth the
+;  warning it got.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_F32PackBits(p.i)
+  Select p
+    Case #V3DQ_PACK_NONE
+      ProcedureReturn 0
+    Case #V3DQ_PACK_L
+      ProcedureReturn 1
+    Case #V3DQ_PACK_H
+      ProcedureReturn 2
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; ======================================================================
+;  THE SIGNAL TABLE
+; ======================================================================
+;
+;  qpu_pack.c:131-161, transcribed entry by entry. The Select is a
+;  reverse lookup - given the flags, find the index - which is Mesa's
+;  linear search (:229-234) written the only way a language without
+;  arrays of structures can write it.
+;
+;  ENTRY 0 IS "NO SIGNALS" AND IS NOT A FAILURE. Mesa's unpacker has
+;  to distinguish "index 0" from "reserved index that unpacked to
+;  nothing" (:212-214) and this direction does not: the caller asked
+;  for no signals and gets zero.
+;
+;  Indices 26 through 30 have no entry in the 4.2 table and this
+;  procedure cannot produce them. That is not an omission - the table
+;  comment says "26-30 reserved" (:159) and an instruction carrying
+;  one is undefined.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_SigPack(flags.i)
+  Select flags
+    Case #V3DQ_SIG_NONE
+      ProcedureReturn 0
+    Case #V3DQ_SIG_THRSW
+      ProcedureReturn 1
+    Case #V3DQ_SIG_LDUNIF
+      ProcedureReturn 2
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDUNIF
+      ProcedureReturn 3
+    Case #V3DQ_SIG_LDTMU
+      ProcedureReturn 4
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDTMU
+      ProcedureReturn 5
+    Case #V3DQ_SIG_LDTMU | #V3DQ_SIG_LDUNIF
+      ProcedureReturn 6
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDTMU | #V3DQ_SIG_LDUNIF
+      ProcedureReturn 7
+    Case #V3DQ_SIG_LDVARY
+      ProcedureReturn 8
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY
+      ProcedureReturn 9
+    Case #V3DQ_SIG_LDVARY | #V3DQ_SIG_LDUNIF
+      ProcedureReturn 10
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY | #V3DQ_SIG_LDUNIF
+      ProcedureReturn 11
+    Case #V3DQ_SIG_LDUNIFRF
+      ProcedureReturn 12
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDUNIFRF
+      ProcedureReturn 13
+    Case #V3DQ_SIG_SMIMM | #V3DQ_SIG_LDVARY
+      ProcedureReturn 14
+    Case #V3DQ_SIG_SMIMM
+      ProcedureReturn 15
+    Case #V3DQ_SIG_LDTLB
+      ProcedureReturn 16
+    Case #V3DQ_SIG_LDTLBU
+      ProcedureReturn 17
+    Case #V3DQ_SIG_WRTMUC
+      ProcedureReturn 18
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_WRTMUC
+      ProcedureReturn 19
+    Case #V3DQ_SIG_LDVARY | #V3DQ_SIG_WRTMUC
+      ProcedureReturn 20
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY | #V3DQ_SIG_WRTMUC
+      ProcedureReturn 21
+    Case #V3DQ_SIG_UCB
+      ProcedureReturn 22
+    Case #V3DQ_SIG_ROTATE
+      ProcedureReturn 23
+    Case #V3DQ_SIG_LDUNIFA
+      ProcedureReturn 24
+    Case #V3DQ_SIG_LDUNIFARF
+      ProcedureReturn 25
+    Case #V3DQ_SIG_SMIMM | #V3DQ_SIG_LDTMU
+      ProcedureReturn 31
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; ======================================================================
+;  THE CONDITION / FLAG FIELD
+; ======================================================================
+;
+;  v3d_qpu_flags_pack, qpu_pack.c:344-421, transcribed whole. The
+;  table at :355-370 lists which combinations of the six things can
+;  coexist and what base bits each gets; the code after it ORs the
+;  values in, and WHERE it ORs them depends on whether bit 6 of the
+;  base is set. That last part is the piece worth reading twice: the
+;  same ac value lands at shift 0 in one shape and shift 2 in another
+;  (:400-406).
+;
+;  The six presence bits, Mesa's own names and values, :349-354.
+; ----------------------------------------------------------------------
+#V3DQ_FP_AC  = 1
+#V3DQ_FP_MC  = 2
+#V3DQ_FP_APF = 4
+#V3DQ_FP_MPF = 8
+#V3DQ_FP_AUF = 16
+#V3DQ_FP_MUF = 32
+
+; v3dq_FlagsBase - the `bits` column of the table at :355-370, given
+; the `flags_present` column. Returns -1 for a combination that is not
+; in the table, which is Mesa's `return false` at :420.
+Procedure.i v3dq_FlagsBase(present.i)
+  Select present
+    Case 0
+      ProcedureReturn 0
+    Case #V3DQ_FP_APF
+      ProcedureReturn 0
+    Case #V3DQ_FP_AUF
+      ProcedureReturn 0
+    Case #V3DQ_FP_MPF
+      ProcedureReturn 16                     ; (1 << 4)
+    Case #V3DQ_FP_MUF
+      ProcedureReturn 16                     ; (1 << 4)
+    Case #V3DQ_FP_AC
+      ProcedureReturn 32                     ; (1 << 5)
+    Case #V3DQ_FP_AC | #V3DQ_FP_MPF
+      ProcedureReturn 32                     ; (1 << 5)
+    Case #V3DQ_FP_MC
+      ProcedureReturn 48                     ; (1 << 5) | (1 << 4)
+    Case #V3DQ_FP_MC | #V3DQ_FP_APF
+      ProcedureReturn 48                     ; (1 << 5) | (1 << 4)
+    Case #V3DQ_FP_MC | #V3DQ_FP_AC
+      ProcedureReturn 64                     ; (1 << 6)
+    Case #V3DQ_FP_MC | #V3DQ_FP_AUF
+      ProcedureReturn 64                     ; (1 << 6)
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; v3dq_FlagsPack - the whole of :372-418. Returns the seven-bit field
+; or -1.
+Procedure.i v3dq_FlagsPack()
+  Protected present.i
+  Protected packed.i
+
+  present = 0
+  If v3dq_ac <> #V3DQ_COND_NONE
+    present = present | #V3DQ_FP_AC
+  EndIf
+  If v3dq_mc <> #V3DQ_COND_NONE
+    present = present | #V3DQ_FP_MC
+  EndIf
+  If v3dq_apf <> #V3DQ_PF_NONE
+    present = present | #V3DQ_FP_APF
+  EndIf
+  If v3dq_mpf <> #V3DQ_PF_NONE
+    present = present | #V3DQ_FP_MPF
+  EndIf
+  If v3dq_auf <> #V3DQ_UF_NONE
+    present = present | #V3DQ_FP_AUF
+  EndIf
+  If v3dq_muf <> #V3DQ_UF_NONE
+    present = present | #V3DQ_FP_MUF
+  EndIf
+
+  packed = v3dq_FlagsBase(present)
+  If packed < 0
+    ProcedureReturn -1
+  EndIf
+
+  ; :392-393. The PUSH values go in raw, both of them, and they cannot
+  ; collide because the table admits at most one push.
+  packed = packed | v3dq_apf
+  packed = packed | v3dq_mpf
+
+  ; :395-398. An UPDATE is stored as its ordinal plus four. The
+  ; enumeration starts ANDZ at 1 here where Mesa starts it at
+  ; V3D_QPU_UF_ANDZ, so the arithmetic is (value - 1) + 4 rather than
+  ; (value - ANDZ) + 4. Same number, different zero.
+  If (present & #V3DQ_FP_AUF) <> 0
+    packed = packed | (v3dq_auf - #V3DQ_UF_ANDZ + 4)
+  EndIf
+  If (present & #V3DQ_FP_MUF) <> 0
+    packed = packed | (v3dq_muf - #V3DQ_UF_ANDZ + 4)
+  EndIf
+
+  ; :400-415. Bit 6 of the base selects the layout, for both halves.
+  If (present & #V3DQ_FP_AC) <> 0
+    If (packed & 64) <> 0
+      packed = packed | (v3dq_ac - #V3DQ_COND_IFA)
+    Else
+      packed = packed | ((v3dq_ac - #V3DQ_COND_IFA) << 2)
+    EndIf
+  EndIf
+  If (present & #V3DQ_FP_MC) <> 0
+    If (packed & 64) <> 0
+      packed = packed | ((v3dq_mc - #V3DQ_COND_IFA) << 4)
+    Else
+      packed = packed | ((v3dq_mc - #V3DQ_COND_IFA) << 2)
+    EndIf
+  EndIf
+
+  ProcedureReturn packed
+EndProcedure
+
+; ======================================================================
+;  THE ADD OPCODE TABLE
+; ======================================================================
+;
+;  qpu_pack.c:457-559. Three questions per operation and therefore
+;  three procedures, because the alternative in this language is one
+;  procedure returning a packed triple and that is unreadable next to
+;  the source it transcribes.
+;
+;    v3dq_AddOpcode(op)   the `opcode_first` column
+;    v3dq_AddMuxAFixed(op) the mux_a to force when the op takes no
+;                          source A - Mesa's ffs(a_mask) - 1
+;    v3dq_AddMuxBFixed(op) likewise for B
+;
+;  A FIXED MUX IS NOT A DON'T-CARE. For opcodes 186, 187, 188, 245,
+;  246, 247 and 252 the mux fields ARE PART OF THE OPCODE. Encoding
+;  EIDX with mux_a left at whatever the caller had produces TIDX, LR
+;  or VFLNB depending on the leftover. That is why V3dQpuReset()
+;  exists and why these return an explicit value rather than zero.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_AddOpcode(op.i)
+  Select op
+    Case #V3DQ_A_FADD
+      ProcedureReturn 0     ; :459, range 0-47, the rest from pack/unpack
+    Case #V3DQ_A_FADDNF
+      ProcedureReturn 0     ; :460
+    Case #V3DQ_A_VFPACK
+      ProcedureReturn 53    ; :461, and the FIRST of THREE rows -
+                            ; :463 is {57,59} and :465 is {61,63}.
+                            ; lookup_opcode_from_instr takes the
+                            ; first match and the packing rule below
+                            ; then REWRITES bits 3:0 from the two
+                            ; input unpacks, which is what moves an
+                            ; instruction into whichever of the three
+                            ; ranges its operands select. 53 is the
+                            ; table row, not the answer.
+    Case #V3DQ_A_ADD
+      ProcedureReturn 56    ; :462
+    Case #V3DQ_A_SUB
+      ProcedureReturn 60    ; :464
+    Case #V3DQ_A_FSUB
+      ProcedureReturn 64    ; :466, range 64-111
+    Case #V3DQ_A_MIN
+      ProcedureReturn 120   ; :467
+    Case #V3DQ_A_MAX
+      ProcedureReturn 121   ; :468
+    Case #V3DQ_A_UMIN
+      ProcedureReturn 122   ; :469
+    Case #V3DQ_A_UMAX
+      ProcedureReturn 123   ; :470
+    Case #V3DQ_A_SHL
+      ProcedureReturn 124   ; :471
+    Case #V3DQ_A_SHR
+      ProcedureReturn 125   ; :472
+    Case #V3DQ_A_ASR
+      ProcedureReturn 126   ; :473
+    Case #V3DQ_A_ROR
+      ProcedureReturn 127   ; :474
+    Case #V3DQ_A_FMIN
+      ProcedureReturn 128   ; :476, range 128-175
+    Case #V3DQ_A_FMAX
+      ProcedureReturn 128   ; :477
+    Case #V3DQ_A_AND
+      ProcedureReturn 181   ; :480
+    Case #V3DQ_A_OR
+      ProcedureReturn 182   ; :481
+    Case #V3DQ_A_XOR
+      ProcedureReturn 183   ; :482
+    Case #V3DQ_A_VADD
+      ProcedureReturn 184   ; :484
+    Case #V3DQ_A_VSUB
+      ProcedureReturn 185   ; :485
+    Case #V3DQ_A_NOT
+      ProcedureReturn 186   ; :486
+    Case #V3DQ_A_NEG
+      ProcedureReturn 186   ; :487
+    Case #V3DQ_A_FLAPUSH
+      ProcedureReturn 186   ; :488
+    Case #V3DQ_A_FLBPUSH
+      ProcedureReturn 186   ; :489
+    Case #V3DQ_A_FLPOP
+      ProcedureReturn 186   ; :490
+    Case #V3DQ_A_RECIP
+      ProcedureReturn 186   ; :491
+    Case #V3DQ_A_SETMSF
+      ProcedureReturn 186   ; :492
+    Case #V3DQ_A_SETREVF
+      ProcedureReturn 186   ; :493
+    Case #V3DQ_A_NOP
+      ProcedureReturn 187   ; :494
+    Case #V3DQ_A_TIDX
+      ProcedureReturn 187   ; :495
+    Case #V3DQ_A_EIDX
+      ProcedureReturn 187   ; :496
+    Case #V3DQ_A_LR
+      ProcedureReturn 187   ; :497
+    Case #V3DQ_A_VFLA
+      ProcedureReturn 187   ; :498
+    Case #V3DQ_A_VFLNA
+      ProcedureReturn 187   ; :499
+    Case #V3DQ_A_VFLB
+      ProcedureReturn 187   ; :500
+    Case #V3DQ_A_VFLNB
+      ProcedureReturn 187   ; :501
+    Case #V3DQ_A_FXCD
+      ProcedureReturn 187   ; :503
+    Case #V3DQ_A_XCD
+      ProcedureReturn 187   ; :504
+    Case #V3DQ_A_FYCD
+      ProcedureReturn 187   ; :505
+    Case #V3DQ_A_YCD
+      ProcedureReturn 187   ; :506
+    Case #V3DQ_A_MSF
+      ProcedureReturn 187   ; :508
+    Case #V3DQ_A_REVF
+      ProcedureReturn 187   ; :509
+    Case #V3DQ_A_IID
+      ProcedureReturn 187   ; :511, first_ver 40 - present on 4.2
+    Case #V3DQ_A_SAMPID
+      ProcedureReturn 187   ; :512, first_ver 40
+    Case #V3DQ_A_BARRIERID
+      ProcedureReturn 187   ; :513, first_ver 40
+    Case #V3DQ_A_TMUWT
+      ProcedureReturn 187   ; :514
+    Case #V3DQ_A_VPMWT
+      ProcedureReturn 187   ; :515
+    Case #V3DQ_A_FLAFIRST
+      ProcedureReturn 187   ; :516, first_ver 41
+    Case #V3DQ_A_FLNAFIRST
+      ProcedureReturn 187   ; :517, first_ver 41
+    ; THE VPM LOADS. Opcode 188 with the variant in MUX_B, and 189
+    ; for the gathered form. first_ver 40, so present on this 4.2
+    ; part - the same gate that admits IID, SAMPID and BARRIERID.
+    ; qpu_pack.c:520-531.
+    ;
+    ; _IN AND _OUT SHARE AN OPCODE AND A MUX_B AND ARE TOLD APART BY
+    ; BIT 44. See v3dq_PackAdd(); the row is identical.
+    Case #V3DQ_A_LDVPMV_IN
+      ProcedureReturn 188   ; :520, mux_b OP_MASK(0)
+    Case #V3DQ_A_LDVPMV_OUT
+      ProcedureReturn 188   ; :521
+    Case #V3DQ_A_LDVPMD_IN
+      ProcedureReturn 188   ; :522, mux_b OP_MASK(1)
+    Case #V3DQ_A_LDVPMD_OUT
+      ProcedureReturn 188   ; :523
+    Case #V3DQ_A_LDVPMP
+      ProcedureReturn 188   ; :524, mux_b OP_MASK(2)
+    Case #V3DQ_A_LDVPMG_IN
+      ProcedureReturn 189   ; :530, both muxes ANYMUX - it takes two
+                            ; sources, a row and a column
+    Case #V3DQ_A_LDVPMG_OUT
+      ProcedureReturn 189   ; :531
+    Case #V3DQ_A_RSQRT
+      ProcedureReturn 188   ; :525, first_ver 41
+    Case #V3DQ_A_EXP
+      ProcedureReturn 188   ; :526
+    Case #V3DQ_A_LOG
+      ProcedureReturn 188   ; :527
+    Case #V3DQ_A_SIN
+      ProcedureReturn 188   ; :528
+    Case #V3DQ_A_RSQRT2
+      ProcedureReturn 188   ; :529
+    Case #V3DQ_A_FCMP
+      ProcedureReturn 192   ; :536, range 192-239
+    Case #V3DQ_A_FROUND
+      ProcedureReturn 245   ; :539
+    Case #V3DQ_A_FTOIN
+      ProcedureReturn 245   ; :540
+    Case #V3DQ_A_FTRUNC
+      ProcedureReturn 245   ; :541
+    Case #V3DQ_A_FTOIZ
+      ProcedureReturn 245   ; :542
+    Case #V3DQ_A_FFLOOR
+      ProcedureReturn 246   ; :543
+    Case #V3DQ_A_FTOUZ
+      ProcedureReturn 246   ; :544
+    Case #V3DQ_A_FCEIL
+      ProcedureReturn 246   ; :545
+    Case #V3DQ_A_FTOC
+      ProcedureReturn 246   ; :546
+    Case #V3DQ_A_FDX
+      ProcedureReturn 247   ; :548
+    Case #V3DQ_A_FDY
+      ProcedureReturn 247   ; :549
+    ; THE VPM STORES. One opcode for all three; "The stvpms are
+    ; distinguished by the waddr field" is the table's own comment at
+    ; :551, and v3dq_PackAdd() does the substituting.
+    Case #V3DQ_A_STVPMV
+      ProcedureReturn 248   ; :552
+    Case #V3DQ_A_STVPMD
+      ProcedureReturn 248   ; :553
+    Case #V3DQ_A_STVPMP
+      ProcedureReturn 248   ; :554
+    Case #V3DQ_A_ITOF
+      ProcedureReturn 252   ; :556
+    Case #V3DQ_A_CLZ
+      ProcedureReturn 252   ; :557
+    Case #V3DQ_A_UTOF
+      ProcedureReturn 252   ; :558
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  How many sources an ADD operation takes. qpu_instr.c:387-503's
+;  add_op_args, reduced by :539-550's rule: B present means two, else
+;  A present means one, else none.
+;
+;  Only the operations this file encodes are listed. The default of 2
+;  is deliberate and is safe: v3dq_AddOpcode() has already refused
+;  anything not in the list above, so an unlisted operation cannot
+;  reach here.
+; ----------------------------------------------------------------------
+;  ONE CASE PER VALUE, and that is the language's rule rather than a
+;  style choice: 'Case 1, 2, 3' is refused by name (Help/_langref.txt,
+;  the Case entry: "ONE VALUE ONLY"). Written as an If ladder it would
+;  be shorter and it would also stop being diffable against
+;  add_op_args, which is one line per operation.
+Procedure.i v3dq_AddNumSrc(op.i)
+  Select op
+    ; Zero sources. Every one of these is an opcode-187 or 188 slot
+    ; where BOTH muxes carry the operation identity.
+    Case #V3DQ_A_NOP
+      ProcedureReturn 0
+    Case #V3DQ_A_TIDX
+      ProcedureReturn 0
+    Case #V3DQ_A_EIDX
+      ProcedureReturn 0
+    Case #V3DQ_A_LR
+      ProcedureReturn 0
+    Case #V3DQ_A_VFLA
+      ProcedureReturn 0
+    Case #V3DQ_A_VFLNA
+      ProcedureReturn 0
+    Case #V3DQ_A_VFLB
+      ProcedureReturn 0
+    Case #V3DQ_A_VFLNB
+      ProcedureReturn 0
+    Case #V3DQ_A_FXCD
+      ProcedureReturn 0
+    Case #V3DQ_A_XCD
+      ProcedureReturn 0
+    Case #V3DQ_A_FYCD
+      ProcedureReturn 0
+    Case #V3DQ_A_YCD
+      ProcedureReturn 0
+    Case #V3DQ_A_MSF
+      ProcedureReturn 0
+    Case #V3DQ_A_REVF
+      ProcedureReturn 0
+    Case #V3DQ_A_IID
+      ProcedureReturn 0
+    Case #V3DQ_A_SAMPID
+      ProcedureReturn 0
+    Case #V3DQ_A_BARRIERID
+      ProcedureReturn 0
+    Case #V3DQ_A_TMUWT
+      ProcedureReturn 0
+    Case #V3DQ_A_VPMWT
+      ProcedureReturn 0
+    Case #V3DQ_A_FLAFIRST
+      ProcedureReturn 0
+    Case #V3DQ_A_FLNAFIRST
+      ProcedureReturn 0
+    ; One source.
+    Case #V3DQ_A_NOT
+      ProcedureReturn 1
+    Case #V3DQ_A_NEG
+      ProcedureReturn 1
+    Case #V3DQ_A_FLAPUSH
+      ProcedureReturn 1
+    Case #V3DQ_A_FLBPUSH
+      ProcedureReturn 1
+    Case #V3DQ_A_FLPOP
+      ProcedureReturn 1
+    Case #V3DQ_A_RECIP
+      ProcedureReturn 1
+    Case #V3DQ_A_SETMSF
+      ProcedureReturn 1
+    Case #V3DQ_A_SETREVF
+      ProcedureReturn 1
+    ; qpu_instr.c:449-453 - LDVPMV/D/P are D | A, one source, and
+    ; that source is the VPM offset. LDVPMG_IN/OUT are D | A | B
+    ; (:459-460) and fall through to the default of two, and STVPM*
+    ; is A | B (:479-481) which is also two - it has no D at all,
+    ; which is the whole reason its waddr field is free to carry the
+    ; operation.
+    Case #V3DQ_A_LDVPMV_IN
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMV_OUT
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMD_IN
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMD_OUT
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMP
+      ProcedureReturn 1
+    Case #V3DQ_A_RSQRT
+      ProcedureReturn 1
+    Case #V3DQ_A_EXP
+      ProcedureReturn 1
+    Case #V3DQ_A_LOG
+      ProcedureReturn 1
+    Case #V3DQ_A_SIN
+      ProcedureReturn 1
+    Case #V3DQ_A_RSQRT2
+      ProcedureReturn 1
+    Case #V3DQ_A_FROUND
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOIN
+      ProcedureReturn 1
+    Case #V3DQ_A_FTRUNC
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOIZ
+      ProcedureReturn 1
+    Case #V3DQ_A_FFLOOR
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOUZ
+      ProcedureReturn 1
+    Case #V3DQ_A_FCEIL
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOC
+      ProcedureReturn 1
+    Case #V3DQ_A_FDX
+      ProcedureReturn 1
+    Case #V3DQ_A_FDY
+      ProcedureReturn 1
+    Case #V3DQ_A_ITOF
+      ProcedureReturn 1
+    Case #V3DQ_A_CLZ
+      ProcedureReturn 1
+    Case #V3DQ_A_UTOF
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 2
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The forced mux values, from the a_mask / b_mask columns at
+;  :486-558. Mesa computes ffs(mask) - 1; where the mask is a RANGE
+;  the answer is the range's bottom, which is why FXCD gives 0 and
+;  not "0 or 1 or 2".
+; ----------------------------------------------------------------------
+Procedure.i v3dq_AddMuxAFixed(op.i)
+  Select op
+    Case #V3DQ_A_NOP
+      ProcedureReturn 0   ; :494 OP_MASK(0)
+    Case #V3DQ_A_TIDX
+      ProcedureReturn 1   ; :495
+    Case #V3DQ_A_EIDX
+      ProcedureReturn 2   ; :496
+    Case #V3DQ_A_LR
+      ProcedureReturn 3   ; :497
+    Case #V3DQ_A_VFLA
+      ProcedureReturn 4   ; :498
+    Case #V3DQ_A_VFLNA
+      ProcedureReturn 5   ; :499
+    Case #V3DQ_A_VFLB
+      ProcedureReturn 6   ; :500
+    Case #V3DQ_A_VFLNB
+      ProcedureReturn 7   ; :501
+    Case #V3DQ_A_FXCD
+      ProcedureReturn 0   ; :503 OP_RANGE(0,2)
+    Case #V3DQ_A_XCD
+      ProcedureReturn 3   ; :504
+    Case #V3DQ_A_FYCD
+      ProcedureReturn 4   ; :505 OP_RANGE(4,6)
+    Case #V3DQ_A_YCD
+      ProcedureReturn 7   ; :506
+    Case #V3DQ_A_MSF
+      ProcedureReturn 0   ; :508
+    Case #V3DQ_A_REVF
+      ProcedureReturn 1   ; :509
+    Case #V3DQ_A_IID
+      ProcedureReturn 2   ; :511
+    Case #V3DQ_A_SAMPID
+      ProcedureReturn 3   ; :512
+    Case #V3DQ_A_BARRIERID
+      ProcedureReturn 4   ; :513
+    Case #V3DQ_A_TMUWT
+      ProcedureReturn 5   ; :514
+    Case #V3DQ_A_VPMWT
+      ProcedureReturn 6   ; :515
+    Case #V3DQ_A_FLAFIRST
+      ProcedureReturn 7   ; :516
+    Case #V3DQ_A_FLNAFIRST
+      ProcedureReturn 0   ; :517
+  EndSelect
+  ; Every other zero-source operation is covered above; a one- or
+  ; two-source operation uses the caller's mux and never asks.
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_AddMuxBFixed(op.i)
+  Select op
+    Case #V3DQ_A_NOT
+      ProcedureReturn 0   ; :486
+    Case #V3DQ_A_NEG
+      ProcedureReturn 1   ; :487
+    Case #V3DQ_A_FLAPUSH
+      ProcedureReturn 2   ; :488
+    Case #V3DQ_A_FLBPUSH
+      ProcedureReturn 3   ; :489
+    Case #V3DQ_A_FLPOP
+      ProcedureReturn 4   ; :490
+    Case #V3DQ_A_RECIP
+      ProcedureReturn 5   ; :491
+    Case #V3DQ_A_SETMSF
+      ProcedureReturn 6   ; :492
+    Case #V3DQ_A_SETREVF
+      ProcedureReturn 7   ; :493
+    Case #V3DQ_A_NOP
+      ProcedureReturn 0   ; :494 b_mask OP_MASK(0)
+    Case #V3DQ_A_TIDX
+      ProcedureReturn 0   ; :495
+    Case #V3DQ_A_EIDX
+      ProcedureReturn 0   ; :496
+    Case #V3DQ_A_LR
+      ProcedureReturn 0   ; :497
+    Case #V3DQ_A_VFLA
+      ProcedureReturn 0   ; :498
+    Case #V3DQ_A_VFLNA
+      ProcedureReturn 0   ; :499
+    Case #V3DQ_A_VFLB
+      ProcedureReturn 0   ; :500
+    Case #V3DQ_A_VFLNB
+      ProcedureReturn 0   ; :501
+    Case #V3DQ_A_FXCD
+      ProcedureReturn 1   ; :503 b_mask OP_MASK(1)
+    Case #V3DQ_A_XCD
+      ProcedureReturn 1   ; :504
+    Case #V3DQ_A_FYCD
+      ProcedureReturn 1   ; :505
+    Case #V3DQ_A_YCD
+      ProcedureReturn 1   ; :506
+    Case #V3DQ_A_MSF
+      ProcedureReturn 2   ; :508 b_mask OP_MASK(2)
+    Case #V3DQ_A_REVF
+      ProcedureReturn 2   ; :509
+    Case #V3DQ_A_IID
+      ProcedureReturn 2   ; :511
+    Case #V3DQ_A_SAMPID
+      ProcedureReturn 2   ; :512
+    Case #V3DQ_A_BARRIERID
+      ProcedureReturn 2   ; :513
+    Case #V3DQ_A_TMUWT
+      ProcedureReturn 2   ; :514
+    Case #V3DQ_A_VPMWT
+      ProcedureReturn 2   ; :515
+    Case #V3DQ_A_FLAFIRST
+      ProcedureReturn 2   ; :516
+    Case #V3DQ_A_FLNAFIRST
+      ProcedureReturn 3   ; :517
+    ; THE VPM LOAD VARIANT SELECTOR. These share opcode 188 with
+    ; RSQRT/EXP/LOG/SIN/RSQRT2 below and MUX_B IS THE WHOLE
+    ; DISTINCTION - qpu_pack.c:520-524. Encoding LDVPMV_IN with a
+    ; leftover mux_b of 3 produces RSQRT, which is not a wrong
+    ; operand, it is a different instruction. That is why
+    ; V3dQpuReset() exists.
+    ;
+    ; LDVPMG_IN/OUT are NOT here: they are opcode 189 with b_mask
+    ; ANYMUX and two real sources, so the caller's mux_b is the
+    ; column operand and must not be overwritten.
+    Case #V3DQ_A_LDVPMV_IN
+      ProcedureReturn 0   ; :520 b_mask OP_MASK(0)
+    Case #V3DQ_A_LDVPMV_OUT
+      ProcedureReturn 0   ; :521
+    Case #V3DQ_A_LDVPMD_IN
+      ProcedureReturn 1   ; :522 b_mask OP_MASK(1)
+    Case #V3DQ_A_LDVPMD_OUT
+      ProcedureReturn 1   ; :523
+    Case #V3DQ_A_LDVPMP
+      ProcedureReturn 2   ; :524 b_mask OP_MASK(2)
+    Case #V3DQ_A_RSQRT
+      ProcedureReturn 3   ; :525
+    Case #V3DQ_A_EXP
+      ProcedureReturn 4   ; :526
+    Case #V3DQ_A_LOG
+      ProcedureReturn 5   ; :527
+    Case #V3DQ_A_SIN
+      ProcedureReturn 6   ; :528
+    Case #V3DQ_A_RSQRT2
+      ProcedureReturn 7   ; :529
+    Case #V3DQ_A_FROUND
+      ProcedureReturn 0   ; :539 OP_RANGE(0,2)
+    Case #V3DQ_A_FTOIN
+      ProcedureReturn 3   ; :540
+    Case #V3DQ_A_FTRUNC
+      ProcedureReturn 4   ; :541 OP_RANGE(4,6)
+    Case #V3DQ_A_FTOIZ
+      ProcedureReturn 7   ; :542
+    Case #V3DQ_A_FFLOOR
+      ProcedureReturn 0   ; :543
+    Case #V3DQ_A_FTOUZ
+      ProcedureReturn 3   ; :544
+    Case #V3DQ_A_FCEIL
+      ProcedureReturn 4   ; :545
+    Case #V3DQ_A_FTOC
+      ProcedureReturn 7   ; :546
+    Case #V3DQ_A_FDX
+      ProcedureReturn 0   ; :548
+    Case #V3DQ_A_FDY
+      ProcedureReturn 4   ; :549
+    Case #V3DQ_A_ITOF
+      ProcedureReturn 0   ; :556
+    Case #V3DQ_A_CLZ
+      ProcedureReturn 3   ; :557
+    Case #V3DQ_A_UTOF
+      ProcedureReturn 4   ; :558
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE MUL OPCODE TABLE. qpu_pack.c:561-574.
+; ======================================================================
+Procedure.i v3dq_MulOpcode(op.i)
+  Select op
+    Case #V3DQ_M_ADD
+      ProcedureReturn 1    ; :562
+    Case #V3DQ_M_SUB
+      ProcedureReturn 2    ; :563
+    Case #V3DQ_M_UMUL24
+      ProcedureReturn 3    ; :564
+    Case #V3DQ_M_SMUL24
+      ProcedureReturn 9    ; :566
+    Case #V3DQ_M_MULTOP
+      ProcedureReturn 10   ; :567
+    Case #V3DQ_M_FMOV
+      ProcedureReturn 14   ; :568 - the FIRST of the two FMOV rows.
+                           ; :569 is {15, b_mask 0-3} and Mesa's
+                           ; lookup_opcode_from_instr takes the first
+                           ; match, so 14 is the packed form.
+    Case #V3DQ_M_NOP
+      ProcedureReturn 15   ; :570
+    Case #V3DQ_M_MOV
+      ProcedureReturn 15   ; :571
+    Case #V3DQ_M_FMUL
+      ProcedureReturn 16   ; :573, range 16-63
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i v3dq_MulNumSrc(op.i)
+  Select op
+    Case #V3DQ_M_NOP
+      ProcedureReturn 0
+    Case #V3DQ_M_FMOV
+      ProcedureReturn 1
+    Case #V3DQ_M_MOV
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i v3dq_MulMuxAFixed(op.i)
+  If op = #V3DQ_M_NOP
+    ProcedureReturn 0    ; :570 a_mask OP_MASK(0)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_MulMuxBFixed(op.i)
+  Select op
+    Case #V3DQ_M_NOP
+      ProcedureReturn 4  ; :570 b_mask OP_MASK(4)
+    Case #V3DQ_M_MOV
+      ProcedureReturn 7  ; :571 b_mask OP_MASK(7)
+    Case #V3DQ_M_FMOV
+      ProcedureReturn 0  ; :568 b_mask ANYMUX, so ffs gives 0. It is
+                         ; then OVERWRITTEN by the FMOV packing rule
+                         ; at :2103, which puts the pack and unpack
+                         ; bits there. Left here for the shape.
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  SMALL IMMEDIATES. qpu_pack.c:239-264 and :278-293.
+; ======================================================================
+;
+;  Forty-eight values reachable through mux 7 with no register read
+;  and no uniform fetch. Sixteen small positives, sixteen small
+;  negatives, and SIXTEEN FLOAT BIT PATTERNS - 2^-8 through 2^7. The
+;  last sixteen are the reason this is a table and not arithmetic:
+;  0x3f800000 is 1.0f and it is index 40, and there is no formula from
+;  the value to the index that covers all three groups.
+;
+;  Mesa searches the table for an exact 32-bit match (:285-289) and
+;  this does the same, in three arms. The caller passes the 32-BIT
+;  PATTERN it wants in the lane: -1 and 0xFFFFFFFF are the same
+;  request and both are accepted, which is why the negative arm tests
+;  both spellings.
+;
+;  Returns the index 0..47, or -1.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_SmallImmIndex(value.i)
+  Protected v.i
+
+  v = value & $FFFFFFFF
+
+  ; :240-243, the sixteen small positives, index == value.
+  If v <= 15
+    ProcedureReturn v
+  EndIf
+
+  ; :244-247, -16 through -1 at indices 16 through 31.
+  If v >= $FFFFFFF0
+    ProcedureReturn 16 + (v - $FFFFFFF0)
+  EndIf
+
+  ; :248-263, the sixteen powers of two as f32 bit patterns.
+  Select v
+    Case $3B800000
+      ProcedureReturn 32   ; 2.0^-8
+    Case $3C000000
+      ProcedureReturn 33   ; 2.0^-7
+    Case $3C800000
+      ProcedureReturn 34   ; 2.0^-6
+    Case $3D000000
+      ProcedureReturn 35   ; 2.0^-5
+    Case $3D800000
+      ProcedureReturn 36   ; 2.0^-4
+    Case $3E000000
+      ProcedureReturn 37   ; 2.0^-3
+    Case $3E800000
+      ProcedureReturn 38   ; 2.0^-2
+    Case $3F000000
+      ProcedureReturn 39   ; 2.0^-1
+    Case $3F800000
+      ProcedureReturn 40   ; 2.0^0
+    Case $40000000
+      ProcedureReturn 41   ; 2.0^1
+    Case $40800000
+      ProcedureReturn 42   ; 2.0^2
+    Case $41000000
+      ProcedureReturn 43   ; 2.0^3
+    Case $41800000
+      ProcedureReturn 44   ; 2.0^4
+    Case $42000000
+      ProcedureReturn 45   ; 2.0^5
+    Case $42800000
+      ProcedureReturn 46   ; 2.0^6
+    Case $43000000
+      ProcedureReturn 47   ; 2.0^7
+  EndSelect
+
+  ProcedureReturn -1
+EndProcedure
+
+; ======================================================================
+;  THE THREE PACKING FAMILIES OF THE ADD HALF
+; ======================================================================
+;
+;  qpu_pack.c:1609-1756 is one switch with three interesting arms and a
+;  default. A switch cannot be transcribed as a Select here because a
+;  Select in this language takes ONE VALUE PER CASE and every one of
+;  these arms lists five or six - see the note at v3dq_AddNumSrc().
+;  So each arm becomes a predicate and the packer becomes an If
+;  ladder, which is the shape the language's own Case entry
+;  recommends ("several values sharing one action means several Case
+;  branches, or an If with Or").
+;
+;  Predicates rather than an inline chain of Or comparisons because
+;  the packer already has six locals and a nine-term condition inside
+;  it would be the least readable line in the file.
+; ----------------------------------------------------------------------
+
+; The six that carry an f32 output pack in opcode bits 5:4 and two
+; f32 input unpacks in bits 3:0. :1610-1615.
+Procedure.i v3dq_AddIsFloatPack(op.i)
+  Select op
+    Case #V3DQ_A_FADD
+      ProcedureReturn 1
+    Case #V3DQ_A_FADDNF
+      ProcedureReturn 1
+    Case #V3DQ_A_FSUB
+      ProcedureReturn 1
+    Case #V3DQ_A_FMIN
+      ProcedureReturn 1
+    Case #V3DQ_A_FMAX
+      ProcedureReturn 1
+    Case #V3DQ_A_FCMP
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; The two of those six that are commutative and are told apart from
+; their twin ONLY by operand order. :1642-1645. FSUB and FCMP share
+; the arm above but never swap.
+Procedure.i v3dq_AddWantsOrderFalse(op.i)
+  Select op
+    Case #V3DQ_A_FMIN
+      ProcedureReturn 1
+    Case #V3DQ_A_FADD
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_AddWantsOrderTrue(op.i)
+  Select op
+    Case #V3DQ_A_FMAX
+      ProcedureReturn 1
+    Case #V3DQ_A_FADDNF
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; The six whose output pack goes in the MUX_B field. :1690-1695.
+Procedure.i v3dq_AddIsRoundFamily(op.i)
+  Select op
+    Case #V3DQ_A_FFLOOR
+      ProcedureReturn 1
+    Case #V3DQ_A_FROUND
+      ProcedureReturn 1
+    Case #V3DQ_A_FTRUNC
+      ProcedureReturn 1
+    Case #V3DQ_A_FCEIL
+      ProcedureReturn 1
+    Case #V3DQ_A_FDX
+      ProcedureReturn 1
+    Case #V3DQ_A_FDY
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE THREE VPM PREDICATES. qpu_pack.c:1577-1607 is a switch with two
+;  arms and three labels in one of them, which a Select in this
+;  language cannot express (one value per Case - see v3dq_AddNumSrc).
+;  Written as predicates for the same reason the pack families are.
+; ----------------------------------------------------------------------
+
+; The WADDR an STVPM encodes its operation into, or -1. :1578-1589.
+; "The stvpms are distinguished by the waddr field" (:551), so the
+; caller's destination is not a destination at all - STVPM has no D
+; operand (qpu_instr.c:479-481) - and Mesa OVERWRITES it and then
+; suppresses the magic bit with no_magic_write.
+Procedure.i v3dq_AddStvpmWaddr(op.i)
+  Select op
+    Case #V3DQ_A_STVPMV
+      ProcedureReturn 0   ; :1578-1580
+    Case #V3DQ_A_STVPMD
+      ProcedureReturn 1   ; :1582-1584
+    Case #V3DQ_A_STVPMP
+      ProcedureReturn 2   ; :1586-1588
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; Any of the seven VPM LOADS. :1591-1603. Every one of them asserts
+; !magic_write, so the destination is a register-file address.
+Procedure.i v3dq_AddIsLdvpm(op.i)
+  Select op
+    Case #V3DQ_A_LDVPMV_IN
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMV_OUT
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMD_IN
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMD_OUT
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMP
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMG_IN
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMG_OUT
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; THE THREE THAT SET BIT 44, and bit 44 is not the magic bit here.
+; :1598-1603. LDVPMV_IN and LDVPMV_OUT are the SAME opcode and the
+; SAME mux_b (:520-521); the only thing in sixty-four bits that tells
+; them apart is MA. The unpacker reads it back the same way -
+; :1154-1168 turns _IN into _OUT when MA is set and only calls it a
+; magic write in the default arm. LDVPMP has no _OUT form.
+Procedure.i v3dq_AddIsLdvpmOut(op.i)
+  Select op
+    Case #V3DQ_A_LDVPMV_OUT
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMD_OUT
+      ProcedureReturn 1
+    Case #V3DQ_A_LDVPMG_OUT
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; The four float-to-integer conversions, which take no output pack at
+; all. :1715-1718.
+Procedure.i v3dq_AddIsFtoiFamily(op.i)
+  Select op
+    Case #V3DQ_A_FTOIN
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOIZ
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOUZ
+      ProcedureReturn 1
+    Case #V3DQ_A_FTOC
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE BUILDER
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  V3dQpuReset - one NOP-NOP with nothing else set.
+;
+;  THE DEFAULT DESTINATION IS MAGIC WADDR 6, WHICH IS THE BIT BUCKET,
+;  AND THAT IS NOT ARBITRARY. py-videocore6's every operation defaults
+;  its destination to `null`, which is Register("null", magic 1,
+;  waddr 6) - assembler.py:299 and :607. Defaulting to register-file
+;  address 0 instead would silently clobber rf0 on every instruction
+;  whose result nobody wanted, and rf0 is where a program's first
+;  uniform usually lands.
+;
+;  It also means the two implementations agree on a bare NOP without
+;  the caller having to say so, which is one fewer thing for the gate
+;  to have to arrange.
+; ----------------------------------------------------------------------
+Procedure V3dQpuReset()
+  v3dq_type       = #V3DQ_TYPE_ALU
+
+  v3dq_addOp      = #V3DQ_A_NOP
+  v3dq_addWaddr   = #V3DQ_WADDR_NOP
+  v3dq_addMagic   = 1
+  v3dq_addMuxA    = 0
+  v3dq_addMuxB    = 0
+  v3dq_addPack    = #V3DQ_PACK_NONE
+  v3dq_addUnpackA = #V3DQ_UNPACK_NONE
+  v3dq_addUnpackB = #V3DQ_UNPACK_NONE
+
+  v3dq_mulOp      = #V3DQ_M_NOP
+  v3dq_mulWaddr   = #V3DQ_WADDR_NOP
+  v3dq_mulMagic   = 1
+  v3dq_mulMuxA    = 0
+  v3dq_mulMuxB    = 0
+  v3dq_mulPack    = #V3DQ_PACK_NONE
+  v3dq_mulUnpackA = #V3DQ_UNPACK_NONE
+  v3dq_mulUnpackB = #V3DQ_UNPACK_NONE
+
+  v3dq_raddrA      = 0
+  v3dq_raddrB      = 0
+  v3dq_raddrBIsImm = 0
+
+  v3dq_sig      = #V3DQ_SIG_NONE
+  v3dq_sigAddr  = 0
+  v3dq_sigMagic = 0
+
+  v3dq_ac  = #V3DQ_COND_NONE
+  v3dq_mc  = #V3DQ_COND_NONE
+  v3dq_apf = #V3DQ_PF_NONE
+  v3dq_mpf = #V3DQ_PF_NONE
+  v3dq_auf = #V3DQ_UF_NONE
+  v3dq_muf = #V3DQ_UF_NONE
+
+  v3dq_brCond    = #V3DQ_BR_ALWAYS
+  v3dq_brMsfign  = #V3DQ_MSFIGN_NONE
+  v3dq_brBdi     = #V3DQ_BDEST_REL
+  v3dq_brBdu     = 0
+  v3dq_brUb      = 0
+  v3dq_brSetLink = 0
+  v3dq_brOffset  = 0
+  v3dq_brRaddrA  = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuAdd / V3dQpuMul - set one half.
+;
+;  `magic` is 1 for a hardware unit and 0 for the register file. The
+;  muxes are ignored for operands the operation does not take; the
+;  packer substitutes the fixed values, so a caller writing EIDX may
+;  pass anything.
+; ----------------------------------------------------------------------
+Procedure V3dQpuAdd(op.i, waddr.i, magic.i, muxA.i, muxB.i)
+  v3dq_addOp    = op
+  v3dq_addWaddr = waddr
+  v3dq_addMagic = magic
+  v3dq_addMuxA  = muxA
+  v3dq_addMuxB  = muxB
+EndProcedure
+
+Procedure V3dQpuMul(op.i, waddr.i, magic.i, muxA.i, muxB.i)
+  v3dq_mulOp    = op
+  v3dq_mulWaddr = waddr
+  v3dq_mulMagic = magic
+  v3dq_mulMuxA  = muxA
+  v3dq_mulMuxB  = muxB
+EndProcedure
+
+Procedure V3dQpuAddPacking(pack.i, unpackA.i, unpackB.i)
+  v3dq_addPack    = pack
+  v3dq_addUnpackA = unpackA
+  v3dq_addUnpackB = unpackB
+EndProcedure
+
+Procedure V3dQpuMulPacking(pack.i, unpackA.i, unpackB.i)
+  v3dq_mulPack    = pack
+  v3dq_mulUnpackA = unpackA
+  v3dq_mulUnpackB = unpackB
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuRaddr - the two register-file addresses this instruction may
+;  read, reached through mux 6 and mux 7.
+; ----------------------------------------------------------------------
+Procedure V3dQpuRaddr(a.i, b.i)
+  v3dq_raddrA = a
+  v3dq_raddrB = b
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuSig - the signals, as an OR of #V3DQ_SIG_*.
+;
+;  Refuses LDVPM by name. See coverage note 7: it has a bit in Mesa's
+;  structure and no row in the 4.2 table, so failing it in
+;  v3dq_SigPack() would report "no such combination" and send the
+;  reader looking for a combination problem that is not there.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuSig(mask.i)
+  If (mask & #V3DQ_SIG_LDVPM) <> 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_SIG_LDVPM)
+  EndIf
+  v3dq_sig = mask
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuSigAddr - where a loading signal puts its result.
+;
+;  LDUNIFRF, LDUNIFARF, LDTMU, LDVARY, LDTLB and LDTLBU each deliver a
+;  value, and the destination is written into the CONDITION field:
+;  bits 52:46 become (magic << 6) | waddr (qpu_pack.c:2449-2451). That
+;  is why an instruction with one of those signals may not also carry
+;  a condition, and why V3dQpuPack() refuses the pair rather than
+;  overwriting one with the other.
+; ----------------------------------------------------------------------
+Procedure V3dQpuSigAddr(waddr.i, magic.i)
+  v3dq_sigAddr  = waddr
+  v3dq_sigMagic = magic
+EndProcedure
+
+Procedure V3dQpuFlags(ac.i, mc.i, apf.i, mpf.i, auf.i, muf.i)
+  v3dq_ac  = ac
+  v3dq_mc  = mc
+  v3dq_apf = apf
+  v3dq_mpf = mpf
+  v3dq_auf = auf
+  v3dq_muf = muf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuSmallImm - put a constant on mux 7.
+;
+;  Sets RADDR_B to the table index and adds the SMIMM signal. It
+;  REFUSES if RADDR_B already holds a register address, because those
+;  are two different meanings for one field and silently taking the
+;  second would produce an instruction that reads a register the
+;  caller never named.
+;
+;  It does NOT set any mux to 7. The caller decides which operand is
+;  the immediate, and an instruction may feed it to both halves.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuSmallImm(value.i)
+  Protected idx.i
+
+  If v3dq_raddrB <> 0
+    If v3dq_raddrBIsImm = 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_SMIMM_CLASH)
+    EndIf
+  EndIf
+
+  idx = v3dq_SmallImmIndex(value)
+  If idx < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_SMALLIMM)
+  EndIf
+
+  v3dq_raddrB      = idx
+  v3dq_raddrBIsImm = 1
+  v3dq_sig         = v3dq_sig | #V3DQ_SIG_SMIMM
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuBranchSet - fill in the branch form.
+;
+;  `offset` is a BYTE offset and it is the caller's arithmetic. For a
+;  relative branch py-videocore6 computes (target_index - this_index -
+;  4) * 8 (assembler.py:1106); the -4 is the two delay slots plus the
+;  pipeline's own two, and it is a property of the machine rather
+;  than of the assembler, so a caller here needs the same -4.
+;
+;  `ub` and `bdu` are the uniform-stream branch. `setLink` is the bit
+;  Mesa does not know about; see #V3DQ_BR_SET_LINK.
+; ----------------------------------------------------------------------
+Procedure V3dQpuBranchSet(cond.i, msfign.i, bdi.i, ub.i, bdu.i, setLink.i, offset.i, raddrA.i)
+  v3dq_type      = #V3DQ_TYPE_BRANCH
+  v3dq_brCond    = cond
+  v3dq_brMsfign  = msfign
+  v3dq_brBdi     = bdi
+  v3dq_brUb      = ub
+  v3dq_brBdu     = bdu
+  v3dq_brSetLink = setLink
+  v3dq_brOffset  = offset
+  v3dq_brRaddrA  = raddrA
+EndProcedure
+
+; ======================================================================
+;  THE PACKER
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  v3dq_PackAdd - v3d42_qpu_add_pack, qpu_pack.c:1548-1766.
+;
+;  Writes into v3dq_hi / v3dq_lo, which the caller has zeroed.
+;  Returns #V3DQ_OK or a refusal.
+;
+;  THE OPERAND SWAP FOR THE COMMUTATIVE FLOAT OPERATIONS (:1638-1655)
+;  IS NOT AN OPTIMISATION AND MUST NOT BE SKIPPED. FADD and FADDNF
+;  share opcodes 0-47, and FMIN and FMAX share 128-175. THE ONLY THING
+;  THAT DISTINGUISHES THEM IN THE ENCODING IS WHICH OPERAND CAME
+;  FIRST. So the packer computes an ordering key from (unpack, mux) of
+;  each side and swaps the two operands when the key is on the wrong
+;  side of the comparison. Encode FADD without it and you have written
+;  FADDNF half the time, and the result differs only in which NaN
+;  propagates - the kind of wrong that shows up in one pixel of one
+;  frame six months later.
+;
+;  py-videocore6 does the same swap, from the same reasoning, at
+;  assembler.py:697-700. Two independent readings agreeing on
+;  something this strange is the single best piece of evidence this
+;  file has that it is right.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_PackAdd()
+  Protected op.i
+  Protected waddr.i
+  Protected muxA.i
+  Protected muxB.i
+  Protected nsrc.i
+  Protected opcode.i
+  Protected outPack.i
+  Protected aUnp.i
+  Protected bUnp.i
+  Protected tmp.i
+  Protected ordering.i
+  Protected magicOk.i
+  Protected forceMa.i
+  Protected stw.i
+
+  op    = v3dq_addOp
+  waddr = v3dq_addWaddr
+  muxA  = v3dq_addMuxA
+  muxB  = v3dq_addMuxB
+
+  opcode = v3dq_AddOpcode(op)
+  If opcode < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_ADD_OP)
+  EndIf
+
+  nsrc = v3dq_AddNumSrc(op)
+  ; :1569-1573. An unused operand's mux carries the opcode.
+  If nsrc < 2
+    muxB = v3dq_AddMuxBFixed(op)
+  EndIf
+  If nsrc < 1
+    muxA = v3dq_AddMuxAFixed(op)
+  EndIf
+
+  If waddr < 0 Or waddr > 63
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  If muxA < 0 Or muxA > 7
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  If muxB < 0 Or muxB > 7
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+
+  magicOk = 1
+  forceMa = 0
+
+  ; ------------------------------------------------------------------
+  ;  THE VPM DESTINATION RULES, :1577-1607. This switch runs BEFORE
+  ;  the packing switch in Mesa and it runs before it here, because
+  ;  it rewrites `waddr` and the packing switch never touches waddr.
+  ;
+  ;  THE CALLER'S WADDR IS STILL RANGE-CHECKED ABOVE, on purpose. For
+  ;  an STVPM the value is discarded a line later, so a caller who
+  ;  passed 999 has made a mistake that Mesa would silently absorb
+  ;  and that this file names.
+  ; ------------------------------------------------------------------
+  stw = v3dq_AddStvpmWaddr(op)
+  If stw >= 0
+    waddr   = stw
+    magicOk = 0
+  EndIf
+  If v3dq_AddIsLdvpm(op) = 1
+    ; :1595 and :1601, `assert(!instr->alu.add.magic_write)` on both
+    ; arms. An assertion in Mesa is a refusal here: bit 44 means
+    ; IN-versus-OUT for these seven operations and a caller who asked
+    ; for a magic destination asked for a different instruction.
+    If v3dq_addMagic <> 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_VPM_DEST)
+    EndIf
+    If v3dq_AddIsLdvpmOut(op) = 1
+      forceMa = 1
+    EndIf
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  The per-operation packing rules, :1609-1756. Every arm that this
+  ;  file does not implement was refused by v3dq_AddOpcode() already.
+  ; ------------------------------------------------------------------
+  If op = #V3DQ_A_VFPACK
+    ; :1663-1688. TWO f32 INPUT UNPACKS AND NO OUTPUT PACK, and ABS
+    ; is refused on both operands before either is converted.
+    ;
+    ; MESA IGNORES output_pack HERE AND THIS FILE REFUSES IT. There is
+    ; nowhere in the encoding to put one - bits 5:4 of the opcode are
+    ; part of VFPACK's own identity, not a pack field - so Mesa's
+    ; silence means a caller who asked for one gets an instruction
+    ; that does something else. Rule 3 of this project: a refusal
+    ; beats a silent drop. py-videocore6 also ignores it
+    ; (assembler.py:712-727 never reads dst.pack_bits), so the two
+    ; oracles agree with each other and this file is stricter than
+    ; both, which the gate records rather than papering over.
+    If v3dq_addPack <> #V3DQ_PACK_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+    EndIf
+    If v3dq_addUnpackA = #V3DQ_UNPACK_ABS
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    If v3dq_addUnpackB = #V3DQ_UNPACK_ABS
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    aUnp = v3dq_F32UnpackBits(v3dq_addUnpackA)
+    If aUnp < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    bUnp = v3dq_F32UnpackBits(v3dq_addUnpackB)
+    If bUnp < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    ; Mesa clears bits 3:2 and then bits 1:0 in two statements. One
+    ; mask here, spelled $F0 rather than as a complement for the
+    ; reason given in the round-family arm below.
+    opcode = (opcode & $F0) | (aUnp << 2) | bUnp
+
+  ElseIf v3dq_AddIsFloatPack(op) = 1
+    ; :1615-1661
+    outPack = v3dq_F32PackBits(v3dq_addPack)
+    If outPack < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+    EndIf
+    opcode = opcode | (outPack << 4)
+
+    aUnp = v3dq_F32UnpackBits(v3dq_addUnpackA)
+    If aUnp < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    bUnp = v3dq_F32UnpackBits(v3dq_addUnpackB)
+    If bUnp < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+
+    ; :1641. The ordering key. Unpack dominates mux, which is why it
+    ; is multiplied by eight - there are eight muxes.
+    ordering = 0
+    If ((aUnp * 8) + muxA) > ((bUnp * 8) + muxB)
+      ordering = 1
+    EndIf
+    ; :1642-1645. FMIN and FADD want the key FALSE, FMAX and FADDNF
+    ; want it TRUE; anything else swaps. FSUB and FCMP share this arm
+    ; and are not commutative, so neither predicate matches them and
+    ; they never swap.
+    tmp = 0
+    If v3dq_AddWantsOrderFalse(op) = 1
+      If ordering = 1
+        tmp = 1
+      EndIf
+    EndIf
+    If v3dq_AddWantsOrderTrue(op) = 1
+      If ordering = 0
+        tmp = 1
+      EndIf
+    EndIf
+    If tmp = 1
+      tmp  = aUnp
+      aUnp = bUnp
+      bUnp = tmp
+      tmp  = muxA
+      muxA = muxB
+      muxB = tmp
+    EndIf
+
+    opcode = opcode | (aUnp << 2)
+    opcode = opcode | bUnp
+
+  ElseIf v3dq_AddIsRoundFamily(op) = 1
+    ; :1690-1713. The OUTPUT PACK GOES IN THE MUX_B FIELD here,
+    ; because these operations occupy a three-wide b_mask range and
+    ; the two spare values are the pack. That is why they are listed
+    ; in the table with OP_RANGE(0,2) rather than a single value.
+    outPack = v3dq_F32PackBits(v3dq_addPack)
+    If outPack < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+    EndIf
+    muxB = muxB | outPack
+
+    aUnp = v3dq_F32UnpackBits(v3dq_addUnpackA)
+    If aUnp < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    ; :1709-1710. ZERO IS REFUSED, and zero is ABS. These six
+    ; operations cannot take the absolute value of their input; the
+    ; encoding has nowhere to say it.
+    If aUnp = 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    ; Mesa writes `opcode & ~(0x3 << 2)`. The complement is spelled
+    ; out as $F3 because unary ~ IS REFUSED ON THE ARM BACKENDS
+    ; (Help/_langref.txt, the operator table: "~ on the 8-bit targets
+    ; only - ARM refuses it, write x ! -1"). An opcode here is at
+    ; most 252, so eight bits of mask is the whole value, and
+    ; `x ! -1` would have been a 64-bit complement needing its own
+    ; mask afterwards.
+    opcode = (opcode & $F3) | (aUnp << 2)
+
+  ElseIf v3dq_AddIsFtoiFamily(op) = 1
+    ; :1715-1732. No output pack at all - the result is an integer.
+    If v3dq_addPack <> #V3DQ_PACK_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+    EndIf
+    aUnp = v3dq_F32UnpackBits(v3dq_addUnpackA)
+    If aUnp < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    If aUnp = 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+    EndIf
+    opcode = opcode | (aUnp << 2)
+
+  Else
+    ; :1748-1755. Everything else takes no pack and no unpack, and
+    ; asking for one is a refusal rather than a silent drop. NOP is
+    ; exempt because a NOP's pack fields are meaningless and Mesa
+    ; lets a caller leave junk in them.
+    If op <> #V3DQ_A_NOP
+      If v3dq_addPack <> #V3DQ_PACK_NONE
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+      EndIf
+      If v3dq_addUnpackA <> #V3DQ_UNPACK_NONE
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+      EndIf
+      If v3dq_addUnpackB <> #V3DQ_UNPACK_NONE
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+      EndIf
+    EndIf
+  EndIf
+
+  ; :1758-1763.
+  v3dq_lo = v3dq_lo | (muxA << #V3DQ_ADD_A_SHIFT)
+  v3dq_lo = v3dq_lo | (muxB << #V3DQ_ADD_B_SHIFT)
+  v3dq_lo = v3dq_lo | ((opcode & #V3DQ_OP_ADD_MASK) << #V3DQ_OP_ADD_SHIFT)
+  v3dq_hi = v3dq_hi | ((waddr & #V3DQ_WADDR_A_MASK) << #V3DQ_WADDR_A_SHIFT_HI)
+  ; :1602 and :1619 - the _OUT forms set MA as a SELECTOR, and they
+  ; reach here with v3dq_addMagic proven zero, so the two writes of
+  ; bit 44 can never both fire.
+  If forceMa = 1
+    v3dq_hi = v3dq_hi | #V3DQ_MA_HI
+  EndIf
+  ; :1762-1763 - `if (magic_write && !no_magic_write)`.
+  If v3dq_addMagic <> 0
+    If magicOk = 1
+      v3dq_hi = v3dq_hi | #V3DQ_MA_HI
+    EndIf
+  EndIf
+
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3dq_PackMul - v3d42_qpu_mul_pack, qpu_pack.c:2039-2154.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_PackMul()
+  Protected op.i
+  Protected muxA.i
+  Protected muxB.i
+  Protected nsrc.i
+  Protected opcode.i
+  Protected packed.i
+
+  op   = v3dq_mulOp
+  muxA = v3dq_mulMuxA
+  muxB = v3dq_mulMuxB
+
+  opcode = v3dq_MulOpcode(op)
+  If opcode < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_MUL_OP)
+  EndIf
+
+  nsrc = v3dq_MulNumSrc(op)
+  If nsrc < 2
+    muxB = v3dq_MulMuxBFixed(op)
+  EndIf
+  If nsrc < 1
+    muxA = v3dq_MulMuxAFixed(op)
+  EndIf
+
+  If v3dq_mulWaddr < 0 Or v3dq_mulWaddr > 63
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  If muxA < 0 Or muxA > 7
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  If muxB < 0 Or muxB > 7
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+
+  Select op
+    Case #V3DQ_M_FMUL
+      ; :2067-2093. The output pack is ADDED rather than ORed, with
+      ; the comment "No need for a +1 because desc->opcode_first has
+      ; a 1 in this field" - opcode_first is 16, which is 1 in the
+      ; bit-4 position, so pack 0 means 16 and pack 1 means 32.
+      packed = v3dq_F32PackBits(v3dq_mulPack)
+      If packed < 0
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+      EndIf
+      opcode = opcode + (packed << 4)
+
+      packed = v3dq_F32UnpackBits(v3dq_mulUnpackA)
+      If packed < 0
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+      EndIf
+      opcode = opcode | (packed << 2)
+
+      packed = v3dq_F32UnpackBits(v3dq_mulUnpackB)
+      If packed < 0
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+      EndIf
+      opcode = opcode | packed
+
+    Case #V3DQ_M_FMOV
+      ; :2095-2112. The pack is SPLIT: its high bit lands in the
+      ; opcode's bit 0 and its low bit in mux_b's bit 2, with the
+      ; unpack in mux_b's low two bits. This is the strangest field
+      ; in the instruction and it is transcribed rather than
+      ; reasoned about.
+      packed = v3dq_F32PackBits(v3dq_mulPack)
+      If packed < 0
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+      EndIf
+      opcode = opcode | ((packed >> 1) & 1)
+      muxB   = (packed & 1) << 2
+
+      packed = v3dq_F32UnpackBits(v3dq_mulUnpackA)
+      If packed < 0
+        ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+      EndIf
+      muxB = muxB | packed
+
+    Default
+      ; :2135-2142, the same rule as the ADD side's default.
+      If op <> #V3DQ_M_NOP
+        If v3dq_mulPack <> #V3DQ_PACK_NONE
+          ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+        EndIf
+        If v3dq_mulUnpackA <> #V3DQ_UNPACK_NONE
+          ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+        EndIf
+        If v3dq_mulUnpackB <> #V3DQ_UNPACK_NONE
+          ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+        EndIf
+      EndIf
+  EndSelect
+
+  ; :2145-2151.
+  v3dq_lo = v3dq_lo | (muxA << #V3DQ_MUL_A_SHIFT)
+  v3dq_lo = v3dq_lo | (muxB << #V3DQ_MUL_B_SHIFT)
+  v3dq_hi = v3dq_hi | ((opcode & #V3DQ_OP_MUL_MASK) << #V3DQ_OP_MUL_SHIFT_HI)
+  v3dq_hi = v3dq_hi | ((v3dq_mulWaddr & #V3DQ_WADDR_M_MASK) << #V3DQ_WADDR_M_SHIFT_HI)
+  If v3dq_mulMagic <> 0
+    v3dq_hi = v3dq_hi | #V3DQ_MM_HI
+  EndIf
+
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3dq_PackBranch - v3d_qpu_instr_pack_branch, qpu_pack.c:2466-2515.
+;
+;  A branch is a different instruction format that shares the word.
+;  Its identity is SIG = 16, which puts a single 1 at bit 57 and
+;  leaves bit 56 clear; every ALU instruction has bits 57:56 in the
+;  range 0..1 of the five-bit signal field, so the pattern 0b10 at
+;  57:56 is unambiguous. py-videocore6 writes it as a literal
+;  `0b10 << 56` (assembler.py:1113) rather than as a signal, which is
+;  the same bits from the other direction.
+;
+;  THE OFFSET IS SPLIT BY THE HARDWARE, not by convenience: bits 23:3
+;  of the byte offset go to instruction bits 55:35, and bits 31:24 go
+;  to instruction bits 31:24. The low three bits are dropped because
+;  an instruction is eight bytes and a branch cannot land between two.
+;  Mesa masks with ~0xff000000 and shifts by 3 (:2497-2499) - note
+;  that this DISCARDS bits 26:24 of the offset from the low field and
+;  re-supplies bits 31:24 through the high field, so the offset really
+;  is 32 bits wide with a three-bit hole at the bottom.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_PackBranch()
+  Protected off.i
+  Protected addrLow.i
+  Protected addrHigh.i
+
+  If v3dq_brCond < 0 Or v3dq_brCond > 6
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_BRANCH)
+  EndIf
+  If v3dq_brMsfign < 0 Or v3dq_brMsfign > 2
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_BRANCH)
+  EndIf
+  If v3dq_brBdi < 0 Or v3dq_brBdi > 3
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_BRANCH)
+  EndIf
+  If v3dq_brBdu < 0 Or v3dq_brBdu > 3
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_BRANCH)
+  EndIf
+  If v3dq_brRaddrA < 0 Or v3dq_brRaddrA > 63
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_BRANCH)
+  EndIf
+
+  ; :2471. SIG = 16.
+  v3dq_hi = v3dq_hi | (16 << #V3DQ_SIG_SHIFT_HI)
+
+  ; :2473-2477. ALWAYS is zero and everything else is 2 + ordinal,
+  ; leaving encoded value 1 unused. See the note at #V3DQ_BR_ALWAYS.
+  If v3dq_brCond <> #V3DQ_BR_ALWAYS
+    v3dq_hi = v3dq_hi | (((2 + (v3dq_brCond - #V3DQ_BR_A0)) & #V3DQ_BR_COND_MASK) << #V3DQ_BR_COND_SHIFT_HI)
+  EndIf
+
+  ; :2479-2480, and again at :2494-2495 inside the destination switch.
+  ; Mesa writes MSFIGN twice; the second write is a no-op because the
+  ; value is the same and the field is ORed into a zeroed word.
+  ; Transcribed once, and this comment is why.
+  v3dq_lo = v3dq_lo | ((v3dq_brMsfign & #V3DQ_BR_MSFIGN_MASK) << #V3DQ_BR_MSFIGN_SHIFT)
+
+  ; :2482-2483.
+  v3dq_lo = v3dq_lo | ((v3dq_brBdi & #V3DQ_BR_BDI_MASK) << #V3DQ_BR_BDI_SHIFT)
+
+  ; :2485-2489. MESA WRITES BDU ONLY WHEN UB IS SET AND
+  ; PY-VIDEOCORE6 ALWAYS WRITES IT, DEFAULTING TO 1
+  ; (assembler.py:1075 sets self.bdu = 1 in the constructor and
+  ; :1121 packs it unconditionally). The two disagree, and they have
+  ; never noticed because both write zero to UB by default and the
+  ; hardware ignores BDU when UB is clear.
+  ;
+  ; THIS FILE WRITES WHAT THE CALLER ASKED FOR, ALWAYS. That is a
+  ; deliberate third choice and it is the only one that lets the gate
+  ; demonstrate the disagreement rather than paper over it: with
+  ; bdu = 1 the two encoders agree bit for bit, and with bdu = 0 they
+  ; differ in exactly bits 17:15 and the gate says so by name.
+  ; a64_v3d_qpu_check.py's BRANCH BDU section is that test.
+  v3dq_lo = v3dq_lo | ((v3dq_brBdu & #V3DQ_BR_BDU_MASK) << #V3DQ_BR_BDU_SHIFT)
+  If v3dq_brUb <> 0
+    v3dq_lo = v3dq_lo | #V3DQ_BR_UB
+  EndIf
+
+  ; Bit 23, which Mesa does not have. See #V3DQ_BR_SET_LINK.
+  If v3dq_brSetLink <> 0
+    v3dq_lo = v3dq_lo | #V3DQ_BR_SET_LINK
+  EndIf
+
+  ; :2491-2503. Only an absolute or relative destination carries an
+  ; offset; a link-register or register-file destination reads the
+  ; address from elsewhere and the field stays zero.
+  If v3dq_brBdi = #V3DQ_BDEST_ABS Or v3dq_brBdi = #V3DQ_BDEST_REL
+    off      = v3dq_brOffset & $FFFFFFFF
+    addrLow  = (off & $00FFFFFF) >> 3
+    addrHigh = (off >> 24) & $FF
+    v3dq_hi  = v3dq_hi | ((addrLow & #V3DQ_BR_ADDR_LOW_MASK) << #V3DQ_BR_ADDR_LOW_SHIFT_HI)
+    v3dq_lo  = v3dq_lo | (addrHigh << #V3DQ_BR_ADDR_HIGH_SHIFT)
+  EndIf
+
+  ; :2508-2512. RADDR_A is read when either destination is a
+  ; register-file address. Note the Or is on the two separate
+  ; comparisons, not on the two values.
+  If v3dq_brBdi = #V3DQ_BDEST_REGFILE Or v3dq_brBdu = #V3DQ_BDEST_REGFILE
+    v3dq_lo = v3dq_lo | ((v3dq_brRaddrA & #V3DQ_RADDR_MASK) << #V3DQ_RADDR_A_SHIFT)
+  EndIf
+
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuPack - assemble the pending instruction into v3dq_hi/v3dq_lo.
+;  v3d_qpu_instr_pack and _alu, qpu_pack.c:2413-2532.
+;
+;  Does NOT emit and does NOT check hazards. A caller wanting one
+;  instruction's bits - the gate does - uses this; a caller building a
+;  program uses V3dQpuEmit(), which calls this.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuPack()
+  Protected sigCode.i
+  Protected flags.i
+  Protected r.i
+
+  v3dq_hi = 0
+  v3dq_lo = 0
+
+  If v3dq_type = #V3DQ_TYPE_BRANCH
+    ProcedureReturn v3dq_PackBranch()
+  EndIf
+
+  ; :2419-2421.
+  sigCode = v3dq_SigPack(v3dq_sig)
+  If sigCode < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_SIG)
+  EndIf
+  v3dq_hi = v3dq_hi | ((sigCode & #V3DQ_SIG_MASK) << #V3DQ_SIG_SHIFT_HI)
+
+  ; :2429-2430. On 4.2 the two register-file read addresses are
+  ; instruction-wide rather than per-operand; that is the single
+  ; biggest difference from 7.1 and the reason this file is 4.2-only.
+  If v3dq_raddrA < 0 Or v3dq_raddrA > 63
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  If v3dq_raddrB < 0 Or v3dq_raddrB > 63
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  v3dq_lo = v3dq_lo | (v3dq_raddrA << #V3DQ_RADDR_A_SHIFT)
+  v3dq_lo = v3dq_lo | (v3dq_raddrB << #V3DQ_RADDR_B_SHIFT)
+
+  r = v3dq_PackAdd()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  r = v3dq_PackMul()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; :2438-2457. Either the signal owns the condition field or the
+  ; flags do, and never both.
+  If (v3dq_sig & #V3DQ_SIG_WRITES_ADDR) <> 0
+    If v3dq_ac <> #V3DQ_COND_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS_SIG)
+    EndIf
+    If v3dq_mc <> #V3DQ_COND_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS_SIG)
+    EndIf
+    If v3dq_apf <> #V3DQ_PF_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS_SIG)
+    EndIf
+    If v3dq_mpf <> #V3DQ_PF_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS_SIG)
+    EndIf
+    If v3dq_auf <> #V3DQ_UF_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS_SIG)
+    EndIf
+    If v3dq_muf <> #V3DQ_UF_NONE
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS_SIG)
+    EndIf
+    If v3dq_sigAddr < 0 Or v3dq_sigAddr > 63
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+    EndIf
+    flags = v3dq_sigAddr
+    If v3dq_sigMagic <> 0
+      flags = flags | #V3DQ_COND_SIG_MAGIC
+    EndIf
+  Else
+    flags = v3dq_FlagsPack()
+    If flags < 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_FLAGS)
+    EndIf
+  EndIf
+
+  v3dq_hi = v3dq_hi | ((flags & #V3DQ_COND_MASK) << #V3DQ_COND_SHIFT_HI)
+
+  v3dq_err = #V3DQ_OK
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ======================================================================
+;  THE HAZARD CHECKER
+; ======================================================================
+;
+;  qpu_validate.c, "Checks for the instruction restrictions from page
+;  37 ('Summary of Instruction Restrictions')" - its own words at
+;  :404-407.
+;
+;  WHAT IS CHECKED, all of it on 4.2 terms and all of it for a
+;  STRAIGHT-LINE program, which is what this file can see:
+;
+;    H1  Only one of [TMU write, SFU write, TSY write, TLB write,
+;        VPM write, LDTMU, LDTLB, LDTLBU, LDVPM] per instruction.
+;        :285-297.
+;    H2  No SFU write within two instructions of an SFU write, and no
+;        read or write of r4 in that window. :263-277.
+;    H3  THRSW not within three instructions of another THRSW, and not
+;        in a branch delay slot. :302-325.
+;    H4  No register-file write in the two instructions after the
+;        last THRSW - the thread-end delay slots. :327-373. On 4.2
+;        this covers the ADD half, the MUL half AND a loading
+;        signal's destination.
+;    H5  No branch in a branch delay slot or a THRSW delay slot.
+;        :385-391.
+;    H6  No LDUNIF or LDUNIFA immediately after an LDVARY. :180-185.
+;    H7  A program must contain a last-THRSW. Checked at
+;        V3dQpuProgramEnd(), :430-436.
+;
+;  WHAT IS NOT CHECKED, AND WHY EACH
+;
+;    N1  "GFXH-1625: No TMUWT in the last instruction", :375-378. The
+;        condition Mesa writes is
+;            state->thrend_found && last_thrsw_ip - ip == 2
+;        and thrend_found only becomes true AT the last THRSW, so
+;        last_thrsw_ip - ip == 2 selects an instruction two BEFORE
+;        the flag was set - which cannot happen in a forward scan.
+;        Transcribed faithfully the check can never fire. Guessing
+;        that the intent was ip - last_thrsw_ip == 2 would be
+;        inventing a hardware rule out of a suspected typo, and this
+;        project does not do that. THE RULE IS REAL AND IS NOT
+;        ENFORCED HERE; a program ending in TMUWT gets no warning.
+;    N2  The TLB Z-write ordering rules, :122-155. They need to know
+;        which write was a depth write, which is shader semantics
+;        this file has no notion of.
+;    N3  The MULTOP/UMUL24 rtop hazard, :135-143 and :380-383. It
+;        needs the same cross-instruction dataflow and neither
+;        operation is reachable from anything this bring-up builds.
+;    N4  Anything about branches' TARGETS. This file sees a byte
+;        offset, not a control flow graph, so "the delay slots at the
+;        destination" is not a question it can ask.
+;    N5  The small-immediate a/c/d rules, :157-176. On 4.2 those
+;        three signals do not exist and this file cannot set them, so
+;        the check would be checking a thing that cannot happen. Said
+;        here rather than silently omitted.
+;
+;  AND THE HONEST HEADLINE: A HAZARD CHECKER IS NOT A CORRECTNESS
+;  PROOF. Passing means the sequence breaks none of the seven rules
+;  above. It does not mean the program computes anything.
+; ----------------------------------------------------------------------
+#V3DQ_HZ_NONE       = 0
+#V3DQ_HZ_UNITS      = 1  ; H1
+#V3DQ_HZ_SFU_SFU    = 2  ; H2
+#V3DQ_HZ_SFU_R4     = 3  ; H2
+#V3DQ_HZ_THRSW_NEAR = 4  ; H3
+#V3DQ_HZ_THRSW_BR   = 5  ; H3
+#V3DQ_HZ_RF_THREND  = 6  ; H4
+#V3DQ_HZ_BR_BR      = 7  ; H5
+#V3DQ_HZ_BR_THRSW   = 8  ; H5
+#V3DQ_HZ_UNIF_VARY  = 9  ; H6
+#V3DQ_HZ_NO_THREND  = 10 ; H7
+#V3DQ_HZ_TWO_LAST   = 11 ; H3, "Two last-THRSW signals", :313
+
+; Which magic write addresses belong to which unit. qpu_instr.c's
+; v3d_qpu_magic_waddr_is_tmu / _sfu / _vpm / _tlb / _tsy, transcribed
+; as ranges because that is what they are.
+Procedure.i v3dq_WaddrIsTmu(w.i)
+  If w >= #V3DQ_WADDR_TMUL And w <= #V3DQ_WADDR_TMUAU
+    ProcedureReturn 1
+  EndIf
+  If w >= #V3DQ_WADDR_TMUC And w <= #V3DQ_WADDR_TMUHSLOD
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_WaddrIsSfu(w.i)
+  If w >= #V3DQ_WADDR_RECIP And w <= #V3DQ_WADDR_RSQRT2
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_WaddrIsVpm(w.i)
+  If w = #V3DQ_WADDR_VPM Or w = #V3DQ_WADDR_VPMU
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_WaddrIsTlb(w.i)
+  If w = #V3DQ_WADDR_TLB Or w = #V3DQ_WADDR_TLBU
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i v3dq_WaddrIsTsy(w.i)
+  If w >= #V3DQ_WADDR_SYNC And w <= #V3DQ_WADDR_SYNCB
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Does the pending instruction read or write accumulator r4? r4 is
+; mux 4 as a source and waddr 4 as a magic destination.
+Procedure.i v3dq_TouchesR4()
+  If v3dq_AddNumSrc(v3dq_addOp) > 0
+    If v3dq_addMuxA = #V3DQ_MUX_R4
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If v3dq_AddNumSrc(v3dq_addOp) > 1
+    If v3dq_addMuxB = #V3DQ_MUX_R4
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If v3dq_MulNumSrc(v3dq_mulOp) > 0
+    If v3dq_mulMuxA = #V3DQ_MUX_R4
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If v3dq_MulNumSrc(v3dq_mulOp) > 1
+    If v3dq_mulMuxB = #V3DQ_MUX_R4
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If v3dq_addOp <> #V3DQ_A_NOP
+    If v3dq_addMagic <> 0
+      If v3dq_addWaddr = #V3DQ_WADDR_R4
+        ProcedureReturn 1
+      EndIf
+    EndIf
+  EndIf
+  If v3dq_mulOp <> #V3DQ_M_NOP
+    If v3dq_mulMagic <> 0
+      If v3dq_mulWaddr = #V3DQ_WADDR_R4
+        ProcedureReturn 1
+      EndIf
+    EndIf
+  EndIf
+  ; A loading signal can also land in r4 - LDTMU's classic
+  ; destination. qpu_instr.c:906-909.
+  If (v3dq_sig & #V3DQ_SIG_WRITES_ADDR) <> 0
+    If v3dq_sigMagic <> 0
+      If v3dq_sigAddr = #V3DQ_WADDR_R4
+        ProcedureReturn 1
+      EndIf
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3dq_Hazard - the seven online rules, in Mesa's order.
+;  Returns 0 for clean, or a #V3DQ_HZ_* code, and leaves the code in
+;  v3dq_hazardName so a diagnostic can name it after the fact.
+; ----------------------------------------------------------------------
+Procedure.i v3dq_Hazard()
+  Protected tmu.i
+  Protected sfu.i
+  Protected vpm.i
+  Protected tlb.i
+  Protected tsy.i
+  Protected units.i
+  Protected inBranchSlots.i
+  Protected inThrswSlots.i
+
+  v3dq_hazardName = #V3DQ_HZ_NONE
+
+  inBranchSlots = 0
+  If (v3dq_ip - v3dq_lastBranchIp) < 3
+    inBranchSlots = 1
+  EndIf
+  inThrswSlots = 0
+  If (v3dq_ip - v3dq_lastThrswIp) < 3
+    inThrswSlots = 1
+  EndIf
+
+  ; ---- H5, branches. qpu_validate.c:385-391. -----------------------
+  If v3dq_type = #V3DQ_TYPE_BRANCH
+    If inBranchSlots = 1
+      v3dq_hazardName = #V3DQ_HZ_BR_BR
+      ProcedureReturn #V3DQ_HZ_BR_BR
+    EndIf
+    If inThrswSlots = 1
+      v3dq_hazardName = #V3DQ_HZ_BR_THRSW
+      ProcedureReturn #V3DQ_HZ_BR_THRSW
+    EndIf
+    ProcedureReturn #V3DQ_HZ_NONE
+  EndIf
+
+  ; ---- H6, LDUNIF after LDVARY. :180-185. --------------------------
+  If v3dq_prevLdvary = 1
+    If (v3dq_sig & #V3DQ_SIG_LDUNIF) <> 0
+      v3dq_hazardName = #V3DQ_HZ_UNIF_VARY
+      ProcedureReturn #V3DQ_HZ_UNIF_VARY
+    EndIf
+    If (v3dq_sig & #V3DQ_SIG_LDUNIFA) <> 0
+      v3dq_hazardName = #V3DQ_HZ_UNIF_VARY
+      ProcedureReturn #V3DQ_HZ_UNIF_VARY
+    EndIf
+  EndIf
+
+  ; ---- H1, one unit per instruction. :210-297. ---------------------
+  ; Mesa counts only when the half is not a NOP, because a NOP's
+  ; waddr is meaningless - and this file's NOPs carry waddr 6, which
+  ; is none of these units anyway. Both guards are kept.
+  tmu = 0 : sfu = 0 : vpm = 0 : tlb = 0 : tsy = 0
+  If v3dq_addOp <> #V3DQ_A_NOP
+    If v3dq_addMagic <> 0
+      tmu = tmu + v3dq_WaddrIsTmu(v3dq_addWaddr)
+      sfu = sfu + v3dq_WaddrIsSfu(v3dq_addWaddr)
+      vpm = vpm + v3dq_WaddrIsVpm(v3dq_addWaddr)
+      tlb = tlb + v3dq_WaddrIsTlb(v3dq_addWaddr)
+      tsy = tsy + v3dq_WaddrIsTsy(v3dq_addWaddr)
+    EndIf
+  EndIf
+  If v3dq_mulOp <> #V3DQ_M_NOP
+    If v3dq_mulMagic <> 0
+      tmu = tmu + v3dq_WaddrIsTmu(v3dq_mulWaddr)
+      sfu = sfu + v3dq_WaddrIsSfu(v3dq_mulWaddr)
+      vpm = vpm + v3dq_WaddrIsVpm(v3dq_mulWaddr)
+      tlb = tlb + v3dq_WaddrIsTlb(v3dq_mulWaddr)
+      tsy = tsy + v3dq_WaddrIsTsy(v3dq_mulWaddr)
+    EndIf
+  EndIf
+
+  units = tmu + sfu + vpm + tlb + tsy
+  ; :291-294. LDTMU counts on 4.2 and not on 7.1; this is a 4.2 file.
+  If (v3dq_sig & #V3DQ_SIG_LDTMU) <> 0
+    units = units + 1
+  EndIf
+  If (v3dq_sig & #V3DQ_SIG_LDTLB) <> 0
+    units = units + 1
+  EndIf
+  If (v3dq_sig & #V3DQ_SIG_LDTLBU) <> 0
+    units = units + 1
+  EndIf
+  If units > 1
+    v3dq_hazardName = #V3DQ_HZ_UNITS
+    ProcedureReturn #V3DQ_HZ_UNITS
+  EndIf
+
+  ; ---- H2, the SFU's two-instruction shadow. :263-277. -------------
+  If (v3dq_ip - v3dq_lastSfuWrite) < 2
+    If v3dq_TouchesR4() = 1
+      v3dq_hazardName = #V3DQ_HZ_SFU_R4
+      ProcedureReturn #V3DQ_HZ_SFU_R4
+    EndIf
+    If sfu > 0
+      v3dq_hazardName = #V3DQ_HZ_SFU_SFU
+      ProcedureReturn #V3DQ_HZ_SFU_SFU
+    EndIf
+  EndIf
+  ; :251-256. An SFU write during a THRSW's delay slots lands in the
+  ; other thread.
+  If inThrswSlots = 1
+    If sfu > 0
+      v3dq_hazardName = #V3DQ_HZ_SFU_SFU
+      ProcedureReturn #V3DQ_HZ_SFU_SFU
+    EndIf
+  EndIf
+
+  ; ---- H3, THRSW spacing. :302-325. --------------------------------
+  If (v3dq_sig & #V3DQ_SIG_THRSW) <> 0
+    If inBranchSlots = 1
+      v3dq_hazardName = #V3DQ_HZ_THRSW_BR
+      ProcedureReturn #V3DQ_HZ_THRSW_BR
+    EndIf
+    If v3dq_lastThrswIp = (v3dq_ip - 1)
+      ; Two in a row is the LAST-THRSW marker rather than a second
+      ; thread switch. A third would be a second marker.
+      If v3dq_lastThrswFound = 1
+        v3dq_hazardName = #V3DQ_HZ_TWO_LAST
+        ProcedureReturn #V3DQ_HZ_TWO_LAST
+      EndIf
+    Else
+      If inThrswSlots = 1
+        v3dq_hazardName = #V3DQ_HZ_THRSW_NEAR
+        ProcedureReturn #V3DQ_HZ_THRSW_NEAR
+      EndIf
+    EndIf
+  EndIf
+
+  ; ---- H4, no register-file write after the last THRSW. :327-373. --
+  If v3dq_threndFound = 1
+    If v3dq_addOp <> #V3DQ_A_NOP
+      If v3dq_addMagic = 0
+        v3dq_hazardName = #V3DQ_HZ_RF_THREND
+        ProcedureReturn #V3DQ_HZ_RF_THREND
+      EndIf
+    EndIf
+    If v3dq_mulOp <> #V3DQ_M_NOP
+      If v3dq_mulMagic = 0
+        v3dq_hazardName = #V3DQ_HZ_RF_THREND
+        ProcedureReturn #V3DQ_HZ_RF_THREND
+      EndIf
+    EndIf
+    If (v3dq_sig & #V3DQ_SIG_WRITES_ADDR) <> 0
+      If v3dq_sigMagic = 0
+        v3dq_hazardName = #V3DQ_HZ_RF_THREND
+        ProcedureReturn #V3DQ_HZ_RF_THREND
+      EndIf
+    EndIf
+  EndIf
+
+  ProcedureReturn #V3DQ_HZ_NONE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3dq_HazardAdvance - fold the instruction just accepted into the
+;  tracker. Separate from v3dq_Hazard() because the checks are asked
+;  BEFORE the instruction counts and the state moves AFTER, and doing
+;  both in one procedure is how an off-by-one gets in.
+; ----------------------------------------------------------------------
+Procedure v3dq_HazardAdvance()
+  Protected sfu.i
+
+  sfu = 0
+  If v3dq_type = #V3DQ_TYPE_ALU
+    If v3dq_addOp <> #V3DQ_A_NOP
+      If v3dq_addMagic <> 0
+        sfu = sfu + v3dq_WaddrIsSfu(v3dq_addWaddr)
+      EndIf
+    EndIf
+    If v3dq_mulOp <> #V3DQ_M_NOP
+      If v3dq_mulMagic <> 0
+        sfu = sfu + v3dq_WaddrIsSfu(v3dq_mulWaddr)
+      EndIf
+    EndIf
+  EndIf
+  If sfu > 0
+    v3dq_lastSfuWrite = v3dq_ip
+  EndIf
+
+  If v3dq_type = #V3DQ_TYPE_BRANCH
+    v3dq_lastBranchIp = v3dq_ip
+    v3dq_prevLdvary   = 0
+  Else
+    If (v3dq_sig & #V3DQ_SIG_THRSW) <> 0
+      If v3dq_lastThrswFound = 1
+        v3dq_threndFound = 1
+      EndIf
+      If v3dq_lastThrswIp = (v3dq_ip - 1)
+        v3dq_lastThrswFound = 1
+        ; :309-311. Mesa sets thrend_found when a THRSW arrives with
+        ; last_thrsw_found already set. The pair that MAKES the
+        ; marker is itself the end, so the flag is set here too -
+        ; otherwise the two instructions after the pair are not
+        ; protected and H4 never fires on the program shape every
+        ; real shader has.
+        v3dq_threndFound = 1
+      Else
+        v3dq_thrswCount   = v3dq_thrswCount + 1
+        v3dq_lastThrswIp  = v3dq_ip
+      EndIf
+    EndIf
+    If (v3dq_sig & #V3DQ_SIG_LDVARY) <> 0
+      v3dq_prevLdvary = 1
+    Else
+      v3dq_prevLdvary = 0
+    EndIf
+  EndIf
+
+  v3dq_ip = v3dq_ip + 1
+EndProcedure
+
+; ======================================================================
+;  THE PROGRAM BUFFER
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  V3dQpuProgramBegin - point the emitter at `bytes` of memory.
+;
+;  EIGHT-BYTE ALIGNMENT IS REQUIRED AND IS CHECKED. An instruction is
+;  eight bytes and the CSD's shader address field has its low bits
+;  taken by PROPAGATE_NANS, SINGLE_SEG and THREADING (v3d_csd.h:38-40),
+;  so a misaligned program address does not merely run slowly - three
+;  of its bits mean something else. Refusing here rather than at
+;  submission puts the complaint next to the mistake.
+; ----------------------------------------------------------------------
+;  `singleSeg` IS MESA'S `.last_thrsw_found = !c->last_thrsw`,
+;  qpu_validate.c:430, AND IT IS NOT A CONVENIENCE.
+;
+;  A shader that never switches threads is SPAWNED ALREADY IN THE
+;  FINAL THREAD SECTION - nir_to_vir.c:4886-4890, "For V3D 4.x, we can
+;  spawn the non-fragment shaders already in the post-last-THRSW
+;  state, so we can skip this" - and its shader-state record says so
+;  with "start in final thread section". Such a program contains ONE
+;  thrsw, the program end, and NOT the pair that marks a last-THRSW.
+;
+;  With singleSeg 0 the validator starts looking for that pair, and
+;  V3dQpuProgramEnd() refuses a program that never produced one. With
+;  singleSeg 1 the program is already past it, so the FIRST thrsw is
+;  the thread end and a second one immediately after it would be a
+;  duplicate marker - which v3dq_Hazard() then refuses as
+;  #V3DQ_HZ_TWO_LAST, exactly as qpu_validate.c:314-315 does.
+;
+;  SETTING THIS AND THE SHADER RECORD BIT DIFFERENTLY IS A REAL
+;  MISTAKE AND NOTHING HERE CAN CATCH IT. The bit lives in v3d.pi4's
+;  shader state record and this flag lives here; they describe the
+;  same property of the same program and the caller owns both.
+Procedure.i V3dQpuProgramBeginSeg(addr.i, bytes.i, singleSeg.i)
+  If addr = 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_NOBUF)
+  EndIf
+  If (addr % 8) <> 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+  If bytes < 8
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_FULL)
+  EndIf
+
+  v3dq_bufAddr  = addr
+  v3dq_bufBytes = bytes
+  v3dq_bufUsed  = 0
+  v3dq_count    = 0
+
+  v3dq_ip             = 0
+  v3dq_lastSfuWrite   = -10
+  v3dq_lastThrswIp    = -10
+  v3dq_lastBranchIp   = -10
+  v3dq_lastThrswFound = 0
+  If singleSeg <> 0
+    v3dq_lastThrswFound = 1
+  EndIf
+  v3dq_threndFound    = 0
+  v3dq_thrswCount     = 0
+  v3dq_prevLdvary     = 0
+  v3dq_hazardName     = #V3DQ_HZ_NONE
+  v3dq_err            = #V3DQ_OK
+
+  V3dQpuReset()
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+Procedure.i V3dQpuProgramBegin(addr.i, bytes.i)
+  ProcedureReturn V3dQpuProgramBeginSeg(addr, bytes, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuEmit - pack the pending instruction, check it against the
+;  straight-line hazard rules, and append it.
+;
+;  LITTLE-ENDIAN, LOW HALF FIRST. The QPU fetches a 64-bit word from
+;  an ARM-visible address on the same bus the CPU wrote it on, so the
+;  byte order is the machine's and the machine is little-endian.
+;  Written as two 32-bit stores rather than one 64-bit store for the
+;  reason given in the header - and because PokeN is the unsigned
+;  32-bit spelling, so neither half can be sign-extended on the way in.
+;
+;  The pending instruction is RESET afterwards. A caller who wanted to
+;  emit the same instruction twice sets it up twice; a caller who
+;  forgot to reset would otherwise emit the previous one's leftovers,
+;  and for the opcode-187 family those leftovers are a DIFFERENT
+;  OPERATION rather than a wrong operand.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuEmit()
+  Protected r.i
+  Protected h.i
+
+  If v3dq_bufAddr = 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_NOBUF)
+  EndIf
+  If (v3dq_bufUsed + 8) > v3dq_bufBytes
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_FULL)
+  EndIf
+
+  r = V3dQpuPack()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  h = v3dq_Hazard()
+  If h <> #V3DQ_HZ_NONE
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_HAZARD)
+  EndIf
+
+  PokeN(v3dq_bufAddr + v3dq_bufUsed,     v3dq_lo & $FFFFFFFF)
+  PokeN(v3dq_bufAddr + v3dq_bufUsed + 4, v3dq_hi & $FFFFFFFF)
+
+  v3dq_bufUsed = v3dq_bufUsed + 8
+  v3dq_count   = v3dq_count + 1
+
+  v3dq_HazardAdvance()
+  V3dQpuReset()
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuProgramEnd - the one whole-program rule. qpu_validate.c:435.
+;
+;  A QPU program that never signals a last-THRSW does not end; the
+;  thread stays scheduled and the dispatch never completes. On the
+;  CSD path that is a job that hangs rather than a job that returns a
+;  wrong answer, which is worse to diagnose, so it is worth a refusal
+;  at build time.
+;
+;  Returns #V3DQ_OK, or #V3DQ_ERR_HAZARD with v3dq_hazardName set to
+;  #V3DQ_HZ_NO_THREND.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuProgramEnd()
+  If v3dq_threndFound = 0
+    v3dq_hazardName = #V3DQ_HZ_NO_THREND
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_HAZARD)
+  EndIf
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; ======================================================================
+;  CONVENIENCE EMITTERS
+; ======================================================================
+;
+;  Every one is Reset, set, Emit. They exist because the alternative
+;  at every call site is four lines, and four lines repeated forty
+;  times is where a forgotten Reset lives.
+; ----------------------------------------------------------------------
+
+; A bare NOP in both halves - the delay-slot filler.
+Procedure.i V3dQpuNop()
+  V3dQpuReset()
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; A NOP carrying signals, which is how a program loads a uniform:
+; nop with LDUNIFRF and a destination.
+Procedure.i V3dQpuNopSig(sigMask.i, sigWaddr.i, sigMagic.i)
+  Protected r.i
+  V3dQpuReset()
+  r = V3dQpuSig(sigMask)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  V3dQpuSigAddr(sigWaddr, sigMagic)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; Two-source ADD, both operands from accumulators or from the two
+; register-file addresses the caller supplies.
+Procedure.i V3dQpuAdd2(op.i, waddr.i, magic.i, muxA.i, muxB.i, raddrA.i, raddrB.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, muxA, muxB)
+  V3dQpuRaddr(raddrA, raddrB)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; One-source ADD.
+Procedure.i V3dQpuAdd1(op.i, waddr.i, magic.i, muxA.i, raddrA.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, muxA, 0)
+  V3dQpuRaddr(raddrA, 0)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; Zero-source ADD - EIDX, TIDX, TMUWT, BARRIERID and the rest of the
+; opcode-187 family.
+Procedure.i V3dQpuAdd0(op.i, waddr.i, magic.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, 0, 0)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; ADD with a small immediate as the B operand.
+Procedure.i V3dQpuAddImm(op.i, waddr.i, magic.i, muxA.i, raddrA.i, imm.i)
+  Protected r.i
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, muxA, #V3DQ_MUX_B)
+  V3dQpuRaddr(raddrA, 0)
+  r = V3dQpuSmallImm(imm)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuMov - a register-to-register move.
+;
+;  THERE IS NO MOV IN THE ADD HALF ON 4.2. The MUL half has one
+;  (opcode 15, mux_b 7) and the ADD half does not - #V3DQ_A_MOV exists
+;  only from 7.1 (qpu_instr.h:232-233, in the block marked "V3D 7.x").
+;  py-videocore6 works round it by defining `mov` as
+;  bor(dst, src, src) (assembler.py:1157) - an OR of a value with
+;  itself - and offering the MUL `mov` separately.
+;
+;  This procedure uses the MUL half's real MOV, because it leaves the
+;  ADD half free for something else and because it is one operation
+;  rather than a trick. A caller who wants the ADD half's spelling
+;  writes V3dQpuAdd2(#V3DQ_A_OR, ...) with both muxes the same, and
+;  the gate checks that shape against py-videocore6's `mov` too.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuMov(waddr.i, magic.i, muxA.i, raddrA.i)
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_MOV, waddr, magic, muxA, 0)
+  V3dQpuRaddr(raddrA, 0)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; A move of a small immediate.
+Procedure.i V3dQpuMovImm(waddr.i, magic.i, imm.i)
+  Protected r.i
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_MOV, waddr, magic, #V3DQ_MUX_B, 0)
+  r = V3dQpuSmallImm(imm)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuThreadEnd - the eight instructions every program ends with.
+;
+;  py-videocore6's summation.py:130-137 ends every program with
+;  exactly this, and so does every other example in that tree:
+;
+;      nop(sig=thrsw)   <- the thread switch
+;      nop(sig=thrsw)   <- immediately again: THIS PAIR is the marker
+;      nop()               that says "last thread switch", and the
+;      nop()               two after it are its delay slots
+;      nop(sig=thrsw)   <- the program end
+;      nop()
+;      nop()
+;      nop()
+;
+;  WHY IT IS NOT SEVEN OR NINE. The first pair is the last-THRSW
+;  marker (qpu_validate.c:309-315 names it), the second and third
+;  instructions are that switch's two delay slots, and the fifth is
+;  the end signal with its own three slots. Cutting any of them
+;  leaves a thread that the dispatcher never sees finish, which on
+;  the CSD path is a hang and not a wrong answer.
+;
+;  Returns #V3DQ_OK or the first refusal.
+; ----------------------------------------------------------------------
+;  IT IS SPLIT IN TWO because a fragment shader has to put its TLB
+;  writes BETWEEN the halves. Mesa emits the last THRSW and only then
+;  emit_frag_end()'s colour writes and emit_vert_end()'s VPMWT -
+;  nir_to_vir.c:4959-4979, "Emit the last THRSW before STVPM and TLB
+;  writes" - so those writes execute in the FINAL THREAD SECTION,
+;  which is where the scoreboard lock lives. A caller that wants the
+;  plain eight-instruction tail still calls V3dQpuThreadEnd().
+Procedure.i V3dQpuLastThrsw()
+  Protected r.i
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  ProcedureReturn V3dQpuNop()
+EndProcedure
+
+;  The program end and its three delay slots. qpu_schedule.c:3052-3055
+;  emits exactly one THRSW here and :2357-2363 fills to three slots.
+Procedure.i V3dQpuProgramEndThrsw()
+  Protected r.i
+  Protected i.i
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  i = 0
+  While i < 3
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK
+      ProcedureReturn r
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+Procedure.i V3dQpuThreadEnd()
+  Protected r.i
+
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  ProcedureReturn V3dQpuProgramEndThrsw()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE VPM EMITTERS
+;
+;  V3dQpuLdvpm - one VPM load. `waddr` is a REGISTER FILE address and
+;  there is no magic parameter, because there is no legal magic
+;  destination: see v3dq_AddIsLdvpm() and #V3DQ_ERR_VPM_DEST.
+;
+;  `muxA` is where the OFFSET comes from. Mesa always passes a
+;  register holding a uniform-loaded constant -
+;  `vir_LDVPMV_IN(c, vir_uniform_ui(c, index))`, nir_to_vir.c:2826-2828
+;  - and the index is counted in 32-bit VALUES across the whole
+;  attribute set, not in attributes and not in bytes.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuLdvpm(op.i, waddr.i, muxA.i, raddrA.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, 0, muxA, 0)
+  V3dQpuRaddr(raddrA, 0)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; The gathered form takes a second operand - qpu_instr.c:459-460,
+; D | A | B - and nir_to_vir.c:3814 passes (row, col).
+Procedure.i V3dQpuLdvpmg(op.i, waddr.i, muxA.i, muxB.i, raddrA.i, raddrB.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, 0, muxA, muxB)
+  V3dQpuRaddr(raddrA, raddrB)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuStvpm - one VPM store. THERE IS NO DESTINATION ARGUMENT and
+;  that is the point: the waddr field carries the operation.
+;  `muxA` is the VPM slot index and `muxB` is the value, in that
+;  order - vir_STVPMV(c, vpm_index, val), nir_to_vir.c:2058.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuStvpm(op.i, muxA.i, muxB.i, raddrA.i, raddrB.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, 0, 0, muxA, muxB)
+  V3dQpuRaddr(raddrA, raddrB)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dQpuVfpack - pack two f32 lanes into one 2 x f16 result.
+;  vir_VFPACK_dest(c, tlb_reg, r, g), nir_to_vir.c:1931.
+;  `magic` is real here: the destination of a colour write is TLB or
+;  TLBU, which are magic write addresses 7 and 8.
+; ----------------------------------------------------------------------
+Procedure.i V3dQpuVfpack(waddr.i, magic.i, muxA.i, muxB.i, raddrA.i, raddrB.i)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VFPACK, waddr, magic, muxA, muxB)
+  V3dQpuRaddr(raddrA, raddrB)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; ======================================================================
+;  ACCESSORS - everything a diagnostic might want to print
+; ======================================================================
+Procedure.i V3dQpuHi()
+  ProcedureReturn v3dq_hi & $FFFFFFFF
+EndProcedure
+
+Procedure.i V3dQpuLo()
+  ProcedureReturn v3dq_lo & $FFFFFFFF
+EndProcedure
+
+Procedure.i V3dQpuError()
+  ProcedureReturn v3dq_err
+EndProcedure
+
+Procedure.i V3dQpuHazardName()
+  ProcedureReturn v3dq_hazardName
+EndProcedure
+
+Procedure.i V3dQpuProgramAddr()
+  ProcedureReturn v3dq_bufAddr
+EndProcedure
+
+Procedure.i V3dQpuProgramBytes()
+  ProcedureReturn v3dq_bufUsed
+EndProcedure
+
+Procedure.i V3dQpuCount()
+  ProcedureReturn v3dq_count
+EndProcedure
+
+Procedure.i V3dQpuIp()
+  ProcedureReturn v3dq_ip
+EndProcedure
+
+Procedure.i V3dQpuThrswCount()
+  ProcedureReturn v3dq_thrswCount
+EndProcedure
+
+Procedure.i V3dQpuThrendFound()
+  ProcedureReturn v3dq_threndFound
+EndProcedure

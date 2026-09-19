@@ -1,0 +1,272 @@
+; Executable emitted-code gate for net_PinApply's selection-only contract.
+; tools/net_pin_identity_emitted_check.py replaces the marker below with
+; the production procedure extracted verbatim from Anvil/Core/net_cmd.pbi.
+;
+; Hardware and address-management seams are deliberately small and visible:
+; HwLinkOpen selects an already-addressed row (or refuses), while
+; EthHasIpConfig and NetAddressBound count any forbidden address acquisition.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+
+#NET_ADDR_NONE      = 0
+#NET_ADDR_LEASE     = 1
+#NET_ADDR_SAVED     = 2
+#NET_ADDR_LINKLOCAL = 3
+
+Global gate_pin.i
+Global gate_autoChoice.i
+Global gate_selected.i
+Global gate_openAllow.i
+Global gate_openCalls.i
+Global gate_openNeedIp.i
+Global gate_ethHasCalls.i
+Global gate_boundCalls.i
+Global gate_boundKind.i
+Global gate_boundIp.i
+Global gate_boundMask.i
+Global gate_boundGw.i
+Global gate_boundSrc.i
+Global gate_linkSayCalls.i
+Global gate_rearmCalls.i
+Global gate_consoleSayCalls.i
+
+Global gEthIp.i
+Global gEthMask.i
+Global gEthGw.i
+Global gEthLlIp.i
+
+Global Dim gate_ip.i[3]
+Global Dim gate_mask.i[3]
+Global Dim gate_gw.i[3]
+Global Dim gate_src.i[3]
+Global Dim gate_lease.i[3]
+Global Dim gate_leaseAt.i[3]
+
+Procedure GateClearRows()
+  Define k.i
+  For k = 0 To 2
+    gate_ip[k] = 0
+    gate_mask[k] = 0
+    gate_gw[k] = 0
+    gate_src[k] = #NET_ADDR_NONE
+    gate_lease[k] = 0
+    gate_leaseAt[k] = 0
+  Next
+EndProcedure
+
+Procedure GateResetCalls()
+  gate_selected = #HW_LINK_NONE
+  gate_openAllow = 1
+  gate_openCalls = 0
+  gate_openNeedIp = -1
+  gate_ethHasCalls = 0
+  gate_boundCalls = 0
+  gate_boundKind = #HW_LINK_NONE
+  gate_boundIp = 0
+  gate_boundMask = 0
+  gate_boundGw = 0
+  gate_boundSrc = #NET_ADDR_NONE
+  gate_linkSayCalls = 0
+  gate_rearmCalls = 0
+  gate_consoleSayCalls = 0
+EndProcedure
+
+Procedure GateSeedLinkLocalAndLease()
+  GateClearRows()
+  gate_ip[#HW_LINK_WIRED] = $A9FE1020
+  gate_mask[#HW_LINK_WIRED] = $FFFF0000
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_LINKLOCAL
+  gate_ip[#HW_LINK_WIFI] = $C0A80177
+  gate_mask[#HW_LINK_WIFI] = $FFFFFF00
+  gate_gw[#HW_LINK_WIFI] = $C0A80101
+  gate_src[#HW_LINK_WIFI] = #NET_ADDR_LEASE
+  gate_lease[#HW_LINK_WIFI] = 3600
+  gate_leaseAt[#HW_LINK_WIFI] = 77
+  gEthLlIp = gate_ip[#HW_LINK_WIRED]
+  gEthIp = 0
+  gEthMask = 0
+  gEthGw = 0
+EndProcedure
+
+; HwLinkOpen is the hardware/policy seam. It only chooses among address rows
+; that the fixture has already established; it never creates an address.
+Procedure.i HwLinkOpen(needIp.i)
+  gate_openCalls = gate_openCalls + 1
+  gate_openNeedIp = needIp
+  If gate_openAllow = 0
+    gate_selected = #HW_LINK_NONE
+    ProcedureReturn 0
+  EndIf
+  If gate_pin = #HW_LINK_WIRED
+    gate_selected = #HW_LINK_WIRED
+  ElseIf gate_pin = #HW_LINK_WIFI
+    gate_selected = #HW_LINK_WIFI
+  Else
+    gate_selected = gate_autoChoice
+  EndIf
+  If needIp <> 0 And gate_ip[gate_selected] = 0
+    gate_selected = #HW_LINK_NONE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i LinkKind()
+  ProcedureReturn gate_selected
+EndProcedure
+
+; This reproduces the relevant compatibility behavior: when no saved wired
+; tuple exists, EthHasIpConfig exposes the wired link-local tuple via gEth*.
+; Correct net_PinApply code must never ask this question.
+Procedure.i EthHasIpConfig()
+  gate_ethHasCalls = gate_ethHasCalls + 1
+  If gEthIp = 0 And gEthLlIp <> 0
+    gEthIp = gEthLlIp
+    gEthMask = $FFFF0000
+    gEthGw = 0
+  EndIf
+  ProcedureReturn Bool(gEthIp <> 0 And gEthMask <> 0)
+EndProcedure
+
+; This seam mirrors the identity-damaging parts of the production binding
+; tail: the selected row is replaced, a non-lease loses its lease metadata,
+; and a non-link-local wired bind retires the wired link-local identity.
+Procedure NetAddressBound(kind.i, ip.i, mask.i, gw.i, src.i)
+  gate_boundCalls = gate_boundCalls + 1
+  gate_boundKind = kind
+  gate_boundIp = ip
+  gate_boundMask = mask
+  gate_boundGw = gw
+  gate_boundSrc = src
+  gate_ip[kind] = ip
+  gate_mask[kind] = mask
+  gate_gw[kind] = gw
+  gate_src[kind] = src
+  If src <> #NET_ADDR_LEASE
+    gate_lease[kind] = 0
+    gate_leaseAt[kind] = 0
+  EndIf
+  If kind = #HW_LINK_WIRED And src <> #NET_ADDR_LINKLOCAL
+    gEthLlIp = 0
+  EndIf
+EndProcedure
+
+Procedure LinkSay()
+  gate_linkSayCalls = gate_linkSayCalls + 1
+EndProcedure
+
+Procedure NetConsoleRearm()
+  gate_rearmCalls = gate_rearmCalls + 1
+EndProcedure
+
+Procedure NetConsoleSay()
+  gate_consoleSayCalls = gate_consoleSayCalls + 1
+EndProcedure
+
+; @@PRODUCTION_NET_PIN_APPLY@@
+
+Procedure.i Main()
+  ; Wi-Fi pin: a valid DHCP lease must retain its address, provenance and
+  ; lease clock while a simultaneous wired link-local row remains intact.
+  GateSeedLinkLocalAndLease()
+  GateResetCalls()
+  gate_pin = #HW_LINK_WIFI
+  gate_autoChoice = #HW_LINK_WIRED
+  net_PinApply()
+  If gate_openCalls <> 1 Or gate_openNeedIp <> 1 : ProcedureReturn 1 : EndIf
+  If gate_selected <> #HW_LINK_WIFI : ProcedureReturn 2 : EndIf
+  If gate_ip[#HW_LINK_WIFI] <> $C0A80177 : ProcedureReturn 3 : EndIf
+  If gate_mask[#HW_LINK_WIFI] <> $FFFFFF00 Or gate_gw[#HW_LINK_WIFI] <> $C0A80101 : ProcedureReturn 4 : EndIf
+  If gate_src[#HW_LINK_WIFI] <> #NET_ADDR_LEASE : ProcedureReturn 5 : EndIf
+  If gate_lease[#HW_LINK_WIFI] <> 3600 Or gate_leaseAt[#HW_LINK_WIFI] <> 77 : ProcedureReturn 6 : EndIf
+  If gate_ip[#HW_LINK_WIRED] <> $A9FE1020 Or gate_src[#HW_LINK_WIRED] <> #NET_ADDR_LINKLOCAL : ProcedureReturn 7 : EndIf
+  If gEthLlIp <> $A9FE1020 : ProcedureReturn 8 : EndIf
+  If gate_linkSayCalls <> 1 Or gate_rearmCalls <> 1 Or gate_consoleSayCalls <> 1 : ProcedureReturn 9 : EndIf
+
+  ; Wired pin: selecting the existing link-local row must not reclassify it
+  ; as saved static or clear the link-local ownership latch.
+  GateSeedLinkLocalAndLease()
+  GateResetCalls()
+  gate_pin = #HW_LINK_WIRED
+  gate_autoChoice = #HW_LINK_WIFI
+  net_PinApply()
+  If gate_selected <> #HW_LINK_WIRED : ProcedureReturn 10 : EndIf
+  If gate_ip[#HW_LINK_WIRED] <> $A9FE1020 Or gate_mask[#HW_LINK_WIRED] <> $FFFF0000 : ProcedureReturn 11 : EndIf
+  If gate_src[#HW_LINK_WIRED] <> #NET_ADDR_LINKLOCAL Or gEthLlIp <> $A9FE1020 : ProcedureReturn 12 : EndIf
+  If gate_ip[#HW_LINK_WIFI] <> $C0A80177 Or gate_src[#HW_LINK_WIFI] <> #NET_ADDR_LEASE : ProcedureReturn 13 : EndIf
+  If gate_lease[#HW_LINK_WIFI] <> 3600 Or gate_leaseAt[#HW_LINK_WIFI] <> 77 : ProcedureReturn 14 : EndIf
+  If gate_linkSayCalls <> 1 Or gate_rearmCalls <> 1 Or gate_consoleSayCalls <> 1 : ProcedureReturn 15 : EndIf
+
+  ; A wired DHCP row is also already acquired. Pinning it must retain the
+  ; dynamic identity even when unrelated saved-settings globals are present.
+  GateClearRows()
+  gate_ip[#HW_LINK_WIRED] = $0A020304
+  gate_mask[#HW_LINK_WIRED] = $FFFFFF00
+  gate_gw[#HW_LINK_WIRED] = $0A020301
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_LEASE
+  gate_lease[#HW_LINK_WIRED] = 7200
+  gate_leaseAt[#HW_LINK_WIRED] = 1234
+  gEthLlIp = 0
+  gEthIp = $C0A88902
+  gEthMask = $FFFFFF00
+  gEthGw = $C0A88901
+  GateResetCalls()
+  gate_pin = #HW_LINK_WIRED
+  gate_autoChoice = #HW_LINK_WIFI
+  net_PinApply()
+  If gate_ip[#HW_LINK_WIRED] <> $0A020304 Or gate_gw[#HW_LINK_WIRED] <> $0A020301 : ProcedureReturn 16 : EndIf
+  If gate_src[#HW_LINK_WIRED] <> #NET_ADDR_LEASE : ProcedureReturn 17 : EndIf
+  If gate_lease[#HW_LINK_WIRED] <> 7200 Or gate_leaseAt[#HW_LINK_WIRED] <> 1234 : ProcedureReturn 18 : EndIf
+
+  ; Auto selection over an existing saved-static wired row preserves both
+  ; interface rows; net_PinApply only announces and rearms the chosen one.
+  GateClearRows()
+  gate_ip[#HW_LINK_WIRED] = $C0A88902
+  gate_mask[#HW_LINK_WIRED] = $FFFFFF00
+  gate_gw[#HW_LINK_WIRED] = $C0A88901
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_SAVED
+  gate_ip[#HW_LINK_WIFI] = $AC10092A
+  gate_mask[#HW_LINK_WIFI] = $FFFF0000
+  gate_gw[#HW_LINK_WIFI] = $AC100001
+  gate_src[#HW_LINK_WIFI] = #NET_ADDR_LEASE
+  gate_lease[#HW_LINK_WIFI] = 1800
+  gate_leaseAt[#HW_LINK_WIFI] = 88
+  gEthLlIp = 0
+  gEthIp = gate_ip[#HW_LINK_WIRED]
+  gEthMask = gate_mask[#HW_LINK_WIRED]
+  gEthGw = gate_gw[#HW_LINK_WIRED]
+  GateResetCalls()
+  gate_pin = #HW_LINK_NONE
+  gate_autoChoice = #HW_LINK_WIRED
+  net_PinApply()
+  If gate_selected <> #HW_LINK_WIRED : ProcedureReturn 19 : EndIf
+  If gate_ip[#HW_LINK_WIRED] <> $C0A88902 Or gate_src[#HW_LINK_WIRED] <> #NET_ADDR_SAVED : ProcedureReturn 20 : EndIf
+  If gate_ip[#HW_LINK_WIFI] <> $AC10092A Or gate_src[#HW_LINK_WIFI] <> #NET_ADDR_LEASE : ProcedureReturn 21 : EndIf
+  If gate_lease[#HW_LINK_WIFI] <> 1800 Or gate_leaseAt[#HW_LINK_WIFI] <> 88 : ProcedureReturn 22 : EndIf
+
+  ; Refusal owns the early return: no status, console rearm or console say.
+  GateResetCalls()
+  gate_openAllow = 0
+  gate_pin = #HW_LINK_WIFI
+  gate_autoChoice = #HW_LINK_WIRED
+  net_PinApply()
+  If gate_openCalls <> 1 Or gate_openNeedIp <> 1 : ProcedureReturn 23 : EndIf
+  If gate_linkSayCalls <> 0 Or gate_rearmCalls <> 0 Or gate_consoleSayCalls <> 0 : ProcedureReturn 24 : EndIf
+
+  ; Across every successful selection above, the caller itself must never
+  ; consult wired settings or invoke the address-binding callback.
+  ; GateResetCalls reset the counts for the refusal case, so issue one final
+  ; successful call and observe both forbidden seams directly.
+  GateResetCalls()
+  gate_openAllow = 1
+  gate_pin = #HW_LINK_WIFI
+  gate_autoChoice = #HW_LINK_WIRED
+  net_PinApply()
+  If gate_ethHasCalls <> 0 : ProcedureReturn 25 : EndIf
+  If gate_boundCalls <> 0 : ProcedureReturn 26 : EndIf
+  If gate_linkSayCalls <> 1 Or gate_rearmCalls <> 1 Or gate_consoleSayCalls <> 1 : ProcedureReturn 27 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

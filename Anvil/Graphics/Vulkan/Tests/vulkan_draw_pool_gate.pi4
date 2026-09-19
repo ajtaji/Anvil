@@ -1,0 +1,218 @@
+; ======================================================================
+;  Emitted gate: bounded shared recorded-draw snapshot pool
+; ======================================================================
+; This is a desk-only command-layer gate. Stage one exercises the pool
+; primitives directly because vkCmdDraw is intentionally not wired to them
+; until the pipeline/list submission tranche lands.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VDP_OUT = $06000000
+#VDP_ROWS = $06000100
+#VDP_MAGIC = $564B4450
+
+Global vdpChecks.i = 0
+Global vdpFails.i = 0
+Global Dim vdpSeen.a[#ANVIL_VK_MAX_RECORDED_DRAWS + 1]
+
+Procedure Vdp(ok.i)
+  PokeN(#VDP_ROWS + (vdpChecks * 8), ok)
+  vdpChecks = vdpChecks + 1
+  If ok = 0 : vdpFails = vdpFails + 1 : EndIf
+EndProcedure
+
+Procedure VdpState(c.i, seed.i)
+  Define k.i
+  avkCbPipe[c] = $100000000 + seed
+  avkCbDescSet[c] = $200000000 + seed
+  avkCbPushBytes[c] = 16
+  k = 0
+  While k < 4
+    avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k] = $300000000 + (seed * 16) + k
+    avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k] = (seed * 64) + (k * 8)
+    avkCbPushWord[(c * 4) + k] = ($A0000000 | (seed << 4) | k) & $FFFFFFFF
+    k = k + 1
+  Wend
+EndProcedure
+
+Procedure.i VdpFreeChainExact()
+  Define s.i
+  Define n.i
+  Define k.i
+  k = 0
+  While k <= #ANVIL_VK_MAX_RECORDED_DRAWS
+    vdpSeen[k] = 0
+    k = k + 1
+  Wend
+  s = avkRecordedDrawFreeHead
+  n = 0
+  While s <> 0
+    If s < 1 Or s > #ANVIL_VK_MAX_RECORDED_DRAWS : ProcedureReturn 0 : EndIf
+    If vdpSeen[s] <> 0 : ProcedureReturn 0 : EndIf
+    vdpSeen[s] = 1
+    n = n + 1
+    If n > #ANVIL_VK_MAX_RECORDED_DRAWS : ProcedureReturn 0 : EndIf
+    s = avkRecordedDraw[s]\next
+  Wend
+  If n <> avkRecordedDrawFreeCount : ProcedureReturn 0 : EndIf
+  ProcedureReturn Bool(n = #ANVIL_VK_MAX_RECORDED_DRAWS)
+EndProcedure
+
+Procedure.i Main()
+  Define rec.AnvilVkRecordedDraw
+  Define instance.i
+  Define physical.i
+  Define device.i
+  Define pool.i
+  Define cmdA.i
+  Define cmdB.i
+  Define cA.i
+  Define cB.i
+  Define count.l
+  Define slot.i
+  Define i.i
+  Define k.i
+  Define beforeHead.i
+  Define beforeFree.i
+  Define beforeCbHead.i
+  Define beforeCbTail.i
+  Define beforeCbCount.i
+
+  ; Exact ABI and deterministic virgin free list.
+  Vdp(SizeOf(AnvilVkRecordedDraw) = #ANVIL_VK_RECORDED_DRAW_BYTES)
+  Vdp(@rec\next - @rec = 0)
+  Vdp(@rec\pipeline - @rec = 8)
+  Vdp(@rec\descriptorSet - @rec = 16)
+  Vdp(@rec\firstVertex - @rec = 24)
+  Vdp(@rec\vertexCount - @rec = 32)
+  Vdp(@rec\indexBuffer - @rec = 40 And @rec\indexType - @rec = 56)
+  Vdp(@rec\pushBytes - @rec = 64)
+  Vdp(@rec\viewportX - @rec = 72 And @rec\viewportH - @rec = 96 And @rec\scissorX - @rec = 104 And @rec\scissorH - @rec = 128)
+  Vdp(@rec\vertexBuffer[0] - @rec = 136)
+  Vdp(@rec\vertexOffset[0] - @rec = 168)
+  Vdp(@rec\pushWord[0] - @rec = 200)
+  avkRecordedDrawPoolInit()
+  Vdp(avkRecordedDrawPoolReady = 1)
+  Vdp(avkRecordedDrawFreeHead = 1)
+  Vdp(avkRecordedDrawFreeCount = #ANVIL_VK_MAX_RECORDED_DRAWS)
+  Vdp(avkRecordedDraw[1]\next = 2)
+  Vdp(avkRecordedDraw[#ANVIL_VK_MAX_RECORDED_DRAWS]\next = 0)
+  avkRecordedDrawPoolInit()
+  Vdp(avkRecordedDrawFreeHead = 1 And avkRecordedDrawFreeCount = #ANVIL_VK_MAX_RECORDED_DRAWS)
+
+  ; Real command-buffer lifecycle owners, over the state-only backend.
+  AnvilVkTestBackendHeap($07000000, $00100000)
+  Vdp(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
+  count = 1
+  Vdp(AnvilVkPhysicalEnumerate(instance, @count, @physical) = #VK_SUCCESS)
+  Vdp(AnvilVkDeviceCreate(physical, @device) = #VK_SUCCESS)
+  Vdp(AnvilVkCommandPoolCreate(device, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @pool) = #VK_SUCCESS)
+  Vdp(AnvilVkCommandBufferAllocate(device, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmdA) = #VK_SUCCESS)
+  Vdp(AnvilVkCommandBufferAllocate(device, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmdB) = #VK_SUCCESS)
+  cA = avkCmdSlot(cmdA) : cB = avkCmdSlot(cmdB)
+  Vdp(cA > 0 And cB > 0 And cA <> cB)
+  Vdp(AnvilVkCommandBufferBegin(cmdA, 0) = #VK_SUCCESS)
+  Vdp(AnvilVkCommandBufferBegin(cmdB, 0) = #VK_SUCCESS)
+
+  ; Snapshot completeness and immunity to later bind-state changes.
+  VdpState(cA, 17)
+  Vdp(avkRecordedDrawAppend(cA, 7, 3, 0, 0, 64, 64, 1, 2, 3, 4, 0, 0, 0) = 1)
+  VdpState(cA, 29)
+  Vdp(avkRecordedDrawAppend(cA, 11, 6, 0, 0, 64, 64, 5, 6, 7, 8, 0, 0, 0) = 2)
+  Vdp(avkCbDrawHead[cA] = 1 And avkCbDrawTail[cA] = 2 And avkCbDrawCount[cA] = 2)
+  Vdp(avkRecordedDraw[1]\next = 2 And avkRecordedDraw[2]\next = 0)
+  Vdp(avkRecordedDraw[1]\pipeline = $100000000 + 17)
+  Vdp(avkRecordedDraw[1]\descriptorSet = $200000000 + 17)
+  Vdp(avkRecordedDraw[1]\firstVertex = 7 And avkRecordedDraw[1]\vertexCount = 3 And avkRecordedDraw[1]\pushBytes = 16)
+  Vdp(avkRecordedDraw[1]\indexBuffer = 0 And avkRecordedDraw[1]\indexOffset = 0 And avkRecordedDraw[1]\indexType = 0)
+  Vdp(avkRecordedDraw[1]\viewportX = 0 And avkRecordedDraw[1]\viewportY = 0 And avkRecordedDraw[1]\viewportW = 64 And avkRecordedDraw[1]\viewportH = 64 And avkRecordedDraw[1]\scissorX = 1 And avkRecordedDraw[1]\scissorY = 2 And avkRecordedDraw[1]\scissorW = 3 And avkRecordedDraw[1]\scissorH = 4)
+  k = 0
+  While k < 4
+    Vdp(avkRecordedDraw[1]\vertexBuffer[k] = $300000000 + (17 * 16) + k)
+    Vdp(avkRecordedDraw[1]\vertexOffset[k] = (17 * 64) + (k * 8))
+    Vdp((avkRecordedDraw[1]\pushWord[k] & $FFFFFFFF) = (($A0000000 | (17 << 4) | k) & $FFFFFFFF))
+    k = k + 1
+  Wend
+  Vdp(avkRecordedDraw[2]\pipeline = $100000000 + 29 And avkRecordedDraw[2]\descriptorSet = $200000000 + 29)
+  beforeHead = avkRecordedDrawFreeHead : beforeFree = avkRecordedDrawFreeCount
+  Vdp(avkRecordedDrawAppend(cA, 99, 0, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) = 0)
+  Vdp(avkRecordedDrawFreeHead = beforeHead And avkRecordedDrawFreeCount = beforeFree And avkCbDrawCount[cA] = 2)
+
+  ; A hostile chain is refused transactionally: neither owner changes.
+  beforeCbHead = avkCbDrawHead[cA] : beforeCbTail = avkCbDrawTail[cA] : beforeCbCount = avkCbDrawCount[cA]
+  avkRecordedDraw[2]\next = 3
+  Vdp(avkRecordedDrawRelease(cA) = 0)
+  Vdp(avkRecordedDrawFreeHead = beforeHead And avkRecordedDrawFreeCount = beforeFree)
+  Vdp(avkCbDrawHead[cA] = beforeCbHead And avkCbDrawTail[cA] = beforeCbTail And avkCbDrawCount[cA] = beforeCbCount)
+  avkRecordedDraw[2]\next = 0
+  Vdp(AnvilVkCommandBufferReset(cmdA, 0) = #VK_SUCCESS)
+  Vdp(avkCbDrawHead[cA] = 0 And avkCbDrawTail[cA] = 0 And avkCbDrawCount[cA] = 0)
+  Vdp(VdpFreeChainExact())
+
+  ; Aggregate capacity: two command buffers consume 2048 slots each.
+  Vdp(AnvilVkCommandBufferBegin(cmdA, 0) = #VK_SUCCESS)
+  i = 0
+  While i < 2048
+    slot = avkRecordedDrawAppend(cA, i, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0)
+    If slot <= 0 : vdpFails = vdpFails + 1 : Break : EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < 2048
+    slot = avkRecordedDrawAppend(cB, i, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0)
+    If slot <= 0 : vdpFails = vdpFails + 1 : Break : EndIf
+    i = i + 1
+  Wend
+  Vdp(avkCbDrawCount[cA] = 2048 And avkCbDrawCount[cB] = 2048)
+  Vdp(avkRecordedDrawFreeHead = 0 And avkRecordedDrawFreeCount = 0)
+  beforeCbCount = avkCbDrawCount[cA]
+  Vdp(avkRecordedDrawAppend(cA, 0, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) = -1)
+  Vdp(avkCbDrawCount[cA] = beforeCbCount And avkRecordedDrawFreeHead = 0 And avkRecordedDrawFreeCount = 0)
+  Vdp(avkRecordedDrawAppend(cA, 0, 0, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) = 0)
+  Vdp(avkRecordedDrawFreeHead = 0 And avkRecordedDrawFreeCount = 0)
+  Vdp(AnvilVkCommandBufferReset(cmdA, 0) = #VK_SUCCESS)
+  Vdp(avkRecordedDrawFreeCount = 2048 And avkCbDrawCount[cB] = 2048)
+  Vdp(AnvilVkCommandBufferFree(device, pool, cmdB) = #VK_SUCCESS)
+  Vdp(VdpFreeChainExact())
+
+  ; One command buffer owns all 4096 entries; draw 4097 refuses exactly.
+  Vdp(AnvilVkCommandBufferBegin(cmdA, 0) = #VK_SUCCESS)
+  i = 0
+  While i < #ANVIL_VK_MAX_RECORDED_DRAWS
+    slot = avkRecordedDrawAppend(cA, i, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0)
+    If slot <= 0 : vdpFails = vdpFails + 1 : Break : EndIf
+    i = i + 1
+  Wend
+  Vdp(i = #ANVIL_VK_MAX_RECORDED_DRAWS)
+  Vdp(avkCbDrawCount[cA] = #ANVIL_VK_MAX_RECORDED_DRAWS)
+  Vdp(avkRecordedDrawFreeHead = 0 And avkRecordedDrawFreeCount = 0)
+  beforeCbHead = avkCbDrawHead[cA] : beforeCbTail = avkCbDrawTail[cA]
+  Vdp(avkRecordedDrawAppend(cA, 4096, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) = -1)
+  Vdp(avkCbDrawHead[cA] = beforeCbHead And avkCbDrawTail[cA] = beforeCbTail And avkCbDrawCount[cA] = #ANVIL_VK_MAX_RECORDED_DRAWS)
+  Vdp(AnvilVkCommandBufferReset(cmdA, #VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) = #VK_SUCCESS)
+  Vdp(VdpFreeChainExact())
+
+  ; Pool reset and pool destroy route every live buffer through the same owner.
+  Vdp(AnvilVkCommandBufferAllocate(device, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmdB) = #VK_SUCCESS)
+  cB = avkCmdSlot(cmdB)
+  Vdp(AnvilVkCommandBufferBegin(cmdA, 0) = #VK_SUCCESS)
+  Vdp(AnvilVkCommandBufferBegin(cmdB, 0) = #VK_SUCCESS)
+  Vdp(avkRecordedDrawAppend(cA, 1, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) > 0 And avkRecordedDrawAppend(cB, 2, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) > 0)
+  Vdp(AnvilVkCommandPoolReset(device, pool, #VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) = #VK_SUCCESS)
+  Vdp(avkCmdState[cA] = #ANVIL_VK_CB_INITIAL And avkCmdState[cB] = #ANVIL_VK_CB_INITIAL)
+  Vdp(VdpFreeChainExact())
+  Vdp(AnvilVkCommandBufferBegin(cmdA, 0) = #VK_SUCCESS)
+  Vdp(AnvilVkCommandBufferBegin(cmdB, 0) = #VK_SUCCESS)
+  Vdp(avkRecordedDrawAppend(cA, 3, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) > 0 And avkRecordedDrawAppend(cB, 4, 3, 0, 0, 64, 64, 0, 0, 64, 64, 0, 0, 0) > 0)
+  Vdp(AnvilVkCommandPoolDestroy(device, pool) = #VK_SUCCESS)
+  Vdp(avkCmdLive[cA] = 0 And avkCmdLive[cB] = 0)
+  Vdp(VdpFreeChainExact())
+
+  PokeN(#VDP_OUT + 0, #VDP_MAGIC)
+  PokeN(#VDP_OUT + 8, vdpChecks)
+  PokeN(#VDP_OUT + 16, vdpFails)
+  ProcedureReturn vdpFails
+EndProcedure
+
+Main()

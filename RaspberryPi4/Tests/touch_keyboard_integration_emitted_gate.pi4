@@ -1,0 +1,881 @@
+; ======================================================================
+;  touch_keyboard_integration_emitted_gate.pi4
+;
+;  THE JOIN, EXECUTED. Four production files are compiled UNCHANGED and
+;  run against each other on the A64 oracle:
+;
+;    Anvil/Core/input_events.pbi        the one dispatcher and the one queue
+;    Anvil/Core/text_edit.pbi           the shared line editor
+;    Anvil/Core/touch_keyboard.pbi      the key model
+;    Anvil/Graphics/touch_keyboard_view.pbi   the geometry (via console.pi4)
+;
+;  and so is the board adapter that joins them: the two fenced sections
+;  of RaspberryPi4/Board/banner_clock.pi4 are LIFTED VERBATIM by
+;  tools/touch_keyboard_integration_emitted_check.py and included below
+;  as "the integration". They are not transcribed and not summarised - if
+;  the fences move, the checker refuses to build rather than test a copy.
+;
+;  WHAT THAT MEANS THIS GATE IS ACTUALLY PROVING. A finger is put on the
+;  glass by calling InputTouchDispatch with coordinates, which is exactly
+;  what RaspberryPi4/Board/cursor_input.pi4's one drain of the hardware
+;  ring does with the fields of a HAL record. From there NOTHING is
+;  simulated: the real dispatcher decides the owner from the real
+;  rectangle the real integration installed from the real layout, the
+;  real model hit-tests through the real view, the real model emits into
+;  its real ring, the real integration pumps that into the real input
+;  queue, and the real editor edits the real command line.
+;
+; ======================================================================
+;  WHAT IT DOES NOT PROVE - AND THESE ARE NOT SMALL
+; ======================================================================
+;  * NO PANEL, NO CONTROLLER, NO PIXELS. Nothing here says a key is where
+;    it looks on the glass; the view's own gate grades the geometry and
+;    only a hand at the bench can grade the glass.
+;  * TouchKeyboardScreenShow/Hide ARE STUBBED, because the real ones read
+;    DisplayWidth, LogoHeight and the panel's own density over I2C. The
+;    stubs below do the two things the JOIN depends on - lay the view out
+;    and reserve console rows - and the checker asserts by source that
+;    the real ones do the same, in the same order. The viewport proof
+;    itself belongs to the view's gate, where the real console core runs.
+;  * THE EDITOR'S APPLY LOOP is reproduced here as GateApply, because the
+;    real one is inside Anvil/Core/parse.pbi's ReadLine, which cannot be
+;    compiled without the whole monitor. The checker reads ReadLine and
+;    requires its mapping - which event kind reaches which editor entry
+;    point - to be exactly this one, so a divergence is a red gate and
+;    not a gate testing its own copy.
+;  * LATENCY AND FRAME BUDGET are hardware measurements. None is claimed.
+;
+;  Main() returns the number of the first failing assertion, or 0.
+; ======================================================================
+
+XIncludeFile "Anvil/Core/state.pbi"
+
+; ----------------------------------------------------------------------
+;  THE LEAVES. Three of them, and every one is scripted so that nothing
+;  in this image reads a register or waits for anything.
+; ----------------------------------------------------------------------
+
+; The board global the line editor's CRLF de-duplication lives in.
+Global gLastCR.i = 0
+
+Global gate_ticks.i = 0
+Procedure.i Ticks()
+  gate_ticks = gate_ticks + 1
+  ProcedureReturn gate_ticks
+EndProcedure
+
+; The monitor's millisecond clock, as a number this gate sets. Every
+; timing rule in the keyboard is arithmetic on it, so scripting it is how
+; a 450 ms repeat delay is checked without a stopwatch.
+Global gate_ms.i = 0
+Procedure.i millis()
+  ProcedureReturn gate_ms
+EndProcedure
+
+; The echo port. Everything the editor emits lands here and is counted;
+; what it contains is the input editor gate's subject, not this one's.
+Global gate_echoN.i = 0
+Procedure UartWrite(c.i)
+  gate_echoN = gate_echoN + 1
+EndProcedure
+
+; The leaves console.pi4 stands on and this gate does not exercise.
+Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
+Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
+Procedure.i UartMirrorReadStyle() : ProcedureReturn 0 : EndProcedure
+
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+XIncludeFile "RaspberryPi4/Board/console.pi4"
+
+; ----------------------------------------------------------------------
+;  THE BOARD UNDER THE INTEGRATION. The screen source id it tags a show
+;  with, the enable flag its attach path owns, and the surface.
+; ----------------------------------------------------------------------
+Global gScrSrc.i = 1
+Global gTkbEnabled.i = 0
+Global gate_m.TouchKeyboardMetrics
+
+; TouchKeyboardScreenShow/Hide, stubbed - see the header. These are the
+; two things the join depends on and nothing else: the view is laid out
+; against the surface, the console reserves the rows the band covers, and
+; the layer is marked for a whole repaint.
+Procedure.i TouchKeyboardScreenShow()
+  If TouchKeyboardLayout(@gate_m) = 0
+    ProcedureReturn 0
+  EndIf
+  TouchKeyboardViewSetVisible(1)
+  ConSetViewRows(TouchKeyboardConsoleRows())
+  TouchKeyboardMarkAll()
+  ConOverlayDamage()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure TouchKeyboardScreenHide()
+  TouchKeyboardViewSetVisible(0)
+  ConViewRelease()
+  TouchKeyboardMarkAll()
+  ConOverlayDamage()
+EndProcedure
+
+Procedure TouchKeyboardOverlayReset()
+  TouchKeyboardLayoutInvalidate()
+EndProcedure
+
+; ---- the production integration, lifted verbatim ---------------------
+XIncludeFile "RaspberryPi4/Tests/_touch_keyboard_integration_lift.pbi"
+
+; ======================================================================
+;  THE EDITOR'S APPLY LOOP
+; ======================================================================
+;  The same mapping ReadLine has, counted. tools/touch_keyboard_
+;  integration_emitted_check.py reads ReadLine and requires it to be this
+;  mapping, so this cannot quietly become a different editor.
+; ======================================================================
+Global gate_text.i = 0             ; TEXT events inserted
+Global gate_keydn.i = 0            ; KEY_DOWN events delivered
+Global gate_keyup.i = 0            ; KEY_UP events delivered
+Global gate_enter.i = 0            ; ... of which Enter
+Global gate_cancel.i = 0           ; CANCEL notices
+Global gate_lastcancel.i = 0
+Global gate_claims.i = 0           ; soft keystrokes that claimed the console
+
+Procedure NetConsoleClaimLocal()
+  gate_claims = gate_claims + 1
+EndProcedure
+
+Procedure GateApply()
+  Define kind.i
+  Define src.i
+  Define code.i
+  Dim ev.a[#AIE_EVSZ]
+  While InputEventsPop(@ev[0]) = 1
+    kind = PeekL(@ev[0] + #AIE_EV_KIND)
+    src = PeekL(@ev[0] + #AIE_EV_SRC)
+    code = PeekL(@ev[0] + #AIE_EV_CODE)
+    If src = #AIS_TOUCH_KEYBOARD
+      If kind = #AIE_TEXT Or kind = #AIE_KEY_DOWN
+        NetConsoleClaimLocal()
+      EndIf
+    EndIf
+    Select kind
+      Case #AIE_TEXT
+        gate_text = gate_text + 1
+        TextEditInsert(code)
+      Case #AIE_KEY_DOWN
+        gate_keydn = gate_keydn + 1
+        If code = #AIK_ENTER
+          gate_enter = gate_enter + 1
+        EndIf
+        TextEditKey(code)
+      Case #AIE_KEY_UP
+        gate_keyup = gate_keyup + 1
+        TextEditKeyRelease(code)
+      Case #AIE_CANCEL
+        gate_cancel = gate_cancel + 1
+        gate_lastcancel = code
+        TextEditCancelNotice(code)
+    EndSelect
+  Wend
+EndProcedure
+
+; ======================================================================
+;  A FINGER, AND A PASS OF THE PROMPT'S SPIN
+; ======================================================================
+;  GateContact is what cursor_input.pi4's one drain does with the fields
+;  of a HAL record: hand them to the dispatcher and let it decide who
+;  owns the contact. It returns the owner, so a test can state who a
+;  point belongs to as well as what happened to it.
+; ----------------------------------------------------------------------
+Procedure.i GateContact(x.i, y.i, id.i, st.i)
+  ProcedureReturn InputTouchDispatch(x, y, id, st, gate_ms, 100)
+EndProcedure
+
+Procedure GateSpin()
+  TouchKeyboardServiceTick()
+  GateApply()
+EndProcedure
+
+Procedure GateAdvance(ms.i)
+  gate_ms = gate_ms + ms
+  GateSpin()
+EndProcedure
+
+; Find a key on the current page by its label, or -1. The label a key
+; reports is the character it would produce RIGHT NOW, so this is also
+; how a test asks for "the key that types a q".
+Procedure.i GateFindLabel(*want)
+  Define i.i
+  Define n.i
+  Define a.i
+  Define b.i
+  Define j.i
+  Define lab.i
+  Define same.i
+  n = TouchKeyboardKeyCount()
+  i = 0
+  While i < n
+    lab = TouchKeyboardKeyLabel(i)
+    same = 1
+    j = 0
+    Repeat
+      a = PeekA(lab + j) & $FF
+      b = PeekA(*want + j) & $FF
+      If a <> b
+        same = 0
+        Break
+      EndIf
+      If a = 0
+        Break
+      EndIf
+      j = j + 1
+    ForEver
+    If same <> 0
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i GateKeyCx(i.i)
+  ProcedureReturn TouchKeyboardKeyX(i) + TouchKeyboardKeyW(i) / 2
+EndProcedure
+
+Procedure.i GateKeyCy(i.i)
+  ProcedureReturn TouchKeyboardKeyY(i) + TouchKeyboardKeyH(i) / 2
+EndProcedure
+
+Procedure.i GateLineByte(i.i)
+  ProcedureReturn gLine[i] & $FF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The surface, and the state the monitor is in when the prompt is up.
+;  1280 x 800 with the bench panel's own 149 px/in is the shipped
+;  default; the view's gate grades what that produces, this one uses it.
+; ----------------------------------------------------------------------
+Procedure GateBoot()
+  ConGridInit(160, 42)
+  gate_m\logicalW     = 1280
+  gate_m\logicalH     = 800
+  gate_m\bannerH      = 120
+  gate_m\cellW        = 8
+  gate_m\cellH        = 16
+  gate_m\ppi          = 149
+  gate_m\displayScale = 1
+  TouchKeyboardInit()
+  gTkbEnabled = 1
+  gTkbSuspended = 0
+  ; The attach path lays the keyboard out once, with the band down, so
+  ; the button beside the prompt exists before anybody asks for a keyboard.
+  TouchKeyboardLayout(@gate_m)
+  TouchKeyboardViewSetVisible(0)
+  TextEditBegin()
+  ; POINTING TYPED INPUT AT THE COMMAND LINE FOR THE FIRST TIME IS A FOCUS
+  ; CHANGE, and a focus change cancels - which puts one #AIE_CANCEL in the
+  ; queue before anybody has touched anything. That is the dispatcher
+  ; doing exactly what it says it does and it is the same on the real
+  ; monitor's first line; drain it here so the counters below start at
+  ; zero and every cancellation they see afterwards is one this gate caused.
+  InputFocusSet(#AIF_COMMAND_LINE)
+  GateApply()
+  gate_text = 0
+  gate_keydn = 0
+  gate_keyup = 0
+  gate_enter = 0
+  gate_cancel = 0
+  gate_claims = 0
+EndProcedure
+
+; Put it away the way a person does - a tap on the down-chevron.
+Procedure GateHide()
+  If TouchKeyboardViewVisible() = 0
+    ProcedureReturn
+  EndIf
+  GateContact(TouchKeyboardHideX() + 2, TouchKeyboardHideY() + 2, 99, #AIT_DOWN)
+  GateSpin()
+  GateContact(TouchKeyboardHideX() + 2, TouchKeyboardHideY() + 2, 99, #AIT_UP)
+  GateSpin()
+  GateAdvance(#TK_SLIDE_MS + 10)
+EndProcedure
+
+; Open the keyboard the way a person does - a deliberate tap on the
+; editable prompt line - and leave it fully visible on the letter page.
+;
+; IT PUTS THE BAND AWAY FIRST. With the keyboard up the band covers the
+; prompt row, so a tap there is a tap on a KEY - the page switch, as it
+; happens, which is a real behaviour and not the one these scenarios are
+; about. Starting from hidden is what makes each of them independent.
+Procedure.i GateOpen()
+  Define owner.i
+  GateHide()
+  TkSetPage(#TK_PAGE_ABC)
+  owner = GateContact(40, TouchKeyboardPromptY() + 2, 90, #AIT_DOWN)
+  If owner <> #AIO_KEYBOARD
+    ProcedureReturn 0
+  EndIf
+  GateSpin()
+  GateContact(40, TouchKeyboardPromptY() + 2, 90, #AIT_UP)
+  GateSpin()
+  GateAdvance(#TK_SLIDE_MS + 10)
+  If TouchKeyboardState() <> #TK_STATE_VISIBLE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  THE SCENARIOS
+; ======================================================================
+
+Procedure.i Main()
+  Define rc.i
+  Define k.i
+  Define kq.i
+  Define kw.i
+  Define ke.i
+  Define owner.i
+  Define n0.i
+  Define len0.i
+  Define cancels0.i
+
+  GateBoot()
+
+  ; ---------------- 10..19  the layer owns the prompt line -------------
+  GateSpin()
+  ; With the band down the dispatcher's one rectangle for this layer is
+  ; the editable prompt line and the keyboard button. A DOWN anywhere
+  ; ELSE on the console is not this layer's.
+  If InputRegionOwnerAt(40, TouchKeyboardPromptY() + 2) <> #AIO_KEYBOARD
+    ProcedureReturn 10
+  EndIf
+  If InputRegionOwnerAt(40, 200) <> #AIO_POINTER
+    ProcedureReturn 11
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn 12
+  EndIf
+
+  ; ---------------- 20..29  a tap on the prompt line OPENS it ----------
+  owner = GateContact(40, TouchKeyboardPromptY() + 2, 1, #AIT_DOWN)
+  If owner <> #AIO_KEYBOARD
+    ProcedureReturn 20
+  EndIf
+  GateSpin()
+  If TouchKeyboardViewVisible() = 0
+    ProcedureReturn 21
+  EndIf
+  ; Opening it emits NOTHING. Not a keystroke, not a cancellation: the
+  ; command line is exactly as it was.
+  If gate_text <> 0 Or gate_keydn <> 0
+    ProcedureReturn 22
+  EndIf
+  If gate_cancel <> 0
+    ProcedureReturn 23
+  EndIf
+  If TextEditLength() <> 0
+    ProcedureReturn 24
+  EndIf
+  ; And the band is now what this layer owns.
+  If InputRegionOwnerAt(TouchKeyboardBandW() / 2, TouchKeyboardBandY() + 4) <> #AIO_KEYBOARD
+    ProcedureReturn 25
+  EndIf
+  GateContact(40, TouchKeyboardPromptY() + 2, 1, #AIT_UP)
+  GateSpin()
+  GateAdvance(#TK_SLIDE_MS + 10)
+  If TouchKeyboardState() <> #TK_STATE_VISIBLE
+    ProcedureReturn 26
+  EndIf
+  ; The finger that opened it typed nothing on the way back up.
+  If gate_text <> 0
+    ProcedureReturn 27
+  EndIf
+
+  ; ---------------- 30..39  one finger, one character ------------------
+  kq = GateFindLabel("q")
+  If kq < 0
+    ProcedureReturn 30
+  EndIf
+  owner = GateContact(GateKeyCx(kq), GateKeyCy(kq), 2, #AIT_DOWN)
+  If owner <> #AIO_KEYBOARD
+    ProcedureReturn 31
+  EndIf
+  GateSpin()
+  ; A DOWN ARMS AND DOES NOT TYPE. The character appears when the finger
+  ; leaves, which is what makes sliding off a key a correction.
+  If TouchKeyboardKeyIsArmed(kq) = 0
+    ProcedureReturn 32
+  EndIf
+  If gate_text <> 0
+    ProcedureReturn 33
+  EndIf
+  GateContact(GateKeyCx(kq), GateKeyCy(kq), 2, #AIT_UP)
+  GateSpin()
+  If gate_text <> 1
+    ProcedureReturn 34
+  EndIf
+  If TextEditLength() <> 1
+    ProcedureReturn 35
+  EndIf
+  If GateLineByte(0) <> 113                   ; 'q'
+    ProcedureReturn 36
+  EndIf
+  If TextEditCaret() <> 1
+    ProcedureReturn 37
+  EndIf
+  ; AN ACCEPTED SOFT KEYSTROKE IS LOCAL INPUT and claims the console the
+  ; way a serial byte does - once, when it is applied.
+  If gate_claims <> 1
+    ProcedureReturn 38
+  EndIf
+  If TouchKeyboardKeyIsArmed(kq) <> 0
+    ProcedureReturn 39
+  EndIf
+
+  ; ---------------- 40..49  started on a key, ended outside ------------
+  kw = GateFindLabel("w")
+  If kw < 0
+    ProcedureReturn 40
+  EndIf
+  n0 = gate_text
+  owner = GateContact(GateKeyCx(kw), GateKeyCy(kw), 3, #AIT_DOWN)
+  If owner <> #AIO_KEYBOARD
+    ProcedureReturn 41
+  EndIf
+  GateSpin()
+  ; Dragged up out of the band and on to the console. THE CONTACT IS
+  ; STILL THE KEYBOARD'S - ownership is decided once, at the DOWN - so it
+  ; cannot click or scroll what is underneath, and it is disarmed because
+  ; it is no longer on a key.
+  owner = GateContact(40, 200, 3, #AIT_MOVE)
+  If owner <> #AIO_KEYBOARD
+    ProcedureReturn 42
+  EndIf
+  GateSpin()
+  If TouchKeyboardKeyIsArmed(kw) <> 0
+    ProcedureReturn 43
+  EndIf
+  GateContact(40, 200, 3, #AIT_UP)
+  GateSpin()
+  If gate_text <> n0
+    ProcedureReturn 44
+  EndIf
+  If TextEditLength() <> 1
+    ProcedureReturn 45
+  EndIf
+  ; AND THE OTHER HALF OF THE SAME RULE: starting outside and sliding in
+  ; does not manufacture a keypress. There is no capture to slide.
+  owner = GateContact(40, 200, 4, #AIT_DOWN)
+  If owner = #AIO_KEYBOARD
+    ProcedureReturn 46
+  EndIf
+  GateContact(GateKeyCx(kq), GateKeyCy(kq), 4, #AIT_MOVE)
+  GateContact(GateKeyCx(kq), GateKeyCy(kq), 4, #AIT_UP)
+  GateSpin()
+  If gate_text <> n0
+    ProcedureReturn 47
+  EndIf
+
+  ; ---------------- 50..59  the chevron hides, and says nothing --------
+  n0 = gate_text
+  cancels0 = gate_cancel
+  owner = GateContact(TouchKeyboardHideX() + 2, TouchKeyboardHideY() + 2, 5, #AIT_DOWN)
+  If owner <> #AIO_KEYBOARD
+    ProcedureReturn 50
+  EndIf
+  GateSpin()
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn 51
+  EndIf
+  If TouchKeyboardDesiredState() <> #TK_STATE_HIDDEN
+    ProcedureReturn 52
+  EndIf
+  ; NOTHING WAS EMITTED. No text, no key, no cancellation - putting the
+  ; keyboard away is not typing, and it does not clear the command.
+  If gate_text <> n0 Or gate_keydn <> 0
+    ProcedureReturn 53
+  EndIf
+  If gate_cancel <> cancels0
+    ProcedureReturn 54
+  EndIf
+  If TouchKeyboardQueued() <> 0
+    ProcedureReturn 55
+  EndIf
+  If TextEditLength() <> 1
+    ProcedureReturn 56
+  EndIf
+  ; The finger lifting off a keyboard that is no longer there types nothing.
+  GateContact(TouchKeyboardHideX() + 2, TouchKeyboardHideY() + 2, 5, #AIT_UP)
+  GateSpin()
+  If gate_text <> n0
+    ProcedureReturn 57
+  EndIf
+  ; And the layer has given the console rows back and now owns the prompt
+  ; line again rather than the band.
+  If InputRegionOwnerAt(TouchKeyboardBandW() / 2, TouchKeyboardBandY() + 4) = #AIO_KEYBOARD
+    ProcedureReturn 58
+  EndIf
+  If InputRegionOwnerAt(40, TouchKeyboardPromptY() + 2) <> #AIO_KEYBOARD
+    ProcedureReturn 59
+  EndIf
+
+  ; ---------------- 60..69  two fingers, one Enter, one submission -----
+  If GateOpen() = 0
+    ProcedureReturn 60
+  EndIf
+  ke = GateFindLabel("Enter")
+  If ke < 0
+    ProcedureReturn 61
+  EndIf
+  GateContact(GateKeyCx(ke), GateKeyCy(ke), 6, #AIT_DOWN)
+  GateSpin()
+  GateContact(GateKeyCx(ke), GateKeyCy(ke), 7, #AIT_DOWN)
+  GateSpin()
+  ; A key is a key: a second finger on the same face is not a second
+  ; press, so only one contact is armed on it.
+  If TouchKeyboardContactCount() <> 2
+    ProcedureReturn 62
+  EndIf
+  GateContact(GateKeyCx(ke), GateKeyCy(ke), 6, #AIT_UP)
+  GateSpin()
+  GateContact(GateKeyCx(ke), GateKeyCy(ke), 7, #AIT_UP)
+  GateSpin()
+  If gate_enter <> 1
+    ProcedureReturn 63
+  EndIf
+  If TextEditDone() = 0
+    ProcedureReturn 64
+  EndIf
+  ; Enter is a DOWN and an UP, always as a pair, so the release is
+  ; delivered and counted rather than dropped.
+  If gate_keyup <> 1
+    ProcedureReturn 65
+  EndIf
+  If TextEditKeyUps() <> 1
+    ProcedureReturn 66
+  EndIf
+
+  ; ---------------- 70..79  a layout generation change cancels ---------
+  ; A new line, the keyboard open, a finger held on a key - and then the
+  ; screen geometry is rebuilt underneath it, which is what a rotation, a
+  ; screen switch or a renderer reset look like from here.
+  TextEditBegin()
+  InputFocusSet(#AIF_COMMAND_LINE)
+  If GateOpen() = 0
+    ProcedureReturn 70
+  EndIf
+  k = GateFindLabel("a")
+  If k < 0
+    ProcedureReturn 71
+  EndIf
+  GateContact(GateKeyCx(k), GateKeyCy(k), 8, #AIT_DOWN)
+  GateSpin()
+  ; Something to keep: typed text must survive a cancellation.
+  k = GateFindLabel("s")
+  GateContact(GateKeyCx(k), GateKeyCy(k), 9, #AIT_DOWN)
+  GateSpin()
+  GateContact(GateKeyCx(k), GateKeyCy(k), 9, #AIT_UP)
+  GateSpin()
+  len0 = TextEditLength()
+  If len0 <> 1
+    ProcedureReturn 72
+  EndIf
+  If TouchKeyboardContactCount() <> 1
+    ProcedureReturn 73
+  EndIf
+  TouchKeyboardLayoutInvalidate()
+  GateSpin()
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 74
+  EndIf
+  If InputCaptureCount() <> 0
+    ProcedureReturn 75
+  EndIf
+  If InputCancelReason() <> #AIC_LAYOUT_CHANGE
+    ProcedureReturn 76
+  EndIf
+  ; RETAIN TYPED TEXT. That is the rule, and it is the whole reason a
+  ; cancellation is about contacts and modifiers and nothing else.
+  If TextEditLength() <> len0
+    ProcedureReturn 77
+  EndIf
+  ; The finger that was on the key finally lifts, against geometry that
+  ; no longer exists. It types nothing.
+  n0 = gate_text
+  GateContact(GateKeyCx(kq), GateKeyCy(kq), 8, #AIT_UP)
+  GateSpin()
+  If gate_text <> n0
+    ProcedureReturn 78
+  EndIf
+  ; Nothing owns a rectangle while there is no layout to own one with.
+  If InputRegionOwnerAt(40, 790) <> #AIO_POINTER
+    ProcedureReturn 79
+  EndIf
+
+  ; ---------------- 80..89  the payload takes the machine --------------
+  ; Lay it out again, open it, hold a modifier and a key - then hand the
+  ; processor over.
+  TouchKeyboardLayout(@gate_m)
+  GateSpin()
+  If GateOpen() = 0
+    ProcedureReturn 80
+  EndIf
+  ; THE LETTER IS FOUND BEFORE SHIFT GOES DOWN. A key's label is the
+  ; character it would produce RIGHT NOW, so with Shift held the z key
+  ; answers to "Z" - which is the model telling the truth about what is
+  ; on the glass, and exactly what a user needs to see.
+  kw = GateFindLabel("z")
+  If kw < 0
+    ProcedureReturn 81
+  EndIf
+  k = GateFindLabel("Shift")
+  If k < 0
+    ProcedureReturn 81
+  EndIf
+  GateContact(GateKeyCx(k), GateKeyCy(k), 11, #AIT_DOWN)
+  GateSpin()
+  If GateFindLabel("Z") <> kw
+    ProcedureReturn 81
+  EndIf
+  GateContact(GateKeyCx(kw), GateKeyCy(kw), 12, #AIT_DOWN)
+  GateSpin()
+  len0 = TextEditLength()
+  If TouchKeyboardContactCount() <> 2
+    ProcedureReturn 82
+  EndIf
+  TouchKeyboardPayloadSuspend()
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 83
+  EndIf
+  If TouchKeyboardShiftHeld() <> 0
+    ProcedureReturn 84
+  EndIf
+  If InputCaptureCount() <> 0
+    ProcedureReturn 85
+  EndIf
+  If InputCancelReason() <> #AIC_PAYLOAD
+    ProcedureReturn 86
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn 87
+  EndIf
+  If InputRegionOwnerAt(40, 790) <> #AIO_POINTER
+    ProcedureReturn 88
+  EndIf
+  ; THE TYPED TEXT SURVIVES THE HANDOVER. It belongs to whoever typed it.
+  If TextEditLength() <> len0
+    ProcedureReturn 89
+  EndIf
+
+  ; ---------------- 90..99  the service is silent while suspended ------
+  n0 = gate_text
+  GateContact(GateKeyCx(kq), GateKeyCy(kq), 13, #AIT_DOWN)
+  GateContact(GateKeyCx(kq), GateKeyCy(kq), 13, #AIT_UP)
+  GateSpin()
+  If gate_text <> n0
+    ProcedureReturn 90
+  EndIf
+  TouchKeyboardPayloadResume()
+  GateSpin()
+  ; It comes back with nothing shown and nothing laid out: the surface it
+  ; was measured against was in the payload's hands.
+  If TouchKeyboardLayoutOk() <> 0
+    ProcedureReturn 91
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn 92
+  EndIf
+
+  ; ---------------- 100..109  one buffer, two producers ----------------
+  gTkbEnabled = 1
+  TouchKeyboardLayout(@gate_m)
+  TouchKeyboardViewSetVisible(0)
+  TextEditBegin()
+  InputFocusSet(#AIF_COMMAND_LINE)
+  GateSpin()
+  If GateOpen() = 0
+    ProcedureReturn 100
+  EndIf
+  ; A serial byte, then a soft key, then another serial byte. They reach
+  ; one editor through one queue, in the order they were produced.
+  InputFeedByte(#AIS_PHYSICAL, 104)             ; 'h'
+  GateApply()
+  k = GateFindLabel("i")
+  GateContact(GateKeyCx(k), GateKeyCy(k), 14, #AIT_DOWN)
+  GateSpin()
+  GateContact(GateKeyCx(k), GateKeyCy(k), 14, #AIT_UP)
+  GateSpin()
+  InputFeedByte(#AIS_NETWORK, 106)              ; 'j'
+  GateApply()
+  If TextEditLength() <> 3
+    ProcedureReturn 101
+  EndIf
+  If GateLineByte(0) <> 104 Or GateLineByte(1) <> 105 Or GateLineByte(2) <> 106
+    ProcedureReturn 102
+  EndIf
+  ; And the caret is a caret: go home, insert, and the character lands
+  ; where the caret is rather than at the end.
+  k = GateFindLabel("Home")
+  GateContact(GateKeyCx(k), GateKeyCy(k), 15, #AIT_DOWN)
+  GateSpin()
+  GateContact(GateKeyCx(k), GateKeyCy(k), 15, #AIT_UP)
+  GateSpin()
+  If TextEditCaret() <> 0
+    ProcedureReturn 103
+  EndIf
+  k = GateFindLabel("g")
+  GateContact(GateKeyCx(k), GateKeyCy(k), 16, #AIT_DOWN)
+  GateSpin()
+  GateContact(GateKeyCx(k), GateKeyCy(k), 16, #AIT_UP)
+  GateSpin()
+  If TextEditLength() <> 4
+    ProcedureReturn 104
+  EndIf
+  If GateLineByte(0) <> 103 Or GateLineByte(1) <> 104
+    ProcedureReturn 105
+  EndIf
+
+  ; ---------------- 110..119  Esc from the glass, and from the wire ----
+  ; The keyboard's Esc key cancels the EDIT and leaves the keyboard up.
+  ; The chevron hides the keyboard and leaves the edit alone. Never both
+  ; in one event, which is what the design asks for in as many words.
+  k = GateFindLabel("Esc")
+  If k < 0
+    ProcedureReturn 110
+  EndIf
+  GateContact(GateKeyCx(k), GateKeyCy(k), 17, #AIT_DOWN)
+  GateSpin()
+  GateContact(GateKeyCx(k), GateKeyCy(k), 17, #AIT_UP)
+  GateSpin()
+  If TextEditCancelled() = 0
+    ProcedureReturn 111
+  EndIf
+  If TextEditLength() <> 0
+    ProcedureReturn 112
+  EndIf
+  If TouchKeyboardViewVisible() = 0
+    ProcedureReturn 113
+  EndIf
+  ; A physical Esc is byte 27 and it is NOT a keystroke on this monitor -
+  ; an arrow key's escape sequence begins with it, and mapping it would
+  ; throw a line away every time somebody pressed Left on a terminal.
+  TextEditBegin()
+  InputFocusSet(#AIF_COMMAND_LINE)
+  InputFeedByte(#AIS_PHYSICAL, 97)              ; 'a'
+  InputFeedByte(#AIS_PHYSICAL, 27)              ; Esc
+  GateApply()
+  If TextEditLength() <> 1
+    ProcedureReturn 114
+  EndIf
+  If TextEditDone() <> 0
+    ProcedureReturn 115
+  EndIf
+  If TouchKeyboardViewVisible() = 0
+    ProcedureReturn 116
+  EndIf
+
+  ; ---------------- 120..129  a held Backspace repeats, and stops ------
+  TextEditBegin()
+  InputFocusSet(#AIF_COMMAND_LINE)
+  InputFeedByte(#AIS_PHYSICAL, 97)
+  InputFeedByte(#AIS_PHYSICAL, 98)
+  InputFeedByte(#AIS_PHYSICAL, 99)
+  InputFeedByte(#AIS_PHYSICAL, 100)
+  GateApply()
+  If TextEditLength() <> 4
+    ProcedureReturn 120
+  EndIf
+  k = GateFindLabel("Backspace")
+  If k < 0
+    ProcedureReturn 121
+  EndIf
+  GateContact(GateKeyCx(k), GateKeyCy(k), 18, #AIT_DOWN)
+  GateSpin()
+  If TextEditLength() <> 4
+    ProcedureReturn 122
+  EndIf
+  ; Nothing happens for 450 ms, and then one deletion at a time.
+  GateAdvance(#TK_REPEAT_DELAY_MS - 10)
+  If TextEditLength() <> 4
+    ProcedureReturn 123
+  EndIf
+  GateAdvance(20)
+  If TextEditLength() <> 3
+    ProcedureReturn 124
+  EndIf
+  GateAdvance(#TK_REPEAT_INTERVAL_MS)
+  If TextEditLength() <> 2
+    ProcedureReturn 125
+  EndIf
+  ; THE RELEASE AFTER A REPEAT DOES NOT DELETE ONE MORE. That extra
+  ; character is the difference between a keyboard and an annoyance.
+  GateContact(GateKeyCx(k), GateKeyCy(k), 18, #AIT_UP)
+  GateSpin()
+  If TextEditLength() <> 2
+    ProcedureReturn 126
+  EndIf
+  GateAdvance(1000)
+  If TextEditLength() <> 2
+    ProcedureReturn 127
+  EndIf
+
+  ; ---------------- 130..139  the operator's own hand ------------------
+  ; `screen keyboard show` and `screen keyboard hide` exist because the
+  ; band could otherwise only be asked for with a finger, and a console
+  ; that can do everything except the one thing on the screen has a hole
+  ; in it. What has to be true is that it is THE SAME PATH a tap takes -
+  ; the model's intent, then the service tick - and that is what these
+  ; check: after it, the dispatcher holds the band, the console has
+  ; reserved the rows, and a key typed on the glass still reaches the
+  ; editor. A command that reached past the model into the screen half
+  ; would pass a "is it visible" test and fail every one of these.
+  If TouchKeyboardRequest(0) <> 0
+    ProcedureReturn 130
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    ProcedureReturn 131
+  EndIf
+  If InputRegionOwnerAt(40, TouchKeyboardPromptY() + 2) <> #AIO_KEYBOARD
+    ProcedureReturn 132
+  EndIf
+  If TouchKeyboardRequest(1) <> 1
+    ProcedureReturn 133
+  EndIf
+  If TouchKeyboardViewVisible() = 0
+    ProcedureReturn 134
+  EndIf
+  ; The band is the dispatcher's rectangle for this layer now, which is
+  ; what stops a contact on a key reaching the console underneath.
+  If InputRegionOwnerAt(TouchKeyboardBandX() + 4, TouchKeyboardBandY() + 4) <> #AIO_KEYBOARD
+    ProcedureReturn 135
+  EndIf
+  If ConViewRows() <> TouchKeyboardConsoleRows()
+    ProcedureReturn 136
+  EndIf
+  ; And it is a keyboard, not a picture of one: a key tapped on a band
+  ; opened from the console types into the same line the wire does.
+  TextEditBegin()
+  InputFocusSet(#AIF_COMMAND_LINE)
+  k = GateFindLabel("g")
+  If k < 0
+    ProcedureReturn 137
+  EndIf
+  GateContact(GateKeyCx(k), GateKeyCy(k), 21, #AIT_DOWN)
+  GateContact(GateKeyCx(k), GateKeyCy(k), 21, #AIT_UP)
+  GateSpin()
+  If TextEditLength() <> 1
+    ProcedureReturn 138
+  EndIf
+  ; Put away from the same command, and the rows come back.
+  If TouchKeyboardRequest(0) <> 0
+    ProcedureReturn 139
+  EndIf
+  If ConViewReserved() <> 0
+    ProcedureReturn 140
+  EndIf
+
+  ProcedureReturn 0
+EndProcedure

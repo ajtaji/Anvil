@@ -1,0 +1,71 @@
+# Raspberry Pi 4 / BCM2711 - bare-metal boot of Anvil.
+#
+# Copy this file to the root of the FAT boot volume as CONFIG.TXT, beside
+# KERNEL8.IMG and the Raspberry Pi firmware files. Boards/RaspberryPi4/sdcard/
+# README.md in the Anvil repository lists everything else the volume needs.
+#
+# These are the directives the bench board actually boots with. Chapter 3 of
+# the Anvil Guide (docs/guide/03_installing_on_a_pi4.txt) explains each of them
+# at length and quotes the bench's own copy verbatim.
+
+arm_64bit=1
+
+# kernel_address IS NOT OPTIONAL.
+#
+# Anvil is built to run at 0x200000, and its BSS - which includes a large USB
+# host arena - runs well past the end of the image. Loaded at the 64-bit
+# default of 0x80000, that BSS would reach down through 0x100000, which is
+# where Anvil puts its own stack. Loading the image where it was linked keeps
+# the memory map that has actually been tested.
+kernel=kernel8.img
+kernel_address=0x200000
+
+# THE SERIAL CONSOLE ON GPIO14/15 (header pins 8 and 10).
+#
+# disable-bt IS NOT OPTIONAL either, and this one cost an evening. With
+# Bluetooth enabled the Pi 4 gives those header pins to the mini-UART and
+# routes the PL011 to the Bluetooth module - so a program writing to the PL011
+# is talking to a device that works perfectly and is not attached to any wire.
+# Reads came back healthy, writes vanished, and nothing faulted.
+#
+# disable-bt puts the PL011 back on the header, where init_uart_clock then
+# genuinely matters: the mini-UART derives its baud rate from the video core
+# clock, which the firmware scales, while a PL011 with a pinned reference does
+# not move.
+dtoverlay=disable-bt
+enable_uart=1
+init_uart_clock=48000000
+
+# OVERSCAN OFF.
+#
+# Without this the firmware trims 48 pixels from every edge of a TV-style HDMI
+# mode, so a 1920x1080 panel comes up as 1824x984. The display code asks the
+# firmware what the physical size is and then faithfully requests the
+# already-shrunken answer, so the loss is invisible unless you look for it.
+disable_overscan=1
+
+# BENCH-SPECIFIC. DELETE THIS LINE IF YOU HAVE NO DSI PANEL.
+#
+# It names one particular 10.1-inch Waveshare DSI panel. HDMI needs nothing
+# here. The line is kept in this skeleton because it is on the bench volume
+# these instructions were written against, not because you need it.
+dtoverlay=vc4-kms-dsi-waveshare-panel-v2,10_1_inch_a
+
+# OPTIONAL FIRMWARE DIAGNOSTICS.
+#
+# These make the firmware itself talk on the UART before Anvil starts, which is
+# what tells a boot that never reaches Anvil apart from a boot that reaches it
+# and hangs. Harmless to remove once the board is known good.
+uart_2ndstage=1
+dtdebug=on
+
+# ARMSTUB8.BIN - EL3. DELIBERATELY ABSENT, AND READ CHAPTER 3 BEFORE ADDING IT.
+#
+# Adding the single line
+#     armstub=armstub8.bin
+# makes the firmware enter Anvil at EL3 instead of EL2. A monitor watchdog
+# CANNOT repair a bad firmware-stage stub: if the board fails before Anvil
+# starts, nothing on the board can help you and you are restoring files from a
+# host. Prove the image boots at EL2 first, write the stub without resetting,
+# and only then add this one line. Every change to this file on the bench is
+# one additive line, on purpose - one line added is one line to delete.

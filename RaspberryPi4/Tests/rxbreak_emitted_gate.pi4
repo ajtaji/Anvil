@@ -1,0 +1,159 @@
+; Emitted-code gate for the production long-command cancellation mux.
+; The UART and admitted network byte are scripted; rxbreak.pbi itself is
+; compiled unchanged. Main returns the first failing assertion.
+
+Global gate_ticks.i
+Global gToTicks.i = 1000
+Global gate_uartReady.i
+Global gate_uartByte.i
+Global gate_localClaims.i
+Global gate_netPending.i       ; 1 admitted owner byte, 2 rejected peer
+Global gate_netByte.i
+Global gate_netHave.i
+Global gate_busy.i
+Global gate_pumpCalls.i
+Global gate_pumpDepth.i
+Global gate_pumpMax.i
+Global gate_msgDepth.i         ; the message bracket, counted
+Global gate_pumpInMsg.i        ; pumps that ran inside one
+
+; Print/PrintN compiler hooks. The gate cares only about cancellation
+; state, not the prose sent after an abort.
+Procedure str_print_at(p.i)
+EndProcedure
+Procedure PrintDec(v.i)
+EndProcedure
+Procedure PrintNl()
+EndProcedure
+
+Procedure.i Ticks()
+  gate_ticks = gate_ticks + 1
+  ProcedureReturn gate_ticks
+EndProcedure
+Procedure.i UartReadReady()
+  ProcedureReturn gate_uartReady
+EndProcedure
+Procedure.i UartRead()
+  gate_uartReady = 0
+  ProcedureReturn gate_uartByte
+EndProcedure
+Procedure NetConsoleClaimLocal()
+  gate_localClaims = gate_localClaims + 1
+EndProcedure
+Procedure.i NetConsoleGetc()
+  Define c.i
+  If gate_netHave = 0 : ProcedureReturn -1 : EndIf
+  c = gate_netByte
+  gate_netHave = 0
+  ProcedureReturn c
+EndProcedure
+; The message context (RaspberryPi4/Lib/uart.pi4). The pump a long command
+; runs to notice Ctrl-C is background work, so it must run inside one.
+Procedure UartMessageBegin()
+  gate_msgDepth = gate_msgDepth + 1
+EndProcedure
+Procedure UartMessageEnd()
+  gate_msgDepth = gate_msgDepth - 1
+EndProcedure
+
+Procedure NetConsolePump()
+  gate_pumpCalls = gate_pumpCalls + 1
+  If gate_msgDepth > 0 : gate_pumpInMsg = gate_pumpInMsg + 1 : EndIf
+  gate_pumpDepth = gate_pumpDepth + 1
+  If gate_pumpDepth > gate_pumpMax : gate_pumpMax = gate_pumpDepth : EndIf
+  If gate_netPending = 1
+    gate_netHave = 1
+  ElseIf gate_netPending = 2
+    ; The production netconsole gate proves this path emits BUSY and does
+    ; not enqueue. This fixture records the same dispatcher verdict.
+    gate_busy = gate_busy + 1
+  EndIf
+  gate_netPending = 0
+  gate_pumpDepth = gate_pumpDepth - 1
+EndProcedure
+
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+
+Procedure GateResetSources()
+  gate_uartReady = 0
+  gate_netPending = 0
+  gate_netHave = 0
+  gate_busy = 0
+  gate_pumpCalls = 0
+  gate_pumpDepth = 0
+  gate_pumpMax = 0
+  gate_pumpInMsg = 0
+EndProcedure
+
+Procedure.i Main()
+  GateResetSources()
+  OutBreakArm()
+  If OutBreak() <> 0 : ProcedureReturn 1 : EndIf
+
+  ; Ordinary UART characters retain the original any-byte cancellation
+  ; rule and explicitly acquire local ownership.
+  gate_uartByte = 120
+  gate_uartReady = 1
+  If OutBreak() <> 1 : ProcedureReturn 2 : EndIf
+  If gate_localClaims <> 1 Or gate_uartReady <> 0 : ProcedureReturn 3 : EndIf
+  If OutBreak() <> 1 Or gate_localClaims <> 1 : ProcedureReturn 4 : EndIf
+
+  ; Ctrl-C-only mode still consumes an ordinary local character without
+  ; aborting, then aborts on byte 3.
+  OutBreakArm()
+  gate_uartByte = 65
+  gate_uartReady = 1
+  If OutBreakCtrlC() <> 0 Or OutBroke() <> 0 : ProcedureReturn 5 : EndIf
+  If gate_localClaims <> 2 : ProcedureReturn 6 : EndIf
+  gate_uartByte = 3
+  gate_uartReady = 1
+  If OutBreakCtrlC() <> 1 Or OutBroke() = 0 : ProcedureReturn 7 : EndIf
+
+  ; An admitted same-session network byte follows the ordinary any-byte
+  ; rule; Ctrl-C follows the restricted rule. Neither claims local.
+  OutBreakArm()
+  GateResetSources()
+  gate_netByte = 113
+  gate_netPending = 1
+  If OutBreak() <> 1 : ProcedureReturn 8 : EndIf
+  If gate_localClaims <> 3 Or gate_pumpCalls <> 1 : ProcedureReturn 9 : EndIf
+  ; The pump ran inside a message bracket, and the bracket was closed.
+  If gate_pumpInMsg <> 1 : ProcedureReturn 18 : EndIf
+  If gate_msgDepth <> 0 : ProcedureReturn 19 : EndIf
+  OutBreakArm()
+  GateResetSources()
+  gate_netByte = 3
+  gate_netPending = 1
+  If OutBreakCtrlC() <> 1 : ProcedureReturn 10 : EndIf
+  OutBreakArm()
+  GateResetSources()
+  gate_netByte = 90
+  gate_netPending = 1
+  If OutBreakCtrlC() <> 0 Or OutBroke() <> 0 : ProcedureReturn 11 : EndIf
+
+  ; Another peer is rejected by the session dispatcher, receives BUSY,
+  ; and leaves no cancellation byte for rxbreak.
+  OutBreakArm()
+  GateResetSources()
+  gate_netPending = 2
+  If OutBreak() <> 0 : ProcedureReturn 12 : EndIf
+  If gate_busy <> 1 Or gate_netHave <> 0 : ProcedureReturn 13 : EndIf
+
+  ; A callback that asks OutBreak while the network pump is active cannot
+  ; recursively drive that pump. With no admitted byte it returns normally.
+  OutBreakArm()
+  GateResetSources()
+  gBreakNetPump = 1
+  If OutBreak() <> 0 : ProcedureReturn 14 : EndIf
+  If gate_pumpCalls <> 0 Or gate_pumpDepth <> 0 : ProcedureReturn 15 : EndIf
+
+  ; Re-entry may consume an owner byte already admitted before the callback,
+  ; but still must not recurse into transport polling.
+  OutBreakArm()
+  gate_netByte = 3
+  gate_netHave = 1
+  If OutBreakCtrlC() <> 1 : ProcedureReturn 16 : EndIf
+  If gate_pumpCalls <> 0 Or gate_netHave <> 0 : ProcedureReturn 17 : EndIf
+  gBreakNetPump = 0
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,119 @@
+; T0 emitted gate: sfnt/first-TTC directory admission only.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+
+Global Dim ttGate.a[256]
+
+Procedure ttGateBE16(at.i, value.i)
+  PokeA(@ttGate[at], (value >> 8) & $FF)
+  PokeA(@ttGate[at + 1], value & $FF)
+EndProcedure
+
+Procedure ttGateBE32(at.i, value.i)
+  PokeA(@ttGate[at], (value >> 24) & $FF)
+  PokeA(@ttGate[at + 1], (value >> 16) & $FF)
+  PokeA(@ttGate[at + 2], (value >> 8) & $FF)
+  PokeA(@ttGate[at + 3], value & $FF)
+EndProcedure
+
+Procedure ttGateClear()
+  Protected n.i
+  For n = 0 To 255 : PokeA(@ttGate[n], 0) : Next
+EndProcedure
+
+Procedure ttGateFace(base.i, headOffset.i, nameOffset.i)
+  ttGateBE32(base, $00010000)
+  ttGateBE16(base + 4, 2)
+  ttGateBE16(base + 6, 16)
+  ttGateBE16(base + 8, 1)
+  ttGateBE16(base + 10, 0)
+  ; head: checksum is calculated with checkSumAdjustment (bytes 8..11) zero.
+  PokeA(@ttGate[base + 12], 104) : PokeA(@ttGate[base + 13], 101)
+  PokeA(@ttGate[base + 14], 97) : PokeA(@ttGate[base + 15], 100)
+  ttGateBE32(base + 16, $00010000)
+  ttGateBE32(base + 20, headOffset)
+  ttGateBE32(base + 24, 12)
+  PokeA(@ttGate[base + 28], 110) : PokeA(@ttGate[base + 29], 97)
+  PokeA(@ttGate[base + 30], 109) : PokeA(@ttGate[base + 31], 101)
+  ttGateBE32(base + 32, $54455354)
+  ttGateBE32(base + 36, nameOffset)
+  ttGateBE32(base + 40, 4)
+  ttGateBE32(headOffset, $00010000)
+  PokeA(@ttGate[nameOffset], 84) : PokeA(@ttGate[nameOffset + 1], 69)
+  PokeA(@ttGate[nameOffset + 2], 83) : PokeA(@ttGate[nameOffset + 3], 84)
+EndProcedure
+
+Procedure ttGateFont(ttc.i)
+  ttGateClear()
+  If ttc = 0
+    ttGateFace(0, 44, 56)
+    ProcedureReturn 60
+  EndIf
+  PokeA(@ttGate[0], 116) : PokeA(@ttGate[1], 116)
+  PokeA(@ttGate[2], 99) : PokeA(@ttGate[3], 102)
+  ttGateBE32(4, $00010000) : ttGateBE32(8, 1) : ttGateBE32(12, 32)
+  ttGateFace(32, 76, 88)
+  ProcedureReturn 92
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i
+  Protected tagHead.i = $68656164
+  Protected tagName.i = $6E616D65
+  bytes = ttGateFont(0)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) = 0 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeTableCount() <> 2 : ProcedureReturn 2 : EndIf
+  If AnvilTrueTypeFind(tagHead) < 0 Or AnvilTrueTypeFind(tagName) < 0 : ProcedureReturn 3 : EndIf
+  If AnvilTrueTypeTableOffset(AnvilTrueTypeFind(tagHead)) <> 44 : ProcedureReturn 4 : EndIf
+  If AnvilTrueTypeTableLength(AnvilTrueTypeFind(tagName)) <> 4 : ProcedureReturn 5 : EndIf
+  If AnvilTrueTypeTableData(AnvilTrueTypeFind(tagHead)) = 0 : ProcedureReturn 23 : EndIf
+  If PeekA(AnvilTrueTypeErrorText()) <> 0 : ProcedureReturn 24 : EndIf
+
+  bytes = ttGateFont(1)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) = 0 : ProcedureReturn 6 : EndIf
+  If AnvilTrueTypeTableCount() <> 2 : ProcedureReturn 7 : EndIf
+
+  bytes = ttGateFont(0) - 1
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) <> 0 : ProcedureReturn 8 : EndIf
+  If AnvilTrueTypeError() <> #ANVIL_TT_E_TABLE Or AnvilTrueTypeErrorTag() <> tagName : ProcedureReturn 9 : EndIf
+  If AnvilTrueTypeErrorText() = 0 Or PeekA(AnvilTrueTypeErrorText()) <> 84 : ProcedureReturn 22 : EndIf
+
+  bytes = ttGateFont(0)
+  ttGateBE32(16, $DEADBEEF)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) <> 0 : ProcedureReturn 10 : EndIf
+  If AnvilTrueTypeError() <> #ANVIL_TT_E_CHECKSUM Or AnvilTrueTypeErrorTag() <> tagHead : ProcedureReturn 11 : EndIf
+  If AnvilTrueTypeTableCount() <> 0 Or AnvilTrueTypeFind(tagHead) <> -1 : ProcedureReturn 21 : EndIf
+  If AnvilTrueTypeTableData(0) <> 0 : ProcedureReturn 25 : EndIf
+  If PeekA(AnvilTrueTypeErrorText()) <> 84 : ProcedureReturn 26 : EndIf
+
+  ; A later successful open and explicit Close both clear stale T0 state.
+  bytes = ttGateFont(0)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) = 0 : ProcedureReturn 27 : EndIf
+  If PeekA(AnvilTrueTypeErrorText()) <> 0 : ProcedureReturn 28 : EndIf
+
+  bytes = ttGateFont(0)
+  ttGateBE32(20, 240)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) <> 0 : ProcedureReturn 12 : EndIf
+  If AnvilTrueTypeError() <> #ANVIL_TT_E_TABLE Or AnvilTrueTypeErrorTag() <> tagHead : ProcedureReturn 13 : EndIf
+
+  bytes = ttGateFont(0)
+  ttGateBE32(36, 50)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) <> 0 : ProcedureReturn 14 : EndIf
+  If AnvilTrueTypeError() <> #ANVIL_TT_E_OVERLAP Or AnvilTrueTypeErrorTag() <> tagName : ProcedureReturn 15 : EndIf
+
+  bytes = ttGateFont(0)
+  ttGateBE32(28, tagHead)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) <> 0 : ProcedureReturn 16 : EndIf
+  If AnvilTrueTypeError() <> #ANVIL_TT_E_DUPLICATE Or AnvilTrueTypeErrorTag() <> tagHead : ProcedureReturn 17 : EndIf
+
+  bytes = ttGateFont(1)
+  ttGateBE32(12, 240)
+  If AnvilTrueTypeOpen(@ttGate[0], bytes) <> 0 : ProcedureReturn 18 : EndIf
+  If AnvilTrueTypeError() <> #ANVIL_TT_E_TTC Or AnvilTrueTypeErrorOffset() <> 12 : ProcedureReturn 19 : EndIf
+
+  AnvilTrueTypeClose()
+  If AnvilTrueTypeTableCount() <> 0 Or AnvilTrueTypeError() <> #ANVIL_TT_E_NONE : ProcedureReturn 20 : EndIf
+  If AnvilTrueTypeTableData(0) <> 0 Or AnvilTrueTypeTableOffset(0) <> 0 : ProcedureReturn 29 : EndIf
+  If PeekA(AnvilTrueTypeErrorText()) <> 0 : ProcedureReturn 30 : EndIf
+  ProcedureReturn 0
+EndProcedure
+

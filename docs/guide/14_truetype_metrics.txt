@@ -1,0 +1,36 @@
+@CHAPTER TrueType font metrics
+@INTRO T1 turns a checked font file into bounded font-wide metrics and per-glyph advances.
+
+@SECTION The four required tables
+
+T1 consumes a font that T0 has already opened. It reads `head`, `maxp`, `hhea` and `hmtx`. The parser validates each table before publishing any metric. If a later open replaces the font, the old metrics become unavailable.
+
+`head` supplies units per em and the `loca` offset format. `maxp` supplies the glyph count. `hhea` supplies signed ascender, descender and line gap values, plus the number of long horizontal metrics. `hmtx` supplies each long advance and left side bearing.
+
+Most fonts store fewer long metrics than glyphs. After the last long metric, each glyph has only a side bearing. T1 uses the final long advance for those later glyphs, as the table format requires. The gate checks a three-glyph font with two long metrics, including the inherited final advance and a negative side bearing.
+
+@SECTION Optional OS/2 metrics
+
+The `OS/2` table is optional. When present, T1 checks the minimum length for versions 0 through 5 before reading weight, width, typographic ascender, descender and line gap, or Windows ascent and descent. Missing `OS/2` is reported as missing; it is not a font error.
+
+The signed values in `head`, `hhea`, `hmtx` and `OS/2` remain signed. T1 reports a table tag and a byte offset when it refuses a short table, an invalid version or a value outside the supported range.
+
+@SECTION The reader contract
+
+Open T0 first, then call `AnvilTrueTypeMetricsOpen()`. The getters are `AnvilTrueTypeUnitsPerEm()`, `AnvilTrueTypeIndexToLocFormat()`, `AnvilTrueTypeGlyphCount()`, `AnvilTrueTypeAscender()`, `AnvilTrueTypeDescender()`, `AnvilTrueTypeLineGap()` and `AnvilTrueTypeNumberOfHMetrics()`. Call `AnvilTrueTypeHorizontalMetric(glyph, advanceOut, bearingOut)` to fetch one glyph's advance and left side bearing into caller-owned integer storage.
+
+Use `AnvilTrueTypeHasOS2()` before reading optional fields. `AnvilTrueTypeMetricsClose()` clears the decoded values. Every getter also checks the T0 revision, so closing or replacing the source font makes old metrics unavailable even if the caller forgot to close T1 first.
+
+T1 does not map characters to glyphs, read outlines, rasterise, lay out text or draw. Those belong to later milestones. The shared glyph atlas remains the rasterise-once cache consumed by the Vulkan text path.
+
+@SECTION Gate and independent fonts
+
+The emitted gate builds a checksummed sfnt in memory. Its 45 cases cover positive and negative metrics, long and tail horizontal metrics, missing optional `OS/2`, truncated or invalid required tables, invalid `head` and `hhea` values, OS/2 version bounds, glyph range refusal and stale metric state after replacing or closing a font. A source mutant weakens the `hmtx` length check; the gate rejects it.
+
+The same emitted reader was checked against `Abel-Regular.ttf` and `CourierPrime-Regular.ttf`. An independent host parser read their table fields and compared units per em, location format, glyph count, ascender, descender, long metric count and three horizontal metric pairs. Abel reports 2,048 units per em and 259 glyphs; Courier Prime reports 2,048 units per em and 415 glyphs.
+
+The font specimen set contains Abel, Acme, Aladin, Almendra, Amarante, Anton, Arbutus, Arvo, Bangers, Courier Prime, Crimson Text and Lato. These static TrueType fonts come from the Google Fonts repository at commit `f2bd09badbc763d8757951d52deec29da27e85fb`; each is distributed with its SIL Open Font License 1.1 text. The monitor recorded the 12 fonts (1,536,152 font bytes), 12 license files, a manifest and a README on the Pi 4 USB data partition. All files were read back with matching bytes and SHA-256 hashes; the manifest records each source URL, size and digest. See `_work/truetype-fonts-20260918/board-readback.json` for the recorded evidence.
+
+The format references are the [OpenType overview](https://learn.microsoft.com/en-us/typography/opentype/spec/otff), [`head`](https://learn.microsoft.com/en-us/typography/opentype/spec/head), [`maxp`](https://learn.microsoft.com/en-us/typography/opentype/spec/maxp), [`hhea`](https://learn.microsoft.com/en-us/typography/opentype/spec/hhea), [`hmtx`](https://learn.microsoft.com/en-us/typography/opentype/spec/hmtx) and [`OS/2`](https://learn.microsoft.com/en-us/typography/opentype/spec/os2) specifications, and Apple's [TrueType Reference Manual](https://developer.apple.com/fonts/TrueType-Reference-Manual/).
+
+The gate proves metrics only. It does not claim character mapping, outlines, raster coverage, cache behavior or board text rendering.

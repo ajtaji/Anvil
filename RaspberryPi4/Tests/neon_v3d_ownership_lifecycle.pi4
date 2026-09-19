@@ -1,0 +1,23 @@
+; Compile-only lifecycle seam fixture. It never submits a V3D job.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+Procedure.i NeonV3dOwnershipLifecycleCompile()
+  Protected rc.i
+  rc = V3dOwnershipClaim()
+  rc = V3dOwnershipRelease()
+  rc = NeonInit()
+  rc = NeonShutdown()
+  ProcedureReturn rc
+EndProcedure
+
+Procedure Main()
+  ProcedureReturn NeonV3dOwnershipLifecycleCompile()
+EndProcedure

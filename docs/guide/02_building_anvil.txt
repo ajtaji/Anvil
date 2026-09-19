@@ -1,0 +1,365 @@
+; Chapter 2 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   tools/build.py            - the target table, the compiler search,
+;                               the exact command line, the messages.
+;   tools/build_count.py      - the build-number mechanism and the ledger.
+;   tools/build_count_check.py- the gate that holds the mechanism honest.
+;   docs/BUILD_NUMBER.md      - the written rule.
+;   README.md                 - the compiler is an external dependency.
+;
+; DESK RUNS BEHIND THIS CHAPTER (2026-09-16):
+;   python tools/build.py --help              - output quoted verbatim
+;   python tools/build.py pi4  (no compiler)  - refusal quoted verbatim
+;   python tools/build_count.py               - output quoted verbatim
+; The successful-build lines are quoted from the format strings in
+; tools/build.py (lines 143, 209) and tools/build_count.py (line 791)
+; and the chapter SAYS they are, rather than pretending to a run.
+@CHAPTER Building Anvil
+@INTRO One program compiles it, one script drives that program, and every build moves a number that the board can show you.
+
+@SECTION What you need
+
+Three things, and only three.
+
+A checkout of this repository. Python 3, which the build wrapper and
+every check script are written in; they use nothing but the standard
+library. And the PureMetal application, which is the compiler.
+
+The compiler is not in this repository and never will be. It is a
+separate, freely downloadable program, and this repository deliberately
+does not carry a copy so that nobody has to wonder which copy is the
+real one. The README points at where to get it.
+
+@NOTE The editor and the compiler are one program. `PureMetalForge.exe`
+opens a window when you double-click it and compiles with no window at
+all when you pass `--compile`. There is no separate command-line
+compiler to install, and there is no second toolchain hiding underneath
+it - no assembler you must fetch, no linker, no runtime library. The one
+program reads the board source and writes the raw image the board runs.
+
+@SECTION Telling the build where the compiler is
+
+You have three ways, and they are tried in this order: the `--compiler`
+option, then the `PMF_COMPILER` environment variable, then a search of
+your `PATH` for `PureMetalForge.exe`, `PureMetalForge.linux` and
+`PureMetalForge`.
+
+There is no built-in default path. If none of the three finds anything,
+the build refuses and tells you all three ways in one sentence. That is
+what you will see:
+
+@FRAG
+$ python tools/build.py pi4
+PureMetal compiler not found. Put PureMetalForge on PATH, set
+PMF_COMPILER, or pass --compiler /path/to/PureMetalForge.exe. The same
+application is the IDE and the command-line compiler; --compile selects
+the build.
+@ENDFRAG
+
+(That refusal really is one long line; it is wrapped here to fit the
+page. Every other transcript in this book is unwrapped.)
+
+Pick whichever of the three suits you. On PowerShell:
+
+@FRAG
+$env:PMF_COMPILER = "C:\PureMetal\PureMetalForge.exe"
+python tools/build.py all
+@ENDFRAG
+
+On a shell where `python3` is the spelling:
+
+@FRAG
+python3 tools/build.py all --compiler /path/to/PureMetalForge.exe
+@ENDFRAG
+
+@TRAP A retired console compiler called `pmfc` used to exist. It is
+gone, and the build refuses it **by name** - if you point `--compiler` or
+`PMF_COMPILER` at anything whose filename stem is `pmfc`, the build
+stops rather than using it. This is deliberate. An old `pmfc` on a
+machine still runs and still produces an image, and that image is built
+by a compiler nobody is maintaining. Do not go looking for one.
+
+@SECTION The targets
+
+Run `python tools/build.py --help` and the list is the first thing you
+see. This is the whole of it:
+
+@FRAG
+$ python tools/build.py --help
+usage: build.py [-h] [--compiler COMPILER]
+                [{all,pi3,pi4,unoq,pi3-loader,pi3-updater,pi3-monitor,armstub,rockpi4c}]
+
+Build Anvil targets with the PureMetal application in command-line mode. The
+editor and the compiler are one program: `PureMetalForge.exe --compile` builds
+without opening a window. Point at it with --compiler or PMF_COMPILER.
+
+positional arguments:
+  {all,pi3,pi4,unoq,pi3-loader,pi3-updater,pi3-monitor,armstub,rockpi4c}
+
+options:
+  -h, --help            show this help message and exit
+  --compiler COMPILER   path or command name of PureMetalForge (or set
+                        PMF_COMPILER); it is run with --compile
+@ENDFRAG
+
+There are exactly two options and one optional target name. The target
+defaults to `all`.
+
+What each target builds, and where it lands:
+
+@FRAG
+pi4              RaspberryPi4/Board/board.pi4    -> build/pi4/anvil.img
+unoq             ArduinoQ/Board/board.unoq       -> build/unoq/anvil.img
+pi3-loader       RaspberryPi3/Board/loader.pi3   -> build/pi3/kernel8.img
+pi3-updater      RaspberryPi3/Board/updater.pi3  -> build/pi3/anvil.img
+                                                 +  build/pi3/anvil-slot.img
+pi3-monitor      RaspberryPi3/Board/board.pi3    -> build/pi3/anvil-monitor.img
+                                                 +  build/pi3/anvil-monitor-slot.img
+armstub          RaspberryPi4/Board/armstub8.asm -> build/pi4/armstub8.bin
+rockpi4c         RockPi4C/Board/board.rockpi4c   -> build/rockpi4c/anvil-flat.img
+                                                 +  build/rockpi4c/Image
+pi3              an alias for pi3-loader, pi3-updater and pi3-monitor
+all              pi4 and unoq, and nothing else
+@ENDFRAG
+
+@NOTE `pi3-monitor` was called `pi3-diagnostic` until 2026-09-18, and the
+build passed it the cold entry's load and stack addresses on the command
+line, because `board.pi3` was a program that printed and parked. It is the
+Pi 3's monitor now, it states its own placement in the source - the A/B
+slot contract's - and no address flags are passed. Declaring a placement
+in two places is how a build from the editor and a build from a script
+stop being the same bytes.
+
+@NOTE `all` means the two shipping monitors, not everything in the list.
+The EL3 firmware stub in particular is never built by `all`, never
+installed by a build, and has its own chapter-3 warning attached to it.
+Building experimental boot firmware as a side effect of typing `all`
+would be exactly the kind of quiet surprise this project refuses to
+ship.
+
+If you only care about the Raspberry Pi 4 - which is what most of this
+book is about - one target is all you need:
+
+@FRAG
+python tools/build.py pi4
+@ENDFRAG
+
+@SECTION What the build actually runs
+
+No magic and nothing hidden. For the Pi 4 the wrapper runs this, from
+the repository root:
+
+@FRAG
+PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4 -o build/pi4/anvil.img
+@ENDFRAG
+
+Two details about that invocation are worth knowing, because they are
+what stop a build from being quietly wrong.
+
+First, the wrapper sets `PMF_ROOT` to this checkout. Every include in
+this repository is written relative to the repository root, so pinning
+the root means a missing file **fails** instead of being silently
+borrowed from some other PureMetal installation on the same machine. A
+build that quietly picked up last month's driver from a different
+folder would be the worst kind of bug: it compiles, it runs, and it is
+not your source.
+
+Second, the wrapper copies the compiler into a temporary directory next
+to a copy of this repository's `Boards/` profiles before running it. The
+compiler resolves board profiles beside its own executable, outside
+`PMF_ROOT`, so staging it is the only way to guarantee that the target
+profile used is this repository's.
+
+You will also notice there are no address flags on the Pi 4 or UNO Q
+command lines. Those boards declare their own load, BSS and stack
+addresses in their source. The Pi 3 diagnostic and the ROCK Pi 4C pass
+them on the command line instead. Chapter 5 explains what those three
+addresses mean, because a payload you write will have to state all
+three.
+
+@SECTION What you will see
+
+Three lines for a clean Pi 4 build, in this order: the announcement, the
+size, and the build number.
+
+@FRAG
+Building pi4: RaspberryPi4/Board/board.pi4 -> build/pi4/anvil.img
+Built build/pi4/anvil.img (2930784 bytes).
+  #ANVIL_BUILD raised from 141 to 142 in board.pi4 after a successful build; build date set to 20260915 and build time to 221311.
+@ENDFRAG
+
+Those are the wrapper's own three messages with real values filled in;
+they are not a screenshot of one session, and the byte count and the
+numbers are from this repository's build directory and its ledger rather
+than from a run made while writing this chapter. The wording is exact.
+
+A failure is a full sentence and it tells you the state you are left in:
+
+@FRAG
+The pi4 build failed with exit code 1. Its build identity and prior artifacts were preserved.
+@ENDFRAG
+
+@NOTE "Prior artifacts were preserved" is a promise, not a hope. Each
+build compiles to a private staged filename and only moves the result
+into place at the end, keeping a backup while it does. A compiler crash,
+a full disk or a failed hash leaves your previous working image exactly
+where it was. You never end up with half an image at the name you were
+about to flash.
+
+@SECTION The build number, and why it moves every single time
+
+Type `version` on a board and it prints a number. That number exists so
+that a person can tell which image is running without hashing anything -
+and that only works if the number moves with **every** build, including
+the ones nobody meant to keep.
+
+It lives in the board source itself, as an ordinary trailing comment on
+a constant:
+
+@FRAG
+#ANVIL_BUILD = 142        ; pmf:build
+#ANVIL_BUILD_DATE = 20260915   ; pmf:builddate
+#ANVIL_BUILD_TIME = 220310     ; pmf:buildtime
+@ENDFRAG
+
+`tools/build_count.py` is the one mechanism that moves it. Every tool in
+`tools/` that compiles a real board file calls it after a compile it has
+proven succeeded. It works out which real board file the compiled path
+was a build of - a temporary copy included - raises the number by
+exactly one, rewrites the date and time beside it, and appends one line
+to `build/BUILDS.log` carrying the image hash and the name of the tool
+that asked.
+
+You can read the current state at any time. This is a real desk run:
+
+@FRAG
+$ python tools/build_count.py
+pi3: 7  (RaspberryPi3/Board/board.pi3)
+pi3-loader: 9  (RaspberryPi3/Board/loader.pi3)
+pi3-updater: 12  (RaspberryPi3/Board/updater.pi3)
+pi4: 142  (RaspberryPi4/Board/board.pi4)
+unoq: 53  (ArduinoQ/Board/board.unoq)
+rockpi4c: 80  (RockPi4C/Board/board.rockpi4c)
+ledger: build/BUILDS.log - 221 recorded builds
+@ENDFRAG
+
+A ledger line looks like this:
+
+@FRAG
+2026-09-16T03:13:44Z target=pi4 build=142 stamp=20260915-221311 board=RaspberryPi4/Board/board.pi4 source=RaspberryPi4/Board/board.pi4 image=_work/flash-candidate-build142-20260915/anvil.img sha256=ec9abb8418344b38b3638b6d6980e0e7c0d81ba52eb967bbbb6b47c0a25ce439 compiler=06efee6763efb53ae5a2ca325b367ce9cbb8cb80680d76d491d82de44120b740 by=tools/build.py compile=4ef69b3f86436462
+@ENDFRAG
+
+The `stamp` is the local date and time the board will print. The
+`sha256` is of the image. The `compiler` field is the hash of the
+compiler executable that produced it, so an image can be traced to the
+exact compiler build. `by` names the tool. `compile` is a short
+fingerprint of the compiled source, which is how the same compile is
+never counted twice.
+
+@TRAP There is **no way to build without counting**, and that is on
+purpose. Gate scripts compile the monitor too - often ten or more times
+in a single run, into temporary directories - and for a while those were
+invisible. Ten images went out over one evening all claiming to be the
+same build, which makes `version` a lie and makes a board impossible to
+identify. The compiler's own bump flag was the cause: it bumped whatever
+file it was handed, which for a gate is a throwaway copy. Nothing passes
+that flag any more, and the opt-out that used to exist is gone. A
+verification build is still a build.
+
+There is exactly one way to hold the number still, and it is for a
+release, where the number is supposed to stand still:
+
+@FRAG
+#ANVIL_BUILD = 142        ; pmf:build off
+@ENDFRAG
+
+The build still happens and is still written to the ledger; the line
+just carries `frozen=yes` and the number does not move.
+
+@NOTE `build/BUILDS.log` is not committed. The durable count is the
+marker line in the board source, which is; the ledger is local evidence
+about this machine. A mechanism nobody checks is a mechanism that rots,
+so there is a gate for it: `python tools/build_count_check.py` runs
+twelve named checks and eight deliberate sabotages, each of which must
+be rejected by the check that owns that property. Chapter 10 is about
+how that style of gate works.
+
+@SECTION What lands in build/
+
+`build/` is ignored by Git. Nothing in it is source and everything in it
+can be reproduced by building again.
+
+For each target you get the image plus a set of sidecar files the
+compiler writes beside it:
+
+@FRAG
+anvil.img            the raw binary the board executes
+anvil.img.pmf        the same image inside a PMFBOOT container
+anvil.img.sym        flat symbol table, one name=address per line
+anvil.img.sym.meta   per-symbol size, kind, scope and origin
+anvil.img.dbg        address -> source file and line
+@ENDFRAG
+
+There are no `.elf` files and no linker map, because there is no link
+step. The compiler writes the flat image and these sidecars directly.
+
+The `.pmf` file is the one to understand, because chapters 5 and 6 both
+lean on it. It is the image with a fixed-size header in front carrying
+the load address, the entry address, the BSS address and length, the
+stack address, flags, and a SHA-256 of the image bytes. A loader can
+therefore place and enter the image correctly without being told
+anything out of band - the container says where it goes.
+
+@TRAP The build treats a missing `.pmf` as an incomplete build and
+refuses to publish anything:
+
+@FRAG
+The pi4 compiler wrote an image without its PMF container. Nothing was published and the build number was not consumed.
+@ENDFRAG
+
+An image with no container is a file that somebody will later have to
+guess the load address for, and guessing a load address on this machine
+is how you overwrite a running monitor. Better to fail now.
+
+@SECTION Building the EL3 stub, which is not part of all
+
+The optional Pi 4 firmware stub is 512 bytes of AArch64 that runs before
+Anvil does. It is built on its own and it is **not installed by any
+build**:
+
+@FRAG
+python3 tools/build.py armstub --compiler /path/to/PureMetalForge.exe
+python3 tools/a64/a64_el3_check.py --compiler /path/to/PureMetalForge.exe
+python3 tools/a64/el3_runtime_emitted_check.py --compiler /path/to/PureMetalForge.exe
+@ENDFRAG
+
+That produces `build/pi4/armstub8.bin`. It is the only target whose
+output has no `.pmf` container, because it is not a container - the
+firmware loads it raw at a fixed address.
+
+Chapter 3 says what the stub does, why you might want it, and the
+specific reason not to install it unless you can physically recover the
+board.
+
+@SECTION Verifying the tree before you hand it to anyone
+
+Two commands, and the difference between them matters:
+
+@FRAG
+python3 tools/verify_export.py --working-tree
+python3 tools/verify_export.py
+@ENDFRAG
+
+The first checks your complete non-ignored working tree. The second
+checks the exact set of files Git is tracking - which is the set another
+person would actually receive. The verifier checks repository
+boundaries, required licence notices, source include closures, and
+whether every dependency of both board entry files is present in the
+selected public tree.
+
+That last check is the one that earns its keep. A build works on your
+machine because the file it needs happens to be sitting there untracked.
+It fails on the first clone somebody else makes, and it fails with a
+missing-include error that tells them nothing about your working
+directory. Run the tracked-set form before you publish anything.

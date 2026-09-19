@@ -1,0 +1,1399 @@
+; ======================================================================
+;  screen_source.pi4 - THE DISPLAY SEAM.
+;
+;  A screen this monitor can put its console on is a framebuffer plus a
+;  way to present it. This file is the whole of what the two kinds of
+;  screen on a Raspberry Pi 4 have in common, and the whole of what makes
+;  them different.
+;
+;  ---- WHY THERE IS A SEAM AT ALL -------------------------------------
+;
+;  Until today "the screen" meant one thing: ask the VideoCore firmware
+;  for a framebuffer, draw on what it hands back. That is HDMI, and it
+;  works because the firmware brings HDMI up before this program loads.
+;
+;  It does not work for the DSI panel and it never can. The firmware
+;  never brings DSI1 up on this board - the block's power domain is off
+;  at boot and nothing in config.txt on the bench stick tells it
+;  otherwise - so the firmware owns NO DSI display. `screen displays`
+;  asks the firmware and gets zero, and that answer is correct: there is
+;  no firmware display. The panel is lit by this monitor, out of this
+;  monitor's own memory, through a display list this monitor writes.
+;
+;  So the two screens differ in exactly one thing - WHERE THE
+;  FRAMEBUFFER COMES FROM - and are identical in everything after it.
+;  That difference is what this file is. Above it, screen_cmd.pi4 builds
+;  the same console on whichever surface it is given. Below it,
+;  display.pi4 draws on whatever surface it was installed with
+;  (DisplayInit for the firmware's, DisplayAdopt for ours).
+;
+;  THE SEAM IS NOT A FLAG. There is no `If dsi` inside a drawing
+;  primitive, inside the console grid, inside the cursor, or inside the
+;  keyboard. Those four never learn which screen they are on.
+;
+;  ---- WHAT A SOURCE HAS TO ANSWER -------------------------------------
+;
+;    ScrSourceName(src)     what to call it in a sentence
+;    ScrSourceCount(src)    how many of this kind the board has now
+;    ScrSourceUp(src, idx)  acquire a surface and install it
+;    ScrPresent(y0, y1)     make rows y0..y1 of what was drawn visible
+;
+;  HDMI's present is empty because the firmware scans the same bytes the
+;  console draws into. The DSI panel's present is empty too at rotation
+;  0 and 180, and is a transpose at 90 and 270 - see THE ROTATION below.
+;
+;  ---- INCLUDE ORDER ---------------------------------------------------
+;
+;  After display.pi4 (the library and the board's), hvs.pi4,
+;  dsi_host.pi4, dsi_panel_v2.pi4, dsi_panel_v2_dcs.pi4, i2c.pi4,
+;  mmu.pi4, memmap.pi4 and Anvil/Core/settings.pbi. Before
+;  screen_cmd.pi4, which drives it.
+; ======================================================================
+
+
+; ======================================================================
+;  THE ROTATION, AND WHAT IT COSTS - READ THIS BEFORE CHANGING IT
+;
+;  THE PANEL IS PORTRAIT AND THAT IS NOT A SETTING. The Waveshare 10.1
+;  scans 800 pixels across and 1280 down; the pixel valve was programmed
+;  with those numbers and read them back (PV_HORZB 00CF0320,
+;  PV_VERTB 00140500). Nothing this program does changes the direction
+;  the panel's own driver ICs walk their rows.
+;
+;  THE HVS HAS NO 90 DEGREE ROTATION. Not "it is not wired up here" -
+;  the block does not have one. vc4_plane.c:2782-2786 declares the
+;  complete set of rotations a VC4/VC5 plane can be asked for:
+;
+;      DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180 |
+;      DRM_MODE_REFLECT_X | DRM_MODE_REFLECT_Y
+;
+;  and vc4_plane.c:1979-1985 reduces whatever DRM asked for down to those
+;  before a single display-list word is written. There is no ROTATE_90
+;  bit to set. 180 degrees is the two mirrors at once, and both mirrors
+;  are free - one bit each in POS0, no pixel moved.
+;
+;  SO 90 AND 270 ARE THE RENDERER DRAWING TRANSPOSED, AND THAT IS THE
+;  WHOLE COST:
+;
+;    * TWO BUFFERS INSTEAD OF ONE. The console draws into a landscape
+;      1280x800 buffer (#MON_FB_DRAW) and the panel scans the portrait
+;      800x1280 one (#MON_FB_SCAN). At 0 and 180 they are the same
+;      buffer and the second is untouched memory.
+;
+;    * A TRANSPOSE ON EVERY REPAINT. One logical row is one COLUMN of
+;      the scanned picture, so it is not a memcpy in either direction.
+;      It is done damage-driven - only the rows the console actually
+;      repainted - and walked so that the DESTINATION runs are
+;      contiguous, which is the half that matters: the loop below steps
+;      the scanned buffer's rows on the outside and writes a short
+;      contiguous run of each. A one-line change to the log is a few
+;      tens of thousands of pixels; a full-screen scroll is all
+;      1,024,000 of them.
+;
+;    * DMA SCROLL STAYS IN THE LOGICAL DRAW BUFFER. A turned row is not
+;      contiguous in the scanned buffer, but it is contiguous in
+;      #MON_FB_DRAW, so ScreenFastScroll still moves it there. The present
+;      then transposes the whole changed console band. V3D does better: it
+;      renders the rebuilt grid already transformed into a physical back
+;      buffer, then DMA presents one contiguous frame to #MON_FB_SCAN.
+;
+;  0 AND 180 KEEP EVERY FAST PATH, AND THE DEFAULT IS NOT ONE OF THEM.
+;  The ruling of 2026-09-08 is that the panel is used landscape, because
+;  that is how it fits on the bench. It is bolted to the frame long edge
+;  across, so a console that scans the way the panel scans is a console
+;  standing on its side, and the fastest possible way to draw an
+;  unreadable screen is not a saving. The default is 90 and the cost
+;  above is paid deliberately, every repaint. `screen rotate 0` gets the
+;  fast paths back for anyone who wants the 100 x 72 portrait console;
+;  it is one command and it is saved.
+;
+;  WHAT THE COST ACTUALLY IS, IN NUMBERS, SO IT IS NOT A VAGUE WORRY.
+;  The panel is 1,024,000 pixels. A full repaint transposes all of them;
+;  a one-line change at 16 x 32 cells transposes 32 logical rows, which
+;  is 32 x 1280 = 40,960 pixels, about a twenty-fifth of the screen. The
+;  console is a monitor's log, not a game: it repaints when somebody
+;  types or a line is printed.
+; ======================================================================
+
+; THE CONSTANTS AND THE ARITHMETIC ARE IN screen_geom.pi4, NOT HERE.
+; #SCR_SRC_*, the >= 80 column font rule, the rotation map, the boot
+; choice and the transpose are all functions of their arguments, and
+; they live in a file with no hardware in it so that
+; tools/a64/a64_dsiscreen_check.py can EXECUTE them - the real image,
+; on the emulator, on a machine with no VideoCore. Everything below
+; this line touches registers, I2C, the mailbox or the settings store,
+; which is exactly why it is not there.
+
+Global gScrSrc.i    = #SCR_SRC_NONE  ; what the running screen is on
+Global gScrRot.i    = 0              ; the rotation IN EFFECT, degrees
+Global gScrScale.i  = 1              ; the font magnification IN EFFECT.
+                                     ; Assigned in ONE place, ScreenUpOn's
+                                     ; shared tail, and read by every report.
+Global gScrDsiUp.i  = 0              ; 1 once the DSI pipeline is scanning
+Global gScrDsiSeen.i = -1            ; -1 not looked yet, 0 no panel
+                                     ; answered, 1 the panel micro did
+Global gScrDsiStep.i = 0             ; the bring-up step that stopped, or 0
+Global gScrDsiLine0.i = 0            ; the scan line counter, read twice
+Global gScrDsiLine1.i = 0            ; 20 ms apart. Different = scanning.
+
+; The scratch the rotation is turned into text in before it is handed to
+; SettingsSet, which takes a NUL-terminated string and not a number.
+; Four bytes of digits at the outside; sixteen so nobody has to think
+; about it again.
+Global Dim gScrRotBuf.a[16]
+
+; The same, for `screen scale`. A separate buffer rather than a shared
+; one: the two commands never run at the same time today, and a shared
+; scratch is the kind of saving that is correct until the day somebody
+; sets both from one line.
+Global Dim gScrScaleBuf.a[16]
+
+; A live DSI geometry change is two-phase because the HVS may accept a
+; newly selected display list after the caller's bounded wait expires.
+Global gScrReadoptPending.i
+Global gScrReadoptRot.i
+Global gScrReadoptScale.i
+Global gScrReadoptBase.i
+Global gScrReadoptPitch.i
+Global gScrReadoptW.i
+Global gScrReadoptH.i
+
+; The bring-up steps, so a failure names itself rather than printing a
+; number. See ScrDsiBringUp.
+#SCR_DSI_STEP_DOMAIN = 1
+#SCR_DSI_STEP_I2C    = 2
+#SCR_DSI_STEP_MCU    = 3
+#SCR_DSI_STEP_PLAN   = 4
+#SCR_DSI_STEP_CLOCKS = 5
+#SCR_DSI_STEP_HOST   = 6
+#SCR_DSI_STEP_PANEL  = 7
+#SCR_DSI_STEP_HVS    = 8
+
+
+Procedure ScrSourceName(src.i)
+  If src = #SCR_SRC_DSI
+    Print("the DSI panel")
+  ElseIf src = #SCR_SRC_HDMI
+    Print("HDMI")
+  Else
+    Print("no display")
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  THE DSI PANEL AS A SCREEN
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  ScrDsiPanelSeen - IS A PANEL PLUGGED IN? One I2C conversation, and it
+;  costs nothing when the answer is no.
+;
+;  The panel's micro is at $45 on the DISPLAY connector's bus, and it
+;  answers three read-only identity registers. Reading them proves more
+;  than an address ACK does: three bytes came back from a part that had
+;  to be addressed, hold a register number across a repeated start, and
+;  drive data. It does NOT prove any differential lane works - the I2C
+;  pair and the DSI lanes are different wires in the same flat cable -
+;  but a ribbon that carries I2C is seated, and a board with nothing
+;  plugged in cannot fake it.
+;
+;  IT DOES NOT POWER ANYTHING. DsiV2Identify() reads; the rails are
+;  DsiV2Begin()'s job and that happens in the bring-up, only if this
+;  said yes. A board with no panel therefore does no DSI work at all at
+;  boot - no domain message, no clock change, no PHY - which is the
+;  property that makes this safe to run on every boot of every board.
+;
+;  The bus is selected and PUT BACK, the same contract touch_cmd and
+;  dsi_cmd use, so a later `i2c scan` cannot report this bus's devices
+;  under a heading naming the header pins.
+; ----------------------------------------------------------------------
+Procedure.i ScrDsiPanelSeen()
+  Define ok.i
+
+  If gScrDsiSeen >= 0
+    ProcedureReturn gScrDsiSeen
+  EndIf
+
+  gScrDsiSeen = 0
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  If I2cUp() <> 0
+    If DsiV2Identify() <> 0
+      If DsiV2Plausible() = 1
+        gScrDsiSeen = 1
+      EndIf
+    EndIf
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  ProcedureReturn gScrDsiSeen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrDsiBringUp - THE PANEL, FROM DARK TO SCANNING.
+;
+;  This is the seventh pass's sequence made a library path. It is NOT
+;  the `dsi` probe commands: those print a page each, are written to be
+;  read by somebody at a prompt, and stop where a probe should stop.
+;  This runs at boot, prints four lines, and either works or says which
+;  step did not.
+;
+;  THE ORDER IS THE DRIVER'S AND IT IS NOT NEGOTIABLE:
+;
+;   1 the firmware power domain          vc4_dsi.c:937 - pm_runtime first
+;   2 the panel's rails, over I2C        panel-waveshare-dsi-v2.c
+;   3 the link clock and the D-PHY       vc4_dsi.c
+;   4 the panel's DCS init table         200 commands, needs 3 to carry it
+;   5 the HVS channel over the buffer    vc4_hvs.c
+;   6 the pixel valve, then video, then
+;     VIDEN last                         vc4_crtc.c:657-703
+;
+;  NOTHING HERE CAN STRAND THE BOOT. Every step is bounded by its own
+;  library's timeouts, the panel's init table gives up after a run of
+;  failures rather than grinding through 200 of them, and a failure at
+;  any step returns 0 with the serial line and the network console
+;  untouched. The one call that could take time on a board with no panel
+;  - all of it - is never reached, because ScrDsiPanelSeen() said no.
+;
+;  It is idempotent: called twice, the second call re-runs the sequence
+;  on hardware that is already up, which is what `screen on dsi` typed
+;  at a running panel has to do anyway.
+; ----------------------------------------------------------------------
+Procedure.i ScrDsiBringUp()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define ok.i
+
+  gScrDsiUp = 0
+  gScrDsiStep = 0
+
+  ; ---- 1. the power domain, before any DSI1 register is touched ------
+  ; Without this every register below reads back perfectly and the block
+  ; drives nothing at all. It is the whole finding of 2026-09-08.
+  If DsiDomainOn() = 0
+    gScrDsiStep = #SCR_DSI_STEP_DOMAIN
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 2. the panel's rails ------------------------------------------
+  ; The rails come BEFORE the host: a host brought up against lanes
+  ; nobody is holding latches a contention error before anything has
+  ; been asked of it, and an unpowered panel holds nothing.
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  If I2cUp() = 0
+    I2cSelectBus(#I2C_BUS_HEADER)
+    gScrDsiStep = #SCR_DSI_STEP_I2C
+    ProcedureReturn 0
+  EndIf
+  If DsiV2Begin() = 0
+    I2cSelectBus(#I2C_BUS_HEADER)
+    gScrDsiStep = #SCR_DSI_STEP_MCU
+    ProcedureReturn 0
+  EndIf
+  ok = DsiPanelRails()
+  If DsiV2Backlight(255) = 0
+    ok = 0
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  If ok = 0
+    gScrDsiStep = #SCR_DSI_STEP_MCU
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 3. the link clock and the D-PHY -------------------------------
+  If DsiModePlan(70000000) = 0
+    gScrDsiStep = #SCR_DSI_STEP_PLAN
+    ProcedureReturn 0
+  EndIf
+  If DsiClocksSet() = 0
+    gScrDsiStep = #SCR_DSI_STEP_CLOCKS
+    ProcedureReturn 0
+  EndIf
+  DsiHostBringUp()
+  If DsiIsUp() = 0
+    gScrDsiStep = #SCR_DSI_STEP_HOST
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 4. the panel's own init table, over the link just built -------
+  ; DsiV2Begin() AGAIN, and it is not redundant: the reference sequence
+  ; that produced a lit panel on this board ran the expander's power-on
+  ; write before the rails and again before the table, and this is that
+  ; sequence rather than a tidied version of it. Rule 21 - reproduce
+  ; what was measured; a rearrangement is a new experiment.
+  ;
+  ; The backlight goes back on AFTER it, and that has to be said out
+  ; loud: DsiV2Begin() rewrites the whole sixteen-bit expander shadow to
+  ; the probe state, which CLEARS the backlight enable. A perfect picture
+  ; behind a dark backlight is indistinguishable from no picture at all,
+  ; and it is exactly the self-inflicted blank screen that gets blamed on
+  ; the flat cable.
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  ok = 1
+  If DsiV2Begin() = 0
+    ok = 0
+  EndIf
+  If ok <> 0
+    If DsiPanelPrepare() = 0
+      ok = 0
+    EndIf
+  EndIf
+  If DsiV2Backlight(255) = 0
+    ok = 0
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  If ok = 0 Or DsiPanelSent() = 0
+    gScrDsiStep = #SCR_DSI_STEP_PANEL
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 5 and 6. the HVS over our buffer, then the valve, then video --
+  ; The buffer is cleared first. The HVS starts scanning the instant the
+  ; channel is enabled, and whatever DRAM held at #MON_FB_SCAN would
+  ; otherwise be the first thing on the glass.
+  HvsFill(#MON_FB_SCAN, #MON_FB_PANEL_W, #MON_FB_PANEL_H, $FF000000)
+  MmuCleanRange(#MON_FB_SCAN, #MON_FB_BYTES)
+
+  ; The mirrors before the list is written, so the list carries them.
+  If gScrRot = 180
+    HvsMirror(1, 1)
+  Else
+    HvsMirror(0, 0)
+  EndIf
+
+  HvsUp(#MON_FB_SCAN, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+
+  ; The vertical numbers are the panel's own timing, unchanged from the
+  ; sequence that scanned on this board: 1280 active, sync 1300..1320,
+  ; total 1324.
+  PvUp(#MON_FB_PANEL_W, DsiHsyncS(), DsiHsyncE(), DsiHtotal(), #MON_FB_PANEL_H, 1300, 1320, 1324)
+  PvEnable()
+  DsiVideoOn()
+  PvVideoOn()
+
+  ; ---- IS IT ACTUALLY SCANNING? THE LINE COUNTER, AND NOTHING ELSE ---
+  ; Every register above this line can be perfect over a channel that is
+  ; standing still. Two reads of the line counter with a different
+  ; number in them is the one measurement that says pixels are moving,
+  ; and it can only be taken HERE - after the valve is running - which
+  ; is why it is not HvsUp's to make. See THE READBACK in hvs.pi4.
+  gScrDsiLine0 = HvsChannelLine()
+  delay(20)
+  gScrDsiLine1 = HvsChannelLine()
+  If gScrDsiLine0 = gScrDsiLine1
+    gScrDsiStep = #SCR_DSI_STEP_HVS
+    ProcedureReturn 0
+  EndIf
+
+  gScrDsiUp = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrDsiSayStep - name the step that stopped, as a sentence with the
+;  first thing to check in it.
+; ----------------------------------------------------------------------
+Procedure ScrDsiSayStep()
+  If gScrDsiStep = #SCR_DSI_STEP_DOMAIN
+    PrintN("!! the firmware would not power the DSI block (domain 19). Nothing")
+    PrintN("   in it works until that domain is on, and the firmware is the only")
+    PrintN("   thing that can turn it on. Check that the firmware on the boot")
+    PrintN("   medium answers the power-domain tags: dsi domain prints every")
+    PrintN("   word of that conversation.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_I2C
+    PrintN("!! the display connector's I2C bus would not come up, so the panel's")
+    PrintN("   rails could not be switched on. Nothing was changed. This is the")
+    PrintN("   controller, not the panel: try i2c bus display then i2c scan.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_MCU
+    PrintN("!! the panel's micro at address 45 answered its identity registers")
+    PrintN("   and then would not take a power-on write, so the panel may be")
+    PrintN("   part powered - which is worse than not powered. Reseat the flat")
+    PrintN("   cable at both ends and reset the board.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_PLAN
+    PrintN("!! the display PLL could not be read, so no divider could be chosen")
+    PrintN("   and no clock was programmed. Nothing was changed.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_CLOCKS
+    PrintN("!! a clock generator would not go idle inside its bound, so the DSI")
+    PrintN("   clocks are in an unknown state and the PHY was not brought up.")
+    PrintN("   Reset the board; dsi clocks shows what CPRMAN holds.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_HOST
+    PrintN("!! the DSI host did not come up, so there is no link for the panel's")
+    PrintN("   init table to travel on. dsi host prints every register it")
+    PrintN("   programmed and what each one read back.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_PANEL
+    PrintN("!! the panel did not take its init table. The link is built and the")
+    PrintN("   rails are on, so the suspect is the four differential lanes in")
+    PrintN("   the flat cable - the I2C pair is proven and they are not. dsi")
+    PrintN("   power is the read only a live panel can answer.")
+  ElseIf gScrDsiStep = #SCR_DSI_STEP_HVS
+    PrintN("!! the panel is lit and the whole pipeline is programmed, but it is")
+    PrintN("   NOT SCANNING: the scaler's line counter read the same number")
+    Print("   twice 20 ms apart (")
+    PrintDec(gScrDsiLine0)
+    Print(" then ")
+    PrintDec(gScrDsiLine1)
+    PrintN("). Every register can be perfect")
+    PrintN("   over a channel that is standing still, and this is the only")
+    PrintN("   reading that tells the two apart. dsi pipe prints the whole")
+    PrintN("   channel and the pixel valve.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrDsiSurface - install the console's drawing surface for the current
+;  rotation. The panel always scans #MON_FB_SCAN; the console draws
+;  there too unless it is sideways, in which case it draws into
+;  #MON_FB_DRAW and ScrPresent moves it.
+; ----------------------------------------------------------------------
+Procedure.i ScrDsiSurface()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define lw.i
+  Define lh.i
+  Define fb.i
+
+  lw = ScrLogicalW(gScrRot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+  lh = ScrLogicalH(gScrRot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+
+  fb = #MON_FB_SCAN
+  If ScrSideways(gScrRot) <> 0
+    fb = #MON_FB_DRAW
+    ; The drawing buffer is cleared here rather than left to the console's
+    ; own first clear: until the first present it is never scanned, so
+    ; nobody would see stale DRAM - but a transpose of uninitialised
+    ; memory into the corner of the panel that the console has not
+    ; painted yet would be visible, and this is one pass over 4 MB at
+    ; boot.
+    HvsFill(fb, lw, lh, $FF000000)
+  EndIf
+
+  ProcedureReturn DisplayAdopt(fb, lw * 4, lw, lh, 32)
+EndProcedure
+
+
+; ======================================================================
+;  ScrPresent - MAKE WHAT WAS DRAWN VISIBLE.
+;
+;  y0..y1 are LOGICAL rows, inclusive, in the console's own coordinates.
+;  The renderer calls this with the band it just painted.
+;
+;  At rotation 0 and 180 on either screen, and on HDMI at any rotation
+;  it is offered, this does nothing at all and costs one comparison: the
+;  bytes the console drew into are the bytes being scanned. The 180 case
+;  is turned round by the scaler's mirror bits, after this.
+;
+;  At 90 and 270 it is the transpose, and THE LOOP ORDER IS THE POINT.
+;  A logical row is a column of the scanned picture, so one of the two
+;  sides has to be walked with a stride whatever happens. The scanned
+;  buffer's rows are on the OUTSIDE and a short contiguous run of each
+;  is written on the inside, because a strided READ costs a cache line
+;  that is mostly wasted while a strided WRITE costs a read-modify-write
+;  of a line that is entirely wasted - and because the cache maintenance
+;  the scaler needs is then one clean of a contiguous run rather than
+;  one per pixel.
+; ======================================================================
+; ----------------------------------------------------------------------
+;  ScrPresentable() - IS THERE A PATH FROM THE DRAWN BYTES TO THE GLASS?
+;
+;  1 yes, 0 no, and the difference is not academic. Three of the four
+;  answers below are "yes, and it costs nothing": HDMI scans the bytes the
+;  renderer drew into, and so does the DSI panel at rotation 0 and 180
+;  (180 is the scaler's two mirror bits, applied at scan-out). The fourth
+;  is the one that matters - the DSI source selected, the rotation
+;  sideways, and the pipeline NOT SCANNING. Everything still succeeds, the
+;  transpose runs, and nobody sees anything.
+;
+;  IT EXISTS BECAUSE A PAYLOAD HAS TO BE ABLE TO REFUSE. A UI that drew a
+;  complete frame into a buffer with no route to the panel and returned
+;  cleanly is the exact failure that cost four board runs: every number
+;  said the session was fine. The console can afford to present into a
+;  dead channel - it is logging to a UART as well - and a payload that
+;  owns the screen cannot, because the screen is the whole of what it has
+;  to say.
+;
+;  ScrPresent ASKS THIS RATHER THAN RESTATING IT, so there is one place
+;  the rule is written and no way for the two to drift.
+; ----------------------------------------------------------------------
+Procedure.i ScrPresentable()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  If gScrSrc = #SCR_SRC_HDMI
+    ProcedureReturn 1
+  EndIf
+  If gScrSrc <> #SCR_SRC_DSI
+    ProcedureReturn 0
+  EndIf
+  If gScrDsiUp = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure ScrPresent(y0.i, y1.i)
+  Define sy.i
+  Define lh.i
+  Define run.i
+
+  If gScrSrc <> #SCR_SRC_DSI
+    ProcedureReturn
+  EndIf
+  If ScrSideways(gScrRot) = 0
+    ProcedureReturn
+  EndIf
+  If ScrPresentable() = 0
+    ProcedureReturn
+  EndIf
+
+  lh = ScrLogicalH(gScrRot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+  If y0 < 0
+    y0 = 0
+  EndIf
+  If y1 > lh - 1
+    y1 = lh - 1
+  EndIf
+  If y1 < y0
+    ProcedureReturn
+  EndIf
+
+  ; The pixels, then the maintenance. Both walk the scanned buffer's
+  ; rows and both get the run's address from ScrRunAddr, so a clean can
+  ; never cover bytes the transpose did not write.
+  ScrTranspose(gScrRot, #MON_FB_DRAW, #MON_FB_SCAN, #MON_FB_PANEL_W, #MON_FB_PANEL_H, y0, y1)
+
+  run = ScrRunBytes(y0, y1)
+  sy = 0
+  While sy < #MON_FB_PANEL_H
+    ; Clean to the point of COHERENCY, not unification: these bytes are
+    ; about to be read by another master. With the caches off this is a
+    ; loop that changes nothing, which is the right price for not having
+    ; to remember whether they are on.
+    MmuCleanRange(ScrRunAddr(gScrRot, #MON_FB_SCAN, #MON_FB_PANEL_W, lh, y0, y1, sy), run)
+    sy = sy + 1
+  Wend
+EndProcedure
+
+; ScrPresentAll - the whole console, for a full repaint and for the
+; banner band, which is not part of the console grid.
+Procedure ScrPresentAll()
+  ScrPresent(0, ScrLogicalH(gScrRot, #MON_FB_PANEL_W, #MON_FB_PANEL_H) - 1)
+EndProcedure
+
+; Begin an in-place DSI surface re-adoption. No panel, DSI host, pixel valve,
+; clock, reset or allocation operation occurs here. Return 1 when staged, 0
+; when refused. A staged request remains pending until ScrDsiReadoptResolve.
+Procedure.i ScrDsiReadoptBegin(rot.i, scale.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define fb.i
+  Define lw.i
+  Define lh.i
+  Define hf.i
+  Define vf.i
+
+  If gScrReadoptPending <> 0 Or gScrDsiUp = 0 Or HvsIsUp() = 0
+    ProcedureReturn 0
+  EndIf
+  If ScrRotOk(rot) = 0 Or ScrScaleOk(scale) = 0
+    ProcedureReturn 0
+  EndIf
+  lw = ScrLogicalW(rot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+  lh = ScrLogicalH(rot, #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+  fb = #MON_FB_SCAN
+  If ScrSideways(rot) <> 0
+    fb = #MON_FB_DRAW
+  EndIf
+  If DisplayAdoptValidate(fb, lw * 4, lw, lh, 32) <> #DSP_OK
+    ProcedureReturn 0
+  EndIf
+  hf = Bool(rot = 180)
+  vf = hf
+  If HvsFlipBegin(#MON_FB_SCAN, hf, vf) = 0
+    ProcedureReturn 0
+  EndIf
+  gScrReadoptRot = rot
+  gScrReadoptScale = scale
+  gScrReadoptBase = fb
+  gScrReadoptPitch = lw * 4
+  gScrReadoptW = lw
+  gScrReadoptH = lh
+  gScrReadoptPending = 1
+  ProcedureReturn 1
+EndProcedure
+
+; Return 1 only after DISPLACT proves the staged list is active and the
+; prevalidated DisplayAdopt has committed matching software geometry. Zero
+; means still pending; both HVS slots and the old software state stay intact.
+Procedure.i ScrDsiReadoptResolve()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  If gScrReadoptPending = 0
+    ProcedureReturn 1
+  EndIf
+  If HvsFlipResolve() = 0
+    ProcedureReturn 0
+  EndIf
+  ; This is the same immutable tuple accepted before the HVS request. No
+  ; resource or external state can change its validation between the calls.
+  If DisplayAdopt(gScrReadoptBase, gScrReadoptPitch, gScrReadoptW, gScrReadoptH, 32) <> #DSP_OK
+    ProcedureReturn 0
+  EndIf
+  gScrRot = gScrReadoptRot
+  gScrScale = gScrReadoptScale
+  DisplayScale(gScrScale)
+  gScrReadoptPending = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Withdraw a staged change. The software geometry was never touched while
+; the request was pending, so there is nothing here to put back; the only
+; state that has left this program is the display list the HVS was asked
+; for, and HvsFlipAbandon makes that request harmless rather than
+; pretending it was cancelled. Returns what the HVS half returned, so a
+; caller that cannot even do this much hears about it.
+Procedure.i ScrDsiReadoptAbandon()
+  Define rc.i
+  If gScrReadoptPending = 0
+    ProcedureReturn 1
+  EndIf
+  rc = HvsFlipAbandon()
+  gScrReadoptPending = 0
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i ScrDsiReadoptPending() : ProcedureReturn gScrReadoptPending : EndProcedure
+
+
+; ======================================================================
+;  THE GPU RENDER TARGET AND PRESENT CONTRACT
+;
+;  V3D renders in the same LOGICAL coordinates as the console. These
+;  accessors describe the PHYSICAL raster target beneath that canvas.
+;  HDMI keeps its firmware surface. DSI renders into Anvil's existing
+;  #MON_FB_DRAW back buffer and presents the finished physical frame to
+;  #MON_FB_SCAN, which the HVS owns. No firmware framebuffer call belongs
+;  on the DSI path.
+; ======================================================================
+Procedure.i ScrGpuBase()
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  If gScrSrc = #SCR_SRC_DSI
+    ProcedureReturn #MON_FB_DRAW
+  EndIf
+  ProcedureReturn DisplayBase()
+EndProcedure
+
+Procedure.i ScrGpuPitch()
+  If gScrSrc = #SCR_SRC_DSI
+    ProcedureReturn #MON_FB_PANEL_W * 4
+  EndIf
+  ProcedureReturn DisplayPitch()
+EndProcedure
+
+Procedure.i ScrGpuPhysicalW()
+  If gScrSrc = #SCR_SRC_DSI
+    ProcedureReturn #MON_FB_PANEL_W
+  EndIf
+  ProcedureReturn DisplayWidth()
+EndProcedure
+
+Procedure.i ScrGpuPhysicalH()
+  If gScrSrc = #SCR_SRC_DSI
+    ProcedureReturn #MON_FB_PANEL_H
+  EndIf
+  ProcedureReturn DisplayHeight()
+EndProcedure
+
+Procedure.i ScrGpuRotation()
+  If gScrSrc = #SCR_SRC_DSI And ScrSideways(gScrRot) <> 0
+    ProcedureReturn gScrRot
+  EndIf
+  ; DSI 180 is already done by the HVS mirrors. HDMI exposes the orientation
+  ; of its firmware surface and needs no renderer transform here either.
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i ScrGpuBytes()
+  ProcedureReturn ScrGpuPitch() * ScrGpuPhysicalH()
+EndProcedure
+
+Procedure.i ScrGpuHasFixedBack()
+  If gScrSrc = #SCR_SRC_DSI
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Snapshot the surface that is ACTUALLY PRESENTED, in one call. Callers keep
+; these eight values for their whole operation; they never temporarily alter
+; DisplayBase/geometry and never infer the front from the renderer's current
+; target. DSI always presents the physical portrait HVS front. HDMI presents
+; the firmware view (offset zero today, but DisplayViewBase is authoritative).
+;
+; w/h are logical capture dimensions; panelW/panelH/pitch describe the physical
+; raster beneath them. ScrCapturePixel applies the one common rotation map.
+Procedure.i ScrCaptureSnapshot(*base, *w, *h, *pitch, *rot, *panelW, *panelH, *bpp)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define fb.i
+  Define pw.i
+  Define ph.i
+  Define p.i
+  Define d.i
+  Define r.i
+
+  If gScrSrc = #SCR_SRC_DSI
+    If gScrDsiUp = 0
+      ProcedureReturn 0
+    EndIf
+    fb = #MON_FB_SCAN
+    pw = #MON_FB_PANEL_W
+    ph = #MON_FB_PANEL_H
+    p = pw * 4
+    d = 4
+    r = gScrRot
+  ElseIf gScrSrc = #SCR_SRC_HDMI
+    fb = DisplayViewBase()
+    pw = DisplayWidth()
+    ph = DisplayHeight()
+    p = DisplayPitch()
+    d = DisplayBytesPerPixel()
+    r = 0
+  Else
+    ProcedureReturn 0
+  EndIf
+
+  If fb = 0 Or pw < 1 Or ph < 1 Or p < (pw * d) Or d <> 4
+    ProcedureReturn 0
+  EndIf
+  PokeI(*base, fb)
+  PokeI(*w, ScrLogicalW(r, pw, ph))
+  PokeI(*h, ScrLogicalH(r, pw, ph))
+  PokeI(*pitch, p)
+  PokeI(*rot, r)
+  PokeI(*panelW, pw)
+  PokeI(*panelH, ph)
+  PokeI(*bpp, d)
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  ScrCaptureToArea - KEEP THE PRESENTED FRAME SOMEWHERE A REPAINT
+;  CANNOT REACH.
+; ----------------------------------------------------------------------
+;  THE PROBLEM, IN ONE SENTENCE. A payload's last frame is on the panel
+;  for exactly as long as it takes the monitor to print its first line
+;  afterwards, and the only person who ever saw it was somebody watching
+;  the glass. The ruling of 2026-09-11 is that every board run comes back
+;  with a picture; this is the copy that makes that possible, and
+;  RaspberryPi4/Board/screen_cmd.pi4's `shot` is what reads it out.
+;
+;  IT COPIES THE PHYSICAL SCANOUT AND NOT THE LOGICAL SURFACE, and that
+;  distinction is the whole correctness of this procedure on this bench.
+;  The panel is bolted down landscape, so the console is normally at 90
+;  degrees: it DRAWS into a 1280 x 800 buffer (#MON_FB_DRAW) which the
+;  panel never scans, and ScrPresent transposes the damaged band into the
+;  800 x 1280 buffer the HVS reads (#MON_FB_SCAN). A capture of the
+;  drawing buffer would be a picture of what the console meant, taken
+;  from bytes the panel has never displayed - and on a run where the
+;  present never happened it would show a frame nobody saw. So the source
+;  is ScrCaptureSnapshot's answer, which is the front on either tier:
+;  the HVS scan buffer on DSI (V3D presents its finished physical frame
+;  into the same buffer, so the GPU tier needs no second case), and the
+;  firmware's view base on HDMI.
+;
+;  THE HEADER CARRIES BOTH GEOMETRIES BECAUSE THE COPY IS PHYSICAL. The
+;  bytes are the raster; the rotation, the pitch and the panel's own
+;  width and height are what turn them back into the console's picture,
+;  and they are recorded rather than assumed so that a capture taken at
+;  one rotation can be read after the operator has typed `screen rotate`.
+;
+;  THE MAGIC IS CLEARED FIRST AND WRITTEN LAST. Between those two moments
+;  the area is explicitly not a capture, so a read that happens across an
+;  interrupted copy - a deadman reset in the middle of one, say - finds
+;  no magic and says there is no picture, rather than decoding half of
+;  this run and half of the one before.
+;
+;  NO CACHE MAINTENANCE, AND THAT IS AN ARGUMENT RATHER THAN AN OMISSION.
+;  One core writes this area and the same core reads it back through the
+;  same caches, in the same session; there is no second master. The
+;  pixels are not kept across a reset on purpose, but DRAM keeps them
+;  anyway, and the sequence number is carried across for that reason. The capture on payload
+;  return happens with the caches OFF (RunAt disables them before the
+;  handover and re-enables them after), so those bytes go straight to
+;  DRAM and the re-enable starts from a cold cache. The source side is
+;  read exactly the way `p` reads the live screen, which is the behaviour
+;  this monitor has been taking screenshots with all along.
+;
+;  IT REFUSES A FRAME LARGER THAN THE AREA rather than writing what fits.
+;  A short capture decodes as a torn picture and looks like a display
+;  fault; a refusal names the numbers. #MON_SHOT_PIX_BYTES covers every
+;  mode this monitor brings up - see THE SCREENSHOT CAPTURE AREA in
+;  RaspberryPi4/Board/memmap.pi4.
+;
+;  who  is #MON_SHOT_WHO_PAYLOAD or #MON_SHOT_WHO_RETURN.
+;  x0   is the payload's return value for a capture on return, and 0
+;       otherwise; it is in the header so that a picture and the number
+;       the run ended with cannot be paired up wrongly by a host.
+;  tier is asked of the caller rather than read here, because the file
+;       that knows which renderer is live (v3d_console.pi4) is included
+;       after this one and a global cannot be read before it is declared.
+;
+;  Returns 1 on a complete capture, 0 having written nothing but the
+;  cleared magic.
+; ======================================================================
+Procedure.i ScrCaptureToArea(who.i, x0.i, tier.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+  Define n.i
+  Define i.i
+  Define dst.i
+
+  ; THE NUMBER CONTINUES FROM WHAT THE AREA HOLDS, read before the magic is
+  ; cleared. The area survives a reset and the counter does not, so without
+  ; this the first capture after a boot is numbered below the picture it
+  ; replaces and a host rightly calls it stale (forum 876).
+  If PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC) = #MON_SHOT_MAGIC
+    ShotSeqCarry(PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_SEQ))
+  EndIf
+
+  ; THERE IS NO PICTURE UNTIL THIS PROCEDURE SAYS SO. Cleared before the
+  ; first check, not after the last one, so every path out of here -
+  ; including the ones that refuse - leaves an area that reads as empty
+  ; rather than as the previous run's.
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC, 0)
+
+  If ScrCaptureSnapshot(@fb, @w, @h, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    ProcedureReturn 0
+  EndIf
+
+  n = pitch * panelH
+  If n < 1 Or n > #MON_SHOT_PIX_BYTES
+    ProcedureReturn 0
+  EndIf
+
+  ; THE WIDEST ACCESS BOTH ENDS CAN TAKE, AND NOT ONE BYTE WIDER. A
+  ; 64-bit load or store to an address that is not eight-aligned is an
+  ; alignment abort on this part with nothing on the console (the same
+  ; reasoning Anvil/Core/memcmd.pbi's DumpMem is written under), and a
+  ; firmware framebuffer's base and pitch are the firmware's choice, not
+  ; this program's. So the width is chosen from the addresses and the
+  ; length rather than assumed from the panel this bench happens to have.
+  dst = #MON_SHOT_PIX
+  i = 0
+  If (fb % 8) = 0 And (dst % 8) = 0 And (n % 8) = 0
+    While i < n
+      PokeI(dst + i, PeekI(fb + i))
+      i = i + 8
+    Wend
+  ElseIf (fb % 4) = 0 And (dst % 4) = 0 And (n % 4) = 0
+    While i < n
+      PokeL(dst + i, PeekL(fb + i))
+      i = i + 4
+    Wend
+  Else
+    While i < n
+      PokeB(dst + i, PeekA(fb + i))
+      i = i + 1
+    Wend
+  EndIf
+
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_SEQ,    ShotNextSeq())
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_W,      w)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_H,      h)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PITCH,  pitch)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_ROT,    rot)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_TIER,   tier)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_X0,     x0)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELW, panelW)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELH, panelH)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_BPP,    bpp)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_SRC,    gScrSrc)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_WHO,    who)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_BYTES,  n)
+
+  ; LAST. Everything above is the description of a picture that is now
+  ; entirely in the area; this word is what makes a reader believe it.
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC, #MON_SHOT_MAGIC)
+  ProcedureReturn 1
+EndProcedure
+
+; Is there a complete capture in the area? The one question every reader
+; asks first, in one place, so that "no picture" is one answer and not
+; three spellings of it.
+Procedure.i ScrShotValid()
+  ProcedureReturn Bool(PeekI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC) = #MON_SHOT_MAGIC)
+EndProcedure
+
+; One header word, by its offset. A reader that wants five of them makes
+; five calls rather than learning the base address, which keeps the area's
+; placement a fact of memmap.pi4 and of nothing else.
+Procedure.i ScrShotField(off.i)
+  ProcedureReturn PeekI(#MON_SHOT_HDR + off)
+EndProcedure
+
+; Where the captured pixels are. Handed to ScrCapturePixel in place of a
+; live framebuffer, with the header's pitch/rotation/panel geometry, so
+; the copy is read back by exactly the map the live screen is read by.
+Procedure.i ScrShotPixels()
+  ProcedureReturn #MON_SHOT_PIX
+EndProcedure
+
+; Write one LOGICAL overlay pixel straight to the surface being presented.
+; This is intentionally distinct from ScrPresent: a sideways DSI V3D back
+; buffer is already in physical layout, so treating its untouched rows as a
+; logical drawing surface would transpose unrelated pixels into the front.
+; Small service overlays use this seam; normal renderers keep their existing
+; damage/present paths. The cache clean is per pixel because callers are tiny
+; (the alive glint is 5 pixels plus two 5x5 restores), never a raster renderer.
+Procedure.i ScrPresentedPixel(x.i, y.i, colour.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define fb.i
+  Define pitch.i
+  Define pw.i
+  Define ph.i
+  Define lw.i
+  Define lh.i
+  Define rot.i
+  Define px.i
+  Define py.i
+  Define at.i
+
+  If gScrSrc = #SCR_SRC_DSI
+    If gScrDsiUp = 0
+      ProcedureReturn 0
+    EndIf
+    fb = #MON_FB_SCAN
+    pw = #MON_FB_PANEL_W
+    ph = #MON_FB_PANEL_H
+    pitch = pw * 4
+    rot = gScrRot
+  ElseIf gScrSrc = #SCR_SRC_HDMI
+    fb = DisplayViewBase()
+    pw = DisplayWidth()
+    ph = DisplayHeight()
+    pitch = DisplayPitch()
+    rot = 0
+  Else
+    ProcedureReturn 0
+  EndIf
+  lw = ScrLogicalW(rot, pw, ph)
+  lh = ScrLogicalH(rot, pw, ph)
+  If fb = 0 Or x < 0 Or y < 0 Or x >= lw Or y >= lh
+    ProcedureReturn 0
+  EndIf
+  px = ScrMapX(rot, x, y, pw, ph)
+  py = ScrMapY(rot, x, y, pw, ph)
+  at = fb + py * pitch + px * 4
+  PokeL(at, colour)
+  MmuCleanRange(at, 4)
+  ProcedureReturn 1
+EndProcedure
+
+; Begin the DSI copy at a frame boundary. There is no interrupt-driven WSI
+; yet, so this bounded poll watches the HVS line counter wrap. A dead channel
+; costs at most 20 ms and the copy still proceeds; presentation must never
+; turn a stopped line counter into a stopped console.
+Procedure ScrDsiWaitFrameStart()
+  Define before.i
+  Define now.i
+  Define t0.i
+
+  If gScrDsiUp = 0
+    ProcedureReturn
+  EndIf
+  before = HvsChannelLine()
+  t0 = Micros()
+  Repeat
+    now = HvsChannelLine()
+    If now < before
+      ProcedureReturn
+    EndIf
+    before = now
+  Until (Micros() - t0) >= 20000
+EndProcedure
+
+; Preserve the already-correct banner from the DSI front buffer after V3D
+; clears and redraws the back. At 90/270 the logical top band is a physical
+; vertical strip; at 0/180 it is the ordinary top strip. This copies pixels
+; already transformed by the established CPU path, so the photo and smooth
+; fonts do not acquire a second renderer or a second rotation formula.
+Procedure.i ScrGpuKeepBanner(renderBase.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define x.i
+  Define y.i
+  Define w.i
+  Define h.i
+  Define row.i
+  Define src.i
+  Define dst.i
+  Define pitch.i
+
+  If gScrSrc <> #SCR_SRC_DSI
+    ProcedureReturn 0
+  EndIf
+  If renderBase <> #MON_FB_DRAW
+    ProcedureReturn 0
+  EndIf
+
+  pitch = #MON_FB_PANEL_W * 4
+  x = 0
+  y = 0
+  w = #MON_FB_PANEL_W
+  h = LogoHeight()
+  If gScrRot = 90
+    x = #MON_FB_PANEL_W - LogoHeight()
+    y = 0
+    w = LogoHeight()
+    h = #MON_FB_PANEL_H
+  ElseIf gScrRot = 270
+    x = 0
+    y = 0
+    w = LogoHeight()
+    h = #MON_FB_PANEL_H
+  EndIf
+
+  src = #MON_FB_SCAN + y * pitch + x * 4
+  dst = #MON_FB_DRAW + y * pitch + x * 4
+  If gDma <> 0
+    If DmaCopy2D(dst, pitch, src, pitch, w * 4, h) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+
+  row = 0
+  While row < h
+    DspCopyUp(dst + row * pitch, src + row * pitch, w * 4)
+    row = row + 1
+  Wend
+  ; The GPU is finished before this routine, so only the later present reads
+  ; these CPU writes. Make them complete before that DMA transfer starts.
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; ANVIL-SCR-KEEP-LOGICAL-BAND-BEGIN
+; THIS PROCEDURE IS LIFTED VERBATIM by
+; tools/keyboard_gpu_face_emitted_check.py and compiled into
+; RaspberryPi4/Tests/keyboard_gpu_face_emitted_gate.pi4, where it runs over
+; the real rotation arithmetic with the copy recorded instead of performed.
+; Keep the fences where they are.
+; ======================================================================
+;  ScrGpuKeepLogicalBand - CARRY A CPU-COMPOSED LOGICAL ROW BAND THROUGH
+;  A GPU FRAME, which is what ScrGpuKeepBanner already does for the
+;  banner and is now asked for by name for a second layer.
+;
+;  WHY A LAYER EVER NEEDS THIS. A picture drawn by the CPU is drawn in
+;  LOGICAL coordinates - it is the only coordinates the display library
+;  has - and a GPU render target on a turned panel is in PHYSICAL layout.
+;  At 90 and 270 a logical row is a physical column, so the CPU cannot
+;  draw into that target at all, and there is exactly ONE transpose in
+;  this monitor: ScrPresent's. So a CPU layer is drawn ONCE, into the
+;  console's own logical surface, and ScrPresent puts it on the panel in
+;  the panel's own layout; from then on every GPU frame carries those
+;  pixels along by copying them back out of the PRESENTED FRONT, where
+;  they already are, correctly turned, with no second renderer and no
+;  second rotation formula anywhere.
+;
+;  It is also why this is a COPY and not a repaint: the band is redrawn
+;  only when its picture changes, not once per console frame.
+;
+;  y0..y1 are LOGICAL rows, inclusive, full width - the same shape
+;  ScrPresent takes and the same shape a damage rectangle answers in.
+;
+;  Returns 1 when the band is in renderBase, 0 when there was nothing to
+;  do or the request does not describe this surface.
+; ======================================================================
+Procedure.i ScrGpuKeepLogicalBand(renderBase.i, y0.i, y1.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define front.i
+  Define pitch.i
+  Define pw.i
+  Define ph.i
+  Define lw.i
+  Define lh.i
+  Define rot.i
+  Define loX.i
+  Define hiX.i
+  Define loY.i
+  Define hiY.i
+  Define v.i
+  Define row.i
+  Define wide.i
+  Define tall.i
+  Define src.i
+  Define dst.i
+
+  If gScrSrc = #SCR_SRC_DSI
+    If gScrDsiUp = 0 Or renderBase <> #MON_FB_DRAW
+      ProcedureReturn 0
+    EndIf
+    front = #MON_FB_SCAN
+    pw = #MON_FB_PANEL_W
+    ph = #MON_FB_PANEL_H
+    pitch = pw * 4
+    rot = gScrRot
+  ElseIf gScrSrc = #SCR_SRC_HDMI
+    front = DisplayBase()
+    pw = DisplayWidth()
+    ph = DisplayHeight()
+    pitch = DisplayPitch()
+    rot = 0
+  Else
+    ProcedureReturn 0
+  EndIf
+  ; RENDERING STRAIGHT INTO THE FRONT IS THE SINGLE-BUFFERED TIER, and
+  ; there the band is already where it has to be.
+  If front = 0 Or renderBase = 0 Or renderBase = front
+    ProcedureReturn 0
+  EndIf
+
+  lw = ScrLogicalW(rot, pw, ph)
+  lh = ScrLogicalH(rot, pw, ph)
+  If y0 < 0
+    y0 = 0
+  EndIf
+  If y1 > lh - 1
+    y1 = lh - 1
+  EndIf
+  If lw < 1 Or y1 < y0
+    ProcedureReturn 0
+  EndIf
+
+  ; THE PHYSICAL RECTANGLE the full-width logical band occupies, taken
+  ; through the ONE map every presented overlay in this monitor goes
+  ; through. All four corners, because a bounding box built from two of
+  ; them is only right for the rotations that happen to be diagonal.
+  loX = ScrMapX(rot, 0, y0, pw, ph)
+  hiX = loX
+  loY = ScrMapY(rot, 0, y0, pw, ph)
+  hiY = loY
+  v = ScrMapX(rot, lw - 1, y0, pw, ph)
+  If v < loX : loX = v : EndIf
+  If v > hiX : hiX = v : EndIf
+  v = ScrMapX(rot, 0, y1, pw, ph)
+  If v < loX : loX = v : EndIf
+  If v > hiX : hiX = v : EndIf
+  v = ScrMapX(rot, lw - 1, y1, pw, ph)
+  If v < loX : loX = v : EndIf
+  If v > hiX : hiX = v : EndIf
+  v = ScrMapY(rot, lw - 1, y0, pw, ph)
+  If v < loY : loY = v : EndIf
+  If v > hiY : hiY = v : EndIf
+  v = ScrMapY(rot, 0, y1, pw, ph)
+  If v < loY : loY = v : EndIf
+  If v > hiY : hiY = v : EndIf
+  v = ScrMapY(rot, lw - 1, y1, pw, ph)
+  If v < loY : loY = v : EndIf
+  If v > hiY : hiY = v : EndIf
+
+  If loX < 0 Or loY < 0 Or hiX > pw - 1 Or hiY > ph - 1
+    ProcedureReturn 0
+  EndIf
+  wide = (hiX - loX + 1) * 4
+  tall = hiY - loY + 1
+  src = front + loY * pitch + loX * 4
+  dst = renderBase + loY * pitch + loX * 4
+
+  If gDma <> 0
+    If DmaCopy2D(dst, pitch, src, pitch, wide, tall) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+
+  row = 0
+  While row < tall
+    DspCopyUp(dst + row * pitch, src + row * pitch, wide)
+    row = row + 1
+  Wend
+  ; The GPU has finished before this runs, so the only reader of these
+  ; CPU writes is the present that follows. Make them complete first.
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+; ANVIL-SCR-KEEP-LOGICAL-BAND-END
+
+; Present one complete GPU frame. DSI has a fixed physical back buffer and
+; no mailbox page flip: DMA copies it to the HVS front after render complete.
+; If the DMA tier is unavailable, the existing unrolled CPU mover is the
+; correctness fallback. HDMI's double-height allocation is also presented by
+; a copy, preserving the crisp offset-zero behaviour already proven there.
+Procedure.i ScrGpuPresent(renderBase.i, bytes.i)
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  Define front.i
+
+  If bytes <> ScrGpuBytes()
+    ProcedureReturn 0
+  EndIf
+  If gScrSrc = #SCR_SRC_DSI
+    If renderBase <> #MON_FB_DRAW Or gScrDsiUp = 0
+      ProcedureReturn 0
+    EndIf
+    front = #MON_FB_SCAN
+    ScrDsiWaitFrameStart()
+  Else
+    front = DisplayBase()
+    If front = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  If renderBase = front
+    ProcedureReturn 1
+  EndIf
+  If gDma <> 0
+    If DmaCopy(front, renderBase, bytes) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+
+  ; Honest lowest-tier fallback. DspCopyUp is overlap-safe in this direction
+  ; and is also valid for these two disjoint buffers.
+  DspCopyUp(front, renderBase, bytes)
+  MmuCleanRange(front, bytes)
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  THE ROTATION SETTING
+;
+;  `screen.rotate` in SETTINGS.TXT, one of 0, 90, 180 or 270. Absent or
+;  unreadable means the screen's own default, which on the DSI panel is
+;  LANDSCAPE (90) because that is how the panel is mounted on the bench.
+;  See WHICH WAY UP THE CONSOLE COMES UP in screen_geom.pi4; the choice
+;  itself is ScrRotPick there, so the gate can execute it.
+;
+;  THIS FILE'S ONLY JOB HERE IS THE STORE. Reading a string out of
+;  SETTINGS.TXT and turning it into a number is the part that cannot run
+;  on the emulator, so it is the only part that is not in the arithmetic
+;  file.
+; ======================================================================
+Procedure.i ScrRotKey()
+  ProcedureReturn "screen.rotate"
+EndProcedure
+
+; ScrRotWanted - the rotation the named screen will come up at, whatever
+; the store does or does not hold.
+Procedure.i ScrRotWanted(src.i)
+  ProcedureReturn ScrRotPick(src, PmfDecOf(SettingsGet(ScrRotKey()), #SCR_ROT_UNSET))
+EndProcedure
+
+; ScrRotStored - what is actually in the store, or #SCR_ROT_UNSET when
+; there is nothing usable there. `screen rotate` prints this beside the
+; rotation in effect, because "the store is empty and you are seeing the
+; default" and "the store says 90" are different sentences and a bench
+; deciding whether to type anything needs to tell them apart.
+Procedure.i ScrRotStored()
+  ProcedureReturn PmfDecOf(SettingsGet(ScrRotKey()), #SCR_ROT_UNSET)
+EndProcedure
+
+
+; ======================================================================
+;  HOW BIG THE SCREEN IS, AND THEREFORE HOW BIG THE TYPE IS
+;
+;  THE ARITHMETIC IS IN screen_geom.pi4. This half is the two things
+;  that cannot run on the emulator: asking the hardware how big it is,
+;  and reading `screen.scale` out of SETTINGS.TXT. The split is exactly
+;  the one the rotation already uses - ScrRotPick decides, this file
+;  fetches - so the gate executes the deciding.
+;
+;  THE ORIENTATION NEVER REACHES THE SIZE. Every procedure here answers
+;  about THE GLASS: the panel's own 800 x 1280 scan and its diagonal in
+;  inches. Only the eighty-column cap is handed a console width, and it
+;  can only ever make the type smaller. That is why turning the console
+;  cannot change how big a letter is any more.
+; ======================================================================
+
+; ScrDiagTenths - the screen's diagonal in TENTHS OF AN INCH.
+;
+;   DSI   the panel's own microcontroller, register $97, read during
+;         ScrDsiPanelSeen() before anything was powered. This board
+;         answers $65 = 101 = 10.1 inches.
+;   HDMI  nothing can be asked. See THE SIZE OF A SCREEN THAT CANNOT SAY
+;         HOW BIG IT IS in screen_geom.pi4: the firmware's
+;         GET_PHYSICAL_WIDTH_HEIGHT is in pixels and says nothing about
+;         glass, and the EDID that would say is not read yet.
+Procedure.i ScrDiagTenths(src.i)
+  Define v.i
+
+  If src = #SCR_SRC_DSI
+    v = DsiV2Size()
+    If ScrDiagUsable(v) <> 0
+      ProcedureReturn v
+    EndIf
+    ProcedureReturn #SCR_DSI_DIAG_TENTHS
+  EndIf
+  ProcedureReturn #SCR_HDMI_DIAG_TENTHS
+EndProcedure
+
+; ScrDiagMeasured - 1 when ScrDiagTenths above is a READING off the
+; hardware, 0 when it is the stated assumption. Every report that prints
+; a density prints this too, because "the panel says it is 10.1 inches"
+; and "no screen can say, so a 24 inch monitor is assumed" are different
+; sentences and a bench deciding whether to type `screen scale` needs to
+; tell them apart.
+Procedure.i ScrDiagMeasured(src.i)
+  If src = #SCR_SRC_DSI
+    If ScrDiagUsable(DsiV2Size()) <> 0
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ScrPanelPixW / ScrPanelPixH - THE SCREEN'S OWN pixel geometry, which
+; is not the console's when the console is turned.
+;
+; For the panel these are constants, because this monitor sends exactly
+; one DSI mode. For HDMI the surface the firmware handed over IS the
+; screen - there is no rotation on that path - so the library's own
+; numbers are the honest answer.
+Procedure.i ScrPanelPixW(src.i)
+  If src = #SCR_SRC_DSI
+    ProcedureReturn #MON_FB_PANEL_W
+  EndIf
+  ProcedureReturn DisplayWidth()
+EndProcedure
+
+Procedure.i ScrPanelPixH(src.i)
+  If src = #SCR_SRC_DSI
+    ProcedureReturn #MON_FB_PANEL_H
+  EndIf
+  ProcedureReturn DisplayHeight()
+EndProcedure
+
+; ScrPpi - pixels to the inch on the named screen. The number the boot
+; log and `screen` print.
+Procedure.i ScrPpi(src.i)
+  ProcedureReturn ScrPixelsPerInch(ScrPanelPixW(src), ScrPanelPixH(src), ScrDiagTenths(src))
+EndProcedure
+
+; ScrScaleComputed - what the density asks for on this screen, at a
+; console this wide. No store, no override: this is the calculation on
+; its own, and `screen scale` prints it beside the stored value so the
+; two can be compared.
+Procedure.i ScrScaleComputed(src.i, logicalW.i)
+  ProcedureReturn ScrScaleFor(ScrPanelPixW(src), ScrPanelPixH(src), ScrDiagTenths(src), logicalW)
+EndProcedure
+
+; The store.
+Procedure.i ScrScaleKey()
+  ProcedureReturn "screen.scale"
+EndProcedure
+
+Procedure.i ScrScaleStored()
+  ProcedureReturn PmfDecOf(SettingsGet(ScrScaleKey()), #SCR_SCALE_UNSET)
+EndProcedure
+
+; ScrScaleWanted - THE MAGNIFICATION THAT WILL BE USED. One expression,
+; and it is the only thing ScreenUpOn calls.
+;
+; `screen.scale` is NOT a per-screen setting the way `screen.rotate` is.
+; A rotation is a fact about how one panel is bolted down and means
+; nothing on HDMI; a scale is a statement about the eyes reading it, and
+; somebody who wants bigger type wants it on whichever screen the
+; console is on. So it applies to both, and it is the calculation - not
+; the setting - that makes the two screens differ.
+Procedure.i ScrScaleWanted(src.i, logicalW.i)
+  ProcedureReturn ScrScalePick(ScrScaleStored(), ScrScaleComputed(src, logicalW))
+EndProcedure

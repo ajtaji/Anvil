@@ -1,0 +1,498 @@
+; ======================================================================
+;  hw_link.pi4 - Raspberry Pi 4: THE HwLink* BACKEND.
+;
+;  The seam contract is written out once, in Anvil/Hal/hal.pbi under
+;  HwLink*. This file is the Pi 4's side of it and it is deliberately
+;  thin: every procedure here is one call into a driver that already
+;  exists and was already proven on silicon. Nothing was reimplemented
+;  and nothing changed behaviour - the code below is, line for line, what
+;  RaspberryPi4/Lib/link.pi4 used to do inline before the eleven chip
+;  names moved out from under it on 2026-09-04.
+;
+;  WHY THE MOVE. link.pi4's own header used to say a target without a
+;  radio "cannot include this file as it stands", and that one sentence
+;  was the whole of what kept net, ping, dns, dhcp, tcp and http off the
+;  Arduino UNO Q - every layer above link.pi4 already built for that
+;  board unchanged. One seam, two boards, one copy of the policy.
+;
+;  THIS BOARD HAS TWO LINKS and answers for both:
+;
+;    #HW_LINK_WIRED  the BCM54213PE behind the GENET MAC, over
+;                    RaspberryPi4/Lib/genet.pi4
+;    #HW_LINK_WIFI   the CYW43455 over SDIO, over
+;                    RaspberryPi4/Lib/cyw43.pi4, with the supplicant in
+;                    RaspberryPi4/Lib/wifi.pi4
+;
+;  THE CONSOLE IS NOT ONE OF THE LINKS AND NEVER WAS. Until 2026-09-07 it
+;  lived inside wifi.pi4 and this file reached it only from the radio's
+;  arm, so a board with a cable and no radio had none. It is
+;  Anvil/Core/netconsole.pbi now, it arms on whichever interface holds the
+;  address, and HwLinkOfferUdp below asks IT which kind that is.
+;
+;  THIS FILE ANSWERS SIXTEEN OF THE NINETEEN. HwLinkOpen, HwLinkClose and
+;  HwLinkSayDetail are answered by RaspberryPi4/Board/eth.pi4 instead, and
+;  the split is an include-order fact rather than a design: those three
+;  read the settings store and this board's own network globals, both of
+;  which arrive in the build long after this file has to. The seam is one
+;  seam either way - Anvil/Hal/hal.pbi states all sixteen in one place.
+;
+;  REQUIRES, and the include order is not negotiable: genet.pi4,
+;  cyw43.pi4 and wifi.pi4 all come before this file, and this file comes
+;  before link.pi4. This language resolves a call to a procedure it has
+;  already seen, so a backend that arrived after its caller would not
+;  link - which is the loud failure and the right one.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  HwLinkHas - what this board HAS, as opposed to what is up right now.
+;
+;  Compile-time truth. The radio is on the board whether or not it has
+;  joined anything, and the socket is on the board whether or not a cable
+;  is in it; "is it carrying traffic" is a different question and
+;  RaspberryPi4/Board/eth.pi4 asks it of the drivers directly, live,
+;  before it calls LinkSelect.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkHas(kind.i)
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn 1
+  EndIf
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkReady - CAN THIS LINK CARRY A FRAME RIGHT NOW? Added 2026-09-07
+;  for the network console.
+;
+;  HwLinkHas above is compile-time truth about the board. This is a
+;  run-time question about the wire, and the console asks it before it
+;  arms: a console announced on an interface that cannot transmit is a
+;  board that says it is listening and answers nobody, which is the
+;  precise defect the console work exists to end.
+;
+;  IT IS A QUESTION AND NEVER A BRING-UP. Both arms are register reads -
+;  the wired side is a driver flag plus one MDIO read of the PHY's link
+;  status, the radio is the keyed flag the supplicant sets. Starting
+;  anything here would put a five-second link wait inside a procedure the
+;  prompt calls on every spin.
+;
+;  THE WIRED ARM ASKS THE PHY AND NOT ONLY THE DRIVER. GenetStarted() says
+;  the driver believes it started, which stays true after somebody pulls
+;  the cable out. A console that went on announcing an address on an
+;  unplugged socket would be the monitor lying about the one thing an
+;  operator uses it for.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkReady(kind.i)
+  If kind = #HW_LINK_WIRED
+    If GenetStarted() <> 1
+      ProcedureReturn 0
+    EndIf
+    If GenetPhyLinkUp() <> 1
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  If kind = #HW_LINK_WIFI
+    If gWifiKeyed = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkName - a lowercase noun phrase, as an ADDRESS. Printed with
+;  UartWriteStr, the way every other board-supplied fragment in this tree
+;  is (RequireCap's *reason, HwGpioReservedReason, HwAddrReason).
+; ----------------------------------------------------------------------
+Procedure.i HwLinkName(kind.i)
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn "the wired Ethernet"
+  EndIf
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn "the Wi-Fi radio"
+  EndIf
+  ProcedureReturn "an interface this board does not have"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkTxMax - the largest 802.3 frame each link will carry.
+;
+;  1514 is the classic Ethernet maximum without the FCS and the wired
+;  side takes it. THE RADIO'S CEILING IS ASKED OF THE DRIVER, because it
+;  is a property of a transmit buffer that also has to hold the SDPCM and
+;  BDC headers - cyw43.pi4 REFUSES anything longer rather than truncating
+;  it, which is right, and the number would go stale the day the buffer
+;  changes size if it were written down here.
+;
+;  link.pi4 applies the 1514 ceiling to whatever comes back, so a backend
+;  cannot raise it by accident.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkTxMax(kind.i)
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn 1514
+  EndIf
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn Cyw43DataMax()
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkSpeed / HwLinkDuplex - what the link NEGOTIATED, never what it
+;  is nominally capable of.
+;
+;  THE WIRED SIDE HAS REAL NUMBERS AND THE RADIO DOES NOT, and the
+;  difference is worth being exact about because the honest answer for
+;  the radio looks like a gap. GenetSpeed() and GenetFullDuplex() report
+;  what the PHY and the MAC agreed on after auto-negotiation - a
+;  measurement of this cable and this switch. The CYW43455's data rate is
+;  a per-frame property of a modulation the firmware chooses and does not
+;  report; there is no "the radio is running at N Mbit/s" to be had, and
+;  a Wi-Fi link is not half or full duplex in the 802.3 sense at all.
+;  Answering 802.11's nominal PHY rate would be a number nothing measured.
+;
+;  THEY ANSWER FOR A LINK THAT IS NOT UP, TOO, and they have to: `net`
+;  asks before it knows. GenetSpeed() on a MAC that never started reports
+;  whatever the last register read left behind, so the started check is
+;  here rather than in the caller - an unknown is a fact and a stale
+;  speed is a lie.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkSpeed(kind.i)
+  If kind <> #HW_LINK_WIRED
+    ProcedureReturn #HW_LINK_SPEED_UNKNOWN
+  EndIf
+  If GenetStarted() <> 1
+    ProcedureReturn #HW_LINK_SPEED_UNKNOWN
+  EndIf
+  ProcedureReturn GenetSpeed()
+EndProcedure
+
+Procedure.i HwLinkDuplex(kind.i)
+  If kind <> #HW_LINK_WIRED
+    ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
+  EndIf
+  If GenetStarted() <> 1
+    ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
+  EndIf
+  If GenetFullDuplex() = 1
+    ProcedureReturn #HW_LINK_DUPLEX_FULL
+  EndIf
+  ProcedureReturn #HW_LINK_DUPLEX_HALF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkWhyText - what the driver under this link last had to say. It
+;  reads after "The link driver said: ".
+;
+;  THIS REPLACES EthWhyGenet(), which printed GenetErrorText() from
+;  Anvil/Core/net_cmd.pbi - the shared core naming one board's MAC
+;  driver, six times over. The text is the same text; what changed is who
+;  is allowed to know where it comes from.
+;
+;  THE RADIO ANSWERS EMPTY RATHER THAN INVENTING A SENTENCE. cyw43.pi4
+;  keeps no equivalent last-error string, and a phrase composed here
+;  would be this file's opinion of what the firmware meant. The caller
+;  prints no line at all for an empty answer.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkWhyText(kind.i)
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn GenetErrorText()
+  EndIf
+  ProcedureReturn ""
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkSend - one frame out. 1 sent, 0 not.
+;
+;  THE COPY LIVES HERE NOW. GenetSend reads from wherever it is pointed,
+;  so the staged frame goes straight over. Cyw43Send transmits what is
+;  already sitting in the driver's own transmit buffer, so the frame has
+;  to be copied there first - and that copy is the reason the radio path
+;  is measurably the slower of the two on a board whose caches are off.
+;  It used to sit in link.pi4 with a comment explaining which board it
+;  was for; it belongs beside the buffer it writes into.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
+  Define dst.i
+  Define i.i
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  If kind = #HW_LINK_WIRED
+    If GenetSend(buf, n, ms) <> 1
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  If kind = #HW_LINK_WIFI
+    If n > Cyw43DataMax()
+      ProcedureReturn 0
+    EndIf
+    dst = Cyw43DataPtr()
+    If dst = 0
+      ProcedureReturn 0
+    EndIf
+    i = 0
+    While i < n
+      PokeB(dst + i, PeekA(buf + i))
+      i = i + 1
+    Wend
+    ; Cyw43Send answers 0 for success, which is the opposite of
+    ; GenetSend's convention. Normalising it is exactly what this seam
+    ; is for: nothing above here should have to remember which driver
+    ; reports which way round.
+    If Cyw43Send(n) <> 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkRecv / HwLinkRxPtr - one frame in, and where it landed.
+;
+;  The wired driver fills the buffer it is given; the radio hands back a
+;  pointer into its own single receive buffer and copies nothing. Both
+;  are honest here: Recv returns the length, RxPtr says where.
+;
+;  ======================================================================
+;  ms = 0 MEANS "LOOK, DO NOT WAIT". IT DOES NOT MEAN "DO NOT LOOK".
+;  ======================================================================
+;  MEASURED ON SILICON, 2026-09-07 21:0x, and it is the whole reason the
+;  wired console was deaf. Anvil/Core/netconsole.pbi's NetConsolePump -
+;  the thing that turns a datagram into a keystroke, and the ONLY thing
+;  that runs at an idle prompt - calls this with ms = 0, because at a
+;  prompt there is nothing to wait for and the same spin has a keyboard
+;  and a mouse to service. GenetRecvWait REFUSES a non-positive timeout:
+;
+;      If ms <= 0 : genet_err = #GENET_ERR_ARG
+;                   ProcedureReturn #GENET_ERR_ARG
+;      (RaspberryPi4/Lib/genet.pi4:3181-3184)
+;
+;  It returns a NEGATIVE before it has looked at the descriptor ring
+;  once. So on the wired link the console pump never saw a single frame,
+;  ever.
+;
+;  WHAT THAT LOOKED LIKE FROM THE OUTSIDE, and it is why it survived a
+;  flash and most of an evening: the board said `The network console is
+;  listening on UDP at its link-local address and port 5555 over Ethernet`,
+;  it answered ARP, and the laptop's ARP table held its MAC. Every
+;  instrument said reachable and nothing answered.
+;
+;  THE PROOF THAT IT WAS THIS, and not the address, the firewall or the
+;  console: with the laptop sending `uptime` to port 5555 four times a
+;  second and getting nothing, typing `ping` on the SERIAL line - a
+;  command whose pump passes a NONZERO slice through LinkPumpNet - made
+;  the console pick the peer up instantly and stream ten lines of that
+;  ping's own output back over the cable. Same address, same firewall,
+;  same console, same second. The only difference was a pump that looked.
+;
+;  THE RADIO NEVER HAD THIS. Cyw43Receive(0) polls its queue once and
+;  returns, which is what a zero budget has always meant on this seam -
+;  so the wireless console worked and the wired one did not, out of the
+;  same three lines of shared code. That asymmetry is exactly what a seam
+;  exists to remove, and it is removed HERE rather than by loosening
+;  GenetRecvWait's argument check: a WAIT of zero milliseconds genuinely
+;  is a bad argument and the driver is right to refuse it. What the seam
+;  promises is a POLL.
+; ----------------------------------------------------------------------
+Global gHwLinkRxPtr.i
+
+Procedure.i HwLinkRecv(kind.i, buf.i, max.i, ms.i)
+  Define n.i
+  gHwLinkRxPtr = 0
+  If kind = #HW_LINK_WIRED
+    If ms <= 0
+      ; ONE LOOK AT THE RING, NO WAIT. GenetRecv is the poll
+      ; GenetRecvWait loops over, so this is that loop's body run once -
+      ; it cannot spin and it cannot block.
+      n = GenetRecv(buf, max)
+    Else
+      n = GenetRecvWait(buf, max, ms)
+    EndIf
+    If n > 0
+      gHwLinkRxPtr = buf
+    EndIf
+    ProcedureReturn n
+  EndIf
+  If kind = #HW_LINK_WIFI
+    n = Cyw43Receive(ms)
+    If n > 0
+      gHwLinkRxPtr = Cyw43ReceivePtr()
+    EndIf
+    ProcedureReturn n
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkRxPtr(kind.i)
+  ProcedureReturn gHwLinkRxPtr
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkMacPtr - the six bytes frames actually leave with.
+;
+;  DHCP puts this in the packet as the client hardware address (RFC 2131
+;  chaddr) and the server addresses its reply to it, so handing over the
+;  wired card's six bytes while the radio carries the conversation
+;  produces an OFFER broadcast to a MAC nobody answers to, with no error
+;  anywhere. That happened on silicon on 2026-09-04.
+;
+;  THE WIRED ADDRESS IS REACHED THROUGH A POINTER SET AT RUN TIME, and
+;  that is not an affectation. gEthMac lives in
+;  RaspberryPi4/Board/eth_globals.pi4, which the board file includes long
+;  AFTER link.pi4 - it has to, because it is the caller half of the
+;  network commands. This file has to come BEFORE link.pi4. Declaring a
+;  second six-byte array here would be two homes for one address and the
+;  two would eventually differ, so eth.pi4 hands its address over once
+;  and this file keeps the pointer.
+; ----------------------------------------------------------------------
+Global gHwWiredMacPtr.i
+
+Procedure HwLinkSetWiredMacPtr(p.i)
+  gHwWiredMacPtr = p
+EndProcedure
+
+Procedure.i HwLinkMacPtr(kind.i)
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn @wifi_ourMac[0]
+  EndIf
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn gHwWiredMacPtr
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE THREE HOOKS. On this board they are the whole of what used to make
+;  link.pi4 name Wi-Fi.
+; ----------------------------------------------------------------------
+
+; HwLinkOfferRaw - first refusal on a received frame, before the IP layer
+; sees it. Ethertype $888E is a mid-session WPA2 rekey: NetInput does not
+; know that ethertype and drops it, which is correct of NetInput and
+; fatal in context, because a board that ignores a rekey keeps
+; transmitting under a key nobody will decrypt any more and the link then
+; dies silently in the middle of whatever was running.
+Procedure.i HwLinkOfferRaw(kind.i, p.i, n.i)
+  If kind <> #HW_LINK_WIFI
+    ProcedureReturn 0
+  EndIf
+  If n < 14
+    ProcedureReturn 0
+  EndIf
+  If PeekA(p + 12) = $88 And PeekA(p + 13) = $8E
+    WifiServiceEapolFrame(p, n)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; HwLinkOfferUdp - the same question for a datagram the IP layer has
+; already classified as UDP. NetConsoleTakeUdp checks the destination
+; port itself and answers 0 for a datagram that is somebody else's - a
+; DNS or DHCP reply belongs to the command that bound that port, not to
+; the console. That was a real defect and the symptom was a DNS reply
+; arriving as keystrokes.
+;
+; IT USED TO REFUSE EVERY KIND BUT #HW_LINK_WIFI, and that one line is the
+; whole of why a board with only a cable in it had no console on
+; 2026-09-07. The console is not a property of the radio; it is a property
+; of whichever interface holds the address.
+;
+; AND SINCE THE PER-INTERFACE LAYER IT ACCEPTS ANY INTERFACE THAT HOLDS
+; AN ADDRESS, not only the announced one. The test used to be `kind <>
+; NetConsoleKind()` - the interface the console NAMES in its
+; announcement - which was exactly right while the board had one address
+; and is a filter that throws away half its traffic now that it has one
+; per interface. NetIfUsable asks the same question of the interface the
+; frame actually arrived on, and the kind is passed through so the reply
+; leaves by that same door.
+Procedure.i HwLinkOfferUdp(kind.i, p.i)
+  If NetConsoleOn() = 0
+    ProcedureReturn 0
+  EndIf
+  If NetIfUsable(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  ; THE SAME DISPATCHER THE CONSOLE'S OWN PUMP USES, so that a datagram
+  ; this board owns is recognised identically whichever pump got it.
+  ; Its answer is passed straight through, 2 included: a 2 means a
+  ; service has STAGED a reply and the caller must put it on the wire.
+  ProcedureReturn NetConsoleOfferUdp(p, kind)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkConsoleArmed - the console has just armed on this kind, or
+;  disarmed from it. Added 2026-09-07.
+;
+;  ONE BOARD FACT HANGS OFF THIS AND IT IS THE RADIO'S RECEIVE PUMP.
+;  RaspberryPi4/Lib/wifi.pi4 keeps a pump of its own so that a group-key
+;  rekey is serviced on a board nobody is talking to; when the console is
+;  the thing reading the radio's frames, that pump has to stand down,
+;  because two consumers of one firmware queue means whichever one does
+;  not deliver keystrokes silently eats them.
+;
+;  THE TEST IS "THE CONSOLE IS ON *THIS RADIO*", NOT "A CONSOLE EXISTS".
+;  A console armed on the cable consumes nothing from the radio, and the
+;  radio's pump must keep running or the rekey death of 2026-09-06 comes
+;  straight back from the other side.
+; ----------------------------------------------------------------------
+Procedure HwLinkConsoleArmed(kind.i, on.i)
+  ; This notification is ABOUT `kind`. A wired notification must not
+  ; silently change the radio's consumer bit: the wildcard console can be
+  ; pumping both interfaces at once, independently of which one is named as
+  ; preferred. The common console explicitly sends Wi-Fi's own off edge when
+  ; that interface leaves its addressed membership.
+  If kind = #HW_LINK_WIFI
+    WifiSetConsoleOwnsRx(on)
+  EndIf
+EndProcedure
+
+; HwLinkNoteRx - what the IP layer made of the frame. A REPLY WE ASKED
+; FOR IS THE ONLY THING THAT PROVES A RADIO LINK IS ALIVE IN BOTH
+; DIRECTIONS: the firmware will happily go on claiming an association
+; while nothing we transmit reaches anybody. Getting this wrong made the
+; self-heal fire in the middle of the very first `http get` on silicon,
+; on a link that was working.
+;
+; ONLY A SOLICITED ANSWER COUNTS, AND THAT IS THE WHOLE OF THE RULE.
+; This procedure is the ONE place outside wifi.pi4 that winds the
+; round-trip clock, and until 2026-09-06 it wound it for four verdicts,
+; two of which prove nothing about the transmit half:
+;
+;   #NET_IN_LEARNED  an ARP REPLY to the keepalive's own request. Cannot
+;                    exist unless our request landed.        SOLICITED.
+;   #NET_IN_PONG     an ICMP echo REPLY to our echo request. Same.
+;                                                            SOLICITED.
+;   #NET_IN_UDP      a datagram somebody sent US. Proves the receive
+;                    half and nothing else.               UNSOLICITED.
+;   #NET_IN_TCP      a segment somebody sent US - which for an inbound
+;                    connection can be a bare SYN.        UNSOLICITED.
+;
+; THE COST OF THE TWO UNSOLICITED ONES WAS MEASURED. On 2026-09-06 the
+; link went dead and the board answered 0 of 20 pings for over half an
+; hour while the detector stayed silent, because the host trying to
+; reach it kept sending - and every one of those arriving datagrams was
+; a fresh #NET_IN_UDP that wound the clock forward. The harder somebody
+; tried to reach the board, the longer the backstop was held off. That
+; is the same mistake the first cut of the detector made in August (it
+; stamped the clock on ANY received frame and the very next TX-only
+; death fooled it), reintroduced here when this seam was written, and
+; the long note over gWifiRxProof in RaspberryPi4/Lib/wifi.pi4 states
+; the rule this now follows.
+Procedure HwLinkNoteRx(kind.i, r.i)
+  If kind <> #HW_LINK_WIFI
+    ProcedureReturn
+  EndIf
+  If r = #NET_IN_LEARNED
+    WifiNoteRxProof()
+  ElseIf r = #NET_IN_PONG
+    WifiNoteRxProof()
+  EndIf
+EndProcedure

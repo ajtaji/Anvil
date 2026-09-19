@@ -1,0 +1,1132 @@
+; ======================================================================
+;  THE MEMORY MAP - COMPUTED FROM THE IMAGE, NOT TYPED AS A WINDOW
+; ----------------------------------------------------------------------
+;  RULING 2026-09-08: "the bootloader is a kernel and can be as big as it
+;  wants." This file used to answer the question "how big may the monitor
+;  be" with a constant - #MON_HI = $003FFFFF, a two-megabyte window - and
+;  everything else in the map was positioned around that constant. That
+;  is a SIZE CAP wearing a map's clothes, and by 2026-09-08 it was 16,872
+;  bytes from binding: the image was 2,080,024 bytes of a 2,096,896-byte
+;  budget.
+;
+;  A kernel does not work that way and this one no longer does. The
+;  toolchain marks the end of the image with a linker symbol - the same
+;  thing Linux calls `_end` (arch/arm64/kernel/vmlinux.lds.S) and reserves
+;  `_text.._end` from at run time - and RaspberryPi4/EmitCore_A64.pbi
+;  emits __image_start__ / __image_end__ on every A64 build. The pair
+;  costs zero bytes; an image built before and after that change hashes
+;  the same. What it buys is that THE RUNNING PROGRAM CAN MEASURE ITSELF,
+;  so the map below is arithmetic on the image rather than a set of
+;  numbers somebody has to remember to raise.
+;
+;  WHAT IS STILL A CONSTANT, AND WHY EACH ONE IS A FACT RATHER THAN A CAP:
+;
+;    #MON_LO       the address the FIRMWARE loads kernel8.img to. It is
+;                  CONFIG.TXT's kernel_address on the stick and the build
+;                  line's LoadAddress, and it is not this program's
+;                  choice. A fact about the boot path.
+;    #MON_STACK    the top of the monitor's own stack, moved there by
+;                  three instructions at the top of Main(). Below the
+;                  image on purpose; see THE STACK in board.pi4.
+;    #AB_BASE      the autoboot record. A FIXED page that no image size
+;                  can reach - see THE AUTOBOOT RECORD below, which is
+;                  where it moved to on 2026-09-08 and why.
+;    #MON_DATA_*   where --bss-addr puts this program's variables. A
+;                  placement decision, not a budget; the 8 MiB size is
+;                  what HitsMonitor() refuses and is argued below.
+;    #PAY0_HI      the top of the low payload window - one clear megabyte
+;                  below the default payload stack top.
+;    #PAY1_LO/HI   the whole of DRAM bank 1, measured from bdinfo.
+;
+;  EVERYTHING ELSE IS COMPUTED: where the monitor's reserved region ends,
+;  where the low payload window begins, and where a host is told to stage
+;  a file. All three move when the image does, in one place, and the
+;  `map` command prints them with the byte count they came from.
+;
+;  THE GRAIN IS ONE MEGABYTE AND THAT IS THE GUARD. The monitor's reserved
+;  region is rounded UP to a whole megabyte, and the low payload window
+;  starts at the megabyte boundary above the image. So a payload address
+;  stays valid until the monitor crosses a megabyte boundary, and on the
+;  day it does the board says so in a full sentence with the new window in
+;  it rather than letting an image land on the monitor. A finer grain
+;  would move payload addresses on almost every build; a coarser one
+;  would hand back megabytes of DRAM for nothing.
+;
+;  WHEN THIS WAS WRITTEN the image was 2,080,024 bytes and the
+;  arithmetic produced $00200000..$003FFFFF and $00400000..$07EFFFFF -
+;  the two constants this file used to carry, derived instead of typed,
+;  which is a reassuring result and a weak proof. TODAY IT IS 2,107,672
+;  BYTES, ending at $00402917, so it produces $00200000..$004FFFFF and
+;  $00500000..$07EFFFFF and the reassuring coincidence is over. Do not
+;  update this paragraph with a third number: type `map`, which is the
+;  whole point of it.
+; ======================================================================
+
+#MON_STACK = $00100000         ; monitor stack top, grows down
+#MON_LO    = $00200000         ; monitor image base (--load-addr,
+                               ; CONFIG.TXT kernel_address)
+
+; The granularity the map moves in. See THE GRAIN IS ONE MEGABYTE above.
+#MON_GRAIN = $00100000
+
+; ----------------------------------------------------------------------
+;  THE AUTOBOOT RECORD - MOVED OUT OF THE IMAGE WINDOW 2026-09-08
+;
+;  IT WAS AT $003FFF00, the last 256 bytes of the old two-megabyte
+;  window, and that was the CEILING: the record was the first thing a
+;  growing image would land on, and nothing about a fixed record inside a
+;  region whose size is the image's is repairable. It had to leave.
+;
+;  WHERE IT WENT AND WHY THAT PAGE. $001FF000 is the last page below
+;  #MON_LO. Four things are true of it and all four are required:
+;
+;    no image size can reach it   the image grows UP from #MON_LO. There
+;                                 is no number of bytes of code that
+;                                 arrives at an address below its own
+;                                 base.
+;    the stack cannot reach it    #MON_STACK is $00100000 and the monitor's
+;                                 stack grows DOWN from there, into
+;                                 $000FFFFF and below. This page is a
+;                                 megabyte ABOVE the stack top, in the
+;                                 band between the stack and the image
+;                                 that nothing else claims.
+;    _start cannot erase it       it is not BSS. The zeroing loop walks
+;                                 __bss_start__..__bss_end__, which
+;                                 --bss-addr puts at #MON_DATA_LO. This was
+;                                 the SILENT failure the old address had
+;                                 and it is now impossible twice over.
+;    its address does not move    which is the whole requirement a record
+;                                 read after a reset by a possibly
+;                                 REBUILT image has, and it is why the
+;                                 record cannot be a NoClear Global: a
+;                                 NoClear Global's address moves when
+;                                 anything above it changes size.
+;
+;  THE 2026-08-28 NOTE SAID THERE WAS NOWHERE TO PUT IT and that moving it
+;  bought 256 bytes. Both statements were answers to a different question.
+;  "Nowhere to put it" was about a WATCHDOG SCRATCH REGISTER - a place
+;  that survives a reset of the SoC - and that is still true: this part
+;  has none this project can cite (Lib/safety.pi4:107-112). The record
+;  never needed one. It needs raw DRAM at a fixed address that survives
+;  _start, and DRAM below the load address is exactly that, which is
+;  where #SAFETY_COUNT_ADDR already lives at $00001000. And "it buys 256
+;  bytes" was true while the ceiling was #AB_BASE; with the ceiling gone
+;  the record is not buying space, it is getting out of the way of a
+;  region that now has no top.
+;
+;  IT IS STILL PROTECTED. It is outside both payload windows, so `b`, `l`,
+;  `load` and `get` refuse it through InPayload(); `w`, `g`, `a`, `fill`
+;  and `copy` are not window-checked, so it is declared below as one of
+;  the regions HwMonRegion*() names and HitsMonitor() refuses. That is the
+;  same reasoning that added the data window as a second region in
+;  2026-08-28 - a region the monitor owns that no window test covers.
+;
+;  THE DSI FRAMEBUFFER IS THE FOURTH REGION. Main added its fixed 8 MiB
+;  allocation after the no-size-cap topic branched, so the topic's list of
+;  three could not name it. It is monitor-owned DMA/scanout memory outside
+;  both payload windows and therefore belongs in the same board-declared
+;  refusal list as code, variables and the autoboot page.
+;
+;  NOTHING READS IT BEFORE THE IMAGE RUNS. The firmware loads kernel8.img
+;  and branches; it has never been told this address exists. The only
+;  readers are AutoRead() and AutoFlush() in RaspberryPi4/Board/cache.pi4,
+;  called from this monitor's own boot path (Board/boot.pi4) after
+;  _start, so moving the address is a change to one file's constant and
+;  to nothing outside this image.
+;
+;  ALIGNMENT IS UNCHANGED IN KIND. $001FF000 is 4 KiB aligned and
+;  therefore 64-byte aligned, so AutoFlush() still needs exactly one
+;  cache line for all three words ($1FF000..$1FF017).
+; ----------------------------------------------------------------------
+#AB_BASE   = $001FF000
+#AB_BYTES  = $00001000         ; the whole page is reserved, not 24 bytes:
+                               ; a refusal that names a page is one an
+                               ; operator can act on, and the page is not
+                               ; wanted for anything else.
+#AB_MAGIC  = $5041594C4F414421 ; "PAYLOAD!" - positive in a signed .i
+
+; ----------------------------------------------------------------------
+;  RAW SECONDARY STACK RESERVATION - INACTIVE, BOARD OWNED
+;
+;  Cores 1..3 each own one exact 4 KiB page immediately below the autoboot
+;  page. The whole $001FC000..$001FEFFF band is below the fixed firmware load
+;  address, above the primary stack top, outside BSS, framebuffer and both
+;  payload windows, and cannot move when the linked image grows upward.
+;  core_worker.pi4 is not in the live include graph; these accessors establish
+;  ownership and monitor protection without activating a secondary core.
+; ----------------------------------------------------------------------
+#CORE_RAW_STACK_LO    = $001FC000
+#CORE_RAW_STACK_PAGE  = $00001000
+#CORE_RAW_STACK_HI    = $001FEFFF
+
+Procedure.i HwCoreRawStackBase(core.i)
+  Select core
+    Case 1 : ProcedureReturn #CORE_RAW_STACK_LO
+    Case 2 : ProcedureReturn #CORE_RAW_STACK_LO + #CORE_RAW_STACK_PAGE
+    Case 3 : ProcedureReturn #CORE_RAW_STACK_LO + (#CORE_RAW_STACK_PAGE * 2)
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwCoreRawStackBytes(core.i)
+  If core >= 1 And core <= 3
+    ProcedureReturn #CORE_RAW_STACK_PAGE
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  #CAP_PARALLEL - the payload-facing four-core capability, ABI group 15.
+;
+;  IT IS DECLARED HERE, BESIDE THE RESERVATION IT IS TRUE BECAUSE OF.
+;  Every other #CAP_* answers "does this board have the hardware"; this
+;  one answers "does this board reserve a stack for each secondary core
+;  and offer the resident job owner that uses them", and the reservation
+;  three lines above is the whole of the first half. A capability whose
+;  evidence is in this file reads correctly in this file.
+;
+;  Anvil/Hal/abi.pbi gates group 15 on it, the same way it gates the
+;  touch group on #CAP_TOUCH: a board that declares 0 compiles the
+;  #SVC_ENOSYS arm and links against no secondary-core code at all.
+; ----------------------------------------------------------------------
+#CAP_PARALLEL = 1
+
+; ----------------------------------------------------------------------
+;  THE MONITOR'S DATA WINDOW - the Globals, put there by BssAddress.
+;
+;  The original 8 MiB reservation at $08200000 was clear of the payload
+;  stack and Ethernet ring, but the TrueType renderer and Vulkan backend
+;  grew the linked monitor's BSS beyond its former reservation. The old bound was
+;  therefore no longer safe. The new 16 MiB window starts at $0D000000,
+;  immediately above the independently reserved Vulkan heap
+;  ($0C000000..$0CFFFFFF), and ends at $0DFFFFFF.
+;
+;  This is inside measured low DRAM bank 0 ($00000000..$3B2FFFFF), which
+;  exists on every supported Pi 4. It is above the low payload window,
+;  payload stack, Ethernet ring, DSI framebuffer, module region, V3D
+;  arena, screenshot capture and Vulkan heap. It is below bank 1 and the
+;  hole between banks. The linker and tools/a64/a64_anvil_check.py check
+;  the exact emitted BSS extent against this named 16 MiB refusal range.
+;
+;  BSS is not copied from the image. _start clears the linker-emitted
+;  __bss_start__..__bss_end__ range at the address selected by BssAddress.
+;  Keeping that directive equal to #MON_DATA_LO and protecting the whole
+;  reserved window through HwMonRegion*() prevents both silent overlap and
+;  writes from monitor memory commands.
+; ----------------------------------------------------------------------
+#MON_DATA_LO    = $0D000000    ; monitor BSS follows the Vulkan heap
+#MON_DATA_BYTES = $01000000    ; 16 MiB; emitted BSS currently uses 14.3 MiB
+#MON_DATA_HI    = $0DFFFFFF
+
+; ----------------------------------------------------------------------
+;  THE PAYLOAD WINDOWS. The LOW window's bottom edge is computed - see
+;  HwPayLo() below. The other three edges are measured facts about this
+;  board's DRAM and stay constants:
+;
+;    #PAY0_HI   one clear megabyte below $08000000, the stack top every
+;               image this compiler emits uses unless it was built with
+;               --stack-addr. A payload loaded at $07F80000 would be
+;               eaten by its own first push.
+;    #PAY1_*    the whole of bdinfo's second bank, which nothing else on
+;               this board enters.
+; ----------------------------------------------------------------------
+#PAY0_HI   = $07EFFFFF
+#PAY1_LO   = $40000000
+#PAY1_HI   = $FBFFFFFF
+
+
+; ----------------------------------------------------------------------
+;  THE DSI PANEL'S FRAMEBUFFER - NEW 2026-09-08.
+;
+;  WHY THE MONITOR OWNS THIS MEMORY AT ALL, WHICH IT DOES NOT FOR HDMI.
+;  On HDMI the VideoCore firmware allocates the surface and hands back an
+;  address; there is nothing to place. On DSI the firmware allocates
+;  NOTHING - it never brings DSI1 up (its power domain is off at boot),
+;  owns no DSI display, and `screen displays` truthfully reports zero
+;  even with the panel lit. Anvil composes that surface itself: it points
+;  an HVS display list at these bytes and pixel valve 1 at the panel. So
+;  the address is ours to choose, and a chosen address in this program is
+;  A NAMED CONSTANT WITH ITS REASONS and never "the obvious next free
+;  megabyte" - the same rule #MON_DATA_LO above is written under, and for
+;  the same reason.
+;
+;  FIVE REQUIREMENTS, AND ONE BAND SATISFIES ALL FIVE:
+;
+;    below $40000000                 - the HVS's window on DRAM is the
+;                                      FIRST GIGABYTE ONLY
+;                                      (bcm2711.dtsi:45, #HVS_PHYS_MAX in
+;                                      hvs.pi4). A display list pointing
+;                                      above it is read without complaint
+;                                      and scans out whatever is 3 GB away.
+;    present on every Pi 4           - so not bank 1; this is the recovery
+;                                      path and may not need the big board.
+;    outside BOTH payload windows    - or a `load`, a `net recv` or a
+;                                      staged upload would land on the
+;                                      picture, and InPayload() would
+;                                      ALLOW it, because those two windows
+;                                      are the whole of what it calls
+;                                      allowed. #PAY0 ends $07EFFFFF and
+;                                      #PAY1 starts $40000000.
+;    clear of the monitor's own text - not $00200000..the image end, and
+;      AND of where tools stage        NOT $00400000 or $00800000, which
+;                                      are where the board tools stage an
+;                                      upload through DRAM.
+;    clear of #MON_DATA and #ETH_RX  - the Globals, and the GENET receive
+;                                      ring a bus master writes into on
+;                                      its own schedule.
+;
+;  $08A00000 was selected immediately above the monitor's original 8 MiB
+;  BSS window. The BSS later outgrew that window and now lives at
+;  $0D000000; the framebuffer keeps its fixed address as a separate,
+;  enumerated monitor-owned region.
+;
+;  THE SIZE IS 8 MiB AND IT IS TWO SCREENS, NOT ONE. 800 x 1280 x 4 is
+;  4,096,000 bytes ($3E8000), so the scanout buffer runs $08A00000 ..
+;  $08DE7FFF. The second buffer is what a 90 or 270 degree rotation
+;  needs: the panel scans 800x1280 portrait whatever the console does,
+;  so a landscape console draws into a 1280x800 buffer of its own and
+;  that is turned into the portrait one on present. A transpose does not
+;  change the pixel count, so the second buffer is the same 4,096,000
+;  bytes; it starts at the next round megabyte after the first ends and
+;  the pair fit inside 8 MiB with 96 KiB to spare.
+;
+;  At rotation 0 and 180 THERE IS NO SECOND BUFFER IN USE - the console
+;  draws straight into the scanout one and #MON_FB_DRAW is untouched
+;  memory. 180 costs nothing either, because the HVS composes it from
+;  its two mirror bits; only 90 and 270 pay for the transpose.
+;
+;  THE PANEL IS 800x1280 AND THAT IS MEASURED, NOT ASSUMED: on this board
+;  PV_HORZB read 00CF0320 and PV_VERTB read 00140500, and $320 is 800
+;  with $500 for 1280.
+; ----------------------------------------------------------------------
+#MON_FB_LO      = $08A00000    ; the DSI framebuffer window, 8 MiB
+#MON_FB_HI      = $091FFFFF
+#MON_FB_SCAN    = $08A00000    ; what the HVS scans out - always the
+                               ; panel's native 800 x 1280 portrait
+#MON_FB_DRAW    = $08E00000    ; what the console draws into when the
+                               ; rotation makes the two differ. The scan
+                               ; buffer ends $08DE7FFF; this is the next
+                               ; round megabyte above it.
+#MON_FB_PANEL_W = 800          ; the panel's own scan geometry
+#MON_FB_PANEL_H = 1280
+#MON_FB_BYTES   = 4096000      ; 800 * 1280 * 4, one screen
+
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE REGION - NEW 2026-09-10.
+;
+;  WHERE A LOADED DRIVER LIVES, and one 8 MiB region holding two windows:
+;  the ARENA, where verified modules are placed and executed, and the
+;  STAGING window, where a container is read to and judged before any of
+;  it is believed. They are separate because the digest covers the
+;  header, and the relocation table and the compatible ids sit AFTER the
+;  image - so the whole file has to be in one place before any of it can
+;  be trusted, and reading it into the arena first would mean writing
+;  unverified bytes into the range live drivers occupy.
+;
+;  THE ADDRESS IN THE 2026-09-06 DESIGN NOTE IS FORBIDDEN AND THAT IS THE
+;  FIRST THING TO SAY. It proposed $08A00000..$091FFFFF, argued four
+;  ways, and every one of those arguments was true when it was written.
+;  Two days later main allocated exactly that range for the DSI
+;  framebuffer (#MON_FB_LO above), for four nearly identical reasons - it
+;  is the first round megabyte above the framebuffer, inside the HVS's
+;  gigabyte, outside both payload windows and the monitor's relocated BSS.
+;  A module loaded
+;  there would be scanned out as pixels and then branched into. The
+;  proposal is struck, the reason is kept here rather than deleted, and
+;  ModArenaInit() now CHECKS the arena against this file's own region
+;  list rather than trusting a paragraph - because the paragraph was
+;  right and went stale anyway.
+;
+;  FIVE REQUIREMENTS, THE SAME FIVE #MON_FB_LO IS ARGUED UNDER:
+;
+;    present on every Pi 4          - so not bank 1 ($40000000 up), which
+;                                     a 1 GB board does not have. This is
+;                                     the recovery path; it may not need
+;                                     the big board.
+;    outside BOTH payload windows   - or a `load`, a `net recv` or a
+;                                     staged upload would land on a
+;                                     loaded driver and InPayload() would
+;                                     ALLOW it. #PAY0 ends $07EFFFFF and
+;                                     #PAY1 starts $40000000.
+;    above the payload's own stack  - which grows DOWN from $08000000
+;    clear of every other owner     - the Globals ($0D000000..$0DFFFFFF),
+;                                     the GENET receive ring
+;                                     ($08100000..$0817FFFF, written by a
+;                                     bus master on its own schedule),
+;                                     the DSI framebuffer
+;                                     ($08A00000..$091FFFFF), and the V3D
+;                                     engine's arena ($0A000000, 16 MiB,
+;                                     RaspberryPi4/Board/v3d_console.pi4)
+;    a round megabyte               - so the refusal reads as a window
+;
+;  $09200000 IS THE FIRST ROUND MEGABYTE ABOVE THE FRAMEBUFFER, and the
+;  8 MiB it takes ends at $099FFFFF - six clear megabytes below the V3D
+;  arena, in the band this map calls "free, but DELIBERATELY NOT
+;  OFFERED". The largest driver anybody has proposed converting is about
+;  600 KiB, so six megabytes of arena holds every module this board is
+;  likely to carry several times over.
+;
+;  THE SPLIT IS 6 MiB ARENA AND 2 MiB STAGING. Staging is a cap on how
+;  big a single container this board will read, and two megabytes is
+;  three times the largest driver in the tree.
+;
+;  IT IS DECLARED AS A MONITOR REGION, which is what protects it: `w`,
+;  `fill` and `copy` are not window-checked and go through
+;  HitsMonitor(), so a typo cannot scribble on a running driver. That
+;  matters more here than for the framebuffer - a corrupted picture is
+;  visible and a corrupted driver is a wild branch later with no message.
+; ----------------------------------------------------------------------
+#MOD_REGION_LO   = $09200000   ; the whole module region, 8 MiB
+#MOD_REGION_HI   = $099FFFFF
+#MOD_ARENA_LO    = $09200000   ; where verified modules are placed
+#MOD_ARENA_BYTES = $00600000   ; 6 MiB
+#MOD_STAGE_LO    = $09800000   ; where one container is read and judged
+#MOD_STAGE_BYTES = $00200000   ; 2 MiB - the largest container accepted
+
+; The index this region has in HwMonRegion*(). ModArenaInit() skips it
+; when it checks the arena against the rest of the map, because a range
+; necessarily overlaps itself; every other region is a real clash.
+#MON_REGION_MODULES = 5
+
+; ----------------------------------------------------------------------
+;  THE BOOT PHASE RECORD - NEW 2026-09-11
+;
+;  WHAT IT IS FOR. The boot log names what is starting, so a hang shows
+;  where - on the PANEL, and only while the panel is being serviced. A
+;  board that stops somewhere the screen service itself cannot run leaves
+;  nothing behind at all, and the only way to ask it afterwards is to boot
+;  a DIFFERENT image and look at memory. That needs an address that is the
+;  same in both images, that neither image's `_start` erases, and that
+;  survives the reset between them.
+;
+;  WHY $001FB000. The same four tests the autoboot record at $001FF000 is
+;  placed by, and it passes all four:
+;
+;    no image size can reach it   the image grows UP from #MON_LO
+;                                 ($00200000). There is no number of bytes
+;                                 of code that arrives below its own base.
+;    the stack cannot reach it    #MON_STACK is $00100000 and the monitor's
+;                                 stack grows DOWN from there. This page is
+;                                 a megabyte and a half ABOVE the stack
+;                                 top, on the far side of it.
+;    _start cannot erase it       it is not BSS. The zeroing loop walks
+;                                 __bss_start__..__bss_end__, which
+;                                 BssAddress puts at #MON_DATA_LO.
+;    its address does not move    which is the whole requirement a record
+;                                 read by a possibly DIFFERENT image after
+;                                 a reset has.
+;
+;  AND IT IS THE PAGE BELOW A BAND THAT IS ALREADY SPOKEN FOR, which is
+;  why this address and not a round number lower down: $001FC000..$001FEFFF
+;  is the raw-secondary stack reserve and $001FF000 is the autoboot record,
+;  so $001FB000 extends a reserved run downwards by one page instead of
+;  planting a lone page in the middle of the free band. It is outside both
+;  payload windows (#PAY0 begins a megabyte above the image end), outside
+;  BSS, outside the framebuffer, and outside the module arena.
+;
+;  IT IS DECLARED AS A REFUSED REGION, region 6 below, so `w`, `fill` and
+;  `copy` cannot write it by accident - the same protection the autoboot
+;  record has, for the same reason: a record an operator can overwrite
+;  without being told is a record that will be believed after it has been
+;  destroyed.
+;
+;  DRAM SURVIVES A RESET AND DOES NOT SURVIVE A POWER CUT, and the record
+;  says which happened rather than leaving the reader to guess: the magic
+;  is written once per boot, so a reader that finds it absent knows the
+;  contents are not a previous boot's, they are whatever DRAM powered up
+;  holding. That is the same property #SAFETY_COUNT_ADDR at $00001000
+;  depends on and it is stated here rather than assumed.
+;
+;  THE LAYOUT IS ONE 64-BYTE CACHE LINE, so one maintenance operation
+;  covers the whole record whatever the caches are doing:
+;
+;    +0   the magic, written once per boot
+;    +8   the phase this boot has reached
+;    +16  the phase the PREVIOUS boot reached, carried across
+;    +24  how many boots have written this record
+;
+;  The rest of the line is reserved and left alone.
+; ----------------------------------------------------------------------
+#MON_PHASE_LO    = $001FB000
+#MON_PHASE_BYTES = $00001000   ; the whole page, as #AB_BASE reserves its
+                               ; own: a refusal that names a page is one an
+                               ; operator can act on
+#MON_PHASE_MAGIC = $414E565048415345   ; "ANVPHASE", positive in a signed .i
+#MON_PHASE_OFF_MAGIC = 0
+#MON_PHASE_OFF_NOW   = 8
+#MON_PHASE_OFF_PREV  = 16
+#MON_PHASE_OFF_BOOTS = 24
+#MON_REGION_PHASE = 6
+
+; ----------------------------------------------------------------------
+;  THE SCREENSHOT CAPTURE AREA - NEW 2026-09-11
+;
+;  WHAT IT IS FOR, AND THE EVENING THAT ASKED FOR IT. A payload ran four
+;  times, returned cleanly every time, and nothing reached the panel;
+;  the fifth run drew a garbled frame. Nobody could say which of those
+;  five was which, because the only record of what the panel showed was
+;  a person looking at it. The ruling was that every board run comes
+;  back with a picture.
+;
+;  THE PICTURE CANNOT BE TAKEN AFTER THE FACT. When a payload returns,
+;  the monitor prints, and printing repaints the console over the whole
+;  surface the payload left behind - so by the time a prompt exists to
+;  type `p` at, the frame being asked about is gone. The only way to
+;  keep it is to copy it somewhere the repaint cannot reach, BEFORE the
+;  repaint, and read that copy out afterwards. This is that somewhere.
+;
+;  WHY IT IS A DECLARED REGION AND NOT A GLOBAL ARRAY. It has to survive
+;  the payload, which owns the whole machine while it runs, and it has
+;  to be writable by the monitor after the payload has returned. BSS is
+;  the wrong home twice over: `--bss-addr` moves it when anything above
+;  it changes size, so nothing outside this image could ever name it,
+;  and a payload that scribbles on the monitor's variables would take
+;  the evidence with it. A fixed address in the band this map calls
+;  "free, but DELIBERATELY NOT OFFERED" is the shape the autoboot
+;  record, the phase record and the framebuffer all already have.
+;
+;  FIVE REQUIREMENTS, THE SAME FIVE #MON_FB_LO AND #MOD_REGION_LO ARE
+;  ARGUED UNDER, AND ONE MORE THAT IS THIS REGION'S OWN:
+;
+;    present on every Pi 4          - so not bank 1 ($40000000 up), which
+;                                     a 1 GB board does not have. 176 MiB
+;                                     is inside bank 0 on every part
+;                                     (which reaches ~$3B2FFFFF).
+;    outside BOTH payload windows   - or a `load`, a `net recv` or a
+;                                     staged upload would land on the
+;                                     capture and InPayload() would ALLOW
+;                                     it. #PAY0 ends $07EFFFFF and #PAY1
+;                                     starts $40000000.
+;    above the payload's own stack  - which grows DOWN from $08000000.
+;    clear of every other owner     - the Globals ($0D000000..$0DFFFFFF),
+;                                     the GENET receive ring ($08100000),
+;                                     the DSI framebuffer
+;                                     ($08A00000..$091FFFFF), the module
+;                                     region ($09200000..$099FFFFF) and
+;                                     the V3D engine's arena
+;                                     ($0A000000..$0AFFFFFF,
+;                                     RaspberryPi4/Board/v3d_console.pi4).
+;    a round megabyte               - so the refusal reads as a window.
+;    NOT THE SOURCE OF ITS OWN COPY - it may not be inside the
+;                                     framebuffer window, because the
+;                                     copy reads that window and writes
+;                                     this one and an overlap would be a
+;                                     picture of itself being taken.
+;
+;  $0B000000 IS THE FIRST ROUND MEGABYTE ABOVE THE V3D ARENA. Later
+;  reservations add the Vulkan heap at $0C000000 and monitor BSS at
+;  $0D000000; this capture window remains below both of them.
+;
+;  THE SIZE IS 12 MiB AND IT IS SIZED BY THE BIGGEST SCREEN, NOT THE
+;  PANEL. The DSI panel is 800 x 1280 x 4 = 4,096,000 bytes and it would
+;  fit in five; the HDMI surface on this bench is 1824 x 984 x 4 =
+;  7,179,264, and a 1920 x 1200 mode would be 9,216,000. A capture area
+;  that silently held only the panel would take a short picture of an
+;  HDMI console and the host would decode a torn frame rather than be
+;  told. So the pixel window is #MON_SHOT_PIX_BYTES, the capture REFUSES
+;  a frame larger than it, and 12 MiB covers every mode this monitor can
+;  bring up with room left.
+;
+;  THE LAYOUT IS ONE HEADER PAGE AND THEN THE PIXELS. The header is the
+;  first 4 KiB - written as 64-bit words in the first two cache lines,
+;  with the rest of the page reserved - and the pixels start at the next
+;  page, so the copy's destination is page aligned and one cache-clean
+;  run covers it. The header is NOT interleaved with the pixels for the
+;  reason every other record here is kept whole: a reader that finds the
+;  magic knows the geometry before it reads a single pixel.
+;
+;  THE MAGIC IS WRITTEN LAST AND CLEARED FIRST. A reader that finds it
+;  is looking at a complete capture; one that finds it absent is looking
+;  at a capture that was interrupted, or at DRAM that powered up. An
+;  instrument that cannot say "there is no picture here" is worse than
+;  none - the same rule the phase record above is written under.
+; ----------------------------------------------------------------------
+#MON_SHOT_LO        = $0B000000    ; the capture area, 12 MiB
+#MON_SHOT_HI        = $0BBFFFFF
+#MON_SHOT_HDR       = $0B000000    ; the header page
+#MON_SHOT_HDR_BYTES = $00001000
+#MON_SHOT_PIX       = $0B001000    ; the physical frame, exactly as scanned
+#MON_SHOT_PIX_BYTES = 12578816     ; $0BBFFFFF - $0B001000 + 1
+#MON_SHOT_MAGIC     = $414E5653484F5431   ; "ANVSHOT1", positive in a signed .i
+#MON_REGION_SHOT    = 7
+
+; Dedicated monitor-owned Vulkan heap. This 16 MiB page-aligned window is
+; above the screenshot reservation (ending at $0BBFFFFF), below payload bank
+; 1 (starting at $40000000), and disjoint from monitor BSS, DSI framebuffers,
+; module staging, and the V3D arena. It is separately mapped by NeonGpuExtraMap.
+#MON_VK_HEAP_LO      = $0C000000
+#MON_VK_HEAP_BYTES   = $01000000
+#MON_VK_HEAP_HI      = $0CFFFFFF
+#MON_REGION_VK_HEAP  = 8
+
+; The header's words. LOGICAL width and height are what the picture is
+; STREAMED as - the console's own coordinates, the same numbers `p` puts
+; in its PIC line - and the physical trio (pitch, panelW, panelH) plus
+; the rotation are what the bytes actually are, so the stream can be
+; rebuilt from the copy by exactly the map the live screen uses.
+#MON_SHOT_OFF_MAGIC  = 0
+#MON_SHOT_OFF_SEQ    = 8       ; rises by one on every completed capture
+#MON_SHOT_OFF_W      = 16      ; logical width  - what `shot` streams
+#MON_SHOT_OFF_H      = 24      ; logical height
+#MON_SHOT_OFF_PITCH  = 32      ; physical bytes per row of the copy
+#MON_SHOT_OFF_ROT    = 40      ; 0, 90, 180 or 270
+#MON_SHOT_OFF_TIER   = 48      ; #HW_TIER_CPU / _DMA / _V3D
+#MON_SHOT_OFF_X0     = 56      ; the payload's x0, for a capture on return
+#MON_SHOT_OFF_PANELW = 64      ; physical raster width of the copy
+#MON_SHOT_OFF_PANELH = 72      ; physical raster height
+#MON_SHOT_OFF_BPP    = 80      ; bytes per pixel; 4 or the capture refused
+#MON_SHOT_OFF_SRC    = 88      ; #SCR_SRC_HDMI / #SCR_SRC_DSI
+#MON_SHOT_OFF_WHO    = 96      ; 0 the payload asked, 1 the monitor took it
+#MON_SHOT_OFF_BYTES  = 104     ; pixel bytes copied
+
+; Who took the picture, for #MON_SHOT_OFF_WHO. Two words rather than a
+; bare 0/1 so that the console line and the host tool say the same thing
+; about a capture, and so a third source later is an added constant
+; rather than a re-interpreted flag.
+#MON_SHOT_WHO_PAYLOAD = 0      ; the payload called the service slot
+#MON_SHOT_WHO_RETURN  = 1      ; the monitor took it as the payload returned
+
+; ======================================================================
+;  MonImage*() - THE IMAGE MEASURES ITSELF
+; ----------------------------------------------------------------------
+;  __image_start__ and __image_end__ are emitted by
+;  RaspberryPi4/EmitCore_A64.pbi on every A64 build: the first is at the
+;  load base, the second is one past the last byte the firmware copies,
+;  because it is emitted immediately before .bss and BSS reserves space
+;  without writing bytes. adrp+add is the architecture's own way to reach
+;  a symbol from anywhere in +/-4 GB, and it is what _start already uses
+;  for __bss_start__.
+;
+;  WHY THE ANSWER GOES THROUGH FILE-SCOPE STORAGE. It used to go through
+;  a procedure local, because on this backend a local was a static slot in
+;  BSS and had an address the assembler could name. THAT IS NO LONGER TRUE,
+;  and the change is right: as of 2026-09-11 automatic storage lives in the
+;  invocation's frame, so a name for it would mean a different place on
+;  every call, and the compiler refuses inline assembly that takes one as
+;  an absolute symbol. The two slots below are therefore file-scope, which
+;  is the layer that can honestly own an address.
+;
+;  THE VALUE IS STILL UNCACHEABLE BY CONSTRUCTION. Each slot is written by
+;  its ASM block and read on the very next line, and nothing in the
+;  procedure reads it beforehand, so the emitter's register map holds
+;  nothing for it and the read must come from memory. That was the point of
+;  the local and it survives the move; what would break it is a read
+;  EARLIER in the same procedure, and there is none.
+;
+;  EACH PROCEDURE HAS ITS OWN SLOT. They hold link-time constants - the
+;  same bytes on every call - so two cores asking at once cannot disagree,
+;  and separate slots keep that true without either procedure having to
+;  know about the other.
+;
+;  x16 and x17 are the scratch pair the emitted preamble itself uses for
+;  the stack switch and the FP gate; A64X() hands out x9..x13 for IR
+;  temporaries, so neither can be live across an ASM block here.
+; ======================================================================
+Global monimage_lo.i = 0       ; written by MonImageLo()'s ASM, read next line
+Global monimage_end.i = 0      ; written by MonImageEnd()'s ASM, read next line
+
+Procedure.i MonImageLo()
+  ASM
+    adrp x16, __image_start__
+    add  x16, x16, #:lo12:__image_start__
+    adrp x17, global_monimage_lo
+    add  x17, x17, #:lo12:global_monimage_lo
+    str  x16, [x17]
+  EndASM
+  ProcedureReturn monimage_lo
+EndProcedure
+
+; ONE PAST THE LAST BYTE OF THE IMAGE. Not the last byte - this is the
+; end the linker states, and the arithmetic below is written against a
+; half-open range for the same reason the assembler's own codeEnd is.
+Procedure.i MonImageEnd()
+  ASM
+    adrp x16, __image_end__
+    add  x16, x16, #:lo12:__image_end__
+    adrp x17, global_monimage_end
+    add  x17, x17, #:lo12:global_monimage_end
+    str  x16, [x17]
+  EndASM
+  ProcedureReturn monimage_end
+EndProcedure
+
+; ======================================================================
+;  THE BOOT PHASE RECORD - the four calls, and the one line they keep
+; ----------------------------------------------------------------------
+;  MonPhaseMark() IS CALLED FROM A PATH THAT MAY BE ABOUT TO WEDGE, so it
+;  does the least it can: one store and one cache-line maintenance. No
+;  branch on state, no printing, no allocation, and nothing that can
+;  itself wait. The rule for an instrument is that it must not be able to
+;  become the fault it is looking for.
+;
+;  THE MAINTENANCE IS NOT OPTIONAL. This monitor can run with caches on
+;  (`cache on`), and a record that is still sitting in this core's
+;  D-cache when the machine wedges is a record that never reaches DRAM
+;  and never survives the reset. "civac" cleans AND invalidates to the
+;  point of coherency, which is what a value another image will read
+;  after a reset needs; it is the same operation and the same one-line
+;  idiom mailbox.pi4 and xhci.pi4 each carry for themselves.
+;
+;  THE FLUSH ADDRESS IS FILE-SCOPE, and that is the frame rule: automatic
+;  storage lives in the invocation's frame as of 2026-09-11, so it has no
+;  address inline assembly can name. Same move, same reason, as
+;  monimage_lo/monimage_end above and the cache walk's bounds in dma.pi4.
+;
+;  x16 IS THE SCRATCH, as in the two blocks above and for the reason
+;  stated there: A64X() hands out x9..x13 for IR temporaries and neither
+;  x16 nor x17 can be live across an ASM block here.
+; ======================================================================
+Global monphase_flush.i = 0
+
+Procedure MonPhaseFlush()
+  ASM
+    adrp x16, global_monphase_flush
+    add  x16, x16, #:lo12:global_monphase_flush
+    ldr  x16, [x16]
+    dc civac, x16
+  EndASM
+EndProcedure
+
+; Start this boot's record, and CARRY THE PREVIOUS BOOT'S LAST PHASE
+; ACROSS. The carry is the whole point: the phase that matters is the one
+; a boot that never finished had reached, and the only reader that can
+; ever see it is the boot after it.
+;
+; A magic that does not match means the page is not a previous boot's
+; record - a power cut, a first boot, or a board somebody else was using -
+; and the carried phase is set to -1 rather than to whatever DRAM powered
+; up holding. An instrument that cannot say "I do not know" is worse than
+; none.
+; ----------------------------------------------------------------------
+;  THE BOOT TRAIL - 2026-09-16, forum 880 (the boot that stops after the
+;  USB stick is found).
+;
+;  The phase record above keeps ONE word: the last marker. That names the
+;  boot step a hang happened in and nothing inside it, and the stops of
+;  2026-09-16 were inside "USB devices" and the mount after it, where one
+;  step covers a whole SCSI conversation. So every marker is ALSO appended
+;  to a ring of the last 64, with the millisecond it happened at, and the
+;  ring the previous boot left is copied aside before this boot starts its
+;  own. A boot that hangs, is reset, and boots again can then say which
+;  SCSI command it sent last and what came back.
+;
+;  NO NEW VARIABLES, ON PURPOSE. Everything here lives in the phase record's
+;  own page, at fixed offsets. A Global would move every other global -
+;  including the USB host's DMA arena - and an instrument that changed the
+;  layout of the code it is watching would be watching a different board.
+;
+;    +256  magic "ANVTRAIL"         +264  markers appended this boot
+;    +272  boot count this trail    +280  1 while recording (config half)
+;    +288  1 while the boot watchdog instrument is armed
+;    +320  64 entries of 16 bytes:  +0 marker (32), +4 unused, +8 ms
+;    +1536 the previous boot's header, +1600 its 64 entries (to +2623)
+;
+;  THE BOOT WATCHDOG IS AN INSTRUMENT AND NOT A WAY TO GET A BOOT. It is
+;  armed for the configuration half only and petted by every marker, so it
+;  fires only when no marker has been written for 15 seconds - a boot that
+;  has stopped - and the reset it causes is what keeps this page (DRAM
+;  survives a reset and not a power cut). The boot after it reports what
+;  the stopped boot reached. Every wait on that path is bounded well under
+;  15 s and marks as it goes; a boot that is merely slow is not reset.
+; ----------------------------------------------------------------------
+#MON_TRAIL_MAGIC     = $414E56545241494C   ; "ANVTRAIL", positive
+#MON_TRAIL_OFF_MAGIC = 256
+#MON_TRAIL_OFF_COUNT = 264
+#MON_TRAIL_OFF_BOOT  = 272
+#MON_TRAIL_OFF_ON    = 280
+#MON_TRAIL_OFF_DOG   = 288
+#MON_TRAIL_OFF_ENTRY = 320
+#MON_TRAIL_OFF_PREV  = 1536
+#MON_TRAIL_N         = 64
+#MON_TRAIL_SPAN      = 1088   ; +256 .. +1343: 64 header bytes, 64 * 16 entries.
+                              ; The copy at +1536 must not overlap it.
+#MON_TRAIL_DOG_S     = 15
+
+; Clean the cache line holding one address. The page is written with the
+; caches in whatever state the boot has them, so each write is flushed.
+Procedure MonTrailFlushAt(a.i)
+  monphase_flush = (a / 64) * 64
+  MonPhaseFlush()
+EndProcedure
+
+Procedure.i MonTrailValid(base.i)
+  ProcedureReturn Bool(PeekI(#MON_PHASE_LO + base) = #MON_TRAIL_MAGIC)
+EndProcedure
+
+; Copy the trail the previous boot left aside, then start this boot's.
+Procedure MonTrailBegin(boots.i)
+  Define i.i
+  i = 0
+  While i < #MON_TRAIL_SPAN
+    If MonTrailValid(#MON_TRAIL_OFF_MAGIC) <> 0
+      PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_PREV + i, PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_MAGIC + i))
+    Else
+      PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_PREV + i, 0)
+    EndIf
+    i = i + 8
+  Wend
+  ; The copy is complete before the original is touched.
+  i = 0
+  While i < #MON_TRAIL_SPAN
+    MonTrailFlushAt(#MON_PHASE_LO + #MON_TRAIL_OFF_PREV + i)
+    i = i + 64
+  Wend
+  i = 8
+  While i < #MON_TRAIL_SPAN
+    PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_MAGIC + i, 0)
+    i = i + 8
+  Wend
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_BOOT, boots)
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_ON, 1)
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_MAGIC, #MON_TRAIL_MAGIC)
+  i = 0
+  While i < #MON_TRAIL_SPAN
+    MonTrailFlushAt(#MON_PHASE_LO + #MON_TRAIL_OFF_MAGIC + i)
+    i = i + 64
+  Wend
+EndProcedure
+
+Procedure MonTrailAppend(p.i)
+  Define n.i
+  Define e.i
+  If PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_ON) <> 1
+    ProcedureReturn
+  EndIf
+  If MonTrailValid(#MON_TRAIL_OFF_MAGIC) = 0
+    ProcedureReturn
+  EndIf
+  n = PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_COUNT)
+  e = #MON_PHASE_LO + #MON_TRAIL_OFF_ENTRY + ((n % #MON_TRAIL_N) * 16)
+  PokeI(e, p & $FFFFFFFF)
+  PokeI(e + 8, Ticks() / (TickHz() / 1000))
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_COUNT, n + 1)
+  MonTrailFlushAt(e)
+  MonTrailFlushAt(e + 8)
+  MonTrailFlushAt(#MON_PHASE_LO + #MON_TRAIL_OFF_COUNT)
+  If PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_DOG) = 1
+    SafetyWatchdogPet()
+  EndIf
+EndProcedure
+
+; The configuration half is done: stop recording and disarm the watchdog.
+Procedure MonTrailEnd()
+  If PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_DOG) = 1
+    SafetyWatchdogStop()
+  EndIf
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_DOG, 0)
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_ON, 0)
+  MonTrailFlushAt(#MON_PHASE_LO + #MON_TRAIL_OFF_ON)
+EndProcedure
+
+Procedure MonTrailDogArm()
+  ; NEVER TWO WATCHDOG RESETS IN A ROW. If the previous boot stopped, this
+  ; boot runs without the instrument's watchdog, so a step that is merely
+  ; slower than 15 s without a marker costs one extra reset and can never
+  ; become a board that resets for ever.
+  If MonTrailValid(#MON_TRAIL_OFF_PREV) <> 0 And MonTrailPrevFinished() = 0
+    ProcedureReturn
+  EndIf
+  PokeI(#MON_PHASE_LO + #MON_TRAIL_OFF_DOG, 1)
+  MonTrailFlushAt(#MON_PHASE_LO + #MON_TRAIL_OFF_DOG)
+  SafetyWatchdogStart(#MON_TRAIL_DOG_S)
+EndProcedure
+
+Procedure.i MonTrailRecording()
+  ProcedureReturn Bool(PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_ON) = 1)
+EndProcedure
+
+; One entry of either trail: which 0 = this boot, 1 = the previous one.
+; Entries are counted from the OLDEST still held. -1 when there is none.
+Procedure.i MonTrailCount(which.i)
+  Define base.i
+  base = #MON_TRAIL_OFF_MAGIC
+  If which <> 0 : base = #MON_TRAIL_OFF_PREV : EndIf
+  If MonTrailValid(base) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekI(#MON_PHASE_LO + base + 8)
+EndProcedure
+
+Procedure.i MonTrailAt(which.i, k.i, ms.i)
+  Define base.i
+  Define n.i
+  Define first.i
+  Define held.i
+  base = #MON_TRAIL_OFF_MAGIC
+  If which <> 0 : base = #MON_TRAIL_OFF_PREV : EndIf
+  n = MonTrailCount(which)
+  held = n
+  If held > #MON_TRAIL_N : held = #MON_TRAIL_N : EndIf
+  If k < 0 Or k >= held
+    ProcedureReturn -1
+  EndIf
+  first = n - held
+  If ms <> 0
+    ProcedureReturn PeekI(#MON_PHASE_LO + base + 64 + (((first + k) % #MON_TRAIL_N) * 16) + 8)
+  EndIf
+  ProcedureReturn PeekI(#MON_PHASE_LO + base + 64 + (((first + k) % #MON_TRAIL_N) * 16)) & $FFFFFFFF
+EndProcedure
+
+Procedure.i MonTrailPrevBoot()
+  If MonTrailValid(#MON_TRAIL_OFF_PREV) = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_PREV + 16)
+EndProcedure
+
+Procedure.i MonTrailPrevFinished()
+  ProcedureReturn Bool(PeekI(#MON_PHASE_LO + #MON_TRAIL_OFF_PREV + 24) = 0 And MonTrailValid(#MON_TRAIL_OFF_PREV) <> 0)
+EndProcedure
+
+Procedure MonPhaseBegin()
+  Define boots.i
+  Define prev.i
+  prev = -1
+  boots = 0
+  If PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_MAGIC) = #MON_PHASE_MAGIC
+    prev = PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW)
+    boots = PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_BOOTS)
+  EndIf
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_MAGIC, #MON_PHASE_MAGIC)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW,   0)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_PREV,  prev)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_BOOTS, boots + 1)
+  monphase_flush = #MON_PHASE_LO
+  MonPhaseFlush()
+  MonTrailBegin(boots + 1)
+  a64_barrier()
+EndProcedure
+
+Procedure MonPhaseMark(p.i)
+  PokeI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW, p)
+  monphase_flush = #MON_PHASE_LO
+  MonPhaseFlush()
+  MonTrailAppend(p)
+  ; Complete the clean before the instrumented device access can stall.
+  ASM
+    dsb sy
+  EndASM
+EndProcedure
+
+; What this boot has reached, what the one before it reached, and whether
+; the record is a record at all.
+Procedure.i MonPhaseNow()   : ProcedureReturn PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_NOW)   : EndProcedure
+Procedure.i MonPhasePrev()  : ProcedureReturn PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_PREV)  : EndProcedure
+Procedure.i MonPhaseBoots() : ProcedureReturn PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_BOOTS) : EndProcedure
+Procedure.i MonPhaseValid()
+  ProcedureReturn Bool(PeekI(#MON_PHASE_LO + #MON_PHASE_OFF_MAGIC) = #MON_PHASE_MAGIC)
+EndProcedure
+
+; HOW BIG THIS MONITOR IS, in bytes, measured rather than recorded. It is
+; exactly the size of the file the firmware copied: the `map` command
+; prints it, and tools/a64/a64_anvil_check.py compares it against the
+; length of the .img on disk, so the image and the number it reports
+; about itself cannot drift.
+Procedure.i HwMonBytes()
+  ProcedureReturn MonImageEnd() - MonImageLo()
+EndProcedure
+
+; Round UP to the next multiple of #MON_GRAIN. Written with a divide
+; rather than a mask because every address it is ever handed is a
+; positive .i well inside 63 bits, and the divide says what it means.
+Procedure.i MonGrainUp(a.i)
+  ProcedureReturn ((a + #MON_GRAIN - 1) / #MON_GRAIN) * #MON_GRAIN
+EndProcedure
+
+
+; ======================================================================
+;  HwMonLo() / HwMonHi() - WHERE THIS MONITOR'S CODE ACTUALLY IS.
+;
+;  THEY ARE NOT CONSTANTS ANY MORE, and the difference is not cosmetic.
+;  The old pair answered "$00200000..$003FFFFF" whatever image was
+;  running, which meant two wrong answers at once whenever the running
+;  image was not the canonical one:
+;
+;    a monitor built --load-addr 0x2000000 for a live-bench swap - the
+;    documented way to try a new monitor without a reset - refused loads
+;    into $200000..$3FFFFF, where nothing of it lived, and DID NOT refuse
+;    a load on top of itself. board.pi4 recorded that as a known defect
+;    and said the fix "would need the running base at run time, and this
+;    file does not know it". It does now.
+;
+;    an image larger than two megabytes had part of itself outside the
+;    region the monitor was protecting.
+;
+;  Both are the same defect: a region that describes an intention instead
+;  of the program. These two now describe the program.
+;
+;  THE REGION IS ROUNDED UP TO #MON_GRAIN. HwMonHi() is the last byte of
+;  the megabyte the image ends in, not the last byte of the image. See
+;  THE GRAIN IS ONE MEGABYTE at the top: the rounding is what keeps a
+;  payload address stable across builds, and the slack it reserves is
+;  memory nothing else was offered anyway.
+; ======================================================================
+Procedure.i HwMonLo()
+  ProcedureReturn MonImageLo()
+EndProcedure
+
+Procedure.i HwMonHi()
+  ProcedureReturn MonGrainUp(MonImageEnd()) - 1
+EndProcedure
+
+; The top of the monitor's own stack, for the paragraphs in `help` and
+; the banner that describe what the monitor occupies. It is asked for
+; rather than read as a constant for the same reason the pair above is:
+; the core prints one sentence and every board fills it in.
+Procedure.i HwMonStack()
+  ProcedureReturn #MON_STACK
+EndProcedure
+
+
+; ======================================================================
+;  HwMonRegion*() - EVERY REGION THIS MONITOR OWNS, ENUMERATED
+; ----------------------------------------------------------------------
+;  Anvil/Core/memrange.pbi's HitsMonitor() used to test two hard-written
+;  ranges: the image window and the data window. Two was already one more
+;  than it started with - the data window was added on 2026-08-28 when
+;  BSS left the image - and 2026-09-08 needs a third, because the autoboot
+;  record left the image window too. A core procedure that grows an `If`
+;  every time a board gains a region is the wrong shape: the core cannot
+;  know what a board reserves, and the Arduino UNO Q's regions are not
+;  these.
+;
+;  So the board enumerates and the core walks. HitsMonitor() is a loop
+;  over HwMonRegions() and it does not change again when another region
+;  appears; it is written once here, per board, beside the constants it
+;  describes.
+;
+;  THE ORDER IS DELIBERATE. Region 0 is the code, because it is the one
+;  an operator hits by aiming a payload at the load address and it is the
+;  one whose extent moved.
+; ======================================================================
+Procedure.i HwMonRegions()
+  ProcedureReturn 9
+EndProcedure
+
+Procedure.i HwMonRegionLo(i.i)
+  Select i
+    Case 0 : ProcedureReturn HwMonLo()
+    Case 1 : ProcedureReturn #MON_DATA_LO
+    Case 2 : ProcedureReturn #AB_BASE
+    Case 3 : ProcedureReturn #MON_FB_LO
+    Case 4 : ProcedureReturn #CORE_RAW_STACK_LO
+    Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_LO
+    Case #MON_REGION_PHASE : ProcedureReturn #MON_PHASE_LO
+    Case #MON_REGION_SHOT : ProcedureReturn #MON_SHOT_LO
+    Case #MON_REGION_VK_HEAP : ProcedureReturn #MON_VK_HEAP_LO
+  EndSelect
+  ; A region index this board does not have. Answering an address here
+  ; would make HitsMonitor() refuse a range for a region that does not
+  ; exist; an empty range (lo above hi) matches nothing and is the only
+  ; answer that cannot invent a refusal.
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwMonRegionHi(i.i)
+  Select i
+    Case 0 : ProcedureReturn HwMonHi()
+    Case 1 : ProcedureReturn #MON_DATA_HI
+    Case 2 : ProcedureReturn #AB_BASE + #AB_BYTES - 1
+    Case 3 : ProcedureReturn #MON_FB_HI
+    Case 4 : ProcedureReturn #CORE_RAW_STACK_HI
+    Case #MON_REGION_MODULES : ProcedureReturn #MOD_REGION_HI
+    Case #MON_REGION_PHASE : ProcedureReturn #MON_PHASE_LO + #MON_PHASE_BYTES - 1
+    Case #MON_REGION_SHOT : ProcedureReturn #MON_SHOT_HI
+    Case #MON_REGION_VK_HEAP : ProcedureReturn #MON_VK_HEAP_HI
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; A short phrase naming the region, printed by `map` beside its addresses.
+; A printing procedure rather than a returned string for the same reason
+; HwIdSayConsole() and I2cSayPins() are: the board owns the prose about
+; its own hardware and the core owns the layout of the line.
+Procedure HwMonRegionSay(i.i)
+  Select i
+    Case 0
+      Print("this monitor's code, measured from the image")
+    Case 1
+      Print("its variables, placed by --bss-addr")
+    Case 2
+      Print("the autoboot record")
+    Case 3
+      Print("the DSI framebuffer")
+    Case 4
+      Print("the reserved raw-secondary stacks")
+    Case #MON_REGION_MODULES
+      Print("the driver-module arena and its staging window")
+    Case #MON_REGION_PHASE
+      Print("the boot phase record")
+    Case #MON_REGION_SHOT
+      Print("the screenshot capture area")
+    Case #MON_REGION_VK_HEAP
+      Print("the reserved Vulkan device-memory heap")
+    Default
+      Print("a region this board does not have")
+  EndSelect
+EndProcedure
+
+
+; ======================================================================
+;  HwPay*() - THE PAYLOAD WINDOWS, AND THE LOW ONE FOLLOWS THE IMAGE
+; ----------------------------------------------------------------------
+;  THE LOW WINDOW'S BOTTOM EDGE IS COMPUTED FROM THE CANONICAL PLACEMENT -
+;  #MON_LO plus the size of this image, rounded up to #MON_GRAIN - and NOT
+;  from where this copy happens to be running. That distinction is worth
+;  the paragraph:
+;
+;    what the WINDOW says is "here is a band of DRAM a payload may live
+;    in", and the band is bounded below by the monitor that will be
+;    resident after the next reset, which is the one at #MON_LO.
+;
+;    what HitsMonitor() says is "that particular range would land on the
+;    program that is running right now", and THAT question is answered
+;    from HwMonLo()/HwMonHi(), which follow the running image.
+;
+;  A monitor relocated to $2000000 for a live-bench swap therefore still
+;  advertises the same window a payload was built for, still accepts
+;  `b 400000`, and now also refuses a load on top of itself - which the
+;  old constants got backwards in both halves.
+;
+;  THE SIZE IS THE ONLY INPUT. There is no ceiling anywhere in this
+;  arithmetic: an image of any size produces a window that starts above
+;  it. That is the ruling of 2026-09-08 written as code.
+; ======================================================================
+Procedure.i HwPayWindows()
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i HwPayLo(i.i)
+  Select i
+    Case 0 : ProcedureReturn MonGrainUp(#MON_LO + HwMonBytes())
+    Case 1 : ProcedureReturn #PAY1_LO
+  EndSelect
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPayHi(i.i)
+  Select i
+    Case 0 : ProcedureReturn #PAY0_HI
+    Case 1 : ProcedureReturn #PAY1_HI
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwStageAddr() - WHERE A HOST SHOULD PUT A FILE IT IS SENDING
+;
+;  Every upload tool used to carry 0x400000 as a constant of its own:
+;  tools/pi4_upload.py's DEFAULT_ADDR, and STAGE in anvil_update.py,
+;  anvil_wifi_update.py and anvil_putfile.py. Four copies of a number
+;  this file owns, on the far side of a serial cable, none of which could
+;  learn that the monitor had grown. The tools ask for this instead - the
+;  same shape as U-Boot's $loadaddr, which a script reads with printenv
+;  rather than assuming.
+;
+;  It is the bottom of the low payload window and nothing more: the first
+;  address that is clear of the monitor by construction, in the window
+;  every refusal already prints.
+; ----------------------------------------------------------------------
+Procedure.i HwStageAddr()
+  ProcedureReturn HwPayLo(0)
+EndProcedure

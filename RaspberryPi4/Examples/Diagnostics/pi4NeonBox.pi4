@@ -1,0 +1,803 @@
+; pi4NeonBox.pi4 - Neon_Box ON THE HDMI SCREEN, THROUGH V3D, WITH THE
+; ALPHA BLEND IN THE TILE BUFFER. Counted pixels, not a photograph.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS IS FOR
+; ======================================================================
+;  pi4V3dTri.pi4 rasterised a triangle into a 64 x 64 buffer in DRAM -
+;  ONE TILE, and memory nothing scans out. Four things stand between
+;  that and the NeonArcade engine drawing on a monitor, and this
+;  program is the first run that has all four in it at once:
+;
+;    1. MULTI-TILE. 1920 x 1080 is 30 x 17 = 510 tiles. Every piece of
+;       tile arithmetic in v3d.pi4 - the supertile sizing, the
+;       supertile sweep, the tile allocation pool, the tile state
+;       buffer, the partial tiles at the right and bottom edges -
+;       collapses to the identity at 64 x 64 and NOTHING HAS EVER
+;       EXERCISED IT.
+;
+;    2. A V3D PAGE TABLE THAT REACHES THE FRAMEBUFFER. Every address
+;       the CLE, the PTB and the TLB touch is virtual
+;       (v3d_submit.c:1054-1055) and the firmware puts the surface at
+;       $3E2CB000 on this board, so the table is about a megabyte
+;       rather than the sixteen kilobytes every probe so far has used.
+;
+;    3. MORE THAN ONE DRAW CALL IN A LIST. The triangle was one.
+;
+;    4. THE BLEND. This is the one that justifies the whole exercise:
+;       the A72 needs 2172.0 ms for a full-surface alpha blend against
+;       a 25 ms budget (pi4NeonLiar.pi4:256-262).
+;
+; ======================================================================
+;  THE PASS CRITERION IS COUNTED PIXELS. ALL 2,073,600 OF THEM.
+; ======================================================================
+;  The surface is poisoned from the CPU, the GPU draws, and then EVERY
+;  PIXEL is read back and compared against the value this program
+;  computed for that pixel on the CPU. Pixels are grouped BY TILE as
+;  well as by region, so the answer is not only "how many were right"
+;  but "how many of the 510 tiles were completely right, and which was
+;  the first that was not" - which is what makes this a multi-tile
+;  test rather than a big single-tile test.
+;
+;  THE COLOURS ARE MULTI-BYTE ON PURPOSE, all four bytes distinct in
+;  every one of them, so a channel swap, a byte-order fault or a
+;  16-bit store cannot pass unnoticed:
+;
+;    clear      R $10  G $20  B $30  A $FF
+;    box A      R $40  G $80  B $C0  A $FF      opaque
+;    box B      R $E0  G $50  B $90  A $80      half transparent
+;    box C      R $22  G $CC  B $66  A $FF      opaque, scissored
+;
+;  AND THE PROGRAM PRINTS THE RAW WORD IT FOUND at a pixel in the
+;  middle of box A before it judges anything. If the channel order is
+;  the other way round, that one line says so directly rather than
+;  leaving 2 million failures to be interpreted.
+;
+;  BOX B OVERLAPS BOX A AND THE CLEAR, which is the whole point: the
+;  same source colour blended against two different destinations gives
+;  two different answers, and both are computed here in integer
+;  arithmetic and checked. A blend that was silently a copy would
+;  match neither.
+;
+;  BOX C IS DRAWN 400 x 400 THROUGH A 200 x 150 SCISSOR. The pixels
+;  outside the scissor and inside the box are the test: they must
+;  still hold the clear colour. A scissor that did nothing would paint
+;  120,000 pixels that are counted as wrong.
+;
+;  THE GUARD PAGE is DRAM this program owns and DELIBERATELY DOES NOT
+;  MAP through the V3D MMU. A word in it that changed means an engine
+;  wrote through an address this program never authorised.
+;
+; ======================================================================
+;  RUNNING IT
+; ======================================================================
+;  PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonBox.pi4 -t pi4 \
+;      --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;      -o neonbox.img
+;  then load neonbox.img on the board and read its serial output.
+;
+;  THE MONITOR IS THE SECOND WITNESS. The screen goes grey with the
+;  poison, then the clear colour with three rectangles on it. Neither
+;  step is evidence - the counts are - but a run that leaves grey on
+;  the screen has told the room the CPU wrote and the GPU did not.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+; NO DMA ENGINE IN THIS BUILD, and that is deliberate. The one thing
+; this program has to be able to say is WHICH ENGINE WROTE THE PIXELS,
+; so the only writers here are the A72 and the V3D.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP.
+;
+;  The payload's low window ends at $07EFFFFF and begins above the
+;  monitor - `map` prints the base, and the image is wherever the board
+;  said to stage it. The stack grows down from $03000000. THE MONITOR'S
+;  VARIABLES ARE AT $0D000000..$0DFFFFFF AND THE GENET RX RING IS AT
+;  $08100000 - neither is in this window and neither may be touched.
+;  The arena sits at $04000000, well above the stack and well below
+;  both.
+; ----------------------------------------------------------------------
+#NB_ARENA       = $04000000
+#NB_ARENA_BYTES = $01000000        ; 16 MB
+
+#NB_POISON = $A5A5A5A5
+
+; The four colours, as logical RGBA. Every byte distinct within each.
+#NB_CLEAR_R = $10
+#NB_CLEAR_G = $20
+#NB_CLEAR_B = $30
+#NB_A_R = $40
+#NB_A_G = $80
+#NB_A_B = $C0
+#NB_B_R = $E0
+#NB_B_G = $50
+#NB_B_B = $90
+#NB_B_A = $80
+#NB_C_R = $22
+#NB_C_G = $CC
+#NB_C_B = $66
+
+; The geometry.
+#NB_AX = 200
+#NB_AY = 150
+#NB_AW = 400
+#NB_AH = 300
+
+#NB_BX = 400
+#NB_BY = 250
+#NB_BW = 400
+#NB_BH = 300
+
+#NB_CX = 900
+#NB_CY = 500
+#NB_CW = 400
+#NB_CH = 400
+#NB_SX = 1000
+#NB_SY = 600
+#NB_SW = 200
+#NB_SH = 150
+
+; ======================================================================
+;  OUTPUT
+; ======================================================================
+Procedure PutC(c.i)
+  UartWrite(c)
+EndProcedure
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)                              ; 36 is the dollar sign
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define n.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  n = 0
+  i = 0
+  While PeekA(*name + i) <> 0
+    n = n + 1
+    i = i + 1
+  Wend
+  While n < width
+    UartWrite(32)
+    n = n + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutPad(*name, 30)
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutPad(*name, 30)
+  PrintDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  If e = 0
+    PutS("OK")
+  Else
+    PutS("error ")
+    PrintDec(e)
+  EndIf
+EndProcedure
+
+Procedure PutMs(us.i)
+  Define w.i
+  Define f.i
+  w = us / 1000
+  f = us - (w * 1000)
+  PrintDec(w)
+  UartWrite(46)                              ; 46 is the full stop
+  UartWrite(48 + (f / 100))
+  UartWrite(48 + ((f / 10) - ((f / 100) * 10)))
+  UartWrite(48 + (f - ((f / 10) * 10)))
+  UartWriteStr(" ms")
+EndProcedure
+
+; ======================================================================
+;  THE EXPECTATION, COMPUTED ON THE CPU
+;
+;  dst = src * a + dst * (1 - a), non-premultiplied, on every channel
+;  INCLUDING alpha - which is what GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
+;  through glBlendFunc means, and what Mesa lowers it to on both the
+;  colour and the alpha equation (v3dx_emit.c:104-121).
+;
+;  In 0..255 integer arithmetic with round to nearest:
+;
+;      out = (src * a + dst * (255 - a) + 127) / 255
+;
+;  THE HARDWARE'S OWN ROUNDING IS NOT WRITTEN DOWN ANYWHERE ON THIS
+;  DISK, so the test counts THREE outcomes and not two: exactly equal,
+;  within one on every channel, and wrong. A pass on "within one" with
+;  zero exact would be a real finding about the rounding and would be
+;  reported as one rather than hidden by a tolerance.
+; ======================================================================
+Procedure.i BlendCh(src.i, dst.i, a.i)
+  ProcedureReturn ((src * a) + (dst * (255 - a)) + 127) / 255
+EndProcedure
+
+Global expClear.i
+Global expA.i
+Global expBoverClear.i
+Global expBoverA.i
+Global expC.i
+
+Procedure BuildExpectations()
+  Define r.i
+  Define g.i
+  Define b.i
+  Define a.i
+
+  ; The surface word. pi4V3dFbClear.pi4 records that DisplayRGB(12,20,92)
+  ; is $FF0C145C on this board, so the packed word is (A<<24)|(R<<16)|
+  ; (G<<8)|B and byte 0 of memory is BLUE. That is display.pi4's BGR
+  ; default order (dsp_order = #MBX_FB_ORDER_BGR).
+  expClear = Neon_RGBA(#NB_CLEAR_R, #NB_CLEAR_G, #NB_CLEAR_B, 255)
+  expA     = Neon_RGBA(#NB_A_R, #NB_A_G, #NB_A_B, 255)
+  expC     = Neon_RGBA(#NB_C_R, #NB_C_G, #NB_C_B, 255)
+
+  a = #NB_B_A
+  r = BlendCh(#NB_B_R, #NB_CLEAR_R, a)
+  g = BlendCh(#NB_B_G, #NB_CLEAR_G, a)
+  b = BlendCh(#NB_B_B, #NB_CLEAR_B, a)
+  expBoverClear = Neon_RGBA(r, g, b, BlendCh(a, 255, a))
+
+  r = BlendCh(#NB_B_R, #NB_A_R, a)
+  g = BlendCh(#NB_B_G, #NB_A_G, a)
+  b = BlendCh(#NB_B_B, #NB_A_B, a)
+  expBoverA = Neon_RGBA(r, g, b, BlendCh(a, 255, a))
+EndProcedure
+
+; What SHOULD pixel (x,y) hold? The regions are checked in painting
+; order, last painted first.
+Procedure.i Expected(x.i, y.i)
+  ; Box C, but only where the scissor let it through.
+  If x >= #NB_SX And x < (#NB_SX + #NB_SW)
+    If y >= #NB_SY And y < (#NB_SY + #NB_SH)
+      If x >= #NB_CX And x < (#NB_CX + #NB_CW)
+        If y >= #NB_CY And y < (#NB_CY + #NB_CH)
+          ProcedureReturn expC
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  ; Box B, over box A or over the clear.
+  If x >= #NB_BX And x < (#NB_BX + #NB_BW)
+    If y >= #NB_BY And y < (#NB_BY + #NB_BH)
+      If x >= #NB_AX And x < (#NB_AX + #NB_AW)
+        If y >= #NB_AY And y < (#NB_AY + #NB_AH)
+          ProcedureReturn expBoverA
+        EndIf
+      EndIf
+      ProcedureReturn expBoverClear
+    EndIf
+  EndIf
+  ; Box A.
+  If x >= #NB_AX And x < (#NB_AX + #NB_AW)
+    If y >= #NB_AY And y < (#NB_AY + #NB_AH)
+      ProcedureReturn expA
+    EndIf
+  EndIf
+  ProcedureReturn expClear
+EndProcedure
+
+Procedure.i Near1(a.i, b.i)
+  Define i.i
+  Define d.i
+  Define sa.i
+  Define sb.i
+  For i = 0 To 3
+    sa = (a >> (i * 8)) & $FF
+    sb = (b >> (i * 8)) & $FF
+    d = sa - sb
+    If d < 0
+      d = 0 - d
+    EndIf
+    If d > 1
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  VERIFICATION
+; ======================================================================
+Global nExact.i = 0
+Global nNear.i  = 0
+Global nWrong.i = 0
+Global nPoison.i = 0
+Global firstBadX.i = -1
+Global firstBadY.i = -1
+Global firstBadGot.i = 0
+Global firstBadWant.i = 0
+Global tilesTotal.i = 0
+Global tilesClean.i = 0
+Global firstBadTile.i = -1
+Global guardTouched.i = 0
+Global usPoison.i = 0
+Global usVerify.i = 0
+Global usFrame.i = 0
+
+; ----------------------------------------------------------------------
+;  NextBoundary - the next x at which Expected() could change value,
+;  for any row.
+;
+;  THE INNER LOOP HAS TO BE CHEAP AND THIS IS WHY THIS EXISTS. With the
+;  ARM MMU off every access - INCLUDING EVERY INSTRUCTION FETCH - is
+;  Device memory, and pi4NeonLiar.pi4 measured a bare read loop at
+;  998 ns a pixel on this board. Calling Expected() per pixel would put
+;  two million procedure calls inside that and take the run past the
+;  15 s deadman. So Expected() is called ONCE PER SEGMENT and the
+;  segment runs to the next rectangle edge.
+; ----------------------------------------------------------------------
+Procedure.i Edge(px.i, e.i, best.i)
+  If e > px
+    If e < best
+      ProcedureReturn e
+    EndIf
+  EndIf
+  ProcedureReturn best
+EndProcedure
+
+Procedure.i NextBoundary(px.i, limit.i)
+  Define b.i
+  b = limit
+  b = Edge(px, #NB_AX, b)
+  b = Edge(px, #NB_AX + #NB_AW, b)
+  b = Edge(px, #NB_BX, b)
+  b = Edge(px, #NB_BX + #NB_BW, b)
+  b = Edge(px, #NB_CX, b)
+  b = Edge(px, #NB_CX + #NB_CW, b)
+  b = Edge(px, #NB_SX, b)
+  b = Edge(px, #NB_SX + #NB_SW, b)
+  ProcedureReturn b
+EndProcedure
+
+Procedure Verify(tw.i, th.i, tx.i, ty.i)
+  Define px.i
+  Define py.i
+  Define v.i
+  Define want.i
+  Define row.i
+  Define bad.i
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+  Define tileX.i
+  Define tileY.i
+  Define segEnd.i
+  Define a.i
+
+  tilesTotal = tx * ty
+  tileY = 0
+  While tileY < ty
+    tileX = 0
+    While tileX < tx
+      x0 = tileX * tw
+      y0 = tileY * th
+      x1 = x0 + tw
+      y1 = y0 + th
+      If x1 > Neon_SurfaceW()
+        x1 = Neon_SurfaceW()
+      EndIf
+      If y1 > Neon_SurfaceH()
+        y1 = Neon_SurfaceH()
+      EndIf
+      bad = 0
+      py = y0
+      While py < y1
+        row = Neon_SurfaceBase() + (py * Neon_SurfacePitch())
+        px = x0
+        While px < x1
+          want = Expected(px, py)
+          segEnd = NextBoundary(px, x1)
+          a = row + (px * 4)
+          While px < segEnd
+            v = PeekN(a)
+            If v = want
+              nExact = nExact + 1
+            Else
+              bad = bad + 1
+              If Near1(v, want) <> 0
+                nNear = nNear + 1
+              ElseIf v = #NB_POISON
+                nPoison = nPoison + 1
+              Else
+                nWrong = nWrong + 1
+              EndIf
+              If firstBadX < 0
+                firstBadX = px
+                firstBadY = py
+                firstBadGot = v
+                firstBadWant = want
+              EndIf
+            EndIf
+            a = a + 4
+            px = px + 1
+          Wend
+        Wend
+        py = py + 1
+      Wend
+      If bad = 0
+        tilesClean = tilesClean + 1
+      ElseIf firstBadTile < 0
+        firstBadTile = (tileY * tx) + tileX
+      EndIf
+      tileX = tileX + 1
+    Wend
+    tileY = tileY + 1
+  Wend
+EndProcedure
+
+Procedure VerifyGuard()
+  Define i.i
+  Define n.i
+  i = 0
+  n = 4096 / 4
+  While i < n
+    If PeekN(Neon_GuardAddr() + (i * 4)) <> #NB_POISON
+      guardTouched = guardTouched + 1
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+Procedure.i Body()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define t0.i
+  Define probe.i
+
+  PutNl()
+  PutS("=== pi4NeonBox - Neon_Box on the HDMI surface, through V3D ===")
+  PutNl()
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running - times read 0")
+    PutNl()
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  1. THE SURFACE
+  ; ------------------------------------------------------------------
+  PutS("1   the HDMI surface")
+  PutNl()
+  If MailboxInit() = 0
+    PutS("    mailbox REFUSED")
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("    display tags REFUSED")
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = DisplayInit(1920, 1080, 32)
+  If r <> 1
+    PutS("    DisplayInit rc ")
+    PrintDec(r)
+    PutS("  MailboxError ")
+    PrintDec(MailboxError())
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("width", DisplayWidth())
+  RowDec("height", DisplayHeight())
+  RowDec("pitch, bytes", DisplayPitch())
+  RowHex("base, ARM physical", DisplayBase())
+  RowDec("allocation, bytes", DisplaySize())
+  If DisplayBytesPerPixel() <> 4
+    PutS("verdict: NOT 32BPP")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  2. THE ENGINE
+  ; ------------------------------------------------------------------
+  PutS("2   the engine")
+  PutNl()
+  r = NeonArena(#NB_ARENA, #NB_ARENA_BYTES)
+  If r <> #NEON_OK
+    PutS("    NeonArena: ")
+    PutErr(r)
+    PutNl()
+    PutS("verdict: ARENA")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  If r <> #NEON_OK
+    PutS("    NeonSurface: ")
+    PutErr(r)
+    PutNl()
+    PutS("verdict: SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonInit()
+  PutS("    NeonInit: ")
+  PutErr(r)
+  PutNl()
+  RowHex("HUB_IDENT1", V3dIdent1())
+  RowDec("page table bytes", Neon_PtBytes())
+  RowDec("arena bytes needed", Neon_ArenaNeed())
+  RowHex("arena top", Neon_ArenaTop())
+  RowHex("guard page", Neon_GuardAddr())
+  RowDec("tile width", V3dTileW())
+  RowDec("tile height", V3dTileH())
+  RowDec("tiles across", V3dTilesX())
+  RowDec("tiles down", V3dTilesY())
+  RowDec("tiles total", V3dTilesX() * V3dTilesY())
+  RowDec("supertile width, tiles", V3dSupertileW())
+  RowDec("supertile height, tiles", V3dSupertileH())
+  RowDec("frame width, supertiles", V3dFrameStW())
+  RowDec("frame height, supertiles", V3dFrameStH())
+  RowDec("tile alloc needed", V3dTileAllocNeeded())
+  RowDec("tile state needed", V3dTileStateNeeded())
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: NEONINIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If (V3dTilesX() * V3dTilesY()) < 2
+    PutS("    one tile only - this probe has nothing to prove here")
+    PutNl()
+    PutS("verdict: NOT MULTI-TILE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  NeonPalette()
+  NeonFontDefaults()
+  BuildExpectations()
+  RowHex("expected clear", expClear)
+  RowHex("expected box A", expA)
+  RowHex("expected B over clear", expBoverClear)
+  RowHex("expected B over A", expBoverA)
+  RowHex("expected box C", expC)
+  RowDec("channel swap in shader", Neon_RbSwapGet())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  3. POISON. The whole surface and the guard page.
+  ;
+  ;     THE SCREEN GOES GREY HERE. $A5A5A5A5 is a flat mid-grey, so a
+  ;     human watching the monitor sees the console vanish under grey
+  ;     and then the grey replaced by the picture. Neither step is
+  ;     evidence - the counts are - but a run that leaves grey on the
+  ;     screen has said the CPU wrote and the GPU did not.
+  ; ------------------------------------------------------------------
+  PutS("3   poisoning the surface")
+  PutNl()
+  UartDrain()
+  t0 = Micros()
+  n = Neon_SurfaceH()
+  i = 0
+  While i < n
+    DspRowFill32(Neon_SurfaceBase() + (i * Neon_SurfacePitch()), Neon_SurfaceW(), #NB_POISON)
+    i = i + 1
+  Wend
+  usPoison = Micros() - t0
+  i = 0
+  While i < 1024
+    PokeN(Neon_GuardAddr() + (i * 4), #NB_POISON)
+    i = i + 1
+  Wend
+  PutPad("poison time", 30)
+  PutMs(usPoison)
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4. THE FRAME. Three boxes and a scissor.
+  ; ------------------------------------------------------------------
+  PutS("4   the frame")
+  PutNl()
+  UartDrain()
+  t0 = Micros()
+
+  r = NeonFrameBegin(expClear)
+  If r <> #NEON_OK
+    PutS("    NeonFrameBegin: ")
+    PutErr(r)
+    PutNl()
+    RowDec("V3dError", V3dError())
+    PutS("verdict: FRAMEBEGIN")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  Neon_Box(#NB_AX, #NB_AY, #NB_AW, #NB_AH, Neon_RGBA(#NB_A_R, #NB_A_G, #NB_A_B, 255))
+  Neon_Box(#NB_BX, #NB_BY, #NB_BW, #NB_BH, Neon_RGBA(#NB_B_R, #NB_B_G, #NB_B_B, #NB_B_A))
+
+  Neon_ScissorSet(#NB_SX, #NB_SY, #NB_SW, #NB_SH)
+  Neon_Box(#NB_CX, #NB_CY, #NB_CW, #NB_CH, Neon_RGBA(#NB_C_R, #NB_C_G, #NB_C_B, 255))
+  Neon_ScissorClear()
+
+  RowDec("draw calls", Neon_Draws())
+  RowDec("boxes", Neon_Boxes())
+  RowDec("vertices", Neon_Verts())
+  RowDec("bin list bytes", V3dClLen())
+  UartDrain()
+
+  r = NeonFrameEnd()
+  usFrame = Micros() - t0
+  PutS("    NeonFrameEnd: ")
+  PutErr(r)
+  PutNl()
+  PutPad("frame time, CPU + GPU", 30)
+  PutMs(usFrame)
+  PutNl()
+  RowHex("CLE_BFC before", V3dBinBfcBefore())
+  RowHex("CLE_BFC after", V3dBinBfcAfter())
+  RowHex("CLE_CT0CA", V3dBinCt0ca())
+  RowHex("CLE_CT0EA", V3dBinCt0ea())
+  RowHex("CLE_RFC before", V3dRenderRfcBefore())
+  RowHex("CLE_RFC after", V3dRenderRfcAfter())
+  RowHex("CLE_CT1CA", V3dRenderCt1ca())
+  RowHex("CLE_CT1EA", V3dRenderCt1ea())
+  RowHex("bin ERR_STAT", V3dBinErrStat())
+  RowHex("render ERR_STAT", V3dRenderErrStat())
+  RowHex("bin MMU_CTL", V3dBinMmuCtl())
+  RowHex("bin MMU_VIO_ADDR", V3dBinVioAddr())
+  RowHex("render MMU_CTL", V3dRenderMmuCtl())
+  RowHex("render MMU_VIO_ADDR", V3dRenderVioAddr())
+  RowDec("OOM events", V3dBinOomCount())
+  RowDec("bin spins", V3dBinSpins())
+  RowDec("render spins", V3dRenderSpins())
+  If r <> #NEON_OK
+    RowDec("Neon_Error", Neon_Error())
+    RowDec("V3dError", V3dError())
+    PutS("verdict: FRAMEEND")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  5. THE RAW WORD, BEFORE ANY JUDGEMENT.
+  ;
+  ;     One pixel from the middle of box A, printed as it is. If the
+  ;     channel order came out the other way round this line says so
+  ;     in one number instead of two million failures.
+  ; ------------------------------------------------------------------
+  probe = PeekN(Neon_SurfaceBase() + ((#NB_AY + 10) * Neon_SurfacePitch()) + ((#NB_AX + 10) * 4))
+  PutS("5   the raw word at the middle of box A")
+  PutNl()
+  RowHex("found", probe)
+  RowHex("wanted", expA)
+  probe = PeekN(Neon_SurfaceBase() + (10 * Neon_SurfacePitch()) + (10 * 4))
+  RowHex("clear, found at (10,10)", probe)
+  RowHex("clear, wanted", expClear)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  6. EVERY PIXEL, BY TILE.
+  ; ------------------------------------------------------------------
+  PutS("6   counting 2073600 pixels")
+  PutNl()
+  UartDrain()
+  t0 = Micros()
+  Verify(V3dTileW(), V3dTileH(), V3dTilesX(), V3dTilesY())
+  usVerify = Micros() - t0
+  VerifyGuard()
+
+  RowDec("pixels exactly right", nExact)
+  RowDec("pixels within one", nNear)
+  RowDec("pixels still poison", nPoison)
+  RowDec("pixels some other value", nWrong)
+  RowDec("tiles total", tilesTotal)
+  RowDec("tiles completely right", tilesClean)
+  RowDec("first bad tile", firstBadTile)
+  RowDec("first bad x", firstBadX)
+  RowDec("first bad y", firstBadY)
+  RowHex("first bad, found", firstBadGot)
+  RowHex("first bad, wanted", firstBadWant)
+  RowDec("guard words touched", guardTouched)
+  PutPad("verify time", 30)
+  PutMs(usVerify)
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  7. THE VERDICT
+  ; ------------------------------------------------------------------
+  If nPoison <> 0
+    PutS("verdict: THE GPU DID NOT COVER THE SURFACE - poison left")
+    PutNl()
+    ProcedureReturn nPoison
+  EndIf
+  If guardTouched <> 0
+    PutS("verdict: GUARD TOUCHED")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If nWrong <> 0
+    PutS("verdict: WRONG PIXELS")
+    PutNl()
+    ProcedureReturn nWrong
+  EndIf
+  If nNear <> 0
+    PutS("verdict: OK WITHIN ONE - the blend rounds differently from")
+    PutNl()
+    PutS("         this program, which is a finding and not a failure")
+    PutNl()
+    ProcedureReturn nExact
+  EndIf
+  PutS("verdict: OK - every pixel exact, multi-tile, blended, scissored")
+  PutNl()
+  ProcedureReturn nExact
+EndProcedure
+
+; ======================================================================
+;  THE WRAPPER THAT HANDS THE GPU BACK.
+;
+;  Main() is a wrapper and Body() is the program, for one reason:
+;  Body() has a dozen early returns and EVERY ONE of them has to put
+;  the V3D MMU back before the monitor gets control again. Measured on
+;  the board, 2026-08-28: a payload that left the MMU enabled with its
+;  own page table killed the VideoCore firmware's mailbox service, and
+;  the NEXT payload could not get a surface - MAIL1_STA $80000008,
+;  full of requests nobody was consuming, cleared only by a reset.
+;  See NeonShutdown() in neon.pi4 for the full note.
+;
+;  A cleanup that has to be repeated at a dozen returns is a cleanup
+;  that will be missed at one of them.
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  rc = Body()
+  NeonShutdown()
+  ProcedureReturn rc
+EndProcedure

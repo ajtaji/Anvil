@@ -1,0 +1,271 @@
+; pi4Vl805Bar.pi4 - where is the VL805's register block, and can we reach it?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHY THIS EXISTS: pi4XhciSelfTest CRASHED THE BOARD. Data abort, CPU
+; reset, U-Boot came back. The faulting instruction was a plain 32-bit
+; load through a computed base:
+;
+;     adrp x11, ... / add x11, x11, #0x6a0 / ldr x13, [x11]
+;     add  x11, x12, x13
+;     ldr  w12, [x11]        <- aborted here
+;
+; That is base + offset, and the base can only be the controller's BAR.
+; The XHCI author named this as the most likely first failure and could
+; not test it: "that the loader's page tables map the outbound window as
+; Device memory - NOTHING IN THIS REPO ESTABLISHES THAT".
+;
+; THE ASYMMETRY THAT MAKES IT LIKELY. The PCIe probe worked perfectly an
+; hour ago, but everything it touched was the root-complex block at
+; $FD500000 - inside the ordinary peripheral aperture the firmware
+; certainly maps. The VL805's registers are somewhere else entirely: in
+; the OUTBOUND WINDOW at CPU $6_0000_0000, ABOVE 4 GB. Config space
+; working proves nothing about whether that window is mapped.
+;
+; So this program deliberately STOPS SHORT. It reads the BAR out of
+; config space - which is the safe path, already proven - reports where
+; it points, and does NOT dereference it. Answering "where would we have
+; to read" separately from "can we read there" is the whole point: the
+; second question costs a reboot and the first does not.
+;
+;   PureMetalForge.exe --compile pi4Vl805Bar.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+
+#PCI_CFG_VENDOR   = $00
+#PCI_CFG_COMMAND  = $04
+#PCI_CFG_CLASS    = $08
+#PCI_CFG_BAR0     = $10
+#PCI_CFG_BAR1     = $14
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Field(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define id.i
+  Define bar0.i
+  Define bar1.i
+  Define cmd.i
+  Define cls.i
+  Define barLo.i
+  Define bus64.i
+  Define cpu.i
+
+  PrintNl()
+  UartWriteStr("=== VL805 BAR - where are its registers, and are they reachable? ===")
+  PrintNl()
+
+  If PcieInit() = 0
+    UartWriteStr("!! ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  id = PcieCfgRead32(1, 0, 0, #PCI_CFG_VENDOR)
+  Field("vendor:device", id, 8)
+  If id <> #PCIE_VL805_ID_EXPECTED
+    UartWriteStr("!! not the VL805 - stopping before reading anything else")
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND)
+  cls = PcieCfgRead32(1, 0, 0, #PCI_CFG_CLASS)
+  Field("command/stat ", cmd, 8)
+  Field("class/rev    ", cls, 8)
+
+  ; BUS MASTER AND MEMORY SPACE. Bit 1 is memory-space-enable and bit 2
+  ; is bus-master. The firmware has already used this controller to boot,
+  ; so both are probably set - and if they are NOT, that alone explains
+  ; an aborting read and is worth knowing before blaming the page tables.
+  UartWriteStr("  mem space    ")
+  If (cmd & 2) <> 0
+    UartWriteStr("enabled")
+  Else
+    UartWriteStr("DISABLED - a register read would abort for this reason alone")
+  EndIf
+  PrintNl()
+  UartWriteStr("  bus master   ")
+  If (cmd & 4) <> 0
+    UartWriteStr("enabled")
+  Else
+    UartWriteStr("disabled")
+  EndIf
+  PrintNl()
+
+  bar0 = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
+  bar1 = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR1)
+  Field("BAR0 raw     ", bar0, 8)
+  Field("BAR1 raw     ", bar1, 8)
+
+  ; The low bits of a BAR are flags, not address. Bit 0 clear means
+  ; memory (not I/O); bits 2:1 = 10b means a 64-bit BAR, in which case
+  ; BAR1 is its high half rather than a BAR of its own.
+  UartWriteStr("  BAR0 type    ")
+  If (bar0 & 1) <> 0
+    UartWriteStr("I/O space - unexpected for XHCI")
+  ElseIf (bar0 & 6) = 4
+    UartWriteStr("memory, 64-bit (BAR1 is the high half)")
+  Else
+    UartWriteStr("memory, 32-bit")
+  EndIf
+  PrintNl()
+
+  barLo = bar0 & $FFFFFFF0
+  If (bar0 & 6) = 4
+    bus64 = (bar1 << 32) | barLo
+  Else
+    bus64 = barLo
+  EndIf
+  Field("BUS address  ", bus64, 16)
+
+  ; The conversion this library exists for: a BAR holds an address on the
+  ; PCI BUS, and dereferencing that directly lands in the ARM peripheral
+  ; aperture instead.
+  cpu = PcieCpuFromBus(bus64)
+  Field("CPU address  ", cpu, 16)
+
+  PrintNl()
+  UartWriteStr("that CPU address is ")
+  If cpu >= PcieOutCpu()
+    If cpu < (PcieOutCpu() + PcieOutSize())
+      UartWriteStr("INSIDE the outbound window - correct")
+    Else
+      UartWriteStr("PAST THE END of the outbound window")
+    EndIf
+  Else
+    UartWriteStr("BELOW the outbound window - the conversion is wrong")
+  EndIf
+  PrintNl()
+
+  ; --- ENUMERATE, then look again -------------------------------------
+  PrintNl()
+  UartWriteStr("PcieEnumerate ... ")
+  If PcieEnumerate() = 0
+    UartWriteStr("FAILED: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 3
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+  Field("BAR size     ", PcieBarBytes(), 8)
+  Field("BAR bus addr ", PcieBarBus(), 16)
+  Field("BAR cpu addr ", PcieBarCpu(), 16)
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND)
+  Field("command now  ", cmd, 8)
+  bar0 = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
+  Field("BAR0 now     ", bar0, 8)
+  UartWriteStr("  endpoint ready: ")
+  If PcieEndpointReady() <> 0
+    UartWriteStr("YES - a register read should now work")
+  Else
+    UartWriteStr("no")
+  EndIf
+  PrintNl()
+
+  ; --- THE ROOT PORT IS A BRIDGE, AND BRIDGES FORWARD BY RANGE --------
+  ; The read came back $DEADDEAD - the root complex's AXI read-error
+  ; pattern, not a crash. So the CPU access reached the RC and the RC
+  ; declined to complete it. That rules out the page tables and points
+  ; at the bus.
+  ;
+  ; The RC is a PCI-to-PCI bridge, and a bridge only passes a memory
+  ; transaction downstream if it falls inside the MEMORY_BASE/LIMIT pair
+  ; in its OWN config header. Programming the outbound window told the
+  ; CPU side where to translate; nothing told the bridge to forward. Both
+  ; are required and they are different registers in different spaces.
+  ;
+  ; Format: two 16-bit fields at 0x20, each holding address bits 31:20 in
+  ; its top 12 bits. Limit is INCLUSIVE and names the last megabyte.
+  Define memwin.i
+  Define secbus.i
+  secbus = PcieCfgRead32(0, 0, 0, $18)
+  Field("bridge busses", secbus, 8)
+  memwin = PcieCfgRead32(0, 0, 0, $20)
+  Field("mem base/lim ", memwin, 8)
+
+  memwin = ((PcieOutBus() >> 16) & $FFF0) | ((((PcieOutBus() + PcieOutSize() - 1) >> 16) & $FFF0) << 16)
+  PcieCfgWrite32(0, 0, 0, $20, memwin)
+  Field("mem base/lim now", PcieCfgRead32(0, 0, 0, $20), 8)
+
+  ; The bridge must also be told to forward at all - same COMMAND bits,
+  ; but on the BRIDGE this time, not the endpoint.
+  Define bcmd.i
+  bcmd = PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND)
+  PcieCfgWrite32(0, 0, 0, #PCI_CFG_COMMAND, bcmd | #PCI_CMD_MEM_SPACE | #PCI_CMD_BUS_MASTER)
+  Field("bridge cmd now", PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND), 8)
+
+  ; --- THE DEREFERENCE ------------------------------------------------
+  ; Everything above is safe and repeatable. This is not: if the loader
+  ; did not map the outbound window, this line takes a data abort and
+  ; resets the CPU. It is worth doing anyway, because after enumeration
+  ; it is a SINGLE-VARIABLE test - the BAR is assigned, memory space is
+  ; on, so the only thing left that can fail is the mapping.
+  ;
+  ; DRAIN THE UART FIRST. The PL011 has a 32-byte FIFO and an abort does
+  ; not flush it, so without this the last thing printed is lost and the
+  ; evidence dies with the program. UartDrain waits on BUSY rather than
+  ; TXFE - the difference is the byte still in the shift register.
+  PrintNl()
+  UartWriteStr("about to read the BAR at CPU $")
+  PutHexN(PcieBarCpu(), 16)
+  PrintNl()
+  UartWriteStr("if the next line is missing, the outbound window is not mapped.")
+  PrintNl()
+  UartDrain()
+
+  Define capver.i
+  capver = PeekN(PcieBarCpu())
+
+  UartWriteStr("IT READ. CAPLENGTH/HCIVERSION = $")
+  PutHexN(capver, 8)
+  PrintNl()
+  UartWriteStr("  CAPLENGTH  ")
+  PrintDec(capver & $FF)
+  UartWriteStr(" bytes of capability registers")
+  PrintNl()
+  UartWriteStr("  HCIVERSION $")
+  PutHexN((capver >> 16) & $FFFF, 4)
+  UartWriteStr("   (U-Boot reported this controller as XHCI 1.00)")
+  PrintNl()
+
+  ; A second read at a different offset, because one plausible number
+  ; could be a fluke of a floating bus. HCSPARAMS1 at +4 carries the
+  ; port count, and U-Boot printed NbrPorts 5 for this controller - so
+  ; there is an independent figure to check it against.
+  Define hcs1.i
+  hcs1 = PeekN(PcieBarCpu() + 4)
+  UartWriteStr("  HCSPARAMS1 $")
+  PutHexN(hcs1, 8)
+  UartWriteStr("   maxports ")
+  PrintDec((hcs1 >> 24) & $FF)
+  UartWriteStr("  maxslots ")
+  PrintDec(hcs1 & $FF)
+  PrintNl()
+
+  ProcedureReturn 0
+EndProcedure

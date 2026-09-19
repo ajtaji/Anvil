@@ -1,0 +1,178 @@
+; Emitted CPU-only fixture for renderer-neutral proportional text measurements.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+XIncludeFile "Anvil/Graphics/truetype_kern.pbi"
+XIncludeFile "Anvil/Graphics/truetype_gpos.pbi"
+XIncludeFile "Anvil/Graphics/truetype_layout.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster.pbi"
+XIncludeFile "Anvil/Graphics/truetype_slots.pbi"
+
+#NEON_OK = 0
+#NEON_ERR_ARGS = 15
+#NEON_ERR_NOFRAME = 10
+#NEON_FONT_UI = 0
+#NEON_FONT_SMALL = 1
+#NEON_FONT_MONO = 2
+#NEON_FONT_BOLD = 3
+#NEON_VK_CHROME_OK = 0
+#NEON_VK_CHROME_ERR_ARGS = -21201
+#NEON_VK_CHROME_TT_RUN_GLYPHS = 4096
+#NMG_META = $0F000000
+#NMG_BASE = $10000000
+#NMG_MAGIC = $54534C54
+
+Global gNeonBackendBox.i, gNeonBackendText.i, gNeonBackendScissorSet.i, gNeonBackendScissorClear.i
+Global gNeonBackendFanBegin.i, gNeonBackendFanPoint.i, gNeonBackendFanEnd.i, gNeonBackendFanOutline.i
+Global gNeonBackendLinesBegin.i, gNeonBackendLine.i, gNeonBackendLinesEnd.i, gNeonBackendActive.i
+Global gNeonMeasureWidth.i, gNeonMeasureLineHeight.i, gNeonMeasureActive.i, neon_err.i
+Global neon_fw.i=8, neon_fh.i=16
+Global Dim neon_fontScale.i[4]
+Global nvcTTFontPixels.i=16, nvcError.i, nvcStubRasterCount.i, nvcTTCount.i=23
+Global nvcTTCacheHits.i=41, nvcTTCacheMisses.i=17, nvcStubUploadCount.i=5, nvcTTDirty.i
+Global Dim nvcTTFontHeight.i[4]
+Global Dim nvcTTDecoded.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutGlyph.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutX.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutY.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutAdvance.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global mngTextX.i, mngTextY.i, mngTextFont.i, mngTextCalls.i
+Global mngChecks.i, mngFails.i, mngFirstFailure.i
+Global Dim mngAV.a[3]
+Global Dim mngA.a[2]
+Global Dim mngV.a[2]
+Global Dim mngAe.a[4]
+Global Dim mngMultiline.a[5]
+Global Dim mngBadUtf8.a[2]
+
+Procedure.i nvcFail(code.i)
+  nvcError=code : ProcedureReturn code
+EndProcedure
+
+Procedure.i Neon_Text(font.i,x.i,y.i,*s,colour.i)
+  mngTextFont=font : mngTextX=x : mngTextY=y : mngTextCalls+1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i neon_BackendBoxUnbound(x.i,y.i,w.i,h.i,colour.i) : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+Procedure.i neon_BackendTextUnbound(font.i,x.i,y.i,*s,colour.i) : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+Procedure neon_BackendScissorSetUnbound(x.i,y.i,w.i,h.i) : EndProcedure
+Procedure neon_BackendScissorClearUnbound() : EndProcedure
+Procedure.i neon_BackendFanBeginUnbound() : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+Procedure neon_BackendFanPointUnbound(x.i,y.i) : EndProcedure
+Procedure.i neon_BackendFanEndUnbound(colour.i) : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+Procedure.i neon_BackendFanOutlineUnbound(colour.i) : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+Procedure.i neon_BackendLinesBeginUnbound() : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+Procedure neon_BackendLineUnbound(x0.i,y0.i,x1.i,y1.i) : EndProcedure
+Procedure.i neon_BackendLinesEndUnbound(colour.i) : ProcedureReturn #NEON_ERR_NOFRAME : EndProcedure
+
+; The exact production procedure bodies are inserted here by the checker.
+;@@NMG_PROCS@@
+
+Procedure mngCheck(ok.i)
+  mngChecks+1
+  If ok=0
+    mngFails+1
+    If mngFirstFailure=0 : mngFirstFailure=mngChecks : EndIf
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i, glyph.i, rc.i, width.i, height.i, stride.i, bx.i, by.i, advance.i
+  Protected measured.i, lines.i, expected.i, rasterBefore.i, countBefore.i, hitsBefore.i, missesBefore.i, uploadsBefore.i
+  Protected wAV.i, wA.i, wV.i
+  gNeonBackendActive=0 : gNeonMeasureActive=0 : neon_err=0
+  nvcTTFontPixels=16 : nvcError=0
+  neon_fw=8 : neon_fh=16
+  neon_fontScale[0]=1 : neon_fontScale[1]=1 : neon_fontScale[2]=2 : neon_fontScale[3]=1
+  nvcTTFontHeight[0]=0 : nvcTTFontHeight[1]=0 : nvcTTFontHeight[2]=0 : nvcTTFontHeight[3]=0
+  If PeekL(#NMG_META)<>#NMG_MAGIC : ProcedureReturn 90 : EndIf
+  bytes=PeekL(#NMG_META+4)
+  If bytes<1 Or bytes>#ANVIL_TTS_MAX_BYTES : ProcedureReturn 91 : EndIf
+  mngAV[0]=$41 : mngAV[1]=$56 : mngAV[2]=0
+  mngA[0]=$41 : mngA[1]=0
+  mngV[0]=$56 : mngV[1]=0
+  mngAe[0]=$41 : mngAe[1]=$C3 : mngAe[2]=$A9 : mngAe[3]=0
+  mngMultiline[0]=$41 : mngMultiline[1]=$56 : mngMultiline[2]=10 : mngMultiline[3]=$41 : mngMultiline[4]=0
+  mngBadUtf8[0]=$C0 : mngBadUtf8[1]=0
+  If AnvilTrueTypeSlotLoad(0,#NMG_BASE,bytes)=0 : ProcedureReturn 92 : EndIf
+  If AnvilTrueTypeSlotSelect(0)=0 : ProcedureReturn 93 : EndIf
+  If AnvilTrueTypeGlyphForCodepoint($41)<1 Or AnvilTrueTypeGlyphForCodepoint($56)<1 Or AnvilTrueTypeGlyphForCodepoint($E9)<1 : ProcedureReturn 94 : EndIf
+
+  ; Install is atomic and requires the renderer draw backend to be active.
+  mngCheck(NeonMeasureBackendActive()=0)
+  mngCheck(NeonMeasureBackendInstall(@NeonVkChromeMeasureWidth,0)=#NEON_ERR_ARGS)
+  mngCheck(NeonMeasureBackendInstall(@NeonVkChromeMeasureWidth,@NeonVkChromeMeasureLineHeight)=#NEON_ERR_ARGS)
+  gNeonBackendActive=1
+  mngCheck(NeonMeasureBackendInstall(@NeonVkChromeMeasureWidth,@NeonVkChromeMeasureLineHeight)=#NEON_OK)
+  mngCheck(NeonMeasureBackendActive()=1)
+
+  ; Abel hmtx/kern oracle: A=950, V=950, kern(A,V)=-41, UPEM=2048.
+  ; At 16 px ceil((1900-41)*16/2048)=15; separate glyphs each ceil to 8.
+  mngCheck(AnvilTrueTypePixelHeight()=16)
+  mngCheck(NeonVkChromeFontPixelHeight(#NEON_FONT_UI)=16)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngAV[0])=15)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngA[0])=8)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngV[0])=8)
+  wAV=Neon_TextWidth(#NEON_FONT_UI,@mngAV[0])
+  wA=Neon_TextWidth(#NEON_FONT_UI,@mngA[0]) : wV=Neon_TextWidth(#NEON_FONT_UI,@mngV[0])
+  mngCheck(wAV<wA+wV)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngAe[0])=15)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngMultiline[0])=15)
+  mngCheck(NeonVkChromeMeasureWidth(#NEON_FONT_UI,@mngBadUtf8[0])<0)
+  mngCheck(Neon_LineHeight(#NEON_FONT_UI)=18)
+
+  ; Mono uses raw scaled bitmap height as raster pixels; widget line box adds 2.
+  mngCheck(NeonBitmapLineHeight(#NEON_FONT_MONO)=32)
+  mngCheck(NeonVkChromeFontPixelHeight(#NEON_FONT_MONO)=32)
+  mngCheck(Neon_LineHeight(#NEON_FONT_MONO)=34)
+  mngCheck(Neon_TextWidth(#NEON_FONT_MONO,@mngAV[0])=30)
+  mngCheck(NeonVkChromeMeasureLineHeight(#NEON_FONT_MONO)=NeonVkChromeFontPixelHeight(#NEON_FONT_MONO)+2)
+
+  ; Face overrides affect measurement and the raster-prewarm pixel key together.
+  mngCheck(NeonVkChromeFontHeightSet(#NEON_FONT_UI,12)=#NEON_VK_CHROME_OK)
+  mngCheck(NeonVkChromeFontPixelHeight(#NEON_FONT_UI)=12)
+  mngCheck(Neon_LineHeight(#NEON_FONT_UI)=14)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngAV[0])=11)
+  mngCheck(NeonVkChromeFontHeightSet(#NEON_FONT_MONO,10)=#NEON_VK_CHROME_OK)
+  mngCheck(NeonVkChromeFontPixelHeight(#NEON_FONT_MONO)=10)
+  mngCheck(Neon_LineHeight(#NEON_FONT_MONO)=12)
+  mngCheck(Neon_TextWidth(#NEON_FONT_MONO,@mngAV[0])=10)
+  mngCheck(NeonVkChromeMeasureLineHeight(#NEON_FONT_MONO)=NeonVkChromeFontPixelHeight(#NEON_FONT_MONO)+2)
+
+  ; Right/centre widget helpers must place from the proportional UTF-8 width.
+  mngCheck(Neon_TextRight(#NEON_FONT_UI,100,7,@mngAV[0],0)=#NEON_OK)
+  mngCheck(mngTextCalls=1 And mngTextX=89 And mngTextY=7)
+  mngCheck(Neon_TextCentre(#NEON_FONT_UI,20,60,9,@mngAV[0],0)=#NEON_OK)
+  mngCheck(mngTextCalls=2 And mngTextX=44 And mngTextY=9)
+
+  ; Measurements are CPU-only: no raster, cache publication, or atlas upload.
+  rasterBefore=AnvilTrueTypeRasterCount()
+  countBefore=nvcTTCount : hitsBefore=nvcTTCacheHits : missesBefore=nvcTTCacheMisses : uploadsBefore=nvcStubUploadCount
+  width=Neon_TextWidth(#NEON_FONT_UI,@mngAe[0]) : height=Neon_LineHeight(#NEON_FONT_MONO)
+  mngCheck(width>0 And height=12)
+  mngCheck(AnvilTrueTypeRasterCount()=rasterBefore)
+  mngCheck(nvcTTCount=countBefore And nvcTTCacheHits=hitsBefore And nvcTTCacheMisses=missesBefore And nvcStubUploadCount=uploadsBefore And nvcTTDirty=0)
+
+  ; Selecting bitmap/detaching callbacks restores legacy bitmap measurement.
+  If AnvilTrueTypeSlotDeselect()=0 : ProcedureReturn 95 : EndIf
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngAV[0])=16)
+  mngCheck(Neon_LineHeight(#NEON_FONT_UI)=16)
+  mngCheck(NeonVkChromeMeasureWidth(#NEON_FONT_UI,@mngAV[0])<0)
+  If AnvilTrueTypeSlotSelect(0)=0 : ProcedureReturn 96 : EndIf
+  NeonMeasureBackendClear()
+  mngCheck(NeonMeasureBackendActive()=0)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngAV[0])=16)
+  mngCheck(Neon_LineHeight(#NEON_FONT_UI)=16)
+  ; Draw backend teardown must detach the measurement callbacks as well.
+  gNeonBackendActive=1
+  If NeonMeasureBackendInstall(@NeonVkChromeMeasureWidth,@NeonVkChromeMeasureLineHeight)<>#NEON_OK : ProcedureReturn 97 : EndIf
+  NeonDrawBackendClear()
+  mngCheck(NeonMeasureBackendActive()=0)
+  mngCheck(Neon_TextWidth(#NEON_FONT_UI,@mngAV[0])=16)
+  mngCheck(Neon_LineHeight(#NEON_FONT_UI)=16)
+
+  If mngFails<>0 : ProcedureReturn mngFirstFailure : EndIf
+  ProcedureReturn 0
+EndProcedure

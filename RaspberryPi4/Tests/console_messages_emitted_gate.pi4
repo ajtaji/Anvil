@@ -1,0 +1,337 @@
+; ======================================================================
+;  console_messages_emitted_gate.pi4
+;
+;  Emitted-code gate for THE RULE of 2026-09-16 (forum 791): a message for
+;  the user is never written to the command line.
+;
+;  COMPILED UNCHANGED AND EXECUTED:
+;    RaspberryPi4/Lib/uart.pi4          the one console write, its PL011
+;                                       path, the screen mirror, the network
+;                                       tap and the message context
+;    Anvil/Core/input_events.pbi        the key vocabulary
+;    Anvil/Core/text_edit.pbi           the line editor and its echo
+;    Anvil/Core/messages.pbi            the message log and `messages`
+;    RaspberryPi4/Board/banner_status.pi4  the banner caption
+;    Anvil/Hal/hal.pbi                  the temperature vocabulary it reads
+;
+;  THE WIRE IS REAL. The harness (tools/console_messages_emitted_check.py)
+;  maps the PL011's flag and data registers and records every byte the
+;  real UartWrite puts on the wire, in order, and compares the whole
+;  stream against the exact bytes it must be. The screen mirror and the
+;  network tap are the real rings, drained here and compared.
+;
+;  THE SHAPE OF THE PROOF. One command line is typed twice, byte for byte
+;  the same keystrokes: once with nothing else happening (pass A), and once
+;  with background messages fired between the keystrokes - with an empty
+;  line, with text before the caret, with the caret in the middle, nested,
+;  and with a message that has no newline (pass B). The wire, the mirror
+;  and the tap must carry exactly the same bytes for both passes, the
+;  edited line must come out the same, and every message must be in the
+;  log and on the banner caption instead.
+;
+;  Main() returns the number of the first failing assertion, or 0.
+; ======================================================================
+
+XIncludeFile "Anvil/Core/state.pbi"
+
+Global gLastCR.i = 0
+Global gBootTicks.i = 0
+Global gate_ticks.i = 0
+
+Procedure.i Ticks()
+  gate_ticks = gate_ticks + 54000000
+  ProcedureReturn gate_ticks
+EndProcedure
+
+Procedure.i TickHz()
+  ProcedureReturn 54000000
+EndProcedure
+
+; The two parser leaves `messages` reads its arguments through.
+Procedure SkipSpace()
+  While gLine[gPos] = 32
+    gPos = gPos + 1
+  Wend
+EndProcedure
+
+Global gate_breaks.i = 0
+Procedure.i OutBreak()
+  gate_breaks = gate_breaks + 1
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+XIncludeFile "Anvil/Core/messages.pbi"
+
+; The banner caption's other readings, fixed so the message half is the
+; only thing that moves.
+#ANVIL_BANNER_FAN = 0
+Procedure.i WallClockCaption()
+  ProcedureReturn "CLOCK"
+EndProcedure
+XIncludeFile "RaspberryPi4/Board/banner_status.pi4"
+
+; ---- the rings, drained into buffers per pass ------------------------
+#GATE_MAX = 1024
+Global Dim gate_mirA.a[#GATE_MAX]
+Global Dim gate_mirB.a[#GATE_MAX]
+Global Dim gate_auxA.a[#GATE_MAX]
+Global Dim gate_auxB.a[#GATE_MAX]
+Global gate_mirAN.i
+Global gate_mirBN.i
+Global gate_auxAN.i
+Global gate_auxBN.i
+Global Dim gate_lineA.a[64]
+
+Procedure.i GateDrainMirror(*dst, cap.i)
+  Define n.i
+  Define c.i
+  n = 0
+  Repeat
+    c = UartMirrorGet()
+    If c < 0
+      Break
+    EndIf
+    If n < cap
+      PokeA(*dst + n, c)
+    EndIf
+    n = n + 1
+  ForEver
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i GateDrainAux(*dst, cap.i)
+  Define n.i
+  Define c.i
+  n = 0
+  Repeat
+    c = UartAuxGet()
+    If c < 0
+      Break
+    EndIf
+    If n < cap
+      PokeA(*dst + n, c)
+    EndIf
+    n = n + 1
+  ForEver
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i GateSame(*a, *b, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    If PeekA(*a + i) <> PeekA(*b + i)
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateStrIs(*a, *b)
+  Define i.i
+  i = 0
+  Repeat
+    If PeekA(*a + i) <> PeekA(*b + i)
+      ProcedureReturn 0
+    EndIf
+    If PeekA(*a + i) = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  ForEver
+EndProcedure
+
+; ---- the background messages -----------------------------------------
+; What a service says, through the real print path. Nothing here knows it
+; is a message: only the bracket around the call makes it one, exactly as
+; the prompt's idle loop brackets the real services.
+Procedure GateSayListening()
+  PrintN("The network console is now listening on:")
+  Print("    192.168.137.1 port 5555, over the wired Ethernet")
+  PrintNl()
+EndProcedure
+
+Procedure GateSayRekey()
+  PrintN("Wi-Fi: group key rekeyed.")
+EndProcedure
+
+Procedure GateSayPartial()
+  Print("Wi-Fi: lease renewed")
+EndProcedure
+
+Procedure GateFire(which.i)
+  UartMessageBegin()
+  Select which
+    Case 1
+      GateSayListening()
+    Case 2
+      GateSayRekey()
+    Case 3
+      ; nested, and a line with no newline: one message, not two
+      UartMessageBegin()
+      GateSayPartial()
+      UartMessageEnd()
+      Print(", 7200 s")
+  EndSelect
+  UartMessageEnd()
+EndProcedure
+
+; ---- one command line, with or without messages between keystrokes ---
+Procedure GateTypeLine(withMessages.i)
+  UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+  Print("pmf> ")
+  UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+  TextEditBegin()
+  If withMessages <> 0 : GateFire(1) : EndIf     ; empty line
+  TextEditInsert(118)                            ; v
+  TextEditInsert(101)                            ; e
+  TextEditInsert(115)                            ; s
+  If withMessages <> 0 : GateFire(2) : EndIf     ; text before the caret
+  TextEditInsert(105)                            ; i
+  TextEditInsert(111)                            ; o
+  TextEditInsert(110)                            ; n
+  TextEditKey(#AIK_LEFT)
+  TextEditKey(#AIK_LEFT)
+  TextEditKey(#AIK_LEFT)
+  TextEditKey(#AIK_LEFT)
+  If withMessages <> 0 : GateFire(3) : EndIf     ; caret in the middle
+  TextEditInsert(114)                            ; r
+  TextEditKey(#AIK_END)
+  TextEditKey(#AIK_ENTER)
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define n.i
+
+  UartMirror(1)
+  UartAuxMirror(1)
+
+  ; 1. NO LOG, NO DIVERSION. A program with no message log must keep every
+  ;    byte it prints: the bracket is counted and ignored. The harness sees
+  ;    "standalone" on the wire.
+  UartMessageBegin()
+  Print("standalone")
+  PrintNl()
+  UartMessageEnd()
+  If UartMessageBytes() <> 0 : ProcedureReturn 1 : EndIf
+  If UartMessageDepth() <> 0 : ProcedureReturn 2 : EndIf
+  GateDrainMirror(@gate_mirA[0], #GATE_MAX)
+  GateDrainAux(@gate_auxA[0], #GATE_MAX)
+
+  MessagesStart()
+  If MessagesTotal() <> 0 Or MessagesUnread() <> 0 : ProcedureReturn 3 : EndIf
+
+  ; 2. PASS A - the line with nothing else happening.
+  GateTypeLine(0)
+  gate_mirAN = GateDrainMirror(@gate_mirA[0], #GATE_MAX)
+  gate_auxAN = GateDrainAux(@gate_auxA[0], #GATE_MAX)
+  If gate_mirAN <= 0 Or gate_mirAN > #GATE_MAX : ProcedureReturn 4 : EndIf
+  If gLineLen <> 7 : ProcedureReturn 5 : EndIf
+  For i = 0 To 7
+    gate_lineA[i] = gLine[i]
+  Next
+  If UartMessageBytes() <> 0 : ProcedureReturn 6 : EndIf
+
+  ; 3. PASS B - the same keystrokes, three messages fired between them.
+  GateTypeLine(1)
+  gate_mirBN = GateDrainMirror(@gate_mirB[0], #GATE_MAX)
+  gate_auxBN = GateDrainAux(@gate_auxB[0], #GATE_MAX)
+
+  ; Not one message byte on the screen mirror or the network tap.
+  If gate_mirBN <> gate_mirAN : ProcedureReturn 10 : EndIf
+  If GateSame(@gate_mirA[0], @gate_mirB[0], gate_mirAN) = 0 : ProcedureReturn 11 : EndIf
+  If gate_auxBN <> gate_auxAN : ProcedureReturn 12 : EndIf
+  If GateSame(@gate_auxA[0], @gate_auxB[0], gate_auxAN) = 0 : ProcedureReturn 13 : EndIf
+  ; The typed line is untouched.
+  If gLineLen <> 7 : ProcedureReturn 14 : EndIf
+  For i = 0 To 7
+    If gLine[i] <> gate_lineA[i] : ProcedureReturn 15 : EndIf
+  Next
+  If GateStrIs(@gLine[0], "version") = 0 : ProcedureReturn 16 : EndIf
+  If TextEditCaret() <> 7 : ProcedureReturn 17 : EndIf
+  If UartMessageDepth() <> 0 : ProcedureReturn 18 : EndIf
+  If UartMessageLost() <> 0 : ProcedureReturn 19 : EndIf
+
+  ; 4. EVERY MESSAGE IS IN THE LOG, as lines, one number per bracket.
+  If MessagesTotal() <> 3 : ProcedureReturn 20 : EndIf
+  If MessagesUnread() <> 3 : ProcedureReturn 21 : EndIf
+  If gMsgKept <> 4 : ProcedureReturn 22 : EndIf
+  If GateStrIs(@gMsgText[0], "The network console is now listening on:") = 0 : ProcedureReturn 23 : EndIf
+  If GateStrIs(@gMsgText[1 * (#MSG_LINE + 1)], "    192.168.137.1 port 5555, over the wired Ethernet") = 0 : ProcedureReturn 24 : EndIf
+  If gMsgNoOf[0] <> 1 Or gMsgNoOf[1] <> 1 : ProcedureReturn 25 : EndIf
+  If GateStrIs(@gMsgText[2 * (#MSG_LINE + 1)], "Wi-Fi: group key rekeyed.") = 0 Or gMsgNoOf[2] <> 2 : ProcedureReturn 26 : EndIf
+  If GateStrIs(@gMsgText[3 * (#MSG_LINE + 1)], "Wi-Fi: lease renewed, 7200 s") = 0 Or gMsgNoOf[3] <> 3 : ProcedureReturn 27 : EndIf
+  If GateStrIs(MessagesNewest(), "Wi-Fi: lease renewed, 7200 s") = 0 : ProcedureReturn 28 : EndIf
+
+  ; 5. THE BANNER SAYS SO, AND ONLY THE BANNER.
+  If GateStrIs(BannerCaption(), "CLOCK    3 new messages: Wi-Fi: lease renewed, 7200 s") = 0 : ProcedureReturn 30 : EndIf
+
+  ; 6. A FAULT IS NOT A MESSAGE. The harness sees "fatal" on the wire.
+  UartMessageBegin()
+  UartMessageAbandon()
+  Print("fatal")
+  PrintNl()
+  If MessagesTotal() <> 3 : ProcedureReturn 31 : EndIf
+
+  ; 6b. A LINE NOBODY WILL FINISH IS TAKEN OFF EVERY CONSOLE (forum 888): the
+  ;     caret walks to the end and each character is erased. The harness
+  ;     sees "ab", a Left, the tail re-sent, then two erasures.
+  TextEditBegin()
+  TextEditInsert(97)
+  TextEditInsert(98)
+  TextEditKey(#AIK_LEFT)
+  TextEditDiscard()
+  If gLineLen <> 0 Or TextEditCaret() <> 0 Or gLine[0] <> 0 : ProcedureReturn 35 : EndIf
+
+  ; 7. `messages` prints the log as command output and marks it read.
+  gLine[0] = 109 : gLine[1] = 101 : gLine[2] = 115 : gLine[3] = 115
+  gLine[4] = 97 : gLine[5] = 103 : gLine[6] = 101 : gLine[7] = 115 : gLine[8] = 0
+  gPos = 8
+  CmdMessages()
+  If MessagesUnread() <> 0 : ProcedureReturn 40 : EndIf
+  If GateStrIs(BannerCaption(), "CLOCK") = 0 : ProcedureReturn 41 : EndIf
+  If UartMessageBytes() = 0 : ProcedureReturn 42 : EndIf
+  ; What `messages` printed went to the consoles, as a command's output.
+  If GateDrainMirror(@gate_mirA[0], #GATE_MAX) <= 7 : ProcedureReturn 43 : EndIf
+  GateDrainAux(@gate_auxA[0], #GATE_MAX)
+
+  ; 8. ONE MESSAGE READS AS ONE.
+  GateFire(2)
+  If GateStrIs(BannerCaption(), "CLOCK    1 new message: Wi-Fi: group key rekeyed.") = 0 : ProcedureReturn 50 : EndIf
+
+  ; 9. THE LOG IS BOUNDED AND COUNTS WHAT IT DROPPED.
+  For i = 1 To #MSG_SLOTS + 6
+    GateFire(2)
+  Next
+  If gMsgKept <> #MSG_SLOTS : ProcedureReturn 60 : EndIf
+  If gMsgEvicted <> 5 + 6 : ProcedureReturn 61 : EndIf
+  If MessagesTotal() <> 3 + 1 + #MSG_SLOTS + 6 : ProcedureReturn 62 : EndIf
+  If GateStrIs(MessagesNewest(), "Wi-Fi: group key rekeyed.") = 0 : ProcedureReturn 63 : EndIf
+  ; And none of those reached the mirror either.
+  If GateDrainMirror(@gate_mirB[0], #GATE_MAX) <> 0 : ProcedureReturn 64 : EndIf
+  If GateDrainAux(@gate_auxB[0], #GATE_MAX) <> 0 : ProcedureReturn 65 : EndIf
+
+  ; 10. NOTHING VISIBLE IS NOT A MESSAGE; A BYTE THAT CANNOT BE SHOWN IS
+  ;     SHOWN AS \xNN (forum 892).
+  n = MessagesTotal()
+  UartMessageBegin()
+  UartWrite(13)
+  Print("         ")
+  UartWrite(13)
+  UartWrite(7)
+  PrintNl()
+  UartMessageEnd()
+  If MessagesTotal() <> n + 1 : ProcedureReturn 70 : EndIf
+  If GateStrIs(MessagesNewest(), "         \x07") = 0 : ProcedureReturn 71 : EndIf
+  UartMessageBegin()
+  Print("         ")
+  PrintNl()
+  UartMessageEnd()
+  If MessagesTotal() <> n + 1 : ProcedureReturn 72 : EndIf
+  ProcedureReturn 0
+EndProcedure

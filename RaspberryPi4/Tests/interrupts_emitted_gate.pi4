@@ -1,0 +1,62 @@
+XIncludeFile "RaspberryPi4/Lib/interrupts.pi4"
+Procedure.i TestHandler()
+  PokeI($6000100, PeekI($6000100) + 1)
+  ProcedureReturn 1
+EndProcedure
+Global test_vector_value.i
+ProcedureNaked TestVector()
+  ASM
+    adrp x9, global_test_vector_value
+    add x9, x9, #:lo12:global_test_vector_value
+    ldr x0, [x9]
+    mrs x9, CurrentEL
+    cmp x9, #12
+    b.ne test_vector_el2
+    msr vbar_el3, x0
+    isb
+    ret
+test_vector_el2:
+    msr vbar_el2, x0
+    isb
+    ret
+  ENDASM
+EndProcedure
+Procedure Main()
+  PokeI($6000000, InterruptInit($8000))
+  PokeI($6000200, InterruptCanTransfer($8000))
+  PokeI($6000208, InterruptTransfer($8000, $10000))
+  test_vector_value = $10000
+  TestVector()
+  PokeI($6000210, InterruptTransfer($9000, $10000))
+  PokeI($6000218, InterruptTransfer($8000, $10001))
+  PokeI($6000220, InterruptTransfer($8000, $10000))
+  test_vector_value = $8000
+  TestVector()
+  PokeI($6000228, InterruptTransfer($10000, $8000))
+  PokeI($6000300, 1)
+  PokeI($6000240, InterruptCanTransfer($8000))
+  PokeI($6000248, InterruptTransfer($8000, $8000))
+  PokeI($6000300, 2)
+  PokeI($6000250, InterruptCanTransfer($8000))
+  PokeI($6000258, InterruptTransfer($8000, $8000))
+  PokeI($6000300, 3)
+  PokeI($6000260, InterruptCanTransfer($8000))
+  PokeI($6000268, InterruptTransfer($8000, $8000))
+  PokeI($6000300, 0)
+  PokeI($6000040, InterruptClaim(-1, @TestHandler))
+  PokeI($6000048, InterruptClaim(256, @TestHandler))
+  PokeI($6000050, InterruptDisable(29))
+  PokeI($6000058, InterruptStart())
+  PokeI($6000008, InterruptClaim(29, @TestHandler))
+  PokeI($6000230, InterruptCanTransfer($8000))
+  PokeI($6000238, InterruptTransfer($8000, $8000))
+  PokeI($6000070, InterruptClaim(40, @TestHandler))
+  PokeI($6000078, InterruptEnable(40))
+  PokeI($6000080, InterruptClaim(255, @TestHandler))
+  PokeI($6000088, InterruptEnable(255))
+  PokeI($6000010, InterruptEnable(29))
+  PokeI($6000060, InterruptStart())
+  PokeI($6000068, InterruptStop())
+  PokeI($6000018, InterruptDispatch())
+  PokeI($6000020, InterruptShutdown())
+EndProcedure

@@ -1,0 +1,325 @@
+; pi4MmuFlush.pi4 - PROVE MmuFlushDCacheAll() pushes dirty cache lines out
+;                   to physical DRAM. Enable the cached MMU, write a known
+;                   pattern (cached stores that sit in the D-cache), flush,
+;                   disable the MMU, then read the buffer back WITH THE MMU
+;                   OFF and assert it holds the pattern.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile pi4MmuFlush.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o mmuflush.img
+;
+; ----------------------------------------------------------------------
+; WHAT THIS PROVES, AND WHY THE MMU-OFF READ IS THE WHOLE PROOF
+; ----------------------------------------------------------------------
+; A set/way clean+invalidate of the entire data cache is what the
+; resident monitor (Anvil) must run before it disables the MMU for a
+; payload jump. If it works, everything a cached monitor wrote is in
+; DRAM before the caches go cold; if it is a no-op, the payload reads
+; stale DRAM and fails in a way that looks like a bad transfer.
+;
+; The experiment isolates exactly that:
+;
+;   1. MMU OFF (as the stub leaves it): write a POISON value to a DRAM
+;      test buffer. With the MMU off this store bypasses the cache and
+;      lands directly in physical DRAM.
+;   2. Enable the cached MMU (M|C|I). DRAM is now Normal Write-Back.
+;   3. Write a different PATTERN to the same buffer. These are cacheable
+;      stores: they allocate dirty lines in the D-cache and DO NOT reach
+;      DRAM. Physical DRAM still holds the POISON.
+;   4. MmuFlushDCacheAll(). Clean+invalidate by set/way writes every
+;      dirty line back. The PATTERN reaches DRAM here, or nowhere.
+;   5. Disable the cached MMU (clear M|C|I). The caches are now off and
+;      are NOT auto-written-back on disable.
+;   6. MMU OFF: read the buffer back. This read goes to physical DRAM.
+;
+; The verdict is decided by step 6 alone:
+;   PASS  - the buffer reads the PATTERN. The flush pushed the dirty
+;           lines to DRAM; if it had been a no-op, DRAM would still hold
+;           POISON and this read would show it.
+;   FAIL  - the buffer reads the POISON (the flush did nothing and the
+;           dirty lines were discarded when C was cleared), or some third
+;           value (a wrong set/way encoding walked the wrong range).
+;
+; The buffer spans two cache lines so the flush must handle more than a
+; single line. It is written immediately before the flush, so natural
+; eviction of its lines in the handful of instructions in between is not
+; a realistic alternative explanation for a PASS on this core.
+;
+; The probe also reads CLIDR_EL1 and the per-level CCSIDR_EL1 and prints
+; the levels, line size, sets and ways the flush walks, so the loop
+; bounds MmuFlushDCacheAll() computes are visible next to the result.
+;
+; ----------------------------------------------------------------------
+; THE BENCH PROCEDURE, AND WHAT EACH OUTCOME MEANS
+; ----------------------------------------------------------------------
+;   pmf> deadman 15
+;   pmf> map              <- it prints `stage a file at <stage>`. The
+;                            --load-addr above does not pin the image.
+;   pmf> receive <stage> <len> <crc>
+;   pmf> run <stage>
+;
+; OUTCOME A - everything prints and the verdict is "FLUSH PROVEN: PASS".
+;   MmuFlushDCacheAll() cleaned the dirty pattern out to DRAM. This is
+;   the result that unblocks caches in the resident monitor. Report the
+;   CLIDR/CCSIDR lines and the read-back values.
+;
+; OUTCOME B - the verdict is "FLUSH FAILED: read POISON". The MMU-off
+;   read saw the pre-write value, so the pattern never reached DRAM. The
+;   flush walked the wrong range or did nothing. Report the CLIDR/CCSIDR
+;   lines - the loop bounds are the first suspect - and the read-back.
+;
+; OUTCOME C - the verdict is "FLUSH FAILED: read unexpected". Neither
+;   pattern nor poison. A malformed set/way operand. Report everything.
+;
+; OUTCOME D - output stops after "ENABLING CACHED MMU NOW". The cached
+;   enable or the map is wrong, unrelated to the flush. The deadman
+;   resets the board in ~16 s and Anvil returns with the MMU off.
+;   Nothing to revert - this is a payload; anvil.img was never touched.
+;
+; OUTCOME E - "THIS BUILD CANNOT ENABLE" appears. Built while
+;   #MMU_HAVE_EL2_REGS was 0. Rebuild once the assembler has the EL2
+;   registers. (It also needs clidr_el1/ccsidr_el1/csselr_el1 and clz,
+;   added 2026-08-29; a build old enough to lack those will not compile
+;   this file at all, so reaching this message means only the EL2 gate.)
+;
+; OUTCOME F - the board does not come back after ~20 s. The deadman did
+;   not fire. POWER-CYCLE IT. The board is not damaged and nothing needs
+;   reverting or reflashing.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+; Page tables: same window and reasoning as pi4MmuIdentity.pi4 - inside
+; the monitor's low payload window, 2 MiB aligned, clear of this image
+; ($00400000) and the stack top ($03000000).
+#TABLES = $00600000
+
+; The DRAM test buffer. $00800000 (8 MiB) is inside slot 0's 1 GiB
+; Normal Write-Back block, identity-mapped, and clear of this image
+; (4 MiB), the tables (6 MiB) and the stack (48 MiB). 16 eight-byte
+; words = 128 bytes = two 64-byte cache lines, so the flush must clean
+; more than one line.
+#TESTBUF   = $00800000
+#TESTWORDS = 16
+
+; Two distinct high halves so a stale read is obvious in the dump:
+; POISON is written to DRAM before the caches come on; PATTERN is the
+; cached write the flush must push out. word i = base + i.
+#POISON_BASE  = $DEAD0000
+#PATTERN_BASE = $C0FFEE00
+
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*label, v.i)
+  UartWriteStr(*label)
+  UartWrite(36)                 ; '$', the hex marker used across these probes
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  UartWriteNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DumpCacheGeometry - read CLIDR_EL1 and, for each level to the Level of
+;  Coherency, decode CCSIDR_EL1 into the exact bounds MmuFlushDCacheAll()
+;  loops over. Every shift is parenthesised: in this dialect the bitwise
+;  operators bind TIGHTER than the shifts (RaspberryPi4/Lib/mmu.pi4's
+;  MmuEl() states the rule), so "c >> 3 & $3FF" would mean "c >> 3".
+; ----------------------------------------------------------------------
+Procedure DumpCacheGeometry()
+  Define clidr.i
+  Define loc.i
+  Define level.i
+  Define ctype.i
+  Define ccsidr.i
+  Define lineBytes.i
+  Define ways.i
+  Define sets.i
+
+  clidr = MmuReadClidrEl1()
+  loc   = (clidr >> 24) & 7
+  Row("CLIDR_EL1              ", clidr)
+  UartWriteStr("Level of Coherency    ")
+  PrintDec(loc)
+  Say(" (levels the flush walks)")
+
+  For level = 0 To loc - 1
+    ctype = (clidr >> (level * 3)) & 7
+    UartWriteStr("  level ")
+    PrintDec(level + 1)
+    UartWriteStr("  Ctype ")
+    PrintDec(ctype)
+    If ctype < 2
+      Say("  (no data/unified cache - skipped)")
+    Else
+      ccsidr    = MmuReadCcsidrForLevel(level)
+      lineBytes = 1 << ((ccsidr & 7) + 4)
+      ways      = ((ccsidr >> 3) & $3FF) + 1
+      sets      = ((ccsidr >> 13) & $7FFF) + 1
+      UartWriteStr("  line ")
+      PrintDec(lineBytes)
+      UartWriteStr("B  ways ")
+      PrintDec(ways)
+      UartWriteStr("  sets ")
+      PrintDec(sets)
+      UartWriteStr("  dc-cisw ops ")
+      PrintDec(ways * sets)
+      UartWriteNl()
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define before.i
+  Define after.i
+  Define i.i
+  Define got.i
+  Define want.i
+  Define fails.i
+  Define poisonSeen.i
+  Define firstBad.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  Say("pi4MmuFlush - prove MmuFlushDCacheAll pushes dirty lines to DRAM")
+  UartWriteNl()
+
+  ; ---- 1. pre-state -------------------------------------------------
+  before = MmuSctlrEl2()
+  Row("SCTLR_EL2 before      ", before)
+  Row("exception level       ", MmuEl())
+  Row("MMU on before         ", MmuEnabled())
+  UartWriteNl()
+
+  ; ---- 2. the geometry the flush will walk --------------------------
+  DumpCacheGeometry()
+  UartWriteNl()
+
+  ; ---- 3. build the identity tables ---------------------------------
+  Row("tables at             ", #TABLES)
+  rc = MmuBuildTables(#TABLES)
+  Row("build returned        ", rc)
+  If rc <> 0
+    Say("REFUSED. See #MMU_ERR_* in RaspberryPi4/Lib/mmu.pi4.")
+    Say("Nothing was enabled. The board is untouched.")
+    UartDrain()
+    ProcedureReturn rc
+  EndIf
+
+  If MmuBuildable() = 0
+    Say("THIS BUILD CANNOT ENABLE - #MMU_HAVE_EL2_REGS is 0. Outcome E.")
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+  UartWriteNl()
+
+  ; ---- 4. POISON the buffer with the MMU OFF ------------------------
+  ; MMU off: these stores bypass the cache and reach physical DRAM.
+  For i = 0 To #TESTWORDS - 1
+    PokeI(#TESTBUF + (i * 8), #POISON_BASE + i)
+  Next
+  Row("poison written, word0 ", PeekI(#TESTBUF))
+  Row("test buffer at        ", #TESTBUF)
+  UartWriteNl()
+
+  ; ---- 5. enable the cached MMU -------------------------------------
+  SafetyWatchdogStart(15)
+  Say("ENABLING CACHED MMU NOW - if this is the last line, outcome D:")
+  Say("the deadman resets the board in ~16 s, Anvil returns MMU off.")
+  UartDrain()
+
+  MmuEnableCached()
+
+  Say("ALIVE - console works with the cached MMU ON.")
+  Row("SCTLR_EL2 during      ", MmuSctlrEl2())
+  If MmuEnabled() = 0
+    Say("WRONG: enable ran but SCTLR_EL2.M is still clear. Outcome D-ish.")
+    UartDrain()
+  EndIf
+
+  ; ---- 6. write the PATTERN into cacheable DRAM ---------------------
+  ; C is set, DRAM is Write-Back: these stores allocate dirty D-cache
+  ; lines and do NOT reach DRAM. Physical DRAM still holds the poison.
+  For i = 0 To #TESTWORDS - 1
+    PokeI(#TESTBUF + (i * 8), #PATTERN_BASE + i)
+  Next
+
+  ; ---- 7+8. disable the cached MMU and flush, in one inline op -------
+  ; MmuDisableCachedFlushed clears C|M and cleans the whole D-cache by
+  ; set/way in a single ASM block - C off for the walk, and no stack
+  ; access between the clear and the flush (proven necessary 2026-08-29).
+  MmuDisableCachedFlushed()
+  after = MmuSctlrEl2()
+  Row("SCTLR_EL2 after       ", after)
+  Row("MMU on after          ", MmuEnabled())
+  If after <> before
+    Say("note: SCTLR_EL2 did not return to its entry value - report both.")
+  EndIf
+  UartWriteNl()
+
+  ; ---- 9. read back WITH THE MMU OFF and judge ----------------------
+  ; This read goes to physical DRAM. If the flush worked it holds the
+  ; pattern; if the flush was a no-op it still holds the poison.
+  fails      = 0
+  poisonSeen = 0
+  firstBad   = -1
+  For i = 0 To #TESTWORDS - 1
+    got  = PeekI(#TESTBUF + (i * 8))
+    want = #PATTERN_BASE + i
+    If got <> want
+      fails = fails + 1
+      If firstBad < 0
+        firstBad = i
+      EndIf
+      If got = #POISON_BASE + i
+        poisonSeen = poisonSeen + 1
+      EndIf
+    EndIf
+  Next
+
+  Say("read-back with the MMU OFF (want $00000000C0FFEE0n):")
+  Row("  word 0              ", PeekI(#TESTBUF))
+  Row("  word 1              ", PeekI(#TESTBUF + 8))
+  Row("  word 15             ", PeekI(#TESTBUF + 15 * 8))
+  UartWriteStr("mismatched words      ")
+  PrintDec(fails)
+  UartWriteStr(" of ")
+  PrintDec(#TESTWORDS)
+  UartWriteNl()
+  UartWriteNl()
+
+  If fails = 0
+    Say("FLUSH PROVEN: PASS. The cached pattern reached physical DRAM.")
+    Say("MmuFlushDCacheAll() cleaned the dirty lines by set/way. This is")
+    Say("the result that unblocks caches in the resident monitor.")
+  ElseIf poisonSeen = fails
+    Say("FLUSH FAILED: read POISON. The pattern never reached DRAM - the")
+    Say("flush did nothing to these lines. Check the CLIDR/CCSIDR bounds")
+    Say("above; a wrong LoC or set/way walk is the first suspect.")
+  Else
+    Say("FLUSH FAILED: read unexpected value (not pattern, not poison).")
+    Say("A malformed set/way operand walked the wrong range. Report all.")
+  EndIf
+
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

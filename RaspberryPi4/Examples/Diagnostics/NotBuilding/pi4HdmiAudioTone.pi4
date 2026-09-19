@@ -1,0 +1,631 @@
+; pi4HdmiAudioTone.pi4 - the smallest thing that could prove sound.
+;
+; DIAGNOSTIC. Does not ship. THIS ONE WRITES REGISTERS AND MAKES A NOISE.
+;
+; A fixed tone, a known number of samples, played once. Not a wav
+; player, not a mixer, no streaming and no double buffering. The whole
+; program is one measurement and five short bursts of square wave, and
+; the verdict is a person saying whether they heard anything.
+;
+; Run pi4HdmiAudioProbe.pi4 FIRST. It reads and writes nothing, and if
+; it says the link is not ready this program cannot work and will say so
+; and stop.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HdmiAudioTone.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o tone.img
+;
+; ----------------------------------------------------------------------
+;  BE HONEST ABOUT WHAT THIS PROVES. IT IS NOT THE USUAL EVIDENCE.
+; ----------------------------------------------------------------------
+;  Every other bring-up in this project was settled by reading bytes
+;  back on the CPU. A SPEAKER CANNOT BE READ BACK. So this program is
+;  explicit about which of its claims are machine-checked and which are
+;  not, and it prints them in that order:
+;
+;    MACHINE-CHECKED, and it happens first:
+;      * the registers were configured and read back
+;      * THE FIFO DRAINS AT THE RATE IT SHOULD - see below. This is the
+;        real result of this program and it needs no ears.
+;      * the underflow and overflow latches in MAI_CTL, after the fact
+;      * FRAME_COUNT advanced while audio was playing, so the blanking
+;        intervals the samples ride in were really going by
+;
+;    NOT MACHINE-CHECKED, and nothing here can make it so:
+;      * that anything came out of the speaker. IT WAS REPORTED
+;        HEARING A TONE, OR DOES NOT. That is the final step and it is a
+;        human one.
+;
+;  A STATUS BIT MUST NOT BE ALLOWED TO STAND IN FOR THE LAST ONE. At the
+;  V3D stage on this same board every register reported success while
+;  the output page was still poison. "MAI_CTL says ENABLE and there was
+;  no underrun" is not a sound.
+;
+; ----------------------------------------------------------------------
+;  WHY THE DRAIN MEASUREMENT COMES BEFORE THE TONE
+; ----------------------------------------------------------------------
+;  The 108 MHz MAI clock is not a firmware clock and cannot be asked
+;  about down the mailbox - see the long note in pi4HdmiAudioProbe.pi4.
+;  The only thing readable there is a gate bit, and on this platform a
+;  gate or power bit means "some client has claimed this", not "the
+;  hardware is running": GET_CLOCK_STATE once said off for a clock
+;  GET_CLOCK_MEASURED reported at 250000496 Hz.
+;
+;  The measurement that does exist is downstream. Feed the FIFO as fast
+;  as it will take words and time a known count against CNTPCT_EL0:
+;
+;    predicted rate = 108000000 / MAI_SMP_N * channels
+;                   = 108000000 / 2250 * 2   = 96000 words per second
+;
+;  One word is one IEC 60958 subframe is one channel's sample
+;  (vc4_hdmi.c:2168 - the DAI accepts only
+;  SNDRV_PCM_FMTBIT_IEC958_SUBFRAME_LE), so stereo takes two words per
+;  frame. THAT ONE NUMBER SETTLES FOUR THINGS AT ONCE: the 108 MHz clock
+;  is really oscillating, MAI_SMP holds the divider we think it does,
+;  the CPU may feed MAI_DATA at all, and a word is a subframe rather
+;  than a packed stereo pair. None of the four needed a status bit to be
+;  believed, and none of the four needed a speaker.
+;
+;  HOW TO READ THE NUMBER:
+;    near 96000  everything above holds. This is the good answer.
+;    near 48000  the first three hold; the fourth does not, and one word
+;                is a whole stereo frame. Segment 4 below is the one to
+;                listen to.
+;    steady but far from either - the MAI is running at a rate nobody
+;                programmed. Suspect MAI_SMP first, the 108 MHz fixed
+;                clock second, and do not touch the audio data.
+;    zero, or the first write fails with EFIFOFULL - nothing is draining
+;                the FIFO. Either the MAI is not running or the CPU may
+;                not write MAI_DATA. STOP: no change to the waveform can
+;                fix this and every minute spent on samples is wasted.
+;
+; ----------------------------------------------------------------------
+;  WHY THERE ARE FIVE SEGMENTS AND NOT ONE TONE
+; ----------------------------------------------------------------------
+;  What a MAI_DATA word must CONTAIN is settled - an IEC 60958 subframe.
+;  The BIT NUMBERING inside that subframe is not, because the standard
+;  is not on this machine and is not free to fetch, and neither is what
+;  MAI_CONFIG's BIT_REVERSE and FORMAT_REVERSE (vc4_regs.h:522-523) do
+;  to the bits on the way out. HdmiAudioStart() sets both because
+;  vc4_hdmi_audio_prepare() sets both, and no source here says what
+;  either one reverses.
+;
+;  Guessing once and hearing silence teaches nothing - it cannot tell a
+;  wrong layout from a dead path. So the same tone is played five times,
+;  each through a different candidate encoding, announced over the UART
+;  before it starts and separated by a gap of digital silence. THE
+;  VERDICT IS WHICH SEGMENT MADE A NOISE, which is something a person
+;  can report without instruments. Silence in all five, with the drain
+;  measuring 96000, is also a result: it means the samples are leaving
+;  the FIFO and not reaching the wire, and the next place to look is the
+;  audio packet slot and AUDIO_PACKET_CONFIG's channel mask, not the
+;  samples.
+;
+;  A rejected alternative was to play one segment per run and rebuild
+;  between them. Five runs, five power cycles, five chances to change
+;  something else by accident, and whoever is listening holds four previous
+;  results in their head. One run with announced segments is the same
+;  experiment with the confounds removed.
+;
+;  NOISE RATHER THAN A CLEAN TONE IS STILL A PASS. It means samples
+;  reached the sink and only the layout is wrong, which is enormously
+;  more progress than silence.
+;
+; ----------------------------------------------------------------------
+;  WHAT THE TONE IS
+; ----------------------------------------------------------------------
+;  1 kHz square wave, one eighth of full scale, 48 kHz stereo, the same
+;  sample in both channels.
+;
+;  SQUARE AND NOT SINE, deliberately. A sine needs a table, and a table
+;  is one more thing that can be wrong in a program whose entire job is
+;  to distinguish "wrong" from "dead". A square wave is two constants
+;  and a counter, it is the loudest thing per unit amplitude, and it
+;  survives severe mangling and is still audible - which is exactly the
+;  property wanted when the encoding is under test.
+;
+;  1 kHz and not 440 Hz: 48000 divides by 1000 exactly, so the half
+;  period is 24 samples with no remainder and no accumulating phase
+;  error over the whole burst. 440 Hz would have needed a fractional
+;  divider, and a drifting one would have been indistinguishable from a
+;  clock problem.
+;
+;  ONE EIGHTH OF FULL SCALE and not full scale: a full-scale square wave
+;  through an unknown encoding into a monitor's speakers at whatever
+;  volume it happens to be set to is how equipment and ears get hurt. A
+;  quiet tone that is audible is enough to answer the question.
+
+XIncludeFile "RaspberryPi4/Lib/hdmiaudio.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; The tone. All four numbers are here so that changing one does not
+; require reading the loop.
+#TONE_RATE      = 48000
+#TONE_CHANNELS  = 2
+#TONE_HALFCYCLE = 24            ; 48000 / 1000 / 2 - a 1 kHz square
+#TONE_AMPLITUDE = $100000       ; 1/8 of a 24-bit full scale ($800000)
+
+; Half a second of stereo at 48 kHz, in WORDS. One word per channel per
+; sample, so 48000 * 2 / 2.
+#TONE_WORDS  = 48000
+; A quarter second of digital silence between segments, same units.
+#GAP_WORDS   = 24000
+; The drain measurement's sample size. Half a second at the predicted
+; rate - long enough that the initial FIFO fill is a rounding error,
+; short enough that nobody is waiting.
+#DRAIN_WORDS = 48000
+
+#SEGMENTS = 5
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. PeekB names the SIGNED .b and sign-extends, so
+    ; a byte above 127 would come back negative and this loop would
+    ; never see its terminator.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The architectural counter, read here rather than borrowed.
+;
+;  Under a private Tone* prefix and NOT taken from timer.pi4, because
+;  house rule 10 says the main file lists the libraries it uses and this
+;  one uses exactly one. Pulling in timer.pi4 for two instructions would
+;  add a whole library to the build to save four lines.
+; ----------------------------------------------------------------------
+Procedure.i ToneTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i ToneHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE FIVE CANDIDATE ENCODINGS.
+;
+;  Each takes a 24-bit signed sample and returns the 32-bit word to
+;  store. They are ordered most-likely-first, so a listener who hears
+;  segment 1 can stop paying attention.
+; ----------------------------------------------------------------------
+
+; 1. The canonical IEC 60958 subframe, built by the library: sample at
+;    bits 4..27, V/U/C clear, even parity at bit 31. This is what
+;    vc4_hdmi.c:2168 says the hardware is fed.
+Procedure.i EncSubframe(s.i)
+  ProcedureReturn HdmiAudioSubframe(s, 0)
+EndProcedure
+
+; 2. The same subframe with all 32 bits reversed. The obvious reading of
+;    MAI_CONFIG's BIT_REVERSE is that the hardware reverses the bits on
+;    the way out, in which case handing it a pre-reversed word cancels
+;    the transform and the wire sees a correct subframe.
+;
+;    Done with a shift loop and not the RBIT instruction. RBIT would be
+;    one cycle, but this runs 96000 times a second on a 600 MHz part at
+;    worst - thirty-two shifts is under a microsecond and the deadline
+;    is ten - and a plain loop cannot be got wrong the way a hand-written
+;    inline instruction with the wrong register can.
+Procedure.i EncBitReversed(s.i)
+  Define v.i
+  Define r.i
+  Define i.i
+  v = HdmiAudioSubframe(s, 0)
+  r = 0
+  i = 0
+  While i < 32
+    r = (r << 1) | ((v >> i) & 1)
+    i = i + 1
+  Wend
+  ProcedureReturn r & $FFFFFFFF
+EndProcedure
+
+; 3. The subframe with its bytes swapped. If FORMAT_REVERSE turns out to
+;    be an endianness swap rather than a bit one, this is the word that
+;    arrives correct.
+Procedure.i EncByteSwapped(s.i)
+  Define v.i
+  v = HdmiAudioSubframe(s, 0)
+  ProcedureReturn (((v & $FF) << 24) | ((v & $FF00) << 8) | ((v >> 8) & $FF00) | ((v >> 24) & $FF)) & $FFFFFFFF
+EndProcedure
+
+; 4. NO IEC FRAMING AT ALL: a packed 16-bit stereo pair, the same sample
+;    in both halves. This is the hypothesis the drain measurement tests
+;    directly - if one word is a whole frame rather than one subframe,
+;    the measured rate is 48000 rather than 96000 and this is the
+;    encoding to listen for. It is included even when the rate says
+;    96000 because a rate is about how many words are consumed and this
+;    is about what is in them, and those can be wrong independently.
+Procedure.i EncPacked16(s.i)
+  Define h.i
+  h = (s >> 8) & $FFFF
+  ProcedureReturn ((h << 16) | h) & $FFFFFFFF
+EndProcedure
+
+; 5. A bare 24-bit sample left-justified in the word, no framing bits at
+;    all. The last resort: it is what the register would want if the
+;    IEC reading is wrong in some way none of the above covers, and it
+;    is cheap to include.
+Procedure.i EncRaw24(s.i)
+  ProcedureReturn ((s & $FFFFFF) << 8) & $FFFFFFFF
+EndProcedure
+
+Procedure.i Encode(which.i, s.i)
+  If which = 1 : ProcedureReturn EncSubframe(s) : EndIf
+  If which = 2 : ProcedureReturn EncBitReversed(s) : EndIf
+  If which = 3 : ProcedureReturn EncByteSwapped(s) : EndIf
+  If which = 4 : ProcedureReturn EncPacked16(s) : EndIf
+  ProcedureReturn EncRaw24(s)
+EndProcedure
+
+; Written as a plain chain of Ifs rather than as early returns: a bare
+; ProcedureReturn with no value cannot be followed by a statement
+; separator on the same line, and spreading five early returns over
+; twenty lines to work around that is worse than five tests.
+Procedure PutEncName(which.i)
+  If which = 1
+    PutS("IEC 60958 subframe, as the driver's format says")
+  EndIf
+  If which = 2
+    PutS("the same subframe, all 32 bits reversed")
+  EndIf
+  If which = 3
+    PutS("the same subframe, bytes swapped")
+  EndIf
+  If which = 4
+    PutS("no framing - a packed 16-bit stereo pair")
+  EndIf
+  If which = 5
+    PutS("no framing - a bare 24-bit sample, left justified")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE MEASUREMENT. Push words of digital silence and time them.
+;
+;  Silence and not tone, because this runs before anybody is asked to
+;  listen and a half second of square wave nobody was warned about is
+;  rude. It measures the same thing either way - the FIFO does not care
+;  what is in the words.
+;
+;  Returns words per second, or 0 if it could not be measured.
+; ----------------------------------------------------------------------
+Procedure.i MeasureDrain(words.i)
+  Define t0.i
+  Define t1.i
+  Define hz.i
+  Define i.i
+  Define quiet.i
+
+  hz = ToneHz()
+  If hz = 0
+    PutS("  CNTFRQ_EL0 reads zero - there is no clock to measure against.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  quiet = HdmiAudioSubframe(0, 0)
+
+  ; PRIME THE FIFO FIRST, AND DO NOT COUNT IT. The first few dozen
+  ; writes go into an empty FIFO at memory speed and would make the
+  ; measured rate look enormous if they were inside the timed window.
+  ; Writing until FULL puts the loop in the steady state the timing is
+  ; supposed to describe.
+  i = 0
+  While HdmiAudioSpace() <> 0
+    If HdmiAudioWriteWord(quiet) = 0
+      PutS("  the priming write failed: ") : PutS(HdmiAudioErrorText()) : PutNl()
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+    ; A FIFO that never fills is a FIFO that is draining infinitely
+    ; fast, which means it is not a FIFO. Bound it rather than hang.
+    If i > 4096
+      PutS("  the FIFO never reported FULL after 4096 words.") : PutNl()
+      PutS("  Either FULL is not where we think it is, or nothing is") : PutNl()
+      PutS("  being buffered at all.") : PutNl()
+      Break
+    EndIf
+  Wend
+
+  t0 = ToneTicks()
+  i = 0
+  While i < words
+    If HdmiAudioWriteWord(quiet) = 0
+      PutS("  write ") : PutDec(i) : PutS(" failed: ")
+      PutS(HdmiAudioErrorText()) : PutNl()
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  t1 = ToneTicks()
+
+  If t1 = t0
+    PutS("  the whole burst took zero ticks - nothing is throttling us,") : PutNl()
+    PutS("  which means the FIFO is not draining, it is discarding.") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; words * hz / elapsed, with the multiply first so the division does
+  ; not round the answer to nothing. words is 48000 and hz is 54000000,
+  ; so the product is about 2.6e12 - comfortable in 64 bits.
+  ProcedureReturn (words * hz) / (t1 - t0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One segment: a known number of words of 1 kHz square wave through one
+;  candidate encoding, then a gap of silence.
+;
+;  Returns 1 if every write was accepted.
+; ----------------------------------------------------------------------
+Procedure.i PlaySegment(which.i)
+  Define i.i
+  Define phase.i
+  Define sample.i
+  Define w.i
+  Define ch.i
+  Define quiet.i
+
+  phase = 0
+  sample = #TONE_AMPLITUDE
+  i = 0
+  While i < #TONE_WORDS
+    ; One sample, then the same sample again for the second channel.
+    ; CHANNEL ORDER IS NOT KNOWN AND DOES NOT MATTER HERE: both
+    ; channels carry identical data precisely so that a swapped pair
+    ; cannot be mistaken for a failure.
+    w = Encode(which, sample)
+    ch = 0
+    While ch < #TONE_CHANNELS
+      If HdmiAudioWriteWord(w) = 0
+        PutNl()
+        PutS("  write failed at word ") : PutDec(i) : PutS(": ")
+        PutS(HdmiAudioErrorText()) : PutNl()
+        ProcedureReturn 0
+      EndIf
+      ch = ch + 1
+    Wend
+    i = i + #TONE_CHANNELS
+
+    phase = phase + 1
+    If phase >= #TONE_HALFCYCLE
+      phase = 0
+      sample = 0 - sample
+    EndIf
+  Wend
+
+  ; The gap. Digital silence, not a stopped stream: stopping and
+  ; restarting the MAI between segments would re-run all of
+  ; HdmiAudioStart()'s register writes and make each segment a
+  ; different experiment.
+  quiet = HdmiAudioSubframe(0, 0)
+  i = 0
+  While i < #GAP_WORDS
+    If HdmiAudioWriteWord(quiet) = 0
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define st.i
+  Define rate.i
+  Define which.i
+  Define f0.i
+  Define f1.i
+  Define ok.i
+
+  PutNl()
+  PutS("=== pi4HdmiAudioTone - THIS ONE MAKES A NOISE ===") : PutNl()
+  PutNl()
+
+  st = HdmiAudioSelfTest()
+  If st <> 0
+    PutS("HdmiAudioSelfTest() FAILED at check ") : PutDec(st) : PutNl()
+    ProcedureReturn 100 + st
+  EndIf
+
+  ; Port 0 first, then port 1 if nothing is plugged into 0. Which
+  ; socket is which is not established anywhere - see
+  ; pi4HdmiAudioProbe.pi4 - so this program finds out rather than
+  ; assuming.
+  If HdmiAudioInit(0) = 0
+    PutS("init(0) failed: ") : PutS(HdmiAudioErrorText()) : PutNl()
+    ProcedureReturn 1
+  EndIf
+  HdmiAudioProbe()
+  If HdmiAudioHotplug() = 0
+    PutS("port 0 reports nothing plugged in - trying port 1.") : PutNl()
+    If HdmiAudioInit(1) = 0
+      PutS("init(1) failed: ") : PutS(HdmiAudioErrorText()) : PutNl()
+      ProcedureReturn 2
+    EndIf
+    HdmiAudioProbe()
+  EndIf
+  PutS("using port ") : PutDec(HdmiAudioPort()) : PutNl()
+
+  If HdmiAudioLinkReady() = 0
+    PutS("THE LINK IS NOT READY: ") : PutS(HdmiAudioErrorText()) : PutNl()
+    PutS("Audio rides in the blanking intervals of a running picture.") : PutNl()
+    PutS("Run pi4HdmiAudioProbe.pi4 and read the four preconditions.") : PutNl()
+    ProcedureReturn 3
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  Configure. This is the first write of the program.
+  ; ------------------------------------------------------------------
+  If HdmiAudioStart(#TONE_RATE, #TONE_CHANNELS) = 0
+    PutS("HdmiAudioStart failed: ") : PutS(HdmiAudioErrorText()) : PutNl()
+    ProcedureReturn 4
+  EndIf
+  PutS("started: ") : PutDec(#TONE_RATE) : PutS(" Hz, ")
+  PutDec(#TONE_CHANNELS) : PutS(" channels, N = ")
+  PutDec(HdmiAudioProgrammedN()) : PutNl()
+  PutS("  MAI_SMP divider N = ") : PutDec(HdmiAudioSmpN())
+  PutS(", M = ") : PutDec(HdmiAudioSmpM()) : PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE MEASUREMENT. The real result of this program.
+  ; ------------------------------------------------------------------
+  PutS("--- MEASURED: how fast does the FIFO drain? ---") : PutNl()
+  f0 = HdmiAudioFrameCount()
+  rate = MeasureDrain(#DRAIN_WORDS)
+  f1 = HdmiAudioFrameCount()
+
+  PutS("  measured  ") : PutDec(rate) : PutS(" words per second") : PutNl()
+  PutS("  predicted 96000  (108000000 / 2250 * 2 channels)") : PutNl()
+  PutS("  frames elapsed during the burst: ")
+  PutDec((f1 - f0) & $FFFFFFFF) : PutNl()
+
+  If rate = 0
+    PutS("  VERDICT: NOTHING IS DRAINING THE FIFO.") : PutNl()
+    PutS("  Either the MAI is not running or the CPU may not write") : PutNl()
+    PutS("  MAI_DATA. Do not go on to the tone - stop and find out") : PutNl()
+    PutS("  which, because no sample value can fix either one.") : PutNl()
+    HdmiAudioStop()
+    ProcedureReturn 5
+  EndIf
+
+  ; Deliberately loose bands. The exact number will not be 96000 - the
+  ; priming fill, the counter's granularity and the polling loop all
+  ; move it by a fraction of a percent - and a gate that demanded
+  ; equality would be a gate that always failed.
+  If rate > 90000 And rate < 102000
+    PutS("  VERDICT: 96000. The 108 MHz clock is real, MAI_SMP holds") : PutNl()
+    PutS("  the divider we think it does, the CPU may feed MAI_DATA,") : PutNl()
+    PutS("  and one word is one IEC 60958 subframe. Four inferences") : PutNl()
+    PutS("  settled without believing a single status bit.") : PutNl()
+  EndIf
+  If rate > 45000 And rate < 51000
+    PutS("  VERDICT: 48000, not 96000. The clock and the divider are") : PutNl()
+    PutS("  right and the CPU may feed the FIFO, but ONE WORD IS A") : PutNl()
+    PutS("  WHOLE STEREO FRAME - the subframe reading is wrong.") : PutNl()
+    PutS("  Segment 4 below is the one to listen for.") : PutNl()
+  EndIf
+  If rate >= 102000
+    PutS("  VERDICT: FASTER THAN PREDICTED. The MAI is running at a") : PutNl()
+    PutS("  rate nobody programmed, or words are being discarded") : PutNl()
+    PutS("  rather than played. Suspect MAI_SMP first.") : PutNl()
+  EndIf
+  If rate <= 45000
+    PutS("  VERDICT: SLOWER THAN PREDICTED. Suspect the 108 MHz fixed") : PutNl()
+    PutS("  clock assumption, then MAI_SMP. Do not touch the samples.") : PutNl()
+  EndIf
+  If rate >= 51000 And rate <= 90000
+    PutS("  VERDICT: BETWEEN THE TWO PREDICTIONS AND NEAR NEITHER.") : PutNl()
+    PutS("  That is the least informative answer and the most likely") : PutNl()
+    PutS("  to mean the polling loop, not the hardware, set the pace.") : PutNl()
+  EndIf
+
+  PutS("  underrun latch after the burst: ") : PutDec(HdmiAudioUnderran()) : PutNl()
+  PutS("  overrun latch after the burst:  ") : PutDec(HdmiAudioOverran()) : PutNl()
+  HdmiAudioClearErrors()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE TONE. Five segments, announced.
+  ; ------------------------------------------------------------------
+  PutS("--- NOW LISTEN. Five bursts of 1 kHz, half a second each, ---") : PutNl()
+  PutS("--- a quarter second of silence between them.             ---") : PutNl()
+  PutS("--- Report WHICH ONES you heard, or that you heard none.  ---") : PutNl()
+  PutNl()
+
+  which = 1
+  While which <= #SEGMENTS
+    PutS("  segment ") : PutDec(which) : PutS(": ")
+    PutEncName(which) : PutNl()
+    ok = PlaySegment(which)
+    If ok = 0
+      PutS("  segment ") : PutDec(which) : PutS(" did not finish.") : PutNl()
+    EndIf
+    If HdmiAudioUnderran() <> 0
+      PutS("    (underran - the CPU could not keep up)") : PutNl()
+    EndIf
+    If HdmiAudioOverran() <> 0
+      PutS("    (overran)") : PutNl()
+    EndIf
+    HdmiAudioClearErrors()
+    which = which + 1
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  Down, leaving the picture exactly as it was found.
+  ; ------------------------------------------------------------------
+  HdmiAudioStop()
+  PutNl()
+  PutS("=== stopped. The picture should be untouched. ===") : PutNl()
+  PutNl()
+  PutS("WHAT THIS RUN PROVED BY ITSELF: the registers took their") : PutNl()
+  PutS("values, the FIFO drained at a measured rate, the error") : PutNl()
+  PutS("latches stayed clear and FRAME_COUNT advanced throughout.") : PutNl()
+  PutS("WHAT IT CANNOT PROVE: that a sound came out. Only you can") : PutNl()
+  PutS("say that, and a status bit must not be allowed to stand in") : PutNl()
+  PutS("for you saying it.") : PutNl()
+  ProcedureReturn 0
+EndProcedure

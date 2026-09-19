@@ -1,0 +1,20 @@
+@CHAPTER TrueType character mapping
+@INTRO T2 maps Unicode scalar values to glyph IDs through checked cmap format 4 and format 12 subtables, and decodes strict UTF-8 into caller-owned storage.
+
+@SECTION Mapping contract
+
+Open T0 and T1 first, then call `AnvilTrueTypeCmapOpen()`. `AnvilTrueTypeGlyphForCodepoint(codepoint)` accepts a Unicode scalar value and returns a glyph ID. Zero is the not-found glyph; invalid scalars are reported through `AnvilTrueTypeCmapError()` and `AnvilTrueTypeCmapErrorOffset()`. UTF-16 surrogate values and values above U+10FFFF are refused.
+
+The reader checks the cmap directory and the selected format 4 and format 12 subtable bounds before it reads mapping data. Format 4 handles BMP mappings; format 12 supports supplementary-plane groups. The decoder checks segment/group ordering, range-offset bounds, glyph limits and UTF-8 continuation bytes. It rejects overlong encodings, surrogates and out-of-range sequences.
+
+`AnvilTrueTypeDecodeUtf8(text, byteCount, glyphOut, capacity)` returns the number of glyph IDs written. Empty input is valid and returns zero. Invalid input or insufficient capacity returns -1. A first pass validates the whole byte sequence and checks capacity, so an undersized output array is not partially filled.
+
+@SECTION Emitted proof
+
+The emitted gate builds format 4 and format 12 subtables and checks BMP and supplementary mappings, missing and invalid scalars, valid empty text, a multibyte UTF-8 sequence, overlong and surrogate encodings, and output-capacity atomicity. It also corrupts the format 4 reserved pad and range offsets, and format 12 group ordering; each malformed table is refused. A source mutant weakens the capacity check and must fail the gate.
+
+The emitted reader was also compared with the independent `fontTools` best-cmap mapping for five scalar values each in Abel and Acme. These are host reference checks against the actual font tables; they do not claim shaping, bidi, variation selectors or text layout.
+
+@SECTION Format references
+
+The [OpenType `cmap` specification](https://learn.microsoft.com/en-us/typography/opentype/spec/cmap) defines encoding records, format 4 segments and format 12 groups. UTF-8 validity follows Unicode scalar-value encoding; this reader decodes only and does not normalize or shape text.

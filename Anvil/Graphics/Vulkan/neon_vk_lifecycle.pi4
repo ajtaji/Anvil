@@ -1,0 +1,98 @@
+; Renderer-neutral Neon lifecycle binder for the resident Vulkan chrome.
+; Include after neon.pi4 and the concrete NeonVkChrome provider. This file
+; owns only selection/configuration and callback translation; Vulkan resource
+; ownership remains in neon_vk_chrome.pi4.
+
+Structure NeonVkLifecycleConfig
+  physicalDevice.i
+  device.i
+  queue.i
+  commandPool.i
+  renderPass.i
+  framebuffer.i
+  width.i
+  height.i
+  maxQuads.i
+EndStructure
+
+Declare.i NeonVkChromeCreate(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxQuads.i)
+Declare.i NeonVkChromeBegin(*clearValue)
+Declare.i NeonVkChromeEnd()
+Declare NeonVkChromeDestroy()
+
+Global nvlConfigured.i
+Global nvlPhysical.i
+Global nvlDevice.i
+Global nvlQueue.i
+Global nvlCommandPool.i
+Global nvlRenderPass.i
+Global nvlFramebuffer.i
+Global nvlWidth.i
+Global nvlHeight.i
+Global nvlMaxQuads.i
+Global Dim nvlClear.l[4]
+
+Procedure.i nvlInit()
+  Protected r.i
+  If nvlConfigured = 0 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
+  r = NeonVkChromeCreate(nvlPhysical, nvlDevice, nvlQueue, nvlCommandPool, nvlRenderPass, nvlFramebuffer, nvlWidth, nvlHeight, nvlMaxQuads)
+  If r <> 0
+    ; Create may have allocated a partial resource family before refusing.
+    ; Destroy is the binder's rollback and never claims native V3D/MMU.
+    NeonVkChromeDestroy()
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvlBegin(colour.i)
+  nvlClear[0] = neon_F32Byte(Neon_R(colour))
+  nvlClear[1] = neon_F32Byte(Neon_G(colour))
+  nvlClear[2] = neon_F32Byte(Neon_B(colour))
+  nvlClear[3] = neon_F32Byte(Neon_A(colour))
+  If NeonVkChromeBegin(@nvlClear[0]) <> 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvlEnd()
+  If NeonVkChromeEnd() <> 0 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvlShutdown()
+  NeonVkChromeDestroy()
+  nvlConfigured = 0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; Configuration is complete before lifecycle selection. No partial config is
+; published if validation or callback installation refuses.
+Procedure.i NeonVkLifecycleConfigure(*cfg.NeonVkLifecycleConfig)
+  Protected r.i
+  If *cfg = 0 Or nvlConfigured <> 0 Or Neon_Ready() <> 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  If *cfg\physicalDevice = 0 Or *cfg\device = 0 Or *cfg\queue = 0 Or *cfg\commandPool = 0 Or *cfg\renderPass = 0 Or *cfg\framebuffer = 0
+    ProcedureReturn #NEON_ERR_ARGS
+  EndIf
+  If *cfg\width < 1 Or *cfg\height < 1 Or *cfg\maxQuads < 1
+    ProcedureReturn #NEON_ERR_ARGS
+  EndIf
+  nvlPhysical = *cfg\physicalDevice : nvlDevice = *cfg\device : nvlQueue = *cfg\queue
+  nvlCommandPool = *cfg\commandPool : nvlRenderPass = *cfg\renderPass : nvlFramebuffer = *cfg\framebuffer
+  nvlWidth = *cfg\width : nvlHeight = *cfg\height : nvlMaxQuads = *cfg\maxQuads
+  r = NeonLifecycleInstall(@nvlInit, @nvlBegin, @nvlEnd, @nvlShutdown)
+  If r <> #NEON_OK
+    nvlPhysical = 0 : nvlDevice = 0 : nvlQueue = 0 : nvlCommandPool = 0
+    nvlRenderPass = 0 : nvlFramebuffer = 0 : nvlWidth = 0 : nvlHeight = 0 : nvlMaxQuads = 0
+    ProcedureReturn r
+  EndIf
+  nvlConfigured = 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkLifecycleConfigured()
+  ProcedureReturn nvlConfigured
+EndProcedure

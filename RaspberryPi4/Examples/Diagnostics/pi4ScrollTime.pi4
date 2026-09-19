@@ -1,0 +1,496 @@
+; pi4ScrollTime.pi4 - HOW LONG DOES THE MONITOR'S CONSOLE SCROLL TAKE?
+;
+; DIAGNOSTIC. Does not ship. Runs as a PAYLOAD at $400000 under Anvil,
+; so the monitor itself is never at risk while the number is being
+; found.
+;
+; ======================================================================
+;  WHY THIS EXISTS
+; ======================================================================
+; The report was "there is no acceleration in the Anvil console's
+; scrolling". That is a statement about SPEED, and the first thing owed
+; to it is a number, not a mechanism. Everything here measures; nothing
+; here changes the monitor.
+;
+; The monitor's console is 1920 x 1080 x 32bpp with a 120-pixel banner
+; band at the top, so the console rectangle is 240 x 60 cells of an
+; 8 x 16 font. Scrolling it by the default chunk of eight text rows
+; moves 52 * 16 * 7680 = 6,389,760 bytes and then fills 8 * 16 * 7680 =
+; 983,040 more. This file reproduces that geometry EXACTLY - same
+; DisplayConsole rectangle, same DisplayAutoFlush(1), same MMU-off
+; environment - and times it.
+;
+; THE ONE DIFFERENCE FROM THE MONITOR, AND IT IS DELIBERATE: this
+; program is built with #DSP_DMA_LINKED = 1 and the monitor is built
+; with 0. That is not a distortion of the baseline, because
+; DisplayUseDma(0) makes the linked build take the identical CPU path -
+; DspDmaReady() returns 0 on dsp_dmaOn and every accelerated primitive
+; falls back to the same DspCopyUp and DspFillCell the monitor compiles.
+; Linking the seam is the only way to get BOTH numbers out of ONE image
+; on ONE boot, which is worth far more than two runs that cannot be
+; compared.
+;
+; ======================================================================
+;  WHAT IT MEASURES, AND WHY EACH ONE IS HERE
+; ======================================================================
+;   1  the console scroll as the monitor does it today   - the baseline
+;   2  the same with the auto-flush off                  - how much of
+;      the baseline is cache maintenance rather than copying
+;   3  the same with chunk 1 instead of 8                - what jump
+;      scroll is already buying
+;   4  the same through the DMA engine                   - the candidate
+;   5  the pieces on their own: the 6.39 MB copy by CPU, the same copy
+;      by the engine, the vacated-row fill both ways, and the flush
+;   6  a full-surface CPU clear                          - the number
+;      dma.pi4's header quotes (356.9 ms, MMU off), so the harness can
+;      be checked against a known result rather than trusted
+;   7  one SET_VIRTUAL_OFFSET mailbox round trip         - the floor
+;      cost of a hardware pan, which is the "move no pixels at all"
+;      candidate and cannot be judged without it
+;
+; ======================================================================
+;  THE WATCHDOG
+; ======================================================================
+; The runner arms Anvil's deadman for fifteen seconds and the CPU
+; measurements alone are several of those. safety.pi4 is in the build
+; ONLY so this file can re-arm between blocks: the monitor's watchdog
+; state lives in the monitor's globals, not in this image, so
+; SafetyWatchdogPet() here would find safety_wdog_on = 0 and do nothing.
+; SafetyWatchdogStart(15) is the pet, and it is correct rather than a
+; trick - it writes the same two PM registers the monitor wrote.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+; #DSP_DMA_LINKED = 1, so dma.pi4 comes BEFORE display.pi4 - definition
+; order is the convention in this dialect and display.pi4 names
+; DmaCopy, DmaCopy2D, DmaFillPattern32, DmaCacheRange and DmaSetBounds.
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+; The DMA scratch block: one 32-byte control block, room for a chained
+; one, and the 256-byte fill pattern. $700000 is what pi4DmaProbe.pi4
+; uses, it is 256-byte aligned, and it is inside the low gigabyte the
+; thirty-bit engines can reach.
+#ST_SCRATCH = $700000
+#ST_SCRATCH_BYTES = 512
+
+; The monitor's banner height. anvil.pi4's #BANNER_H, and the console
+; starts immediately below it.
+#ST_BANNER = 120
+
+Global stFail.i
+
+; ----------------------------------------------------------------------
+;  Printing. Microseconds are the unit that comes out of the counter;
+;  milliseconds with one decimal are the unit the report is written in,
+;  so both are printed and neither has to be worked out by hand.
+; ----------------------------------------------------------------------
+Procedure PutS(*s)
+  UartWriteStr(*s)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutMs(us.i)
+  PrintDec(us / 1000)
+  UartWriteStr(".")
+  PrintDec((us % 1000) / 100)
+  UartWriteStr(" ms")
+EndProcedure
+
+; name, total microseconds, how many operations went into it
+Procedure Report(*name, us.i, n.i)
+  Define per.i
+  If n < 1
+    n = 1
+  EndIf
+  per = us / n
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PutMs(per)
+  UartWriteStr("   (")
+  PrintDec(per)
+  UartWriteStr(" us each, ")
+  PrintDec(n)
+  UartWriteStr(" ops, ")
+  PrintDec(us)
+  UartWriteStr(" us total)")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; MB/s from bytes and microseconds, printed as a whole number. Bytes per
+; microsecond IS megabytes per second to within the 1024/1000 the whole
+; industry argues about, and this is a speed comparison rather than an
+; accountancy exercise.
+Procedure ReportRate(*name, us.i, bytes.i, n.i)
+  Define per.i
+  If n < 1
+    n = 1
+  EndIf
+  per = us / n
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PutMs(per)
+  UartWriteStr("   ")
+  If per > 0
+    PrintDec(bytes / per)
+    UartWriteStr(" MB/s")
+  Else
+    UartWriteStr("too fast to time")
+  EndIf
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; The pet. See THE WATCHDOG in the header for why this is Start and not
+; Pet.
+Procedure Pet()
+  SafetyWatchdogStart(15)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrollBlock - n scrolls of `chunk` rows, timed together.
+;
+;  TIMED TOGETHER AND NOT ONE BY ONE on purpose: a per-scroll Micros()
+;  pair would put a counter read inside the thing being measured, and at
+;  hundreds of milliseconds per scroll the read is noise either way - so
+;  the loop is the honest shape and the division is done once.
+;
+;  THE CONSOLE IS RE-FILLED FIRST. A scroll of an empty console still
+;  moves the same bytes, but the picture would be uniform and a wrong
+;  answer would be invisible; the fill puts something on the glass that
+;  a human can watch move.
+; ----------------------------------------------------------------------
+Procedure.i ScrollBlock(chunk.i, n.i)
+  Define i.i
+  Define t0.i
+
+  t0 = Micros()
+  i = 0
+  While i < n
+    DisplayScroll(chunk)
+    i = i + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Paint - something to look at, so a scroll that moves nothing is
+;  visible as such on the monitor rather than only in the numbers.
+; ----------------------------------------------------------------------
+Procedure Paint()
+  Define r.i
+  Define ch.i
+  DisplayLocate(0, 0)
+  r = 0
+  While r < DisplayRows()
+    DisplayLocate(0, r)
+    ch = 48 + (r % 10)
+    DisplayPrint("scroll timing row ")
+    DisplayPrintDec(r)
+    DisplayPrint("  ")
+    DisplayPutC(ch)
+    r = r + 1
+  Wend
+EndProcedure
+
+Procedure.i Main()
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define chgt.i
+  Define rows.i
+  Define keepBytes.i
+  Define fillRows.i
+  Define dstA.i
+  Define srcA.i
+  Define t0.i
+  Define us.i
+  Define i.i
+  Define rc.i
+
+  PrintNl()
+  PutS("=== pi4ScrollTime - what does one console scroll actually cost? ===")
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running - nothing here can be timed")
+    ProcedureReturn 1
+  EndIf
+  If MailboxInit() = 0
+    PutS("!! mailbox")
+    ProcedureReturn 2
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("!! display tags")
+    ProcedureReturn 3
+  EndIf
+  If DisplayInit(1920, 1080, 32) <> 1
+    UartWriteStr("!! DisplayInit rc ")
+    PrintDec(DisplayLastError())
+    PrintNl()
+    ProcedureReturn 4
+  EndIf
+
+  w     = DisplayWidth()
+  h     = DisplayHeight()
+  pitch = DisplayPitch()
+  chgt  = DisplayCharHeight()
+
+  UartWriteStr("  surface ")
+  PrintDec(w)
+  UartWriteStr("x")
+  PrintDec(h)
+  UartWriteStr("  pitch ")
+  PrintDec(pitch)
+  UartWriteStr("  base ")
+  PrintDec(DisplayBase())
+  UartWriteStr("  size ")
+  PrintDec(DisplaySize())
+  PrintNl()
+  UartDrain()
+
+  ; The monitor's console, exactly: below the banner, full width.
+  DisplayColour(DisplayRGB(226, 232, 240), DisplayRGB(0, 0, 40))
+  DisplayConsole(0, #ST_BANNER, w, h - #ST_BANNER)
+  DisplayAutoFlush(1)
+  rows = DisplayRows()
+
+  UartWriteStr("  console ")
+  PrintDec(DisplayCols())
+  UartWriteStr(" x ")
+  PrintDec(rows)
+  UartWriteStr(" cells, cell height ")
+  PrintDec(chgt)
+  UartWriteStr(", default chunk ")
+  PrintDec(DisplayScrollChunkGet())
+  PrintNl()
+  UartDrain()
+
+  ; The two block sizes the default chunk implies, computed here rather
+  ; than quoted, so the report cannot drift from the geometry.
+  keepBytes = (rows - 8) * chgt * pitch
+  fillRows  = 8 * chgt
+  dstA = DisplayBase() + (#ST_BANNER * pitch)
+  srcA = dstA + (8 * chgt * pitch)
+
+  UartWriteStr("  a chunk-8 scroll moves ")
+  PrintDec(keepBytes)
+  UartWriteStr(" bytes and fills ")
+  PrintDec(fillRows * pitch)
+  PrintNl()
+  UartDrain()
+
+  ; --- the engine, brought up but NOT yet used ------------------------
+  ; DisplayUseDma stays 0 until section 4. Everything before it is the
+  ; monitor's own path.
+  If DmaSetScratch(#ST_SCRATCH, #ST_SCRATCH_BYTES) = 0
+    PutS("!! DmaSetScratch refused - the DMA sections will be skipped")
+    stFail = 1
+  ElseIf DisplayDmaBind() = 0
+    PutS("!! DisplayDmaBind refused - the DMA sections will be skipped")
+    stFail = 1
+  ElseIf DmaInit() = 0
+    UartWriteStr("!! DmaInit refused: ")
+    UartWriteStr(DmaErrorText())
+    PrintNl()
+    stFail = 1
+  EndIf
+  DisplayUseDma(0)
+  Pet()
+
+  Paint()
+
+  ; ==================================================================
+  ;  1  THE BASELINE - what the monitor does today
+  ; ==================================================================
+  PutS("")
+  PutS("1. AS THE MONITOR SCROLLS TODAY (CPU, auto-flush on)")
+  us = ScrollBlock(8, 3)
+  Report("chunk 8, the default   ", us, 3)
+  ReportRate("        as a copy rate ", us, keepBytes, 3)
+  Pet()
+
+  ; ==================================================================
+  ;  2  HOW MUCH OF THAT IS CACHE MAINTENANCE
+  ; ==================================================================
+  ; DisplayScroll's auto-flush cleans the WHOLE console block after a
+  ; CPU scroll - rows * chgt * pitch, which is more than the block it
+  ; just copied. With the MMU off there is nothing cacheable to clean,
+  ; so this should be small; if it is not, the maintenance loop itself
+  ; is the cost and that is worth knowing before anything is accelerated.
+  PutS("")
+  PutS("2. THE SAME WITH THE AUTO-FLUSH OFF (isolates the cache walk)")
+  DisplayAutoFlush(0)
+  us = ScrollBlock(8, 3)
+  Report("chunk 8, no flush      ", us, 3)
+  DisplayAutoFlush(1)
+  Pet()
+
+  ; ==================================================================
+  ;  3  WHAT JUMP SCROLL IS ALREADY BUYING
+  ; ==================================================================
+  ; Chunk 1 is one text row per scroll and it is what a line-at-a-time
+  ; console costs. It moves MORE bytes per scroll than chunk 8 does
+  ; (59 rows kept against 52) and advances one eighth as far, so the
+  ; per-printed-line figure is the one that matters and it is the
+  ; product of the two.
+  PutS("")
+  PutS("3. CHUNK 1 - one text row per scroll, the un-chunked cost")
+  us = ScrollBlock(1, 3)
+  Report("chunk 1                ", us, 3)
+  Pet()
+
+  ; ==================================================================
+  ;  4  THROUGH THE ENGINE
+  ; ==================================================================
+  PutS("")
+  If stFail = 1
+    PutS("4. SKIPPED - the engine did not come up")
+  Else
+    PutS("4. THE SAME SCROLL THROUGH THE DMA ENGINE")
+    DisplayUseDma(1)
+    DisplayDmaStatsReset()
+    us = ScrollBlock(8, 3)
+    Report("chunk 8, engine        ", us, 3)
+    ReportRate("        as a copy rate ", us, keepBytes, 3)
+    us = ScrollBlock(1, 3)
+    Report("chunk 1, engine        ", us, 3)
+    UartWriteStr("  engine ops ")
+    PrintDec(DisplayDmaOps())
+    UartWriteStr("  fell back ")
+    PrintDec(DisplayDmaFallbacks())
+    UartWriteStr("  refused ")
+    PrintDec(DisplayDmaRefusals())
+    PrintNl()
+    UartDrain()
+    DisplayUseDma(0)
+  EndIf
+  Pet()
+
+  ; ==================================================================
+  ;  5  THE PIECES ON THEIR OWN
+  ; ==================================================================
+  PutS("")
+  PutS("5. THE PIECES, TIMED SEPARATELY")
+
+  t0 = Micros()
+  DspCopyUp(dstA, srcA, keepBytes)
+  us = Micros() - t0
+  ReportRate("CPU copy of the block  ", us, keepBytes, 1)
+  Pet()
+
+  t0 = Micros()
+  DspFillCell(0, #ST_BANNER + ((rows - 8) * chgt), w, fillRows, DisplayRGB(0, 0, 40))
+  us = Micros() - t0
+  ReportRate("CPU fill of the gap    ", us, fillRows * pitch, 1)
+  Pet()
+
+  t0 = Micros()
+  DspFlushSpan(dstA, rows * chgt * pitch)
+  us = Micros() - t0
+  ReportRate("the auto-flush walk    ", us, rows * chgt * pitch, 1)
+  Pet()
+
+  If stFail = 0
+    DmaCacheRange(dstA, (srcA - dstA) + keepBytes)
+    t0 = Micros()
+    rc = DmaCopy(dstA, srcA, keepBytes)
+    us = Micros() - t0
+    If rc = 0
+      UartWriteStr("  engine copy REFUSED: ")
+      UartWriteStr(DmaErrorText())
+      PrintNl()
+      UartDrain()
+    Else
+      ReportRate("engine copy of the block", us, keepBytes, 1)
+    EndIf
+    Pet()
+
+    t0 = Micros()
+    rc = DmaFill32(DisplayBase() + ((#ST_BANNER + ((rows - 8) * chgt)) * pitch), pitch, w, fillRows, DisplayRGB(0, 0, 40))
+    us = Micros() - t0
+    If rc = 0
+      UartWriteStr("  engine fill REFUSED: ")
+      UartWriteStr(DmaErrorText())
+      PrintNl()
+      UartDrain()
+    Else
+      ReportRate("engine fill of the gap  ", us, fillRows * pitch, 1)
+    EndIf
+    Pet()
+  EndIf
+
+  ; ==================================================================
+  ;  6  THE HARNESS CHECK
+  ; ==================================================================
+  ; dma.pi4's header quotes 356.9 ms for a full-surface CPU clear with
+  ; the MMU off. If this comes back near that, the timing here can be
+  ; believed; if it does not, everything above is suspect and the first
+  ; thing to doubt is this file rather than the silicon.
+  PutS("")
+  PutS("6. HARNESS CHECK - full-surface CPU clear, expected about 357 ms")
+  DisplayAutoFlush(0)
+  t0 = Micros()
+  DisplayClear(DisplayRGB(0, 0, 40))
+  us = Micros() - t0
+  ReportRate("full CPU clear         ", us, w * h * 4, 1)
+  DisplayAutoFlush(1)
+  Pet()
+
+  ; ==================================================================
+  ;  7  WHAT A HARDWARE PAN WOULD COST PER SCROLL
+  ; ==================================================================
+  ; SET_VIRTUAL_OFFSET, tag $00048009, is the "move no pixels at all"
+  ; candidate: a console that scrolls by telling the display controller
+  ; to start reading one text row lower copies nothing. The whole
+  ; question is what one of those mailbox round trips costs, because
+  ; that becomes the per-scroll price.
+  ;
+  ; THE OFFSET SENT IS (0,0) AND THE PICTURE MUST NOT MOVE. The virtual
+  ; surface is the same size as the physical one in this build, so a
+  ; non-zero offset has nowhere to go and the firmware would clamp it;
+  ; sending zero measures the transport, which is the number wanted,
+  ; and leaves the screen alone.
+  PutS("")
+  PutS("7. ONE SET_VIRTUAL_OFFSET ROUND TRIP - the floor cost of a pan")
+  t0 = Micros()
+  i = 0
+  rc = 1
+  While i < 8
+    If MailboxBegin(#MBX_TAG_FB_SETOFFSET, 8, 8) = 0
+      rc = 0
+      i = 8
+    Else
+      MailboxSetWord(0, 0)
+      MailboxSetWord(1, 0)
+      If MailboxSend() = 0
+        rc = 0
+        i = 8
+      Else
+        i = i + 1
+      EndIf
+    EndIf
+  Wend
+  us = Micros() - t0
+  If rc = 0
+    UartWriteStr("  the offset tag was refused, mailbox error ")
+    PrintDec(MailboxError())
+    PrintNl()
+    UartDrain()
+  Else
+    Report("SET_VIRTUAL_OFFSET(0,0)", us, 8)
+  EndIf
+  Pet()
+
+  PutS("")
+  PutS("=== done ===")
+  SafetyWatchdogStop()
+  ProcedureReturn 0
+EndProcedure

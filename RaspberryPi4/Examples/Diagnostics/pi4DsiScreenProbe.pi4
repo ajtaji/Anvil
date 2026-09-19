@@ -1,0 +1,873 @@
+; ======================================================================
+; pi4DsiScreenProbe.pi4 - the executable gate for the display seam's
+; arithmetic, RaspberryPi4/Board/screen_geom.pi4.
+; ----------------------------------------------------------------------
+; screen_geom.pi4 decides four things and every one of them is wrong in
+; a way nobody at a desk can see:
+;
+;   WHICH SCREEN the board comes up on with nothing typed
+;   WHICH WAY UP the console sits on the panel with nothing typed
+;   HOW BIG the type is IN INCHES on the glass, and therefore how many
+;     columns and lines - the same either way the console is turned
+;   WHERE a pixel drawn at (x, y) ends up on a panel that is turned
+;   WHICH BYTES of the scanned buffer a repaint touched
+;
+; A wrong boot choice is a dark panel and a console on an HDMI socket
+; nobody is looking at. A wrong default rotation is a console standing
+; on its side on a panel bolted down the other way, which builds, boots
+; and reports itself perfectly happy. A wrong font rule is a console
+; that wraps every line of this monitor's own text - or, as happened on
+; 2026-09-08, one whose letters change physical size when the picture is
+; turned, on a piece of glass that did not change size. A rotation off
+; by one is a picture one pixel to the left. A run address off by one is
+; a cache clean that misses the byte the transpose just wrote, on a
+; board where the caches are usually off so it is invisible until the
+; day they are on.
+;
+; NONE OF THOSE FAIL LOUDLY, so all four are checked here, by number,
+; against a reference that is written a different way from the code
+; under test - the corner map ScrMapX/ScrMapY is one pixel and no
+; addresses, and the transpose is a loop over runs. The gate is that the
+; two agree on EVERY pixel of a whole surface, not on a sample.
+;
+;   on the bench     receive / run, and read the tally on the UART
+;   with no board    tools/a64/a64_dsiscreen_check.py, which builds THIS
+;                    file and executes it on the project's A64 oracle
+;
+; screen_geom.pi4 opens no port and touches no register, so the oracle
+; run is a real proof of the shipped arithmetic rather than a model of
+; it - and the gate hard-stops on any MMIO access outside the PL011 the
+; tally is printed through, which is what keeps that claim honest.
+;
+; THE BUILD LINE:
+;   pmfc RaspberryPi4/Examples/Diagnostics/pi4DsiScreenProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o dsiscreen.img
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
+
+
+; ======================================================================
+;  THE TALLY - every check prints its own line whether it passed or
+;  failed. A silent pass cannot be told from a check that never ran.
+; ======================================================================
+
+Global tPass.i = 0
+Global tFail.i = 0
+Global tNum.i = 0
+
+; No character literals - house rule. 32 is a space, 46 the full stop.
+Procedure THead(*name)
+  tNum = tNum + 1
+  If tNum < 10
+    UartWrite(32)
+  EndIf
+  If tNum < 100
+    UartWrite(32)
+  EndIf
+  PrintDec(tNum)
+  UartWrite(46)
+  UartWrite(32)
+  UartWriteStr(*name)
+EndProcedure
+
+Procedure TOk()
+  UartWriteStr("  PASS")
+  PrintNl()
+  tPass = tPass + 1
+EndProcedure
+
+Procedure TBad(got.i, want.i)
+  UartWriteStr("  ** FAIL **  got ")
+  PrintDec(got)
+  UartWriteStr(", wanted ")
+  PrintDec(want)
+  PrintNl()
+  tFail = tFail + 1
+EndProcedure
+
+Procedure TEq(*name, got.i, want.i)
+  THead(*name)
+  If got = want
+    TOk()
+  Else
+    TBad(got, want)
+  EndIf
+EndProcedure
+
+
+; ======================================================================
+;  THE TWO SURFACES THE TRANSPOSE IS CHECKED OVER.
+;
+;  SMALL ON PURPOSE, AND THE SIZE IS NOT A SHORTCUT. The transpose has
+;  no size-dependent behaviour - no tiling, no alignment case, no
+;  special first or last row - so a 16 x 24 panel exercises exactly the
+;  same four expressions a 800 x 1280 one does, and it exercises them
+;  over EVERY pixel rather than a sample of one screen in a gate that
+;  would then take a minute to run on the oracle. The real geometry IS
+;  checked, at full size, for the arithmetic that does not need pixels:
+;  the run addresses and the derived console geometry.
+;
+;  The dimensions are deliberately unequal and not powers of each other,
+;  so a transpose that confused width with height cannot pass by
+;  coincidence.
+; ======================================================================
+#PW = 16          ; the modelled panel, portrait like the real one
+#PH = 24
+#PIX = #PW * #PH
+
+Global Dim gDraw.l[#PIX]
+Global Dim gScan.l[#PIX]
+
+; A value that is unique per logical pixel AND is never zero, so "was
+; this written?" and "was this written with the right thing?" are the
+; same question. Zero is what an untouched buffer holds.
+Procedure.i CellOf(x.i, y.i)
+  ProcedureReturn (y * 1000) + x + 1
+EndProcedure
+
+Procedure FillDraw(lw.i, lh.i)
+  Define x.i
+  Define y.i
+  y = 0
+  While y < lh
+    x = 0
+    While x < lw
+      gDraw[y * lw + x] = CellOf(x, y)
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+Procedure ClearScan()
+  Define i.i
+  i = 0
+  While i < #PIX
+    gScan[i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CheckTransposed - EVERY pixel of the band, against the corner map.
+;
+;  Returns the number of pixels that disagree. The reference is
+;  ScrMapX/ScrMapY, which is one pixel and no addresses and is written a
+;  different way from the loop being checked - two implementations of a
+;  rotation agreeing on a million pixels is evidence; one implementation
+;  agreeing with itself is not.
+; ----------------------------------------------------------------------
+Procedure.i CheckTransposed(deg.i, lw.i, y0.i, y1.i)
+  Define x.i
+  Define y.i
+  Define sx.i
+  Define sy.i
+  Define bad.i
+
+  bad = 0
+  y = y0
+  While y <= y1
+    x = 0
+    While x < lw
+      sx = ScrMapX(deg, x, y, #PW, #PH)
+      sy = ScrMapY(deg, x, y, #PW, #PH)
+      If gScan[sy * #PW + sx] <> CellOf(x, y)
+        bad = bad + 1
+      EndIf
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+  ProcedureReturn bad
+EndProcedure
+
+; CountNonZero - how much of the scanned buffer was written at all. A
+; band transpose that wrote the right pixels AND some others would pass
+; CheckTransposed and be a bug; this is the other half of the claim.
+Procedure.i CountNonZero()
+  Define i.i
+  Define n.i
+  n = 0
+  i = 0
+  While i < #PIX
+    If gScan[i] <> 0
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RunsInsideRows - the run every scanned row gets must lie WHOLLY
+;  inside that row. Returns the number of rows where it does not.
+;
+;  This is the check that a cache clean cannot walk off the end of a row
+;  into the next one, or start before the buffer. It is done at the REAL
+;  panel size, because that is the arithmetic that ships and it needs no
+;  pixels to check.
+; ----------------------------------------------------------------------
+Procedure.i RunsInsideRows(deg.i, panelW.i, panelH.i, lh.i, y0.i, y1.i)
+  Define sy.i
+  Define a.i
+  Define rowLo.i
+  Define rowHi.i
+  Define bad.i
+  Define run.i
+
+  run = ScrRunBytes(y0, y1)
+  bad = 0
+  sy = 0
+  While sy < panelH
+    a = ScrRunAddr(deg, 0, panelW, lh, y0, y1, sy)
+    rowLo = sy * panelW * 4
+    rowHi = rowLo + panelW * 4
+    If a < rowLo Or (a + run) > rowHi
+      bad = bad + 1
+    EndIf
+    sy = sy + 1
+  Wend
+  ProcedureReturn bad
+EndProcedure
+
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+Procedure.i Main()
+  Define lw.i
+  Define lh.i
+
+  UartInit(115200)
+  PrintNl()
+  UartWriteStr("=== pi4DsiScreenProbe - the gate for the display seam's arithmetic ===")
+  PrintNl()
+  UartWriteStr("No display, no mailbox, no I2C, no registers. Integers and two buffers.")
+  PrintNl()
+  PrintNl()
+  UartDrain()
+
+  ; ------------------------------------------------------------------
+  ;  A. THE BOOT CHOICE - which screen, with nothing typed
+  ; ------------------------------------------------------------------
+  UartWriteStr("-- A. the boot choice")
+  PrintNl()
+
+  TEq("a panel on I2C wins over an HDMI display     ", ScrChoose(1, 1), #SCR_SRC_DSI)
+  TEq("a panel on I2C wins over two of them         ", ScrChoose(1, 2), #SCR_SRC_DSI)
+  TEq("a panel with no HDMI at all                  ", ScrChoose(1, 0), #SCR_SRC_DSI)
+  TEq("no panel, one HDMI display                   ", ScrChoose(0, 1), #SCR_SRC_HDMI)
+  TEq("no panel, two HDMI displays                  ", ScrChoose(0, 2), #SCR_SRC_HDMI)
+  TEq("no panel and no display is NONE, not a guess ", ScrChoose(0, 0), #SCR_SRC_NONE)
+  ; NOBODY LOOKED IS NOT YES. -1 is what ScrDsiPanelSeen returns before
+  ; the I2C probe has run, and reading it as a panel would bring the DSI
+  ; pipeline up on a board with nothing plugged into it.
+  TEq("nobody looked (-1) does NOT count as a panel ", ScrChoose(-1, 1), #SCR_SRC_HDMI)
+  TEq("nobody looked and no HDMI either is NONE     ", ScrChoose(-1, 0), #SCR_SRC_NONE)
+  ; A firmware that would not say how many displays it has answers -1,
+  ; and a negative count is not a display.
+  TEq("a firmware that would not say is not a screen", ScrChoose(0, -1), #SCR_SRC_NONE)
+
+  ; ------------------------------------------------------------------
+  ;  B. THE FONT SIZE, COMPUTED FROM HOW BIG THE GLASS IS
+  ;
+  ;  THE BUG THIS SECTION EXISTS TO KEEP DEAD: the rule here used to be
+  ;  floor(width / 640), which scaled the type with the console's PIXEL
+  ;  WIDTH - so turning the panel doubled the size of the letters on a
+  ;  piece of glass that had not changed size. Reported from the bench
+  ;  on 2026-09-08 as "everything scaled correctly portrait, too big
+  ;  landscape still", and portrait was never fixed: it was accidentally
+  ;  right, because 800 pixels happens to land on the scale this panel's
+  ;  density wants.
+  ;
+  ;  Every check below is against the SCREEN's diagonal in pixels and in
+  ;  tenths of an inch. The console's width appears once, as the
+  ;  eighty-column cap, and it can only ever make the type smaller.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- B. the font size, from the size of the glass")
+  PrintNl()
+
+  ; --- the integer square root the density rests on -----------------
+  ; It is Newton's method and it must give the FLOOR, from both sides of
+  ; an exact square. A sqrt that came back one too high would make every
+  ; screen read denser than it is and every glyph one step too big.
+  TEq("isqrt of 0 is 0, and does not divide by it   ", ScrISqrt(0), 0)
+  TEq("isqrt of a negative is 0, not a hang         ", ScrISqrt(-5), 0)
+  TEq("isqrt of 1 is 1                              ", ScrISqrt(1), 1)
+  TEq("isqrt of 2 is 1 - it floors                  ", ScrISqrt(2), 1)
+  TEq("isqrt of 1509 squared is exactly 1509        ", ScrISqrt(2277081), 1509)
+  TEq("...and one less is 1508, so it really floors ", ScrISqrt(2277080), 1508)
+  TEq("the panel's diagonal is 1509 pixels          ", ScrDiagPixels(800, 1280), 1509)
+  ; A DIAGONAL DOES NOT CARE WHICH WAY ROUND THE SCREEN IS, and that is
+  ; the property the whole fix rests on.
+  TEq("...and turning it round changes nothing      ", ScrDiagPixels(1280, 800), 1509)
+
+  ; --- the density --------------------------------------------------
+  ; $65 = 101 = 10.1 inches, read off the panel's own microcontroller on
+  ; this board on 2026-09-06. Cross-checked against the panel driver's
+  ; own 135 x 216 mm for this mode, which is 150.5 px/in.
+  TEq("the panel is 149 pixels to the inch          ", ScrPixelsPerInch(800, 1280, 101), 149)
+  TEq("...and still 149 with the panel turned round ", ScrPixelsPerInch(1280, 800, 101), 149)
+  TEq("a screen that cannot say its size is 0 px/in ", ScrPixelsPerInch(800, 1280, 0), 0)
+
+  ; --- THE ANSWER, AND IT IS THE SAME BOTH WAYS ---------------------
+  ; The first of these two is the one that was wrong. The old rule
+  ; answered 2 for a console 1280 across; the panel is the same panel.
+  TEq("landscape, 1280 across: scale 1              ", ScrScaleFor(800, 1280, 101, 1280), 1)
+  TEq("portrait, 800 across: scale 1 - THE SAME     ", ScrScaleFor(800, 1280, 101, 800), 1)
+  TEq("...and 0.107 inch to a line, landscape       ", ScrGlyphThou(ScrScaleFor(800, 1280, 101, 1280), ScrPixelsPerInch(800, 1280, 101)), 107)
+  TEq("...and 0.107 inch to a line, portrait TOO    ", ScrGlyphThou(ScrScaleFor(800, 1280, 101, 800), ScrPixelsPerInch(800, 1280, 101)), 107)
+
+  ; --- ROUNDED TO THE NEAREST, NOT FLOORED --------------------------
+  ; The boundary from BOTH sides, one tenth of an inch apart, on the
+  ; same 800 x 1280 mode. A 6.9 inch panel of this many pixels is dense
+  ; enough to want scale 2 and a 7.0 inch one is not; flooring instead
+  ; of rounding would answer 1 for both and be half a step small on
+  ; every screen there is.
+  TEq("6.9 inches of this mode rounds UP to scale 2 ", ScrScaleFor(800, 1280, 69, 1280), 2)
+  TEq("7.0 inches of the same mode stays at scale 1 ", ScrScaleFor(800, 1280, 70, 1280), 1)
+
+  ; --- THE EIGHTY-COLUMN CAP, WHICH IS ALL THE OLD RULE IS NOW ------
+  TEq("1280 across caps at scale 2                  ", ScrScaleCap(1280), 2)
+  TEq("640 across caps at scale 1, the exact boundar", ScrScaleCap(640), 1)
+  TEq("639 across caps at 1 too, never at zero      ", ScrScaleCap(639), 1)
+  TEq("1920 across caps at scale 3                  ", ScrScaleCap(1920), 3)
+  TEq("a zero width still caps at 1, not at 0       ", ScrScaleCap(0), 1)
+  ; A SMALL DENSE PANEL IS WHERE THE CAP ACTUALLY BITES. A four inch
+  ; 720 x 720 screen is 254 pixels to the inch and its density asks for
+  ; scale 2, which would be 45 columns - and this monitor's own text is
+  ; written to eighty, so the cap wins and the type comes out smaller
+  ; than ideal on purpose.
+  TEq("a 4 inch 720x720 panel wants scale 2         ", ScrScaleIdeal(720, 720, 40), 2)
+  TEq("...but 80 columns caps it back to 1          ", ScrScaleFor(720, 720, 40, 720), 1)
+
+  ; --- A SCREEN THAT CANNOT SAY HOW BIG IT IS -----------------------
+  ; Answering 1 rather than dividing by zero or inventing a density. The
+  ; caller is what knows whether the size was read or assumed and it is
+  ; the caller that says so out loud.
+  TEq("a zero diagonal never divides, it answers 1  ", ScrScaleFor(800, 1280, 0, 1280), 1)
+  TEq("a negative diagonal answers 1 as well        ", ScrScaleFor(800, 1280, -1, 1280), 1)
+  TEq("a size byte of 0 is not a panel size         ", ScrDiagUsable(0), 0)
+  TEq("a size byte of $FF is an undriven bus        ", ScrDiagUsable(255), 0)
+  TEq("under an inch is not a panel either          ", ScrDiagUsable(9), 0)
+  TEq("101 tenths - 10.1 inches - is usable         ", ScrDiagUsable(101), 1)
+
+  ; ------------------------------------------------------------------
+  ;  C. THE ROTATIONS THEMSELVES
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- C. which rotations exist")
+  PrintNl()
+
+  TEq("0 is a rotation                              ", ScrRotOk(0), 1)
+  TEq("90 is a rotation                             ", ScrRotOk(90), 1)
+  TEq("180 is a rotation                            ", ScrRotOk(180), 1)
+  TEq("270 is a rotation                            ", ScrRotOk(270), 1)
+  TEq("360 is NOT - it is not rounded down to 0     ", ScrRotOk(360), 0)
+  TEq("45 is not                                    ", ScrRotOk(45), 0)
+  TEq("-90 is not                                   ", ScrRotOk(-90), 0)
+  TEq("1 is not                                     ", ScrRotOk(1), 0)
+
+  TEq("0 is not sideways                            ", ScrSideways(0), 0)
+  TEq("90 is sideways                               ", ScrSideways(90), 1)
+  ; 180 IS THE ONE THAT LOOKS SIDEWAYS AND IS NOT. It is a turn, but the
+  ; console's width and height are unchanged and the scaler's mirror
+  ; bits do it during scan-out, so it must take the fast path. Getting
+  ; this wrong costs a 4 MB transpose per repaint for nothing.
+  TEq("180 is NOT sideways - the mirrors do it      ", ScrSideways(180), 0)
+  TEq("270 is sideways                              ", ScrSideways(270), 1)
+
+  ; ------------------------------------------------------------------
+  ;  D. THE CONSOLE'S GEOMETRY AT THE REAL PANEL SIZE
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- D. the console geometry, at 800 x 1280")
+  PrintNl()
+
+  TEq("native is 800 across                         ", ScrLogicalW(0, 800, 1280), 800)
+  TEq("native is 1280 down                          ", ScrLogicalH(0, 800, 1280), 1280)
+  TEq("180 is still 800 across                      ", ScrLogicalW(180, 800, 1280), 800)
+  TEq("180 is still 1280 down                       ", ScrLogicalH(180, 800, 1280), 1280)
+  TEq("90 is 1280 across                            ", ScrLogicalW(90, 800, 1280), 1280)
+  TEq("90 is 800 down                               ", ScrLogicalH(90, 800, 1280), 800)
+  TEq("270 is 1280 across                           ", ScrLogicalW(270, 800, 1280), 1280)
+  TEq("270 is 800 down                              ", ScrLogicalH(270, 800, 1280), 800)
+  ; THE NUMBERS THE OPERATOR IS TOLD, AND THE ONES ON THE GLASS. The
+  ; banner is 120 pixels deep and the console starts under it.
+  ;
+  ; THEY ARE NOT THE SAME AS THEY WERE. Landscape was 80 x 21 in 16 x 32
+  ; type; it is 160 x 42 in 8 x 16 type, which is the same physical size
+  ; of letter as the portrait console that was graded correct on the
+  ; bench. Portrait is unchanged at 100 x 72, because it was already
+  ; right - that is the whole shape of the fix in four lines.
+  TEq("native console is 100 columns                ", ScrColsFor(800, ScrScaleFor(800, 1280, 101, 800)), 100)
+  TEq("native console is 72 lines under the banner  ", ScrRowsFor(1280, 120, ScrScaleFor(800, 1280, 101, 800)), 72)
+  TEq("landscape console is 160 columns             ", ScrColsFor(1280, ScrScaleFor(800, 1280, 101, 1280)), 160)
+  TEq("landscape console is 42 lines under the banner", ScrRowsFor(800, 120, ScrScaleFor(800, 1280, 101, 1280)), 42)
+  ; THE ONE NUMBER THAT IS SUPPOSED TO BE EQUAL. Columns and rows differ
+  ; because the screen is not square. The height of a line of type must
+  ; not, and it is what doubled before.
+  TEq("both orientations draw 0.107 inch of type    ", ScrGlyphThou(ScrScaleFor(800, 1280, 101, 800), ScrPixelsPerInch(800, 1280, 101)) - ScrGlyphThou(ScrScaleFor(800, 1280, 101, 1280), ScrPixelsPerInch(800, 1280, 101)), 0)
+
+  ; ------------------------------------------------------------------
+  ;  E. THE CORNERS - where each corner of the console lands
+  ;
+  ;  A rotation is exactly as correct as its corners. An interior pixel
+  ;  agrees under any number of wrong maps; the four corners do not.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- E. the four corners, at 800 x 1280")
+  PrintNl()
+
+  ; 0: the identity, and it has to be checked so that a map which
+  ; "helpfully" flipped something at 0 cannot pass unnoticed.
+  TEq("0: top left x stays 0                        ", ScrMapX(0, 0, 0, 800, 1280), 0)
+  TEq("0: top left y stays 0                        ", ScrMapY(0, 0, 0, 800, 1280), 0)
+  TEq("0: bottom right x stays 799                  ", ScrMapX(0, 799, 1279, 800, 1280), 799)
+  TEq("0: bottom right y stays 1279                 ", ScrMapY(0, 799, 1279, 800, 1280), 1279)
+
+  ; 180: the identity TOO, because the mirror bits do the turn during
+  ; scan-out. This pair is the one a reader will think is wrong.
+  TEq("180: top left x stays 0 (the mirrors turn it)", ScrMapX(180, 0, 0, 800, 1280), 0)
+  TEq("180: bottom right y stays 1279               ", ScrMapY(180, 799, 1279, 800, 1280), 1279)
+
+  ; 90, clockwise. The console is 1280 x 800.
+  TEq("90: console top left goes to panel x 799     ", ScrMapX(90, 0, 0, 800, 1280), 799)
+  TEq("90: console top left goes to panel y 0       ", ScrMapY(90, 0, 0, 800, 1280), 0)
+  TEq("90: console top right goes to panel x 799    ", ScrMapX(90, 1279, 0, 800, 1280), 799)
+  TEq("90: console top right goes to panel y 1279   ", ScrMapY(90, 1279, 0, 800, 1280), 1279)
+  TEq("90: console bottom left goes to panel x 0    ", ScrMapX(90, 0, 799, 800, 1280), 0)
+  TEq("90: console bottom left goes to panel y 0    ", ScrMapY(90, 0, 799, 800, 1280), 0)
+  TEq("90: console bottom right goes to panel x 0   ", ScrMapX(90, 1279, 799, 800, 1280), 0)
+  TEq("90: console bottom right goes to panel y 1279", ScrMapY(90, 1279, 799, 800, 1280), 1279)
+
+  ; 270, the other way. Every corner is 90's opposite, which is the
+  ; property that makes them two rotations and not one with a sign.
+  TEq("270: console top left goes to panel x 0      ", ScrMapX(270, 0, 0, 800, 1280), 0)
+  TEq("270: console top left goes to panel y 1279   ", ScrMapY(270, 0, 0, 800, 1280), 1279)
+  TEq("270: console top right goes to panel x 0     ", ScrMapX(270, 1279, 0, 800, 1280), 0)
+  TEq("270: console top right goes to panel y 0     ", ScrMapY(270, 1279, 0, 800, 1280), 0)
+  TEq("270: console bottom left goes to panel x 799 ", ScrMapX(270, 0, 799, 800, 1280), 799)
+  TEq("270: console bottom left goes to panel y 1279", ScrMapY(270, 0, 799, 800, 1280), 1279)
+  TEq("270: console bottom right goes to panel x 799", ScrMapX(270, 1279, 799, 800, 1280), 799)
+  TEq("270: console bottom right goes to panel y 0  ", ScrMapY(270, 1279, 799, 800, 1280), 0)
+
+  ; ------------------------------------------------------------------
+  ;  F. THE TRANSPOSE, EVERY PIXEL, BOTH WAYS ROUND
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- F. the transpose itself, every pixel of a 16 x 24 panel")
+  PrintNl()
+
+  ; --- 90, the whole surface ----------------------------------------
+  lw = ScrLogicalW(90, #PW, #PH)
+  lh = ScrLogicalH(90, #PW, #PH)
+  TEq("90: the console is 24 across on a 16x24 panel", lw, 24)
+  TEq("90: and 16 down                              ", lh, 16)
+  ClearScan()
+  FillDraw(lw, lh)
+  ScrTranspose(90, @gDraw[0], @gScan[0], #PW, #PH, 0, lh - 1)
+  TEq("90: every pixel landed where the map says    ", CheckTransposed(90, lw, 0, lh - 1), 0)
+  TEq("90: and every pixel of the panel was written ", CountNonZero(), #PIX)
+
+  ; --- 270, the whole surface ---------------------------------------
+  ClearScan()
+  ScrTranspose(270, @gDraw[0], @gScan[0], #PW, #PH, 0, lh - 1)
+  TEq("270: every pixel landed where the map says   ", CheckTransposed(270, lw, 0, lh - 1), 0)
+  TEq("270: and every pixel of the panel was written", CountNonZero(), #PIX)
+
+  ; --- A BAND, WHICH IS THE CASE THAT ACTUALLY RUNS ----------------
+  ; The console repaints dirty rows, not screens, so the band is the
+  ; hot path and the whole-surface case above is the rare one. A band
+  ; that wrote the right pixels AND some others would pass the first
+  ; check and be a bug, so the count is asserted too: rows 3..6 of a 24
+  ; wide console is 4 * 24 = 96 pixels and not one more.
+  ClearScan()
+  ScrTranspose(90, @gDraw[0], @gScan[0], #PW, #PH, 3, 6)
+  TEq("90: a band of four rows lands correctly      ", CheckTransposed(90, lw, 3, 6), 0)
+  TEq("90: ...and wrote exactly 96 pixels, no others", CountNonZero(), 96)
+
+  ClearScan()
+  ScrTranspose(270, @gDraw[0], @gScan[0], #PW, #PH, 3, 6)
+  TEq("270: a band of four rows lands correctly     ", CheckTransposed(270, lw, 3, 6), 0)
+  TEq("270: ...and wrote exactly 96 pixels          ", CountNonZero(), 96)
+
+  ; --- ONE ROW, THE COMMONEST BAND OF ALL ---------------------------
+  ClearScan()
+  ScrTranspose(90, @gDraw[0], @gScan[0], #PW, #PH, 0, 0)
+  TEq("90: the first row alone is 24 pixels         ", CountNonZero(), 24)
+  TEq("90: ...and each is where the map says        ", CheckTransposed(90, lw, 0, 0), 0)
+  ClearScan()
+  ScrTranspose(90, @gDraw[0], @gScan[0], #PW, #PH, lh - 1, lh - 1)
+  TEq("90: the LAST row alone is 24 pixels          ", CountNonZero(), 24)
+  TEq("90: ...and each is where the map says        ", CheckTransposed(90, lw, lh - 1, lh - 1), 0)
+
+  ; --- 0 AND 180 MOVE NOTHING ---------------------------------------
+  ; They must not, because at those rotations the two buffers are the
+  ; same one and a transpose would be reading and writing the same
+  ; memory. A single written pixel here is a corrupted screen.
+  ClearScan()
+  ScrTranspose(0, @gDraw[0], @gScan[0], #PW, #PH, 0, #PH - 1)
+  TEq("0 moves no pixel at all                      ", CountNonZero(), 0)
+  ScrTranspose(180, @gDraw[0], @gScan[0], #PW, #PH, 0, #PH - 1)
+  TEq("180 moves no pixel at all either             ", CountNonZero(), 0)
+
+  ; --- A BAND OUTSIDE THE CONSOLE IS NOT A CRASH --------------------
+  ; The renderer clamps, but the transpose is handed rows by more than
+  ; one caller and an out-of-range band must be refused rather than
+  ; walked. An unclamped y1 here writes past the buffer.
+  ClearScan()
+  ScrTranspose(90, @gDraw[0], @gScan[0], #PW, #PH, lh, lh + 4)
+  TEq("a band wholly below the console writes nothin", CountNonZero(), 0)
+  ScrTranspose(90, @gDraw[0], @gScan[0], #PW, #PH, 5, 2)
+  TEq("a band whose end precedes its start does too ", CountNonZero(), 0)
+
+  ; ------------------------------------------------------------------
+  ;  G. THE RUN ADDRESSES, AT THE REAL PANEL SIZE
+  ;
+  ;  The transpose and the cache clean both take the run's address from
+  ;  ScrRunAddr, so this is the arithmetic that decides whether a clean
+  ;  covers exactly the bytes that were written. Checked at 800 x 1280,
+  ;  because that is the size that ships and it needs no pixels.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- G. the scanned-row runs, at 800 x 1280")
+  PrintNl()
+
+  TEq("one row is four bytes of run                 ", ScrRunBytes(7, 7), 4)
+  TEq("four rows are sixteen                        ", ScrRunBytes(3, 6), 16)
+
+  ; 90: the console is 1280 x 800, so lh is 800 and rows 0..0 sit at the
+  ; FAR END of each scanned row - column 799, byte offset 3196.
+  TEq("90: row 0's run starts at column 799         ", ScrRunAddr(90, 0, 800, 800, 0, 0, 0), 799 * 4)
+  TEq("90: and on scanned row 1, one row further on ", ScrRunAddr(90, 0, 800, 800, 0, 0, 1), 800 * 4 + 799 * 4)
+  TEq("90: the LAST console row sits at column 0    ", ScrRunAddr(90, 0, 800, 800, 799, 799, 0), 0)
+  ; 270: the same band sits at the near end instead. If these two were
+  ; the same expression, one of the two rotations would be wrong.
+  TEq("270: row 0's run starts at column 0          ", ScrRunAddr(270, 0, 800, 800, 0, 0, 0), 0)
+  TEq("270: the LAST console row sits at column 799 ", ScrRunAddr(270, 0, 800, 800, 799, 799, 0), 799 * 4)
+
+  ; EVERY RUN INSIDE ITS OWN ROW, for every scanned row of a real panel,
+  ; at both sideways rotations and for three different bands.
+  TEq("90: every run of a one-row band is in its row", RunsInsideRows(90, 800, 1280, 800, 0, 0), 0)
+  TEq("90: every run of a 32-row band is in its row ", RunsInsideRows(90, 800, 1280, 800, 100, 131), 0)
+  TEq("90: every run of the whole console is too    ", RunsInsideRows(90, 800, 1280, 800, 0, 799), 0)
+  TEq("270: every run of a one-row band is in its ro", RunsInsideRows(270, 800, 1280, 800, 0, 0), 0)
+  TEq("270: every run of a 32-row band is in its row", RunsInsideRows(270, 800, 1280, 800, 100, 131), 0)
+  TEq("270: every run of the whole console is too   ", RunsInsideRows(270, 800, 1280, 800, 0, 799), 0)
+
+  ; ------------------------------------------------------------------
+  ;  H. WHICH WAY UP IT COMES UP, WITH NOTHING TYPED.
+  ;
+  ;  THE RULING, 2026-09-08: the panel on this bench is used LANDSCAPE,
+  ;  because that is how it fits there. This section is that instruction
+  ;  as numbers.
+  ;
+  ;  IT IS WORTH ITS OWN SECTION FOR THE SAME REASON AS THE REST OF THIS
+  ;  FILE: the failure is silent. A default that quietly went back to 0
+  ;  builds, boots, lights the panel, prints a perfectly happy screen
+  ;  report and puts a console on its side on a bench nobody at a desk
+  ;  is looking at. There is no exception, no log line and no red gate
+  ;  anywhere else that would catch it.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- H. which way up it comes up")
+  PrintNl()
+
+  ; THE ONE THAT MATTERS. If this line ever reads 0 again, the console
+  ; is standing on its side on a panel that is bolted down the other
+  ; way, and the 2026-09-08 ruling says it must not.
+  TEq("the DSI panel defaults to LANDSCAPE (90)     ", ScrRotDefault(#SCR_SRC_DSI), 90)
+  TEq("...and landscape means sideways              ", ScrSideways(ScrRotDefault(#SCR_SRC_DSI)), 1)
+  TEq("...so the console is 1280 across             ", ScrLogicalW(ScrRotDefault(#SCR_SRC_DSI), 800, 1280), 1280)
+  TEq("...and 800 down                              ", ScrLogicalH(ScrRotDefault(#SCR_SRC_DSI), 800, 1280), 800)
+  TEq("...which is 160 columns of 8 x 16 type       ", ScrColsFor(ScrLogicalW(ScrRotDefault(#SCR_SRC_DSI), 800, 1280), ScrScaleFor(800, 1280, 101, ScrLogicalW(ScrRotDefault(#SCR_SRC_DSI), 800, 1280))), 160)
+
+  ; HDMI IS NOT THE SAME QUESTION. The firmware hands over a landscape
+  ; framebuffer already the right way up and this monitor does not turn
+  ; it; a default of 90 there would transpose a screen that needs no
+  ; transposing, into a buffer sized for the panel.
+  TEq("HDMI defaults to 0 - it is already landscape ", ScrRotDefault(#SCR_SRC_HDMI), 0)
+  TEq("no screen at all defaults to 0               ", ScrRotDefault(#SCR_SRC_NONE), 0)
+
+  ; THE RESOLUTION, WHICH IS THE THING THE BOOT PATH ACTUALLY CALLS.
+  ; An empty store, a store full of rubbish and a store naming a real
+  ; rotation are three different inputs and only the third is obeyed.
+  TEq("nothing stored gives the default             ", ScrRotPick(#SCR_SRC_DSI, #SCR_ROT_UNSET), 90)
+  TEq("a stored 270 is obeyed                       ", ScrRotPick(#SCR_SRC_DSI, 270), 270)
+  ; 270 IS THE CORRECTION, AND IT MUST WORK FROM THE STORE ALONE. If the
+  ; first picture on the glass is upside down, this is the whole fix -
+  ; one command, saved - and a rebuild would be the wrong answer.
+  TEq("...and 270 is still landscape                ", ScrSideways(ScrRotPick(#SCR_SRC_DSI, 270)), 1)
+  TEq("a stored 0 is obeyed - the bench may want it ", ScrRotPick(#SCR_SRC_DSI, 0), 0)
+  TEq("a stored 180 is obeyed                       ", ScrRotPick(#SCR_SRC_DSI, 180), 180)
+  ; A NUMBER NOBODY MEANT IS NOT ROUNDED TO THE NEAREST ONE THAT WORKS.
+  TEq("a stored 45 falls back to the default        ", ScrRotPick(#SCR_SRC_DSI, 45), 90)
+  TEq("a stored 360 falls back too, not to 0        ", ScrRotPick(#SCR_SRC_DSI, 360), 90)
+  TEq("a stored -1 is the same as nothing stored    ", ScrRotPick(#SCR_SRC_DSI, -1), 90)
+  ; HDMI IGNORES THE STORE ENTIRELY. `screen.rotate` is the panel's
+  ; setting; a console moved to HDMI must not inherit the panel's turn.
+  TEq("HDMI ignores a stored 90                     ", ScrRotPick(#SCR_SRC_HDMI, 90), 0)
+  TEq("HDMI ignores a stored 270                    ", ScrRotPick(#SCR_SRC_HDMI, 270), 0)
+  TEq("no screen ignores a stored 90                ", ScrRotPick(#SCR_SRC_NONE, 90), 0)
+  ; AND THE DEFAULT HAS TO BE A ROTATION THIS CAN DO, which is the check
+  ; that catches somebody typing 900 into ScrRotDefault.
+  TEq("the DSI default is one of the four           ", ScrRotOk(ScrRotDefault(#SCR_SRC_DSI)), 1)
+  TEq("the HDMI default is one of the four          ", ScrRotOk(ScrRotDefault(#SCR_SRC_HDMI)), 1)
+
+  ; ------------------------------------------------------------------
+  ;  I. HDMI, AND THE OVERRIDE
+  ;
+  ;  TWO CLAIMS THAT ARE EASY TO BREAK WITHOUT NOTICING.
+  ;
+  ;  The first is that AN HDMI MONITOR DOES NOT CHANGE. The font rule exists
+  ;  because the type was wrong on a 10.1 inch panel; a fix that also
+  ;  resized every HDMI console would be a second, unasked-for change
+  ;  riding along with the first, and nobody with a monitor plugged in
+  ;  would know why their console had moved. An HDMI console draws at
+  ;  magnification 1 today and it has to draw at magnification 1
+  ;  afterwards, at every ordinary desktop size.
+  ;
+  ;  The second is that A TYPED SCALE BEATS THE CALCULATION AND A
+  ;  RUBBISH ONE DOES NOT. `screen scale 3` is the escape hatch for a
+  ;  bench the general rule does not suit, and it is only worth having
+  ;  if it is obeyed exactly - while a stored 40, which nothing can
+  ;  draw, must fall back and stay visible as wrong rather than being
+  ;  quietly clamped to 8.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- I. HDMI, and the typed override")
+  PrintNl()
+
+  ; A 24 inch monitor is the stated assumption for a screen that cannot
+  ; say how big it is - the firmware's GET_PHYSICAL_WIDTH_HEIGHT is in
+  ; pixels and says nothing about glass. Every ordinary desktop mode on
+  ; a screen that size lands on magnification 1, which is what an HDMI
+  ; console draws at today.
+  TEq("the stated HDMI diagonal is 24.0 inches      ", #SCR_HDMI_DIAG_TENTHS, 240)
+  TEq("1920x1080 on a 24 inch monitor is scale 1    ", ScrScaleFor(1920, 1080, 240, 1920), 1)
+  TEq("...which is 91 pixels to the inch            ", ScrPixelsPerInch(1920, 1080, 240), 91)
+  TEq("1280x720 on a 24 inch monitor is scale 1     ", ScrScaleFor(1280, 720, 240, 1280), 1)
+  ; The size this board's own firmware actually hands back, overscan and
+  ; all - the mode an HDMI console on this Pi 4 is really drawn at.
+  TEq("this board's 1824x984 HDMI is scale 1 too    ", ScrScaleFor(1824, 984, 240, 1824), 1)
+  TEq("3840x2160 on a 24 inch monitor is still 1    ", ScrScaleFor(3840, 2160, 240, 3840), 1)
+  ; AND THE PANEL AND AN HDMI MONITOR MUST NOT COME OUT THE SAME BY
+  ; ACCIDENT. They are 149 and 91 pixels to the inch; a rule that had
+  ; stopped reading the density at all would answer 1 for both and pass
+  ; every line above.
+  TEq("the panel and a monitor are different sizes  ", ScrPixelsPerInch(800, 1280, 101) - ScrPixelsPerInch(1920, 1080, 240), 58)
+
+  ; --- the override -------------------------------------------------
+  TEq("1 is a magnification                         ", ScrScaleOk(1), 1)
+  TEq("8 is the largest one                         ", ScrScaleOk(#SCR_SCALE_MAX), 1)
+  TEq("9 is not                                     ", ScrScaleOk(#SCR_SCALE_MAX + 1), 0)
+  TEq("0 is not - it would be a zero-pixel cell     ", ScrScaleOk(0), 0)
+  TEq("a negative magnification is not              ", ScrScaleOk(-2), 0)
+  TEq("nothing stored gives the computed scale      ", ScrScalePick(#SCR_SCALE_UNSET, 1), 1)
+  TEq("a stored 3 is obeyed exactly                 ", ScrScalePick(3, 1), 3)
+  TEq("a stored 1 is obeyed over a computed 2       ", ScrScalePick(1, 2), 1)
+  ; NOT CLAMPED INTO RANGE. A stored 40 becomes the computed scale and
+  ; stays wrong where somebody can see it, exactly as a stored rotation
+  ; of 45 does - obeying half of what was typed is how a setting stops
+  ; meaning what it says.
+  TEq("a stored 40 falls back, it is not clamped to8", ScrScalePick(40, 2), 2)
+  TEq("a stored 0 falls back too                    ", ScrScalePick(0, 1), 1)
+
+  ; ------------------------------------------------------------------
+  ;  J. A FINGER, GOING THE OTHER WAY.
+  ;
+  ;  ScrTouchX / ScrTouchY are the rotation map run backwards: from a
+  ;  contact the touch controller reported, in ITS units, to the console
+  ;  pixel the finger is sitting on. They are here rather than in the
+  ;  touch driver because there is ONE rotation on this board, and a
+  ;  touch path with a second one would disagree with the picture the
+  ;  first time somebody typed `screen rotate`.
+  ;
+  ;  EVERY FAILURE MODE IS INVISIBLE FROM A DESK, exactly like the
+  ;  forward map's. A finger that lands in the wrong corner builds,
+  ;  boots and reports itself perfectly happy; the only instrument that
+  ;  would catch it is a hand on a panel in another room. So the four
+  ;  corners are checked at all four rotations, both ways round.
+  ;
+  ;  THE PANEL IS 800 ACROSS BY 1280 DOWN AND SO IS THE CONTROLLER on
+  ;  the board this ships on: the v2 overlay's 10_1_inch_a variant sets
+  ;  no touchscreen-size and no axis override at all, so the correction
+  ;  is ALIGNED and the two grids are the same shape. The scale is
+  ;  checked separately, with a surface that is deliberately not the
+  ;  controller's size.
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("-- J. a finger, mapped back through the same rotation")
+  PrintNl()
+
+  ; ---- rotation 0: the identity ------------------------------------
+  ; The console draws straight into the scanned buffer and nothing is
+  ; turned, so a contact is a pixel.
+  TEq("0: touch 0,0 is screen x 0                   ", ScrTouchX(0, 0, 0, 0, 800, 1280, 800, 1280), 0)
+  TEq("0: touch 0,0 is screen y 0                   ", ScrTouchY(0, 0, 0, 0, 800, 1280, 800, 1280), 0)
+  TEq("0: touch 799,0 is screen x 799               ", ScrTouchX(0, 0, 799, 0, 800, 1280, 800, 1280), 799)
+  TEq("0: touch 799,0 is screen y 0                 ", ScrTouchY(0, 0, 799, 0, 800, 1280, 800, 1280), 0)
+  TEq("0: touch 0,1279 is screen x 0                ", ScrTouchX(0, 0, 0, 1279, 800, 1280, 800, 1280), 0)
+  TEq("0: touch 0,1279 is screen y 1279             ", ScrTouchY(0, 0, 0, 1279, 800, 1280, 800, 1280), 1279)
+  TEq("0: touch 799,1279 is screen x 799            ", ScrTouchX(0, 0, 799, 1279, 800, 1280, 800, 1280), 799)
+  TEq("0: touch 799,1279 is screen y 1279           ", ScrTouchY(0, 0, 799, 1279, 800, 1280, 800, 1280), 1279)
+
+  ; ---- rotation 90: the one that ships -----------------------------
+  ; The console is 1280 across by 800 down. It was turned CLOCKWISE onto
+  ; the panel, so a finger goes back the other way: the console's x
+  ; comes from the panel's y, and its y from the panel's x counted from
+  ; the far end.
+  TEq("90: touch 0,0 is screen x 0                  ", ScrTouchX(90, 0, 0, 0, 800, 1280, 1280, 800), 0)
+  TEq("90: touch 0,0 is screen y 799                ", ScrTouchY(90, 0, 0, 0, 800, 1280, 1280, 800), 799)
+  TEq("90: touch 799,0 is screen x 0                ", ScrTouchX(90, 0, 799, 0, 800, 1280, 1280, 800), 0)
+  TEq("90: touch 799,0 is screen y 0                ", ScrTouchY(90, 0, 799, 0, 800, 1280, 1280, 800), 0)
+  TEq("90: touch 0,1279 is screen x 1279            ", ScrTouchX(90, 0, 0, 1279, 800, 1280, 1280, 800), 1279)
+  TEq("90: touch 0,1279 is screen y 799             ", ScrTouchY(90, 0, 0, 1279, 800, 1280, 1280, 800), 799)
+  TEq("90: touch 799,1279 is screen x 1279          ", ScrTouchX(90, 0, 799, 1279, 800, 1280, 1280, 800), 1279)
+  TEq("90: touch 799,1279 is screen y 0             ", ScrTouchY(90, 0, 799, 1279, 800, 1280, 1280, 800), 0)
+
+  ; ---- rotation 270: the correction --------------------------------
+  ; And the other way. If 90 and 270 gave the same answer, one of them
+  ; would be wrong and `screen rotate 270` would fix a picture while
+  ; breaking the touch on it.
+  TEq("270: touch 0,0 is screen x 1279              ", ScrTouchX(270, 0, 0, 0, 800, 1280, 1280, 800), 1279)
+  TEq("270: touch 0,0 is screen y 0                 ", ScrTouchY(270, 0, 0, 0, 800, 1280, 1280, 800), 0)
+  TEq("270: touch 799,0 is screen x 1279            ", ScrTouchX(270, 0, 799, 0, 800, 1280, 1280, 800), 1279)
+  TEq("270: touch 799,0 is screen y 799             ", ScrTouchY(270, 0, 799, 0, 800, 1280, 1280, 800), 799)
+  TEq("270: touch 0,1279 is screen x 0              ", ScrTouchX(270, 0, 0, 1279, 800, 1280, 1280, 800), 0)
+  TEq("270: touch 0,1279 is screen y 0              ", ScrTouchY(270, 0, 0, 1279, 800, 1280, 1280, 800), 0)
+  TEq("270: touch 799,1279 is screen x 0            ", ScrTouchX(270, 0, 799, 1279, 800, 1280, 1280, 800), 0)
+  TEq("270: touch 799,1279 is screen y 799          ", ScrTouchY(270, 0, 799, 1279, 800, 1280, 1280, 800), 799)
+
+  ; ---- rotation 180: THE ONE THAT IS NOT THE IDENTITY --------------
+  ; ScrMapX/ScrMapY are the identity at 180 - the console draws straight
+  ; into the scanned buffer and the SCALER's two mirror bits turn the
+  ; picture over as it scans. So the pixel map has nothing to do and the
+  ; TOUCH map has both axes to turn back, and this is the one case where
+  ; the two directions are not mirror images of each other. The pixel
+  ; map's 180 case copied into the touch map would give a picture that
+  ; is upside down and a finger that is not, which is the most confusing
+  ; single result this file can produce.
+  TEq("180: the PIXEL map is still the identity, x  ", ScrMapX(180, 123, 456, 800, 1280), 123)
+  TEq("180: the PIXEL map is still the identity, y  ", ScrMapY(180, 123, 456, 800, 1280), 456)
+  TEq("180: but touch 0,0 is screen x 799           ", ScrTouchX(180, 0, 0, 0, 800, 1280, 800, 1280), 799)
+  TEq("180: and touch 0,0 is screen y 1279          ", ScrTouchY(180, 0, 0, 0, 800, 1280, 800, 1280), 1279)
+  TEq("180: touch 799,1279 is screen x 0            ", ScrTouchX(180, 0, 799, 1279, 800, 1280, 800, 1280), 0)
+  TEq("180: touch 799,1279 is screen y 0            ", ScrTouchY(180, 0, 799, 1279, 800, 1280, 800, 1280), 0)
+
+  ; ---- the four rotations are four DIFFERENT maps -------------------
+  ; One point, four answers, no two the same. A file that had quietly
+  ; made two of them equal would pass every corner check above, because
+  ; a corner maps to a corner under all of them.
+  TEq("0 and 180 are different maps                 ", ScrTouchX(0, 0, 100, 200, 800, 1280, 800, 1280) - ScrTouchX(180, 0, 100, 200, 800, 1280, 800, 1280), 100 - 699)
+  TEq("90 and 270 are different maps                ", ScrTouchX(90, 0, 100, 200, 800, 1280, 1280, 800) - ScrTouchX(270, 0, 100, 200, 800, 1280, 1280, 800), 200 - 1079)
+
+  ; ---- THE AXIS CORRECTION -----------------------------------------
+  ; ALIGNED is the default and it is what the overlay says about this
+  ; panel. The other seven codes exist because the same overlay gives
+  ; three of its other panels an inversion or a swap, one line each.
+  TEq("the default correction is ALIGNED            ", ScrTouchFlipPick(#SCR_TOUCH_UNSET), #SCR_TOUCH_ALIGNED)
+  TEq("nothing stored means aligned                 ", ScrTouchFlipPick(-1), 0)
+  TEq("a stored 5 is obeyed                         ", ScrTouchFlipPick(5), 5)
+  TEq("a stored 8 falls back to aligned             ", ScrTouchFlipPick(8), 0)
+  TEq("a stored -3 falls back to aligned            ", ScrTouchFlipPick(-3), 0)
+  TEq("0 through 7 are the legal codes              ", ScrTouchFlipOk(7), 1)
+  TEq("...and 8 is not                              ", ScrTouchFlipOk(8), 0)
+
+  ; INVERT-X ALONE, at rotation 0, turns the panel's x round and leaves
+  ; y where it was.
+  TEq("invx: touch 0,0 is screen x 799              ", ScrTouchX(0, #SCR_TOUCH_INVX, 0, 0, 800, 1280, 800, 1280), 799)
+  TEq("invx: touch 0,0 is screen y 0                ", ScrTouchY(0, #SCR_TOUCH_INVX, 0, 0, 800, 1280, 800, 1280), 0)
+  TEq("invy: touch 0,0 is screen x 0                ", ScrTouchX(0, #SCR_TOUCH_INVY, 0, 0, 800, 1280, 800, 1280), 0)
+  TEq("invy: touch 0,0 is screen y 1279             ", ScrTouchY(0, #SCR_TOUCH_INVY, 0, 0, 800, 1280, 800, 1280), 1279)
+
+  ; SWAP MOVES THE RANGES AS WELL AS THE VALUES, which is the part that
+  ; gets written wrong. A controller reporting 800 x 1280 that is
+  ; swapped onto a 1280 x 800 surface must scale x against 1280 and y
+  ; against 800; scaling against the unswapped ranges is out by the
+  ; aspect ratio, which looks like a badly calibrated screen and is not.
+  TEq("swap: the panel's x range becomes 1280       ", ScrTouchPanelXMax(#SCR_TOUCH_SWAP, 800, 1280), 1280)
+  TEq("swap: and its y range becomes 800            ", ScrTouchPanelYMax(#SCR_TOUCH_SWAP, 800, 1280), 800)
+  TEq("swap: touch 0,1279 is screen x 1279          ", ScrTouchX(0, #SCR_TOUCH_SWAP, 0, 1279, 800, 1280, 1280, 800), 1279)
+  TEq("swap: touch 0,1279 is screen y 0             ", ScrTouchY(0, #SCR_TOUCH_SWAP, 0, 1279, 800, 1280, 1280, 800), 0)
+  TEq("swap: touch 799,0 is screen x 0              ", ScrTouchX(0, #SCR_TOUCH_SWAP, 799, 0, 800, 1280, 1280, 800), 0)
+  TEq("swap: touch 799,0 is screen y 799            ", ScrTouchY(0, #SCR_TOUCH_SWAP, 799, 0, 800, 1280, 1280, 800), 799)
+
+  ; ---- THE SCALE ---------------------------------------------------
+  ; The controller's grid and the console's are two different sizes
+  ; whenever the display layer gives the console a surface that is not
+  ; the panel's pixel count. It is the SAME step as the rotation and
+  ; not a fourth one, so a change of scale needs no change to any of
+  ; the code above - which is only true if it is done as "this far
+  ; along, out of that many", and these are the numbers that say so.
+  TEq("half-size surface: 0 maps to 0               ", ScrTouchScale(0, 800, 400), 0)
+  TEq("half-size surface: 400 maps to 200           ", ScrTouchScale(400, 800, 400), 200)
+  TEq("half-size surface: the last unit maps to 399 ", ScrTouchScale(799, 800, 400), 399)
+  TEq("double-size surface: 400 maps to 800         ", ScrTouchScale(400, 800, 1600), 800)
+  TEq("double-size surface: the last maps to 1598   ", ScrTouchScale(799, 800, 1600), 1598)
+  ; A CONTACT ONE COUNT PAST THE END IS CLAMPED, not written outside the
+  ; surface. Parts of this family have been seen to report it on a bezel
+  ; touch, and one pixel outside a framebuffer is a pixel in somebody
+  ; else's memory.
+  TEq("a contact past the end is clamped            ", ScrTouchScale(900, 800, 400), 399)
+  TEq("a negative contact is clamped to 0           ", ScrTouchScale(-5, 800, 400), 0)
+  TEq("a whole-surface map lands on the last pixel  ", ScrTouchX(0, 0, 799, 0, 800, 1280, 400, 640), 399)
+
+  ; ---- AN UNANSWERABLE MAP REFUSES ---------------------------------
+  ; A controller that would not say what its resolution is answers 0 to
+  ; Gt9XMax(), and scaling by zero is not a coordinate. -1 is a refusal
+  ; the caller has to notice; a 0 would be the top left corner of the
+  ; screen, which is exactly where a UI puts something worth not
+  ; pressing by accident.
+  TEq("a zero x range refuses, in x                 ", ScrTouchX(90, 0, 10, 20, 0, 1280, 1280, 800), -1)
+  TEq("a zero x range refuses, in y                 ", ScrTouchY(90, 0, 10, 20, 0, 1280, 1280, 800), -1)
+  TEq("a zero y range refuses                       ", ScrTouchX(90, 0, 10, 20, 800, 0, 1280, 800), -1)
+  TEq("a zero-width surface refuses                 ", ScrTouchX(90, 0, 10, 20, 800, 1280, 0, 800), -1)
+  TEq("a zero-height surface refuses                ", ScrTouchY(90, 0, 10, 20, 800, 1280, 1280, 0), -1)
+
+  ; ------------------------------------------------------------------
+  ;  THE VERDICT
+  ; ------------------------------------------------------------------
+  PrintNl()
+  UartWriteStr("======================================================================")
+  PrintNl()
+  UartWriteStr("  checks run   ")
+  PrintDec(tNum)
+  PrintNl()
+  UartWriteStr("  passed       ")
+  PrintDec(tPass)
+  PrintNl()
+  UartWriteStr("  FAILED       ")
+  PrintDec(tFail)
+  PrintNl()
+  If tFail = 0
+    UartWriteStr("  VERDICT      GREEN - the seam picks the right screen, comes up")
+    PrintNl()
+    UartWriteStr("               LANDSCAPE on the panel, draws the SAME PHYSICAL SIZE of")
+    PrintNl()
+    UartWriteStr("               type whichever way the console is turned, and puts every")
+    PrintNl()
+    UartWriteStr("               pixel where the map says it goes.")
+    PrintNl()
+  Else
+    UartWriteStr("  VERDICT      RED. Do not put a console on the panel until this is")
+    PrintNl()
+    UartWriteStr("               zero: every one of these failures is invisible from a")
+    PrintNl()
+    UartWriteStr("               desk and shows only as a wrong picture on the glass.")
+    PrintNl()
+  EndIf
+  UartWriteStr("======================================================================")
+  PrintNl()
+  UartDrain()
+
+  ; The return value IS the verdict, so a harness that cannot read the
+  ; serial line can still tell. Anvil prints x0 when a payload returns.
+  ProcedureReturn tFail
+EndProcedure

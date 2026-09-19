@@ -1,0 +1,1079 @@
+; pi4DisplayProbe.pi4 - does display.pi4 actually get a framebuffer, and
+;                       does its geometry arithmetic agree with the
+;                       numbers the firmware chose?
+;
+; DIAGNOSTIC. Does not ship. (House rule 19.)
+;
+; ======================================================================
+;  WHY THIS PROGRAM EXISTS
+; ======================================================================
+; display.pi4 was written complete and then deliberately disabled. Its
+; seven VideoCore framebuffer tag numbers were left as EMPTY SLOTS and
+; DisplayInit() refused with #DSP_ENOTAGS, because the defining kernel
+; header was not on this machine and the file would not guess.
+;
+; That header arrived on 2026-08-25: the Linux kernel's
+; include/soc/bcm2835/raspberrypi-firmware.h. mailbox.pi4 and this file
+; cite it as "Datasheets/pi4/raspberrypi-firmware.h", the name of the
+; reference copy that was read; the file itself is not part of this
+; repository. tools/a64/a64_display_check.py pins the tag values it
+; needs, with the header line each one came from.
+;
+; All the values live in RaspberryPi4/Lib/mailbox.pi4 as #MBX_TAG_FB_*.
+; They were re-checked against the header, value by value, while this
+; probe was written; every one matches:
+;
+;   FRAMEBUFFER_ALLOCATE                  $00040001
+;   FRAMEBUFFER_GET_PHYSICAL_WIDTH_HEIGHT $00040003
+;   FRAMEBUFFER_GET_PITCH                 $00040008
+;   FRAMEBUFFER_SET_PHYSICAL_WIDTH_HEIGHT $00048003
+;   FRAMEBUFFER_SET_VIRTUAL_WIDTH_HEIGHT  $00048004
+;   FRAMEBUFFER_SET_DEPTH                 $00048005
+;   FRAMEBUFFER_SET_PIXEL_ORDER           $00048006
+;   FRAMEBUFFER_SET_ALPHA_MODE            $00048007
+;   FRAMEBUFFER_SET_VIRTUAL_OFFSET        $00048009
+;   FRAMEBUFFER_SET_OVERSCAN              $0004800A
+;
+; TEN SLOTS SINCE 2026-08-26, AND DisplayStandardTags() FILLS ALL TEN.
+; Three of them - get-physical, set-alpha-mode, set-overscan - arrived
+; with the rewrite that put nine tags in one mailbox message, and the
+; set-pixel-order slot that section 3 used to assert must stay EMPTY is
+; now asserted to be FILLED. That reversal is not tidying and it is
+; argued where the assertion is, in section 3; the short version is that
+; the meaning of the pixel-order value stopped being uncitable the same
+; day, and that a tag left out of a combined message is not a default
+; left alone but a gap in the state the firmware allocates against.
+;
+; ======================================================================
+;  WHAT THIS PROBE WAS GREEN THROUGH, AND WHAT IT NOW CHECKS
+; ======================================================================
+; This program and its harness passed, 39 checks out of 39, over a
+; library that produced a 2 x 2 FRAMEBUFFER on real silicon. Booted
+; through U-Boot the seven-message bring-up worked; booted straight from
+; the firmware it returned success over a surface two pixels square in
+; front of a 1920 x 1080 panel, and the console built on it computed a
+; negative number of rows.
+;
+; Nothing in the checks below was wrong. The gap was that they were all
+; downstream of a mailbox model that answered separate messages out of
+; state accumulated across all of them - and the real firmware
+; accumulates within ONE transaction and allocates against that. So the
+; failure was invisible to every assertion in this file, because every
+; one of them starts from the geometry DisplayInit() came back with.
+;
+; What is new here is section 3's tag assertions and, in the harness,
+; the shape of the traffic: how many messages, which tags in each, in
+; what order, carrying what words. That is the only place the defect was
+; ever visible, and it is the reason the harness watches the wire
+; instead of only reading the pixels.
+;
+; So the library may be complete and working, and nothing has ever
+; called it. This program calls it, and reports what happens rather
+; than assuming.
+;
+; ======================================================================
+;  BUILD IT EXACTLY LIKE THIS
+; ======================================================================
+;   pmfc RaspberryPi4/Examples/Diagnostics/pi4DisplayProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o pi4DisplayProbe.img
+;
+; --entry-returns is why this is safe to send to a resident Anvil:
+; Main() finishing RETURNS to the monitor with the verdict in x0 instead
+; of trapping forever, so a wrong answer costs a line of output and not
+; a walk to the plug.
+;
+; The load address must stay in the LOW GIGABYTE. mailbox.pi4 refuses
+; with #MBX_ERR_ADDRESS if its buffer lands at or above $40000000,
+; because the dma-ranges alias the VideoCore is named through
+; (bcm2711.dtsi:45) is only $40000000 long. 0x400000 is well inside it.
+;
+; ======================================================================
+;  IT RUNS WITHOUT HARDWARE TOO
+; ======================================================================
+; tools/a64/a64_display_check.py builds this exact file and executes the
+; exact image on the project's A64 oracle (tools/a64/a64_interp.py),
+; against a modelled PL011 and a modelled VideoCore that CLAMPS the mode
+; and returns a PADDED pitch. The whole serial log below is produced
+; there before the board ever sees it, and every pixel is checked in the
+; harness at addresses the harness computes for itself.
+;
+; ======================================================================
+;  NO MONITOR IS ATTACHED, AND THAT DOES NOT STOP MOST OF THIS
+; ======================================================================
+; A framebuffer is DRAM. Every pixel written can be read back, so the
+; geometry arithmetic can be PROVEN against the real pitch the firmware
+; chose without anything being plugged into the HDMI socket. What cannot
+; be settled without a screen is which channel is which and whether an
+; image appears at all. Each section says which kind it is, and the
+; summary at the end lists the open questions in one place.
+;
+; The one question a missing monitor is itself the experiment for:
+; DOES THE FIRMWARE ALLOCATE A FRAMEBUFFER WITH HDMI UNPLUGGED? It may
+; refuse, it may clamp to a default mode, or it may hand back exactly
+; what was asked for. Section 4 reports which, and that is a result
+; either way.
+;
+; WHICH IS ALSO WHY NOTHING BELOW HARDCODES A COORDINATE. An early draft
+; drew its rectangles at x=100..800 and put the console at (100,400)
+; 1200x400, which is a picture on a 1920x1080 surface and almost nothing
+; on the 640x480 the firmware may well clamp to with the cable out. The
+; layout is computed from the width and height the firmware ACTUALLY
+; gave, printed before it is used, and the assertions read the same
+; variables - so the probe draws a proportionally identical picture at
+; any mode, and says which one it drew.
+;
+; ======================================================================
+;  THE TWO PREDICTED FAILURES, STATED BEFORE THE RUN
+; ======================================================================
+;   1. PITCH. The firmware picks the bytes-per-row and it is not
+;      obliged to be width*bpp. Getting it wrong does not blank the
+;      screen, it SHEARS the picture diagonally. Section 7 writes single
+;      pixels at chosen coordinates and reads the raw bytes back at
+;      base + y*pitch, and separately checks that base + y*width*bpp is
+;      still background - which is the shear, asserted rather than
+;      reasoned about. If the firmware happens to return a pitch equal
+;      to width*bpp that control is vacuous, and the section says so
+;      instead of quietly claiming a pass.
+;   2. RED AND BLUE SWAPPED. Only an eye can settle this.
+;      DisplayColourSwap(1) is the fix and it needs no firmware tag.
+;      Section 9 draws pure red, green and blue at stated coordinates
+;      and PRINTS THE PIXEL WORD it wrote, so that whoever does plug a
+;      monitor in can compare what they see against a number rather
+;      than against a memory.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM REFUSES TO DO
+; ======================================================================
+; It does not draw one pixel until it has checked that the framebuffer
+; the firmware handed back lies OUTSIDE the low 64 MiB. The monitor, this
+; image at $400000 and its stack at $3000000 all live down there, and a
+; bad base address would not produce a graphical glitch - it would
+; overwrite the program that is running. See PrRegionSafe().
+;
+; ======================================================================
+;  RECORDED AND REJECTED
+; ======================================================================
+; * Calling DisplayInit() without DisplayStandardTags() first, to "let
+;   the defaults work". There are no defaults; that is the whole design
+;   of the slot mechanism. Section 2 makes the refusal an assertion
+;   instead - it checks that DisplayInit() DOES refuse with #DSP_ENOTAGS
+;   before the tags are filled, so the guard is proven live rather than
+;   assumed to have been removed cleanly.
+; * Checking the drawn glyph against three pixel coordinates picked by
+;   eye from a font dump. Section 10 compares ALL 128 pixels of a cell
+;   against the bit the font table actually holds, read here with PeekA.
+;   Three coordinates would have tested three coordinates; the table
+;   comparison tests the MSB-first bit order, the glyph stride, the row
+;   stride and the run loop at once, and it cannot go stale if the font
+;   is regenerated.
+; * Reading the surface back through DisplayGetPixel() for the geometry
+;   claims. Checking display.pi4's arithmetic with display.pi4's
+;   arithmetic proves only that it agrees with itself. PrRaw32() below
+;   recomputes the address here, from the pitch, and PeekNs it.
+;   DisplayGetPixel() is used only where IT is the thing under test.
+; * Its own PL011 driver. RaspberryPi4/Lib/uart.pi4 exists, but bringing
+;   it in would make this probe depend on a second library being correct
+;   before it can report that the first one is not. The two registers
+;   below are the same two pi4MailboxProbe.pi4 uses, for the same
+;   reason, and are cited there.
+; * Its own read of CNTPCT_EL0 for the cache timing in section 8.
+;   mailbox.pi4 already exposes MbxTicks(), it is already linked in, and
+;   house rule 9 says a library beats an intrinsic even when the
+;   intrinsic is two words. timer.pi4's Ticks() would have been the
+;   other candidate and would have meant a third include.
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+; #DSP_DMA_LINKED - MANDATORY, and it must be defined BEFORE display.pi4.
+; 0 = the CPU drawing path and nothing else; every procedure that would
+; touch the blitter is skipped at the token level and never parsed, and
+; what display.pi4 still carries is ten accessors totalling 660 bytes so
+; that a program can ask whether the engine was linked and be told no.
+; 1 would additionally require RaspberryPi4/Lib/dma.pi4 to be included
+; ahead of display.pi4.
+; display.pi4's THE DMA SEAM section has the reasoning; there is no
+; default because a default in the library and a different value here
+; would be a hard "Constant already defined" error.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+; The PL011 the console is already running on. Cited in
+; pi4MailboxProbe.pi4 and in RaspberryPi4/Lib/uart.pi4; bus $7E201000
+; through bcm2711.dtsi:41's soc ranges is ARM $FE201000.
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+#UART_FR_TXFF = 32             ; bit 5, transmit FIFO full
+
+; The floor the framebuffer must sit above before this program will
+; write to it. The monitor, this image ($400000) and its stack
+; ($3000000) are all below $4000000. See PrRegionSafe().
+#SAFE_FLOOR = $4000000
+
+; Below this the drawing sections have nothing to draw in and would
+; report failures that are about the mode, not about the library.
+#MIN_W = 64
+#MIN_H = 48
+
+Global prFails.i
+Global prChecks.i
+
+; ======================================================================
+;  UART - the same shape as pi4MailboxProbe.pi4
+; ======================================================================
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & #UART_FR_TXFF) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+; PeekA, not PeekB. Ruled 2026-08-25: PeekB names the SIGNED .b and
+; sign-extends on every backend now, so a byte above 127 comes back
+; negative and this loop would never meet its terminator the way it
+; expects. PeekA is the raw-byte accessor.
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    ; Parenthesised: & binds TIGHTER than >> on this compiler, so
+    ; "v >> i * 4 & $F" would shift by (i*4 & $F).
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; "  name = 1234   ($000004D2)"
+Procedure Row(*name, v.i)
+  PutS("  ")
+  PutS(*name)
+  PutS(" = ")
+  PutDec(v)
+  PutS("   ($")
+  PutHex(v, 8)
+  PutS(")")
+  PutNl()
+EndProcedure
+
+; A 64-bit address wants all sixteen digits; folding one to eight is how
+; a truncated pointer hides.
+Procedure RowAddr(*name, v.i)
+  PutS("  ")
+  PutS(*name)
+  PutS(" = $")
+  PutHex(v, 16)
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  ASSERTIONS
+;
+;  Every one prints its own line whether it passes or fails, because a
+;  diagnostic that only speaks up when something is wrong cannot be
+;  distinguished from one that did not run.
+; ======================================================================
+
+Procedure.i Chk(*name, got.i, want.i)
+  prChecks = prChecks + 1
+  If got = want
+    PutS("  ok   ")
+    PutS(*name)
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+  prFails = prFails + 1
+  PutS("  FAIL ")
+  PutS(*name)
+  PutS("   got $")
+  PutHex(got, 16)
+  PutS("  want $")
+  PutHex(want, 16)
+  PutNl()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  SAFETY - do not draw into the program that is drawing
+; ======================================================================
+
+; PrRegionSafe - 1 if [base, base+size) is somewhere it is safe to
+; write. A framebuffer base of zero, or one pointing into the low 64 MiB
+; where the monitor and this image live, is not a graphical problem: a
+; DisplayClear() over it overwrites the running program and the board
+; goes quiet with no message. DisplayInit() already refuses a zero base
+; and a size below pitch*height; this is the check it cannot make,
+; because a library does not know where its caller was loaded.
+Procedure.i PrRegionSafe(base.i, size.i)
+  If base < #SAFE_FLOOR
+    ProcedureReturn 0
+  EndIf
+  If size < 1
+    ProcedureReturn 0
+  EndIf
+  ; The bus->ARM conversion is & $3FFFFFFF, so an ARM address out of it
+  ; can never exceed $3FFFFFFF. Anything past that means the conversion
+  ; did something other than what display.pi4's header describes.
+  If (base + size) > $40000000
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  READBACK HELPERS
+;
+;  PrRaw32 reaches the surface at an address THIS FILE computes,
+;  deliberately not through DisplayGetPixel(). See RECORDED AND REJECTED.
+; ======================================================================
+
+; The 32-bit word at (x, y) assuming a row stride of `stride` bytes.
+; Masked because PeekN of a pixel with the top alpha byte at $FF has
+; bit 31 set and would come back negative into a 64-bit .i.
+Procedure.i PrRaw32(base.i, stride.i, x.i, y.i)
+  ProcedureReturn PeekN((base + (y * stride)) + (x * 4)) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PrIsNot - 1 if the two differ. Exists so the shear checks below can
+; assert "the pixel is NOT here" without writing what it IS.
+;
+; THIS IS NOT STYLE. The first version of section 7 asserted that the
+; tight-stride address held ZERO, and two of its checks failed against a
+; library that was working perfectly. The background after
+; DisplayClear(black) is not zero: DisplayRGB() puts $FF in the top byte
+; - correct under ARGB, ignored under XRGB - so a cleared pixel reads
+; $FF000000. Worse, the one shear check that PASSED passed by accident,
+; because at row 1 the tight-stride address happens to land in the row
+; padding, which really is untouched zero. A check that is right for the
+; wrong reason next to a check that is wrong for the right reason is not
+; a section anybody should keep.
+;
+; Asking "is the magic value here?" removes the whole question. It does
+; not care what the background is, it does not care whether the address
+; lands in a pixel or in padding, and it says exactly the thing the
+; shear bug would make false.
+; ----------------------------------------------------------------------
+Procedure.i PrIsNot(a.i, b.i)
+  If a = b
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; How many pixels in a rectangle differ from `bg`. A count is the
+; monitor-free answer to "did the text draw": a cell that rendered has
+; some ink and some ground, a cell that rendered nothing has none of one
+; of them.
+Procedure.i PrInkCount(base.i, stride.i, x.i, y.i, w.i, h.i, bg.i)
+  Define r.i
+  Define c.i
+  Define n.i
+  n = 0
+  r = 0
+  While r < h
+    c = 0
+    While c < w
+      If PrRaw32(base, stride, x + c, y + r) <> bg
+        n = n + 1
+      EndIf
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PrGlyphErrors - compare EVERY pixel of a drawn 8x16 cell against the
+; bit the font table actually holds. Returns the number that disagree.
+;
+; This is the check that covers the four things a character renderer can
+; get wrong independently: the MSB-of-the-first-byte-is-the-leftmost-
+; pixel order, the 16-byte glyph stride, the row stride inside a glyph,
+; and the run-coalescing loop in DisplayChar(). Three hand-picked
+; coordinates would have covered one of them by luck.
+;
+; The table is reached as ?dsp_font8x16 + (ch-32)*16, which is
+; DisplayFontDefault()'s own layout: fixed 8x16 cells, ASCII 32..126,
+; one byte per row. Read with PeekA, never Read/Restore - "Read strides
+; 2 bytes whatever the element width" is an open bug on every target
+; (Bugs/Open bugs.md:309, open since 2026-08-08) and display.pi4's own
+; header records the same avoidance for the same reason.
+;
+; Scale must be 1 and the cell must be fully on the surface; the caller
+; checks both.
+; ----------------------------------------------------------------------
+Procedure.i PrGlyphErrors(base.i, stride.i, x.i, y.i, ch.i, fg.i, bg.i)
+  Define r.i
+  Define c.i
+  Define b.i
+  Define want.i
+  Define bad.i
+  Define rowbase.i
+  bad = 0
+  rowbase = ?dsp_font8x16 + ((ch - 32) * 16)
+  r = 0
+  While r < 16
+    b = PeekA(rowbase + r)
+    c = 0
+    While c < 8
+      ; Parenthesised: & binds tighter than >>, so "b & 128 >> c" is
+      ; "(b & 128) >> c" - a different, and wrong, question.
+      If (b & (128 >> c)) <> 0
+        want = fg
+      Else
+        want = bg
+      EndIf
+      If PrRaw32(base, stride, x + c, y + r) <> want
+        bad = bad + 1
+      EndIf
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  ProcedureReturn bad
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+Procedure.i Main()
+  Define rc.i
+  Define bus.i
+  Define base.i
+  Define size.i
+  Define w.i
+  Define h.i
+  Define depth.i
+  Define bpp.i
+  Define pitch.i
+  Define tight.i
+  Define pad.i
+  Define black.i
+  Define red.i
+  Define green.i
+  Define blue.i
+  Define white.i
+  Define field.i
+  Define magic.i
+  Define t0.i
+  Define t1.i
+  Define t2.i
+  Define t3.i
+  Define ink.i
+  Define cw.i
+  Define chh.i
+  ; the computed layout - see WHICH IS ALSO WHY NOTHING BELOW HARDCODES
+  Define rx.i
+  Define ry.i
+  Define rw.i
+  Define rh.i
+  Define gap.i
+  Define conx.i
+  Define cony.i
+  Define conw.i
+  Define conh.i
+  Define gx.i
+  Define gy.i
+  Define ncell.i
+
+  prFails = 0
+  prChecks = 0
+
+  PutNl()
+  PutS("=== Pi 4 display probe - first call ever made into display.pi4 ===")
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. THE TRANSPORT
+  ;
+  ;  display.pi4 calls MailboxInit() itself if it has to, but doing it
+  ;  here separates "the mailbox is broken" from "the framebuffer tags
+  ;  are wrong" - two failures that would otherwise arrive as the same
+  ;  #DSP_ENOMAILBOX.
+  ; ------------------------------------------------------------------
+  PutS("-- 1. mailbox transport")
+  PutNl()
+  If MailboxInit() = 0
+    PutS("  MailboxInit FAILED, MailboxError() = ")
+    PutDec(MailboxError())
+    PutNl()
+    PutS("  (2 = the buffer landed at or above $40000000, where the")
+    PutNl()
+    PutS("   VideoCore has no name for it. Build for a lower load addr.)")
+    PutNl()
+    ProcedureReturn $BAD1
+  EndIf
+  RowAddr("mailbox buffer, ARM", MailboxBufferAddr())
+  Row("mailbox buffer, bus", MailboxBusAddr())
+
+  ; ------------------------------------------------------------------
+  ;  2. THE REFUSAL, PROVEN LIVE
+  ;
+  ;  Before the tags are filled, DisplayInit() must refuse. This is not
+  ;  ceremony: the slot mechanism is the only thing standing between a
+  ;  caller and a framebuffer configured with numbers nobody chose, and
+  ;  a guard that has quietly stopped working looks exactly like a guard
+  ;  that is working, right up until the day it matters.
+  ; ------------------------------------------------------------------
+  PutS("-- 2. the refusal, before any tag is filled")
+  PutNl()
+  Chk("DisplayTagsReady() is 0", DisplayTagsReady(), 0)
+  Chk("DisplayMissingSlot() names slot 0", DisplayMissingSlot(), #DSP_TAG_SETPHYS)
+  rc = DisplayInit(1920, 1080, 32)
+  Chk("DisplayInit refuses with #DSP_ENOTAGS", rc, #DSP_ENOTAGS)
+  Chk("DisplayReady() still 0", DisplayReady(), 0)
+
+  ; ------------------------------------------------------------------
+  ;  3. FILL THE SLOTS
+  ; ------------------------------------------------------------------
+  PutS("-- 3. DisplayStandardTags()")
+  PutNl()
+  DisplayStandardTags()
+  Chk("DisplayTagsReady() is 1", DisplayTagsReady(), 1)
+  Chk("DisplayMissingSlot() is -1", DisplayMissingSlot(), -1)
+  ; The numbers, printed, so the serial log carries the evidence and not
+  ; just the claim. Compare against the header values quoted at the top
+  ; of this file.
+  Row("slot 0 set-physical", #MBX_TAG_FB_SETPHYS)
+  Row("slot 1 set-virtual ", #MBX_TAG_FB_SETVIRT)
+  Row("slot 2 set-depth   ", #MBX_TAG_FB_SETDEPTH)
+  Row("slot 3 allocate    ", #MBX_TAG_FB_ALLOCATE)
+  Row("slot 4 get-pitch   ", #MBX_TAG_FB_GETPITCH)
+  Row("slot 5 set-order   ", #MBX_TAG_FB_SETORDER)
+  Row("slot 6 set-offset  ", #MBX_TAG_FB_SETOFFSET)
+  Row("slot 7 set-alpha   ", #MBX_TAG_FB_SETALPHA)
+  Row("slot 8 set-overscan", #MBX_TAG_FB_SETOVERSCAN)
+  Row("slot 9 get-physical", #MBX_TAG_FB_GETPHYS)
+
+  ; THE SET-PIXEL-ORDER SLOT IS NOW FILLED, AND IT WAS AN ASSERTION HERE
+  ; THAT IT MUST NOT BE. The reversal is written out because this file
+  ; is where the original defect was caught and deleting the assertion
+  ; without saying so would erase the only record of that.
+  ;
+  ; WHAT THE OLD CHECK GUARDED. The first DisplayStandardTags() filled
+  ; slot 5, so DisplayInit() sent the tag carrying dsp_order - zero
+  ; unless DisplayPixelOrder() had been called - and commanded the
+  ; firmware's channel layout to a number nobody had chosen. The meaning
+  ; of that number was not on this disk, so nobody COULD have chosen it
+  ; responsibly. The first execution of this probe caught it.
+  ;
+  ; WHY IT IS RIGHT NOW, and both halves are needed:
+  ;   * the value is cited - Datasheets/pi4/uboot/v2025.01_mbox.h:373-374
+  ;     gives BGR 0 and RGB 1, and the library sends BGR, which is the
+  ;     arrangement DisplayRGB()'s packing already assumes and the one
+  ;     the bench measured booting straight from the firmware.
+  ;   * the nine tags now travel in ONE message and the firmware
+  ;     allocates against what that message accumulated, so a tag left
+  ;     out is a hole in that state rather than a default left alone.
+  ;
+  ; The second predicted failure at the top of this file has not gone
+  ; away - only an eye settles whether the socket agrees with the word
+  ; BGR - but it is now a disagreement with a request that can be
+  ; printed, instead of with whatever the loader happened to leave.
+  Chk("set-pixel-order slot IS filled", DisplayTagSet(#DSP_TAG_SETORDER), 1)
+  Chk("set-virtual-offset slot IS filled", DisplayTagSet(#DSP_TAG_SETOFFSET), 1)
+  Chk("set-alpha-mode slot IS filled", DisplayTagSet(#DSP_TAG_SETALPHA), 1)
+  Chk("set-overscan slot IS filled", DisplayTagSet(#DSP_TAG_SETOVERSCAN), 1)
+  Chk("get-physical slot IS filled", DisplayTagSet(#DSP_TAG_GETPHYS), 1)
+
+  ; ------------------------------------------------------------------
+  ;  4. DisplayInit - AND WHETHER HDMI HAS TO BE PLUGGED IN
+  ;
+  ;  The interesting reading with nothing connected. Three outcomes and
+  ;  all three are results:
+  ;    #DSP_OK, 1920x1080      - the firmware allocated the mode asked
+  ;                              for and does not care about the cable
+  ;    #DSP_OK, anything else  - it CLAMPED to a default; section 5 says
+  ;                              to what
+  ;    a negative code         - it refused; the code and MailboxError()
+  ;                              say at which tag
+  ; ------------------------------------------------------------------
+  PutS("-- 4. DisplayInit(1920, 1080, 32)")
+  PutNl()
+  rc = DisplayInit(1920, 1080, 32)
+  Row("return code", rc)
+  Row("DisplayLastError()", DisplayLastError())
+  Row("MailboxError()", MailboxError())
+  If rc <> #DSP_OK
+    Row("DisplayMissingSlot()", DisplayMissingSlot())
+    PutS("  the return code names the step: -1 no tags, -2 bad args,")
+    PutNl()
+    PutS("  -3 bad depth, -4 no mailbox, -5 set-phys, -6 set-virt,")
+    PutNl()
+    PutS("  -7 set-depth, -8 set-order, -9 set-offset, -10 allocate,")
+    PutNl()
+    PutS("  -11 get-pitch, -12 zero base, -13 bad pitch, -14 short")
+    PutNl()
+    PutS("  size, -15 unusable geometry, -16 set-alpha, -17 set-overscan,")
+    PutNl()
+    PutS("  -18 the nine-tag buffer would not compose, -19 the message")
+    PutNl()
+    PutS("  went out and the transaction failed. MailboxError() 8")
+    PutNl()
+    PutS("  (#MBX_ERR_TAG) means the firmware did not recognise the tag")
+    PutNl()
+    PutS("  the code names; the transport reports WHICH tag of the nine.")
+    PutNl()
+
+    ; A CLAMP TO NOTHING IS NOT THE SAME AS A REFUSAL, so if 1080p was
+    ; turned down, ask for a mode no display has ever failed to do. If
+    ; THAT works the finding is "no HDMI means no big modes"; if it
+    ; fails too the finding is "no HDMI means no framebuffer at all".
+    ; Distinguishing those two is worth one more round trip.
+    PutS("-- 4b. retrying at 640x480x32")
+    PutNl()
+    rc = DisplayInit(640, 480, 32)
+    Row("return code", rc)
+    Row("MailboxError()", MailboxError())
+  EndIf
+
+  If rc <> #DSP_OK
+    PutS("=== no framebuffer. Nothing below can run. ===")
+    PutNl()
+    ProcedureReturn $BAD2
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  5. EVERY NUMBER THE FIRMWARE CHOSE
+  ;
+  ;  These are the firmware's, not the request's. DisplayInit() carries
+  ;  each tag's echo forward into the next step, so a clamped mode is
+  ;  configured consistently instead of leaving the library's idea of
+  ;  the geometry disagreeing with the firmware's.
+  ; ------------------------------------------------------------------
+  PutS("-- 5. what the firmware actually gave back")
+  PutNl()
+  bus   = DisplayBusBase()
+  base  = DisplayBase()
+  size  = DisplaySize()
+  w     = DisplayWidth()
+  h     = DisplayHeight()
+  depth = DisplayDepth()
+  bpp   = DisplayBytesPerPixel()
+  pitch = DisplayPitch()
+
+  ; WHAT THE PANEL SAID BEFORE ANYTHING WAS SET, which is the input the
+  ; combined message's set-physical was built from. A zero here means
+  ; the query would not answer and the width and height this program
+  ; passed in were used instead - a different experiment, and worth
+  ; knowing which one was run.
+  Row("panel width  (get-physical)", DisplayPanelWidth())
+  Row("panel height (get-physical)", DisplayPanelHeight())
+
+  Row("bus base (VideoCore)", bus)
+  ; Bits 31:30 select which of the four aliases the VideoCore was using.
+  ; $C0000000 is the one bcm2711.dtsi:45's dma-ranges describes, so this
+  ; should read 3. Anything else means the & $3FFFFFFF below is being
+  ; applied to an address it was not derived for, and DisplayBase() is
+  ; then a plausible wrong number rather than an obviously wrong one.
+  Row("bus alias selector (bits 31:30)", (bus >> 30) & 3)
+  RowAddr("ARM base (bus & $3FFFFFFF)", base)
+  Row("allocated size, bytes", size)
+  Row("width  (CLAMPED value)", w)
+  Row("height (CLAMPED value)", h)
+  Row("depth  (CLAMPED value)", depth)
+  Row("bytes per pixel", bpp)
+  Row("PITCH, bytes per row", pitch)
+
+  tight = w * bpp
+  pad = pitch - tight
+  Row("width * bpp (NOT the pitch)", tight)
+  Row("padding per row, bytes", pad)
+  Row("rows the size covers", size / pitch)
+
+  Chk("size covers pitch*height", size >= (pitch * h), 1)
+  Chk("pitch is at least width*bpp", pitch >= tight, 1)
+  Chk("bus alias selector is 3", (bus >> 30) & 3, 3)
+  Chk("ARM base is bus minus the alias", base, bus & $3FFFFFFF)
+
+  ; ------------------------------------------------------------------
+  ;  6. IS IT SAFE TO WRITE?
+  ; ------------------------------------------------------------------
+  PutS("-- 6. is the surface somewhere safe to write")
+  PutNl()
+  If PrRegionSafe(base, size) = 0
+    PutS("  REFUSING TO DRAW. The surface is at $")
+    PutHex(base, 16)
+    PutS(" for ")
+    PutDec(size)
+    PutS(" bytes,")
+    PutNl()
+    PutS("  which is not clear of the low 64 MiB where this image, its")
+    PutNl()
+    PutS("  stack and the monitor live. Writing there would overwrite")
+    PutNl()
+    PutS("  the running program, not the screen.")
+    PutNl()
+    prFails = prFails + 1
+    ProcedureReturn $BAD3
+  EndIf
+  PutS("  ok   surface is clear of the low 64 MiB")
+  PutNl()
+
+  If w < #MIN_W Or h < #MIN_H
+    PutS("  the mode is too small to lay a picture out in; stopping")
+    PutS(" here rather than reporting failures that are about the mode.")
+    PutNl()
+    ProcedureReturn prFails
+  EndIf
+
+  black = DisplayRGB(0, 0, 0)
+  red   = DisplayRGB(255, 0, 0)
+  green = DisplayRGB(0, 255, 0)
+  blue  = DisplayRGB(0, 0, 255)
+  white = DisplayRGB(255, 255, 255)
+  ; A dark blue field rather than black, so that "cleared" and "never
+  ; written" are different sights on a monitor and different numbers in
+  ; a readback.
+  field = DisplayRGB(0, 0, 40)
+
+  ; ------------------------------------------------------------------
+  ;  7. THE PITCH, PROVEN AGAINST THE REAL NUMBER
+  ;
+  ;  THIS IS THE SECTION THAT DOES NOT NEED A MONITOR AND IS THE WHOLE
+  ;  REASON THIS PROBE IS WORTH RUNNING TODAY.
+  ;
+  ;  Clear the surface, write single pixels through display.pi4, then
+  ;  read the raw bytes back at addresses computed HERE from the pitch
+  ;  the firmware reported. Two claims:
+  ;
+  ;    a) a pixel written at row y is at base + y*pitch  -> it is there
+  ;    b) it is NOT at base + y*width*bpp                -> the shear
+  ;
+  ;  (b) is only a real control when pitch differs from width*bpp. When
+  ;  they are equal the two addresses ARE the same address and the check
+  ;  says nothing; it is reported as VACUOUS rather than as a pass,
+  ;  because a check that cannot fail is not evidence.
+  ; ------------------------------------------------------------------
+  PutS("-- 7. pitch arithmetic, read back from DRAM")
+  PutNl()
+  DisplayClear(black)
+
+  ; $00ABCDEF has its top byte CLEAR, which no DisplayRGB() colour ever
+  ; does, so it cannot be confused with the background or with any
+  ; rectangle drawn later.
+  magic = $00ABCDEF
+  DisplayPixel(0, 1, magic)
+  Chk("pixel(0,1) is at base + 1*pitch", PrRaw32(base, pitch, 0, 1), magic)
+  If pad = 0
+    PutS("  --   the width*bpp control is VACUOUS: this mode's pitch")
+    PutNl()
+    PutS("       equals width*bpp, so both addresses are the same one.")
+    PutNl()
+  Else
+    Chk("the pixel is NOT at base + 1*width*bpp (the shear)", PrIsNot(PrRaw32(base, tight, 0, 1), magic), 1)
+  EndIf
+
+  ; The same claim further out, because an off-by-one in the row
+  ; multiply is invisible at row 1 if the code happens to use y-1 - and
+  ; because at row 1 the tight-stride address lands in row 0's padding,
+  ; where nothing was ever written; by row 7 it lands in a real pixel of
+  ; row 6, so this is the version of the control that has to reason
+  ; about a written surface rather than an untouched one.
+  DisplayPixel(3, 7, magic)
+  Chk("pixel(3,7) is at base + 7*pitch + 3*4", PrRaw32(base, pitch, 3, 7), magic)
+  If pad <> 0
+    Chk("NOT at base + 7*width*bpp + 3*4", PrIsNot(PrRaw32(base, tight, 3, 7), magic), 1)
+    ; The padding itself. Every row has `pad` bytes past its last pixel
+    ; that are not part of the picture, and a library addressing rows as
+    ; y*width*bpp would put row y+1 into them. Row 0's is checked here
+    ; because it is the one a clear has already had every chance to
+    ; scribble on.
+    Chk("row 0's padding is untouched", PeekN(base + tight) & $FFFFFFFF, 0)
+    Chk("row 1's padding is untouched", PeekN(base + pitch + tight) & $FFFFFFFF, 0)
+  EndIf
+
+  ; Along a row the stride is bpp and not the pitch.
+  DisplayPixel(1, 0, magic)
+  Chk("pixel(1,0) is at base + 1*4", PrRaw32(base, pitch, 1, 0), magic)
+
+  ; The LAST pixel of a row and the FIRST of the next. If row addressing
+  ; were tight-packed these two would be adjacent words; with a padded
+  ; pitch they are `pad` bytes apart, and writing one must not disturb
+  ; the other.
+  DisplayPixel(w - 1, 5, red)
+  DisplayPixel(0, 6, blue)
+  Chk("last pixel of row 5 held", PrRaw32(base, pitch, w - 1, 5), red)
+  Chk("first pixel of row 6 held", PrRaw32(base, pitch, 0, 6), blue)
+
+  ; Clipping. A write one past the right edge must land nowhere - and
+  ; "nowhere" specifically must not be the first pixel of the next row,
+  ; which is exactly where a missing clip puts it.
+  ;
+  ; The expected value is BLACK and not zero: the surface was cleared to
+  ; DisplayRGB(0,0,0), which is $FF000000 because the top byte is set.
+  DisplayPixel(w, 8, white)
+  Chk("write at x=width did not land on row 9", PrRaw32(base, pitch, 0, 9), black)
+  If pad <> 0
+    ; Where an unclipped write would ACTUALLY go if the clip were the
+    ; only thing missing: straight into row 8's padding.
+    Chk("write at x=width did not land in row 8's padding", PeekN(base + (8 * pitch) + tight) & $FFFFFFFF, 0)
+  EndIf
+  Chk("DisplayGetPixel off-surface is -1", DisplayGetPixel(w, 8), -1)
+  ; ...and DisplayGetPixel agrees with the raw read where it is defined.
+  ; This is the one place the library's own reader is the thing tested.
+  Chk("DisplayGetPixel agrees with the raw read", DisplayGetPixel(3, 7), magic)
+
+  ; ------------------------------------------------------------------
+  ;  8. CACHE MAINTENANCE - VERIFIED, NOT ASSUMED
+  ;
+  ;  Under the monitor the MMU and caches are ON, so pixels written and
+  ;  not cleaned out of the D-cache never reach the memory the display
+  ;  controller scans. display.pi4 auto-flushes by default. The claim
+  ;  under test is that the dc cvac loop is REALLY RUNNING.
+  ;
+  ;  READ BACK CANNOT SHOW IT, and this is worth being explicit about
+  ;  because section 7 looks like it should: a read hits the same dirty
+  ;  cache line and returns the right answer whether or not the line was
+  ;  ever cleaned. Section 7 passing says nothing at all about the
+  ;  cache. The only thing that distinguishes a flush that happened from
+  ;  one that did not is that it COST something.
+  ;
+  ;  So, timed on CNTPCT_EL0 through MbxTicks():
+  ;    A  a full-surface fill, auto-flush OFF   - pixels only
+  ;    B  DisplayFlush() on its own             - cleaning only
+  ;    C  a full-surface fill, auto-flush ON    - both
+  ;
+  ;  B must be greater than zero: a flush of the whole surface is
+  ;  size/64 cache lines and that cannot take no time. B at or near zero
+  ;  means the maintenance is not happening whatever the source says.
+  ;  C must exceed A: if it matches A instead, the auto-flush path is
+  ;  not reaching the code the explicit flush reaches.
+  ;
+  ;  WHAT THIS STILL DOES NOT PROVE: that dc cvac is the RIGHT
+  ;  maintenance operation for this reader. Only a monitor showing
+  ;  fresh pixels can settle that. It proves the instructions execute.
+  ; ------------------------------------------------------------------
+  PutS("-- 8. cache maintenance, measured")
+  PutNl()
+  Row("CNTFRQ_EL0, Hz", MbxCounterHz())
+
+  DisplayAutoFlush(0)
+  t0 = MbxTicks()
+  DisplayClear(black)
+  t1 = MbxTicks()
+  DisplayFlush()
+  t2 = MbxTicks()
+  DisplayAutoFlush(1)
+  DisplayClear(black)
+  t3 = MbxTicks()
+
+  Row("A  fill, no flush   (ticks)", t1 - t0)
+  Row("B  flush alone      (ticks)", t2 - t1)
+  Row("C  fill + autoflush (ticks)", t3 - t2)
+  Row("cache lines B had to clean", size / 64)
+  Chk("B > 0: the dc cvac loop really ran", (t2 - t1) > 0, 1)
+  Chk("C > A: auto-flush costs what flushing costs", (t3 - t2) > (t1 - t0), 1)
+
+  ; ------------------------------------------------------------------
+  ;  9. THE PICTURE
+  ;
+  ;  Known colours at computed coordinates, all of them printed. Reading
+  ;  the rectangles back proves they were written where they were asked
+  ;  for; it says NOTHING about what a screen would show. The printed
+  ;  pixel words are for whoever plugs a monitor in: red appearing where
+  ;  the log says blue was written is the channel swap, and
+  ;  DisplayColourSwap(1) is the one-line fix.
+  ; ------------------------------------------------------------------
+  PutS("-- 9. drawing")
+  PutNl()
+  Row("pixel word for pure RED  ", red)
+  Row("pixel word for pure GREEN", green)
+  Row("pixel word for pure BLUE ", blue)
+  Row("pixel word for WHITE     ", white)
+  Row("pixel word for the FIELD ", field)
+
+  ; The layout, in twelfths of the surface. Three rectangles across the
+  ; top with a gap between them, one below the first, a frame round the
+  ; lot, and the console under it. rx + 3*rw + 2*gap is 2/3 of the
+  ; width, so it fits at any mode this section runs at.
+  rx  = w / 12
+  ry  = h / 12
+  rw  = w / 6
+  rh  = h / 8
+  gap = rw / 4
+  Row("rect x", rx)
+  Row("rect y", ry)
+  Row("rect w", rw)
+  Row("rect h", rh)
+  Row("rect gap", gap)
+
+  DisplayClear(field)
+  DisplayFillRect(rx, ry, rw, rh, red)
+  DisplayFillRect(rx + rw + gap, ry, rw, rh, green)
+  DisplayFillRect(rx + (2 * (rw + gap)), ry, rw, rh, blue)
+  DisplayFillRect(rx, ry + rh + gap, rw, rh, white)
+  DisplayFrameRect(rx - 2, ry - 2, (3 * rw) + (2 * gap) + 4, (2 * rh) + gap + 4, white)
+
+  ; Read the middle of each back. Centre and not a corner, so an
+  ; off-by-one in the fill's clip cannot make the check pass on a
+  ; rectangle that is one pixel short.
+  Chk("red rect centre",   PrRaw32(base, pitch, rx + (rw / 2), ry + (rh / 2)), red)
+  Chk("green rect centre", PrRaw32(base, pitch, rx + rw + gap + (rw / 2), ry + (rh / 2)), green)
+  Chk("blue rect centre",  PrRaw32(base, pitch, rx + (2 * (rw + gap)) + (rw / 2), ry + (rh / 2)), blue)
+  Chk("white rect centre", PrRaw32(base, pitch, rx + (rw / 2), ry + rh + gap + (rh / 2)), white)
+  ; ...and that the fill stopped where it was told to. The pixel at
+  ; rx+rw-1 is the last one inside; rx+rw is the first one outside.
+  Chk("red rect ends at rx+rw-1", PrRaw32(base, pitch, rx + rw - 1, ry + (rh / 2)), red)
+  Chk("red rect does not reach rx+rw", PrRaw32(base, pitch, rx + rw, ry + (rh / 2)), field)
+  Chk("frame top-left corner", PrRaw32(base, pitch, rx - 2, ry - 2), white)
+  ; The frame is ONE pixel thick, so the pixel diagonally inside its
+  ; corner must still be the field. A frame drawn as a filled rectangle
+  ; would pass every check above and fail this one.
+  Chk("frame is one pixel thick", PrRaw32(base, pitch, rx - 1, ry - 1), field)
+
+  ; ------------------------------------------------------------------
+  ;  10. TEXT
+  ; ------------------------------------------------------------------
+  PutS("-- 10. text")
+  PutNl()
+  cw  = DisplayCharWidth()
+  chh = DisplayCharHeight()
+  Row("cell width, pixels", cw)
+  Row("cell height, pixels", chh)
+
+  ; THE GLYPH, CHECKED AGAINST ITS OWN TABLE. Drawn in the bottom-right
+  ; corner, well clear of the console, so the console's text cannot
+  ; supply a false pass. 'H' is used because its top row is two separate
+  ; stems and its middle row is solid - a cell that renders one and not
+  ; the other is caught - but the comparison is over all 128 pixels, so
+  ; the choice of character is convenience rather than the method.
+  gx = w - cw - 1
+  gy = h - chh - 1
+  DisplayFillRect(gx, gy, cw, chh, black)
+  DisplayChar(gx, gy, 72, white, black)
+  Row("glyph cell x", gx)
+  Row("glyph cell y", gy)
+  Chk("all 128 pixels of 'H' match the font table", PrGlyphErrors(base, pitch, gx, gy, 72, white, black), 0)
+
+  ; THE CONSOLE. Under the picture, using what is left of the surface.
+  conx = rx
+  cony = ry + (2 * rh) + gap + 8
+  conw = w - (2 * rx)
+  conh = h - cony - ry
+  Row("console x", conx)
+  Row("console y", cony)
+  Row("console w", conw)
+  Row("console h", conh)
+  If DisplayConsole(conx, cony, conw, conh) = 0
+    PutS("  DisplayConsole refused - no whole cell fits in that window")
+    PutNl()
+    prFails = prFails + 1
+  Else
+    Row("console columns", DisplayCols())
+    Row("console rows", DisplayRows())
+    DisplayColour(white, field)
+    DisplayCls()
+
+    ; ONE SHORT LINE FIRST, and the ink counted before anything can
+    ; wrap or scroll it away. A count taken after four long lines on a
+    ; three-row console would be measuring whatever survived the scroll.
+    DisplayPrintLn("PureMetal Forge")
+    ncell = 10
+    If ncell > DisplayCols()
+      ncell = DisplayCols()
+    EndIf
+    ink = PrInkCount(base, pitch, conx, cony, cw * ncell, chh, field)
+    Row("cells counted", ncell)
+    Row("ink pixels in them", ink)
+    Chk("the text rendered something", ink > 0, 1)
+    ; ...and did not render EVERYTHING, which is what a glyph lookup
+    ; reading past the end of the table into all-ones would do.
+    Chk("the text is not a solid block", ink < (cw * ncell * chh), 1)
+
+    ; Then the rest, which exercises wrap, scroll and the number
+    ; formatters. Nothing is asserted about it; it is there so that a
+    ; monitor, when one is plugged in, has something worth reading.
+    DisplayPrint("mode ")
+    DisplayPrintDec(w)
+    DisplayPrint("x")
+    DisplayPrintDec(h)
+    DisplayPrint("x")
+    DisplayPrintDec(depth)
+    DisplayNewLine()
+    DisplayPrint("pitch ")
+    DisplayPrintDec(pitch)
+    DisplayPrint(" base $")
+    DisplayPrintHex(base, 8)
+    DisplayNewLine()
+    DisplayPrintLn("ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789")
+    DisplayPrintLn("the quick brown fox jumps over the lazy dog")
+    Chk("the cursor is on the last console row", DisplayCursorRow(), DisplayRows() - 1)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  THE VERDICT
+  ; ------------------------------------------------------------------
+  PutNl()
+  PutS("=== ")
+  PutDec(prChecks - prFails)
+  PutS(" of ")
+  PutDec(prChecks)
+  PutS(" checks passed ===")
+  PutNl()
+  PutS("NEEDED NO MONITOR: the mode numbers, the pitch, the bus-to-ARM")
+  PutNl()
+  PutS("conversion, every readback, the clipping, the glyph comparison")
+  PutNl()
+  PutS("and the cache timing.")
+  PutNl()
+  PutS("STILL NEEDS ONE PLUGGED IN: whether a picture appears at all,")
+  PutNl()
+  PutS("whether it leans (that is the pitch), whether dc cvac is the")
+  PutNl()
+  PutS("right maintenance op for this reader, and whether the LEFT-HAND")
+  PutNl()
+  PutS("rectangle looks RED - if it looks blue, the channels are")
+  PutNl()
+  PutS("swapped and DisplayColourSwap(1) fixes it.")
+  PutNl()
+
+  ProcedureReturn prFails
+EndProcedure

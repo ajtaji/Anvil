@@ -1,0 +1,60 @@
+; ======================================================================
+;  hwtimer_q.pi4 - Arduino UNO Q (QCM2290) HwTimer backend.
+;
+;  Monotonic time on the Q from the ARMv8 ARCHITECTURAL timer. The Q's
+;  arch timer is architectural (vault: arm,armv8-timer, agatti.dtsi), so
+;  this is CNTPCT_EL0 / CNTFRQ_EL0 - exactly RaspberryPi4/Lib/timer.pi4's
+;  mechanism. Only the frequency differs and it is read at RUN TIME from
+;  CNTFRQ_EL0 rather than baked as a constant, so the same code is correct
+;  on the Q (19.2 MHz, confirmed) and the Pi 4 (54 MHz).
+;
+;  Each reader is a single mrs leaving its value in x0, where a .i return
+;  value lives - the same shape timer.pi4 and the bring-up probe use.
+; ======================================================================
+
+; CNTPCT_EL0 - the 64-bit monotonic physical count. Read twice in the
+; proof to show it advances (live execution + a working counter).
+Procedure.i RdCntpct()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+; CNTFRQ_EL0 - the counter frequency in Hz. 19.2 MHz on the Q.
+Procedure.i RdCntfrq()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwUptimeMs - milliseconds since the counter's zero.
+;
+;  ms = ticks / (freq/1000). At 19.2 MHz freq/1000 = 19200, an exact
+;  integer, so no precision is lost to the divide and no ticks*1000
+;  intermediate can overflow.
+; ----------------------------------------------------------------------
+Procedure.i HwUptimeMs()
+  Define f.i
+  f = RdCntfrq()
+  If f <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn RdCntpct() / (f / 1000)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwTimerUs - microseconds since the counter's zero.
+;
+;  us = ticks / (freq/1000000). freq/1000000 = 19 at 19.2 MHz, so this is
+;  coarse by ~1% (the .2 is dropped); HwUptimeMs above is the exact one.
+;  Kept because it is the seam name the core asks for.
+; ----------------------------------------------------------------------
+Procedure.i HwTimerUs()
+  Define f.i
+  f = RdCntfrq()
+  If f < 1000000
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn RdCntpct() / (f / 1000000)
+EndProcedure

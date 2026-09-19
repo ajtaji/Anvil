@@ -1,0 +1,65 @@
+; ======================================================================
+;  hwinfo_q.pi4 - Arduino UNO Q (QCM2290) HwInfo backend.
+;
+;  The Q's IDENTITY, read from architectural system registers plus the
+;  confirmed DRAM extent from memmap_q.pi4. This is the Q's answer to the
+;  Pi 4's VideoCore-mailbox soc.pi4: no mailbox, just mrs. Temperature
+;  (TSENS) is deferred - not needed to prove the core runs.
+;
+;  DEPENDS ON hwtimer_q.pi4 for RdCntfrq() (include hwtimer_q before this)
+;  and on memmap_q.pi4 for the #Q_DRAM_* / #Q_FREE_* constants.
+; ======================================================================
+
+; MIDR_EL1 - implementer/variant/part/revision. On the QCM2290 A53 this
+; reads 0x51af8014 (implementer 0x51 = Qualcomm, part 0x801 = Cortex-A53),
+; confirmed on silicon (vault, 2026-08-30).
+Procedure.i RdMidr()
+  ASM
+    mrs x0, midr_el1
+  EndASM
+EndProcedure
+
+; CurrentEL - the raw register; the exception level is bits [3:2], so
+; EL = raw >> 2. UEFI hands the app EL1 on the Q (confirmed), so this
+; reads 0x4 -> EL1.
+Procedure.i RdCurrentEl()
+  ASM
+    mrs x0, CurrentEL
+  EndASM
+EndProcedure
+
+; HwInfoEl - the decoded exception level (0..3).
+Procedure.i HwInfoEl()
+  ProcedureReturn (RdCurrentEl() >> 2) & 3
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwInfoIsQ - a one-call identity check: does MIDR match the QCM2290
+;  A53? Returns 1 when implementer=0x51 and partnum=0x801. Lets the proof
+;  assert it really ran on Q silicon and not something else.
+; ----------------------------------------------------------------------
+Procedure.i HwInfoIsQ()
+  Define m.i
+  Define impl.i
+  Define part.i
+  m = RdMidr()
+  impl = (m >> 24) & $FF
+  part = (m >> 4) & $FFF
+  If impl = $51 And part = $801
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; DRAM extent accessors, so the sink/report need not know the constants.
+Procedure.i HwInfoDramBase()
+  ProcedureReturn #Q_DRAM_BASE
+EndProcedure
+
+Procedure.i HwInfoDramTop()
+  ProcedureReturn #Q_DRAM_TOP
+EndProcedure
+
+Procedure.i HwInfoDramBytes()
+  ProcedureReturn #Q_DRAM_TOP - #Q_DRAM_BASE
+EndProcedure

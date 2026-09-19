@@ -1,0 +1,626 @@
+; ======================================================================
+;  gcm.pi4 - GHASH + AES-GCM AEAD (CONSTANT-TIME), ON THE RASPBERRY PI 4
+;            (BCM2711, AArch64)
+; ======================================================================
+;
+;  Translated from BearSSL (c) 2016 Thomas Pornin - MIT licence.
+;  The notice ships as licenses/BearSSL-LICENSE.txt (release condition).
+;
+;     XIncludeFile "RaspberryPi4/Lib/aes.pi4"     ; REQUIRED, before this
+;     XIncludeFile "RaspberryPi4/Lib/gcm.pi4"
+;
+;  AES-GCM authenticated encryption, from the BearSSL 32-bit
+;  constant-time GHASH (ghash_ctmul32) and the GCM composition (gcm.c).
+;  Reads-and-translates only: no C is linked, no foreign ABI is followed.
+;
+;  REQUIRES aes.pi4, included BEFORE this file (house rule: a library
+;  never includes a library - the MAIN file lists them, in order).  GCM
+;  drives the AES CTR core (AesCtrInit / AesCtrCore) for the keystream,
+;  for the GHASH key H = E_K(0), and for the tag mask; it never needs AES
+;  decrypt.  The CTR entry points were ADDED to aes.pi4 for this file -
+;  before 2026-09-04 that file was the raw block cipher and key wrap only,
+;  and a GCM written against it would have had nowhere to get a
+;  keystream.  See "CTR MODE" in aes.pi4.
+;
+;  API (module-global GCM state - one key installed at a time):
+;    GcmInit(key.i, keylen.i)      install a key (16, 24 or 32 bytes) and
+;                                  derive the GHASH key H = E_K(0).
+;                                  Returns the round count, or 0 for a
+;                                  refused key length - and then NO key
+;                                  is installed and nothing else here
+;                                  will do anything.
+;    GcmEncrypt(iv.i, ivlen.i, aad.i, aadlen.i, plain.i, len.i,
+;               cipher.i, tag.i)   AEAD encrypt: writes len cipher bytes
+;                                  and a 16-byte tag
+;    GcmDecrypt(iv.i, ivlen.i, aad.i, aadlen.i, cipher.i, len.i,
+;               plain.i, tag.i)    AEAD decrypt: writes len plain bytes
+;                                  and returns a CONSTANT-TIME verdict
+;                                  MASK - $FFFFFFFF if the tag is
+;                                  authentic, 0 if not.  The plaintext is
+;                                  produced either way; the caller MUST
+;                                  discard it on a 0.
+;
+;  A 96-bit (12-byte) IV takes the fast path; any other IV length is
+;  hashed with GHASH per the spec.  AAD and plaintext may each be empty.
+;
+;  THIS FILE ASSUMES EnableExplicit IS ON (aes.pi4 turned it on).
+;
+;  ======================================================================
+;   CONSTANT TIME
+;  ======================================================================
+;
+;  GHASH here uses only 32-bit carry-less multiplies built out of ordinary
+;  multiplies of sparse operands - the ctmul32 construction - so there is
+;  no table and no data-dependent index.  No control decision in this file
+;  depends on key, plaintext or tag bytes; every loop bound is a public
+;  length.
+;
+;  THE TAG CHECK ACCUMULATES ALL SIXTEEN BYTE-DIFFERENCES WITH OR AND
+;  TESTS ONCE, at the end, returning a mask.  It never branches on a tag
+;  byte, so a good tag and a bad tag cost the same instructions.  That is
+;  measured by the gate, not asserted here.
+;
+;  Secret buffers carry a sec-style name (secGcmH, secGcmTag).
+;
+;  ======================================================================
+;   .i IS 64 BITS HERE.  WHAT THAT CHANGES, AND THE ONE PLACE IT BITES
+;  ======================================================================
+;
+;  GHASH is defined on 32-bit words, like SHA-256, and the same three
+;  rules that Anvil/Core/sha256.pbi and RaspberryPi4/Lib/aes.pi4 arrived
+;  at apply unchanged:
+;
+;    1. EVERY LOGICAL SHIFT GOES THROUGH GhLsr / GhLsl, which mask.
+;       `>>` is arithmetic on this target and `<<` does not discard at
+;       bit 31, so an open-coded shift leaves rubbish above the word.
+;    2. EVERY RAW BYTE IS READ WITH PeekA, never PeekB.  PeekB
+;       sign-extends, and a ciphertext byte of $80 read with PeekB is
+;       $FFFFFFFFFFFFFF80.
+;    3. EVERY VALUE THAT STANDS FOR A 32-BIT WORD IS HELD CLEAN in
+;       0..$FFFFFFFF and masked with #GCM_W32 wherever it could leave
+;       that range.
+;
+;  ---- GhBmul32 DOES NOT NEED A WIDER MULTIPLY, AND HERE IS WHY --------
+;
+;  The other families' header says the construction uses "only 32-bit
+;  multiplies, which this target computes mod 2^32 exactly".  THAT
+;  SENTENCE IS FALSE HERE - this target computes the full 64-bit product -
+;  and the function is still correct unchanged.  The reason is worth
+;  writing down because it looks like the exact place a port breaks:
+;
+;    * the operands are pre-masked to $11111111 / $22222222 / $44444444 /
+;      $88888888, so each is under 2^32 and the widest product is
+;      $88888888 * $22222222, which is about 2^60.2 - it cannot overflow
+;      a signed 64-bit value and cannot go negative;
+;    * multiplication modulo 2^32 agrees with the full product on bits
+;      0..31, because a carry only ever propagates upward;
+;    * every z is then masked back to a 32-bit sparse pattern.
+;
+;  So the extra 28 bits of product are computed and thrown away.  The
+;  values that COME OUT are bit-for-bit what the 32-bit families produce.
+;
+;  ---- THE ONE THAT ACTUALLY BREAKS: THE TAG VERDICT ------------------
+;
+;  The 32-bit copies end GcmDecrypt with
+;
+;      neq = (diff | (- diff)) >> 31
+;      ProcedureReturn neq ! $FFFFFFFF
+;
+;  which smears the sign bit across the word to make an all-ones mask
+;  when diff is non-zero.  ON A 64-BIT `.i` THE SIGN BIT IS BIT 63, NOT
+;  BIT 31, and there is no mask at the end.
+;
+;  MEASURED, NOT REASONED (mutation M2 in tools/a64/a64_gcm_check.py is
+;  those two lines verbatim, and the sweep watches it die).  With a BAD
+;  tag, diff is non-zero, so (diff | -diff) is -1; an arithmetic `>> 31`
+;  of -1 is still -1, not $00000001; and -1 XOR $FFFFFFFF is
+;  $FFFFFFFF00000000.  THAT IS NOT ZERO.  Every caller that tests the
+;  verdict by asking "is it non-zero" ACCEPTS A FORGED TAG.  It happens
+;  to be zero in the low 32 bits, which is worse rather than better: a
+;  caller that truncates would look correct and a caller that does not
+;  would be silently broken, and both spellings are in this tree.
+;
+;  That is the single most dangerous line in this file and it is the one
+;  line that could not be copied.  It is written as `>> 63` with an
+;  explicit mask, and the gate has a negative for it: a one-bit tag
+;  forgery on every vector, requiring exactly 0.
+;
+;  PROVEN: builds clean for pi4 and passes tools/a64/a64_gcm_check.py -
+;  the NIST/McGrew GCM known-answer set at AES-128/192/256 (the same
+;  table tools/gen_gcm_vectors.py feeds the Pico gates), encrypt AND
+;  decrypt, empty-plaintext, AAD-only and non-96-bit-IV cases, plus
+;  single-bit tag forgeries on every vector and a no-key refusal - under
+;  the A64 model in tools/a64/a64_interp.py, with the constant-time
+;  A/B instruction-count gate green on plaintext and on tag
+;  verification.  NOTHING HERE HAS RUN ON SILICON.
+; ======================================================================
+; ==== PORTABLE CORE A64 BEGIN ====
+
+#GCM_W32 = $FFFFFFFF
+
+; ----------------------------------------------------------------------
+;  STATE - flat Global arrays, house style.  GHASH scratch is
+;  module-global because GHASH runs sequentially (never reentrant, no
+;  recursion).
+; ----------------------------------------------------------------------
+Global Dim secGcmH.a[16]             ; the GHASH key H = E_K(0)   (secret)
+Global Dim GcmZeroNonce.a[12]        ; a zero nonce, for deriving H
+Global Dim GcmJ01.a[12]              ; J0 nonce part
+Global GcmJ02.i                      ; J0 counter part
+Global Dim GcmY.a[16]                ; the running GHASH accumulator
+Global Dim GcmLenBlk.a[16]           ; the final AAD/text length block
+Global Dim secGcmTag.a[16]           ; the recomputed tag             (secret)
+Global Dim GcmTyBuf.a[16]            ; J0-derivation GHASH accumulator
+Global Dim GcmTmp16.a[16]            ; scratch block
+
+Global Dim GhYw.i[4]                 ; GHASH y words
+Global Dim GhHw.i[4]                 ; GHASH h words
+Global Dim GhHwr.i[4]                ; bit-reversed h words
+Global Dim GhA.i[18]                 ; Karatsuba operand a
+Global Dim GhB.i[18]                 ; Karatsuba operand b
+Global Dim GhC.i[18]                 ; Karatsuba products
+Global Dim GhZw.i[8]                 ; reduction words
+Global Dim GhBlk.a[16]               ; zero-padded partial-block scratch
+
+; ----------------------------------------------------------------------
+;  THE TWO SHIFT PRIMITIVES.  Every shift in this file goes through one
+;  of them, for the reason aes.pi4's header gives at length: a shift that
+;  is safe for a reason is a shift whose reason has to be rechecked after
+;  every edit.
+;
+;  MASK FIRST, THEN SHIFT, in GhLsr - masking makes x non-negative, so
+;  the arithmetic `>>` brings in zeroes.  The 32-bit copies must instead
+;  shift and then mask with ((1 << (32 - n)) - 1), which is correct there
+;  and would also be correct here, but only because that mask happens to
+;  be exactly the width of the surviving field.  This spelling is correct
+;  for any x, including a dirty one, without that argument.
+;
+;  n is a public constant at every call site - 1, 2, 7, 8, 16, 24, 29,
+;  30, 31 - never 0 and never 32.
+; ----------------------------------------------------------------------
+Procedure.i GhLsr(x.i, n.i)
+  ProcedureReturn (x & #GCM_W32) >> n
+EndProcedure
+
+Procedure.i GhLsl(x.i, n.i)
+  ProcedureReturn (x << n) & #GCM_W32
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Big-endian 32-bit codec over RAW BYTES.
+;
+;  BYTE ACCESSORS, NOT PeekN, AND THAT IS LOAD-BEARING - the same reason
+;  aes.pi4 gives: AAD, ciphertext and IVs arrive at whatever address the
+;  caller has, and with the MMU off an unaligned wide access on this part
+;  is a silent runaway rather than a fault.  Four PeekA cannot be
+;  misaligned.  The internal word arrays are Dim .i and therefore
+;  aligned, and are indexed, not peeked.
+; ----------------------------------------------------------------------
+Procedure.i GhDec32be(p.i)
+  ProcedureReturn ((PeekA(p) & 255) << 24) | ((PeekA(p + 1) & 255) << 16) | ((PeekA(p + 2) & 255) << 8) | (PeekA(p + 3) & 255)
+EndProcedure
+
+Procedure GhEnc32be(p.i, x.i)
+  PokeB(p,     GhLsr(x, 24) & 255)
+  PokeB(p + 1, GhLsr(x, 16) & 255)
+  PokeB(p + 2, GhLsr(x, 8) & 255)
+  PokeB(p + 3, x & 255)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GhRev32(x) - bit-reverse a 32-bit word.  This is the trick that lets a
+;  low-32 carry-less multiply stand in for the high half of a GF(2)
+;  product: reversing both operands reverses the product, so the top of
+;  the real product is the bottom of the reversed one.
+; ----------------------------------------------------------------------
+Procedure.i GhRev32(x.i)
+  x = GhLsl(x & $55555555, 1) | (GhLsr(x, 1) & $55555555)
+  x = GhLsl(x & $33333333, 2) | (GhLsr(x, 2) & $33333333)
+  x = GhLsl(x & $0F0F0F0F, 4) | (GhLsr(x, 4) & $0F0F0F0F)
+  x = GhLsl(x & $00FF00FF, 8) | (GhLsr(x, 8) & $00FF00FF)
+  ProcedureReturn GhLsl(x, 16) | GhLsr(x, 16)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GhBmul32(x, y) - carry-less (GF(2)) multiply, low 32 bits only.
+;
+;  The operands are split into four sparse quarters so that an ordinary
+;  integer multiply of two of them carries no bit across a nibble
+;  boundary, which makes an ordinary multiply into a carry-less one for
+;  the bits that survive the final mask.  See the header for why the
+;  64-bit product changes nothing.
+; ----------------------------------------------------------------------
+Procedure.i GhBmul32(x.i, y.i)
+  Protected x0.i
+  Protected x1.i
+  Protected x2.i
+  Protected x3.i
+  Protected y0.i
+  Protected y1.i
+  Protected y2.i
+  Protected y3.i
+  Protected z0.i
+  Protected z1.i
+  Protected z2.i
+  Protected z3.i
+  x0 = x & $11111111
+  x1 = x & $22222222
+  x2 = x & $44444444
+  x3 = x & $88888888
+  y0 = y & $11111111
+  y1 = y & $22222222
+  y2 = y & $44444444
+  y3 = y & $88888888
+  z0 = (x0 * y0) ! (x1 * y3) ! (x2 * y2) ! (x3 * y1)
+  z1 = (x0 * y1) ! (x1 * y0) ! (x2 * y3) ! (x3 * y2)
+  z2 = (x0 * y2) ! (x1 * y1) ! (x2 * y0) ! (x3 * y3)
+  z3 = (x0 * y3) ! (x1 * y2) ! (x2 * y1) ! (x3 * y0)
+  z0 = z0 & $11111111
+  z1 = z1 & $22222222
+  z2 = z2 & $44444444
+  z3 = z3 & $88888888
+  ProcedureReturn z0 | z1 | z2 | z3
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GhashOneBlock(src) - fold the ONE 16-byte block at src into the running
+;  GHASH accumulator GhYw, using the key words GhHw / GhHwr already set
+;  up.  Split out of GhashRun in the other families so no single procedure
+;  carried a conditional branch spanning more than ~2 KB (the R4
+;  assembler's relaxation limit, forum tid 492).  THAT LIMIT IS NOT THIS
+;  TARGET'S - the A64 assembler relaxes far branches - and the split is
+;  kept anyway because it is the cleaner shape and because keeping the
+;  procedure boundaries the same across the families is what makes the
+;  copies readable side by side.
+; ----------------------------------------------------------------------
+Procedure GhashOneBlock(src.i)
+  Protected i.i
+  Protected lw.i
+  Protected gd0.i
+  Protected gd1.i
+  Protected gd2.i
+  Protected gd3.i
+  Protected gd4.i
+  Protected gd5.i
+  Protected gd6.i
+  Protected gd7.i
+
+  GhYw[3] = GhYw[3] ! GhDec32be(src)
+  GhYw[2] = GhYw[2] ! GhDec32be(src + 4)
+  GhYw[1] = GhYw[1] ! GhDec32be(src + 8)
+  GhYw[0] = GhYw[0] ! GhDec32be(src + 12)
+
+  GhA[0] = GhYw[0]
+  GhA[1] = GhYw[1]
+  GhA[2] = GhYw[2]
+  GhA[3] = GhYw[3]
+  GhA[4] = GhA[0] ! GhA[1]
+  GhA[5] = GhA[2] ! GhA[3]
+  GhA[6] = GhA[0] ! GhA[2]
+  GhA[7] = GhA[1] ! GhA[3]
+  GhA[8] = GhA[6] ! GhA[7]
+  GhA[9] = GhRev32(GhYw[0])
+  GhA[10] = GhRev32(GhYw[1])
+  GhA[11] = GhRev32(GhYw[2])
+  GhA[12] = GhRev32(GhYw[3])
+  GhA[13] = GhA[9] ! GhA[10]
+  GhA[14] = GhA[11] ! GhA[12]
+  GhA[15] = GhA[9] ! GhA[11]
+  GhA[16] = GhA[10] ! GhA[12]
+  GhA[17] = GhA[15] ! GhA[16]
+
+  GhB[0] = GhHw[0]
+  GhB[1] = GhHw[1]
+  GhB[2] = GhHw[2]
+  GhB[3] = GhHw[3]
+  GhB[4] = GhB[0] ! GhB[1]
+  GhB[5] = GhB[2] ! GhB[3]
+  GhB[6] = GhB[0] ! GhB[2]
+  GhB[7] = GhB[1] ! GhB[3]
+  GhB[8] = GhB[6] ! GhB[7]
+  GhB[9] = GhHwr[0]
+  GhB[10] = GhHwr[1]
+  GhB[11] = GhHwr[2]
+  GhB[12] = GhHwr[3]
+  GhB[13] = GhB[9] ! GhB[10]
+  GhB[14] = GhB[11] ! GhB[12]
+  GhB[15] = GhB[9] ! GhB[11]
+  GhB[16] = GhB[10] ! GhB[12]
+  GhB[17] = GhB[15] ! GhB[16]
+
+  i = 0
+  While i < 18
+    GhC[i] = GhBmul32(GhA[i], GhB[i])
+    i = i + 1
+  Wend
+
+  GhC[4] = GhC[4] ! GhC[0] ! GhC[1]
+  GhC[5] = GhC[5] ! GhC[2] ! GhC[3]
+  GhC[8] = GhC[8] ! GhC[6] ! GhC[7]
+  GhC[13] = GhC[13] ! GhC[9] ! GhC[10]
+  GhC[14] = GhC[14] ! GhC[11] ! GhC[12]
+  GhC[17] = GhC[17] ! GhC[15] ! GhC[16]
+
+  gd0 = GhC[0]
+  gd1 = GhC[4] ! GhLsr(GhRev32(GhC[9]), 1)
+  gd2 = GhC[1] ! GhC[0] ! GhC[2] ! GhC[6] ! GhLsr(GhRev32(GhC[13]), 1)
+  gd3 = GhC[4] ! GhC[5] ! GhC[8] ! GhLsr(GhRev32(GhC[10] ! GhC[9] ! GhC[11] ! GhC[15]), 1)
+  gd4 = GhC[2] ! GhC[1] ! GhC[3] ! GhC[7] ! GhLsr(GhRev32(GhC[13] ! GhC[14] ! GhC[17]), 1)
+  gd5 = GhC[5] ! GhLsr(GhRev32(GhC[11] ! GhC[10] ! GhC[12] ! GhC[16]), 1)
+  gd6 = GhC[3] ! GhLsr(GhRev32(GhC[14]), 1)
+  gd7 = GhLsr(GhRev32(GhC[12]), 1)
+
+  GhZw[0] = GhLsl(gd0, 1)
+  GhZw[1] = GhLsl(gd1, 1) | GhLsr(gd0, 31)
+  GhZw[2] = GhLsl(gd2, 1) | GhLsr(gd1, 31)
+  GhZw[3] = GhLsl(gd3, 1) | GhLsr(gd2, 31)
+  GhZw[4] = GhLsl(gd4, 1) | GhLsr(gd3, 31)
+  GhZw[5] = GhLsl(gd5, 1) | GhLsr(gd4, 31)
+  GhZw[6] = GhLsl(gd6, 1) | GhLsr(gd5, 31)
+  GhZw[7] = GhLsl(gd7, 1) | GhLsr(gd6, 31)
+
+  i = 0
+  While i < 4
+    lw = GhZw[i]
+    GhZw[i + 4] = GhZw[i + 4] ! lw ! GhLsr(lw, 1) ! GhLsr(lw, 2) ! GhLsr(lw, 7)
+    GhZw[i + 3] = GhZw[i + 3] ! GhLsl(lw, 31) ! GhLsl(lw, 30) ! GhLsl(lw, 25)
+    i = i + 1
+  Wend
+
+  GhYw[0] = GhZw[4]
+  GhYw[1] = GhZw[5]
+  GhYw[2] = GhZw[6]
+  GhYw[3] = GhZw[7]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GhashRun(y, h, data, len) - fold len bytes of data into the 16-byte
+;  GHASH accumulator y under key h.  A final partial block is zero-padded,
+;  exactly as GHASH requires.  The per-block work is in GhashOneBlock;
+;  this procedure only selects each block.  Length-driven control only.
+; ----------------------------------------------------------------------
+Procedure GhashRun(y.i, h.i, data.i, len.i)
+  Protected pos.i
+  Protected rem.i
+  Protected src.i
+  Protected i.i
+
+  GhYw[3] = GhDec32be(y)
+  GhYw[2] = GhDec32be(y + 4)
+  GhYw[1] = GhDec32be(y + 8)
+  GhYw[0] = GhDec32be(y + 12)
+  GhHw[3] = GhDec32be(h)
+  GhHw[2] = GhDec32be(h + 4)
+  GhHw[1] = GhDec32be(h + 8)
+  GhHw[0] = GhDec32be(h + 12)
+  GhHwr[3] = GhRev32(GhHw[3])
+  GhHwr[2] = GhRev32(GhHw[2])
+  GhHwr[1] = GhRev32(GhHw[1])
+  GhHwr[0] = GhRev32(GhHw[0])
+
+  pos = data
+  rem = len
+  While rem > 0
+    If rem >= 16
+      src = pos
+      pos = pos + 16
+      rem = rem - 16
+    Else
+      i = 0
+      While i < 16
+        If i < rem
+          GhBlk[i] = PeekA(pos + i) & 255
+        Else
+          GhBlk[i] = 0
+        EndIf
+        i = i + 1
+      Wend
+      src = @GhBlk[0]
+      rem = 0
+    EndIf
+    GhashOneBlock(src)
+  Wend
+
+  GhEnc32be(y,      GhYw[3])
+  GhEnc32be(y + 4,  GhYw[2])
+  GhEnc32be(y + 8,  GhYw[1])
+  GhEnc32be(y + 12, GhYw[0])
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GcmInit(key, keylen) - install the key and derive H = E_K(0^128).
+;
+;  A BAD LENGTH IS A REFUSAL AND IT LEAVES NO KEY INSTALLED, because
+;  AesCtrInit is AesSetKey and that is what AesSetKey does.  H is NOT
+;  derived in that case and stays whatever it was, which does not matter
+;  because every other entry point here goes through AesCtrCore and
+;  AesCtrCore refuses with no key.
+; ----------------------------------------------------------------------
+Procedure.i GcmInit(key.i, keylen.i)
+  Protected i.i
+  Protected r.i
+  r = AesCtrInit(key, keylen)
+  If r = 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < 12
+    GcmZeroNonce[i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < 16
+    secGcmH[i] = 0
+    i = i + 1
+  Wend
+  ; H = E_K(0): the counter block is nonce(0) || 0 and the source is
+  ; zero, so the "ciphertext" IS the keystream, which IS E_K(0).
+  AesCtrCore(@GcmZeroNonce[0], 0, @secGcmH[0], @secGcmH[0], 16)
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GcmComputeJ0(iv, ivlen) - set J0 (nonce part GcmJ01, counter GcmJ02).
+;  A 12-byte IV is used directly; any other length is GHASHed per spec.
+; ----------------------------------------------------------------------
+Procedure GcmComputeJ0(iv.i, ivlen.i)
+  Protected i.i
+  If ivlen = 12
+    i = 0
+    While i < 12
+      GcmJ01[i] = PeekA(iv + i) & 255
+      i = i + 1
+    Wend
+    GcmJ02 = 1
+  Else
+    i = 0
+    While i < 16
+      GcmTyBuf[i] = 0
+      i = i + 1
+    Wend
+    GhashRun(@GcmTyBuf[0], @secGcmH[0], iv, ivlen)
+    ; length block: 12 zero bytes then BE32(ivlen * 8)
+    i = 0
+    While i < 12
+      GcmTmp16[i] = 0
+      i = i + 1
+    Wend
+    GhEnc32be(@GcmTmp16[0] + 12, GhLsl(ivlen, 3))
+    GhashRun(@GcmTyBuf[0], @secGcmH[0], @GcmTmp16[0], 16)
+    i = 0
+    While i < 12
+      GcmJ01[i] = GcmTyBuf[i]
+      i = i + 1
+    Wend
+    GcmJ02 = GhDec32be(@GcmTyBuf[0] + 12)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GcmBuildLenBlock(aadlen, len) - the final GHASH block:
+;  BE64(aadlen*8) || BE64(len*8), into GcmLenBlk.
+; ----------------------------------------------------------------------
+Procedure GcmBuildLenBlock(aadlen.i, len.i)
+  GhEnc32be(@GcmLenBlk[0],      GhLsr(aadlen, 29))
+  GhEnc32be(@GcmLenBlk[0] + 4,  GhLsl(aadlen, 3))
+  GhEnc32be(@GcmLenBlk[0] + 8,  GhLsr(len, 29))
+  GhEnc32be(@GcmLenBlk[0] + 12, GhLsl(len, 3))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GcmEncrypt(iv, ivlen, aad, aadlen, plain, len, cipher, tag)
+; ----------------------------------------------------------------------
+Procedure GcmEncrypt(iv.i, ivlen.i, aad.i, aadlen.i, plain.i, len.i, cipher.i, tag.i)
+  Protected i.i
+  GcmComputeJ0(iv, ivlen)
+  i = 0
+  While i < 16
+    GcmY[i] = 0
+    i = i + 1
+  Wend
+  GhashRun(@GcmY[0], @secGcmH[0], aad, aadlen)
+  AesCtrCore(@GcmJ01[0], (GcmJ02 + 1) & #GCM_W32, plain, cipher, len)
+  GhashRun(@GcmY[0], @secGcmH[0], cipher, len)
+  GcmBuildLenBlock(aadlen, len)
+  GhashRun(@GcmY[0], @secGcmH[0], @GcmLenBlk[0], 16)
+  i = 0
+  While i < 16
+    PokeB(tag + i, GcmY[i])
+    i = i + 1
+  Wend
+  AesCtrCore(@GcmJ01[0], GcmJ02, tag, tag, 16)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GcmDecrypt(iv, ivlen, aad, aadlen, cipher, len, plain, tag)
+;
+;  Returns a constant-time verdict mask: $FFFFFFFF authentic, 0 not.  The
+;  tag is recomputed and compared with an OR-accumulated difference tested
+;  ONCE - never a per-byte branch - so good and bad tags cost the same.
+;  The plaintext is produced regardless; DISCARD IT ON 0.
+;
+;  THE `>> 63` IS NOT A TYPO AND IT IS NOT A COPY OF THE 32-BIT FAMILIES.
+;  See the header: on this target the sign bit is bit 63, and the 32-bit
+;  spelling `>> 31` would return $FFFFFFFE for a forged tag - non-zero,
+;  and therefore "authentic" to every caller that tests for non-zero.
+; ----------------------------------------------------------------------
+Procedure.i GcmDecrypt(iv.i, ivlen.i, aad.i, aadlen.i, cipher.i, len.i, plain.i, tag.i)
+  Protected i.i
+  Protected diff.i
+  Protected neq.i
+  GcmComputeJ0(iv, ivlen)
+  i = 0
+  While i < 16
+    GcmY[i] = 0
+    i = i + 1
+  Wend
+  GhashRun(@GcmY[0], @secGcmH[0], aad, aadlen)
+  GhashRun(@GcmY[0], @secGcmH[0], cipher, len)
+  GcmBuildLenBlock(aadlen, len)
+  GhashRun(@GcmY[0], @secGcmH[0], @GcmLenBlk[0], 16)
+  i = 0
+  While i < 16
+    secGcmTag[i] = GcmY[i]
+    i = i + 1
+  Wend
+  AesCtrCore(@GcmJ01[0], GcmJ02, @secGcmTag[0], @secGcmTag[0], 16)
+  AesCtrCore(@GcmJ01[0], (GcmJ02 + 1) & #GCM_W32, cipher, plain, len)
+  ; constant-time tag compare: OR all sixteen byte-differences, test once
+  diff = 0
+  i = 0
+  While i < 16
+    diff = diff | ((secGcmTag[i] & 255) ! (PeekA(tag + i) & 255))
+    i = i + 1
+  Wend
+  ; neq = all-ones in the low 32 bits if diff <> 0, else 0.  An arithmetic
+  ; right shift by 63 smears bit 63 - the sign of (diff | -diff), which is
+  ; set for every non-zero diff and clear only for zero.
+  neq = ((diff | (- diff)) >> 63) & #GCM_W32
+  ProcedureReturn neq ! #GCM_W32
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GcmWipe() - zero the secret state of this file.  aes.pi4's AesWipe()
+;  is a separate call and the caller wants both; neither includes the
+;  other, per the house rule.
+; ----------------------------------------------------------------------
+Procedure GcmWipe()
+  Protected i.i
+  i = 0
+  While i < 16
+    secGcmH[i] = 0
+    secGcmTag[i] = 0
+    GcmY[i] = 0
+    GcmTyBuf[i] = 0
+    GcmTmp16[i] = 0
+    GcmLenBlk[i] = 0
+    GhBlk[i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < 12
+    GcmJ01[i] = 0
+    i = i + 1
+  Wend
+  GcmJ02 = 0
+  i = 0
+  While i < 4
+    GhYw[i] = 0
+    GhHw[i] = 0
+    GhHwr[i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < 18
+    GhA[i] = 0
+    GhB[i] = 0
+    GhC[i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < 8
+    GhZw[i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+; ==== PORTABLE CORE A64 END ====

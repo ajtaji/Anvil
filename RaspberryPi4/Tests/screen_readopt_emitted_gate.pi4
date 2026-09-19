@@ -1,0 +1,34 @@
+; Host gate injects the actual HvsMirror/HvsFlip bodies at the markers.
+#HVS_DLIST_FIRST=32 : #HVS_DLIST_SECOND=41 : #SCALER_DISPLIST0_OFF=$20
+Global hvs_dlist_at.i : Global hvs_fb.i : Global hvs_w.i : Global hvs_h.i
+Global hvs_up.i : Global hvs_hflip.i : Global hvs_vflip.i
+Global hvs_flip_pending.i : Global hvs_flip_at.i : Global hvs_flip_fb.i
+Global hvs_flip_hf.i : Global hvs_flip_vf.i
+Global gate_active.i : Global gate_requested.i : Global gate_writeAt.i
+Global gate_writeFb.i : Global gate_writeHf.i : Global gate_writeVf.i : Global gate_writes.i
+Procedure.i HvsWriteDlistFor(at.i,fb.i,w.i,h.i,hf.i,vf.i)
+ gate_writeAt=at : gate_writeFb=fb : gate_writeHf=hf : gate_writeVf=vf : gate_writes=gate_writes+1
+ ProcedureReturn at
+EndProcedure
+Procedure.i HvsWriteDlist(at.i,fb.i,w.i,h.i)
+ gate_writes=gate_writes+1 : ProcedureReturn at
+EndProcedure
+Procedure HvsWr(off.i,v.i) : If off=#SCALER_DISPLIST0_OFF : gate_requested=v : EndIf : EndProcedure
+Procedure.i HvsDlistActive() : ProcedureReturn gate_active : EndProcedure
+; @@BODY@@
+Procedure.i Main()
+ hvs_up=0 : HvsMirror(1,1)
+ If hvs_hflip<>1 Or hvs_vflip<>1 Or gate_writes<>0 : ProcedureReturn 1 : EndIf
+ hvs_up=1 : hvs_fb=$4000000 : hvs_w=800 : hvs_h=1280 : hvs_dlist_at=32 : gate_active=32
+ If HvsFlipBegin($4000000,0,0)=0 Or gate_requested<>41 Or gate_writeAt<>41 Or gate_writeHf<>0 Or gate_writeVf<>0 : ProcedureReturn 2 : EndIf
+ If HvsFlipResolve()<>0 Or HvsFlipPending()<>1 Or hvs_dlist_at<>32 : ProcedureReturn 3 : EndIf
+ If HvsFlipBegin($5000000,1,1)<>0 : ProcedureReturn 4 : EndIf
+ gate_active=41
+ If HvsFlipResolve()<>1 Or HvsFlipPending()<>0 Or hvs_dlist_at<>41 Or hvs_hflip<>0 Or hvs_vflip<>0 : ProcedureReturn 5 : EndIf
+ If HvsFlipBegin($4000000,1,1)=0 Or gate_requested<>32 : ProcedureReturn 6 : EndIf
+ ; A bounded caller may leave here pending. Adoption later is still recognized.
+ If HvsFlipResolve()<>0 Or HvsFlipPending()<>1 : ProcedureReturn 7 : EndIf
+ gate_active=32
+ If HvsFlipResolve()<>1 Or hvs_hflip<>1 Or hvs_vflip<>1 Or hvs_dlist_at<>32 : ProcedureReturn 8 : EndIf
+ ProcedureReturn 0
+EndProcedure

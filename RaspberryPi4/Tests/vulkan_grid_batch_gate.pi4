@@ -1,0 +1,193 @@
+; Emitted CPU-only grid batching gate. The checker inserts exact production
+; batch entrypoints; only Vulkan draw and glyph-cache boundaries are stubbed.
+#NEON_VK_CHROME_OK = 0
+#NEON_VK_CHROME_ERR_STATE = -21202
+#NEON_VK_CHROME_ERR_ARGS = -21201
+#NEON_VK_CHROME_ERR_CAPACITY = -21203
+#NEON_VK_CHROME_ERR_ATLAS = -21204
+#NVC_PATH_NONE = 0
+#NEON_VK_CHROME_MAX_VERTEX_QUADS = 20992
+
+Global nvcReady.i, nvcInFrame.i, nvcMapped.i, nvcGridBatchActive.i
+Global nvcGridBatchFirst.i, nvcGridBatchSlot.i, nvcGridBatchGeneration.i
+Global nvcTTDirty.i, nvcPathKind.i, nvcVertices.i, nvcMaxVertexQuads.i
+Global nvcMaxQuads.i, nvcDrawCount.i, nvcError.i
+Global nvcAtlasW.i, nvcAtlasH.i, nvcGridSelected.i, nvcGridParserBound.i
+Global nvcGridGeneration.i, nvcGridGlyphCount.i
+Global nvcGridLastQuadX0.i, nvcGridLastQuadY0.i, nvcGridLastQuadX1.i, nvcGridLastQuadY1.i
+Global nvcGridLastU0.i, nvcGridLastV0.i, nvcGridLastU1.i, nvcGridLastV1.i
+Global nvcGridLastDrawFirst.i, nvcGridLastDrawCount.i, nvcGridLastColour.i
+Global nvcGridQuadCalls.i, nvcGridDrawCalls.i
+Global Dim nvcTTSlot.i[512]
+Global Dim nvcTTGen.i[512]
+Global Dim nvcTTHeight.i[512]
+Global Dim nvcTTGlyph.i[512]
+Global Dim nvcTTX.i[512]
+Global Dim nvcTTY.i[512]
+Global Dim nvcTTW.i[512]
+Global Dim nvcTTH.i[512]
+Global Dim nvcTTBearingX.i[512]
+Global Dim nvcTTBearingY.i[512]
+Global Dim nvcTTAdvance.i[512]
+
+Procedure.i nvcFail(code.i)
+  nvcError = code
+  ProcedureReturn code
+EndProcedure
+
+Procedure.i nvcTTCacheFind(slot.i, generation.i, pixelHeight.i, glyph.i)
+  If slot = nvcTTSlot[0] And generation = nvcTTGen[0] And pixelHeight = nvcTTHeight[0] And glyph = nvcTTGlyph[0]
+    ProcedureReturn 0
+  EndIf
+  If slot = nvcTTSlot[1] And generation = nvcTTGen[1] And pixelHeight = nvcTTHeight[1] And glyph = nvcTTGlyph[1]
+    ProcedureReturn 1
+  EndIf
+  If slot = nvcTTSlot[2] And generation = nvcTTGen[2] And pixelHeight = nvcTTHeight[2] And glyph = nvcTTGlyph[2]
+    ProcedureReturn 2
+  EndIf
+  If slot = nvcTTSlot[3] And generation = nvcTTGen[3] And pixelHeight = nvcTTHeight[3] And glyph = nvcTTGlyph[3]
+    ProcedureReturn 3
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i AnvilTrueTypeSlotSelected()
+  ProcedureReturn nvcGridSelected
+EndProcedure
+
+Procedure.i AnvilTrueTypeSlotParserBound()
+  ProcedureReturn nvcGridParserBound
+EndProcedure
+
+Procedure.i AnvilTrueTypeSlotGeneration(slot.i)
+  If slot <> nvcGridSelected : ProcedureReturn 0 : EndIf
+  ProcedureReturn nvcGridGeneration
+EndProcedure
+
+Procedure.i AnvilTrueTypeGlyphCount()
+  ProcedureReturn nvcGridGlyphCount
+EndProcedure
+
+Procedure.i AnvilTrueTypeUnitsPerEm()
+  ProcedureReturn 2048
+EndProcedure
+
+Procedure.i AnvilTrueTypeAscender()
+  ProcedureReturn 2006
+EndProcedure
+
+Procedure.i AnvilTrueTypeDescender()
+  ProcedureReturn -604
+EndProcedure
+
+Procedure.i neon_F32Ratio(numerator.i, denominator.i)
+  ProcedureReturn numerator
+EndProcedure
+
+Procedure nvcQuad(first.i, x0.i, y0.i, x1.i, y1.i, u0.i, v0.i, u1.i, v1.i)
+  nvcGridQuadCalls + 1
+  nvcGridLastQuadX0 = x0 : nvcGridLastQuadY0 = y0
+  nvcGridLastQuadX1 = x1 : nvcGridLastQuadY1 = y1
+  nvcGridLastU0 = u0 : nvcGridLastV0 = v0
+  nvcGridLastU1 = u1 : nvcGridLastV1 = v1
+EndProcedure
+
+Procedure.i nvcDraw(first.i, count.i, colour.i)
+  If nvcDrawCount >= nvcMaxQuads : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcGridDrawCalls + 1 : nvcDrawCount + 1
+  nvcGridLastDrawFirst = first : nvcGridLastDrawCount = count : nvcGridLastColour = colour
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+;@@GRID_BATCH_PROCS@@
+
+Procedure.i gridCheck(condition.i, code.i)
+  If condition = 0 : ProcedureReturn code : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, i.i, beforeVertices.i, beforeDraws.i
+  ; Real glyph record 65: 10x12 pixels, advance 12, bearings (-2,9), atlas (100,200).
+  nvcReady = 1 : nvcInFrame = 1 : nvcMapped = 1
+  nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1
+  nvcTTDirty = 0 : nvcPathKind = #NVC_PATH_NONE
+  nvcVertices = 0 : nvcMaxVertexQuads = #NEON_VK_CHROME_MAX_VERTEX_QUADS
+  nvcMaxQuads = 4096 : nvcDrawCount = 0 : nvcError = 0
+  nvcAtlasW = 512 : nvcAtlasH = 1024
+  nvcGridSelected = 0 : nvcGridParserBound = 1 : nvcGridGeneration = 7 : nvcGridGlyphCount = 128
+  nvcTTSlot[0] = 0 : nvcTTGen[0] = 7 : nvcTTHeight[0] = 16 : nvcTTGlyph[0] = 65
+  nvcTTX[0] = 100 : nvcTTY[0] = 200 : nvcTTW[0] = 10 : nvcTTH[0] = 12
+  nvcTTBearingX[0] = -2 : nvcTTBearingY[0] = 9 : nvcTTAdvance[0] = 12
+
+  ; An oversized bitmap is fit uniformly, retaining the complete atlas UV range.
+  rc = NeonVkChromeGridBatchBegin() : If rc <> 0 : ProcedureReturn 1 : EndIf
+  rc = NeonVkChromeGridBatchReserve(20480 + 512, 2) : If rc <> 0 : ProcedureReturn 2 : EndIf
+  beforeVertices = nvcVertices
+  rc = NeonVkChromeGridGlyphAppend(65, 16, 0, 0, 8, 8)
+  If rc <> 0 Or nvcVertices <> beforeVertices + 6 : ProcedureReturn 3 : EndIf
+  If nvcGridLastQuadX0 <> 1 Or nvcGridLastQuadY0 <> 0 Or nvcGridLastQuadX1 <> 7 Or nvcGridLastQuadY1 <> 8 : ProcedureReturn 4 : EndIf
+  If nvcGridLastU0 <> 100 Or nvcGridLastV0 <> 200 Or nvcGridLastU1 <> 110 Or nvcGridLastV1 <> 212 : ProcedureReturn 5 : EndIf
+
+  ; A fitting digit-zero quad is byte-for-byte stable; a below-baseline
+  ; bitmap moves into its cell without changing its complete UV interval.
+  nvcTTSlot[1] = 0 : nvcTTGen[1] = 7 : nvcTTHeight[1] = 16 : nvcTTGlyph[1] = 19
+  nvcTTX[1] = 141 : nvcTTY[1] = 2 : nvcTTW[1] = 7 : nvcTTH[1] = 13
+  nvcTTBearingX[1] = 1 : nvcTTBearingY[1] = 12 : nvcTTAdvance[1] = 8
+  rc = NeonVkChromeGridGlyphAppend(19, 16, 100, 200, 8, 16)
+  If rc <> 0 Or nvcGridLastQuadX0 <> 101 Or nvcGridLastQuadY0 <> 201 Or nvcGridLastQuadX1 <> 108 Or nvcGridLastQuadY1 <> 214 : ProcedureReturn 24 : EndIf
+  If nvcGridLastU0 <> 141 Or nvcGridLastV0 <> 2 Or nvcGridLastU1 <> 148 Or nvcGridLastV1 <> 15 : ProcedureReturn 25 : EndIf
+  nvcTTSlot[2] = 0 : nvcTTGen[2] = 7 : nvcTTHeight[2] = 16 : nvcTTGlyph[2] = 64
+  nvcTTX[2] = 200 : nvcTTY[2] = 2 : nvcTTW[2] = 4 : nvcTTH[2] = 5
+  nvcTTBearingX[2] = 0 : nvcTTBearingY[2] = -3 : nvcTTAdvance[2] = 4
+  rc = NeonVkChromeGridGlyphAppend(64, 16, 20, 40, 8, 16)
+  If rc <> 0 Or nvcGridLastQuadX0 <> 22 Or nvcGridLastQuadY0 <> 51 Or nvcGridLastQuadX1 <> 26 Or nvcGridLastQuadY1 <> 56 : ProcedureReturn 26 : EndIf
+  If nvcGridLastU0 <> 200 Or nvcGridLastV0 <> 2 Or nvcGridLastU1 <> 204 Or nvcGridLastV1 <> 7 : ProcedureReturn 27 : EndIf
+  nvcTTSlot[3] = 0 : nvcTTGen[3] = 7 : nvcTTHeight[3] = 16 : nvcTTGlyph[3] = 99
+  nvcTTX[3] = 220 : nvcTTY[3] = 2 : nvcTTW[3] = 14 : nvcTTH[3] = 13
+  nvcTTBearingX[3] = 0 : nvcTTBearingY[3] = 12 : nvcTTAdvance[3] = 16
+  rc = NeonVkChromeGridGlyphAppend(99, 16, 50, 60, 8, 16)
+  If rc <> 0 Or nvcGridLastQuadX0 <> 50 Or nvcGridLastQuadY0 <> 64 Or nvcGridLastQuadX1 <> 58 Or nvcGridLastQuadY1 <> 71 : ProcedureReturn 28 : EndIf
+  If nvcGridLastU0 <> 220 Or nvcGridLastV0 <> 2 Or nvcGridLastU1 <> 234 Or nvcGridLastV1 <> 15 : ProcedureReturn 29 : EndIf
+  ; A zero-area glyph and an unwarmed glyph leave the append cursor untouched.
+  beforeVertices = nvcVertices
+  nvcTTW[0] = 0
+  rc = NeonVkChromeGridGlyphAppend(65, 16, 0, 0, 8, 8)
+  nvcTTW[0] = 10
+  If rc <> 0 Or nvcVertices <> beforeVertices : ProcedureReturn 6 : EndIf
+  rc = NeonVkChromeGridGlyphAppend(66, 16, 0, 0, 8, 8)
+  If rc = 0 Or nvcVertices <> beforeVertices : ProcedureReturn 7 : EndIf
+
+  ; Capacity refusal is atomic and cannot consume vertices or draw records.
+  rc = NeonVkChromeGridBatchReserve(#NEON_VK_CHROME_MAX_VERTEX_QUADS + 1, 2)
+  If rc = 0 Or nvcVertices <> beforeVertices Or nvcDrawCount <> 0 : ProcedureReturn 8 : EndIf
+  rc = NeonVkChromeGridBatchFlush($FF00FF00) : If rc <> 0 : ProcedureReturn 9 : EndIf
+  rc = NeonVkChromeGridGlyphAppend(65, 16, 0, 0, 32, 32) : If rc <> 0 : ProcedureReturn 10 : EndIf
+  rc = NeonVkChromeGridBatchFlush($FFFF0000) : If rc <> 0 : ProcedureReturn 11 : EndIf
+  rc = NeonVkChromeGridBatchEnd() : If rc <> 0 : ProcedureReturn 12 : EndIf
+  If nvcGridDrawCalls <> 2 Or nvcDrawCount <> 2 Or nvcGridLastDrawCount <> 6 Or nvcGridLastColour <> $FFFF0000 : ProcedureReturn 13 : EndIf
+
+  ; A concrete create-time cap below the global maximum must still be honored.
+  nvcInFrame = 1 : nvcGridBatchActive = 0 : nvcGridBatchFirst = nvcVertices : nvcGridBatchSlot = -1
+  nvcMaxVertexQuads = 20480
+  rc = NeonVkChromeGridBatchBegin() : If rc <> 0 : ProcedureReturn 21 : EndIf
+  rc = NeonVkChromeGridBatchReserve(20481, 1)
+  If rc = 0 Or nvcVertices <> 30 Or nvcDrawCount <> 2 : ProcedureReturn 22 : EndIf
+  rc = NeonVkChromeGridBatchEnd() : If rc <> 0 : ProcedureReturn 23 : EndIf
+
+  ; Full 256x80 logical grid fits one vertex reservation and uses at most two draws.
+  nvcInFrame = 1 : nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1
+  nvcMaxVertexQuads = #NEON_VK_CHROME_MAX_VERTEX_QUADS
+  nvcVertices = 0 : nvcDrawCount = 0 : nvcGridDrawCalls = 0
+  rc = NeonVkChromeGridBatchBegin() : If rc <> 0 : ProcedureReturn 14 : EndIf
+  rc = NeonVkChromeGridBatchReserve(20480 + 512, 2) : If rc <> 0 : ProcedureReturn 15 : EndIf
+  For i = 0 To 20479
+    rc = NeonVkChromeGridGlyphAppend(65, 16, 0, 0, 32, 32)
+    If rc <> 0 : ProcedureReturn 16 : EndIf
+  Next
+  If nvcVertices <> 20480 * 6 Or nvcVertices > nvcMaxVertexQuads * 6 : ProcedureReturn 17 : EndIf
+  rc = NeonVkChromeGridBatchFlush($FF00FF00) : If rc <> 0 : ProcedureReturn 18 : EndIf
+  rc = NeonVkChromeGridBatchEnd() : If rc <> 0 : ProcedureReturn 19 : EndIf
+  If nvcDrawCount <> 1 Or nvcGridLastDrawCount <> 20480 * 6 : ProcedureReturn 20 : EndIf
+  ProcedureReturn 0
+EndProcedure

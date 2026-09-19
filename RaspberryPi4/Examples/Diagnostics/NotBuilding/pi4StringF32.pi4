@@ -1,0 +1,326 @@
+; pi4StringF32.pi4 - does the exact float formatter run on real silicon?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; RaspberryPi4/Lib/string_f32.pi4 formats binary32 to decimal and parses
+; it back using nothing but integer arithmetic over a bignum. It is
+; gated hard by tools/a64/a64_string_f32_check.py - against exact
+; rational arithmetic, against Python, and against itself - and every
+; one of those runs happened inside tools/a64/a64_interp.py, which is a
+; MODEL. Rule 17: if the board is attached, the gate runs on the board.
+; This is that program.
+;
+; ======================================================================
+;  IT CARRIES ALMOST NO EXPECTED ANSWERS, AND THAT IS THE POINT
+; ======================================================================
+;
+; The obvious board self-test is a table of expected strings somebody
+; typed. That test passes when the typist and the implementation agree,
+; which is a weaker thing than it looks: both can be wrong in the same
+; way, and a typed table is the first thing to go stale.
+;
+; SO THE MAIN CHECK HERE IS A ROUND TRIP, which needs no table at all:
+; format a bit pattern with StrFRt, parse the text back with ValF, and
+; require the identical 32 bits. That is a property of the pair and it
+; is checkable without knowing the right answer.
+;
+; WHAT A ROUND TRIP CANNOT CATCH, said plainly: two matching bugs. A
+; formatter that wrote the digits backwards and a parser that read them
+; backwards would round-trip perfectly. The desktop gate is what rules
+; that out, by comparing against implementations that never saw this
+; one. This program's job is narrower and worth doing anyway - it
+; answers "does the code that has only ever run under a model also run
+; on the part", and the failures it is looking for are the ones a model
+; cannot have: a wrong division result, an alignment fault, a
+; miscompiled shift.
+;
+; THE ONLY TYPED ANSWERS ARE THE FOUR THE CONTRACT NAMES - "nan",
+; "inf", "-inf" and "-0" - because those are decisions rather than
+; computations, and a decision is exactly the thing worth writing down
+; twice.
+;
+; ======================================================================
+;  BUILT WITH --entry-returns
+; ======================================================================
+;   PureMetalForge.exe --compile pi4StringF32.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+;
+; It returns the number of failures, so the monitor's own line is the
+; verdict; the detail goes over the UART. Nothing here touches a
+; peripheral except the console, so it cannot hang and cannot leave the
+; machine in a state.
+;
+; EXPECT IT TO TAKE A MOMENT. One StrFRt plus one ValF is about 790,000
+; instructions - see the cost section in string_f32.pi4's header - so
+; the sweep below is a few hundred million instructions. At 1.5 GHz
+; that is a fraction of a second, but it is not instant, and if this
+; ever gets extended to the whole 32-bit space it would be a week.
+
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/string_f32.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; The pseudo-random sweep. NOT a claim of coverage: 4096 of 2^32 is one
+; pattern in a million. It is a smoke test for the arithmetic, and the
+; named patterns below are where the real boundary work is.
+#SWEEP = 4096
+
+Global Dim sbuf.a[64]
+Global sv.f
+Global sfails.i
+Global rngState.i
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  A DETERMINISTIC pseudo-random source, so a failure can be reproduced
+;  exactly. xorshift64*, the same shape pi4DamageSelfTest.pi4 uses, and
+;  for the same reason: this is a SWEEP, not entropy, and it must give
+;  the same sweep on every run and on every board.
+; ----------------------------------------------------------------------
+Procedure.i RngNext()
+  Define v.i
+  v = rngState
+  v = v ! (v << 13)
+  v = v ! ((v >> 7) & $01FFFFFFFFFFFFFF)
+  v = v ! (v << 17)
+  rngState = v
+  ProcedureReturn (v >> 32) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RoundTrip(bits) - 0 if it came back, 1 if it did not (and it says so).
+;
+;  A NaN is expected NOT to come back as itself. The contract says
+;  StrFRt writes "nan" for any NaN and ValF reads that as the default
+;  quiet NaN, so the payload cannot survive and is not asked to.
+; ----------------------------------------------------------------------
+Procedure.i RoundTrip(bits.i)
+  Define back.i
+  Define e.i
+  Define want.i
+
+  PokeN(@sv, bits)
+  StrFRt(@sbuf[0], sv)
+  sv = ValF(@sbuf[0])
+  back = PeekN(@sv)
+
+  want = bits
+  e = (bits >> 23) & 255
+  If e = 255
+    If (bits & 8388607) <> 0
+      want = $7FC00000
+    EndIf
+  EndIf
+
+  If back = want
+    ProcedureReturn 0
+  EndIf
+  PutS("  ROUND TRIP FAILED  $") : PutHex(bits, 8)
+  PutS("  ->  '") : PutS(@sbuf[0]) : PutS("'  ->  $") : PutHex(back, 8)
+  PutS("   wanted $") : PutHex(want, 8)
+  PutNl()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SameText(a, b) - 1 if the two NUL-terminated strings match.
+; ----------------------------------------------------------------------
+Procedure.i SameText(*a, *b)
+  Define i.i
+  Define ca.i
+  Define cb.i
+  i = 0
+  Repeat
+    ca = PeekA(a + i)
+    cb = PeekA(b + i)
+    If ca <> cb
+      ProcedureReturn 0
+    EndIf
+    If ca = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ExpectRt(bits, text) - StrFRt must write exactly this.
+;
+;  Used ONLY for the four contract answers. See the header for why
+;  there is not a table of these.
+; ----------------------------------------------------------------------
+Procedure.i ExpectRt(bits.i, *want)
+  PokeN(@sv, bits)
+  StrFRt(@sbuf[0], sv)
+  If SameText(@sbuf[0], want) = 1
+    ProcedureReturn 0
+  EndIf
+  PutS("  WRONG TEXT  $") : PutHex(bits, 8)
+  PutS("  gave '") : PutS(@sbuf[0]) : PutS("'  wanted '") : PutS(want)
+  PutS("'") : PutNl()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define b.i
+  Define n.i
+
+  PutNl()
+  PutS("=== pi4StringF32 - the exact binary32 formatter, on silicon ===")
+  PutNl()
+
+  sfails = 0
+
+  ; -- the four contract answers, the only typed strings here ---------
+  PutS("contract answers:") : PutNl()
+  sfails = sfails + ExpectRt($7FC00000, "nan")
+  sfails = sfails + ExpectRt($FFC00000, "nan")
+  sfails = sfails + ExpectRt($7F800001, "nan")     ; signalling
+  sfails = sfails + ExpectRt($7F800000, "inf")
+  sfails = sfails + ExpectRt($FF800000, "-inf")
+  sfails = sfails + ExpectRt($00000000, "0")
+  sfails = sfails + ExpectRt($80000000, "-0")      ; THE ONE THAT MATTERS
+  PutS("  ") : PutDec(sfails) : PutS(" wrong") : PutNl()
+
+  ; -- StrF's own three refusals and its clamp ------------------------
+  PutS("StrF boundaries:") : PutNl()
+  PokeN(@sv, $80000000)
+  StrF(@sbuf[0], sv, 2)
+  If SameText(@sbuf[0], "-0.00") = 0
+    PutS("  StrF(-0.0, 2) gave '") : PutS(@sbuf[0]) : PutS("'") : PutNl()
+    sfails = sfails + 1
+  EndIf
+  PokeN(@sv, $4F000000)                             ; 2147483648.0
+  StrF(@sbuf[0], sv, 0)
+  If SameText(@sbuf[0], "ovf") = 0
+    PutS("  StrF(2^31, 0) gave '") : PutS(@sbuf[0]) : PutS("'") : PutNl()
+    sfails = sfails + 1
+  EndIf
+  PokeN(@sv, $4EFFFFFF)                             ; 2147483520.0
+  StrF(@sbuf[0], sv, 0)
+  If SameText(@sbuf[0], "2147483520") = 0
+    PutS("  StrF(2147483520, 0) gave '") : PutS(@sbuf[0]) : PutS("'")
+    PutNl()
+    sfails = sfails + 1
+  EndIf
+  PokeN(@sv, $40200000)                             ; 2.5
+  StrF(@sbuf[0], sv, 0)
+  If SameText(@sbuf[0], "3") = 0
+    PutS("  StrF(2.5, 0) gave '") : PutS(@sbuf[0])
+    PutS("' - the tie rule is half AWAY from zero here") : PutNl()
+    sfails = sfails + 1
+  EndIf
+
+  ; -- the named boundary patterns, by round trip ---------------------
+  PutS("boundary round trips:") : PutNl()
+  sfails = sfails + RoundTrip($00000000)            ; +0
+  sfails = sfails + RoundTrip($80000000)            ; -0
+  sfails = sfails + RoundTrip($7F800000)            ; +inf
+  sfails = sfails + RoundTrip($FF800000)            ; -inf
+  sfails = sfails + RoundTrip($7FC00000)            ; quiet NaN
+  sfails = sfails + RoundTrip($7F800001)            ; signalling NaN
+  sfails = sfails + RoundTrip($00000001)            ; smallest subnormal
+  sfails = sfails + RoundTrip($80000001)
+  sfails = sfails + RoundTrip($007FFFFF)            ; largest subnormal
+  sfails = sfails + RoundTrip($00800000)            ; smallest normal
+  sfails = sfails + RoundTrip($80800000)
+  sfails = sfails + RoundTrip($7F7FFFFF)            ; largest finite
+  sfails = sfails + RoundTrip($FF7FFFFF)
+  sfails = sfails + RoundTrip($3F800000)            ; 1.0
+  sfails = sfails + RoundTrip($3DCCCCCD)            ; 0.1
+  sfails = sfails + RoundTrip($4048F5C3)            ; 3.14
+  sfails = sfails + RoundTrip($4B7FFFFF)            ; 16777215
+  sfails = sfails + RoundTrip($4B800000)            ; 16777216
+
+  ; -- the sweep ------------------------------------------------------
+  PutS("sweep of ") : PutDec(#SWEEP) : PutS(" patterns ...") : PutNl()
+  rngState = $2545F4914F6CDD1D
+  n = 0
+  i = 0
+  While i < #SWEEP
+    b = RngNext()
+    n = n + RoundTrip(b)
+    i = i + 1
+  Wend
+  PutS("  ") : PutDec(n) : PutS(" of ") : PutDec(#SWEEP) : PutS(" failed")
+  PutNl()
+  sfails = sfails + n
+
+  PutS("=== ")
+  If sfails = 0
+    PutS("all checks passed ON THE PART. This says the code RUNS")
+    PutNl()
+    PutS("    here; the desktop gate is what says the answers are")
+    PutNl()
+    PutS("    right against implementations that never saw this one.")
+  Else
+    PutDec(sfails) : PutS(" FAILURE(S) - see the lines above")
+  EndIf
+  PutS(" ===")
+  PutNl()
+
+  ProcedureReturn sfails
+EndProcedure

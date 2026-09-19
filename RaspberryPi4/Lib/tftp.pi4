@@ -1,0 +1,2226 @@
+; ======================================================================
+;  tftp.pi4 - the Trivial File Transfer Protocol, RFC 1350, client side.
+; ======================================================================
+;
+;  NOTHING IN THIS FILE HAS RUN ON SILICON. Written 2026-08-26, the day
+;  RaspberryPi4/Lib/net.pi4 answered a ping and received five of five
+;  UDP datagrams from a laptop over a direct cable. The Ethernet cable
+;  was unplugged before this file existed, so every claim below is a
+;  gate claim (tools/a64/a64_tftp_check.py) and not a bench claim. See
+;  WHAT TO RUN WHEN THE CABLE GOES BACK IN at the bottom of this header.
+;
+;  RE-CHECKED 2026-08-27 AND STILL TRUE. It is dated twice on purpose:
+;  an undated "nothing has run" reads as present tense for ever, and six
+;  headers in this directory were false for days because of exactly
+;  that.
+;
+;  WHAT CHANGED THAT DAY WITHOUT CHANGING THIS. Anvil grew `get` and
+;  `put`, so this file finally HAS a caller - it performs no I/O by
+;  design and needs someone to pump GenetRecvWait -> NetInput ->
+;  GenetSend, and until then nothing called it at all. That work was
+;  committed with "NOT RUN ON HARDWARE, AND THE CABLE IS OUT" in its own
+;  message, and there has been no end-to-end transfer in either
+;  direction. Still never executed on a board: the pump, the ARP resolve
+;  (nothing has ever replied for it to parse), the retransmit path,
+;  every EthUp() refusal, and the four net.* settings keys.
+;
+;  THE ONE SENTENCE HERE THAT IS ABOUT ANOTHER FILE WAS THE ONE THAT WAS
+;  RIGHT, and it is worth a line because of what it caught. net.pi4
+;  carried "NOTHING IN THIS FILE HAS RUN ON SILICON" in its own header
+;  at the same time as the paragraph above said it had answered a ping.
+;  Two files in one directory, flatly contradicting each other, and
+;  nothing in the vault to arbitrate. The git history settled it - the
+;  commit introducing net.pi4 is titled "net.pi4: the board answers a
+;  ping" and quotes the transcript - and net.pi4's banner has been
+;  corrected. The record was recoverable only because this paragraph
+;  STATED ITS EVIDENCE. A bare status line cannot be checked against
+;  anything, which is why it is the shape that rots.
+;
+;  A LATENT DEFECT IN THE PROBE, FILED AND NOT FIXED HERE, because
+;  meeting it at the bench would cost a session:
+;  RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4 sends its RRQ
+;  straight after TftpBeginRead with NO ARP RESOLVE FIRST. NetUdpBuild
+;  refuses with #NET_E_NO_ARP until the cache holds the next hop, so on
+;  a bench where the server has not already ARPed the board the probe
+;  prints a send failure it cannot explain - then does it eight more
+;  times on the retransmit timer. Anvil's EthResolve() is the step the
+;  probe is missing.
+;
+;  WHAT THIS IS FOR. Eleven kilobytes a second down a serial line is
+;  twenty-four seconds for a 260 KB image, and it is twenty-four seconds
+;  every single time somebody changes one line. genet.pi4 moves frames,
+;  net.pi4 speaks IPv4 and UDP, fat.pi4 writes files. This file is the
+;  last piece: the thing that turns a working network into a working
+;  workflow, by letting a file be PULLED onto the board over Ethernet.
+;
+;  THE DIRECTION THAT MATTERS IS READ. TftpBeginRead() asks a server for
+;  a file and the file arrives here. TftpBeginWrite() also exists and is
+;  described below, but it is the junior partner: it earns its place
+;  mostly because the canonical fix for the Sorcerer's Apprentice
+;  Syndrome lives on the SENDING side and cannot be written, or gated,
+;  without it.
+;
+;
+;  HOW A CALLER USES IT - AND WHY IT LOOKS LIKE THIS
+;  ----------------------------------------------------------------------
+;  THIS LIBRARY PERFORMS NO INPUT AND NO OUTPUT. It never calls
+;  NetUdpBuild, it never calls GenetSend, it never calls FatWrite, and
+;  it does not know that net.pi4, genet.pi4 or fat.pi4 exist. It builds
+;  TFTP PAYLOADS into one staging buffer and it parses TFTP PAYLOADS out
+;  of a buffer the caller hands it. Everything else is the caller's.
+;
+;  This is the same discipline net.pi4 states in its own header
+;  ("HOW A CALLER USES IT - AND WHY IT LOOKS LIKE THIS", net.pi4:18-58)
+;  and it is here for the same three reasons, which are worth repeating
+;  because they are the reasons this file can be believed at all:
+;
+;   1. A LIBRARY NEVER INCLUDES A LIBRARY here. If this file called
+;      NetUdpBuild it would have to include net.pi4; the main program
+;      lists both instead. That also settles a question that would
+;      otherwise need answering badly: where the received bytes go. They
+;      go wherever the CALLER puts them, because this file cannot see
+;      fat.pi4 either. See THE DESTINATION below.
+;
+;   2. IT MAKES THE GATE POSSIBLE. tools/a64/a64_tftp_check.py feeds
+;      byte-exact TFTP payloads in and reads byte-exact TFTP payloads
+;      out, with no device model, no IP stack and no filesystem in the
+;      path, because there is none of that in the path. A file transfer
+;      layer that did its own I/O would need the whole of net.pi4 and
+;      the whole of genet.pi4 modelled underneath it before a single
+;      block number could be tested.
+;
+;   3. THE CALLER OWNS THE DEADLINE. Nothing in this file waits, and
+;      nothing in this file reads a clock. TftpTick() is handed the
+;      current millisecond by the caller and decides whether the
+;      retransmit timer has expired. net.pi4 reads CNTPCT_EL0 for its
+;      ARP lifetimes and that was the right trade there; here the timer
+;      is the caller's loop timer already, and asking for it as an
+;      argument means the gate can make an hour pass in one call.
+;
+;  THE PUMP, IN FULL. This is the whole of it:
+;
+;      XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+;      XIncludeFile "Anvil/Hal/hal.pbi"
+;      XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+;      XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+;      XIncludeFile "RaspberryPi4/Lib/net.pi4"
+;      XIncludeFile "RaspberryPi4/Lib/tftp.pi4"
+;      ...
+;      NetSetMac(#HW_LINK_WIRED, @mymac[0])
+;      NetSetIPv4(#HW_LINK_WIRED, NetMakeIPv4(192,168,1,50), NetMakeIPv4(255,255,255,0), NetMakeIPv4(192,168,1,1))
+;
+;      TftpInit()
+;      TftpSetMemory($10000000, 16 * 1024 * 1024)      ; SEE THE DESTINATION
+;      port = TftpSuggestPort(TimerMillis())
+;      NetUdpBind(port)                                ; net.pi4 filters for us
+;      TftpBeginRead(NetMakeIPv4(192,168,1,20), "anvil.img", port)
+;
+;      ; Send whatever TftpBeginRead staged - the read request.
+;      NetUdpBuild(#HW_LINK_WIRED, TftpOutIp(), TftpOutPort(), TftpLocalPort(), TftpOutBuf(), TftpOutLen())
+;      GenetSend(NetOutBuf(), NetOutLen(), 100)
+;
+;      Repeat
+;        n = GenetRecvWait(@rx[0], 1600, 50)
+;        If n > 0
+;          r = NetInput(#HW_LINK_WIRED, @rx[0], n)
+;          If r = #NET_IN_REPLY
+;            GenetSend(NetOutBuf(), NetOutLen(), 100)     ; an ARP reply
+;          ElseIf r = #NET_IN_UDP
+;            t = TftpInput(NetUdpRxFrom(), NetUdpRxPort(), NetUdpRxDstPort(), NetUdpRxData(), NetUdpRxLen())
+;            If TftpOutLen() > 0
+;              NetUdpBuild(#HW_LINK_WIRED, TftpOutIp(), TftpOutPort(), TftpLocalPort(), TftpOutBuf(), TftpOutLen())
+;              GenetSend(NetOutBuf(), NetOutLen(), 100)
+;            EndIf
+;          EndIf
+;        EndIf
+;        If TftpTick(TimerMillis()) = 1
+;          NetUdpBuild(#HW_LINK_WIRED, TftpOutIp(), TftpOutPort(), TftpLocalPort(), TftpOutBuf(), TftpOutLen())
+;          GenetSend(NetOutBuf(), NetOutLen(), 100)
+;        EndIf
+;      Until TftpComplete() = 1 Or TftpFailed() = 1
+;
+;  READ TftpOutIp() AND TftpOutPort() EVERY TIME, and never cache them.
+;  Nearly every packet goes to the server, and then one does not: the
+;  ERROR packet this file stages for a stranger who used the wrong
+;  transfer identifier goes to the STRANGER, and sending that to the
+;  server instead would tell the server its own transfer had failed. See
+;  THE TID RULE below - this is the reason the destination travels with
+;  the payload instead of being remembered by the caller.
+;
+;
+;  THE ONE BUFFER THIS FILE OWNS
+;  ----------------------------------------------------------------------
+;  Every builder builds into one staging buffer of #TFTP_OUT_MAX bytes,
+;  reached through TftpOutBuf() and TftpOutLen(). 516 bytes of BSS, which
+;  is four octets of DATA header plus one 512-byte block, because that is
+;  the largest thing this file can ever emit.
+;
+;  EACH BUILD OVERWRITES THE LAST, exactly as in net.pi4. TftpInput()
+;  clears the buffer on entry, so a packet staged by one call is gone by
+;  the next - send it before you pump again. TftpOutLen() is ZERO when
+;  there is nothing to send, and "nothing to send" is a real and
+;  frequent answer: see THE SORCERER'S APPRENTICE below, where staying
+;  silent is the entire point.
+;
+;  THERE IS NO PADDING HERE. net.pi4 pads to the 60-byte Ethernet
+;  minimum in its own buffer (net.pi4:991-1009, net_Finish) and that is
+;  the right place for it, because that minimum is a property of
+;  Ethernet and not of TFTP. A four-byte ACK is a four-byte ACK; the UDP
+;  length field must say 12 and the IP total length must say 32, and if
+;  this file padded the ACK to 60 the lengths would say 68 and the
+;  server would be reading 48 octets of our zeroes as part of nothing.
+;
+;
+;  ENDIANNESS, SAID OUT LOUD BECAUSE THIS IS WHERE IT BITES
+;  ----------------------------------------------------------------------
+;  TFTP IS BIG-ENDIAN ON THE WIRE AND THIS MACHINE IS LITTLE-ENDIAN.
+;  Every multi-byte field in this protocol - the opcode, the block
+;  number, the error code - is exactly two octets, and every one of them
+;  is read and written ONE BYTE AT A TIME through tftp_GetBE16 and
+;  tftp_PutWord.
+;
+;  THERE IS NOT A SINGLE PeekU, PeekW, PeekL, PeekN, PokeU, PokeW, PokeL
+;  OR PokeN AIMED AT A PROTOCOL FIELD ANYWHERE IN THIS FILE. The reason
+;  is the same one net.pi4 gives at length (net.pi4:97-118) and it is
+;  sharper here than anywhere: block number 1 read the wrong way round
+;  is block number 256. That is not a crash and it is not a refusal. It
+;  is a plausible block number, in a protocol whose whole flow control
+;  is "the number I expected plus one", and the transfer simply stalls
+;  while both ends behave impeccably.
+;
+;
+;  THE DESTINATION - AND WHY THIS FILE REFUSES TO GUESS ONE
+;  ----------------------------------------------------------------------
+;  A TFTP client is a machine for writing bytes that a stranger chose
+;  into memory that you own. Nothing here can damage hardware. It can
+;  very easily damage the BOOT IMAGE, and that costs pulling the stick
+;  out of the board and rewriting it on another machine.
+;
+;  So there is no default destination. TftpBeginRead() REFUSES with
+;  #TFTP_E_NO_DEST until the caller has picked one of three:
+;
+;    TftpSetMemory(base, capacity)
+;        Blocks are copied to base + offset. EVERY BLOCK IS BOUNDS
+;        CHECKED before the copy: if offset + length would exceed
+;        capacity the transfer is FAILED with #TFTP_E_DEST_FULL and an
+;        ERROR packet (code 3, "Disk full or allocation exceeded",
+;        rfc1350.txt:518) is staged for the server. It is refused rather
+;        than truncated, and it is refused BEFORE the write rather than
+;        after it. U-Boot does the same thing for the same reason -
+;        v2025.01_net_tftp.c:161-168 checks the store address against
+;        the reserved-memory map and prints "trying to overwrite
+;        reserved memory..." rather than writing.
+;
+;    TftpSetSinkCaller()
+;        Nothing is copied anywhere. TftpBlockData() and TftpBlockLen()
+;        point at the block that has just been accepted, inside the
+;        caller's own receive buffer, valid until the next TftpInput().
+;        THIS IS HOW A FILE GETS ONTO THE BOOT MEDIUM: the caller hands
+;        those bytes to fat.pi4 itself. This file cannot call fat.pi4 -
+;        a library never includes a library - and it should not want to,
+;        because a filesystem write can fail in a dozen ways that a
+;        transfer layer has no vocabulary for.
+;
+;    TftpSetSinkNone()
+;        The bytes are counted and discarded. For measuring a file, and
+;        for proving a path end to end before pointing it at memory that
+;        matters. This is the safe thing to run first on the bench.
+;
+;  THE CAPACITY IS NOT A SUGGESTION. It is checked on every single
+;  block, including after a block-number wraparound, and the arithmetic
+;  it is checked against is 64-bit.
+;
+;
+;  THE TID RULE - THE CLASSIC FIRST-TFTP-CLIENT FAILURE
+;  ----------------------------------------------------------------------
+;  A read request goes to port 69. THE REPLY DOES NOT COME FROM PORT 69.
+;
+;  RFC 1350 calls the two ports "transfer identifiers", and says
+;  (rfc1350.txt:197-210) that each end picks its own TID for the
+;  duration of the connection, that the requester sends its first
+;  request "to the known TID 69 decimal (105 octal) on the serving
+;  host", and that "the response to the request, under normal
+;  operation, uses a TID chosen by the server as its source TID". The
+;  reading example at rfc1350.txt:487-491 spells it out: host A sends
+;  RRQ to destination 69, and host B replies with DATA block 1 from
+;  B's TID.
+;
+;  A client that keeps talking to port 69 gets nowhere, and gets nowhere
+;  quietly, because port 69 is still open and still listening and will
+;  happily treat each of your ACKs as noise. This file therefore:
+;
+;    * sends the RRQ to #TFTP_WELL_KNOWN_PORT, which is 69
+;      [rfc1350.txt:206, v2025.01_net_tftp.c:26];
+;    * ADOPTS THE SOURCE PORT OF THE FIRST DATA PACKET as the server's
+;      TID and sends everything afterwards there. U-Boot does exactly
+;      this at v2025.01_net_tftp.c:632, `tftp_remote_port = src;`, in
+;      the branch that runs when the first block arrives;
+;    * refuses, after that, to accept anything from a different source
+;      port.
+;
+;  AND THE WRONG-TID CASE IS NOT A DROP. RFC 1350 is unusually specific
+;  here (rfc1350.txt:239-246): "If a source TID does not match, the
+;  packet should be discarded as erroneously sent from somewhere else.
+;  An error packet should be sent to the source of the incorrect packet,
+;  while not disturbing the transfer." The scenario it then describes
+;  (rfc1350.txt:248-259) is a duplicated request producing two server
+;  TIDs, and the whole point is that the FIRST connection survives.
+;
+;  So TftpInput() answers such a packet with ERROR code 5, "Unknown
+;  transfer ID" (rfc1350.txt:520), addressed to the stranger, and
+;  changes NOT ONE BYTE of transfer state. It returns
+;  #TFTP_IN_STRANGER, and TftpOutIp() and TftpOutPort() name the
+;  stranger rather than the server. That is the only reason those two
+;  accessors exist.
+;
+;  ONE DELIBERATE NARROWING, AND THE REASON FOR IT. A packet from a
+;  DIFFERENT IP ADDRESS is ignored in silence - no ERROR is sent back.
+;  RFC 1350's scenario is two TIDs on the SAME serving host, which is
+;  what the port check covers. Answering an arbitrary address would make
+;  this board into a thing that can be made to shout at a third party by
+;  anyone willing to forge a source address, and net.pi4 already refuses
+;  that class of favour twice over (net.pi4:148-165, the broadcast ping
+;  and the absent port-unreachable). A refusal to be useful to an
+;  attacker is worth more than exact conformance to a courtesy.
+;
+;
+;  THE 512-BYTE BLOCK, AND WHAT ENDS A TRANSFER
+;  ----------------------------------------------------------------------
+;  Data travels in blocks of 512 octets [rfc1350.txt:91-94,
+;  v2025.01_net_tftp.c:117]. Block numbers begin at ONE and increase by
+;  one [rfc1350.txt:357-360].
+;
+;  A SHORT BLOCK ENDS THE TRANSFER. "The data field is from zero to 512
+;  bytes long. If it is 512 bytes long, the block is not the last block
+;  of data; if it is from zero to 511 bytes long, it signals the end of
+;  the transfer." [rfc1350.txt:361-364] U-Boot's test is the same one
+;  line for line: `if (len < tftp_block_size)` then complete
+;  [v2025.01_net_tftp.c:661-665].
+;
+;  THE TRAP IS A FILE WHOSE LENGTH IS AN EXACT MULTIPLE OF 512. There is
+;  then no short block to end on, so the sender MUST transmit one final
+;  DATA packet carrying ZERO octets of data - a four-byte datagram that
+;  is entirely header. "The end of a transfer is marked by a DATA packet
+;  that contains between 0 and 511 bytes of data (i.e., Datagram length
+;  < 516)" [rfc1350.txt:418-419]. Note the word ZERO.
+;
+;  This file gets that right on both sides and neither side needed a
+;  special case, which is the good kind of correct:
+;
+;    RECEIVING, the test is `length < #TFTP_BLOCK`, and zero is less
+;    than 512. A zero-length final block is stored (copying zero bytes),
+;    acknowledged, and completes the transfer.
+;
+;    SENDING, the length of each block is the smaller of 512 and what
+;    remains. When the file is an exact multiple, the block after the
+;    last full one has zero remaining, so a zero-length DATA is built
+;    and it is short and therefore final.
+;
+;  A client that instead ends when "remaining = 0" would send no final
+;  block for such a file, and the server would sit retransmitting its
+;  last ACK until it timed out. The gate has a case for exactly this
+;  (a 1024-byte file), in both directions.
+;
+;
+;  BLOCK NUMBER WRAPAROUND - WHAT IS DONE, AND WHAT IS NOT
+;  ----------------------------------------------------------------------
+;  The block number is SIXTEEN BITS. RFC 1350 says block numbers begin
+;  at one and increase by one and says nothing whatever about what
+;  happens after 65535, because in 1992 nobody was moving 32 MB by TFTP.
+;  65535 blocks of 512 octets is 33,553,920 bytes, and a client that
+;  treats the wrap as an error, or as a duplicate, or as a restart,
+;  stops dead there.
+;
+;  WHAT THIS FILE DOES: it counts the wraps. The block number after
+;  65535 is expected to be 0, and when block 0 arrives with at least one
+;  block already behind us, tftp_wraps is incremented and the offset
+;  into the destination carries on climbing. The absolute index of a
+;  block is
+;
+;      absolute = tftp_wraps * 65536 + block
+;
+;  with the first block of the file being absolute 1, so the offset is
+;  (absolute - 1) * 512 and it is 64-bit arithmetic throughout. The
+;  sequence 65534, 65535, 0, 1 produces offsets that are contiguous, and
+;  the gate proves that by forcing a wrap.
+;
+;  This is U-Boot's design, deliberately: v2025.01_net_tftp.c:264-278
+;  ("If we receive a sequence number of 0 this means that there was a
+;  wrap around of the (16 bit) counter"), with tftp_block_wrap_offset
+;  added into the store address at :155-156.
+;
+;  WHAT THIS FILE DOES NOT DO, SAID PLAINLY: there is no 32 MB limit and
+;  there is no silent truncation, but there is also no protection
+;  against a genuinely lost wrap. If a client misses SIXTY-FIVE
+;  THOUSAND consecutive blocks the modular arithmetic cannot tell that
+;  from a duplicate, and nothing in the protocol can. Anvil's own image
+;  is around 260 KB, five hundred blocks, so this is theory - it is
+;  written down because the next person will otherwise have to work out
+;  whether it was considered.
+;
+;
+;  THE SORCERER'S APPRENTICE, AND WHY SILENCE IS A FEATURE
+;  ----------------------------------------------------------------------
+;  This is the one bug that a first TFTP client always has, that never
+;  corrupts a file, and that makes every transfer twice as expensive
+;  until it times out.
+;
+;  RFC 1123 section 4.2.3.1 names it and mandates the fix
+;  [rfc1123.txt:2589-2603]:
+;
+;      "Implementations MUST contain the fix for this problem: the
+;       sender (i.e., the side originating the DATA packets) must never
+;       resend the current DATA packet on receipt of a duplicate ACK."
+;
+;  The mechanism [rfc1123.txt:2605-2618] is that a delayed packet
+;  arriving after a timeout produces a duplicate, and if the other side
+;  answers a duplicate with a duplicate of its own then "every datagram
+;  will be sent in duplicate for the remainder of the transfer", and
+;  since the delay was usually congestion in the first place, the
+;  duplicates make more congestion.
+;
+;  BOTH HALVES ARE IMPLEMENTED HERE, and they are different halves:
+;
+;    SENDING (TftpBeginWrite). An ACK whose block number is not the
+;    block we are waiting to have acknowledged is DISCARDED AND NOTHING
+;    IS SENT. That is the RFC 1123 MUST, exactly as worded. It returns
+;    #TFTP_IN_DUP with TftpOutLen() zero.
+;
+;    RECEIVING (TftpBeginRead). A DATA packet carrying a block we have
+;    already stored is DISCARDED AND NOT ACKNOWLEDGED. This is not the
+;    RFC 1123 rule - it is the other end of the same loop, and it is
+;    what U-Boot does at v2025.01_net_tftp.c:597-604, where a block
+;    older than expected breaks out of the handler before any ACK is
+;    built. It returns #TFTP_IN_DUP, again with nothing staged.
+;
+;  NOW THE PART THAT MATTERS, because a careless reading of the
+;  paragraph above produces a client that deadlocks:
+;
+;      A RECEIVER THAT IS SILENT ON DUPLICATES AND HAS NO RETRANSMIT
+;      TIMER WILL HANG FOREVER THE FIRST TIME AN ACK IS LOST.
+;
+;  The server retransmits DATA n; we recognise a duplicate and say
+;  nothing; the server retransmits again; and the two of us are polite
+;  at each other until the server gives up. The two rules are ONE rule
+;  and must be implemented together:
+;
+;      * never speak because the other end spoke twice;
+;      * always speak when YOUR OWN timer expires.
+;
+;  TftpTick() is the second half. U-Boot's is
+;  v2025.01_net_tftp.c:702-712, whose timeout handler re-sends the last
+;  packet and counts the attempts. Deleting TftpTick from the pump loop
+;  is therefore not a simplification, it is the reintroduction of a
+;  hang, and the gate has a mutation for it.
+;
+;  A BLOCK FROM THE FUTURE IS A DIFFERENT ANIMAL and is handled
+;  differently. If the expected block is 7 and block 9 arrives, block 8
+;  was lost; there is no point storing 9 because the file would have a
+;  hole in it. This file re-stages the ACK for the last GOOD block - a
+;  negative acknowledgement in effect - and returns #TFTP_IN_GAP. It
+;  does that AT MOST ONCE PER BLOCK, tracked in tftp_lastNack, because a
+;  lost packet in a windowed server means every remaining packet in the
+;  window arrives out of order and answering all of them "overwhelms the
+;  server" - U-Boot's own word, v2025.01_net_tftp.c:605-616.
+;
+;  OLD OR NEW IS DECIDED MODULO 65536, NOT BY COMPARING. U-Boot
+;  subtracts an unsigned short from a signed short at
+;  v2025.01_net_tftp.c:603 and relies on the sign, which is correct in
+;  practice and unreadable. Here the forward distance from what we
+;  expect to what arrived is taken as (got - expected) & $FFFF, and a
+;  distance above 32767 means the packet is BEHIND us. That is the same
+;  answer, it is obviously the same answer at the wrap, and it needs no
+;  reasoning about integer promotion.
+;
+;
+;  OPTIONS ARE NOT NEGOTIATED, AND AN OACK IS AN ERROR
+;  ----------------------------------------------------------------------
+;  U-Boot's read request carries four option fields - timeout, tsize,
+;  blksize and sometimes windowsize [v2025.01_net_tftp.c:343-362] - and
+;  a server that understands them replies with opcode 6, OACK, which is
+;  not in RFC 1350 at all; it is RFC 2347's extension, and RFC 2348 adds
+;  blksize.
+;
+;  THIS FILE SENDS NO OPTIONS. The request is the plain RFC 1350 one:
+;  opcode, filename, zero, "octet", zero. Three reasons, in order of
+;  weight: a 512-byte block cannot be fragmented and therefore cannot
+;  meet net.pi4's fragment refusal (net.pi4:128-147); options are a
+;  second protocol with its own parser and its own failure mode, and
+;  this file is already the longest thing in the boot path that a
+;  stranger's bytes reach; and 512-byte blocks at gigabit are quick
+;  enough that the 260 KB image is well under a second even at one
+;  round trip per block.
+;
+;  CONSEQUENTLY AN OACK IS A PROTOCOL VIOLATION WHEN WE RECEIVE ONE - a
+;  server may only acknowledge options that were offered. It is answered
+;  with ERROR code 8, which RFC 2347 defines for exactly this, and the
+;  transfer is failed with #TFTP_E_OACK. The alternative, ignoring it
+;  and hoping, gives a server the impression its options were accepted
+;  and then reads its 1428-byte blocks as oversized garbage.
+;
+;  rfc2347.txt and rfc2348.txt are on the disk beside rfc1350.txt so
+;  that this paragraph can be checked rather than believed.
+;
+;
+;  NETASCII IS NOT IMPLEMENTED. OCTET IS THE ONLY MODE.
+;  ----------------------------------------------------------------------
+;  RFC 1350 defines three modes [rfc1350.txt:296-300] and mail is
+;  obsolete by its own text [rfc1350.txt:80-82]. netascii means
+;  translating line endings to and from the network's own form, which
+;  would corrupt an image file in a way that is invisible until the
+;  board fails to boot. "octet" means the bytes arrive as the bytes they
+;  were [rfc1350.txt:301-308]. U-Boot hard-codes it too
+;  [v2025.01_net_tftp.c:341-342].
+;
+;  The mode string is five letters and SIX OCTETS, because it is
+;  terminated by a zero like every other string in this protocol
+;  [rfc1350.txt:287-292]. It is written from named ASCII constants
+;  below, one per letter, because a character literal is not something
+;  this compiler has and because writing 111 with the letter o beside it
+;  is a thing that can be checked.
+;
+;
+;  ERROR PACKETS ARE DECODED INTO ENGLISH
+;  ----------------------------------------------------------------------
+;  A TFTP failure that reaches a person as "-211, code 1" has wasted
+;  everybody's time. There are eight codes, they are listed at
+;  rfc1350.txt:511-522, and TftpCodeText() turns each into a sentence
+;  that says what to do about it. The server's own message string -
+;  "intended for human consumption" [rfc1350.txt:412-413] - is kept
+;  separately in TftpServerMessage(), because a real server says useful
+;  things there like the path it tried.
+;
+;  AN ERROR PACKET IS NOT ACKNOWLEDGED AND NOT RETRANSMITTED
+;  [rfc1350.txt:407-414, and again at :439-441 - "This is only a
+;  courtesy since it will not be retransmitted or acknowledged, so it
+;  may never be received"]. So receiving one stages nothing, and the
+;  ones this file sends are sent once and then forgotten. That is also
+;  why a transfer must have a timeout even though errors exist.
+;
+;  THE TWO CODES THAT MEAN "STOP" RATHER THAN "TRY AGAIN" are 1 (file
+;  not found) and 2 (access violation): U-Boot prints "Not retrying..."
+;  and halts for those two, and restarts for everything else
+;  [v2025.01_net_tftp.c:681-697]. This file has no restart policy of its
+;  own - restarting is the caller's decision - but TftpRetryWorthwhile()
+;  reports the same judgement so a monitor command can act on it.
+;
+;
+;  ERROR CODES - NEGATIVE, AND NUMBERED FROM -200 ON PURPOSE
+;  ----------------------------------------------------------------------
+;  genet.pi4's refusals run -1 to -18, net.pi4's -100 to -122, and these
+;  run from -200. A program using all three prints all three into the
+;  same log and -205 can only ever have come from this file. The gap is
+;  not decoration; it is so that a number in a transcript identifies its
+;  own author. net.pi4:326-340 says the same and it was right.
+;
+;  TftpInput() returns a NON-NEGATIVE #TFTP_IN_* when it succeeded and a
+;  negative #TFTP_E_* when it refused, and the two ranges cannot
+;  overlap. #TFTP_IN_IGNORED is ZERO AND IS NOT AN ERROR.
+;
+;
+;  UNITS
+;  ----------------------------------------------------------------------
+;  Lengths in bytes, times in milliseconds, ports and block numbers as
+;  plain numbers, IPv4 addresses in net.pi4's representation - one
+;  integer whose most significant byte is the first octet, so
+;  192.168.1.20 is $C0A80114. Use NetMakeIPv4() to build one. This file
+;  never takes an address apart, so it does not care, but the caller
+;  hands the same number to NetUdpBuild() and the two must agree.
+;
+;
+;  WHAT TO RUN WHEN THE CABLE GOES BACK IN
+;  ----------------------------------------------------------------------
+;  1. python tools/a64/a64_tftp_check.py --mutate         (green, first)
+;  2. Serve a file from the laptop. tftpd64 on Windows, or on Linux
+;     `sudo dnsmasq --enable-tftp --tftp-root=/srv/tftp --port=0 -d`.
+;     Put a file of EXACTLY 1024 bytes in the root and fetch that first:
+;     it is the exact-multiple case, and it is the one that fails.
+;  3. Run RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4, which
+;     starts with TftpSetSinkNone() so that a wrong address cannot
+;     damage anything, and prints the block count and the byte count.
+;  4. Only then point it at memory, and only then at the boot medium.
+; ======================================================================
+
+
+; ======================================================================
+;  SIZES
+; ======================================================================
+; The block. [rfc1350.txt:91-94 "fixed length blocks of 512 bytes";
+; v2025.01_net_tftp.c:117 "#define TFTP_BLOCK_SIZE 512"]
+#TFTP_BLOCK = 512
+
+; Opcode plus block number. The header on a DATA packet and the whole of
+; an ACK. [rfc1350.txt:348-353, :373-379]
+#TFTP_DATA_HDR = 4
+#TFTP_ACK_LEN  = 4
+
+; The staging buffer: the largest thing this file can build, which is a
+; full DATA packet. A read request with the longest name this file will
+; accept is 2 + 127 + 1 + 6 = 136 and fits easily.
+; 4 + 512.  Written out because this compiler takes only a literal
+; in a constant declaration, so the arithmetic is stated in the comment
+; and the gate re-derives it from #TFTP_DATA_HDR and #TFTP_BLOCK.
+#TFTP_OUT_MAX = 516
+
+; The longest filename accepted. U-Boot's default is 128 including the
+; terminator [v2025.01_net_tftp.c:126 "#define MAX_LEN 128"], and this
+; matches it rather than inventing a different number.
+#TFTP_NAME_MAX = 127
+
+; How much of a server's error message is kept. Its own text, not ours.
+#TFTP_MSG_MAX = 127
+
+; The largest datagram this file will parse: a full DATA packet. Longer
+; than that means the server used a block size nobody negotiated.
+#TFTP_IN_MAX = 516
+
+; 2^16. The block number is sixteen bits and this is where it wraps.
+; [v2025.01_net_tftp.c:120 "#define TFTP_SEQUENCE_SIZE ((ulong)(1<<16))"]
+#TFTP_SEQUENCE = 65536
+#TFTP_BLOCK_MASK = $FFFF
+
+; Half of 2^16. A forward distance greater than this means the block is
+; behind us rather than ahead. See THE SORCERER'S APPRENTICE.
+#TFTP_HALF_SEQUENCE = 32768
+
+
+; ======================================================================
+;  THE PROTOCOL, ALL OF IT CITED
+; ======================================================================
+; Every constant in this block has a line number beside it, and the file
+; it names is in RaspberryPi4/Reference/ in this repository. net.pi4's
+; header asks for exactly this and could not have it
+; (net.pi4:266-290, "ASK FOR THOSE FIVE RFCs TO BE PUT ON THE DISK");
+; rfc1350.txt was downloaded on 2026-08-26, along with 768, 826, 791,
+; 792, 1123, 2347, 2348 and 2349, so this file has what that one wanted.
+
+; ---- the well known port ----
+; "sends its initial request to the known TID 69 decimal (105 octal) on
+;  the serving host" [rfc1350.txt:206; also :545 "(69 for RRQ or WRQ)";
+;  v2025.01_net_tftp.c:26 "#define WELL_KNOWN_PORT 69"]
+#TFTP_WELL_KNOWN_PORT = 69
+
+; ---- the five opcodes ----
+; [rfc1350.txt:266-271, the table headed "opcode  operation";
+;  v2025.01_net_tftp.c:35-39]
+#TFTP_OP_RRQ   = 1        ; Read request
+#TFTP_OP_WRQ   = 2        ; Write request
+#TFTP_OP_DATA  = 3        ; Data
+#TFTP_OP_ACK   = 4        ; Acknowledgment
+#TFTP_OP_ERROR = 5        ; Error
+
+; The sixth, which is NOT RFC 1350's. It is RFC 2347's option
+; acknowledgement [rfc2347.txt, and v2025.01_net_tftp.c:40
+; "#define TFTP_OACK 6"]. It is here so that receiving one can be
+; recognised and refused rather than silently mis-parsed as an
+; unknown number.
+#TFTP_OP_OACK  = 6
+
+; ---- the eight error codes ----
+; [rfc1350.txt:511-522, the table headed "Value     Meaning";
+;  v2025.01_net_tftp.c:59-68 for the same set plus 8]
+#TFTP_ERR_UNDEFINED   = 0   ; Not defined, see error message (if any).
+#TFTP_ERR_NOT_FOUND   = 1   ; File not found.
+#TFTP_ERR_ACCESS      = 2   ; Access violation.
+#TFTP_ERR_DISK_FULL   = 3   ; Disk full or allocation exceeded.
+#TFTP_ERR_ILLEGAL     = 4   ; Illegal TFTP operation.
+#TFTP_ERR_UNKNOWN_TID = 5   ; Unknown transfer ID.
+#TFTP_ERR_EXISTS      = 6   ; File already exists.
+#TFTP_ERR_NO_USER     = 7   ; No such user.
+
+; The ninth, from the options extension rather than from RFC 1350.
+; [rfc2347.txt; v2025.01_net_tftp.c:67 "TFTP_ERR_OPTION_NEGOTIATION = 8"]
+#TFTP_ERR_OPTIONS     = 8   ; Option negotiation failed.
+
+; ---- the mode string, one letter at a time ----
+; "octet" [rfc1350.txt:298; v2025.01_net_tftp.c:341]. Five letters, six
+; octets on the wire because every string in this protocol is
+; terminated by a zero byte [rfc1350.txt:287-292].
+;
+; There are no character literals in this language and there would be no
+; excuse for one here anyway: a number with its letter named beside it
+; is a thing a reader can check against an ASCII table, and 'o' is a
+; thing a reader has to trust the compiler about.
+#TFTP_CH_o = 111          ; the letter o, lower case
+#TFTP_CH_c =  99          ; the letter c, lower case
+#TFTP_CH_t = 116          ; the letter t, lower case
+#TFTP_CH_e = 101          ; the letter e, lower case
+#TFTP_CH_NUL = 0          ; the terminator every string here ends with
+
+; The printable band a filename must lie inside. Space through tilde.
+; RFC 1350 says a filename is "a sequence of bytes in netascii"
+; [rfc1350.txt:296-297] and does not narrow it further; this file
+; narrows it, because a control character in a filename is either a
+; mistake or an attack and neither should reach a server unremarked.
+#TFTP_CH_SPACE = 32       ; a space, the lowest byte a name may hold
+#TFTP_CH_TILDE = 126      ; a tilde, the highest
+
+
+; ======================================================================
+;  DEFAULTS
+; ======================================================================
+; Five seconds and ten attempts. U-Boot's TIMEOUT is 5000 ms
+; [v2025.01_net_tftp.c:28] and its retry count is CONFIG_NET_RETRY_COUNT
+; doubled [:43], which is 5 doubled in the usual configuration. Fifty
+; seconds of total patience for a link that is either there or is not.
+#TFTP_TIMEOUT_MS_DEFAULT = 5000
+#TFTP_RETRIES_DEFAULT    = 10
+
+; The ephemeral port band TftpSuggestPort() picks from. U-Boot's is
+; `1024 + (get_timer(0) % 3072)` [v2025.01_net_tftp.c:924], which is
+; 1024..4095, and this reproduces it exactly rather than inventing a
+; range.
+#TFTP_PORT_BASE  = 1024
+#TFTP_PORT_SPAN  = 3072
+
+
+; ======================================================================
+;  STATES
+; ======================================================================
+#TFTP_IDLE      = 0   ; nothing started
+#TFTP_RRQ_SENT  = 1   ; a read request is out; the server's TID is not
+                      ; known yet and any source port from the server's
+                      ; address is still acceptable
+#TFTP_READING   = 2   ; at least one block has arrived; the TID is locked
+#TFTP_WRQ_SENT  = 3   ; a write request is out; waiting for ACK block 0
+#TFTP_WRITING   = 4   ; sending data blocks
+#TFTP_COMPLETE  = 5   ; finished, successfully
+#TFTP_FAILED    = 6   ; finished, unsuccessfully. TftpError() says why
+
+
+; ======================================================================
+;  WHERE RECEIVED BYTES GO
+; ======================================================================
+#TFTP_SINK_UNSET  = 0   ; nothing chosen. Starting a read is REFUSED.
+#TFTP_SINK_NONE   = 1   ; counted and discarded
+#TFTP_SINK_MEMORY = 2   ; copied to base + offset, bounds checked
+#TFTP_SINK_CALLER = 3   ; not copied; TftpBlockData() points at it
+
+
+; ======================================================================
+;  WHAT TftpInput() RETURNS
+; ======================================================================
+#TFTP_IN_IGNORED  = 0   ; not ours, or nothing to do. NORMAL, not a fault.
+#TFTP_IN_DATA     = 1   ; a new block was stored and an ACK is staged.
+                        ; SEND IT.
+#TFTP_IN_LAST     = 2   ; the FINAL block was stored and its ACK is
+                        ; staged. SEND IT - the transfer is complete but
+                        ; the server is still waiting to hear so.
+#TFTP_IN_DUP      = 3   ; a duplicate. NOTHING IS STAGED, on purpose.
+                        ; See THE SORCERER'S APPRENTICE in the header.
+#TFTP_IN_GAP      = 4   ; a block from the future; a block was lost. The
+                        ; last good ACK is re-staged, once. SEND IT.
+#TFTP_IN_STRANGER = 5   ; the wrong transfer identifier. An ERROR 5 is
+                        ; staged FOR THE STRANGER - TftpOutIp() and
+                        ; TftpOutPort() name them, not the server. SEND
+                        ; IT. The transfer is untouched.
+#TFTP_IN_ERROR    = 6   ; the server sent an ERROR packet. The transfer
+                        ; has FAILED. Nothing is staged, because an
+                        ; ERROR is never acknowledged.
+#TFTP_IN_ACKED    = 7   ; (write) a block was acknowledged and the next
+                        ; DATA is staged. SEND IT.
+#TFTP_IN_SENT     = 8   ; (write) the final block was acknowledged. The
+                        ; transfer is complete. Nothing is staged.
+
+
+; ======================================================================
+;  REFUSALS
+; ======================================================================
+#TFTP_E_NONE        =    0
+#TFTP_E_ARG         = -200  ; a null pointer or a negative length
+#TFTP_E_STATE       = -201  ; the call does not belong in this state
+#TFTP_E_NO_DEST     = -202  ; no destination chosen. Call one of
+                            ; TftpSetMemory / TftpSetSinkCaller /
+                            ; TftpSetSinkNone first.
+#TFTP_E_NAME        = -203  ; the filename is empty, too long, or holds
+                            ; a byte outside the printable band
+#TFTP_E_PORT        = -204  ; a transfer identifier outside 1..65535
+#TFTP_E_RUNT        = -205  ; a datagram too short to hold the field it
+                            ; claims to
+#TFTP_E_OPCODE      = -206  ; an opcode a client must never receive, or
+                            ; one nobody has defined
+#TFTP_E_OACK        = -207  ; options acknowledged that were never
+                            ; offered. See OPTIONS in the header.
+#TFTP_E_OVERSIZE    = -208  ; a DATA block longer than 512 octets
+#TFTP_E_FIRST_BLOCK = -209  ; the first DATA packet was not block 1
+#TFTP_E_DEST_FULL   = -210  ; the block would run past the destination
+                            ; window. REFUSED, NOT TRUNCATED.
+#TFTP_E_SERVER      = -211  ; the server sent an ERROR packet.
+                            ; TftpServerCode() and TftpServerMessage()
+#TFTP_E_TIMEOUT     = -212  ; every retry was used
+#TFTP_E_SOURCE      = -213  ; a write with no source buffer
+#TFTP_E_CANCELLED   = -214  ; the caller called TftpCancel()
+#TFTP_E_TOO_BIG     = -215  ; a write longer than the block numbering
+                            ; can address at all
+
+
+; ======================================================================
+;  STATE
+; ======================================================================
+Global tftp_err.i                    ; the last refusal
+
+Global tftp_state.i
+Global tftp_serverIp.i               ; net.pi4's representation
+Global tftp_serverPort.i             ; the server's TID. 69 until the
+                                     ; first reply moves it.
+Global tftp_localPort.i              ; our TID
+Global tftp_tidLocked.i              ; 1 once the server's TID is known
+
+Global tftp_block.i                  ; the last block number DEALT WITH:
+                                     ; stored, when reading; sent and
+                                     ; awaiting acknowledgement, when
+                                     ; writing. 0..65535.
+Global tftp_wraps.i                  ; how many times the 16-bit block
+                                     ; number has gone round
+Global tftp_bytes.i                  ; bytes accounted for so far
+Global tftp_lastNack.i               ; the block whose ACK was last
+                                     ; re-staged because of a gap, so
+                                     ; that a whole lost window does not
+                                     ; produce a whole window of NACKs
+Global tftp_haveNacked.i             ; 0 until tftp_lastNack means anything
+
+Global tftp_sink.i
+Global tftp_destBase.i
+Global tftp_destCap.i
+
+Global tftp_source.i                 ; the write side's source buffer
+Global tftp_sourceLen.i
+Global tftp_finalSent.i              ; 1 once the short final DATA is out
+
+Global Dim tftp_name.a[#TFTP_NAME_MAX + 1]   ; kept so that a
+Global tftp_nameLen.i                        ; retransmitted request is
+                                             ; byte-identical
+
+Global Dim tftp_out.a[#TFTP_OUT_MAX]
+Global tftp_outLen.i
+Global tftp_outIp.i                  ; WHERE the staged packet goes.
+Global tftp_outPort.i                ; Read them every time - see the
+                                     ; header.
+
+Global tftp_blockPtr.i               ; the caller sink's window onto the
+Global tftp_blockLen.i               ; block just accepted
+
+Global tftp_srvCode.i
+Global Dim tftp_srvMsg.a[#TFTP_MSG_MAX + 1]
+Global tftp_srvMsgLen.i
+
+Global tftp_timeoutMs.i
+Global tftp_retries.i                ; the limit
+Global tftp_tries.i                  ; how many have been spent
+Global tftp_armed.i                  ; 0 = the timer is not running
+Global tftp_deadline.i               ; the millisecond it expires at
+
+; Counters. A transfer that "did not work" is a very different problem
+; depending on which of these moved, and a monitor that prints them
+; turns an evening into a minute.
+Global tftp_dataCount.i
+Global tftp_dupCount.i
+Global tftp_gapCount.i
+Global tftp_strangerCount.i
+Global tftp_retxCount.i
+Global tftp_ignoredCount.i
+
+
+; ======================================================================
+;  SMALL HELPERS
+; ======================================================================
+;  Every one of these exists so that no protocol field is ever touched
+;  by a multi-byte poke. See ENDIANNESS in the header.
+; ----------------------------------------------------------------------
+
+; Read two octets, most significant first, which is network byte order.
+Procedure.i tftp_GetBE16(*p)
+  ProcedureReturn (PeekA(*p) << 8) | PeekA(*p + 1)
+EndProcedure
+
+; The write twin lives further down, beside the staging buffer, because
+; everything this file writes is APPENDED to that buffer rather than
+; poked at an address - see tftp_PutWord().
+
+Procedure tftp_Copy(*dst, *src, n.i)
+  Protected i.i
+  i = 0
+  While i < n
+    PokeB(*dst + i, PeekA(*src + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+; The length of a NUL-terminated byte string, refusing to walk past
+; `limit` so that a caller's unterminated buffer cannot take this file
+; on a tour of the address space. Returns -1 if no terminator was found
+; inside the limit, which every caller treats as a refusal.
+Procedure.i tftp_StrLen(*s, limit.i)
+  Protected i.i
+  i = 0
+  While i <= limit
+    If PeekA(*s + i) = #TFTP_CH_NUL
+      ProcedureReturn i
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+
+; ======================================================================
+;  THE STAGING BUFFER
+; ======================================================================
+Procedure.i TftpOutBuf()
+  ProcedureReturn @tftp_out[0]
+EndProcedure
+
+Procedure.i TftpOutLen()
+  ProcedureReturn tftp_outLen
+EndProcedure
+
+; WHERE the staged packet must be sent. Almost always the server; once
+; in a while a stranger who used the wrong transfer identifier. Read
+; both of these on every send. See THE TID RULE in the header.
+Procedure.i TftpOutIp()
+  ProcedureReturn tftp_outIp
+EndProcedure
+
+Procedure.i TftpOutPort()
+  ProcedureReturn tftp_outPort
+EndProcedure
+
+Procedure TftpOutClear()
+  tftp_outLen = 0
+  tftp_outIp = 0
+  tftp_outPort = 0
+EndProcedure
+
+; Append one octet. Silently refuses to run off the end, and cannot: the
+; buffer is sized to the largest packet this file can build and every
+; builder checks its own lengths first. The guard is here because a
+; buffer overrun that is prevented by arithmetic elsewhere is one
+; refactor away from not being prevented at all.
+Procedure tftp_PutByte(v.i)
+  If tftp_outLen < #TFTP_OUT_MAX
+    tftp_out[tftp_outLen] = v & $FF
+    tftp_outLen = tftp_outLen + 1
+  EndIf
+EndProcedure
+
+; Append two octets, MOST SIGNIFICANT FIRST, which is network byte order.
+;
+; THIS IS THE ONLY PLACE IN THIS FILE THAT WRITES A TWO-OCTET FIELD, and
+; it exists as a procedure rather than as two lines repeated in four
+; builders precisely so that there is one place to get it wrong and one
+; place to check. Every opcode, every block number and every error code
+; on the wire goes through here.
+;
+; There was briefly a second one - a poke-at-an-address version, written
+; to mirror net.pi4's net_PutBE16 - and it had NO CALLERS, because
+; everything here appends. The mutation harness found it: flipping its
+; byte order left the gate green, which is the signature of dead code.
+; It is gone. [found 2026-08-26 by tools/a64/a64_tftp_check.py --mutate]
+Procedure tftp_PutWord(v.i)
+  tftp_PutByte((v >> 8) & $FF)
+  tftp_PutByte(v & $FF)
+EndProcedure
+
+; Append a NUL-terminated string INCLUDING its terminator, which is what
+; every string field in this protocol needs [rfc1350.txt:287-292].
+Procedure tftp_PutText(*s)
+  Protected i.i
+  Protected c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = #TFTP_CH_NUL
+      Break
+    EndIf
+    tftp_PutByte(c)
+    i = i + 1
+  ForEver
+  tftp_PutByte(#TFTP_CH_NUL)
+EndProcedure
+
+; "octet", and the zero after it. Written a letter at a time from the
+; named constants above rather than copied from a literal, so that the
+; six bytes this file puts on the wire can be read off this page.
+Procedure tftp_PutOctetMode()
+  tftp_PutByte(#TFTP_CH_o)
+  tftp_PutByte(#TFTP_CH_c)
+  tftp_PutByte(#TFTP_CH_t)
+  tftp_PutByte(#TFTP_CH_e)
+  tftp_PutByte(#TFTP_CH_t)
+  tftp_PutByte(#TFTP_CH_NUL)
+EndProcedure
+
+; Every builder starts here: clear the buffer, name the destination,
+; write the opcode.
+Procedure tftp_Begin(op.i, ip.i, port.i)
+  tftp_outLen = 0
+  tftp_outIp = ip
+  tftp_outPort = port
+  tftp_PutWord(op)
+EndProcedure
+
+
+; ======================================================================
+;  CONFIGURATION
+; ======================================================================
+
+Procedure.i TftpError()
+  ProcedureReturn tftp_err
+EndProcedure
+
+Procedure.i TftpState()
+  ProcedureReturn tftp_state
+EndProcedure
+
+Procedure.i TftpComplete()
+  If tftp_state = #TFTP_COMPLETE
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i TftpFailed()
+  If tftp_state = #TFTP_FAILED
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The retransmit timer. Both arguments must be positive: a timeout of
+; zero would retransmit on every tick and a retry count of zero would
+; give up before trying, and both are the kind of mistake that looks
+; like a network fault.
+Procedure.i TftpSetTimeout(ms.i, retries.i)
+  If ms < 1
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If retries < 1
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  tftp_timeoutMs = ms
+  tftp_retries = retries
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i TftpTimeoutMs()
+  ProcedureReturn tftp_timeoutMs
+EndProcedure
+
+Procedure.i TftpRetries()
+  ProcedureReturn tftp_retries
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE DESTINATION. Read THE DESTINATION in the header before changing
+;  any of these three. A wrong base here does not produce an error
+;  message, it produces a board that will not boot.
+; ----------------------------------------------------------------------
+Procedure.i TftpSetMemory(base.i, capacity.i)
+  If base = 0
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If capacity < 1
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  tftp_sink = #TFTP_SINK_MEMORY
+  tftp_destBase = base
+  tftp_destCap = capacity
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i TftpSetSinkCaller()
+  tftp_sink = #TFTP_SINK_CALLER
+  tftp_destBase = 0
+  tftp_destCap = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i TftpSetSinkNone()
+  tftp_sink = #TFTP_SINK_NONE
+  tftp_destBase = 0
+  tftp_destCap = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i TftpSink()
+  ProcedureReturn tftp_sink
+EndProcedure
+
+Procedure.i TftpDestBase()
+  ProcedureReturn tftp_destBase
+EndProcedure
+
+Procedure.i TftpDestCapacity()
+  ProcedureReturn tftp_destCap
+EndProcedure
+
+; An ephemeral transfer identifier, from a seed the caller supplies -
+; the millisecond clock is the obvious one. This is U-Boot's own
+; arithmetic, `1024 + (get_timer(0) % 3072)`
+; [v2025.01_net_tftp.c:924], reproduced rather than reinvented, so the
+; band is 1024..4095.
+;
+; A NEGATIVE SEED IS FOLDED RATHER THAN REFUSED, because the obvious
+; seed on a board that has been up for a while is a tick count that has
+; been through some arithmetic, and a refusal here would be an
+; irritation rather than a safeguard.
+Procedure.i TftpSuggestPort(seed.i)
+  Protected s.i
+  s = seed
+  If s < 0
+    s = -s
+  EndIf
+  ProcedureReturn #TFTP_PORT_BASE + (s % #TFTP_PORT_SPAN)
+EndProcedure
+
+Procedure.i TftpLocalPort()
+  ProcedureReturn tftp_localPort
+EndProcedure
+
+Procedure.i TftpServerIp()
+  ProcedureReturn tftp_serverIp
+EndProcedure
+
+; The server's TRANSFER IDENTIFIER, which is 69 only until the first
+; reply arrives and is a different, unpredictable number afterwards.
+Procedure.i TftpServerPort()
+  ProcedureReturn tftp_serverPort
+EndProcedure
+
+Procedure.i TftpTidLocked()
+  ProcedureReturn tftp_tidLocked
+EndProcedure
+
+
+; ======================================================================
+;  PROGRESS
+; ======================================================================
+
+; The last block number seen on the wire, 0..65535. This WRAPS, and a
+; caller printing progress should print TftpBlocksDone() instead.
+Procedure.i TftpBlock()
+  ProcedureReturn tftp_block
+EndProcedure
+
+Procedure.i TftpWraps()
+  ProcedureReturn tftp_wraps
+EndProcedure
+
+; The absolute block count, which does not wrap. The first block of a
+; file is 1. See BLOCK NUMBER WRAPAROUND in the header.
+Procedure.i TftpBlocksDone()
+  ProcedureReturn tftp_wraps * #TFTP_SEQUENCE + tftp_block
+EndProcedure
+
+Procedure.i TftpBytes()
+  ProcedureReturn tftp_bytes
+EndProcedure
+
+; The block just accepted, for #TFTP_SINK_CALLER. It points INTO THE
+; CALLER'S OWN receive buffer and is valid only until the next
+; TftpInput() - this file copies nothing in that mode, which is the
+; whole point of it.
+Procedure.i TftpBlockData()
+  ProcedureReturn tftp_blockPtr
+EndProcedure
+
+Procedure.i TftpBlockLen()
+  ProcedureReturn tftp_blockLen
+EndProcedure
+
+Procedure.i TftpDataCount()
+  ProcedureReturn tftp_dataCount
+EndProcedure
+
+Procedure.i TftpDupCount()
+  ProcedureReturn tftp_dupCount
+EndProcedure
+
+Procedure.i TftpGapCount()
+  ProcedureReturn tftp_gapCount
+EndProcedure
+
+Procedure.i TftpStrangerCount()
+  ProcedureReturn tftp_strangerCount
+EndProcedure
+
+Procedure.i TftpRetransmitCount()
+  ProcedureReturn tftp_retxCount
+EndProcedure
+
+Procedure.i TftpIgnoredCount()
+  ProcedureReturn tftp_ignoredCount
+EndProcedure
+
+Procedure.i TftpTriesUsed()
+  ProcedureReturn tftp_tries
+EndProcedure
+
+
+; ======================================================================
+;  THE SERVER'S OWN COMPLAINT
+; ======================================================================
+Procedure.i TftpServerCode()
+  ProcedureReturn tftp_srvCode
+EndProcedure
+
+; A pointer to the server's message text, NUL-terminated, in memory this
+; file owns. It is the server's words, not ours - "intended for human
+; consumption" [rfc1350.txt:412-413] - and a real server puts genuinely
+; useful things there, such as the path it looked in.
+Procedure.i TftpServerMessage()
+  ProcedureReturn @tftp_srvMsg[0]
+EndProcedure
+
+Procedure.i TftpServerMessageLen()
+  ProcedureReturn tftp_srvMsgLen
+EndProcedure
+
+; Whether trying the same thing again could possibly help. U-Boot makes
+; the same split at v2025.01_net_tftp.c:681-697: it prints "Not
+; retrying..." for file-not-found and access-violation and restarts for
+; everything else. This file does not restart anything by itself -
+; that is a policy decision and it belongs to the caller - but the
+; judgement is worth exporting so a monitor command need not re-derive
+; it.
+Procedure.i TftpRetryWorthwhile()
+  If tftp_srvCode = #TFTP_ERR_NOT_FOUND
+    ProcedureReturn 0
+  EndIf
+  If tftp_srvCode = #TFTP_ERR_ACCESS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  BUILDERS
+; ======================================================================
+
+; A read or write request:
+;   2 bytes opcode | filename | 0 | mode | 0     [rfc1350.txt:287-292]
+;
+; It is rebuilt from tftp_name rather than remembered, so that a
+; retransmitted request is byte-identical to the first one. A server
+; that saw both must be able to tell they are the same request.
+Procedure.i tftp_BuildRequest(op.i)
+  Protected i.i
+  tftp_Begin(op, tftp_serverIp, tftp_serverPort)
+  i = 0
+  While i < tftp_nameLen
+    tftp_PutByte(tftp_name[i])
+    i = i + 1
+  Wend
+  tftp_PutByte(#TFTP_CH_NUL)
+  tftp_PutOctetMode()
+  ProcedureReturn tftp_outLen
+EndProcedure
+
+; An acknowledgement:
+;   2 bytes opcode | 2 bytes block      [rfc1350.txt:373-379]
+;
+; "The block number in an ACK echoes the block number of the DATA packet
+;  being acknowledged." [rfc1350.txt:382-385]
+Procedure.i tftp_BuildAck(block.i)
+  tftp_Begin(#TFTP_OP_ACK, tftp_serverIp, tftp_serverPort)
+  tftp_PutWord(block)
+  ProcedureReturn tftp_outLen
+EndProcedure
+
+; An error:
+;   2 bytes opcode | 2 bytes code | message | 0   [rfc1350.txt:399-404]
+;
+; `ip` and `port` are arguments rather than the server, because the one
+; error this file sends to somebody other than the server - unknown
+; transfer identifier - is the one that matters most.
+Procedure.i tftp_BuildError(ip.i, port.i, code.i, *text)
+  tftp_Begin(#TFTP_OP_ERROR, ip, port)
+  tftp_PutWord(code)
+  tftp_PutText(*text)
+  ProcedureReturn tftp_outLen
+EndProcedure
+
+; A data packet:
+;   2 bytes opcode | 2 bytes block | 0..512 bytes  [rfc1350.txt:348-353]
+;
+; `length` may be ZERO and that is not an edge case, it is the final
+; block of a file whose length is an exact multiple of 512. See THE
+; 512-BYTE BLOCK in the header.
+Procedure.i tftp_BuildData(block.i, *src, length.i)
+  Protected i.i
+  tftp_Begin(#TFTP_OP_DATA, tftp_serverIp, tftp_serverPort)
+  tftp_PutWord(block)
+  i = 0
+  While i < length
+    tftp_PutByte(PeekA(*src + i))
+    i = i + 1
+  Wend
+  ProcedureReturn tftp_outLen
+EndProcedure
+
+
+; ======================================================================
+;  STARTING A TRANSFER
+; ======================================================================
+
+; Copy and validate the filename. Refuses an empty name, a name longer
+; than #TFTP_NAME_MAX, and any byte outside the printable band - see
+; #TFTP_CH_SPACE above for why this file is stricter than RFC 1350.
+Procedure.i tftp_TakeName(*filename)
+  Protected n.i
+  Protected i.i
+  Protected c.i
+  If *filename = 0
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  n = tftp_StrLen(*filename, #TFTP_NAME_MAX)
+  If n < 1
+    ; Either empty, or no terminator inside the limit. Both are
+    ; #TFTP_E_NAME rather than two codes, because the advice is the
+    ; same: look at the string you passed.
+    tftp_err = #TFTP_E_NAME
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < n
+    c = PeekA(*filename + i)
+    If c < #TFTP_CH_SPACE
+      tftp_err = #TFTP_E_NAME
+      ProcedureReturn 0
+    EndIf
+    If c > #TFTP_CH_TILDE
+      tftp_err = #TFTP_E_NAME
+      ProcedureReturn 0
+    EndIf
+    tftp_name[i] = c
+    i = i + 1
+  Wend
+  tftp_name[n] = #TFTP_CH_NUL
+  tftp_nameLen = n
+  ProcedureReturn 1
+EndProcedure
+
+; Everything both directions share. Leaves tftp_state alone; the caller
+; sets it.
+Procedure.i tftp_Arm(serverIp.i, *filename, localPort.i)
+  If localPort < 1
+    tftp_err = #TFTP_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If localPort > 65535
+    tftp_err = #TFTP_E_PORT
+    ProcedureReturn 0
+  EndIf
+  If tftp_TakeName(*filename) = 0
+    ProcedureReturn 0
+  EndIf
+
+  tftp_err = #TFTP_E_NONE
+  tftp_serverIp = serverIp & $FFFFFFFF
+  tftp_serverPort = #TFTP_WELL_KNOWN_PORT
+  tftp_localPort = localPort
+  tftp_tidLocked = 0
+
+  tftp_block = 0
+  tftp_wraps = 0
+  tftp_bytes = 0
+  tftp_lastNack = 0
+  tftp_haveNacked = 0
+  tftp_finalSent = 0
+
+  tftp_blockPtr = 0
+  tftp_blockLen = 0
+
+  tftp_srvCode = 0
+  tftp_srvMsg[0] = #TFTP_CH_NUL
+  tftp_srvMsgLen = 0
+
+  tftp_tries = 0
+  tftp_armed = 0
+  tftp_deadline = 0
+
+  tftp_dataCount = 0
+  tftp_dupCount = 0
+  tftp_gapCount = 0
+  tftp_strangerCount = 0
+  tftp_retxCount = 0
+  tftp_ignoredCount = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Ask a server for a file. On success a READ REQUEST is staged - send it
+; with TftpOutBuf() / TftpOutLen() to TftpOutIp() / TftpOutPort(), which
+; is port 69 for this one packet only.
+;
+; REFUSES until a destination has been chosen. See THE DESTINATION.
+Procedure.i TftpBeginRead(serverIp.i, *filename, localPort.i)
+  TftpOutClear()
+  If tftp_sink = #TFTP_SINK_UNSET
+    tftp_err = #TFTP_E_NO_DEST
+    ProcedureReturn 0
+  EndIf
+  If tftp_Arm(serverIp, *filename, localPort) = 0
+    ProcedureReturn 0
+  EndIf
+  tftp_state = #TFTP_RRQ_SENT
+  tftp_BuildRequest(#TFTP_OP_RRQ)
+  ProcedureReturn 1
+EndProcedure
+
+; Send a file to a server. The source buffer must stay put and unchanged
+; for the whole transfer, because a retransmission reads it again.
+;
+; A WRITE REQUEST is staged. The server answers with ACK block ZERO -
+; "since the positive response to a write request is an acknowledgment
+; packet, in this special case the block number will be zero"
+; [rfc1350.txt:190-194] - and that ACK is what starts the data flowing.
+Procedure.i TftpBeginWrite(serverIp.i, *filename, localPort.i, *source, length.i)
+  TftpOutClear()
+  If length < 0
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn 0
+  EndIf
+  If length > 0 And *source = 0
+    tftp_err = #TFTP_E_SOURCE
+    ProcedureReturn 0
+  EndIf
+  If tftp_Arm(serverIp, *filename, localPort) = 0
+    ProcedureReturn 0
+  EndIf
+  tftp_source = *source
+  tftp_sourceLen = length
+  tftp_state = #TFTP_WRQ_SENT
+  tftp_BuildRequest(#TFTP_OP_WRQ)
+  ProcedureReturn 1
+EndProcedure
+
+; Give up politely. An ERROR packet with code 0 goes to the server, and
+; the transfer is marked failed. It is a courtesy and nothing more:
+; "This is only a courtesy since it will not be retransmitted or
+; acknowledged, so it may never be received" [rfc1350.txt:439-441].
+Procedure.i TftpCancel()
+  TftpOutClear()
+  If tftp_state = #TFTP_IDLE
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn 0
+  EndIf
+  If tftp_state = #TFTP_COMPLETE
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn 0
+  EndIf
+  If tftp_state = #TFTP_FAILED
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn 0
+  EndIf
+  tftp_BuildError(tftp_serverIp, tftp_serverPort, #TFTP_ERR_UNDEFINED, "cancelled by the board")
+  tftp_state = #TFTP_FAILED
+  tftp_err = #TFTP_E_CANCELLED
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  STORING A BLOCK
+; ======================================================================
+;  `absolute` is the block's index counting from 1 and NOT wrapping, so
+;  the offset arithmetic is 64-bit and a wrap costs nothing.
+;
+;  THE BOUNDS CHECK IS BEFORE THE WRITE AND THE REFUSAL IS FINAL. There
+;  is no truncation, no "store what fits", no wrapping round to the
+;  start. A transfer that will not fit is a transfer that was aimed
+;  wrongly, and the useful thing to do about it is to stop loudly while
+;  the destination is still whatever it was. U-Boot does the same at
+;  v2025.01_net_tftp.c:161-168.
+; ----------------------------------------------------------------------
+Procedure.i tftp_Store(absolute.i, *src, length.i)
+  Protected offset.i
+  offset = (absolute - 1) * #TFTP_BLOCK
+  If offset < 0
+    tftp_err = #TFTP_E_DEST_FULL
+    ProcedureReturn 0
+  EndIf
+
+  If tftp_sink = #TFTP_SINK_MEMORY
+    If offset + length > tftp_destCap
+      tftp_err = #TFTP_E_DEST_FULL
+      ProcedureReturn 0
+    EndIf
+    If length > 0
+      tftp_Copy(tftp_destBase + offset, *src, length)
+    EndIf
+  EndIf
+
+  ; In CALLER and NONE modes nothing is copied. The window is published
+  ; either way, because a caller in NONE mode may still want to look.
+  tftp_blockPtr = *src
+  tftp_blockLen = length
+  tftp_bytes = offset + length
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  PROGRESS RESTARTS THE CLOCK
+; ======================================================================
+;  Called whenever the transfer actually moved forward - a block stored,
+;  or a block acknowledged. It does two things and both matter:
+;
+;    THE RETRY COUNT GOES BACK TO ZERO. Ten retries is meant to be ten
+;    consecutive failures, not ten spread over a transfer of a thousand
+;    blocks. Without this a long transfer over a slightly lossy link
+;    accumulates its way to a refusal while succeeding. U-Boot resets it
+;    for the same reason and says so in one word - "we've done well,
+;    reset the timeout" [v2025.01_net_tftp.c:275].
+;
+;    THE TIMER IS DISARMED so the next TftpTick() re-arms it from the
+;    current millisecond. Otherwise the deadline is still measured from
+;    whenever the previous packet went out, and the first tick after a
+;    slow block fires a retransmission of something that has already
+;    been answered. U-Boot re-arms on every stored block too
+;    [v2025.01_net_tftp.c:652-653].
+; ----------------------------------------------------------------------
+Procedure tftp_Progress()
+  tftp_tries = 0
+  tftp_armed = 0
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: DATA
+; ======================================================================
+;  *p points at the TFTP payload, `n` is its length, and the opcode has
+;  already been read off the front.
+; ----------------------------------------------------------------------
+Procedure.i tftp_RecvData(*p, n.i, fromPort.i)
+  Protected blk.i
+  Protected length.i
+  Protected expected.i
+  Protected ahead.i
+  Protected absolute.i
+
+  If n < #TFTP_DATA_HDR
+    tftp_err = #TFTP_E_RUNT
+    ProcedureReturn #TFTP_E_RUNT
+  EndIf
+  blk = tftp_GetBE16(*p + 2)
+  length = n - #TFTP_DATA_HDR
+
+  ; We offered no options, so 512 is the only block size that can
+  ; legitimately arrive. Anything longer means a server negotiated with
+  ; itself, and storing it would put 900 bytes where 512 belong and
+  ; corrupt every block after it.
+  If length > #TFTP_BLOCK
+    tftp_err = #TFTP_E_OVERSIZE
+    tftp_BuildError(tftp_serverIp, fromPort, #TFTP_ERR_ILLEGAL, "this client asked for no options and cannot take a block longer than 512 bytes")
+    tftp_state = #TFTP_FAILED
+    ProcedureReturn #TFTP_E_OVERSIZE
+  EndIf
+
+  ; THE VERY FIRST BLOCK IS JUDGED BEFORE THE DUPLICATE ARITHMETIC IS,
+  ; and that order is not cosmetic. Until a block has arrived there is
+  ; no conversation to have a duplicate in and no last-good block to
+  ; re-acknowledge, so running the gap path here would answer a server
+  ; that opened on block 2 with an acknowledgement of block 0 - a block
+  ; that does not exist in a read - and the two of us would then
+  ; disagree politely until one timed out.
+  ;
+  ; "block numbers are consecutive and begin with one"
+  ; [rfc1350.txt:188-190]. U-Boot calls a first block that is not 1 an
+  ; assertion failure and restarts [v2025.01_net_tftp.c:635-642]; here
+  ; it is a refusal, because a server that opens a conversation in the
+  ; middle is a server we cannot reason about.
+  ;
+  ; THIS WAS A REAL DEFECT, found by the gate on 2026-08-26 before this
+  ; file had ever met a server: the check existed but sat AFTER the
+  ; duplicate-or-gap decision, so a first block of 2 was classified as a
+  ; gap and never reached it.
+  If tftp_state = #TFTP_RRQ_SENT
+    If blk <> 1
+      tftp_err = #TFTP_E_FIRST_BLOCK
+      tftp_state = #TFTP_FAILED
+      ProcedureReturn #TFTP_E_FIRST_BLOCK
+    EndIf
+  EndIf
+
+  expected = (tftp_block + 1) & #TFTP_BLOCK_MASK
+
+  If blk <> expected
+    ; OLD OR NEW, DECIDED MODULO 65536. The forward distance from what
+    ; we want to what we got: small means the packet is ahead of us and
+    ; something was lost; large means it is behind us and it is a
+    ; duplicate. See THE SORCERER'S APPRENTICE in the header for why
+    ; this is done with modular arithmetic instead of a comparison.
+    ahead = (blk - expected) & #TFTP_BLOCK_MASK
+    If ahead >= #TFTP_HALF_SEQUENCE
+      ; A DUPLICATE. NOTHING IS SENT. This is deliberate and it is half
+      ; of the Sorcerer's Apprentice fix; the other half is TftpTick(),
+      ; and without that other half this line is a deadlock.
+      tftp_dupCount = tftp_dupCount + 1
+      ProcedureReturn #TFTP_IN_DUP
+    EndIf
+
+    ; A GAP. Re-acknowledge the last block we actually have, so the
+    ; server backs up to it - but at most once per block, or a whole
+    ; lost window turns into a whole window of complaints.
+    ; [v2025.01_net_tftp.c:605-616]
+    tftp_gapCount = tftp_gapCount + 1
+    If tftp_haveNacked = 1 And tftp_lastNack = tftp_block
+      ProcedureReturn #TFTP_IN_DUP
+    EndIf
+    tftp_lastNack = tftp_block
+    tftp_haveNacked = 1
+    tftp_BuildAck(tftp_block)
+    ProcedureReturn #TFTP_IN_GAP
+  EndIf
+
+  ; ---- the block we were waiting for --------------------------------
+
+  If tftp_state = #TFTP_RRQ_SENT
+    ; THE FIRST BLOCK CARRIES THE SERVER'S TRANSFER IDENTIFIER, and
+    ; everything after this goes to that port and not to 69.
+    ; [rfc1350.txt:487-491; v2025.01_net_tftp.c:632]
+    tftp_serverPort = fromPort
+    tftp_tidLocked = 1
+    tftp_state = #TFTP_READING
+  EndIf
+
+  ; THE WRAP. Block 0 can only mean the 16-bit counter went round,
+  ; because block numbers begin at one. [v2025.01_net_tftp.c:264-278,
+  ; "If we receive a sequence number of 0 this means that there was a
+  ; wrap around of the (16 bit) counter"]
+  ;
+  ; NO EXPLICIT "have we seen a block yet" GUARD IS NEEDED HERE, and
+  ; that is worth a sentence because U-Boot needs one (`tftp_cur_block
+  ; == 0 && tftp_prev_block != 0`, :272). Control only reaches this line
+  ; when blk equalled the expected block, and the expected block is
+  ; (tftp_block + 1) & $FFFF, which is zero only when tftp_block is
+  ; 65535 - which cannot be true until 65535 blocks have been stored. On
+  ; the first packet of any transfer tftp_block is 0, so the expected
+  ; block is 1 and a block 0 would have been refused as the wrong first
+  ; block several lines above.
+  If blk = 0
+    tftp_wraps = tftp_wraps + 1
+  EndIf
+
+  absolute = tftp_wraps * #TFTP_SEQUENCE + blk
+  If tftp_Store(absolute, *p + #TFTP_DATA_HDR, length) = 0
+    ; The destination is full. Tell the server, with the code RFC 1350
+    ; reserves for exactly this - "Disk full or allocation exceeded"
+    ; [rfc1350.txt:518] - and stop. Nothing was written.
+    tftp_BuildError(tftp_serverIp, tftp_serverPort, #TFTP_ERR_DISK_FULL, "the board has no room left for this file")
+    tftp_state = #TFTP_FAILED
+    ProcedureReturn #TFTP_E_DEST_FULL
+  EndIf
+
+  tftp_block = blk
+  tftp_dataCount = tftp_dataCount + 1
+  tftp_haveNacked = 0
+  tftp_Progress()
+  tftp_BuildAck(blk)
+
+  ; A SHORT BLOCK ENDS THE TRANSFER, and zero is short.
+  ; [rfc1350.txt:361-364, :418-419; v2025.01_net_tftp.c:661-665]
+  ;
+  ; THE ACK IS STILL STAGED AND THE CALLER MUST STILL SEND IT. The
+  ; sender "must retransmit it until the packet is acknowledged or the
+  ; sending host times out" [rfc1350.txt:427-428], so a client that
+  ; completes without answering leaves the server retransmitting into
+  ; the dark for its whole timeout. Dallying - waiting a moment in case
+  ; the final ACK is lost and the final DATA comes again - is
+  ; encouraged by the RFC [rfc1350.txt:421-426] and is the caller's
+  ; business, since it is a decision about time.
+  If length < #TFTP_BLOCK
+    tftp_state = #TFTP_COMPLETE
+    ProcedureReturn #TFTP_IN_LAST
+  EndIf
+  ProcedureReturn #TFTP_IN_DATA
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: ACK - the write direction
+; ======================================================================
+Procedure.i tftp_RecvAck(*p, n.i, fromPort.i)
+  Protected blk.i
+  Protected nextBlk.i
+  Protected absolute.i
+  Protected offset.i
+  Protected remaining.i
+  Protected length.i
+
+  If n < #TFTP_ACK_LEN
+    tftp_err = #TFTP_E_RUNT
+    ProcedureReturn #TFTP_E_RUNT
+  EndIf
+  blk = tftp_GetBE16(*p + 2)
+
+  If tftp_state = #TFTP_WRQ_SENT
+    ; The positive answer to a write request is ACK block ZERO
+    ; [rfc1350.txt:190-194, :234-236], and it carries the server's
+    ; transfer identifier just as the first DATA does for a read
+    ; [v2025.01_net_tftp.c:495-500].
+    If blk <> 0
+      tftp_err = #TFTP_E_FIRST_BLOCK
+      tftp_state = #TFTP_FAILED
+      ProcedureReturn #TFTP_E_FIRST_BLOCK
+    EndIf
+    tftp_serverPort = fromPort
+    tftp_tidLocked = 1
+    tftp_state = #TFTP_WRITING
+  ElseIf tftp_state <> #TFTP_WRITING
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn #TFTP_E_STATE
+  EndIf
+
+  If blk <> tftp_block
+    ; A DUPLICATE ACK, AND NOTHING IS SENT.
+    ;
+    ; This is the Sorcerer's Apprentice fix in the exact words RFC 1123
+    ; uses: "the sender ... must never resend the current DATA packet on
+    ; receipt of a duplicate ACK" [rfc1123.txt:2589-2603]. Resending
+    ; here is the single most natural thing to write, it looks helpful,
+    ; and it doubles every packet for the rest of the transfer.
+    tftp_dupCount = tftp_dupCount + 1
+    ProcedureReturn #TFTP_IN_DUP
+  EndIf
+
+  If tftp_finalSent = 1
+    ; The short block has been acknowledged. That is the whole
+    ; definition of a completed write [rfc1350.txt:428-429 - "If the
+    ; response is an ACK, the transmission was completed
+    ; successfully"].
+    tftp_state = #TFTP_COMPLETE
+    ProcedureReturn #TFTP_IN_SENT
+  EndIf
+
+  nextBlk = (blk + 1) & #TFTP_BLOCK_MASK
+  If nextBlk = 0
+    tftp_wraps = tftp_wraps + 1
+  EndIf
+  absolute = tftp_wraps * #TFTP_SEQUENCE + nextBlk
+  offset = (absolute - 1) * #TFTP_BLOCK
+  remaining = tftp_sourceLen - offset
+  If remaining < 0
+    remaining = 0
+  EndIf
+  length = remaining
+  If length > #TFTP_BLOCK
+    length = #TFTP_BLOCK
+  EndIf
+
+  ; A SHORT BLOCK ENDS IT, AND A ZERO-LENGTH BLOCK IS SHORT. When the
+  ; file is an exact multiple of 512 this is the branch that sends the
+  ; four-byte, all-header DATA packet that tells the server the file is
+  ; over. Ending on "remaining = 0" instead - which is what a reader
+  ; expects to see here - would send nothing at all and leave the server
+  ; waiting. See THE 512-BYTE BLOCK in the header.
+  If length < #TFTP_BLOCK
+    tftp_finalSent = 1
+  EndIf
+
+  tftp_block = nextBlk
+  tftp_bytes = offset + length
+  tftp_dataCount = tftp_dataCount + 1
+  tftp_Progress()
+  tftp_BuildData(nextBlk, tftp_source + offset, length)
+  ProcedureReturn #TFTP_IN_ACKED
+EndProcedure
+
+
+; ======================================================================
+;  RECEIVE: ERROR
+; ======================================================================
+;  An ERROR packet is never acknowledged and never retransmitted
+;  [rfc1350.txt:407-414], so this stages NOTHING. It records the code
+;  and the server's own words and fails the transfer.
+; ----------------------------------------------------------------------
+Procedure.i tftp_RecvError(*p, n.i)
+  Protected i.i
+  Protected c.i
+
+  If n < 4
+    tftp_err = #TFTP_E_RUNT
+    ProcedureReturn #TFTP_E_RUNT
+  EndIf
+  tftp_srvCode = tftp_GetBE16(*p + 2)
+
+  ; The message is netascii terminated by a zero byte
+  ; [rfc1350.txt:412-414]. A server that forgets the terminator is not
+  ; unheard of, so the datagram's own length is the second bound, and
+  ; the copy stops at whichever comes first.
+  i = 0
+  While i < #TFTP_MSG_MAX
+    If 4 + i >= n
+      Break
+    EndIf
+    c = PeekA(*p + 4 + i)
+    If c = #TFTP_CH_NUL
+      Break
+    EndIf
+    tftp_srvMsg[i] = c
+    i = i + 1
+  Wend
+  tftp_srvMsg[i] = #TFTP_CH_NUL
+  tftp_srvMsgLen = i
+
+  tftp_err = #TFTP_E_SERVER
+  tftp_state = #TFTP_FAILED
+  ProcedureReturn #TFTP_IN_ERROR
+EndProcedure
+
+
+; ======================================================================
+;  THE FRONT DOOR
+; ======================================================================
+;  Hand it what net.pi4 just delivered:
+;
+;      TftpInput(NetUdpRxFrom(), NetUdpRxPort(), NetUdpRxDstPort(),
+;                NetUdpRxData(), NetUdpRxLen())
+;
+;  Returns a non-negative #TFTP_IN_* or a negative #TFTP_E_*. If
+;  TftpOutLen() is greater than zero afterwards, SEND WHAT IS STAGED, to
+;  TftpOutIp() and TftpOutPort() and not to anywhere remembered.
+; ----------------------------------------------------------------------
+Procedure.i TftpInput(fromIp.i, fromPort.i, toPort.i, *p, length.i)
+  Protected op.i
+
+  TftpOutClear()
+
+  If tftp_state = #TFTP_IDLE
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn #TFTP_E_STATE
+  EndIf
+  If tftp_state = #TFTP_COMPLETE
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn #TFTP_E_STATE
+  EndIf
+  If tftp_state = #TFTP_FAILED
+    tftp_err = #TFTP_E_STATE
+    ProcedureReturn #TFTP_E_STATE
+  EndIf
+  If *p = 0
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn #TFTP_E_ARG
+  EndIf
+  If length < 0
+    tftp_err = #TFTP_E_ARG
+    ProcedureReturn #TFTP_E_ARG
+  EndIf
+
+  ; NOT ADDRESSED TO OUR TRANSFER IDENTIFIER. net.pi4's NetUdpBind()
+  ; will normally have filtered this out already, but the bind is the
+  ; caller's to set and this file will not assume they set it.
+  ; [v2025.01_net_tftp.c:460-462]
+  If toPort <> tftp_localPort
+    tftp_ignoredCount = tftp_ignoredCount + 1
+    ProcedureReturn #TFTP_IN_IGNORED
+  EndIf
+
+  ; FROM A DIFFERENT HOST ENTIRELY: ignored in silence, no ERROR sent
+  ; back. See the last paragraph of THE TID RULE in the header - this is
+  ; a deliberate narrowing of RFC 1350's courtesy, so that a forged
+  ; source address cannot use this board to shout at a third party.
+  If fromIp <> tftp_serverIp
+    tftp_ignoredCount = tftp_ignoredCount + 1
+    ProcedureReturn #TFTP_IN_IGNORED
+  EndIf
+
+  ; THE WRONG TRANSFER IDENTIFIER, from the right host. This is RFC
+  ; 1350's own scenario [rfc1350.txt:239-259]: a duplicated request
+  ; answered twice, from two different server TIDs. The second one gets
+  ; an ERROR 5 and the first conversation carries on undisturbed.
+  ;
+  ; NOTHING BELOW THIS POINT TOUCHES TRANSFER STATE, and that is the
+  ; requirement: "while not disturbing the transfer".
+  If tftp_tidLocked = 1 And fromPort <> tftp_serverPort
+    tftp_strangerCount = tftp_strangerCount + 1
+    tftp_BuildError(fromIp, fromPort, #TFTP_ERR_UNKNOWN_TID, "that transfer identifier belongs to no transfer on this board")
+    ProcedureReturn #TFTP_IN_STRANGER
+  EndIf
+
+  ; A datagram too short to hold an opcode is not a TFTP packet at all.
+  If length < 2
+    tftp_err = #TFTP_E_RUNT
+    ProcedureReturn #TFTP_E_RUNT
+  EndIf
+  If length > #TFTP_IN_MAX
+    tftp_err = #TFTP_E_OVERSIZE
+    tftp_BuildError(tftp_serverIp, fromPort, #TFTP_ERR_ILLEGAL, "that datagram is longer than any packet this client agreed to receive")
+    tftp_state = #TFTP_FAILED
+    ProcedureReturn #TFTP_E_OVERSIZE
+  EndIf
+
+  op = tftp_GetBE16(*p)
+
+  If op = #TFTP_OP_DATA
+    If tftp_state = #TFTP_WRQ_SENT Or tftp_state = #TFTP_WRITING
+      ; We are the sender. Data coming the other way is nonsense.
+      tftp_err = #TFTP_E_OPCODE
+      tftp_BuildError(tftp_serverIp, fromPort, #TFTP_ERR_ILLEGAL, "this board is writing a file and cannot accept data")
+      tftp_state = #TFTP_FAILED
+      ProcedureReturn #TFTP_E_OPCODE
+    EndIf
+    ProcedureReturn tftp_RecvData(*p, length, fromPort)
+  EndIf
+
+  If op = #TFTP_OP_ACK
+    If tftp_state = #TFTP_RRQ_SENT Or tftp_state = #TFTP_READING
+      tftp_err = #TFTP_E_OPCODE
+      tftp_BuildError(tftp_serverIp, fromPort, #TFTP_ERR_ILLEGAL, "this board is reading a file and has nothing to acknowledge")
+      tftp_state = #TFTP_FAILED
+      ProcedureReturn #TFTP_E_OPCODE
+    EndIf
+    ProcedureReturn tftp_RecvAck(*p, length, fromPort)
+  EndIf
+
+  If op = #TFTP_OP_ERROR
+    ProcedureReturn tftp_RecvError(*p, length)
+  EndIf
+
+  If op = #TFTP_OP_OACK
+    ; OPTIONS WE NEVER OFFERED. See OPTIONS ARE NOT NEGOTIATED in the
+    ; header: ignoring this would leave the server convinced it may send
+    ; 1428-byte blocks.
+    tftp_err = #TFTP_E_OACK
+    tftp_BuildError(tftp_serverIp, fromPort, #TFTP_ERR_OPTIONS, "this client offered no options, so there was nothing to acknowledge")
+    tftp_state = #TFTP_FAILED
+    ProcedureReturn #TFTP_E_OACK
+  EndIf
+
+  ; RRQ, WRQ, or a number nobody has defined. A client is not a server
+  ; and must not be talked to as one.
+  tftp_err = #TFTP_E_OPCODE
+  tftp_BuildError(tftp_serverIp, fromPort, #TFTP_ERR_ILLEGAL, "this board is a client and does not answer requests")
+  tftp_state = #TFTP_FAILED
+  ProcedureReturn #TFTP_E_OPCODE
+EndProcedure
+
+
+; Rebuild the data block currently awaiting acknowledgement. Split out
+; of TftpTick() below only because the offset arithmetic is easier to
+; check on its own, and defined ahead of its caller because nothing in
+; this tree relies on a forward reference.
+Procedure.i tftp_RetransmitData()
+  Protected absolute.i
+  Protected offset.i
+  Protected remaining.i
+  Protected length.i
+  absolute = tftp_wraps * #TFTP_SEQUENCE + tftp_block
+  offset = (absolute - 1) * #TFTP_BLOCK
+  remaining = tftp_sourceLen - offset
+  If remaining < 0
+    remaining = 0
+  EndIf
+  length = remaining
+  If length > #TFTP_BLOCK
+    length = #TFTP_BLOCK
+  EndIf
+  tftp_BuildData(tftp_block, tftp_source + offset, length)
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  THE CLOCK - THE OTHER HALF OF THE SORCERER'S APPRENTICE FIX
+; ======================================================================
+;  Call this every time round the pump loop with the current
+;  millisecond. It reads no clock of its own; see reason 3 in the
+;  header.
+;
+;  Returns
+;      0   nothing to do
+;      1   A RETRANSMISSION IS STAGED. Send it, exactly as you would
+;          send anything else.
+;     -212 every retry is spent; the transfer is FAILED.
+;
+;  THIS IS NOT OPTIONAL. A receiver that refuses to answer duplicates -
+;  which this one does, and must - and has no timer of its own will hang
+;  forever the first time an acknowledgement is lost. Read THE
+;  SORCERER'S APPRENTICE in the header before removing this from a pump
+;  loop to make it simpler.
+;
+;  THE TIMER ARMS ITSELF on the first call after anything is staged, so
+;  a caller never has to tell this file what time a packet went out.
+;  That also means a monitor that forgets to call TftpTick until the
+;  first reply is late has not broken anything - it has merely started
+;  the clock late.
+; ----------------------------------------------------------------------
+Procedure.i TftpTick(nowMs.i)
+  ; THE STAGING BUFFER IS CLEARED HERE TOO, exactly as TftpInput()
+  ; clears it. The rule is one rule and it is the rule net.pi4 states:
+  ; build, send, build, send - anything staged is gone by the next call
+  ; that could stage something.
+  ;
+  ; It matters more here than it looks. A pump loop written as
+  ; "call TftpTick, then send if TftpOutLen() is not zero" - which is
+  ; the obvious way to write it - would otherwise find the READ REQUEST
+  ; still sitting in the buffer on every single pass and send it again
+  ; every few microseconds. That is a request storm aimed at a server,
+  ; produced by a client that thinks it is idling.
+  TftpOutClear()
+  If tftp_state = #TFTP_IDLE
+    ProcedureReturn 0
+  EndIf
+  If tftp_state = #TFTP_COMPLETE
+    ProcedureReturn 0
+  EndIf
+  If tftp_state = #TFTP_FAILED
+    ProcedureReturn 0
+  EndIf
+
+  If tftp_armed = 0
+    tftp_armed = 1
+    tftp_deadline = nowMs + tftp_timeoutMs
+    ProcedureReturn 0
+  EndIf
+
+  ; SUBTRACT AND COMPARE AGAINST ZERO rather than comparing the two
+  ; numbers. `now > deadline` is wrong the moment the caller's clock
+  ; wraps, and a millisecond counter on a board that has been up for a
+  ; while is exactly the kind of number that wraps. The difference is
+  ; correct across a wrap for any interval shorter than half the
+  ; counter's range, which a five-second timeout comfortably is.
+  If (nowMs - tftp_deadline) < 0
+    ProcedureReturn 0
+  EndIf
+
+  tftp_tries = tftp_tries + 1
+  If tftp_tries > tftp_retries
+    TftpOutClear()
+    tftp_err = #TFTP_E_TIMEOUT
+    tftp_state = #TFTP_FAILED
+    ProcedureReturn #TFTP_E_TIMEOUT
+  EndIf
+
+  tftp_retxCount = tftp_retxCount + 1
+  tftp_deadline = nowMs + tftp_timeoutMs
+
+  ; REBUILD, DO NOT REPLAY. The staging buffer has been overwritten
+  ; several times since the packet went out - by a stranger's ERROR, by
+  ; a duplicate that staged nothing and cleared it. What is retransmitted
+  ; is therefore built again from state, which also means it is
+  ; byte-identical to what was sent, which is what a server deduplicating
+  ; requests needs it to be.
+  If tftp_state = #TFTP_RRQ_SENT
+    tftp_BuildRequest(#TFTP_OP_RRQ)
+    ProcedureReturn 1
+  EndIf
+  If tftp_state = #TFTP_WRQ_SENT
+    tftp_BuildRequest(#TFTP_OP_WRQ)
+    ProcedureReturn 1
+  EndIf
+  If tftp_state = #TFTP_READING
+    ; Re-acknowledge the last block we have. The server will resend the
+    ; one after it. [v2025.01_net_tftp.c:702-712 does exactly this]
+    tftp_BuildAck(tftp_block)
+    ProcedureReturn 1
+  EndIf
+
+  ; #TFTP_WRITING: resend the current data block. Note that this is our
+  ; OWN timer firing, which is allowed and necessary; what is forbidden
+  ; is resending because a duplicate ACK arrived, and that is refused in
+  ; tftp_RecvAck().
+  ProcedureReturn tftp_RetransmitData()
+EndProcedure
+
+
+; ======================================================================
+;  RESET
+; ======================================================================
+Procedure TftpReset()
+  Protected i.i
+  tftp_err = #TFTP_E_NONE
+  tftp_state = #TFTP_IDLE
+  tftp_serverIp = 0
+  tftp_serverPort = #TFTP_WELL_KNOWN_PORT
+  tftp_localPort = 0
+  tftp_tidLocked = 0
+  tftp_block = 0
+  tftp_wraps = 0
+  tftp_bytes = 0
+  tftp_lastNack = 0
+  tftp_haveNacked = 0
+
+  ; THE SINK IS CLEARED TOO, so that a reset board cannot inherit a
+  ; destination address from a transfer somebody set up an hour ago.
+  ; This is the one piece of state where forgetting is safer than
+  ; remembering.
+  tftp_sink = #TFTP_SINK_UNSET
+  tftp_destBase = 0
+  tftp_destCap = 0
+
+  tftp_source = 0
+  tftp_sourceLen = 0
+  tftp_finalSent = 0
+
+  tftp_nameLen = 0
+  tftp_name[0] = #TFTP_CH_NUL
+
+  tftp_outLen = 0
+  tftp_outIp = 0
+  tftp_outPort = 0
+  i = 0
+  While i < #TFTP_OUT_MAX
+    tftp_out[i] = 0
+    i = i + 1
+  Wend
+
+  tftp_blockPtr = 0
+  tftp_blockLen = 0
+
+  tftp_srvCode = 0
+  tftp_srvMsg[0] = #TFTP_CH_NUL
+  tftp_srvMsgLen = 0
+
+  tftp_timeoutMs = #TFTP_TIMEOUT_MS_DEFAULT
+  tftp_retries = #TFTP_RETRIES_DEFAULT
+  tftp_tries = 0
+  tftp_armed = 0
+  tftp_deadline = 0
+
+  tftp_dataCount = 0
+  tftp_dupCount = 0
+  tftp_gapCount = 0
+  tftp_strangerCount = 0
+  tftp_retxCount = 0
+  tftp_ignoredCount = 0
+EndProcedure
+
+; Call this once before anything else. A program that forgets gets a
+; zero timeout and zero retries, which would retransmit on every tick
+; and give up immediately - so this is not one of the calls that can be
+; skipped.
+Procedure TftpInit()
+  TftpReset()
+EndProcedure
+
+
+; ======================================================================
+;  THE REFUSAL, IN WORDS
+; ======================================================================
+; net.pi4:2309-2311 sets the rule: a number in a log is a number
+; somebody has to look up. Every code above has a sentence here and the
+; sentence says what to do about it wherever there is something to do.
+; ----------------------------------------------------------------------
+Procedure.i TftpErrorText()
+  Select tftp_err
+    Case #TFTP_E_NONE
+      ProcedureReturn "tftp: no refusal recorded"
+    Case #TFTP_E_ARG
+      ProcedureReturn "tftp: REFUSED - a null pointer, a negative length, or a zero timeout"
+    Case #TFTP_E_STATE
+      ProcedureReturn "tftp: REFUSED - that call does not belong in this state. Call TftpBeginRead() to start a transfer, and stop feeding packets in once TftpComplete() or TftpFailed() is true"
+    Case #TFTP_E_NO_DEST
+      ProcedureReturn "tftp: REFUSED - nowhere to put the file. Call TftpSetMemory(base, capacity), or TftpSetSinkCaller() to hand each block to the filesystem yourself, or TftpSetSinkNone() to measure the file without storing it"
+    Case #TFTP_E_NAME
+      ProcedureReturn "tftp: REFUSED - the filename is empty, longer than 127 bytes, unterminated, or holds a byte that is not printable"
+    Case #TFTP_E_PORT
+      ProcedureReturn "tftp: REFUSED - a transfer identifier outside 1 to 65535. TftpSuggestPort() will pick one"
+    Case #TFTP_E_RUNT
+      ProcedureReturn "tftp: REFUSED - a datagram too short to hold the header it must contain"
+    Case #TFTP_E_OPCODE
+      ProcedureReturn "tftp: REFUSED - an operation code this board must never receive. This board is a client, not a server"
+    Case #TFTP_E_OACK
+      ProcedureReturn "tftp: REFUSED - the server acknowledged options that were never offered. This client asks for none, so a 512-byte block is the only thing it can take"
+    Case #TFTP_E_OVERSIZE
+      ProcedureReturn "tftp: REFUSED - a data block longer than 512 bytes. No block size was negotiated, so no other size is legal"
+    Case #TFTP_E_FIRST_BLOCK
+      ProcedureReturn "tftp: REFUSED - the transfer opened on the wrong block number. A read must begin with block 1 and a write must be answered with block 0"
+    Case #TFTP_E_DEST_FULL
+      ProcedureReturn "tftp: REFUSED - the file is larger than the space it was aimed at, and nothing was written. Give TftpSetMemory() more room, or check that the address is the one you meant"
+    Case #TFTP_E_SERVER
+      ProcedureReturn "tftp: the SERVER refused. TftpCodeText() says what its code means and TftpServerMessage() carries its own words"
+    Case #TFTP_E_TIMEOUT
+      ProcedureReturn "tftp: gave up - every retry was spent with no answer. Check the cable, check that the server is running, and check that its address and the board's are on the same subnet"
+    Case #TFTP_E_SOURCE
+      ProcedureReturn "tftp: REFUSED - a write with no source buffer to write from"
+    Case #TFTP_E_CANCELLED
+      ProcedureReturn "tftp: the transfer was cancelled from this end"
+    Case #TFTP_E_TOO_BIG
+      ProcedureReturn "tftp: REFUSED - the file is too large for the block numbering to address"
+    Default
+      ProcedureReturn "tftp: an unnumbered refusal, which is itself a defect"
+  EndSelect
+EndProcedure
+
+; The eight codes RFC 1350 defines, plus the one RFC 2347 adds, each in
+; a sentence rather than as a number. [rfc1350.txt:511-522]
+Procedure.i TftpCodeText(code.i)
+  Select code
+    Case #TFTP_ERR_UNDEFINED
+      ProcedureReturn "the server did not say which error this was; read its own message"
+    Case #TFTP_ERR_NOT_FOUND
+      ProcedureReturn "the server has no such file. Check the spelling, and check that it is inside the directory the server was told to serve"
+    Case #TFTP_ERR_ACCESS
+      ProcedureReturn "the server refused access to that file. It exists but the server process may not read it"
+    Case #TFTP_ERR_DISK_FULL
+      ProcedureReturn "the server has no room for the file, or exceeded its allocation"
+    Case #TFTP_ERR_ILLEGAL
+      ProcedureReturn "the server called this an illegal operation, which usually means it did not understand a packet this board sent"
+    Case #TFTP_ERR_UNKNOWN_TID
+      ProcedureReturn "the server did not recognise the transfer identifier, so it believes this board is talking about a transfer that ended"
+    Case #TFTP_ERR_EXISTS
+      ProcedureReturn "the file already exists on the server and it will not overwrite it"
+    Case #TFTP_ERR_NO_USER
+      ProcedureReturn "no such user. This belongs to the obsolete mail mode and should never appear"
+    Case #TFTP_ERR_OPTIONS
+      ProcedureReturn "option negotiation failed"
+    Default
+      ProcedureReturn "an error code that no version of this protocol defines"
+  EndSelect
+EndProcedure
+
+; What TftpInput() returned, in words. A monitor loop printing this is
+; the difference between watching a transfer and guessing at one.
+Procedure.i TftpInputText(r.i)
+  Select r
+    Case #TFTP_IN_IGNORED
+      ProcedureReturn "ignored - that datagram belongs to somebody else"
+    Case #TFTP_IN_DATA
+      ProcedureReturn "a block arrived and an acknowledgement is ready to send"
+    Case #TFTP_IN_LAST
+      ProcedureReturn "the last block arrived; send the acknowledgement and the file is complete"
+    Case #TFTP_IN_DUP
+      ProcedureReturn "a duplicate, deliberately answered with silence so that the transfer does not double itself"
+    Case #TFTP_IN_GAP
+      ProcedureReturn "a block was lost; the last good acknowledgement is ready to send again"
+    Case #TFTP_IN_STRANGER
+      ProcedureReturn "somebody used the wrong transfer identifier; an error is ready to send back to them and the transfer is untouched"
+    Case #TFTP_IN_ERROR
+      ProcedureReturn "the server sent an error and the transfer has failed"
+    Case #TFTP_IN_ACKED
+      ProcedureReturn "a block was acknowledged and the next one is ready to send"
+    Case #TFTP_IN_SENT
+      ProcedureReturn "the last block was acknowledged and the file has been sent"
+    Default
+      ProcedureReturn "a refusal - call TftpErrorText()"
+  EndSelect
+EndProcedure
+
+; The state, in words.
+Procedure.i TftpStateText()
+  Select tftp_state
+    Case #TFTP_IDLE
+      ProcedureReturn "idle - no transfer has been started"
+    Case #TFTP_RRQ_SENT
+      ProcedureReturn "a read request has gone out and the first block has not arrived, so the server's transfer identifier is not known yet"
+    Case #TFTP_READING
+      ProcedureReturn "reading"
+    Case #TFTP_WRQ_SENT
+      ProcedureReturn "a write request has gone out and has not been acknowledged"
+    Case #TFTP_WRITING
+      ProcedureReturn "writing"
+    Case #TFTP_COMPLETE
+      ProcedureReturn "complete"
+    Case #TFTP_FAILED
+      ProcedureReturn "failed - call TftpErrorText()"
+    Default
+      ProcedureReturn "a state that does not exist, which is itself a defect"
+  EndSelect
+EndProcedure

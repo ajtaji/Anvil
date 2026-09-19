@@ -1,0 +1,369 @@
+
+; ======================================================================
+;  baud - go faster on the wire we already have
+; ======================================================================
+;  115200 is about 11.5 KB a second. Anvil itself is 200 KB, so loading
+;  it takes twenty seconds, and a screenshot takes half a minute. The
+;  USB-C route would be far faster still but nothing is driving that
+;  port on this bench, so the wire in hand is the one to make quicker.
+;
+;  THE PL011'S CLOCK IS 48 MHz HERE - measured, and reported by "info" -
+;  and that divides EXACTLY into the useful high rates:
+;
+;      48000000 / (16 * 1500000) = 2      IBRD 2, FBRD 0
+;      48000000 / (16 * 3000000) = 1      IBRD 1, FBRD 0
+;
+;  No fractional divisor, no accumulated error: 1.5 Mbaud is thirteen
+;  times 115200 and 3 Mbaud is twenty-six times, both dead on.
+;
+;  THE OBVIOUS DANGER, AND WHAT IS DONE ABOUT IT. Changing the board's
+;  rate to something the host adapter cannot do makes the board
+;  unreachable - including unreachable by the reset command, which is
+;  the usual way out. Not a hang, but indistinguishable from one, and
+;  the fix would be a power cycle.
+;
+;  So the switch AUTO-REVERTS. After changing rate the monitor waits for
+;  the host to say ANYTHING at the new speed. If nothing arrives inside
+;  the timeout it puts 115200 back and carries on. Trying a rate costs
+;  nothing but the wait, and a rate that does not work cannot strand the
+;  board.
+;
+;  THE HOST SIDE, in order:
+;      send "baud 1500000" at the old rate
+;      wait for the port to go quiet
+;      close and reopen at 1500000
+;      send a carriage return - THIS is what confirms the rate
+;      the prompt comes back, and the new rate is kept
+;  tools/anvil.py does this in Anvil.setbaud().
+; ----------------------------------------------------------------------
+#BAUD_CONFIRM_MS = 8000        ; how long to wait for the host to speak
+#BAUD_DEFAULT    = 115200
+
+Global gBaud.i = 115200        ; what the port is running at now
+
+Procedure.i CurrentBaud()
+  ProcedureReturn gBaud
+EndProcedure
+
+Procedure CmdBaud()
+  Define n.i
+  Define t0.i
+  Define got.i
+
+  n = ParseDec()
+  If gParseOk = 0
+    Print("This serial line is running at ")
+    PrintDec(gBaud)
+    PrintN(" baud.")
+    PrintN("  Type baud <rate> to change it. The rate is in decimal. The clock")
+    PrintN("  feeding the serial port here is 48000000 Hz, so 1500000 and 3000000")
+    PrintN("  divide into it exactly - thirteen and twenty-six times 115200 - and")
+    PrintN("  921600 and 230400 work too.")
+    PrintN("  Changing it is safe to try. If the host does not answer at the new")
+    PrintN("  rate within eight seconds, the board puts 115200 back by itself, so")
+    PrintN("  a rate your adapter cannot manage costs you a pause and not a power")
+    PrintN("  cycle.")
+    ProcedureReturn
+  EndIf
+  If n < 1200
+    PrintN("!! anything below 1200 baud is refused, because it is almost certainly")
+    PrintN("   a typing mistake rather than a rate anybody wants. The line is")
+    Print("   unchanged and still running at ")
+    PrintDec(gBaud)
+    PrintN(" baud.")
+    ProcedureReturn
+  EndIf
+  If n = gBaud
+    Print("This line is already running at ")
+    PrintDec(n)
+    PrintN(" baud, so nothing was changed and")
+    PrintN("there is no need to reopen the port.")
+    ProcedureReturn
+  EndIf
+
+  ; SAY IT ALL BEFORE CHANGING ANYTHING, and drain. Once the divisor
+  ; moves, everything still sitting in the FIFO comes out at the new
+  ; rate and is unreadable at the old one.
+  Print("Switching this line to ")
+  PrintDec(n)
+  PrintN(" baud now.")
+  PrintN("  Reopen the port at the new rate and press Enter to confirm it.")
+  PrintN("  If nothing answers within eight seconds the board puts 115200 back")
+  PrintN("  by itself, so nothing here can leave the board unreachable.")
+  UartDrain()
+
+  If UartInit(n) = 0
+    ; The divisor was out of range and the port was NOT touched.
+    PrintN("!! that rate cannot be made from this board's 48 MHz serial clock -")
+    PrintN("   there is no divisor that produces it. The port was not touched and")
+    PrintN("   the line is still running at the rate it was. Try 115200, 230400,")
+    PrintN("   921600, 1500000 or 3000000; the last two divide exactly.")
+    ProcedureReturn
+  EndIf
+  gBaud = n
+
+  ; A banner at the NEW rate, so a host that got there sees something
+  ; immediately rather than silence it has to guess about.
+  PrintNl()
+  Print("This line is now running at ")
+  PrintDec(n)
+  PrintN(" baud. If you can read this, press Enter")
+  PrintN("to keep it. Say nothing for eight seconds and 115200 comes back.")
+  UartDrain()
+
+  ; ---- the confirmation window ---------------------------------------
+  got = 0
+  t0 = millis()
+  While (millis() - t0) < #BAUD_CONFIRM_MS
+    If UartReadReady() <> 0
+      UartRead()
+      got = 1
+      Break
+    EndIf
+  Wend
+
+  If got <> 0
+    ; "kept" IS A PROTOCOL WORD. tools/anvil.py setbaud() decides whether
+    ; the new rate stuck with  if "pmf>" in out or "kept" in out  - so the
+    ; four letters stay, and stay near the front of the line where a short
+    ; capture window will still contain them. The rest is free prose.
+    Print("kept. This line stays at ")
+    PrintDec(gBaud)
+    PrintN(" baud until you change it again or")
+    PrintN("the board resets, which puts 115200 back.")
+    ProcedureReturn
+  EndIf
+
+  ; Nobody answered. Put it back and say so at the rate that works.
+  UartInit(#BAUD_DEFAULT)
+  gBaud = #BAUD_DEFAULT
+  UartDrain()
+  PrintNl()
+  Print("Nothing answered at ")
+  PrintDec(n)
+  PrintN(" baud within eight seconds, so this line has")
+  PrintN("been put back to 115200 and you are reading it at that rate again.")
+  PrintN("  Either the port was never reopened at the new rate, or the adapter")
+  PrintN("  on the other end of the cable cannot manage it. Nothing is broken")
+  PrintN("  and nothing needs resetting.")
+EndProcedure
+
+Procedure CmdReset()
+  ; NO CONFIRMATION PROMPT. This is a monitor on a bench, the command is
+  ; one letter typed on purpose, and the cost of being wrong is a five
+  ; second reboot into a working loader. A y/n here would be theatre.
+  ; NOT "U-Boot comes back" - it does not, and has not since Anvil became
+  ; the boot image. The firmware loads KERNEL8.IMG, which is this monitor.
+  ; The old wording survived the whole sentence sweep because it is a
+  ; perfectly grammatical English sentence that happens to be false, which
+  ; is exactly the kind a proofreading pass does not catch.
+  PrintN("Resetting the board now. The firmware reloads this monitor from the boot")
+  PrintN("medium and it starts again in a few seconds. Nothing in memory survives.")
+  UartDrain()
+  ; Does not return: SafetyToFirmware lights the fuse and spins. The
+  ; drain above is the last chance for any of this to reach the wire.
+  SafetyToFirmware()
+EndProcedure
+
+Procedure CmdDeadman()
+  Define n.i
+
+  ; "deadman off", for symmetry with "screen off". Same reasoning: the
+  ; word has to be taken before ParseDec, which cannot see it.
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  If WordIs("off") <> 0
+    gDead = 0
+    PrintN("The deadman watchdog is off. A payload that hangs will now hang the")
+    PrintN("board with it, and getting out of that means a reset or the mains.")
+    ProcedureReturn
+  EndIf
+  gPos = gWordAt
+
+  n = ParseDec()
+  If gParseOk = 0 And gWordLen > 0
+    ; A WORD THIS COMMAND DOES NOT KNOW. It used to fall through to the
+    ; report below, so "deadman of" - one letter short of "off" - printed
+    ; the current setting and looked as though it had disarmed the thing.
+    Define k.i
+    Print("? deadman does not know the word ")
+    k = 0
+    While k < gWordLen And k < 24
+      UartWrite(gLine[gWordAt + k] & $FF)
+      k = k + 1
+    Wend
+    PrintN(", so nothing was changed.")
+    PrintN("  deadman            say whether it is armed")
+    PrintN("  deadman <seconds>  arm it, in whole decimal seconds")
+    PrintN("  deadman off        disarm it")
+    ProcedureReturn
+  EndIf
+  If gParseOk = 0
+    ; Bare deadman - report, do not change. A command that silently
+    ; disarms the safety net when you mistype it is worse than no net.
+    If gDead > 0
+      Print("The deadman watchdog is armed for ")
+      PrintDec(gDead)
+      PrintN(" seconds. The next payload you")
+      PrintN("run gets a watchdog, and if it hangs the board resets itself.")
+    Else
+      PrintN("The deadman watchdog is off. A payload that hangs will hang the board")
+      PrintN("with it, and getting out of that means a reset or the mains.")
+    EndIf
+    PrintN("  Type deadman <seconds> to arm it and deadman off to disarm it. The")
+    PrintN("  seconds are decimal and whole.")
+    PrintN("  The counter behind it is 20 bits wide and counts 65536 times a")
+    PrintN("  second, so a fraction under 16 seconds is the longest it can be set")
+    PrintN("  to. Anything larger is cut down to 15 rather than 16, because a")
+    PrintN("  deadman that fires SOONER than it promised is a trap and one that")
+    PrintN("  fires later is merely patient.")
+    ProcedureReturn
+  EndIf
+  If n < 0
+    PrintN("!! a number of seconds cannot be negative, so nothing was changed and")
+    PrintN("   the watchdog is as it was. Type deadman off to disarm it, or give a")
+    PrintN("   whole number of seconds from 1 to 15 to arm it.")
+    ProcedureReturn
+  EndIf
+  gDead = n
+  If n = 0
+    PrintN("The deadman watchdog is off, because zero seconds means off. A payload")
+    PrintN("that hangs will now hang the board with it.")
+    ProcedureReturn
+  EndIf
+  ; SAY WHAT WILL ACTUALLY HAPPEN, not what was typed. The PM counter is
+  ; 20 bits at 65536 ticks a second, so anything past ~16 s is clamped,
+  ; and finding that out from a reboot instead of from this line is the
+  ; exact species of surprise this monitor is written against.
+  Print("The deadman watchdog is armed for ")
+  PrintDec(SafetyWatchdogTicks(n) / 65536)
+  PrintN(" seconds.")
+  If SafetyWatchdogTicks(n) / 65536 <> n
+    Print("  That is not the ")
+    PrintDec(n)
+    PrintN(" you asked for. The counter behind it is 20 bits")
+    PrintN("  wide and counts 65536 times a second, so it cannot be set to more")
+    PrintN("  than a fraction under 16 seconds, and what you asked for has been")
+    PrintN("  cut down to fit. It is reported as the smaller whole number rather")
+    PrintN("  than the larger one, because a deadman that fires sooner than it")
+    PrintN("  promised is a trap.")
+  EndIf
+  PrintN("  It covers the NEXT payload only. It is armed immediately before the")
+  PrintN("  jump and stopped immediately after, and it is never running while you")
+  PrintN("  are sitting at this prompt - a board that reset itself while somebody")
+  PrintN("  was reading a dump would be a rescue costing more than the thing it")
+  PrintN("  rescued from.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  power_SaySctlr() - print the control register, NAMED BY THE LEVEL.
+;
+;  This printed "SCTLR_EL2 = $..." in three places, which was true while
+;  the monitor could only be at EL2. Since 2026-09-07 it can be at EL3,
+;  where the register that governs its translation and caches is
+;  SCTLR_EL3 - a different register with the same layout and, on this
+;  board, a very similar value. Printing the wrong NAME beside a right
+;  VALUE is the worst of the three possible mistakes: somebody comparing
+;  the number against $30C50830 gets the answer they expect and goes
+;  away, having read the wrong register's state as the right one.
+;
+;  So the label is derived from MmuEl() and the value comes from
+;  MmuSctlr(), and the two cannot disagree.
+; ----------------------------------------------------------------------
+Procedure power_SaySctlr()
+  If MmuAtEl3() <> 0
+    Print("SCTLR_EL3 = $")
+  Else
+    Print("SCTLR_EL2 = $")
+  EndIf
+  PutHex16(MmuSctlr())
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdCache - turn the D-cache and MMU on or off at runtime.
+;
+;  cache            - show the state
+;  cache on         - build the identity tables and set the running
+;                     level's SCTLR M|C|I
+;  cache off        - flush the whole D-cache to DRAM and disable
+;
+;  RECOVERABLE BY DESIGN: caches are off at every boot, so a wrong enable
+;  is undone by a power cycle - the firmware reloads the monitor and it
+;  comes back off. The serial console is device-mapped and works cached;
+;  the HDMI console is not cache-coherent yet, so it may show stale pixels
+;  while caches are on.
+; ----------------------------------------------------------------------
+Procedure CmdCache()
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If gWordLen = 0 Or WordIs("show") <> 0 Or WordIs("status") <> 0
+    Print("The D-cache and MMU are ")
+    If gCacheOn <> 0
+      PrintN("ON - DRAM is cacheable write-back.")
+    Else
+      PrintN("OFF - the stub's state, every access straight to DRAM.")
+    EndIf
+    Print("  ")
+    power_SaySctlr()
+    CompilerIf #ANVIL_CACHE = 1
+    PrintN("  cache on   - build the identity tables and enable M|C|I")
+    PrintN("  cache off  - flush the whole D-cache to DRAM and disable")
+    PrintN("  The framebuffer and GENET ring are mapped non-cacheable, so the")
+    PrintN("  console, screenshot, wifi, USB, mailbox and payloads are all coherent")
+    PrintN("  with the cache on. It is turned on automatically for the V3D console.")
+    CompilerElse
+    PrintN("  This build has the cache capability compiled out (#ANVIL_CACHE = 0).")
+    CompilerEndIf
+    ProcedureReturn
+  EndIf
+
+  CompilerIf #ANVIL_CACHE = 1
+  If WordIs("on") <> 0 Or WordIs("enable") <> 0
+    If gCacheOn <> 0
+      PrintN("The caches are already on.")
+      ProcedureReturn
+    EndIf
+    If CoreAcceptOwnsSecondaries() <> 0
+      PrintN("!! resident secondary cores own the current cache/MMU regime.")
+      PrintN("   Restart Anvil before changing cache policy; nothing was changed.")
+      ProcedureReturn
+    EndIf
+    If CacheEnable() <> 0
+      Print("Caches ON. ")
+      power_SaySctlr()
+      PrintN("  Everything stays coherent: the framebuffer and the GENET receive")
+      PrintN("  ring are mapped non-cacheable, and the mailbox and DMA engine clean")
+      PrintN("  their buffers, so the console, screenshots, wifi, USB, ethernet and")
+      PrintN("  payloads all work cached. cache off returns to the uncached world.")
+    Else
+      PrintN("Could not enable - this build cannot (MmuBuildable is 0) or the")
+      PrintN("tables were refused. The monitor is untouched and still MMU-off.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If WordIs("off") <> 0 Or WordIs("disable") <> 0
+    If gCacheOn = 0
+      PrintN("The caches are already off.")
+      ProcedureReturn
+    EndIf
+    If CoreAcceptOwnsSecondaries() <> 0
+      PrintN("!! resident secondary cores own the current cache/MMU regime.")
+      PrintN("   Restart Anvil before changing cache policy; nothing was changed.")
+      ProcedureReturn
+    EndIf
+    CacheDisable()
+    Print("Caches OFF - everything the monitor had cached is flushed to DRAM. ")
+    power_SaySctlr()
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+
+  PrintN("? cache takes on, off, or status (or no word for status).")
+EndProcedure

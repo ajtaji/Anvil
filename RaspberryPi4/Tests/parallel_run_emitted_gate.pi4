@@ -1,0 +1,315 @@
+; ======================================================================
+;  parallel_run_emitted_gate.pi4 - the fixture tools/a64/parallel_run_check.py
+;  builds, decodes and executes on four interleaved interpreter PEs.
+;
+;  IT INCLUDES THE LIBRARY DIRECTLY AND NOT RaspberryPi4/Board/board.pi4.
+;  The gate must be able to run while the board file is being changed by
+;  somebody else, and a gate that can only build the whole monitor is a
+;  gate that stops whenever the monitor does.
+;
+;  THE WORKERS BELOW STAND IN FOR A PAYLOAD KERNEL and are deliberately
+;  ORDINARY GENERATED CODE - a real frame, real parameters, real locals -
+;  because that is the thing ABI 1.3 newly allows on a secondary core and
+;  therefore the thing that has to be proven. They touch no global except
+;  the output array they are told to write, and each partition writes a
+;  disjoint range of it.
+; ======================================================================
+Procedure str_print_at(*text)
+EndProcedure
+XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu_secondary.pi4"
+XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
+
+#PAR_GATE_SLOTS  = 256
+#PAR_GATE_STRIDE = 32          ; four .i words per partition block
+
+; The argument blocks, one per partition: out base, first, last, seed.
+Global Dim par_args.i[#CORE_PAR_MAX_PARTS * 4]
+Global Dim par_out.i[#PAR_GATE_SLOTS]
+Global Dim par_ref.i[#PAR_GATE_SLOTS]
+
+Procedure.i parGateValue(index.i, seed.i)
+  ProcedureReturn seed + index * 3 + 1
+EndProcedure
+
+; The stand-in kernel. One partition, one contiguous output range, and the
+; value written at an index does not depend on which partition wrote it -
+; the same property an output-channel split of a convolution has.
+Procedure.i ParWorker(*p.i)
+  Protected outBase.i
+  Protected first.i
+  Protected last.i
+  Protected seed.i
+  Protected i.i
+  If *p = 0
+    ProcedureReturn 1
+  EndIf
+  outBase = PeekI(*p)
+  first = PeekI(*p + 8)
+  last = PeekI(*p + 16)
+  seed = PeekI(*p + 24)
+  If outBase = 0 Or first < 0 Or last > #PAR_GATE_SLOTS Or first > last
+    ProcedureReturn 2
+  EndIf
+  i = first
+  While i < last
+    PokeI(outBase + i * 8, parGateValue(i, seed))
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; Reports failure without writing anything, so the gate can prove that a
+; partition's own refusal comes back as the partition's return value and
+; is not mistaken for an Anvil fault.
+Procedure.i ParFailWorker(*p.i)
+  Protected first.i
+  If *p = 0
+    ProcedureReturn 7
+  EndIf
+  first = PeekI(*p + 8)
+  ProcedureReturn 9 + first
+EndProcedure
+
+; Never returns ON A SECONDARY. The gate uses it to prove the bound is
+; real and that the refusal names the core rather than the board needing
+; hands.
+;
+; IT MUST LET PARTITION 0 FINISH, and that is not a convenience - it is
+; the shape of the thing being tested. Partition 0 runs ON THE PRIMARY,
+; which is the core that would do the waiting; a primary that never
+; returns from the payload's own entry is not something this service can
+; bound, because nothing can interrupt it there. That case is the
+; payload's own infinite loop and the deadman is its answer, exactly as
+; it would be on one core. What the bound exists for is the OTHER case: a
+; secondary that stops answering while the primary is healthy, which the
+; deadman cannot see at all because the primary is still petting it.
+Procedure.i ParHangWorker(*p.i)
+  Protected spin.i
+  If PeekI(*p + 8) = 0
+    ProcedureReturn 0
+  EndIf
+  spin = 0
+  While spin >= 0
+    spin = spin + 1
+  Wend
+  ProcedureReturn spin
+EndProcedure
+
+; A DEEPER FRAME, AND IT WRITES NO GLOBAL. The first version of this
+; recorded its own stack pointer into a Global so the fixture could report
+; the depth - and the gate's span check refused it on the spot, which is
+; exactly right: a partition worker may touch nothing but its own frame
+; and its own output range, and a shared depth marker is neither. The
+; depth is measured from outside instead, by the gate watching SP.
+Procedure.i ParDepthWorker(*p.i)
+  Protected pad0.i
+  Protected pad1.i
+  Protected pad2.i
+  Protected pad3.i
+  Protected pad4.i
+  Protected pad5.i
+  Protected r.i
+  pad0 = PeekI(*p)
+  pad1 = pad0 + 1
+  pad2 = pad1 + 2
+  pad3 = pad2 + 3
+  pad4 = pad3 + 4
+  pad5 = pad4 + 5
+  r = ParWorker(*p)
+  If pad5 = 0
+    ProcedureReturn 3
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+Procedure parGateSplit(count.i, outBase.i, seed.i)
+  Define i.i
+  Define first.i
+  Define last.i
+  For i = 0 To #CORE_PAR_MAX_PARTS - 1
+    par_args[i * 4 + 0] = 0
+    par_args[i * 4 + 1] = 0
+    par_args[i * 4 + 2] = 0
+    par_args[i * 4 + 3] = 0
+  Next
+  For i = 0 To count - 1
+    first = #PAR_GATE_SLOTS * i / count
+    last = #PAR_GATE_SLOTS * (i + 1) / count
+    par_args[i * 4 + 0] = outBase
+    par_args[i * 4 + 1] = first
+    par_args[i * 4 + 2] = last
+    par_args[i * 4 + 3] = seed
+  Next
+EndProcedure
+
+Procedure parGateClear(base.i)
+  Define i.i
+  For i = 0 To #PAR_GATE_SLOTS - 1
+    PokeI(base + i * 8, 0)
+  Next
+EndProcedure
+
+; The serial reference, computed by the primary alone, in the order the
+; single-core path would.
+Procedure ParReference(seed.i)
+  Define i.i
+  For i = 0 To #PAR_GATE_SLOTS - 1
+    par_ref[i] = parGateValue(i, seed)
+  Next
+EndProcedure
+
+Procedure.i ParOutBase()
+  ProcedureReturn @par_out[0]
+EndProcedure
+
+Procedure.i ParRefBase()
+  ProcedureReturn @par_ref[0]
+EndProcedure
+
+Procedure.i ParArgsBase()
+  ProcedureReturn @par_args[0]
+EndProcedure
+
+; Every output slot equals the serial reference. A partition skipped, run
+; twice with the wrong block, or run over another partition's range fails
+; here rather than being averaged away.
+Procedure.i ParVerify()
+  Define i.i
+  For i = 0 To #PAR_GATE_SLOTS - 1
+    If par_out[i] <> par_ref[i]
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ParRun(count.i, seed.i)
+  parGateClear(@par_out[0])
+  parGateSplit(count, @par_out[0], seed)
+  ParReference(seed)
+  ProcedureReturn CoreParallelRun(@ParWorker, @par_args[0], #PAR_GATE_STRIDE, count)
+EndProcedure
+
+Procedure.i ParRunDepth(count.i, seed.i)
+  parGateClear(@par_out[0])
+  parGateSplit(count, @par_out[0], seed)
+  ParReference(seed)
+  ProcedureReturn CoreParallelRun(@ParDepthWorker, @par_args[0], #PAR_GATE_STRIDE, count)
+EndProcedure
+
+Procedure.i ParRunFail(count.i)
+  parGateSplit(count, @par_out[0], 1)
+  ProcedureReturn CoreParallelRun(@ParFailWorker, @par_args[0], #PAR_GATE_STRIDE, count)
+EndProcedure
+
+Procedure.i ParRunHang(count.i)
+  parGateSplit(count, @par_out[0], 1)
+  ProcedureReturn CoreParallelRun(@ParHangWorker, @par_args[0], #PAR_GATE_STRIDE, count)
+EndProcedure
+
+; Deliberately malformed requests, each one argument away from the good
+; one above, so a refusal cannot be attributed to the wrong field.
+Procedure.i ParRunBadCount(count.i)
+  parGateSplit(1, @par_out[0], 1)
+  ProcedureReturn CoreParallelRun(@ParWorker, @par_args[0], #PAR_GATE_STRIDE, count)
+EndProcedure
+
+Procedure.i ParRunBadEntry(entry.i)
+  parGateSplit(1, @par_out[0], 1)
+  ProcedureReturn CoreParallelRun(entry, @par_args[0], #PAR_GATE_STRIDE, 1)
+EndProcedure
+
+Procedure.i ParRunBadStride(stride.i)
+  parGateSplit(1, @par_out[0], 1)
+  ProcedureReturn CoreParallelRun(@ParWorker, @par_args[0], stride, 1)
+EndProcedure
+
+Procedure.i ParGuardBase(core.i)
+  ProcedureReturn HwCoreRawStackBase(core)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PAYLOAD BOUNDARY, MODELLED - many payloads per boot.
+;
+;  This is exactly what RaspberryPi4/Board/cache.pi4's RunAt does at both
+;  ends of a payload: if anything owns the secondaries they go back to
+;  the firmware spin state, and the entry is refused only if they will
+;  not go. It is written out here rather than reached through RunAt for
+;  the reason at the top of this file - the gate must build while the
+;  board file is somebody else's - and the gate separately reads
+;  cache.pi4 to prove RunAt really calls it, at both ends.
+; ----------------------------------------------------------------------
+Procedure.i ParPayloadBoundary()
+  If CoreAcceptOwnsSecondaries() = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn CoreAcceptReclaim()
+EndProcedure
+
+Procedure.i ParOwns()
+  ProcedureReturn CoreAcceptOwnsSecondaries()
+EndProcedure
+
+Procedure.i ParRawReleased(core.i)
+  If core < 1 Or core > 3
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn core_raw_released[core]
+EndProcedure
+
+Procedure.i ParSpinSlot(core.i)
+  ProcedureReturn PeekI(CoreRawReleaseAddr(core))
+EndProcedure
+
+; A DISPATCH THAT IS NEVER JOINED, so the boundary can be asked about a
+; job that is genuinely still in flight rather than one that has already
+; timed out and latched. CoreParallelRun is the only real dispatcher and
+; it always waits, so on the board this state exists only between its
+; release store and its acquire load - which is not a moment a gate can
+; otherwise stand in. Raising the request word alone reproduces it
+; exactly: request ahead of acknowledgement, nothing latched.
+Procedure ParForceInFlight(core.i)
+  Define row.i
+  row = CoreAcceptRow(core)
+  PokeI(row, PeekI(row) + 1)
+EndProcedure
+
+; One word of a control row, so the gate can ask whether a refusal
+; refused BEFORE it wrote anything. "It returned zero" and "it published
+; a release request to a core that is mid-job and then gave up waiting"
+; are both a failed call and only one of them is safe.
+Procedure.i ParRowWord(core.i, offset.i)
+  ProcedureReturn PeekI(CoreAcceptRow(core) + offset)
+EndProcedure
+
+Procedure.i Main()
+  If CoreRawId() = 99
+    CoreAcceptRun()
+    CoreAcceptStop()
+    ParRun(4, 5)
+    ParRunDepth(4, 5)
+    ParRunFail(4)
+    ParRunHang(4)
+    ParRunBadCount(9)
+    ParRunBadEntry(0)
+    ParRunBadStride(-1)
+    ParVerify()
+    CoreParallelCores()
+    CoreParallelStatus(0)
+    CoreParallelErr()
+    CoreParallelFailedCore()
+    ParGuardBase(1)
+    ParOutBase()
+    ParRefBase()
+    ParArgsBase()
+    ParPayloadBoundary()
+    ParOwns()
+    ParRawReleased(1)
+    ParSpinSlot(1)
+    ParForceInFlight(1)
+    ParRowWord(1, 0)
+  EndIf
+  ProcedureReturn CoreAcceptRow(1)
+EndProcedure

@@ -1,0 +1,23 @@
+[all]
+# Anvil Raspberry Pi 3 Model B v1.2 experimental cold entry.
+# Keep the firmware handoff in AArch64 at the compiler's linked address.
+arm_64bit=1
+kernel=kernel8.img
+kernel_address=0x80000
+
+# Main captures the firmware-provided DTB pointer in x0. Keep the complete
+# tree resident and outside Anvil's reserved $80000..$200000 bootstrap span.
+device_tree=bcm2710-rpi-3-b.dtb
+device_tree_address=0x1000000
+
+# Anvil's first diagnostics use PL011 on GPIO14/15. On Pi 3, Bluetooth owns
+# PL011 unless the official overlay releases it.
+enable_uart=1
+dtoverlay=disable-bt
+
+# Make the first framebuffer test deterministic even when HDMI is connected
+# after power-on. The program still validates every returned buffer property.
+hdmi_force_hotplug=1
+# Keep the firmware rainbow visible during this first silicon diagnosis.  The
+# Anvil framebuffer replaces it after ARM entry reaches the display path.
+disable_splash=0

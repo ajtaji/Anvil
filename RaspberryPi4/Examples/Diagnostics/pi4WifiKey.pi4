@@ -1,0 +1,2042 @@
+; ======================================================================
+; pi4WifiKey.pi4 - ASSOCIATE, RUN THE FOUR-WAY HANDSHAKE IN THE HOST,
+; INSTALL THE KEYS, AND SHOW THE LINK CARRYING ENCRYPTED TRAFFIC.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+; WHY THE HOST HAS TO RUN THE HANDSHAKE, AND HOW THAT WAS SETTLED
+; WITHOUT SPENDING A SINGLE BENCH RUN ON IT
+; ======================================================================
+; The Pico and the Uno R4 hand their radio an ASCII passphrase and the
+; radio firmware does PBKDF2, the four-way handshake and the keying.
+; That is not a property of the CYW43 family. It is a property of the
+; FIRMWARE IMAGE, and the two images on this bench say so themselves -
+; every Broadcom build carries the list of components it was compiled
+; with, in plain text, inside the blob:
+;
+;   Firmware/CYW43439/wb43439A0-7.95.49.00.combined.bin   (the Pico's)
+;     43439a0-roml/sdio-g-pool-p2p-IDSUP-IDAUTH-pktfilter-keepalive-
+;     aoe-lpc-swdiv-srfast-fuart-btcx-noclminc-clm_min-fbt-mfp-SAE-
+;     wowlpf-tko-nvd-btsdio            Version: 7.95.61 (abcd531 CY)
+;
+;   Firmware/CYW43455/brcmfmac43455-sdio.bin  (this one)
+;     43455c0-roml/43455_sdio-pno-aoe-pktfilter-pktctx-wfds-mfp-
+;     dfsradar-wowlpf-noclminc-clm_min-obss-obssdump-swdiv-gtkoe-
+;     roamprof-txbf-ve-EXTSAE-dpp-sr-okc-bpd
+;                                      Version: 7.45.265 (28bca26 CY)
+;
+; `idsup` is the IN-DONGLE SUPPLICANT, `idauth` the in-dongle
+; authenticator. THE PICO'S IMAGE HAS BOTH AND THIS ONE HAS NEITHER,
+; and where the Pico's says `sae` this one says `extsae` - EXTERNAL
+; SAE, meaning the host does it.
+;
+; That is the whole explanation for the four refusals pi4WifiJoin.pi4
+; measured on 2026-08-27 (`bsscfg:sup_wpa`, `bsscfg:sup_wpa2_eapver`
+; and `bsscfg:sup_wpa_tmo` all -23 BCME_UNSUPPORTED, and
+; WLC_SET_WSEC_PMK -2 BCME_BADARG at both documented struct sizes).
+; Four measurements, one cause, and the cause was readable in a file
+; already on this disk.
+;
+; IT IS ALSO WHAT EVERY RASPBERRY PI DOES. brcmfmac with this same
+; image has no firmware supplicant either; wpa_supplicant in userspace
+; runs the handshake over the data path and plumbs the finished keys
+; down with `bsscfg:wsec_key`. This payload is that, minus the
+; operating system.
+;
+; ======================================================================
+; WHAT TO TYPE, IN THIS ORDER
+; ======================================================================
+;     pmf> screen off
+;     pmf> load BRCMFW.BIN  1000000
+;     pmf> load BRCMNV.TXT  1200000
+;     pmf> load BRCMCLM.BLB 1300000
+;     pmf> fill 1400000 0 800
+;     pmf> load SETTINGS.TXT 1400000
+;     pmf> deadman 15
+;     pmf> map              <- it prints `stage a file at <stage>`. An
+;                              image is the same bytes at any --load-addr.
+;     pmf> run <stage>
+;
+; AND pi4WifiPmk.pi4 MUST HAVE RUN FIRST, until it says "all staged" or
+; at least until the network you want is in its table. This payload
+; does NOT derive a PMK: PBKDF2-SHA1 at 4096 iterations measures about
+; ten seconds on this part with the MMU off, and the whole budget here
+; is fifteen. The staged table lives at $01500000 and carries a
+; fingerprint of SETTINGS.TXT so a stale one cannot be used silently.
+;
+; `screen off` IS IN THE LIST FOR A MEASURED REASON. On 2026-08-28,
+; after a deadman reset, Anvil came back with the HDMI framebuffer
+; enabled and the very next payload could not get an answer out of the
+; mailbox: `MailboxClockRate(1)` returned zero and the run stopped at
+; "the firmware would not report the EMMC clock" with the radio never
+; touched. The clock query below therefore RETRIES and prints each
+; attempt, so that if it happens again the log says whether it is a
+; hard refusal or a race.
+;
+; ======================================================================
+; NO CREDENTIAL IS PRINTED, DERIVED OR OTHERWISE
+; ======================================================================
+; The passphrase never enters this payload at all - it stops at
+; pi4WifiPmk.pi4. The PMK is read from DRAM and handed to wpa2sup.pi4;
+; the PTK, the TK and the GTK are computed, installed and wiped. What
+; is printed is lengths, verdicts, MAC addresses, an RSSI and a
+; channel. Nothing here is a key or a function of one.
+;
+; ======================================================================
+; WHAT SUCCESS LOOKS LIKE, IN ORDER
+; ======================================================================
+;   1. the staged table is valid and holds the network we will join
+;   2. `wpaie` is accepted, and `assoc_req_ies` reads back the SAME
+;      bytes - which is what lets message 2 repeat them exactly
+;   3. association: AUTH 0 and LINK flags bit 0
+;   4. EAPOL message 1 arrives as a data frame
+;   5. message 2 goes out; message 3 arrives AND ITS MIC VERIFIES -
+;      that is the moment the access point proves it holds the same
+;      PMK, and it is the milestone
+;   6. the PTK and the GTK go into the firmware
+;   7. message 4 goes out
+;   8. encrypted traffic arrives and decodes as valid Ethernet
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
+XIncludeFile "RaspberryPi4/Lib/sha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/hmacsha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/aes.pi4"
+XIncludeFile "RaspberryPi4/Lib/keywrap.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "RaspberryPi4/Lib/wpa2sup.pi4"
+
+; Where Anvil's `load` put each file. pi4WifiScan.pi4's addresses,
+; lengths and CRCs, measured on the board by reading each file back off
+; the stick, and unchanged here.
+#FW_ADDR = $01000000
+#FW_LEN  = 609309
+
+; ----------------------------------------------------------------------
+;  TWO 4 KB WINDOWS OF THE FIRMWARE, NOT ALL 609,309 BYTES, AND THE
+;  REASON IS A MEASUREMENT.
+;
+;  pi4WifiJoin.pi4 CRCs the whole image and on 2026-08-28 this payload
+;  printed
+;
+;      [t+5849 ms] blobs checked
+;
+;  FIVE POINT EIGHT SECONDS of a fifteen-second budget, spent before the
+;  radio is touched, on a check of bytes that are about to be verified
+;  anyway. The MMU is off, so the CRC reads 609 KB of uncached Device
+;  memory a byte at a time.
+;
+;  WHAT THE CHECK IS ACTUALLY FOR: "did somebody forget the `load`, or
+;  load the wrong file". The head window catches a missing or truncated
+;  load and the wrong image; the tail window catches a SHORT one, which
+;  the head alone would not. Both are computed from
+;  Firmware/CYW43455/brcmfmac43455-sdio.bin.
+;
+;  AND THE FULL INTEGRITY CHECK STILL HAPPENS, just not here:
+;  Cyw43UploadFirmware reads every byte back out of the radio's RAM and
+;  compares it with the copy in DRAM (Cyw43VerifyMem), so a corrupt
+;  middle fails the upload with an address. Doing it twice cost more
+;  than a third of the budget.
+;
+;  THE SMALL BLOBS ARE STILL CHECKED WHOLE. 2,074 and 2,676 bytes
+;  together are about 45 ms; there is nothing to buy by trimming them.
+; ----------------------------------------------------------------------
+#FW_WINDOW   = 4096
+#FW_CRC_HEAD = $A61DFDB1
+#FW_CRC_TAIL = $9E75B809
+
+#NV_ADDR = $01200000
+#NV_LEN  = 2074
+#NV_CRC  = $2BDBDDF6
+
+#CLM_ADDR = $01300000
+#CLM_LEN  = 2676
+#CLM_CRC  = $346D4B26
+
+#SET_ADDR = $01400000
+#SET_WIN  = 8192
+
+#NV_WORK      = $01210000
+#NV_WORK_MAX  = 4096
+#SCRATCH      = $01220000
+#SCRATCH_LEN  = 2048
+
+; The staged PMK table. pi4WifiPmk.pi4 owns the layout; this is the
+; reader's copy of it and the two must agree.
+#PMKS_ADDR      = $01500000
+#PMKS_MAGIC     = $504D4B31
+#PMKS_HDR       = 16
+#PMKS_OFF_COUNT = 4
+#PMKS_OFF_FP    = 8
+#PMKS_ENTRY     = 80
+#PMKS_OFF_SLOT  = 0
+#PMKS_OFF_SLEN  = 4
+#PMKS_OFF_SSID  = 8
+#PMKS_OFF_PMK   = 40
+#PMKS_MAX       = 8
+
+; Mailbox clock id 1 = EMMC. NOT 12, which is EMMC2's.
+#CLOCK_ID_EMMC = 1
+#CLOCK_TRIES   = 8
+#CLOCK_GAP_MS  = 25
+
+; The join's polling slice, and the caller's own ceiling on it. The
+; library owns the real guards; this is the belt to their braces.
+#JOIN_SLICE_MS   = 20
+#JOIN_MAX_SLICES = 400
+
+;  THE LADDER'S WALL CLOCK. Four staged networks at one attempt each
+;  measured 13,430 ms on 2026-08-28 and left nothing for the handshake
+;  - and two of those four are the truck's and are not on the air at
+;  this bench. 9,500 ms is what the ladder may spend; everything after
+;  it belongs to the four-way handshake, which needs about 300 ms, and
+;  to the DHCP exchange, which is gated separately.
+#JOIN_LADDER_BY_MS = 9500
+
+; How long to wait for each EAPOL message. An authenticator retries
+; message 1 about once a second, four times; 1200 ms covers the first
+; and one retry without eating the budget. Message 3 follows message 2
+; within milliseconds, so its window is shorter.
+#EAPOL_M1_MS = 2600
+#EAPOL_M3_MS = 800
+
+; How long to listen for encrypted traffic once the keys are in. Any
+; real LAN broadcasts ARP and multicast constantly, so this does not
+; need to be long to prove the link decrypts - and every millisecond
+; here is one the DHCP exchange below does not have.
+#TRAFFIC_MS = 150
+
+; ----------------------------------------------------------------------
+;  DHCP, AND WHY THERE IS NO STATIC ADDRESS IN THIS FILE.
+;
+;  A ping needs an address, a netmask and somewhere to send it. This
+;  bench's SETTINGS.TXT holds four Wi-Fi credentials and NOTHING ELSE -
+;  the eight keys the parser reports are four SSIDs and four
+;  passphrases, with no net.address, net.netmask or net.gateway among
+;  them. So there is nothing to read, and the only alternatives are to
+;  ask the network or to invent a number.
+;
+;  INVENTING ONE IS NOT AN OPTION ON SOMEBODY'S HOME LAN. A guessed
+;  192.168.1.50 that happens to be in use takes another machine off the
+;  network, and it does it silently. So: DHCP, built by hand here
+;  rather than through net.pi4, whose header says plainly that it has
+;  no DHCP and that the omission is deliberate (net.pi4:266). Four
+;  frames, no library, and it returns the mask and the router as well
+;  as the address.
+;
+;  THE EXCHANGE IS ALSO THE PROOF. A DHCP OFFER comes back over the
+;  air CCMP-encrypted with the keys this payload just installed, so
+;  reaching an ACK proves the link both ways at the IP layer before a
+;  single ICMP packet is sent.
+; ----------------------------------------------------------------------
+#DHCP_FRAME_LEN = 342          ; 14 eth + 20 ip + 8 udp + 300 bootp
+#DHCP_WAIT_MS   = 1800
+#DHCP_ACK_MS    = 1200
+#PING_WAIT_MS   = 600
+#ARP_WAIT_MS    = 800
+#PING_COUNT     = 3
+;  The wall-clock gate on the whole DHCP-and-ping stage. Eleven seconds
+;  of fifteen, which leaves room for a DISCOVER, an OFFER, a REQUEST,
+;  an ACK, an ARP and two echoes if every one of them is prompt, and
+;  refuses to start if the association has already eaten the budget.
+#PING_START_BY_MS = 12000
+
+; THE SPIN BOUND IS entropy.pi4's OWN #ENTROPY_SPINS and this file does
+; not define a second one. It tried to, with a smaller number, and the
+; compiler refused: "already defined as 4000000 and this redefines it as
+; 200000 ... that CompilerIf may be in an included library you never
+; opened." That refusal is the project's whole philosophy working - a
+; quieter compiler would have let the smaller bound win inside the
+; library as well as here.
+
+Global g_hz.i = 0
+Global startMs.i = 0
+Global Dim ourMac.a[6]
+Global Dim apMac.a[6]
+Global Dim snonce.a[32]
+; The largest RSN element this file will carry. DECLARED HERE AND NOT
+; beside the element it bounds, because it sizes theIe below and a
+; constant used as an array size has to exist first - the compiler
+; refuses rather than assuming, which is how this was found.
+#RSN_IE_MAX = 64
+
+Global Dim thePmk.a[32]
+; The RSN element as the firmware ACTUALLY TRANSMITTED it, read back
+; from `assoc_req_ies`. This is what message 2 repeats.
+Global Dim theIe.a[#RSN_IE_MAX]
+Global theIeLen.i = 0
+Global Dim dhcpXid.a[4]
+Global Dim peerMac.a[6]
+; The DHCP server's hardware address, taken from the source field
+; of its own OFFER or ACK. See the ARP seeding below.
+Global Dim srvMac.a[6]
+Global srvMacOk.i = 0
+; What the network says about a file server, if anything.
+Global dhcpNext.i = 0        ; BOOTP siaddr
+Global dhcpTftpIp.i = 0      ; DHCP option 150, first entry
+Global Dim dhcpTftpName.a[64]
+Global dhcpTftpNameLen.i = 0
+Global dhcpIp.i   = 0
+Global dhcpMask.i = 0
+Global dhcpGw.i   = 0
+Global dhcpSrv.i  = 0
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; An SSID is 32 arbitrary bytes chosen by whoever runs the access point,
+; so everything outside printable ASCII is replaced: a name carrying
+; escape sequences must not be able to rewrite the lines above it in a
+; log destined for a report.
+Procedure PrintSsid(p.i, n.i)
+  Define j.i
+  If n <= 0
+    UartWriteStr("<hidden>")
+    ProcedureReturn 0
+  EndIf
+  If n > 32
+    n = 32
+  EndIf
+  For j = 0 To n - 1
+    If PeekA(p + j) >= 32 And PeekA(p + j) <= 126
+      UartWrite(PeekA(p + j))
+    Else
+      UartWrite(46)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PrintBssid(p.i)
+  Define j.i
+  For j = 0 To 5
+    PutHexN(PeekA(p + j) & $FF, 2)
+    If j < 5
+      UartWrite(58)
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i NowMs()
+  If g_hz < 1000
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Ticks() / (g_hz / 1000)
+EndProcedure
+
+Procedure Stamp(*what)
+  UartWriteStr("  [t+")
+  PrintDec(NowMs() - startMs)
+  UartWriteStr(" ms] ")
+  UartWriteStr(*what)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure.i Crc32(addr.i, len.i)
+  Define crc.i
+  Define i.i
+  Define b.i
+  Define k.i
+  crc = $FFFFFFFF
+  For i = 0 To len - 1
+    crc = crc ! PeekA(addr + i)
+    For k = 0 To 7
+      b = crc & 1
+      crc = (crc >> 1) & $7FFFFFFF
+      If b <> 0
+        crc = crc ! $EDB88320
+      EndIf
+    Next
+  Next
+  ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+EndProcedure
+
+Procedure.i Rd32(p.i)
+  ProcedureReturn PeekA(p) | (PeekA(p + 1) << 8) | (PeekA(p + 2) << 16) | (PeekA(p + 3) << 24)
+EndProcedure
+
+Procedure.i Fnv1a(p.i, n.i)
+  Define h.i
+  Define i.i
+  h = $811C9DC5
+  For i = 0 To n - 1
+    h = (h ! PeekA(p + i)) & $FFFFFFFF
+    h = (h * 16777619) & $FFFFFFFF
+  Next
+  ProcedureReturn h
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE RSN INFORMATION ELEMENT WE OFFER, AND WHY IT IS A CONSTANT.
+;
+;      30 14                        id 48, length 20
+;      01 00                        RSN version 1
+;      00 0F AC 04                  group cipher   CCMP
+;      01 00  00 0F AC 04           one pairwise   CCMP
+;      01 00  00 0F AC 02           one AKM        PSK
+;      00 00                        RSN capabilities: none
+;
+;  THESE EXACT BYTES GO OUT TWICE - into the association request
+;  through the `wpaie` iovar, and into EAPOL message 2 - and the
+;  authenticator compares the two. That is IEEE 802.11 12.7.6.3, and
+;  hostapd deauthenticates on a mismatch. Having the host choose them
+;  is the only way to be sure the two copies agree; a firmware-
+;  synthesised element would have to be guessed at, and a guess one
+;  capability bit out fails the handshake with no diagnosis.
+;
+;  THE CAPABILITIES FIELD IS $000C AND THAT NUMBER CAME OFF THE BOARD.
+;  Measured 2026-08-28: we sent $0000 through `wpaie` and the firmware
+;  transmitted $000C. Every other byte was identical, so the firmware
+;  DOES carry the element it is given and then overwrites this one
+;  field with its own capability - bits 2 and 3 are the PTKSA Replay
+;  Counter field, and 3 means sixteen counters per PTKSA.
+;
+;  MESSAGE 2 CARRIED OUR $0000 AND THE ACCESS POINT DROPPED IT. IEEE
+;  802.11 12.7.6.3 has the authenticator verify that message 2's RSNE
+;  is identical to the association request's; hostapd logs "RSN IE in
+;  msg 2/4 does not match with IE in association request" and says
+;  nothing on the air. Message 3 simply never arrives, which reads
+;  exactly like a wrong passphrase and is not one.
+;
+;  MATCHING IT HERE IS BELT; THE BRACES ARE THE READ-BACK. Section 7b
+;  asks the firmware what the request actually carried and hands THOSE
+;  bytes to the supplicant, so this constant only has to be close
+;  enough to make the association itself sensible.
+;
+;  NO MANAGEMENT FRAME PROTECTION - bit 6 (MFPC) and bit 7 (MFPR) are
+;  both clear, and that is a real limitation: this driver has no
+;  BIP-CMAC-128 and `bsscfg:mfp` is one of the iovars this firmware
+;  refuses. An access point that REQUIRES MFP will answer 802.11 status
+;  43 AKMP_NOT_VALID - which is exactly what ajtaji_5G already answers.
+;
+;  NO PMKID LIST. Its absence is what the end of the element says.
+; ----------------------------------------------------------------------
+#RSN_IE_LEN = 22
+
+DataSection
+  theRsnIe:
+    Data.b $30, $14, $01, $00
+    Data.b $00, $0F, $AC, $04
+    Data.b $01, $00, $00, $0F, $AC, $04
+    Data.b $01, $00, $00, $0F, $AC, $02
+    Data.b $0C, $00
+EndDataSection
+
+; ======================================================================
+;  A MINIMAL DHCP CLIENT - DISCOVER, OFFER, REQUEST, ACK.
+;
+;  Everything is big-endian on the wire and every field is written a
+;  byte at a time. That is not fussiness: the MMU is off, so every
+;  access is Device memory and an unaligned wide store faults - the
+;  same rule that made cyw43_PutLE32 four PokeB calls.
+; ======================================================================
+Procedure PutBE16(p.i, v.i)
+  PokeB(p, (v >> 8) & $FF)
+  PokeB(p + 1, v & $FF)
+EndProcedure
+
+Procedure PutBE32(p.i, v.i)
+  PokeB(p, (v >> 24) & $FF)
+  PokeB(p + 1, (v >> 16) & $FF)
+  PokeB(p + 2, (v >> 8) & $FF)
+  PokeB(p + 3, v & $FF)
+EndProcedure
+
+Procedure.i GetBE16(p.i)
+  ProcedureReturn (PeekA(p) << 8) | PeekA(p + 1)
+EndProcedure
+
+Procedure.i GetBE32(p.i)
+  ProcedureReturn (PeekA(p) << 24) | (PeekA(p + 1) << 16) | (PeekA(p + 2) << 8) | PeekA(p + 3)
+EndProcedure
+
+Procedure PrintIp(v.i)
+  PrintDec((v >> 24) & $FF)
+  UartWrite(46)
+  PrintDec((v >> 16) & $FF)
+  UartWrite(46)
+  PrintDec((v >> 8) & $FF)
+  UartWrite(46)
+  PrintDec(v & $FF)
+EndProcedure
+
+; The IPv4 header checksum: the ones-complement sum of the ten 16-bit
+; words, folded and complemented. The checksum field must read zero
+; while it is computed, which the zeroed buffer already guarantees.
+Procedure.i IpChecksum(ip.i)
+  Define s.i
+  Define i.i
+  s = 0
+  For i = 0 To 9
+    s = s + GetBE16(ip + i * 2)
+  Next
+  While (s >> 16) <> 0
+    s = (s & $FFFF) + (s >> 16)
+  Wend
+  ProcedureReturn (~s) & $FFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildDhcp - a complete DISCOVER (kind 1) or REQUEST (kind 3) in the
+;  radio's transmit buffer. Returns the frame length.
+;
+;  THE BROADCAST FLAG IS SET, and it is the one bit that decides
+;  whether this works at all: with no address configured we cannot
+;  accept a unicast IP datagram, so the server is asked to broadcast
+;  its reply instead. RFC 2131 section 4.1.
+; ----------------------------------------------------------------------
+Procedure.i BuildDhcp(kind.i, reqIp.i, srvIp.i)
+  Define p.i
+  Define ip.i
+  Define u.i
+  Define b.i
+  Define o.i
+  Define i.i
+
+  p = Cyw43DataPtr()
+  For i = 0 To #DHCP_FRAME_LEN - 1
+    PokeB(p + i, 0)
+  Next
+
+  For i = 0 To 5
+    PokeB(p + i, $FF)
+    PokeB(p + 6 + i, ourMac[i])
+  Next
+  PokeB(p + 12, $08)
+  PokeB(p + 13, $00)
+
+  ip = p + 14
+  PokeB(ip + 0, $45)
+  PutBE16(ip + 2, #DHCP_FRAME_LEN - 14)
+  PutBE16(ip + 4, $B00B)
+  PokeB(ip + 8, 64)
+  PokeB(ip + 9, 17)
+  PutBE32(ip + 16, $FFFFFFFF)
+  PutBE16(ip + 10, IpChecksum(ip))
+
+  u = p + 34
+  PutBE16(u + 0, 68)
+  PutBE16(u + 2, 67)
+  PutBE16(u + 4, #DHCP_FRAME_LEN - 34)
+  ; The UDP checksum stays zero, which IPv4 permits and which every
+  ; DHCP server accepts - a client with no address of its own cannot
+  ; build the pseudo-header it would be computed over.
+
+  b = p + 42
+  PokeB(b + 0, 1)              ; BOOTREQUEST
+  PokeB(b + 1, 1)              ; Ethernet
+  PokeB(b + 2, 6)              ; six-byte hardware address
+  For i = 0 To 3
+    PokeB(b + 4 + i, dhcpXid[i])
+  Next
+  PutBE16(b + 10, $8000)       ; BROADCAST. See the header.
+  For i = 0 To 5
+    PokeB(b + 28 + i, ourMac[i])
+  Next
+  PokeB(b + 236, 99)
+  PokeB(b + 237, 130)
+  PokeB(b + 238, 83)
+  PokeB(b + 239, 99)
+
+  o = b + 240
+  PokeB(o, 53)
+  PokeB(o + 1, 1)
+  PokeB(o + 2, kind)
+  o = o + 3
+  If kind = 3
+    PokeB(o, 50)
+    PokeB(o + 1, 4)
+    PutBE32(o + 2, reqIp)
+    o = o + 6
+    PokeB(o, 54)
+    PokeB(o + 1, 4)
+    PutBE32(o + 2, srvIp)
+    o = o + 6
+  EndIf
+  PokeB(o, 55)                 ; parameter request list
+  PokeB(o + 1, 5)
+  PokeB(o + 2, 1)              ; subnet mask
+  PokeB(o + 3, 3)              ; router
+  PokeB(o + 4, 6)              ; domain name servers
+  PokeB(o + 5, 66)             ; TFTP server NAME
+  PokeB(o + 6, 150)            ; TFTP server ADDRESS list
+  o = o + 7
+  PokeB(o, 255)
+
+  ProcedureReturn #DHCP_FRAME_LEN
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ParseDhcp - is this frame a DHCP reply to OUR transaction, and if so
+;  what kind? Returns the option 53 message type, or 0.
+;
+;  EVERY BOUND IS CHECKED AGAINST THE LENGTH THE CALLER GAVE, because
+;  this is the first thing in this payload to walk bytes that came off
+;  the air from a machine nobody here controls. The IHL is honoured
+;  rather than assumed to be five: a server that puts options in the IP
+;  header would otherwise move every field and the parse would read the
+;  wrong ones without noticing.
+; ----------------------------------------------------------------------
+Procedure.i ParseDhcp(f.i, n.i)
+  Define b.i
+  Define o.i
+  Define t.i
+  Define l.i
+  Define hdr.i
+  Define kind.i
+
+  If n < 42 + 240
+    ProcedureReturn 0
+  EndIf
+  If PeekA(f + 12) <> $08 Or PeekA(f + 13) <> $00
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(f + 14) >> 4) <> 4
+    ProcedureReturn 0
+  EndIf
+  hdr = (PeekA(f + 14) & $F) * 4
+  If hdr < 20 Or (14 + hdr + 8 + 240) > n
+    ProcedureReturn 0
+  EndIf
+  If PeekA(f + 14 + 9) <> 17
+    ProcedureReturn 0
+  EndIf
+  If GetBE16(f + 14 + hdr) <> 67 Or GetBE16(f + 14 + hdr + 2) <> 68
+    ProcedureReturn 0
+  EndIf
+
+  b = f + 14 + hdr + 8
+  If PeekA(b) <> 2
+    ProcedureReturn 0
+  EndIf
+  For l = 0 To 3
+    If PeekA(b + 4 + l) <> dhcpXid[l]
+      ProcedureReturn 0
+    EndIf
+  Next
+  If PeekA(b + 236) <> 99 Or PeekA(b + 237) <> 130 Or PeekA(b + 238) <> 83 Or PeekA(b + 239) <> 99
+    ProcedureReturn 0
+  EndIf
+
+  kind = 0
+  o = b + 240
+  While o < (f + n)
+    t = PeekA(o)
+    If t = 255
+      Break
+    EndIf
+    If t = 0
+      o = o + 1
+      Continue
+    EndIf
+    If (o + 2) > (f + n)
+      Break
+    EndIf
+    l = PeekA(o + 1)
+    If (o + 2 + l) > (f + n)
+      Break
+    EndIf
+    If t = 53 And l = 1
+      kind = PeekA(o + 2)
+    EndIf
+    If t = 1 And l = 4
+      dhcpMask = GetBE32(o + 2)
+    EndIf
+    If t = 3 And l >= 4
+      dhcpGw = GetBE32(o + 2)
+    EndIf
+    If t = 54 And l = 4
+      dhcpSrv = GetBE32(o + 2)
+    EndIf
+    ; OPTION 66 IS A NAME AND OPTION 150 IS A LIST OF ADDRESSES. Both
+    ; are optional and most home routers send neither; the point of
+    ; asking is to be able to say which.
+    If t = 66 And l >= 1
+      dhcpTftpNameLen = l
+      If dhcpTftpNameLen > 63
+        dhcpTftpNameLen = 63
+      EndIf
+      For hdr = 0 To dhcpTftpNameLen - 1
+        dhcpTftpName[hdr] = PeekA(o + 2 + hdr)
+      Next
+    EndIf
+    If t = 150 And l >= 4
+      dhcpTftpIp = GetBE32(o + 2)
+    EndIf
+    o = o + 2 + l
+  Wend
+
+  If kind <> 0
+    dhcpIp = GetBE32(b + 16)
+    ; siaddr - "the address of the next server to use in bootstrap".
+    ; Zero on almost every home router, which is itself the answer.
+    dhcpNext = GetBE32(b + 20)
+  EndIf
+  ProcedureReturn kind
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Send whatever wpa2sup has staged, through the radio's data path.
+;  Returns the transport's verdict.
+;
+;  BUILD IN PLACE IS NOT AN OPTION HERE and the copy is the price of
+;  wpa2sup.pi4 owning no transport. It is at most 135 bytes.
+; ----------------------------------------------------------------------
+Procedure.i SendSupFrame()
+  Define n.i
+  Define i.i
+  Define src.i
+  Define dst.i
+  n = Wpa2SupTxLen()
+  If n < 1
+    ProcedureReturn -1
+  EndIf
+  src = Wpa2SupTxPtr()
+  dst = Cyw43DataPtr()
+  For i = 0 To n - 1
+    PokeB(dst + i, PeekA(src + i))
+  Next
+  ProcedureReturn Cyw43Send(n)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Push whatever net.pi4 staged in its output buffer out of the radio.
+;
+;  ONE COPY PER FRAME, and it is the price of net.pi4 performing no I/O
+;  by design - the same price the Ethernet path pays in the other
+;  direction. At 60 bytes for an ARP and 74 for an echo request it is
+;  not a price worth engineering away.
+; ----------------------------------------------------------------------
+Procedure.i SendNetOut()
+  Define n.i
+  Define i.i
+  Define src.i
+  Define dst.i
+  n = NetOutLen()
+  If n < 1
+    ProcedureReturn -1
+  EndIf
+  src = NetOutBuf()
+  dst = Cyw43DataPtr()
+  For i = 0 To n - 1
+    PokeB(dst + i, PeekA(src + i))
+  Next
+  ProcedureReturn Cyw43Send(n)
+EndProcedure
+
+Procedure.i Main()
+  Define ok.i
+  Define r.i
+  Define i.i
+  Define j.i
+  Define n.i
+  Define p.i
+  Define hz.i
+  Define crc.i
+  Define setLen.i
+  Define fp.i
+  Define count.i
+  Define ent.i
+  Define chosen.i
+  Define ssid.i
+  Define ssidLen.i
+  Define slices.i
+  Define verdict.i
+  Define tries.i
+  Define waitMs.i
+  Define got.i
+  Define code.i
+  Define m1.i
+  Define m3.i
+  Define keyed.i
+  Define frames.i
+  Define t0.i
+  Define k.i
+
+  If TimerInit() <> 0
+    g_hz = TickHz()
+  EndIf
+  startMs = NowMs()
+
+  PrintNl()
+  UartWriteStr("=== pi4WifiKey - host four-way handshake ===")
+  PrintNl()
+  PrintNl()
+
+  ; ====================================================================
+  ; 1 - the blobs
+  ; ====================================================================
+  UartWriteStr("-- the blobs, as loaded --")
+  PrintNl()
+  crc = Crc32(#FW_ADDR, #FW_WINDOW)
+  HexLine("firmware head 4K ", crc, 8)
+  If crc <> #FW_CRC_HEAD
+    UartWriteStr("  WRONG - type:  load BRCMFW.BIN 1000000")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  crc = Crc32(#FW_ADDR + #FW_LEN - #FW_WINDOW, #FW_WINDOW)
+  HexLine("firmware tail 4K ", crc, 8)
+  If crc <> #FW_CRC_TAIL
+    UartWriteStr("  WRONG OR SHORT - type:  load BRCMFW.BIN 1000000")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  crc = Crc32(#NV_ADDR, #NV_LEN)
+  HexLine("nvram crc32      ", crc, 8)
+  If crc <> #NV_CRC
+    UartWriteStr("  WRONG - type:  load BRCMNV.TXT 1200000")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  crc = Crc32(#CLM_ADDR, #CLM_LEN)
+  HexLine("clm crc32        ", crc, 8)
+  If crc <> #CLM_CRC
+    UartWriteStr("  WRONG - type:  load BRCMCLM.BLB 1300000")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Stamp("blobs checked")
+
+  ; ====================================================================
+  ; 2 - THE STAGED PMK TABLE, AND ITS FINGERPRINT
+  ;
+  ; The fingerprint is over SETTINGS.TXT as it sits in DRAM right now.
+  ; If it does not match the one pi4WifiPmk.pi4 recorded, the staged
+  ; keys were derived from a different file and using them would fail
+  ; message 3's MIC with no visible cause. REFUSED, not risked.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- the staged keys --")
+  PrintNl()
+
+  setLen = -1
+  For i = 0 To #SET_WIN - 1
+    If PeekA(#SET_ADDR + i) = 0
+      setLen = i
+      Break
+    EndIf
+  Next
+  If setLen < 1
+    UartWriteStr("  SETTINGS.TXT is not in DRAM. Type:")
+    PrintNl()
+    UartWriteStr("    fill 1400000 0 800")
+    PrintNl()
+    UartWriteStr("    load SETTINGS.TXT 1400000")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  fp = Fnv1a(#SET_ADDR, setLen)
+  Line("settings bytes   ", setLen)
+  HexLine("settings fingerprint", fp, 8)
+
+  If Rd32(#PMKS_ADDR) <> #PMKS_MAGIC
+    UartWriteStr("  NOTHING IS STAGED at $01500000. Run pi4WifiPmk.pi4")
+    PrintNl()
+    UartWriteStr("  first - it derives the PMKs, which costs about ten")
+    PrintNl()
+    UartWriteStr("  seconds each and cannot be done inside this payload's")
+    PrintNl()
+    UartWriteStr("  fifteen-second budget.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If Rd32(#PMKS_ADDR + #PMKS_OFF_FP) <> fp
+    UartWriteStr("  THE STAGED TABLE WAS BUILT FROM A DIFFERENT SETTINGS.TXT")
+    PrintNl()
+    HexLine("  it recorded    ", Rd32(#PMKS_ADDR + #PMKS_OFF_FP), 8)
+    UartWriteStr("  Run pi4WifiPmk.pi4 again.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  count = Rd32(#PMKS_ADDR + #PMKS_OFF_COUNT)
+  If count < 1 Or count > #PMKS_MAX
+    Line("  staged count is not sane", count)
+    ProcedureReturn 1
+  EndIf
+  Line("staged networks  ", count)
+  For i = 0 To count - 1
+    ent = #PMKS_ADDR + #PMKS_HDR + i * #PMKS_ENTRY
+    UartWriteStr("  ")
+    PrintDec(i)
+    UartWriteStr("  slot ")
+    PrintDec(Rd32(ent + #PMKS_OFF_SLOT))
+    UartWriteStr("  ")
+    PrintSsid(ent + #PMKS_OFF_SSID, Rd32(ent + #PMKS_OFF_SLEN))
+    PrintNl()
+  Next
+  UartDrain()
+
+  ; ====================================================================
+  ; 3 - the bus. THE CLOCK QUERY RETRIES, and the reason is a bench
+  ;     measurement rather than caution: on 2026-08-28 the very same
+  ;     call returned zero on the first attempt after a deadman reset
+  ;     with Anvil's HDMI framebuffer enabled, and the run stopped
+  ;     there with the radio never touched.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- bus --")
+  PrintNl()
+
+  ok = MailboxInit()
+  Line("mailbox init (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+
+  hz = 0
+  tries = 0
+  While tries < #CLOCK_TRIES And hz <= 0
+    hz = MailboxClockRate(#CLOCK_ID_EMMC)
+    UartWriteStr("  EMMC clock attempt ")
+    PrintDec(tries + 1)
+    UartWriteStr("  -> ")
+    PrintDec(hz)
+    UartWriteStr(" Hz")
+    PrintNl()
+    UartDrain()
+    If hz <= 0
+      delay(#CLOCK_GAP_MS)
+    EndIf
+    tries = tries + 1
+  Wend
+  If hz <= 0
+    UartWriteStr("  THE FIRMWARE WOULD NOT REPORT THE EMMC CLOCK in ")
+    PrintDec(#CLOCK_TRIES)
+    UartWriteStr(" tries.")
+    PrintNl()
+    UartWriteStr("  Type `screen off` at the prompt and run again - Anvil's")
+    PrintNl()
+    UartWriteStr("  framebuffer is the one thing known to have changed the")
+    PrintNl()
+    UartWriteStr("  day this first happened. sdio.pi4 will not guess a base")
+    PrintNl()
+    UartWriteStr("  clock and neither will this file.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  SdioSetBaseClockKhz(hz / 1000)
+
+  ok = SdioAssertWlOn()
+  Line("WL_ON asserted (want 1)", ok)
+  ok = SdioInit()
+  Line("SdioInit (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  ok = SdioEnableFunction(1)
+  Line("enable F1 (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; 4 - the chip and the firmware
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- chip and firmware --")
+  PrintNl()
+
+  Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+
+  ok = Cyw43Attach()
+  Line("Cyw43Attach (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  HexLine("chip id          ", Cyw43ChipId(), 4)
+  Cyw43SetBlockMode(1)
+
+  ok = Cyw43PrepareDownload()
+  Line("Cyw43PrepareDownload (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+  ok = Cyw43UploadFirmware(#FW_ADDR, #FW_LEN, #SCRATCH, #SCRATCH_LEN)
+  Line("Cyw43UploadFirmware (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  ok = Cyw43UploadNvram(#NV_ADDR, #NV_LEN, #NV_WORK, #NV_WORK_MAX, #SCRATCH, #SCRATCH_LEN)
+  Line("Cyw43UploadNvram (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+  ok = Cyw43Start()
+  Line("Cyw43Start (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+  ok = Cyw43HtClock()
+  Line("Cyw43HtClock (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+  Cyw43AnnounceHost()
+  ok = SdioEnableFunction(2)
+  Line("enable F2 (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+  Stamp("firmware up")
+
+  r = Cyw43WifiUp(#CLM_ADDR, #CLM_LEN, #CYW43_EVMASK_JOIN, 2000)
+  Line("Cyw43WifiUp (want 0)", r)
+  If r <> 0
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    ProcedureReturn 1
+  EndIf
+  Stamp("radio up")
+
+  r = Cyw43MacAddress(@ourMac[0], 2000)
+  Line("cur_etheraddr rc ", r)
+  If r <> 0
+    UartWriteStr("  WITHOUT OUR OWN MAC THE PTK CANNOT BE DERIVED - it is")
+    PrintNl()
+    UartWriteStr("  half of the Min/Max pair the derivation sorts.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("  our MAC          ")
+  PrintBssid(@ourMac[0])
+  PrintNl()
+
+  ; ====================================================================
+  ; 5 - THE SNonce, FROM THE HARDWARE RANDOM NUMBER GENERATOR.
+  ;
+  ; A predictable SNonce makes every session key on this board
+  ; derivable by anyone who captured the handshake, and it fails
+  ; SILENTLY - the link comes up perfectly. wpa2sup.pi4 refuses to
+  ; derive a PTK without one for exactly that reason.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- the nonce --")
+  PrintNl()
+  r = EntropyBegin()
+  Line("EntropyBegin (want 0)", r)
+  If r = 0
+    r = EntropyWarmupWait(#ENTROPY_SPINS)
+    Line("EntropyWarmupWait   ", r)
+  EndIf
+  n = EntropyBytes(@snonce[0], 32, #ENTROPY_SPINS)
+  Line("EntropyBytes (want 32)", n)
+  If n <> 32
+    UartWriteStr("  NO ENTROPY, NO HANDSHAKE. A zero SNonce would associate")
+    PrintNl()
+    UartWriteStr("  and key perfectly and would be a real weakness, so this")
+    PrintNl()
+    UartWriteStr("  stops instead. See RaspberryPi4/Lib/entropy.pi4.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  ; Not one byte of it is printed. Its ONLY published property is that
+  ; it is not all zeros, which is the failure this checks for.
+  ok = 0
+  For i = 0 To 31
+    If snonce[i] <> 0
+      ok = 1
+    EndIf
+  Next
+  Line("nonce is non-zero (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+
+  ; ====================================================================
+  ; 6 - THE SECURITY BLOCK, WITHOUT THE SUPPLICANT KNOBS.
+  ;
+  ; Items 4, 5 and 6 (`bsscfg:sup_wpa`, `sup_wpa2_eapver`,
+  ; `sup_wpa_tmo`) and item 7 (`bsscfg:mfp`) are all refused by this
+  ; firmware and all four are OMITTED rather than sent-and-tolerated.
+  ; Sending an ioctl in the certain knowledge that it will fail, and
+  ; then ignoring the failure, teaches a reader that failures here do
+  ; not matter - and the next real one will be ignored too.
+  ;
+  ; WHAT REMAINS IS WHAT THE ASSOCIATION REQUEST IS BUILT FROM:
+  ;   0  ampdu_ba_wsize = 8
+  ;   1  WLC_SET_INFRA = 1
+  ;   2  bsscfg:auth = 0        802.11 OPEN SYSTEM
+  ;   3  bsscfg:wsec = AES
+  ;   8  bsscfg:wpa_auth = WPA2_PSK      LAST, as brcmfmac does
+  ; plus the `wpaie` iovar, which is this payload's addition and is the
+  ; thing that makes message 2 possible.
+  ;
+  ; NO WLC_SET_WSEC_PMK. There is nothing in this firmware to run a
+  ; supplicant, so there is nothing to give a key to. The PMK stays in
+  ; the host.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- security --")
+  PrintNl()
+
+  ; THE RSN ELEMENT GOES FIRST, which is brcmf_cfg80211_connect's order:
+  ; `wpaie` is set at cfg80211.c:2409, above set_wpa_version,
+  ; set_auth_type, set_wsec_mode and set_key_mgmt. It very likely does
+  ; not matter - but the driver that works with this firmware every day
+  ; does it this way, and matching it costs nothing.
+  r = Cyw43SetWpaIe(?theRsnIe, #RSN_IE_LEN, 2000)
+  Line("wpaie set (want 0)", r)
+  If r <> 0
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    UartWriteStr("  WITHOUT `wpaie` THE HOST CANNOT KNOW WHAT THE ASSOCIATION")
+    PrintNl()
+    UartWriteStr("  REQUEST CARRIED, and message 2 has to repeat it exactly.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = 1
+  For i = 0 To 3
+    r = Cyw43SecItem(i, 2000)
+    UartWriteStr("  ")
+    PrintDec(i)
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43SecItemName(i))
+    UartWriteStr("   rc ")
+    PrintDec(r)
+    PrintNl()
+    If r <> 0
+      ok = 0
+    EndIf
+  Next
+  r = Cyw43SecItem(8, 2000)
+  UartWriteStr("  8  ")
+  UartWriteStr(Cyw43SecItemName(8))
+  UartWriteStr("   rc ")
+  PrintDec(r)
+  PrintNl()
+  If r <> 0
+    ok = 0
+  EndIf
+  UartDrain()
+  If ok = 0
+    UartWriteStr("  A SECURITY ITEM WAS REFUSED - the association request")
+    PrintNl()
+    UartWriteStr("  would carry the wrong RSN information element.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  Stamp("security set")
+
+  ; ====================================================================
+  ; 7 - THE JOIN. Staged networks in order, first one that associates.
+  ;
+  ; NO SCAN, AND THE SAVING IS THE REASON. pi4WifiJoin.pi4's escan is
+  ; five seconds of a fifteen-second budget and everything it produces
+  ; - band, RSSI, BSSID - can be read back from the firmware AFTER
+  ; association, which is where this file reads it. The one thing lost
+  ; is the ability to prefer 5 GHz on measured signal strength before
+  ; committing, and on this bench that preference is moot: ajtaji_5G
+  ; answers 802.11 status 43 AKMP_NOT_VALID because it wants WPA3/SAE,
+  ; which is recorded at length in pi4WifiJoin.pi4's finding 2.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- join --")
+  PrintNl()
+
+  ; NOKEY, not SECURED: the firmware will never emit a PSK_SUP event
+  ; because it has no supplicant, so the accumulator must not wait for
+  ; one. The KEYING happens below, in this payload, and its proof is
+  ; message 3's MIC rather than an event.
+  Cyw43SetJoinExpectation(#CYW43_JOINEXP_NOKEY)
+
+  ; ------------------------------------------------------------------
+  ;  DISASSOCIATE BEFORE THE FIRST ATTEMPT, WHICH cyw43.pi4 SAYS NOT TO
+  ;  DO, AND HERE IS WHY IT IS RIGHT ANYWAY.
+  ;
+  ;  Cyw43Disassoc's header says "DO NOT SEND IT BEFORE A FIRST JOIN -
+  ;  neither reference driver does". True for a DRIVER, whose first
+  ;  join follows a cold boot. This is an INSTRUMENT, and its first
+  ;  join follows the last run of itself. Measured 2026-08-28, the run
+  ;  straight after one whose handshake failed at message 2:
+  ;
+  ;      [t+5067 ms] event 3 AUTH status 2 reason 0 state $0804
+  ;
+  ;  Status 2 is TIMEOUT: the access point was still holding a station
+  ;  that had authenticated, associated and then vanished mid-
+  ;  handshake. The twin measured what a clean teardown buys - attempt
+  ;  one going from 4.3% to 75.3% over 144 reset-to-reset cycles, with
+  ;  the stall MODE disappearing rather than getting rarer.
+  ; ------------------------------------------------------------------
+  r = Cyw43Disassoc(2000)
+  Line("clean teardown before the first attempt (0 = ok)", r)
+  Cyw43DrainEvents(120)
+
+  chosen = -1
+  verdict = #CYW43_JOIN_FAILED
+  For i = 0 To count - 1
+    If (NowMs() - startMs) > #JOIN_LADDER_BY_MS
+      UartWriteStr("  LADDER STOPS ON THE CLOCK at t+")
+      PrintDec(NowMs() - startMs)
+      UartWriteStr(" ms - what is left of the")
+      PrintNl()
+      UartWriteStr("  budget belongs to the handshake, not to another SSID.")
+      PrintNl()
+      Break
+    EndIf
+    ent = #PMKS_ADDR + #PMKS_HDR + i * #PMKS_ENTRY
+    ssid = ent + #PMKS_OFF_SSID
+    ssidLen = Rd32(ent + #PMKS_OFF_SLEN)
+
+    UartWriteStr("  trying  ")
+    PrintSsid(ssid, ssidLen)
+    PrintNl()
+    UartDrain()
+
+    r = Cyw43JoinStart(ssid, ssidLen, 2000)
+    If r <> 0
+      Line("    WLC_SET_SSID refused, rc", r)
+      Continue
+    EndIf
+
+    slices = 0
+    verdict = #CYW43_JOIN_RUNNING
+    While verdict = #CYW43_JOIN_RUNNING And slices < #JOIN_MAX_SLICES
+      verdict = Cyw43JoinPoll(#JOIN_SLICE_MS)
+      If Cyw43EventNew() <> 0
+        UartWriteStr("    [t+")
+        PrintDec(NowMs() - startMs)
+        UartWriteStr(" ms] event ")
+        PrintDec(Cyw43JoinEventType())
+        UartWriteStr(" ")
+        UartWriteStr(Cyw43EventName(Cyw43JoinEventType()))
+        UartWriteStr(" status ")
+        PrintDec(Cyw43JoinEventStatus())
+        UartWriteStr(" reason ")
+        PrintDec(Cyw43JoinEventReason())
+        UartWriteStr(" flags $")
+        PutHexN(Cyw43JoinEventFlags(), 4)
+        UartWriteStr(" state $")
+        PutHexN(Cyw43JoinState(), 4)
+        PrintNl()
+        UartDrain()
+      EndIf
+      slices = slices + 1
+    Wend
+
+    If verdict = #CYW43_JOIN_JOINED
+      chosen = i
+      Break
+    EndIf
+    UartWriteStr("    FAILED: ")
+    UartWriteStr(Cyw43JoinFailText())
+    PrintNl()
+    UartDrain()
+    Cyw43Disassoc(2000)
+    Cyw43DrainEvents(150)
+
+    ; ONE RETRY, AND ONLY FOR FAILURES A RETRY CAN FIX. A stale
+    ; association at the far end shows as an AUTH timeout or a keying
+    ; stall and clears once we have disassociated; NONET means the
+    ; name was not on the air and PRUNE means the access point does
+    ; not accept what we offer, and re-asking either of those asks the
+    ; identical question.
+    If Cyw43JoinFail() = #CYW43_JOINFAIL_BADAUTH Or Cyw43JoinFail() = #CYW43_JOINFAIL_TIMEOUT Or Cyw43JoinFail() = #CYW43_JOINFAIL_KEYTIMEOUT
+      If (NowMs() - startMs) < #JOIN_LADDER_BY_MS
+        UartWriteStr("    retrying the same network after the teardown")
+        PrintNl()
+        UartDrain()
+        r = Cyw43JoinStart(ssid, ssidLen, 2000)
+        If r = 0
+          slices = 0
+          verdict = #CYW43_JOIN_RUNNING
+          While verdict = #CYW43_JOIN_RUNNING And slices < #JOIN_MAX_SLICES
+            verdict = Cyw43JoinPoll(#JOIN_SLICE_MS)
+            If Cyw43EventNew() <> 0
+              UartWriteStr("    [t+")
+              PrintDec(NowMs() - startMs)
+              UartWriteStr(" ms] event ")
+              PrintDec(Cyw43JoinEventType())
+              UartWriteStr(" ")
+              UartWriteStr(Cyw43EventName(Cyw43JoinEventType()))
+              UartWriteStr(" status ")
+              PrintDec(Cyw43JoinEventStatus())
+              UartWriteStr(" reason ")
+              PrintDec(Cyw43JoinEventReason())
+              UartWriteStr(" flags $")
+              PutHexN(Cyw43JoinEventFlags(), 4)
+              UartWriteStr(" state $")
+              PutHexN(Cyw43JoinState(), 4)
+              PrintNl()
+              UartDrain()
+            EndIf
+            slices = slices + 1
+          Wend
+          If verdict = #CYW43_JOIN_JOINED
+            chosen = i
+            Break
+          EndIf
+          UartWriteStr("    FAILED AGAIN: ")
+          UartWriteStr(Cyw43JoinFailText())
+          PrintNl()
+          UartDrain()
+          Cyw43Disassoc(2000)
+          Cyw43DrainEvents(150)
+        EndIf
+      EndIf
+    EndIf
+  Next
+
+  If chosen < 0
+    UartWriteStr("  NOTHING ASSOCIATED. There is no link to key.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ent = #PMKS_ADDR + #PMKS_HDR + chosen * #PMKS_ENTRY
+  UartWriteStr("  ASSOCIATED to  ")
+  PrintSsid(ent + #PMKS_OFF_SSID, Rd32(ent + #PMKS_OFF_SLEN))
+  PrintNl()
+  Stamp("associated")
+
+  ; ====================================================================
+  ; 7b - WHAT THE ASSOCIATION REQUEST ACTUALLY CARRIED.
+  ;
+  ; ONE IOCTL, AND IT HAS TO HAPPEN HERE rather than after the
+  ; handshake, because message 2 has to repeat these exact bytes.
+  ; cyw43.pi4's ioctl path reuses cyw43_rx while it waits for a reply,
+  ; so a data frame arriving during this call is lost - and on the
+  ; 2026-08-28 bench message 1 landed 27 ms after LINK. The cost of
+  ; that risk is one authenticator retry, which is why #EAPOL_M1_MS is
+  ; wide enough to hold one. The cost of NOT doing it is a handshake
+  ; that cannot succeed at all.
+  ; ====================================================================
+  theIeLen = 0
+  r = Cyw43GetAssocReqIes(160, 2000)
+  If r = 0
+    n = Cyw43ReplyLen()
+    p = Cyw43ReplyPtr()
+    i = 0
+    While i + 2 <= n
+      j = PeekA(p + i + 1)
+      If i + 2 + j > n
+        Break
+      EndIf
+      If PeekA(p + i) = 48 And (j + 2) <= #RSN_IE_MAX
+        theIeLen = j + 2
+        For k = 0 To theIeLen - 1
+          theIe[k] = PeekA(p + i + k)
+        Next
+      EndIf
+      i = i + 2 + j
+    Wend
+  EndIf
+
+  ; ====================================================================
+  ; 8 - THE FOUR-WAY HANDSHAKE
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- the four-way handshake --")
+  PrintNl()
+
+  For i = 0 To 31
+    thePmk[i] = PeekA(ent + #PMKS_OFF_PMK + i)
+  Next
+  ; apMac IS STILL ZERO HERE and that is not an oversight. The read-back
+  ; that would fill it now happens after the handshake, and it is not
+  ; needed: Wpa2SupHandle takes the authenticator's address from
+  ; message 1's SOURCE field, which is the address that actually spoke
+  ; to us. On a network where the BSSID and the transmitter differ,
+  ; that is the one the PTK must be derived from.
+  If theIeLen >= 2
+    UartWriteStr("  the request carried:  ")
+    For i = 0 To theIeLen - 1
+      PutHexN(theIe[i], 2)
+      UartWrite(32)
+    Next
+    PrintNl()
+    ok = 1
+    If theIeLen <> #RSN_IE_LEN
+      ok = 0
+    Else
+      For i = 0 To #RSN_IE_LEN - 1
+        If theIe[i] <> PeekA(?theRsnIe + i)
+          ok = 0
+        EndIf
+      Next
+    EndIf
+    Line("  and it matches the one we asked for (want 1)", ok)
+    If ok = 0
+      UartWriteStr("  THE FIRMWARE CHANGED IT. Message 2 repeats what the")
+      PrintNl()
+      UartWriteStr("  REQUEST carried, not what we asked for - the access")
+      PrintNl()
+      UartWriteStr("  point compares against what it received.")
+      PrintNl()
+    EndIf
+    ok = Wpa2SupBegin(@thePmk[0], @ourMac[0], @apMac[0], @theIe[0], theIeLen)
+  Else
+    UartWriteStr("  assoc_req_ies gave no RSN element - falling back to the")
+    PrintNl()
+    UartWriteStr("  constant. If message 3 never arrives, this is the first")
+    PrintNl()
+    UartWriteStr("  thing to look at.")
+    PrintNl()
+    ok = Wpa2SupBegin(@thePmk[0], @ourMac[0], @apMac[0], ?theRsnIe, #RSN_IE_LEN)
+  EndIf
+  Line("Wpa2SupBegin (want 1)", ok)
+  If ok = 0
+    ProcedureReturn 1
+  EndIf
+  Wpa2SupSetSnonce(@snonce[0])
+  For i = 0 To 31
+    thePmk[i] = 0
+  Next
+
+  m1 = 0
+  m3 = 0
+  keyed = 0
+  waitMs = #EAPOL_M1_MS
+  t0 = NowMs()
+  While (NowMs() - t0) < waitMs And m3 = 0
+    n = Cyw43Receive(60)
+    If n >= 14
+      code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
+      If code = #WPA2SUP_IGNORED
+        UartWriteStr("    a data frame, ")
+        PrintDec(n)
+        UartWriteStr(" bytes, ethertype $")
+        p = Cyw43ReceivePtr()
+        PutHexN(PeekA(p + 12), 2)
+        PutHexN(PeekA(p + 13), 2)
+        PrintNl()
+        UartDrain()
+      ElseIf code = #WPA2SUP_SENT_M2
+        m1 = m1 + 1
+        UartWriteStr("    [t+")
+        PrintDec(NowMs() - startMs)
+        UartWriteStr(" ms] MESSAGE 1 IN, ")
+        PrintDec(n)
+        UartWriteStr(" bytes, from ")
+        PrintBssid(Cyw43ReceivePtr() + 6)
+        PrintNl()
+        r = SendSupFrame()
+        UartWriteStr("    message 2 out, ")
+        PrintDec(Wpa2SupTxLen())
+        UartWriteStr(" bytes, Cyw43Send rc ")
+        PrintDec(r)
+        PrintNl()
+        UartDrain()
+        ; From here the AP answers in milliseconds, not seconds.
+        t0 = NowMs()
+        waitMs = #EAPOL_M3_MS
+      ElseIf code = #WPA2SUP_SENT_M4
+        m3 = 1
+        UartWriteStr("    [t+")
+        PrintDec(NowMs() - startMs)
+        UartWriteStr(" ms] MESSAGE 3 IN, ")
+        PrintDec(n)
+        UartWriteStr(" bytes - AND ITS MIC VERIFIED")
+        PrintNl()
+        UartWriteStr("    *** THE ACCESS POINT HOLDS THE SAME PMK. THAT IS")
+        PrintNl()
+        UartWriteStr("    *** THE MUTUAL AUTHENTICATION.")
+        PrintNl()
+        Line("    GTK bytes    ", Wpa2SupGtkLen())
+        Line("    GTK key id   ", Wpa2SupGtkIndex())
+        UartDrain()
+
+        ; ------------------------------------------------------------
+        ;  MESSAGE 4 GOES OUT FIRST AND THE KEYS GO IN AFTER IT. THE
+        ;  ORDER IS NOT A PREFERENCE - THE OTHER WAY ROUND CANNOT WORK.
+        ;
+        ;  IEEE 802.11-2016 12.7.6.5: the Authenticator installs the PTK
+        ;  ON RECEPTION OF MESSAGE 4. It does not hold the pairwise key
+        ;  while message 4 is in the air. Install ours first and the
+        ;  radio CCMP-encrypts message 4 under a key the access point
+        ;  has not plumbed, so it arrives as noise.
+        ;
+        ;  MEASURED, 2026-08-28. This payload installed first and the
+        ;  access point retransmitted message 3 twice:
+        ;
+        ;      [t+5626 ms] MESSAGE 3 IN, 169 bytes - MIC VERIFIED
+        ;        PTK installed (want 0)  0
+        ;      message 4 out, 113 bytes, Cyw43Send rc 0
+        ;      169 bytes ethertype $888E from 04:42:1A:A5:BC:90 ...
+        ;      169 bytes ethertype $888E from 04:42:1A:A5:BC:90 ...
+        ;
+        ;  An authenticator retransmits message 3 when message 4 does
+        ;  not arrive valid. IT ALSO EXPLAINS THE MISSING DHCP OFFER,
+        ;  which was being chased separately: the DISCOVER went out
+        ;  under a PTK the access point had never installed either.
+        ;  One cause, two symptoms.
+        ; ------------------------------------------------------------
+        r = SendSupFrame()
+        UartWriteStr("    message 4 out, ")
+        PrintDec(Wpa2SupTxLen())
+        UartWriteStr(" bytes, Cyw43Send rc ")
+        PrintDec(r)
+        UartWriteStr("   (in the clear - the AP has no PTK yet)")
+        PrintNl()
+        UartDrain()
+
+        r = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+        Line("    PTK installed (want 0)", r)
+        If r <> 0
+          Line("      ioctl status", Cyw43IoctlStatus())
+        EndIf
+        j = r
+        r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+        Line("    GTK installed (want 0)", r)
+        If r <> 0
+          Line("      ioctl status", Cyw43IoctlStatus())
+        EndIf
+        If j = 0 And r = 0
+          keyed = 1
+        EndIf
+      Else
+        UartWriteStr("    ")
+        UartWriteStr(Wpa2SupErrorText(code))
+        PrintNl()
+        UartDrain()
+      EndIf
+    EndIf
+  Wend
+
+  Wpa2SupWipe()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+
+  If m1 = 0
+    UartWriteStr("  NO EAPOL MESSAGE 1 ARRIVED in ")
+    PrintDec(#EAPOL_M1_MS)
+    UartWriteStr(" ms.")
+    PrintNl()
+    UartWriteStr("  Either the association did not really complete, or the")
+    PrintNl()
+    UartWriteStr("  firmware is not passing 802.1X frames up to the host.")
+    PrintNl()
+    UartWriteStr("  The rx data frame counter below tells those apart: a")
+    PrintNl()
+    UartWriteStr("  non-zero count with no 802.1X means frames arrive and")
+    PrintNl()
+    UartWriteStr("  EAPOL is being kept back; a zero count means nothing at")
+    PrintNl()
+    UartWriteStr("  all is reaching the data path.")
+    PrintNl()
+  EndIf
+  If m1 > 0 And m3 = 0
+    UartWriteStr("  MESSAGE 3 NEVER ARRIVED. Message 2 went out; the access")
+    PrintNl()
+    UartWriteStr("  point did not accept it. The two things it checks are")
+    PrintNl()
+    UartWriteStr("  the MIC - which would mean the PMK is wrong, so the")
+    PrintNl()
+    UartWriteStr("  passphrase or the SSID salt is wrong - and the RSN")
+    PrintNl()
+    UartWriteStr("  element, which the read-back above prints in full.")
+    PrintNl()
+  EndIf
+  Line("keys installed (want 1)", keyed)
+  Stamp("handshake over")
+
+  ; ====================================================================
+  ; 8b - THE READ-BACKS, AFTER THE HANDSHAKE AND NOT BEFORE IT.
+  ;
+  ; THE ORDER IS LOAD-BEARING AND THIS IS WHY. Message 1 arrives within
+  ; tens of milliseconds of the association response, and cyw43.pi4's
+  ; ioctl path reuses cyw43_rx while it waits for a reply - so a data
+  ; frame that lands during WLC_GET_BSSID is overwritten and gone. Five
+  ; read-back ioctls between LINK-up and the first Cyw43Receive is
+  ; precisely the window in which the first EAPOL message disappears.
+  ; The authenticator's one-second retry would recover it and would eat
+  ; most of the listen budget doing so.
+  ;
+  ; The BSSID, the channel and the RSSI answer exactly the same a few
+  ; hundred milliseconds later. The handshake does not get a second
+  ; chance that cheaply, so it goes first.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- the link, read back from the firmware --")
+  PrintNl()
+  r = Cyw43ReadBssid(2000)
+  Line("WLC_GET_BSSID says associated (want 1)", r)
+  If r = 1
+    UartWriteStr("  BSSID            ")
+    PrintBssid(@cyw43_linkBssid[0])
+    PrintNl()
+    For j = 0 To 5
+      apMac[j] = Cyw43LinkBssidByte(j)
+    Next
+  EndIf
+  r = Cyw43ReadChannel(2000)
+  If r = 0
+    Line("channel          ", Cyw43LinkChannel())
+    If Cyw43LinkChannel() > 14
+      UartWriteStr("    that is the 5 GHz band")
+    Else
+      UartWriteStr("    that is the 2.4 GHz band")
+    EndIf
+    PrintNl()
+  EndIf
+  r = Cyw43ReadRssi(2000)
+  If r = 0
+    Line("RSSI dBm         ", Cyw43LinkRssi())
+  EndIf
+
+  ; ====================================================================
+  ; 7b - WHAT THE ASSOCIATION REQUEST ACTUALLY CARRIED.
+  ;
+  ; `wpaie` was accepted; this is the read-back that turns "accepted"
+  ; into "and these are the bytes". If they differ from ours, message 2
+  ; will be rejected and this row is where a reader finds out why -
+  ; instead of blaming the arithmetic.
+  ; ====================================================================
+  ; The events that arrived AFTER the handshake, drained and printed.
+  ; A DEAUTH here is the access point saying why it stopped talking,
+  ; and it is the difference between "message 3 was late" and "we were
+  ; thrown off the network".
+  r = Cyw43DrainEvents(120)
+  Line("events after the handshake", r)
+  If Cyw43EventNew() <> 0
+    UartWriteStr("  last event ")
+    PrintDec(Cyw43JoinEventType())
+    UartWriteStr(" ")
+    UartWriteStr(Cyw43EventName(Cyw43JoinEventType()))
+    UartWriteStr(" status ")
+    PrintDec(Cyw43JoinEventStatus())
+    UartWriteStr(" reason ")
+    PrintDec(Cyw43JoinEventReason())
+    PrintNl()
+  EndIf
+  UartDrain()
+
+
+  ; ====================================================================
+  ; 9 - TRAFFIC. The proof that the keys are the RIGHT keys.
+  ;
+  ; Once the pairwise and group keys are in, every frame on the air is
+  ; CCMP-encrypted and the firmware decrypts it before handing it up.
+  ; A frame that arrives here with a sensible EtherType therefore
+  ; decrypted correctly - which is a stronger statement than "the
+  ; handshake completed", because a handshake can complete against a
+  ; key the firmware then refuses.
+  ;
+  ; NOTHING IS TRANSMITTED. Any real LAN broadcasts ARP, mDNS and DHCP
+  ; constantly, so listening is enough and it needs no IP address, no
+  ; DHCP client and no assumption about this network's numbering. The
+  ; ICMP echo that would follow needs an address, and that is the next
+  ; payload's job rather than a guess made here.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- traffic --")
+  PrintNl()
+
+  frames = 0
+  t0 = NowMs()
+  While (NowMs() - t0) < #TRAFFIC_MS
+    n = Cyw43Receive(50)
+    If n >= 14
+      frames = frames + 1
+      If frames <= 6
+        p = Cyw43ReceivePtr()
+        UartWriteStr("  ")
+        PrintDec(n)
+        UartWriteStr(" bytes  ethertype $")
+        PutHexN(PeekA(p + 12), 2)
+        PutHexN(PeekA(p + 13), 2)
+        UartWriteStr("  from ")
+        PrintBssid(p + 6)
+        UartWriteStr("  to ")
+        PrintBssid(p)
+        PrintNl()
+        UartDrain()
+      EndIf
+    EndIf
+  Wend
+  Line("frames decrypted ", frames)
+  If frames > 0
+    UartWriteStr("  *** THE LINK CARRIES TRAFFIC. Those frames were CCMP on")
+    PrintNl()
+    UartWriteStr("  *** the air and came up as valid Ethernet, which only")
+    PrintNl()
+    UartWriteStr("  *** happens if the installed keys are the right ones.")
+    PrintNl()
+  EndIf
+
+  ; ====================================================================
+  ; 9b - AN ADDRESS, AND THEN A PING.
+  ;
+  ; THE WHOLE STAGE IS SKIPPED IF THE CLOCK HAS ALREADY GONE, and that
+  ; is deliberate rather than defensive. Everything above this point is
+  ; the milestone; this is the next rung. A stage that starts at
+  ; t = 13 s cannot finish before the deadman fires, and a reset takes
+  ; the log of the milestone with it if the drain has not kept up.
+  ; #PING_START_BY_MS is the gate and it is checked once, out loud.
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- dhcp --")
+  PrintNl()
+  UartDrain()
+
+  If keyed = 0
+    UartWriteStr("  skipped: no keys, so nothing would be carried anyway")
+    PrintNl()
+  ElseIf (NowMs() - startMs) > #PING_START_BY_MS
+    UartWriteStr("  SKIPPED ON THE CLOCK at t+")
+    PrintDec(NowMs() - startMs)
+    UartWriteStr(" ms. Starting a DHCP exchange")
+    PrintNl()
+    UartWriteStr("  this late cannot finish inside the deadman, and a reset")
+    PrintNl()
+    UartWriteStr("  here would cost the keying evidence above.")
+    PrintNl()
+  Else
+    ; The transaction id, from the same generator as the SNonce. It is
+    ; not a secret - it is on the wire in clear inside the encrypted
+    ; frame - but it must not repeat between runs, or a server's reply
+    ; to the PREVIOUS boot would be accepted by this one.
+    If EntropyBytes(@dhcpXid[0], 4, #ENTROPY_SPINS) <> 4
+      dhcpXid[0] = ourMac[5]
+      dhcpXid[1] = ourMac[4]
+      dhcpXid[2] = ourMac[3]
+      dhcpXid[3] = $5A
+    EndIf
+
+    n = BuildDhcp(1, 0, 0)
+    r = Cyw43Send(n)
+    Line("DISCOVER sent, Cyw43Send rc", r)
+    UartDrain()
+
+    got = 0
+    frames = 0
+    t0 = NowMs()
+    While (NowMs() - t0) < #DHCP_WAIT_MS And got = 0
+      n = Cyw43Receive(40)
+      If n >= 14
+        If ParseDhcp(Cyw43ReceivePtr(), n) = 2
+          got = 2
+          For j = 0 To 5
+            srvMac[j] = PeekA(Cyw43ReceivePtr() + 6 + j)
+          Next
+          srvMacOk = 1
+        Else
+          ; EVERY OTHER FRAME IS PRINTED, and that is the whole
+          ; correction. The previous run received three data frames
+          ; and reported zero twice, because anything this loop did
+          ; not recognise it dropped in silence. A frame arriving at
+          ; all is the proof the keys work; only its CONTENT is a DHCP
+          ; question.
+          frames = frames + 1
+          If frames <= 6
+            p = Cyw43ReceivePtr()
+            UartWriteStr("    ")
+            PrintDec(n)
+            UartWriteStr(" bytes  ethertype $")
+            PutHexN(PeekA(p + 12), 2)
+            PutHexN(PeekA(p + 13), 2)
+            UartWriteStr("  from ")
+            PrintBssid(p + 6)
+            UartWriteStr("  to ")
+            PrintBssid(p)
+            PrintNl()
+            UartDrain()
+          EndIf
+        EndIf
+      EndIf
+    Wend
+    If frames > 0
+      Line("frames arrived while waiting", frames)
+      UartWriteStr("  *** THOSE CAME OFF THE AIR CCMP-ENCRYPTED AND DECODED")
+      PrintNl()
+      UartWriteStr("  *** AS VALID ETHERNET. THE LINK CARRIES TRAFFIC.")
+      PrintNl()
+      UartDrain()
+    EndIf
+
+    If got <> 2
+      UartWriteStr("  NO OFFER in ")
+      PrintDec(#DHCP_WAIT_MS)
+      UartWriteStr(" ms. The frames above show the link decrypts,")
+      PrintNl()
+      UartWriteStr("  so this is a DHCP question rather than a radio one.")
+      PrintNl()
+    Else
+      UartWriteStr("  OFFER      ")
+      PrintIp(dhcpIp)
+      UartWriteStr("  mask ")
+      PrintIp(dhcpMask)
+      UartWriteStr("  router ")
+      PrintIp(dhcpGw)
+      PrintNl()
+      UartWriteStr("  *** THAT DATAGRAM CAME BACK CCMP-ENCRYPTED AND")
+      PrintNl()
+      UartWriteStr("  *** DECRYPTED CORRECTLY. The link carries IP.")
+      PrintNl()
+      UartDrain()
+
+      n = BuildDhcp(3, dhcpIp, dhcpSrv)
+      r = Cyw43Send(n)
+      Line("REQUEST sent, Cyw43Send rc", r)
+      UartDrain()
+
+      got = 0
+      t0 = NowMs()
+      While (NowMs() - t0) < #DHCP_ACK_MS And got = 0
+        n = Cyw43Receive(40)
+        If n >= 14
+          j = ParseDhcp(Cyw43ReceivePtr(), n)
+          If j = 5
+            got = 5
+            For k = 0 To 5
+              srvMac[k] = PeekA(Cyw43ReceivePtr() + 6 + k)
+            Next
+            srvMacOk = 1
+          ElseIf j = 6
+            got = 6
+          EndIf
+        EndIf
+      Wend
+
+      If got = 6
+        UartWriteStr("  the server sent a NAK - it will not lease that address")
+        PrintNl()
+      ElseIf got <> 5
+        UartWriteStr("  no ACK, but the OFFER above already proved the link")
+        PrintNl()
+      Else
+        UartWriteStr("  ACK        ")
+        PrintIp(dhcpIp)
+        PrintNl()
+        Stamp("addressed")
+
+        ; --------------------------------------------------------
+        ;  DOES THIS NETWORK OFFER A FILE SERVER?
+        ;
+        ;  The last rung of the standing request is a file transfer,
+        ;  and tftp.pi4 is a complete client waiting for an address.
+        ;  There is no `net.server` in SETTINGS.TXT - the eight keys
+        ;  it holds are four SSIDs and four passphrases - so the only
+        ;  honest source is the network itself. Asked, and whatever
+        ;  comes back is printed. NOTHING IS INVENTED: a guessed
+        ;  address on somebody's home LAN sends packets to a stranger.
+        ; --------------------------------------------------------
+        UartWriteStr("  next server (siaddr)  ")
+        PrintIp(dhcpNext)
+        PrintNl()
+        UartWriteStr("  option 150 tftp addr  ")
+        PrintIp(dhcpTftpIp)
+        PrintNl()
+        UartWriteStr("  option  66 tftp name  ")
+        If dhcpTftpNameLen > 0
+          PrintSsid(@dhcpTftpName[0], dhcpTftpNameLen)
+        Else
+          UartWriteStr("<none offered>")
+        EndIf
+        PrintNl()
+        If dhcpNext = 0 And dhcpTftpIp = 0 And dhcpTftpNameLen = 0
+          UartWriteStr("  THIS NETWORK ADVERTISES NO FILE SERVER. The transfer")
+          PrintNl()
+          UartWriteStr("  rung needs one address and one filename; tftp.pi4 is")
+          PrintNl()
+          UartWriteStr("  ready for both. Put them in SETTINGS.TXT as")
+          PrintNl()
+          UartWriteStr("  net.server, or run a TFTP server and say where.")
+          PrintNl()
+        EndIf
+        UartDrain()
+
+        ; ------------------------------------------------------------
+        ; 9c - THE PING.
+        ; ------------------------------------------------------------
+        PrintNl()
+        UartWriteStr("-- ping --")
+        PrintNl()
+        UartDrain()
+
+        NetInit()
+        NetSetMac(#HW_LINK_WIFI, @ourMac[0])
+        ok = NetSetIPv4(#HW_LINK_WIFI, dhcpIp, dhcpMask, dhcpGw)
+        Line("NetSetIPv4 (want 1)", ok)
+        If ok = 0
+          UartWriteStr("  ")
+          UartWriteStr(NetErrorText())
+          PrintNl()
+        Else
+          ; ----------------------------------------------------------
+          ;  SEED THE CACHE FROM THE DHCP REPLY WE ALREADY HAVE.
+          ;
+          ;  The ACK arrived as an Ethernet frame from the server, so
+          ;  its source address IS the server's hardware address. Only
+          ;  the address the frame actually came from is seeded - where
+          ;  the DHCP server and the default gateway are different
+          ;  machines, the gateway is still ARPed for, because putting
+          ;  the wrong MAC against the right IP fails as "the ping went
+          ;  nowhere" and reads as a network fault.
+          ; ----------------------------------------------------------
+          If srvMacOk = 1
+            UartWriteStr("  the DHCP server answered from  ")
+            PrintBssid(@srvMac[0])
+            UartWriteStr("  (")
+            PrintIp(dhcpSrv)
+            UartWriteStr(")")
+            PrintNl()
+            NetArpSet(#HW_LINK_WIFI, dhcpSrv, @srvMac[0])
+            If dhcpSrv = dhcpGw
+              UartWriteStr("  it is also the router, so the cache is seeded and")
+              PrintNl()
+              UartWriteStr("  no ARP round trip is needed")
+              PrintNl()
+            EndIf
+          EndIf
+          UartDrain()
+
+          ; The router has to be resolved before anything can be sent
+          ; to it. NetArpRequest stages the request; the reply comes
+          ; back through NetInput as #NET_IN_LEARNED.
+          If NetArpLookup(#HW_LINK_WIFI, dhcpGw, @peerMac[0]) = 0
+            r = NetArpRequest(#HW_LINK_WIFI, dhcpGw)
+            Line("  NetArpRequest (want 1)", r)
+            If r = 1
+              r = SendNetOut()
+              Line("  ARP request sent, Cyw43Send rc", r)
+            Else
+              UartWriteStr("  ")
+              UartWriteStr(NetErrorText())
+              PrintNl()
+            EndIf
+            UartDrain()
+            t0 = NowMs()
+            While (NowMs() - t0) < #ARP_WAIT_MS
+              n = Cyw43Receive(30)
+              If n >= 14
+                code = NetInput(#HW_LINK_WIFI, Cyw43ReceivePtr(), n)
+                If code = #NET_IN_REPLY
+                  SendNetOut()
+                EndIf
+              EndIf
+              If NetArpLookup(#HW_LINK_WIFI, dhcpGw, @peerMac[0]) = 1
+                Break
+              EndIf
+            Wend
+          EndIf
+          ok = NetArpLookup(#HW_LINK_WIFI, dhcpGw, @peerMac[0])
+          Line("router resolved (want 1)", ok)
+          If ok = 1
+            UartWriteStr("  router MAC       ")
+            PrintBssid(@peerMac[0])
+            PrintNl()
+            UartDrain()
+
+            got = 0
+            For i = 1 To #PING_COUNT
+              If NetPingBuild(#HW_LINK_WIFI, dhcpGw, $4321, i, 32) = 0
+                UartWriteStr("  ")
+                UartWriteStr(NetErrorText())
+                PrintNl()
+                Break
+              EndIf
+              SendNetOut()
+              t0 = NowMs()
+              While (NowMs() - t0) < #PING_WAIT_MS
+                n = Cyw43Receive(30)
+                If n >= 14
+                  code = NetInput(#HW_LINK_WIFI, Cyw43ReceivePtr(), n)
+                  If code = #NET_IN_REPLY
+                    SendNetOut()
+                  ElseIf code = #NET_IN_PONG
+                    got = got + 1
+                    UartWriteStr("  echo reply seq ")
+                    PrintDec(NetPongSeq())
+                    UartWriteStr(" from ")
+                    PrintIp(NetPongFrom())
+                    UartWriteStr(", ")
+                    PrintDec(NetPongBytes())
+                    UartWriteStr(" bytes")
+                    PrintNl()
+                    UartDrain()
+                    Break
+                  EndIf
+                EndIf
+              Wend
+            Next
+            Line("echo replies     ", got)
+            If got > 0
+              UartWriteStr("  *** PING. The Pi 4 is on the network.")
+              PrintNl()
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  UartDrain()
+
+  ; ====================================================================
+  ; 10 - the counters
+  ; ====================================================================
+  PrintNl()
+  UartWriteStr("-- transport counters --")
+  PrintNl()
+  Line("rx frames        ", Cyw43RxFrames())
+  Line("rx data frames   ", Cyw43RxDataFrames())
+  Line("tx data frames   ", Cyw43TxFrames())
+  Line("bad headers      ", Cyw43RxBadHdr())
+  Line("too short        ", Cyw43RxShort())
+  Line("other channels   ", Cyw43RxOther())
+  Line("other events     ", Cyw43EvOther())
+  Line("empty events     ", Cyw43EvEmpty())
+  Line("credit stalls    ", Cyw43Stalls())
+  Line("icv errors       ", Cyw43IcvErrors())
+  PrintNl()
+
+  Stamp("done")
+  If keyed = 1
+    UartWriteStr("=== KEYED ===")
+  Else
+    UartWriteStr("=== not keyed ===")
+  EndIf
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

@@ -1,0 +1,1022 @@
+; pi4V3dFbClear.pi4 - stage 5a. THE GPU CLEARS THE REAL HDMI SURFACE.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHY A CLEAR AND NOT THE TRIANGLE, WHEN THE TRIANGLE ALREADY WORKS
+; ======================================================================
+;
+;  pi4V3dTri.pi4 rasterises a triangle. It does it into a 64 x 64
+;  buffer in DRAM, which is EXACTLY ONE TILE and one supertile, and
+;  into memory that nothing scans out. Two things stand between that
+;  and a picture on a monitor, and they are both plumbing:
+;
+;    1. MULTI-TILE. Every piece of tile arithmetic in v3d.pi4 - the
+;       supertile sizing loop, the supertile sweep, the tile
+;       allocation pool, the tile state buffer, the partial tiles at
+;       the right and bottom edges - collapses to the identity at
+;       64 x 64. NOTHING HAS EVER EXERCISED IT. 1920 x 1080 is 510
+;       tiles and 135 supertiles.
+;
+;    2. A V3D PAGE TABLE THAT REACHES THE FRAMEBUFFER. Every address
+;       the CLE, the PTB and the TLB touch is VIRTUAL - v3d_submit.c
+;       :1054-1055 - and the framebuffer the firmware hands back sits
+;       high in the low gigabyte. A table covering it is about a
+;       megabyte, not the sixteen kilobytes every probe so far has
+;       used.
+;
+;  THIS PROGRAM DOES BOTH OF THOSE AND NOTHING ELSE. No shader, no
+;  vertex, no rasteriser: a flat colour. That is the whole point. If
+;  the screen comes out wrong here, it is the plumbing; if it comes
+;  out right here and wrong in pi4V3dFbTri.pi4, it is the geometry.
+;  Skipping this step to save a bench run is what makes a black
+;  screen undiagnosable.
+;
+; ======================================================================
+;  THE PASS CRITERION IS COUNTED PIXELS, PER TILE. NOT A PHOTOGRAPH.
+; ======================================================================
+;
+;  The framebuffer is filled with poison from the CPU, the GPU is
+;  asked to clear it, and then EVERY PIXEL IS READ BACK AND COUNTED -
+;  two million of them - grouped BY TILE, so the answer is not "how
+;  many pixels are right" but "how many of the 510 tiles are
+;  completely right, and which is the first that is not".
+;
+;  A per-tile count is what makes this a multi-tile test rather than
+;  a big single-tile test. A supertile sweep that emitted one
+;  coordinate would leave 509 tiles full of poison and a global count
+;  would still report "most pixels wrong", which names nothing. This
+;  one names the tile.
+;
+;  THE COLOUR IS MULTI-BYTE ON PURPOSE. $FF0C145C - four distinct
+;  bytes - so a channel swap, a byte-order fault or a 16-bit store
+;  cannot pass. It is also what DisplayRGB(12, 20, 92) produces, so
+;  the same word that the counter checks is the word display.pi4 says
+;  means "deep navy", and the monitor is a second, independent
+;  witness to the same number.
+;
+;  THERE ARE TWO GUARDS AND THEY GUARD DIFFERENT THINGS:
+;
+;    GUARD A, the page at #FB_GUARD, is DRAM this program owns and
+;    DELIBERATELY DOES NOT MAP. Nothing the GPU does can reach it, so
+;    a word that changed means an engine wrote through an address
+;    this program never authorised.
+;
+;    GUARD B is the tail of the firmware's own framebuffer
+;    ALLOCATION - the bytes between pitch*height and the size the
+;    firmware reported. Part of it IS inside the last mapped page, so
+;    it is reachable, which makes it the real overrun detector: a
+;    store that runs one row long lands in it.
+;
+; ======================================================================
+;  THE MEMORY MAP
+; ======================================================================
+;
+;  Identity-mapped through the V3D MMU, VA = PA, the same as every
+;  V3D probe before it. The framebuffer is identity-mapped too, which
+;  is the reason the table is a megabyte: the table is indexed by
+;  virtual page number, so covering a VA of $3Exxxxxx costs four
+;  bytes for every 4 KiB below it whether or not anything is mapped
+;  there. Sparse in content, dense in extent.
+;
+;  A NON-IDENTITY WINDOW WOULD HAVE COST SIXTEEN KILOBYTES and was
+;  refused. Mapping the framebuffer at some low VA works and is
+;  cheaper, and it introduces a second address for one buffer - one
+;  the CPU must never use and the GPU must always use. Every other
+;  address in this file and in the five probes before it is the same
+;  number on both sides. A megabyte of DRAM on a four-gigabyte board
+;  is not worth the class of bug where the two are transposed.
+;
+; ======================================================================
+;  RUNNING IT
+; ======================================================================
+;
+;  PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4V3dFbClear.pi4 -t pi4 \
+;      --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;      -o _work/v3dfbclear.img
+;  stage _work/v3dfbclear.img at 0x400000 with tools/pi4_upload.py, run
+;  "screen on", then enter it at 0x400000.
+;
+;  "screen on" first, so the monitor's own console proves the surface
+;  was live BEFORE this program touched it. Without it this program
+;  brings the display up itself and the screen goes from black to the
+;  clear colour, which is a weaker before-and-after.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+; NO DMA ENGINE IN THIS BUILD, and that is deliberate. display.pi4's
+; accelerated fills would make the poison pass faster and would put a
+; second bus master on the same surface in the same run. The one thing
+; this program has to be able to say is WHICH ENGINE WROTE THE PIXELS,
+; so the only writers here are the A72 and the V3D.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+#FBC_UART_DR = $FE201000
+#FBC_UART_FR = $FE201018
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP. Everything below the framebuffer is fixed; the
+;  framebuffer's address and the page table's SIZE come from the
+;  firmware at run time and are printed before anything is built from
+;  them.
+;
+;  The page table is first and is given two megabytes of room, which
+;  covers a virtual address space of two gigabytes. display.pi4 :391
+;  records that the firmware's framebuffer is converted into the LOW
+;  GIGABYTE, so one megabyte is always enough and the second is there
+;  so that a board that disagrees produces a refusal with a number in
+;  it rather than a table that runs off its own end.
+; ----------------------------------------------------------------------
+#FB_PT          = $01000000
+#FB_PT_MAX      = $00200000
+#FB_ILLEGAL     = $01200000
+#FB_BCL         = $01201000
+#FB_TILELIST    = $01202000
+#FB_RCL         = $01204000
+#FB_TSTATE      = $01210000
+#FB_TALLOC      = $01250000
+#FB_OVERFLOW    = $01350000
+#FB_GUARD       = $01390000
+
+#FB_BCL_BYTES   = 4096
+#FB_TL_BYTES    = 8192
+#FB_RCL_BYTES   = 16384
+; 510 tiles x 256 bytes is 130,560. 256 KiB is room for 1024 tiles,
+; which is 2048 x 2048 - past anything HDMI on this part will produce.
+#FB_TSTATE_BYTES = $00040000
+; 510 tiles: align(510*64, 4096) + 8192 + 512K = 569,344. A megabyte
+; is room for the same 1024 tiles.
+#FB_TALLOC_BYTES = $00100000
+#FB_OVERFLOW_BYTES = 262144
+#FB_GUARD_BYTES = 4096
+
+; The first virtual address above everything this program allocates
+; for itself, so the page table is never smaller than its own map even
+; if the firmware puts the framebuffer somewhere low.
+#FB_OWN_TOP     = $01391000
+
+#FB_PAGE        = 4096
+
+; ----------------------------------------------------------------------
+;  THE COLOURS.
+;
+;  #FB_CLEAR is the 32-bit word that must end up in every pixel. It is
+;  written into TILE_RENDERING_MODE_CFG_CLEAR_COLORS_PART1 unchanged
+;  and, with R/B swap off, arrives in memory unchanged - which is what
+;  pi4V3dClear.pi4 measured on silicon: clear $44332211 in, 4096 words
+;  of $44332211 out.
+;
+;  IT IS ALSO DisplayRGB(12, 20, 92). display.pi4 :2467 packs 32bpp as
+;  $FF << 24 | r << 16 | g << 8 | b, so the byte at the lowest address
+;  is BLUE. The GPU's RGBA8 output writes RED at the lowest address.
+;  THE TWO DISAGREE, and this program does not paper over it with the
+;  store packet's R/B swap bit: it writes the word it wants, counts
+;  the word it wants, and PRINTS whether that word is the one
+;  display.pi4 would have written for the same colour. A swap bit set
+;  to make a picture look right is a swap bit nobody has measured.
+; ----------------------------------------------------------------------
+#FB_CLEAR   = $FF0C145C
+#FB_POISON  = $A5A5A5A5
+
+; 1.0f into ZS_CLEAR_VALUES. There is no depth buffer; the packet is
+; emitted because it TERMINATES the rendering-mode configuration.
+#FB_ZCLEAR  = $3F800000
+
+; 100 ms for the bin, one second for the render. The render writes
+; every pixel of a 1080p surface and is the first job in this tree
+; that has real work to do; the kernel's own order of magnitude for a
+; V3D wait is 100 ms and this is ten of them, so a timeout means
+; stopped rather than slow.
+#FB_BIN_WAIT_US    = 100000
+#FB_RENDER_WAIT_US = 1000000
+
+; ======================================================================
+;  PRINTING - the same shape every V3D probe in this directory uses.
+; ======================================================================
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#FBC_UART_FR)
+  Until (f & 32) = 0
+  PokeL(#FBC_UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 30)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 30)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_NOINIT
+      PutS("NOINIT - V3dInit() has not passed")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - no V3D page table")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page walk failed. See VIO_ADDR.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - outside the page table, or page 0")
+    Case #V3D_ERR_MMU_FLUSH
+      PutS("MMU_FLUSH - the TLB clear never finished")
+    Case #V3D_ERR_MMU_ABSENT
+      PutS("MMU_ABSENT - HUB_IDENT2 says there is no MMU")
+    Case #V3D_ERR_CACHE_TIMEOUT
+      PutS("CACHE_TIMEOUT - the L2T clean never finished")
+    Case #V3D_ERR_CL_ARGS
+      PutS("CL_ARGS - a field or a buffer will not do")
+    Case #V3D_ERR_CL_FULL
+      PutS("CL_FULL - the list ran out of room")
+    Case #V3D_ERR_CL_NOBUF
+      PutS("CL_NOBUF - a packet with no list open")
+    Case #V3D_ERR_BIN_TIMEOUT
+      PutS("BIN_TIMEOUT - CLE_BFC never moved")
+    Case #V3D_ERR_BIN_OOM
+      PutS("BIN_OOM - the tile allocation pool ran out")
+    Case #V3D_ERR_RENDER_TIMEOUT
+      PutS("RENDER_TIMEOUT - CLE_RFC never moved")
+    Case #V3D_ERR_JOB_BUSY
+      PutS("JOB_BUSY - the render was offered before the bin finished")
+    Default
+      PutS("code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure DumpBytes(base.i, len.i)
+  Define i.i
+  i = 0
+  While i < len
+    If (i % 16) = 0
+      PutS("  ")
+      PutHex(base + i, 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekA(base + i), 2)
+    i = i + 1
+    If (i % 16) = 0
+      PutNl()
+    EndIf
+  Wend
+  If (len % 16) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE SURFACE, AS THE FIRMWARE DESCRIBED IT
+;
+;  NOTHING HERE IS A CONSTANT. anvil.pi4:5222-5225 records that this
+;  firmware applies overscan of its own accord and has been seen to
+;  answer 1824 x 984 to a request for 1920 x 1080. A probe with 1920
+;  compiled into it would then render 1920 pixels into a 1824-pixel
+;  row and the picture would shear - which looks like a tile
+;  arithmetic bug and is not one.
+; ======================================================================
+
+Global fbBase.i    = 0
+Global fbW.i       = 0
+Global fbH.i       = 0
+Global fbPitch.i   = 0
+Global fbSize.i    = 0
+Global fbUsed.i    = 0
+Global fbPage0.i   = 0
+Global fbMapEnd.i  = 0
+Global fbMapBytes.i = 0
+Global fbTail.i    = 0
+Global fbTailBytes.i = 0
+
+Global ptBytes.i   = 0
+Global ptEntries.i = 0
+
+; ======================================================================
+;  THE COUNTERS
+; ======================================================================
+
+Global nCorrect.i     = 0
+Global nPoison.i      = 0
+Global nOther.i       = 0
+Global firstOtherX.i  = -1
+Global firstOtherY.i  = -1
+Global firstOtherVal.i = 0
+Global tilesTotal.i   = 0
+Global tilesFull.i    = 0
+Global tilesEmpty.i   = 0
+Global firstBadTx.i   = -1
+Global firstBadTy.i   = -1
+Global guardATouched.i = 0
+Global guardBTouched.i = 0
+Global usPoison.i     = 0
+Global usVerify.i     = 0
+
+; ----------------------------------------------------------------------
+;  Verify - every pixel of the surface, grouped by tile.
+;
+;  THE LOOP IS TILE-MAJOR AND THAT IS THE POINT. A pixel-major loop
+;  produces one number for the whole frame; this one produces a
+;  verdict per tile, so "the sweep only visited the first supertile"
+;  and "the store address was wrong" are different answers instead of
+;  the same low percentage.
+;
+;  The right and bottom tiles are PARTIAL - 1920 is 30 whole tiles but
+;  1080 is 16 whole tiles and 56 rows - so the inner bounds are
+;  clipped to the surface. Those partial tiles are the ones a 64 x 64
+;  test could not have exercised at all.
+; ----------------------------------------------------------------------
+Procedure Verify(tileW.i, tileH.i, tilesX.i, tilesY.i)
+  Define tx.i
+  Define ty.i
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+  Define x.i
+  Define y.i
+  Define v.i
+  Define bad.i
+  Define good.i
+  Define rowBase.i
+  Define t0.i
+
+  t0 = Micros()
+  tilesTotal = tilesX * tilesY
+  ty = 0
+  While ty < tilesY
+    tx = 0
+    While tx < tilesX
+      x0 = tx * tileW
+      y0 = ty * tileH
+      x1 = x0 + tileW
+      y1 = y0 + tileH
+      If x1 > fbW : x1 = fbW : EndIf
+      If y1 > fbH : y1 = fbH : EndIf
+      bad  = 0
+      good = 0
+      y = y0
+      While y < y1
+        rowBase = fbBase + (y * fbPitch)
+        x = x0
+        While x < x1
+          v = PeekN(rowBase + (x * 4))
+          If v = #FB_CLEAR
+            good = good + 1
+            nCorrect = nCorrect + 1
+          Else
+            bad = bad + 1
+            If v = #FB_POISON
+              nPoison = nPoison + 1
+            Else
+              nOther = nOther + 1
+              If firstOtherX < 0
+                firstOtherX = x
+                firstOtherY = y
+                firstOtherVal = v
+              EndIf
+            EndIf
+          EndIf
+          x = x + 1
+        Wend
+        y = y + 1
+      Wend
+      If bad = 0
+        tilesFull = tilesFull + 1
+      Else
+        If good = 0
+          tilesEmpty = tilesEmpty + 1
+        EndIf
+        If firstBadTx < 0
+          firstBadTx = tx
+          firstBadTy = ty
+        EndIf
+      EndIf
+      tx = tx + 1
+    Wend
+    ty = ty + 1
+  Wend
+  usVerify = Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The two guards, read back word by word.
+; ----------------------------------------------------------------------
+Procedure VerifyGuards()
+  Define i.i
+  Define n.i
+
+  i = 0
+  n = #FB_GUARD_BYTES / 4
+  While i < n
+    If PeekN(#FB_GUARD + (i * 4)) <> #FB_POISON
+      guardATouched = guardATouched + 1
+    EndIf
+    i = i + 1
+  Wend
+
+  i = 0
+  n = fbTailBytes / 4
+  While i < n
+    If PeekN(fbTail + (i * 4)) <> #FB_POISON
+      guardBTouched = guardBTouched + 1
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define t0.i
+  Define ok.i
+  Define rgbWord.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 5a - the GPU clears the HDMI surface ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0. Stage 0. The CLE is a bus master and V3D 7.1 puts different
+  ;     registers at these offsets.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0: ")
+  PutErr(r)
+  PutNl()
+  RowHex("HUB_IDENT1", V3dIdent1())
+  RowHex("MMU_DEBUG_INFO", V3dMmuDebug())
+  If r <> #V3D_OK
+    PutS("verdict: STAGE0")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running - times will read 0")
+    PutNl()
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  1. THE SURFACE. Asked for, not assumed.
+  ; ------------------------------------------------------------------
+  PutS("1   the HDMI surface")
+  PutNl()
+  If MailboxInit() = 0
+    PutS("    mailbox: REFUSED")
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("    display tags: REFUSED")
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayInit(1920, 1080, 32) <> 1
+    PutS("    DisplayInit: rc ")
+    PutDec(DisplayLastError())
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  fbBase  = DisplayBase()
+  fbW     = DisplayWidth()
+  fbH     = DisplayHeight()
+  fbPitch = DisplayPitch()
+  fbSize  = DisplaySize()
+  fbUsed  = fbPitch * fbH
+
+  RowDec("width", fbW)
+  RowDec("height", fbH)
+  RowDec("pitch, bytes", fbPitch)
+  RowDec("bytes per pixel", DisplayBytesPerPixel())
+  RowHex("base, ARM physical", fbBase)
+  RowHex("base, VideoCore bus", DisplayBusBase())
+  RowDec("allocation, bytes", fbSize)
+  RowDec("pitch * height", fbUsed)
+  PutNl()
+
+  If DisplayBytesPerPixel() <> 4
+    PutS("    this program is 32bpp only and the firmware gave ")
+    PutDec(DisplayBytesPerPixel() * 8)
+    PutS(" bits")
+    PutNl()
+    PutS("verdict: NOT 32BPP")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If fbUsed > fbSize
+    PutS("    pitch * height is larger than the allocation - refusing")
+    PutNl()
+    PutS("verdict: SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; The framebuffer's alignment is the firmware's business: the
+  ; allocate tag asks for $100 (display.pi4:2233) and nothing promises
+  ; a page. The page table is indexed by page, so the MAPPING is
+  ; widened to whole pages around the surface while the RENDER TARGET
+  ; keeps the exact address the firmware gave.
+  fbPage0    = (fbBase / #FB_PAGE) * #FB_PAGE
+  fbMapEnd   = (((fbBase + fbUsed) + (#FB_PAGE - 1)) / #FB_PAGE) * #FB_PAGE
+  fbMapBytes = fbMapEnd - fbPage0
+  RowHex("first page mapped", fbPage0)
+  RowHex("one past last mapped", fbMapEnd)
+  RowDec("framebuffer pages", fbMapBytes / #FB_PAGE)
+  RowDec("base offset in its page", fbBase - fbPage0)
+
+  ; GUARD B - the slack the firmware allocated and the surface does
+  ; not use. Capped at two pages: it is a tripwire, not a survey.
+  fbTail      = fbBase + fbUsed
+  fbTailBytes = fbSize - fbUsed
+  If fbTailBytes > 8192
+    fbTailBytes = 8192
+  EndIf
+  fbTailBytes = (fbTailBytes / 4) * 4
+  RowHex("guard B, address", fbTail)
+  RowDec("guard B, bytes", fbTailBytes)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  2. THE PAGE TABLE'S SIZE, DERIVED. Four bytes per 4 KiB of
+  ;     virtual address space, and the highest virtual address this
+  ;     program uses is the end of the framebuffer.
+  ; ------------------------------------------------------------------
+  n = fbMapEnd
+  If n < #FB_OWN_TOP
+    n = #FB_OWN_TOP
+  EndIf
+  ptEntries = n / #FB_PAGE
+  ptBytes   = (((ptEntries * 4) + (#FB_PAGE - 1)) / #FB_PAGE) * #FB_PAGE
+
+  PutS("2   the page table")
+  PutNl()
+  RowHex("table at", #FB_PT)
+  RowDec("entries needed", ptEntries)
+  RowDec("table bytes", ptBytes)
+  RowDec("table bytes reserved", #FB_PT_MAX)
+  If ptBytes > #FB_PT_MAX
+    PutS("    the framebuffer is too high for the reserved table")
+    PutNl()
+    PutS("verdict: PAGE TABLE TOO SMALL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  ; The table must not sit inside anything it maps.
+  If (#FB_PT + ptBytes) > #FB_ILLEGAL
+    PutS("    the table would overrun the illegal page")
+    PutNl()
+    PutS("verdict: LAYOUT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If fbPage0 < #FB_OWN_TOP
+    PutS("    the firmware put the framebuffer inside this program's own map")
+    PutNl()
+    PutS("verdict: LAYOUT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  3. THE FRAME. Everything the hardware derives from the surface
+  ;     size, printed before anything is built from it.
+  ; ------------------------------------------------------------------
+  r = V3dRenderBegin(fbW, fbH, #V3D_OFMT_RGBA8)
+  PutS("3   the frame: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: GEOMETRY")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("tile width", V3dTileW())
+  RowDec("tile height", V3dTileH())
+  RowDec("tiles across", V3dTilesX())
+  RowDec("tiles down", V3dTilesY())
+  RowDec("tiles total", V3dTilesX() * V3dTilesY())
+  RowDec("supertile width, tiles", V3dSupertileW())
+  RowDec("supertile height, tiles", V3dSupertileH())
+  RowDec("frame width, supertiles", V3dFrameStW())
+  RowDec("frame height, supertiles", V3dFrameStH())
+  RowDec("tile alloc needed", V3dTileAllocNeeded())
+  RowDec("tile alloc given", #FB_TALLOC_BYTES)
+  RowDec("tile state needed", V3dTileStateNeeded())
+  RowDec("tile state given", #FB_TSTATE_BYTES)
+  PutNl()
+
+  ; THIS PROGRAM EXISTS TO EXERCISE MORE THAN ONE TILE. If the surface
+  ; turned out to be one tile it would be pi4V3dClear.pi4 again with a
+  ; bigger page table, and a pass would mean nothing it does not
+  ; already mean.
+  If (V3dTilesX() * V3dTilesY()) < 2
+    PutS("    one tile only - this probe has nothing to prove here")
+    PutNl()
+    PutS("verdict: NOT MULTI-TILE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dRenderTarget(fbBase, fbUsed, #V3D_MEMFMT_RASTER, fbPitch, 0)
+  If r <> #V3D_OK
+    PutS("    the render target: ") : PutErr(r) : PutNl()
+    PutS("verdict: TARGET")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  V3dRenderClear(#FB_CLEAR, #FB_ZCLEAR, 0)
+  r = V3dRenderPool(#FB_TALLOC, #FB_TALLOC_BYTES, #FB_TSTATE, #FB_TSTATE_BYTES)
+  If r <> #V3D_OK
+    PutS("    the pools: ") : PutErr(r) : PutNl()
+    PutS("verdict: POOLS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinOverflow(#FB_OVERFLOW, #FB_OVERFLOW_BYTES)
+  If r <> #V3D_OK
+    PutS("    the overflow pool: ") : PutErr(r) : PutNl()
+    PutS("verdict: POOLS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  4. POISON. The whole surface, both guards, and the first page of
+  ;     each pool.
+  ;
+  ;     THE SCREEN GOES GREY HERE and that is the before-and-after
+  ;     picture: $A5A5A5A5 is a flat mid-grey, so a human watching the
+  ;     monitor sees the console vanish under grey and then the grey
+  ;     replaced by the clear colour. Neither step is evidence - the
+  ;     counts below are - but a run that leaves grey on the screen
+  ;     has told the room the CPU wrote and the GPU did not.
+  ; ------------------------------------------------------------------
+  PutS("4   poisoning ")
+  PutDec(fbUsed)
+  PutS(" bytes of surface")
+  PutNl()
+  t0 = Micros()
+  i = 0
+  n = fbUsed / 4
+  While i < n
+    PokeN(fbBase + (i * 4), #FB_POISON)
+    i = i + 1
+  Wend
+  usPoison = Micros() - t0
+  RowDec("microseconds", usPoison)
+
+  i = 0
+  n = #FB_GUARD_BYTES / 4
+  While i < n
+    PokeN(#FB_GUARD + (i * 4), #FB_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = fbTailBytes / 4
+  While i < n
+    PokeN(fbTail + (i * 4), #FB_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = 4096 / 4
+  While i < n
+    PokeN(#FB_TALLOC + (i * 4), #FB_POISON)
+    PokeN(#FB_TSTATE + (i * 4), #FB_POISON)
+    i = i + 1
+  Wend
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  5. THE V3D MMU.
+  ; ------------------------------------------------------------------
+  PutS("5   the V3D MMU: ")
+  t0 = Micros()
+  r = V3dMmuInit(#FB_PT, ptBytes, #FB_ILLEGAL)
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dMmuMap(#FB_BCL, #FB_BCL, #FB_BCL_BYTES)
+  If r = #V3D_OK
+    r = V3dMmuMap(#FB_TILELIST, #FB_TILELIST, #FB_TL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#FB_RCL, #FB_RCL, #FB_RCL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#FB_TSTATE, #FB_TSTATE, #FB_TSTATE_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#FB_TALLOC, #FB_TALLOC, #FB_TALLOC_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#FB_OVERFLOW, #FB_OVERFLOW, #FB_OVERFLOW_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(fbPage0, fbPage0, fbMapBytes)
+  EndIf
+  If r <> #V3D_OK
+    PutS("    mapping: ") : PutErr(r) : PutNl()
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("microseconds", Micros() - t0)
+  RowDec("pages mapped", V3dMmuPagesMapped())
+  RowHex("PTE for the framebuffer", V3dMmuEntry(fbPage0))
+  RowHex("PTE, last surface page", V3dMmuEntry(fbMapEnd - #FB_PAGE))
+  RowHex("PTE, one page past it", V3dMmuEntry(fbMapEnd))
+  RowHex("PTE for guard A", V3dMmuEntry(#FB_GUARD))
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  6. THE BIN LIST. A clear bins nothing: the prologue and the
+  ;     epilogue, six packets, and no primitive - which is exactly
+  ;     what Mesa submits for glClear (v3dx_draw.c:1793-1806). The
+  ;     binner still has to RUN, because the render list branches into
+  ;     a per-tile list only the PTB produces.
+  ; ------------------------------------------------------------------
+  r = V3dBclBegin(#FB_BCL, #FB_BCL_BYTES)
+  If r = #V3D_OK
+    r = V3dBclFinish()
+  EndIf
+  PutS("6   the bin list: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("bin list bytes", V3dBclBytes())
+  DumpBytes(V3dBclStartAddr(), V3dBclBytes())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  7. THE RENDER LIST. THIS IS THE PART THAT HAS NEVER BEEN
+  ;     EXERCISED: the supertile sweep emits one SUPERTILE_COORDINATES
+  ;     packet per supertile, and until now the frame has had one.
+  ; ------------------------------------------------------------------
+  r = V3dRclBuild(#FB_TILELIST, #FB_TL_BYTES, #FB_RCL, #FB_RCL_BYTES)
+  PutS("7   the render list: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("generic tile list bytes", V3dTileListBytes())
+  DumpBytes(V3dTileListStartAddr(), V3dTileListBytes())
+  RowDec("render list bytes", V3dRclBytes())
+  RowDec("supertile packets expected", V3dFrameStW() * V3dFrameStH())
+  ; The head of the list, which is the configuration, and then the
+  ; first sixteen bytes of the sweep. The sweep itself is hundreds of
+  ; three-byte packets and printing all of it would cost more serial
+  ; time than the render costs GPU time; the gate decodes it in full
+  ; out of memory, which is where a decoder should read it from.
+  PutS("    render list, first 128 bytes:")
+  PutNl()
+  DumpBytes(V3dRclStartAddr(), 128)
+  PutS("    render list, last 32 bytes:")
+  PutNl()
+  DumpBytes(V3dRclEndAddr() - 32, 32)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  8. THE BIN JOB.
+  ; ------------------------------------------------------------------
+  r = V3dBinSubmit()
+  PutS("8   bin submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BINSUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinWait(#FB_BIN_WAIT_US)
+  PutS("    bin wait: ")
+  PutErr(r)
+  PutNl()
+  RowHex("CLE_BFC before", V3dBinBfcBefore())
+  RowHex("CLE_BFC after", V3dBinBfcAfter())
+  RowHex("CLE_CT0CA", V3dBinCt0ca())
+  RowHex("CLE_CT0EA", V3dBinCt0ea())
+  RowHex("PTB_BPCA", V3dBinBpca())
+  RowHex("PTB_BPCS", V3dBinBpcs())
+  RowHex("CTL_INT_STS", V3dBinIntSts())
+  RowHex("ERR_STAT", V3dBinErrStat())
+  RowHex("MMU_CTL", V3dBinMmuCtl())
+  RowHex("MMU_VIO_ADDR", V3dBinVioAddr())
+  RowDec("bin spins", V3dBinSpins())
+  RowDec("OOM events", V3dBinOomCount())
+  PutS("    the tile allocation pool, first 32 bytes:")
+  PutNl()
+  DumpBytes(#FB_TALLOC, 32)
+  If r <> #V3D_OK
+    PutS("verdict: BIN")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  9. THE RENDER JOB. 510 tiles, each cleared and stored.
+  ; ------------------------------------------------------------------
+  r = V3dRenderSubmit()
+  PutS("9   render submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RENDERSUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  t0 = Micros()
+  r = V3dRenderWait(#FB_RENDER_WAIT_US)
+  PutS("    render wait: ")
+  PutErr(r)
+  PutNl()
+  RowDec("microseconds", Micros() - t0)
+  RowHex("CLE_RFC before", V3dRenderRfcBefore())
+  RowHex("CLE_RFC after", V3dRenderRfcAfter())
+  RowHex("CLE_CT1CA", V3dRenderCt1ca())
+  RowHex("CLE_CT1EA", V3dRenderCt1ea())
+  RowHex("CTL_INT_STS", V3dRenderIntSts())
+  RowHex("ERR_STAT", V3dRenderErrStat())
+  RowHex("MMU_CTL", V3dRenderMmuCtl())
+  RowHex("MMU_VIO_ADDR", V3dRenderVioAddr())
+  RowDec("render spins", V3dRenderSpins())
+  RowDec("cache clean result", V3dRenderCleanResult())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  10. THE PIXELS. This is the whole test.
+  ; ------------------------------------------------------------------
+  Verify(V3dTileW(), V3dTileH(), V3dTilesX(), V3dTilesY())
+  VerifyGuards()
+
+  rgbWord = DisplayRGB(12, 20, 92)
+
+  PutS("10  the pixels")
+  PutNl()
+  RowDec("pixels total", fbW * fbH)
+  RowHex("clear colour", #FB_CLEAR)
+  RowHex("DisplayRGB(12,20,92)", rgbWord)
+  RowDec("pixels correct", nCorrect)
+  RowDec("pixels still poison", nPoison)
+  RowDec("pixels some other value", nOther)
+  RowDec("first other, x", firstOtherX)
+  RowDec("first other, y", firstOtherY)
+  RowHex("first other, value", firstOtherVal)
+  RowDec("verify microseconds", usVerify)
+  PutNl()
+  RowDec("tiles total", tilesTotal)
+  RowDec("tiles fully correct", tilesFull)
+  RowDec("tiles with nothing right", tilesEmpty)
+  RowDec("first wrong tile, column", firstBadTx)
+  RowDec("first wrong tile, row", firstBadTy)
+  RowDec("guard A words touched", guardATouched)
+  RowDec("guard B words touched", guardBTouched)
+  PutNl()
+
+  ; The channel-order reading, stated rather than corrected. See THE
+  ; COLOURS above.
+  If rgbWord = #FB_CLEAR
+    PutS("    channel order: the GPU's RGBA8 store and display.pi4 agree")
+  Else
+    PutS("    channel order: they DISAGREE - the surface is not R-first")
+  EndIf
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE VERDICT. Every tile right, nothing left over, both guards
+  ;  clean, and more than one tile - the last because a pass on a
+  ;  single tile is pi4V3dClear.pi4's pass and not this one's.
+  ; ------------------------------------------------------------------
+  ok = 1
+  If tilesTotal < 2 : ok = 0 : EndIf
+  If tilesFull <> tilesTotal : ok = 0 : EndIf
+  If nPoison <> 0 : ok = 0 : EndIf
+  If nOther <> 0 : ok = 0 : EndIf
+  If nCorrect <> (fbW * fbH) : ok = 0 : EndIf
+  If guardATouched <> 0 : ok = 0 : EndIf
+  If guardBTouched <> 0 : ok = 0 : EndIf
+
+  If ok = 1
+    PutS("verdict: OK - the GPU cleared ")
+    PutDec(tilesTotal)
+    PutS(" tiles of the HDMI surface")
+  Else
+    PutS("verdict: NOT CLEARED")
+  EndIf
+  PutNl()
+
+  ProcedureReturn nCorrect
+EndProcedure

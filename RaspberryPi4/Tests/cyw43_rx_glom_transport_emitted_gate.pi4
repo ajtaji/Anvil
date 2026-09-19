@@ -1,0 +1,316 @@
+; Executable gate for the production CYW43 receive-glom integration.
+; A scripted function-2 FIFO drives the real cyw43_RxFrame/Cyw43Receive path.
+; Main returns the first failed assertion number, or zero.
+
+Global Dim gate_fifo.a[4096]
+Global gate_fifoLen.i
+Global gate_fifoPos.i
+Global gate_f2Reads.i
+Global gate_f2Bytes.i
+Global gate_f2Writes.i
+Global gate_termWrites.i
+Global gate_termFail.i
+Global gate_residualPair.i
+Global gate_residualFirst.i
+
+XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+
+Procedure GatePut16(*p, v.i)
+  PokeB(*p, v & $FF)
+  PokeB(*p + 1, (v >> 8) & $FF)
+EndProcedure
+
+Procedure GateClear(*p, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    PokeB(*p + i, 0)
+  Next
+EndProcedure
+
+Procedure GateHeader(*p, n.i, seq.i, rawchan.i, next.i, doff.i, flow.i, window.i)
+  GateClear(*p, 12)
+  GatePut16(*p, n)
+  GatePut16(*p + 2, (~n) & $FFFF)
+  PokeB(*p + 4, seq & $FF)
+  PokeB(*p + 5, rawchan & $FF)
+  PokeB(*p + 6, next & $FF)
+  PokeB(*p + 7, doff & $FF)
+  PokeB(*p + 8, flow & $FF)
+  PokeB(*p + 9, window & $FF)
+EndProcedure
+
+Procedure.i GateRb(fn.i, addr.i)
+  If fn = 1 And addr = #CYW43_RFRAMEBCHI
+    ProcedureReturn 0
+  EndIf
+  If fn = 1 And addr = #CYW43_RFRAMEBCLO
+    gate_residualPair = gate_residualPair + 1
+    If gate_residualPair = 1
+      ProcedureReturn gate_residualFirst
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GateWb(fn.i, addr.i, v.i)
+  If fn = 1 And addr = #CYW43_FRAMECTRL And v = #CYW43_RF_TERM
+    gate_termWrites = gate_termWrites + 1
+    If gate_termFail <> 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateRd(fn.i, addr.i, *dst, n.i, incr.i)
+  Define i.i
+  If fn <> 2 Or incr <> 0
+    ProcedureReturn 0
+  EndIf
+  If gate_fifoPos + n > gate_fifoLen
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To n - 1
+    PokeB(*dst + i, gate_fifo[gate_fifoPos + i])
+  Next
+  gate_fifoPos = gate_fifoPos + n
+  gate_f2Reads = gate_f2Reads + 1
+  gate_f2Bytes = gate_f2Bytes + n
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateWr(fn.i, addr.i, *src, n.i, incr.i)
+  If fn = 2 And incr = 0
+    gate_f2Writes = gate_f2Writes + 1
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure GateReset()
+  gate_fifoLen = 0
+  gate_fifoPos = 0
+  gate_f2Reads = 0
+  gate_f2Bytes = 0
+  gate_f2Writes = 0
+  gate_termWrites = 0
+  gate_termFail = 0
+  gate_residualPair = 0
+  gate_residualFirst = 0
+  Cyw43InvalidateWindow()
+  Cyw43TransportReset()
+EndProcedure
+
+Procedure.i GateReserve(n.i)
+  Define p.i
+  p = @gate_fifo[0] + gate_fifoLen
+  GateClear(p, n)
+  gate_fifoLen = gate_fifoLen + n
+  ProcedureReturn p
+EndProcedure
+
+Procedure GateAppendData(seq.i, marker.i)
+  Define *p
+  *p = GateReserve(80)
+  GateHeader(*p, 80, seq, #CYW43_CHAN_DATA, 0, 12, 0, 31)
+  PokeB(*p + 15, 0)
+  PokeB(*p + 16, marker)
+  PokeB(*p + 79, marker + 1)
+EndProcedure
+
+Procedure GateAppendDescriptor(valid.i)
+  Define *p
+  *p = GateReserve(64)
+  GateHeader(*p, 18, 9, #CYW43_SDPCM_GLOMDESC | #CYW43_CHAN_GLOM, 32, 12, 0, 0)
+  If valid <> 0
+    GatePut16(*p + 12, 40)
+    GatePut16(*p + 14, 12)
+    GatePut16(*p + 16, 28)
+  Else
+    ; First descriptor segment must contain outer and inner headers.
+    GatePut16(*p + 12, 20)
+    GatePut16(*p + 14, 12)
+    GatePut16(*p + 16, 28)
+  EndIf
+EndProcedure
+
+Procedure GateAppendSuper(malformedLast.i)
+  Define *p
+  *p = GateReserve(512)
+  GateHeader(*p, 80, 10, #CYW43_CHAN_GLOM, 0, 12, 7, 27)
+  GateHeader(*p + 12, 28, 10, #CYW43_CHAN_DATA, 0, 12, 0, 0)
+  PokeB(*p + 27, 0)
+  PokeB(*p + 28, $A0)
+  PokeB(*p + 39, $A1)
+  ; A legitimate payload-free event/credit frame between the data frames.
+  GateHeader(*p + 40, 12, 11, #CYW43_CHAN_EVENT, 0, 12, 0, 0)
+  GateHeader(*p + 52, 28, 12, #CYW43_CHAN_DATA, 0, 12, 0, 0)
+  PokeB(*p + 67, 0)
+  PokeB(*p + 68, $C0)
+  PokeB(*p + 79, $C1)
+  If malformedLast <> 0
+    PokeB(*p + 54, 0)
+    PokeB(*p + 55, 0)
+  EndIf
+EndProcedure
+
+Procedure GateAppendOversized(seq.i)
+  Define *p
+  *p = GateReserve(64)
+  GateHeader(*p, 3000, seq, #CYW43_CHAN_GLOM, 0, 12, 0, 0)
+EndProcedure
+
+Procedure GateAppendControl(seq.i, id.i, window.i)
+  Define *p
+  *p = GateReserve(64)
+  GateHeader(*p, 28, seq, #CYW43_CHAN_CONTROL, 0, 12, 0, window)
+  PokeL(*p + 12 + #CYW43_BCDC_OFF_FLAGS, id << #CYW43_BCDC_ID_SHIFT)
+EndProcedure
+
+Procedure GateAppendEvent(seq.i, window.i)
+  Define *p
+  *p = GateReserve(64)
+  GateHeader(*p, 12, seq, #CYW43_CHAN_EVENT, 0, 12, 0, window)
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  Define reads.i
+  Define data0.i
+  Define i.i
+
+  If Cyw43SetIo(@GateRb, @GateWb, @GateRd, @GateWr) = 0 : ProcedureReturn 1 : EndIf
+  cyw43_f2ByteMax = 512
+  cyw43_f2Blk = 512
+  cyw43_hz = 54000000
+
+  ; Valid descriptor + one exact rounded superframe. Nothing is exposed until
+  ; all three inner headers have passed validation.
+  GateReset()
+  GateAppendDescriptor(1)
+  GateAppendSuper(0)
+  If cyw43_RxFrame(-1, 0) <> 6 : ProcedureReturn 2 : EndIf
+  If gate_fifoPos <> 576 Or gate_f2Reads <> 2 Or gate_f2Bytes <> 576 : ProcedureReturn 3 : EndIf
+  If Cyw43RxQueueDepth() <> 3 Or Cyw43RxQueueHighWater() <> 3 Or Cyw43RxQueueFull() <> 0 : ProcedureReturn 4 : EndIf
+  If Cyw43RxGlomPackets() <> 3 Or Cyw43RxGlomFailures() <> 0 Or cyw43_credit <> 27 : ProcedureReturn 5 : EndIf
+  reads = gate_f2Reads
+  If Cyw43Receive(0) <> 12 Or PeekA(Cyw43ReceivePtr()) <> $A0 : ProcedureReturn 6 : EndIf
+  If Cyw43RxQueueDepth() <> 2 Or gate_f2Reads <> reads : ProcedureReturn 7 : EndIf
+  If Cyw43Receive(0) <> 12 Or PeekA(Cyw43ReceivePtr()) <> $C0 : ProcedureReturn 8 : EndIf
+  If Cyw43RxQueueDepth() <> 0 Or gate_f2Reads <> reads Or cyw43_credit <> 27 : ProcedureReturn 9 : EndIf
+  If Cyw43RxEvent() <> 1 Or Cyw43EvEmpty() <> 1 Or Cyw43RxDataFrames() <> 2 : ProcedureReturn 10 : EndIf
+  If Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 11 : EndIf
+
+  ; A malformed final inner frame invalidates the whole aggregate. The exact
+  ; 512-byte read has already drained it, so the following ordinary frame is
+  ; parsed cleanly and no aggregate prefix escaped.
+  data0 = Cyw43RxDataFrames()
+  GateReset()
+  GateAppendDescriptor(1)
+  GateAppendSuper(1)
+  GateAppendData(10, $D0)
+  If cyw43_RxFrame(-1, 0) <> 3 : ProcedureReturn 12 : EndIf
+  If gate_fifoPos <> 576 Or Cyw43RxQueueDepth() <> 0 Or Cyw43RxGlomFailures() <> 1 : ProcedureReturn 13 : EndIf
+  If Cyw43Receive(0) <> 64 Or PeekA(Cyw43ReceivePtr()) <> $D0 : ProcedureReturn 14 : EndIf
+  If gate_fifoPos <> 656 Or Cyw43RxDataFrames() <> data0 + 1 Or Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 15 : EndIf
+
+  ; An invalid descriptor cannot name the following superframe. Receive
+  ; termination is serviced one residual-count observation per call and no F2
+  ; header is touched until the device reports zero.
+  GateReset()
+  GateAppendDescriptor(0)
+  GateAppendData(10, $E0)
+  gate_residualFirst = 4
+  If cyw43_RxFrame(-1, 0) <> 3 : ProcedureReturn 16 : EndIf
+  If Cyw43RxAbortActive() = 0 Or Cyw43RxAbortStarted() <> 1 Or gate_termWrites <> 1 : ProcedureReturn 17 : EndIf
+  If gate_fifoPos <> 64 : ProcedureReturn 18 : EndIf
+  r = cyw43_RxFrame(-1, 0)
+  If r <> 0 Or gate_fifoPos <> 64 Or gate_residualPair <> 1 : ProcedureReturn 19 : EndIf
+  If cyw43_RxFrame(-1, 0) <> 5 : ProcedureReturn 20 : EndIf
+  If Cyw43RxAbortActive() <> 0 Or Cyw43RxAbortDone() <> 1 Or gate_residualPair <> 2 : ProcedureReturn 21 : EndIf
+  If gate_fifoPos <> 144 Or cyw43_dataLen <> 64 Or PeekA(@cyw43_rx[0] + cyw43_dataP) <> $E0 : ProcedureReturn 22 : EndIf
+
+  ; The same bounded termination protects the historical oversized-header
+  ; case: only its first 64 bytes were consumed.
+  GateReset()
+  GateAppendOversized(20)
+  GateAppendData(21, $F0)
+  If cyw43_RxFrame(-1, 0) <> 3 Or Cyw43RxTooBigGlom() <> 1 : ProcedureReturn 23 : EndIf
+  If gate_fifoPos <> 64 Or Cyw43RxAbortActive() = 0 : ProcedureReturn 24 : EndIf
+  If cyw43_RxFrame(-1, 0) <> 5 Or gate_fifoPos <> 144 : ProcedureReturn 25 : EndIf
+  If PeekA(@cyw43_rx[0] + cyw43_dataP) <> $F0 Or Cyw43RxAbortDone() <> 1 : ProcedureReturn 26 : EndIf
+
+  ; If RF_TERM itself is refused, fail closed. Reading another F2 header would
+  ; reinterpret unread payload as a new frame.
+  GateReset()
+  GateAppendOversized(30)
+  gate_termFail = 1
+  If cyw43_RxFrame(-1, 0) <> -1 : ProcedureReturn 27 : EndIf
+  If Cyw43RxAbortFailed() <> 1 Or Cyw43RxAbortActive() = 0 Or Cyw43RxAbortFault() = 0 Or gate_fifoPos <> 64 : ProcedureReturn 28 : EndIf
+  If cyw43_RxFrame(-1, 0) <> -1 Or gate_fifoPos <> 64 : ProcedureReturn 40 : EndIf
+
+  ; A residual count that never clears reaches the bounded deadline and also
+  ; latches unsafe. It cannot silently resume header parsing afterward.
+  GateReset()
+  GateAppendDescriptor(0)
+  GateAppendData(10, $88)
+  gate_residualFirst = 4
+  If cyw43_RxFrame(-1, 0) <> 3 : ProcedureReturn 50 : EndIf
+  cyw43_rxAbortBudget = 0
+  If cyw43_RxFrame(-1, 0) <> -1 : ProcedureReturn 51 : EndIf
+  If Cyw43RxAbortFault() = 0 Or Cyw43RxAbortActive() = 0 Or gate_fifoPos <> 64 : ProcedureReturn 52 : EndIf
+
+  ; A synchronous request is not failed or resent merely because unrelated
+  ; data precedes its matching reply. The data stays queued, then drains once;
+  ; replaying it must not repeat sequence/credit accounting.
+  GateReset()
+  GateAppendData(0, $B0)
+  GateAppendControl(1, 7, 41)
+  r = cyw43_Poll(7, 0, 10, #CYW43_POLL_CONTROL)
+  If r <> #CYW43_IO_OK : ProcedureReturn 29 : EndIf
+  If gate_fifoPos <> 144 Or gate_f2Reads <> 3 : ProcedureReturn 30 : EndIf
+  If Cyw43RxQueueDepth() <> 1 Or Cyw43RxDataQueuedInControlPoll() <> 1 : ProcedureReturn 31 : EndIf
+  If cyw43_credit <> 41 Or Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 32 : EndIf
+  reads = gate_f2Reads
+  If Cyw43Receive(0) <> 64 Or PeekA(Cyw43ReceivePtr()) <> $B0 : ProcedureReturn 33 : EndIf
+  If Cyw43RxQueueDepth() <> 0 Or gate_f2Reads <> reads Or cyw43_credit <> 41 Or Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 34 : EndIf
+
+  ; Exercise the actual synchronous ioctl wrapper, including its one request
+  ; transmission and generated BCDC id. Unrelated data cannot make it resend.
+  GateReset()
+  GateAppendData(0, $90)
+  GateAppendEvent(1, 35)
+  GateAppendControl(2, 1, 42)
+  If Cyw43IoctlSetU32(#CYW43_C_UP, 1, 10) <> #CYW43_IO_OK : ProcedureReturn 35 : EndIf
+  If gate_f2Writes <> 1 Or cyw43_reqid <> 1 Or gate_fifoPos <> 208 Or gate_f2Reads <> 4 : ProcedureReturn 36 : EndIf
+  If Cyw43RxQueueDepth() <> 1 Or Cyw43RxDataQueuedInControlPoll() <> 1 : ProcedureReturn 37 : EndIf
+  If Cyw43RxEvent() <> 1 Or Cyw43EvEmpty() <> 1 : ProcedureReturn 41 : EndIf
+  reads = gate_f2Reads
+  If Cyw43Receive(0) <> 64 Or PeekA(Cyw43ReceivePtr()) <> $90 : ProcedureReturn 38 : EndIf
+  If gate_f2Writes <> 1 Or gate_f2Reads <> reads Or cyw43_credit <> 42 Or Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 39 : EndIf
+
+  ; Capacity is finite and derived from the firmware's 32-frame maximum: one
+  ; full aggregate may be retained while 32 slots remain reserved for the next.
+  ; No push overwrites an older frame when all 64 slots are occupied.
+  GateReset()
+  For i = 0 To 63
+    GateClear(@gate_fifo[0], 28)
+    GateHeader(@gate_fifo[0], 28, i, #CYW43_CHAN_DATA, 0, 12, 0, i)
+    PokeB(@gate_fifo[0] + 15, 0)
+    PokeB(@gate_fifo[0] + 16, i)
+    If cyw43_RxqPush(@gate_fifo[0], 28, 1, 1) = 0 : ProcedureReturn 42 : EndIf
+    If i = 31 And cyw43_RxqCanPoll() = 0 : ProcedureReturn 43 : EndIf
+    If i = 32 And cyw43_RxqCanPoll() <> 0 : ProcedureReturn 44 : EndIf
+  Next
+  If cyw43_RxqPush(@gate_fifo[0], 28, 1, 1) <> 0 : ProcedureReturn 45 : EndIf
+  If Cyw43RxQueueDepth() <> 64 Or Cyw43RxQueueHighWater() <> 64 Or Cyw43RxQueueFull() <> 1 : ProcedureReturn 46 : EndIf
+  cyw43_credit = 77
+  For i = 0 To 63
+    If cyw43_RxFrame(-1, 1) <> 5 : ProcedureReturn 47 : EndIf
+    If PeekA(@cyw43_rx[0] + cyw43_dataP) <> i : ProcedureReturn 48 : EndIf
+  Next
+  If Cyw43RxQueueDepth() <> 0 Or cyw43_credit <> 77 Or Cyw43RxSeqMismatch() <> 0 : ProcedureReturn 49 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

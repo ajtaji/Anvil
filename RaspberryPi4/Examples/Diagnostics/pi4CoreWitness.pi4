@@ -1,0 +1,383 @@
+; pi4CoreWitness.pi4 - the bounded secondary-core witness.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. It is an instrument, not a how-to.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4 -t pi4 \
+;        --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;        -o corewitness.img
+;
+; ======================================================================
+;  IT RELEASES NO CORE. THERE IS NO PATH IN THIS FILE THAT DOES.
+; ======================================================================
+;  Nothing here writes a firmware spin slot, sends an event, or branches
+;  a secondary anywhere. The four slots at $D8/$E0/$E8/$F0 are READ and
+;  reported and never written; grep this file for `PokeI` and every hit
+;  is inside this program's own BSS.
+;
+;  That is not caution for its own sake. Three separate facts each make a
+;  release from a PAYLOAD wrong, and any one of them alone settles it:
+;
+;  1. A RELEASED CORE PARKS IN THE CODE THAT RELEASED IT. The park loop
+;     is two instructions inside the released routine, and a payload's
+;     image is memory the monitor stages the NEXT payload into. The core
+;     cannot be recalled, so the day something else is loaded at this
+;     address, a parked core is sitting in a `wfe` loop that has become
+;     somebody else's data - and one stray SEV executes it. The resident
+;     monitor is the only correct home for a permanent worker, which is
+;     what RaspberryPi4/Lib/core_worker.pi4's own header says.
+;
+;  2. `CoreRawPrepare()`'s running-image overlap guard asks
+;     `HwMonLo()/HwMonHi()`, and those are derived from
+;     `__image_start__`/`__image_end__` OF THE IMAGE THAT CONTAINS THEM.
+;     Called from a payload it measures the PAYLOAD and reports that a
+;     secondary stack clear of the payload is clear of the monitor too.
+;     That is a confident wrong answer with no symptom, so this file does
+;     not call it at all.
+;
+;  3. ON THE BOARD AS IT BOOTS TODAY IT WOULD BE REFUSED ANYWAY. The
+;     stick boots KERNEL8.IMG under the FIRMWARE'S OWN stub, which erets
+;     to EL2. Every secondary parked by that stub is parked at EL2, and
+;     both halves of the saved bootstrap accept only the pinned EL3
+;     contract. The expected result of running this witness today is
+;     status 1 - "not at EL3" - and that is a measurement, not a failure.
+;
+; ======================================================================
+;  WHAT IT DOES PROVE, ON THE SILICON
+; ======================================================================
+;  * The exception level the monitor is actually running at, and the
+;    SCTLR of THAT level - not of EL2 because EL2 is what used to be
+;    read. Printing the wrong register's name beside a right-looking
+;    value is the worst of the available mistakes.
+;  * CPUECTLR_EL1.SMPEN, the coherency prerequisite - READ ONLY AT EL3.
+;    It is implementation-defined and may trap below EL3, and this board
+;    has no exception vector installed, so a trap is a silent hang. The
+;    read is behind a runtime branch on the measured level for that
+;    reason and for no other.
+;  * The four firmware spin slots, read. Nothing in this tree has ever
+;    reported what the stock stub leaves in them on this board.
+;  * That the three board-reserved secondary stack pages are readable
+;    and what they currently hold.
+;  * THE PRIMARY-SIDE WAIT CONTRACT, EXECUTED AGAINST THE REAL COUNTER:
+;    a WALL-CLOCK deadline off CNTPCT_EL0/CNTFRQ_EL0 rather than a spin
+;    count, an acquire load of the state word, and a per-run NONCE that
+;    the publisher must echo. Three self-tests run it against this
+;    program's own word: one that never becomes ready (must time out),
+;    one that becomes ready with this run's nonce (must succeed), and one
+;    that becomes ready carrying SOMEBODY ELSE'S nonce (must refuse).
+;
+;  WHY THE NONCE. `CoreRawWaitReady()` in the library today accepts a
+;  state word equal to READY, and its bound is a SPIN COUNT. Two things
+;  follow. A spin count is not a time: the same loop with the caches off
+;  is orders of magnitude slower than with them on, so one constant
+;  cannot mean one deadline - that is the shape forum 726 already
+;  records for the I2C driver. And a word is not a witness: a row left
+;  READY by an earlier run of the same image, in memory nothing cleared,
+;  reads exactly like a core that has just come up. The nonce makes the
+;  second unsayable and the counter makes the first measurable.
+;
+; ======================================================================
+;  WHAT IT DOES NOT PROVE, AND THE LIST IS THE POINT
+; ======================================================================
+;  Nothing about a second core. Not that one exists, not that one is
+;  parked, not that one can be woken, not cache coherency, not WFE/SEV,
+;  not the publication ordering as the hardware observes it, not
+;  parallelism, not the EL3 stub. This is the PRECONDITION half. The
+;  release half needs the EL3 stub on the boot medium and a permanent
+;  worker inside the resident monitor, and neither exists today.
+;
+; ======================================================================
+;  THE OUTPUT, AND HOW TO READ IT
+; ======================================================================
+;  There is no serial adapter on this bench, so this writes a report
+;  block into its own BSS and returns the block's ADDRESS in x0. The
+;  monitor prints a returning payload's x0. Then:
+;
+;      memory <the address x0 printed> 100
+;
+;  The first word AND the last word are the magic $4357495441424C45,
+;  which is "CWITABLE" in ASCII. If either is missing the block was not
+;  written through, and nothing between them is this program's - which is
+;  exactly why a magic is written at both ends rather than one.
+;
+;  Arm the deadman first, as every payload on this bench does:
+;      deadman 15
+;  The three wait self-tests are bounded at #CW_TEST_MS each, so the
+;  whole program is a few milliseconds plus the reads.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+
+; --- status, in x0's report word 2 ------------------------------------
+#CW_OK_WOULD_ADMIT   = 0   ; EL3, M/C/I set, SMPEN set: a release would be
+                           ; admissible. NOTHING WAS RELEASED.
+#CW_ERR_NOT_EL3      = 1   ; the machine is not at EL3
+#CW_ERR_NO_MCI       = 2   ; at EL3, but M, C and I are not all set
+#CW_ERR_NO_SMPEN     = 3   ; at EL3 with M/C/I, but CPUECTLR_EL1.SMPEN clear
+#CW_ERR_NO_CLOCK     = 4   ; CNTFRQ_EL0 is not positive - no deadline exists
+#CW_ERR_WAIT_BROKEN  = 5   ; the wait contract failed one of its self-tests
+
+; --- the wait contract's own return codes -----------------------------
+#CW_WAIT_READY       = 1   ; READY, and the nonce is this run's
+#CW_WAIT_TIMEOUT     = 0   ; the deadline passed and it never became ready
+#CW_WAIT_NO_CLOCK    = -4  ; CNTFRQ_EL0 is not positive
+#CW_WAIT_BAD_BOUND   = -10 ; a non-positive deadline was asked for
+#CW_WAIT_STALE       = -13 ; READY, carrying a nonce from another run
+
+#CW_STATE_IDLE       = 0
+#CW_STATE_READY      = 2
+
+#CW_TEST_MS          = 5
+#CW_REPORT_WORDS     = 32
+#CW_MAGIC            = $4357495441424C45   ; "CWITABLE"
+
+; the firmware's AArch64 spin table, read only
+#CW_SPIN0            = $D8
+#CW_SPIN1            = $E0
+#CW_SPIN2            = $E8
+#CW_SPIN3            = $F0
+
+; The board's reserved raw-secondary stacks. These are the numbers
+; RaspberryPi4/Board/memmap.pi4 declares; they are repeated as constants
+; rather than reached through that file because including a BOARD file in
+; a payload would also bring HwMonLo()/HwMonHi(), which measure whichever
+; image contains them - here, this payload. A wrong monitor extent is
+; worse than a repeated constant, and
+; tools/multicore_witness_check.py checks these three against the board
+; file on every run so the repetition cannot drift.
+#CW_STACK_LO         = $001FC000
+#CW_STACK_PAGE       = $00001000
+#CW_STACK_CORES      = 3
+
+; SCTLR M | C | I, the same three bits at EL2 and EL3 on ARMv8.0
+#CW_SCTLR_MCI        = $1005
+#CW_SMPEN            = $40
+
+Global Dim cw_report.i[#CW_REPORT_WORDS]
+
+; The word a secondary WOULD publish, and the nonce it WOULD echo. Both
+; live in this program's own BSS: no secondary exists, and the self-tests
+; drive them from this core so the wait contract is exercised rather than
+; described.
+Global cw_state.i
+Global cw_nonce.i
+Global cw_acqaddr.i
+
+Procedure cwPut(slot.i, value.i)
+  If slot >= 0 And slot < #CW_REPORT_WORDS
+    cw_report[slot] = value
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The machine, read. Each of these is one MRS and nothing else.
+; ----------------------------------------------------------------------
+Procedure.i cwCurrentEl()
+  ASM
+    mrs x0, currentel
+  EndASM
+EndProcedure
+
+Procedure.i cwSctlrEl2()
+  ASM
+    mrs x0, sctlr_el2
+  EndASM
+EndProcedure
+
+Procedure.i cwSctlrEl3()
+  ASM
+    mrs x0, sctlr_el3
+  EndASM
+EndProcedure
+
+; IMPLEMENTATION-DEFINED AND EL3-ONLY IN PRACTICE. Every caller must have
+; measured the level first; see the header.
+Procedure.i cwCpuectlrEl1()
+  ASM
+    mrs x0, cpuectlr_el1
+  EndASM
+EndProcedure
+
+Procedure.i cwMpidrEl1()
+  ASM
+    mrs x0, mpidr_el1
+  EndASM
+EndProcedure
+
+Procedure.i cwEl()
+  ProcedureReturn (cwCurrentEl() >> 2) & 3
+EndProcedure
+
+; The SCTLR OF THE LEVEL WE ARE AT. At EL3 an `mrs sctlr_el2` is legal
+; and answers a register the processor is not using, so reading the wrong
+; one produces a plausible number and no fault at all.
+Procedure.i cwSctlr()
+  If cwEl() = 3
+    ProcedureReturn cwSctlrEl3()
+  EndIf
+  ProcedureReturn cwSctlrEl2()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE WAIT CONTRACT
+; ----------------------------------------------------------------------
+;  The state word is consumed with an acquire load, so every witness the
+;  publisher stored before its release is ordered before the reads that
+;  follow here. The nonce is read after that acquire, which is what makes
+;  it a witness of THIS run rather than of the memory's history.
+; ----------------------------------------------------------------------
+Procedure.i cwLoadAcquire()
+  ASM
+    adrp x0, global_cw_acqaddr
+    add  x0, x0, #:lo12:global_cw_acqaddr
+    ldr  x0, [x0]
+    ldar x0, [x0]
+  EndASM
+EndProcedure
+
+Procedure.i cwStateAcquire()
+  cw_acqaddr = @cw_state
+  ProcedureReturn cwLoadAcquire()
+EndProcedure
+
+; ms is a WALL-CLOCK bound off the architectural counter, not a spin
+; count. A spin count means different amounts of time with the caches on
+; and off, so it cannot be a deadline; this can.
+Procedure.i CoreWitnessWait(ms.i, nonce.i)
+  Define hz.i
+  Define start.i
+  Define limit.i
+  If ms <= 0
+    ProcedureReturn #CW_WAIT_BAD_BOUND
+  EndIf
+  hz = TickHz()
+  If hz <= 0
+    ProcedureReturn #CW_WAIT_NO_CLOCK
+  EndIf
+  limit = (hz * ms) / 1000
+  If limit <= 0
+    ProcedureReturn #CW_WAIT_BAD_BOUND
+  EndIf
+  start = Ticks()
+  Repeat
+    If cwStateAcquire() = #CW_STATE_READY
+      If cw_nonce = nonce
+        ProcedureReturn #CW_WAIT_READY
+      EndIf
+      ; READY, and not from this run. Reporting success here is the
+      ; exact failure this procedure exists to make impossible.
+      ProcedureReturn #CW_WAIT_STALE
+    EndIf
+  Until Ticks() - start >= limit
+  ProcedureReturn #CW_WAIT_TIMEOUT
+EndProcedure
+
+; ----------------------------------------------------------------------
+Procedure.i Main()
+  Define i.i
+  Define el.i
+  Define sctlr.i
+  Define ectlr.i
+  Define hz.i
+  Define nonce.i
+  Define t0.i
+  Define t1.i
+  Define r.i
+  Define status.i
+  Define base.i
+
+  For i = 0 To #CW_REPORT_WORDS - 1
+    cw_report[i] = 0
+  Next
+
+  TimerInit()
+  t0 = Ticks()
+
+  el = cwEl()
+  sctlr = cwSctlr()
+  hz = TickHz()
+
+  cwPut(0, #CW_MAGIC)
+  cwPut(1, 1)                       ; report version
+  cwPut(3, cwCurrentEl())
+  cwPut(4, el)
+  cwPut(5, sctlr)
+  ; -1 means NOT READ, which is a different fact from "read as zero".
+  ectlr = -1
+  If el = 3
+    ectlr = cwCpuectlrEl1()
+  EndIf
+  cwPut(6, ectlr)
+  cwPut(7, cwMpidrEl1())
+  cwPut(8, hz)
+
+  cwPut(9, PeekI(#CW_SPIN0))
+  cwPut(10, PeekI(#CW_SPIN1))
+  cwPut(11, PeekI(#CW_SPIN2))
+  cwPut(12, PeekI(#CW_SPIN3))
+
+  For i = 0 To #CW_STACK_CORES - 1
+    base = #CW_STACK_LO + i * #CW_STACK_PAGE
+    cwPut(13 + i * 3, base)
+    cwPut(14 + i * 3, PeekI(base))
+    cwPut(15 + i * 3, PeekI(base + #CW_STACK_PAGE - 8))
+  Next
+
+  ; --- the three wait self-tests ---------------------------------------
+  ; The nonce is this run's, taken from the counter, so a report left in
+  ; memory by a previous run cannot satisfy this one.
+  nonce = t0 | 1
+  cwPut(28, nonce)
+
+  ; 1. never ready: must reach the deadline and say so.
+  cw_state = #CW_STATE_IDLE
+  cw_nonce = 0
+  t1 = Ticks()
+  r = CoreWitnessWait(#CW_TEST_MS, nonce)
+  cwPut(22, r)
+  cwPut(23, Ticks() - t1)
+
+  ; 2. ready, carrying this run's nonce: must succeed.
+  cw_nonce = nonce
+  cw_state = #CW_STATE_READY
+  t1 = Ticks()
+  r = CoreWitnessWait(#CW_TEST_MS, nonce)
+  cwPut(24, r)
+  cwPut(25, Ticks() - t1)
+
+  ; 3. READY, carrying somebody else's nonce: must REFUSE. This is a word
+  ;    that says a core came up, in memory nothing cleared, from a run
+  ;    that is over.
+  cw_nonce = nonce + 1
+  cw_state = #CW_STATE_READY
+  t1 = Ticks()
+  r = CoreWitnessWait(#CW_TEST_MS, nonce)
+  cwPut(26, r)
+  cwPut(27, Ticks() - t1)
+
+  ; --- the verdict ------------------------------------------------------
+  status = #CW_OK_WOULD_ADMIT
+  If hz <= 0
+    status = #CW_ERR_NO_CLOCK
+  ElseIf cw_report[22] <> #CW_WAIT_TIMEOUT Or cw_report[24] <> #CW_WAIT_READY Or cw_report[26] <> #CW_WAIT_STALE
+    status = #CW_ERR_WAIT_BROKEN
+  ElseIf el <> 3
+    status = #CW_ERR_NOT_EL3
+  ElseIf (sctlr & #CW_SCTLR_MCI) <> #CW_SCTLR_MCI
+    status = #CW_ERR_NO_MCI
+  ElseIf (ectlr & #CW_SMPEN) = 0
+    status = #CW_ERR_NO_SMPEN
+  EndIf
+  cwPut(2, status)
+
+  ; Leave the word IDLE. A witness that left its own state word saying
+  ; READY would be the stale word test 3 refuses, written by hand.
+  cw_state = #CW_STATE_IDLE
+  cw_nonce = 0
+
+  cwPut(29, t0)
+  cwPut(30, Ticks())
+  cwPut(31, #CW_MAGIC)
+
+  ; x0 is the report block's address. `memory <that> 100` reads it.
+  ProcedureReturn @cw_report[0]
+EndProcedure

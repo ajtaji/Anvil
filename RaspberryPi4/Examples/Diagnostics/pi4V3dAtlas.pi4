@@ -1,0 +1,1465 @@
+; pi4V3dAtlas.pi4 - V3D milestone 2: a GLYPH ATLAS sampled through the TMU.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM CLAIMS, AND WHAT IT REFUSES TO CLAIM
+; ======================================================================
+;
+;  pi4V3dTex.pi4 (M1) proved ONE thing on silicon: a 4x4 RGBA8 texture,
+;  TFU-tiled to LINEARTILE (an IDENTITY re-tile at that size), samples
+;  correctly through the TMU - red left of blue. That leaves the real
+;  question for text open: can the TMU sample a REAL, LARGER, NON-
+;  IDENTITY-TILED atlas of the console font and reproduce each glyph's
+;  ink pattern at the exact texel the UV rectangle names?
+;
+;  This program builds an RGBA8 GLYPH ATLAS from display.pi4's 8x16
+;  one-bit-per-pixel console font (the exact bytes, embedded below as
+;  fontData; ASCII 32..126, 95 printable glyphs), TFU-tiles it to a
+;  UBLINEAR_2_COLUMN texture, draws several textured quads that each
+;  sample ONE glyph's cell, and then CHECKS EVERY TEXEL OF EVERY DRAWN
+;  GLYPH ON THE CPU against the font bitmap it claims to encode.
+;
+;  THE PASS CRITERION IS COUNTED TEXELS, NOT A PICTURE. For each drawn
+;  glyph the whole 8x16 cell is probed at texel-block centres: an INK
+;  texel must render WHITE ($FFFFFFFF), a BLANK texel must render the
+;  sampled TRANSPARENT value ($00000000). All 128 texels of each glyph
+;  must match, for FIVE distinctive glyphs ('A','H','i','.','T'), and a
+;  never-drawn background pixel must still hold the clear colour. The
+;  match is computed for BOTH the natural and the Y-flipped orientation
+;  and the verdict names which one the silicon produced, because the
+;  screen-Y-to-atlas-row convention is exactly the thing M1 refused to
+;  pin down (it made its texture V-uniform on purpose) and text cannot.
+;
+; ======================================================================
+;  WHY UBLINEAR_2_COLUMN, AND WHY NOT 128x128 UIF
+; ======================================================================
+;
+;  The TMU has NO memory-format field in TEXTURE_SHADER_STATE - only UIF
+;  modifier bits (neon.pi4:2326-2333). It DERIVES the tiling from the
+;  texture WIDTH/HEIGHT/cpp exactly as the driver's v3d_setup_slices
+;  does (Reference/mesa-24.3.4_v3d_resource.c:646-663). For a single-
+;  level RGBA8 (cpp=4, utile 4x4, uif_block 8x8) texture with the UIF
+;  bits clear, that derivation is driven by WIDTH:
+;
+;      width<=4  OR height<=4 -> LINEARTILE       (M1's case)
+;      width<=8               -> UBLINEAR_1_COLUMN
+;      width<=16              -> UBLINEAR_2_COLUMN   <-- THIS PROGRAM
+;      width>16               -> UIF (+ ub_pad + the XOR bit)
+;
+;  So the atlas WIDTH chooses the tiling. A 128-wide "16 column" atlas
+;  would force UIF, the most complex layout on the part - ub_pad, the
+;  page-cache XOR, and a height-dependent macroblock id - none of it
+;  proven on this silicon. The lowest-risk atlas that still proves a
+;  GENUINE 2D non-identity tiling (two ub-columns, so the ub_x term is
+;  actually exercised) is 16 wide: UBLINEAR_2_COLUMN. This program uses
+;  a 16 x 1024 atlas: two columns of 8-px glyph cells, 48 rows used
+;  (95 glyphs) and the rest transparent. Height is padded to 1024 - a
+;  power of two - ONLY so the normalised V coordinates are exact f32
+;  (row*16/1024 = row/64); the UBLINEAR address formula ignores height,
+;  and height 1024 is not <=4 so it does not change the tiling choice.
+;
+;  THE TFU OUTPUT FORMAT AND THE TMU-DERIVED TILING MUST AGREE. The TFU
+;  is told #V3D_TFU_OFMT_UBLINEAR_2 (=5); the TMU, from width 16, derives
+;  UBLINEAR_2_COLUMN. Both are the same hardware layout
+;  (Reference/mesa-24.3.4_v3d_tiling.c:114-146):
+;
+;      ub(x,y) = 256*((y/8)*2 + (x/8))
+;              + ((x&4)?64:0) + ((y&4)?128:0)
+;              + (x&3)*4 + (y&3)*16          (cpp=4)
+;
+;  and this program VERIFIES the TFU output against that formula on the
+;  CPU before it ever renders (TfuTilingCheck), so a bad TFU tiling and
+;  a bad TMU sample are two different failures in the log, not one.
+;
+; ======================================================================
+;  THE UV CONVENTION (the classic atlas bug, stated so the bench can
+;  watch for it)
+; ======================================================================
+;
+;  Each glyph cell spans atlas texels [cellX0,cellX0+8) x [cellY0,
+;  cellY0+16). The quad's four corners carry the CELL-EDGE (texel-CORNER)
+;  UVs: uL=cellX0/16, uR=(cellX0+8)/16, vT=cellY0/1024, vB=(cellY0+16)
+;  /1024. Each glyph is drawn at integer scale S=4, so texel (tx,ty)
+;  covers screen columns [gx0+tx*4, +4) and rows [gy0+ty*4, +4). Probing
+;  the block CENTRE (offset +2, pixel centre +2.5) gives, for NEAREST
+;  sampling, u*16 = cellX0 + (tx+0.625) and v*1024 = cellY0 + (ty+0.625);
+;  floor() lands on cellX0+tx and cellY0+ty with a 0.625/0.375 margin
+;  from either texel boundary. So: texel-corner UV at the vertices,
+;  pixel-centre probe. If a glyph's ink lands one texel off, that margin
+;  is where to look first (a texel-CENTRE UV convention would shift it).
+;
+; ======================================================================
+;  WHAT IS REUSED FROM M1 UNCHANGED (do not re-derive it)
+; ======================================================================
+;   * The coordinate, vertex and TEXTURED fragment shaders, byte for
+;     byte - including the thrsw+2nop before the first LDTMU and the
+;     LDVARY->r5 one-cycle delay slot.
+;   * numVaryingsFs=2 and V3dShaderRecordVpm(1,0,1,1,2,0,1,1): TEN
+;     attributes -> vsOutSeg=2. The vertex layout is M1's exactly
+;     (Xc Yc Zc Wc Xs Ys Zs 1/Wc U V, stride 40), so the VPM sizing is
+;     unchanged and U,V do not silently read 0.
+;   * The explicit Non-perspective Flags packet ($3) matching the FS
+;     (vary+r5) arithmetic, and the Flat Shade Flags (0).
+;   * The TEXTURE_SHADER_STATE / SAMPLER_STATE hand-packing (only the
+;     Image Width/Height change: 16 and 1024).
+;   * The cache maintenance around every GPU-read/written buffer (MMU
+;     off, so V3dCacheRange is dc civac; kept structural anyway).
+;
+;  Only these change: the texture is a glyph atlas not a checkerboard;
+;  the TFU output is UBLINEAR_2 not LINEARTILE; there are several quads
+;  not one triangle; and the render target is 256x128 not 64x64.
+;
+; ======================================================================
+;  BUILD (copy of M1's line, new output name):
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4V3dAtlas.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o RaspberryPi4/Examples/Diagnostics/pi4V3dAtlas.img
+;
+;  RUN (resident monitor): arm the deadman, send the payload to
+;  $400000, jump to it:
+;     deadman 15
+;     b 0x400000 <len> <crc>
+;     go 0x400000
+;  A hung render wedges V3D; the board is rebooted between runs, so one
+;  clean run per boot is all this needs. --entry-returns makes a wrong
+;  answer cost a line of output, not a power cycle.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; The BCM2711 System Timer free-running counter low word, 1 MHz. Read-
+; only, same peripheral range M1 already pokes for the UART. Used for an
+; approximate bin+render frame time.
+#SYST_CLO = $FE003004
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP. Identity-mapped through the V3D MMU, VA = PA. Same
+;  base as M1 ($640000+), enlarged for the atlas and the wider target.
+;  Every GPU-touched region is 4 KiB aligned.
+; ----------------------------------------------------------------------
+#AT_PT         = $640000       ; V3D page table, 16 KiB
+#AT_PT_BYTES   = 16384
+#AT_ILLEGAL    = $648000       ; MMU illegal-address page
+#AT_BCL        = $650000       ; bin control list
+#AT_TILELIST   = $651000       ; generic tile sub-list
+#AT_RCL        = $652000       ; render control list (8 KiB, multi-tile)
+#AT_TSTATE     = $654000       ; tile state buffer (16 KiB)
+#AT_SHREC      = $658000       ; shader record + 10 attribute records
+#AT_VERTS      = $659000       ; vertex data; defaults at +2048
+#AT_DEFAULTS   = $659800       ; attribute default values (VERTS + 2048)
+#AT_UNIF       = $65A000       ; uniforms: CS +0, VS +64, FS +128
+#AT_UNIF_CS    = $65A000
+#AT_UNIF_VS    = $65A040
+#AT_UNIF_FS    = $65A080
+#AT_CODE       = $65B000       ; QPU code: CS +0, VS +512, FS +1024
+#AT_CODE_CS    = $65B000
+#AT_CODE_VS    = $65B200
+#AT_CODE_FS    = $65B400
+#AT_CODE_SLOT  = 512
+#AT_TARGET     = $660000       ; render target, 256x128 RGBA8 = 128 KiB
+#AT_ATLAS_SRC  = $6A0000       ; raster atlas (TFU reads), 64 KiB
+#AT_ATLAS_TEX  = $6C0000       ; UBLINEAR_2 atlas (TFU writes, TMU reads)
+#AT_TEXSTATE   = $6E0000       ; texture shader state at +0
+#AT_SAMPSTATE  = $6E0100       ; sampler state at +256
+#AT_TALLOC     = $6E1000       ; binner tile allocation pool, 640 KiB
+#AT_OVERFLOW   = $781000       ; bin overflow pool, 256 KiB
+
+; Map extents (bytes) handed to the MMU - what the GPU actually reaches.
+#AT_BCL_BYTES      = 4096
+#AT_TL_BYTES       = 4096
+#AT_RCL_BYTES      = 8192
+#AT_TSTATE_BYTES   = 16384
+#AT_SHREC_BYTES    = 4096
+#AT_VERTS_BYTES    = 4096
+#AT_UNIF_BYTES     = 4096
+#AT_CODE_BYTES     = 4096
+#AT_TARGET_BYTES   = 131072    ; 256 * 128 * 4
+#AT_ATLAS_BYTES    = 65536     ; 16 * 1024 * 4
+#AT_TEXSTATE_BYTES = 4096
+#AT_TALLOC_BYTES   = 655360    ; >= V3dTileAllocBytesFor(4,2,1) = 536576
+#AT_OVERFLOW_BYTES = 262144
+
+; ----------------------------------------------------------------------
+;  THE TARGET, THE ATLAS, THE FONT.
+; ----------------------------------------------------------------------
+#AT_TW      = 256              ; target width
+#AT_TH      = 128              ; target height
+#AT_STRIDE  = 1024             ; #AT_TW * 4
+#AT_CX      = 128             ; viewport centre x (#AT_TW/2, a power of two)
+#AT_CY      = 64              ; viewport centre y (#AT_TH/2, a power of two)
+#AT_HALFW_S = 7               ; log2(#AT_CX): Xc = (px-CX) / 2^7
+#AT_HALFH_S = 6               ; log2(#AT_CY): Yc = (py-CY) / 2^6
+
+#AT_ATLAS_W = 16              ; atlas width (texels) -> UBLINEAR_2_COLUMN
+#AT_ATLAS_H = 1024            ; atlas height (texels), padded pow2 for exact V
+#AT_ATLAS_W_S = 4            ; log2(#AT_ATLAS_W): U = texelX / 2^4
+#AT_ATLAS_H_S = 10           ; log2(#AT_ATLAS_H): V = texelY / 2^10
+#AT_COLS    = 2              ; glyph columns in the atlas (16 / 8)
+
+#AT_FW      = 8              ; font cell width  (display.pi4 dsp_font8x16)
+#AT_FH      = 16             ; font cell height
+#AT_FFIRST  = 32            ; first glyph char
+#AT_FLAST   = 126          ; last  glyph char
+#AT_NGLYPH  = 95           ; printable glyphs 32..126
+
+#AT_S       = 4            ; on-screen glyph scale: texel -> S x S pixels
+#AT_GY0     = 32           ; on-screen top row of every glyph (rows 32..96)
+
+#AT_NTEST   = 5            ; number of glyphs probed in full
+
+#AT_WHITE   = $FFFFFFFF    ; an ink texel, sampled straight to the TLB
+#AT_TRANSP  = $00000000    ; a blank texel (transparent), sampled straight
+#AT_CLEAR   = $FF00FF00    ; clear colour: opaque green (R=00 G=FF B=00 A=FF)
+#AT_POISON  = $A5A5A5A5
+
+#AT_F_ZERO  = $00000000    ; 0.0
+#AT_F_ONE   = $3F800000    ; 1.0
+#AT_ZCLEAR  = $3F800000
+#AT_F_HALFW = $47000000    ; 32768.0 = (#AT_TW/2)*256, clipper x scaling
+#AT_F_HALFH = $46800000    ; 16384.0 = (#AT_TH/2)*256, clipper y scaling
+#AT_TLB_CONF = $FFFFFFFF   ; normal vec4 f16 RT0, as M1
+
+#AT_WAIT_US = 200000
+
+; ======================================================================
+;  PRINTING - lifted unchanged from M1 / pi4V3dTri.
+; ======================================================================
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - no V3D page table")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page walk failed. See VIO_ADDR.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - outside the page table, or page 0")
+    Case #V3D_ERR_CL_ARGS
+      PutS("CL_ARGS - a field or a buffer will not do")
+    Case #V3D_ERR_CL_FULL
+      PutS("CL_FULL - the list ran out of room")
+    Case #V3D_ERR_BIN_TIMEOUT
+      PutS("BIN_TIMEOUT - CLE_BFC never moved")
+    Case #V3D_ERR_BIN_OOM
+      PutS("BIN_OOM - the tile allocation pool ran out")
+    Case #V3D_ERR_RENDER_TIMEOUT
+      PutS("RENDER_TIMEOUT - CLE_RFC never moved")
+    Case #V3D_ERR_TFU_ARGS
+      PutS("TFU_ARGS - the job description cannot be encoded")
+    Case #V3D_ERR_TFU_TIMEOUT
+      PutS("TFU_TIMEOUT - CVTCT never moved")
+    Case #V3D_ERR_TFU_FAIL
+      PutS("TFU_FAIL - HUB_INT_STS.TFUF. The unit said no.")
+    Default
+      PutS("code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure PutQpuErr(e.i)
+  Select e
+    Case #V3DQ_OK
+      PutS("OK")
+    Default
+      PutS("qpu code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure DumpBytes(base.i, len.i)
+  Define i.i
+  i = 0
+  While i < len
+    If (i % 16) = 0
+      PutS("  ")
+      PutHex(base + i, 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekA(base + i), 2)
+    i = i + 1
+    If (i % 16) = 0
+      PutNl()
+    EndIf
+  Wend
+  If (len % 16) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+Procedure DumpProgram(base.i, count.i)
+  Define i.i
+  i = 0
+  While i < count
+    PutS("  Q ")
+    PutDec(i)
+    PutS(" ")
+    PutHex(PeekN(base + (i * 8) + 4), 8)
+    PutS(" ")
+    PutHex(PeekN(base + (i * 8)), 8)
+    PutNl()
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  IEEE-754 f32 BIT PATTERNS FROM INTEGER RATIOS - no runtime float.
+;
+;  Every coordinate this program needs is m / 2^s for a small integer m
+;  and a shift s, and all of them are normal f32. Building the bit
+;  pattern with pure integer ops keeps the UV maths exact and off the
+;  FP path (which is itself still under test on this part).
+; ======================================================================
+
+; F32Ratio(m, s) = the f32 bit pattern for m / 2^s, m >= 0.
+Procedure.i F32Ratio(m.i, s.i)
+  Define p.i
+  Define e.i
+  Define mant.i
+  If m = 0
+    ProcedureReturn 0
+  EndIf
+  p = 0
+  While (m >> (p + 1)) > 0
+    p = p + 1
+  Wend                       ; 2^p <= m < 2^(p+1)
+  e = p - s                  ; unbiased exponent
+  mant = (m - (1 << p)) << (23 - p)
+  ProcedureReturn ((e + 127) << 23) | (mant & $7FFFFF)
+EndProcedure
+
+; F32RatioS(num, s) = the f32 bit pattern for num / 2^s, num signed.
+Procedure.i F32RatioS(num.i, s.i)
+  Define sign.i
+  Define m.i
+  If num < 0
+    sign = $80000000
+    m = 0 - num
+  Else
+    sign = 0
+    m = num
+  EndIf
+  ProcedureReturn sign | F32Ratio(m, s)
+EndProcedure
+
+; ======================================================================
+;  THE FONT - display.pi4's dsp_font8x16, embedded byte for byte so this
+;  diagnostic depends on no library for its glyph data. 8x16 cell, one
+;  byte per row, MSB of each byte the leftmost pixel, ASCII 32..126.
+; ======================================================================
+
+; GlyphRow(ch, row) - the eight ink bits of one glyph row, MSB leftmost.
+Procedure.i GlyphRow(ch.i, row.i)
+  ProcedureReturn PeekA(?fontData + ((ch - #AT_FFIRST) * #AT_FH) + row)
+EndProcedure
+
+; GlyphInk(ch, tx, ty) - is texel (tx,ty) of glyph ch ink?
+Procedure.i GlyphInk(ch.i, tx.i, ty.i)
+  If (GlyphRow(ch, ty) & (128 >> tx)) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE UBLINEAR_2_COLUMN LAYOUT MODEL (cpp = 4). The one piece of tiling
+;  arithmetic that has to be right, from
+;  Reference/mesa-24.3.4_v3d_tiling.c:114-146. Used to verify the TFU
+;  output and never trusted from a status bit.
+; ======================================================================
+Procedure.i Ub2Off(x.i, y.i)
+  Define ubx.i
+  Define uby.i
+  Define o.i
+  ubx = x / 8
+  uby = y / 8
+  o = 256 * ((uby * 2) + ubx)
+  If (x & 4) <> 0
+    o = o + 64
+  EndIf
+  If (y & 4) <> 0
+    o = o + 128
+  EndIf
+  o = o + ((x & 3) * 4) + ((y & 3) * 16)
+  ProcedureReturn o
+EndProcedure
+
+; ======================================================================
+;  THE THREE SHADERS - byte for byte M1's textured build.
+; ======================================================================
+
+Procedure.i BuildCoordShader()
+  Define r.i
+  Define k.i
+  r = V3dQpuProgramBeginSeg(#AT_CODE_CS, #AT_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  k = 0
+  While k < 8
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  k = 0
+  While k < 8
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 8 + k, #V3DQ_MUX_A, k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  k = 0
+  While k < 6
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, k, 8 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  ; varying0 = U (in[6] -> rf14), varying1 = V (in[7] -> rf15).
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 6, 14)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 7, 15)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+Procedure.i BuildVertexShader()
+  Define r.i
+  Define k.i
+  r = V3dQpuProgramBeginSeg(#AT_CODE_VS, #AT_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  k = 0
+  While k < 10
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  k = 0
+  While k < 4
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 10 + k, #V3DQ_MUX_A, 4 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  ; varying0 = U (in[8] -> rf14), varying1 = V (in[9] -> rf15).
+  r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 14, #V3DQ_MUX_A, 8)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 15, #V3DQ_MUX_A, 9)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  k = 0
+  While k < 6
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, k, 10 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+Procedure.i BuildTexturedFragmentShader()
+  Define r.i
+  r = V3dQpuProgramBeginSeg(#AT_CODE_FS, #AT_CODE_SLOT, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; TMU config P0, P1 via WRTMUC, one uniform each.
+  r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; varying 0 (U -> S): LDVARY rf10, delay nop, FADD rf12 = rf10 + r5.
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; varying 1 (V -> T).
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; coordinate writes: T then S (writing TMUS fires the lookup).
+  r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; the thread switch that delivers the TMU result, plus two delay nops.
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; read the four texel channels R,G,B,A into rf0..rf3.
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 1, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 2, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 3, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; the last-THRSW pair and its two delay slots.
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; the TLB colour write: pack (R,G) -> TLBU, (B,A) -> TLB.
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 3)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ======================================================================
+;  THE DATA
+; ======================================================================
+
+; The five probed glyphs and their on-screen X origins. Filled at run
+; time because the pi4 dialect wants one Define per line.
+Global Dim tstCh.i[#AT_NTEST]
+Global Dim tstX.i[#AT_NTEST]
+
+Procedure SetupTests()
+  tstCh[0] = 65  : tstX[0] = 8      ; 'A'
+  tstCh[1] = 72  : tstX[1] = 56     ; 'H'
+  tstCh[2] = 105 : tstX[2] = 104    ; 'i'
+  tstCh[3] = 46  : tstX[3] = 152    ; '.'
+  tstCh[4] = 84  : tstX[4] = 200    ; 'T'
+EndProcedure
+
+; The atlas cell of a glyph: two columns of 8x16 cells.
+Procedure.i CellX0(ch.i)
+  ProcedureReturn ((ch - #AT_FFIRST) % #AT_COLS) * #AT_FW
+EndProcedure
+Procedure.i CellY0(ch.i)
+  ProcedureReturn ((ch - #AT_FFIRST) / #AT_COLS) * #AT_FH
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildAtlasSrc - the raster RGBA8 atlas the TFU reads. Transparent
+;  everywhere, then each glyph's ink texels set to opaque white. Cell of
+;  glyph g=(ch-32): column g%2, row g/2; texel (tx,ty) at raster offset
+;  ((cellY0+ty)*atlasW + cellX0+tx) * 4.
+; ----------------------------------------------------------------------
+Procedure BuildAtlasSrc()
+  Define i.i
+  Define n.i
+  Define g.i
+  Define ch.i
+  Define cx.i
+  Define cy.i
+  Define tx.i
+  Define ty.i
+  Define off.i
+  ; Transparent the whole buffer (also clears the padded rows 768..1023).
+  i = 0
+  n = #AT_ATLAS_BYTES / 4
+  While i < n
+    PokeN(#AT_ATLAS_SRC + (i * 4), #AT_TRANSP)
+    i = i + 1
+  Wend
+  ; Ink every glyph.
+  g = 0
+  While g < #AT_NGLYPH
+    ch = #AT_FFIRST + g
+    cx = (g % #AT_COLS) * #AT_FW
+    cy = (g / #AT_COLS) * #AT_FH
+    ty = 0
+    While ty < #AT_FH
+      tx = 0
+      While tx < #AT_FW
+        If GlyphInk(ch, tx, ty) <> 0
+          off = (((cy + ty) * #AT_ATLAS_W) + (cx + tx)) * 4
+          PokeN(#AT_ATLAS_SRC + off, #AT_WHITE)
+        EndIf
+        tx = tx + 1
+      Wend
+      ty = ty + 1
+    Wend
+    g = g + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildTexState - TEXTURE_SHADER_STATE (Image Width 16, Height 1024,
+;  RGBA8, RGBA swizzle, all UIF fields clear so the TMU derives
+;  UBLINEAR_2 from the width) and SAMPLER_STATE (nearest, clamp) - the
+;  M1 packing with only the two dimensions changed.
+; ----------------------------------------------------------------------
+Procedure BuildTexState()
+  Define i.i
+  i = 0
+  While i < 8
+    PokeN(#AT_TEXSTATE  + (i * 4), 0)
+    PokeN(#AT_SAMPSTATE + (i * 4), 0)
+    i = i + 1
+  Wend
+  PokeN(#AT_TEXSTATE +  0, #AT_ATLAS_TEX)
+  PokeN(#AT_TEXSTATE +  4, (#AT_ATLAS_W << 26))
+  PokeN(#AT_TEXSTATE +  8, (#AT_ATLAS_H << 8) | (1 << 22))
+  PokeN(#AT_TEXSTATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))
+  PokeN(#AT_SAMPSTATE +  0, 1 | 2 | $80)
+  PokeN(#AT_SAMPSTATE +  4, (1 << 16) | (1 << 19))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One vertex: ten 32-bit values, Xc Yc Zc Wc Xs Ys Zs 1/Wc U V, stride
+;  40. px,py in pixels; uTexel,vTexel in atlas texels (cell edges).
+; ----------------------------------------------------------------------
+Procedure PutVertex(n.i, px.i, py.i, uTexel.i, vTexel.i)
+  Define b.i
+  b = #AT_VERTS + (n * 40)
+  PokeN(b +  0, F32RatioS(px - #AT_CX, #AT_HALFW_S))   ; Xc = (px-CX)/2^7
+  PokeN(b +  4, F32RatioS(py - #AT_CY, #AT_HALFH_S))   ; Yc = (py-CY)/2^6
+  PokeN(b +  8, #AT_F_ZERO)                            ; Zc
+  PokeN(b + 12, #AT_F_ONE)                             ; Wc
+  PokeN(b + 16, (px - #AT_CX) * 256)                   ; Xs, 1/256 px, int
+  PokeN(b + 20, (py - #AT_CY) * 256)                   ; Ys
+  PokeN(b + 24, #AT_F_ZERO)                            ; Zs
+  PokeN(b + 28, #AT_F_ONE)                             ; 1/Wc
+  PokeN(b + 32, F32Ratio(uTexel, #AT_ATLAS_W_S))       ; U = uTexel/16
+  PokeN(b + 36, F32Ratio(vTexel, #AT_ATLAS_H_S))       ; V = vTexel/1024
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildVerts - one quad (two triangles, six vertices) per probed glyph.
+;  Corners carry the cell-edge UVs. Vertex order per quad:
+;    TL TR BL   TR BR BL
+;  Winding is irrelevant - CFG_BITS enables both facings (no culling).
+;  Returns the vertex count.
+; ----------------------------------------------------------------------
+Procedure.i BuildVerts()
+  Define i.i
+  Define n.i
+  Define ch.i
+  Define gx0.i
+  Define gy0.i
+  Define gx1.i
+  Define gy1.i
+  Define uL.i
+  Define uR.i
+  Define vT.i
+  Define vB.i
+  n = 0
+  i = 0
+  While i < #AT_NTEST
+    ch  = tstCh[i]
+    gx0 = tstX[i]
+    gy0 = #AT_GY0
+    gx1 = gx0 + (#AT_FW * #AT_S)
+    gy1 = gy0 + (#AT_FH * #AT_S)
+    uL  = CellX0(ch)
+    uR  = CellX0(ch) + #AT_FW
+    vT  = CellY0(ch)
+    vB  = CellY0(ch) + #AT_FH
+    PutVertex(n + 0, gx0, gy0, uL, vT)    ; TL
+    PutVertex(n + 1, gx1, gy0, uR, vT)    ; TR
+    PutVertex(n + 2, gx0, gy1, uL, vB)    ; BL
+    PutVertex(n + 3, gx1, gy0, uR, vT)    ; TR
+    PutVertex(n + 4, gx1, gy1, uR, vB)    ; BR
+    PutVertex(n + 5, gx0, gy1, uL, vB)    ; BL
+    n = n + 6
+    i = i + 1
+  Wend
+  ; Attribute defaults: Zc=0 style vec, as M1.
+  PokeN(#AT_DEFAULTS +  0, #AT_F_ZERO)
+  PokeN(#AT_DEFAULTS +  4, #AT_F_ZERO)
+  PokeN(#AT_DEFAULTS +  8, #AT_F_ZERO)
+  PokeN(#AT_DEFAULTS + 12, #AT_F_ONE)
+  ProcedureReturn n
+EndProcedure
+
+Procedure BuildUniforms()
+  Define k.i
+  k = 0
+  While k < 8
+    PokeN(#AT_UNIF_CS + (k * 4), k)
+    k = k + 1
+  Wend
+  k = 0
+  While k < 10
+    PokeN(#AT_UNIF_VS + (k * 4), k)
+    k = k + 1
+  Wend
+  ; Textured FS stream: P0, P1, then the TLB config word.
+  PokeN(#AT_UNIF_FS +  0, #AT_TEXSTATE | $F)
+  PokeN(#AT_UNIF_FS +  4, #AT_SAMPSTATE | 1)
+  PokeN(#AT_UNIF_FS +  8, #AT_TLB_CONF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SHADER STATE RECORD AND TEN ATTRIBUTE RECORDS - M1's exactly.
+;  numVaryingsFs=2, vsOutSeg=2 (ten attribute values -> two sectors).
+; ----------------------------------------------------------------------
+Procedure.i BuildRecords()
+  Define r.i
+  Define k.i
+  Define cs.i
+  r = V3dShaderRecordBegin(#AT_SHREC, 10)
+  If r <> #V3D_OK : ProcedureReturn r : EndIf
+  V3dShaderRecordFlags(1, 0, 0, 0, 1, 2)
+  V3dShaderRecordVpm(1, 0, 1, 1, 2, 0, 1, 1)
+  V3dShaderRecordDefaults(#AT_DEFAULTS)
+  V3dShaderRecordFragment(#AT_CODE_FS, #AT_UNIF_FS, 1, 0, 1)
+  V3dShaderRecordVertex(#AT_CODE_VS, #AT_UNIF_VS, 1, 1, 1)
+  V3dShaderRecordCoord(#AT_CODE_CS, #AT_UNIF_CS, 1, 1, 1)
+  k = 0
+  While k < 10
+    cs = 1
+    If k = 6 Or k = 7
+      cs = 0
+    EndIf
+    V3dAttrRecord(k, #AT_VERTS + (k * 4), 40, $FFFFFF, cs, 1)
+    k = k + 1
+  Wend
+  V3dAttrRecordType(4, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
+  V3dAttrRecordType(5, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
+  If V3dShaderRecordOk() = 0
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+; ======================================================================
+;  EXPLICIT VARYING-FLAG PACKETS - M1's exactly.
+; ======================================================================
+Procedure EmitFlatShadeFlags(flags.i)
+  v3d_ClU8(98)
+  v3d_ClU8($50)
+  v3d_ClU8(flags & $FF)
+  v3d_ClU8((flags >> 8) & $FF)
+  v3d_ClU8((flags >> 16) & $FF)
+EndProcedure
+
+Procedure EmitNonperspFlags(flags.i)
+  v3d_ClU8(100)
+  v3d_ClU8($50)
+  v3d_ClU8(flags & $FF)
+  v3d_ClU8((flags >> 8) & $FF)
+  v3d_ClU8((flags >> 16) & $FF)
+EndProcedure
+
+; ======================================================================
+;  VERIFICATION
+; ======================================================================
+Global Dim natMatch.i[#AT_NTEST]
+Global Dim flipMatch.i[#AT_NTEST]
+Global sumNat.i     = 0
+Global sumFlip.i    = 0
+Global tfuBad.i     = 0
+Global tfuFirstX.i  = -1
+Global tfuFirstY.i  = -1
+Global tfuFirstWant.i = 0
+Global tfuFirstGot.i  = 0
+Global bgPixel.i    = 0
+
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(#AT_TARGET + (y * #AT_STRIDE) + (x * 4))
+EndProcedure
+
+; Screen pixel at the centre of glyph i's texel (tx,ty) for a given
+; orientation (0 = natural, 1 = Y-flipped).
+Procedure.i ProbeX(i.i, tx.i)
+  ProcedureReturn tstX[i] + (tx * #AT_S) + (#AT_S / 2)
+EndProcedure
+Procedure.i ProbeY(ty.i, flip.i)
+  Define ry.i
+  If flip <> 0
+    ry = (#AT_FH - 1) - ty
+  Else
+    ry = ty
+  EndIf
+  ProcedureReturn #AT_GY0 + (ry * #AT_S) + (#AT_S / 2)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TfuTilingCheck - every atlas texel: the tiled buffer at its UBLINEAR_2
+;  offset must equal the raster source. Proves the TFU produced the
+;  layout the TMU is about to read, independently of the render.
+; ----------------------------------------------------------------------
+Procedure TfuTilingCheck()
+  Define x.i
+  Define y.i
+  Define want.i
+  Define got.i
+  tfuBad = 0
+  y = 0
+  While y < #AT_ATLAS_H
+    x = 0
+    While x < #AT_ATLAS_W
+      want = PeekN(#AT_ATLAS_SRC + (((y * #AT_ATLAS_W) + x) * 4))
+      got  = PeekN(#AT_ATLAS_TEX + Ub2Off(x, y))
+      If got <> want
+        If tfuBad = 0
+          tfuFirstX = x
+          tfuFirstY = y
+          tfuFirstWant = want
+          tfuFirstGot = got
+        EndIf
+        tfuBad = tfuBad + 1
+      EndIf
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  VerifyGlyphs - every texel of every probed glyph against the font, in
+;  both orientations. An ink texel must render WHITE, a blank texel must
+;  render TRANSPARENT (the sampled clear texel, written straight).
+; ----------------------------------------------------------------------
+Procedure VerifyGlyphs()
+  Define i.i
+  Define ch.i
+  Define tx.i
+  Define ty.i
+  Define want.i
+  Define gotN.i
+  Define gotF.i
+  sumNat = 0
+  sumFlip = 0
+  i = 0
+  While i < #AT_NTEST
+    ch = tstCh[i]
+    natMatch[i] = 0
+    flipMatch[i] = 0
+    ty = 0
+    While ty < #AT_FH
+      tx = 0
+      While tx < #AT_FW
+        If GlyphInk(ch, tx, ty) <> 0
+          want = #AT_WHITE
+        Else
+          want = #AT_TRANSP
+        EndIf
+        gotN = PixelAt(ProbeX(i, tx), ProbeY(ty, 0))
+        gotF = PixelAt(ProbeX(i, tx), ProbeY(ty, 1))
+        If gotN = want
+          natMatch[i] = natMatch[i] + 1
+        EndIf
+        If gotF = want
+          flipMatch[i] = flipMatch[i] + 1
+        EndIf
+        tx = tx + 1
+      Wend
+      ty = ty + 1
+    Wend
+    sumNat = sumNat + natMatch[i]
+    sumFlip = sumFlip + flipMatch[i]
+    i = i + 1
+  Wend
+  bgPixel = PixelAt(2, 2)
+EndProcedure
+
+; Print one glyph's concrete ink and blank probe (coords + values), in
+; the winning orientation, so the log names exact pixels.
+Procedure ProbeReport(i.i, flip.i)
+  Define ch.i
+  Define tx.i
+  Define ty.i
+  Define px.i
+  Define py.i
+  Define done.i
+  ch = tstCh[i]
+  PutS("    '")
+  PutC(ch)
+  PutS("' cell x0=")
+  PutDec(CellX0(ch))
+  PutS(" y0=")
+  PutDec(CellY0(ch))
+  PutS("  natMatch=")
+  PutDec(natMatch[i])
+  PutS("/128 flipMatch=")
+  PutDec(flipMatch[i])
+  PutS("/128")
+  PutNl()
+  ; first ink texel
+  done = 0
+  ty = 0
+  While ty < #AT_FH And done = 0
+    tx = 0
+    While tx < #AT_FW And done = 0
+      If GlyphInk(ch, tx, ty) <> 0
+        px = ProbeX(i, tx)
+        py = ProbeY(ty, flip)
+        PutS("      ink   texel(")
+        PutDec(tx) : PutS(",") : PutDec(ty)
+        PutS(") -> px(") : PutDec(px) : PutS(",") : PutDec(py)
+        PutS(") = $") : PutHex(PixelAt(px, py), 8)
+        PutS("  want $") : PutHex(#AT_WHITE, 8)
+        PutNl()
+        done = 1
+      EndIf
+      tx = tx + 1
+    Wend
+    ty = ty + 1
+  Wend
+  ; first blank texel
+  done = 0
+  ty = 0
+  While ty < #AT_FH And done = 0
+    tx = 0
+    While tx < #AT_FW And done = 0
+      If GlyphInk(ch, tx, ty) = 0
+        px = ProbeX(i, tx)
+        py = ProbeY(ty, flip)
+        PutS("      blank texel(")
+        PutDec(tx) : PutS(",") : PutDec(ty)
+        PutS(") -> px(") : PutDec(px) : PutS(",") : PutDec(py)
+        PutS(") = $") : PutHex(PixelAt(px, py), 8)
+        PutS("  want $") : PutHex(#AT_TRANSP, 8)
+        PutNl()
+        done = 1
+      EndIf
+      tx = tx + 1
+    Wend
+    ty = ty + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define csBytes.i
+  Define vsBytes.i
+  Define fsBytes.i
+  Define nVerts.i
+  Define ok.i
+  Define full.i
+  Define orient.i
+  Define tStart.i
+  Define tEnd.i
+
+  SetupTests()
+
+  PutNl()
+  PutS("=== Pi 4 V3D M2 - a GLYPH ATLAS sampled through the TMU ===")
+  PutNl()
+  PutS("    16x1024 RGBA8 atlas, UBLINEAR_2_COLUMN, nearest, 5 glyphs")
+  PutNl()
+  PutNl()
+
+  ; -- 0. Stage 0 -----------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0: ")
+  PutErr(r)
+  PutNl()
+  RowHex("HUB_IDENT1", V3dIdent1())
+  If r <> #V3D_OK
+    PutS("verdict: STAGE0") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; -- 1. The three shaders (M1's, verbatim) --------------------------
+  PutS("1   the shaders") : PutNl()
+  r = BuildCoordShader()
+  csBytes = V3dQpuProgramBytes()
+  PutS("    coordinate shader: ") : PutQpuErr(r) : PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("cs instructions", csBytes / 8)
+  r = BuildVertexShader()
+  vsBytes = V3dQpuProgramBytes()
+  PutS("    vertex shader: ") : PutQpuErr(r) : PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("vs instructions", vsBytes / 8)
+  r = BuildTexturedFragmentShader()
+  fsBytes = V3dQpuProgramBytes()
+  PutS("    fragment shader: ") : PutQpuErr(r) : PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("fs instructions", fsBytes / 8)
+  DumpProgram(#AT_CODE_FS, fsBytes / 8)
+  PutNl()
+
+  ; -- 2. The V3D MMU -------------------------------------------------
+  PutS("2   the V3D MMU: ")
+  r = V3dMmuInit(#AT_PT, #AT_PT_BYTES, #AT_ILLEGAL)
+  PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: MMU") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dMmuMap(#AT_BCL, #AT_BCL, #AT_BCL_BYTES)
+  If r = #V3D_OK : r = V3dMmuMap(#AT_TILELIST, #AT_TILELIST, #AT_TL_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_RCL, #AT_RCL, #AT_RCL_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_TSTATE, #AT_TSTATE, #AT_TSTATE_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_SHREC, #AT_SHREC, #AT_SHREC_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_VERTS, #AT_VERTS, #AT_VERTS_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_UNIF, #AT_UNIF, #AT_UNIF_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_CODE, #AT_CODE, #AT_CODE_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_TARGET, #AT_TARGET, #AT_TARGET_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_ATLAS_SRC, #AT_ATLAS_SRC, #AT_ATLAS_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_ATLAS_TEX, #AT_ATLAS_TEX, #AT_ATLAS_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_TEXSTATE, #AT_TEXSTATE, #AT_TEXSTATE_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_TALLOC, #AT_TALLOC, #AT_TALLOC_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#AT_OVERFLOW, #AT_OVERFLOW, #AT_OVERFLOW_BYTES) : EndIf
+  If r <> #V3D_OK
+    PutS("    mapping: ") : PutErr(r) : PutNl()
+    PutS("verdict: MMU") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("pages mapped", V3dMmuPagesMapped())
+  RowHex("PTE for the atlas tex", V3dMmuEntry(#AT_ATLAS_TEX))
+  PutNl()
+
+  ; -- 3. The atlas: build raster, TFU-tile, verify the tiling --------
+  PutS("3   the glyph atlas") : PutNl()
+  BuildAtlasSrc()
+  ; Poison the tiled buffer so a TFU that wrote nothing is visible.
+  i = 0
+  n = #AT_ATLAS_BYTES / 4
+  While i < n
+    PokeN(#AT_ATLAS_TEX + (i * 4), #AT_POISON)
+    i = i + 1
+  Wend
+  RowDec("atlas width", #AT_ATLAS_W)
+  RowDec("atlas height", #AT_ATLAS_H)
+  RowDec("glyphs packed", #AT_NGLYPH)
+
+  r = V3dTfuBegin(#AT_ATLAS_W, #AT_ATLAS_H, #V3D_TEXFMT_RGBA8)
+  If r = #V3D_OK : r = V3dTfuSourceRaster(#AT_ATLAS_SRC, #AT_ATLAS_W, #AT_ATLAS_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dTfuDest(#AT_ATLAS_TEX, #V3D_TFU_OFMT_UBLINEAR_2, #AT_ATLAS_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dTfuSubmit() : EndIf
+  PutS("    TFU submit: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: TFU") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dTfuWait(#V3D_TFU_TIMEOUT_US)
+  PutS("    TFU wait: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: TFU") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  TfuTilingCheck()
+  RowDec("TFU texels wrong", tfuBad)
+  If tfuBad <> 0
+    PutS("    first wrong texel (") : PutDec(tfuFirstX) : PutS(",") : PutDec(tfuFirstY)
+    PutS("): got $") : PutHex(tfuFirstGot, 8) : PutS(" want $") : PutHex(tfuFirstWant, 8)
+    PutNl()
+  EndIf
+
+  BuildTexState()
+  PutS("    texture shader state (24 bytes):") : PutNl()
+  DumpBytes(#AT_TEXSTATE, 24)
+  PutNl()
+
+  ; -- 4. The frame geometry ------------------------------------------
+  r = V3dRenderBegin(#AT_TW, #AT_TH, #V3D_OFMT_RGBA8)
+  PutS("4   the frame: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: GEOMETRY") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("tile alloc needed", V3dTileAllocNeeded())
+  RowDec("tile alloc given", #AT_TALLOC_BYTES)
+  RowDec("tile state needed", V3dTileStateNeeded())
+  r = V3dRenderTarget(#AT_TARGET, #AT_TARGET_BYTES, #V3D_MEMFMT_RASTER, #AT_STRIDE, 0)
+  If r <> #V3D_OK
+    PutS("    the render target: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  V3dRenderClear(#AT_CLEAR, #AT_ZCLEAR, 0)
+  r = V3dRenderPool(#AT_TALLOC, #AT_TALLOC_BYTES, #AT_TSTATE, #AT_TSTATE_BYTES)
+  If r <> #V3D_OK
+    PutS("    the pools: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinOverflow(#AT_OVERFLOW, #AT_OVERFLOW_BYTES)
+  If r <> #V3D_OK
+    PutS("    the overflow pool: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; -- 5. Data, records, poison ---------------------------------------
+  nVerts = BuildVerts()
+  BuildUniforms()
+  i = 0
+  n = #AT_SHREC_BYTES / 4
+  While i < n
+    PokeN(#AT_SHREC + (i * 4), #AT_POISON)
+    i = i + 1
+  Wend
+  r = BuildRecords()
+  PutS("5   the shader state record: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RECORD") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("vertices", nVerts)
+  RowDec("record + attrs, bytes", V3dShaderRecordBytes())
+
+  ; Poison the target so an un-drawn pixel is visibly poison, not stale.
+  i = 0
+  n = #AT_TARGET_BYTES / 4
+  While i < n
+    PokeN(#AT_TARGET + (i * 4), #AT_POISON)
+    i = i + 1
+  Wend
+  PutNl()
+
+  ; -- 6. The bin list (M1's, with the wider viewport/clipper) --------
+  r = V3dBclBegin(#AT_BCL, #AT_BCL_BYTES)
+  If r = #V3D_OK
+    V3dClClipWindow(0, 0, #AT_TW, #AT_TH)
+    V3dClCfgBits(V3dCfgBitsWord(1, 1, 0, 7))
+    V3dClPointSize(#AT_F_ONE)
+    V3dClLineWidth(#AT_F_ONE)
+    V3dClClipperXyScaling(#AT_F_HALFW, #AT_F_HALFH)
+    V3dClClipperZScaleOffset(#AT_F_ONE, #AT_F_ZERO)
+    V3dClClipperZMinMax($BF800000, #AT_F_ONE)
+    V3dClViewportOffset((#AT_CX * 256), 0, (#AT_CY * 256), 0)
+    V3dClColorWriteMasks(0)
+    EmitFlatShadeFlags(0)
+    EmitNonperspFlags($3)
+    V3dClZeroAllCentroidFlags()
+    V3dClOcclusionQueryCounter(0)
+    V3dClSampleState($3F80, $F)
+    V3dClVcmCacheSize(4, 4)
+    V3dClGlShaderState(V3dShaderRecordAddr(), 10)
+    V3dClVertexArrayPrims(#V3D_PRIM_TRIANGLES, nVerts, 0)
+    r = V3dBclFinish()
+  EndIf
+  PutS("6   the bin list: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BCL") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("bin list bytes", V3dBclBytes())
+  PutNl()
+
+  ; -- 7. The render list ---------------------------------------------
+  r = V3dRclBuild(#AT_TILELIST, #AT_TL_BYTES, #AT_RCL, #AT_RCL_BYTES)
+  PutS("7   the render list: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RCL") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; -- 8. Cache maintenance -------------------------------------------
+  V3dCacheRange(#AT_SHREC, V3dShaderRecordBytes())
+  V3dCacheRange(#AT_VERTS, #AT_VERTS_BYTES)
+  V3dCacheRange(#AT_UNIF_CS, 256)
+  V3dCacheRange(#AT_CODE, #AT_CODE_SLOT * 3)
+  V3dCacheRange(#AT_ATLAS_TEX, #AT_ATLAS_BYTES)
+  V3dCacheRange(#AT_TEXSTATE, 512)
+  V3dBarrier()
+  V3dInvalidateCaches()
+
+  ; -- 9. The bin job (timer starts here) -----------------------------
+  tStart = PeekN(#SYST_CLO)
+  r = V3dBinSubmit()
+  PutS("8   bin submit: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BINSUBMIT") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinWait(#AT_WAIT_US)
+  PutS("    bin wait: ") : PutErr(r) : PutNl()
+  RowHex("CLE_BFC after", V3dBinBfcAfter())
+  RowHex("ERR_STAT", V3dBinErrStat())
+  RowHex("MMU_VIO_ADDR", V3dBinVioAddr())
+  If r <> #V3D_OK
+    PutS("verdict: BIN") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; -- 10. The render job ---------------------------------------------
+  r = V3dRenderSubmit()
+  PutS("9   render submit: ") : PutErr(r) : PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RENDERSUBMIT") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dRenderWait(#AT_WAIT_US)
+  tEnd = PeekN(#SYST_CLO)
+  PutS("    render wait: ") : PutErr(r) : PutNl()
+  RowHex("CLE_RFC after", V3dRenderRfcAfter())
+  RowHex("ERR_STAT", V3dRenderErrStat())
+  RowHex("MMU_VIO_ADDR", V3dRenderVioAddr())
+  If r <> #V3D_OK
+    PutS("verdict: RENDER") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("bin+render usec (approx)", tEnd - tStart)
+  PutNl()
+
+  ; -- 11. The pixels. This is the whole test. ------------------------
+  VerifyGlyphs()
+
+  PutS("10  the glyphs") : PutNl()
+  full = #AT_NTEST * #AT_FW * #AT_FH
+  RowDec("texels per glyph", #AT_FW * #AT_FH)
+  RowDec("glyphs probed", #AT_NTEST)
+  RowDec("natural  matches", sumNat)
+  RowDec("flipped  matches", sumFlip)
+  RowDec("of a possible", full)
+  RowHex("background px (2,2)", bgPixel)
+  RowHex("clear colour", #AT_CLEAR)
+  PutNl()
+
+  ; Winning orientation.
+  orient = 0
+  If sumFlip > sumNat
+    orient = 1
+  EndIf
+  i = 0
+  While i < #AT_NTEST
+    ProbeReport(i, orient)
+    i = i + 1
+  Wend
+  PutNl()
+
+  ; -- THE VERDICT ----------------------------------------------------
+  ;  A pass needs the TFU tiling exact, every texel of every probed
+  ;  glyph correct in ONE orientation, and the background still clear.
+  ok = 0
+  If tfuBad = 0
+    If bgPixel = #AT_CLEAR
+      If sumNat = full
+        ok = 1
+        PutS("verdict: OK - GLYPH ATLAS SAMPLED. All 640 texels match, natural Y.")
+      ElseIf sumFlip = full
+        ok = 1
+        PutS("verdict: OK-YFLIP - GLYPH ATLAS SAMPLED, but screen Y is FLIPPED vs atlas rows.")
+      EndIf
+    EndIf
+  EndIf
+  If ok = 0
+    If tfuBad <> 0
+      PutS("verdict: TFU-TILING - the TFU did not produce UBLINEAR_2; the TMU was never fairly tested.")
+    ElseIf bgPixel <> #AT_CLEAR
+      PutS("verdict: NO-CLEAR - the background is not the clear colour; render/store is wrong.")
+    Else
+      PutS("verdict: NO-GLYPH - the atlas did not sample; see per-glyph matches and probes above.")
+    EndIf
+  EndIf
+  PutNl()
+
+  ProcedureReturn sumNat + sumFlip
+EndProcedure
+
+; ======================================================================
+;  THE FONT DATA - display.pi4:4532-4629 dsp_font8x16, byte for byte.
+;  8x16 cell, one byte per row, MSB the leftmost pixel, ASCII 32..126.
+; ======================================================================
+DataSection
+  fontData:
+  Data.a $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00   ; ' '  32
+  Data.a $00,$00,$00,$18,$18,$18,$18,$18,$18,$00,$18,$18,$00,$00,$00,$00   ; '!'  33
+  Data.a $00,$00,$00,$24,$24,$24,$24,$00,$00,$00,$00,$00,$00,$00,$00,$00   ; '"'  34
+  Data.a $00,$00,$12,$16,$14,$7F,$24,$24,$FE,$68,$48,$48,$00,$00,$00,$00   ; '#'  35
+  Data.a $00,$00,$00,$00,$3C,$68,$40,$38,$1C,$02,$46,$3C,$00,$00,$00,$00   ; '$'  36
+  Data.a $00,$00,$00,$70,$90,$90,$76,$18,$6E,$0B,$0B,$0E,$00,$00,$00,$00   ; '%'  37
+  Data.a $00,$00,$00,$3C,$60,$20,$30,$59,$CB,$C6,$46,$3A,$00,$00,$00,$00   ; '&'  38
+  Data.a $00,$00,$00,$18,$18,$18,$18,$00,$00,$00,$00,$00,$00,$00,$00,$00   ; '''  39
+  Data.a $00,$08,$08,$18,$10,$10,$10,$10,$10,$10,$18,$08,$08,$00,$00,$00   ; '('  40
+  Data.a $00,$30,$10,$18,$18,$08,$08,$08,$08,$08,$18,$10,$30,$00,$00,$00   ; ')'  41
+  Data.a $00,$00,$00,$10,$52,$38,$38,$52,$10,$00,$00,$00,$00,$00,$00,$00   ; '*'  42
+  Data.a $00,$00,$00,$00,$18,$18,$18,$FE,$18,$18,$18,$00,$00,$00,$00,$00   ; '+'  43
+  Data.a $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$18,$18,$10,$10,$00,$00   ; ','  44
+  Data.a $00,$00,$00,$00,$00,$00,$00,$00,$3C,$00,$00,$00,$00,$00,$00,$00   ; '-'  45
+  Data.a $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$18,$18,$00,$00,$00,$00   ; '.'  46
+  Data.a $00,$00,$00,$06,$04,$0C,$08,$08,$10,$10,$30,$20,$60,$40,$00,$00   ; '/'  47
+  Data.a $00,$00,$00,$3C,$64,$46,$42,$5A,$42,$46,$64,$3C,$00,$00,$00,$00   ; '0'  48
+  Data.a $00,$00,$00,$78,$08,$08,$08,$08,$08,$08,$08,$3E,$00,$00,$00,$00   ; '1'  49
+  Data.a $00,$00,$00,$3C,$44,$06,$04,$0C,$18,$30,$60,$7E,$00,$00,$00,$00   ; '2'  50
+  Data.a $00,$00,$00,$3C,$44,$06,$04,$3C,$06,$06,$46,$3C,$00,$00,$00,$00   ; '3'  51
+  Data.a $00,$00,$00,$0C,$1C,$14,$24,$64,$44,$7E,$04,$04,$00,$00,$00,$00   ; '4'  52
+  Data.a $00,$00,$00,$7C,$60,$60,$7C,$04,$06,$06,$44,$38,$00,$00,$00,$00   ; '5'  53
+  Data.a $00,$00,$00,$3C,$60,$40,$7C,$66,$42,$42,$66,$3C,$00,$00,$00,$00   ; '6'  54
+  Data.a $00,$00,$00,$7E,$06,$04,$0C,$08,$18,$18,$10,$30,$00,$00,$00,$00   ; '7'  55
+  Data.a $00,$00,$00,$3C,$66,$46,$64,$3C,$66,$42,$66,$3C,$00,$00,$00,$00   ; '8'  56
+  Data.a $00,$00,$00,$3C,$64,$46,$46,$66,$3E,$06,$04,$38,$00,$00,$00,$00   ; '9'  57
+  Data.a $00,$00,$00,$00,$00,$18,$18,$00,$00,$00,$18,$18,$00,$00,$00,$00   ; ':'  58
+  Data.a $00,$00,$00,$00,$00,$18,$18,$00,$00,$00,$18,$18,$10,$10,$00,$00   ; ';'  59
+  Data.a $00,$00,$00,$00,$00,$02,$1C,$60,$60,$1C,$02,$00,$00,$00,$00,$00   ; '<'  60
+  Data.a $00,$00,$00,$00,$00,$00,$FE,$00,$00,$FE,$00,$00,$00,$00,$00,$00   ; '='  61
+  Data.a $00,$00,$00,$00,$00,$40,$38,$0E,$0E,$38,$40,$00,$00,$00,$00,$00   ; '>'  62
+  Data.a $00,$00,$00,$3C,$06,$06,$0C,$18,$10,$00,$10,$10,$00,$00,$00,$00   ; '?'  63
+  Data.a $00,$00,$00,$3C,$62,$42,$CF,$93,$93,$93,$CF,$40,$60,$1C,$00,$00   ; '@'  64
+  Data.a $00,$00,$00,$18,$18,$3C,$2C,$24,$66,$7E,$42,$C3,$00,$00,$00,$00   ; 'A'  65
+  Data.a $00,$00,$00,$7C,$46,$46,$46,$7C,$46,$42,$46,$7C,$00,$00,$00,$00   ; 'B'  66
+  Data.a $00,$00,$00,$1C,$22,$60,$40,$40,$40,$60,$22,$1C,$00,$00,$00,$00   ; 'C'  67
+  Data.a $00,$00,$00,$78,$44,$46,$42,$42,$42,$46,$44,$78,$00,$00,$00,$00   ; 'D'  68
+  Data.a $00,$00,$00,$7E,$60,$60,$60,$7E,$60,$60,$60,$7E,$00,$00,$00,$00   ; 'E'  69
+  Data.a $00,$00,$00,$7E,$60,$60,$60,$7E,$60,$60,$60,$60,$00,$00,$00,$00   ; 'F'  70
+  Data.a $00,$00,$00,$3C,$62,$40,$40,$4E,$42,$42,$62,$3C,$00,$00,$00,$00   ; 'G'  71
+  Data.a $00,$00,$00,$42,$42,$42,$42,$7E,$42,$42,$42,$42,$00,$00,$00,$00   ; 'H'  72
+  Data.a $00,$00,$00,$7E,$18,$18,$18,$18,$18,$18,$18,$7E,$00,$00,$00,$00   ; 'I'  73
+  Data.a $00,$00,$00,$3C,$04,$04,$04,$04,$04,$04,$4C,$78,$00,$00,$00,$00   ; 'J'  74
+  Data.a $00,$00,$00,$42,$44,$48,$70,$78,$48,$4C,$46,$42,$00,$00,$00,$00   ; 'K'  75
+  Data.a $00,$00,$00,$60,$60,$60,$60,$60,$60,$60,$60,$7E,$00,$00,$00,$00   ; 'L'  76
+  Data.a $00,$00,$00,$E6,$E6,$E6,$FA,$DA,$DA,$C2,$C2,$C2,$00,$00,$00,$00   ; 'M'  77
+  Data.a $00,$00,$00,$62,$62,$72,$52,$5A,$4A,$4E,$46,$46,$00,$00,$00,$00   ; 'N'  78
+  Data.a $00,$00,$00,$3C,$66,$46,$42,$42,$42,$46,$66,$3C,$00,$00,$00,$00   ; 'O'  79
+  Data.a $00,$00,$00,$7C,$66,$62,$62,$66,$7C,$60,$60,$60,$00,$00,$00,$00   ; 'P'  80
+  Data.a $00,$00,$00,$3C,$66,$46,$42,$42,$42,$46,$66,$3C,$0C,$04,$00,$00   ; 'Q'  81
+  Data.a $00,$00,$00,$7C,$46,$46,$46,$7C,$4C,$46,$42,$43,$00,$00,$00,$00   ; 'R'  82
+  Data.a $00,$00,$00,$3C,$60,$40,$60,$3C,$06,$02,$46,$3C,$00,$00,$00,$00   ; 'S'  83
+  Data.a $00,$00,$00,$FF,$18,$18,$18,$18,$18,$18,$18,$18,$00,$00,$00,$00   ; 'T'  84
+  Data.a $00,$00,$00,$42,$42,$42,$42,$42,$42,$42,$66,$3C,$00,$00,$00,$00   ; 'U'  85
+  Data.a $00,$00,$00,$C2,$42,$46,$64,$24,$24,$3C,$18,$18,$00,$00,$00,$00   ; 'V'  86
+  Data.a $00,$00,$00,$83,$C3,$C3,$DA,$5A,$5A,$6E,$66,$66,$00,$00,$00,$00   ; 'W'  87
+  Data.a $00,$00,$00,$42,$66,$3C,$18,$18,$3C,$24,$66,$C2,$00,$00,$00,$00   ; 'X'  88
+  Data.a $00,$00,$00,$C2,$66,$24,$3C,$18,$18,$18,$18,$18,$00,$00,$00,$00   ; 'Y'  89
+  Data.a $00,$00,$00,$7E,$06,$04,$0C,$18,$10,$20,$60,$7E,$00,$00,$00,$00   ; 'Z'  90
+  Data.a $00,$1C,$10,$10,$10,$10,$10,$10,$10,$10,$10,$10,$1C,$00,$00,$00   ; '['  91
+  Data.a $00,$00,$00,$40,$60,$20,$30,$10,$10,$08,$08,$0C,$04,$06,$00,$00   ; '\'  92
+  Data.a $00,$38,$08,$08,$08,$08,$08,$08,$08,$08,$08,$08,$38,$00,$00,$00   ; ']'  93
+  Data.a $00,$00,$00,$18,$3C,$64,$42,$00,$00,$00,$00,$00,$00,$00,$00,$00   ; '^'  94
+  Data.a $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$FF,$00   ; '_'  95
+  Data.a $00,$00,$30,$10,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00   ; '`'  96
+  Data.a $00,$00,$00,$00,$00,$3C,$44,$06,$3E,$46,$46,$3E,$00,$00,$00,$00   ; 'a'  97
+  Data.a $00,$40,$40,$40,$40,$7C,$66,$62,$42,$62,$66,$7C,$00,$00,$00,$00   ; 'b'  98
+  Data.a $00,$00,$00,$00,$00,$1C,$22,$60,$60,$60,$22,$1C,$00,$00,$00,$00   ; 'c'  99
+  Data.a $00,$06,$06,$06,$06,$3E,$66,$46,$46,$46,$66,$3E,$00,$00,$00,$00   ; 'd'  100
+  Data.a $00,$00,$00,$00,$00,$3C,$66,$42,$7E,$40,$62,$3C,$00,$00,$00,$00   ; 'e'  101
+  Data.a $00,$0E,$18,$10,$10,$7E,$10,$10,$10,$10,$10,$10,$00,$00,$00,$00   ; 'f'  102
+  Data.a $00,$00,$00,$00,$00,$3E,$66,$46,$46,$46,$66,$3E,$06,$04,$38,$00   ; 'g'  103
+  Data.a $00,$40,$40,$40,$40,$7C,$66,$66,$46,$46,$46,$46,$00,$00,$00,$00   ; 'h'  104
+  Data.a $00,$18,$00,$00,$00,$38,$18,$18,$18,$18,$18,$7E,$00,$00,$00,$00   ; 'i'  105
+  Data.a $00,$08,$00,$00,$00,$38,$08,$08,$08,$08,$08,$08,$08,$18,$70,$00   ; 'j'  106
+  Data.a $00,$60,$60,$60,$60,$66,$6C,$78,$78,$6C,$66,$62,$00,$00,$00,$00   ; 'k'  107
+  Data.a $00,$70,$10,$10,$10,$10,$10,$10,$10,$10,$10,$0E,$00,$00,$00,$00   ; 'l'  108
+  Data.a $00,$00,$00,$00,$00,$7E,$5A,$5A,$5A,$5A,$5A,$5A,$00,$00,$00,$00   ; 'm'  109
+  Data.a $00,$00,$00,$00,$00,$7C,$66,$66,$46,$46,$46,$46,$00,$00,$00,$00   ; 'n'  110
+  Data.a $00,$00,$00,$00,$00,$3C,$66,$42,$42,$42,$66,$3C,$00,$00,$00,$00   ; 'o'  111
+  Data.a $00,$00,$00,$00,$00,$7C,$66,$62,$42,$62,$66,$7C,$40,$40,$40,$00   ; 'p'  112
+  Data.a $00,$00,$00,$00,$00,$3E,$66,$46,$46,$46,$66,$3E,$06,$06,$06,$00   ; 'q'  113
+  Data.a $00,$00,$00,$00,$00,$3E,$30,$30,$30,$30,$30,$30,$00,$00,$00,$00   ; 'r'  114
+  Data.a $00,$00,$00,$00,$00,$3C,$64,$60,$3C,$04,$44,$3C,$00,$00,$00,$00   ; 's'  115
+  Data.a $00,$00,$00,$10,$10,$7E,$10,$10,$10,$10,$10,$1E,$00,$00,$00,$00   ; 't'  116
+  Data.a $00,$00,$00,$00,$00,$46,$46,$46,$46,$66,$66,$3E,$00,$00,$00,$00   ; 'u'  117
+  Data.a $00,$00,$00,$00,$00,$42,$46,$64,$24,$2C,$18,$18,$00,$00,$00,$00   ; 'v'  118
+  Data.a $00,$00,$00,$00,$00,$83,$C3,$5A,$5A,$7E,$66,$64,$00,$00,$00,$00   ; 'w'  119
+  Data.a $00,$00,$00,$00,$00,$46,$24,$18,$18,$3C,$24,$42,$00,$00,$00,$00   ; 'x'  120
+  Data.a $00,$00,$00,$00,$00,$42,$66,$24,$24,$3C,$18,$18,$18,$10,$60,$00   ; 'y'  121
+  Data.a $00,$00,$00,$00,$00,$7E,$04,$08,$18,$30,$20,$7E,$00,$00,$00,$00   ; 'z'  122
+  Data.a $00,$0C,$18,$18,$18,$10,$70,$10,$18,$18,$18,$18,$0C,$00,$00,$00   ; '{'  123
+  Data.a $00,$18,$18,$18,$18,$18,$18,$18,$18,$18,$18,$18,$18,$18,$00,$00   ; '|'  124
+  Data.a $00,$70,$10,$18,$18,$18,$0C,$18,$18,$18,$10,$10,$70,$00,$00,$00   ; '}'  125
+  Data.a $00,$00,$00,$00,$00,$00,$00,$70,$0E,$00,$00,$00,$00,$00,$00,$00   ; '~'  126
+EndDataSection

@@ -1,0 +1,1098 @@
+; pi4WifiScan.pi4 - bring the CYW43455 up and print the networks it can
+; see. The list of SSIDs on the serial console is the deliverable.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is the artefact tools/a64/a64_sdio_check.py runs for the scan
+; path. Its output format is load-bearing: the gate reads values back
+; out of the serial log by label, so a label changed here changes the
+; gate.
+;
+; ======================================================================
+; ARM THE DEADMAN. `deadman 15` BEFORE `run`. EVERY TIME.
+; ======================================================================
+; CORRECTED 2026-08-27, AND THE OLD TEXT IS QUOTED BELOW BECAUSE IT WAS
+; FOLLOWED AND IT COST A HAND POWER CYCLE.
+;
+; This header used to read "RUN IT WITH THE DEADMAN OFF", on the
+; arithmetic that the payload can take eleven seconds against a sixteen
+; second counter and that "the failure mode if it goes over is a reset
+; in the middle of a firmware upload - which costs a power cycle and
+; tells you nothing."
+;
+; THE SECOND HALF OF THAT SENTENCE IS BACKWARDS, and it is the half that
+; matters. A deadman expiry does not cost a power cycle - it is the one
+; thing that AVOIDS one. Read RunAt in RaspberryPi4/Board/cache.pi4 (the
+; deadman is armed at line 446 and SafetyWatchdogStop runs at line 635):
+; the watchdog is armed immediately before the jump and stopped
+; immediately after, so a payload that hangs never reaches the stop, the counter
+; runs out, and THE BOARD RESETS ITSELF BACK INTO THE FIRMWARE. It comes
+; back on its own. Unarmed, the same hang wedges the board and needs a
+; hand on the mains switch, because U-Boot is gone from the stick and
+; there is no other way back (RaspberryPi4/Examples/Diagnostics/
+; pi4Install.pi4 lines 1-52).
+;
+; The arithmetic is still true and is still worth having:
+;
+;   bring-up      609,312 bytes uploaded and READ BACK for verification,
+;                 so about 1.2 MB across the bus       ~1 to 2 s
+;   NVRAM         1,748 bytes, likewise                 negligible
+;   HT clock, F2  bounded polls                         < 1 s
+;   the scan      #SCAN_BUDGET_MS below                 up to 8 s
+;                                                       ------------
+;                                                       up to ~11 s
+;
+; Eleven against fifteen - the ceiling is reported as 15, not 16, because
+; a deadman must never fire before it said it would - is four seconds of
+; margin. If a run does overrun it, the cost is a reset and a re-run,
+; which is cheap. The cost of the other choice was measured on
+; 2026-08-26 and again on 2026-08-27: a manual power cycle, twice.
+;
+;     pmf> deadman 15
+;     pmf> map              <- it prints `stage a file at <stage>`. An
+;                              image is the same bytes at any --load-addr.
+;     pmf> run <stage>
+;
+; A bench-practice note written on 2026-08-26 - the same day as the text
+; this replaces - said to arm the deadman before every payload, directly
+; contradicting it. Two documents disagreed and the wrong one was the one
+; sitting in the file open beside the board. That is why this correction
+; is a paragraph and not a deletion.
+;
+; ======================================================================
+; THE PREAMBLE THAT IS NOT OPTIONAL
+; ======================================================================
+; SdioInit REFUSES WITHOUT A BASE CLOCK and says so: on a BCM2711 the
+; SDHCI Capabilities register reads back zero in the base-clock field,
+; so the number has to come from the property mailbox instead. Every
+; diagnostic on this bus needs these three calls, in this order, before
+; SdioInit:
+;
+;     MailboxInit()
+;     hz = MailboxClockRate(1)         ; clock id 1 is EMMC, NOT 12
+;     SdioSetBaseClockKhz(hz / 1000)
+;
+; Clock id 1 is EMMC and feeds the controller at $FE300000. Id 12 is
+; EMMC2 and feeds the micro-SD slot. They are different clocks with
+; different rates and picking the wrong one produces a bus that almost
+; works.
+;
+; ======================================================================
+; WHERE THE FIRMWARE COMES FROM
+; ======================================================================
+; NOT FROM HERE. This payload does not touch the filesystem. The three
+; blobs are read off the boot stick into DRAM by Anvil's `load` before
+; the payload runs, and this program is handed nothing but addresses:
+;
+;     load BRCMFW.BIN  1000000     609309 bytes  crc32 $B8B12CED
+;     load BRCMNV.TXT  1200000       2074 bytes  crc32 $2BDBDDF6
+;     load BRCMCLM.BLB 1300000       2676 bytes  crc32 $346D4B26
+;
+; BRCMFW.BIN and BRCMCLM.BLB are Firmware/CYW43455/ in this repository.
+; BRCMNV.TXT is the board's own NVRAM and is NOT - it is calibration
+; and identity data - so #NV_LEN and #NV_CRC below describe one board's
+; file. tools/a64/a64_sdio_check.py --scan builds a copy of this program
+; with those two constants naming the NVRAM text it uploads instead.
+;
+; THE THIRD LINE IS NEW ON 2026-08-27 AND IT IS THE POINT OF THE DAY.
+; The CLM blob was on the stick and was never loaded, so the PHY had no
+; regulatory data, so every escan came back BCME_NOTUP (-4) even though
+; WLC_UP itself returned 0. tools/anvil_putfile.py put all three files
+; there and records the 8.3 mapping; the long names do not fit a short
+; directory entry, which is why BRCMCLM.BLB and not .clm_blob.
+;
+; A PAYLOAD TAKES NO ARGUMENTS, so it cannot be told what it was given.
+; It CRCs each buffer against the constant below and refuses on a
+; mismatch. That guard is not ceremony - it caught a real bug on the
+; first run of the bring-up payload. If a CRC line prints WRONG, the
+; `load` did not happen, loaded a different file, or loaded it
+; somewhere else, and nothing below the CRC check would be meaningful.
+;
+; ======================================================================
+; WHAT EACH STOPPING POINT MEANS
+; ======================================================================
+;   stops at "crc"          the DRAM does not hold what this expects.
+;                           Re-run Anvil's load; nothing is wrong with
+;                           the radio.
+;   stops at "SdioInit"     the bus. Check the mailbox preamble above.
+;   stops at "Cyw43Attach"  the chip. This is the ground already proven
+;                           on 2026-08-26; a failure here is a
+;                           regression, not new territory.
+;   stops at "F2 ready"     THE FIRMWARE DID NOT BOOT. Image and NVRAM
+;                           both verified, so look at the reset vector
+;                           and at whether the ARM left reset.
+;   stops at "wifi up"      one of three ioctls inside Cyw43WifiUp was
+;                           refused. The trace lines name which: 13/14
+;                           are the CLM chunks, 15/16 the clmload_status
+;                           query, 3/4 the event mask and 5/6 WLC_UP.
+;                           A return of -5 is the special one - the blob
+;                           uploaded and the firmware rejected it, and
+;                           "clm status" below carries its reason.
+;   "scan started" then     the transport can send but not receive, or
+;   nothing                 the event mask never took. Look at the
+;                           frame counters - rx frames 0 with a clean
+;                           scan start is a receive-side fault, and rx
+;                           frames non-zero with events 0 is the mask.
+;   networks 0, DONE        the firmware completed a scan and saw
+;                           nothing. That is a REAL ANSWER and a
+;                           different failure from a timeout. Check the
+;                           antenna before the code.
+;
+; ======================================================================
+; STOPS INSIDE THE TRANSPORT, WITH NO RESULT LINE AT ALL
+; ======================================================================
+; Everything above this line reports itself: each call prints a row with
+; its result, so "the last row printed" names the failing call. The
+; transport does not work that way. Cyw43WifiUp is one call containing
+; three ioctls, a poll loop and two chunking loops, and its result line
+; is printed only if it comes back - so a hang in there produces
+; "-- transport --" and then silence, which names nothing.
+;
+; So the transport ANNOUNCES ITSELF. probe_Trace below prints a line
+; before every step it is about to attempt and drains the UART before
+; attempting it, and the last such line is the failing step:
+;
+;     -- transport --
+;       .. 1  Cyw43WifiUp entered
+;       .. 2  transport bookkeeping reset
+;       .. 3  SENDING bsscfg:event_msgs      <- stopped here on 2026-08-27
+;
+; THAT EXACT STOP HAS HAPPENED AND ITS CAUSE IS WORTH KNOWING, because
+; it will happen again in some other file. Step 3 died inside
+; Cyw43SetEventMask on an unaligned 32-bit store: the iovar name is
+; seventeen characters and a NUL, so the u32 after it lands two bytes
+; off a word boundary, and with the MMU off every data access is
+; Device-nGnRnE where an unaligned access is an Alignment fault - with
+; no vector installed, and therefore no message. Fixed at source; the
+; long argument is at cyw43_PutLE32 in Lib/cyw43.pi4.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43_rx_glom.pi4"
+XIncludeFile "RaspberryPi4/Lib/cyw43.pi4"
+
+; ----------------------------------------------------------------------
+;  Where Anvil's `load` put the two files, and what they must contain.
+;
+;  THE CRCs ARE THE CONTRACT. They were measured on the board by reading
+;  each file back off the stick, not by CRCing a serial transfer, so
+;  they cover the whole path from the stick to DRAM.
+; ----------------------------------------------------------------------
+#FW_ADDR = $01000000
+#FW_LEN  = 609309
+#FW_CRC  = $B8B12CED
+
+#NV_ADDR = $01200000
+#NV_LEN  = 2074
+#NV_CRC  = $2BDBDDF6
+
+; The CLM blob. THE CRC WAS MEASURED ON THE BOARD, by loading
+; BRCMCLM.BLB off the stick and running Anvil's own crc32 over it, and
+; it agrees with zlib.crc32 of Firmware/CYW43455/
+; brcmfmac43455-sdio.clm_blob on the host - two independent
+; implementations of the same polynomial, which is what makes the number
+; worth carrying.
+;
+; $01300000 IS CLEAR OF EVERYTHING ELSE. The NVRAM ends at $012008 1A,
+; the cook workspace is at $01210000 and the verify scratch at
+; $01220000, so there is a megabyte of daylight before this. It is
+; inside Anvil's low payload window (00400000 to 07EFFFFF), which is
+; checked by `load` and not by this file.
+#CLM_ADDR = $01300000
+#CLM_LEN  = 2676
+#CLM_CRC  = $346D4B26
+
+; Working buffers, placed after the two blobs. The NVRAM cook needs
+; length + 8 and the verify scratch is brcmfmac's own MEMBLOCK.
+#NV_WORK      = $01210000
+#NV_WORK_MAX  = 4096
+#SCRATCH      = $01220000
+#SCRATCH_LEN  = 2048
+
+; Mailbox clock id 1 = EMMC. U-Boot v2025.01
+; arch/arm/mach-bcm283x/include/mach/mbox.h line 229. NOT 12, which is EMMC2's.
+#CLOCK_ID_EMMC = 1
+
+; ----------------------------------------------------------------------
+;  The scan's budget, and it is the CALLER's, deliberately.
+;
+;  A scan ends on an EVENT, never on a delay. Cyw43ScanPoll returns
+;  RUNNING for as long as nothing has arrived, and this program decides
+;  when to give up - because "no completion event in eight seconds" and
+;  "completed with zero networks" are different failures with different
+;  causes, and a library that timed out internally would report them
+;  identically.
+;
+;  Eight seconds is generous: a full dual-band active scan is commonly
+;  three to five. See the deadman arithmetic in the header for why it is
+;  not more.
+; ----------------------------------------------------------------------
+#SCAN_BUDGET_MS = 8000
+#SCAN_SLICE_MS  = 50
+
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; PrintNl and PrintDec ARE NOT DEFINED HERE. uart.pi4 already has both
+; (lines 1155 and 1119) and defining them again is a duplicate-procedure
+; error rather than a shadow, which is the compiler being helpful.
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  probe_Count - a count that is allowed to say it never happened.
+;
+;  A NEGATIVE VALUE MEANS NOT COMPARED and prints as those words. This
+;  convention came out of the 2026-08-26 bench run, where a control
+;  printed "0" while both of the reads it was comparing had failed and
+;  nothing had been walked. Zero out of zero is arithmetically true,
+;  reads as a pass, and was the most misleading line in the log. Every
+;  count in this program that can be skipped goes through here.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  THE TRANSPORT INSTRUMENT.
+;
+;  cyw43.pi4 cannot print - a library never includes a library - so it
+;  announces each transport step through a callback and this is the
+;  handler. See THE TRACE SEAM in cyw43.pi4 for the codes.
+;
+;  THE UartDrain() IS THE WHOLE POINT AND IT IS NOT TIDINESS. The
+;  announcement is made BEFORE the dangerous call, so if that call never
+;  returns, this line is the last thing the board will ever say and it
+;  has to be OUT OF THE CHIP before the call is attempted. Without the
+;  drain it sits in the PL011 transmit FIFO, the CPU blocks or faults
+;  inside the call, nothing ever pushes the FIFO out, and the one line
+;  that was supposed to survive the hang dies with everything else.
+;
+;  That was learned twice on 2026-08-26 and paid for again on
+;  2026-08-27, when the payload printed "-- transport --" and then
+;  nothing at all - and the cause turned out to be an alignment fault
+;  three instructions into Cyw43SetEventMask that this instrument would
+;  have named in one line.
+;
+;  A NUMBER AND A NAME, NOT ONE OR THE OTHER. The number survives a
+;  rename of the text; the text is what gets read at two in the
+;  morning. Printing both costs nothing and means a log filed today is
+;  still readable when the codes have moved.
+; ----------------------------------------------------------------------
+Procedure.i probe_StepName(step.i)
+  Select step
+    Case 1
+      ProcedureReturn "Cyw43WifiUp entered"
+    Case 2
+      ProcedureReturn "transport bookkeeping reset"
+    Case 3
+      ProcedureReturn "SENDING bsscfg:event_msgs"
+    Case 4
+      ProcedureReturn "event mask returned"
+    Case 5
+      ProcedureReturn "SENDING WLC_UP"
+    Case 6
+      ProcedureReturn "WLC_UP returned"
+    Case 7
+      ProcedureReturn "SENDING the escan request"
+    Case 8
+      ProcedureReturn "escan request returned"
+    Case 9
+      ProcedureReturn "no credit - draining to earn one"
+    Case 10
+      ProcedureReturn "pushing the request frame at F2"
+    Case 11
+      ProcedureReturn "WAITING for the reply"
+    Case 12
+      ProcedureReturn "the wait returned"
+    Case 13
+      ProcedureReturn "SENDING one clmload chunk"
+    Case 14
+      ProcedureReturn "every clmload chunk was accepted"
+    Case 15
+      ProcedureReturn "ASKING clmload_status"
+    Case 16
+      ProcedureReturn "clmload_status answered"
+    Case 20
+      ProcedureReturn "poll starting"
+    Case 21
+      ProcedureReturn "poll gave up on its budget"
+    Case 22
+      ProcedureReturn "F2 read - the fixed first 64 bytes"
+    Case 23
+      ProcedureReturn "F2 read - the rest of the frame"
+    Case 24
+      ProcedureReturn "F2 block-mode chunk"
+    Case 25
+      ProcedureReturn "F2 byte-mode chunk"
+  EndSelect
+  ProcedureReturn "unknown step - see THE TRACE SEAM in cyw43.pi4"
+EndProcedure
+
+Procedure probe_Trace(step.i)
+  UartWriteStr("  .. ")
+  PrintDec(step)
+  UartWriteStr("  ")
+  UartWriteStr(probe_StepName(step))
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure probe_Count(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  If v < 0
+    UartWriteStr("NOT COMPARED - the step that would have produced it did not run")
+  Else
+    PrintDec(v)
+  EndIf
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  crc32 over a DRAM buffer - the ordinary reflected CRC-32, polynomial
+;  $EDB88320, both inversions.
+;
+;  TABLE-DRIVEN, WITH THE TABLE BUILT AT RUN TIME FROM THE POLYNOMIAL.
+;  That is the whole of the trick and it is worth a paragraph, because
+;  the obvious two options are both worse:
+;
+;    * BIT BY BIT is what this was first, and it is eight shifts per
+;      byte. On the board that is milliseconds and nobody would care.
+;      In the offline gate it is the single most expensive thing in the
+;      run - 609,309 bytes times eight - and it made a gate that should
+;      take a minute take twenty-five.
+;
+;    * A TYPED-OUT 256-ENTRY TABLE is eight times faster and is 256
+;      constants nobody can check by eye against the polynomial they
+;      came from. This project does not carry numbers like that.
+;
+;  Building the table from the polynomial at start-up costs 2048
+;  iterations once, keeps $EDB88320 as the ONLY constant in the whole
+;  routine, and leaves the per-byte loop at one shift and one lookup.
+;  Checkable and fast, rather than one or the other.
+; ----------------------------------------------------------------------
+#CRC32_POLY = $EDB88320
+Global Dim crcTab.l[256]
+Global crcTabReady.i = 0
+
+Procedure Crc32Init()
+  Define i.i
+  Define k.i
+  Define c.i
+  If crcTabReady = 1
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To 255
+    c = i
+    For k = 0 To 7
+      If (c & 1) = 1
+        c = (c >> 1) ! #CRC32_POLY
+      Else
+        c = c >> 1
+      EndIf
+    Next
+    crcTab[i] = c
+  Next
+  crcTabReady = 1
+EndProcedure
+
+; THE TABLE BASE AND THE CURSOR ARE HOISTED OUT OF THE LOOP, and that
+; is not micro-optimisation for its own sake. This runs 609,309 times
+; per call and twice per run; leaving `@crcTab[0]` inside the loop makes
+; the compiler recompute an array base address every byte. On the board
+; that is invisible. In the offline gate, which executes every one of
+; those instructions in Python, it was the difference between a gate
+; that takes a couple of minutes and one that takes twenty.
+Procedure.i Crc32(*p, n.i)
+  Define c.i
+  Define i.i
+  Define idx.i
+  Define tab.i
+  Define q.i
+  Crc32Init()
+  tab = @crcTab[0]
+  q = *p
+  c = $FFFFFFFF
+  For i = 1 To n
+    idx = (c ! PeekA(q)) & $FF
+    ; PeekN, not the .l element: .i is 64 bits here and a .l read
+    ; sign-extends, so a table entry with bit 31 set would come back
+    ; negative and poison every byte after it.
+    c = PeekN(tab + (idx << 2)) ! ((c >> 8) & $00FFFFFF)
+    q = q + 1
+  Next
+  ProcedureReturn (~c) & $FFFFFFFF
+EndProcedure
+
+
+Procedure.i Main()
+  Define ok.i
+  Define hz.i
+  Define i.i
+  Define j.i
+  Define r.i
+  Define crc.i
+  Define t0.i
+  Define budget.i
+  Define slices.i
+  Define stop.i
+  Define done.i
+  Define found.i
+  Define ssid.i
+  Define n.i
+
+  PrintNl()
+  UartWriteStr("=== pi4 CYW43455 scan ===")
+  PrintNl()
+  PrintNl()
+
+  ; ====================================================================
+  ; 1 - what is in DRAM
+  ; ====================================================================
+  UartWriteStr("-- the blobs, as loaded --")
+  PrintNl()
+
+  HexLine("firmware at      ", #FW_ADDR, 8)
+  Line("firmware bytes   ", #FW_LEN)
+  crc = Crc32(#FW_ADDR, #FW_LEN)
+  HexLine("firmware crc32   ", crc, 8)
+  If crc <> #FW_CRC
+    HexLine("  EXPECTED       ", #FW_CRC, 8)
+    UartWriteStr("  WRONG - Anvil's load did not put BRCMFW.BIN here.")
+    PrintNl()
+    UartWriteStr("=== stopped at crc ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  crc = Crc32(#NV_ADDR, #NV_LEN)
+  HexLine("nvram crc32      ", crc, 8)
+  If crc <> #NV_CRC
+    HexLine("  EXPECTED       ", #NV_CRC, 8)
+    UartWriteStr("  WRONG - Anvil's load did not put BRCMNV.TXT here.")
+    PrintNl()
+    UartWriteStr("=== stopped at crc ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; THE CLM IS CRC'd LIKE THE OTHER TWO AND FOR A SHARPER REASON. The
+  ; firmware image is verified again by read-back after upload, so a bad
+  ; one is caught twice. The CLM is not: clmload_status reports whether
+  ; the firmware could PARSE what it assembled, which a blob that is
+  ; wrong in the middle can still pass. This CRC is the only check that
+  ; the 2676 bytes about to be handed to the radio are the 2676 bytes
+  ; that came out of RPi-Distro.
+  Line("clm bytes        ", #CLM_LEN)
+  crc = Crc32(#CLM_ADDR, #CLM_LEN)
+  HexLine("clm crc32        ", crc, 8)
+  If crc <> #CLM_CRC
+    HexLine("  EXPECTED       ", #CLM_CRC, 8)
+    UartWriteStr("  WRONG - Anvil's load did not put BRCMCLM.BLB here.")
+    PrintNl()
+    UartWriteStr("  Type:  load BRCMCLM.BLB 1300000")
+    PrintNl()
+    UartWriteStr("=== stopped at crc ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 2 - the bus. The mailbox preamble is not optional; see the header.
+  ; ====================================================================
+  UartWriteStr("-- bus --")
+  PrintNl()
+
+  ok = MailboxInit()
+  Line("mailbox init (want 1)", ok)
+  If ok = 0
+    UartWriteStr("=== stopped at the mailbox ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  hz = MailboxClockRate(#CLOCK_ID_EMMC)
+  Line("EMMC clock Hz (id 1)", hz)
+  If hz <= 0
+    UartWriteStr("  the firmware would not report the EMMC clock, and")
+    PrintNl()
+    UartWriteStr("  SdioInit refuses to guess a base clock.")
+    PrintNl()
+    UartWriteStr("=== stopped at the clock ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  SdioSetBaseClockKhz(hz / 1000)
+  Line("base clock kHz   ", hz / 1000)
+
+  ok = SdioAssertWlOn()
+  Line("WL_ON asserted (want 1)", ok)
+
+  ok = SdioInit()
+  Line("SdioInit (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the bus ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = SdioEnableFunction(1)
+  Line("enable F1 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at function 1 ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 3 - the chip
+  ; ====================================================================
+  UartWriteStr("-- chip --")
+  PrintNl()
+
+  ok = Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Line("Cyw43SetIo (want 1)", ok)
+  ok = Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+  Line("Cyw43SetBlockIo (want 1)", ok)
+
+  ok = Cyw43Attach()
+  Line("Cyw43Attach (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the chip ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  HexLine("chip id          ", Cyw43ChipId(), 4)
+  Line("chip rev         ", Cyw43ChipRev())
+  Line("F1 block size    ", Cyw43F1BlockSize())
+  Line("F1 byte-mode max ", Cyw43ByteMax())
+  Line("F2 block size    ", Cyw43F2BlockSize())
+
+  ok = Cyw43SetBlockMode(1)
+  Line("block mode on (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 4 - the firmware
+  ; ====================================================================
+  UartWriteStr("-- firmware --")
+  PrintNl()
+
+  ok = Cyw43PrepareDownload()
+  Line("Cyw43PrepareDownload (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped before the download ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  HexLine("ram base         ", Cyw43RamBase(), 8)
+  Line("ram size bytes   ", Cyw43RamSize())
+
+  ok = Cyw43UploadFirmware(#FW_ADDR, #FW_LEN, #SCRATCH, #SCRATCH_LEN)
+  Line("Cyw43UploadFirmware (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    HexLine("  first bad addr ", Cyw43BadAddr(), 8)
+    UartWriteStr("=== stopped at the image ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  HexLine("reset vector     ", Cyw43ResetVector(), 8)
+
+  ok = Cyw43UploadNvram(#NV_ADDR, #NV_LEN, #NV_WORK, #NV_WORK_MAX, #SCRATCH, #SCRATCH_LEN)
+  Line("Cyw43UploadNvram (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the nvram ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Line("nvram after cooking", Cyw43NvramBytes())
+
+  ok = Cyw43Start()
+  Line("Cyw43Start (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped releasing the ARM ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43HtClock()
+  Line("Cyw43HtClock (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    UartWriteStr("=== stopped at the HT clock ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ok = Cyw43AnnounceHost()
+  Line("Cyw43AnnounceHost (want 1)", ok)
+
+  ; ====================================================================
+  ; 5 - F2 READY. THIS IS THE FIRMWARE SAYING IT BOOTED.
+  ;
+  ; There is no mailbox, no magic word and no version read. The host
+  ; enables function 2 and polls CCCR IORx for bit 2; that bit going
+  ; from 0 to 1 is the whole signal. Before the upload it reads 0 and
+  ; that is CORRECT.
+  ; ====================================================================
+  ok = SdioEnableFunction(2)
+  Line("enable F2 (want 1)", ok)
+  If ok = 0
+    UartWriteStr("  ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    UartWriteStr("  F2 NEVER CAME READY - the firmware did not boot.")
+    PrintNl()
+    UartWriteStr("=== stopped at F2 ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 6 - the transport
+  ; ====================================================================
+  UartWriteStr("-- transport --")
+  PrintNl()
+
+  ; THE INSTRUMENT GOES ON HERE, not at the top, because everything
+  ; above this line already reports itself: each call has a result and
+  ; a printed row, and a failure above stops with a named message. The
+  ; transport is the part with nowhere to stop - three ioctls, a poll
+  ; loop and two chunking loops under that, all inside one call that
+  ; either returns a number or does not return.
+  ;
+  ; SECOND ARGUMENT 0 = COARSE. The fine points sit inside cyw43_Poll
+  ; and cyw43_F2Xfer, which run thousands of times a second; printing
+  ; and draining at each one does not merely make a long log, it changes
+  ; the timing enough that the F2 FIFO overruns and the scan loses
+  ; results. Pass 1 only when a call is already known to hang and the
+  ; question is which loop inside it - and expect the scan itself to be
+  ; unusable in that run.
+  Cyw43SetTrace(@probe_Trace, 0)
+
+  ; THE CLM GOES IN AS AN ARGUMENT rather than as a call of its own, and
+  ; the reason is Cyw43TransportReset. That reset zeroes the SDPCM
+  ; sequence and the BCDC request id and lives at the top of
+  ; Cyw43WifiUp, so anything this program sent "before Cyw43WifiUp"
+  ; would be sent with numbers the firmware then watches go backwards.
+  ; The library owns the ordering; see Cyw43WifiUp's header.
+  ; #CYW43_EVMASK_SCAN, NOT JOIN. This instrument's whole value is that
+  ; every transport counter reconciles against the frames a clean scan
+  ; produces, and the join mask lets ten more event types in - see the
+  ; argument at Cyw43SetEventMask. The join has its own payload.
+  r = Cyw43WifiUp(#CLM_ADDR, #CLM_LEN, #CYW43_EVMASK_SCAN, 2000)
+  Line("Cyw43WifiUp (want 0)", r)
+  ; THE CLM ROWS ARE PRINTED ON EVERY PATH, pass or fail, because they
+  ; are the diagnosis. chunks 3 of 3 with status 0 is the good answer;
+  ; chunks 2 with a negative return names the chunk that was refused;
+  ; chunks 3 with a positive status means the radio took every byte and
+  ; then rejected the blob, which is a different bug entirely.
+  Line("  clm chunks sent", Cyw43ClmChunks())
+  probe_Count("  clm status (want 0)", Cyw43ClmStatus())
+  If r <> 0
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    Line("  rx frames      ", Cyw43RxFrames())
+    If r = -5
+      UartWriteStr("  -5 is CLMBAD: every chunk was accepted and the firmware")
+      PrintNl()
+      UartWriteStr("  then refused the assembled blob. The bytes in DRAM CRC'd")
+      PrintNl()
+      UartWriteStr("  correctly, so suspect the chunk flags before the file.")
+      PrintNl()
+    EndIf
+    UartWriteStr("=== stopped at wifi up ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 6b - WHAT THE RADIO SAYS IT IS NOW HOLDING
+  ;
+  ; None of these three is required to scan. All three are one ioctl
+  ; each and each answers a question that was previously argued about
+  ; rather than measured, so they are sent once, here, after the CLM and
+  ; after WLC_UP where every one of them is legal.
+  ;
+  ; A REFUSAL HERE IS NOT FATAL AND MUST NOT BE. These are instruments,
+  ; and an instrument that aborts the run it was measuring is worse than
+  ; no instrument. Each prints its own verdict and the scan goes ahead.
+  ; ====================================================================
+  UartWriteStr("-- what the radio says --")
+  PrintNl()
+
+  ; "clmver" - the first HUMAN-READABLE proof the CLM went in, as
+  ; distinct from clmload_status saying the transfer completed. Several
+  ; \n-separated Key: value lines. Printed byte by byte with everything
+  ; unprintable turned into a dot and newlines turned into spaces,
+  ; because this is firmware-supplied text and it is not this program's
+  ; job to let it move the cursor.
+  r = Cyw43GetClmVersion(2000)
+  Line("clmver rc (want 0)", r)
+  If r = 0
+    UartWriteStr("  clmver  ")
+    ssid = Cyw43ReplyPtr()
+    n = Cyw43ReplyLen()
+    ; A While AND NOT A For, because this loop has to STOP at the first
+    ; NUL and assigning to a For's counter to break out of it is not
+    ; something this language promises anything about. The reply buffer
+    ; is 128 bytes of which the string uses maybe sixty; the rest is
+    ; whatever the firmware left there.
+    j = 0
+    While j < n And PeekA(ssid + j) <> 0
+      If PeekA(ssid + j) >= 32 And PeekA(ssid + j) <= 126
+        UartWrite(PeekA(ssid + j))
+      Else
+        UartWrite(32)
+      EndIf
+      j = j + 1
+    Wend
+    PrintNl()
+  EndIf
+
+  ; "country" - READ, NEVER WRITTEN, and the argument for that is in
+  ; Cyw43GetCountry's header in cyw43.pi4. The short version: brcmfmac
+  ; does not set it at bring-up, this board's NVRAM has no ccode line at
+  ; all, and the firmware picks a domain by itself. This row is here so
+  ; that what it picked stops being a matter of opinion.
+  ;
+  ; The struct is country_abbrev[4], le32 rev, ccode[4].
+  r = Cyw43GetCountry(2000)
+  Line("country rc (want 0)", r)
+  If r = 0
+    ssid = Cyw43ReplyPtr()
+    UartWriteStr("  country abbrev  ")
+    For j = 0 To 1
+      If PeekA(ssid + j) >= 32 And PeekA(ssid + j) <= 126
+        UartWrite(PeekA(ssid + j))
+      Else
+        UartWrite(46)
+      EndIf
+    Next
+    UartWriteStr("   ccode  ")
+    For j = 8 To 9
+      If PeekA(ssid + j) >= 32 And PeekA(ssid + j) <= 126
+        UartWrite(PeekA(ssid + j))
+      Else
+        UartWrite(46)
+      EndIf
+    Next
+    PrintNl()
+    ; rev is a SIGNED 32-bit field and -1 is a legal, meaningful value
+    ; ("unspecified"), so it is sign-extended before printing. Read
+    ; unsigned it would print 4294967295, which looks like garbage and
+    ; is in fact the normal answer.
+    n = PeekA(ssid + 4) | (PeekA(ssid + 5) << 8) | (PeekA(ssid + 6) << 16) | (PeekA(ssid + 7) << 24)
+    If n >= $80000000
+      n = n - $100000000
+    EndIf
+    Line("  country rev    ", n)
+  EndIf
+
+  ; "scan_ver" - v1 or v2, settled by one ioctl instead of by argument.
+  ;
+  ; brcmfmac decides purely on WHETHER THE NAME EXISTS: feature.c:184-201
+  ; enables BRCMF_FEAT_SCAN_V2 for any error other than
+  ; -BRCMF_FW_UNSUPPORTED, and BRCMF_FW_UNSUPPORTED is 23 (feature.c:20).
+  ; So status -23 means v1 and ANYTHING ELSE means v2. Our escan request
+  ; is v1 and byte-for-byte the Pico W's, which has been scanning for
+  ; months - this row is what turns "probably right" into a fact.
+  r = Cyw43ScanVerProbe(2000)
+  Line("scan_ver rc      ", r)
+  Line("scan_ver status  ", Cyw43ScanVerStatus())
+  Line("scan_ver value   ", Cyw43ScanVer())
+  If Cyw43ScanVerStatus() = -23
+    UartWriteStr("  status -23 is BRCMF_FW_UNSUPPORTED: this firmware does")
+    PrintNl()
+    UartWriteStr("  NOT know scan_ver, so escan v1 is correct - which is")
+    PrintNl()
+    UartWriteStr("  what this driver sends.")
+    PrintNl()
+  Else
+    UartWriteStr("  status is NOT -23, so brcmfmac would enable SCAN_V2 and")
+    PrintNl()
+    UartWriteStr("  send brcmf_escan_params_v2_le instead. See cfg80211.c")
+    PrintNl()
+    UartWriteStr("  lines 1451-1466. This driver still sends v1.")
+    PrintNl()
+  EndIf
+
+  ; "sup_wpa" - WHO RUNS THE SUPPLICANT. The same existence test as
+  ; scan_ver above, on the name feature.c:341 uses, and the answer
+  ; decides whether WPA2 costs two hundred lines of ioctls or a host
+  ; PBKDF2-SHA1 and a hand-written four-way handshake. Asked here rather
+  ; than in the join payload because this instrument already runs on
+  ; every bench session and the answer is wanted BEFORE anything is
+  ; written against it. Cyw43SupWpaProbe carries the full argument.
+  r = Cyw43SupWpaProbe(2000)
+  Line("sup_wpa rc       ", r)
+  Line("sup_wpa status   ", Cyw43SupWpaStatus())
+  Line("sup_wpa value    ", Cyw43SupWpa())
+  Line("sup_wpa present  ", Cyw43SupWpaPresent())
+  If Cyw43SupWpaPresent() = 0
+    UartWriteStr("  status -23 is BRCMF_FW_UNSUPPORTED: NO firmware supplicant.")
+    PrintNl()
+    UartWriteStr("  The HOST must do PBKDF2-SHA1 4096 and the EAPOL four-way")
+    PrintNl()
+    UartWriteStr("  handshake itself. That is a much larger job - see")
+    PrintNl()
+    UartWriteStr("  Cyw43SupWpaProbe in cyw43.pi4.")
+    PrintNl()
+  Else
+    UartWriteStr("  NOT -23, so brcmfmac would set BRCMF_FEAT_FWSUP: the")
+    PrintNl()
+    UartWriteStr("  FIRMWARE can run the supplicant. Set bsscfg:sup_wpa = 1,")
+    PrintNl()
+    UartWriteStr("  hand it the passphrase, and it does the handshake.")
+    PrintNl()
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 7 - the scan
+  ; ====================================================================
+  UartWriteStr("-- scan --")
+  PrintNl()
+
+  r = Cyw43ScanStart(0, 2000)
+  Line("Cyw43ScanStart (want 0)", r)
+  If r <> 0
+    Line("  ioctl status   ", Cyw43IoctlStatus())
+    UartWriteStr("=== stopped starting the scan ===")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; The guard timer is HERE and not in the library. See #SCAN_BUDGET_MS.
+  ; TWO COUNTERS, NOT ONE. `slices` counts what actually ran and is what
+  ; gets printed; `stop` is the loop's exit flag. Using the slice count
+  ; itself to break the loop - setting it to the budget on completion -
+  ; makes the printed number ALWAYS equal the budget, which is a row
+  ; that looks like a measurement and is a constant. The first run of
+  ; this program printed "slices used 160" for a scan that finished in
+  ; six.
+  done = -1
+  slices = 0
+  stop = 0
+  budget = #SCAN_BUDGET_MS / #SCAN_SLICE_MS
+  While stop = 0 And slices < budget
+    r = Cyw43ScanPoll(#SCAN_SLICE_MS)
+    slices = slices + 1
+    If r = 2
+      done = 0
+      stop = 1
+    EndIf
+    If r = 3
+      done = 1
+      stop = 1
+    EndIf
+  Wend
+
+  Line("slices used      ", slices)
+  Line("slice budget     ", budget)
+  If done = -1
+    UartWriteStr("  NO COMPLETION EVENT within the budget. That is NOT the")
+    PrintNl()
+    UartWriteStr("  same as a scan that found nothing - see the header.")
+    PrintNl()
+  ElseIf done = 0
+    UartWriteStr("  scan completed, status SUCCESS")
+    PrintNl()
+  Else
+    UartWriteStr("  scan completed, status ")
+    PrintDec(Cyw43EventStatus())
+    UartWriteStr(" - see fweh.h lines 114-129")
+    PrintNl()
+  EndIf
+  PrintNl()
+
+  ; ====================================================================
+  ; 8 - THE DELIVERABLE
+  ; ====================================================================
+  UartWriteStr("-- networks --")
+  PrintNl()
+
+  found = Cyw43ScanCount()
+  Line("networks found   ", found)
+  For i = 0 To found - 1
+    UartWriteStr("  ")
+    ; The index, right-padded to two so the columns line up.
+    If i < 10
+      UartWrite(32)
+    EndIf
+    PrintDec(i)
+    ; THE CONTROL CHANNEL, and the chanspec's centre channel beside it
+    ; when they differ - which on a 40 or 80 MHz AP they always do. The
+    ; first real scan on this board printed "ch 58" for an 80 MHz
+    ; network whose control channel is 52, because this column used to
+    ; be the chanspec's byte. 58 is not a channel anything sits on.
+    ; cfg80211.c:3348 is the ruling; the long note is in cyw43_ParseBss.
+    UartWriteStr("  ch ")
+    n = Cyw43ScanChannel(i)
+    If n < 10
+      UartWrite(32)
+    EndIf
+    PrintDec(n)
+    If Cyw43ScanChanspecChannel(i) <> n
+      UartWriteStr("/c")
+      PrintDec(Cyw43ScanChanspecChannel(i))
+    Else
+      UartWriteStr("    ")
+    EndIf
+    UartWriteStr("  ")
+    n = Cyw43ScanRssi(i)
+    If n > -100
+      UartWrite(32)
+    EndIf
+    PrintDec(n)
+    UartWriteStr(" dBm  ")
+    If Cyw43ScanPrivate(i) = 1
+      UartWriteStr("enc  ")
+    Else
+      UartWriteStr("open ")
+    EndIf
+    UartWriteStr(" ")
+    For j = 0 To 5
+      PutHexN(Cyw43ScanBssidByte(i, j), 2)
+      If j < 5
+        UartWrite(58)
+      EndIf
+    Next
+    UartWriteStr("  ")
+    ; THE SSID IS UNTRUSTED TEXT FROM THE AIR and is printed byte by
+    ; byte with everything unprintable replaced, rather than handed to
+    ; a string printer. A hidden network's SSID is all NULs and a
+    ; malicious one can be any 32 bytes at all; neither should be able
+    ; to move the cursor or end the line.
+    ssid = Cyw43ScanSsid(i)
+    n = Cyw43ScanSsidLen(i)
+    If n = 0
+      UartWriteStr("<hidden>")
+    Else
+      For j = 0 To n - 1
+        If PeekA(ssid + j) >= 32 And PeekA(ssid + j) <= 126
+          UartWrite(PeekA(ssid + j))
+        Else
+          UartWrite(46)
+        EndIf
+      Next
+    EndIf
+    PrintNl()
+  Next
+  PrintNl()
+
+  ; ====================================================================
+  ; 9 - what the transport saw, whether or not it worked
+  ;
+  ; EVERY COUNTER HERE IS A DIFFERENT BUG. "networks 0" with rx frames 0
+  ; is a receive-side fault; with rx frames high and events 0 it is the
+  ; event mask; with bad headers high it is the framing. One number
+  ; would have hidden all three.
+  ; ====================================================================
+  UartWriteStr("-- transport counters --")
+  PrintNl()
+  Line("rx frames        ", Cyw43RxFrames())
+  Line("bad headers      ", Cyw43RxBadHdr())
+  Line("too big          ", Cyw43RxTooBig())
+  Line("too short        ", Cyw43RxShort())
+  Line("other channels   ", Cyw43RxOther())
+  Line("other events     ", Cyw43EvOther())
+  Line("bad event prefix ", Cyw43EvBadIsland())
+  ; ONE PER SCAN IS THE NORMAL READING AND IT IS NOT A FAULT. A frame
+  ; twelve bytes long whose SDPCM data offset is also twelve is a header
+  ; with no payload behind it - the firmware handing the host a credit
+  ; update with nothing attached. It was captured on the bench on
+  ; 2026-08-27 and its bytes are transcribed in cyw43_RxFrame; until
+  ; then it was landing in "bad event prefix" above, which is why every
+  ; clean scan on this board used to report exactly one anomaly. That
+  ; row is now expected to be ZERO and this one is not.
+  Line("empty events     ", Cyw43EvEmpty())
+  Line("credit stalls    ", Cyw43Stalls())
+  Line("table overflow   ", Cyw43ScanOverflow())
+  ; NON-ZERO IS THE NORMAL READING HERE AND IS NOT A FAULT. An escan
+  ; reports one PARTIAL event per beacon or probe response the radio
+  ; heard, so one access point arrives several times; the table merges
+  ; them by BSSID and this is how many merged. The first bench run that
+  ; exposed the behaviour printed five networks for two real ones -
+  ; three folds. "networks found" plus this is the number of PARTIAL
+  ; results the firmware delivered, and that is the number that has to
+  ; square with "rx frames" above.
+  Line("duplicates folded", Cyw43ScanDuplicates())
+  ; TWO CROSS-CHECKS, AND THEY NO LONGER MEAN THE SAME THING.
+  ;
+  ; "sync id mismatch" is still a pure layout alarm: non-zero means the
+  ; field is not where this driver thinks it is.
+  ;
+  ; "channel mismatch" IS NOT, since 2026-08-27. It counts records whose
+  ; ctl_ch and chanspec channel differ, which is EVERY 40 or 80 MHz
+  ; access point and is completely normal - the first scan on this board
+  ; raised two of them and both were the same 5 GHz network. It is only
+  ; an alarm when it is non-zero and the list above shows no 5 GHz rows
+  ; (nothing above channel 14) and no "/c" suffixes. Read it against the
+  ; channel column, never on its own.
+  Line("channel mismatch ", Cyw43ChanMismatch())
+  Line("sync id mismatch ", Cyw43SyncBad())
+  Line("bss_info length  ", Cyw43BssLength())
+  PrintNl()
+
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

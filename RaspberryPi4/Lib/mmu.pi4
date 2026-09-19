@@ -1,0 +1,2614 @@
+; ======================================================================
+;  mmu.pi4 - the Cortex-A72 MMU and caches on the Raspberry Pi 4,
+;            brought up in stages, each one provable on the board
+; ======================================================================
+;
+;  STATUS: STAGES 0 AND 1. Stage 0 is PROVEN ON SILICON - the board
+;  reported SCTLR_EL2 = $30C50830, exactly what the firmware stub
+;  writes, so the MMU and both caches are confirmed off. Stage 1 - the
+;  page tables and the enable sequence - is written and builds, with
+;  the switch itself held behind #MMU_HAVE_EL2_REGS until the A64
+;  assembler learns TTBR0_EL2, TCR_EL2 and MAIR_EL2.
+;
+;  Stages 2, 3 and 4 are NOT started and must not be started here. Read
+;  THE STAGING PLAN below before adding anything.
+;
+;  ---- ON RISK, CALIBRATED -------------------------------------------
+;
+;  Earlier drafts of this file described a bad enable as bricking the
+;  board. THAT WAS WRONG AND IS CORRECTED HERE, because an overstated
+;  risk buys timid engineering, which is its own defect.
+;
+;  Nothing in this file can brick a Pi 4. A bad page table hangs the
+;  board or resets it in a loop, and the cost is A POWER CYCLE - a
+;  human reaching for the mains. A damaged boot image costs pulling the
+;  USB stick and rewriting it on a PC. The only genuinely unrecoverable
+;  part of a Pi 4 is the SPI bootloader EEPROM, and nothing in this
+;  project goes anywhere near it.
+;
+;  So the real cost of getting this wrong is an interrupted session,
+;  not hardware. The care taken here is therefore about DIAGNOSABILITY,
+;  not damage, and that is a genuinely different objective:
+;
+;    * a hang with the MMU half-enabled gives no console and no clue,
+;      so everything that CAN be verified is verified BEFORE the
+;      enabling instruction, and the table builder is a separate
+;      procedure from the switch precisely so its output can be dumped
+;      and read while the board is still in no danger at all;
+;    * there is no U-Boot to fall back to, which is why every stage is
+;      a payload built into _work/ and never a change to anvil.img;
+;    * the deadman turns a hang into an automatic reset, which is
+;      strictly better than waiting for a human.
+;
+;  ---- A QUICK EXAMPLE ------------------------------------------------
+;
+;    XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+;
+;    Procedure Main()
+;      UartInit(115200)
+;      ; What exception level are we actually at, and is the MMU on?
+;      ; Do not answer either of these from a comment in another file.
+;      Define el.i = MmuCurrentEl()
+;      Define s.i  = MmuSctlrEl2()
+;    EndProcedure
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NONE, and that is deliberate rather than lucky. House rule 10 (vault
+;  RULES.md, 2026-07-30) says a library never includes another
+;  library; the MAIN file lists what it needs. This file reads system
+;  registers and, later, writes memory it was handed the address of. It
+;  performs no I/O at all, so it needs no uart.pi4, and it allocates
+;  nothing, so it needs no memory.pi4. A caller that wants the numbers
+;  printed prints them.
+;
+;  There is a second reason beyond the house rule, and it is the more
+;  important one here. The stage that eventually turns the MMU on is
+;  the single most dangerous instruction sequence in this project. It
+;  must be auditable by reading ONE FILE end to end. A dependency is a
+;  place where something can happen between the store to the page table
+;  and the write to SCTLR_EL2, and there must be no such place.
+;
+;  This file also uses NO INTRINSICS, following the same rule the other
+;  libraries follow and state at RaspberryPi4/Lib/genet.pi4:1088 and
+;  RaspberryPi4/Lib/pcie.pi4:819: hand-written ASM blocks instead. So
+;  `dsb sy` and `isb` are written out here rather than reached through
+;  a64_barrier() (RaspberryPi4/Intrinsics/bcm2711_hardware.def:26-33),
+;  even though that intrinsic emits exactly those two instructions.
+;
+; ======================================================================
+;  WHY THIS FILE EXISTS
+; ======================================================================
+;
+;  Anvil is loaded by the firmware as kernel8.img at $200000 and runs
+;  at EL2 in AArch64 with, on every reading anyone has written down,
+;  the MMU and both caches OFF. With the MMU off, ARMv8-A treats every
+;  data access as Device and every instruction fetch as uncached. The
+;  cost of that has been measured three separate times:
+;
+;    * the HDMI console at 1920x1080x4 was so slow that a 130-line hex
+;      dump took minutes. Rewriting the copy loops from 43 instructions
+;      per four bytes down to about two helped, and did not touch the
+;      cause.
+;    * the graphics port plan concluded that memory bandwidth with the
+;      MMU off is the single biggest risk to the whole project, and
+;      that a shadow framebuffer cannot help while the MMU is off,
+;      because the shadow is exactly as slow as the real thing.
+;    * RaspberryPi4/Lib/genet.pi4:318-326 and
+;      RaspberryPi4/Lib/memory.pi4:239-244 both write the assumption
+;      down as a limitation they are working around.
+;
+;  Instruction fetch alone is a large win. A Cortex-A72 fetching every
+;  instruction from DRAM with no I-cache is not a 1.5 GHz part.
+;
+; ======================================================================
+;  WHY THIS FILE IS STAGED, AND WHY THE STAGING IS NOT OVER-CAUTIOUS
+; ======================================================================
+;
+;  TURNING THE CACHES ON CAN BREAK EVERY DRIVER THAT CURRENTLY WORKS.
+;
+;  XHCI, GENET, the VideoCore mailbox and USB mass storage all do DMA:
+;  a device writes DRAM and the CPU reads it, or the reverse. With the
+;  caches OFF that is automatically coherent, and those drivers have
+;  been proven on silicon IN THAT WORLD. With the caches ON, every one
+;  of those buffers needs correct clean/invalidate discipline.
+;
+;  Those drivers do contain `dc cvac` and `dc civac` calls already -
+;  RaspberryPi4/Lib/xhci.pi4 has ten sites, RaspberryPi4/Lib/display.pi4
+;  eight, RaspberryPi4/Monitor/anvil.pi4 eleven, RaspberryPi4/Lib/
+;  genet.pi4 three, RaspberryPi4/Lib/mailbox.pi4 three and
+;  RaspberryPi4/Lib/hdmiaudio.pi4 one. EVERY ONE OF THEM IS A NO-OP
+;  TODAY. They have never been exercised. Assume they are wrong until
+;  each one is proven otherwise, one driver at a time.
+;
+;  That is the "correct in the branch that never runs" shape this
+;  project has already been bitten by three times, and the reason the
+;  stage ordering below never turns two unknowns on at once.
+;
+;  It gets worse than a clean failure. Getting cache maintenance wrong
+;  produces INTERMITTENT corruption - a frame that is right nine times
+;  and wrong the tenth - rather than a driver that stops. So each stage
+;  has to be provable by a probe that either passes or does not, and
+;  "it seemed to work" is not a stage passing.
+;
+;  Two of the existing comments are also STALE and will mislead anyone
+;  auditing this. RaspberryPi4/Lib/display.pi4:426-428 and
+;  RaspberryPi4/Lib/xhci.pi4:275 both say the MMU and caches are ON.
+;  They are describing the U-Boot world, where an image was entered
+;  through "go" with U-Boot's page tables live. U-Boot is gone from the
+;  stick. Those two comments now describe a configuration that no
+;  longer exists, and they contradict genet.pi4:318 and memory.pi4:239,
+;  which describe the current one. NEITHER GROUP HAS BEEN MEASURED.
+;  That is precisely what stage 0 is for.
+;
+; ======================================================================
+;  THE STAGING PLAN
+; ======================================================================
+;
+;  Each stage is independently provable on the board, and each one is a
+;  separate payload run under the monitor's deadman, NOT a change to
+;  the resident monitor. See THE RECOVERY PATH below for why that
+;  distinction is the whole safety argument.
+;
+;  STAGE 0 - MEASURE. Read SCTLR_EL2 and CurrentEL and report them.
+;            No writes to anything. Cannot fail dangerously.
+;            THIS IS THE ONLY STAGE IMPLEMENTED IN THIS FILE.
+;            Probe: RaspberryPi4/Examples/Diagnostics/pi4MmuState.pi4
+;
+;  STAGE 1 - ENABLE, CHANGING NOTHING. Build page tables that map
+;            everything Device, identity-mapped, and turn the MMU on.
+;            Behaviourally identical to today: same memory type, same
+;            addresses, same speed. If that boots and the console still
+;            works, then the table walk, the descriptor format, the
+;            TCR/MAIR programming and the enable sequence are all
+;            right, and NOTHING about cache coherency has changed.
+;            This is the stage that de-risks every later one, and it is
+;            the only stage where a mistake is a hang rather than a
+;            corruption.
+;
+;  STAGE 2 - CACHE OUR OWN CODE AND STACK. Make Anvil's image window
+;            and its stack Normal Write-Back Cacheable and leave
+;            everything else Device. No DMA buffer lives in either, so
+;            no driver's coherency changes. Instruction fetch alone is
+;            the large win, and it is available with no DMA risk at all.
+;
+;  STAGE 3 - CACHE GENERAL DRAM, ONE DRIVER AT A TIME. This is where
+;            the DMA audit happens and it is the long stage. Each
+;            driver is re-proven with its existing probe before the
+;            next one is touched. See THE DMA AUDIT below for the
+;            inventory and the order.
+;
+;  STAGE 4 - DECIDE THE FRAMEBUFFER'S ATTRIBUTES. Normal Non-Cacheable,
+;            or write-combining, or cacheable with an explicit clean.
+;            The decision needs a measurement stage 2 has not made yet,
+;            so it is deliberately last. See THE FRAMEBUFFER QUESTION.
+;
+; ======================================================================
+;  THE RECOVERY PATH, AND WHY EVERY STAGE IS A PAYLOAD
+; ======================================================================
+;
+;  There is NO recovery path on this board that does not involve
+;  physical access. U-Boot is gone from the stick and cannot be
+;  chainloaded: it is linked for $80000 and is not position-independent
+;  (RaspberryPi4/Examples/Diagnostics/pi4Install.pi4:1-52). A hung
+;  board is a human walking to the bench.
+;
+;  Except that there IS one, and it is Anvil's deadman. The vault note
+;  "Raspberry Pi 4/Bench practice - arm the deadman.md" states the rule:
+;  `deadman 15` immediately before `run <addr>`, no exceptions, and it
+;  covers the NEXT payload only. The deadman is the PM watchdog and it
+;  performs a FULL BOARD RESET, which reloads kernel8.img, which is
+;  Anvil. So a payload that hangs costs fifteen seconds, not a walk.
+;
+;  THAT IS THE ENTIRE REASON THE MMU WORK IS SHAPED AS PAYLOADS RATHER
+;  THAN AS A CHANGE TO THE MONITOR. A payload that enables the MMU and
+;  gets it wrong hangs, the deadman fires, the board resets, and Anvil
+;  comes back with the MMU off because the firmware entered it that
+;  way. A MONITOR that enables the MMU and gets it wrong is a board
+;  that resets into the same broken code forever, and no watchdog helps
+;  because the fault is reached before anything can disarm it.
+;
+;  So: nothing in this family is wired into Anvil until the payload
+;  form of it has passed on silicon, and even then the wiring is a
+;  separate decision with its own argument.
+;
+;  A payload additionally arms its OWN deadman through
+;  RaspberryPi4/Lib/safety.pi4's SafetyWatchdogStart(), which is belt
+;  and braces over the monitor's, and costs nothing.
+;
+; ======================================================================
+;  THE MECHANISM - HOW A SYSTEM REGISTER GETS WRITTEN AT ALL
+; ======================================================================
+;
+;  The compiler does not emit MRS or MSR from any expression. It never
+;  will; those are not expressible in the language. What exists instead
+;  is the ASM / EndASM block, and the A64 assembler DOES encode these
+;  mnemonics. The precedent is everywhere - RaspberryPi4/Lib/timer.pi4:
+;  198-214 is the smallest example, one `mrs` and a return, and
+;  RaspberryPi4/Monitor/anvil.pi4:1305-1321 is the one that also reaches
+;  a global from inside the block.
+;
+;  WHAT THE ASSEMBLER SUPPORTS, read out of
+;  RaspberryPi4/A64Assembler.pbi rather than remembered:
+;
+;    :441-487  MRS/MSR, for currentel, mpidr_el1, cntfrq_el0,
+;              cntpct_el0, daif, sp_el0, sp_el1, sctlr_el1, vbar_el1,
+;              elr_el1, spsr_el1, and the EL2 set added 2026-08-24:
+;              sctlr_el2, hcr_el2, vbar_el2, elr_el2, spsr_el2.
+;    :538-550  ISB, and DMB/DSB with every barrier option.
+;    :584-620  DC / IC / TLBI, including `tlbi alle2` and
+;              `tlbi alle2is`, which are the EL2 forms this work needs.
+;    :904-905  the .byte / .hword / .word / .quad directives, which are
+;              accepted INSIDE an ASM block - verified, see below.
+;
+;  WHAT THE ASSEMBLER DOES NOT SUPPORT, AND THIS IS THE BLOCKING GAP
+;  FOR STAGE 1: there is no encoding for TTBR0_EL2, TCR_EL2 or
+;  MAIR_EL2. A64SystemRegBase() at :441 has no Case for any of them and
+;  its Default calls A64Fail(), so `msr tcr_el2, x0` is a hard build
+;  error rather than a wrong encoding - which is the correct behaviour
+;  and is why this was found at build time rather than on the bench.
+;
+;  A64Assembler.pbi is owned by somebody else and is not edited here.
+;  The gap is REPORTED, not fixed. Two ways round it exist and only one
+;  of them is acceptable:
+;
+;    ACCEPTABLE:   the three registers are added to A64SystemRegBase()
+;                  by their owner, from the architecture manual, in one
+;                  small change that looks exactly like the EL2 block
+;                  already there.
+;    NOT DONE HERE: hand-encoding them as `.word $xxxxxxxx` inside an
+;                  ASM block. This WORKS - it was tested, and
+;                  `.word $D51C2000` emits verbatim into the image at
+;                  the expected offset - but the word would be a number
+;                  that could only be recalled rather than read, which
+;                  RaspberryPi4/Lib/mailbox.pi4:239-240 forbids, and a
+;                  wrong op0/op1/CRn/CRm/op2 quadruple in an MSR is
+;                  EXACTLY the class of mistake that produces a board
+;                  needing hands. It assembles clean either way.
+;
+; ======================================================================
+;  THE DMA AUDIT - the inventory stage 3 has to work through
+; ======================================================================
+;
+;  Every site that will stop being a no-op the moment DRAM becomes
+;  cacheable, counted out of the tree rather than estimated:
+;
+;    RaspberryPi4/Lib/xhci.pi4        10 sites   rings, ERST, DCBAA,
+;                                                device contexts, setup
+;                                                packets, event TRBs
+;    RaspberryPi4/Monitor/anvil.pi4   11 sites   payload flush (cvau +
+;                                                ivau) and the autoboot
+;                                                record (civac)
+;    RaspberryPi4/Lib/display.pi4      8 sites   the framebuffer
+;    RaspberryPi4/Lib/genet.pi4        3 sites   TX and RX frames
+;    RaspberryPi4/Lib/mailbox.pi4      3 sites   the property buffer
+;    RaspberryPi4/Lib/hdmiaudio.pi4    1 site
+;
+;  THE ORDER STAGE 3 SHOULD TAKE THEM IN, easiest to prove first:
+;
+;    1. mailbox.pi4. One small buffer, one direction each way, and a
+;       probe that already exists and gives an unambiguous answer -
+;       either the firmware answered with sensible numbers or it did
+;       not. If mailbox coherency is wrong, nothing else is worth
+;       trying, and it is the cheapest place to find out.
+;    2. anvil.pi4's own payload flush. It is cvau/ivau, the
+;       instruction-fetch case rather than the DMA case, and it is
+;       exercised by every single payload transfer, so a failure is
+;       immediate and total rather than intermittent.
+;    3. genet.pi4. Frames are large, the probe is end to end, and a
+;       coherency fault shows as a bad checksum rather than as silence.
+;    4. xhci.pi4. The most sites, the most structures, and the one
+;       where an intermittent fault is hardest to distinguish from a
+;       flaky device. Last on purpose.
+;    5. display.pi4 and hdmiaudio.pi4 - deferred into stage 4, because
+;       the right answer for a framebuffer may be "do not cache it",
+;       in which case the eight sites become permanently no-ops and
+;       the question is a mapping decision rather than a maintenance
+;       one.
+;
+;  AND ONE HAZARD THAT IS NOT A CACHE HAZARD AND WILL BE BLAMED ON THE
+;  CACHE. A DMA ENGINE ON THIS PART MAY NOT BE ABLE TO SEE THE BUFFER AT
+;  ALL, and the symptom - a device that accepts everything and completes
+;  nothing - is indistinguishable at the bench from a missing cache
+;  clean. When stage 3 produces a driver that "went wrong when the cache
+;  came on", CHECK THE BUFFER ADDRESS FIRST.
+;
+;  THERE ARE TWO DIFFERENT CEILINGS AND THIS PARAGRAPH USED TO GIVE ONLY
+;  THE LOOSER ONE. Corrected 2026-08-27 against the vault note "DMA 2D
+;  blitter and the V3D linear question 2026-08-26", which measured it:
+;
+;    $C0000000  the PCIe controller's inbound window. This is what
+;               RaspberryPi4/Lib/pcie.pi4's PcieDmaOk() tests, and it is
+;               correct FOR THAT CONTROLLER - xHCI rings, usbmsc
+;               buffers, anything the VL805 must reach.
+;    $40000000  the LEGACY DMA engines, which are thirty-bit.
+;               bcm2711.dtsi:45, `dma-ranges = <0xc0000000 0x0
+;               0x00000000 0x40000000>`. Three quarters tighter.
+;
+;  So a buffer at $80000000 is waved through by PcieDmaOk() and is
+;  POISON for the 2D blitter. Do not use the PCIe predicate as a general
+;  "safe for DMA" test. The framebuffer is always safe on the blitter
+;  side - display.pi4:2053 masks with $3FFFFFFF - and
+;  RaspberryPi4/Lib/memory.pi4 carries the same correction in its own
+;  header.
+;
+;  The wording that was here, kept because it is the mistake:
+;  ~~DMA CANNOT REACH ABOVE $C0000000 ON THIS BOARD.~~ It states a real
+;  bound as if it were the only one, which is the dangerous direction -
+;  a reader who satisfies it believes they are safe.
+;
+; ======================================================================
+;  THE ADDRESS SPACE THE PAGE TABLES MUST COVER
+; ======================================================================
+;
+;  Written down here because it is the input to every later stage, and
+;  because getting the SIZE wrong is a quiet way to lose a peripheral.
+;  THE MEMORY MAP in RaspberryPi4/Board/memmap.pi4 is where every line
+;  comes from, and `map` on the board prints the two that move.
+;
+;    $00000000..$00000FFF   firmware spin table, secondary core release
+;                           mailboxes
+;    $00001000..$000FFFFF   monitor stack, growing down
+;    $00200000..            the monitor image. No top: it ends where the
+;                           image ends, rounded up to a megabyte, and
+;                           its BSS is elsewhere. `map` on the board.
+;           ..$07EFFFFF     payload LOW window, starting above that
+;    $08100000..$3B2FFFFF   the monitor's own data regions and free
+;                           DRAM, not offered to a payload
+;    $3B300000..$3FFFFFFF   NOT DRAM. The hole between the two banks.
+;    $40000000..$FBFFFFFF   payload HIGH window, the whole of bank 1.
+;    $FC000000..$FFFFFFFF   VideoCore and the peripheral aperture.
+;
+;  Peripherals actually used, all inside that last window:
+;    $FD500000  PCIe root complex     pcie.pi4:452
+;    $FD580000  GENET                 genet.pi4:600
+;    $FE100000  PM / watchdog         safety.pi4:348
+;    $FE200000  GPIO                  gpio.pi4:199
+;    $FE201000  PL011 / BT UART       bluetooth.pi4:808
+;    $FE300000  SDIO                  sdio.pi4:634
+;    $FE340000  EMMC                  emmc.pi4:484
+;    $FEF00000  DVP clock gate        hdmiaudio.pi4:476
+;
+;  THE PERIPHERAL WINDOWS, CONFIRMED AGAINST THE DEVICE TREE rather
+;  than inferred from the individual drivers' base addresses.
+;  Datasheets/pi4/bcm2711.dtsi:41-43 is the SoC bus translation:
+;
+;      ranges = <0x7e000000  0x0 0xfe000000  0x01800000>,
+;               <0x7c000000  0x0 0xfc000000  0x02000000>,
+;               <0x40000000  0x0 0xff800000  0x00800000>;
+;
+;    $FE000000 length $01800000   main peripherals, 24 MiB. Every base
+;                                 in the list above from $FE100000 to
+;                                 $FEF00000 falls inside it.
+;    $FC000000 length $02000000   32 MiB, and this is where the PCIe
+;                                 root complex at $FD500000 and GENET
+;                                 at $FD580000 live.
+;    $FF800000 length $00800000   ARM-LOCAL peripherals, 8 MiB - the
+;                                 local timers, the core mailboxes and
+;                                 the GIC-400 at $FF841000
+;                                 (bcm2711.dtsi:52-63, and the same
+;                                 address in Datasheets/pi4/
+;                                 armstub8.S:49-50).
+;
+;  THE ARM-LOCAL WINDOW IS EASY TO MISS and it is not optional: it is
+;  where the secondary cores' release mailboxes are, so a map that
+;  omits it is a map that cannot ever start core 1.
+;
+;  AND THE ONE THAT BREAKS A NAIVE 32-BIT IDENTITY MAP:
+;
+;    $600000000..                 the PCIe OUTBOUND WINDOW. The CPU
+;                                 sees it ABOVE FOUR GIGABYTES.
+;                                 pcie.pi4:462 (#PCIE_OUT_CPU =
+;                                 $600000000) and the reading behind it
+;                                 at pcie.pi4:172-221. The device tree
+;                                 agrees twice, and the two sizes are
+;                                 NOT the same number, so cite the one
+;                                 you mean: bcm2711.dtsi:551 maps
+;                                 1 GiB there for the whole SCB bus
+;                                 (<0x6 0 0x6 0 0x40000000>), while
+;                                 pcie0's own ranges at :575-576 use a
+;                                 64 MiB window
+;                                 (<0x02000000 0 0xf8000000
+;                                   0x6 0 0x0 0x04000000>).
+;
+;  So the translation regime must cover AT LEAST 35 bits of address,
+;  and the PS field must therefore be at least the 36-bit encoding -
+;  or, allowing for the 1 GiB SCB window reaching to $63FFFFFFF, the
+;  40-bit one. Datasheets/arm-a64-instruction-set.txt:493224-493232
+;  gives that encoding table: 000=32, 001=36, 010=40, 011=42, 100=44,
+;  101=48, 110=52, 111=56.
+;
+;  A page table built for a 32-bit space would map all of DRAM and all
+;  of the peripherals perfectly and would leave the VL805 XHCI
+;  controller unreachable - USB would stop, and the page table would
+;  look completely correct to anyone checking it against the DRAM map.
+;  This is the single most likely way to get stage 1 wrong.
+;
+;  ONE MORE THING THAT WOULD MOVE ALL OF THIS. "High Peripheral" mode
+;  puts the SAME peripheral registers at $4_7Enn_nnnn instead of
+;  $0_FEnn_nnnn - Datasheets/pi4/bcm2711-peripherals.txt:304-316 - and
+;  then EVERYTHING is above 4 GiB, not just PCIe. It is not reached by
+;  accident: it needs a different firmware stub
+;  (armstub8-gic-highperi.bin, Datasheets/pi4/armstubs-Makefile:1,27)
+;  or the `dtoverlay=highperi` overlay
+;  (Datasheets/pi4/firmware-overlays-README:2149-2151). This board is
+;  believed to be in LOW peripheral mode, and every driver in this tree
+;  working at $FEnnnnnn is strong evidence of it, but stage 1 should
+;  not hard-code the assumption where it can avoid it.
+;
+; ======================================================================
+;  THE FRAMEBUFFER QUESTION - stage 4, stated now so it is not decided
+;  by accident in stage 3
+; ======================================================================
+;
+;  Three candidate attributes, and the argument for each:
+;
+;    NORMAL NON-CACHEABLE. Writes are not cached but they ARE gathered
+;    and reordered, unlike Device-nGnRnE. That alone should be a large
+;    improvement on today for a linear fill, because today every four
+;    bytes is a separate bus transaction that must complete in order.
+;    No maintenance needed, no coherency question with the display
+;    controller, and display.pi4's eight `dc cvac` sites stay no-ops
+;    and stay harmless. This is the safe answer.
+;
+;    WRITE-COMBINING (Normal Non-Cacheable with the gathering the
+;    hardware will do anyway) is the same mapping in ARMv8-A terms;
+;    there is no separate "write-combining" memory type to choose. It
+;    is listed separately here only because the graphics plan uses the
+;    x86 name for it and someone will look for it.
+;
+;    NORMAL WRITE-BACK CACHEABLE plus explicit clean. Fastest for
+;    read-modify-write drawing - alpha blending, scrolling, anything
+;    that reads the framebuffer back - and for a shadow buffer that is
+;    later blitted. It makes display.pi4's `dc cvac` discipline load
+;    bearing for the first time, and a missed flush shows as stale
+;    pixels in a rectangle, which is a visible and diagnosable fault
+;    rather than a silent one. That is a point in its favour.
+;
+;  WHAT DECIDES IT IS A MEASUREMENT NOBODY HAS MADE: how much of the
+;  console's cost is the write itself and how much is the read-back.
+;  A pure blit never reads, and for a pure blit Normal Non-Cacheable
+;  wins on simplicity at no cost. Scrolling reads. So the honest
+;  answer today is: MAP IT NORMAL NON-CACHEABLE IN STAGE 3, measure a
+;  scroll, and only move to cacheable in stage 4 if the scroll is what
+;  hurts. Deciding it earlier is guessing.
+;
+;  The shadow-framebuffer conclusion from the graphics port plan - that
+;  a shadow does not help while the MMU is off - is worth restating
+;  because it INVERTS here. A shadow in cacheable DRAM, blitted to a
+;  non-cacheable framebuffer, is the standard arrangement and it does
+;  help, from stage 3 onward. That plan's conclusion was correct about
+;  today and should not be carried forward as if it were permanent.
+;
+; ======================================================================
+;  WHAT HAS BEEN TESTED
+; ======================================================================
+;
+;  THE MMU HAS BEEN ON, ON THIS BOARD, WITH THE CONSOLE STILL TALKING.
+;  Twice, and the second run measured what it was worth.
+;
+;  ---- STAGE 1, 2026-08-26. Translation on, and back off again. ------
+;
+;      SCTLR_EL2 before  $30C50830     MMU on before 0
+;      ENABLING NOW ...
+;      ALIVE - the console works with the MMU ON.
+;      SCTLR_EL2 during  $30C50831     MMU on during 1
+;      SCTLR_EL2 after   $30C50830     MMU on after  0
+;      MMU OFF AGAIN - byte for byte what it was.
+;      STAGE 1 PASSES. Outcome A.
+;
+;  "ALIVE" is the whole assertion: a PL011 write completing through a
+;  translation this file built. And SCTLR_EL2 coming back BYTE FOR BYTE
+;  is the second half - a stage that leaves the register subtly changed
+;  hands a wrecked machine to whatever runs next, and would look exactly
+;  like a pass.
+;
+;  TWO DESCRIPTORS IN THAT DUMP WOULD EACH HAVE BEEN A SILENT FAILURE,
+;  and neither is obvious from the architecture:
+;
+;      L1 slot 24  $0000000600000401   PCIe outbound, ABOVE 4 GiB. A
+;                                      tidy 32-bit identity map covers
+;                                      all DRAM and all peripherals,
+;                                      looks perfectly correct, and
+;                                      makes the VL805 unreachable - USB
+;                                      and the boot medium simply stop.
+;      L2 slot 508 $00000000FF800401   ARM-local. Omit it and core 1 can
+;                                      never start.
+;      L2 slot 479 $00000000FBE0070D   top of DRAM
+;      L2 slot 480 $00000000FC000401   peripherals begin, Device
+;
+;  ---- CACHES ON, 2026-08-26 later. Measured, and the answer was no. --
+;
+;  DRAM was moved from Normal Non-Cacheable ($70D) to Normal Write-Back
+;  Cacheable ($711) through the single constant #MMU_DRAM_ATTR, so the
+;  before-and-after is one edit. The same program, both ways, full
+;  1920x1080 surface, on the board:
+;
+;                              MMU off      MMU on, cacheable    gain
+;      clear, stores only      356.9 ms          266.4 ms        1.34x
+;      read, loads only       1787.0 ms         1155.0 ms        1.55x
+;      blend, three locals    3438.1 ms         2581.9 ms        1.33x
+;      blend, locals fused    2718.8 ms         2172.0 ms        1.25x
+;      whole-surface flush     121.4 ms           92.6 ms        1.31x
+;      the picture            1184.7 ms          922.5 ms        1.28x
+;
+;  THE PREDICTION WAS 100x AND THE MEASUREMENT IS 1.3x, WHICH IS THE
+;  VALUABLE PART. A compositor STREAMS: every cache line is touched once,
+;  so there is no reuse to exploit and all a cache buys is burst fills
+;  instead of individual accesses. 1.3x is exactly what that is worth.
+;  The wall is the GENERATED CODE - 266 ms for 8.29 MB is 48 cycles per
+;  byte, about 194 cycles to store one four-byte pixel - and no memory
+;  attribute can move that. Every plan that treated memory as the slow
+;  part was aimed at the wrong target. See the vault, "Silicon results
+;  2026-08-26" section 11.
+;
+;  A TEST OF MY OWN PRODUCED A COMPLETE-LOOKING LIE, recorded because
+;  the shape recurs: MmuBuildTables returns 0 ON SUCCESS and a negative
+;  #MMU_ERR_* on refusal (see :1044-1046, :1144). A caller testing `= 0`
+;  as FAILURE built the tables perfectly, threw them away, ran entirely
+;  uncached, and printed numbers under a heading that said the caches
+;  were on. It was caught only because those numbers were IDENTICAL to
+;  the previous run rather than merely similar.
+;  RaspberryPi4/Examples/Diagnostics/pi4MmuIdentity.pi4:216 has always
+;  done it correctly with `If rc <> 0`.
+;
+;  ---- WHAT IS STILL NOT PROVEN ---------------------------------------
+;
+;    * NOTHING RUNS WITH THE MMU LEFT ON. Every silicon run so far turns
+;      translation off again before returning, because Anvil knows
+;      nothing about page tables and until 2026-08-27 there was no
+;      exception vector anywhere in the tree for a fault in one. A
+;      resident program running under translation is untested.
+;    * THE SECONDARY CORES. Slot 508 exists so core 1 CAN start; no core
+;      has been started.
+;    * THE FRAMEBUFFER ATTRIBUTE DECISION below (stage 3 / stage 4) is
+;      still open, and the scroll measurement it turns on has not been
+;      made with the blitter out of the picture.
+;
+;  ---- SUPERSEDED ------------------------------------------------------
+;
+;      ~~Stage 0 has not run on silicon. It builds clean.~~
+;
+;  True when written. Stage 0 shipped inside Anvil on 2026-08-26 and
+;  stage 1 passed on the board about forty-five minutes later; this line
+;  survived both, because nothing in a build can contradict a sentence.
+;
+;  What was verified BEFORE any of it ran, by reading the emitted image
+;  rather than trusting the listing, using the -S flag and a word-level
+;  dump - kept because it is why the first silicon attempt was worth
+;  making at all:
+;
+;    * `mrs x0, sctlr_el2` inside an ASM block assembles to $D53C1000.
+;      That is A64Assembler.pbi:475's base $D51C1000 with the read bit
+;      $00200000 set at :486 and Rt=0. Confirmed present in a built
+;      image at a known offset.
+;    * `.word` inside an ASM block reaches the assembler's directive
+;      handler (A64Assembler.pbi:904) and emits its operand verbatim.
+;      Tested with $D51C2000 and found unchanged in the image. This is
+;      recorded because it is the escape hatch that WOULD let stage 1
+;      reach TTBR0_EL2 without the assembler being changed, and the
+;      decision not to use it is in THE MECHANISM above.
+;
+;  WHAT NO MODEL CAN TELL US, and this is a plain statement rather than
+;  a hedge:
+;
+;    tools/a64/a64_interp.py IS NOT AN ORACLE FOR ANY OF THIS. It does
+;    not decode MRS or MSR at all - the only $D5-space instructions it
+;    handles are the hint words, the barriers, the DC/IC/TLBI
+;    maintenance family and the two immediate PSTATE writes
+;    (a64_interp.py:128-174), and anything else in that space falls
+;    through to its unsupported-instruction path. It has, in its own
+;    words at :149-153, one flat byte-addressed memory with no I-cache,
+;    no D-cache and no TLB. A gate written against it could not
+;    distinguish a correct page table from a table of zeroes, because
+;    it performs no translation at all.
+;
+;    RaspberryPi4/A64EmuCore.pbi is slightly better and still not an
+;    oracle: it DOES decode MRS/MSR and stores SctlrEl2 as a field
+;    (:150, :476, :494), so a gate could prove that a sequence writes
+;    the registers it claims to write, in the order it claims. It
+;    models no translation either. It can check the SHAPE of the enable
+;    sequence. It cannot check that the sequence is correct.
+;
+;    So: a gate over stage 1 can prove the ENCODINGS and the ORDER. It
+;    cannot prove the board will survive. Only the board can, which is
+;    why the bench procedure matters more here than the gate does.
+;
+; ======================================================================
+;  STAGE 0 - the reads
+; ======================================================================
+;
+;  All three of these are one instruction and a return, the same shape
+;  as RaspberryPi4/Lib/timer.pi4:198-214, and for the same reason: the
+;  result of an `mrs` into x0 is already where a .i return value goes,
+;  so there is nothing between the read and the return that could
+;  disturb it.
+;
+;  These are READS. They are safe at any exception level this program
+;  can be at, they change nothing, and calling them from a payload
+;  cannot hang the board. That is the whole point of stage 0 - the
+;  measurement has to be free, or nobody will make it before guessing.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  MmuCurrentEl() - the raw CurrentEL register.
+;
+;  NOT the exception level. CurrentEL holds the level in bits 3:2 with
+;  the rest reserved, so the caller wants MmuEl() below unless it is
+;  dumping the register. Returned raw as well as decoded because a
+;  reserved bit that is unexpectedly set is information, and a decode
+;  that masks it away throws that information out.
+;
+;  Anvil is believed to run at EL2. Believed. The whole reason this
+;  procedure exists is that "believed" is not "measured", and every
+;  system register this work needs is a different register at a
+;  different level - SCTLR_EL2 is not SCTLR_EL1 and writing the wrong
+;  one is a silent no-op at best.
+; ----------------------------------------------------------------------
+Procedure.i MmuCurrentEl()
+  ASM
+    mrs x0, currentel
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEl() - the exception level as a small number: 0, 1, 2 or 3.
+;
+;  CurrentEL bits 3:2. The shift is parenthesised even though it does
+;  not need to be, because in this dialect the bitwise operators bind
+;  TIGHTER than the shifts - "v >> 2 & 3" parses as "v >> (2 & 3)",
+;  which is "v >> 2" by accident and would be right here for entirely
+;  the wrong reason. RaspberryPi4/Lib/display.pi4:416-422 states the
+;  rule; every shift in this file is parenthesised without exception.
+;
+;  The 3:2 position is not a recalled number: it is the only field
+;  CurrentEL has, and this file's own MmuCurrentEl() returns the raw
+;  register beside it so the decode can be checked against the value.
+;  If a bench run shows MmuCurrentEl() = 8 and MmuEl() = 2, the decode
+;  is confirmed by the pair; if they disagree with each other the pair
+;  says so out loud.
+; ----------------------------------------------------------------------
+Procedure.i MmuEl()
+  ProcedureReturn (MmuCurrentEl() >> 2) & 3
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlrEl2() - the raw SCTLR_EL2, all 64 bits of it.
+;
+;  THIS IS THE NUMBER THE WHOLE JOB TURNS ON. Three files in this tree
+;  assert the MMU is off and two assert it is on, none of them from a
+;  measurement, and they cannot all be right. Print this, in hex, and
+;  the argument is over.
+;
+;  Returned undecoded ON PURPOSE, and the reason is worth reading
+;  before somebody helpfully adds a decode. Splitting this into M, C
+;  and I flags needs the three bit POSITIONS, and no document on this
+;  machine states them - see THE MISSING DOCUMENT at the foot of this
+;  file. A raw hex value is a fact. A decode built on a recalled bit
+;  position is a fact-shaped guess wearing the same clothes.
+;
+;  AND THE DECODE IS NOT NEEDED, WHICH IS THE GOOD NEWS. There is an
+;  exact expected value, and comparing against it answers the question
+;  completely without knowing where any single bit lives. See
+;  MmuSctlrEl2Entered() below.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlrEl2()
+  ASM
+    mrs x0, sctlr_el2
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  #MMU_SCTLR_EL2_STUB - what the firmware's stub leaves in SCTLR_EL2.
+;
+;  $30C50830, and this is READ, not recalled. The Raspberry Pi
+;  firmware's ARM stub runs at EL3, sets this register, and then erets
+;  into our kernel at EL2. The source is on this disk:
+;
+;      Datasheets/pi4/armstub8.S:136-141
+;
+;        /*
+;         * Set up SCTLR_EL2
+;         * All set bits below are res1. LE, no WXN/I/SA/C/A/M
+;         */
+;        ldr x0, =0x30c50830
+;        msr SCTLR_EL2, x0
+;
+;  READ THAT COMMENT AGAIN, because it is the entire stage 0 result
+;  handed over for free. "All set bits below are res1" means every bit
+;  that is 1 in $30C50830 is a bit the architecture requires to be 1.
+;  "no WXN/I/SA/C/A/M" names the six control bits that are therefore 0:
+;
+;      M    the MMU                        OFF
+;      A    alignment checking             OFF
+;      C    the data cache                 OFF
+;      SA   stack-pointer alignment check  OFF
+;      I    the instruction cache          OFF
+;      WXN  write-implies-execute-never    OFF
+;
+;  So a bench run that reads back exactly $30C50830 has PROVED the MMU
+;  and both caches are off, at EL2, WITHOUT ANY BIT POSITION BEING
+;  KNOWN. That is a complete answer from a complete citation, and it is
+;  why stage 0 is worth running even though the decode is missing.
+;
+;  Datasheets/pi4/armstub8.S:143-148 is the handover itself - SPSR_EL3
+;  set to EL2h with DAIF masked, ELR_EL3 pointed at in_el2, eret - so
+;  EL2 is not an assumption either, it is what the line above the
+;  branch says. And :163-171 is the branch into our image, with x0
+;  holding the DTB pointer on the primary core and zero on the others.
+; ----------------------------------------------------------------------
+#MMU_SCTLR_EL2_STUB = $30C50830
+
+; ----------------------------------------------------------------------
+;  MmuSctlrEl2Entered() - 1 if SCTLR_EL2 is still exactly what the
+;  firmware stub left, 0 if anything at all has changed it.
+;
+;  THIS IS THE STAGE 0 ANSWER. A 1 means the MMU is off, both caches
+;  are off, alignment checking is off, and nothing between the stub and
+;  here has touched the register - which settles the contradiction
+;  recorded in WHY THIS FILE IS STAGED, in favour of genet.pi4:318 and
+;  memory.pi4:239 and against display.pi4:427 and xhci.pi4:275.
+;
+;  A 0 IS THE INTERESTING RESULT AND MUST NOT BE READ AS "the MMU is
+;  on". It means only that SOMETHING changed the register, and the
+;  possibilities are not equivalent: the firmware may run a different
+;  stub than the one on this disk, a newer stub may use a different
+;  RES1 set, or something in our own startup may be writing it. Each of
+;  those needs a different response, so the probe prints the raw value
+;  beside this flag rather than reporting a bare pass or fail. The
+;  number is the finding; this predicate is a convenience over it.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlrEl2Entered()
+  If MmuSctlrEl2() = #MMU_SCTLR_EL2_STUB
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  EL3 - THE SAME REGISTERS ONE LEVEL UP. Added 2026-09-07.
+; ======================================================================
+;  Ruling 2026-09-07: Anvil runs at EL3 on this board, entered there by
+;  RaspberryPi4/Board/armstub8.asm instead of being dropped to EL2 by the
+;  stock stub.
+;
+;  THE MONITOR MUST BOOT AT EITHER LEVEL, and that is not a nicety - it
+;  is what makes the flash survivable. KERNEL8.IMG goes on the card
+;  FIRST, under the stock stub, and has to come up and say "exception
+;  level 2". Only then do armstub8.bin and the one `armstub=` line
+;  follow. A monitor that only worked at EL3 would have to be flashed
+;  together with the stub, which on a board with no serial port means one
+;  reset that either works or leaves nothing to ask.
+;
+;  So every decision below is at RUN TIME, off MmuEl(), and never at
+;  compile time. One image, both levels.
+;
+;  WHAT IS ACTUALLY DIFFERENT BETWEEN THE TWO, AND IT IS LESS THAN IT
+;  LOOKS. TCR_EL3, MAIR_EL3 and TTBR0_EL3 have the SAME FIELD LAYOUT as
+;  their EL2 twins - both are the "one VA range, no VHE" format - so
+;  #MMU_TCR_EL2 and #MMU_MAIR_EL2 are correct values for the EL3
+;  registers too and are not duplicated with new names. SCTLR_EL3 shares
+;  SCTLR_EL2's RES1 pattern as well (bits 29,28,23,22,18,16,11,5,4), so
+;  M, C and I sit at bits 0, 2 and 12 in both and #MMU_SCTLR_MCI is one
+;  constant for both. The only real difference is the register NAME in
+;  the MSR, and `tlbi alle3` where `tlbi alle2` was.
+;
+;  THAT SAMENESS IS ALSO THE DANGER, and it is why these procedures
+;  exist instead of a comment saying "use the EL2 ones, they are the
+;  same". An `msr sctlr_el2` executed AT EL3 is legal - EL3 may write EL2
+;  registers - so the wrong one does not trap, does not refuse, and does
+;  not print anything. It programs a translation regime that is not the
+;  one the processor is using, and MmuEnabled() then reads SCTLR_EL2.M
+;  set and reports the MMU is on while every access still runs
+;  untranslated and uncached. A confident wrong answer with no symptom
+;  is the exact failure this whole tree is built to refuse.
+
+; ----------------------------------------------------------------------
+;  MmuAtEl3() - 1 when the monitor is running at EL3, 0 otherwise.
+;
+;  Every level-dependent branch in this tree goes through this one
+;  predicate rather than comparing MmuEl() itself, so that the question
+;  is asked the same way everywhere and can be grepped for.
+; ----------------------------------------------------------------------
+Procedure.i MmuAtEl3()
+  If MmuEl() = 3
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlrEl3() - the raw SCTLR_EL3.
+;
+;  Readable from EL3 only. Calling it at EL2 traps, which is why nothing
+;  outside this file calls it directly - MmuSctlr() below is the seam.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlrEl3()
+  ASM
+    mrs x0, sctlr_el3
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlr() - the SCTLR OF THE LEVEL WE ARE ACTUALLY AT.
+;
+;  This is what every caller outside this file wants, and every one of
+;  them used to call MmuSctlrEl2() because there was only one answer.
+;  `cache status`, HwMmuState() and MmuEnabled() are all asking "is
+;  translation on for the code I am running", and at EL3 that question
+;  is answered by SCTLR_EL3 and not by SCTLR_EL2 - which at EL3 holds
+;  whatever the stub left and answers a question nobody asked.
+;
+;  MmuSctlrEl2() STAYS, unchanged and still exported, because the
+;  diagnostics that dump machine state (pi4MmuState, pi4SmpWake,
+;  pi4FpState) want the EL2 register specifically, and at EL3 reading it
+;  is still legal and still informative.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlr()
+  If MmuAtEl3() <> 0
+    ProcedureReturn MmuSctlrEl3()
+  EndIf
+  ProcedureReturn MmuSctlrEl2()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  #MMU_SCTLR_EL3_STUB - what OUR stub leaves in SCTLR_EL3.
+;
+;  The same $30C50830, and it is not a copy made on the assumption that
+;  the two registers are alike. RaspberryPi4/Board/armstub8.asm WRITES
+;  this value into SCTLR_EL3 - the line is there and the reasoning is in
+;  that file's header - so this is a fact about our own code rather than
+;  a claim about the firmware. The stock stub never touches SCTLR_EL3 at
+;  all, because it is leaving EL3 and does not care what it holds; on a
+;  board booted the stock way this constant is meaningless and nothing
+;  compares against it, because nothing runs at EL3 there.
+;
+;  It happens to equal #MMU_SCTLR_EL2_STUB, and that is not a
+;  coincidence: in ARMv8.0 SCTLR_EL2 and SCTLR_EL3 have the same RES1
+;  pattern, so "every set bit is RES1, nothing else on" is the same
+;  number for both. It is written out separately anyway. Two constants
+;  that agree today for a stated reason can be checked against each
+;  other; one constant used for two registers cannot, and the day the
+;  stub changes one of them the shared constant is silently wrong for
+;  the other.
+; ----------------------------------------------------------------------
+#MMU_SCTLR_EL3_STUB = $30C50830
+
+; ----------------------------------------------------------------------
+;  MmuStubEntered() - 1 if the SCTLR of the level we are at is still
+;  exactly what the stub that brought us here left in it.
+;
+;  The level-aware twin of MmuSctlrEl2Entered(), and the one `info` and
+;  the probes should ask. A 0 still means only that SOMETHING changed the
+;  register - see the long note on MmuSctlrEl2Entered() for why that is
+;  not the same as "the MMU is on".
+; ----------------------------------------------------------------------
+Procedure.i MmuStubEntered()
+  If MmuAtEl3() <> 0
+    If MmuSctlrEl3() = #MMU_SCTLR_EL3_STUB
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn MmuSctlrEl2Entered()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuSctlrEl1() - the raw SCTLR_EL1.
+;
+;  Read as well as EL2 because it costs one instruction and it settles
+;  a question the EL2 read cannot. If Anvil turns out to be at EL1
+;  rather than EL2 - and nobody has measured which - then SCTLR_EL2 is
+;  the register that traps or reads as something meaningless, and
+;  SCTLR_EL1 is the one that matters. Reading both means the bench run
+;  produces the right answer either way instead of producing a puzzle.
+;
+;  At EL2 this read is legal and returns the EL1 control register,
+;  which the firmware may or may not have programmed.
+; ----------------------------------------------------------------------
+Procedure.i MmuSctlrEl1()
+  ASM
+    mrs x0, sctlr_el1
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuHcrEl2() - the raw HCR_EL2.
+;
+;  Included in the stage 0 dump because it governs what EL1 sees and
+;  whether stage 2 translation is in play at all. If something below us
+;  has already established a stage 2 regime, every plan in this file
+;  changes, and this is the cheapest place to find that out.
+; ----------------------------------------------------------------------
+Procedure.i MmuHcrEl2()
+  ASM
+    mrs x0, hcr_el2
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuBarrier() - dsb sy followed by isb.
+;
+;  Written out rather than reached through the a64_barrier() intrinsic,
+;  for the libraries-never-intrinsics reason in DEPENDENCIES above. It
+;  is here in stage 0, unused by stage 0, because every later stage
+;  needs it and because a barrier helper that appears in the same
+;  commit as the enable sequence is a barrier helper nobody reviewed.
+;
+;  `dsb sy` is the full-system, all-types form. A64Assembler.pbi:930-932
+;  builds it as base $D503309F with the CRm option in bits 11:8, and
+;  A64BarrierOption() at :884 answers 15 for "sy" (:897), giving
+;  $D5033F9F - the word this assembler has always emitted. The CRm field
+;  itself is explained at :873-883: domain 11 is full system, types 11
+;  is both reads and writes, and the reserved types=00 encodings are
+;  deliberately REFUSED rather than allowed to behave as SY by accident.
+;
+;  THESE LINE NUMBERS MOVED ONCE ALREADY, ON 2026-08-26, and the way they
+;  moved is worth knowing. This comment used to cite :548-550, :516 and
+;  :545-547. A generated table of 297 system registers was then spliced
+;  into A64SystemRegBase and pushed everything below it down by about
+;  380 lines, so :548-550 now lands in the middle of that table - on
+;  afsr1_el2, aidr_el1 and amair_el1. The citation did not break loudly;
+;  it quietly started pointing at three unrelated registers, which is
+;  worse, because a reader who follows it finds plausible-looking code
+;  and no reason to doubt it.
+;
+;  A line-number citation into a file that gets generated content
+;  inserted is a citation with an expiry date. If these drift again,
+;  search for the `Case "dsb"` arm and for `Procedure.i
+;  A64BarrierOption` rather than trusting the numbers.
+; ----------------------------------------------------------------------
+Procedure MmuBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; ======================================================================
+;  STAGE 1 - build the tables and turn the MMU on, changing nothing else
+; ======================================================================
+;
+;  THE GOAL IS A NON-EVENT. After stage 1 the board must behave exactly
+;  as it does today: same addresses, same memory behaviour, same DMA
+;  coherency. Nothing is cached. If the console still works, then the
+;  descriptor format, the TCR and MAIR programming, the table walk and
+;  the enable sequence are ALL correct, and every later stage is a
+;  change of attribute bits on a mechanism already proven.
+;
+;  Every constant below is cited to a file in RaspberryPi4/Reference/,
+;  which is in the repo. None of them is recalled.
+;
+;  ---- ONE DELIBERATE DEPARTURE FROM "EVERYTHING DEVICE" -------------
+;
+;  The brief says map everything Device. DRAM IS MAPPED NORMAL
+;  NON-CACHEABLE INSTEAD, and this is the one place stage 1 knowingly
+;  does not do what it was told, so here is the whole argument.
+;
+;  With the MMU OFF, ARMv8-A does not treat everything as Device. Data
+;  accesses are Device-nGnRnE, but INSTRUCTION FETCHES ARE TREATED AS
+;  NORMAL NON-CACHEABLE. That asymmetry is invisible today because
+;  there is no page table to state it. The moment a table exists, one
+;  attribute has to cover both, and "Device" is the wrong half to pick:
+;  instruction fetch from Device memory is not something to rely on,
+;  and U-Boot's own descriptors say so by never leaving a Device region
+;  executable - it sets PTE_BLOCK_PXN and PTE_BLOCK_UXN
+;  (RaspberryPi4/Reference/v2025.01_armv8_mmu.h:67-68) on every one.
+;
+;  So mapping DRAM Device would map Anvil's own code, this payload's
+;  code and both stacks as Device and then fetch from them. That is not
+;  the conservative choice, it is a novel one, and the failure would be
+;  a hang at the enabling instruction with no console - the least
+;  diagnosable outcome available.
+;
+;  NORMAL NON-CACHEABLE IS THE FAITHFUL TRANSLATION OF TODAY, not a
+;  liberty: instruction fetch is exactly what it already is, and data
+;  accesses become Normal NC rather than Device, which permits
+;  gathering and reordering that Device-nGnRnE forbids. THE PROPERTY
+;  STAGE 1 MUST PRESERVE IS "NOTHING IS CACHED", AND NORMAL
+;  NON-CACHEABLE PRESERVES IT EXACTLY. Not one line of the DMA
+;  discipline changes, every `dc` site stays the no-op it is today, and
+;  no driver's coherency is touched. That is the invariant that makes
+;  stage 1 safe, and it is fully intact.
+;
+;  Peripherals ARE mapped Device-nGnRnE, which is what they must be.
+;
+;  A visible side effect, stated so it is not mistaken for a fault: the
+;  console may get FASTER at stage 1, because framebuffer writes can be
+;  gathered. That is a correct result, not evidence of a wrong map.
+;
+;  ---- THE GEOMETRY --------------------------------------------------
+;
+;  The largest address that must be mapped is the top of the PCIe
+;  outbound window. RaspberryPi4/Reference/v2025.01_cache_v8.c:60-95
+;  picks the address size from exactly that number:
+;
+;      max_addr > 1<<32  ->  ips = 1, va_bits = 36
+;
+;  $6_4000_0000 (25 GiB) is above 4 GiB and below 64 GiB, so ips = 1
+;  and va_bits = 36. T0SZ is then 64 - 36 = 28
+;  (v2025.01_armv8_mmu.h:83, TCR_T0SZ(x) = (64 - x) << 0).
+;
+;  Level shifts, from v2025.01_cache_v8.c:121-126 - "Page is 12 bits
+;  wide, every level translates 9 bits", level2shift = 12 + 9*(3-level):
+;
+;      level 1  ->  shift 30  ->  1 GiB blocks
+;      level 2  ->  shift 21  ->  2 MiB blocks
+;      level 3  ->  shift 12  ->  4 KiB pages
+;
+;  The starting level is 1, not 0: v2025.01_cache_v8.c:132-138 starts at
+;  level 1 whenever va_bits < 39. With 36 bits the level-1 index is bits
+;  [35:30], so SIXTY-FOUR entries cover the whole 64 GiB space.
+;
+;  So the entire stage-1 map is ONE level-1 table of 64 used entries,
+;  plus ONE level-2 table to split the top gigabyte of the 32-bit
+;  space. 8 KiB of page tables in total, and no level-3 table at all.
+;
+;  A full 4 KiB is allocated for the level-1 table even though only 64
+;  of its 512 slots can ever be indexed. That is deliberate: 4 KiB
+;  alignment satisfies every alignment rule a smaller table could have,
+;  the spare entries are unreachable rather than wrong, and a
+;  hand-computed tight size is a place to be subtly incorrect for no
+;  saving worth having.
+;
+;  ---- THE MAP, ENTRY BY ENTRY ---------------------------------------
+;
+;  Level 1, sixty-four 1 GiB slots:
+;
+;    0   $0_0000_0000  Normal NC   DRAM bank 0, and the inter-bank hole
+;    1   $0_4000_0000  Normal NC   DRAM bank 1
+;    2   $0_8000_0000  Normal NC   DRAM bank 1
+;    3   $0_C000_0000  TABLE       split - see the level-2 table below
+;    4..23             INVALID     nothing is there
+;    24..31            Device      PCIe outbound window
+;    32..63            INVALID     nothing is there
+;
+;  Level 2 under slot 3, five hundred and twelve 2 MiB slots covering
+;  $C000_0000..$FFFF_FFFF:
+;
+;    0..479    $C000_0000..$FBFF_FFFF   Normal NC   DRAM bank 1, top
+;    480..511  $FC00_0000..$FFFF_FFFF   Device      VideoCore, the
+;                                                   peripheral aperture
+;                                                   and the ARM-local
+;                                                   window
+;
+;  WHY SLOT 3 HAS TO BE SPLIT AT ALL, because a 1 GiB map would be
+;  simpler and would be wrong: slot 3 spans $C000_0000..$FFFF_FFFF,
+;  which contains DRAM below $FC00_0000 (anvil.pi4:611-612 - the HIGH
+;  payload window runs to $FBFF_FFFF) AND the peripheral aperture above
+;  it (anvil.pi4:138). Those two need different memory types, so one
+;  1 GiB descriptor cannot express it. $FC00_0000 is 2 MiB aligned, so
+;  a level-2 table splits it exactly: 480 slots of DRAM then 32 of
+;  peripherals, 512 in total with nothing left over.
+;
+;  THE TWO WINDOWS THAT MUST NOT BE MISSED, both mapped above:
+;
+;    * THE PCIe OUTBOUND WINDOW AT CPU $6_0000_0000, ABOVE 4 GiB. Slots
+;      24..31. Omit it and the VL805 XHCI controller is unreachable -
+;      USB and the boot medium stop, silently, while a page table
+;      checked against the DRAM map looks perfectly correct.
+;      Eight slots, 8 GiB, are mapped rather than the one gigabyte
+;      RaspberryPi4/Lib/pcie.pi4:462 and bcm2711.dtsi:551 strictly
+;      require, because pcie.pi4:205 reads the window as running to
+;      $7_FFFF_FFFF and the two readings disagree. Seven spare
+;      descriptors is a trivial price for covering both, and mapping
+;      Device address space that turns out to be empty costs nothing.
+;
+;    * THE ARM-LOCAL WINDOW AT $FF80_0000, inside level-2 slots
+;      480..511. It holds the local timers, the GIC-400 and THE
+;      SECONDARY CORES' RELEASE MAILBOXES (bcm2711.dtsi:43). Omit it
+;      and core 1 can never be started.
+;
+;  WHAT IS DELIBERATELY LEFT INVALID, and what that changes. Slots
+;  4..23 and 32..63 are zero, which is PTE_TYPE_FAULT
+;  (v2025.01_armv8_mmu.h:46). Nothing is there, so nothing should touch
+;  them. But note the behaviour change, because it is real: today a
+;  stray access to those addresses is a silent nothing, and after
+;  stage 1 it is a translation fault. THERE IS NO EXCEPTION VECTOR
+;  INSTALLED, so that fault is a runaway rather than a message. That is
+;  still the better trade - a wild access should not be silent - and
+;  installing a vector is genuinely stage 2 work, not stage 1 work. It
+;  is written down here so that a hang which appears LATER, in some
+;  driver that was quietly reading a bogus address all along, is
+;  recognised for what it is.
+;
+;  The inter-bank hole at $3B30_0000..$3FFF_FFFF (anvil.pi4:136) is NOT
+;  faulted, because it shares slot 0 with the whole of DRAM bank 0 and
+;  splitting it would need a second level-2 table to buy a diagnostic
+;  that stage 1 was not asked for. Same as today. Stage 2 can fault it.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  THE SWITCH. One constant, and it is the only thing to change when
+;  the assembler learns the three registers.
+;
+;  RaspberryPi4/A64Assembler.pbi cannot yet encode TTBR0_EL2, TCR_EL2 or
+;  MAIR_EL2 - A64SystemRegBase()'s Default calls A64Fail(), so
+;  `msr ttbr0_el2, x9` is a BUILD ERROR and not a wrong encoding. That
+;  refusal is correct and is exactly what stopped a recalled word being
+;  written. A dedicated worker is adding the full system-register set.
+;
+;  Until that lands, MmuEnable() and MmuDisable() compile to a `nop`
+;  and MmuBuildable() reports 0, so everything else in this file - the
+;  whole table builder, which is where the bugs would actually be -
+;  builds, runs and is gated today.
+;
+;  TO ARM STAGE 1: change this 0 to a 1. Nothing else. The plain
+;  mnemonics are already written below.
+; ----------------------------------------------------------------------
+#MMU_HAVE_EL2_REGS = 1
+
+; ----------------------------------------------------------------------
+;  The attribute constants. Every one cited.
+; ----------------------------------------------------------------------
+
+; MAIR_EL2. RaspberryPi4/Reference/v2025.01_armv8_mmu.h:34-38 builds
+; MEMORY_ATTRIBUTES as one byte per index, and :28-32 fixes the indices:
+;
+;   index 0  MT_DEVICE_NGNRNE  $00
+;   index 1  MT_DEVICE_NGNRE   $04
+;   index 2  MT_DEVICE_GRE     $0C
+;   index 3  MT_NORMAL_NC      $44
+;   index 4  MT_NORMAL         $FF
+;
+; packed low index first, which gives $FF_440C_0400. Stage 1 uses only
+; indices 0 and 3; the other three are carried because the register is
+; written whole and because stage 2 and 3 need index 4 unchanged.
+#MMU_MAIR_EL2 = $FF440C0400
+
+; TCR_EL2, composed from v2025.01_cache_v8.c:94-103 for the el == 2 case
+; with the fields at v2025.01_armv8_mmu.h:83-104:
+;
+;   TCR_EL2_RSVD      (1<<31)|(1<<23)   $80800000   :103
+;   ips << 16, ips=1                    $00010000   cache_v8.c:96
+;   TCR_TG0_4K        (0<<14)           $00000000   :97
+;   TCR_SHARED_INNER  (3<<12)           $00003000   :96
+;   TCR_ORGN_WBWA     (1<<10)           $00000400   :90
+;   TCR_IRGN_WBWA     (1<<8)            $00000100   :85
+;   TCR_T0SZ(36)      (64-36)           $0000001C   :83
+;                                       ----------
+;                                       $8081351C
+;
+; The IRGN/ORGN/SHARED fields describe the PAGE TABLE WALKER's own
+; accesses, not the memory being mapped, which is why they say
+; write-back cacheable in a stage that caches nothing. That is not an
+; inconsistency: it is the exact combination U-Boot's mmu_setup() runs
+; with when it sets CR_M and has not yet set CR_C
+; (v2025.01_cache_v8.c:734-748).
+#MMU_TCR_EL2 = $8081351C
+
+; A 1 GiB or 2 MiB BLOCK descriptor for Device-nGnRnE memory:
+;   PTE_TYPE_BLOCK                (1<<0)    $001   mmu.h:49
+;   PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE=0)   $000   mmu.h:60, :28
+;   PTE_BLOCK_NON_SHARE           (0<<8)    $000   mmu.h:62
+;   PTE_BLOCK_AF                  (1<<10)   $400   mmu.h:65
+;
+; THE ACCESS FLAG IS NOT OPTIONAL. With AF clear, the very first access
+; through the descriptor takes an Access Flag fault. It is one bit, it
+; is easy to leave out, and leaving it out produces a board that dies
+; on the instruction after the enable with no console.
+;
+; PXN and UXN are deliberately NOT set, unlike U-Boot's device
+; mappings. See ONE DELIBERATE DEPARTURE above: in stage 1 the
+; distinction between "memory we execute from" and "memory we do not"
+; is not yet expressed, so nothing is marked execute-never. Stage 2
+; introduces that split properly.
+#MMU_ATTR_DEVICE = $401
+
+; The same, for Normal Inner/Outer Non-Cacheable:
+;   PTE_TYPE_BLOCK                (1<<0)    $001   mmu.h:49
+;   PTE_BLOCK_MEMTYPE(MT_NORMAL_NC=3)  (3<<2) $00C mmu.h:60, :31
+;   PTE_BLOCK_INNER_SHARE         (3<<8)    $300   mmu.h:64
+;   PTE_BLOCK_AF                  (1<<10)   $400   mmu.h:65
+#MMU_ATTR_NORMAL_NC = $70D
+
+; NORMAL INNER/OUTER WRITE-BACK CACHEABLE - the same descriptor with the
+; memory-type index moved from 3 to 4:
+;   PTE_TYPE_BLOCK                (1<<0)    $001   mmu.h:49
+;   PTE_BLOCK_MEMTYPE(MT_NORMAL=4)     (4<<2) $010 mmu.h:60, :32
+;   PTE_BLOCK_INNER_SHARE         (3<<8)    $300   mmu.h:64
+;   PTE_BLOCK_AF                  (1<<10)   $400   mmu.h:65
+; MAIR index 4 is $FF - Normal, Outer and Inner Write-Back Non-transient,
+; Read- and Write-Allocate. v2025.01_armv8_mmu.h:34-38 and :32.
+;
+; TURNING THIS ON IS NOT COSMETIC. Every driver that DMAs - xhci, genet,
+; usbmsc, the mailbox - has cache-maintenance calls that are no-ops today
+; and become real the moment DRAM is cacheable. They have never once been
+; exercised. Assume they are wrong until a probe says otherwise, and read
+; THE DMA HAZARD above first: a buffer above $C0000000 fails in a way that
+; is indistinguishable at the bench from a missing cache clean.
+#MMU_ATTR_NORMAL_WB = $711
+
+; Which of the two DRAM gets. Stage 1 shipped NON-CACHEABLE because its
+; whole claim was "nothing about the machine changes except that
+; translation is on". Stage 3 flips this to measure what caches are
+; worth. It is one constant so that the before-and-after is one edit and
+; one rebuild, and so that a bad result is reverted the same way.
+;
+; MEASURED WITH THIS AT NORMAL_NC, 2026-08-26, full 1920x1080 surface:
+;   clear, stores only        356.8 ms    23.2 MB/s
+;   read, loads only         1787.0 ms     4.6 MB/s
+;   blend, read-modify-write 2713.5 ms     6.1 MB/s   against a 25 ms budget
+; Reads were FIVE TIMES slower than writes, which is the signature of
+; uncached memory precisely: stores post and retire, loads must go to
+; DRAM and back with no gathering and no pipelining.
+; (Written as a literal, not as #MMU_ATTR_NORMAL_WB: this language
+; refuses a constant declared from another constant - 'Invalid constant
+; declaration', found the direct way. $711 is Normal WB, $70D is
+; Normal NC; those are the only two values this may take.)
+#MMU_DRAM_ATTR = $711
+
+; A TABLE descriptor is the next table's address with the low two bits
+; set. PTE_TYPE_TABLE = (3<<0), mmu.h:47. No hierarchical permission
+; bits are set (mmu.h:52-55), so the table imposes no extra restriction
+; on what it points at.
+#MMU_DESC_TABLE = 3
+
+; PTE_TYPE_FAULT = (0<<0), mmu.h:46. An all-zero descriptor faults, so
+; the invalid slots need no special value - but the name is here so the
+; loop below says what it means rather than storing a bare zero.
+#MMU_DESC_FAULT = 0
+
+; CR_M, the MMU enable bit in SCTLR_EL2. Bit 0.
+; RaspberryPi4/Reference/v2025.01_arm_system.h:12.
+;
+; This is the last of the four facts stage 1 was blocked on, and it
+; closes the loop on stage 0's measurement: in the $30C50830 the board
+; actually reported, bit 0 is clear, which is what
+; Datasheets/pi4/armstub8.S:136-141 said the stub wrote.
+#MMU_SCTLR_M = 1
+
+; CR_C and CR_I, the D-cache and I-cache enable bits in SCTLR_EL2.
+; RaspberryPi4/Reference/v2025.01_arm_system.h:14 (CR_C = (1<<2), Dcache
+; enable) and :16 (CR_I = (1<<12), Icache enable) - the same header and
+; the same lines that give CR_M above, so the three come from one source.
+;
+; STAGE 1 SETS ONLY M (#MMU_SCTLR_M). With C clear, ARMv8-A treats every
+; Normal-memory data access as Non-Cacheable REGARDLESS of the page-table
+; attribute, which is exactly why stage 1 is a non-event even though
+; #MMU_DRAM_ATTR below is the Write-Back descriptor $711: the descriptor
+; says cacheable, the C bit says do not, and the C bit wins. Setting M|C|I
+; together (#MMU_SCTLR_MCI, MmuEnableCached()) is what finally makes the
+; Write-Back attribute take effect. Instruction fetch from Normal memory
+; becomes cached only with I set, and I-cache lines are never dirty, so I
+; costs no clean discipline of its own.
+#MMU_SCTLR_C   = $4         ; bit 2,  D-cache enable
+#MMU_SCTLR_I   = $1000      ; bit 12, I-cache enable
+#MMU_SCTLR_MCI = $1005      ; M | C | I, the caches-on set, one movz-able word
+
+; Geometry, all from v2025.01_cache_v8.c:121-126 and :132-138 as
+; reasoned in THE GEOMETRY above.
+#MMU_L1_ENTRIES  = 64            ; va_bits 36, level-1 index is [35:30]
+#MMU_L2_ENTRIES  = 512           ; a full 4 KiB table, 9 index bits
+#MMU_TABLE_BYTES = 8192          ; two 4 KiB tables, level 1 then level 2
+
+; The one level-1 slot that is split by a level-2 table, and the
+; boundary inside it. $FC000000 is where DRAM stops and the VideoCore
+; and peripheral aperture begin (anvil.pi4:138); it is 2 MiB aligned,
+; which is why a level-2 table splits it exactly.
+#MMU_SPLIT_SLOT  = 3
+#MMU_PERIPH_BASE = $FC000000
+
+; The PCIe outbound window, in level-1 slots. Slot 24 is
+; $6_0000_0000 (24 * 1 GiB). See THE MAP above for why eight slots.
+#MMU_PCIE_SLOT_LO = 24
+#MMU_PCIE_SLOT_HI = 31
+
+; MmuBuildTables() refusals. Negative, and distinct, because "the
+; tables were not built" and "the tables were built somewhere useless"
+; are different bugs and a single -1 would merge them.
+#MMU_ERR_NULL    = -1            ; base address of zero
+#MMU_ERR_ALIGN   = -2            ; base not 4 KiB aligned
+#MMU_ERR_LOW     = -3            ; base collides with the monitor or
+                                 ; the firmware spin table
+
+; Where the enable sequence reads its three values from. Globals rather
+; than parameters because the ASM block below reaches them by symbol
+; through adrp/add/ldr, which is the pattern
+; RaspberryPi4/Monitor/anvil.pi4:1305-1321 uses and the only one proven
+; to work in this compiler's ASM blocks.
+Global mmu_ttbr.i                ; the level-1 table's physical address
+Global mmu_tcr.i                 ; #MMU_TCR_EL2
+Global mmu_mair.i                ; #MMU_MAIR_EL2
+
+; REGIONS MAPPED Normal NON-CACHEABLE. Anything shared with a bus master
+; that never sees the D-cache - the framebuffer (display controller, V3D,
+; the DMA engine), the GENET receive ring (the ethernet DMA writes it) -
+; is mapped Non-Cacheable so the CPU's access goes STRAIGHT to DRAM,
+; coherent with the master, and no dc maintenance is needed on it at all.
+; That is the standard framebuffer cure (the vault's stage-4 answer) and it
+; generalises to every such region. The caller (CacheEnable) lists the
+; regions just before the tables are built, because some addresses (the
+; firmware's framebuffer) are only known once the screen is up. No regions
+; -> all DRAM stays Write-Back, exactly as before.
+#MMU_NC_MAX = 8
+Global Dim mmu_ncLo.i[#MMU_NC_MAX]
+Global Dim mmu_ncHi.i[#MMU_NC_MAX]
+Global mmu_ncN.i = 0
+
+; MmuClearNc - forget every NC region (the next MmuBuildTables maps all
+; DRAM Write-Back unless regions are added again first).
+Procedure MmuClearNc()
+  mmu_ncN = 0
+EndProcedure
+
+; MmuAddNc - add [lo, hi) to the set mapped Non-Cacheable by the next
+; MmuBuildTables, rounded out to the 2 MiB block the table splits at.
+Procedure MmuAddNc(lo.i, hi.i)
+  If lo <= 0 Or hi <= lo Or mmu_ncN >= #MMU_NC_MAX
+    ProcedureReturn
+  EndIf
+  ; Round down / up to 2 MiB - shift pairs, never a 32-bit mask (which
+  ; would clear the top half of a 64-bit address).
+  mmu_ncLo[mmu_ncN] = (lo >> 21) << 21
+  mmu_ncHi[mmu_ncN] = ((hi + $1FFFFF) >> 21) << 21
+  mmu_ncN = mmu_ncN + 1
+EndProcedure
+
+; mmu_BlockNc - 1 if the 2 MiB block starting at pa overlaps any NC region.
+Procedure.i mmu_BlockNc(pa.i)
+  Define k.i
+  k = 0
+  While k < mmu_ncN
+    If (pa + $200000) > mmu_ncLo[k] And pa < mmu_ncHi[k]
+      ProcedureReturn 1
+    EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; The caches-on enable/disable reach their SCTLR_EL2 bit masks the same
+; way the switch reaches ttbr/tcr/mair: parked in a Global and read back
+; with adrp/add/ldr, the one pattern proven to work in this compiler's
+; ASM blocks (anvil.pi4:1305-1321). mmu_scset is OR-ed in to turn the
+; caches on; mmu_scclr is AND-ed in to turn them off. Both are filled by
+; the procedures below before their ASM runs, and both stores happen
+; while the value is still coherent for the load that follows (see the
+; note in MmuDisableCached about why the disable-side store is safe even
+; with the D-cache still on at that instant).
+Global mmu_scset.i               ; #MMU_SCTLR_MCI
+Global mmu_scclr.i               ; ~#MMU_SCTLR_MCI, built at run time
+
+; The address MmuCleanLine() operates on. Parked in a Global for the same
+; ASM-reachability reason as v3d.pi4:1299-1303's v3d_flushaddr.
+Global mmu_flushaddr.i
+
+; ----------------------------------------------------------------------
+;  MmuBuildTables(base) - write both tables. Does NOT enable anything.
+;
+;  base must be 4 KiB aligned with #MMU_TABLE_BYTES of room. The level-1
+;  table goes at base, the level-2 table at base + 4096.
+;
+;  Returns 0, or one of the #MMU_ERR_* refusals. It refuses rather than
+;  coping, because every one of those conditions produces a table the
+;  hardware will walk into nonsense, and a diagnostic now is worth
+;  incomparably more than a hang later with no console.
+;
+;  SEPARATE FROM MmuEnable() ON PURPOSE. This procedure only writes
+;  DRAM. It can be called, and its output dumped and checked word by
+;  word, with the MMU still off and the board in no danger at all. That
+;  is the whole reason stage 1 is provable: everything that could be
+;  wrong is inspectable BEFORE the one instruction that commits to it.
+; ----------------------------------------------------------------------
+Procedure.i MmuBuildTables(base.i)
+  Define i.i
+  Define pa.i
+  Define l2.i
+  Define l2low.i
+  Define d.i
+
+  If base = 0
+    ProcedureReturn #MMU_ERR_NULL
+  EndIf
+  If (base & $FFF) <> 0
+    ProcedureReturn #MMU_ERR_ALIGN
+  EndIf
+  ; Below $400000 is the firmware spin table, the monitor stack and the
+  ; monitor image (anvil.pi4:120-124). Putting page tables there would
+  ; corrupt the thing we intend to return to.
+  If base < $400000
+    ProcedureReturn #MMU_ERR_LOW
+  EndIf
+
+  l2 = base + 4096
+
+  ; ---- the level-2 table: the top gigabyte of the 32-bit space ------
+  ; 2 MiB per slot, starting at $C0000000. Below #MMU_PERIPH_BASE is
+  ; DRAM and gets Normal NC; from there up is the VideoCore, the
+  ; peripheral aperture and the ARM-local window, and gets Device.
+  For i = 0 To #MMU_L2_ENTRIES - 1
+    pa = $C0000000 + (i << 21)
+    If pa < #MMU_PERIPH_BASE
+      d = pa | #MMU_DRAM_ATTR
+    Else
+      d = pa | #MMU_ATTR_DEVICE
+    EndIf
+    ; PokeI, eight bytes. A descriptor is 64 bits and PokeL would write
+    ; four, leaving the top half of every entry holding whatever was in
+    ; DRAM - which for a table this size is a walk into arbitrary
+    ; memory. This is the same 64-bit trap anvil.pi4:1309-1314 records
+    ; for ldr w9 against ldr x9.
+    PokeI(l2 + (i << 3), d)
+  Next
+
+  ; ---- a SECOND level-2 table: the LOW gigabyte (slot 0) -------------
+  ; Built only when a framebuffer range was given, so slot 0 can carry the
+  ; framebuffer's 2 MiB blocks as Normal NON-CACHEABLE while everything
+  ; else in the low gigabyte - the monitor's code, its stack, the payload
+  ; window, the NeonArcade arena - stays Write-Back cacheable. This is what
+  ; makes the CPU's framebuffer access coherent with V3D, the DMA engine
+  ; and the display controller without a single dc maintenance call.
+  l2low = base + 8192
+  If mmu_ncN > 0
+    For i = 0 To #MMU_L2_ENTRIES - 1
+      pa = i << 21                          ; 0 .. $40000000, 2 MiB per slot
+      If mmu_BlockNc(pa) <> 0
+        d = pa | #MMU_ATTR_NORMAL_NC        ; a framebuffer / DMA-ring block
+      Else
+        d = pa | #MMU_DRAM_ATTR             ; ordinary low-GiB DRAM
+      EndIf
+      PokeI(l2low + (i << 3), d)
+    Next
+  EndIf
+
+  ; ---- the level-1 table: sixty-four 1 GiB slots --------------------
+  For i = 0 To #MMU_L1_ENTRIES - 1
+    pa = i << 30
+    If i = 0 And mmu_ncN > 0
+      ; Slot 0 is split into l2low so the framebuffer / DMA-ring blocks in
+      ; the low gigabyte can be Non-Cacheable.
+      d = l2low | #MMU_DESC_TABLE
+    ElseIf i = #MMU_SPLIT_SLOT
+      ; Point at the level-2 table rather than mapping a gigabyte.
+      d = l2 | #MMU_DESC_TABLE
+    ElseIf i < #MMU_SPLIT_SLOT
+      ; Slots 0 (when no framebuffer split), 1 and 2 - DRAM bank 0, the
+      ; inter-bank hole, and the bottom 2 GiB of bank 1.
+      d = pa | #MMU_DRAM_ATTR
+    ElseIf i < #MMU_PCIE_SLOT_LO
+      d = #MMU_DESC_FAULT
+    ElseIf i <= #MMU_PCIE_SLOT_HI
+      ; The PCIe outbound window, above 4 GiB.
+      d = pa | #MMU_ATTR_DEVICE
+    Else
+      d = #MMU_DESC_FAULT
+    EndIf
+    PokeI(base + (i << 3), d)
+  Next
+
+  ; Hand the enable sequence its three values. Written here, not in
+  ; MmuEnable(), so that everything MmuEnable() needs is already in
+  ; memory before it is called and its ASM block contains nothing but
+  ; the switch itself.
+  mmu_ttbr = base
+  mmu_tcr  = #MMU_TCR_EL2
+  mmu_mair = #MMU_MAIR_EL2
+
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuDescriptor(base, slot)   - read back one level-1 descriptor.
+;  MmuDescriptorL2(base, slot) - read back one level-2 descriptor.
+;
+;  So a probe can dump and check the tables with the MMU still off.
+;  These exist because "the table builder is correct" is a claim that
+;  should be tested by something other than the table builder, and on
+;  this board the cheapest such thing is a hex dump read by a human
+;  against THE MAP above.
+; ----------------------------------------------------------------------
+Procedure.i MmuDescriptor(base.i, slot.i)
+  ProcedureReturn PeekI(base + (slot << 3))
+EndProcedure
+
+Procedure.i MmuDescriptorL2(base.i, slot.i)
+  ProcedureReturn PeekI(base + 4096 + (slot << 3))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEnable() - THE SWITCH. The single most dangerous sequence here.
+;
+;  Call ONLY after MmuBuildTables() has returned 0. Everything it needs
+;  is already in mmu_ttbr / mmu_tcr / mmu_mair, so this block does no
+;  arithmetic and makes no decisions - it moves three values into three
+;  registers and sets one bit.
+;
+;  THE ORDER, and why each step is there rather than being tidy:
+;
+;    dsb sy          the table stores must be complete and visible to
+;                    the table walker before anything can walk them.
+;                    v2025.01_armv8_mmu.h:113 opens set_ttbr_tcr_mair()
+;                    with exactly this.
+;    tlbi alle2      discard any stale EL2 translation. U-Boot does the
+;                    equivalent immediately before mmu_setup()
+;                    (v2025.01_cache_v8.c:815). There should be nothing
+;                    cached with the MMU off, and "should be" is not a
+;                    reason to skip a single instruction here.
+;    dsb sy / isb    the invalidate must complete before the new
+;                    settings land.
+;    msr ttbr0_el2   the three registers, in U-Boot's order
+;    msr tcr_el2     (v2025.01_armv8_mmu.h:119-121).
+;    msr mair_el2
+;    dsb sy / isb    :129 ends set_ttbr_tcr_mair() with isb; the dsb is
+;                    ours and is free.
+;    set SCTLR_EL2.M v2025.01_cache_v8.c:747 - read, or in CR_M, write.
+;                    A READ-MODIFY-WRITE, never a bare store: every
+;                    other bit in that register, including the RES1
+;                    bits stage 0 measured as $30C50830, has to survive.
+;    isb             v2025.01_arm_system.h:202 ends set_sctlr() with it.
+;                    Without this the next instruction may be fetched
+;                    under the old regime, which is the definition of
+;                    undefined behaviour at the worst possible moment.
+;
+;  THE MAP IS IDENTITY, so the instruction after the enable is at the
+;  same address it was before and the fetch resolves. That is not a
+;  happy accident, it is the property that makes this survivable.
+;
+;  x9 and x10 are the scratch registers, the same ones
+;  anvil.pi4:1305-1321 uses in its ASM blocks.
+;
+;  `orr x9, x9, x10` rather than an immediate: the assembler's logical
+;  immediate encoding is a bitmask form this file does not need to rely
+;  on, and a register is unambiguous.
+; ----------------------------------------------------------------------
+Procedure MmuEnable()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; ------------------------------------------------------------------
+  ;  THE EL3 TWIN, added 2026-09-07. Chosen at RUN TIME, because one
+  ;  image has to boot under either stub - see the EL3 block up beside
+  ;  MmuAtEl3() for the whole argument.
+  ;
+  ;  THE TWO ARMS ARE DUPLICATED RATHER THAN FACTORED, and that is
+  ;  deliberate. The obvious tidy-up is one helper called from both with
+  ;  the register name passed in, which this assembler cannot express -
+  ;  a system register is part of the instruction, not an operand. The
+  ;  next tidy-up is a helper per level called from the middle of the
+  ;  sequence, and that puts a stack push and pop between the register
+  ;  loads and the enable. MmuDisableCached()'s note records what a
+  ;  memory round trip cost here once already, measured on this silicon:
+  ;  a store and a load a few instructions apart did NOT round-trip
+  ;  through the D-cache, the mask read back as all ones, and the MMU
+  ;  stayed on with nothing to see. Two copies of eighteen instructions
+  ;  is cheaper than one copy of that bug.
+  ;
+  ;  THE VALUES ARE THE SAME ONES. #MMU_TCR_EL2 and #MMU_MAIR_EL2 are
+  ;  correct for the EL3 registers too: TCR_EL3 and MAIR_EL3 have the
+  ;  same field layout as their EL2 twins, both being the one-VA-range
+  ;  no-VHE format. That is why there is no #MMU_TCR_EL3 to disagree
+  ;  with them.
+  ;
+  ;  REASONED, NOT MEASURED. No board has run this arm.
+  ; ------------------------------------------------------------------
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      tlbi alle3
+      dsb sy
+      isb
+
+      adrp x9, global_mmu_ttbr
+      add  x9, x9, #:lo12:global_mmu_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el3, x9
+
+      adrp x9, global_mmu_tcr
+      add  x9, x9, #:lo12:global_mmu_tcr
+      ldr  x9, [x9]
+      msr  tcr_el3, x9
+
+      adrp x9, global_mmu_mair
+      add  x9, x9, #:lo12:global_mmu_mair
+      ldr  x9, [x9]
+      msr  mair_el3, x9
+
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el3
+      movz x10, #1
+      orr  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+    EndASM
+  Else
+  ASM
+    dsb sy
+    tlbi alle2
+    dsb sy
+    isb
+
+    adrp x9, global_mmu_ttbr
+    add  x9, x9, #:lo12:global_mmu_ttbr
+    ldr  x9, [x9]
+    msr  ttbr0_el2, x9
+
+    adrp x9, global_mmu_tcr
+    add  x9, x9, #:lo12:global_mmu_tcr
+    ldr  x9, [x9]
+    msr  tcr_el2, x9
+
+    adrp x9, global_mmu_mair
+    add  x9, x9, #:lo12:global_mmu_mair
+    ldr  x9, [x9]
+    msr  mair_el2, x9
+
+    dsb sy
+    isb
+
+    mrs  x9, sctlr_el2
+    movz x10, #1
+    orr  x9, x9, x10
+    msr  sctlr_el2, x9
+    isb
+  EndASM
+  EndIf
+  CompilerElse
+  ; The assembler cannot encode ttbr0_el2/tcr_el2/mair_el2 yet. A nop
+  ; rather than a build error, so the table builder above stays
+  ; testable; MmuBuildable() reports 0, so a probe can tell the
+  ; difference between "the MMU did not come on" and "this build cannot
+  ; turn it on" without being told which it is.
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuDisable() - put it back exactly as it was.
+;
+;  Clears SCTLR_EL2.M and invalidates the TLB. Nothing else has to be
+;  undone, because stage 1 never sets CR_C or CR_I: no cache was ever
+;  enabled, so there is nothing dirty to clean and
+;  v2025.01_cache_v8.c:826-850's flush_dcache_all() has no work to do
+;  here. It is NOT called, and that is a stage-1-only shortcut which
+;  stops being valid the moment stage 2 sets CR_C.
+;
+;  `movn x10, #1` puts $FFFF_FFFF_FFFF_FFFE in x10 - the inverse of bit
+;  0 - so the `and` clears M and preserves every other bit. There is no
+;  `bic` in this assembler, which is why the mask is built rather than
+;  written.
+;
+;  WHY A PROBE DISABLES BEFORE RETURNING. The monitor is entered with
+;  the MMU off and every payload after this one expects that. Handing
+;  Anvil back a translation regime it does not know about would make
+;  the NEXT payload's failure the mystery, which is the worst way to
+;  spend a bench session.
+; ----------------------------------------------------------------------
+Procedure MmuDisable()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; The EL3 twin - see MmuEnable() for why the arms are duplicated.
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      mrs  x9, sctlr_el3
+      movn x10, #1
+      and  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+      tlbi alle3
+      dsb sy
+      isb
+    EndASM
+  Else
+  ASM
+    dsb sy
+    mrs  x9, sctlr_el2
+    movn x10, #1
+    and  x9, x9, x10
+    msr  sctlr_el2, x9
+    isb
+    tlbi alle2
+    dsb sy
+    isb
+  EndASM
+  EndIf
+  CompilerElse
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ======================================================================
+;  STAGE 2/3 - THE CACHES-ON PATH.  Enable M | C | I, and disable it
+;              again, for a caller that has taken on the coherency work.
+;
+;  MmuEnable()/MmuDisable() above set ONLY M and are a non-event: with C
+;  clear the Write-Back DRAM descriptors behave Non-Cacheable and no
+;  driver's DMA discipline changes. The two procedures here set C and I
+;  as well, which is what finally caches DRAM - and the moment they are
+;  used, every `dc` site in every DMA driver stops being a no-op and has
+;  to be correct. Do not reach for these without having read the coherency
+;  section of RaspberryPi4/Lib/v3d.pi4 and the DMA AUDIT above.
+;
+;  ---- THE ONE ASYMMETRY WITH THE M-ONLY PATH, STATED PLAINLY ---------
+;
+;  MmuDisable() can clear M with no cleanup because stage 1 never dirties
+;  a line. The caches-on path DOES, so the architecturally-correct
+;  disable is "clean+invalidate the whole D-cache by set/way, then clear
+;  C". THAT SEQUENCE CANNOT BE WRITTEN IN THIS DIALECT: it needs to read
+;  CLIDR_EL1, CCSIDR_EL1 and write CSSELR_EL1 to discover the cache
+;  geometry, and RaspberryPi4/A64Assembler.pbi:810-815 lists all three as
+;  having no encoding - `mrs x0, clidr_el1` is a hard build error, not a
+;  wrong one. The `dc cisw` set/way op itself IS encodable; the registers
+;  that drive its loop are not.
+;
+;  So the clean is done BY VIRTUAL ADDRESS instead (MmuCleanRange, which
+;  is `dc cvac` - the same substitution U-Boot's flush_dcache_range makes
+;  for a bounded region). THE CALLER OWNS IT: before MmuDisableCached()
+;  every region the CPU wrote while cached must have been cleaned by VA,
+;  either through this file's MmuCleanRange() or through v3d.pi4's
+;  V3dCacheRange() during the frame. What cannot be reached this way is
+;  the payload's own stack and globals at the instant of the disable -
+;  including MmuDisableCached()'s own frame - and those few lines are left
+;  dirty. That is SAFE HERE and unsafe in general, for reasons that are a
+;  property of this bench and must be re-checked anywhere else:
+;    * the monitor this returns to runs with caches OFF, so it never HITS
+;      a stale line, and with nothing allocating into the cache nothing
+;      EVICTS one over fresh DRAM either;
+;    * it shares no physical page with the payload's stack ($3000000) or
+;      image ($400000+);
+;    * the supervisor reboots between runs, and reset clears the caches.
+;  A resident consumer (Anvil) does NOT get this for free and must grow a
+;  real set/way flush - which means the assembler learning CLIDR/CCSIDR
+;  first. That is the honest blocker for wiring caches into the monitor.
+; ----------------------------------------------------------------------
+
+; #MMU_CACHE_LINE - the clean stride. 64, the Cortex-A72 D-cache line and
+; the same value v3d.pi4:1138 uses for V3dCacheRange. It cannot be read
+; from CTR_EL0 (ctr_el0 has no encoding either, A64Assembler.pbi:814), so
+; it is fixed. Striding by the true line size or LESS is what correctness
+; needs: 64 is the A72's line, and were it ever smaller this would miss
+; lines - which is the one thing to re-verify if this runs on other sil
+; icon. Rounding the range start down covers a partial leading line.
+#MMU_CACHE_LINE = 64
+
+; ----------------------------------------------------------------------
+;  MmuCleanLine() - clean (to the point of coherency) the one line named
+;  by mmu_flushaddr. `dc cvac`, clean ONLY: it writes a dirty line back to
+;  DRAM and leaves it valid, which is exactly what flushing CPU writes out
+;  before disabling the cache wants - no invalidate, nothing discarded.
+;  "ldr x9", never "ldr w9": mmu_flushaddr is a .i, eight bytes; the
+;  narrow load would drop the top half of the address (v3d.pi4:1305-1309).
+; ----------------------------------------------------------------------
+Procedure MmuCleanLine()
+  ASM
+    adrp x9, global_mmu_flushaddr
+    add  x9, x9, #:lo12:global_mmu_flushaddr
+    ldr  x9, [x9]
+    dc cvac, x9
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuCleanRange(addr, len) - clean every line the range touches, then a
+;  single barrier. The start rounds DOWN by divide-and-multiply, not by
+;  masking, because "addr & $FFFFFFC0" is a 32-bit literal that would
+;  clear the top half of a 64-bit address (v3d.pi4:1339-1343). Addresses
+;  here are physical and positive, so the divide is exact.
+; ----------------------------------------------------------------------
+Procedure MmuCleanRange(addr.i, len.i)
+  Protected a.i
+  Protected e.i
+  If len <= 0
+    ProcedureReturn
+  EndIf
+  a = (addr / #MMU_CACHE_LINE) * #MMU_CACHE_LINE
+  e = addr + len
+  While a < e
+    mmu_flushaddr = a
+    MmuCleanLine()
+    a = a + #MMU_CACHE_LINE
+  Wend
+  MmuBarrier()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuInvalidateDCacheAll() - invalidate (DISCARD, do NOT clean) the
+;  ENTIRE data cache by set/way, every level to the Level of Coherency.
+;  This is the operation the ARM ARM requires BEFORE enabling the data
+;  cache from reset: out of reset the cache lines are in an UNKNOWN
+;  state - valid bits and contents are not defined - so turning C on
+;  without this exposes stale garbage lines that shadow DRAM.
+;
+;  `dc isw` (invalidate by set/way), NOT `dc cisw`: at enable-from-cold
+;  C is still clear, so every store the monitor made went straight to
+;  DRAM and DRAM is authoritative. There is nothing to write back and a
+;  clean would push the unknown garbage lines OUT to DRAM, corrupting
+;  it. Invalidate discards; that is the whole point.
+;
+;  PROVEN NECESSARY ON SILICON 2026-08-29: pi4MmuFlush enabled caches
+;  from cold and the first post-enable access read garbage (Main
+;  diverged, returned a wrong x0); a second run, with the caches already
+;  warm, passed. The only variable was the starting cache state. See
+;  Bugs\ in the vault. The walk itself is byte-for-byte MmuFlushDCacheAll
+;  below, with `dc isw` in place of `dc cisw` and its own labels; the
+;  set/way operand and the clz way-shift are identical and equally
+;  verified.
+;
+;  ONE TIGHT ASM BLOCK, NO MEMORY, NO STACK - the same rule as the flush.
+; ----------------------------------------------------------------------
+Procedure MmuInvalidateDCacheAll()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ASM
+    dsb  sy
+    mrs  x10, clidr_el1              ; x10 = CLIDR_EL1
+    lsr  x11, x10, #24
+    movz x13, #7
+    and  x11, x11, x13              ; x11 = LoC (CLIDR bits 26:24)
+    cbz  x11, mmuInvAllDone         ; LoC == 0: no cache to invalidate
+    movz x0, #0                     ; x0 = cache level, from 0
+mmuInvAllLevel:
+    lsl  x12, x0, #1
+    add  x12, x12, x0               ; x12 = 3 * level
+    lsr  x12, x10, x12              ; x12 = CLIDR >> (3*level)
+    movz x13, #7
+    and  x12, x12, x13              ; x12 = Ctype for this level
+    cmp  x12, #2
+    b.lt mmuInvAllSkip              ; < 2: no data or unified cache here
+    lsl  x12, x0, #1                ; x12 = level<<1 (CSSELR value and
+    msr  csselr_el1, x12            ;         the isw Level field)
+    isb                             ; sync the CSSELR change before read
+    mrs  x6, ccsidr_el1             ; x6 = CCSIDR_EL1 for this level
+    movz x13, #7
+    and  x2, x6, x13
+    add  x2, x2, #4                 ; x2 = log2(line size in bytes)
+    lsr  x3, x6, #3
+    movz x13, #1023
+    and  x3, x3, x13                ; x3 = associativity - 1 (ways - 1)
+    clz  w5, w3                     ; w5 = 32 - ceil(log2(ways)) = way shift
+    lsr  x4, x6, #13
+    movz x13, #32767
+    and  x4, x4, x13                ; x4 = number of sets - 1
+mmuInvAllSet:
+    mov  x7, x3                     ; x7 = ways - 1, reset each set
+mmuInvAllWay:
+    lsl  x9, x7, x5                 ; x9 = way << way-shift
+    orr  x8, x12, x9                ; x8 = (level<<1) | (way<<shift)
+    lsl  x9, x4, x2                 ; x9 = set << log2(line)
+    orr  x8, x8, x9                 ; x8 = full set/way operand
+    dc   isw, x8                    ; invalidate by set/way (discard)
+    subs x7, x7, #1                 ; next way
+    b.ge mmuInvAllWay
+    subs x4, x4, #1                 ; next set
+    b.ge mmuInvAllSet
+mmuInvAllSkip:
+    add  x0, x0, #1                 ; next level
+    cmp  x11, x0
+    b.gt mmuInvAllLevel             ; while level < LoC
+    movz x0, #0
+    msr  csselr_el1, x0             ; leave CSSELR selecting level 0
+    dsb  sy                         ; all set/way ops complete before return
+    isb
+mmuInvAllDone:
+  EndASM
+  CompilerElse
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEnableCached() - THE SWITCH, WITH THE CACHES ON. Identical to
+;  MmuEnable() above except for the SCTLR_EL2 bits it sets: M | C | I via
+;  mmu_scset, not M alone. Call ONLY after MmuBuildTables() returned 0.
+;
+;  THE D-CACHE IS INVALIDATED FIRST, when C is currently off. Out of
+;  reset the data cache is NOT empty in the way the firmware's C-clear
+;  might suggest - the ARM ARM leaves the lines in an UNKNOWN state, and
+;  on this BCM2711 (proven 2026-08-29) enabling C over those unknown
+;  lines makes the first post-enable access read garbage and diverge.
+;  MmuInvalidateDCacheAll() discards them by set/way before C goes on.
+;  It is guarded on C being clear so an already-cached re-entry does NOT
+;  invalidate live dirty lines - only the cold, dangerous transition
+;  pays for it, and it is microseconds. An `ic iallu` is still issued
+;  before I is set (U-Boot's icache_enable does the same,
+;  v2025.01_cache_v8.c:1053-1056).
+;
+;  ORDER is MmuEnable()'s exactly - table stores visible, TLB flushed,
+;  ttbr/tcr/mair loaded, barriers - up to the final SCTLR write, which
+;  ORs mmu_scset instead of a bare movz #1. The map is identity, so the
+;  instruction after the enable resolves at the same address.
+; ----------------------------------------------------------------------
+Procedure MmuEnableCached()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; Cold transition only: discard the unknown reset-state D-cache lines
+  ; before C exposes them. Skipped when C is already set, so a re-entry
+  ; over live cached data does not throw that data away.
+  ; MmuSctlr(), not MmuSctlrEl2(): the cold-transition test asks whether
+  ; the data cache of THE LEVEL WE ARE AT is currently off, and at EL3
+  ; that is SCTLR_EL3.C. Reading the EL2 register here would test a bit
+  ; nothing is using - and get it wrong in the dangerous direction,
+  ; because the stub leaves SCTLR_EL2.C clear, so the invalidate would
+  ; run every time including over live dirty lines.
+  If (MmuSctlr() & #MMU_SCTLR_C) = 0
+    MmuInvalidateDCacheAll()
+  EndIf
+  mmu_scset = #MMU_SCTLR_MCI
+  ; The EL3 twin - see MmuEnable() for why the arms are duplicated.
+  ; #MMU_SCTLR_MCI is one constant for both levels because SCTLR_EL3
+  ; shares SCTLR_EL2's layout: M at bit 0, C at bit 2, I at bit 12.
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      tlbi alle3
+      dsb sy
+      isb
+
+      adrp x9, global_mmu_ttbr
+      add  x9, x9, #:lo12:global_mmu_ttbr
+      ldr  x9, [x9]
+      msr  ttbr0_el3, x9
+
+      adrp x9, global_mmu_tcr
+      add  x9, x9, #:lo12:global_mmu_tcr
+      ldr  x9, [x9]
+      msr  tcr_el3, x9
+
+      adrp x9, global_mmu_mair
+      add  x9, x9, #:lo12:global_mmu_mair
+      ldr  x9, [x9]
+      msr  mair_el3, x9
+
+      dsb sy
+      isb
+
+      ic iallu
+      dsb sy
+      isb
+
+      mrs  x9, sctlr_el3
+      adrp x10, global_mmu_scset
+      add  x10, x10, #:lo12:global_mmu_scset
+      ldr  x10, [x10]
+      orr  x9, x9, x10
+      msr  sctlr_el3, x9
+      isb
+    EndASM
+  Else
+  ASM
+    dsb sy
+    tlbi alle2
+    dsb sy
+    isb
+
+    adrp x9, global_mmu_ttbr
+    add  x9, x9, #:lo12:global_mmu_ttbr
+    ldr  x9, [x9]
+    msr  ttbr0_el2, x9
+
+    adrp x9, global_mmu_tcr
+    add  x9, x9, #:lo12:global_mmu_tcr
+    ldr  x9, [x9]
+    msr  tcr_el2, x9
+
+    adrp x9, global_mmu_mair
+    add  x9, x9, #:lo12:global_mmu_mair
+    ldr  x9, [x9]
+    msr  mair_el2, x9
+
+    dsb sy
+    isb
+
+    ic iallu
+    dsb sy
+    isb
+
+    mrs  x9, sctlr_el2
+    adrp x10, global_mmu_scset
+    add  x10, x10, #:lo12:global_mmu_scset
+    ldr  x10, [x10]
+    orr  x9, x9, x10
+    msr  sctlr_el2, x9
+    isb
+  EndASM
+  EndIf
+  CompilerElse
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuDisableCached() - put it back exactly as it was, caches and all.
+;
+;  Clears M, C and I together and invalidates the TLB and the I-cache. It
+;  does NOT flush the D-cache - see THE ONE ASYMMETRY above for why it
+;  cannot; MmuDisableCachedFlushed() is the composition that does, in the
+;  safe order. The caller must have cleaned every region whose contents
+;  matter before calling this.
+;
+;  THE MASK IS BUILT IN A REGISTER, NOT READ FROM MEMORY. `movn x10,#4101`
+;  puts ~(M|C|I) straight into x10 - 4101 = $1005 = #MMU_SCTLR_MCI, and
+;  movn stores the bitwise INVERSE of its immediate, so the "derive it,
+;  never recall the constant" rule (mailbox.pi4:239-240) is honoured by
+;  the hardware rather than by a hand-typed $FFFFFFFFFFFFEFFA. There is no
+;  `bic` in this assembler, which is why it is an inverted mask AND-ed.
+;
+;  WHY NOT A MEMORY GLOBAL - which is what this DID, and it was wrong.
+;  It stored the mask to mmu_scclr and read it back in the ASM. That store
+;  happens with the D-cache STILL ON, so it lands in the cache - and on
+;  this A72 the `ldr` a few instructions later did NOT reliably read it
+;  back. The resident monitor's first `cache off` read all-ones, the AND
+;  changed nothing, and the MMU stayed on with SCTLR_EL2 unmoved at
+;  $30C51835. PROVEN ON SILICON 2026-08-29. A register-built mask has no
+;  such same-core store/load round trip and cannot fail that way. (The
+;  enable's mmu_scset round trip is fine because it runs with C already
+;  OFF, so its store and load both go straight to DRAM.)
+; ----------------------------------------------------------------------
+Procedure MmuDisableCached()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ; The EL3 twin - see MmuEnable() for why the arms are duplicated, and
+  ; note that the argument is at its strongest HERE: this is the
+  ; procedure whose memory round trip failed on this silicon.
+  If MmuAtEl3() <> 0
+    ASM
+      dsb sy
+      mrs  x9, sctlr_el3
+      movn x10, #4101                ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
+      and  x9, x9, x10               ; clear M, C and I in one AND
+      msr  sctlr_el3, x9
+      isb
+      ic iallu
+      tlbi alle3
+      dsb sy
+      isb
+    EndASM
+  Else
+  ASM
+    dsb sy
+    mrs  x9, sctlr_el2
+    movn x10, #4101                  ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
+    and  x9, x9, x10                 ; clear M, C and I in one AND
+    msr  sctlr_el2, x9
+    isb
+    ic iallu
+    tlbi alle2
+    dsb sy
+    isb
+  EndASM
+  EndIf
+  CompilerElse
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuReadClidrEl1() - the raw CLIDR_EL1.
+;
+;  It names the cache hierarchy: LoC (bits 26:24) is the number of
+;  levels flush_dcache_all must walk, and Ctype<n> (three bits each,
+;  starting at bit 0) says what kind of cache each level has. This is
+;  returned undecoded on purpose, the same way MmuSctlrEl2() is: the
+;  diagnostic prints it beside the decoded fields so the decode can be
+;  checked against the raw value. clidr_el1 = (3,1,0,0,1),
+;  A64Assembler.pbi cites it to llvm...SystemOperands.td:717.
+; ----------------------------------------------------------------------
+Procedure.i MmuReadClidrEl1()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ASM
+    mrs x0, clidr_el1
+  EndASM
+  CompilerElse
+  ASM
+    movz x0, #0
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuReadCcsidrForLevel(level) - CCSIDR_EL1 for one cache level.
+;
+;  Selects the level by writing CSSELR_EL1 = level<<1 (bit 0 = 0 means
+;  data or unified, which is the only kind a D-cache flush touches),
+;  ISBs so the selection takes effect, then reads CCSIDR_EL1. The raw
+;  value carries, in the no-CCIDX layout this A72 uses: LineSize bits
+;  2:0 (log2(bytes)-4), Associativity bits 12:3 (ways-1), NumSets bits
+;  27:13 (sets-1). The caller decodes; this returns the fact.
+;
+;  `level` arrives in x0 by the calling convention and is used before
+;  anything clobbers it, exactly as RaspberryPi4/Lib/atomic.pi4 takes
+;  its first argument from x0. csselr_el1 = (3,2,0,0,0) RWSysReg and
+;  ccsidr_el1 = (3,1,0,0,0) ROSysReg; A64Assembler.pbi cites both.
+;
+;  SIDE EFFECT: it leaves CSSELR_EL1 selecting `level`. That is
+;  harmless - CSSELR only steers which cache CCSIDR reports, it changes
+;  no caching behaviour - and MmuFlushDCacheAll() restores CSSELR to 0
+;  when it finishes anyway.
+; ----------------------------------------------------------------------
+Procedure.i MmuReadCcsidrForLevel(level.i)
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ASM
+    lsl  x0, x0, #1
+    msr  csselr_el1, x0
+    isb
+    mrs  x0, ccsidr_el1
+  EndASM
+  CompilerElse
+  ASM
+    movz x0, #0
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuFlushDCacheAll() - clean AND invalidate the ENTIRE data cache by
+;  set/way, every level to the Level of Coherency. This is the operation
+;  the resident monitor (Anvil) needs before it disables the MMU for a
+;  payload jump: a payload expects the MMU off and the caches clean, and
+;  a clean-by-VA cannot cover the whole cache the way this does.
+;
+;  CALL THIS WITH THE D-CACHE ALREADY OFF (SCTLR.C clear). A set/way walk
+;  issued while C is on races the A72's live allocation and L1<->L2 line
+;  migration and intermittently misses lines - proven alternating on
+;  silicon 2026-08-29 (see MmuDisableCachedFlushed and pi4MmuCycle*). The
+;  correct teardown is MmuDisableCached() FIRST, then this; that composed
+;  operation is MmuDisableCachedFlushed(), and it is what callers want.
+;
+;  PORTED FROM U-Boot's __asm_flush_dcache_all / __asm_dcache_all /
+;  __asm_dcache_level (arch/arm/cpu/armv8/cache.S). The C wrapper is in
+;  RaspberryPi4/Reference/v2025.01_cache_v8.c:768 (flush_dcache_all);
+;  the set/way assembly itself is in cache.S, which is NOT in this tree,
+;  so the algorithm below is the canonical one and every step says what
+;  it does. The standard walk: read CLIDR_EL1 for LoC; for each level
+;  whose Ctype is >= 2 (has a data or unified cache) select it in
+;  CSSELR_EL1, ISB, read CCSIDR_EL1 for the line-size / associativity /
+;  set count, then loop every set x every way issuing `dc cisw`
+;  (clean+invalidate by set/way); finish with `dsb sy`.
+;
+;  ONE TIGHT ASM BLOCK, NO MEMORY, NO STACK. U-Boot's own comment on
+;  flush_dcache_all is "This function needs to be inline to avoid using
+;  stack" (v2025.01_cache_v8.c:765): a set/way maintenance loop that
+;  touched memory between operations could re-dirty a line it had just
+;  cleaned. So this is written the way RaspberryPi4/Lib/atomic.pi4
+;  writes its primitives - one ASM block that reads and writes ONLY
+;  registers x0..x13, not a global, not a parameter slot, not the stack.
+;  The high-level loop of MmuCleanRange() above is deliberately NOT the
+;  model here: that cleans a handful of named lines by VA and a stack
+;  access between iterations is harmless; a whole-cache set/way walk
+;  cannot afford one.
+;
+;  THE SET/WAY OPERAND for `dc cisw` (Arm ARM, DC CISW): Level at bits
+;  3:1, Way at bits 31:(32-A) where A = ceil(log2(associativity)), Set
+;  at bits (L+S-1):L where L = log2(line bytes). U-Boot builds it as
+;  (level<<1) | (way << clz(ways-1)) | (set << log2(line)); clz(ways-1)
+;  is exactly 32-A, which is why `clz` had to be added to the assembler.
+;
+;  REGISTER MAP (all caller-clobberable, like every ASM block in this
+;  file): x10 CLIDR, x11 LoC and loop bound, x0 level; per level x12
+;  level<<1, x2 log2(line), x3 ways-1, x4 set counter, x5 way shift,
+;  x6 CCSIDR, x7 way counter, x8 cisw operand, x9/x13 scratch.
+;
+;  WHAT A WRONG ENCODING WOULD DO: walk the wrong set/way range and
+;  either clean too little (dirty lines survive - the exact failure the
+;  MMU-off read-back in pi4MmuFlush.pi4 is built to catch) or issue a
+;  malformed maintenance op. Every instruction below is one the
+;  assembler's own probe and capstone agree on, and the three system
+;  registers were verified against two reference tables before use.
+; ----------------------------------------------------------------------
+Procedure MmuFlushDCacheAll()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ASM
+    dsb  sy
+    mrs  x10, clidr_el1              ; x10 = CLIDR_EL1
+    lsr  x11, x10, #24
+    movz x13, #7
+    and  x11, x11, x13              ; x11 = LoC (CLIDR bits 26:24)
+    cbz  x11, mmuFlushAllDone       ; LoC == 0: nothing to clean
+    movz x0, #0                     ; x0 = cache level, from 0
+mmuFlushAllLevel:
+    lsl  x12, x0, #1
+    add  x12, x12, x0               ; x12 = 3 * level
+    lsr  x12, x10, x12              ; x12 = CLIDR >> (3*level)
+    movz x13, #7
+    and  x12, x12, x13              ; x12 = Ctype for this level
+    cmp  x12, #2
+    b.lt mmuFlushAllSkip            ; < 2: no data or unified cache here
+    lsl  x12, x0, #1                ; x12 = level<<1 (CSSELR value and
+    msr  csselr_el1, x12            ;         the cisw Level field)
+    isb                             ; sync the CSSELR change before read
+    mrs  x6, ccsidr_el1             ; x6 = CCSIDR_EL1 for this level
+    movz x13, #7
+    and  x2, x6, x13
+    add  x2, x2, #4                 ; x2 = log2(line size in bytes)
+    lsr  x3, x6, #3
+    movz x13, #1023
+    and  x3, x3, x13                ; x3 = associativity - 1 (ways - 1)
+    clz  w5, w3                     ; w5 = 32 - ceil(log2(ways)) = way shift
+    lsr  x4, x6, #13
+    movz x13, #32767
+    and  x4, x4, x13                ; x4 = number of sets - 1
+mmuFlushAllSet:
+    mov  x7, x3                     ; x7 = ways - 1, reset each set
+mmuFlushAllWay:
+    lsl  x9, x7, x5                 ; x9 = way << way-shift
+    orr  x8, x12, x9                ; x8 = (level<<1) | (way<<shift)
+    lsl  x9, x4, x2                 ; x9 = set << log2(line)
+    orr  x8, x8, x9                 ; x8 = full set/way operand
+    dc   cisw, x8                   ; clean+invalidate by set/way
+    subs x7, x7, #1                 ; next way
+    b.ge mmuFlushAllWay
+    subs x4, x4, #1                 ; next set
+    b.ge mmuFlushAllSet
+mmuFlushAllSkip:
+    add  x0, x0, #1                 ; next level
+    cmp  x11, x0
+    b.gt mmuFlushAllLevel           ; while level < LoC
+    movz x0, #0
+    msr  csselr_el1, x0             ; leave CSSELR selecting level 0
+    dsb  sy                         ; all set/way ops complete before return
+    isb
+mmuFlushAllDone:
+  EndASM
+  CompilerElse
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuDisableCachedFlushed() - the safe teardown Anvil calls before a
+;  payload jump. Clears M, C and I, then cleans+invalidates the WHOLE
+;  D-cache by set/way - ALL IN ONE ASM BLOCK, on purpose.
+;
+;  TWO CONSTRAINTS THAT TOGETHER FORCE THE INLINE SHAPE, both proven on
+;  silicon 2026-08-29:
+;
+;  1. THE SET/WAY WALK MUST RUN WITH C ALREADY OFF. U-Boot's
+;     dcache_disable() (Reference/v2025.01_cache_v8.c:826-849) clears
+;     C|M first and only THEN flush_dcache_all(). A set/way clean issued
+;     while C is still on races the A72's live allocation / L1<->L2 line
+;     migration and misses lines - pi4MmuCycle alternated pass/fail;
+;     pi4MmuCycleDF (clear C, then flush) passed 8/8.
+;
+;  2. NO STACK MAY BE TOUCHED BETWEEN CLEARING C AND THE FLUSH FINISHING.
+;     This is why U-Boot's flush is "inline to avoid using stack"
+;     (cache.S / cache_v8.c:765). The instant C is cleared, a stack load
+;     goes to DRAM and NO LONGER hits the dirty cache line that holds the
+;     current value - so a procedure epilogue's `ldr x30,[sp]` between the
+;     clear and the flush reads a STALE return address. The first cut of
+;     this split the work across MmuDisableCached()+MmuFlushDCacheAll();
+;     MmuDisableCached cleared C and then its OWN epilogue read x30 back
+;     from DRAM before anything had flushed it - `cache off` in the
+;     resident monitor left SCTLR_EL2 unmoved at $30C51835 and the whole
+;     thing wandered. Inlining removes every stack access between the two.
+;
+;  So: prologue saves x30 with C ON (a dirty line); the ASM block clears
+;  C|M and then walks set/way cleaning EVERY dirty line - this function's
+;  frame and its callers' among them - out to DRAM; the epilogue then
+;  reads x30 back with C off, from the DRAM the flush just wrote. The A72
+;  caches are PIPT, so a line allocated under the identity map keeps its
+;  physical tag once M is clear and set/way needs no translation, so the
+;  clean lands the monitor's writes at the same physical address a stock
+;  MMU-off payload reads them from.
+;
+;  Registers: x9/x10 for the SCTLR clear, then x0-x8,x11-x13 for the walk
+;  (all caller-clobberable). x30 and sp are never touched here, so the procedure
+;  epilogue owns them.
+; ----------------------------------------------------------------------
+Procedure MmuDisableCachedFlushed()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ASM
+    ; --- WHICH LEVEL, DECIDED INSIDE THE ASM. 2026-09-07 --------------
+    ;
+    ; Every other procedure in this file takes its EL3 twin as a whole
+    ; duplicated ASM block under an If. THIS ONE CANNOT, for two reasons
+    ; that both come from the constraints above:
+    ;
+    ;   * the walk below carries LABELS, and two copies of it would be
+    ;     two definitions of mmuDcfLevel, mmuDcfSet and the rest - a
+    ;     build error, and renaming them gives two walks that have to be
+    ;     kept identical by hand for ever;
+    ;   * an If around two blocks would put the level test between the
+    ;     caller's frame and the clear, which is fine, but the natural
+    ;     way to write it in the host language reads a value from memory,
+    ;     and constraint 2 is that NOTHING may touch the stack between
+    ;     the clear and the end of the flush.
+    ;
+    ; So the level is read into x14 here, ONCE, and tested twice - at the
+    ; SCTLR clear and at the TLB invalidate. x14 is not touched by the
+    ; walk (which uses x0-x8 and x9-x13), so it survives.
+    ;
+    ; REASONED, NOT MEASURED. No board has run the EL3 arm.
+    dsb  sy
+    mrs  x14, currentel
+    lsr  x14, x14, #2
+    movz x13, #3
+    and  x14, x14, x13              ; x14 = the exception level, 0..3
+    cmp  x14, #3
+    b.ne mmuDcfClearEl2
+    ; --- clear M, C, I at EL3 -----------------------------------------
+    mrs  x9, sctlr_el3
+    movn x10, #4101                 ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
+    and  x9, x9, x10
+    msr  sctlr_el3, x9
+    b    mmuDcfCleared
+mmuDcfClearEl2:
+    ; --- clear M, C, I: MMU and both caches off -----------------------
+    mrs  x9, sctlr_el2
+    movn x10, #4101                 ; x10 = ~(M|C|I); 4101 = $1005 = #MMU_SCTLR_MCI
+    and  x9, x9, x10
+    msr  sctlr_el2, x9
+mmuDcfCleared:
+    isb
+    ; --- clean+invalidate the whole D-cache by set/way, INLINE --------
+    ; Byte-for-byte MmuFlushDCacheAll's walk, but here with no procedure
+    ; boundary between it and the clear above, so nothing reads a stale
+    ; frame. dc cisw runs with C off (constraint 1); no stack (constraint 2).
+    dsb  sy
+    mrs  x10, clidr_el1
+    lsr  x11, x10, #24
+    movz x13, #7
+    and  x11, x11, x13              ; x11 = LoC
+    cbz  x11, mmuDcfDone
+    movz x0, #0                     ; x0 = level
+mmuDcfLevel:
+    lsl  x12, x0, #1
+    add  x12, x12, x0
+    lsr  x12, x10, x12
+    movz x13, #7
+    and  x12, x12, x13              ; Ctype
+    cmp  x12, #2
+    b.lt mmuDcfSkip
+    lsl  x12, x0, #1                ; level<<1 = CSSELR and cisw Level field
+    msr  csselr_el1, x12
+    isb
+    mrs  x6, ccsidr_el1
+    movz x13, #7
+    and  x2, x6, x13
+    add  x2, x2, #4                 ; log2(line bytes)
+    lsr  x3, x6, #3
+    movz x13, #1023
+    and  x3, x3, x13                ; ways - 1
+    clz  w5, w3                     ; way shift
+    lsr  x4, x6, #13
+    movz x13, #32767
+    and  x4, x4, x13                ; sets - 1
+mmuDcfSet:
+    mov  x7, x3
+mmuDcfWay:
+    lsl  x9, x7, x5
+    orr  x8, x12, x9
+    lsl  x9, x4, x2
+    orr  x8, x8, x9
+    dc   cisw, x8                   ; clean+invalidate by set/way
+    subs x7, x7, #1
+    b.ge mmuDcfWay
+    subs x4, x4, #1
+    b.ge mmuDcfSet
+mmuDcfSkip:
+    add  x0, x0, #1
+    cmp  x11, x0
+    b.gt mmuDcfLevel
+    movz x0, #0
+    msr  csselr_el1, x0
+mmuDcfDone:
+    dsb  sy
+    isb
+    ic   iallu
+    ; The second use of x14. The EL2 and EL3 translation regimes have
+    ; SEPARATE TLB entries, so invalidating the wrong one leaves the
+    ; regime we are actually using holding stale translations - silently,
+    ; because a stale translation of an identity map looks exactly like a
+    ; correct one until something is remapped.
+    cmp  x14, #3
+    b.ne mmuDcfTlbiEl2
+    tlbi alle3
+    b    mmuDcfTlbiDone
+mmuDcfTlbiEl2:
+    tlbi alle2
+mmuDcfTlbiDone:
+    dsb  sy
+    isb
+  EndASM
+  CompilerElse
+  ASM
+    nop
+  EndASM
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuEnabled() - 1 if the M bit of the SCTLR OF THE LEVEL WE ARE AT is
+;  set, 0 if not.
+;
+;  Reads the live register rather than remembering what was written,
+;  which is the difference between an instrument and a comment.
+;
+;  IT READS MmuSctlr() AND NOT MmuSctlrEl2(), 2026-09-07, and the
+;  difference is not cosmetic. At EL3 the translation regime in force is
+;  EL3's, so SCTLR_EL2.M answers a question about a level nothing is
+;  running at - and answers it WRONG IN THE DANGEROUS DIRECTION either
+;  way round. Left as it was, `cache on` at EL3 would set SCTLR_EL3.M
+;  and this would keep reporting 0 while the caches were live; and if a
+;  future path wrote SCTLR_EL2.M from EL3 this would report 1 while
+;  every access still ran untranslated. Callers use it to decide whether
+;  a payload jump has to quiesce the caches, so a wrong answer here is a
+;  payload entered with dirty lines the board never wrote back.
+; ----------------------------------------------------------------------
+Procedure.i MmuEnabled()
+  If (MmuSctlr() & #MMU_SCTLR_M) = #MMU_SCTLR_M
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MmuBuildable() - 1 if this build can actually turn the MMU on.
+;
+;  So a probe reports "this image was built before the assembler learned
+;  the registers" as a distinct outcome instead of silently doing
+;  nothing and looking like a hardware result.
+; ----------------------------------------------------------------------
+Procedure.i MmuBuildable()
+  CompilerIf #MMU_HAVE_EL2_REGS = 1
+  ProcedureReturn 1
+  CompilerElse
+  ProcedureReturn 0
+  CompilerEndIf
+EndProcedure
+
+; ======================================================================
+;  THE DOCUMENTS - RESOLVED 2026-08-26
+; ======================================================================
+;
+;  THIS SECTION IS HISTORY NOW. Everything below WAS the blocking list,
+;  and all four items were closed the same day by four small files
+;  placed in RaspberryPi4/Reference/ - in the repo, versioned, with a
+;  README. Read that README before reading the rest of this section.
+;
+;    TCR field bit positions   -> v2025.01_armv8_mmu.h:83-104
+;    MAIR encoding             -> v2025.01_armv8_mmu.h:34-38
+;    descriptor layout         -> v2025.01_armv8_mmu.h:45-68
+;    T0SZ to starting level    -> v2025.01_cache_v8.c:121-138
+;    SCTLR M/A/C/SA/I/WXN bits -> v2025.01_arm_system.h:12-17
+;    MSR/MRS encodings         -> v6.12_arm64_sysreg.h:507,516,518,543
+;
+;  Arm DDI 0487 itself is still NOT on this machine and was NOT needed.
+;  If some later field is named by none of those four files, DOWNLOAD
+;  the manual. DO NOT SEARCH THE DRIVES FOR IT - that is now a standing
+;  rule, written into RaspberryPi4/Reference/README.md, and it exists
+;  because an agent spawned to hunt for this exact document ended up
+;  enumerating the C drive and had to be killed.
+;
+;  The original analysis is kept below because the REASONING is still
+;  worth having - in particular which sources look authoritative and
+;  are not, which is the part that costs a session to rediscover.
+;
+;  STAGE 1 IS BLOCKED, AND THE BLOCK IS NARROWER THAN IT LOOKS. The
+;  whole disk was searched on 2026-08-26 - every PDF, TXT, HTML and CHM
+;  on C: and D: - and the result is worth writing down precisely,
+;  because "we need the ARM ARM" is too coarse an ask to act on and
+;  most of what stage 1 needs turns out to be citable already.
+;
+;  ---- WHAT IS ALREADY CITABLE, AND FROM WHERE ------------------------
+;
+;  Datasheets/arm-a64-instruction-set.txt is NOT just the instruction
+;  set. It is document 111182 (ID102025), 30 June 2026, and it carries
+;  the COMPLETE SHARED PSEUDOCODE volume from about line 467000 on.
+;  That pseudocode is the behavioural VMSA specification and it states
+;  descriptor bit positions literally, as array subscripts:
+;
+;    descriptor type, bits [1:0]        :495774-495806
+;                                        bit 0 = 0 is invalid; bit 1
+;                                        picks table vs block at a
+;                                        non-final level, page at the
+;                                        final one
+;    AttrIndx, bits [4:2]               :496050-496058
+;    NS, bit [5]                        :496023
+;    AP, bits [7:6]                     :495840
+;    SH, bits [9:8]                     :496062
+;    AF, bit [10]                       :496283, :496348
+;    nG, bit [11]                       :496110
+;    nT, bit [16]                       :495947
+;    DBM, bit [51]                      :495848
+;    PXN, bit [53] / UXN and XN, bit [54]  :495838-495845
+;    table descriptor hierarchical permissions:
+;      APTable [62:61], UXNTable [60], PXNTable [59]   :495876-495878
+;    next-table output address, 4 KB granule: [47:12]  :493210
+;    leaf output address                               :493257
+;
+;    MAIR attribute byte encodings      :514901-515065
+;      attr '0000xxxx' is Device, with the device type in attr[3:2]:
+;        00 nGnRnE, 01 nGnRE, 10 nGRE, 11 GRE          :514901
+;      attr '01000000' is Normal Inner and Outer Non-cacheable
+;      otherwise outer = attr[7:4], inner = attr[3:0], decoded by
+;        DecodeLDFAttr at :514914
+;      and Attr<n> is simply byte n of the register       :492878
+;
+;    the PS / IPS 3-bit size encoding   :493224-493232
+;      000=32, 001=36, 010=40, 011=42, 100=44, 101=48, 110=52, 111=56
+;
+;  Datasheets/pi4/armstub8.S:136-141 gives SCTLR_EL2 = $30C50830 with
+;  the RES1 bits set and M/A/C/SA/I/WXN clear, which is what
+;  #MMU_SCTLR_EL2_STUB above is built on.
+;
+;  ---- WHAT IS MISSING. FOUR THINGS, AND ONLY FOUR -------------------
+;
+;    1. THE BIT POSITIONS OF THE TCR_EL2 FIELDS: T0SZ, IRGN0, ORGN0,
+;       SH0, TG0, PS, and TBI. The pseudocode names every one of them
+;       and uses them - TCR_EL2().TG0, TCR_EL2().T0SZ and the rest are
+;       gathered at :497292-497342 - but it never says where they sit.
+;       A grep for the register-description style "bits [15:14]" across
+;       the whole 10.9 MB file returns ZERO matches. There are no
+;       register field tables in it at all.
+;
+;       WITHOUT THIS, TCR_EL2 CANNOT BE COMPOSED. It is one 64-bit
+;       value and every field in it is in the wrong place if any one
+;       position is wrong, and the failure mode is a translation regime
+;       that is subtly not the one intended - a granule that is not
+;       4 KB, or an address space that is 25 bits instead of 36 -
+;       rather than a clean refusal.
+;
+;    2. THE MSR ENCODINGS for TTBR0_EL2, TCR_EL2 and MAIR_EL2, i.e.
+;       their op0/op1/CRn/CRm/op2 quadruples. Needed so the maintainer of
+;       RaspberryPi4/A64Assembler.pbi can add them to
+;       A64SystemRegBase() exactly the way the EL2 block at :475-479
+;       was added. Until then `msr tcr_el2, x0` is a build error.
+;
+;    3. THE SCTLR_EL2 BIT POSITIONS for M, C and I. Not needed to
+;       MEASURE the current state - #MMU_SCTLR_EL2_STUB handles that
+;       without them - but needed to SET them in stage 1.
+;
+;    4. Confirmation of the level/granule geometry: which starting
+;       level a given T0SZ implies for a 4 KB granule. The pseudocode
+;       computes it; the table is not stated.
+;
+;  ---- THE EXACT DOCUMENT TO FETCH -----------------------------------
+;
+;      Arm Architecture Reference Manual for A-profile architecture,
+;      Arm DDI 0487 (D17 or later). Chapter D8, "The AArch64 Virtual
+;      Memory System Architecture", plus the D24 register descriptions
+;      for SCTLR_EL2, TCR_EL2, TTBR0_EL2 and MAIR_EL2.
+;
+;  ANY ONE of these would also close it, and two are much smaller:
+;
+;      U-Boot arch/arm/include/asm/armv8/mmu.h  - has TCR_EL2 field
+;        shifts, the MAIR values and the descriptor macros as C
+;        #defines, and is a few hundred lines.
+;      U-Boot arch/arm/cpu/armv8/cache_v8.c     - the worked enable
+;        sequence, including the barrier and TLBI ordering.
+;      Linux arch/arm64/include/asm/pgtable-hwdef.h + sysreg.h - the
+;        same information, and sysreg.h's sys_reg(op0,op1,crn,crm,op2)
+;        macros close item 2 as well.
+;
+;  None of those is on this machine. The pi4/uboot/ folder is a 33-file
+;  DRIVER extract with no arch/ directory at all - see the vault's
+;  "Raspberry Pi 4/Reference sources on disk - MAP.md" - and the only
+;  AArch64 system-register MMU line in the whole of Datasheets/ is the
+;  SCTLR_EL2 write in armstub8.S quoted above.
+;
+;  ---- WHAT IS ON THE DISK AND IS NOT SUFFICIENT ---------------------
+;
+;  Recorded so nobody re-checks these three and reaches the same dead
+;  ends:
+;
+;    Datasheets/armv8m-architecture-reference-manual.pdf/.txt is the
+;      WRONG PROFILE - DDI0553B.z, Armv8-M. M-profile has a Memory
+;      Protection Unit and no page tables at all. Its MPU_MAIR0/1
+;      attribute byte does happen to agree with A-profile's, and that
+;      agreement is a trap: the register names collide across the two
+;      profiles and the bit positions do not.
+;    Datasheets/bcm2711-peripherals.pdf documents the SoC. The MMU is
+;      in the ARM core, not in the SoC.
+;    Datasheets/pi4/v3d/linux/v3d_mmu.c is a page table format, and it
+;      is the V3D GPU's own single-level IOMMU, nothing to do with the
+;      CPU's VMSA. Its own SOURCES.md calls it "THE PAGE TABLE FORMAT",
+;      which is exactly how somebody ends up building a CPU page table
+;      out of a GPU one.
+;
+;  Working from memory here is specifically forbidden and specifically
+;  fatal. RaspberryPi4/Lib/mailbox.pi4:239-240 is the house rule: a
+;  number that could only be recalled rather than read does not belong
+;  in this tree. A page-table descriptor is the purest case of it - a
+;  wrong bit position assembles clean, walks clean, and produces a
+;  board that needs a human at the mains.
+; ======================================================================

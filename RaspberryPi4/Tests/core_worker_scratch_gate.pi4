@@ -1,0 +1,52 @@
+; Interpreter fixture: substitute the raw MMU join with the strongest legal
+; scratch-clobbering callee. The secondary must retain core/context/row only in
+; the documented x19..x30 preserved set across this call.
+Procedure str_print_at(*text)
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Procedure.i MmuSecondaryTtbr0()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MmuSecondaryTcr()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MmuSecondaryMair()
+  ProcedureReturn 0
+EndProcedure
+
+ProcedureNaked MmuSecondaryJoinRaw()
+  ASM
+    movz x0, #0
+    movz x1, #0
+    movz x2, #0
+    movz x3, #0
+    movz x4, #0
+    movz x5, #0
+    movz x6, #0
+    movz x7, #0
+    movz x8, #0
+    movz x9, #0
+    movz x10, #0
+    movz x11, #0
+    movz x12, #0
+    movz x13, #0
+    movz x14, #0
+    movz x15, #0
+    movz x16, #0
+    movz x17, #0
+    movz x18, #0
+    movz x0, #1
+    ret
+  EndASM
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/core_worker.pi4"
+
+Procedure.i Main()
+  ProcedureReturn CoreRawBootBase() = CoreRawRowBase()
+EndProcedure

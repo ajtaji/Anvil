@@ -1,0 +1,431 @@
+; ======================================================================
+;  hw_con.pi4 - the Pi 4 backend for the HwCon* seam.
+;
+;  THE PAYLOAD OWNS THE PIXELS AND ANVIL OWNS THE DEVICE. This file is the
+;  one place that knows this board draws into a mailbox-allocated linear
+;  framebuffer at 32 bits per pixel; Anvil/Hal/abi.pbi above it knows only
+;  rectangles, text runs and a tier code.
+;
+;  It is thin over RaspberryPi4/Lib/display.pi4 (the surface: base, pitch,
+;  geometry) and RaspberryPi4/Board/display.pi4 (the smooth-text
+;  rasteriser and its three fonts). It re-drives nothing - the same
+;  discipline hw_usb.pi4 states for the xHCI stack.
+;
+;  INCLUDE ORDER: after RaspberryPi4/Lib/display.pi4,
+;  RaspberryPi4/Monitor/anvil_fonts.pi4, RaspberryPi4/Board/display.pi4
+;  (DrawSmoothText, SmoothTextWidth) and RaspberryPi4/Board/screen_source.pi4
+;  (ScrPresent - see THE PRESENT below), and before Anvil/Hal/abi.pbi, which
+;  calls this. House rule 10: this file includes nothing itself.
+;
+; ----------------------------------------------------------------------
+;  THE PRESENT, AND THE DAY IT WAS MISSING
+; ----------------------------------------------------------------------
+;  A PAYLOAD'S FRAME HAS TO BE PRESENTED AND THIS FILE IS WHERE THAT
+;  HAPPENS. HwConFrameEnd used to clean a cache line and return, which is
+;  the whole of what an HDMI surface needs - the firmware scans the same
+;  bytes the caller drew into - and is not the whole of what the DSI panel
+;  needs on the rotation this board actually runs at.
+;
+;  The panel scans 800 x 1280 PORTRAIT and nothing changes that. The
+;  console is used landscape, so at 90 and 270 the monitor adopts a
+;  LOGICAL 1280 x 800 surface (#MON_FB_DRAW, pitch 5120) and ScrPresent
+;  transposes the rows that changed into the portrait buffer the scaler
+;  reads (#MON_FB_SCAN, pitch 3200). Every drawing primitive in this file
+;  writes into the adopted surface, which is the logical one - correctly -
+;  and until today NOTHING MOVED THOSE BYTES TO THE PANEL for a payload.
+;
+;  What that cost: a UI payload ran four times returning 0, having drawn
+;  a complete and correctly laid out frame, with the panel showing either
+;  the console it had replaced or a turned mixture of the two. Every
+;  number said the run was clean. The pixels never left the back buffer.
+;
+;  SO THE PAYLOAD'S FRAME CONTRACT IS THE SAME AS THE TOUCH GROUP'S, IN
+;  THE OTHER DIRECTION. The touch seam hands a payload SCREEN pixels
+;  "already turned and scaled, so no payload ever learns which way up the
+;  panel is bolted"; a payload that had to learn the panel's rotation to
+;  put a pixel back would be the same fact discovered twice, in two
+;  places, with two chances to disagree. The payload draws in LOGICAL
+;  screen coordinates - HwConWidth() by HwConHeight() - and the BOARD
+;  turns them. There is no rotation, no pitch and no physical geometry
+;  anywhere in the published console group, deliberately.
+;
+;  IT IS DAMAGE-DRIVEN, for the same reason the console's own present is.
+;  A transpose of the whole panel is 1,024,000 pixels through a processor
+;  loop with the caches off; a UI that repaints one band should pay for
+;  one band. HwConRect and HwConText widen the band, HwConFrameBegin
+;  clears it, HwConFrameEnd presents exactly it. A frame that drew nothing
+;  presents nothing rather than a screenful of unchanged pixels.
+;
+;  AT ROTATION 0 AND 180, AND ON HDMI, ScrPresent RETURNS ON A COMPARISON
+;  and the cost is the cache maintenance alone - the bytes drawn are the
+;  bytes scanned. There is no flag here and no second path: one call,
+;  which the seam below the console knows how to make cheap.
+;
+; ----------------------------------------------------------------------
+;  WHY THE PIXELS ARE WRITTEN BY A PLAIN LOOP AND NOT BY THE DMA ENGINE
+; ----------------------------------------------------------------------
+;  The monitor's own console scrolls with DMA channel 0 and RunAt takes
+;  that channel back on every return, because "a payload must not leave a
+;  bus master running underneath the monitor" (cache.pi4). A payload
+;  filling rectangles through the same channel would be the mirror of that
+;  problem - two owners, one engine, no agreement - and the monitor is not
+;  running to arbitrate while the payload has the machine.
+;
+;  A processor loop needs no arbitration, cannot be left running, and is
+;  fast enough for a UI that redraws rectangles rather than whole screens.
+;  HwConTier() reports #HW_TIER_CPU honestly rather than claiming a tier
+;  this path does not use, so a payload that measures its frame cost knows
+;  what it measured.
+;
+; ----------------------------------------------------------------------
+;  THE ONE HONEST LIMITATION, SAID OUT LOUD RATHER THAN DISCOVERED
+; ----------------------------------------------------------------------
+;  THIS BOARD HAS THREE FONTS AND ONE SIZE. anvil_fonts.pi4 carries sans,
+;  serif and condensed, each rasterised at a single line height (57, 58
+;  and 57 pixels). The ABI's SvcText takes a pixel height because a UI
+;  wants one; this backend cannot honour it, so HwConTextHeight() reports
+;  the height the board actually draws at and a payload that lays out
+;  against the number it asked for rather than the number it got will draw
+;  outside its own boxes.
+;
+;  Scaled or multi-size text is real work (a second rasteriser, or a
+;  distance field) and it is not Phase A. Reporting the truth costs one
+;  procedure; pretending would cost somebody an afternoon in front of a
+;  screen wondering why the rows overlap.
+; ======================================================================
+
+; The tier vocabulary. In Anvil/Hal/hal.pbi's portable set, restated here
+; only in the comment: #HW_TIER_V3D / _DMA / _CPU.
+
+; ----------------------------------------------------------------------
+;  THE DAMAGE BAND - logical rows, inclusive, for the frame now open.
+;
+;  hwConDmg = 0 means NOTHING WAS DRAWN, which is a different state from
+;  "row 0 was drawn" and has to be, or every empty frame would transpose
+;  a row nobody touched. The band is in the same logical coordinates the
+;  caller draws in, because that is what ScrPresent takes.
+; ----------------------------------------------------------------------
+Global hwConDmg.i
+Global hwConDmgY0.i
+Global hwConDmgY1.i
+
+; Widen the band by logical rows y .. y + h - 1. Called from every
+; primitive that puts a pixel down, and from nowhere else; a primitive
+; that draws without calling this is a band of the screen that stops
+; updating and nothing in the drawing code is wrong.
+Procedure HwConDamage(y.i, h.i)
+  Define y1.i
+  If h <= 0
+    ProcedureReturn
+  EndIf
+  y1 = y + h - 1
+  If y < 0
+    y = 0
+  EndIf
+  If y1 < y
+    ProcedureReturn
+  EndIf
+  If hwConDmg = 0
+    hwConDmg = 1
+    hwConDmgY0 = y
+    hwConDmgY1 = y1
+    ProcedureReturn
+  EndIf
+  If y < hwConDmgY0
+    hwConDmgY0 = y
+  EndIf
+  If y1 > hwConDmgY1
+    hwConDmgY1 = y1
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Geometry. Straight from the surface the mailbox allocated.
+; ----------------------------------------------------------------------
+Procedure.i HwConWidth()
+  ProcedureReturn DisplayWidth()
+EndProcedure
+
+Procedure.i HwConHeight()
+  ProcedureReturn DisplayHeight()
+EndProcedure
+
+Procedure.i HwConTier()
+  ProcedureReturn #HW_TIER_CPU
+EndProcedure
+
+; The single line height this board's fonts are rasterised at. See the
+; limitation note above.
+Procedure.i HwConTextHeight()
+  ProcedureReturn #FONT_sans_LINEH
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConFrameBegin / HwConFrameEnd
+;
+;  THERE IS NO BACK BUFFER ON THIS PATH AND THE SEAM SAYS SO. The
+;  monitor's V3D console can double-buffer; this direct path draws
+;  straight into the visible surface, so Begin only checks that a surface
+;  exists and End is where the cost is measured.
+;
+;  Begin returns 1 when there is a surface to draw on, 0 when there is
+;  not - which on this board means the mailbox never gave the monitor a
+;  framebuffer, and a payload that drew anyway would be writing to
+;  address 0.
+; ----------------------------------------------------------------------
+Procedure.i HwConFrameBegin()
+  If DisplayReady() = 0
+    ProcedureReturn 0
+  EndIf
+  If DisplayBase() = 0
+    ProcedureReturn 0
+  EndIf
+  ; AND THERE HAS TO BE A ROUTE TO THE GLASS, NOT ONLY A SURFACE. A
+  ; payload that drew a complete frame into a buffer nothing scans and
+  ; returned cleanly is the failure that cost four board runs; the
+  ; screen is the whole of what a UI has to say, so it is refused here
+  ; rather than discovered by somebody watching a dark panel. The
+  ; question is asked in screen_source.pi4, which owns the answer.
+  If ScrPresentable() = 0
+    ProcedureReturn 0
+  EndIf
+  ; A NEW FRAME HAS DRAWN NOTHING YET. The band left over from the last
+  ; one would present rows this frame never touched, which is free on a
+  ; correct picture and is exactly how a stale row survives a redraw.
+  hwConDmg = 0
+  hwConDmgY0 = 0
+  hwConDmgY1 = 0
+  ProcedureReturn 1
+EndProcedure
+
+; THIS IS THE PAYLOAD'S PRESENT. See THE PRESENT in the header for what
+; it is and for the day it was not here.
+;
+; The cache maintenance covers the rows that were DRAWN, in the surface
+; that was drawn into; ScrPresent then moves those rows onto the panel
+; and does its own maintenance on the bytes it writes there. At rotation
+; 0 and 180 and on HDMI the two surfaces are the same bytes and
+; ScrPresent returns on a comparison, so the flush below is the whole of
+; what those paths need - which is why it is here and not inside the
+; rotation case.
+Procedure.i HwConFrameEnd()
+  Define h.i
+  If DisplayReady() = 0
+    ProcedureReturn 0
+  EndIf
+  If hwConDmg = 0
+    ProcedureReturn 1
+  EndIf
+  If hwConDmgY0 < 0
+    hwConDmgY0 = 0
+  EndIf
+  If hwConDmgY1 > DisplayHeight() - 1
+    hwConDmgY1 = DisplayHeight() - 1
+  EndIf
+  If hwConDmgY1 < hwConDmgY0
+    ProcedureReturn 1
+  EndIf
+  h = hwConDmgY1 - hwConDmgY0 + 1
+  DisplayFlushRect(0, hwConDmgY0, DisplayWidth(), h)
+  ScrPresent(hwConDmgY0, hwConDmgY1)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConRect(x, y, w, h, argb) - a filled, alpha-blended rectangle.
+;
+;  THE ONE PRIMITIVE THE WHOLE UI IS BUILT FROM. The V3D study measured
+;  that GlIdeShell makes zero direct draw calls and reduces to a blended
+;  rect, a tinted textured quad and a clip; the ELD's screens are the
+;  same shape.
+;
+;  THE CALLER HAS ALREADY CLIPPED. Anvil/Hal/abi.pbi's SvcRect intersects
+;  against the scissor and against the screen before calling here, because
+;  rectangle arithmetic is not silicon knowledge and belongs where it can
+;  be tested without a board. This procedure still refuses a range it
+;  cannot draw - a second check on the one path that would otherwise write
+;  outside the surface, which is the class of bug that corrupts something
+;  else entirely and is diagnosed hours later.
+;
+;  ALPHA IS THE TOP BYTE. 255 is opaque and takes the fast path with no
+;  read at all; 0 draws nothing; anything between reads the destination
+;  and blends per channel. Blending in integers, 0..255, with the
+;  round-to-nearest term - (a*s + (255-a)*d + 127) / 255 - because
+;  dropping it darkens every translucent overlay by up to one level per
+;  composite, and a UI composites the same panel every frame.
+; ----------------------------------------------------------------------
+Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
+  Define base.i
+  Define pitch.i
+  Define sw.i
+  Define sh.i
+  Define a.i
+  Define sr.i
+  Define sg.i
+  Define sb.i
+  Define row.i
+  Define col.i
+  Define p.i
+  Define d.i
+  Define dr.i
+  Define dg.i
+  Define db.i
+
+  If DisplayReady() = 0
+    ProcedureReturn
+  EndIf
+  base = DisplayBase()
+  If base = 0
+    ProcedureReturn
+  EndIf
+  If w <= 0 Or h <= 0
+    ProcedureReturn
+  EndIf
+
+  sw = DisplayWidth()
+  sh = DisplayHeight()
+  If x < 0
+    w = w + x
+    x = 0
+  EndIf
+  If y < 0
+    h = h + y
+    y = 0
+  EndIf
+  If x + w > sw
+    w = sw - x
+  EndIf
+  If y + h > sh
+    h = sh - y
+  EndIf
+  If w <= 0 Or h <= 0
+    ProcedureReturn
+  EndIf
+
+  a = (argb >> 24) & $FF
+  If a = 0
+    ProcedureReturn
+  EndIf
+  sr = (argb >> 16) & $FF
+  sg = (argb >> 8) & $FF
+  sb = argb & $FF
+
+  ; The band is widened AFTER the clamp above, so it names rows that were
+  ; really written and never rows the clamp threw away.
+  HwConDamage(y, h)
+
+  pitch = DisplayPitch()
+  row = 0
+  While row < h
+    p = base + (y + row) * pitch + x * 4
+    col = 0
+    While col < w
+      If a = 255
+        PokeL(p, argb & $00FFFFFF)
+      Else
+        d = PeekL(p)
+        dr = (d >> 16) & $FF
+        dg = (d >> 8) & $FF
+        db = d & $FF
+        dr = (a * sr + (255 - a) * dr + 127) / 255
+        dg = (a * sg + (255 - a) * dg + 127) / 255
+        db = (a * sb + (255 - a) * db + 127) / 255
+        PokeL(p, (dr << 16) | (dg << 8) | db)
+      EndIf
+      p = p + 4
+      col = col + 1
+    Wend
+    row = row + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConText(x, y, *utf8, argb, bg) - one run of text, baseline at y.
+;
+;  y IS THE BASELINE AND NOT THE TOP, because that is what the rasteriser
+;  underneath takes and because a UI that aligns two runs of different
+;  glyphs aligns their baselines. HwConTextHeight() and the font's ascent
+;  are what a caller converts a top-left box into a baseline with.
+;
+;  THE BACKGROUND IS A PARAMETER AND NOT AN ALPHA. DrawSmoothText blends
+;  each glyph's coverage between fg and bg without reading the surface,
+;  which is what makes it fast and what makes it wrong over a picture. For
+;  the ELD's screens - flat panels of colour - passing the panel's own
+;  colour is exactly right, and it is the caller who knows what that is.
+;
+;  Returns the width drawn.
+; ----------------------------------------------------------------------
+; THE BAND A RUN OF TEXT DAMAGES IS DELIBERATELY GENEROUS AND SAYS SO.
+; y is the baseline, the face has an ascent above it and a descent below,
+; and the console's magnification can make both larger than the unscaled
+; metric this file reports. A band one whole line height above the
+; baseline and half of one below covers the scaled case with room, and
+; the cost of being wrong in the two directions is not symmetrical: a few
+; tens of extra rows in a transpose are microseconds, and a row of
+; letters that never reaches the panel is a screen a driver reads as
+; broken. It is a DAMAGE estimate, not a metric, and nothing lays out
+; against it.
+Procedure.i HwConText(x.i, y.i, *utf8, argb.i, bg.i)
+  Define lh.i
+  If DisplayReady() = 0
+    ProcedureReturn 0
+  EndIf
+  If *utf8 = 0
+    ProcedureReturn 0
+  EndIf
+  lh = HwConTextHeight()
+  HwConDamage(y - lh, lh + lh / 2 + 1)
+  ProcedureReturn DrawSmoothText(x, y, *utf8, 0, argb & $00FFFFFF, bg & $00FFFFFF)
+EndProcedure
+
+Procedure.i HwConTextWidth(*utf8)
+  If *utf8 = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn SmoothTextWidth(*utf8, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConBacklight(pct)
+;
+;  -1, AND THAT IS THE HONEST ANSWER RATHER THAN A NO-OP THAT RETURNS 0.
+;  An HDMI monitor's brightness is the monitor's own, reachable only over
+;  DDC/CI and not at all through this board's framebuffer path. A payload
+;  that dimmed the screen for a night-driving mode and got a silent
+;  success would show the driver a screen that never dims and no reason.
+;  The DSI panel has a real backlight over the mailbox, and when that
+;  backend exists it answers here.
+; ----------------------------------------------------------------------
+Procedure.i HwConBacklight(pct.i)
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwConCapture() - KEEP THE FRAME THE PANEL IS SHOWING.
+;
+;  THE PAYLOAD'S OWN WAY TO ASK FOR A PICTURE. A payload that draws
+;  something worth keeping calls the console group's capture slot when it
+;  has finished presenting; this is what that slot reaches. It is the
+;  same copy the operator's `shot now` makes and the same copy the
+;  monitor takes on a payload's way back, so there is one shape of
+;  capture in the area and one decoder on the host.
+;
+;  IT CAPTURES WHAT THE PANEL IS SCANNING, NOT WHAT THE PAYLOAD DREW
+;  INTO. On this board with the console sideways those are two different
+;  buffers, and the one that matters is the one the glass is reading -
+;  see ScrCaptureToArea in RaspberryPi4/Board/screen_source.pi4 for why a
+;  capture of the drawing buffer would be a picture of an intention.
+;
+;  IT IS AFTER THE PRESENT, NOT INSTEAD OF ONE. This copies; it does not
+;  flip, drain or damage anything. A payload that calls it without having
+;  ended its frame keeps whatever was last presented, which is the honest
+;  answer to the question it asked.
+;
+;  1 on a complete capture, 0 when there is no screen behind the console
+;  or its surface will not fit the area. The seam returns a boolean and
+;  the ABI turns it into a code; the reason a capture was refused is a
+;  property of the board and `shot status` prints it.
+; ----------------------------------------------------------------------
+Procedure.i HwConCapture()
+  ProcedureReturn ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0)
+EndProcedure

@@ -1,0 +1,1231 @@
+
+; ======================================================================
+;  ScreenPump - drain the mirror onto the screen.
+;
+;  Cheap and safe to call when the screen is off: it does nothing.
+;
+;  ====================================================================
+;   IT SKIPS WHAT IT WOULD ONLY SCROLL AWAY, AND THAT IS THE WHOLE FIX
+;  ====================================================================
+;  This procedure used to be four lines: take a character, draw it,
+;  repeat. That is correct and it is what made the board look dead.
+;
+;  The mirror holds 8192 characters. A hex dump line is 78 characters,
+;  so a full ring is about 105 lines - and the console has 60 rows
+;  (1920 x 1080, pitch 7680, 240 cols, under a 120-pixel banner). The
+;  old loop drew all 105, scrolling 105 times to arrive at a screen
+;  showing the last 60. FORTY-FIVE ENTIRE LINES WERE DRAWN AND THEN
+;  THROWN AWAY, and each of the 105 scrolls moved 59 * 16 * 7680 bytes -
+;  7.25 MB - through the framebuffer. Nearly all of the work produced
+;  nothing a human could see.
+;
+;  So the line feeds are COUNTED FIRST. If there are at least as many as
+;  the console has rows, everything before the last screenful is
+;  guaranteed to be scrolled off before the drawing stops, so it is
+;  skipped: one DisplayCls(), then only the survivors, and NO SCROLLING
+;  AT ALL. The final picture is identical - byte for byte, it is the
+;  same screen the old loop arrived at - and the cost drops from 105
+;  scrolls to zero.
+;
+;  Counting costs one pass over at most 8192 bytes of ordinary cached
+;  RAM, which is nothing next to one megabyte-scale scroll.
+;
+;  THE WIRE IS STILL THE RECORD. Nothing is lost that the serial log
+;  does not have; the mirror was already the lossy half (it counts what
+;  it had to drop, and the prompt reports it). This changes which
+;  characters the SCREEN spends its time on, not what the board said.
+;
+;  UartMirrorCount() and UartMirrorAt() are read-only and do not move
+;  the tail - see their note in uart.pi4. The draining loop below is
+;  still UartMirrorGet(), exactly as before.
+; ======================================================================
+; ======================================================================
+;  THE MOUSE CURSOR
+;
+;  Asked 2026-08-28: "put a mouse cursor on the anvil screen if it detects
+;  a mouse so i can see for myself". USB HID was proven the same evening -
+;  a real hand on a real mouse produced dx -2 dy -1 on this board - but a
+;  number in a serial log is not the same as seeing the thing move.
+;
+;  IT COSTS NOTHING WHEN THERE IS NO MOUSE. The attach is tried ONCE,
+;  lazily, the first time the screen is on and the tick runs; if no mouse
+;  answers, gMouseOk stays 0 and every later tick is a single compare.
+;
+;  IT IS RATE LIMITED. Reading a boot-protocol mouse is a control
+;  transfer and costs about 722 us - measured, 10,236 polls, worst case
+;  1254 us. RxByte() spins thousands of times a second waiting for a
+;  character, so polling on every pass would put a millisecond of USB
+;  between the user's keystroke and the monitor seeing it. Once every
+;  8 ms is smoother than the 8 ms bInterval the device itself asks for
+;  and leaves the serial path alone.
+;
+;  SAVE-UNDER, NOT XOR. The pixels beneath the arrow are copied out
+;  before it is drawn and put back before it moves. XOR would be cheaper
+;  and would leave the console text underneath in inverted colours, which
+;  on a screen made of text is worse than the cursor.
+; ======================================================================
+
+; Set by the active GPU screen renderer. It lives here, before
+; v3d_console.pi4 in the include order, so MouseTick never needs a forward
+; reference to that backend. When set, the cursor is part of the next GPU
+; frame and save-under must not touch the renderer's physical back buffer.
+Global gCursorGpuOwned.i = 0
+
+Procedure CursorShape()
+  gCurMask[0]  = $80
+  gCurMask[1]  = $C0
+  gCurMask[2]  = $E0
+  gCurMask[3]  = $F0
+  gCurMask[4]  = $F8
+  gCurMask[5]  = $FC
+  gCurMask[6]  = $FE
+  gCurMask[7]  = $FF
+  gCurMask[8]  = $FC
+  gCurMask[9]  = $DC
+  gCurMask[10] = $8E
+  gCurMask[11] = $0E
+  gCurMask[12] = $07
+  gCurMask[13] = $07
+EndProcedure
+
+; Read the block under the cursor. Straight off the framebuffer rather
+; than through display.pi4, which has no pixel READ.
+Procedure CursorSave(x.i, y.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
+  Define base.i
+  Define pitch.i
+  Define r.i
+  Define c.i
+  base = DisplayBase()
+  pitch = DisplayPitch()
+  If base = 0
+    ProcedureReturn
+  EndIf
+  For r = 0 To #CUR_H - 1
+    For c = 0 To #CUR_W - 1
+      If (x + c) < DisplayWidth() And (y + r) < DisplayHeight()
+        gCurSave[r * #CUR_W + c] = PeekL(base + (y + r) * pitch + (x + c) * 4)
+      Else
+        gCurSave[r * #CUR_W + c] = 0
+      EndIf
+    Next
+  Next
+EndProcedure
+
+Procedure CursorRestore(x.i, y.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
+  Define base.i
+  Define pitch.i
+  Define r.i
+  Define c.i
+  base = DisplayBase()
+  pitch = DisplayPitch()
+  If base = 0
+    ProcedureReturn
+  EndIf
+  For r = 0 To #CUR_H - 1
+    For c = 0 To #CUR_W - 1
+      If (x + c) < DisplayWidth() And (y + r) < DisplayHeight()
+        PokeL(base + (y + r) * pitch + (x + c) * 4, gCurSave[r * #CUR_W + c])
+      EndIf
+    Next
+  Next
+EndProcedure
+
+Procedure CursorDraw(x.i, y.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
+  Define base.i
+  Define pitch.i
+  Define r.i
+  Define c.i
+  Define m.i
+  base = DisplayBase()
+  pitch = DisplayPitch()
+  If base = 0
+    ProcedureReturn
+  EndIf
+  For r = 0 To #CUR_H - 1
+    m = gCurMask[r]
+    For c = 0 To #CUR_W - 1
+      If (m & (128 >> c)) <> 0
+        If (x + c) < DisplayWidth() And (y + r) < DisplayHeight()
+          PokeL(base + (y + r) * pitch + (x + c) * 4, #CUR_COLOUR)
+        EndIf
+      EndIf
+    Next
+  Next
+EndProcedure
+
+; Try ONCE to find a mouse. Everything below is a no-op if this fails.
+; THE MONITOR DOES NOT START USB AT BOOT. PCI Express and the host
+; controller come up inside UsbDiskUp(), which only runs when something
+; wants the boot stick - so at the prompt XhciReady() is 0 and the first
+; version of this attached to nothing, silently. It has to bring the bus
+; up itself.
+;
+; PcieInit() has been seen to take 10.9 seconds on 3 runs out of about 12
+; - not reproducible on demand and still unexplained - so this says what
+; it is doing before it starts. It runs ONCE.
+; ----------------------------------------------------------------------
+;  UsbEnumerate - THE SINGLE USB BRING-UP. PCIe and the xHCI controller
+;  come up ONCE here; the hub-aware walk attaches every keyboard and
+;  mouse AND hands each non-HID device (the boot stick) to
+;  MscSetupCurrent. After it, HID control transfers and MSC bulk
+;  transfers coexist because they target different slots - so the mouse,
+;  the keyboard and the stick are all live at the same time on one
+;  controller. Both the cursor and the storage path call this; it runs
+;  its walk exactly once.
+;
+;  Returns 1 if the controller came up (whether or not a stick or an
+;  input device was found), 0 if PCIe or xHCI would not start.
+; ----------------------------------------------------------------------
+Global gUsbEnum.i = 0
+
+; A kernel-style boot line: two spaces, the subsystem name, dots to a
+; fixed column, then the caller prints the result and the newline. If the
+; board HANGS during a step, the name sits on the screen with no result
+; and names exactly what wedged. gBootLog gates it so the same procedures
+; can be called silently on the lazy path after boot.
+Global gBootLog.i = 0
+
+; The phase codes the boot writes into the record at #MON_PHASE_LO, and
+; the step counter they carry. Declared here, beside gBootLog and above
+; BootStep, because that is the first thing that marks one.
+#BPH_CONFIG_BEGIN = $0001
+#BPH_CONFIG_END   = $0002
+#BPH_STEP_LABEL   = $0200
+#BPH_STEP_WORK    = $0400
+#BPH_PCIE         = $0500
+#BPH_XHCI         = $0600
+#BPH_STEP_SCREEN  = $0700
+#BPH_XHCI_DETAIL  = $0800
+#BPH_XHCI_SCREEN_ENTER = $0900
+#BPH_XHCI_SCREEN_EXIT = $0A00
+
+Global gBootStepN.i = 0
+Procedure bootStrLen(*s)
+  Define n.i
+  n = 0
+  While PeekA(*s + n) <> 0
+    n = n + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+Procedure BootStep(*name)
+  Define i.i
+  ; THE STEP IS COUNTED WHETHER OR NOT IT IS PRINTED, so the number in
+  ; the phase record is the same number on a silent boot as on a logged
+  ; one. A record whose meaning depends on a print flag is not a record.
+  gBootStepN = gBootStepN + 1
+  MonPhaseMark(#BPH_STEP_LABEL | gBootStepN)
+  If gBootLog = 0
+    ProcedureReturn
+  EndIf
+  Print("  ")
+  UartWriteStr(*name)
+  UartWrite(32)
+  i = bootStrLen(*name) + 1
+  While i < 22
+    UartWrite(46)                ; '.'
+    i = i + 1
+  Wend
+  UartWrite(32)
+  ; PUSH THE LABEL OUT ON BOTH CONSOLES BEFORE THE WORK IT NAMES.
+  ;
+  ; The serial line: UartDrain empties the TX FIFO now, so "PCI Express
+  ; ....." is fully transmitted before the step runs. This matters because
+  ; a step's work can disturb the UART - PcieInit() holds it silent for the
+  ; whole of PCIe link training, and anything still in the FIFO when that
+  ; starts is lost (measured 2026-08-29: the label vanished and the log
+  ; jumped straight to its "ok" eleven seconds later). UartDrain is
+  ; spin-capped, so a dead port costs a sub-millisecond timeout, not a hang.
+  ;
+  ; The screen: everything printed goes into a mirror ring that the display
+  ; service drains onto the glass. So without this boundary, the WHOLE
+  ; bring-up log can sit in the ring
+  ; and lands on the screen in one burst at the first prompt - the board
+  ; "sits there then prints everything at once". Pumping here draws the
+  ; label the instant it is written, so the screen shows what is being
+  ; started before the pause, exactly like the wire now does. The service
+  ; also advances bounded banner work, and returns at once with no screen.
+  UartDrain()
+  ; THE SCREEN SERVICE IS ITS OWN PHASE. It is the one thing this
+  ; procedure does that can wedge, it runs between the label and the
+  ; work, and a board stopped in it is indistinguishable from a board
+  ; stopped in the work unless the record separates them.
+  MonPhaseMark(#BPH_STEP_SCREEN | gBootStepN)
+  ScreenServiceTick()
+  MonPhaseMark(#BPH_STEP_WORK | gBootStepN)
+EndProcedure
+Procedure BootOk(*name)
+  ; UartWriteStr, NOT PrintN: *name is a pointer and PrintN routes by
+  ; type, so PrintN(*name) prints the ADDRESS as a decimal number. That
+  ; is the '2819752' the first cut showed where 'ok' belonged.
+  If gBootLog <> 0
+    UartWriteStr(*name)
+    PrintNl()
+    ; Land the result on the screen now, next to the label BootStep
+    ; already drew - otherwise it waits in the mirror ring for the prompt.
+    ScreenServiceTick()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE xHCI STEP SAYS WHICH PART OF ITSELF IS RUNNING - added 2026-09-11.
+;
+;  BootStep's contract is "if the board hangs during a step, the name sits
+;  on the screen with no result and names exactly what wedged". For every
+;  other step that is enough, because a step is one thing. The xHCI step
+;  is seven, and three of them touch a bus that can STALL rather than
+;  answer - the config-space walk, the first read of the controller's own
+;  registers through the PCIe outbound window, and the reset. All seven
+;  produce the same picture from the panel: a label and no result.
+;
+;  Every wait inside xhci.pi4 is bounded and every failure it can describe
+;  comes back as a code with a sentence, so a stop with NO sentence is by
+;  construction not a refusal - it is the machine wedging. The only thing
+;  that can say where is a word printed BEFORE the access. This prints it.
+;
+;  The words go on the same line as the label, after its dots, so a
+;  completed step reads as one line and a wedged one ends at the word for
+;  the piece it was doing. The hook is removed the moment the step is
+;  over: nothing prints on the lazy path a `usb` command takes later.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  AND IT ALSO GOES SOMEWHERE A DIFFERENT IMAGE CAN READ IT - 2026-09-11
+;  evening, after the board said the RAM twin gets all the way through.
+;
+;  WHAT THE TWIN PROVED AND WHAT IT DID NOT. A build-75 twin entered into
+;  DRAM from a running build 55 reached the last xHCI phase and answered
+;  its own console. So the xHCI bring-up is not broken by anything a
+;  second monitor can reach. What a twin CANNOT reach is everything a
+;  cold flash boot does and it does not: the PCIe cold path (the twin
+;  finds the link already trained and adopts it), and - the one the twin
+;  made obvious - the WHOLE SCREEN SERVICE, because the firmware would
+;  not give the twin the DSI power domain, so gScreen was 0 and
+;  BannerClockTick, ScreenPump and the keyboard composer all returned at
+;  their first line.
+;
+;  THAT MATTERS HERE BECAUSE BootStep() CALLS ScreenServiceTick() AFTER
+;  PRINTING ITS LABEL AND BEFORE THE WORK THE LABEL NAMES. A board that
+;  wedges in that tick shows a label with no result - which is exactly
+;  the picture a board that wedges in the work shows, and the two have
+;  nothing else in common. So the marker distinguishes them.
+;
+;  A WORD ON THE PANEL IS NOT ENOUGH ON ITS OWN. It needs the panel to
+;  still be serviced and it needs somebody watching; it survives nothing.
+;  So every marker also goes to #MON_PHASE_LO, which is raw DRAM below
+;  the load address that no image's _start erases and that survives a
+;  reset - so a monitor that boots afterwards can be asked what the one
+;  before it reached. memmap.pi4 argues the address.
+;
+;  THE CODE IS ONE WORD AND IT READS AS HEX:
+;    $0001 / $0002   the configuration half of the boot, begun / done
+;    $02nn           boot step nn printed its label
+;    $07nn           boot step nn is inside ScreenServiceTick
+;    $04nn           boot step nn is doing the work its label names
+;    $05pp           PCIe sub-phase pp   (PciePhaseText)
+;    $06pp           xHCI sub-phase pp   (XhciPhaseText)
+; ----------------------------------------------------------------------
+
+#BPH_MSC_CBW   = $0B00
+#BPH_MSC_CSW   = $0C00
+#BPH_MSC_FAIL  = $0D00
+#BPH_MSC_XFER  = $0E00
+#BPH_STORAGE   = $0F00
+#BPH_MSC_SENSE = $1100
+#BPH_MSC_ASC   = $1200
+#BPH_MSC_READ  = $1300
+
+Procedure MonTrailSayEvent(t.i)
+  Select t
+    Case 0 : Print("a transfer event")
+    Case 1 : Print("a command completion")
+    Case 2 : Print("a port status change")
+    Default : Print("event type ") : PrintDec(t + 32)
+  EndSelect
+EndProcedure
+
+Procedure MonTrailSayScsi(op.i)
+  Select op
+    Case $00 : Print("TEST UNIT READY")
+    Case $03 : Print("REQUEST SENSE")
+    Case $12 : Print("INQUIRY")
+    Case $25 : Print("READ CAPACITY")
+    Case $28 : Print("READ(10)")
+    Case $2A : Print("WRITE(10)")
+    Default  : Print("opcode ") : PutHex2(op)
+  EndSelect
+EndProcedure
+
+; Turn a recorded code back into words. Used by the report the NEXT boot
+; prints, so it has to be able to name a code produced by an image that
+; is no longer running - which is why the step is named by its number and
+; not by its label: a label is a pointer and a pointer does not survive a
+; rebuild, while the order of the boot steps is the boot log's own order.
+Procedure MonPhaseSay(p.i)
+  Define grp.i
+  Define sub.i
+  grp = p & $FF00
+  sub = p & $00FF
+  Select grp
+    Case #BPH_STEP_LABEL
+      Print("boot step ") : PrintDec(sub) : Print(", its label printed")
+    Case #BPH_STEP_SCREEN
+      Print("boot step ") : PrintDec(sub) : Print(", inside the screen service")
+    Case #BPH_STEP_WORK
+      Print("boot step ") : PrintDec(sub) : Print(", doing its work")
+    Case #BPH_PCIE
+      Print("PCI Express: ") : UartWriteStr(PciePhaseText(sub))
+    Case #BPH_XHCI
+      Print("USB host: ") : UartWriteStr(XhciPhaseText(sub))
+    Case #BPH_XHCI_DETAIL
+      If sub >= $E0
+        Print("USB host: a wait for ") : MonTrailSayEvent(sub & $1F) : Print(" RAN OUT")
+      ElseIf sub >= $C0
+        Print("USB host: waiting for ") : MonTrailSayEvent(sub & $1F)
+      Else
+        Print("USB host bring-up detail ") : PrintDec(sub)
+      EndIf
+    Case #BPH_XHCI_SCREEN_ENTER
+      Print("USB host: ") : UartWriteStr(XhciPhaseText(sub)) : Print(", entering the screen service")
+    Case #BPH_XHCI_SCREEN_EXIT
+      Print("USB host: ") : UartWriteStr(XhciPhaseText(sub)) : Print(", back from the screen service")
+    Case #BPH_MSC_CBW
+      Print("USB stick: sending SCSI ") : MonTrailSayScsi(sub)
+    Case #BPH_MSC_CSW
+      Print("USB stick: status came back ") : PrintDec(sub)
+      Select sub
+        Case 0 : Print(" (good)")
+        Case 1 : Print(" (command failed)")
+        Case 2 : Print(" (phase error)")
+      EndSelect
+    Case #BPH_MSC_FAIL
+      Print("USB stick: the command failed, storage error ") : PrintDec(sub)
+    Case #BPH_MSC_XFER
+      Print("USB stick: a bulk transfer did not complete, host completion code ") : PrintDec(sub)
+    Case #BPH_MSC_SENSE
+      Print("USB stick: sense key ") : PrintDec(sub)
+    Case #BPH_MSC_ASC
+      Print("USB stick: additional sense code ") : PutHex2(sub)
+    Case #BPH_MSC_READ
+      Print("USB stick: READ(10) of a block ending in byte ") : PutHex2(sub)
+    Case #BPH_STORAGE
+      Select sub
+        Case 1 : Print("storage: bringing the USB stick up")
+        Case 2 : Print("storage: the stick answered, mounting its filesystem")
+        Case 3 : Print("storage: mounted")
+        Case 4 : Print("storage: the filesystem did not mount")
+        Case 5 : Print("storage: nothing usable on USB, trying the SD card")
+        Default : Print("storage: step ") : PrintDec(sub)
+      EndSelect
+    Default
+      Select p
+        Case #BPH_CONFIG_BEGIN : Print("the configuration half of the boot, just begun")
+        Case #BPH_CONFIG_END   : Print("the configuration half of the boot, finished")
+        Case 0                 : Print("nothing - it did not reach the first marker")
+        Default                : Print("an unknown phase code")
+      EndSelect
+  EndSelect
+EndProcedure
+
+; The report. Printed once, early, by whoever owns the boot - it is the
+; only chance a board that hangs in the same place every time has to say
+; what happened last time.
+; IT IS SILENT UNLESS IT HAS SOMETHING TO SAY, and the three silences are
+; each a real answer rather than a shrug:
+;
+;   no magic          the power was cut between the two boots, or this is
+;                     the first boot of this record. DRAM holds whatever
+;                     it powered up holding and there is nothing to
+;                     report. This is the NORMAL case for a card swap,
+;                     and a line about it on every cold boot would be
+;                     noise on the one path that always takes it.
+;   no previous phase the record exists and the boot before this one
+;                     never reached a marker.
+;   it finished       the previous boot completed the configuration half.
+;                     Saying so every time would be a line that means
+;                     "nothing happened", printed for ever.
+;
+; Everything else is a boot that started this half and did not finish it,
+; which is the whole reason the record exists.
+; THE TRAIL, AS SENTENCES AND AS MACHINE LINES. `last` limits it to the
+; newest entries; 0 prints every one held.
+Procedure MonTrailSay(which.i, last.i)
+  Define n.i
+  Define held.i
+  Define k.i
+  Define code.i
+  n = MonTrailCount(which)
+  held = n
+  If held > #MON_TRAIL_N : held = #MON_TRAIL_N : EndIf
+  k = 0
+  If last > 0 And held > last
+    k = held - last
+  EndIf
+  While k < held
+    code = MonTrailAt(which, k, 0)
+    Print("TRAIL ")
+    PrintDec(which)
+    Print(" ")
+    PutHexN(code, 4)
+    Print(" ")
+    PrintDec(MonTrailAt(which, k, 1))
+    Print(" ms  ")
+    MonPhaseSay(code)
+    PrintNl()
+    k = k + 1
+  Wend
+EndProcedure
+
+; trail - both boots' records, for a host after a boot that stopped.
+Procedure CmdTrail()
+  PrintN("The boot trail: every step of the configuration half, with its millisecond.")
+  If MonTrailValid(#MON_TRAIL_OFF_PREV) = 0
+    PrintN("There is no record of a previous boot (a power cut clears it).")
+  Else
+    Print("The previous boot (boot ")
+    PrintDec(MonTrailPrevBoot())
+    If MonTrailPrevFinished() <> 0
+      PrintN(") FINISHED its configuration half. Its steps (TRAIL 1):")
+    Else
+      PrintN(") DID NOT FINISH its configuration half. Its steps (TRAIL 1), the last")
+      PrintN("one being where it stopped:")
+    EndIf
+    MonTrailSay(1, 0)
+  EndIf
+  Print("This boot (boot ")
+  PrintDec(MonPhaseBoots())
+  PrintN("), TRAIL 0:")
+  MonTrailSay(0, 0)
+EndProcedure
+
+Procedure MonPhaseReport()
+  ; EVERY BOOT SAYS WHAT THE ONE BEFORE IT REACHED, on the screen and the
+  ; serial line, before USB starts (forum 880): a boot that stopped leaves
+  ; its last steps here for whoever is looking at the glass.
+  If MonTrailValid(#MON_TRAIL_OFF_PREV) <> 0
+    If MonTrailPrevFinished() <> 0
+      PrintN("The previous boot finished bringing the board up.")
+    Else
+      PrintN("!! THE PREVIOUS BOOT STOPPED. Its last steps, the final one being where:")
+      MonTrailSay(1, 6)
+      PrintN("   (type trail at the prompt for all of them)")
+    EndIf
+  EndIf
+  If MonPhaseValid() = 0
+    ProcedureReturn
+  EndIf
+  If MonPhasePrev() < 0 Or MonPhasePrev() = #BPH_CONFIG_END
+    ProcedureReturn
+  EndIf
+  Print("!! the previous boot did not finish this half. It stopped at: ")
+  MonPhaseSay(MonPhasePrev())
+  PrintNl()
+  Print("   (phase record at $001FB000; ")
+  PrintDec(MonPhaseBoots())
+  PrintN(" boots have written it)")
+EndProcedure
+
+Procedure PciePhaseWord()
+  MonPhaseMark(#BPH_PCIE | PciePhase())
+  If gBootLog = 0
+    ProcedureReturn
+  EndIf
+  If PciePhase() = #PCIE_PH_DONE
+    ProcedureReturn
+  EndIf
+  UartWriteStr(PciePhaseText(PciePhase()))
+  UartWrite(32)
+  UartDrain()
+  ScreenServiceTick()
+EndProcedure
+
+Procedure UsbTraceWord()
+  ; ONLY WHILE THE BOOT IS BEING RECORDED. The host's event waits and the
+  ; storage steps mark through this hook too (forum 880), and at the prompt
+  ; they would rewrite the phase word on every keyboard poll. A code of
+  ; $100 or more is a whole marker of its own (the storage steps); below
+  ; that it is an xHCI detail code, as it always was.
+  If MonTrailRecording() = 0
+    ProcedureReturn
+  EndIf
+  If XhciTrace() >= $100
+    MonPhaseMark(XhciTrace())
+  Else
+    MonPhaseMark(#BPH_XHCI_DETAIL | XhciTrace())
+  EndIf
+EndProcedure
+
+Procedure UsbPhaseWord()
+  ; THE MARK FIRST, ALWAYS, and before anything that can wait. An
+  ; instrument that only records when the log is on records nothing on
+  ; the path that matters.
+  MonPhaseMark(#BPH_XHCI | XhciPhase())
+  If gBootLog = 0
+    ProcedureReturn
+  EndIf
+  If XhciPhase() = #XHCI_PH_DONE
+    ; BootOk prints the result for this line. Two "ok"s would be a lie
+    ; about how many things finished.
+    ProcedureReturn
+  EndIf
+  UartWriteStr(XhciPhaseText(XhciPhase()))
+  UartWrite(32)
+  UartDrain()
+  MonPhaseMark(#BPH_XHCI_SCREEN_ENTER | XhciPhase())
+  ScreenServiceTick()
+  MonPhaseMark(#BPH_XHCI_SCREEN_EXIT | XhciPhase())
+EndProcedure
+
+Procedure.i UsbEnumerate()
+  Define i.i
+  Define phase.i
+  ; Leave the retained-only hook installed for storage's later retry too.
+  XhciSetTraceHook(@UsbTraceWord)
+  ; AND BIND THE SHARED USB CORE BEFORE ANYTHING ENUMERATES. The mass
+  ; storage bring-up below reads a configuration descriptor through
+  ; Anvil/Bus/usb_core.pbi, and the core carries a control transfer only
+  ; through the two procedures this board hands it. Binding it later -
+  ; when the device listing first asks - would leave the stick's own
+  ; bring-up talking to a null pointer, which the core refuses rather
+  ; than branching to, so the symptom would be a boot with no storage and
+  ; a sentence about a descriptor that would not come back.
+  HwUsbBindCore()
+  If gUsbEnum <> 0
+    ProcedureReturn 1
+  EndIf
+  BootStep("PCI Express")
+  ; SIZE THE INBOUND DMA WINDOW TO THIS BOARD'S MEMORY, before anything
+  ; programs it. PcieTellMemory (RaspberryPi4/Board/hw_mem.pi4) hands the
+  ; driver the number and says so out loud if there is not one. It must
+  ; come before PcieInit: after the window is written, a later number can
+  ; only make the window and the DMA check disagree, which is forum 916.
+  PcieTellMemory()
+  phase = PcieSetPhaseHook(@PciePhaseWord)
+  If PcieInit() = 0
+    PcieSetPhaseHook(phase)
+    BootOk("FAILED - the bus would not start")
+    ProcedureReturn 0
+  EndIf
+  PcieSetPhaseHook(phase)
+  BootOk("link ready")
+  BootStep("USB firmware handover")
+  phase = XhciSetPhaseHook(@UsbPhaseWord)
+  If XhciQuiesceAdopted() = 0
+    XhciSetPhaseHook(phase)
+    BootOk("FAILED - firmware USB handover refused; DMA mapping preserved")
+    ProcedureReturn 0
+  EndIf
+  XhciSetPhaseHook(phase)
+  BootOk("quiesced")
+  BootStep("PCI Express mapping")
+  phase = PcieSetPhaseHook(@PciePhaseWord)
+  If PcieEnumerate() = 0
+    PcieSetPhaseHook(phase)
+    BootOk("FAILED - nothing enumerated on the bus")
+    ProcedureReturn 0
+  EndIf
+  PcieSetPhaseHook(phase)
+  BootOk("ok")
+  BootStep("USB host (xHCI)")
+  phase = XhciSetPhaseHook(@UsbPhaseWord)
+  If XhciInit() = 0
+    XhciSetPhaseHook(phase)
+    BootOk("FAILED - the controller would not start")
+    ProcedureReturn 0
+  EndIf
+  XhciSetPhaseHook(phase)
+  BootOk("ok")
+  BootStep("USB devices")
+  HidFindAndAttachAll()
+  ; Offer every slot the walk addressed but did not keep to storage.
+  i = 0
+  While i < HidOtherCount()
+    If XhciUseSlot(HidOtherSlot(i)) <> 0
+      MscSetupCurrent()
+    EndIf
+    i = i + 1
+  Wend
+  If gBootLog <> 0
+    Define any.i
+    any = 0
+    If HidFind(#HID_PROTO_KEYBOARD) <> 0
+      Print("keyboard")
+      any = 1
+    EndIf
+    If HidFind(#HID_PROTO_MOUSE) <> 0
+      If any <> 0 : Print(", ") : EndIf
+      Print("mouse")
+      any = 1
+    EndIf
+    If XhciBulkReady() <> 0
+      If any <> 0 : Print(", ") : EndIf
+      Print("mass storage")
+      any = 1
+    EndIf
+    If any = 0
+      Print("none found")
+    EndIf
+    PrintNl()
+  EndIf
+  gUsbEnum = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure MouseTryAttach()
+  gMouseTried = 1
+  If XhciReady() = 0
+    PrintN("Looking for a USB mouse or keyboard - this starts PCI Express and")
+    PrintN("the USB host controller, which the monitor does not do at boot, so")
+    PrintN("it may sit here for a few seconds.")
+  EndIf
+  If UsbEnumerate() = 0
+    ProcedureReturn
+  EndIf
+  gMouseH = HidFind(#HID_PROTO_MOUSE)
+  gKbdH   = HidFind(#HID_PROTO_KEYBOARD)
+  If gKbdH <> 0
+    PrintN("A USB keyboard was found, so you can type at this monitor")
+    PrintN("directly - it does not have to come down the serial line.")
+  EndIf
+  If gMouseH = 0
+    If gKbdH = 0
+      PrintN("No USB mouse or keyboard answered, so there is no cursor. The")
+      PrintN("controller is up either way; plug one in and reboot to look again.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  CursorShape()
+  PointerHome()
+  gMouseOk = 1
+  PrintN("A mouse was found on the USB bus, so there is a cursor on the")
+  PrintN("screen now. Move it and it moves; this monitor does not do")
+  PrintN("anything with the buttons yet.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  KeyboardChar() - one character from a USB keyboard, or -1.
+;
+;  And then: "well it gonna need to read a keyboard to so it needs to be in
+;  there anyways". Right - hid.pi4 is linked for the cursor either way,
+;  and a monitor you can only reach down a serial cable is half a
+;  monitor.
+;
+;  Returns only KEY-DOWN events with a printable or control character
+;  that HidKeyChar could map. Releases and dead keys give -1, so RxByte
+;  keeps waiting rather than seeing a phantom keystroke.
+; ----------------------------------------------------------------------
+Procedure.i KeyboardChar()
+  Define n.i
+  Define i.i
+  Define c.i
+  If gKbdH = 0
+    ProcedureReturn -1
+  EndIf
+  n = HidKeyboardPoll(gKbdH)
+  If n <= 0
+    ProcedureReturn -1
+  EndIf
+  For i = 0 To HidKeyEventCount() - 1
+    If HidKeyDown(i) <> 0
+      c = HidKeyCharAt(i)
+      If c > 0
+        ProcedureReturn c
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+; ======================================================================
+;  THE POINTER - ONE ARROW, TWO DEVICES
+; ======================================================================
+;  The mouse moves it by DELTAS and the panel's touch controller puts it
+;  at an ABSOLUTE place, so the position has to belong to the pointer
+;  rather than to either device. That is the whole of this block: one
+;  place where the arrow moves, one place where it is drawn, and a
+;  button that is the OR of what the two devices report.
+;
+;  IT MATTERS THAT THIS IS ONE THING AND NOT TWO. A UI is handed a
+;  pointer position and a pressed flag; if the finger and the mouse each
+;  kept their own, the UI would see two cursors, and the one the hand is
+;  not on would sit forever wherever it was left - which reads as a
+;  hover state that never clears.
+;
+;  THE CLAMP IS TO THE SURFACE, NOT TO THE PANEL. DisplayWidth() and
+;  DisplayHeight() are the console's own surface, whatever rotation and
+;  whatever scale the display layer chose, and the touch path maps into
+;  exactly the same numbers - so a finger on the edge of the glass and a
+;  mouse driven into the same corner arrive at the same pixel.
+; ======================================================================
+
+; PointerPlace - put the arrow at an absolute pixel and redraw it.
+; The one writer of gCurX and gCurY.
+Procedure PointerPlace(nx.i, ny.i)
+  If nx < 0
+    nx = 0
+  EndIf
+  If ny < 0
+    ny = 0
+  EndIf
+  If nx > DisplayWidth() - #CUR_W
+    nx = DisplayWidth() - #CUR_W
+  EndIf
+  If ny > DisplayHeight() - #CUR_H
+    ny = DisplayHeight() - #CUR_H
+  EndIf
+  If gCurShown <> 0 And nx = gCurX And ny = gCurY
+    ProcedureReturn
+  EndIf
+  If gCursorGpuOwned <> 0
+    gCurX = nx
+    gCurY = ny
+    gPtrPlaced = 1
+    gCurShown = 1
+    ConRepaint()
+    ProcedureReturn
+  EndIf
+  If gCurShown <> 0
+    CursorRestore(gCurX, gCurY)
+  EndIf
+  gCurX = nx
+  gCurY = ny
+  gPtrPlaced = 1
+  CursorSave(gCurX, gCurY)
+  CursorDraw(gCurX, gCurY)
+  gCurShown = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PointerHome - put the arrow in the middle of the surface, ONCE.
+;
+;  Called when a pointing device attaches, and it is guarded because
+;  there are two of them now. The mouse's attach used to set the centre
+;  unconditionally; with a finger able to attach first, that would
+;  teleport a cursor somebody had just put somewhere the moment a mouse
+;  was plugged in - and a cursor that moves when nobody moved it is the
+;  kind of thing that gets reported as a fault in the touch.
+;
+;  It also stops the OTHER half of the same problem: without it, a board
+;  whose only pointing device is the panel comes up with an arrow parked
+;  in the top left corner at (0, 0), which is not a position anybody
+;  chose - it is the BSS.
+; ----------------------------------------------------------------------
+Procedure PointerHome()
+  If gPtrPlaced <> 0
+    ProcedureReturn
+  EndIf
+  gCurX = DisplayWidth() / 2
+  gCurY = DisplayHeight() / 2
+  gPtrPlaced = 1
+EndProcedure
+
+; PointerShow - draw it where it already is. Used so the arrow appears
+; the moment a device is found rather than on the first movement.
+Procedure PointerShow()
+  If gCurShown <> 0
+    ProcedureReturn
+  EndIf
+  gCurShown = 1
+  If gCursorGpuOwned <> 0
+    ConRepaint()
+  Else
+    CursorSave(gCurX, gCurY)
+    CursorDraw(gCurX, gCurY)
+  EndIf
+EndProcedure
+
+Procedure PointerHide()
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  gCurShown = 0
+  If gCursorGpuOwned <> 0
+    ConRepaint()
+  Else
+    CursorRestore(gCurX, gCurY)
+  EndIf
+EndProcedure
+
+Procedure.i PointerX()
+  ProcedureReturn gCurX
+EndProcedure
+
+Procedure.i PointerY()
+  ProcedureReturn gCurY
+EndProcedure
+
+; PointerDown - 1 while the pointer is pressed, by either device.
+;
+; THE ENGINE'S FRAME INPUT READS THIS. Neon_ChromeBeginFrame takes a
+; position and a pressed flag and derives the click and the release
+; edges from them, so a finger and a mouse button reach it as the same
+; fact and every widget behaves the same under both.
+Procedure.i PointerDown()
+  If (gPtrBtnMouse & 1) <> 0
+    ProcedureReturn 1
+  EndIf
+  If gPtrBtnTouch <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; PointerButtons - the raw mouse button bits, for a caller that wants
+; the middle or the right one. A touch contact is reported in bit 0 with
+; the left button, because a finger has one button and it is that one.
+Procedure.i PointerButtons()
+  If gPtrBtnTouch <> 0
+    ProcedureReturn gPtrBtnMouse | 1
+  EndIf
+  ProcedureReturn gPtrBtnMouse
+EndProcedure
+
+
+Procedure MouseTick()
+  Define n.i
+  ; No screen, no cursor - and no point paying for the poll.
+  If gScreen = 0
+    ProcedureReturn
+  EndIf
+  If gMouseTried = 0
+    MouseTryAttach()
+  EndIf
+  If gMouseOk = 0
+    ProcedureReturn
+  EndIf
+  ; Rate limit. TickHz() is 54 MHz, so this is once every 8 ms.
+  If (Ticks() - gCurTick) < (TickHz() / 125)
+    ProcedureReturn
+  EndIf
+  gCurTick = Ticks()
+
+  n = HidMousePoll(gMouseH)
+  ; A negative return is an error, not an idle mouse. Three in a row and
+  ; the device is gone (unplugged, or the bus was reset underneath us);
+  ; keep polling and every one of them costs a control timeout.
+  If n < 0
+    gMouseMiss = gMouseMiss + 1
+    If gMouseMiss >= 3
+      gMouseOk = 0
+      gPtrBtnMouse = 0
+      If gTouchOk = 0
+        PointerHide()
+        PrintN("The mouse stopped answering, so the cursor is gone.")
+      Else
+        PrintN("The mouse stopped answering. The cursor stays - the panel's touch")
+        PrintN("controller still moves it.")
+      EndIf
+    EndIf
+    ProcedureReturn
+  EndIf
+  gMouseMiss = 0
+  ; Button state is absolute and may change without any movement.
+  gPtrBtnMouse = HidMouseButtons()
+  If n <= 0
+    ; Draw it once even if the mouse has not moved, so it appears the
+    ; moment the screen comes on rather than on the first movement.
+    PointerShow()
+    ProcedureReturn
+  EndIf
+
+  ; Accumulate raw counts and take out whole pixels, keeping the
+  ; remainder so a slow drag is not rounded away to nothing. The
+  ; subtraction of stepX*#MOUSE_DIV carries the sign correctly whichever
+  ; way the mouse moved, which a bare integer divide would not.
+  Define stepX.i
+  Define stepY.i
+  ; HidMouseDx/Dy are a RUNNING TOTAL the library keeps and only
+  ; HidMouseTake() clears - HidMousePoll adds to it and never resets it.
+  ; The first cut added that whole total every tick, so all past movement
+  ; was re-counted on every poll and the cursor ran away faster the
+  ; longer the hand moved. That is the "acceleration". Read the deltas
+  ; once, clear them, and only the NEW movement since the last tick is
+  ; applied - a constant hand speed now gives a constant cursor speed.
+  Define rawDx.i
+  Define rawDy.i
+  rawDx = HidMouseDx()
+  rawDy = HidMouseDy()
+  HidMouseTake()
+  ; gCurAx is in COUNT-PERCENT: raw counts times the percent gain. Take
+  ; out whole pixels (÷100) and carry the rest, so 100 is exactly 1:1
+  ; and the leftover of a slow drag is never rounded away. The subtract
+  ; carries the sign whichever way the mouse moved.
+  gCurAx = gCurAx + rawDx * gMousePct
+  gCurAy = gCurAy + rawDy * gMousePct
+  stepX = gCurAx / 100
+  stepY = gCurAy / 100
+  gCurAx = gCurAx - stepX * 100
+  gCurAy = gCurAy - stepY * 100
+  If stepX = 0 And stepY = 0
+    ProcedureReturn
+  EndIf
+  PointerPlace(gCurX + stepX, gCurY + stepY)
+EndProcedure
+
+; ======================================================================
+;  A FINGER ON THE PANEL, DRIVING THE SAME ARROW
+; ======================================================================
+;  The touch controller is on the DSI panel and reports up to ten
+;  contacts. This turns them into the pointer - position from the events
+;  the seam queues, pressed from the contact count - and it does NOT
+;  invent a second cursor for the second, third and tenth fingers:
+;
+;    THE POINTER FOLLOWS ONE STABLE PRIMARY CONTACT. Ten
+;    arrows on a console made of text would be ten save-unders fighting
+;    over the same pixels, and a monitor has nothing for a second finger
+;    to do. All ten are read, all ten are reported by `touch points` and
+;    all ten reach a UI through the seam's queue. The first contact in a
+;    new gesture becomes primary and keeps ownership until that tracking
+;    ID lifts; another active contact then takes over. A second finger
+;    therefore cannot make a one-finger drag jump underneath it.
+;
+;  IT ATTACHES ONCE, LAZILY, AND COSTS NOTHING WITHOUT A PANEL. Like the
+;  mouse: HwTouchUp() is tried the first time the screen is on and the
+;  tick runs, and if the panel is not the screen it is not tried at all
+;  (TouchBoot has the reasoning). After a failure every later tick is a
+;  single compare.
+;
+;  IT IS NOT RATE LIMITED HERE. HwTouchTick() limits itself to one
+;  controller read every 17 ms, because it has three callers and a limit
+;  per caller would be three cadences against one part.
+;
+; ======================================================================
+;  THERE IS ONE DRAIN OF THE HARDWARE QUEUE, AND THIS IS IT
+; ======================================================================
+;  This procedure used to end with
+;
+;      While HwTouchPoll(@ev) = 1
+;      Wend
+;
+;  and a comment explaining that it drained the ring so the console
+;  consumer could not fill it. Every one of those events was thrown
+;  away: the pointer takes its position from HwTouchContacts() and the
+;  frame, not from the stream, so the stream had nowhere to go.
+;
+;  A SOFT KEYBOARD CANNOT BE GIVEN A SECOND DRAIN OF THE SAME RING. Two
+;  consumers polling one queue is a coin toss over which of them sees
+;  each event, and hal.pbi is explicit about why the queue exists at
+;  all: "a tap that begins and ends between two UI frames must still be
+;  seen". Half of them being seen by the wrong consumer is the same loss.
+;
+;  So the drain stayed exactly here, where it always was, and what
+;  changed is where the events GO: each one is handed to
+;  InputTouchDispatch() in Anvil/Core/input_events.pbi, which decides -
+;  once, at the DOWN, from one hit rectangle per owner - whose contact
+;  it is, and puts it in that owner's own lane. The pointer then drains
+;  ITS lane, which is the same "drain and discard" it always did, for
+;  the same reason.
+;
+;  THE RECONCILE AFTER THE DRAIN IS NOT TIDYING. HwTouchFlush() runs on
+;  every screen change and the hardware ring drops its oldest record
+;  when it overflows, so an UP can be swallowed - and a capture whose UP
+;  never arrives is a finger some surface believes is still pressed.
+;  Marking the contacts the controller reports NOW and cancelling the
+;  captures that were not marked is the same argument this file already
+;  makes for taking the button from HwTouchContacts() rather than from
+;  the events.
+; ======================================================================
+Procedure TouchTick()
+  Define n.i
+  Define pollSeq.i
+  Define contacts.i
+  Define found.i
+  Define i.i
+  Define id.i
+  Define tx.i
+  Define ty.i
+  Dim ev.a[#HW_TOUCH_EVSZ]
+  Dim rev.a[#AIT_EVSZ]
+
+  If gScreen = 0 Or gScrSrc <> #SCR_SRC_DSI
+    gPtrBtnTouch = 0
+    gTouchPrimaryId = -1
+    ; The touch surface is not on screen any more. Anything that was
+    ; holding a contact is holding one that can no longer be lifted.
+    If InputCaptureCount() > 0
+      InputCancelAll(#AIC_SCREEN_CHANGE)
+    EndIf
+    ProcedureReturn
+  EndIf
+  If gTouchTried = 0
+    gTouchTried = 1
+    ; Only where the touch surface is: the controller lives on the DSI
+    ; panel, so on HDMI or with no screen there is nothing to attach to
+    ; and probing would spend two failed transfers to learn it.
+    ;
+    ; HwTouchUp sets gTouchOk itself - there is one bring-up path and it
+    ; owns every flag that says the controller is up, so a `touch` that
+    ; revives the part revives the cursor with it.
+    If gScrSrc = #SCR_SRC_DSI
+      If HwTouchUp() <> 0
+        ; The arrow needs a starting place and a shape whichever device
+        ; found it first. CursorShape is idempotent - it writes the same
+        ; fourteen bytes - and PointerHome does nothing if the mouse's
+        ; attach has already run.
+        CursorShape()
+        PointerHome()
+      EndIf
+    EndIf
+  EndIf
+  If gTouchOk = 0
+    ProcedureReturn
+  EndIf
+
+  pollSeq = gTouchPollSeq
+  n = HwTouchTick()
+
+  ; A tight prompt spin calls us many times inside one 17 ms hardware
+  ; period. Those rate-limited returns are not successful transfers and
+  ; must not erase an earlier miss, or three failed BUS POLLS can never
+  ; become three strikes. The sequence advances only for a real attempt.
+  If gTouchPollSeq = pollSeq
+    ProcedureReturn
+  EndIf
+
+  ; A NEGATIVE IS A FAILED TRANSFER, NOT AN IDLE PANEL. Three in a row
+  ; and the controller is gone - the ribbon was pulled, or the micro was
+  ; rewritten underneath us and bit 9 took the chip back into reset - and
+  ; every further tick would cost a full bus timeout at 60 Hz. Same
+  ; three-strike shape as the mouse, and for the same measured reason.
+  If n < 0
+    gTouchMiss = gTouchMiss + 1
+    If gTouchMiss >= 3
+      gTouchOk = 0
+      gPtrBtnTouch = 0
+      gTouchPrimaryId = -1
+      ; THE SURFACE IS GONE, SO NOTHING MAY STILL OWN A CONTACT ON IT.
+      ; Without this a modifier held on a soft keyboard when the ribbon
+      ; was pulled would stay latched for the rest of the session, and
+      ; the design names a stuck Shift as the failure to prevent.
+      InputCancelAll(#AIC_TOUCH_LOST)
+      PrintN("The panel's touch controller stopped answering, so a finger no")
+      PrintN("longer moves the cursor. `touch` re-probes it and says what the")
+      PrintN("bus reported; `touch panel reset` pulses its reset line.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  gTouchMiss = 0
+
+  ; THE BUTTON IS THE CONTACT COUNT AND NOT THE EVENTS. An UP dropped by
+  ; a full ring, or thrown away by a HwTouchFlush on a screen change,
+  ; would leave a button held down forever if the press state were built
+  ; out of the queue. HwTouchContacts() is the truth about now.
+  contacts = HwTouchContacts()
+  If contacts > 0
+    gPtrBtnTouch = 1
+  Else
+    gPtrBtnTouch = 0
+    gTouchPrimaryId = -1
+  EndIf
+
+  ; Pick a stable primary from the frame that is true NOW. Tracking IDs
+  ; survive controller reordering, so adding a second finger cannot steal
+  ; a drag merely because its record happened to arrive later.
+  found = 0
+  i = 0
+  While i < contacts
+    id = HwTouchPointId(i)
+    If id = gTouchPrimaryId
+      tx = HwTouchPointX(i)
+      ty = HwTouchPointY(i)
+      found = 1
+    EndIf
+    i = i + 1
+  Wend
+  If found = 0 And contacts > 0
+    gTouchPrimaryId = HwTouchPointId(0)
+    tx = HwTouchPointX(0)
+    ty = HwTouchPointY(0)
+    found = 1
+  EndIf
+
+  ; THE ONE DRAIN. Every record leaves the hardware ring here and is
+  ; routed to exactly one owner - see this procedure's header. The
+  ; coordinates are handed over as the fields they already are: they
+  ; were rotated and scaled by the display layer before they were
+  ; queued, and nothing downstream of here transforms a coordinate a
+  ; second time.
+  ;
+  ; Multitouch programs own this queue while they run; this tick executes
+  ; only in the interactive console's input wait.
+  While HwTouchPoll(@ev) = 1
+    InputTouchDispatch(PeekL(@ev + #HW_TOUCH_EV_X), PeekL(@ev + #HW_TOUCH_EV_Y), PeekL(@ev + #HW_TOUCH_EV_ID), PeekL(@ev + #HW_TOUCH_EV_ST), PeekI(@ev + #HW_TOUCH_EV_TICK), PeekL(@ev + #HW_TOUCH_EV_PRES))
+  Wend
+
+  ; RECONCILE AGAINST THE FRAME THAT IS TRUE NOW. A flush or a full ring
+  ; can swallow an UP; this is what stops the capture outliving the
+  ; finger. gTouchPrevN is the frame HwTouchTick just read.
+  InputCaptureReconcileBegin()
+  i = 0
+  While i < contacts
+    InputCaptureSeen(HwTouchPointId(i))
+    i = i + 1
+  Wend
+  InputCaptureReconcileEnd(#AIC_CONTACT_LOST)
+
+  ; And the pointer empties its OWN lane. It reads its position from the
+  ; frame above rather than from these records - see THE BUTTON IS THE
+  ; CONTACT COUNT - so draining is all it has to do, exactly as the old
+  ; drain of the hardware ring was.
+  While InputTouchPop(#AIO_POINTER, @rev) = 1
+  Wend
+
+  If found <> 0
+    ; The arrow's tip is the pixel the finger is on, so the bitmap is
+    ; drawn from there - the mask's top left pixel IS the point (see
+    ; CursorShape: bit 7 of row 0).
+    PointerPlace(tx, ty)
+  Else
+    PointerShow()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  mouse [percent]  - report or set the cursor sensitivity, LIVE.
+;
+;  With no argument it prints the current gain. With a number it sets it:
+;  100 is 1:1 with the raw counts, 200 twice as fast, 50 half. Kept as a
+;  runtime knob because the right value is a feel, found at the bench,
+;  and reflashing to try each one costs a minute of upload every time.
+;  It is NOT persisted - it is a comfort setting, not a stored network -
+;  so it returns to #MOUSE_PCT on reset. Clamped to 10..1000 so a fat
+;  finger cannot pin the cursor in a corner or freeze it in place.
+; ----------------------------------------------------------------------
+Procedure CmdMouse()
+  Define v.i
+  SkipSpace()
+  If gLine[gPos] = 0
+    Print("mouse sensitivity is ")
+    PrintDec(gMousePct)
+    PrintN("% of 1:1 (100 = raw counts, 200 = twice as fast).")
+    If gMouseOk = 0
+      PrintN("No mouse is attached yet; the setting still takes effect when one is.")
+    EndIf
+    PrintN("Type mouse <percent> to change it, e.g. mouse 200.")
+    ProcedureReturn
+  EndIf
+  v = ParseDec()
+  If gParseOk = 0
+    PrintN("!! mouse wants a whole number of percent, e.g. mouse 150. Nothing")
+    PrintN("   was changed.")
+    ProcedureReturn
+  EndIf
+  If v < 10
+    v = 10
+  EndIf
+  If v > 1000
+    v = 1000
+  EndIf
+  gMousePct = v
+  Print("mouse sensitivity is now ")
+  PrintDec(gMousePct)
+  PrintN("% of 1:1.")
+EndProcedure

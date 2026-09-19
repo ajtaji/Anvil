@@ -1,0 +1,297 @@
+; Chapter 9 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   Anvil/Hal/module_format.pbi - THE numeric contract. docs/MODULE_FORMAT.md
+;                                 deliberately holds no offset table.
+;   docs/MODULE_FORMAT.md       - what is validated, the placement seam.
+;   docs/MODULE_PIPELINE.md     - the loader's half, the nine steps, the
+;                                 lifecycle states.
+;   Anvil/Core/mod_cmd.pbi      - the console commands.
+;   Anvil/Core/help.pbi         - the help entry.
+;   RaspberryPi4/Modules/MODULES.TXT - the manifest, quoted whole.
+;   docs/ARCHITECTURE.md        - the "placement engine only" boundary.
+;   README.md                   - the deliberately-incomplete list.
+;
+; THE HONEST PART, AND IT IS MOST OF THE CHAPTER: ARCHITECTURE.md and
+; README.md say the engine is load-once placement infrastructure and that
+; NEITHER BOARD ACTIVATES IT, while mod_cmd.pbi contains a full command
+; set and a real board session exists in the vault. Both are true at
+; different dates and the chapter says so rather than picking one. The
+; published boundary is the one a reader must plan against.
+@CHAPTER Driver modules
+@INTRO Not every board has the same hardware. A driver that is not on the path that loads modules does not have to be compiled into the monitor.
+
+@SECTION What a module is meant to be
+
+A `.MOD` file on the boot medium: a driver, verified against its own
+digest, placed in a reserved area of memory, relocated, matched to a
+device the board declares, probed without side effects, and asked to
+publish the service it implements.
+
+The argument for it is simple. The Pi 4 image today contains drivers for
+hardware that a given board may not have - a particular touch
+controller, a particular panel, a particular radio. Every one of those
+is weight that every user carries. A module is that driver as a separate
+file.
+
+@SECTION Read this before you plan anything around it
+
+The published architecture is explicit, and it is the thing to plan
+against:
+
+@FRAG
+The engine is load-once placement infrastructure, not a working driver
+loader. READY means verified, relocated, zeroed and cache-synchronised
+only. The files are not wired into either board composition and no
+board currently supplies a module arena.
+@ENDFRAG
+
+and the list of what is **not** implemented in the published export:
+
+@FRAG
+- board arena reservation or module-file ingestion
+- MODULES.TXT parsing
+- hardware discovery and compatible-id matching
+- module global-initializer, probe, init, quiesce, or service binding
+- mod list, mod info, mod load, or mod reload
+- stable service trampolines, in-flight accounting, transactional reload
+@ENDFRAG
+
+@TRAP The working tree is ahead of that text, and this is the one place
+in this book where two true statements sit next to each other. The
+console command set described below exists in the source, and a real
+board session has loaded a real module. The **published** boundary is
+the one quoted above. If you are reading this against a checkout, check
+what `mod` actually does on your own board before designing around it -
+and treat `docs/MODULE_FORMAT.md` and `docs/MODULE_PIPELINE.md` as the
+authorities, because they move with the code.
+
+@SECTION The container
+
+PMFMOD v1 is a little-endian AArch64 container. A fixed **160-byte
+header**, then the image bytes, zero padding to an eight-byte boundary,
+fixed 16-byte relocation records, and one to eight fixed 64-byte
+compatible-id records.
+
+The magic is the ASCII bytes `PMFMOD` followed by two zeros, at offset
+zero.
+
+@FRAG
++0    magic - 'PMFMOD' and two NUL bytes
++8    version              (1)
++12   header length        (160)
++16   ABI major
++20   ABI minor
++24   seam count
++28   flags                (no v1 flag promises reload)
++32   image bytes
++40   BSS offset
++48   BSS bytes
++56   init offset
++64   relocation count
++68   relocation offset
++72   alignment
++76   architecture         (1 = AArch64)
++80   seams                (4 cells; unused cells are all-ones)
++96   sha256               (32 bytes)
++128  match count
++132  match offset
++136  probe offset
++144  quiesce offset
++152  reserved
+@ENDFRAG
+
+@NOTE The digest covers the **complete container except header bytes 96
+to 127**, which hold the digest itself. That detects accidental or
+malicious damage in transit. It does **not** authenticate a publisher,
+establish trust, or sandbox native code, and the format document says so
+in its own opening paragraph rather than letting anyone assume
+otherwise.
+
+Compatible IDs are 1 to 63 printable ASCII bytes, then a NUL and an
+all-zero tail. Space is allowed; **slash and backslash are forbidden**,
+so an ID can never be read as a path. IDs within one container must be
+unique.
+
+@NOTE The numbers above live in `Anvil/Hal/module_format.pbi` and the
+format document deliberately does not repeat them. Compiler writers and
+loaders consume a byte-identical copy of that one file rather than
+maintaining their own tables. Two copies of a numeric contract is one
+copy too many.
+
+@SECTION What is validated, and when
+
+The engine validates the **complete** container - exact layout, ABI,
+architecture, flags, reserved fields, entries, matches, relocation
+sites, targets, opcodes and ranges, and the digest - **before it changes
+the arena**. Call targets must be aligned instructions inside the
+emitted image. Data relocations may target image or BSS but not the gap
+between them. Relocation destination spans may not overlap.
+
+@TRAP A digest is never a substitute for structural validation. It
+proves the bytes are the ones somebody produced; it does not prove that
+what they produced is safe to place. Both checks exist and neither
+replaces the other.
+
+@SECTION The board's half of the contract
+
+A board that wants modules supplies six functions:
+
+@FRAG
+HwModArenaBase()            4 KiB-aligned first byte, or 0 for "none here"
+HwModArenaBytes()           byte length of a reserved, guarded range
+HwModArenaRegion()          which monitor-region index IS the arena, or -1
+HwModStageAddr()            where one container is read and judged
+HwModStageBytes()           the largest container this board accepts
+HwModCodeSync(base, bytes)  clean D-cache, invalidate I-cache
+@ENDFRAG
+
+@NOTE The arena is **checked, not trusted**. The engine walks the
+board's own reserved-region list and payload windows and refuses an
+arena that overlaps one, skipping only the index the board names as the
+arena's own. That check exists because an earlier design reserved a
+fixed range which is now the DSI framebuffer - and a paragraph saying
+"do not use this range any more" is not a mechanism. A board that offers
+no arena answers 0 and gets a **different sentence** from a board whose
+arena is misaligned.
+
+And a device table, so a driver can be matched to something real:
+
+@FRAG
+HwDevCount()        how many devices the board will name
+HwDevIdAddr(i)      a NUL-terminated ASCII compatible id
+HwDevSeam(i)        the capability group it belongs to
+HwDevToken(i)       the handle a driver needs - a register base, usually
+HwDevSay(i)         prints the device's own name, in the board's words
+HwSeamCore(id)      does the core reach this seam with no module at all
+HwSeamPossible(id)  is the hardware here, whether or not anything reaches it
+@ENDFRAG
+
+@SECTION Building one
+
+@FRAG
+PureMetalForge.exe --compile RaspberryPi4/Modules/thermal_avs.pi4 -t pi4 --module -o THERMAL.MOD
+@ENDFRAG
+
+Then the file goes on the boot medium, and a line naming it goes in
+`MODULES.TXT`.
+
+@SECTION The manifest
+
+`MODULES.TXT` lives in the **root of the boot medium**, beside
+`SETTINGS.TXT`. Not in a subdirectory - the filesystem reader descends
+into none, and one place for the monitor's files is easier to explain
+than two.
+
+The file in this repository is its own documentation:
+
+@FRAG
+# Anvil driver modules, loaded in this order at boot.
+#
+# COPY THIS FILE TO THE ROOT OF THE BOOT MEDIUM, beside SETTINGS.TXT, and
+# copy each .MOD it names there too.
+#
+# A line is a FILE NAME and an optional SEAM NAME. The seam name can only
+# ever NARROW a module to part of what its own header declares; naming a
+# seam the header does not carry is refused, and nothing can widen a
+# module past the list its digest covers. `mod seams` prints the names.
+#
+# A line that cannot be acted on STOPS THE WALK - the modules after it are
+# not loaded, and the console says which line stopped it. Acting on half a
+# manifest is the confident wrong answer this monitor refuses to give.
+#
+# `#` and `;` start a comment. Blank lines are ignored.
+THERMAL.MOD
+@ENDFRAG
+
+@NOTE "A line that cannot be acted on stops the walk." That is worth
+repeating because it is the opposite of what most loaders do. Loading
+the modules after a failure would leave you with a system that is
+partly what the manifest asked for, and no way to tell which part.
+
+@SECTION The commands
+
+@FRAG
+mod [list]              what is loaded, where, and in what state
+mod info <file>         the header, the digest, the seams, the device
+mod devices             what this board offers a driver to bind to
+mod seams               the published seams and who answers each
+mod load <file> [seam]  read, verify, place and activate one module
+mod unload <file>       refused while a consumer still holds a seam
+mod detach <seam>       ask those consumers to let go first
+@ENDFRAG
+
+@NOTE `unload` being **refused** while anything still uses the service
+is the interesting half. `detach` asks the users to let go first, and
+they fall back to whatever they used before the module was loaded. An
+unloaded module's memory stays reserved until a reset - it does not come
+back to the pool, and the state table calls that out by name.
+
+@SECTION The lifecycle states
+
+Each state says exactly what it does **not** mean, which is how you read
+this table:
+
+@FRAG
+READY     verified, placed, zeroed, relocated, cache-synchronised
+          -- but nothing has looked at hardware
+MATCHED   a device the board declares answers one of the container's
+          compatible ids
+          -- but the device is not known to be responding
+PROBED    the driver looked at that device and accepted it, changing
+          nothing
+          -- but it has acquired nothing
+ACTIVE    init returned 0 and published at least one service
+          -- but nothing is necessarily using it
+FAILED    a step refused; everything it had published was withdrawn
+          first
+          -- the bytes did not go away
+STRANDED  unloaded cleanly; the arena it used is not reusable until a
+          reset
+          -- the memory is not free
+@ENDFRAG
+
+@SECTION The example driver
+
+`RaspberryPi4/Modules/thermal_avs.pi4` is the part's own temperature
+monitor. It matches a device id, fills the thermal seam's read function,
+and **contains no address of its own** - the board hands it the block's
+base as an argument.
+
+With it loaded, `fan` reports the temperature as coming from a sensor
+register the board reads directly. Without it, the same command reports
+the firmware property interface and everything still works.
+
+@NOTE That property is what made the conversion safe to do with no board
+attached: the thing being replaced kept working. A driver conversion
+where the old path stops existing is a conversion you cannot test
+incrementally.
+
+@SECTION The ABI boundary a module may not cross
+
+@FRAG
+Anvil/Hal/seams.pbi is the published contract: the seam ids, the
+function-index vocabulary per seam, the two slot numbers, and nothing
+else. A module includes that file and no other Anvil file. If a module
+ever needs a second one, the contract has leaked.
+@ENDFRAG
+
+@SECTION What is proven
+
+Two gates. One compiles the real driver as a module, mutates copies of
+the container into the negative cases, compiles the real core sources
+against a modelled board and medium, and runs the emitted instructions
+in this project's own interpreter. The other is the container and
+relocator gate, covering all eight relocation kinds at two placements.
+
+@TRAP **Neither is a hardware claim.** There is no MMU, no cache, no DMA
+and no firmware in either; the device register is interpreter memory and
+cache maintenance is a stub. Silicon acceptance is a separate claim and
+is recorded separately.
+
+@SECTION What the modules are for, eventually
+
+The planned first conversions are the fan controller, the touch
+controller, the panel power and backlight controller, and the radio.
+Until the loader lands, they remain compiled into the image where
+included.

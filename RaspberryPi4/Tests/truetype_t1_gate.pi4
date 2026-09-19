@@ -1,0 +1,261 @@
+; T1 emitted gate: bounded sfnt metrics and horizontal metrics.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+
+#TT1_HEAD = $68656164
+#TT1_MAXP = $6D617870
+#TT1_HHEA = $68686561
+#TT1_HMTX = $686D7478
+#TT1_OS2 = $4F532F32
+#TT1_REAL_META = $0F000000
+#TT1_REAL_BASE = $10000000
+#TT1_REAL_MAGIC = $54543152
+
+Global Dim tt1Font.a[511]
+Global Dim tt1Tag.i[5]
+Global Dim tt1Length.i[5]
+Global Dim tt1Offset.i[5]
+Global tt1TableCount.i
+
+Procedure tt1BE16(at.i, value.i)
+  PokeA(@tt1Font[at], (value >> 8) & $FF)
+  PokeA(@tt1Font[at + 1], value & $FF)
+EndProcedure
+
+Procedure tt1BE32(at.i, value.i)
+  PokeA(@tt1Font[at], (value >> 24) & $FF)
+  PokeA(@tt1Font[at + 1], (value >> 16) & $FF)
+  PokeA(@tt1Font[at + 2], (value >> 8) & $FF)
+  PokeA(@tt1Font[at + 3], value & $FF)
+EndProcedure
+
+Procedure.i tt1Checksum(offset.i, length.i, head.i)
+  Protected words.i = (length + 3) / 4
+  Protected sum.i = 0
+  Protected word.i
+  Protected pos.i
+  Protected n.i
+  Protected j.i
+  For n = 0 To words - 1
+    word = 0
+    For j = 0 To 3
+      pos = n * 4 + j
+      word = word << 8
+      If pos < length And (head = 0 Or pos < 8 Or pos >= 12)
+        word = word | (PeekA(@tt1Font[offset + pos]) & $FF)
+      EndIf
+    Next
+    sum = (sum + word) & $FFFFFFFF
+  Next
+  ProcedureReturn sum
+EndProcedure
+
+Procedure.i tt1Build(headLength.i, maxpLength.i, hheaLength.i, hmtxLength.i, os2Length.i, os2Version.i, unitsPerEm.i, locaFormat.i, glyphCount.i, numberOfHMetrics.i)
+  Protected cursor.i
+  Protected count.i
+  Protected n.i
+  Protected record.i
+  Protected checksum.i
+  For n = 0 To 511 : PokeA(@tt1Font[n], 0) : Next
+  tt1Tag[0] = #TT1_HEAD : tt1Length[0] = headLength
+  tt1Tag[1] = #TT1_MAXP : tt1Length[1] = maxpLength
+  tt1Tag[2] = #TT1_HHEA : tt1Length[2] = hheaLength
+  tt1Tag[3] = #TT1_HMTX : tt1Length[3] = hmtxLength
+  count = 4
+  If os2Length > 0
+    tt1Tag[4] = #TT1_OS2 : tt1Length[4] = os2Length
+    count = 5
+  EndIf
+  tt1TableCount = count
+  tt1BE32(0, $00010000)
+  tt1BE16(4, count)
+  tt1BE16(6, count * 16)
+  tt1BE16(8, 1)
+  cursor = 12 + count * 16
+  For n = 0 To count - 1
+    tt1Offset[n] = cursor
+    cursor = cursor + tt1Length[n]
+  Next
+  If headLength >= 54
+    tt1BE32(tt1Offset[0], $00010000)
+    tt1BE32(tt1Offset[0] + 12, $5F0F3CF5)
+    tt1BE16(tt1Offset[0] + 18, unitsPerEm)
+    tt1BE16(tt1Offset[0] + 50, locaFormat)
+  EndIf
+  If maxpLength >= 6
+    tt1BE32(tt1Offset[1], $00010000)
+    tt1BE16(tt1Offset[1] + 4, glyphCount)
+  EndIf
+  If hheaLength >= 36
+    tt1BE32(tt1Offset[2], $00010000)
+    tt1BE16(tt1Offset[2] + 4, 800)
+    tt1BE16(tt1Offset[2] + 6, -200)
+    tt1BE16(tt1Offset[2] + 8, 100)
+    tt1BE16(tt1Offset[2] + 34, numberOfHMetrics)
+  EndIf
+  If hmtxLength >= 4 : tt1BE16(tt1Offset[3], 500) : tt1BE16(tt1Offset[3] + 2, -10) : EndIf
+  If hmtxLength >= 8 : tt1BE16(tt1Offset[3] + 4, 600) : tt1BE16(tt1Offset[3] + 6, 20) : EndIf
+  If hmtxLength >= 10 : tt1BE16(tt1Offset[3] + 8, -30) : EndIf
+  If os2Length > 0 And os2Length >= 78
+    tt1BE16(tt1Offset[4], os2Version)
+    tt1BE16(tt1Offset[4] + 4, 400)
+    tt1BE16(tt1Offset[4] + 6, 5)
+    tt1BE16(tt1Offset[4] + 68, -700)
+    tt1BE16(tt1Offset[4] + 70, -250)
+    tt1BE16(tt1Offset[4] + 72, 50)
+    tt1BE16(tt1Offset[4] + 74, 900)
+    tt1BE16(tt1Offset[4] + 76, 250)
+  EndIf
+  For n = 0 To count - 1
+    record = 12 + n * 16
+    checksum = tt1Checksum(tt1Offset[n], tt1Length[n], Bool(tt1Tag[n] = #TT1_HEAD))
+    tt1BE32(record, tt1Tag[n])
+    tt1BE32(record + 4, checksum)
+    tt1BE32(record + 8, tt1Offset[n])
+    tt1BE32(record + 12, tt1Length[n])
+  Next
+  ProcedureReturn cursor
+EndProcedure
+
+Procedure.i tt1Open(headLength.i, maxpLength.i, hheaLength.i, hmtxLength.i, os2Length.i, os2Version.i, unitsPerEm.i, locaFormat.i, glyphCount.i, numberOfHMetrics.i)
+  Protected bytes.i
+  bytes = tt1Build(headLength, maxpLength, hheaLength, hmtxLength, os2Length, os2Version, unitsPerEm, locaFormat, glyphCount, numberOfHMetrics)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn AnvilTrueTypeMetricsOpen()
+EndProcedure
+
+Procedure.i tt1ExpectedFailure(code.i, tag.i, offset.i)
+  If AnvilTrueTypeMetricsOpenState() <> 0 : ProcedureReturn 0 : EndIf
+  If AnvilTrueTypeMetricsError() <> code : ProcedureReturn 0 : EndIf
+  If AnvilTrueTypeMetricsErrorTag() <> tag : ProcedureReturn 0 : EndIf
+  If AnvilTrueTypeMetricsErrorOffset() <> offset : ProcedureReturn 0 : EndIf
+  If AnvilTrueTypeMetricsErrorText() = 0 : ProcedureReturn 0 : EndIf
+  If PeekA(AnvilTrueTypeMetricsErrorText()) <> 84 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i tt1RealFont()
+  Protected bytes.i
+  Protected glyphs.i
+  Protected metricCount.i
+  Protected advance.i
+  Protected lsb.i
+  Protected n.i
+  If PeekL(#TT1_REAL_META) <> #TT1_REAL_MAGIC : ProcedureReturn 0 : EndIf
+  bytes = PeekL(#TT1_REAL_META + 4)
+  glyphs = PeekL(#TT1_REAL_META + 12)
+  metricCount = PeekL(#TT1_REAL_META + 28)
+  If AnvilTrueTypeOpen(#TT1_REAL_BASE, bytes) = 0 : ProcedureReturn 46 : EndIf
+  If AnvilTrueTypeMetricsOpen() = 0 : ProcedureReturn 47 : EndIf
+  If AnvilTrueTypeUnitsPerEm() <> PeekL(#TT1_REAL_META + 8) : ProcedureReturn 48 : EndIf
+  If AnvilTrueTypeIndexToLocFormat() <> PeekL(#TT1_REAL_META + 16) : ProcedureReturn 49 : EndIf
+  If AnvilTrueTypeGlyphCount() <> glyphs : ProcedureReturn 50 : EndIf
+  If AnvilTrueTypeAscender() <> PeekL(#TT1_REAL_META + 20) : ProcedureReturn 51 : EndIf
+  If AnvilTrueTypeDescender() <> PeekL(#TT1_REAL_META + 24) : ProcedureReturn 52 : EndIf
+  If AnvilTrueTypeNumberOfHMetrics() <> metricCount : ProcedureReturn 53 : EndIf
+  For n = 0 To 2
+    If AnvilTrueTypeHorizontalMetric(PeekL(#TT1_REAL_META + 32 + n * 12), @advance, @lsb) = 0 : ProcedureReturn 54 : EndIf
+    If advance <> PeekL(#TT1_REAL_META + 36 + n * 12) Or lsb <> PeekL(#TT1_REAL_META + 40 + n * 12) : ProcedureReturn 55 : EndIf
+  Next
+  AnvilTrueTypeMetricsClose()
+  AnvilTrueTypeClose()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i
+  Protected advance.i
+  Protected lsb.i
+  Protected headOffset.i
+  Protected maxpOffset.i
+  Protected hheaOffset.i
+  Protected hmtxOffset.i
+  Protected os2Offset.i
+  Protected realResult.i
+
+  bytes = tt1Build(54, 32, 36, 10, 78, 0, 1000, 1, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeMetricsOpen() = 0 : ProcedureReturn 2 : EndIf
+  If AnvilTrueTypeUnitsPerEm() <> 1000 Or AnvilTrueTypeIndexToLocFormat() <> 1 : ProcedureReturn 3 : EndIf
+  If AnvilTrueTypeGlyphCount() <> 3 Or AnvilTrueTypeNumberOfHMetrics() <> 2 : ProcedureReturn 4 : EndIf
+  If AnvilTrueTypeAscender() <> 800 Or AnvilTrueTypeDescender() <> -200 Or AnvilTrueTypeLineGap() <> 100 : ProcedureReturn 5 : EndIf
+  If AnvilTrueTypeHorizontalMetric(0, @advance, @lsb) = 0 Or advance <> 500 Or lsb <> -10 : ProcedureReturn 6 : EndIf
+  If AnvilTrueTypeHorizontalMetric(1, @advance, @lsb) = 0 Or advance <> 600 Or lsb <> 20 : ProcedureReturn 7 : EndIf
+  If AnvilTrueTypeHorizontalMetric(2, @advance, @lsb) = 0 Or advance <> 600 Or lsb <> -30 : ProcedureReturn 8 : EndIf
+  If AnvilTrueTypeHasOS2() <> 1 Or AnvilTrueTypeOS2Version() <> 0 : ProcedureReturn 9 : EndIf
+  If AnvilTrueTypeOS2TypoAscender() <> -700 Or AnvilTrueTypeOS2TypoDescender() <> -250 Or AnvilTrueTypeOS2TypoLineGap() <> 50 : ProcedureReturn 10 : EndIf
+  If AnvilTrueTypeOS2WinAscent() <> 900 Or AnvilTrueTypeOS2WinDescent() <> 250 : ProcedureReturn 11 : EndIf
+  If AnvilTrueTypeOS2WeightClass() <> 400 Or AnvilTrueTypeOS2WidthClass() <> 5 : ProcedureReturn 12 : EndIf
+  headOffset = AnvilTrueTypeTableOffset(AnvilTrueTypeFind(#TT1_HEAD))
+  maxpOffset = AnvilTrueTypeTableOffset(AnvilTrueTypeFind(#TT1_MAXP))
+  hheaOffset = AnvilTrueTypeTableOffset(AnvilTrueTypeFind(#TT1_HHEA))
+  hmtxOffset = AnvilTrueTypeTableOffset(AnvilTrueTypeFind(#TT1_HMTX))
+  os2Offset = AnvilTrueTypeTableOffset(AnvilTrueTypeFind(#TT1_OS2))
+
+  If AnvilTrueTypeHorizontalMetric(3, @advance, @lsb) <> 0 : ProcedureReturn 13 : EndIf
+  If AnvilTrueTypeMetricsError() <> #ANVIL_TTM_E_GLYPH Or AnvilTrueTypeMetricsErrorTag() <> #TT1_HMTX : ProcedureReturn 14 : EndIf
+
+  bytes = tt1Build(53, 32, 36, 10, 78, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 15 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_TABLE, #TT1_HEAD, 92) = 0 : ProcedureReturn 16 : EndIf
+
+  bytes = tt1Build(54, 6, 36, 10, 0, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 17 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_FORMAT, #TT1_MAXP, 130) = 0 : ProcedureReturn 18 : EndIf
+
+  bytes = tt1Build(54, 32, 35, 10, 0, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 19 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_TABLE, #TT1_HHEA, 162) = 0 : ProcedureReturn 20 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 9, 0, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 21 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_TABLE, #TT1_HMTX, 198) = 0 : ProcedureReturn 22 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 0, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() = 0 : ProcedureReturn 23 : EndIf
+  If AnvilTrueTypeHasOS2() <> 0 Or AnvilTrueTypeOS2Version() <> -1 Or AnvilTrueTypeOS2WeightClass() <> 0 : ProcedureReturn 24 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 77, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 25 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_TABLE, #TT1_OS2, 224) = 0 : ProcedureReturn 26 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 95, 2, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 27 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_TABLE, #TT1_OS2, 224) = 0 : ProcedureReturn 28 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 78, 6, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 29 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_FORMAT, #TT1_OS2, 224) = 0 : ProcedureReturn 30 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 0, 0, 0, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 31 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_RANGE, #TT1_HEAD, 94) = 0 : ProcedureReturn 32 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 0, 0, 1000, 2, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 33 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_FORMAT, #TT1_HEAD, 126) = 0 : ProcedureReturn 34 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 0, 0, 1000, 0, 0, 0)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 35 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_RANGE, #TT1_HHEA, 196) = 0 : ProcedureReturn 36 : EndIf
+
+  bytes = tt1Build(54, 32, 36, 10, 0, 0, 1000, 0, 3, 4)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() <> 0 : ProcedureReturn 37 : EndIf
+  If tt1ExpectedFailure(#ANVIL_TTM_E_RANGE, #TT1_HHEA, 196) = 0 : ProcedureReturn 38 : EndIf
+
+  ; The previous success cannot leak through a failed T0 replacement or Close.
+  bytes = tt1Build(54, 32, 36, 10, 0, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 Or AnvilTrueTypeMetricsOpen() = 0 : ProcedureReturn 39 : EndIf
+  bytes = tt1Build(54, 32, 36, 9, 0, 0, 1000, 0, 3, 2)
+  If AnvilTrueTypeOpen(@tt1Font[0], bytes) = 0 : ProcedureReturn 40 : EndIf
+  If AnvilTrueTypeGlyphCount() <> 0 Or AnvilTrueTypeUnitsPerEm() <> 0 : ProcedureReturn 41 : EndIf
+  If AnvilTrueTypeMetricsOpen() <> 0 Or AnvilTrueTypeMetricsOpenState() <> 0 : ProcedureReturn 42 : EndIf
+  If AnvilTrueTypeMetricsErrorTag() <> #TT1_HMTX : ProcedureReturn 43 : EndIf
+  AnvilTrueTypeMetricsClose()
+  If AnvilTrueTypeMetricsError() <> #ANVIL_TTM_E_NONE Or AnvilTrueTypeMetricsErrorText() = 0 : ProcedureReturn 44 : EndIf
+  If PeekA(AnvilTrueTypeMetricsErrorText()) <> 0 : ProcedureReturn 45 : EndIf
+  realResult = tt1RealFont()
+  If realResult <> 0 : ProcedureReturn realResult : EndIf
+  ProcedureReturn 0
+EndProcedure
+

@@ -1,0 +1,279 @@
+; ======================================================================
+;  hw_mem.pi3 - the Raspberry Pi 3's answer to "how much memory is
+;               fitted", and the one place this board's backend is
+;               STRUCTURALLY different from the Pi 4's.
+;
+;  The contract is the HwMemory* block in Anvil/Hal/hal.pbi: one total in
+;  BYTES, or -1 when the board honestly cannot know, and a fragment
+;  saying where the number came from.
+;
+; ----------------------------------------------------------------------
+;  WHERE THE NUMBER COMES FROM, AND WHY NOT FROM THE OBVIOUS PLACE
+; ----------------------------------------------------------------------
+;  THE MAILBOX HAS A TAG THAT LOOKS LIKE THE ANSWER AND IS NOT. "Get ARM
+;  memory" ($00010005) reports the ARM's SHARE after the VideoCore split
+;  that gpu_mem in config.txt sets. On a stock 1 GB Pi 3 it answers about
+;  948 MB, and a monitor that printed that as the board's memory would be
+;  wrong and would sound completely sure of itself. This file does not
+;  ask it. RaspberryPi3/Board/memmap.pi3 does, for a different question -
+;  where the payload window has to stop - and that is the question that
+;  tag really answers.
+;
+;  THE REVISION CODE IS THE ANSWER. The firmware's board revision word
+;  carries a MEMSIZE field in bits 22:20, documented by Raspberry Pi
+;  under "Raspberry Pi hardware - New-style revision codes". The field is
+;  an exponent: the size is 256 MB shifted left by it, so 0 is 256 MB, 1
+;  is 512 MB, 2 is 1 GB, 3 is 2 GB, 4 is 4 GB and 5 is 8 GB. Consulted,
+;  not copied. A Raspberry Pi 3 Model B v1.2 is code 2.
+;
+;  DECODED AS A SHIFT AND NOT AS A TABLE, exactly as
+;  RaspberryPi4/Board/hw_mem.pi4 decodes the same field: a table answers
+;  nothing for the first board that ships a size nobody here has seen,
+;  and two decoders of one field must not be able to disagree. The
+;  procedure below is a character-for-character twin of the Pi 4's,
+;  because it is the same field in the same word from the same firmware.
+;
+;  AN OLD-STYLE CODE ANSWERS -1. Bit 23 says which scheme the word is in.
+;  An old-style code is a small board number from a table this monitor
+;  does not carry, and there is no memory field in it at all.
+;
+; ----------------------------------------------------------------------
+;  THE DIFFERENCE FROM THE Pi 4, AND IT IS NOT A STYLE CHOICE
+; ----------------------------------------------------------------------
+;  The Pi 4's version asks the mailbox LAZILY, on the first call, from
+;  inside the address guard, and remembers. It can: its mailbox works
+;  whenever it is asked.
+;
+;  THIS BOARD'S MAILBOX STOPS ANSWERING THE MOMENT THE MMU COMES ON.
+;  RaspberryPi3/Lib/mailbox.pbi's Pi3MailboxContext() reads SCTLR, masks
+;  it with 5 - the MMU bit and the D-cache bit - and REFUSES the
+;  transaction if either is set, because the property buffer has to be
+;  memory the VideoCore and the ARM agree about and that file makes no
+;  claim to support a cached one. The whole argument, and the boot order
+;  it forces, is in the ORDER section of RaspberryPi3/Lib/mmu.pi3.
+;
+;  SO THIS FILE IS ASKED ONCE, DELIBERATELY, DURING BOOT, BEFORE THE MMU.
+;  HwMemAsk() is the call the board's Main() makes at the right moment;
+;  HwMemoryBytes() afterwards only reads what was remembered. If nobody
+;  asked, it says so rather than trying and failing - a mailbox call that
+;  refuses looks identical to a firmware that would not answer, and
+;  reporting the second when the first happened would send somebody
+;  looking at their config.txt for a bug in this file.
+;
+;  A LAZY ASK WOULD NOT MERELY FAIL. It would fail from inside
+;  HwAddrCheck(), which stands in front of every command that takes an
+;  address, and it would fail on every one of them, silently, having
+;  already decided the answer is unknown. That is why the seam is split
+;  into an ask and a read here and is not on the Pi 4.
+;
+;  INCLUDE ORDER: after RaspberryPi3/Lib/mailbox.pbi (Pi3MailboxCall,
+;  pi3_property, pi3_mailbox_outstanding) and after Anvil/Hal/hal.pbi
+;  (#HW_MEM_UNKNOWN), and BEFORE RaspberryPi3/Board/hw_addr.pi3, which
+;  reads it. House rule 10: this file includes nothing itself.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  What has been asked, and what came back.
+;
+;  gPiMemAsked is 0 until HwMemAsk() has run and 1 afterwards, whatever
+;  the answer was. gPiMemBytes is meaningless until then and is
+;  deliberately NOT initialised to a plausible size: an uninitialised
+;  read must not look like an answer. *gPiMemWhy is the fragment
+;  HwMemoryWhere() returns and is never 0 once asked.
+; ----------------------------------------------------------------------
+Global gPiMemAsked.i
+Global gPiMemBytes.i
+Global *gPiMemWhy
+Global gPiMemRev.i
+
+; ----------------------------------------------------------------------
+;  HwMemFromRevision(rev) - the decode, and nothing else.
+;
+;  IT IS A PROCEDURE OF ITS OWN because it is the only part of this that
+;  a desk gate can EXECUTE. Everything around it talks to the firmware,
+;  and a firmware is a board. This is pure - two shifts and a mask on one
+;  word - so tools/pi3_hw_memory_emitted_check.py compiles this exact
+;  procedure, runs the emitted A64 over every MEMSIZE code and over an
+;  old-style word, and rejects a wrong shift, a wrong base and an
+;  off-by-one code. A decode nothing can test is a decode nobody should
+;  trust.
+;
+;  268435456 IS 256 MB WRITTEN OUT. It is a literal rather than a
+;  constant because a constant in this compiler takes no arithmetic in
+;  its initialiser, so "256 * 1024 * 1024" cannot be written where a
+;  reader would want it.
+;
+;  THE SHIFT IS OF A POSITIVE VALUE: rev is a firmware word below
+;  $01000000 by the time the field is taken, so ">>" being arithmetic
+;  cannot bite.
+; ----------------------------------------------------------------------
+Procedure.i HwMemFromRevision(rev.i)
+  Define mem.i
+  ; NEW-STYLE CODES ONLY. Bit 23 is the scheme bit; an old-style word has
+  ; no memory field at all.
+  If (rev & $00800000) = 0
+    ProcedureReturn #HW_MEM_UNKNOWN
+  EndIf
+  mem = (rev >> 20) & 7
+  ProcedureReturn 268435456 << mem
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  pi3MemRevision() - the firmware's board revision word, or 0.
+;
+;  Property tag $00010002, "Get board revision": no request words, one
+;  32-bit response word. The reply header is checked the same way every
+;  other tag in this tree is - tag, length, and the response bit set with
+;  the right byte count - because a firmware that answered a different
+;  tag would otherwise have its answer decoded as a memory size.
+; ----------------------------------------------------------------------
+Procedure.i pi3MemRevision()
+  Define buffer.i
+  If pi3_mailbox_outstanding <> 0
+    ProcedureReturn 0
+  EndIf
+  buffer = ((@pi3_property[0] + 15) >> 4) << 4
+  PokeL(buffer, 28)
+  PokeL(buffer + 4, 0)
+  PokeL(buffer + 8, $10002)
+  PokeL(buffer + 12, 4)
+  PokeL(buffer + 16, 0)
+  PokeL(buffer + 20, 0)
+  PokeL(buffer + 24, 0)
+  If Pi3MailboxCall(buffer, 28) = 0
+    ProcedureReturn 0
+  EndIf
+  If PeekL(buffer + 8) <> $10002 Or PeekL(buffer + 12) <> 4 Or (PeekL(buffer + 16) & $FFFFFFFF) <> $80000004
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn PeekL(buffer + 20) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemAsk() - ask the firmware, once, while it can still be asked.
+;
+;  CALLED BY THE BOARD'S Main() BEFORE THE MMU COMES ON. It answers 1 if
+;  a size is now known and 0 if not; the board does not stop for a 0,
+;  because a monitor that will not come up because it could not learn its
+;  memory size is worse than one that says it does not know.
+; ----------------------------------------------------------------------
+Procedure.i HwMemAsk()
+  Define rev.i
+
+  If gPiMemAsked <> 0
+    ProcedureReturn Bool(gPiMemBytes <> #HW_MEM_UNKNOWN)
+  EndIf
+  gPiMemAsked = 1
+  gPiMemBytes = #HW_MEM_UNKNOWN
+
+  rev = pi3MemRevision()
+  gPiMemRev = rev
+  If rev = 0
+    *gPiMemWhy = "the firmware would not say what board this is"
+    ProcedureReturn 0
+  EndIf
+
+  gPiMemBytes = HwMemFromRevision(rev)
+  If gPiMemBytes = #HW_MEM_UNKNOWN
+    *gPiMemWhy = "an old-style revision code carries no memory field"
+    ProcedureReturn 0
+  EndIf
+
+  *gPiMemWhy = "the board revision code the firmware reports"
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemoryBytes() - the seam. A READ, never a firmware transaction.
+; ----------------------------------------------------------------------
+Procedure.i HwMemoryBytes()
+  ProcedureReturn gPiMemBytes
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemoryWhere() - where that number came from, or why there is none.
+;
+;  IT IS NEVER 0. A caller prints this fragment whenever the size is
+;  missing, and a caller that printed nothing would turn "this board
+;  cannot say" into a blank space, which reads as a monitor that failed
+;  to fill something in rather than as an answer.
+; ----------------------------------------------------------------------
+Procedure.i HwMemoryWhere()
+  If gPiMemAsked = 0
+    ProcedureReturn "the firmware was never asked - this board can only ask before it turns its MMU on, and that moment has passed"
+  EndIf
+  ProcedureReturn *gPiMemWhy
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemoryRevision() - the raw word, for `info` and for a bug report.
+;
+;  Not part of the portable seam; the board's own `info` row prints it
+;  because a revision code is the one number that identifies a Pi model,
+;  memory size and manufacturer at once, and somebody reporting a wrong
+;  size needs to be able to quote it.
+; ----------------------------------------------------------------------
+Procedure.i HwMemoryRevision()
+  ProcedureReturn gPiMemRev
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PutMemBytes(b) - a byte count as a person would say it.
+;
+;  "1 GB", "512 MB". Not 1073741824, and not 1024 MB: the number on the
+;  box is the number to print, and every size this field can carry is an
+;  exact power of two multiplying 256 MB, so there is never a remainder
+;  to round away or to hide.
+; ----------------------------------------------------------------------
+Procedure PutMemBytes(b.i)
+  Define mb.i
+  If b < 0
+    Print("an unknown amount")
+    ProcedureReturn
+  EndIf
+  mb = b / 1048576
+  If mb >= 1024
+    PrintDec(mb / 1024)
+    Print(" GB")
+  Else
+    PrintDec(mb)
+    Print(" MB")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemSayArm() - the sentence `info` needs that the Pi 4 does not.
+;
+;  THREE DIFFERENT NUMBERS ARE ALL TRUE AT ONCE ON THIS BOARD and a
+;  monitor that blurs them is lying:
+;
+;    FITTED is what HwMemoryBytes() answers - 1 GB on a Model B v1.2,
+;    from the revision code. That is the question "how much memory does
+;    this computer have", and it is the RAM row of `info`.
+;
+;    REACHABLE BY THE ARM is at most $3F000000, because the peripheral
+;    aperture sits on the top 16 MB of the gigabyte and - unlike the
+;    Pi 4 - that memory does not reappear anywhere. It is gone.
+;
+;    GIVEN TO THE ARM is less again, by whatever gpu_mem takes for the
+;    VideoCore. That is pi3_ram_end, and it is the number the payload
+;    window's ceiling comes from.
+;
+;  The Pi 4 has none of this to explain because its firmware does not
+;  carve the ARM's memory the same way, which is why this procedure
+;  exists here and has no counterpart there.
+; ----------------------------------------------------------------------
+Procedure HwMemSayArm()
+  Print("            of which the ARM was given ")
+  If pi3_ram_end > 0
+    PutMemBytes(pi3_ram_end - pi3_ram_base)
+    Print(", ending at ")
+    PutAddr(pi3_ram_end - 1)
+    PrintNl()
+    PrintN("            - the rest is the VideoCore's share, set by gpu_mem, and the")
+    PrintN("              top 16 MB of the gigabyte is under the peripheral window and")
+    PrintN("              is not reachable by the processor at all.")
+    ProcedureReturn
+  EndIf
+  PrintN("an amount the firmware has not been asked for.")
+EndProcedure

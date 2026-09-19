@@ -1,0 +1,702 @@
+; ======================================================================
+;  board.pi3 - THE RASPBERRY PI 3 MODEL B COMPILE TARGET.
+;
+;      PureMetalForge.exe --compile RaspberryPi3/Board/board.pi3 -t pi3 \
+;           -o build/pi3/anvil.img
+;      python tools/pi3_slot_pack.py build/pi3/anvil.img \
+;           build/pi3/anvil-slot.img
+;      python tools/pi3_update.py build/pi3/anvil-slot.img --port COMnn
+;
+;  This is the third Anvil composition, after RaspberryPi4/Board/board.pi4
+;  and ArduinoQ/Board/board.unoq. It includes this board's hardware
+;  backends and the shared Anvil core, declares what this board can and
+;  cannot do, and holds Main(). Same core bytes as the other two.
+;  Different hardware. No fork.
+;
+;  Until 2026-09-18 this file was a program that printed and parked. What
+;  it is now is a composition, and everything that made that possible is
+;  one of two things: a library that already existed once, or a thin
+;  backend under it.
+;
+; ----------------------------------------------------------------------
+;  0. WHERE THIS IMAGE RUNS, AND WHY IT IS NOT A kernel8.img
+; ----------------------------------------------------------------------
+;  THIS IS A/B SLOT CONTENT. The card carries an immutable first-stage
+;  loader as KERNEL8.IMG and two monitor slots; the loader verifies a
+;  slot, writes its trial state, copies it to $200000 and branches there.
+;  An update replaces a SLOT, never the loader, which is what makes a bad
+;  monitor recoverable without taking the card out.
+;
+;  THE THREE PLACEMENT NUMBERS ARE NOT A CHOICE. tools/pi3_slot.py's
+;  LOAD_ADDRESS, BSS_ADDRESS and STACK_ADDRESS are what the packer and
+;  the loader both check, and a slot whose header disagrees is refused
+;  before it ever reaches the card. They are stated here so the IDE -
+;  which embeds the compiler and has no command line - builds the same
+;  bytes a script does.
+;
+;  THE ENTRY CONTRACT. Pi3UpdateEnter() in the loader branches to
+;  $200000 with x0 = $1000000. That is not the firmware's own device-tree
+;  register; it is the loader restating the pinned location. So Main()
+;  does NOT capture x0: it writes pi3_dtb = $1000000, because identity
+;  comes from the loader's CRC-protected handoff page and not from a
+;  register the cold startup may have consumed. The serial updater has
+;  done it that way on silicon since 2026-09-12 and the comment there
+;  says why.
+;
+;  THE DEADMAN IS ALREADY ARMED WHEN THIS FILE STARTS. Fifteen seconds,
+;  never fed, and the loader does not stop it. Section 5 below is about
+;  nothing else.
+; ----------------------------------------------------------------------
+LoadAddress  $200000
+BssAddress   $1100000
+StackAddress $1F00000
+
+; ----------------------------------------------------------------------
+;  THE BUILD NUMBER. An ordinary constant that `version` prints; the
+;  trailing marker is what makes a successful build raise it by one,
+;  writing back that one line and nothing else.
+;
+;  THIS BOARD COUNTS ITS OWN BUILDS. tools/build_count.py maps the target
+;  name `pi3` to this file, and `pi3-loader` and `pi3-updater` to the
+;  other two Pi 3 board files, so three programs on one board keep three
+;  numbers and none of them moves when another is built.
+; ----------------------------------------------------------------------
+#ANVIL_BUILD = 10 ; pmf:build
+#ANVIL_BUILD_DATE = 20260918 ; pmf:builddate
+#ANVIL_BUILD_TIME = 193420 ; pmf:buildtime
+
+; ======================================================================
+;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
+;
+;  ALL FOUR ARE THE BOOT LANE'S AND NONE IS EDITED HERE. They are
+;  compiled into the immutable loader and the serial updater as well, so
+;  a change to any of them changes KERNEL8.IMG. Where this monitor needs
+;  something they do not have, the change is written down and reported
+;  rather than forked - see the header of pl011_console.pi3 for the one
+;  outstanding request.
+;
+;  Order: the timer first because the UART's bounded waits are measured
+;  against it, then the UART, then the mailbox, then the card.
+; ======================================================================
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/uart.pbi"
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
+
+; ----------------------------------------------------------------------
+;  This lane's two: the console seam over that UART, and the MMU.
+; ----------------------------------------------------------------------
+XIncludeFile "RaspberryPi3/Lib/pl011_console.pi3"
+XIncludeFile "RaspberryPi3/Lib/mmu.pi3"
+XIncludeFile "RaspberryPi3/Board/hwtimer.pi3"
+
+; ----------------------------------------------------------------------
+;  The board facts the A/B boot arrangement establishes, before anything
+;  that reads them. pi3_ram_base and pi3_ram_end come from the firmware
+;  during boot; pi3_dtb is pinned by the loader.
+; ----------------------------------------------------------------------
+Global pi3_dtb.i
+Global pi3_dtb_end.i
+Global pi3_ram_base.i
+Global pi3_ram_end.i
+Global pi3_boot_status.i
+Global Dim pi3_build_text.a[32]
+XIncludeFile "RaspberryPi3/Board/pi3_boot_primitives.pbi"
+
+; ======================================================================
+;  2. THIS BOARD'S CAPABILITIES - what it offers Anvil's command families.
+;
+;  1 means "a family gated behind this may assume the board's backend is
+;  present and works". 0 means Anvil cannot reach the group here -
+;  because the hardware is genuinely absent, or because no backend has
+;  been written for it yet. From the operator's seat those are the same
+;  fact and the same honest refusal, so one flag carries both; each line
+;  below says WHICH it is, because they are not the same fact for the
+;  next person to work here.
+;
+;  NOTHING IS 0 TO MAKE THE IMAGE SMALLER. Anvil/Hal/hal.pbi forbids that
+;  in as many words and nothing here is hidden that works.
+;
+;  They must be declared BEFORE Anvil/Hal/hal.pbi and before every gated
+;  command file, because that is where RequireCap reads them.
+; ======================================================================
+#CAP_STORAGE  = 1   ; YES. The card is reached through this board's own
+                    ; host driver behind the shared filesystems' block
+                    ; seam, and the file family comes from
+                    ; Anvil/Storage/hwfile.pbi, which every board with a
+                    ; block device answers with. Nothing about FAT32 or
+                    ; exFAT is written twice.
+#CAP_NET      = 0   ; NO BACKEND IN THIS IMAGE. The drivers exist - a
+                    ; DWC2 host and a LAN9514 behind it - and they are
+                    ; the boot lane's, compiled into the serial updater.
+                    ; Bringing them in here means DMA, and this monitor
+                    ; has just turned its caches on for the first time on
+                    ; this part; adding both at once would give the first
+                    ; failure two candidate causes. The radio is a later
+                    ; milestone and needs a bus backend that does not
+                    ; exist yet.
+#CAP_GPIO     = 0   ; NO BACKEND. The block is at $3F200000 and this
+                    ; monitor already writes it - the console's pin mux
+                    ; and the card's - so this is unwritten work rather
+                    ; than unreachable hardware. What it needs first is
+                    ; the reserved-pin list: the console on 14 and 15,
+                    ; the card on 48 to 53 and the radio on 34 to 39, any
+                    ; of which takes the machine down under itself.
+#CAP_I2C      = 0   ; NO BACKEND. Two Broadcom Serial Controllers, and
+                    ; nothing in this tree drives either.
+#CAP_TOUCH    = 0   ; NO PANEL. Not unwritten work - there is no touch
+                    ; controller on this bench's board and no plan.
+#CAP_MMC      = 0   ; NOT OFFERED, AND THE CARD WORKS. This group is the
+                    ; RAW BLOCK family. The driver will only write inside
+                    ; a window somebody declared, because the card
+                    ; carries the loader and both slots; offering the
+                    ; family and then refusing half of it would be worse
+                    ; than not offering it.
+#CAP_USB      = 0   ; NO BACKEND IN THIS IMAGE - see #CAP_NET.
+#CAP_PWM      = 0   ; NO BACKEND, and a Model B has no fan header for the
+                    ; family's main use.
+#CAP_BOOT_EL1 = 0   ; REACHABLE AND NOT WRITTEN. Unlike the UNO Q, which
+                    ; runs at EL1 and cannot, this board is handed over
+                    ; at EL2 - so the capability is real work rather than
+                    ; a platform limit. It needs the caches and the MMU
+                    ; put back exactly as a kernel expects, which has
+                    ; never been done here.
+#CAP_CONSOLE  = 0   ; NO PIXEL SURFACE YET. There IS a framebuffer and it
+                    ; was presented on this silicon in build 6; what does
+                    ; not exist is the HwCon* surface a payload draws on.
+                    ; A 1 here would offer a payload a surface that
+                    ; answers every call with a zero.
+#CAP_GNSS     = 0   ; NO RECEIVER.
+#CAP_UART     = 0   ; NO SECOND PORT OFFERED. The console's PL011 is the
+                    ; console's; the mini-UART is not driven.
+#CAP_SPI      = 0   ; NO BACKEND.
+#CAP_VEHLINK  = 0   ; NO BACKEND and no unit.
+#CAP_RTC      = 0   ; NO CLOCK HARDWARE. A Pi keeps no time across a
+                    ; power cut without an add-on board, and there is
+                    ; none here - so this is genuine absence.
+#CAP_PARALLEL = 0   ; NO SECONDARY-CORE OWNER. The part has four A53s and
+                    ; this monitor starts one. The spin table is the
+                    ; firmware's; claiming the group without a core owner
+                    ; would let a payload ask for workers that never come.
+
+; ======================================================================
+;  3. THE HAL SEAM, THE SHARED LIBRARIES, AND THIS BOARD'S BACKENDS.
+;
+;  ORDER IS THE WHOLE OF THIS SECTION AND IT IS NOT ARBITRARY:
+;
+;    hal.pbi needs the capability constants above it.
+;    state.pbi owns #CRC_POLY, which crc.pbi reads.
+;    format.pbi owns PutAddr, which hw_mem.pi3 prints with.
+;    The filesystems need crc and sha256 under them.
+;    hwfile.pbi DECLARES gHwFileMounted / gHwFileWritable / gHwFileWriter
+;      and storage.pi3 ASSIGNS them, so the shared file comes first -
+;      the same order board.pi4 uses for the same reason.
+;    hw_mem.pi3 comes before hw_addr.pi3, which asks it.
+; ======================================================================
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Core/wallclock.pbi"
+
+; The shared USB core - the descriptor vocabulary and the walk over it,
+; which Anvil/Core/usb_cmd.pbi decodes with. INCLUDED EVEN THOUGH
+; #CAP_USB IS 0 ON THIS BOARD: a configuration descriptor has the same
+; shape on every bus on every board, so the decoding is written once and
+; a board only fetches. With no host backend here nothing ever fetches,
+; the `usb` family refuses at the gate, and this costs the constants and
+; the dead code - which is the price of the core being one set of bytes
+; for every board.
+XIncludeFile "Anvil/Bus/usb_core.pbi"
+
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Storage/exfat.pbi"
+XIncludeFile "Anvil/Storage/filesystem.pbi"
+XIncludeFile "Anvil/Storage/hwfile.pbi"
+XIncludeFile "Anvil/Storage/ab_record.pbi"
+XIncludeFile "RaspberryPi3/Lib/boot_record.pbi"
+
+XIncludeFile "RaspberryPi3/Board/memmap.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_mem.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_addr.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_id.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_board.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_mod.pi3"
+XIncludeFile "RaspberryPi3/Board/storage.pi3"
+XIncludeFile "RaspberryPi3/Board/pi3stubs.pi3"
+
+; The board's identity for the payload ABI, one of Anvil/Hal/abi.pbi's
+; #SVC_BOARD_* codes. INFORMATIONAL ONLY - a payload that branches on it
+; has re-forked the thing the capability model exists to prevent, and the
+; ABI gate looks for exactly that. 3 was appended to that vocabulary for
+; this board; the list is append-only, so nothing that already knew 1 and
+; 2 changes meaning.
+#SVC_BOARD_ID = 3   ; #SVC_BOARD_PI3
+
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+XIncludeFile "Anvil/Hal/abi.pbi"
+
+; ======================================================================
+;  4. THE SHARED ANVIL CORE, included unchanged. Not one of these files
+;     knows which board it is on.
+; ======================================================================
+XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+XIncludeFile "Anvil/Core/parse.pbi"
+XIncludeFile "Anvil/Core/messages.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+XIncludeFile "Anvil/Core/addrsafe.pbi"
+XIncludeFile "Anvil/Core/argfmt.pbi"
+XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "Anvil/Core/memcmd.pbi"
+XIncludeFile "Anvil/Core/uptime.pbi"
+XIncludeFile "Anvil/Core/flow_cmd.pbi"
+XIncludeFile "Anvil/Core/gpio_cmd.pbi"
+XIncludeFile "Anvil/Core/i2c_cmd.pbi"
+XIncludeFile "Anvil/Core/mmc_cmd.pbi"
+XIncludeFile "Anvil/Core/usb_cmd.pbi"
+XIncludeFile "Anvil/Core/boot_cmd.pbi"
+XIncludeFile "Anvil/Core/datapath.pbi"
+XIncludeFile "Anvil/Core/fs_cmd.pbi"
+XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
+XIncludeFile "Anvil/Core/pmfboot.pbi"
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+XIncludeFile "Anvil/Core/mod_cmd.pbi"
+XIncludeFile "Anvil/Core/shotarm.pbi"
+XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+XIncludeFile "Anvil/Core/fan.pbi"
+XIncludeFile "Anvil/Core/fan_cmd.pbi"
+XIncludeFile "Anvil/Core/help.pbi"
+
+; ======================================================================
+;  5. THE BOOT, AND THE FIFTEEN SECONDS IT HAS
+; ======================================================================
+;  Two constraints shape every line of Main(), and neither is negotiable.
+;
+;  THE FIRMWARE MAILBOX STOPS ANSWERING ONCE THE MMU IS ON.
+;  RaspberryPi3/Lib/mailbox.pbi's own context check reads SCTLR, masks it
+;  with the MMU bit and the D-cache bit, and REFUSES the transaction if
+;  either is set - because its property buffer has to be memory the
+;  VideoCore and the ARM agree about, and that file makes no claim to
+;  support a cached one. That guard is correct for what it guards and it
+;  is absolute. So every mailbox question this monitor will ever ask is
+;  asked HERE, before the MMU, and remembered: the console clock, the
+;  ARM's memory extent, the device tree's validity, the card's clock, and
+;  the board revision code that is how `info` knows this is a 1 GB board.
+;
+;  THE LOADER'S DEADMAN IS ARMED AND IS NOT FED. Fifteen seconds from the
+;  branch, and on this card a single-block read costs more than fourteen
+;  milliseconds - so seventy-four reads is a second. The confirm therefore
+;  does the least card work that can possibly confirm (mount partition 1,
+;  open the one control record the handoff names, rewrite it, read it
+;  back) and everything else - the second partition, the settings, the
+;  banner - happens after the watchdog is off. The reasoning is in
+;  RaspberryPi3/Board/storage.pi3 under THE CONFIRM PATH IS SIZED IN CARD
+;  READS.
+;
+;  THE ORDER, THEREFORE:
+;      UART first, so that everything after it can say what went wrong
+;      the firmware questions, while they can still be asked
+;      the card, and the confirm, and the watchdog off
+;      the MMU and the caches
+;      the banner and the prompt
+; ======================================================================
+
+; The monitor's memory validator remains local: its RAM and DTB contract is
+; deliberately stricter than the loader's early-boot contract.
+Procedure.i Pi3MonitorBootMemory()
+  Define buffer.i
+  Define size.i
+  Define total.i
+  If pi3_mailbox_outstanding <> 0 : ProcedureReturn 0 : EndIf
+  buffer = ((@pi3_property[0] + 15) >> 4) << 4
+  PokeL(buffer,32) : PokeL(buffer + 4,0)
+  PokeL(buffer + 8,$10005) : PokeL(buffer + 12,8)
+  PokeL(buffer + 16,0) : PokeL(buffer + 20,0)
+  PokeL(buffer + 24,0) : PokeL(buffer + 28,0)
+  If Pi3MailboxCall(buffer,32) = 0 : ProcedureReturn 0 : EndIf
+  If PeekL(buffer + 8) <> $10005 Or PeekL(buffer + 12) <> 8 Or (PeekL(buffer + 16) & $FFFFFFFF) <> $80000008
+    ProcedureReturn 0
+  EndIf
+  pi3_ram_base = PeekL(buffer + 20) & $FFFFFFFF
+  size = PeekL(buffer + 24) & $FFFFFFFF
+  If pi3_ram_base <> 0 Or size < $3000000 Or size > $3F000000
+    ProcedureReturn 0
+  EndIf
+  pi3_ram_end = pi3_ram_base + size
+  If pi3_dtb <> $1000000 : ProcedureReturn 0 : EndIf
+  If Pi3ReadBe32(pi3_dtb) <> $D00DFEED : ProcedureReturn 0 : EndIf
+  total = Pi3ReadBe32(pi3_dtb + 4)
+  If total < 40 Or total > 1048576 Or total > pi3_ram_end - pi3_dtb
+    ProcedureReturn 0
+  EndIf
+  pi3_dtb_end = pi3_dtb + total
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pi3BootFail(*why) - say it, then park.
+;
+;  ONE PLACE, so that every failure in the window looks the same and none
+;  of them forgets to drain the port before the watchdog resets the
+;  board. UartDrain() waits for the last stop bit; without it the reason
+;  is cut off mid-sentence and the operator sees a board that reset for
+;  no stated cause.
+; ----------------------------------------------------------------------
+Procedure Pi3BootFail(*why)
+  PrintN("!! Anvil could not start on this board.")
+  Print("   ")
+  UartWriteStr(*why)
+  PrintNl()
+  PrintN("   The loader's fifteen-second deadman is still armed, so the board is")
+  PrintN("   about to reset and fall back to its other slot.")
+  UartDrain()
+  Pi3Park()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdPi3Info() - what this computer is, as this board can answer it.
+;
+;  THE RAM ROW IS THE ONE WORTH READING TWICE. It reports the memory
+;  FITTED, from the board revision code, because that is what the question
+;  "how much memory does this computer have" means. What the processor was
+;  actually GIVEN is smaller and is printed under it, with the reason:
+;  the VideoCore takes its share, and the top sixteen megabytes of the
+;  gigabyte are under the peripheral window and - unlike the other Pi in
+;  this tree - do not reappear anywhere. Three different true numbers, and
+;  a monitor that printed one of them as all three would be lying twice.
+; ----------------------------------------------------------------------
+Procedure CmdPi3Info()
+  PrintN("")
+  Print("board       ") : UartWriteStr(HwIdBoard())
+  Print(", ") : UartWriteStr(HwIdCpu())
+  Print(", four cores, one started")
+  If HwMemoryRevision() <> 0
+    Print("   (revision code $") : PutHexN(HwMemoryRevision(), 8) : Print(")")
+  EndIf
+  PrintNl()
+
+  Print("RAM         ") : PutMemBytes(HwMemoryBytes())
+  Print(", from ") : UartWriteStr(HwMemoryWhere()) : PrintN(".")
+  HwMemSayArm()
+
+  Print("exception   EL") : PrintDec(HwIdEl()) : PrintN("")
+  Print("translation ")
+  If (HwMmuState() & 1) = 0
+    PrintN("off - which this monitor never runs with; say so if you see it")
+  Else
+    Print("on, ")
+    If (HwMmuState() & 2) <> 0
+      Print("data cache on, ")
+    Else
+      Print("data cache OFF, ")
+    EndIf
+    If (HwMmuState() & 4) <> 0
+      PrintN("instruction cache on")
+    Else
+      PrintN("instruction cache OFF")
+    EndIf
+  EndIf
+
+  PrintN("")
+  HwIdSayConsole()
+  PrintN("")
+  HwStorageReport()
+  PrintN("")
+  HwAddrReport()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdPi3Reset() - reset the board through the power-management watchdog.
+;
+;  IT SAYS SO AND DRAINS FIRST. HwReboot() waits for the last stop bit
+;  before it writes the register, so the sentence reaches the operator
+;  rather than being cut off by the reset it is announcing.
+; ----------------------------------------------------------------------
+Procedure CmdPi3Reset()
+  PrintN("resetting. The loader will choose a slot again; if this image was")
+  PrintN("confirmed, it will choose this one.")
+  HwReboot()
+EndProcedure
+
+Procedure Main()
+  Define clock.i
+  Define c.i
+  Define k.i
+  Define suf.i
+  Define tmv.i
+
+  ; ------------------------------------------------------------------
+  ;  IDENTITY FROM THE HANDOFF, NOT FROM A REGISTER. See section 0.
+  ; ------------------------------------------------------------------
+  pi3_dtb = $1000000
+  pi3_boot_status = 1
+
+  ; ------------------------------------------------------------------
+  ;  THE CONSOLE FIRST, and before it the one mailbox question it needs.
+  ;  Everything after this line can say what went wrong; nothing before
+  ;  it can.
+  ; ------------------------------------------------------------------
+  If Pi3MailboxContext() = 0 : Pi3Park() : EndIf
+  clock = Pi3ClockRate(2)
+  If clock <= 0 : Pi3Park() : EndIf
+  If Pi3UartInit(clock, 115200) = 0 : Pi3Park() : EndIf
+
+  PrintN("Anvil starting.")
+
+  ; ------------------------------------------------------------------
+  ;  THE REST OF THE FIRMWARE QUESTIONS, while they can still be asked.
+  ; ------------------------------------------------------------------
+  If Pi3MonitorBootMemory() = 0
+    pi3_boot_status = -4
+    Pi3BootFail("The firmware would not state a memory layout this monitor recognises, or the device tree is not where the loader pinned it. Check that the loader started this slot rather than something else having branched here.")
+  EndIf
+  ; Asked once, here, and remembered - see the header of hw_mem.pi3. A 0
+  ; is not fatal: a monitor that would not come up because it could not
+  ; learn its memory size is worse than one that says it does not know.
+  HwMemAsk()
+
+  clock = Pi3BootMaxCoreClock()
+  If clock < 1000000
+    pi3_boot_status = -6
+    Pi3BootFail("The firmware refused to state the card controller's maximum clock, so the SD host cannot be brought up safely.")
+  EndIf
+  If Pi3SdInit(clock, 0, pi3_ram_end) = 0
+    pi3_boot_status = -7
+    Pi3BootFail("The SD host did not come up. The loader read this slot off the same card, so the medium is there - which points at the controller's state rather than at the card.")
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  THE CONFIRM, AND THE DEADMAN OFF. The least card work that can
+  ;  possibly confirm; everything else waits. See section 5.
+  ; ------------------------------------------------------------------
+  If Pi3StorageConfirmSlot() = 0
+    pi3_boot_status = -8
+    UartDrain()
+    Pi3Park()
+  EndIf
+  If Pi3MonWatchdogStop() = 0
+    pi3_boot_status = -9
+    Pi3BootFail("The running slot confirmed itself and the deadman would not switch off. That is a fault in this monitor or in the power-management block, and the board will reset shortly whatever else happens.")
+  EndIf
+  PrintN("Slot confirmed; the loader's deadman is off.")
+
+  ; ------------------------------------------------------------------
+  ;  THE MMU AND THE CACHES. After this line the mailbox is closed for
+  ;  the rest of the boot and every mailbox answer above is all this
+  ;  monitor will ever have.
+  ;
+  ;  IT IS NOT AN OPTIMISATION HERE. With translation off every access is
+  ;  to Device memory and an unaligned access to Device memory is an
+  ;  alignment fault whatever SCTLR.A says - so the shared filesystems'
+  ;  packed directory entries and the hash's message blocks would fault
+  ;  rather than run slowly. The whole argument is at the top of
+  ;  RaspberryPi3/Lib/mmu.pi3.
+  ;
+  ;  THE MAILBOX PROPERTY BUFFER IS MARKED NON-CACHEABLE BEFORE THE
+  ;  TABLES ARE BUILT even though nothing asks the mailbox afterwards.
+  ;  It costs one 2 MB block of cacheability in a region that holds this
+  ;  monitor's variables, and it is what makes the day somebody adds a
+  ;  mailbox call after boot a working day instead of a mystery.
+  ; ------------------------------------------------------------------
+  MmuAddNc(@pi3_property[0], @pi3_property[0] + 47)
+  If MmuUp() <> 0
+    pi3_boot_status = -10
+    Pi3BootFail("The page tables would not build where this monitor puts them, so translation was not enabled and nothing was changed. The deadman is already off, so the board will stay here rather than reset.")
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  FROM HERE IT IS THE SAME MONITOR EVERY OTHER BOARD RUNS.
+  ; ------------------------------------------------------------------
+  pi3_boot_status = 2
+  gBootTicks = Ticks()
+  Banner()
+
+  ; ==================================================================
+  ;  THE PROMPT.
+  ;
+  ;  Written out rather than called because there is no CommandLoop() in
+  ;  the core to call - on every Anvil board the loop lives inline in
+  ;  the board's Main(), and the other two are the reference. That is a
+  ;  duplication this monitor has three copies of and it is not this
+  ;  lane's to fix; it is recorded in the layering plan.
+  ;
+  ;  "pmf> " IS LOAD-BEARING: five characters, a trailing space, no
+  ;  newline. Host tools match on it. Do not tidy it.
+  ; ==================================================================
+  Repeat
+    Print("pmf> ")
+    UartDrain()
+    ReadLine()
+
+    OutBreakArm()
+    gPos = 0
+    SkipSpace()
+    gWordAt = gPos
+    c = gLine[gPos] & $FF
+    SkipWord()
+    gWordLen = gPos - gWordAt
+
+    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
+    ; When the word moves, the single-letter character moves with it; a
+    ; refusal sets that character to zero, which the empty-line arm below
+    ; already runs nothing for.
+    tmv = TimeArm()
+    If tmv = 1
+      c = gLine[gWordAt] & $FF
+    ElseIf tmv = 2
+      c = 0
+    EndIf
+
+    gMemWidth = 0
+    ; THE SAFETY OVERRIDE AGES HERE, beside the width reset and for the
+    ; same reason: state must not leak from one command line into the
+    ; next. `force <address>` arms one address for the NEXT line and this
+    ; ends it, used or not.
+    ForceAge()
+    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46      ; 46 = .
+      suf = gLine[gWordAt + gWordLen - 1] & $FF
+      If suf = 98 Or suf = 66                                    ; b / B
+        gMemWidth = 1
+      ElseIf suf = 119 Or suf = 87                               ; w / W
+        gMemWidth = 2
+      ElseIf suf = 108 Or suf = 76                               ; l / L
+        gMemWidth = 4
+      EndIf
+      If gMemWidth <> 0
+        gWordLen = gWordLen - 2                                  ; hide .x
+      EndIf
+    EndIf
+
+    If c = 0
+      ; An empty line reprints the prompt and does nothing else.
+    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
+      CmdMem()
+    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
+      CmdWrite()
+    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
+      CmdCompare()
+    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
+      CmdCopy()
+    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
+      CmdCrc32()
+    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
+      CmdFill()
+    ElseIf WordIs("mm") <> 0
+      CmdMm()
+    ElseIf WordIs("nm") <> 0
+      CmdNm()
+    ElseIf WordIs("mtest") <> 0
+      CmdMtest()
+    ElseIf WordIs("base") <> 0
+      CmdBase()
+    ; force - arm one address this board refused, for the next command
+    ; line only. A whole word, no alias and no abbreviation: it is the
+    ; confirmation for an access the board has said is not safe, and a
+    ; short way to type it would be the accident it exists to prevent.
+    ElseIf WordIs("force") <> 0
+      CmdForce()
+    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
+      CmdGo()
+    ElseIf WordIs("booti") <> 0
+      CmdBooti()
+    ElseIf WordIs("bootm") <> 0
+      CmdBootm()
+    ElseIf WordIs("boot") <> 0
+      CmdBoot()
+    ; THE FILE COMMANDS, over the shared filesystems and the shared file
+    ; seam. Unedited for this board: it supplies a block reader and a
+    ; block writer and nothing else.
+    ElseIf WordIs("load") <> 0 Or WordIs("fatload") <> 0 Or LetterIs(102) <> 0
+      CmdFat()
+    ElseIf WordIs("save") <> 0
+      CmdSave()
+    ElseIf WordIs("mkdir") <> 0
+      CmdMkdir()
+    ElseIf WordIs("rmdir") <> 0
+      CmdRmdir()
+    ElseIf WordIs("rm") <> 0 Or WordIs("del") <> 0
+      CmdRemove()
+    ElseIf WordIs("rename") <> 0 Or WordIs("mv") <> 0
+      CmdRename()
+    ElseIf WordIs("fatls") <> 0 Or WordIs("ls") <> 0 Or WordIs("dir") <> 0
+      CmdFatls()
+    ; THE SETTINGS STORE. SETTINGS.TXT on the boot partition, which is
+    ; where the other board keeps its too - a board that lost its
+    ; settings to a data-partition swap would be a board that lost its
+    ; network credentials to one.
+    ElseIf WordIs("settings") <> 0
+      CmdSettings()
+    ElseIf WordIs("printenv") <> 0
+      CmdEnvPrint()
+    ElseIf WordIs("setenv") <> 0
+      CmdEnvSet()
+    ElseIf WordIs("saveenv") <> 0
+      CmdSettingsSave()
+    ElseIf WordIs("env") <> 0
+      CmdEnv()
+    ElseIf WordIs("time") <> 0
+      CmdTime()
+    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
+      CmdUptime()
+    ElseIf WordIs("messages") <> 0
+      CmdMessages()
+    ElseIf WordIs("echo") <> 0
+      CmdEcho()
+    ElseIf WordIs("sleep") <> 0
+      CmdSleep()
+    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
+      CmdVersion()
+    ElseIf WordIs("setexpr") <> 0
+      CmdSetexpr()
+    ElseIf WordIs("gpio") <> 0
+      CmdGpio()
+    ElseIf WordIs("i2c") <> 0
+      CmdI2c()
+    ElseIf WordIs("fan") <> 0
+      CmdFan()
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+    ElseIf WordIs("mmc") <> 0
+      CmdMmc()
+    ElseIf WordIs("usb") <> 0
+      CmdUsb()
+    ; map - where this image put itself, measured rather than declared.
+    ; A whole word only; m is the memory dump.
+    ElseIf WordIs("map") <> 0
+      CmdMap()
+    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
+      CmdPi3Info()
+    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
+      CmdPi3Reset()
+    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
+      Help()
+    Else
+      Print("? this monitor does not know the command ")
+      k = 0
+      While k < gWordLen And k < 24
+        UartWrite(gLine[gWordAt + k] & $FF)
+        k = k + 1
+      Wend
+      PrintN(", so nothing was done.")
+      PrintN("  Type help, or just a question mark, for the list of commands.")
+      PrintN("  Every command is a whole word; the old single letters still work.")
+    EndIf
+
+    ; What the command above cost, on this board's own counter, if the
+    ; line began with `measure`. Silent otherwise.
+    TimeReport()
+  ForEver
+EndProcedure

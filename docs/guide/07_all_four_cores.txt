@@ -1,0 +1,362 @@
+; Chapter 7 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   Anvil/Hal/abi.pbi                         - group 15, slots 184-186,
+;                                               the error sentences, the
+;                                               bit-identity argument.
+;   RaspberryPi4/Lib/core_accept.pi4          - the implementation, the
+;                                               five-second bound, the
+;                                               latch, the stacks.
+;   RaspberryPi4/Board/core_accept_cmd.pi4    - coretest's printed text.
+;   RaspberryPi4/Board/cache.pi4              - RunAt's refusal.
+;   docs/CORE_ACCEPTANCE.md, docs/RAW_CORES.md, docs/MULTICORE_STATUS.md
+;
+; TRANSCRIPT-SOURCED, AND SAID SO IN THE TEXT:
+;   The coretest status/run output is from the recorded board session of
+;   2026-09-16 on build 142 (vault: Anvil/Four-core service - monitor
+;   flash package 2026-09-15.md). Nothing in this chapter was run on a
+;   board while it was written; the board was in another lane's hands.
+;
+; DELIBERATE: the coretest transcript here shows the full command output
+; including the status block CmdCoreAcceptRun always prints, because the
+; vault note quoted only an excerpt and a reader comparing their own
+; screen to an excerpt would think lines were missing.
+@CHAPTER Using all four cores
+@INTRO A Pi 4 has four processors. Anvil will run one of your procedures on all of them, inside a bound, with results that are bit-for-bit what one core would have produced.
+
+@SECTION What the service does, in one paragraph
+
+You hand Anvil one procedure address and N argument blocks. Anvil calls
+that procedure once per block - on cores 0, 1, 2 and 3, with the core
+you were already on taking a block too - waits for all of them inside a
+bounded deadline, and returns. That is the whole service. It is not a
+scheduler, there are no threads, nothing is queued, and nothing runs in
+the background afterwards.
+
+@SECTION The three slots
+
+Group 15 of the service table, new at ABI 1.3:
+
+@FRAG
+SvcParallelCores()                                   slot 184
+SvcParallelRun(entry, argsBase, argsStride, count)   slot 185
+SvcParallelStatus(index)                             slot 186
+@ENDFRAG
+
+`SvcParallelCores()` tells you how many partitions this monitor will run
+at once. It returns 4 or 1, and **it is never an error**. One is a real
+answer, not a failure: it means "this Anvil will run your work on the
+core you are already on". A monitor older than ABI 1.3 gives you the
+same answer by not having the slot at all. So your payload has exactly
+one fallback path - the single-core code you already have - and not two.
+
+`SvcParallelRun` starts the run. `entry` is the procedure address,
+`count` is 1 to 4, and the call Anvil makes for partition `i` is:
+
+@FRAG
+entry(argsBase + i * argsStride)
+@ENDFRAG
+
+Nothing else is defined. One pointer goes in. Your procedure's return
+value is kept and readable afterwards through `SvcParallelStatus(i)`;
+zero conventionally means it is content. It must return.
+
+@TRAP Your entry gets a pointer and **nothing else**. No core index, no
+partition number, no base, no count. If your worker needs to know which
+slice it owns, put that in the block - which is what every real user of
+this service does. A four-field block of
+`{ shared args pointer, first, last, status }` at a stride of 32 bytes
+is the shape the desk gate and the first real user both settled on.
+
+@SECTION Ask for the count at the right moment
+
+Call `SvcParallelCores()` **after** your payload has enabled its own MMU
+and caches, not before.
+
+The count is not a constant for the life of your payload. The service
+answers 4 only when the calling context is right, and one of the
+conditions it checks is that your translation regime and caches are on.
+Ask too early and you get 1 - correctly, and silently, because 1 is a
+legitimate answer - and your payload quietly runs everything on one
+core while believing it asked.
+
+This is not hypothetical. It happened to the first real user of the
+service: the count read 1 because the question was asked before the
+payload's own cache bring-up, and the run took the single-core path for
+an entire board session before anybody noticed the timings had not
+moved.
+
+@SECTION Partitions are yours, and that is the point
+
+Anvil does not split your work. You do.
+
+You split your output into ranges, one per partition, and those ranges
+must be **disjoint**. No output element may be written by two cores.
+This is the whole design, and it is what buys you the property that
+matters:
+
+@NOTE A kernel that is bit-identical to its scalar reference on one core
+stays bit-identical on four, **by construction rather than by
+measurement**. Because the partitions are disjoint output ranges, no
+result is written twice and no result's accumulation order changes. You
+are not hoping the answer comes out the same. There is no path by which
+it can differ.
+
+That claim held the first time it was tested on real work. Two reference
+waveforms produced by a four-core run came back byte-for-byte identical
+to the ones the single-core build had produced, while the run itself
+went from 265.5 seconds to 107.3 (recorded board session, 2026-09-16,
+build 142).
+
+Two mechanisms hold the property up, and both are worth knowing because
+both can bite you.
+
+@SECTION The floating-point control register must agree
+
+Rounding mode and flush-to-zero live in a register that is **per
+processor**. One core rounding differently from the others is a silently
+different answer, which is exactly the failure this whole design exists
+to make impossible.
+
+So every secondary publishes its floating-point control register when it
+reports ready and at every job acknowledgement, and the primary refuses
+the job unless all four agree with its own. You do not have to do
+anything about this; you just need to know that a refusal citing it is
+real and is not a false alarm.
+
+@SECTION Do not flush caches at the join, and this is not a performance note
+
+@TRAP **Cache maintenance at the join would be WRONG, not merely slow.**
+Splitting a computation by output range puts two cores' outputs in the
+same 64-byte cache line at each boundary. On the memory type these
+buffers live in, the hardware's coherency protocol resolves that
+correctly at byte granularity. A clean-and-invalidate over the output at
+the join takes a line that two cores have each partly written and writes
+one core's copy of it over the other's - destroying exactly the results
+you just computed. Anvil's own join loop carries this rule as a comment
+and does no maintenance there. Do not add any in your payload either.
+
+@SECTION What your worker procedure may not do
+
+Cores 1, 2 and 3 are running your code in a context that has none of
+Anvil around it. From those cores your procedure may not:
+
+@FRAG
+- call a service slot
+- print anything
+- touch a device
+- pet the deadman
+- unmask interrupts
+- reach Anvil's state in any way
+@ENDFRAG
+
+Pure computation over memory you own. That is the entire permitted
+surface.
+
+It works because on this backend a procedure's parameters and locals
+live in its own frame, so four invocations on four stacks do not
+collide. What they must not do is share anything mutable that Anvil
+owns.
+
+@TRAP Each secondary gets a 4 KiB page of stack, and the lowest 256
+bytes of it are a poison guard, so your **usable depth is 3840 bytes**.
+Run off the bottom and the guard is overwritten, the run is refused, and
+the refusal says plainly that this job's outputs cannot be trusted. A
+deep recursion or a large local array in a worker is not a small
+mistake here.
+
+@SECTION The five-second bound
+
+`SvcParallelRun` is bounded at five seconds. The bound is armed before
+anything is dispatched, and it is measured off the board's wall counter.
+
+Five is chosen against the 15-second deadman, with your payload's own
+pet immediately before the call. A kernel whose partition cannot finish
+inside five seconds is one you split into more calls. **The bound is
+never widened toward the deadman**, because a bound that approaches the
+deadman stops being a separate safety net.
+
+The bound exists for one specific failure the deadman cannot see: a
+wedged secondary beside a healthy primary that keeps petting. Nothing
+else covers that case. The board looks alive, the deadman is fed, and
+one core is simply gone.
+
+@NOTE What the bound does NOT cover, said plainly: **your own
+partition**. Partition 0 runs on the primary as an ordinary call into
+your code, and nothing can interrupt it. A worker that never returns on
+the primary is your payload's own infinite loop, and the deadman is its
+answer exactly as it would be on one core. The bound is armed at entry
+so its five seconds are measured from before that call rather than
+after, which keeps the arithmetic honest - but it cannot make a
+non-returning primary return.
+
+@SECTION When a core wedges
+
+On expiry the service latches a fault, names the core, and returns
+`SVC_ETIMEOUT` (-104). Your payload should print the reason by name
+rather than a bare code; `SvcErrText` and `SvcErrDetail` give you both
+halves of the sentence, and the detail for this one reads:
+
+@FRAG
+a secondary core did not finish its partition inside the five-second bound; a payload entry that faults on a secondary parks it silently, because a secondary has no exception vectors of its own
+@ENDFRAG
+
+That second clause is the important part. A secondary has no exception
+vectors of its own. If your worker faults on core 2, core 2 does not
+report an error - it takes an exception to a vector base it does not
+own, and it is gone. There is nothing to catch. The timeout is how you
+find out.
+
+@TRAP A wedged core **latches the service failed for the rest of the
+boot**. Every later call refuses with `SVC_ESTATE` (-108), and
+`SvcParallelCores()` starts answering 1 so that a well-written payload
+falls back to one core instead of looping on refusals. There is no
+re-release and no warm rejoin, because a core that stopped answering
+cannot be proven safe to re-use. **Recovery is a reset.** This is
+accepted policy, not an unfinished corner.
+
+@SECTION The full list of refusals
+
+Every one of these is a sentence, and every one names what to check:
+
+@FRAG
+SVC_EARG     (-102)  count must be 1 to 4, entry must be a non-zero
+                     word-aligned address, and argsStride must not be
+                     negative
+SVC_EPERM    (-106)  a parallel run may only be started from the core
+                     the payload was entered on, at EL3, with interrupts
+                     masked
+SVC_EBUSY    (-103)  the secondary cores could not be started because
+                     something else already holds them
+SVC_ESTATE   (-108)  a secondary core has an unfinished job outstanding
+                     or was permanently parked, and neither is
+                     recoverable without a reset
+SVC_ETIMEOUT (-104)  a secondary core did not finish its partition
+                     inside the five-second bound
+SVC_EPERM    (-106)  a secondary core is not rounding the way the
+                     primary is, and bit-identical results need every
+                     core to share one floating-point control register
+SVC_EPERM    (-106)  a partition ran off the bottom of its secondary
+                     stack and overwrote the guard below it, so this
+                     job's outputs cannot be trusted
+SVC_EIO      (-105)  the payload's own partition procedure reported
+                     failure; the value it returned is in
+                     SvcParallelStatus and no Anvil state is at fault
+SVC_ENOSYS   (-100)  this board does not have the parallel capability
+@ENDFRAG
+
+That last distinction is worth a second of your time. `SVC_EIO` with
+that detail means **your** worker said no. Nothing in Anvil failed.
+Go and read `SvcParallelStatus(i)` for the value your own code returned.
+
+@SECTION coretest: proving the cores before you trust them
+
+`coretest` is a bounded acceptance instrument, not a scheduler and not a
+payload. It starts cores 1 to 3 and runs sixteen verified arithmetic
+rounds on each, so you can establish that the machinery works before
+you blame your own kernel for a silence.
+
+@FRAG
+coretest           report ownership, run count, nonces, per-core state
+coretest status    the same thing, spelled out
+coretest run       start cores 1-3 if needed, run 16 verified rounds
+coretest stop      publish stop requests, wait for permanent park
+@ENDFRAG
+
+Extra arguments and unknown subcommands are refused. There is no
+automatic start and no payload form.
+
+What you will see. These lines are from a recorded board session on
+2026-09-16, build 142 - the first time this machinery ran on a board.
+Cold, before anything else:
+
+@FRAG
+pmf> coretest
+coretest started=0 stopped=0 runs=0 nonce=0 error=0 core=0
+  leases: secondary=0 gic=0 watchdog=0
+@ENDFRAG
+
+Then the run. `coretest run` always prints the status block after its
+verdict, so you get the verdict, the counters, the leases, and one row
+per core:
+
+@FRAG
+pmf> coretest run
+coretest PASS: 16 nonce rounds, three resident EL3 workers.
+coretest started=1 stopped=0 runs=1 nonce=16 error=0 core=0
+  leases: secondary=1 gic=1 watchdog=1
+  core=1 ready=2 request=16 ack=16 result=25167481 status=1
+  core=2 ready=2 request=16 ack=16 result=25236842 status=1
+  core=3 ready=2 request=16 ack=16 result=25306203 status=1
+@ENDFRAG
+
+`request` and `ack` matching at 16 is the proof: every nonce was asked
+for and every one was acknowledged, with no refusal and no timeout.
+
+A failure says so and tells you where to look:
+
+@FRAG
+coretest REFUSED/FAILED; see error and core below.
+@ENDFRAG
+
+and in a latched state, the status block adds:
+
+@FRAG
+Failure latched. No re-release or warm rejoin. Try stop only after jobs finish.
+If stop refuses, retain diagnostics; controlled restart required for recovery.
+@ENDFRAG
+
+@SECTION The lifecycle limit you will hit, and it is still open
+
+This is the one thing about the four-core service that will surprise
+you, and it is worth reading twice.
+
+**Once anything has started the secondary cores, this monitor will not
+enter another payload until you reset the board.** Not another four-core
+payload - not any payload at all, including a plain single-core one.
+
+You will see exactly this:
+
+@FRAG
+pmf> run
+!! resident secondary cores own this monitor until restart, so no
+   payload was entered. Restart Anvil before run, go or boot mem.
+@ENDFRAG
+
+`run`, `go` and `boot mem` all refuse the same way.
+
+The reason is sound. A released secondary is executing code and reading
+rows inside the resident monitor image. Handing the machine to a payload
+would disable the translation regime those addresses were handed out
+under, and every address the workers were given would stop meaning what
+it meant. Stopped workers are permanently parked **in that same resident
+code**, so `coretest stop` does not help - it parks them and keeps
+ownership by design. Only a restart clears it.
+
+@TRAP The trap is that your payload springs this itself. `SvcParallelRun`
+starts the cores lazily, on first use. You do not type a command to
+enter this state; your payload's first parallel call enters it for you.
+So the shape of a four-core session today is: reset, upload, run one
+payload, read your results back, reset again. Budget for the re-upload
+of anything large.
+
+@NOTE To be exact about what the limit is and is not: a single payload
+may call `SvcParallelRun` as many times as it likes. The first real user
+made 252 dispatches in one payload with no refusals and no timeouts.
+The limit is one **payload** per boot once the secondaries are up, not
+one call.
+
+Lifting this is open work as of 2026-09-16 and has only just started. It
+is not built, and nothing in the current build 142 changes it. When it
+lands, `docs/MULTICORE_STATUS.md` is where it will be recorded first.
+
+@SECTION One more thing, if your four-core run is long
+
+A long, silent payload can outlast the host tool's patience on the
+console peer. During one run the host tool reported that the payload
+never returned - and it had in fact completed, in 265.5 seconds. The
+result was recovered from the board's own trace and from memory.
+
+So: if a long run comes back as "never returned", do not assume the
+board is wedged and do not reset it reflexively. Check the board first.
+Chapter 6 covers what the host tool records and how to read it back.
