@@ -15,6 +15,7 @@
 Global gPi3StorageUp.i          ; 1 once a filesystem is mounted for us
 Global gPi3StorageWhy.i         ; the refusal code from the last attempt
 Global gPi3StoragePart.i        ; the partition FsMount() took
+Global gPi3StorageInitAttempted.i ; one lazy SDHOST bring-up attempt
 
 ; THE THREE VALUES Anvil/Storage/hwfile.pbi READS, and nothing else. It
 ; declares them; this file is what sets them. gHwFileWriter is HELD, not
@@ -173,19 +174,15 @@ Procedure.i Pi3StorageForConfirm()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  StorageUp() - bring the medium up and mount a filesystem on it.
+;  StorageUp() - lazily bring up the medium and mount a filesystem.
 ;
-;  THE MEDIUM IS ALREADY UP BY THE TIME THIS RUNS, and this procedure
-;  does not bring it up again. Pi3SdInit() was called during boot, before
-;  the MMU, because it needs the firmware mailbox for its clock
-;  (sdhost.pbi line 173 asks Pi3ClockRate(4)) and the mailbox stops
-;  answering once the MMU is on - the whole argument is in the ORDER
-;  section of RaspberryPi3/Lib/mmu.pi3. Pi3SdInit() also refuses a second
-;  attempt outright (p3sd_attempted), so calling it here would turn a
-;  working card into a refusal.
+;  The console is ready and the MMU's Device mappings are active before
+;  this is called. The monitor remembered the clock properties before the
+;  MMU; Pi3SdSetBootClock() supplies the current CORE rate so PIO init does
+;  not need a firmware mailbox transaction. This is one attempt only.
 ;
-;  So what this does is the FILESYSTEM half: install this board's reader
-;  and held writer on the shared layer, close the write window, and mount.
+;  After init, install this board's reader and held writer on the shared
+;  layer, close the write window, and mount.
 ;
 ;  IT IS IDEMPOTENT. A command calls HwStorageUp() before it reads files
 ;  and has no idea whether another command did so first.
@@ -195,19 +192,30 @@ Procedure.i StorageUp()
     ProcedureReturn 1
   EndIf
 
+  ; Direct firmware boot does not touch the card before the console prompt.
+  ; All firmware properties were collected before MmuUp(), so card init
+  ; receives the remembered clock and performs only PIO register access.
+  If p3sd_ready = 0 And gPi3StorageInitAttempted = 0
+    gPi3StorageInitAttempted = 1
+    If pi3_sd_clock_ceiling >= 1000000 And pi3_sd_core_actual >= 1000000
+      If Pi3SdSetBootClock(pi3_sd_core_actual) <> 0
+        If Pi3SdInit(pi3_sd_clock_ceiling, 0, pi3_ram_end) = 0
+          gPi3StorageWhy = Pi3SdError()
+        EndIf
+      EndIf
+    Else
+      gPi3StorageWhy = -1
+    EndIf
+  EndIf
+
   If p3sd_ready = 0
-    gPi3StorageWhy = -1
-    PrintN("!! the SD host did not come up during boot, so there is no medium to")
-    PrintN("   mount. Everything that reads or writes a file is unavailable this")
-    PrintN("   boot. The reason was printed while the board was starting.")
+    If gPi3StorageWhy = 0 : gPi3StorageWhy = Pi3SdError() : EndIf
+    If gPi3StorageWhy = 0 : gPi3StorageWhy = -1 : EndIf
+    PrintN("!! the SD host could not be initialized on demand, so no filesystem")
+    PrintN("   is available this boot. The Anvil console remains usable.")
     ProcedureReturn 0
   EndIf
 
-  ; THE CONFIRM PATH HAS USUALLY DONE ALL OF THIS ALREADY, and the early
-  ; return above is what makes this cheap. This body runs only when the
-  ; confirm did not happen or did not get this far - a slot started by
-  ; hand, or a card that would not mount in the window.
-  ;
   ; The reader is this board's. FsSetRange* installs into BOTH
   ; filesystems, so one call covers FAT32 and exFAT and they cannot end
   ; up with different block sources.

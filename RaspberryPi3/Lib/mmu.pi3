@@ -43,11 +43,9 @@
 ;  read while the board is still in no danger at all.
 ;
 ;  This board has a second safety net the Pi 4 did not have at the same
-;  stage: the immutable loader's fifteen-second never-fed watchdog is
-;  still armed while this runs. A monitor that wedges in here is reset
-;  by it and the loader falls back to the last confirmed slot. That is
-;  not an excuse to be careless; it is the reason the MMU is brought up
-;  AFTER the A/B confirm rather than before it - see THE ORDER below.
+;  stage: this is firmware-loaded kernel8.img; no slot selector or trial
+;  watchdog wraps it. A failed table setup is reported over UART and the
+;  processor parks for a manual reset.
 ;
 ;  ---- THE ORDER, AND IT IS THE LOAD-BEARING PART OF THIS FILE --------
 ;
@@ -63,16 +61,16 @@
 ;  mailbox call on this board returns 0.
 ;
 ;  That is not a small list. Pi3ClockRate() feeds the UART baud divisor
-;  AND Pi3SdInit()'s clock (RaspberryPi3/Lib/sdhost.pbi:173); the ARM
-;  memory extent and the DTB validation come from a property tag; the
+;  AND SDHOST's clock, which direct boot remembers before the MMU; the ARM
+;  memory extent and the DTB validation come from property tags; the
 ;  board revision code - which is how HwMemoryBytes() knows this is a
 ;  1 GB board - is a property tag; the framebuffer is allocated by
 ;  property tag; the status LED is a firmware GPIO expander line reached
 ;  by property tag.
 ;
-;  SO THE MONITOR'S BOOT IS: every mailbox transaction first, the A/B
-;  confirm and the watchdog release next, THEN this file, and then the
-;  prompt. Everything the monitor will ever need from the firmware is
+;  SO THE MONITOR'S BOOT IS: UART, vectors, every required mailbox
+;  transaction, THEN this file, then the prompt. Card initialization is
+;  on-demand after the MMU. Everything the monitor needs from firmware is
 ;  asked for once, while it can still be asked, and remembered.
 ;  RaspberryPi3/Board/hw_mem.pi3 is written around exactly that and says
 ;  so; it is the one place where this board's backend is structurally

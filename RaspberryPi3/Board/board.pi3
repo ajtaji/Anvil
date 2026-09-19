@@ -1,11 +1,8 @@
 ; ======================================================================
 ;  board.pi3 - THE RASPBERRY PI 3 MODEL B COMPILE TARGET.
 ;
-;      PureMetalForge.exe --compile RaspberryPi3/Board/board.pi3 -t pi3 \
-;           -o build/pi3/anvil.img
-;      python tools/pi3_slot_pack.py build/pi3/anvil.img \
-;           build/pi3/anvil-slot.img
-;      python tools/pi3_update.py build/pi3/anvil-slot.img --port COMnn
+;      python tools/build.py pi3 --compiler <PureMetalForge.exe>
+;  This emits build/pi3/kernel8.img and its Pi 3 firmware armstub8.bin.
 ;
 ;  This is the third Anvil composition, after RaspberryPi4/Board/board.pi4
 ;  and ArduinoQ/Board/board.unoq. It includes this board's hardware
@@ -19,33 +16,24 @@
 ;  backend under it.
 ;
 ; ----------------------------------------------------------------------
-;  0. WHERE THIS IMAGE RUNS, AND WHY IT IS NOT A kernel8.img
+;  0. WHERE THIS IMAGE RUNS: IT IS kernel8.img
 ; ----------------------------------------------------------------------
-;  THIS IS A/B SLOT CONTENT. The card carries an immutable first-stage
-;  loader as KERNEL8.IMG and two monitor slots; the loader verifies a
-;  slot, writes its trial state, copies it to $200000 and branches there.
-;  An update replaces a SLOT, never the loader, which is what makes a bad
-;  monitor recoverable without taking the card out.
+;  Firmware loads this complete monitor at $200000 as kernel8.img. The
+;  separate Pi 3 armstub starts at EL3, parks secondary cores, preserves
+;  the firmware DTB in x0 and enters this image at masked EL2h. This Main
+;  path does not mount storage or perform A/B slot admission before the
+;  console; Anvil's own payload loader remains available after startup.
 ;
-;  THE THREE PLACEMENT NUMBERS ARE NOT A CHOICE. tools/pi3_slot.py's
-;  LOAD_ADDRESS, BSS_ADDRESS and STACK_ADDRESS are what the packer and
-;  the loader both check, and a slot whose header disagrees is refused
-;  before it ever reaches the card. They are stated here so the IDE -
-;  which embeds the compiler and has no command line - builds the same
-;  bytes a script does.
+;  The load/BSS/stack addresses are shared with the firmware config and
+;  the direct Pi 3 build target. Firmware loads the image; no slot header
+;  is involved in normal monitor startup.
 ;
-;  THE ENTRY CONTRACT. Pi3UpdateEnter() in the loader branches to
-;  $200000 with x0 = $1000000. That is not the firmware's own device-tree
-;  register; it is the loader restating the pinned location. So Main()
-;  does NOT capture x0: it writes pi3_dtb = $1000000, because identity
-;  comes from the loader's CRC-protected handoff page and not from a
-;  register the cold startup may have consumed. The serial updater has
-;  done it that way on silicon since 2026-09-12 and the comment there
-;  says why.
+;  ENTRY CONTRACT: Main captures the firmware-provided DTB pointer in x0
+;  before ordinary code runs. The source validates that pointer against
+;  the RAM extent rather than replacing it with a slot handoff address.
 ;
-;  THE DEADMAN IS ALREADY ARMED WHEN THIS FILE STARTS. Fifteen seconds,
-;  never fed, and the loader does not stop it. Section 5 below is about
-;  nothing else.
+;  The monitor does not inherit a slot-trial watchdog. Failures park with
+;  the serial reason intact; reset or replace kernel8.img to recover.
 ; ----------------------------------------------------------------------
 LoadAddress  $200000
 BssAddress   $1100000
@@ -61,19 +49,16 @@ StackAddress $1F00000
 ;  other two Pi 3 board files, so three programs on one board keep three
 ;  numbers and none of them moves when another is built.
 ; ----------------------------------------------------------------------
-#ANVIL_BUILD = 10 ; pmf:build
-#ANVIL_BUILD_DATE = 20260918 ; pmf:builddate
-#ANVIL_BUILD_TIME = 193420 ; pmf:buildtime
+#ANVIL_BUILD = 11 ; pmf:build
+#ANVIL_BUILD_DATE = 20260919 ; pmf:builddate
+#ANVIL_BUILD_TIME = 113032 ; pmf:buildtime
 
 ; ======================================================================
 ;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
 ;
-;  ALL FOUR ARE THE BOOT LANE'S AND NONE IS EDITED HERE. They are
-;  compiled into the immutable loader and the serial updater as well, so
-;  a change to any of them changes KERNEL8.IMG. Where this monitor needs
-;  something they do not have, the change is written down and reported
-;  rather than forked - see the header of pl011_console.pi3 for the one
-;  outstanding request.
+;  These are the board's timer, UART, mailbox and SD host libraries.
+;  They are also shared by the separate recovery/updater programs. The
+;  direct monitor uses the SD host lazily after it has enabled the MMU.
 ;
 ;  Order: the timer first because the UART's bounded waits are measured
 ;  against it, then the UART, then the mailbox, then the card.
@@ -91,15 +76,17 @@ XIncludeFile "RaspberryPi3/Lib/mmu.pi3"
 XIncludeFile "RaspberryPi3/Board/hwtimer.pi3"
 
 ; ----------------------------------------------------------------------
-;  The board facts the A/B boot arrangement establishes, before anything
-;  that reads them. pi3_ram_base and pi3_ram_end come from the firmware
-;  during boot; pi3_dtb is pinned by the loader.
+;  The board facts captured from firmware before anything reads them.
+;  pi3_ram_base/end come from ARM-memory properties; pi3_dtb is captured
+;  from the direct firmware entry argument x0.
 ; ----------------------------------------------------------------------
 Global pi3_dtb.i
 Global pi3_dtb_end.i
 Global pi3_ram_base.i
 Global pi3_ram_end.i
 Global pi3_boot_status.i
+Global pi3_sd_core_actual.i
+Global pi3_sd_clock_ceiling.i
 Global Dim pi3_build_text.a[32]
 XIncludeFile "RaspberryPi3/Board/pi3_boot_primitives.pbi"
 
@@ -146,12 +133,9 @@ XIncludeFile "RaspberryPi3/Board/pi3_boot_primitives.pbi"
                     ; nothing in this tree drives either.
 #CAP_TOUCH    = 0   ; NO PANEL. Not unwritten work - there is no touch
                     ; controller on this bench's board and no plan.
-#CAP_MMC      = 0   ; NOT OFFERED, AND THE CARD WORKS. This group is the
-                    ; RAW BLOCK family. The driver will only write inside
-                    ; a window somebody declared, because the card
-                    ; carries the loader and both slots; offering the
-                    ; family and then refusing half of it would be worse
-                    ; than not offering it.
+#CAP_MMC      = 0   ; NOT OFFERED, AND THE CARD WORKS. The raw-block
+                    ; family has no monitor-owned policy covering the
+                    ; firmware files, kernel8.img and user files together.
 #CAP_USB      = 0   ; NO BACKEND IN THIS IMAGE - see #CAP_NET.
 #CAP_PWM      = 0   ; NO BACKEND, and a Model B has no fan header for the
                     ; family's main use.
@@ -200,6 +184,7 @@ XIncludeFile "Anvil/Core/mod_registry.pbi"
 XIncludeFile "Anvil/Hal/hal.pbi"
 
 XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Kernel/exceptions.pbi"
 XIncludeFile "Anvil/Core/format.pbi"
 XIncludeFile "Anvil/Core/crc.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
@@ -281,7 +266,7 @@ XIncludeFile "Anvil/Core/fan_cmd.pbi"
 XIncludeFile "Anvil/Core/help.pbi"
 
 ; ======================================================================
-;  5. THE BOOT, AND THE FIFTEEN SECONDS IT HAS
+;  5. DIRECT FIRMWARE BOOT
 ; ======================================================================
 ;  Two constraints shape every line of Main(), and neither is negotiable.
 ;
@@ -291,31 +276,23 @@ XIncludeFile "Anvil/Core/help.pbi"
 ;  either is set - because its property buffer has to be memory the
 ;  VideoCore and the ARM agree about, and that file makes no claim to
 ;  support a cached one. That guard is correct for what it guards and it
-;  is absolute. So every mailbox question this monitor will ever ask is
-;  asked HERE, before the MMU, and remembered: the console clock, the
-;  ARM's memory extent, the device tree's validity, the card's clock, and
-;  the board revision code that is how `info` knows this is a 1 GB board.
-;
-;  THE LOADER'S DEADMAN IS ARMED AND IS NOT FED. Fifteen seconds from the
-;  branch, and on this card a single-block read costs more than fourteen
-;  milliseconds - so seventy-four reads is a second. The confirm therefore
-;  does the least card work that can possibly confirm (mount partition 1,
-;  open the one control record the handoff names, rewrite it, read it
-;  back) and everything else - the second partition, the settings, the
-;  banner - happens after the watchdog is off. The reasoning is in
-;  RaspberryPi3/Board/storage.pi3 under THE CONFIRM PATH IS SIZED IN CARD
-;  READS.
+;  is absolute. All firmware properties are queried before MmuUp() and
+;  remembered: UART rate, ARM RAM extent, firmware DTB, board revision,
+;  SD CORE ceiling and current CORE rate. After MmuUp(), the property
+;  buffer is never submitted to firmware again. The SD host is PIO and
+;  initializes lazily from that remembered clock on a file command.
 ;
 ;  THE ORDER, THEREFORE:
 ;      UART first, so that everything after it can say what went wrong
 ;      the firmware questions, while they can still be asked
-;      the card, and the confirm, and the watchdog off
-;      the MMU and the caches
+;      the firmware properties and clock state
+;      validated normal mappings and caches
+;      optional SD initialization on the first file command
 ;      the banner and the prompt
 ; ======================================================================
 
-; The monitor's memory validator remains local: its RAM and DTB contract is
-; deliberately stricter than the loader's early-boot contract.
+; The monitor validates firmware RAM and its supplied DTB before using
+; either pointer for general boot work.
 Procedure.i Pi3MonitorBootMemory()
   Define buffer.i
   Define size.i
@@ -336,7 +313,7 @@ Procedure.i Pi3MonitorBootMemory()
     ProcedureReturn 0
   EndIf
   pi3_ram_end = pi3_ram_base + size
-  If pi3_dtb <> $1000000 : ProcedureReturn 0 : EndIf
+  If pi3_dtb < $1000 Or (pi3_dtb & 7) <> 0 Or pi3_dtb > pi3_ram_end - 40 : ProcedureReturn 0 : EndIf
   If Pi3ReadBe32(pi3_dtb) <> $D00DFEED : ProcedureReturn 0 : EndIf
   total = Pi3ReadBe32(pi3_dtb + 4)
   If total < 40 Or total > 1048576 Or total > pi3_ram_end - pi3_dtb
@@ -360,10 +337,21 @@ Procedure Pi3BootFail(*why)
   Print("   ")
   UartWriteStr(*why)
   PrintNl()
-  PrintN("   The loader's fifteen-second deadman is still armed, so the board is")
-  PrintN("   about to reset and fall back to its other slot.")
+  PrintN("   The direct kernel image has no slot watchdog or automatic fallback.")
+  PrintN("   Correct kernel8.img or firmware configuration, then reset the board.")
   UartDrain()
   Pi3Park()
+EndProcedure
+
+Procedure Pi3DirectFaultReport()
+  UartWriteStr("!! fatal processor exception; monitor parked. ESR=$")
+  PutHexN(ExceptionEsr(), 8)
+  UartWriteStr(" ELR=$")
+  PutHexN(ExceptionElr(), 16)
+  UartWriteStr(" FAR=$")
+  PutHexN(ExceptionFar(), 16)
+  PrintNl()
+  UartDrain()
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -426,8 +414,7 @@ EndProcedure
 ;  rather than being cut off by the reset it is announcing.
 ; ----------------------------------------------------------------------
 Procedure CmdPi3Reset()
-  PrintN("resetting. The loader will choose a slot again; if this image was")
-  PrintN("confirmed, it will choose this one.")
+  PrintN("resetting. Firmware will reload kernel8.img from the boot partition.")
   HwReboot()
 EndProcedure
 
@@ -438,10 +425,17 @@ Procedure Main()
   Define suf.i
   Define tmv.i
 
+  ; Firmware's armstub8 supplies the DTB in x0. Capture before any C-like
+  ; initialization so later boot code never relies on a caller-saved register.
+  ASM
+    adrp x1, global_pi3_dtb
+    add x1, x1, #:lo12:global_pi3_dtb
+    str x0, [x1]
+  EndASM
+
   ; ------------------------------------------------------------------
-  ;  IDENTITY FROM THE HANDOFF, NOT FROM A REGISTER. See section 0.
+  ;  IDENTITY FROM THE FIRMWARE ENTRY REGISTER, not a slot handoff.
   ; ------------------------------------------------------------------
-  pi3_dtb = $1000000
   pi3_boot_status = 1
 
   ; ------------------------------------------------------------------
@@ -454,6 +448,8 @@ Procedure Main()
   If clock <= 0 : Pi3Park() : EndIf
   If Pi3UartInit(clock, 115200) = 0 : Pi3Park() : EndIf
 
+  ExceptionSetReporter(@Pi3DirectFaultReport)
+  If ExceptionInstall() = 0 : Pi3Park() : EndIf
   PrintN("Anvil starting.")
 
   ; ------------------------------------------------------------------
@@ -461,37 +457,26 @@ Procedure Main()
   ; ------------------------------------------------------------------
   If Pi3MonitorBootMemory() = 0
     pi3_boot_status = -4
-    Pi3BootFail("The firmware would not state a memory layout this monitor recognises, or the device tree is not where the loader pinned it. Check that the loader started this slot rather than something else having branched here.")
+    Pi3BootFail("The firmware RAM extent or its x0 device-tree pointer failed validation. Check the firmware boot files and board memory configuration.")
   EndIf
   ; Asked once, here, and remembered - see the header of hw_mem.pi3. A 0
   ; is not fatal: a monitor that would not come up because it could not
   ; learn its memory size is worse than one that says it does not know.
   HwMemAsk()
 
+  ; Query and remember every firmware value needed by the card before the
+  ; MMU. The mailbox buffer is marked NC before translation is enabled.
+  If Pi3BootSetStockClocks() = 0
+    PrintN("Warning: firmware did not accept the preferred ARM/CORE rates; using its reported current rates.")
+  EndIf
   clock = Pi3BootMaxCoreClock()
   If clock < 1000000
-    pi3_boot_status = -6
-    Pi3BootFail("The firmware refused to state the card controller's maximum clock, so the SD host cannot be brought up safely.")
+    clock = 0
   EndIf
-  If Pi3SdInit(clock, 0, pi3_ram_end) = 0
-    pi3_boot_status = -7
-    Pi3BootFail("The SD host did not come up. The loader read this slot off the same card, so the medium is there - which points at the controller's state rather than at the card.")
-  EndIf
-
-  ; ------------------------------------------------------------------
-  ;  THE CONFIRM, AND THE DEADMAN OFF. The least card work that can
-  ;  possibly confirm; everything else waits. See section 5.
-  ; ------------------------------------------------------------------
-  If Pi3StorageConfirmSlot() = 0
-    pi3_boot_status = -8
-    UartDrain()
-    Pi3Park()
-  EndIf
-  If Pi3MonWatchdogStop() = 0
-    pi3_boot_status = -9
-    Pi3BootFail("The running slot confirmed itself and the deadman would not switch off. That is a fault in this monitor or in the power-management block, and the board will reset shortly whatever else happens.")
-  EndIf
-  PrintN("Slot confirmed; the loader's deadman is off.")
+  ; CORE clock is queried directly before MMU, then passed to SDHOST so it
+  ; never needs a mailbox call from translated code.
+  pi3_sd_core_actual = Pi3ClockRate(4)
+  If pi3_sd_core_actual < 1000000 : clock = 0 : EndIf
 
   ; ------------------------------------------------------------------
   ;  THE MMU AND THE CACHES. After this line the mailbox is closed for
@@ -512,10 +497,18 @@ Procedure Main()
   ;  mailbox call after boot a working day instead of a mystery.
   ; ------------------------------------------------------------------
   MmuAddNc(@pi3_property[0], @pi3_property[0] + 47)
+  If MmuNcCount() = 0
+    pi3_boot_status = -10
+    Pi3BootFail("The firmware mailbox buffer could not be marked non-cacheable.")
+  EndIf
   If MmuUp() <> 0
     pi3_boot_status = -10
-    Pi3BootFail("The page tables would not build where this monitor puts them, so translation was not enabled and nothing was changed. The deadman is already off, so the board will stay here rather than reset.")
+    Pi3BootFail("The page tables would not build at their reserved address; translation was not enabled.")
   EndIf
+
+  ; The SD host is PIO. Bring it up only on the first file command, after
+  ; Device-nGnRnE mappings exist; no card scan or mount delays the prompt.
+  pi3_sd_clock_ceiling = clock
 
   ; ------------------------------------------------------------------
   ;  FROM HERE IT IS THE SAME MONITOR EVERY OTHER BOARD RUNS.

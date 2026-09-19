@@ -1,6 +1,7 @@
 ; BCM2837 SDHOST (SD0), not Arasan SDHCI/EMMC2. Native polled 1-bit SDHC.
 ; Include timer.pbi and mailbox.pbi first. Caller supplies firmware maximum
-; core-clock rate, and firmware-validated ARM RAM extent. SDHOST uses CORE,
+; core-clock rate (or prequeried current CORE rate via Pi3SdSetBootClock)
+; and firmware-validated ARM RAM extent. SDHOST uses CORE,
 ; not the Pi4 EMMC clock. SLOW_CARD keeps the full divider in data mode.
 ; Original implementation from register/protocol facts; no Linux code copied.
 ; Specification/reference scope and silicon limits: docs/PI3_SELF_UPDATE.md.
@@ -17,6 +18,8 @@ Global p3sd_blocks.i
 Global p3sd_ram_base.i
 Global p3sd_ram_bytes.i
 Global p3sd_clock_ceiling.i
+Global p3sd_actual_core_override.i
+Global p3sd_mmu_mapped.i
 Global p3sd_write_first.i
 Global p3sd_write_count.i
 Global *p3sd_progress_handler
@@ -26,6 +29,19 @@ Global Dim p3sd_response.i[4]
 ; block and must not start another SD transaction or act as an ISR.
 Procedure.i Pi3SdSetProgressHook(handler.i)
   p3sd_progress_handler = handler
+  ProcedureReturn 1
+EndProcedure
+; Direct kernel boot performs all mailbox reads before enabling the MMU. A
+; validated, remembered CORE rate lets the later PIO init avoid a forbidden
+; mailbox transaction. Setting this also authorizes the normal MMU+C state;
+; this driver is PIO and touches only the board's identity-mapped SD Device
+; window, so it has no DMA coherency requirement.
+Procedure.i Pi3SdSetBootClock(actualCoreHz.i)
+  If p3sd_attempted <> 0 Or actualCoreHz < 1000000 Or actualCoreHz > 800000000
+    ProcedureReturn 0
+  EndIf
+  p3sd_actual_core_override = actualCoreHz
+  p3sd_mmu_mapped = 1
   ProcedureReturn 1
 EndProcedure
 Procedure.i Pi3SdProgress(completed.i)
@@ -86,7 +102,14 @@ p3sdContext2:
 p3sdCheckContext:
     movz x9, #5
     and x0, x0, x9
-    cbnz x0, p3sdBadContext
+    cbz x0, p3sdCheckInterruptMask
+    adrp x1, global_p3sd_mmu_mapped
+    add x1, x1, #:lo12:global_p3sd_mmu_mapped
+    ldr x1, [x1]
+    cbz x1, p3sdBadContext
+    cmp x0, #5
+    b.ne p3sdBadContext
+p3sdCheckInterruptMask:
     mrs x0, daif
     movz x9, #$3C0
     and x0, x0, x9
@@ -183,7 +206,8 @@ Procedure.i Pi3SdInit(clockCeilingHz.i, ramBase.i, ramBytes.i)
   Protected size.i
   If p3sd_attempted <> 0 Or p3sdContext() = 0 : ProcedureReturn p3sdFail(-1) : EndIf
   If ramBase <> 0 Or ramBytes < $2000000 Or ramBytes > $3F000000 Or clockCeilingHz < 1000000 Or clockCeilingHz > 800000000 : ProcedureReturn p3sdFail(-1) : EndIf
-  actual = Pi3ClockRate(4)
+  actual = p3sd_actual_core_override
+  If actual = 0 : actual = Pi3ClockRate(4) : EndIf
   If actual < 1 Or actual > clockCeilingHz Or actual / ((clockCeilingHz + 399999) / 400000) < 100000 : ProcedureReturn p3sdFail(-6) : EndIf
   p3sd_ram_base = ramBase
   p3sd_ram_bytes = ramBytes

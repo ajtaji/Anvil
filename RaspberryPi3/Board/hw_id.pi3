@@ -90,25 +90,19 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure HwIdSayImage()
   PrintN("  The A64 backend is the same one the other 64-bit boards use - the A53")
-  PrintN("  and the A72 are both ARMv8.0-A. What differs is the image contract:")
-  PrintN("  this is A/B slot content, not a kernel8.img. An immutable loader on")
-  PrintN("  the card verifies a slot, writes its trial state, copies it to")
-  PrintN("  $200000 and branches there with a fifteen-second deadman already")
-  PrintN("  armed, which this monitor releases by confirming the slot. The card's")
-  PrintN("  kernel8.img is that loader and is never replaced by an update.")
+  PrintN("  and the A72 are both ARMv8.0-A. This monitor is the firmware-loaded")
+  PrintN("  kernel8.img at $200000. A Pi 3 EL3 armstub parks the other cores and")
+  PrintN("  enters Anvil directly at masked EL2h with the firmware device tree")
+  PrintN("  in x0. There is no slot selector in front of the monitor. Anvil's own")
+  PrintN("  payload loader remains available from the prompt.")
 EndProcedure
 
 ; ----------------------------------------------------------------------
 ;  HwIdImageBase() / HwIdImageLen() - forum 586, the content stamp.
 ;
-;  Measured from the linker's own symbols by
-;  RaspberryPi3/Board/memmap.pi3, so the digest the core computes covers
-;  the bytes that are actually running. On this board that IS the file on
-;  the card, byte for byte: the loader copies the slot payload without
-;  relocating or padding it, so unlike a firmware-loaded image the digest
-;  here CAN be compared against a host-side hash of the payload inside
-;  the slot container. Saying which of the two a digest is remains worth
-;  the sentence - see HwIdSayImageWhere().
+;  Measured from the linker's own symbols by RaspberryPi3/Board/memmap.pi3.
+;  The digest covers the running kernel8 monitor image, not the separate
+;  firmware armstub or the FAT file's unused trailing sectors.
 ; ----------------------------------------------------------------------
 Procedure.i HwIdImageBase()
   ProcedureReturn MonImageLo()
@@ -122,9 +116,6 @@ EndProcedure
 ;  HwIdSayImageWhere() - and what the digest is comparable to.
 ; ----------------------------------------------------------------------
 Procedure HwIdSayImageWhere()
-  PrintN("  That extent is the linker's own image symbols, so the digest covers")
-  PrintN("  exactly the bytes the loader copied out of the slot - the payload")
-  PrintN("  inside the slot container, after its 256-byte header. It will match a")
-  PrintN("  host-side digest of that payload and it will NOT match a digest of the")
-  PrintN("  whole slot file, which carries the header as well.")
+  PrintN("  The digest uses the linker's running-image extent. Compare it with the")
+  PrintN("  emitted kernel8.img bytes; armstub8.bin is a separate firmware file.")
 EndProcedure
