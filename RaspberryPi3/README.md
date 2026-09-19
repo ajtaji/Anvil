@@ -1,30 +1,36 @@
 # Raspberry Pi 3 Model B v1.2
 
-Status: **cold-entry foundation plus an immutable serial A/B updater are
-implemented and desk-tested; final SDHOST/update recovery acceptance on the
-physical Pi remains**.
+The normal Pi 3 boot path loads a Pi 3-specific `armstub8.bin` and then the
+complete Anvil monitor as `kernel8.img`. There is no A/B slot selector in this
+path. The stub moves firmware's EL3 entry into masked non-secure EL2h and hands
+the firmware device-tree address to the monitor in `x0`.
 
-`Board/platform.pbi` supplies identity and disabled capability declarations.
-It is an include, not a runnable board file. `Board/board.pi3` is the cold-entry
-program, using the explicit `-t pi3` compiler target. Do not use `-t pi4`: CPU instruction compatibility
-does not make the Pi 4 startup or memory layout correct for this board.
+`Board/board.pi3` is the BCM2837 composition root. Build it with the explicit
+`pi3` target; do not use `pi4`, because Pi 3 startup, timer, memory map, and
+peripherals differ. `Board/armstub8.asm` is assembled separately as the
+firmware stub. The direct boot contract and checks are in
+[Pi 3 boot](../docs/PI3_BOOT.md); the removable-card update flow is in
+[Pi 3 direct update](../docs/PI3_SELF_UPDATE.md).
 
-Hardware basis: BCM2837, four Cortex-A53 cores, VideoCore IV. This is the
-original Model B, not B+. The USB host and USB-connected Ethernet path must
-be brought up before wired networking can work; the Pi 4 GENET backend is
-not applicable.
+The monitor keeps Anvil's ordinary file-backed `boot <name>` payload path.
+That command loads an Anvil payload after the monitor is running; it is separate
+from firmware loading `kernel8.img` at cold boot.
 
-Next steps and acceptance: [porting checklist](../docs/NEW_BOARD_PORTS.md).
-Implement future drivers under this board directory, using neutral `.pbi`
-includes. Never label them
-`.pi4` or duplicate the shared Anvil core.
+Build both direct-boot artifacts:
 
-References:
+```text
+python tools/build.py pi3 --compiler <PureMetalForge.exe>
+```
 
-Boot contract and measured desk coverage: [Pi3 boot](../docs/PI3_BOOT.md).
-Pinned firmware and explicit staging instructions: [boot files](Boot/README.txt).
-The card-stays-in-board build, one-time provision, update and recovery contract:
-[Pi3 self update](../docs/PI3_SELF_UPDATE.md).
+This writes `build/pi3/armstub8.bin` and `build/pi3/kernel8.img`. Validate and
+stage the exact images against the pinned Raspberry Pi firmware files before
+installing them on an already prepared FAT boot volume. Neither build nor
+staging chooses or formats a disk.
+
+The board is a Raspberry Pi 3 Model B v1.2: BCM2837, four Cortex-A53 cores,
+VideoCore IV. Normal entry starts one ARM core; the Pi 3-specific stub parks
+the others. USB host and USB-connected Ethernet require the Pi 3 USB path; the
+Pi 4 GENET backend does not apply.
 
 - [Official board specification](https://www.raspberrypi.com/products/raspberry-pi-3-model-b/)
 - [Processor documentation](https://www.raspberrypi.com/documentation/computers/processors.html)

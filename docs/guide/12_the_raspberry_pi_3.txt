@@ -1,166 +1,76 @@
 @CHAPTER Anvil on a Raspberry Pi 3
 
-@INTRO The same monitor, on a different computer. What is the same, what
-is not, and the one thing about this board that shapes everything else:
-an immutable loader that gives every new image fifteen seconds to prove
-it started.
+@INTRO The same Anvil core on a BCM2837 board. The firmware starts a small
+Pi 3 stub, then enters the complete monitor directly as `kernel8.img`.
 
 @SECTION What this board runs
 
-The Raspberry Pi 3 Model B runs the same Anvil core the Raspberry Pi 4
-runs. Not a port of it and not a version of it - the same files. What
-differs is the layer underneath: a handful of small backends that know
-about the BCM2837 and nothing else.
+The Raspberry Pi 3 Model B runs the shared Anvil core with backends for the
+BCM2837. Its composition root is `RaspberryPi3/Board/board.pi3`; its own
+firmware stub is `RaspberryPi3/Board/armstub8.asm`. Shared commands and
+filesystems come from `Anvil/`.
 
 @FRAG
-RaspberryPi3/Board/board.pi3   the composition: placement, capabilities,
-                               the boot order and the prompt
-RaspberryPi3/Board/hw_*.pi3    the backends: the memory map, the address
-                               guard, identity, the block medium, the
-                               clock, and honest refusals for the rest
-RaspberryPi3/Lib/mmu.pi3       this part's page tables
-RaspberryPi3/Lib/*.pbi         the boot chain's drivers, shared with the
-                               loader and the serial updater
+RaspberryPi3/Board/board.pi3       composition, placement and prompt
+RaspberryPi3/Board/armstub8.asm    firmware EL3-to-EL2 entry stub
+RaspberryPi3/Lib/mmu.pi3           BCM2837 page tables
+RaspberryPi3/Lib/*.pbi             Pi 3 timer, UART, mailbox and SDHOST
 @ENDFRAG
 
-Everything above those is shared: the command loop, the filesystems, the
-file seam, the hashes, the settings store, the boot-container reader and
-the A/B control record all come from `Anvil/`.
+@SECTION Direct firmware entry
 
-@SECTION It is not a kernel8.img
+The normal cold boot does not run an Anvil slot selector. Firmware loads the
+custom `armstub8.bin` at address zero, then the complete Anvil monitor as
+`kernel8.img` at `$200000`. The stub configures the BCM2837 counter and SMP
+coherency, enables FP/SIMD access for EL2, masks exceptions, parks secondary
+cores, and enters non-secure AArch64 EL2h. It passes the firmware DTB address
+in x0; the compiler startup reaches Main with that value intact.
 
-This is the first difference to understand, because it changes how an
-image gets onto the board.
+@FRAG
+monitor image and entry     $200000
+firmware DTB                $1000000
+monitor BSS                 $1100000
+monitor stack top           $1F00000
+@ENDFRAG
 
-The card carries an IMMUTABLE FIRST-STAGE LOADER as `KERNEL8.IMG`, and
-two monitor slots beside it. The loader verifies a slot, writes its trial
-state, copies it to `$200000` and branches there. An update replaces a
-SLOT, never the loader - which is what makes a bad monitor recoverable
-without taking the card out of the machine.
+These values are checked against the emitted PMF metadata and firmware config.
+The Pi 3 stub uses the BCM2837 local-control block at `$40000000` and its
+19.2 MHz counter source. It does not configure the Pi 4 GIC.
+
+@SECTION Startup and storage
+
+Main captures x0 before its first ordinary runtime call. It validates the
+firmware DTB and RAM extent, performs required firmware mailbox queries before
+enabling the MMU, then initializes the console and prompt. It does not mount a
+filesystem or verify slot metadata before showing the prompt. SDHOST starts
+lazily on the first card operation, using the CORE clock remembered before
+MMU/cache enable; its cached execution path refuses an absent clock handoff or
+a mixed MMU/cache state.
+
+The monitor keeps Anvil's `boot <name>` command for file-backed payloads after
+startup. That payload loader is separate from firmware's cold loading of
+`kernel8.img`.
+
+@SECTION Building and checking
 
 @CODE
-PureMetalForge.exe --compile RaspberryPi3/Board/board.pi3 -t pi3 \
-     -o build/pi3/anvil.img
-python tools/pi3_slot_pack.py build/pi3/anvil.img build/pi3/anvil-slot.img
-python tools/pi3_update.py build/pi3/anvil-slot.img --port COMnn
+python tools/build.py pi3 --compiler <PureMetalForge.exe>
+python tools/pi3_direct_boot_check.py
 @ENDCODE
 
-The packer refuses an image whose placement disagrees with the loader's,
-before it ever reaches the card: load and entry at `$200000`, variables
-at `$1100000`, stack top at `$1F00000`, and the whole thing compiled for
-this part. Those three numbers are stated in the board file so that a
-build from the editor and a build from a script are the same bytes.
+The board target builds the stub and complete monitor. The direct-boot gate
+checks the stub firmware slots, EL3-to-EL2 register setup, primary DTB handoff,
+secondary-core parking and release, PMF placement, and the actual emitted
+stub-to-compiler-startup-to-Main path. It is a host check; a board cold boot is
+still required to establish firmware and silicon behavior.
 
-@TRAP The loader passes the device tree's address in x0, and the monitor
-does not read it. Identity comes from a checksummed handoff record the
-loader leaves in memory, not from a register the cold startup may have
-used for something else. Copying the other board's "capture x0 at entry"
-here would work until the day it did not.
+@SECTION Replacing the boot files
 
-@SECTION Fifteen seconds
-
-The loader arms a watchdog before it branches, and DOES NOT FEED IT. A
-new image has fifteen seconds to confirm the slot it came from; if it
-does not, the board resets and the loader chooses the last confirmed
-image instead.
-
-That is the whole safety net, and it is why a monitor on this board
-cannot be storage-less: confirming means writing a control record on the
-card, which means mounting a filesystem. So the boot goes:
-
-@FRAG
-   1  the console, and the one firmware question it needs
-   2  the rest of the firmware questions, while they can still be asked
-   3  the card, the confirm, and the watchdog off
-   4  the page tables and the caches
-   5  the banner and the prompt
-@ENDFRAG
-
-Step 3 does the LEAST CARD WORK THAT CAN POSSIBLY CONFIRM - mount the
-boot partition, open the one control record the handoff names, rewrite
-it, read it back - and nothing else. The data partition, the settings and
-the banner all wait until the watchdog is off. On a card where a single
-block read is slow, being tidy inside that window is how a board that
-works becomes a board that resets every fifteen seconds with no
-explanation.
-
-@TRAP Steps 1 and 2 are before step 4 for a reason that is not obvious.
-This part's firmware mailbox REFUSES every transaction once the MMU or
-the data cache is on - its property buffer has to be memory the graphics
-processor and the main processor agree about. So the console's clock, the
-memory extent, the device tree's validity, the card's clock and the board
-revision code are all asked once, during boot, and remembered. After step
-4 the firmware cannot be asked anything at all.
-
-@SECTION Why the page tables are not optional here
-
-On the other board the MMU is a speed decision. Here it is what makes the
-shared core runnable.
-
-With translation off, this processor treats every data access as device
-memory, and an unaligned access to device memory is a fault - not a slow
-path, and not one any control bit turns off. The shared filesystems read
-packed directory entries at whatever byte offset the format puts them,
-and the hash walks message blocks the same way. Any one of those landing
-odd is a data abort.
-
-So the monitor builds its tables and turns the caches on before it prints
-its banner. The map is short: the memory the firmware gave the processor,
-the peripherals at `$3F000000`, the processor-local window at
-`$40000000`, and nothing else. Four entries, against the other board's
-sixty-four.
-
-@NOTE There is no second run of memory on this part. On a 4 GB Pi 4 the
-64 MB the peripheral window displaces reappears above four gigabytes;
-here it is simply gone. `info` says so.
-
-@SECTION What info tells you, and why it prints three numbers
-
-Three different things are all true about memory on this board at once,
-and a monitor that printed one of them as all three would be wrong twice.
-
-@FRAG
-FITTED          1 GB, from the board revision code. The number on the box
-REACHABLE       at most 1008 MB: the peripheral window covers the top
-                16 MB of the gigabyte and that memory does not come back
-GIVEN           less again, by whatever the graphics processor's share is
-@ENDFRAG
-
-The RAM row reports the first and says where it came from; the line under
-it reports the third. The address guard refuses above it - and says which
-kind of refusal it is, because "there is nothing here for this processor"
-and "an access here would stop the board" are different facts an operator
-needs to tell apart.
-
-@SECTION What this board does not do yet
-
-@FRAG
-storage         YES - the card, through the shared filesystems
-network         no backend in this image
-screen          a framebuffer exists and has been shown on this board;
-                the console surface above it is not written
-GPIO, I2C, PWM  no backend
-USB             drivers exist and are not in this image
-@ENDFRAG
-
-Every one of those refuses in a sentence rather than failing quietly, and
-the board file says which kind of absence each one is: hardware that is
-not there, or a backend nobody has written.
-
-@SECTION Proving it without a board
-
-@CODE
-PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=tools/a64/a64_interp.py \
-    python tools/pi3_memory_guard_check.py
-@ENDCODE
-
-It compiles the memory decode, the map and the address guard out of the
-production files, runs the emitted code, and checks that THE GUARD AND
-THE PAGE TABLES AGREE - including the two places they deliberately do
-not. Seven deliberate mistakes are introduced and every one has to be
-caught.
-
-@NOTE That gate found dead code in this board's own guard on its first
-run: a refusal for a gap between the peripherals and the processor-local
-window, on a part where those two are adjacent. The refusal could never
-have fired and its sentence could never have been read. It is gone.
+Use `tools/pi3_boot_stage.py` to validate the exact monitor and stub hashes
+against the pinned firmware set and create a new bundle. Review its
+`SHA256.json` manifest, then use `tools/pi3_provision.py` on an already-mounted
+boot volume with the reviewed manifest hash and a new host backup directory.
+The provisioner backs up files it changes before writing, checks readback
+hashes, and does not partition or format media. The normal update replaces
+direct firmware files; it is not an A/B slot transaction. See `docs/PI3_BOOT.md`
+and `docs/PI3_SELF_UPDATE.md` for the full contract and commands.

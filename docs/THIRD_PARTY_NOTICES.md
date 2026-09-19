@@ -139,12 +139,13 @@ https://www.bearssl.org/git/BearSSL at commit
 
 ## Raspberry Pi firmware stub
 
-`RaspberryPi4/Board/armstub8.asm` was written for the same job as
+`RaspberryPi3/Board/armstub8.asm` and `RaspberryPi4/Board/armstub8.asm` are
+separate board-specific adaptations written for the same general job as
 [Raspberry Pi's armstub8.S](https://github.com/raspberrypi/tools/blob/439b6198a9b340de5998dd14a26a0d9d38a6bcac/armstubs/armstub8.S)
 at commit `439b6198a9b340de5998dd14a26a0d9d38a6bcac`, which was read for how the
 secondary cores are parked and released and how the GIC is set up on this SoC.
-The file carries the complete three-clause copyright, conditions and disclaimer
-in its own header, and
+Both files carry the complete three-clause copyright, conditions and disclaimer
+in their own headers, and
 [`licenses/RaspberryPi-armstub8-BSD-3-Clause.txt`](../licenses/RaspberryPi-armstub8-BSD-3-Clause.txt)
 retains the same text. Both stay as they are.
 

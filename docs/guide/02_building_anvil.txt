@@ -88,14 +88,14 @@ see. This is the whole of it:
 @FRAG
 $ python tools/build.py --help
 usage: build.py [-h] [--compiler COMPILER]
-                [{all,pi3,pi4,unoq,pi3-loader,pi3-updater,pi3-monitor,armstub,rockpi4c}]
+                [{all,pi3,pi4,unoq,pi3-stub,pi3-monitor,pi3-loader,pi3-updater,armstub,rockpi4c}]
 
 Build Anvil targets with the PureMetal application in command-line mode. The
 editor and the compiler are one program: `PureMetalForge.exe --compile` builds
 without opening a window. Point at it with --compiler or PMF_COMPILER.
 
 positional arguments:
-  {all,pi3,pi4,unoq,pi3-loader,pi3-updater,pi3-monitor,armstub,rockpi4c}
+  {all,pi3,pi4,unoq,pi3-stub,pi3-monitor,pi3-loader,pi3-updater,armstub,rockpi4c}
 
 options:
   -h, --help            show this help message and exit
@@ -111,32 +111,29 @@ What each target builds, and where it lands:
 @FRAG
 pi4              RaspberryPi4/Board/board.pi4    -> build/pi4/anvil.img
 unoq             ArduinoQ/Board/board.unoq       -> build/unoq/anvil.img
-pi3-loader       RaspberryPi3/Board/loader.pi3   -> build/pi3/kernel8.img
-pi3-updater      RaspberryPi3/Board/updater.pi3  -> build/pi3/anvil.img
-                                                 +  build/pi3/anvil-slot.img
-pi3-monitor      RaspberryPi3/Board/board.pi3    -> build/pi3/anvil-monitor.img
-                                                 +  build/pi3/anvil-monitor-slot.img
+pi3-stub         RaspberryPi3/Board/armstub8.asm -> build/pi3/armstub8.bin
+pi3-monitor      RaspberryPi3/Board/board.pi3    -> build/pi3/kernel8.img
+pi3-loader       recovery-only legacy A/B loader -> build/pi3/recovery/kernel8.img
+pi3-updater      recovery-only legacy A/B updater -> build/pi3/recovery/anvil.img
+                                                 +  build/pi3/recovery/anvil-slot.img
 armstub          RaspberryPi4/Board/armstub8.asm -> build/pi4/armstub8.bin
 rockpi4c         RockPi4C/Board/board.rockpi4c   -> build/rockpi4c/anvil-flat.img
                                                  +  build/rockpi4c/Image
-pi3              an alias for pi3-loader, pi3-updater and pi3-monitor
+pi3              an alias for pi3-stub and pi3-monitor
 all              pi4 and unoq, and nothing else
 @ENDFRAG
 
-@NOTE `pi3-monitor` was called `pi3-diagnostic` until 2026-09-18, and the
-build passed it the cold entry's load and stack addresses on the command
-line, because `board.pi3` was a program that printed and parked. It is the
-Pi 3's monitor now, it states its own placement in the source - the A/B
-slot contract's - and no address flags are passed. Declaring a placement
-in two places is how a build from the editor and a build from a script
-stop being the same bytes.
+@NOTE `pi3` builds the direct firmware set: a Pi 3-specific `armstub8.bin`
+and the complete `kernel8.img` monitor. The separately named legacy loader
+and updater targets are recovery artifacts; neither participates in normal
+firmware cold boot. The monitor's load, BSS and stack placement is declared
+in `board.pi3` and checked against the emitted PMF metadata.
 
 @NOTE `all` means the two shipping monitors, not everything in the list.
-The EL3 firmware stub in particular is never built by `all`, never
-installed by a build, and has its own chapter-3 warning attached to it.
-Building experimental boot firmware as a side effect of typing `all`
-would be exactly the kind of quiet surprise this project refuses to
-ship.
+Pi 3 and Pi 4 firmware stubs are never built by `all` and are built only by
+their explicit board targets. Building boot firmware as a side effect of
+typing `all` would be exactly the kind of quiet surprise this project refuses
+to ship.
 
 If you only care about the Raspberry Pi 4 - which is what most of this
 book is about - one target is all you need:

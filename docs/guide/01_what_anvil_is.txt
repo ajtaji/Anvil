@@ -142,8 +142,8 @@ Arduino UNO Q / QCM2290 / Cortex-A53
     outstanding.
 
 Raspberry Pi 3 / BCM2837 / Cortex-A53
-    early. Cold-entry foundation and an immutable A/B updater,
-    desk-tested. USB host and USB Ethernet not brought up.
+    early. Direct firmware cold entry through a Pi 3 EL3 stub into the
+    complete kernel8.img monitor. USB host and USB Ethernet not brought up.
 
 ROCK Pi 4C / RK3399
     early. MiniDP proven on hardware at 1024x768; the preferred 1080p
@@ -168,29 +168,26 @@ reads `config.txt`, sets up clocks and power domains, and loads
 **Without the firmware stub**, the firmware drops the image to **EL2**
 and Anvil runs there. That is the default arrangement.
 
-**With the firmware stub installed**, a 512-byte piece of AArch64 called
-`armstub8.bin` runs first at EL3. It does the machine setup the stock
-stub does - the timer, the interrupt controller, parking the other three
-cores in the spin table - and then **deliberately omits the exception
-return to EL2**, branching into `kernel8.img` with the processor still
-at EL3. Anvil then runs at EL3.
+**With the Pi 4 firmware stub installed**, its AArch64 `armstub8.bin`
+runs first at EL3, sets up the Pi 4 machine state and enters that monitor
+at EL3. The Pi 3 uses a separate stub: it starts at EL3, configures the
+BCM2837 timer and SMP state, parks the other cores, then returns to masked
+non-secure EL2h before branching to its complete `kernel8.img`. It passes
+the firmware DTB in x0. Anvil therefore runs at EL3 on the Pi 4 stub path
+and at EL2 on the Pi 3 direct-boot path.
 
 **A payload is entered at the same level Anvil is running at.** Anvil
 does not change the level to enter you and you must not change it
 either.
 
-@TRAP **Never hard-code the exception level in a payload.** This is not
-advice; it is a bug that has already happened. A large payload's
-precondition asserted "we must be at EL2", and the day the monitor
-started booting through the stub at EL3, that payload refused to run -
-correctly, having computed nothing, which is why one run found it. The
-refusal was right and the check was wrong. Ask the service table.
+@TRAP **Never hard-code the exception level in a payload.** The correct
+level depends on which monitor and entry path is active. A payload that
+assumes EL2 or EL3 can refuse a valid system; ask the service table instead.
 
-@NOTE The EL3 stub is optional, is never built by a plain build, is
-never installed by a build, and the EL3-to-EL1 handoff is **still
-incomplete**. Do not change boot configuration without physical access
-to the board. Chapter 3 has the full procedure and the reason each step
-is separate.
+@NOTE The Pi 4 stub remains a separate boot artifact; the Pi 3 `pi3`
+target builds its own stub together with the direct monitor. Boot
+configuration and replacement procedures are board-specific; see
+chapters 3 and 12 before changing either one.
 
 @SECTION What a payload is
 

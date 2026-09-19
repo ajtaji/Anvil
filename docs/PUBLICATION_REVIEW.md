@@ -7,25 +7,26 @@ or public-history rewrite is authorized by it.
 
 ## The confirmation
 
-**It was confirmed on 2026-09-10 that no third-party code was used; the
-references were read for how the hardware behaves.** U-Boot, the Linux kernel,
-Mesa, OpenBSD, BearSSL, the device trees and every other source named in this
-tree were read to learn how the hardware is driven — register sequences,
-ordering, quirks, wire formats — and the result was implemented independently.
+**It was confirmed on 2026-09-10 that the then-reviewed driver tree used no
+third-party implementation code.** References including U-Boot, Linux, Mesa,
+OpenBSD and BearSSL were read for hardware and protocol behavior and
+implemented independently. The Pi 3 and Pi 4 armstub files added later are
+explicit BSD-3-Clause licensed adaptations; both retain the full source notice,
+and the license text is retained in `licenses/`.
 
 That answers the question this review was opened on, and it answers it as a
 statement of fact about how the code was written, not as a licensing argument.
 Its consequences are simple:
 
-- **There is no licence election to make.** The retain-or-replace choice this
-  document used to pose, per driver, does not arise: there is nothing to retain
-  and nothing to replace.
+- **The 2026 driver review required no licence election.** The two later
+  armstub adaptations are separately classified and carry their BSD-3-Clause
+  terms and notices.
 - **There is no corresponding-source obligation**, and no GPL text is owed by
   this repository.
-- **Nothing in the tree is classified `derived` or `verbatim`.** Every such pair
-  is now `consulted`, and `tools/provenance_inventory_check.py` refuses either
-  class outright — a copied or derived block is not permitted in this tree; it is
-  restated or removed.
+- **The armstub adaptations are not represented as independent implementations.**
+  The provenance inventory records those two files as `licensed-adaptation`;
+  the gate reserves that class for them and refuses `derived` or `verbatim`
+  classifications for other sources.
 - **Every citation stays.** They are the provenance of the hardware and protocol
   facts and are how a reader checks a register offset, a timing or a quirk. None
   was removed by this lane, and no source header was reworded.
@@ -37,8 +38,9 @@ PCIe wrapper cannot reach past the first 3 GiB, and the inbound window is sized
 to match — is now stated in the file's own words, with the device-tree lines kept
 as a pointer to where it can be checked.
 
-The retained texts under `licenses/` stay, as acknowledgments of references
-consulted rather than as notices for incorporated code.
+The retained texts under `licenses/` stay as acknowledgments of consulted
+references, except the Raspberry Pi armstub BSD text, which applies to the two
+adaptation files and accompanies their complete source notices.
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) is written that way and says
 so. The one entry that is genuinely redistribution — the Cypress CYW43455
 firmware binaries — is called out there as such and keeps its own terms.

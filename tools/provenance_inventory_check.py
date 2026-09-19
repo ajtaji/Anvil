@@ -8,17 +8,14 @@ the source tree.
 
 It answers three questions, and it is deliberately not clever about any of them.
 
-  1. IS EVERY PAIR CONSULTED, AND DOES IT CITE WHAT IT CONSULTED?
-     It was confirmed on 2026-09-10 that no third-party code was used; the
-     references were read for how the hardware behaves. So the only class this
-     tree may carry against an upstream implementation is `consulted`, and
-     `derived` and `verbatim` are refusals: a copied or derived block is not
-     permitted here, it is restated in our own words or removed. A `consulted`
-     pair needs no notice — nothing was taken, so nothing is owed — but it must
-     CITE the source it consulted, because the citation is the provenance of the
-     fact and is how a reader checks it. Where an upstream names a retained
-     license text or an acknowledgment section, those must still exist: a
-     dangling acknowledgment is as misleading as a missing one.
+  1. IS EVERY PAIR CLASSIFIED TRUTHFULLY AND SUPPORTED?
+     Most implementation references are `consulted`: behavior was read and
+     implemented independently. The Raspberry Pi armstub adaptations are the
+     explicit exception: their source declares them as translations and their
+     BSD-3-Clause notices are retained. `derived` and `verbatim` remain
+     refusals for all other sources. Every pair must cite its source; a
+     licensed adaptation must additionally retain its named license and
+     acknowledgment.
 
   2. DOES ANY SOURCE FILE CITE AN UPSTREAM THE INVENTORY DOES NOT LIST?
      Every tracked source file is re-scanned with the citation patterns stored
@@ -66,6 +63,11 @@ NOTICES = ROOT / "docs" / "THIRD_PARTY_NOTICES.md"
 SOURCE_SUFFIXES = (".pi4", ".pbi", ".unoq", ".asm", ".def")
 
 CONSULTED = "consulted"
+LICENSED_ADAPTATION = "licensed-adaptation"
+LICENSED_ADAPTATIONS = {
+    ("RaspberryPi3/Board/armstub8.asm", "rpi-armstub8"),
+    ("RaspberryPi4/Board/armstub8.asm", "rpi-armstub8"),
+}
 REFUSED_CLASSES = ("derived", "verbatim")
 REFUSAL = (
     "a copied or derived block is not permitted in this tree; restate it or "
@@ -157,7 +159,7 @@ def check_classes(third_party: dict, report: Report) -> None:
         return
     anchors = heading_anchors(notices_text)
 
-    consulted_pairs = []
+    cited_pairs: list[tuple[str, str, str]] = []
     for path, entry in third_party["classified_files"].items():
         for src, cls in entry.items():
             if cls in REFUSED_CLASSES:
@@ -166,28 +168,30 @@ def check_classes(third_party: dict, report: Report) -> None:
                     f"confirmed on 2026-09-10 that no third-party code was used; the "
                     f"references were read for how the hardware behaves, so the only "
                     f"class this tree carries against an implementation is "
-                    f"'{CONSULTED}'."
+                    f"'{CONSULTED}', except for explicitly licensed adaptations."
                 )
             elif cls not in classifications:
                 report.fail(
                     f"{path}: classified '{cls}' against '{src}', which is not one of "
                     f"the classes PROVENANCE.json defines: {sorted(classifications)}"
                 )
-            elif cls == CONSULTED:
-                consulted_pairs.append((path, src))
+            elif cls in (CONSULTED, LICENSED_ADAPTATION):
+                if cls == LICENSED_ADAPTATION and (path, src) not in LICENSED_ADAPTATIONS:
+                    report.fail(f"{path}: licensed-adaptation is reserved for the two Raspberry Pi armstubs")
+                cited_pairs.append((path, src, cls))
 
-    if not consulted_pairs:
+    if not cited_pairs:
         report.fail("no consulted pairs are recorded; that cannot be right")
         return
 
-    for path, src in consulted_pairs:
+    for path, src, cls in cited_pairs:
         meta = sources.get(src)
         if meta is None:
             report.fail(f"{path}: consulted an unknown source id '{src}'")
             continue
 
-        # A consulted pair needs no notice. It does need its citation: that is
-        # the provenance of the fact and the only way a reader can check it.
+        # Both relationships need citations. An adaptation also needs the
+        # retained license text and an anchored acknowledgment in the notices.
         pattern = meta.get("citation_pattern")
         if not pattern:
             report.fail(
@@ -211,13 +215,19 @@ def check_classes(third_party: dict, report: Report) -> None:
             continue
 
         text = meta.get("license_text")
+        ref = meta.get("acknowledgment")
         if text and not (ROOT / text).exists():
             report.fail(
                 f"{path}: source '{src}' names retained text '{text}', which is not "
                 f"on disk"
             )
             continue
-        ref = meta.get("acknowledgment")
+        if cls == LICENSED_ADAPTATION and not text:
+            report.fail(f"{path}: licensed adaptation has no retained license text")
+            continue
+        if cls == LICENSED_ADAPTATION and not ref:
+            report.fail(f"{path}: licensed adaptation has no acknowledgment reference")
+            continue
         if ref:
             anchor = anchor_of(ref)
             if anchor and anchor not in anchors:
@@ -228,12 +238,13 @@ def check_classes(third_party: dict, report: Report) -> None:
                 continue
         report.ok()
 
-    by_source = sorted({src for _, src in consulted_pairs})
+    consulted_pairs = [(path, src) for path, src, cls in cited_pairs if cls == CONSULTED]
+    adapted_pairs = [(path, src) for path, src, cls in cited_pairs if cls == LICENSED_ADAPTATION]
+    by_source = sorted({src for _, src, _ in cited_pairs})
     report.note(
         f"{len(consulted_pairs)} consulted pair(s) across {len(by_source)} source(s): "
-        f"{', '.join(by_source)}. No licence election is made or owed for any of "
-        f"them, and no corresponding source is owed. The retained texts under "
-        f"licenses/ acknowledge references consulted, not incorporated code."
+        f"{', '.join(by_source)}; {len(adapted_pairs)} licensed adaptation(s) retain "
+        f"their license text and notice."
     )
 
 
@@ -422,7 +433,7 @@ def main() -> int:
         print(
             "Publication review: held. This check proves the inventory and the "
             "acknowledgments agree with the source tree, and that nothing in it is "
-            "recorded as copied or derived. It does not grant publication authority: "
+            "recorded as unlicensed derivation. It does not grant publication authority: "
             "publishing is a separate, explicit instruction."
         )
     return 0

@@ -11,12 +11,12 @@ def main():
         if r.returncode or not image.exists():raise AssertionError(r.stdout+r.stderr)
         sym=base.parse_symbols(image);blob=image.read_bytes();a64=base.load_interp(base.INTERP);checks=0
         class SD(a64.A64):
-            def __init__(self,mode='normal',el=2,affinity=0,code=None,symbols=None):
+            def __init__(self,mode='normal',el=2,affinity=0,sctlr=0,code=None,symbols=None):
                 super().__init__();self.mode=mode;self.device_regs={};self.ticks=0;self.command=-1;self.words=0;self.writes=[];self.data=[]
                 self.forced=0;self.status_cmds=0;self.completion_polls=0
                 self.symbols=symbols if symbols is not None else sym
                 self.memory={base.LOAD+i:b for i,b in enumerate(code if code is not None else blob)};self.sp=base.STACK
-                self.enable_system_registers(el=el,preset={0xD51800A0:affinity,0xD51C1000:0,0xD51E1000:0,0xD51B4220:0x3c0})
+                self.enable_system_registers(el=el,preset={0xD51800A0:affinity,0xD51C1000:sctlr,0xD51E1000:0,0xD51B4220:0x3c0})
             def load(self,addr,size):
                 if addr==0x3f003008:return 0
                 if addr==0x3f003004:self.ticks+=1000;return self.ticks
@@ -89,6 +89,29 @@ def main():
         assert c.call('Pi3SdBlockCount')==(0x123456+1)*1024;checks+=1
         for mode in ('command-timeout','busy-timeout','sdsc','program-timeout','bad-csd'):
             c=SD(mode);assert c.call('Pi3SdInit',400000000,0,0x8000000)==0,mode;checks+=1
+        # Direct monitor is EL2 with MMU+caches enabled before first SD use.
+        # It must have installed the actual firmware CORE rate beforehand;
+        # the cached path must never call the mailbox-backed clock service.
+        query=sym['global_sd_gate_clock_queries']
+        c=SD(sctlr=5)
+        assert c.call('Pi3SdInit',400000000,0,0x8000000)==0,'cached SD init without remembered clock was accepted'
+        assert c.load(query,8)==0,'cached refusal called the mailbox clock service';checks+=2
+        c=SD(sctlr=5)
+        assert c.call('Pi3SdSetBootClock',250000000)==1
+        assert c.call('Pi3SdInit',400000000,0,0x8000000)==1,'cached SD init refused explicit clock handoff'
+        assert c.load(query,8)==0,'cached SD init called the mailbox clock service';checks+=3
+        c=SD(sctlr=5)
+        assert c.call('Pi3SdSetBootClock',999)==0,'invalid remembered clock was accepted'
+        assert c.call('Pi3SdInit',400000000,0,0x8000000)==0,'invalid handoff authorized cached SD init'
+        assert c.load(query,8)==0;checks+=3
+        for mixed in (1,4):
+            c=SD(sctlr=mixed)
+            assert c.call('Pi3SdSetBootClock',250000000)==1
+            assert c.call('Pi3SdInit',400000000,0,0x8000000)==0,'mixed MMU/cache state was accepted'
+            assert c.load(query,8)==0,'mixed-state refusal called clock service';checks+=3
+        c=SD(sctlr=0)
+        assert c.call('Pi3SdInit',400000000,0,0x8000000)==1,'legacy cache-off path refused'
+        assert c.load(query,8)==1,'cache-off path did not use the clock service';checks+=2
         c=SD();assert c.call('Pi3SdInit',400000000,0,0x8000000)==1
         c.mode='crc';assert c.call('Pi3SdReadBlock',42,b)==0
         count=len(c.writes);assert c.call('Pi3SdWriteBlock',42,b)==0 and len(c.writes)==count;checks+=2

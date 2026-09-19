@@ -26,7 +26,7 @@ path in.** Chapter 11 is the map back out to them, by topic.
 | 9 | [Driver modules](guide/09_driver_modules.txt) | PMFMOD v1: the container, what exists, and the loader that does not. |
 | 10 | [Proving things](guide/10_proving_things.txt) | The gate set, the emitted-code interpreter, how to add a check, and why a listing is not proof. |
 | 11 | [Where the engineering notes are](guide/11_the_engineering_notes.txt) | `docs/`, mapped by topic — and the rule that keeps this book current. |
-| 12 | [Anvil on a Raspberry Pi 3](guide/12_the_raspberry_pi_3.txt) | The same monitor on a different computer: A/B slot content rather than a `kernel8.img`, the immutable loader's fifteen-second trial and the boot order it forces, why the page tables are not optional on this part, and the three true numbers `info` prints about its memory. |
+| 12 | [Anvil on a Raspberry Pi 3](guide/12_the_raspberry_pi_3.txt) | Direct firmware loading through a Pi 3 EL3 stub into the complete `kernel8.img`, the DTB handoff and memory placement, lazy SD startup, and direct bundle replacement. |
 | 13 | [TrueType font container](guide/13_truetype_t0.txt) | T0 opens a checked sfnt font or the first face of a collection, and refuses unsafe table directories with table and offset diagnostics. |
 | 14 | [TrueType font metrics](guide/14_truetype_metrics.txt) | T1 reads bounded `head`, `maxp`, `hhea`, `hmtx` and optional `OS/2` metrics from an opened font. |
 | 15 | [TrueType character mapping](guide/15_truetype_unicode.txt) | T2 maps checked cmap format 4 and 12 data and strictly decodes UTF-8 into caller-owned glyph IDs. |

@@ -5,10 +5,13 @@ below.** This document records engineering evidence: where each fact in this
 tree came from and how a reader checks it. It is not a legal determination, it
 does not relicense anything, and it removes no attribution and no citation.
 
-**It was confirmed on 2026-09-10 that no third-party code was used; the
-references were read for how the hardware behaves.** Every pair this document
-once classified `derived` or `verbatim` is therefore `consulted`. See
-[The 2026-09-10 confirmation, and what it means](#the-2026-09-10-confirmation-and-what-it-means).
+**The 2026-09-10 confirmation applies to the driver tree reviewed on that
+date.** The Pi 3 and Pi 4 firmware stubs added later are explicitly identified
+as licensed adaptations of Raspberry Pi's armstub8 source; their BSD-3-Clause
+notices and license text are retained. The inventory uses
+`licensed-adaptation` for those two files and `consulted` for independent
+implementations based on reading. See [The 2026-09-10 confirmation, and what
+it means](#the-2026-09-10-confirmation-and-what-it-means).
 
 Companion records:
 
@@ -61,8 +64,8 @@ specification or a copyright notice, using the citation patterns recorded in
 was then read in context and classified by hand. The scan is repeated on every
 run of the check script, so a citation added later cannot go unlisted.
 
-**143 of 218 files carry at least one citation; 75 carry none.** The 311
-resulting file/source pairs classify as:
+**In the 2026-09-10 snapshot, 143 of 218 files carried at least one citation
+and 75 carried none.** The 311 resulting file/source pairs were classified as:
 
 | Class | Pairs | What it means |
 | --- | ---: | --- |
@@ -108,7 +111,7 @@ agree: the root `LICENSE`, `README.md` under "License", `docs/LICENSING.md`
 record, where MIT was selected for original Anvil source.
 There is no ambiguity to resolve on that point.
 
-## Consulted references, file by file
+## Consulted references and licensed adaptations, file by file
 
 Line numbers are from the current working tree at local `main` `9e0e55e` and
 will drift; the procedure names will not.
@@ -118,8 +121,9 @@ will drift; the procedure names will not.
 > or "THE PRIMARY SOURCE". That is bring-up vocabulary: it is how someone
 > describes working with a reference open beside them, and it was written to
 > stop a later reader from "tidying away" a sequence the hardware actually
-> needs. It was confirmed on 2026-09-10 that no third-party code was used; the
-> references were read for how the hardware behaves. The headers are left
+> needs. The 2026-09-10 confirmation applies to the then-reviewed driver
+> tree; the two armstub files are later licensed adaptations with notices
+> retained. The headers are left
 > exactly as their authors wrote them — rewording a source comment is not this
 > lane's to do — and they are quoted below because they are the record of which
 > reference answered which question.
@@ -402,15 +406,22 @@ Every row is a reference that was read. None of them contributed code, so the
 | IETF RFCs | per document | specification | yes | none needed | the citations, kept |
 | Vendor and standards documents | per document | specification | yes | none needed | the citations, kept |
 
-The retained texts are acknowledgments of references consulted. They attach no
-terms to any Anvil file and they are not an election; the one genuine exception
-is the Cypress row, whose binaries really are redistributed under their own
-agreement.
+These figures are a historical snapshot. The current table also records the
+two Raspberry Pi stub adaptations as `licensed-adaptation`; those files retain
+their BSD-3-Clause notices and are covered by
+`licenses/RaspberryPi-armstub8-BSD-3-Clause.txt`. Other retained texts
+acknowledge consulted references. Cypress firmware binaries are separately
+redistributed under their own agreement.
 
 ## The 2026-09-10 confirmation, and what it means
 
-**It was confirmed on 2026-09-10 that no third-party code was used; the
-references were read for how the hardware behaves.**
+**It was confirmed on 2026-09-10 that the then-reviewed driver tree used no
+third-party implementation code; references were read for hardware behavior.**
+
+The Pi 3 and Pi 4 armstub adaptations were added later. They are explicitly
+classified `licensed-adaptation`, retain the full BSD-3-Clause notice in each
+source file and are acknowledged below. That exception does not alter the
+historical driver review.
 
 That is a statement of fact about how this tree was written, and it replaces the
 per-driver retain-versus-rewrite decision this document used to carry. What
@@ -423,9 +434,9 @@ follows from it:
 - **There is no corresponding-source obligation** and no GPL text is owed by
   this repository. No such text was ever added here, which was the right call
   for a different reason than the one recorded at the time.
-- **No pair is `derived` or `verbatim`.** All 41 are `consulted`. The gate now
-  refuses either class outright: a copied or derived block is not permitted in
-  this tree; restate it or remove it.
+- **The then-reviewed pairs contain no unlicensed derivation.** The two later
+  armstub adaptations are separately classified and retain their BSD notice;
+  the gate refuses `derived` and `verbatim` classifications for other pairs.
 - **Every citation is retained.** They are the provenance of the *facts* — a
   register offset, a reset order, a warm-up delay, an erratum — and they are how
   a reader who doubts one goes and checks it. Removing them would make this tree
@@ -593,7 +604,7 @@ and by running the checks:
 
 ## Complete file inventory
 
-One row per file/source pair, 311 rows, generated from `PROVENANCE.json`
+One row per file/source pair, 312 rows, generated from `PROVENANCE.json`
 `third_party.classified_files` and checked against the sources by
 `tools/provenance_inventory_check.py`. The 75 files that carry no citation at
 all are `original` and are not listed; `--list-original` enumerates them.
@@ -701,8 +712,9 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `ArduinoQ/Lib/geni_i2c.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `ArduinoQ/Lib/tlmm.unoq` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `ArduinoQ/Lib/tlmm.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi3/Board/armstub8.asm` | licensed-adaptation | rpi-armstub8 | BSD-3-Clause | retain full notice, license text and acknowledgment |
 | `RaspberryPi4/Board/armstub8.asm` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
-| `RaspberryPi4/Board/armstub8.asm` | consulted | rpi-armstub8 | BSD-3-Clause | cite the source; no notice obligation; `licenses/RaspberryPi-armstub8-BSD-3-Clause.txt` retained as an acknowledgment |
+| `RaspberryPi4/Board/armstub8.asm` | licensed-adaptation | rpi-armstub8 | BSD-3-Clause | retain full notice, license text and acknowledgment |
 | `RaspberryPi4/Board/board.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Board/board.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
 | `RaspberryPi4/Board/board.pi4` | reference-only | dejavu-fonts | DejaVu/Bitstream Vera | cite the document; no notice obligation |
