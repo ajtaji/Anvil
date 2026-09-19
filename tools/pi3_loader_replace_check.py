@@ -28,11 +28,11 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pi3_loader_replace as replace  # noqa: E402
-from pi3_provision import REQUIRED_FIRMWARE, SLOT_BYTES, ProvisionError  # noqa: E402
+from pi3_ab_provision import REQUIRED_FIRMWARE, SLOT_BYTES, ProvisionError  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-LOADER = ROOT / "build" / "pi3" / "kernel8.img"
-LOADER_PMF = ROOT / "build" / "pi3" / "kernel8.img.pmf"
+LOADER = ROOT / "build" / "pi3" / "recovery" / "kernel8.img"
+LOADER_PMF = ROOT / "build" / "pi3" / "recovery" / "kernel8.img.pmf"
 PINNED_CONFIG = ROOT / "RaspberryPi3" / "Boot" / "config.txt"
 
 checks = 0
@@ -130,7 +130,7 @@ def expect_refusal(root: Path, backup: Path, fragment: str, **kwargs) -> None:
 def main() -> int:
     if not LOADER.is_file() or not LOADER_PMF.is_file():
         raise SystemExit(
-            "build/pi3/kernel8.img and its .pmf sidecar must exist; "
+            "build/pi3/recovery/kernel8.img and its .pmf sidecar must exist; "
             "run tools/build.py pi3-loader first"
         )
     loader = LOADER.read_bytes()

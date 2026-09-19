@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""One-time provisioning of an existing Raspberry Pi 3 FAT boot volume.
+"""Install a reviewed direct-boot Pi 3 bundle on an already-mounted FAT root.
 
-This tool does not select, partition, format, or erase a disk.  The caller must
-name the already-mounted boot-volume root explicitly.  The expected Pi 3
-firmware files must already be there, which prevents an arbitrary directory or
-the Windows system drive from being mistaken for the card.
-
-It installs the immutable kernel8.img loader, two equal preallocated monitor
-slots, and two redundant control records.  Slot A begins at generation 1; slot
-B and its record begin invalid.  Every written byte is read back and hashed.
-The loader performs the final FAT-contiguity and image-hash checks on the board.
+No disk is selected, partitioned, formatted, or cleaned. Every replaced file
+is copied to a new, explicitly named backup directory before any card writes.
 """
 
 from __future__ import annotations
@@ -18,47 +11,20 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
-import struct
-import sys
+from pathlib import Path, PurePosixPath
+import shutil
 import tempfile
-import zlib
 
-from pi3_slot import (
-    BSS_ADDRESS,
-    BSS_LIMIT,
-    IMAGE_LIMIT,
-    LOAD_ADDRESS,
-    PMF_HEADER_BYTES,
-    PMF_MAGIC,
-    PMF_VERSION,
-    SLOT_HEADER_BYTES,
-    SLOT_ISA,
-    SLOT_MAGIC,
-    SLOT_TARGET,
-    SLOT_VERSION,
-    STACK_ADDRESS,
-    SlotError,
-    validate_loader_pmf,
-    validate_slot,
-)
-from pi3_boot_stage import BOOT as PINNED_BOOT, validate as validate_pinned_boot
+from pi3_boot_stage import validate_config
 
 
-SLOT_BYTES = 0xE00000
-# Loader begins at 0x80000 and its BSS begins at 0x180000.
-LOADER_MAX = 0x100000
-CONTROL_MAGIC = 0x42413350
-CONTROL_VERSION = 2
-CONTROL_CONFIRMED = 3
-REQUIRED_FIRMWARE = (
-    "bootcode.bin",
-    "start.elf",
-    "fixup.dat",
-    "bcm2710-rpi-3-b.dtb",
-    "overlays/disable-bt.dtbo",
-    "config.txt",
-)
+FORMAT = "Anvil Pi 3 direct boot bundle 1"
+REQUIRED = {
+    "bootcode.bin", "start.elf", "fixup.dat", "bcm2710-rpi-3-b.dtb",
+    "overlays/disable-bt.dtbo", "LICENCE.broadcom", "config.txt", "README.txt",
+    "firmware.json", "armstub8.bin", "kernel8.img",
+    "RaspberryPi-armstub8-BSD-3-Clause.txt",
+}
 
 
 class ProvisionError(RuntimeError):
@@ -67,209 +33,200 @@ class ProvisionError(RuntimeError):
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
-def control_record(slot: int, generation: int, image: bytes) -> bytes:
-    record = bytearray(512)
-    struct.pack_into(
-        "<IIQQII",
-        record,
-        0,
-        CONTROL_MAGIC,
-        CONTROL_VERSION,
-        generation,
-        len(image),
-        slot,
-        LOAD_ADDRESS,
-    )
-    record[32:64] = hashlib.sha256(image).digest()
-    struct.pack_into("<I", record, 64, CONTROL_CONFIRMED)
-    struct.pack_into("<I", record, 508, zlib.crc32(record[:508]) & 0xFFFFFFFF)
-    return bytes(record)
+def safe_relative(name: str) -> Path:
+    pure = PurePosixPath(name)
+    if (not name or pure.is_absolute() or "\\" in name or
+            any(part in ("", ".", "..") for part in pure.parts)):
+        raise ProvisionError(f"unsafe bundle path: {name!r}")
+    return Path(*pure.parts)
 
 
-def write_atomic(target: Path, chunks) -> None:
-    # Keep the temporary on the same FAT volume so replacement does not cross
-    # devices.  No broad cleanup occurs: only the exact temporary made here is
-    # removed on failure.
-    fd, temp_name = tempfile.mkstemp(prefix="P3NEW-", dir=target.parent)
-    temp = Path(temp_name)
+def reject_link_components(root: Path, relative: Path, *, allow_missing: bool) -> Path:
+    """Resolve an intended child while rejecting symlinks/junctions in its path."""
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.exists() or cursor.is_symlink():
+            if cursor.is_symlink():
+                raise ProvisionError(f"refusing a symlink/junction path: {cursor}")
+            if not cursor.resolve().is_relative_to(root.resolve()):
+                raise ProvisionError(f"path escapes its named root: {cursor}")
+        elif not allow_missing:
+            raise ProvisionError(f"required path is missing: {cursor}")
+    return cursor
+
+
+def load_bundle(bundle: Path, expected_manifest_sha256: str) -> tuple[dict, list[tuple[str, Path, str]]]:
+    if not bundle.is_dir() or bundle.is_symlink():
+        raise ProvisionError("--bundle must name an ordinary staging directory")
+    manifest = bundle / "SHA256.json"
+    if not manifest.is_file() or manifest.is_symlink():
+        raise ProvisionError("bundle SHA256.json is missing or is not a regular file")
+    if sha256(manifest) != expected_manifest_sha256.lower():
+        raise ProvisionError("bundle manifest differs from the reviewed SHA-256")
     try:
-        with os.fdopen(fd, "wb") as stream:
-            for chunk in chunks:
-                stream.write(chunk)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, target)
-    finally:
-        if temp.exists():
-            temp.unlink()
+        record = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProvisionError(f"cannot read bundle manifest: {exc}") from exc
+    if record.get("format") != FORMAT:
+        raise ProvisionError("unsupported direct-boot bundle format")
+    files = record.get("files")
+    if not isinstance(files, dict) or set(files) != REQUIRED:
+        raise ProvisionError("bundle manifest has an unexpected file set")
+    normalized: set[str] = set()
+    operations: list[tuple[str, Path, str]] = []
+    for name, item in files.items():
+        relative = safe_relative(name)
+        key = name.casefold()
+        if key in normalized:
+            raise ProvisionError(f"duplicate case-insensitive FAT destination: {name}")
+        normalized.add(key)
+        source = reject_link_components(bundle, relative, allow_missing=False)
+        if not source.is_file():
+            raise ProvisionError(f"bundle entry is not a regular file: {name}")
+        expected_hash = item.get("sha256") if isinstance(item, dict) else None
+        expected_bytes = item.get("bytes") if isinstance(item, dict) else None
+        if (not isinstance(expected_hash, str) or len(expected_hash) != 64 or
+                not isinstance(expected_bytes, int) or expected_bytes < 0):
+            raise ProvisionError(f"bad size/hash record for {name}")
+        if source.stat().st_size != expected_bytes or sha256(source) != expected_hash.lower():
+            raise ProvisionError(f"bundle file does not match manifest: {name}")
+        operations.append((name, source, expected_hash.lower()))
 
-
-def padded_image(image: bytes):
-    yield image
-    remaining = SLOT_BYTES - len(image)
-    zero = bytes(1024 * 1024)
-    while remaining:
-        take = min(remaining, len(zero))
-        yield zero[:take]
-        remaining -= take
-
-
-def all_zero_slot():
-    remaining = SLOT_BYTES
-    zero = bytes(1024 * 1024)
-    while remaining:
-        take = min(remaining, len(zero))
-        yield zero[:take]
-        remaining -= take
-
-
-def check_card_root(root: Path) -> None:
-    if not root.is_dir():
-        raise ProvisionError(f"card root is not a directory: {root}")
-    missing = [name for name in REQUIRED_FIRMWARE if not (root / name).is_file()]
-    if missing:
-        raise ProvisionError(
-            "the selected directory is not the prepared Pi 3 boot volume; "
-            "required files are missing: " + ", ".join(missing)
-        )
-    resolved = root.resolve()
-    system_drive = Path(os.environ.get("SystemDrive", "C:") + "\\").resolve()
-    if resolved == system_drive:
-        raise ProvisionError("refusing to provision the Windows system drive")
-
-
-def check_boot_contract(root: Path, loader: Path, loader_sha256: str) -> None:
     try:
-        validate_pinned_boot(root, loader, loader_sha256)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise ProvisionError(f"Pi 3 pinned boot contract refused: {exc}") from exc
-    pinned_config = (PINNED_BOOT / "config.txt").read_bytes()
-    if (root / "config.txt").read_bytes() != pinned_config:
-        raise ProvisionError(
-            "card config.txt is not the pinned AArch64 loader/DTB/PL011 contract"
-        )
+        validate_config(bundle / "config.txt")
+    except (OSError, ValueError) as exc:
+        raise ProvisionError(f"direct-boot config refused: {exc}") from exc
+    # Pin the image contract independently of the JSON labels.
+    pmf = record.get("monitorPmf", {})
+    expected_contract = {
+        "loadAddress": 0x200000, "entryAddress": 0x200000,
+        "bssAddress": 0x1100000, "stackAddress": 0x1F00000,
+        "target": 2837,
+    }
+    if any(pmf.get(key) != value for key, value in expected_contract.items()):
+        raise ProvisionError("bundle monitor PMF metadata violates the direct Pi 3 contract")
+    if pmf.get("imageBytes") != files["kernel8.img"].get("bytes"):
+        raise ProvisionError("bundle PMF image length differs from kernel8.img")
+    return record, operations
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--card-root", required=True, type=Path)
-    parser.add_argument("--loader", required=True, type=Path)
-    parser.add_argument(
-        "--loader-pmf",
-        type=Path,
-        help="compiler PMFBOOT v2 sidecar (default: <loader>.pmf)",
-    )
-    parser.add_argument(
-        "--monitor",
-        required=True,
-        type=Path,
-        help="build-produced updater P3SLOT image",
-    )
-    parser.add_argument(
-        "--yes-replace-kernel8",
-        action="store_true",
-        help="required acknowledgement that kernel8.img will be replaced",
-    )
-    return parser.parse_args()
+def install(card_root: Path, bundle: Path, backup_dir: Path,
+            manifest_sha256: str, *, yes_replace_kernel8: bool) -> dict:
+    if not card_root.is_dir() or card_root.is_symlink():
+        raise ProvisionError("--card-root must name an existing ordinary directory")
+    card = card_root.resolve()
+    if card == Path(card.anchor).resolve():
+        raise ProvisionError("refusing a filesystem root as the card root")
+    bundle_root = bundle.resolve()
+    if (card == bundle_root or card.is_relative_to(bundle_root) or
+            bundle_root.is_relative_to(card)):
+        raise ProvisionError("bundle source and card root must be disjoint")
+    if not yes_replace_kernel8:
+        raise ProvisionError("direct install requires --yes-replace-kernel8")
+    if backup_dir.exists() or backup_dir.is_symlink():
+        raise ProvisionError("backup directory must be new and must not already exist")
+    backup = backup_dir.resolve()
+    if backup == card or backup.is_relative_to(card) or card.is_relative_to(backup):
+        raise ProvisionError("backup directory and card root must be disjoint")
+    if (backup == bundle_root or backup.is_relative_to(bundle_root) or
+            bundle_root.is_relative_to(backup)):
+        raise ProvisionError("backup directory and bundle source must be disjoint")
+
+    record, operations = load_bundle(bundle, manifest_sha256)
+    # Validate the currently mounted root before making any backup or write.
+    validate_config(bundle / "config.txt")
+    required_existing = ("bootcode.bin", "start.elf", "fixup.dat", "bcm2710-rpi-3-b.dtb",
+                         "overlays/disable-bt.dtbo", "LICENCE.broadcom", "config.txt")
+    for name in required_existing:
+        dest = reject_link_components(card, safe_relative(name), allow_missing=False)
+        if not dest.is_file():
+            raise ProvisionError(f"card root is missing required firmware file: {name}")
+    if (card / "autoboot.txt").exists():
+        raise ProvisionError("autoboot.txt is present; review and remove that alternate boot selector first")
+
+    destinations: list[tuple[str, Path, Path, str]] = []
+    for name, source, digest in operations:
+        relative = safe_relative(name)
+        dest = reject_link_components(card, relative, allow_missing=True)
+        if dest.exists() and not dest.is_file():
+            raise ProvisionError(f"destination is not a regular file: {dest}")
+        destinations.append((name, source, dest, digest))
+
+    # Back up all current files that will be changed before touching the card.
+    # Prepare the exact backup set before starting mutations.
+    changed = [(name, dest) for name, _, dest, digest in destinations
+               if dest.is_file() and sha256(dest) != digest]
+    backup.mkdir(parents=True, exist_ok=False)
+    try:
+        for name, dest in changed:
+            saved = backup / safe_relative(name)
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest, saved)
+            if sha256(saved) != sha256(dest):
+                raise ProvisionError(f"backup verification failed: {name}")
+
+        for name, source, dest, digest in destinations:
+            if dest.is_file() and sha256(dest) == digest:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary_name = tempfile.mkstemp(prefix="ANVIL-", dir=dest.parent)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(fd, "wb") as out, source.open("rb") as inp:
+                    shutil.copyfileobj(inp, out, 1024 * 1024)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(temporary, dest)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+            if sha256(dest) != digest:
+                raise ProvisionError(f"card readback verification failed: {name}")
+    except BaseException:
+        # Preserve the backup and any completed writes for explicit recovery;
+        # never attempt a broad automatic rollback on a FAT boot volume.
+        raise
+
+    summary = {
+        "cardRoot": str(card),
+        "backupDir": str(backup),
+        "manifestSha256": manifest_sha256.lower(),
+        "installed": {name: digest for name, _, _, digest in destinations},
+        "changedBackups": [name for name, _ in changed],
+        "monitorPmf": record["monitorPmf"],
+    }
+    return summary
 
 
 def main() -> int:
-    args = parse_args()
-    if not args.yes_replace_kernel8:
-        raise ProvisionError(
-            "kernel8.img replacement was not acknowledged; add "
-            "--yes-replace-kernel8 after checking --card-root"
-        )
-    check_card_root(args.card_root)
-    loader_pmf_path = args.loader_pmf or Path(str(args.loader) + ".pmf")
-    if not args.loader.is_file() or not loader_pmf_path.is_file() or not args.monitor.is_file():
-        raise ProvisionError("loader, loader PMF sidecar, and monitor must all be existing files")
-    loader = args.loader.read_bytes()
-    loader_pmf = loader_pmf_path.read_bytes()
-    monitor = args.monitor.read_bytes()
-    if not loader or len(loader) > LOADER_MAX:
-        raise ProvisionError(
-            f"loader must contain 1..{LOADER_MAX} bytes; got {len(loader)}"
-        )
-    try:
-        loader_metadata = validate_loader_pmf(loader_pmf, loader)
-        monitor_metadata = validate_slot(monitor)
-    except SlotError as exc:
-        raise ProvisionError(f"monitor slot refused: {exc}") from exc
-    if len(monitor) > SLOT_BYTES:
-        raise ProvisionError(
-            f"wrapped monitor must fit {SLOT_BYTES} bytes; got {len(monitor)}"
-        )
-
-    loader_sha256 = hashlib.sha256(loader).hexdigest()
-    check_boot_contract(args.card_root, args.loader, loader_sha256)
-
-    root = args.card_root.resolve()
-    outputs = {
-        "ANVILA.BIN": padded_image(monitor),
-        "ANVILB.BIN": all_zero_slot(),
-        "P3CTRLA.BIN": [control_record(0, 1, monitor)],
-        "P3CTRLB.BIN": [bytes(512)],
-        "kernel8.img": [loader],
-    }
-    expected: dict[str, str] = {}
-    for name, chunks in outputs.items():
-        target = root / name
-        print(f"writing {target}")
-        write_atomic(target, chunks)
-        expected[name] = sha256(target)
-
-    # Re-open every file and enforce exact sizes after replacement.
-    sizes = {
-        "ANVILA.BIN": SLOT_BYTES,
-        "ANVILB.BIN": SLOT_BYTES,
-        "P3CTRLA.BIN": 512,
-        "P3CTRLB.BIN": 512,
-        "kernel8.img": len(loader),
-    }
-    for name, size in sizes.items():
-        actual = (root / name).stat().st_size
-        if actual != size:
-            raise ProvisionError(f"readback size mismatch for {name}: {actual} != {size}")
-
-    manifest = {
-        "format": "Anvil Pi3 A/B provision 2",
-        "slotFormat": "P3SLOT 1 containing PMFBOOT 2",
-        "slotBytes": SLOT_BYTES,
-        "loadAddress": hex(LOAD_ADDRESS),
-        "activeSlot": "A",
-        "generation": 1,
-        "monitorLength": len(monitor),
-        "monitorSha256": hashlib.sha256(monitor).hexdigest(),
-        "monitorPmfLength": monitor_metadata["pmfBytes"],
-        "monitorPmfSha256": monitor_metadata["pmfSha256"],
-        "monitorMetadata": monitor_metadata,
-        "loaderSha256": loader_sha256,
-        "loaderPmfSha256": hashlib.sha256(loader_pmf).hexdigest(),
-        "loaderMetadata": loader_metadata,
-        "firmwarePin": json.loads((PINNED_BOOT / "firmware.json").read_text(encoding="utf-8")),
-        "files": {name: {"bytes": sizes[name], "sha256": expected[name]} for name in sizes},
-        "finalBoardGate": "loader must accept every file as contiguous and hash-valid",
-    }
-    manifest_path = root / "P3UPDATE.JSON"
-    write_atomic(
-        manifest_path,
-        [json.dumps(manifest, indent=2, sort_keys=True).encode("ascii") + b"\n"],
-    )
-    print(f"wrote {manifest_path}")
-    print("provisioning readback passed; board contiguity/hash acceptance remains")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--card-root", required=True, type=Path,
+                        help="explicit root of the already-mounted FAT boot volume")
+    parser.add_argument("--bundle", required=True, type=Path,
+                        help="new direct-boot staging directory from pi3_boot_stage.py")
+    parser.add_argument("--manifest-sha256", required=True,
+                        help="reviewed SHA-256 printed for bundle SHA256.json")
+    parser.add_argument("--backup-dir", required=True, type=Path,
+                        help="new directory outside the card for prior files")
+    parser.add_argument("--yes-replace-kernel8", action="store_true",
+                        help="acknowledge direct install replaces the firmware kernel image")
+    args = parser.parse_args()
+    result = install(args.card_root, args.bundle, args.backup_dir,
+                     args.manifest_sha256, yes_replace_kernel8=args.yes_replace_kernel8)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    print("PASS: direct Pi 3 files installed and read back; no partition or format operation occurred")
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except ProvisionError as exc:
-        print(f"!! {exc}", file=sys.stderr)
-        raise SystemExit(1)
+    except ProvisionError as error:
+        raise SystemExit(f"REFUSED: {error}") from error

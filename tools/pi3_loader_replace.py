@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replace only the immutable kernel8.img loader on a prepared Pi 3 boot card.
+"""Retired A/B loader replacement; current direct-boot cards are not compatible.
 
 Provisioning recreates both monitor slots and both control records, which
 discards whichever slot is currently confirmed and restarts the generation
@@ -16,12 +16,13 @@ The outgoing loader is copied to a named backup on the PC first, so the previous
 boot chain can always be put back.
 
     python tools/pi3_loader_replace.py --card-root X:\\ \
-        --loader build/pi3/kernel8.img \
+        --loader build/pi3/recovery/kernel8.img \
         --backup _work/pi3-loader-backup/KERNEL8.IMG.outgoing \
         --yes-replace-kernel8
 
-The board still performs the final FAT-contiguity and image-hash checks itself;
-a host readback proves the bytes landed, not that the loader will accept them.
+The retained validation helpers support older A/B research artifacts only.
+The tool refuses live provisioning because current config.txt loads the full
+Anvil monitor directly. Use tools/pi3_provision.py for the supported path.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from pi3_provision import (
+from pi3_ab_provision import (
     LOADER_MAX,
     REQUIRED_FIRMWARE,
     SLOT_BYTES,
@@ -140,7 +141,7 @@ def main() -> int:
     if not target.is_file():
         raise ProvisionError(
             "this card has no kernel8.img, so it has never been provisioned; "
-            "use pi3_provision.py for a first installation"
+            "use pi3_ab_provision.py only for an explicitly selected A/B recovery card"
         )
     outgoing = target.read_bytes()
     outgoing_sha256 = hashlib.sha256(outgoing).hexdigest()

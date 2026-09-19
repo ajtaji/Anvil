@@ -1,21 +1,14 @@
-ANVIL RASPBERRY PI 3 MODEL B v1.2 - EXPERIMENTAL BOOT CARD
+ANVIL RASPBERRY PI 3 MODEL B v1.2 - DIRECT FIRMWARE BOOT
 
-This is a bare-metal Anvil development image, not Linux and not yet a full
-Anvil monitor. It initializes PL011 UART, validates firmware ARM memory and
-the device tree, starts a 640x480 framebuffer console, prints its status, and
-parks safely.
+The firmware loads a Pi 3-specific armstub8.bin at address zero, then loads the
+complete Anvil monitor as kernel8.img at 0x200000. The stub performs the
+BCM2837 EL3 handoff to masked EL2h, leaves the firmware device-tree pointer in
+x0, clears x1-x3 and parks the secondary cores. There is no separate A/B
+selector or monitor payload in the normal boot path.
 
-FIRST-SILICON DIAGNOSTIC
-The display now comes up before PL011. The firmware rainbow is intentionally
-visible until Anvil replaces it. Pi 3B's activity LED is firmware-controlled:
-  one short flash       ARM entry and mailbox context reached
-  repeating two flashes ARM RAM or device-tree validation failed
-  repeating three       framebuffer negotiation failed
-  repeating four        PL011 initialization failed
-  repeating five        PL011 transmission failed
-Failure codes repeat five times, then the CPU parks. No flashes at all means
-either failure before mailbox access or that the optional firmware LED service
-did not answer; it is not by itself proof that ARM entry was absent.
+The complete Anvil monitor initializes PL011, validates the firmware-provided
+RAM and device tree, starts its board services and enters the Anvil console.
+See docs/PI3_BOOT.md for the direct-entry contract and emitted boot checks.
 
 Required card files:
   bootcode.bin
@@ -23,26 +16,43 @@ Required card files:
   fixup.dat
   bcm2710-rpi-3-b.dtb
   overlays/disable-bt.dtbo
+  LICENCE.broadcom
   config.txt
+  armstub8.bin
   kernel8.img
 
-The firmware files must all come from one pinned official Raspberry Pi
-firmware revision. kernel8.img must be built from RaspberryPi3/Board/board.pi3
-for target pi3 with load address $80000 and stack top $200000, then pass
-tools/pi3_cold_entry_check.py before deployment.
+config.txt explicitly selects AArch64, kernel8.img at 0x200000, the custom
+armstub8.bin, the pinned DTB at 0x1000000, PL011 and the Pi 3 Bluetooth
+overlay. Keep these settings in sync with the source placement declarations.
+
+Build both Anvil artifacts through the counted Pi 3 target:
+  python tools/build.py pi3 --compiler <PureMetalForge.exe>
+
+This writes build/pi3/armstub8.bin and build/pi3/kernel8.img (plus its PMF
+validation sidecar). It does not flash a card. Validate and optionally stage
+the exact built files into a new folder:
+  python tools/pi3_boot_stage.py --firmware <pinned-firmware-boot-dir> \
+      --image build/pi3/kernel8.img --image-sha256 <accepted-image-sha256> \
+      --armstub build/pi3/armstub8.bin --armstub-sha256 <accepted-stub-sha256> \
+      --output <new-staging-directory>
+
+The stage command prints the SHA-256 for the resulting SHA256.json. After
+reviewing that manifest and naming the already-mounted FAT boot root, install
+the bundle with a new host backup directory:
+  python tools/pi3_provision.py --card-root <mounted-fat-root> \
+      --bundle <new-staging-directory> --manifest-sha256 <reviewed-manifest-sha256> \
+      --backup-dir <new-host-backup-directory> --yes-replace-kernel8
+
+Provisioning replaces only files listed in the pinned bundle, backs up every
+changed destination first, then reads each installed file back and verifies
+its SHA-256. It does not partition, format or remove other files. It refuses a
+root with an autoboot.txt alternate selector.
+
+The firmware files must all come from the single revision pinned in
+firmware.json; retain LICENCE.broadcom and never mix start.elf and fixup.dat
+revisions. Staging requires an output path that does not already exist and
+never selects, formats or writes a disk. Review the reported readback hashes
+before booting the card.
 
 UART is 3.3 V TTL on GPIO14 TX and GPIO15 RX at 115200 baud. Never attach an
 RS-232 voltage-level port directly.
-
-REPRODUCIBLE STAGING (no automatic disk selection or formatting)
-Official firmware revision and file SHA256 values are in firmware.json.
-Download its listed files from that revision's boot/ directory, retaining
-LICENCE.broadcom. Never mix start.elf and fixup.dat revisions.
-
-Read-only validation:
-  python tools/pi3_boot_stage.py --firmware <boot-files-directory> --image <accepted-image> --image-sha256 <accepted-sha256>
-Add --output <new-staging-directory> to create verified copies and SHA256.json.
-The output directory must not exist; this tool never overwrites a card.
-It does not compile, validate BSS/DTB placement, or replace the emitted boot gate.
-After successful gates, copying to an explicitly identified spare FAT32 card
-and testing its first boot is a separate manual deployment step.

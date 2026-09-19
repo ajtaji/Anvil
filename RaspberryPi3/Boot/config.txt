@@ -1,12 +1,14 @@
 [all]
-# Anvil Raspberry Pi 3 Model B v1.2 experimental cold entry.
-# Keep the firmware handoff in AArch64 at the compiler's linked address.
+# Anvil Raspberry Pi 3 Model B v1.2 direct cold entry.
+# The Pi 3-specific stub starts at EL3, preserves the firmware DTB pointer,
+# parks secondary cores and enters the complete Anvil image at masked EL2h.
 arm_64bit=1
 kernel=kernel8.img
-kernel_address=0x80000
+kernel_address=0x200000
+armstub=armstub8.bin
 
-# Main captures the firmware-provided DTB pointer in x0. Keep the complete
-# tree resident and outside Anvil's reserved $80000..$200000 bootstrap span.
+# The Pi 3 stub restores the firmware-provided DTB pointer to x0. Keep the
+# complete tree at the agreed firmware location, separate from monitor BSS.
 device_tree=bcm2710-rpi-3-b.dtb
 device_tree_address=0x1000000
 

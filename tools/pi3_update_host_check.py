@@ -12,7 +12,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pi3_update as update  # noqa: E402
-import pi3_provision as provision  # noqa: E402
+import pi3_ab_provision as provision  # noqa: E402
 import pi3_slot as slot_format  # noqa: E402
 
 

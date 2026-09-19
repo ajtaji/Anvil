@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Safely stage and commit a Raspberry Pi 3 Anvil A/B image over PL011.
+"""Retired A/B updater for legacy Raspberry Pi 3 recovery cards.
 
-The Pi 3 boot card stays in the board.  Its immutable kernel8.img loader chooses
+The former Pi 3 boot card stayed in the board. Its immutable kernel8.img loader chose
 between two preallocated monitor slots.  This tool sends a candidate into RAM,
 asks Anvil to write and read-verify the inactive slot, and only then commits the
 next redundant boot-control record.  It never raw-writes a disk and never
 reboots unless --reboot is explicitly requested.
 
-    python tools/pi3_update.py build/pi3/anvil-slot.img --port COM7
+    python tools/pi3_update.py build/pi3/recovery/anvil-slot.img --port COM7
 
 pyserial is the only external dependency.  If --port is omitted, exactly one
 serial port must be present; ambiguity is refused and the available ports are

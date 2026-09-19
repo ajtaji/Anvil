@@ -48,12 +48,13 @@ def check(board: str, slot: bytes | None = None) -> dict[str, int | str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--slot", type=Path, default=ROOT / "build" / "pi3" / "anvil-monitor-slot.img")
+    parser.add_argument("--slot", type=Path,
+                        help="optional legacy A/B slot; normal direct boot needs no slot")
     parser.add_argument("--source-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     board = BOARD.read_text(encoding="utf-8")
-    if args.source_only:
+    if args.source_only or args.slot is None:
         artifact = None
     else:
         if not args.slot.is_file():

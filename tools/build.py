@@ -36,35 +36,40 @@ TARGETS = {
         "output": Path("build/unoq/anvil.img"),
         "args": ["--entry-returns"],
     },
+    # The normal Pi 3 card boots Anvil directly. The separate stub is the
+    # firmware's EL3 entry file; kernel8.img is the complete monitor image.
+    "pi3-stub": {
+        "source": Path("RaspberryPi3/Board/armstub8.asm"),
+        "output": Path("build/pi3/armstub8.bin"),
+        # PureMetalForge's raw armstub frontend currently requires `-t pi4`.
+        # This is only assembler selection: the source is Pi3-specific raw
+        # instructions and contains no injected Pi4 runtime or constants.
+        "target": "pi4",
+        "args": ["--armstub"],
+    },
+    "pi3-monitor": {
+        "source": Path("RaspberryPi3/Board/board.pi3"),
+        "output": Path("build/pi3/kernel8.img"),
+        "target": "pi3",
+        "count_target": "pi3",
+        "args": [],
+    },
+    # Retired A/B loader/updater artifacts are available only by their
+    # explicit diagnostic targets below. The current board.pi3 is not an
+    # A/B-confirming monitor, so it must never be packaged as a recovery slot.
     "pi3-loader": {
         "source": Path("RaspberryPi3/Board/loader.pi3"),
-        "output": Path("build/pi3/kernel8.img"),
+        "output": Path("build/pi3/recovery/kernel8.img"),
         "target": "pi3",
         "count_target": "pi3-loader",
         "args": [],
     },
     "pi3-updater": {
         "source": Path("RaspberryPi3/Board/updater.pi3"),
-        "output": Path("build/pi3/anvil.img"),
-        "slot_output": Path("build/pi3/anvil-slot.img"),
+        "output": Path("build/pi3/recovery/anvil.img"),
+        "slot_output": Path("build/pi3/recovery/anvil-slot.img"),
         "target": "pi3",
         "count_target": "pi3-updater",
-        "args": [],
-    },
-    # THE MONITOR. It was "pi3-diagnostic" until 2026-09-18, with the cold
-    # entry's placement passed on the command line, because board.pi3 was a
-    # program that printed and parked. It is now the composition, it states
-    # its own placement in the source - the A/B slot contract's, which
-    # tools/pi3_slot.py checks - and it is packed as a slot like the
-    # updater beside it. NO ADDRESS FLAGS: passing them here and declaring
-    # them there is how a build from the editor and a build from a script
-    # stop being the same bytes.
-    "pi3-monitor": {
-        "source": Path("RaspberryPi3/Board/board.pi3"),
-        "output": Path("build/pi3/anvil-monitor.img"),
-        "slot_output": Path("build/pi3/anvil-monitor-slot.img"),
-        "target": "pi3",
-        "count_target": "pi3",
         "args": [],
     },
     "armstub": {
@@ -81,10 +86,11 @@ TARGETS = {
                  "--stack-addr", "0x05000000"],
     },
 }
-# `pi3` builds all three programs this board carries. The monitor is last
-# because it is the one being worked on; a failure in it leaves the boot
-# chain's two already built.
-TARGET_ALIASES = {"pi3": ("pi3-loader", "pi3-updater", "pi3-monitor")}
+# `pi3` builds the stub and full direct-boot monitor. The monitor is last so a
+# failure preserves the previously published complete monitor image.
+TARGET_ALIASES = {
+    "pi3": ("pi3-stub", "pi3-monitor"),
+}
 
 
 class PublishedArtifacts:
@@ -131,9 +137,11 @@ class PublishedArtifacts:
         self.backups.clear()
 
 
-def _stage_output(output: Path, token: str) -> Path:
+def _stage_output(output: Path, token: str, *, preserve_suffix: bool = False) -> Path:
     """A unique compiler destination beside the eventual atomic destination."""
     output.parent.mkdir(parents=True, exist_ok=True)
+    if preserve_suffix:
+        return output.with_name(f".{output.stem}.build-stage-{token}{output.suffix}")
     return output.with_name(f".{output.name}.build-stage-{token}")
 
 
@@ -141,7 +149,9 @@ def _compile_and_publish(compiler: str, target: str, source: Path,
                          output: Path, spec: dict) -> PublishedArtifacts:
     """Compile to private names, validate/pack, then reversibly publish."""
     token = f"{os.getpid()}-{uuid.uuid4().hex}"
-    staged_output = _stage_output(output, token)
+    staged_output = _stage_output(
+        output, token, preserve_suffix="--armstub" in spec["args"]
+    )
     staged_slot = None
     staged_slot_json = None
     staged_image = None
