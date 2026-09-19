@@ -8,8 +8,10 @@ is copied to a new, explicitly named backup directory before any card writes.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -29,6 +31,69 @@ REQUIRED = {
 
 class ProvisionError(RuntimeError):
     pass
+
+
+def validate_windows_card_root(card_root: str, volume_root: str, drive_type: int,
+                               filesystem: str, system_drive: str,
+                               *, confirmed: bool) -> None:
+    """Admit only an explicitly confirmed removable FAT volume root on Windows."""
+    norm = lambda value: ntpath.normcase(ntpath.normpath(value))
+    card = norm(card_root)
+    volume = norm(volume_root)
+    system = norm(system_drive)
+    if card != volume:
+        raise ProvisionError("on Windows, --card-root must be the removable volume root")
+    if card == system:
+        raise ProvisionError("refusing to provision the Windows system drive")
+    if not confirmed:
+        raise ProvisionError("direct install requires --yes-replace-kernel8")
+    if drive_type != 2:  # DRIVE_REMOVABLE
+        raise ProvisionError("Windows --card-root must be a confirmed removable drive")
+    if filesystem.upper() not in ("FAT", "FAT32"):
+        raise ProvisionError("Windows --card-root must use FAT/FAT32, not " + filesystem)
+
+
+def windows_volume_identity(root: str) -> tuple[int, str]:
+    """Return the OS-reported drive type and filesystem for an existing root."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetDriveTypeW.restype = wintypes.UINT
+    drive_type = int(kernel32.GetDriveTypeW(root))
+    filesystem = ctypes.create_unicode_buffer(32)
+    dword_p = ctypes.POINTER(wintypes.DWORD)
+    kernel32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, dword_p, dword_p,
+        dword_p, wintypes.LPWSTR, wintypes.DWORD,
+    ]
+    kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+    if not kernel32.GetVolumeInformationW(root, None, 0, None, None, None,
+                                           filesystem, len(filesystem)):
+        error = ctypes.get_last_error()
+        raise ProvisionError(f"cannot identify Windows card volume {root!r} (error {error})")
+    return drive_type, filesystem.value
+
+
+def windows_system_drive() -> str:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetWindowsDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    kernel32.GetWindowsDirectoryW.restype = wintypes.UINT
+    directory = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetWindowsDirectoryW(directory, len(directory))
+    if length == 0 or length >= len(directory):
+        raise ProvisionError("cannot identify the Windows system drive safely")
+    return str(Path(directory.value).anchor)
+
+
+def validate_windows_volume(card: Path, *, confirmed: bool) -> None:
+    root = Path(card.anchor).resolve()
+    system_root = Path(windows_system_drive()).resolve()
+    drive_type, filesystem = windows_volume_identity(str(root))
+    validate_windows_card_root(str(card), str(root), drive_type, filesystem,
+                               str(system_root), confirmed=confirmed)
 
 
 def sha256(path: Path) -> str:
@@ -122,7 +187,9 @@ def install(card_root: Path, bundle: Path, backup_dir: Path,
     if not card_root.is_dir() or card_root.is_symlink():
         raise ProvisionError("--card-root must name an existing ordinary directory")
     card = card_root.resolve()
-    if card == Path(card.anchor).resolve():
+    if os.name == "nt":
+        validate_windows_volume(card, confirmed=yes_replace_kernel8)
+    elif card == Path(card.anchor).resolve():
         raise ProvisionError("refusing a filesystem root as the card root")
     bundle_root = bundle.resolve()
     if (card == bundle_root or card.is_relative_to(bundle_root) or
